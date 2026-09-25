@@ -23,9 +23,7 @@
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { mkdtemp, rm } from 'fs/promises';
 import { join } from 'path';
-import { tmpdir } from 'os';
 import { startDaemonServer, type RunningDaemon } from '../../src/daemon/server';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { pinConfig } from '../helpers/pin-config';
@@ -41,8 +39,6 @@ isolateInProcessDaemonEnv();
 
 describe('shared daemon token rotation', () => {
   let ctx: TestContext;
-  let tmpDir: string;
-  let socketPath: string;
   let daemon: RunningDaemon | undefined;
   let restoreConfig: (() => void) | undefined;
   let daemonBaseDir: string;
@@ -56,9 +52,6 @@ describe('shared daemon token rotation', () => {
 
     ctx = await setupTestLazy();
     restoreConfig = pinConfig(ctx.root);
-
-    tmpDir = await mkdtemp(join(tmpdir(), 'lazy-rotation-'));
-    socketPath = join(tmpDir, 'test.sock');
   });
 
   afterEach(async () => {
@@ -71,13 +64,11 @@ describe('shared daemon token rotation', () => {
     restoreDaemonBaseDir?.();
     restoreDaemonBaseDir = undefined;
     await removeDaemonBaseDir(daemonBaseDir);
-    await rm(tmpDir, { recursive: true, force: true });
   });
 
-  /** GET an /rpc route over the daemon's unix socket with a given bearer token. */
+  /** POST an /rpc route on the daemon's TCP port with a given bearer token. */
   function rpc(token: string): Promise<Response> {
-    return fetch('http://localhost/rpc/list', {
-      unix: socketPath,
+    return fetch(`http://127.0.0.1:${daemon!.webPort}/rpc/list`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -85,12 +76,11 @@ describe('shared daemon token rotation', () => {
         'X-Lazy-Project': ctx.root,
       },
       body: JSON.stringify({}),
-    } as any);
+    });
   }
 
   function mcp(token: string): Promise<Response> {
-    return fetch('http://localhost/mcp/_/lazy_list', {
-      unix: socketPath,
+    return fetch(`http://127.0.0.1:${daemon!.webPort}/mcp/_/lazy_list`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -98,7 +88,7 @@ describe('shared daemon token rotation', () => {
         'X-Lazy-Project': ctx.root,
       },
       body: JSON.stringify({ arguments: {} }),
-    } as any);
+    });
   }
 
   // The rotation has to actually reach the running system: a daemon started
@@ -117,7 +107,7 @@ describe('shared daemon token rotation', () => {
     expect(rotated).not.toBe(leaked);
 
     // Same call ensureDaemon makes: no explicit token, so it adopts the file.
-    daemon = await startDaemonServer({ socketPath, projectRoot: ctx.root });
+    daemon = await startDaemonServer({ projectRoot: ctx.root });
 
     expect((await rpc(rotated)).status).toBe(200);
     // INVARIANT: the credential every agent could read is now worthless. Do not
@@ -139,13 +129,12 @@ describe('shared daemon token rotation', () => {
     await Bun.write(join(legacyMcpConfigDir(ctx.root), 'daemon-mcp-lazy-old.json'), '{"token":"x"}');
     expect((await purgeLegacyDaemonMcpConfigs(ctx.root)).rotated).toBe(true);
 
-    daemon = await startDaemonServer({ socketPath, projectRoot: ctx.root });
+    daemon = await startDaemonServer({ projectRoot: ctx.root });
 
     expect((await mcp(agentToken)).status).toBe(200);
     // A task token on its own surface is likewise untouched (403 here would be
     // an identity mismatch, 401 a dead token — neither may happen).
-    const taskResp = await fetch(`http://localhost/mcp/${taskId}/lazy_status`, {
-      unix: socketPath,
+    const taskResp = await fetch(`http://127.0.0.1:${daemon.webPort}/mcp/${taskId}/lazy_status`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -153,7 +142,7 @@ describe('shared daemon token rotation', () => {
         'X-Lazy-Project': ctx.root,
       },
       body: JSON.stringify({ arguments: {} }),
-    } as any);
+    });
     expect(taskResp.status).toBe(200);
   });
 });

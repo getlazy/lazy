@@ -27,10 +27,14 @@
  * bears on the question, and a reduce pass writes the single answer. Every
  * degradation — an excerpt that failed, a single message too large to pass
  * whole — comes back as a warning rather than being silently absorbed.
+ *
+ * That map-reduce is not spelled here: it lives in src/oneshot/ask-engine.ts,
+ * shared with the task-record ask (src/task/record-ask.ts). This module owns
+ * only what is specific to a conversation — how a stored message renders, and
+ * the three prompt templates.
  */
 
-import { runClaudeOneshot, extractTokenUsage } from '../capture/claude';
-import { logger } from '../utils/logger';
+import { chunkParts, runAskEngine, TRANSCRIPT_CHARS_PER_CALL as ENGINE_BUDGET, type AskChunk } from '../oneshot/ask-engine';
 import type { StoredConversation, StoredMessage } from '../storage/types';
 import type { TokenUsage } from '../types';
 
@@ -41,28 +45,12 @@ import reduceTemplate from '../prompts/conversation-ask-reduce.md' with { type: 
 /**
  * How many characters of rendered transcript may go into ONE prompt.
  *
- * The binding limit is not the context window — it is argv. `runClaudeOneshot`
- * passes the prompt as a single `claude -p <prompt>` argument, and Linux caps
- * one argv element at MAX_ARG_STRLEN (128 KiB); exceeding it fails the spawn
- * with E2BIG rather than degrading. 96 KiB of transcript leaves ~30 KiB of head
- * room for the template, the question and the metadata block, which is far more
- * than either needs.
+ * Re-exported from the shared engine, where the argv reasoning behind the
+ * number lives, so existing callers and tests keep one import site.
  */
-export const TRANSCRIPT_CHARS_PER_CALL = 96_000;
-
-/** Sentinel a map pass returns for an excerpt with nothing bearing on the question. */
-const NOTHING_RELEVANT = 'NOTHING_RELEVANT';
-
-/**
- * Map passes in flight at once. Bounded rather than unbounded-parallel: a big
- * transcript can be dozens of excerpts, and firing all of them at the API at
- * once is how a read-only question turns into a rate-limit error.
- */
-const MAP_CONCURRENCY = 4;
+export const TRANSCRIPT_CHARS_PER_CALL = ENGINE_BUDGET;
 
 export interface ConversationAskOptions {
-  /** Model for every pass. Undefined → the Claude CLI default. */
-  model?: string;
   /**
    * Progress sink for the human-facing surfaces. Called with one short line per
    * milestone (chunking decision, each excerpt, reduce). The CLI routes these
@@ -112,11 +100,8 @@ function renderMetadata(conv: StoredConversation): string {
   return lines.join('\n');
 }
 
-export interface TranscriptChunk {
-  text: string;
-  /** Warnings produced while building this chunk (an elided oversized message). */
-  warnings: string[];
-}
+/** Re-exported so callers keep one name for the engine's chunk shape. */
+export type TranscriptChunk = AskChunk;
 
 /**
  * Split a conversation into consecutive chunks, each under the per-call budget.
@@ -135,79 +120,16 @@ export function chunkTranscript(
   messages: StoredMessage[],
   budget: number = TRANSCRIPT_CHARS_PER_CALL,
 ): TranscriptChunk[] {
-  const chunks: TranscriptChunk[] = [];
-  let current: string[] = [];
-  let currentLen = 0;
-  let currentWarnings: string[] = [];
-
-  const flush = (): void => {
-    if (current.length === 0) return;
-    chunks.push({ text: current.join('\n\n'), warnings: currentWarnings });
-    current = [];
-    currentLen = 0;
-    currentWarnings = [];
-  };
-
-  for (const msg of messages) {
-    let rendered = renderMessage(msg);
-    let warning: string | null = null;
-
-    if (rendered.length > budget) {
-      const elided = rendered.length - budget;
-      rendered = `${rendered.substring(0, budget)}\n[… ${elided} characters elided by lazy: this single message exceeds the per-call budget …]`;
-      const stamp = msg.timestamp ? ` at ${msg.timestamp}` : '';
-      warning = `One ${msg.role === 'user' ? 'human' : 'assistant'} message${stamp} was too large to pass whole — ${elided} characters were elided from it.`;
-    }
-
-    // +2 for the blank line between messages.
-    if (currentLen > 0 && currentLen + rendered.length + 2 > budget) flush();
-    current.push(rendered);
-    currentLen += rendered.length + 2;
-    if (warning) currentWarnings.push(warning);
-  }
-
-  flush();
-  return chunks;
-}
-
-/** Run `tasks` with at most `limit` in flight, preserving result order. */
-async function runBounded<T>(tasks: Array<() => Promise<T>>, limit: number): Promise<Array<PromiseSettledResult<T>>> {
-  const results: Array<PromiseSettledResult<T>> = new Array(tasks.length);
-  let next = 0;
-
-  const worker = async (): Promise<void> => {
-    while (true) {
-      const index = next++;
-      if (index >= tasks.length) return;
-      try {
-        results[index] = { status: 'fulfilled', value: await tasks[index]() };
-      } catch (err) {
-        results[index] = { status: 'rejected', reason: err };
-      }
-    }
-  };
-
-  await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, worker));
-  return results;
-}
-
-function addUsage(total: TokenUsage, add: TokenUsage): TokenUsage {
-  return {
-    inputTokens: total.inputTokens + add.inputTokens,
-    outputTokens: total.outputTokens + add.outputTokens,
-    cacheCreationTokens: total.cacheCreationTokens + add.cacheCreationTokens,
-    cacheReadTokens: total.cacheReadTokens + add.cacheReadTokens,
-  };
-}
-
-const ZERO_USAGE: TokenUsage = { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
-
-function fill(template: string, values: Record<string, string>): string {
-  let out = template;
-  for (const [key, value] of Object.entries(values)) {
-    out = out.replaceAll(`{{${key}}}`, value);
-  }
-  return out;
+  return chunkParts(
+    messages.map(msg => ({
+      text: renderMessage(msg),
+      noun: 'message',
+      warningSubject:
+        `One ${msg.role === 'user' ? 'human' : 'assistant'} message` +
+        (msg.timestamp ? ` at ${msg.timestamp}` : ''),
+    })),
+    budget,
+  );
 }
 
 /**
@@ -223,150 +145,17 @@ export async function askConversation(
   question: string,
   opts: ConversationAskOptions = {},
 ): Promise<ConversationAskResult> {
-  const progress = opts.onProgress ?? ((): void => {});
-  const metadata = renderMetadata(conv);
-
-  if (conv.messages.length === 0) {
-    throw new Error(
-      `Conversation ${conv.sessionId.substring(0, 8)} has no messages stored — there is nothing to ask about.`,
-    );
-  }
-
   const chunks = chunkTranscript(conv.messages);
-  const warnings = chunks.flatMap(c => c.warnings);
-
-  // --- Single pass: the whole transcript fits in one call ---
-  if (chunks.length === 1) {
-    progress(`Asking conversation ${conv.sessionId.substring(0, 8)} (${conv.messages.length} messages, single pass)…`);
-    const prompt = fill(singleTemplate, {
-      metadata,
-      question,
-      transcript: chunks[0].text,
-    });
-    const response = await runClaudeOneshot(prompt, opts.model, { readOnly: true });
-    return {
-      sessionId: conv.sessionId,
-      answer: (response.result ?? '').trim(),
-      chunks: 1,
-      relevantChunks: 1,
-      usage: extractTokenUsage(response),
-      warnings,
-    };
-  }
-
-  // --- Map: read each excerpt for material bearing on the question ---
-  progress(
-    `Conversation ${conv.sessionId.substring(0, 8)} is too large for one pass ` +
-    `(${conv.messages.length} messages) — reading it as ${chunks.length} excerpts…`,
-  );
-
-  let usage = ZERO_USAGE;
-  let completed = 0;
-  const mapResults = await runBounded(
-    chunks.map((chunk, i) => async () => {
-      const prompt = fill(mapTemplate, {
-        metadata,
-        question,
-        transcript: chunk.text,
-        index: String(i + 1),
-        total: String(chunks.length),
-      });
-      const response = await runClaudeOneshot(prompt, opts.model, { readOnly: true });
-      progress(`  excerpt ${++completed}/${chunks.length} read`);
-      return response;
-    }),
-    MAP_CONCURRENCY,
-  );
-
-  const findings: string[] = [];
-  let failedChunks = 0;
-  mapResults.forEach((res, i) => {
-    if (res.status === 'rejected') {
-      failedChunks++;
-      const reason = res.reason instanceof Error ? res.reason.message : String(res.reason);
-      warnings.push(`Excerpt ${i + 1} of ${chunks.length} could not be read (${reason}) — the answer is based on the rest.`);
-      logger.debug(`conversation ask: excerpt ${i + 1} failed: ${reason}`);
-      return;
-    }
-    usage = addUsage(usage, extractTokenUsage(res.value));
-    const text = (res.value.result ?? '').trim();
-    if (!text || text === NOTHING_RELEVANT) return;
-    findings.push(`### Excerpt ${i + 1} of ${chunks.length}\n\n${text}`);
-  });
-
-  if (failedChunks === chunks.length) {
-    throw new Error(
-      `Every one of the ${chunks.length} excerpts of conversation ${conv.sessionId.substring(0, 8)} failed to read. ` +
-      `First failure: ${mapResults[0].status === 'rejected' ? String((mapResults[0].reason as Error)?.message ?? mapResults[0].reason) : 'unknown'}`,
-    );
-  }
-
-  // Nothing relevant anywhere: say so directly rather than paying for a reduce
-  // pass over an empty findings list (which could only invent an answer).
-  if (findings.length === 0) {
-    return {
-      sessionId: conv.sessionId,
-      answer:
-        `Nothing in this conversation bears on that question. All ${chunks.length} excerpts of the ` +
-        `transcript were read${failedChunks > 0 ? ` (${failedChunks} could not be read — see warnings)` : ''} and none of them addressed it.`,
-      chunks: chunks.length,
-      relevantChunks: 0,
-      usage,
-      warnings,
-    };
-  }
-
-  // --- Reduce: one answer from the per-excerpt findings ---
-  //
-  // The findings themselves are bounded by the same argv budget as the
-  // transcript: on a very large conversation, dozens of excerpts each returning
-  // a page of bullets can add up past it. Keep whole findings in conversation
-  // order until the budget is spent and SAY which ones were dropped — a reduce
-  // that silently lost its tail would read as a confident, complete answer.
-  const keptFindings: string[] = [];
-  let findingsLen = 0;
-  let droppedFindings = 0;
-  for (const finding of findings) {
-    if (findingsLen > 0 && findingsLen + finding.length + 2 > TRANSCRIPT_CHARS_PER_CALL) {
-      droppedFindings++;
-      continue;
-    }
-    keptFindings.push(finding);
-    findingsLen += finding.length + 2;
-  }
-  if (droppedFindings > 0) {
-    warnings.push(
-      `${droppedFindings} of ${findings.length} relevant excerpt(s) did not fit in the final pass and were left out of the answer. ` +
-      `Ask a narrower question to see them.`,
-    );
-  }
-
-  progress(`Composing the answer from ${keptFindings.length} relevant excerpt(s)…`);
-  const gapNote = [
-    failedChunks > 0
-      ? `- ${failedChunks} of ${chunks.length} excerpts could not be read. Say that the answer may be incomplete.`
-      : null,
-    droppedFindings > 0
-      ? `- ${droppedFindings} further excerpt(s) had relevant material that did not fit here. Say that the answer may be incomplete.`
-      : null,
-  ].filter(Boolean).join('\n');
-  const reducePrompt = fill(reduceTemplate, {
-    metadata,
+  const result = await runAskEngine({
+    subject: `conversation ${conv.sessionId.substring(0, 8)}`,
+    sizeLabel: `${conv.messages.length} messages`,
+    metadata: renderMetadata(conv),
     question,
-    gapNote: gapNote ? `${gapNote}\n` : '',
-    findings: keptFindings.join('\n\n'),
+    chunks,
+    templates: { single: singleTemplate, map: mapTemplate, reduce: reduceTemplate },
+    onProgress: opts.onProgress,
   });
-  const reduceResponse = await runClaudeOneshot(reducePrompt, opts.model, { readOnly: true });
-  usage = addUsage(usage, extractTokenUsage(reduceResponse));
-
-  return {
-    sessionId: conv.sessionId,
-    answer: (reduceResponse.result ?? '').trim(),
-    chunks: chunks.length,
-    relevantChunks: findings.length,
-    usage,
-    warnings,
-  };
+  return { sessionId: conv.sessionId, ...result };
 }
 
 /**

@@ -16,6 +16,7 @@ describe('ClaudeCodeAgent effort flag', () => {
 
   test('emits --effort <level> when effort is provided', () => {
     const args = agent.buildExecArgs({
+      modelId: 'test-model',
       prompt: 'Do the thing',
       dangerouslySkipPermissions: false,
       effort: 'high',
@@ -28,6 +29,7 @@ describe('ClaudeCodeAgent effort flag', () => {
 
   test('omits --effort entirely when effort is undefined', () => {
     const args = agent.buildExecArgs({
+      modelId: 'test-model',
       prompt: 'Do the thing',
       dangerouslySkipPermissions: false,
     });
@@ -39,6 +41,7 @@ describe('ClaudeCodeAgent effort flag', () => {
   test('passes every valid effort level through verbatim', () => {
     for (const level of VALID_EFFORT_LEVELS) {
       const args = agent.buildExecArgs({
+        modelId: 'test-model',
         prompt: 'Do the thing',
         dangerouslySkipPermissions: false,
         effort: level,

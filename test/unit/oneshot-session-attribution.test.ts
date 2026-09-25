@@ -4,9 +4,9 @@
  *
  * THE BUG THIS ENCODES
  * --------------------
- * A fidelity summary (accept-time housekeeping, run via `runClaudeOneshot`)
+ * A fidelity summary (accept-time housekeeping, run as a machine one-shot)
  * appeared as a user turn inside a live builder conversation. The delivery path
- * is session ATTRIBUTION, not synthesis: `runClaudeOneshot` inherits the
+ * is session ATTRIBUTION, not synthesis: the one-shot used to inherit the
  * daemon's cwd, so its JSONL lands in exactly the projects dir every
  * session-ownership rule scans — and being brand new it is by construction the
  * newest "created since launch" file, which is the whole of `pickLaunchSessionId`
@@ -35,7 +35,7 @@ import {
   snapshotSessionFiles,
   captureNewOrModifiedConversations,
 } from '../../src/import/capture-session';
-import { buildOneshotArgs } from '../../src/capture/claude';
+import { buildOneshotArgs } from '../../src/oneshot/args';
 import type { Storage } from '../../src/storage';
 
 /** One JSONL line shaped like Claude Code's first user entry. */
@@ -320,7 +320,7 @@ describe('one-shot execution path', () => {
   // make housekeeping execute inside a human's conversation, so their absence is
   // the contract worth pinning — not an implementation detail.
   test('is always `claude -p` and never resumes a session', () => {
-    const args = buildOneshotArgs('summarize the task', 'opus', { readOnly: true });
+    const args = buildOneshotArgs('summarize the task', 'opus');
     expect(args[0]).toBe('claude');
     expect(args).toContain('-p');
     expect(args).toContain('--output-format');
@@ -333,22 +333,22 @@ describe('one-shot execution path', () => {
   // ever stops being applied, every housekeeping run silently becomes a
   // "conversation" again — and every filter above goes blind at once.
   test('marks its prompt at the head', () => {
-    const args = buildOneshotArgs('summarize the task');
+    const args = buildOneshotArgs('summarize the task', 'opus');
     const prompt = args[args.indexOf('-p') + 1];
     expect(prompt.startsWith(ONESHOT_MARKER)).toBe(true);
   });
 
   // INVARIANT: the fidelity summarizer's ONLY agent entry point is the one-shot
   // runner. Source-level because the seam is which function it calls, and a
-  // module mock of src/capture/claude leaks process-wide across test files.
+  // module mock of src/oneshot leaks process-wide across test files.
   // If this ever needs to change, the question to answer first is "whose session
   // does the summary now run in?".
-  test('ClaudeSummarizer calls runClaudeOneshot and nothing else', async () => {
+  test('ClaudeSummarizer calls the one-shot dispatcher and nothing else', async () => {
     const src = await readFile(
       join(import.meta.dir, '..', '..', 'src', 'synthesis', 'summarizer.ts'),
       'utf-8',
     );
-    expect(src).toContain('runClaudeOneshot');
+    expect(src).toContain('runOneshot');
     // `runClaude(` / `runClaudeInteractive` / `--resume` would each put the
     // summary inside somebody's existing session.
     expect(src).not.toMatch(/\brunClaude\s*\(/);

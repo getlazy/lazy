@@ -23,7 +23,8 @@
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { join } from 'path';
-import { readFileSync, writeFileSync } from 'fs';
+import { readFileSync, writeFileSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS, setProtectedPatterns } from '../helpers/fixtures';
@@ -54,15 +55,29 @@ const CHANGELOG = { title: 'changelog', pattern: 'CHANGELOG.md', instructions: '
 
 describe('maintained files automation', () => {
   let ctx: TestContext;
+  /** Existence declares final for the NEXT mocked turn; contents are the note.
+   *  The wrap-up chain (maintain included) runs once, on a declared-final turn
+   *  (final-turn design §14 slice 3), so the nudge-firing tests seed the
+   *  LAZY_MOCK_FINAL flag file — the mock's seam (see the wrap-up gate comment
+   *  in test/mocks/claude.ts). Daemonless: per-invocation env reaches the mock. */
+  let finalFlag: string;
 
   beforeEach(async () => {
     ctx = await setupTestLazy();
+    finalFlag = join(tmpdir(), `lazy-final-flag-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   });
 
   afterEach(async () => {
+    rmSync(finalFlag, { force: true });
     // ctx.cleanup() removes the external storage dir too (see setup.ts).
     await ctx.cleanup();
   });
+
+  /** The next mocked turn declares final: write the flag before the call and
+   *  pass LAZY_MOCK_FINAL in that invocation's env. */
+  function seedFinal(): void {
+    writeFileSync(finalFlag, '');
+  }
 
   // INVARIANT: A turn that touches none of a maintained group's files triggers a
   // one-shot follow-up recorded as its OWN nudge turn pair — the work turn stays
@@ -74,6 +89,7 @@ describe('maintained files automation', () => {
 
     // Agent only touches source code — neither docs/ nor CHANGELOG.md.
     const mockFiles = JSON.stringify([{ path: 'src/feature.ts', content: 'export const f = 1;\n' }]);
+    seedFinal();
     const result = await ctx.lazyMocked(
       ['start', taskId, '--yes', '--follow'],
       MOCK_CLAUDE_SUCCESS,
@@ -82,6 +98,7 @@ describe('maintained files automation', () => {
           LAZY_MOCK_SHOULD_COMMIT: '1',
           LAZY_MOCK_FILES: mockFiles,
           LAZY_MOCK_MAINTAIN_RESPONSE: 'Intra-release change; no docs or CHANGELOG update needed.',
+          LAZY_MOCK_FINAL: finalFlag,
         },
       },
     );
@@ -96,14 +113,20 @@ describe('maintained files automation', () => {
     expect(workTurn!.content).not.toContain('Intra-release change; no docs or CHANGELOG update needed.');
 
     // The nudge is recorded as its own discrete turn pair, authored by the SUPERVISOR.
-    const nudgeTurns = turns.filter(t => t.turn_type === 'nudge');
-    expect(nudgeTurns).toHaveLength(2);
-    const [nudgeHuman, nudgeAgent] = nudgeTurns;
-    expect(nudgeHuman.role).toBe('human');
-    expect(nudgeHuman.actor).toBe('supervisor'); // not 'human' / 'system'
-    expect(nudgeHuman.content).toContain('## Maintained Files Review');
-    expect(nudgeHuman.content).toContain('docs');
-    expect(nudgeHuman.content).toContain('changelog');
+    // (A declared-final human-audience turn also runs the wrap-up's present
+    // step, which materializes as a supervised pair of its own — so the pair is
+    // located by the MAINTAIN nudge's heading, the human turn that carries it
+    // followed by its agent reply.)
+    const nudgeHuman = turns.find(t => t.turn_type === 'nudge' && String(t.content).includes('## Maintained Files Review'));
+    expect(nudgeHuman).toBeDefined();
+    const nudgeAgent = turns[turns.indexOf(nudgeHuman!) + 1];
+    expect(nudgeAgent).toBeDefined();
+    const nudgeTurns = [nudgeHuman!, nudgeAgent];
+    expect(nudgeHuman!.role).toBe('human');
+    expect(nudgeHuman!.actor).toBe('supervisor'); // not 'human' / 'system'
+    expect(nudgeHuman!.content).toContain('## Maintained Files Review');
+    expect(nudgeHuman!.content).toContain('docs');
+    expect(nudgeHuman!.content).toContain('changelog');
     expect(nudgeAgent.role).toBe('agent');
     expect(nudgeAgent.content).toContain('Intra-release change; no docs or CHANGELOG update needed.');
     // The supervised reply carries its OWN usage, incl. cache tokens (not zero).
@@ -111,16 +134,20 @@ describe('maintained files automation', () => {
     expect(nudgeAgent.usage?.cacheReadTokens).toBeGreaterThan(0);
 
     // The nudge turn pair comes AFTER the work turn (work → nudge → nudge reply).
-    expect(turns.indexOf(workTurn!)).toBeLessThan(turns.indexOf(nudgeHuman));
+    expect(turns.indexOf(workTurn!)).toBeLessThan(turns.indexOf(nudgeHuman!));
 
     // Maintain is a nudge, not a gate — task still blocks normally (not conflict).
     expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
   });
 
-  // INVARIANT: When the turn touches a maintained group's files, no follow-up fires.
+  // INVARIANT: When the turn touches a maintained group's files, no follow-up
+  // fires. The turn DECLARES FINAL so the maintain step actually runs and
+  // finds nothing to say — without that the negative would hold for the wrong
+  // reason (the step never ran at all).
   test('does not fire a follow-up when a maintained file was updated', async () => {
     enableMaintain(ctx, [DOCS]);
     const taskId = await createTask(ctx, 'Update docs too', 'Implement and document');
+    writeFileSync(finalFlag, '');
 
     // Agent touches docs/ — the maintained group is satisfied.
     const mockFiles = JSON.stringify([
@@ -135,6 +162,7 @@ describe('maintained files automation', () => {
           LAZY_MOCK_SHOULD_COMMIT: '1',
           LAZY_MOCK_FILES: mockFiles,
           LAZY_MOCK_MAINTAIN_RESPONSE: 'should-not-appear',
+          LAZY_MOCK_FINAL: finalFlag,
         },
       },
     );
@@ -143,8 +171,13 @@ describe('maintained files automation', () => {
 
     const content = readAgentTurnContent(ctx.root, taskId);
     expect(content).not.toContain('should-not-appear');
-    // No nudge fired → no nudge turns.
-    expect(readTurns(ctx.root, taskId).some(t => t.turn_type === 'nudge')).toBe(false);
+    // No MAINTAIN nudge fired. Asserted by heading rather than by "no nudge
+    // turns at all": other wrap-up steps (the presentation) are recorded as
+    // nudge turns too, and a blanket count would fail on their presence
+    // instead of on this step's.
+    expect(readTurns(ctx.root, taskId).some(
+      t => String(t.content).includes('## Maintained Files Review'),
+    )).toBe(false);
     expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
   });
 
@@ -154,10 +187,11 @@ describe('maintained files automation', () => {
     const taskId = await createTask(ctx, 'Investigate only', 'Look around, change nothing');
 
     // No LAZY_MOCK_SHOULD_COMMIT and no files → the mock agent makes zero changes.
+    writeFileSync(finalFlag, '');
     const result = await ctx.lazyMocked(
       ['start', taskId, '--yes', '--follow'],
       MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_MOCK_MAINTAIN_RESPONSE: 'should-not-appear' } },
+      { env: { LAZY_MOCK_MAINTAIN_RESPONSE: 'should-not-appear', LAZY_MOCK_FINAL: finalFlag } },
     );
     expectSuccess(result);
     await runReconcile(ctx.root, ctx.protocolBase);
@@ -165,8 +199,10 @@ describe('maintained files automation', () => {
     // The work turn IS recorded — otherwise the nudge assertion below would pass
     // vacuously on an empty turn list.
     expect(readTurns(ctx.root, taskId).some(t => t.role === 'agent')).toBe(true);
-    // No-op turn → no nudge turns at all.
-    expect(readTurns(ctx.root, taskId).some(t => t.turn_type === 'nudge')).toBe(false);
+    // No-op turn → no maintain nudge, even though the turn declared final.
+    expect(readTurns(ctx.root, taskId).some(
+      t => String(t.content).includes('## Maintained Files Review'),
+    )).toBe(false);
   });
 
   // INVARIANT (maintain-nudge-violation-precedence): the maintain nudge fires AFTER
@@ -195,6 +231,7 @@ describe('maintained files automation', () => {
     // Agent modifies the protected file (a violation) and touches no docs. No revert
     // → the violation stands.
     const mockFiles = JSON.stringify([{ path: 'unit.spec.ts', content: 'describe("modified", () => {});\n' }]);
+    seedFinal();
     const result = await ctx.lazyMocked(
       ['start', taskId, '--yes', '--follow'],
       MOCK_CLAUDE_SUCCESS,
@@ -204,6 +241,7 @@ describe('maintained files automation', () => {
           LAZY_MOCK_FILES: mockFiles,
           LAZY_MOCK_PUSHBACK_RESPONSE: 'Intentional — keeping the spec change.',
           LAZY_MOCK_MAINTAIN_RESPONSE: 'No docs update needed.',
+          LAZY_MOCK_FINAL: finalFlag,
         },
       },
     );
@@ -244,6 +282,7 @@ describe('maintained files automation', () => {
       { path: 'unit.spec.ts', content: 'describe("modified", () => {});\n' },
       { path: 'src/feature.ts', content: 'export const f = 1;\n' },
     ]);
+    seedFinal();
     const result = await ctx.lazyMocked(
       ['start', taskId, '--yes', '--follow'],
       MOCK_CLAUDE_SUCCESS,
@@ -255,6 +294,7 @@ describe('maintained files automation', () => {
           LAZY_MOCK_PUSHBACK_REVERTS: JSON.stringify(['unit.spec.ts']),
           LAZY_MOCK_PUSHBACK_RESPONSE: 'Reverted the spec file.',
           LAZY_MOCK_MAINTAIN_RESPONSE: 'No docs update needed.',
+          LAZY_MOCK_FINAL: finalFlag,
         },
       },
     );

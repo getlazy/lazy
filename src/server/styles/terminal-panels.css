@@ -1,0 +1,143 @@
+/* The two embedded terminal panels — the interactive web shell and the
+ * read-only watch stream. They are one component behind two feature prefixes:
+ * the same vendored xterm.js, the same frame, the same status bar, the same
+ * full-width-when-open behaviour. The rules they share are grouped so the two
+ * cannot drift; only what genuinely differs is stated on its own.
+ *
+ * Watch shipped with no stylesheet at all, which is what made its panel a slim
+ * column: unstyled, its root stayed an inline flex item in `.action-links` and
+ * capped the terminal at its own button's width. Adding the panel here rather
+ * than in a second file of near-identical rules is the fix for that class of
+ * bug, not just for this instance of it.
+ *
+ * The xterm.js stylesheet (served from /assets/xterm.css) styles the terminal
+ * itself; these rules only frame it. */
+
+.lz-shell,
+.lz-watch { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-2); }
+
+/* Open, a panel claims a whole row of the action bar and stretches across it.
+ * `.action-links` is a wrapping flex row, so an inline-sized root would cap the
+ * panel at the width of its own button — the terminal must be as wide as the
+ * page's content column, which is what a full-basis row gives it. The class is
+ * toggled by each client script, so a closed panel keeps its button inline with
+ * the other actions. */
+.lz-shell.is-open,
+.lz-watch.is-open { flex: 1 1 100%; width: 100%; align-self: stretch; }
+
+.lz-shell-reason { font-size: 0.85em; }
+
+.lz-shell-panel,
+.lz-watch-panel {
+  margin-top: var(--space-2);
+  border: 1px solid var(--border, #444);
+  border-radius: var(--radius, 6px);
+  background: #000;
+  padding: var(--space-2);
+  box-sizing: border-box;
+  /* Width belongs to the content column (see .is-open above); height is the
+   * reviewer's — they drag the bottom edge and xterm's FitAddon reflows the
+   * terminal on the resize observer. Horizontal resize is deliberately off:
+   * an inline width set by a drag would override the column width for good. */
+  resize: vertical;
+  overflow: hidden;
+  min-height: 200px;
+  width: 100%;
+  max-width: 100%;
+  height: 420px;
+}
+
+/* Shell only: the panel is a column: a fixed-height tab bar, then whichever
+ * session is in front filling the rest. The terminal cannot size itself off a
+ * percentage here (the bar's height depends on its content), so the sessions
+ * area takes the remaining space as a flex child and the terminal fills that.
+ * Watch has a single stream and no tab strip, so its panel stays a plain block
+ * and its terminal subtracts the bar directly — see the term rules below. */
+.lz-shell-panel {
+  display: flex;
+  flex-direction: column;
+}
+/* Ships hidden until a session is opened into it; the author `display`
+   above beats the UA's `[hidden]`, so the attribute needs this companion or
+   it does nothing — see the note on .rv-viewopts[hidden] in diff.css. */
+.lz-shell-panel[hidden] { display: none; }
+
+.lz-shell-bar,
+.lz-watch-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+  color: var(--text, #ddd);
+  font-size: 0.85em;
+  flex: 0 0 auto;
+}
+
+/* The tab strip takes the slack in the bar so the status and buttons stay put
+ * on the right as tabs accumulate; many tabs wrap rather than push them off.
+ * Shell only — the watch stream is one read-only session with nothing to tab
+ * between. */
+.lz-shell-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1, 4px);
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.lz-shell-tab {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--border, #444);
+  border-radius: var(--radius, 6px);
+  background: var(--bg-subtle, #161616);
+}
+
+.lz-shell-tab.is-active { border-color: var(--color-accent, #58a6ff); }
+
+.lz-shell-tab-btn,
+.lz-shell-tab-close {
+  background: none;
+  border: 0;
+  color: var(--text-muted, #999);
+  font: inherit;
+  cursor: pointer;
+  padding: 2px 6px;
+}
+
+.lz-shell-tab.is-active .lz-shell-tab-btn { color: var(--text, #ddd); }
+.lz-shell-tab-close { padding-left: 0; }
+.lz-shell-tab-close:hover { color: var(--color-danger, #f85149); }
+
+.lz-shell-status,
+.lz-watch-status { color: var(--text-muted, #999); }
+.lz-shell-status.is-connected,
+.lz-watch-status.is-connected { color: var(--color-success, #3fb950); }
+
+/* One session is visible at a time; the hidden ones keep their terminals alive
+ * (and their execs connected) so switching back shows the output that arrived
+ * while the tab was in the background. Shell only, as above. */
+.lz-shell-sessions {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+}
+
+.lz-shell-session { height: 100%; width: 100%; }
+.lz-shell-session[hidden] { display: none; }
+
+/* Width is shared and comes from the content column. Height is the one thing
+ * the two panels genuinely disagree about, because their boxes differ: the
+ * shell terminal fills `.lz-shell-sessions`, already sized as a flex child, so
+ * it takes the whole of it; the watch terminal sits directly in a plain block
+ * panel and has to subtract its own status bar. Keep them apart — grouping the
+ * height would silently break whichever panel lost the argument. */
+.lz-shell-term,
+.lz-watch-term { width: 100%; }
+
+.lz-shell-term { height: 100%; }
+.lz-watch-term { height: calc(100% - 2rem); }
+
+.lz-shell .btn-sm,
+.lz-watch .btn-sm { margin: 0; }

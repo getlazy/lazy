@@ -1,4 +1,5 @@
 import { describe, test, expect } from 'bun:test';
+import { ANTHROPIC_DEFAULT_TARGET } from '../../src/utils/role-target';
 import { DEFAULT_CONFIG } from '../../src/config/loader';
 import { GitHubDriver } from '../../src/remote/github-driver';
 import type { Task } from '../../src/types';
@@ -6,21 +7,28 @@ import type { ResolvedConfig } from '../../src/config/types';
 import type { DriverDeps, GhResult } from '../../src/remote/github-driver';
 
 /**
- * Unit tests for GitHub driver's handling of 422 errors when self-approving PRs.
+ * Unit tests for `GitHubDriver.approveForMerge` — the ONE review lazy still
+ * writes to a PR, and only under `[remote] auto_approve` on a protected
+ * target, where the forge refuses the merge without an approval.
  *
- * GitHub returns HTTP 422 (Unprocessable Entity) when a PR author tries to approve
- * their own PR. This is expected behavior — lazy should log it at debug level and
- * fall back to posting a comment instead.
+ * GitHub returns HTTP 422 (Unprocessable Entity) when a PR author tries to
+ * approve their own PR. That is expected: it is logged at debug level and
+ * returns null, so nothing reaches the human — warning about the normal
+ * outcome on every accept would train the reader to ignore the warnings that
+ * matter. Only a real failure returns a warning. It is NOT followed by a
+ * comment either: lazy writes no comments to a forge, and a comment is not an
+ * approval anyway. GitLab's twin needs a credential probe to draw the same
+ * line, because there every refusal is a 401 — see gitlab-driver.test.ts.
  */
 
-describe('GitHubDriver 422 self-approval handling', () => {
+describe('GitHubDriver approveForMerge', () => {
   // Minimal config for testing
   const mockConfig: ResolvedConfig = {
     models: {
       default: 'claude-sonnet-4-5-20250929',
       roles: {
-        builder: { backend: 'anthropic', model: '', endpoint: '' },
-        agent: { backend: 'anthropic', model: '', endpoint: '' },
+        builder: ANTHROPIC_DEFAULT_TARGET,
+        agent: ANTHROPIC_DEFAULT_TARGET,
       },
     },
     session: {
@@ -34,7 +42,6 @@ describe('GitHubDriver 422 self-approval handling', () => {
     storage: {
       backend: 'external',
       external_path: '',
-      postgres_ssl: false,
     },
     git: {
       default_branch_prefix: 'lazy',
@@ -43,11 +50,13 @@ describe('GitHubDriver 422 self-approval handling', () => {
     output: {
       shortid_length: 8,
     },
+    agents: {},
     agent: {
       agent_id: 'test-agent',
       watchdog_output_timeout_ms: 0, wind_down_timeout_ms: 0,
       effort: 'medium',
     },
+    review: { mode: 'low_high', auto_fix: false, gate: 'auto', draft_effort: 'low', review_effort: 'xhigh' },
     builder: {
       effort: 'high',
     },
@@ -56,6 +65,7 @@ describe('GitHubDriver 422 self-approval handling', () => {
       port: 3000,
       sync_interval: 1000,
       bind: '127.0.0.1',
+      dashboard_url: '',
     },
     remote: {
       driver: 'github',
@@ -69,8 +79,10 @@ describe('GitHubDriver 422 self-approval handling', () => {
     },
     docker: {
       dockerfile: '',
+      build_inputs: [],
+      run_args: [],
     },
-    runner: { type: 'docker' as const, permission_mode: 'sandbox' as const, sandbox_allowed_domains: ['*.anthropic.com'], sandbox_deny_read: [], sandbox_deny_write: [], sandbox_allow_weaker_nested: false },
+    runner: { type: 'docker' as const, permission_mode: 'sandbox' as const, sandbox_allowed_domains: ['*.anthropic.com'], sandbox_deny_read: [], sandbox_deny_write: [], sandbox_allow_weaker_nested: false, verify_sandbox_boundary: 'off' as const },
     documents: {
       path: '',
     },
@@ -78,11 +90,13 @@ describe('GitHubDriver 422 self-approval handling', () => {
     worktree: { include: [] },
     permissions: { protected: [] },
     protection: { enabled: false, protected_branches: [], protected_tasks: [], gate_default_branch: true },
-  automation: { maintain: [], pre_accept: { enabled: false, commands: [], timeout: 600 } },
+  automation: { maintain: [], react: [], pre_accept: { enabled: false, commands: [], timeout: 600 }, pre_turn: '', pre_turn_timeout: 120, pre_turn_required: false, post_turn: '', post_turn_timeout: 300, accept_check: '', accept_check_timeout: 300 },
   mounts: [],
-    checks: { post_turn: '', post_turn_timeout: 300 },
-    ollama: { enabled: false, model: '', endpoint: 'http://host.docker.internal:11434' },
-    limits: { max_concurrent_agents: 8, max_concurrent_builders: 8, idle_grace_minutes: 10, max_turns_without_human: 10 },
+    serve: { services: [], start_services_cmd: '' },
+    credentials: { backend: 'auto' },
+    limits: { max_concurrent_builders: 8, max_turns_without_human: 10 },
+    cluster: { max_child_fix_rounds: 3 },
+    usage_pause: { threshold_percent: 0, credentials: {} },
     daemon: {
       auto_react_ci: true,
       auto_react_comments: true,
@@ -108,7 +122,6 @@ describe('GitHubDriver 422 self-approval handling', () => {
     prompt: '',
     type: 'task',
     status: 'blocked',
-    priority: 'normal',
     model: 'claude-sonnet-4-5-20250929',
     agent_id: 'claude-code',
     created_at: Date.now(),
@@ -123,133 +136,121 @@ describe('GitHubDriver 422 self-approval handling', () => {
     tags: [], pending_sync: 0,
   };
 
-  test('postAcceptReview suppresses 422 error (self-approval)', async () => {
-    // Mock gh CLI to return 422 error on review, success on comment
-    const mockDeps: DriverDeps = {
+  /**
+   * Every `gh` call the driver makes, so a test can assert what did NOT happen.
+   */
+  function recordingDeps(approveResult: GhResult): { deps: DriverDeps; calls: string[][] } {
+    const calls: string[][] = [];
+    const deps: DriverDeps = {
       runGh: async (args: string[]) => {
-        if (args[0] === 'api' && args.includes('event=APPROVE')) {
-          // Review request returns 422
-          return {
-            stdout: '',
-            stderr: 'gh: Unprocessable Entity (HTTP 422)',
-            exitCode: 1,
-          };
-        }
-        if (args[0] === 'pr' && args[1] === 'comment') {
-          // Comment succeeds
-          return {
-            stdout: 'Comment posted',
-            stderr: '',
-            exitCode: 0,
-          };
-        }
+        calls.push(args);
+        if (args[0] === 'api' && args.includes('event=APPROVE')) return approveResult;
         return { stdout: '', stderr: 'unexpected call', exitCode: 1 };
       },
       runGit: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
     };
+    return { deps, calls };
+  }
 
-    const driver = new GitHubDriver(mockConfig, mockDeps);
-    const warning = await driver.postAcceptReview(mockTask, 'LGTM');
+  test('approveForMerge returns null when the approval lands', async () => {
+    const { deps, calls } = recordingDeps({ stdout: '{}', stderr: '', exitCode: 0 });
+    const driver = new GitHubDriver(mockConfig, deps);
 
-    // Should not return a warning (comment fallback succeeded)
-    expect(warning).toBeNull();
+    expect(await driver.approveForMerge(mockTask, 'LGTM')).toBeNull();
+    expect(calls.length).toBe(1);
   });
 
-  test('postAcceptReview does not suppress non-422 errors', async () => {
-    // Mock gh CLI to return auth error on review, success on comment
-    const mockDeps: DriverDeps = {
-      runGh: async (args: string[]) => {
-        if (args[0] === 'api' && args.includes('event=APPROVE')) {
-          // Review request returns auth error (not 422)
-          return {
-            stdout: '',
-            stderr: 'gh: HTTP 403: Forbidden',
-            exitCode: 1,
-          };
-        }
-        if (args[0] === 'pr' && args[1] === 'comment') {
-          // Comment succeeds
-          return {
-            stdout: 'Comment posted',
-            stderr: '',
-            exitCode: 0,
-          };
-        }
-        return { stdout: '', stderr: 'unexpected call', exitCode: 1 };
-      },
-      runGit: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
-    };
+  // INVARIANT: the review body is passed with `--raw-field`, NEVER the typed
+  // `--field`. `gh` reads a `--field` value beginning with `@` as a FILE to
+  // read and send. The body here is the accept reason a human or the builder
+  // typed, so with `[remote] auto_approve` on, an accept reason of
+  // `@~/.claude/.credentials.json` would publish that file into a PR review.
+  // Asserted on argv because that is where the difference lives — no amount
+  // of escaping downstream can undo the wrong flag.
+  test('the approve body is sent literally, never as a typed field', async () => {
+    const { deps, calls } = recordingDeps({ stdout: '{}', stderr: '', exitCode: 0 });
+    const driver = new GitHubDriver(mockConfig, deps);
 
-    const driver = new GitHubDriver(mockConfig, mockDeps);
-    const warning = await driver.postAcceptReview(mockTask, 'LGTM');
+    await driver.approveForMerge(mockTask, '@/home/user/.claude/.credentials.json');
 
-    // Should not return a warning (comment fallback succeeded)
-    // Note: The 403 error is still logged at warn level, but since the comment
-    // succeeded, no warning is returned to the caller
-    expect(warning).toBeNull();
+    const argv = calls[0]!;
+    // The body rides --raw-field with its value literally as typed…
+    const rawIdx = argv.indexOf('--raw-field');
+    expect(rawIdx).toBeGreaterThanOrEqual(0);
+    expect(argv[rawIdx + 1]).toBe('body=@/home/user/.claude/.credentials.json');
+    // …and no `--field` anywhere carries a body=, which is the file-read flag.
+    const typedBody = argv.some(
+      (arg, i) => arg === '--field' && String(argv[i + 1] ?? '').startsWith('body='),
+    );
+    expect(typedBody).toBe(false);
   });
 
-  test('postRejectReview suppresses 422 error (self-review)', async () => {
-    // Mock gh CLI to return 422 error on review, success on comment
-    const mockDeps: DriverDeps = {
-      runGh: async (args: string[]) => {
-        if (args[0] === 'api' && args.includes('event=REQUEST_CHANGES')) {
-          // Review request returns 422
-          return {
-            stdout: '',
-            stderr: 'gh: Unprocessable Entity (HTTP 422)',
-            exitCode: 1,
-          };
-        }
-        if (args[0] === 'pr' && args[1] === 'comment') {
-          // Comment succeeds
-          return {
-            stdout: 'Comment posted',
-            stderr: '',
-            exitCode: 0,
-          };
-        }
-        return { stdout: '', stderr: 'unexpected call', exitCode: 1 };
-      },
-      runGit: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
-    };
+  // INVARIANT: a 422 self-approval is SILENT — debug log, null return. It is
+  // the normal outcome for the sole developer `[remote] auto_approve` is
+  // documented for (they opened the PR, so GitHub will not let them approve
+  // it), and returning a warning surfaces "Auto-approve warning: …422" on
+  // every accept they run. It was quiet before this task too, swallowed by
+  // the comment fallback that has since been removed.
+  test('a 422 self-approval is quiet: no warning, and no comment', async () => {
+    const { deps, calls } = recordingDeps({
+      stdout: '',
+      stderr: 'gh: Unprocessable Entity (HTTP 422)',
+      exitCode: 1,
+    });
+    const driver = new GitHubDriver(mockConfig, deps);
 
-    const driver = new GitHubDriver(mockConfig, mockDeps);
-    const warning = await driver.postRejectReview(mockTask, 'Needs changes');
-
-    // Should not return a warning (comment fallback succeeded)
-    expect(warning).toBeNull();
+    expect(await driver.approveForMerge(mockTask, 'LGTM')).toBeNull();
+    expect(calls.some((args) => args[0] === 'pr' && args[1] === 'comment')).toBe(false);
   });
 
-  test('postAcceptReview handles 422 with "Unprocessable Entity" text', async () => {
-    // Mock gh CLI to return 422 error with different message format
-    const mockDeps: DriverDeps = {
-      runGh: async (args: string[]) => {
-        if (args[0] === 'api' && args.includes('event=APPROVE')) {
-          // Review request returns 422 with different error text
-          return {
-            stdout: '',
-            stderr: 'error: Unprocessable Entity',
-            exitCode: 1,
-          };
-        }
-        if (args[0] === 'pr' && args[1] === 'comment') {
-          // Comment succeeds
-          return {
-            stdout: 'Comment posted',
-            stderr: '',
-            exitCode: 0,
-          };
-        }
-        return { stdout: '', stderr: 'unexpected call', exitCode: 1 };
-      },
-      runGit: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
-    };
+  test('a bare "422" in stderr is recognised as the same expected refusal', async () => {
+    const { deps } = recordingDeps({
+      stdout: '',
+      stderr: 'gh: HTTP 422',
+      exitCode: 1,
+    });
+    const driver = new GitHubDriver(mockConfig, deps);
 
-    const driver = new GitHubDriver(mockConfig, mockDeps);
-    const warning = await driver.postAcceptReview(mockTask, 'LGTM');
+    expect(await driver.approveForMerge(mockTask, 'LGTM')).toBeNull();
+  });
 
-    // Should not return a warning (422 is suppressed, comment succeeded)
-    expect(warning).toBeNull();
+  // INVARIANT: a failed approval reports itself and posts NOTHING. The old
+  // code fell back to a `[Lazy Accept]` PR comment, which notified every
+  // watcher and was not an approval anyway, so it never unblocked the merge.
+  // Lazy writes no comments to a forge (engineer decision, 2026-09-21).
+  test('a non-422 approval failure returns a warning and posts no comment', async () => {
+    const { deps, calls } = recordingDeps({
+      stdout: '',
+      stderr: 'gh: HTTP 403: Forbidden',
+      exitCode: 1,
+    });
+    const driver = new GitHubDriver(mockConfig, deps);
+
+    const warning = await driver.approveForMerge(mockTask, 'LGTM');
+    expect(warning).toContain('Could not approve PR #123');
+    expect(calls.some((args) => args[0] === 'pr' && args[1] === 'comment')).toBe(false);
+  });
+
+  test('approveForMerge on a task with no PR is a silent no-op', async () => {
+    const { deps, calls } = recordingDeps({ stdout: '{}', stderr: '', exitCode: 0 });
+    const driver = new GitHubDriver(mockConfig, deps);
+
+    expect(await driver.approveForMerge({ ...mockTask, metadata: null }, 'LGTM')).toBeNull();
+    expect(calls).toEqual([]);
+  });
+
+  // INVARIANT: lazy writes no reviews or comments to a forge, so the driver
+  // has no method that could (engineer decision, 2026-09-21). Typecheck does
+  // NOT catch this: an EXTRA method on a class still satisfies the interface,
+  // so a well-meaning reinstatement would compile clean. The sibling checks
+  // live in test/e2e/remote-driver.test.ts (LocalDriver) and
+  // test/unit/gitlab-driver.test.ts (GitLabDriver).
+  test('postReviewReport / postAcceptReview / postRejectReview are gone', () => {
+    const { deps } = recordingDeps({ stdout: '{}', stderr: '', exitCode: 0 });
+    const driver = new GitHubDriver(mockConfig, deps) as unknown as Record<string, unknown>;
+
+    expect(driver.postReviewReport).toBeUndefined();
+    expect(driver.postAcceptReview).toBeUndefined();
+    expect(driver.postRejectReview).toBeUndefined();
   });
 });

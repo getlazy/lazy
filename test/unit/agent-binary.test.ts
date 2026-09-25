@@ -1,9 +1,10 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { join } from 'path';
-import { mkdirSync, rmSync, existsSync, writeFileSync, readdirSync, statSync } from 'fs';
+import { basename, join } from 'path';
+import { mkdirSync, rmSync, existsSync, writeFileSync, readdirSync, statSync, lstatSync, realpathSync } from 'fs';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
 import { extractEmbeddedAgentBinary } from '../../src/capture/claude';
+import { agentBinaryContentId, versionedAgentBinaryPath } from '../../src/agent/binary-install';
 import { AGENT_SELFCHECK_SENTINEL } from '../../src/agent/binary-identity';
 
 /**
@@ -161,30 +162,59 @@ describe('extractEmbeddedAgentBinary staleness detection', () => {
     if (existsSync(testDir)) rmSync(testDir, { recursive: true, force: true });
   });
 
-  test('extracts when nothing is there yet', async () => {
-    writeFileSync(embeddedPath, pad('BUILD-A'));
-    const out = await extractEmbeddedAgentBinary(destDir, embeddedPath);
-    expect(out).toBe(join(destDir, 'lazy-agent'));
-    expect(await Bun.file(out!).text()).toBe(pad('BUILD-A'));
-    expect(statSync(out!).mode & 0o111).toBeGreaterThan(0);
-  });
-
-  // THE regression: same size, different bytes. A size-only check keeps the
-  // stale binary here and ships old agent code into every container.
-  test('re-extracts a stale binary of identical size', async () => {
+  // INVARIANT: the path handed back — and therefore the path every container
+  // bind-mounts — is a content-addressed install, never ~/.lazy/bin/lazy-agent.
+  // A Docker Desktop file bind mount re-resolves the HOST PATH on every access
+  // (verified 2026-09-01, see src/agent/binary-install.ts), so mounting a name
+  // that a later writer replaces is what produced three "bare Bun runtime"
+  // builder deaths.
+  test('extracts to a content-addressed path, not the pointer name', async () => {
     writeFileSync(embeddedPath, pad('BUILD-A'));
     const out = (await extractEmbeddedAgentBinary(destDir, embeddedPath))!;
+
+    expect(out).not.toBe(join(destDir, 'lazy-agent'));
+    expect(basename(out).startsWith('lazy-agent-')).toBe(true);
+    expect(out).toBe(versionedAgentBinaryPath(destDir, agentBinaryContentId(Buffer.from(pad('BUILD-A')))));
     expect(await Bun.file(out).text()).toBe(pad('BUILD-A'));
-
-    // A new lazy build: same length to the byte, different content.
-    writeFileSync(embeddedPath, pad('BUILD-B'));
-    expect(Bun.file(embeddedPath).size).toBe(4096);
-
-    await extractEmbeddedAgentBinary(destDir, embeddedPath);
-    expect(await Bun.file(out).text()).toBe(pad('BUILD-B'));
+    expect(statSync(out).mode & 0o111).toBeGreaterThan(0);
   });
 
-  test('leaves a byte-identical binary untouched', async () => {
+  // The pointer exists for humans and `lazy doctor`; it is never a mount source.
+  // It also lives under a name that was never one: writing over the legacy
+  // `lazy-agent` path would swap the binary of every container created before
+  // this layout, which is the failure being fixed.
+  test('writes the pointer as a symlink, and never at the legacy path', async () => {
+    writeFileSync(embeddedPath, pad('BUILD-A'));
+    const out = (await extractEmbeddedAgentBinary(destDir, embeddedPath))!;
+
+    const pointer = join(destDir, 'lazy-agent-current');
+    expect(lstatSync(pointer).isSymbolicLink()).toBe(true);
+    expect(realpathSync(pointer)).toBe(realpathSync(out));
+    expect(existsSync(join(destDir, 'lazy-agent'))).toBe(false);
+  });
+
+  // THE original regression, now expressed structurally: two builds of the same
+  // SIZE but different bytes must not share an install path at all. A size-only
+  // check used to keep the stale binary and ship old agent code into containers.
+  test('a different build of identical size installs alongside, not over', async () => {
+    writeFileSync(embeddedPath, pad('BUILD-A'));
+    const a = (await extractEmbeddedAgentBinary(destDir, embeddedPath))!;
+
+    writeFileSync(embeddedPath, pad('BUILD-B'));
+    expect(Bun.file(embeddedPath).size).toBe(4096);
+    const b = (await extractEmbeddedAgentBinary(destDir, embeddedPath))!;
+
+    expect(b).not.toBe(a);
+    // The older install is untouched — a container mounting it keeps working.
+    expect(await Bun.file(a).text()).toBe(pad('BUILD-A'));
+    expect(await Bun.file(b).text()).toBe(pad('BUILD-B'));
+  });
+
+  // INVARIANT: an install that exists and verifies is never rewritten. An older
+  // `lazy` process re-extracts its own embedded agent on every container launch;
+  // under the single-path layout that wrote ~100MB over the freshly upgraded
+  // binary and silently downgraded it.
+  test('leaves an existing verified install untouched', async () => {
     writeFileSync(embeddedPath, pad('BUILD-A'));
     const out = (await extractEmbeddedAgentBinary(destDir, embeddedPath))!;
     const before = statSync(out);
@@ -194,22 +224,6 @@ describe('extractEmbeddedAgentBinary staleness detection', () => {
     // Same inode AND same mtime — nothing was rewritten.
     expect(statSync(out).ino).toBe(before.ino);
     expect(statSync(out).mtimeMs).toBe(before.mtimeMs);
-  });
-
-  // INVARIANT: re-extraction must not rewrite the destination inode in place.
-  // Running containers bind-mount that exact file at /usr/local/bin/lazy-agent;
-  // truncating and rewriting it mutates a live builder's agent binary
-  // mid-session. rename() gives them the old inode and new launches the new one.
-  test('re-extraction replaces the file atomically, not in place', async () => {
-    writeFileSync(embeddedPath, pad('BUILD-A'));
-    const out = (await extractEmbeddedAgentBinary(destDir, embeddedPath))!;
-    const oldIno = statSync(out).ino;
-
-    writeFileSync(embeddedPath, pad('BUILD-B'));
-    await extractEmbeddedAgentBinary(destDir, embeddedPath);
-
-    expect(statSync(out).ino).not.toBe(oldIno);
-    // And no temp file is left behind.
     expect(readdirSync(destDir).filter(f => f.startsWith('.tmp-'))).toEqual([]);
   });
 

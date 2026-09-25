@@ -2,6 +2,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectOutputExcludes, expectError } from '../helpers/assertions';
 import { createTask, disablePreAccept, startAndReconcile } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 
 describe('lazy list', () => {
   let ctx: TestContext;
@@ -131,6 +132,8 @@ describe('lazy list', () => {
     // Create and start a task with commit (needed for accept to work)
     const taskId = await createTask(ctx, 'Task to accept', 'Do work');
     await startAndReconcile(ctx, taskId);
+    // Fixture setup, not the subject (see test/helpers/final.ts).
+    seedFinal(ctx, taskId);
 
     // Verify it appears in active
     let result = await ctx.lazy(['active']);
@@ -200,6 +203,8 @@ describe('lazy list', () => {
   test('blocked does not show accepted task', async () => {
     const taskId = await createTask(ctx, 'Task for blocked accept test', 'Do work');
     await startAndReconcile(ctx, taskId);
+    // Fixture setup, not the subject (see test/helpers/final.ts).
+    seedFinal(ctx, taskId);
 
     // Verify it appears in blocked
     let result = await ctx.lazy(['blocked']);
@@ -308,6 +313,8 @@ describe('lazy list', () => {
   test('list does not show accepted task by default', async () => {
     const taskId = await createTask(ctx, 'Task for list accept test', 'Do work');
     await startAndReconcile(ctx, taskId);
+    // Fixture setup, not the subject (see test/helpers/final.ts).
+    seedFinal(ctx, taskId);
 
     // Verify it appears in list
     let result = await ctx.lazy(['list']);
@@ -385,6 +392,8 @@ describe('lazy list', () => {
 
     // Start and accept the child task
     await startAndReconcile(ctx, 'child-all');
+    // Fixture setup, not the subject (see test/helpers/final.ts).
+    seedFinal(ctx, 'child-all');
     await ctx.lazy(['accept', 'child-all']);
 
     // Without --all, accepted child should not appear even when filtering by parent
@@ -417,6 +426,38 @@ describe('lazy list', () => {
     expectOutput(result, 'Parent');
     expectOutput(result, 'Child');
     expectOutputExcludes(result, 'Unrelated');
+  });
+
+  test('tree view shows AGENT column and omits token totals', async () => {
+    expectSuccess(await ctx.lazy(['create', '--goal', 'Claude task', '--code', 'claude-task']));
+    expectSuccess(await ctx.lazy(['create', '--goal', 'Cursor task', '--code', 'cursor-task', '--agent', 'cursor']));
+
+    const list = await ctx.lazy(['list']);
+    expectSuccess(list);
+    expectOutput(list, 'AGENT');
+    expectOutput(list, 'claude-code');
+    expectOutput(list, 'cursor');
+    expectOutputExcludes(list, 'TOKENS IN/OUT');
+
+    const flat = await ctx.lazy(['list', '--flat']);
+    expectSuccess(flat);
+    expectOutput(flat, 'AGENT');
+    expectOutput(flat, 'claude-code');
+    expectOutput(flat, 'cursor');
+    expectOutputExcludes(flat, 'TOKENS IN/OUT');
+
+    const taskId = await createTask(ctx, 'Started for listings', 'Do work');
+    await startAndReconcile(ctx, taskId);
+
+    const active = await ctx.lazy(['active']);
+    expectSuccess(active);
+    expectOutput(active, 'AGENT');
+    expectOutputExcludes(active, 'TOKENS IN/OUT');
+
+    const blocked = await ctx.lazy(['blocked']);
+    expectSuccess(blocked);
+    expectOutput(blocked, 'AGENT');
+    expectOutputExcludes(blocked, 'TOKENS IN/OUT');
   });
 });
 

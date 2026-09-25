@@ -4,7 +4,7 @@
  * INVARIANT: a diagnostic must never hang on the thing it diagnoses.
  *
  * A daemon whose event loop is frozen still has a live kernel listener on its
- * unix socket, so connect(2) succeeds and the request is queued to a process
+ * TCP port, so connect(2) succeeds and the request is queued to a process
  * that will never read it. Both of these calls used to fetch with no
  * AbortSignal, so `lazy daemon status` (and `lazy daemon stop`) hung forever
  * against exactly the daemon they were run to investigate — an hour of blind
@@ -15,9 +15,11 @@
  * "nothing is there" needs a start. checkDaemonHealth therefore distinguishes
  * three states, and these tests pin all three.
  *
- * The stalling daemon is simulated with a real unix listener that accepts the
+ * The stalling daemon is simulated with a real TCP listener that accepts the
  * connection and then never writes a byte — the same thing the kernel does for
- * a frozen daemon.
+ * a frozen daemon. The port/host markers are what checkDaemonHealth discovers
+ * the daemon through (the TCP port is its only transport — drop-unix-socket),
+ * so the fake listener is pointed at by writing those markers.
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
@@ -27,7 +29,7 @@ import {
   requestShutdown,
   DAEMON_HEALTH_TIMEOUT_MS,
 } from '../../src/daemon';
-import { getSocketPath, getTokenPath, getPidPath, getDaemonDir } from '../../src/daemon/paths';
+import { getWebPortPath, getWebHostPath, getTokenPath, getPidPath, getDaemonDir } from '../../src/daemon/paths';
 import {
   makeDaemonBaseDir,
   pinDaemonBaseDir,
@@ -46,7 +48,7 @@ describe('checkDaemonHealth timeout', () => {
   const root = '/tmp/lazy-health-timeout-project';
   let baseDir: string;
   let unpin: () => void;
-  let listener: { stop: (closeActiveConnections?: boolean) => void } | null = null;
+  let listener: { port: number; stop: (closeActiveConnections?: boolean) => void } | null = null;
 
   const writeStateFiles = async (pid: number) => {
     await mkdir(getDaemonDir(root), { recursive: true });
@@ -54,18 +56,26 @@ describe('checkDaemonHealth timeout', () => {
     await writeFile(getPidPath(root), String(pid));
   };
 
+  /** Point discovery at a port on loopback, the way a bound daemon would. */
+  const writePortMarker = async (port: number) => {
+    await writeFile(getWebPortPath(root), String(port));
+    await writeFile(getWebHostPath(root), '127.0.0.1');
+  };
+
   /**
-   * Bind a unix listener that accepts and then stalls — a frozen daemon from the
+   * Bind a TCP listener that accepts and then stalls — a frozen daemon from the
    * client's point of view. No `data` handling, no reply, ever.
    */
-  const startStallingListener = () => {
+  const startStallingListener = async () => {
     listener = Bun.listen({
-      unix: getSocketPath(root),
+      hostname: '127.0.0.1',
+      port: 0, // OS-assigned: never collides with another suite's daemon
       socket: {
         data() { /* Deliberately silent: this is the freeze being simulated. */ },
         open() { /* Accept and stall. */ },
       },
-    }) as unknown as { stop: (closeActiveConnections?: boolean) => void };
+    }) as unknown as { port: number; stop: (closeActiveConnections?: boolean) => void };
+    await writePortMarker(listener.port);
   };
 
   beforeEach(async () => {
@@ -80,13 +90,14 @@ describe('checkDaemonHealth timeout', () => {
     listener = null;
     unpin();
     await removeDaemonBaseDir(baseDir);
-    await rm(getSocketPath(root), { force: true }).catch(() => {});
+    await rm(getWebPortPath(root), { force: true }).catch(() => {});
+    await rm(getWebHostPath(root), { force: true }).catch(() => {});
   });
 
   // THE regression test. Before the fix this call never returned.
   test('a listener that accepts but never replies yields "alive but unresponsive"', async () => {
     await writeStateFiles(process.pid); // this process is alive
-    startStallingListener();
+    await startStallingListener();
 
     const start = Date.now();
     const status = await checkDaemonHealth(root);
@@ -103,9 +114,9 @@ describe('checkDaemonHealth timeout', () => {
 
   // The "unresponsive" verdict claims a live process. Without a live pid there
   // is nothing to kill, so it must fall back to plain "not running".
-  test('a stalling socket with a DEAD pid is plain not-running, not unresponsive', async () => {
+  test('a stalling port with a DEAD pid is plain not-running, not unresponsive', async () => {
     await writeStateFiles(DEAD_PID);
-    startStallingListener();
+    await startStallingListener();
 
     const status = await checkDaemonHealth(root);
 
@@ -113,12 +124,15 @@ describe('checkDaemonHealth timeout', () => {
     expect(status.unresponsive).toBeFalsy();
   }, TEST_TIMEOUT_MS);
 
-  // State (b): the socket FILE exists but nothing is listening on it, so the
-  // connection is refused. That is "not running" and must be reported fast —
+  // State (b): the port MARKER exists but nothing is listening on that port, so
+  // the connection is refused. That is "not running" and must be reported fast —
   // never as a freeze.
-  test('a socket file with nothing listening is not-running, and fast', async () => {
+  test('a port marker with nothing listening is not-running, and fast', async () => {
     await writeStateFiles(process.pid);
-    await writeFile(getSocketPath(root), ''); // a plain file, not a live socket
+    // Bind and immediately release, so the recorded port is one nothing holds.
+    await startStallingListener();
+    listener!.stop(true);
+    listener = null;
 
     const start = Date.now();
     const status = await checkDaemonHealth(root);
@@ -128,7 +142,7 @@ describe('checkDaemonHealth timeout', () => {
     expect(Date.now() - start).toBeLessThan(DAEMON_HEALTH_TIMEOUT_MS);
   }, TEST_TIMEOUT_MS);
 
-  test('no socket file at all is not-running, not unresponsive', async () => {
+  test('no port marker at all is not-running, not unresponsive', async () => {
     await writeStateFiles(process.pid);
 
     const status = await checkDaemonHealth(root);
@@ -141,7 +155,7 @@ describe('checkDaemonHealth timeout', () => {
   // its SIGTERM path instead of hanging on a daemon that cannot answer.
   test('requestShutdown returns false within the timeout instead of hanging', async () => {
     await writeStateFiles(process.pid);
-    startStallingListener();
+    await startStallingListener();
 
     const start = Date.now();
     const accepted = await requestShutdown(root);

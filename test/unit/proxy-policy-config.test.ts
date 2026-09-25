@@ -32,7 +32,7 @@ describe('[proxy.policy] resolution', () => {
   // to opt-in needs human approval.
   test('no [proxy] section → proxy resolves with defaults (on by default)', async () => {
     await writeFile(join(dir, 'lazy.toml'), `[models]\ndefault = "claude-opus-4-8"\n`);
-    const config = await loadConfig(dir, { cwd: dir });
+    const config = await loadConfig(dir);
     expect(config.proxy).not.toBeNull();
     expect(config.proxy?.upstream).toBe('https://api.anthropic.com');
     expect(config.proxy?.port).toBe(0);            // OS-assigned
@@ -47,7 +47,7 @@ describe('[proxy.policy] resolution', () => {
   // and loads; see proxy-config.test.ts.)
   test('[proxy] enabled = false is rejected at load, never resolved to a null proxy', async () => {
     await writeFile(join(dir, 'lazy.toml'), `[proxy]\nenabled = false\n`);
-    await expect(loadConfig(dir, { cwd: dir })).rejects.toThrow(/has been removed/);
+    await expect(loadConfig(dir)).rejects.toThrow(/has been removed/);
   });
 
   // INVARIANT: when no [proxy.policy] is given, the
@@ -56,7 +56,7 @@ describe('[proxy.policy] resolution', () => {
   // why this must not be weakened without human approval.
   test('[proxy] with no policy → closed default posture (enforce on, connectors deny-by-default)', async () => {
     await writeFile(join(dir, 'lazy.toml'), `[proxy]\nport = 8766\n`);
-    const config = await loadConfig(dir, { cwd: dir });
+    const config = await loadConfig(dir);
     expect(config.proxy).not.toBeNull();
     expect(config.proxy!.policy).toEqual({
       enforce: true,
@@ -82,7 +82,7 @@ describe('[proxy.policy] resolution', () => {
         ``,
       ].join('\n'),
     );
-    const config = await loadConfig(dir, { cwd: dir });
+    const config = await loadConfig(dir);
     expect(config.proxy!.policy).toEqual({
       enforce: true,
       connectorAllowlist: ['mcp__claude_ai_gmail_search_threads'],
@@ -97,7 +97,7 @@ describe('[proxy.policy] resolution', () => {
       join(dir, 'lazy.toml'),
       `[proxy]\nport = 8766\n[proxy.policy]\negress_allowlist = []\n`,
     );
-    const config = await loadConfig(dir, { cwd: dir });
+    const config = await loadConfig(dir);
     expect(config.proxy!.policy.egressAllowlist).toBeNull();
   });
 
@@ -106,7 +106,7 @@ describe('[proxy.policy] resolution', () => {
       join(dir, 'lazy.toml'),
       `[proxy]\nport = 8766\n[proxy.policy]\nenforce = false\n`,
     );
-    const config = await loadConfig(dir, { cwd: dir });
+    const config = await loadConfig(dir);
     expect(config.proxy!.policy.enforce).toBe(false);
   });
 });

@@ -16,11 +16,21 @@
  */
 import { readFileSync } from 'fs';
 import { join } from 'path';
-import { execSync } from 'child_process';
+import { spawnSyncUnsupervised } from '../src/utils/spawn';
 
-function git(args: string, cwd: string): string | null {
+/** Git probes during version computation should finish quickly or fall back. */
+const GIT_PROBE_TIMEOUT_MS = 5_000;
+
+function git(args: string[], cwd: string): string | null {
   try {
-    return execSync(`git ${args}`, { cwd, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    const proc = spawnSyncUnsupervised(['git', ...args], {
+      cwd,
+      stdout: 'pipe',
+      stderr: 'pipe',
+      timeout: GIT_PROBE_TIMEOUT_MS,
+    });
+    if (proc.exitCode !== 0) return null;
+    return proc.stdout.toString().trim();
   } catch {
     // Git not available, or not a git repo.
     return null;
@@ -39,7 +49,7 @@ export function detectBranch(root: string): string | null {
   const fromCI = process.env.GITHUB_REF_NAME?.trim();
   if (fromCI) return fromCI;
 
-  const branch = git('rev-parse --abbrev-ref HEAD', root);
+  const branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], root);
   if (!branch || branch === 'HEAD') return null;
   return branch;
 }
@@ -58,7 +68,7 @@ export function detectBranch(root: string): string | null {
 export function computeVersion(root: string): string {
   const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf-8'));
 
-  const commitCount = git('rev-list --count HEAD', root);
+  const commitCount = git(['rev-list', '--count', 'HEAD'], root);
   if (!commitCount || !/^\d+$/.test(commitCount)) {
     return pkg.version;
   }

@@ -33,8 +33,9 @@ import { proxyBaseUrlForRunner } from '../utils/role-target';
 /** Path prefix that marks a request as cursor-bound. */
 export const CURSOR_PROXY_PREFIX = '/_lazy/cursor';
 
-/** Cursor's production API origin — the default upstream for this route. */
-export const DEFAULT_CURSOR_UPSTREAM = 'https://api2.cursor.sh';
+// Re-exported from its leaf-module home so existing importers keep working;
+// see src/proxy/upstream-defaults.ts for why it cannot live here.
+export { DEFAULT_CURSOR_UPSTREAM } from './upstream-defaults';
 
 /**
  * Segment placeholder for "this launch has no minted grant".
@@ -161,9 +162,15 @@ export function cursorProxyEnvVars(
  *
  * Returns [] for every non-cursor agent — Anthropic traffic is routed by the
  * role-target machinery, not by this.
+ *
+ * Keyed on the HARNESS, not on the task's `agent` — that names a PROFILE
+ * (`[agents.<name>]`), and a project with `[agents.work-cursor] harness =
+ * "cursor"` would fail this comparison, get no `CURSOR_API_ENDPOINT`, and dial
+ * Cursor's servers straight past the audit proxy. The caller resolves the
+ * profile (src/capture/claude.ts) and passes what it runs.
  */
 export function cursorLaunchEnvVars(opts: {
-  agentId: string | undefined;
+  harness: string | undefined;
   runnerType: RunnerType;
   /** Live proxy port, or undefined when the daemon context has no proxy. */
   proxyPort: number | undefined;
@@ -176,7 +183,7 @@ export function cursorLaunchEnvVars(opts: {
    */
   token: string | null;
 }): Array<{ key: string; value: string }> {
-  if (opts.agentId !== 'cursor') return [];
+  if (opts.harness !== 'cursor') return [];
   const proxyBaseUrl = opts.proxyPort
     ? proxyBaseUrlForRunner(opts.runnerType, opts.proxyPort, opts.bind)
     : undefined;

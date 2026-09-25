@@ -3,8 +3,8 @@
  *
  * THE HOLE THIS CLOSES: the proxy used to forward `url.pathname + url.search`
  * verbatim to whichever upstream it resolved. That is fine when the upstream is
- * api.anthropic.com — its whole surface is the model API — but a role upstream
- * (src/proxy/role-upstreams.ts) can be a local ollama server, whose surface also
+ * api.anthropic.com — its whole surface is the model API — but a profile
+ * upstream (src/proxy/agent-upstreams.ts) can be a local ollama server, whose surface also
  * includes `/api/pull`, `/api/delete`, `/api/create` and `/api/ps`. A task agent
  * holds a placeholder whose grant routes to that upstream, so "the proxy decides
  * WHERE traffic goes" was not enough: it also has to decide WHAT goes there.
@@ -34,9 +34,12 @@
  * list being default-deny rather than from a special case — there is no encoding
  * table here to keep in sync with anyone's.
  *
- * TWO TIERS. The Anthropic-shaped primary gets the documented model API; a role
- * upstream gets inference and nothing else. An ollama endpoint has no legitimate
- * non-inference traffic from an agent, so its list is strictly the smaller one.
+ * THREE TIERS. The Anthropic-shaped primary gets the documented model API; an
+ * Anthropic-wire role upstream gets inference and nothing else (an ollama
+ * endpoint has no legitimate non-inference traffic from an agent, so its list
+ * is strictly the smaller one); an OpenAI-compatible profile upstream gets the
+ * OpenAI inference surface (`/v1/chat/completions`, `/v1/responses`, model
+ * discovery) and never the Anthropic paths — nor anything account-shaped.
  *
  * NOT COVERED: the cursor passthrough route (`/_lazy/cursor/...`). That route is
  * opaque by design — cursor-agent speaks connect-rpc over a path space lazy has
@@ -49,12 +52,20 @@
  * self-hosted or user-supplied cursor-compatible endpoint.
  */
 
-/** Which upstream a request is bound for — the two tiers get different lists. */
+/** Which upstream a request is bound for — each tier gets its own list. */
 export type UpstreamTier =
   /** The configured Anthropic-native primary (or one of its failover targets). */
   | 'primary'
-  /** A per-role upstream: a non-Anthropic backend, e.g. a local ollama server. */
-  | 'role';
+  /**
+   * A per-PROFILE Anthropic-wire upstream: e.g. a local ollama server, or
+   * OpenRouter's Messages endpoint. The identifier still reads `role` because
+   * these upstreams were role-wide before `[agents.<name>]` profiles; the tier
+   * is the same set of paths either way, so renaming it would churn every
+   * allowlist entry and its tests for nothing.
+   */
+  | 'role'
+  /** A per-profile OpenAI-compatible upstream (api.openai.com, openrouter.ai). OpenAI wire only. */
+  | 'openai';
 
 interface AllowedRoute {
   /** HTTP methods permitted on this path. Anything else is refused. */
@@ -63,14 +74,20 @@ interface AllowedRoute {
   path: string;
   /** When true, sub-paths of `path` match too (`/v1/models/<id>`). */
   prefix?: boolean;
-  /** Allowed on a role upstream as well as the primary. */
-  onRoleUpstream: boolean;
+  /** Tiers this route is forwarded on. A tier not listed refuses the path. */
+  tiers: readonly UpstreamTier[];
 }
 
 /**
  * The forwarding surface. Every entry is here because lazy has SEEN it, or
  * because it is a documented read-only part of the same model API — never
  * because it seemed harmless.
+ *
+ * The `openai` tier is DISJOINT from the Anthropic tiers on the inference
+ * paths, deliberately: the Anthropic extractor must never see OpenAI-wire
+ * traffic and vice versa, and an Anthropic-wire client misconfigured against an
+ * OpenAI upstream (or the reverse) should fail with lazy's actionable 403, not
+ * an upstream 404 that reads as an outage.
  */
 export const PROXY_ALLOWED_ROUTES: readonly AllowedRoute[] = [
   {
@@ -78,38 +95,84 @@ export const PROXY_ALLOWED_ROUTES: readonly AllowedRoute[] = [
     // requests in this project's own audit log are this path.
     methods: ['POST'],
     path: '/v1/messages',
-    onRoleUpstream: true,
+    tiers: ['primary', 'role'],
   },
   {
     // Claude Code counts tokens before large turns. Inference-shaped and
     // read-only, so it is allowed on a role upstream too — ollama answers it
-    // with a 404, and turning that into a lazy 403 would trade a truthful
-    // upstream answer for a misleading one while protecting nothing.
+    // with a 404 (and so does OpenRouter's Anthropic-compatible endpoint,
+    // verified 2026-09-02), and turning that into a lazy 403 would trade a
+    // truthful upstream answer for a misleading one while protecting nothing.
     methods: ['POST'],
     path: '/v1/messages/count_tokens',
-    onRoleUpstream: true,
+    tiers: ['primary', 'role'],
   },
   {
     // Claude Code's unauthenticated reachability probe against
-    // ANTHROPIC_BASE_URL. Allowed on both tiers: refusing it would report the
-    // endpoint as DOWN to the agent, which is the one failure mode the proxy's
-    // "never 401 an unauthenticated probe" rule already exists to avoid
-    // (src/proxy/server.ts header comment). HEAD is what the CLI sends; GET is
-    // included because a probe that changes verb must not read as an outage.
+    // ANTHROPIC_BASE_URL. Refusing it would report the endpoint as DOWN to the
+    // agent, which is the one failure mode the proxy's "never 401 an
+    // unauthenticated probe" rule already exists to avoid (src/proxy/server.ts
+    // header comment). HEAD is what the CLI sends; GET is included because a
+    // probe that changes verb must not read as an outage. On the openai tier
+    // too: a probe is harmless everywhere and only ever read-only.
     methods: ['HEAD', 'GET'],
     path: '/api/hello',
-    onRoleUpstream: true,
+    tiers: ['primary', 'role', 'openai'],
   },
   {
-    // Read-only model discovery on the documented Anthropic API. Not observed in
-    // lazy's own traffic, but it is what an SDK calls to resolve a model alias,
-    // and a GET that lists models cannot mutate anything. PRIMARY ONLY: on a
-    // role upstream the equivalent lists the user's locally pulled models, which
-    // is inventory disclosure an agent has no inference need for.
+    // Read-only model discovery. On the ANTHROPIC side it is what an SDK calls
+    // to resolve a model alias; on the OPENAI side both api.openai.com and
+    // openrouter.ai serve it and OpenAI-wire clients call it to validate a
+    // model name. NOT on the `role` tier: there the equivalent lists the user's
+    // locally pulled ollama models, which is inventory disclosure an agent has
+    // no inference need for. The openai tier's upstreams are hosted services
+    // whose model list is public catalogue, not local inventory.
     methods: ['GET'],
     path: '/v1/models',
     prefix: true,
-    onRoleUpstream: false,
+    tiers: ['primary', 'openai'],
+  },
+  {
+    // OpenAI-wire inference: the Chat Completions API. pi's OpenAI/OpenRouter
+    // providers speak this. OPENAI TIER ONLY — the primary and role tiers are
+    // Anthropic-wire.
+    methods: ['POST'],
+    path: '/v1/chat/completions',
+    tiers: ['openai'],
+  },
+  {
+    // OpenAI-wire inference: the Responses API — what the Codex agent drives
+    // via OPENAI_BASE_URL. Sub-paths cover the documented follow-ups on a
+    // stored response (GET /v1/responses/{id}, its input_items listing, POST
+    // {id}/cancel) — all inference-lifecycle, none account-surface.
+    methods: ['GET', 'POST'],
+    path: '/v1/responses',
+    prefix: true,
+    tiers: ['openai'],
+  },
+  {
+    // The SAME two OpenAI-wire surfaces, unprefixed. The ChatGPT subscription
+    // backend serves Codex at `https://chatgpt.com/backend-api/codex`, where the
+    // Responses API is `<base>/responses` with no `/v1` segment (verified
+    // against codex-cli 0.152.1 — see docs/codex-chatgpt-subscription.md). The
+    // proxy forwards a request's path to the upstream UNCHANGED, which is an
+    // invariant worth keeping, so the unprefixed spelling is listed here rather
+    // than rewritten on the way out.
+    //
+    // OPENAI TIER ONLY, and no new capability: these are the same inference and
+    // model-discovery paths the entries above already allow, in the spelling
+    // that upstream uses. No account, billing or administrative surface sits at
+    // an unprefixed path on any openai-tier upstream.
+    methods: ['GET', 'POST'],
+    path: '/responses',
+    prefix: true,
+    tiers: ['openai'],
+  },
+  {
+    methods: ['GET'],
+    path: '/models',
+    prefix: true,
+    tiers: ['openai'],
   },
 ];
 
@@ -118,7 +181,7 @@ export type PathRefusalReason =
   | 'unlisted-path'
   /** The path is listed, but not for this method. */
   | 'method-not-allowed'
-  /** The path is listed for the primary, but this request is bound for a role upstream. */
+  /** The path is listed, but not for the tier this request's upstream is on. */
   | 'role-upstream-restricted';
 
 export type PathDecision =
@@ -160,7 +223,7 @@ export function decideProxyPath(
   const onMethod = onPath.filter((r) => r.methods.includes(verb));
   if (onMethod.length === 0) return { allowed: false, reason: 'method-not-allowed' };
 
-  if (tier === 'role' && !onMethod.some((r) => r.onRoleUpstream)) {
+  if (!onMethod.some((r) => r.tiers.includes(tier))) {
     return { allowed: false, reason: 'role-upstream-restricted' };
   }
   return { allowed: true };
@@ -174,7 +237,7 @@ export function pathRefusalReasonText(reason: PathRefusalReason): string {
     case 'method-not-allowed':
       return 'method is not permitted on this path';
     case 'role-upstream-restricted':
-      return 'path is not forwarded to a per-role upstream (inference only)';
+      return 'path is not forwarded to this kind of upstream (inference only, matching its wire format)';
   }
 }
 
@@ -191,10 +254,12 @@ export function pathRefusalMessage(
   reason: PathRefusalReason,
 ): string {
   const surface = tier === 'role'
-    ? 'a per-role upstream (a non-Anthropic backend such as a local ollama server)'
-    : 'the Anthropic upstream';
+    ? "a per-profile upstream (an agent profile's endpoint, such as a local ollama server)"
+    : tier === 'openai'
+      ? 'an OpenAI-compatible upstream (api.openai.com, openrouter.ai)'
+      : 'the Anthropic upstream';
   const allowed = PROXY_ALLOWED_ROUTES
-    .filter((r) => tier === 'primary' || r.onRoleUpstream)
+    .filter((r) => r.tiers.includes(tier))
     .map((r) => `  ${r.methods.join('/')} ${r.path}${r.prefix ? '/*' : ''}`)
     .join('\n');
 

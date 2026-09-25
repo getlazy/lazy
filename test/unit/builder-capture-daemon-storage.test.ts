@@ -12,7 +12,7 @@
  * server (the daemon MCP config's `target`), which owns the real host store, so
  * capture routes through the daemon exactly like agent tasks do.
  *
- * These are pure/unit checks of the two load-bearing seams (TCP-vs-unix request
+ * These are pure/unit checks of the two load-bearing seams (daemon RPC request
  * building, and daemon-vs-local factory selection). The full builder loop needs
  * docker + an authenticated Claude + a running daemon and cannot run here.
  */
@@ -30,11 +30,11 @@ import {
 } from '../../src/daemon/rpc-handlers';
 import type { Storage } from '../../src/storage/interface';
 
-describe('buildDaemonRpcRequest — unix vs TCP transport', () => {
-  // INVARIANT: a container reaches the daemon over TCP; only the host uses the
-  // unix socket. Getting this branch wrong is exactly what stranded builder
-  // capture writes in an unreachable/ephemeral place.
-  test('TCP target builds an absolute URL and NO unix option', () => {
+describe('buildDaemonRpcRequest — TCP transport', () => {
+  // INVARIANT: every caller reaches the daemon over its TCP port — the unix
+  // socket transport is gone (drop-unix-socket). The request must be an
+  // absolute URL against the target base with auth + project headers.
+  test('TCP target builds an absolute URL', () => {
     const { url, options } = buildDaemonRpcRequest(
       'http://host.docker.internal:26024',
       'tok-123',
@@ -48,18 +48,6 @@ describe('buildDaemonRpcRequest — unix vs TCP transport', () => {
     expect(headers.Authorization).toBe('Bearer tok-123');
     expect(headers['X-Lazy-Project']).toBe('/repo');
     expect(options.body).toBe(JSON.stringify({ method: 'saveConversation', args: {} }));
-  });
-
-  test('unix socket target routes through the socket path', () => {
-    const { url, options } = buildDaemonRpcRequest(
-      '/home/user/.lazy/daemon/lazy.sock',
-      'tok-123',
-      'storage',
-      '/repo',
-      {},
-    );
-    expect(url).toBe('http://localhost/rpc/storage');
-    expect(options.unix).toBe('/home/user/.lazy/daemon/lazy.sock');
   });
 
   // INVARIANT: the route family is a property of the CREDENTIAL, not of the
@@ -80,19 +68,6 @@ describe('buildDaemonRpcRequest — unix vs TCP transport', () => {
     expect(url).toBe('http://host.docker.internal:26024/builder/storage');
   });
 
-  test('routePrefix "builder" targets /builder/storage over the unix socket too', () => {
-    const { url, options } = buildDaemonRpcRequest(
-      '/home/user/.lazy/daemon/lazy.sock',
-      'builder-mcp-token',
-      'storage',
-      '/repo',
-      {},
-      'builder',
-    );
-    expect(url).toBe('http://localhost/builder/storage');
-    expect(options.unix).toBe('/home/user/.lazy/daemon/lazy.sock');
-  });
-
   test('the default prefix stays "rpc" — existing daemon-token callers are unchanged', () => {
     const { url } = buildDaemonRpcRequest('http://127.0.0.1:26024', 't', 'list', '/repo', {});
     expect(url).toBe('http://127.0.0.1:26024/rpc/list');
@@ -100,18 +75,20 @@ describe('buildDaemonRpcRequest — unix vs TCP transport', () => {
 });
 
 describe('BUILDER_STORAGE_METHODS — the capture allowlist', () => {
-  // INVARIANT: a builder container may call FOUR storage methods. The list is
+  // INVARIANT: a builder container may call SIX storage methods. The list is
   // the security boundary of the /builder/storage surface: everything on it is
   // something the SUPERVISOR does on the human's behalf (persist this session's
-  // conversation, stamp/read its own resume intent). Widening it widens what a
-  // compromised builder container can do to the store — give a new caller its
-  // own surface instead of adding an entry here.
-  test('contains exactly the four capture methods', () => {
+  // conversation and scratch artifacts, stamp/read its own resume intent).
+  // Widening it widens what a compromised builder container can do to the store
+  // — give a new caller its own surface instead of adding an entry here.
+  test('contains exactly the six capture methods', () => {
     expect([...BUILDER_STORAGE_METHODS].sort()).toEqual([
       'getStoragePath',
       'listBuilderResumeIntents',
+      'listScratchFiles',
       'saveBuilderResumeIntent',
       'saveConversation',
+      'saveScratchFile',
     ]);
   });
 

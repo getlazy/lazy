@@ -130,34 +130,36 @@ describe('proxy → activity bus wiring', () => {
 });
 
 /**
- * Attribution and per-role routing, together.
+ * Attribution and per-profile routing, together.
  *
  * Two things are pinned here, and the second is why the feature shipped broken
  * once already:
  *
- *  1. The activity tap sits BEFORE per-role target selection, so a role routed
- *     to its own upstream (an ollama server, a pinned gateway) is still visible
- *     to `lazy watch`. A tap wired after target selection would go dark for
- *     exactly the setups that route.
+ *  1. The activity tap sits BEFORE per-profile target selection, so a launch
+ *     routed to its profile's own upstream (an ollama server, a pinned gateway)
+ *     is still visible to `lazy watch`. A tap wired after target selection would
+ *     go dark for exactly the setups that route.
  *  2. What lands on `taskId` is the task REF carried by the credential grant —
  *     the task's code, not its full id. Every consumer filters against that, so
  *     it is written down here rather than left to be rediscovered in the field.
  */
-describe('activity attribution composes with per-role routing', () => {
+describe('activity attribution composes with per-profile routing', () => {
   const AGENT_TOKEN = 'sk-ant-api03-lazy-agent-placeholder';
+  /** The `[agents.<name>]` profile whose endpoint this grant routes to. */
+  const LOCAL_PROFILE = 'local-ollama';
   const grant: CredentialGrant = {
     token: AGENT_TOKEN, role: 'agent', taskId: 'watch-proxy-traffic',
-    label: 'lazy-watch-proxy-traffic', envKey: 'ANTHROPIC_API_KEY',
+    label: 'lazy-watch-proxy-traffic', envKey: 'ANTHROPIC_API_KEY', profile: LOCAL_PROFILE,
     createdAt: new Date().toISOString(),
   };
 
   let primary: ReturnType<typeof Bun.serve>;
-  let roleTarget: ReturnType<typeof Bun.serve>;
+  let profileTarget: ReturnType<typeof Bun.serve>;
   let proxy: ReturnType<typeof Bun.serve>;
   let proxyPort: number;
   let bus: ProxyActivityBus;
   let events: ProxyActivityEvent[];
-  let reachedRoleTarget: boolean;
+  let reachedProfileTarget: boolean;
 
   function upstreamServer(port: number, onHit: () => void) {
     return Bun.serve({
@@ -172,10 +174,10 @@ describe('activity attribution composes with per-role routing', () => {
 
   beforeAll(async () => {
     const primaryPort = findFreePort();
-    const rolePort = findFreePort();
-    reachedRoleTarget = false;
+    const profilePort = findFreePort();
+    reachedProfileTarget = false;
     primary = upstreamServer(primaryPort, () => {});
-    roleTarget = upstreamServer(rolePort, () => { reachedRoleTarget = true; });
+    profileTarget = upstreamServer(profilePort, () => { reachedProfileTarget = true; });
 
     bus = new ProxyActivityBus();
     events = [];
@@ -191,7 +193,7 @@ describe('activity attribution composes with per-role routing', () => {
         port: proxyPort, bind: '127.0.0.1',
         upstream: `http://127.0.0.1:${primaryPort}`,
         fallbacks: [],
-        roleUpstreams: { agent: `http://127.0.0.1:${rolePort}` },
+        agentUpstreams: { [LOCAL_PROFILE]: { upstream: `http://127.0.0.1:${profilePort}`, wire: 'anthropic' } },
       },
       { append: async () => {} } as AuditSink,
       credentials,
@@ -200,9 +202,9 @@ describe('activity attribution composes with per-role routing', () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
   });
 
-  afterAll(() => { primary.stop(); roleTarget.stop(); proxy.stop(); });
+  afterAll(() => { primary.stop(); profileTarget.stop(); proxy.stop(); });
 
-  test('role-routed traffic is published, attributed by the grant task ref', async () => {
+  test('profile-routed traffic is published, attributed by the grant task ref', async () => {
     events.length = 0;
     const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
       method: 'POST',
@@ -213,7 +215,7 @@ describe('activity attribution composes with per-role routing', () => {
     await response.text();
     await new Promise((resolve) => setTimeout(resolve, 50));
 
-    expect(reachedRoleTarget).toBe(true);
+    expect(reachedProfileTarget).toBe(true);
     const open = events.find((e) => e.kind === 'open');
     expect(open).toBeDefined();
     expect(open!.role).toBe('agent');

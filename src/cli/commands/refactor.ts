@@ -1,7 +1,9 @@
-import { requireStorage, requireLazyRoot, displayId, displayIdFor, parseFlags, validateModel, validateCode, MAX_TASK_CODE_LENGTH } from '../helpers';
+import { requireStorage, requireLazyRoot, parseFlags, validateModel } from '../helpers';
+import { requireActorIdentity } from '../identity-preflight';
+import { displayId, displayIdFor, validateCode, MAX_TASK_CODE_LENGTH } from '../../task/identity';
 import type { Task } from '../../types';
 import { loadConfig } from '../../config/loader';
-import { resolveAgentForNewTask } from '../../agent/task-agent';
+import { resolveAgentForNewTaskFromConfig, formatAgentResolutionLine } from '../../agent/task-agent';
 import { openEditor, removeRecoveryFile, readStdinIfPiped } from '../editor';
 
 
@@ -25,6 +27,10 @@ export async function commandRefactor(args: string[]): Promise<void> {
   let code: string | undefined;
   let promptRecoveryPath: string | null = null;
   let parentTaskId: string | undefined;
+
+  // Before the refactoring goal and its prompt is typed: the daemon refuses a write it cannot
+  // attribute, and a refusal must never cost the human what they wrote.
+  await requireActorIdentity();
 
   // Parse --model flag
   const modelValue = parsed.flags.get('model') as string | undefined;
@@ -106,16 +112,25 @@ export async function commandRefactor(args: string[]): Promise<void> {
       parent = parentTask;
     }
 
-    const t = await storage.createTask(goal, parentTaskId, undefined, code, 'refactor',
-      resolveAgentForNewTask({
-        inheritFrom: parent,
-        configDefault: (await loadConfig(requireLazyRoot())).agent.agent_id,
-      }));
+    const [config, projectSettings] = await Promise.all([
+      loadConfig(requireLazyRoot()),
+      storage.getProjectSettings(),
+    ]);
+    const agentResolution = resolveAgentForNewTaskFromConfig(
+      { inheritFrom: parent, taskType: 'refactor' },
+      config.agent,
+      projectSettings,
+    );
+    const t = await storage.createTask(goal, parentTaskId, undefined, code, 'refactor', agentResolution.agentId);
     console.log(`Created task ${displayId(t)}`);
     console.log(`  Goal:   ${t.goal}`);
     console.log(`  Status: ${t.status}`);
     console.log(`  ID:     ${t.id}`);
     console.log(`  Type:   refactor`);
+    const agentLine = formatAgentResolutionLine(agentResolution);
+    if (agentLine) {
+      console.log(agentLine);
+    }
     if (t.code) {
       console.log(`  Code:   ${t.code}`);
     }
@@ -150,7 +165,7 @@ Enforces: no behavior changes, one step per commit, tests pass after each step.
 Options:
   --goal <goal>      Refactoring goal (what to refactor and why)
   --prompt <text>    Additional instructions for the refactoring agent
-  --model <model>    Set model for this task (e.g. opus, sonnet, claude-opus-4-8)
+  --model <model>    Set model for this task (e.g. opus, sonnet, claude-opus-5)
   --code <code>      Human-readable code (e.g. "refactor-auth", "refactor-storage")
                      Lowercase alphanumeric + hyphens, 2-${MAX_TASK_CODE_LENGTH} chars
   --parent <task_id> Parent task ID (creates a child task)

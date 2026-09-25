@@ -10,8 +10,10 @@
  * recorded and prints it. Nothing here mutates a task, a branch or the store.
  */
 import { commandTokens, tokensUsage } from './tokens';
+import { commandTools, toolsUsage } from './tools';
 import { commandTimings, timingsUsage } from './timings';
 import { commandAudit, auditUsage } from './audit';
+import { commandLimits, limitsUsage } from './limits';
 
 export async function commandStats(args: string[]): Promise<void> {
   const subcommand = args[0];
@@ -27,11 +29,17 @@ export async function commandStats(args: string[]): Promise<void> {
     case 'tokens':
       await commandTokens(sub);
       break;
+    case 'tools':
+      await commandTools(sub);
+      break;
     case 'timings':
       await commandTimings(sub);
       break;
     case 'audit':
       await commandAudit(sub);
+      break;
+    case 'limits':
+      await commandLimits(sub);
       break;
     default:
       console.error(`Unknown subcommand: stats ${subcommand}`);
@@ -49,8 +57,10 @@ export async function commandStats(args: string[]): Promise<void> {
  */
 export const statsSubcommandUsage: Record<string, () => void> = {
   'tokens': tokensUsage,
+  'tools': toolsUsage,
   'timings': timingsUsage,
   'audit': auditUsage,
+  'limits': limitsUsage,
 };
 
 export function statsUsage(): void {
@@ -60,16 +70,20 @@ Read-only analytics over what lazy recorded. Nothing here changes any state.
 
 Subcommands:
   tokens    Token accounting from the proxy audit trail (by role, task and model)
+  tools     One task's per-tool breakdown — which tool filled its context
   audit     Browse the proxy audit trail record by record (filters + detail view)
   timings   Recorded request traces, ranked by self time
+  limits    Latest usage-limit reading per credential (subscription / rate-limit windows)
 
 Examples:
   lazy stats tokens                 # totals plus by-role / by-task / by-model
   lazy stats tokens --since 24h     # only the last day
   lazy stats tokens --json          # machine-readable rollup
+  lazy stats tools add-proxy        # one task's tools, ranked by tokens added
   lazy stats audit                  # newest proxied requests, one row each
   lazy stats audit --denied         # only requests with a policy denial
   lazy stats timings                # newest traces, ranked by self time
+  lazy stats limits                 # how close each credential is to its limits
   lazy stats timings --limit 1 --tree  # newest request plus its span tree
   lazy stats tokens -h              # full options for a subcommand`);
 }

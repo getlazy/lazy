@@ -11,7 +11,7 @@ import { buildLazyRunnerImage } from '../../capture/claude';
 import { IMAGE_TAG, IMAGE_MAX_AGE_DAYS } from '../../capture/image-tag';
 import { parseFlags } from '../helpers';
 import { BUILD_TIMEOUT_FLAG, BUILD_TIMEOUT_USAGE, resolveBuildTimeoutMs } from './build-timeout';
-import { theme } from '../theme';
+import { theme } from '../../render/theme';
 import { logger } from '../../utils/logger';
 
 /** System images that `lazy system build` can prebuild. */

@@ -2,6 +2,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { checkDaemonHealth } from '../../src/daemon';
+import { signInToDashboard } from '../helpers/dashboard-session';
 
 // INVARIANT (one-diff-renderer): the commit detail page renders through the
 // SAME renderer as the review surface — light-DOM rows carrying (file, side,
@@ -36,7 +37,7 @@ describe('lazy server diff rendering', () => {
     // The daemon serves the web dashboard; ask it for its bound web port.
     const health = await checkDaemonHealth(ctx.root);
     expect(health.webPort).toBeGreaterThan(0);
-    const base = `http://localhost:${health.webPort}`;
+    const { base, fetch } = await signInToDashboard(ctx);
 
     // The task starts with an empty "Initialize task" commit (no diff). Poll the
     // task page until the daemon has reconciled the mock agent's *content*
@@ -45,7 +46,7 @@ describe('lazy server diff rendering', () => {
     let target: { path: string; html: string } | null = null;
     const deadline = Date.now() + 15_000;
     while (Date.now() < deadline && !target) {
-      const taskRes = await fetch(`${base}/tasks/${taskId}`);
+      const taskRes = await fetch(`${base}/tasks/${taskId}/turns`);
       expect(taskRes.status).toBe(200);
       const taskHtml = await taskRes.text();
       const paths = [...taskHtml.matchAll(/href="(\/tasks\/[^"]+\/commits\/[^"]+)"/g)].map((m) => m[1]);
@@ -65,7 +66,7 @@ describe('lazy server diff rendering', () => {
 
     // Light-DOM rows, addressable per line — the property the shadow-DOM
     // renderer structurally could not provide.
-    expect(html).toContain('class="rv-file"');
+    expect(html).toContain('class="rv-file rv-viewable"');
     expect(html).toMatch(/<tr class="rv-line[^"]*"[^>]*data-file="[^"]+" data-side="(old|new)" data-line="\d+"/);
     expect(html).not.toContain('diffs-container');
     expect(html).not.toContain('customElements.define');
@@ -86,13 +87,13 @@ describe('lazy server diff rendering', () => {
     await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
 
     const health = await checkDaemonHealth(ctx.root);
-    const base = `http://localhost:${health.webPort}`;
+    const { base, fetch } = await signInToDashboard(ctx);
 
     const prRes = await fetch(`${base}/tasks/${taskId}/pr`);
     expect(prRes.status).toBe(404);
 
     const taskHtml = await (await fetch(`${base}/tasks/${taskId}`)).text();
     expect(taskHtml).not.toContain(`/tasks/${taskId}/pr`);
-    expect(taskHtml).toContain(`/review/${taskId}`);
+    expect(taskHtml).toMatch(/\/tasks\/[0-9a-f-]+\/review/);
   });
 });

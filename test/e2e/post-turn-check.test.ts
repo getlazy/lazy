@@ -45,6 +45,26 @@ describe('post-turn check', () => {
     await ctx.cleanup();
   });
 
+  // INVARIANT: the modern spelling is `[automation] post_turn`. Every other
+  // test in this suite uses the deprecated `[checks]` alias on purpose (it must
+  // keep working); this one pins the key it was migrated to.
+  test('runs the check configured as [automation] post_turn', async () => {
+    const configPath = join(ctx.root, 'lazy.toml');
+    const before = readFileSync(configPath, 'utf-8');
+    const after = before.replace('[automation]\n', '[automation]\npost_turn = "echo automation-check-ran >&2 && exit 7"\n');
+    expect(after).not.toBe(before);
+    writeFileSync(configPath, after);
+    ctx.git('add', 'lazy.toml');
+    ctx.git('commit', '-m', 'Enable post-turn check via [automation]');
+
+    const taskId = await createTask(ctx, 'Do something', 'Do the thing');
+    await startAndReconcile(ctx, taskId);
+
+    const agentTurn = readTurns(ctx.root, taskId).find(t => t.role === 'agent');
+    expect(agentTurn!.check_exit_code).toBe(7);
+    expect(agentTurn!.check_output).toContain('automation-check-ran');
+  });
+
   // INVARIANT: When post_turn check passes (exit 0), the turn records exit code 0.
   test('captures passing check result on turn', async () => {
     // Configure a check command that always succeeds

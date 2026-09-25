@@ -31,8 +31,8 @@ import type { Span } from '@opentelemetry/api';
 import { contextFromTraceparent, isTracingEnabled, TRACER_NAME } from '../tracing';
 import { isHeartbeatEnvelope } from './heartbeat';
 
-/** Which listener took the request — the two have different reap behaviour. */
-export type DaemonTransport = 'unix' | 'tcp';
+/** Which listener took the request. TCP is the daemon's only transport. */
+export type DaemonTransport = 'tcp';
 
 /**
  * Path segments are interpolated into the span NAME, so anything unbounded

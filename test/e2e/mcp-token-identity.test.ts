@@ -20,7 +20,7 @@
  * These tests must not be relaxed. A green run here is the only mechanical
  * evidence that a task agent can only ever act as itself.
  *
- * The daemon is the REAL one (startDaemonServer on a unix socket) because the
+ * The daemon is the REAL one (startDaemonServer on a TCP port) because the
  * enforcement lives in that route and nowhere else.
  */
 
@@ -52,7 +52,7 @@ isolateInProcessDaemonEnv();
 describe('per-task MCP token identity', () => {
   let ctx: TestContext;
   let tmpDir: string;
-  let socketPath: string;
+  let daemonUrl: string;
   let daemon: RunningDaemon | undefined;
   let restoreConfig: (() => void) | undefined;
   let daemonBaseDir: string;
@@ -90,8 +90,8 @@ describe('per-task MCP token identity', () => {
     builderToken = await mintMcpToken(ctx.root, { kind: 'builder' }, 'builder-1');
 
     tmpDir = await mkdtemp(join(tmpdir(), 'lazy-mcp-identity-'));
-    socketPath = join(tmpDir, 'test.sock');
-    daemon = await startDaemonServer({ socketPath, token: SHARED_TOKEN, projectRoot: ctx.root });
+    daemon = await startDaemonServer({ token: SHARED_TOKEN, projectRoot: ctx.root });
+    daemonUrl = `http://127.0.0.1:${daemon.webPort}`;
   });
 
   afterEach(async () => {
@@ -110,15 +110,14 @@ describe('per-task MCP token identity', () => {
     await rm(tmpDir, { recursive: true, force: true });
   });
 
-  /** POST a tool call over the daemon's unix socket with a given bearer token. */
+  /** POST a tool call over the daemon's TCP port with a given bearer token. */
   function call(
     token: string,
     taskSegment: string,
     toolName: string,
     args: Record<string, unknown> = {},
   ): Promise<Response> {
-    return fetch(`http://localhost/mcp/${encodeURIComponent(taskSegment)}/${encodeURIComponent(toolName)}`, {
-      unix: socketPath,
+    return fetch(`${daemonUrl}/mcp/${encodeURIComponent(taskSegment)}/${encodeURIComponent(toolName)}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -129,23 +128,34 @@ describe('per-task MCP token identity', () => {
     } as any);
   }
 
-  /** Comments the task actually has — the observable side effect of lazy_comment. */
-  async function commentCount(shortId: string): Promise<number> {
+  /**
+   * Journal entries the task actually has — the observable side effect of the
+   * probe write these tests use.
+   *
+   * The probe is `lazy_journal` rather than `lazy_comment` because the identity
+   * boundary must be tested with a write that no OTHER gate would also refuse.
+   * Since 2026-08-07 (task `agent-tree-read-access`) an agent may only comment on
+   * a DIRECT SUBTASK, so a self-comment is refused by the annotation gate before
+   * identity ever comes into it — which would have made "nothing ran" pass for
+   * the wrong reason. lazy_journal is the deliberately ungated write, so a
+   * refusal here can only be the identity check.
+   */
+  async function journalCount(shortId: string): Promise<number> {
     let raw: string;
     try {
-      raw = await readFile(taskFilePath(ctx.root, shortId, 'comments.json'), 'utf-8');
+      raw = await readFile(taskFilePath(ctx.root, shortId, 'journal.json'), 'utf-8');
     } catch (err) {
-      // No comments file yet means no comment was ever written — that IS zero.
+      // No journal file yet means no entry was ever written — that IS zero.
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 0;
       throw err;
     }
-    return (JSON.parse(raw).comments as unknown[]).length;
+    return (JSON.parse(raw).journal as unknown[]).length;
   }
 
   // INVARIANT: task A's token claiming task B is refused, and NOTHING runs.
   // This is the whole point of the feature — the case that used to succeed.
   test('task A token claiming task B is refused (403) and executes nothing', async () => {
-    const resp = await call(tokenA, taskBId, 'lazy_comment', { message: 'marker-impersonation' });
+    const resp = await call(tokenA, taskBId, 'lazy_journal', { message: 'marker-impersonation' });
 
     expect(resp.status).toBe(403);
     const body = await resp.json() as { error?: string };
@@ -154,17 +164,17 @@ describe('per-task MCP token identity', () => {
     expect(body.error).toContain(taskBId);
 
     // The side effect must not have happened: refusal precedes execution.
-    expect(await commentCount(taskBShort)).toBe(0);
+    expect(await journalCount(taskBShort)).toBe(0);
   });
 
   // INVARIANT: a short id or code for ANOTHER task is refused too — the check
   // resolves the claim rather than comparing raw strings, so spelling the
   // victim's id differently is not a bypass.
   test('a SHORT id for another task is refused just the same', async () => {
-    const resp = await call(tokenA, taskBShort, 'lazy_comment', { message: 'marker-short' });
+    const resp = await call(tokenA, taskBShort, 'lazy_journal', { message: 'marker-short' });
 
     expect(resp.status).toBe(403);
-    expect(await commentCount(taskBShort)).toBe(0);
+    expect(await journalCount(taskBShort)).toBe(0);
   });
 
   // The mirror image: an agent may not escape into the builder/project-wide
@@ -181,13 +191,13 @@ describe('per-task MCP token identity', () => {
   // Legitimate traffic must be untouched: this feature is a boundary, not a
   // wall. Both the canonical id and the short id resolve to the same identity.
   test('an agent presenting its own token acts normally', async () => {
-    const byFullId = await call(tokenA, taskAId, 'lazy_comment', { message: 'marker-own-full' });
+    const byFullId = await call(tokenA, taskAId, 'lazy_journal', { message: 'marker-own-full' });
     expect(byFullId.status).toBe(200);
 
-    const byShortId = await call(tokenA, taskAShort, 'lazy_comment', { message: 'marker-own-short' });
+    const byShortId = await call(tokenA, taskAShort, 'lazy_journal', { message: 'marker-own-short' });
     expect(byShortId.status).toBe(200);
 
-    expect(await commentCount(taskAShort)).toBe(2);
+    expect(await journalCount(taskAShort)).toBe(2);
   });
 
   // INVARIANT: the token dies with the session. accept/reject/close call
@@ -196,15 +206,15 @@ describe('per-task MCP token identity', () => {
   test('the token of an ended session is refused (401)', async () => {
     expect(await revokeTaskMcpTokens(ctx.root, taskAId)).toBe(1);
 
-    const resp = await call(tokenA, taskAId, 'lazy_comment', { message: 'marker-revoked' });
+    const resp = await call(tokenA, taskAId, 'lazy_journal', { message: 'marker-revoked' });
 
     expect(resp.status).toBe(401);
     const body = await resp.json() as { error?: string };
     expect(body.error).toContain('not a valid daemon MCP token');
-    expect(await commentCount(taskAShort)).toBe(0);
+    expect(await journalCount(taskAShort)).toBe(0);
 
     // Task B is unaffected — revocation is per identity, not a global reset.
-    expect((await call(tokenB, taskBId, 'lazy_comment', { message: 'marker-b' })).status).toBe(200);
+    expect((await call(tokenB, taskBId, 'lazy_journal', { message: 'marker-b' })).status).toBe(200);
   });
 
   // (That accept/reject/close actually CALL revokeTaskMcpTokens is proven end
@@ -240,11 +250,11 @@ describe('per-task MCP token identity', () => {
   // ...but it is not a skeleton key: claiming a task id with a builder token is
   // refused, so a compromised builder config cannot act AS a task either.
   test('a builder token claiming a task id is refused (403)', async () => {
-    const resp = await call(builderToken, taskAId, 'lazy_comment', { message: 'marker-builder' });
+    const resp = await call(builderToken, taskAId, 'lazy_journal', { message: 'marker-builder' });
 
     expect(resp.status).toBe(403);
     const body = await resp.json() as { error?: string };
     expect(body.error).toContain('BUILDER token');
-    expect(await commentCount(taskAShort)).toBe(0);
+    expect(await journalCount(taskAShort)).toBe(0);
   });
 });

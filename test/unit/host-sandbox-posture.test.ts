@@ -181,6 +181,7 @@ describe('headless agent launch (ClaudeCodeAgent + sandbox args)', () => {
   test('agent gets both --dangerously-skip-permissions and the sandbox --settings', () => {
     const agent = new ClaudeCodeAgent();
     const args = agent.buildExecArgs({
+      modelId: 'test-model',
       prompt: 'do work',
       dangerouslySkipPermissions: true,
       extraArgs: buildAgentSandboxArgs(SANDBOX),

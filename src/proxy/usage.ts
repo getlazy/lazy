@@ -28,6 +28,29 @@
 import type { ProxyTokenUsage } from '../storage/types';
 
 /**
+ * Which wire format the response being scanned speaks.
+ *
+ * `anthropic` — the historical default: `usage` on the body / `message_start`
+ * + `message_delta` SSE events.
+ *
+ * `openai` — OpenAI-compatible upstreams (api.openai.com, openrouter.ai), both
+ * the Chat Completions and the Responses API. Non-streaming bodies carry a
+ * top-level `usage`; streaming chat completions carry it on the final chunk
+ * (only when the client asked via `stream_options.include_usage`), and
+ * streaming Responses carry it under `response.usage` on the
+ * `response.completed` event. One merge handles all four cases because the
+ * field names are disjoint per API and both are folded below.
+ *
+ * FIELD MAPPING, deliberate: OpenAI's `prompt_tokens` / `input_tokens` INCLUDE
+ * cached tokens, while Anthropic's `input_tokens` EXCLUDES cache reads — and
+ * lazy's aggregator (src/proxy/aggregate.ts) sums all four counters for a
+ * total. So cached tokens are SUBTRACTED out of input and recorded as
+ * `cacheReadInputTokens`: totals stay correct and the record means the same
+ * thing as the Anthropic records sharing the audit log.
+ */
+export type UsageWire = 'anthropic' | 'openai';
+
+/**
  * Cap on the SSE partial-line remainder. A single `data:` line is a few KB at
  * most in practice; anything past this means we are not looking at an SSE
  * stream we understand, so we resync at the next newline rather than growing
@@ -84,6 +107,34 @@ class UsageAccumulator {
     if (cacheRead !== null) this.usage.cacheReadInputTokens = cacheRead;
   }
 
+  /**
+   * Merge one raw OpenAI-wire `usage` object — Chat Completions
+   * (`prompt_tokens`/`completion_tokens`/`prompt_tokens_details.cached_tokens`)
+   * or Responses (`input_tokens`/`output_tokens`/`input_tokens_details.cached_tokens`).
+   * See {@link UsageWire} for the cached-token subtraction.
+   */
+  mergeOpenAI(raw: unknown): void {
+    if (raw === null || typeof raw !== 'object') return;
+    const u = raw as Record<string, unknown>;
+    const prompt = numberOrNull(u.prompt_tokens) ?? numberOrNull(u.input_tokens);
+    const output = numberOrNull(u.completion_tokens) ?? numberOrNull(u.output_tokens);
+    const details = (u.prompt_tokens_details ?? u.input_tokens_details) as
+      | Record<string, unknown>
+      | null
+      | undefined;
+    const cached = details && typeof details === 'object' ? numberOrNull(details.cached_tokens) : null;
+
+    if (output !== null) this.usage.outputTokens = output;
+    if (prompt !== null) {
+      if (cached !== null && cached > 0) {
+        this.usage.inputTokens = Math.max(0, prompt - cached);
+        this.usage.cacheReadInputTokens = cached;
+      } else {
+        this.usage.inputTokens = prompt;
+      }
+    }
+  }
+
   /** The merged usage, or null when nothing usable was ever seen. */
   result(): ProxyTokenUsage | null {
     return isEmpty(this.usage) ? null : { ...this.usage };
@@ -91,7 +142,7 @@ class UsageAccumulator {
 }
 
 /**
- * Feed one parsed SSE `data:` payload into the accumulator. Only the two event
+ * Feed one parsed SSE `data:` payload into the accumulator. Only the event
  * types that carry usage are considered; everything else is ignored.
  */
 function mergeSSEEvent(acc: UsageAccumulator, data: Record<string, unknown>): void {
@@ -105,26 +156,49 @@ function mergeSSEEvent(acc: UsageAccumulator, data: Record<string, unknown>): vo
   }
 }
 
+/**
+ * OpenAI-wire SSE payloads that carry usage:
+ *  - Chat Completions chunks: top-level `usage` (null on every chunk except the
+ *    final one, and present at all only when the client sent
+ *    `stream_options: {"include_usage": true}`).
+ *  - Responses events: `response.usage` on the terminal `response.completed`
+ *    (matched by the nested field rather than the event name, so partial usage
+ *    on earlier lifecycle events also folds in — later values win).
+ */
+function mergeOpenAISSEEvent(acc: UsageAccumulator, data: Record<string, unknown>): void {
+  if (data.usage !== null && data.usage !== undefined) acc.mergeOpenAI(data.usage);
+  const response = data.response as Record<string, unknown> | undefined;
+  if (response && typeof response === 'object') acc.mergeOpenAI(response.usage);
+}
+
 /** Merge every usage-bearing `data:` line of a buffered SSE body. */
-function mergeSSEBody(acc: UsageAccumulator, bodyText: string): void {
+function mergeSSEBody(acc: UsageAccumulator, bodyText: string, wire: UsageWire): void {
   for (const line of bodyText.split('\n')) {
-    mergeSSELine(acc, line);
+    mergeSSELine(acc, line, wire);
   }
 }
 
 /** Merge one raw SSE line (with or without a trailing `\r`). */
-function mergeSSELine(acc: UsageAccumulator, line: string): void {
+function mergeSSELine(acc: UsageAccumulator, line: string, wire: UsageWire): void {
   const trimmed = line.trimEnd();
   if (!trimmed.startsWith('data:')) return;
   const payload = trimmed.slice('data:'.length).trim();
   if (!payload || payload === '[DONE]') return;
   try {
-    mergeSSEEvent(acc, JSON.parse(payload) as Record<string, unknown>);
+    const data = JSON.parse(payload) as Record<string, unknown>;
+    if (wire === 'openai') mergeOpenAISSEEvent(acc, data);
+    else mergeSSEEvent(acc, data);
   } catch {
     // A malformed data line means this event is unreadable — skip it and keep
     // scanning. Usage lives on its own event, so one bad line elsewhere in the
     // stream must not cost us the whole record.
   }
+}
+
+/** Merge a fully-parsed non-streaming JSON body's `usage`, per wire. */
+function mergeJsonBody(acc: UsageAccumulator, parsed: Record<string, unknown>, wire: UsageWire): void {
+  if (wire === 'openai') acc.mergeOpenAI(parsed?.usage);
+  else acc.merge(parsed?.usage);
 }
 
 /**
@@ -134,15 +208,19 @@ function mergeSSELine(acc: UsageAccumulator, line: string): void {
  * @param bodyText the complete response body
  * @returns merged usage, or null when the body carries none
  */
-export function extractUsage(isStream: boolean, bodyText: string): ProxyTokenUsage | null {
+export function extractUsage(
+  isStream: boolean,
+  bodyText: string,
+  wire: UsageWire = 'anthropic',
+): ProxyTokenUsage | null {
   if (!bodyText) return null;
   const acc = new UsageAccumulator();
   if (isStream) {
-    mergeSSEBody(acc, bodyText);
+    mergeSSEBody(acc, bodyText, wire);
   } else {
     try {
       const parsed = JSON.parse(bodyText) as Record<string, unknown>;
-      acc.merge(parsed?.usage);
+      mergeJsonBody(acc, parsed, wire);
     } catch {
       // Not JSON we can read (e.g. an HTML error page from a proxy in front of
       // the upstream) — no usage to report.
@@ -160,14 +238,16 @@ class UsageScanner {
   private readonly acc = new UsageAccumulator();
   private readonly decoder = new TextDecoder('utf-8');
   private readonly isStream: boolean;
+  private readonly wire: UsageWire;
   private buffer = '';
   /** Set after an over-long SSE line: skip bytes until the next newline resyncs us. */
   private resyncing = false;
   /** Set once the JSON accumulator hits its cap: stop accumulating entirely. */
   private overflowed = false;
 
-  constructor(isStream: boolean) {
+  constructor(isStream: boolean, wire: UsageWire) {
     this.isStream = isStream;
+    this.wire = wire;
   }
 
   push(chunk: Uint8Array): void {
@@ -196,7 +276,7 @@ class UsageScanner {
         this.resyncing = false;
         continue;
       }
-      mergeSSELine(this.acc, line);
+      mergeSSELine(this.acc, line, this.wire);
     }
     if (this.buffer.length > MAX_SSE_LINE_BYTES) {
       this.buffer = '';
@@ -210,11 +290,11 @@ class UsageScanner {
     if (tail) this.buffer += tail;
     if (this.overflowed) return this.acc.result();
     if (this.isStream) {
-      if (!this.resyncing && this.buffer) mergeSSELine(this.acc, this.buffer);
+      if (!this.resyncing && this.buffer) mergeSSELine(this.acc, this.buffer, this.wire);
     } else if (this.buffer) {
       try {
         const parsed = JSON.parse(this.buffer) as Record<string, unknown>;
-        this.acc.merge(parsed?.usage);
+        mergeJsonBody(this.acc, parsed, this.wire);
       } catch {
         // Truncated or non-JSON body — nothing to report.
       }
@@ -240,8 +320,9 @@ export function teeUsageStream(
   body: ReadableStream<Uint8Array>,
   isStream: boolean,
   onDone: (usage: ProxyTokenUsage | null) => void,
+  wire: UsageWire = 'anthropic',
 ): ReadableStream<Uint8Array> {
-  const scanner = new UsageScanner(isStream);
+  const scanner = new UsageScanner(isStream, wire);
   const reader = body.getReader();
   let finished = false;
   const finish = () => {

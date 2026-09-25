@@ -1,7 +1,7 @@
 /**
  * Credential redaction for anything lazy prints or writes to a log.
  *
- * Two seams, one rule set:
+ * Two shapes, one rule set:
  *
  *  1. `redactSecrets(argv)` — argv about to be echoed under `[session] debug`.
  *     Container launch argv carries auth as `-e KEY=VALUE` pairs, so a raw
@@ -9,9 +9,25 @@
  *     in clear text — in the exact situation (debug on, output pasted into a bug
  *     report) where it is most likely to be shared.
  *
- *  2. `redactSecretValues(text)` — the logger boundary. Belt to the argv
- *     braces: whatever path a credential value takes into a log line, it is
+ *  2. `redactSecretValues(text)` — free text. Belt to the argv braces: whatever
+ *     path a credential value takes into something a human reads, it is
  *     scrubbed on the way out.
+ *
+ * Applied at four boundaries, each of which writes text a human can paste into
+ * a bug report:
+ *
+ *  - the `[session] debug` argv echoes (src/capture/claude.ts, the two runners)
+ *  - `Logger` (src/utils/logger.ts), covering every level
+ *  - the supervisor's own logger (src/supervisor/log.ts) — a SEPARATE logger
+ *    that `Logger` has no reach into, and the one that writes the builder log
+ *  - the proxy audit log's free-text fields (src/proxy/audit-log.ts), where the
+ *    agent's own Bash commands and tool results are recorded verbatim
+ *
+ * Deliberately NOT applied to the proxy's per-request handling path or to
+ * captured agent stdout/stderr beyond what `Logger` already scrubs: those are
+ * high-volume, a substring scan per credential per call is not free there, and
+ * rewriting captured content could alter text a human is reading for other
+ * reasons.
  *
  * Redaction is driven by env var KEY NAMES, never by guessing which values look
  * secret. The keys are the ones lazy's own env builders can emit
@@ -39,6 +55,9 @@ export const CREDENTIAL_ENV_KEYS: readonly string[] = [
   'ANTHROPIC_AUTH_TOKEN',
   'CLAUDE_CODE_OAUTH_TOKEN',
   'CURSOR_API_KEY',
+  'OLLAMA_API_KEY',
+  'OPENAI_API_KEY',
+  'OPENROUTER_API_KEY',
 ];
 
 const CREDENTIAL_KEY_SET = new Set(CREDENTIAL_ENV_KEYS);
@@ -54,10 +73,24 @@ const CREDENTIAL_KEY_SET = new Set(CREDENTIAL_ENV_KEYS);
  */
 const CREDENTIAL_KEY_SHAPE = /(?:^|_)(?:TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL|CREDENTIALS|AUTH)$/;
 
+/**
+ * Namespace lazy GENERATES env var names in, for credentials it does not know
+ * by name (`namedCredentialEnvVar`, src/credentials/providers.ts).
+ *
+ * Matched as a PREFIX because the trailing word is the user's credential name —
+ * `LAZY_CREDENTIAL_WORK_OPENAI` ends in OPENAI and `…_OAUTH` in OAUTH, neither
+ * of which the shape rule below covers, so every named credential's env var was
+ * exempt from redaction. The prefix is the part lazy controls and is by
+ * construction only ever put on a credential.
+ */
+const CREDENTIAL_KEY_PREFIX = 'LAZY_CREDENTIAL_';
+
 /** True when `key` names an env var whose VALUE must never be logged. */
 export function isCredentialEnvKey(key: string): boolean {
   if (CREDENTIAL_KEY_SET.has(key)) return true;
-  return CREDENTIAL_KEY_SHAPE.test(key.toUpperCase());
+  const upper = key.toUpperCase();
+  if (upper.startsWith(CREDENTIAL_KEY_PREFIX)) return true;
+  return CREDENTIAL_KEY_SHAPE.test(upper);
 }
 
 /** `KEY=VALUE` argv element, e.g. what follows `-e` in a `docker run` argv. */
@@ -75,12 +108,23 @@ const ENV_ASSIGNMENT = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/;
  * covered and a new caller cannot reintroduce the leak by framing it
  * differently. Returns a new array; the input is untouched (the argv actually
  * passed to spawn must keep the real values).
+ *
+ * `alwaysRedactKeys` extends the rule set for one call with keys whose values
+ * are known to be secret regardless of NAME shape. Per-task env vars
+ * (`lazy env set`, src/daemon/task-env.ts) are the case this exists for: the
+ * user supplied them precisely because they are sensitive, and `STRIPE_SANDBOX`
+ * is every bit as secret as `STRIPE_API_KEY` while matching no name shape.
  */
-export function redactSecrets(argv: readonly string[]): string[] {
+export function redactSecrets(
+  argv: readonly string[],
+  alwaysRedactKeys?: Iterable<string>,
+): string[] {
+  const always = alwaysRedactKeys ? new Set(alwaysRedactKeys) : undefined;
   return argv.map((arg) => {
     const match = ENV_ASSIGNMENT.exec(arg);
     if (!match) return arg;
-    return isCredentialEnvKey(match[1]) ? `${match[1]}=${REDACTED}` : arg;
+    const key = match[1];
+    return (always?.has(key) || isCredentialEnvKey(key)) ? `${key}=${REDACTED}` : arg;
   });
 }
 
@@ -112,6 +156,38 @@ function credentialKeysInEnv(): string[] {
 }
 
 /**
+ * Live credential values from the environment that are long enough to scrub.
+ *
+ * The threshold is what keeps `ANTHROPIC_API_KEY=ollama` and the QA agent's
+ * `none` from being substring-replaced across unrelated text — see
+ * MIN_SCRUBBABLE_VALUE_LENGTH. Every value-based scrub reads this, so the rule
+ * lives in exactly one place.
+ */
+function scrubbableCredentialValues(): string[] {
+  const values: string[] = [];
+  for (const key of credentialKeysInEnv()) {
+    const value = process.env[key];
+    if (value && value.length >= MIN_SCRUBBABLE_VALUE_LENGTH) values.push(value);
+  }
+  return values;
+}
+
+/**
+ * True when the environment currently holds at least one credential value that
+ * `redactSecretValues` could actually replace.
+ *
+ * For callers that must build a scrubbed COPY of a structured value: this says
+ * up front whether the copy is worth making, so the common case (no live
+ * credential in env, e.g. an ollama-only setup) costs one env scan instead of a
+ * per-field walk. Never use it to skip scrubbing a single string —
+ * `redactSecretValues` is already a no-op there and the guard would only add
+ * work.
+ */
+export function hasScrubbableCredentials(): boolean {
+  return scrubbableCredentialValues().length > 0;
+}
+
+/**
  * Replace any live credential value from the environment with `<redacted>`
  * wherever it appears in `text`.
  *
@@ -121,9 +197,7 @@ function credentialKeysInEnv(): string[] {
 export function redactSecretValues(text: string): string {
   if (!text) return text;
   let out = text;
-  for (const key of credentialKeysInEnv()) {
-    const value = process.env[key];
-    if (!value || value.length < MIN_SCRUBBABLE_VALUE_LENGTH) continue;
+  for (const value of scrubbableCredentialValues()) {
     if (!out.includes(value)) continue;
     out = out.split(value).join(REDACTED);
   }

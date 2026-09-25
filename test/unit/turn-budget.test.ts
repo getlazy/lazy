@@ -109,6 +109,18 @@ describe('turn budget', () => {
       expect(result.reason).toContain('lazy resume');
     });
 
+    // INVARIANT: The refusal is true on every surface that relays it. It
+    // reaches Teams members through the server-side builder chat, and they
+    // have no CLI — so it names a person and the task page (without one
+    // surface's button label, which differs between surfaces), not
+    // only CLI commands.
+    test('refusal points at the task page as well as the CLI', () => {
+      const reason = checkTurnBudget(10, 10).reason!;
+      expect(reason).toContain('A person must unblock or resume this task');
+      expect(reason).toContain('from the task page');
+      expect(reason).not.toContain('must run');
+    });
+
     // INVARIANT: Blocked when count exceeds the limit too (defensive — should
     // never happen since the check runs before each increment, but the
     // decision must stay refused rather than flip back to allowed).

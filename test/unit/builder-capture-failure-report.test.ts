@@ -16,15 +16,48 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtemp, rm, writeFile } from 'fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import type { Storage } from '../../src/storage/interface';
 import {
   createCaptureFailureRecorder,
+  describeError,
   startCaptureMonitor,
   preflightBuilderCapture,
 } from '../../src/supervisor/builder';
+
+/**
+ * INVARIANT: a capture failure carries the machine detail, not just the prose.
+ *
+ * These reports are read once, hours later, by someone who cannot reproduce the
+ * failure. Bun's refused-connection TypeError says "Unable to connect. Is the
+ * computer able to access the url?" and names neither address nor errno — the
+ * errno is on `code`. A report built from `err.message` alone is unactionable
+ * for the single most likely container failure there is.
+ */
+describe('describeError', () => {
+  test('appends an errno-style code the message omits', () => {
+    const err = Object.assign(new TypeError('Unable to connect. Is the computer able to access the url?'), {
+      code: 'ConnectionRefused',
+    });
+    expect(describeError(err)).toContain('ConnectionRefused');
+  });
+
+  test('does not repeat a code the message already carries', () => {
+    const err = Object.assign(new Error("ENOENT: no such file or directory, open '/x'"), { code: 'ENOENT' });
+    expect(describeError(err)).toBe("ENOENT: no such file or directory, open '/x'");
+  });
+
+  test('surfaces a wrapped cause', () => {
+    const err = new Error('fetch failed', { cause: new Error('getaddrinfo ENOTFOUND host.docker.internal') });
+    expect(describeError(err)).toContain('ENOTFOUND host.docker.internal');
+  });
+
+  test('a non-Error throw still renders', () => {
+    expect(describeError('plain string')).toBe('plain string');
+  });
+});
 
 describe('createCaptureFailureRecorder', () => {
   // INVARIANT: dedup is for the human-facing SUMMARY only. The log keeps every
@@ -47,7 +80,43 @@ describe('createCaptureFailureRecorder', () => {
     rec.record('a');
     rec.record('b');
     rec.record('c');
+    expect(rec.list().slice(0, 2)).toEqual(['a', 'b']);
+  });
+
+  // INVARIANT: the cap TRUNCATES VISIBLY. Messages embed the failing session id,
+  // so distinct ones are ordinary — six failing conversations reach the cap on
+  // their own. A report that showed the first five and silently dropped the rest
+  // would recreate, one layer up, the invisible loss this recorder exists for.
+  test('a truncated report says how many it is not showing, and count() counts them', () => {
+    const rec = createCaptureFailureRecorder(() => {}, 2);
+    rec.record('a');
+    rec.record('b');
+    rec.record('c');
+    rec.record('d');
+    rec.record('d');   // a repeat is not a new distinct failure
+
+    expect(rec.list()).toEqual(['a', 'b', expect.stringContaining('2 further distinct capture failures')]);
+    expect(rec.count()).toBe(4);
+  });
+
+  test('an untruncated report has no notice line, and count() matches', () => {
+    const rec = createCaptureFailureRecorder(() => {}, 5);
+    rec.record('a');
+    rec.record('b');
     expect(rec.list()).toEqual(['a', 'b']);
+    expect(rec.count()).toBe(2);
+  });
+
+  // INVARIANT: the report is the durable half, so it must not depend on the log
+  // write succeeding. A builder session died exactly this way — logFailure threw
+  // out of record(), inside the capture timer's catch, killing the supervisor and
+  // destroying the capture error it was recording. src/supervisor/log.ts no
+  // longer throws; this keeps the guarantee whatever logger a caller injects.
+  test('a throwing logger neither escapes record() nor loses the failure', () => {
+    const rec = createCaptureFailureRecorder(() => { throw new Error('ENOSPC: no space left on device'); });
+
+    expect(() => rec.record('401 Unauthorized')).not.toThrow();
+    expect(rec.list()).toEqual(['401 Unauthorized']);
   });
 
   test('a clean session reports nothing', () => {
@@ -64,12 +133,21 @@ describe('createCaptureFailureRecorder', () => {
 
 describe('startCaptureMonitor — failures reach the caller', () => {
   let lazyRoot: string;
+  let savedScratchDir: string | undefined;
 
   beforeEach(async () => {
     lazyRoot = await mkdtemp(join(tmpdir(), 'lazy-capfail-'));
+    // Pinned to an empty dir of this test's own: stopping the monitor syncs the
+    // scratch dir it resolves, and an inherited LAZY_SCRATCH_DIR (any builder
+    // session) points it at a real, non-empty one the stubs cannot serve.
+    savedScratchDir = process.env.LAZY_SCRATCH_DIR;
+    process.env.LAZY_SCRATCH_DIR = join(lazyRoot, 'scratch');
+    await mkdir(process.env.LAZY_SCRATCH_DIR);
   });
 
   afterEach(async () => {
+    if (savedScratchDir === undefined) delete process.env.LAZY_SCRATCH_DIR;
+    else process.env.LAZY_SCRATCH_DIR = savedScratchDir;
     await rm(lazyRoot, { recursive: true, force: true });
   });
 
@@ -144,5 +222,21 @@ describe('preflightBuilderCapture', () => {
     expect(err).toBeInstanceOf(Error);
     expect(err!.message).toContain(cfg);
     expect(err!.message).toContain('/builder/storage');
+  });
+
+  // INVARIANT: the failure names the TARGET it could not reach. The same
+  // handshake failure is what a mid-session capture tick records, and there it
+  // is all the human gets — "unable to connect" without an address cannot
+  // distinguish an unreachable host.docker.internal from a wrong port.
+  test('an unreachable daemon is reported with the address and the errno', async () => {
+    const cfg = join(dir, 'daemon-mcp.json');
+    await writeFile(cfg, JSON.stringify({
+      token: 'tok', projectRoot: dir, taskId: '', target: 'http://127.0.0.1:1',
+    }));
+
+    const err = await preflightBuilderCapture(cfg).then(() => null, (e: unknown) => e as Error);
+    expect(err).toBeInstanceOf(Error);
+    expect(err!.message).toContain('http://127.0.0.1:1');
+    expect(err!.message).toContain('ConnectionRefused');
   });
 });

@@ -7,17 +7,17 @@
  * EDGE at accept time; nothing asked it "would this task be gated?" ahead of
  * time, so the first news a human (or builder) got was a 403. This module
  * answers that question for a task, without side effects, so `lazy show`,
- * `lazy status`, `lazy list`, `lazy review`, `lazy_show` over MCP and the web
+ * `lazy status`, `lazy list`, `lazy browse`, `lazy_show` over MCP and the web
  * dashboard can all say the same thing in the same words.
  *
- * DEFINE ONCE, RENDER EVERYWHERE: the markers (`[P]`, `[A]`) and the phrasing
+ * DEFINE ONCE, RENDER EVERYWHERE: the marker (`[P]`) and the phrasing
  * helpers below are the shared vocabulary. A new surface renders these; it does
  * not re-derive protection from config. Divergent wording across surfaces is
  * how a friction feature turns into a mystery.
  *
  * READ-ONLY, DELIBERATELY: there is no write path here and no MCP write
- * surface. Managing gates is a human act (`lazy protect`, `lazy approve`) —
- * see public-docs/surface-asymmetries.md. Reading state is harmless; arranging your
+ * surface. Managing gates is a human act (`lazy protect`) — see
+ * public-docs/surface-asymmetries.md. Reading state is harmless; arranging your
  * own gates is not.
  *
  * FIDELITY: the target branch is resolved exactly the way accept resolves it
@@ -31,9 +31,9 @@ import type { Storage } from '../storage';
 import type { ResolvedConfig } from '../config';
 import type { Task } from '../types';
 import { getRemoteDefaultBranch } from '../git/operations';
-import { getBranchNameFromId } from '../cli/helpers';
+import { getBranchNameFromId } from '../task/identity';
 import { parentTaskIdOf, targetBranchOf } from '../task-target';
-import { peekHumanApproval } from './edge-gate';
+import { peekPendingAcceptReview } from './pending-review';
 import { logger } from '../utils/logger';
 
 // ---------------------------------------------------------------------------
@@ -49,13 +49,9 @@ import { logger } from '../utils/logger';
  */
 export const PROTECTED_MARKER = '[P]';
 
-/** Compact marker for "a `lazy approve` is recorded and not yet consumed". */
-export const APPROVAL_PENDING_MARKER = '[A]';
-
-/** Legend for the markers, for help text and column footers. */
+/** Legend for the marker, for help text and column footers. */
 export const PROTECTION_MARKER_LEGEND =
-  `${PROTECTED_MARKER} protected — accepting needs \`lazy approve\`   ` +
-  `${APPROVAL_PENDING_MARKER} approval recorded and pending`;
+  `${PROTECTED_MARKER} protected — \`lazy accept\` prompts for the approval passphrase`;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -90,8 +86,12 @@ export interface TaskProtectionStatus {
   branchGate: { branch: string; source: BranchGateSource } | null;
   /** Branch this task merges into, or null when it cannot be resolved. */
   targetBranch: string | null;
-  /** An unconsumed `lazy approve` record, when one exists. */
-  pendingApproval: { approvedAt: string } | null;
+  /**
+   * A builder review captured when a gated accept refused it, waiting for the
+   * human's accept to surface and attach it. Review TEXT only — it authorizes
+   * nothing (see src/protection/pending-review.ts).
+   */
+  pendingReview: { actor: string; recordedAt: string } | null;
 }
 
 /**
@@ -265,18 +265,18 @@ export async function protectionStatusForTask(
   const taskGate = listedAs ? { listedAs, armed } : null;
   const gated = ctx.enabled && (taskGate !== null || branchGate !== null);
 
-  // Probed only for a gated task: a pending approval on an ungated task is
+  // Probed only for a gated task: a pending review on an ungated task is
   // leftover bookkeeping, not something a reader must act on.
-  let pendingApproval: TaskProtectionStatus['pendingApproval'] = null;
+  let pendingReview: TaskProtectionStatus['pendingReview'] = null;
   if (gated) {
     try {
-      const approval = await peekHumanApproval(storage, task.id);
-      if (approval) pendingApproval = { approvedAt: approval.approved_at };
+      const review = await peekPendingAcceptReview(storage, task.id);
+      if (review) pendingReview = { actor: review.actor, recordedAt: review.recorded_at };
     } catch (err) {
-      // A corrupt approval record throws. It must not break a read-only view;
-      // `lazy approve` overwrites it and accept reports it properly.
+      // A corrupt review record throws. It must not break a read-only view;
+      // accept reports it properly.
       logger.debug(
-        `Protection status: could not read the approval record for task ${task.id}: ` +
+        `Protection status: could not read the pending review for task ${task.id}: ` +
         `${err instanceof Error ? err.message : err}`,
       );
     }
@@ -288,7 +288,7 @@ export async function protectionStatusForTask(
     taskGate,
     branchGate,
     targetBranch,
-    pendingApproval,
+    pendingReview,
   };
 }
 
@@ -309,14 +309,11 @@ export async function loadTaskProtectionStatus(
 // ---------------------------------------------------------------------------
 
 /**
- * Markers for a dense view, e.g. `` or `[P]` or `[P][A]`. Empty string when
- * there is nothing to say — callers concatenate unconditionally.
+ * Marker for a dense view, e.g. `` or `[P]`. Empty string when there is
+ * nothing to say — callers concatenate unconditionally.
  */
 export function protectionMarkers(status: TaskProtectionStatus): string {
-  if (!status.gated) return '';
-  return status.pendingApproval
-    ? `${PROTECTED_MARKER}${APPROVAL_PENDING_MARKER}`
-    : PROTECTED_MARKER;
+  return status.gated ? PROTECTED_MARKER : '';
 }
 
 /**
@@ -374,12 +371,15 @@ export function protectionAdvice(
   if (!status.gated) return lines;
 
   lines.push(
-    status.pendingApproval
-      ? `Approval pending (recorded ${status.pendingApproval.approvedAt}) — ` +
-        `spent by the next accept that completes.`
-      : `No approval recorded — a human must run \`lazy approve ${taskDisplayId}\` ` +
-        `before this task can be accepted.`,
+    `Accepting needs human approval — run \`lazy accept ${taskDisplayId}\` from a ` +
+    `terminal; it prompts for the approval passphrase and merges in one step.`,
   );
+  if (status.pendingReview) {
+    lines.push(
+      `A review by ${status.pendingReview.actor} (recorded ${status.pendingReview.recordedAt}) ` +
+      `is waiting — accept shows it and attaches it to the merge.`,
+    );
+  }
 
   return lines;
 }
@@ -395,9 +395,7 @@ export function protectionHeadline(status: TaskProtectionStatus): string | null 
     : status.taskGate
       ? 'protected (task gate)'
       : `protected (merges into \`${status.branchGate!.branch}\`)`;
-  return status.pendingApproval
-    ? `${PROTECTED_MARKER} ${what} — approval pending`
-    : `${PROTECTED_MARKER} ${what} — needs \`lazy approve\``;
+  return `${PROTECTED_MARKER} ${what} — accept prompts for the passphrase`;
 }
 
 /**
@@ -416,8 +414,8 @@ export function protectionToJson(status: TaskProtectionStatus): Record<string, u
     branch_gate: status.branchGate
       ? { branch: status.branchGate.branch, source: status.branchGate.source }
       : null,
-    approval_pending: status.pendingApproval
-      ? { approved_at: status.pendingApproval.approvedAt }
+    pending_review: status.pendingReview
+      ? { actor: status.pendingReview.actor, recorded_at: status.pendingReview.recordedAt }
       : null,
     markers: protectionMarkers(status),
     summary: protectionSummary(status),

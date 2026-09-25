@@ -6,19 +6,23 @@
  */
 
 import { join } from 'path';
+import { formatDate } from '../../utils/format';
+import { shortId, displayId, getWorktreePath, getBranchName } from '../../task/identity';
 import { existsSync } from 'fs';
 import { Terminal, getTerminalSize, type KeyPress } from './terminal';
 import { render, renderTreeOverlay, renderHelpOverlay, flattenNavItems, formatMarkdown, colorDiff, wrapLines, statusColor, type NavItem, type LayoutState, type TreeOverlayNode, type SubtaskFilterMode } from './renderer';
-import { getDiffStat, getDiffFull, getCurrentBranch, getRemoteDefaultBranch, getCommitDiff, getCommitChangedFiles, getFileAtCommit, branchExists, recoverMissingWorktreeWithFetch } from '../../git/operations';
-import { shortId, displayId, requireStorage, formatDate, getWorktreePath, getBranchName, getBranchNameFromId } from '../helpers';
+import { getDiffStat, getDiffFull, getCurrentBranch, getCommitDiff, getCommitChangedFiles, getFileAtCommit, branchExists, recoverMissingWorktreeWithFetch } from '../../git/operations';
+import { gitDiffPaths, resolveTaskDirectDiff } from '../../task-diff-base';
+import { requireStorage } from '../helpers';
 import type { TaskTreeNode } from '../../storage/types';
-import { getNewNotesSince } from '../commands/shared';
+import { getNewNotesSince, resolveNotesCutoff } from '../../task/turn-context';
 import { groupTurnsIntoChunks } from '../../utils/turn-chunks';
-import { formatTurnLaunchLabels } from '../../utils/turn-labels';
-import type { Task, Session, Turn, Comment, Commit, JournalEntry, FollowUp } from '../../types';
+import { formatTurnLaunchLabels, formatTurnModelWarning } from '../../utils/turn-labels';
+import type { Task, Session, Turn, Comment, Commit, JournalEntry, RaisedItem, TurnReport, FileDecision } from '../../types';
+import { REPORT_SECTION_LABELS, orderReportSections } from '../../review/report-policy';
 import { parentTaskIdOf } from '../../task-target';
 import type { Storage } from '../../storage';
-import { getDataDir } from '../init';
+import { getDataDir } from '../../project-paths';
 import { ansi } from './terminal';
 import { loadConfig } from '../../config/loader';
 import type { ResolvedConfig } from '../../config/types';
@@ -35,10 +39,11 @@ import {
  * resolved. Review must open for a task whatever the config says, so a failure
  * here is a missing line, never a failed review.
  *
- * The target branch is deliberately NOT taken from ReviewData: review resolves
- * a top-level task's target with `getRemoteDefaultBranch`, while accept — the
- * thing the gate actually stops — resolves it from the task's stored target.
- * The header must describe the gate that fires.
+ * The target branch is deliberately NOT taken from ReviewData: that is the ref
+ * the DIFF is rendered against (the resolved branch point, possibly
+ * `origin/<branch>`), while accept — the thing the gate actually stops —
+ * resolves the target from the task's stored target. The header must describe
+ * the gate that fires.
  */
 async function loadReviewProtection(
   storage: Storage,
@@ -76,10 +81,17 @@ export interface ReviewData {
   commits: Commit[];
   comments: Comment[];
   unseenComments: Comment[];
-  /** Append-only, prompt-immune journal entries (orchestration metadata / memories). */
+  /** Append-only journal entries (orchestration metadata / memories) — entry text never enters an agent prompt. */
   journal: JournalEntry[];
-  /** Passive, agent-recorded orthogonal-work notes. Display-only — never triggers anything. */
-  followUps: FollowUp[];
+  /**
+   * Everything the agent raised for a human — blocking items gate accept,
+   * non-blocking ones are the orthogonal proposals that used to be follow-ups.
+   */
+  raisedItems: RaisedItem[];
+  /** Structured end-of-turn report for the current session (if any). */
+  turnReport: TurnReport | null;
+  /** Keep/skip reasons from lazy_justify_* (display-only). */
+  fileDecisions: FileDecision[];
   diffStat: string;
   diffFull: string;
   worktreePath: string;
@@ -113,45 +125,61 @@ export async function loadReviewData(
 
   const parentId = parentTaskIdOf(task);
 
-  // Determine target branch
-  let targetBranch: string;
-  if (parentId) {
-    targetBranch = await getBranchNameFromId(parentId, storage);
-  } else {
-    targetBranch = await getRemoteDefaultBranch(root);
-  }
+  // The diff base is the ref the task branch was CUT from, resolved through the
+  // one shared resolver (src/task-diff-base.ts) so this surface cannot disagree
+  // with the launcher, the daemon diff, or accept. Reading the raw local default
+  // branch here is what showed a whole release as "the task's changes" in a
+  // freshly cloned project.
+  const resolvedConfig = config ?? await loadConfig(root);
+  const direct = await resolveTaskDirectDiff({
+    task,
+    session: session ?? ({} as Session),
+    storage,
+    projectRoot: root,
+    worktreePath: existsSync(worktreePath) ? worktreePath : root,
+    config: resolvedConfig,
+  });
+  const targetBranch = direct.base.ref;
+  const baseTwoDot = direct.base.twoDot;
+  const restrict = gitDiffPaths(direct);
 
   // Load all data in parallel (skip session-specific data if no session)
-  const [turns, commits, comments, journal, followUps, parentTask] = await Promise.all([
+  const [turns, commits, comments, journal, raisedItems, parentTask, turnReport, fileDecisions] = await Promise.all([
     session ? storage.getSessionTurns(session.id) : Promise.resolve([]),
     session ? storage.getSessionCommits(session.id) : Promise.resolve([]),
     storage.getTaskComments(task.id),
     storage.getTaskJournal(task.id),
-    storage.getTaskFollowUps(task.id),
+    storage.getTaskRaisedItems(task.id),
     parentId ? storage.getTask(parentId) : Promise.resolve(null),
+    session ? storage.getTurnReportBySession(task.id, session.id) : Promise.resolve(null),
+    storage.getTaskFileDecisions(task.id),
   ]);
 
   const lastAgentTurn = turns.filter(t => t.role === 'agent').pop() ?? null;
-  const unseenComments = lastAgentTurn
-    ? getNewNotesSince(comments, lastAgentTurn.timestamp)
-    : comments;
+  // Unseen = not yet delivered to the agent, the same cutoff the next unblock
+  // uses — an ask or sync in between must not make a queued comment look seen.
+  const unseenCutoff = resolveNotesCutoff(session, turns);
+  const unseenComments = unseenCutoff === null
+    ? comments
+    : getNewNotesSince(comments, unseenCutoff);
 
   // Load diff — prefer worktree (has uncommitted changes), fall back to
   // branch-based diff from the main repo when the worktree is gone (e.g.
   // accepted subtasks whose worktrees have been cleaned up).
   let diffStat = '';
   let diffFull = '';
-  if (existsSync(worktreePath)) {
+  if (restrict.empty) {
+    // Scoped hub with no files of its own — do not ask git for the whole tree.
+  } else if (existsSync(worktreePath)) {
     try {
-      diffStat = await getDiffStat(targetBranch, 'HEAD', worktreePath) || '';
+      diffStat = await getDiffStat(targetBranch, 'HEAD', worktreePath, baseTwoDot, restrict.paths) || '';
     } catch { /* branch may not exist */ }
     try {
-      diffFull = await getDiffFull(targetBranch, 'HEAD', worktreePath) || '';
+      diffFull = await getDiffFull(targetBranch, 'HEAD', worktreePath, baseTwoDot, restrict.paths) || '';
     } catch { /* branch may not exist */ }
   } else {
     // Worktree gone — try to recover from local or remote branch
     const taskBranch = session?.git_branch ?? getBranchName(task);
-    const resolvedConfig = config ?? await loadConfig(root);
     try {
       const recovery = await recoverMissingWorktreeWithFetch(
         worktreePath, taskBranch, resolvedConfig.remote.git_remote, root,
@@ -159,18 +187,18 @@ export async function loadReviewData(
       if (recovery.recovered) {
         // Worktree recovered — use it for diffing
         try {
-          diffStat = await getDiffStat(targetBranch, 'HEAD', worktreePath) || '';
+          diffStat = await getDiffStat(targetBranch, 'HEAD', worktreePath, baseTwoDot, restrict.paths) || '';
         } catch { /* branch may not exist */ }
         try {
-          diffFull = await getDiffFull(targetBranch, 'HEAD', worktreePath) || '';
+          diffFull = await getDiffFull(targetBranch, 'HEAD', worktreePath, baseTwoDot, restrict.paths) || '';
         } catch { /* branch may not exist */ }
       } else if (await branchExists(taskBranch, root)) {
         // Recovery failed but branch exists locally — diff from main repo root
         try {
-          diffStat = await getDiffStat(targetBranch, taskBranch, root) || '';
+          diffStat = await getDiffStat(targetBranch, taskBranch, root, baseTwoDot, restrict.paths) || '';
         } catch { /* branch comparison may fail */ }
         try {
-          diffFull = await getDiffFull(targetBranch, taskBranch, root) || '';
+          diffFull = await getDiffFull(targetBranch, taskBranch, root, baseTwoDot, restrict.paths) || '';
         } catch { /* branch comparison may fail */ }
       }
       // else: no worktree, no branch — fall through to empty diff
@@ -225,7 +253,10 @@ export async function loadReviewData(
   }
 
   return {
-    task, session, turns, commits, comments, unseenComments, journal, followUps,
+    task, session, turns, commits, comments, unseenComments, journal,
+    raisedItems,
+    turnReport,
+    fileDecisions,
     diffStat, diffFull, worktreePath, targetBranch, lastAgentTurn,
     turnInfoMap, taskTree, childTasks, parentTask,
     protection: await loadReviewProtection(storage, root, task, config),
@@ -267,7 +298,9 @@ async function loadReviewDataForSubtask(
       comments: await storage.getTaskComments(task.id),
       unseenComments: [],
       journal: await storage.getTaskJournal(task.id),
-      followUps: await storage.getTaskFollowUps(task.id),
+      raisedItems: await storage.getTaskRaisedItems(task.id),
+      turnReport: null,
+      fileDecisions: await storage.getTaskFileDecisions(task.id),
       diffStat: '',
       diffFull: '',
       worktreePath,
@@ -282,36 +315,43 @@ async function loadReviewDataForSubtask(
   }
 
   // Non-backlog sessionless tasks (e.g., completed with cleaned-up session,
-  // or missing session record) — still try to get branch diff
-  // Determine target branch for diff
-  let targetBranch = '';
-  if (parentId) {
-    targetBranch = await getBranchNameFromId(parentId, storage);
-  } else {
-    targetBranch = await getRemoteDefaultBranch(root);
-  }
+  // or missing session record) — still try to get branch diff, against the same
+  // resolved base as every other surface (src/task-diff-base.ts).
+  const sessionlessConfig = config ?? await loadConfig(root);
+  const sessionlessDirect = await resolveTaskDirectDiff({
+    task,
+    session: {} as Session,
+    storage,
+    projectRoot: root,
+    worktreePath: existsSync(worktreePath) ? worktreePath : root,
+    config: sessionlessConfig,
+  });
+  const targetBranch = sessionlessDirect.base.ref;
+  const baseTwoDot = sessionlessDirect.base.twoDot;
+  const sessionlessRestrict = gitDiffPaths(sessionlessDirect);
 
   let diffStat = '';
   let diffFull = '';
   const taskBranch = getBranchName(task);
-  if (existsSync(worktreePath)) {
-    try { diffStat = await getDiffStat(targetBranch, 'HEAD', worktreePath) || ''; } catch { /* */ }
-    try { diffFull = await getDiffFull(targetBranch, 'HEAD', worktreePath) || ''; } catch { /* */ }
+  if (sessionlessRestrict.empty) {
+    // Scoped hub with no files of its own.
+  } else if (existsSync(worktreePath)) {
+    try { diffStat = await getDiffStat(targetBranch, 'HEAD', worktreePath, baseTwoDot, sessionlessRestrict.paths) || ''; } catch { /* */ }
+    try { diffFull = await getDiffFull(targetBranch, 'HEAD', worktreePath, baseTwoDot, sessionlessRestrict.paths) || ''; } catch { /* */ }
   } else {
     // Worktree gone — try to recover from local or remote branch
-    const resolvedConfig = config ?? await loadConfig(root);
     try {
       const recovery = await recoverMissingWorktreeWithFetch(
-        worktreePath, taskBranch, resolvedConfig.remote.git_remote, root,
+        worktreePath, taskBranch, sessionlessConfig.remote.git_remote, root,
       );
       if (recovery.recovered) {
         // Worktree recovered — use it for diffing
-        try { diffStat = await getDiffStat(targetBranch, 'HEAD', worktreePath) || ''; } catch { /* */ }
-        try { diffFull = await getDiffFull(targetBranch, 'HEAD', worktreePath) || ''; } catch { /* */ }
+        try { diffStat = await getDiffStat(targetBranch, 'HEAD', worktreePath, baseTwoDot, sessionlessRestrict.paths) || ''; } catch { /* */ }
+        try { diffFull = await getDiffFull(targetBranch, 'HEAD', worktreePath, baseTwoDot, sessionlessRestrict.paths) || ''; } catch { /* */ }
       } else if (await branchExists(taskBranch, root)) {
         // Recovery failed but branch exists locally — diff from main repo root
-        try { diffStat = await getDiffStat(targetBranch, taskBranch, root) || ''; } catch { /* */ }
-        try { diffFull = await getDiffFull(targetBranch, taskBranch, root) || ''; } catch { /* */ }
+        try { diffStat = await getDiffStat(targetBranch, taskBranch, root, baseTwoDot, sessionlessRestrict.paths) || ''; } catch { /* */ }
+        try { diffFull = await getDiffFull(targetBranch, taskBranch, root, baseTwoDot, sessionlessRestrict.paths) || ''; } catch { /* */ }
       }
       // else: no worktree, no branch — fall through to empty diff
     } catch {
@@ -328,7 +368,9 @@ async function loadReviewDataForSubtask(
     comments: await storage.getTaskComments(task.id),
     unseenComments: [],
     journal: await storage.getTaskJournal(task.id),
-    followUps: await storage.getTaskFollowUps(task.id),
+    raisedItems: await storage.getTaskRaisedItems(task.id),
+    turnReport: null,
+    fileDecisions: await storage.getTaskFileDecisions(task.id),
     diffStat,
     diffFull,
     worktreePath,
@@ -523,8 +565,9 @@ export function buildNavItemsForTask(
   }
 
   // ── Journal (top-level, peer of Comments) ────────────────────────
-  // Append-only, prompt-immune side channel. No unseen tracking — journal
-  // entries are never delivered to the agent, so "seen by agent" is moot.
+  // Append-only, pull-based side channel. No unseen tracking — entry text is
+  // never delivered to the agent (it gets a count and reads on demand), so
+  // "seen by agent" is not something this view can or should claim.
   if (data.journal.length > 0) {
     const sorted = [...data.journal].reverse();
     const journalChildren: NavItem[] = sorted.map(entry => {
@@ -547,27 +590,52 @@ export function buildNavItemsForTask(
     });
   }
 
-  // ── Follow-ups (top-level, peer of Comments) ─────────────────────
-  // Passive, agent-recorded orthogonal-work notes — display only.
-  if (data.followUps.length > 0) {
-    const sorted = [...data.followUps].reverse();
-    const followUpChildren: NavItem[] = sorted.map(f => {
-      const firstLine = entryText(f).split('\n')[0];
+  // ── Raised items (everything the agent surfaced for a human) ─────
+  // One list: blocking items gate accept, non-blocking ones are the orthogonal
+  // proposals that used to live in a separate Follow-ups section.
+  if (data.raisedItems.length > 0) {
+    const open = data.raisedItems.filter(r => r.status === 'open');
+    const openBlocking = open.filter(r => r.blocking).length;
+    const sorted = [...data.raisedItems].reverse();
+    const raisedChildren: NavItem[] = sorted.map(r => {
+      const firstLine = entryText(r).split('\n')[0];
       const preview = firstLine.length > 25 ? firstLine.substring(0, 22) + '...' : firstLine;
+      // `!` is reserved for what stands between the reviewer and a merge.
+      const mark = r.status !== 'open' ? '·' : r.blocking ? '!' : '+';
       return {
-        key: `${keyPrefix}followup:${f.id}`,
-        label: preview,
-        icon: '📌',
+        key: `${keyPrefix}raised:${r.id}`,
+        label: `${mark} ${preview}`,
+        icon: r.blocking ? '❓' : '📌',
       };
     });
 
     items.push({
-      key: `${keyPrefix}followups`,
-      label: 'Follow-ups',
-      icon: '📌',
-      badge: `${data.followUps.length}`,
-      children: followUpChildren,
-      expanded: false,
+      key: `${keyPrefix}raised`,
+      label: 'Raised',
+      icon: '❓',
+      badge: openBlocking > 0
+        ? `${openBlocking} gating`
+        : open.length > 0 ? `${open.length} open` : `${data.raisedItems.length}`,
+      children: raisedChildren,
+      expanded: openBlocking > 0,
+    });
+
+  }
+
+  // ── Presentation walkthrough (TOC only — full snippets are web review) ──
+  if (data.turnReport?.presentation?.groups.length) {
+    const presChildren: NavItem[] = data.turnReport.presentation.groups.map((g, i) => ({
+      key: `${keyPrefix}pres:${i}`,
+      label: `[${g.tier}] ${g.title.length > 28 ? g.title.slice(0, 25) + '…' : g.title}`,
+      icon: '📋',
+    }));
+    items.push({
+      key: `${keyPrefix}presentation`,
+      label: 'Walkthrough',
+      icon: '📋',
+      badge: `${data.turnReport.presentation.groups.length}`,
+      children: presChildren,
+      expanded: true,
     });
   }
 
@@ -694,6 +762,37 @@ function buildTurnChildren(turn: Turn, data: ReviewData, keyPrefix: string = '')
       icon: '📦',
       badge: `${turnCommits.length}`,
       children: commitChildren,
+      expanded: false,
+    });
+  }
+
+  // Pre-turn setup hook — only recorded when it FAILED, so its presence alone
+  // is the finding. A healthy hook adds no node.
+  if (turn.pre_turn_exit_code !== undefined) {
+    children.push({
+      key: `${keyPrefix}turn-pre-turn:${seq}`,
+      label: 'Pre-turn hook',
+      icon: '✗',
+      badge: `exit ${turn.pre_turn_exit_code}`,
+    });
+  }
+
+  // The paths this turn left loose in the worktree. Recorded only when
+  // non-empty, so its presence alone is the finding — and the consequence a
+  // reviewer has to act on is that none of it is in the diff below, which is
+  // why the label says "not on the branch" here exactly as it does in `lazy
+  // show`, the web turn head and the accept refusal.
+  if (turn.uncommitted?.length) {
+    children.push({
+      key: `${keyPrefix}turn-uncommitted:${seq}`,
+      label: 'Uncommitted (not on the branch)',
+      icon: '⚠',
+      badge: `${turn.uncommitted.length}`,
+      children: turn.uncommitted.map(path => ({
+        key: `${keyPrefix}turn-uncommitted-file:${seq}:${path}`,
+        label: path,
+        icon: '📄',
+      })),
       expanded: false,
     });
   }
@@ -829,6 +928,16 @@ async function getContentForItem(key: string, dataMap: Map<string, ReviewData>, 
     return getTurnCommitsOverview(mainData, seq);
   }
 
+  // Per-turn uncommitted paths (the file child first — both start the same way)
+  if (key.startsWith('turn-uncommitted-file:')) {
+    const rest = key.substring('turn-uncommitted-file:'.length);
+    return [rest.substring(rest.indexOf(':') + 1)];
+  }
+  if (key.startsWith('turn-uncommitted:')) {
+    const seq = parseInt(key.substring('turn-uncommitted:'.length), 10);
+    return getTurnUncommittedContent(mainData, seq);
+  }
+
   // Per-turn check results
   if (key.startsWith('turn-check:')) {
     const seq = parseInt(key.substring(11), 10);
@@ -866,13 +975,13 @@ async function getContentForItem(key: string, dataMap: Map<string, ReviewData>, 
     return getSingleJournalEntryContent(mainData, entryId);
   }
 
-  // Follow-ups
-  if (key === 'followups') {
-    return getFollowUpsContent(mainData);
+  // Raised items
+  if (key === 'raised') {
+    return getRaisedItemsContent(mainData);
   }
-  if (key.startsWith('followup:')) {
-    const followUpId = key.substring(9);
-    return getSingleFollowUpContent(mainData, followUpId);
+  if (key.startsWith('raised:')) {
+    const raisedId = key.substring(7);
+    return getSingleRaisedItemContent(mainData, raisedId);
   }
 
   // All Commits (top-level)
@@ -908,6 +1017,8 @@ function getTurnContent(data: ReviewData, seq: number): string[] {
   // does not carry — never back-filled from the task's current settings.
   const detailLabels = formatTurnLaunchLabels(turn);
   if (detailLabels) lines.push(ansi.dim + detailLabels + ansi.reset);
+  const modelWarning = formatTurnModelWarning(turn);
+  if (modelWarning) lines.push(ansi.fg.yellow + modelWarning + ansi.reset);
   lines.push('');
 
   // Show violations prominently for agent turns (before the agent's response)
@@ -924,6 +1035,17 @@ function getTurnContent(data: ReviewData, seq: number): string[] {
       const statusLabel = statusColor + `[${v.status}]` + ansi.reset;
       lines.push(`  - ${v.file} ${statusLabel}`);
     }
+    lines.push('');
+  }
+
+  // Show pre-turn hook failure prominently — the agent worked in an environment
+  // its own project said was not ready, which colours everything below it.
+  if (turn.pre_turn_exit_code !== undefined) {
+    const msg = turn.pre_turn_exit_code === -2 ? 'PRE-TURN HOOK TIMED OUT'
+      : turn.pre_turn_exit_code === -1 ? 'PRE-TURN HOOK FAILED TO EXECUTE'
+      : `PRE-TURN HOOK FAILED (exit ${turn.pre_turn_exit_code})`;
+    lines.push(ansi.fg.red + ansi.bold + `✗ ${msg}` + ansi.reset);
+    if (turn.pre_turn_output) lines.push(...turn.pre_turn_output.split('\n'));
     lines.push('');
   }
 
@@ -990,6 +1112,24 @@ function getTurnCheckContent(data: ReviewData, seq: number): string[] {
   }
 
   return lines;
+}
+
+/**
+ * The paths a turn left loose. The wording is deliberately the same everywhere
+ * this appears — `lazy show`, the web turn head, the JSON projections and the
+ * accept refusal — because "uncommitted" is a git word and the consequence a
+ * reviewer acts on is that none of it is in the diff they are approving.
+ */
+function getTurnUncommittedContent(data: ReviewData, seq: number): string[] {
+  const turn = data.turns.find(t => t.sequence === seq);
+  if (!turn?.uncommitted?.length) {
+    return [ansi.dim + 'Nothing was left uncommitted when this turn ended.' + ansi.reset];
+  }
+  return [
+    ansi.fg.red + ansi.bold + '⚠ Uncommitted when this turn ended (not on the branch)' + ansi.reset,
+    '',
+    ...turn.uncommitted.map(path => '  ' + path),
+  ];
 }
 
 function getTurnCommitsOverview(data: ReviewData, seq: number): string[] {
@@ -1070,6 +1210,8 @@ function extractDiffFiles(diffFull: string): string[] {
 
 function getDiffOverview(data: ReviewData): string[] {
   const lines: string[] = [];
+  // Report-first: same three blocks as the web review page, then diff stats.
+  lines.push(...getReportFirstBlocks(data));
   lines.push(ansi.bold + 'Diff Summary' + ansi.reset);
   lines.push('');
   if (data.diffStat) {
@@ -1146,21 +1288,6 @@ function getJournalContent(data: ReviewData): string[] {
   return lines;
 }
 
-function getFollowUpsContent(data: ReviewData): string[] {
-  const lines: string[] = [];
-  lines.push(ansi.bold + `Follow-ups (${data.followUps.length})` + ansi.reset);
-  lines.push('');
-
-  // Show newest first
-  const sorted = [...data.followUps].reverse();
-  for (const f of sorted) {
-    lines.push(ansi.dim + `[${formatDate(f.created_at)}]` + ansi.reset);
-    lines.push(...entryText(f).split('\n'));
-    lines.push('');
-  }
-
-  return lines;
-}
 
 function getSingleJournalEntryContent(data: ReviewData, entryId: string): string[] {
   const entry = data.journal.find(e => e.id === entryId);
@@ -1173,14 +1300,163 @@ function getSingleJournalEntryContent(data: ReviewData, entryId: string): string
   return lines;
 }
 
-function getSingleFollowUpContent(data: ReviewData, followUpId: string): string[] {
-  const f = data.followUps.find(x => x.id === followUpId);
-  if (!f) return ['Follow-up not found.'];
+
+function getRaisedItemsContent(data: ReviewData): string[] {
+  const lines: string[] = [];
+  const open = data.raisedItems.filter(r => r.status === 'open');
+  const openBlocking = open.filter(r => r.blocking).length;
+  lines.push(
+    ansi.bold +
+    `Raised items (${data.raisedItems.length}, ${openBlocking} open blocking, ${open.length - openBlocking} open non-blocking)` +
+    ansi.reset,
+  );
+  lines.push(ansi.dim + 'Accept refuses while a BLOCKING item is open — respond, promote, dismiss, or acknowledge each. Non-blocking items are proposals and never gate.' + ansi.reset);
+  lines.push('');
+
+  // Blocking first: what stands between the reviewer and a merge leads.
+  const sorted = [...data.raisedItems].reverse()
+    .sort((a, b) => Number(b.blocking) - Number(a.blocking));
+  for (const r of sorted) {
+    const statusColor = r.status === 'open' ? ansi.fg.yellow : ansi.fg.green;
+    lines.push(
+      ansi.dim + `[${formatDate(r.created_at)}]` + ansi.reset + ' ' +
+      statusColor + r.status + ansi.reset + ' ' +
+      (r.blocking ? ansi.fg.yellow + 'gates accept' : ansi.dim + 'fyi') + ansi.reset + ' ' +
+      ansi.dim + r.id.slice(0, 8) + ansi.reset,
+    );
+    lines.push(...entryText(r).split('\n'));
+    if (r.options?.length) {
+      for (const opt of r.options) {
+        lines.push(ansi.dim + `  · ${opt}` + ansi.reset);
+      }
+    }
+    if (r.resolution) {
+      lines.push(ansi.dim + `  → ${r.resolution}` + ansi.reset);
+    }
+    lines.push('');
+  }
+
+  return lines;
+}
+
+function getSingleRaisedItemContent(data: ReviewData, raisedId: string): string[] {
+  const r = data.raisedItems.find(x => x.id === raisedId || x.id.startsWith(raisedId));
+  if (!r) return ['Raised item not found.'];
 
   const lines: string[] = [];
-  lines.push(ansi.dim + `Date: ${formatDate(f.created_at)}` + ansi.reset);
+  lines.push(ansi.dim + `Id: ${r.id.slice(0, 8)}` + ansi.reset);
+  lines.push(ansi.dim + `Status: ${r.status}` + ansi.reset);
+  lines.push(
+    ansi.dim + `Gate: ${r.blocking ? 'blocking — accept refuses while open' : 'non-blocking — never gates accept'}` + ansi.reset,
+  );
+  lines.push(ansi.dim + `Date: ${formatDate(r.created_at)}` + ansi.reset);
   lines.push('');
-  lines.push(...entryText(f).split('\n'));
+  lines.push(...entryText(r).split('\n'));
+  if (r.options?.length) {
+    lines.push('');
+    lines.push(ansi.bold + 'Options:' + ansi.reset);
+    for (const opt of r.options) {
+      lines.push(`  · ${opt}`);
+    }
+  }
+  if (r.resolution) {
+    lines.push('');
+    lines.push(ansi.bold + 'Resolution:' + ansi.reset);
+    lines.push(r.resolution);
+  }
+  return lines;
+}
+
+/**
+ * The report-first blocks shared by task overview and diff overview:
+ * open raised items → structured/prose agent report → untriaged follow-ups
+ * → maintain skip reasons.
+ *
+ * INVARIANT: when a TurnReport is present, render sections in array order —
+ * never reorder by kind.
+ */
+function getReportFirstBlocks(data: ReviewData): string[] {
+  const lines: string[] = [];
+  const openRaised = data.raisedItems.filter(r => r.status === 'open' && r.blocking);
+  if (openRaised.length > 0) {
+    lines.push(ansi.bold + ansi.fg.yellow + `── Open blocking raised items (${openRaised.length}) ──` + ansi.reset);
+    lines.push(ansi.dim + 'Accept refuses until each is responded to, promoted, dismissed, or acknowledged.' + ansi.reset);
+    lines.push('');
+    for (const r of openRaised) {
+      lines.push(ansi.fg.yellow + `  [${r.id.slice(0, 8)}]` + ansi.reset + ` ${entryText(r).split('\n')[0]}`);
+      if (r.options?.length) {
+        for (const opt of r.options) {
+          lines.push(ansi.dim + `      · ${opt}` + ansi.reset);
+        }
+      }
+    }
+    lines.push('');
+  }
+
+  if (data.turnReport && data.turnReport.sections.length > 0) {
+    const seq =
+      data.turnReport.turn_sequence != null
+        ? `turn #${data.turnReport.turn_sequence}`
+        : data.lastAgentTurn
+          ? `turn #${data.lastAgentTurn.sequence}`
+          : 'structured';
+    lines.push(ansi.bold + ansi.fg.cyan + `── Agent report (${seq}) ──` + ansi.reset);
+    lines.push('');
+    // INVARIANT (narrowed 2026-09): human-facing renderers rank kinds so
+    // behavior lands above implementation; agent order is kept within a tier.
+    for (const section of orderReportSections(data.turnReport.sections)) {
+      const label = REPORT_SECTION_LABELS[section.kind] ?? section.kind;
+      lines.push(ansi.bold + label + ansi.reset);
+      const formatted = formatMarkdown(section.body);
+      const previewLimit = 20;
+      if (formatted.length > previewLimit) {
+        lines.push(...formatted.slice(0, previewLimit));
+        lines.push(ansi.dim + `… ${formatted.length - previewLimit} more lines in this section.` + ansi.reset);
+      } else {
+        lines.push(...formatted);
+      }
+      lines.push('');
+    }
+  } else if (data.lastAgentTurn) {
+    const raw = turnText(data.lastAgentTurn);
+    lines.push(ansi.bold + ansi.fg.cyan + `── Agent report (turn #${data.lastAgentTurn.sequence}) ──` + ansi.reset);
+    lines.push('');
+    // Cap the overview preview; full turn is under Turns in the nav.
+    const previewLimit = 40;
+    const formatted = formatMarkdown(raw);
+    if (formatted.length > previewLimit) {
+      lines.push(...formatted.slice(0, previewLimit));
+      lines.push('');
+      lines.push(ansi.dim + `… ${formatted.length - previewLimit} more lines — open the turn for the full report.` + ansi.reset);
+    } else {
+      lines.push(...formatted);
+    }
+    lines.push('');
+  }
+
+  const openFyi = data.raisedItems.filter(r => r.status === 'open' && !r.blocking);
+  if (openFyi.length > 0) {
+    lines.push(ansi.bold + `── Open non-blocking raised items (${openFyi.length}) ──` + ansi.reset);
+    lines.push(ansi.dim + 'Optional — these never block accept.' + ansi.reset);
+    lines.push('');
+    for (const r of openFyi) {
+      const first = entryText(r).split('\n')[0];
+      lines.push(`  • ${first}`);
+    }
+    lines.push('');
+  }
+
+
+  const maintainSkips = data.fileDecisions.filter(d => d.scope === 'maintain');
+  if (maintainSkips.length > 0) {
+    lines.push(ansi.bold + `── Maintained groups skipped (${maintainSkips.length}) ──` + ansi.reset);
+    lines.push('');
+    for (const d of maintainSkips) {
+      lines.push(`  • ${d.target}: ${d.reason.split('\n')[0]}`);
+    }
+    lines.push('');
+  }
+
   return lines;
 }
 
@@ -1323,6 +1599,9 @@ function getTaskOverviewContent(data: ReviewData): string[] {
   const task = data.task;
   const lines: string[] = [];
 
+  // Report-first blocks lead the overview (structural-agent-questions).
+  lines.push(...getReportFirstBlocks(data));
+
   lines.push(ansi.bold + `Task ${displayId(task)}` + ansi.reset);
   lines.push('');
 
@@ -1381,8 +1660,20 @@ function getTaskOverviewContent(data: ReviewData): string[] {
   if (data.journal.length > 0) {
     lines.push(`  ${ansi.bold}Journal:${ansi.reset} ${data.journal.length}`);
   }
-  if (data.followUps.length > 0) {
-    lines.push(`  ${ansi.bold}Follow-ups:${ansi.reset} ${data.followUps.length}`);
+  if (data.raisedItems.length > 0) {
+    const open = data.raisedItems.filter(r => r.status === 'open');
+    const gating = open.filter(r => r.blocking).length;
+    lines.push(`  ${ansi.bold}Raised:${ansi.reset}  ${data.raisedItems.length}` +
+      (gating > 0 ? ansi.fg.yellow + ` (${gating} gating accept)` + ansi.reset : '') +
+      (open.length - gating > 0 ? ansi.dim + ` (${open.length - gating} open non-blocking)` + ansi.reset : ''));
+  }
+  // Diff stats after the report-first blocks and metadata.
+  if (data.diffStat) {
+    lines.push('');
+    lines.push(ansi.bold + '  Diff:' + ansi.reset);
+    for (const line of data.diffStat.split('\n')) {
+      lines.push(`  ${line}`);
+    }
   }
   lines.push('');
   lines.push(ansi.dim + 'Expand this node to see its Turns, Comments, Commits, and Diff.' + ansi.reset);
@@ -2109,11 +2400,12 @@ export function buildStatusLine(data: ReviewData): string {
   if (data.unseenComments.length > 0) {
     parts.push(`${data.unseenComments.length} unseen comment(s)`);
   }
-  if (data.followUps.length > 0) {
-    parts.push(`${data.followUps.length} follow-up(s)`);
+  const gatingRaised = data.raisedItems.filter(r => r.status === 'open' && r.blocking).length;
+  if (gatingRaised > 0) {
+    parts.push(`${gatingRaised} raised item(s) gating accept`);
   }
   // Last, and only when there is a gate: the reviewer should learn that accept
-  // needs `lazy approve` here, not from accept refusing.
+  // prompts for the approval passphrase here, not from accept refusing.
   const protection = data.protection ? protectionHeadline(data.protection) : null;
   if (protection) {
     parts.push(protection);

@@ -138,6 +138,36 @@ describe('a completed response is never destroyed by the next command', () => {
     expect(agentTurns[0]!.content).toContain('everything I concluded');
   });
 
+  // INVARIANT: a displaced turn is never attributed to the turn that displaced
+  // it. The sweep runs LATE by construction — that is why its idempotency check
+  // is content-based rather than "is the last turn an agent turn?" — so by the
+  // time the row is written the session belongs to whoever asked for the NEWER
+  // turn. Reading the person off the session there put ivan's work, and ivan's
+  // token usage, on a row that said pete. Nothing that survived the
+  // displacement names ivan (the response file lives in an agent-writable
+  // worktree and is not an identity source), so the row names NOBODY: an
+  // unattributed row reads as it always did and can be corrected later, while a
+  // row naming the wrong person cannot even be recognised as wrong.
+  test('a displaced turn swept up after a newer turn names nobody, not the newer turn owner', async () => {
+    const { taskId, sessionId, protoDir } = await makeTask(env, 'working');
+
+    // Ivan's turn finished, and its response was displaced by the next command.
+    writeResponse(protoDir, finishedTurn);
+    writeCommand(protoDir, nextCommand(taskId));
+
+    // Pete asked for that next turn, so the session is pete's by now.
+    await env.storage.setSessionTurnOwner(sessionId, { email: 'pete@example.com', name: 'Pete' });
+
+    await sweepSupersededResponses(env.storage, env.lazyRoot);
+
+    const recovered = (await env.storage.getSessionTurns(sessionId)).find(
+      t => t.role === 'agent' && t.content.includes('everything I concluded'),
+    );
+    expect(recovered).toBeDefined();
+    expect(recovered!.actor_email).toBeUndefined();
+    expect(recovered!.actor_name).toBeUndefined();
+  });
+
   test('the session id of the superseded turn is reconciled, so pairing resumes it', async () => {
     const { taskId, sessionId, protoDir } = await makeTask(env, 'working');
 
@@ -179,5 +209,36 @@ describe('a stale sweep does not clobber a turn that started in the meantime', (
     // It must NOT drag the live turn back into the auto-resume queue.
     const task = await env.storage.getTask(taskId);
     expect(task?.status).toBe('working');
+  });
+
+  test('a superseded crash report does not overwrite the session id a newer turn recorded', async () => {
+    const { taskId, sessionId, protoDir } = await makeTask(env, 'interrupted');
+
+    // Turn N crashed in session A...
+    const staleCrashInSessionA: ErrorResponse = { ...staleCrash, session_id: 'crashed-turn-session' };
+    writeResponse(protoDir, staleCrashInSessionA);
+
+    // ...and before the sweep processed the report, the next turn started in
+    // session B and recorded itself. The real sweep loads the session fresh
+    // from storage, so the record already carries B when it acts.
+    writeCommand(protoDir, nextCommand(taskId));
+    await env.storage.updateTaskStatus(taskId, 'working', 'human');
+    await env.storage.updateSessionClaudeId(sessionId, 'running-turn-session');
+
+    await handleErrorResponse(
+      env.storage,
+      taskId,
+      { id: sessionId, agent_session_id: 'running-turn-session' },
+      staleCrashInSessionA,
+      protoDir,
+      env.lazyRoot,
+    );
+
+    // INVARIANT: a stale turn's crash report must not redirect the next launch
+    // into the stale turn's conversation. shouldReconcileAgentSessionId only
+    // compares reported != stored, so it is the superseded-response guard — not
+    // the predicate — that keeps turn N's id from clobbering turn N+1's.
+    const session = await env.storage.getSession(sessionId);
+    expect(session?.agent_session_id).toBe('running-turn-session');
   });
 });

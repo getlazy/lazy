@@ -1,14 +1,16 @@
 import { join } from 'path';
+import { requireActorIdentity } from '../identity-preflight';
+import { shortId, displayId, validateCode, taskRef, getWorktreePath } from '../../task/identity';
 import { existsSync } from 'fs';
-import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, validateModel, validateCode, resolveTaskOrExit, taskRef, getWorktreePath } from '../helpers';
+import { requireLazyRoot, requireStorage, parseFlags, validateModel, resolveTaskOrExit } from '../helpers';
 import { getCurrentSha } from '../../git/operations';
 import { openEditor, promptLine, promptYesNo, removeRecoveryFile, requireTTY } from '../editor';
 import { commandStart } from './start';
 
 
-import { getDataDir } from '../init';
+import { getDataDir } from '../../project-paths';
 import { loadConfig } from '../../config/loader';
-import { resolveAgentForNewTask } from '../../agent/task-agent';
+import { resolveAgentForNewTaskFromConfig } from '../../agent/task-agent';
 
 export async function commandBranch(args: string[]): Promise<void> {
   // Parse and validate flags
@@ -25,6 +27,10 @@ export async function commandBranch(args: string[]): Promise<void> {
     branchUsage();
     process.exit(1);
   }
+
+  // Before the branch task's goal and prompt is typed: the daemon refuses a write it cannot
+  // attribute, and a refusal must never cost the human what they wrote.
+  await requireActorIdentity();
 
   const root = requireLazyRoot();
   const storage = await requireStorage();
@@ -122,16 +128,21 @@ export async function commandBranch(args: string[]): Promise<void> {
 
     // Create child task with parent reference. A subtask runs on its parent's
     // agent — it is a continuation of the parent's work, not a fresh task.
+    const [config, projectSettings] = await Promise.all([
+      loadConfig(requireLazyRoot()),
+      storage.getProjectSettings(),
+    ]);
     const childTask = await storage.createTask(
       childGoal,
       parentTask.id,
       branchFromSha,
       childCode,
       undefined,
-      resolveAgentForNewTask({
-        inheritFrom: parentTask,
-        configDefault: (await loadConfig(requireLazyRoot())).agent.agent_id,
-      }),
+      resolveAgentForNewTaskFromConfig(
+        { inheritFrom: parentTask },
+        config.agent,
+        projectSettings,
+      ).agentId,
     );
 
     // Set prompt
@@ -187,7 +198,7 @@ Arguments:
 Options:
   --goal <goal>      Goal for the variant (default: parent goal + "(variant)")
   --prompt <text>    Prompt for the variant (default: inherit parent's prompt)
-  --model <model>    Override model for the variant (e.g. opus, sonnet, claude-opus-4-8)
+  --model <model>    Override model for the variant (e.g. opus, sonnet, claude-opus-5)
   --code <code>      Set a human-readable code for the variant task
   --yes              Skip confirmation prompt when starting the variant task
 

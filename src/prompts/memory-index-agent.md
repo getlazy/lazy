@@ -17,5 +17,6 @@ final summary and let the human decide.
 Do NOT use your harness's own memory feature (a memory directory in your
 sandbox) for anything you want remembered: that directory is per-sandbox and is
 discarded when your task ends. Lazy memory is the shared, durable store; the
-task journal (`lazy_journal`) is for per-task rationale that should stay out of
-prompts.
+task journal (`lazy_journal`) is for per-task rationale whose text stays out of
+prompts — a later turn is told only how many new entries exist, and reads them
+on demand.

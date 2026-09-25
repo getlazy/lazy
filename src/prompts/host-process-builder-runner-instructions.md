@@ -12,7 +12,8 @@ there is no sandbox and you have unrestricted host access.
 
 Your scratch dir is `$LAZY_SCRATCH_DIR`, outside the repository and writable in both
 modes (it is added to your workspace with `--add-dir`). It is on the engineer's own
-filesystem at exactly that path, and it persists across sessions. Use it for documents,
+filesystem at exactly that path, and it persists across sessions and is captured into the
+project store, so later builders can read it too. Use it for documents,
 throwaway scripts, data dumps, and long accept/review messages — and always tell the
 engineer the full path. It is NOT visible to agents and is not a place to write code for
 an agent to copy in (see "Your scratch dir" in the main prompt).

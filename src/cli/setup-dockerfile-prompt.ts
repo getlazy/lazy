@@ -10,15 +10,21 @@
 import setupDockerfilePrompt from '../prompts/setup-dockerfile.md' with { type: 'text' };
 import { getAgentPackaging, agentDisplayName } from '../agent/registry';
 
-export function renderSetupDockerfilePrompt(agentId: string): string {
-  const name = agentDisplayName(agentId);
+/**
+ * @param harness The agent BINARY the image must install — not a profile name.
+ *   Packaging is keyed by harness, so the caller resolves `[agent] agent_id`
+ *   through the profile table before calling.
+ */
+export function renderSetupDockerfilePrompt(harness: string): string {
+  const name = agentDisplayName(harness);
   let install: string;
   try {
-    install = getAgentPackaging(agentId).dockerInstallCommand();
+    install = getAgentPackaging(harness).dockerInstallCommand();
   } catch {
-    // Unknown agent id (a hand-edited lazy.toml). Seeding a task is best-effort
-    // context, never a reason to fail init — name the agent and let the seeded
-    // task's own agent fill in its installer.
+    // Unknown harness (a hand-edited lazy.toml, or a profile naming one lazy
+    // does not implement). Seeding a task is best-effort context, never a reason
+    // to fail init — name the agent and let the seeded task's own agent fill in
+    // its installer.
     install = `RUN <install the ${name} CLI>`;
   }
   return setupDockerfilePrompt

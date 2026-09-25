@@ -195,7 +195,7 @@ auto_react_daily_budget = 100
       const { loadConfig } = await import('../../src/config/loader');
       // Pass cwd: tempDir so findConfigDir starts searching from the temp dir,
       // not from the test process's cwd (which would find the repo's lazy.toml).
-      const config = await loadConfig(tempDir, { cwd: tempDir });
+      const config = await loadConfig(tempDir);
 
       expect(config.daemon.auto_react_max_retries).toBe(5);
       expect(config.daemon.auto_react_backoff).toBe('linear');

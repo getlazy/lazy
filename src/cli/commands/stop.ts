@@ -1,7 +1,11 @@
-import { requireStorage, displayId, parseFlags, resolveTaskOrExit } from '../helpers';
+import { requireStorage, parseFlags, resolveTaskOrExit } from '../helpers';
+import { requireActorIdentity } from '../identity-preflight';
+import { displayId } from '../../task/identity';
 import { promptLine, isTTY, readStdinIfPiped } from '../editor';
 import { queryStopTask } from '../../daemon/rpc-fallback';
-import { theme } from '../theme';
+import { stoppableClaimOf } from '../../daemon/in-flight-turn';
+import { createPhaseDisplay } from '../phase-display';
+import { theme } from '../../render/theme';
 
 const DEFAULT_STOP_REASON = 'Stopping to change direction';
 
@@ -17,6 +21,10 @@ export async function commandStop(args: string[]): Promise<void> {
     process.exit(1);
   }
 
+  // Before the stop reason is typed: the daemon refuses a write it cannot
+  // attribute, and a refusal must never cost the human what they wrote.
+  await requireActorIdentity();
+
   const skipPrompt = parsed.flags.get('yes') === true;
   const reasonFromFlag = parsed.flags.get('reason') as string | undefined;
 
@@ -24,13 +32,22 @@ export async function commandStop(args: string[]): Promise<void> {
   // Per CLAUDE.md "Save first, act second" — we should never ask the user to
   // type feedback only to throw it away because the task wasn't stoppable.
   let taskDisplayId = taskId;
+  let claimOwner: 'ask' | 'review' | null = null;
   {
     const storage = await requireStorage();
     try {
       const task = await resolveTaskOrExit(storage, taskId);
       taskDisplayId = displayId(task);
+      claimOwner = stoppableClaimOf(task)?.owner as 'ask' | 'review' | undefined ?? null;
 
-      if (task.status !== 'working') {
+      // THE CLAIM OUTRANKS THE STATUS — the same rule the daemon routes on, read
+      // from its own module rather than restated here. A live ask/review claim
+      // on a task whose status says `blocked` means a turn is running, or died
+      // and left its record behind, and opening that disagreement is exactly
+      // what an operator needs this verb for. While this pre-flight kept its own
+      // `status !== 'working'` copy, the daemon's claim route was unreachable
+      // from the CLI and the wedge still answered "blocked, not working".
+      if (task.status !== 'working' && !claimOwner) {
         console.error(
           `Task ${taskDisplayId} is ${task.status}, not working. ` +
           `Only running tasks can be stopped.`,
@@ -71,11 +88,34 @@ export async function commandStop(args: string[]): Promise<void> {
   }
 
   try {
-    const result = await queryStopTask({ taskId, reason });
-    console.log(`\nTask ${theme.taskId(result.displayId)} stopped.`);
-    console.log(`  Reason: ${result.reason}`);
-    console.log(`  Status: blocked (will not auto-resume)`);
-    console.log(`\nTo continue: ${theme.command('lazy unblock ' + result.displayId)}`);
+    const display = createPhaseDisplay();
+    let result;
+    try {
+      result = await queryStopTask({ taskId, reason }, display);
+    } finally {
+      display.close();
+    }
+    // WHICH ENDING RAN IS THE DAEMON'S ANSWER, not ours to re-derive: the
+    // pre-flight snapshot above was taken before the reason prompt, which a
+    // person can sit on for minutes, so a claim that settled in that window
+    // would have had us announcing "the task itself was not stopped" about a
+    // task just stopped with auto-resume disabled. The snapshot is the fallback
+    // only for a daemon too old to send the field.
+    const endedClaim = result.ended ? result.ended === 'claim' : claimOwner !== null;
+    if (endedClaim) {
+      // A stopped ask/review is a VISITOR being shown out: the status it found
+      // is restored, the user-stopped gate is never set, and the task needs no
+      // unblock to be usable. Saying "blocked (will not auto-resume)" here — the
+      // work-turn ending — would describe a task lazy did not leave behind.
+      console.log(`\n${claimOwner === 'ask' ? 'Ask' : 'Review'} on ${theme.taskId(result.displayId)} stopped.`);
+      console.log(`  Reason: ${result.reason}`);
+      console.log(`  Status: restored to what the ${claimOwner ?? 'review'} found (the task itself was not stopped)`);
+    } else {
+      console.log(`\nTask ${theme.taskId(result.displayId)} stopped.`);
+      console.log(`  Reason: ${result.reason}`);
+      console.log(`  Status: blocked (will not auto-resume)`);
+      console.log(`\nTo continue: ${theme.command('lazy unblock ' + result.displayId)}`);
+    }
   } catch (err) {
     console.error(`Error: ${err instanceof Error ? err.message : err}`);
     process.exit(1);
@@ -89,7 +129,8 @@ Halt a running task without auto-resume. Records a human turn note and sets
 the user-stopped flag so the reconciler will NOT auto-resume the task.
 
 Arguments:
-  <task_id>    ID or code of the task to stop (must be in 'working' status)
+  <task_id>    ID or code of the task to stop (running, or carrying a
+               review/ask that is still running on it)
 
 Options:
   --reason "..."  Reason for stopping (default: "${DEFAULT_STOP_REASON}")
@@ -98,8 +139,10 @@ Options:
 Reason input priority: --reason flag > piped stdin > interactive prompt > default.
 
 Notes:
-  - Only running ('working') tasks can be stopped. For other statuses, use
-    \`lazy close\` or \`lazy unblock\` as appropriate.
+  - Running ('working') tasks can be stopped. So can a task carrying a
+    \`lazy review\` or \`lazy ask\` that is still running on it, whatever its
+    status reads — that ends the review or ask only, and restores the status it
+    found. For anything else, use \`lazy close\` or \`lazy unblock\`.
   - The task transitions to 'blocked' (with a user-stopped gate). Unlike a
     crash, the reconciler will NOT auto-resume — a manual \`lazy unblock\` is
     required to continue.

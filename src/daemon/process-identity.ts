@@ -16,9 +16,11 @@
  *
  * THE SIGNALS, STRONGEST FIRST
  * ----------------------------
- * 1. **The daemon answers on its own unix socket.** Definitive: only a live
- *    lazy daemon serving THIS dir can respond there. Immune to PID reuse
- *    because it never looks at a PID. (Probed by the registry, not here.)
+ * 1. **The daemon answers /daemon/status on the dir's recorded TCP port AND
+ *    names the dir's project root.** Definitive: the port window is shared
+ *    across projects, so a bare answer proves nothing — the project-root match
+ *    is what binds the answer to THIS dir. Immune to PID reuse because it
+ *    never looks at a PID. (Probed by the registry, not here.)
  * 2. **The daemon holds an flock on `daemon.lock`.** The daemon acquires it at
  *    startup and holds it for its entire lifetime; the OS releases it on exit,
  *    crash or SIGKILL (see acquireDaemonLock). If we can take the lock, nothing
@@ -29,10 +31,10 @@
  *    dirs predating flock enforcement have none. Weakest of the three, so it is
  *    only consulted last.
  *
- * If NONE of the three can be evaluated (no socket, no lock file, and the
- * command line cannot be read) we deliberately fall back to "assume it is a
- * daemon". Being wrong in that direction leaves a phantom in the list; being
- * wrong the other way would let `--prune-dirs` delete a live daemon's socket
+ * If NONE of the three can be evaluated (no status answer, no lock file, and
+ * the command line cannot be read) we deliberately fall back to "assume it is
+ * a daemon". Being wrong in that direction leaves a phantom in the list; being
+ * wrong the other way would let `--prune-dirs` delete a live daemon's state
  * and token, or let `kill-stray` kill a stranger's process.
  */
 

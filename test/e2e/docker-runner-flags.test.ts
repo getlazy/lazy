@@ -2,7 +2,7 @@ import { describe, test, beforeEach, afterEach } from 'bun:test';
 import { join } from 'path';
 import { writeFileSync, readFileSync } from 'fs';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { expectSuccess, expectOutput, expectOutputExcludes } from '../helpers/assertions';
+import { expectSuccess, expectOutput, expectOutputExcludes, expectFailure } from '../helpers/assertions';
 import { createTask } from '../helpers/fixtures';
 
 // The `lazy init` template ALREADY writes a [runner] section. Appending a second
@@ -87,7 +87,7 @@ describe('docker runner flags', () => {
     expectOutputExcludes(result, "Unknown config option 'runner'");
   });
 
-  test('host-process runner still works with [runner] section', async () => {
+  test('host-process runner in [runner] section is rejected', async () => {
     const configPath = join(ctx.root, 'lazy.toml');
     const existingConfig = readFileSync(configPath, 'utf-8');
     writeFileSync(
@@ -96,7 +96,8 @@ describe('docker runner flags', () => {
     );
 
     const result = await ctx.lazy(['doctor']);
-    expectOutput(result, 'Runner mode: host-process');
-    expectOutputExcludes(result, 'Docker installed');
+    expectFailure(result);
+    expectOutput(result, 'Host-process runner is no longer supported');
+    expectOutputExcludes(result, 'Invalid runner type');
   });
 });

@@ -99,6 +99,52 @@ describe('proxy policy engine — secret-path reads', () => {
     expect(evaluateToolUse('Read', { file_path: '/home/user/.ssh/id_rsa' }, cfg()).action).toBe('deny');
   });
 
+  // REGRESSION: a `.env.example` is a committed template with placeholder
+  // values — the exact file an agent must read to update deploy docs. Denying it
+  // as a "secret path" ended a real agent turn mid-task (fix-proxy-env-example-block).
+  test('allows reads of template files (.example / .sample / .template)', () => {
+    for (const p of [
+      '/app/lazy-teams/deploy/.env.example',
+      '/app/.env.sample',
+      '/app/config/.env.template',
+      '/app/deploy/.env.EXAMPLE',
+      '/app/credentials.json.example',
+      '/app/config.pem.sample',
+    ]) {
+      const d = evaluateToolUse('Read', { path: p }, cfg());
+      expect(d.action).toBe('allow');
+    }
+  });
+
+  // INVARIANT: the template carve-out must not weaken the guard for real secret
+  // files. It keys off a template SUFFIX on the file name only — a real secret
+  // path stays denied even when a template-looking segment appears elsewhere,
+  // and the carve-out never applies inside a credential DIRECTORY, where nothing
+  // is legitimately a committed template.
+  test('still denies real secret paths near the template carve-out', () => {
+    for (const p of [
+      '/app/.env',                      // the real thing
+      '/app/.env.local',
+      '/app/.env.example.bak',          // a copy of a template is not a template
+      '/app/example/.env',              // "example" as a directory, not a suffix
+      '/home/u/.ssh/id_rsa.example',    // inside a credential directory
+      '/home/u/.aws/credentials.example',
+    ]) {
+      const d = evaluateToolUse('Read', { path: p }, cfg());
+      expect(d.action).toBe('deny');
+      if (d.action === 'deny') expect(d.rule).toBe('secret-path-read');
+    }
+  });
+
+  // The carve-out is scoped to the built-in secret-path rule. Deny globs are
+  // written by hand by an operator and stay literal.
+  test('the template carve-out does NOT relax operator-written deny globs', () => {
+    const config = cfg({ denyPathGlobs: ['**/.env*'] });
+    const d = evaluateToolUse('Read', { path: '/app/.env.example' }, config);
+    expect(d.action).toBe('deny');
+    if (d.action === 'deny') expect(d.rule).toBe('path-glob-deny');
+  });
+
   test('is disabled when denySecretPathReads is false', () => {
     expect(evaluateToolUse('Read', { path: '/home/user/.ssh/id_rsa' }, cfg({ denySecretPathReads: false })).action).toBe('allow');
   });

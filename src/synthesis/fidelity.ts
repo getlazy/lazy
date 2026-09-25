@@ -20,6 +20,8 @@ import type { Summarizer, SummarizerInput } from './summarizer';
 import { getSummarizer } from './summarizer';
 import { logger } from '../utils/logger';
 import { turnText, MISSING_TURN_CONTENT } from '../utils/turn-content';
+import { formatTurnTypeSuffix } from '../utils/turn-labels';
+import { formatUnparsedReviewSuffix } from '../review/parse-report';
 
 /**
  * Delimiters for the lazy-owned section of a PR/MR description. HTML comments
@@ -48,7 +50,7 @@ function commitSubject(message: string): string {
 /** Describe a turn for the event bundle, distinguishing human feedback. */
 function formatTurn(turn: Turn): string {
   const who = turn.role === 'human' ? (turn.actor ?? 'human') : 'agent';
-  const kind = turn.turn_type === 'ask' ? ' (ask)' : turn.turn_type === 'nudge' ? ' (nudge)' : turn.turn_type === 'sync' ? ' (sync)' : '';
+  const kind = `${formatTurnTypeSuffix(turn)}${formatUnparsedReviewSuffix(turn)}`;
   const auto = turn.auto_triggered ? ' (auto)' : '';
   // Crashed/recovered turns from older writes can lack `content` entirely.
   // Render a placeholder — the turn's existence is itself signal — and never
@@ -166,6 +168,7 @@ export async function synthesizeFidelityBody(
 
   try {
     const summary = await summarizer.summarize(input);
+    synthesisSuccesses++;
     return { summary, synthesized: true };
   } catch (err) {
     logger.warn(
@@ -174,6 +177,27 @@ export async function synthesizeFidelityBody(
     );
     return { summary: deterministicSummary(commitSubjects), synthesized: false };
   }
+}
+
+/**
+ * How many times synthesis has SUCCEEDED in this process.
+ *
+ * Summarizer availability is process-wide, not per task: every synthesis runs
+ * on the same builder role target with the same credential, so one success
+ * anywhere — a sync refresh, an accept, a child-accept — proves the capability
+ * is back for everyone. A caller that has stopped attempting synthesis for a
+ * task can watch this count instead of spending probe calls of its own to find
+ * out; while it has not moved, nothing has demonstrated that a retry would do
+ * anything but fail again.
+ *
+ * Monotonic and never reset: callers compare against a value they captured, so
+ * only movement is meaningful and wrap-around is not a concern at one
+ * increment per model call.
+ */
+let synthesisSuccesses = 0;
+
+export function synthesisSuccessCount(): number {
+  return synthesisSuccesses;
 }
 
 /** Wrap a summary in the lazy-owned delimiters. */
@@ -204,6 +228,25 @@ export function applyFidelitySection(existingBody: string, summary: string): str
   return base.length > 0 ? `${base}\n\n${wrapped}` : wrapped;
 }
 
+/**
+ * What happened to the REMOTE description on a regeneration. A caller that
+ * tracks "which turns are reflected in the PR/MR" must branch on this and not
+ * on `warning`: two of the four outcomes leave the description untouched and
+ * only ONE of them carries a warning.
+ *
+ *  - `written`            — updateRemoteBody succeeded; the description now
+ *                           reflects this summary.
+ *  - `not-attempted`      — the driver has no remote body to write (local
+ *                           driver, or no PR/MR yet). Nothing is pending.
+ *  - `synthesis-fallback` — synthesis fell back to the deterministic commit
+ *                           list, so the write was deliberately SKIPPED rather
+ *                           than downgrade a good description to a worse one.
+ *                           The description is unchanged and still stale.
+ *  - `write-failed`       — updateRemoteBody threw; `warning` says why. The
+ *                           description is unchanged and still stale.
+ */
+export type FidelityRemoteOutcome = 'written' | 'not-attempted' | 'synthesis-fallback' | 'write-failed';
+
 export interface RegenerateResult {
   /**
    * Synthesized body to feed into the local squash commit
@@ -213,6 +256,55 @@ export interface RegenerateResult {
   fidelityBody?: string;
   /** Non-fatal warning when the remote body write failed (never blocks the caller). */
   warning?: string;
+  /**
+   * What happened to the remote description. Required, so every return path
+   * has to say — the absence of a warning used to be read as "the write
+   * landed", which is false on the `synthesis-fallback` path.
+   */
+  outcome: FidelityRemoteOutcome;
+}
+
+export interface WriteFidelityResult {
+  outcome: Extract<FidelityRemoteOutcome, 'written' | 'not-attempted' | 'write-failed'>;
+  /** Non-fatal warning when the write failed (never thrown). */
+  warning?: string;
+}
+
+/**
+ * Write an already-synthesized summary into the lazy-owned section of a PR/MR
+ * description. Never throws: a hard failure inside `updateRemoteBody` comes
+ * back as `write-failed` plus a warning, because every caller is on a
+ * non-critical path (an accept, a push, a sync tick) that must proceed.
+ *
+ * Separate from `regenerateFidelity` so a caller holding a summary whose write
+ * failed can RETRY THE WRITE without paying for synthesis again — a summarizer
+ * run is a model one-shot, and re-deriving the same text from unchanged
+ * storage would spend one to produce what the caller already has.
+ */
+export async function writeFidelityBody(
+  task: Task,
+  driver: RepositoryDriver,
+  summary: string,
+  opts: {
+    /**
+     * Log a failure at warn level (default true). A caller that RETRIES on a
+     * timer sets this false and decides for itself when a repeat is worth
+     * saying again — otherwise a write that can never succeed warns on every
+     * tick forever. The warning is still returned either way.
+     */
+    logWarning?: boolean;
+  } = {},
+): Promise<WriteFidelityResult> {
+  if (!driver.needsSync || !driver.hasRemoteRef(task)) return { outcome: 'not-attempted' };
+
+  try {
+    await driver.updateRemoteBody(task, summary);
+    return { outcome: 'written' };
+  } catch (err) {
+    const warning = `Could not update remote body for task ${task.id.slice(0, 8)}: ${err instanceof Error ? err.message : err}`;
+    if (opts.logWarning ?? true) logger.warn(warning);
+    return { outcome: 'write-failed', warning };
+  }
 }
 
 /**
@@ -228,6 +320,12 @@ export interface RegenerateResult {
  * enhancement, while remote writes fail hard *inside* updateRemoteBody — but
  * here we are on a non-critical path, so we catch the hard failure and surface
  * it as a warning rather than aborting the user's accept/push.
+ *
+ * `outcome` reports which of the two (if either) happened, and is the field to
+ * branch on when you care whether the DESCRIPTION changed. `warning` alone
+ * cannot answer that: a synthesis fallback writes nothing and warns nothing.
+ * To retry a failed write later, keep `fidelityBody` and call
+ * `writeFidelityBody` — do not call this again, which re-runs the summarizer.
  */
 export async function regenerateFidelity(
   storage: Storage,
@@ -238,20 +336,15 @@ export async function regenerateFidelity(
   const result = await synthesizeFidelityBody(storage, task, summarizer);
   if (!result.synthesized) {
     // Deterministic fallback everywhere — leave existing body/squash behavior.
-    return {};
+    // Note for callers tracking staleness: NOTHING was written remotely here,
+    // so the description still shows whatever it showed before. That is
+    // deliberate (never downgrade a synthesized description to a commit list),
+    // but it is not success — hence the distinct outcome.
+    return { outcome: 'synthesis-fallback' };
   }
 
-  let warning: string | undefined;
-  if (driver.needsSync && driver.hasRemoteRef(task)) {
-    try {
-      await driver.updateRemoteBody(task, result.summary);
-    } catch (err) {
-      warning = `Could not update remote body for task ${task.id.slice(0, 8)}: ${err instanceof Error ? err.message : err}`;
-      logger.warn(warning);
-    }
-  }
-
-  return { fidelityBody: result.summary, warning };
+  const write = await writeFidelityBody(task, driver, result.summary);
+  return { fidelityBody: result.summary, warning: write.warning, outcome: write.outcome };
 }
 
 /**

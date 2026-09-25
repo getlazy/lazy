@@ -87,6 +87,16 @@ export interface AgentActivityEvent {
    * Same `undefined` vs `[]` distinction as `mcpServers`.
    */
   toolNames?: string[];
+  /**
+   * Present on `session_start` when the agent reports the CONCRETE model it
+   * is about to run. Claude Code and Cursor both put a `model` string on
+   * their init line; the supervisor copies it onto `Turn.model_id` when
+   * `parseResponse` did not already extract one (Cursor's result object
+   * has no model field — the init line is the only report).
+   *
+   * `undefined` means the agent said nothing, not that a default ran.
+   */
+  model?: string;
   /** Present on `tool_start` / `tool_end` / `heartbeat`. */
   toolUseId?: string;
   /** Human-readable tool name, for diagnostics ("MCP tool `x` in flight"). */
@@ -174,6 +184,12 @@ export class ClaudeCodeActivityStream implements AgentActivityStream {
           sessionId: msg.session_id,
           mcpServers: parseMcpServers(msg.mcp_servers),
           toolNames: parseToolNames(msg.tools),
+          // Same field Cursor's init carries. Claude Code's result line also
+          // repeats it, and parseResponse prefers that; this is the fallback
+          // and the ground truth at the moment the session actually started.
+          ...(typeof msg.model === 'string' && msg.model.trim()
+            ? { model: msg.model.trim() }
+            : {}),
         };
       }
       return { kind: 'progress' };

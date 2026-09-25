@@ -7,7 +7,7 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { runWork, CrashError, FatalAgentError, CrashLoopError, type WorkResult, type RetryState } from '../../src/supervisor/work';
+import { runWork, CrashError, FatalAgentError, CrashLoopError, WatchdogTimeoutError, GracefulExitTimeoutError, turnErrorSessionId, type WorkResult, type RetryState } from '../../src/supervisor/work';
 import { describeTurnFailure } from '../../src/supervisor';
 import type { ErrorResponse } from '../../src/protocol';
 import { ClaudeCodeAgent } from '../../src/agent/claude-code';
@@ -242,5 +242,72 @@ describe('runWork — retry state carries the classification', () => {
     expect(states[0]!.failureReason).toBeTruthy();
     expect(states[0]!.nextDelayMs).toBe(5_000);
     expect(states[0]!.errors[0]!.failure_class).toBe('transient_overload');
+  });
+});
+
+describe('session id survives the turn\'s own failure', () => {
+  // INVARIANT (the 2026-09-16 pi incident): a turn that knows which
+  // conversation it was in must hand that id to whatever comes next. The
+  // stream reported the session on every one of these paths; dropping it on
+  // the wire is what made every resume after a crash start over from scratch.
+  const crashWithSession = (message: string, sessionId: string) =>
+    new CrashError({ message, exitCode: 1, stderr: '', durationMs: 50, sessionId });
+
+  test('turnErrorSessionId reads the id off every turn-error class and nothing else', () => {
+    expect(turnErrorSessionId(
+      new CrashError({ message: 'boom', exitCode: 1, stderr: '', durationMs: 1, sessionId: 's-crash' }),
+    )).toBe('s-crash');
+    expect(turnErrorSessionId(
+      new WatchdogTimeoutError(1_000, 1_000, { sessionId: 's-watchdog' }),
+    )).toBe('s-watchdog');
+    expect(turnErrorSessionId(
+      new GracefulExitTimeoutError({ timeoutMs: 1_000, durationMs: 1_000, elapsedSinceSignalMs: 500, sessionId: 's-wind-down' }),
+    )).toBe('s-wind-down');
+    const fatal = new FatalAgentError({ message: 'gave up', failureClass: 'fatal_auth', failureReason: '401', attempts: 1, sessionId: 's-fatal' });
+    expect(turnErrorSessionId(fatal)).toBe('s-fatal');
+    const loop = new CrashLoopError({ message: 'Crash loop detected', failureClass: 'unknown', failureReason: 'segfault', attempts: 3, sessionId: 's-loop' });
+    expect(turnErrorSessionId(loop)).toBe('s-loop');
+    expect(turnErrorSessionId(new Error('unrelated'))).toBeUndefined();
+    expect(turnErrorSessionId(undefined)).toBeUndefined();
+  });
+
+  test('a fatal failure carries the crashed attempt\'s session id', async () => {
+    const { error } = await run({
+      execute: async () => {
+        throw crashWithSession('API Error: 401 {"type":"authentication_error"}', 'sess-fatal-1');
+      },
+    });
+
+    expect(error).toBeInstanceOf(FatalAgentError);
+    expect((error as FatalAgentError).sessionId).toBe('sess-fatal-1');
+  });
+
+  test('a crash-loop exit carries the last attempt\'s session id', async () => {
+    const { error } = await run({
+      execute: async () => {
+        throw crashWithSession('Segmentation fault (core dumped)', 'sess-loop-1');
+      },
+    });
+
+    expect(error).toBeInstanceOf(CrashLoopError);
+    expect((error as CrashLoopError).sessionId).toBe('sess-loop-1');
+  });
+
+  test('describeTurnFailure puts the session id on the error response', () => {
+    const err = new CrashError({ message: 'Connection error.', exitCode: 0, stderr: '', durationMs: 300_000, sessionId: 'sess-pi-1' });
+    const response: ErrorResponse = { status: 'error', error: err.message, phase: 'work' };
+
+    describeTurnFailure(response, err);
+
+    expect(response.session_id).toBe('sess-pi-1');
+  });
+
+  test('describeTurnFailure does not clobber a session id the caller already set', () => {
+    const err = new CrashError({ message: 'Connection error.', exitCode: 0, stderr: '', durationMs: 300_000, sessionId: 'sess-pi-1' });
+    const response: ErrorResponse = { status: 'error', error: err.message, phase: 'work', session_id: 'sess-set-by-executor' };
+
+    describeTurnFailure(response, err);
+
+    expect(response.session_id).toBe('sess-set-by-executor');
   });
 });

@@ -4,29 +4,30 @@
  *
  * WHY THIS EXISTS
  * ---------------
- * A daemon's `lazy.pid` and `lazy.sock` can be deleted while the daemon is
- * running fine. That used to happen through `cleanupStaleFiles` — a losing
- * `lazy daemon start` deleted the incumbent's files — and the ownership guard
- * added there closes that specific hole. But the failure mode itself is not
- * lazy's alone to cause: a `rm`, a tmp reaper, an over-eager cleanup script or
- * an older lazy build can do the same thing, and the result is a daemon that
- * holds its lock, serves its web port, and is unreachable over its unix socket
- * because the socket file that names it no longer exists.
+ * A daemon's `lazy.pid` can be deleted while the daemon is running fine. That
+ * used to happen through `cleanupStaleFiles` — a losing `lazy daemon start`
+ * deleted the incumbent's files — and the ownership guard added there closes
+ * that specific hole. But the failure mode itself is not lazy's alone to
+ * cause: a `rm`, a tmp reaper, an over-eager cleanup script or an older lazy
+ * build can do the same thing, and the result is a daemon that holds its lock
+ * and serves its TCP port while the file-based fallbacks (liveness when the
+ * lock verdict is 'unknown', `lazy doctor`'s reporting) no longer name it.
+ * So the daemon repairs its own state file: it rewrites `lazy.pid`.
  *
- * A unix socket file only exists while a listener holds it, so it cannot be put
- * back by hand — before this, the only recovery was killing a healthy daemon,
- * which strands every running builder, agent and pair session on a dead proxy
- * address. So the daemon repairs its own state files: it rewrites `lazy.pid`
- * and re-binds the unix listener, which re-creates the socket.
+ * (Pre-v0.22 daemons also had a unix socket file with the same exposure —
+ * worse, in fact, since a deleted socket file made the daemon unreachable and
+ * could not be put back by hand. The TCP port is now the only transport
+ * (drop-unix-socket): a bound listener cannot be deleted out from under the
+ * daemon, so the PID file is the only state left to repair.)
  *
  * `inspectDaemonStateFiles` is the read-only half, used by `lazy doctor` to
- * recognise the signature (lock held, files missing) and say so in plain terms
+ * recognise the signature (lock held, file missing) and say so in plain terms
  * instead of repeating "daemon is not running".
  */
 
 import { stat } from 'fs/promises';
 import { logger } from '../utils/logger';
-import { getPidPath, getSocketPath } from './paths';
+import { getPidPath } from './paths';
 import {
   isProcessAlive,
   probeDaemonLockSync,
@@ -51,8 +52,6 @@ export interface DaemonStateFileReport {
   /** Whether `lazy.pid` exists (and its contents, when parseable). */
   pidFilePresent: boolean;
   pid: number | null;
-  /** Whether `lazy.sock` exists. Absent ⇒ the daemon is unreachable over the socket. */
-  socketFilePresent: boolean;
   /** Last web port the daemon recorded, if any. */
   webPort: number | null;
   /**
@@ -62,8 +61,8 @@ export interface DaemonStateFileReport {
    */
   webPortListening: boolean | null;
   /**
-   * The wedge signature: a live daemon owns this dir (lock held) but at least
-   * one of its two state files has been deleted underneath it.
+   * The wedge signature: a live daemon owns this dir (lock held) but its PID
+   * file has been deleted underneath it.
    */
   filesDeletedUnderLiveDaemon: boolean;
 }
@@ -100,10 +99,7 @@ async function probeLocalPort(port: number): Promise<boolean> {
  */
 export async function inspectDaemonStateFiles(projectRoot: string): Promise<DaemonStateFileReport> {
   const lock = probeDaemonLockSync(projectRoot);
-  const [pidFilePresent, socketFilePresent] = await Promise.all([
-    exists(getPidPath(projectRoot)),
-    exists(getSocketPath(projectRoot)),
-  ]);
+  const pidFilePresent = await exists(getPidPath(projectRoot));
   const webPort = readWebPort(projectRoot);
   const webPortListening = webPort === null ? null : await probeLocalPort(webPort);
 
@@ -112,24 +108,14 @@ export async function inspectDaemonStateFiles(projectRoot: string): Promise<Daem
     lockPid: readDaemonLockPid(projectRoot),
     pidFilePresent,
     pid: readPid(projectRoot),
-    socketFilePresent,
     webPort,
     webPortListening,
-    filesDeletedUnderLiveDaemon: lock === 'held' && (!pidFilePresent || !socketFilePresent),
+    filesDeletedUnderLiveDaemon: lock === 'held' && !pidFilePresent,
   };
 }
 
 export interface DaemonStateFileWatchOptions {
   projectRoot: string;
-  /** The socket path this daemon actually bound (tests pass an explicit one). */
-  socketPath: string;
-  /**
-   * Re-create the unix socket by re-binding the listener. Must stop the old
-   * listener BEFORE binding the new one: Bun unlinks the socket path when a
-   * unix listener stops, so binding first and stopping second would delete the
-   * file we just re-created.
-   */
-  rebindSocket: () => void;
   /** Override the poll interval (tests). */
   intervalMs?: number;
 }
@@ -137,9 +123,10 @@ export interface DaemonStateFileWatchOptions {
 /**
  * Watch this daemon's own state files and put back anything that disappears.
  *
- * Repairs, in order of what is possible:
- *   - `lazy.pid` missing or naming a different/dead process → rewrite it.
- *   - `lazy.sock` missing → re-bind the unix listener, which re-creates it.
+ * The one repair left in the TCP-only world: `lazy.pid` missing or naming a
+ * different/dead process → rewrite it. (The unix-socket re-bind this watch was
+ * born for went away with the socket — a bound TCP listener cannot be deleted
+ * out from under the daemon.)
  *
  * Only ever runs inside the daemon that owns these files, so there is no
  * ownership question here — it is the answer to one.
@@ -147,7 +134,7 @@ export interface DaemonStateFileWatchOptions {
  * Returns a stop function.
  */
 export function startDaemonStateFileWatch(options: DaemonStateFileWatchOptions): () => void {
-  const { projectRoot, socketPath, rebindSocket } = options;
+  const { projectRoot } = options;
   const intervalMs = options.intervalMs ?? STATE_FILE_WATCH_INTERVAL_MS;
   let checking = false;
 
@@ -167,26 +154,6 @@ export function startDaemonStateFileWatch(options: DaemonStateFileWatchOptions):
           `Something deleted this daemon's state files while it was running.`,
         );
         writePid(projectRoot, process.pid);
-      }
-
-      if (!(await exists(socketPath))) {
-        logger.warn(
-          `Daemon socket file ${socketPath} was deleted while the daemon was running — ` +
-          `re-binding the unix listener so the CLI can reach the daemon again.`,
-        );
-        try {
-          rebindSocket();
-          logger.info(`Daemon socket re-created at ${socketPath}`);
-        } catch (err) {
-          // Leave the daemon running: the web/TCP listener and the proxy are
-          // unaffected, and the next tick retries. Surface it so a persistent
-          // failure is diagnosable rather than a silent unreachable daemon.
-          logger.error(
-            `Failed to re-bind the daemon unix socket at ${socketPath}: ` +
-            `${err instanceof Error ? err.message : String(err)}. ` +
-            `The daemon is running but unreachable over its socket — 'lazy doctor' explains the state.`,
-          );
-        }
       }
     } catch (err) {
       // A watch tick must never take the daemon down.

@@ -58,6 +58,19 @@ export interface CredentialGrant {
    * shape, and a client that validates its key format would reject the other.
    */
   envKey: string;
+  /**
+   * Agent profile (`[agents.<name>]`) the launch runs, which is how the proxy
+   * decides where to forward this caller's traffic (src/proxy/agent-upstreams.ts).
+   *
+   * OPTIONAL because the registry on disk outlives a daemon restart, and grants
+   * minted before profiles existed have no such field. Declaring it required
+   * would be a lie about the data: a legacy grant would read as `undefined`
+   * through a `string` type and route by a name nothing configured. Absent means
+   * "no profile evidence" and routes to the primary upstream, the same answer as
+   * traffic with no grant at all; the identity's next launch mints one that
+   * carries the profile.
+   */
+  profile?: string;
   createdAt: string;
 }
 
@@ -72,7 +85,9 @@ interface GrantFile {
  * its grants are bounded by a cap instead. Oldest first: a builder session that
  * has been idle longest is the one least likely to still be running. Task
  * grants are not capped — they are revoked explicitly when the task ends, and
- * capping them could silently kill a live long-running task's turn.
+ * capping them could silently kill a live long-running task's turn. That is by
+ * TASK ID, not by role: a builder-role grant naming a task is revocable and so
+ * is excluded from this cap too.
  */
 export const MAX_BUILDER_GRANTS = 50;
 
@@ -91,6 +106,9 @@ const PLACEHOLDER_PREFIXES: Record<string, string> = {
   ANTHROPIC_AUTH_TOKEN: 'sk-ant-oat01-lazy-',
   ANTHROPIC_API_KEY: 'sk-ant-api03-lazy-',
   CURSOR_API_KEY: 'key_lazy_',
+  // OpenAI keys are `sk-...` / `sk-proj-...`; OpenRouter keys are `sk-or-v1-...`.
+  OPENAI_API_KEY: 'sk-proj-lazy-',
+  OPENROUTER_API_KEY: 'sk-or-v1-lazy-',
 };
 
 /** Fallback for an env var lazy has no shape knowledge of. */
@@ -202,14 +220,25 @@ async function mutate<T>(
   return run;
 }
 
+/**
+ * The identity a grant is reused for.
+ *
+ * The PROFILE participates: two profiles forward to different upstreams with
+ * different credentials, so one placeholder covering both would let a request
+ * bound for a local Ollama be routed — and paid for — as if it were the other.
+ * Switching a task's profile therefore mints a new placeholder rather than
+ * re-pointing the old one, which is also what makes a legacy profile-less grant
+ * self-heal on the identity's next launch.
+ */
 function identityKey(
   role: GrantRole,
   taskId: string | null,
   label: string,
   envKey: string,
+  profile: string | undefined,
 ): string {
   const who = role === 'agent' ? `agent:${taskId ?? label}` : `builder:${label}`;
-  return `${who}|${envKey}`;
+  return `${who}|${envKey}|${profile ?? ''}`;
 }
 
 /**
@@ -228,13 +257,13 @@ function identityKey(
  */
 export async function mintCredentialGrant(
   projectRoot: string,
-  opts: { role: GrantRole; taskId?: string | null; label: string; envKey: string },
+  opts: { role: GrantRole; taskId?: string | null; label: string; envKey: string; profile?: string },
 ): Promise<string> {
   const taskId = opts.taskId ?? null;
   return mutate(projectRoot, async registry => {
-    const key = identityKey(opts.role, taskId, opts.label, opts.envKey);
+    const key = identityKey(opts.role, taskId, opts.label, opts.envKey, opts.profile);
     const existing = registry.grants.find(
-      g => identityKey(g.role, g.taskId, g.label, g.envKey) === key,
+      g => identityKey(g.role, g.taskId, g.label, g.envKey, g.profile) === key,
     );
     if (existing) return existing.token;
 
@@ -244,11 +273,18 @@ export async function mintCredentialGrant(
       taskId,
       label: opts.label,
       envKey: opts.envKey,
+      ...(opts.profile ? { profile: opts.profile } : {}),
       createdAt: new Date().toISOString(),
     };
     registry.grants.push(grant);
 
-    const builders = registry.grants.filter(g => g.role === 'builder');
+    // Only TASKLESS builder grants are capped. A builder-role grant that names a
+    // task (a task-scoped machine one-shot — see oneshotLaunchIdentity) has a
+    // lifecycle event to be revoked on, exactly like an agent grant, so it
+    // belongs on the revocation path rather than the eviction path. Counting
+    // them here would let a busy project's one-shots push the cap over and evict
+    // a live builder session — the one grant the cap exists to protect.
+    const builders = registry.grants.filter(g => g.role === 'builder' && !g.taskId);
     if (builders.length > MAX_BUILDER_GRANTS) {
       const drop = new Set(
         [...builders]
@@ -294,6 +330,13 @@ export async function lookupCredentialGrant(
  * (accept / reject / close) — after that point its container must not be able
  * to spend the human's credential, and it is being torn down anyway.
  *
+ * EVERY grant naming the task, whatever its role. A task's traffic is not only
+ * its agent's: a machine one-shot ABOUT the task (an accept-time summary) and a
+ * pairing container both mint BUILDER-role grants carrying the task id, and both
+ * are as dead as the agent's once the task ends. Filtering on `role === 'agent'`
+ * as this once did left those behind as live placeholders with nothing left to
+ * revoke them.
+ *
  * Returns the number revoked. Idempotent.
  */
 export async function revokeTaskCredentialGrants(
@@ -302,7 +345,7 @@ export async function revokeTaskCredentialGrants(
 ): Promise<number> {
   return mutate(projectRoot, async registry => {
     const before = registry.grants.length;
-    registry.grants = registry.grants.filter(g => !(g.role === 'agent' && g.taskId === taskId));
+    registry.grants = registry.grants.filter(g => g.taskId !== taskId);
     const removed = before - registry.grants.length;
     if (removed > 0) await persist(projectRoot, registry);
     return removed;
@@ -323,6 +366,21 @@ export async function revokeBuilderCredentialGrant(
   return mutate(projectRoot, async registry => {
     const before = registry.grants.length;
     registry.grants = registry.grants.filter(g => !(g.role === 'builder' && g.label === label));
+    const removed = before - registry.grants.length;
+    if (removed > 0) await persist(projectRoot, registry);
+    return removed;
+  });
+}
+
+/**
+ * Revoke every grant whose label starts with `prefix` — the member
+ * containers' grants (`member-terminal:`), whose only other revoke is the
+ * container's removal, which a daemon restart interrupts. Returns how many.
+ */
+export async function revokeGrantsByLabelPrefix(projectRoot: string, prefix: string): Promise<number> {
+  return mutate(projectRoot, async registry => {
+    const before = registry.grants.length;
+    registry.grants = registry.grants.filter(g => !g.label.startsWith(prefix));
     const removed = before - registry.grants.length;
     if (removed > 0) await persist(projectRoot, registry);
     return removed;

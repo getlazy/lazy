@@ -1,7 +1,9 @@
 #!/usr/bin/env bun
 
-import { init, findLazyRoot, findGitRoot } from './cli/init';
+import { init } from './cli/init';
+import { findLazyRoot, findGitRoot } from './project-paths';
 import { isTTY, promptYesNo } from './cli/editor';
+import { readTeamsLogin, MultipleTeamsLoginsError, type TeamsLogin } from './teams/login';
 import {
   commandCreate, createUsage,
   commandEdit, editUsage,
@@ -9,6 +11,8 @@ import {
   commandClone, cloneUsage,
   commandStart, startUsage,
   commandStats, statsUsage, statsSubcommandUsage,
+  commandEnv, envUsage, envSubcommandUsage,
+  commandCustomize, customizeUsage, customizeSubcommandUsage,
   commandUnblock, unblockUsage,
   commandList, listUsage,
   commandActive, activeUsage,
@@ -16,11 +20,15 @@ import {
   commandShow, showUsage,
   commandStatus, statusUsage,
   commandDiff, diffUsage,
+  commandRegions, regionsUsage,
   commandShell, shellUsage,
+  commandDashboard, dashboardUsage,
+  commandPlayground, playgroundUsage,
+  commandUrl, urlUsage,
+  commandForward, forwardUsage,
   commandPair, pairUsage,
   commandChat, chatUsage,
   commandAccept, acceptUsage,
-  commandApprove, approveUsage,
   commandProtect, protectUsage,
   commandClose, closeUsage,
   commandReject, rejectUsage,
@@ -31,21 +39,30 @@ import {
   commandTag, tagUsage, commandUntag, untagUsage,
   commandJournal, journalUsage,
   commandMemory, memoryUsage, memorySubcommandUsage,
+  commandScratch, scratchUsage, scratchSubcommandUsage,
+  commandArtifact, artifactUsage, artifactSubcommandUsage,
+  commandMessages, messagesUsage, messagesSubcommandUsage,
+  commandRaised, raisedUsage, raisedSubcommandUsage,
+  commandConversations, conversationsUsage, conversationsSubcommandUsage,
   commandLink, linkUsage,
+  commandDescribe, describeUsage,
   commandImportConversation, importConversationUsage,
   commandReopen, reopenUsage,
   commandResume, resumeUsage,
   commandWait, waitUsage,
   commandBuilder, builderUsage,
   commandDoctor, doctorUsage,
+  commandAuth, authUsage,
+  commandLogin, loginUsage,
+  commandLogout, logoutUsage,
   commandLoop, loopUsage,
   commandRevert, revertUsage,
   commandSubmit, submitUsage,
   commandSync, syncUsage,
   commandReparent, reparentUsage,
-  commandPrioritize, prioritizeUsage,
   commandCompletion, completionUsage,
   commandReview, reviewUsage,
+  commandBrowse, browseUsage,
   commandRedo, redoUsage,
   commandUpgrade, upgradeUsage,
   commandSystem, systemUsage, systemSubcommandUsage,
@@ -59,7 +76,7 @@ import {
   commandReport, reportUsage,
 } from './cli/commands';
 import { handleFuzzyCommand } from './cli/fuzzy-command';
-import { COMMAND_ALIASES, ALIAS_NAMES } from './cli/command-aliases';
+import { COMMAND_ALIASES, ALIAS_NAMES, DEPRECATED_ALIAS_NOTES } from './cli/command-aliases';
 import { isLoggedToFile } from './utils/logged-error';
 import { docsFooter } from './docs/links';
 
@@ -86,7 +103,6 @@ Task Management:
   tag <task_id> <tag>    Add a tag to a task (grouping label)
   untag <task_id> <tag>  Remove a tag from a task
   clone <task_id>        Duplicate task with optional reparenting
-  prioritize <task> <lvl> Set queue priority (low/normal/high/urgent)
   list / tasks           List all non-terminal tasks
   active                 List active tasks (with sessions)
   blocked                List blocked tasks (waiting for user)
@@ -95,9 +111,19 @@ Task Management:
   report                 LLM-summarized markdown digest of recent activity
   memory                 Shared, curated cross-task knowledge (list/show/save/rm/
                          history/compact)
+  messages               Inbox of proactive system-to-human reports (list/read/
+                           dismiss); see also raised for agent-raised items
+  raised                 Everything agents raised for you, across tasks — list,
+                         respond, dismiss, promote, change what gates accept
+  conversations          Browse captured builder conversations (list/search/show)
+  artifact               Files attached to a task and published back by it
+                         (list/add/get/rm)
+  scratch                Builder scratch artifacts captured into the store
+                         (list/show/sync/rm/path)
 
 Working on Tasks:
-  review <task_id>       TUI review: full-screen artifact browser
+  review <task_id>       Run an agent review of the task's work
+  browse <task_id>       TUI browser: task artifacts (response, plan, diff)
   ask <task_id>          Ask a paused task's agent a question (read-only)
   loop [<task_id>...]    Review all blocked tasks sequentially, or drive a
                          curated queue: start, wait, review gate, decide, next
@@ -120,17 +146,30 @@ System:
 
 Stats:
   stats tokens           Token accounting from the proxy audit trail (by role/task/model)
+  stats tools <task>     Per-tool breakdown for one task — which tool filled its context
   stats audit            Browse the proxy audit trail record by record (denials, reroutes)
   stats timings          Recorded request traces, ranked by self time
+  stats limits           Latest usage-limit reading per credential (5h / 7d windows)
+
+Task Environment:
+  env set <task_id>      Give one task an env var (API token) — host-only, never persisted
+  env list <task_id>     List a task's env var NAMES (never values)
+  env unset <task_id>    Remove named env vars from a task
+  env clear <task_id>    Remove every env var from a task
+
+Customize:
+  customize proxy-plugin <name>  Scaffold a model-API proxy request plugin in .lazy/plugins/
 
 Inspect:
   diff <task_id>         Show changes made by task
+  regions <task_id>      Show the review regions the task's walkthrough declared
   status <task_id>       Show worktree and commit state
-  shell <task_id>        Open shell in task's worktree
+  shell <task_id>        Open shell in task's container (--host for the worktree on this machine)
+  url <task_id> [svc]    Show where the task's [serve] ports are reachable
+  forward <task_id> <p>  Forward a port inside the task's container, on demand
   pair <task_id>         Pair program with Claude in task's worktree
   chat <task_id>         Read-only chat with a finished task's agent session
   accept <task_id>       Merge task's work
-  approve <task_id>      Record a human approval for accepting into a protected branch
   protect <branch|task>  Protect a branch or task ('on'/'off'; no args shows state)
   close <task_id>        Close a task (no session required)
   reject <task_id>       Reject a task's work and close its PR
@@ -140,7 +179,8 @@ Inspect:
   submit <task_id>       Submit a task for human review (opens a PR)
 
 Link:
-  link <url>             Link an external resource (e.g., GitHub PR) as a task
+  link <ref>             Link a pull request or git branch as a task
+  describe <task_id>     Rewrite a linked task's description from its branch/PR
 
 Import:
   import-conversation    Import Claude Code conversation logs
@@ -149,6 +189,7 @@ Remote:
   sync                   Sync lazy tasks with your remote repository
 
 Daemon:
+  dashboard              Sign in to the web dashboard and open it in a browser
   daemon start           Start the lazy daemon (includes web dashboard)
   daemon stop            Stop the daemon gracefully
   daemon restart         Restart the daemon
@@ -159,6 +200,7 @@ Daemon:
   daemon auto-budget     Control/inspect the auto-react daily budget (list/update/pause/resume)
   daemon config          Inspect/override concurrency caps at runtime (get/set/reset)
   server                 Start daemon and show web dashboard URL
+  playground <sub>       Throwaway project (up/down/status) with a real daemon and seeded tasks
   config set/get         Runtime config toggles (e.g., auto_react on/off)
 
 Builder:
@@ -167,6 +209,9 @@ Builder:
 Setup:
   init                   Initialize lazy in a git repository
   doctor                 Check installation health
+  auth                   Store model-provider credentials in OS secure storage
+  login                  Log this machine in to Lazy Teams and bind this clone
+  logout                 Unbind this clone and delete the stored login
   upgrade                Rebuild image/binary and restart containers
   completion             Output shell completion script (--bash or --zsh)
 
@@ -183,6 +228,7 @@ const commandMap: Record<string, {
   subcommands?: Record<string, () => void>;
 }> = {
   'link':     { run: commandLink, usage: linkUsage },
+  'describe': { run: commandDescribe, usage: describeUsage },
   'import-conversation': { run: commandImportConversation, usage: importConversationUsage },
   'init':     {
     run: async (args: string[]) => {
@@ -190,14 +236,26 @@ const commandMap: Record<string, {
       const skipRemoteCheck = args.includes('--skip-remote-check') || args.includes('--skip-github-check');
       const skipCompletionCheck = args.includes('--skip-completion-check');
       const nonInteractive = args.includes('--non-interactive');
-      await init(process.cwd(), { skipAuthCheck, skipRemoteCheck, skipCompletionCheck, nonInteractive });
+      const externalPathIdx = args.indexOf('--external-path');
+      let externalPath: string | undefined;
+      if (externalPathIdx !== -1) {
+        externalPath = args[externalPathIdx + 1];
+        if (!externalPath || externalPath.startsWith('--')) {
+          console.error('Error: --external-path requires a directory path.');
+          process.exit(1);
+        }
+      }
+      await init(process.cwd(), { skipAuthCheck, skipRemoteCheck, skipCompletionCheck, nonInteractive, externalPath });
     },
     usage: () => {
-      console.log('Usage: lazy init [--skip-auth-check] [--skip-remote-check] [--skip-completion-check]\n');
+      console.log('Usage: lazy init [--external-path PATH] [--skip-auth-check] [--skip-remote-check] [--skip-completion-check]\n');
       console.log('Initialize lazy in the current git repository.\n');
       console.log('Requires an interactive terminal to display warnings and instructions.\n');
       console.log('If a supported remote (GitHub, etc.) is detected, offers to configure it.\n');
       console.log('Options:');
+      console.log('  --external-path PATH      Put the external store here instead of ~/.lazy/<project-name>.');
+      console.log('                            Answers the storage prompt, so it also works without a TTY,');
+      console.log('                            and rewrites storage.external_path in an existing lazy.toml.');
       console.log('  --skip-auth-check         Skip authentication check during init');
       console.log('  --skip-remote-check       Skip remote driver detection during init');
       console.log('  --skip-github-check       Alias for --skip-remote-check');
@@ -217,18 +275,30 @@ const commandMap: Record<string, {
   'untag':    { run: commandUntag, usage: untagUsage },
   'journal':  { run: commandJournal, usage: journalUsage },
   'memory':   { run: commandMemory, usage: memoryUsage, subcommands: memorySubcommandUsage },
+  'scratch':  { run: commandScratch, usage: scratchUsage, subcommands: scratchSubcommandUsage },
+  'artifact': { run: commandArtifact, usage: artifactUsage, subcommands: artifactSubcommandUsage },
+  'messages': { run: commandMessages, usage: messagesUsage, subcommands: messagesSubcommandUsage },
+  'raised':   { run: commandRaised, usage: raisedUsage, subcommands: raisedSubcommandUsage },
+  'conversations': { run: commandConversations, usage: conversationsUsage, subcommands: conversationsSubcommandUsage },
   'start':    { run: commandStart, usage: startUsage },
   'unblock':  { run: commandUnblock, usage: unblockUsage },
   'resume':   { run: commandResume, usage: resumeUsage },
   'reopen':   { run: commandReopen, usage: reopenUsage },
   'branch':   { run: commandBranch, usage: branchUsage },
   'diff':     { run: commandDiff, usage: diffUsage },
+  'regions':  { run: commandRegions, usage: regionsUsage },
   'status':   { run: commandStatus, usage: statusUsage },
   'shell':    { run: commandShell, usage: shellUsage },
+  'dashboard': { run: commandDashboard, usage: dashboardUsage },
+  // No `subcommands` map: `up`/`down`/`status` share one usage text, so -h on
+  // any of them should print it. A map entry exists only where a subcommand
+  // ships its own `<name>Usage()`.
+  'playground': { run: commandPlayground, usage: playgroundUsage },
+  'url':      { run: commandUrl, usage: urlUsage },
+  'forward':  { run: commandForward, usage: forwardUsage },
   'pair':     { run: commandPair, usage: pairUsage },
   'chat':     { run: commandChat, usage: chatUsage },
   'accept':   { run: commandAccept, usage: acceptUsage },
-  'approve':  { run: commandApprove, usage: approveUsage },
   'protect':  { run: commandProtect, usage: protectUsage },
   'close':    { run: commandClose, usage: closeUsage },
   'reject':   { run: commandReject, usage: rejectUsage },
@@ -237,17 +307,22 @@ const commandMap: Record<string, {
   'wait':     { run: commandWait, usage: waitUsage },
   'builder':  { run: commandBuilder, usage: builderUsage },
   'doctor':   { run: commandDoctor, usage: doctorUsage },
+  'auth':     { run: commandAuth, usage: authUsage },
+  'login':    { run: commandLogin, usage: loginUsage },
+  'logout':   { run: commandLogout, usage: logoutUsage },
   'loop':     { run: commandLoop, usage: loopUsage },
   'submit':   { run: commandSubmit, usage: submitUsage },
   'sync':     { run: commandSync, usage: syncUsage },
   'reparent': { run: commandReparent, usage: reparentUsage },
-  'prioritize': { run: commandPrioritize, usage: prioritizeUsage },
   'completion': { run: commandCompletion, usage: completionUsage },
   'review':   { run: commandReview, usage: reviewUsage },
+  'browse':   { run: commandBrowse, usage: browseUsage },
   'ask':      { run: commandAsk, usage: askUsage },
   'redo':     { run: commandRedo, usage: redoUsage },
   'upgrade':  { run: commandUpgrade, usage: upgradeUsage },
   'stats':    { run: commandStats, usage: statsUsage, subcommands: statsSubcommandUsage },
+  'env':      { run: commandEnv, usage: envUsage, subcommands: envSubcommandUsage },
+  'customize': { run: commandCustomize, usage: customizeUsage, subcommands: customizeSubcommandUsage },
   'system':   { run: commandSystem, usage: systemUsage, subcommands: systemSubcommandUsage },
   'document': { run: commandDocument, usage: documentUsage },
   'refactor': { run: commandRefactor, usage: refactorUsage },
@@ -280,6 +355,10 @@ const fuzzyMatchCommands = Object.keys(commandMap).filter(c => !ALIAS_NAMES.incl
 async function dispatch(cmd: string, cmdArgs: string[]): Promise<void> {
   const entry = commandMap[cmd];
   if (!entry) return;
+
+  // An old spelling still works; the human just hears about it once, on stderr.
+  const deprecation = DEPRECATED_ALIAS_NOTES[cmd];
+  if (deprecation) console.error(deprecation);
 
   if (cmdArgs.includes('--help') || cmdArgs.includes('-h')) {
     // For multiplexer commands the subcommand always sits at cmdArgs[0] (that's
@@ -338,13 +417,34 @@ const hiddenCommands: Record<string, (args: string[]) => Promise<void>> = {
 
     const taskId = cmdArgs[taskIdIdx + 1];
     const worktreePath = cmdArgs[worktreeIdx + 1];
-    // Read-only turns (ask) get a toolset with the write tools withheld. The
-    // supervisor writes this flag into ~/.claude.json per turn — see
+    // Ask turns get --read-only; review turns get --review (reads + lazy_raise).
+    // The supervisor writes the flag into ~/.claude.json per turn — see
     // src/supervisor/mcp-setup.ts.
     const readOnly = cmdArgs.includes('--read-only');
+    const review = cmdArgs.includes('--review');
 
-    const { startMcpServer } = await import('./mcp/index');
-    await startMcpServer({ taskId, worktreePath }, { readOnly });
+    // Fail closed if ~/.claude.json named a different task than the turn this
+    // server was spawned in — see src/mcp/turn-identity.ts.
+    const { assertMcpServesExpectedTurn } = await import('./mcp/turn-identity');
+    try {
+      assertMcpServesExpectedTurn({ taskId, worktreePath });
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+
+    // Same net the containerized entry installs — this process is the agent's
+    // only channel to lazy state, and Claude Code never respawns it.
+    // See src/mcp/process-guards.ts.
+    const { installMcpKeepAlive, reportMcpStartupFailure } = await import('./mcp/process-guards');
+    installMcpKeepAlive();
+
+    try {
+      const { startMcpServer } = await import('./mcp/index');
+      await startMcpServer({ taskId, worktreePath, boundToTeams: await mcpServesBoundClone() }, { readOnly, review });
+    } catch (err) {
+      reportMcpStartupFailure(err);
+    }
   },
 
 };
@@ -365,7 +465,12 @@ if (command && hiddenCommands[command]) {
 
 // Auto-init: if running in an uninitialized git repo, offer to initialize.
 // Skip for init itself, help, version, and completion.
-const skipAutoInit = ['init', 'completion'];
+// `playground` (and its old spelling `demo`) is here for the same reason as `init`: it provisions a lazy project of
+// its OWN, somewhere else entirely, and has no use for whichever project the
+// caller happens to be standing in. Offering to init that one would be
+// answering a question nobody asked.
+// login/logout bind or unbind a clone; neither needs, nor may create, a local project.
+const skipAutoInit = ['init', 'completion', 'playground', 'demo', 'login', 'logout'];
 const isHelpOrVersion = !command || command === '--help' || command === '-h' || command === '--version' || command === '-V';
 
 // Filesystem preflight: fail fast with a clear error when the terminal lacks
@@ -376,7 +481,7 @@ const isHelpOrVersion = !command || command === '--help' || command === '-h' || 
 // cause. Skipped for help/version/completion and in test mode.
 let cachedLazyRoot: string | null = null;
 let cachedLazyRootComputed = false;
-function resolveLazyRoot(): string | null {
+function lazyRootOrNull(): string | null {
   if (!cachedLazyRootComputed) {
     cachedLazyRoot = findLazyRoot();
     cachedLazyRootComputed = true;
@@ -384,16 +489,121 @@ function resolveLazyRoot(): string | null {
   return cachedLazyRoot;
 }
 
+/**
+ * Whether this clone is bound to a Teams project — the one thing the daemon
+ * auto-start preflight below needs to know before deciding whether to touch
+ * the LOCAL machine at all, and the one place that decides for the WHOLE
+ * dispatcher (see the announcement right below this preflight): every
+ * remote-routed command reaches the daemon through wildly different code —
+ * `requireStorage()`'s full `Storage` interface, or `src/daemon/rpc-fallback.ts`'s
+ * typed wrappers straight over `tryRpc`, depending on the command — and a
+ * banner planted in only one of those paths reaches only the commands that
+ * happen to take it. Printed ONCE, here, it reaches all of them the same way
+ * `ensureDaemon` being skipped does.
+ *
+ * `readTeamsLogin` THROWS a {@link MultipleTeamsLoginsError}, rather than
+ * returning null, when the credential store holds more than one login — a
+ * broken state whose only recovery is `lazy logout` (`clearTeamsLogin`
+ * enumerates the index directly rather than going through `readTeamsLogin`,
+ * precisely so that recovery command still works). This preflight must not
+ * reintroduce that trap one level up: letting the exception propagate here
+ * would crash EVERY command, including the one that fixes it. So THAT
+ * specific error is answered `'ambiguous'` — not because the clone is
+ * cleanly bound (there is no one login to print a banner for), but because
+ * starting a local daemon for it is exactly as wrong as it would be for an
+ * ordinary bound clone, and the actual command (a normal one hits the same
+ * loud refusal from `resolveStorage`; `login`/`logout` recover it) is what
+ * should decide what happens next, not this preflight.
+ *
+ * Any OTHER error (a corrupted credential index, which breaks every
+ * credential it holds and answers nothing about Teams binding specifically)
+ * is answered `null` — proceed as an ordinary local project — rather than
+ * swallowed into the same "bound" bucket: `lazy doctor`'s own diagnosis of
+ * that exact corruption must still run, which skipping its daemon auto-start
+ * on a guess would get in the way of.
+ */
+/**
+ * The Teams install and project a hand-run `lazy mcp` serves, when its clone
+ * is bound — read from the same root `resolveStorage()` resolves, so the tools
+ * and their storage agree on where the project is. An AMBIGUOUS binding
+ * answers undefined: every storage call refuses it loudly (naming `lazy
+ * logout` as the recovery), so there is no single install to name here.
+ */
+async function mcpServesBoundClone(): Promise<{ url: string; project: string } | undefined> {
+  const { findLazyRoot } = await import('./project-paths');
+  const root = findLazyRoot();
+  if (!root) return undefined;
+  const login = await resolveCloneBinding(root);
+  if (!login || login === 'ambiguous') return undefined;
+  return { url: login.binding.teams_url, project: login.binding.project };
+}
+
+async function resolveCloneBinding(root: string): Promise<TeamsLogin | 'ambiguous' | null> {
+  try {
+    return await readTeamsLogin(root);
+  } catch (err) {
+    return err instanceof MultipleTeamsLoginsError ? 'ambiguous' : null;
+  }
+}
+
 // LAZY_FORCE_PREFLIGHT is a test-only escape hatch: preflight is skipped under
 // LAZY_TEST because test temp dirs are always accessible, but the preflight
 // suite deliberately makes them inaccessible and must still exercise the check.
 const preflightSkipped = process.env.LAZY_TEST === '1' && process.env.LAZY_FORCE_PREFLIGHT !== '1';
 
-if (!isHelpOrVersion && command !== 'completion' && !preflightSkipped) {
+// `lazy init --external-path` is the one command that REPLACES
+// storage.external_path, so validating the value already in lazy.toml would
+// reject the config for the exact staleness this invocation is there to fix —
+// a provisioning run against a repo whose committed config points at its
+// authors' home directory dies before it can rewrite it. The new value is
+// still validated: init creates and opens the store at it.
+const rewritesStoragePath = command === 'init' && args.includes('--external-path');
+
+// `lazy system source-id` is a pure function of a SOURCE TREE: it hashes files
+// and prints, touching no lazy state, needing no project and writing nothing.
+// Preflight probes whichever `.lazy` happens to be above the cwd, so without
+// this the command fails on a checkout it has no business caring about — a
+// read-only mount, somebody else's project, a worktree whose store is not
+// writable from here. Lazy Teams asks this question with its cwd inside the
+// checkout on every fleet tick, so the failure is not hypothetical.
+//
+// `lazy system store-check <path>` joins it for the same reason and with the
+// same caller: it reads a store directory named on the command line — usually
+// one belonging to ANOTHER install, possibly still running — and writes
+// nothing. Probing the surrounding project's `.lazy` would refuse the fleet's
+// adoption preflight on exactly the machines it has to run on.
+const isProjectFreeSystemQuery =
+  command === 'system' && (args[1] === 'source-id' || args[1] === 'store-check');
+
+// `lazy playground` (alias `demo`) is exempt for the same reason, and the failure is not
+// hypothetical either: the command exists to be run by an agent inside its own
+// container, where the lazy checkout is mounted READ-ONLY on purpose. It writes
+// nothing to the surrounding project — it builds a throwaway project of its own
+// under a separate root — so probing that project's `.lazy` for writability
+// refuses the one invocation the command was designed for. Its own root is
+// checked where it is actually used, by `lazy playground` itself.
+const isPlaygroundCommand = command === 'playground' || command === 'demo';
+
+if (!isHelpOrVersion && command !== 'completion' && !isProjectFreeSystemQuery && !isPlaygroundCommand && !preflightSkipped) {
   const { runPreflight } = await import('./cli/preflight');
-  await runPreflight(resolveLazyRoot());
-  const { validateConfigPaths } = await import('./cli/config-path-validation');
-  await validateConfigPaths(resolveLazyRoot());
+  await runPreflight(lazyRootOrNull());
+  // login/logout, and every command in a bound clone, never touch the local
+  // store: after a handover to Lazy Teams the operator moves that store away
+  // BEFORE binding, so validating `storage.external_path` would refuse the
+  // very commands the handover runbook tells them to run next.
+  const skipsLocalStore =
+    command === 'login' ||
+    command === 'logout' ||
+    await (async () => {
+      const root = lazyRootOrNull();
+      if (!root) return false;
+      const binding = await resolveCloneBinding(root);
+      return binding !== null && binding !== 'ambiguous';
+    })();
+  if (!rewritesStoragePath && !skipsLocalStore) {
+    const { validateConfigPaths } = await import('./cli/config-path-validation');
+    await validateConfigPaths(lazyRootOrNull());
+  }
 }
 
 // Documentation pointers ("Check documentation at <url>") honour the project's
@@ -404,7 +614,7 @@ if (!isHelpOrVersion && command !== 'completion' && !preflightSkipped) {
 // directory" diagnosis. Best-effort on purpose: `lazy --help` must not die of a
 // broken lazy.toml, and neither must the message explaining that it is broken.
 {
-  const docsRoot = resolveLazyRoot();
+  const docsRoot = lazyRootOrNull();
   if (docsRoot) {
     try {
       const { loadRawConfig } = await import('./config/loader');
@@ -421,7 +631,7 @@ if (!isHelpOrVersion && command !== 'completion' && !preflightSkipped) {
 }
 
 if (!isHelpOrVersion && (!command || !skipAutoInit.includes(command))) {
-  const lazyRoot = resolveLazyRoot();
+  const lazyRoot = lazyRootOrNull();
   if (!lazyRoot) {
     const gitRoot = findGitRoot();
     if (gitRoot && isTTY()) {
@@ -441,12 +651,37 @@ if (!isHelpOrVersion && (!command || !skipAutoInit.includes(command))) {
 
 // Auto-start daemon if not running. In v0.11+, daemon is required —
 // ensureDaemon() throws if it can't start. Skips for daemon, init, completion, help.
-if (!isHelpOrVersion) {
+//
+// And for the project-free `system` queries (`source-id`, `store-check`), for
+// the same reason preflight skips them: reading a source tree or a named store
+// directory needs no daemon, and starting one would run the credential gate —
+// so asking "which lazy is this?" on a machine with no Anthropic credential
+// would fail with a message about the model API. Lazy Teams asks exactly those
+// questions, from a checkout, on every fleet tick and before every adoption.
+if (!isHelpOrVersion && !isProjectFreeSystemQuery) {
   const { ensureDaemon } = await import('./daemon/auto-start');
   // Reuse the cached lazy root if we found one earlier; otherwise re-probe —
   // auto-init may have just created .lazy/ and the cached null is now stale.
   const root = cachedLazyRoot ?? findLazyRoot();
-  if (root) {
+  // A bound clone has no local daemon to start (design doc §4.4) — its
+  // project lives on Teams. Without this, EVERY command in a bound clone hit
+  // this unconditionally: `ensureDaemon` finds nothing running and tries to
+  // start one, which either fails loudly on a laptop with no local Anthropic
+  // credential (turns run on Teams, not here) or silently leaves a real local
+  // daemon running for a project that is supposed to have none.
+  const binding = root ? await resolveCloneBinding(root) : null;
+  // Every remote-routed command names the install and project as its first
+  // line (design doc §4.7) — printed HERE, once, rather than in
+  // `requireStorage()`, because that only reaches commands going through the
+  // full `Storage` interface. Several read commands (`list`, `blocked`,
+  // `active`, …) call `src/daemon/rpc-fallback.ts`'s typed wrappers straight
+  // over `tryRpc` instead and never touched that banner at all. `'ambiguous'`
+  // prints nothing — there is no one login to name, and the command is about
+  // to get the daemon's own loud refusal instead.
+  if (binding && binding !== 'ambiguous') {
+    console.error(`${binding.binding.teams_url} — ${binding.binding.project}`);
+  }
+  if (root && !binding) {
     try {
       await ensureDaemon(command, root);
     } catch (err) {
@@ -502,12 +737,29 @@ if (process.env.LAZY_TEST === '1') {
   }
 }
 
+/**
+ * End the process after a command returned normally, honouring the exit code it
+ * asked for.
+ *
+ * `process.exit(0)` here used to discard `process.exitCode` outright, so a
+ * command that failed without throwing exited 0 — a silent false success for
+ * every `&&` chain and CI step. A command that wants to fail LOUDLY but still
+ * run its own teardown (closing storage, releasing the store lock) has no other
+ * way to say so: `process.exit(1)` from inside a `finally`-guarded callback
+ * skips exactly the cleanup that must happen. Throwing is still the right choice
+ * for an abort; this is for "finished, but the outcome was a failure".
+ */
+function exitAfterDispatch(): never {
+  process.exit(process.exitCode ?? 0);
+}
+
 try {
   if (!command || command === '--help' || command === '-h') {
     // Help
     usage();
   } else if (command === '--version' || command === '-V') {
-    console.log(VERSION);
+    const { formatVersionWithEmbeddedProvenance } = await import('./utils/build-provenance');
+    console.log(await formatVersionWithEmbeddedProvenance(VERSION));
   } else if (legacyCommands[command]) {
     // Legacy commands
     console.error(legacyCommands[command]);
@@ -515,14 +767,14 @@ try {
   } else if (commandMap[command]) {
     // Known command — dispatch it
     await dispatch(command, args.slice(1));
-    process.exit(0);
+    exitAfterDispatch();
   } else {
     // Unknown command — try fuzzy matching
     const result = await handleFuzzyCommand(command, args, fuzzyMatchCommands);
 
     if (result.action === 'execute') {
       await dispatch(result.command, args.slice(1));
-      process.exit(0);
+      exitAfterDispatch();
     } else if (result.action === 'none') {
       console.error(`Unknown command: ${command}`);
       usage();

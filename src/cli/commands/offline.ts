@@ -21,7 +21,7 @@ import { join } from 'path';
 import { requireLazyRoot } from '../helpers';
 import { loadConfig } from '../../config/loader';
 import { setOfflineMode, resolveOfflineStatus, formatOfflineExpiry } from '../../utils/offline';
-import { theme } from '../theme';
+import { theme } from '../../render/theme';
 
 export async function commandOffline(_args: string[]): Promise<void> {
   const root = requireLazyRoot();

@@ -5,7 +5,7 @@
  * The one property the mechanism must have: the token originates OUTSIDE the
  * builder's context (the human's eyes/keyboard, not an MCP tool result). The
  * mechanism today is a passphrase the human enrolls once per machine with
- * `lazy system passphrase set` and types at `lazy approve`'s own prompt; a TOTP
+ * `lazy system passphrase set` and types at `lazy accept`'s own prompt; a TOTP
  * verifier can replace it behind this same interface without touching
  * enforcement or the CLI.
  *
@@ -76,7 +76,7 @@ function enrollmentInstructions(): string {
   return (
     `No approval passphrase is enrolled on this machine. As the human, at your own terminal, run:\n\n` +
     `  lazy system passphrase set\n\n` +
-    `then re-run \`lazy approve\`. The passphrase is stored hashed, outside every repository, ` +
+    `then re-run \`lazy accept\`. The passphrase is stored hashed, outside every repository, ` +
     `and covers every lazy project on this machine — enroll it once.`
   );
 }

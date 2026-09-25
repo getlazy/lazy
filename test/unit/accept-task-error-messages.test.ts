@@ -51,6 +51,11 @@ await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => (
       offline: false,
     },
     storage: { backend: 'external', external_path: '' },
+    // ResolvedConfig always carries a fully-populated `review` section, and
+    // the accept gate reads `config.review.mode` unguarded like every other
+    // required section. `separate` keeps these doubles on the pre-2026-09-21
+    // behaviour, where every recorded review turn gates.
+    review: { mode: 'separate', auto_fix: false, draft_effort: 'low', review_effort: 'xhigh' },
     git: { default_branch_prefix: 'lazy' },
     // Remote-ref error behavior under test predates the edge gate; gate
     // scenarios are covered by edge-gate.test.ts + e2e approve.test.ts.
@@ -59,7 +64,7 @@ await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => (
     // acceptTask reads `config.automation.pre_accept` unguarded like every other
     // required section. These tests are about push/PR-creation error messages,
     // not the pre-accept turn, so the step is disabled here.
-    automation: { maintain: [], pre_accept: { enabled: false, commands: [], timeout: 600 } },
+    automation: { maintain: [], react: [], pre_accept: { enabled: false, commands: [], timeout: 600 }, accept_check: '', accept_check_timeout: 300 },
   }),
   DEFAULT_CONFIG: REAL_DEFAULT_CONFIG,
   getDefaultConfigTemplate: REAL_getDefaultConfigTemplate,
@@ -91,11 +96,10 @@ await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
     getPRState: async () => null,
     getChecksStatus: async () => ({ status: 'passed' as const, failed: [] }),
     getTaskUrl: async () => null,
-    postAcceptReview: async () => null,
+    approveForMerge: async () => null,
     checkAcceptGates: async () => [],
     merge: async () => ({ status: 'merged' as const, metadata: {} }),
     fastForwardLocal: async () => ({ success: true }),
-    postTurnSummary: async () => {},
     fetchRemoteState: async () => {},
     getFailedCIJobs: async () => [],
     recoverRemoteRef: async () => null,
@@ -141,8 +145,8 @@ await mockModule(resolve(import.meta.dir, '../../src/utils/lock.ts'), () => ({
   removeLock: () => {},
 }));
 
-// --- Mock cli/helpers for branch name resolution ---
-await mockModule(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
+// --- Mock task/identity for branch name resolution ---
+await mockModule(resolve(import.meta.dir, '../../src/task/identity.ts'), () => ({
   shortId: (id: string) => id.substring(0, 8),
   displayId: (task: any) => task.code ?? task.id.substring(0, 8),
   taskRef: (task: any) => task.code ?? task.id.substring(0, 8),
@@ -152,7 +156,7 @@ await mockModule(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
 }));
 
 // --- Mock orphan helpers (not reached in our error paths, but still imported) ---
-await mockModule(resolve(import.meta.dir, '../../src/cli/orphan.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/task/orphan.ts'), () => ({
   checkOrphanedChild: async () => null,
   retargetOrphanedChild: async () => {},
   getActiveChildren: async () => [],
@@ -161,17 +165,21 @@ await mockModule(resolve(import.meta.dir, '../../src/cli/orphan.ts'), () => ({
 }));
 
 // --- Mock shared cleanup (not reached in error paths) ---
-await mockModule(resolve(import.meta.dir, '../../src/cli/commands/shared.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/task/turn-context.ts'), () => ({
   buildNotesContext: () => '',
   buildSystemPrompt: () => '',
   buildPromptWithInstructions: () => '',
   buildTurnHistoryContext: () => '',
   getNewNotesSince: async () => [],
+}));
+await mockModule(resolve(import.meta.dir, '../../src/task/sync-remote.ts'), () => ({
   runSyncWithRemote: async () => {},
+  syncTaskFromRemote: async () => {},
+}));
+await mockModule(resolve(import.meta.dir, '../../src/task/cleanup.ts'), () => ({
   cleanupWorktree: () => {},
   cleanupWorktreeAndBranch: () => {},
   cleanupTaskContainer: async () => {},
-  syncTaskFromRemote: async () => {},
 }));
 
 // --- Mock protocol helpers ---
@@ -192,8 +200,21 @@ function createMockStorage() {
     resolveTask: async () => ({ task: mockTask, ambiguousMatches: [] }),
     getTask: async () => mockTask,
     getSessionByTaskId: async () => mockSession,
-    getSessionTurns: async () => [],
+    // Fixture finality: the accept gate (final-turn §5.1) refuses a task
+    // nobody has declared done. This suite targets refusal MESSAGES, not
+    // finality, so the session carries one final-carrying marker turn; no
+    // work turns follow it, so nothing un-finals.
+    getSessionTurns: async () => [{
+      id: 'turn-final', sequence: 1, role: 'human',
+      content: '[system] Finalize declared', turn_type: 'pre_accept',
+      created_at: Date.now(),
+      final: { sha: 'abc123', actor: 'human', at: Date.now(), wrap_up_steps: [] },
+    }],
     getSessionCommits: async () => mockCommits,
+    getTaskRaisedItems: async () => [],
+    getTaskComments: async () => [],
+    getTaskReviewComments: async () => [],
+    resolveRaisedItem: async () => { throw new Error('unexpected resolveRaisedItem in accept error-messages test'); },
     updateTaskStatus: async () => {},
     updateTaskMetadata: async () => {},
     updateTurnViolations: async () => {},

@@ -1,0 +1,22 @@
+# Run Lazy Teams on a host WITHOUT hardware virtualization (no /dev/kvm).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.local-backend.yml up -d
+#
+# or put it in .env once, which is what bootstrap.sh writes when it finds no
+# /dev/kvm, so plain `docker compose` commands pick it up:
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.local-backend.yml
+#
+# It drops the /dev/kvm device (compose cannot start a service whose device
+# does not exist) and selects the `local` fleet backend, which runs each
+# project's background process inside the app container. Everything works —
+# accounts, teams, projects, hosted repositories, review — EXCEPT agent turns,
+# which need a microVM. See "Task turns" in public-docs/self-hosting-lazy-teams.md.
+#
+# `!reset` needs Docker Compose v2.24 or later.
+
+services:
+  app:
+    devices: !reset []
+    environment:
+      LAZY_FLEET_BACKEND: local

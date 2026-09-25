@@ -4,9 +4,15 @@
  *
  * Protected patterns flag files agents must NOT touch. Maintained patterns are
  * files agents are *expected* to keep up to date (docs, CHANGELOG, architecture
- * diagrams). When a turn's changes touch NONE of a maintained group's files, the
- * supervisor nudges the agent once — "you didn't update <title>, are you sure?"
- * — so a silent omission becomes a deliberate, recorded decision.
+ * diagrams). When a scanned range's changes touch NONE of a maintained group's
+ * files, the supervisor nudges the agent once — "you didn't update <title>, are
+ * you sure?" — so a silent omission becomes a deliberate, recorded decision.
+ *
+ * The range is the caller's: a work turn's own SHA span, or — at a wrap-up
+ * final — the task's whole branch range (base_sha..HEAD), which on a
+ * human-audience parent includes its accepted children's work, the content an
+ * agent-audience child's skipped maintain pass left to the parent's pass
+ * (final-turn design §4.2).
  *
  * This is a single-shot mechanism: detect skipped groups → one follow-up →
  * record. No loop. The follow-up's response is appended to the turn so reviewers
@@ -17,7 +23,7 @@ import type { MaintainEntry } from '../config/types';
 import type { AgentResponse } from '../types';
 import type { Agent } from '../agent/interface';
 import { runGit } from '../utils/git';
-import { log, logError } from './log';
+import { log, logError, logWarn } from './log';
 import { execWithWatchdog } from './watchdog';
 import maintainFollowupTemplate from '../prompts/maintain-followup.md' with { type: 'text' };
 import maintainContextTemplate from '../prompts/maintain-context.md' with { type: 'text' };
@@ -46,6 +52,9 @@ function matchesPattern(filePath: string, pattern: string): boolean {
  * leftover-commit sweep), so a maintained file edited but not committed will NOT
  * land — and the agent SHOULD still be nudged (to actually commit it). Scanning
  * the working tree would wrongly suppress that nudge.
+ *
+ * A failed `git diff` is logged and treated as "no changes" so a broken scan
+ * never looks identical to a clean miss without a warning in the supervisor log.
  */
 async function getTurnChangedFiles(
   worktreePath: string,
@@ -66,6 +75,13 @@ async function getTurnChangedFiles(
       const f = line.trim();
       if (f) files.add(f);
     }
+  } else {
+    // INVARIANT: a failed scan must not silently look like "no match" / "all skipped".
+    logWarn(
+      `[maintain] git diff --name-only failed (exit ${result.exitCode}) for ` +
+      `${startSha.substring(0, 8)}..${endSha.substring(0, 8)}; treating as no changed files. ` +
+      `stderr: ${result.stderr.slice(-300)}`,
+    );
   }
 
   return files;
@@ -162,6 +178,11 @@ export async function runMaintainFollowup(
   skipped: MaintainEntry[],
   modelId?: string,
   effort?: string,
+  /**
+   * Host OS-sandbox `--settings` (and any other argv) from
+   * `commonCommandFields.agent_extra_args`. Same path work/push-back use.
+   */
+  extraArgs?: string[],
 ): Promise<MaintainFollowupResult> {
   const prompt = maintainFollowupTemplate
     .replace('{{count}}', String(skipped.length))
@@ -175,6 +196,7 @@ export async function runMaintainFollowup(
     dangerouslySkipPermissions: true,
     modelId,
     effort,
+    extraArgs,
   });
 
   const { stdout, stderr, exitCode } = await execWithWatchdog(claudeArgs, {

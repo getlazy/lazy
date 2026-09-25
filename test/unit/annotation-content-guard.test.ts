@@ -1,6 +1,6 @@
 /**
  * Regression suite for content-less ANNOTATION records (comments, journal
- * entries, follow-ups).
+ * entries, raised items).
  *
  * A live crash (2026-08-14): `lazy review release-v021` — a release hub with 86
  * children — died with "undefined is not an object (evaluating
@@ -33,7 +33,7 @@ import {
   repairRecordContents,
 } from '../../src/utils/turn-content';
 import { buildNavItemsForTask, type ReviewData } from '../../src/cli/tui/review';
-import type { Task, Comment, JournalEntry, FollowUp } from '../../src/types';
+import type { Task, Comment, JournalEntry, RaisedItem } from '../../src/types';
 
 describe('annotation content helpers', () => {
   test('repairRecordContents substitutes a visible placeholder for a missing content', () => {
@@ -61,7 +61,7 @@ describe('annotation content helpers', () => {
   test('normalizeRecordContent coerces non-strings to an empty string', () => {
     expect(normalizeRecordContent(undefined, 'test', 'appendJournalEntry', 'JournalEntry.content')).toBe('');
     expect(normalizeRecordContent(null, 'test', 'createComment', 'Comment.content')).toBe('');
-    expect(normalizeRecordContent({}, 'test', 'createFollowUp', 'FollowUp.content')).toBe('');
+    expect(normalizeRecordContent({}, 'test', 'createRaisedItem', 'RaisedItem.content')).toBe('');
     expect(normalizeRecordContent('kept', 'test', 'createComment', 'Comment.content')).toBe('kept');
   });
 });
@@ -120,14 +120,14 @@ describe('storage reads over content-less annotation records', () => {
     expect(() => comments[0].content.match(/\{(?:remote|gh):(\w+)\}/)).not.toThrow();
   });
 
-  test('getTaskFollowUps renders a placeholder instead of returning undefined content', async () => {
-    await seedDefective('follow-ups.json', 'follow_ups', {
-      id: 'f1', task_id: task.id, created_at: Date.now(),
+  test('getTaskRaisedItems renders a placeholder instead of returning undefined content', async () => {
+    await seedDefective('raised-items.json', 'raised_items', {
+      id: 'r1', task_id: task.id, created_at: Date.now(), status: 'open', blocking: false,
     });
 
-    const followUps = await storage.getTaskFollowUps(task.id);
-    expect(followUps).toHaveLength(1);
-    expect(followUps[0].content).toBe(MISSING_RECORD_CONTENT);
+    const raised = await storage.getTaskRaisedItems(task.id);
+    expect(raised).toHaveLength(1);
+    expect(raised[0].content).toBe(MISSING_RECORD_CONTENT);
   });
 
   // INVARIANT: the read-side repair is presentation, not a migration. A
@@ -169,7 +169,6 @@ describe('review TUI over content-less annotation records', () => {
       prompt: 'ship it',
       type: 'task',
       status: 'blocked',
-      priority: 'normal',
       created_at: Date.now(),
       completed_at: null,
       target: { kind: 'branch' as const, branch: 'main' },
@@ -188,7 +187,9 @@ describe('review TUI over content-less annotation records', () => {
     // Records as they exist on disk after the defect: no `content` key at all.
     const journalEntry = { id: 'j1', task_id: 'task1234', created_at: 1 } as unknown as JournalEntry;
     const comment = { id: 'c1', task_id: 'task1234', created_at: 1 } as unknown as Comment;
-    const followUp = { id: 'f1', task_id: 'task1234', created_at: 1 } as unknown as FollowUp;
+    const raisedItem = {
+      id: 'r1', task_id: 'task1234', created_at: 1, status: 'open', blocking: false,
+    } as unknown as RaisedItem;
 
     return {
       task: makeTask(),
@@ -198,7 +199,9 @@ describe('review TUI over content-less annotation records', () => {
       comments: [comment],
       unseenComments: [],
       journal: [journalEntry],
-      followUps: [followUp],
+      raisedItems: [raisedItem],
+      turnReport: null,
+      fileDecisions: [],
       diffStat: '',
       diffFull: '',
       worktreePath: '/tmp/nowhere',
@@ -224,6 +227,6 @@ describe('review TUI over content-less annotation records', () => {
 
     expect(labelsUnder('journal')).toEqual([MISSING_RECORD_CONTENT]);
     expect(labelsUnder('comments')).toEqual([MISSING_RECORD_CONTENT]);
-    expect(labelsUnder('followups')).toEqual([MISSING_RECORD_CONTENT]);
+    expect(labelsUnder('raised')).toEqual([`+ ${MISSING_RECORD_CONTENT}`]);
   });
 });

@@ -5,17 +5,19 @@
  * protected branch") and OUTGOING ("the source is a protected task").
  */
 
-import { describe, test, expect } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { mkdtemp, mkdir, rm } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import {
   evaluateEdgeGate,
   enforceEdgeGate,
   EdgeGateRefusedError,
-  peekHumanApproval,
-  recordHumanApproval,
   type ProtectionConfig,
 } from '../../src/protection/edge-gate';
 import type { Storage } from '../../src/storage';
 import type { ResolvedConfig } from '../../src/config';
+import { enrollPassphrase } from '../helpers/passphrase';
 
 /**
  * `enabled: true` in the helper: these tests exercise the protection decision
@@ -197,16 +199,21 @@ describe('evaluateEdgeGate — protected tasks (outgoing)', () => {
 });
 
 /**
- * Satisfiers of the gate. A forge PR/MR approval and a `lazy approve` record
+ * Satisfiers of the gate. A forge PR/MR approval and the inline passphrase
  * are two expressions of the SAME deliberate human act, resolved in one place
  * — not two parallel protection mechanisms (P0.2c).
+ *
+ * There is deliberately NO stored approval any more: the pre-v0.22
+ * `lazy approve` record was a floating credential (no expiry, no binding to
+ * the commits being merged). The passphrase now travels WITH the accept that
+ * uses it, so approval cannot outlive or drift from the merge it authorizes.
  *
  * `protected_branches: ['release']` throughout so the decision is reached
  * without a git lookup for the repo default branch; which RULE gated the merge
  * is irrelevant to how it is satisfied, and that is exactly the point.
  */
 describe('enforceEdgeGate — satisfiers', () => {
-  /** Minimal in-memory Storage double: only task metadata is touched here. */
+  /** Minimal in-memory Storage double: nothing is persisted by the gate. */
   function fakeStorage(): Storage {
     const meta = new Map<string, string>();
     return {
@@ -216,6 +223,28 @@ describe('enforceEdgeGate — satisfiers', () => {
       },
     } as unknown as Storage;
   }
+
+  // A real project root plus a machine-global enrollment, so the inline token
+  // path is exercised end-to-end through createHumanTokenVerifier. The store
+  // is redirected to a temp dir via its own seam — never the developer's real
+  // ~/.lazy/passphrase.json, which these tests would otherwise read.
+  let projectRoot: string;
+  let passphraseBase: string;
+  let previousPassphraseBase: string | undefined;
+  beforeAll(async () => {
+    projectRoot = await mkdtemp(join(tmpdir(), 'edge-gate-test-'));
+    await mkdir(join(projectRoot, '.lazy'), { recursive: true });
+    passphraseBase = await mkdtemp(join(tmpdir(), 'edge-gate-passphrase-'));
+    previousPassphraseBase = process.env.LAZY_PASSPHRASE_BASE_DIR;
+    process.env.LAZY_PASSPHRASE_BASE_DIR = passphraseBase;
+    await enrollPassphrase(passphraseBase, 'sesame');
+  });
+  afterAll(async () => {
+    if (previousPassphraseBase === undefined) delete process.env.LAZY_PASSPHRASE_BASE_DIR;
+    else process.env.LAZY_PASSPHRASE_BASE_DIR = previousPassphraseBase;
+    await rm(projectRoot, { recursive: true, force: true });
+    await rm(passphraseBase, { recursive: true, force: true });
+  });
 
   function config(overrides: Partial<ProtectionConfig> = {}): ResolvedConfig {
     return {
@@ -227,129 +256,97 @@ describe('enforceEdgeGate — satisfiers', () => {
 
   const edge = { sourceBranch: 'lazy/add-auth', targetBranch: 'release' };
 
-  function enforce(storage: Storage, forgeApproval?: () => Promise<boolean>) {
+  function enforce(storage: Storage, opts: {
+    forgeApproval?: () => Promise<boolean>;
+    token?: string;
+  } = {}) {
     return enforceEdgeGate({
       storage,
       config: config(),
-      projectRoot: '/tmp/does-not-matter',
+      projectRoot,
       taskId: 'task-1',
       displayId: 'add-auth',
       edge,
-      forgeApproval,
+      forgeApproval: opts.forgeApproval,
+      token: opts.token,
     });
   }
 
-  // INVARIANT: a human's approval on the PR/MR satisfies the SAME gate as
-  // `lazy approve`. It is not a parallel path that only remote drivers take —
-  // it is a satisfier resolved inside enforceEdgeGate, so every driver reaches
-  // the identical decision.
+  // INVARIANT: a human's approval on the PR/MR satisfies the SAME gate as the
+  // inline passphrase. It is not a parallel path that only remote drivers
+  // take — it is a satisfier resolved inside enforceEdgeGate, so every driver
+  // reaches the identical decision.
   test('a forge PR/MR approval satisfies the gate', async () => {
     const storage = fakeStorage();
-    await enforce(storage, async () => true); // must not throw
+    await enforce(storage, { forgeApproval: async () => true }); // must not throw
   });
 
-  // INVARIANT: the forge is checked BEFORE the stored approval so an
-  // already-approved PR does not silently burn the human's one-shot
-  // `lazy approve` record — it stays pending for an accept that needs it.
-  // Not even commit() spends it: there was nothing local to satisfy.
-  test('a forge approval does not consume a pending lazy-approve record', async () => {
+  // INVARIANT: the correct passphrase, supplied inline with the accept,
+  // satisfies the gate — approval is bound to this very invocation.
+  test('the inline passphrase satisfies the gate', async () => {
     const storage = fakeStorage();
-    await recordHumanApproval(storage, 'task-1');
-
-    const clearance = await enforce(storage, async () => true);
-    expect(clearance.usesLocalApproval).toBe(false);
-    await clearance.commit();
-
-    expect(await peekHumanApproval(storage, 'task-1')).not.toBeNull();
+    await enforce(storage, { token: 'sesame' }); // must not throw
   });
 
-  // INVARIANT: approval consumption is atomic with accept completion. Passing
-  // the gate only RESERVES the record; it is spent by commit(), which the
-  // accept calls at the point the merge is durable. A gate check that consumed
-  // eagerly burned the approval on accepts that then failed in pre-flight or
-  // mid-merge, forcing the human to approve again for a merge that never
-  // happened.
-  test('passing the gate does not consume the lazy-approve record', async () => {
+  // INVARIANT: a wrong passphrase REFUSES — and the refusal never echoes the
+  // expected token (the message travels back over builder-readable channels).
+  test('a wrong passphrase refuses without echoing the expected one', async () => {
     const storage = fakeStorage();
-    await recordHumanApproval(storage, 'task-1');
-
-    const clearance = await enforce(storage, async () => false);
-    expect(clearance.gated).toBe(true);
-    expect(clearance.usesLocalApproval).toBe(true);
-
-    // The accept dies after the gate: the approval must still be there.
-    expect(await peekHumanApproval(storage, 'task-1')).not.toBeNull();
-
-    // …and must still satisfy the retry.
-    const retry = await enforce(storage, async () => false);
-    expect(retry.usesLocalApproval).toBe(true);
+    let message = '';
+    try {
+      await enforce(storage, { token: 'wrong' });
+    } catch (err) {
+      expect(err).toBeInstanceOf(EdgeGateRefusedError);
+      message = (err as Error).message;
+    }
+    expect(message).toContain('does not match');
+    expect(message).not.toContain('sesame');
   });
 
-  // INVARIANT: the approval is still SINGLE-USE. commit() — called only where
-  // the merge is durable — spends it, so it cannot unlock a second accept.
-  test('commit() consumes the record, and the gate then refuses', async () => {
+  // INVARIANT: no satisfier means REFUSAL. This is the whole gate — an
+  // unapproved merge must not land just because a forge exists.
+  test('refuses when neither the forge nor a token approves', async () => {
     const storage = fakeStorage();
-    await recordHumanApproval(storage, 'task-1');
-
-    const clearance = await enforce(storage, async () => false);
-    await clearance.commit();
-
-    expect(await peekHumanApproval(storage, 'task-1')).toBeNull();
-    await expect(enforce(storage, async () => false)).rejects.toBeInstanceOf(EdgeGateRefusedError);
-  });
-
-  // A second commit() must not throw or resurrect anything — accept's finalize
-  // path is re-entrant, and a double spend of an already-empty slot is a no-op.
-  test('commit() is safe to call twice', async () => {
-    const storage = fakeStorage();
-    await recordHumanApproval(storage, 'task-1');
-
-    const clearance = await enforce(storage, async () => false);
-    await clearance.commit();
-    await clearance.commit();
-
-    expect(await peekHumanApproval(storage, 'task-1')).toBeNull();
-  });
-
-  // INVARIANT: an unprotected merge reserves nothing, so its commit() can
-  // never touch an approval the human recorded for a later, protected accept.
-  test('an ungated merge never consumes an approval', async () => {
-    const storage = fakeStorage();
-    await recordHumanApproval(storage, 'task-1');
-
-    const clearance = await enforceEdgeGate({
-      storage,
-      config: config(),
-      projectRoot: '/tmp/does-not-matter',
-      taskId: 'task-1',
-      displayId: 'add-auth',
-      edge: { sourceBranch: 'lazy/add-auth', targetBranch: 'lazy/parent' },
-    });
-    expect(clearance.gated).toBe(false);
-    await clearance.commit();
-
-    expect(await peekHumanApproval(storage, 'task-1')).not.toBeNull();
-  });
-
-  // INVARIANT: no satisfier of either kind means REFUSAL. This is the whole
-  // gate — an unapproved PR must not merge just because a forge exists.
-  test('refuses when neither the forge nor a record approves', async () => {
-    const storage = fakeStorage();
-    await expect(enforce(storage, async () => false)).rejects.toBeInstanceOf(EdgeGateRefusedError);
+    await expect(enforce(storage, { forgeApproval: async () => false }))
+      .rejects.toBeInstanceOf(EdgeGateRefusedError);
   });
 
   // INVARIANT: the forge probe FAILS CLOSED. An unreachable forge must never
-  // open the gate — the human still has `lazy approve` as the offline path.
+  // open the gate — the human still has the inline passphrase as the offline
+  // path.
   test('a throwing forge probe leaves the gate shut', async () => {
     const storage = fakeStorage();
     await expect(
-      enforce(storage, async () => { throw new Error('network down'); }),
+      enforce(storage, { forgeApproval: async () => { throw new Error('network down'); } }),
     ).rejects.toBeInstanceOf(EdgeGateRefusedError);
+  });
+
+  // INVARIANT: the gate persists NOTHING. There is no stored approval to go
+  // stale or to authorize a later, different diff — a successful token pass
+  // leaves no metadata behind.
+  test('a satisfied gate writes no approval record', async () => {
+    const meta = new Map<string, string>();
+    const storage = {
+      getTaskMetadata: async (taskId: string, key: string) => meta.get(`${taskId}:${key}`) ?? null,
+      updateTaskMetadata: async (taskId: string, key: string, value: string) => {
+        meta.set(`${taskId}:${key}`, value);
+      },
+    } as unknown as Storage;
+    await enforceEdgeGate({
+      storage,
+      config: config(),
+      projectRoot,
+      taskId: 'task-1',
+      displayId: 'add-auth',
+      edge,
+      token: 'sesame',
+    });
+    expect(meta.size).toBe(0);
   });
 
   // INVARIANT: a local-driver project (no forge probe passed) is gated exactly
   // like a forge project and is never told to go approve a PR it cannot have.
-  test('local driver (no forge probe): refusal names only lazy approve', async () => {
+  test('local driver (no forge probe): refusal names accept, not a PR', async () => {
     const storage = fakeStorage();
     let message = '';
     try {
@@ -357,8 +354,28 @@ describe('enforceEdgeGate — satisfiers', () => {
     } catch (err) {
       message = (err as Error).message;
     }
-    expect(message).toContain('lazy approve add-auth');
+    expect(message).toContain('lazy accept add-auth');
     expect(message).not.toContain('PR/MR');
+  });
+
+  test('refusal interpolates the complete accept command the daemon composed', async () => {
+    const storage = fakeStorage();
+    let message = '';
+    try {
+      await enforceEdgeGate({
+        storage,
+        config: config(),
+        projectRoot,
+        taskId: 'task-1',
+        displayId: 'add-auth',
+        edge,
+        acceptCommand: 'lazy accept add-auth --approve-file a.spec.ts --reason LGTM',
+      });
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toContain('lazy accept add-auth --approve-file a.spec.ts --reason LGTM');
+    expect(message).not.toMatch(/lazy accept add-auth\n/);
   });
 
   // The refusal a forge project sees names both routes, because both work.
@@ -366,11 +383,11 @@ describe('enforceEdgeGate — satisfiers', () => {
     const storage = fakeStorage();
     let message = '';
     try {
-      await enforce(storage, async () => false);
+      await enforce(storage, { forgeApproval: async () => false });
     } catch (err) {
       message = (err as Error).message;
     }
-    expect(message).toContain('lazy approve add-auth');
+    expect(message).toContain('lazy accept add-auth');
     expect(message).toContain('PR/MR');
   });
 });

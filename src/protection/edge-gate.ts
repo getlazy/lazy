@@ -2,10 +2,11 @@
  * Protected branches — human-approved accepts (internally: the edge-gate model).
  *
  * A merge is a directed edge `source → target`. Internally the decision is
- * asked about the edge, not the endpoints: today only the INCOMING direction
- * is user-facing (the target is a protected branch, e.g. the repo default
- * branch), and a protected accept cannot complete without a human-recorded
- * approval (`lazy approve <task>`), which is consumed by exactly one accept.
+ * asked about the edge, not the endpoints: a protected accept cannot complete
+ * without a deliberate human act — the human types the approval passphrase at
+ * `lazy accept`'s own prompt, in the same invocation that merges. The approval
+ * is therefore inherently bound to the exact commits being merged: there is no
+ * stored token to go stale or to authorize a later, different diff.
  *
  * Both directions now ship. INCOMING: the target is a protected branch (e.g.
  * the repo default branch). OUTGOING: the SOURCE is a protected TASK — a task
@@ -26,6 +27,7 @@ import type { ResolvedConfig } from '../config';
 import { getRemoteDefaultBranch } from '../git/operations';
 import { logger } from '../utils/logger';
 import { docsSuffix } from '../docs/links';
+import { createHumanTokenVerifier } from './verify-token';
 
 export interface MergeEdge {
   /** Branch being merged (the task's branch). */
@@ -249,99 +251,29 @@ export async function resolveEdgeGateDecision(
 }
 
 // ---------------------------------------------------------------------------
-// Human-approval store (one-shot, per task)
-// ---------------------------------------------------------------------------
-//
-// Persisted through the Storage interface as task metadata — never via direct
-// file access. One pending approval per task; consuming it clears the slot so
-// an approval unlocks exactly one accept.
-
-const APPROVAL_METADATA_KEY = 'edge_gate_approval';
-
-export interface HumanApproval {
-  approved_at: string;
-}
-
-/** Record a pending human approval for a task (overwrites any prior pending one). */
-export async function recordHumanApproval(storage: Storage, taskId: string): Promise<HumanApproval> {
-  const approval: HumanApproval = { approved_at: new Date().toISOString() };
-  await storage.updateTaskMetadata(taskId, APPROVAL_METADATA_KEY, JSON.stringify(approval));
-  return approval;
-}
-
-/** Read the pending human approval for a task without consuming it. */
-export async function peekHumanApproval(storage: Storage, taskId: string): Promise<HumanApproval | null> {
-  const raw = await storage.getTaskMetadata(taskId, APPROVAL_METADATA_KEY);
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw) as HumanApproval;
-  } catch (err) {
-    throw new Error(
-      `Corrupt approval record on task ${taskId} (metadata key '${APPROVAL_METADATA_KEY}'): ` +
-      `${err instanceof Error ? err.message : err}. Re-run \`lazy approve\` to overwrite it.`,
-    );
-  }
-}
-
-/**
- * Consume the pending human approval for a task: return it and clear it so it
- * cannot satisfy a second accept. Returns null when none is pending.
- *
- * INVARIANT: approval consumption is atomic with accept completion. Callers
- * must NOT call this at gate-check time — an accept that fails afterwards
- * would have burned the human's one-shot approval without merging anything.
- * The accept path reaches this only through {@link EdgeGateClearance.commit},
- * at the point the merge is durably finalized.
- */
-export async function takeHumanApproval(storage: Storage, taskId: string): Promise<HumanApproval | null> {
-  const approval = await peekHumanApproval(storage, taskId);
-  if (!approval) return null;
-  await storage.updateTaskMetadata(taskId, APPROVAL_METADATA_KEY, '');
-  return approval;
-}
-
-// ---------------------------------------------------------------------------
 // Enforcement
 // ---------------------------------------------------------------------------
-
-/**
- * The outcome of a passed edge-gate check, plus the deferred consumption of
- * whatever satisfied it.
- *
- * `commit()` is what actually spends a one-shot `lazy approve` record. It is
- * a no-op when the gate did not apply, or when a forge PR/MR approval was the
- * satisfier (there is nothing local to spend — and a pending `lazy approve`
- * record must survive for the accept that really needs it).
- *
- * Calling `commit()` more than once is safe: the second call finds nothing
- * pending and does nothing.
- */
-export interface EdgeGateClearance {
-  /** True when the merge was protected at all. */
-  gated: boolean;
-  /**
-   * True when a pending `lazy approve` record is the satisfier and is still
-   * waiting to be spent by `commit()`.
-   */
-  usesLocalApproval: boolean;
-  /**
-   * Spend the reserved approval. Call this — and only this — at the point the
-   * accept is durably finalized.
-   */
-  commit: () => Promise<void>;
-}
-
-/** Clearance for a merge that needed no approval at all. */
-const UNGATED_CLEARANCE: EdgeGateClearance = {
-  gated: false,
-  usesLocalApproval: false,
-  commit: async () => {},
-};
+//
+// There is deliberately NO stored approval here. The pre-v0.22
+// `edge_gate_approval` metadata record (`lazy approve`) was a floating
+// credential: an `approved_at` stamp with no expiry and no binding to the
+// commits being merged, so a pre-approval could let a later, different diff
+// through. Approval is now supplied inline — the passphrase travels with the
+// accept that uses it — so it cannot outlive or drift from the merge it
+// authorizes. Do not reintroduce a stored approval token.
 
 export class EdgeGateRefusedError extends Error {
-  constructor(message: string) {
+  /**
+   * True when a token WAS supplied and simply did not match the enrolled
+   * passphrase. Callers use it to distinguish "retype it" from "nothing is
+   * enrolled / you need to approve at all" when composing a remedy.
+   */
+  readonly tokenRejected: boolean;
+
+  constructor(message: string, tokenRejected = false) {
     super(message);
     this.name = 'EdgeGateRefusedError';
+    this.tokenRejected = tokenRejected;
   }
 }
 
@@ -357,17 +289,25 @@ export function edgeGateRefusalMessage(
   edge: MergeEdge,
   reason: string,
   forgeAvailable = false,
+  /**
+   * The complete pasteable command (approved files, typed reason). The daemon
+   * composes it; this function only interpolates. Absent, a bare accept.
+   */
+  acceptCommand?: string,
 ): string {
+  const cmd = acceptCommand ?? `lazy accept ${displayId}`;
   return (
     `Accepting task ${displayId} would merge \`${edge.sourceBranch}\` into \`${edge.targetBranch}\`, ` +
     `which requires human approval (${reason}). ` +
     `This cannot be satisfied from a builder or agent session — no flag, confirmation code, ` +
-    `or retry will complete it. A human must record a one-time approval by running:\n\n` +
-    `  lazy approve ${displayId}\n\n` +
+    `or retry will complete it. A human must run, from their own terminal:\n\n` +
+    `  ${cmd}\n\n` +
+    `which prompts for the approval passphrase and merges in one step. ` +
+    `There is no non-interactive path.\n\n` +
     (forgeAvailable
       ? `Approving this task's PR/MR on the forge satisfies the same gate — either act works.\n\n`
       : '') +
-    `then re-run the accept. To change what is protected, a human can run ` +
+    `To change what is protected, a human can run ` +
     `\`lazy protect <branch|task> off\` (or turn protection off entirely with ` +
     `[protection] enabled = false in lazy.toml).` +
     docsSuffix('protected-branches', '\n\n')
@@ -384,28 +324,18 @@ export function edgeGateRefusalMessage(
  *
  *   1. A forge PR/MR approval (`forgeApproval`), when one is configured and
  *      the task has a remote ref. A human clicking "Approve" on the PR is the
- *      same deliberate act as `lazy approve`, expressed where they were
- *      already reviewing the diff; demanding a second, local approval on top
- *      would be friction with no added judgement behind it.
- *   2. A pending `lazy approve` record, consumed one-approval-per-accept.
+ *      same deliberate act as typing the passphrase, expressed where they were
+ *      already reviewing the diff; demanding the passphrase on top would be
+ *      friction with no added judgement behind it.
+ *   2. The approval passphrase (`token`), typed by the human at `lazy accept`'s
+ *      own prompt and verified here, inline with the merge it authorizes.
  *
- * The forge is checked FIRST so an already-approved PR does not silently burn
- * the human's stored one-shot approval — that approval stays pending for the
- * accept that actually needs it.
+ * The forge is checked FIRST so an already-approved PR merges without the
+ * human being prompted for a passphrase they don't need to type.
  *
  * A `forgeApproval` probe that throws is treated as "no approval": the forge
- * being unreachable must never open the gate, and the human always has
- * `lazy approve` as the offline path. The reason is logged, never swallowed.
- *
- * INVARIANT: approval consumption is atomic with accept completion. Passing
- * the gate does NOT spend the approval — it only reserves it. The returned
- * {@link EdgeGateClearance} carries a `commit()` that the caller invokes at
- * the exact point the merge becomes durable (the same point that writes the
- * lazy-accept tag / hands the merge to the forge). An accept that fails or is
- * aborted at ANY phase therefore leaves the approval intact and re-usable,
- * while a successful accept still spends it exactly once. The check and the
- * commit both run inside accept's per-task lifecycle lock, so two concurrent
- * accepts cannot both consume the same approval.
+ * being unreachable must never open the gate, and the human always has the
+ * inline passphrase as the offline path. The reason is logged, never swallowed.
  */
 export async function enforceEdgeGate(opts: {
   storage: Storage;
@@ -419,9 +349,20 @@ export async function enforceEdgeGate(opts: {
    * task's PR/MR. Omitted by callers with no forge, and by the local driver.
    */
   forgeApproval?: () => Promise<boolean>;
-}): Promise<EdgeGateClearance> {
+  /**
+   * The approval passphrase, collected by the CLI at its own TTY prompt.
+   * Verified inline via the verify-token seam — never stored, so it cannot
+   * outlive this accept.
+   */
+  token?: string;
+  /**
+   * Complete `lazy accept …` command to name in the refusal. The caller
+   * composes it (approved files, typed reason); this gate only prints it.
+   */
+  acceptCommand?: string;
+}): Promise<void> {
   const decision = await resolveEdgeGateDecision(opts.edge, opts.config, opts.projectRoot, opts.storage);
-  if (!decision.gated) return UNGATED_CLEARANCE;
+  if (!decision.gated) return;
 
   if (opts.forgeApproval) {
     let approvedOnForge = false;
@@ -433,7 +374,7 @@ export async function enforceEdgeGate(opts: {
       logger.warn(
         `Branch protection: could not check for a PR/MR approval on task ${opts.displayId} ` +
         `(${err instanceof Error ? err.message : err}) — treating it as unapproved. ` +
-        `Use \`lazy approve ${opts.displayId}\` to approve locally.`,
+        `Run \`lazy accept ${opts.displayId}\` from a terminal to approve with the passphrase instead.`,
       );
     }
     if (approvedOnForge) {
@@ -441,36 +382,28 @@ export async function enforceEdgeGate(opts: {
         `Branch protection: satisfied by a PR/MR approval on task ${opts.displayId} — ` +
         `merging \`${opts.edge.sourceBranch}\` into \`${opts.edge.targetBranch}\`.`,
       );
-      // Nothing local to spend, and any pending `lazy approve` record stays
-      // pending for an accept that actually needs it.
-      return { gated: true, usesLocalApproval: false, commit: async () => {} };
+      return;
     }
   }
 
-  // RESERVE, do not spend: peek only. The approval is consumed by commit()
-  // once the merge is durable — see the invariant on this function.
-  const approval = await peekHumanApproval(opts.storage, opts.taskId);
-  if (approval) {
-    logger.info(
-      `Branch protection: using human approval for task ${opts.displayId} ` +
-      `(recorded at ${approval.approved_at}) — merging \`${opts.edge.sourceBranch}\` into ` +
-      `\`${opts.edge.targetBranch}\`. It is spent only once the merge completes; ` +
-      `if this accept fails, the approval stays valid for a retry.`,
-    );
-    return {
-      gated: true,
-      usesLocalApproval: true,
-      commit: async () => {
-        const spent = await takeHumanApproval(opts.storage, opts.taskId);
-        if (spent) {
-          logger.info(
-            `Branch protection: consumed human approval for task ${opts.displayId} ` +
-            `(recorded at ${spent.approved_at}) — the accept completed.`,
-          );
-        }
-      },
-    };
+  if (opts.token !== undefined) {
+    const verifier = createHumanTokenVerifier(opts.projectRoot);
+    const verification = await verifier.verify(opts.token);
+    if (verification.ok) {
+      logger.info(
+        `Branch protection: satisfied by inline human approval (${verifier.kind}) for task ${opts.displayId} — ` +
+        `merging \`${opts.edge.sourceBranch}\` into \`${opts.edge.targetBranch}\`.`,
+      );
+      return;
+    }
+    throw new EdgeGateRefusedError(verification.message, verification.mismatch === true);
   }
 
-  throw new EdgeGateRefusedError(edgeGateRefusalMessage(opts.displayId, opts.edge, decision.reason, !!opts.forgeApproval));
+  throw new EdgeGateRefusedError(edgeGateRefusalMessage(
+    opts.displayId,
+    opts.edge,
+    decision.reason,
+    !!opts.forgeApproval,
+    opts.acceptCommand,
+  ));
 }

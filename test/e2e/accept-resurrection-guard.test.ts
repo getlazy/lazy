@@ -4,6 +4,7 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 
 /**
  * End-to-end coverage for the deleted-file resurrection guard.
@@ -40,6 +41,9 @@ describe('lazy accept — deleted-file resurrection guard', () => {
     if (waitResult.exitCode !== 0) {
       throw new Error(`wait failed for ${taskId}: ${waitResult.stderr}\n${waitResult.stdout}`);
     }
+    // Fixture setup, not the subject: the finality gate needs a standing final
+    // before any accept of a committed task (see test/helpers/final.ts).
+    await seedFinal(ctx, taskId);
     return taskId;
   }
 

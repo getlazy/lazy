@@ -20,7 +20,7 @@ import { describe, test, expect } from 'bun:test';
 import { ClaudeCodeAgent } from '../../src/agent/claude-code';
 import { CursorAgent } from '../../src/agent/cursor';
 import { QaAgent } from '../../src/agent/qa-agent';
-import { buildMergeClaudeArgs } from '../../src/supervisor/merge';
+import { buildMergeAgentArgs } from '../../src/supervisor/merge';
 import { spawn, spawnSyncUnsupervised } from '../../src/utils/spawn';
 import { sanitizeUserText, findArgvIllegalIndices, NUL_CHAR } from '../../src/utils/sanitize-text';
 
@@ -58,6 +58,7 @@ describe('NUL-bearing feedback: argv construction', () => {
   // delivered (escaped) turn, never to a crash loop that eats the feedback.
   test('ClaudeCodeAgent.buildExecArgs escapes a NUL prompt instead of emitting it', () => {
     const args = new ClaudeCodeAgent().buildExecArgs({
+      modelId: 'test-model',
       prompt: REAL_WORLD_FEEDBACK,
       dangerouslySkipPermissions: true,
     });
@@ -69,6 +70,7 @@ describe('NUL-bearing feedback: argv construction', () => {
 
   test('ClaudeCodeAgent.buildExecArgs also escapes the system prompt', () => {
     const args = new ClaudeCodeAgent().buildExecArgs({
+      modelId: 'test-model',
       prompt: 'clean',
       systemPrompt: `system${NUL}instructions`,
       dangerouslySkipPermissions: true,
@@ -79,6 +81,7 @@ describe('NUL-bearing feedback: argv construction', () => {
 
   test('CursorAgent.buildExecArgs escapes its trailing positional prompt', () => {
     const args = new CursorAgent().buildExecArgs({
+      modelId: 'test-model',
       prompt: REAL_WORLD_FEEDBACK,
       dangerouslySkipPermissions: true,
     });
@@ -88,16 +91,24 @@ describe('NUL-bearing feedback: argv construction', () => {
 
   test('QaAgent.buildExecArgs escapes its prompt', () => {
     const args = new QaAgent().buildExecArgs({
+      modelId: 'test-model',
       prompt: REAL_WORLD_FEEDBACK,
       dangerouslySkipPermissions: true,
     });
     expect(findArgvIllegalIndices(args)).toEqual([]);
   });
 
-  test('buildMergeClaudeArgs escapes its prompt', () => {
-    const args = buildMergeClaudeArgs(`resolve${NUL}conflicts`);
+  test('buildMergeAgentArgs escapes its prompt', () => {
+    const args = buildMergeAgentArgs(new ClaudeCodeAgent(), `resolve${NUL}conflicts`, 'test-model');
     expect(findArgvIllegalIndices(args)).toEqual([]);
     expect(args[2]).toContain('resolve\\u0000conflicts');
+  });
+
+  // The merge builder delegates to the agent, so the sanitization holds for
+  // whichever agent resolves the conflicts — not just Claude Code.
+  test('buildMergeAgentArgs escapes its prompt for cursor too', () => {
+    const args = buildMergeAgentArgs(new CursorAgent(), `resolve${NUL}conflicts`, 'test-model');
+    expect(findArgvIllegalIndices(args)).toEqual([]);
   });
 
   // INVARIANT: clean prompts must pass through byte-for-byte. Sanitization is
@@ -105,6 +116,7 @@ describe('NUL-bearing feedback: argv construction', () => {
   test('a clean prompt is passed through unchanged', () => {
     const prompt = 'Fix the off-by-one in the parser.\n\nSee line 42.\tThanks.';
     const args = new ClaudeCodeAgent().buildExecArgs({
+      modelId: 'test-model',
       prompt,
       dangerouslySkipPermissions: true,
     });
@@ -153,6 +165,7 @@ describe('NUL-bearing feedback: end-to-end at the delivery seam', () => {
     const sanitized = sanitizeUserText(REAL_WORLD_FEEDBACK);
 
     const args = new ClaudeCodeAgent().buildExecArgs({
+      modelId: 'test-model',
       prompt: sanitized,
       dangerouslySkipPermissions: true,
     });

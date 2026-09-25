@@ -1,6 +1,7 @@
 import { describe, test, expect } from 'bun:test';
 import type { Turn, Actor, TurnRole, Task, Session } from '../../src/types';
-import { buildTaskShowLines, type TaskShowData } from '../../src/cli/commands/show';
+import { buildTaskShowLines } from '../../src/cli/commands/show';
+import type { TaskShowData } from '../../src/task/show-data';
 import { taskDetailHtml } from '../../src/server/templates';
 import { buildNavItemsForTask, getChunkOverview, type ReviewData } from '../../src/cli/tui/review';
 import type { NavItem } from '../../src/cli/tui/renderer';
@@ -60,7 +61,6 @@ function mockTask(): Task {
     prompt: 'demo prompt',
     type: 'task',
     status: 'blocked',
-    priority: 'normal',
     created_at: 1_700_000_000_000,
     completed_at: null,
     target: { kind: 'branch', branch: 'main' },
@@ -91,6 +91,7 @@ function mockSession(): Session {
     total_duration_ms: 0,
     total_usage: null,
     container_name: null,
+    container_agent_id: null,
     interrupt_reason: null,
     interrupt_exit_code: null,
     interrupt_at: null,
@@ -177,6 +178,54 @@ describe('Web taskDetailHtml chunk grouping', () => {
     expect(chunkHeaders.length).toBe(1);
     expect(html).toContain('1 chunk)'); // singular, no trailing 's'
   });
+
+  // INVARIANT: the Turns tab reads in ONE direction. Newest-first (default)
+  // puts the latest chunk at the top and the latest turn at the top of that
+  // chunk. The mixed order (chunks descending, turns inside ascending) was
+  // two timelines on one page — changed because a reader could not tell
+  // which way to read. The grouping rule itself (a chunk is "since you last
+  // acted") is unchanged; it is stated on the page.
+  test('chunks and turns within a chunk share newest-first by default', () => {
+    const html = taskDetailHtml(mockTask(), mockSession(), scenarioTurns(), [], [], [], [], [], []);
+    const chunk1 = html.indexOf('Chunk 1 ·');
+    const chunk2 = html.indexOf('Chunk 2 ·');
+    expect(chunk2).toBeGreaterThan(-1);
+    expect(chunk1).toBeGreaterThan(-1);
+    expect(chunk2).toBeLessThan(chunk1); // Chunk 2 (newer) appears first
+
+    // Within the newest chunk (Chunk 2 = turns 6,7), #7 before #6.
+    // Both must be FOUND first: when the header text changed from a bare "#7"
+    // to "Turn #7", the two indexOf calls silently became -1 and the ordering
+    // assertion stopped testing ordering at all. Anchor the search to the link
+    // text and fail loudly on the next rename instead.
+    const chunk2Body = html.slice(chunk2, chunk1);
+    const sixth = chunk2Body.indexOf('>Turn #6</a>');
+    const seventh = chunk2Body.indexOf('>Turn #7</a>');
+    expect(sixth).toBeGreaterThan(-1);
+    expect(seventh).toBeGreaterThan(-1);
+    expect(seventh).toBeLessThan(sixth);
+    expect(html).toContain('A chunk is what happened since you last acted');
+  });
+
+  test('?chunks=oldest restores chronological order for chunks AND turns inside them', () => {
+    const html = taskDetailHtml(
+      mockTask(), mockSession(), scenarioTurns(), [], [], [], [], [], [],
+      null, null, undefined, null, 'oldest',
+    );
+    const chunk1 = html.indexOf('Chunk 1 ·');
+    const chunk2 = html.indexOf('Chunk 2 ·');
+    expect(chunk1).toBeLessThan(chunk2);
+    // Task URLs carry the task's code.
+    expect(html).toContain('href="/tasks/demo-task/turns">Newest first</a>');
+    // Oldest-first is the same one-direction rule the other way: #6 before #7
+    // inside chunk 2.
+    const chunk2Body = html.slice(chunk2);
+    const sixth = chunk2Body.indexOf('>Turn #6</a>');
+    const seventh = chunk2Body.indexOf('>Turn #7</a>');
+    expect(sixth).toBeGreaterThan(-1);
+    expect(seventh).toBeGreaterThan(-1);
+    expect(sixth).toBeLessThan(seventh);
+  });
 });
 
 // ── Review TUI: nav grouping + chunk overview ──────────────────────────────
@@ -191,6 +240,7 @@ describe('Review TUI chunk grouping', () => {
       unseenComments: [],
       journal: [],
       followUps: [],
+      raisedItems: [],
       proposals: [],
       diffStat: '',
       diffFull: '',

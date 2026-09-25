@@ -35,7 +35,6 @@ function makeTask(overrides?: Partial<Task>): Task {
     prompt: 'Test prompt',
     type: 'task',
     status: 'blocked',
-    priority: 'normal',
     created_at: 0,
     completed_at: null,
     target: { kind: 'branch', branch: 'main' },

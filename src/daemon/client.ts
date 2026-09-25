@@ -1,12 +1,12 @@
 /**
- * Daemon RPC client — sends commands to the daemon over unix socket.
+ * Daemon RPC client — sends commands to the daemon over its TCP port, the
+ * daemon's only transport.
  *
  * Used by CLI commands to route read-only operations through the daemon.
  * In v0.11+, the daemon is required — if it's unavailable, commands fail
  * with an actionable error instead of falling back to direct execution.
  */
 
-import { existsSync } from 'fs';
 import { parseAcceptRemedy } from '../types';
 import type { AcceptRemedy } from '../types';
 import {
@@ -16,10 +16,10 @@ import {
   DaemonConnectionLostError,
 } from './heartbeat';
 import { currentTraceparent } from '../tracing';
-import { getSocketPath } from './paths';
-import { readToken } from './lifecycle';
-import { findLazyRoot } from '../cli/init';
+import { readToken, getDaemonTcpTarget } from './lifecycle';
+import { findLazyRoot } from '../project-paths';
 import type { ProgressEmitter } from './progress';
+import { resolveTeamsLogin } from '../teams/login';
 
 /** Optional observers for a long RPC's mid-flight envelope lines. */
 export interface RpcObservers {
@@ -51,24 +51,21 @@ export class RpcApplicationError extends Error {
   }
 }
 
-/**
- * Build the fetch URL + options for a daemon RPC call.
- *
- * The daemon exposes the same `/rpc/{command}` handler on two transports:
- *   - a unix socket (host-side CLI) — `target` is the socket file path
- *   - the TCP web server (containers) — `target` is an `http(s)://host:port` base
- *
- * A container (e.g. the builder supervisor) cannot reach the unix socket, so it
- * must talk to the daemon over TCP via the `target` in its daemon MCP config
- * (`http://host.docker.internal:<webPort>`). Pure and exported so the
- * unix-vs-TCP branching is unit-testable without a live daemon.
- */
 /** `{ traceparent }` when this process has an active span, `{}` otherwise. */
 function traceparentHeader(): Record<string, string> {
   const traceparent = currentTraceparent();
   return traceparent ? { traceparent } : {};
 }
 
+/**
+ * Build the fetch URL + options for a daemon RPC call.
+ *
+ * `target` is always an `http(s)://host:port` base: the host-side CLI reaches
+ * the daemon at its recorded loopback address (see getDaemonTcpTarget), and a
+ * container (e.g. the builder supervisor) at the `target` in its daemon MCP
+ * config (`http://host.docker.internal:<webPort>`). Pure and exported so the
+ * request shape is unit-testable without a live daemon.
+ */
 export function buildDaemonRpcRequest(
   target: string,
   token: string,
@@ -84,7 +81,6 @@ export function buildDaemonRpcRequest(
    */
   routePrefix: DaemonRoutePrefix = 'rpc',
 ): { url: string; options: Record<string, unknown> } {
-  const isHttp = target.startsWith('http://') || target.startsWith('https://');
   const options: Record<string, unknown> = {
     method: 'POST',
     headers: {
@@ -103,16 +99,7 @@ export function buildDaemonRpcRequest(
     },
     body: JSON.stringify(params),
   };
-  let url: string;
-  if (isHttp) {
-    // TCP web server: target is the base URL.
-    url = `${target}/${routePrefix}/${command}`;
-  } else {
-    // Unix socket: Bun routes the request to the socket file via `unix`.
-    url = `http://localhost/${routePrefix}/${command}`;
-    options.unix = target;
-  }
-  return { url, options };
+  return { url: `${target}/${routePrefix}/${command}`, options };
 }
 
 /**
@@ -141,7 +128,7 @@ export type DaemonRoutePrefix = 'rpc' | 'builder';
 
 export class DaemonClient {
   constructor(
-    /** Either a unix socket path (host) or an http(s):// base URL (container). */
+    /** An http(s):// base URL where the daemon listens. */
     private target: string,
     private token: string,
     /** Optional re-read of the credential source, used once per 401. */
@@ -156,31 +143,71 @@ export class DaemonClient {
   ) {}
 
   /**
-   * Create a client for a specific project's daemon over its unix socket.
-   * Returns null if socket or token file doesn't exist.
+   * The Teams install and project this client reaches, when it belongs to a
+   * bound clone — null for a local daemon. Read by the error paths below: a
+   * bound clone has no local daemon, so `lazy daemon start|status|restart`
+   * (which refuse there) is never the remedy for a failure to reach Teams.
    */
-  static create(projectRoot: string): DaemonClient | null {
-    const socketPath = getSocketPath(projectRoot);
-    if (!existsSync(socketPath)) return null;
+  teams: TeamsTarget | null = null;
+
+  /**
+   * Create a client for a specific project's daemon, at either of two
+   * targets — a bound clone (design doc §4.4, §4.7) never has a local daemon
+   * or store at all, and the login record decides which this is:
+   *
+   * - **Bound**: the client points at Teams' proxy route
+   *   (`<teamsUrl>/api/projects/<project>/rpc`) carrying the clone's
+   *   CLI-scoped ApiToken. This is the ONE seam the design routes the whole
+   *   remote-client change through — `RemoteStorage`, the typed RPC wrappers
+   *   and every `lazy_*` tool are unchanged, because none of them know where
+   *   the daemon is.
+   * - **Local**: the recorded TCP address and shared daemon token (see
+   *   `getDaemonTcpTarget`), exactly as before.
+   *
+   * Returns null if neither a login record nor a local port marker/token
+   * exists.
+   */
+  static async create(projectRoot: string): Promise<DaemonClient | null> {
+    const bound = await resolveTeamsLogin(projectRoot);
+    if (bound) {
+      // The path segment IS `/api/projects/<slug>/rpc` already, so the base
+      // handed to `buildDaemonRpcRequest` must stop one segment short of
+      // `rpc` — that function appends `/${routePrefix}/${command}` itself.
+      const target = `${bound.login.binding.teams_url}/api/projects/${bound.login.binding.project}`;
+      const client = new DaemonClient(target, bound.token, async () => {
+        // Re-reads the credential store, not a token FILE — there is no
+        // local marker file for a bound clone. One re-read either way: a
+        // revoked or rotated ApiToken surfaces as a second 401, which is
+        // final, exactly as it is for the local path below.
+        const fresh = await resolveTeamsLogin(projectRoot);
+        return fresh ? { target, token: fresh.token } : null;
+      });
+      client.teams = { url: bound.login.binding.teams_url, project: bound.login.binding.project };
+      return client;
+    }
+
+    const target = getDaemonTcpTarget(projectRoot);
+    if (!target) return null;
 
     const token = readToken(projectRoot);
     if (!token) return null;
 
-    // On the host the token file itself is the live source: a daemon restart
-    // that rotates the token is picked up by re-reading it.
-    return new DaemonClient(socketPath, token, async () => {
+    // On the host the marker/token files themselves are the live source: a
+    // daemon restart that moves port or rotates the token is picked up by
+    // re-reading them.
+    return new DaemonClient(target, token, async () => {
+      const freshTarget = getDaemonTcpTarget(projectRoot);
       const fresh = readToken(projectRoot);
-      return fresh ? { target: socketPath, token: fresh } : null;
+      return fresh && freshTarget ? { target: freshTarget, token: fresh } : null;
     });
   }
 
   /**
    * Create a client for an explicit target + token.
    *
-   * Used inside containers (the builder supervisor), where the daemon is only
-   * reachable over TCP at the `target` carried by the daemon MCP config
-   * (`http://host.docker.internal:<webPort>`) — the unix socket does not exist
-   * in the container.
+   * Used inside containers (the builder supervisor), where the daemon is
+   * reachable at the `target` carried by the daemon MCP config
+   * (`http://host.docker.internal:<webPort>`).
    *
    * `routePrefix` must match the KIND of token being presented. A container's
    * daemon MCP config carries a per-identity MCP token, which /rpc/* rejects by
@@ -253,6 +280,10 @@ export class DaemonClient {
 
     if (!response.ok) {
       const body = await response.text().catch(() => '');
+      if (this.teams) {
+        const refused = teamsCommandRefusal(this.teams, response.status, body, command, params);
+        if (refused) throw refused;
+      }
       // Application-level error — daemon responded but rejected the request.
       // The body is JSON in every daemon reply; a non-JSON body (a proxy page,
       // a truncated stream) is not an error worth surfacing here, so it simply
@@ -287,6 +318,108 @@ export class DaemonClient {
     if (signal) options.signal = signal;
     return await fetch(url, options as any);
   }
+}
+
+/** Which Teams install and project a bound clone's client reaches. */
+export interface TeamsTarget {
+  url: string;
+  project: string;
+}
+
+/**
+ * Teams answered "this command is not offered through the proxy" — the Rails
+ * route's refuse-by-default for anything its tables do not admit (the browser
+ * could not do it either, so a bound clone may not).
+ *
+ * Deliberately NOT an {@link RpcApplicationError}: several callers read a 404
+ * from the daemon as "no such task" and fall back quietly, and a command Teams
+ * will never run is not an absent task.
+ */
+export class TeamsCommandRefusedError extends Error {
+  constructor(message: string, readonly refused: string) {
+    super(message);
+    this.name = 'TeamsCommandRefusedError';
+  }
+}
+
+/**
+ * Turn the proxy's own refusal into one that names the binding and the way
+ * forward. The route's wording ("Unknown or unsupported command 'storage'")
+ * names neither the install nor, for a storage call, the method that was
+ * refused, and tells a person nothing about what to do. Returns null for any
+ * other failure, which keeps its own wording.
+ */
+export function teamsCommandRefusal(
+  teams: TeamsTarget,
+  status: number,
+  body: string,
+  command: string,
+  params: Record<string, unknown>,
+): TeamsCommandRefusedError | null {
+  const way =
+    'Use the Teams web UI where it offers this, or a server-side builder session (`lazy builder`), ' +
+    'which runs where the project lives — or run `lazy logout` to work on this clone as a local project instead.';
+  // The route's content refusals (a body key or a task setting the browser
+  // could not have sent) already say what was refused; they lack the install
+  // and the way forward. Status 403 alone is not enough — an authorization
+  // refusal is also a 403 and says something else.
+  if (status === 403 && /from a clone logged in to Lazy Teams/.test(body)) {
+    let reason = body;
+    try {
+      const parsed = JSON.parse(body) as { error?: unknown };
+      if (typeof parsed.error === 'string') reason = parsed.error;
+    } catch {
+      // Not JSON: the raw body is the best wording there is, so it is used as is.
+    }
+    return new TeamsCommandRefusedError(
+      `This clone is bound to Lazy Teams (${teams.project} on ${teams.url}), and Teams refused the request: ` +
+      `${reason} ${way}`,
+      command === 'storage' && typeof params.method === 'string' ? `storage.${params.method}` : command,
+    );
+  }
+  if (status !== 404 || !/Unknown or unsupported command '/.test(body)) return null;
+  const refused = command === 'storage' && typeof params.method === 'string'
+    ? `storage.${params.method}`
+    : command;
+  return new TeamsCommandRefusedError(
+    `This clone is bound to Lazy Teams (${teams.project} on ${teams.url}), and Teams does not offer ` +
+    `'${refused}' to a bound clone. ${way}`,
+    refused,
+  );
+}
+
+/**
+ * The error a bound clone shows when a call to Teams fails in a way the
+ * local-daemon remedies would otherwise describe: Teams unreachable, the
+ * connection dropped mid-call, or the login refused (a final 401 — revoked or
+ * expired token). Every `lazy daemon …` command refuses in a bound clone, so
+ * suggesting one would send the person between two dead ends; instead this
+ * names the install and project, and the two ways forward.
+ *
+ * Returns `err` unchanged for anything else — an application refusal other
+ * than 401 is the daemon's own answer and already says what to do.
+ */
+export function boundCloneFailure(teams: TeamsTarget, err: unknown): unknown {
+  // Teams was reached and answered: it already names the binding and the way forward.
+  if (err instanceof TeamsCommandRefusedError) return err;
+  const where = `${teams.project} on ${teams.url}`;
+  const ways =
+    'Run `lazy login` to sign in again, or `lazy logout` to work on this clone as a local project instead.';
+  if (err instanceof RpcApplicationError) {
+    if (err.status !== 401) return err;
+    return new RpcApplicationError(401, `Lazy Teams refused this clone's login for ${where}.\n${ways}`);
+  }
+  if (err instanceof DaemonConnectionLostError) {
+    return new Error(
+      `The connection to Lazy Teams (${where}) dropped while the command was still running — ` +
+      'it may have completed there. Re-check with `lazy show <task>` before retrying.',
+    );
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  return new Error(
+    `Could not reach Lazy Teams (${where}): ${msg}\n` +
+    `Check that ${teams.url} is up and reachable from this machine. ${ways}`,
+  );
 }
 
 /**
@@ -358,12 +491,16 @@ export async function tryRpc<T>(
   const root = findLazyRoot();
   if (!root) throw new NotALazyProjectError();
 
-  const client = DaemonClient.create(root);
+  const client = await DaemonClient.create(root);
   if (!client) throw new DaemonNotRunningError();
 
   try {
     return await client.rpc(command, root, params, observers, signal) as T;
   } catch (err) {
+    // A bound clone has no local daemon to check or restart: say which Teams
+    // install could not be reached and how to recover, instead.
+    if (client.teams) throw boundCloneFailure(client.teams, err);
+
     // Application-level error (daemon responded with error) — surface it directly
     if (err instanceof RpcApplicationError) {
       throw err;

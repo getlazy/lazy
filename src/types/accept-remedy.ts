@@ -26,8 +26,12 @@ export type AcceptRefusalReason =
   | 'approval-required'
   | 'approval-invalid'
   | 'pending-violations'
+  | 'open-raised-items'
+  | 'review-issues-unaddressed'
+  | 'queued-comments-undelivered'
   | 'resurrection'
   | 'lfs-raw-blob'
+  | 'check-failed'
   | 'out-of-sync'
   | 'merge-conflict'
   | 'mid-merge'
@@ -39,7 +43,8 @@ export type AcceptRefusalReason =
   | 'no-commits'
   | 'already-accepted'
   | 'forge-approval-required'
-  | 'mr-closed';
+  | 'mr-closed'
+  | 'review-base-mismatch';
 
 /**
  * A remedy the review page can perform itself, instead of sending the human to
@@ -64,10 +69,12 @@ export interface AcceptRemedy {
 }
 
 const REASONS: ReadonlySet<string> = new Set<AcceptRefusalReason>([
-  'approval-required', 'approval-invalid', 'pending-violations', 'resurrection',
-  'lfs-raw-blob', 'out-of-sync', 'merge-conflict', 'mid-merge', 'dirty-worktree',
+  'approval-required', 'approval-invalid', 'pending-violations', 'open-raised-items',
+  'review-issues-unaddressed', 'queued-comments-undelivered',
+  'resurrection',
+  'lfs-raw-blob', 'check-failed', 'out-of-sync', 'merge-conflict', 'mid-merge', 'dirty-worktree',
   'no-session', 'interrupted', 'working', 'parent-active', 'no-commits',
-  'already-accepted', 'forge-approval-required', 'mr-closed',
+  'already-accepted', 'forge-approval-required', 'mr-closed', 'review-base-mismatch',
 ]);
 
 const UI_ACTIONS: ReadonlySet<string> = new Set<AcceptRemedyUiAction>(['passphrase', 'sync']);

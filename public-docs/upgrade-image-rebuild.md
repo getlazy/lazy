@@ -1,11 +1,11 @@
 # How `lazy upgrade` rebuilds the container image
 
-`lazy upgrade` used to do its work strictly in order: find running containers,
-ask the human what to do about the working ones, wait for them to block, stop
-everything — and only *then* start a container image rebuild that can take
-several minutes. None of that waiting is an input to the build: the image is
-built from the Dockerfile, not from the state of your tasks. So the build now
-starts first and runs in the background while the rest of the upgrade proceeds.
+This page explains how `lazy upgrade` rebuilds the container image your agents
+run in, and when else lazy rebuilds it. A rebuild can take several minutes, and
+none of the upgrade's other steps — asking what to do about working agents,
+waiting for them to block, stopping containers — is an input to it: the image is
+built from the Dockerfile, not from the state of your tasks. So the build starts
+first and runs in the background while the rest of the upgrade proceeds.
 
 ## The sequence
 
@@ -13,17 +13,39 @@ starts first and runs in the background while the rest of the upgrade proceeds.
    this project's running containers. Nothing has changed yet, and an abort here
    costs nothing.
 2. **Start the rebuild, in the background, to a staging tag.** The build writes
-   `<repository>:<tag>-upgrade` (e.g. `lazy-runner:0.21-upgrade`), always
+   `<repository>:<tag>-upgrade` (e.g. `lazy-runner:0.22-upgrade`), always
    with `--no-cache` — the Dockerfile text is unchanged when a new version of
    the configured agent's CLI ships, so only busting the cache actually
    re-fetches it.
 
-   This happens **unconditionally**: no version comparison, no Dockerfile-hash
-   check, no age check. Upgrading lazy rebuilds the image, always. That is what
-   makes the image tag safe to keep coarse (`major.minor`) — the tag is an
-   identity, and this is the freshness mechanism.
+   Upgrading lazy rebuilds the image. That is what makes the image tag safe to
+   keep coarse (`major.minor`) — the tag is an identity, and this is the
+   freshness mechanism.
+
+   The one exception is **repeating a build that just happened** — and it is a
+   question, not a rule. If an image built from exactly these inputs already
+   exists (the usual cause being a `lazy upgrade --images` you ran minutes
+   earlier), `lazy upgrade` tells you how old it is and asks whether to rebuild
+   it anyway:
+
+   ```
+   lazy-runner:0.22 was built 6 minutes ago from these exact inputs — its
+   Dockerfile and build inputs are unchanged since.
+     Rebuilding re-resolves everything unpinned inside it (the agent CLI, apt
+     packages, anything else the Dockerfile fetches) and takes several minutes.
+     Rebuild the container image anyway? [Y/n]
+   ```
+
+   The default is yes, because refreshing unpinned contents is what an upgrade
+   rebuild is *for* — but whether that is worth several minutes right now
+   depends on why you are upgrading, which only you know. There is no hidden
+   time threshold deciding it for you. Without a TTY (scripts, CI) and with
+   `--force`, the rebuild happens without asking; `lazy upgrade --images` never
+   asks — it is the force-refresh path.
 3. **Foreground flow continues**: the stop/wait/cancel prompt, waiting for
-   working agents to block, the builder pre-stop warning, stopping containers.
+   working agents to block, the builder pre-stop warning, stopping **task**
+   containers. Builder sessions stay running — they reconnect in place once
+   the daemon restarts (step 6).
 4. **Collect and promote.** The upgrade waits for the background build (usually
    already finished), then points the canonical tags — `lazy-runner:<major.minor>`
    and, for the base repository, `lazy-runner:latest` — at the staged image and
@@ -32,6 +54,13 @@ starts first and runs in the background while the rest of the upgrade proceeds.
    rotate the shared daemon token they leaked — the one window where no
    container and no daemon holds it.
 6. **Restart the daemon**, which reconciles and auto-resumes interrupted tasks.
+7. **Print a completion summary** as the last output — a bordered **Upgrade
+   complete** block below any docker build progress (and any prompts that
+   scrolled away during a long build). It states the version transition, what
+   was rebuilt (container image tag, agent binary), daemon restart status, and
+   what happens next (interrupted tasks auto-resuming, builders resuming in
+   place, etc.). `lazy upgrade --images` ends with a similar **Image refresh
+   complete** block instead.
 
 ## Why this is safe
 
@@ -53,6 +82,51 @@ If the build has already failed by the time you answer the prompt, the upgrade
 aborts *before* stopping anything, so your builders and agents keep running on
 the intact image. If it fails while the upgrade is collecting it, the failure is
 reported with the staging tag that was not promoted.
+
+## Running builder sessions
+
+On docker/podman, a live `lazy builder` in another terminal **stays running**
+through the upgrade. The upgrade rebuilds the agent binary and restarts the
+daemon, but it does **not** stop your builder container. The in-container
+supervisor watches for the daemon restart, refreshes the proxy address and
+credentials against the new daemon, and relaunches Claude Code in the **same
+terminal** with `--resume`. You should see at most a one-line notice:
+
+```
+Daemon upgraded 0.22.1140 → 0.22.1141; lazy tools reconnected and the session resumed.
+```
+
+You do not need to run `lazy builder --resume` yourself when the upgrade
+succeeds.
+
+Before the upgrade proceeds, it warns you to **submit any message you have typed
+but not yet sent** — that in-progress input cannot be preserved when Claude
+relaunches. While the background image build runs, docker step output can scroll
+that warning off screen; once the build finishes, lazy prints the press-Enter
+prompt again below the build output so you are not left staring at `#14 DONE`
+with no visible next step.
+
+If the in-container reconnect fails (for example the new daemon never comes
+healthy), lazy prints an actionable error and `lazy builder --resume <id>` so
+nothing is silently lost.
+
+The host-side `lazy builder` wrapper still has a relaunch loop for when the
+container exits for other reasons (a crash or manual stop). That loop waits for
+the upgrade to finish and re-execs `lazy builder --resume` into the same
+terminal — but a normal upgrade does not trigger it, because the container
+never exits.
+
+**Task agents** running in containers follow a different path: the upgrade
+restarts the daemon (and its audit proxy, usually on a new OS-assigned port),
+but the task container keeps running. The in-container supervisor watches for
+that restart, stops the current agent launch, refreshes `ANTHROPIC_BASE_URL`
+from the new daemon, and retries the turn — so a mid-turn "Connection refused"
+from a stale proxy address should clear within a retry or two rather than
+looking like a firewall block. If a task was already stopped by the restart
+reaper, the next auto-resume launches a fresh container with fresh env.
+
+Host-process builders (no container) are not stopped by upgrade; their
+interactive supervisor reconnects the same way `lazy pair` and `lazy chat` do.
 
 ## Builds have no time limit
 
@@ -87,12 +161,21 @@ limit killing them is the exact failure this default exists to prevent.
 
 ## Related
 
+- **Worktree Dockerfile adoption** — when a task worktree's `Dockerfile.lazy`
+  differs from the project root's, `lazy upgrade`
+  (and `lazy upgrade --images`) can adopt it for the rebuild and the daemon.
+  Your cwd may be anywhere inside that worktree — a subdirectory counts the
+  same as the worktree root. Each rebuild first announces any existing adoption:
+  on a TTY you choose whether to keep it (default yes); scripts and CI keep it
+  and log. A new worktree Dockerfile is offered only when you are standing
+  inside that worktree and its content differs (default no). Running upgrade
+  from the project root alone never offers a new adoption.
 - `lazy upgrade --images` is the separate **non-disruptive** path: it rebuilds
   only the image, in the foreground, and stops nothing and restarts nothing.
   Only newly-created containers pick the new image up (`lazy upgrade --images
   --dry-run` prints the exact boundary).
-- Image tags are versioned, never bare `:latest` — see the rationale in
-  `src/capture/image-tag.ts` and `docs/agent-container.md`.
+- Image tags are versioned (lazy's `major.minor`), never bare `:latest` — see
+  [Rebuilding](agent-container.md#rebuilding) in the agent container page.
 - An upgrade is not the only thing that refreshes the image — see "When else the
   image gets rebuilt" below.
 
@@ -103,7 +186,7 @@ runner image, on three different axes:
 
 | Trigger | What it catches |
 | --- | --- |
-| `lazy upgrade` | Everything. Unconditional, `--no-cache`, described above |
+| `lazy upgrade` | Everything. `--no-cache`, described above — asks first (default yes) when an identical image already exists |
 | The image is more than 14 days old | Unpinned contents drifting on a host nobody upgrades |
 | The Dockerfile's content hash changed | You edited the Dockerfile |
 

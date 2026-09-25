@@ -25,24 +25,20 @@ needs the file to be missing at the base entirely.
 ## How a base gets that stale
 
 The shape that produces it in lazy is a **squash-accepted parent with a stacked
-child** — which is exactly how release hubs work:
+child** — for example, a long-lived parent task with a follow-up branched off it:
 
 ```
-main ── … ── "Release v0.11" (squash of the v0.11 hub) ── "delete src/sse.ts"
+main ── … ── "Parent A" (squash of parent A) ── "delete src/sse.ts"
         \
-         v0.11 hub ── (adds src/sse.ts) ── v0.12 hub ── … ── Merge origin/main
+         parent A ── (adds src/sse.ts) ── parent B ── … ── Merge origin/main
 ```
 
-Accepting the v0.11 hub squashes its work into a single commit on `main`. That
-commit is *not* a descendant of the hub's own commits, so the v0.12 hub — which
-was branched off v0.11 before the squash — still has a merge base with `main`
-that predates the entire v0.11 window. Every file born in that window has no
-version at the base. When `main` later deletes one of them, the v0.12 hub's
-routine `Merge origin/main` brings it straight back.
-
-This is not hypothetical. In the v0.12 release it resurrected a dead SSE module
-and five other changes, one of them a live behavioral regression, and none of it
-was noticed for eight releases.
+Accepting parent A squashes its work into a single commit on `main`. That commit
+is *not* a descendant of the parent's own commits, so parent B — which was branched
+off parent A before the squash — still has a merge base with `main` that predates
+all of parent A's work. Every file born in that window has no version at the base.
+When `main` later deletes one of them, parent B's routine `Merge origin/main`
+brings it straight back — and because nothing conflicts, nobody notices.
 
 ## What the guard checks
 
@@ -60,15 +56,15 @@ Before any accept merges, lazy computes:
 Anything that survives step 4 is a resurrection. Paths the target never had, or
 that it deleted and later re-added itself, are not flagged.
 
-### Why not `git diff --diff-filter=D main...hub`
+### Why not `git diff --diff-filter=D main...parent`
 
 That command is the intuitive one and it does **not** work. A three-dot diff is
 taken from the merge base, and in this topology the resurrected file has no
 version at the merge base — so it appears in neither side of that diff. Run
-against a reproduction of the v0.12 topology it returns nothing at all.
+against the topology above it returns nothing at all.
 
-The related idea of checking that `merge-base(hub, main)` is recent enough also
-fails, for a different reason: by accept time the hub has already merged `main`,
+The related idea of checking that `merge-base(parent, main)` is recent enough also
+fails, for a different reason: by accept time the parent has already merged `main`,
 so its merge base *is* `main`'s tip. The staleness signal is gone precisely when
 you would want to read it. The guard therefore asks the direct question — "would
 this merge un-delete anything?" — instead of a proxy for it.
@@ -79,17 +75,17 @@ The accept is refused, nothing is merged, and the message names each file, the
 commit that deleted it, and the command that resolves it:
 
 ```
-Accepting task t1 would merge `lazy/release-v012` into `main` and RE-ADD 1 file
+Accepting task t1 would merge `lazy/parent-b` into `main` and RE-ADD 1 file
 that `main` deliberately deleted:
 
   src/sse.ts
       deleted by 4f2a1c9e "Remove dead SSE module" (2026-04-12)
 
-`lazy/release-v012` has no version of this file at its merge base with `main`, so
+`lazy/parent-b` has no version of this file at its merge base with `main`, so
 git sees the deletion as nothing to merge and takes the branch's copy wholesale —
 no conflict, nothing to review. …
 
-If it is dead on `main`, delete it on `lazy/release-v012` and re-run the accept.
+If it is dead on `main`, delete it on `lazy/parent-b` and re-run the accept.
 
 If bringing it back is intentional, approve it explicitly:
 
@@ -118,27 +114,25 @@ point at `lazy sync`.
 
 Lazy does **not** sync those children for you. Merging into somebody else's
 worktree as a side effect of an accept the human asked for on a different task is
-exactly the hidden side effect CLAUDE.md forbids, and a conflict raised there
+a hidden side effect lazy avoids by design, and a conflict raised there
 would strand a task nobody is watching. Upstream merge is `lazy sync`'s job. The
 resurrection guard is the backstop for when the advice is ignored.
 
 ## Scope and limits
 
-- **The guard is always on** and applies to every accept, not just release hubs.
+- **The guard is always on** and applies to every accept, not just long-lived parent tasks.
   The hazard is a property of merge topology, not of release semantics — any
   squash-accepted parent with a stacked child can produce it. It adds no config.
 - **File granularity only.** A file that survives on the target but has *hunks*
   reverted inside it by the same mechanism is not detected. That defect class is
-  real — the v0.12 audit found instances — but hunk-level detection has no clean
+  real, but hunk-level detection has no clean
   signal to key off and would fire constantly on ordinary merges.
 - **Deletions made only inside a merge commit** are not attributed to a deleting
-  commit; `git log --diff-filter=D` does not report them by default. No such case
-  appeared in the v0.12 audit, and the file-level check itself still catches the
+  commit; `git log --diff-filter=D` does not report them by default. The file-level check itself still catches the
   re-add — only the "deleted by" attribution would be missing.
 - **A very wide branch is capped.** If a merge adds more than 2000 files the
   guard checks the first 2000 and warns that it truncated, rather than silently
   reporting a clean result.
 
-Implementation: [`src/protection/resurrection-guard.ts`](../src/protection/resurrection-guard.ts);
-enforcement point in the daemon accept path, alongside the branch-protection edge
+The check runs in the daemon's accept path, alongside the branch-protection edge
 gate, so every driver and every caller (CLI, MCP, automation) is covered.

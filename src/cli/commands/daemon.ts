@@ -3,9 +3,9 @@
  *
  * Manages the lazy daemon process lifecycle:
  *   lazy daemon start     — start daemon (detaches by default)
- *   lazy daemon stop      — graceful shutdown via socket RPC
+ *   lazy daemon stop      — graceful shutdown via RPC over the daemon's TCP port
  *   lazy daemon restart   — stop + start
- *   lazy daemon status    — show PID, uptime, socket path
+ *   lazy daemon status    — show PID, uptime, web/dashboard address
  *   lazy daemon logs      — tail the daemon log file
  *
  * Per-project: each project gets its own daemon process. Commands must be
@@ -15,15 +15,15 @@
  * never kill existing daemons — only stop/restart do that.
  */
 
-import { existsSync } from 'fs';
 import { rm, readFile } from 'fs/promises';
-import { parseFlags, requireLazyRoot } from '../helpers';
-import { formatDuration } from '../helpers';
+import { parseFlags, requireLazyRoot, refuseIfBoundClone } from '../helpers';
+import { formatDuration } from '../../utils/format';
 import { describeExpiry } from '../../utils/local-day';
 import { isTTY, promptYesNo } from '../editor';
 import {
   checkDaemonHealth,
   DAEMON_HEALTH_TIMEOUT_MS,
+  SIGNAL_SHUTDOWN_BUDGET_MS,
   isDaemonRunning,
   readPid,
   readToken,
@@ -32,26 +32,70 @@ import {
   requestShutdown,
   blockingFlock,
   cleanupStaleFiles,
-  getSocketPath,
   getDaemonBaseDir,
+  getDaemonTcpTarget,
   getStartupErrorPath,
-  formatDashboardUrl,
   enumerateDaemons,
   type DaemonRecord,
 } from '../../daemon';
+import { dashboardUrlFromStatus } from '../../daemon/dashboard-availability';
+import { checkDashboardAddress, dashboardAddressNote } from '../../daemon/dashboard-address';
 import { listInteractiveSessions, describeInteractiveSession } from '../../daemon/interactive-registry';
 import { startDaemonBackground } from '../../daemon/auto-start';
 import { getRunningCodeSha } from '../../daemon/code-version';
+import type { DaemonStatus } from '../../daemon/lifecycle';
 import { assertDaemonCredentials } from '../../daemon/credential-gate';
 import { collectDaemonStopInventory, confirmDaemonStop } from './daemon-pre-stop';
 import { commandLogs, logsUsage } from './logs';
 import { commandAutoBudget, autoBudgetUsage } from './auto-budget';
 import { commandDaemonConfig, daemonConfigUsage } from './daemon-config';
 import { commandResumeQueue, resumeQueueUsage } from './resume-queue';
+import { commandDaemonHealth, daemonHealthUsage } from './daemon-health';
+
+import { formatDaemonBuiltLine } from '../../utils/build-provenance';
+import { getSourceIdentity } from '../../utils/source-id';
+
+/**
+ * Compare a daemon's reported source id against this checkout's.
+ *
+ * Returns null when there is nothing to say — the daemon is too old to report an
+ * id, or this process is a compiled binary whose `build:` identity is not
+ * comparable to a checkout's fingerprint. Saying nothing is the right answer
+ * there: a warning derived from two incomparable values is worse than silence.
+ */
+async function describeSourceStaleness(
+  reported: string | undefined,
+): Promise<{ line: string; stale: boolean; running: string; current: string } | null> {
+  if (!reported) return null;
+
+  let identity;
+  try {
+    identity = await getSourceIdentity();
+  } catch {
+    return null;
+  }
+  if (identity.kind === 'build') return null;
+
+  const stale = identity.id !== reported;
+  return {
+    line: stale ? `${reported} (running) — this checkout is ${identity.id}` : `${reported} (up to date)`,
+    stale,
+    running: reported,
+    current: identity.id,
+  };
+}
 
 export async function commandDaemon(args: string[]): Promise<void> {
   const subcommand = args[0];
   const subArgs = args.slice(1);
+
+  // Operating THIS machine's daemon by hand is exactly the thing a bound
+  // clone does not do — Teams' own daemon is the one that runs (design doc
+  // §4.4, §4.7). Fleet-wide introspection (`list`, `kill-stray`) and `logs`
+  // are left alone: they are host-diagnostic, not "operate my daemon".
+  if (['start', 'stop', 'restart', 'status', 'health'].includes(subcommand ?? '')) {
+    await refuseIfBoundClone(`daemon ${subcommand}`);
+  }
 
   switch (subcommand) {
     case 'start':
@@ -65,6 +109,9 @@ export async function commandDaemon(args: string[]): Promise<void> {
       break;
     case 'status':
       await daemonStatus(subArgs);
+      break;
+    case 'health':
+      await commandDaemonHealth(subArgs);
       break;
     case 'dashboard-url':
       await daemonDashboardUrl(subArgs);
@@ -140,20 +187,17 @@ async function daemonStart(args: string[]): Promise<void> {
     const { startDaemonServer } = await import('../../daemon/server');
     const daemon = await startDaemonServer({ projectRoot });
     console.log(`Daemon started (PID ${process.pid})`);
-    console.log(`Socket: ${daemon.socketPath}`);
     console.log(`Token:  ${daemon.token.substring(0, 8)}...`);
-    if (daemon.webPort) {
-      console.log(`Web:    ${formatDashboardUrl(daemon.bindHost, daemon.webPort)}`);
-    }
+    console.log(`Web:    ${daemon.dashboardUrl}`);
     console.log('Press Ctrl+C to stop.');
 
     // Keep the process alive
     await new Promise(() => {});
   } else {
-    // Background mode: use unified liveness check (socket + token + PID alive).
-    // After a crash, socket+token files remain but process is dead — the old
-    // check (file existence only) would say "already running" while `daemon status`
-    // (which connects to the socket) said "not running".
+    // Background mode: use unified liveness check (token + port marker + PID
+    // alive). After a crash, the marker files remain but the process is dead —
+    // the old check (file existence only) would say "already running" while
+    // `daemon status` (which connects) said "not running".
     if (isDaemonRunning(projectRoot)) {
       const pid = readPid(projectRoot);
       console.log(`Daemon is already running${pid ? ` (PID ${pid})` : ''}.`);
@@ -166,9 +210,9 @@ async function daemonStart(args: string[]): Promise<void> {
     // Report status after successful start
     const status = await checkDaemonHealth(projectRoot);
     console.log(`Daemon started (PID ${status.pid})`);
-    console.log(`Socket: ${getSocketPath(projectRoot)}`);
-    if (status.webPort) {
-      console.log(`Web:    ${formatDashboardUrl(status.bindHost, status.webPort)}`);
+    const dashboardUrl = dashboardUrlFromStatus(status);
+    if (dashboardUrl) {
+      console.log(`Web:    ${dashboardUrl}`);
     }
   }
 }
@@ -236,7 +280,7 @@ async function daemonStop(
   const yes = parsed.flags.get('yes') === true;
 
   // Use unified liveness check — same as start and status.
-  // After a crash, socket file may exist but process is dead.
+  // After a crash, marker files may exist but the process is dead.
   if (!isDaemonRunning(projectRoot)) {
     // Clean up stale files from a previous crash so the next start works cleanly
     cleanupStaleFiles(projectRoot);
@@ -256,13 +300,14 @@ async function daemonStop(
   const pid = readPid(projectRoot);
   console.log(`Stopping daemon${pid ? ` (PID ${pid})` : ''}...`);
 
-  // Try graceful shutdown via socket. Bounded (see DAEMON_HEALTH_TIMEOUT_MS):
-  // a frozen daemon accepts the connection and never answers, so an unbounded
-  // request here would hang the stop on exactly the daemon that needs stopping.
+  // Try graceful shutdown over the daemon's TCP port. Bounded (see
+  // DAEMON_HEALTH_TIMEOUT_MS): a frozen daemon accepts the connection and never
+  // answers, so an unbounded request here would hang the stop on exactly the
+  // daemon that needs stopping.
   const shutdownAccepted = await requestShutdown(projectRoot);
 
   if (!shutdownAccepted && pid && isProcessAlive(pid)) {
-    // Socket shutdown failed — try SIGTERM directly
+    // RPC shutdown failed — try SIGTERM directly
     console.log('  Daemon did not accept the shutdown request — sending SIGTERM...');
     try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
   }
@@ -281,9 +326,11 @@ async function daemonStop(
 
   // ESCALATE, rather than telling the human to run `kill -9` themselves.
   //
-  // This is the frozen-daemon case: the shutdown request went unanswered and
-  // SIGTERM changed nothing, because the daemon's signal handler runs on the
-  // very event loop that is stuck. Nothing short of SIGKILL will clear it, and
+  // The shutdown request went unanswered and SIGTERM did not finish the job
+  // within the window. WHY is not established here and must not be asserted: a
+  // frozen event loop cannot run the handler at all, but a healthy daemon can
+  // also still be inside a shutdown that is simply taking longer than its
+  // budget. Either way nothing short of SIGKILL will clear it now, and
   // until it is cleared the dead-but-alive process holds the daemon lock, so no
   // replacement can start — which makes "did not stop, try kill -9 yourself"
   // both the wrong answer and the only thing standing between the human and a
@@ -291,8 +338,8 @@ async function daemonStop(
   // job the human asked for is not a new decision, so it does not need a
   // separate --force flag. It is narrated at every step.
   if (pid && isProcessAlive(pid)) {
-    console.log(`  Still running after ${graceMs / 1000}s — SIGTERM is handled on the daemon's own`);
-    console.log('  event loop, which is stuck. Escalating to SIGKILL...');
+    console.log(`  Still running after ${graceMs / 1000}s — it did not answer the shutdown`);
+    console.log('  request and did not exit on SIGTERM. Escalating to SIGKILL...');
     try {
       process.kill(pid, 'SIGKILL');
     } catch (err) {
@@ -434,8 +481,8 @@ async function daemonStatus(args: string[]): Promise<void> {
   const projectRoot = resolveProjectRoot(parsed.flags);
 
   // Primary check: same isDaemonRunning() used by start/stop/ensureDaemon.
-  // If the process is dead but socket file remains (crash), clean up and
-  // report "not running" — don't attempt a socket health check that will fail.
+  // If the process is dead but marker files remain (crash), clean up and
+  // report "not running" — don't attempt a health check that will fail.
   if (!isDaemonRunning(projectRoot)) {
     cleanupStaleFiles(projectRoot);
     console.log('Daemon is not running.');
@@ -453,15 +500,15 @@ async function daemonStatus(args: string[]): Promise<void> {
     return;
   }
 
-  // Daemon process is alive — get rich diagnostic info via socket.
+  // Daemon process is alive — get rich diagnostic info over its TCP port.
   const status = await checkDaemonHealth(projectRoot);
 
   if (status.running) {
     console.log('Daemon is running.');
     console.log(`  PID:     ${status.pid}`);
-    console.log(`  Socket:  ${status.socketPath}`);
-    if (status.webPort) {
-      console.log(`  Web:     ${formatDashboardUrl(status.bindHost, status.webPort)}`);
+    const dashboardUrl = dashboardUrlFromStatus(status);
+    if (dashboardUrl) {
+      console.log(`  Web:     ${dashboardUrl}`);
     } else {
       // INVARIANT: always surface the web-port state. Post-fix, the daemon
       // refuses to start when web binding fails, so this branch is only
@@ -490,10 +537,9 @@ async function daemonStatus(args: string[]): Promise<void> {
     if (status.version) {
       console.log(`  Version: ${status.version}`);
     }
-    if (status.buildTime) {
-      // 'dev' when the daemon runs from source (no build step); otherwise the
-      // UTC timestamp embedded into the compiled binary at build time.
-      console.log(`  Built:   ${status.buildTime}${status.buildTime === 'dev' ? '' : ' (UTC)'}`);
+    const builtLine = formatDaemonBuiltLine(status);
+    if (builtLine) {
+      console.log(`  Built:   ${builtLine}`);
     }
 
     // Staleness check (dev mode): the daemon serves whatever code it started
@@ -501,7 +547,23 @@ async function daemonStatus(args: string[]): Promise<void> {
     // SHA diverges from the working tree's current HEAD, its handlers are stale
     // and on-disk fixes won't take effect until restart. Surface this loudly so
     // the "why is the merged fix not working?" confusion is diagnosable.
-    if (status.codeSha) {
+    //
+    // The SOURCE ID answers it better than the SHA and is preferred wherever
+    // the daemon reports one: it is a content hash, so it moves with
+    // uncommitted edits — which is most of a development day, and exactly the
+    // window in which "why is my fix not working?" gets asked. The SHA check
+    // remains for a daemon too old to report an id.
+    const sourceStale = await describeSourceStaleness(status.sourceId);
+    if (sourceStale) {
+      console.log(`  Source:  ${sourceStale.line}`);
+      if (sourceStale.stale) {
+        console.log('');
+        console.log(`  ⚠ Daemon is STALE: it is running source ${sourceStale.running}, but this`);
+        console.log(`    checkout is now ${sourceStale.current}. On-disk changes (merged fixes,`);
+        console.log('    new handlers) will NOT take effect until you restart the daemon:');
+        console.log('      lazy daemon restart');
+      }
+    } else if (status.codeSha) {
       const currentSha = getRunningCodeSha();
       if (currentSha && currentSha !== status.codeSha) {
         console.log(`  Code:    ${status.codeSha} (running) — working tree at ${currentSha}`);
@@ -536,17 +598,17 @@ async function daemonStatus(args: string[]): Promise<void> {
       }
     }
   } else if (status.unresponsive) {
-    // The socket ACCEPTED the connection and then nothing came back — the
+    // The port ACCEPTED the connection and then nothing came back — the
     // process is alive with a frozen event loop. This is a different failure
-    // from "not responding" below (connection refused / socket gone) and needs
+    // from "not responding" below (connection refused / port gone) and needs
     // a different remedy, so say so explicitly rather than letting the human
     // spend an hour deciding which one they are looking at.
     const pid = status.pid ?? readPid(projectRoot);
     console.log(`Daemon is ALIVE but UNRESPONSIVE${pid ? ` (PID ${pid})` : ''}.`);
-    console.log(`  Socket:  ${status.socketPath ?? getSocketPath(projectRoot)}`);
+    console.log(`  Address: ${getDaemonTcpTarget(projectRoot) ?? 'unknown (no port marker)'}`);
     console.log(`  Probe:   connected, but no reply within ${DAEMON_HEALTH_TIMEOUT_MS / 1000}s`);
     console.log('');
-    console.log('  Its event loop is stuck: the socket is still listening, so the connection');
+    console.log('  Its event loop is stuck: the port is still listening, so the connection');
     console.log('  succeeds, but nothing in the daemon is running to answer. Reconciliation,');
     console.log('  turns, and every other daemon-owned activity are stalled.');
     console.log('');
@@ -555,15 +617,17 @@ async function daemonStatus(args: string[]): Promise<void> {
     console.log('  It force-kills a daemon in this state — SIGTERM alone would be ignored,');
     console.log('  because the signal handler runs on the same frozen loop.');
   } else {
-    // Process is alive (isDaemonRunning passed) but socket isn't responding.
-    // This can happen if the daemon is still starting up or the HTTP handler is stuck.
+    // Process is alive (isDaemonRunning passed) but the daemon isn't answering
+    // on its recorded TCP port — still starting up, a stuck HTTP handler, or a
+    // foreign daemon has taken the port (checkDaemonHealth rejects those).
     const pid = readPid(projectRoot);
-    console.log(`Daemon process is alive${pid ? ` (PID ${pid})` : ''} but not responding on socket.`);
-    if (!existsSync(getSocketPath(projectRoot))) {
-      // The socket FILE is gone, not just unresponsive — something deleted this
-      // daemon's state files while it was running. The daemon repairs that
-      // itself within seconds; doctor is the single surface that explains it.
-      console.log("Its socket file is missing. Run `lazy doctor` for details.");
+    console.log(`Daemon process is alive${pid ? ` (PID ${pid})` : ''} but not responding on its TCP port.`);
+    if (pid === null) {
+      // The lock says a daemon owns this dir but its PID file is gone —
+      // something deleted this daemon's state files while it was running. The
+      // daemon repairs that itself within seconds; doctor is the single
+      // surface that explains it.
+      console.log('Its PID file is missing. Run `lazy doctor` for details.');
     } else {
       console.log('It may be starting up. If this persists, try: lazy daemon restart');
     }
@@ -574,10 +638,19 @@ async function daemonStatus(args: string[]): Promise<void> {
  * `lazy daemon dashboard-url` — print the web dashboard URL and exit.
  *
  * Deliberately does NOT auto-start the daemon (unlike the old `lazy server`
- * alias): this is meant for scripting (`open $(lazy daemon dashboard-url)`),
- * where silently spawning a daemon on a bare URL lookup would surprise a
- * caller that just wants to know if one is already up. Same "check, don't
- * start" posture as `lazy daemon status`.
+ * alias): this is meant for scripting, where silently spawning a daemon on a
+ * bare URL lookup would surprise a caller that just wants to know if one is
+ * already up. Same "check, don't start" posture as `lazy daemon status`.
+ *
+ * It stays the ADDRESS lookup, and only that. Signing in is `lazy dashboard`,
+ * which mints a one-time login link and opens a browser at it — a URL printed
+ * here reaches the sign-in page, not the dashboard. Keeping the two separate
+ * means the scriptable form has no secret in its output and stays safe to log,
+ * paste, or leave in shell history.
+ *
+ * The host it prints is the dashboard's own (`lazy.localhost` on a loopback
+ * bind), because that is the only host the dashboard answers on — see
+ * src/daemon/dashboard-url.ts for why it is not 127.0.0.1.
  */
 async function daemonDashboardUrl(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [
@@ -601,12 +674,18 @@ async function daemonDashboardUrl(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  if (!status.webPort) {
+  const dashboardUrl = dashboardUrlFromStatus(status);
+  if (!dashboardUrl) {
     console.error('Error: daemon is running but the web dashboard port is not available.');
     process.exit(1);
   }
 
-  console.log(formatDashboardUrl(status.bindHost, status.webPort));
+  // Same rule as `lazy dashboard`: print what is served, never silently when
+  // lazy.toml asks for something else — one line on stderr, stdout stays the URL.
+  const addressProblem = await checkDashboardAddress(projectRoot, status);
+  if (addressProblem) console.error(dashboardAddressNote(addressProblem));
+
+  console.log(dashboardUrl);
 }
 
 /** Human-readable age for a daemon record: live uptime if known, else pidfile age. */
@@ -687,8 +766,16 @@ async function daemonList(args: string[]): Promise<void> {
   }
 }
 
-/** SIGTERM a pid, wait up to `timeoutMs` for it to exit, then SIGKILL. */
-async function terminatePid(pid: number, timeoutMs = 3000): Promise<void> {
+/**
+ * SIGTERM a pid, wait up to `timeoutMs` for it to exit, then SIGKILL.
+ *
+ * The default allows the daemon its whole signal-shutdown budget plus a second
+ * for the exit itself. A stray daemon's ROOT is gone, but the PROCESS is
+ * usually healthy and shuts down properly — stopping this project's agents,
+ * recording why their turns ended, closing storage — and the old 3s cut that
+ * off partway, which is how a SIGKILL lands inside a storage write.
+ */
+async function terminatePid(pid: number, timeoutMs = SIGNAL_SHUTDOWN_BUDGET_MS + 1_000): Promise<void> {
   try {
     process.kill(pid, 'SIGTERM');
   } catch {
@@ -819,21 +906,25 @@ export const daemonSubcommandUsage: Record<string, () => void> = {
   'auto-budget': autoBudgetUsage,
   'config': daemonConfigUsage,
   'resume-queue': resumeQueueUsage,
+  'health': daemonHealthUsage,
 };
 
 export function daemonUsage(): void {
   console.log(`Usage: lazy daemon <subcommand> [options]
 
 Manage the lazy daemon process. Each project gets its own daemon.
-The daemon serves both the unix socket (for CLI/agent RPC) and
-a TCP web dashboard (default port: 26024).
+The daemon serves everything — CLI/agent RPC, MCP, and the web
+dashboard — on a single TCP port (default: 26024, loopback-only).
 
 Subcommands:
   start       Start the daemon (includes web dashboard)
   stop        Stop the daemon gracefully
   restart     Restart the daemon
   status      Show daemon status and web dashboard URL (current project)
+  health      Check the daemon's moving parts: loops, sweeps, proxy, storage,
+              runner, stuck tasks, dashboard (OK / WARN / FAIL per row)
   dashboard-url  Print the web dashboard URL, or exit non-zero if not running
+                 (the address only — to SIGN IN, run: lazy dashboard)
   list        List ALL running lazy daemons on this host (marks strays)
   kill-stray  Reap daemons whose project root no longer exists on disk
   logs        Tail the daemon log file (primary debugging tool)
@@ -867,14 +958,15 @@ Examples:
   lazy daemon start             # Start in background
   lazy daemon start --foreground  # Start in foreground (for debugging)
   lazy daemon status            # Check if running, show web URL
+  lazy daemon health            # Is everything inside it still working?
   lazy daemon dashboard-url     # Print the web dashboard URL (for scripting)
-  open $(lazy daemon dashboard-url)  # Open the dashboard in the default browser
+  lazy dashboard                # Sign in and open the dashboard in a browser
   lazy daemon stop              # Stop gracefully
   lazy daemon restart           # Stop + start
   lazy daemon list              # Show every daemon on the host
   lazy daemon kill-stray        # Reap daemons whose project root was deleted
   lazy daemon kill-stray --yes --prune-dirs  # Non-interactive full cleanup
   lazy daemon auto-budget list  # Inspect today's auto-react budget
-  lazy daemon config get        # Show concurrency caps + current usage
-  lazy daemon config set max_concurrent_agents 12  # Raise the agent cap (ephemeral)`);
+  lazy daemon config get        # Show the builder cap + current usage
+  lazy daemon config set builders 4  # Change the builder cap (ephemeral)`);
 }

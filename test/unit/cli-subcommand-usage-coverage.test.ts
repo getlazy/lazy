@@ -275,10 +275,25 @@ describe('CLI multiplexer subcommand help coverage', () => {
     const audits = await auditMultiplexers();
 
     const byCommand = new Map(audits.map((a) => [a.command, a]));
-    // `memory` (list/show/save/rm/history) and `stats` (read-only analytics)
-    // must appear here for the same reason daemon/system do: the scan has to
-    // prove it found the real surface, not silently miss a command.
-    expect([...byCommand.keys()].sort()).toEqual(['daemon', 'memory', 'stats', 'system']);
+    // `memory` (list/show/save/rm/history), `messages` (list/read/dismiss),
+    // `followup` (acknowledge/dismiss triage), `conversations` (list/search/show),
+    // `stats` (read-only analytics), `customize` (scaffolding for extension
+    // seams), `env` (per-task environment variables), `artifact`
+    // (list/add/get/rm for files attached to a task), `followup`
+    // (acknowledge/dismiss triage), `conversations`
+    // (list/search/show over captured builder conversations) and `scratch`
+    // (list/show/sync/rm/path over captured builder scratch files) must appear
+    // here for the same reason daemon/system do: the scan has to prove it found
+    // the real surface, not silently miss a command.
+    expect([...byCommand.keys()].sort()).toEqual(['artifact', 'conversations', 'customize', 'daemon', 'env', 'memory', 'messages', 'raised', 'scratch', 'stats', 'system']);
+
+    const customize = byCommand.get('customize')!;
+    expect(customize.dispatchable).toContain('proxy-plugin');
+    expect(Object.keys(customize.mapped)).toContain('proxy-plugin');
+
+    const env = byCommand.get('env')!;
+    expect(env.dispatchable).toContain('set');
+    expect(Object.keys(env.mapped)).toContain('set');
 
     const stats = byCommand.get('stats')!;
     expect(stats.dispatchable).toContain('tokens');

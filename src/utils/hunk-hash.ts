@@ -1,7 +1,7 @@
 /**
  * Content-addressable hash of a review hunk.
  *
- * Used by `lazy review -i` to persist per-hunk approvals: a hunk that's
+ * Used by `lazy browse -i` to persist per-hunk approvals: a hunk that's
  * been marked reviewed stays cleared on subsequent sessions only as
  * long as its content remains the same. Any change to the hunk body
  * (added, removed, or surrounding context line) yields a fresh hash

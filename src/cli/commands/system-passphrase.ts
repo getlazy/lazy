@@ -1,6 +1,6 @@
 /**
  * `lazy system passphrase` — enroll, inspect, and remove the approval
- * passphrase that `lazy approve` demands when a merge crosses a protected edge.
+ * passphrase that `lazy accept` demands when a merge crosses a protected edge.
  *
  * Subcommands:
  *   status (default)  is a passphrase enrolled on this machine, where the store
@@ -15,7 +15,7 @@
  *   set-key`, which accepts a pipe. A passphrase reaching the process by any
  *   route a script can drive is a passphrase that can sit in shell history, in
  *   a CI variable, or in an agent transcript, and the whole point of this
- *   credential is that a HUMAN was at the keyboard. `lazy approve`'s prompt
+ *   credential is that a HUMAN was at the keyboard. `lazy accept`'s prompt
  *   enforces the same rule at the other end.
  *
  * - NO RPC AND NO MCP TOOL. Enrollment writes from this CLI process on the
@@ -40,9 +40,10 @@
 // No isTTY() here on purpose — requireHumanTerminal reads process.stdin.isTTY
 // directly so LAZY_FORCE_TTY cannot answer for a human. See its comment.
 import { promptSecret, promptYesNo, PromptCancelledError } from '../editor';
-import { findLazyRoot } from '../init';
-import { theme } from '../theme';
+import { findLazyRoot } from '../../project-paths';
+import { theme } from '../../render/theme';
 import { isRunningInContainer } from '../../utils/container';
+import { PROMPT_TEST_SEAMS } from '../human-terminal';
 import {
   readPassphraseEnrollment,
   isPassphraseEnrolled,
@@ -59,18 +60,10 @@ import {
 /** Shortest passphrase worth calling one. Friction, not cryptography. */
 const MIN_LENGTH = 8;
 
-/**
- * The test-only prompt seams, which this command refuses to run alongside.
- *
- * `LAZY_FORCE_TTY` makes isTTY() lie, `LAZY_PROMPT_DEFAULTS` makes every prompt
- * auto-answer, and `LAZY_PROMPT_SECRET` supplies the value a masked prompt
- * "types". Together they are a complete non-interactive route to enrollment —
- * exactly the thing this command says does not exist. They are compiled out of
- * released binaries (see RELEASE_BUILD in src/cli/editor.ts), so this list is
- * the belt to that braces: it also covers running from source, which is how
- * every agent working on lazy itself runs it.
- */
-const PROMPT_TEST_SEAMS = ['LAZY_FORCE_TTY', 'LAZY_PROMPT_DEFAULTS', 'LAZY_PROMPT_SECRET'] as const;
+// The test-only prompt seams this command refuses to run alongside — one list,
+// shared with the other human-terminal-only command (src/cli/human-terminal.ts).
+// They are a complete non-interactive route to enrollment, exactly the thing
+// this command says does not exist.
 
 /**
  * Every mutating path runs this first: a human, at a real terminal, on the
@@ -285,7 +278,7 @@ async function setPassphrase(): Promise<void> {
   }
 
   if (!(await promptAndStore(enrollment.enrolled))) process.exit(1);
-  console.log('Every lazy project on this machine uses it. `lazy approve` asks for it when a');
+  console.log('Every lazy project on this machine uses it. `lazy accept` asks for it when a');
   console.log('merge crosses a protected branch or task.');
 
   await offerLegacyCleanup();
@@ -307,7 +300,7 @@ async function deleteEnrollment(): Promise<void> {
   await deletePassphrase();
   console.log(theme.success('Approval passphrase deleted.'));
   console.log(
-    'Protected merges now fail closed: `lazy approve` will refuse and point back at ' +
+    'Protected merges now fail closed: `lazy accept` will refuse and point back at ' +
     '`lazy system passphrase set`.',
   );
 }
@@ -380,7 +373,7 @@ export async function commandSystemPassphrase(args: string[]): Promise<void> {
 export function systemPassphraseUsage(): void {
   console.log(`Usage: lazy system passphrase [status|set|delete]
 
-Manage the approval passphrase that \`lazy approve\` asks for when a merge
+Manage the approval passphrase that \`lazy accept\` asks for when a merge
 crosses a protected branch or task.
 
 The passphrase is stored HASHED at ${passphraseStorePath()}

@@ -98,6 +98,7 @@ describe('upgrade credential preflight', () => {
       expect(message).toContain('Nothing was stopped, rebuilt, or changed');
       // Same actionable text the daemon gate would have printed — after the
       // damage — so the human sees one consistent remedy.
+      expect(message).toContain('lazy auth set');
       expect(message).toContain('CLAUDE_CODE_OAUTH_TOKEN');
       expect(message).toContain('claude setup-token');
     });
@@ -119,9 +120,17 @@ describe('upgrade credential preflight', () => {
 
     // Ollama setups authenticate against a local model with dummy credentials —
     // requiring an Anthropic token there would block upgrades for no reason.
+    // (Spelled as an agent profile since `[ollama]` was removed; the behaviour
+    // being pinned — a local-model project can still upgrade — is unchanged.)
     test('passes for an ollama-backed project with no Anthropic credential', async () => {
       const configPath = join(projectRoot, 'lazy.toml');
-      await writeFile(configPath, '[ollama]\nenabled = true\nmodel = "qwen"\n');
+      await writeFile(
+        configPath,
+        '[agents.local]\nharness = "claude-code"\nmodel = "qwen"\n' +
+        'endpoint = "http://localhost:11434"\n\n' +
+        '[models.roles.builder]\nagent = "local"\n\n' +
+        '[models.roles.agent]\nagent = "local"\n',
+      );
       process.env.LAZY_CONFIG = configPath;
       expect(await upgradeCredentialPreflight(projectRoot)).toBeNull();
     });

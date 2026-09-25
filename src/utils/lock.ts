@@ -9,7 +9,7 @@
  */
 
 import { stat, readFile, writeFile, unlink } from 'fs/promises';
-import { join } from 'path';
+import { join, resolve } from 'path';
 import { pathExists } from './fs';
 import { checkHolder, selfIdentity, type StartTimeSource } from './process-identity';
 
@@ -30,6 +30,22 @@ export interface LockInfo {
 }
 
 const LOCK_FILENAME = '.lazy-lock';
+
+/**
+ * The locks THIS process has taken and not yet removed, by worktree, with the
+ * command each was taken for. The lock FILE lives in the worktree, which a
+ * task's agent can write, so its contents — command, pid, all of it — can be
+ * planted; this record cannot. See {@link lockHeldHere}.
+ */
+const heldHere = new Map<string, string>();
+
+/**
+ * The command this process took the worktree's lock for, or null when this
+ * process holds no lock on it — read from memory, never from the lock file.
+ */
+export function lockHeldHere(worktreePath: string): string | null {
+  return heldHere.get(resolve(worktreePath)) ?? null;
+}
 
 /**
  * Get the lock file path for a worktree directory.
@@ -56,8 +72,9 @@ export async function readLock(worktreePath: string): Promise<LockInfo | null> {
 
     // Validate required fields
     if (!lock.pid || !lock.started_at || !lock.command) {
-      // Corrupt lock file — remove it
-      await removeLock(worktreePath);
+      // Corrupt lock file — remove the FILE (never this process's record of
+      // its own lock: see unlinkLockFile).
+      await unlinkLockFile(worktreePath);
       return null;
     }
 
@@ -73,15 +90,32 @@ export async function readLock(worktreePath: string): Promise<LockInfo | null> {
     });
     if (!verdict.alive) {
       // Stale lock — holder is gone (exited, defunct, or its pid recycled).
-      await removeLock(worktreePath);
+      await unlinkLockFile(worktreePath);
       return null;
     }
 
     return lock;
   } catch {
     // Corrupt or unreadable lock file — remove it
-    await removeLock(worktreePath);
+    await unlinkLockFile(worktreePath);
     return null;
+  }
+}
+
+/**
+ * Remove the lock FILE only. What stale- and corrupt-file cleanup does: the
+ * file is in the worktree, which a task's agent can write, so its state — a
+ * `{}`, a dead pid — says nothing about a lock this process still holds, and
+ * must never clear this process's record of it ({@link lockHeldHere}). Only
+ * the holder's own release ({@link removeLock}) does that.
+ */
+async function unlinkLockFile(worktreePath: string): Promise<void> {
+  const lockPath = getLockPath(worktreePath);
+  try {
+    await stat(lockPath);
+    await unlink(lockPath);
+  } catch {
+    // Best effort — lock file may already be gone
   }
 }
 
@@ -108,6 +142,7 @@ export async function acquireLock(worktreePath: string, command: string): Promis
 
   const lockPath = getLockPath(worktreePath);
   await writeFile(lockPath, JSON.stringify(lock, null, 2) + '\n', 'utf-8');
+  heldHere.set(resolve(worktreePath), command);
 }
 
 /**
@@ -115,13 +150,8 @@ export async function acquireLock(worktreePath: string, command: string): Promis
  * Safe to call even if no lock exists.
  */
 export async function removeLock(worktreePath: string): Promise<void> {
-  const lockPath = getLockPath(worktreePath);
-  try {
-    await stat(lockPath);
-    await unlink(lockPath);
-  } catch {
-    // Best effort — lock file may already be gone
-  }
+  heldHere.delete(resolve(worktreePath));
+  await unlinkLockFile(worktreePath);
 }
 
 /**

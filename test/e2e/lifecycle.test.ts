@@ -4,6 +4,7 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
 import { createTask, disablePreAccept, startAndReconcile } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 
 describe('full task lifecycle', () => {
   let ctx: TestContext;
@@ -26,6 +27,9 @@ describe('full task lifecycle', () => {
     // 2. Start task (mock Claude making a commit), then drive the reconcile
     //    pass that moves it working → blocked so accept will take it.
     await startAndReconcile(ctx, taskId);
+
+    // Fixture setup, not the subject (see test/helpers/final.ts).
+    seedFinal(ctx, taskId);
 
     // 3. Verify worktree exists
     const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);

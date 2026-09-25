@@ -49,14 +49,14 @@ describe('FileStorage concurrent writes', () => {
     await Promise.all([
       storage.updateTaskModel(task.id, 'opus'),
       storage.updateTaskPrompt(task.id, 'FULL PROMPT'),
-      storage.updateTaskStatus(task.id, 'queued', 'human'),
+      storage.updateTaskStatus(task.id, 'working', 'human'),
     ]);
 
     const after = await storage.getTask(task.id);
     expect(after?.prompt).toBe('FULL PROMPT');
     // Every concurrent write survives — none was reverted by the directory swap.
     expect(after?.model).toBe('opus');
-    expect(after?.status).toBe('queued');
+    expect(after?.status).toBe('working');
 
     // prompt-history.json is written in the SAME atomicWriteTask as task.json,
     // so a reverted directory swap loses the version too (that is what `lazy
@@ -73,7 +73,6 @@ describe('FileStorage concurrent writes', () => {
       storage.updateTaskGoal(task.id, 'new goal'),
       storage.updateTaskPrompt(task.id, 'a prompt'),
       storage.updateTaskType(task.id, 'fix'),
-      storage.updateTaskPriority(task.id, 'high'),
       storage.updateTaskModel(task.id, 'sonnet'),
     ]);
 
@@ -81,7 +80,6 @@ describe('FileStorage concurrent writes', () => {
     expect(after?.goal).toBe('new goal');
     expect(after?.prompt).toBe('a prompt');
     expect(after?.type).toBe('fix');
-    expect(after?.priority).toBe('high');
     expect(after?.model).toBe('sonnet');
   });
 

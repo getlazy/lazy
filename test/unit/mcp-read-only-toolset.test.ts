@@ -21,7 +21,7 @@ import { describe, test, expect } from 'bun:test';
 import { McpServer } from '../../src/mcp/server';
 import { registerTools } from '../../src/mcp/index';
 import { allTools } from '../../src/mcp/tools';
-import { isReadOnlyTool } from '../../src/mcp/tool-access';
+import { toolNamesForRole } from '../../src/mcp/tool-surface';
 import type { McpToolHandler } from '../../src/mcp/types';
 
 interface JsonRpcLine {
@@ -62,7 +62,9 @@ async function exchange(server: McpServer, requests: object[]): Promise<JsonRpcL
 
 function readOnlyServer(ran: string[]): McpServer {
   const server = new McpServer({ name: 'lazy', version: 'test' });
-  registerTools(server, trackingHandlers(ran), allTools, { readOnly: true });
+  // An ask turn always belongs to a task, so the role is 'agent': read-only
+  // narrows on top of the role, never instead of it.
+  registerTools(server, trackingHandlers(ran), allTools, { readOnly: true, role: 'agent' });
   return server;
 }
 
@@ -75,7 +77,9 @@ describe('read-only MCP toolset (ask turns)', () => {
 
     const advertised = (reply.result?.tools ?? []).map(t => t.name).sort();
     expect(advertised.length).toBeGreaterThan(0);
-    expect(advertised).toEqual(allTools.map(t => t.name).filter(isReadOnlyTool).sort());
+    expect(advertised).toEqual([...toolNamesForRole('agent', { readOnly: true })].sort());
+    // lazy_scratch is a READ but builder-only, so the role filter still applies.
+    expect(advertised).not.toContain('lazy_scratch');
     // The tools an ask turn actually needs to answer questions about live state.
     for (const name of ['lazy_show', 'lazy_list', 'lazy_search', 'lazy_status', 'lazy_diff']) {
       expect(advertised).toContain(name);
@@ -111,10 +115,38 @@ describe('read-only MCP toolset (ask turns)', () => {
     expect(ran).toEqual([]);
   });
 
-  test('without readOnly, every tool is advertised and callable', async () => {
+  test('review toolset advertises reads plus lazy_raise, and refuses other writes', async () => {
     const ran: string[] = [];
     const server = new McpServer({ name: 'lazy', version: 'test' });
-    registerTools(server, trackingHandlers(ran), allTools);
+    registerTools(server, trackingHandlers(ran), allTools, { toolset: 'review', role: 'agent' });
+
+    const replies = await exchange(server, [
+      { jsonrpc: '2.0', id: 10, method: 'tools/list' },
+      { jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'lazy_raise', arguments: { content: 'x', blocking: true } } },
+      { jsonrpc: '2.0', id: 12, method: 'tools/call', params: { name: 'lazy_commit', arguments: { message: 'x' } } },
+    ]);
+
+    const list = replies.find(r => r.id === 10);
+    const advertised = (list?.result?.tools ?? []).map(t => t.name).sort();
+    expect(advertised).toEqual([...toolNamesForRole('agent', { toolset: 'review' })].sort());
+    expect(advertised).toContain('lazy_raise');
+    expect(advertised).toContain('lazy_show');
+    expect(advertised).not.toContain('lazy_commit');
+
+    const raise = replies.find(r => r.id === 11);
+    expect(raise?.result?.isError).toBeFalsy();
+    expect(ran).toContain('lazy_raise');
+
+    const commit = replies.find(r => r.id === 12);
+    expect(commit?.result?.isError).toBe(true);
+    expect(commit?.result?.content?.[0].text ?? '').toMatch(/review turn/);
+    expect(ran.filter((n) => n === 'lazy_commit')).toEqual([]);
+  });
+
+  test('without readOnly, the role\'s whole toolset is advertised and callable', async () => {
+    const ran: string[] = [];
+    const server = new McpServer({ name: 'lazy', version: 'test' });
+    registerTools(server, trackingHandlers(ran), allTools, { role: 'agent' });
 
     const replies = await exchange(server, [
       { jsonrpc: '2.0', id: 4, method: 'tools/list' },
@@ -122,7 +154,9 @@ describe('read-only MCP toolset (ask turns)', () => {
     ]);
 
     const list = replies.find(r => r.id === 4);
-    expect((list?.result?.tools ?? []).map(t => t.name).sort()).toEqual(allTools.map(t => t.name).sort());
+    expect((list?.result?.tools ?? []).map(t => t.name).sort()).toEqual(
+      [...toolNamesForRole('agent')].sort(),
+    );
     expect(ran).toEqual(['lazy_commit']);
   });
 });

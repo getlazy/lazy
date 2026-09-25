@@ -10,7 +10,7 @@
  *
  * What that does downstream is silent and total: `LAZY_IS_DAEMON=1` means "I am
  * the daemon, never RPC myself", so `tryRemoteStorage`/`tryRpc` return null
- * without even looking for a socket (src/cli/helpers.ts, src/daemon/client.ts).
+ * without even looking for a socket (src/preconditions.ts, src/daemon/client.ts).
  * Every CLI child of a later `withDaemon: true` suite therefore refuses to talk
  * to the daemon that suite just started, and dies with
  * "Error: Daemon is not running. Start it with: lazy daemon start" — while

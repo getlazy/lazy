@@ -26,3 +26,23 @@ Do NOT refactor, improve, or modify any code beyond what's needed for conflict r
 When resolving conflicts, neither side is more authoritative than the other. Both your local
 changes and the remote changes are work in progress. Resolve conflicts by combining both sets
 of changes so that the merged result preserves the intent of both sides.
+
+Rules that decide the common cases:
+
+- **Lists of entries take the UNION.** A changelog or release-notes section, a list of
+  contributors, a table of options: both sides added entries, and both belong in the result.
+  Keep every entry from both sides, in a sensible order. Never resolve such a file by taking
+  one side's section wholesale.
+- **Explicit field lists take the UNION, and you must verify it.** When a conflict touches an
+  enumerated list of names — a serializer's field list, a switch over an enum, an exported
+  symbol list, a schema, a permissions table — dropping one side's entries compiles cleanly
+  and silently loses a feature. After resolving such a file, diff the resolved version against
+  BOTH parents (`git diff HEAD -- <file>` and `git diff MERGE_HEAD -- <file>`) and confirm that
+  every name either side had is still present, or that you can say why it should not be.
+- **The merge commit is the deliverable.** Do not "finish" by abandoning the merge and
+  hand-copying the other branch's content in as new commits. That produces a commit with one
+  parent, so git believes the branches were never merged and every later merge conflicts on
+  the same lines again. The result must be a commit with both parents, created by `lazy_commit`.
+- **Check both sides still work.** After resolving, run whatever is cheap and relevant — a
+  type-check, the tests covering the files you touched. A resolution that compiles but breaks
+  one side's behavior is not a resolution.

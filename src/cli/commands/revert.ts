@@ -1,8 +1,11 @@
-import { requireLazyRoot, requireStorage, shortId, displayId, taskRef, parseFlags, resolveTaskOrExit, formatDate, getBranchNameFromId } from '../helpers';
+import { requireLazyRoot, requireStorage, parseFlags, resolveTaskOrExit } from '../helpers';
+import { requireActorIdentity } from '../identity-preflight';
+import { formatDate } from '../../utils/format';
+import { shortId, displayId, taskRef, getBranchNameFromId } from '../../task/identity';
 import { loadConfig } from '../../config/loader';
-import { resolveAgentForNewTask } from '../../agent/task-agent';
+import { resolveAgentForNewTaskFromConfig } from '../../agent/task-agent';
 import { openEditor, removeRecoveryFile, isTTY } from '../editor';
-import { theme } from '../theme';
+import { theme } from '../../render/theme';
 import { getActor } from '../../constants';
 import { runGit } from '../../utils/git';
 import { parentTaskIdOf } from '../../task-target';
@@ -37,6 +40,10 @@ export async function commandRevert(args: string[]): Promise<void> {
     revertUsage();
     process.exit(1);
   }
+
+  // Before the revert reason is typed: the daemon refuses a write it cannot
+  // attribute, and a refusal must never cost the human what they wrote.
+  await requireActorIdentity();
 
   const reasonFlag = parsed.flags.get('reason') as string | undefined;
   const yes = parsed.flags.get('yes') === true;
@@ -152,16 +159,21 @@ export async function commandRevert(args: string[]): Promise<void> {
 
     // Create the revert task. It undoes the original task's work, so it runs
     // on the same agent rather than the project default.
+    const [config, projectSettings] = await Promise.all([
+      loadConfig(requireLazyRoot()),
+      storage.getProjectSettings(),
+    ]);
     const revertTask = await storage.createTask(
       revertGoal,
       undefined,
       undefined,
       revertCode,
       undefined,
-      resolveAgentForNewTask({
-        inheritFrom: task,
-        configDefault: (await loadConfig(requireLazyRoot())).agent.agent_id,
-      }),
+      resolveAgentForNewTaskFromConfig(
+        { inheritFrom: task },
+        config.agent,
+        projectSettings,
+      ).agentId,
     );
 
     // Set prompt

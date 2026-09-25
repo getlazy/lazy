@@ -9,8 +9,8 @@
  *
  * The unit suites pin the two halves in isolation (daemon-mcp-reconnect,
  * builder-mcp-reissue). This file puts them together against a daemon that is
- * genuinely stopped and genuinely started again — a different server object, a
- * different socket — with the mounted config file rewritten in place exactly as
+ * genuinely stopped and genuinely started again — a different server object,
+ * usually a different port — with the mounted config file rewritten in place exactly as
  * `refreshDaemonMcpConfigs` rewrites it on daemon start. The proxy handler under
  * test is the same one the container's MCP server builds.
  *
@@ -53,8 +53,6 @@ describe('MCP survives a real daemon restart', () => {
   let restoreDaemonBaseDir: (() => void) | undefined;
   let configPath: string;
   let builderToken: string;
-  let socketA: string;
-  let socketB: string;
 
   beforeEach(async () => {
     process.env.LAZY_TEST = '1';
@@ -70,14 +68,12 @@ describe('MCP survives a real daemon restart', () => {
     restoreConfig = pinConfig(ctx.root);
 
     tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-restart-mcp-'));
-    socketA = join(tmpDir, 'a.sock');
-    socketB = join(tmpDir, 'b.sock');
     configPath = join(tmpDir, 'daemon-mcp-builder.json');
 
     builderToken = await mintMcpToken(ctx.root, { kind: 'builder' }, BUILDER_NAME);
-    await writeConfig({ token: builderToken, target: socketA });
 
-    daemon = await startDaemonServer({ socketPath: socketA, token: SHARED_TOKEN, projectRoot: ctx.root });
+    daemon = await startDaemonServer({ token: SHARED_TOKEN, projectRoot: ctx.root });
+    await writeConfig({ token: builderToken, target: urlOf(daemon) });
   });
 
   afterEach(async () => {
@@ -95,6 +91,11 @@ describe('MCP survives a real daemon restart', () => {
     await removeDaemonBaseDir(daemonBaseDir);
     await rm(tmpDir, { recursive: true, force: true });
   });
+
+  /** The TCP base URL a container-side client would use for this daemon. */
+  function urlOf(d: RunningDaemon): string {
+    return `http://127.0.0.1:${d.webPort}`;
+  }
 
   /**
    * Write the mounted MCP config the way the daemon does: truncate in place,
@@ -120,9 +121,8 @@ describe('MCP survives a real daemon restart', () => {
   }
 
   /** A raw MCP call, bypassing the proxy — for the security assertions. */
-  function rawCall(socket: string, token: string, taskId: string, toolName: string): Promise<Response> {
-    return fetch(`http://localhost/mcp/${encodeURIComponent(taskId || '_')}/${toolName}`, {
-      unix: socket,
+  function rawCall(url: string, token: string, taskId: string, toolName: string): Promise<Response> {
+    return fetch(`${url}/mcp/${encodeURIComponent(taskId || '_')}/${toolName}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -144,15 +144,15 @@ describe('MCP survives a real daemon restart', () => {
     await daemon!.stop();
     daemon = undefined;
 
-    // A lazy_* call lands in the gap. Nothing is listening at socketA.
+    // A lazy_* call lands in the gap. Nothing is listening at the old target.
     const pending = handlerFor('lazy_list').call({});
 
-    // The daemon comes back — a different server, a different socket, exactly
-    // as a restart that could not re-bind its old address would — and rewrites
-    // every mounted config in place with the new target.
+    // The daemon comes back — a different server, usually a different port,
+    // exactly as a restart that could not re-bind its old address would — and
+    // rewrites every mounted config in place with the new target.
     await new Promise((r) => setTimeout(r, 300));
-    daemon = await startDaemonServer({ socketPath: socketB, token: SHARED_TOKEN, projectRoot: ctx.root });
-    await writeConfig({ token: builderToken, target: socketB });
+    daemon = await startDaemonServer({ token: SHARED_TOKEN, projectRoot: ctx.root });
+    await writeConfig({ token: builderToken, target: urlOf(daemon) });
 
     // No relaunch: the call the human made before the restart returns normally.
     expect(await pending).toHaveProperty('tasks');
@@ -169,11 +169,11 @@ describe('MCP survives a real daemon restart', () => {
     await rm(getMcpTokensPath(ctx.root), { force: true });
     clearMcpTokenCache();
 
-    daemon = await startDaemonServer({ socketPath: socketB, token: SHARED_TOKEN, projectRoot: ctx.root });
-    await writeConfig({ token: builderToken, target: socketB });
+    daemon = await startDaemonServer({ token: SHARED_TOKEN, projectRoot: ctx.root });
+    await writeConfig({ token: builderToken, target: urlOf(daemon) });
 
     // The old token really is refused by the restarted daemon.
-    expect((await rawCall(socketB, builderToken, '', 'lazy_list')).status).toBe(401);
+    expect((await rawCall(urlOf(daemon), builderToken, '', 'lazy_list')).status).toBe(401);
 
     const pending = handlerFor('lazy_list').call({});
 
@@ -181,7 +181,7 @@ describe('MCP survives a real daemon restart', () => {
     // new daemon instance: ask for a config under THIS session's own label.
     await new Promise((r) => setTimeout(r, 300));
     const reissued = await mintMcpToken(ctx.root, { kind: 'builder' }, BUILDER_NAME);
-    await writeConfig({ token: reissued, target: socketB });
+    await writeConfig({ token: reissued, target: urlOf(daemon!) });
 
     expect(await pending).toHaveProperty('tasks');
     // A genuinely NEW credential — not the old one resurrected.
@@ -196,14 +196,14 @@ describe('MCP survives a real daemon restart', () => {
     await daemon!.stop();
     await rm(getMcpTokensPath(ctx.root), { force: true });
     clearMcpTokenCache();
-    daemon = await startDaemonServer({ socketPath: socketB, token: SHARED_TOKEN, projectRoot: ctx.root });
+    daemon = await startDaemonServer({ token: SHARED_TOKEN, projectRoot: ctx.root });
 
     // Re-issue for the session, as the watcher would.
     const reissued = await mintMcpToken(ctx.root, { kind: 'builder' }, BUILDER_NAME);
-    expect((await rawCall(socketB, reissued, '', 'lazy_list')).status).toBe(200);
+    expect((await rawCall(urlOf(daemon), reissued, '', 'lazy_list')).status).toBe(200);
 
     // The old one is not honoured by any grace period.
-    const old = await rawCall(socketB, builderToken, '', 'lazy_list');
+    const old = await rawCall(urlOf(daemon), builderToken, '', 'lazy_list');
     expect(old.status).toBe(401);
     expect((await old.json() as { error?: string }).error).toContain('not a valid daemon MCP token');
   }, 30_000);
@@ -215,11 +215,11 @@ describe('MCP survives a real daemon restart', () => {
     expect(await revokeBuilderMcpToken(ctx.root, BUILDER_NAME)).toBe(1);
 
     await daemon!.stop();
-    daemon = await startDaemonServer({ socketPath: socketB, token: SHARED_TOKEN, projectRoot: ctx.root });
+    daemon = await startDaemonServer({ token: SHARED_TOKEN, projectRoot: ctx.root });
     // The config file is still mounted and still names the revoked token.
-    await writeConfig({ token: builderToken, target: socketB });
+    await writeConfig({ token: builderToken, target: urlOf(daemon) });
 
-    expect((await rawCall(socketB, builderToken, '', 'lazy_list')).status).toBe(401);
+    expect((await rawCall(urlOf(daemon), builderToken, '', 'lazy_list')).status).toBe(401);
 
     // Even after the reconnect/re-auth windows are spent, it fails — the wait
     // gives the owner time to re-issue, it does not soften the check.
@@ -231,13 +231,13 @@ describe('MCP survives a real daemon restart', () => {
   // claim; the token is the proof. A restart changes nothing about that.
   test('a builder token claiming a task identity is refused after a restart', async () => {
     await daemon!.stop();
-    daemon = await startDaemonServer({ socketPath: socketB, token: SHARED_TOKEN, projectRoot: ctx.root });
+    daemon = await startDaemonServer({ token: SHARED_TOKEN, projectRoot: ctx.root });
 
-    const resp = await rawCall(socketB, builderToken, 'deadbeefdeadbeef', 'lazy_list');
+    const resp = await rawCall(urlOf(daemon), builderToken, 'deadbeefdeadbeef', 'lazy_list');
     expect(resp.status).toBe(403);
 
     // The shared daemon token is likewise not an MCP identity — the MCP surface
     // has no fallback that would put every agent back on one credential.
-    expect((await rawCall(socketB, SHARED_TOKEN, '', 'lazy_list')).status).toBe(401);
+    expect((await rawCall(urlOf(daemon), SHARED_TOKEN, '', 'lazy_list')).status).toBe(401);
   }, 30_000);
 });

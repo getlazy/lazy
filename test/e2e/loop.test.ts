@@ -1,7 +1,11 @@
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
-import { createTask } from '../helpers/fixtures';
+import { createTask, MOCK_CLAUDE_SUCCESS, setProtectedPatterns } from '../helpers/fixtures';
+import { runReconcile } from '../helpers/reconcile';
+import { readTaskStatus } from '../helpers/storage';
+import { writeFileSync } from 'fs';
+import { join } from 'path';
 
 describe('lazy loop', () => {
   let ctx: TestContext;
@@ -29,6 +33,9 @@ describe('lazy loop', () => {
     expectOutput(result, '--follow');
   });
 
+  // `lazy loop` is the HUMAN's loop over a queue of tasks, at a review gate.
+  // It kept the word when the `loop` TASK TYPE became `cluster` on 2026-09-20 —
+  // freeing the word for exactly this is part of why the type was renamed.
   test('loop appears in main help output', async () => {
     const result = await ctx.lazy(['--help']);
     expectSuccess(result);
@@ -95,6 +102,52 @@ describe('lazy loop', () => {
     expectFailure(result);
     expectError(result, 'lazy loop requires an interactive terminal');
   });
+
+  // INVARIANT (a conflict task is reviewable from the loop —
+  // move-file-approval-to-accept): the loop had two gates that skipped the
+  // feedback flow whenever a protected file was still pending and told the
+  // human to "use lazy unblock to handle them interactively". Both are gone:
+  // unblock reverts nothing now, that interactive prompt was deleted with the
+  // revert, and the advice led to an ordinary feedback editor that never
+  // mentioned the files. Meanwhile the loop silently advanced past exactly the
+  // tasks a reviewer most wanted to nudge — the workflow this change exists to
+  // restore.
+  //
+  // Driven through the prompt seams (LAZY_FORCE_TTY + LAZY_PROMPT_DEFAULTS
+  // picks the first menu entry, "Give feedback") with EDITOR as a no-op, so the
+  // run reaches the feedback flow and stops there. What is asserted is that the
+  // loop did NOT refuse on the violation.
+  test('a task with a pending protected file still reaches the feedback flow', async () => {
+    setProtectedPatterns(ctx.root, ['*.spec.*']);
+    ctx.git('add', 'lazy.toml');
+    ctx.git('commit', '-m', 'Enable protected patterns');
+    writeFileSync(join(ctx.root, 'a.spec.ts'), 'describe("existing", () => {});\n');
+    ctx.git('add', 'a.spec.ts');
+    ctx.git('commit', '-m', 'Add a spec file');
+
+    const taskId = await createTask(ctx, 'Touch a protected test', 'Do the work');
+    expectSuccess(await ctx.lazyMocked(['start', taskId, '--yes', '--follow'], MOCK_CLAUDE_SUCCESS, {
+      env: {
+        LAZY_MOCK_SHOULD_COMMIT: '1',
+        LAZY_MOCK_FILES: JSON.stringify([
+          { path: 'a.spec.ts', content: 'describe("agent changed this", () => {});\n' },
+        ]),
+      },
+    }));
+    await runReconcile(ctx.root, ctx.protocolBase);
+    expect(readTaskStatus(ctx.root, taskId)).toBe('conflict');
+
+    const result = await ctx.lazyMocked(['loop', taskId], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_FORCE_TTY: '1', LAZY_PROMPT_DEFAULTS: '1', EDITOR: 'true', VISUAL: 'true' },
+    });
+
+    const output = result.stdout + result.stderr;
+    // The refusal that used to fire here, verbatim from the deleted gate.
+    expect(output).not.toContain('has file permission violations');
+    expect(output).not.toContain('to handle them interactively');
+    // It got as far as offering the feedback menu for this task.
+    expect(output).toContain('Give feedback');
+  }, 60_000);
 
   test('one bad task reference fails the whole run before anything starts', async () => {
     // INVARIANT: the queue resolves all-or-nothing (same rule as `lazy wait`'s

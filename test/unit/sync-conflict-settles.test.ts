@@ -110,7 +110,7 @@ describe('a conflicted sync whose resolution never succeeds', () => {
 
     let thrown: Error | null = null;
     try {
-      await runSyncWithUpstream(repo, 'main');
+      await runSyncWithUpstream(repo, 'main', 'test-model');
     } catch (err) {
       thrown = err as Error;
     }
@@ -135,7 +135,7 @@ describe('a conflicted sync whose resolution never succeeds', () => {
     const { repo, logPath } = await setup();
 
     await expect(
-      runSyncWithUpstream(repo, 'main', undefined, 'prior-session-id'),
+      runSyncWithUpstream(repo, 'main', 'test-model', 'prior-session-id'),
     ).rejects.toThrow();
 
     const log = await readFile(logPath, 'utf-8');

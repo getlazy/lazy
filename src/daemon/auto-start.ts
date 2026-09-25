@@ -19,10 +19,31 @@ import { getLazyCommand } from '../utils/cli-path';
 import { assertDaemonCredentials } from './credential-gate';
 
 /** Commands that should NOT trigger auto-start (they work without daemon) */
-const SKIP_AUTO_START = new Set([
+export const SKIP_AUTO_START = new Set([
   'daemon',     // avoid recursion
   'init',       // bootstrap command — must work before daemon exists
   'completion', // shell completion — must be fast
+  'customize',  // writes template files into the project; touches no task state
+  // `lazy auth` is how you FIX a missing credential, so it must never be gated
+  // on having one: auto-start runs the credential gate, and a gated `auth set`
+  // would leave a credential-less machine with no way to store a credential.
+  // It touches no task state either — it writes to OS secure storage and the
+  // per-project daemon dir, both of which the daemon re-reads at startup.
+  'auth',
+  // `lazy playground` provisions a project of its OWN, under a throwaway root, and
+  // starts that project's daemon itself with the environment a demo needs.
+  // Whichever project the caller happens to be standing in is irrelevant to it,
+  // and starting THAT project's daemon would run the credential gate — so an
+  // agent asking for a demo inside its container, where no real credential is
+  // present by design, would be refused for a daemon it never wanted.
+  'playground',
+  'demo', // the old spelling of `playground`, kept as an alias for one release
+  // `lazy login` / `lazy logout` talk only to Lazy Teams and the clone's
+  // binding file. They run in exactly the checkout that is NOT bound yet —
+  // after a store handover, one whose lazy.toml still names the store Teams
+  // now owns — so auto-starting there would put a second writer on that store.
+  'login',
+  'logout',
   '--help',
   '-h',
   '--version',
@@ -32,7 +53,7 @@ const SKIP_AUTO_START = new Set([
 /**
  * Start the daemon in the background. Used by ensureDaemon() and daemonStart().
  *
- * Forks a child process and waits for its socket to become ready.
+ * Forks a child process and waits for its TCP port to become ready.
  * Singleton enforcement is handled by startDaemonServer()'s flock — if two
  * callers race and both spawn, only one child wins the lock; the other exits.
  *
@@ -180,8 +201,8 @@ async function readStartupErrorMarker(markerPath: string): Promise<string | null
 /**
  * Ensure the daemon is running for the given project. Called before command dispatch.
  *
- * Checks for the socket file — if it exists, the daemon is ready.
- * If not, spawns a daemon and polls for the socket.
+ * Fast-checks the daemon state files — if they show a live daemon, it is
+ * ready. If not, spawns a daemon and polls its /daemon/status endpoint.
  * Singleton enforcement is in startDaemonServer() (flock), not here.
  *
  * @param command - The CLI command being run (to check skip list)
@@ -194,14 +215,14 @@ export async function ensureDaemon(command: string | undefined, projectRoot: str
   // Commands that don't need daemon
   if (!command || SKIP_AUTO_START.has(command)) return false;
 
-  // Fast path: socket exists, token readable, AND process is alive.
-  // After a crash, socket+token files remain but the process is dead —
+  // Fast path: token + port marker readable, AND process is alive.
+  // After a crash, the marker files remain but the process is dead —
   // the PID check catches this (the old check only tested file existence).
   if (isDaemonRunning(projectRoot)) {
     return true;
   }
 
-  // Daemon is dead or never started. Clean up stale files (socket, PID)
+  // Daemon is dead or never started. Clean up stale files (PID, legacy socket)
   // left behind by a crash, then start a fresh daemon.
   // startDaemonServer's flock ensures only one daemon wins if multiple
   // callers race to start.

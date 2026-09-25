@@ -12,6 +12,14 @@ export interface DaemonContext {
   /** Bearer token for daemon authentication. */
   token: string;
   /**
+   * Interface the web dashboard bound to (`[server] bind`). Optional so older
+   * test fixtures that only set webPort+token still construct a context;
+   * `formatDashboardUrl` then falls back to the loopback dashboard host.
+   */
+  bindHost?: string;
+  /** Public dashboard origin, including a reverse proxy when configured. */
+  dashboardUrl?: string;
+  /**
    * Actual TCP port the Anthropic passthrough proxy bound to, once started.
    * Undefined only before the proxy has bound (it is always started). May be an OS-assigned
    * port (when `[proxy] port` was omitted), so this — not the config — is the

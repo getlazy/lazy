@@ -3,7 +3,9 @@ import type { NetworkInterfaceInfo } from 'os';
 import {
   detectContainerBridgeHosts,
   resolveDaemonBindHosts,
+  resolveProxyBindHosts,
   isContainerRunner,
+  parseIpAddrOutput,
 } from '../../src/daemon/bind-hosts';
 
 // INVARIANT: on native Linux Docker, a container reaches the daemon via
@@ -169,3 +171,93 @@ describe.skipIf(secondLoopbackSuiteSkipped('dual-bind mechanism'))(
     });
   },
 );
+
+// INVARIANT: the credential proxy is bound where a task container can reach
+// it, under exactly the daemon port's conditions. A container dials the proxy
+// at host.docker.internal:<port>; on native Linux Docker that is the bridge
+// gateway, and a loopback-only proxy refuses every model call the container
+// makes — no fleet turn can complete. Managed mode pins `[proxy] bind` to
+// loopback and that pin stays: the gateway is bound IN ADDITION, never
+// 0.0.0.0. The proxy authenticates by placeholder lookup, not by source
+// address, so binding the bridge changes who can connect, not who is served.
+describe('resolveProxyBindHosts', () => {
+  const ifaces = { docker0: [ipv4('172.17.0.1')], lo: [ipv4('127.0.0.1', true)] };
+
+  test('linux + docker + bridge present: loopback AND the bridge gateway', () => {
+    const r = resolveProxyBindHosts({ configBind: '127.0.0.1', platform: 'linux', runnerType: 'docker', interfaces: ifaces });
+    expect(r.hosts).toEqual(['127.0.0.1', '172.17.0.1']);
+    expect(r.bridgeUnreachable).toBe(false);
+  });
+
+  test('linux + podman + bridge present: same, off the podman bridge', () => {
+    const r = resolveProxyBindHosts({
+      configBind: '127.0.0.1', platform: 'linux', runnerType: 'podman', interfaces: { podman0: [ipv4('10.88.0.1')] },
+    });
+    expect(r.hosts).toEqual(['127.0.0.1', '10.88.0.1']);
+  });
+
+  test('linux + docker + NO bridge: loopback only, flagged unreachable', () => {
+    const r = resolveProxyBindHosts({ configBind: '127.0.0.1', platform: 'linux', runnerType: 'docker', interfaces: { lo: [ipv4('127.0.0.1', true)] } });
+    expect(r.hosts).toEqual(['127.0.0.1']);
+    expect(r.bridgeUnreachable).toBe(true);
+  });
+
+  test('macOS + docker, and the host-process runner anywhere: loopback only', () => {
+    expect(resolveProxyBindHosts({ configBind: '127.0.0.1', platform: 'darwin', runnerType: 'docker', interfaces: ifaces }).hosts)
+      .toEqual(['127.0.0.1']);
+    expect(resolveProxyBindHosts({ configBind: '127.0.0.1', platform: 'linux', runnerType: 'dangerously-host-process-without-any-isolation', interfaces: ifaces }).hosts)
+      .toEqual(['127.0.0.1']);
+  });
+
+  test('an explicit [proxy] bind is respected exactly — nothing is added, and 0.0.0.0 is never chosen', () => {
+    expect(resolveProxyBindHosts({ configBind: '10.0.0.5', platform: 'linux', runnerType: 'docker', interfaces: ifaces }).hosts)
+      .toEqual(['10.0.0.5']);
+    expect(resolveProxyBindHosts({ configBind: '0.0.0.0', platform: 'linux', runnerType: 'docker', interfaces: ifaces }).hosts)
+      .toEqual(['0.0.0.0']);
+    for (const r of [
+      resolveProxyBindHosts({ configBind: '127.0.0.1', platform: 'linux', runnerType: 'docker', interfaces: ifaces }),
+      resolveDaemonBindHosts({ configBind: '127.0.0.1', platform: 'linux', runnerType: 'docker', interfaces: ifaces }),
+    ]) expect(r.hosts).not.toContain('0.0.0.0');
+  });
+});
+
+// INVARIANT: a bridge with no container attached is NO-CARRIER, and
+// `os.networkInterfaces()` omits it (libuv lists only IFF_UP && IFF_RUNNING).
+// MEASURED on the smolvm fleet demo: dockerd assigned docker0 172.17.0.1 one
+// second before the daemon started, bun listed only lo and eth0, the daemon
+// warned "no docker/podman bridge interface was detected" and bound loopback
+// only — then every container it launched was refused. A daemon on a fresh
+// host ALWAYS starts before its first container, so the fallback reads the
+// address from the kernel, which assigns it regardless of carrier.
+describe('a NO-CARRIER bridge is still found', () => {
+  const noBridgeListed = { lo: [ipv4('127.0.0.1', true)], eth0: [ipv4('100.96.0.2')] };
+  const ipOutput = '4: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\\       valid_lft forever preferred_lft forever\n';
+
+  test('the kernel fallback supplies the gateway when networkInterfaces omits the bridge', () => {
+    const asked: string[] = [];
+    const read = (iface: string) => { asked.push(iface); return iface === 'docker0' ? parseIpAddrOutput(ipOutput) : []; };
+    expect(detectContainerBridgeHosts(noBridgeListed, read)).toEqual(['172.17.0.1']);
+    expect(asked).toContain('docker0');
+    const r = resolveProxyBindHosts({ configBind: '127.0.0.1', platform: 'linux', runnerType: 'docker', interfaces: noBridgeListed, readIpv4Addrs: read });
+    expect(r.hosts).toEqual(['127.0.0.1', '172.17.0.1']);
+    expect(r.bridgeUnreachable).toBe(false);
+  });
+
+  test('the fallback is not consulted for a bridge networkInterfaces already lists', () => {
+    const asked: string[] = [];
+    const read = (iface: string) => { asked.push(iface); return []; };
+    expect(detectContainerBridgeHosts({ docker0: [ipv4('172.17.0.1')] }, read)).toEqual(['172.17.0.1']);
+    expect(asked).not.toContain('docker0');
+  });
+
+  test('parses ip -4 -o addr show output, and nothing else', () => {
+    expect(parseIpAddrOutput(ipOutput)).toEqual(['172.17.0.1']);
+    expect(parseIpAddrOutput('')).toEqual([]);
+    expect(parseIpAddrOutput('Device "docker0" does not exist.')).toEqual([]);
+  });
+
+  test('injected interfaces alone never reach the kernel (a docker0 on the test machine cannot leak in)', () => {
+    expect(resolveDaemonBindHosts({ configBind: '127.0.0.1', platform: 'linux', runnerType: 'docker', interfaces: noBridgeListed }).hosts)
+      .toEqual(['127.0.0.1']);
+  });
+});

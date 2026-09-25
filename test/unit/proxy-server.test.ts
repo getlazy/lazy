@@ -11,9 +11,10 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { createProxyServer } from '../../src/proxy/server';
+import { createProxyServer, PROXY_HEALTH_PATH, type ProxyServer } from '../../src/proxy/server';
 import type { AuditSink } from '../../src/proxy/audit';
-import type { ProxyAuditRecord } from '../../src/storage/types';
+import { ProxyToolStatsRecorder } from '../../src/proxy/tool-stats';
+import type { ProxyAuditRecord, TaskToolStatsRecord } from '../../src/storage/types';
 
 // The proxy writes audit records to an AuditSink (the project-local bounded
 // log in production) — never to Storage.
@@ -75,6 +76,33 @@ describe('proxy server', () => {
   afterAll(() => {
     mockUpstream.stop();
     proxyServer.stop();
+  });
+
+  // INVARIANT: the liveness path `lazy daemon health` probes is answered by
+  // the proxy itself — never forwarded, never audited, no credential. A health
+  // check that spent a request or wrote an audit record would be traffic.
+  test('answers its own health path without forwarding or auditing', async () => {
+    lastForwardedRequest = null;
+    const before = mockSink.records.length;
+    const res = await fetch(`http://127.0.0.1:${proxyPort}${PROXY_HEALTH_PATH}`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, service: 'lazy-proxy' });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(lastForwardedRequest).toBeNull();
+    expect(mockSink.records.length).toBe(before);
+  });
+
+  test('reports its audit appends for health', async () => {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-test', messages: [] }),
+    });
+    await res.text();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const health = (proxyServer as unknown as ProxyServer).auditHealth();
+    expect(health.lastFailure).toBeNull();
+    expect(typeof health.lastSuccessAt).toBe('number');
   });
 
   test('forwards a POST request and returns the upstream response', async () => {
@@ -214,6 +242,13 @@ describe('proxy server', () => {
     expect(record.toolUses[1]).toMatchObject({ name: 'Bash', command: 'ls -la' });
     expect(record.toolResults).toHaveLength(1);
     expect(record.toolResults[0].contentPreview).toBe('127.0.0.1 localhost');
+    // The result's size in tokens, paired with the tool_use it answers — this
+    // is what makes "what did Read cost" answerable downstream. The tokenizer
+    // table loads asynchronously, so null (not yet warm) is the other legal
+    // answer here; a 0 never is.
+    expect(record.toolResults[0].toolUseId).toBe('tu-1');
+    const tokens = record.toolResults[0].contentTokens;
+    expect(tokens === null || tokens === undefined || tokens > 0).toBe(true);
   });
 
   test('returns 502 when upstream is unreachable', async () => {
@@ -814,5 +849,101 @@ describe('proxy usage capture', () => {
 
     proxy.stop();
     upstream.server.stop();
+  });
+});
+
+/**
+ * The durable per-task tool stats, wired end to end.
+ *
+ * The fold's rules are unit-tested in proxy-tool-stats.test.ts. What is pinned
+ * here is the WIRING through a real proxy: that a real request body's tool
+ * blocks reach the recorder with the extractor's tail markers intact, and that
+ * a recorder which cannot write does not cost the client its response.
+ */
+describe('proxy server → durable tool stats', () => {
+  let mockUpstream: ReturnType<typeof Bun.serve>;
+  let proxyServer: ReturnType<typeof Bun.serve>;
+  let proxyPort: number;
+  let recorder: ProxyToolStatsRecorder;
+  let saved: TaskToolStatsRecord | null;
+  let failSaves: boolean;
+
+  beforeAll(async () => {
+    const upstreamPort = findFreePort();
+    mockUpstream = Bun.serve({
+      port: upstreamPort,
+      hostname: '127.0.0.1',
+      async fetch() {
+        return Response.json({ type: 'message', usage: { input_tokens: 10, output_tokens: 2 } });
+      },
+    });
+
+    saved = null;
+    failSaves = false;
+    recorder = new ProxyToolStatsRecorder({
+      getToolStats: async () => saved,
+      saveToolStats: async (record) => {
+        if (failSaves) throw new Error('storage is down');
+        saved = structuredClone(record);
+      },
+    });
+
+    proxyPort = findFreePort();
+    proxyServer = createProxyServer(
+      { port: proxyPort, bind: '127.0.0.1', upstream: `http://127.0.0.1:${upstreamPort}` },
+      createMockSink().sink,
+      null,
+      { toolStats: recorder },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  });
+
+  afterAll(() => {
+    mockUpstream.stop();
+    proxyServer.stop();
+  });
+
+  async function send(messages: unknown[]): Promise<Response> {
+    return fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-lazy-task-id': 'task-1111' },
+      body: JSON.stringify({ model: 'claude-opus-5', messages, max_tokens: 100 }),
+    });
+  }
+
+  test('a real tool loop lands on the task record, counted once', async () => {
+    // Turn 1: the agent has just called Read.
+    await send([
+      { role: 'user', content: [{ type: 'text', text: 'read it' }] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'u1', name: 'Read', input: { file_path: '/x' } }] },
+    ]);
+    // Turn 2: the result comes back, and turn 1 is replayed as history.
+    await send([
+      { role: 'user', content: [{ type: 'text', text: 'read it' }] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'u1', name: 'Read', input: { file_path: '/x' } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'u1', content: 'file body' }] },
+    ]);
+    await recorder.flush();
+
+    expect(saved).not.toBeNull();
+    const read = saved!.tools.find((t) => t.name === 'Read');
+    // The call appears in both request bodies and is ONE call.
+    expect(read?.invocations).toBe(1);
+    expect(read?.resultsMeasured! + read?.resultsUnmeasured!).toBe(1);
+    // Usage the proxy observed is on the record, and in no tool row.
+    expect(saved!.proxy_usage.inputTokens).toBeGreaterThan(0);
+  });
+
+  // INVARIANT: statistics never cost a request. A storage failure is logged and
+  // the request forwards — the proxy's job is forwarding, not bookkeeping.
+  test('a recorder that cannot write does not fail the request', async () => {
+    failSaves = true;
+    const resp = await send([
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'u9', name: 'Bash', input: {} }] },
+    ]);
+    expect(resp.status).toBe(200);
+    await expect(resp.json()).resolves.toMatchObject({ type: 'message' });
+    await recorder.flush();
+    failSaves = false;
   });
 });

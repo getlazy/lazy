@@ -134,6 +134,20 @@ describe('docs site generator', () => {
       expect(html).toContain('href="../src/git/lfs.ts"');
     });
 
+    // INVARIANT: a fragment naming a heading its page does not have is an
+    // unresolved link. The reader lands at the top of the page with no hint the
+    // section is gone, so a page-only check passed while anchors rotted.
+    test('fragments are checked against the target page headings', async () => {
+      await writeDoc('a.md', '# A\n\n[ok](./b.md#real-heading) [bad](./b.md#gone) [self](#here) [selfbad](#nope) [malformed](./b.md#50%-off)\n\n## Here\n');
+      await writeDoc('b.md', '# B\n\n## Real heading\n');
+      const manifest = await buildDocsSite({ docsDir, outDir });
+      expect(manifest.unresolvedLinks).toEqual([
+        { source: 'a.md', href: './b.md#gone' },
+        { source: 'a.md', href: '#nope' },
+        { source: 'a.md', href: './b.md#50%-off' },
+      ]);
+    });
+
     // The same HTML is served from /v0.21/ and from the site root, so a
     // root-absolute path can only be correct in one of them. The generator
     // never emits one.

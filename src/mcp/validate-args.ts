@@ -15,19 +15,20 @@
  * enforces is documentation, not validation.
  *
  * Deliberately dependency-free: the schemas we declare use a small, closed
- * subset of JSON Schema (type/enum/minLength/maxLength/pattern/items/required),
- * so a full JSON Schema library would be a large dependency to check four
- * keywords. `assertSchemaSubsetSupported` keeps that claim honest — a schema
- * that grows a keyword this validator does not implement fails loudly in tests
- * rather than silently going unchecked.
+ * subset of JSON Schema (type/enum/minLength/maxLength/pattern/items/
+ * properties/required), so a full JSON Schema library would be a large
+ * dependency to check a handful of keywords. `assertSchemaSubsetSupported`
+ * keeps that claim honest — a schema that grows a keyword this validator does
+ * not implement fails loudly in tests rather than silently going unchecked.
  */
 
 import { levenshteinDistance } from '../utils/levenshtein';
 import type { McpTool, McpToolInputSchema, McpToolPropertySchema } from './types';
 
-/** JSON Schema keywords this validator understands. */
+/** JSON Schema keywords this validator understands (including nested objects). */
 const SUPPORTED_PROPERTY_KEYWORDS = new Set([
   'type', 'description', 'enum', 'minLength', 'maxLength', 'pattern', 'items',
+  'properties', 'required',
 ]);
 
 /** The JSON type name of a value, using JSON Schema's vocabulary. */
@@ -114,12 +115,32 @@ function validateProperty(
   if (Array.isArray(value) && schema.items) {
     for (let i = 0; i < value.length; i++) {
       const item = value[i];
-      if (!matchesType(item, schema.items.type)) {
-        return `'${key}[${i}]' must be ${schema.items.type}, got ${jsonTypeOf(item)}`;
+      // Reuse the property validator so nested object items (properties /
+      // required / enum) get the same checks as top-level params.
+      const itemErr = validateProperty(`${key}[${i}]`, item, schema.items);
+      if (itemErr) return itemErr;
+    }
+  }
+
+  // Nested object: enforce required keys and each declared property.
+  if (isPlainObject(value) && schema.properties) {
+    for (const req of schema.required ?? []) {
+      const nested = value[req];
+      if (nested === undefined || nested === null) {
+        const propSchema = schema.properties[req];
+        const expected = propSchema ? ` (${describeType(propSchema.type)})` : '';
+        return `'${key}.${req}' is required${expected}`;
       }
-      if (schema.items.enum && typeof item === 'string' && !schema.items.enum.includes(item)) {
-        return `'${key}[${i}]' must be one of: ${schema.items.enum.join(', ')} (got '${item}')`;
+    }
+    for (const [nestedKey, nestedValue] of Object.entries(value)) {
+      if (nestedValue === undefined || nestedValue === null) continue;
+      const propSchema = schema.properties[nestedKey];
+      if (!propSchema) {
+        const known = Object.keys(schema.properties);
+        return `'${key}.${nestedKey}' is not a known property (valid: ${known.join(', ') || '(none)'})`;
       }
+      const nestedErr = validateProperty(`${key}.${nestedKey}`, nestedValue, propSchema);
+      if (nestedErr) return nestedErr;
     }
   }
 
@@ -270,8 +291,9 @@ export function describeArgsFailure(
  *
  * Returns the list of problems (empty when the schema is fully covered). Used
  * by test/unit/mcp-validate-args.test.ts against every declared tool, so a
- * schema that grows an unsupported keyword — `minimum`, `oneOf`, a nested
- * object schema — fails a test instead of silently going unenforced.
+ * schema that grows an unsupported keyword — `minimum`, `oneOf` — fails a
+ * test instead of silently going unenforced. Nested object schemas
+ * (`properties` / `required` on items) ARE supported and checked recursively.
  */
 export function assertSchemaSubsetSupported(tool: McpTool): string[] {
   const problems: string[] = [];
@@ -289,19 +311,41 @@ export function assertSchemaSubsetSupported(tool: McpTool): string[] {
   }
 
   for (const [key, prop] of Object.entries(properties)) {
-    for (const keyword of Object.keys(prop)) {
-      if (!SUPPORTED_PROPERTY_KEYWORDS.has(keyword)) {
-        problems.push(`${tool.name}.${key}: unsupported JSON Schema keyword '${keyword}' — validate-args.ts does not enforce it`);
-      }
-    }
-    if (prop.pattern) {
-      try {
-        new RegExp(prop.pattern);
-      } catch (err) {
-        problems.push(`${tool.name}.${key}: invalid pattern '${prop.pattern}': ${err instanceof Error ? err.message : err}`);
-      }
-    }
+    assertPropertySchemaSupported(`${tool.name}.${key}`, prop, problems);
   }
 
   return problems;
+}
+
+/** Recurse into items/properties so nested object schemas stay inside the subset. */
+function assertPropertySchemaSupported(
+  path: string,
+  prop: McpToolPropertySchema,
+  problems: string[],
+): void {
+  for (const keyword of Object.keys(prop)) {
+    if (!SUPPORTED_PROPERTY_KEYWORDS.has(keyword)) {
+      problems.push(`${path}: unsupported JSON Schema keyword '${keyword}' — validate-args.ts does not enforce it`);
+    }
+  }
+  if (prop.pattern) {
+    try {
+      new RegExp(prop.pattern);
+    } catch (err) {
+      problems.push(`${path}: invalid pattern '${prop.pattern}': ${err instanceof Error ? err.message : err}`);
+    }
+  }
+  if (prop.items) {
+    assertPropertySchemaSupported(`${path}.items`, prop.items, problems);
+  }
+  if (prop.properties) {
+    for (const req of prop.required ?? []) {
+      if (!(req in prop.properties)) {
+        problems.push(`${path}: required property '${req}' has no schema in properties`);
+      }
+    }
+    for (const [nestedKey, nested] of Object.entries(prop.properties)) {
+      assertPropertySchemaSupported(`${path}.${nestedKey}`, nested, problems);
+    }
+  }
 }

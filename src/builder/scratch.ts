@@ -68,6 +68,26 @@ export function builderScratchDir(projectRoot: string): string {
 }
 
 /**
+ * The scratch dir to CAPTURE from, as seen by the process doing the capturing.
+ *
+ * Prefers the `LAZY_SCRATCH_DIR` the runner exported over recomputing the path.
+ * The builder supervisor runs INSIDE the container, where `getHome()` is the
+ * container's home and `~/.lazy/scratch/<slug>` therefore names a path that does
+ * not exist — the real dir is bind-mounted at the HOST's absolute path, which is
+ * exactly what the env var carries (the identical-path convention makes this
+ * work under both runners). Recomputing would silently capture an empty
+ * directory in Docker mode and look like a builder that wrote nothing.
+ *
+ * Falls back to the computed path for callers on the host (the CLI, tests) that
+ * are not running under a runner-provided environment.
+ */
+export function resolveScratchDirForCapture(projectRoot: string): string {
+  const fromRunner = process.env[SCRATCH_ENV_VAR];
+  if (fromRunner) return fromRunner;
+  return builderScratchDir(projectRoot);
+}
+
+/**
  * Create the scratch dir if needed and return its absolute path.
  *
  * The mode is 0777 ON PURPOSE. A builder CONTAINER writes here as the image's

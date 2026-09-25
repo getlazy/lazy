@@ -17,6 +17,7 @@ import {
   isUpgradeComplete,
   builderRunName,
   formatWaited,
+  waitForUpgradeComplete,
   type RelaunchStorage,
   type BuilderLaunchResult,
 } from '../../src/builder/relaunch';
@@ -226,6 +227,31 @@ describe('runBuilderRelaunchLoop', () => {
     expect(result).toEqual({ exitCode: 0, sessionId: 'sess-resume' });
     // Intent consumed exactly once.
     expect(storage.intents.size).toBe(0);
+  });
+
+  // INVARIANT: abandoning the upgrade wait must leave the resume intent intact
+  // and print manual resume — same cleanup the old timer exit performed.
+  test('upgrade wait abort → exit 130, intent preserved, manual resume printed', async () => {
+    const abort = new AbortController();
+    const storage = fakeStorage([intent({ sessionId: 'sess-resume' })]);
+    const errors: string[] = [];
+    let launches = 0;
+    const result = await runBuilderRelaunchLoop(baseDeps({
+      getStorage: async () => storage,
+      upgradeWaitAbortSignal: abort.signal,
+      launch: async () => { launches++; return { exitCode: 137, sessionId: null, builderId: 'abcd1234' }; },
+      daemonStatus: async () => ({ running: true, pid: 1, buildTime: 'dev' }),
+      sleep: async () => { abort.abort(); },
+      errorOut: (m) => errors.push(m),
+    }));
+    expect(launches).toBe(1);
+    expect(result).toEqual({ exitCode: 130, sessionId: null });
+    expect(storage.intents.size).toBe(1);
+    const text = errors.join('\n');
+    expect(text).toContain('Upgrade wait cancelled');
+    expect(text).toContain('lazy builder --resume sess-resume');
+    expect(text).not.toContain('exited without completing');
+    expect(text).not.toContain('Timed out');
   });
 
   // INVARIANT: the wait for an upgrade is UNBOUNDED. It previously gave up after
@@ -656,5 +682,45 @@ describe('runBuilderRelaunchLoop — daemon-restart intent', () => {
     // A baseline plus at least one poll — i.e. it really waited.
     expect(seen.length).toBeGreaterThanOrEqual(2);
     expect(result.exitCode).toBe(0);
+  });
+});
+
+describe('waitForUpgradeComplete', () => {
+  const baseline: DaemonStatus = { running: true, pid: 1, buildTime: 'old' };
+  const restarted: DaemonStatus = { running: true, pid: 2, buildTime: 'new' };
+
+  // INVARIANT: no timer — the loop keeps polling until completion or a real failure.
+  test('waits without a deadline until the daemon restart is observed', async () => {
+    let polls = 0;
+    const POLLS = 500;
+    const outcome = await waitForUpgradeComplete({
+      baseline,
+      pollIntervalMs: 10,
+      sleep: noopSleep,
+      upgradeAlive: null,
+      reassureAfterMs: 1_000_000,
+      reassureIntervalMs: 1_000_000,
+      onReassure: () => {},
+      daemonStatus: async () => (polls++ < POLLS ? baseline : restarted),
+    });
+    expect(outcome).toBe('complete');
+    expect(polls).toBeGreaterThan(POLLS);
+  });
+
+  test('abort signal returns interrupted without waiting for completion', async () => {
+    const abort = new AbortController();
+    abort.abort();
+    const outcome = await waitForUpgradeComplete({
+      baseline,
+      pollIntervalMs: 10,
+      sleep: noopSleep,
+      upgradeAlive: null,
+      reassureAfterMs: 1_000_000,
+      reassureIntervalMs: 1_000_000,
+      onReassure: () => {},
+      abortSignal: abort.signal,
+      daemonStatus: async () => baseline,
+    });
+    expect(outcome).toBe('interrupted');
   });
 });

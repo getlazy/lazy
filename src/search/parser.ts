@@ -47,24 +47,24 @@ export interface NotNode {
   operand: QueryNode;
 }
 
-/** Field match: status:working, goal:"some text", code:fix-reconciler, tag:onboarding */
+/** Field match: status:working, goal:"some text", task:fix-reconciler, tag:onboarding */
 export interface FieldNode {
   type: 'field';
-  field: 'status' | 'goal' | 'code' | 'tag';
+  field: 'status' | 'goal' | 'task' | 'tag';
   value: string;
 }
 
-/** Scoped search: in:turns "reconciler", in:commits "wip", in:memories "credentials" */
+/** Scoped search: in:tasks "reconciler", in:active "auth", in:commits "wip" */
 export interface InNode {
   type: 'in';
-  scope: 'turns' | 'commits' | 'comments' | 'followups' | 'conversations' | 'memories';
+  scope: 'tasks' | 'active' | 'backlog' | 'finished' | 'turns' | 'commits' | 'comments' | 'followups' | 'raised' | 'conversations' | 'memories' | 'scratch';
   value: string;
 }
 
-/** Existence check: has:commits, has:turns, has:comments, has:followups */
+/** Existence check: has:commits, has:turns, has:comments, has:followups, has:raised */
 export interface HasNode {
   type: 'has';
-  scope: 'commits' | 'turns' | 'comments' | 'followups';
+  scope: 'commits' | 'turns' | 'comments' | 'followups' | 'raised';
 }
 
 /** Date range: created:>2026-02-15, updated:<2026-01-01 */
@@ -357,12 +357,26 @@ export function parseQuery(input: string): QueryNode {
       return { type: 'field', field: 'goal', value };
     }
 
-    // code:value
-    if (field === 'code') {
+    // task:value — matches the task CODE, as a substring
+    if (field === 'task') {
       if (!value) {
-        throw new QueryParseError('code: requires a value', pos);
+        throw new QueryParseError('task: requires a value', pos);
       }
-      return { type: 'field', field: 'code', value: value.toLowerCase() };
+      return { type: 'field', field: 'task', value: value.toLowerCase() };
+    }
+
+    // `code:` was the old spelling of `task:` and is deliberately NOT kept as a
+    // hidden alias — silently matching the literal text "code:spike" is the
+    // confusion this rename exists to end. Say what to type instead.
+    //
+    // Only a `code:` carrying a value is rejected: `code:` followed by a space
+    // (the tokenizer yields an empty value) is ordinary prose — "exit code: 1"
+    // must stay searchable as text.
+    if (field === 'code' && value) {
+      throw new QueryParseError(
+        `code: was renamed to task: — use task:${value} to match the task code`,
+        pos
+      );
     }
 
     // tag:value — normalized the same way tags are stored (see normalizeTag)
@@ -388,11 +402,14 @@ export function parseQuery(input: string): QueryNode {
     if (field === 'in') {
       const scope = value.toLowerCase();
       if (
-        scope !== 'turns' && scope !== 'commits' && scope !== 'comments' &&
-        scope !== 'followups' && scope !== 'conversations' && scope !== 'memories'
+        scope !== 'tasks' && scope !== 'active' && scope !== 'backlog' &&
+        scope !== 'finished' && scope !== 'turns' && scope !== 'commits' && scope !== 'comments' &&
+        scope !== 'followups' && scope !== 'raised' &&
+        scope !== 'conversations' && scope !== 'memories' &&
+        scope !== 'scratch'
       ) {
         throw new QueryParseError(
-          `in: scope must be "turns", "commits", "comments", "followups", "conversations", or "memories" (got "${value}")`,
+          `in: scope must be "tasks", "active", "backlog", "finished", "turns", "commits", "comments", "followups", "raised", "conversations", "memories", or "scratch" (got "${value}")`,
           pos
         );
       }
@@ -417,9 +434,12 @@ export function parseQuery(input: string): QueryNode {
     // has:scope
     if (field === 'has') {
       const scope = value.toLowerCase();
-      if (scope !== 'commits' && scope !== 'turns' && scope !== 'comments' && scope !== 'followups') {
+      if (
+        scope !== 'commits' && scope !== 'turns' && scope !== 'comments' &&
+        scope !== 'followups' && scope !== 'raised'
+      ) {
         throw new QueryParseError(
-          `has: scope must be "commits", "turns", "comments", or "followups" (got "${value}")`,
+          `has: scope must be "commits", "turns", "comments", "followups", or "raised" (got "${value}")`,
           pos
         );
       }
@@ -479,7 +499,12 @@ export function isStructuredQuery(input: string): boolean {
   if (/\bNOT\b/.test(input)) return true;
 
   // Check for field syntax
-  if (/\b(status|goal|code|tag|in|has|created|updated):/.test(input)) return true;
+  if (/\b(status|goal|task|tag|in|has|created|updated):/.test(input)) return true;
+
+  // `code:<value>` no longer parses as a field, but it must still reach the
+  // parser so the caller gets the rename error instead of a silent regex search
+  // for the literal characters. `code:` with nothing after it is prose.
+  if (/\bcode:\S/.test(input)) return true;
 
   // A bare '#name' token is the tag spelling lazy prints, and parseFieldOrText
   // turns it into (tag:name OR text:"#name"). That only takes effect on the

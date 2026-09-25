@@ -40,26 +40,26 @@ describe('[agent] wind_down_timeout_ms', () => {
 
   test('is read from lazy.toml', async () => {
     await writeLazyToml(root, '[agent]\nwind_down_timeout_ms = 15000\n');
-    const config = await loadConfig(root, { cwd: root });
+    const config = await loadConfig(root);
     expect(config.agent.wind_down_timeout_ms).toBe(15000);
   });
 
   // An existing config must keep working across the rename.
   test('the pre-rename graceful_exit_timeout_ms still applies', async () => {
     await writeLazyToml(root, '[agent]\ngraceful_exit_timeout_ms = 12345\n');
-    const config = await loadConfig(root, { cwd: root });
+    const config = await loadConfig(root);
     expect(config.agent.wind_down_timeout_ms).toBe(12345);
   });
 
   test('the new name wins when both are present', async () => {
     await writeLazyToml(root, '[agent]\ngraceful_exit_timeout_ms = 12345\nwind_down_timeout_ms = 999\n');
-    const config = await loadConfig(root, { cwd: root });
+    const config = await loadConfig(root);
     expect(config.agent.wind_down_timeout_ms).toBe(999);
   });
 
   test('0 (wait indefinitely) survives the load — it is not treated as unset', async () => {
     await writeLazyToml(root, '[agent]\nwind_down_timeout_ms = 0\n');
-    const config = await loadConfig(root, { cwd: root });
+    const config = await loadConfig(root);
     expect(config.agent.wind_down_timeout_ms).toBe(0);
   });
 

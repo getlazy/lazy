@@ -11,7 +11,7 @@
 
 import { parseFlags } from '../helpers';
 import { isTTY, promptYesNo } from '../editor';
-import { theme } from '../theme';
+import { theme } from '../../render/theme';
 
 export async function commandReparent(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [
@@ -51,9 +51,14 @@ export async function commandReparent(args: string[]): Promise<void> {
   }
 
   const { queryReparentTask } = await import('../../daemon/rpc-fallback');
+  const { createPhaseDisplay } = await import('../phase-display');
 
+  // A reparent repoints and then syncs — the sync half fetches upstream and may
+  // build a container image, minutes in which this would otherwise say nothing.
+  const display = createPhaseDisplay();
   try {
-    const result = await queryReparentTask({ taskId, parent });
+    const result = await queryReparentTask({ taskId, parent }, display);
+    display.close();
 
     for (const warning of result.warnings) {
       console.error(theme.warning(`Warning: ${warning}`));
@@ -77,6 +82,10 @@ export async function commandReparent(args: string[]): Promise<void> {
   } catch (err) {
     console.error(err instanceof Error ? err.message : String(err));
     process.exit(1);
+  } finally {
+    // Idempotent — the success path closes it before printing the summary so the
+    // checklist never interleaves with the result.
+    display.close();
   }
 }
 

@@ -6,6 +6,19 @@ import { expectSuccess, expectOutput } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 
 /**
+ * The WORK turns, named rather than taken as "the last turn of its role".
+ *
+ * A human-facing park now also records the wrap-up presentation step as a
+ * supervisor→agent pair, so "the newest human turn" is the step's prompt
+ * rather than the feedback the test sent — and that prompt carries no model
+ * label, because the launch settings ride the agent reply. Every assertion
+ * about per-turn model/effort means the WORK pair.
+ */
+function isWorkTurn(t: { turn_type?: string | null }): boolean {
+  return (t.turn_type ?? 'work') === 'work';
+}
+
+/**
  * Resolve the tasks directory for a test project. Test projects use external
  * storage (external_path in lazy.toml) with a fallback to the in-repo
  * .lazy/tasks layout.
@@ -33,6 +46,7 @@ function findFullTaskId(root: string, shortId: string): string {
 function readTurns(root: string, shortId: string): Array<{
   sequence: number;
   role: string;
+  turn_type?: string | null;
   model?: string;
   model_id?: string;
   effort?: string;
@@ -100,16 +114,21 @@ describe('per-turn model override', () => {
 
     const turns = readTurns(ctx.root, taskId);
     // Find the feedback turn (second human turn, sequence > 1)
-    const humanTurns = turns.filter(t => t.role === 'human');
+    const humanTurns = turns.filter(t => t.role === 'human' && isWorkTurn(t));
     expect(humanTurns.length).toBeGreaterThanOrEqual(2);
     const feedbackTurn = humanTurns[humanTurns.length - 1];
     expect(feedbackTurn.model).toBe('claude-sonnet-4-5-20250929');
   }, 30_000);
 
-  // INVARIANT: Sticky behavior - after unblocking with --model claude-haiku-4-5-20251001, the next unblock
-  // without --model should still use haiku (inherited from previous turn).
-  // This prevents users from having to re-specify the model every turn.
-  test('sticky model: next unblock without --model inherits from previous turn', async () => {
+  // INVARIANT (override-is-durable): after unblocking with --model
+  // claude-haiku-4-5-20251001, the next unblock without --model still uses
+  // haiku — the override was PERSISTED into task.model, and a plain unblock
+  // falls back to task.model. Users do not re-specify the model every turn.
+  // The inheritance comes from task.model, not from a scan of prior turns:
+  // that scan ("sticky model") was removed in fix-unblock-sticky-model because
+  // it carried nothing task.model did not already carry and shadowed
+  // `lazy edit --model` (see the edit test below).
+  test('a --model override carries to the next unblock without --model', async () => {
     const taskId = await createTask(ctx, 'Sticky model', 'Do work');
 
     // Start task
@@ -128,7 +147,7 @@ describe('per-turn model override', () => {
     expectSuccess(unblock1);
     expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
 
-    // Second unblock WITHOUT --model — should inherit claude-haiku-4-5-20251001 from previous turn
+    // Second unblock WITHOUT --model — inherits claude-haiku-4-5-20251001 from task.model
     const unblock2 = await ctx.lazyMocked(
       ['unblock', taskId, '--message', 'Continue'],
       MOCK_CLAUDE_SUCCESS,
@@ -139,10 +158,47 @@ describe('per-turn model override', () => {
 
     const turns = readTurns(ctx.root, taskId);
     // Find human turns (skip agent turns)
-    const humanTurns = turns.filter(t => t.role === 'human');
-    // Last human turn should have haiku (sticky from previous)
+    const humanTurns = turns.filter(t => t.role === 'human' && isWorkTurn(t));
+    // Last human turn should have haiku (from the persisted task.model)
     const lastHumanTurn = humanTurns[humanTurns.length - 1];
     expect(lastHumanTurn.model).toBe('claude-haiku-4-5-20251001');
+  }, 45_000);
+
+  // INVARIANT (edited-task-model-wins — fix-unblock-sticky-model): `lazy edit
+  // --model` on a STARTED task must take effect on the next launch. It used
+  // not to: unblock resolved `override ?? stickyModel ?? task.model`, where
+  // stickyModel was the previous turn's model, so an edit could never outrank
+  // the last turn and the edit was a silent no-op. `lazy edit` documents model
+  // as editable on started tasks precisely so later turns pick it up.
+  // Precedence is now: --model override > task.model > config default.
+  test('lazy edit --model on a started task is honored by the next unblock', async () => {
+    const taskId = await createTask(ctx, 'Edited model', 'Do work');
+
+    const startResult = await ctx.lazyMocked(
+      ['start', taskId, '--yes', '--model', 'claude-opus-4-6'],
+      MOCK_CLAUDE_SUCCESS,
+      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
+    );
+    expectSuccess(startResult);
+    expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
+
+    // Edit the task's model — no --model on the unblock that follows.
+    const editResult = await ctx.lazy(['edit', taskId, '--model', 'claude-haiku-4-5-20251001']);
+    expectSuccess(editResult);
+
+    const unblockResult = await ctx.lazyMocked(
+      ['unblock', taskId, '--message', 'Continue'],
+      MOCK_CLAUDE_SUCCESS,
+      { env: { LAZY_MOCK_SHOULD_COMMIT: '1' } },
+    );
+    expectSuccess(unblockResult);
+    expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
+
+    const turns = readTurns(ctx.root, taskId);
+    const lastHumanTurn = turns.filter(t => t.role === 'human' && isWorkTurn(t)).at(-1)!;
+    expect(lastHumanTurn.model).toBe('claude-haiku-4-5-20251001');
+    // The agent turn it produced ran on the edited model too.
+    expect(turns.filter(t => t.role === 'agent' && isWorkTurn(t)).at(-1)!.model).toBe('claude-haiku-4-5-20251001');
   }, 45_000);
 
   // INVARIANT: When no per-turn model has been set and no --model flag is given,
@@ -222,7 +278,7 @@ describe('per-turn model override', () => {
     expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
 
     const turns = readTurns(ctx.root, taskId);
-    const agentTurns = turns.filter(t => t.role === 'agent');
+    const agentTurns = turns.filter(t => t.role === 'agent' && isWorkTurn(t));
     expect(agentTurns.length).toBeGreaterThanOrEqual(2);
 
     // The pre-override turn is untouched by the override…
@@ -233,7 +289,7 @@ describe('per-turn model override', () => {
     const lastAgentTurn = agentTurns[agentTurns.length - 1];
     expect(lastAgentTurn.model).toBe('claude-haiku-4-5-20251001');
     expect(lastAgentTurn.effort).toBe('high');
-    const lastHumanTurn = turns.filter(t => t.role === 'human').at(-1)!;
+    const lastHumanTurn = turns.filter(t => t.role === 'human' && isWorkTurn(t)).at(-1)!;
     expect(lastHumanTurn.model).toBe('claude-haiku-4-5-20251001');
     expect(lastHumanTurn.effort).toBe('high');
 
@@ -242,9 +298,9 @@ describe('per-turn model override', () => {
     const showJson = await ctx.lazy(['show', taskId, '--json']);
     expectSuccess(showJson);
     const shown = JSON.parse(showJson.stdout) as {
-      turns: Array<{ role: string; model: string | null; model_id: string | null; effort: string | null }>;
+      turns: Array<{ role: string; turn_type?: string | null; model: string | null; model_id: string | null; effort: string | null }>;
     };
-    const shownAgentTurns = shown.turns.filter(t => t.role === 'agent');
+    const shownAgentTurns = shown.turns.filter(t => t.role === 'agent' && isWorkTurn(t));
     expect(shownAgentTurns[0].model).toBe('claude-opus-4-6');
     expect(shownAgentTurns[0].effort).toBe('low');
     expect(shownAgentTurns.at(-1)!.model).toBe('claude-haiku-4-5-20251001');

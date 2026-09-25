@@ -331,15 +331,23 @@ describe('lazy sync <task> (task-level upstream merge)', () => {
   // (recordSyncTurns), keyed on the merge OUTCOME — so NO turn is pre-created on
   // the daemon here. Pre-creating one before the outcome is known is exactly what
   // left a spurious turn pair on no-op syncs (see recordSyncTurns).
-  test('sync with upstream changes transitions task to working and pre-creates no turn', async () => {
+  test('sync with conflicting upstream changes transitions task to working and pre-creates no turn', async () => {
     const taskId = await createTask(ctx, 'Sync transitions to working', 'Do work');
     await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     });
 
+    // A CLEAN sync merges on the host and launches no turn, so the task would
+    // never reach 'working'. Force a real sync turn: the task branch and main
+    // both change the same file, so the merge conflicts and the agent must run.
+    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
+    writeFileSync(join(worktreePath, 'upstream-change.txt'), 'task branch\n');
+    ctx.git('-C', worktreePath, 'add', 'upstream-change.txt');
+    ctx.git('-C', worktreePath, 'commit', '-m', 'task-side edit');
+
     setTaskStatus(taskId, 'blocked');
 
-    // Introduce upstream changes so sync actually launches a merge.
+    // Introduce conflicting upstream changes so sync launches a merge turn.
     ctx.git('checkout', 'main');
     writeFileSync(join(ctx.root, 'upstream-change.txt'), 'upstream\n');
     ctx.git('add', 'upstream-change.txt');
@@ -373,6 +381,42 @@ describe('lazy sync <task> (task-level upstream merge)', () => {
     // merge outcome — and records nothing at all for a no-op.
     const turnsAfter = JSON.parse(readFileSync(join(tasksDir, fullId, 'turns.json'), 'utf-8')).turns.length;
     expect(turnsAfter).toBe(turnsBefore);
+  });
+
+  // INVARIANT: a clean sync merges on the host and launches no agent turn — the
+  // task keeps the status it had and the upstream commit is on its branch.
+  // Moving it to 'working' with no supervisor behind it would leave nothing for
+  // the reconciler to park.
+  test('clean sync merges on the host and keeps the task status', async () => {
+    const taskId = await createTask(ctx, 'Clean sync', 'Do work');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
+    });
+    setTaskStatus(taskId, 'blocked');
+
+    ctx.git('checkout', 'main');
+    writeFileSync(join(ctx.root, 'clean-upstream.txt'), 'upstream\n');
+    ctx.git('add', 'clean-upstream.txt');
+    ctx.git('commit', '-m', 'clean upstream commit');
+    ctx.git('checkout', '-');
+
+    const tasksDir = join(homedir(), '.lazy', basename(ctx.root), 'tasks');
+    const fullId = readdirSync(tasksDir).find(e => e.startsWith(taskId));
+    if (!fullId) throw new Error(`No task directory starting with ${taskId}`);
+    const nonSync = () => JSON.parse(readFileSync(join(tasksDir, fullId, 'turns.json'), 'utf-8'))
+      .turns.filter((t: { turn_type?: string }) => t.turn_type !== 'sync').length;
+    const nonSyncBefore = nonSync();
+
+    const result = await ctx.lazyMocked(['sync', taskId], MOCK_CLAUDE_SUCCESS);
+    expectSuccess(result);
+    expect((result.stdout + result.stderr).includes('up to date')).toBe(false);
+
+    // No agent turn ran.
+    expect(nonSync()).toBe(nonSyncBefore);
+    expect(JSON.parse(readFileSync(join(tasksDir, fullId, 'task.json'), 'utf-8')).status).toBe('blocked');
+
+    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
+    expect(readFileSync(join(worktreePath, 'clean-upstream.txt'), 'utf-8')).toBe('upstream\n');
   });
 
   test('sync help includes task-level sync documentation', async () => {

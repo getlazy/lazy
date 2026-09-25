@@ -1,10 +1,10 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { join } from 'path';
-import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'fs';
+import { mkdtempSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes, extractTaskId } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask, fullTaskId, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 
 /**
  * Resolve the tasks directory for a test project. Test projects use external
@@ -18,11 +18,11 @@ function tasksDirFor(root: string): string {
   return join(root, '.lazy', 'tasks');
 }
 
-/** Extract a task short ID from `lazy link` output (which says "Linked task <id>") */
-function extractLinkedTaskId(output: string): string {
-  const match = output.match(/Linked task ([a-f0-9]{8})/);
+/** Extract the display id (usually a derived code) from `lazy link` output. */
+function extractLinkedTaskRef(output: string): string {
+  const match = output.match(/Linked task (\S+)/);
   if (!match) {
-    throw new Error(`Could not extract linked task ID from output: ${output}`);
+    throw new Error(`Could not extract linked task ref from output: ${output}`);
   }
   return match[1];
 }
@@ -111,17 +111,33 @@ async function linkTask(
     comments: [],
   });
 
-  const result = await ctx.lazyMocked(
-    ['link', 'https://github.com/org/repo/pull/1'],
-    MOCK_CLAUDE_SUCCESS,
-    { env: { LAZY_MOCK_IMPORT_RESULT: mockImport } },
-  );
+  // Daemon-backed suites cannot see per-call env, so also write the file
+  // the mock re-reads from LAZY_PROTOCOL_BASE.
+  writeFileSync(join(ctx.protocolBase, 'mock-import-result.json'), mockImport);
 
-  if (result.exitCode !== 0) {
-    throw new Error(`lazy link failed: ${result.stderr}\n${result.stdout}`);
+  try {
+    const result = await ctx.lazyMocked(
+      ['link', 'https://github.com/org/repo/pull/1'],
+      MOCK_CLAUDE_SUCCESS,
+      { env: { LAZY_MOCK_IMPORT_RESULT: mockImport } },
+    );
+
+    if (result.exitCode !== 0) {
+      throw new Error(`lazy link failed: ${result.stderr}\n${result.stdout}`);
+    }
+
+    return extractLinkedTaskRef(result.stdout);
+  } finally {
+    // Do not leave mock-import-result.json for a later regular-task start
+    // in this suite (or a later file sharing LAZY_PROTOCOL_BASE). The
+    // mock also consumes the file after importUrl; this is the helper-side
+    // belt in case link never reached importUrl.
+    try {
+      unlinkSync(join(ctx.protocolBase, 'mock-import-result.json'));
+    } catch {
+      // gone already
+    }
   }
-
-  return extractLinkedTaskId(result.stdout);
 }
 
 describe('lazy start', () => {
@@ -283,10 +299,10 @@ describe('lazy start', () => {
     expectOutput(result, 'Started task');
   });
 
-  test.skip('starts a linked task using existing branch (no branch creation or push)', async () => {
-    // Skipped: link command is timing out in this test environment
+  test('starts a linked task using existing branch (no branch creation or push)', async () => {
     const branch = 'feature/linked-pr';
-    const taskId = await linkTask(ctx, branch, 'Fix linked PR');
+    const taskRef = await linkTask(ctx, branch, 'Fix linked PR');
+    const taskId = (await fullTaskId(ctx, taskRef)).slice(0, 8);
 
     // Set prompt on the linked task (direct file edit since lazy edit blocks)
     setTaskPrompt(ctx.root, taskId, 'Review and fix the linked PR');
@@ -314,10 +330,10 @@ describe('lazy start', () => {
     expectOutput(result, 'Reusing existing worktree');
   });
 
-  test.skip('linked task does not create a new branch', async () => {
-    // Skipped: link command is timing out in this test environment
+  test('linked task does not create a new branch', async () => {
     const branch = 'ivan/my-feature';
-    const taskId = await linkTask(ctx, branch, 'My linked feature');
+    const taskRef = await linkTask(ctx, branch, 'My linked feature');
+    const taskId = (await fullTaskId(ctx, taskRef)).slice(0, 8);
 
     setTaskPrompt(ctx.root, taskId, 'Work on the feature');
 
@@ -341,10 +357,10 @@ describe('lazy start', () => {
     expectOutputExcludes(result, 'Creating worktree');
   });
 
-  test.skip('linked task first turn includes situational awareness preamble', async () => {
-    // Skipped: link command is timing out in this test environment
+  test('linked task first turn includes situational awareness preamble', async () => {
     const branch = 'feature/preamble-test';
-    const taskId = await linkTask(ctx, branch, 'Preamble test PR');
+    const taskRef = await linkTask(ctx, branch, 'Preamble test PR');
+    const taskId = (await fullTaskId(ctx, taskRef)).slice(0, 8);
 
     const userPrompt = 'Fix the auth bug in login.ts';
     setTaskPrompt(ctx.root, taskId, userPrompt);
@@ -414,10 +430,10 @@ describe('lazy start', () => {
     expect(metadata!.remote_target_branch).toBe('main');
   });
 
-  test.skip('linked task preamble includes parent_branch from link metadata', async () => {
-    // Skipped: link command is timing out in this test environment
+  test('linked task preamble includes parent_branch from link metadata', async () => {
     const branch = 'feature/parent-branch-test';
-    const taskId = await linkTask(ctx, branch, 'Parent branch test');
+    const taskRef = await linkTask(ctx, branch, 'Parent branch test');
+    const taskId = (await fullTaskId(ctx, taskRef)).slice(0, 8);
 
     setTaskPrompt(ctx.root, taskId, 'Do some work');
 
@@ -471,71 +487,34 @@ describe('lazy start', () => {
 
   // INVARIANT: Linked tasks already have work on them, so they should NOT
   // get an empty initial commit (which would pollute the existing PR).
-  test.skip('does not create empty commit for linked tasks', async () => {
-    // Skipped: link command is timing out in this test environment
+  test('does not create empty commit for linked tasks', async () => {
     const branch = 'feature/no-empty-commit';
+    const taskRef = await linkTask(ctx, branch, 'Linked task test');
+    const taskId = (await fullTaskId(ctx, taskRef)).slice(0, 8);
 
-    // Set up a bare repo as "origin" so git fetch works
-    const bareRepo = mkdtempSync(join(tmpdir(), 'lazy-e2e-bare-'));
-    Bun.spawnSync(['git', 'init', '--bare', bareRepo]);
-    ctx.git('remote', 'add', 'origin', bareRepo);
+    setTaskPrompt(ctx.root, taskId, 'Work on the task');
 
-    // Create the branch locally and push it to origin
-    ctx.git('branch', branch);
-    ctx.git('push', 'origin', branch);
-
-    // Mock the import result
     const mockImport = JSON.stringify({
       goal: 'Linked task test',
       branch,
-      metadata: {
-        remote_ref_url: 'https://github.com/org/repo/pull/1',
-        remote_ref_id: '1',
-        remote_ref_state: 'OPEN',
-        import_source_url: 'https://github.com/org/repo/pull/1',
-      },
+      metadata: { import_source_url: 'https://github.com/org/repo/pull/1' },
       comments: [],
     });
 
-    const linkResult = await ctx.lazyMocked(
-      ['link', 'https://github.com/org/repo/pull/1'],
-      MOCK_CLAUDE_SUCCESS,
-      { env: { LAZY_MOCK_IMPORT_RESULT: mockImport } },
-    );
-
-    expectSuccess(linkResult);
-
-    // Find the task directory (it has a hex ID but we need to find it)
-    const tasksDir = join(ctx.root, '.lazy', 'tasks');
-    const taskDirs = readdirSync(tasksDir);
-    const taskDir = taskDirs[taskDirs.length - 1]; // Most recent task
-    const taskJsonPath = join(tasksDir, taskDir, 'task.json');
-    const task = JSON.parse(readFileSync(taskJsonPath, 'utf-8'));
-    const taskShortId = taskDir.split('-')[0];
-
-    // Set the prompt directly in task.json
-    task.prompt = 'Work on the task';
-    writeFileSync(taskJsonPath, JSON.stringify(task, null, 2));
-
     const result = await ctx.lazyMocked(
-      ['start', taskShortId, '--yes'],
+      ['start', taskId, '--yes'],
       MOCK_CLAUDE_SUCCESS,
       { env: { LAZY_MOCK_IMPORT_RESULT: mockImport } },
     );
-
     expectSuccess(result);
 
-    // Check the git log in the worktree
-    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskShortId);
+    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
     const logResult = Bun.spawnSync(
       ['git', 'log', '--oneline', '--format=%s'],
       { cwd: worktreePath, stdout: 'pipe' },
     );
-
     expect(logResult.exitCode).toBe(0);
     const commits = logResult.stdout.toString().trim().split('\n');
-
-    // Should NOT have an "Initialize task" commit
     expect(commits[0]).not.toMatch(/^Initialize task/);
   });
 

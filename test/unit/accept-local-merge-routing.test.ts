@@ -16,6 +16,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterAll } from 'bun:test';
+import { ANTHROPIC_DEFAULT_TARGET } from '../../src/utils/role-target';
 import { mockModule, restoreMockedModules } from '../helpers/mock-module';
 import { resolve } from 'path';
 import { RpcError as RealRpcError } from '../../src/daemon/rpc-handlers';
@@ -44,12 +45,17 @@ await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => (
   loadConfig: async () => ({
     remote: { driver: 'gitlab', git_remote: 'origin', auto_approve: false, offline: false },
     storage: { backend: 'external', external_path: '' },
+    // ResolvedConfig always carries a fully-populated `review` section, and
+    // the accept gate reads `config.review.mode` unguarded like every other
+    // required section. `separate` keeps these doubles on the pre-2026-09-21
+    // behaviour, where every recorded review turn gates.
+    review: { mode: 'separate', auto_fix: false, draft_effort: 'low', review_effort: 'xhigh' },
     // ResolvedConfig always carries a fully-populated `automation` section, and
     // acceptTask reads `config.automation.pre_accept` unguarded like every other
     // required section. These tests are about merge ROUTING, not the pre-accept
     // turn, so the step is disabled here to keep the routing path unchanged.
-    automation: { maintain: [], pre_accept: { enabled: false, commands: [], timeout: 600 } },
-    models: { default: 'claude-opus-4-7', roles: { builder: { backend: 'anthropic', model: '', endpoint: '' }, agent: { backend: 'anthropic', model: '', endpoint: '' } } },
+    automation: { maintain: [], react: [], pre_accept: { enabled: false, commands: [], timeout: 600 }, accept_check: '', accept_check_timeout: 300 },
+    models: { default: 'claude-opus-4-7', roles: { builder: ANTHROPIC_DEFAULT_TARGET, agent: ANTHROPIC_DEFAULT_TARGET } },
     git: { default_branch_prefix: 'lazy' },
     // Routing behavior under test predates the edge gate; gate scenarios are
     // covered by test/unit/edge-gate.test.ts + test/e2e/approve.test.ts.
@@ -83,7 +89,7 @@ await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => {
     async checkAcceptGates() { return []; }
     async merge(opts: any) { localMergeTargets.push(opts.targetBranch); return { status: 'merged' as const }; }
     async fastForwardLocal() { return { success: true }; }
-    async postAcceptReview() { return null; }
+    async approveForMerge() { return null; }
     async getTaskUrl() { return null; }
     async updateRemoteBody() {}
   };
@@ -99,14 +105,15 @@ await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => {
       isTargetBranchProtected: async () => { remoteCalls.push('isTargetBranchProtected'); return remoteProtected; },
       pushBranch: async (branch: string) => { remoteCalls.push('pushBranch'); pushedBranches.push(branch); },
       markReadyForReview: async () => { remoteCalls.push('markReadyForReview'); return { metadata: { gitlab_remote_ref_id: '1' } }; },
+      // The recorded PR merges into the task's own target (src/daemon/review-base.ts checks it).
+      getReviewBase: async (t: any) => (t.target?.kind === 'branch' ? (t.target.branch || 'main') : null),
       getPRState: async () => null,
       getChecksStatus: async () => ({ status: 'passed' as const, failed: [] }),
       getTaskUrl: async () => 'https://gitlab/mr/1',
-      postAcceptReview: async () => null,
+      approveForMerge: async () => null,
       checkAcceptGates: async () => { remoteCalls.push('checkAcceptGates'); return []; },
       merge: async () => { remoteCalls.push('merge'); return { status: 'merged' as const, metadata: {} }; },
       fastForwardLocal: async () => ({ success: true }),
-      postTurnSummary: async () => {},
       updateRemoteBody: async () => {},
       recoverRemoteRef: async () => null,
     }),
@@ -148,7 +155,7 @@ await mockModule(resolve(import.meta.dir, '../../src/utils/lock.ts'), () => ({
   removeLock: () => {},
 }));
 
-await mockModule(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/task/identity.ts'), () => ({
   shortId: (id: string) => id.substring(0, 8),
   displayId: (task: any) => task.code ?? task.id.substring(0, 8),
   taskRef: (task: any) => task.code ?? task.id.substring(0, 8),
@@ -157,7 +164,7 @@ await mockModule(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
   getBranchNameFromId: async () => 'lazy/parent-branch',
 }));
 
-await mockModule(resolve(import.meta.dir, '../../src/cli/orphan.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/task/orphan.ts'), () => ({
   checkOrphanedChild: async () => null,
   retargetOrphanedChild: async () => {},
   getActiveChildren: async () => [],
@@ -165,17 +172,21 @@ await mockModule(resolve(import.meta.dir, '../../src/cli/orphan.ts'), () => ({
   formatReparentWarning: () => null,
 }));
 
-await mockModule(resolve(import.meta.dir, '../../src/cli/commands/shared.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/task/turn-context.ts'), () => ({
   buildNotesContext: () => '',
   buildSystemPrompt: () => '',
   buildPromptWithInstructions: () => '',
   buildTurnHistoryContext: () => '',
   getNewNotesSince: async () => [],
+}));
+await mockModule(resolve(import.meta.dir, '../../src/task/sync-remote.ts'), () => ({
   runSyncWithRemote: async () => {},
+  syncTaskFromRemote: async () => {},
+}));
+await mockModule(resolve(import.meta.dir, '../../src/task/cleanup.ts'), () => ({
   cleanupWorktree: () => {},
   cleanupWorktreeAndBranch: () => {},
   cleanupTaskContainer: async () => {},
-  syncTaskFromRemote: async () => {},
 }));
 
 await mockModule(resolve(import.meta.dir, '../../src/protocol/index.ts'), () => ({
@@ -196,10 +207,22 @@ function createMockStorage() {
       return mockTask;
     },
     getSessionByTaskId: async () => mockSession,
-    getSessionTurns: async () => [],
+    // Fixture finality: the accept gate (final-turn §5.1) refuses a task
+    // nobody has declared done. This suite targets merge routing, not
+    // finality, so the session carries one final-carrying marker turn; no
+    // work turns follow it, so nothing un-finals.
+    getSessionTurns: async () => [{
+      id: 'turn-final', sequence: 1, role: 'human',
+      content: '[system] Finalize declared', turn_type: 'pre_accept',
+      created_at: Date.now(),
+      final: { sha: 'abc123', actor: 'human', at: Date.now(), wrap_up_steps: [] },
+    }],
     getSessionCommits: async () => mockCommits,
+    getTaskReviewComments: async () => [],
     getTaskComments: async () => [],
     getChildTasks: async () => [],
+    getTaskRaisedItems: async () => [],
+    resolveRaisedItem: async () => { throw new Error('unexpected resolveRaisedItem in merge-routing test'); },
     updateTaskStatus: async () => {},
     updateTaskMetadata: async () => {},
     updateTurnViolations: async () => {},

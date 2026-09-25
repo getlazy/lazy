@@ -51,8 +51,10 @@ describe('proxy fail-loud', () => {
   const ARMED = { env: { LAZY_FORCE_PROXY_GATE: '1' } };
 
   test('launch fails actionably when the proxy is unresolvable', async () => {
-    // No [proxy] section at all — the proxy is always on.
-    const result = await ctx.lazy(['pair'], ARMED);
+    // No [proxy] section at all — the proxy is always on. Branchless pairing is
+    // opt-in (`lazy pair --host`) since pair-in-container; the gate lives on the
+    // host path that actually launches an agent.
+    const result = await ctx.lazy(['pair', '--host'], ARMED);
 
     expectFailure(result);
     // What was attempted and why it is blocked...
@@ -78,7 +80,7 @@ describe('proxy fail-loud', () => {
   test('an explicit [proxy] section fails the same way (no partial mode)', async () => {
     await appendConfig('[proxy]\nupstream = "https://api.anthropic.com"\n');
 
-    const result = await ctx.lazy(['pair'], ARMED);
+    const result = await ctx.lazy(['pair', '--host'], ARMED);
 
     expectFailure(result);
     expectError(result, 'could not resolve the live proxy address');
@@ -123,7 +125,7 @@ model = "qwen3:8b"
 endpoint = "http://localhost:11434"
 `);
 
-    const result = await ctx.lazy(['pair'], ARMED);
+    const result = await ctx.lazy(['pair', '--host'], ARMED);
 
     if (result.stderr.includes('could not resolve the live proxy address')) {
       throw new Error(`proxy gate fired for an ollama role:\n${result.stderr}`);
@@ -155,7 +157,7 @@ endpoint = "http://localhost:11434"
     const result = await ctx.lazy(['create', '--goal', 'still works']);
     expectSuccess(result);
 
-    const pair = await ctx.lazy(['pair']);
+    const pair = await ctx.lazy(['pair', '--host']);
     expectOutput(pair, 'Launching Claude Code');
   });
 });

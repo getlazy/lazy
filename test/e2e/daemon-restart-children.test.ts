@@ -64,14 +64,21 @@ describe('daemon restart stops the previous generation', () => {
     const interrupt = await until(
       // The session record may not exist for a beat after the stop.
       () => sessionInterrupt(ctx.root, taskId).catch(() => ({ interrupt_reason: undefined })),
-      i => typeof i.interrupt_reason === 'string' && i.interrupt_reason.includes('daemon restarted'),
+      i => typeof i.interrupt_reason === 'string' && /daemon (restarted|stopped)/.test(i.interrupt_reason),
       40_000,
     );
 
     // INVARIANT: the recorded reason is honest. Left to the ordinary run-stopped
     // path this would read as an agent crash, which sends whoever reads it
     // looking for a bug in the agent.
-    expect(interrupt.interrupt_reason).toContain('daemon restarted');
+    //
+    // Either half of a restart may be the one that records it, so both wordings
+    // satisfy the invariant. On a CLEAN restart the outgoing daemon stops the
+    // supervisor in its shutdown sweep and records "the daemon stopped" there;
+    // when the old daemon never ran that code — kill -9, OOM, reboot — the
+    // incoming daemon's reaper finds the orphan and records "the daemon
+    // restarted". What must never appear is an exit code blamed on the agent.
+    expect(interrupt.interrupt_reason).toMatch(/daemon (restarted|stopped)/);
     expect(interrupt.interrupt_reason).toContain('audit proxy');
   }, 120_000);
 });

@@ -1,7 +1,8 @@
-import { requireStorage, displayId, parseFlags, resolveTaskOrExit } from '../helpers';
+import { requireStorage, parseFlags, resolveTaskOrExit } from '../helpers';
+import { displayId } from '../../task/identity';
 import { getActor } from '../../constants';
 import { normalizeTag } from '../../utils/tags';
-import { theme } from '../theme';
+import { theme } from '../../render/theme';
 
 /**
  * `lazy tag <task_id> <tag> [<tag>...]`

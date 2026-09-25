@@ -4,10 +4,12 @@
  *
  * WHY THIS EXISTS
  * ---------------
- * lazy runs `claude -p` on the HOST for its own bookkeeping: the PR/commit
- * fidelity summary on every accept, `lazy report`'s map-reduce, and LLM memory
- * compaction (see runClaudeOneshot in src/capture/claude.ts). Each of those runs
- * writes a session JSONL into `~/.claude/projects/<encoded-repo>/`, exactly
+ * Machine one-shots (accept fidelity summary, `lazy ask <session-id>` over a
+ * stored conversation, `lazy report`, memory compaction) run in throwaway
+ * containers via `runOneshot` (src/oneshot/index.ts). `lazy ask <task>` and
+ * `lazy chat` share the verb but not the mechanism — they resume the task's own
+ * agent session, so they are ordinary turns and never reach this predicate.
+ * Each run writes a session JSONL into `~/.claude/projects/<encoded-repo>/`, exactly
  * where the daemon capture sweep and `lazy doctor --reimport-conversations`
  * look. They were therefore captured as "builder conversations" and came to
  * dominate the store (~83% of it), drowning real conversations in
@@ -18,7 +20,7 @@
  *
  * MARKED AT THE SOURCE, NOT SNIFFED AFTER THE FACT
  * ------------------------------------------------
- * `runClaudeOneshot` knows it is a one-shot, so it stamps its prompt with
+ * `buildOneshotAgentArgv` in src/oneshot/args.ts knows it is a one-shot, so it stamps its prompt with
  * {@link ONESHOT_MARKER} before spawning Claude. Claude records the `-p` prompt
  * verbatim as the session's first user message, so the marker lands at the very
  * head of the JSONL — a durable, deterministic marker that survives a crashed
@@ -68,8 +70,12 @@ export function markMachineOneshotPrompt(prompt: string): string {
  * hundred bytes even with a long repo path, so 4 KiB is generous while keeping
  * the check to a single small read per session — the capture sweep runs this on
  * every discovered session on every tick.
+ *
+ * Exported because a caller that CACHES a verdict needs to know when the head
+ * it was read from was complete: once a file is at least this long, appending
+ * to it can never change the answer (see `session-discovery.ts`).
  */
-const HEAD_BYTES = 4096;
+export const ONESHOT_HEAD_BYTES = 4096;
 
 /**
  * The marker must appear as the START of the first message's content. Claude
@@ -103,8 +109,8 @@ export async function isMachineOneshotSessionFile(filePath: string): Promise<boo
     return false;
   }
   try {
-    const buf = Buffer.alloc(HEAD_BYTES);
-    const { bytesRead } = await handle.read(buf, 0, HEAD_BYTES, 0);
+    const buf = Buffer.alloc(ONESHOT_HEAD_BYTES);
+    const { bytesRead } = await handle.read(buf, 0, ONESHOT_HEAD_BYTES, 0);
     return headHasOneshotMarker(buf.subarray(0, bytesRead).toString('utf-8'));
   } catch (err) {
     logger.debug(`Could not read ${filePath} to check for the one-shot marker: ${(err as Error).message}`);

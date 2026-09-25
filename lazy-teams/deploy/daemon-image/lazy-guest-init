@@ -1,0 +1,369 @@
+#!/bin/sh
+#
+# lazy-guest-init — bring the VM this image boots in to the state lazy's daemon
+# needs. smolvm is the vehicle today; the reasoning below is about the VM, not
+# about smolvm.
+#
+# Two things must be true before a lazy daemon can run a task inside the
+# machine, and neither survives a VM stop/start:
+#
+#   1. Docker's data-root must live on a REAL filesystem. smolvm's guest rootfs
+#      is an overlay whose lower layer is ramfs, which has no file-handle
+#      support, so Docker refuses to stack overlay2 on it (docs/spikes/smolvm.md
+#      §4, gotcha 1). The machine's `--storage` volume is ext4 on /dev/vda and
+#      is mounted at /storage — that is where the data-root goes.
+#   2. dockerd must be running. There is no init system in the guest: libkrunfw
+#      boots an injected /init.krun and the supervisor drives everything through
+#      `machine exec`, so nothing starts a service on our behalf.
+#   3. The daemon's port must be reachable from the VM's published-port relay.
+#      Managed mode pins the daemon to 127.0.0.1, and smolvm's `-p` relay dials
+#      the guest's LINK address, not its loopback (MEASURED, hardware run
+#      20260920-081830: a 127.0.0.1 bind was reset through the mapping, a
+#      0.0.0.0 bind answered). So a forwarder listens on the link address only
+#      and hands each connection to 127.0.0.1:<daemon port>. Link address only
+#      — never 0.0.0.0 — so nothing new is exposed on the docker bridge the
+#      daemon already handles itself (src/daemon/bind-hosts.ts); the link
+#      address is reachable from nowhere but the relay.
+#
+# Mounts and processes do not persist across stop/start, so this script is
+# idempotent and re-runs after every boot. Its readiness marker lives in /run
+# (tmpfs, empty on every boot), which is what makes "has this boot been
+# prepared?" answerable without asking dockerd first — and the forwarder's pid
+# file lives beside it, so "is the forwarder alive?" is answerable from outside
+# (`--print-plan` reports it, and the fleet supervisor reads that when a health
+# check fails, to tell "daemon up, forwarder down" from "daemon down").
+#
+# It is invoked automatically by the `lazy` wrapper — the supervisor's only
+# entry point into the guest — and can be run directly, or from a Smolfile
+# `init = ["lazy-guest-init"]` for operators who drive smolvm by hand.
+#
+# Usage:
+#   lazy-guest-init [--ensure] [--force] [--print-plan] [--timeout N]
+#
+#   --ensure      (default) do nothing if this boot is already prepared and the
+#                 forwarder is alive; otherwise prepare what is missing
+#   --force       redo the work even if the marker says otherwise
+#   --print-plan  print the data-root/driver decision and the forwarder's
+#                 bind and liveness, then exit; changes nothing
+#   --timeout N   seconds to wait for dockerd to answer (default 60)
+#
+# Environment overrides (all optional):
+#   LAZY_GUEST_STORAGE_ROOT          where the machine's real disk is mounted
+#                                    (default /storage)
+#   LAZY_GUEST_DOCKER_DATA_ROOT      exact data-root path, skips detection
+#   LAZY_GUEST_DOCKER_STORAGE_DRIVER exact storage driver, skips detection
+#   LAZY_GUEST_MOUNTS_FILE           mount table to read (default /proc/mounts;
+#                                    the seam the unit test drives)
+#   LAZY_GUEST_DAEMON_PORT           the daemon port the forwarder carries
+#                                    (default 26024, managed mode's pin)
+#   LAZY_GUEST_LINK_ADDRESS          the address the forwarder binds, skips
+#                                    detection (default: the first global IPv4
+#                                    address on a non-loopback interface)
+#
+# Prints `key=value` lines and exits non-zero when the guest is NOT ready — the
+# caller decides how much that matters (`lazy --version` does not need docker;
+# `lazy daemon start` does).
+
+set -eu
+
+MODE=ensure
+TIMEOUT=60
+MARKER=/run/lazy-guest-ready
+LOCK=/run/lazy-guest-init.lock
+DOCKERD_LOG=/var/log/lazy-dockerd.log
+FORWARDER_PID=/run/lazy-guest-forwarder.pid
+FORWARDER_LOG=/var/log/lazy-forwarder.log
+MOUNTS="${LAZY_GUEST_MOUNTS_FILE:-/proc/mounts}"
+STORAGE_ROOT="${LAZY_GUEST_STORAGE_ROOT:-/storage}"
+DAEMON_PORT="${LAZY_GUEST_DAEMON_PORT:-26024}"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --ensure) MODE=ensure; shift ;;
+    --force) MODE=force; shift ;;
+    --print-plan) MODE=plan; shift ;;
+    --timeout)
+      TIMEOUT="${2:-}"
+      [ -n "$TIMEOUT" ] || { echo "lazy-guest-init: --timeout requires a value" >&2; exit 2; }
+      shift 2
+      ;;
+    -h|--help)
+      sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      echo "lazy-guest-init: unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+emit() { printf '%s=%s\n' "$1" "$2"; }
+warn() { printf 'lazy-guest-init: %s\n' "$1" >&2; }
+
+# Filesystem type of the mount point covering $1, from the mount table. Longest
+# matching mount path wins, which is how a nested mount is attributed correctly.
+fs_type_of() {
+  target="$1"
+  [ -r "$MOUNTS" ] || { echo ""; return 0; }
+  awk -v target="$target" '
+    {
+      point = $2; type = $3
+      if (point == "/") { prefix = "/" } else { prefix = point "/" }
+      if (target == point || index(target, prefix) == 1) {
+        if (length(point) >= best_len) { best_len = length(point); best = type }
+      }
+    }
+    END { print best }
+  ' "$MOUNTS"
+}
+
+# overlay2 needs a lower layer with file-handle support. ext4/xfs/btrfs have it;
+# the guest rootfs overlay (ramfs lower) does not, and virtiofs is a host
+# passthrough that Docker does not support as a data-root either.
+driver_for_fs() {
+  case "$1" in
+    ext4|xfs|btrfs) echo overlay2 ;;
+    *) echo vfs ;;
+  esac
+}
+
+# The first real block filesystem that is not the rootfs, so a machine whose
+# disk is mounted somewhere other than /storage still gets overlay2.
+first_block_mount() {
+  [ -r "$MOUNTS" ] || { echo ""; return 0; }
+  awk '$2 != "/" && ($3 == "ext4" || $3 == "xfs" || $3 == "btrfs") { print $2; exit }' "$MOUNTS"
+}
+
+# ── the forwarder: link address → 127.0.0.1:<daemon port> ────────────────────
+
+# The address the VM's relay dials: the first global-scope IPv4 address on a
+# non-loopback interface (100.96.0.2 on smolvm's /30 link; 172.17.x when this
+# image runs as a plain container). Discovered, never hardcoded — the vehicle
+# owns the number.
+link_address() {
+  if [ -n "${LAZY_GUEST_LINK_ADDRESS:-}" ]; then
+    echo "$LAZY_GUEST_LINK_ADDRESS"
+    return 0
+  fi
+  if command -v ip >/dev/null 2>&1; then
+    ip -4 -o addr show scope global 2>/dev/null | awk '$2 != "lo" { split($4, a, "/"); print a[1]; exit }'
+  elif command -v hostname >/dev/null 2>&1; then
+    # A guest without iproute2 (not this image, which installs it) still has
+    # the libc answer.
+    hostname -I 2>/dev/null | awk '{ print $1 }'
+  else
+    echo ""
+  fi
+}
+
+# alive | dead | not-started, from the pid file alone (so it works from
+# --print-plan, which must change nothing, and from the fleet supervisor's
+# diagnosis over `machine exec`).
+forwarder_state() {
+  [ -f "$FORWARDER_PID" ] || { echo not-started; return 0; }
+  pid="$(cat "$FORWARDER_PID" 2>/dev/null)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo alive; else echo dead; fi
+}
+
+forwarder_listening() {
+  command -v ss >/dev/null 2>&1 || return 0
+  ss -Hltn 2>/dev/null | grep -q "[[:space:]]$1:$2[[:space:]]"
+}
+
+# socat: in Debian's main archive, ~400 KB, and the same tool `lazy forward`
+# already relies on inside task containers (src/serve/forward.ts). `fork` gives
+# one child per connection; `reuseaddr` lets a fast restart rebind. Bound with
+# `bind=<link>` and nothing else — the whole point is NOT to widen the daemon's
+# exposure beyond the one address only the relay can reach.
+ensure_forwarder() {
+  link="$(link_address)"
+  if [ -z "$link" ]; then
+    emit forwarder skipped
+    emit forwarder_reason no-link-address
+    return 0
+  fi
+  emit forwarder_bind "$link:$DAEMON_PORT"
+  if [ "$(forwarder_state)" = alive ]; then
+    emit forwarder alive
+    emit forwarder_pid "$(cat "$FORWARDER_PID")"
+    return 0
+  fi
+  if ! command -v socat >/dev/null 2>&1; then
+    warn "socat is not installed in this guest image — the daemon's port cannot be reached through the VM's relay"
+    emit forwarder no
+    emit forwarder_reason no-socat
+    return 1
+  fi
+  rm -f "$FORWARDER_PID"
+  mkdir -p "$(dirname "$FORWARDER_LOG")"
+  setsid socat -d "TCP4-LISTEN:${DAEMON_PORT},bind=${link},reuseaddr,fork" "TCP4:127.0.0.1:${DAEMON_PORT}" \
+    >>"$FORWARDER_LOG" 2>&1 &
+  echo $! >"$FORWARDER_PID"
+  waited=0
+  while [ "$waited" -lt 10 ]; do
+    if forwarder_listening "$link" "$DAEMON_PORT" && [ "$(forwarder_state)" = alive ]; then
+      emit forwarder started
+      emit forwarder_pid "$(cat "$FORWARDER_PID")"
+      return 0
+    fi
+    [ "$(forwarder_state)" = alive ] || break
+    waited=$((waited + 1))
+    sleep 0.5
+  done
+  warn "the forwarder did not come up on ${link}:${DAEMON_PORT}; last lines of ${FORWARDER_LOG}:"
+  tail -n 5 "$FORWARDER_LOG" >&2 2>/dev/null || true
+  emit forwarder no
+  emit forwarder_reason forwarder-failed
+  return 1
+}
+
+# ── decide where docker's data-root goes ─────────────────────────────────────
+
+BACKING_FS=""
+DATA_ROOT="${LAZY_GUEST_DOCKER_DATA_ROOT:-}"
+
+if [ -z "$DATA_ROOT" ]; then
+  storage_fs="$(fs_type_of "$STORAGE_ROOT")"
+  case "$storage_fs" in
+    ext4|xfs|btrfs)
+      DATA_ROOT="${STORAGE_ROOT}/docker"
+      BACKING_FS="$storage_fs"
+      ;;
+    *)
+      fallback="$(first_block_mount)"
+      if [ -n "$fallback" ]; then
+        DATA_ROOT="${fallback}/docker"
+        BACKING_FS="$(fs_type_of "$fallback")"
+      else
+        # No real disk: the machine was created without --storage, or the volume
+        # failed to attach. Docker still runs on the rootfs overlay under vfs —
+        # slow and RAM-backed, but a task can execute and the operator gets a
+        # named reason rather than an opaque dockerd failure.
+        DATA_ROOT=/var/lib/docker
+        BACKING_FS="$(fs_type_of /var/lib/docker)"
+        warn "no real disk found under ${STORAGE_ROOT} (mount table: ${MOUNTS}); \
+docker will run on the rootfs overlay with the vfs driver. Create the machine \
+with --storage so images and containers land on /dev/vda."
+      fi
+      ;;
+  esac
+else
+  BACKING_FS="$(fs_type_of "$DATA_ROOT")"
+fi
+
+STORAGE_DRIVER="${LAZY_GUEST_DOCKER_STORAGE_DRIVER:-$(driver_for_fs "$BACKING_FS")}"
+
+if [ "$MODE" = plan ]; then
+  emit data_root "$DATA_ROOT"
+  emit backing_fs "${BACKING_FS:-unknown}"
+  emit storage_driver "$STORAGE_DRIVER"
+  plan_link="$(link_address)"
+  emit forwarder_bind "${plan_link:-none}:$DAEMON_PORT"
+  emit forwarder_state "$(forwarder_state)"
+  emit docker_ready "$([ -f "$MARKER" ] && echo yes || echo no)"
+  exit 0
+fi
+
+# ── prepare this boot ────────────────────────────────────────────────────────
+
+# The marker says dockerd was brought up this boot; the forwarder is a process
+# that can die on its own, so "already prepared" also means "forwarder alive".
+if [ "$MODE" = ensure ] && [ -f "$MARKER" ] && [ "$(forwarder_state)" != dead ]; then
+  emit ready yes
+  emit source marker
+  emit forwarder "$(forwarder_state)"
+  exit 0
+fi
+
+if [ "$(id -u)" != "0" ]; then
+  warn "must run as root to start dockerd (running as uid $(id -u))"
+  emit ready no
+  emit reason not-root
+  exit 1
+fi
+
+# Two `lazy` invocations can land in the same boot at once (the supervisor runs
+# a mount probe and a daemon start back to back). mkdir is the portable atomic
+# test-and-set; the loser waits for the winner rather than starting a second
+# dockerd against the same data-root.
+waited=0
+while ! mkdir "$LOCK" 2>/dev/null; do
+  if [ -f "$MARKER" ] && [ "$MODE" = ensure ]; then
+    emit ready yes
+    emit source marker
+    exit 0
+  fi
+  waited=$((waited + 1))
+  if [ "$waited" -gt "$TIMEOUT" ]; then
+    warn "timed out waiting for another lazy-guest-init to finish (${LOCK})"
+    emit ready no
+    emit reason lock-timeout
+    exit 1
+  fi
+  sleep 1
+done
+trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
+
+# The forwarder first: it is cheap, it does not depend on dockerd, and a daemon
+# that starts before it is a daemon the host cannot reach for as long as the
+# race lasts.
+if ! ensure_forwarder; then
+  emit ready no
+  emit reason forwarder
+  exit 1
+fi
+
+mkdir -p "$DATA_ROOT"
+
+if docker info >/dev/null 2>&1; then
+  : >"$MARKER"
+  emit ready yes
+  emit source running-dockerd
+  emit data_root "$DATA_ROOT"
+  emit storage_driver "$(docker info --format '{{.Driver}}' 2>/dev/null || echo unknown)"
+  exit 0
+fi
+
+if ! command -v dockerd >/dev/null 2>&1; then
+  warn "dockerd is not installed in this guest image — task containers cannot run"
+  emit ready no
+  emit reason no-dockerd
+  exit 1
+fi
+
+# setsid so dockerd outlives the `machine exec` session that started it. The
+# smolvm docker-in-vm example relies on exactly this (spike §3), and the
+# supervisor's own `lazy daemon start --background` depends on the same
+# property.
+mkdir -p "$(dirname "$DOCKERD_LOG")"
+setsid dockerd \
+  --data-root "$DATA_ROOT" \
+  --storage-driver "$STORAGE_DRIVER" \
+  --host unix:///var/run/docker.sock \
+  >>"$DOCKERD_LOG" 2>&1 &
+
+waited=0
+while [ "$waited" -lt "$TIMEOUT" ]; do
+  if docker info >/dev/null 2>&1; then
+    : >"$MARKER"
+    emit ready yes
+    emit source started-dockerd
+    emit data_root "$DATA_ROOT"
+    emit backing_fs "${BACKING_FS:-unknown}"
+    emit storage_driver "$(docker info --format '{{.Driver}}' 2>/dev/null || echo "$STORAGE_DRIVER")"
+    emit waited_seconds "$waited"
+    exit 0
+  fi
+  waited=$((waited + 1))
+  sleep 1
+done
+
+warn "dockerd did not become ready within ${TIMEOUT}s (data-root ${DATA_ROOT}, \
+driver ${STORAGE_DRIVER}); last lines of ${DOCKERD_LOG}:"
+tail -n 10 "$DOCKERD_LOG" >&2 2>/dev/null || true
+emit ready no
+emit reason dockerd-timeout
+emit data_root "$DATA_ROOT"
+emit storage_driver "$STORAGE_DRIVER"
+exit 1

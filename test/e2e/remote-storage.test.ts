@@ -30,7 +30,7 @@ describe.skipIf(slowSuiteSkipped('RemoteStorage'))('RemoteStorage', () => {
   let daemon: RunningDaemon;
   let ctx: TestContext;
   let tmpDir: string;
-  let socketPath: string;
+  let daemonUrl: string;
   let token: string;
   let cliTaskId: string;
 
@@ -40,9 +40,9 @@ describe.skipIf(slowSuiteSkipped('RemoteStorage'))('RemoteStorage', () => {
     // cannot take the storage lock the in-process daemon holds for its lifetime.
     cliTaskId = await createTaskBeforeDaemon(ctx, 'CLI created task for remote test');
     tmpDir = await mkdtemp(join(tmpdir(), 'lazy-remote-storage-'));
-    socketPath = join(tmpDir, 'remote-storage-test.sock');
     token = 'remote-storage-test-token';
-    daemon = await startDaemonServer({ socketPath, token, projectRoot: ctx.root });
+    daemon = await startDaemonServer({ token, projectRoot: ctx.root });
+    daemonUrl = `http://127.0.0.1:${daemon.webPort}`;
   });
 
   afterAll(async () => {
@@ -58,7 +58,7 @@ describe.skipIf(slowSuiteSkipped('RemoteStorage'))('RemoteStorage', () => {
   });
 
   function makeClient(): DaemonClient {
-    return new (DaemonClient as any)(socketPath, token) as DaemonClient;
+    return new (DaemonClient as any)(daemonUrl, token) as DaemonClient;
   }
 
   async function makeRemoteStorage(): Promise<RemoteStorage> {

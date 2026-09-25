@@ -10,7 +10,7 @@
  * wrappers. The tree is still available behind `--tree`.
  */
 import { requireStorage, parseFlags } from '../helpers';
-import { theme, dim } from '../theme';
+import { theme, dim } from '../../render/theme';
 import {
   buildTraceAnalyses,
   slowestLeaves,

@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test';
-import { deriveTaskRef, taskRef } from '../../src/cli/helpers';
+import { deriveTaskRef, taskRef } from '../../src/task/identity';
 import type { Task } from '../../src/types';
 
 function makeTask(overrides: Partial<Task> & { id: string; created_at: number }): Task {
@@ -8,7 +8,6 @@ function makeTask(overrides: Partial<Task> & { id: string; created_at: number })
     prompt: '',
     type: 'task' as const,
     status: 'backlog' as const,
-    priority: 'normal',
     completed_at: null,
     target: { kind: 'branch' as const, branch: 'main' },
     branched_from_sha: null,

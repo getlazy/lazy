@@ -2,95 +2,727 @@
  * The review surface: everything around the diff. The diff itself is styled by
  * diff.css, which commit detail shares — nothing here may be required for a
  * diff to read correctly, or the two pages drift apart again.
+ *
+ * Every colour here is a semantic role from theme.css: pending/needs-you is
+ * `warning`, delivered/approved is `success`, failed is `danger`. The class
+ * names are untouched — tests assert on several of them, and a reskin is not a
+ * rename.
  */
 
 body { padding-bottom: 68px; }
 .rv-queue td { white-space: normal; }
-.rv-badge { display: inline-block; padding: 0 6px; border-radius: 999px; font-size: 11px; background: var(--bg-secondary); border: 1px solid var(--border); }
-.rv-badge.rv-pending { border-color: #d97706; color: #d97706; }
+/* The queue says what order it is in, right above the table — the sort arrow
+   alone left the reviewer guessing what the rows were ranked by. */
+.rv-queue-order {
+  font-size: 12px; color: color-mix(in srgb, var(--color-text) 60%, transparent);
+  margin: 0 0 var(--space-2);
+}
+.rv-queue-when { white-space: nowrap; }
+/* Subtask counts read as a column of numbers: tabular, so a release hub's two
+   digits stand out from everything else's dash. */
+.rv-queue-count { font-variant-numeric: tabular-nums; }
+/* The goal column absorbs the table's leftover width, so without a gutter the
+   goal text runs straight into the time in the cell beside it. */
+.rv-queue-when, .rv-queue-count { padding-left: var(--space-4); }
+.rv-badge {
+  display: inline-block; padding: 0 6px; font-size: 11px;
+  background: var(--color-surface); border: 1px solid var(--color-divider);
+}
+.rv-badge.rv-pending { border-color: var(--color-warning); color: var(--color-warning); }
 /* Threads and the comment form live in the same scrolling table, so without
    this they inherit the width of the longest code line and drift off-screen
    the moment the reviewer scrolls right. */
 tr.rv-thread-row .rv-thread, tr.rv-form-row .rv-form { position: sticky; left: 0; max-width: min(900px, calc(100vw - 80px)); }
-tr.rv-thread-row td { padding: 8px 12px; background: var(--bg-secondary); white-space: normal; }
-.rv-thread { border-left: 3px solid var(--link); padding-left: 10px; }
-.rv-msg { margin-bottom: 8px; }
-.rv-msg-head { font-size: 11px; color: var(--text-secondary); }
-.rv-msg-body { font-family: var(--font-ui); white-space: pre-wrap; word-break: break-word; }
-.rv-msg-agent .rv-msg-head { color: #16a34a; }
+tr.rv-thread-row td { padding: var(--space-2) var(--space-3); background: var(--color-surface); white-space: normal; }
+.rv-thread { border-left: 3px solid var(--color-accent); padding-left: 10px; }
+.rv-msg { margin-bottom: var(--space-2); }
+.rv-msg-head { font-size: 11px; color: color-mix(in srgb, var(--color-text) 55%, transparent); }
+.rv-msg-body { font-family: var(--font-body); white-space: pre-wrap; word-break: break-word; }
+.rv-msg-agent .rv-msg-head { color: var(--color-success); }
 .rv-state { font-size: 11px; }
-.rv-state-pending { color: #d97706; }
-.rv-state-failed { color: #dc2626; }
-.rv-state-queued { color: var(--text-secondary); }
-.rv-state-delivered { color: #16a34a; }
-.rv-state-withdrawn { color: var(--text-secondary); font-style: italic; }
+.rv-state-pending { color: var(--color-warning); }
+.rv-state-failed { color: var(--color-danger); }
+.rv-state-queued { color: color-mix(in srgb, var(--color-text) 55%, transparent); }
+.rv-state-delivered { color: var(--color-success); }
+.rv-state-withdrawn { color: color-mix(in srgb, var(--color-text) 55%, transparent); font-style: italic; }
 /* A withdrawn message keeps its place in the thread — struck through, not gone,
    so the reviewer can see what they took back. */
-.rv-msg-withdrawn .rv-msg-body { text-decoration: line-through; color: var(--text-secondary); }
-.rv-state-hint { color: var(--text-secondary); }
+.rv-msg-withdrawn .rv-msg-body { text-decoration: line-through; color: color-mix(in srgb, var(--color-text) 55%, transparent); }
+.rv-state-hint { color: color-mix(in srgb, var(--color-text) 55%, transparent); }
 .rv-retry, .rv-withdraw { display: inline; }
-.rv-withdraw button { font-family: var(--font-ui); font-size: 11px; padding: 1px 8px; margin: 4px 0 0; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--text-secondary); cursor: pointer; }
-.rv-retry button { font-family: var(--font-ui); font-size: 11px; padding: 1px 8px; margin: 4px 0 0; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--text); cursor: pointer; }
-.rv-pending-box { border: 1px solid #d97706; border-radius: 4px; padding: 8px 12px; margin-bottom: 16px; }
-.rv-queued-list { list-style: none; margin: 8px 0 0; padding: 0; }
-.rv-queued-item { border-top: 1px dashed var(--border); padding: 6px 0; }
+.rv-withdraw button, .rv-retry button {
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  font-size: 11px; padding: 1px 8px; margin: 4px 0 0;
+  border: 1px solid var(--color-divider); background: transparent; cursor: pointer;
+}
+.rv-withdraw button { color: color-mix(in srgb, var(--color-text) 55%, transparent); }
+.rv-retry button { color: var(--color-text); }
+.rv-withdraw button:hover, .rv-retry button:hover { border-color: var(--color-accent); }
+.rv-pending-box {
+  border: 1px solid var(--color-warning); background: var(--color-warning-100);
+  color: var(--color-warning-800); padding: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-4);
+}
+.rv-queued-list { list-style: none; margin: var(--space-2) 0 0; padding: 0; }
+.rv-queued-item { border-top: 1px dashed var(--color-divider); padding: 6px 0; }
 .rv-queued-item:first-child { border-top: 0; }
 .rv-queued-where { font-family: var(--font-mono); font-size: 11px; }
-.rv-form-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.rv-hint { font-size: 11px; color: var(--text-secondary); }
-.rv-warn { font-size: 11px; color: #d97706; margin-bottom: 6px; }
-.rv-form textarea, .rv-actions textarea { width: 100%; box-sizing: border-box; font-family: var(--font-ui); font-size: 14px; line-height: 1.5; padding: 10px 12px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--text); }
-.rv-form button, .rv-actions button, .rv-dialog button { font-family: var(--font-ui); font-size: 13px; padding: 5px 12px; margin-top: 6px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-secondary); color: var(--text); cursor: pointer; }
-.rv-form button:hover, .rv-actions button:hover, .rv-dialog button:hover { border-color: var(--link); }
-.rv-form button.rv-primary, .rv-actions button.rv-primary, .rv-dialog button.rv-primary { background: var(--link); border-color: var(--link); color: #fff; }
-.rv-actions { border: 1px solid var(--border); border-radius: 6px; padding: 16px; margin: 24px 0; }
+.rv-form-actions { display: flex; gap: var(--space-2); align-items: center; flex-wrap: wrap; }
+.rv-hint { font-size: 11px; color: color-mix(in srgb, var(--color-text) 55%, transparent); }
+/* Autosave feedback for a review in progress. Quiet when it worked, loud when
+   it did not — words that are only in the textarea are words at risk. */
+.rv-draft-state { font-size: 11px; color: color-mix(in srgb, var(--color-text) 55%, transparent); }
+.rv-draft-state[data-state="error"] { color: var(--color-warning); font-weight: 600; }
+.rv-warn { font-size: 11px; color: var(--color-warning); margin-bottom: 6px; }
+/* Promote-a-discussion: folded away until asked for, so a thread still reads
+   as a conversation rather than a form. */
+.rv-promote { margin-top: 8px; }
+.rv-promote > summary { cursor: pointer; font-size: 12px; }
+.rv-promote form { display: flex; flex-direction: column; gap: var(--space-2); margin-top: 8px; }
+.rv-promote input[type="text"] {
+  width: 100%; box-sizing: border-box; font-family: var(--font-body); font-size: 13px;
+  padding: 6px 8px; border: 1px solid var(--color-divider);
+  background: var(--color-surface); color: var(--color-text);
+}
+.rv-promote-relation { border: 1px solid var(--color-divider); padding: 6px 8px; font-size: 12px; }
+.rv-promote-relation legend { font-size: 11px; padding: 0 4px; }
+.rv-promote-relation label { display: inline-flex; gap: 4px; align-items: center; margin-right: 12px; }
+/* Not a warning: where an answer came from. Quiet, but always present — an
+   answer read off the task's stored record must never look like the live
+   agent's. */
+.rv-note {
+  font-size: 11px; margin-bottom: 6px; padding: 6px 8px;
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
+  border-left: 2px solid var(--color-divider); background: var(--color-surface);
+}
+.rv-form textarea, .rv-actions textarea, .rv-promote textarea {
+  width: 100%; box-sizing: border-box; font-family: var(--font-body);
+  font-size: 14px; line-height: 1.5; padding: 10px 12px;
+  border: 1px solid var(--color-divider); background: var(--color-surface); color: var(--color-text);
+}
+.rv-form textarea:focus-visible, .rv-actions textarea:focus-visible, .rv-promote textarea:focus-visible { border-color: var(--color-accent); outline-offset: 0; }
+/* The buttons are Industry's `.btn` in everything but the class attribute —
+   these are bare <button> elements inside forms the renderer emits, so the look
+   is restated here rather than threading a class through every call site. */
+.rv-form button, .rv-actions button, .rv-dialog button, .rv-promote button {
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  font-size: 13px; padding: 5px 12px; margin-top: 6px;
+  border: 1px solid var(--color-divider); background: transparent;
+  color: var(--color-text); cursor: pointer;
+}
+.rv-form button:hover, .rv-actions button:hover, .rv-dialog button:hover, .rv-promote button:hover {
+  border-color: var(--color-accent);
+  background: color-mix(in srgb, var(--color-text) 7%, transparent);
+}
+.rv-form button.rv-primary, .rv-actions button.rv-primary, .rv-dialog button.rv-primary {
+  background: var(--color-accent); border-color: var(--color-accent); color: var(--color-bg);
+}
+.rv-form button.rv-primary:hover, .rv-actions button.rv-primary:hover, .rv-dialog button.rv-primary:hover {
+  background: var(--color-accent-600);
+}
+.rv-actions { border: 1px solid var(--color-divider); padding: var(--space-4); margin: var(--space-8) 0; }
 .rv-actions > form { margin: 0; }
 .rv-actions label { display: block; margin-bottom: 6px; }
-.rv-accept-form { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border); }
-/* margin:auto is what centres a modal <dialog>; the layout's global
-   `* { margin: 0 }` reset wipes the UA default, which pinned this to a corner
-   of the viewport. Restate it here rather than exempting dialog from the
-   reset, which would change every other page. */
-dialog.rv-dialog { width: min(680px, calc(100vw - 40px)); font-family: var(--font-ui); margin: auto; padding: 0; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); box-shadow: 0 16px 40px rgba(0,0,0,0.32); }
-dialog.rv-dialog::backdrop { background: rgba(0,0,0,0.45); }
-dialog.rv-dialog .rv-accept-form { margin: 0; padding: 24px; border-top: 0; }
+.rv-tablist { display: flex; gap: 0; margin-bottom: var(--space-4); border-bottom: 1px solid var(--color-divider); }
+.rv-tab {
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  font-size: 13px; padding: 8px 14px; margin: 0; border: 0; border-bottom: 2px solid transparent;
+  background: transparent; color: color-mix(in srgb, var(--color-text) 55%, transparent); cursor: pointer;
+}
+.rv-tab-on { color: var(--color-text); border-bottom-color: var(--color-accent); }
+.rv-tabpanel { margin-top: var(--space-2); }
+/* With JS on (rv-tabs-ready), all three panels sit in the SAME grid cell so
+   the tallest one sets the card's height — switching tabs must never move
+   anything below the card. A hidden panel keeps its layout box (display stays
+   on) but is invisible and inert via visibility, which also drops it from the
+   tab order. Without JS the class is absent and the panels stack as forms. */
+.rv-tabs-ready .rv-tabpanels { display: grid; }
+.rv-tabs-ready .rv-tabpanel { grid-area: 1 / 1; min-width: 0; }
+.rv-tabs-ready .rv-tabpanel[hidden] { display: block; visibility: hidden; }
+/* Equal-height panels are not enough on their own: the eye still jumps if the
+   TEXTAREA itself moves or resizes between tabs. So all three carry the same
+   rows= and the same height here, their lead line reserves the same two lines
+   whether it wraps or not, and anything panel-specific (queued comments, the
+   ask thread list, an availability warning) lives in .rv-tabpanel-extras
+   BELOW the form, where it cannot push the textarea around. */
+.rv-actions .rv-tabpanel textarea { height: 9.5rem; }
+.rv-actions .rv-tabpanel .rv-tab-lead { display: block; min-height: 2.6em; }
+.rv-tabpanel-extras { margin-top: var(--space-4); }
+.rv-tabpanel-extras:empty { margin-top: 0; }
+.rv-task-threads { margin-bottom: var(--space-4); }
+.rv-task-form { margin: var(--space-2) 0 var(--space-4); padding-left: 10px; border-left: 3px solid var(--color-accent); }
+.rv-accept-form { margin-top: 0; padding-top: 0; border-top: 0; }
+/* `margin: auto` is what centres a modal <dialog>. It is the UA default and is
+   restated because this element is exactly the kind of thing a future page
+   reset would silently re-corner. */
+dialog.rv-dialog {
+  width: min(680px, calc(100vw - 40px)); font-family: var(--font-body); margin: auto;
+  padding: 0; border: 1px solid var(--color-divider);
+  background: var(--color-bg); color: var(--color-text); box-shadow: var(--shadow-lg);
+}
+dialog.rv-dialog::backdrop { background: color-mix(in srgb, var(--color-neutral-900) 50%, transparent); }
+dialog.rv-dialog .rv-accept-form { margin: 0; padding: var(--space-8); border-top: 0; }
 dialog.rv-dialog label { font-size: 15px; margin-bottom: 10px; }
 dialog.rv-dialog textarea { font-size: 15px; line-height: 1.55; padding: 12px 14px; min-height: 120px; }
 dialog.rv-dialog button { font-size: 14px; padding: 7px 16px; }
-dialog.rv-dialog .rv-form-actions { justify-content: flex-end; margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
-.rv-statusbar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 50; display: flex; gap: 6px 18px; flex-wrap: wrap; align-items: center; padding: 8px 20px; background: var(--bg-secondary); border-top: 1px solid var(--border); font-size: 12px; }
-.rv-statusbar .rv-sb-sep { color: var(--text-secondary); }
-.rv-statusbar[data-rv-askable="0"] .rv-sb-ask { color: #d97706; }
-.rv-notice { padding: 8px 12px; border: 1px solid var(--border); border-radius: 4px; margin-bottom: 16px; }
-.rv-notice-err { border-color: #dc2626; color: #dc2626; }
-.rv-violations { border: 1px solid #d97706; border-radius: 4px; padding: 12px 14px; margin-bottom: 16px; }
-.rv-violations[data-resolved="1"] { border-color: #16a34a; }
-.rv-violation-list { list-style: none; margin: 8px 0 0; padding: 0; }
-.rv-violation-item { padding: 2px 0; display: flex; align-items: center; gap: 8px; }
+dialog.rv-dialog .rv-form-actions { justify-content: flex-end; margin-top: var(--space-4); padding-top: 14px; border-top: 1px solid var(--color-divider); }
+dialog.lz-raised-dialog {
+  width: min(720px, calc(100vw - 40px));
+  max-height: calc(100vh - 40px);
+}
+.lz-raised-dialog-close {
+  display: flex; justify-content: flex-end;
+  padding: var(--space-3) var(--space-4) 0;
+}
+.lz-raised-dialog-body {
+  overflow: auto; max-height: calc(100vh - 80px);
+  padding: var(--space-4) var(--space-8) var(--space-8);
+}
+/* Task-page action dialog — live CLI phases, close on success, stay on failure.
+   Floor at ~28rem so short forms → steps do not shrink the box; grow with
+   tall content up to the viewport; body scrolls only when that still is not
+   enough. Submit row sticks to the bottom of the scroll pane. */
+dialog.lz-action-dialog {
+  width: min(640px, calc(100vw - 40px));
+  height: auto;
+  min-height: min(28rem, calc(100vh - 40px));
+  max-height: calc(100vh - 40px);
+  padding: 0 0 var(--space-6);
+  overflow: hidden;
+}
+dialog.lz-action-dialog[open] {
+  display: flex;
+  flex-direction: column;
+}
+dialog.lz-action-form-hidden .lz-action-dialog-body {
+  display: none;
+}
+.lz-action-dialog-close {
+  display: flex; justify-content: flex-end;
+  padding: var(--space-3) var(--space-4) 0;
+  flex: none;
+}
+.lz-action-dialog-title {
+  margin: 0 var(--space-8) var(--space-3);
+  font-size: 1.1rem;
+  flex: none;
+}
+.lz-action-dialog-body {
+  padding: 0 var(--space-8);
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+.lz-action-dialog-body .lz-action-form { margin: 0; }
+.lz-action-dialog-body .lz-action-form .input,
+.lz-action-dialog-body .lz-action-form textarea {
+  width: 100%;
+  margin: var(--space-2) 0;
+}
+/* Pin the primary action while the middle of a tall Accept/Unblock form
+   scrolls — sticky keeps every template's HTML intact (incl. noscript). */
+.lz-action-dialog-body .rv-form-actions {
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  margin-top: var(--space-4);
+  padding-top: 14px;
+  padding-bottom: var(--space-2);
+  background: var(--color-bg);
+  border-top: 1px solid var(--color-divider);
+  box-shadow: 0 -10px 14px -10px color-mix(in srgb, var(--color-neutral-900) 22%, transparent);
+}
+.lz-action-steps {
+  list-style: none;
+  margin: var(--space-4) var(--space-8) 0;
+  padding: 0;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 13px;
+  line-height: 1.45;
+  min-height: 6rem;
+  max-height: 14rem;
+  overflow-y: auto;
+  flex: none;
+}
+.lz-action-step {
+  display: flex;
+  gap: var(--space-2);
+  padding: 2px 0;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}
+.lz-action-step[data-state="start"],
+.lz-action-step[data-state="progress"] {
+  color: var(--color-text);
+}
+.lz-action-step[data-state="done"] { color: var(--color-success, #1a7f37); }
+.lz-action-step[data-state="failed"] { color: var(--color-danger, #c0392b); font-weight: 600; }
+.lz-action-step[data-state="skipped"] { color: color-mix(in srgb, var(--color-text) 45%, transparent); }
+.lz-action-step-mark { width: 1.2em; flex: none; text-align: center; }
+.lz-action-step-text { white-space: pre-wrap; min-width: 0; }
+.lz-action-error {
+  margin: var(--space-3) var(--space-8) 0;
+  color: var(--color-danger, #c0392b);
+  white-space: pre-wrap;
+  flex: none;
+  overflow: auto;
+  max-height: 8rem;
+}
+.lz-action-remedy {
+  margin: var(--space-3) var(--space-8) 0;
+  padding: 0;
+  flex: none;
+  overflow: auto;
+  max-height: 12rem;
+}
+.lz-action-remedy .lz-action-form label,
+.lz-action-remedy .lz-action-passphrase label {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.lz-action-remedy input[type="password"] {
+  width: 100%;
+}
+.lz-action-remedy .rv-remedy-cmd {
+  margin: var(--space-2) 0 0;
+  overflow-x: auto;
+  white-space: pre-wrap;
+}
+.lz-action-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: flex-start;
+}
+/* Visible busy reason under Unblock / Accept — not only a title tooltip. */
+.lz-action-buttons + [data-rv-busy-reason] {
+  margin-top: 6px;
+}
+.lz-action-buttons + [data-rv-busy-reason][hidden] {
+  display: none;
+}
+a.lz-task-link, a.lz-sym-link { text-underline-offset: 2px; }
+a.lz-raised-open { font-weight: 500; }
+.rv-statusbar {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
+  display: flex; gap: 6px 18px; flex-wrap: wrap; align-items: center;
+  padding: var(--space-2) var(--space-6);
+  background: var(--color-surface); border-top: 1px solid var(--color-divider); font-size: 12px;
+}
+.rv-statusbar .rv-sb-sep { color: color-mix(in srgb, var(--color-text) 35%, transparent); }
+/* A loop's k-of-n, only on a loop task. `white-space: nowrap` keeps the one
+   compact item from breaking across the bar's two possible lines. */
+.rv-statusbar .rv-sb-cluster { white-space: nowrap; }
+/* Prev/next/help over the page's viewable sections (review-navigation.ts).
+   Ships hidden; the island unhides it. */
+.rv-nav { display: inline-flex; gap: 4px; margin-left: auto; }
+/* The `display` above is an author rule and beats the UA's `[hidden]`, so
+   the attribute needs this companion or it does nothing — see the note on
+   .rv-viewopts[hidden] in diff.css. */
+.rv-nav[hidden] { display: none; }
+.rv-nav-btn {
+  font-size: 11px; padding: 2px 8px; cursor: pointer;
+  border: 1px solid var(--color-divider); background: transparent; color: inherit;
+}
+.rv-nav-btn:hover { border-color: var(--color-accent); }
+.rv-nav-help { padding: 2px 6px; }
+/* Key hints, injected next to a real control while Shift is held (or the `?`
+   legend is open) and removed on release. Purely decorative — aria-hidden, and
+   never rendered without JS, so nothing advertises a shortcut that cannot run. */
+.rv-keyhint {
+  display: inline-block; margin-left: 5px; padding: 0 4px;
+  font-family: var(--font-mono); font-size: 10px; line-height: 15px;
+  border: 1px solid var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent) 15%, transparent);
+  color: var(--color-accent); vertical-align: middle;
+}
+dialog.rv-nav-legend { width: min(360px, calc(100vw - 40px)); padding: var(--space-4); }
+dialog.rv-nav-legend h2 { margin-top: 0; }
+.rv-nav-legend-table td { padding: 2px 10px 2px 0; font-size: 13px; }
+.rv-nav-legend-table kbd {
+  font-family: var(--font-mono, monospace); font-size: 11px; padding: 1px 5px;
+  border: 1px solid var(--color-divider); background: var(--color-surface);
+}
+.rv-statusbar[data-rv-askable="0"] .rv-sb-ask { color: var(--color-warning); }
+.rv-notice { padding: var(--space-2) var(--space-3); border: 1px solid var(--color-divider); margin-bottom: var(--space-4); }
+.rv-notice-err { border-color: var(--color-danger); background: var(--color-danger-100); color: var(--color-danger-800); }
+.rv-violations { border: 1px solid var(--color-warning); padding: var(--space-3); margin-bottom: var(--space-4); }
+.rv-violations[data-resolved="1"] { border-color: var(--color-success); }
+.rv-violation-list { list-style: none; margin: var(--space-2) 0 0; padding: 0; }
+.rv-violation-item { padding: 2px 0; display: flex; align-items: center; gap: var(--space-2); }
 .rv-violation-mark { flex: none; width: 1.4em; text-align: center; }
-.rv-violation-state { font-size: 11px; color: #d97706; margin-left: auto; }
-[data-approved="1"] > .rv-violation-state { color: #16a34a; }
-.rv-decide-state { font-size: 11px; font-weight: 600; color: #d97706; }
-[data-approved="1"] .rv-decide-state { color: #16a34a; }
+.rv-violation-state { font-size: 11px; color: var(--color-warning); margin-left: auto; }
+[data-approved="1"] > .rv-violation-state { color: var(--color-success); }
+.rv-decide-state { font-size: 11px; font-weight: 600; color: var(--color-warning); }
+[data-approved="1"] .rv-decide-state { color: var(--color-success); }
 .rv-violation-mark::before { content: '⛔'; }
 [data-approved="1"] .rv-violation-mark::before { content: '✅'; }
-.rv-file-protected { border-color: #d97706; }
-.rv-file-protected .rv-file-head { background: rgba(217,119,6,0.10); }
+.rv-file-protected { border-color: var(--color-warning); }
+.rv-file-protected .rv-file-head { background: var(--color-warning-100); }
+
+/* Raised items — same weight as violations; accept refuses while any are open. */
+.rv-raised-list { display: flex; flex-direction: column; gap: var(--space-3); }
+.rv-raised-item { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-2) 0; border-top: 1px solid var(--color-divider); }
+.rv-raised-item:first-child { border-top: 0; }
+.rv-raised-body { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; }
+/* Badges and title on ONE line. The row used to stack them, so a gate tag sat
+   alone on a line above the link and read as a stray word rather than as this
+   item's state. */
+.rv-raised-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.rv-raised-head .lz-raised-open { font-weight: 600; }
+.rv-raised-content { flex: 1 1 16em; }
+.rv-raised-options { list-style: disc; margin: 4px 0 0 1.4em; padding: 0; font-size: 12px; width: 100%; }
+.rv-raised-decide { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 0; }
+.rv-raised-decide select, .rv-raised-decide input[type="text"] { font-size: 12px; }
+.rv-raised-response { flex: 1 1 12em; }
+.rv-raised-response input { width: 100%; }
+
+/* Agent report above the diff.
+   The report is a viewable card (cards.css) — border, header row and collapse
+   come from there. It is never truncated and never scrolls inside itself: the
+   preview-behind-a-details it used to hide in is gone. */
+.rv-agent-report { margin-bottom: var(--space-4); }
+.rv-agent-report-body { margin-top: var(--space-2); }
+
+/* Follow-ups — quieter than raised/violations; triage never blocks accept. */
+.rv-followups { border: 1px solid var(--color-divider); padding: var(--space-3); margin-bottom: var(--space-4); }
+.rv-followup-list { list-style: none; margin: var(--space-2) 0 0; padding: 0; }
+.rv-followup-item { padding: var(--space-2) 0; border-top: 1px solid var(--color-divider); display: flex; flex-direction: column; gap: 6px; }
+.rv-followup-item:first-child { border-top: 0; }
+.rv-followup-body { white-space: pre-wrap; }
+.rv-followup-decide { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; margin: 0; }
+.rv-followup-decide input[type="text"] { flex: 1 1 12em; font-size: 12px; }
+.rv-followup-decide select { font-size: 12px; }
+.rv-followup-decide label { display: flex; align-items: center; gap: 6px; }
+.rv-followup-note { flex: 1 1 14em; }
+.rv-followup-field-label, .rv-followup-action-label {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}
+/* Promote is a card, not a button: goal and code are the two things worth
+   correcting before a backlog task exists under a name nobody chose. */
+.rv-followup-promote-card {
+  flex: 1 1 100%; display: flex; flex-direction: column; gap: 6px;
+  border: 1px solid var(--color-divider); padding: var(--space-2);
+}
+.rv-followup-promote-card .rv-hint { margin: 0; }
+.rv-followup-decide-card { flex-direction: column; align-items: stretch; }
+.rv-followup-decide-card label { justify-content: space-between; }
+.rv-followup-decide-card button[type="submit"] { align-self: flex-start; }
+.rv-followup-state { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
+/* The enhancement script hides the fields a decision does not use; without it
+   every field stays visible and the same single POST still works. */
+.rv-followup-decide [hidden] { display: none; }
+.followup-provenance { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+
 /* The one ⛔/✅ control, in the header of the file it decides. */
 .rv-decide { display: inline-flex; align-items: center; gap: 6px; margin: 0; }
-.rv-decide-btn { font-family: var(--font-ui); font-size: 11px; padding: 2px 8px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg); color: var(--text-secondary); cursor: pointer; }
-.rv-decide-btn:hover { border-color: var(--link); }
+.rv-decide-btn {
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  font-size: 11px; padding: 2px 8px;
+  border: 1px solid var(--color-divider); background: transparent;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent); cursor: pointer;
+}
+.rv-decide-btn:hover { border-color: var(--color-accent); }
 /* The chosen answer is lit and the other dimmed, so the CURRENT state is
    readable at a glance instead of inferred from an empty checkbox. */
-.rv-decide-btn.rv-decide-on { border-color: #d97706; color: #d97706; background: rgba(217,119,6,0.12); font-weight: 600; }
-.rv-decide-btn[value="1"].rv-decide-on { border-color: #16a34a; color: #16a34a; background: rgba(22,163,74,0.12); }
+.rv-decide-btn.rv-decide-on {
+  border-color: var(--color-warning); color: var(--color-warning-800);
+  background: var(--color-warning-100); font-weight: 600;
+}
+.rv-decide-btn[value="1"].rv-decide-on {
+  border-color: var(--color-success); color: var(--color-success-800);
+  background: var(--color-success-100);
+}
 
 /* Remedy panel: what to do about a refused accept. Deliberately loud — it is
    shown only when an action the reviewer just took was refused. */
-.rv-remedy { border: 1px solid #d97706; border-radius: 4px; padding: 12px 14px; margin-bottom: 16px; }
+.rv-remedy { border: 1px solid var(--color-warning); padding: var(--space-3); margin-bottom: var(--space-4); }
 .rv-remedy p { margin: 6px 0; }
-.rv-remedy-files { list-style: none; margin: 8px 0; padding: 0; max-height: 12em; overflow-y: auto; font-size: 12px; }
-.rv-remedy-cmd { background: var(--code-bg, #f6f8fa); border: 1px solid var(--border); border-radius: 4px;
-  padding: 8px 10px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; font-size: 12px; }
+/* No max-height: the reviewer has to read every path this lists to act on the
+   remedy, and a clipped list hides the ones at the bottom. */
+.rv-remedy-files { list-style: none; margin: var(--space-2) 0; padding: 0; font-size: 12px; }
+.rv-remedy-cmd {
+  background: var(--color-neutral-100); border: 1px solid var(--color-divider);
+  padding: var(--space-2); overflow-x: auto; white-space: pre-wrap; word-break: break-all;
+  font-family: var(--font-mono); font-size: 12px;
+}
 .rv-remedy-form { margin: 10px 0; }
 .rv-remedy-form input[type="password"] { width: 100%; max-width: 24em; }
+
+/* Builder review session page — transcript + compose, no diff chrome. */
+.rs-start-bar, .rs-start { margin: var(--space-4) 0; }
+.rs-start button, .rs-start-bar button {
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  font-size: 13px; padding: 5px 12px;
+  border: 1px solid var(--color-accent); background: var(--color-accent); color: var(--color-bg);
+  cursor: pointer;
+}
+.rs-start button:hover, .rs-start-bar button:hover { background: var(--color-accent-600); }
+.rs-transcript { max-width: min(900px, 100%); margin: var(--space-6) 0; }
+.rs-empty, .rs-hint { color: color-mix(in srgb, var(--color-text) 55%, transparent); font-size: 13px; }
+.rs-status { font-size: 13px; color: var(--color-warning); margin: var(--space-2) 0; }
+.rs-status-active { font-weight: 600; }
+.rs-compose { border: 1px solid var(--color-divider); padding: var(--space-4); margin: var(--space-8) 0; max-width: min(900px, 100%); }
+.rs-compose textarea {
+  width: 100%; box-sizing: border-box; font-family: var(--font-body);
+  font-size: 14px; line-height: 1.5; padding: 10px 12px;
+  border: 1px solid var(--color-divider); background: var(--color-surface); color: var(--color-text);
+}
+.rs-retry { display: inline; }
+.rs-retry button {
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  font-size: 11px; padding: 1px 8px; margin: 4px 0 0;
+  border: 1px solid var(--color-divider); background: transparent; cursor: pointer;
+}
+
+/* Agent-declared Changes walkthrough (present-review-changes) */
+.rv-changes-viewopts { margin-bottom: var(--space-2); }
+.rv-changes-presented { margin-bottom: var(--space-4); }
+.rv-pres-group { margin-bottom: var(--space-3); border: 1px solid var(--color-divider); border-radius: 4px; }
+.rv-pres-details > summary { cursor: pointer; padding: var(--space-2) var(--space-3); list-style: none; }
+.rv-pres-details > summary::-webkit-details-marker { display: none; }
+.rv-pres-summary { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: baseline; }
+.rv-pres-tier {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em;
+  padding: 1px 6px; border: 1px solid var(--color-divider); border-radius: 3px;
+}
+.rv-pres-tier-core { border-color: var(--color-accent); color: var(--color-accent); }
+.rv-pres-paths { font-size: 11px; color: color-mix(in srgb, var(--color-text) 55%, transparent); }
+.rv-pres-paths code { font-size: 10px; }
+.rv-pres-items { padding: 0 var(--space-3) var(--space-3); }
+.rv-pres-prose { margin: var(--space-2) 0; }
+.rv-pres-snippet { margin: var(--space-3) 0; }
+.rv-pres-snippet-head { font-size: 12px; margin-bottom: var(--space-1); }
+.rv-pres-residual { font-style: italic; margin: var(--space-1) var(--space-3); }
+.rv-changes-raw[hidden], .rv-changes-presented[hidden] { display: none !important; }
+
+/* Agent-declared screenshots (review-screenshots): the first thing on the page,
+   so they get room — a grid on wide screens, one column when narrow. */
+.rv-shots {
+  display: grid; gap: var(--space-3); padding: var(--space-3);
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+}
+.rv-shot { margin: 0; }
+.rv-shot-img {
+  display: block; width: 100%; height: auto; max-height: 70vh; object-fit: contain;
+  border: 1px solid var(--color-divider); border-radius: 4px; background: var(--color-bg);
+}
+.rv-shot-caption {
+  font-size: 12px; margin-top: var(--space-1);
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
+}
+/* The thumbnail is a link, and it says so on hover and on keyboard focus — a
+   picture that opens something must not look inert. */
+.rv-shot-link { display: block; cursor: zoom-in; }
+.rv-shot-link:hover .rv-shot-img { border-color: var(--color-accent); }
+.rv-shot-link:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+
+/* The screenshot lightbox (src/server/screenshot-lightbox.ts). Nearly the whole
+   viewport: the reviewer opened it to LOOK at the picture, so the image gets
+   the room and the chrome is one thin bar. */
+/* NO `display` here, deliberately — like every other dialog in this file. An
+   author-origin `display` on the element beats the UA's
+   `dialog:not([open]) { display: none }`, so a closed dialog goes on occupying
+   the page: close the overlay and a viewport-sized image, its arrows and its
+   caption bar stay laid out at the bottom of the review, once per close. The
+   stage and bar are block boxes and the image bounds its own height, so the
+   flex column this used to declare bought nothing. */
+dialog.lz-shotbox {
+  width: min(1400px, calc(100vw - 32px)); max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 32px); padding: 0; overflow: hidden;
+}
+dialog.lz-shotbox::backdrop { background: color-mix(in srgb, var(--color-neutral-900) 75%, transparent); }
+/* The letterbox around an image that does not fill the stage. A token step off
+   the page background, so it reads as a frame in light and dark alike — the
+   neutral ramp flips end-for-end between themes (see theme.css). */
+.lz-shotbox-stage {
+  position: relative; display: flex; align-items: center; justify-content: center;
+  background: var(--color-neutral-200); cursor: zoom-out;
+}
+/* The image is not a dismiss target, so it does not wear the stage's cursor. */
+.lz-shotbox-img {
+  display: block; max-width: 100%; max-height: calc(100vh - 120px);
+  width: auto; height: auto; object-fit: contain; cursor: default;
+}
+/* Overlaid on the image rather than beside it, so the picture keeps the width;
+   large hit targets because this is the most-clicked control on the page. */
+dialog.lz-shotbox .lz-shotbox-nav {
+  position: absolute; top: 50%; transform: translateY(-50%); margin-top: 0;
+  font-size: 26px; line-height: 1; padding: 8px 14px;
+  background: color-mix(in srgb, var(--color-bg) 85%, transparent);
+}
+dialog.lz-shotbox .lz-shotbox-nav:hover { background: var(--color-accent); color: var(--color-bg); }
+.lz-shotbox-prev { left: var(--space-2); }
+.lz-shotbox-next { right: var(--space-2); }
+.lz-shotbox-nav[hidden] { display: none; }
+.lz-shotbox-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--space-3);
+  padding: var(--space-2) var(--space-3); border-top: 1px solid var(--color-divider);
+  font-size: 13px;
+}
+.lz-shotbox-text { display: flex; align-items: baseline; gap: var(--space-2); min-width: 0; }
+.lz-shotbox-pos {
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+  color: color-mix(in srgb, var(--color-text) 60%, transparent);
+}
+.lz-shotbox-caption { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lz-shotbox-actions { display: flex; align-items: center; gap: var(--space-2); white-space: nowrap; }
+.lz-shotbox-fullsize { font-size: 12px; }
+
+/* Prose anchors (review-prose-anchors): any line of the agent's prose — report
+   sections, follow-ups, raised items — takes the same Ask/Comment pair a diff
+   line has. Blocks are annotated by the island; the "+" mirrors the diff
+   gutter's, appearing on hover. */
+.rv-prose-add {
+  visibility: hidden; cursor: pointer; margin-left: 6px;
+  border: 1px solid var(--color-accent); background: var(--color-accent);
+  color: var(--color-bg); line-height: 1; padding: 0 5px; font-family: inherit;
+  font-size: 12px; vertical-align: baseline;
+}
+.rv-prose-block:hover > .rv-prose-add { visibility: visible; }
+/* Unsent comment boxes whose anchor is not on screen (a line inside a context
+   gap, a view this tab is not showing). Loud enough to be seen — they are words
+   the reviewer has not sent — and they carry their anchor, so they can still be
+   sent from here. */
+.rv-draft-orphans {
+  margin: 0 0 var(--space-4);
+  padding: var(--space-3);
+  border: 1px solid var(--color-warning);
+  border-left-width: 3px;
+  background: color-mix(in srgb, var(--color-warning) 6%, transparent);
+}
+.rv-draft-orphans[hidden] { display: none; }
+.rv-draft-orphan + .rv-draft-orphan { margin-top: var(--space-3); }
+
+.rv-prose-thread-wrap, .rv-prose-form {
+  margin: var(--space-2) 0; padding-left: 10px;
+  border-left: 3px solid var(--color-accent);
+}
+.rv-prose-threads { margin: var(--space-3) 0; }
+.rv-prose-quote {
+  margin: 0 0 var(--space-1); font-style: italic;
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
+}
+
+/* "How to verify" block (review-verify.ts): prose steps + copyable command panels */
+.rv-verify { margin-bottom: var(--space-4); }
+.rv-verify-prose { margin: var(--space-2) 0; }
+/* The reason no Run button works, with whatever can be done about it (the Start
+ * container button), once at the top of the card. */
+.rv-verify-shell-down {
+  display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap;
+  margin-bottom: var(--space-2);
+}
+.rv-cmd-panel { margin: var(--space-2) 0; border: 1px solid var(--color-divider); border-radius: 4px; }
+.rv-cmd-head {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 2px var(--space-2); border-bottom: 1px solid var(--color-divider);
+}
+.rv-cmd-lang {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}
+.rv-cmd-actions { display: flex; align-items: center; gap: var(--space-2); }
+.rv-cmd-copy, .rv-cmd-run { font-size: 11px; padding: 1px 8px; cursor: pointer; }
+.rv-cmd-copy.rv-cmd-copied, .rv-cmd-run.rv-cmd-ran { color: var(--color-accent); }
+.rv-cmd-run[disabled] { cursor: not-allowed; opacity: 0.55; }
+.rv-cmd-pre { margin: 0; padding: var(--space-2); overflow-x: auto; }
+.rv-cmd-line { display: block; }
+.rv-cmd-copy-line {
+  font-size: 10px; margin-left: var(--space-2); padding: 0 4px; cursor: pointer;
+  border: none; background: none; color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}
+.rv-cmd-copy-line:hover, .rv-cmd-copy-line.rv-cmd-copied { color: var(--color-accent); }
+
+/* Minimal hub-children list in Changes. The later Subtasks tab owns grouping. */
+.rv-hub-children { margin: 0 0 var(--space-4); }
+.rv-hub-children h3 { font-size: 14px; margin: var(--space-3) 0 var(--space-2); }
+.rv-hub-children ul { margin: 0; padding-left: 1.2em; }
+.rv-hub-children li { margin: 0 0 var(--space-1); }
+
+/* Review regions strip — the `?region=` filter on Changes. Indentation is the
+   provenance hierarchy (a hub's children sit under it), which is the single
+   most useful thing about a several-hundred-region cover. */
+.rv-regions { margin: 0 0 var(--space-4); }
+.rv-regions-head { font-size: 13px; margin: 0 0 var(--space-2); }
+.rv-regions-list { list-style: none; margin: 0; padding: 0; }
+.rv-region {
+  padding: var(--space-1) var(--space-2);
+  padding-left: calc(var(--space-2) + var(--rv-region-depth, 0) * 1.1em);
+  border-left: 2px solid transparent;
+}
+.rv-region-active {
+  border-left-color: var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent) 8%, transparent);
+}
+.rv-region-link { display: inline-flex; gap: var(--space-2); align-items: baseline; }
+.rv-region-label { font-weight: 500; }
+.rv-region-id { font-size: 11px; opacity: 0.7; }
+.rv-region-meta {
+  display: block;
+  font-size: 11px;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}
+/* The walkthrough's own line about a region — on "Other changes" it carries
+   the uncovered count and any cap the walkthrough was refused for. */
+.rv-region-note { margin: 2px 0 0; font-size: 11px; }
+.rv-regions-more { margin-top: var(--space-2); }
+.rv-regions-more summary { cursor: pointer; font-size: 13px; }
+
+/* The compact regions card on Changes — a pointer to the Regions tab, not a
+   second copy of the list. */
+.rv-regions-card {
+  margin: 0 0 var(--space-4);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-divider);
+  border-left: 3px solid var(--color-accent);
+  background: var(--color-surface);
+  font-size: 13px;
+}
+.rv-regions-card-active {
+  background: color-mix(in srgb, var(--color-accent) 8%, transparent);
+}
+/* A sign-off the branch has moved past must never read as current approval. */
+.rv-region-stale .rv-region-meta { color: var(--color-warning, #a15c00); }
+
+/* Agent-review findings on Summary and on review turn cards. */
+.lz-findings { margin: var(--space-6) 0; }
+.lz-findings h2 { margin: 0 0 var(--space-3); }
+.lz-findings-report {
+  border: 1px solid var(--color-divider);
+  background: var(--color-surface);
+  padding: var(--space-4);
+  margin: 0 0 var(--space-4);
+}
+.lz-findings-failed { border-left: 3px solid var(--color-danger); }
+.lz-findings-head { margin: 0 0 var(--space-3); font-size: 16px; }
+.lz-findings-unparsed { color: var(--color-danger); }
+.lz-findings-statements { margin: 0 0 var(--space-4); }
+.lz-findings-statements > div { display: grid; grid-template-columns: 8em 1fr; gap: var(--space-2); margin: 0 0 var(--space-2); }
+.lz-findings-statements dt {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: color-mix(in srgb, var(--color-text) 60%, transparent);
+}
+.lz-findings-statements dd { margin: 0; }
+.lz-findings-group { margin: var(--space-3) 0 0; }
+.lz-findings-group h4 { margin: 0 0 var(--space-2); font-size: 13px; }
+.lz-findings-group ul { margin: 0; padding-left: 0; list-style: none; }
+.lz-finding { margin: 0 0 var(--space-2); padding-left: var(--space-3); border-left: 3px solid var(--color-divider); }
+.lz-finding-critical { border-left-color: var(--color-danger); }
+.lz-finding-high { border-left-color: var(--color-warning); }
+.lz-finding-sev {
+  display: inline-block;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-right: var(--space-2);
+  color: color-mix(in srgb, var(--color-text) 60%, transparent);
+}
+.lz-finding-where { font-family: var(--font-mono); font-size: 12px; }
+.lz-finding-summary { display: block; margin-top: 2px; }
+.lz-findings-none { color: color-mix(in srgb, var(--color-text) 60%, transparent); }
+.lz-findings-raw { margin-top: var(--space-3); }
+.lz-findings-raw > summary { cursor: pointer; }

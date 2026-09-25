@@ -26,12 +26,10 @@ are captured as they go:
 ### Capture never shortens a conversation
 
 The same session exists in several projects dirs, and a stale copy can be
-touched — mounted, refreshed — without gaining a byte. Capture used to re-parse
-whatever it found and blind-write it, so a stale copy could replace a stored
-conversation with an earlier snapshot of itself; the user then could not read
-their newest turns via `lazy view` at all. A capture whose messages are a strict
-prefix of what is already stored (same message uuids, position for position,
-fewer of them) is now refused, and the refusal is logged. This is deliberately
+touched — mounted, refreshed — without gaining a byte. Storing such a copy would
+replace a conversation with an earlier snapshot of itself, so a capture whose
+messages are a strict prefix of what is already stored (same message uuids,
+position for position, fewer of them) is refused, and the refusal is logged. This is deliberately
 narrow: a conversation that genuinely *diverged* is still stored, because there
 the on-disk copy is the truth.
 
@@ -39,51 +37,153 @@ the on-disk copy is the truth.
 
 Lazy runs its own machine-generated `claude -p` one-shots — the PR/commit
 fidelity summaries on every accept, `lazy report`, and LLM memory compaction.
-These are housekeeping, not conversations, and they were ~83% of the store,
-drowning real builder conversations in `lazy builder list` and search. They are
-now **never** captured, by either path.
+These are housekeeping, not conversations, and would drown real builder
+conversations in `lazy conversations` and search. They are **never** captured,
+by either path.
 
-They are identified by a marker that `runClaudeOneshot` prepends to the prompt,
-so the session JSONL carries it durably (see `src/import/machine-oneshot.ts`).
-Detection is structural — marked at the source, not sniffed from prompt wording —
+They are identified by a marker that lazy's one-shot runner prepends to the
+prompt, so the session JSONL carries it durably. Detection is structural — marked at the source, not sniffed from prompt wording —
 so a real conversation that merely *discusses* the marker is still captured.
 
-The end-of-pairing session summary (`lazy pair`) is marked the same way, even
-though it goes through `runClaude` rather than `runClaudeOneshot` — its output
+#### Local-command transcripts
+
+Running a built-in slash command — `/clear`, `/model`, `/compact`, `/login` —
+makes Claude Code write three kinds of message into the session log: a fixed
+caveat telling the model to ignore what follows, the command invocation itself,
+and whatever the command printed. Nobody said any of it, so none of it is
+conversation, and it is dropped when a session is read.
+
+Two things follow. A session made of nothing but local commands — the usual
+shape, because `/clear` opens a fresh log and typing `/clear` again ends it — has
+no content left and is never stored at all. A real conversation that merely
+*starts* with a `/clear` is stored as it always was, minus the boilerplate, so
+its one-line summary is the first thing you actually said instead of the caveat.
+
+The line is drawn at "did a human type it". A command whose arguments carry your
+own words (`/compact keep the focus on last night's run`) is kept, and so is any
+message that merely quotes one of these wrappers while discussing it. Matching is
+on Claude Code's own tags, never on the caveat's wording, so a reworded caveat
+means a message is kept rather than silently dropped.
+
+**Only Claude Code's own built-in commands count as boilerplate.** Your project's
+slash commands are kept, even when you invoke one with no arguments — `/deploy`
+on its own stays in the transcript. Claude Code writes a custom command exactly
+the way it writes `/clear`, so there is no way to tell them apart by shape, and
+the invocation is usually the line that explains why the next fifty messages
+happened. If a built-in ever turns up in a transcript, that is the same rule
+erring the safe way: lazy keeps anything it does not recognise.
+
+One thing is *not* filtered: `/context` writes its report as an ordinary message
+with no wrapper around it, so there is nothing to match on that a human could not
+also have typed, and those still appear.
+
+##### Cleaning up conversations stored before this filter existed
+
+Filtering happens as a session is read, so conversations captured earlier still
+carry the boilerplate — they still list the caveat where your first sentence
+should be. `lazy doctor` warns when it finds any, and one flag cleans them:
+
+```
+lazy doctor --clean-local-command-conversations              # lists, changes nothing
+lazy doctor --clean-local-command-conversations --dry-run    # lists and stops
+lazy doctor --clean-local-command-conversations --yes        # applies
+```
+
+It prints every conversation it would touch — short session ID, start time, how
+many scaffolding messages it would drop, the summary it has today and the one it
+would get — and then, on a terminal, asks; the default is **no**, and a non-TTY
+is told to re-run with `--yes`. Nothing runs on its own, ever.
+
+Each conversation is put back through today's reader, so the result is exactly
+what importing that session fresh would produce: the scaffolding messages go, the
+summary becomes the first thing you actually said, and everything else — your
+messages, the assistant's replies, the token totals — is untouched.
+
+**On its own it deletes nothing.** Some stored rows are nothing *but*
+scaffolding (a caveat and a `/clear`, with no conversation around it) — a
+listing entry with no conversation behind it. Those are listed so you can see
+how many there are, and then left exactly as they are.
+
+If you want them gone, ask for it explicitly:
+
+```
+lazy doctor --clean-local-command-conversations --delete-empty-local-command-conversations
+```
+
+Only rows whose *every* stored message is scaffolding are deleted; a
+conversation with one real message in it is cleaned, never removed. The flag is
+never implied by `--yes`, and the deletion is confirmed separately from the
+cleanup — approving the rewrite is not approving a delete. Each row is listed
+first with its short session ID and start time, on a terminal the question
+defaults to **no**, and without a terminal and without `--yes` the command
+refuses rather than guessing.
+
+Deletion is permanent as far as lazy is concerned, and one thing is worth
+knowing before you say yes: a deleted row is **not** brought back by `lazy
+doctor --reimport-conversations` even if its raw Claude JSONL is still on disk,
+because today's reader drops that session as empty — which is the whole reason
+it is not worth keeping.
+
+### Other sessions lazy does not capture
+
+The end-of-pairing session summary (`lazy pair`) carries the same marker, even
+though it goes through a supervised turn rather than a machine one-shot — its output
 already lands on the task as a turn, so capturing the session too is noise.
 
-Deliberately-skipped one-shots never count as uncaptured, so the capture-rot
-check below stays honest instead of going red after every accept.
+Deliberately-skipped one-shots never count as uncaptured, so the `lazy doctor`
+capture check below does not go red after every accept.
 
-### One-shots are also excluded from session *ownership*
+### One-shots never become your resume target
 
-Skipping capture is only half of it. `runClaudeOneshot` inherits the daemon's
-cwd, so a one-shot's JSONL lands in the very projects dir that every
-"which session was this launch running?" rule scans — and, being brand new, it
-is by construction the newest file *created since launch*. That is the whole of
-`pickLaunchSessionId` and rule 1 of `pickActiveSessionFile`.
+Lazy also ignores its own one-shots when working out which Claude session a
+builder, `lazy pair` or `lazy chat` launch was running, and when `lazy watch`
+picks the session to follow. Without that, a housekeeping summary fired by an
+accept during your builder session could become the newest session file and be
+offered as the `lazy builder --resume <id>` target — reopening the housekeeping
+conversation instead of yours. Files lazy cannot read, or that carry no marker,
+are treated as real sessions: a redundant capture costs nothing, while losing
+your resume target costs the session.
 
-The consequence, if the ownership rules do not filter: a fidelity summary fired
-by an accept made *during* a builder or `lazy pair` session wins "newest session
-this launch owns". Its id is stamped as the resume target and printed as
-`lazy builder --resume <id>`, so the next builder opens **inside** the
-housekeeping conversation — the human's terminal shows the fidelity prompt as a
-user turn and answers it. That is a real incident, not a hypothetical.
+### Where a one-shot runs
 
-So every ownership and capture path filters with the same head-anchored
-predicate that discovery uses (`excludeMachineOneshots` in
-`src/import/machine-oneshot.ts`):
+Every machine one-shot runs in a **throwaway container** from the project's
+agent image — the same isolation as a supervised task turn (proxy, placeholder
+credentials, audit log). Nothing agent-shaped runs on the host.
 
-- `detectBuilderLaunchSessionId` (host-side builder recovery)
-- `detectInteractiveSessionId` (`lazy pair` / `lazy chat`)
-- `getSessionFileTimes` → `pickActiveSessionFile` (in-container supervisor)
-- `snapshotSessionFiles` / `captureNewOrModifiedConversations`, whose
-  `newestSessionId` callers use as the resume target
+- Accept's merge-description summary and memory compaction get **no repository
+  mount at all**, so they cannot write to the branch being merged.
+- `lazy ask` and `lazy report` get the project root mounted **read-only**, so
+  the agent can read the tree but cannot write into it.
 
-Discovery itself stays honest — it reports what is on disk; the ownership paths
-filter. Unreadable or unmarked files are **kept** (treated as real sessions),
-which is the safe direction: a redundant capture costs nothing, handing a
-human's resume target to housekeeping costs the session.
+Session state lands in a lazy-owned agent state directory (the `.claude` tree
+for Claude Code, `.cursor` for Cursor) at
+`~/.lazy/oneshot/<project-slug>/<config-dir>`, mounted into the container — not
+your real `~/.claude` or `~/.cursor`, and not the daemon directory that holds
+lazy's tokens and credentials. The directory is stable per project, so one-shots
+do not leave a new `~/.claude/projects/` entry behind each time. Set
+`LAZY_ONESHOT_BASE_DIR` to relocate the base for every project at once. Write
+tools are disallowed.
+
+Docker must be available — a one-shot fails loud with actionable guidance if the
+runner cannot launch a container; there is no silent fallback to a host spawn.
+
+### How long a one-shot may run
+
+Every machine one-shot is bounded: a run is killed after ten minutes with an
+error that says so. A one-shot is a single model call — one prompt, one answer,
+no tools to wait on — so ten minutes only ever elapses on a call that is never
+going to answer, which is what an unreachable proxy or API endpoint looks like
+from the inside. The bound keeps an accept from hanging in `merging` and keeps
+`lazy report`, `lazy ask` and `lazy memory compact` from hanging your terminal.
+
+A timed-out run's container is removed, so it cannot linger. Each command then
+handles the failure the way it handles missing authentication: memory compaction
+falls back to mechanical compaction (and in `--llm` mode fails while naming that
+alternative), a `lazy report` map unit is listed as a failed unit and the digest
+is composed without it, and a `lazy ask` excerpt becomes a warning on an answer
+built from the rest. A timeout in a *reduce* pass — the single call that
+composes the final answer — fails the command, because there is nothing left to
+degrade to.
 
 ### Purging housekeeping conversations captured before the marker
 
@@ -103,8 +203,8 @@ a non-TTY is told to re-run with `--yes`. Deletion is not recoverable from lazy
 (Claude Code prunes the raw JSONL on disk over time), so read the list.
 
 This is the only place in lazy that classifies a conversation by sniffing
-prompt wording (`src/import/housekeeping-conversation.ts`). That brittleness is
-acceptable *here* precisely because the command is explicit, human-reviewed, and
+prompt wording. That is acceptable
+*here* because the command is explicit, human-reviewed, and
 one-time, where at capture time — running forever, on every sweep tick — it
 would not be. Every rule is anchored at the very start of the conversation's
 single user message, so a real conversation that quotes a lazy prompt is never
@@ -115,7 +215,9 @@ A caveat worth knowing: because these conversations have no marker on disk,
 still present. Purge is about cleaning up the store, not about rewriting what is
 on disk.
 
-If the daemon is not running, the second path is not running either — the
+### When live capture is not running
+
+If the daemon is not running, its host-side sweep is not running either — the
 sessions stay on disk until a daemon is up or you import them manually.
 `lazy doctor` fails (not warns) when it finds sessions from the last 24 hours
 that never reached the store, because that means live capture is broken *now*:
@@ -128,6 +230,32 @@ that never reached the store, because that means live capture is broken *now*:
 
 Sessions written in the last few minutes are treated as in flight, not as
 failures — the sweep may simply not have ticked yet.
+
+### What a builder session tells you when its capture failed
+
+The first path runs on a 30-second timer inside the builder's container, where
+its only voice is a log file you are not watching. So when a builder session
+ends, it prints on your terminal what went wrong — once, after the Claude Code
+interface is gone:
+
+```
+Conversation capture failed during this session — some or all of this session's
+history may not be in the lazy store, and `lazy upgrade` may not be able to
+resume it:
+  [builder] Incremental capture failed: Unable to connect. Is the computer able
+  to access the url? [ConnectionRefused]
+Check `lazy daemon status`, then `lazy doctor` for details.
+`lazy doctor --reimport-conversations` can re-import from the session files on disk.
+```
+
+Each *distinct* reason is listed once, however many times it recurred. Beyond
+the first five the report says how many more it is not showing rather than
+truncating silently, and the full list is in that session's supervisor log.
+
+Reasons carry the machine detail as well as the prose — the error code, and the
+underlying error when one was wrapped. Without it the most common failure of all
+reads as "unable to connect" with no address and no reason, which is not enough
+to tell a wrong port from an unreachable host.
 
 ## One surface: `lazy import-conversation`
 
@@ -149,8 +277,7 @@ lazy import-conversation --show bc77e1b1     # Show a full conversation transcri
 Discovery spans **every** Claude projects dir for this repo:
 
 - the shared `~/.claude/projects/<encoded-repo>/` dir, and
-- the per-builder isolation dirs under `<data>/builder-projects/<id>/`
-  (see `src/builder/projects-isolation.ts` for the layout).
+- each builder's own isolated projects dir, under lazy's data directory.
 
 When the same session appears in several dirs (seeding copies a session into
 each isolation dir), the most complete copy is used (largest size, newest
@@ -160,8 +287,8 @@ importable — both in bulk and by session-id.
 Not to be confused with `lazy builder --resume <id> --import`, which is a
 different operation entirely: it decides which projects dir a *builder launch*
 mounts (adopting a session that has never run under builder isolation), and
-writes nothing to lazy's store. See "One `/resume` list per project" in
-[lazy-agent design](./lazy-agent-design.md). Importing a conversation here never affects which
+writes nothing to lazy's store. See [One `/resume` list per project](./lazy-agent-design.md#one-resume-list-per-project-builder-session-isolation) in
+lazy-agent design. Importing a conversation here never affects which
 sessions `/resume` lists, and adopting a session there never imports it.
 
 ### Bulk import never writes silently
@@ -191,10 +318,10 @@ silence, and naming one explicitly says so instead of "session not found".
 `lazy doctor --reimport-conversations` is an alias for the bulk path of
 `lazy import-conversation` — same multi-root discovery, dedupe, preview, and
 confirmation. It exists as a recovery entry point for stranded builder
-conversations (the fallout of a capture bug that left conversations on disk but
-out of the store). The `lazy doctor` health sweep also *detects* conversations
+conversations (sessions that are on disk but never reached
+the store). The `lazy doctor` health sweep also *detects* conversations
 on disk but not in the store — a warning for old ones, a failure for recent ones
-(see "Live capture" above) — and points at this command; detection is
+(see [When live capture is not running](#when-live-capture-is-not-running)) — and points at this command; detection is
 report-only and never writes.
 
 ```bash
@@ -202,15 +329,112 @@ lazy doctor --reimport-conversations          # Preview, then confirm
 lazy doctor --reimport-conversations --yes    # Recover without prompting
 ```
 
-## Using what is stored: `lazy ask <conversation-id>`
+## Using what is stored
 
 Claude Code's own retention ages old sessions out of `/resume`; lazy's store
-keeps them. Reading one back has always worked (`lazy show <session-id>`,
-`lazy builder list`, `lazy search --conversations`) — `lazy ask` is the verb for
-asking one a question instead of reading the whole thing:
+keeps them. Browse them from the terminal:
+
+```bash
+lazy conversations                              # list (newest first)
+lazy conversations search "design decision"       # search message content
+lazy conversations show 4f8c2a1b                  # read one in full
+```
+
+`lazy builder list` shows the same table (first prompt column); `lazy show
+<session-id>` still works too. For structured search across the whole project,
+`lazy search --conversations` and `lazy search 'in:conversations <text>'` also
+reach conversation bodies.
+
+### In the browser
+
+The daemon's web UI serves the same conversations under **Conversations** in the
+nav (the dashboard's address is printed by `lazy daemon status`):
+
+- **`/conversations`** — every captured conversation, newest first: session id,
+  start and end, how many turns came from you and from the builder, and the
+  summary. The search box takes the same pattern `lazy conversations search`
+  does and shows the matching passages inline, so you can tell from the results
+  which conversation you meant before opening it. A pattern the engine
+  rejects — a typo, or one that takes too long to evaluate — is named on
+  the page; the box keeps what you typed.
+- **`/conversations/<session-id>`** — one conversation, read as a dialogue.
+  Long transcripts are paged 40 messages at a time with **Earlier** / **Later**
+  links. A short id works here too, as long as it is unique; an ambiguous one is
+  refused rather than resolved to a guess.
+
+Conversations are captured, never authored here: nothing you do on these pages
+edits a transcript. The one thing they let you *create* is a task, from part of
+a transcript — see below. Everything works with JavaScript turned off. Lazy
+Teams shows the same two pages for a project, so the record reads the same
+either way.
+
+The **Conversations** nav entry carries a badge counting what has been captured
+since you last opened the listing. That mark lives in your browser rather than
+in the store — conversations have no read state — so each browser counts for
+itself; see [the nav counts](web-review.md#the-nav-counts).
+
+### Turning part of a conversation into a task
+
+Decisions get made in a builder session and then have to be typed out again as a
+task. They don't. Promote the exchange instead — in the browser or from the
+terminal — and you get a **backlog task seeded with those messages, verbatim**,
+which you edit before anything is created.
+
+You always name a **range of messages**, never the whole conversation: a session
+runs to hundreds of messages across unrelated topics, so a task seeded from all
+of it says everything and means nothing. Messages are numbered from 1, and both
+surfaces show the numbers.
+
+In the browser, open the conversation and use **Start here** on the first
+message of the exchange and **End here** on the last. The selected run is
+highlighted and a form appears with:
+
+- **Goal** — the first sentence of what *you* said in that range
+- **Code** — derived from the goal; edit it or clear it
+- **Parent task** — a task id or code to file the new task under; leave it empty
+  for a top-level task
+- **Prompt** — the selected messages verbatim, plus a line saying which
+  conversation and which messages they came from
+
+**In Lazy Teams**, the same **Start here** / **End here** links are on a
+conversation, and the form is the same four fields with one difference: they
+start **empty**, and each says what it falls back to. Leave a field alone and
+that default is used — the goal from what you said, a code from the goal, the
+prompt from the messages themselves — so promoting there is two clicks and a
+button. Type in a field only to override it. Teams also cannot warn you about an
+overlap up front the way the single-project browser does; it tells you which
+other task shares those messages once the new one is created.
+
+From the terminal:
 
 ```
-lazy builder list                                   # find the session id
+lazy conversations show 3f9a01b2          # message numbers are in the transcript
+lazy conversations promote 3f9a01b2 --from 12 --to 18
+```
+
+That prompts for the goal, code and parent, then opens `$EDITOR` on the seeded
+prompt. Everything that can fail — an unknown session id, a range the transcript
+does not have, a range already promoted — is checked *before* the editor opens,
+so you never type a brief and lose it to a validation error. `--goal`, `--code`
+and `--parent` set fields up front; `--yes` takes the seeded text unedited
+(scripts and non-interactive shells get this automatically).
+
+**The new task is created in the backlog and never started** — promoting writes
+the task down, starting the work stays your call.
+
+**Promoted twice? You'll see it.** Each promoted task records which conversation
+and which messages it came from, so the transcript page lists what has already
+been promoted out of it, and a selection that overlaps an earlier one says so
+before you submit. Promoting the *exact same* range twice is refused, naming the
+task that already exists. A long conversation legitimately yields several tasks,
+so overlapping ranges are allowed — just never by accident.
+
+### Asking instead of reading: `lazy ask <conversation-id>`
+
+When you want an answer rather than the whole transcript, use `lazy ask`:
+
+```
+lazy conversations                                # find the session id
 lazy ask 4f8c2a1b -m "what did we decide about retention?"
 lazy ask 4f8c2a1b                                   # no -m: opens $EDITOR
 lazy ask 4f8c2a1b -m "..." --json                   # structured answer

@@ -2,7 +2,7 @@
  * LocalDriver — the default RepositoryDriver implementation.
  *
  * Performs squash merges locally. All remote-oriented methods (push, comments,
- * turn summaries, cleanup) are no-ops since there is no remote to talk to.
+ * body refresh, cleanup) are no-ops since there is no remote to talk to.
  */
 
 import type {
@@ -18,9 +18,11 @@ import type {
   HealthCheck,
   DriverConfigOptions,
   AcceptGateWarning,
+  MarkReadyOptions,
+  OpenReview,
 } from './driver';
 import type { Task } from '../types';
-import { checkMergeConflicts, checkMergeConflictsIntoTarget, squashMergeTaskBranch } from '../git/operations';
+import { checkMergeConflicts, checkMergeConflictsIntoTarget, squashMergeTaskBranch, branchChangesAlreadyIn } from '../git/operations';
 import type { DestinationRestoreConflict } from '../git/operations';
 import { runGit } from '../utils/git';
 
@@ -33,7 +35,16 @@ export class LocalDriver implements RepositoryDriver {
   }
 
   async merge(opts: MergeOptions): Promise<MergeResult> {
-    const { sourceBranch, targetBranch, task, taskShortId, root, fidelityBody } = opts;
+    const { sourceBranch, targetBranch, task, taskShortId, root, fidelityBody, resume } = opts;
+
+    // Resume of a dead accept: if merging the branch would change nothing, the
+    // squash already landed. Asked of the TREES, never of a tag or marker, so an
+    // unrelated accept landing into the same parent in between does not change
+    // the answer. A fresh accept never takes this path: there a no-op squash
+    // still means a net-empty branch and is refused below.
+    if (resume && await branchChangesAlreadyIn(sourceBranch, targetBranch, root)) {
+      return { status: 'merged', alreadyLanded: true };
+    }
 
     // Check for merge conflicts
     // Use the appropriate check based on whether we're merging to main (HEAD) or a specific target
@@ -69,9 +80,12 @@ export class LocalDriver implements RepositoryDriver {
     try {
       restoreConflict = await squashMergeTaskBranch(sourceBranch, targetBranch, taskShortId, task.goal, root, fidelityBody);
     } catch (err) {
+      // Pass the underlying message through. Re-wrapping as "Merge failed: …"
+      // on top of an already-complete error produced the triple-nested
+      // "Merge failed: Merge failed: Squash merge failed: …" the human saw.
       return {
         status: 'failed',
-        error: `Merge failed: ${err instanceof Error ? err.message : err}`,
+        error: err instanceof Error ? err.message : String(err),
       };
     }
 
@@ -116,9 +130,14 @@ export class LocalDriver implements RepositoryDriver {
     return { success: true };
   }
 
+  upstreamRefName(parentBranch: string): string {
+    // No remote — the local branch IS the upstream ref.
+    return parentBranch;
+  }
+
   async resolveUpstreamRef(parentBranch: string, _worktreePath: string): Promise<string> {
     // No remote — use the local branch as-is
-    return parentBranch;
+    return this.upstreamRefName(parentBranch);
   }
 
   async publishBranch(_opts: { branch: string; targetBranch: string; task: Task }): Promise<PublishResult> {
@@ -126,12 +145,28 @@ export class LocalDriver implements RepositoryDriver {
     return {};
   }
 
-  async markReadyForReview(_task: Task): Promise<{ metadata?: Record<string, string> }> {
+  async markReadyForReview(_task: Task, _opts?: MarkReadyOptions): Promise<{ metadata?: Record<string, string> }> {
     // No-op for local driver
     return {};
   }
 
-  async syncComments(_task: Task, _since: string): Promise<RemoteComment[]> {
+  async remoteBranchHead(_branch: string): Promise<string | null> {
+    return null;
+  }
+
+  async findOpenReviewForBranch(_branch: string): Promise<OpenReview | null> {
+    return null;
+  }
+
+  async getReviewBase(_task: Task): Promise<string | null> {
+    return null;
+  }
+
+  async retargetReview(_task: Task, _base: string): Promise<void> {
+    throw new Error('The local driver has no forge, so there is no PR/MR to retarget.');
+  }
+
+  async syncComments(_task: Task, _since?: string): Promise<RemoteComment[]> {
     return [];
   }
 
@@ -139,22 +174,13 @@ export class LocalDriver implements RepositoryDriver {
     return null;
   }
 
-  async postTurnSummary(_task: Task, _content: string): Promise<void> {
-    // No-op for local driver
-  }
-
   async updateRemoteBody(_task: Task, _summary: string): Promise<void> {
     // No-op for local driver — there is no remote body. The synthesized
     // summary reaches the local squash commit via MergeOptions.fidelityBody.
   }
 
-  async postAcceptReview(_task: Task, _reason: string): Promise<string | null> {
-    // No-op for local driver — no remote to post reviews to
-    return null;
-  }
-
-  async postRejectReview(_task: Task, _reason: string): Promise<string | null> {
-    // No-op for local driver — no remote to post reviews to
+  async approveForMerge(_task: Task, _reason: string): Promise<string | null> {
+    // No-op for local driver — no remote to approve on
     return null;
   }
 
@@ -215,28 +241,12 @@ export class LocalDriver implements RepositoryDriver {
     throw new Error('Sync requires a remote driver. Configure it with: lazy init');
   }
 
-  getLastCommentSyncedAt(_task: Task): string | undefined {
-    return undefined;
-  }
-
-  commentSyncedAtKey(): string {
-    return 'remote_last_comment_synced_at';
-  }
-
-  getLastPostedTurnSeq(_task: Task): number {
+  getLastFidelityTurnSeq(_task: Task): number {
     return -1;
   }
 
-  postedTurnSeqKey(): string {
-    return 'remote_last_posted_turn_seq';
-  }
-
-  getLastPostedNoteAt(_task: Task): string | undefined {
-    return undefined;
-  }
-
-  postedNoteAtKey(): string {
-    return 'remote_last_posted_note_at';
+  fidelityTurnSeqKey(): string {
+    return 'remote_fidelity_turn_seq';
   }
 
   getLastCIFailureSynced(_task: Task): string | undefined {

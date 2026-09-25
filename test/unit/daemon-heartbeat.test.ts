@@ -39,6 +39,23 @@ const SLOW_OP_MS = 16_000;
 /** Heartbeat cadence for the harness, scaled to TEST_IDLE_TIMEOUT_S the way production is to 120s. */
 const TEST_HEARTBEAT_MS = 1_000;
 
+/**
+ * Poll until `predicate` holds, or throw with `what` on timeout.
+ *
+ * Used instead of "sleep long enough and hope": a fixed sleep that is too short
+ * fails a correct daemon, and one that is long enough to be safe pads every run.
+ * Throwing (rather than returning false) keeps a never-satisfied condition from
+ * looking like a pass.
+ */
+async function waitUntil(predicate: () => boolean, timeoutMs: number, what: string): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await Bun.sleep(25);
+  }
+  throw new Error(`${what} (within ${timeoutMs}ms)`);
+}
+
 const servers: { stop(closeActiveConnections?: boolean): void }[] = [];
 
 afterEach(() => {
@@ -292,16 +309,39 @@ describe('daemon heartbeat envelope', () => {
   // inside a ReadableStream `start()`, and the question "does Bun.serve tear
   // that down when the socket closes?" has to be answered by a real socket.
   test('a client abort mid-operation does not cancel the daemon-side work', async () => {
-    const WORK_MS = 2_000;
+    // "Mid-flight" is established by an explicit gate, never by wall-clock: the
+    // handler's work cannot finish until the test releases it, so the
+    // pre-abort `completed === false` assertion is a fact rather than a race.
+    // A `Bun.sleep(2s)` in the handler made it a race — on a starved event loop
+    // (the whole suite runs ~45s of real sockets) the sleep could elapse before
+    // the client had even read the preamble, and the test failed asserting that
+    // work which correctly ran had not yet run. That flake said nothing about
+    // the invariant, which is only ever about what happens AFTER the abort.
+    let releaseWork!: () => void;
+    const workGate = new Promise<void>(resolve => { releaseWork = resolve; });
     let completed = false;
-    let sawEnqueueFailure = false;
+
+    // What "nothing threw out of the handler" actually means: the enqueues that
+    // run AFTER the socket is gone (heartbeat timer, progress, the final result
+    // line) are wrapped in try/catch by design, so an escaping throw would land
+    // here as an uncaught error and take the daemon with it. Observed directly —
+    // the previous spelling watched the CLIENT's `reader.cancel()` promise, which
+    // measures the client's own fetch implementation and not the daemon at all
+    // (on Bun 1.4 cancelling an already-aborted body rejects with AbortError,
+    // which is correct client behaviour and said nothing about this invariant).
+    const escaped: unknown[] = [];
+    const onUncaught = (err: unknown) => { escaped.push(err); };
+    process.on('uncaughtException', onUncaught);
+    process.on('unhandledRejection', onUncaught);
+
+    let cancelRejection: unknown;
 
     const server = Bun.serve({
       port: 0,
       idleTimeout: TEST_IDLE_TIMEOUT_S,
       fetch: () => heartbeatEnvelopeResponse(
         async () => {
-          await Bun.sleep(WORK_MS);
+          await workGate;
           completed = true;
           return { status: 200, body: { merged: true } };
         },
@@ -321,15 +361,117 @@ describe('daemon heartbeat envelope', () => {
     const reader = response.body!.getReader();
     await reader.read();
     controller.abort();
-    await reader.cancel().catch(() => { sawEnqueueFailure = true; });
+    // Releasing the client's grip on a body the abort already errored is a
+    // client-side no-op whose promise may resolve or reject depending on the
+    // fetch implementation; neither outcome is what is under test, so the
+    // rejection is only held (checked loosely at the end), never asserted on.
+    await reader.cancel().catch((err: unknown) => { cancelRejection = err; });
 
-    // The work was mid-flight at abort time and must still finish.
+    try {
+      // The work was mid-flight at abort time — guaranteed, the gate is shut —
+      // and must still finish once released, with nobody left to deliver to.
+      expect(completed).toBe(false);
+      // Hold the gate shut across several heartbeat intervals so the timer
+      // really does attempt enqueues into a stream whose socket is gone — that
+      // is the write the handler must swallow, and with no wait here the test
+      // could go green without a single post-abort enqueue being tried. Unlike
+      // the wall-clock this test used to depend on, a longer wait here is only
+      // ever safer: it adds attempts, it cannot invalidate an assertion.
+      await Bun.sleep(1_000);
+      releaseWork();
+      await waitUntil(() => completed, 10_000, 'daemon-side work never completed after client abort');
+      // ...and every post-abort write must still have been swallowed by the
+      // handler, because there is no one left to report them to. Give the
+      // wrapper's post-`produce()` enqueue/close a beat to run and any escaping
+      // rejection a beat to surface before concluding nothing escaped.
+      await Bun.sleep(500);
+      expect(escaped).toEqual([]);
+      // The hang-up must be OUR hang-up and nothing else. Aborting errors the
+      // response stream with the signal's reason, so cancelling the reader
+      // afterwards rejects with that `AbortError` (streams spec; observed on Bun
+      // 1.4.2 — Bun 1.3.14 resolved instead, so both outcomes are accepted). Any
+      // other rejection means the connection died of something this test did not
+      // cause, which would make the assertions above prove less than they claim.
+      // Daemon-side enqueue failures never reach here at all: they are swallowed
+      // inside `heartbeatEnvelopeResponse`, where there is nobody left to report
+      // them to — that swallowing is what lets the work above run to completion.
+      const cancelOutcome = cancelRejection === undefined
+        ? 'resolved'
+        : (cancelRejection as Error)?.name ?? String(cancelRejection);
+      expect(['resolved', 'AbortError']).toContain(cancelOutcome);
+    } finally {
+      process.off('uncaughtException', onUncaught);
+      process.off('unhandledRejection', onUncaught);
+    }
+  }, 20_000);
+
+  // INVARIANT: the request's own AbortSignal is for TRACING ONLY — wiring it
+  // into cancellation is the regression this guards.
+  //
+  // The case above hangs up without handing the wrapper a signal, so it can only
+  // observe that Bun.serve does not tear the stream's `start()` down. But every
+  // production call site passes `{ signal: req.signal }` (src/daemon/server.ts),
+  // and that signal is the single input a cancellation regression would arrive
+  // through — racing `produce()` against it, or forwarding it into the work, is
+  // a two-line change that the signal-less case cannot see. So this case wires
+  // the signal in exactly as production does and aborts it mid-flight.
+  test('an aborted request signal is traced, not honoured as cancellation', async () => {
+    // Gated, not timed — same reasoning as the case above: "the work is still
+    // in flight when the signal fires" must be arranged, not hoped for.
+    let releaseWork!: () => void;
+    const workGate = new Promise<void>(resolve => { releaseWork = resolve; });
+    let completed = false;
+
+    const controller = new AbortController();
+    const server = Bun.serve({
+      port: 0,
+      idleTimeout: TEST_IDLE_TIMEOUT_S,
+      fetch: () => heartbeatEnvelopeResponse(
+        async () => {
+          await workGate;
+          completed = true;
+          return { status: 200, body: { merged: true } };
+        },
+        // Same shape as every production route.
+        { intervalMs: 200, signal: controller.signal },
+      ),
+    });
+    servers.push(server);
+
+    const response = await fetch(`http://localhost:${server.port}/slow`, {
+      headers: heartbeatRequestHeaders(),
+    });
+    const reader = response.body!.getReader();
+    await reader.read();
+
+    // Fire the signal the wrapper was handed, mid-work, then let the work run.
+    // Releasing AFTER the abort is what makes this a cancellation test: if the
+    // wrapper raced `produce()` against the signal, the envelope would have
+    // already terminated with an abort-shaped result by the time the work
+    // finishes, and the last-line assertion below would catch it.
     expect(completed).toBe(false);
-    await Bun.sleep(WORK_MS + 1_000);
+    controller.abort();
+    releaseWork();
+
+    // This case aborts only the SIGNAL, not the fetch, so the socket is still
+    // open and the envelope is still readable. That is deliberate: it lets the
+    // assertion be about what the wrapper DELIVERS, which is the only thing that
+    // actually distinguishes "traced" from "honoured". Asserting merely that the
+    // work ran to completion would not — `produce()` keeps running and sets its
+    // own flag even when the wrapper has already abandoned it to a race.
+    const decoder = new TextDecoder();
+    let buffered = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffered += decoder.decode(value, { stream: true });
+    }
+    const lines = buffered.trim().split('\n').map(l => JSON.parse(l) as Record<string, unknown>);
+
+    // The work finished, and its real result — not an abort-shaped error — is
+    // what the envelope terminated with.
     expect(completed).toBe(true);
-    // Nothing above should have thrown out of the handler; enqueue failures are
-    // swallowed by design (there is no one left to report them to).
-    expect(sawEnqueueFailure).toBe(false);
+    expect(lines.at(-1)).toEqual({ status: 200, body: { merged: true } });
   }, 20_000);
 
   test('framing is opt-in: a request without the header gets plain JSON', async () => {

@@ -43,9 +43,34 @@
  * is the upstream 401/403 the audit proxy already sees on every request. What
  * this gate owns is the cheap, offline, deterministic half: a credential must
  * be present and non-blank (see `credentialFromEnv`).
+ *
+ * WHICH credential, though? Not "an Anthropic token, always". The gate resolves
+ * the AGENT PROFILE each role defaults to (`[models.roles.<role>] agent`, else
+ * `[agent] agent_id`, else the built-in `claude-code` profile) into the set of
+ * PROVIDERS those profiles actually need, and demands a credential for exactly
+ * those. A default profile on a local model server needs none and is let
+ * through; a mixed setup still needs its Anthropic token. Widening the skip to
+ * "any local endpoint anywhere in the config" would be the wrong fix — it would
+ * wave through the mixed case this gate exists to catch.
+ *
+ * PRESENCE IS READ FROM THE INDEX, NEVER THE SECRET. A credential in the store
+ * counts, but the gate answers "is there one?" from the non-secret
+ * `credential-index.json`, not by opening a keychain item. That matters: the
+ * daemon usually starts DETACHED from any GUI session, and touching a macOS
+ * Keychain item there can block on an unlock prompt nobody can answer. The
+ * secret itself is read once, later, by `hydrateCredentialEnv`.
  */
 
 import { loadConfig } from '../config/loader';
+import {
+  type Provider,
+  envVarsFor,
+  credentialHowToGet,
+  credentialLabel,
+  requiredProviders,
+} from '../credentials/providers';
+import { credentialAvailable } from '../credentials/store';
+import { localModelProfileAdvice } from '../config/agent-profile-advice';
 
 /** Env vars that can carry the model credential, in precedence order. */
 const CREDENTIAL_ENV_VARS = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'] as const;
@@ -79,26 +104,60 @@ export function credentialFromEnv(env: NodeJS.ProcessEnv = process.env): string 
  * notably `lazy upgrade`, which must not stop and rebuild anything only to be
  * refused a daemon at the very end — use this and decide for themselves.
  *
- * The check is env-based and process-local, so a preflight in the CLI process
- * that will later spawn the daemon (the daemon child inherits `process.env`) is
- * exactly equivalent to the gate the child will run.
+ * The check reads this process's environment and the project's credential index,
+ * both of which the daemon child sees identically (it inherits `process.env` and
+ * reads the same store), so a preflight in the CLI process that will later spawn
+ * the daemon is exactly equivalent to the gate the child will run.
  *
- * Mirrors the runner's existing auth logic: when `[ollama]` is enabled the
- * daemon uses local dummy credentials and needs no Anthropic token, so the gate
- * is skipped in that case.
+ * Mirrors the runner's existing auth logic: a profile pointed at a local model
+ * server declares `credential = "none"` and needs no Anthropic token, so a
+ * project whose default profiles are all local requires nothing and passes.
  *
- * @param projectRoot - Project root (used to read lazy.toml for the ollama flag)
+ * @param projectRoot - Project root (its lazy.toml resolves the role profiles,
+ *                      its credential index answers store presence)
  */
 export async function checkDaemonCredentials(projectRoot: string): Promise<string | null> {
   const config = await loadConfig(projectRoot);
 
-  // Ollama-backed setups talk to a local model with dummy credentials — no
-  // Claude/Anthropic token is required, matching runner.checkAvailability().
-  if (config.ollama.enabled) return null;
+  const missing: Provider[] = [];
+  for (const provider of requiredProviders(config)) {
+    if (!(await credentialAvailable(projectRoot, provider))) missing.push(provider);
+  }
+  if (missing.length === 0) return null;
 
-  if (credentialFromEnv()) return null;
+  return daemonCredentialError(missing);
+}
 
-  return DAEMON_CREDENTIAL_ERROR;
+/**
+ * The actionable refusal for a specific set of unsatisfied providers.
+ *
+ * Naming the provider is the whole point: "no credential found" sent people
+ * hunting for an Anthropic token in projects that needed a different one, or
+ * none at all. Each provider gets the env vars that would satisfy it, how to
+ * obtain one, and the `lazy auth set` command that stores it durably so the next
+ * daemon start does not depend on the shell it happened to be launched from.
+ */
+export function daemonCredentialError(providers: Provider[]): string {
+  const lines: string[] = [
+    `Daemon refuses to start: no ${providers.map(credentialLabel).join(' or ')} credential found.`,
+    '',
+    'The daemon launches task containers that inherit its credential. Without one,',
+    'every container it spawns would come up unable to reach the model API.',
+    '',
+  ];
+
+  for (const provider of providers) {
+    lines.push(`${credentialLabel(provider)} — ${credentialHowToGet(provider)}`);
+    lines.push(`  Store it (preferred, survives your shell):  lazy auth set ${provider}`);
+    lines.push(`  Or export one of:  ${envVarsFor(provider).join(', ')}`);
+    lines.push('');
+  }
+
+  lines.push(localModelProfileAdvice());
+  lines.push('');
+  lines.push('A set-but-blank value counts as absent — check for an empty export.');
+
+  return lines.join('\n');
 }
 
 /**
@@ -106,7 +165,7 @@ export async function checkDaemonCredentials(projectRoot: string): Promise<strin
  * credential. The single enforcement point — see `checkDaemonCredentials` for
  * the non-throwing form used by preflights.
  *
- * @param projectRoot - Project root (used to read lazy.toml for the ollama flag)
+ * @param projectRoot - Project root (its lazy.toml resolves the role profiles)
  */
 export async function assertDaemonCredentials(projectRoot: string): Promise<void> {
   const message = await checkDaemonCredentials(projectRoot);
@@ -114,20 +173,13 @@ export async function assertDaemonCredentials(projectRoot: string): Promise<void
 }
 
 /**
- * The actionable refusal text. Exported so callers that surface it through a
- * different channel (the startup-error marker file) emit the identical message
- * the user would have seen in their terminal.
+ * The actionable refusal text for the default (Anthropic-only) project — by far
+ * the common case. Exported so callers that surface a refusal through a
+ * different channel (the startup-error marker file, `lazy doctor`) emit the same
+ * message the user would have seen in their terminal.
+ *
+ * A project with a different provider set gets the tailored message from
+ * `daemonCredentialError`; this constant is the anthropic instance of it, not a
+ * separate string that could drift from it.
  */
-export const DAEMON_CREDENTIAL_ERROR =
-  'Daemon refuses to start: no authentication credential found in the environment.\n' +
-  '\n' +
-  'The daemon launches task containers that inherit its credential. Without one,\n' +
-  'every container it spawns would come up unable to reach the model API.\n' +
-  '\n' +
-  'Set one of these in the environment the daemon runs in, then try again:\n' +
-  '  • CLAUDE_CODE_OAUTH_TOKEN — generate with `claude setup-token`\n' +
-  '  • ANTHROPIC_API_KEY       — your Anthropic API key\n' +
-  '\n' +
-  '(If you use a local model, enable [ollama] in lazy.toml instead.)\n' +
-  '\n' +
-  'A set-but-blank value counts as absent — check for an empty export.';
+export const DAEMON_CREDENTIAL_ERROR = daemonCredentialError(['anthropic']);

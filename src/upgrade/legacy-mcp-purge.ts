@@ -46,7 +46,7 @@
 
 import { readdir, unlink } from 'fs/promises';
 import { join } from 'path';
-import { getDataDir } from '../cli/init';
+import { getDataDir } from '../project-paths';
 import { generateToken } from '../daemon/lifecycle';
 
 /**

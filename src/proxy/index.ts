@@ -1,4 +1,5 @@
-export { createProxyServer, type ProxyServerConfig, type ProxyFallbackTarget } from './server';
+export { createProxyServer, PROXY_HEALTH_PATH, type ProxyServerConfig, type ProxyFallbackTarget } from './server';
+export type { ProxyServer } from './server';
 export { AuditQueue, type AuditSink } from './audit';
 export {
   ProxyAuditLog,
@@ -21,6 +22,15 @@ export {
   type ProxyPolicyConfig,
   type PolicyDecision,
 } from './policy';
+export {
+  loadProxyRequestPlugins,
+  proxyPluginDir,
+  ProxyPluginLoadError,
+  PLUGIN_DIR_RELATIVE,
+  applyRequestPlugins,
+  type ProxyRequestPlugin,
+  type ProxyRequestContext,
+} from './plugins';
 export {
   enforceResponseBody,
   applyPolicyToMessage,

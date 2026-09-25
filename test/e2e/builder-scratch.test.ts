@@ -81,7 +81,10 @@ async function hostBuilderProbe(root: string): Promise<{
     }
   };
   return {
-    env: { PATH: `${binDir}:${process.env.PATH}` },
+    env: {
+      LAZY_ALLOW_HOST_RUNNER: '1',
+      PATH: `${binDir}:${process.env.PATH}`,
+    },
     argv: () => read(argvLog),
     scratchEnv: async () => (await read(envLog))[0] ?? '',
   };

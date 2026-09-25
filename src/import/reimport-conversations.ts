@@ -310,6 +310,61 @@ export function classifyMissingConversations(
   return out;
 }
 
+/** Missing sessions split by whether the reimport remedy can actually import them. */
+export interface MissingConversationsByImportability {
+  /** Missing from the store AND holding at least one parseable message. */
+  recoverable: MissingConversation[];
+  /**
+   * Missing from the store and un-importable: an empty JSONL shell (what
+   * reimportConversations reports as `skippedEmpty`) or a file that will not
+   * parse at all (its `errors`). No remedy can move these into the store.
+   */
+  unimportable: MissingConversation[];
+}
+
+/**
+ * Missing sessions, split by whether `lazy doctor --reimport-conversations`
+ * could actually import them.
+ *
+ * WHY this exists next to listMissingConversations: doctor used to count every
+ * miss as recoverable, tell the human to run the reimport, and then see the
+ * reimport skip the same empty shells as `skippedEmpty` — so the next sweep
+ * warned about the identical sessions, forever, with no remedy that could ever
+ * clear it. The predicate here is deliberately the SAME one reimport applies
+ * (`parseConversation(...).messages.length === 0`) rather than a size or age
+ * heuristic: a check and its remedy that disagree is the whole defect.
+ *
+ * A file that throws while parsing is un-importable too — reimport records it
+ * under `errors` and stores nothing — so it lands in the same bucket. Nothing
+ * is persisted about either verdict: it is re-derived from disk each time, so a
+ * shell that later gains content becomes recoverable again on its own.
+ *
+ * Costlier than listMissingConversations (it parses), but only for sessions
+ * that are actually missing — zero of them on a healthy machine.
+ */
+export async function listMissingConversationsByImportability(
+  opts: ReimportOptions & { storage: Storage },
+): Promise<MissingConversationsByImportability> {
+  const { storage } = opts;
+  const candidates = await discoverCandidateSessions(opts);
+  const out: MissingConversationsByImportability = { recoverable: [], unimportable: [] };
+  for (const c of candidates) {
+    if (await storage.isConversationImported(c.sessionId)) continue;
+    const entry: MissingConversation = { sessionId: c.sessionId, mtimeMs: c.mtimeMs };
+    try {
+      const conversation = await parseConversation(c.projectPath, c.sessionId, c.projectsDirRoot);
+      if (conversation.messages.length === 0) out.unimportable.push(entry);
+      else out.recoverable.push(entry);
+    } catch {
+      // Unparseable on disk: reimport would record an error and store nothing,
+      // so calling it recoverable would restart the same forever-loop. Reported
+      // as un-importable, never silently dropped.
+      out.unimportable.push(entry);
+    }
+  }
+  return out;
+}
+
 /** How many on-disk sessions are missing from the store. */
 export async function countMissingConversations(
   opts: ReimportOptions & { storage: Storage },

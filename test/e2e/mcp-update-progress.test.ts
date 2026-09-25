@@ -75,7 +75,7 @@ describe('lazy_update_progress (MCP channel)', () => {
     expect((result.message as string).length).toBe(MAX_PROGRESS_MESSAGE_LENGTH);
   });
 
-  // INVARIANT: agent-only, like lazy_commit and lazy_add_followup — the tool is
+  // INVARIANT: agent-only, like lazy_commit and lazy_raise — the tool is
   // defined relative to "the current task" and the builder has no current task.
   test('the builder session cannot post progress', async () => {
     await createTask(ctx, 'Builder has no current task');

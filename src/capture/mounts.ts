@@ -1,4 +1,5 @@
 import { isAbsolute, resolve, relative } from 'path';
+import { realpath } from 'fs/promises';
 import type { MountConfigEntry } from '../config/types';
 import { getDaemonBaseDir } from '../daemon/paths';
 import { getScratchBaseDir } from '../builder/scratch';
@@ -254,4 +255,102 @@ export function buildMountArgs(mounts: MountConfigEntry[], paths: MountPaths): s
   });
 
   return args;
+}
+
+/**
+ * `[[mounts]]` as a member's own terminal container gets them.
+ *
+ * THE RULE: a SHARED entry — a bind mount or a named volume, the same storage
+ * in every container that mounts it — reaches a member's container ONLY when
+ * the project entry itself is `readonly = true` AND the same storage is not
+ * writable to turns through anything else: another `[[mounts]]` entry, a
+ * `[docker] run_args` mount, or lazy's own read-write mounts (every task's
+ * worktree, the object store, the worktrees' gitdirs) — compared by volume
+ * name, and by host path with containment either way ({@link turnWritableIndex}). Turns of other tasks keep
+ * running while a member works (only this task's container is stopped), and
+ * they mount every entry exactly as configured: an entry without `readonly`
+ * is read-write in every one of them, so whatever a turn — prompt-injected or
+ * not — writes there (an executable in a cache, toolchain or PATH directory)
+ * appears in the member's container at once and runs beside the member's
+ * credential. Mounting it read-only on the member's side alone would stop the
+ * member writing, not the turns. An entry marked `readonly` is read-only in
+ * every task container, because the ONE launch path that applies
+ * `[[mounts]]` to a task container — launchSupervisorAsync in
+ * ./claude.ts — builds them with {@link buildMountArgs}, which honours it.
+ * (The same host directory mounted read-write by ANOTHER project's
+ * configuration is outside what one project can promise.)
+ *
+ * Anonymous volumes are the container's own and are kept as configured.
+ * `omitted` names every entry left out (`source → target`), for the launch
+ * to log and the member to be told.
+ */
+export async function buildMemberMountArgs(
+  mounts: MountConfigEntry[],
+  paths: MountPaths,
+  isTurnWritable: (storage: SharedStorage) => Promise<boolean>,
+): Promise<{ args: string[]; omitted: string[] }> {
+  const kept: MountConfigEntry[] = [];
+  const omitted: string[] = [];
+  for (const entry of mounts) {
+    const storage = sharedStorageOf(entry, paths);
+    if (storage && (!entry.readonly || (await isTurnWritable(storage)))) {
+      const from = storage.kind === 'path' ? storage.path : `volume ${storage.name}`;
+      omitted.push(`${from} → ${expandPlaceholders(entry.target, paths)}`);
+      continue;
+    }
+    kept.push(entry);
+  }
+  return { args: buildMountArgs(kept, paths), omitted };
+}
+
+/**
+ * Storage other containers can share: a host path, or a volume by name. An
+ * anonymous volume is one container's own and is not shared storage.
+ */
+export type SharedStorage = { kind: 'path'; path: string } | { kind: 'volume'; name: string };
+
+/** The shared storage a `[[mounts]]` entry mounts, or null for an anonymous volume. */
+export function sharedStorageOf(entry: MountConfigEntry, paths: MountPaths): SharedStorage | null {
+  if ((entry.type ?? 'bind') === 'volume') return entry.name ? { kind: 'volume', name: entry.name } : null;
+  let source = expandPlaceholders(entry.source as string, paths);
+  if (!isAbsolute(source)) source = resolve(paths.repoRoot, source);
+  return { kind: 'path', path: source };
+}
+
+/** The shared storage `[[mounts]]` hands every task container read-write. */
+export function turnWritableMountStorage(mounts: MountConfigEntry[], paths: MountPaths): SharedStorage[] {
+  return mounts
+    .filter((entry) => !entry.readonly)
+    .map((entry) => sharedStorageOf(entry, paths))
+    .filter((s): s is SharedStorage => s !== null);
+}
+
+/**
+ * Is `storage` something turns can write, given everything turns can write?
+ * The promise is per STORAGE, not per entry: a `readonly` entry does not make
+ * storage read-only while another entry, a `run_args` mount or lazy's own
+ * mounts give turns the same storage read-write. Volumes are compared by
+ * name; paths by resolved host path (symlinks followed where the path
+ * exists), and a path that CONTAINS writable storage, or lies INSIDE it, is
+ * writable too — either way the same files are reachable read-write.
+ */
+export async function turnWritableIndex(writable: SharedStorage[]): Promise<(storage: SharedStorage) => Promise<boolean>> {
+  const volumes = new Set(writable.flatMap((s) => (s.kind === 'volume' ? [s.name] : [])));
+  const writablePaths = await Promise.all(writable.flatMap((s) => (s.kind === 'path' ? [canonicalPath(s.path)] : [])));
+  return async (storage) => {
+    if (storage.kind === 'volume') return volumes.has(storage.name);
+    const path = await canonicalPath(storage.path);
+    return writablePaths.some((w) => isWithin(w, path) || isWithin(path, w));
+  };
+}
+
+/** The path with symlinks resolved where it exists; lexically resolved where it does not. */
+async function canonicalPath(path: string): Promise<string> {
+  try {
+    return await realpath(path);
+  } catch (err) {
+    // A path that does not exist (yet) has no links to follow.
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT' || (err as NodeJS.ErrnoException).code === 'ENOTDIR') return resolve(path);
+    throw new Error(`could not resolve mount path ${path}: ${(err as Error).message}`);
+  }
 }

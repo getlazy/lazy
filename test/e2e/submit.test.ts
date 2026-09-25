@@ -106,6 +106,11 @@ describe('lazy submit', () => {
     // Exactly what a daemon killed mid-accept leaves behind.
     setTaskStatus(ctx.root, taskId, 'merging');
     setTaskMetadata(ctx.root, taskId, 'accept_in_flight_from', 'blocked');
+    // ...after the daemon has given up resuming it. While a resume is still
+    // pending the escape refuses instead (a dead accept is resumed, never
+    // restored — see test/e2e/merging-escape.test.ts); once resumes are
+    // exhausted the escape must open, or this wedge comes back.
+    setTaskMetadata(ctx.root, taskId, 'accept_resume_attempts', '3');
 
     const submitResult = await lazy(['submit', taskId]);
     expectFailure(submitResult);
@@ -135,7 +140,7 @@ describe('lazy submit', () => {
     const existingConfig = readFileSync(configPath, 'utf-8');
     writeFileSync(configPath, existingConfig.replace('driver = "local"', 'driver = "github"'));
 
-    const submitResult = await lazy(['submit', taskId]);
+    const submitResult = await lazy(['submit', taskId, '--yes']);
     // Will fail because there's no actual remote to push to
     expectFailure(submitResult);
     // Should fail at push step, not at validation
@@ -145,6 +150,23 @@ describe('lazy submit', () => {
     // path takes ~6s. Bun's default per-test timeout is 5s, so this test must
     // opt into a longer budget or it times out mid-retry before the assertion.
   }, 20_000);
+
+  test('submit without --yes refuses on a non-TTY', async () => {
+    const taskId = await createTaskTest(lazy, 'Confirm submit', 'Need a prompt');
+    const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
+    });
+    expectSuccess(startResult);
+    await runReconcile(ctx.root);
+
+    const configPath = join(ctx.root, 'lazy.toml');
+    const existingConfig = readFileSync(configPath, 'utf-8');
+    writeFileSync(configPath, existingConfig.replace('driver = "local"', 'driver = "github"'));
+
+    const submitResult = await lazy(['submit', taskId]);
+    expectFailure(submitResult);
+    expectError(submitResult, '--yes');
+  });
 
   test('submit shows usage when no task ID provided', async () => {
     const result = await lazy(['submit']);

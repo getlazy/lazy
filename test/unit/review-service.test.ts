@@ -21,7 +21,9 @@ import {
   isPendingDelivery,
   buildUnblockPrompt,
 } from '../../src/daemon/review-service';
+import { handleReviewComments } from '../../src/daemon/rpc-review';
 import type { ReviewComment } from '../../src/types';
+import { TASK_LEVEL_REVIEW_ANCHOR } from '../../src/review/task-level-anchor';
 
 describe('review service', () => {
   let root: string;
@@ -51,7 +53,7 @@ describe('review service', () => {
   // must survive and be visible, annotated with why they were not delivered.
   test('a comment on a non-askable task is still saved, marked failed with a reason', async () => {
     const storage = await getOrCreateStorage();
-    const task = await storage.createTask('Not askable yet');
+    const task = await storage.createTask('Nothing recorded yet');
     const actions = createReviewActions(root);
 
     const posted = await actions.postComment(task.id, {
@@ -66,8 +68,11 @@ describe('review service', () => {
     expect(stored).toHaveLength(1);
     expect(stored[0].content).toBe('this looks wrong');
     expect(stored[0].ask_state).toBe('failed');
-    // The error must tell the reviewer what to do, not just that it failed.
-    expect(stored[0].ask_error).toMatch(/blocked/i);
+    // The error must tell the reviewer what to do, not just that it failed. A
+    // never-started task is the ONE case an ask cannot be answered at all —
+    // every other task is answered from its stored record.
+    expect(stored[0].ask_error).toMatch(/nothing recorded/i);
+    expect(stored[0].ask_error).toMatch(/lazy start/i);
     expect(stored[0].ask_error).toMatch(/saved/i);
     // The anchor survives the failure — the thread still renders in place.
     expect(stored[0].file).toBe('src/foo.ts');
@@ -98,6 +103,42 @@ describe('review service', () => {
     // No session was ever started, so the reviewer is told the agent is absent
     // rather than being offered a conversation that cannot happen.
     expect(entry!.hasSession).toBe(false);
+  });
+
+  // INVARIANT: the subtask count spans the WHOLE subtree, at every status.
+  // It exists so a release hub (dozens of descendants, most of them already
+  // terminal) can be told from an ordinary task at a glance — counting only
+  // the blocked ones, or only direct children, would show a hub as empty.
+  test('a queue entry counts every descendant and reports last activity', async () => {
+    const storage = await getOrCreateStorage();
+    const hub = await storage.createTask('Release hub');
+    await storage.updateTaskStatus(hub.id, 'blocked');
+    const child = await storage.createTask('Child of the hub', hub.id);
+    const grandchild = await storage.createTask('Grandchild of the hub', child.id);
+    await storage.updateTaskStatus(grandchild.id, 'abandoned');
+    const loner = await storage.createTask('No descendants at all');
+    await storage.updateTaskStatus(loner.id, 'blocked');
+
+    const before = Date.now();
+    await storage.createSession(hub.id, 'claude-code', 'lazy/release-hub', 'abc123');
+
+    const queue = await createReviewActions(root).listQueue();
+
+    const hubEntry = queue.find((e) => e.id === hub.id);
+    expect(hubEntry).toBeDefined();
+    expect(hubEntry!.descendantCount).toBe(2);
+    expect(hubEntry!.lastActiveAt).toBeGreaterThanOrEqual(before);
+
+    const lonerEntry = queue.find((e) => e.id === loner.id);
+    expect(lonerEntry).toBeDefined();
+    expect(lonerEntry!.descendantCount).toBe(0);
+    // Never launched: null, not 0 — the page must be able to say "never"
+    // rather than render the epoch.
+    expect(lonerEntry!.lastActiveAt).toBeNull();
+
+    // The children themselves are not blocked, so they are not in the queue —
+    // counting them did not smuggle them into the review list.
+    expect(queue.some((e) => e.id === child.id)).toBe(false);
   });
 
   // INVARIANT: a 'comment' is a change request, not a question. It must never be
@@ -171,6 +212,85 @@ describe('review service', () => {
     expect(entry.pendingAsks).toBe(1);
     expect(entry.pendingComments).toBe(2);
     expect(entry.commentCount).toBe(4);
+  });
+
+  // The reviewer asks a task-level question, reads the answer, and wants to
+  // say "alright, do that" — as a COMMENT that rides the next unblock. Before
+  // this exception they had to scroll into the diff and find some code line to
+  // hang it on. A reply on an existing task-level thread is the whole exception.
+  test('a comment replying on a task-level thread is accepted and queued', async () => {
+    const storage = await getOrCreateStorage();
+    const task = await storage.createTask('Task-level reply');
+    await storage.updateTaskStatus(task.id, 'blocked');
+    const actions = createReviewActions(root);
+
+    const question = await storage.createReviewComment(task.id, {
+      ...TASK_LEVEL_REVIEW_ANCHOR,
+      role: 'human',
+      content: 'why this approach?',
+      intent: 'ask',
+      askState: 'answered',
+    });
+    await storage.createReviewComment(task.id, {
+      ...TASK_LEVEL_REVIEW_ANCHOR,
+      threadId: question.thread_id,
+      role: 'agent',
+      content: 'because the alternative needs a migration',
+      intent: 'ask',
+    });
+
+    const reply = await actions.postComment(task.id, {
+      ...TASK_LEVEL_REVIEW_ANCHOR,
+      threadId: question.thread_id,
+      content: 'alright, do that',
+      intent: 'comment',
+    });
+    expect(reply.delivery_state).toBe('pending_delivery');
+    expect(reply.thread_id).toBe(question.thread_id);
+
+    const entry = (await actions.listQueue()).find((e) => e.id === task.id)!;
+    expect(entry.pendingComments).toBe(1);
+  });
+
+  // INVARIANT: the exception above is for REPLIES only. A fresh task-level
+  // comment is what the Unblock tab's message box already is, so it stays
+  // refused rather than becoming a second way to say the same thing.
+  test('a fresh task-level comment (no thread) is refused, pointing at Unblock', async () => {
+    const storage = await getOrCreateStorage();
+    const task = await storage.createTask('No fresh task comment');
+    await storage.updateTaskStatus(task.id, 'blocked');
+    const actions = createReviewActions(root);
+
+    await expect(
+      actions.postComment(task.id, {
+        ...TASK_LEVEL_REVIEW_ANCHOR,
+        content: 'general note',
+        intent: 'comment',
+      }),
+    ).rejects.toThrow(/Unblock message/i);
+
+    expect(await storage.getTaskReviewComments(task.id)).toHaveLength(0);
+  });
+
+  test('a task-level comment on a line thread is refused', async () => {
+    const storage = await getOrCreateStorage();
+    const task = await storage.createTask('Mismatched anchor');
+    await storage.updateTaskStatus(task.id, 'blocked');
+    const actions = createReviewActions(root);
+
+    const onLine = await storage.createReviewComment(task.id, {
+      file: 'src/foo.ts', line: 3, side: 'new', role: 'human',
+      content: 'why?', intent: 'ask', askState: 'answered',
+    });
+
+    await expect(
+      actions.postComment(task.id, {
+        ...TASK_LEVEL_REVIEW_ANCHOR,
+        threadId: onLine.thread_id,
+        content: 'do that',
+        intent: 'comment',
+      }),
+    ).rejects.toThrow(/anchor to a diff line/i);
   });
 
   test('isPendingDelivery ignores agent replies and delivered comments', async () => {
@@ -309,7 +429,7 @@ describe('review service', () => {
   // and retrying re-sends that same comment — it never asks for the words again.
   test('retrying a failed ask reuses the saved question, and re-records why when it still cannot go', async () => {
     const storage = await getOrCreateStorage();
-    const task = await storage.createTask('Busy when asked');
+    const task = await storage.createTask('Never ran when asked');
     const actions = createReviewActions(root);
 
     const posted = await actions.postComment(task.id, {
@@ -317,11 +437,11 @@ describe('review service', () => {
     });
     expect(posted.ask_state).toBe('failed');
 
-    // Still not askable: the retry must not throw the question away, and must
-    // leave a reason naming the CURRENT status.
+    // Still unanswerable (the task never ran): the retry must not throw the
+    // question away, and must leave a reason naming the CURRENT status.
     const again = await actions.retryAsk(task.id, posted.id);
     expect(again.ask_state).toBe('failed');
-    expect(again.ask_error).toMatch(/blocked/i);
+    expect(again.ask_error).toMatch(/nothing recorded/i);
     const [stored] = await storage.getTaskReviewComments(task.id);
     expect(stored.content).toBe('why this cast?');
     expect(stored.ask_state).toBe('failed');
@@ -375,6 +495,43 @@ describe('review service', () => {
     });
     const comments = await actions.listComments(task.id);
     expect(comments.map((c) => c.content)).toEqual(['first', 'second']);
+  });
+
+  // INVARIANT: the reviewComments RPC reply carries everQueued/everAsked, the
+  // two ever-counted flags the Teams footer needs so a counter that has counted
+  // drains to zero instead of vanishing. Pinned at the wire boundary because
+  // dropping the keys from handleReviewComments would pass every test while
+  // the footer silently went back to vanishing. The flags call the same
+  // predicates the dashboard endpoint does — this test asserts the reply
+  // carries them, not the rule behind them.
+  test('reviewComments reply carries everQueued/everAsked at the RPC boundary', async () => {
+    const storage = await getOrCreateStorage();
+    const actions = createReviewActions(root);
+
+    const commented = await storage.createTask('Has a queued comment');
+    await storage.createReviewComment(commented.id, {
+      file: 'a.ts', line: 1, side: 'new', role: 'human', content: 'rename this',
+      intent: 'comment', deliveryState: 'pending_delivery',
+    });
+    const asked = await storage.createTask('Has an ask');
+    await storage.createReviewComment(asked.id, {
+      file: 'a.ts', line: 1, side: 'new', role: 'human', content: 'why this cast?',
+      intent: 'ask',
+    });
+    const empty = await storage.createTask('Never reviewed');
+
+    const commentedReply = await handleReviewComments(root, { taskId: commented.id });
+    expect(commentedReply.everQueued).toBe(true);
+    expect(commentedReply.everAsked).toBe(false);
+
+    const askedReply = await handleReviewComments(root, { taskId: asked.id });
+    expect(askedReply.everQueued).toBe(false);
+    expect(askedReply.everAsked).toBe(true);
+
+    const emptyReply = await handleReviewComments(root, { taskId: empty.id });
+    expect(emptyReply.everQueued).toBe(false);
+    expect(emptyReply.everAsked).toBe(false);
+    expect(emptyReply.comments).toEqual([]);
   });
 
   /**
@@ -496,5 +653,25 @@ describe('the bundled unblock prompt', () => {
     // Later messages on the thread are not "earlier" — no time travel.
     const later = c({ id: 'z', thread_id: 'q', content: 'never mind', created_at: 9 });
     expect(buildUnblockPrompt([request], [question, answer, request, later], 'go')).not.toContain('never mind');
+  });
+
+  // A task-level reply has no file and no line. Rendering the `(task)` sentinel
+  // as an anchor would send the agent hunting for a code line that does not
+  // exist; the quoted thread is the anchor.
+  test('renders a task-level reply as a reply on the conversation, with no file/line header', () => {
+    const anchor = TASK_LEVEL_REVIEW_ANCHOR;
+    const question = c({ ...anchor, id: 'q', thread_id: 'q', intent: 'ask', content: 'why not a queue?', created_at: 1 });
+    const answer = c({ ...anchor, id: 'r', thread_id: 'q', role: 'agent', content: 'a queue needs a migration', created_at: 2 });
+    const reply = c({ ...anchor, id: 'w', thread_id: 'q', content: 'alright, do that', created_at: 3 });
+
+    const prompt = buildUnblockPrompt([reply], [question, answer, reply], 'go on');
+
+    expect(prompt).toContain('1. Reply on the task-level conversation');
+    expect(prompt).not.toContain(TASK_LEVEL_REVIEW_ANCHOR.file);
+    expect(prompt).not.toMatch(/line 0/);
+    expect(prompt).toContain('Earlier on this thread:');
+    expect(prompt).toContain('why not a queue?');
+    expect(prompt).toContain('a queue needs a migration');
+    expect(prompt).toContain('alright, do that');
   });
 });

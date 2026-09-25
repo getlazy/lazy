@@ -73,7 +73,6 @@ describe('deferred PR creation (driver unit)', () => {
       prompt: 'test prompt',
       type: 'task' as const,
       status: 'working' as const,
-      priority: 'normal' as const,
       created_at: Date.now(),
       completed_at: null,
       target: { kind: 'branch' as const, branch: 'main' },

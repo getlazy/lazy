@@ -12,10 +12,12 @@
  *
  * These drive the two per-runner sweeps directly with a fake Runner and a
  * partial Storage, so no Docker and no real task launch is involved. The fake
- * storage's `listTasks()` is deliberately empty: that is the early exit inside
- * `maybeAutoResume` that keeps `interruptForDaemonRestart` from trying to
- * launch a real supervisor here. The reap is what is under test; the resume
- * path belongs to the reconciler.
+ * storage lists its tasks as `working`: ownership of a discovered run is
+ * resolved by naming every task in storage, and `working` is the early exit
+ * inside `maybeAutoResume` (which only resumes an `interrupted` task) that
+ * keeps `interruptForDaemonRestart` from trying to launch a real supervisor
+ * here. The reap is what is under test; the resume path belongs to the
+ * reconciler.
  */
 
 import { describe, test, expect } from 'bun:test';
@@ -44,6 +46,9 @@ function fakeRunner(opts: {
       return true;
     },
     runDisplayName: (name: string) => name,
+    // Ownership is resolved by naming every task the same way the launcher
+    // named its run, so the fake must name runs the way the host runner does.
+    runNameForTask: (ref: string) => `lazy-${ref}`,
   } as unknown as Runner;
   // The reap works from the pre-listen SNAPSHOT, not from live discovery, so
   // tests hand it the same names the snapshot would have captured.
@@ -101,7 +106,18 @@ function fakeStorage(opts: FakeStorageOpts): {
       calls.resets.push(sessionId);
     },
     updateSessionContainerName: async () => {},
-    listTasks: async () => [],
+    // Ownership of a discovered run is resolved by naming every task in
+    // storage, so these must be listable — a task the list omits is another
+    // project's and must not be stopped. They stay `working`: that is the
+    // early exit inside `maybeAutoResume` (it only resumes an `interrupted`
+    // task) which keeps `interruptForDaemonRestart` from trying to launch a
+    // real supervisor here. The reap is what is under test.
+    listTasks: async () =>
+      Object.entries(opts.tasks ?? {}).map(([short, full]) => ({
+        id: full,
+        status: 'working',
+        metadata: { task_ref: short },
+      })),
     listSessions: async () => [],
     saveBuilderResumeIntent: async (intent: { builderId: string; reason?: string }) => {
       if (opts.failIntentFor?.includes(intent.builderId)) throw new Error('storage down');
@@ -235,50 +251,15 @@ describe('reapTaskAgents', () => {
 });
 
 describe('reapBuilders', () => {
-  test('stops this project’s builders with a daemon-restart resume intent', async () => {
+  // INVARIANT: builders supervise themselves in-container (src/builder/continuity.ts)
+  // — the restart reaper must NOT stop them, same as pair/chat on the host.
+  test('does not stop builders from the pre-listen snapshot', async () => {
     const { runner, stops, builders } = fakeRunner({ builders: ['lazy-builder-abc12345'] });
     const { storage, calls } = fakeStorage({});
 
-    expect(await reapBuilders(runner, storage, '/proj', builders)).toEqual(['abc12345']);
-    expect(stops).toEqual([
-      { name: 'lazy-builder-abc12345', gracefulTimeoutSeconds: RESTART_STOP_GRACE_SECONDS },
-    ]);
-    // Canonical intent key is the SHORT id, exactly as `lazy upgrade` writes it.
-    expect(calls.intents.map(i => i.builderId)).toEqual(['abc12345']);
-    expect(calls.intents[0]!.reason).toBe('daemon-restart');
-  });
-
-  // INVARIANT: intent FIRST, stop second. The host-side relaunch wrapper unblocks
-  // the instant the container dies and immediately looks for an intent; writing
-  // it afterwards races, and a missed intent is a builder session that silently
-  // does not come back.
-  test('the resume intent is durable before the container is signalled', async () => {
-    const order: string[] = [];
-    const { runner, builders } = fakeRunner({ builders: ['lazy-builder-abc12345'] });
-    const patched = {
-      ...runner,
-      stopRun: async () => { order.push('stop'); return true; },
-      discoverProjectBuilderRuns: runner.discoverProjectBuilderRuns.bind(runner),
-      runDisplayName: (n: string) => n,
-    } as unknown as Runner;
-    const storage = {
-      saveBuilderResumeIntent: async () => { order.push('intent'); },
-    } as unknown as Storage;
-
-    await reapBuilders(patched, storage, '/proj', builders);
-
-    expect(order).toEqual(['intent', 'stop']);
-  });
-
-  // If the intent cannot be persisted, stopping the builder would destroy the
-  // session with nothing to bring it back. Better a builder still running against
-  // a dead proxy — the human can see and restart that — than one silently gone.
-  test('a builder whose intent cannot be saved is left running', async () => {
-    const { runner, stops, builders } = fakeRunner({ builders: ['lazy-builder-abc12345'] });
-    const { storage } = fakeStorage({ failIntentFor: ['abc12345'] });
-
     expect(await reapBuilders(runner, storage, '/proj', builders)).toEqual([]);
     expect(stops).toEqual([]);
+    expect(calls.intents).toEqual([]);
   });
 
   test('no builders means no storage writes at all', async () => {

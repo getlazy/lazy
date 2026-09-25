@@ -85,8 +85,11 @@
  * can never name a per-launch path at all.
  */
 
-import { readFile, writeFile } from 'fs/promises';
+import { readFile, writeFile, mkdir } from 'fs/promises';
 import { join } from 'path';
+import { createHash } from 'crypto';
+import { getHome } from '../utils/home';
+import { projectSlug } from '../daemon/paths';
 
 /**
  * A syntactically valid credential store with no `claudeAiOauth` record.
@@ -97,6 +100,52 @@ import { join } from 'path';
  * `claudeAiOauth === undefined`, which is exactly the state a task agent's
  * sandbox `.claude` is in.
  */
+/**
+ * Base directory for every project's per-member builder homes:
+ * `~/.lazy/builder-homes/` on the machine running the daemon.
+ *
+ * `LAZY_BUILDER_HOMES_BASE_DIR` overrides it — the same test-isolation seam
+ * `LAZY_SCRATCH_BASE_DIR` gives the builder scratch dir (src/builder/scratch.ts).
+ */
+function getBuilderHomesBaseDir(): string {
+  const override = process.env.LAZY_BUILDER_HOMES_BASE_DIR;
+  if (override) return override;
+  return join(getHome(), '.lazy', 'builder-homes');
+}
+
+/**
+ * Resolve (and create) a per member+project home directory for a daemon-owned
+ * builder session, in place of the host's `~/.claude`.
+ *
+ * On a server there is no launching human's home to mount — `~/.claude` would
+ * be the fleet process user's, which is nobody's
+ * (docs/design/actor-identity-and-remote-clients.md §5.5) — and even on a
+ * laptop, two members of the same project must not share one settings/history
+ * tree. Keyed by email so it survives a stop/resume cycle and a daemon
+ * restart; `null` (single-person installs with no configured identity reach
+ * this only outside team mode) gets one shared directory, matching today's
+ * single-user behavior.
+ *
+ * DELIBERATELY OUTSIDE the project's data dir. A builder container mounts the
+ * whole data dir read-write (`-v ${dataDir}:${dataDir}`, docker-runner.ts) —
+ * nesting per-member homes under it put every OTHER member's `~/.claude.json`
+ * and full Claude session transcripts inside that same mount, readable and
+ * writable by a container that is not theirs. Living at `~/.lazy/builder-homes/`
+ * instead — the same "outside the repo" placement `builderScratchDir` uses —
+ * means only the ONE home this launch resolves is ever bind-mounted in.
+ */
+export function resolveBuilderSessionHomeDir(projectRoot: string, memberEmail: string | null): string {
+  const key = memberEmail ? createHash('sha256').update(memberEmail).digest('hex').slice(0, 16) : 'shared';
+  return join(getBuilderHomesBaseDir(), projectSlug(projectRoot), key);
+}
+
+/** Ensure a builder session's home directory (and its `.claude` subtree) exists. */
+export async function ensureBuilderSessionHomeDir(projectRoot: string, memberEmail: string | null): Promise<string> {
+  const home = resolveBuilderSessionHomeDir(projectRoot, memberEmail);
+  await mkdir(join(home, '.claude'), { recursive: true });
+  return home;
+}
+
 export const NEUTRAL_CREDENTIAL_STORE = '{}\n';
 
 /** Container path the neutral store shadows. */
@@ -153,12 +202,13 @@ export function builderClaudeSessionConfigPath(tmpDir: string, builderId: string
 export function mergeBuilderClaudeConfig(
   base: Record<string, unknown>,
   mcpArgs: string[],
+  mcpCommand = 'lazy-agent',
 ): Record<string, unknown> {
   return {
     ...base,
     mcpServers: {
       ...((base.mcpServers as Record<string, unknown>) ?? {}),
-      lazy: { command: 'lazy-agent', args: mcpArgs },
+      lazy: { command: mcpCommand, args: mcpArgs },
     },
   };
 }
@@ -178,16 +228,19 @@ export function mergeBuilderClaudeConfig(
  * re-seed and says so, rather than refusing to launch the builder.
  *
  * @param persistedPath - Stable per-project config (see `builderClaudeConfigPath`)
- * @param hostConfigPath - The human's real `~/.claude.json`
+ * @param hostConfigPath - The human's real `~/.claude.json`, or null for a launch whose
+ *   host home belongs to nobody in particular (a daemon-owned builder session on a
+ *   shared host — see writeBuilderSessionClaudeConfig), which then seeds from `{}`
  * @param onWarn - Called with an actionable message when a file exists but is unreadable
  */
 export async function resolveBuilderClaudeConfigBase(
   persistedPath: string,
-  hostConfigPath: string,
+  hostConfigPath: string | null,
   onWarn: (message: string) => void,
 ): Promise<Record<string, unknown>> {
   const persisted = await readJsonObject(persistedPath, onWarn);
   if (persisted) return persisted;
+  if (hostConfigPath === null) return {};
   return (await readJsonObject(hostConfigPath, onWarn)) ?? {};
 }
 
@@ -201,8 +254,19 @@ export async function resolveBuilderClaudeConfigBase(
 export async function writeBuilderSessionClaudeConfig(opts: {
   sessionPath: string;
   persistedPath: string;
-  hostConfigPath: string;
+  /**
+   * The launching human's real `~/.claude.json`, used only when nothing is
+   * persisted yet. NULL on the daemon-owned session path, deliberately: there
+   * the daemon process user's home is nobody's (design §5.5), and seeding from
+   * it handed every member the operator's `oauthAccount`, `userID`, project
+   * history and MCP server entries with their env secrets. The CLI `lazy
+   * builder` path passes it, because that process runs as the person whose
+   * home it reads.
+   */
+  hostConfigPath: string | null;
   mcpArgs: string[];
+  /** Command Claude Code uses to spawn the lazy MCP server (default lazy-agent). */
+  mcpCommand?: string;
   onWarn: (message: string) => void;
 }): Promise<string> {
   const base = await resolveBuilderClaudeConfigBase(
@@ -210,7 +274,11 @@ export async function writeBuilderSessionClaudeConfig(opts: {
   );
   await writeFile(
     opts.sessionPath,
-    JSON.stringify(mergeBuilderClaudeConfig(base, opts.mcpArgs), null, 2) + '\n',
+    JSON.stringify(
+      mergeBuilderClaudeConfig(base, opts.mcpArgs, opts.mcpCommand),
+      null,
+      2,
+    ) + '\n',
   );
   return opts.sessionPath;
 }
@@ -285,4 +353,21 @@ async function readJsonObject(
     onWarn(`Could not parse ${path}: ${(err as Error).message}. Continuing without it.`);
     return null;
   }
+}
+
+/**
+ * Directory holding ONE daemon-owned launch's per-launch files: its system
+ * prompt, container config, mounted `~/.claude.json` copy, MCP wrapper and
+ * neutral credential store.
+ *
+ * Under the member's own home, never `<dataDir>/tmp`: every builder container
+ * mounts the whole data dir read-write, so files there were readable and
+ * writable by every OTHER member's container — member A's live session config
+ * and credential store included. Nothing mounts this directory as a whole; the
+ * launch bind-mounts each file in it individually, so a container sees only
+ * its own. Removed when the launch's resources are released (stop, end, a
+ * failed launch).
+ */
+export function builderSessionLaunchDir(homeDirAbs: string, builderId: string): string {
+  return join(homeDirAbs, 'launches', builderId);
 }

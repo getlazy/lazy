@@ -12,6 +12,8 @@ import {
 } from '../../src/daemon/auth-env';
 import { assertDaemonCredentials, credentialFromEnv } from '../../src/daemon/credential-gate';
 import type { RoleTarget } from '../../src/config/types';
+import { ANTHROPIC_DEFAULT_TARGET } from '../../src/config/default-target';
+import { NO_CREDENTIAL } from '../../src/config/agent-profiles';
 import { setDaemonContext, clearDaemonContext } from '../../src/daemon/context';
 import {
   lookupCredentialGrant,
@@ -27,6 +29,24 @@ import { pinDaemonBaseDir, makeDaemonBaseDir } from '../helpers/daemon-base-dir'
  * a daemon-only-env deployment) and failed with "Authentication required" even
  * though the daemon held a valid token.
  */
+
+/**
+ * A profile pinned to a local model server — the successor to the old
+ * `backend = "ollama"`. `pinned` is what that backend NAME used to encode (a
+ * human named this endpoint) and `credential: none` is what made it the
+ * documented escape hatch from the daemon's credential gate.
+ */
+const localProfile = (over: Partial<RoleTarget> = {}): RoleTarget => ({
+  profile: 'local-ollama',
+  harness: 'claude-code',
+  model: 'qwen',
+  endpoint: 'http://localhost:11434',
+  pinned: true,
+  wire: 'anthropic',
+  credential: NO_CREDENTIAL,
+  ...over,
+});
+
 describe('daemon auth env', () => {
   let projectRoot: string;
 
@@ -42,8 +62,9 @@ describe('daemon auth env', () => {
     projectRoot = await mkdtemp(join(tmpdir(), 'lazy-auth-env-'));
     delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
     delete process.env.ANTHROPIC_API_KEY;
-    // Point loadConfig at a hermetic, minimal config (ollama disabled) so these
-    // tests don't pick up the repo's lazy.toml via cwd-walking.
+    // Point loadConfig at a hermetic, EMPTY config (so every role defaults to
+    // the built-in claude-code profile) rather than letting these tests pick up
+    // the repo's own lazy.toml via cwd-walking.
     const configPath = join(projectRoot, 'lazy.toml');
     await writeFile(configPath, '');
     process.env.LAZY_CONFIG = configPath;
@@ -88,20 +109,15 @@ describe('daemon auth env', () => {
   });
 
   describe('resolveAuthEnvFromDaemon', () => {
-    // INVARIANT: an Ollama-backed setup needs no Anthropic token. It is the
-    // documented escape hatch from the daemon credential gate, so making ollama
-    // roles proxied must not quietly make a real credential mandatory again —
-    // the synthetic LOCAL_BACKEND_CREDS stand in, and this must never throw
-    // "Authentication required".
-    test('resolves an Ollama role with no Anthropic credential present', async () => {
+    // INVARIANT: a profile on a local model server needs no Anthropic token. It
+    // is the documented escape hatch from the daemon credential gate, so making
+    // such profiles proxied must not quietly make a real credential mandatory
+    // again — the synthetic LOCAL_BACKEND_CREDS stand in, and this must never
+    // throw "Authentication required".
+    test('resolves a local-server profile with no Anthropic credential present', async () => {
       process.env.LAZY_TEST = '1'; // bypass the daemon RPC; resolve in-process
       // No CLAUDE/ANTHROPIC creds set; if this consulted real auth it would throw.
-      const ollamaTarget: RoleTarget = {
-        backend: 'ollama',
-        model: 'qwen',
-        endpoint: 'http://localhost:11434',
-        proxyUrl: 'http://127.0.0.1:8766',
-      };
+      const ollamaTarget = localProfile({ proxyUrl: 'http://127.0.0.1:8766' });
       const result = await resolveAuthEnvFromDaemon(ollamaTarget);
       const map = Object.fromEntries(result.map(v => [v.key, v.value]));
       expect(map.ANTHROPIC_AUTH_TOKEN).toBe('ollama');
@@ -132,12 +148,7 @@ describe('daemon auth env', () => {
     // nothing left to translate about it.
     test('propagates the launch surface to the injected proxy address', async () => {
       process.env.LAZY_TEST = '1'; // bypass the daemon RPC; resolve in-process
-      const dockerInternal: RoleTarget = {
-        backend: 'ollama',
-        model: 'qwen',
-        endpoint: 'http://localhost:11434',
-        proxyUrl: 'http://host.docker.internal:8766',
-      };
+      const dockerInternal = localProfile({ proxyUrl: 'http://host.docker.internal:8766' });
       const hostEnv = await resolveAuthEnvFromDaemon(dockerInternal, undefined, 'host');
       expect(hostEnv.find(v => v.key === 'ANTHROPIC_BASE_URL')?.value).toBe('http://localhost:8766');
 
@@ -162,7 +173,7 @@ describe('daemon auth env', () => {
    * (test-only) re-arms it, which is what these tests use.
    */
   describe('resolveLiveProxyUrl / withLiveProxyTarget (proxy fail-loud gate)', () => {
-    const anthropicRole: RoleTarget = { backend: 'anthropic', model: '', endpoint: '' };
+    const anthropicRole: RoleTarget = ANTHROPIC_DEFAULT_TARGET;
 
     beforeEach(() => {
       // Deterministic: tryRpc must not reach out to any real daemon from a unit test.
@@ -178,7 +189,7 @@ describe('daemon auth env', () => {
       await writeFile(configPath, toml);
       process.env.LAZY_CONFIG = configPath;
       const { loadConfig } = await import('../../src/config/loader');
-      return loadConfig(projectRoot, { cwd: projectRoot });
+      return loadConfig(projectRoot);
     }
 
     test('fails with an actionable error when the proxy is on and no address resolves', async () => {
@@ -210,34 +221,39 @@ describe('daemon auth env', () => {
       expect(await withLiveProxyTarget(anthropicRole, config)).toEqual(anthropicRole);
     });
 
-    // INVARIANT (proxy-role-upstreams): the gate fires for EVERY backend. These
-    // two were the carve-outs — an ollama role and a role pinned at an explicit
-    // endpoint both connected direct, behind the audit plane's back, and neither
-    // needed the daemon. Their endpoint is now the upstream the PROXY forwards
-    // to, so both need the proxy's address and both fail loudly without it.
-    // Re-exempting either one would silently reopen the bypass.
-    test('fires for an ollama role', async () => {
+    // INVARIANT (proxy-role-upstreams): the gate fires for EVERY profile. These
+    // two were the carve-outs — a local-server profile and one pinned at an
+    // explicit remote endpoint both connected direct, behind the audit plane's
+    // back, and neither needed the daemon. Their endpoint is now the upstream
+    // the PROXY forwards to, so both need the proxy's address and both fail
+    // loudly without it. Re-exempting either one would silently reopen the
+    // bypass — including on the credential axis, which is why the first case
+    // carries `credential: none`: needing no secret is not permission to skip
+    // the audit plane.
+    test('fires for a local-server profile that needs no credential', async () => {
       process.env.LAZY_FORCE_PROXY_GATE = '1';
       const config = await configWith('');
-      const ollama: RoleTarget = { backend: 'ollama', model: 'qwen', endpoint: 'http://localhost:11434' };
-      await expect(withLiveProxyTarget(ollama, config)).rejects.toThrow(ProxyUnavailableError);
+      await expect(withLiveProxyTarget(localProfile(), config)).rejects.toThrow(ProxyUnavailableError);
     });
 
-    test('fires for a role with an explicit endpoint', async () => {
+    test('fires for a profile pinned to an explicit endpoint', async () => {
       process.env.LAZY_FORCE_PROXY_GATE = '1';
       const config = await configWith('');
-      const explicit: RoleTarget = { backend: 'proxy', model: 'm', endpoint: 'http://127.0.0.1:9999' };
+      const explicit = localProfile({
+        profile: 'gateway', model: 'm', endpoint: 'http://127.0.0.1:9999', credential: 'anthropic',
+      });
       await expect(withLiveProxyTarget(explicit, config)).rejects.toThrow(ProxyUnavailableError);
     });
 
     // ...and the endpoint survives the stamping: applyLiveProxyUrl must not
     // overwrite it, because it IS the routing the proxy reads at request time.
-    test('stamping the proxy address preserves the role endpoint', async () => {
+    test('stamping the proxy address preserves the profile endpoint', async () => {
       const config = await configWith('');
-      const explicit: RoleTarget = { backend: 'ollama', model: 'm', endpoint: 'http://localhost:11434' };
-      expect(applyLiveProxyUrl(explicit, 'http://127.0.0.1:8766')).toEqual({
+      const explicit = localProfile({ model: 'm' });
+      expect(applyLiveProxyUrl(explicit, 'http://127.0.0.1:8766', 'https://api.anthropic.com')).toEqual({
         ...explicit,
         proxyUrl: 'http://127.0.0.1:8766',
+        primaryUpstream: 'https://api.anthropic.com',
       });
       expect(config).toBeDefined();
     });
@@ -277,15 +293,38 @@ describe('daemon auth env', () => {
       await expect(assertDaemonCredentials(projectRoot)).resolves.toBeUndefined();
     });
 
-    // INVARIANT: Ollama-backed setups talk to a local model with dummy
-    // credentials, so the gate must not demand an Anthropic token — mirroring
-    // runner.checkAvailability().
-    test('is skipped when [ollama] is enabled', async () => {
+    // INVARIANT: a local model server authenticates nobody, so a project whose
+    // ROLE-DEFAULT profiles are all local must start with no Anthropic token —
+    // mirroring runner.checkAvailability(). The old spelling of this was the
+    // role-wide `[ollama]` block; the profile form is what it became, and the
+    // skip must survive the move. (The `[ollama]` block itself is now REFUSED at
+    // load — test/e2e covers that migration message.)
+    test('is skipped when every role-default profile needs no credential', async () => {
       await writeFile(
         join(projectRoot, 'lazy.toml'),
-        '[ollama]\nenabled = true\nmodel = "qwen3:8b"\n',
+        '[agents.local-ollama]\n' +
+        'harness = "claude-code"\n' +
+        'model = "qwen3:8b"\n' +
+        'endpoint = "http://localhost:11434"\n\n' +
+        '[models.roles.builder]\nagent = "local-ollama"\n\n' +
+        '[models.roles.agent]\nagent = "local-ollama"\n',
       );
       await expect(assertDaemonCredentials(projectRoot)).resolves.toBeUndefined();
+    });
+
+    // ...and the other half of that rule, which is the one a broad "any local
+    // endpoint anywhere" skip would break: a MIXED project still owes a token
+    // for the role that is not local.
+    test('still demands a credential when only one role is local', async () => {
+      await writeFile(
+        join(projectRoot, 'lazy.toml'),
+        '[agents.local-ollama]\n' +
+        'harness = "claude-code"\n' +
+        'model = "qwen3:8b"\n' +
+        'endpoint = "http://localhost:11434"\n\n' +
+        '[models.roles.agent]\nagent = "local-ollama"\n',
+      );
+      await expect(assertDaemonCredentials(projectRoot)).rejects.toThrow(/Anthropic/i);
     });
   });
 
@@ -319,7 +358,7 @@ describe('daemon auth env', () => {
     test('a proxied launch gets a placeholder, never the real credential', async () => {
       process.env.CLAUDE_CODE_OAUTH_TOKEN = 'sk-ant-oat01-THE-REAL-ONE';
       const result = await handleGetAuthEnv(projectRoot, {
-        proxied: true, role: 'agent', taskId: 'task-77', label: 'lazy-task-77',
+        proxied: true, profile: 'claude-code', role: 'agent', taskId: 'task-77', label: 'lazy-task-77',
       }) as { authEnvVars: Array<{ key: string; value: string }> };
 
       const token = result.authEnvVars.find(v => v.key === 'CLAUDE_CODE_OAUTH_TOKEN');
@@ -338,7 +377,7 @@ describe('daemon auth env', () => {
     test('the env var the credential occupies is unchanged', async () => {
       process.env.ANTHROPIC_API_KEY = 'sk-ant-api03-THE-REAL-ONE';
       const result = await handleGetAuthEnv(projectRoot, {
-        proxied: true, role: 'builder', label: 'builder-abc',
+        proxied: true, profile: 'claude-code', role: 'builder', label: 'builder-abc',
       }) as { authEnvVars: Array<{ key: string; value: string }> };
       expect(result.authEnvVars.map(v => v.key)).toContain('ANTHROPIC_API_KEY');
       expect(JSON.stringify(result)).not.toContain('sk-ant-api03-THE-REAL-ONE');
@@ -352,9 +391,15 @@ describe('daemon auth env', () => {
     // how the proxy authenticates the caller and routes it to the role's upstream)
     // WITHOUT consulting the daemon's own credential.
     test('a self-credentialed launch mints a grant without a real credential', async () => {
+      // The profile has to be one the project really configures — see the
+      // unknown-profile refusal below.
+      await writeFile(
+        process.env.LAZY_CONFIG!,
+        '[agents.local-ollama]\nharness = "claude-code"\nmodel = "qwen"\nendpoint = "http://localhost:11434"\n',
+      );
       // Deliberately no CLAUDE/ANTHROPIC creds: this must not throw.
       const result = await handleGetAuthEnv(projectRoot, {
-        proxied: true, selfCredentialed: true, role: 'agent', taskId: 'task-88', label: 'lazy-task-88',
+        proxied: true, profile: 'local-ollama', selfCredentialed: true, role: 'agent', taskId: 'task-88', label: 'lazy-task-88',
       }) as { authEnvVars: Array<{ key: string; value: string }> };
 
       const token = result.authEnvVars.find(v => v.key === 'ANTHROPIC_AUTH_TOKEN');
@@ -385,10 +430,112 @@ describe('daemon auth env', () => {
 
     test('a bad identity is rejected at the boundary', async () => {
       process.env.CLAUDE_CODE_OAUTH_TOKEN = 'sk-ant-oat01-THE-REAL-ONE';
-      await expect(handleGetAuthEnv(projectRoot, { proxied: true, role: 'root', label: 'x' }))
-        .rejects.toThrow('role must be');
-      await expect(handleGetAuthEnv(projectRoot, { proxied: true, role: 'agent', label: '' }))
-        .rejects.toThrow('label must be');
+      await expect(handleGetAuthEnv(projectRoot, {
+        proxied: true, profile: 'claude-code', role: 'root', label: 'x',
+      })).rejects.toThrow('role must be');
+      await expect(handleGetAuthEnv(projectRoot, {
+        proxied: true, profile: 'claude-code', role: 'agent', label: '',
+      })).rejects.toThrow('label must be');
+    });
+
+    // INVARIANT (agent-profiles): the PROFILE is part of the launch identity,
+    // and is required at this boundary for the same reason `proxied` is — it
+    // decides which upstream the minted grant is forwarded to. Defaulting a
+    // missing one would silently send a launch that meant to reach a local
+    // Ollama box (or a work OpenAI account) to whichever upstream the fallback
+    // happened to name, on whichever credential that upstream uses. The refusal
+    // says what to do about it, because the only realistic way to hit it is a
+    // CLI older than the daemon it is talking to.
+    test('a proxied launch that names no profile is refused', async () => {
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = 'sk-ant-oat01-THE-REAL-ONE';
+      await expect(handleGetAuthEnv(projectRoot, { proxied: true, role: 'agent', label: 'x' }))
+        .rejects.toThrow(/profile must be a non-empty agent profile name/);
+      await expect(handleGetAuthEnv(projectRoot, { proxied: true, role: 'agent', label: 'x' }))
+        .rejects.toThrow(/lazy upgrade/);
+      await expect(handleGetAuthEnv(projectRoot, {
+        proxied: true, profile: '', role: 'agent', label: 'x',
+      })).rejects.toThrow(/profile must be/);
+    });
+
+    // ...and "non-empty" is not the whole check. The proxy routes by looking the
+    // grant's profile up in its route table; a name that is not there looks
+    // exactly like a legacy grant carrying no profile, and both forward to the
+    // PRIMARY upstream. So a typo would not fail — it would quietly bill an
+    // Anthropic turn for a launch the user pointed at a local server, which is
+    // the silent reinterpretation profiles exist to prevent. The name must
+    // resolve against the project's own profiles.
+    test('a proxied launch naming an unconfigured profile is refused', async () => {
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = 'sk-ant-oat01-THE-REAL-ONE';
+      const attempt = handleGetAuthEnv(projectRoot, {
+        proxied: true, profile: 'local-olama', role: 'agent', label: 'lazy-task-9',
+      });
+      // Named, and answered: which profiles this project actually has.
+      await expect(attempt).rejects.toThrow(/Unknown agent profile "local-olama"/);
+      await expect(handleGetAuthEnv(projectRoot, {
+        proxied: true, profile: 'local-olama', role: 'agent', label: 'lazy-task-9',
+      })).rejects.toThrow(/Available profiles: /);
+    });
+
+    // The other half of the same boundary: the credential a launch is handed
+    // comes from the profile the grant ROUTES by, not from the role's default
+    // profile. Those used to be resolved separately — routing from the
+    // identity's profile, the credential from `[models.roles.<role>]` — so a
+    // task pinned to a different profile of the same role could be handed one
+    // profile's credential while its traffic went to another profile's upstream.
+    test('the credential follows the identity profile, not the role default', async () => {
+      // The role default bills Anthropic; the launch names a local profile that
+      // bills nothing. If the role default won, this would read the daemon's own
+      // Anthropic credential — absent here, so it would throw.
+      await writeFile(
+        process.env.LAZY_CONFIG!,
+        '[agents.local-ollama]\nharness = "claude-code"\nmodel = "qwen"\nendpoint = "http://localhost:11434"\n',
+      );
+      const result = await handleGetAuthEnv(projectRoot, {
+        proxied: true, profile: 'local-ollama', role: 'agent', taskId: 'task-90', label: 'lazy-task-90',
+      }) as { authEnvVars: Array<{ key: string; value: string }> };
+
+      // The local profile's credential slot decides the env var, and the value
+      // is a placeholder the proxy can redeem back to THIS profile.
+      const token = result.authEnvVars.find(v => v.key === 'ANTHROPIC_AUTH_TOKEN');
+      expect(token).toBeDefined();
+      const grant = await lookupCredentialGrant(projectRoot, token!.value);
+      expect(grant?.profile).toBe('local-ollama');
+    });
+
+    // INVARIANT (agent-profiles): a BUILDER launch is routed by the profile the
+    // BUILDER ROLE resolves to, never by the built-in `claude-code` name. Every
+    // builder launch site used to hard-code it, so a project that pinned
+    // `[models.roles.builder] agent = "..."` had its endpoint preflighted and
+    // its traffic then sent to the primary Anthropic upstream on the primary
+    // credential — a config lazy itself advertises (`lazy builder`'s help).
+    test('a pinned builder profile reaches the minted grant', async () => {
+      await writeFile(join(projectRoot, 'lazy.toml'), [
+        '[agents.builder-ollama]',
+        'harness = "claude-code"',
+        'model = "qwen3:8b"',
+        'endpoint = "http://localhost:11434"',
+        '',
+        '[models.roles.builder]',
+        'agent = "builder-ollama"',
+        '',
+      ].join('\n'));
+      const { loadConfig } = await import('../../src/config/loader');
+      const { resolveRoleTarget } = await import('../../src/utils/role-target');
+      const config = await loadConfig(projectRoot);
+      const target = resolveRoleTarget('builder', config);
+      expect(target.profile).toBe('builder-ollama');
+
+      // What the launch sites pass: the RESOLVED target's profile.
+      const result = await handleGetAuthEnv(projectRoot, {
+        proxied: true, selfCredentialed: true, profile: target.profile,
+        role: 'builder', taskId: null, label: 'builder-abc',
+      }) as { authEnvVars: Array<{ key: string; value: string }> };
+
+      const token = result.authEnvVars.find(v => v.key === 'ANTHROPIC_AUTH_TOKEN');
+      expect(token).toBeDefined();
+      const grant = await lookupCredentialGrant(projectRoot, token!.value);
+      expect(grant?.role).toBe('builder');
+      expect(grant?.profile).toBe('builder-ollama');
     });
 
     // INVARIANT: `proxied` is REQUIRED at this boundary, not defaulted. It

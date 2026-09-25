@@ -19,7 +19,7 @@
  * lists (nested prompts like confirmations/*.md are consumed via their own
  * direct text imports, not via the prompt-listing command).
  */
-import { readdirSync, writeFileSync, renameSync, statSync } from 'fs';
+import { readdirSync, readFileSync, writeFileSync, renameSync, statSync } from 'fs';
 import { join, basename } from 'path';
 
 const root = join(import.meta.dir, '..');
@@ -63,28 +63,36 @@ ${entries.join('\n')}
 }
 
 /**
- * True when the bundle is missing, or older than any prompt it should contain.
+ * True when the bundle is missing, lists a different set of prompts than the
+ * prompts directory holds, or is older than any prompt it should contain.
  *
- * The bundle is gitignored and generated, so a worktree keeps whatever copy it
- * generated first. Merging a branch that ADDS a prompt therefore leaves a
- * silently stale bundle behind — `prompt-bundle.test.ts` then fails with a
- * drift error on a machine where nothing is actually wrong with the code.
+ * The bundle is gitignored and generated, so a checkout keeps whatever copy it
+ * generated first. It goes stale two ways:
+ *   - a prompt was ADDED or edited since (merge, pull) — caught by mtime;
+ *   - a prompt was DELETED or renamed (switching to a branch that lacks it) —
+ *     the bundle then imports a file that does not exist, and nothing on disk
+ *     got newer, so mtime alone cannot see it. The listed set is compared too.
  */
-export function isPromptBundleStale(): boolean {
+export function isPromptBundleStale(dir: string = promptsDir, bundle: string = outFile): boolean {
   let bundleMtime: number;
+  let bundleSource: string;
   try {
-    bundleMtime = statSync(outFile).mtimeMs;
+    bundleMtime = statSync(bundle).mtimeMs;
+    bundleSource = readFileSync(bundle, 'utf-8');
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return true;
-    throw new Error(`Failed to stat ${outFile}: ${(err as Error).message}`);
+    throw new Error(`Failed to read ${bundle}: ${(err as Error).message}`);
   }
-  return readdirSync(promptsDir)
-    .filter(f => f.endsWith('.md'))
-    .some(f => statSync(join(promptsDir, f)).mtimeMs > bundleMtime);
+  const onDisk = readdirSync(dir).filter(f => f.endsWith('.md')).sort();
+  const listed = [...bundleSource.matchAll(/from '\.\/prompts\/([^']+\.md)'/g)].map(m => m[1]!).sort();
+  if (onDisk.join('\n') !== listed.join('\n')) return true;
+  return onDisk.some(f => statSync(join(dir, f)).mtimeMs > bundleMtime);
 }
 
-// Allow running directly: `bun run scripts/generate-prompt-bundle.ts`
+// Allow running directly: `bun run scripts/generate-prompt-bundle.ts`.
+// `--check` writes nothing and exits 1 when the bundle is stale (native preflight).
 if (import.meta.main) {
+  if (process.argv.includes('--check')) process.exit(isPromptBundleStale() ? 1 : 0);
   generatePromptBundle();
   console.log(`Generated ${outFile}`);
 }

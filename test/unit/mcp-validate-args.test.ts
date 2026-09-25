@@ -80,6 +80,40 @@ describe('validateToolArgs', () => {
     expect(validateToolArgs(SCHEMA, { message: 'hi', modes: ['x', 'z'] })).toContain("'modes[1]' must be one of: x, y");
   });
 
+  // Nested object array items (raised_resolutions shape) — schema keywords
+  // properties/required must be enforced at the boundary, not documentation-only.
+  test('validates nested object array items (properties + required + enum)', () => {
+    const nested: McpToolInputSchema = {
+      type: 'object',
+      properties: {
+        raised_resolutions: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', minLength: 1 },
+              action: { type: 'string', enum: ['respond', 'promote_subtask', 'promote_peer', 'dismiss'] },
+              response: { type: 'string' },
+            },
+            required: ['id', 'action'],
+          },
+        },
+      },
+    };
+    expect(validateToolArgs(nested, {
+      raised_resolutions: [{ id: 'abc', action: 'respond' }],
+    })).toBeNull();
+    expect(validateToolArgs(nested, {
+      raised_resolutions: [{ action: 'respond' }],
+    })).toContain("'raised_resolutions[0].id' is required");
+    expect(validateToolArgs(nested, {
+      raised_resolutions: [{ id: 'abc', action: 'nope' }],
+    })).toContain('must be one of: respond, promote_subtask, promote_peer, dismiss');
+    expect(validateToolArgs(nested, {
+      raised_resolutions: ['not-an-object'],
+    })).toBe("'raised_resolutions[0]' must be object, got string");
+  });
+
   test('accepts any branch of a union type', () => {
     expect(validateToolArgs(SCHEMA, { message: 'hi', either: 'one' })).toBeNull();
     expect(validateToolArgs(SCHEMA, { message: 'hi', either: ['one', 'two'] })).toBeNull();

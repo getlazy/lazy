@@ -1,0 +1,109 @@
+/* Settings page — Memories / Doctor tabs and the doctor report. */
+
+.lz-settings-intro { max-width: 40rem; }
+
+.lz-settings-tabs { margin-top: var(--space-4); }
+
+.lz-doctor-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
+}
+
+.lz-doctor-head h2 { margin: 0; }
+
+.lz-doctor-run-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.lz-doctor-checks {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.lz-doctor-check {
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--color-divider);
+  background: var(--color-surface);
+}
+
+.lz-doctor-check-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+}
+
+.lz-doctor-check-head h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.lz-doctor-status {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.lz-doctor-ok .lz-doctor-status { color: var(--color-success, #1b7f3a); }
+.lz-doctor-warning .lz-doctor-status { color: var(--color-warning); }
+.lz-doctor-error .lz-doctor-status { color: var(--color-danger); }
+.lz-doctor-error { border-color: color-mix(in srgb, var(--color-danger) 40%, var(--color-divider)); }
+.lz-doctor-warning { border-color: color-mix(in srgb, var(--color-warning) 40%, var(--color-divider)); }
+
+.lz-doctor-detail, .lz-doctor-remedy, .lz-doctor-docs {
+  margin: var(--space-2) 0 0;
+}
+
+.lz-doctor-remedies { margin-top: var(--space-8); }
+
+.lz-doctor-remedy-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.lz-doctor-remedy-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) 0;
+  border-bottom: 1px solid var(--color-divider);
+}
+
+.lz-doctor-remedy-form { margin: 0; }
+
+dialog.lz-doctor-dialog {
+  width: min(40rem, calc(100vw - 40px));
+  max-height: calc(100vh - 40px);
+}
+
+.lz-doctor-dialog-body {
+  padding: var(--space-4) var(--space-8) var(--space-8);
+  overflow: auto;
+  max-height: calc(100vh - 80px);
+}
+
+.lz-doctor-steps {
+  margin: var(--space-3) 0;
+  padding-left: 1.2em;
+}
+
+.lz-doctor-step-error { color: var(--color-danger); }
+.lz-doctor-step-ok, .lz-doctor-step-done { color: var(--color-success, #1b7f3a); }
+
+.lz-doctor-dialog-error {
+  color: var(--color-danger);
+  border: 1px solid var(--color-danger);
+  padding: var(--space-2) var(--space-3);
+}
+
+.lz-doctor-progress-log { margin: var(--space-4) 0; }

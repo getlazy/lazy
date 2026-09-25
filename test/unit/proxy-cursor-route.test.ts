@@ -109,8 +109,21 @@ describe('cursorLaunchEnvVars: which address each launch surface gets', () => {
   // are routed by the role-target machinery; adding an endpoint override for
   // them here would silently override THAT decision.
   test('non-cursor agents get nothing', () => {
-    expect(cursorLaunchEnvVars({ ...base, agentId: 'claude-code', runnerType: 'docker' })).toEqual([]);
-    expect(cursorLaunchEnvVars({ ...base, agentId: undefined, runnerType: 'docker' })).toEqual([]);
+    expect(cursorLaunchEnvVars({ ...base, harness: 'claude-code', runnerType: 'docker' })).toEqual([]);
+    expect(cursorLaunchEnvVars({ ...base, harness: undefined, runnerType: 'docker' })).toEqual([]);
+  });
+
+  // INVARIANT: the gate is the HARNESS, never the task's `agent` — that names a
+  // PROFILE. A caller passing `work-cursor` (a `[agents.work-cursor]` block with
+  // harness = "cursor") would get [] here, launch with no CURSOR_API_ENDPOINT,
+  // and dial Cursor's servers straight past the audit proxy. The caller resolves
+  // the profile and passes what it runs.
+  test('a custom profile running cursor is routed by its harness', () => {
+    expect(cursorLaunchEnvVars({ ...base, harness: 'cursor', runnerType: 'docker' })).toEqual([
+      { key: 'CURSOR_API_ENDPOINT', value: 'http://host.docker.internal:8766/_lazy/cursor/key_lazy_t' },
+    ]);
+    // …and a profile NAME reaching this function is the bug, not an input.
+    expect(cursorLaunchEnvVars({ ...base, harness: 'work-cursor', runnerType: 'docker' })).toEqual([]);
   });
 
   // INVARIANT: the container surface must get host.docker.internal and the host
@@ -119,7 +132,7 @@ describe('cursorLaunchEnvVars: which address each launch surface gets', () => {
   // how a container address ends up handed to a host process.
   test('container runners reach the proxy via host.docker.internal', () => {
     for (const runnerType of ['docker', 'podman'] as const) {
-      expect(cursorLaunchEnvVars({ ...base, agentId: 'cursor', runnerType })).toEqual([
+      expect(cursorLaunchEnvVars({ ...base, harness: 'cursor', runnerType })).toEqual([
         { key: 'CURSOR_API_ENDPOINT', value: 'http://host.docker.internal:8766/_lazy/cursor/key_lazy_t' },
       ]);
     }
@@ -129,7 +142,7 @@ describe('cursorLaunchEnvVars: which address each launch surface gets', () => {
     expect(cursorLaunchEnvVars({
       ...base,
       bind: '127.0.0.2',
-      agentId: 'cursor',
+      harness: 'cursor',
       runnerType: 'dangerously-host-process-without-any-isolation',
     })).toEqual([
       { key: 'CURSOR_API_ENDPOINT', value: 'http://127.0.0.2:8766/_lazy/cursor/key_lazy_t' },
@@ -141,7 +154,7 @@ describe('cursorLaunchEnvVars: which address each launch surface gets', () => {
   // nothing to mint — the traffic is forwarded verbatim and recorded
   // unattributed rather than refused.
   test('a launch with no placeholder is routed anyway, as "-"', () => {
-    expect(cursorLaunchEnvVars({ ...base, token: null, agentId: 'cursor', runnerType: 'docker' })[0].value)
+    expect(cursorLaunchEnvVars({ ...base, token: null, harness: 'cursor', runnerType: 'docker' })[0].value)
       .toBe('http://host.docker.internal:8766/_lazy/cursor/-');
   });
 
@@ -149,7 +162,7 @@ describe('cursorLaunchEnvVars: which address each launch surface gets', () => {
   // direct would produce an unaudited turn, which is the exact failure this
   // whole route exists to prevent. Mirrors the Anthropic path's fail-loud gate.
   test('a cursor launch with no live proxy port fails loudly', () => {
-    expect(() => cursorLaunchEnvVars({ ...base, proxyPort: undefined, agentId: 'cursor', runnerType: 'docker' }))
+    expect(() => cursorLaunchEnvVars({ ...base, proxyPort: undefined, harness: 'cursor', runnerType: 'docker' }))
       .toThrow(/could not resolve the live proxy address/i);
   });
 });

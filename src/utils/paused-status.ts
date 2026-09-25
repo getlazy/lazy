@@ -2,7 +2,7 @@
  * Parking a task in its correct PAUSED status.
  *
  * A paused task is either `blocked` (nothing owed) or `conflict` (the reviewer
- * still owes an approve/revert decision on file-permission violations).
+ * still owes an approval decision, at accept, on file-permission violations).
  *
  * INVARIANT (violations-are-the-source-of-truth — fix-ask-nukes-violations):
  * `conflict` is DERIVED from the pending violation set; it is never asserted or
@@ -11,22 +11,26 @@
  * recovery, pairing teardown, auto-deliver rollback, `lazy stop` — must go
  * through here rather than writing `'blocked'` directly.
  *
+ * A side-channel turn may additionally have a status of its OWN to put back that
+ * this derivation does not describe — a sync turn that found the task `submitted`
+ * passes it as `restore`, and it applies only when nothing is owed on protected
+ * files. See src/task/sync-restore-status.ts.
+ *
  * WHY: a dozen call sites wrote `'blocked'` unconditionally, while the only
- * enforcement that matters (the revert in `launchUnblockTask`) reads the
- * violation set. The two fell out of sync the moment ANY side-channel turn
- * finished on a `conflict` task — a `lazy ask` whose response the reconciler
- * flushed, a `lazy sync`, the end of a `lazy pair` session. The task then read
- * `blocked` while violations were still pending, which made the state
- * unexpressible: the reviewer surfaces refused `approved_files` ("this task has
- * no violations") and the daemon then reverted the unapproved files anyway,
- * silently destroying committed agent work. Deriving the label from the set is
- * what keeps the reviewer's view and the daemon's enforcement on one truth.
+ * enforcement that matters (the accept gate) reads the violation set. The two
+ * fell out of sync the moment ANY side-channel turn finished on a `conflict`
+ * task — a `lazy ask` whose response the reconciler flushed, a `lazy sync`, the
+ * end of a `lazy pair` session. The task then read `blocked` while violations
+ * were still pending, so every surface that shows the reviewer what they owe
+ * showed nothing. Deriving the label from the set is what keeps the reviewer's
+ * view and the accept gate on one truth.
  */
 
 import type { Storage } from '../storage';
 import type { FileViolation, TaskStatus } from '../types';
-import type { Actor } from '../types';
-import { pendingViolations } from './turns';
+import type { ActorInput } from '../types';
+import type { SyncRestorableStatus } from '../task/sync-restore-status';
+import { outstandingFromRecords } from '../protection/outstanding';
 import { logger } from './logger';
 
 /** The paused status a task with this violation state belongs in. */
@@ -41,13 +45,30 @@ export type PausedStatus = Extract<TaskStatus, 'blocked' | 'conflict'>;
  * nothing, and "reported nothing" must never be read as "there is nothing".
  * Equally, a turn that DID re-detect violations owns them even before they are
  * written to a turn.
+ *
+ * INVARIANT (an empty later re-detect cannot clear an earlier pending file —
+ * move-file-approval-to-accept): the records are read ACROSS ALL TURNS, latest
+ * decision per file (`outstandingFromRecords`), never off the single latest
+ * violation turn. Since the decision moved to accept, a conflict task runs many
+ * turns before anyone decides, and a later turn that touches no protected file
+ * records `violations: []` — which, read as the whole story, silently parked the
+ * task `blocked` with a protected edit still in the diff and nobody told.
+ *
+ * This is the CONSERVATIVE half of the answer: it can keep saying `conflict`
+ * after the agent itself reverted the file. The whole-branch scan behind
+ * `resolveOutstandingViolations` is what settles that, and callers with a
+ * project root pass its result in as `outstanding`.
  */
 export function pausedStatusFor(
-  turns: Parameters<typeof pendingViolations>[0],
+  turns: Parameters<typeof outstandingFromRecords>[0],
   detected?: FileViolation[],
+  outstanding?: FileViolation[],
 ): PausedStatus {
+  if (outstanding !== undefined) {
+    return outstanding.length > 0 || (detected?.length ?? 0) > 0 ? 'conflict' : 'blocked';
+  }
   if (detected && detected.length > 0) return 'conflict';
-  return pendingViolations(turns).length > 0 ? 'conflict' : 'blocked';
+  return outstandingFromRecords(turns).length > 0 ? 'conflict' : 'blocked';
 }
 
 /**
@@ -58,24 +79,45 @@ export function pausedStatusFor(
  * caller has one. Omit it for turns that ran no permission check — omitting is
  * NOT the same as passing `[]`, and neither one can clear a pending set.
  *
+ * `projectRoot`, when given, upgrades the answer from the recorded set to the
+ * whole-branch scan — which is the only thing that can tell "the agent reverted
+ * it" from "the last turn did not look at it". Pass it wherever it is in scope.
+ *
+ * `restore` is for a SIDE-CHANNEL turn that must put back a status this
+ * derivation does not describe — today only a sync turn restoring `submitted`
+ * (see src/task/sync-restore-status.ts). It applies ONLY when the derivation says
+ * `blocked`: a derived `conflict` always wins, because the reviewer's pending
+ * violation set outranks a restored label and `conflict` may never be cleared by
+ * anything other than the derivation.
+ *
  * Failure to read the turns is not fatal: we fall back to `blocked`, which is
  * exactly the behaviour every one of these call sites had before, and log it.
  */
 export async function parkTaskPaused(
   storage: Storage,
   taskId: string,
-  actor: Actor,
-  opts: { sessionId?: string; detected?: FileViolation[] } = {},
-): Promise<PausedStatus> {
+  actor: ActorInput,
+  opts: {
+    sessionId?: string;
+    detected?: FileViolation[];
+    projectRoot?: string;
+    restore?: SyncRestorableStatus | null;
+  } = {},
+): Promise<PausedStatus | SyncRestorableStatus> {
   let status: PausedStatus = 'blocked';
   try {
-    let sessionId = opts.sessionId;
-    if (!sessionId) {
-      const sess = await storage.getSessionByTaskId(taskId);
-      sessionId = sess?.id;
-    }
+    const sess = await storage.getSessionByTaskId(taskId);
+    const sessionId = opts.sessionId ?? sess?.id;
     const turns = sessionId ? await storage.getSessionTurns(sessionId) : [];
-    status = pausedStatusFor(turns, opts.detected);
+    let outstanding: FileViolation[] | undefined;
+    const task = opts.projectRoot ? await storage.getTask(taskId) : null;
+    if (opts.projectRoot && task && sess) {
+      // Lazy import: paused-status is reached from the CLI too, and the daemon
+      // resolver pulls in config + git. The fallback inside it never throws.
+      const { resolveOutstandingViolations } = await import('../protection/outstanding-resolver');
+      outstanding = (await resolveOutstandingViolations(opts.projectRoot, task, sess, turns, storage)).outstanding;
+    }
+    status = pausedStatusFor(turns, opts.detected, outstanding);
   } catch (err) {
     logger.warn(
       `Task ${taskId.substring(0, 8)}: could not read violations while parking the task — ` +
@@ -83,6 +125,8 @@ export async function parkTaskPaused(
       `${err instanceof Error ? err.message : String(err)}`,
     );
   }
-  await storage.updateTaskStatus(taskId, status, actor);
-  return status;
+  const parked: PausedStatus | SyncRestorableStatus =
+    status === 'blocked' && opts.restore ? opts.restore : status;
+  await storage.updateTaskStatus(taskId, parked, actor);
+  return parked;
 }

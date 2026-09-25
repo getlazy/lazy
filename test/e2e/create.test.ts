@@ -1,7 +1,9 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, extractTaskId } from '../helpers/assertions';
-import { createTask } from '../helpers/fixtures';
+import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { readTaskJson, writeTaskJson } from '../helpers/storage';
+import { REVIEW_MODE_METADATA_KEY } from '../../src/review/mode';
 
 describe('lazy create', () => {
   let ctx: TestContext;
@@ -329,4 +331,211 @@ describe('lazy create --parent (started tasks)', () => {
     // (i.e., child branched from parent's HEAD, not from an earlier point)
     expect(mergeBase).toBe(parentHead);
   }, 60_000);
+
+  /*
+   * The per-task review MODE, pinned at creation (engineer decision
+   * 2026-09-21). Pinning it here rather than at start is what lets
+   * `lazy create --review separate` stick with no second flag on the command
+   * that launches the task, and what keeps a task in one review arm for its
+   * whole life when the project default later changes.
+   */
+  describe('--review', () => {
+    test('pins the mode on the task, in the stored spelling', async () => {
+      const result = await ctx.lazy([
+        'create', '--goal', 'Rotate the signing keys', '--review', 'separate',
+      ]);
+      expectSuccess(result);
+      expectOutput(result, 'Review: separate');
+      const taskId = extractTaskId(result.stdout);
+      // The hyphenated spelling a human types normalizes to the underscored
+      // one metadata and lazy.toml use — one vocabulary, two spellings.
+      expect(readTaskJson(ctx.root, taskId).metadata?.[REVIEW_MODE_METADATA_KEY]).toBe('separate');
+    });
+
+    test('accepts the hyphenated spelling', async () => {
+      const result = await ctx.lazy([
+        'create', '--goal', 'Tidy the imports', '--review', 'low-high',
+      ]);
+      expectSuccess(result);
+      const taskId = extractTaskId(result.stdout);
+      expect(readTaskJson(ctx.root, taskId).metadata?.[REVIEW_MODE_METADATA_KEY]).toBe('low_high');
+    });
+
+    // INVARIANT: an unrecognised mode is refused BEFORE the task row is
+    // written. The mode decides whether a reviewer ever runs for this task, so
+    // resolving a typo to a default would give someone a review posture they
+    // did not choose, silently, for the task's whole life.
+    test('refuses an unknown mode, naming the three, and creates nothing', async () => {
+      const before = (await ctx.lazy(['list', '--all'])).stdout;
+      const result = await ctx.lazy([
+        'create', '--goal', 'Nope', '--review', 'thorough',
+      ]);
+      expectFailure(result);
+      expectError(result, "Invalid --review value 'thorough'");
+      expectError(result, 'off, low-high, separate');
+      expect((await ctx.lazy(['list', '--all'])).stdout).toBe(before);
+    });
+
+    test('leaves the mode unpinned when the flag is absent, so the project default applies', async () => {
+      const result = await ctx.lazy(['create', '--goal', 'Ordinary work']);
+      expectSuccess(result);
+      const taskId = extractTaskId(result.stdout);
+      expect(readTaskJson(ctx.root, taskId).metadata?.[REVIEW_MODE_METADATA_KEY]).toBeUndefined();
+    });
+
+    // Mid-flight safe, like --model and --effort: this is the escape hatch out
+    // of a reviewer cycle costing more than it is finding.
+    test('lazy edit --review changes it on an existing task', async () => {
+      const taskId = await createTask(ctx, 'Change my mind', 'Do the work');
+      expectSuccess(await ctx.lazy(['edit', taskId, '--review', 'off']));
+      expect(readTaskJson(ctx.root, taskId).metadata?.[REVIEW_MODE_METADATA_KEY]).toBe('off');
+    });
+  });
+
+  /*
+   * INHERITANCE: project config → parent task → task (engineer requirement,
+   * 2026-09-21). "A cluster driver therefore sets a mode once on itself and its
+   * children follow unless they override."
+   *
+   * Through the real CLI and the real launch path: `lazy create --review` pins
+   * the parent, `lazy start` on the child is what RESOLVES and pins the child,
+   * so what these read back is what the daemon actually decided.
+   */
+  describe('inheritance from a parent task', () => {
+    test('a child with no --review keeps its parent\'s mode', async () => {
+      const parent = await ctx.lazy([
+        'create', '--goal', 'Drive the batch', '--prompt', 'Drive it', '--type', 'cluster',
+        '--code', 'inherit-parent', '--review', 'separate', '--review-gate', 'always',
+      ]);
+      expectSuccess(parent);
+      const parentId = extractTaskId(parent.stdout);
+      expectSuccess(await ctx.lazyMocked(['start', parentId, '--yes'], MOCK_CLAUDE_SUCCESS));
+      expectSuccess(await ctx.lazy(['wait', parentId]));
+
+      const child = await ctx.lazy([
+        'create', '--goal', 'Do one piece', '--prompt', 'Do the work',
+        '--parent', 'inherit-parent', '--code', 'inherit-child',
+      ]);
+      expectSuccess(child);
+      const childId = extractTaskId(child.stdout);
+
+      // Nothing is pinned until the child LAUNCHES: create records only what it
+      // was told, so the rest can still follow a parent that changes its mind.
+      expect(readTaskJson(ctx.root, childId).metadata?.[REVIEW_MODE_METADATA_KEY]).toBeUndefined();
+
+      // …and `show` on that unpinned task still says what it WILL run under,
+      // naming where it comes from. Reading the project default here would be a
+      // false claim on exactly the tasks a human inspects before starting them.
+      const beforeStart = await ctx.lazy(['show', childId]);
+      expectSuccess(beforeStart);
+      expectOutput(beforeStart, 'Review:  separate, gate always, auto-fix off');
+      expectOutput(beforeStart, 'inherited from inherit-parent');
+
+      expectSuccess(await ctx.lazyMocked(['start', childId, '--yes'], MOCK_CLAUDE_SUCCESS));
+      expectSuccess(await ctx.lazy(['wait', childId]));
+
+      const metadata = readTaskJson(ctx.root, childId).metadata ?? {};
+      expect(metadata[REVIEW_MODE_METADATA_KEY]).toBe('separate');
+      expect(metadata.review_gate).toBe('always');
+      // Stated nowhere up the chain, so the PROJECT's value is what got pinned.
+      expect(metadata.review_auto_fix).toBe('off');
+      expect(metadata.review_mode_source).toBe('parent:inherit-parent');
+
+      // INVARIANT: the choice keeps travelling. A GRANDCHILD of the hub gets
+      // `separate` too — inheritance is the whole chain, and stopping after one
+      // generation would silently give a deep tree LESS review than the human
+      // asked for. The provenance keeps naming the hub that decided, not the
+      // intermediary that passed it on.
+      const grandchild = await ctx.lazy([
+        'create', '--goal', 'A piece of the piece', '--prompt', 'Do the work',
+        '--parent', 'inherit-child', '--code', 'inherit-grandchild',
+      ]);
+      expectSuccess(grandchild);
+      const grandchildId = extractTaskId(grandchild.stdout);
+      expectSuccess(await ctx.lazyMocked(['start', grandchildId, '--yes'], MOCK_CLAUDE_SUCCESS));
+      expectSuccess(await ctx.lazy(['wait', grandchildId]));
+
+      const grandchildMetadata = readTaskJson(ctx.root, grandchildId).metadata ?? {};
+      expect(grandchildMetadata[REVIEW_MODE_METADATA_KEY]).toBe('separate');
+      expect(grandchildMetadata.review_mode_source).toBe('parent:inherit-parent');
+    });
+
+    test('a child that overrides keeps its own mode, and still inherits the rest', async () => {
+      const parent = await ctx.lazy([
+        'create', '--goal', 'Drive the batch', '--prompt', 'Drive it', '--type', 'cluster',
+        '--code', 'override-parent', '--review', 'separate', '--review-gate', 'always',
+      ]);
+      expectSuccess(parent);
+      const parentId = extractTaskId(parent.stdout);
+      expectSuccess(await ctx.lazyMocked(['start', parentId, '--yes'], MOCK_CLAUDE_SUCCESS));
+      expectSuccess(await ctx.lazy(['wait', parentId]));
+
+      const child = await ctx.lazy([
+        'create', '--goal', 'Do one piece', '--prompt', 'Do the work',
+        '--parent', 'override-parent', '--code', 'override-child', '--review', 'low-high',
+      ]);
+      expectSuccess(child);
+      const childId = extractTaskId(child.stdout);
+
+      expectSuccess(await ctx.lazyMocked(['start', childId, '--yes'], MOCK_CLAUDE_SUCCESS));
+      expectSuccess(await ctx.lazy(['wait', childId]));
+
+      const metadata = readTaskJson(ctx.root, childId).metadata ?? {};
+      // INVARIANT: the levels resolve PER KEY. The child overrode only the mode,
+      // so its parent's gate still reaches it — one flag must not silently reset
+      // the other two to the project default.
+      expect(metadata[REVIEW_MODE_METADATA_KEY]).toBe('low_high');
+      expect(metadata.review_gate).toBe('always');
+    });
+
+    /*
+     * INVARIANT: a parent's LEGACY flag is not a decision about its children.
+     * The old resolver pinned `low_high_loop = "off"` on every task alive, so
+     * reading it as a choice put every task created under an existing hub into
+     * `separate` on a project whose default is `low_high` — reported by the
+     * engineer on 2026-09-21, the first task they created after upgrading:
+     * "Why would review be separate by default — I think I was pretty explicit
+     * in that regard?"
+     */
+    test("a parent's pre-[review] flag does not put the child in separate", async () => {
+      const parent = await ctx.lazy([
+        'create', '--goal', 'An older hub', '--prompt', 'Hub', '--code', 'legacy-hub',
+      ]);
+      expectSuccess(parent);
+      const parentId = extractTaskId(parent.stdout);
+      expectSuccess(await ctx.lazyMocked(['start', parentId, '--yes'], MOCK_CLAUDE_SUCCESS));
+      expectSuccess(await ctx.lazy(['wait', parentId]));
+
+      // Put the hub in the state every task was in before `[review]` existed:
+      // the legacy flag, pinned 'off' by the old resolver whether or not anyone
+      // had an opinion, and no review_* keys at all.
+      const parentJson = readTaskJson(ctx.root, parentId);
+      const parentMetadata = { ...(parentJson.metadata ?? {}) } as Record<string, string>;
+      for (const key of Object.keys(parentMetadata)) {
+        if (key.startsWith('review_')) delete parentMetadata[key];
+      }
+      parentMetadata.low_high_loop = 'off';
+      writeTaskJson(ctx.root, parentId, { ...parentJson, metadata: parentMetadata });
+
+      const child = await ctx.lazy([
+        'create', '--goal', 'New work under it', '--prompt', 'Do the work',
+        '--parent', 'legacy-hub', '--code', 'legacy-child',
+      ]);
+      expectSuccess(child);
+      const childId = extractTaskId(child.stdout);
+      expectSuccess(await ctx.lazyMocked(['start', childId, '--yes'], MOCK_CLAUDE_SUCCESS));
+      expectSuccess(await ctx.lazy(['wait', childId]));
+
+      const metadata = readTaskJson(ctx.root, childId).metadata ?? {};
+      expect(metadata[REVIEW_MODE_METADATA_KEY]).toBe('low_high');
+      // …and the task records WHERE that came from, which is the other half of
+      // the report: the line said `separate` and explained nothing.
+      expect(metadata.review_mode_source).toBe('project');
+
+      const shown = await ctx.lazy(['show', childId]);
+      expectSuccess(shown);
+      expectOutput(shown, 'Review:  low-high, gate auto, auto-fix off');
+      expectOutput(shown, 'project default');
+    });
+  });
 });

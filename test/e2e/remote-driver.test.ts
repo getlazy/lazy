@@ -4,13 +4,13 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 import { createDriver, LocalDriver, GitHubDriver, GitLabDriver } from '../../src/remote';
 import type { GhResult, DriverDeps, RemoteComment } from '../../src/remote';
 import { DEFAULT_CONFIG } from '../../src/config/loader';
 import type { ResolvedConfig } from '../../src/config/types';
 import type { Task } from '../../src/types';
-import { buildRemoteCommentsContext } from '../../src/cli/commands/shared';
-import { formatAgentTurnSummary, formatHumanReviewTurn, formatNoteComment } from '../../src/daemon/remote-sync';
+import { buildRemoteCommentsContext } from '../../src/task/turn-context';
 
 describe('remote driver', () => {
   describe('createDriver factory', () => {
@@ -51,34 +51,44 @@ describe('remote driver', () => {
 
     test('publishBranch is a no-op', async () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
       const result = await driver.publishBranch({ branch: 'some-branch', targetBranch: 'main', task });
       expect(result).toEqual({});
     });
 
     test('syncComments returns empty array', async () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
       const result = await driver.syncComments(task, '2024-01-01');
       expect(result).toEqual([]);
     });
 
     test('getPRState returns null', async () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
       const result = await driver.getPRState(task);
       expect(result).toBeNull();
     });
 
-    test('postTurnSummary is a no-op', async () => {
+    test('approveForMerge is a no-op', async () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
-      await driver.postTurnSummary(task, 'summary');
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
+      expect(await driver.approveForMerge(task, 'looks good')).toBeNull();
+    });
+
+    // INVARIANT: lazy writes no reviews or comments to a forge (engineer
+    // decision, 2026-09-21), so the driver interface has no method to do it.
+    // A driver growing one back is the regression this guards.
+    test('the driver has no review/comment posting methods at all', () => {
+      const driver = new LocalDriver() as unknown as Record<string, unknown>;
+      expect(driver.postReviewReport).toBeUndefined();
+      expect(driver.postAcceptReview).toBeUndefined();
+      expect(driver.postRejectReview).toBeUndefined();
     });
 
     test('markReadyForReview is a no-op', async () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
       await driver.markReadyForReview(task);
     });
 
@@ -95,7 +105,7 @@ describe('remote driver', () => {
 
     test('validateAccept always returns null (no preconditions)', () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
       expect(driver.validateAccept(task)).toBeNull();
     });
 
@@ -104,29 +114,15 @@ describe('remote driver', () => {
       await expect(driver.fetchRemoteState('/tmp/test')).rejects.toThrow('Sync requires a remote driver');
     });
 
-    test('getLastCommentSyncedAt returns undefined', () => {
+    test('getLastFidelityTurnSeq returns -1', () => {
       const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
-      expect(driver.getLastCommentSyncedAt(task)).toBeUndefined();
-    });
-
-    test('getLastPostedTurnSeq returns -1', () => {
-      const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
-      expect(driver.getLastPostedTurnSeq(task)).toBe(-1);
-    });
-
-    test('getLastPostedNoteAt returns undefined', () => {
-      const driver = new LocalDriver();
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
-      expect(driver.getLastPostedNoteAt(task)).toBeUndefined();
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
+      expect(driver.getLastFidelityTurnSeq(task)).toBe(-1);
     });
 
     test('metadata key methods return canonical remote_* names', () => {
       const driver = new LocalDriver();
-      expect(driver.commentSyncedAtKey()).toBe('remote_last_comment_synced_at');
-      expect(driver.postedTurnSeqKey()).toBe('remote_last_posted_turn_seq');
-      expect(driver.postedNoteAtKey()).toBe('remote_last_posted_note_at');
+      expect(driver.fidelityTurnSeqKey()).toBe('remote_fidelity_turn_seq');
     });
 
     // INVARIANT: LocalDriver.fastForwardLocal is a no-op because there is no
@@ -179,6 +175,9 @@ describe('remote driver', () => {
       const gitCommit = await ctx.git('-C', worktreePath, 'commit', '-m', 'Add driver test file');
       expect(gitCommit.exitCode).toBe(0);
 
+      // Fixture setup, not the subject (see test/helpers/final.ts).
+      await seedFinal(ctx, taskId);
+
       // Accept should succeed via LocalDriver
       const acceptResult = await ctx.lazy(['accept', taskId]);
       expectSuccess(acceptResult);
@@ -204,16 +203,9 @@ describe('remote driver', () => {
     test('syncComments returns empty array when no PR metadata', async () => {
       const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
       const driver = new GitHubDriver(config);
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
       const result = await driver.syncComments(task, '2024-01-01');
       expect(result).toEqual([]);
-    });
-
-    test('postTurnSummary is a no-op when no PR metadata', async () => {
-      const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
-      const driver = new GitHubDriver(config);
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
-      await driver.postTurnSummary(task, 'summary');
     });
 
     test('checkHealth returns structured health checks', async () => {
@@ -236,7 +228,7 @@ describe('remote driver', () => {
     test('markReadyForReview surfaces gh pr create failure when no remote is configured', async () => {
       const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
       const driver = new GitHubDriver(config);
-      const task = { id: 'test1234test1234', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
+      const task = { id: 'test1234test1234', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
       // Without a configured gh remote (or with gh missing), the driver must throw
       // a descriptive error rather than silently return empty metadata — otherwise
       // callers report a misleading "no remote reference" downstream.
@@ -246,7 +238,7 @@ describe('remote driver', () => {
     test('validateAccept returns error when no remote ref', () => {
       const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
       const driver = new GitHubDriver(config);
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
       const result = driver.validateAccept(task);
       expect(result).toContain('no remote reference');
     });
@@ -254,70 +246,40 @@ describe('remote driver', () => {
     test('validateAccept returns null when remote ref exists', () => {
       const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
       const driver = new GitHubDriver(config);
-      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_remote_ref_id: '42' }, tags: [], pending_sync: 0, runner_type: null };
+      const task = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_remote_ref_id: '42' }, tags: [], pending_sync: 0, runner_type: null };
       expect(driver.validateAccept(task)).toBeNull();
     });
 
-    // INVARIANT: GitHub driver uses github_remote_* prefixed keys to avoid
-    // collision with GitLab driver metadata when switching drivers.
-    test('getLastCommentSyncedAt reads github_remote_* key with fallback chain', () => {
+    test('getLastFidelityTurnSeq reads canonical key with posted-turn fallback chain', () => {
       const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
       const driver = new GitHubDriver(config);
 
-      // New prefixed key takes precedence
-      const task1 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_remote_last_comment_synced_at: '2024-06-01T00:00:00Z' }, tags: [], pending_sync: 0, runner_type: null };
-      expect(driver.getLastCommentSyncedAt(task1)).toBe('2024-06-01T00:00:00Z');
+      // Canonical fidelity key wins over the legacy posted-turn keys.
+      const task1 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_fidelity_turn_seq: '5' }, tags: [], pending_sync: 0, runner_type: null };
+      expect(driver.getLastFidelityTurnSeq(task1)).toBe(5);
 
-      // Falls back to unprefixed key (backward compat)
-      const task1b = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { remote_last_comment_synced_at: '2024-05-01T00:00:00Z' }, tags: [], pending_sync: 0, runner_type: null };
-      expect(driver.getLastCommentSyncedAt(task1b)).toBe('2024-05-01T00:00:00Z');
+      // INVARIANT: stores written before the per-turn forge mirroring was
+      // removed kept the watermark under github_remote_last_posted_turn_seq
+      // (and older spellings). The fidelity refresher must keep reading them,
+      // or every upgrade would treat all existing turns as new work and
+      // regenerate every PR description once.
+      const task1b = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_remote_last_posted_turn_seq: '4' }, tags: [], pending_sync: 0, runner_type: null };
+      expect(driver.getLastFidelityTurnSeq(task1b)).toBe(4);
 
-      // Falls back to old github_* key
-      const task2 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_last_comment_synced_at: '2024-01-01T00:00:00Z' }, tags: [], pending_sync: 0, runner_type: null };
-      expect(driver.getLastCommentSyncedAt(task2)).toBe('2024-01-01T00:00:00Z');
+      const task1c = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { remote_last_posted_turn_seq: '3' }, tags: [], pending_sync: 0, runner_type: null };
+      expect(driver.getLastFidelityTurnSeq(task1c)).toBe(3);
 
-      // Returns undefined when no metadata
-      const task3 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
-      expect(driver.getLastCommentSyncedAt(task3)).toBeUndefined();
+      const task2 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_last_posted_turn_seq: '2' }, tags: [], pending_sync: 0, runner_type: null };
+      expect(driver.getLastFidelityTurnSeq(task2)).toBe(2);
+
+      const task3 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
+      expect(driver.getLastFidelityTurnSeq(task3)).toBe(-1);
     });
 
-    test('getLastPostedTurnSeq reads github_remote_* key with fallback chain', () => {
+    test('metadata key methods return github_* prefixed names', () => {
       const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
       const driver = new GitHubDriver(config);
-
-      const task1 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_remote_last_posted_turn_seq: '5' }, tags: [], pending_sync: 0, runner_type: null };
-      expect(driver.getLastPostedTurnSeq(task1)).toBe(5);
-
-      const task1b = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { remote_last_posted_turn_seq: '4' }, tags: [], pending_sync: 0, runner_type: null };
-      expect(driver.getLastPostedTurnSeq(task1b)).toBe(4);
-
-      const task2 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_last_posted_turn_seq: '3' }, tags: [], pending_sync: 0, runner_type: null };
-      expect(driver.getLastPostedTurnSeq(task2)).toBe(3);
-
-      const task3 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null };
-      expect(driver.getLastPostedTurnSeq(task3)).toBe(-1);
-    });
-
-    test('getLastPostedNoteAt reads github_remote_* key with fallback chain', () => {
-      const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
-      const driver = new GitHubDriver(config);
-
-      const task1 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_remote_last_posted_note_at: '2024-06-01' }, tags: [], pending_sync: 0, runner_type: null };
-      expect(driver.getLastPostedNoteAt(task1)).toBe('2024-06-01');
-
-      const task1b = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { remote_last_posted_note_at: '2024-05-01' }, tags: [], pending_sync: 0, runner_type: null };
-      expect(driver.getLastPostedNoteAt(task1b)).toBe('2024-05-01');
-
-      const task2 = { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: { github_last_posted_note_at: '2024-01-01' }, tags: [], pending_sync: 0, runner_type: null };
-      expect(driver.getLastPostedNoteAt(task2)).toBe('2024-01-01');
-    });
-
-    test('metadata key methods return github_remote_* prefixed names', () => {
-      const config: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
-      const driver = new GitHubDriver(config);
-      expect(driver.commentSyncedAtKey()).toBe('github_remote_last_comment_synced_at');
-      expect(driver.postedTurnSeqKey()).toBe('github_remote_last_posted_turn_seq');
-      expect(driver.postedNoteAtKey()).toBe('github_remote_last_posted_note_at');
+      expect(driver.fidelityTurnSeqKey()).toBe('github_fidelity_turn_seq');
     });
 
     // INVARIANT: When `git push` fails, merge() returns status='failed' with
@@ -341,7 +303,7 @@ describe('remote driver', () => {
       const result = await driver.merge({
         sourceBranch: 'test-branch',
         targetBranch: 'main',
-        task: { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, priority: 'normal' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null },
+        task: { id: 'test', code: null, goal: 'test', prompt: '', type: 'task' as const, status: 'working' as const, created_at: Date.now(), completed_at: null, target: { kind: 'branch' as const, branch: 'main' }, branched_from_sha: null, close_reason: null, model: null, agent_id: 'claude-code', metadata: null, tags: [], pending_sync: 0, runner_type: null },
         taskShortId: 'test1234',
         root: '/tmp/nonexistent',
       });
@@ -419,7 +381,7 @@ describe('remote driver', () => {
         prompt: 'Test prompt',
         type: 'task',
         status: 'working' as const,
-        priority: 'normal' as const,
+       
         created_at: Date.now(),
         completed_at: null,
         target: { kind: 'branch' as const, branch: 'main' },
@@ -1088,7 +1050,7 @@ describe('remote driver', () => {
         prompt: 'Test prompt',
         type: 'task',
         status: 'working' as const,
-        priority: 'normal' as const,
+       
         created_at: Date.now(),
         completed_at: null,
         target: { kind: 'branch' as const, branch: 'main' },
@@ -1141,7 +1103,8 @@ describe('remote driver', () => {
           if (args[0] === 'api' && args[1].includes('issues')) {
             return ok(JSON.stringify(issueComments));
           }
-          if (args[0] === 'api' && args[1].includes('pulls')) {
+          if (args[0] === 'api' && args[1].endsWith('/pulls/42/reviews')) return ok('[]');
+          if (args[0] === 'api' && args[1].endsWith('/pulls/42/comments')) {
             return ok(JSON.stringify(reviewComments));
           }
           return fail('unexpected gh call');
@@ -1173,7 +1136,8 @@ describe('remote driver', () => {
           if (args[0] === 'api' && args[1].includes('issues')) {
             return ok(JSON.stringify(issueComments));
           }
-          if (args[0] === 'api' && args[1].includes('pulls')) {
+          if (args[0] === 'api' && args[1].endsWith('/pulls/42/reviews')) return ok('[]');
+          if (args[0] === 'api' && args[1].endsWith('/pulls/42/comments')) {
             return ok('[]');
           }
           return fail('unexpected');
@@ -1198,7 +1162,8 @@ describe('remote driver', () => {
             // gh api --paginate concatenates arrays
             return ok(JSON.stringify(page1) + JSON.stringify(page2));
           }
-          if (args[0] === 'api' && args[1].includes('pulls')) {
+          if (args[0] === 'api' && args[1].endsWith('/pulls/42/reviews')) return ok('[]');
+          if (args[0] === 'api' && args[1].endsWith('/pulls/42/comments')) {
             return ok('[]');
           }
           return fail('unexpected');
@@ -1224,7 +1189,8 @@ describe('remote driver', () => {
           if (args[0] === 'api' && args[1].includes('issues')) {
             return ok(JSON.stringify(issueComments));
           }
-          if (args[0] === 'api' && args[1].includes('pulls')) {
+          if (args[0] === 'api' && args[1].endsWith('/pulls/42/reviews')) return ok('[]');
+          if (args[0] === 'api' && args[1].endsWith('/pulls/42/comments')) {
             return fail('API rate limit exceeded');
           }
           return fail('unexpected');
@@ -1294,7 +1260,8 @@ describe('remote driver', () => {
           if (args[0] === 'api' && args[1].includes('issues')) {
             return ok(JSON.stringify(issueComments));
           }
-          if (args[0] === 'api' && args[1].includes('pulls')) {
+          if (args[0] === 'api' && args[1].endsWith('/pulls/42/reviews')) return ok('[]');
+          if (args[0] === 'api' && args[1].endsWith('/pulls/42/comments')) {
             return ok('[]');
           }
           return fail('unexpected');
@@ -1329,6 +1296,32 @@ describe('remote driver', () => {
       expect(apiCalled).toBe(false);
     });
 
+    // INVARIANT: PR review SUMMARIES are imported as kind `review_body` (review
+    // and comment ids come from different tables, so kind is part of identity), dated by
+    // submitted_at. Empty, PENDING (the viewer's own draft) and lazy-marked
+    // bodies are skipped. Without `since`, nothing is filtered by time.
+    test('imports review bodies as review_body items, skipping empty, pending and lazy-marked ones', async () => {
+      const reviews = [
+        { id: 1, body: 'Pull request overview', user: { login: 'copilot[bot]' }, state: 'COMMENTED', submitted_at: '2020-01-01T00:00:00Z' },
+        { id: 2, body: '  ', user: { login: 'bob' }, state: 'APPROVED', submitted_at: '2020-01-02T00:00:00Z' },
+        { id: 3, body: 'draft', user: { login: 'bob' }, state: 'PENDING' },
+        { id: 4, body: '<!-- lazy:review -->\nown', user: { login: 'me' }, state: 'COMMENTED', submitted_at: '2020-01-03T00:00:00Z' },
+      ];
+      const deps: DriverDeps = {
+        runGh: privateRepoGh(async (args) => {
+          if (args[0] === 'api' && args[1].endsWith('/pulls/42/reviews')) return ok(JSON.stringify(reviews));
+          if (args[0] === 'api') return ok('[]');
+          return fail('unexpected');
+        }),
+        runGit: async () => fail('should not be called'),
+      };
+      const driver = new GitHubDriver(ghConfig, deps);
+      const result = await driver.syncComments(makeTask());
+      expect(result).toEqual([
+        { forge: 'github', kind: 'review_body', id: '1', body: 'Pull request overview', author: 'copilot[bot]', createdAt: '2020-01-01T00:00:00Z' },
+      ]);
+    });
+
     test('filters out comments with lazy marker', async () => {
       const issueComments = [
         { id: 1, body: 'External comment', user: { login: 'alice' }, created_at: '2024-06-01T10:00:00Z' },
@@ -1345,7 +1338,8 @@ describe('remote driver', () => {
           if (args[0] === 'api' && args[1].includes('issues')) {
             return ok(JSON.stringify(issueComments));
           }
-          if (args[0] === 'api' && args[1].includes('pulls')) {
+          if (args[0] === 'api' && args[1].endsWith('/pulls/42/reviews')) return ok('[]');
+          if (args[0] === 'api' && args[1].endsWith('/pulls/42/comments')) {
             return ok(JSON.stringify(reviewComments));
           }
           return fail('unexpected gh call');
@@ -1369,28 +1363,6 @@ describe('remote driver', () => {
       expect(result.every(c => !c.body.includes('<!-- lazy:'))).toBe(true);
     });
 
-    test('postTurnSummary prepends lazy marker to comment', async () => {
-      let postedBody = '';
-      const deps: DriverDeps = {
-        runGh: async (args) => {
-          if (args[0] === 'pr' && args[1] === 'comment') {
-            const bodyIdx = args.indexOf('--body');
-            postedBody = bodyIdx >= 0 ? args[bodyIdx + 1] : '';
-            return ok();
-          }
-          return fail('unexpected');
-        },
-        runGit: async () => fail('should not be called'),
-      };
-
-      const driver = new GitHubDriver(ghConfig, deps);
-      await driver.postTurnSummary(makeTask(), 'Turn 1 summary: did things');
-
-      expect(postedBody).toContain('<!-- lazy:turn -->');
-      expect(postedBody).toContain('Turn 1 summary: did things');
-      // Marker should be at the beginning
-      expect(postedBody.startsWith('<!-- lazy:turn -->\n')).toBe(true);
-    });
   });
 
   describe('GitHubDriver getPRState (mocked)', () => {
@@ -1404,7 +1376,7 @@ describe('remote driver', () => {
         prompt: 'Test prompt',
         type: 'task',
         status: 'working' as const,
-        priority: 'normal' as const,
+       
         created_at: Date.now(),
         completed_at: null,
         target: { kind: 'branch' as const, branch: 'main' },
@@ -1503,83 +1475,6 @@ describe('remote driver', () => {
     });
   });
 
-  describe('GitHubDriver postTurnSummary (mocked)', () => {
-    const ghConfig: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
-
-    function makeTask(overrides?: Partial<Task>): Task {
-      return {
-        id: 'test-task-id',
-        code: null,
-        goal: 'Test goal',
-        prompt: 'Test prompt',
-        type: 'task',
-        status: 'working' as const,
-        priority: 'normal' as const,
-        created_at: Date.now(),
-        completed_at: null,
-        target: { kind: 'branch' as const, branch: 'main' },
-        branched_from_sha: null,
-        close_reason: null,
-        model: null,
-        agent_id: 'claude-code',
-        metadata: { github_remote_ref_id: '42', github_remote_ref_url: 'https://github.com/o/r/pull/42' },
-        runner_type: null,
-        tags: [], pending_sync: 0,
-        ...overrides,
-      };
-    }
-
-    const ok = async (stdout = ''): Promise<GhResult> => ({ stdout, stderr: '', exitCode: 0 });
-    const fail = async (stderr = 'error'): Promise<GhResult> => ({ stdout: '', stderr, exitCode: 1 });
-
-    test('posts comment to PR', async () => {
-      let postedBody = '';
-      const deps: DriverDeps = {
-        runGh: async (args) => {
-          if (args[0] === 'pr' && args[1] === 'comment') {
-            const bodyIdx = args.indexOf('--body');
-            postedBody = bodyIdx >= 0 ? args[bodyIdx + 1] : '';
-            return ok();
-          }
-          return fail('unexpected');
-        },
-        runGit: async () => fail('should not be called'),
-      };
-
-      const driver = new GitHubDriver(ghConfig, deps);
-      await driver.postTurnSummary(makeTask(), 'Turn 1 summary: did things');
-
-      // Should have the lazy marker prepended
-      expect(postedBody).toContain('<!-- lazy:turn -->');
-      expect(postedBody).toContain('Turn 1 summary: did things');
-      expect(postedBody.startsWith('<!-- lazy:turn -->\n')).toBe(true);
-    });
-
-    test('skips when no PR number', async () => {
-      let ghCalled = false;
-      const deps: DriverDeps = {
-        runGh: async () => { ghCalled = true; return fail('should not be called'); },
-        runGit: async () => fail('should not be called'),
-      };
-
-      const driver = new GitHubDriver(ghConfig, deps);
-      await driver.postTurnSummary(makeTask({ metadata: null }), 'summary');
-
-      expect(ghCalled).toBe(false);
-    });
-
-    test('does not throw when posting fails', async () => {
-      const deps: DriverDeps = {
-        runGh: async () => fail('Network error'),
-        runGit: async () => fail('should not be called'),
-      };
-
-      const driver = new GitHubDriver(ghConfig, deps);
-      // Should not throw
-      await driver.postTurnSummary(makeTask(), 'summary');
-    });
-  });
-
   describe('GitHubDriver checkHealth (mocked)', () => {
     const ghConfig: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
     const ok = (stdout = ''): GhResult => ({ stdout, stderr: '', exitCode: 0 });
@@ -1654,52 +1549,6 @@ describe('remote driver', () => {
     });
   });
 
-  describe('PR comment formatting (content and structure)', () => {
-    // Note: the lazy marker (<!-- lazy:turn -->) is prepended by the driver's
-    // postTurnSummary method, NOT by these formatters. See the
-    // 'postTurnSummary prepends lazy marker to comment' test above.
-
-    test('agent turn summary has correct header and content', () => {
-      const result = formatAgentTurnSummary('Did some work', 1, 1, 'abc12345');
-      expect(result).toContain('### Turn 1 — Agent Summary');
-      expect(result).toContain('Did some work');
-      expect(result).toContain('task `abc12345`');
-    });
-
-    test('agent turn summary truncates long content', () => {
-      const longContent = 'x'.repeat(5000);
-      const result = formatAgentTurnSummary(longContent, 2, 3, 'abc12345');
-      expect(result.length).toBeLessThan(5000 + 200); // content + overhead
-      expect(result).toContain('... (truncated)');
-    });
-
-    test('human review turn has Review Feedback header', () => {
-      const result = formatHumanReviewTurn('Please fix the bug', 2, 2, 'abc12345');
-      expect(result).toContain('### Turn 2 — Review Feedback');
-      expect(result).toContain('Please fix the bug');
-      expect(result).toContain('task `abc12345`');
-    });
-
-    test('human review turn truncates long feedback', () => {
-      const longFeedback = 'y'.repeat(5000);
-      const result = formatHumanReviewTurn(longFeedback, 1, 2, 'abc12345');
-      expect(result).toContain('... (truncated)');
-    });
-
-    test('note comment has Note header', () => {
-      const result = formatNoteComment('Important observation', 'note-uuid-123', 'abc12345');
-      expect(result).toContain('### Note');
-      expect(result).toContain('Important observation');
-      expect(result).toContain('task `abc12345`');
-    });
-
-    test('note comment truncates long notes', () => {
-      const longNote = 'z'.repeat(5000);
-      const result = formatNoteComment(longNote, 'note-id', 'abc12345');
-      expect(result).toContain('... (truncated)');
-    });
-  });
-
   describe('GitHubDriver.canImport', () => {
     const ghConfig: ResolvedConfig = { ...DEFAULT_CONFIG, remote: { ...DEFAULT_CONFIG.remote, driver: 'github' } };
 
@@ -1748,8 +1597,8 @@ describe('remote driver', () => {
               body: 'This fixes the auth bug',
             }));
           }
-          if (args[0] === 'pr' && args[1] === 'view' && args.includes('comments')) {
-            return ok(JSON.stringify({ comments: [] }));
+          if (args[0] === 'api' && args[1].endsWith('/issues/42/comments')) {
+            return ok('[]');
           }
           return fail('unexpected gh call');
         },
@@ -1781,14 +1630,13 @@ describe('remote driver', () => {
               body: '',
             }));
           }
-          if (args[0] === 'pr' && args[1] === 'view' && args.includes('comments')) {
-            return ok(JSON.stringify({
-              comments: [
-                { author: { login: 'alice' }, body: 'Looks good, but needs tests' },
-                { author: { login: 'bob' }, body: 'Please add error handling' },
-                { author: { login: 'carol' }, body: '' },  // empty comment should be skipped
-              ],
-            }));
+          // The SAME REST endpoint sync reads, so ids match later passes.
+          if (args[0] === 'api' && args[1].endsWith('/issues/10/comments')) {
+            return ok(JSON.stringify([
+              { id: 101, user: { login: 'alice' }, body: 'Looks good, but needs tests', created_at: '2024-01-01T00:00:00Z' },
+              { id: 102, user: { login: 'bob' }, body: 'Please add error handling', created_at: '2024-01-02T00:00:00Z' },
+              { id: 103, user: { login: 'carol' }, body: '', created_at: '2024-01-03T00:00:00Z' },  // empty comment should be skipped
+            ]));
           }
           return fail('unexpected gh call');
         },
@@ -1799,8 +1647,10 @@ describe('remote driver', () => {
       const result = await driver.importUrl!('https://github.com/org/repo/pull/10', {});
 
       expect(result.comments).toHaveLength(2);
-      expect(result.comments![0]).toBe('[alice] Looks good, but needs tests');
-      expect(result.comments![1]).toBe('[bob] Please add error handling');
+      // INVARIANT: link-imported comments carry forge identity (the REST id
+      // every later sync pass dedups against), never just text.
+      expect(result.comments![0]).toMatchObject({ forge: 'github', kind: 'issue_comment', id: '101', author: 'alice', body: 'Looks good, but needs tests' });
+      expect(result.comments![1]).toMatchObject({ forge: 'github', kind: 'issue_comment', id: '102', author: 'bob', body: 'Please add error handling' });
     });
 
     test('throws when gh pr view fails', async () => {
@@ -1833,7 +1683,7 @@ describe('remote driver', () => {
               body: '',
             }));
           }
-          if (args[0] === 'pr' && args[1] === 'view' && args.includes('comments')) {
+          if (args[0] === 'api' && args[1].endsWith('/issues/5/comments')) {
             return fail('API error');
           }
           return fail('unexpected gh call');
@@ -1857,7 +1707,7 @@ describe('remote driver', () => {
 
     test('includes untrusted input warning', () => {
       const comments: RemoteComment[] = [
-        { id: '1', body: 'Please fix this', author: 'reviewer', createdAt: '2024-06-01T10:00:00Z' },
+        { forge: 'github', kind: 'issue_comment', id: '1', body: 'Please fix this', author: 'reviewer', createdAt: '2024-06-01T10:00:00Z' },
       ];
       const result = buildRemoteCommentsContext(comments);
 
@@ -1869,7 +1719,7 @@ describe('remote driver', () => {
 
     test('formats author, timestamp, and body', () => {
       const comments: RemoteComment[] = [
-        { id: '1', body: 'Looks good!', author: 'alice', createdAt: '2024-06-01T10:00:00Z' },
+        { forge: 'github', kind: 'issue_comment', id: '1', body: 'Looks good!', author: 'alice', createdAt: '2024-06-01T10:00:00Z' },
       ];
       const result = buildRemoteCommentsContext(comments);
 
@@ -1879,7 +1729,7 @@ describe('remote driver', () => {
 
     test('includes file path and line for inline comments', () => {
       const comments: RemoteComment[] = [
-        { id: '1', body: 'Rename this', author: 'bob', createdAt: '2024-06-01T10:00:00Z', path: 'src/main.ts', line: 42 },
+        { forge: 'github', kind: 'issue_comment', id: '1', body: 'Rename this', author: 'bob', createdAt: '2024-06-01T10:00:00Z', path: 'src/main.ts', line: 42 },
       ];
       const result = buildRemoteCommentsContext(comments);
 
@@ -1888,7 +1738,7 @@ describe('remote driver', () => {
 
     test('includes file path without line when line is not present', () => {
       const comments: RemoteComment[] = [
-        { id: '1', body: 'Review this file', author: 'carol', createdAt: '2024-06-01T10:00:00Z', path: 'README.md' },
+        { forge: 'github', kind: 'issue_comment', id: '1', body: 'Review this file', author: 'carol', createdAt: '2024-06-01T10:00:00Z', path: 'README.md' },
       ];
       const result = buildRemoteCommentsContext(comments);
 
@@ -1898,7 +1748,7 @@ describe('remote driver', () => {
 
     test('uses clear delimiters that are distinct from other prompt sections', () => {
       const comments: RemoteComment[] = [
-        { id: '1', body: 'Test', author: 'x', createdAt: '2024-01-01T00:00:00Z' },
+        { forge: 'github', kind: 'issue_comment', id: '1', body: 'Test', author: 'x', createdAt: '2024-01-01T00:00:00Z' },
       ];
       const result = buildRemoteCommentsContext(comments);
 

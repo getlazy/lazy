@@ -17,11 +17,20 @@ import type {
   ReviewVerdict,
   Comment,
   JournalEntry,
-  FollowUp,
+  ActorIdentityMigrationResult,
+  FollowUpMigrationResult,
+  RaisedItem,
+  RaisedItemInput,
+  RaisedItemResolveAction,
+  TurnReport,
+  TurnReportInput,
+  FileDecision,
+  FileDecisionInput,
   TaskPromptVersion,
   TaskStatus,
   TaskTarget,
   SessionOutcome,
+  TurnOwner,
   TurnRole,
   TurnType,
   InFlightTurn,
@@ -30,29 +39,104 @@ import type {
   WorktreeSnapshot,
   TaskTreeNode,
   ListTasksOptions,
+  TaskCodeEntry,
   SearchResult,
   StoredConversation,
+  ConversationSummary,
   AgentSessionLog,
   BuilderResumeIntent,
+  BuilderSession,
+  BuilderSessionUpdate,
+  ProjectSettings,
   StatusChange,
   Actor,
+  ActorInput,
   TagEvent,
   MemoryRecord,
   MemoryEvent,
   MemoryWriteInput,
   MemoryCompact,
   MemoryCompactInput,
+  ScratchFile,
+  ScratchFileInput,
+  SystemMessage,
+  SystemMessageInput,
   CommentSource,
+  CommentCreateOptions,
+  CommentUpdate,
   HunkApproval,
   HunkApprovalLineage,
   ReviewComment,
   ReviewCommentInput,
   ReviewCommentUpdate,
+  ReviewSession,
+  ReviewSessionMessage,
+  ReviewSessionMessageInput,
+  ReviewSessionMessageUpdate,
+  ReviewSessionUpdate,
+  ReviewDraftState,
+  ReviewDraftPatch,
+  TaskArtifact,
+  TaskArtifactContent,
+  TaskArtifactInput,
+  TaskToolStatsRecord,
+  StoredUsageLimitReading,
 } from './types';
 import type { SpanRecord } from '../tracing/types';
 import type { RunnerType } from '../config/types';
-import type { WaitInterval, WaitOutcome } from '../types';
+import type { FinalClaim, ReviewReport, WaitInterval, WaitOutcome } from '../types';
 import type { WaitIntervalStart, WaitIntervalFilter } from './wait-intervals';
+
+/**
+ * The typed refusal of `createBuilderSession`: a rival active session exists
+ * for the same member on the same PROJECT (§5.7). Lives beside the contract
+ * it documents, not inside one backend — every Storage implementation throws
+ * it for the same condition, and callers match on the class rather than on
+ * one backend's import. The check and the insert run in the same locked
+ * critical section, so the claim row a start writes before launching its
+ * container is also what excludes a rival — two concurrent starts cannot both
+ * register for the same member, and a start racing a raw storage-proxy call
+ * is refused the same way. `rivalId` names the row that won; callers that
+ * want it as a session re-read `getActiveBuilderSessionForMember` (the loser
+ * of a start returns it).
+ */
+export class BuilderSessionActiveError extends Error {
+  constructor(readonly rivalId: string, state: string) {
+    super(
+      `Builder session ${rivalId} is still active for this member (state '${state}') — ` +
+      `one session per member per project; resume or end it before starting another.`,
+    );
+    this.name = 'BuilderSessionActiveError';
+  }
+}
+
+/**
+ * The typed refusal of `updateBuilderSession(id, patch, expectedState)`: the
+ * row's state at WRITE time — read in the same locked critical section as
+ * the write — was not the state the caller expected. Someone moved the row
+ * first (§5.7: typically the member's own explicit end racing a launch that
+ * was already in flight). `expectedState` is what the caller required;
+ * `actualState` is what the row said when the write ran. The guard never
+ * rewrites the row and never reverts the member's decision: the refused
+ * caller re-reads `getBuilderSession` and defers to the row's current state.
+ */
+export class BuilderSessionStateConflictError extends Error {
+  constructor(
+    readonly id: string,
+    readonly expectedState: BuilderSession['state'],
+    readonly actualState: BuilderSession['state'],
+    readonly expectedBuilderId?: string,
+    readonly actualBuilderId?: string,
+  ) {
+    super(
+      (expectedBuilderId !== undefined && expectedBuilderId !== actualBuilderId
+        ? `Builder session ${id} was relaunched (builder id '${actualBuilderId}', not the expected '${expectedBuilderId}') — `
+        : `Builder session ${id} is in state '${actualState}', not the expected '${expectedState}' — `) +
+      `the row moved on before this update could land; re-read it and defer to its current state.`,
+    );
+    this.name = 'BuilderSessionStateConflictError';
+  }
+}
 
 /**
  * Options for creating a new turn
@@ -69,6 +153,12 @@ export interface CreateTurnOptions {
   endShaWork?: string;
   mergeConflicts?: MergeConflict[];
   violations?: FileViolation[];
+  /**
+   * Paths left uncommitted in the worktree when this turn ended. Pass only a
+   * NON-EMPTY set — see `Turn.uncommitted` for why an empty one is not the
+   * same statement as an absent one.
+   */
+  uncommitted?: string[];
   /**
    * Agent id this turn was launched with (e.g. `claude-code`, `cursor`). Omit
    * when it is not known — absent means "unknown", never "the task's current
@@ -92,19 +182,64 @@ export interface CreateTurnOptions {
    */
   mcpTools?: string;
   prompt?: string;
-  /** Who created this turn: human (CLI) or builder (MCP). Only meaningful for role='human' turns. */
-  actor?: Actor;
+  /**
+   * Who created this turn: human (CLI) or builder (MCP). Only meaningful for
+   * role='human' turns. Pass an {@link ActorRef} to also record WHICH person
+   * acted — daemon-imposed from the caller's user actor token, never client-set.
+   */
+  actor?: ActorInput;
   /** Exit code of the post-turn check command */
   checkExitCode?: number;
   /** Captured output from the post-turn check command */
   checkOutput?: string;
+  /** Exit code of the pre-turn setup hook, when it failed before this turn */
+  preTurnExitCode?: number;
+  /** Captured output of the failed pre-turn setup hook */
+  preTurnOutput?: string;
   /** Whether this turn was auto-triggered (CI failure, comment, upstream sync, crash) vs human-triggered */
   autoTriggered?: boolean;
   /**
    * Turn category. Defaults to 'work' (substantive task-advancing turn) when
-   * omitted. Use 'ask' for read-only Q&A exchanges (e.g. `lazy review -i`).
+   * omitted. Use 'ask' for read-only Q&A exchanges (e.g. `lazy browse -i`).
+   * Use 'review' for an agent review turn (`lazy review`).
    */
   turnType?: TurnType;
+  /**
+   * Structured findings from an agent review. Only meaningful on the agent
+   * turn of a `turnType: 'review'` exchange. See {@link ReviewReport}.
+   */
+  review?: ReviewReport;
+  /**
+   * HOW this review was started: 'auto' (the daemon dispatched it after a
+   * final) or 'manual' (a human's `lazy review`, a driver's `lazy_review`).
+   *
+   * The accept gate reads it: under the default gate only a `separate` task's
+   * dispatched review holds a merge, while a review somebody ASKED for holds
+   * one whatever mode the task is in. Absent is read as 'manual' — the gating
+   * direction, and what every turn recorded before this field already did.
+   */
+  reviewDispatch?: 'auto' | 'self' | 'manual';
+  /**
+   * This review's findings were ALREADY ACTED ON by the same exchange that
+   * produced it — the `low_high` revise pass, which runs straight after the
+   * self-review and applies its instructions.
+   *
+   * The recorded report is the PRE-fix state (that is what the reviewer wrote),
+   * and the revise phase is a supervised `nudge` turn, so `hasWorkAgentTurnAfter`
+   * never clears it: without this, `gate = "always"` holds a merge forever on
+   * findings that were fixed seconds later, and a project on that setting could
+   * not land a task whose self-review worked.
+   */
+  reviewAddressed?: boolean;
+  /**
+   * Pencils down: the declaration that this turn's agent (or a human) made that
+   * the task's work is finished. See {@link FinalClaim}.
+   *
+   * INVARIANT (final-turn design §13.1): the claim is recorded on the turn that
+   * MADE it and nowhere else — never as a field on the task. Whether the task
+   * is final NOW is `resolveFinalState`'s answer over these records.
+   */
+  final?: FinalClaim;
   /**
    * Mark this turn as carrying human/builder feedback that the agent has not
    * consumed yet (persisted as `feedback_delivery: 'pending'`).
@@ -162,7 +297,7 @@ export interface Storage {
    * 'agent', CLI → omitted, which reads as human). It is stamped on the initial
    * 'backlog' status-changelog entry so "who created this task" is auditable.
    */
-  createTask(goal: string, parentTaskId?: string, branchedFromSha?: string, code?: string, type?: string, agentId?: string, actor?: Actor): Promise<Task>;
+  createTask(goal: string, parentTaskId?: string, branchedFromSha?: string, code?: string, type?: string, agentId?: string, actor?: ActorInput): Promise<Task>;
 
   /**
    * Get a task by ID (supports prefix matching and code lookup)
@@ -192,9 +327,29 @@ export interface Storage {
   listTasksWithOptions(options: ListTasksOptions): Promise<Task[]>;
 
   /**
+   * Every task's id and code — identity only, no task bodies.
+   *
+   * For callers that want to map codes to tasks (autolinking prose, resolving a
+   * code a human typed) and would otherwise materialise the whole store to read
+   * one field off each task. Ordering is unspecified: this is a lookup table,
+   * not a listing.
+   */
+  listTaskCodes(): Promise<TaskCodeEntry[]>;
+
+  /**
+   * How many descendants — children, grandchildren, … — each of `taskIds` has.
+   *
+   * Same numbers as `descendantCounts()` over the full task set, without
+   * materialising it. Keyed by the ids passed in; an id the store does not know
+   * maps to 0. A plain object rather than a Map because this crosses the daemon
+   * RPC boundary.
+   */
+  countDescendants(taskIds: string[]): Promise<Record<string, number>>;
+
+  /**
    * Update task status
    */
-  updateTaskStatus(taskId: string, status: TaskStatus, actor?: Actor): Promise<void>;
+  updateTaskStatus(taskId: string, status: TaskStatus, actor?: ActorInput): Promise<void>;
 
   /**
    * Update task goal
@@ -238,11 +393,6 @@ export interface Storage {
   updateTaskType(taskId: string, type: string): Promise<void>;
 
   /**
-   * Update task queue priority (orders the concurrency drain sweep).
-   */
-  updateTaskPriority(taskId: string, priority: string): Promise<void>;
-
-  /**
    * Update the agent to use for this task. Allowed at any time while the task
    * is live (not in terminal status). The change takes effect on the next turn.
    * NOTE: When switching agents mid-task, the caller must also clear the
@@ -263,12 +413,12 @@ export interface Storage {
   /**
    * Abandon a task with a reason. Sets status to 'abandoned' and records the reason.
    */
-  abandonTask(taskId: string, reason: string, actor?: Actor): Promise<void>;
+  abandonTask(taskId: string, reason: string, actor?: ActorInput): Promise<void>;
 
   /**
    * Reopen an abandoned task: reset status to 'blocked' and clear completed_at
    */
-  reopenTask(taskId: string, actor?: Actor): Promise<void>;
+  reopenTask(taskId: string, actor?: ActorInput): Promise<void>;
 
   /**
    * Set a metadata key-value pair on a task
@@ -286,7 +436,21 @@ export interface Storage {
   updateTaskPrompt(taskId: string, content: string, sessionId?: string): Promise<TaskPromptVersion>;
 
   /**
-   * Get prompt version history for a task
+   * Get prompt version history for a task. This is for HISTORY — for the
+   * CURRENT prompt use `currentPromptOf(task)` (`src/task-prompt.ts`), never
+   * an index into this array.
+   *
+   * WARNING: the ORDER of this array is backend-dependent and unspecified.
+   * FileStorage returns it newest-first, PostgresStorage oldest-first. Five
+   * callers each independently read `history[history.length - 1]` as "the
+   * current prompt", which on the default file backend is the ORIGINAL one:
+   * `lazy_show` reported a prompt the agent never received, and `clone`/`redo`
+   * seeded new tasks with superseded text that then got executed.
+   *
+   * Sort by `version` yourself if order matters to you. (Making the two
+   * backends agree would be the better fix, but it changes an assertion in an
+   * invariant test — `test/unit/storage-concurrent-writes.test.ts` — so it
+   * needs human approval rather than a passing agent's judgment.)
    */
   getPromptHistory(taskId: string): Promise<TaskPromptVersion[]>;
 
@@ -339,9 +503,19 @@ export interface Storage {
   updateSessionClaudeId(sessionId: string, claudeSessionId: string): Promise<void>;
 
   /**
-   * Update session's container name for async tracking
+   * Update session's container name for async tracking.
+   *
+   * When `containerName` is null the container is gone — also clears
+   * `container_agent_id` (the stamp describes the container we just dropped).
+   * When setting a name, pass `containerAgentId` to stamp which profile the
+   * (re)created container was launched for; omit it to leave the stamp alone
+   * (legacy clear-only callers).
    */
-  updateSessionContainerName(sessionId: string, containerName: string | null): Promise<void>;
+  updateSessionContainerName(
+    sessionId: string,
+    containerName: string | null,
+    containerAgentId?: string | null,
+  ): Promise<void>;
 
   /**
    * Stamp the runner that actually launched this session. Recorded at launch as
@@ -351,12 +525,18 @@ export interface Storage {
   updateSessionRunnerType(sessionId: string, runnerType: RunnerType | null): Promise<void>;
 
   /**
-   * Update session's agent when switching agents mid-task. This updates the
-   * session's agent_id AND clears the agent_session_id (sessions cannot be
-   * resumed across different agents — each agent has its own session format).
-   * The next turn starts a fresh agent session with the new agent.
+   * Update a session's agent when switching agents mid-task, and — when
+   * `resetAgentSession` — clear its agent_session_id so the next turn starts a
+   * fresh agent session.
+   *
+   * `agentId` is a PROFILE name; the reset is a HARNESS decision. A session id
+   * is only meaningful to the agent binary that issued it, so it survives a
+   * switch between two profiles of the same harness (e.g. two claude-code
+   * profiles on different upstreams) and must not survive a switch to a
+   * different one. The caller knows which case it is — hence the explicit
+   * argument rather than an inference from the id here.
    */
-  updateSessionAgent(sessionId: string, agentId: string): Promise<void>;
+  updateSessionAgent(sessionId: string, agentId: string, resetAgentSession: boolean): Promise<void>;
 
   /**
    * Update session interaction tracking
@@ -372,6 +552,37 @@ export interface Storage {
    * Update the upstream merge SHA (for accurate diff scope)
    */
   updateSessionUpstreamMergeSha(sessionId: string, sha: string): Promise<void>;
+
+  /**
+   * Record that every comment created at or before `timestamp` has been
+   * delivered to the agent in a prompt. Monotonic — never moves backwards.
+   * See {@link Session.notes_delivered_through}.
+   */
+  markNotesDelivered(sessionId: string, timestamp: number): Promise<void>;
+
+  /**
+   * Record who asked for the turn this session is about to run, or `null` when
+   * nobody did. See {@link Session.turn_owner_email}.
+   *
+   * `systemInitiated` says the daemon started the turn ITSELF, and is written
+   * in the SAME operation so the two can never disagree: a launch that records
+   * a person clears the mark, and one that clears the owner sets it. A caller
+   * that passes neither records "no asker, and we are not claiming the daemon
+   * did it" — which is what a failed write must degrade to
+   * ({@link Session.turn_system_initiated}).
+   *
+   * DAEMON-ONLY, and not proxied by RemoteStorage: the owner is derived from
+   * the caller's token (or, on a laptop, from the daemon's own git config), so
+   * accepting it over the wire would make attribution a request field — the one
+   * thing the whole identity design refuses. It is written by the launch path
+   * (src/daemon/turn-owner.ts) and read by everything that attributes an
+   * agent's work.
+   */
+  setSessionTurnOwner(
+    sessionId: string,
+    owner: TurnOwner | null,
+    systemInitiated?: boolean,
+  ): Promise<void>;
 
   /**
    * Record interrupt diagnostics on a session
@@ -443,6 +654,24 @@ export interface Storage {
   beginInFlightTurn(taskId: string, turn: InFlightTurn): Promise<boolean>;
 
   /**
+   * Stamp the run/container the in-flight turn at `turnSequence` is executing
+   * in, once its launch has succeeded. Returns false when no record with that
+   * sequence is present.
+   *
+   * This is what makes an ASYNCHRONOUS ask/review probeable and stoppable: with
+   * no RPC caller holding the answer, "is the reviewer still alive?" and "which
+   * container does `lazy stop` kill?" are both answered from here. Stamped
+   * AFTER the launch on purpose — its absence is the startup grace, so a
+   * reconcile tick landing between the claim and the launch cannot mistake a
+   * run that has not started yet for one that died.
+   */
+  stampInFlightTurnRun(
+    taskId: string,
+    turnSequence: number,
+    run: { runName: string; runnerType?: RunnerType },
+  ): Promise<boolean>;
+
+  /**
    * Record how the in-flight turn at `turnSequence` ended. Returns false when
    * no record with that sequence is present, so a settler that raced a clear
    * (or a stale settler) writes nothing.
@@ -468,6 +697,22 @@ export interface Storage {
   updateTurnViolations(taskId: string, turnId: string, violations: FileViolation[]): Promise<void>;
 
   /**
+   * Fill the wrap-up audit record (final-turn design §13.3) on a turn's final
+   * claim with the wrap-up steps that actually ran. Called by the settle/work
+   * paths right after the turns are recorded; best-effort on the caller side.
+   * Throws when the turn no longer exists.
+   */
+  updateTurnWrapUpSteps(taskId: string, turnId: string, wrapUpSteps: string[]): Promise<void>;
+
+  /**
+   * Replace the structured review record on a turn.
+   *
+   * Used after a review turn is persisted, once forge comments have been
+   * posted, so a remote failure can never lose the review itself.
+   */
+  updateTurnReview(taskId: string, turnId: string, review: ReviewReport): Promise<void>;
+
+  /**
    * Mark every `feedback_delivery: 'pending'` turn in a session as 'consumed'.
    *
    * Called when an agent response completes normally (the agent turn is
@@ -491,6 +736,16 @@ export interface Storage {
    * Get all commits for a session
    */
   getSessionCommits(sessionId: string): Promise<Commit[]>;
+
+  /**
+   * Remove commit records by SHA and return how many were removed.
+   *
+   * The one way a commit record is ever deleted, and it exists for a single
+   * caller: the explicit `lazy system repair-commits` repair of lists that a
+   * historical range bug over-recorded (see src/task/session-commits.ts).
+   * Recording paths only ever ADD — nothing removes a record implicitly.
+   */
+  deleteSessionCommits(sessionId: string, shas: string[]): Promise<number>;
 
   // --- Reviews ---
 
@@ -553,8 +808,25 @@ export interface Storage {
   /**
    * Create a comment on a task.
    * @param source - 'remote' for comments synced from PR/MR, 'local' (default) for locally-created.
+   * @param options - structured forge identity ({@link Comment.external}) and,
+   *   for the revision of a seen comment, the comment it revises.
    */
-  createComment(taskId: string, content: string, actor?: Actor, source?: CommentSource): Promise<Comment>;
+  createComment(taskId: string, content: string, actor?: ActorInput, source?: CommentSource, options?: CommentCreateOptions): Promise<Comment>;
+
+  /**
+   * Change an existing comment's content and/or forge identity. A content
+   * change stamps `edited_at`; `created_at` never moves, so the comment keeps
+   * its place in the delivery order.
+   *
+   * This is the RAW write and enforces no policy. Whether a comment may be
+   * edited at all (only while the agent has not seen it) is a business rule
+   * that lives in `src/task/comment-edit.ts`; every caller that edits content
+   * goes through it. Stamping identity onto a seen comment is fine — it
+   * changes nothing the agent read.
+   * @param actor - who is editing the content, stamped as edited_by /
+   *   edited_by_email / edited_by_name. Ignored for an identity-only update.
+   */
+  updateComment(taskId: string, commentId: string, update: CommentUpdate, actor?: ActorInput): Promise<Comment>;
 
   /**
    * Get all comments for a task
@@ -563,46 +835,370 @@ export interface Storage {
 
   // --- Journal ---
   //
-  // The task journal is an append-only, prompt-immune side channel for
+  // The task journal is an append-only, pull-based side channel for
   // orchestration metadata, decision rationale, and cross-run agent memories.
   //
-  // INVARIANT: journal entries must NEVER be injected into the agent/LLM
-  // prompt. They are a separate entity from comments precisely so there is no
-  // shared code path that could leak them into a prompt. Do not add methods
-  // here that feed the journal into prompt-assembly, auto-react, or remote PR
-  // sync — those are comment behaviors, not journal behaviors.
+  // INVARIANT: appending an entry must never trigger a turn, and entry CONTENT
+  // must never be injected into the agent/LLM prompt. Prompt assembly may read
+  // the journal for exactly one purpose — counting entries new since the last
+  // agent turn, to render the count-only notice (`buildJournalNotice`). Entries
+  // are a separate entity from comments precisely so no shared code path can
+  // leak a body into a prompt. Do not add methods here that feed journal text
+  // into prompt-assembly, auto-react, or remote PR sync — those are comment
+  // behaviors, not journal behaviors.
 
   /**
    * Append an entry to a task's journal. Append-only: there is no update or
    * delete counterpart by design.
    */
-  appendJournalEntry(taskId: string, content: string, actor?: Actor): Promise<JournalEntry>;
+  appendJournalEntry(taskId: string, content: string, actor?: ActorInput): Promise<JournalEntry>;
 
   /**
    * Get all journal entries for a task, in chronological order.
    */
   getTaskJournal(taskId: string): Promise<JournalEntry[]>;
 
-  // --- Follow-ups (task-level orthogonal-work discoveries) ---
+  // --- Raised items (everything an agent surfaces for human eyes) ---
+  //
+  // ONE entity with ONE flag: `blocking: true` gates accept (a question or
+  // decision about this task's own scope or diff), `blocking: false` never does
+  // (orthogonal proposals, FYIs — the former follow-ups).
+  //
+  // INVARIANT: creating or resolving a raised item is a PASSIVE write — it must
+  // NOT create a comment, change task status, or trigger an auto-turn. That
+  // non-triggering property is exactly why this is a distinct store and NOT
+  // comments (comments feed the auto-react loop, which would spuriously kick the
+  // agent into a new turn). The pending comment is stored on the item;
+  // unblock/accept materializes it. Accept refuses while BLOCKING items are
+  // open; that is the only lifecycle coupling. Close / reject / abandon leave
+  // open items as historical `open`. See docs/design/raised-items-unified.md.
 
   /**
-   * Append a follow-up note to a task.
+   * Append a raised item to a task.
    *
-   * INVARIANT: This is a PASSIVE write — recording a follow-up MUST NOT trigger
-   * any auto-turn, auto-resume, or auto-react. That non-triggering property is
-   * exactly why follow-ups are a distinct store and NOT comments (comments feed
-   * the comment auto-react loop, which would spuriously kick the agent into a
-   * new turn — the "lost turn" failure follow-ups exist to avoid). See CLAUDE.md.
-   * @param sessionId - the agent run that surfaced this follow-up, if known.
+   * `input.blocking` is REQUIRED — every caller decides whether the item gates
+   * accept. Non-triggering, per the invariant above.
    */
-  createFollowUp(taskId: string, content: string, sessionId?: string | null): Promise<FollowUp>;
+  createRaisedItem(taskId: string, input: RaisedItemInput): Promise<RaisedItem>;
 
   /**
-   * Get all follow-ups for a task, oldest first.
+   * Get all raised items for a task, oldest first.
    */
-  getTaskFollowUps(taskId: string): Promise<FollowUp[]>;
+  getTaskRaisedItems(taskId: string): Promise<RaisedItem[]>;
 
-  // --- Hunk Approvals (per-hunk "reviewed" state for `lazy review -i`) ---
+  /**
+   * Append a note on a raised item (agent reply after review, disagreement,
+   * "fixed in commit …", etc.). Does NOT change status or clear accept gates.
+   * Passive — no signal, no auto-turn.
+   *
+   * The actor is an `ActorInput` because this row NAMES A PERSON: a raised item
+   * is what gates an accept, and its conversation is the human-written record a
+   * reviewer reads beside an attributed resolution. It is declared in
+   * PERSON_ATTRIBUTED_STORAGE_ACTORS (src/daemon/rpc-command-kinds.ts), which is
+   * what makes both the daemon's stamping and a user token's pinning reach it.
+   */
+  addRaisedItemComment(
+    taskId: string,
+    itemId: string,
+    input: {
+      content: string;
+      actor: ActorInput;
+      session_id?: string | null;
+      turn_sequence?: number | null;
+    },
+  ): Promise<RaisedItem>;
+
+  /**
+   * Resolve a raised item (respond / promote_subtask / promote_peer / dismiss).
+   * Stores a pending comment; does not write a real comment.
+   * Overwrites an existing resolution when the comment has not been delivered.
+   * Refuses a change after comment_delivered_at is set (except same-status idempotent).
+   */
+  resolveRaisedItem(
+    taskId: string,
+    itemId: string,
+    resolution: {
+      action: RaisedItemResolveAction;
+      /**
+       * Who decided. An {@link ActorRef} additionally stamps
+       * `resolved_by_email` / `resolved_by_name` — a raised-item decision gates
+       * a merge, so a team
+       * must be able to see which member made it, not just that "a human" did.
+       */
+      actor: ActorInput;
+      response?: string | null;
+      pending_comment?: string | null;
+    },
+  ): Promise<RaisedItem>;
+
+  /**
+   * Clear a resolution that has not been delivered yet (item returns to open).
+   * Refuses after comment_delivered_at — comments are append-only.
+   *
+   * `actor` is recorded as `unresolved_by` (plus the person, for a ref): the
+   * decision is gone, so who UNDID it is the only attribution left to keep.
+   */
+  unresolveRaisedItem(taskId: string, itemId: string, actor?: ActorInput): Promise<RaisedItem>;
+
+  /**
+   * Stamp that the pending comment was written as a real comment.
+   * Optionally records a promote_peer task id created at materialize time,
+   * and — once the carrying turn is known — the turn number it rode in on
+   * (`delivered_turn`). A second call on an already-delivered item may add
+   * `delivered_turn` but never resets `comment_delivered_at`.
+   */
+  markRaisedItemCommentDelivered(
+    taskId: string,
+    itemId: string,
+    extras?: {
+      promoted_task_id?: string | null;
+      promoted_task_code?: string | null;
+      pending_comment?: string | null;
+      delivered_turn?: number | null;
+    },
+  ): Promise<RaisedItem>;
+
+  /**
+   * Flip whether an item gates accept. The agent chooses the flag at raise
+   * time; the builder/human may correct it at review (CLI, MCP, web).
+   *
+   * Idempotent. Allowed on resolved items too — a reviewer re-flagging a
+   * resolved item changes nothing about the gate, and refusing would make the
+   * listing's toggle fail unpredictably.
+   */
+  setRaisedItemBlocking(
+    taskId: string,
+    itemId: string,
+    blocking: boolean,
+    actor: ActorInput,
+  ): Promise<RaisedItem>;
+
+  /**
+   * Promote a raised item into a backlog task and mark it promoted.
+   *
+   * Works for either flavour. `proposed_code` / `proposed_prompt` on the item
+   * supply the new task's code and prompt when the caller does not override.
+   *
+   * INVARIANT: creates BACKLOG only — never auto-starts. Re-promote is refused.
+   * A deliberate human/builder act (same posture as MCP create for vetting).
+   */
+  promoteRaisedItem(
+    taskId: string,
+    itemId: string,
+    options: {
+      goal?: string;
+      prompt?: string;
+      code?: string;
+      parent?: string;
+      /** `peer` (default, the former follow-up behavior) or `subtask`. */
+      relation?: 'peer' | 'subtask';
+      /** Who promoted it — stamped on the item's resolution and the new task. */
+      actor: ActorInput;
+    },
+  ): Promise<import('../types').PromoteRaisedItemResult>;
+
+  /**
+   * Seed a BACKLOG task from a consecutive range of a stored conversation's
+   * messages, resolving `sessionId` by exact id or unique prefix.
+   *
+   * Same posture as {@link promoteRaisedItem}: the shared seeding path creates
+   * the task, nothing is started, and the durable link back is written on the
+   * TASK (`metadata.promoted_from_conversation`) — never on the conversation
+   * record, which capture rewrites wholesale every time the session grows.
+   *
+   * An EXACT repeat of a range already promoted is refused; an overlapping one
+   * is allowed and reported, because a long conversation legitimately yields
+   * several tasks.
+   */
+  promoteConversation(
+    sessionId: string,
+    options: {
+      /** 1-based inclusive message numbers; `to` defaults to `from`. */
+      from?: number;
+      to?: number;
+      goal?: string;
+      prompt?: string;
+      code?: string;
+      /** Task id/code to parent the new task under; absent = top level. */
+      parent?: string;
+      actor: Actor;
+    },
+  ): Promise<import('../types').PromoteConversationResult>;
+
+  /**
+   * Convert every pre-unification follow-up record into a raised item with
+   * `blocking: false`. Run once at daemon start.
+   *
+   * INVARIANT: idempotent and loud. A record that cannot be converted is left
+   * in place, its task's follow-up file is NOT retired, and the failure is
+   * reported — never dropped. Nothing is deleted; the source file is renamed,
+   * not removed. See docs/design/raised-items-unified.md.
+   */
+  migrateFollowUpsToRaisedItems(): Promise<FollowUpMigrationResult>;
+
+  /**
+   * Rewrite stored attribution off the control plane's `actor_user_id` and onto
+   * the `actor_email` the store now names people by. Run once at daemon start.
+   *
+   * INVARIANT: idempotent and loud. An id that cannot be read as an email is
+   * CLEARED — carrying `user-12` into a field that promises an address would
+   * render a person who does not exist — and both the count and the distinct
+   * ids come back so the daemon can report them. Silently dropping attribution
+   * is the one thing this migration must not do. See
+   * docs/design/actor-identity-and-remote-clients.md §3.8.
+   */
+  migrateActorIdentity(): Promise<ActorIdentityMigrationResult>;
+
+  // --- Turn reports (structured end-of-turn summaries via lazy_report) ---
+  //
+  // INVARIANT: upserting a turn report is a PASSIVE write — no status change,
+  // no auto-turn, no turn-end/liveness signal. Latest-wins per session_id.
+  // Agent-chosen section order is the presentation contract.
+
+  /**
+   * Replace-or-create the structured report for this task+session (latest-wins).
+   * Non-triggering — same posture as createFollowUp / createRaisedItem.
+   */
+  upsertTurnReport(taskId: string, input: TurnReportInput): Promise<TurnReport>;
+
+  /** All turn reports for a task, oldest first. */
+  getTaskTurnReports(taskId: string): Promise<TurnReport[]>;
+
+  /** Report for a session, if any. */
+  getTurnReportBySession(taskId: string, sessionId: string): Promise<TurnReport | null>;
+
+  /**
+   * Best-effort stamp of turn_sequence onto the session's report.
+   * No-op if no report exists. Callers (reconciler) must catch errors so a
+   * stamp failure never fails the turn.
+   */
+  stampTurnReportSequence(taskId: string, sessionId: string, turnSequence: number): Promise<void>;
+
+  // --- File decisions (protected/maintain keep justifications) ---
+  //
+  // INVARIANT: passive write; justification never auto-approves a protected file.
+
+  /**
+   * Upsert a keep justification. Latest-wins per (session_id, scope, target)
+   * when session_id is set; otherwise per (scope, target) task-wide.
+   */
+  upsertFileDecision(taskId: string, input: FileDecisionInput): Promise<FileDecision>;
+
+  /** All file decisions for a task, oldest first. */
+  getTaskFileDecisions(taskId: string): Promise<FileDecision[]>;
+
+  /**
+   * List every raised item in the project with originating-task context,
+   * mechanical recurrence grouping, and promotion hints derived from task prompts.
+   * Filterable by `blocking`.
+   */
+  listRaisedItems(options?: import('../raised').ListRaisedItemsOptions): Promise<import('../raised').ListRaisedItemsResult>;
+
+  // --- Task artifacts (named files attached to a task) ---
+  //
+  // An artifact is a file handed TO a task (design assets, a spec, a fixture) or
+  // PUBLISHED BY it (a report, a rendered image, a data dump). It replaces the
+  // pre-artifact smuggle of pasting file content into a comment.
+  //
+  // INVARIANT: attaching an artifact is a PASSIVE write. It must never create a
+  // comment, change task status, or trigger an auto-turn/auto-resume — the same
+  // non-triggering property as follow-ups, and for the same reason. Artifact
+  // CONTENT is never injected into an agent prompt: the launch path materializes
+  // the files into the worktree and the prompt carries a count-and-location
+  // notice only. Do not add methods here that feed artifact bytes into prompt
+  // assembly — that is comment behavior, not artifact behavior.
+  //
+  // INVARIANT: bounded by construction. Implementations MUST enforce
+  // `assertArtifactWithinLimits` (src/artifacts/limits.ts) before persisting.
+  // Unbounded per-task growth inside the store is the failure mode that broke a
+  // real store once (see the proxy audit log carve-out in CLAUDE.md); artifacts
+  // must not become the second instance.
+
+  /**
+   * Attach an artifact to a task, or REPLACE the existing artifact of the same
+   * name. There is deliberately no versioning: one name, one artifact.
+   *
+   * Throws `ArtifactLimitError` when the per-file, per-task-total or per-task
+   * count bound would be breached, and `ArtifactNameError` for a name that is
+   * absolute or escapes the artifact root.
+   */
+  createTaskArtifact(taskId: string, input: TaskArtifactInput, actor?: Actor): Promise<TaskArtifact>;
+
+  /**
+   * List a task's artifacts (METADATA ONLY), oldest first. Content is fetched
+   * per-artifact so that listing a task with a megabyte of attachments costs a
+   * few hundred bytes.
+   */
+  listTaskArtifacts(taskId: string): Promise<TaskArtifact[]>;
+
+  /**
+   * Read one artifact by name, content included, or null when the task or the
+   * name does not exist.
+   */
+  getTaskArtifact(taskId: string, name: string): Promise<TaskArtifactContent | null>;
+
+  /** Remove an artifact by name. Returns false when there was nothing to remove. */
+  deleteTaskArtifact(taskId: string, name: string): Promise<boolean>;
+
+  // --- Review regions (the carved cover of a task's review range) ---
+  //
+  // A region cover is a persistent domain object on the task, so it lives here
+  // like everything else — there is no `.lazy/cache` carve-out for it. It is
+  // derived from git, but it is not disposable in the way the proxy audit log
+  // is: a reviewer's overlay hangs off its unit ids, and losing the cover
+  // loses the sign-offs with it.
+  //
+  // INVARIANT: the cover is REPLACED wholesale by a refresh and the overlay is
+  // NOT. Region identity is the unit id (a task code, a chunk index, a commit
+  // sha), never a position in a slicing, which is what lets the daemon
+  // recompute at the end of every turn without anything shifting under a
+  // reviewer mid-review. Do not merge overlay fields into the stored cover —
+  // the next refresh would drop them.
+
+  /**
+   * The task's stored region cover, or null when none has been computed yet
+   * (a task whose first turn has not finished, or an older task).
+   *
+   * The human overlay is NOT merged in here — callers that render regions
+   * apply it with `applyRegionOverlays`, because the daemon is also a caller
+   * and must write back a cover with no overlay in it.
+   */
+  getRegionCover(taskId: string): Promise<import('../regions').RegionCover | null>;
+
+  /** Replace the task's region cover. Overlays are untouched. */
+  saveRegionCover(taskId: string, cover: import('../regions').RegionCover): Promise<void>;
+
+  /** The task's human region overlays, keyed by unit id. */
+  getRegionOverlays(taskId: string): Promise<import('../regions').RegionOverlay[]>;
+
+  /**
+   * Set or update one region's overlay, merged field-by-field over any
+   * existing one so naming a region does not clear its sign-off.
+   *
+   * Accepts a unit id that is not (or not yet) in the cover: an overlay
+   * outlives the cover it was written against by design.
+   *
+   * `actor` is WHO is making this write, derived by the daemon from the calling
+   * token and never from a request field. It is recorded against the fields
+   * this patch actually changes — the owner, the sign-off, or both — so a later
+   * rename cannot make one person's annotation look like another's. Absent
+   * means the caller could not be attributed to a person (the CLI, the daemon's
+   * own review page, a control-plane token); the attribution on the fields
+   * being written is then REMOVED rather than left pointing at whoever wrote
+   * them last.
+   */
+  setRegionOverlay(
+    taskId: string,
+    unitId: string,
+    patch: {
+      name?: string;
+      owner?: string | null;
+      signed_off_sha?: string | null;
+      actor?: import('../regions').OverlayActor;
+    },
+  ): Promise<import('../regions').RegionOverlay>;
+
+  // --- Hunk Approvals (per-hunk "reviewed" state for `lazy browse -i`) ---
 
   /**
    * List all hunk approvals for a task. The reviewer loads these at
@@ -665,6 +1261,76 @@ export interface Storage {
     update: ReviewCommentUpdate,
   ): Promise<ReviewComment>;
 
+  // --- Review Sessions (task-scoped builder review conversations) ---
+
+  /**
+   * Create an empty review session for a task. The lazy-minted id exists before
+   * any agent runs. v1: one session per task — rejects if one already exists.
+   */
+  createReviewSession(taskId: string): Promise<ReviewSession>;
+
+  /** Primary read in v1 — at most one session per task. */
+  getReviewSessionByTaskId(taskId: string): Promise<ReviewSession | null>;
+
+  /** Update session status and/or the Claude --resume target. */
+  updateReviewSession(sessionId: string, patch: ReviewSessionUpdate): Promise<ReviewSession>;
+
+  /**
+   * Append a transcript message. Human messages default to delivery `pending`
+   * and MUST be persisted before any failable builder launch.
+   */
+  appendReviewSessionMessage(
+    sessionId: string,
+    message: ReviewSessionMessageInput,
+  ): Promise<ReviewSessionMessage>;
+
+  /** Advance launch delivery bookkeeping on an existing message. */
+  updateReviewSessionMessage(
+    sessionId: string,
+    messageId: string,
+    patch: ReviewSessionMessageUpdate,
+  ): Promise<ReviewSessionMessage>;
+
+  /** Messages for a session, oldest first (embedded on get in v1). */
+  listReviewSessionMessages(sessionId: string): Promise<ReviewSessionMessage[]>;
+
+  // --- Review drafts (a review in progress: unsent words + viewed ticks) ---
+
+  /**
+   * Read the reviewer's in-progress review state for a task, or null when
+   * there is none.
+   *
+   * `reviewer` is the key from {@link ReviewDraftState.reviewer} — the actor's
+   * user id where the daemon could attribute the caller to a person, else
+   * `local`. Callers should not compose it by hand; use `reviewerKey()` in
+   * src/review-draft.ts.
+   */
+  getReviewDraft(taskId: string, reviewer: string): Promise<ReviewDraftState | null>;
+
+  /**
+   * Write part of a review draft, creating the record on first write.
+   *
+   * INVARIANT (CLAUDE.md "Never Lose Human Feedback"): this is a PATCH, not a
+   * replace. An omitted key is left as it was, so the feedback box autosaving
+   * mid-sentence can never blank the accept reason a reviewer typed in another
+   * tab. Clearing is explicit: write `''`.
+   *
+   * INVARIANT: this is a PASSIVE write, like follow-ups and review comments —
+   * it never starts a turn and never reaches the agent. A draft is by
+   * definition something the reviewer has NOT sent.
+   */
+  saveReviewDraft(
+    taskId: string,
+    reviewer: string,
+    patch: ReviewDraftPatch,
+  ): Promise<ReviewDraftState>;
+
+  /**
+   * Drop a reviewer's whole draft record for a task. Idempotent: returns false
+   * when there was nothing to delete.
+   */
+  deleteReviewDraft(taskId: string, reviewer: string): Promise<boolean>;
+
   // --- Conversations ---
 
   /**
@@ -683,6 +1349,18 @@ export interface Storage {
   listConversations(): Promise<StoredConversation[]>;
 
   /**
+   * List conversation metadata only — no transcripts — sorted by startedAt DESC,
+   * the same order as {@link listConversations}.
+   *
+   * Listing surfaces (the web `/conversations` page, `/api/conversations`,
+   * `lazy conversations list`, `lazy builder list`) must use this instead of
+   * `listConversations()`, which parses every full transcript. Search and a
+   * single-conversation read still go through `listConversations` /
+   * `loadConversation`.
+   */
+  listConversationSummaries(): Promise<ConversationSummary[]>;
+
+  /**
    * Check if a conversation has been imported
    */
   isConversationImported(sessionId: string): Promise<boolean>;
@@ -692,9 +1370,12 @@ export interface Storage {
    * false if none existed under that session ID — so the operation is
    * idempotent and callers can report "already gone" without a pre-check race.
    *
-   * The only caller today is `lazy doctor --purge-housekeeping-conversations`,
-   * the one-time cleanup of machine-generated one-shots captured before they
-   * were excluded at the source. Deleting a conversation is not recoverable
+   * Two callers today, both one-time cleanups behind an explicit flag:
+   * `lazy doctor --purge-housekeeping-conversations` (machine-generated
+   * one-shots captured before they were excluded at the source) and
+   * `lazy doctor --clean-local-command-conversations
+   * --delete-empty-local-command-conversations` (rows holding nothing but
+   * Claude Code scaffolding). Deleting a conversation is not recoverable
    * from lazy alone (Claude Code prunes the raw JSONL on disk over time), so
    * any new caller must be explicitly human-confirmed.
    */
@@ -720,6 +1401,28 @@ export interface Storage {
   // lives in the impermanent project-local `.lazy/` dir, size-capped — see
   // src/proxy/audit-log.ts.
 
+  // --- Project settings overlay ---
+  //
+  // The deployment's operational overrides, layered over the repository's
+  // lazy.toml (docs/design/lazy-teams.md §11). Deliberately in Storage and not
+  // in a file: it must survive a VM rebuild and travel with the project.
+
+  /**
+   * Read the project's settings overlay, or null when nothing has ever been
+   * set. Null means "no overrides" — every effective value comes from
+   * lazy.toml. Callers must not treat null as an error.
+   */
+  getProjectSettings(): Promise<ProjectSettings | null>;
+
+  /**
+   * Replace the project's settings overlay wholesale. The caller passes the
+   * complete desired overlay; a key absent from `settings` is an override that
+   * is being CLEARED, not one left untouched. Whole-record replace rather than
+   * per-key patch because a settings form submits the whole form, and a patch
+   * API makes "unset this back to the repository default" inexpressible.
+   */
+  saveProjectSettings(settings: ProjectSettings): Promise<void>;
+
   // --- Builder Resume Intents (durable upgrade↔builder handshake) ---
 
   /**
@@ -743,6 +1446,75 @@ export interface Storage {
    */
   listBuilderResumeIntents(projectRoot?: string): Promise<BuilderResumeIntent[]>;
 
+  // --- Builder Sessions (daemon-owned interactive builder registry) ---
+
+  /**
+   * Register a new builder session. The caller has not necessarily launched
+   * the container yet — `state: 'starting'` is the expected initial value,
+   * moved to `'running'` once the container is confirmed up.
+   *
+   * Refuses (BuilderSessionActiveError) when the same member already has an
+   * active (non-`ended`) session on the same project — the write-side of the
+   * "one session per member per project" rule (§5.7). The check and the
+   * insert run inside one storage lock, so a start's claim row is both the
+   * record that prevents an orphaned container and the exclusion that keeps
+   * a rival start out. `getActiveBuilderSessionForMember` is the read-side.
+   */
+  createBuilderSession(session: BuilderSession): Promise<BuilderSession>;
+
+  /** A session by id, or null. */
+  getBuilderSession(id: string): Promise<BuilderSession | null>;
+
+  /**
+   * The live (non-`ended`) session for a given project + member, or null.
+   * This is what `startBuilderSession` consults for the "one session per
+   * member per project" rule (§5.7) — a second start for the same member
+   * finds and resumes/reattaches this row rather than registering a second one.
+   */
+  getActiveBuilderSessionForMember(
+    projectRoot: string,
+    memberEmail: string | null,
+  ): Promise<BuilderSession | null>;
+
+  /** All sessions, optionally filtered to a project. */
+  listBuilderSessions(projectRoot?: string): Promise<BuilderSession[]>;
+
+  /**
+   * Patch a session's mutable fields. Always stamps `updatedAt`. Throws if the
+   * session does not exist — a patch to a session nobody registered is a bug at
+   * the call site, not a silent no-op.
+   *
+   * `expectedState` (optional) turns the patch into an expected-state (CAS)
+   * write: the patch lands only while the row's CURRENT state is exactly
+   * `expectedState`, read and decided in the SAME locked critical section as
+   * the write — a refusal is the serialization point, not an advisory check
+   * the patch can outrun. The property it exists for (§5.7): a session the
+   * member explicitly ended must never be resurrected by a launch that was
+   * already in flight — a claim or reconcile whose row moved on underneath it
+   * is refused with BuilderSessionStateConflictError (carrying both states)
+   * instead of overwriting the member's decision; the loser re-reads
+   * `getBuilderSession` and defers. Callers that pass no expected state get
+   * today's unconditional patch — the guard is opt-in per call, not a
+   * parameter every call site has to think about.
+   *
+   * Reachability note, same shape as BuilderSessionActiveError: the typed
+   * refusal is stable against FileStorage (the daemon's own storage). A
+   * RemoteStorage client receives the refusal as a generic Error carrying
+   * this message — no client-side code may match on the class across a
+   * remote hop.
+   *
+   * `expectedBuilderId` narrows the guard to one LAUNCH: state alone cannot
+   * tell a row from the same row relaunched (running → stopped → starting →
+   * running, under a new builder id), so a caller acting on the launch it
+   * read passes that launch's builder id too. A mismatch refuses the same way.
+   */
+  updateBuilderSession(
+    id: string,
+    patch: BuilderSessionUpdate,
+    expectedState?: BuilderSession['state'],
+    expectedBuilderId?: string,
+  ): Promise<BuilderSession>;
+
   // --- Tags ---
   //
   // Tags are lightweight, non-hierarchical grouping labels. The current set
@@ -757,7 +1529,7 @@ export interface Storage {
    * tag is added to Task.tags and a 'tag' event (with actor) is appended to the
    * history. Returns the updated task.
    */
-  addTaskTag(taskId: string, tag: string, actor?: Actor): Promise<Task>;
+  addTaskTag(taskId: string, tag: string, actor?: ActorInput): Promise<Task>;
 
   /**
    * Remove a tag from a task. The tag is normalized before lookup. Idempotent:
@@ -765,7 +1537,7 @@ export interface Storage {
    * event. Otherwise the tag is removed from Task.tags and an 'untag' event
    * (with actor) is appended to the history. Returns the updated task.
    */
-  removeTaskTag(taskId: string, tag: string, actor?: Actor): Promise<Task>;
+  removeTaskTag(taskId: string, tag: string, actor?: ActorInput): Promise<Task>;
 
   /**
    * Get the append-only tag-history for a task, in chronological order.
@@ -773,6 +1545,49 @@ export interface Storage {
    * tasks that have never been tagged.
    */
   getTagHistory(taskId: string): Promise<TagEvent[]>;
+
+  // --- Builder scratch sandbox ---
+  //
+  // The project's builder scratch sandbox, captured from the live
+  // `$LAZY_SCRATCH_DIR` (see src/builder/scratch.ts) so the artifacts a builder
+  // leaves for the engineer survive the host they were written on, are visible
+  // to later builders, and are reachable through `in:scratch` search.
+  //
+  // The live directory stays the working area — that is where builders write,
+  // and it keeps the identical-path convention that makes a printed path
+  // pasteable. Storage is the DURABLE COPY, refreshed by the builder
+  // supervisor's capture monitor (src/builder/scratch-sync.ts).
+  //
+  // INVARIANT: content is stored whole or not at all. Over-cap and binary files
+  // get a metadata-only record carrying `skipped`, never a truncated body — a
+  // half a document read as whole is worse than a document known to be absent.
+  //
+  // INVARIANT: capture never deletes. A file vanishing from the live directory
+  // does not remove its stored record; the store outliving the host dir is the
+  // whole point. Removal is explicit (`lazy scratch rm`).
+
+  /**
+   * Create or update a scratch file, keyed by its sandbox-relative `path`.
+   * Re-saving the same path supersedes the previous content; `created_at` is
+   * preserved from the first capture.
+   *
+   * Throws if `input.content` exceeds the per-file cap — callers that capture
+   * from disk must classify oversize files as `skipped` rather than passing
+   * them through (see `src/builder/scratch-sync.ts`).
+   */
+  saveScratchFile(input: ScratchFileInput, actor: Actor): Promise<ScratchFile>;
+
+  /** Get one scratch file by sandbox-relative path, or null if not captured. */
+  getScratchFile(path: string): Promise<ScratchFile | null>;
+
+  /** List every captured scratch file, newest-updated first. */
+  listScratchFiles(): Promise<ScratchFile[]>;
+
+  /**
+   * Delete a captured scratch file. Returns true if one was removed, false if
+   * that path was never captured — idempotent, so callers need no pre-check.
+   */
+  deleteScratchFile(path: string): Promise<boolean>;
 
   // --- Memory (lazy-owned shared knowledge) ---
   //
@@ -795,7 +1610,7 @@ export interface Storage {
    * supersedes the body/description/type and increments the revision. Saving a
    * tombstoned name revives it as a new revision. Appends a history event.
    */
-  saveMemory(input: MemoryWriteInput, actor: Actor): Promise<MemoryRecord>;
+  saveMemory(input: MemoryWriteInput, actor: ActorInput): Promise<MemoryRecord>;
 
   /**
    * Get a live memory record by name, or null if it does not exist or has been
@@ -814,7 +1629,7 @@ export interface Storage {
    * but its history is preserved. Returns the tombstoned record, or null if no
    * live record with that name exists (idempotent).
    */
-  deleteMemory(name: string, actor: Actor): Promise<MemoryRecord | null>;
+  deleteMemory(name: string, actor: ActorInput): Promise<MemoryRecord | null>;
 
   /**
    * Get the append-only memory write history in chronological order, for one
@@ -835,7 +1650,7 @@ export interface Storage {
    * before is replaced — a compact is regenerated from the records, so old
    * versions carry no information worth keeping.
    */
-  saveMemoryCompact(input: MemoryCompactInput, actor: Actor): Promise<MemoryCompact>;
+  saveMemoryCompact(input: MemoryCompactInput, actor: ActorInput): Promise<MemoryCompact>;
 
   /** Get the project's memory compact, or null if none has been generated. */
   getMemoryCompact(): Promise<MemoryCompact | null>;
@@ -846,6 +1661,55 @@ export interface Storage {
    */
   clearMemoryCompact(): Promise<boolean>;
 
+  // --- System messages (proactive system-to-human reports) ---
+  //
+  // Project-scoped inbox of messages the SYSTEM writes FOR the human: scheduled
+  // report tasks, the daemon (e.g. upgrade notices), or the builder. The
+  // builder injects unread messages compactly on launch; the CLI and any UI can
+  // always list them.
+  //
+  // INVARIANT: append-only. Messages are never deleted or edited — reading and
+  // dismissal are narrow state changes (`read_at`, `dismissed_at`), so the
+  // record of what the system told the human is permanent.
+  //
+  // INVARIANT (boundary): dismissal is a human/builder decision. This interface
+  // does not encode that — the gate lives at the MCP boundary
+  // (`lazy_message_dismiss` rejects a non-empty ctx.taskId), because that is
+  // where caller identity exists. Creation is deliberately open to task agents:
+  // report tasks run as agents and must be able to file their report. Unlike
+  // memory, a system message is never injected into agent prompts as guidance —
+  // it is attributed data shown to the human — so agent creation is safe.
+
+  /** Create a system message. Append-only; returns the stored message. */
+  createSystemMessage(input: SystemMessageInput): Promise<SystemMessage>;
+
+  /**
+   * List system messages, newest first. Dismissed messages are excluded unless
+   * `includeDismissed` is set.
+   */
+  listSystemMessages(options?: { includeDismissed?: boolean }): Promise<SystemMessage[]>;
+
+  /**
+   * Get one system message by id or unique id prefix. Returns null when no
+   * message matches; throws when the prefix is ambiguous.
+   */
+  getSystemMessage(id: string): Promise<SystemMessage | null>;
+
+  /**
+   * Mark a system message read (sets `read_at` once; idempotent — a second
+   * call keeps the original timestamp). Accepts an id or unique prefix; throws
+   * when the message does not exist.
+   */
+  markSystemMessageRead(id: string): Promise<SystemMessage>;
+
+  /**
+   * Dismiss a system message (sets `dismissed_at`/`dismissed_by` once;
+   * idempotent). Accepts an id or unique prefix; throws when the message does
+   * not exist. Dismissal hides the message from default surfaces — it never
+   * deletes it.
+   */
+  dismissSystemMessage(id: string, actor: Actor): Promise<SystemMessage>;
+
   // --- Status History ---
 
   /**
@@ -854,6 +1718,46 @@ export interface Storage {
    * If no changelog exists yet, lazily reconstructs one from task/session data.
    */
   getStatusHistory(taskId: string): Promise<StatusChange[]>;
+
+  // --- Per-task tool stats ---
+
+  /**
+   * A task's durable per-tool statistics, or null when none were ever recorded
+   * (the task ran before the proxy kept them, or its traffic never went through
+   * the lazy proxy). Null is a real answer the surfaces state plainly — it is
+   * never rendered as "this task used no tools".
+   */
+  getToolStats(taskId: string): Promise<TaskToolStatsRecord | null>;
+
+  /**
+   * Write a task's tool-stats record. Written only by the proxy's recorder
+   * (src/proxy/tool-stats.ts), which folds each forwarded request into it —
+   * nothing recomputes this from the bounded audit log.
+   */
+  saveToolStats(record: TaskToolStatsRecord): Promise<void>;
+
+  // --- Usage-limit readings ([usage_pause]) ---
+  //
+  // DAEMON-LOCAL: the storage RPC does not carry these and RemoteStorage refuses
+  // them. A reading decides whether turns may spend a credential, so only the
+  // daemon's own recorder writes one (src/daemon/usage-readings.ts), and the
+  // merge rule every backend applies is src/storage/usage-limit-readings.ts.
+
+  /**
+   * The latest usage-limit reading per credential, as last saved — what the
+   * daemon seeds `[usage_pause]` from after a restart, so a pause survives the
+   * bounded audit log rotating its reading away. Empty when none was saved.
+   */
+  getUsageLimitReadings(): Promise<StoredUsageLimitReading[]>;
+
+  /**
+   * Record the latest reading for `reading.credential` by the shared merge rule
+   * (`mergeUsageLimitReading`): a header-less spend mark never replaces a
+   * reading (it only moves `spentAt`), and a late write never rolls a
+   * credential back. The record is validated first (shape, no future `ts`).
+   * Written only by the daemon's reading recorder (src/daemon/usage-readings.ts).
+   */
+  saveUsageLimitReading(reading: StoredUsageLimitReading): Promise<void>;
 
   // --- Search ---
 

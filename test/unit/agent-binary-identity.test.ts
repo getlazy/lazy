@@ -7,9 +7,12 @@ import {
   verifyAgentBinary,
   verifyAgentBinaryBytes,
   formatAgentBinaryError,
+  selfcheckOutputVerdict,
+  verifyAgentBinarySelfcheckExec,
   AGENT_SELFCHECK_SENTINEL,
 } from '../../src/agent/binary-identity';
 import { extractEmbeddedAgentBinary } from '../../src/capture/claude';
+import { agentBinaryContentId, versionedAgentBinaryPath } from '../../src/agent/binary-install';
 // Captured BEFORE any mock.module() call below replaces the registry entry, so
 // afterEach can put the real module back. bun's mock.restore() does NOT undo
 // mock.module — without this, every later test FILE in the same `bun test`
@@ -130,6 +133,23 @@ describe('agent binary identity', () => {
     // Both must explain the consequence, not just the fact.
     expect(dev).toContain('/usr/local/bin/lazy-agent');
   });
+
+  test('selfcheckOutputVerdict accepts sentinel stdout', () => {
+    expect(selfcheckOutputVerdict(`${AGENT_SELFCHECK_SENTINEL} 0.0.0-test`, '', 0)).toEqual({ ok: true });
+  });
+
+  test('selfcheckOutputVerdict names a bare Bun runtime from stderr', () => {
+    const verdict = selfcheckOutputVerdict('', 'error: Script not found "selfcheck"', 1);
+    expect(verdict.ok).toBe(false);
+    expect((verdict as { reason: string }).reason).toContain('bare Bun runtime');
+  });
+
+  test('verifyAgentBinarySelfcheckExec rejects bun as lazy-agent', () => {
+    const bunPath = Bun.which('bun');
+    if (!bunPath) return;
+    const verdict = verifyAgentBinarySelfcheckExec(bunPath);
+    expect(verdict.ok).toBe(false);
+  });
 });
 
 describe('extractEmbeddedAgentBinary refuses to install a non-agent', () => {
@@ -150,7 +170,9 @@ describe('extractEmbeddedAgentBinary refuses to install a non-agent', () => {
     const src = join(dir, 'embedded');
     writeFileSync(src, agentLike());
     const out = await extractEmbeddedAgentBinary(destDir, src);
-    expect(out).toBe(join(destDir, 'lazy-agent'));
+    // Installs are content-addressed and immutable: the mounted path is
+    // lazy-agent-<id>, never the ~/.lazy/bin/lazy-agent pointer.
+    expect(out).toBe(versionedAgentBinaryPath(destDir, agentBinaryContentId(agentLike())));
     expect(readFileSync(out!).length).toBe(4096);
   });
 
@@ -232,5 +254,12 @@ describe('lazy upgrade agent-binary rebuild', () => {
     const { forceRebuildAgentBinary } = await import('../../src/cli/commands/upgrade');
 
     await expect(forceRebuildAgentBinary()).rejects.toThrow(/bare Bun runtime/);
+  });
+
+  test('assertUpgradeAgentBinaryMount rejects a mount that would fail selfcheck', async () => {
+    const binary = join(binDir, 'lazy-agent');
+    writeFileSync(binary, bareBunLike());
+    const { assertUpgradeAgentBinaryMount } = await import('../../src/cli/commands/upgrade');
+    await expect(assertUpgradeAgentBinaryMount(binary, 'lazy-runner:test')).rejects.toThrow(/bare Bun runtime/);
   });
 });

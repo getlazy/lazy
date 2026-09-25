@@ -32,7 +32,7 @@ describe('proxy config: failover chain', () => {
       join(dir, 'lazy.toml'),
       `[proxy]\nport = 8766\n`,
     );
-    const config = await loadConfig(dir, { cwd: dir });
+    const config = await loadConfig(dir);
     expect(config.proxy).not.toBeNull();
     expect(config.proxy?.fallbacks).toEqual([]);
     expect(config.proxy?.retryAfterThreshold).toBe(5);
@@ -53,7 +53,7 @@ model = "qwen3.5:35b"
 upstream = "https://api.anthropic.com"
 `,
     );
-    const config = await loadConfig(dir, { cwd: dir });
+    const config = await loadConfig(dir);
     expect(config.proxy?.retryAfterThreshold).toBe(2);
     expect(config.proxy?.fallbacks).toEqual([
       // Trailing slash is normalized away so path joins stay clean.
@@ -77,7 +77,7 @@ port = 8766
 model = "qwen3.5:35b"
 `,
     );
-    await expect(loadConfig(dir, { cwd: dir })).rejects.toThrow(/proxy\.fallback.*upstream/is);
+    await expect(loadConfig(dir)).rejects.toThrow(/proxy\.fallback.*upstream/is);
   });
 
   test('a negative retry_after_threshold fails config load', async () => {
@@ -85,14 +85,14 @@ model = "qwen3.5:35b"
       join(dir, 'lazy.toml'),
       `[proxy]\nport = 8766\nretry_after_threshold = -1\n`,
     );
-    await expect(loadConfig(dir, { cwd: dir })).rejects.toThrow(/retry_after_threshold/i);
+    await expect(loadConfig(dir)).rejects.toThrow(/retry_after_threshold/i);
   });
 
   // INVARIANT: port is OPTIONAL — omitting it resolves to 0, meaning the daemon
   // lets the OS assign a free port at bind time (avoids per-project conflicts).
   test('a [proxy] section with no port resolves to port 0 (OS-assigned)', async () => {
     await writeFile(join(dir, 'lazy.toml'), `[proxy]\nupstream = "https://api.anthropic.com"\n`);
-    const config = await loadConfig(dir, { cwd: dir });
+    const config = await loadConfig(dir);
     expect(config.proxy).not.toBeNull();
     expect(config.proxy?.port).toBe(0);
   });
@@ -100,35 +100,47 @@ model = "qwen3.5:35b"
   // The engineer's existing static-port config must keep working unchanged.
   test('an explicit port is preserved as an override', async () => {
     await writeFile(join(dir, 'lazy.toml'), `[proxy]\nport = 8766\n`);
-    const config = await loadConfig(dir, { cwd: dir });
+    const config = await loadConfig(dir);
     expect(config.proxy?.port).toBe(8766);
   });
 
   test('an out-of-range explicit port fails config load', async () => {
     await writeFile(join(dir, 'lazy.toml'), `[proxy]\nport = 70000\n`);
-    await expect(loadConfig(dir, { cwd: dir })).rejects.toThrow(/port.*1.*65535/is);
+    await expect(loadConfig(dir)).rejects.toThrow(/port.*1.*65535/is);
   });
 
-  // INVARIANT: a proxy role may omit `endpoint` — the daemon injects its live
-  // proxy URL at launch — but ONLY when a [proxy] section exists to inject from.
-  test('a proxy role with no endpoint is allowed when [proxy] is configured', async () => {
+  // INVARIANT: a role's profile may omit `endpoint` — every launch is proxied
+  // regardless, and the daemon injects its live proxy URL at launch. The empty
+  // endpoint means "the harness's default upstream", NOT "unproxied".
+  //
+  // This was `[models.roles.agent] backend = "proxy"` before agent profiles;
+  // that spelling is now refused at load (see the migration tests), and the
+  // profile form below is what it became.
+  test('a role profile with no endpoint is allowed when [proxy] is configured', async () => {
     await writeFile(
       join(dir, 'lazy.toml'),
-      `[proxy]\n\n[models.roles.agent]\nbackend = "proxy"\nmodel = "claude-sonnet-4-6"\n`,
+      `[proxy]\n\n[agents.house]\nharness = "claude-code"\nmodel = "claude-sonnet-4-6"\n\n` +
+      `[models.roles.agent]\nagent = "house"\n`,
     );
-    const config = await loadConfig(dir, { cwd: dir });
-    expect(config.models.roles.agent.backend).toBe('proxy');
+    const config = await loadConfig(dir);
+    expect(config.models.roles.agent.profile).toBe('house');
     expect(config.models.roles.agent.endpoint).toBe('');
+    // Nothing named an endpoint, so nothing is pinned — that is the successor to
+    // the old `backend` name, and it is what decides whether the launch carries
+    // the local-server stability flags.
+    expect(config.models.roles.agent.pinned).toBe(false);
   });
 
-  // Default-on inverts this: with no [proxy] section the proxy now EXISTS, so an
-  // endpoint-less proxy role is fine — the daemon injects the live address.
-  test('a proxy role with no endpoint and no [proxy] section is fine (proxy is default-on)', async () => {
+  // Default-on inverts the old rule: with no [proxy] section the proxy now
+  // EXISTS, so an endpoint-less role profile is fine — the daemon injects the
+  // live address.
+  test('a role profile with no endpoint and no [proxy] section is fine (proxy is default-on)', async () => {
     await writeFile(
       join(dir, 'lazy.toml'),
-      `[models.roles.agent]\nbackend = "proxy"\nmodel = "claude-sonnet-4-6"\n`,
+      `[agents.house]\nharness = "claude-code"\nmodel = "claude-sonnet-4-6"\n\n` +
+      `[models.roles.agent]\nagent = "house"\n`,
     );
-    const config = await loadConfig(dir, { cwd: dir });
+    const config = await loadConfig(dir);
     expect(config.proxy).not.toBeNull();
     expect(config.models.roles.agent.endpoint).toBe('');
   });
@@ -139,8 +151,8 @@ model = "qwen3.5:35b"
   // saying the proxy is always on.
   test('[proxy] enabled = false is rejected with an actionable message', async () => {
     await writeFile(join(dir, 'lazy.toml'), `[proxy]\nenabled = false\n`);
-    await expect(loadConfig(dir, { cwd: dir })).rejects.toThrow(/`enabled` option has been removed/);
-    await expect(loadConfig(dir, { cwd: dir })).rejects.toThrow(/always on/);
+    await expect(loadConfig(dir)).rejects.toThrow(/`enabled` option has been removed/);
+    await expect(loadConfig(dir)).rejects.toThrow(/always on/);
   });
 
   // INVARIANT: `enabled = true` asks for exactly what lazy already does, so the
@@ -152,7 +164,7 @@ model = "qwen3.5:35b"
     const originalWarn = console.warn;
     console.warn = (...args: unknown[]) => { warnings.push(args.join(' ')); };
     try {
-      const config = await loadConfig(dir, { cwd: dir });
+      const config = await loadConfig(dir);
       expect(config.proxy).not.toBeNull();
     } finally {
       console.warn = originalWarn;
@@ -166,8 +178,8 @@ model = "qwen3.5:35b"
   // for the same reason `[proxy] enabled` was removed — a config that quietly
   // sent cursor traffic direct would leave the user believing it was audited.
   test('cursor_upstream defaults to Cursor even with no [proxy] section', async () => {
-    await writeFile(join(dir, 'lazy.toml'), `[models.roles.agent]\nbackend = "proxy"\nmodel = "claude-sonnet-4-6"\n`);
-    const config = await loadConfig(dir, { cwd: dir });
+    await writeFile(join(dir, 'lazy.toml'), `[agents.house]\nharness = "claude-code"\nmodel = "claude-sonnet-4-6"\n`);
+    const config = await loadConfig(dir);
     expect(config.proxy?.cursorUpstream).toBe('https://api2.cursor.sh');
   });
 
@@ -176,16 +188,20 @@ model = "qwen3.5:35b"
       join(dir, 'lazy.toml'),
       `[proxy]\ncursor_upstream = "http://127.0.0.1:9911/"\n`,
     );
-    const config = await loadConfig(dir, { cwd: dir });
+    const config = await loadConfig(dir);
     expect(config.proxy?.cursorUpstream).toBe('http://127.0.0.1:9911');
   });
 
-  test('a proxy role with an explicit endpoint still works with no [proxy] section', async () => {
+  test('a role profile with an explicit endpoint still works with no [proxy] section', async () => {
     await writeFile(
       join(dir, 'lazy.toml'),
-      `[models.roles.agent]\nbackend = "proxy"\nmodel = "claude-sonnet-4-6"\nendpoint = "http://127.0.0.1:9999"\n`,
+      `[agents.gateway]\nharness = "claude-code"\nmodel = "claude-sonnet-4-6"\n` +
+      `endpoint = "http://127.0.0.1:9999"\n\n[models.roles.agent]\nagent = "gateway"\n`,
     );
-    const config = await loadConfig(dir, { cwd: dir });
+    const config = await loadConfig(dir);
     expect(config.models.roles.agent.endpoint).toBe('http://127.0.0.1:9999');
+    // Named by the profile's own block, so it IS pinned — the distinction the
+    // built-in codex profile's default OpenAI upstream would otherwise blur.
+    expect(config.models.roles.agent.pinned).toBe(true);
   });
 });

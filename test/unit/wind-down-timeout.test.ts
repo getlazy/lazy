@@ -435,6 +435,24 @@ describe('GracefulExitTimeoutError', () => {
     expect(err.sessionId).toBeUndefined();
   });
 
+  // INVARIANT: when the captured result was unusable, WHY rides the message.
+  // On 2026-09-16 a proxy timeout reached every Pi turn as an error-terminated
+  // final message; the parser's explanation existed only in the supervisor log,
+  // and the turn record, `lazy show` and the loop's view all said just "the
+  // captured result could not be parsed". A reason nobody can read is not a
+  // reason.
+  test('the parse failure reason rides the message', () => {
+    const err = new GracefulExitTimeoutError({
+      timeoutMs: 60000,
+      durationMs: 90000,
+      elapsedSinceSignalMs: 60000,
+      parseError: 'pi turn ended in error: 502 {"type":"error","error":{"type":"proxy_error"}}',
+    });
+    expect(err.message).toContain('could not be parsed:');
+    expect(err.message).toContain('proxy_error');
+    expect(err.parseError).toContain('pi turn ended in error');
+  });
+
   test('carries sessionId when provided', () => {
     const err = new GracefulExitTimeoutError({
       timeoutMs: 60000,

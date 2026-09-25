@@ -53,11 +53,16 @@ export interface Agent {
     modelId?: string;
     sessionId?: string;
     dangerouslySkipPermissions: boolean;
-    /** Reasoning effort level passed as `--effort` (Claude Code only). */
+    /**
+     * Reasoning effort level. Every harness implements it, each in its own
+     * spelling — Claude Code `--effort`, Codex `-c model_reasoning_effort=…`,
+     * pi `--thinking`, Cursor a model-name suffix — so the caller passes the
+     * level and the agent decides how to say it.
+     */
     effort?: string;
     /**
      * Permission mode for this invocation. When 'plan', the agent runs
-     * read-only (plan-only, no writes). Used by `lazy review -i` for Q&A.
+     * read-only (plan-only, no writes). Used by `lazy browse -i` for Q&A.
      * Agents that don't support plan mode should ignore this.
      */
     permissionMode?: 'plan' | 'default';
@@ -130,9 +135,13 @@ export interface Agent {
    *   1. an explicit `--model` override (`overrideModel`)
    *   2. the authoritative model of a local backend ([models.roles.agent] with
    *      backend ollama/proxy) — a pinned local model is never stomped
-   *   3. a soft per-task model (sticky model, `task.model`) on the anthropic backend
+   *   3. a soft per-task model (`task.model`) on the anthropic backend
    *   4. this agent-declared default
-   *   5. `[models] default`
+   *   5. the project-settings overlay, else `[models] default`
+   *
+   * (4) above (5) is deliberate: both entries in (5) are ONE project-wide name,
+   * in practice an Anthropic one, so letting either pre-empt this declaration
+   * pins a foreign-catalog agent to a model nobody chose for it.
    *
    * A future per-agent config key slots in between (3) and (4): it would
    * override this declaration while still yielding to an explicit per-task
@@ -160,7 +169,7 @@ export interface Agent {
 
   /**
    * Whether `lazy pair` may hand a human an interactive session on this
-   * agent's CLI, in the task's worktree, on the HOST.
+   * agent's CLI, in the task's worktree.
    *
    * This is a refusal gate, not a caller branch in the sense the note above
    * forbids — same shape as AgentPackaging.supportsContainerRunner(). An agent
@@ -171,18 +180,54 @@ export interface Agent {
    * Returning false is the safe default for a new agent. Say true only once
    * BOTH hold:
    *
-   *   1. A session the agent wrote INSIDE a task container is not silently
-   *      resumed on the host. Chat history is written by the agent, so
-   *      resuming it host-side turns agent-authored text into input for a
-   *      session running as the human with their credentials. Claude Code
-   *      qualifies only because lazy bridges those files explicitly and
-   *      narrowly (symlinks, additive, removed on exit — see pair-bridge.ts).
+   *   1. A session the agent wrote inside the task container is not carried
+   *      ACROSS the container boundary to be resumed on the host. Chat history
+   *      is written by the agent, so resuming it host-side turns agent-authored
+   *      text into input for a session running as the human with their
+   *      credentials. Task-mode pairing now runs INSIDE the container
+   *      (pair-in-container), where the session never crosses that boundary at
+   *      all — it is read and written on the same mounted home the supervised
+   *      turns use — which is what satisfies this condition generically rather
+   *      than per-agent. It still binds the HOST paths: `--host` pairing and
+   *      branchless pairing resume host sessions, and pair-bridge.ts's narrow
+   *      symlink bridge (additive, removed on exit) is the only crossing left.
    *   2. Pairing is actually useful — the human gets the agent's prior
    *      conversation, not an empty session with no memory of the work.
+   *
+   * An agent that says true MUST implement {@link buildInteractiveArgs}.
    *
    * @see src/cli/commands/pair.ts
    */
   supportsPairing(): boolean;
+
+  /**
+   * Argv for an INTERACTIVE session on this agent's CLI — a human at a terminal,
+   * no prompt argument, output for eyes rather than for a parser.
+   *
+   * Deliberately separate from {@link buildExecArgs}, which builds a headless,
+   * machine-parsed turn: the flags that matter differ in kind (`--print`,
+   * `--output-format`, an appended prompt are all wrong here), and folding both
+   * into one method means every caller passes flags that mean nothing to it.
+   *
+   * Returns `null` for an agent that has no interactive mode. `supportsPairing()`
+   * is the gate humans see; this is what the launcher needs, and an agent that
+   * gates true and returns null here is a programming error, not a runtime path.
+   */
+  buildInteractiveArgs(opts: {
+    /** Session to resume, or null/absent to start fresh. */
+    sessionId?: string | null;
+    /** Model to pin, or absent for the agent's own default. */
+    modelId?: string | null;
+    /**
+     * Run without permission prompts.
+     *
+     * Since pairing moved into the container this is the same trust decision as
+     * any supervised turn — the agent is confined to the same container, with
+     * the same mounts and the same credentials — NOT unrestricted access to the
+     * human's machine.
+     */
+    dangerouslySkipPermissions: boolean;
+  }): string[] | null;
 
   /**
    * Discover session log files for conversation capture.

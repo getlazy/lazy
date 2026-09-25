@@ -1,15 +1,14 @@
 # GitLab CI/CD for lazy-dev
 #
-# This replaces the GitHub Actions workflows in .github/workflows/
-# DO NOT delete .github/workflows/ yet — we'll do that after verification.
+# Type-checking only. Releases (source, images and the docs site) are published
+# by GitHub Actions — .github/workflows/release.yml — never from here: a job
+# that looks like a release but cannot publish one is worse than none.
 #
 # Pipeline structure:
 # - typecheck: Runs on merge requests to main
-# - release: Manual trigger on version tags
 
 stages:
   - check
-  - publish
 
 # Default settings
 default:
@@ -26,40 +25,3 @@ typecheck:
   script:
     - bun install
     - bun run typecheck
-
-#
-# Release to Public Repo
-# Manual trigger only, runs on version tags (v<major>.<minor>.<patch>)
-#
-release:
-  stage: publish
-  rules:
-    # Only run on tag pushes matching semantic version pattern
-    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/
-      when: manual
-  variables:
-    GIT_DEPTH: 0  # Full history needed for changelog generation
-    PUBLIC_REPO: "git@gitlab.com:getlazy/lazy.git"
-    PUBLIC_BRANCH: "main"
-  before_script:
-    # Configure SSH for pushing to public repo
-    - mkdir -p ~/.ssh
-    - chmod 700 ~/.ssh
-    # Deploy key is base64-encoded in CI variables (GitLab can't mask multiline values)
-    - echo "$PUBLIC_REPO_DEPLOY_KEY" | base64 -d > ~/.ssh/deploy_key
-    - chmod 600 ~/.ssh/deploy_key
-    - ssh-keyscan gitlab.com >> ~/.ssh/known_hosts 2>/dev/null
-    - |
-      cat >> ~/.ssh/config <<SSHEOF
-      Host gitlab.com
-        IdentityFile ~/.ssh/deploy_key
-        StrictHostKeyChecking accept-new
-      SSHEOF
-    # Configure git identity
-    - git config --global user.name "lazy-release[bot]"
-    - git config --global user.email "lazy-release-bot@gitlab.com"
-  script:
-    - scripts/release.sh "$CI_COMMIT_TAG"
-  after_script:
-    # Always cleanup SSH key, even if job fails
-    - rm -f ~/.ssh/deploy_key

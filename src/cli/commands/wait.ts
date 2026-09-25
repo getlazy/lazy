@@ -1,4 +1,5 @@
-import { requireStorage, requireLazyRoot, displayId, parseFlags, resolveTaskOrExit, getWorktreePath } from '../helpers';
+import { requireStorage, requireLazyRoot, parseFlags, resolveTaskOrExit } from '../helpers';
+import { displayId, getWorktreePath } from '../../task/identity';
 import { followContainer } from './shared';
 import { isBlockedStatus } from '../../types';
 import type { Task, TaskStatus } from '../../types';
@@ -129,6 +130,9 @@ async function raceViaDaemon(refs: string[], json: boolean): Promise<void> {
     // guards against — say it right under the status (fix-sync-silent-conflict).
     if (result.merge_state) {
       console.log(result.merge_state.summary);
+    }
+    if (result.head_sha) {
+      console.log(`head_sha: ${result.head_sha}`);
     }
     // The other tasks' statuses are useful context when racing a set.
     const others = (result.tasks ?? []).filter(t => t.task_id !== result.task_id);

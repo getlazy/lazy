@@ -31,7 +31,7 @@
 
 import type { MemoryRecord, MemoryCompact, MemoryCompactInput, MemoryCompactCoverage } from '../types';
 import { isLiveMemory, renderMemoryBody } from './index';
-import { runClaudeOneshot } from '../capture/claude';
+import { runOneshot } from '../oneshot';
 import { logger } from '../utils/logger';
 
 import memoryCompactGenerateTemplate from '../prompts/memory-compact-generate.md' with { type: 'text' };
@@ -53,6 +53,12 @@ export interface GenerateCompactOptions {
    * the launch path too).
    */
   offline?: boolean;
+  /**
+   * Session placeholder env binding the model run to the HUMAN who asked for
+   * it, so the proxy bills their credential (team mode). Omitted on a
+   * single-user install: the builder credential pays, as before.
+   */
+  ownerCredentialEnv?: Array<{ key: string; value: string }>;
 }
 
 /**
@@ -274,7 +280,17 @@ export async function generateMemoryCompact(
 
   let content: string;
   try {
-    const response = await runClaudeOneshot(prompt, options.model);
+    // `low` effort: this condenses records the caller already assembled into a
+    // shorter index — reading and compressing, not reasoning. `options.model`
+    // stays because it is a genuine human choice (`lazy memory compact
+    // --model`); absent it, the builder role target's model runs.
+    const response = await runOneshot({
+      prompt,
+      model: options.model,
+      effort: 'low',
+      repoAccess: 'none',
+      ...(options.ownerCredentialEnv ? { ownerCredentialEnv: options.ownerCredentialEnv } : {}),
+    });
     content = stripOuterFence(response.result ?? '');
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

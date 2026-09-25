@@ -1,8 +1,9 @@
 import { join } from 'path';
+import { shortId, displayId, validateCode, taskRef, getWorktreePath, MAX_TASK_CODE_LENGTH } from '../../task/identity';
 import { existsSync } from 'fs';
-import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, validateModel, validateCode, resolveTaskOrExit, taskRef, getWorktreePath, MAX_TASK_CODE_LENGTH } from '../helpers';
+import { requireLazyRoot, requireStorage, parseFlags, validateModel, resolveTaskOrExit } from '../helpers';
 import { getDiffStat, hasUncommittedChanges } from '../../git/operations';
-import { cleanupTaskContainer, cleanupWorktreeAndBranch } from './shared';
+import { cleanupTaskContainer, cleanupWorktreeAndBranch } from '../../task/cleanup';
 import { commandStart } from './start';
 import { loadConfig } from '../../config/loader';
 import { createDriver } from '../../remote';
@@ -11,10 +12,11 @@ import { logger } from '../../utils/logger';
 import { getActor } from '../../constants';
 import type { Storage } from '../../storage/interface';
 import { parentTaskIdOf } from '../../task-target';
-import { resolveAgentForNewTask } from '../../agent/task-agent';
+import { currentPromptOf } from '../../task-prompt';
+import { resolveAgentForNewTaskFromConfig } from '../../agent/task-agent';
 
-import { getDataDir } from '../init';
-import { theme } from '../theme';
+import { getDataDir } from '../../project-paths';
+import { theme } from '../../render/theme';
 import { escapeRegex } from '../../utils/regex';
 import { latestWorkAgentTurn } from '../../utils/turns';
 import { turnText } from '../../utils/turn-content';
@@ -167,11 +169,10 @@ export async function commandRedo(args: string[]): Promise<void> {
       }
     }
 
-    // Get the latest prompt version
-    const promptHistory = await storage.getPromptHistory(oldTask.id);
-    const latestPrompt = promptHistory.length > 0
-      ? promptHistory[promptHistory.length - 1].content
-      : oldTask.prompt;
+    // The stale task's CURRENT prompt, via the one resolver — a redo is a
+    // second attempt at the work as most recently specified, not as first
+    // drafted.
+    const latestPrompt = currentPromptOf(oldTask) ?? '';
 
     // Build new prompt: user override > old prompt + redo context
     const newPrompt = promptOverride
@@ -185,16 +186,21 @@ export async function commandRedo(args: string[]): Promise<void> {
     // Preserve parent relationship if the old task had one. The agent carries
     // over too: a redo is a second attempt at the SAME work, so it must run on
     // the agent the original was on, not on the project default.
+    const [config, projectSettings] = await Promise.all([
+      loadConfig(requireLazyRoot()),
+      storage.getProjectSettings(),
+    ]);
     const newTask = await storage.createTask(
       oldTask.goal,
       parentTaskIdOf(oldTask) ?? undefined,
       undefined,
       undefined,
       undefined,
-      resolveAgentForNewTask({
-        inheritFrom: oldTask,
-        configDefault: (await loadConfig(requireLazyRoot())).agent.agent_id,
-      }),
+      resolveAgentForNewTaskFromConfig(
+        { inheritFrom: oldTask },
+        config.agent,
+        projectSettings,
+      ).agentId,
     );
 
     // Set prompt
@@ -296,7 +302,7 @@ Arguments:
 
 Options:
   --prompt <text>    Override the prompt for the new task (default: inherit old prompt)
-  --model <model>    Override model for the new task (e.g. opus, sonnet, claude-opus-4-8)
+  --model <model>    Override model for the new task (e.g. opus, sonnet, claude-opus-5)
   --no-start         Create the new task but don't start it (backlog)
   --yes              Skip confirmation prompt when starting
 

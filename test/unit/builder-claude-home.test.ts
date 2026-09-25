@@ -10,6 +10,8 @@ import {
   mergeBuilderClaudeConfig,
   resolveBuilderClaudeConfigBase,
   writeNeutralCredentialStore,
+  resolveBuilderSessionHomeDir,
+  ensureBuilderSessionHomeDir,
 } from '../../src/builder/claude-home';
 
 describe('builder claude home', () => {
@@ -88,6 +90,14 @@ describe('builder claude home', () => {
       expect(base).toEqual({ theme: 'dark' });
     });
 
+    // INVARIANT: a launch with no host seed (the daemon-owned session path,
+    // whose process home is nobody's) starts from an EMPTY document on first
+    // launch — never from whatever file happens to sit at a default path.
+    test('a null host seed starts from an empty document', async () => {
+      const base = await resolveBuilderClaudeConfigBase(join(dir, 'missing.json'), null, noWarn);
+      expect(base).toEqual({});
+    });
+
     // INVARIANT: once the builder has its own config, the persisted copy is
     // authoritative. Re-seeding from the host would discard the onboarding,
     // folder-trust and model answers Claude Code wrote inside the container —
@@ -144,5 +154,49 @@ describe('builder claude home', () => {
   test('builderClaudeConfigPath is stable across calls', () => {
     expect(builderClaudeConfigPath('/p/.lazy')).toBe('/p/.lazy/builder-claude-config.json');
     expect(builderClaudeConfigPath('/p/.lazy')).toBe(builderClaudeConfigPath('/p/.lazy'));
+  });
+
+  // SECURITY INVARIANT: a builder container mounts the whole project data dir
+  // read-write (`-v ${dataDir}:${dataDir}`, docker-runner.ts buildBuilderDockerArgs).
+  // Per-member builder homes must NEVER live under it — nesting them there once
+  // put every OTHER member's `~/.claude.json` and full Claude session
+  // transcripts inside the mount member A's own builder container sees, with
+  // write access. Found in review (18aaef62): confirmed cross-member exposure.
+  describe('resolveBuilderSessionHomeDir', () => {
+    const originalOverride = process.env.LAZY_BUILDER_HOMES_BASE_DIR;
+
+    afterEach(() => {
+      if (originalOverride === undefined) delete process.env.LAZY_BUILDER_HOMES_BASE_DIR;
+      else process.env.LAZY_BUILDER_HOMES_BASE_DIR = originalOverride;
+    });
+
+    test('never sits under the project root or a data dir nested inside it', () => {
+      const projectRoot = '/home/user/projects/acme';
+      const dataDirAbs = join(projectRoot, '.lazy');
+      const home = resolveBuilderSessionHomeDir(projectRoot, 'ivan@example.com');
+
+      expect(home.startsWith(projectRoot)).toBe(false);
+      expect(home.startsWith(dataDirAbs)).toBe(false);
+    });
+
+    test('two members of the same project resolve to two different directories', () => {
+      const projectRoot = '/home/user/projects/acme';
+      const ivan = resolveBuilderSessionHomeDir(projectRoot, 'ivan@example.com');
+      const pete = resolveBuilderSessionHomeDir(projectRoot, 'pete@example.com');
+      expect(ivan).not.toBe(pete);
+    });
+
+    test('is deterministic for the same member+project across calls', () => {
+      const projectRoot = '/home/user/projects/acme';
+      expect(resolveBuilderSessionHomeDir(projectRoot, 'ivan@example.com'))
+        .toBe(resolveBuilderSessionHomeDir(projectRoot, 'ivan@example.com'));
+    });
+
+    test('ensureBuilderSessionHomeDir creates the directory and its .claude subtree', async () => {
+      process.env.LAZY_BUILDER_HOMES_BASE_DIR = dir;
+      const home = await ensureBuilderSessionHomeDir('/home/user/projects/acme', 'ivan@example.com');
+      const stat = await import('fs/promises').then(fs => fs.stat(join(home, '.claude')));
+      expect(stat.isDirectory()).toBe(true);
+    });
   });
 });

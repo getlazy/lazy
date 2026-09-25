@@ -15,6 +15,7 @@
 import { readFile, readdir, stat } from 'fs/promises';
 import { join, basename } from 'path';
 import { getHome } from '../utils/home';
+import { isLocalCommandScaffolding } from './local-command-messages';
 import type { TokenUsage } from '../types';
 
 // --- Raw JSONL types ---
@@ -314,6 +315,16 @@ function parseLogEntry(line: string): { entry: RawLogEntry; message: Conversatio
     return { entry, message: null };
   }
 
+  // Skip Claude Code's own local-command scaffolding — the caveat, a built-in
+  // slash command's invocation block, and its stdout/stderr. Nobody said any of
+  // it, so it is not conversation content; a session made of nothing else then
+  // has no messages at all and every ingest path's empty-shell guard drops it.
+  // Only user entries: those wrappers are something the harness writes into the
+  // user turn, so an assistant message reproducing one is the agent talking.
+  if (entry.type === 'user' && isLocalCommandScaffolding(text)) {
+    return { entry, message: null };
+  }
+
   let usage: TokenUsage | null = null;
   if (msg.usage) {
     usage = {
@@ -493,8 +504,12 @@ export async function parseConversation(
 /**
  * Extract a human-readable summary of a conversation.
  * Takes the first user message text as the summary.
+ *
+ * Takes only the messages, not a whole ParsedConversation, so the store-side
+ * cleanup in `local-command-cleanup.ts` recomputes a summary through this exact
+ * rule rather than a second copy of it.
  */
-export function extractSummary(conversation: ParsedConversation): string {
+export function extractSummary(conversation: { messages: Pick<ConversationMessage, 'role' | 'text'>[] }): string {
   const firstUserMsg = conversation.messages.find((m) => m.role === 'user' && m.text.trim());
   if (!firstUserMsg) return '(empty conversation)';
 

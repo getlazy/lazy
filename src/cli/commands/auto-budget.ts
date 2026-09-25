@@ -15,7 +15,7 @@
 import { join } from 'path';
 import { requireLazyRoot, parseFlags } from '../helpers';
 import { loadConfig } from '../../config/loader';
-import { theme } from '../theme';
+import { theme } from '../../render/theme';
 import { describeExpiry, nextLocalMidnight } from '../../utils/local-day';
 import {
   readDailyBudget,
@@ -31,6 +31,7 @@ const TRIGGER_LABELS: Record<string, string> = {
   upstream_sync: 'upstream sync',
   comment: 'comment',
   child_completed: 'child completed',
+  child_added: 'loop child added',
   crash: 'crash',
 };
 

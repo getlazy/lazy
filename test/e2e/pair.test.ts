@@ -1,11 +1,16 @@
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { join, dirname } from 'path';
-import { writeFileSync, existsSync, mkdirSync } from 'fs';
+import { join, dirname, resolve } from 'path';
+import { writeFileSync, existsSync, mkdirSync, readFileSync } from 'fs';
+import { mkdtemp } from 'fs/promises';
+import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes } from '../helpers/assertions';
 import { createTask } from '../helpers/fixtures';
-import { findFullTaskId, readTaskJson, readTaskStatus, setTaskMetadata, setTaskStatus, taskFilePath, worktreePathFor, writeTaskJson } from '../helpers/storage';
+import { findFullTaskId, readTaskJson, readTaskStatus, readTurns, setTaskMetadata, setTaskStatus, storageDirFor, taskFilePath, worktreePathFor, writeTaskJson } from '../helpers/storage';
+import { installFakeDocker, type FakeDocker } from '../helpers/fake-docker';
+import { encodeProjectPath } from '../../src/import/claude-code-logs';
+import { SANDBOX_DIR } from '../../src/utils/sandbox';
 
 /** The lock path lazy actually uses — see getPairingLockPath in src/utils/pairing-lock.ts. */
 function pairingLockPath(root: string, shortId: string): string {
@@ -84,6 +89,7 @@ function createSessionManually(ctx: TestContext, shortId: string, options: Manua
     total_duration_ms: 0,
     total_usage: null,
     container_name: null,
+    container_agent_id: null,
     interrupt_reason: null,
     interrupt_exit_code: null,
     interrupt_at: null,
@@ -105,13 +111,25 @@ describe('lazy pair', () => {
     await ctx.cleanup();
   });
 
-  // INVARIANT: When on main (non-task branch) with no argument, pair launches
-  // branchless mode — Claude Code in the current directory with conversation capture.
-  test('launches branchless pairing on non-task branch', async () => {
-    // On main branch (default in test repos), `lazy pair` should attempt
+  // INVARIANT (pair-in-container): branchless pairing is HOST execution — there
+  // is no task, no worktree and therefore no container. Host execution is never
+  // implicit, so bare `lazy pair` on a non-task branch refuses and names the
+  // opt-in rather than quietly launching an agent on the human's machine.
+  test('refuses branchless pairing without --host', async () => {
+    const result = await ctx.lazy(['pair']);
+    expectFailure(result);
+    expectError(result, 'no task container to pair in');
+    expectError(result, 'lazy pair --host');
+    expectOutputExcludes(result, 'Launching Claude Code');
+  });
+
+  // INVARIANT: With --host on a non-task branch, pair launches branchless mode —
+  // Claude Code in the current directory with conversation capture.
+  test('launches branchless pairing on non-task branch with --host', async () => {
+    // On main branch (default in test repos), `lazy pair --host` should attempt
     // to launch Claude Code without task context. It will fail because
     // the `claude` binary doesn't exist, but should NOT show usage.
-    const result = await ctx.lazy(['pair']);
+    const result = await ctx.lazy(['pair', '--host']);
     expectOutputExcludes(result, 'Usage: lazy pair');
     expectOutput(result, 'Launching Claude Code');
     expectOutput(result, 'no task context');
@@ -133,7 +151,7 @@ describe('lazy pair', () => {
     const result = await ctx.lazy(['pair']);
 
     expectOutputExcludes(result, 'Usage: lazy pair');
-    expectOutput(result, 'No existing Claude session to resume');
+    expectOutput(result, 'No existing claude-code session to resume');
   });
 
   test('--unlock fails without task on non-task branch', async () => {
@@ -142,13 +160,12 @@ describe('lazy pair', () => {
     expectError(result, '--unlock requires a task argument');
   });
 
-  // SECURITY INVARIANT (fix-cursor-security-musts): pairing is opt-in per agent
-  // and only claude-code opts in. `lazy pair` hands a human a session on the
-  // HOST; for an agent whose container-written chat lazy will not import, that
-  // session is both dangerous (agent-authored text becomes input to a session
-  // running as the human) and useless (no memory of the work). The refusal must
-  // land BEFORE the status moves — a refused task stays exactly as it was.
-  test('refuses to pair on a Cursor task, and leaves its status untouched', async () => {
+  // SECURITY INVARIANT (fix-cursor-security-musts → pair-in-container): Cursor
+  // pairing was refused because a HOST session could only see container-written
+  // chat if lazy copied it onto the host. Pairing now runs inside the task's
+  // container, over that same sandbox home, so the refusal is lifted — and the
+  // session must be reported as running in the CONTAINER, never on the host.
+  test('pairs on a Cursor task, in the container', async () => {
     const taskId = await createTask(ctx, 'Cursor task', 'Some work');
     createSessionManually(ctx, taskId);
     setTaskStatus(ctx.root, taskId, 'blocked');
@@ -158,12 +175,52 @@ describe('lazy pair', () => {
 
     const result = await ctx.lazy(['pair', taskId]);
 
+    expectOutputExcludes(result, 'does not support pairing');
+    expectOutput(result, 'No existing cursor session to resume');
+    expectOutput(result, 'container');
+    // Never on the host — that is the whole point of lifting the refusal.
+    expectOutputExcludes(result, '⚠ --host');
+  });
+
+  // INVARIANT (pair-in-container): --host launches CLAUDE CODE, always. The host
+  // launcher builds its argv with interactiveClaudeArgs, which is hardcoded to
+  // `claude` and takes no agent — so --host on a cursor task would print
+  // "Agent: cursor" and then run a different agent entirely. Refuse instead:
+  // launching the wrong agent against a task's work is precisely the silent
+  // wrongness pairing must not have. Host pairing is claude-code-only.
+  test('refuses --host on a non-claude-code task rather than launching Claude', async () => {
+    const taskId = await createTask(ctx, 'Cursor task', 'Some work');
+    createSessionManually(ctx, taskId);
+    setTaskStatus(ctx.root, taskId, 'blocked');
+    const task = readTaskJson(ctx.root, taskId);
+    task.agent_id = 'cursor';
+    writeTaskJson(ctx.root, taskId, task);
+
+    const result = await ctx.lazy(['pair', taskId, '--host']);
+
     expectFailure(result);
-    expectError(result, 'Cannot pair on a cursor task');
-    // The refusal points somewhere useful rather than just saying no.
-    expectError(result, 'lazy unblock');
-    // Never launched, never locked, never moved.
-    expectOutputExcludes(result, 'Launching Claude Code');
+    expectError(result, 'Host pairing supports claude-code only');
+    expectError(result, 'cursor');
+    // It must not have started anything, nor claimed it was about to.
+    expectOutputExcludes(result, 'Launching');
+    expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
+  });
+
+  // Legacy tasks may still carry a stored host-process runner_type from before
+  // the runner was removed — pairing must fail loud, not silently opt into host.
+  test('refuses a task whose stored runner is the removed host-process runner', async () => {
+    const taskId = await createTask(ctx, 'Legacy host runner task', 'Some work');
+    createSessionManually(ctx, taskId);
+    setTaskStatus(ctx.root, taskId, 'blocked');
+    const task = readTaskJson(ctx.root, taskId);
+    task.runner_type = 'dangerously-host-process-without-any-isolation';
+    writeTaskJson(ctx.root, taskId, task);
+
+    const result = await ctx.lazy(['pair', taskId]);
+
+    expectFailure(result);
+    expectError(result, 'Host-process runner is no longer supported');
+    expectError(result, '--runner docker');
     expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
   });
 
@@ -316,16 +373,62 @@ describe('lazy pair', () => {
     const result = await ctx.lazy(['pair', taskId]);
 
     expectOutputExcludes(result, 'Daemon refuses to start');
-    expectOutput(result, 'No existing Claude session to resume');
+    expectOutput(result, 'No existing claude-code session to resume');
+  });
+
+  // INVARIANT (fix-pair-container-resume): container pairing seeds onboarding
+  // state into the sandbox before docker exec, so Claude Code does not replay
+  // the first-run wizard on every pair.
+  test('container pairing seeds sandbox claude config before launch', async () => {
+    const taskId = await createTask(ctx, 'Pair seed task', 'Some work');
+    createSessionManually(ctx, taskId);
+    setTaskStatus(ctx.root, taskId, 'blocked');
+
+    const result = await ctx.lazy(['pair', taskId]);
+    expectOutputExcludes(result, 'Daemon refuses to start');
+
+    const configPath = join(worktreePathFor(ctx.root, taskId), SANDBOX_DIR, '.claude.json');
+    expect(existsSync(configPath)).toBe(true);
+    const config = JSON.parse(readFileSync(configPath, 'utf-8'));
+    expect(config.hasCompletedOnboarding).toBe(true);
+  });
+
+  // INVARIANT: when a session id exists and its JSONL is in the sandbox, pair
+  // reaches launch with that id (printed in the session line).
+  test('container pairing resumes when sandbox session jsonl exists', async () => {
+    const taskId = await createTask(ctx, 'Resume pair task', 'Some work');
+    createSessionManually(ctx, taskId);
+    setTaskStatus(ctx.root, taskId, 'blocked');
+
+    const sessionId = 'pair-resume-session-1';
+    const worktree = worktreePathFor(ctx.root, taskId);
+    const projectDir = join(
+      worktree,
+      SANDBOX_DIR,
+      '.claude',
+      'projects',
+      encodeProjectPath(worktree),
+    );
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(projectDir, `${sessionId}.jsonl`), '{"type":"user","message":{"content":"hi"}}\n');
+
+    const sessionPath = taskFilePath(ctx.root, taskId, 'session.json');
+    const session = JSON.parse(readFileSync(sessionPath, 'utf-8'));
+    session.agent_session_id = sessionId;
+    writeFileSync(sessionPath, JSON.stringify(session, null, 2));
+
+    const result = await ctx.lazy(['pair', taskId]);
+    expectOutputExcludes(result, 'No existing claude-code session to resume');
+    expectOutput(result, sessionId.substring(0, 16));
   });
 
   // INVARIANT: --resume is only valid in branchless mode.
   // Task-based pairing resumes sessions automatically via agent_session_id.
   test('--resume works in branchless mode', async () => {
-    // On main branch (no task context), `lazy pair --resume` should attempt
-    // to launch Claude Code with the --resume flag. It will fail because
+    // On main branch (no task context), `lazy pair --host --resume` should
+    // attempt to launch Claude Code with the --resume flag. It will fail because
     // the `claude` binary doesn't exist, but should show branchless launch message.
-    const result = await ctx.lazy(['pair', '--resume', 'abc123session']);
+    const result = await ctx.lazy(['pair', '--host', '--resume', 'abc123session']);
     expectOutputExcludes(result, 'Usage: lazy pair');
     expectOutput(result, 'Launching Claude Code');
     expectOutput(result, 'no task context');
@@ -355,6 +458,187 @@ describe('lazy pair', () => {
     expectFailure(result);
     expectError(result, '--resume is only valid in branchless mode');
     expectError(result, 'Task-based pairing resumes sessions automatically');
+  });
+});
+
+/**
+ * A pairing session that actually ENDS, so the post-pairing capture runs.
+ *
+ * Every other suite here stops at the launch step, because the container CLI
+ * is missing. These put a fake `docker` on PATH (test/helpers/fake-docker.ts):
+ * its `run` stands in for the task container and answers the summary
+ * one-shot, and its scripted `exec` hook stands in for the in-container
+ * session — writing into the task sandbox exactly what the real agent would
+ * have left there — so `lazy pair` runs its whole post-pairing path against
+ * unmocked `src/`: conversation capture, transcript, summary, turn.
+ */
+describe('lazy pair captures the ended session', () => {
+  let ctx: TestContext;
+  let docker: FakeDocker;
+  let scratch: string;
+
+  const PI_FIXTURE = resolve(__dirname, '../fixtures/pi/sessions/two-turn-resumed.jsonl');
+  const PI_FIXTURE_SESSION_ID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0001';
+
+  beforeEach(async () => {
+    scratch = await mkdtemp(join(tmpdir(), 'lazy-pair-capture-'));
+    docker = await installFakeDocker(scratch);
+    ctx = await setupTestLazy();
+  });
+
+  afterEach(async () => {
+    await ctx.cleanup();
+  });
+
+  function pairEnv(): Record<string, string> {
+    return { PATH: `${docker.binDir}:${process.env.PATH ?? ''}` };
+  }
+
+  /** A blocked task with a worktree and session, on the given agent profile. */
+  function pairableTask(taskId: string, agentId: string): void {
+    createSessionManually(ctx, taskId);
+    setTaskStatus(ctx.root, taskId, 'blocked');
+    const task = readTaskJson(ctx.root, taskId);
+    task.agent_id = agentId;
+    writeTaskJson(ctx.root, taskId, task);
+  }
+
+  /**
+   * Script the in-container "session" to leave a pi session file in the task
+   * sandbox, where pi writes them (`~/.pi/agent/sessions/--<cwd>--/`, HOME
+   * being the sandbox mount). The content is the REAL fixture the pinned pi
+   * binary wrote — only the entry timestamps are moved past the pairing start,
+   * because the transcript keeps entries from this session onward and the
+   * fixture predates it.
+   */
+  async function piSessionLeftBehind(worktree: string): Promise<void> {
+    const future = new Date(Date.now() + 60_000).toISOString();
+    const shifted = readFileSync(PI_FIXTURE, 'utf-8')
+      .replace(/"timestamp":"2026-[^"]+"/g, `"timestamp":"${future}"`);
+    const staged = join(scratch, 'pi-session.jsonl');
+    writeFileSync(staged, shifted);
+    const sessionsDir = join(
+      worktree, SANDBOX_DIR, '.pi', 'agent', 'sessions',
+      `--${worktree.replace(/^\//, '').replace(/\//g, '-')}--`,
+    );
+    await docker.onExec(`#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "${sessionsDir}"
+cp "${staged}" "${sessionsDir}/2026-09-05T12-00-00-000Z_${PI_FIXTURE_SESSION_ID}.jsonl"
+`);
+  }
+
+  // INVARIANT (pi-conversation-capture): a pi pairing persists the session
+  // into lazy's conversation store and builds the end-of-session summary from
+  // that transcript — the same as Claude Code, and said so in
+  // public-docs/pairing.md. The task is on a NAMED profile on purpose: after
+  // agent-profiles `task.agent_id` is a profile name, and capture keyed on
+  // the profile name instead of the harness (`taskHarness === 'pi'`) would
+  // silently never run for exactly this task. This test fails if it stops.
+  test('a pi pairing on a named profile stores the conversation and summarizes it', async () => {
+    // A pi profile inherits pi's default upstream — a LOCAL Ollama — when it
+    // names no endpoint, and a local upstream is preflighted before any launch.
+    // The loopback stub is what an Ollama would be here; the pairing itself
+    // never sends a model request (the container's pi is faked).
+    const ollamaStub = Bun.serve({ port: 0, fetch: () => new Response('Ollama is running') });
+    const tomlPath = join(ctx.root, 'lazy.toml');
+    const before = readFileSync(tomlPath, 'utf-8');
+    writeFileSync(
+      tomlPath,
+      `${before}\n[agents.local-pi]\nharness = "pi"\nmodel = "qwen3.8:latest"\n` +
+      `endpoint = "http://127.0.0.1:${ollamaStub.port}"\n`,
+    );
+
+    const taskId = await createTask(ctx, 'Pi capture task', 'Some work');
+    pairableTask(taskId, 'local-pi');
+    await piSessionLeftBehind(worktreePathFor(ctx.root, taskId));
+    await docker.setOneshotResponse('PI-PAIR-SUMMARY: greeted twice.');
+
+    const result = await ctx.lazy(['pair', taskId], { env: pairEnv() });
+    expectSuccess(result);
+    expectOutput(result, 'Agent:     local-pi (pi)');
+    expectOutput(result, 'Pairing session ended');
+    // Never the degraded-capture note: pi IS capturable.
+    expectOutputExcludes(result, 'transcript capture is not available');
+    expectOutputExcludes(result, 'Failed to save');
+
+    // The session went to the container's pi, as pi.
+    const execs = await docker.execs();
+    expect(execs.length).toBe(1);
+    expect(execs[0]).toContain('lazy-agent pair');
+    expect(execs[0]).toContain('--agent pi');
+    ollamaStub.stop(true);
+
+    // Stored: the conversation is in the store under its pi session id, with
+    // the fixture's four text messages and the session's token usage.
+    const stored = JSON.parse(readFileSync(
+      join(storageDirFor(ctx.root), 'conversations', `${PI_FIXTURE_SESSION_ID}.json`), 'utf-8',
+    ));
+    expect(stored.messages.map((m: { role: string; text: string }) => `${m.role}: ${m.text}`)).toEqual([
+      'user: say hi',
+      'assistant: FAKE_OK reply number 1',
+      'user: second turn please',
+      'assistant: FAKE_OK reply number 2',
+    ]);
+    expect(stored.totalUsage.outputTokens).toBeGreaterThan(0);
+
+    // Searchable, as public-docs/pairing.md promises.
+    expectOutput(await ctx.lazy(['search', 'FAKE_OK reply number 2']), 'conversation');
+
+    // Summarized FROM that transcript: the summary one-shot's prompt carried
+    // the captured lines, and its answer landed on the task as the turn.
+    const summaryRun = (await docker.invocations()).join('\n');
+    expect(summaryRun).toContain('Human: say hi');
+    expect(summaryRun).toContain('Assistant: FAKE_OK reply number 2');
+    const turns = readTurns(ctx.root, taskId);
+    expect(turns.length).toBe(1);
+    expect(turns[0].content).toContain('PI-PAIR-SUMMARY: greeted twice.');
+  });
+
+  // INVARIANT: a Claude pairing that starts a FRESH session — no stored id,
+  // the ordinary state of a task whose stale id lazy dropped — has nothing to
+  // read yet, which is not the same as "lazy cannot read this agent's session
+  // files". That note is for cursor/codex; printing it here is false, and it
+  // regressed once when the pi branch turned `else if (!claudeSessions)` into
+  // a bare `else`.
+  test('a Claude pairing with no session to resume does not claim capture is unavailable', async () => {
+    const taskId = await createTask(ctx, 'Fresh claude pair task', 'Some work');
+    pairableTask(taskId, 'claude-code');
+    await docker.setOneshotResponse('CLAUDE-PAIR-SUMMARY.');
+
+    const result = await ctx.lazy(['pair', taskId], { env: pairEnv() });
+    expectSuccess(result);
+    expectOutput(result, 'No existing claude-code session to resume');
+    expectOutput(result, 'Pairing session ended');
+    expectOutputExcludes(result, 'transcript capture is not available');
+    expectOutputExcludes(result, 'lazy cannot read its');
+  });
+
+  // The note IS right for an agent whose session files lazy cannot read — the
+  // control for the test above, so the two assertions cannot both pass by the
+  // note simply never printing.
+  test('a cursor pairing says its transcript is not captured', async () => {
+    // A cursor container needs what a Claude one does not: its own cursor
+    // credential (a container cannot use a host login session) and the LIVE
+    // proxy, which cursor traffic is refused without — and only a daemon has a
+    // proxy. This test used to pass daemonless and keyless only because the
+    // container was launched on the default claude-code profile, the bug where
+    // a cursor task's container never got cursor's environment. So this one
+    // test swaps the suite's daemonless context for a daemon that sees the fake
+    // docker and holds a cursor key of its own (never the host's).
+    await ctx.cleanup();
+    ctx = await setupTestLazy({
+      withDaemon: true,
+      daemonEnv: { PATH: pairEnv().PATH!, CURSOR_API_KEY: 'cursor-test-fake-key' },
+    });
+
+    const taskId = await createTask(ctx, 'Cursor pair task', 'Some work');
+    pairableTask(taskId, 'cursor');
+
+    const result = await ctx.lazy(['pair', taskId], { env: pairEnv() });
+    expectSuccess(result);
+    expectOutput(result, 'transcript capture is not available for cursor');
+    expectOutput(result, 'Pairing session ended');
   });
 });
 
@@ -409,7 +693,7 @@ describe('pairing state blocks operations', () => {
     const result = await ctx.lazy(['pair', taskId]);
 
     // Reached the launch step — the state gate let `interrupted` through.
-    expectOutput(result, 'No existing Claude session to resume');
+    expectOutput(result, 'No existing claude-code session to resume');
   });
 
   test('pair rejects task already in pairing state', async () => {

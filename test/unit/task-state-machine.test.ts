@@ -13,8 +13,11 @@ import {
 import type { TaskStatus } from '../../src/types';
 
 // All statuses that exist in the TaskStatus type
+// INVARIANT (remove-reaper-cap-sweep): 'queued' is deliberately absent — the
+// agent concurrency cap and its queue were removed, so a start always launches
+// immediately and no task can be in a 'queued' state.
 const ALL_STATUSES: TaskStatus[] = [
-  'backlog', 'queued', 'working', 'blocked', 'conflict', 'pairing',
+  'backlog', 'working', 'blocked', 'conflict', 'pairing',
   'interrupted', 'submitted', 'merging', 'zombie', 'complete', 'abandoned',
 ];
 

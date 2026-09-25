@@ -120,7 +120,10 @@ function agentSupervisorArgs(binary = 'docker'): string[] {
     agentBinaryPath: '/usr/local/share/lazy-agent',
     authEnvVars: [],
     customMountArgs: [],
+    taskEnvArgs: [],
     gitMountArgs: [],
+    publishArgs: [],
+    runArgs: [],
     wrapperScript: 'sleep 1',
   });
 }

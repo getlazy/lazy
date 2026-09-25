@@ -46,7 +46,7 @@ describe('tilde expansion in config', () => {
       join(dir, 'lazy.toml'),
       `[storage]\nbackend = "external"\nexternal_path = "~/.lazy/tilde-test"\n`,
     );
-    const config = await loadConfig(dir, { cwd: dir });
+    const config = await loadConfig(dir);
     expect(config.storage.external_path).toBe(`${getHome()}/.lazy/tilde-test`);
     // And NOT the literal form that would create <cwd>/~/...
     expect(config.storage.external_path.startsWith('~')).toBe(false);
@@ -57,7 +57,7 @@ describe('tilde expansion in config', () => {
       join(dir, 'lazy.toml'),
       `[storage]\nbackend = "external"\nexternal_path = "/tmp/explicit-abs"\n`,
     );
-    const config = await loadConfig(dir, { cwd: dir });
+    const config = await loadConfig(dir);
     expect(config.storage.external_path).toBe('/tmp/explicit-abs');
   });
 
@@ -66,7 +66,7 @@ describe('tilde expansion in config', () => {
       join(dir, 'lazy.toml'),
       `[storage]\nbackend = "external"\nexternal_path = ""\n`,
     );
-    const config = await loadConfig(dir, { cwd: dir });
+    const config = await loadConfig(dir);
     expect(config.storage.external_path).toBe('');
   });
 });

@@ -1,0 +1,17 @@
+{
+  "name": "linkshelf",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A tiny link shortener: the lazy playground project.",
+  "scripts": {
+    "start": "bun run src/server.ts",
+    "dev": "bun --watch run src/server.ts",
+    "test": "bun test",
+    "typecheck": "bun ./node_modules/typescript/bin/tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.6.0"
+  }
+}

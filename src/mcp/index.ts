@@ -18,7 +18,12 @@ export { allTools, createAllHandlers, type McpToolContext } from './tools';
 
 import { McpServer } from './server';
 import { allTools, createAllHandlers, type McpToolContext } from './tools';
-import { isReadOnlyTool } from './tool-access';
+import {
+  isToolAllowedOnToolset,
+  mcpToolsetFromFlags,
+  type McpToolset,
+} from './tool-access';
+import { isToolForRole, roleForTaskId, type McpRole } from './tool-roles';
 import type { McpTool, McpToolHandler } from './types';
 import mcpServerInstructions from '../prompts/mcp-server-instructions.md' with { type: 'text' };
 
@@ -32,18 +37,53 @@ export interface McpServerOptions {
    * daemon, which never sees the supervisor's `LAZY_MCP_READ_ONLY` env var, so
    * the in-handler guard alone would be a no-op for containerized agents. Here
    * the write tool is refused before it is ever proxied.
+   *
+   * Prefer {@link toolset} when both could apply; if omitted, derived from
+   * `readOnly` / `review`.
    */
   readOnly?: boolean;
+
+  /**
+   * Agent-review toolset (`--review`): reads plus `lazy_raise`. Other writes
+   * stay refused. Mutually exclusive with a plain ask `--read-only` in practice
+   * — the supervisor passes one or the other.
+   */
+  review?: boolean;
+
+  /** Explicit toolset. Wins over `readOnly` / `review` flags when set. */
+  toolset?: McpToolset;
+
+  /**
+   * Which role this server serves — decides which tools are ADVERTISED.
+   *
+   * Defaults to 'builder', matching the empty task id an entry point falls back
+   * to. Advertisement only; the handlers' own role guards are what refuse a
+   * wrong-role call, and they stay reachable for a caller working from a stale
+   * tool list.
+   */
+  role?: McpRole;
+}
+
+function resolveServerToolset(opts?: McpServerOptions): McpToolset {
+  if (opts?.toolset) return opts.toolset;
+  return mcpToolsetFromFlags({ readOnly: opts?.readOnly, review: opts?.review });
 }
 
 /**
- * The refusal a write tool returns on a read-only turn.
+ * The refusal a write tool returns on a restricted turn (ask or review).
  *
  * Actionable on purpose — a competent model corrects course in the same turn
  * instead of concluding lazy is broken and giving up on tools entirely.
  */
-function readOnlyRefusal(toolName: string): McpToolHandler {
+function restrictedToolRefusal(toolName: string, toolset: McpToolset): McpToolHandler {
   return async () => {
+    if (toolset === 'review') {
+      throw new Error(
+        `${toolName} is not available on a review turn — file issues with lazy_raise, ` +
+        `then write the verdict JSON as your final message. Read-only lazy tools ` +
+        `(lazy_show, lazy_list, lazy_search, lazy_status, lazy_diff, …) work normally.`,
+      );
+    }
     throw new Error(
       `${toolName} is not available on a read-only turn — your final message is the answer. ` +
       `Write it directly as text. Read-only lazy tools (lazy_show, lazy_list, lazy_search, ` +
@@ -53,10 +93,13 @@ function readOnlyRefusal(toolName: string): McpToolHandler {
 }
 
 /**
- * Register every tool on the server, applying the read-only policy.
+ * Register every tool on the server, applying the toolset and role policies.
  *
- * On a read-only server the write tools stay REGISTERED but unadvertised, so
- * they answer with the refusal above rather than "Unknown tool".
+ * Both policies hide rather than remove: an unadvertised tool stays REGISTERED,
+ * so a caller working from a stale tool list gets an actionable refusal (the
+ * restricted-turn message above, or the handler's own "not available in builder
+ * mode") rather than "Unknown tool". Toolset is checked first because its
+ * refusal names the right correction for ask / review turns.
  *
  * Exported for `test/unit/mcp-read-only-toolset.test.ts`: the entry points that
  * use it block on stdin forever, so the policy is only testable on its own.
@@ -67,14 +110,16 @@ export function registerTools(
   tools: McpTool[],
   opts?: McpServerOptions,
 ): void {
+  const role = opts?.role ?? 'builder';
+  const toolset = resolveServerToolset(opts);
   for (const tool of tools) {
-    if (opts?.readOnly && !isReadOnlyTool(tool.name)) {
-      server.registerTool(tool, readOnlyRefusal(tool.name), { advertise: false });
+    if (!isToolAllowedOnToolset(tool.name, toolset)) {
+      server.registerTool(tool, restrictedToolRefusal(tool.name, toolset), { advertise: false });
       continue;
     }
     const handler = handlers.get(tool.name);
     if (handler) {
-      server.registerTool(tool, handler);
+      server.registerTool(tool, handler, { advertise: isToolForRole(tool.name, role) });
     }
   }
 }
@@ -98,7 +143,10 @@ export async function startMcpServer(ctx: McpToolContext, opts?: McpServerOption
     { instructions: mcpServerInstructions },
   );
 
-  registerTools(server, createAllHandlers(ctx), allTools, opts);
+  registerTools(server, createAllHandlers(ctx), allTools, {
+    ...opts,
+    role: opts?.role ?? roleForTaskId(ctx.taskId),
+  });
 
   // Run the server (blocks until stdin closes)
   await server.run();
@@ -140,11 +188,21 @@ export async function startMcpServerDaemonProxy(
   );
 
   // Only mint proxy handlers for tools this server will actually serve — a
-  // read-only server must not hold a live proxy handler for a write tool.
-  const served = opts?.readOnly ? allTools.filter(t => isReadOnlyTool(t.name)) : allTools;
-  const handlers = createAllDaemonProxyHandlers(config, served.map(t => t.name));
+  // restricted (ask/review) server must not hold a live proxy handler for a
+  // write tool outside its toolset.
+  //
+  // The ROLE filter deliberately does not narrow this set: an out-of-role tool
+  // is hidden, not removed, and its refusal is produced by the handler running
+  // inside the daemon — so it still needs a proxy handler to reach.
+  const toolset = resolveServerToolset(opts);
+  const served = allTools.filter((t) => isToolAllowedOnToolset(t.name, toolset));
+  const handlers = createAllDaemonProxyHandlers(config, served.map((t) => t.name));
 
-  registerTools(server, handlers, allTools, opts);
+  registerTools(server, handlers, allTools, {
+    ...opts,
+    toolset,
+    role: opts?.role ?? roleForTaskId(config.taskId),
+  });
 
   // Run the server (blocks until stdin closes)
   await server.run();
@@ -170,12 +228,8 @@ export async function startMcpServerProxy(builderConfigPath: string): Promise<vo
   const toolNames = allTools.map(t => t.name);
   const handlers = createAllProxyHandlers(config.host, config.port, config.token, toolNames);
 
-  for (const tool of allTools) {
-    const handler = handlers.get(tool.name);
-    if (handler) {
-      server.registerTool(tool, handler);
-    }
-  }
+  // This mode only ever serves a builder session.
+  registerTools(server, handlers, allTools, { role: 'builder' });
 
   // Run the server (blocks until stdin closes)
   await server.run();

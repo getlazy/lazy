@@ -14,7 +14,8 @@ import {
   readHeartbeatEnvelope,
   type EnvelopeResult,
 } from '../../src/daemon/heartbeat';
-import { PhaseReporter, ACCEPT_PHASES, type ProgressEvent } from '../../src/daemon/progress';
+import { PhaseReporter, ACCEPT_PHASES, SYNC_PHASES, type ProgressEvent } from '../../src/daemon/progress';
+import { createPhaseDisplay } from '../../src/cli/phase-display';
 
 describe('progress lines in the heartbeat envelope', () => {
   test('phase events written by the handler reach the client in order', async () => {
@@ -92,5 +93,45 @@ describe('progress lines in the heartbeat envelope', () => {
     expect(await readHeartbeatEnvelope(response, 'accept')).toEqual({
       status: 409, body: { error: 'nope' },
     });
+  });
+
+  // The whole chain a `lazy sync` on a piped stdout goes through: daemon phase
+  // + heartbeat lines → NDJSON → reader → the append-only terminal rendering.
+  // A phase that is genuinely slow (the upstream fetch, a container create)
+  // narrates nothing on its own, so without the heartbeats being wired into the
+  // display the screen is silent for the whole phase — which is the bug this
+  // asserts against, one layer below the CLI command.
+  test('a slow phase gets liveness lines on a non-TTY display', async () => {
+    const lines: string[] = [];
+    const realLog = console.log;
+    console.log = (...args: unknown[]) => { lines.push(args.join(' ')); };
+
+    // The display waits ~4s of silence before it says anything. Rather than
+    // sleep that long, run it on a clock that ticks 100x wall time: the same
+    // production code path fires, in ~150ms.
+    const realStart = Date.now();
+    const fastClock = () => realStart + (Date.now() - realStart) * 100;
+
+    try {
+      const display = createPhaseDisplay({ tty: false, now: fastClock });
+      const response = heartbeatEnvelopeResponse(async emit => {
+        const phases = new PhaseReporter(emit, 'sync');
+        phases.begin(SYNC_PHASES.upstream, 'main');
+        // A phase that does its work without narrating — exactly what a fetch
+        // or a container create looks like from out here.
+        await new Promise(resolve => setTimeout(resolve, 150));
+        phases.end('main');
+        return { status: 200, body: { status: 'launched' } };
+      }, { intervalMs: 20 });
+
+      await readHeartbeatEnvelope(response, 'syncTask', display.onHeartbeat, display.onProgress);
+      display.close();
+    } finally {
+      console.log = realLog;
+    }
+
+    const output = lines.join('\n');
+    expect(output).toContain('Fetch and resolve upstream');
+    expect(output).toContain('still running');
   });
 });

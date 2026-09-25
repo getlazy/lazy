@@ -40,8 +40,17 @@
 import { DaemonClient } from '../daemon/client';
 import { RemoteStorage } from '../storage/remote-storage';
 import { createRpcReviewActions } from '../cli/review-actions-rpc';
+import { createStorageMessageActions } from '../daemon/message-service';
+import { createRpcMemoryActions } from '../cli/memory-actions-rpc';
+import { createRpcDoctorActions } from '../cli/doctor-actions-rpc';
+import { createRpcServeActions } from '../cli/serve-actions-rpc';
 import { createWebRequestHandler, tryBindTcpPort } from '../server';
-import { findLazyRoot } from '../cli/init';
+import { createShellUpgrader } from '../server/shell-ws';
+import { createActionRunUpgrader } from '../server/action-ws';
+import { composeUpgraders } from '../server/ws';
+import { guardDashboardRequest, serveDashboardRequest } from '../daemon/dashboard-auth';
+import { dashboardHostFor } from '../daemon/dashboard-url';
+import { findLazyRoot } from '../project-paths';
 import { DEFAULT_SERVER_BIND } from '../config/constants';
 
 /** Default dev port. Deliberately not the daemon's 26024 — both run at once. */
@@ -73,7 +82,7 @@ export async function startDevWebServer(options: DevWebServerOptions = {}) {
   // LAZY_IS_DAEMON=1 so CLI processes can fall back to a direct store. This
   // server has no fallback by design — it is always a daemon client — so it
   // builds the client itself and fails loudly when there is none.
-  const client = DaemonClient.create(projectRoot);
+  const client = await DaemonClient.create(projectRoot);
   if (!client) {
     throw new DevWebServerError(
       `No daemon is running for ${projectRoot}. The dev web server is a client of the daemon — ` +
@@ -97,20 +106,61 @@ export async function startDevWebServer(options: DevWebServerOptions = {}) {
 
   const storage = new RemoteStorage(client, projectRoot, storagePath);
   const actions = createRpcReviewActions(client, projectRoot);
-  const handler = createWebRequestHandler(storage, actions, { stylesheetFromDisk: true });
+  // The inbox's writes go through the same RemoteStorage — i.e. the daemon's
+  // storage RPC — so this dev server never opens the store itself either.
+  const dashboard = createWebRequestHandler(storage, actions, {
+    stylesheetFromDisk: true,
+    messageActions: createStorageMessageActions(async () => storage),
+    memoryActions: createRpcMemoryActions(client, projectRoot),
+    doctorActions: createRpcDoctorActions(client, projectRoot),
+    serveActions: createRpcServeActions(client, projectRoot),
+  });
 
   const port = options.port ?? DEV_WEB_PORT;
   const host = options.host ?? DEFAULT_SERVER_BIND;
+  // Same hostname as the daemon's dashboard, deliberately: the session cookie
+  // is scoped to the HOST and not the port, so a browser already signed in with
+  // `lazy dashboard` reaches this server too and the dev loop needs no second
+  // sign-in. That sharing is exactly why the host matters — reached as
+  // `127.0.0.1:26124` this server refuses, because a cookie valid there would
+  // also be sent to the task apps published on 127.0.0.1.
+  const dashboardHost = dashboardHostFor(host);
+
+  // Same pages, same store, same reachable-from-a-container loopback port — so
+  // the same gate, through the same wrapper the daemon uses: it carries the
+  // anti-framing headers with it, and a second surface must not be the one that
+  // serves these pages frameable. A task container holding an MCP token cannot
+  // read a thing here.
+  const handler = (req: Request): Promise<Response> =>
+    serveDashboardRequest(projectRoot, req, dashboardHost, dashboard);
+
+  // The web shell reaches the task's container the same way `lazy shell` does.
+  // Its WebSocket upgrade sits in front of `handler`, so it carries the SAME
+  // dashboard gate itself — a shell is the most valuable thing on this port and
+  // must never be the one route the session check misses.
+  const guard = (req: Request) => guardDashboardRequest(projectRoot, req, dashboardHost);
+  const shellUpgrader = createShellUpgrader({
+    getStorage: async () => storage,
+    root: projectRoot,
+    guard,
+  });
+  const wsUpgrader = composeUpgraders([
+    shellUpgrader,
+    createActionRunUpgrader({ getStorage: async () => storage, guard }),
+  ]);
+
   // maxAttempts 1: silently drifting to another port is exactly the kind of
   // ambient state this server exists to avoid — say the port is busy instead.
-  const bound = tryBindTcpPort(port, handler, 1, host);
+  const bound = tryBindTcpPort(port, handler, 1, host, wsUpgrader);
   if (!bound) {
     throw new DevWebServerError(
       `Port ${port} is already in use on ${host}. Free it, or pass --port <n>.`,
     );
   }
 
-  return { server: bound.server, url: `http://${host}:${port}`, projectRoot };
+  // The URL is on the dashboard host, not the bind address: that is the one
+  // address the gate accepts a session on.
+  return { server: bound.server, url: `http://${dashboardHost}:${port}`, projectRoot };
 }
 
 function parseArgs(argv: string[]): DevWebServerOptions {

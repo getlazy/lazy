@@ -23,7 +23,6 @@ function makeTask(): Task {
     prompt: 'Do work',
     type: 'task',
     status: 'complete',
-    priority: 'normal',
     created_at: 0,
     completed_at: null,
     target: { kind: 'branch', branch: 'main' },
@@ -62,7 +61,10 @@ function makeCommit(): Commit {
 describe('commitDetailHtml', () => {
   test('renders light-DOM diff rows, not a shadow-DOM web component', () => {
     const html = commitDetailHtml(makeTask(), makeCommit(), SAMPLE_PATCH);
-    expect(html).toContain('class="rv-file"');
+    // `rv-viewable` rides alongside `rv-file`: a file and a markdown card are
+    // the same collapsible affordance and share one island. The light-DOM
+    // section itself is what this invariant is about.
+    expect(html).toContain('class="rv-file rv-viewable"');
     expect(html).toContain('table class="rv-diff"');
     expect(html).not.toContain('diffs-container');
     expect(html).not.toContain('customElements.define');

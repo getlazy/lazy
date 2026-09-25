@@ -6,7 +6,7 @@ import { expectSuccess, expectOutput, expectOutputExcludes } from '../helpers/as
 import { createTask, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 // Storage lives at the project's external_path, not <root>/.lazy/tasks.
 import { findFullTaskId } from '../helpers/storage';
-import { getNewNotesSince, buildNotesContext } from '../../src/cli/commands/shared';
+import { getNewNotesSince, buildNotesContext } from '../../src/task/turn-context';
 import { buildNotesSectionForEditor, buildFreeformEditorContentWithNotes, buildEditorContentWithDiff, extractSurvivingNotes, extractFeedbackFromDiff } from '../../src/utils/diff';
 import { readCommand, protocolDir as getProtocolDir } from '../../src/protocol';
 import type { UnblockCommand } from '../../src/protocol';

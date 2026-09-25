@@ -1,21 +1,48 @@
+import { requireLaunchModel } from '../agent/launch-model';
 import { createHash, randomUUID } from 'crypto';
-import { readFileSync, existsSync, mkdirSync, chmodSync, unlinkSync, renameSync } from 'fs';
-import { mkdir, mkdtemp, writeFile, readFile } from 'fs/promises';
-import { join, isAbsolute, dirname } from 'path';
+import { throttleNotes, type PhaseNotify } from '../daemon/progress';
+import { readFileSync, existsSync, mkdirSync, chmodSync, unlinkSync, writeFileSync, renameSync } from 'fs';
+import { access, mkdir, mkdtemp, writeFile, readFile } from 'fs/promises';
+import { join, isAbsolute, dirname, basename } from 'path';
 import { tmpdir } from 'os';
 import type { AgentResponse, TokenUsage } from '../types';
 import { ClaudeCodeAgent } from '../agent/claude-code';
 import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
-import { getAgentPackaging } from '../agent/registry';
-import { agentSupportsApiKey, resolveAgentApiKey, AGENT_KEY_ENV } from '../agent/credentials';
-import { findLazyRoot } from '../cli/init';
+import { getAgentPackaging, listAgents } from '../agent/registry';
+import { agentSupportsApiKey, resolveProfileCredential, alternativeCredentialHint, AGENT_KEY_ENV } from '../agent/credentials';
+import { findLazyRoot } from '../project-paths';
 import { loadConfig } from '../config/loader';
+import {
+  BUILDER_PROFILE_NAME,
+  profileNameForAgent,
+  harnessForAgentName,
+  profileForAgentName,
+  NO_CREDENTIAL,
+} from '../config/agent-profiles';
+import { envVarsFor, credentialSetupCommand, resolveCredentialTarget } from '../credentials/providers';
 import type { RoleTarget } from '../config/types';
 import { buildMountArgs } from './mounts';
+import { buildPublishArgs } from '../serve/ports';
+// Leaf module: task-env only reaches daemon/paths → utils/home, so this adds no
+// cycle between the capture and daemon layers.
+import { getTaskEnv, buildTaskEnvArgs } from '../daemon/task-env';
+import { sessionCredentialEnvFor } from '../daemon/turn-credentials';
+import { isSessionPlaceholderToken } from '../daemon/session-credentials';
 import { isBuildProgressLine, splitLines, formatDuration, buildTimeoutMessage } from './docker-build-output';
-import { buildGitMountArgsFor } from './git-mounts';
-import { targetEnvVars, ANTHROPIC_DEFAULT_TARGET, LOCAL_BACKEND_CREDS, type ProxyAuditHints, type LaunchSurface } from '../utils/role-target';
+import { buildGitMountArgsFor, buildGitMountArgs, resolveGitMountPaths } from './git-mounts';
+import {
+  targetEnvVars,
+  ANTHROPIC_DEFAULT_TARGET,
+  LOCAL_BACKEND_CREDS,
+  resolveProfileLaunchCreds,
+  usesSyntheticCreds,
+  type ProxyAuditHints,
+  type LaunchSurface,
+} from '../utils/role-target';
 import { cursorLaunchEnvVars } from '../proxy/cursor-route';
+import { piLaunchEnvVars, piCredentialMirror } from '../agent/pi-turn-config';
+import { DEFAULT_UPSTREAM_TIMEOUT_SECONDS } from '../proxy/upstream-defaults';
+import { codexLaunchEnvVars } from '../proxy/codex-route';
 import { placeholderizeAuthEnv, type LaunchIdentity } from '../proxy/placeholder-env';
 import { mintCredentialGrant } from '../proxy/credential-broker';
 import { hasDaemonContext, getDaemonContext } from '../daemon/context';
@@ -28,7 +55,6 @@ import { redactSecrets } from '../utils/redact';
 import { isOfflineMode } from '../utils/offline';
 import { spawn } from '../utils/spawn';
 import { safeArgvPrompt } from '../agent/argv-safety';
-import { markMachineOneshotPrompt } from '../import/machine-oneshot';
 import DEFAULT_DOCKERFILE from '../docker/base.Dockerfile' with { type: 'text' };
 
 // Re-export so other modules (e.g. `lazy system export-dockerfile`) can use the
@@ -37,9 +63,35 @@ export { DEFAULT_DOCKERFILE };
 import { getHome } from '../utils/home';
 import { toTurnUsage } from '../utils/usage-recording';
 import { VERSION } from '../version';
-import { IMAGE_NAME, DOCKERFILE_HASH_LABEL, IMAGE_TAG, IMAGE_MAX_AGE_DAYS, IMAGE_MAX_AGE_MS, consentedBuildIdentity } from './image-tag';
+import {
+  IMAGE_NAME,
+  DOCKERFILE_HASH_LABEL,
+  IMAGE_INPUTS_LABEL,
+  DOCKERFILE_INPUT_KEY,
+  IMAGE_TAG,
+  IMAGE_MAX_AGE_DAYS,
+  IMAGE_MAX_AGE_MS,
+  consentedBuildIdentity,
+} from './image-tag';
+import { pathExists } from '../utils/fs';
+import { TaskMutex } from '../utils/task-mutex';
 import { analyzeLazyBaseUsage, type LazyBaseUsage } from './dockerfile-base';
 import { adoptedBuildContextRoot } from '../daemon/adopted-image';
+
+/**
+ * Serializes `ensureImage` per resolved image name, so a fan-out of task starts
+ * after a lockfile bump triggers ONE build instead of `max_concurrent_agents`
+ * of them. The second caller waits, then finds the label hash current and
+ * returns without building.
+ *
+ * In-process only, and that is the fan-out that matters: every task launch goes
+ * through the daemon. A cross-PROCESS race remains — a human running
+ * `lazy upgrade` or starting a builder from the CLI while the daemon fans out —
+ * and it is left open deliberately: it is rare, and the loser just rebuilds an
+ * image that is already correct. If it ever needs closing, the file-lock
+ * pattern in src/utils/storage-lock.ts is the tool.
+ */
+const imageBuildMutex = new TaskMutex();
 
 // Re-exported so callers keep importing the image identity from one place.
 export { IMAGE_TAG, IMAGE_MAX_AGE_DAYS, IMAGE_MAX_AGE_MS };
@@ -66,7 +118,42 @@ import {
   verifyAgentBinaryBytes,
   formatAgentBinaryError,
   MIN_AGENT_BINARY_SIZE,
+  verifyAgentBinarySelfcheckExec,
+  assertAgentBinarySelfcheckForImage,
 } from '../agent/binary-identity';
+import {
+  AGENT_BINARY_TMP_PREFIX,
+  adoptLegacyAgentBinary,
+  adoptVersionedAgentBinary,
+  agentBinaryContentId,
+  agentBinaryContentIdOfFile,
+  agentBinaryPointerPath,
+  installVersionedAgentBinary,
+  listContainerMountSources,
+  pruneAgentBinaries,
+  resolveInstalledAgentBinary,
+  updateAgentBinaryPointer,
+  versionedAgentBinaryName,
+  versionedAgentBinaryPath,
+} from '../agent/binary-install';
+import {
+  captureBuildProvenance,
+  DEV_BUILD_INFO,
+  formatBuildInfoContent,
+  formatSourceProvenanceLine,
+  type BuildInfoValues,
+} from '../utils/build-provenance';
+
+/** Provenance of the most recent source compile in this process, if any. */
+let lastSourceBuildProvenance: BuildInfoValues | null = null;
+
+/** Serializes dev-mode source compiles — they briefly mutate src/build-info.ts. */
+let sourceAgentBinaryBuild: Promise<string> | null = null;
+
+/** Returns provenance when ensureAgentBinary last compiled from a source checkout. */
+export function getLastSourceBuildProvenance(): BuildInfoValues | null {
+  return lastSourceBuildProvenance;
+}
 
 export interface SandboxConfig {
   worktreePath: string;
@@ -114,7 +201,10 @@ export async function checkDocker(binary: string = 'docker'): Promise<void> {
   const exitCode = await proc.exited;
   if (exitCode !== 0) {
     const name = binary.charAt(0).toUpperCase() + binary.slice(1);
-    throw new Error(`${name} is not installed or not running. Install ${name}: https://docs.${binary}.com/get-${binary}/`);
+    const installUrl = binary === 'podman'
+      ? 'https://podman.io/docs/installation'
+      : `https://docs.${binary}.com/get-${binary}/`;
+    throw new Error(`${name} is not installed or not running. Install ${name}: ${installUrl}`);
   }
 
   logger.debug(`${binary} is running ✓`);
@@ -206,13 +296,40 @@ export async function resolveCustomDockerfile(lazyRoot: string): Promise<string 
   if (!configPath) return null;
 
   const absPath = join(lazyRoot, configPath);
-  if (!existsSync(absPath)) {
+  try {
+    await access(absPath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') {
+      throw new Error(
+        `Custom Dockerfile not found: ${configPath} (resolved to ${absPath}). ` +
+        `Check the [docker].dockerfile setting in lazy.toml.`
+      );
+    }
     throw new Error(
-      `Custom Dockerfile not found: ${configPath} (resolved to ${absPath}). ` +
-      `Check the [docker].dockerfile setting in lazy.toml.`
+      `failed to access custom Dockerfile at ${absPath}: ${(err as Error).message}`,
+      { cause: err },
     );
   }
   return absPath;
+}
+
+/**
+ * Resolve the extra `docker run` arguments for TASK containers
+ * (`[docker] run_args`).
+ *
+ * INVARIANT: like the image (see resolveCustomDockerfile above), run args must
+ * come from the PROJECT ROOT's lazy.toml, never from a task worktree's copy.
+ * Task branches are agent-writable, and honouring a worktree lazy.toml here
+ * would let an agent grant its own next container `--privileged` or a host
+ * bind mount. `loadConfig` now anchors every read at the project root (see
+ * findConfigDir in src/config/loader.ts), so this is anchoring by construction
+ * rather than by call-site discipline; the wrapper stays because the key's
+ * anchoring is asserted directly (test/unit/docker-run-args.test.ts).
+ */
+export async function resolveDockerRunArgs(lazyRoot: string): Promise<string[]> {
+  const config = await loadConfig(lazyRoot);
+  return config.docker.run_args;
 }
 
 /**
@@ -272,16 +389,24 @@ async function adoptedImageRepository(lazyRoot: string): Promise<string | null> 
  * otherwise the project's configured default agent applies. Returns null when
  * the effective agent needs no extra install: claude-code is already in the
  * base image, and host-only agents never reach a container build.
+ *
+ * `agentId` names a PROFILE; what gets installed is its HARNESS — the binary.
+ * The lookup is lenient (see profileForAgentNameOrNull): a task naming a
+ * profile lazy.toml no longer defines is a problem for the selection surface
+ * to report, not a reason for an image build to throw from underneath.
  */
-async function resolveImageAgent(lazyRoot: string, agentId?: string): Promise<string | null> {
-  const effective = agentId ?? (await loadConfig(lazyRoot)).agent.agent_id;
+/** Exported for unit tests — decides which agent CLI an image build should bake in. */
+export async function resolveImageAgent(lazyRoot: string, agentId?: string): Promise<string | null> {
+  const config = await loadConfig(lazyRoot);
+  const profileName = agentId ?? config.agent.agent_id;
+  const effective = harnessForAgentName(config, profileName) ?? profileName;
   if (effective === 'claude-code') return null;
-  try {
-    return getAgentPackaging(effective).supportsContainerRunner() ? effective : null;
-  } catch {
-    // Unknown agent id — validated elsewhere; the image build just uses base.
-    return null;
-  }
+  // Unknown ids fall back to the base image — but only after an explicit registry
+  // check. getAgentPackaging throws for unknown ids AND for genuine packaging
+  // failures; swallowing the catch hid the latter and built base images for
+  // registered agents whose packaging broke.
+  if (!listAgents().includes(effective)) return null;
+  return getAgentPackaging(effective).supportsContainerRunner() ? effective : null;
 }
 
 async function getDockerfileContent(lazyRoot: string, agentId?: string): Promise<{ content: string; isCustom: boolean }> {
@@ -290,7 +415,7 @@ async function getDockerfileContent(lazyRoot: string, agentId?: string): Promise
     // Custom Dockerfiles are the user's own — never silently amended. If they
     // run a non-claude agent they add its install line themselves (the install
     // command is printed by `lazy system export-dockerfile` docs).
-    return { content: readFileSync(customPath, 'utf-8'), isCustom: true };
+    return { content: await readFile(customPath, 'utf-8'), isCustom: true };
   }
 
   // Agent-aware default image: bake the configured (or task-overridden) agent's
@@ -307,9 +432,139 @@ async function getDockerfileContent(lazyRoot: string, agentId?: string): Promise
   return { content: DEFAULT_DOCKERFILE, isCustom: false };
 }
 
-export async function calculateDockerfileHash(lazyRoot: string, agentId?: string): Promise<string> {
+/**
+ * A path → content-hash map of everything the image's identity is derived from.
+ * Key order is the map's insertion order and is stable (Dockerfile first, then
+ * `build_inputs` sorted), so the combined hash below is deterministic.
+ */
+export type ImageInputManifest = Record<string, string>;
+
+function shortHash(content: string | Buffer): string {
+  return createHash('sha256').update(content).digest('hex').substring(0, 16);
+}
+
+/**
+ * Resolve `[docker] build_inputs` to absolute paths, in a stable sorted order.
+ *
+ * A declared file that does NOT exist is a hard error, not a warning, and not
+ * "hashes as absent". The alternatives both fail silently in the case that
+ * actually happens: a typo (`Gemfille.lock`) would hash as permanently absent,
+ * so the image would never rebuild on a lockfile bump and the user would get
+ * exactly the silent drift this feature exists to remove — with no signal
+ * anywhere. Erroring matches how a missing `[docker] dockerfile` already fails
+ * (`resolveCustomDockerfile` above), and the fix is a one-line lazy.toml edit
+ * named in the message.
+ */
+async function resolveBuildInputs(lazyRoot: string): Promise<{ relative: string; absolute: string }[]> {
+  const config = await loadConfig(lazyRoot);
+  const declared = config.docker.build_inputs;
+  if (declared.length === 0) return [];
+
+  const resolved = [...declared]
+    .sort()
+    .map(relative => ({ relative, absolute: join(lazyRoot, relative) }));
+
+  const missing: string[] = [];
+  for (const input of resolved) {
+    if (!(await pathExists(input.absolute))) missing.push(input.relative);
+  }
+  if (missing.length > 0) {
+    throw new Error(
+      `[docker] build_inputs file(s) not found: ${missing.join(', ')} ` +
+      `(resolved against ${lazyRoot}). ` +
+      `Remove them from the build_inputs setting in lazy.toml, or create the files.`
+    );
+  }
+
+  return resolved;
+}
+
+/**
+ * Everything the image identity is derived from: the Dockerfile text plus the
+ * contents of every declared build input.
+ *
+ * Files are hashed as `path + content` (not content alone) so that renaming a
+ * declared input — same bytes, different name — is a change: the Dockerfile
+ * COPYs it by name, so the built image genuinely differs.
+ */
+export async function calculateImageInputManifest(lazyRoot: string, agentId?: string): Promise<ImageInputManifest> {
   const { content } = await getDockerfileContent(lazyRoot, agentId);
-  return createHash('sha256').update(content).digest('hex');
+  const manifest: ImageInputManifest = { [DOCKERFILE_INPUT_KEY]: shortHash(content) };
+
+  for (const input of await resolveBuildInputs(lazyRoot)) {
+    const bytes = await readFile(input.absolute);
+    manifest[input.relative] = shortHash(Buffer.concat([Buffer.from(`${input.relative}\0`), bytes]));
+  }
+
+  return manifest;
+}
+
+/**
+ * The image's identity hash — what goes in DOCKERFILE_HASH_LABEL and what
+ * `ensureImage` compares to decide whether to rebuild.
+ *
+ * Deliberately NOT folded into `resolveImageRepository`: the repository stays
+ * `lazy-custom-<dockerfile-hash>`, so a lockfile bump rebuilds the image IN
+ * PLACE rather than minting a new image name per bump and leaving a trail of
+ * orphaned images behind.
+ *
+ * With no `build_inputs` configured the manifest holds one entry and this is
+ * NOT the bare sha256 of the Dockerfile text it used to be — so every existing
+ * image looks stale exactly once, rebuilds, and is stable from then on. That
+ * one-off is the cost of having a single identity mechanism instead of two.
+ *
+ * `agentId` selects which agent's CLI the Dockerfile bakes in, so a cursor image
+ * and a claude-code image are different identities rather than two builds
+ * fighting over one hash (cursor-first-class-agent). Omitted means the project's
+ * configured agent.
+ */
+export async function calculateImageInputsHash(lazyRoot: string, agentId?: string): Promise<string> {
+  return (await resolveImageIdentity(lazyRoot, agentId)).hash;
+}
+
+/** The identity hash and the manifest it was derived from, always in step. */
+export interface ImageIdentity {
+  hash: string;
+  manifest: ImageInputManifest;
+}
+
+/**
+ * Resolved once per build/check so the label pair written to an image can never
+ * disagree with each other.
+ */
+async function resolveImageIdentity(lazyRoot: string, agentId?: string): Promise<ImageIdentity> {
+  const manifest = await calculateImageInputManifest(lazyRoot, agentId);
+  return { hash: hashManifest(manifest), manifest };
+}
+
+function hashManifest(manifest: ImageInputManifest): string {
+  const canonical = Object.entries(manifest).map(([path, hash]) => `${path}=${hash}`).join('\n');
+  return createHash('sha256').update(canonical).digest('hex');
+}
+
+/**
+ * Human-readable reason a rebuild is happening, by diffing the manifest an
+ * image was built from against the current one.
+ *
+ * Best-effort by construction: `previous` is null for any image built before
+ * the manifest label existed, and the caller falls back to a generic message.
+ */
+export function describeInputChanges(
+  previous: ImageInputManifest | null,
+  current: ImageInputManifest,
+): string | null {
+  if (!previous) return null;
+
+  const changes: string[] = [];
+  for (const [path, hash] of Object.entries(current)) {
+    if (!(path in previous)) changes.push(`${path} added`);
+    else if (previous[path] !== hash) changes.push(`${path} changed`);
+  }
+  for (const path of Object.keys(previous)) {
+    if (!(path in current)) changes.push(`${path} no longer a build input`);
+  }
+
+  return changes.length > 0 ? changes.join(', ') : null;
 }
 
 /**
@@ -389,6 +644,39 @@ async function getImageDockerfileHash(imageName: string, binary: string = 'docke
 }
 
 /**
+ * The input manifest an existing image was built from, or null when it cannot
+ * be read (image missing, label absent because the image predates the label,
+ * unparseable JSON). Null means "no opinion" — the caller degrades to a generic
+ * "image inputs changed" message and never to a wrong one.
+ */
+async function getImageInputManifest(imageName: string, binary: string = 'docker'): Promise<ImageInputManifest | null> {
+  const inspect = spawn(
+    [binary, 'image', 'inspect', imageName, '--format', `{{index .Config.Labels "${IMAGE_INPUTS_LABEL}"}}`],
+    { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS }
+  );
+
+  const [stdout, exitCode] = await Promise.all([
+    new Response(inspect.stdout).text(),
+    inspect.exited,
+  ]);
+  if (exitCode !== 0) return null;
+
+  const raw = stdout.trim();
+  if (!raw || raw === '<no value>') return null;
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    return parsed as ImageInputManifest;
+  } catch {
+    // The label is explanatory only — a malformed one must never fail a launch,
+    // it just costs us the ability to name the file that changed.
+    logger.debug(`Ignoring unparseable ${IMAGE_INPUTS_LABEL} label on ${imageName}`);
+    return null;
+  }
+}
+
+/**
  * When the image was built, per the container runtime, or null if it cannot be
  * determined (image missing, runtime hiccup, unparseable timestamp).
  *
@@ -434,6 +722,90 @@ export async function isImageTooOld(
   return { tooOld: ageMs > IMAGE_MAX_AGE_MS, ageDays: Math.floor(ageMs / (24 * 60 * 60 * 1000)) };
 }
 
+/** What `lazy upgrade` should do about the container image. */
+export interface UpgradeRebuildEvaluation {
+  /**
+   * `rebuild` — something about the image genuinely changed (or could not be
+   * read), so there is nothing to ask about.
+   * `ask` — the image on this host was built from exactly these inputs already.
+   * Rebuilding would only re-resolve unpinned contents, which is a judgement
+   * call, so the caller puts it to the human (and rebuilds when it cannot ask).
+   */
+  verdict: 'rebuild' | 'ask';
+  /** Why, in words a human can act on. Printed either way. */
+  reason: string;
+  imageName: string;
+  /** For `ask`: how long ago that identical build finished ("6 minutes"). */
+  builtAgo?: string;
+}
+
+/**
+ * Decide whether `lazy upgrade` has a REASON to rebuild the container image, or
+ * only a judgement call to put to the human.
+ *
+ * `lazy upgrade --images` is the documented force-refresh and never comes here.
+ *
+ * There is deliberately no timer. An earlier revision skipped the rebuild when
+ * an identical image had been built within the last hour, and an hour is an
+ * arbitrary number that neither the output nor the docs could justify: an
+ * upgrade minutes after `lazy upgrade --images` repeats a pointless multi-minute
+ * build, while the same image at three days old may be exactly what you want
+ * refreshed. Whether re-resolving the unpinned contents (the agent CLI, apt
+ * packages, anything else the Dockerfile fetches) is worth the wait is the
+ * human's call, and `ask` is how they get to make it — the age goes in the
+ * question rather than into a threshold nobody can see.
+ *
+ * The age itself comes from the image's BUILD time (see getImageCreatedAt): a
+ * `docker tag` does not advance it, so promoting an old image onto the tag can
+ * never masquerade as a fresh build. Anything unreadable (image absent, runtime
+ * hiccup, no identity label) answers `rebuild` — the safe direction, and the
+ * same "null means no opinion" posture as the rest of this file.
+ */
+export async function evaluateUpgradeRebuild(
+  lazyRoot: string,
+  binary: string = 'docker',
+  agentId?: string,
+): Promise<UpgradeRebuildEvaluation> {
+  const imageName = await resolveImageName(lazyRoot, agentId);
+
+  const builtHash = await getImageDockerfileHash(imageName, binary);
+  if (!builtHash) {
+    return { verdict: 'rebuild', reason: `${imageName} is not built on this host`, imageName };
+  }
+
+  const identity = await resolveImageIdentity(lazyRoot, agentId);
+  if (builtHash !== identity.hash) {
+    const previous = await getImageInputManifest(imageName, binary);
+    const changed = describeInputChanges(previous, identity.manifest) ?? 'image inputs have changed';
+    return { verdict: 'rebuild', reason: changed, imageName };
+  }
+
+  const created = await getImageCreatedAt(imageName, binary);
+  if (!created) {
+    return { verdict: 'rebuild', reason: 'the image build time could not be read', imageName };
+  }
+
+  const builtAgo = formatBuildAge(Date.now() - created.getTime());
+  return {
+    verdict: 'ask',
+    reason:
+      `${imageName} was built ${builtAgo} ago from these exact inputs — ` +
+      `its Dockerfile and build inputs are unchanged since`,
+    imageName,
+    builtAgo,
+  };
+}
+
+/** Coarse "N minutes/hours/days" for build-age messages. */
+function formatBuildAge(ageMs: number): string {
+  const minutes = Math.max(0, Math.round(ageMs / 60_000));
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours} hour${hours === 1 ? '' : 's'}`;
+  const days = Math.round(hours / 24);
+  return `${days} day${days === 1 ? '' : 's'}`;
+}
+
 /** One image built by lazy, as reported by `docker images`. */
 export interface LazyImageInfo {
   /** Full reference, e.g. `lazy-runner:0.21`. */
@@ -466,6 +838,26 @@ export async function listLazyImages(binary: string = 'docker'): Promise<LazyIma
     images.push({ ref: `${repository}:${tag}`, repository, tag, id: id ?? '', size: size ?? '' });
   }
   return images;
+}
+
+/**
+ * Remove one lazy-built image by reference.
+ *
+ * Lives here, beside listLazyImages, so the only code that speaks `docker
+ * image` for lazy's own images is this module — `lazy doctor
+ * --clean-docker-images` calls this rather than composing its own runtime
+ * command line. Returns the runtime's own message on failure (an image another
+ * image depends on, or one a stopped container still references, cannot be
+ * removed) so the caller can report WHICH image refused and why.
+ */
+export async function removeLazyImage(
+  ref: string,
+  binary: string = 'docker',
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const proc = spawn([binary, 'image', 'rm', ref], { stdout: 'pipe', stderr: 'pipe' });
+  const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+  if (exitCode === 0) return { ok: true };
+  return { ok: false, error: stderr.trim() || `${binary} image rm exited ${exitCode}` };
 }
 
 /** Image references only — used by the offline fallback below. */
@@ -542,22 +934,56 @@ async function pumpBuildStream(
  * `spawn`, so that when it does fire we know for certain that lazy killed the
  * build and can say so instead of reporting an exit code.
  */
-async function runDockerBuild(
-  buildCwd: string,
-  dockerfilePath: string,
-  tags: string[],
-  hash: string,
-  binary: string,
-  noCache: boolean,
-  signal?: AbortSignal,
-  timeoutMs: number = 0,
-): Promise<void> {
+interface DockerBuildRequest {
+  buildCwd: string;
+  /** The `-f` path handed to docker — usually a temp snapshot, not human-meaningful. */
+  dockerfilePath: string;
+  tags: string[];
+  identity: ImageIdentity;
+  binary: string;
+  noCache: boolean;
+  /**
+   * Where the Dockerfile really came from, in words a human can act on: an
+   * absolute path, or "the embedded default Dockerfile". This is what the
+   * announcement names — `dockerfilePath` is a temp copy and tells nobody
+   * which Dockerfile governs.
+   */
+  source: string;
+  /** Why this build is happening, when the caller knows. Named in the announcement. */
+  reason?: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  /** Mirrors build progress to whoever asked for this build (turn-launch display). */
+  notify?: PhaseNotify;
+}
+
+async function runDockerBuild(request: DockerBuildRequest): Promise<void> {
+  const { buildCwd, dockerfilePath, tags, identity, binary, noCache, source, reason, signal, notify } = request;
+  const timeoutMs = request.timeoutMs ?? 0;
   if (signal?.aborted) throw new Error('Container build cancelled before it started');
 
   const startedAt = Date.now();
+
+  // ONE announcement for every container build in lazy, at the layer that
+  // actually runs docker — callers used to each print their own, which is how a
+  // daemon log ended up streaming hundreds of build lines with nothing saying
+  // what was being built. Info level: a multi-minute build is never debug noise.
+  const extraTags = tags.slice(1);
+  logger.info(
+    `Building container image ${tags[0]} from ${source}` +
+    (reason ? ` — ${reason}` : '') +
+    (noCache ? ' [--no-cache]' : '') +
+    ' (this can take several minutes).' +
+    (extraTags.length > 0 ? ` Also tagged ${extraTags.join(', ')}.` : ''),
+  );
   const tagArgs = tags.flatMap(tag => ['-t', tag]);
   const proc = spawn(
-    [binary, 'build', ...(noCache ? ['--no-cache'] : []), ...tagArgs, '--label', `${DOCKERFILE_HASH_LABEL}=${hash}`, '-f', dockerfilePath, '.'],
+    [
+      binary, 'build', ...(noCache ? ['--no-cache'] : []), ...tagArgs,
+      '--label', `${DOCKERFILE_HASH_LABEL}=${identity.hash}`,
+      '--label', `${IMAGE_INPUTS_LABEL}=${JSON.stringify(identity.manifest)}`,
+      '-f', dockerfilePath, '.',
+    ],
     // timeout: 0 disables spawn()'s own kill timer. Any bound is armed below.
     { cwd: buildCwd, stdout: 'pipe', stderr: 'pipe', timeout: 0 }
   );
@@ -580,14 +1006,23 @@ async function runDockerBuild(
   // builder writes steps to stdout, so both are echoed. A heartbeat covers the
   // long silent stretches inside a single step (a big apt or npm download).
   let lastOutputAt = Date.now();
+  // The same lines the daemon log gets, mirrored to whoever asked for this
+  // build. Throttled: BuildKit emits a line per layer step and the caller is a
+  // network connection, not a log file. See throttleNotes.
+  const noteBuild = throttleNotes(notify);
   const echo = (line: string) => {
     lastOutputAt = Date.now();
     logger.info(`  ${line}`);
+    noteBuild(`building ${tags[0]}: ${line}`);
   };
   const heartbeat = setInterval(() => {
     if (Date.now() - lastOutputAt >= BUILD_HEARTBEAT_INTERVAL_MS) {
       lastOutputAt = Date.now();
-      logger.info(`  still building ${tags[0]}... (${formatDuration(Date.now() - startedAt)} elapsed)`);
+      const still = `still building ${tags[0]}... (${formatDuration(Date.now() - startedAt)} elapsed)`;
+      logger.info(`  ${still}`);
+      // Forced: a heartbeat exists precisely because nothing else is arriving,
+      // so it must never be the thing the throttle drops.
+      noteBuild(still, true);
     }
   }, BUILD_HEARTBEAT_INTERVAL_MS);
 
@@ -596,8 +1031,12 @@ async function runDockerBuild(
   let exitCode: number | null = null;
   try {
     [stdout, stderr, exitCode] = await Promise.all([
-      pumpBuildStream(proc.stdout as ReadableStream<Uint8Array>, 'out', echo),
-      pumpBuildStream(proc.stderr as ReadableStream<Uint8Array>, 'err', echo),
+      // Both streams carry the SAME build's progress (BuildKit writes to
+      // stderr, the classic builder to stdout), so both are labelled with the
+      // image ref rather than 'out'/'err' — `[build err]` read as an error
+      // stream and told nobody which image the lines belonged to.
+      pumpBuildStream(proc.stdout as ReadableStream<Uint8Array>, tags[0], echo),
+      pumpBuildStream(proc.stderr as ReadableStream<Uint8Array>, tags[0], echo),
       proc.exited,
     ]);
   } finally {
@@ -624,11 +1063,13 @@ async function runDockerBuild(
     throw new Error(`Container build failed with exit code ${exitCode}`);
   }
 
-  logger.debug(`Container build completed successfully in ${formatDuration(Date.now() - startedAt)}`);
+  logger.info(
+    `Built container image ${tags[0]} from ${source} in ${formatDuration(Date.now() - startedAt)}.`,
+  );
 }
 
-async function buildImage(lazyRoot: string, repository: string, currentHash: string, binary: string = 'docker', noCache: boolean = false, agentId?: string, timeoutMs: number = 0): Promise<void> {
-  await buildImageWithTags(lazyRoot, buildTagsFor(repository), currentHash, binary, noCache, undefined, agentId, timeoutMs);
+async function buildImage(lazyRoot: string, repository: string, identity: ImageIdentity, binary: string = 'docker', noCache: boolean = false, agentId?: string, timeoutMs: number = 0, reason?: string, notify?: PhaseNotify): Promise<void> {
+  await buildImageWithTags(lazyRoot, buildTagsFor(repository), identity, binary, noCache, undefined, agentId, timeoutMs, reason, notify);
 }
 
 /** Does the container runtime have this image locally? */
@@ -705,27 +1146,35 @@ export async function buildImageFromDockerfilePath(
   const imageName = `${repository}:${IMAGE_TAG}`;
   const tags = buildTagsFor(repository);
 
+  // A consented worktree Dockerfile bypasses lazy.toml entirely, so its image
+  // identity is that Dockerfile alone — never the project's `build_inputs`,
+  // which belong to the root image. Same shape as `buildLazyRunnerImage`.
+  const manifest: ImageInputManifest = { [DOCKERFILE_INPUT_KEY]: contentHash.substring(0, 16) };
+  const identity: ImageIdentity = { hash: hashManifest(manifest), manifest };
+
   // Same FROM-lazy-runner preflight as the root custom-image path.
   const baseUsage = analyzeLazyBaseUsage(content, IMAGE_NAME, buildTagsFor(IMAGE_NAME));
   await ensureLazyBaseImage(baseUsage, absPath, binary, options.timeoutMs ?? 0);
 
   // Build from a temp copy of the consented bytes, with the worktree as context.
   const snap = await writeDockerfileToTempDir(content);
-  logger.info(
-    `Building ${imageName} container image from consented Dockerfile ` +
-      `(source ${absPath}, context ${contextDir})...`,
-  );
   try {
-    await runDockerBuild(
-      contextDir,
-      snap.dockerfilePath,
+    await runDockerBuild({
+      // The context is the worktree directory holding the consented Dockerfile
+      // — never the project root, whose tree is a different branch and would
+      // resolve the Dockerfile's COPY paths against the wrong files.
+      buildCwd: contextDir,
+      dockerfilePath: snap.dockerfilePath,
       tags,
-      contentHash,
+      identity,
       binary,
-      options.noCache ?? false,
-      undefined,
-      options.timeoutMs ?? 0,
-    );
+      noCache: options.noCache ?? false,
+      // Names the context in the one build announcement runDockerBuild makes,
+      // rather than logging a second line here.
+      source: `${absPath} (consented Dockerfile, context ${contextDir})`,
+      reason: 'building the image you consented to pin',
+      timeoutMs: options.timeoutMs ?? 0,
+    });
   } catch (err) {
     if (baseUsage.unbuildable.length > 0) {
       const detail = err instanceof Error ? err.message : String(err);
@@ -804,23 +1253,29 @@ async function ensureLazyBaseImage(
 async function buildImageWithTags(
   lazyRoot: string,
   tags: string[],
-  currentHash: string,
+  identity: ImageIdentity,
   binary: string = 'docker',
   noCache: boolean = false,
   signal?: AbortSignal,
   agentId?: string,
   timeoutMs: number = 0,
+  reason?: string,
+  notify?: PhaseNotify,
 ): Promise<void> {
   const customPath = await resolveCustomDockerfile(lazyRoot);
 
   let buildCwd: string;
   let dockerfileName: string;
+  let source: string;
   let baseUsage: LazyBaseUsage | null = null;
 
   if (customPath) {
     // Name the Dockerfile in the announcement: from a worktree it is genuinely
     // ambiguous which copy governs, and a wrong one once cost a whole session.
-    // Read once and build from a copy so a concurrent write to customPath
+    // The log line for this is emitted once, by runDockerBuild. The phase note
+    // is not a log line — it goes to whoever is watching this turn launch.
+    notify?.(`building ${tags[0]} from ${customPath}`);
+    // Read once and build from a temp copy so a concurrent write to customPath
     // cannot change what docker sees after we hashed (hash/build TOCTOU). For
     // adoption, customPath is already the daemon snapshot; the extra copy is
     // still correct.
@@ -833,9 +1288,11 @@ async function buildImageWithTags(
     // root's tree.
     const adoptedContext = await adoptedBuildContextRoot(lazyRoot, customPath);
     buildCwd = adoptedContext ?? lazyRoot;
-    logger.info(
-      `Building ${tags[0]} container image from ${customPath} (context ${buildCwd})...`,
-    );
+    // The single build announcement runDockerBuild makes names `source`, so the
+    // context rides along there rather than in a second log line of our own.
+    source = adoptedContext
+      ? `${customPath} (context ${adoptedContext})`
+      : customPath;
     // Temp dirs are unique (mkdtemp) under the OS temp dir — outside every
     // worktree — and left in place so the `-f` path stays inspectable.
     const snap = await writeDockerfileToTempDir(content);
@@ -851,7 +1308,8 @@ async function buildImageWithTags(
     );
     await ensureLazyBaseImage(baseUsage, customPath, binary, timeoutMs);
   } else {
-    logger.info(`Building ${tags[0]} container image from the embedded default Dockerfile...`);
+    source = 'the embedded default Dockerfile';
+    notify?.(`building ${tags[0]} from the default Dockerfile`);
     // Write the resolved Dockerfile to a temp directory for the build.
     // Never use the project's own Dockerfile — it's for the project, not agents.
     const { content } = await getDockerfileContent(lazyRoot, agentId);
@@ -861,7 +1319,28 @@ async function buildImageWithTags(
   }
 
   try {
-    await runDockerBuild(buildCwd, dockerfileName, tags, currentHash, binary, noCache, signal, timeoutMs);
+    await runDockerBuild({
+      buildCwd,
+      dockerfilePath: dockerfileName,
+      tags,
+      identity,
+      binary,
+      noCache,
+      source,
+      reason,
+      signal,
+      timeoutMs,
+      notify,
+    });
+    // The image does not embed lazy-agent — it is bind-mounted at launch from a
+    // content-addressed install in ~/.lazy/bin. When that file is a bare Bun
+    // runtime, tagging a fresh image still strands every builder; prove the
+    // mount works before the tag moves (skipped when no verified agent binary
+    // exists yet). The pointer symlink resolves to the current install; a stale
+    // or missing pointer simply skips the probe.
+    const binDir = join(getHome(), '.lazy', 'bin');
+    const agentBinaryPath = (await resolveInstalledAgentBinary(binDir)) ?? agentBinaryPointerPath(binDir);
+    await assertAgentBinarySelfcheckForImage(tags[0], agentBinaryPath, binary);
   } catch (err) {
     // The base refs lazy could NOT supply itself (an agent-suffixed repository,
     // or a base pinned to a tag no base build writes — see
@@ -904,15 +1383,25 @@ export async function resolveImageBuildTags(lazyRoot: string): Promise<string[]>
 export async function buildProjectImageToTag(
   lazyRoot: string,
   tag: string,
-  options: { binary?: string; noCache?: boolean; signal?: AbortSignal; timeoutMs?: number } = {},
+  options: { binary?: string; noCache?: boolean; signal?: AbortSignal; timeoutMs?: number; reason?: string } = {},
 ): Promise<string> {
   const binary = options.binary ?? 'docker';
   await checkDocker(binary);
 
   const { repository } = await resolveImageRepository(lazyRoot);
   const ref = `${repository}:${tag}`;
-  const currentHash = await calculateDockerfileHash(lazyRoot);
-  await buildImageWithTags(lazyRoot, [ref], currentHash, binary, options.noCache ?? false, options.signal, undefined, options.timeoutMs ?? 0);
+  const identity = await resolveImageIdentity(lazyRoot);
+  await buildImageWithTags(
+    lazyRoot,
+    [ref],
+    identity,
+    binary,
+    options.noCache ?? false,
+    options.signal,
+    undefined,
+    options.timeoutMs ?? 0,
+    options.reason ?? '`lazy upgrade` refreshing the image',
+  );
   return ref;
 }
 
@@ -957,12 +1446,23 @@ export async function buildLazyRunnerImage(options: { binary?: string; noCache?:
   await checkDocker(binary);
 
   const tags = buildTagsFor(IMAGE_NAME);
-  logger.info(`Building ${tags[0]} container image...`);
-  logger.debug('Using embedded default Dockerfile');
 
-  const hash = createHash('sha256').update(DEFAULT_DOCKERFILE).digest('hex');
+  // The BASE image bypasses lazy.toml entirely (that is this function's whole
+  // point), so its identity is the embedded Dockerfile alone — never the
+  // project's `build_inputs`, which belong to the custom image layered on top.
+  const manifest: ImageInputManifest = { [DOCKERFILE_INPUT_KEY]: shortHash(DEFAULT_DOCKERFILE) };
   const { buildCwd, dockerfilePath } = await writeDockerfileToTempDir(DEFAULT_DOCKERFILE);
-  await runDockerBuild(buildCwd, dockerfilePath, tags, hash, binary, noCache, undefined, options.timeoutMs ?? 0);
+  await runDockerBuild({
+    buildCwd,
+    dockerfilePath,
+    tags,
+    identity: { hash: hashManifest(manifest), manifest },
+    binary,
+    noCache,
+    source: 'the embedded default Dockerfile',
+    reason: `base image ${IMAGE_NAME} requested explicitly`,
+    timeoutMs: options.timeoutMs ?? 0,
+  });
 
   return tags;
 }
@@ -989,8 +1489,16 @@ export async function ensureImage(
      * explicit upgrade build with the upgrade-build latch on).
      */
     pinnedImage?: string;
+    /**
+     * Narration sink. Image resolution is the slowest thing a turn launch does
+     * — a cold `docker build` is minutes — and until this existed all of it
+     * went to the daemon log, where the human waiting on the CLI never saw it.
+     */
+    notify?: PhaseNotify;
   },
 ): Promise<string> {
+  const notify = options?.notify;
+  notify?.('resolving container image');
   await checkDocker(binary);
 
   // Resolution order: task pin → daemon adoption soft-pin (launches) → root.
@@ -998,6 +1506,7 @@ export async function ensureImage(
   if (options?.pinnedImage) {
     if (await imageExists(options.pinnedImage, binary)) {
       logger.debug(`Using task-pinned container image ${options.pinnedImage}`);
+      notify?.(`using task-pinned image ${options.pinnedImage}`);
       return options.pinnedImage;
     }
     // Lazy import avoids a load-time cycle (worktree-image imports this module).
@@ -1018,6 +1527,7 @@ export async function ensureImage(
     if (adopted) {
       if (await imageExists(adopted.imageName, binary)) {
         logger.debug(`Using daemon-adopted container image ${adopted.imageName}`);
+        notify?.(`using adopted image ${adopted.imageName}`);
         return adopted.imageName;
       }
       throw new Error(missingAdoptedImageMessage(adopted.imageName));
@@ -1026,9 +1536,37 @@ export async function ensureImage(
 
   const { repository } = await resolveImageRepository(lazyRoot, options?.agentId);
   const imageName = `${repository}:${IMAGE_TAG}`;
-  const currentHash = await calculateDockerfileHash(lazyRoot, options?.agentId);
+
+  // Everything from here on is inspect-then-build, which is a race: without the
+  // lock, a fan-out of task starts after a lockfile bump has every one of them
+  // inspect a stale image and start its own multi-minute build, each holding an
+  // agent slot. Serialized, the first builds and the rest fall straight through
+  // the hash check below. See `imageBuildMutex` for the residual cross-process
+  // race, which is left open deliberately.
+  return imageBuildMutex.withLock(imageName, () =>
+    ensureImageLocked(lazyRoot, repository, imageName, binary, options?.noCache ?? false, options?.agentId, options?.timeoutMs ?? 0, notify)
+  );
+}
+
+async function ensureImageLocked(
+  lazyRoot: string,
+  repository: string,
+  imageName: string,
+  binary: string,
+  requestedNoCache: boolean,
+  agentId?: string,
+  timeoutMs: number = 0,
+  notify?: PhaseNotify,
+): Promise<string> {
+  // The agent decides which CLI the Dockerfile bakes in, so it is part of the
+  // image's identity — the same lock/hash/build path serves the base image and
+  // an agent-suffixed one (cursor-first-class-agent).
+  const identity = await resolveImageIdentity(lazyRoot, agentId);
+  const currentHash = identity.hash;
   const imageHash = await getImageDockerfileHash(imageName, binary);
-  let noCache = options?.noCache ?? false;
+  let noCache = requestedNoCache;
+  // Handed to the build so its single announcement says WHY it is running.
+  let reason: string;
 
   if (imageHash === currentHash) {
     // The Dockerfile text matches — but its text is not what goes stale. What
@@ -1038,6 +1576,7 @@ export async function ensureImage(
     const { tooOld, ageDays } = await isImageTooOld(imageName, binary);
     if (!tooOld) {
       logger.debug('Container image is up to date ✓');
+      notify?.(`image ${imageName} is up to date`);
       return imageName;
     }
     // --no-cache is not optional on this path: with the Dockerfile text
@@ -1045,10 +1584,10 @@ export async function ensureImage(
     // nothing AND return the identical image — leaving the created timestamp
     // untouched and re-triggering this same rebuild on every launch forever.
     noCache = true;
-    logger.info(
-      `Container image ${imageName} is ${ageDays} days old (older than ${IMAGE_MAX_AGE_DAYS} days) — ` +
-      `rebuilding it so the agent gets a current Claude Code (this can take several minutes).`
-    );
+    reason =
+      `too old: built ${ageDays} days ago (limit ${IMAGE_MAX_AGE_DAYS} days), ` +
+      `rebuilding so the agent gets a current agent CLI`;
+    notify?.(`rebuilding ${imageName} — image is ${ageDays} days old (older than ${IMAGE_MAX_AGE_DAYS} days)`);
   } else if (imageHash === null) {
     // Image missing. Say WHY in one line: on a host that upgraded lazy this is
     // the first sign that a multi-minute build is happening, and "not found"
@@ -1057,19 +1596,30 @@ export async function ensureImage(
     const older = (await listLazyImages(binary))
       .filter(image => image.repository === repository && image.tag !== IMAGE_TAG && image.tag !== LATEST_ALIAS_TAG)
       .map(image => image.tag);
-    const olderNote = older.length > 0
-      ? ` Older image(s) for ${repository} (${older.join(', ')}) are kept as build cache — run \`lazy doctor\` for details.`
-      : '';
-    logger.info(`Container image ${imageName} not found — building it for lazy ${VERSION} (this can take several minutes).${olderNote}`);
+    if (older.length > 0) {
+      logger.info(
+        `Older image(s) for ${repository} (${older.join(', ')}) are kept as build cache — ` +
+        `run \`lazy doctor\` for details.`,
+      );
+    }
+    reason = `missing on this host — first build for lazy ${VERSION}`;
+    notify?.(`building ${imageName} — no image for lazy ${VERSION} exists yet`);
   } else {
-    logger.info(`Dockerfile has changed, rebuilding ${imageName}...`);
+    // Name the file that changed rather than saying "something did" — with
+    // build_inputs the trigger is usually a lockfile someone else bumped, and
+    // "rebuilding" with no reason reads like lazy being arbitrary about a
+    // multi-minute wait. Falls back to the generic line for images built before
+    // the manifest label existed.
+    const previous = await getImageInputManifest(imageName, binary);
+    reason = describeInputChanges(previous, identity.manifest) ?? 'image inputs have changed';
+    notify?.(`rebuilding ${imageName} — ${reason}`);
   }
 
   try {
     // No timeout unless the caller passed one. The implicit path — a task
     // starting when the image hash has changed — always passes nothing, so a
     // build nobody is watching can never be killed on a timer.
-    await buildImage(lazyRoot, repository, currentHash, binary, noCache, options?.agentId, options?.timeoutMs ?? 0);
+    await buildImage(lazyRoot, repository, identity, binary, noCache, agentId, timeoutMs, reason, notify);
     return imageName;
   } catch (buildErr) {
     // If not offline, just propagate the build error
@@ -1149,6 +1699,10 @@ function getLazySourceRoot(): string | null {
  * Extract the embedded agent binary from the compiled lazy executable.
  * Returns the path to the extracted binary, or null if not in compiled mode
  * or the embedded binary is not available (e.g. dev mode placeholder).
+ *
+ * The returned path is a content-addressed, immutable install
+ * (`<destDir>/lazy-agent-<id>`), never the `lazy-agent` pointer — see
+ * src/agent/binary-install.ts for why nothing may write to a mounted path.
  */
 export async function extractEmbeddedAgentBinary(
   destDir: string,
@@ -1202,50 +1756,48 @@ export async function extractEmbeddedAgentBinary(
   }
 
   await mkdir(destDir, { recursive: true });
-  const destPath = join(destDir, 'lazy-agent');
 
-  // Skip extraction only when the file on disk is BYTE-IDENTICAL to the
-  // embedded one.
+  // The install path IS the identity of the bytes: `lazy-agent-<content-id>`.
   //
-  // This used to compare sizes alone, on the theory that the embedded binary
-  // changes only when lazy is upgraded. Two builds of a ~100MB Bun executable
-  // that differ by a few source lines routinely land on the same size, and when
-  // they do, the stale extracted binary is kept and bind-mounted into every
-  // container — so a freshly upgraded daemon talks to agents running OLD agent
-  // code. That is silent and near-impossible to diagnose from inside a
-  // container: the daemon reports the new version while the agent-side MCP
-  // client behaves like the old one. Hashing costs a few milliseconds and makes
-  // the check exact.
-  try {
-    const existing = await Bun.file(destPath).arrayBuffer();
-    if (
-      existing.byteLength === embedded.length &&
-      Bun.hash(new Uint8Array(existing)) === Bun.hash(embedded)
-    ) {
-      return destPath;
-    }
-  } catch {
-    // Missing or unreadable — fall through and (re-)extract.
+  // This subsumes the byte-identity check that used to guard a single shared
+  // path. That check existed because a size-only comparison kept a stale binary
+  // whenever two ~100MB Bun builds happened to match in length, so a freshly
+  // upgraded daemon talked to agents running OLD agent code. Content addressing
+  // makes staleness unrepresentable: different bytes are a different file name,
+  // and identical bytes are the same install, which is returned untouched.
+  const contentId = agentBinaryContentId(embedded);
+  const result = await installVersionedAgentBinary(destDir, embedded, contentId);
+  // Only a process that actually installed bytes claims the pointer. An OLD
+  // lazy re-extracting its own embedded agent must not drag the pointer back to
+  // its version on every relaunch while the upgraded daemon flips it forward.
+  await updateAgentBinaryPointer(destDir, result.path, { force: result.installed });
+  if (result.installed) {
+    await collectStaleAgentBinaries(destDir, result.path);
   }
+  return result.path;
+}
 
-  // Write to a temp file and rename into place. Writing destPath directly would
-  // truncate and rewrite the very inode that already-running containers have
-  // bind-mounted at /usr/local/bin/lazy-agent, mutating the agent binary of a
-  // live builder mid-session. rename() is atomic: existing containers keep the
-  // old inode, new ones get the new binary.
-  const tmpPath = join(destDir, `.tmp-lazy-agent-${randomUUID()}`);
+/**
+ * Best-effort GC of superseded agent binaries.
+ *
+ * Immutable installs never overwrite each other, so old versions accumulate at
+ * ~100MB apiece. Anything a running container mounts is kept, as is anything
+ * installed recently (a container being created right now is not in `docker ps`
+ * yet). A failure here costs disk, never a launch — so it is logged, not thrown.
+ */
+async function collectStaleAgentBinaries(binDir: string, currentPath: string): Promise<void> {
   try {
-    await Bun.write(tmpPath, embedded);
-    chmodSync(tmpPath, 0o755);
-    renameSync(tmpPath, destPath);
+    const referenced = await listContainerMountSources();
+    const removed = await pruneAgentBinaries(binDir, { keep: [currentPath], referenced });
+    if (removed.length > 0) {
+      logger.debug(`Removed ${removed.length} superseded agent binary file(s) from ${binDir}`);
+    }
   } catch (err) {
-    try { if (existsSync(tmpPath)) unlinkSync(tmpPath); } catch { /* best effort */ }
-    throw new Error(
-      `Failed to extract the embedded agent binary to ${destPath}: ` +
+    logger.debug(
+      `Could not collect superseded agent binaries in ${binDir}: ` +
       `${err instanceof Error ? err.message : String(err)}`,
     );
   }
-  return destPath;
 }
 
 /**
@@ -1259,13 +1811,21 @@ function getUserBinDir(): string {
 /**
  * Ensure the agent binary is available for use in Docker containers.
  *
+ * Returns a content-addressed, immutable install — `~/.lazy/bin/lazy-agent-<id>`
+ * — which is what every launch bind-mounts. `~/.lazy/bin/lazy-agent-current` is
+ * only a pointer symlink for humans; mounting a name a later writer can replace
+ * would reintroduce the swap-under-a-live-mount failure this layout exists to
+ * prevent (see binary-install.ts). The legacy `~/.lazy/bin/lazy-agent` path is
+ * never written to at all — pre-migration containers still mount it.
+ *
  * Resolution order:
- * 1. Embedded binary extracted to ~/.lazy/bin/lazy-agent (compiled mode)
- * 2. Cached binary in ~/.lazy/bin/ (already there from previous extraction)
+ * 1. Embedded binary installed content-addressed (compiled mode)
+ * 2. A previous install already in ~/.lazy/bin/ (incl. a legacy single-path one)
  * 3. Build from source (dev mode only)
  */
 export async function ensureAgentBinary(): Promise<string> {
   const binDir = getUserBinDir();
+  lastSourceBuildProvenance = null;
 
   // 1. Try to extract embedded binary (compiled mode)
   const extracted = await extractEmbeddedAgentBinary(binDir);
@@ -1274,23 +1834,30 @@ export async function ensureAgentBinary(): Promise<string> {
     return extracted;
   }
 
-  // 2. Check for a cached binary in ~/.lazy/bin/
-  const binaryPath = join(binDir, 'lazy-agent');
-
   // 3. Try to build from source (dev mode only)
   const sourceRoot = getLazySourceRoot();
   if (!sourceRoot) {
-    // No source available and no embedded binary found
-    if (existsSync(binaryPath)) {
+    // 2. No source available and no embedded binary found: fall back to whatever
+    // install is already here — including a pre-content-addressing
+    // ~/.lazy/bin/lazy-agent regular file, which is copied into the immutable
+    // layout rather than mounted where a writer could later land on it.
+    const adopted = await adoptLegacyAgentBinary(binDir);
+    if (adopted) {
+      await updateAgentBinaryPointer(binDir, adopted.path, { force: adopted.installed });
+      logger.debug('Adopted the legacy agent binary into a content-addressed install');
+      return adopted.path;
+    }
+    const installed = await resolveInstalledAgentBinary(binDir);
+    if (installed) {
       // Verify rather than trust. This path returns a file nobody in this
       // process produced — whatever a previous install, a partial upgrade or a
       // stray copy left behind — straight into a container bind mount.
-      const cached = await verifyAgentBinary(binaryPath);
+      const cached = await verifyAgentBinary(installed);
       if (!cached.ok) {
-        throw new Error(formatAgentBinaryError(binaryPath, cached.reason, { canRebuild: false }));
+        throw new Error(formatAgentBinaryError(installed, cached.reason, { canRebuild: false }));
       }
       logger.debug('Using cached agent binary (source not available for rebuild)');
-      return binaryPath;
+      return installed;
     }
     throw new Error(
       'Agent binary not found. This may indicate a corrupted installation. ' +
@@ -1301,103 +1868,208 @@ export async function ensureAgentBinary(): Promise<string> {
   const entryPoint = join(sourceRoot, 'src', 'agent-entry.ts');
   const target = getLinuxTarget();
 
-  // Check if binary needs rebuilding by comparing source hash + target arch
-  const hashFile = binaryPath + '.hash';
+  // Check if binary needs rebuilding by comparing source hash + target arch.
+  // The stamp records BOTH the source hash and the install the last build
+  // produced, because the install path is no longer a fixed name.
+  const hashFile = agentBinaryStampPath(binDir);
   const currentHash = calculateSourceHash(sourceRoot) + ':' + target;
 
-  if (existsSync(binaryPath) && existsSync(hashFile)) {
-    const storedHash = readFileSync(hashFile, 'utf-8').trim();
-    if (storedHash === currentHash) {
-      // The hash says the SOURCE has not changed; it says nothing about whether
-      // the file on disk is still the binary that hash was recorded for.
-      const cached = await verifyAgentBinary(binaryPath);
-      if (cached.ok) {
-        logger.debug('Agent binary is up to date');
-        return binaryPath;
-      }
-      logger.warn(
-        `Cached agent binary at ${binaryPath} failed verification (${cached.reason}). Rebuilding.`,
-      );
+  const stamp = await readAgentBinaryStamp(hashFile);
+  if (stamp && stamp.sourceHash === currentHash && stamp.installName) {
+    const stampedPath = join(binDir, stamp.installName);
+    // The hash says the SOURCE has not changed; it says nothing about whether
+    // the file on disk is still the binary that hash was recorded for.
+    const cached = await verifyAgentBinary(stampedPath);
+    if (cached.ok) {
+      logger.debug('Agent binary is up to date');
+      await updateAgentBinaryPointer(binDir, stampedPath);
+      return stampedPath;
     }
+    logger.warn(
+      `Cached agent binary at ${stampedPath} failed verification (${cached.reason}). Rebuilding.`,
+    );
   }
 
   mkdirSync(binDir, { recursive: true });
 
-  logger.info(`Building agent binary for Linux (${target})...`);
-
-  // Build to a temp file to avoid disrupting running containers that have
-  // the existing binary bind-mounted. On macOS/Linux, rename() is atomic —
-  // existing processes holding the old inode continue to work, and new execs
-  // get the new binary. No window where the file is missing.
-  const tmpPath = join(binDir, `.tmp-lazy-agent-${randomUUID()}`);
-
-  // Build with cwd set to the OUTPUT directory, not the source root.
-  //
-  // `bun build --compile` writes a `.<hash>.bun-build` temp file in its cwd and
-  // renames it onto --outfile. That rename fails across filesystems (ENOENT),
-  // and bun leaves the ~190MB temp file behind in the cwd — so building from the
-  // source root both fails and litters the repo whenever ~/.lazy sits on another
-  // volume (a bind-mounted worktree, a separate $HOME volume). Same-directory
-  // cwd + outfile makes the rename intra-filesystem. scripts/build.ts works
-  // around the same bug the same way. Module resolution is unaffected: the entry
-  // point is absolute and bun resolves from the entry file, not from cwd.
-  const proc = spawn(
-    ['bun', 'build', '--compile', `--target=${target}`, entryPoint, '--outfile', tmpPath],
-    { cwd: binDir, stdout: 'pipe', stderr: 'pipe' }
-  );
-
-  const outputPromise = new Response(proc.stdout).text();
-  const stderrPromise = new Response(proc.stderr).text();
-
-  const [stdout, stderr, exitCode] = await Promise.all([
-    outputPromise,
-    stderrPromise,
-    proc.exited,
-  ]);
-
-  logger.stream('Agent binary build stdout:\n' + stdout);
-  logger.stream('Agent binary build stderr:\n' + stderr);
-
-  if (exitCode !== 0) {
-    // Clean up temp file on failure
-    try {
-      if (existsSync(tmpPath)) {
-        unlinkSync(tmpPath);
-      }
-    } catch {
-      // Best effort cleanup
-    }
-
-    const stderrLines = stderr.trim().split('\n');
-    const lastOutput = stderrLines.slice(-10).join('\n');
-    logger.error(`Agent binary build failed with exit code ${exitCode}\n\nLast output:\n${lastOutput}`);
-    throw new Error(`Agent binary build failed with exit code ${exitCode}`);
+  if (sourceAgentBinaryBuild) {
+    return sourceAgentBinaryBuild;
   }
 
-  // Verify BEFORE the rename. `bun build --compile` writes the target runtime
-  // first and appends the bundle last, so an interrupted or partial compile can
-  // leave an output that is a plain Bun runtime — and Bun does not always report
-  // that with a non-zero exit. Renaming it into place would replace a working
-  // binary with one that answers every subcommand `Script not found "<sub>"`.
-  const built = await verifyAgentBinary(tmpPath);
-  if (!built.ok) {
-    try { if (existsSync(tmpPath)) unlinkSync(tmpPath); } catch { /* best effort */ }
+  sourceAgentBinaryBuild = buildAgentBinaryFromSourceCheckout(
+    sourceRoot,
+    entryPoint,
+    target,
+    hashFile,
+    currentHash,
+    binDir,
+  ).finally(() => {
+    sourceAgentBinaryBuild = null;
+  });
+
+  return sourceAgentBinaryBuild;
+}
+
+/** Where the dev-mode build records its source hash and resulting install. */
+export function agentBinaryStampPath(binDir: string): string {
+  return join(binDir, 'lazy-agent.hash');
+}
+
+interface AgentBinaryStamp {
+  sourceHash: string;
+  /** File name of the install that build produced; absent on a legacy stamp. */
+  installName: string | null;
+}
+
+/**
+ * Read the dev-build stamp. Line 1 is the source hash (unchanged from the
+ * single-path layout, so `lazy upgrade` deleting this file still forces a
+ * rebuild); line 2 names the content-addressed install it produced. A legacy
+ * one-line stamp yields a null install name, which forces one rebuild.
+ */
+async function readAgentBinaryStamp(hashFile: string): Promise<AgentBinaryStamp | null> {
+  try {
+    const raw = await readFile(hashFile, 'utf-8');
+    const [sourceHash, installName] = raw.split('\n').map((l) => l.trim());
+    if (!sourceHash) return null;
+    return { sourceHash, installName: installName || null };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw new Error(
-      `Agent binary build produced an invalid binary (${built.reason}). ` +
-      `The previous binary at ${binaryPath} was left untouched. ` +
-      `Re-run the build; if it keeps happening, clear Bun's cross-compile cache ` +
-      `(~/.bun/install/cache) and rebuild.`,
+      `Failed to read the agent binary build stamp at ${hashFile}: ` +
+      `${err instanceof Error ? err.message : String(err)}`,
     );
   }
+}
 
-  // Atomically replace the existing binary
-  renameSync(tmpPath, binaryPath);
+/**
+ * Dev-mode compile: stamp build-info.ts, run `bun build --compile`, restore dev defaults.
+ *
+ * Checkout mutation window — same accepted trade as scripts/build.ts: overwrite
+ * src/build-info.ts so bun embeds compile-time git identity, restore dev defaults
+ * in `finally`. SIGKILL mid-build skips `finally` and leaves the file stamped
+ * until the next `generate:version` or rebuild restore. Callers serialize on
+ * sourceAgentBinaryBuild so concurrent compiles do not interleave writes.
+ */
+async function buildAgentBinaryFromSourceCheckout(
+  sourceRoot: string,
+  entryPoint: string,
+  target: string,
+  hashFile: string,
+  currentHash: string,
+  binDir: string,
+): Promise<string> {
+  // Stamp compile-time metadata into the binary so `lazy-agent selfcheck` and
+  // `lazy --version` can answer which checkout produced it hours later.
+  const provenance = captureBuildProvenance(sourceRoot);
+  lastSourceBuildProvenance = provenance;
+  const buildInfoPath = join(sourceRoot, 'src', 'build-info.ts');
+  writeFileSync(buildInfoPath, formatBuildInfoContent(provenance));
 
-  // Store hash for next comparison
-  await Bun.write(hashFile, currentHash);
+  try {
+    logger.info(`Building agent binary for Linux (${target}) — ${formatSourceProvenanceLine(provenance)}`);
 
-  logger.debug('Agent binary build completed successfully');
-  return binaryPath;
+    // Build to a temp file, then adopt it under its content-addressed name.
+    // Nothing a running container has mounted is ever the target of a write:
+    // a Docker Desktop file bind mount re-resolves the HOST PATH on access, so
+    // renaming onto a mounted path IS visible inside live containers (see
+    // src/agent/binary-install.ts for the verified evidence).
+    const tmpPath = join(binDir, `${AGENT_BINARY_TMP_PREFIX}${randomUUID()}`);
+
+    // Build with cwd set to the OUTPUT directory, not the source root.
+    //
+    // `bun build --compile` writes a `.<hash>.bun-build` temp file in its cwd and
+    // renames it onto --outfile. That rename fails across filesystems (ENOENT),
+    // and bun leaves the ~190MB temp file behind in the cwd — so building from the
+    // source root both fails and litters the repo whenever ~/.lazy sits on another
+    // volume (a bind-mounted worktree, a separate $HOME volume). Same-directory
+    // cwd + outfile makes the rename intra-filesystem. scripts/build.ts works
+    // around the same bug the same way. Module resolution is unaffected: the entry
+    // point is absolute and bun resolves from the entry file, not from cwd.
+    const proc = spawn(
+      ['bun', 'build', '--compile', `--target=${target}`, entryPoint, '--outfile', tmpPath],
+      { cwd: binDir, stdout: 'pipe', stderr: 'pipe' }
+    );
+
+    const outputPromise = new Response(proc.stdout).text();
+    const stderrPromise = new Response(proc.stderr).text();
+
+    const [stdout, stderr, exitCode] = await Promise.all([
+      outputPromise,
+      stderrPromise,
+      proc.exited,
+    ]);
+
+    logger.stream('Agent binary build stdout:\n' + stdout);
+    logger.stream('Agent binary build stderr:\n' + stderr);
+
+    if (exitCode !== 0) {
+      // Clean up temp file on failure
+      try {
+        if (existsSync(tmpPath)) {
+          unlinkSync(tmpPath);
+        }
+      } catch {
+        // Best effort cleanup
+      }
+
+      const stderrLines = stderr.trim().split('\n');
+      const lastOutput = stderrLines.slice(-10).join('\n');
+      logger.error(`Agent binary build failed with exit code ${exitCode}\n\nLast output:\n${lastOutput}`);
+      throw new Error(`Agent binary build failed with exit code ${exitCode}`);
+    }
+
+    // Verify BEFORE the rename. `bun build --compile` writes the target runtime
+    // first and appends the bundle last, so an interrupted or partial compile can
+    // leave an output that is a plain Bun runtime — and Bun does not always report
+    // that with a non-zero exit. Renaming it into place would replace a working
+    // binary with one that answers every subcommand `Script not found "<sub>"`.
+    const built = await verifyAgentBinary(tmpPath);
+    if (!built.ok) {
+      try { if (existsSync(tmpPath)) unlinkSync(tmpPath); } catch { /* best effort */ }
+      throw new Error(
+        `Agent binary build produced an invalid binary (${built.reason}). ` +
+        `The previously installed binary in ${binDir} was left untouched. ` +
+        `Re-run the build; if it keeps happening, clear Bun's cross-compile cache ` +
+        `(~/.bun/install/cache) and rebuild.`,
+      );
+    }
+
+    // On Linux, also run the live selfcheck the builder preflight uses. Content
+    // checks alone cannot catch every bad artifact bun can write with exit 0.
+    if (process.platform === 'linux') {
+      const execVerdict = verifyAgentBinarySelfcheckExec(tmpPath);
+      if (!execVerdict.ok) {
+        try { if (existsSync(tmpPath)) unlinkSync(tmpPath); } catch { /* best effort */ }
+        throw new Error(
+          `Agent binary build failed selfcheck (${execVerdict.reason}). ` +
+          `The previously installed binary in ${binDir} was left untouched.`,
+        );
+      }
+    }
+
+    // Adopt the verified temp file under its content-addressed name. If that
+    // exact content is already installed and still verifies, the existing file
+    // is kept and the temp file is discarded — an install is never rewritten.
+    const contentId = await agentBinaryContentIdOfFile(tmpPath);
+    const adopted = await adoptVersionedAgentBinary(binDir, tmpPath, contentId);
+    await updateAgentBinaryPointer(binDir, adopted.path, { force: adopted.installed });
+
+    // Store the source hash AND the install it produced, for the next
+    // staleness comparison.
+    await Bun.write(hashFile, `${currentHash}\n${versionedAgentBinaryName(contentId)}\n`);
+
+    if (adopted.installed) {
+      await collectStaleAgentBinaries(binDir, adopted.path);
+    }
+
+    logger.debug('Agent binary build completed successfully');
+    return adopted.path;
+  } finally {
+    // Restore dev defaults so a dev checkout's build-info.ts does not stay dirty
+    // with compile-time values after the binary is already stamped.
+    writeFileSync(buildInfoPath, DEV_BUILD_INFO);
+  }
 }
 
 /**
@@ -1431,34 +2103,52 @@ export function hasAuthEnv(): boolean {
   return _agent.hasAuthEnv();
 }
 
-export type { OllamaConfig } from '../config/types';
-
 /**
  * Get auth environment variables for a resolved role target.
  *
- * - ollama: synthetic credentials ({@link LOCAL_BACKEND_CREDS}) — the ollama
- *   server ignores auth, and an ollama-only project may hold no real credential
- *   at all, so demanding one here would break it.
- * - anthropic / proxy (or no target): the real Anthropic credential (throws if
- *   absent, via ClaudeCodeAgent.getAuthEnvVars()).
+ * - credential `none` (a local model server): synthetic credentials
+ *   ({@link LOCAL_BACKEND_CREDS})
+ * - credential `anthropic` (or no target): the real Anthropic credential (throws
+ *   if absent, via ClaudeCodeAgent.getAuthEnvVars()).
+ * - any other slot (ollama.com, openai, openrouter, a named credential): resolved
+ *   from the credential STORE, which is async — so this function refuses and
+ *   names {@link getLaunchAuthEnvVars} instead of guessing.
  *
- * The base URL is the proxy's for every backend — where a role's traffic goes
+ * The base URL is the proxy's for every profile — where a profile's traffic goes
  * upstream is the proxy's routing decision, not the launched process's.
  *
  * `surface` says whether the env is for a container or a host process — see
  * {@link targetEnvVars}. It defaults to `'container'` because every caller in
  * this module builds `docker run` argv; host launch paths pass `'host'`
  * explicitly.
+ *
+ * `credentialOverride` replaces the daemon's own credential with a caller-supplied
+ * one. Team mode passes the task's placeholder session token here, in the env var
+ * mirroring its owner's credential kind, so the container never holds a real
+ * secret. Omitted everywhere else, which is the single-user default: the daemon's
+ * credential, exactly as before.
  */
 export function getAuthEnvVars(
   target?: RoleTarget,
   hints?: ProxyAuditHints,
   surface: LaunchSurface = 'container',
+  credentialOverride?: Array<{ key: string; value: string }> | null,
 ): Array<{ key: string; value: string }> {
   const resolved = target ?? ANTHROPIC_DEFAULT_TARGET;
-  const creds = resolved.backend === 'ollama'
-    ? LOCAL_BACKEND_CREDS
-    : _agent.getAuthEnvVars(); // throws, actionably, if genuinely absent
+  if (usesSyntheticCreds(resolved)) {
+    return targetEnvVars(resolved, LOCAL_BACKEND_CREDS, surface, hints);
+  }
+  if (resolved.credential !== 'anthropic' && !credentialOverride) {
+    throw new Error(
+      `Agent profile "${resolved.profile}" bills the "${resolved.credential}" credential, which ` +
+      'is read from the credential store asynchronously — use getLaunchAuthEnvVars instead of ' +
+      'getAuthEnvVars. This is a lazy bug — please report it.',
+    );
+  }
+  const creds =
+    // throws, actionably, if genuinely absent — unless the caller supplied a
+    // credential to use in its place (team mode's per-session token).
+    credentialOverride ?? _agent.getAuthEnvVars();
   return targetEnvVars(resolved, creds, surface, hints);
 }
 
@@ -1470,20 +2160,37 @@ export function getAuthEnvVars(
  * against inside the daemon — but nothing that hands env to a launched process
  * should call it any more. Use this.
  *
- * Every role's traffic reaches lazy's proxy now — including ollama roles and
- * roles pinned at an explicit `endpoint`, which the proxy forwards to on their
- * behalf — so the only remaining condition is that this process is the daemon
- * that runs the proxy. Without a daemon context (the in-container supervisor
- * relaunching its own agent, test/daemonless modes) this process cannot mint
- * against the daemon's grant registry, and in the container case it does not
- * need to: the value it reads out of its own env is already the placeholder the
- * daemon minted.
+ * Every profile's traffic reaches lazy's proxy now — including profiles pinned
+ * at an explicit `endpoint`, which the proxy forwards to on their behalf — so
+ * the only remaining condition is that this process is the daemon that runs the
+ * proxy. Without a daemon context (the in-container supervisor relaunching its
+ * own agent, test/daemonless modes) this process cannot mint against the
+ * daemon's grant registry, and in the container case it does not need to: the
+ * value it reads out of its own env is already the placeholder the daemon
+ * minted.
  *
- * An ollama role is placeholderized like any other, over synthetic credentials
- * ({@link LOCAL_BACKEND_CREDS}) rather than the user's token — the grant is what
- * lets the proxy authenticate the caller and route it to that role's upstream,
- * so skipping the swap would cost the routing, not just the secrecy.
+ * A profile whose credential is `none` is placeholderized like any other, over
+ * synthetic credentials ({@link LOCAL_BACKEND_CREDS}) rather than the user's
+ * token — the grant is what lets the proxy authenticate the caller and route it
+ * to that profile's upstream, so skipping the swap would cost the routing, not
+ * just the secrecy.
  */
+/**
+ * Fill `[proxy] upstream` on a target that already has a proxy address but
+ * was built by a path that never went through `applyLiveProxyUrl`.
+ *
+ * The first-party flag in `targetEnvVars` needs to know where an unpinned
+ * profile's traffic lands. Callers that stamp `proxyUrl` through
+ * `applyLiveProxyUrl` already carry `primaryUpstream`; this is the safety net
+ * for remaining in-daemon launches that pass a role target with only the
+ * address.
+ */
+async function withPrimaryUpstream(target: RoleTarget): Promise<RoleTarget> {
+  if (!target.proxyUrl || target.primaryUpstream) return target;
+  const config = await loadConfig(getLazyRoot());
+  return { ...target, primaryUpstream: config.proxy.upstream };
+}
+
 export async function getLaunchAuthEnvVars(
   identity: LaunchIdentity,
   target?: RoleTarget,
@@ -1491,20 +2198,31 @@ export async function getLaunchAuthEnvVars(
   surface: LaunchSurface = 'container',
   injectedCreds?: Array<{ key: string; value: string }>,
 ): Promise<Array<{ key: string; value: string }>> {
-  const resolved = target ?? ANTHROPIC_DEFAULT_TARGET;
-  // injectedCreds: a runner that holds its own agent instance reads the
-  // credential from THAT agent rather than the module-level default. The
-  // placeholder swap below is identical either way — which is the point of
-  // taking it as a parameter instead of letting that caller bypass this.
-  const real = resolved.backend === 'ollama'
-    ? LOCAL_BACKEND_CREDS
-    : (injectedCreds ?? _agent.getAuthEnvVars());
+  const resolved = await withPrimaryUpstream(target ?? ANTHROPIC_DEFAULT_TARGET);
+  // injectedCreds: either team-mode session placeholders (`lazy-sess-…`, passed
+  // through unchanged below) or real credential vars from the host runner's
+  // agent — which still need JIT placeholderization. When absent, the profile's
+  // own credential slot decides the source: the store for a named/provider slot,
+  // the module-level default agent reader for Anthropic.
+  const real =
+    (await resolveProfileLaunchCreds(getLazyRoot(), resolved))
+      ?? injectedCreds
+      ?? _agent.getAuthEnvVars();
   const proxyPort = hasDaemonContext() ? getDaemonContext().proxyPort : undefined;
   if (!proxyPort) {
     return targetEnvVars(resolved, real, surface, hints);
   }
-  const placeholders = await placeholderizeAuthEnv(getLazyRoot(), real, identity);
-  return targetEnvVars(resolved, placeholders, surface, hints);
+  // Team-mode session credentials (`lazy-sess-…`) are already placeholders bound
+  // to a turn owner. Running them through JIT placeholderizeAuthEnv would replace
+  // that token with an unrelated grant the per-user swap path cannot resolve.
+  // Judged on the creds actually USED: a named-credential profile resolves its
+  // own real key ahead of `injectedCreds`, and that key must still be
+  // placeholderized even when session placeholders were injected.
+  const usesSessionPlaceholders = real.some((v) => isSessionPlaceholderToken(v.value));
+  const creds = usesSessionPlaceholders
+    ? real
+    : await placeholderizeAuthEnv(getLazyRoot(), real, identity);
+  return targetEnvVars(resolved, creds, surface, hints);
 }
 
 /**
@@ -1563,20 +2281,19 @@ export async function runClaude(
     ensureAgentBinary(),
   ]);
 
-  // The caller's decision site resolves the model; for a local backend fall back
-  // to the target's authoritative model if no explicit model was passed.
-  const effectiveModel =
-    model ?? (target && target.backend !== 'anthropic' ? target.model : undefined);
+  // The caller's decision site resolves the model; for a profile pinned at its
+  // own endpoint fall back to that profile's authoritative model if no explicit
+  // model was passed — the upstream serves what it serves, and lazy's usual
+  // model chain names Anthropic models it has never heard of.
+  const effectiveModel = model || (target?.pinned ? target.model : '') || undefined;
 
   const claudeArgs = [
     'claude', '-p', safeArgvPrompt(prompt, 'prompt'),
     '--output-format', 'json',
     '--dangerously-skip-permissions',
+    // Always: see requireLaunchModel (src/agent/launch-model.ts).
+    '--model', requireLaunchModel('claude-code', effectiveModel),
   ];
-
-  if (effectiveModel) {
-    claudeArgs.push('--model', effectiveModel);
-  }
 
   if (effort) {
     claudeArgs.push('--effort', effort);
@@ -1587,9 +2304,15 @@ export async function runClaude(
   // every other one — the real credential must not reach the container's env or
   // the docker argv. Resolved through the daemon (the credential's owner) with a
   // builder identity: this runs on behalf of a human at a terminal, not a task.
+  // The identity's profile is the proxy's routing key, so it is the profile of
+  // the target this one-shot actually runs on. It falls back to the built-in
+  // name only when the caller passed no target at all.
   const authEnvVars = await resolveAuthEnvFromDaemon(
     target, { role: 'builder' }, 'container', undefined,
-    { role: 'builder', taskId: null, label: `oneshot:${getLazyRoot()}` },
+    {
+      role: 'builder', taskId: null, label: `oneshot:${getLazyRoot()}`,
+      profile: target?.profile || BUILDER_PROFILE_NAME,
+    },
   );
   const args = buildDockerArgs(
     sandbox, claudeArgs, agentBinaryPath, imageName, binary,
@@ -1632,97 +2355,6 @@ export async function runClaude(
   }
 
   logger.debug('Parsing Claude response...');
-  return JSON.parse(output) as AgentResponse;
-}
-
-/**
- * Run a one-shot Claude Code prompt directly on the host (no Docker / sandbox).
- *
- * Used by lightweight CLI commands that only need a single LLM call and don't
- * need a worktree, sandbox, or session continuity (e.g. `lazy report`).
- * Authentication comes from the same env vars as the agent runner.
- *
- * Every run here is MACHINE-GENERATED housekeeping — a fidelity summary, a
- * report unit, a memory compaction — never a conversation anyone will read.
- * Claude still writes a session JSONL for it into the shared projects dir, so
- * the prompt is stamped with the one-shot marker (see src/import/machine-oneshot.ts)
- * and conversation capture skips it. This is the ONLY place that stamps: every
- * caller of this function is housekeeping by construction, so marking here means
- * no caller can forget.
- */
-export interface OneshotOptions {
-  /**
-   * Block the write tools for this run (`lazy ask <conversation>`): the agent
-   * may Read/Grep while forming its answer but cannot touch the repo.
-   */
-  readOnly?: boolean;
-}
-
-/**
- * Write tools blocked by `readOnly`. Mirrors DISALLOWED_TOOLS_IN_PLAN_MODE in
- * src/agent/claude-code.ts and DISALLOWED_TOOLS in src/cli/commands/chat.ts —
- * the same three tools, kept spelled out here so this module stays free of the
- * agent/runner graph.
- */
-const ONESHOT_READ_ONLY_DISALLOWED_TOOLS = 'Bash Write Edit';
-
-/**
- * Compose the argv for a one-shot run. Pure, so the execution-path contract is
- * assertable without spawning: a one-shot is always `claude -p <marked prompt>`,
- * and it NEVER carries `--resume`/`--continue`. Those two flags are what would
- * make housekeeping run inside somebody's existing session instead of its own.
- */
-export function buildOneshotArgs(
-  prompt: string,
-  model?: string,
-  opts: OneshotOptions = {},
-): string[] {
-  const marked = markMachineOneshotPrompt(prompt);
-  const args = ['claude', '-p', safeArgvPrompt(marked, 'prompt'), '--output-format', 'json'];
-  if (model) {
-    args.push('--model', model);
-  }
-  if (opts.readOnly) {
-    // Same lockdown the supervisor's ask turns use, and for the same reason:
-    // `--permission-mode plan` triggers an interactive ExitPlanMode prompt that
-    // `claude -p` has no human to answer, so writes are blocked with
-    // --disallowedTools instead. Read-only tools stay available so the answer
-    // can be checked against the code.
-    args.push('--disallowedTools', ONESHOT_READ_ONLY_DISALLOWED_TOOLS);
-  }
-  return args;
-}
-
-export async function runClaudeOneshot(
-  prompt: string,
-  model?: string,
-  opts: OneshotOptions = {},
-): Promise<AgentResponse> {
-  // Validate auth up front so the failure mode is a clean error, not a cryptic
-  // Claude CLI exit. Throws if no token / API key is available.
-  _agent.getAuthEnvVars();
-
-  const args = buildOneshotArgs(prompt, model, opts);
-  // No progress log here — callers fire N+ of these and own the messaging
-  // (see e.g. `lazy report`'s map-reduce, which logs per-unit progress).
-
-  const proc = spawn(args, {
-    stdout: 'pipe',
-    stderr: 'pipe',
-    timeout: 0,
-  });
-
-  const [output, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-
-  if (exitCode !== 0) {
-    const tail = stderr.trim().split('\n').slice(-20).join('\n  ');
-    throw new Error(`Claude Code exited with code ${exitCode}${tail ? `\n\nLast output:\n  ${tail}` : ''}`);
-  }
-
   return JSON.parse(output) as AgentResponse;
 }
 
@@ -1875,11 +2507,116 @@ export async function getContainerInfo(containerName: string, binary: string = '
   }
 }
 
+/** What a container lookup found — and whether the runtime answered at all. */
+export type ContainerProbe =
+  /** The runtime answered: the container's state, or null for "no such container". */
+  | { kind: 'answered'; info: ContainerInfo | null }
+  /** The runtime did not answer (timed out, killed, could not connect, could not start). */
+  | { kind: 'no-answer'; reason: string };
+
+/**
+ * `getContainerInfo`, but saying WHY there is no info.
+ *
+ * `getContainerInfo` returns null alike for "no such container" and for a
+ * runtime that never answered — right for its callers, which only ask "is
+ * there a run I can use". A health check asks something else: "is this run
+ * confirmed dead?", and only the first case confirms it. A busy Docker Desktop
+ * timing out every lookup must not read as every task's container being gone.
+ *
+ * So stderr is kept and read: a non-zero exit whose stderr says "no such
+ * object/container" is an ANSWER (the container does not exist); any other
+ * non-zero exit (cannot connect to the daemon, permission denied), a lookup
+ * killed at the deadline, or a binary that cannot be started is NO ANSWER.
+ * Never throws.
+ */
+export async function probeContainerInfo(
+  containerName: string,
+  binary: string = 'docker',
+  timeoutMs: number = DOCKER_TIMEOUT_MS,
+): Promise<ContainerProbe> {
+  const lookup = `${binary.split('/').pop()} inspect`;
+  let proc;
+  try {
+    proc = spawn(
+      [binary, 'inspect', containerName, '--format', '{{.State.Running}} {{.State.ExitCode}} {{.State.FinishedAt}}'],
+      { stdout: 'pipe', stderr: 'pipe', timeout: timeoutMs },
+    );
+  } catch (err) {
+    return { kind: 'no-answer', reason: `${lookup} could not be run: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  try {
+    // Reads start at once (a full pipe must never stall the child), but are
+    // only awaited for a normal exit: a killed wrapper script can leave a
+    // grandchild holding the pipe open long after the deadline.
+    const stdoutRead = new Response(proc.stdout).text();
+    const stderrRead = new Response(proc.stderr).text();
+    const exitCode = await proc.exited;
+    // Killed by a signal: the spawn wrapper's deadline, or someone else's kill.
+    // Either way the runtime never said anything about the container.
+    if (proc.signalCode) {
+      // The abandoned reads settle whenever the pipe closes; nothing awaits them.
+      stdoutRead.catch(() => '');
+      stderrRead.catch(() => '');
+      return { kind: 'no-answer', reason: `${lookup} did not answer within ${Math.round(timeoutMs / 1000)}s` };
+    }
+    const [stdout, stderr] = await Promise.all([stdoutRead, stderrRead]);
+    if (exitCode !== 0) {
+      if (/no such (object|container)/i.test(stderr)) return { kind: 'answered', info: null };
+      const said = stderr.split('\n').map(l => l.trim()).find(Boolean) ?? `exit code ${exitCode}`;
+      return { kind: 'no-answer', reason: `${lookup} failed: ${said}` };
+    }
+    const parts = stdout.trim().split(' ');
+    if (parts.length < 3) {
+      return { kind: 'no-answer', reason: `${lookup} printed something unexpected: ${stdout.trim() || '(nothing)'}` };
+    }
+    const finishedAt = parts.slice(2).join(' ');
+    return {
+      kind: 'answered',
+      info: {
+        running: parts[0] === 'true',
+        exitCode: parseInt(parts[1]!, 10),
+        // "0001-01-01T00:00:00Z" means never finished (still running or never started).
+        finishedAt: finishedAt.startsWith('0001-01-01') ? null : finishedAt,
+      },
+    };
+  } catch (err) {
+    return { kind: 'no-answer', reason: `${lookup} failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
 /**
  * Generate a container name for a task.
  */
 export function containerNameForTask(taskShortId: string): string {
   return `lazy-${taskShortId}`;
+}
+
+/**
+ * Ephemeral run name for `lazy review` — never the work agent's container.
+ *
+ * Review mounts the same worktree but must not reuse or restamp the work
+ * container: credential/harness env is fixed at create time, and sharing the
+ * work run name made review clear `session.container_agent_id` (via
+ * removeTaskRun) or leave a mismatched stamp. The review command also uses a
+ * sibling protocol mailbox (`reviewProtocolDir`) so a live work supervisor
+ * cannot consume it. The review container is torn down when the review ends;
+ * the work session's container_name / container_agent_id stay untouched.
+ */
+export function reviewContainerNameForTask(taskShortId: string): string {
+  return `lazy-review-${taskShortId}`;
+}
+
+/**
+ * Ephemeral run name for the MECHANICAL acceptance gate — never the work
+ * agent's container. The gate mounts the same worktree but runs NO agent: it
+ * exists only to execute the configured check commands in the task's
+ * environment. Its own name keeps teardown (which always happens — the gate
+ * is ephemeral) from ever touching the work run, and its own protocol mailbox
+ * (`acceptGateProtocolDir`) keeps the gate's response away from every other
+ * reader.
+ */
+export function acceptGateContainerNameForTask(taskShortId: string): string {
+  return `lazy-gate-${taskShortId}`;
 }
 
 /**
@@ -1893,41 +2630,99 @@ export function containerNameForTask(taskShortId: string): string {
  * The wrapper also naturally reaps zombie processes because it is PID 1 and
  * calls `wait` on its children.
  *
+ * The wrapper deliberately does NOT kill other processes between turns (the
+ * old between-turn sweep was removed — remove-reaper-cap-sweep): anything the
+ * agent starts (dev servers, databases, stray orphans) survives turn
+ * boundaries. The container is the boundary — everything dies with the
+ * container when the task reaches a terminal state (accept/reject/close) or
+ * is stopped.
+ *
  * Exit code protocol:
  *   0  — turn completed successfully → restart supervisor
  *   42 — stop command received → exit wrapper cleanly
  *   other — unexpected error → exit wrapper with that code
  */
-function buildSupervisorWrapperScript(protocolDir: string, worktreePath: string): string {
+/**
+ * Where the task's protocol dir is mounted INSIDE the supervisor container.
+ *
+ * Never the host path. The host path is `~/.lazy/protocol/<task>` of whoever
+ * runs the daemon, and when that is root — a Linux self-host, the lazy daemon
+ * image inside a fleet microVM — it sits under `/root`, which is mode 0700 in
+ * the runner image. The container runs as the unprivileged `user`, so a
+ * same-path mount under `/root` is a directory it cannot even traverse:
+ * `command.json` was on the other side of the mount and the supervisor logged
+ * "Waiting for command..." for ever (fleet demo runs 5 and 6, 2026-09-21). A
+ * Mac never showed it because a user's home is traversable. A fixed
+ * top-level path has no ancestor that can be closed to the container user.
+ */
+export function containerProtocolDir(protocolDir: string): string {
+  return `/lazy-protocol/${basename(protocolDir)}`;
+}
+
+/**
+ * The mounted paths a turn must be able to WRITE, as the container sees them.
+ *
+ * On native Linux docker a bind mount keeps host ownership, so when the daemon
+ * runs as root (a Linux self-host, the daemon image inside a fleet microVM)
+ * every one of these is root-owned and the runner image's unprivileged
+ * `user` cannot write it: the sandbox's `.claude.json` (fleet demo run 8,
+ * "Could not register the lazy MCP tools … EACCES"), the worktree, the
+ * worktree's gitdir, the shared objects dir. Docker Desktop maps ownership,
+ * which is why no Mac ever saw it. The wrapper takes ownership of what is not
+ * writable before each turn (see the `adopt` step); `find -writable` asks the
+ * kernel, so on a Mac nothing matches and nothing is changed.
+ */
+export function supervisorWritablePaths(opts: {
+  protocolDir: string;
+  worktreePath: string;
+  objectsDir?: string;
+  worktreeGitDir?: string;
+}): string[] {
+  return [
+    opts.protocolDir,
+    opts.worktreePath,
+    ...(opts.worktreeGitDir ? [opts.worktreeGitDir] : []),
+    ...(opts.objectsDir ? [opts.objectsDir] : []),
+    '/home/user/.claude.json',
+    '/home/user/.claude',
+    '/home/user/.pi',
+    '/home/user/.codex',
+    '/home/user/.cursor',
+  ];
+}
+
+export function buildSupervisorWrapperScript(protocolDir: string, worktreePath: string, writablePaths: string[] = []): string {
   // Use single quotes for the sh -c wrapper to avoid escaping issues.
   // The paths are injected directly — they come from our own code, not user input.
+  const adoptArgs = writablePaths.map((p) => `"${p}"`).join(' ');
   return [
     '#!/bin/sh',
     '# PID 1 wrapper — restarts supervisor between turns to release memory.',
-    '# Between turns, kills orphaned processes (MCP servers, node, bash, etc.)',
-    '# that survived the supervisor exit. tini (--init) reaps zombies but does',
-    '# not kill living orphans — without this they accumulate across turns.',
+    '# Processes the agent leaves running (dev servers, databases) survive turn',
+    '# boundaries on purpose; the container is the cleanup boundary.',
+    '# adopt: take ownership of a mounted path the container user cannot write.',
+    '# A daemon running as root on native Linux leaves every mount root-owned;',
+    '# the runner image gives its user sudo for exactly this kind of thing.',
+    'adopt() {',
+    '  for p in "$@"; do',
+    '    [ -e "$p" ] || continue',
+    '    find "$p" ! -writable -print -quit 2>/dev/null | grep -q . || continue',
+    '    if command -v sudo >/dev/null 2>&1; then',
+    '      sudo -n chown -R "$(id -u):$(id -g)" "$p" || echo "lazy: could not take ownership of $p (a root-run daemon on Linux needs this to be writable)" >&2',
+    '    else',
+    '      echo "lazy: $p is not writable by $(id -un) and sudo is unavailable — writes there will fail" >&2',
+    '    fi',
+    '  done',
+    '}',
     'child_pid=""',
-    'my_pid=$$',
     'trap \'[ -n "$child_pid" ] && kill $child_pid 2>/dev/null; wait; exit\' TERM INT',
     'while true; do',
+    ...(adoptArgs ? [`  adopt ${adoptArgs}`] : []),
     `  lazy-agent --one-shot --protocol-dir "${protocolDir}" --worktree "${worktreePath}" &`,
     '  child_pid=$!',
     '  wait $child_pid',
     '  rc=$?',
     '  child_pid=""',
-    '  # Kill orphaned processes from the finished turn.',
-    '  for p in /proc/[0-9]*/status; do',
-    '    pid=${p#/proc/}; pid=${pid%/status}',
-    '    [ "$pid" = "1" ] || [ "$pid" = "$my_pid" ] && continue',
-    '    kill "$pid" 2>/dev/null',
-    '  done',
-    '  sleep 1',
-    '  for p in /proc/[0-9]*/status; do',
-    '    pid=${p#/proc/}; pid=${pid%/status}',
-    '    [ "$pid" = "1" ] || [ "$pid" = "$my_pid" ] && continue',
-    '    kill -9 "$pid" 2>/dev/null',
-    '  done',
     '  # 0 = turn done, restart. 42 = stop command, exit. Other = error, exit.',
     '  if [ $rc -ne 0 ] && [ $rc -ne 42 ]; then exit $rc; fi',
     '  if [ $rc -eq 42 ]; then exit 0; fi',
@@ -1944,6 +2739,12 @@ export interface SupervisorDockerArgsParams {
   protocolDir: string;
   agentBinaryPath: string;
   authEnvVars: Array<{ key: string; value: string }>;
+  /**
+   * Already-built `-e KEY=VALUE` args for this task's own environment
+   * variables (`lazy env set`). Empty for every task that has none.
+   * Build with `buildTaskEnvArgs`; see src/daemon/task-env.ts.
+   */
+  taskEnvArgs: string[];
   /** Already-built `-v ...` args for user-configured [[mounts]]. */
   customMountArgs: string[];
   /**
@@ -1952,6 +2753,20 @@ export interface SupervisorDockerArgsParams {
    * Build with `buildGitMountArgsFor(worktreePath)`; see src/capture/git-mounts.ts.
    */
   gitMountArgs: string[];
+  /**
+   * Already-built `-p 127.0.0.1:0:<port>` args for the project's `[serve]`
+   * ports. Empty when the project declares none, so the argv of every existing
+   * task is byte-identical to before. Build with `buildPublishArgs`; see
+   * src/serve/ports.ts.
+   */
+  publishArgs: string[];
+  /**
+   * Extra `docker run` args from the PROJECT ROOT's `[docker] run_args`,
+   * verbatim and in order. Resolve with `resolveDockerRunArgs` — never from a
+   * task worktree's lazy.toml (agent-writable; see the INVARIANT there).
+   * Empty by default, so the argv is byte-identical when unconfigured.
+   */
+  runArgs: string[];
   wrapperScript: string;
   /** Path to this container's daemon MCP config, when the daemon minted one. */
   daemonConfigPath?: string;
@@ -1967,8 +2782,8 @@ export interface SupervisorDockerArgsParams {
 export function buildSupervisorDockerArgs(params: SupervisorDockerArgsParams): string[] {
   const {
     binary, containerName, imageName, repoRoot, sandbox, protocolDir,
-    agentBinaryPath, authEnvVars, customMountArgs, gitMountArgs, wrapperScript,
-    daemonConfigPath,
+    agentBinaryPath, authEnvVars, taskEnvArgs, customMountArgs, gitMountArgs,
+    publishArgs, runArgs, wrapperScript, daemonConfigPath,
   } = params;
 
   return [
@@ -1987,14 +2802,34 @@ export function buildSupervisorDockerArgs(params: SupervisorDockerArgsParams): s
     // sibling worktree gitdirs) is read-only; only objects and this worktree's
     // own gitdir are writable. See src/capture/git-mounts.ts.
     ...gitMountArgs,
-    '-v', `${protocolDir}:${protocolDir}`,
+    // At a path the container USER can reach — see containerProtocolDir.
+    '-v', `${protocolDir}:${containerProtocolDir(protocolDir)}`,
     '-w', sandbox.worktreePath,
     '-v', `${sandbox.sandboxPath}/.claude:/home/user/.claude`,
+    // Onboarding, theme, folder trust, and MCP discovery — persisted per task in
+    // the sandbox so pair and later turns do not replay the first-run wizard.
+    // See src/task/claude-home.ts. NOT the human's host ~/.claude.json.
+    '-v', `${sandbox.sandboxPath}/.claude.json:/home/user/.claude.json`,
     // Cursor's home-config dir, mounted unconditionally (like .claude): the dir
     // always exists (setupSandbox creates it) and non-Cursor agents ignore it.
     '-v', `${sandbox.sandboxPath}/.cursor:/home/user/.cursor`,
+    // pi's home-config dir (sessions, models.json, the lazy MCP bridge) —
+    // same unconditional mount rationale as .cursor.
+    '-v', `${sandbox.sandboxPath}/.pi:/home/user/.pi`,
+    // Codex's home-config dir, same arrangement — config.toml, auth state and
+    // session rollouts persist per task in the sandbox.
+    '-v', `${sandbox.sandboxPath}/.codex:/home/user/.codex`,
     '-v', `${sandbox.sandboxPath}/.gitconfig:/home/user/.gitconfig:ro`,
     '-v', `${agentBinaryPath}:/usr/local/bin/lazy-agent:ro`,
+    // This task's own env vars (`lazy env set`), FIRST — docker resolves a
+    // repeated -e by last-one-wins, so placing these ahead of everything lazy
+    // sets makes them strictly lower precedence: they can only ever ADD to the
+    // environment, never redirect lazy's auth, model routing, daemon connection
+    // or GIT_SSH_COMMAND. Reserved names are already refused at intake; this is
+    // the second line of defense, and it matches the host-process runner, which
+    // spreads the task env before its own auth vars for the same reason.
+    // Empty by default. The order is pinned by test/unit/task-env.test.ts.
+    ...taskEnvArgs,
     ...authEnvVars.flatMap(v => ['-e', `${v.key}=${v.value}`]),
     '-e', 'GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=accept-new',
     // Pass daemon config to container for MCP proxy mode. The config file is the
@@ -2008,6 +2843,15 @@ export function buildSupervisorDockerArgs(params: SupervisorDockerArgsParams): s
     // so a {worktree}/node_modules volume clearly shadows it (Docker resolves
     // overlapping mounts by longest container-path match regardless of order).
     ...customMountArgs,
+    // [serve] ports, published to ephemeral loopback host ports. Published
+    // ports are fixed at container CREATE time — editing [serve] takes effect
+    // the next time this task's container is created.
+    ...publishArgs,
+    // User-configured extra `docker run` args ([docker] run_args) — verbatim,
+    // in order, last before the image name so they can only be docker flags,
+    // never rewrite the image or the command. Root-config only; see
+    // resolveDockerRunArgs.
+    ...runArgs,
     imageName,
     'sh', '-c', wrapperScript,
   ];
@@ -2021,6 +2865,106 @@ export function buildSupervisorDockerArgs(params: SupervisorDockerArgsParams): s
  * Uses a PID-1 wrapper script that restarts the supervisor between turns
  * so that memory is released back to the OS after each turn.
  */
+/**
+ * Classify the outcome of `docker run --entrypoint which <image> <binary>`.
+ *
+ * Only exit code 1 means "binary genuinely absent" (`which` found nothing).
+ * Docker-level failures and probe infrastructure failures must not be reported
+ * as a missing agent binary — that was the misreporting bug this hardening fixes.
+ *
+ * Exported for direct unit coverage.
+ */
+export type AgentBinaryProbeContext = {
+  imageName: string;
+  agentId: string;
+  agentBinary: string;
+  dockerfileRelativePath: string;
+  installCommand: string;
+};
+
+export type AgentBinaryProbeClassification =
+  | { kind: 'ok' }
+  | { kind: 'missing-binary' }
+  | { kind: 'error'; message: string };
+
+export function classifyAgentBinaryProbeResult(
+  exitCode: number | null,
+  signalCode: string | null,
+  stderr: string,
+  ctx: Pick<AgentBinaryProbeContext, 'imageName' | 'agentId' | 'agentBinary'>,
+): AgentBinaryProbeClassification {
+  const target =
+    `image "${ctx.imageName}" for '${ctx.agentBinary}' (agent "${ctx.agentId}")`;
+
+  if (exitCode === 0) {
+    return { kind: 'ok' };
+  }
+
+  const stderrTrimmed = stderr.trim();
+  const stderrSuffix = stderrTrimmed ? `\nDocker stderr:\n${stderrTrimmed}` : '';
+
+  if (exitCode === null && signalCode === 'SIGTERM') {
+    return {
+      kind: 'error',
+      message:
+        `Timed out probing ${target} after 60s.` +
+        stderrSuffix,
+    };
+  }
+
+  // Exit 1 is `which`'s documented not-found code (see `which(1)`); it is the
+  // ONLY outcome that may claim the agent binary is absent from the image.
+  if (exitCode === 1) {
+    return { kind: 'missing-binary' };
+  }
+
+  if (exitCode === 125) {
+    return {
+      kind: 'error',
+      message:
+        `Failed to start a probe container for ${target} (docker exit 125).` +
+        stderrSuffix,
+    };
+  }
+
+  if (exitCode === 126) {
+    return {
+      kind: 'error',
+      message:
+        `Probe container for ${target} could not execute 'which' (docker exit 126).` +
+        stderrSuffix,
+    };
+  }
+
+  if (exitCode === 127) {
+    return {
+      kind: 'error',
+      message:
+        `Probe container for ${target} has no 'which' command (docker exit 127). ` +
+        `The agent-binary preflight requires 'which' in the image.` +
+        stderrSuffix,
+    };
+  }
+
+  return {
+    kind: 'error',
+    message:
+      `Unexpected result probing ${target} ` +
+      `(exit ${exitCode ?? 'null'}${signalCode ? `, signal ${signalCode}` : ''}).` +
+      stderrSuffix,
+  };
+}
+
+function missingAgentBinaryMessage(ctx: AgentBinaryProbeContext): string {
+  return (
+    `The custom Dockerfile image "${ctx.imageName}" does not contain '${ctx.agentBinary}', ` +
+    `which the "${ctx.agentId}" agent needs. Lazy never amends custom Dockerfiles — ` +
+    `add this line to ${ctx.dockerfileRelativePath} (in the non-root user section) and relaunch:\n` +
+    `  ${ctx.installCommand}\n` +
+    `The image rebuilds automatically on the next launch once the file changes.`
+  );
+}
+
 /**
  * Verify a non-claude agent's binary exists in the image that is about to run.
  *
@@ -2040,26 +2984,52 @@ export async function preflightAgentBinaryInImage(
   binary: string,
   agentId?: string,
 ): Promise<void> {
-  if (!agentId || agentId === 'claude-code') return;
+  if (!agentId) return;
   const lazyRoot = getLazyRoot();
   if (!(await resolveCustomDockerfile(lazyRoot))) return; // default image is agent-aware
 
-  const pkg = getAgentPackaging(agentId);
+  // `agentId` names a PROFILE; the binary that has to exist in the image is its
+  // HARNESS. Resolved after the check above so the default-image path — every
+  // project that has not written its own Dockerfile — still costs no config
+  // read. Lenient for the same reason resolveImageAgent is; an unregistered
+  // name still reaches getAgentPackaging and throws there, as before.
+  const config = await loadConfig(lazyRoot);
+  const harness = harnessForAgentName(config, agentId) ?? agentId;
+  if (harness === 'claude-code') return;
+
+  const pkg = getAgentPackaging(harness);
   const agentBinary = pkg.binaryName();
+  const probeCtx: AgentBinaryProbeContext = {
+    imageName,
+    agentId: harness,
+    agentBinary,
+    dockerfileRelativePath: config.docker.dockerfile,
+    installCommand: pkg.dockerInstallCommand(),
+  };
+
+  // Pin --entrypoint to `which` so a custom image's own ENTRYPOINT cannot
+  // receive `which <binary>` as arguments and pass/fail for the wrong reason.
+  // --network none: the probe needs no network and must not inherit one.
   const probe = spawn(
-    [binary, 'run', '--rm', imageName, 'which', agentBinary],
-    { stdout: 'ignore', stderr: 'ignore', timeout: 60_000 },
+    [binary, 'run', '--rm', '--network', 'none', '--entrypoint', 'which', imageName, agentBinary],
+    { stdout: 'ignore', stderr: 'pipe', timeout: 60_000 },
   );
-  if (await probe.exited !== 0) {
-    const config = await loadConfig(lazyRoot);
-    throw new Error(
-      `The custom Dockerfile image "${imageName}" does not contain '${agentBinary}', ` +
-      `which the "${agentId}" agent needs. Lazy never amends custom Dockerfiles — ` +
-      `add this line to ${config.docker.dockerfile} (in the non-root user section) and relaunch:\n` +
-      `  ${pkg.dockerInstallCommand()}\n` +
-      `The image rebuilds automatically on the next launch once the file changes.`
-    );
+  const [, stderr] = await Promise.all([
+    probe.exited,
+    new Response(probe.stderr).text(),
+  ]);
+  const classification = classifyAgentBinaryProbeResult(
+    probe.exitCode,
+    probe.signalCode ?? null,
+    stderr,
+    probeCtx,
+  );
+
+  if (classification.kind === 'ok') return;
+  if (classification.kind === 'missing-binary') {
+    throw new Error(missingAgentBinaryMessage(probeCtx));
   }
+  throw new Error(classification.message);
 }
 
 export async function launchSupervisorAsync(
@@ -2071,20 +3041,32 @@ export async function launchSupervisorAsync(
   daemonConfigPath?: string,
   target?: RoleTarget,
   taskId?: string,
+  taskUuid?: string,
+  /**
+   * The task's agent PROFILE name (`[agents.<name>]`), not a harness. The
+   * harness it runs is resolved from config below; everything downstream that
+   * asks "is this codex / cursor / pi" must ask the harness, and the launch
+   * grant carries this name so the proxy can route per profile.
+   */
   agentId?: string,
   /**
    * Task-pinned image from metadata.custom_image. Threaded from the daemon
    * launch path — never resolved from the worktree here.
    */
   pinnedImage?: string,
+  /**
+   * Narration sink for the caller's open phase. See RunnerInterface.launchSupervisor.
+   */
+  notify?: PhaseNotify,
 ): Promise<void> {
   // Image resolution is deliberately NOT anchored at sandbox.worktreePath:
   // a task branch that edits Dockerfile.lazy must never auto-govern the image.
   // Human-consented pins arrive as pinnedImage from task metadata only.
   const [imageName, agentBinaryPath] = await Promise.all([
-    ensureImage(binary, { agentId, pinnedImage }),
+    ensureImage(binary, { agentId, pinnedImage, notify }),
     ensureAgentBinary(),
   ]);
+  notify?.(`image ${imageName} ready — starting container ${containerName}`);
 
   // Custom Dockerfiles are never amended by lazy, so a non-claude agent's
   // binary may simply not be in the image. Verify it BEFORE launching the
@@ -2093,42 +3075,119 @@ export async function launchSupervisorAsync(
   // a whole session this way before the failure was even classified).
   await preflightAgentBinaryInImage(imageName, binary, agentId);
 
+  const repoRoot = getLazyRoot();
+
+  // `agentId` names a PROFILE (`[agents.<name>]`). Everything below that used to
+  // compare it against a harness name — which credential to mint, which proxy
+  // env to build — needs the HARNESS this launch actually runs, so resolve the
+  // profile ONCE, here. The daemon owns config: a container must never
+  // re-derive this from the task worktree's lazy.toml, which its own agent can
+  // edit (same governance rule as Dockerfile.lazy).
+  //
+  // Strict — it throws naming the available profiles — because every fallback
+  // available to a launch that cannot say what it is running is a direct-egress
+  // path: a cursor or codex turn treated as "some other agent" gets no
+  // CURSOR_API_ENDPOINT / LAZY_CODEX_API_BASE and dials the vendor's servers
+  // with nothing audited.
+  //
+  // This is also the config `buildMountArgs` and the proxy env below read; one
+  // load serves all of them.
+  const config = await loadConfig(repoRoot);
+  const profile = profileForAgentName(config, agentId, taskId ? `task ${taskId}` : 'this launch');
+  const harness = profile.harness;
+  // Named only when it adds information: when the profile and the harness are
+  // the same word (`codex`, `cursor`), "(profile "codex")" is noise. Keyed on
+  // the NAMES rather than on `builtin`, because the built-in set now includes
+  // profiles whose name is not their harness — `codex-subscription` runs codex,
+  // and a refusal saying "the codex agent" sends a user looking for something
+  // they did not start.
+  const profileNote = profile.name === harness ? '' : ` (agent profile "${profile.name}")`;
+
+  // In team mode the task has a session binding (made by the launcher, which
+  // decided whose credential this turn runs on), and the launch placeholderizes
+  // THAT credential instead of the daemon's own — in the env var mirroring the
+  // owner's credential kind. Null for every single-user install, where this
+  // falls through to the daemon's own credential exactly as before.
+  const sessionCredential = taskUuid ? await sessionCredentialEnvFor(repoRoot, taskUuid) : null;
+
   // Supervisor launches are always the `agent` role; the task turn it runs
   // inherits this env, so proxied traffic is attributed to agent + task.
   let authEnvVars: Array<{ key: string; value: string }>;
   // The launch identity every placeholder minted below is bound to. The proxy
   // derives attribution from the grant rather than from the self-reported
   // x-lazy-* headers, so this is what the audit trail ends up asserting.
-  const agentIdentity: LaunchIdentity = { role: 'agent', taskId: taskId ?? null, label: containerName };
-  if (agentId && agentId !== 'claude-code') {
+  // The task's agent IS its profile name, so the grant carries where this
+  // turn's traffic should be forwarded (src/proxy/agent-upstreams.ts).
+  const agentIdentity: LaunchIdentity = {
+    role: 'agent',
+    taskId: taskId ?? null,
+    label: containerName,
+    profile: profileNameForAgent(agentId),
+  };
+  // pi deliberately takes the claude-code path below: it has no credential of
+  // its own — its turns RUN ON lazy's Anthropic/Ollama credentials via the
+  // proxy — so a missing credential must fail the launch, not degrade to the
+  // best-effort merge-phase forwarding of the non-claude branch.
+  //
+  // Branching on the HARNESS, not on the profile name: `[agents.work-codex]`
+  // runs codex and must take the codex path.
+  if (harness !== 'claude-code' && harness !== 'pi') {
     // Non-claude task agent: its own credentials are what the turn needs.
     // Resolved at LAUNCH time (env override → per-project .lazy credentials
     // file), so a key set while the daemon is running takes effect on the
     // next launch — never "restart the daemon". See src/agent/credentials.ts.
     authEnvVars = [];
-    if (agentSupportsApiKey(agentId)) {
-      const key = await resolveAgentApiKey(getLazyRoot(), agentId);
+    // `none` is a profile pointed at a server that authenticates nobody: there
+    // is no key to require, and requiring one would make a local codex upstream
+    // unreachable. Every other slot must resolve, or this launch 401s mid-turn.
+    if (agentSupportsApiKey(harness) && profile.credential !== NO_CREDENTIAL) {
+      // Keyed by the PROFILE's credential, not by the harness: two profiles on
+      // the same harness can bill different keys, and the proxy resolves the
+      // profile's slot per request — so a check keyed by harness could pass on
+      // a key the request is never sent with.
+      const key = await resolveProfileCredential(getLazyRoot(), profile);
       if (!key) {
+        // Name the command after the PROFILE the user chose when that says more
+        // than the credential does — `lazy auth` resolves an agent name to the
+        // credential it bills, so `lazy auth import codex-subscription` is a
+        // command they can paste without first learning a second vocabulary.
+        // Only when the profile's name is not simply the harness (where the two
+        // are the same word), and only when `lazy auth` really would resolve it
+        // back to this same credential — a config that names a profile after
+        // some other profile's credential must not be handed a wrong command.
+        const namedByProfile =
+          profile.name !== harness &&
+          resolveCredentialTarget(config, profile.name).credential === profile.credential;
+        const setupCommand = credentialSetupCommand(
+          profile.credential,
+          namedByProfile ? profile.name : undefined,
+        );
         // A container cannot see the host's login session, so no key from any
         // source means every turn would fail on auth. Refuse the launch with
         // the remedy instead.
         throw new Error(
-          `No API key for the "${agentId}" agent. A container cannot use a host login session, ` +
-          `so this task needs a key from one of:\n` +
-          `  1. lazy system agent set-key ${agentId}   (stored per-project outside the repo — takes effect on the next launch)\n` +
-          `  2. the ${AGENT_KEY_ENV[agentId]} environment variable (override)`
+          // Named by the AGENT the task actually selected, with the harness in
+          // brackets when it differs: a `codex-subscription` task refused with
+          // "the codex agent" sends a user looking for something they did not
+          // start, which is exactly how this refusal was first read.
+          `No ${profile.credential} credential for the "${profile.name}" agent` +
+          `${profile.name === harness ? '' : ` (${harness})`}. A container ` +
+          `cannot use a host login session, so this task needs a credential from one of:\n` +
+          `  1. lazy ${setupCommand}   (OS secure storage, outside the repo — takes effect on the next launch)\n` +
+          `  2. the ${envVarsFor(profile.credential).join(' or ')} environment variable (override)` +
+          alternativeCredentialHint(harness, profile.credential)
         );
       }
       // JIT INJECTION: the container gets a PLACEHOLDER, never the key. The
       // real key is resolved above only to prove one EXISTS (a container has no
       // login session to fall back on) — its value is then dropped on the floor
       // and the proxy re-resolves it per request, upstream.
-      const agentEnvKey = AGENT_KEY_ENV[agentId]!;
+      const agentEnvKey = AGENT_KEY_ENV[harness]!;
       const placeholder = await mintCredentialGrant(getLazyRoot(), {
-        role: 'agent', taskId: taskId ?? null, label: containerName, envKey: agentEnvKey,
+        ...agentIdentity, envKey: agentEnvKey,
       });
       authEnvVars.push({ key: agentEnvKey, value: placeholder });
-      logger.debug(`Resolved ${agentId} API key from ${key.source}; container gets a placeholder`);
+      logger.debug(`Resolved ${harness} API key from ${key.source}; container gets a placeholder`);
     }
     // The Anthropic/proxy env is still forwarded when resolvable — the
     // in-container merge phase shells out to `claude`
@@ -2136,7 +3195,9 @@ export async function launchSupervisorAsync(
     // never authenticates against Anthropic.
     try {
       authEnvVars = [
-        ...(await getLaunchAuthEnvVars(agentIdentity, target, { role: 'agent', taskId })),
+        ...(await getLaunchAuthEnvVars(
+          agentIdentity, target, { role: 'agent', taskId }, 'container', sessionCredential ?? undefined
+        )),
         ...authEnvVars,
       ];
     } catch (err) {
@@ -2150,12 +3211,12 @@ export async function launchSupervisorAsync(
       const merelyAbsent = /no .*credential|not authenticated|setup-token|ANTHROPIC_API_KEY/i.test(message);
       if (merelyAbsent) {
         logger.debug(
-          `No Anthropic credential forwarded to ${agentId} task container ` +
+          `No Anthropic credential forwarded to ${harness} task container${profileNote} ` +
           `(merge-conflict turns need one): ${message}`
         );
       } else {
         logger.warn(
-          `[proxy] could not build the placeholder auth env for the ${agentId} task container: ` +
+          `[proxy] could not build the placeholder auth env for the ${harness} task container${profileNote}: ` +
           `${message}. The launch continues without Anthropic credentials, so an in-container ` +
           `merge turn will fail on auth. This is not a missing key — it is a failure to mint or ` +
           `resolve one.`
@@ -2163,14 +3224,10 @@ export async function launchSupervisorAsync(
       }
     }
   } else {
-    authEnvVars = await getLaunchAuthEnvVars(agentIdentity, target, { role: 'agent', taskId });
+    authEnvVars = await getLaunchAuthEnvVars(
+      agentIdentity, target, { role: 'agent', taskId }, 'container', sessionCredential ?? undefined
+    );
   }
-  const repoRoot = getLazyRoot();
-
-  // Resolve user-configured custom mounts ([[mounts]]). Validated at load time;
-  // here we just expand placeholders and build the `-v` args. Empty by default,
-  // so default behavior is completely unchanged when no mounts are configured.
-  const config = await loadConfig(repoRoot);
 
   // Cursor API traffic routes through lazy's proxy exactly like Anthropic's,
   // via cursor-agent's endpoint override. The launch's PLACEHOLDER rides in the
@@ -2178,7 +3235,7 @@ export async function launchSupervisorAsync(
   // request (see src/proxy/cursor-route.ts); the proxy authenticates it there
   // and swaps in the real CURSOR_API_KEY upstream.
   authEnvVars.push(...cursorLaunchEnvVars({
-    agentId,
+    harness,
     // Container surface: `binary` is the container runtime for this launch.
     runnerType: binary === 'podman' ? 'podman' : 'docker',
     proxyPort: hasDaemonContext() ? getDaemonContext().proxyPort : undefined,
@@ -2186,14 +3243,74 @@ export async function launchSupervisorAsync(
     token: authEnvVars.find(v => v.key === AGENT_KEY_ENV.cursor)?.value ?? null,
   }));
 
+  // pi launch env: provider selection + no-startup-egress flags, and a mirror
+  // of a claude-shaped OAuth placeholder into an env var pi actually reads.
+  // The PROFILE decides which of pi's providers the turn runs and which model
+  // that provider declares — the supervisor holds no config and cannot resolve
+  // a profile itself, so this env is how the daemon states the answer.
+  // No-ops for every other harness. See src/agent/pi-turn-config.ts.
+  if (harness === 'pi') {
+    authEnvVars.push(...piLaunchEnvVars({
+      harness,
+      profile,
+      upstreamTimeoutMs: (config.proxy.upstreamTimeoutSeconds ?? DEFAULT_UPSTREAM_TIMEOUT_SECONDS) * 1000,
+    }));
+    authEnvVars.push(...piCredentialMirror(authEnvVars));
+  }
+
+  // Codex API traffic routes through the proxy's OpenAI-compatible route. No
+  // token in the URL: codex bearers the OPENAI_API_KEY placeholder (minted
+  // above) on every provider request, which is what the proxy authenticates.
+  // The env var carries the route base into the supervisor, which writes it
+  // into ~/.codex/config.toml each turn — see src/proxy/codex-route.ts.
+  authEnvVars.push(...codexLaunchEnvVars({
+    harness,
+    runnerType: binary === 'podman' ? 'podman' : 'docker',
+    proxyPort: hasDaemonContext() ? getDaemonContext().proxyPort : undefined,
+    bind: config.proxy.bind,
+    endpoint: profile.endpoint,
+  }));
+
+  // Resolve user-configured custom mounts ([[mounts]]). Validated at load time;
+  // here we just expand placeholders and build the `-v` args. Empty by default,
+  // so default behavior is completely unchanged when no mounts are configured.
   const customMountArgs = buildMountArgs(config.mounts, {
     worktreePath: sandbox.worktreePath,
     repoRoot,
   });
 
-  const gitMountArgs = await buildGitMountArgsFor(sandbox.worktreePath);
+  // This task's own environment variables (`lazy env set`). Read from the
+  // daemon state dir — never from the repo, which is mounted into every
+  // container. See src/daemon/task-env.ts. Empty unless the user set one, so
+  // the argv is byte-identical to before for every other task. Keyed by the
+  // task UUID, not the ref — see RunnerInterface.launchSupervisor.
+  const taskEnv = taskUuid ? await getTaskEnv(repoRoot, taskUuid) : {};
+  const taskEnvArgs = buildTaskEnvArgs(taskEnv);
 
-  const wrapperScript = buildSupervisorWrapperScript(protocolDir, sandbox.worktreePath);
+  const gitMountPaths = await resolveGitMountPaths(sandbox.worktreePath);
+  const gitMountArgs = buildGitMountArgs(gitMountPaths);
+
+  // [serve] ports. Resolved and validated at config load time; here we only
+  // turn them into publish args. Empty for a project with no [serve] section.
+  const publishArgs = buildPublishArgs(config.serve.services);
+
+  // Extra `docker run` args ([docker] run_args) — root-anchored on purpose:
+  // never resolved from the task worktree's lazy.toml (see resolveDockerRunArgs).
+  const runArgs = await resolveDockerRunArgs(repoRoot);
+  if (runArgs.length > 0) {
+    logger.info(`Applying extra docker run args from [docker] run_args: ${runArgs.join(' ')}`);
+  }
+
+  const wrapperScript = buildSupervisorWrapperScript(
+    containerProtocolDir(protocolDir),
+    sandbox.worktreePath,
+    supervisorWritablePaths({
+      protocolDir: containerProtocolDir(protocolDir),
+      worktreePath: sandbox.worktreePath,
+      objectsDir: gitMountPaths.objectsDir,
+      worktreeGitDir: gitMountPaths.worktreeGitDir,
+    }),
+  );
 
   // Daemon MCP config is provided by the caller (daemon task launcher).
   // The daemon always provides this when launching containers — it knows
@@ -2208,17 +3325,23 @@ export async function launchSupervisorAsync(
     protocolDir,
     agentBinaryPath,
     authEnvVars,
+    taskEnvArgs,
     customMountArgs,
     gitMountArgs,
+    publishArgs,
+    runArgs,
     wrapperScript,
     daemonConfigPath,
   });
 
   if (debug) {
-    console.log('[DEBUG] Running container command:', redactSecrets(args).join(' '));
+    // Per-task values are secret whatever their key is named — the user set
+    // them here precisely because they are.
+    console.log('[DEBUG] Running container command:', redactSecrets(args, Object.keys(taskEnv)).join(' '));
   }
 
   logger.info('Launching supervisor container...');
+  notify?.(`starting supervisor container ${containerName}`);
 
   // Async spawn (not spawnSync) so a wedged `docker run` can never block the
   // daemon event loop. We own the timeout explicitly (wrapper timer disabled via

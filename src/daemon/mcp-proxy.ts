@@ -8,9 +8,8 @@
  * This replaces the builder-specific TCP server pattern (src/builder/server.ts)
  * with a unified approach: the daemon is the single MCP server for all agents.
  *
- * Connection modes:
- *   - Unix socket: when running on the host (daemon socket at ~/.lazy/daemon/lazy.sock)
- *   - TCP via host.docker.internal: when running inside a container
+ * The daemon is reached over its TCP port — its only transport: loopback
+ * (127.0.0.1) from the host, host.docker.internal from inside a container.
  *
  * Credential freshness: the config is minted once at launch and mounted into
  * the container, but the daemon rewrites that same file IN PLACE whenever it
@@ -73,9 +72,9 @@ export interface DaemonMcpConfig {
   /** Task ID for scoping tool execution (empty string for builder/project-wide mode) */
   taskId: string;
   /**
-   * Connection target. Either:
-   *   - A unix socket path (e.g., ~/.lazy/daemon/lazy.sock)
-   *   - An HTTP URL (e.g., http://host.docker.internal:26024)
+   * Connection target: an HTTP base URL where the daemon listens
+   * (e.g., http://127.0.0.1:26024 on the host,
+   * http://host.docker.internal:26024 from a container).
    */
   target: string;
   /**
@@ -269,15 +268,12 @@ export async function probeDaemonProject(target: string): Promise<string | null>
   return (await probeDaemonStatus(target)).projectRoot;
 }
 
-/** Build a fetch URL + init for a path against a unix-socket or http(s) target. */
+/** Build a fetch URL + init for a path against the daemon's http(s) target. */
 function buildTargetRequest(
   target: string,
   path: string,
-): { url: string; init: RequestInit & { unix?: string } } {
-  if (target.startsWith('http://') || target.startsWith('https://')) {
-    return { url: `${target}${path}`, init: {} };
-  }
-  return { url: `http://localhost${path}`, init: { unix: target } };
+): { url: string; init: RequestInit } {
+  return { url: `${target}${path}`, init: {} };
 }
 
 /**
@@ -480,7 +476,7 @@ export function createDaemonProxyHandler(
       config.target,
       `/mcp/${encodedTask}/${encodedTool}`,
     );
-    const fetchOptions: RequestInit & { unix?: string } = {
+    const fetchOptions: RequestInit = {
       ...init,
       method: 'POST',
       headers: {
@@ -736,9 +732,8 @@ export interface DaemonMcpConfigFile {
   /** Task ID (empty for builder mode) */
   taskId: string;
   /**
-   * Connection target:
-   *   - Unix socket path for host-side
-   *   - TCP URL (e.g., http://host.docker.internal:26024) for containers
+   * Connection target: an HTTP base URL where the daemon listens
+   * (e.g., http://host.docker.internal:26024 from a container).
    */
   target: string;
 }

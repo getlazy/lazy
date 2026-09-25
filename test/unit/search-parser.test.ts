@@ -24,7 +24,7 @@ describe('isStructuredQuery', () => {
   test('detects field syntax', () => {
     expect(isStructuredQuery('status:working')).toBe(true);
     expect(isStructuredQuery('goal:auth')).toBe(true);
-    expect(isStructuredQuery('code:fix-bug')).toBe(true);
+    expect(isStructuredQuery('task:fix-bug')).toBe(true);
     expect(isStructuredQuery('in:turns error')).toBe(true);
     expect(isStructuredQuery('has:commits')).toBe(true);
     expect(isStructuredQuery('created:>2026-01-01')).toBe(true);
@@ -109,14 +109,40 @@ describe('parseQuery', () => {
     expect(ast).toEqual({ type: 'field', field: 'goal', value: 'error handling' });
   });
 
-  test('parses code:value field', () => {
-    const ast = parseQuery('code:fix-reconciler');
-    expect(ast).toEqual({ type: 'field', field: 'code', value: 'fix-reconciler' });
+  test('parses task:value field', () => {
+    const ast = parseQuery('task:fix-reconciler');
+    expect(ast).toEqual({ type: 'field', field: 'task', value: 'fix-reconciler' });
+  });
+
+  // INVARIANT: `code:` is gone, not aliased. The engineer waived backward
+  // compatibility on the rename, and a hidden alias would preserve the exact
+  // confusion it was meant to end — `code:spike` silently meaning two different
+  // things depending on which surface typed it. The rejection names the
+  // replacement so a stale query is one edit from working.
+  test('code:<value> no longer parses, and says what to type instead', () => {
+    expect(() => parseQuery('code:spike')).toThrow(QueryParseError);
+    expect(() => parseQuery('code:spike')).toThrow(/renamed to task:.*task:spike/);
+    // It has to REACH the parser to be rejected, so it must still count as a
+    // structured query rather than falling through to a literal regex search.
+    expect(isStructuredQuery('code:spike')).toBe(true);
+  });
+
+  // INVARIANT: only `code:` carrying a value is rejected. "exit code: 1" is
+  // ordinary prose that people genuinely search for, and it must keep working
+  // as a plain text search.
+  test('a bare "code:" in prose is still text, not a rename error', () => {
+    expect(isStructuredQuery('exit code: 1')).toBe(false);
+    expect(() => parseQuery('exit code: 1')).not.toThrow();
   });
 
   test('parses in:turns with text', () => {
     const ast = parseQuery('in:turns reconciler');
     expect(ast).toEqual({ type: 'in', scope: 'turns', value: 'reconciler' });
+  });
+
+  test.each(['tasks', 'active', 'backlog', 'finished'])('parses in:%s with text', (scope) => {
+    const ast = parseQuery(`in:${scope} authentication`);
+    expect(ast).toEqual({ type: 'in', scope, value: 'authentication' });
   });
 
   test('parses in:commits with quoted text', () => {
@@ -127,6 +153,11 @@ describe('parseQuery', () => {
   test('parses in:comments with text', () => {
     const ast = parseQuery('in:comments review');
     expect(ast).toEqual({ type: 'in', scope: 'comments', value: 'review' });
+  });
+
+  test('parses in:raised with text', () => {
+    const ast = parseQuery('in:raised proxy');
+    expect(ast).toEqual({ type: 'in', scope: 'raised', value: 'proxy' });
   });
 
   test('parses has:commits', () => {
@@ -142,6 +173,11 @@ describe('parseQuery', () => {
   test('parses has:comments', () => {
     const ast = parseQuery('has:comments');
     expect(ast).toEqual({ type: 'has', scope: 'comments' });
+  });
+
+  test('parses has:raised', () => {
+    const ast = parseQuery('has:raised');
+    expect(ast).toEqual({ type: 'has', scope: 'raised' });
   });
 
   test('parses created:>date', () => {

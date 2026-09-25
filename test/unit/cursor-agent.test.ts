@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { CursorAgent } from '../../src/agent/cursor';
+import { CursorAgent, CursorActivityStream } from '../../src/agent/cursor';
 import { CursorPackaging } from '../../src/agent/cursor-packaging';
 import { getAgent, getAgentPackaging, listAgents } from '../../src/agent/registry';
 
@@ -34,7 +34,7 @@ describe('CursorAgent', () => {
 
       test('pins --agent-endpoint to CURSOR_API_ENDPOINT when set', () => {
         process.env.CURSOR_API_ENDPOINT = 'http://127.0.0.1:8766/_lazy/cursor/agent/ab12';
-        const args = agent.buildExecArgs({ prompt: 'Hi', dangerouslySkipPermissions: false });
+        const args = agent.buildExecArgs({ modelId: 'test-model', prompt: 'Hi', dangerouslySkipPermissions: false });
         const i = args.indexOf('--agent-endpoint');
         expect(i).toBeGreaterThan(-1);
         expect(args[i + 1]).toBe('http://127.0.0.1:8766/_lazy/cursor/agent/ab12');
@@ -42,19 +42,20 @@ describe('CursorAgent', () => {
 
       test('omits the flag entirely when no endpoint is set', () => {
         delete process.env.CURSOR_API_ENDPOINT;
-        const args = agent.buildExecArgs({ prompt: 'Hi', dangerouslySkipPermissions: false });
+        const args = agent.buildExecArgs({ modelId: 'test-model', prompt: 'Hi', dangerouslySkipPermissions: false });
         expect(args).not.toContain('--agent-endpoint');
       });
 
       test('the prompt stays the last positional argument', () => {
         process.env.CURSOR_API_ENDPOINT = 'http://127.0.0.1:8766/_lazy/cursor/agent/ab12';
-        const args = agent.buildExecArgs({ prompt: 'Hi', dangerouslySkipPermissions: false });
+        const args = agent.buildExecArgs({ modelId: 'test-model', prompt: 'Hi', dangerouslySkipPermissions: false });
         expect(args[args.length - 1]).toBe('Hi');
       });
     });
 
     test('uses cursor-agent binary with --print and --trust', () => {
       const args = agent.buildExecArgs({
+        modelId: 'test-model',
         prompt: 'Hello',
         dangerouslySkipPermissions: false,
       });
@@ -63,7 +64,13 @@ describe('CursorAgent', () => {
       expect(args).toContain('--print');
       expect(args).toContain('--trust');
       expect(args).toContain('--output-format');
-      expect(args).toContain('json');
+      // INVARIANT (fix-cursor-silent-watchdog): stream-json, NOT the single-blob
+      // `json`. In `json` mode cursor-agent emits nothing until the turn ends,
+      // so the supervisor's no-progress guard saw a working turn as silence and
+      // killed every turn longer than its window. buildExecArgs and
+      // activityStream() must change together — a stream parser reading a
+      // format the process does not produce makes every turn look silent.
+      expect(args[args.indexOf('--output-format') + 1]).toBe('stream-json');
     });
 
     // INVARIANT (cursor-first-class-agent, security verification): lazy must
@@ -78,11 +85,12 @@ describe('CursorAgent', () => {
     // src/agent/cursor.ts buildExecArgs. Do NOT "restore" this flag.
     test('never passes --approve-mcps (arbitrary-exec-by-checkout guard)', () => {
       for (const opts of [
-        { prompt: 'Hello', dangerouslySkipPermissions: false },
-        { prompt: 'Hello', dangerouslySkipPermissions: true },
-        { prompt: 'Hello', dangerouslySkipPermissions: false, permissionMode: 'plan' as const },
+        { prompt: 'Hello', modelId: 'test-model', dangerouslySkipPermissions: false },
+        { prompt: 'Hello', modelId: 'test-model', dangerouslySkipPermissions: true },
+        { prompt: 'Hello', modelId: 'test-model', dangerouslySkipPermissions: false, permissionMode: 'plan' as const },
         {
           prompt: 'Hello',
+          modelId: 'test-model',
           dangerouslySkipPermissions: false,
           extraArgs: ['--sandbox', 'enabled'],
         },
@@ -93,6 +101,7 @@ describe('CursorAgent', () => {
 
     test('prompt is the last positional argument', () => {
       const args = agent.buildExecArgs({
+        modelId: 'test-model',
         prompt: 'Hello',
         dangerouslySkipPermissions: false,
       });
@@ -101,6 +110,7 @@ describe('CursorAgent', () => {
 
     test('prepends system prompt to user prompt', () => {
       const args = agent.buildExecArgs({
+        modelId: 'test-model',
         prompt: 'Do something',
         systemPrompt: 'You are a helper',
         dangerouslySkipPermissions: false,
@@ -117,6 +127,7 @@ describe('CursorAgent', () => {
 
     test('adds --force and --sandbox disabled for dangerouslySkipPermissions', () => {
       const args = agent.buildExecArgs({
+        modelId: 'test-model',
         prompt: 'Hello',
         dangerouslySkipPermissions: true,
       });
@@ -129,6 +140,7 @@ describe('CursorAgent', () => {
 
     test('does not add --force when dangerouslySkipPermissions is false', () => {
       const args = agent.buildExecArgs({
+        modelId: 'test-model',
         prompt: 'Hello',
         dangerouslySkipPermissions: false,
       });
@@ -136,21 +148,49 @@ describe('CursorAgent', () => {
       expect(args).not.toContain('--sandbox');
     });
 
-    // INVARIANT: plan/ask turns must be read-only. Cursor has a native
-    // read-only mode (--mode plan), used instead of Claude's tool-blocklist.
-    test('permissionMode plan maps to --mode plan and suppresses --force', () => {
+    // INVARIANT (fix-reviewer-cannot-access-mcp): plan/ask/review turns must
+    // stay read-only WITHOUT `--mode plan`. Cursor's plan mode rejects MCP tool
+    // calls (reviewers reported "MCP calls were rejected" on every Cursor
+    // review). Mirror Claude Code: exclude write ToolCall oneofs, keep --force
+    // so remaining tools (reads + lazy MCP) auto-run headless.
+    test('permissionMode plan excludes write tools and keeps --force (no --mode plan)', () => {
       const args = agent.buildExecArgs({
+        modelId: 'test-model',
         prompt: 'Hello',
         dangerouslySkipPermissions: true,
         permissionMode: 'plan',
       });
-      expect(args).toContain('--mode');
-      expect(args).toContain('plan');
+      expect(args).not.toContain('--mode');
+      expect(args).not.toContain('plan');
+      expect(args).toContain('--exclude-tools');
+      const excludeIdx = args.indexOf('--exclude-tools');
+      const excluded = args[excludeIdx + 1] ?? '';
+      expect(excluded).toContain('shellToolCall');
+      expect(excluded).toContain('editToolCall');
+      expect(excluded).toContain('deleteToolCall');
+      expect(excluded).toContain('writeShellStdinToolCall');
+      // MCP must remain callable — do not exclude mcpToolCall.
+      expect(excluded).not.toContain('mcpToolCall');
+      expect(args).toContain('--force');
+      expect(args).toContain('--sandbox');
+      expect(args[args.indexOf('--sandbox') + 1]).toBe('disabled');
+    });
+
+    test('permissionMode plan without dangerouslySkipPermissions still excludes writes and omits --force', () => {
+      const args = agent.buildExecArgs({
+        modelId: 'test-model',
+        prompt: 'Hello',
+        dangerouslySkipPermissions: false,
+        permissionMode: 'plan',
+      });
+      expect(args).toContain('--exclude-tools');
       expect(args).not.toContain('--force');
+      expect(args).not.toContain('--mode');
     });
 
     test('adds --resume with sessionId', () => {
       const args = agent.buildExecArgs({
+        modelId: 'test-model',
         prompt: 'Hello',
         sessionId: 'abc-123',
         dangerouslySkipPermissions: false,
@@ -179,29 +219,50 @@ describe('CursorAgent', () => {
       expect(args).toContain(modelId);
     });
 
-    test('omits --model when modelId is empty', () => {
-      const args = agent.buildExecArgs({
-        prompt: 'Hello',
-        modelId: '',
-        dangerouslySkipPermissions: false,
-      });
-      expect(args).not.toContain('--model');
+    // INVARIANT (turn-model stickiness): a Cursor launch with no model is
+    // refused, never spelled by omitting --model. An omitted flag makes
+    // cursor-agent read its own persisted selection (~/.cursor/cli-config.json)
+    // — a model nobody chose for the task. See src/agent/launch-model.ts.
+    test('refuses a launch with no model instead of omitting --model', () => {
+      for (const modelId of [undefined, '', '   ']) {
+        expect(() => agent.buildExecArgs({ prompt: 'Hello', modelId, dangerouslySkipPermissions: false }))
+          .toThrow(/cursor launch names no model/);
+      }
     });
 
-    // INVARIANT: "auto" is spelled by OMITTING --model. cursor-agent's flag is
-    // optional and it then applies its own model selection — which is exactly
-    // what auto means. The literal string is never sent: the CLI does no
-    // client-side model validation, so a name the server doesn't know would
-    // surface only as a failed turn.
-    test('omits --model for the "auto" model, letting Cursor choose', () => {
+    // INVARIANT (fix-cursor-model-turn-setting): "auto" is spelled by PASSING
+    // `--model auto`, never by omitting the flag.
+    //
+    // This REPLACES the opposite invariant, which was asserted on a false
+    // premise: that an absent --model makes cursor-agent "apply its own model
+    // selection". It does not. cursor-agent resolves an absent --model against
+    // its OWN persisted default in ~/.cursor/cli-config.json (`model` /
+    // `selectedModel`, guarded by `hasChangedDefaultModel`) — the model the
+    // human last picked in Cursor. In a real task sandbox that file read
+    // `"model": {"modelId": "claude-opus-4-5"}`, so every turn ran Opus while
+    // lazy recorded `auto`, and `lazy unblock --model auto` looked like a
+    // no-op. Omission is not neutrality; it hands the choice to state lazy
+    // does not own.
+    //
+    // The old comment's other claim — that the CLI does no client-side model
+    // validation — is also wrong, and in our favour: cursor-agent matches
+    // --model against its catalog (model id, display id, display name and
+    // aliases, lowercased) and exits with "Cannot use this model: X.
+    // Available models: …" when it cannot resolve one. `auto` IS in that
+    // catalog (id `default`, displayed `auto`). A loud, named failure beats
+    // silently running a model nobody chose.
+    test('passes --model auto through rather than omitting the flag', () => {
       for (const modelId of ['auto', 'AUTO', '  auto  ']) {
         const args = agent.buildExecArgs({
           prompt: 'Hello',
           modelId,
           dangerouslySkipPermissions: false,
         });
-        expect(args).not.toContain('--model');
-        expect(args).not.toContain('auto');
+        expect(args).toContain('--model');
+        // Verbatim: the resolved id is what lazy recorded on the turn, so what
+        // Cursor receives and what a human reads in `lazy show` are the same
+        // string.
+        expect(args[args.indexOf('--model') + 1]).toBe(modelId);
       }
     });
 
@@ -213,6 +274,7 @@ describe('CursorAgent', () => {
 
     test('appends extraArgs after flags, before the prompt', () => {
       const args = agent.buildExecArgs({
+        modelId: 'test-model',
         prompt: 'Hello',
         dangerouslySkipPermissions: false,
         extraArgs: ['--extra-flag', 'value'],
@@ -223,11 +285,11 @@ describe('CursorAgent', () => {
 
     test('omits optional flags when not provided', () => {
       const args = agent.buildExecArgs({
+        modelId: 'test-model',
         prompt: 'Hello',
         dangerouslySkipPermissions: false,
       });
       expect(args).not.toContain('--resume');
-      expect(args).not.toContain('--model');
       expect(args).not.toContain('--force');
       expect(args).not.toContain('--append-system-prompt');
       expect(args).not.toContain('--worktree');
@@ -237,6 +299,7 @@ describe('CursorAgent', () => {
     // INVARIANT: --trust is always present in headless mode to avoid interactive prompts.
     test('always includes --trust', () => {
       const args = agent.buildExecArgs({
+        modelId: 'test-model',
         prompt: 'Hello',
         dangerouslySkipPermissions: false,
       });
@@ -279,6 +342,27 @@ describe('CursorAgent', () => {
       const response = agent.parseResponse(stdout);
       expect(response.result).toBe('final');
       expect(response.session_id).toBe('s2');
+    });
+
+    // INVARIANT: a raw stream's init-line `model` lands on the response as
+    // `model_id`. Cursor's result object has no model field, and the
+    // supervisor's follow-up invocations (self-review, wrap-up, walkthrough)
+    // hand parseResponse raw stdout — without this every one of those turns
+    // records no model_id and reads as if it ran the requested alias.
+    test('takes model_id from the init line of a stream', () => {
+      const stdout = [
+        JSON.stringify({ type: 'system', subtype: 'init', session_id: 's3', model: 'claude-opus-4-5-20251101' }),
+        JSON.stringify({ type: 'result', result: 'final', session_id: 's3' }),
+      ].join('\n');
+      expect(agent.parseResponse(stdout).model_id).toBe('claude-opus-4-5-20251101');
+    });
+
+    test('leaves model_id unset when the init line reports no model', () => {
+      const stdout = [
+        JSON.stringify({ type: 'system', subtype: 'init', session_id: 's4' }),
+        JSON.stringify({ type: 'result', result: 'final', session_id: 's4' }),
+      ].join('\n');
+      expect(agent.parseResponse(stdout).model_id).toBeUndefined();
     });
 
     test('throws on invalid JSON', () => {
@@ -380,6 +464,21 @@ describe('CursorAgent', () => {
         const response = agent.parseResponse(stdout);
         expect(response.result).toContain('Let me start by exploring the codebase.\n\nLet me check the files.');
         expect(response.result).toContain('Now I understand.\n\n## Summary');
+      });
+
+      // INVARIANT (fix-reviewer-cannot-access-mcp): the real mangling is not only
+      // "I'll"/"Let me" — Cursor glues ANY mid-turn bubble onto the previous
+      // sentence with no space ("else.MCP", "directly.Shell", "...JSON.```").
+      test('splits sentences glued without whitespace (review-turn mangling)', () => {
+        const stdout = JSON.stringify({
+          result:
+            "I'll review this task's branch hostilely: first the task context and diff, then security and data-integrity sweeps before anything else.MCP calls were rejected, so I'll inspect the worktree and git history directly.Shell is blocked in this review mode; I'll read the changed files.Filing raises for the confirmed gaps, then the verdict JSON.```json\n{\"verdict\":\"request changes\"}\n```",
+          session_id: 's1',
+        });
+        const response = agent.parseResponse(stdout);
+        expect(response.result).toContain('before anything else.\n\nMCP calls were rejected');
+        expect(response.result).toContain('git history directly.\n\nShell is blocked');
+        expect(response.result).toContain('the verdict JSON.\n\n```json');
       });
     });
 
@@ -621,9 +720,108 @@ describe('CursorAgent', () => {
   });
 
   describe('watchdog', () => {
-    // INVARIANT: Cursor CLI has a historic hanging bug — non-zero default timeout.
-    test('returns non-zero default watchdog timeout', () => {
-      expect(agent.defaultWatchdogTimeoutMs()).toBeGreaterThan(0);
+    // INVARIANT (fix-cursor-silent-watchdog): 0 = "no agent-specific default",
+    // so the configured `[agent] watchdog_output_timeout_ms` applies, same as
+    // Claude Code / Codex / pi. This used to be 5 minutes as belt-and-braces
+    // against a historic --print hang, but on the single-blob output format
+    // that number was really "how long may a Cursor turn take" — a working turn
+    // emitted nothing until it ended, and every longer one was killed and
+    // retried. With an activity stream the guard measures forward progress, so
+    // a per-agent shortcut is no longer needed.
+    test('defers to the configured watchdog window', () => {
+      expect(agent.defaultWatchdogTimeoutMs()).toBe(0);
+    });
+
+    // INVARIANT: Cursor HAS an activity stream, and its shapes were verified
+    // against the shipped binary (see docs/cursor-stream-json.md). Without one
+    // the guard falls back to counting bytes, which is the bug above.
+    test('exposes an activity stream', () => {
+      expect(agent.activityStream()).not.toBeNull();
+    });
+  });
+
+  describe('CursorActivityStream', () => {
+    let stream: CursorActivityStream;
+    beforeEach(() => { stream = new CursorActivityStream(); });
+
+    test('maps the init line to session_start carrying the session id and model', () => {
+      const event = stream.parseLine(JSON.stringify({
+        type: 'system', subtype: 'init', session_id: 'chat-1', model: 'claude-opus-4-5-20251101', cwd: '/w',
+      }));
+      expect(event).toEqual({
+        kind: 'session_start',
+        sessionId: 'chat-1',
+        model: 'claude-opus-4-5-20251101',
+      });
+    });
+
+    test('session_start omits model when the init line has none', () => {
+      const event = stream.parseLine(JSON.stringify({
+        type: 'system', subtype: 'init', session_id: 'chat-1',
+      }));
+      expect(event).toEqual({ kind: 'session_start', sessionId: 'chat-1' });
+    });
+
+    // INVARIANT (src/supervisor/mcp-verify.ts, rule 1): fail only on POSITIVE
+    // evidence of zero tools. Cursor's init reports neither `mcp_servers` nor
+    // `tools`, so both must stay undefined — empty arrays would read as "this
+    // turn loaded no lazy tools" and abort every Cursor turn at session start.
+    test('reports no MCP evidence on session_start', () => {
+      const event = stream.parseLine(JSON.stringify({
+        type: 'system', subtype: 'init', session_id: 'chat-1',
+      }));
+      expect(event!.kind).toBe('session_start');
+      expect(event!.mcpServers).toBeUndefined();
+      expect(event!.toolNames).toBeUndefined();
+    });
+
+    test('maps tool_call started/completed to tool_start/tool_end', () => {
+      const started = stream.parseLine(JSON.stringify({
+        type: 'tool_call', subtype: 'started', call_id: 'c1', session_id: 'chat-1',
+        tool_call: { tool: { case: 'readToolCall', value: {} } },
+      }));
+      expect(started).toEqual({ kind: 'tool_start', toolUseId: 'c1', toolName: 'read' });
+
+      const completed = stream.parseLine(JSON.stringify({
+        type: 'tool_call', subtype: 'completed', call_id: 'c1', session_id: 'chat-1',
+        tool_call: { tool: { case: 'readToolCall', value: {} } },
+      }));
+      expect(completed).toEqual({ kind: 'tool_end', toolUseId: 'c1', toolName: 'read' });
+    });
+
+    test('maps the final result line to a result event with the raw line', () => {
+      stream.parseLine(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'chat-1' }));
+      const line = JSON.stringify({
+        type: 'result', subtype: 'success', result: 'done', session_id: 'chat-1',
+      });
+      const event = stream.parseLine(line);
+      expect(event!.kind).toBe('result');
+      expect(event!.sessionId).toBe('chat-1');
+      expect(event!.raw).toBe(line);
+      // The isolated result line is what the supervisor hands parseResponse.
+      expect(agent.parseResponse(event!.raw!).result).toContain('done');
+    });
+
+    // Cursor writes no keep-alive event, so nothing may map to `heartbeat`:
+    // a heartbeat deliberately does NOT reset the no-progress timer, and
+    // demoting real progress to one would resurrect the silent-kill bug.
+    test('treats thinking, assistant and unknown events as forward progress', () => {
+      for (const msg of [
+        { type: 'thinking', subtype: 'delta', text: 'hm' },
+        { type: 'assistant', message: { role: 'assistant', content: [] } },
+        { type: 'user', message: { role: 'user', content: [] } },
+        { type: 'system', subtype: 'task_notification' },
+        { type: 'something_new_in_a_future_release' },
+      ]) {
+        expect(stream.parseLine(JSON.stringify(msg))).toEqual({ kind: 'progress' });
+      }
+    });
+
+    test('ignores blank, non-JSON and truncated lines rather than throwing', () => {
+      expect(stream.parseLine('')).toBeNull();
+      expect(stream.parseLine('  ')).toBeNull();
+      expect(stream.parseLine('Some plain warning from the CLI')).toBeNull();
+      expect(stream.parseLine('{"type":"tool_call","subty')).toBeNull();
     });
   });
 
@@ -711,20 +909,37 @@ describe('Agent registry', () => {
     expect(getAgentPackaging('qa-agent').supportsContainerRunner()).toBe(false);
   });
 
-  // SECURITY INVARIANT (fix-cursor-security-musts): pairing is opt-in per agent
-  // and ONLY claude-code opts in. `lazy pair` hands a human an interactive
-  // session on the HOST, in the task worktree. For any agent whose container
-  // session lazy cannot surface without copying agent-written history onto the
-  // host, that session is both dangerous (agent-authored text becomes input to
-  // a session running as the human) and useless (no memory of the work).
+  // SECURITY INVARIANT (fix-cursor-security-musts): pairing is opt-in per agent.
+  // Cursor was gated OFF because `lazy pair` ran the interactive session on the
+  // HOST, which meant surfacing a container session required copying
+  // agent-written history into the human's own ~/.cursor — agent-authored text
+  // becoming input to a session running as the human, with `--force` on top.
   //
-  // Do not flip cursor to true to "restore pairing". The gate is the decision.
-  // It can only change when pairing itself runs inside the container, where
-  // nothing needs importing across the boundary.
+  // The gate was lifted in `pair-in-container` under exactly the condition its
+  // predecessor named: pairing now runs INSIDE the task's container, over the
+  // sandbox home the agent's own turns already write, so nothing crosses the
+  // boundary and `--autonomous` is the same trust decision as a supervised turn.
+  // Do NOT flip cursor back to false to "restore" the old refusal, and do not
+  // flip a new agent to true while pairing could still land on the host: the
+  // condition, not the value, is the invariant.
   test('pairing capability matrix', () => {
     expect(getAgent('claude-code').supportsPairing()).toBe(true);
-    expect(getAgent('cursor').supportsPairing()).toBe(false);
+    expect(getAgent('cursor').supportsPairing()).toBe(true);
     expect(getAgent('qa-agent').supportsPairing()).toBe(false);
+  });
+
+  // An agent that opts into pairing MUST be able to build an interactive argv —
+  // otherwise `lazy pair` passes the capability gate on the host and dies inside
+  // the container with nothing to launch.
+  test('every pairing-capable agent can build interactive args', () => {
+    for (const id of listAgents()) {
+      const agent = getAgent(id);
+      if (!agent.supportsPairing()) continue;
+      // A model, as every pair launcher supplies one (pairSessionModel always
+      // resolves one); every harness refuses a model-less launch.
+      const argv = agent.buildInteractiveArgs({ modelId: 'some-model', dangerouslySkipPermissions: false });
+      expect(Array.isArray(argv) && argv.length > 0).toBe(true);
+    }
   });
 
   // A new agent must not become pairable by forgetting to think about it.

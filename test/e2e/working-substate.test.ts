@@ -106,17 +106,19 @@ describe('working-substate observability', () => {
   let originalCwd: string;
 
   beforeEach(async () => {
-    ctx = await setupTestLazy();
+    ctx = await setupTestLazy({ allowHostRunner: true });
     await useHostProcessRunner(ctx.root);
     // The test process's cwd is this repo, whose lazy.toml can bleed into
     // config/storage resolution for in-test createStorage. Run from the test
     // root so in-test storage resolves to the same place the subprocess reads.
     originalCwd = process.cwd();
     process.chdir(ctx.root);
+    process.env.LAZY_ALLOW_HOST_RUNNER = '1';
   });
 
   afterEach(async () => {
     process.chdir(originalCwd);
+    delete process.env.LAZY_ALLOW_HOST_RUNNER;
     await rm(pidFilePath(), { force: true });
     await ctx.cleanup();
   });

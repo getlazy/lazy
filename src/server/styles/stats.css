@@ -1,0 +1,258 @@
+/*
+ * Stats tab — stat tiles, the time meter, and the inline-SVG token charts.
+ *
+ * THE FOUR VIZ SLOTS are the house data-viz categorical order (blue, orange,
+ * aqua, yellow), validated against THIS surface in both themes: worst adjacent
+ * CVD ΔE 9.1 light / 8.4 dark, worst normal-vision ΔE 22.9 / 19.8, every dark
+ * step ≥ 3:1 against the dark surface. The dark column is the same four hues
+ * re-stepped for the dark ground, not an automatic flip — which is why they are
+ * spelled out under the media query rather than derived.
+ *
+ * Three of the light steps sit below 3:1 against the light surface, so the
+ * relief rule applies: the renderer ships a labelled legend with values and a
+ * per-turn table, and never relies on color alone.
+ *
+ * These are deliberately their own tokens rather than the semantic
+ * success/danger/indigo roles: those mean "succeeded" and "failed" everywhere
+ * else on this surface, and reusing them for "cache read" would make the status
+ * vocabulary lie.
+ */
+
+.lz-stats-tab {
+  --lz-viz-1: #2a78d6;
+  --lz-viz-2: #eb6834;
+  --lz-viz-3: #1baf7a;
+  --lz-viz-4: #eda100;
+}
+
+@media (prefers-color-scheme: dark) {
+  .lz-stats-tab {
+    --lz-viz-1: #3987e5;
+    --lz-viz-2: #d95926;
+    --lz-viz-3: #199e70;
+    --lz-viz-4: #c98500;
+  }
+}
+
+.lz-stats-tab h3 {
+  margin: 28px 0 8px;
+  font-size: 14px;
+}
+
+.lz-stats-tab h4 {
+  margin: 18px 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.lz-stats-note {
+  margin: 8px 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  max-width: 68ch;
+}
+
+/* — scope toggle (this task / including subtasks) —
+   A segmented control made of plain links: the two views are separate URLs, so
+   each is bookmarkable and neither needs script. The active side is a <span>,
+   not a dead link. */
+
+.lz-stats-scope {
+  display: inline-flex;
+  margin: 4px 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md, 6px);
+  overflow: hidden;
+  font-size: 12px;
+}
+
+.lz-stats-scope .lz-scope-opt {
+  padding: 5px 12px;
+  color: var(--text-secondary);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.lz-stats-scope .lz-scope-opt + .lz-scope-opt {
+  border-left: 1px solid var(--border);
+}
+
+.lz-stats-scope a.lz-scope-opt:hover {
+  background: color-mix(in srgb, var(--color-text) 6%, transparent);
+  color: var(--text);
+}
+
+.lz-stats-scope .lz-scope-active {
+  background: color-mix(in srgb, var(--color-text) 10%, transparent);
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* — stat tiles — */
+
+.lz-stat-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 4px 0 8px;
+}
+
+.lz-stat-tile {
+  flex: 1 1 140px;
+  padding: 12px 14px;
+  border-radius: var(--radius-md, 6px);
+  background: var(--color-surface);
+  border: 1px solid var(--border);
+}
+
+.lz-stat-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+}
+
+/* Proportional figures on purpose — tabular-nums looks loose at this size and
+   these values are not in a column that has to align. */
+.lz-stat-value {
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1.2;
+  margin-top: 2px;
+}
+
+.lz-stat-note {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 2px;
+}
+
+/* — the time meter — */
+
+.lz-meter {
+  display: flex;
+  gap: 2px; /* the house 2px surface gap between touching marks */
+  height: 20px;
+  margin: 10px 0;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.lz-meter-seg {
+  display: block;
+  min-width: 2px;
+}
+
+/* — legend — */
+
+.lz-viz-legend {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 20px;
+  font-size: 12px;
+}
+
+.lz-viz-legend li {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.lz-viz-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  flex: none;
+  align-self: center;
+}
+
+/* Text wears text tokens, never the series color — the swatch carries identity. */
+.lz-viz-key { color: var(--text-secondary); }
+.lz-viz-val { font-variant-numeric: tabular-nums; font-weight: 600; }
+.lz-viz-pct { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+
+/* — svg charts — */
+
+.lz-viz-svg {
+  display: block;
+  width: 100%;
+  max-width: 720px;
+  height: auto;
+  margin: 6px 0;
+}
+
+.lz-viz-grid {
+  stroke: color-mix(in srgb, var(--color-text) 12%, transparent);
+  stroke-width: 1;
+}
+
+.lz-viz-tick {
+  fill: var(--text-secondary);
+  font-size: 10px;
+  font-family: var(--font-mono);
+}
+
+.lz-viz-line {
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.lz-viz-endlabel {
+  fill: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+}
+
+/* — tables — */
+
+.lz-stats-tab .lz-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  margin: 8px 0;
+}
+
+.lz-stats-tab .lz-table th,
+.lz-stats-tab .lz-table td {
+  text-align: left;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.lz-stats-tab .lz-table th {
+  color: var(--text-secondary);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.lz-stats-tab .lz-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+
+.lz-stats-table summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: 10px;
+}
+
+.lz-stats-facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 16px;
+  margin: 10px 0;
+  font-size: 12px;
+}
+
+.lz-stats-facts dt { color: var(--text-secondary); }
+.lz-stats-facts dd { margin: 0; font-family: var(--font-mono); }

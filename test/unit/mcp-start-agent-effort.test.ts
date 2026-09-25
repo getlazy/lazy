@@ -127,9 +127,12 @@ describe('MCP lazy_start agent/effort parity', () => {
     const handlers = createAllHandlers(ctx);
     const created = await handlers.get('lazy_create')!({ goal: 'Agent task' });
 
+    // `--agent` names an agent PROFILE now, so the refusal is phrased in those
+    // terms and lists the profiles this project actually has. What is pinned
+    // here is unchanged: the name is rejected, by name, before any launch.
     await expect(
       handlers.get('lazy_start')!({ task_id: (created as any).full_id, agent: 'not-a-real-agent' }),
-    ).rejects.toThrow(/Unknown agent 'not-a-real-agent'/);
+    ).rejects.toThrow(/Unknown agent profile "not-a-real-agent"/);
 
     const task = await storage.getTask((created as any).full_id);
     expect(task?.status).toBe('backlog');

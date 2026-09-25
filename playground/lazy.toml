@@ -1,0 +1,19 @@
+# Lazy configuration for Linkshelf. See https://docs.getlazy.dev for every key.
+
+[serve.services]
+# The dev server listens on 3000 inside each task's environment; lazy publishes
+# it, so `lazy url <task> web` opens that task's running copy of the app.
+web = 3000
+
+[docker]
+# The default agent image has no Bun; this one adds it.
+dockerfile = "Dockerfile.lazy"
+
+[permissions]
+# The database schema is protected: an agent may add to it, but changing or
+# deleting what is there is flagged for a human at review.
+protected = ["src/schema.sql"]
+
+[automation]
+# Run the tests after every agent turn and attach the result for the reviewer.
+post_turn = "bun test"

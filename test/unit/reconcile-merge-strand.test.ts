@@ -26,7 +26,7 @@ import { FileStorage } from '../../src/storage';
 import { handleCompletedResponses, handleErrorResponse } from '../../src/utils/reconcile';
 import { protocolDir as getProtocolDir } from '../../src/protocol';
 import type { CompletedResponse, ErrorResponse, WorktreeRecovery } from '../../src/protocol';
-import { getWorktreePathForRef, taskRef } from '../../src/cli/helpers';
+import { getWorktreePathForRef, taskRef } from '../../src/task/identity';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 
 function git(cwd: string, ...args: string[]): string {

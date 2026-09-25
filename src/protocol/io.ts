@@ -14,16 +14,29 @@
  * All writes use atomic temp-file-then-rename to prevent partial reads.
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, unlinkSync, renameSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, unlinkSync, renameSync, chmodSync } from 'fs';
 import { join, dirname } from 'path';
 import { randomUUID } from 'crypto';
 import { getHome } from '../utils/home';
 import type { Command, Response, SupervisorStatus } from './types';
-import { PROTOCOL_VERSION } from './types';
+import { PROTOCOL_VERSION, normalizeResponse, normalizeSupervisorStatus, type CommandId } from './types';
 import { PROGRESS_FILE } from './progress';
-import type { ResolvedConfig, MaintainEntry } from '../config/types';
+import { FINAL_MARKER_FILE } from './final-marker';
+import { PRESENTATION_MARKER_FILE } from './presentation-marker';
+import type { ResolvedConfig, MaintainEntry, ReactEntry } from '../config/types';
 import { buildAgentSandboxArgs } from '../runner/host-sandbox';
+import { harnessForAgentName } from '../config/agent-profiles';
 import { logger } from '../utils/logger';
+
+/**
+ * Allocate a fresh command correlation id.
+ *
+ * Every command written to a supervisor gets one so the response can be
+ * attributed to the command that produced it.
+ */
+export function newCommandId(): CommandId {
+  return randomUUID();
+}
 
 /**
  * Common policy fields for every start/unblock command.
@@ -33,20 +46,33 @@ import { logger } from '../utils/logger';
  *
  * `protocol_version` is injected here so every command sent to the
  * supervisor passes the version gate. See PROTOCOL_VERSION for bump rules.
+ *
+ * `command_id` is injected here so every synchronous waiter can ask
+ * "is this response mine?" Pass `opts.command_id` when the id was already
+ * allocated (e.g. stamped on an in-flight turn record before the command).
  */
-export function commonCommandFields(config: ResolvedConfig): {
+export function commonCommandFields(
+  config: ResolvedConfig,
+  opts?: { command_id?: CommandId },
+): {
   protocol_version: number;
+  command_id: CommandId;
   turn_started_at: string;
   watchdog_output_timeout_ms?: number;
   wind_down_timeout_ms?: number;
   protected_patterns: string[];
   post_turn_check?: string;
   post_turn_timeout?: number;
+  pre_turn_hook?: string;
+  pre_turn_timeout?: number;
+  pre_turn_required?: boolean;
   agent_extra_args?: string[];
   maintain?: MaintainEntry[];
+  react?: ReactEntry[];
 } {
   return {
     protocol_version: PROTOCOL_VERSION,
+    command_id: opts?.command_id ?? newCommandId(),
     turn_started_at: new Date().toISOString(),
     ...(config.agent.watchdog_output_timeout_ms !== 0 && {
       watchdog_output_timeout_ms: config.agent.watchdog_output_timeout_ms,
@@ -55,15 +81,26 @@ export function commonCommandFields(config: ResolvedConfig): {
     // supervisor sees the explicit opt-out instead of falling back to a default.
     wind_down_timeout_ms: config.agent.wind_down_timeout_ms,
     protected_patterns: config.permissions.protected,
-    ...(config.checks.post_turn !== '' && {
-      post_turn_check: config.checks.post_turn,
-      post_turn_timeout: config.checks.post_turn_timeout,
+    ...(config.automation.post_turn !== '' && {
+      post_turn_check: config.automation.post_turn,
+      post_turn_timeout: config.automation.post_turn_timeout,
+    }),
+    // Pre-turn setup hook (opt-in). Omitted entirely when unconfigured so the
+    // supervisor skips the phase rather than running an empty `sh -c`.
+    ...(config.automation.pre_turn !== '' && {
+      pre_turn_hook: config.automation.pre_turn,
+      pre_turn_timeout: config.automation.pre_turn_timeout,
+      pre_turn_required: config.automation.pre_turn_required,
     }),
     ...computeAgentExtraArgs(config),
     // Maintained-file groups (opt-in). Only sent when configured — omitted
     // entirely on the default empty config so the supervisor skips the check.
     ...(config.automation.maintain.length > 0 && {
       maintain: config.automation.maintain,
+    }),
+    // Reactive automations (opt-in). Same omit-when-empty rule as maintain.
+    ...(config.automation.react.length > 0 && {
+      react: config.automation.react,
     }),
   };
 }
@@ -85,8 +122,14 @@ export function commonCommandFields(config: ResolvedConfig): {
 function computeAgentExtraArgs(config: ResolvedConfig): { agent_extra_args?: string[] } {
   // Optional chaining: callers (and tests) may pass partial configs. Anything
   // other than a host-process Claude agent in sandbox mode gets no extra args.
+  //
+  // `--settings` is a property of the BINARY, so the test is on the harness
+  // behind `[agent] agent_id` (a profile name) rather than on the name itself.
+  // Lenient, like every best-effort harness lookup: a partial config carries no
+  // `[agents]` table, and the built-in profiles it falls back to answer this
+  // correctly for every project that has not defined a custom one.
   const isHost = config.runner?.type === 'dangerously-host-process-without-any-isolation';
-  const isClaude = config.agent?.agent_id === 'claude-code';
+  const isClaude = harnessForAgentName(config, config.agent?.agent_id) === 'claude-code';
   if (!isHost || !isClaude) return {};
 
   const extra = buildAgentSandboxArgs({
@@ -112,10 +155,38 @@ function protocolBase(): string {
  *
  * Protocol dirs live at ~/.lazy/protocol/<taskId>/ — per-user operational
  * state, not in the repo. Inside containers, the host-side protocol dir
- * is bind-mounted at the same path.
+ * is bind-mounted at `containerProtocolDir()` (src/capture/claude.ts) — a fixed
+ * top-level path, never the host path, which sits under an untraversable
+ * `/root` whenever the daemon runs as root.
  */
 export function protocolDir(taskId: string): string {
   return join(protocolBase(), taskId);
+}
+
+/**
+ * Protocol mailbox for `lazy review` only — a sibling of {@link protocolDir},
+ * never nested inside it.
+ *
+ * INVARIANT: the work supervisor bind-mounts `protocolDir(taskId)` and polls
+ * it while the task is paused. Review must not write `command.json` there:
+ * the idle work supervisor would consume the review command before the
+ * ephemeral review container finished starting. A dedicated sibling dir
+ * (`<taskId>-review`) keeps the work mailbox empty for the implementer and
+ * gives the review container its own channel.
+ */
+export function reviewProtocolDir(taskId: string): string {
+  return join(protocolBase(), `${taskId}-review`);
+}
+
+/**
+ * Protocol mailbox for the MECHANICAL acceptance gate only — a sibling of
+ * {@link protocolDir}, never nested inside it. Same reasons as the review
+ * mailbox (a live work supervisor must never consume the gate command), plus
+ * one of its own: the gate's response must not be readable as some turn's
+ * answer. Nothing but the gate's own waiter polls this dir.
+ */
+export function acceptGateProtocolDir(taskId: string): string {
+  return join(protocolBase(), `${taskId}-gate`);
 }
 
 function commandPath(dir: string): string {
@@ -161,7 +232,7 @@ function safeReadJson<T>(filePath: string): T | null {
  * Sets aside any previous response — never deletes it — before writing the new command.
  */
 export function writeCommand(dir: string, command: Command): void {
-  mkdirSync(dir, { recursive: true });
+  ensureProtocolDir(dir);
   // Clear previous response so supervisor knows this is a fresh command.
   //
   // INVARIANT: an unconsumed response is NEVER destroyed here. It is the only
@@ -214,6 +285,16 @@ export function writeCommand(dir: string, command: Command): void {
   if (existsSync(pPath)) {
     try { unlinkSync(pPath); } catch { /* best effort */ }
   }
+  // Same argument for the pencils-down marker, and it is a correctness one
+  // rather than a cosmetic one: a `final.json` left by the previous turn would
+  // make this turn's first agent invocation look declared-done before the agent
+  // had written a line. The supervisor ALSO clears it before every agent
+  // invocation (a command runs several), which is the load-bearing clear; this
+  // one closes the gap for a turn whose supervisor never reaches that code.
+  const fPath = join(dir, FINAL_MARKER_FILE);
+  if (existsSync(fPath)) {
+    try { unlinkSync(fPath); } catch { /* best effort */ }
+  }
   atomicWrite(commandPath(dir), JSON.stringify(command, null, 2));
 }
 
@@ -252,7 +333,11 @@ export function writeResponse(dir: string, response: Response): void {
  * Read the supervisor's response. Returns null if no response yet.
  */
 export function readResponse(dir: string): Response | null {
-  return safeReadJson<Response>(responsePath(dir));
+  const response = safeReadJson<Response>(responsePath(dir));
+  // THE read boundary for supervised-kind spellings: a response written by a
+  // pre-rename supervisor still carries `ivan_review`/`ivan_revise`, and every
+  // consumer downstream switches on the current spelling only.
+  return response === null ? null : normalizeResponse(response);
 }
 
 /**
@@ -323,7 +408,10 @@ export function writeStatus(dir: string, status: SupervisorStatus): void {
  * Read the supervisor's status. Returns null if no status file.
  */
 export function readStatus(dir: string): SupervisorStatus | null {
-  return safeReadJson<SupervisorStatus>(statusPath(dir));
+  const status = safeReadJson<SupervisorStatus>(statusPath(dir));
+  // Same read boundary for phases: a supervisor that started before an upgrade
+  // is still writing `ivan_review` into status.json for the rest of its turn.
+  return status === null ? null : normalizeSupervisorStatus(status);
 }
 
 /**
@@ -379,10 +467,48 @@ export async function waitForResponse(dir: string, intervalMs: number = 1000, ti
 // --- Protocol directory management ---
 
 /**
- * Ensure the protocol directory exists.
+ * The mode a task's protocol dir needs when the daemon runs as `uid`, or null
+ * when the default is right.
+ *
+ * The supervisor inside the container writes `response.json` and
+ * `status.json` into this dir and deletes `command.json` from it, as the
+ * runner image's unprivileged `user`. When the daemon is root (a Linux
+ * self-host, the daemon image inside a fleet microVM) the dir is root-owned
+ * 0755 and every one of those writes fails with EACCES — fleet demo run 7
+ * ended with the supervisor crashing in `writeResponse`. A Mac never showed
+ * it: there the daemon is the human, and Docker Desktop maps ownership. World-
+ * writable is safe here because the dir's ancestor is root's own 0700 home:
+ * nothing on the host but root can reach it, and the container user is the
+ * one client the mailbox exists for.
+ */
+export function protocolDirModeFor(uid: number | undefined): number | null {
+  return uid === 0 ? 0o777 : null;
+}
+
+/**
+ * The mode for a bearer-credential file the daemon writes for ONE container to
+ * read (the per-task MCP config). 0600 is right when the daemon is the human:
+ * Docker Desktop maps ownership and the container reads it. A root daemon on
+ * native Linux hands the container a root-owned 0600 file it cannot open
+ * (fleet demo run 9: "Work phase failed: EACCES … daemon-mcp-<task>.json"), so
+ * there it is 0644 — readable by the container user, inside a base dir only
+ * root and that container can reach.
+ */
+export function containerHandoffFileModeFor(uid: number | undefined): number {
+  return uid === 0 ? 0o644 : 0o600;
+}
+
+function ensureContainerWritable(dir: string): void {
+  const mode = protocolDirModeFor(process.getuid?.());
+  if (mode !== null) chmodSync(dir, mode);
+}
+
+/**
+ * Ensure the protocol directory exists, writable by the container's user.
  */
 export function ensureProtocolDir(dir: string): void {
   mkdirSync(dir, { recursive: true });
+  ensureContainerWritable(dir);
 }
 
 /**
@@ -392,7 +518,13 @@ export function cleanProtocol(dir: string): void {
   // waiting.json is included: a torn-down turn cannot still be blocked on a
   // subtask, so leaving the marker behind would render a dead task as waiting.
   // progress.json likewise — a torn-down turn is not making progress.
-  for (const file of ['command.json', 'response.json', 'status.json', 'waiting.json', PROGRESS_FILE]) {
+  // final.json likewise, and it matters most: a stale pencils-down marker from a
+  // torn-down turn must never make a LATER, unfinished turn look done
+  // (final-turn design §13.10). presentation.json likewise: the marker is a
+  // signal for the wrap-up's presentation step, and a torn-down turn owns
+  // neither a pending step nor a declaration — the durable fact lives in the
+  // stored report.
+  for (const file of ['command.json', 'response.json', 'status.json', 'waiting.json', PROGRESS_FILE, FINAL_MARKER_FILE, PRESENTATION_MARKER_FILE]) {
     const p = join(dir, file);
     try { if (existsSync(p)) unlinkSync(p); } catch { /* best effort */ }
   }

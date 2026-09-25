@@ -30,9 +30,13 @@ import type { Storage } from '../storage';
 import type { ResolvedConfig } from '../config/types';
 import type { Task } from '../types';
 import { logger } from '../utils/logger';
-import { shortId } from '../cli/helpers';
+import { shortId } from '../task/identity';
+// The one home of the user-stop rule. This module used to spell it out for
+// itself to dodge a cycle with reconcile.ts; src/task/user-stop.ts has no
+// imports, so there is nothing left to dodge.
+import { isUserStopped } from '../task/user-stop';
 import { autoResumeTask, MAX_CONSECUTIVE_INTERRUPTIONS } from '../utils/auto-resume';
-import { effectiveAgentLimit, tryAdmitAgentSlot, releaseAgentSlot } from './concurrency';
+import { usagePauseHold } from './usage-pause';
 
 // --- Per-task slow-lane state (task metadata) ---
 
@@ -148,15 +152,6 @@ export interface AutoResumeQueueEntry {
 }
 
 /**
- * A task is user_stopped-gated the same way maybeAutoResume() gates the fast
- * lane — mirrored here (not imported from src/utils/reconcile.ts) to avoid a
- * circular import, since reconcile.ts calls back into this module's resets.
- */
-function isUserStopped(session: { user_stopped?: boolean }): boolean {
-  return session.user_stopped === true;
-}
-
-/**
  * List every task currently in (or waiting to enter) the slow lane, in
  * round-robin order: oldest last-attempt first, never-attempted tasks first
  * of all. Read-only — no side effects, safe to call from CLI/RPC handlers.
@@ -233,7 +228,16 @@ export async function processAutoResumeQueue(
   }
 
   const queue = await listSlowLaneQueue(storage, config, now);
-  const candidate = queue.find(entry => entry.intervalEligibleAt <= now);
+  // A task a [usage_pause] holds is passed over WITHOUT recording an attempt:
+  // an attempt the pause refused would spend the task's slow-lane budget on a
+  // window that was always going to reset, and could exhaust it for good.
+  let candidate: AutoResumeQueueEntry | undefined;
+  for (const entry of queue) {
+    if (entry.intervalEligibleAt > now) continue;
+    if (await usagePauseHold(lazyRoot, storage, entry.task, 'auto-resume')) continue;
+    candidate = entry;
+    break;
+  }
   if (!candidate) return { attempted: false };
 
   const { task } = candidate;
@@ -241,25 +245,15 @@ export async function processAutoResumeQueue(
   const session = await storage.getSessionByTaskId(task.id);
   if (!session) return { attempted: false };
 
-  let slotAdmitted = false;
-  try {
-    const decision = await tryAdmitAgentSlot(storage, task.id, effectiveAgentLimit(config));
-    if (!decision.admitted) {
-      logger.debug(`Task ${taskShortId}: at agent cap (${decision.running}/${decision.limit}), deferring slow-lane resume`);
-      return { attempted: false };
-    }
-    slotAdmitted = true;
-  } catch (err) {
-    logger.debug(`Task ${taskShortId}: agent cap check failed (proceeding): ${err instanceof Error ? err.message : err}`);
-  }
-
+  // No agent-slot admission: agent starts are uncapped (`remove-reaper-cap-sweep`
+  // removed `max_concurrent_agents` and the slot queue). What paces the slow
+  // lane is the round-robin gap above — one task project-wide per gap — not a
+  // cap on how many agents may run at once.
   let success = false;
   try {
     success = await autoResumeTask(storage, task, session, lazyRoot);
   } catch (err) {
     logger.warn(`Task ${taskShortId}: slow-lane resume error: ${err instanceof Error ? err.message : err}`);
-  } finally {
-    if (slotAdmitted) releaseAgentSlot(task.id);
   }
 
   // Record the attempt (and consume the round-robin gap) regardless of

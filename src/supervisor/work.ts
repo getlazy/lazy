@@ -24,9 +24,28 @@ import type { AgentTokenUsage } from '../types';
 import { addAgentUsage, attachUsage, readUsage, usageFromRawOutput } from './usage';
 import { hostname } from 'os';
 import { McpToolsUnavailableError } from './mcp-setup';
-import { formatMcpObservation, verifyInitMcpTools } from './mcp-verify';
+import {
+  formatMcpObservation,
+  MCP_VERIFY_NO_INVENTORY_REASON,
+  verifyInitMcpTools,
+} from './mcp-verify';
+import { watchDaemonGeneration } from '../daemon/generation';
+import { refreshSupervisorLaunchEnv, resolveSupervisorProjectRoot } from './launch-env';
+import { loadConfig } from '../config/loader';
+import { turnModelMismatchWarning } from '../utils/turn-labels';
 
 export { WatchdogTimeoutError, GracefulExitTimeoutError };
+
+/** Context needed to refresh model/proxy env and watch daemon generation. */
+export interface WorkLaunchContext {
+  taskId: string;
+  /**
+   * Agent (= profile) this turn runs, so a mid-turn env refresh re-mints the
+   * SAME grant the launch did rather than a second one under a different
+   * profile — see refreshSupervisorLaunchEnv.
+   */
+  agentId?: string;
+}
 
 export interface WorkResult {
   result: string;
@@ -51,6 +70,14 @@ export class CrashError extends Error {
   durationMs: number;
   /** Tokens the agent reported before it crashed, when any could be salvaged. */
   usage?: AgentTokenUsage;
+  /**
+   * The agent's session id as parsed off its own stream before it crashed —
+   * the conversation a resume of this turn should continue. pi prints its
+   * session header as the first stream line, so a crash AFTER a hung model
+   * call still knows which conversation it was in; without it the next launch
+   * starts a new conversation (the 2026-09-16 pi incident).
+   */
+  sessionId?: string;
 
   constructor(opts: {
     message: string;
@@ -59,6 +86,7 @@ export class CrashError extends Error {
     stdoutError?: string;
     durationMs: number;
     usage?: AgentTokenUsage;
+    sessionId?: string;
   }) {
     super(opts.message);
     this.name = 'CrashError';
@@ -67,6 +95,7 @@ export class CrashError extends Error {
     this.stdoutError = opts.stdoutError;
     this.durationMs = opts.durationMs;
     this.usage = opts.usage;
+    this.sessionId = opts.sessionId;
   }
 }
 
@@ -86,6 +115,12 @@ export class FatalAgentError extends Error {
    * before giving up spent all three; attributing only the last would under-count.
    */
   usage?: AgentTokenUsage;
+  /**
+   * The last attempt's session id, when its stream reported one — the
+   * conversation a resume (auto-resume or `lazy unblock`) should continue.
+   * Set by runWork from the error the retry loop gave up on.
+   */
+  sessionId?: string;
 
   constructor(opts: {
     message: string;
@@ -93,6 +128,7 @@ export class FatalAgentError extends Error {
     failureReason: string;
     attempts: number;
     usage?: AgentTokenUsage;
+    sessionId?: string;
   }) {
     super(opts.message);
     this.name = 'FatalAgentError';
@@ -100,6 +136,7 @@ export class FatalAgentError extends Error {
     this.failureReason = opts.failureReason;
     this.attempts = opts.attempts;
     this.usage = opts.usage;
+    this.sessionId = opts.sessionId;
   }
 }
 
@@ -122,6 +159,8 @@ export class CrashLoopError extends Error {
   failureReason: string;
   attempts: number;
   usage?: AgentTokenUsage;
+  /** The last attempt's session id — see FatalAgentError. */
+  sessionId?: string;
 
   constructor(opts: {
     message: string;
@@ -129,6 +168,7 @@ export class CrashLoopError extends Error {
     failureReason: string;
     attempts: number;
     usage?: AgentTokenUsage;
+    sessionId?: string;
   }) {
     super(opts.message);
     this.name = 'CrashLoopError';
@@ -136,6 +176,7 @@ export class CrashLoopError extends Error {
     this.failureReason = opts.failureReason;
     this.attempts = opts.attempts;
     this.usage = opts.usage;
+    this.sessionId = opts.sessionId;
   }
 }
 
@@ -210,6 +251,56 @@ function salvageUsage(raw: string | undefined, context: string): AgentTokenUsage
 }
 
 /**
+ * Fold the concrete model the agent reported at session start onto a parsed
+ * response, then log once when that id is a different family or an older
+ * version than the name we asked for.
+ *
+ * Claude Code usually already has `model_id` from its result line; Cursor's
+ * result object does not, so the init-line value is the only report. Prefer
+ * parseResponse when both exist — the result is what actually billed.
+ */
+async function attachReportedModel(
+  parsed: WorkResult,
+  sessionStartModel: string | undefined,
+  requestedModel: string | undefined,
+): Promise<WorkResult> {
+  const fromInit = sessionStartModel?.trim() || undefined;
+  const model_id = parsed.model_id ?? fromInit;
+  const result = model_id ? { ...parsed, model_id } : parsed;
+  if (requestedModel && result.model_id) {
+    const warning = turnModelMismatchWarning(
+      requestedModel,
+      result.model_id,
+      await expectedLatestModel(),
+    );
+    if (warning) log(`[work] ${warning}`);
+  }
+  return result;
+}
+
+/**
+ * `[models] default` from the project-root config — the hint used when a
+ * short alias like `opus` has no version of its own. A load failure must
+ * not fail a successful turn; the warning then just skips the "older than
+ * default" case.
+ */
+async function expectedLatestModel(): Promise<string | undefined> {
+  try {
+    const root = await resolveSupervisorProjectRoot();
+    if (!root) return undefined;
+    const config = await loadConfig(root);
+    const fallback = config.models.default?.trim();
+    return fallback || undefined;
+  } catch (err) {
+    log(
+      `[work] Could not load [models] default to compare against the reported model: ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return undefined;
+  }
+}
+
+/**
  * Execute the agent once and return the result or throw on error.
  * When watchdogTimeoutMs > 0, monitors output and kills hung processes.
  */
@@ -227,6 +318,7 @@ async function executeAgent(
   _protocolDir?: string,
   windDownTimeoutMs?: number,
   extraArgs?: string[],
+  registerKill?: (kill: (signal?: 'SIGTERM' | 'SIGKILL') => void) => void,
 ): Promise<WorkResult> {
   const claudeArgs = agent.buildExecArgs({
     prompt,
@@ -257,6 +349,7 @@ async function executeAgent(
     windDownElapsedMs,
     resultLine,
     sessionId: streamSessionId,
+    sessionStartEvent,
     abortReason,
   } = await execWithWatchdog(claudeArgs, {
     cwd: worktreePath,
@@ -264,6 +357,7 @@ async function executeAgent(
     timeoutMs: effectiveTimeout,
     activityStream,
     windDownTimeoutMs: effectiveWindDownMs,
+    registerKill,
     // Line 1 of the agent's own stream is the only place that says whether THIS
     // turn actually has its lazy tools. `prepareTurnMcp` proves we wrote a
     // config; this proves the agent loaded one. See supervisor/mcp-verify.ts.
@@ -272,9 +366,15 @@ async function executeAgent(
       if (verdict.outcome === 'unknown') {
         // Absence of evidence is not evidence of absence: a future agent
         // release that stops reporting these fields, or an agent that never
-        // did, must not have its turns killed. Log so the blind spot is at
-        // least visible, and let the turn run.
-        log(`[work] Could not verify this turn's lazy MCP tools — ${verdict.reason}. Letting the turn run.`);
+        // did, must not have its turns killed. Let the turn run.
+        //
+        // Cursor/Codex/Pi never put mcp_servers/tools on session-start, so
+        // "neither field" is their normal every-turn path — do not INFO-log
+        // it (it read as a failure while lazy_* tools were working fine).
+        // Other unknown reasons (no session-start at all, etc.) still log.
+        if (verdict.reason !== MCP_VERIFY_NO_INVENTORY_REASON) {
+          log(`[work] Could not verify this turn's lazy MCP tools — ${verdict.reason}. Letting the turn run.`);
+        }
         return null;
       }
       mcpObservation = formatMcpObservation(verdict.observation);
@@ -318,6 +418,11 @@ async function executeAgent(
       progressBased: !!activityStream,
       capturedResult: !!resultLine,
       usage: salvageUsage(resultLine ?? output, 'no-progress watchdog kill'),
+      // Whatever the stream parsed before the kill — pi's session header is its
+      // first stream line, so a kill 3s into a hung model call still knows the
+      // conversation. Losing it here is what made every watchdog-killed pi turn
+      // resume as a brand-new session (the 2026-09-16 incident).
+      sessionId: streamSessionId,
     });
   }
 
@@ -325,8 +430,11 @@ async function executeAgent(
   // exit. The summary is already in hand, so this is a SUCCESSFUL turn — the
   // only thing lost is the CLI's own teardown. Returning the result here is
   // what keeps a killed wind-down from destroying a turn's summary (and from
-  // aborting an accept whose pre-accept validation already committed).
+  // aborting an accept whose mechanical gate was about to consume it).
   if (killedDuringWindDown) {
+    // Why the captured result was unusable, kept so it can reach the TURN
+    // RECORD rather than only the supervisor log — see GracefulExitTimeoutError.
+    let resultParseError: string | undefined;
     if (resultLine) {
       try {
         const parsed = agent.parseResponse(resultLine, { workingDir: worktreePath }) as WorkResult;
@@ -334,12 +442,11 @@ async function executeAgent(
           `[work] Agent did not exit within ${effectiveWindDownMs}ms of its final result; killed ` +
           `during wind-down. Summary was captured — treating the turn as successful.`,
         );
-        return { ...parsed, ...(mcpObservation ? { mcp_tools: mcpObservation } : {}) };
+        const withModel = await attachReportedModel(parsed, sessionStartEvent?.model, modelId);
+        return { ...withModel, ...(mcpObservation ? { mcp_tools: mcpObservation } : {}) };
       } catch (parseErr) {
-        log(
-          `[work] Wind-down kill: captured result could not be parsed ` +
-          `(${parseErr instanceof Error ? parseErr.message : String(parseErr)}).`,
-        );
+        resultParseError = parseErr instanceof Error ? parseErr.message : String(parseErr);
+        log(`[work] Wind-down kill: captured result could not be parsed (${resultParseError}).`);
       }
     }
     // No usable result. Fall back to the error path, still carrying the session
@@ -356,6 +463,7 @@ async function executeAgent(
       elapsedSinceSignalMs: windDownElapsedMs ?? effectiveWindDownMs,
       sessionId: recoveredSessionId,
       usage: salvageUsage(resultLine ?? output, 'wind-down kill with an unparseable result'),
+      ...(resultParseError ? { parseError: resultParseError } : {}),
     });
   }
 
@@ -395,6 +503,7 @@ async function executeAgent(
       stdoutError,
       durationMs: runtime,
       usage: salvageUsage(errorSource, `agent crash (exit ${exitCode})`),
+      sessionId: streamSessionId,
     });
   }
 
@@ -410,7 +519,8 @@ async function executeAgent(
   // always retained in full.
   try {
     const parsed = agent.parseResponse(resultLine ?? output, { workingDir: worktreePath }) as WorkResult;
-    return { ...parsed, ...(mcpObservation ? { mcp_tools: mcpObservation } : {}) };
+    const withModel = await attachReportedModel(parsed, sessionStartEvent?.model, modelId);
+    return { ...withModel, ...(mcpObservation ? { mcp_tools: mcpObservation } : {}) };
   } catch (parseErr) {
     throw new CrashError({
       message: parseErr instanceof Error ? parseErr.message : String(parseErr),
@@ -419,8 +529,31 @@ async function executeAgent(
       stdoutError: output.substring(0, 500),
       durationMs: Date.now() - launchTime,
       usage: salvageUsage(resultLine ?? output, 'unparseable agent response'),
+      sessionId: streamSessionId,
     });
   }
+}
+
+/**
+ * Read the agent's session id off a turn error, when the error class carries
+ * one — the conversation a resume of this turn should continue.
+ *
+ * Covers the five ways a turn dies: a crash (the stream reported a session
+ * before the crash), a no-progress watchdog kill (same), the wind-down kill
+ * (explicitly recovered in executeAgent), and the two give-up paths where
+ * runWork copies the last attempt's id onto the FatalAgentError/CrashLoopError.
+ */
+export function turnErrorSessionId(err: unknown): string | undefined {
+  if (
+    err instanceof CrashError ||
+    err instanceof FatalAgentError ||
+    err instanceof CrashLoopError ||
+    err instanceof WatchdogTimeoutError ||
+    err instanceof GracefulExitTimeoutError
+  ) {
+    return err.sessionId;
+  }
+  return undefined;
 }
 
 /**
@@ -436,7 +569,9 @@ async function executeAgent(
  *      agent session project dir (`runner.agentSessionProjectDir`) from the
  *      moment it starts (same path `lazy watch` discovers). Pick the file
  *      modified after `launchTime` so we ignore stale sessions from previous
- *      turns.
+ *      turns. `findLatestSessionFile` also skips lazy's own machine one-shots:
+ *      one fired during this turn is newer than `launchTime` too, and recording
+ *      its id here would point the next resume at a housekeeping conversation.
  *
  * Returns undefined only when neither path yields anything (e.g. claude died
  * before writing any jsonl). The caller logs that case so it is debuggable.
@@ -592,11 +727,16 @@ export async function runWork(
    * real wall-clock.
    */
   _sleepOverride?: (ms: number) => Promise<void>,
+  /** When set, enables proxy refresh on retry and daemon-generation watch. */
+  launchContext?: WorkLaunchContext,
 ): Promise<WorkResult> {
   const execute = _executeOverride
     ? _executeOverride
     : (wt: string, p: string, sp?: string, mid?: string, sid?: string, eff?: string, pm?: 'plan' | 'default') =>
-        executeAgent(agent, runner, wt, p, sp, mid, sid, watchdogTimeoutMs, eff, pm, protocolDir, windDownTimeoutMs, agentExtraArgs);
+        executeAgent(
+          agent, runner, wt, p, sp, mid, sid, watchdogTimeoutMs, eff, pm,
+          protocolDir, windDownTimeoutMs, agentExtraArgs, registerAgentKill,
+        );
   let currentSessionId = claudeSessionId;
 
   let retryState: RetryState = {
@@ -624,6 +764,17 @@ export async function runWork(
    */
   let failedAttemptUsage: AgentTokenUsage | undefined;
 
+  /** Set when the generation watch SIGTERM'd the agent for a daemon restart. */
+  let stoppedForDaemonRestart = false;
+  let killAgent: ((signal?: 'SIGTERM' | 'SIGKILL') => void) | null = null;
+  const registerAgentKill = (kill: (signal?: 'SIGTERM' | 'SIGKILL') => void) => {
+    killAgent = kill;
+  };
+
+  const projectRootForWatch = launchContext
+    ? await resolveSupervisorProjectRoot()
+    : null;
+
   /**
    * Throw out of the retry loop with the turn's accumulated usage attached, so
    * the supervisor can put it on the wire no matter which exit path ended the
@@ -640,10 +791,36 @@ export async function runWork(
     const isRetry = retryState.count > 0;
     log(`[work] ${isRetry ? `Retry ${retryState.count}: ` : ''}Running ${agent.id}${currentSessionId ? ' (resume)' : ''}...`);
 
+    stoppedForDaemonRestart = false;
+    killAgent = null;
+
+    // When the daemon restarts mid-turn, stop the agent so this turn retries
+    // against the new proxy rather than spinning on a dead address until the
+    // restart reaper catches up.
+    const generationWatch = launchContext && projectRootForWatch
+      ? watchDaemonGeneration({
+          projectRoot: projectRootForWatch,
+          onRestart: () => {
+            stoppedForDaemonRestart = true;
+            log(
+              '[work] The lazy daemon restarted (for example after lazy upgrade) — stopping this ' +
+              'agent launch so the turn can retry with a fresh proxy address.',
+            );
+            try {
+              killAgent?.('SIGTERM');
+            } catch {
+              /* already gone */
+            }
+          },
+        })
+      : null;
+
     const launchTime = Date.now();
 
     try {
       const result = await execute(worktreePath, prompt, systemPrompt, modelId, currentSessionId, effort, permissionMode);
+
+      generationWatch?.stop();
 
       // Success! Reset retry state
       if (retryState.count > 0) {
@@ -666,6 +843,8 @@ export async function runWork(
       return result;
 
     } catch (err) {
+      generationWatch?.stop();
+
       const runtime = Date.now() - launchTime;
       const errorMessage = err instanceof Error ? err.message : String(err);
 
@@ -792,7 +971,14 @@ export async function runWork(
 
       // Ask the AGENT what went wrong. The supervisor never reads error strings
       // itself — it branches on the returned class only (see retry-policy.ts).
-      const failure: AgentFailure = classifyFailure(agent, err, errorMessage);
+      const failure: AgentFailure = stoppedForDaemonRestart
+        ? {
+            class: 'transient_unreachable',
+            reason:
+              'the lazy daemon restarted while this turn was running — retrying with a ' +
+              'fresh proxy address',
+          }
+        : classifyFailure(agent, err, errorMessage);
       log(`[work] Failure classified as ${failure.class}: ${failure.reason}`);
 
       // Record the error BEFORE any decision below can end the turn — the
@@ -830,6 +1016,7 @@ export async function runWork(
             failureClass: failure.class,
             failureReason: failure.reason,
             attempts: retryState.count,
+            sessionId: turnErrorSessionId(err),
           }));
         }
       } else {
@@ -853,29 +1040,69 @@ export async function runWork(
           failureReason: failure.reason,
           attempts: retryState.count,
           usage: failedAttemptUsage,
+          // The conversation this turn was in when it gave up — a resume
+          // (auto-resume or `lazy unblock`) continues it instead of starting
+          // over. This is what the 2026-09-16 pi incident lost: every retry
+          // after a client-timeout crash opened a brand-new conversation.
+          sessionId: turnErrorSessionId(err),
         });
       }
 
       const delay = decision.delayMs;
       retryState.nextDelayMs = delay;
 
+      // Before every retry, re-resolve the live proxy address from the daemon
+      // now serving. The container's original env is stale after a restart.
+      if (launchContext && (isRetry || stoppedForDaemonRestart || failure.class === 'transient_unreachable')) {
+        try {
+          await refreshSupervisorLaunchEnv({
+            taskId: launchContext.taskId,
+            agentId: launchContext.agentId,
+          });
+        } catch (refreshErr) {
+          const refreshMsg = refreshErr instanceof Error ? refreshErr.message : String(refreshErr);
+          logError(`[work] Could not refresh model launch env before retry: ${refreshMsg}`);
+          retryState.nextDelayMs = undefined;
+          if (onRetryStateChange) onRetryStateChange(retryState);
+          throw new FatalAgentError({
+            message:
+              `Could not refresh the model launch environment after a daemon restart: ${refreshMsg}`,
+            failureClass: failure.class,
+            failureReason: failure.reason,
+            attempts: retryState.count,
+            usage: failedAttemptUsage,
+            // The attempt that just failed was mid-conversation; a resume after
+            // the blocked state should pick up where IT left off.
+            sessionId: turnErrorSessionId(err),
+          });
+        }
+      }
+
       // Notify caller of retry state change
       if (onRetryStateChange) {
         onRetryStateChange(retryState);
       }
 
-      log(`[work] Retrying in ${delay / 1000}s (retry ${retryState.count}, ${decision.reason})...`);
+      // A daemon-restart stop already cost the human a visible interruption;
+      // skip backoff when we know the new daemon is up and env is fresh.
+      const effectiveDelay = stoppedForDaemonRestart ? 0 : delay;
+
+      log(
+        effectiveDelay > 0
+          ? `[work] Retrying in ${effectiveDelay / 1000}s (retry ${retryState.count}, ${decision.reason})...`
+          : `[work] Retrying immediately (retry ${retryState.count}, ${decision.reason})...`,
+      );
 
       // Sleep with periodic checks for new commands
       if (_sleepOverride) {
-        await _sleepOverride(delay);
+        await _sleepOverride(effectiveDelay);
       } else if (protocolDir) {
-        const newCommandArrived = await sleepWithCommandCheck(protocolDir, delay);
+        const newCommandArrived = await sleepWithCommandCheck(protocolDir, effectiveDelay);
         if (newCommandArrived) {
           fail(new Error('Retry canceled: new command arrived'));
         }
-      } else {
-        await Bun.sleep(delay);
+      } else if (effectiveDelay > 0) {
+        await Bun.sleep(effectiveDelay);
       }
     }
   }

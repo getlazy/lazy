@@ -4,6 +4,7 @@ import { join, dirname } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 
 /**
  * End-to-end coverage for the two git LFS layers.
@@ -136,6 +137,8 @@ describe('git LFS guard', () => {
     // Committed exactly as the incident did: a broken filter, so git stores the
     // raw bytes with exit 0 and nothing on stderr.
     commitInWorktree(taskId, 'datasets/big.bin', 'A'.repeat(50_000), 'Add training data');
+    // Fixture setup, not the subject (see test/helpers/final.ts).
+    await seedFinal(ctx, taskId);
 
     const result = await ctx.lazy(['accept', taskId, '--yes']);
     expectFailure(result);
@@ -157,6 +160,8 @@ describe('git LFS guard', () => {
 
     const taskId = await startedTask('Add a dataset pointer');
     commitInWorktree(taskId, 'datasets/big.bin', pointer(50_000), 'Add training data pointer');
+    // Fixture setup, not the subject (see test/helpers/final.ts).
+    await seedFinal(ctx, taskId);
 
     expectSuccess(await ctx.lazy(['accept', taskId, '--yes']));
     expect(ctx.git('-C', ctx.root, 'ls-files', 'datasets/big.bin').stdout.trim()).toBe('datasets/big.bin');
@@ -169,6 +174,8 @@ describe('git LFS guard', () => {
 
     const taskId = await startedTask('Add a small tracked file as-is');
     commitInWorktree(taskId, 'datasets/notes.txt', 'plain text, deliberately not LFS\n', 'Add notes');
+    // Fixture setup, not the subject (see test/helpers/final.ts).
+    await seedFinal(ctx, taskId);
 
     expectSuccess(await ctx.lazy(['accept', taskId, '--yes', '--approve-file', 'datasets/notes.txt']));
     expect(ctx.git('-C', ctx.root, 'ls-files', 'datasets/notes.txt').stdout.trim()).toBe('datasets/notes.txt');

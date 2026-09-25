@@ -214,9 +214,9 @@ describe('MCP confirmation protocol', () => {
     // The MCP server is spawned WITHOUT LAZY_TEST=1 (see runMcpSession /
     // McpSession — both pin it off, see MCP_SERVER_ENV_PINS), so every storage-backed tool it
     // exposes must reach a real daemon over RPC — exactly like the pairing and
-    // builder MCP servers do in production. Daemonless, requireStorage() exits
-    // with "Daemon is not running" and the server dies before answering the
-    // first tool call ("MCP process exited before response"). Mirrors mcp.test.ts.
+    // builder MCP servers do in production. Daemonless, resolveStorage() throws
+    // "Daemon is not running" and every storage-backed tool answers with that
+    // error instead of the result under test. Mirrors mcp.test.ts.
     ctx = await setupTestLazy({ withDaemon: true });
   });
 

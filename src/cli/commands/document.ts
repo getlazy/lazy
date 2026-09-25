@@ -1,6 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, appendFileSync } from 'fs';
+import { requireActorIdentity } from '../identity-preflight';
+import { displayId, displayIdFor, validateCode, MAX_TASK_CODE_LENGTH } from '../../task/identity';
 import { join } from 'path';
-import { requireLazyRoot, requireStorage, displayId, displayIdFor, parseFlags, validateModel, validateCode, MAX_TASK_CODE_LENGTH } from '../helpers';
+import { requireLazyRoot, requireStorage, parseFlags, validateModel } from '../helpers';
 import { openEditor, removeRecoveryFile, readStdinIfPiped } from '../editor';
 import { loadConfig } from '../../config/loader';
 
@@ -8,7 +10,7 @@ import { loadConfig } from '../../config/loader';
 import documentConstraints from '../../prompts/document-constraints.md' with { type: 'text' };
 import { parentTaskIdOf } from '../../task-target';
 import type { Task } from '../../types';
-import { resolveAgentForNewTask } from '../../agent/task-agent';
+import { resolveAgentForNewTaskFromConfig, formatAgentResolutionLine } from '../../agent/task-agent';
 
 const TERMINAL_STATUSES = ['complete', 'abandoned'];
 
@@ -78,6 +80,10 @@ export async function commandDocument(args: string[]): Promise<void> {
   let code: string | undefined;
   let promptRecoveryPath: string | null = null;
   let parentTaskId: string | undefined;
+
+  // Before the documentation goal and its prompt is typed: the daemon refuses a write it cannot
+  // attribute, and a refusal must never cost the human what they wrote.
+  await requireActorIdentity();
 
   // Parse --model flag
   const modelValue = parsed.flags.get('model') as string | undefined;
@@ -164,16 +170,25 @@ export async function commandDocument(args: string[]): Promise<void> {
       parent = parentTask;
     }
 
-    const t = await storage.createTask(goal, parentTaskId, undefined, code, 'document',
-      resolveAgentForNewTask({
-        inheritFrom: parent,
-        configDefault: (await loadConfig(requireLazyRoot())).agent.agent_id,
-      }));
+    const [config, projectSettings] = await Promise.all([
+      loadConfig(requireLazyRoot()),
+      storage.getProjectSettings(),
+    ]);
+    const agentResolution = resolveAgentForNewTaskFromConfig(
+      { inheritFrom: parent, taskType: 'document' },
+      config.agent,
+      projectSettings,
+    );
+    const t = await storage.createTask(goal, parentTaskId, undefined, code, 'document', agentResolution.agentId);
     console.log(`Created task ${displayId(t)}`);
     console.log(`  Goal:   ${t.goal}`);
     console.log(`  Status: ${t.status}`);
     console.log(`  ID:     ${t.id}`);
     console.log(`  Type:   document`);
+    const agentLine = formatAgentResolutionLine(agentResolution);
+    if (agentLine) {
+      console.log(agentLine);
+    }
     if (t.code) {
       console.log(`  Code:   ${t.code}`);
     }
@@ -209,7 +224,7 @@ in markdown with mermaid diagrams. It does NOT modify code files.
 Options:
   --goal <goal>      Documentation goal (what to document)
   --prompt <text>    Additional instructions for the documentation agent
-  --model <model>    Set model for this task (e.g. opus, sonnet, claude-opus-4-8)
+  --model <model>    Set model for this task (e.g. opus, sonnet, claude-opus-5)
   --code <code>      Human-readable code (e.g. "doc-storage", "doc-architecture")
                      Lowercase alphanumeric + hyphens, 2-${MAX_TASK_CODE_LENGTH} chars
   --parent <task_id> Parent task ID (creates a child task)

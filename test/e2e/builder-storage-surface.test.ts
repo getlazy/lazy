@@ -17,16 +17,13 @@
  *   - Teach /rpc/* to accept MCP tokens. That collapses the deliberate,
  *     documented split between the two surfaces (public-docs/lazy-agent-design.md).
  * So capture got its own surface instead, strictly narrower than both: builder
- * tokens only, four methods only.
+ * tokens only, six methods only.
  *
- * These tests run a REAL daemon in-process and drive the route over its socket,
- * so an auth check that only passed in a mock could not pass here.
+ * These tests run a REAL daemon in-process and drive the route over its TCP
+ * port, so an auth check that only passed in a mock could not pass here.
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { mkdtemp, rm } from 'fs/promises';
-import { join } from 'path';
-import { tmpdir } from 'os';
 import { startDaemonServer, type RunningDaemon } from '../../src/daemon/server';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { pinConfig } from '../helpers/pin-config';
@@ -41,8 +38,7 @@ isolateInProcessDaemonEnv();
 
 describe('POST /builder/storage — the builder capture surface', () => {
   let ctx: TestContext;
-  let tmpDir: string;
-  let socketPath: string;
+  let daemonUrl: string;
   let daemon: RunningDaemon | undefined;
   let restoreConfig: (() => void) | undefined;
   let daemonBaseDir: string;
@@ -62,9 +58,8 @@ describe('POST /builder/storage — the builder capture surface', () => {
     builderToken = await mintMcpToken(ctx.root, { kind: 'builder' }, BUILDER_NAME);
     taskToken = await mintMcpToken(ctx.root, { kind: 'task', taskId: 'deadbeef' }, 'task-deadbeef');
 
-    tmpDir = await mkdtemp(join(tmpdir(), 'lazy-builder-storage-'));
-    socketPath = join(tmpDir, 'test.sock');
-    daemon = await startDaemonServer({ socketPath, token: SHARED_TOKEN, projectRoot: ctx.root });
+    daemon = await startDaemonServer({ token: SHARED_TOKEN, projectRoot: ctx.root });
+    daemonUrl = `http://127.0.0.1:${daemon.webPort}`;
   });
 
   afterEach(async () => {
@@ -77,12 +72,10 @@ describe('POST /builder/storage — the builder capture surface', () => {
     restoreDaemonBaseDir?.();
     restoreDaemonBaseDir = undefined;
     await removeDaemonBaseDir(daemonBaseDir);
-    await rm(tmpDir, { recursive: true, force: true });
   });
 
   function post(path: string, token: string, body: unknown, project = ctx.root): Promise<Response> {
-    return fetch(`http://localhost${path}`, {
-      unix: socketPath,
+    return fetch(`${daemonUrl}${path}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -90,10 +83,10 @@ describe('POST /builder/storage — the builder capture surface', () => {
         'X-Lazy-Project': project,
       },
       body: JSON.stringify(body),
-    } as any);
+    });
   }
 
-  // The bug, inverted: this is the exact call the capture monitor makes.
+  // The bug, inverted: these are the exact calls the capture monitor makes.
   test('a builder token can call the allowlisted capture methods', async () => {
     const probe = await post('/builder/storage', builderToken, { method: 'getStoragePath', args: {} });
     expect(probe.status).toBe(200);
@@ -104,6 +97,19 @@ describe('POST /builder/storage — the builder capture surface', () => {
     });
     expect(intents.status).toBe(200);
     expect(await intents.json()).toEqual([]);
+
+    const scratchList = await post('/builder/storage', builderToken, {
+      method: 'listScratchFiles',
+      args: {},
+    });
+    expect(scratchList.status).toBe(200);
+    expect(await scratchList.json()).toEqual([]);
+
+    const scratchSave = await post('/builder/storage', builderToken, {
+      method: 'saveScratchFile',
+      args: { input: { path: 'probe.md', content: 'preflight', size: 9 }, actor: 'builder' },
+    });
+    expect(scratchSave.status).toBe(200);
   });
 
   // The regression itself: the credential the container actually holds is NOT
@@ -136,7 +142,7 @@ describe('POST /builder/storage — the builder capture surface', () => {
   });
 
   // INVARIANT: authentication is not authorization. A valid builder token is a
-  // key to FOUR methods, not to the Storage interface.
+  // key to SIX methods, not to the Storage interface.
   test('a non-allowlisted storage method is a 403, not a 200', async () => {
     const resp = await post('/builder/storage', builderToken, { method: 'saveTask', args: {} });
     expect(resp.status).toBe(403);

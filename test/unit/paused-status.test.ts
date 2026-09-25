@@ -148,6 +148,26 @@ describe('parkTaskPaused', () => {
     expect(await parkTaskPaused(storage, taskId, 'system')).toBe('conflict');
   });
 
+  // INVARIANT (sync restores what it found): a side-channel turn may carry a
+  // status of its own to put back — today a sync that found the task
+  // `submitted`. Without this the reconciler's park sent every synced task with
+  // an open PR to `blocked`, dropping it out of the review queue.
+  test('restores a side-channel turn’s status when nothing is owed', async () => {
+    const taskId = await workingTaskWith();
+    expect(await parkTaskPaused(storage, taskId, 'system', { restore: 'submitted' })).toBe('submitted');
+    expect((await storage.getTask(taskId))!.status).toBe('submitted');
+  });
+
+  // INVARIANT (violations-are-the-source-of-truth): a DERIVED `conflict` outranks
+  // a restored status. `conflict` gates `lazy accept` on a decision the reviewer
+  // still owes, and it may only ever be cleared by the derivation — never by a
+  // side-channel turn putting an older label back.
+  test('a pending violation set outranks the restored status', async () => {
+    const taskId = await workingTaskWith(PENDING);
+    expect(await parkTaskPaused(storage, taskId, 'system', { restore: 'submitted' })).toBe('conflict');
+    expect((await storage.getTask(taskId))!.status).toBe('conflict');
+  });
+
   // A park that cannot read the turns must not strand the task in `working`.
   // Falling back to `blocked` is exactly what every one of these call sites did
   // before — and the unblock gate still enforces the pending set from storage,

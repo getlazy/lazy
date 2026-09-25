@@ -11,7 +11,6 @@
 import { describe, test, expect } from 'bun:test';
 import {
   PROTECTED_MARKER,
-  APPROVAL_PENDING_MARKER,
   contextIsInert,
   protectionMarkers,
   protectionSummary,
@@ -32,7 +31,7 @@ function status(over: Partial<TaskProtectionStatus> = {}): TaskProtectionStatus 
     taskGate: null,
     branchGate: null,
     targetBranch: 'main',
-    pendingApproval: null,
+    pendingReview: null,
     ...over,
   };
 }
@@ -98,16 +97,18 @@ describe('protectionMarkers', () => {
     expect(protectionMarkers(branchGated)).toBe(PROTECTED_MARKER);
   });
 
-  test('a pending approval adds the approval marker', () => {
-    const s = status({ ...branchGated, pendingApproval: { approvedAt: '2026-08-04T00:00:00Z' } });
-    expect(protectionMarkers(s)).toBe(`${PROTECTED_MARKER}${APPROVAL_PENDING_MARKER}`);
+  // A pending builder REVIEW is text awaiting the human's accept, not a state
+  // of the gate — the marker stays [P] alone. (The pre-v0.22 [A] marker
+  // reported a stored `lazy approve`; that store no longer exists.)
+  test('a pending review does not change the marker', () => {
+    const s = status({ ...branchGated, pendingReview: { actor: 'builder', recordedAt: '2026-08-04T00:00:00Z' } });
+    expect(protectionMarkers(s)).toBe(PROTECTED_MARKER);
   });
 
   // These land inside padded, width-computed columns and in output scripts grep.
   // A shield emoji is two columns wide in some terminals and zero in others.
-  test('markers are ASCII', () => {
+  test('marker is ASCII', () => {
     expect(PROTECTED_MARKER).toBe('[P]');
-    expect(APPROVAL_PENDING_MARKER).toBe('[A]');
   });
 });
 
@@ -135,14 +136,15 @@ describe('protectionAdvice', () => {
   test('tells the reader who must approve, and how', () => {
     const lines = protectionAdvice(branchGated, 'abc123');
     expect(lines.join('\n')).toContain('the repo default branch');
-    expect(lines.join('\n')).toContain('lazy approve abc123');
+    expect(lines.join('\n')).toContain('lazy accept abc123');
+    expect(lines.join('\n')).toContain('passphrase');
   });
 
-  test('reports a recorded approval as pending instead of demanding another', () => {
-    const s = status({ ...branchGated, pendingApproval: { approvedAt: '2026-08-04T00:00:00Z' } });
+  test('reports a captured builder review as waiting for the accept', () => {
+    const s = status({ ...branchGated, pendingReview: { actor: 'builder', recordedAt: '2026-08-04T00:00:00Z' } });
     const text = protectionAdvice(s, 'abc123').join('\n');
-    expect(text).toContain('Approval pending');
-    expect(text).not.toContain('No approval recorded');
+    expect(text).toContain('review by builder');
+    expect(text).toContain('attaches it to the merge');
   });
 
   // A protected_tasks entry resolves to a branch at decision time, so an
@@ -154,7 +156,7 @@ describe('protectionAdvice', () => {
 
   test('an ungated listed task gets no approval instruction', () => {
     const s = status({ enabled: false, gated: false, taskGate: { listedAs: 'my-task', armed: true } });
-    expect(protectionAdvice(s, 'abc123').join('\n')).not.toContain('lazy approve');
+    expect(protectionAdvice(s, 'abc123').join('\n')).not.toContain('passphrase');
   });
 });
 
@@ -164,12 +166,12 @@ describe('protectionHeadline', () => {
   });
 
   test('names the target branch and the required action', () => {
-    expect(protectionHeadline(branchGated)).toBe('[P] protected (merges into `main`) — needs `lazy approve`');
+    expect(protectionHeadline(branchGated)).toBe('[P] protected (merges into `main`) — accept prompts for the passphrase');
   });
 
-  test('reports a pending approval', () => {
-    const s = status({ ...taskGated, pendingApproval: { approvedAt: '2026-08-04T00:00:00Z' } });
-    expect(protectionHeadline(s)).toBe('[P] protected (task gate) — approval pending');
+  test('a pending review does not change the headline', () => {
+    const s = status({ ...taskGated, pendingReview: { actor: 'builder', recordedAt: '2026-08-04T00:00:00Z' } });
+    expect(protectionHeadline(s)).toBe('[P] protected (task gate) — accept prompts for the passphrase');
   });
 });
 
@@ -179,24 +181,24 @@ describe('protectionToJson', () => {
   test('carries the full shape with null-safe fields', () => {
     const json = protectionToJson(status());
     expect(Object.keys(json).sort()).toEqual([
-      'approval_pending', 'branch_gate', 'enabled', 'gated', 'markers', 'summary', 'target_branch', 'task_gate',
+      'branch_gate', 'enabled', 'gated', 'markers', 'pending_review', 'summary', 'target_branch', 'task_gate',
     ]);
     expect(json.task_gate).toBeNull();
     expect(json.branch_gate).toBeNull();
-    expect(json.approval_pending).toBeNull();
+    expect(json.pending_review).toBeNull();
   });
 
   test('snake_cases the gate details', () => {
     const s = status({
       ...taskGated,
       branchGate: { branch: 'main', source: 'default-branch' },
-      pendingApproval: { approvedAt: '2026-08-04T00:00:00Z' },
+      pendingReview: { actor: 'builder', recordedAt: '2026-08-04T00:00:00Z' },
     });
     const json = protectionToJson(s);
     expect(json.task_gate).toEqual({ listed_as: 'my-task', armed: true });
     expect(json.branch_gate).toEqual({ branch: 'main', source: 'default-branch' });
-    expect(json.approval_pending).toEqual({ approved_at: '2026-08-04T00:00:00Z' });
-    expect(json.markers).toBe('[P][A]');
+    expect(json.pending_review).toEqual({ actor: 'builder', recorded_at: '2026-08-04T00:00:00Z' });
+    expect(json.markers).toBe('[P]');
   });
 });
 
@@ -207,12 +209,13 @@ describe('review header', () => {
     commits: [],
     unseenComments: [],
     followUps: [],
+    raisedItems: [],
     protection,
   } as unknown as ReviewData);
 
   test('appends the protection headline last, so existing fields keep their place', () => {
     const line = buildStatusLine(reviewData(branchGated));
-    expect(line.endsWith('[P] protected (merges into `main`) — needs `lazy approve`')).toBe(true);
+    expect(line.endsWith('[P] protected (merges into `main`) — accept prompts for the passphrase')).toBe(true);
   });
 
   // INVARIANT: additive. An unprotected project's review header is what it was.

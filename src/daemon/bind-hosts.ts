@@ -22,8 +22,9 @@
  * exposure beyond what daemon-bind-localhost intended.
  */
 import { networkInterfaces, type NetworkInterfaceInfo } from 'os';
+import { spawnSyncUnsupervised } from '../utils/spawn';
 import type { RunnerType } from '../config/types';
-import { DEFAULT_SERVER_BIND } from '../config/constants';
+import { DEFAULT_SERVER_BIND, DEFAULT_PROXY_BIND } from '../config/constants';
 
 /** Runner types that launch workloads inside containers (vs. host processes). */
 export function isContainerRunner(runnerType: RunnerType): boolean {
@@ -49,21 +50,57 @@ const BRIDGE_INTERFACE_NAMES = ['docker0', 'podman0', 'cni-podman0'];
  */
 export function detectContainerBridgeHosts(
   interfaces: NodeJS.Dict<NetworkInterfaceInfo[]> = networkInterfaces(),
+  readIpv4Addrs: (iface: string) => string[] = ipv4AddrsFromIpCommand,
 ): string[] {
   const hosts: string[] = [];
   for (const name of BRIDGE_INTERFACE_NAMES) {
     const addrs = interfaces[name];
-    if (!addrs) continue;
-    for (const addr of addrs) {
-      // The bridge gateway is a real (non-internal) IPv4 host interface address.
-      // `family` is 'IPv4' on Bun/modern Node but historically was the number 4.
-      const isIpv4 = addr.family === 'IPv4' || (addr.family as unknown as number) === 4;
-      if (isIpv4 && !addr.internal && !hosts.includes(addr.address)) {
-        hosts.push(addr.address);
+    if (addrs) {
+      for (const addr of addrs) {
+        // The bridge gateway is a real (non-internal) IPv4 host interface address.
+        // `family` is 'IPv4' on Bun/modern Node but historically was the number 4.
+        const isIpv4 = addr.family === 'IPv4' || (addr.family as unknown as number) === 4;
+        if (isIpv4 && !addr.internal && !hosts.includes(addr.address)) {
+          hosts.push(addr.address);
+        }
       }
+      continue;
+    }
+    // MEASURED (smolvm fleet demo, run 5): a bridge with NO container attached
+    // is NO-CARRIER — administratively up, operationally down — and
+    // `os.networkInterfaces()` (libuv: IFF_UP && IFF_RUNNING) omits it, so a
+    // daemon that starts on a fresh host, before its first container exists,
+    // saw no bridge, bound loopback only, and every container it later launched
+    // was refused. The address is assigned regardless of carrier, so ask the
+    // kernel for it directly.
+    for (const address of readIpv4Addrs(name)) {
+      if (!hosts.includes(address)) hosts.push(address);
     }
   }
   return hosts;
+}
+
+/** `ip -4 -o addr show dev <iface>` → its IPv4 addresses; empty when there is no such interface or no `ip`. */
+export function ipv4AddrsFromIpCommand(iface: string): string[] {
+  if (process.platform !== 'linux') return [];
+  try {
+    const result = spawnSyncUnsupervised(['ip', '-4', '-o', 'addr', 'show', 'dev', iface], { timeout: 5_000 });
+    if (result.exitCode !== 0) return [];
+    return parseIpAddrOutput(result.stdout.toString());
+  } catch {
+    // No `ip` binary (or it could not be spawned): the interface list above is
+    // all there is, which is the pre-existing behaviour.
+    return [];
+  }
+}
+
+/** The `inet` addresses in `ip -4 -o addr show` output. */
+export function parseIpAddrOutput(output: string): string[] {
+  const out: string[] = [];
+  for (const m of output.matchAll(/\binet (\d{1,3}(?:\.\d{1,3}){3})\//g)) {
+    if (!out.includes(m[1]!)) out.push(m[1]!);
+  }
+  return out;
 }
 
 export interface BindHostResolution {
@@ -98,16 +135,57 @@ export function resolveDaemonBindHosts(opts: {
   platform: NodeJS.Platform;
   runnerType: RunnerType;
   interfaces?: NodeJS.Dict<NetworkInterfaceInfo[]>;
+  readIpv4Addrs?: (iface: string) => string[];
 }): BindHostResolution {
-  const { configBind, platform, runnerType } = opts;
+  return resolveBindHosts({ ...opts, defaultBind: DEFAULT_SERVER_BIND });
+}
 
-  if (configBind !== DEFAULT_SERVER_BIND) {
+/**
+ * The same resolution for the CREDENTIAL PROXY, which a task container dials
+ * at `http://host.docker.internal:<port>` (proxyBaseUrlForRunner) — the very
+ * address that is the bridge gateway on native Linux. The proxy's default bind
+ * is loopback and managed mode pins it there; both are kept, and the bridge
+ * gateway is bound IN ADDITION under exactly the daemon port's conditions.
+ *
+ * Security posture is unchanged (container-credential-and-egress-posture):
+ * the proxy authenticates every request by placeholder LOOKUP, not by where
+ * it came from, and the container bridge is precisely the set of clients the
+ * proxy exists to serve. `0.0.0.0` is never chosen here; an explicit
+ * `[proxy] bind` is respected exactly.
+ */
+export function resolveProxyBindHosts(opts: {
+  configBind: string;
+  platform: NodeJS.Platform;
+  runnerType: RunnerType;
+  interfaces?: NodeJS.Dict<NetworkInterfaceInfo[]>;
+  readIpv4Addrs?: (iface: string) => string[];
+}): BindHostResolution {
+  return resolveBindHosts({ ...opts, defaultBind: DEFAULT_PROXY_BIND });
+}
+
+function resolveBindHosts(opts: {
+  configBind: string;
+  defaultBind: string;
+  platform: NodeJS.Platform;
+  runnerType: RunnerType;
+  interfaces?: NodeJS.Dict<NetworkInterfaceInfo[]>;
+  readIpv4Addrs?: (iface: string) => string[];
+}): BindHostResolution {
+  const { configBind, defaultBind, platform, runnerType } = opts;
+
+  if (configBind !== defaultBind) {
     return { hosts: [configBind], bridgeUnreachable: false };
   }
 
-  const hosts = [DEFAULT_SERVER_BIND];
+  const hosts = [defaultBind];
   if (platform === 'linux' && isContainerRunner(runnerType)) {
-    const bridgeHosts = detectContainerBridgeHosts(opts.interfaces);
+    // Injected interfaces are a test's whole world: no kernel fallback unless
+    // the test injects that too, or a docker0 on the machine running the suite
+    // would leak into a "no bridge" case.
+    const bridgeHosts = detectContainerBridgeHosts(
+      opts.interfaces,
+      opts.readIpv4Addrs ?? (opts.interfaces ? () => [] : undefined),
+    );
     for (const h of bridgeHosts) {
       if (!hosts.includes(h)) hosts.push(h);
     }

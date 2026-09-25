@@ -1,9 +1,11 @@
-import { requireStorage, requireLazyRoot, shortId, displayId, displayIdFor, parseFlags, validateModel, validateCode, resolveTaskOrExit, MAX_TASK_CODE_LENGTH } from '../helpers';
+import { requireStorage, requireLazyRoot, parseFlags, validateModel, resolveTaskOrExit } from '../helpers';
+import { requireActorIdentity } from '../identity-preflight';
+import { shortId, displayId, displayIdFor, validateCode, MAX_TASK_CODE_LENGTH } from '../../task/identity';
 import { loadConfig } from '../../config/loader';
-import { resolveAgentForNewTask } from '../../agent/task-agent';
+import { resolveAgentForNewTaskFromConfig } from '../../agent/task-agent';
 import { openEditor, removeRecoveryFile, readStdinIfPiped, requireTTY } from '../editor';
-import { buildTurnHistoryContext } from './shared';
-import { theme } from '../theme';
+import { buildTurnHistoryContext } from '../../task/turn-context';
+import { theme } from '../../render/theme';
 import type { Task } from '../../types';
 import type { Storage } from '../../storage/interface';
 import { logger } from '../../utils/logger';
@@ -95,6 +97,10 @@ export async function commandRework(args: string[]): Promise<void> {
     reworkUsage();
     process.exit(1);
   }
+
+  // Before the rework prompt is typed: the daemon refuses a write it cannot
+  // attribute, and a refusal must never cost the human what they wrote.
+  await requireActorIdentity();
 
   const goalOverride = parsed.flags.get('goal') as string | undefined;
   const promptFlag = parsed.flags.get('prompt') as string | undefined;
@@ -220,16 +226,21 @@ export async function commandRework(args: string[]): Promise<void> {
 
     // Create new task (with parent if resolved). Like redo, a rework is another
     // pass at the original's work, so it carries the original's agent over.
+    const [config, projectSettings] = await Promise.all([
+      loadConfig(requireLazyRoot()),
+      storage.getProjectSettings(),
+    ]);
     const newTask = await storage.createTask(
       newGoal,
       parentTaskId,
       undefined,
       undefined,
       undefined,
-      resolveAgentForNewTask({
-        inheritFrom: originalTask,
-        configDefault: (await loadConfig(requireLazyRoot())).agent.agent_id,
-      }),
+      resolveAgentForNewTaskFromConfig(
+        { inheritFrom: originalTask },
+        config.agent,
+        projectSettings,
+      ).agentId,
     );
 
     // Set prompt — CRITICAL: persist before anything else (never lose human feedback)

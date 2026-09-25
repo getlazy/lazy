@@ -269,15 +269,13 @@ describe('container mounts agree with the config they are given', () => {
     expect(sessionConfig).toContain('a1b2c3d4');
   });
 
-  // INVARIANT: task agents are structurally immune to this bug and must stay so.
-  // Their `/home/user/.claude.json` is NOT a host mount — it lives on the
-  // container's own filesystem and is written per turn by the in-container
-  // supervisor from LAZY_DAEMON_CONFIG (src/supervisor/mcp-setup.ts), which is
-  // this container's own mounted path. There is no shared host file for a
-  // second launch to clobber. If a future change starts mounting a host
-  // ~/.claude.json into agent containers, this test fails and the builder's
-  // per-launch discipline must be applied there too.
-  test('agent: no host ~/.claude.json is mounted, and the credential path is the env var', () => {
+  // INVARIANT: task agents mount the SANDBOX copy of ~/.claude.json, never the
+  // human's host file. The sandbox file is seeded once from host UI preferences
+  // (theme, onboarding) and persisted per task; prepareTurnMcp merges the lazy
+  // MCP entry each turn from LAZY_DAEMON_CONFIG. Mounting the host file would
+  // let an agent clobber the human's real config — see src/task/claude-home.ts.
+  test('agent: mounts the sandbox ~/.claude.json and the credential path is the env var', () => {
+    const sandboxPath = `${ROOT}/.lazy/worktrees/a/.lazy-task-sandbox`;
     const args = buildSupervisorDockerArgs({
       binary: 'docker',
       containerName: 'lazy-task-a',
@@ -285,18 +283,22 @@ describe('container mounts agree with the config they are given', () => {
       repoRoot: ROOT,
       sandbox: {
         worktreePath: `${ROOT}/.lazy/worktrees/a`,
-        sandboxPath: `${ROOT}/.lazy/worktrees/a/.lazy-task-sandbox`,
+        sandboxPath,
       } as never,
       protocolDir: `${ROOT}/.lazy/tmp/protocol-a`,
       agentBinaryPath: '/usr/local/share/lazy-agent',
       authEnvVars: [],
       customMountArgs: [],
+      taskEnvArgs: [],
       gitMountArgs: [],
+      publishArgs: [],
+      runArgs: [],
       wrapperScript: 'sleep 1',
       daemonConfigPath: TOKEN,
     });
 
-    expect(args.some(a => a.includes(':/home/user/.claude.json'))).toBe(false);
+    expect(args).toContain(`${sandboxPath}/.claude.json:/home/user/.claude.json`);
+    expect(args.some(a => a.startsWith(`${HOME_DIR}/.claude.json:`))).toBe(false);
     expect(args).toContain(`${TOKEN}:${TOKEN}:ro`);
     expect(args).toContain(`LAZY_DAEMON_CONFIG=${TOKEN}`);
   });

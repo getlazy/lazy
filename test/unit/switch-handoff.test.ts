@@ -12,7 +12,7 @@ import { mkdtemp, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
-import { buildTurnHistoryContext } from '../../src/cli/commands/shared';
+import { buildTurnHistoryContext } from '../../src/task/turn-context';
 import {
   buildAgentSwitchHandoffContext,
   buildTaskOrientationContext,
@@ -138,17 +138,24 @@ describe('buildTaskOrientationContext / handoff', () => {
     expect(text).toContain('2 conflict-free upstream sync turn(s)');
   });
 
-  test('omits a conflict-free merge whose tree equals a parent', async () => {
-    // Create a side branch and merge it with no conflicts (FF or tree-equivalent).
+  test('a merge is represented by its merge commit, never by the line it merged', async () => {
+    // INVARIANT: orientation walks first-parent, and every commit on that walk
+    // is listed. A merge therefore contributes exactly one line — the merge
+    // commit — and the commits it brought in are not listed as this branch's
+    // work. This replaced a filter that DROPPED merges whose tree equalled a
+    // parent. That filter was written against a reachability walk, where the
+    // merged-in commits appeared individually and the merge line was pure
+    // noise. Under first-parent the merge commit is the only thing standing
+    // for that line, so omitting it silently erased the work from the handoff
+    // — a fresh agent was briefed on a branch with a hole in it.
     git(dir, 'checkout', '-b', 'side');
     await writeFile(join(dir, 'side.ts'), 'side\n');
     git(dir, 'add', '.');
     git(dir, 'commit', '-m', 'side work');
-    git(dir, 'checkout', '-'); // back to previous branch
-    // Non-FF merge so we get a merge commit; content comes entirely from the side parent
-    // when merging into a branch that has no divergent changes… actually after
-    // checkout - we are on the original branch which has 'add feature'. Side has
-    // that plus side.ts. Merge creates a merge commit whose tree equals side's tip.
+    git(dir, 'checkout', '-'); // back to the original branch
+    // --no-ff so there is a real merge commit. Its tree equals side's tip,
+    // because this branch had nothing of its own to combine — exactly the
+    // shape the old filter dropped.
     git(dir, 'merge', '--no-ff', '-m', 'Merge side', 'side');
 
     const text = await buildTaskOrientationContext({
@@ -156,11 +163,15 @@ describe('buildTaskOrientationContext / handoff', () => {
       gitStartSha: baseSha,
       worktreePath: dir,
     });
-    // The tree-equivalent merge should be omitted; side work + feature remain.
-    expect(text).toMatch(/Conflict-free merge commits omitted from the list below: [1-9]/);
-    expect(text).toContain('side work');
+
+    // The merge stands for what it brought in...
+    expect(text).toContain('Merge side');
+    // ...and this branch's own commit is still listed.
     expect(text).toContain('add feature');
-    expect(text).not.toContain('Merge side');
+    // The merged-in branch's commits are NOT this branch's work.
+    expect(text).not.toContain('side work');
+    // The old filter's accounting line is gone with it.
+    expect(text).not.toContain('omitted from the list below');
   });
 
   test('buildAgentSwitchHandoffContext wraps template + history + orientation', async () => {

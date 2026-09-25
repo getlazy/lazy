@@ -6,7 +6,7 @@
  * a hosted forge, or anything else that can accept branches and comments.
  */
 
-import type { Task } from '../types';
+import type { Task, CommentForge, CommentExternalKind } from '../types';
 import type { Storage } from '../storage';
 import type { DestinationRestoreConflict } from '../git/operations';
 
@@ -98,6 +98,18 @@ export interface MergeOptions {
    * deterministic goal + commit-subjects message.
    */
   fidelityBody?: string;
+  /**
+   * This merge RESUMES an accept that died after the human said accept. The work
+   * may already be on the target: a merge that would change nothing then answers
+   * `merged` with `alreadyLanded`, instead of the fresh-accept refusal "squash
+   * merge produced no commit". Never set on a fresh accept — there, a no-op
+   * squash still means the branch is net-empty. Hosted drivers honour it too:
+   * their ancestry check (`isBranchMerged`) cannot see a squash that already
+   * landed, so on a resume they also ask the trees (`changesAlreadyOnRemoteTarget`
+   * — would merging the branch into the remote target change nothing?) and
+   * answer `alreadyLanded` when it would not.
+   */
+  resume?: boolean;
 }
 
 /**
@@ -126,7 +138,7 @@ export interface AcceptGateWarning {
  * destination worktree's owning task.
  */
 export type MergeResult =
-  | { status: 'merged'; metadata?: Record<string, string>; restoreConflict?: DestinationRestoreConflict }
+  | { status: 'merged'; metadata?: Record<string, string>; restoreConflict?: DestinationRestoreConflict; alreadyLanded?: boolean }
   | { status: 'pending'; reason: string; metadata?: Record<string, string> }
   | { status: 'failed'; error: string; isConflict?: boolean; metadata?: Record<string, string> };
 
@@ -138,6 +150,11 @@ export interface PublishResult {
 
 /** A comment fetched from an external review system. */
 export interface RemoteComment {
+  /** Which forge the item lives on. With kind and id, its identity. */
+  forge: CommentForge;
+  /** Which kind of forge item — ids are unique only within a kind. */
+  kind: CommentExternalKind;
+  /** The forge's own id for the item (no namespace prefix). */
   id: string;
   body: string;
   author: string;
@@ -217,16 +234,39 @@ export interface WaitForChecksOptions {
   pollInterval?: number;
 }
 
+/** Options for {@link RepositoryDriver.markReadyForReview}. */
+export interface MarkReadyOptions {
+  /** Explicit base for a NEW PR/MR (see markReadyForReview). */
+  baseBranch?: string;
+}
+
+/** An open PR/MR found on the forge by its head branch. */
+export interface OpenReview {
+  url: string;
+  /** The branch the PR/MR merges into. */
+  baseBranch: string;
+  /** Task metadata that records it — the keys markReadyForReview would write. */
+  metadata: Record<string, string>;
+}
+
 /** Result returned by a driver's importUrl method. */
 export interface ImportResult {
   /** Task goal (e.g., PR title) */
   goal: string;
+  /**
+   * The PR/MR description body, when the driver has one.
+   *
+   * Not stored on the task: it is raw material for the link-time description
+   * one-shot (src/daemon/link-describe.ts), which turns it — together with the
+   * commits, the diff and the imported comments — into the task's prompt.
+   */
+  description?: string;
   /** Existing branch name to adopt */
   branch: string;
   /** Driver-specific metadata (e.g., PR number, URL) */
   metadata: Record<string, string>;
-  /** Existing comments to import as notes */
-  comments?: string[];
+  /** Existing comments to import as notes, with their forge identity. */
+  comments?: RemoteComment[];
 }
 
 /**
@@ -305,11 +345,67 @@ export interface RepositoryDriver {
    * Called after the first agent turn completes (task transitions to blocked).
    * Returns metadata to store on the task (e.g., PR URL/number if PR was created).
    * No-op for local driver.
+   *
+   * `opts.baseBranch` names the base of a NEW PR/MR explicitly. It exists for
+   * one caller: an explicit `lazy submit` by a person on a task that
+   * integrates into an intermediate (task) branch. Without it the base is
+   * derived from the task's target and a task-branch target is refused — by
+   * default lazy never opens a PR/MR for an intermediate branch on its own.
+   * It never re-targets a PR/MR that already exists.
    */
-  markReadyForReview(task: Task): Promise<{ metadata?: Record<string, string> }>;
+  markReadyForReview(task: Task, opts?: MarkReadyOptions): Promise<{ metadata?: Record<string, string> }>;
 
-  /** Fetch comments left on this task's branch since the given timestamp. */
-  syncComments(task: Task, since: string): Promise<RemoteComment[]>;
+  /**
+   * The SHA `branch` points at on the remote, or null when the remote has no
+   * such branch. Asks the remote (`git ls-remote`), never a local tracking
+   * ref, which can be stale or missing. Throws when the remote cannot be
+   * asked, so "not there" is never confused with "could not tell".
+   *
+   * LocalDriver: always null (there is no remote).
+   */
+  remoteBranchHead(branch: string): Promise<string | null>;
+
+  /**
+   * The OPEN PR/MR whose head is `branch`, if one exists — including one a
+   * person opened by hand on the forge. Lightweight (no comment import), so
+   * `lazy submit` can adopt it instead of failing to open a second one.
+   * Closed and merged PRs/MRs are never returned. Throws when the forge
+   * cannot be asked.
+   *
+   * LocalDriver: always null.
+   */
+  findOpenReviewForBranch(branch: string): Promise<OpenReview | null>;
+
+  /**
+   * The base branch of the PR/MR this task records, in whatever state it is
+   * (open, merged, closed), or null when the task records none. Read from the
+   * FORGE — a PR's base is a forge-side fact that can drift from the task's
+   * target (a reparent, a person editing the PR). Throws when the forge cannot
+   * be asked.
+   *
+   * LocalDriver: always null.
+   */
+  getReviewBase(task: Task): Promise<string | null>;
+
+  /**
+   * Change the base of the PR/MR this task records to `base` on the forge
+   * (`gh pr edit --base`, `glab mr update --target-branch`). Called only when a
+   * reparent moved the task's target under an open PR (src/daemon/review-retarget.ts).
+   * Throws when the forge refuses or cannot be asked; the caller closes the PR
+   * instead rather than leave it merging somewhere the task no longer goes.
+   *
+   * LocalDriver: never called (it records no PR); throws if it is.
+   */
+  retargetReview(task: Task, base: string): Promise<void>;
+
+  /**
+   * Fetch comments (and review summaries) left on this task's PR/MR. With
+   * `since`, only those written at or after it: a display window for the turn
+   * prompt. Without it, everything visible. Importers must omit it and dedup
+   * by id, because an item's timestamp is when it was written, not when it
+   * became visible, so no timestamp watermark can be trusted to import it.
+   */
+  syncComments(task: Task, since?: string): Promise<RemoteComment[]>;
 
   /**
    * Get the current state of a task's PR/MR on the remote.
@@ -317,9 +413,6 @@ export interface RepositoryDriver {
    * No-op (returns null) for local driver.
    */
   getPRState(task: Task): Promise<PRState | null>;
-
-  /** Publish a turn summary so external reviewers can follow progress. */
-  postTurnSummary(task: Task, content: string): Promise<void>;
 
   /**
    * Update the lazy-owned, delimited section of the PR/MR body with a
@@ -341,28 +434,30 @@ export interface RepositoryDriver {
   updateRemoteBody(task: Task, summary: string): Promise<void>;
 
   /**
-   * Post an approving review on the task's PR/MR with the given reason.
-   * For GitHub: submits a PR review with event "APPROVE" and the reason as body.
-   * Falls back to a regular PR comment if the review fails.
-   * No-op for local driver or when no PR exists.
+   * Submit an approving review so the forge will let the merge through.
    *
-   * Returns null on success, or a warning message string if neither the review
-   * nor the comment fallback could be posted. The caller should display the
-   * warning but not fail the accept.
-   */
-  postAcceptReview(task: Task, reason: string): Promise<string | null>;
-
-  /**
-   * Post a requesting-changes review on the task's PR/MR with the given reason.
-   * For GitHub: submits a PR review with event "REQUEST_CHANGES" and the reason as body.
-   * Falls back to a regular PR comment if the review fails.
-   * No-op for local driver or when no PR exists.
+   * INVARIANT: this is the ONLY review or comment lazy writes to a PR/MR, and
+   * it runs ONLY under `[remote] auto_approve` on a protected target — where
+   * the forge refuses the merge without an approval, so the write is the
+   * mechanism, not narration. Everything else lazy used to post (review
+   * findings, accept/reject reviews) was removed on 2026-09-21: forge
+   * notifications for lazy's own bookkeeping annoyed the humans watching the
+   * PR. Do not add a second write path here.
    *
-   * Returns null on success, or a warning message string if neither the review
-   * nor the comment fallback could be posted. The caller should display the
-   * warning but not fail the reject.
+   * For GitHub: submits a PR review with event "APPROVE" and the reason as
+   * body. There is NO comment fallback — a comment is not an approval, so it
+   * would not unblock the merge, and posting one is the thing this method's
+   * invariant forbids. An implementation that cannot approve reports that and
+   * writes nothing. No-op for the local driver or when no PR exists.
+   *
+   * Returns null when the approval landed, and null for a forge refusing a
+   * SELF-approval (GitHub's 422): that is the expected outcome for the sole
+   * developer `auto_approve` is aimed at, so it is logged at debug and the
+   * accept carries on — warning about it on every accept is noise, not news.
+   * Any other failure returns a warning string the caller should display
+   * without failing the accept.
    */
-  postRejectReview(task: Task, reason: string): Promise<string | null>;
+  approveForMerge(task: Task, reason: string): Promise<string | null>;
 
   /** Clean up external resources when a task is rejected or closed. */
   cleanup(branch: string): Promise<void>;
@@ -445,6 +540,19 @@ export interface RepositoryDriver {
   resolveUpstreamRef(parentBranch: string, worktreePath: string): Promise<string>;
 
   /**
+   * The ref name {@link resolveUpstreamRef} resolves `parentBranch` to, with NO
+   * network I/O: `<remote>/<branch>` for a hosted driver, the branch itself for
+   * a local one. `resolveUpstreamRef` is this name plus the fetch that refreshes
+   * it.
+   *
+   * Read-only surfaces — above all a task diff — need the SAME answer the task
+   * launcher branched from, but must not fetch: rendering a diff is not a
+   * network operation, and a three-dot diff is merge-base-based, so a slightly
+   * stale remote-tracking ref gives an identical result.
+   */
+  upstreamRefName(parentBranch: string): string;
+
+  /**
    * After a successful accept, attempt to fast-forward the local parent branch
    * to match the remote. This prevents the next task from starting on a stale
    * SHA and showing a confusing merge commit on turn 1.
@@ -479,31 +587,16 @@ export interface RepositoryDriver {
   fetchRemoteState(root: string, branchesToUpdate?: string[]): Promise<void>;
 
   /**
-   * Get the timestamp of the last comment sync from task metadata.
-   * Each driver resolves its own metadata key names (with backward compat).
+   * Get the sequence number of the last turn already reflected in the PR/MR
+   * body's lazy-owned fidelity section, from task metadata. Returns -1 when
+   * nothing has been reflected yet. Drivers resolve their own metadata key
+   * names, reading the pre-fidelity "posted turn" keys as fallbacks so
+   * existing stores keep their progress.
    */
-  getLastCommentSyncedAt(task: Task): string | undefined;
+  getLastFidelityTurnSeq(task: Task): number;
 
-  /** Get the canonical metadata key for storing the last comment sync timestamp. */
-  commentSyncedAtKey(): string;
-
-  /**
-   * Get the sequence number of the last posted turn from task metadata.
-   * Returns -1 if no turns have been posted.
-   */
-  getLastPostedTurnSeq(task: Task): number;
-
-  /** Get the canonical metadata key for storing the last posted turn sequence. */
-  postedTurnSeqKey(): string;
-
-  /**
-   * Get the timestamp of the last posted note from task metadata.
-   * Each driver resolves its own metadata key names (with backward compat).
-   */
-  getLastPostedNoteAt(task: Task): string | undefined;
-
-  /** Get the canonical metadata key for storing the last posted note timestamp. */
-  postedNoteAtKey(): string;
+  /** Get the canonical metadata key for the fidelity turn watermark. */
+  fidelityTurnSeqKey(): string;
 
   /**
    * Get the stored CI failure signature from task metadata.
@@ -556,7 +649,9 @@ export interface RepositoryDriver {
 
   /**
    * Check if a note's content was originally imported from the remote.
-   * Used to avoid echoing imported comments back to the remote.
+   * Read by auto-react to keep lazy's own imported comments out of the
+   * human-comment feed: a PR/MR comment lazy imported must never be treated
+   * as fresh human feedback, or auto-react would react to it in a loop.
    */
   isImportedComment(noteContent: string): boolean;
 
@@ -577,4 +672,14 @@ export interface RepositoryDriver {
 
   /** Import a resource from a URL (e.g., adopt an existing PR). */
   importUrl?(url: string, opts: ImportOptions): Promise<ImportResult>;
+
+  /**
+   * Find an open PR/MR for `branch` and import it the same way as importUrl.
+   * Returns null when none exists (or the driver has no forge). Used at
+   * `lazy link <branch>` time and by the daemon's later-PR-discovery pass.
+   *
+   * Must look up by the real git branch name — never `lazy/<task-ref>`.
+   * Linked tasks adopt someone else's branch; getBranchName() is the wrong ref.
+   */
+  findPullRequestForBranch?(branch: string): Promise<ImportResult | null>;
 }

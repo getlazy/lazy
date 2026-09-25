@@ -22,7 +22,7 @@
 
 import { join } from 'path';
 import { requireLazyRoot, requireStorage, parseFlags, type LineRange, sliceLines } from '../helpers';
-import { theme } from '../theme';
+import { theme } from '../../render/theme';
 import { docsFooter } from '../../docs/links';
 import { isTTY, promptYesNo } from '../editor';
 import { loadConfig } from '../../config/loader';
@@ -244,6 +244,14 @@ async function importSession(storage: Storage, session: CandidateSession): Promi
     // Parse from the root the session actually lives in — a session that only
     // exists in an isolation dir would be invisible to the shared-dir default.
     const conversation = await parseConversation(projectPath, sessionId, projectsDirRoot);
+    // Same rule as every other ingest path: a JSONL with no parseable messages is
+    // not a conversation. That is an empty shell Claude created before the first
+    // turn landed, or a session whose whole content was local-command scaffolding.
+    if (conversation.messages.length === 0) {
+      console.log(`Skipped ${sessionId.substring(0, 8)}  (no conversation content)`);
+      return;
+    }
+
     const summary = extractSummary(conversation);
     const stats = conversationStats(conversation);
 
@@ -329,13 +337,15 @@ export async function showConversationTranscript(storage: Storage, sessionIdPref
   outputLines.push(`  ${theme.label('Summary:')}  ${conv.summary}`);
   outputLines.push('');
 
-  // Interleaved messages
-  for (const msg of conv.messages) {
+  // Interleaved messages. Each carries its 1-based number: that is what
+  // `lazy conversations promote --from/--to` selects by, and a range is
+  // unusable if the transcript never says which message is which.
+  for (const [index, msg] of conv.messages.entries()) {
     const roleLabel = msg.role === 'user'
       ? theme.turnRole('human')
       : theme.turnRole('agent');
     const timestamp = msg.timestamp ? msg.timestamp.replace('T', ' ').substring(11, 19) : '';
-    outputLines.push(`${theme.separator('---')} ${roleLabel} ${timestamp ? `(${timestamp})` : ''} ${theme.separator('---')}`);
+    outputLines.push(`${theme.separator('---')} #${index + 1} ${roleLabel} ${timestamp ? `(${timestamp})` : ''} ${theme.separator('---')}`);
     outputLines.push(msg.text);
     outputLines.push('');
   }

@@ -1,5 +1,5 @@
 /**
- * `lazy review -i <task>` — interactive per-hunk review loop.
+ * `lazy browse -i <task>` — interactive per-hunk review loop.
  *
  * Walks the task's diff hunk-by-hunk. For each hunk the reviewer can:
  *   o  okay, advance
@@ -17,9 +17,8 @@ import { existsSync } from 'fs';
 import type { Storage } from '../../storage/interface';
 import type { Task, Session } from '../../types';
 import { getActor } from '../../constants';
-import { queryDiff, queryUnblockTask, queryAskTask } from '../../daemon/rpc-fallback';
-import { getWorktreePath } from '../helpers';
-import { getBranchName } from '../helpers';
+import { queryDiff, queryUnblockTask, queryAskTaskAwaited } from '../../daemon/rpc-fallback';
+import { getWorktreePath, getBranchName } from '../../task/identity';
 import { ansi } from '../../utils/ansi';
 import { RpcError } from '../../daemon/rpc-handlers';
 import { recoverMissingWorktreeWithFetch, branchExists } from '../../git/operations';
@@ -28,6 +27,7 @@ import { hunkHash } from '../../utils/hunk-hash';
 import reviewQaPromptTemplate from '../../prompts/review-qa.md' with { type: 'text' };
 import { loadTaskProtectionStatus, protectionHeadline } from '../../protection/status';
 import { logger } from '../../utils/logger';
+import { usagePauseOverrideEligibility } from '../human-terminal';
 
 /**
  * The one-line protection headline for the per-hunk review header, or null when
@@ -1050,40 +1050,23 @@ async function askAgent(
 
   try {
     const result = await Promise.race([
-      queryAskTask({
+      queryAskTaskAwaited({
         taskId,
         message: payload,
         effortOverride: ASK_EFFORT,
+        ...(await usagePauseOverrideEligibility()),
       }),
       abortPromise,
     ]);
     detachAbort();
     stopProgress();
     if (verbose) {
-      const total = Date.now() - t0;
-      // An older daemon (pre-timings) returns no `timings` field — degrade
-      // gracefully to just total so the ask doesn't hard-fail over telemetry.
-      if (!result.timings) {
-        console.log(`${ansi.dim}[verbose] ask: total=${total}ms (daemon missing timings — restart daemon)${ansi.reset}`);
-      } else {
-        const { daemon_ms, wait_ms, agent_ms } = result.timings;
-        // Layer breakdown:
-        //   agent       — claude process time (supervisor reports it)
-        //   supervisor  — container-side overhead (wait minus agent)
-        //   daemon      — prep/post around the supervisor wait
-        //   rpc         — CLI↔daemon wire + process handoff
-        const rpc = Math.max(0, total - daemon_ms);
-        const daemonOverhead = Math.max(0, daemon_ms - wait_ms);
-        const supervisorOverhead = agent_ms !== undefined
-          ? Math.max(0, wait_ms - agent_ms)
-          : undefined;
-        const parts: string[] = [];
-        if (agent_ms !== undefined) parts.push(`agent=${agent_ms}ms`);
-        if (supervisorOverhead !== undefined) parts.push(`supervisor=${supervisorOverhead}ms`);
-        else parts.push(`wait=${wait_ms}ms`);
-        parts.push(`daemon=${daemonOverhead}ms`, `rpc=${rpc}ms`, `total=${total}ms`);
-        console.log(`${ansi.dim}[verbose] ask: ${parts.join(' ')}${ansi.reset}`);
-      }
+      // One number, deliberately. The per-layer breakdown (agent / supervisor /
+      // daemon / rpc) came off a single blocking RPC that spanned the whole
+      // turn; an ask is now started and waited for separately, so the daemon
+      // handler's own wall-clock no longer contains the agent's at all and the
+      // old arithmetic would report overheads that are not real.
+      console.log(`${ansi.dim}[verbose] ask: total=${Date.now() - t0}ms${ansi.reset}`);
     }
     return result.answer.trim();
   } catch (err) {
@@ -1374,7 +1357,7 @@ export async function runInteractiveReview(
   try {
     console.log(`\n${ansi.bold}Interactive review: ${task.goal}${ansi.reset}`);
     // Same header fact as the full-screen review: if accepting this task will
-    // need `lazy approve`, say so before the reviewer starts approving hunks.
+    // prompt for the approval passphrase, say so before the reviewer starts approving hunks.
     const protectionLine = await protectionHeadlineForTask(storage, root, task);
     if (protectionLine) {
       console.log(`${ansi.fg.yellow}${protectionLine}${ansi.reset}`);
@@ -1591,7 +1574,7 @@ export async function runInteractiveReview(
           const result = await queryUnblockTask({
             taskId: task.id,
             message,
-            approvedFiles: [],
+            ...(await usagePauseOverrideEligibility()),
           });
           for (const w of result.warnings) console.log(w);
           console.log(`${ansi.fg.green}Task unblocked (turn ${result.turnNumber}).${ansi.reset}`);

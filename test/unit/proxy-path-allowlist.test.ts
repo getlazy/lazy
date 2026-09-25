@@ -117,6 +117,47 @@ describe('decideProxyPath — refusals', () => {
   });
 });
 
+describe('decideProxyPath — the openai tier', () => {
+  // INVARIANT: wire isolation. The openai tier gets the OpenAI inference
+  // surface and nothing Anthropic-shaped; the Anthropic tiers never open the
+  // OpenAI paths. This is what keeps each wire's traffic in front of its own
+  // extractor, and turns a cross-wired role config into an actionable 403.
+  test('OpenAI inference paths are allowed on the openai tier only', () => {
+    expect(decideProxyPath('POST', '/v1/chat/completions', 'openai')).toEqual({ allowed: true });
+    expect(decideProxyPath('POST', '/v1/responses', 'openai')).toEqual({ allowed: true });
+    expect(decideProxyPath('GET', '/v1/responses/resp_123', 'openai')).toEqual({ allowed: true });
+    for (const tier of ['primary', 'role'] as const) {
+      expect(decideProxyPath('POST', '/v1/chat/completions', tier).allowed).toBe(false);
+      expect(decideProxyPath('POST', '/v1/responses', tier).allowed).toBe(false);
+    }
+  });
+
+  test('Anthropic paths are refused on the openai tier', () => {
+    expect(decideProxyPath('POST', '/v1/messages', 'openai')).toEqual({
+      allowed: false,
+      reason: 'role-upstream-restricted',
+    });
+    expect(decideProxyPath('POST', '/v1/messages/count_tokens', 'openai').allowed).toBe(false);
+  });
+
+  test('model discovery and the reachability probe work on the openai tier', () => {
+    expect(decideProxyPath('GET', '/v1/models', 'openai')).toEqual({ allowed: true });
+    expect(decideProxyPath('HEAD', '/api/hello', 'openai')).toEqual({ allowed: true });
+  });
+
+  // INVARIANT: inference only — never an account/billing/admin surface, on any
+  // tier. These are real api.openai.com endpoints an agent's key must not reach.
+  test.each([
+    ['GET', '/v1/organization/usage'],
+    ['GET', '/v1/organization/projects'],
+    ['POST', '/v1/fine_tuning/jobs'],
+    ['GET', '/v1/files'],
+    ['DELETE', '/v1/models/gpt-5.2'],
+  ])('refuses account-surface %s %s on the openai tier', (method, path) => {
+    expect(decideProxyPath(method, path, 'openai').allowed).toBe(false);
+  });
+});
+
 describe('decideProxyPath — matching details', () => {
   test('is case-insensitive on the method only', () => {
     expect(decideProxyPath('post', '/v1/messages', 'primary')).toEqual({ allowed: true });
@@ -165,11 +206,24 @@ describe('refusal surfacing', () => {
 // surface grows, which is the point: growing it should require saying so.
 test('the forwarding surface is exactly the reviewed set', () => {
   expect(
-    PROXY_ALLOWED_ROUTES.map((r) => `${r.methods.join('/')} ${r.path}${r.prefix ? '/*' : ''}${r.onRoleUpstream ? ' [role]' : ''}`),
+    PROXY_ALLOWED_ROUTES.map((r) => `${r.methods.join('/')} ${r.path}${r.prefix ? '/*' : ''} [${r.tiers.join(',')}]`),
   ).toEqual([
-    'POST /v1/messages [role]',
-    'POST /v1/messages/count_tokens [role]',
-    'HEAD/GET /api/hello [role]',
-    'GET /v1/models/*',
+    'POST /v1/messages [primary,role]',
+    'POST /v1/messages/count_tokens [primary,role]',
+    'HEAD/GET /api/hello [primary,role,openai]',
+    'GET /v1/models/* [primary,openai]',
+    'POST /v1/chat/completions [openai]',
+    'GET/POST /v1/responses/* [openai]',
+    // SAYING SO, as this test requires. These two are the SAME OpenAI-wire
+    // inference and model-discovery surfaces as the entries above, in the
+    // spelling the ChatGPT subscription backend uses: it serves Codex at
+    // https://chatgpt.com/backend-api/codex, where the Responses API is
+    // <base>/responses with no /v1 segment (verified against codex-cli 0.152.1).
+    // The proxy forwards a request's path to its upstream UNCHANGED, so the
+    // alternative was a path rewrite — a worse trade, since the invariant that
+    // what the client asked for is what the upstream receives is what makes this
+    // list mean anything. openai tier only; no new capability reaches any tier.
+    'GET/POST /responses/* [openai]',
+    'GET /models/* [openai]',
   ]);
 });

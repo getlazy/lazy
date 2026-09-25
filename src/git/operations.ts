@@ -4,8 +4,28 @@ import { logger } from '../utils/logger';
 import { runGit } from '../utils/git';
 import { withRemoteRetry } from '../utils/retry';
 import { pathExists, ensureDir, stat, copyFile, chmod } from '../utils/fs';
+import { TaskMutex } from '../utils/task-mutex';
 import type { Task } from '../types';
 import { targetBranchOf } from '../task-target';
+import {
+  clearStaleIndexLock,
+  formatIndexLockFailure,
+  isIndexLockError,
+  resolveAbsoluteGitDir,
+  resolveIndexLockPath,
+} from './index-lock';
+
+/**
+ * Serialize squash merges that target the same git directory.
+ *
+ * Accept's lifecycle lock is keyed on the CHILD task being accepted, so two
+ * siblings accepted into the same parent can otherwise run `git merge --squash`
+ * in the parent's worktree concurrently and collide on index.lock. This mutex
+ * is in-process only (one daemon owns merges for a repo); cross-process
+ * collisions still fail via git's lock, and {@link clearStaleIndexLock} then
+ * distinguishes a live holder from a stale file.
+ */
+const gitDirMergeMutex = new TaskMutex();
 
 export interface GitCommitInfo {
   sha: string;
@@ -150,10 +170,41 @@ export async function removeWorktree(path: string, cwd?: string): Promise<void> 
   }
 }
 
-export async function getNewCommits(sinceSha: string, cwd?: string): Promise<GitCommitInfo[]> {
-  const result = await runGit(['log', '--format=%H%n%s%n---END---', `${sinceSha}..HEAD`], { cwd });
+export interface NewCommitsOptions {
+  /**
+   * Walk only the FIRST PARENT of every merge — i.e. the commits this branch
+   * itself gained, with a merge counting as the single merge commit.
+   *
+   * Without it, `<since>..HEAD` is a reachability query: merging an upstream
+   * branch in answers with every commit that upstream carried and `<since>`
+   * did not, which is somebody else's history. Any caller asking "what did
+   * this branch do since X" wants the first-parent walk.
+   */
+  firstParent?: boolean;
+  /** Resolve the range against this ref instead of `HEAD`. */
+  headRef?: string;
+}
+
+export async function getNewCommits(
+  sinceSha: string,
+  cwd?: string,
+  options: NewCommitsOptions = {},
+): Promise<GitCommitInfo[]> {
+  const head = options.headRef ?? 'HEAD';
+  const args = ['log', '--format=%H%n%s%n---END---'];
+  if (options.firstParent) args.push('--first-parent');
+  args.push(`${sinceSha}..${head}`);
+
+  const result = await runGit(args, { cwd });
+  // A git FAILURE is not an empty range, and the two must never look alike.
+  // Returning [] here told `lazy system repair-commits` that a branch it could
+  // not read carried no commits, which made every stored record look foreign
+  // and deleted the lot. Callers that genuinely want best-effort say so with a
+  // try/catch, where the degrading is visible.
   if (result.exitCode !== 0) {
-    return [];
+    throw new Error(
+      `git log ${sinceSha}..${head}${cwd ? ` in ${cwd}` : ''} failed: ${result.stderr?.trim() || `exit ${result.exitCode}`}`,
+    );
   }
   if (!result.stdout) return [];
 
@@ -166,6 +217,28 @@ export async function getNewCommits(sinceSha: string, cwd?: string): Promise<Git
     }
   }
   return commits;
+}
+
+/**
+ * How many commits are on HEAD that `sinceSha` does not have, first-parent.
+ *
+ * The cheap half of `getNewCommits`, and it answers the same question, so it
+ * walks the same way: `--first-parent`, or a task that merges its upstream
+ * reports every commit that upstream carried as work it did this turn. This is
+ * the counting twin of the range bug in `src/task/session-commits.ts`; the
+ * mechanical guard in `test/unit/session-commit-scan.test.ts` covers both
+ * function names for that reason.
+ *
+ * Unlike `getNewCommits`, this one still returns 0 rather than throwing when
+ * git fails — it backs a live readout, where a missing number is a gap on a
+ * display and nothing is decided from it. Do not reuse it anywhere a decision
+ * depends on the answer.
+ */
+export async function countNewCommits(sinceSha: string, cwd?: string): Promise<number> {
+  const result = await runGit(['rev-list', '--count', '--first-parent', `${sinceSha}..HEAD`], { cwd });
+  if (result.exitCode !== 0) return 0;
+  const count = parseInt(result.stdout.trim(), 10);
+  return Number.isFinite(count) && count > 0 ? count : 0;
 }
 
 export async function getCommitDiff(sha: string, cwd?: string): Promise<string> {
@@ -252,6 +325,35 @@ export async function getAcceptTagCommit(taskId: string, cwd?: string): Promise<
   return sha.length > 0 ? sha : null;
 }
 
+/**
+ * SHA that identifies a waited task's tip for wait/comment idempotency.
+ *
+ * - `complete`: the accept-tag commit (the task branch may already be deleted).
+ * - otherwise: HEAD of the task branch when it still resolves.
+ *
+ * Returned on `lazy_wait` / `lazy_wait` MCP as `head_sha`, and echoed in the
+ * `[Subtask accepted]` parent comment after accept, so a parent agent can
+ * de-dupe "wait already told me" vs "new note about the same merge".
+ */
+export async function resolveTaskTipSha(
+  taskId: string,
+  status: string,
+  gitBranch: string | null | undefined,
+  cwd?: string,
+): Promise<string | null> {
+  if (status === 'complete') {
+    return getAcceptTagCommit(taskId, cwd);
+  }
+  if (!gitBranch) return null;
+  const result = await runGit(
+    ['rev-parse', '--verify', '--quiet', `${gitBranch}^{commit}`],
+    { cwd },
+  );
+  if (result.exitCode !== 0) return null;
+  const sha = result.stdout.trim();
+  return sha.length > 0 ? sha : null;
+}
+
 export async function mergeBranch(branch: string, cwd?: string): Promise<void> {
   const result = await runGit(['merge', branch, '--no-ff', '-m', `Merge ${branch}`], { cwd });
   if (result.exitCode !== 0) {
@@ -290,6 +392,11 @@ export async function squashMergeBranch(branch: string, cwd?: string): Promise<v
  * Run the squash-merge + commit sequence in `cwd`, which MUST already have
  * `targetBranch` checked out. Does not change branches. Throws (without
  * committing) when the source has no changes relative to the target.
+ *
+ * Before touching the index, clears a *stale* `index.lock` when a real open-file
+ * scan proves no process holds it. A live holder fails loudly without removal.
+ * Concurrent callers targeting the same git dir are serialized (see
+ * {@link gitDirMergeMutex}).
  */
 async function runSquashMergeCommit(
   sourceBranch: string,
@@ -297,11 +404,56 @@ async function runSquashMergeCommit(
   commitMessage: string,
   cwd: string
 ): Promise<void> {
+  const gitDir = (await resolveAbsoluteGitDir(cwd)) ?? cwd;
+  return gitDirMergeMutex.withLock(gitDir, () => runSquashMergeCommitLocked(sourceBranch, targetBranch, commitMessage, cwd));
+}
+
+async function runSquashMergeCommitLocked(
+  sourceBranch: string,
+  targetBranch: string,
+  commitMessage: string,
+  cwd: string
+): Promise<void> {
+  // Stale index.lock from a crashed earlier git permanently wedges accept into
+  // this worktree. Clear it only with evidence that no process has it open.
+  await clearStaleIndexLock(cwd);
+
   const merge = await runGit(['merge', '--squash', sourceBranch], { cwd });
   if (merge.exitCode !== 0) {
-    throw new Error(`Squash merge failed: ${merge.stderr}`);
+    if (isIndexLockError(merge.stderr)) {
+      // Lock appeared between our pre-check and the merge (or a race with a
+      // sibling accept). Re-probe once: a lock that went stale mid-flight still
+      // recovers; a live holder throws from clearStaleIndexLock with a human
+      // message (and never deletes the lock).
+      await clearStaleIndexLock(cwd);
+      const retry = await runGit(['merge', '--squash', sourceBranch], { cwd });
+      if (retry.exitCode !== 0) {
+        const stderr = (retry.stderr || merge.stderr).trim();
+        if (isIndexLockError(stderr)) {
+          const lockPath = await resolveIndexLockPath(cwd);
+          throw new Error(formatIndexLockFailure(stderr, lockPath));
+        }
+        throw new Error(
+          `Could not squash-merge ${sourceBranch} into ${targetBranch} in ${cwd}: ${stderr}`,
+        );
+      }
+      await finishSquashCommit(sourceBranch, targetBranch, commitMessage, cwd);
+      return;
+    }
+    throw new Error(
+      `Could not squash-merge ${sourceBranch} into ${targetBranch} in ${cwd}: ${merge.stderr.trim()}`,
+    );
   }
 
+  await finishSquashCommit(sourceBranch, targetBranch, commitMessage, cwd);
+}
+
+async function finishSquashCommit(
+  sourceBranch: string,
+  targetBranch: string,
+  commitMessage: string,
+  cwd: string,
+): Promise<void> {
   // Check if the squash merge produced any staged changes
   const diffIndex = await runGit(['diff', '--cached', '--quiet'], { cwd });
   if (diffIndex.exitCode === 0) {
@@ -310,7 +462,9 @@ async function runSquashMergeCommit(
 
   const commit = await runGit(['commit', '-m', commitMessage], { cwd });
   if (commit.exitCode !== 0) {
-    throw new Error(`Commit after squash merge failed: ${commit.stderr}`);
+    throw new Error(
+      `Squash-merge of ${sourceBranch} into ${targetBranch} staged changes but commit failed in ${cwd}: ${commit.stderr.trim()}`,
+    );
   }
 }
 
@@ -571,6 +725,76 @@ export async function getDiffFull(fromRef: string, toRef: string = 'HEAD', cwd?:
   return output;
 }
 
+/** The pre- and post-image paths a diff touches. */
+export interface DiffPathSets {
+  /** Post-image paths — what the diff renders as `data-file`. */
+  newPaths: string[];
+  /** Pre-image paths, which differ from the above only for renames and deletions. */
+  oldPaths: string[];
+}
+
+/**
+ * The paths a diff touches, both sides, without materialising the patch.
+ *
+ * This is the allow-list for reading unchanged context out of a file (the review
+ * page's expand controls): a reviewer may read more of a file the change already
+ * shows them, and nothing else. Deriving it with --name-status rather than by
+ * parsing the full patch keeps a 20-line expansion from regenerating megabytes
+ * of diff, and keeps renames honest — `R100 old new` contributes one path to
+ * each side.
+ *
+ * Uncommitted changes are included on the same terms as getDiffFull, because
+ * that is what the reviewer is looking at when the worktree is dirty.
+ */
+export async function getDiffPathSets(
+  fromRef: string,
+  toRef: string = 'HEAD',
+  cwd?: string,
+  twoDot: boolean = false,
+  /**
+   * Restrict the allow-list to these pathspecs — the same restriction
+   * `getDiffFull` honours. An empty array is "no files" (a scoped hub with
+   * no direct changes), not "the whole tree".
+   */
+  paths?: string[],
+): Promise<DiffPathSets> {
+  const newPaths = new Set<string>();
+  const oldPaths = new Set<string>();
+
+  const absorb = (stdout: string) => {
+    for (const raw of stdout.split('\n')) {
+      if (!raw) continue;
+      const parts = raw.split('\t');
+      const status = parts[0] ?? '';
+      if (status.startsWith('R') || status.startsWith('C')) {
+        if (parts[1]) oldPaths.add(parts[1]);
+        if (parts[2]) newPaths.add(parts[2]);
+        continue;
+      }
+      const path = parts[1];
+      if (!path) continue;
+      if (status !== 'A') oldPaths.add(path);
+      if (status !== 'D') newPaths.add(path);
+    }
+  };
+
+  // Empty path list is a scoped-and-empty hub: nothing is readable.
+  if (paths && paths.length === 0) {
+    return { newPaths: [], oldPaths: [] };
+  }
+
+  const range = twoDot ? `${fromRef}..${toRef}` : `${fromRef}...${toRef}`;
+  const result = await runGit(withPathspecs(['diff', '--no-color', '--name-status', range], paths), { cwd });
+  if (result.exitCode === 0) absorb(result.stdout);
+
+  if (toRef === 'HEAD' && (await hasUncommittedChanges(cwd))) {
+    const dirty = await runGit(withPathspecs(['diff', '--no-color', '--name-status', 'HEAD'], paths), { cwd });
+    if (dirty.exitCode === 0) absorb(dirty.stdout);
+  }
+
+  return { newPaths: [...newPaths], oldPaths: [...oldPaths] };
+}
+
 /**
  * Whether a worktree is sitting in the middle of a merge, and how far along.
  *
@@ -622,16 +846,85 @@ export async function readWorktreeMergeState(cwd?: string): Promise<WorktreeMerg
   };
 }
 
+/**
+ * Lazy's own runtime/control artifacts, excluded from every dirty-worktree
+ * question. They are not the agent's work and must never make a worktree look
+ * dirty:
+ *   .lazy-task-sandbox/ — agent sessions, protocol files
+ *   .lazy-lock          — the per-worktree session lock. A CRASHED session
+ *     leaves a stale lock behind, so auto-resume's dirty check (which decides
+ *     whether to merge upstream before resuming) would otherwise always see
+ *     the worktree as dirty and skip the merge. See auto-resume.ts.
+ *
+ * Spelled once and shared by {@link hasUncommittedChanges} and
+ * {@link listUncommittedPaths}: the predicate and the list must answer about
+ * the SAME worktree, or a turn is nudged about a path accept does not consider
+ * dirty — or, worse, the other way round.
+ */
+const DIRTY_CHECK_EXCLUSIONS = [':!.lazy-task-sandbox', ':!.lazy-lock'];
+
+/**
+ * The paths with uncommitted content — staged, unstaged and untracked alike,
+ * lazy's own artifacts excluded.
+ *
+ * Returns `null` when the scan itself FAILED, which is deliberately not the
+ * same answer as an empty array: a caller reporting "this turn left nothing
+ * behind" must be able to tell a clean worktree from one it could not read.
+ * ({@link hasUncommittedChanges} answers `false` in that case instead, which is
+ * right for a gate — refusing an operation because git hiccuped would be worse
+ * — and wrong for a record.)
+ *
+ * TWO commands that emit BARE PATHS, deliberately not `git status
+ * --porcelain`, whose records are `XY <path>`:
+ *
+ *  - `runGit` TRIMS stdout, and an unstaged modification's status begins with a
+ *    space (` M README.md`). Trimming eats it, so a fixed `slice(3)` returns
+ *    `EADME.md` — and only ever for the FIRST record, which is why a parser
+ *    like that looks correct in most tests. Recovering the lost column means
+ *    guessing from how many spaces follow the status letter; bare paths need no
+ *    guess.
+ *  - A rename record carries a second field for the original path, and status
+ *    output C-quotes any path with a space or a non-ASCII byte unless `-z` is
+ *    passed. None of that applies to a list of names.
+ *
+ * `--others --exclude-standard` lists untracked files INDIVIDUALLY, where `git
+ * status` collapses a wholly untracked directory to `public-docs/` — the thing
+ * that matters being `public-docs/troubleshooting.md`. The predicate above
+ * keeps `git status`: it only ever claims "something is here", where none of
+ * this bites.
+ *
+ * Returns `null` if either command fails, including in a repository with no
+ * commits (`HEAD` does not resolve) — an answer this cannot give, rather than
+ * a wrong one.
+ */
+export async function listUncommittedPaths(cwd?: string): Promise<string[] | null> {
+  // Tracked changes, staged and unstaged together, against HEAD.
+  const tracked = await runGit(
+    ['diff', '--name-only', '-z', 'HEAD', '--', ...DIRTY_CHECK_EXCLUSIONS],
+    { cwd },
+  );
+  if (tracked.exitCode !== 0) return null;
+  const untracked = await runGit(
+    ['ls-files', '-z', '--others', '--exclude-standard', '--', ...DIRTY_CHECK_EXCLUSIONS],
+    { cwd },
+  );
+  if (untracked.exitCode !== 0) return null;
+
+  // NUL-separated, so a path's own spaces and newlines survive intact. Deduped
+  // because a file staged and then edited again appears once in `diff`, and a
+  // path can never be both tracked and untracked.
+  const paths = new Set<string>();
+  for (const out of [tracked.stdout, untracked.stdout]) {
+    for (const path of out.split('\0')) {
+      if (path) paths.add(path);
+    }
+  }
+  return [...paths];
+}
+
 export async function hasUncommittedChanges(cwd?: string): Promise<boolean> {
-  // Exclude lazy's own runtime/control artifacts from dirty worktree checks —
-  // they are not real uncommitted work and must never affect dirty state:
-  //   .lazy-task-sandbox/ — agent sessions, protocol files
-  //   .lazy-lock          — the per-worktree session lock. A CRASHED session
-  //     leaves a stale lock behind, so auto-resume's dirty check (which decides
-  //     whether to merge upstream before resuming) would otherwise always see
-  //     the worktree as dirty and skip the merge. See auto-resume.ts.
   const result = await runGit(
-    ['status', '--porcelain', '--', ':!.lazy-task-sandbox', ':!.lazy-lock'],
+    ['status', '--porcelain', '--', ...DIRTY_CHECK_EXCLUSIONS],
     { cwd },
   );
   if (result.exitCode !== 0) {
@@ -646,31 +939,388 @@ export async function hasUncommittedChanges(cwd?: string): Promise<boolean> {
   return hasRealChanges;
 }
 
+/**
+ * Per-file and total ceilings on the UNTRACKED content a snapshot carries.
+ *
+ * `git diff` bounds itself — it can only describe files already in the index —
+ * but the untracked pass is pointed at whatever happens to be sitting in the
+ * worktree, and the snapshot lives in the store. An unbounded capture is how a
+ * store grows until something else breaks (the proxy audit log reached 677 MiB
+ * that way). A file over the ceiling is named in the status capture and skipped
+ * in the patch; losing a 4 MiB artifact nobody committed is the better trade.
+ */
+const MAX_UNTRACKED_FILE_BYTES = 1024 * 1024;
+const MAX_UNTRACKED_TOTAL_BYTES = 4 * 1024 * 1024;
+
+/**
+ * THE USER'S DIFF CONFIGURATION MUST NOT REACH THIS CAPTURE. `git diff` is
+ * porcelain, so it honours three settings by default that each turn the output
+ * into something `git apply` cannot put back — and the cost of that is not the
+ * one file, it is every file in the snapshot, because a patch is rejected whole.
+ *
+ *  - **textconv** (`*.png diff=exif` and friends). A one-way filter, enabled by
+ *    default for `git diff` alone, and it WINS over `--binary`: a modified
+ *    binary comes out as `-CONVERTED-TEXT-FOR /tmp/git-blob-xxxx/f.bin` and
+ *    `git apply` answers `patch does not apply` (verified, git 2.x). Worse in
+ *    the untracked pass, where the `Binary files …` guard then never fires and
+ *    the unappliable text is captured as if it were content.
+ *  - **an external diff driver** (`diff.external`, `GIT_EXTERNAL_DIFF`), whose
+ *    output is not a patch at all.
+ *  - **`diff.noprefix`**, which writes `diff --git f.bin f.bin`; `git apply`
+ *    strips a leading component by default and mangles every path in it.
+ *
+ * None of these is exotic in a user's repository, and lazy captures in THEIR
+ * worktree with THEIR config. Pinning the flags is what makes "the snapshot is
+ * restorable" a property of this function rather than of the project it runs in.
+ */
+const CONFIG_PROOF_DIFF_FLAGS = ['--no-textconv', '--no-ext-diff', '--src-prefix=a/', '--dst-prefix=b/'];
+
+/** The tracked captures add `--binary`; the untracked pass deliberately does not. */
+const CAPTURE_DIFF_FLAGS = ['--binary', ...CONFIG_PROOF_DIFF_FLAGS];
+
+/**
+ * The uncommitted work in a worktree, as a patch `git apply` can put back:
+ * staged, unstaged, AND the content of untracked files.
+ *
+ * UNTRACKED FILES ARE THE POINT, not a nicety. `git diff` describes only what
+ * the index already knows, so for its first years this capture held nothing at
+ * all for a NEW file — and a new file is the usual shape of the work this
+ * mechanism exists to protect. The loss that prompted all of this was a new
+ * `public-docs/troubleshooting.md`: a snapshot would have stored its NAME, in
+ * the accompanying `git status`, and not one byte of its content, while the
+ * restore reported success for having put back nothing.
+ *
+ * Each untracked file is diffed against `/dev/null`, which yields an ordinary
+ * `new file mode` patch — no `git add -N` anywhere, because that writes the
+ * index of a worktree we are only supposed to be READING at turn end.
+ *
+ * Two files are skipped rather than captured, and both skips protect the rest
+ * of the patch: one over {@link MAX_UNTRACKED_FILE_BYTES} (or past the running
+ * total), and a BINARY one — `git diff` renders that as "Binary files … differ",
+ * a line `git apply` cannot apply, and one of them would fail the whole patch
+ * and take the tracked edits down with it.
+ */
 export async function getUncommittedDiff(cwd?: string): Promise<string> {
-  // Get both staged and unstaged changes
-  const staged = await runGit(['diff', '--no-color', '--cached'], { cwd });
-  const unstaged = await runGit(['diff', '--no-color'], { cwd });
+  // CAPTURED VERBATIM (`trim: false`). A patch's whitespace is CONTENT: git
+  // writes an empty context line as a single space, so a section ending on a
+  // blank line ends `" \n"`, and `runGit`'s default trim takes both characters
+  // — leaving a hunk body one line shorter than its `@@` header promises. `git
+  // apply` calls that `corrupt patch at line N` and rejects the ENTIRE patch,
+  // so one blank line at the end of one file's diff loses every other file's
+  // edits with it, and the unblock lands right back in "Could not restore
+  // uncommitted changes from backup".
+  //
+  // It has to be fixed HERE rather than at apply time. `patchBytes` can restore
+  // the newline ending the whole patch, but the staged section's trailing blank
+  // line goes missing in the MIDDLE of the patch as soon as an unstaged or
+  // untracked section follows it, and no end-of-string repair can reach that.
+  // `patchBytes` stays regardless: every snapshot already in the store was
+  // captured trimmed and still needs the tail put back.
+  //
+  // `--binary` for the same reason the untracked pass skips a binary file:
+  // WITHOUT it, a tracked binary the agent edited renders as `Binary files …
+  // differ`, and `git apply` refuses the ENTIRE patch over that one line
+  // (`cannot apply binary patch … without full index line`) — losing every
+  // text edit and every untracked new file captured alongside it. With it, git
+  // emits a literal `GIT binary patch` payload that applies cleanly, and the
+  // only thing left to bound is its SIZE, which `dropOversizedBinaries` does.
+  const staged = await runGit(
+    ['diff', '--no-color', ...CAPTURE_DIFF_FLAGS, '--cached'],
+    { cwd, trim: false },
+  );
+  const unstaged = await runGit(['diff', '--no-color', ...CAPTURE_DIFF_FLAGS], { cwd, trim: false });
 
-  let diff = '';
-  if (staged.exitCode === 0 && staged.stdout) {
-    diff += '--- STAGED CHANGES ---\n' + staged.stdout;
+  const sections: string[] = [];
+  // ONE budget across both captures: a file that is staged and edited again
+  // appears in each, and six modified binaries are six either way.
+  const budget = { binaryBytesUsed: 0 };
+  const stagedPatch = staged.exitCode === 0 ? dropOversizedBinaries(staged.stdout, budget) : '';
+  const unstagedPatch = unstaged.exitCode === 0 ? dropOversizedBinaries(unstaged.stdout, budget) : '';
+  if (stagedPatch) {
+    sections.push('--- STAGED CHANGES ---\n' + stagedPatch);
   }
-  if (unstaged.exitCode === 0 && unstaged.stdout) {
-    if (diff) diff += '\n\n';
-    diff += '--- UNSTAGED CHANGES ---\n' + unstaged.stdout;
+  if (unstagedPatch) {
+    sections.push('--- UNSTAGED CHANGES ---\n' + unstagedPatch);
   }
 
-  return diff;
+  const untracked = await captureUntrackedFiles(cwd);
+  if (untracked) sections.push('--- UNTRACKED FILES ---\n' + untracked);
+
+  // Each section now ends with its own newline, so sections are joined by the
+  // marker line alone — a blank line between them would be read as patch
+  // content, which is the mistake this capture just stopped making.
+  return sections.join('');
+}
+
+/**
+ * The same two ceilings as the untracked pass, applied to the `GIT binary
+ * patch` payloads of TRACKED binaries. `git diff` bounds itself to files the
+ * index knows, but a tracked 8 MiB fixture the agent rewrote is still 8 MiB of
+ * base85 in a store that is not a place for it — and the TOTAL matters as much
+ * as the per-file figure: a snapshot is written on every dirty turn, nothing
+ * ever consumes or supersedes one, so a worktree holding six modified binaries
+ * would deposit all six, again, every turn.
+ */
+const MAX_TRACKED_BINARY_BYTES = MAX_UNTRACKED_FILE_BYTES;
+const MAX_TRACKED_BINARY_TOTAL_BYTES = MAX_UNTRACKED_TOTAL_BYTES;
+
+/**
+ * Drop the whole `diff --git` section of any binary file this snapshot cannot
+ * afford or cannot apply, leaving every other file's edits intact.
+ *
+ * Three reasons a section goes:
+ *  - its payload is over {@link MAX_TRACKED_BINARY_BYTES};
+ *  - the running binary total is spent ({@link MAX_TRACKED_BINARY_TOTAL_BYTES},
+ *    shared across the staged and unstaged captures via `budget`);
+ *  - it still carries a `Binary files … differ` line. With `--binary` and
+ *    {@link CONFIG_PROOF_DIFF_FLAGS} that should be unreachable, and it is
+ *    checked anyway: that one line makes `git apply` reject the patch WHOLE, so
+ *    the cost of being wrong about "unreachable" is every other file in it.
+ *
+ * A WHOLE section, never a truncation: half a binary payload is a patch `git
+ * apply` rejects too. The file is still NAMED in the snapshot's `git status`,
+ * and the restore-failure message reports it as recorded by name only.
+ *
+ * Sections are split on `diff --git ` at the start of a line. A base85 payload
+ * line can never look like that: git writes each one as a length letter
+ * (`A`–`z`) followed by base85, so it has no space in it at all. Nor can a text
+ * file's own content, which is always prefixed with `+`, `-` or a space.
+ */
+function dropOversizedBinaries(patch: string, budget: { binaryBytesUsed: number }): string {
+  if (!patch) return '';
+  const kept: string[] = [];
+  // The leading '' from a patch that starts with the delimiter is dropped by
+  // the emptiness check below.
+  for (const chunk of patch.split(/^(?=diff --git )/m)) {
+    if (!chunk) continue;
+    const name = /^diff --git a\/(.*?) b\//.exec(chunk)?.[1] ?? 'a binary file';
+
+    if (/^Binary files /m.test(chunk)) {
+      logger.debug(
+        `Worktree snapshot: ${name} came back as an unappliable binary diff; naming it without capturing its content`,
+      );
+      continue;
+    }
+
+    const isBinary = chunk.includes('\nGIT binary patch\n');
+    if (isBinary) {
+      if (chunk.length > MAX_TRACKED_BINARY_BYTES) {
+        logger.debug(
+          `Worktree snapshot: ${name} is a binary over the per-file ceiling; naming it without capturing its content`,
+        );
+        continue;
+      }
+      if (budget.binaryBytesUsed + chunk.length > MAX_TRACKED_BINARY_TOTAL_BYTES) {
+        logger.debug(
+          `Worktree snapshot: the binary capture is full; naming ${name} without capturing its content`,
+        );
+        continue;
+      }
+      budget.binaryBytesUsed += chunk.length;
+    }
+
+    kept.push(chunk);
+  }
+  return kept.join('');
+}
+
+/** The new-file patches for the worktree's untracked files, within the ceilings. */
+async function captureUntrackedFiles(cwd?: string): Promise<string> {
+  const listed = await runGit(
+    ['ls-files', '-z', '--others', '--exclude-standard', '--', ...DIRTY_CHECK_EXCLUSIONS],
+    { cwd },
+  );
+  if (listed.exitCode !== 0) return '';
+
+  const patches: string[] = [];
+  let total = 0;
+  for (const path of listed.stdout.split('\0')) {
+    if (!path) continue;
+    if (total >= MAX_UNTRACKED_TOTAL_BYTES) {
+      logger.debug(`Worktree snapshot: untracked capture is full; not capturing ${path}`);
+      continue;
+    }
+
+    // `--no-index` compares two paths outside the index and answers 1 for
+    // "they differ", which is the normal case here — anything above that is a
+    // real failure. An EMPTY untracked file is exit 0 with no output: nothing
+    // to restore, so nothing to store.
+    // `trim: false` for the same reason as the two captures above: an
+    // untracked file ending in a blank line would otherwise lose it, and take
+    // the whole patch down with it.
+    const result = await runGit(
+      ['diff', '--no-color', ...CONFIG_PROOF_DIFF_FLAGS, '--no-index', '--', '/dev/null', path],
+      { cwd, trim: false },
+    );
+    if (result.exitCode > 1 || !result.stdout) continue;
+    if (/^Binary files /m.test(result.stdout)) {
+      logger.debug(`Worktree snapshot: ${path} is binary; naming it without capturing its content`);
+      continue;
+    }
+    if (result.stdout.length > MAX_UNTRACKED_FILE_BYTES) {
+      logger.debug(`Worktree snapshot: ${path} is over the per-file ceiling; not capturing its content`);
+      continue;
+    }
+
+    patches.push(result.stdout);
+    total += result.stdout.length;
+  }
+
+  // Joined bare: each patch was captured verbatim and already ends with its own
+  // newline, so anything added here would be read as patch content.
+  return patches.join('');
+}
+
+/**
+ * A patch, as bytes `git apply` will accept.
+ *
+ * THE TRAILING NEWLINE IS LOAD-BEARING, and its absence is why the worktree
+ * backup could never be restored. `runGit` trims every command's stdout, so the
+ * patch `getUncommittedDiff` captures has lost the newline that ends its last
+ * line — and `git apply` answers a patch that ends mid-line with `error:
+ * corrupt patch at line N`, for the `--check` dry run just as much as for the
+ * real thing. Every snapshot lazy has ever stored is trimmed that way, so this
+ * has to be fixed HERE, at apply time, rather than by capturing new snapshots
+ * correctly: the ones already in the store are exactly the ones somebody needs
+ * back.
+ */
+function patchBytes(patch: string): Uint8Array {
+  return new TextEncoder().encode(patch.endsWith('\n') ? patch : patch + '\n');
+}
+
+/**
+ * Is this patch's content ALREADY in the working tree (typically because it was
+ * committed since the patch was taken)?
+ *
+ * `git apply -R --check` asks exactly that: a patch that reverses cleanly is
+ * one whose additions are all present. It is the difference between "your
+ * backup could not be restored" and "your backup is redundant" — two messages
+ * an operator reads very differently, and one failed `git apply` produces both.
+ *
+ * Never throws and never writes: `--check` is a dry run.
+ */
+export async function patchIsAlreadyApplied(patch: string, cwd?: string): Promise<boolean> {
+  const result = await runGit(['apply', '-R', '--check'], {
+    cwd,
+    stdin: patchBytes(patch),
+  });
+  return result.exitCode === 0;
+}
+
+/**
+ * Paths out of a stored `git status --porcelain` capture, for naming files in a
+ * message.
+ *
+ * Plain porcelain (not `-z`) because that is the format snapshots were captured
+ * in — a path holding a space or a non-ASCII byte comes back C-quoted, as git
+ * wrote it. Good enough to name a file to a human; use
+ * {@link listUncommittedPaths} for anything that has to be an exact path.
+ *
+ * The status field is dropped by MATCHING it, never by slicing three fixed
+ * columns. Snapshots were captured through `runGit`, which trims stdout, so a
+ * status whose first record is an unstaged modification (` M README.md`) is
+ * stored having already lost its leading space — and `slice(3)` on that yields
+ * `EADME.md`. Only ever the first record, which is why the mistake survives
+ * most tests; it is the same trim that made the patch itself unusable.
+ */
+export function snapshotFiles(gitStatus: string): string[] {
+  return gitStatus
+    .split('\n')
+    .map(line => {
+      // `XY <path>`, or `Y <path>` when the leading space was trimmed away.
+      const match = /^[ MADRCU?!]{1,2}\s+(.*)$/.exec(line);
+      const path = (match ? match[1] : line).trim();
+      // A rename reads `old -> new`; name the file that exists now.
+      const arrow = path.lastIndexOf(' -> ');
+      return arrow === -1 ? path : path.slice(arrow + 4).trim();
+    })
+    .filter(Boolean);
+}
+
+/**
+ * The paths a patch actually carries, and can therefore put back.
+ *
+ * Needed because a snapshot's file NAMES and its file CONTENT come from two
+ * different captures, and they do not always agree: the status names everything
+ * the worktree held, while the patch skips a file that was unappliable or over
+ * a capture ceiling. Telling a human their work "is still in the task's
+ * snapshot" when the snapshot never held a byte of it sends them to a store
+ * that cannot give it back — the worst possible answer to give somebody who is
+ * already looking for lost work. The message is built from the intersection, so
+ * a path missing HERE is reported to them as recorded by name only.
+ *
+ * READ PER SECTION, not per `+++ b/<path>` line, because three kinds of change
+ * git can replay perfectly have no `+++` line naming them, and each one used to
+ * fall into that "content was not captured" bucket — the opposite of the truth:
+ *
+ *  - a DELETION, whose `+++` is `/dev/null` (the a-side names the file);
+ *  - a BINARY file captured with `--binary`, which carries no `---`/`+++` pair
+ *    at all, just `GIT binary patch` and its payload;
+ *  - a pure RENAME or a mode-only change, which is `rename from`/`rename to` or
+ *    `old mode`/`new mode` and nothing else.
+ *
+ * So every `diff --git` section counts, named by its `+++` target where it has
+ * one and by its b-side header otherwise. That is exactly true of a snapshot:
+ * a section the capture could not replay was dropped WHOLE before it was
+ * stored, so a section that is present is a change this patch can apply.
+ */
+export function patchPaths(patch: string): string[] {
+  const paths: string[] = [];
+  const strip = (p: string) => (/^[ab]\//.test(p) ? p.slice(2) : p);
+
+  // The section in hand: the file its `diff --git` header names, and whether
+  // some line inside it has already named the file more precisely.
+  let headerName: string | undefined;
+  let source: string | undefined;
+  let named = false;
+  const endSection = () => {
+    if (!named && headerName) paths.push(headerName);
+    headerName = undefined;
+    source = undefined;
+    named = false;
+  };
+
+  for (const line of patch.split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      endSection();
+      // `a/<path> b/<path>`; the b-side is the file as it exists after the patch.
+      headerName = /^diff --git a\/(.*?) b\/(.*)$/.exec(line)?.[2];
+      continue;
+    }
+    if (line.startsWith('--- ')) {
+      source = line.slice(4).trim();
+      continue;
+    }
+    if (!line.startsWith('+++ ')) continue;
+    const target = line.slice(4).trim();
+    if (target === '/dev/null') {
+      const deleted = source && source !== '/dev/null' ? strip(source) : headerName;
+      if (deleted) paths.push(deleted);
+    } else {
+      paths.push(strip(target));
+    }
+    named = true;
+  }
+  endSection();
+
+  return paths;
 }
 
 export async function applyPatch(patch: string, cwd?: string): Promise<boolean> {
-  // Apply a git patch to the working directory
-  // Use git apply which handles both staged and unstaged changes
+  // Apply a git patch to the working directory. `git apply` handles a capture
+  // holding both the staged and the unstaged diff back to back — what it will
+  // not accept is a patch that ends mid-line, hence patchBytes.
   const result = await runGit(['apply'], {
     cwd,
-    stdin: new TextEncoder().encode(patch),
+    stdin: patchBytes(patch),
   });
 
+  if (result.exitCode !== 0) {
+    // The caller decides what a failure MEANS (redundant backup vs lost one),
+    // but git's own reason must not vanish on the way: "corrupt patch at line
+    // N" and "patch does not apply" send an investigation to different places.
+    logger.debug(`applyPatch failed: ${result.stderr || `git apply exited ${result.exitCode}`}`);
+  }
   return result.exitCode === 0;
 }
 
@@ -981,6 +1631,22 @@ export async function getCommitsBehindCount(sourceBranch: string, targetBranch: 
 /**
  * Get the merge base between two branches
  */
+/**
+ * Is `ancestor` contained in `descendant`'s history?
+ *
+ * Returns false — never throws — when either ref is unknown to this
+ * repository, so a caller can treat "not an ancestor" and "gone" the same way
+ * when all it needs is "can I safely use this as a range start".
+ */
+export async function isAncestorCommit(
+  ancestor: string,
+  descendant: string,
+  cwd?: string,
+): Promise<boolean> {
+  const result = await runGit(['merge-base', '--is-ancestor', ancestor, descendant], { cwd });
+  return result.exitCode === 0;
+}
+
 export async function getMergeBase(branch1: string, branch2: string, cwd?: string): Promise<string> {
   const result = await runGit(['merge-base', branch1, branch2], { cwd });
   if (result.exitCode !== 0) {
@@ -1063,6 +1729,75 @@ export async function checkMergeConflictsIntoTarget(sourceBranch: string, target
 }
 
 /**
+ * The same merge-tree dry run as {@link mergeWouldConflict}, but also names
+ * the conflicted paths so a reviewer can see *where* before they press Sync.
+ *
+ * Parsing is a pure function of stdout ({@link parseMergeTreeConflictFiles})
+ * so the unit tests do not need a repo. Exit-status rules stay identical:
+ * 0 = clean, 1 = conflict, anything else throws.
+ */
+export interface MergeConflictPreview {
+  wouldConflict: boolean;
+  files: string[];
+}
+
+/**
+ * Collect unique conflicted paths from `git merge-tree --write-tree` stdout.
+ *
+ * The modern informational format lists each path under a "changed in both"
+ * (or "added in both", …) block; some git versions also emit unmerged-index
+ * lines (`mode oid stage<TAB>path`) or `CONFLICT (content): Merge conflict in
+ * <path>`. We accept all three so a stale git still names the files.
+ */
+export function parseMergeTreeConflictFiles(stdout: string): string[] {
+  const files = new Set<string>();
+  for (const raw of stdout.split('\n')) {
+    const line = raw.trimEnd();
+    const conflictMsg = line.match(/^CONFLICT \([^)]+\): Merge conflict in (.+)$/);
+    if (conflictMsg) {
+      files.add(conflictMsg[1]);
+      continue;
+    }
+    const indexStage = line.match(/^\d{6} \S+ [123]\t(.+)$/);
+    if (indexStage) {
+      files.add(indexStage[1]);
+      continue;
+    }
+    const sideLine = line.match(/^\s+(?:base|our|their)\s+\d{6}\s+\S+\s+(.+)$/);
+    if (sideLine) {
+      files.add(sideLine[1].trim());
+    }
+  }
+  return [...files];
+}
+
+export async function mergeConflictPreview(
+  oursBranch: string,
+  sourceBranch: string,
+  cwd?: string,
+): Promise<MergeConflictPreview> {
+  for (const ref of [oursBranch, sourceBranch]) {
+    const rev = await runGit(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { cwd });
+    if (rev.exitCode !== 0) {
+      throw new Error(
+        `Cannot check merge conflicts: ref '${ref}' does not resolve to a commit` +
+        `${cwd ? ` in ${cwd}` : ''}: ${rev.stderr || 'unknown ref'}`,
+      );
+    }
+  }
+
+  const result = await runGit(['merge-tree', '--write-tree', oursBranch, sourceBranch], { cwd });
+  if (result.exitCode === 0) return { wouldConflict: false, files: [] };
+  if (result.exitCode === 1) {
+    return { wouldConflict: true, files: parseMergeTreeConflictFiles(result.stdout) };
+  }
+  throw new Error(
+    `git merge-tree --write-tree ${oursBranch} ${sourceBranch} failed with exit code ${result.exitCode}` +
+    `${cwd ? ` in ${cwd}` : ''}: ${result.stderr || result.stdout || 'unknown error'}`,
+  );
+}
+
+/**
  * Build a squash commit message for a task merge.
  *
  * When `fidelityBody` is provided (a synthesized summary of what the work
@@ -1105,6 +1840,25 @@ export async function squashMergeTaskBranch(
 ): Promise<DestinationRestoreConflict | null> {
   const commitMessage = await buildSquashCommitMessage(taskShortId, goal, sourceBranch, targetBranch, root, fidelityBody);
   return await squashMergeBranchIntoTarget(sourceBranch, targetBranch, commitMessage, root);
+}
+
+/**
+ * Would merging `sourceBranch` into `targetBranch` change nothing?
+ *
+ * True when a clean 3-way merge of the two yields exactly the target's tree —
+ * every change the source carries is already on the target. Used ONLY to make a
+ * RESUMED accept's squash idempotent; a conflicted merge-tree answers false so
+ * the caller takes its ordinary path and reports the conflict.
+ */
+export async function branchChangesAlreadyIn(sourceBranch: string, targetBranch: string, cwd: string): Promise<boolean> {
+  const merged = await runGit(['merge-tree', '--write-tree', targetBranch, sourceBranch], { cwd });
+  if (merged.exitCode !== 0) return false;
+  const mergedTree = merged.stdout.split('\n')[0]?.trim();
+  const target = await runGit(['rev-parse', '--verify', `${targetBranch}^{tree}`], { cwd });
+  if (target.exitCode !== 0) {
+    throw new Error(`Failed to resolve the tree of ${targetBranch}: ${target.stderr || 'unknown error'}`);
+  }
+  return !!mergedTree && mergedTree === target.stdout.trim();
 }
 
 /**

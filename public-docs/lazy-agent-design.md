@@ -1,11 +1,22 @@
 # lazy-agent Design
 
+How lazy's in-container side works: the `lazy-agent` binary that supervises
+an agent's turns, serves lazy's MCP tools to it, and talks to the daemon on the
+host. Read this if you want to understand what runs inside a task's container,
+how it survives daemon restarts and rebuilds, and why it behaves the way it does
+when something fails.
+
 ## Overview
 
-`lazy-agent` is the binary that runs inside Docker containers. It serves two roles:
+`lazy-agent` is the binary that runs inside Docker containers. It serves three roles:
 
 1. **Supervisor** (default mode) — container entrypoint that manages work phases
 2. **MCP server** (`mcp` subcommand) — exposes lazy tools to Claude Code via JSON-RPC over stdio
+3. **Pairing session** (`pair` subcommand) — the in-container half of `lazy pair <task>`:
+   wires this session's MCP tools, then hands the terminal to the agent's own
+   interactive CLI. Spawned by the host via `docker exec -it` rather than being
+   the container's entrypoint, because pairing JOINS the task's existing
+   container instead of replacing it. See [Pairing](pairing.md).
 
 ## Process Architecture
 
@@ -49,6 +60,16 @@ The supervisor is the container entrypoint. It:
 5. Writes `response.json` when done
 6. Stays alive between turns (the container is long-lived)
 
+The container's PID-1 wrapper restarts the one-shot supervisor between turns
+(releasing its post-turn RSS), and deliberately kills nothing else: processes
+the agent leaves running — dev servers, databases — survive turn boundaries.
+The **container is the cleanup boundary**: everything in it dies together when
+the task reaches a terminal state (accept/reject/close) or is stopped, which
+still `docker kill`s the container. The old between-turn process sweep
+(SIGTERM/SIGKILL of the whole process table) was removed; the trade-off is that leaked orphans also
+accumulate for the task's lifetime instead of one turn — accepted, because the
+container bounds them and dies with the task.
+
 Before spawning Claude Code, the supervisor writes `~/.claude.json` inside the
 container so Claude Code discovers the MCP server on startup.
 
@@ -57,12 +78,14 @@ container so Claude Code discovers the MCP server on startup.
 `~/.claude.json` is **not** persisted for a task. The container mounts
 `<worktree>/.lazy-task-sandbox/.claude` at `/home/user/.claude`, but
 `/home/user/.claude.json` sits beside that mount on the container's own ephemeral
-filesystem. A task whose container has been reaped — the normal state for anything
-blocked for a while — gets a brand-new container on its next turn, with no MCP
-entry at all.
+filesystem. A task whose container has gone away (a daemon-restart reap, a crash, a manual
+`docker rm`) gets a brand-new container on its next turn, with no MCP entry at
+all. (Blocked tasks used to hit this constantly via the idle-container reaper;
+that reaper was removed, so a blocked task now
+normally keeps its warm container until a terminal state.)
 
 So every supervisor path that runs an agent calls `prepareTurnMcp`
-(`src/supervisor/mcp-setup.ts`) first. Ask and pre-accept turns did not, which is
+(`src/supervisor/mcp-setup.ts`) first. Ask turns do not, which is
 how an agent asked about its own task came to answer *"the lazy MCP tools are
 currently disconnected"* — it genuinely had none. A source-scanning coverage test
 (`test/unit/supervisor-mcp-setup.test.ts`) fails if a new agent-running handler
@@ -96,17 +119,17 @@ The MCP server is spawned by Claude Code (not by the supervisor directly). It:
 
 1. Implements JSON-RPC 2.0 over stdio (no external dependencies)
 2. Exposes the agent-facing tools: `lazy_search`, `lazy_show`, `lazy_create`,
-   `lazy_start`, `lazy_comment`, `lazy_add_followup`, `lazy_update_progress`, `lazy_commit`,
+   `lazy_start`, `lazy_comment`, `lazy_raise`, `lazy_update_progress`, `lazy_commit`,
    `lazy_status`
    (plus read-only conversation tools). `lazy_create`/`lazy_start` are scoped so an
    agent may only create and start subtasks of its OWN task; `lazy_propose` was retired
-   (orthogonal work is recorded via `lazy_add_followup` — see below)
+   (orthogonal work is recorded via `lazy_raise` — see below)
 3. Opens/closes storage per tool call to avoid stale state
 4. Runs as long as Claude Code keeps stdin open
 5. **Dispatches requests concurrently.** The read loop parses each line and hands
    the handler off without awaiting it, so a tool call that runs for minutes does
    not stall the next request on the same stdio pipe. This is required, not an
-   optimization: `lazy_accept` can run a pre-accept turn (opt-in) plus a merge, and while it
+   optimization: `lazy_accept` can run the acceptance gate (opt-in) plus a merge, and while it
    ran, every other `lazy_*` call from the same builder session used to hang for
    its full duration (misdiagnosed for weeks as "daemon blips", even though the
    daemon answered direct HTTP probes in milliseconds). Ordering is NOT the
@@ -115,20 +138,23 @@ The MCP server is spawned by Claude Code (not by the supervisor directly). It:
    individually atomic. Clients that need one call to precede another await the
    first reply, which is what the MCP protocol expects.
 
-### Follow-ups: a passive, task-level store for orthogonal discoveries
+### Raised items: a passive, task-level store for everything the human must see
 
-When an agent notices genuinely **orthogonal** work — a different concern the current task
-does not need in order to be correct and mergeable — it records it with `lazy_add_followup`
-rather than creating a backlog task or burying it in prose. Follow-ups are stored on the task
-(`follow-ups.json` / a `follow_ups` table), so they survive auto-turns and auto-resumes.
+When an agent has a question or decision about its **own** scope or diff, or notices genuinely
+**orthogonal** work — a different concern the current task does not need in order to be correct
+and mergeable — it records it with `lazy_raise` rather than creating a backlog task or burying
+it in prose. One entity covers both; a required `blocking` flag says which it is, and only
+blocking items gate `lazy accept`. Raised items are stored on the task, so they survive
+auto-turns and auto-resumes.
 
-The defining invariant is that recording a follow-up is **non-triggering**: it creates no
-comment, changes no task status, and writes no signal, so it can never kick off an auto-turn or
-auto-resume. This is exactly why follow-ups are a separate store and not comments — comments
-feed the comment auto-react loop, which would spuriously resume the agent. Follow-ups are
-read and triaged by the builder/human at review time (`lazy_show` surfaces them as `follow_ups`):
-each is folded back into the task, promoted to a vetted task, or dropped. The backlog only ever
-receives builder-vetted tasks.
+The defining invariant is that recording an item is **non-triggering**: it creates no comment,
+changes no task status, and writes no signal, so it can never kick off an auto-turn or
+auto-resume. This is exactly why raised items are a separate store and not comments — a comment
+is delivered into the next turn's prompt, so orthogonal notes would pile into work the agent
+was never asked to do (and, on a submitted task, forge comments do resume it). Raised items are
+read and triaged by the builder/human at review time (`lazy_show` surfaces them as
+`raised_items`): each is folded back into the task, answered, promoted to a vetted task, or
+dropped. The backlog only ever receives builder-vetted tasks.
 
 The MCP server replaces the old CLI-based agent commands. Instead of the agent
 calling `lazy search ...` as shell commands, it uses MCP tool calls which are
@@ -144,7 +170,7 @@ Claude Code's MCP child (`lazy-agent mcp …`) exits immediately, and the builde
 silently loses **every** `lazy_*` tool. The only visible symptom is an opaque
 `Failed to reconnect to lazy: -32000` buried in Claude's own logs.
 
-Two mechanisms make that failure loud:
+Two mechanisms make that failure loud at **container launch**:
 
 1. **`lazy-agent selfcheck`** (and `--version` / `--revision`) prints a stable
    sentinel, `lazy-agent ok <version>`, and exits 0. A bare Bun binary instead
@@ -155,29 +181,87 @@ Two mechanisms make that failure loud:
    actionable "rebuild/reinstall the agent binary" error when the sentinel is
    missing — instead of handing off into a session that will silently `-32000`.
 
+The same selfcheck is also run **before anything ships**: `bun run build` refuses
+to embed a bad `./lazy-agent` into the compiled `lazy` binary; a container image
+rebuild refuses to tag when the bind-mount would fail selfcheck; and `lazy upgrade`
+runs the probe again after it rebuilds both the image and the agent binary.
+
 Neither catches a binary that is *valid but stale*, which is the more insidious
 failure: it passes `selfcheck`, speaks MCP, and only misbehaves where its code
 has since diverged from the daemon's. In a compiled install the mounted binary is
 extracted from the executable's embedded copy on demand
 (`extractEmbeddedAgentBinary`), and that extraction used to skip the write when
 the on-disk file merely *matched in size* — which two builds of a ~100MB Bun
-executable routinely do. The check is now byte-exact (length **and** content
-hash), and the replacement goes through a temp file plus `rename()` rather than
-rewriting the destination in place, because running containers bind-mount that
-exact inode and an in-place rewrite mutates a live session's agent binary.
+executable routinely do. Installs are now identified by a hash of their bytes, so
+"same version" is decided by content and never by size.
 
-### Daemon staleness (`codeSha`)
+### Installs are immutable, so nothing is ever swapped under a mount
+
+The agent binary is installed **content-addressed**: `~/.lazy/bin/lazy-agent-<id>`,
+where `<id>` comes from the bytes. Each install is verified once and then never
+written to again, and a launch bind-mounts that concrete file.
+`~/.lazy/bin/lazy-agent-current` is a **pointer symlink** to the current install,
+for humans and for `lazy doctor` — it is not what containers mount.
+
+The pointer deliberately uses a new name. `~/.lazy/bin/lazy-agent` — the single
+path older versions installed to — is the file that containers started before
+the upgrade are still mounting, so nothing writes there either: it is read once
+to adopt its bytes into the new layout, and then removed only when no running
+container mounts it any more.
+
+This replaced a single fixed path that every producer overwrote with temp file +
+`rename()`. That was believed to be invisible to running containers, on the
+theory that they hold the old inode. On Docker Desktop that is not true: a file
+bind mount is a subpath of the whole `/Users` share and the guest re-resolves the
+**path** on every access, so a host rename swaps the binary underneath every
+running container. A container reading across such a swap can see inconsistent
+attributes, and because a Bun compiled executable locates its embedded bundle
+through a trailer at the *end* of the file, a reader that sees a stale size
+misses the trailer and behaves exactly like a bare Bun runtime — the
+`Script not found "selfcheck"` failure above, appearing seconds after an upgrade
+and healing on its own minutes later.
+
+Two further properties fall out of immutability:
+
+- **An install that exists and verifies is never rewritten.** An older `lazy`
+  process — the pre-upgrade `lazy builder` wrapper still running its relaunch
+  loop — re-extracts its own embedded agent at every launch. Under the single
+  path that wrote ~100MB over the freshly upgraded binary and silently
+  downgraded it; now that write lands on the old version's own path and changes
+  nothing.
+- **Superseded installs are garbage-collected**, not overwritten: an install is
+  removed only when no running container mounts it, it is not the current one,
+  and it is older than an hour. If the container runtime cannot be queried,
+  nothing is removed.
+
+### Daemon staleness (`sourceId`, `codeSha`)
 
 Tool calls in daemon-proxy mode are forwarded to the long-lived daemon, which
 serves whatever code it was **started** with — it does not hot-reload when the
-source changes. During lazy's own development this masks merged fixes: the daemon
-keeps running the old handlers, so a bug that is fixed on disk still misbehaves at
-runtime with no visible signal. The daemon captures the git short SHA of the
-source it is running (`GET /daemon/status` → `codeSha`), and `lazy daemon status`
-compares it against the working tree's current HEAD, printing a `⚠ Daemon is
-STALE` warning pointing at `lazy daemon restart` when they diverge. `codeSha` is
-absent for compiled/installed binaries (no source tree), where the `version` and
-`Built` timestamp already convey staleness.
+source changes. During development this masks merged fixes: the daemon keeps
+running the old handlers, so a bug that is fixed on disk still misbehaves at
+runtime with no visible signal.
+
+The daemon reports two identities for the code it is running, and prints both to
+its log at startup:
+
+- **`sourceId`** — a content fingerprint of the source tree (`src/`,
+  `package.json`, `bun.lock`, `Dockerfile.lazy`). This is the one to compare,
+  because it moves with **uncommitted edits** and exists for a release build with
+  no git history. Ask any checkout for its own with `lazy system source-id`.
+- **`codeSha`** — the git short SHA, kept for continuity. Absent for a
+  compiled/installed binary, and blind to a dirty working tree.
+
+`lazy daemon status` compares the daemon's `sourceId` against this checkout's and
+prints a `⚠ Daemon is STALE` warning pointing at `lazy daemon restart` when they
+diverge, falling back to the SHA comparison for a daemon too old to report an id.
+`lazy doctor` runs the same check. Restarting interrupts running agent and pair
+sessions; each agent turn resumes against the new daemon with its conversation,
+its worktree and any feedback it had not yet read.
+
+For a compiled binary the `Built` line carries the UTC build timestamp plus the
+git short SHA and whether the tree had uncommitted changes at compile time
+(`dirty tree`), alongside `version`.
 
 ### Surviving a daemon restart (credential refresh)
 
@@ -297,7 +381,7 @@ is waited out there too. Covered by `test/unit/daemon-mcp-reconnect.test.ts`,
 ### When the tools are gone anyway: the end-of-turn handoff file
 
 Healing is best-effort; the channel can still be down when a turn ends. What an
-agent holds at that moment — its journal entry and its follow-ups — is the most
+agent holds at that moment — its journal entry and its raised items — is the most
 expensive thing in the turn to lose, and agents improvised: they ran the lazy CLI
 in the container (which fails with EROFS, and would bypass the daemon's storage
 ownership even if it could write), then pasted the journal text into the summary
@@ -309,8 +393,12 @@ a directory that is already mounted read-write in every runner and gitignored:
 
 ```
 {"kind":"journal","content":"Chose X over Y because …"}
-{"kind":"followup","content":"The retry path in foo.ts swallows errors."}
+{"kind":"raised","content":"The retry path in foo.ts swallows errors."}
+{"kind":"raised","blocking":true,"content":"Should the new flag default on? Say the word."}
 ```
+
+`"kind":"followup"` is still accepted and means a non-blocking raised item, so an agent
+carrying the older instructions loses nothing.
 
 The supervisor clears any stale file before the agent runs, then collects it after
 (`src/supervisor/turn-handoff.ts`) and puts the entries on the protocol response —
@@ -336,20 +424,20 @@ a restarted daemon almost always serves the proxy somewhere else.
 
 For a command that launches and exits this is invisible: the address is resolved
 in `createRunner`, used once, and the process ends. `lazy builder` is the
-exception — it holds one runner across a `lazy upgrade`, which stops the builder
-container, rebuilds, and **restarts the daemon**, and then relaunches the child
-into the same terminal (`src/builder/relaunch.ts`). The credential and the MCP
-config are re-fetched from the daemon on every launch, and storage is re-resolved
-per access, so those healed themselves. The proxy address did not: it was
-stamped onto the runner's role targets at startup, and an already-set `proxyUrl`
-is treated as authoritative everywhere downstream (`needsLiveProxyUrl`,
-`resolveAuthEnvFromDaemon`). The relaunched builder therefore came back pointed
-at a **dead port** and every model call failed until the human relaunched by hand.
+exception — it holds one runner across a `lazy upgrade`, which **restarts the
+daemon** while the builder container keeps running. The in-container supervisor
+(`runBuilderWithContinuity`) watches `/daemon/status` for a generation change,
+gracefully stops Claude, re-fetches launch env (proxy address, credentials,
+MCP config) from the new daemon, and relaunches with `--resume`. That healed
+the proxy half in place; MCP tool calls heal separately via the daemon proxy
+reconnect window, credential re-issue, and an MCP launch wrapper that runs
+`lazy-agent selfcheck` before each spawn.
 
-The relaunch loop now re-resolves it (`refreshRunnerProxyTargets`, `src/runner/index.ts`)
-at the one correct moment: after the wait has confirmed the new daemon is
-serving, and before the child is launched with it. Two properties are
-load-bearing:
+The host-side relaunch loop (`src/builder/relaunch.ts`) remains as a fallback
+when the container exits for other reasons (crash, manual stop, an older lazy).
+It re-resolves the proxy at the one correct moment: after the wait has confirmed
+the new daemon is serving, and before the child is launched with it. Two
+properties are load-bearing:
 
 - **It fails loud rather than degrading.** An unresolvable address throws
   `ProxyUnavailableError`; the loop reports it and does not relaunch. Coming back
@@ -369,12 +457,16 @@ the wrong session.
 The id was only ever produced on an exit path that did not run. In docker mode
 `launchBuilderInteractive` returns `sessionId: null` — only the in-container
 supervisor diffs the JSONL files and learns the id — and it stamped that id onto
-the builder-resume-intent *after* its Claude child exited. `lazy upgrade` stopped
-builder containers with `docker kill`, i.e. SIGKILL: the supervisor was not
-signalled, never reached the stamp, and the intent went to the relaunch loop with
-no `sessionId`. The loop then fell through to its last-resort fallback — the
-newest captured conversation anywhere in the project — which is not necessarily
-this builder's session at all.
+the builder-resume-intent *after* its Claude child exited. Before in-container
+continuity, `lazy upgrade` stopped builder containers with `docker kill`, i.e.
+SIGKILL: the supervisor was not signalled, never reached the stamp, and the
+intent went to the relaunch loop with no `sessionId`. The loop then fell through
+to its last-resort fallback — the newest captured conversation anywhere in the
+project — which is not necessarily this builder's session at all. A normal
+upgrade no longer stops builders; continuity reads the active session id from
+the capture monitor and passes `--resume` on the in-place relaunch. The host-side
+detection and graceful-stop machinery below remain belt-and-braces for container
+exits that still happen (crash, manual stop, the host relaunch fallback).
 
 Three changes, in order of how much they carry:
 
@@ -389,12 +481,15 @@ Three changes, in order of how much they carry:
   works under SIGKILL, an OOM, a crashed supervisor, or a sleeping machine. The
   launch-instant cut is what keeps host-*seeded* history out — seeding preserves
   the originals' mtimes, so seeded copies always sort as pre-launch.
-- **`lazy upgrade` stops builders gracefully** (`docker stop --time 10`, via
+- **`lazy upgrade` used to stop builders gracefully** (`docker stop --time 10`, via
   `stopRun`'s opt-in `gracefulTimeoutSeconds`) so the supervisor's signal handler
-  actually runs. That matters beyond the id: the handler performs the final
-  conversation capture, so the last stretch of the human's session is not lost
-  from lazy's store. Task supervisors are still killed immediately — they have no
-  exit work, and a grace period there is pure latency in the daemon's hot path.
+  actually ran. Upgrade no longer stops builders — continuity handles reconnect
+  in place — but the graceful-stop path remains for manual container stops and
+  the host relaunch fallback. That matters beyond the id: the handler performs
+  the final conversation capture, so the last stretch of the human's session is
+  not lost from lazy's store. Task supervisors are still killed immediately on
+  upgrade — they have no exit work, and a grace period there is pure latency in
+  the daemon's hot path.
 - **The supervisor's stamp moved onto the signal path.** It now hangs off the
   capture monitor's memoized `stop()` (`onFinalSession`), so the graceful exit and
   the SIGTERM handler converge on the same stamp, exactly once, instead of it
@@ -476,9 +571,10 @@ fresh and revoked each launch. Mounting the persisted file directly was a real
 bug: a single-file bind mount pins the inode, so a second launch of the same
 project rewrote the running container's config in place, pointing its MCP server
 at a credential file that container never had mounted. The builder then ran the
-whole session with no `lazy_*` tools and nothing said why. `lazy upgrade` made it
-routine rather than rare — it stops every builder of a project at once and each
-host wrapper relaunches off the same daemon-healthy poll, milliseconds apart.
+whole session with no `lazy_*` tools and nothing said why. Before in-container
+continuity, `lazy upgrade` stopped every builder of a project at once and each
+host wrapper relaunched off the same daemon-healthy poll, milliseconds apart —
+which made the per-launch MCP config race routine rather than rare.
 
 The MCP identity label — the key the daemon binds the token to, and the key the
 builder revokes on exit — is `builder-<builderId>`, drawn per launch, never
@@ -514,7 +610,7 @@ It is also deliberately narrow. Claude Code writes tool-call error *results* int
 that same file as `{"error": …}` lines, so a raw scan reports a healthy server —
 one answering `lazy_accept` with its confirmation-code gate, or rejecting an
 over-long memory description — as a connectivity failure, which is how the banner
-came to fire on nearly every v0.21 beta session. Those entries are recognised
+could otherwise fire on nearly every session. Those entries are recognised
 structurally, by Claude's own framing rather than by matching lazy's error text:
 a tool result is echoed a second time as
 `{"debug":"Tool '<name>' failed after <d>: <same text>"}`, while the availability
@@ -632,7 +728,8 @@ while the daemon itself kept answering short RPCs normally.
 
 Nothing about the timeout configuration can fix that. `Bun.serve` refuses
 `idleTimeout > 255`, so no value covers a 600s wait, and `server.timeout(req, n)`
-extends the deadline on the TCP listener but is ignored on the unix socket.
+extended the deadline on the TCP listener but was ignored on the unix socket
+the daemon dual-bound at the time (the socket is gone — drop-unix-socket).
 
 What does work is writing bytes, so long routes reply with a streamed
 newline-delimited JSON **envelope** (`src/daemon/heartbeat.ts`):
@@ -658,7 +755,7 @@ Two properties are load-bearing:
   `DaemonConnectionLostError` ("the operation may have completed on the host,
   re-check state"), never as an unreachable daemon. The old code reported every
   transport throw as "the daemon appears to be down, relaunch this builder",
-  which sent an engineer down a recovery path that could not help.
+  which sent users down a recovery path that could not help.
 - **"Down" is a claim that gets checked.** A transport failure whose wording
   matches neither list (never-connected vs lost-mid-flight) is no longer guessed
   at: the proxy probes `GET /daemon/status` (3s budget) and lets the answer
@@ -680,10 +777,10 @@ pinned by tests rather than assumed, in `test/unit/daemon-heartbeat.test.ts` and
 `test/unit/mcp-server-progress.test.ts`.
 
 The corollary is that an aborted client must not leave the task *unexplained*.
-Accept's abort paths (a pre-accept turn that times out, a supervisor that fails
-to launch) record a `system` comment on the task before throwing, so the reason
-survives even when the RPC error reaches nobody — the field symptom was a task
-that fell back to `blocked` with no trace of why.
+Accept's abort paths (a gate command that fails or times out, a supervisor that
+fails to launch) record a `system` comment on the task before throwing, so the
+reason survives even when the RPC error reaches nobody — the field symptom was a
+task that fell back to `blocked` with no trace of why.
 
 `test/unit/daemon-heartbeat.test.ts` proves the mechanism against a real
 `Bun.serve` with a shrunken idle timeout (including a control case that must
@@ -702,10 +799,12 @@ aborting" — with a 30-minute default for stdio servers. The stdio MCP server
 daemon proxy (`src/daemon/mcp-proxy.ts`) parsed the heartbeat lines only to skip
 them. So the heartbeats stopped dead in the process that read them.
 
-That is a guaranteed failure for accept, not a rare one: an accept runs a
-pre-accept validation turn bounded at `PRE_ACCEPT_TIMEOUT_MS` — 30 minutes, the
-same number as the client's idle budget. The field case: `lazy_accept` entered
-pre-accept, the client aborted at 1800s, the daemon kept working, and the merge
+That is a guaranteed failure for accept, not a rare one: an accept runs the
+opt-in acceptance gate (`[automation.pre_accept]`), whose daemon-side wait is
+bounded by the work itself — number of commands times each command's configured
+timeout, plus a startup margin — which can exceed the client's 1800s idle budget.
+The field case: `lazy_accept` entered the gate, the client aborted at 1800s, the
+daemon kept working, and the merge
 never ran.
 
 The fix relays what already exists. `readHeartbeatEnvelope` takes an
@@ -840,6 +939,15 @@ through typed accessors (`src/daemon/rpc-params.ts`) instead of
 runtime, so a wrong-typed value used to pass the presence check and reach the
 lifecycle code, where it surfaced as a 500.
 
+`/rpc/storage`, the generic proxy onto the storage interface, is the same
+surface with a different shape. Its writers of stored *text* — a comment, a
+journal entry, a raised item — validate that text with those accessors before the
+write, so a call that lost its argument is a 400 naming the field. The storage
+layer still coerces a non-string to an empty string and logs the caller, but
+that is now a second layer for internal callers rather than the only one: a
+coerced write leaves a record with no text, which is exactly the corruption the
+boundary exists to refuse.
+
 Rejection is total: a request that fails validation performs no work at all. A
 400 that still wrote something would be the same corruption with better manners.
 
@@ -869,9 +977,11 @@ A mismatch is **refused**, never silently retargeted to the token's identity: a
 caller acting on task B while believing it acts on task A is a worse failure than a
 hard error, and a silent override would hide a real impersonation attempt. There is
 deliberately no fallback to the shared daemon token on `/mcp` — keeping one would
-restore the single shared identity this exists to remove. Other surfaces (the CLI
-over the unix socket, `/rpc/*`) still use the shared token; they are host-side
-callers, not agents in containers.
+restore the single shared identity this exists to remove. The other surface
+(`/rpc/*`, where the host-side CLI and any control plane live) takes the shared
+token or an **actor token** — see "Actor identity on `/rpc/*`" below. The two
+populations are disjoint in both directions: an agent's MCP token is refused on
+`/rpc/*`, and an actor token is refused on `/mcp`.
 
 Where the tokens live is load-bearing: `~/.lazy/daemon/<slug>/mcp-tokens.json`
 (mode 0600), the daemon's own state directory, and **never** under the project
@@ -911,6 +1021,123 @@ sends none) is treated as residue exactly as before, and a recycled pid makes a 
 record merely *look* live — which only demotes it in the order. The cap stays hard:
 when every retained builder is live, the oldest live one is still dropped.
 
+### Actor identity on `/rpc/*`
+
+The same registry also answers a second question: **who** is calling `/rpc/*`.
+Until now the answer was a caller-supplied `actor` string on the request, so
+anything holding the shared token could claim to be anyone. That is fine for a
+single-user install — the one token *is* the machine's owner — and not fine once a
+control plane mediates several humans against one daemon.
+
+So the registry gained two more kinds beside `task` and `builder`, and
+`resolveRpcActor` (`src/daemon/rpc-auth.ts`) maps a presented token to the actor it
+proves:
+
+| presented token | actor | may name an `actor` on a write? |
+| --- | --- | --- |
+| the legacy shared daemon token | `control` | yes — unchanged |
+| a minted control token | `control` | yes |
+| a minted user token | `user` (its own id) | **no — 403** |
+| a task or builder MCP token | — | **401**, naming the wrong surface |
+
+**Back-compat is the load-bearing property.** The shared token
+(`~/.lazy/daemon/<slug>/token`) resolves to `control`, the most privileged actor,
+and a control caller's parameters are passed through untouched — so every existing
+CLI, supervisor and script behaves exactly as before, including the CLI's own
+`LAZY_ACTOR=builder` attribution. A single-user install mints nothing and changes
+in no way.
+
+A `user`-kind caller is the opposite: its identity comes from the token only.
+`handleRpc` pins the `actor` on its request before dispatch — including inside
+the `storage` proxy, which is the widest mutating surface there is, where the
+actor is written at the location each method actually carries one (`createTurn`,
+the single most attribution-bearing write there is, carries its actor in an
+`options` bag one level down; a raised-item resolution carries it in a
+`resolution` bag). A request that names a *different* actor is **refused with
+403** rather than silently corrected, for the same reason a `/mcp` claim
+mismatch is.
+
+Those two halves are deliberately asymmetric. The *refusal* examines the whole
+request, wherever the caller put an actor; the *pin* writes only where a person
+belongs. Most of the store's writers record only which KIND of actor wrote a row
+and have no person fields at all — a memory record, an attached file, a
+dismissed message — and writing a person into one of those does not attribute
+it, it corrupts the row. So a method that names no person keeps the plain role
+it was given. "Different"
+covers both halves of an actor: another ROLE, and another PERSON (see per-user
+attribution below). Naming its own identity redundantly is accepted, since the
+pin would write exactly that. Enforcement sits at that single point so a
+mutating handler added later cannot quietly go on trusting a caller-supplied
+field. `mintActorToken` / `revokeActorToken` and
+`POST /daemon/shutdown` are control-only: a per-user token exists to work on
+tasks, not to mint itself more reach or take the daemon away from everyone on it.
+
+`mintActorToken` is idempotent per identity (one live token each, as for agents)
+and takes `rotate: true` to replace a secret without re-minting the identity —
+which is how a user's credential is rotated after an expiry or a leak. It is the
+only time a secret is readable; nothing else ever returns or logs one.
+
+Idempotent does not mean inert. A person's identity is their **email**, so
+minting again for the same address returns the same secret but *adopts the pair
+it was given*: a corrected or newly-learned display name takes effect on the next
+row that person writes, and minting with no name clears the stored one. Without
+that, fixing a misspelled name would report success and change nothing, and the
+only remedy would be rotating the secret — which logs that person out mid-session.
+An address identifies one person however it is typed: surrounding spaces and
+upper/lower case are folded, on the token and on that person's stored model
+credential alike, so one member has one identity rather than several partial ones.
+
+`revokeActorToken` takes exactly one selector (`token`, `email`, or a control
+`label`) and deliberately cannot revoke an agent's MCP token: those belong to a
+session lifecycle, and revoking one here would strip a running agent of its tools
+mid-turn.
+
+**Which person acted is recorded too, durably.** The `actor` role stays lazy's
+five-value channel taxonomy (`human`, `builder`, `agent`, `system`,
+`supervisor`) — a `user`-kind caller's writes still record `human` — and two
+fields beside it, `actor_email` and `actor_name`, record WHICH person. Role says
+what KIND of actor; these say which one.
+
+A person is named the way git names one: an `(email, name)` pair, the same
+spelling `git log` uses. There is no user directory and no opaque id, so an
+exported store names people you can actually reach rather than ids that meant
+something only inside the system that minted them, and the display name travels
+on the row as the name at the time of the act.
+
+It is a storage-schema change on purpose, across file and daemon-remote storage
+(turns, comments, status transitions and tag events). The
+alternative was a control-plane-side audit table, which does not travel with a
+store export — and an export that cannot say who did what is not the user's own
+data. It is nullable forever: every system, builder and agent write has no
+person behind it, and neither does any row predating the change.
+
+The two halves are nullable independently, so a row may name an address with no
+display name beside it — and it reads as that address alone, because a name lazy
+is not sure of is worse than no name at all.
+
+The value comes from the token, never from the request — it is written by the
+same pin above, which is why naming another person is a 403 rather than a silent
+correction. A `control`-kind caller may still name one, exactly as it may name a
+role, because the control plane has already authenticated the human itself.
+`tasks/show` returns it, and `lazy show` prints it as `Name <email>` beside the
+role — falling back to the email alone, then to the role alone, so a row with
+nobody behind it reads exactly as it always did.
+
+**Rows written before that change are converted once, on the first start of the
+upgraded daemon.** An earlier version recorded whatever id the control plane in
+front of the daemon used for somebody, and an id is not an address: one that
+cannot be read as an email is cleared rather than carried into a field that
+promises a person, so the row keeps its actor role and names nobody. The daemon
+reports the count and the ids it cleared in its log rather than dropping them
+quietly — a control plane that knows who those ids are can rewrite them to
+emails in the store before the upgraded daemon runs, and then every one of them
+survives. An install that never had a control plane in front of it has no such
+rows, sees no message, and loses nothing.
+
+Per-user credentials are keyed by email for the same reason: one spelling of a
+person everywhere, so the identity on a row and the identity billed for the work
+are the same string.
+
 ### Builder conversation capture has its own surface: `POST /builder/storage`
 
 The builder supervisor runs **inside** the builder container, and the project's
@@ -944,12 +1171,13 @@ So capture got a fourth surface, strictly narrower than any of them:
 | | `/rpc/*` | `/mcp/:taskId/:tool` | `/builder/storage` |
 | --- | --- | --- | --- |
 | credential | shared daemon token | any MCP token, identity-matched | **builder**-kind MCP token only |
-| exposes | every CLI command + all of Storage | the MCP toolset | 4 Storage methods |
+| exposes | every CLI command + all of Storage | the MCP toolset | 6 Storage methods |
 | caller | host-side CLI | agent in a container | builder **supervisor** in a container |
 
 The allowlist is `BUILDER_STORAGE_METHODS` in `src/daemon/rpc-handlers.ts`:
 `getStoragePath` (probe + `getTaskDir`), `saveConversation`,
-`listBuilderResumeIntents`, `saveBuilderResumeIntent`. Anything else is a **403**,
+`listScratchFiles`, `saveScratchFile` (builder scratch capture on the same
+cadence), `listBuilderResumeIntents`, `saveBuilderResumeIntent`. Anything else is a **403**,
 refused before storage is even opened. A task-kind token, the shared token, and an
 unknown token are all **401** — the surface is defined by credential *kind*, not by
 "at least as privileged as". Client-side, the route family is a property of the
@@ -970,11 +1198,12 @@ corrupt Claude Code's TUI, which is why the report waits for the exit.
 
 ### The daemon state dir is never mounted into a container
 
-`/rpc/*` still authenticates with the single **shared** daemon token, and the token
-registry sits in the same directory. Both are safe only because no container can
-read that directory: an agent that could would not need to impersonate anyone over
-`/mcp` — it would lift the shared token and call `/rpc/acceptTask` directly, or copy
-another task's MCP token straight out of the registry.
+`/rpc/*` authenticates with the shared daemon token or a minted actor token, and
+the token registry sits in the same directory. Both are safe only because no
+container can read that directory: an agent that could would not need to
+impersonate anyone over `/mcp` — it would lift the shared token and call
+`/rpc/acceptTask` directly, or copy another task's MCP token straight out of the
+registry.
 
 Rather than rebuild `/rpc` auth, that is an **asserted invariant**:
 `test/unit/daemon-dir-never-mounted.test.ts` derives the forbidden directory
@@ -1019,15 +1248,17 @@ long is already broken, and this only decides whether the user finds out.
 
 ## Naming: lazy vs lazy-agent
 
-The binary is named `lazy-agent` (not `lazy`) because eventually both will be
-separate MCP servers:
+The in-container binary is named `lazy-agent` (not `lazy`) to keep it distinct
+from the host-side `lazy` CLI: `lazy-agent` runs inside containers and exposes
+tools for the coding agent.
 
-- **`lazy-agent`** — runs inside containers, exposes tools for the coding agent
-- **`lazy`** (future) — runs on the host, allows the lazy builder to talk to lazy directly
-
-These have similar but different APIs. The agent-facing tools (search, commit,
-and the agent's own-subtree create/start/show/diff/wait/unblock/accept) are
-ownership-scoped, whereas the builder's host-facing tools are unrestricted.
+The agent-facing and builder-facing tool surfaces have similar but different
+APIs. The agent-facing WRITE tools (the agent's
+own-subtree create/start/unblock/accept) are ownership-scoped, whereas the
+builder's host-facing tools are unrestricted. Agent READS (search, show, diff,
+wait, list, …) are not scoped at all — they span the whole task tree, which is
+what lets an agent learn from earlier tasks. See
+[surface asymmetries: agent-ownership gating](surface-asymmetries.md#1-agent-ownership-gating-writes-only).
 
 ## Container Setup
 
@@ -1036,6 +1267,11 @@ The host mounts the agent binary into the container:
 ```
 -v ${agentBinaryPath}:/usr/local/bin/lazy-agent:ro
 ```
+
+`agentBinaryPath` is always a content-addressed install
+(`~/.lazy/bin/lazy-agent-<id>`), never the `~/.lazy/bin/lazy-agent-current`
+pointer — see
+[Installs are immutable](#installs-are-immutable-so-nothing-is-ever-swapped-under-a-mount).
 
 The container's entrypoint runs `lazy-agent --protocol-dir ... --worktree ...`
 which starts the supervisor loop.
@@ -1130,11 +1366,29 @@ A worktree with unmerged files and no resolution in flight is not a valid
 outcome. `settleConflictedWorktree` (`src/supervisor/merge.ts`) enforces it:
 every failure path in the merge phase goes through it, and its verdict is
 attached to the error the supervisor reports (`merge_state` on the error
-response) so the human sees whether their files are still conflicted. A failed
-abort is reported as `settled: false` with the one command to run by hand — it
-is never swallowed. The sync success path re-reads the worktree before reporting
-success, and turns a still-mid-merge tree into a loud failure rather than a
-`blocked` task that looks settled.
+response) so the human sees whether their files are still conflicted. The sync
+success path re-reads the worktree before reporting success, and turns a
+still-mid-merge tree into a loud failure rather than a `blocked` task that looks
+settled.
+
+Settling tries three things in order, stopping at the first that works, because
+git refuses to abort a merge while a tracked file it touches is dirty in the
+index (`error: Entry 'bun.lock' not uptodate`) — which is what a post-turn check
+that reinstalls dependencies leaves behind:
+
+1. `git merge --abort`.
+2. Refresh the index, then abort again. This only re-stats tracked files, so a
+   file whose contents really did change stays dirty and nothing can be lost.
+   It clears the common case: a file rewritten with its own bytes.
+3. Save the worktree's diff to `.lazy/recovery/merge-settle-<timestamp>.patch`,
+   then reset to HEAD. This is the only step that discards anything, and it
+   only ever discards what it has just saved: if the diff cannot be captured,
+   the reset does **not** run.
+
+Whatever happens, it is reported. A settle that had to reset names the patch
+file so you can `git apply` it. A settle that could not finish comes back as
+`settled: false` with the commands to run by hand and the worktree path — never
+a quiet success, and never a worktree left wedged without you being told.
 
 A **fully resolved but uncommitted** merge is concluded, not discarded. The
 agent cannot create a merge commit from inside the container, so the supervisor
@@ -1149,7 +1403,10 @@ resolution. Before aborting, the supervisor saves what it found to
 `.lazy/recovery/merge-rollback-<timestamp>.patch`, reports it on the protocol
 response (`worktree_recovery`), and the reconciler writes it to the task journal
 attributed to the supervisor. The journal is the right home: durable, visible in
-`lazy show`, and never fed back into a prompt.
+`lazy show`, and never fed back into a prompt. On the rare occasion the diff
+cannot be captured at all, the rollback still happens — a turn cannot start on a
+half-merged worktree — but the journal entry says so explicitly, so a discard is
+never reported as "there was nothing to save".
 
 Supervisor **startup** deliberately does not roll back. It is the one moment
 with no command to attribute a rollback to, and a supervisor starts for every

@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test';
-import { renderStatusHeader } from '../../src/cli/status-header';
+import { renderStatusHeader } from '../../src/render/status-header';
 import type { SupervisorStatus } from '../../src/protocol/types';
 
 const baseStatus: SupervisorStatus = {

@@ -33,6 +33,16 @@
  * failover decisions are made purely on the upstream's status line, before its
  * body is handed back to the client.
  *
+ * Outbound request plugins (user extension seam): when the project has plugin
+ * modules in `.lazy/plugins/`, the parsed request body is passed through a chain
+ * of pure transforms before it is forwarded (src/proxy/plugins). With no plugin
+ * installed — the default — the chain is empty, short-circuits, and the original
+ * bytes go out untouched.
+ *
+ * Clients identify themselves with two optional headers that lazy injects:
+ *   x-lazy-role     — "builder" | "agent"
+ *   x-lazy-task-id  — short task id
+ *
  * JIT CREDENTIALS: a launched agent never holds a real credential. It carries a
  * per-launch PLACEHOLDER (src/proxy/credential-broker.ts); this server resolves
  * it to the grant it was minted for, and swaps in the target's real credential
@@ -54,8 +64,16 @@
 
 import { randomUUID } from 'crypto';
 import type { ProxyAuditRecord, ProxyEnforcementAudit, ProxyReroute } from '../storage/types';
-import { extractRequest } from './extractor';
+import { extractRequest, classifyEndpoint } from './extractor';
+import { warmToolResultTokenizer } from './tool-result-tokens';
+import type { ProxyToolStatsRecorder } from './tool-stats';
 import { AuditQueue, type AuditSink } from './audit';
+import {
+  captureUsageLimitHeaders,
+  daemonUsageLimits,
+  usageLimitCredentialKey,
+  type UsageLimitTracker,
+} from './usage-limits';
 import {
   activityPath, closeEventFromRecord, proxyActivity,
   CREDENTIAL_REFUSED_PREFIX, PATH_REFUSED_PREFIX, type ProxyActivityBus,
@@ -67,8 +85,29 @@ import {
   pathRefusalReasonText,
 } from './path-allowlist';
 import { enforceResponseBody } from './enforce';
-import { extractUsage, teeUsageStream } from './usage';
+import { extractUsage, teeUsageStream, type UsageWire } from './usage';
+import { isSseContentType, withSseKeepAlive } from './keepalive';
+import {
+  DEFAULT_UPSTREAM_TIMEOUT_SECONDS,
+  describeUpstreamFailure,
+  isUpstreamTimeout,
+  upstreamFetchOptions,
+} from './upstream-timeout';
+import { extractOpenAIRequest } from './openai-extractor';
+import { routeForProfile, type AgentUpstreamRoute } from './agent-upstreams';
 import { defaultPolicyConfig, type ProxyPolicyConfig } from './policy';
+import { applyRequestPlugins, type ProxyRequestPlugin } from './plugins/types';
+import {
+  scanForPlaceholder,
+  swapCredential,
+  expectedFormFor,
+  envVarForForm,
+  denialMessage,
+  normalizePeerAddress,
+  type SessionAuthDenial,
+  type SessionCredentialLookup,
+} from './session-auth';
+import { isSessionPlaceholderToken } from '../daemon/session-credentials';
 import {
   CURSOR_PROXY_PREFIX,
   DEFAULT_CURSOR_UPSTREAM,
@@ -87,7 +126,6 @@ import {
 } from './inject';
 import type { TargetCredentials } from './target-credentials';
 import type { CredentialGrant } from './credential-broker';
-import type { RoleName } from '../config/types';
 import { looksLikeLazyPlaceholder } from './credential-broker';
 import { logger } from '../utils/logger';
 
@@ -127,7 +165,32 @@ export interface ProxyFallbackTarget {
   model?: string;
 }
 
+/**
+ * What `createProxyServer` returns: Bun's primary server, whose `stop` also
+ * stops every extra listener, plus `binds` — every address actually listening.
+ */
+export type ProxyServer = ReturnType<typeof Bun.serve> & {
+  binds: string[];
+  /** The audit queue's append history, for `lazy daemon health`. */
+  auditHealth: () => ReturnType<AuditQueue['health']>;
+};
+
+/**
+ * The proxy's own liveness path, answered by the proxy itself and never
+ * forwarded. `lazy daemon health` sends one request here to prove the proxy
+ * is listening and its handler runs — it carries no credential, reaches no
+ * upstream, spends nothing and is not audited. Under the `/_lazy/` prefix the
+ * cursor route already reserves, so it can never shadow an upstream path.
+ */
+export const PROXY_HEALTH_PATH = '/_lazy/health';
+
 export interface ProxyServerConfig {
+  /**
+   * Addresses to listen on IN ADDITION to `bind`, on the same port — the
+   * container bridge gateway on native Linux (see resolveProxyBindHosts in
+   * src/daemon/bind-hosts.ts). Empty or absent means `bind` alone.
+   */
+  extraBindHosts?: string[];
   /** TCP port to listen on. */
   port: number;
   /** Bind address (e.g., "127.0.0.1"). */
@@ -152,27 +215,62 @@ export interface ProxyServerConfig {
    */
   policy?: ProxyPolicyConfig;
   /**
-   * Per-ROLE upstream overrides, keyed by the role a verified caller's grant was
-   * minted for. A request from a role listed here is forwarded to ITS upstream
-   * instead of the primary — this is what makes a role `endpoint` proxy-side
-   * routing rather than a direct connection the agent makes itself (see
-   * src/proxy/role-upstreams.ts).
+   * Ordered outbound request-transform chain, already loaded from the project's
+   * `.lazy/plugins/` directory by the caller (src/proxy/plugins/loader.ts).
+   * Omitted or empty means NO plugin runs and the request body is forwarded
+   * byte-for-byte, which is the default posture.
+   *
+   * The server takes a LIST rather than a config object on purpose: loading is
+   * async and can fail loudly, and that failure belongs to daemon startup, not
+   * to constructing a server.
+   */
+  plugins?: readonly ProxyRequestPlugin[];
+  /**
+   * Resolve a lazy session placeholder token to its owner's real credential
+   * (src/proxy/session-auth.ts). Supplied by the daemon, which is the only
+   * process that holds real per-user credentials.
+   *
+   * Omitted — the default, and the only shape a single-user install ever has —
+   * means no request can carry a placeholder lazy would honour, so credential
+   * headers are forwarded verbatim exactly as they always were.
+   */
+  resolveSessionCredential?: SessionCredentialLookup;
+  /**
+   * Per-PROFILE upstream overrides, keyed by the agent profile a verified
+   * caller's grant was minted for (`[agents.<name>]`, see
+   * src/proxy/agent-upstreams.ts). A request from a profile listed here is
+   * forwarded to ITS upstream instead of the primary — this is what makes a
+   * profile `endpoint` proxy-side routing rather than a direct connection the
+   * agent makes itself.
    *
    * Deliberately NOT a failover chain: `[[proxy.fallback]]` is the primary's
-   * failover, and failing an ollama role over to api.anthropic.com would change
-   * the model AND bill the user, silently (CLAUDE.md: no silent fallbacks). A
-   * role upstream that is down fails, loudly, like any other unreachable upstream.
+   * failover, and failing an ollama profile over to api.anthropic.com would
+   * change the model AND bill the user, silently (CLAUDE.md: no silent
+   * fallbacks). A profile upstream that is down fails, loudly, like any other
+   * unreachable upstream.
    *
-   * Unlisted roles — and unattributed traffic, which has no role at all — use the
-   * primary upstream and its chain, unchanged.
+   * Unlisted profiles — and unattributed traffic, which has no profile at all —
+   * use the primary upstream and its chain, unchanged.
+   *
+   * Each entry carries the upstream's WIRE FORMAT too: an `openai` wire routes
+   * the request through the OpenAI path-allowlist tier and the OpenAI usage
+   * extractor; the Anthropic-shaped extractor never sees that traffic.
    */
-  roleUpstreams?: Partial<Record<RoleName, string>>;
+  agentUpstreams?: Record<string, AgentUpstreamRoute>;
   /**
    * Cursor API base URL that the `/_lazy/cursor/<token>` route forwards
    * to. Defaults to Cursor's production origin. This route is a verbatim
    * passthrough — see src/proxy/cursor-route.ts.
    */
   cursorUpstream?: string;
+  /**
+   * Seconds the proxy waits for an upstream to answer before giving up, on
+   * every route. Defaults to {@link DEFAULT_UPSTREAM_TIMEOUT_SECONDS}; 0 means
+   * no ceiling. This REPLACES Bun's hidden default fetch timeout, which used to
+   * end slow local-model requests at a number lazy never chose — see
+   * src/proxy/upstream-timeout.ts.
+   */
+  upstreamTimeoutSeconds?: number;
 }
 
 const LAZY_HEADERS = new Set(['x-lazy-role', 'x-lazy-task-id']);
@@ -184,6 +282,23 @@ const DEFAULT_RETRY_AFTER_THRESHOLD = 5;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Wrap an SSE response body in keep-alive framing; hand anything else back
+ * untouched.
+ *
+ * The content type is read from the headers the CLIENT will receive, so the
+ * decision matches what the client's parser will do with the bytes. A
+ * non-SSE body is never touched: an injected comment would corrupt JSON, and
+ * cursor's connect-rpc passthrough is not SSE either.
+ */
+function keepAliveIfSse(
+  body: ReadableStream<Uint8Array> | null,
+  respHeaders: Headers,
+): ReadableStream<Uint8Array> | null {
+  if (!body || !isSseContentType(respHeaders.get('content-type'))) return body;
+  return withSseKeepAlive(body);
 }
 
 /**
@@ -400,6 +515,7 @@ async function forwardCursor(
     id: string; seq: number; startMs: number;
     auditQueue: AuditQueue;
     activity: ProxyActivityBus;
+    upstreamTimeoutSeconds: number;
   },
 ): Promise<Response> {
   const fwdHeaders = new Headers(req.headers);
@@ -410,6 +526,7 @@ async function forwardCursor(
   const target = cursorUpstream + route.upstreamPath;
   let hasBody = req.method !== 'GET' && req.method !== 'HEAD' && req.body != null;
   let bodyOverride: Uint8Array | null = null;
+  let cursorCredentialLabel: string | null = null;
 
   // --- JIT credential exchange ---
   if (caller && credentials) {
@@ -431,6 +548,7 @@ async function forwardCursor(
       stripPresentedCredential(fwdHeaders, presented, caller.token);
     } else {
       applyCredential(fwdHeaders, presented, caller.token, outcome.placement);
+      cursorCredentialLabel = outcome.label;
       // Body substitution only for an in-place placement: that value is the
       // bare credential. A header placement's value may carry wire framing
       // ("Bearer x"), which belongs in a header and nowhere else.
@@ -499,9 +617,12 @@ async function forwardCursor(
       // sent while the response is read. A substituted body is a plain string
       // and must NOT declare half-duplex.
       ...(bodyOverride === null && hasBody ? { duplex: 'half' } : {}),
+      // lazy's own ceiling instead of Bun's hidden one — same rule on every
+      // route, so no upstream can be reaped at a number nobody chose.
+      ...upstreamFetchOptions(ctx.upstreamTimeoutSeconds),
     } as RequestInit);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    const message = describeUpstreamFailure(err, cursorUpstream, ctx.upstreamTimeoutSeconds);
     ctx.auditQueue.enqueue({ ...base, status: null, error: message, durationMs: Date.now() - ctx.startMs });
     logger.warn(`[proxy] seq=${ctx.seq} cursor upstream ${cursorUpstream} unreachable: ${message}`);
     return new Response(
@@ -513,6 +634,11 @@ async function forwardCursor(
   ctx.auditQueue.enqueue({
     ...base,
     status: upstreamResp.status,
+    usageLimitHeaders: captureUsageLimitHeaders(upstreamResp.headers),
+    credential: usageLimitCredentialKey({
+      credentialLabel: cursorCredentialLabel,
+      upstream: cursorUpstream,
+    }),
     error: null,
     durationMs: Date.now() - ctx.startMs,
   });
@@ -542,46 +668,96 @@ export function createProxyServer(
   credentials: ProxyCredentialDeps | null,
   // Live-activity sink for `lazy watch`. Defaults to the daemon-wide singleton;
   // injectable so a unit test can observe one proxy's traffic in isolation.
-  options?: { activity?: ProxyActivityBus },
-): ReturnType<typeof Bun.serve> {
+  //
+  // `toolStats` is the DURABLE per-task tool-stats recorder (src/proxy/tool-
+  // stats.ts) — the one thing here that does reach Storage, because a per-tool
+  // summary must outlive the bounded audit log. Optional: a unit test of the
+  // routing paths wants no storage at all, and omitting it changes nothing
+  // about how requests are forwarded.
+  options?: {
+    activity?: ProxyActivityBus;
+    toolStats?: ProxyToolStatsRecorder;
+    // Latest usage-limit reading per credential. Defaults to the daemon-wide
+    // tracker the `usageLimits` RPC reads; injectable for tests.
+    usageLimits?: UsageLimitTracker;
+  },
+): ProxyServer {
   const upstream = config.upstream.replace(/\/$/, '');
   const fallbacks: ProxyFallbackTarget[] = (config.fallbacks ?? []).map((f) => ({
     upstream: f.upstream.replace(/\/$/, ''),
     model: f.model,
   }));
   const cursorUpstream = (config.cursorUpstream ?? DEFAULT_CURSOR_UPSTREAM).replace(/\/$/, '');
-  const roleUpstreams: Partial<Record<RoleName, string>> = {};
-  for (const [role, url] of Object.entries(config.roleUpstreams ?? {})) {
-    if (url) roleUpstreams[role as RoleName] = url.replace(/\/$/, '');
+  const agentUpstreams: Record<string, AgentUpstreamRoute> = {};
+  for (const [profile, route] of Object.entries(config.agentUpstreams ?? {})) {
+    if (route?.upstream) {
+      agentUpstreams[profile] = {
+        upstream: route.upstream.replace(/\/$/, ''),
+        wire: route.wire,
+      };
+    }
   }
   const retryAfterThreshold = config.retryAfterThreshold ?? DEFAULT_RETRY_AFTER_THRESHOLD;
+  const upstreamTimeoutSeconds =
+    config.upstreamTimeoutSeconds ?? DEFAULT_UPSTREAM_TIMEOUT_SECONDS;
   const policy = config.policy ?? defaultPolicyConfig();
+  // Empty unless the project ships plugins in .lazy/plugins. An empty chain is
+  // short-circuited per request, so the default path is unchanged.
+  const requestPlugins = config.plugins ?? [];
   // The live tap: every audited record becomes a `close` event for any
   // `lazy watch` subscriber. Wired at the queue so no record site can miss it.
   const activity = options?.activity ?? proxyActivity;
-  const auditQueue = new AuditQueue(auditSink, (record) =>
-    activity.publish(closeEventFromRecord(record)),
-  );
+  const toolStats = options?.toolStats ?? null;
+  const usageLimits = options?.usageLimits ?? daemonUsageLimits;
+  const auditQueue = new AuditQueue(auditSink, (record) => {
+    activity.publish(closeEventFromRecord(record));
+    // Pure in-memory map write; cannot fail on I/O.
+    usageLimits.observe(record);
+    // Folded at the queue for the same reason the activity tap is: every
+    // record that reaches the trail reaches the durable tool stats too, by
+    // construction, so a future audit site cannot forget it. `observe` returns
+    // immediately — the read-modify-write runs behind the request.
+    if (toolStats) {
+      try {
+        toolStats.observe(record);
+      } catch (err) {
+        // A statistics failure must never break the request being observed,
+        // nor stop the DURABLE audit append below from happening.
+        logger.warn(
+          `[proxy] tool-stats fold failed for seq=${record.seq}: ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  });
   let seq = 0;
+
+  // Load the BPE table the tool_result sizer needs, off the request path.
+  // Fire-and-forget on purpose: results audited before it resolves record a
+  // null token count (honest "not measured"), and nothing waits to serve.
+  void warmToolResultTokenizer().catch((err) => {
+    logger.warn(
+      `[proxy] tool-result token sizing unavailable: ${err instanceof Error ? err.message : String(err)}. ` +
+        `Tool calls will still be audited; their result sizes will read as not measured.`,
+    );
+  });
 
   const fallbackNote = fallbacks.length
     ? `, failover chain: [${fallbacks.map((f) => f.upstream).join(', ')}]`
     : '';
-  const roleEntries = Object.entries(roleUpstreams);
-  const roleNote = roleEntries.length
-    ? `, role upstreams: [${roleEntries.map(([r, u]) => `${r} → ${u}`).join(', ')}]`
+  const agentEntries = Object.entries(agentUpstreams);
+  const agentNote = agentEntries.length
+    ? `, agent profiles: [${agentEntries.map(([p, u]) => `${p} → ${u.upstream} (${u.wire} wire)`).join(', ')}]`
     : '';
 
-  const server = Bun.serve({
-    // 0 = let the OS assign a free port; the actual port is read back from
-    // `server.port` below (and published so agents/status can find it).
-    port: config.port,
-    hostname: config.bind,
-    idleTimeout: 240,
-
-    async fetch(req) {
-      const startMs = Date.now();
+  const handleRequest = async (req: Request, srv?: { requestIP(req: Request): { address: string } | null }): Promise<Response> => {
       const url = new URL(req.url);
+      // Liveness self-check (see PROXY_HEALTH_PATH). FIRST, ahead of the
+      // sequence counter and every audit site: it is not traffic.
+      if (url.pathname === PROXY_HEALTH_PATH && req.method === 'GET') {
+        return Response.json({ ok: true, service: 'lazy-proxy' });
+      }
+      const startMs = Date.now();
       const path = url.pathname + url.search;
       const id = randomUUID();
       const currentSeq = ++seq;
@@ -636,6 +812,7 @@ export function createProxyServer(
           startMs,
           auditQueue,
           activity,
+          upstreamTimeoutSeconds,
         });
       }
 
@@ -692,9 +869,21 @@ export function createProxyServer(
       const taskId = caller ? caller.grant.taskId : req.headers.get('x-lazy-task-id');
 
       // Which upstream this request is bound for. Resolved HERE rather than at
-      // the forwarding site because the allowlist tier depends on it: a role
+      // the forwarding site because the allowlist tier depends on it: a routed
       // upstream is a non-Anthropic backend and gets the tighter list.
-      const roleUpstream = caller ? roleUpstreams[caller.grant.role] : undefined;
+      //
+      // The caller's PROFILE decides where this goes. It is read off the
+      // broker-minted grant, so it is evidence rather than a client claim — an
+      // agent cannot route itself somewhere else by setting a header. A caller
+      // with no profile route (an unattributed request — a host `claude` login
+      // session sharing the proxy — or a profile with no endpoint of its own)
+      // has nothing to route by and uses the primary upstream, as before.
+      const callerRoute = caller ? routeForProfile(agentUpstreams, caller.grant) : undefined;
+      const routedUpstream = callerRoute?.upstream;
+      // Which wire format this request's traffic speaks — picks the allowlist
+      // tier, the request extractor, and the usage scanner. The Anthropic
+      // extractor must never see OpenAI-wire traffic, and vice versa.
+      const wire: UsageWire = callerRoute?.wire === 'openai' ? 'openai' : 'anthropic';
 
       // --- Forwarding-surface allowlist ---
       // Applied BEFORE the body is buffered, the extractor runs, or anything is
@@ -705,10 +894,10 @@ export function createProxyServer(
       // it to granted callers would leave the surface open to exactly the class
       // of client that presents no credential, and there is no legitimate
       // non-model-API request through this proxy from any client.
-      const tier = roleUpstream ? 'role' : 'primary';
+      const tier = callerRoute ? (callerRoute.wire === 'openai' ? 'openai' : 'role') : 'primary';
       const pathDecision = decideProxyPath(req.method, url.pathname, tier);
       if (!pathDecision.allowed) {
-        const upstreamForRecord = roleUpstream ?? upstream;
+        const upstreamForRecord = routedUpstream ?? upstream;
         logger.warn(
           `[proxy] seq=${currentSeq} REFUSED ${req.method} ${url.pathname} → ${upstreamForRecord} ` +
             `(${pathRefusalReasonText(pathDecision.reason)}) task=${taskId ?? '-'} role=${role ?? '-'}`,
@@ -734,7 +923,7 @@ export function createProxyServer(
       // Buffer the request body for audit extraction; forward verbatim (and
       // re-send on failover — the body is already in memory, so a reroute costs
       // nothing extra to buffer).
-      const bodyText =
+      let bodyText =
         req.method === 'GET' || req.method === 'HEAD' ? '' : await req.text();
 
       let parsedBody: unknown = null;
@@ -746,7 +935,45 @@ export function createProxyServer(
         }
       }
 
-      const extracted = extractRequest(path, parsedBody);
+      // --- outbound request plugins (src/proxy/plugins) ---
+      // No-op unless the project installed one: with an empty chain this
+      // returns the same object identity and the original bytes are forwarded.
+      // Runs BEFORE extraction so the audit trail describes what was actually
+      // sent upstream, never a body the upstream never saw.
+      // Plugins are Anthropic-body transforms; OpenAI-wire bodies are never
+      // offered to them — a transform written against Anthropic block shapes
+      // rewriting a chat-completions body would be silent corruption.
+      if (requestPlugins.length > 0 && parsedBody !== null && wire === 'anthropic') {
+        const originalBytes = bodyText.length;
+        const transformed = applyRequestPlugins(requestPlugins, parsedBody, {
+          method: req.method,
+          path,
+          endpoint: classifyEndpoint(path),
+        });
+        if (transformed.changed) {
+          // Re-serialising must never take down a request: if the transformed
+          // body somehow will not stringify, forward the original bytes.
+          try {
+            const nextText = JSON.stringify(transformed.body);
+            parsedBody = transformed.body;
+            bodyText = nextText;
+            logger.debug(
+              `[proxy] seq=${currentSeq} plugins [${transformed.appliedBy.join(', ')}] ` +
+                `rewrote request body: ${originalBytes} → ${bodyText.length} bytes ` +
+                `(${(((originalBytes - bodyText.length) / originalBytes) * 100).toFixed(1)}% smaller)`,
+            );
+          } catch (err) {
+            logger.warn(
+              `[proxy] seq=${currentSeq} plugin output could not be serialised; ` +
+                `forwarding the original body: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
+      }
+
+      const extracted = wire === 'openai'
+        ? extractOpenAIRequest(path, parsedBody)
+        : extractRequest(path, parsedBody);
       if (extracted.requestShape) {
         extracted.requestShape.bodyBytes = bodyText.length;
       }
@@ -771,12 +998,78 @@ export function createProxyServer(
       fwdHeaders.delete('content-length');
       for (const h of LAZY_HEADERS) fwdHeaders.delete(h);
 
-      // Ordered target list. A verified caller whose ROLE names its own upstream
-      // is routed there and ONLY there — see `roleUpstreams` for why that list
-      // gets no failover chain. Everything else is primary-then-fallbacks, and
-      // the primary never overrides the model (undefined); fallbacks may.
-      const targets: ProxyFallbackTarget[] = roleUpstream
-        ? [{ upstream: roleUpstream, model: undefined }]
+      // --- per-user credentials: session placeholder → real token ---
+      // Only touches a credential lazy itself minted (the `lazy-sess-` prefix).
+      // With no resolver configured, or a request carrying a real credential,
+      // this whole block is a single prefix test and the headers go out
+      // untouched — the single-user path, unchanged.
+      let userId: string | null = null;
+      const scan = config.resolveSessionCredential
+        ? scanForPlaceholder(fwdHeaders, isSessionPlaceholderToken)
+        : ({ kind: 'none' } as const);
+
+      /** Refuse a placeholder request: 401, audited, never forwarded. */
+      const denySession = (denial: SessionAuthDenial, detail?: string): Response => {
+        const message = denialMessage(denial, detail);
+        // `status` stays null: the request never reached the upstream, so this
+        // is not evidence about lazy's own credential (see proxy/auth-verdict.ts
+        // — a 401 there means "Anthropic rejected us"). The refusal is recorded
+        // in `authDenial`, which is what a per-user audit reads.
+        auditQueue.enqueue({
+          id, seq: currentSeq, ts: startMs, role, taskId, userId,
+          backend: 'proxy', upstream: config.upstream,
+          method: req.method, path, endpoint: extracted.endpoint, model: extracted.model,
+          tier: extracted.tier, stream: extracted.stream, requestShape: extracted.requestShape,
+          toolUses: extracted.toolUses, toolResults: extracted.toolResults,
+          status: null, usage: null, stopReason: null, error: message,
+          durationMs: Date.now() - startMs, reroute: null, enforcement: null,
+          authDenial: denial,
+        });
+        logger.warn(
+          `[proxy] seq=${currentSeq} refused ${denial} task=${taskId ?? '-'} role=${role ?? '-'}` +
+          (userId ? ` user=${userId}` : ''),
+        );
+        return new Response(
+          JSON.stringify({ type: 'error', error: { type: 'authentication_error', message } }),
+          { status: 401, headers: { 'content-type': 'application/json' } },
+        );
+      };
+
+      if (scan.kind === 'ambiguous') {
+        return denySession(
+          'auth_kind_mismatch',
+          'a lazy session token was presented in both Authorization and x-api-key',
+        );
+      }
+      if (scan.kind === 'one') {
+        // Where the request came from: a member placeholder is pinned to its
+        // container's address, and refused from anywhere else.
+        const peerAddress = normalizePeerAddress(srv?.requestIP(req)?.address);
+        const resolved = await config.resolveSessionCredential!(scan.credential.token, { peerAddress });
+        if (!resolved.ok) {
+          return resolved.reason === 'wrong_origin'
+            ? denySession('session_token_wrong_origin', resolved.detail)
+            : denySession('unknown_session_token');
+        }
+        userId = resolved.userId;
+        const expected = expectedFormFor(resolved.kind);
+        if (expected !== scan.credential.form) {
+          return denySession(
+            'auth_kind_mismatch',
+            `user ${resolved.userId} holds a ${resolved.kind} credential, which lazy sends as ` +
+            `${envVarForForm(expected)}, but the request arrived as ${envVarForForm(scan.credential.form)}`,
+          );
+        }
+        swapCredential(fwdHeaders, scan.credential, resolved.secret);
+      }
+
+      // Ordered target list. A verified caller whose PROFILE names its own
+      // upstream is routed there and ONLY there — see `agentUpstreams` for why
+      // that list gets no failover chain. Everything else is
+      // primary-then-fallbacks, and the primary never overrides the model
+      // (undefined); fallbacks may.
+      const targets: ProxyFallbackTarget[] = routedUpstream
+        ? [{ upstream: routedUpstream, model: undefined }]
         : [{ upstream, model: undefined }, ...fallbacks];
 
       // --- Per-target credentials ---
@@ -785,7 +1078,7 @@ export function createProxyServer(
       // reroute must carry the credential the target it actually reaches needs,
       // not whichever one the client happened to present. Forwarding the
       // primary's credential down the chain is exactly the leak this closes.
-      const chain: Array<{ target: ProxyFallbackTarget; headers: Headers }> = [];
+      const chain: Array<{ target: ProxyFallbackTarget; headers: Headers; label: string | null }> = [];
       if (caller) {
         for (const target of targets) {
           const outcome = await credentials!.targets.forTarget(target.upstream);
@@ -824,11 +1117,11 @@ export function createProxyServer(
             );
             continue;
           }
-          chain.push({ target, headers });
+          chain.push({ target, headers, label: outcome.kind === 'credential' ? outcome.label : null });
         }
       } else {
         // No verified caller: forward exactly what arrived, to every target.
-        for (const target of targets) chain.push({ target, headers: fwdHeaders });
+        for (const target of targets) chain.push({ target, headers: fwdHeaders, label: null });
       }
 
       // Every target reached below came OUT of the chain, so the lookup cannot
@@ -853,7 +1146,11 @@ export function createProxyServer(
           method: req.method,
           headers: headersFor(target),
           body: body.length ? body : undefined,
-        });
+          // lazy's own ceiling, replacing Bun's hidden default fetch timeout.
+          // Without this a local model that is merely slow to produce its first
+          // byte is aborted mid-prefill and reported as an unreachable upstream.
+          ...upstreamFetchOptions(upstreamTimeoutSeconds),
+        } as RequestInit);
       };
 
       let upstreamResp: Response | null = null;
@@ -863,6 +1160,26 @@ export function createProxyServer(
       // failure, not an intermediate fallback's). Null until the primary fails.
       let firstTrigger: string | null = null;
       let attempts = 0;
+      // The primary's usage-limit reading from the response that triggered the
+      // failover. That response is cancelled below and never audited on its
+      // own, so its headers — often the very "limit reached" signal — are
+      // carried on the reroute instead.
+      let primaryDropped: { credential: string; status: number; headers: Record<string, string> } | null = null;
+      /** Capture a response the loop is about to discard, into the live view. */
+      const noteDiscarded = (resp: Response, i: number): void => {
+        const headers = captureUsageLimitHeaders(resp.headers);
+        if (!headers) return;
+        const credential = usageLimitCredentialKey({
+          userId,
+          credentialLabel: chain[i].label,
+          upstream: chain[i].target.upstream,
+        });
+        usageLimits.observeReading({
+          credential, ts: startMs, upstream: chain[i].target.upstream, backend: 'proxy',
+          status: resp.status, taskId, model: wireModel, headers,
+        });
+        if (i === 0 && primaryDropped === null) primaryDropped = { credential, status: resp.status, headers };
+      };
 
       for (let i = 0; i < chain.length; i++) {
         const target = chain[i].target;
@@ -875,10 +1192,11 @@ export function createProxyServer(
         try {
           resp = await doFetch(target);
         } catch (err) {
-          // Unreachable. Reroute to the next target if one exists, else this is
-          // the terminal error (unchanged behavior when no fallback chain).
-          forwardError = err instanceof Error ? err.message : String(err);
-          if (firstTrigger === null) firstTrigger = 'unreachable';
+          // Unreachable, or past lazy's own ceiling. Reroute to the next target
+          // if one exists, else this is the terminal error (unchanged behavior
+          // when no fallback chain).
+          forwardError = describeUpstreamFailure(err, target.upstream, upstreamTimeoutSeconds);
+          if (firstTrigger === null) firstTrigger = isUpstreamTimeout(err) ? 'timeout' : 'unreachable';
           if (!isLast) {
             logger.warn(
               `[proxy] seq=${currentSeq} primary/target ${target.upstream} unreachable (${forwardError}); ` +
@@ -897,6 +1215,7 @@ export function createProxyServer(
           if (resp.status === 429 && isPrimary && chain.length > 1) {
             const wait = parseRetryAfter(resp.headers.get('retry-after'));
             if (wait !== null && wait <= retryAfterThreshold) {
+              noteDiscarded(resp, i);
               await resp.body?.cancel();
               logger.warn(
                 `[proxy] seq=${currentSeq} primary ${target.upstream} 429 with Retry-After=${wait}s ` +
@@ -906,8 +1225,8 @@ export function createProxyServer(
               try {
                 resp = await doFetch(target);
               } catch (err) {
-                forwardError = err instanceof Error ? err.message : String(err);
-                if (firstTrigger === null) firstTrigger = 'unreachable';
+                forwardError = describeUpstreamFailure(err, target.upstream, upstreamTimeoutSeconds);
+                if (firstTrigger === null) firstTrigger = isUpstreamTimeout(err) ? 'timeout' : 'unreachable';
                 if (!isLast) {
                   logger.warn(
                     `[proxy] seq=${currentSeq} primary ${target.upstream} unreachable on retry (${forwardError}); ` +
@@ -932,6 +1251,7 @@ export function createProxyServer(
               `[proxy] seq=${currentSeq} target ${target.upstream} returned ${resp.status}; ` +
                 `failing over to ${chain[i + 1].target.upstream}`,
             );
+            noteDiscarded(resp, i);
             await resp.body?.cancel();
             continue;
           }
@@ -960,6 +1280,13 @@ export function createProxyServer(
             toModel: finalTarget.model ?? wireModel,
             trigger: firstTrigger ?? 'unknown',
             attempts,
+            ...(primaryDropped
+              ? {
+                  fromUsageLimitHeaders: (primaryDropped as { headers: Record<string, string> }).headers,
+                  fromCredential: (primaryDropped as { credential: string }).credential,
+                  fromStatus: (primaryDropped as { status: number }).status,
+                }
+              : {}),
           }
         : null;
 
@@ -981,6 +1308,7 @@ export function createProxyServer(
           ts: startMs,
           role,
           taskId,
+          userId,
           backend: 'proxy',
           upstream: finalTarget.upstream,
           method: req.method,
@@ -1011,6 +1339,36 @@ export function createProxyServer(
       }
 
       const status = upstreamResp.status;
+
+      // Usage-limit signal: read off the response HEADERS, which arrive before
+      // any body — so streamed and error (429) responses carry it alike.
+      const usageLimitHeaders = captureUsageLimitHeaders(upstreamResp.headers);
+      const credentialKey = usageLimitCredentialKey({
+        userId,
+        credentialLabel: chain.find((c) => c.target === finalTarget)?.label ?? null,
+        upstream: finalTarget.upstream,
+      });
+
+      // A 404 on an inference path means the MODEL is not on this upstream, and
+      // the proxy is the only place that holds both halves of that sentence: the
+      // model the client asked for and the upstream its PROFILE routes to. The
+      // agent sees an opaque 404 and the operator saw only `FAIL(404)` in the
+      // traffic view, which is how a pi task pointed at Anthropic with an Ollama
+      // model name cost a session to diagnose. One line, no body read.
+      if (
+        status === 404 &&
+        (extracted.endpoint === 'messages' ||
+          extracted.endpoint === 'chat_completions' ||
+          extracted.endpoint === 'responses')
+      ) {
+        logger.warn(
+          `[proxy] seq=${currentSeq} MODEL NOT FOUND: ${finalTarget.upstream} has no model ` +
+            `"${extracted.model ?? '(unnamed)'}" (task=${taskId ?? '-'} role=${role ?? '-'} ` +
+            `profile=${caller?.grant.profile ?? '-'}). An agent profile with no \`endpoint\` runs the ` +
+            `primary upstream, so a model name from another service 404s there — set the task's model ` +
+            `to one this upstream serves, or give the task a profile whose \`endpoint\` serves that model.`,
+        );
+      }
 
       // Bun's fetch decoded the body (gzip from real Anthropic), so strip the
       // now-stale content-encoding/content-length before forwarding or the
@@ -1065,12 +1423,12 @@ export function createProxyServer(
 
         const durationMs = Date.now() - startMs;
         auditQueue.enqueue({
-          id, seq: currentSeq, ts: startMs, role, taskId, backend: 'proxy', upstream: finalTarget.upstream,
+          id, seq: currentSeq, ts: startMs, role, taskId, userId, backend: 'proxy', upstream: finalTarget.upstream,
           method: req.method, path, endpoint: extracted.endpoint, model: extracted.model,
           tier: extracted.tier, stream: extracted.stream, requestShape: extracted.requestShape,
           toolUses: extracted.toolUses, toolResults: extracted.toolResults,
           status, usage, stopReason: enforced.stopReason, error: null, durationMs,
-          reroute, enforcement,
+          reroute, enforcement, usageLimitHeaders, credential: credentialKey,
         });
 
         return new Response(enforced.bodyText, {
@@ -1091,6 +1449,7 @@ export function createProxyServer(
         ts: startMs,
         role,
         taskId,
+        userId,
         backend: 'proxy',
         upstream: finalTarget.upstream,
         method: req.method,
@@ -1109,18 +1468,25 @@ export function createProxyServer(
         durationMs,
         reroute,
         enforcement: null,
+        usageLimitHeaders,
+        credential: credentialKey,
       };
 
-      // Only a successful /v1/messages response carries token usage. For
-      // everything else (count_tokens, non-2xx, empty body) enqueue immediately
-      // and hand back the upstream stream untouched, exactly as before.
-      const canCaptureUsage =
-        extracted.endpoint === 'messages' && upstreamResp.ok && upstreamResp.body != null;
+      // Only a successful inference response carries token usage —
+      // /v1/messages on the Anthropic wire; /v1/chat/completions and
+      // /v1/responses on the OpenAI wire. For everything else (count_tokens,
+      // non-2xx, empty body) enqueue immediately and hand back the upstream
+      // stream untouched, exactly as before.
+      const usageEndpoint =
+        extracted.endpoint === 'messages' ||
+        extracted.endpoint === 'chat_completions' ||
+        extracted.endpoint === 'responses';
+      const canCaptureUsage = usageEndpoint && upstreamResp.ok && upstreamResp.body != null;
 
       if (!canCaptureUsage) {
         // Fire-and-forget — never awaited on the hot path.
         auditQueue.enqueue(record);
-        return new Response(upstreamResp.body, {
+        return new Response(keepAliveIfSse(upstreamResp.body, respHeaders), {
           status: upstreamResp.status,
           statusText: upstreamResp.statusText,
           headers: respHeaders,
@@ -1134,23 +1500,124 @@ export function createProxyServer(
       const respContentType = upstreamResp.headers.get('content-type') ?? '';
       const respIsStream =
         respContentType.includes('text/event-stream') || extracted.stream === true;
+      // The headers arrived with the response; a stream can run for minutes
+      // before the record is enqueued, so update the live view now. The later
+      // observe from the audit tap carries the same ts and changes nothing.
+      usageLimits.observe(record);
       const teed = teeUsageStream(upstreamResp.body!, respIsStream, (usage) => {
         auditQueue.enqueue({ ...record, usage });
-      });
+      }, wire);
 
-      return new Response(teed, {
+      // Keep-alive framing wraps the tee, never the other way round: the usage
+      // scanner must see the upstream's bytes and ONLY the upstream's bytes, or
+      // lazy's own keep-alive comments would land in the audit record.
+      return new Response(keepAliveIfSse(teed, respHeaders), {
         status: upstreamResp.status,
         statusText: upstreamResp.statusText,
         headers: respHeaders,
       });
-    },
+  };
+
+    /**
+     * Last line of defence for ONE request.
+     *
+     * Every failure the proxy anticipates is already handled inline and audited
+     * (an unreachable upstream, a refused credential, a malformed cursor
+     * route). Anything reaching here is a bug in the handler, and the question
+     * is only what the client and the operator get.
+     *
+     * Without this callback Bun answers with its own 500 and prints the stack —
+     * an HTML-ish page an SDK cannot parse, carrying lazy's internals to an
+     * agent's stderr. With it, the caller gets the same JSON error envelope
+     * every other proxy refusal uses, so a client that already knows how to
+     * read an upstream error reads this one too, and the operator gets exactly
+     * one line with the stack in the daemon log.
+     *
+     * This isolates the failing request and nothing more. It cannot see a throw
+     * from an already-streaming response body — Bun logs those and tears down
+     * the socket without consulting `error` (verified on Bun 1.4.2) — which is
+     * why the daemon also installs process-level guards (src/daemon/process-guards.ts).
+     */
+  const handleError = (err: unknown): Response => {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error(
+        `[proxy] request handler failed (proxy staying up): ${err instanceof Error ? (err.stack ?? message) : message}`,
+      );
+      return new Response(
+        JSON.stringify({
+          type: 'error',
+          error: { type: 'proxy_error', message: `lazy proxy failed to handle this request: ${message}` },
+        }),
+        { status: 502, headers: { 'content-type': 'application/json' } },
+      );
+  };
+
+  // Bun.serve listens on ONE hostname per call, so every address the proxy
+  // answers on is its own server sharing the handlers — the same shape the
+  // daemon's RPC port uses (src/daemon/server.ts, "container reachability").
+  const listen = (hostname: string, port: number) => Bun.serve({
+    // 0 = let the OS assign a free port; the actual port is read back from
+    // `server.port` below (and published so agents/status can find it).
+    port,
+    hostname,
+    // Bun reaps a connection whose RESPONSE BODY has been silent this long
+    // (verified 1.4.2; a handler that has not returned a Response yet is NOT
+    // affected). Raising it is not an option — Bun caps it at 255 — so a silent
+    // SSE body is kept warm by keep-alive comment frames instead
+    // (src/proxy/keepalive.ts), and how long the proxy waits for an upstream is
+    // a separate, explicit ceiling (src/proxy/upstream-timeout.ts).
+    idleTimeout: 240,
+    fetch: handleRequest,
+    error: handleError,
   });
 
-  // Log the ACTUAL bound port (config.port may be 0 → OS-assigned).
-  logger.info(`[proxy] listening on ${config.bind}:${server.port}, forwarding to ${upstream}${fallbackNote}${roleNote}` +
-      `, cursor route ${CURSOR_PROXY_PREFIX}/* → ${cursorUpstream}`);
+  const server = listen(config.bind, config.port);
 
-  return server;
+  // CONTAINER REACHABILITY. A task container dials this proxy at
+  // host.docker.internal:<port>; on native Linux Docker that name is the bridge
+  // gateway, a non-loopback interface a loopback-bound proxy refuses. The
+  // daemon resolves those extra addresses (resolveProxyBindHosts: only under
+  // the daemon port's own conditions, never 0.0.0.0, never overriding an
+  // explicit or managed-mode bind) and hands them here; each is bound on the
+  // SAME port. Security posture unchanged: the proxy authenticates every
+  // request by placeholder lookup, not by where it came from, and the
+  // container bridge is exactly the set of clients it exists for. A bind that
+  // fails is logged and skipped — a proxy the host can still reach beats none.
+  const primaryPort = server.port ?? config.port;
+  const extraServers: ReturnType<typeof Bun.serve>[] = [];
+  const extraHosts: string[] = [];
+  for (const host of config.extraBindHosts ?? []) {
+    if (host === config.bind) continue;
+    try {
+      extraServers.push(listen(host, primaryPort));
+      extraHosts.push(host);
+      logger.info(`[proxy] also listening on ${host}:${primaryPort} (container reachability)`);
+    } catch (err) {
+      logger.warn(
+        `[proxy] could not also listen on ${host}:${primaryPort} (container reachability): ` +
+        `${err instanceof Error ? err.message : String(err)}. Task containers reaching the proxy via ` +
+        `host.docker.internal:${primaryPort} may be refused.`,
+      );
+    }
+  }
+
+  // Log the ACTUAL bound port (config.port may be 0 → OS-assigned).
+  logger.info(`[proxy] listening on ${config.bind}:${server.port}, forwarding to ${upstream}${fallbackNote}${agentNote}` +
+      `, cursor route ${CURSOR_PROXY_PREFIX}/* → ${cursorUpstream}` +
+      `, upstream timeout ${upstreamTimeoutSeconds > 0 ? `${upstreamTimeoutSeconds}s` : 'none'}`);
+
+  // The primary server, with `stop` widened to every listener and the list of
+  // addresses actually bound — `/daemon/status` reports it as `proxy.binds`.
+  const primaryStop = server.stop.bind(server);
+  const stop = async (closeActiveConnections?: boolean): Promise<void> => {
+    for (const extra of extraServers) await extra.stop(closeActiveConnections);
+    await primaryStop(closeActiveConnections);
+  };
+  return Object.assign(server, {
+    binds: [config.bind, ...extraHosts],
+    stop,
+    auditHealth: () => auditQueue.health(),
+  }) as ProxyServer;
 }
 
 export { AuditQueue };

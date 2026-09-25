@@ -10,9 +10,54 @@
 import { describe, test, expect } from 'bun:test';
 import { ClaudeCodeAgent } from '../../src/agent/claude-code';
 import { CursorAgent } from '../../src/agent/cursor';
+import { CursorPackaging } from '../../src/agent/cursor-packaging';
 import { QaAgent } from '../../src/agent/qa-agent';
 import { listAgents, getAgent } from '../../src/agent/registry';
-import { isFatalFailureClass } from '../../src/agent/failure-taxonomy';
+import {
+  classifyCommonFailureSignals,
+  isFatalFailureClass,
+} from '../../src/agent/failure-taxonomy';
+
+describe('classifyCommonFailureSignals', () => {
+  test("the spawn wrapper's binary-not-found message is fatal_config", () => {
+    const failure = classifyCommonFailureSignals(
+      { message: "spawn failed: binary 'claude' not found" },
+      ['claude'],
+    );
+    expect(failure?.class).toBe('fatal_config');
+  });
+
+  test('exit 127 is fatal_config', () => {
+    const failure = classifyCommonFailureSignals(
+      { message: 'claude: command not found', exitCode: 127 },
+      ['claude'],
+    );
+    expect(failure?.class).toBe('fatal_config');
+  });
+
+  // INVARIANT: a quoted shell "command not found" for some other tool is not
+  // evidence the agent binary is missing — only an anchored line naming the
+  // agent binary (or exit 127 / the spawn wrapper) may stop retries.
+  test('quoted command-not-found for another tool is not fatal_config', () => {
+    const failure = classifyCommonFailureSignals(
+      {
+        message: 'agent turn failed',
+        stderr: 'I ran `npm test` and the shell said:\nsome-other-tool: command not found',
+        exitCode: 1,
+      },
+      ['claude'],
+    );
+    expect(failure).toBeNull();
+  });
+
+  test('a genuine shell command-not-found for the agent binary is fatal_config', () => {
+    const failure = classifyCommonFailureSignals(
+      { message: '', stderr: 'claude: command not found', exitCode: 1 },
+      ['claude'],
+    );
+    expect(failure?.class).toBe('fatal_config');
+  });
+});
 
 describe('ClaudeCodeAgent.classifyFailure', () => {
   const agent = new ClaudeCodeAgent();
@@ -67,6 +112,86 @@ describe('ClaudeCodeAgent.classifyFailure', () => {
       message: 'API Error: 403 {"error":"organization has reached its limit"}',
     });
     expect(failure.class).toBe('fatal_auth');
+  });
+
+  // INVARIANT: a 404 from a model API is fatal_config, never retried. The model
+  // does not exist on the upstream this task's profile routes to, which no
+  // number of attempts changes — a pi task on a profile with no endpoint (so,
+  // Anthropic) ran an Ollama model name and burned its attempts on a 404 that
+  // lazy classified `unknown`.
+  test('a model-not-found 404 is fatal_config, and says which two things disagree', () => {
+    const failure = agent.classifyFailure({
+      message: 'API Error: 404 {"type":"error","error":{"type":"not_found_error","message":"model: qwen3.6:27b"}}',
+    });
+    expect(failure.class).toBe('fatal_config');
+    expect(failure.reason).toMatch(/model/i);
+    expect(failure.reason).toMatch(/endpoint|profile/i);
+
+    expect(agent.classifyFailure({ message: 'openai error: model_not_found' }).class)
+      .toBe('fatal_config');
+  });
+
+  // INVARIANT: Anthropic's spent-balance 400 is fatal_auth. Seen on a real pi
+  // turn — it retried the same unpayable request until the crash-loop backstop.
+  // Distinct from "usage limit reached" (the 5-hour window), which stays
+  // transient because it reopens on its own.
+  test('"out of extra usage" is fatal_auth, while a resetting usage limit stays transient', () => {
+    expect(agent.classifyFailure({
+      message: 'pi turn ended in error: 400 {"type":"error","error":{"type":"invalid_request_error",' +
+        '"message":"You\'re out of extra usage. Add more at claude.ai/settings/usage and keep going."}}',
+    }).class).toBe('fatal_auth');
+
+    expect(agent.classifyFailure({ message: 'Claude AI usage limit reached|1758300000' }).class)
+      .toBe('transient_overload');
+  });
+
+  // INVARIANT: a 404 the AGENT printed is not evidence about the model API. The
+  // bare number only counts next to model-API evidence on the same line — the
+  // same defence the "command not found" signal already needed, for the same
+  // reason: agents quote their own work, and a wrong fatal stops a task with a
+  // confident, wrong reason ("your model does not exist") pointing the human at
+  // a model/endpoint pair that is fine.
+  test('a 404 quoted from the agent\'s own work stays retryable', () => {
+    expect(agent.classifyFailure({
+      message: 'agent turn failed',
+      stderr: [
+        'I ran the smoke test and it printed:',
+        '  GET /api/widgets -> 404',
+        'so I fixed the route and re-ran it.',
+      ].join('\n'),
+      exitCode: 1,
+    }).class).toBe('unknown');
+
+    // A test asserting a status code is the same shape.
+    expect(agent.classifyFailure({
+      message: 'agent turn failed',
+      stderr: 'expect(res.status).toBe(404)  // FAIL: received 200',
+    }).class).toBe('unknown');
+  });
+
+  // …while the real model-API shapes still classify, structured or bare.
+  test('model-API 404s still classify, with or without the structured wording', () => {
+    expect(agent.classifyFailure({
+      message: 'API Error: 404 {"type":"error","error":{"type":"not_found_error","message":"model: qwen3.6:27b"}}',
+    }).class).toBe('fatal_config');
+    expect(agent.classifyFailure({ message: 'http 404 from https://api.anthropic.com/v1/messages' }).class)
+      .toBe('fatal_config');
+    // Structured spellings say what they are and need no neighbour.
+    expect(agent.classifyFailure({ message: 'the upstream reported model_not_found' }).class)
+      .toBe('fatal_config');
+  });
+
+  // INVARIANT: the 404 rule is LAST among the shared signals. Ambiguity
+  // resolves toward "keep trying" — a wrong fatal blocks a task that would have
+  // recovered — so ANY auth, overload or connectivity evidence in the same text
+  // wins, including a 404 the agent merely quoted from its own work.
+  test('any transient or auth evidence outranks the 404 rule', () => {
+    expect(agent.classifyFailure({ message: 'API Error: 429 rate limit (see /404 docs)' }).class)
+      .toBe('transient_overload');
+    expect(agent.classifyFailure({ message: 'API Error: 403 forbidden, 404 not_found_error' }).class)
+      .toBe('fatal_auth');
+    expect(agent.classifyFailure({ message: 'socket hang up', stderr: 'earlier: GET /thing 404' }).class)
+      .toBe('transient_network');
   });
 
   test('socket/timeout errors are transient_network', () => {
@@ -153,6 +278,29 @@ describe('CursorAgent.classifyFailure', () => {
     expect(agent.classifyFailure({ message: '429 Too Many Requests' }).class).toBe('transient_overload');
     expect(agent.classifyFailure({ message: 'connect ECONNREFUSED 127.0.0.1:4000' }).class)
       .toBe('transient_unreachable');
+  });
+
+  // INVARIANT: lazy launches `cursor-agent`, not the legacy `agent` symlink —
+  // matching the bare name would stop retries when an agent's transcript quotes
+  // `agent: command not found` from some other tool in the worktree.
+  test('a bare agent: command not found line is not fatal_config', () => {
+    const failure = agent.classifyFailure({
+      message: '',
+      stderr: 'agent: command not found',
+      exitCode: 1,
+    });
+    expect(failure.class).not.toBe('fatal_config');
+    expect(failure.class).toBe('unknown');
+  });
+
+  test('a genuine cursor-agent command-not-found line is fatal_config', () => {
+    const launchBinary = new CursorPackaging().binaryName();
+    const failure = agent.classifyFailure({
+      message: '',
+      stderr: `${launchBinary}: command not found`,
+      exitCode: 1,
+    });
+    expect(failure.class).toBe('fatal_config');
   });
 
   // The counterpart to the Claude case above: same two words, opposite class,

@@ -93,7 +93,7 @@ describe('withRequestSpan', () => {
 
     // Deliberately never resolves — this is a handler killed mid-operation, so
     // the returned promise is not awaited.
-    void withRequestSpan(request('/rpc/wait', { signal: controller.signal }), 'unix',
+    void withRequestSpan(request('/rpc/wait', { signal: controller.signal }), 'tcp',
       () => new Promise<Response>(() => {}));
 
     controller.abort();
@@ -112,7 +112,7 @@ describe('withRequestSpan', () => {
     const controller = new AbortController();
     let settle: (r: Response) => void = () => {};
 
-    const inFlight = withRequestSpan(request('/rpc/accept', { signal: controller.signal }), 'unix',
+    const inFlight = withRequestSpan(request('/rpc/accept', { signal: controller.signal }), 'tcp',
       () => new Promise<Response>((resolve) => { settle = resolve; }));
 
     controller.abort();
@@ -132,7 +132,7 @@ describe('withRequestSpan', () => {
     const records = captureSpans();
     const workMs = 60;
 
-    const response = await withRequestSpan(request('/rpc/wait'), 'unix', async () =>
+    const response = await withRequestSpan(request('/rpc/wait'), 'tcp', async () =>
       heartbeatEnvelopeResponse(async () => {
         await Bun.sleep(workMs);
         return { status: 200, body: { done: true } };
@@ -161,7 +161,7 @@ describe('withRequestSpan', () => {
     const req = request('/rpc/wait', { signal: controller.signal });
     // The signal is what src/daemon/server.ts hands the envelope; without it the
     // writer cannot tell a lost client from a slow one.
-    const response = await withRequestSpan(req, 'unix',
+    const response = await withRequestSpan(req, 'tcp',
       async () => heartbeatEnvelopeResponse(async () => {
         await Bun.sleep(200);
         return { status: 200, body: { done: true } };

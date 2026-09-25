@@ -22,12 +22,14 @@ import type { Task } from '../types';
 import type { ResolvedConfig } from '../config/types';
 import type { RepositoryDriver, RemoteComment } from '../remote/driver';
 import { createDriver } from '../remote';
+import { planForgeImport, applyForgeImport, seenPredicate } from '../remote/imported-comments';
 import {
   shouldAutoReact,
   recordAutoReact,
   type AutoReactTrigger,
 } from './auto-react-budget';
 import { autoUnblockTask } from './auto-deliver';
+import { usagePauseHold } from './usage-pause';
 import { logger } from '../utils/logger';
 // --- Metadata keys for tracking auto-react state ---
 
@@ -154,25 +156,13 @@ async function checkPRComments(
 ): Promise<CheckResult> {
   const taskShortId = task.id.substring(0, 8);
 
-  // Get the sync timestamp to fetch comments since
-  const lastSyncedAt = driver.getLastCommentSyncedAt(task);
-  const session = await storage.getSessionByTaskId(task.id);
-
-  let sinceTimestamp: string;
-  if (lastSyncedAt) {
-    sinceTimestamp = lastSyncedAt;
-  } else if (session) {
-    const turns = await storage.getSessionTurns(session.id);
-    const lastAgentTurn = turns.filter(t => t.role === 'agent').pop();
-    sinceTimestamp = new Date(lastAgentTurn?.timestamp ?? task.created_at).toISOString();
-  } else {
-    sinceTimestamp = new Date(task.created_at).toISOString();
-  }
-
+  // Every visible comment, deduped by id below — no timestamp window, for the
+  // same reason as syncTaskFromRemote: created_at is when a comment was
+  // written, not when it became visible.
   logger.info(`Fetching PR comments for task ${taskShortId}`);
   let comments: RemoteComment[];
   try {
-    comments = await driver.syncComments(task, sinceTimestamp);
+    comments = await driver.syncComments(task);
   } catch (err) {
     logger.error(`Failed to fetch PR comments for task ${taskShortId}: ${err instanceof Error ? err.message : err}`);
     return 'no_action';
@@ -189,33 +179,41 @@ async function checkPRComments(
     return 'no_action';
   }
 
-  // Check if we've already auto-reacted to these comments
-  const lastAutoReactedCommentId = await storage.getTaskMetadata(task.id, AUTO_REACT_LAST_COMMENT_KEY);
+  // Newest by created_at, recorded for diagnostics only. It is NOT a "seen
+  // everything" shortcut: a late-visible comment sorts before it.
   const latestCommentId = humanComments[humanComments.length - 1].id;
 
-  if (lastAutoReactedCommentId === latestCommentId) {
-    // Already reacted to this comment
-    return 'no_action';
-  }
+  // Dedup and edit detection by structured identity (src/remote/imported-comments.ts).
+  const plan = planForgeImport(
+    await storage.getTaskComments(task.id),
+    humanComments,
+    await seenPredicate(storage, task.id),
+  );
+  const format = (c: RemoteComment) => driver.formatImportedComment(c, task);
 
-  // Deduplicate: check if these comments already exist in storage
-  const existingNotes = await storage.getTaskComments(task.id);
-  const existingCommentIds = new Set<string>();
-  for (const note of existingNotes) {
-    const match = note.content.match(/\{(?:remote|gh):(\w+)\}/);
-    if (match) existingCommentIds.add(match[1]);
-  }
-
-  // Find truly new human comments
-  const newComments = humanComments.filter(c => !existingCommentIds.has(c.id));
+  // What warrants a turn: comments never imported, and edits to comments the
+  // agent already saw (they arrive as new revisions). Claims of legacy records
+  // and in-place edits of still-queued comments change nothing the agent has
+  // yet to receive in a new turn, so they are applied without one.
+  const newComments = [...plan.create, ...plan.revise.map(e => e.remote)];
 
   if (newComments.length === 0) {
-    // All comments already synced — update tracking but no auto-react needed
+    await applyForgeImport(storage, task.id, plan, format, 'system');
     await storage.updateTaskMetadata(task.id, AUTO_REACT_LAST_COMMENT_KEY, latestCommentId);
     return 'no_action';
   }
 
   logger.info(`${newComments.length} new PR comment(s) for task ${taskShortId}`);
+
+  // [usage_pause]: held BEFORE anything is consumed. Importing the comments or
+  // recording the attempt here would make the next tick see nothing new, and
+  // the reaction would be lost instead of delayed. Held, the comments stay
+  // un-imported on the forge and this path finds them again after the reset.
+  const usageHold = await usagePauseHold(projectRoot, storage, task, 'auto-react (PR comment)');
+  if (usageHold) {
+    logger.info(`Auto-react: PR comment for task ${taskShortId} held by usage pause — ${usageHold}`);
+    return 'no_action';
+  }
 
   // Check budget
   const decision = await shouldAutoReact(storage, task.id, 'comment', config, dataDir);
@@ -225,11 +223,8 @@ async function checkPRComments(
   }
 
   // Store the new comments in storage first (so the agent can see them)
-  for (const comment of newComments) {
-    const noteContent = driver.formatImportedComment(comment, task);
-    await storage.createComment(task.id, noteContent, 'system', 'remote');
-    logger.info(`Created local comment from remote for task ${taskShortId} (author: ${comment.author})`);
-  }
+  const outcome = await applyForgeImport(storage, task.id, plan, format, 'system');
+  logger.info(`Imported ${outcome.created.length + outcome.revised.length} remote comment(s) for task ${taskShortId}`);
 
   // Build feedback message from new comments
   const feedback = formatCommentFeedback(newComments);
@@ -243,11 +238,6 @@ async function checkPRComments(
   if (success) {
     // Store the latest comment ID so we don't re-trigger
     await storage.updateTaskMetadata(task.id, AUTO_REACT_LAST_COMMENT_KEY, latestCommentId);
-
-    // Update the comment sync timestamp
-    const latestDate = new Date(newComments[newComments.length - 1].createdAt);
-    latestDate.setSeconds(latestDate.getSeconds() + 1);
-    await storage.updateTaskMetadata(task.id, driver.commentSyncedAtKey(), latestDate.toISOString());
 
     logger.info(`Auto-react: auto-unblocked task ${taskShortId} for ${newComments.length} new PR comment(s)`);
 

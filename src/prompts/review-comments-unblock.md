@@ -1,5 +1,8 @@
 The reviewer left {{count}} inline comment(s) on your diff, then unblocked you to
-act on them. Each one is anchored to a specific line.
+act on them. Each one is anchored to a specific line, except two kinds: a comment
+on your own words (your report or a raised item) quotes the line it
+points at instead of naming a file, and a reply on the task-level conversation is
+anchored to the thread quoted under it.
 
 {{comments}}
 

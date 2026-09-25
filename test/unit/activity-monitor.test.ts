@@ -3,6 +3,7 @@ import { mkdtemp, rm, mkdir, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { ActivityMonitor, parseSupervisorLogLine } from '../../src/cli/activity-monitor';
+import { markMachineOneshotPrompt } from '../../src/import/machine-oneshot';
 import { createRunnerFromType } from '../../src/runner';
 
 describe('parseSupervisorLogLine', () => {
@@ -105,5 +106,48 @@ describe('ActivityMonitor (runner-driven discovery)', () => {
     const lines = monitor.drain();
     expect(lines.length).toBeGreaterThan(0);
     expect(lines.some((l) => l.activity.includes('Reading') && l.activity.includes('index.ts'))).toBe(true);
+  });
+
+  // INVARIANT: the monitor follows the TASK's session, never lazy's own
+  // housekeeping one-shot. A one-shot lands in the same projects dir and is the
+  // newest file there, so an unfiltered mtime pick makes the dashboard narrate
+  // the fidelity/report prompt instead of the agent's work.
+  test('ignores a newer machine one-shot session in the same dir', async () => {
+    const runner = createRunnerFromType('dangerously-host-process-without-any-isolation');
+    const projDir = runner.agentSessionProjectDir(worktree);
+    await mkdir(projDir, { recursive: true });
+
+    const agentEntry = JSON.stringify({
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'tool_use', name: 'Read', input: { file_path: '/repo/src/index.ts' } }],
+      },
+    });
+    await writeFile(join(projDir, 'agent-sess.jsonl'), agentEntry + '\n', 'utf-8');
+
+    // Newer, marker-stamped one-shot stub — shaped like the ones seen on disk.
+    await Bun.sleep(20);
+    const oneshotHead = JSON.stringify({
+      type: 'queue-operation',
+      content: markMachineOneshotPrompt('write the branch description'),
+    });
+    const oneshotTool = JSON.stringify({
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'tool_use', name: 'Read', input: { file_path: '/repo/HOUSEKEEPING.md' } }],
+      },
+    });
+    await writeFile(join(projDir, 'oneshot.jsonl'), `${oneshotHead}\n${oneshotTool}\n`, 'utf-8');
+
+    const monitor = new ActivityMonitor(runner, worktree, 'task1234');
+    monitor.start(50);
+    await Bun.sleep(120);
+    monitor.stop();
+
+    const lines = monitor.drain();
+    expect(lines.some((l) => l.activity.includes('index.ts'))).toBe(true);
+    expect(lines.some((l) => l.activity.includes('HOUSEKEEPING.md'))).toBe(false);
   });
 });

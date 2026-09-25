@@ -13,6 +13,7 @@ import { tmpdir } from 'os';
 import { createAllHandlers, type McpToolContext } from '../../src/mcp/tools';
 import { createStorage, type Storage } from '../../src/storage';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
+import { isStoppedParked } from '../../src/task/user-stop';
 
 describe('MCP tools with injected storage', () => {
   let testDir: string;
@@ -214,5 +215,61 @@ describe('MCP tools with injected storage', () => {
     expect(taskHit).toBeDefined();
     expect(taskHit.index).toBeUndefined();
     expect(taskHit.turnSequence).toBeUndefined();
+  });
+});
+
+describe('lazy_list stop marker', () => {
+  let testDir: string;
+  let storage: Storage;
+
+  beforeEach(async () => {
+    testDir = mkdtempSync(join(tmpdir(), 'lazy-mcp-list-stop-'));
+    mkdirSync(join(testDir, '.lazy'), { recursive: true });
+    spawnSyncUnsupervised(['git', 'init'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'config', 'user.name', 'Test'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'config', 'user.email', 'test@example.com'], { cwd: testDir });
+    writeFileSync(join(testDir, 'README.md'), '# Test\n');
+    spawnSyncUnsupervised(['git', 'add', '.'], { cwd: testDir });
+    spawnSyncUnsupervised(['git', 'commit', '-m', 'Initial commit'], { cwd: testDir });
+    storage = await createStorage(testDir, { backend: 'external' });
+  });
+
+  afterEach(async () => {
+    await storage.close();
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  // INVARIANT: lazy_list reports `stopped: true` on a blocked/conflict/
+  // interrupted task whose session a person deliberately stopped, by the same
+  // rule as the CLI's [STOPPED] chip. Without it an agent (the builder
+  // included) cannot tell a stopped task from one that finished its turn, and
+  // may unblock work a human halted on purpose. Never on a `working` task: a
+  // builder unblock leaves the flag set until that turn completes.
+  test('marks user-stopped parked tasks and only those', async () => {
+    const seed = async (goal: string, status: 'blocked' | 'conflict' | 'interrupted', stopped: boolean) => {
+      const task = await storage.createTask(goal);
+      const session = await storage.createSession(task.id, 'claude-code', `lazy/${goal}`, 'a'.repeat(40));
+      await storage.updateTaskStatus(task.id, 'working');
+      await storage.updateTaskStatus(task.id, status);
+      if (stopped) await storage.setUserStopped(session.id, true);
+      return task.id.slice(0, 8);
+    };
+    const stoppedBlocked = await seed('sb', 'blocked', true);
+    const stoppedConflict = await seed('sc', 'conflict', true);
+    const stoppedInterrupted = await seed('si', 'interrupted', true);
+    const plainBlocked = await seed('pb', 'blocked', false);
+
+    const handlers = createAllHandlers({ taskId: '', worktreePath: testDir, storage });
+    const result = (await handlers.get('lazy_list')!({})) as { tasks: Array<{ id: string; stopped: boolean }> };
+    const byId = new Map(result.tasks.map(t => [t.id, t.stopped]));
+    const lookup = (id: string) => [...byId].find(([k]) => id.startsWith(k) || k.startsWith(id))?.[1];
+
+    expect(lookup(stoppedBlocked)).toBe(true);
+    expect(lookup(stoppedConflict)).toBe(true);
+    expect(lookup(stoppedInterrupted)).toBe(true);
+    expect(lookup(plainBlocked)).toBe(false);
+    // A `working` row would pull in runner setup for its substate, so the
+    // working exclusion is asserted on the shared rule lazy_list calls.
+    expect(isStoppedParked('working', { user_stopped: true })).toBe(false);
   });
 });

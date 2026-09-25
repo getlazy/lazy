@@ -1,11 +1,13 @@
-import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, validateModel, resolveTaskOrExit, taskRef } from '../helpers';
+import { requireLazyRoot, requireStorage, parseFlags, validateModel, resolveTaskOrExit } from '../helpers';
+import { shortId, displayId, taskRef } from '../../task/identity';
 import { followContainer } from './shared';
 import { protocolDir as getProtocolDir } from '../../protocol';
 
 import { queryResumeTask } from '../../daemon/rpc-fallback';
 import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 
-import { theme } from '../theme';
+import { theme } from '../../render/theme';
+import { usagePauseOverrideEligibility } from '../human-terminal';
 
 // Re-export for other modules that import from resume.ts
 export { buildSystemPromptForResume, buildResumePrompt } from '../../daemon/task-lifecycle';
@@ -48,12 +50,18 @@ export async function commandResume(args: string[]): Promise<void> {
   const root = requireLazyRoot();
 
   // --- Delegate to daemon RPC ---
+  // Resuming launches a supervisor, which may resolve and build a container
+  // image first — narrate those phases instead of sitting silent for minutes.
+  const { createPhaseDisplay } = await import('../phase-display');
+  const display = createPhaseDisplay();
   try {
     const result = await queryResumeTask({
       taskId,
       modelOverride,
       effortOverride,
-    });
+      ...(await usagePauseOverrideEligibility()),
+    }, display);
+    display.close();
 
     // Print warnings
     for (const w of result.warnings) {
@@ -88,6 +96,9 @@ export async function commandResume(args: string[]): Promise<void> {
   } catch (err) {
     console.error(`Error: ${err instanceof Error ? err.message : err}`);
     process.exit(1);
+  } finally {
+    // Idempotent — the success path closes it before printing the summary.
+    display.close();
   }
 }
 
@@ -103,14 +114,16 @@ Tasks become 'interrupted' when:
   - The machine goes down while an agent is running
   - Network connectivity is lost during execution
 
-Also resumes a 'blocked' task exactly as it left off, with no new context —
-the agent picks up where its last turn ended.
+Also resumes a 'blocked' or 'conflict' task exactly as it left off, with no new
+context — the agent picks up where its last turn ended. A protected-file
+decision still pending does not block a resume: nothing reverts a file, and the
+decision is made at 'lazy accept'.
 
 Arguments:
   <task_id>    ID of the task to resume
 
 Options:
-  --model <model>    Override model for this session (e.g. opus, sonnet, claude-opus-4-8)
+  --model <model>    Override model for this session (e.g. opus, sonnet, claude-opus-5)
   --effort <level>   Override Claude Code reasoning effort (low, medium, high, xhigh, max)
   --follow           Wait for the agent to finish, streaming output in real time
 

@@ -120,6 +120,38 @@ describe('adopted-image persistence', () => {
     expect(await readAdoptedImage(root)).toBeNull();
   });
 
+  // INVARIANT (fix-upgrade-image-rebuild-churn): expiry is keyed on the image
+  // TAG (major.minor), not the full VERSION. VERSION's patch component is the
+  // commit count, so it advances across every upgrade in a source checkout —
+  // expiring on it threw away the image the upgrade had just built and made the
+  // first sync/unblock after an upgrade rebuild it synchronously.
+  test('adoption survives a patch-only version change (same image tag)', async () => {
+    const sameTagOlderVersion = `${IMAGE_TAG}.1-alpha`;
+    expect(sameTagOlderVersion).not.toBe(VERSION);
+    await writeAdoptedImage(root, {
+      dockerfilePath: dockerfile,
+      contentHash: hashDockerfileContent(ADOPTED_CONTENT),
+      imageName: `lazy-custom-dddddddddddd:${IMAGE_TAG}`,
+      lazyVersion: sameTagOlderVersion,
+    });
+    expect(await inspectAdoptedImage(root)).toMatchObject({ status: 'valid' });
+    expect(await loadValidAdoptedImage(root)).not.toBeNull();
+    expect(await readAdoptedImage(root)).not.toBeNull();
+  });
+
+  // INVARIANT: a genuine minor bump still expires — the adopted image ref is
+  // tagged with the image tag, so a different tag means a different image.
+  test('adoption expires on a minor-version change', async () => {
+    await writeAdoptedImage(root, {
+      dockerfilePath: dockerfile,
+      contentHash: hashDockerfileContent(ADOPTED_CONTENT),
+      imageName: `lazy-custom-dddddddddddd:${IMAGE_TAG}`,
+      lazyVersion: '0.1.2-alpha',
+    });
+    expect(await inspectAdoptedImage(root)).toMatchObject({ status: 'expired' });
+    expect(await loadValidAdoptedImage(root)).toBeNull();
+  });
+
   // INVARIANT: a deleted worktree must not wedge every launch.
   test('loadValidAdoptedImage clears when the Dockerfile is missing', async () => {
     const gone = join(root, 'gone', 'Dockerfile.lazy');
@@ -292,6 +324,43 @@ describe('ensureImage adoption soft-pin', () => {
     expect(await readAdoptedImage(root)).toBeNull();
     // Soft-pin of the old imageName must not apply after drift-clear.
     expect(used).not.toBe(imageName);
+  });
+
+  // INVARIANT (fix-upgrade-image-rebuild-churn): the first launch after
+  // `lazy upgrade` must not rebuild the image the upgrade just built.
+  //
+  // This is the reported bug, end to end. An upgrade in a source checkout
+  // advances VERSION's commit-count patch component (0.23.1651 → 0.23.1658)
+  // while the image tag stays 0.23, so the adoption on disk is stamped with a
+  // version the restarted daemon no longer runs. Under the old exact-VERSION
+  // rule the daemon expired that adoption, fell through to a root-Dockerfile
+  // identity nothing had built, and rebuilt it SYNCHRONOUSLY inside the first
+  // sync/unblock RPC — minutes of silence right after an upgrade that had just
+  // spent minutes building. Zero builds is the whole point of this test.
+  test('first launch after an upgrade reuses the adopted image — no rebuild', async () => {
+    const docker = await installFakeDocker(root);
+    const imageName = `lazy-custom-postupgrade:${IMAGE_TAG}`;
+
+    // Adoption as `lazy upgrade` left it: stamped with the version that was
+    // running when it was written, a patch bump below the current one.
+    const beforeUpgrade = `${IMAGE_TAG}.1-alpha`;
+    expect(beforeUpgrade).not.toBe(VERSION);
+    await writeAdoptedImage(root, {
+      dockerfilePath: dockerfile,
+      contentHash: hashDockerfileContent(await readFile(dockerfile, 'utf-8')),
+      imageName,
+      lazyVersion: beforeUpgrade,
+    });
+    // ...and the image that upgrade built and promoted, present on the host.
+    await docker.seedImage(imageName, { dockerfileHash: 'consented-hash' });
+
+    // A launch: upgrade latch off (beforeEach resets it), soft-pin path.
+    const used = await ensureImage(docker.binPath);
+
+    expect(used).toBe(imageName);
+    expect(await docker.builds()).toEqual([]);
+    // The adoption is still there for every later turn, not consumed once.
+    expect(await readAdoptedImage(root)).not.toBeNull();
   });
 
   test('fails loud when adopted image is missing locally', async () => {

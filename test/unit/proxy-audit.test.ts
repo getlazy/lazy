@@ -72,6 +72,32 @@ describe('AuditQueue', () => {
     expect(callCount).toBe(3);
   });
 
+  // INVARIANT: a failing audit sink is visible to `lazy daemon health` — the
+  // queue swallows the error by design (forwarding matters more than auditing),
+  // so its health record is the only place the failure stays visible.
+  test('health reports a failing sink until an append succeeds again', async () => {
+    let failing = true;
+    const sink: AuditSink = {
+      append: async () => { if (failing) throw new Error('ENOSPC: no space left on device'); },
+    };
+    const queue = new AuditQueue(sink);
+    queue.enqueue(makeRecord(1));
+    queue.enqueue(makeRecord(2));
+    await queue.flush();
+    const broken = queue.health();
+    expect(broken.lastFailure).toContain('ENOSPC');
+    expect(broken.droppedSinceSuccess).toBe(2);
+    expect(broken.lastSuccessAt).toBeNull();
+
+    failing = false;
+    queue.enqueue(makeRecord(3));
+    await queue.flush();
+    const healed = queue.health();
+    expect(healed.lastFailure).toBeNull();
+    expect(healed.droppedSinceSuccess).toBe(0);
+    expect(typeof healed.lastSuccessAt).toBe('number');
+  });
+
   test('flush returns after all enqueued writes complete', async () => {
     let resolveWrite!: () => void;
     const writePromise = new Promise<void>((res) => { resolveWrite = res; });

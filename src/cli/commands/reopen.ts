@@ -1,14 +1,17 @@
 import { join } from 'path';
+import { requireActorIdentity } from '../identity-preflight';
+import { shortId, displayId, taskRef, getWorktreePath, getWorktreePathForRef } from '../../task/identity';
 import { existsSync } from 'fs';
-import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, resolveTaskOrExit, taskRef, getWorktreePath, getWorktreePathForRef } from '../helpers';
+import { requireLazyRoot, requireStorage, parseFlags, resolveTaskOrExit } from '../helpers';
 import { createWorktree, createWorktreeFromSha, getCurrentSha, copyUntrackedFilesIntoWorktree } from '../../git/operations';
 import { openEditor, removeRecoveryFile, requireTTY, readStdinIfPiped } from '../editor';
-import { checkOrphanedChild, retargetOrphanedChild } from '../orphan';
+import { checkOrphanedChild, retargetOrphanedChild } from '../../task/orphan';
 import { loadConfig } from '../../config/loader';
 
-import { getDataDir } from '../init';
+import { getDataDir } from '../../project-paths';
 import { getActor } from '../../constants';
 import { parentTaskIdOf } from '../../task-target';
+import { queryReopenTask } from '../../daemon/rpc-fallback';
 
 async function promptForReason(taskShortId: string, goal?: string): Promise<{ reason: string; recoveryPath: string | null }> {
   const headerLines = [
@@ -57,6 +60,10 @@ export async function commandReopen(args: string[]): Promise<void> {
     reopenUsage();
     process.exit(1);
   }
+
+  // Before the reopen reason is typed: the daemon refuses a write it cannot
+  // attribute, and a refusal must never cost the human what they wrote.
+  await requireActorIdentity();
 
   const argReason = parsed.flags.get('reason') as string | undefined;
 
@@ -173,23 +180,22 @@ export async function commandReopen(args: string[]): Promise<void> {
       // Copy untracked files configured in worktree.include
       const config = await loadConfig(root);
       await copyUntrackedFilesIntoWorktree(root, worktreePath, config.worktree.include);
-
-      // Reset session: clear ended_at, outcome, and agent_session_id
-      await storage.resetSession(sess.id);
     }
 
-    // Reset task: status back to blocked (if has session) or backlog (if never started), clear completed_at
-    await storage.reopenTask(task.id, getActor());
+    // The one reopen implementation (src/daemon/task-lifecycle.ts), shared with
+    // lazy_reopen and the web task page: reason comment → reopen to
+    // blocked-or-backlog → session reset. Only the worktree recreation above is
+    // CLI-side, because it is host git work the other callers defer to the next
+    // start/unblock.
+    const result = await queryReopenTask({
+      taskId: task.id,
+      reason: reason ?? undefined,
+      actor: getActor(),
+    });
+    // Reason (if any) is now durably persisted as a comment — clean up recovery file
+    if (reopenRecoveryPath) removeRecoveryFile(reopenRecoveryPath);
 
-    // Record reason as a comment if reopening a complete task
-    if (reason) {
-      await storage.createComment(task.id, `[Reopened] ${reason.trim()}`, getActor());
-      // Comment is now durably persisted — clean up recovery file
-      if (reopenRecoveryPath) removeRecoveryFile(reopenRecoveryPath);
-    }
-
-    // Determine final status based on whether task has a session
-    const finalStatus = sess ? 'blocked' : 'backlog';
+    const finalStatus = result.newStatus;
 
     console.log(`\nTask ${displayId(task)} reopened.`);
     console.log(`  Goal:   ${task.goal}`);

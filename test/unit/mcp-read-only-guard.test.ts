@@ -1,9 +1,9 @@
 /**
- * INVARIANT: Write MCP tools (lazy_commit, lazy_comment) must reject in ask
- * mode (LAZY_MCP_READ_ONLY=1). The handlers are the last line of defense if
- * the agent ignores the ask-system-prompt and the `--disallowedTools`
- * lockdown — without this guard a misbehaving model could still mutate state
- * during a read-only Q&A turn.
+ * INVARIANT: Write MCP tools (lazy_commit, lazy_comment, lazy_review) must
+ * reject in a read-only turn (LAZY_MCP_READ_ONLY=1 — ask and review). The
+ * handlers are the last line of defense if the agent ignores the system
+ * prompt and the harness write lockdown — without this guard a misbehaving
+ * model could still mutate state during a read-only turn.
  *
  * The error message must be actionable (tell the agent to answer in text)
  * so a competent model corrects course in the same turn.
@@ -13,7 +13,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { createCommitHandler, createCommentHandler, createAddFollowUpHandler, type McpToolContext } from '../../src/mcp/tools';
+import { createCommitHandler, createCommentHandler, createRaiseHandler, createReviewHandler, type McpToolContext } from '../../src/mcp/tools';
 import { createStorage, type Storage } from '../../src/storage';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 
@@ -52,20 +52,27 @@ describe('MCP write handlers honor LAZY_MCP_READ_ONLY=1', () => {
 
   test('lazy_commit rejects with actionable message', async () => {
     const handler = createCommitHandler(ctx);
-    await expect(handler({ message: 'wip' })).rejects.toThrow(/ask mode/);
+    await expect(handler({ message: 'wip' })).rejects.toThrow(/read-only turn/);
     await expect(handler({ message: 'wip' })).rejects.toThrow(/lazy_commit/);
   });
 
   test('lazy_comment rejects with actionable message', async () => {
     const handler = createCommentHandler(ctx);
-    await expect(handler({ message: 'note' })).rejects.toThrow(/ask mode/);
+    await expect(handler({ message: 'note' })).rejects.toThrow(/read-only turn/);
     await expect(handler({ message: 'note' })).rejects.toThrow(/lazy_comment/);
   });
 
-  test('lazy_add_followup rejects with actionable message', async () => {
-    const handler = createAddFollowUpHandler(ctx);
-    await expect(handler({ note: 'orthogonal thing' })).rejects.toThrow(/ask mode/);
-    await expect(handler({ note: 'orthogonal thing' })).rejects.toThrow(/lazy_add_followup/);
+  test('lazy_raise rejects with actionable message', async () => {
+    const handler = createRaiseHandler(ctx);
+    const args = { content: 'orthogonal thing', blocking: false };
+    await expect(handler(args)).rejects.toThrow(/read-only turn/);
+    await expect(handler(args)).rejects.toThrow(/lazy_raise/);
+  });
+
+  test('lazy_review rejects with actionable message', async () => {
+    const handler = createReviewHandler(ctx);
+    await expect(handler({ task_id: 'abc12345' })).rejects.toThrow(/read-only turn/);
+    await expect(handler({ task_id: 'abc12345' })).rejects.toThrow(/lazy_review/);
   });
 
   test('error message instructs the agent to write the answer as text', async () => {

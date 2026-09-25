@@ -23,8 +23,8 @@ lazy protect main on
 
 That both lists `main` in `[protection].protected_branches` **and** sets
 `enabled = true` (it says so when it does). From then on, accepting any task
-into `main` requires a human `lazy approve <task>` — or an approval on the
-task's PR/MR, which satisfies the same gate.
+into `main` prompts for the approval passphrase at `lazy accept` itself — or
+is satisfied by an approval on the task's PR/MR, which is the same gate.
 
 The equivalent by hand, which needs no branch listing at all because the repo's
 **default branch** is protected as soon as the switch is on:
@@ -61,12 +61,12 @@ so — before you try to accept.
 
 | Surface | What you see |
 | --- | --- |
-| `lazy show <task>` | a `Protected:` line — `yes (branch gate)`, `yes (task gate)`, or `yes (task gate + branch gate)` — followed by what each gate is and where the approval stands |
+| `lazy show <task>` | a `Protected:` line — `yes (branch gate)`, `yes (task gate)`, or `yes (task gate + branch gate)` — followed by what each gate is, how to accept, and whether a builder review is waiting |
 | `lazy status <task>` | the same `Protected:` line, in the same words |
-| `lazy list` / `lazy active` / `lazy blocked` | a compact `[P]` marker on the goal, `[P][A]` when an approval is recorded and pending, plus a one-line legend under the table |
-| `lazy review <task>` | the gate in the header line (and above the hunks under `-i`), so you learn about it before you press `a` |
-| MCP `lazy_show` | a `protection` object — `gated`, `target_branch`, `task_gate`, `branch_gate`, `approval_pending`, `markers`, `summary` |
-| Web dashboard | the same `[P]` / `[P][A]` badge on the task list, and a `Protected` row on the task detail page |
+| `lazy list` / `lazy active` / `lazy blocked` | a compact `[P]` marker on the goal, plus a one-line legend under the table |
+| `lazy browse <task>` | the gate in the header line (and above the hunks under `-i`), so you learn about it before you press `a` |
+| MCP `lazy_show` | a `protection` object — `gated`, `target_branch`, `task_gate`, `branch_gate`, `pending_review`, `markers`, `summary` |
+| Web dashboard | the same `[P]` badge on the task list, and a `Protected` row on the task detail page |
 
 Two properties are deliberate:
 
@@ -75,32 +75,30 @@ Two properties are deliberate:
   last column so no fixed-width column shifts, and they are ASCII (`[P]`, not a
   shield emoji, whose width varies by terminal) so scripts can grep them.
 - **Read-only.** These surfaces report gates; they never arrange them. There is
-  no MCP write surface for `lazy protect` or `lazy approve` — see
-  [surface-asymmetries.md](surface-asymmetries.md). The builder can plan around
-  a gate without being able to open it.
+  no MCP write surface for `lazy protect`, and no MCP route to a protected
+  merge at all — see [surface-asymmetries.md](surface-asymmetries.md). The
+  builder can plan around a gate without being able to open it.
 
 A task you listed in `protected_tasks` while `enabled = false` gets no marker —
 it gates nothing — but `lazy show` still reports it, as `no — listed in
 [protection].protected_tasks, but protection is disabled`. Silence there would
 leave you believing a gate was armed when it was not.
 
-All surfaces render one shared vocabulary (`src/protection/status.ts`), which
-also resolves the target branch exactly the way accept resolves it. A new
-surface renders those helpers; it does not re-derive protection from config.
-
 ## What a protected accept looks like
 
 With protection on, `lazy accept` of a task targeting a protected branch
-refuses — regardless of who asks (CLI `--yes`, the builder over MCP, any
-automation) and on **all** remote drivers, including `local`. The refusal
-says exactly what to do: merging into `main` requires human approval — run
-`lazy approve <task>`.
+**prompts for the approval passphrase and merges in the same invocation**:
 
 ```
 lazy system passphrase set   # once per MACHINE, at your own terminal
-lazy approve <task>          # prompts for the passphrase
-lazy accept <task>           # consumes it once it completes
+lazy accept <task>           # prompts, verifies, merges
 ```
+
+Approve-then-merge in one step is the point: the approval is inherently bound
+to the exact commits being merged. There is no stored approval token that
+could go stale, be recorded before the agent finished, or let a later,
+different diff through. (Earlier releases had a separate `lazy approve <task>` command recording a
+one-shot approval; that command and its floating credential are gone.)
 
 - The passphrase lives **nowhere in the repository**. It is enrolled once per
   machine with `lazy system passphrase set`, stored as a `Bun.password` hash
@@ -109,71 +107,76 @@ lazy accept <task>           # consumes it once it completes
   passphrase is **outside the builder's context** — never paste it into a
   conversation with the builder. See
   [the enrollment section](#enrolling-the-passphrase-lazy-system-passphrase).
-- One approval unlocks **exactly one** accept of that task, and it is spent
-  **only when that accept completes**. Passing the gate merely reserves the
-  approval; it is consumed at the moment the merge becomes durable (the same
-  point that writes the accept tag, or that hands the merge to the forge). An
-  accept that fails or aborts at any phase — pre-flight, a pre-merge gate, the
-  merge itself — leaves the approval pending and says so in the failure, so
-  you fix the cause and re-run `lazy accept` **without approving again**.
-  Consumption happens inside accept's per-task lock, so two concurrent accepts
-  can never both spend one approval.
-- `lazy approve` checks enrollment **before** it prompts. With nothing enrolled
-  on the machine, it prints the enrollment instructions and exits non-zero
-  without asking you to type a secret that could not possibly have matched. The
+- Accept checks enrollment **before** it prompts. With nothing enrolled on the
+  machine, it prints the enrollment instructions and exits non-zero without
+  asking you to type a secret that could not possibly have matched. The
   interactive prompt is a bare `Approval passphrase:` — it names no file,
   because there is no file to read it from.
 - The prompt is **masked** — each character you type shows as `*`, so the
   passphrase never reaches the screen, terminal scrollback, or a screen
-  share. Masking needs a real terminal: without one, `lazy approve` refuses
-  rather than falling back to an echoing prompt.
-- `lazy approve` is CLI-only. There is deliberately **no MCP equivalent**;
-  exposing one would let the builder approve its own work.
-- The MCP `lazy_accept` tool refuses protected accepts up front and **never
-  issues a confirmation code** for them: the two-step confirmation is
+  share. Masking needs a real terminal: without one, accept refuses rather
+  than falling back to an echoing prompt.
+- `--yes` skips accept's *other* prompts, **never** the passphrase. The
+  daemon's gate has no parameter that means "skip it", so no flag combination
+  can express an unapproved protected merge.
+- The MCP `lazy_accept` tool refuses protected accepts **unconditionally** and
+  never issues a confirmation code for them: the two-step confirmation is
   self-satisfiable by the builder and does not count as authorization for a
-  protected merge (it remains in place for unprotected operations).
+  protected merge (it remains in place for unprotected operations). The
+  refusal is not a dead end — see the next section.
 
 Task-to-task merges (a subtask accepted into its parent's `lazy/*` branch)
-are never protected by default — no friction in the inner loop. Re-entry of a
-task already in `merging` status is exempt — a human already approved the merge
-that reached that state (and it was spent when the forge took the merge over);
-re-entry only completes that authorized merge.
+are never protected by default — no friction in the inner loop — and never get
+a pull request unless a person asks for one with `lazy submit` (see
+[Submitting a subtask for review](#submitting-a-subtask-for-review)). Re-entry of a
+task already in `merging` status is exempt — reaching that state already
+passed the gate; re-entry only completes the authorized merge.
+
+### The builder's review survives the refusal
+
+The `reason` a builder hands `lazy_accept` is often a real code review. When
+the gate refuses the merge, that review is **captured on the task** (as
+`pending_accept_review` metadata — review *text*, it authorizes nothing) and
+the refusal says so. Your own `lazy accept` then:
+
+1. prints the review — attributed, e.g. `Review by builder (recorded …)` —
+   **before** the passphrase prompt, so it is part of what you approve;
+2. attaches it to the merge: it lands in the `[Accepted]` task comment. Your
+   `--reason` (or typed reason) comes first, then the attributed review. It is
+   not written to the PR — lazy posts no reviews or comments to a forge.
+
+A review recorded before later commits is kept and **labeled** stale
+(`recorded before N later commit(s)`), never silently dropped — and a builder
+retrying `lazy_accept` with an updated reason replaces its earlier review
+rather than stacking copies.
 
 ### CI and scripting
 
-There is deliberately **no `--yes`** for `lazy approve`, and — since v0.23 —
-**no scripted route to the passphrase at all**: no flag, no env var, no piped
-stdin. It is typed at the masked prompt, at a terminal, or not at all.
-
-Until v0.23 `echo "$SECRET" | lazy approve <task>` was supported and
-documented. It is now refused with a message pointing you at a terminal. The
-reason is the same one that moved the passphrase out of the repo: a value a
-script can supply is a value that lives on in shell history, CI logs, process
-listings and agent transcripts, and a gate whose credential can be replayed by
-automation is not proof a human looked at the diff. If a pipeline needs to
-merge without a human, the honest answer is to not protect that branch, or to
-merge it on the forge where the approval is a person clicking Approve.
+There is deliberately **no non-interactive path** for the passphrase: no
+flag, no env var, and no stdin route (stdin to `lazy accept` is the accept
+*reason*). A value a script can supply is a value that sits in shell history,
+CI logs, and agent transcripts — which breaks the one property the mechanism
+must keep: the token originates outside the builder's context. For automation
+on forge projects, approve the PR/MR instead; that satisfies the same gate.
 
 ### Approving the PR/MR counts
 
 On a GitHub or GitLab project, **approving the task's PR/MR satisfies the same
-gate** — no separate `lazy approve` needed. Clicking "Approve" while reading
-the diff is the same deliberate human act, expressed where you were already
-reviewing; demanding a second local approval on top would be friction with no
-extra judgement behind it.
+gate** — no passphrase asked. Clicking "Approve" while reading the diff is the
+same deliberate human act, expressed where you were already reviewing;
+demanding the passphrase on top would be friction with no extra judgement
+behind it.
 
 The two are one mechanism, not two: the forge approval is resolved *inside*
 the same gate, so a local-driver project and a forge project reach the
 identical decision. Details that follow from that:
 
-- The forge is checked **first**, so an already-approved PR does not silently
-  burn a pending `lazy approve` record — that record stays for an accept that
-  needs it.
+- The forge is checked **first**, so an accept of an already-approved PR
+  merges without prompting you for a passphrase you don't need to type.
 - The check **fails closed**: if the forge cannot be reached, the gate stays
-  shut and the refusal points you at `lazy approve`, which works offline.
+  shut and the passphrase prompt is the offline path.
 - A refusal on a forge project names both routes; on a `local` project it
-  names only `lazy approve`, because there is no PR to approve.
+  names only the terminal route, because there is no PR to approve.
 
 ## Enrolling the passphrase: `lazy system passphrase`
 
@@ -192,8 +195,8 @@ worse than one shared across your projects, and the passphrase is *friction*
 
 **Stored hashed, outside every repository.** `~/.lazy/passphrase.json` holds a
 `Bun.password` hash (argon2id) and mode `0600` — never the passphrase. It sits
-one level *above* `~/.lazy/daemon/`, with its own `LAZY_PASSPHRASE_BASE_DIR`
-seam, so `LAZY_DAEMON_BASE_DIR` cannot relocate your credential out from under
+one level *above* `~/.lazy/daemon/`, so moving the daemon's directory
+cannot relocate your credential out from under
 you. lazy **refuses** — not warns — to use a store that is group- or
 world-readable, and tells you the `chmod` to fix it: a hash other accounts can
 read is a hash they can attack offline while you believe the gate is intact.
@@ -210,7 +213,7 @@ lazy system passphrase set      # enroll a new one, at your terminal
 
 That is a plain local file only your account can write, and removing it resets
 the passphrase and nothing else — protection settings, tasks and branches are
-untouched. Until you re-enroll, protected merges **fail closed**: `lazy approve`
+untouched. Until you re-enroll, protected merges **fail closed**: `lazy accept`
 refuses and points back at `lazy system passphrase set` rather than letting the
 merge through.
 
@@ -227,7 +230,7 @@ Three deliberate restrictions, each load-bearing:
 
 ### Migrating from `.lazy/approve-passphrase`
 
-Before v0.23 the passphrase sat in plaintext inside the repo, at
+In earlier releases the passphrase sat in plaintext inside the repo, at
 `.lazy/approve-passphrase` or wherever `[protection].passphrase_file` pointed.
 Both are **gone**: the key is removed from the schema (`lazy doctor` explains
 the migration if it is still in your `lazy.toml`), and the old file is **never
@@ -297,7 +300,8 @@ resolved from the task at decision time, so it stays correct:
 protected_tasks = ["add-auth"]
 ```
 
-The refusal names the task and, as always, `lazy approve <task>`.
+The refusal names the task and, as always, the passphrase prompt at
+`lazy accept <task>`.
 
 ### Stale entries fail open — loudly
 
@@ -339,8 +343,8 @@ lazy protect --branch main off     # Stop protecting the 'main' branch
   a no-op) but **warns** that it has no effect yet. `lazy doctor` flags the
   same combination: gate keys configured while the switch is off.
 - There is deliberately **no MCP equivalent for writing**: the builder must
-  not manage its own gates, for the same reason it cannot run `lazy approve`.
-  Reading the state is harmless.
+  not manage its own gates, for the same reason it cannot complete a protected
+  merge. Reading the state is harmless.
 
 ### What the config editing does and does not preserve
 
@@ -359,23 +363,14 @@ survive**. Known limitations:
 
 ## Mechanics
 
-Verification goes through a pluggable `verifyHumanToken` seam
-(`src/protection/verify-token.ts`). The static passphrase is the first-cut
-mechanism; TOTP can replace it behind the same seam.
+The approval is checked against the passphrase you enrolled on this machine.
+Before prompting, `lazy accept` asks the daemon whether a passphrase is enrolled
+at all, so an accept that could never succeed is refused up front instead of
+after you type. That check is answered by the same project the merge runs in.
 
-The seam also answers a token-free question — "is anything enrolled?" — which
-is what lets `lazy approve` refuse before prompting, and which names the
-token's source in the prompt. A mechanism that cannot know the answer without
-a token (TOTP has no file to inspect) reports that honestly, and `lazy approve`
-falls back to asking and then verifying. The CLI asks the daemon this over a
-pre-flight RPC rather than reading config itself, so the answer always comes
-from the same project root that will do the verifying.
-
-A forge PR approval is an *additional* satisfier of that same check, not a
-parallel mechanism — see [Approving the PR/MR counts](#approving-the-prmr-counts)
-above. The accept path hands the gate a probe for it rather than checking the
-forge on its own branch of logic, so adding a future satisfier means adding it
-in one place.
+A forge PR approval is an *additional* way to satisfy the same check, not a
+separate mechanism — see [Approving the PR/MR counts](#approving-the-prmr-counts)
+above.
 
 ## A separate gate on the same path
 
@@ -393,9 +388,47 @@ push-prevention (an agent on a host runner can `git push` around the check —
 accepted), no cryptographic hardening or rate limiting. The feature succeeds
 if it changes the *default* path from auto-accept to human-approved.
 
-Moving the passphrase out of the repo (v0.23) closed one concrete hole — the
+Moving the passphrase out of the repo closed one concrete hole — the
 secret is no longer sitting in plaintext in a tree every agent can read, at a
 path the repo's own config could redirect. It did not turn friction into
 security: see
 [What this does not close](#what-this-does-not-close) for the residual that
 remains under the host-process runner.
+
+## Submitting a subtask for review
+
+Lazy does not open a pull or merge request for a subtask on its own: its work
+goes into the parent task's branch, and `lazy accept` merges it there locally.
+If a reviewer wants to look at a subtask on your forge anyway, ask for it:
+
+```bash
+lazy submit <subtask>
+```
+
+This opens the PR/MR with the parent task's branch as its base and marks the
+subtask `submitted`, so PR comments reach it like any submitted task. A few
+things to know:
+
+- **The parent's branch must already be on the remote.** Lazy pushes a task's
+  branch after each of its turns, so it normally is. If it is not, submit says
+  so and stops; it never pushes the parent for you. Wait for the parent's turn
+  to end, or push it yourself, and submit again.
+- **A pull request you opened by hand is adopted.** If the subtask's branch
+  already has an open PR/MR, submit records that one instead of opening a
+  second — as long as it targets the parent's branch. If it targets something
+  else, submit tells you to change its base or close it.
+- **Accepting still merges locally**, into the parent's branch, and then lazy
+  closes the PR/MR, since the work has landed. If the reviewer merges it on
+  the forge instead, lazy notices and completes the subtask.
+- **If the parent is accepted first, the pull request moves with the subtask.**
+  Accepting (or closing) the parent re-parents the subtask onto the parent's
+  own target, and lazy changes the pull request's base to match. If the forge
+  will not allow that, lazy closes the pull request and puts the subtask back
+  to `blocked` so you can submit it again. `lazy reparent` does the same.
+- **A pull request is never merged into the wrong branch.** If a subtask's pull
+  request still targets a branch the subtask no longer integrates into — for
+  example because someone changed it by hand — `lazy accept` refuses until the
+  base is fixed, and a merge done on the forge into that branch does not mark
+  the subtask complete; lazy raises an alert instead.
+- **Agents cannot do this.** The `lazy_submit` agent tool keeps refusing a
+  subtask; the request has to come from a person.

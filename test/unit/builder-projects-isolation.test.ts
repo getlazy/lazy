@@ -245,7 +245,7 @@ describe('builder projects-dir isolation', () => {
       const old = new Date(now - maxAge - 1);
       await utimes(join(root, 'stale111'), old, old);
 
-      const removed = await pruneStaleBuilderProjectsDirs(dataDir, 'active33', maxAge, now);
+      const removed = await pruneStaleBuilderProjectsDirs(builderProjectsRoot(dataDir), 'active33', maxAge, now);
       expect(removed).toEqual(['stale111']);
 
       const remaining = (await readdir(root)).sort();
@@ -253,7 +253,7 @@ describe('builder projects-dir isolation', () => {
     });
 
     test('no-op when the root does not exist', async () => {
-      const removed = await pruneStaleBuilderProjectsDirs(dataDir, null);
+      const removed = await pruneStaleBuilderProjectsDirs(builderProjectsRoot(dataDir), null);
       expect(removed).toEqual([]);
     });
   });

@@ -4,6 +4,7 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 
 /**
  * Tests for offline-mode warnings on `lazy start` (builder startup),
@@ -67,6 +68,9 @@ describe('offline-mode warnings', () => {
 
     switchDriver('github');
     expectSuccess(await ctx.lazy(['system', 'offline']));
+
+    // Fixture setup, not the subject (see test/helpers/final.ts).
+    await seedFinal(ctx, taskId);
 
     const result = await ctx.lazy(['accept', taskId, '--yes']);
     expectSuccess(result);

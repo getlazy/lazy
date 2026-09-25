@@ -102,7 +102,7 @@ describe('MCP lazy_edit on started tasks', () => {
   // allowed change so the caller knows what IS possible.
   test('goal edit is rejected on a task with turns', async () => {
     await expect(handler()({ task_id: task.id, goal: 'New goal' }))
-      .rejects.toThrow(/only model and effort can be changed/);
+      .rejects.toThrow(/only model, effort and review mode can be changed/);
   });
 
   // INVARIANT: The model-only exemption does not extend to combined edits —
@@ -110,13 +110,81 @@ describe('MCP lazy_edit on started tasks', () => {
   // partially applied.
   test('model combined with goal is rejected on a task with turns', async () => {
     await expect(handler()({ task_id: task.id, model: 'claude-haiku-4-5-20251001', goal: 'New goal' }))
-      .rejects.toThrow(/only model and effort can be changed/);
+      .rejects.toThrow(/only model, effort and review mode can be changed/);
 
     const verify = new FileStorage(lazyRoot, { basePath });
     await verify.initialize();
     try {
       const updated = await verify.getTask(task.id);
       expect(updated?.model).toBe('claude-opus-4-6');
+    } finally {
+      await verify.close();
+    }
+  });
+});
+
+/*
+ * AN AGENT MAY NOT CHANGE ITS OWN TASK'S REVIEW SETTINGS.
+ *
+ * Found by a cold review of this branch, and it is the reason the rule exists
+ * rather than a hypothetical: `assertAgentMayTarget` permits self-targeting and
+ * the review arguments are mid-flight-safe, so a working agent could have
+ * called `lazy_edit(task_id: <its own>, review_gate: "never")` and the review
+ * of its own work would have stopped holding accept. That is
+ * `lazy accept --allow-review-issues` — CLI/TTY-only precisely so no agent can
+ * wave away a review of its own work — reached through another door.
+ *
+ * A DIRECT SUBTASK stays allowed: a cluster driver deciding how its CHILD is
+ * reviewed is arranging work it is responsible for, not overruling a verdict on
+ * itself. The two differ by exactly one comparison, and both halves are pinned.
+ */
+describe('MCP lazy_edit review settings — own task vs a subtask', () => {
+  beforeEach(setupStartedTask);
+
+  afterEach(async () => {
+    await Promise.all([
+      rm(lazyRoot, { recursive: true, force: true }),
+      rm(basePath, { recursive: true, force: true }),
+    ]);
+  });
+
+  /** The handler as the agent RUNNING `task` — `ctx.taskId` is its own id. */
+  function asOwnAgent() {
+    return createEditHandler({ taskId: task.id, worktreePath: lazyRoot, storage });
+  }
+
+  for (const [name, args] of [
+    ['review', { review: 'off' }],
+    ['review_gate', { review_gate: 'never' }],
+    ['review_auto_fix', { review_auto_fix: false }],
+  ] as const) {
+    test(`refuses ${name} on the caller's own task`, async () => {
+      await expect(asOwnAgent()({ task_id: task.id, ...args }))
+        .rejects.toThrow(/cannot change their OWN task's review settings/);
+    });
+  }
+
+  // Nothing else about self-editing changed: model and effort are still the
+  // supported mid-flight dials, and refusing the review args must not take
+  // them with it.
+  test('still allows model and effort on the caller\'s own task', async () => {
+    const result = await asOwnAgent()({
+      task_id: task.id, model: 'claude-haiku-4-5-20251001', effort: 'high',
+    }) as { changes: string[] };
+    expect(result.changes).toEqual(expect.arrayContaining(['model', 'effort']));
+  });
+
+  test('allows the review settings on a DIRECT SUBTASK', async () => {
+    const child = await storage.createTask('Child goal', task.id);
+    const driver = createEditHandler({ taskId: task.id, worktreePath: lazyRoot, storage });
+
+    const result = await driver({ task_id: child.id, review: 'separate' }) as { changes: string[] };
+    expect(result.changes).toContain('review');
+
+    const verify = new FileStorage(lazyRoot, { basePath });
+    await verify.initialize();
+    try {
+      expect((await verify.getTask(child.id))?.metadata?.review_mode).toBe('separate');
     } finally {
       await verify.close();
     }

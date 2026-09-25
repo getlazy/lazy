@@ -1,235 +1,52 @@
-import { requireStorage, shortId, displayId, formatDate, formatDuration, formatTokenCount, totalTokens, totalInputTokens, parseFlags, parseLineRange, sliceLines, taskRef } from '../helpers';
+import { requireStorage, parseFlags, parseLineRange, sliceLines } from '../helpers';
+import { formatDate, formatDuration, formatTokenCount, totalTokens, totalInputTokens } from '../../utils/format';
+import { resolveTaskForgeLink } from '../../task-forge-link';
+import { isLinkedTask, formatLinkedMarker } from '../../task/linked';
 import { queryTaskShow, type ShowResult } from '../../daemon/rpc-fallback';
-import { protocolDir as getProtocolDir, readStatus } from '../../protocol';
-import { createRunner } from '../../runner';
-import { theme, dim } from '../theme';
-import { renderStatusHeader } from '../status-header';
-import { computeWorkingSubstate, renderWorkingStatus, type WorkingSubstate } from '../../utils/working-substate';
-import { formatTurnLaunchLabels } from '../../utils/turn-labels';
+import { theme, dim } from '../../render/theme';
+import { renderStatusHeader } from '../../render/status-header';
+import { renderWorkingStatus } from '../../utils/working-substate';
+import { formatTurnLaunchLabels, formatTurnModelWarning, formatTurnTypeSuffix } from '../../utils/turn-labels';
+import { formatUnparsedReviewSuffix } from '../../review/parse-report';
 import { isBuiltinPromptCode, readBuiltinPrompt, listBuiltinPrompts } from './prompts';
 import { showConversationTranscript } from './import-conversation';
 import { isTTY, promptChoice } from '../editor';
-import { checkOrphanedChild, type OrphanCheckResult } from '../orphan';
-import type { Task, Session, Turn, Commit, Comment, JournalEntry, FollowUp } from '../../types';
-import type { StatusChange, TagEvent } from '../../storage/types';
-import type { SupervisorStatus } from '../../protocol/types';
-import type { AgentFailureClass } from '../../agent/failure-taxonomy';
+import type { Task, Session, Turn } from '../../types';
+import { formatArtifactBytes } from '../../artifacts/limits';
 import { parentTaskIdOf } from '../../task-target';
-import { readWorktreeMergeState, isMidMerge, describeMergeState, type WorktreeMergeState } from '../../git/operations';
-import { getWorktreePathForRef } from '../helpers';
-import { pathExists } from '../../utils/fs';
-import { TERMINAL_STATUSES } from '../../types';
+import { isMidMerge, describeMergeState } from '../../git/operations';
+import { shortId, displayId } from '../../task/identity';
+import { clusterProgressOf, formatClusterProgress, clusterProgressPayload } from '../../task/cluster-progress';
+import { displayUrlFor } from '../../serve/subdomain';
 import type { Storage } from '../../storage/interface';
-import { getAutoReactSummary, type AutoReactTrigger } from '../../daemon/auto-react-budget';
+import { loadTaskShowData, type TaskShowData } from '../../task/show-data';
 import { showFileViewer } from '../tui/file-viewer';
 import { groupTurnsIntoChunks } from '../../utils/turn-chunks';
-import { logger } from '../../utils/logger';
+import { buildShowFinal } from '../../task/show-sections';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { turnText } from '../../utils/turn-content';
-import { loadConfig } from '../../config/loader';
+import { REPORT_SECTION_LABELS, orderReportSections } from '../../review/report-policy';
+import { reviewExplanationLine } from '../../review/mode';
 import { describeExpiry } from '../../utils/local-day';
-import { getSlowLaneState, getLastProjectAutoResumeAt } from '../../daemon/auto-resume-queue';
-import { MAX_CONSECUTIVE_INTERRUPTIONS } from '../../utils/auto-resume';
-import {
-  loadTaskProtectionStatus,
-  protectionSummary,
-  protectionAdvice,
-  type TaskProtectionStatus,
-} from '../../protection/status';
+import { protectionSummary, protectionAdvice } from '../../protection/status';
+import { attributionLabel } from '../../actor-ref';
+import { usagePauseHoldOf, usagePausePendingStartOf, type UsagePauseHold } from '../../usage-pause/hold';
+import { mayOfferUsagePauseOverride } from '../human-terminal';
+import { describeUsagePause } from '../../usage-pause/policy';
 
 /**
- * Pre-loaded data for building task show output.
- * Passed to buildTaskShowLines to avoid duplicating data loading.
+ * Render the person behind an actor role, when the store recorded one.
+ *
+ * The actor role says WHAT KIND of actor wrote a row; `actor_email` /
+ * `actor_name` say WHICH person. Both are absent for rows with no person
+ * behind them and for every row written before per-person attribution existed,
+ * so this appends nothing in that case and the line reads exactly as it always
+ * has. The role is passed as null because the caller has already printed it.
  */
-export interface TaskShowData {
-  task: Task;
-  session: Session | null;
-  turns: Turn[];
-  commits: Commit[];
-  comments: Comment[];
-  journal: JournalEntry[];
-  followUps: FollowUp[];
-  statusHistory: StatusChange[];
-  tagHistory: TagEvent[];
-  children: Task[];
-  childSessions: Map<string, Session | null>;
-  parent: Task | null;
-  retryStatus: {
-    retryCount: number;
-    errors: { count: number; message: string; firstSeen: string; lastSeen: string; failure_class?: AgentFailureClass }[];
-    /** Taxonomy class of the latest failure — says WHY the turn is retrying. */
-    failureClass?: AgentFailureClass;
-    failureReason?: string;
-    /** Delay before the next attempt (ms), when the supervisor has scheduled one. */
-    nextDelayMs?: number;
-  } | null;
-  orphanStatus: OrphanCheckResult | null;
-  autoReactStatus: { paused: boolean; reason: string | null; counts: Record<AutoReactTrigger, number>; consecutiveAutoTurns: number } | null;
-  /** Supervisor status snapshot for working tasks (null when task is not working or status file is missing). */
-  supervisorStatus: SupervisorStatus | null;
-  /**
-   * Derived working substate (agent / harness:<phase> / not-alive) for working
-   * tasks. Observational only. Null when the task is not working or no substate
-   * can be derived. Shares the single derivation used by ls/blocked/active/watch.
-   */
-  workingSubstate: WorkingSubstate | null;
-  /**
-   * Merge state of the task's worktree, when one exists on disk.
-   *
-   * INVARIANT (fix-sync-silent-conflict): a task whose worktree is mid-merge must
-   * SAY so. A stranded merge used to be invisible on every status surface — the
-   * task read as a plain `blocked` and the only symptom was accept refusing much
-   * later with the wrong reason. Null when there is no worktree to read.
-   */
-  mergeState: WorktreeMergeState | null;
-  /**
-   * Read-only branch-protection status (add-protection-surfacing): is this
-   * task's accept gated, and does a `lazy approve` already sit pending?
-   *
-   * Null when no project root was available to read config/git from (e.g. the
-   * search command's line-number computation), NOT when nothing is protected —
-   * an unprotected task carries a status object saying so.
-   */
-  protection: TaskProtectionStatus | null;
-  /**
-   * Slow-lane auto-resume queue position (src/daemon/auto-resume-queue.ts),
-   * present only when this task's fast-lane circuit breaker has tripped and
-   * it is now waiting for a round-robin retry. Null otherwise — including
-   * when daemon.auto_resume is off, since nothing is queued then.
-   */
-  autoResumeQueue: { attempts: number; maxAttempts: number; nextEligibleAt: number } | null;
-}
-
-/**
- * Load all data needed for task show output.
- */
-export async function loadTaskShowData(storage: Storage, task: Task, root?: string): Promise<TaskShowData> {
-  const sess = await storage.getSessionByTaskId(task.id);
-  const children = await storage.getChildTasks(task.id);
-
-  let retryStatus: TaskShowData['retryStatus'] = null;
-  let supervisorStatus: SupervisorStatus | null = null;
-  let workingSubstate: WorkingSubstate | null = null;
-  if (task.status === 'working' && sess) {
-    const protoDir = getProtocolDir(task.id);
-    const status = readStatus(protoDir);
-    supervisorStatus = status;
-    if (status?.phase === 'retrying') {
-      retryStatus = {
-        retryCount: status.retryCount ?? 0,
-        errors: status.errors ?? [],
-        failureClass: status.retry_failure_class,
-        failureReason: status.retry_failure_reason,
-        nextDelayMs: status.retry_next_delay_ms,
-      };
-    }
-
-    // Derive the working substate from status.json + run liveness. Requires a
-    // root to probe the runner; when absent (e.g. search line-number computation)
-    // we degrade to no substate rather than guessing alive/dead.
-    if (root) {
-      try {
-        const runner = await createRunner(root);
-        const cn = sess.container_name ?? runner.runNameForTask(taskRef(task));
-        const info = await runner.getRunInfo(cn);
-        workingSubstate = await computeWorkingSubstate(protoDir, info?.running === true);
-      } catch (err) {
-        logger.debug(`Task ${shortId(task.id)}: could not derive working substate: ${err instanceof Error ? err.message : err}`);
-      }
-    }
-  }
-
-  // Read the worktree's merge state for any task that still has a worktree. This
-  // is two cheap git calls and it is the ONLY thing that makes a stranded merge
-  // visible before accept trips over it (fix-sync-silent-conflict).
-  let mergeState: WorktreeMergeState | null = null;
-  if (root && !TERMINAL_STATUSES.has(task.status)) {
-    try {
-      const wt = getWorktreePathForRef(root, taskRef(task));
-      if (await pathExists(wt)) mergeState = await readWorktreeMergeState(wt);
-    } catch (err) {
-      logger.debug(`Task ${shortId(task.id)}: could not read worktree merge state: ${err instanceof Error ? err.message : err}`);
-    }
-  }
-
-  const turns = sess ? await storage.getSessionTurns(sess.id) : [];
-  const commits = sess ? await storage.getSessionCommits(sess.id) : [];
-  const comments = await storage.getTaskComments(task.id);
-  const journal = await storage.getTaskJournal(task.id);
-  const followUps = await storage.getTaskFollowUps(task.id);
-  const statusHistory = await storage.getStatusHistory(task.id);
-  const tagHistory = await storage.getTagHistory(task.id);
-
-  const parentId = parentTaskIdOf(task);
-  const parent = parentId ? await storage.getTask(parentId) : null;
-
-  const childSessions = new Map<string, Session | null>();
-  for (const child of children) {
-    childSessions.set(child.id, await storage.getSessionByTaskId(child.id));
-  }
-
-  // Check orphan status for child tasks
-  let orphanStatus: OrphanCheckResult | null = null;
-  if (parentId && root) {
-    orphanStatus = await checkOrphanedChild(task, storage, root);
-  }
-
-  // Load auto-react status
-  let autoReactStatus: TaskShowData['autoReactStatus'] = null;
-  try {
-    autoReactStatus = await getAutoReactSummary(storage, task.id);
-    // Only include if there's meaningful data (any count > 0, paused, or auto-turns)
-    const hasData = autoReactStatus.paused || Object.values(autoReactStatus.counts).some(c => c > 0) || autoReactStatus.consecutiveAutoTurns > 0;
-    if (!hasData) autoReactStatus = null;
-  } catch {
-    // Non-critical
-  }
-
-  // Branch-protection status. Read-only and best-effort: a project whose
-  // config or git we cannot read must still show the task, so this degrades to
-  // null rather than failing the command.
-  let protection: TaskProtectionStatus | null = null;
-  let autoResumeQueue: TaskShowData['autoResumeQueue'] = null;
-  if (root) {
-    try {
-      const config = await loadConfig(root);
-      protection = await loadTaskProtectionStatus(storage, config, root, task, {
-        hasBranch: Boolean(sess?.git_branch),
-      });
-
-      // Slow-lane queue position — only meaningful for an interrupted task
-      // whose fast-lane circuit breaker has already tripped (mirrors
-      // listSlowLaneQueue's own filter, so this can't disagree with
-      // `lazy daemon resume-queue`/`lazy list`).
-      if (config.daemon.auto_resume && task.status === 'interrupted' && sess && !sess.ended_at
-        && sess.consecutive_interruptions >= MAX_CONSECUTIVE_INTERRUPTIONS && !sess.user_stopped) {
-        const state = await getSlowLaneState(storage, task.id);
-        if (!state.exhausted) {
-          const now = Date.now();
-          const intervalMs = config.daemon.auto_resume_interval_minutes * 60_000;
-          const dataDir = join(root, config.data.path);
-          const lastProjectAttempt = await getLastProjectAutoResumeAt(dataDir);
-          const gapMs = config.daemon.auto_resume_gap_minutes * 60_000;
-          const gapEligibleAt = lastProjectAttempt === null ? now : lastProjectAttempt + gapMs;
-          const intervalEligibleAt = state.lastAttemptAt === null ? now : state.lastAttemptAt + intervalMs;
-          // Approximation: this floors the ETA at the project-wide gap as if this
-          // task were always next in the round-robin. When another task is ahead
-          // of it, the real wait is longer — `lazy daemon resume-queue` shows the
-          // exact order for that case.
-          autoResumeQueue = {
-            attempts: state.attempts,
-            maxAttempts: config.daemon.auto_resume_max_attempts,
-            nextEligibleAt: Math.max(intervalEligibleAt, gapEligibleAt),
-          };
-        }
-      }
-    } catch (err) {
-      logger.debug(`Task ${shortId(task.id)}: could not resolve protection/auto-resume status: ${err instanceof Error ? err.message : err}`);
-    }
-  }
-
-  return { task, session: sess, turns, commits, comments, journal, followUps, statusHistory, tagHistory, children, childSessions, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate, mergeState, protection, autoResumeQueue };
+function formatActorPerson(email: string | undefined, name: string | undefined): string {
+  const who = attributionLabel(null, email, name);
+  return who ? ` ${dim(`(${who})`)}` : '';
 }
 
 /**
@@ -241,8 +58,18 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
  * using the single source of truth in `src/utils/turn-chunks.ts`. The per-turn
  * rendering is identical in both modes — only the grouping/headers differ.
  */
-export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showChunks = false): string[] {
-  const { task, session: sess, turns, commits, comments, journal, followUps, statusHistory, tagHistory, children, childSessions, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate, mergeState, protection, autoResumeQueue } = data;
+/**
+ * `offerUsagePauseOverride`: name the one-shot usage-pause override command in
+ * a hold line — only for a person at their own terminal
+ * (`mayOfferUsagePauseOverride`). Defaults to never.
+ */
+export function buildTaskShowLines(
+  data: TaskShowData,
+  showFull: boolean,
+  showChunks = false,
+  offerUsagePauseOverride = false,
+): string[] {
+  const { task, session: sess, turns, commits, comments, journal, raisedItems, turnReport, fileDecisions, artifacts, statusHistory, tagHistory, children, childSessions, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate, mergeState, serveState, protection, autoResumeQueue } = data;
   const outputLines: string[] = [];
 
   // Status text decorated with the derived working substate for working tasks.
@@ -292,11 +119,62 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
       outputLines.push(`             ${dim(line)}`);
     }
   }
+  // Pencils down, next to the status because it answers the question the status
+  // cannot: `blocked` reads as "settled, waiting for you" whether the agent
+  // finished or merely stopped. Resolved by the one function that owns the rule
+  // (the same one the web page and `lazy_show` read), never re-derived here.
+  // Shown only once a session exists — an unstarted task nobody has declared
+  // done is not news.
+  const finalState = sess ? buildShowFinal(turns) : null;
+  if (sess) {
+    if (finalState) {
+      const who = attributionLabel(finalState.claim.actor, finalState.claim.actor_user_id);
+      outputLines.push(
+        `  ${theme.label('Final:')}   declared by ${who} at ` +
+        `${theme.commitSha(finalState.claim.sha.substring(0, 8))} ` +
+        `${theme.timestamp(formatDate(finalState.claim.at))}`,
+      );
+      if (finalState.claim.note) {
+        outputLines.push(`           ${dim(finalState.claim.note)}`);
+      }
+      if (finalState.head_moved_label) {
+        outputLines.push(`           ${theme.warning(finalState.head_moved_label)}`);
+      }
+    } else {
+      outputLines.push(`  ${theme.label('Final:')}   ${dim('not declared — nobody has said this work is done')}`);
+    }
+  }
   outputLines.push(`  ${theme.label('Model:')}   ${theme.model(task.model ?? '-')}`);
   outputLines.push(`  ${theme.label('Agent:')}   ${task.agent_id}`);
   outputLines.push(`  ${theme.label('Type:')}    ${task.type ?? 'task'}`);
+  // Pre-composed by the daemon — this line is never assembled from the three
+  // fields here, so the CLI and the web page cannot word it differently.
+  if (data.review) {
+    outputLines.push(`  ${theme.label('Review:')}  ${data.review.line}`);
+    // The line names three values and explains none of them, and the question a
+    // surprised reader has is "why is it THAT" — so each value says what it
+    // means and where it came from, composed daemon-side (engineer report,
+    // 2026-09-21). Dimmed: this is the footnote, the line above is the answer.
+    for (const explanation of data.review.explanations ?? []) {
+      outputLines.push(`           ${dim(reviewExplanationLine(explanation))}`);
+    }
+    if (data.review.docs_url) {
+      outputLines.push(`           ${dim(`docs: ${data.review.docs_url}`)}`);
+    }
+  }
   if (task.tags && task.tags.length > 0) {
     outputLines.push(`  ${theme.label('Tags:')}    ${task.tags.map(t => theme.tag('#' + t)).join(' ')}`);
+  }
+  // One line, same URL the web header and MCP lazy_show read — no second derivation.
+  const forgeLink = resolveTaskForgeLink(task);
+  if (isLinkedTask(task)) {
+    outputLines.push(`  ${theme.label('Linked:')}  ${formatLinkedMarker(task)}`);
+  }
+  if (forgeLink) {
+    outputLines.push(`  ${theme.label(forgeLink.kind === 'mr' ? 'MR:' : 'PR:')}      ${forgeLink.url}`);
+  }
+  if (data.upstreamLine) {
+    outputLines.push(`  ${data.upstreamLine}`);
   }
 
   outputLines.push(`  ${theme.label('Created:')} ${theme.timestamp(formatDate(task.created_at))}`);
@@ -349,6 +227,32 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
       }
     }
     outputLines.push(`  ${theme.label('Start SHA:')}        ${theme.commitSha(sess.git_start_sha.substring(0, 8))}`);
+
+    // Declared [serve] ports. Only rendered when the project declares any —
+    // there is nothing useful to say about a project that serves nothing.
+    if (serveState && serveState.declared.length > 0) {
+      outputLines.push(`\n  ${theme.label('Serving:')}`);
+      if (serveState.unavailable === 'not-running') {
+        for (const s of serveState.declared) {
+          outputLines.push(`    ${s.name} → ${dim('(container not running)')}`);
+        }
+      } else if (serveState.unavailable === 'no-container-runner') {
+        outputLines.push(`    ${dim(`${serveState.runnerType} runner — services are on this machine's own ports`)}`);
+      } else {
+        for (const s of serveState.services) {
+          outputLines.push(`    ${s.name} → ${displayUrlFor(s) ?? dim('(not published — restart to pick up [serve])')}`);
+        }
+      }
+    }
+
+    // [usage_pause] holding a launch the daemon would otherwise have made.
+    const usageHold = usagePauseHoldOf(task);
+    if (usageHold) {
+      outputLines.push(...usagePauseHoldLines(usageHold, {
+        heldStart: usagePausePendingStartOf(task) !== null,
+        offerOverride: offerUsagePauseOverride,
+      }));
+    }
 
     // Interrupt diagnostics (if task was interrupted)
     if (sess.interrupt_at) {
@@ -438,13 +342,15 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
           : '';
         // Per-turn launch labels: which agent, model and effort this turn ran
         // under, always all three, `unknown` for anything the turn does not
-        // carry. Built by the shared formatter so `lazy show`, `lazy review` and
+        // carry. Built by the shared formatter so `lazy show`, `lazy browse` and
         // the web UI agree; an absent field is never filled in from the task's
         // current setting (see src/utils/turn-labels.ts).
         // A turn lazy wrote itself (supervisor nudge, [system] notice) ran no
         // agent and gets no labels at all — see turnRanNoAgent.
         const launchSegment = formatTurnLaunchLabels(turn);
         const launchLabels: string[] = launchSegment ? [launchSegment] : [];
+        const modelWarning = formatTurnModelWarning(turn, data.modelsDefault);
+        if (modelWarning) launchLabels.push(theme.warning(modelWarning));
         // What the agent reported about its own lazy tools at session start.
         // Printed only when it is NEWS — i.e. the turn ran with no lazy tools —
         // since the healthy case is every turn and would be pure noise. Absent
@@ -458,7 +364,21 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
             ? ` | ${theme.status('check: OK')}`
             : ` | ${theme.error(`check: FAILED (exit ${turn.check_exit_code})`)}`)
           : '';
+        // Only ever set when the hook FAILED — a healthy pre-turn hook is silent.
+        const preTurnSuffix = turn.pre_turn_exit_code !== undefined
+          ? ` | ${theme.error(`pre-turn hook: FAILED (exit ${turn.pre_turn_exit_code})`)}`
+          : '';
         const autoSuffix = turn.auto_triggered ? ` | ${theme.warning('auto')}` : '';
+        // Work the turn left in the worktree. It is in no commit, so it is in
+        // no diff below and in nothing accept would merge — which is why the
+        // count sits on the header, where a reader who is only skimming turns
+        // still meets it. The paths themselves print in the full view.
+        const uncommittedSuffix = turn.uncommitted?.length
+          ? ` | ${theme.error(`${turn.uncommitted.length} uncommitted`)}`
+          : '';
+        // WHICH person acted, when the store recorded one. Absent for rows
+        // with nobody behind them and for turns predating attribution.
+        const personSuffix = formatActorPerson(turn.actor_email, turn.actor_name);
         // Show the author for human-role turns authored by a non-human actor
         // (e.g. 'supervisor' for push-back/maintain prompts, 'builder' for MCP),
         // so the reader can tell "the human said" from "the supervisor pushed back".
@@ -466,8 +386,10 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
           ? turn.actor
           : turn.role;
         const roleDisplay = isErrorTurn ? theme.error('crash') : theme.turnRole(authorLabel);
+        const unparsedSuffix = formatUnparsedReviewSuffix(turn);
+        const reviewFailSuffix = unparsedSuffix ? theme.error(unparsedSuffix) : '';
         if (showFull) {
-          outputLines.push(`\n    --- Turn #${turn.sequence} [${roleDisplay}]${usageSuffix}${modelSuffix}${checkSuffix}${autoSuffix} ---`);
+          outputLines.push(`\n    --- Turn #${turn.sequence} [${roleDisplay}]${formatTurnTypeSuffix(turn)}${reviewFailSuffix}${usageSuffix}${modelSuffix}${preTurnSuffix}${checkSuffix}${autoSuffix}${uncommittedSuffix}${personSuffix} ---`);
           if (isErrorTurn) {
             for (const line of turnBody.split('\n')) {
               outputLines.push(`    ${theme.error(line)}`);
@@ -481,6 +403,22 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
               outputLines.push(turnBody);
             }
           }
+          if (turn.pre_turn_output) {
+            outputLines.push(`\n    ${theme.label('--- Pre-turn hook output ---')}`);
+            for (const line of turn.pre_turn_output.split('\n')) {
+              outputLines.push(`    ${line}`);
+            }
+          }
+          // The paths this turn left in the worktree. Printed in full, with
+          // what it means next to them: "uncommitted" is a git word, and the
+          // consequence a reviewer has to act on is that none of it is in the
+          // diff they are about to approve.
+          if (turn.uncommitted?.length) {
+            outputLines.push(`\n    ${theme.error('--- Uncommitted when this turn ended (not on the branch) ---')}`);
+            for (const path of turn.uncommitted) {
+              outputLines.push(`    ${path}`);
+            }
+          }
           // Show check output in full view
           if (turn.check_output) {
             outputLines.push(`\n    ${theme.label('--- Post-turn check output ---')}`);
@@ -491,9 +429,9 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
         } else {
           const preview = turnBody.substring(0, 80).replace(/\n/g, ' ');
           if (isErrorTurn) {
-            outputLines.push(`    #${turn.sequence} [${roleDisplay}]${usageSuffix}${modelSuffix}${checkSuffix}${autoSuffix} ${theme.error(preview)}${turnBody.length > 80 ? '...' : ''}`);
+            outputLines.push(`    #${turn.sequence} [${roleDisplay}]${formatTurnTypeSuffix(turn)}${reviewFailSuffix}${usageSuffix}${modelSuffix}${preTurnSuffix}${checkSuffix}${autoSuffix}${uncommittedSuffix}${personSuffix} ${theme.error(preview)}${turnBody.length > 80 ? '...' : ''}`);
           } else {
-            outputLines.push(`    #${turn.sequence} [${theme.turnRole(authorLabel)}]${usageSuffix}${modelSuffix}${checkSuffix}${autoSuffix} ${preview}${turnBody.length > 80 ? '...' : ''}`);
+            outputLines.push(`    #${turn.sequence} [${theme.turnRole(authorLabel)}]${formatTurnTypeSuffix(turn)}${reviewFailSuffix}${usageSuffix}${modelSuffix}${preTurnSuffix}${checkSuffix}${autoSuffix}${uncommittedSuffix}${personSuffix} ${preview}${turnBody.length > 80 ? '...' : ''}`);
           }
         }
       };
@@ -538,6 +476,25 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
   } else {
     outputLines.push(`\n${theme.label('Session:')} (not started)`);
     outputLines.push(`  Start with: ${theme.command('lazy start ' + displayId(task))}`);
+    // A subtask start the usage pause is holding has no session yet (only a
+    // first start is held), so its hold is shown here rather than above.
+    const heldStartHold = usagePauseHoldOf(task);
+    if (heldStartHold) {
+      outputLines.push(...usagePauseHoldLines(heldStartHold, {
+        heldStart: usagePausePendingStartOf(task) !== null,
+        offerOverride: offerUsagePauseOverride,
+      }));
+    }
+  }
+
+  // Cluster progress — derived from the children below, printed above them so
+  // the k-of-n answer is the first thing a reviewer sees on a cluster task.
+  const clusterProgress = clusterProgressOf(task, children);
+  if (clusterProgress) {
+    outputLines.push(`\n${theme.label('Cluster progress:')} ${formatClusterProgress(clusterProgress)}`);
+    for (const child of clusterProgress.deferred) {
+      outputLines.push(`  ${dim('deferred')} ${theme.taskId(displayId(child))} ${child.goal}`);
+    }
   }
 
   // Children (variants)
@@ -558,24 +515,27 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
 
     for (const comment of comments) {
       if (showFull) {
-        outputLines.push(`\n  [${theme.timestamp(formatDate(comment.created_at))}]`);
+        outputLines.push(`\n  [${theme.timestamp(formatDate(comment.created_at))}]${formatActorPerson(comment.actor_email, comment.actor_name)}`);
         const lines = comment.content.split('\n');
         for (const line of lines) {
           outputLines.push(`    ${line}`);
         }
       } else {
         const preview = comment.content.substring(0, 80).replace(/\n/g, ' ');
-        outputLines.push(`  [${theme.timestamp(formatDate(comment.created_at))}] ${preview}${comment.content.length > 80 ? '...' : ''}`);
+        outputLines.push(`  [${theme.timestamp(formatDate(comment.created_at))}]${formatActorPerson(comment.actor_email, comment.actor_name)} ${preview}${comment.content.length > 80 ? '...' : ''}`);
       }
     }
   }
 
-  // Journal (append-only, prompt-immune side channel — separate from Comments)
+  // Journal (append-only side channel — separate from Comments: entry text is
+  // never injected into an agent prompt, only counted)
   if (journal.length > 0) {
     outputLines.push(`\n${theme.separator('---')} ${theme.label(`Journal (${journal.length})`)} ${theme.separator('---')}`);
 
     for (const entry of journal) {
-      const who = entry.actor ? ` ${theme.label(entry.actor)}` : '';
+      const who = entry.actor
+        ? ` ${theme.label(entry.actor)}${formatActorPerson(entry.actor_email, entry.actor_name)}`
+        : '';
       if (showFull) {
         outputLines.push(`\n  [${theme.timestamp(formatDate(entry.created_at))}]${who}`);
         for (const line of entry.content.split('\n')) {
@@ -587,22 +547,137 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
       }
     }
   }
+  // Raised items — everything the agent surfaced for a human. Open BLOCKING
+  // ones gate accept; non-blocking ones are the orthogonal proposals that used
+  // to be follow-ups. One list, one vocabulary, the flag says which is which.
+  // `?? []` for version skew against a daemon that predates raised items.
+  const raisedList = raisedItems ?? [];
+  if (raisedList.length > 0) {
+    const open = raisedList.filter(r => r.status === 'open');
+    const openBlocking = open.filter(r => r.blocking).length;
+    const openNonBlocking = open.length - openBlocking;
+    const label = open.length > 0
+      ? `Raised items (${raisedList.length}, ${openBlocking} open blocking, ${openNonBlocking} open non-blocking)`
+      : `Raised items (${raisedList.length})`;
+    outputLines.push(`\n${theme.separator('---')} ${theme.label(label)} ${theme.separator('---')}`);
 
-  // Follow-ups (orthogonal-work discoveries recorded by the agent; for triage)
-  if (followUps.length > 0) {
-    outputLines.push(`\n${theme.separator('---')} ${theme.label(`Follow-ups (${followUps.length})`)} ${theme.separator('---')}`);
-
-    for (const f of followUps) {
+    for (const r of raisedList) {
+      const statusTag = r.status === 'open'
+        ? theme.warning('[open]')
+        : dim(`[${r.status}]`);
+      const gateTag = r.blocking ? theme.warning('[gates accept]') : dim('[fyi]');
+      const body = r.title ?? r.content;
       if (showFull) {
-        outputLines.push(`\n  [${theme.timestamp(formatDate(f.created_at))}]`);
-        for (const line of f.content.split('\n')) {
+        outputLines.push(`\n  [${theme.timestamp(formatDate(r.created_at))}] ${dim(r.id.slice(0, 8))} ${statusTag} ${gateTag}`);
+        for (const line of (r.title ? [r.title, ...(r.explanation ? ['', r.explanation] : [])] : [r.content]).join('\n').split('\n')) {
+          outputLines.push(`    ${line}`);
+        }
+        if (r.options && r.options.length > 0) {
+          outputLines.push(`    ${dim('options:')} ${r.options.join(' | ')}`);
+        }
+        if (r.proposed_code) {
+          outputLines.push(`    ${dim(`proposed code: ${r.proposed_code}`)}`);
+        }
+        // Who decided — the person when the store knew one, the role
+        // otherwise. Above the note, because "who" frames it.
+        const decidedBy = attributionLabel(r.resolved_by, r.resolved_by_email, r.resolved_by_name);
+        if (r.status !== 'open' && decidedBy) {
+          outputLines.push(`    ${dim(`decided by: ${decidedBy}`)}`);
+        }
+        const reopenedBy = attributionLabel(r.unresolved_by, r.unresolved_by_email, r.unresolved_by_name);
+        if (r.status === 'open' && reopenedBy) {
+          outputLines.push(`    ${dim(`reopened by: ${reopenedBy}`)}`);
+        }
+        if (r.resolution) {
+          outputLines.push(`    ${dim(`resolution: ${r.resolution}`)}`);
+        }
+        if (r.comments && r.comments.length > 0) {
+          outputLines.push(`    ${dim(`agent comments (${r.comments.length}):`)}`);
+          for (const c of r.comments) {
+            const preview = c.content.replace(/\n/g, ' ').slice(0, 120);
+            outputLines.push(`      ${dim(`[${c.actor}]`)} ${preview}${c.content.length > 120 ? '...' : ''}`);
+          }
+        }
+        if (r.pending_comment && r.comment_delivered_at == null) {
+          outputLines.push(`    ${dim('pending comment (delivered on next unblock/accept)')}`);
+        }
+        if (r.promoted_task_id) {
+          outputLines.push(`    ${dim(`promoted task: ${r.promoted_task_id.slice(0, 8)}`)}`);
+        }
+      } else {
+        const preview = body.substring(0, 80).replace(/\n/g, ' ');
+        outputLines.push(`  [${theme.timestamp(formatDate(r.created_at))}] ${dim(r.id.slice(0, 8))} ${statusTag} ${gateTag} ${preview}${body.length > 80 ? '...' : ''}`);
+      }
+    }
+    if (openBlocking > 0) {
+      outputLines.push(`  ${dim(`Resolve blocking items before accept: --respond-raised / --promote-raised-subtask / --promote-raised-peer / --dismiss-raised`)}`);
+    }
+    if (openNonBlocking > 0) {
+      outputLines.push(`  ${dim(`Triage: lazy raised respond|acknowledge|dismiss|promote ${displayId(task)} <id>`)}`);
+    }
+
+  }
+
+  // Structured turn report. Storage keeps agent order; this CLI view is
+  // human-facing so it applies the same tier policy as web/TUI.
+  if (turnReport && turnReport.sections.length > 0) {
+    const seq =
+      turnReport.turn_sequence != null
+        ? ` turn #${turnReport.turn_sequence}`
+        : '';
+    outputLines.push(
+      `\n${theme.separator('---')} ${theme.label(`Turn report${seq}`)} ${theme.separator('---')}`,
+    );
+    for (const section of orderReportSections(turnReport.sections)) {
+      const label = REPORT_SECTION_LABELS[section.kind] ?? section.kind;
+      if (showFull) {
+        outputLines.push(`\n  ${theme.label(label)}`);
+        for (const line of section.body.split('\n')) {
           outputLines.push(`    ${line}`);
         }
       } else {
-        const preview = f.content.substring(0, 80).replace(/\n/g, ' ');
-        outputLines.push(`  [${theme.timestamp(formatDate(f.created_at))}] ${preview}${f.content.length > 80 ? '...' : ''}`);
+        const preview = section.body.substring(0, 80).replace(/\n/g, ' ');
+        outputLines.push(
+          `  ${theme.label(label)}: ${preview}${section.body.length > 80 ? '...' : ''}`,
+        );
       }
     }
+  }
+
+  // Structured keep/skip reasons from justify tools (display-only; never auto-approve).
+  // `?? []` for version skew against a daemon that predates file decisions.
+  const decisionList = fileDecisions ?? [];
+  if (decisionList.length > 0) {
+    outputLines.push(
+      `\n${theme.separator('---')} ${theme.label(`File decisions (${decisionList.length})`)} ${theme.separator('---')}`,
+    );
+    for (const d of decisionList) {
+      const scope = d.scope === 'protected' ? 'keep' : 'skip';
+      const preview = d.reason.substring(0, 80).replace(/\n/g, ' ');
+      outputLines.push(
+        `  [${d.scope}/${scope}] ${d.target}: ${preview}${d.reason.length > 80 ? '...' : ''}`,
+      );
+    }
+  }
+
+  // Artifacts (files attached to the task, and files it published back).
+  // Metadata only, always — content is fetched with `lazy artifact get`, and a
+  // megabyte of design files must never land in a `lazy show`.
+  //
+  // `?? []`, not a bare read: this data can arrive deserialized from a daemon
+  // that predates artifacts, and `lazy show` crashing on version skew would be
+  // a far worse failure than one missing section.
+  const artifactList = artifacts ?? [];
+  if (artifactList.length > 0) {
+    outputLines.push(`\n${theme.separator('---')} ${theme.label(`Artifacts (${artifactList.length})`)} ${theme.separator('---')}`);
+    for (const a of artifactList) {
+      const origin = a.origin === 'output' ? ' (published by this task)' : '';
+      outputLines.push(
+        `  ${a.name}  ${dim(formatArtifactBytes(a.size))}${origin}  ` +
+        `[${theme.timestamp(formatDate(a.created_at))}]`,
+      );
+    }
+    outputLines.push(`  ${dim(`Read one with: lazy artifact get ${displayId(task)} <name>`)}`);
   }
 
   // Status History (audit trail of status transitions)
@@ -613,7 +688,7 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
       const transition = prev === null
         ? theme.status(change.status)
         : `${theme.status(prev)} → ${theme.status(change.status)}`;
-      const actor = change.actor ? ` ${theme.label('by')} ${change.actor}` : '';
+      const actor = change.actor ? ` ${theme.label('by')} ${change.actor}${formatActorPerson(change.actor_email, change.actor_name)}` : '';
       outputLines.push(`  [${theme.timestamp(formatDate(change.timestamp))}] ${transition}${actor}`);
       prev = change.status;
     }
@@ -624,7 +699,7 @@ export function buildTaskShowLines(data: TaskShowData, showFull: boolean, showCh
     outputLines.push(`\n${theme.separator('---')} ${theme.label(`Tag History (${tagHistory.length})`)} ${theme.separator('---')}`);
     for (const event of tagHistory) {
       const verb = event.action === 'tag' ? theme.success('tagged') : theme.warning('untagged');
-      const actor = event.actor ? ` ${theme.label('by')} ${event.actor}` : '';
+      const actor = event.actor ? ` ${theme.label('by')} ${event.actor}${formatActorPerson(event.actor_email, event.actor_name)}` : '';
       outputLines.push(`  [${theme.timestamp(formatDate(event.timestamp))}] ${verb} ${theme.tag('#' + event.tag)}${actor}`);
     }
   }
@@ -716,7 +791,7 @@ export async function commandShow(args: string[], invokedAs = 'show'): Promise<v
 
   const showFull = parsed.flags.get('full') === true;
   // Turn grouping default depends on the invoked name: `lazy view` groups turns
-  // into review chunks by default (parity with `lazy review`, which groups by
+  // into review chunks by default (parity with `lazy browse`, which groups by
   // default), while the canonical `lazy show` stays flat by default so scripts
   // reading its text output are undisturbed. `--chunks`/`--flat` force either
   // mode explicitly on both; `--flat` wins if both are somehow passed.
@@ -739,7 +814,7 @@ export async function commandShow(args: string[], invokedAs = 'show'): Promise<v
       return;
     }
 
-    const outputLines = buildTaskShowLines(data, showFull, showChunks);
+    const outputLines = buildTaskShowLines(data, showFull, showChunks, await mayOfferUsagePauseOverride());
     let output = outputLines.join('\n');
     if (lineRange) {
       output = sliceLines(output, lineRange);
@@ -774,7 +849,7 @@ export async function commandShow(args: string[], invokedAs = 'show'): Promise<v
           return;
         }
 
-        const outputLines = buildTaskShowLines(resolved.data, showFull, showChunks);
+        const outputLines = buildTaskShowLines(resolved.data, showFull, showChunks, await mayOfferUsagePauseOverride());
         let output = outputLines.join('\n');
         if (lineRange) {
           output = sliceLines(output, lineRange);
@@ -878,7 +953,7 @@ export async function commandShow(args: string[], invokedAs = 'show'): Promise<v
 
 /** Build the JSON output structure from TaskShowData. Used by both direct and daemon paths. */
 function buildShowJson(data: TaskShowData): Record<string, unknown> {
-  const { task, session: sess, turns, commits, comments, journal, followUps, children, retryStatus, autoReactStatus, mergeState } = data;
+  const { task, session: sess, turns, commits, comments, journal, raisedItems, turnReport, fileDecisions, artifacts, children, retryStatus, autoReactStatus, mergeState, workingSubstate, supervisorStatus } = data;
 
   const jsonData: Record<string, unknown> = {
     id: task.id,
@@ -886,7 +961,6 @@ function buildShowJson(data: TaskShowData): Record<string, unknown> {
     goal: task.goal,
     status: task.status,
     type: task.type ?? 'task',
-    priority: task.priority ?? 'normal',
     model: task.model,
     agent_id: task.agent_id,
     prompt: task.prompt || null,
@@ -905,6 +979,10 @@ function buildShowJson(data: TaskShowData): Record<string, unknown> {
       started_at: sess.started_at,
       ended_at: sess.ended_at,
       last_interaction_at: sess.last_interaction_at,
+      // Which run the reconciler probes for this session, and on which runner
+      // — the first two things to check when a task sits at working(not-alive).
+      container_name: sess.container_name ?? null,
+      runner_type: sess.runner_type ?? null,
       total_duration_ms: sess.total_duration_ms,
       total_usage: sess.total_usage,
       consecutive_interruptions: sess.consecutive_interruptions,
@@ -913,6 +991,11 @@ function buildShowJson(data: TaskShowData): Record<string, unknown> {
     turns: turns.map(t => ({
       sequence: t.sequence,
       role: t.role,
+      // WHAT KIND of actor wrote the turn, and WHICH person — null for rows
+      // with nobody behind them and for turns predating attribution.
+      actor: t.actor ?? null,
+      actor_email: t.actor_email ?? null,
+      actor_name: t.actor_name ?? null,
       content: turnText(t),
       prompt: t.prompt ?? null,
       timestamp: t.timestamp,
@@ -933,6 +1016,11 @@ function buildShowJson(data: TaskShowData): Record<string, unknown> {
       auto_triggered: t.auto_triggered ?? false,
       ...(t.check_exit_code !== undefined ? { check_exit_code: t.check_exit_code } : {}),
       ...(t.check_output !== undefined ? { check_output: t.check_output } : {}),
+      // Paths the turn left in the worktree — present only when there were
+      // some, so a script can read the field's presence as the alarm.
+      ...(t.uncommitted?.length ? { uncommitted: t.uncommitted } : {}),
+      ...(t.pre_turn_exit_code !== undefined ? { pre_turn_exit_code: t.pre_turn_exit_code } : {}),
+      ...(t.pre_turn_output !== undefined ? { pre_turn_output: t.pre_turn_output } : {}),
     })),
     commits: commits.map(c => ({
       sha: c.sha,
@@ -943,16 +1031,73 @@ function buildShowJson(data: TaskShowData): Record<string, unknown> {
     comments: comments.map(c => ({
       content: c.content,
       created_at: c.created_at,
+      actor: c.actor ?? null,
+      actor_email: c.actor_email ?? null,
+      actor_name: c.actor_name ?? null,
     })),
     journal: journal.map(j => ({
       content: j.content,
       created_at: j.created_at,
       actor: j.actor ?? null,
+      actor_email: j.actor_email ?? null,
+      actor_name: j.actor_name ?? null,
     })),
-    follow_ups: followUps.map(f => ({
-      content: f.content,
-      created_at: f.created_at,
-      session_id: f.session_id ?? null,
+    // ONE array for everything the agent raised: `follow_ups` is gone, and
+    // `blocking` is what tells a consumer whether an item gates accept.
+    // `?? []` for version skew against an older daemon.
+    raised_items: (raisedItems ?? []).map(r => ({
+      id: r.id,
+      blocking: r.blocking,
+      content: r.content,
+      title: r.title ?? null,
+      explanation: r.explanation ?? null,
+      proposed_code: r.proposed_code ?? null,
+      proposed_prompt: r.proposed_prompt ?? null,
+      options: r.options ?? null,
+      created_at: r.created_at,
+      session_id: r.session_id ?? null,
+      turn_sequence: r.turn_sequence ?? null,
+      status: r.status,
+      resolved_at: r.resolved_at ?? null,
+      resolved_by: r.resolved_by ?? null,
+      resolved_by_email: r.resolved_by_email ?? null,
+      resolved_by_name: r.resolved_by_name ?? null,
+      resolution: r.resolution ?? null,
+      comments: r.comments ?? null,
+      pending_comment: r.pending_comment ?? null,
+      comment_delivered_at: r.comment_delivered_at ?? null,
+      delivered_turn: r.delivered_turn ?? null,
+      promoted_task_id: r.promoted_task_id ?? null,
+    })),
+    turn_report: turnReport
+      ? {
+          id: turnReport.id,
+          session_id: turnReport.session_id,
+          turn_sequence: turnReport.turn_sequence ?? null,
+          sections: turnReport.sections,
+          raised_item_ids: turnReport.raised_item_ids ?? null,
+          created_at: turnReport.created_at,
+        }
+      : null,
+    file_decisions: fileDecisions.map((d) => ({
+      id: d.id,
+      scope: d.scope,
+      target: d.target,
+      decision: d.decision,
+      reason: d.reason,
+      created_at: d.created_at,
+    })),
+    // Metadata only — `lazy artifact get` is the content path. `?? []` for the
+    // same version-skew reason as the text renderer above.
+    artifacts: (artifacts ?? []).map(a => ({
+      name: a.name,
+      size: a.size,
+      sha256: a.sha256,
+      mime_type: a.mime_type,
+      binary: a.binary,
+      origin: a.origin,
+      created_by: a.created_by,
+      created_at: a.created_at,
     })),
     children: children.map(c => ({
       id: c.id,
@@ -962,8 +1107,40 @@ function buildShowJson(data: TaskShowData): Record<string, unknown> {
     })),
   };
 
+  // A scripted consumer must be able to answer "how far along is this cluster"
+  // without re-deriving the rule — same derivation the text output prints.
+  const clusterProgress = clusterProgressOf(task, children);
+  if (clusterProgress) {
+    // The same projection the `show` and `clusters` RPCs send, so a script
+    // reading one surface and a client reading the other see one shape.
+    //
+    // Was `loop_progress` until 2026-09-20 and renamed with the Ruby client. No
+    // compatibility spelling, for the reason given on `show`'s `clusterProgress`:
+    // a reader that misses this key sees the same absence a non-cluster task
+    // produces, which costs a progress line rather than a page.
+    jsonData.cluster_progress = clusterProgressPayload(clusterProgress);
+  }
+
+  // Pencils down. Emitted even when null, unlike the optional blocks below: a
+  // script must be able to tell "nobody declared this done" from "this build
+  // does not report finals", and only an explicit null does that.
+  jsonData.final = buildShowFinal(turns);
+
   if (retryStatus) {
     jsonData.retry_status = retryStatus;
+  }
+
+  // What the reconciler sees for a WORKING task, for remote diagnosis of one
+  // that sits at working(not-alive) (docs/working-not-alive.md): the derived
+  // label, the supervisor's last checkpoint, and the ask/review claim that
+  // decides which run speaks for the task.
+  if (task.status === 'working') {
+    jsonData.liveness = {
+      working_status: renderWorkingStatus(workingSubstate),
+      supervisor_phase: supervisorStatus?.phase ?? null,
+      supervisor_updated_at: supervisorStatus?.updated_at ?? null,
+      in_flight_turn: task.in_flight_turn ?? null,
+    };
   }
 
   if (autoReactStatus) {
@@ -978,6 +1155,14 @@ function buildShowJson(data: TaskShowData): Record<string, unknown> {
       unmerged_files: mergeState.unmergedFiles,
       summary: describeMergeState(mergeState),
     };
+  }
+
+  // Same no-network line the text renderer and MCP lazy_show print.
+  if (data.review) {
+    jsonData.review = data.review;
+  }
+  if (data.upstreamLine) {
+    jsonData.upstream = data.upstreamLine;
   }
 
   return jsonData;
@@ -1005,7 +1190,7 @@ Arguments:
 
 Turn grouping:
   'lazy view' groups turns into review chunks by default (parity with the
-  'lazy review' TUI); the canonical 'lazy show' lists turns flat by default.
+  'lazy browse' TUI); the canonical 'lazy show' lists turns flat by default.
   Use --chunks or --flat to force either mode regardless of how it was invoked.
 
 Options:
@@ -1034,4 +1219,33 @@ Examples:
   lazy show README.md                         # View a file in scrollable TUI
   lazy show src/index.ts                      # View a TypeScript file
   lazy show CLAUDE.md --lines 1..50           # Show first 50 lines of file`)
+}
+
+/**
+ * The `lazy show` lines for a launch the usage pause is holding.
+ *
+ * INVARIANT: the override command is named only to a person at their own
+ * terminal (`offerOverride`), and never for a HELD SUBTASK START, which the
+ * override does not release (the replay runs as the agent that asked): that
+ * one starts by itself after the reset, and says so.
+ */
+export function usagePauseHoldLines(
+  hold: UsagePauseHold,
+  opts: { heldStart: boolean; offerOverride: boolean; now?: number },
+): string[] {
+  const lifted = hold.resetsAt !== null && hold.resetsAt <= (opts.now ?? Date.now());
+  const lines = [
+    `\n  ${theme.label('Usage pause:')} ` +
+      (lifted
+        ? `the window has reset — the ${hold.held} goes ahead on the daemon's next pass`
+        : `the ${hold.held} is waiting`),
+  ];
+  if (!lifted) lines.push(`    ${describeUsagePause(hold)}`);
+  const next = opts.heldStart
+    ? 'it starts by itself after the reset'
+    : opts.offerOverride
+      ? `let one turn start now: ${theme.command('lazy daemon config set usage_pause_threshold off')}`
+      : 'it goes ahead by itself after the reset';
+  lines.push(`    ${dim(`Details: ${theme.command('lazy doctor')} · ${next}`)}`);
+  return lines;
 }

@@ -1,5 +1,5 @@
 /**
- * Death-resilient registry for daemons spawned by the e2e test suite.
+ * Death-resilient registry for daemons AND supervisors spawned by the e2e suite.
  *
  * WHY THIS EXISTS
  * ---------------
@@ -42,16 +42,76 @@
  *    the daemon's own parent watch can cover that — see
  *    `src/daemon/test-parent-watch.ts`, armed by `LAZY_TEST_PARENT_PID` in
  *    setup.ts.
+ *
+ * SUPERVISORS, NOT JUST DAEMONS
+ * -----------------------------
+ * A `fakeClaude` suite runs the host-process runner, which spawns a REAL
+ * `lazy supervise` subprocess per task — also detached and `unref()`'d, and NOT
+ * killed by stopping the daemon that launched it. Nothing used to reap those:
+ * a crashed or interrupted run left live supervisors behind whose /tmp
+ * worktrees had already been deleted. That is not merely untidy. Every
+ * supervisor turn rewrites the ONE shared `~/.claude.json` `mcpServers.lazy`
+ * entry with its own `--task-id`/`--worktree` (src/mcp/config.ts), so a leaked
+ * test supervisor pointed a real agent's lazy MCP channel at a deleted temp
+ * worktree — observed as `lazy_commit` failing with "working directory
+ * '/tmp/lazy-e2e-.../worktrees/...' does not exist".
+ *
+ * So the same three layers now cover supervisors: `ctx.cleanup()` (graceful,
+ * SIGTERM then SIGKILL), the exit/signal sweep below, and the supervisor's own
+ * `LAZY_TEST_PARENT_PID` watch (src/supervisor/index.ts) for a SIGKILLed run.
+ *
+ * AND MACHINE ONE-SHOTS
+ * ---------------------
+ * There is a third leakable process, one level further down: a machine one-shot
+ * (accept's fidelity summary, `lazy report`, `lazy ask`, memory compaction). It
+ * is a child of whichever process ran it, so killing the daemon does not reap
+ * it, and it has no pidfile at all. Containers accumulated stranded `claude`
+ * pids carrying the one-shot marker, each one an unbounded model call against a
+ * proxy that had already been torn down.
+ *
+ * One-shots are a Runner concern now (docs/oneshot-execution.md), which shrinks
+ * this to the HOST runner: a containerized one-shot is a `--rm` container
+ * carrying the project label, reaped like every other lazy container. The host
+ * runner still spawns a real process, and it is still bounded by default, so a
+ * strand is rare rather than routine — but "rare" is not "none", and the reaper
+ * that catches the remaining ones is here.
+ *
+ * A one-shot is identified by lazy's OWN marker in its argv
+ * (ONESHOT_MARKER, stamped into every one-shot prompt) plus a cwd under a
+ * directory this run owns; both are required, so a developer's real `claude` on
+ * the same machine is never touched.
  */
 
 // NOTE: import the lightweight `paths` module directly, NOT the `src/daemon`
 // barrel. The barrel transitively pulls the daemon status path, which imports
 // the generated `src/build-info.ts`. This module is imported by the global
-// preload, which runs BEFORE that file is generated — pulling the barrel there
-// would crash the preload in worktrees. `paths` only depends on path/crypto/os.
-import { readFileSync, existsSync, readdirSync } from 'fs';
+// preload — and ES imports hoist, so it loads BEFORE the preload generates that
+// file — which is why pulling the barrel here crashes every suite at once in a
+// fresh worktree. `paths` only depends on path/crypto/os.
+//
+// `src/utils/process-identity` passes the same test, and was CHECKED against it
+// rather than assumed: its whole import chain is fs / fs-promises / `./spawn`,
+// and `./spawn` reaches only node:fs, node:path, bun's `which` and
+// `./sanitize-text`, which imports nothing at all. Verified by hiding
+// `src/version.ts` and `lazy-agent` — the exact state a cold worktree is in —
+// and importing it.
+import { readFileSync, existsSync, readdirSync, readlinkSync } from 'fs';
+import { basename } from 'path';
 import { getPidPath } from '../../src/daemon/paths';
+import { processGroupIdSync, isRunningProcessSync } from '../../src/utils/process-identity';
 import { commandLooksLikeDaemon } from '../../src/daemon/process-identity';
+
+/**
+ * The nonce from ONESHOT_MARKER (src/import/machine-oneshot.ts), duplicated
+ * rather than imported ON PURPOSE: this module is loaded by the global preload,
+ * before `src/build-info.ts` is generated, so it may only import leaf modules
+ * (see the NOTE above). `machine-oneshot.ts` pulls in the logger and, through
+ * it, most of the CLI.
+ *
+ * `test/unit/oneshot-reaper.test.ts` asserts this string is still a substring of
+ * the real marker, so the duplication cannot silently rot.
+ */
+const ONESHOT_MARKER_NONCE = 'lazy-machine-oneshot/v1/';
 
 /** Project roots of test daemons that have not been gracefully stopped yet. */
 const liveDaemonRoots = new Set<string>();
@@ -72,7 +132,33 @@ const liveDaemonRoots = new Set<string>();
  */
 const allTestRoots = new Set<string>();
 
+/**
+ * Every directory a machine one-shot spawned by this run could be standing in,
+ * beyond the project roots themselves: the per-context `LAZY_ONESHOT_BASE_DIR`
+ * temp dir, which is where the fidelity summarizer deliberately runs its agent
+ * (src/oneshot/state-dir.ts). Never pruned, for the same reason
+ * `allTestRoots` is not.
+ */
+const allOneshotDirs = new Set<string>();
+
 let handlersInstalled = false;
+
+/** True once a SIGINT/SIGTERM handler has started — second interrupt skips cleanup. */
+let interruptHandled = false;
+
+/** Bound for the process-table sweep so teardown cannot hang forever. */
+const EXIT_SWEEP_BUDGET_MS = 2_000;
+
+/**
+ * Test-only: per-/proc-entry delay so benchmarks can simulate a busy machine
+ * without guessing. Read only inside `readAllProcessCommands`.
+ */
+function sweepDelayPerProcMs(): number {
+  const raw = process.env.LAZY_TEST_REGISTRY_SWEEP_DELAY_MS;
+  if (!raw) return 0;
+  const n = parseInt(raw, 10);
+  return Number.isNaN(n) || n < 0 ? 0 : n;
+}
 
 /** Sync read of a root's daemon pidfile. Mirrors `readPid` without the barrel. */
 function readDaemonPid(root: string): number | null {
@@ -107,6 +193,300 @@ export function isDaemonCommandForRoot(cmd: string, root: string): boolean {
 }
 
 /**
+ * Does this command line belong to a `lazy supervise` process working inside
+ * `root`?
+ *
+ * The supervisor is always spawned as `<lazy command…> supervise --protocol-dir
+ * <dir> --worktree <path> --runner <type>` (see HostProcessRunner.launchSupervisor),
+ * and a task's worktree always lives under the project root
+ * (`<root>/.lazy/worktrees/<ref>`). As with the daemon matcher we key on the
+ * ARGUMENTS — the `lazy` command itself may be a compiled binary or
+ * `bun run <repo>/src/index.ts` — and we compare the `--worktree` value as a
+ * TOKEN under this exact root, never with `includes`, so one temp root can
+ * never match another run's supervisor.
+ */
+export function isSupervisorCommandForRoot(cmd: string, root: string): boolean {
+  const tokens = cmd.split(/\s+/);
+  if (!tokens.includes('supervise')) return false;
+  const idx = tokens.lastIndexOf('--worktree');
+  if (idx === -1) return false;
+  const worktree = tokens[idx + 1];
+  if (!worktree) return false;
+  return worktree === root || worktree.startsWith(`${root}/`);
+}
+
+/**
+ * Pids of every live `lazy supervise` process working inside `root`. Exported so
+ * a test can assert the absence of one after teardown — the leak this whole
+ * sweep exists for.
+ */
+export function findSupervisorsForRoot(root: string): number[] {
+  const found: number[] = [];
+  for (const [pid, cmd] of readAllProcessCommands()) {
+    if (pid !== process.pid && isSupervisorCommandForRoot(cmd, root)) found.push(pid);
+  }
+  return found;
+}
+
+/**
+ * A supervisor the sweep found, plus the process group it OWNS (null when it
+ * does not own one).
+ *
+ * Reaping a supervisor by pid alone leaves the AGENT it spawned running,
+ * reparented to init — the leak that put fake-`claude` processes in the process
+ * table for the rest of a `bun test` run, each holding a worktree the harness
+ * then deleted underneath it. The host-process runner launches every supervisor
+ * with `setsid()` for exactly this reason, so the group reaches the agent too.
+ *
+ * `group` is only ever the supervisor's own group id: a process can only join a
+ * group led by another process in its session, and a session leader's session
+ * holds nothing but its own descendants, so `pgid === pid` is proof that every
+ * member is this supervisor or something it started. Anything else — a
+ * supervisor from before that launch behaviour, a platform that would not
+ * answer — is null and gets the pid alone, exactly as before.
+ */
+export interface SupervisorTarget {
+  pid: number;
+  group: number | null;
+}
+
+/**
+ * The process group `pid` leads, or null if it does not lead one.
+ *
+ * Ownership only — the READING is `processGroupIdSync`, which owns the
+ * procfs-vs-`ps` split for the whole codebase. What is decided here is the
+ * narrower question: a pgid equal to the pid means that process created the
+ * group, so its members can only be it and its descendants. No answer means
+ * null, never a guess at something wider.
+ */
+function ownedProcessGroup(pid: number): number | null {
+  const pgid = processGroupIdSync(pid);
+  return pgid !== null && pgid === pid ? pgid : null;
+}
+
+/** The `kill(2)` argument reaching a target: a negative pid addresses a group. */
+function supervisorKillArg(target: SupervisorTarget): number {
+  return target.group === null ? target.pid : -target.group;
+}
+
+/**
+ * Every live `lazy supervise` process working inside `root`, with the group each
+ * one owns — snapshotted, because a group id cannot be recovered once its leader
+ * is gone, and the escalation pass needs it after the SIGTERM killed exactly
+ * that leader.
+ */
+export function findSupervisorTargetsForRoot(root: string): SupervisorTarget[] {
+  return findSupervisorsForRoot(root).map(pid => ({ pid, group: ownedProcessGroup(pid) }));
+}
+
+/** Signal a supervisor and, when it owns a group, the agent it spawned. */
+export function signalSupervisorTarget(target: SupervisorTarget, signal: NodeJS.Signals): void {
+  try {
+    process.kill(supervisorKillArg(target), signal);
+  } catch {
+    // Already exited (ESRCH) — nothing to reap.
+  }
+}
+
+/**
+ * Is anything this target covers still RUNNING?
+ *
+ * "Any group member", not "the leader": the whole point is the agent that
+ * outlives its supervisor, so answering on the leader alone would report the
+ * reap finished while the process it exists to catch was still there.
+ *
+ * Zombies do not count. `kill(pid, 0)` succeeds against a process that has
+ * exited and not yet been reaped, and this runs immediately after SIGTERMing a
+ * whole process tree — so the children are, by construction, mid-exit at exactly
+ * the moment they are counted. Treating them as alive made every teardown wait
+ * out its full two seconds before a SIGKILL with nothing left to kill. Same rule
+ * the runner applies to its own stop; `isRunningProcessSync` is the same helper.
+ */
+export function isSupervisorTargetAlive(target: SupervisorTarget): boolean {
+  // `kill(-pgid, 0)` is the cheap "does this group exist at all" probe; only if
+  // it says yes is it worth reading each member's state.
+  try {
+    process.kill(supervisorKillArg(target), 0);
+  } catch {
+    return false;
+  }
+  if (target.group === null) return isRunningProcessSync(target.pid);
+  return membersOfGroup(target.group).some(isRunningProcessSync);
+}
+
+/**
+ * Pids in `pgid`, read straight from the process table.
+ *
+ * Sync and self-contained for the same reason the rest of this module is: it is
+ * reachable from an `exit` handler, where nothing may await.
+ */
+function membersOfGroup(pgid: number): number[] {
+  const members: number[] = [];
+  if (process.platform === 'linux') {
+    let entries: string[];
+    try {
+      entries = readdirSync('/proc');
+    } catch {
+      return [];
+    }
+    for (const entry of entries) {
+      const pid = parseInt(entry, 10);
+      if (Number.isNaN(pid)) continue;
+      if (processGroupIdSync(pid) === pgid) members.push(pid);
+    }
+    return members;
+  }
+  const out = Bun.spawnSync(['ps', '-eo', 'pid=,pgid=']);
+  if (out.exitCode !== 0) return [];
+  for (const line of out.stdout.toString().split('\n')) {
+    const [rawPid, rawPgid] = line.trim().split(/\s+/);
+    const pid = parseInt(rawPid ?? '', 10);
+    if (!Number.isNaN(pid) && parseInt(rawPgid ?? '', 10) === pgid) members.push(pid);
+  }
+  return members;
+}
+
+/**
+ * Signal every `lazy supervise` process working inside `root` — and the agent
+ * each one spawned — found by command line (supervisors have no registry of
+ * their own the harness can read: the host-process runner's pidfiles live under
+ * the SUPERVISOR's `$HOME/.lazy/run`, which a fakeClaude context deliberately
+ * moves out of the test process's reach). Synchronous; safe from an `exit`
+ * handler.
+ *
+ * Returns the supervisor pids it signalled.
+ */
+export function killSupervisorsForRoot(
+  root: string,
+  commands?: Map<number, string>,
+  signal: NodeJS.Signals = 'SIGKILL',
+): number[] {
+  const killed: number[] = [];
+  for (const [pid, cmd] of commands ?? readAllProcessCommands()) {
+    if (pid === process.pid) continue;
+    if (!isSupervisorCommandForRoot(cmd, root)) continue;
+    const target: SupervisorTarget = { pid, group: ownedProcessGroup(pid) };
+    if (!isSupervisorTargetAlive(target)) continue;
+    signalSupervisorTarget(target, signal);
+    killed.push(pid);
+  }
+  return killed;
+}
+
+/**
+ * Does this command line belong to a lazy machine one-shot (`claude -p` spawned
+ * by the host runner's one-shot path)?
+ *
+ * Keyed on lazy's OWN marker, which src/oneshot/args.ts stamps into every
+ * one-shot prompt and therefore into its argv — the same structural signal the
+ * capture sweep uses to know a session is housekeeping. A human's `claude -p`
+ * never carries it, so this alone already excludes the developer's own runs; the
+ * cwd tie below narrows it further to runs this test process owns.
+ *
+ * The `claude` binary itself is matched by BASENAME on any argv token, not by
+ * argv[0]: the harness's fake agent is a shebang script, so /proc reports the
+ * interpreter first (`bun /tmp/…/bin/claude -p …`).
+ */
+export function isMachineOneshotClaudeCommand(cmd: string): boolean {
+  if (!cmd.includes(ONESHOT_MARKER_NONCE)) return false;
+  const tokens = cmd.split(/\s+/);
+  if (!tokens.includes('-p')) return false;
+  return tokens.some(t => basename(t) === 'claude');
+}
+
+/** Is `dir` the directory `path`, or does it contain it? */
+function isUnder(path: string, dir: string): boolean {
+  return path === dir || path.startsWith(`${dir}/`);
+}
+
+/**
+ * Working directory of each given pid. Synchronous, and best-effort: a platform
+ * where neither mechanism works yields an empty map, which degrades the one-shot
+ * sweep to a no-op rather than to a sweep that kills on the marker alone.
+ *
+ * Only ever called with the handful of pids that already matched the one-shot
+ * marker, so the per-pid `lsof` on macOS stays cheap.
+ */
+function readProcessCwds(pids: number[]): Map<number, string> {
+  const out = new Map<number, string>();
+  if (pids.length === 0) return out;
+  if (process.platform === 'linux') {
+    for (const pid of pids) {
+      try {
+        // A cwd whose directory was already removed reads back as
+        // "/path/to/dir (deleted)" — exactly the case a leaked one-shot is in
+        // after cleanup removed the temp root, so strip the suffix rather than
+        // failing to match it.
+        out.set(pid, readlinkSync(`/proc/${pid}/cwd`).replace(/ \(deleted\)$/, ''));
+      } catch {
+        // Process exited, or this process may not read its cwd link.
+      }
+    }
+    return out;
+  }
+  try {
+    // -Fpn prints machine-readable records: `p<pid>` then `n<path>` per fd.
+    const result = Bun.spawnSync(['lsof', '-a', '-p', pids.join(','), '-d', 'cwd', '-Fpn'], {
+      stdout: 'pipe',
+      stderr: 'ignore',
+    });
+    let current: number | null = null;
+    for (const line of result.stdout.toString().split('\n')) {
+      if (line.startsWith('p')) current = parseInt(line.slice(1), 10);
+      else if (line.startsWith('n') && current !== null) out.set(current, line.slice(1));
+    }
+  } catch {
+    // `lsof` missing or failed — documented no-op above.
+  }
+  return out;
+}
+
+/**
+ * Pids of every live machine one-shot standing inside one of `dirs`. Exported so
+ * a test can assert the absence of one after teardown — the leak this sweep
+ * exists for.
+ */
+export function findOneshotClaudeUnderDirs(
+  dirs: Iterable<string>,
+  commands?: Map<number, string>,
+): number[] {
+  const dirList = [...dirs];
+  if (dirList.length === 0) return [];
+  const candidates: number[] = [];
+  for (const [pid, cmd] of commands ?? readAllProcessCommands()) {
+    if (pid === process.pid) continue;
+    if (isMachineOneshotClaudeCommand(cmd)) candidates.push(pid);
+  }
+  if (candidates.length === 0) return [];
+  const cwds = readProcessCwds(candidates);
+  return candidates.filter(pid => {
+    const cwd = cwds.get(pid);
+    return cwd !== undefined && dirList.some(dir => isUnder(cwd, dir));
+  });
+}
+
+/**
+ * Signal every machine one-shot standing inside one of `dirs`. Synchronous; safe
+ * from an `exit` handler. Returns the pids it signalled.
+ */
+export function killOneshotClaudeUnderDirs(
+  dirs: Iterable<string>,
+  commands?: Map<number, string>,
+  signal: NodeJS.Signals = 'SIGKILL',
+): number[] {
+  const killed: number[] = [];
+  for (const pid of findOneshotClaudeUnderDirs(dirs, commands)) {
+    try {
+      process.kill(pid, signal);
+      killed.push(pid);
+    } catch {
+      // Already exited (ESRCH) — nothing to reap.
+    }
+  }
+  return killed;
+}
+
+/**
  * Read every live process's command line, keyed by pid. Synchronous on purpose:
  * the callers run inside `process.on('exit')`, where async work never completes.
  *
@@ -114,8 +494,9 @@ export function isDaemonCommandForRoot(cmd: string, root: string): boolean {
  * A platform where neither works yields an empty map, which degrades this sweep
  * to a no-op — the pidfile path and the daemon's own parent watch still apply.
  */
-function readAllProcessCommands(): Map<number, string> {
+function readAllProcessCommands(deadlineMs?: number): Map<number, string> {
   const out = new Map<number, string>();
+  const overBudget = () => deadlineMs !== undefined && Date.now() > deadlineMs;
   if (process.platform === 'linux') {
     let entries: string[];
     try {
@@ -125,6 +506,7 @@ function readAllProcessCommands(): Map<number, string> {
       return out;
     }
     for (const entry of entries) {
+      if (overBudget()) break;
       const pid = parseInt(entry, 10);
       if (Number.isNaN(pid)) continue;
       try {
@@ -133,6 +515,11 @@ function readAllProcessCommands(): Map<number, string> {
         if (cmd.length > 0) out.set(pid, cmd);
       } catch {
         // Process exited between readdir and here, or it is a kernel thread.
+      }
+      const delay = sweepDelayPerProcMs();
+      if (delay > 0) {
+        const until = Date.now() + delay;
+        while (Date.now() < until) { /* test-only busy wait */ }
       }
     }
     return out;
@@ -172,12 +559,11 @@ export function killDaemonsForRoot(root: string, commands?: Map<number, string>)
 }
 
 /**
- * SIGKILL the daemon for every still-registered root, then sweep the process
- * table for any daemon serving a root this process ever created. Synchronous so
- * it is safe to call from a `process.on('exit')` handler. Best-effort: a pidfile
- * that is missing or a pid that is already gone is silently skipped.
+ * Fast path: SIGKILL every daemon whose pidfile is still registered. No process-
+ * table scan — safe to call from a SIGINT/SIGTERM handler where blocking on a
+ * full /proc or `ps` sweep would make Ctrl-C feel dead on a busy machine.
  */
-function reapAllTestDaemons(): void {
+function reapRegisteredByPidfile(): void {
   for (const root of liveDaemonRoots) {
     const pid = readDaemonPid(root);
     if (pid === null) continue;
@@ -189,23 +575,119 @@ function reapAllTestDaemons(): void {
     }
   }
   liveDaemonRoots.clear();
+}
 
-  // The pidfile pass above misses two cases: a daemon that died before writing
-  // its pidfile's dir was recreated, and one auto-started after its root was
-  // unregistered and its daemon dir deleted. One process-table scan covers both
-  // for every root this run owns. One scan, reused across all roots.
-  if (allTestRoots.size === 0) return;
-  const commands = readAllProcessCommands();
-  const swept: number[] = [];
-  for (const root of allTestRoots) swept.push(...killDaemonsForRoot(root, commands));
+/**
+ * Command-line sweep: one bounded process-table scan, then kill every leaked
+ * daemon/supervisor/one-shot this run owns. Uses whatever `commands` contains —
+ * including a partial map when the scan hit its deadline — never discards it.
+ */
+function reapCommandLineSweep(deadlineMs: number): void {
+  if (allTestRoots.size === 0 && allOneshotDirs.size === 0) return;
+  const commands = readAllProcessCommands(deadlineMs);
+  const scanEndedEarly = Date.now() > deadlineMs;
+  const { swept, sweptSupervisors, sweptOneshots } = killFromCommandScan(commands);
+  if (scanEndedEarly) {
+    process.stderr.write('daemon-registry: process-table scan stopped early (budget exceeded)\n');
+  }
   if (swept.length > 0) {
-    // Never reap silently: anything the sweep finds is a daemon that BOTH
-    // cleanup() and the pidfile pass missed, which is a harness bug worth
-    // seeing rather than a routine event. One line, on the way out.
     process.stderr.write(
       `daemon-registry: swept ${swept.length} leaked test daemon(s) at exit: ${swept.join(', ')}\n`,
     );
   }
+  if (sweptSupervisors.length > 0) {
+    process.stderr.write(
+      `daemon-registry: swept ${sweptSupervisors.length} leaked test supervisor(s) at exit: ` +
+      `${sweptSupervisors.join(', ')}\n`,
+    );
+  }
+  if (sweptOneshots.length > 0) {
+    process.stderr.write(
+      `daemon-registry: swept ${sweptOneshots.length} stranded machine one-shot(s) at exit: ` +
+      `${sweptOneshots.join(', ')}\n`,
+    );
+  }
+}
+
+/**
+ * Normal-exit path: pidfile reaping plus bounded command-line sweep. Runs from
+ * `process.on('exit')` when the test process finishes cleanly.
+ */
+function reapAllTestDaemons(): void {
+  reapRegisteredByPidfile();
+  reapCommandLineSweep(Date.now() + EXIT_SWEEP_BUDGET_MS);
+}
+
+/** Shared kill pass after a process-table scan. */
+function killFromCommandScan(commands: Map<number, string>): {
+  swept: number[];
+  sweptSupervisors: number[];
+  sweptOneshots: number[];
+} {
+  const swept: number[] = [];
+  const sweptSupervisors: number[] = [];
+  const sweptOneshots = killOneshotClaudeUnderDirs([...allTestRoots, ...allOneshotDirs], commands);
+  for (const root of allTestRoots) {
+    swept.push(...killDaemonsForRoot(root, commands));
+    sweptSupervisors.push(...killSupervisorsForRoot(root, commands));
+  }
+  return { swept, sweptSupervisors, sweptOneshots };
+}
+
+/**
+ * Test-only: pre-fix unbounded reap (no scan deadline). Used by the A/B benchmark
+ * subprocess to replicate the old double-sweep + process.exit(130) path.
+ */
+export function reapAllTestDaemonsUnboundedForBenchmark(): void {
+  reapRegisteredByPidfile();
+  if (allTestRoots.size === 0 && allOneshotDirs.size === 0) return;
+  killFromCommandScan(readAllProcessCommands());
+}
+
+/**
+ * Test-only: install the pre-fix SIGINT/exit handlers for A/B timing. The
+ * subprocess must set LAZY_TEST_REGISTRY_SKIP_AUTO_INSTALL=1 before importing
+ * this module, then call registerTestDaemonRoot, then this function.
+ */
+export function installOldHandlersForBenchmark(): void {
+  process.on('exit', reapAllTestDaemonsUnboundedForBenchmark);
+  process.on('SIGINT', () => {
+    reapAllTestDaemonsUnboundedForBenchmark();
+    process.exit(130);
+  });
+}
+
+/**
+ * Re-raise `signal` with default disposition after bounded cleanup.
+ *
+ * INVARIANT: never `process.exit()` from a signal handler — that bypasses the
+ * signal's natural propagation and leaves foreground children holding the TTY.
+ * On bun 1.4.0, re-raise kills by signal and `process.on('exit')` does NOT run,
+ * so the bounded command-line sweep MUST happen here before re-raising — not in
+ * the exit handler.
+ */
+function handleProcessSignal(signal: NodeJS.Signals): void {
+  // Second Ctrl-C while the first handler runs: die immediately, no cleanup.
+  if (interruptHandled) {
+    process.kill(process.pid, 'SIGKILL');
+    return;
+  }
+  interruptHandled = true;
+
+  reapRegisteredByPidfile();
+  reapCommandLineSweep(Date.now() + EXIT_SWEEP_BUDGET_MS);
+
+  process.removeListener('SIGINT', onSigint);
+  process.removeListener('SIGTERM', onSigterm);
+  process.kill(process.pid, signal);
+}
+
+function onSigint(): void {
+  handleProcessSignal('SIGINT');
+}
+
+function onSigterm(): void {
+  handleProcessSignal('SIGTERM');
 }
 
 /**
@@ -219,15 +701,10 @@ function ensureHandlersInstalled(): void {
   // Normal exit and most uncaught-exception exits. Synchronous only.
   process.on('exit', reapAllTestDaemons);
 
-  // Ctrl-C / external kill: reap, then exit so the run is reported as
-  // interrupted (the 'exit' handler runs too, harmlessly re-reaping an empty
-  // set).
-  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-    process.on(signal, () => {
-      reapAllTestDaemons();
-      process.exit(signal === 'SIGINT' ? 130 : 143);
-    });
-  }
+  // Ctrl-C / external kill: bounded reaping in-handler, then re-raise. The exit
+  // handler above covers normal completion only — it does not run on signal death.
+  process.on('SIGINT', onSigint);
+  process.on('SIGTERM', onSigterm);
 }
 
 /**
@@ -241,6 +718,17 @@ export function registerTestDaemonRoot(root: string): void {
   allTestRoots.add(root);
 }
 
+/**
+ * Record a directory that a machine one-shot spawned by this run could be
+ * standing in (the context's `LAZY_ONESHOT_BASE_DIR`). Project roots are already
+ * covered by `registerTestDaemonRoot`; this exists because the fidelity
+ * summarizer deliberately runs its agent OUTSIDE the project.
+ */
+export function registerTestOneshotDir(dir: string): void {
+  ensureHandlersInstalled();
+  allOneshotDirs.add(dir);
+}
+
 /** Stop tracking a root once its daemon has been gracefully stopped + cleaned. */
 export function unregisterTestDaemonRoot(root: string): void {
   liveDaemonRoots.delete(root);
@@ -248,4 +736,8 @@ export function unregisterTestDaemonRoot(root: string): void {
 
 // Install handlers on import so the net is armed the moment any test module —
 // or the global preload — loads this file, even before the first daemon spawns.
-ensureHandlersInstalled();
+// Benchmark subprocesses set LAZY_TEST_REGISTRY_SKIP_AUTO_INSTALL=1 to install
+// handlers themselves (old vs new A/B timing).
+if (process.env.LAZY_TEST_REGISTRY_SKIP_AUTO_INSTALL !== '1') {
+  ensureHandlersInstalled();
+}

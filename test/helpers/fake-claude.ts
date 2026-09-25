@@ -31,8 +31,16 @@
  * stream-json`, `--model`, …) rather than trusting a mock's own bookkeeping.
  */
 
-import { chmod, mkdir, readFile, writeFile, rm } from 'fs/promises';
-import { join } from 'path';
+import {
+  composeFakeAgentSource,
+  installFakeAgent,
+  setAgentScenario,
+  recordAgentEnvKeys,
+  readAgentInvocations,
+  clearAgentInvocations,
+  type FakeAgentBinary,
+  type FakeAgentInvocation,
+} from './fake-agent-core';
 
 /** One scripted action of the fake agent. */
 export type ClaudeStep =
@@ -44,8 +52,29 @@ export type ClaudeStep =
   | { kind: 'stderr'; text: string }
   /** Sleep. This is how "silent mid-turn" and "hangs after result" are expressed. */
   | { kind: 'sleep'; ms: number }
+  /**
+   * Write a file without committing it — the handoff channel a tools-down agent uses.
+   * `path` may be absolute or relative to the cwd (the worktree); parent directories are created.
+   */
+  | { kind: 'write-file'; path: string; content: string }
   /** Write files in the cwd and `git commit` them — the agent "doing work". */
   | { kind: 'commit'; message: string; files: Array<{ path: string; content: string }> }
+  /**
+   * POST to `ANTHROPIC_BASE_URL` using the credential env the agent was launched
+   * with — the shape Claude Code derives from `CLAUDE_CODE_OAUTH_TOKEN` (Bearer)
+   * or `ANTHROPIC_API_KEY` (x-api-key). Used to exercise the proxy credential
+   * swap on a real supervised turn without calling Anthropic.
+   */
+  | {
+      kind: 'http';
+      path?: string;
+      method?: string;
+      body?: unknown;
+      /** Fail the step unless the response status matches. */
+      expectStatus?: number;
+      /** Write `{ status, ok }` into the fake's state dir under this filename. */
+      recordFile?: string;
+    }
   /**
    * Append a turn to a Claude session JSONL under
    * `$HOME/.claude/projects/<encoded-cwd>/<sessionId>.jsonl` — exactly what a
@@ -59,7 +88,14 @@ export type ClaudeStep =
    */
   | { kind: 'session-jsonl'; sessionId: string; userText: string; assistantText: string }
   /** Stop ignoring nothing and exit immediately with this code. */
-  | { kind: 'exit'; code: number };
+  | { kind: 'exit'; code: number }
+  /**
+   * Simulate the agent's `lazy_report` MCP call reaching the daemon: write the
+   * presentation marker into the task's protocol dir (shared runtime step — see
+   * fake-agent-core.ts). What the present step's invocation needs to pass §6.2
+   * enforcement; deliberately scriptable so enforcement-failure suites omit it.
+   */
+  | { kind: 'declare-presentation' };
 
 export interface ClaudeScenario {
   steps: ClaudeStep[];
@@ -83,22 +119,13 @@ export interface ClaudeScenario {
  */
 export type ClaudeScenarioFile = ClaudeScenario | { sequence: ClaudeScenario[] };
 
-/** Record of one fake-agent invocation, as written to invocations.jsonl. */
-export interface ClaudeInvocation {
-  argv: string[];
-  cwd: string;
-  /** Epoch ms when the invocation started. */
-  at: number;
-  /**
-   * The auth-shaped environment the agent was actually launched with — the
-   * credential slots plus the base URL. Recorded so a test can assert what the
-   * agent process holds, and in particular what it does NOT hold: under JIT
-   * credential injection these carry a placeholder, never a real credential.
-   *
-   * Only these keys, and only in the fake: every value here is a test fixture.
-   */
-  env: Record<string, string>;
-}
+/**
+ * Record of one fake-agent invocation, as written to invocations.jsonl.
+ *
+ * Structurally agent-agnostic (see `FakeAgentInvocation`), kept under this name
+ * because every suite on this seam already imports it.
+ */
+export type ClaudeInvocation = FakeAgentInvocation;
 
 // ---------------------------------------------------------------------------
 // stream-json event builders
@@ -184,6 +211,16 @@ export interface SuccessScenarioOptions {
   commit?: { message: string; files: Array<{ path: string; content: string }> };
   /** Concrete model id to self-report via `modelUsage` (see `resultEvent`). */
   modelId?: string;
+  /**
+   * Simulate the agent declaring its report presentation via `lazy_report`: the
+   * fake writes the same `presentation.json` marker the daemon writes when a
+   * real agent's MCP call arrives (see fake-agent-core's `declare-presentation`
+   * step). A wrap-up turn's present invocation needs it — the real agent
+   * declares when prompted with the presentation prompt, and the fake's stand-in
+   * is this step. Deliberately NOT automatic: a suite exercising the §6.2
+   * enforcement failure scripts a scenario WITHOUT it.
+   */
+  declarePresentation?: boolean;
 }
 
 /** Session start → a tool call → (optional commit) → result → exit 0. */
@@ -196,6 +233,9 @@ export function successScenario(opts: SuccessScenarioOptions = {}): ClaudeScenar
   ];
   if (opts.commit) {
     steps.push({ kind: 'commit', message: opts.commit.message, files: opts.commit.files });
+  }
+  if (opts.declarePresentation) {
+    steps.push({ kind: 'declare-presentation' });
   }
   steps.push({
     kind: 'emit',
@@ -254,6 +294,38 @@ export function heartbeatOnlyScenario(opts: { sessionId?: string; beats?: number
   return { steps };
 }
 
+/**
+ * Session start → one proxied API request → result. The HTTP step is what proves
+ * the placeholder the launch env handed the agent is swapped for the owner's
+ * real credential before the stub upstream sees it.
+ */
+export function credentialSwapScenario(opts: {
+  sessionId?: string;
+  httpPath?: string;
+  result?: string;
+  recordFile?: string;
+} = {}): ClaudeScenario {
+  const sessionId = opts.sessionId ?? 'fake-sess-cred-swap';
+  return {
+    steps: [
+      { kind: 'emit', event: sessionStartEvent(sessionId) },
+      {
+        kind: 'http',
+        path: opts.httpPath ?? '/v1/messages',
+        expectStatus: 200,
+        ...(opts.recordFile ? { recordFile: opts.recordFile } : {}),
+      },
+      {
+        kind: 'emit',
+        event: resultEvent({
+          result: opts.result ?? 'Exercised the proxy credential swap.',
+          sessionId,
+        }),
+      },
+    ],
+  };
+}
+
 /** The crash case: some stderr, then a non-zero exit with no result line. */
 export function crashScenario(opts: { stderr?: string; exitCode?: number } = {}): ClaudeScenario {
   return {
@@ -305,172 +377,127 @@ export function crashAfterReportingUsageScenario(opts: {
 // Installation / state
 // ---------------------------------------------------------------------------
 
-const SCENARIO_FILE = 'scenario.json';
-const INVOCATIONS_FILE = 'invocations.jsonl';
-
-export interface FakeClaude {
-  /** State directory: holds scenario.json and invocations.jsonl. */
-  dir: string;
-  /** Directory to prepend to PATH — contains the `claude` executable. */
-  binDir: string;
-}
+/**
+ * An installed fake `claude` binary and its state directory.
+ *
+ * Structurally agent-agnostic (see `FakeAgentBinary`), kept under this name
+ * because every suite on this seam already imports it.
+ */
+export type FakeClaude = FakeAgentBinary;
 
 /**
  * Write the fake `claude` executable and its state directory.
  *
- * The shebang is the ABSOLUTE path of the bun that is running the tests, not
- * `/usr/bin/env bun`: the binary is invoked from subprocesses whose PATH we
- * control, and pinning the interpreter keeps the fake agent working even if a
- * test narrows PATH further.
+ * `installFakeAgent` (test/helpers/fake-agent-core.ts) owns the shebang and the
+ * permissions; everything claude-specific about the binary is in
+ * `FAKE_CLAUDE_PRELUDE` below.
  */
 export async function installFakeClaude(dir: string): Promise<FakeClaude> {
-  const binDir = join(dir, 'bin');
-  await mkdir(binDir, { recursive: true });
-
-  const script = `#!${process.execPath}\n${FAKE_CLAUDE_SOURCE}`;
-  const binPath = join(binDir, 'claude');
-  await writeFile(binPath, script);
-  await chmod(binPath, 0o755);
-
-  return { dir, binDir };
+  return await installFakeAgent(dir, 'claude', composeFakeAgentSource(FAKE_CLAUDE_PRELUDE));
 }
 
 /** Install (or replace) the scenario the fake agent will replay next. */
 export async function setClaudeScenario(fake: FakeClaude, scenario: ClaudeScenarioFile): Promise<void> {
-  await writeFile(join(fake.dir, SCENARIO_FILE), JSON.stringify(scenario, null, 2));
+  await setAgentScenario(fake, scenario);
+}
+
+/**
+ * Ask the fake agent to echo these env keys back on every future invocation.
+ *
+ * The proof a test needs for per-task env is "the agent's own process had this
+ * variable" — nothing weaker (an argv containing `-e KEY=VALUE` only proves
+ * lazy meant to). Values land in `ClaudeInvocation.env`.
+ */
+export async function recordClaudeEnvKeys(fake: FakeClaude, keys: string[]): Promise<void> {
+  await recordAgentEnvKeys(fake, keys);
 }
 
 /** Every invocation of the fake agent so far, oldest first. */
 export async function readClaudeInvocations(fake: FakeClaude): Promise<ClaudeInvocation[]> {
-  let raw: string;
-  try {
-    raw = await readFile(join(fake.dir, INVOCATIONS_FILE), 'utf-8');
-  } catch (err) {
-    // No invocations yet is a normal state (the agent has not been launched).
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
-    throw new Error(`Failed to read fake-claude invocations: ${(err as Error).message}`);
-  }
-  return raw
-    .split('\n')
-    .filter(line => line.trim())
-    .map(line => JSON.parse(line) as ClaudeInvocation);
+  return await readAgentInvocations(fake);
 }
 
 /** Forget every recorded invocation (useful between turns in one test). */
 export async function clearClaudeInvocations(fake: FakeClaude): Promise<void> {
-  await rm(join(fake.dir, INVOCATIONS_FILE), { force: true });
+  await clearAgentInvocations(fake);
 }
 
 /**
- * Source of the fake binary.
+ * The claude-specific half of the fake binary.
  *
- * Kept as a string rather than a separate .ts file that gets copied because the
- * binary must be standalone: it runs outside the test process, outside the
- * repo's module graph, and (in principle) from a temp dir with no node_modules.
- * It therefore uses only `node:` builtins.
+ * `composeFakeAgentSource` sandwiches this between the shared preamble (which
+ * defines `fs`, `path`, `spawnSync`, `stateDir`, `argv` and `sleep`) and the
+ * shared runtime (which calls `agentProbe`, records the invocation, resolves
+ * `DEFAULT_SCENARIO`, and dispatches non-generic step kinds to `runAgentStep`).
+ * The result is standalone and uses only `node:` builtins: it runs outside the
+ * test process, outside the repo's module graph, and in principle from a temp
+ * dir with no node_modules.
  */
-const FAKE_CLAUDE_SOURCE = String.raw`
-// Fake "claude" CLI. Generated by test/helpers/fake-claude.ts — see that file
-// for the scripting model. Uses only node: builtins so it can run standalone.
-const fs = require('node:fs');
-const path = require('node:path');
-const { spawnSync } = require('node:child_process');
-
-const stateDir = path.resolve(__dirname, '..');
-const argv = process.argv.slice(2);
+const FAKE_CLAUDE_PRELUDE = String.raw`
+const FAKE_LABEL = 'fake claude';
 
 // --version is asked by runner.checkAvailability() and by which-style probes
-// long before any turn exists. Answer without touching the scenario so a probe
-// never consumes a sequence entry.
-if (argv.includes('--version')) {
-  process.stdout.write('9.9.9 (Fake Claude Code for lazy e2e)\n');
-  process.exit(0);
-}
-
-const invocationsPath = path.join(stateDir, 'invocations.jsonl');
-let invocationIndex = 0;
-try {
-  const existing = fs.readFileSync(invocationsPath, 'utf-8');
-  invocationIndex = existing.split('\n').filter(l => l.trim()).length;
-} catch (err) {
-  if (err.code !== 'ENOENT') throw err;
-  invocationIndex = 0;
-}
-// Record the auth-shaped env the agent was launched with. Tests assert on the
-// ABSENCE of a real credential here \u2014 see public-docs/proxy-jit-credentials.md.
-const AUTH_ENV_KEYS = [
-  'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN',
-  'CURSOR_API_KEY', 'ANTHROPIC_BASE_URL',
-];
-const authEnv = {};
-for (const key of AUTH_ENV_KEYS) {
-  if (process.env[key] !== undefined) authEnv[key] = process.env[key];
-}
-fs.appendFileSync(
-  invocationsPath,
-  JSON.stringify({ argv, cwd: process.cwd(), at: Date.now(), env: authEnv }) + '\n',
-);
-
-function loadScenario() {
-  let raw;
-  try {
-    raw = fs.readFileSync(path.join(stateDir, 'scenario.json'), 'utf-8');
-  } catch (err) {
-    if (err.code !== 'ENOENT') throw err;
-    // No scenario configured: behave like a trivially successful agent so a
-    // test that never scripts one still gets a well-formed turn.
-    return {
-      steps: [
-        { kind: 'emit', event: { type: 'system', subtype: 'init', session_id: 'fake-sess-default' } },
-        {
-          kind: 'emit',
-          event: {
-            type: 'result',
-            subtype: 'success',
-            result: 'Fake agent default response.',
-            session_id: 'fake-sess-default',
-            usage: { input_tokens: 1, output_tokens: 1 },
-          },
-        },
-      ],
-    };
+// long before any turn exists. Answering it here keeps it off the scenario, so
+// a probe never consumes a sequence entry.
+function agentProbe(argv) {
+  if (argv.includes('--version')) {
+    process.stdout.write('9.9.9 (Fake Claude Code for lazy e2e)\n');
+    return true;
   }
-  const parsed = JSON.parse(raw);
-  if (Array.isArray(parsed.sequence)) {
-    if (parsed.sequence.length === 0) throw new Error('fake claude: empty scenario sequence');
-    const idx = Math.min(invocationIndex, parsed.sequence.length - 1);
-    return parsed.sequence[idx];
-  }
-  return parsed;
+  return false;
 }
 
-const scenario = loadScenario();
+// Used when no scenario file exists: behave like a trivially successful agent
+// so a test that never scripts one still gets a well-formed turn.
+const DEFAULT_SCENARIO = {
+  steps: [
+    { kind: 'emit', event: { type: 'system', subtype: 'init', session_id: 'fake-sess-default' } },
+    {
+      kind: 'emit',
+      event: {
+        type: 'result',
+        subtype: 'success',
+        result: 'Fake agent default response.',
+        session_id: 'fake-sess-default',
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+    },
+  ],
+};
 
-if (scenario.ignoreSigterm) {
-  // Exercise the watchdog's SIGTERM -> SIGKILL escalation: refuse the polite
-  // signal so only SIGKILL can end this process.
-  process.on('SIGTERM', () => {});
-  process.on('SIGINT', () => {});
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function runCommit(step) {
-  for (const file of step.files) {
-    const full = path.join(process.cwd(), file.path);
-    fs.mkdirSync(path.dirname(full), { recursive: true });
-    fs.writeFileSync(full, file.content);
+async function runHttp(step) {
+  const baseUrl = process.env.ANTHROPIC_BASE_URL;
+  if (!baseUrl) throw new Error('fake claude: ANTHROPIC_BASE_URL is unset');
+  const pathPart = step.path || '/v1/messages';
+  const method = step.method || 'POST';
+  const headers = { 'content-type': 'application/json' };
+  if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+    headers.authorization = 'Bearer ' + process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  } else if (process.env.ANTHROPIC_API_KEY) {
+    headers['x-api-key'] = process.env.ANTHROPIC_API_KEY;
+  } else {
+    throw new Error('fake claude: no credential env var set for http step');
   }
-  const add = spawnSync('git', ['add', '-A'], { cwd: process.cwd() });
-  if (add.status !== 0) {
-    throw new Error('fake claude: git add failed: ' + (add.stderr || '').toString());
+  const body = step.body !== undefined
+    ? JSON.stringify(step.body)
+    : JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'ping' }],
+        max_tokens: 16,
+      });
+  const url = baseUrl.replace(/\/$/, '') + pathPart;
+  const res = await fetch(url, { method, headers, body });
+  const record = { status: res.status, ok: res.ok };
+  if (step.recordFile) {
+    fs.writeFileSync(path.join(stateDir, step.recordFile), JSON.stringify(record));
   }
-  const commit = spawnSync('git', ['commit', '-m', step.message], { cwd: process.cwd() });
-  if (commit.status !== 0) {
-    throw new Error('fake claude: git commit failed: ' + (commit.stderr || '').toString());
+  if (step.expectStatus !== undefined && res.status !== step.expectStatus) {
+    throw new Error(
+      'fake claude: http expected status ' + step.expectStatus + ' got ' + res.status,
+    );
   }
+  // Drain the body so the connection closes cleanly.
+  await res.text().catch(() => '');
 }
 
 // Claude Code's cwd -> projects-dir-name encoding. MUST stay in lockstep with
@@ -510,39 +537,27 @@ function writeSessionJsonl(step) {
   fs.appendFileSync(file, lines.join('\n') + '\n');
 }
 
-async function main() {
-  for (const step of scenario.steps || []) {
-    switch (step.kind) {
-      case 'session-jsonl':
-        writeSessionJsonl(step);
-        break;
-      case 'emit':
-        process.stdout.write(JSON.stringify(step.event) + '\n');
-        break;
-      case 'stdout':
-        process.stdout.write(step.text);
-        break;
-      case 'stderr':
-        process.stderr.write(step.text);
-        break;
-      case 'sleep':
-        await sleep(step.ms);
-        break;
-      case 'commit':
-        runCommit(step);
-        break;
-      case 'exit':
-        process.exit(step.code);
-        break;
-      default:
-        throw new Error('fake claude: unknown step kind ' + step.kind);
+// The step kinds only Claude Code understands. Returning false hands an unknown
+// kind back to the shared runtime, which fails loudly.
+async function runAgentStep(step) {
+  switch (step.kind) {
+    case 'emit':
+      process.stdout.write(JSON.stringify(step.event) + '\n');
+      return true;
+    case 'write-file': {
+      const dir = path.dirname(step.path);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(step.path, step.content);
+      return true;
     }
+    case 'http':
+      await runHttp(step);
+      return true;
+    case 'session-jsonl':
+      writeSessionJsonl(step);
+      return true;
+    default:
+      return false;
   }
-  process.exit(scenario.exitCode ?? 0);
 }
-
-main().catch(err => {
-  process.stderr.write('fake claude failed: ' + (err && err.stack ? err.stack : String(err)) + '\n');
-  process.exit(70);
-});
 `;

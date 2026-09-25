@@ -112,15 +112,27 @@ export async function collectTurnHandoff(
       continue;
     }
     const entry = parsed as Partial<AgentHandoffEntry>;
-    if (entry?.kind !== 'journal' && entry?.kind !== 'followup') {
+    if (
+      entry?.kind !== 'journal' && entry?.kind !== 'followup' &&
+      entry?.kind !== 'raised' && entry?.kind !== 'final'
+    ) {
       skipped++;
       continue;
     }
-    if (typeof entry.content !== 'string' || entry.content.trim() === '') {
+    // `final` is the one kind whose content is optional: it declares pencils
+    // down, and the content is only the agent's note. Requiring a note would
+    // discard the declaration over a missing nicety — the exact silent loss
+    // this channel exists to prevent.
+    const content = typeof entry.content === 'string' ? entry.content : '';
+    if (entry.kind !== 'final' && content.trim() === '') {
       skipped++;
       continue;
     }
-    entries.push({ kind: entry.kind, content: entry.content.slice(0, MAX_HANDOFF_CONTENT) });
+    entries.push({
+      kind: entry.kind,
+      content: content.slice(0, MAX_HANDOFF_CONTENT),
+      ...(entry.blocking === true ? { blocking: true } : {}),
+    });
   }
 
   if (skipped > 0) {
@@ -147,6 +159,31 @@ export async function handoffField(
 ): Promise<{ agent_handoff?: AgentHandoffEntry[] }> {
   const entries = await collectTurnHandoff(worktreePath, log);
   return entries.length > 0 ? { agent_handoff: entries } : {};
+}
+
+/**
+ * How the agent said its turn was ending, from the handoff file — the MCP-down
+ * fallback for the two declared endings (final-turn design §2.4).
+ *
+ * `final` wins over `needs_input` only in the sense that it is reported first;
+ * only `final` changes anything downstream (it selects the closing chain), but
+ * both mean the agent said where it is. Reads quietly (no log callback): this
+ * runs before the closing-chain decision, and the same file is collected and
+ * logged properly on the way out.
+ */
+export async function handoffTurnEnding(
+  worktreePath: string,
+): Promise<{ ending: 'final' | 'needs_input'; note?: string } | null> {
+  const entries = await collectTurnHandoff(worktreePath);
+  const final = entries.find((e) => e.kind === 'final');
+  if (final) {
+    const note = final.content.trim();
+    return { ending: 'final', ...(note ? { note } : {}) };
+  }
+  if (entries.some((e) => e.kind === 'raised' && e.blocking === true)) {
+    return { ending: 'needs_input' };
+  }
+  return null;
 }
 
 /**

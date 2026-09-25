@@ -4,6 +4,7 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 
 /**
  * Resolve the tasks directory for the test project. Test projects init with
@@ -81,6 +82,8 @@ describe('lazy accept target branch', () => {
     if (waitResult.exitCode !== 0) {
       throw new Error(`wait failed for ${taskId}: ${waitResult.stderr}\n${waitResult.stdout}`);
     }
+    // Fixture setup, not the subject (see test/helpers/final.ts).
+    await seedFinal(ctx, taskId);
   }
 
   test('accept merges into remote_target_branch when set', async () => {

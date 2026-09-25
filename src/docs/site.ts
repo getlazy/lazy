@@ -63,7 +63,11 @@ export interface DocsSiteManifest {
   pages: DocsSitePage[];
   /** Non-markdown files copied through verbatim (images, diagrams), sorted. */
   assets: string[];
-  /** Relative links that point at nothing this site publishes. Never fatal here — see {@link buildDocsSite}. */
+  /**
+   * Relative links that point at nothing this site publishes — a missing page or
+   * asset, or a `#fragment` that is not a heading on its target page. Never fatal
+   * here — see {@link buildDocsSite}.
+   */
   unresolvedLinks: DocsSiteUnresolvedLink[];
 }
 
@@ -149,11 +153,13 @@ export async function buildDocsSite(options: BuildDocsSiteOptions): Promise<Docs
 
   const pages: DocsSitePage[] = [];
   const unresolvedLinks: DocsSiteUnresolvedLink[] = [];
+  const fragmentLinks: (FragmentLink & { source: string })[] = [];
 
   for (const source of markdown) {
     const raw = await readFile(join(docsDir, source), 'utf-8');
     const rendered = renderPage({ source, markdown: raw, knownPages, knownAssets });
     unresolvedLinks.push(...rendered.unresolved.map((href) => ({ source, href })));
+    fragmentLinks.push(...rendered.fragmentLinks.map((link) => ({ source, ...link })));
 
     const pagePath = source.replace(/\.md$/, '');
     const file = posix.join(pagePath, 'index.html');
@@ -170,6 +176,15 @@ export async function buildDocsSite(options: BuildDocsSiteOptions): Promise<Docs
   }
 
   pages.sort((a, b) => a.path.localeCompare(b.path));
+
+  // A link to a heading that is not on its page lands the reader at the top,
+  // silently — as much a dead end as a missing page, so it counts as unresolved.
+  const anchorsBySource = new Map(pages.map((page) => [page.source, new Set(page.anchors)]));
+  for (const link of fragmentLinks) {
+    if (!anchorsBySource.get(link.target)?.has(link.fragment)) {
+      unresolvedLinks.push({ source: link.source, href: link.href });
+    }
+  }
 
   for (const asset of assets) {
     const target = join(outDir, ...asset.split('/'));
@@ -259,6 +274,28 @@ interface RenderedPage {
   title: string;
   anchors: string[];
   unresolved: string[];
+  fragmentLinks: FragmentLink[];
+}
+
+/**
+ * Percent-decode a fragment for comparison with heading slugs. A malformed
+ * escape (`#50%-off`) is compared as written — it then simply does not match —
+ * because a link problem is reported, never fatal to the build.
+ */
+function decodeFragment(fragment: string): string {
+  try {
+    return decodeURIComponent(fragment);
+  } catch (err) {
+    if (err instanceof URIError) return fragment;
+    throw err;
+  }
+}
+
+/** A link with a `#fragment` into a page this site renders; `target` is that page's source path. */
+interface FragmentLink {
+  href: string;
+  target: string;
+  fragment: string;
 }
 
 /**
@@ -275,6 +312,7 @@ function renderPage(input: RenderPageInput): RenderedPage {
   const slugger = new GithubSlugger();
   const anchors: string[] = [];
   const unresolved: string[] = [];
+  const fragmentLinks: FragmentLink[] = [];
   let title = '';
 
   // Where this page's HTML lands, so rewritten links can be relative to it.
@@ -286,6 +324,16 @@ function renderPage(input: RenderPageInput): RenderedPage {
     if (result === null) {
       unresolved.push(href);
       return href;
+    }
+    // Remember `page.md#frag` / `#frag` links into our own pages: whether the
+    // fragment exists is only knowable once every page's anchors are collected.
+    const hashAt = href.indexOf('#');
+    if (hashAt !== -1 && hashAt < href.length - 1 && !/^([a-z][a-z0-9+.-]*:|\/)/i.test(href)) {
+      const pathPart = href.slice(0, hashAt);
+      const target = pathPart === '' ? source : posix.normalize(posix.join(sourceDir, pathPart));
+      if (target.endsWith('.md')) {
+        fragmentLinks.push({ href, target, fragment: decodeFragment(href.slice(hashAt + 1)) });
+      }
     }
     return result;
   };
@@ -327,7 +375,7 @@ function renderPage(input: RenderPageInput): RenderedPage {
 
   if (!title) title = prettifyName(source);
 
-  return { html, title, anchors, unresolved };
+  return { html, title, anchors, unresolved, fragmentLinks };
 }
 
 interface ResolveHrefInput {
@@ -512,7 +560,7 @@ function indexHtml(pages: DocsSitePage[], version: string | null): string {
   }
 
   const body = `<h1>lazy documentation</h1>
-<p>Everything in this build's <code>docs/</code> tree. ${
+<p>Every page of lazy's documentation. ${
     version ? `This is <strong>${escapeHtml(version)}</strong>.` : ''
   }</p>
 ${sections.join('\n')}`;

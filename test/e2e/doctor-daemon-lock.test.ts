@@ -20,7 +20,7 @@ import { readFileSync, writeFileSync } from 'fs';
 import { rm } from 'fs/promises';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { getSocketPath } from '../../src/daemon/paths';
+import { getWebPortPath } from '../../src/daemon/paths';
 import { storageDirFor } from '../helpers/storage';
 import { expectOutput, expectOutputExcludes } from '../helpers/assertions';
 
@@ -95,16 +95,18 @@ describe('lazy doctor with a running daemon', () => {
    * reachable for storage reads is a real failure, and must not be waved
    * through by the "it's the daemon, so it's fine" branch.
    *
-   * Deleting the socket file reproduces a state that happens in the wild (see
+   * Deleting the port marker reproduces a state that happens in the wild (see
    * src/daemon/state-files.ts — a tmp reaper or an over-eager cleanup script):
    * the daemon is alive and still holds the storage lock, but nothing can
-   * reach it, so nothing can read task state. The daemon puts the socket back
-   * within a few seconds, which is why the assertions run on a doctor started
-   * immediately after.
+   * address it, so nothing can read task state. That file is how every client
+   * finds the daemon's loopback port (getDaemonTcpTarget), so removing it is
+   * the TCP-era equivalent of removing the unix socket this test used to
+   * delete. The daemon restores it, which is why the assertions run on a
+   * doctor started immediately after.
    */
   test('fails loudly when the daemon holds the lock but cannot be reached', async () => {
     const pid = lockHolderPid(ctx.root);
-    await rm(getSocketPath(ctx.root), { force: true });
+    await rm(getWebPortPath(ctx.root), { force: true });
 
     const result = await ctx.lazy(['doctor']);
 

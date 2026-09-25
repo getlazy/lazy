@@ -2,15 +2,16 @@
  * Daemon lifecycle management — flock-based singleton, PID file, health checks.
  *
  * All functions require a projectRoot parameter to locate per-project daemon
- * state files (PID, socket, token, lock).
+ * state files (PID, token, port/host markers, lock).
  *
  * Singleton enforcement: flock(2) is the SOLE source of truth for daemon
  * liveness. The daemon acquires an exclusive lock on daemon.lock at startup
  * and holds it for its entire lifetime. When the process exits — cleanly,
  * via SIGTERM, SIGKILL, or crash — the OS automatically releases the lock.
  *
- * Health checks (socket connectivity) are ONLY for diagnostic display
- * (lazy daemon status). They are NOT used as a liveness gate in the start path.
+ * Health checks (TCP connectivity to /daemon/status) are ONLY for diagnostic
+ * display (lazy daemon status). They are NOT used as a liveness gate in the
+ * start path.
  *
  * NOTE: fd-lock (npm) is the preferred package for flock(2) semantics, but it
  * depends on fs-native-extensions which calls uv_get_osfhandle — a libuv
@@ -23,7 +24,7 @@
 
 import { existsSync, readFileSync, unlinkSync, mkdirSync, writeFileSync, openSync, closeSync, statSync, constants } from 'fs';
 import { randomBytes } from 'crypto';
-import { getPidPath, getSocketPath, getTokenPath, getWebPortPath, getDaemonDir, getDaemonLockPath, getStartLockPath } from './paths';
+import { getPidPath, getLegacySocketPath, getTokenPath, getWebPortPath, getWebHostPath, getDaemonDir, getDaemonLockPath, getStartLockPath } from './paths';
 
 export interface AutoReactBudgetEntry {
   project: string;
@@ -55,7 +56,6 @@ export interface DaemonStatus {
    */
   unresponsive?: boolean;
   pid?: number;
-  socketPath?: string;
   uptime?: number;
   version?: string;
   /**
@@ -68,13 +68,37 @@ export interface DaemonStatus {
   instanceId?: string;
   /** UTC ISO timestamp the daemon binary was built, or 'dev' when run from source. */
   buildTime?: string;
+  /** Git short SHA the binary was built from, or 'dev' when run from source. */
+  buildSha?: string;
+  /** True when the source tree had uncommitted changes at compile time. */
+  buildDirty?: boolean;
+  /** Branch checked out at compile time, or 'dev' when run from source. */
+  buildBranch?: string;
+  /** Absolute checkout path at compile time, or 'dev' when run from source. */
+  buildSourcePath?: string;
   /** Git short SHA of the source the daemon is running (dev mode only; null/absent
    *  for compiled binaries). Used to detect a stale daemon vs the working tree. */
   codeSha?: string;
+  /**
+   * Content identity of the source tree the daemon is running — see
+   * src/utils/source-id.ts. Present on every daemon from v0.23 on, absent from
+   * older ones, and a caller must read that absence as "too old to say", which
+   * for a fleet means stale.
+   */
+  sourceId?: string;
+  /** How `sourceId` was arrived at: 'baked' | 'computed' | 'build'. */
+  sourceIdKind?: string;
   webPort?: number;
   /** Interface the web dashboard bound to (= config.server.bind). Used to
    *  print a dashboard URL that points at the real interface, not `localhost`. */
   bindHost?: string;
+  /**
+   * User-facing dashboard base URL (`http://lazy.localhost:<port>` on a
+   * loopback bind). `null` when the dashboard is off (managed mode). Absent
+   * on older daemons that predate the field — format from bindHost+webPort
+   * then, and never treat a missing field as "off".
+   */
+  dashboardUrl?: string | null;
   autoReactBudget?: AutoReactBudgetEntry[];
   /** Anthropic passthrough proxy status. Absent only when the daemon could not
    *  read its own config while answering the health probe. */
@@ -200,6 +224,65 @@ export type DaemonLockState =
   | 'unknown';
 
 /**
+ * Persist the interface the daemon bound (= config.server.bind). Read back by
+ * connectHostFor via readWebHost so the host-side CLI connects to the right
+ * interface when [server] bind is moved off loopback. Best-effort, mirrors
+ * writeWebPort.
+ */
+export function writeWebHost(projectRoot: string, host: string): void {
+  try {
+    mkdirSync(getDaemonDir(projectRoot), { recursive: true });
+    writeFileSync(getWebHostPath(projectRoot), host, { mode: 0o600 });
+  } catch {
+    // Non-fatal — connectHostFor falls back to loopback.
+  }
+}
+
+/** Read the recorded bind interface. Null when absent (older daemon) — the
+ *  caller falls back to loopback. */
+export function readWebHost(projectRoot: string): string | null {
+  const hostPath = getWebHostPath(projectRoot);
+  if (!existsSync(hostPath)) return null;
+  try {
+    const host = readFileSync(hostPath, 'utf-8').trim();
+    return host.length > 0 ? host : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Map a bind interface to the host a LOCAL client should connect to: a
+ * wildcard bind (0.0.0.0 / ::) is reachable on loopback, and loopback is the
+ * address that always works locally; a specific interface is used as-is.
+ * NOT formatDashboardUrl's rule: that one deliberately addresses the dashboard
+ * as `lazy.localhost` so the browser scopes its session cookie away from the
+ * task app ports published on 127.0.0.1. This is a programmatic client with no
+ * cookies and no browser resolver, so it takes the literal loopback address.
+ */
+function connectHostFor(bindHost: string | null): string {
+  if (bindHost === null || bindHost === '0.0.0.0' || bindHost === '::') return '127.0.0.1';
+  return bindHost;
+}
+
+/**
+ * The base URL a host-side client uses to reach this project's daemon, derived
+ * from the port/host markers the daemon persisted when it bound. Null when no
+ * port marker exists (no daemon has ever bound for this project).
+ *
+ * The TCP port is the daemon's ONLY transport (drop-unix-socket), so this is
+ * THE discovery mechanism for every host-side caller. The marker can be stale
+ * — the port may now be free, or held by another project's daemon — so callers
+ * that need certainty must verify the /daemon/status payload's `projectRoot`
+ * (checkDaemonHealth does).
+ */
+export function getDaemonTcpTarget(projectRoot: string): string | null {
+  const port = readWebPort(projectRoot);
+  if (port === null) return null;
+  return `http://${connectHostFor(readWebHost(projectRoot))}:${port}`;
+}
+
+/**
  * Probe whether this project's `daemon.lock` is currently held by a live process.
  *
  * This is the ONE signal about daemon liveness that a process which is not the
@@ -274,25 +357,31 @@ export type CleanupOutcome =
   /** Refused: the recorded PID belongs to a process that is still alive. */
   | 'refused-pid-alive';
 
-/** Unlink the PID and socket files, no questions asked. Internal. */
+/**
+ * Unlink the PID file (plus any legacy unix socket file left behind by a
+ * pre-v0.22 daemon), no questions asked. Internal. The web-port/web-host
+ * markers are deliberately NOT removed — they steer the next start back onto
+ * the same port (see writeWebPort).
+ */
 function unlinkStateFiles(projectRoot: string): CleanupOutcome {
   const pidPath = getPidPath(projectRoot);
-  const socketPath = getSocketPath(projectRoot);
+  const legacySocketPath = getLegacySocketPath(projectRoot);
   let removed = false;
 
   if (existsSync(pidPath)) {
     removed = true;
     try { unlinkSync(pidPath); } catch { /* ignore — another process may have removed it */ }
   }
-  if (existsSync(socketPath)) {
+  if (existsSync(legacySocketPath)) {
     removed = true;
-    try { unlinkSync(socketPath); } catch { /* ignore — another process may have removed it */ }
+    try { unlinkSync(legacySocketPath); } catch { /* ignore — another process may have removed it */ }
   }
   return removed ? 'removed' : 'nothing-to-remove';
 }
 
 /**
- * Remove STALE daemon files (PID, socket) — only after proving they are stale.
+ * Remove STALE daemon files (PID, plus any legacy pre-v0.22 socket) — only
+ * after proving they are stale.
  *
  * WHY THE GUARD EXISTS: this function used to take a projectRoot and nothing
  * else, so it had no notion of WHOSE files it was deleting; "stale" was assumed
@@ -307,11 +396,10 @@ function unlinkStateFiles(projectRoot: string): CleanupOutcome {
  *   - the daemon lock is held by a live process → refuse (a daemon owns this dir)
  *   - the recorded PID is alive → refuse (something is using these files)
  *
- * Refusing is cheap and safe in the wrong direction: a leftover PID/socket file
+ * Refusing is cheap and safe in the wrong direction: a leftover PID file
  * no longer makes a dead daemon look alive (isDaemonRunning prefers the lock)
- * and a starting daemon unlinks a stale socket and overwrites the PID file
- * itself. A wrongly-permitted delete, by contrast, wedges the project. When in
- * doubt, refuse.
+ * and a starting daemon overwrites the PID file itself. A wrongly-permitted
+ * delete, by contrast, wedges the project. When in doubt, refuse.
  *
  * The daemon removing its OWN files (clean shutdown, failed-start teardown)
  * must use {@link cleanupOwnDaemonFiles} — this guard would refuse it, since
@@ -327,7 +415,8 @@ export function cleanupStaleFiles(projectRoot: string): CleanupOutcome {
 }
 
 /**
- * Remove the calling daemon's OWN PID and socket files, unconditionally.
+ * Remove the calling daemon's OWN PID file (plus any legacy socket file),
+ * unconditionally.
  *
  * Only a daemon process may call this, and only for state it wrote itself:
  * clean shutdown (src/daemon/server.ts stop) and failed-start teardown. The
@@ -349,32 +438,39 @@ export function cleanupOwnDaemonFiles(projectRoot: string): void {
  * daemon, so start and liveness can never disagree.
  *
  * INVARIANT: liveness must rest on evidence a losing racer cannot destroy.
- * Before this, the answer came from the socket file plus the PID file — the very
- * two files `cleanupStaleFiles` deletes. Deleting them therefore made a running
+ * Before this, the answer came from state files — the very files
+ * `cleanupStaleFiles` deletes. Deleting them therefore made a running
  * daemon look dead, and the wrong answer then re-triggered the cleanup that
  * caused it: a self-reinforcing wedge (see cleanupStaleFiles). An flock cannot
  * be faked, and unlinking the lock file does not release it.
  *
  * Fallback (lock verdict 'unknown' — no lock file, or flock unavailable on this
- * platform): the original three file-based signals, all of which must hold:
- *   1. Socket file exists (daemon created it on startup)
- *   2. Token file is readable (daemon created it on startup)
+ * platform): three file-based signals, all of which must hold:
+ *   1. Token file is readable (daemon created it on startup)
+ *   2. Web-port marker is readable (daemon persisted its TCP port — without it
+ *      no client could reach the daemon anyway)
  *   3. PID file exists and process is alive (kill -0)
  * A dir with no lock file is either a daemon started under LAZY_TEST=1 (which
  * skips the lock) or one predating flock enforcement.
  *
  * Synchronous and fast (~microseconds): open + flock + close, or file stat +
  * kill(pid, 0). No network I/O.
+ *
+ * After a crash, the token and port markers remain but the process is dead.
+ * The PID check catches this case — a fast-path on file existence alone would
+ * cause `lazy daemon start` to say "already running" while `lazy daemon
+ * status` (which connects) said "not running". After a clean stop, the PID
+ * file is removed (cleanupOwnDaemonFiles), so the surviving token/port markers
+ * do not make a stopped daemon look alive.
  */
 export function isDaemonRunning(projectRoot: string): boolean {
   const lock = probeDaemonLockSync(projectRoot);
   if (lock === 'held') return true;
   if (lock === 'free') return false;
 
-  const socketPath = getSocketPath(projectRoot);
-  if (!existsSync(socketPath)) return false;
-
   if (!readToken(projectRoot)) return false;
+
+  if (readWebPort(projectRoot) === null) return false;
 
   const pid = readPid(projectRoot);
   if (pid === null) return false;
@@ -383,11 +479,11 @@ export function isDaemonRunning(projectRoot: string): boolean {
 }
 
 /**
- * How long a diagnostic probe of the daemon socket waits for an answer.
+ * How long a diagnostic probe of the daemon's TCP port waits for an answer.
  *
  * INVARIANT: a diagnostic must never hang on the thing it diagnoses. A daemon
- * whose event loop is frozen still has a live kernel listener on its unix
- * socket, so `connect(2)` succeeds and the request is queued to a process that
+ * whose event loop is frozen still has a live kernel listener on its TCP port,
+ * so `connect(2)` succeeds and the request is queued to a process that
  * will never read it — an unbounded fetch then waits forever. That is exactly
  * how `lazy daemon status` came to hang during a real freeze incident (see
  * fix-markdown-crlf-daemon-hang), turning the one command meant to explain the
@@ -400,6 +496,69 @@ export function isDaemonRunning(projectRoot: string): boolean {
  */
 export const DAEMON_HEALTH_TIMEOUT_MS = 3_000;
 
+/**
+ * How long a SIGTERM/SIGINT/SIGHUP'd daemon may take to shut down before it
+ * exits regardless — and therefore the floor for every window a caller gives it
+ * before escalating to SIGKILL.
+ *
+ * ONE number, because it is a contract between two sides that used to be
+ * written independently. The daemon's signal handler awaits `stop()`, whose
+ * first job is stopping this project's supervisors and whose last jobs are
+ * recording WHY each turn ended and closing storage. A caller that SIGKILLs
+ * before that finishes destroys both: the turns read as "General error" to
+ * whoever looks next, and a kill landing inside a storage write leaves a
+ * `.storage-lock` naming a pid that will one day be recycled — at which point
+ * the lock looks held forever by a process that never had it.
+ *
+ * Every caller that signals a daemon it has no other reason to think is wedged
+ * must allow at least this long:
+ *
+ *   - `terminatePid` (`lazy daemon kill-stray`) — a stray daemon's ROOT is gone,
+ *     but the process itself is usually perfectly healthy.
+ *   - `stopTestDaemon` (the e2e harness) — signals a healthy daemon on every
+ *     teardown, which is the tightest and most frequent case of all.
+ *   - `reapDemoProcesses` (`lazy playground down`) — a `--teams` demo's fleet daemons
+ *     live under `<root>/teams/` and are matched by that sweep.
+ *
+ * `test/unit/signal-shutdown-budget.test.ts` checks all three against this
+ * number, plus the two windows below, so none of this is taken on trust.
+ *
+ * ONE window deliberately sits outside the rule, because by the time it is
+ * reached the daemon has already failed to behave and a short clock is the
+ * point: `lazy daemon stop`'s post-RPC SIGTERM fallback, reached only when the
+ * shutdown request went unanswered. It is 5s, which exceeds this budget anyway;
+ * the 15s window for a daemon that DID accept the request exceeds it by more.
+ *
+ * The value is chosen to clear the shutdown sweep's realistic worst case with
+ * room to spare, NOT to be generous: the sweep asks the host runner for a short
+ * per-run stop precisely so it fits (see SHUTDOWN_STOP_GRACE_SECONDS).
+ */
+export const SIGNAL_SHUTDOWN_BUDGET_MS = 3_000;
+
+/**
+ * Per-run graceful-stop window the daemon's shutdown sweep gives the HOST
+ * runner, whose standalone default (5s) does not fit inside the budget above.
+ *
+ * It is passed to that runner ONLY. On Docker the same option is not a shorter
+ * grace at all — it switches `docker kill` (immediate, and already the default)
+ * to `docker stop --time <n>` — so the sweep leaves Docker on its own default
+ * rather than making production's runner spend wall clock it was not spending
+ * before. See the call site in src/daemon/server.ts.
+ *
+ * During shutdown the daemon is racing a caller's SIGKILL, and a grace period
+ * that gets cut off is strictly worse than a short one that completes: the
+ * escalation to SIGKILL, the interrupt records and the storage close all live
+ * on the far side of it.
+ *
+ * Nothing is lost by being brisk. The supervisor installs no SIGTERM handler,
+ * so the grace buys it nothing, and the turn is recorded `interrupted` and
+ * auto-resumed either way. Docker reached the same conclusion first and more
+ * bluntly: its default stop for an agent run is `docker kill`, no grace at all,
+ * on the reasoning that an agent container "has no graceful shutdown to wait
+ * for". The 5s host-side wait was the outlier.
+ */
+export const SHUTDOWN_STOP_GRACE_SECONDS = 1;
+
 /** True for the DOMException an aborted/timed-out fetch rejects with. */
 function isAbortError(err: unknown): boolean {
   const name = (err as { name?: unknown } | null)?.name;
@@ -407,24 +566,29 @@ function isAbortError(err: unknown): boolean {
 }
 
 /**
- * Full health check: verify socket responds to HTTP request.
+ * Full health check: verify the daemon responds on its TCP port.
  * Used ONLY for diagnostic display (lazy daemon status), NOT for liveness.
  *
  * Reports one of THREE states, which a boolean cannot express:
  *   (a) `running: true` — the daemon answered.
- *   (b) `running: false` — socket file absent, no token, or the connection was
+ *   (b) `running: false` — no port marker, no token, or the connection was
  *       refused: nothing is there.
- *   (c) `running: false, unresponsive: true` — the socket accepted us but no
+ *   (c) `running: false, unresponsive: true` — the port accepted us but no
  *       answer arrived within {@link DAEMON_HEALTH_TIMEOUT_MS} while the
  *       recorded pid is still alive: the process exists with a frozen event
  *       loop. Collapsing this into (b) is what made a wedged daemon look
  *       identical to no daemon at all.
+ *
+ * The port marker can be stale and the port window is shared across projects,
+ * so a response alone is not proof: the /daemon/status payload's `projectRoot`
+ * must match, or the answering daemon is a foreign project's daemon squatting
+ * our recorded port and we report "not running" rather than its vitals.
  */
 export async function checkDaemonHealth(projectRoot: string): Promise<DaemonStatus> {
   const pid = readPid(projectRoot);
 
-  const socketPath = getSocketPath(projectRoot);
-  if (!existsSync(socketPath)) {
+  const target = getDaemonTcpTarget(projectRoot);
+  if (!target) {
     return { running: false, pid: pid ?? undefined };
   }
 
@@ -435,8 +599,7 @@ export async function checkDaemonHealth(projectRoot: string): Promise<DaemonStat
 
   // Try to connect and hit the health endpoint
   try {
-    const response = await fetch(`http://localhost/daemon/status`, {
-      unix: socketPath,
+    const response = await fetch(`${target}/daemon/status`, {
       headers: {
         'Authorization': `Bearer ${token}`,
       },
@@ -449,18 +612,31 @@ export async function checkDaemonHealth(projectRoot: string): Promise<DaemonStat
       return { running: false, pid: pid ?? undefined };
     }
 
-    const data = await response.json() as { uptime?: number; version?: string; instanceId?: string; buildTime?: string; codeSha?: string; webPort?: number; bindHost?: string; autoReactBudget?: AutoReactBudgetEntry[]; proxy?: DaemonProxyStatus };
+    const data = await response.json() as { projectRoot?: string; uptime?: number; version?: string; instanceId?: string; buildTime?: string; buildSha?: string; buildDirty?: boolean; buildBranch?: string; buildSourcePath?: string; codeSha?: string; sourceId?: string; sourceIdKind?: string; webPort?: number; bindHost?: string; dashboardUrl?: string | null; autoReactBudget?: AutoReactBudgetEntry[]; proxy?: DaemonProxyStatus };
+    if (data.projectRoot !== projectRoot) {
+      // A daemon answered, but for a different project — our port marker is
+      // stale and another project's daemon now holds the port.
+      return { running: false, pid: pid ?? undefined };
+    }
     return {
       running: true,
       pid: pid ?? undefined,
-      socketPath,
       uptime: data.uptime,
       version: data.version,
       instanceId: data.instanceId,
       buildTime: data.buildTime,
+      buildSha: data.buildSha,
+      buildDirty: data.buildDirty,
+      buildBranch: data.buildBranch,
+      buildSourcePath: data.buildSourcePath,
       codeSha: data.codeSha,
+      sourceId: data.sourceId,
+      sourceIdKind: data.sourceIdKind,
       webPort: data.webPort,
       bindHost: data.bindHost,
+      // Preserve explicit `null` (dashboard off). A missing field stays
+      // undefined so callers can fall back to formatting bindHost+webPort.
+      ...('dashboardUrl' in data ? { dashboardUrl: data.dashboardUrl ?? null } : {}),
       autoReactBudget: data.autoReactBudget,
       proxy: data.proxy,
     };
@@ -469,14 +645,14 @@ export async function checkDaemonHealth(projectRoot: string): Promise<DaemonStat
     // its loop is frozen. Any other failure (ECONNREFUSED, absent socket, dead
     // pid) is state (b): nothing is answering because nothing is there.
     if (isAbortError(err) && pid !== null && isProcessAlive(pid)) {
-      return { running: false, unresponsive: true, pid, socketPath };
+      return { running: false, unresponsive: true, pid };
     }
     return { running: false, pid: pid ?? undefined };
   }
 }
 
 /**
- * Send a graceful shutdown request to the daemon via its socket.
+ * Send a graceful shutdown request to the daemon over its TCP port.
  * Returns true if the shutdown request was accepted.
  *
  * Bounded by {@link DAEMON_HEALTH_TIMEOUT_MS} for the same reason as
@@ -487,14 +663,13 @@ export async function checkDaemonHealth(projectRoot: string): Promise<DaemonStat
  * exactly what the caller needs to know to escalate.
  */
 export async function requestShutdown(projectRoot: string): Promise<boolean> {
-  const socketPath = getSocketPath(projectRoot);
+  const target = getDaemonTcpTarget(projectRoot);
   const token = readToken(projectRoot);
-  if (!token || !existsSync(socketPath)) return false;
+  if (!token || !target) return false;
 
   try {
-    const response = await fetch(`http://localhost/daemon/shutdown`, {
+    const response = await fetch(`${target}/daemon/shutdown`, {
       method: 'POST',
-      unix: socketPath,
       headers: {
         'Authorization': `Bearer ${token}`,
       },
@@ -508,7 +683,7 @@ export async function requestShutdown(projectRoot: string): Promise<boolean> {
 }
 
 /**
- * Wait for the daemon socket to become available.
+ * Wait for the daemon to become reachable on its TCP port.
  * Polls every 100ms up to the given timeout.
  * Returns true if the daemon responded to a health check within the timeout.
  */
@@ -535,11 +710,11 @@ export async function waitForDaemon(projectRoot: string, timeoutMs: number = 500
  * `expectedPid` (the OLD daemon's pid, captured before shutdown) is the precise
  * signal and should always be passed for a restart. Without it we fall back to
  * `isDaemonRunning`, which is lock-based: the daemon releases its flock as the
- * very LAST step of exit, after removing its own socket/PID files, so the
+ * very LAST step of exit, after removing its own PID file, so the
  * fallback no longer returns "stopped" while the old daemon is still finishing
- * cleanup. (It used to key on the socket FILE, which the daemon removes while
+ * cleanup. (It used to key on state FILES, which the daemon removes while
  * still alive — returning then let a new daemon start whose freshly-written
- * socket/PID got clobbered by the old daemon's trailing cleanup.) Waiting on the
+ * PID file got clobbered by the old daemon's trailing cleanup.) Waiting on the
  * actual process death is still the precise signal and remains preferred, since
  * a daemon dir with no lock file falls back to those same file signals.
  */

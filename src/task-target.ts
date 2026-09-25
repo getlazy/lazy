@@ -7,7 +7,7 @@
  *
  * This module is the ONE place that knows how the legacy two-field shape
  * `(parent_task_id, metadata.remote_target_branch)` maps to/from the union.
- * The storage boundary (FileStorage / PostgresStorage) uses `targetFromLegacy`
+ * The storage boundary (FileStorage) uses `targetFromLegacy`
  * on read and `targetToLegacy` on write; nothing else should reconstruct the
  * mapping by hand.
  *
@@ -137,6 +137,43 @@ export function collectSubtreeIds(rootId: string, allTasks: Task[]): Set<string>
   return ids;
 }
 
+/**
+ * How many descendants each task has — children, grandchildren, and so on —
+ * for every task in `allTasks`, keyed by task id. Tasks with none map to 0.
+ *
+ * One pass for the whole set: a caller that needs this for a list of tasks must
+ * not run {@link collectSubtreeIds} per task, which rebuilds the parent index
+ * every time. Pass the FULL task set for the same reason that function
+ * documents — descent walks parent links, so a filtered set silently truncates
+ * subtrees. Filter the result, not the input.
+ *
+ * Counted by walking each task UP its ancestor chain and crediting every
+ * ancestor, which needs no recursion and is cycle-safe by construction: a
+ * corrupt parent link is credited at most once per walk instead of hanging.
+ */
+export function descendantCounts(allTasks: Task[]): Map<string, number> {
+  const parentOf = new Map<string, string>();
+  const counts = new Map<string, number>();
+  for (const task of allTasks) {
+    counts.set(task.id, 0);
+    const parentId = parentTaskIdOf(task);
+    if (parentId) parentOf.set(task.id, parentId);
+  }
+
+  for (const task of allTasks) {
+    const seen = new Set<string>([task.id]);
+    let ancestorId = parentOf.get(task.id);
+    while (ancestorId && !seen.has(ancestorId)) {
+      seen.add(ancestorId);
+      // A parent outside the set (deleted, or not yet visible) gets no entry —
+      // counts only describe the tasks the caller passed in.
+      if (counts.has(ancestorId)) counts.set(ancestorId, counts.get(ancestorId)! + 1);
+      ancestorId = parentOf.get(ancestorId);
+    }
+  }
+  return counts;
+}
+
 /** Result of pruning a task set to a depth limit. See {@link pruneTasksToDepth}. */
 export interface DepthPruneResult {
   /** The tasks that survive the limit, in the input order. */
@@ -235,4 +272,20 @@ export function targetBranchOf(task: Task): string | undefined {
   return task.target.kind === 'branch' && task.target.branch
     ? task.target.branch
     : undefined;
+}
+
+/**
+ * The named integration branch a top-level task was explicitly created against
+ * (`lazy create --parent release-x`), or undefined when the caller must fall
+ * back to the repo default.
+ *
+ * Stricter than {@link targetBranchOf}: a stored `lazy/…` value is a stale task
+ * branch left by an earlier reparent, not an integration target — the task
+ * launcher has always treated it as "needs runtime resolution", and everything
+ * that must agree with the launcher about a task's base ref resolves it the
+ * same way.
+ */
+export function integrationBranchOf(task: Task): string | undefined {
+  const stored = targetBranchOf(task);
+  return stored && !looksLikeTaskBranch(stored) ? stored : undefined;
 }

@@ -16,9 +16,11 @@ import { join } from 'path';
 import { readFile, writeFile } from 'fs/promises';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
-import { expectSuccess } from '../helpers/assertions';
-import { checkDaemonHealth } from '../../src/daemon';
 import { enrollPassphrase } from '../helpers/passphrase';
+import { expectSuccess } from '../helpers/assertions';
+import { seedFinal } from '../helpers/final';
+import { checkDaemonHealth } from '../../src/daemon';
+import { signInToDashboard, type DashboardFetch } from '../helpers/dashboard-session';
 
 const PASSPHRASE = 'test-approval-passphrase';
 
@@ -35,6 +37,7 @@ async function enableProtection(ctx: TestContext): Promise<void> {
 describe('review page remedies for a refused accept', () => {
   let ctx: TestContext;
   let base: string;
+  let fetch: DashboardFetch;
 
   beforeEach(async () => {
     ctx = await setupTestLazy({
@@ -44,7 +47,7 @@ describe('review page remedies for a refused accept', () => {
     await enableProtection(ctx);
     const health = await checkDaemonHealth(ctx.root);
     expect(health.webPort).toBeGreaterThan(0);
-    base = `http://localhost:${health.webPort}`;
+    ({ base, fetch } = await signInToDashboard(ctx));
   });
 
   afterEach(async () => {
@@ -58,6 +61,8 @@ describe('review page remedies for a refused accept', () => {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     }));
     expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
+    // Fixture setup, not the subject (see test/helpers/final.ts).
+    await seedFinal(ctx, taskId);
     return taskId;
   }
 
@@ -76,7 +81,7 @@ describe('review page remedies for a refused accept', () => {
   test('a protection-gated accept offers the passphrase form and the CLI command', async () => {
     const taskId = await blockedTaskWithWork('gate');
 
-    const res = await fetch(`${base}/review/${taskId}/accept`, acceptForm({ reason: 'LGTM' }));
+    const res = await fetch(`${base}/tasks/${taskId}/review/accept`, acceptForm({ reason: 'LGTM' }));
     expect(res.status).toBe(200);
     const html = await res.text();
 
@@ -96,7 +101,7 @@ describe('review page remedies for a refused accept', () => {
   test('a refused accept preserves the reason and the unblock feedback', async () => {
     const taskId = await blockedTaskWithWork('draft');
 
-    const res = await fetch(`${base}/review/${taskId}/accept`, acceptForm({
+    const res = await fetch(`${base}/tasks/${taskId}/review/accept`, acceptForm({
       reason: 'ship it please',
       feedback: 'also rename the helper before merging',
     }));
@@ -115,7 +120,7 @@ describe('review page remedies for a refused accept', () => {
   test('a wrong passphrase re-offers the form and never echoes the attempt', async () => {
     const taskId = await blockedTaskWithWork('wrong-pass');
 
-    const res = await fetch(`${base}/review/${taskId}/accept`, acceptForm({
+    const res = await fetch(`${base}/tasks/${taskId}/review/accept`, acceptForm({
       reason: 'LGTM',
       feedback: 'keep this text',
       passphrase: 'not-the-passphrase',
@@ -135,7 +140,7 @@ describe('review page remedies for a refused accept', () => {
   test('the correct passphrase completes the gated accept', async () => {
     const taskId = await blockedTaskWithWork('good-pass');
 
-    const res = await fetch(`${base}/review/${taskId}/accept`, acceptForm({
+    const res = await fetch(`${base}/tasks/${taskId}/review/accept`, acceptForm({
       reason: 'LGTM',
       passphrase: PASSPHRASE,
     }));

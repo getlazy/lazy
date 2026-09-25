@@ -11,7 +11,7 @@
  */
 
 import type { TokenUsage, AgentTokenUsage, MergeConflict, FileViolation } from '../types';
-import type { MaintainEntry } from '../config/types';
+import type { MaintainEntry, ReactEntry } from '../config/types';
 import type { AgentFailureClass } from '../agent/failure-taxonomy';
 
 /**
@@ -29,23 +29,63 @@ import type { AgentFailureClass } from '../agent/failure-taxonomy';
  *
  * Integer only. Protocols either match or they don't; no semver, no ranges.
  */
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
+
+/**
+ * Correlation id carried on every supervisor-bound command and echoed on its
+ * response. The protocol dir is a single-slot mailbox — without this, a
+ * synchronous waiter cannot tell whether `response.json` answers its command.
+ */
+export type CommandId = string;
 
 // --- Command (host → supervisor) ---
 
-export type CommandType = 'start' | 'unblock' | 'ask' | 'sync' | 'stop' | 'pre_accept';
+export type CommandType = 'start' | 'unblock' | 'ask' | 'sync' | 'stop' | 'review' | 'accept_gate';
+
+/*
+ * `agent_id` vs `harness` on a command — they answer different questions.
+ *
+ * `agent_id` is the PROFILE the turn was launched under (`[agents.<name>]` in
+ * lazy.toml: harness + model + endpoint + credential). It is what the human or
+ * the builder selected, it is what the task record stores, and it is what the
+ * response echoes back and what a failed-invocation record keeps — a task on
+ * `local-ollama-pi` must report itself as that, not as `pi`.
+ *
+ * `harness` is which agent BINARY runs, and it is the only one the supervisor
+ * can act on: `getAgent()` / `getAgentPackaging()` are registry lookups, and the
+ * registry holds harnesses. The daemon resolves it from the profile at dispatch
+ * (it owns the project's config) and states it here rather than making every
+ * supervisor site re-derive it.
+ *
+ * It is OPTIONAL and every reader falls back to `agent_id`: the built-in
+ * profiles are named after their harnesses, so for every project that has not
+ * defined a custom profile the two strings are equal and the fallback is exact.
+ * That is also why this needs no PROTOCOL_VERSION bump — an older supervisor
+ * ignoring an unknown field lands on the same harness it would have picked.
+ */
 
 export interface StartCommand {
   type: 'start';
   task_id: string;
   goal: string;
   prompt: string;
+  /** Echoed on the response so the host can correlate a single-slot answer. */
+  command_id?: CommandId;
   protocol_version?: number;   // wire protocol version — supervisor rejects on mismatch (see PROTOCOL_VERSION)
   agent_id?: string;           // which agent to use (e.g., 'claude-code', 'cursor') — defaults to 'claude-code'
+  /** Harness (agent binary) the profile in `agent_id` runs. See the note above CommandType. */
+  harness?: string;
   system_prompt?: string;      // static system instructions (tool usage, commit guidelines) — passed as --append-system-prompt
   model_id?: string;
   effort?: string;             // reasoning effort level — passed as --effort (Claude Code only)
   parent_branch?: string;      // upstream branch for sync (pre-turn and/or post-turn)
+  /**
+   * Ref `resolveUpstreamMergeRef` chose for the parent — the same base accept
+   * and sync use. Written by the daemon at command dispatch; the supervisor
+   * uses this (not the raw parent branch name) when filtering merge-artifact
+   * protected-file violations.
+   */
+  upstream_merge_ref?: string;
   sync_before_work?: boolean;  // if true, sync upstream before work phase (default: false for start)
   sync_after_work?: boolean;   // if true, sync upstream after work phase
   remote_branch?: string;      // remote tracking ref to merge (e.g., "origin/lazy/abc12345") — sync-with-remote phase
@@ -57,8 +97,17 @@ export interface StartCommand {
   branch_point_sha?: string;          // SHA of the commit the task branched from — files not present here are task-created and exempt from permission violations
   post_turn_check?: string;           // command to run after agent work (output captured for review)
   post_turn_timeout?: number;          // timeout in seconds for post_turn_check (default: 300)
+  pre_turn_hook?: string;              // setup command run in the worktree BEFORE the agent starts (`[automation] pre_turn`)
+  pre_turn_timeout?: number;           // timeout in seconds for pre_turn_hook (default: 120)
+  pre_turn_required?: boolean;         // if true, a failing pre_turn_hook fails the turn instead of warning
   agent_extra_args?: string[];         // extra `claude` args for the agent launch (host OS-sandbox `--settings`); see commonCommandFields
   maintain?: MaintainEntry[];          // maintained-file groups agents are nudged to keep up to date (post-turn skip check + up-front context)
+  react?: ReactEntry[];                // reactive automations: pattern match → one-shot follow-up with instructions
+  low_high_loop?: LowHighLoopSettings; // EXPERIMENTAL two-phase turn — see LowHighLoopSettings
+  /** Closing steps for this turn, by how it ends — see WrapUpPlan. */
+  wrap_up?: WrapUpPlan;
+  /** Base SHA the wrap-up phase scans from — see WrapUpPlan docs. */
+  base_sha?: string;
 }
 
 export interface UnblockCommand {
@@ -66,20 +115,28 @@ export interface UnblockCommand {
   task_id: string;
   goal: string;
   prompt: string;
+  /** Echoed on the response so the host can correlate a single-slot answer. */
+  command_id?: CommandId;
   protocol_version?: number;   // wire protocol version — supervisor rejects on mismatch (see PROTOCOL_VERSION)
   agent_id?: string;           // which agent to use (e.g., 'claude-code', 'cursor') — defaults to 'claude-code'
+  /** Harness (agent binary) the profile in `agent_id` runs. See the note above CommandType. */
+  harness?: string;
   system_prompt?: string;      // static system instructions (tool usage, commit guidelines) — passed as --append-system-prompt
   model_id?: string;
   effort?: string;             // reasoning effort level — passed as --effort (Claude Code only)
   agent_session_id?: string;  // resume existing agent session
   parent_branch?: string;      // upstream branch for sync (pre-turn and/or post-turn)
+  /**
+   * Ref `resolveUpstreamMergeRef` chose for the parent — see StartCommand.
+   */
+  upstream_merge_ref?: string;
   sync_before_work?: boolean;  // if true, sync upstream before work phase
   sync_after_work?: boolean;   // if true, sync upstream after work phase
   remote_branch?: string;      // remote tracking ref to merge (e.g., "origin/lazy/abc12345") — sync-with-remote phase
 
   /**
    * Agent permission mode for this turn. When 'plan', the agent runs read-only
-   * (no writes, no commits) — used by `lazy review -i` for Q&A against the
+   * (no writes, no commits) — used by `lazy browse -i` for Q&A against the
    * agent's session. Omitted/undefined means the default (unconstrained) mode.
    */
   permission_mode?: 'plan' | 'default';
@@ -91,14 +148,103 @@ export interface UnblockCommand {
   branch_point_sha?: string;          // SHA of the commit the task branched from — files not present here are task-created and exempt from permission violations
   post_turn_check?: string;           // command to run after agent work (output captured for review)
   post_turn_timeout?: number;          // timeout in seconds for post_turn_check (default: 300)
+  pre_turn_hook?: string;              // setup command run in the worktree BEFORE the agent starts (`[automation] pre_turn`)
+  pre_turn_timeout?: number;           // timeout in seconds for pre_turn_hook (default: 120)
+  pre_turn_required?: boolean;         // if true, a failing pre_turn_hook fails the turn instead of warning
   agent_extra_args?: string[];         // extra `claude` args for the agent launch (host OS-sandbox `--settings`); see commonCommandFields
   maintain?: MaintainEntry[];          // maintained-file groups agents are nudged to keep up to date (post-turn skip check + up-front context)
+  react?: ReactEntry[];                // reactive automations: pattern match → one-shot follow-up with instructions
+  low_high_loop?: LowHighLoopSettings; // EXPERIMENTAL two-phase turn — see LowHighLoopSettings
+  /** Closing steps for this turn, by how it ends — see WrapUpPlan. */
+  wrap_up?: WrapUpPlan;
+  /** Base SHA the wrap-up phase scans from — see WrapUpPlan docs. */
+  base_sha?: string;
+}
+
+/**
+ * One step of the final-turn wrap-up phase, in the order the supervisor runs
+ * them (final-turn design §3.3). Which of these a task actually gets is decided
+ * by the DAEMON from the task's audience (`audienceOf`, src/task/audience.ts)
+ * at command dispatch — the supervisor runs the steps it is handed and never
+ * derives a plan itself.
+ */
+export type WrapUpStep =
+  | 'permission_pushback'
+  | 'maintain'
+  | 'react'
+  | 'commit_leftovers'
+  | 'present';
+
+/**
+ * The wrap-up plan a work turn carries (start/unblock only — ask, sync and
+ * review turns have no wrap-up phase).
+ *
+ * The plan rides on every work command because the turn's ENDING is not known
+ * when the command is written: the agent declares (or does not) during the
+ * turn. So the daemon sends BOTH lists and the supervisor picks by what
+ * actually happened — it never derives a plan itself.
+ *
+ * - {@link steps} runs when the turn ended with a `lazy_final` — pencils down,
+ *   the full reader-facing closing chain (final-turn design §3.3).
+ * - {@link park_steps} runs when it did NOT: the turn left a blocking raise, or
+ *   just stopped. This is the presentation-on-every-human-facing-park rule: a
+ *   human being asked to decide gets the walkthrough whichever way the turn
+ *   ended, because the walkthrough exists to INFORM that decision. Everything
+ *   else in the chain still belongs to the final alone.
+ *
+ * `base_sha` (on the same commands) is the concrete SHA of the base this task's
+ * own diff is rendered against — the daemon resolves it through
+ * `resolveTaskDiffBase`, the same resolution the reviewer's diff uses. The
+ * wrap-up phase's scans run over `base_sha..HEAD` — the task's own range, not
+ * the turn window (§3.4) — so the push-back sees exactly what the reviewer
+ * sees. When omitted (resolution failed), the supervisor falls back to the
+ * turn window rather than refusing the scan.
+ */
+export interface WrapUpPlan {
+  /** Steps for a turn that declared `lazy_final`. */
+  steps: WrapUpStep[];
+  /**
+   * Steps for a turn that parked WITHOUT a final — needs-input or plain
+   * blocked. Today this is `['present']` on a human-audience task that is not
+   * a hub, and empty otherwise.
+   *
+   * Optional on the wire only so a daemon/supervisor version skew degrades to
+   * the old behaviour (no park steps) rather than crashing.
+   */
+  park_steps?: WrapUpStep[];
+  /**
+   * HEAD when the walkthrough now on record was declared, or absent when the
+   * task has none.
+   *
+   * The regeneration rule, handed to the supervisor as a COMPARISON rather than
+   * a decision: the `present` step re-authors only when HEAD has moved since
+   * the stored walkthrough was written. A park that changed nothing is shown
+   * the walkthrough that already exists, and costs no model turn.
+   */
+  presented_sha?: string;
+}
+
+/**
+ * EXPERIMENTAL "low-high loop" settings for a work turn (start/unblock only —
+ * ask, sync and wrap-up turns never run the loop).
+ *
+ * When present, the command's `effort` field IS the draft/revise effort (the
+ * work phase runs at it), and after the work phase the supervisor runs one
+ * bounded review→revise cycle in the same agent session:
+ *   1. self-review at `review_effort` in plan mode (instructions only, no writes)
+ *   2. unless the review approved, one revise invocation back at the command's
+ *      `effort` applying those instructions.
+ * Absent → normal single-shot turn, byte-for-byte unchanged behavior.
+ */
+export interface LowHighLoopSettings {
+  /** Reasoning effort for the self-review phase (e.g. "xhigh"). */
+  review_effort: string;
 }
 
 /**
  * Ask command — a read-only "ask turn" against an existing agent session.
  *
- * Used by `lazy review -i` so a reviewer can ask questions of the agent while
+ * Used by `lazy browse -i` so a reviewer can ask questions of the agent while
  * walking a task's diff. Semantically distinct from Unblock:
  *   - Read-only: plan mode always, no writes, no commits.
  *   - No integration machinery: skips sync_with_remote, merge_and_fix,
@@ -116,8 +262,12 @@ export interface AskCommand {
   task_id: string;
   goal: string;
   prompt: string;
+  /** Echoed on the response so the host can correlate a single-slot answer. */
+  command_id?: CommandId;
   protocol_version?: number;   // wire protocol version — supervisor rejects on mismatch (see PROTOCOL_VERSION)
   agent_id?: string;
+  /** Harness (agent binary) the profile in `agent_id` runs. See the note above CommandType. */
+  harness?: string;
   system_prompt?: string;
   model_id?: string;
   effort?: string;
@@ -132,8 +282,12 @@ export interface AskCommand {
   protected_patterns?: string[];
   post_turn_check?: string;
   post_turn_timeout?: number;
+  pre_turn_hook?: string;
+  pre_turn_timeout?: number;
+  pre_turn_required?: boolean;
   agent_extra_args?: string[];         // extra `claude` args for the agent launch (host OS-sandbox `--settings`); see commonCommandFields
   maintain?: MaintainEntry[];
+  react?: ReactEntry[];
 }
 
 /**
@@ -146,6 +300,8 @@ export interface AskCommand {
 export interface SyncCommand {
   type: 'sync';
   task_id: string;
+  /** Echoed on the response so the host can correlate a single-slot answer. */
+  command_id?: CommandId;
   protocol_version?: number;   // wire protocol version — supervisor rejects on mismatch (see PROTOCOL_VERSION)
   parent_branch: string;       // upstream branch to merge (for display/logging)
   /**
@@ -157,8 +313,42 @@ export interface SyncCommand {
    * the merge. Fixes the silent no-op sync regression (see fix-sync-no-merge).
    */
   upstream_sha?: string;
+  /**
+   * Remote tracking ref for the task's OWN branch (e.g. `origin/lazy/abc12345`),
+   * set only when the host's fetch found commits the local branch lacks — a
+   * colleague pushed to the task branch.
+   *
+   * When present the supervisor merges it FIRST, before `parent_branch`: what
+   * the branch is supposed to contain is settled before approved upstream work
+   * is merged on top, the same ordering the start/unblock path uses. The parent
+   * branch itself is never touched by either step.
+   */
+  remote_branch?: string;
   agent_session_id?: string;   // existing agent session for conflict resolution
   model_id?: string;           // model for conflict resolution (if needed)
+  /**
+   * Reasoning effort for the conflict-resolution turn.
+   *
+   * Travels with `model_id` for the same reason every other command carries
+   * both: a sync turn runs on the task's own effort, `task.metadata.effort`
+   * (INVARIANT turn-launch-continuity, src/daemon/launch-identity.ts).
+   * Omitting it made a conflict resolution — the turn most likely to need the
+   * task's real effort — silently run on the agent binary's own default.
+   */
+  effort?: string;
+  /**
+   * Which agent resolves the conflicts (e.g. 'claude-code', 'cursor') —
+   * defaults to 'claude-code'.
+   *
+   * REQUIRED for `model_id` and `agent_session_id` to mean anything: both are
+   * issued by, and only valid for, one agent. A sync that carried a cursor
+   * task's model and session but launched `claude` exited 1 on every attempt
+   * and left the worktree wedged mid-merge, which is why all three now travel
+   * together (see src/supervisor/merge.ts).
+   */
+  agent_id?: string;
+  /** Harness (agent binary) the profile in `agent_id` runs. See the note above CommandType. */
+  harness?: string;
   /**
    * Guard timeouts for the conflict-resolution agent turn. A sync that hits
    * conflicts runs a real agent turn, so it gets the same two guards as work:
@@ -176,54 +366,121 @@ export interface StopCommand {
 }
 
 /**
- * Pre-accept command — the final agent turn before a task's merge.
+ * Acceptance-gate command — the MECHANICAL check run at accept.
  *
- * Dispatched synchronously by the daemon's accept path (launchPreAcceptTurn),
- * daemon-owned end-to-end like an ask, but a WRITE turn: the agent runs the
- * configured gate commands, fixes what they surface, updates any configured
- * maintained-file groups against the FINAL diff, writes a built-in post-mortem
- * to the task journal, and commits. After the agent's turn the
- * supervisor RE-RUNS `commands` itself as the authoritative gate and reports the
- * outcome in the response's `pre_accept` field — the agent cannot self-certify.
+ * Dispatched synchronously by the daemon's accept path (launchAcceptanceGate)
+ * into a DEDICATED protocol mailbox and run in its own EPHEMERAL container: no
+ * agent runs, no session is resumed, no turn is recorded. The supervisor runs
+ * the configured gate commands in the task's worktree, in order, and reports
+ * the outcome in the response's `accept_gate` field — the agent cannot
+ * self-certify, and a failing suite can never merge.
  *
- * Always resumes an existing session (a task being accepted has run at least
- * once). `prompt` is fully rendered host-side (config lives on the daemon).
+ * Deliberately minimal: no agent_id/harness/model/session fields, because
+ * nothing here launches an agent. `command_id` is kept so the response is
+ * correlated in logs; there is no single-slot answer to protect (the mailbox
+ * belongs to this gate alone).
  */
-export interface PreAcceptCommand {
-  type: 'pre_accept';
+export interface AcceptGateCommand {
+  type: 'accept_gate';
+  task_id: string;
+  /** Echoed on the response; the gate mailbox is dedicated, so this is log hygiene, not correlation. */
+  command_id?: CommandId;
+  protocol_version?: number;   // wire protocol version — supervisor rejects on mismatch (see PROTOCOL_VERSION)
+  /** Gate commands run in order; first non-zero exit fails the gate. */
+  accept_gate_commands: string[];
+  /** Timeout in seconds for EACH gate command (default 600). */
+  accept_gate_timeout?: number;
+}
+
+/**
+ * Review command — a read-only review turn in a NEW agent session.
+ *
+ * Dispatched synchronously by `lazy review` / `lazy_review` (`launchReviewTask`).
+ * Same shape as an ask (plan mode, no integration machinery, daemon-owned
+ * response) EXCEPT it never carries `agent_session_id`: the reviewer must not
+ * resume the implementer's session, and the new session id must not be written
+ * back onto the task's work session.
+ */
+export interface ReviewCommand {
+  type: 'review';
   task_id: string;
   goal: string;
   prompt: string;
-  protocol_version?: number;   // wire protocol version — supervisor rejects on mismatch (see PROTOCOL_VERSION)
+  /** Echoed on the response so the host can correlate a single-slot answer. */
+  command_id?: CommandId;
+  protocol_version?: number;
   agent_id?: string;
+  /** Harness (agent binary) the profile in `agent_id` runs. See the note above CommandType. */
+  harness?: string;
   system_prompt?: string;
   model_id?: string;
   effort?: string;
-  agent_session_id?: string;   // always set by the daemon — pre-accept always resumes
-  /** Gate commands the supervisor re-runs after the agent turn; first non-zero exit fails the gate. */
-  pre_accept_commands: string[];
-  /** Timeout in seconds for EACH gate command (default 600). */
-  pre_accept_timeout?: number;
+  // Deliberately no agent_session_id — a review is always a fresh session.
 
   turn_started_at?: string;
   watchdog_output_timeout_ms?: number;
-  wind_down_timeout_ms?: number;
-  // Accepted so the command builder can share commonCommandFields; the maintain
-  // context is injected into the pre-accept prompt host-side instead.
+  // Accepted so the command builder can share commonCommandFields; they are
+  // no-ops on the review path (read-only plan mode).
   protected_patterns?: string[];
   post_turn_check?: string;
   post_turn_timeout?: number;
+  pre_turn_hook?: string;
+  pre_turn_timeout?: number;
+  pre_turn_required?: boolean;
+  agent_extra_args?: string[];
   maintain?: MaintainEntry[];
+  react?: ReactEntry[];
 }
 
-export type Command = StartCommand | UnblockCommand | AskCommand | SyncCommand | StopCommand | PreAcceptCommand;
+
+/**
+ * The authoritative merge-gate outcome carried on the gate command's response
+ * (`accept_gate`, formerly `pre_accept`). `passed` false means the accept must
+ * abort and the task return to its prior status; the daemon surfaces
+ * `failed_command` + `output` to the human.
+ */
+export interface AcceptGateResult {
+  passed: boolean;
+  /** The first command that exited non-zero (undefined when passed). */
+  failed_command?: string;
+  /** Exit code of the failed command (-1 exec error, -2 timeout). */
+  exit_code?: number;
+  /** Captured output of the failed command (truncated). */
+  output?: string;
+}
+
+export type Command = StartCommand | UnblockCommand | AskCommand | SyncCommand | StopCommand | AcceptGateCommand | ReviewCommand;
+
+/** Supervisor-bound commands that carry a correlation id (every type except stop). */
+export type CorrelatedCommand = Exclude<Command, StopCommand>;
 
 // --- Response (supervisor → host) ---
 
 export type ResponseStatus = 'completed' | 'error';
 
+/**
+ * Kind of a supervised follow-up invocation (see `CompletedResponse.supervised`).
+ *
+ * `low_high_review` / `low_high_revise` were spelled `ivan_review` /
+ * `ivan_revise` before the loop was renamed. Old spellings are NOT part of this
+ * union — they are normalized away at the protocol read boundary
+ * ({@link normalizeSupervisedKind}), so nothing downstream has to know they
+ * ever existed.
+ */
+export type SupervisedKind =
+  | 'permission_pushback'
+  | 'maintain'
+  | 'react'
+  | 'commit_leftovers'
+  | 'present'
+  | 'low_high_review'
+  | 'low_high_revise'
+  | 'review_reask';
+
 export interface CompletedResponse {
   status: 'completed';
+  /** Echo of the command that produced this response; absent on pre-correlation supervisors. */
+  command_id?: CommandId;
   result: string;
   session_id: string;
   usage: AgentTokenUsage;
@@ -247,6 +504,22 @@ export interface CompletedResponse {
    * nothing to judge (an agent that does not enumerate its tools).
    */
   mcp_tools?: string;
+  /**
+   * Present ONLY on a review response whose first reply had no usable verdict.
+   *
+   * A review's verdict is a closed set (`clean` / `needs_work` / `needs_human`)
+   * because the daemon ACTS on it — auto-fix, park, count a round, gate accept.
+   * When the first reply resolves to none of them the supervisor re-asks the
+   * same session ONCE for the JSON block alone, single-shot exactly like the
+   * maintain follow-up, and carries the answer here.
+   *
+   * A separate field rather than a replaced `result`: the first reply may hold
+   * the reviewer's only written reasoning, and it stays the turn's content. The
+   * daemon parses THIS instead only when it actually resolves to a verdict —
+   * otherwise the review is recorded as FAILED and gates accept like
+   * `needs_work`.
+   */
+  review_reask?: string;
   /** Merge conflicts captured before agent resolution (if any merges had conflicts) */
   merge_conflicts?: MergeConflict[];
   /** File permission violations detected after this invocation (FINAL set for the
@@ -254,10 +527,30 @@ export interface CompletedResponse {
   violations?: FileViolation[];
   /** Whether the agent was given a push-back chance for violations */
   pushed_back?: boolean;
+  /**
+   * Paths still uncommitted in the worktree when the TURN ended — after every
+   * wrap-up step, including the `commit_leftovers` follow-up that asked about
+   * them. Capped at {@link MAX_REPORTED_PATHS}.
+   *
+   * Nothing here is on the branch, so nothing here survives the worktree. The
+   * field exists so that fact reaches the turn record and the review surfaces
+   * without a human running `git status` in a container they may not have.
+   *
+   * Set on the WORK response — it describes the turn as a whole, not one
+   * invocation, and is deliberately written only when the set is NON-EMPTY:
+   * absent means "clean, or never scanned", and a scan that FAILED must never
+   * be recorded as an empty set (see `detectUncommittedPaths`, which answers
+   * null for exactly that reason).
+   */
+  uncommitted?: string[];
   /** Exit code of the post-turn check command (undefined if no check, -1 if exec failed, -2 if timed out) */
   check_exit_code?: number;
-  /** Captured stderr output from the post-turn check command (truncated to last 200 lines) */
+  /** Captured stdout+stderr from the post-turn check command (truncated to last 200 lines) */
   check_output?: string;
+  /** Exit code of the pre-turn setup hook (only set when it FAILED; -1 exec error, -2 timeout) */
+  pre_turn_exit_code?: number;
+  /** Captured output of the failed pre-turn setup hook (truncated) */
+  pre_turn_output?: string;
   /**
    * Wall-clock duration (ms) of the agent process itself — measured inside
    * the supervisor around the `work` phase. Used by LAZY_VERBOSE telemetry
@@ -282,25 +575,19 @@ export interface CompletedResponse {
    * same way a human→agent exchange is. Absent on the work response.
    */
   supervised?: {
-    kind: 'permission_pushback' | 'maintain';
+    kind: SupervisedKind;
     prompt: string;
   };
   /**
-   * Present ONLY on the pre-accept response. The authoritative gate outcome: the
-   * supervisor re-ran `pre_accept_commands` after the agent's turn. `passed`
-   * false means the accept must abort and the task return to blocked; the daemon
-   * surfaces `failed_command` + `output` to the human. Absent → no gate ran
-   * (post-mortem-only turn), which the daemon treats as passed.
+   * Present ONLY on the acceptance-gate response. The authoritative gate
+   * outcome: the supervisor ran `accept_gate_commands` mechanically (no agent)
+   * in the task's worktree before the merge. `passed` false means the accept
+   * must abort and the task return to its prior status; the daemon surfaces
+   * `failed_command` + `output` to the human. Absent → this response is not
+   * the gate's answer (the gate mailbox is dedicated, so anything else there
+   * is foreign).
    */
-  pre_accept?: {
-    passed: boolean;
-    /** The first command that exited non-zero (undefined when passed). */
-    failed_command?: string;
-    /** Exit code of the failed command (-1 exec error, -2 timeout). */
-    exit_code?: number;
-    /** Captured output of the failed command (truncated). */
-    output?: string;
-  };
+  accept_gate?: AcceptGateResult;
   /**
    * Present ONLY on the upstream-merge (sync) response. Carries the outcome the
    * reconciler needs to record turns:
@@ -328,6 +615,33 @@ export interface CompletedResponse {
    * file because the `lazy_*` tools were unreachable (see `AgentHandoffEntry`).
    */
   agent_handoff?: AgentHandoffEntry[];
+  /**
+   * PENCILS DOWN: this invocation's agent declared the task's work finished.
+   *
+   * Read by the supervisor off `final.json` in the protocol dir (see
+   * src/protocol/final-marker.ts), which the `lazy_final` MCP handler wrote in
+   * the daemon. Present only on the invocation that declared it, so the
+   * reconciler can record the claim on the TURN that made it — a final is a
+   * claim about a SHA, not a property of the bundle.
+   */
+  final?: FinalDeclaration;
+}
+
+/**
+ * What an agent declared when it called `lazy_final` (or wrote a
+ * `{"kind":"final"}` handoff entry because its tools were down).
+ *
+ * Deliberately not `FinalClaim`: the ACTOR and the person behind it are the
+ * daemon's to decide from the channel, never a field a container-side process
+ * fills in. This carries only what the agent itself said.
+ */
+export interface FinalDeclaration {
+  /** HEAD of the task branch when the claim was made. */
+  sha: string;
+  /** ISO timestamp the claim was recorded. */
+  declared_at: string;
+  /** The agent's one-line note about what it is handing over, if any. */
+  note?: string;
 }
 
 /**
@@ -344,8 +658,22 @@ export interface CompletedResponse {
  * durable, daemon-owned write channel — carries it home on the response.
  */
 export interface AgentHandoffEntry {
-  kind: 'journal' | 'followup';
+  /**
+   * `followup` is the pre-unification spelling of a non-blocking `raised`.
+   *
+   * `final` is pencils down — the fallback for `lazy_final` when the tool
+   * channel died. It is the one kind whose `content` is optional-in-spirit: the
+   * note, if the agent wrote one. A turn that lost its tools can still say the
+   * work is done.
+   */
+  kind: 'journal' | 'followup' | 'raised' | 'final';
   content: string;
+  /**
+   * Only meaningful for `raised`, and only `true` does anything: an item
+   * recovered from the handoff file gates accept only when the agent said so
+   * explicitly. A fallback channel must not wedge a task on a typo.
+   */
+  blocking?: boolean;
 }
 
 /**
@@ -388,11 +716,15 @@ export interface WorktreeRecovery {
  */
 export interface CompletedResponseBundle {
   status: 'completed';
+  /** Echo of the command that produced this bundle; absent on pre-correlation supervisors. */
+  command_id?: CommandId;
   responses: CompletedResponse[];
 }
 
 export interface ErrorResponse {
   status: 'error';
+  /** Echo of the command that produced this response; absent on pre-correlation supervisors. */
+  command_id?: CommandId;
   error: string;
   phase: SupervisorPhase;
   /**
@@ -476,7 +808,7 @@ export interface ErrorResponse {
   /**
    * True when the failed turn provably had no effect on the branch: no commits
    * between turn start and turn end, AND the worktree is clean. This lets
-   * downstream consumers (reconciler, accept/pre-accept) skip mechanisms that
+   * downstream consumers (reconciler, accept) skip mechanisms that
    * only make sense when the agent actually did something — asking a crashed
    * agent to "reflect on its work" is nonsensical when there is no work.
    *
@@ -484,9 +816,57 @@ export interface ErrorResponse {
    * effect" — consumers must fall back to existing behavior when undefined.
    */
   agent_had_no_effect?: boolean;
+  /**
+   * See `CompletedResponse.uncommitted` — same field, failing turn, and the
+   * case where it matters MOST.
+   *
+   * A turn that crashes or is killed by the watchdog never reaches the wrap-up,
+   * so nobody asks it to commit what it wrote; the edits sit in the worktree
+   * with no record that they exist. That is precisely how this task's own
+   * crashed turn left a CHANGELOG line behind. The failure path already runs a
+   * dirty check for `agent_had_no_effect`, so the paths cost nothing extra.
+   *
+   * Written only when NON-EMPTY, for the same reason as on the work response: a
+   * scan that could not run must not read back as a clean worktree.
+   */
+  uncommitted?: string[];
 }
 
 export type Response = CompletedResponse | CompletedResponseBundle | ErrorResponse;
+
+/** Read the command id a supervisor echoed on a response, if any. */
+export function responseCommandId(response: Response): CommandId | undefined {
+  return response.command_id;
+}
+
+/** Attach the originating command's id to a response before writing it. */
+export function attachCommandId(response: Response, commandId: CommandId | undefined): Response {
+  if (!commandId) return response;
+  return { ...response, command_id: commandId };
+}
+
+/** Read the correlation id from a command (every type except stop). */
+export function commandCorrelationId(command: CorrelatedCommand): CommandId | undefined {
+  return command.command_id;
+}
+
+/**
+ * Whether a response positively correlates to an in-flight turn's command.
+ *
+ * Version skew: a response without `command_id`, or a record persisted before
+ * correlation shipped, is never a positive match — callers fall back to their
+ * owner's own rules (an ask tolerates the skew; a legacy `pre_accept` record
+ * abandons).
+ */
+export function inFlightResponseCorrelates(
+  response: Response,
+  recordCommandId: CommandId | undefined,
+): 'match' | 'mismatch' | 'uncorrelated' {
+  if (!recordCommandId) return 'uncorrelated';
+  const responseId = responseCommandId(response);
+  if (!responseId) return 'uncorrelated';
+  return responseId === recordCommandId ? 'match' : 'mismatch';
+}
 
 /**
  * Normalize a completed wire response to the flat array of invocation responses.
@@ -509,10 +889,35 @@ export type SupervisorPhase =
   | 'sync_with_remote_done'
   | 'merge_and_fix'
   | 'merge_and_fix_done'
+  | 'pre_turn_hook'
+  | 'pre_turn_hook_done'
   | 'work'
   | 'work_done'
+  | 'low_high_review'
+  | 'low_high_review_done'
+  | 'low_high_revise'
+  | 'low_high_revise_done'
   | 'permission_pushback'
   | 'permission_pushback_done'
+  | 'maintain'
+  | 'maintain_done'
+  | 'react'
+  | 'react_done'
+  | 'commit_leftovers'
+  | 'commit_leftovers_done'
+  | 'present'
+  | 'present_done'
+  // The ONE re-ask for a review whose verdict was not one of the three values
+  // the daemon acts on (src/supervisor/review-reask.ts).
+  | 'review_reask'
+  | 'review_reask_done'
+  | 'wrap_up'
+  | 'wrap_up_done'
+  // The mechanical acceptance gate: the supervisor runs the configured commands
+  // in its own ephemeral container — no agent, no session. Never observed by the
+  // daemon's working-substate surfaces (the status lives in the gate's own
+  // protocol dir, not the work mailbox).
+  | 'accept_gate'
   | 'post_turn_check'
   | 'post_turn_check_done'
   | 'post_turn_sync'
@@ -551,6 +956,21 @@ export interface SupervisorStatus {
   upstream_merge_sha?: string;
   /** SHA of HEAD after work phase completed (before post-turn sync) */
   post_work_sha?: string;
+  /**
+   * The claim this turn's WORK invocation made, when it made one.
+   *
+   * Written at the start of the wrap-up chain and read by `lazy_final` across
+   * the protocol-dir seam: the daemon can see which phase it is serving but
+   * not how the turn ended, because the turn-ending marker was read and
+   * CLEARED by the supervisor before the closing steps ran. Without it the
+   * walkthrough-step refusal cannot tell an agent re-declaring a claim that
+   * already stands from one declaring for the first time where it will be
+   * dropped (review c6b6cdde).
+   *
+   * Cleared on every turn for the same reason the marker is (§13.10): a stale
+   * value would answer a later turn's question with an earlier turn's claim.
+   */
+  declared_final?: { sha: string; declared_at: string };
   /** PID of the supervisor process */
   pid: number;
   /** Retry count (only present when phase is 'retrying') */
@@ -567,4 +987,59 @@ export interface SupervisorStatus {
   retry_failure_reason?: string;
   /** Delay before the next attempt (ms) — lets the UI say when the retry lands. */
   retry_next_delay_ms?: number;
+}
+
+// --- Legacy spellings (the loop's pre-rename names) ---
+
+/**
+ * The EXPERIMENTAL two-phase turn used to be called the "Ivan Loop", and its
+ * supervised kinds and supervisor phases were spelled `ivan_*`. Those strings
+ * were written into status/response files (and, through them, into everything
+ * that switched on them) before the rename, so lazy must still be able to READ
+ * them: a supervisor from before an upgrade is still running mid-turn, and a
+ * status file it wrote must not render as "unknown phase".
+ *
+ * Compatibility lives HERE, at the one read boundary, and nowhere else. The
+ * type unions above carry only the new spellings on purpose — a `||` check
+ * scattered through the presenters is how a legacy value ends up handled in
+ * three places and missed in a fourth. Nothing WRITES the old spellings any
+ * more, and no store is migrated in place.
+ */
+const LEGACY_KIND_SPELLINGS: Readonly<Record<string, string>> = {
+  ivan_review: 'low_high_review',
+  ivan_review_done: 'low_high_review_done',
+  ivan_revise: 'low_high_revise',
+  ivan_revise_done: 'low_high_revise_done',
+};
+
+/** Map a possibly-legacy supervisor phase onto its current spelling. */
+export function normalizeSupervisorPhase(phase: string): SupervisorPhase {
+  return (LEGACY_KIND_SPELLINGS[phase] ?? phase) as SupervisorPhase;
+}
+
+/** Map a possibly-legacy supervised follow-up kind onto its current spelling. */
+export function normalizeSupervisedKind(kind: string): SupervisedKind {
+  return (LEGACY_KIND_SPELLINGS[kind] ?? kind) as SupervisedKind;
+}
+
+/**
+ * Normalize a status record read off disk. Returns the same object (mutated) so
+ * callers can keep treating `readStatus()` as a plain read.
+ */
+export function normalizeSupervisorStatus(status: SupervisorStatus): SupervisorStatus {
+  if (typeof status.phase === 'string') {
+    status.phase = normalizeSupervisorPhase(status.phase);
+  }
+  return status;
+}
+
+/** Normalize a response record read off disk (every invocation in a bundle). */
+export function normalizeResponse(response: Response): Response {
+  if (response.status !== 'completed') return response;
+  for (const invocation of completedResponses(response)) {
+    if (invocation.supervised && typeof invocation.supervised.kind === 'string') {
+      invocation.supervised.kind = normalizeSupervisedKind(invocation.supervised.kind);
+    }
+  }
+  return response;
 }

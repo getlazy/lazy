@@ -6,7 +6,7 @@
  */
 
 import type { QueryNode } from './parser';
-import type { Task, Comment, Turn, Commit, FollowUp } from '../types';
+import { isTerminalStatus, type Task, type Comment, type Turn, type Commit, type RaisedItem } from '../types';
 import type { SearchResult } from '../storage/types';
 
 /** All data associated with a single task, used for evaluation. */
@@ -15,7 +15,11 @@ export interface TaskData {
   turns: Turn[];
   commits: Commit[];
   comments: Comment[];
-  followUps: FollowUp[];
+  /**
+   * Everything the agent surfaced for human eyes, blocking and non-blocking
+   * alike. `in:followups` is an alias for `in:raised` over this one array.
+   */
+  raisedItems: RaisedItem[];
 }
 
 /**
@@ -64,19 +68,27 @@ function textContains(haystack: unknown, needle: string): boolean {
 }
 
 function evaluateField(
-  field: 'status' | 'goal' | 'code' | 'tag',
+  field: 'status' | 'goal' | 'task' | 'tag',
   value: string,
   data: TaskData
 ): boolean {
   switch (field) {
     case 'status':
+      // Exact: status is a closed enum, and a substring match would make
+      // status:complete also match nothing useful while status:work matched
+      // 'working'. Documented as exact in src/search/grammar.ts.
       return data.task.status === value;
 
     case 'goal':
       return textContains(data.task.goal, value);
 
-    case 'code':
-      return data.task.code !== null && data.task.code.toLowerCase() === value.toLowerCase();
+    case 'task':
+      // SUBSTRING over the task code, case-insensitively — the semantics the
+      // field list documents. This was exact equality, which made the obvious
+      // query (task:spike over a project full of spike-* codes) return nothing
+      // at all while the same string typed into the dashboard returned regex
+      // hits on the literal text "code:spike".
+      return textContains(data.task.code, value);
 
     case 'tag':
       // Exact match against the task's normalized tags. The parser already
@@ -87,11 +99,24 @@ function evaluateField(
 }
 
 function evaluateIn(
-  scope: 'turns' | 'commits' | 'comments' | 'followups' | 'conversations' | 'memories',
+  scope: 'tasks' | 'active' | 'backlog' | 'finished' | 'turns' | 'commits' | 'comments' | 'followups' | 'raised' | 'conversations' | 'memories' | 'scratch',
   value: string,
   data: TaskData
 ): boolean {
   switch (scope) {
+    case 'tasks':
+      return evaluateTaskText(value, data);
+
+    case 'active':
+      return ['working', 'interrupted', 'blocked'].includes(data.task.status) &&
+        evaluateTaskText(value, data);
+
+    case 'backlog':
+      return data.task.status === 'backlog' && evaluateTaskText(value, data);
+
+    case 'finished':
+      return isTerminalStatus(data.task.status) && evaluateTaskText(value, data);
+
     case 'turns':
       return data.turns.some(t => textContains(t.content, value));
 
@@ -101,8 +126,10 @@ function evaluateIn(
     case 'comments':
       return data.comments.some(c => textContains(c.content, value));
 
+    // One entity, two spellings: `followups` is the pre-unification alias.
     case 'followups':
-      return data.followUps.some(f => textContains(f.content, value));
+    case 'raised':
+      return data.raisedItems.some(r => textContains(r.content, value));
 
     case 'conversations':
       // Conversations are standalone entities, not associated with tasks.
@@ -113,11 +140,16 @@ function evaluateIn(
       // Memory records are project-level, not per-task — searched separately
       // in structuredSearch, so they never match a task here.
       return false;
+
+    case 'scratch':
+      // Builder scratch files are project-level too (one sandbox per project,
+      // not per task) — searched separately in structuredSearch.
+      return false;
   }
 }
 
 function evaluateHas(
-  scope: 'commits' | 'turns' | 'comments' | 'followups',
+  scope: 'commits' | 'turns' | 'comments' | 'followups' | 'raised',
   data: TaskData
 ): boolean {
   switch (scope) {
@@ -128,7 +160,8 @@ function evaluateHas(
     case 'comments':
       return data.comments.length > 0;
     case 'followups':
-      return data.followUps.length > 0;
+    case 'raised':
+      return data.raisedItems.length > 0;
   }
 }
 
@@ -157,14 +190,18 @@ function evaluateDate(
 }
 
 function evaluateText(value: string, data: TaskData): boolean {
-  // Free-text search across all content
+  return evaluateTaskText(value, data);
+}
+
+/** Free text across a task and everything attached to it. */
+function evaluateTaskText(value: string, data: TaskData): boolean {
   if (data.task.code && textContains(data.task.code, value)) return true;
   if (textContains(data.task.goal, value)) return true;
   if (data.task.prompt && textContains(data.task.prompt, value)) return true;
   if (data.turns.some(t => textContains(t.content, value))) return true;
   if (data.commits.some(c => textContains(c.message, value))) return true;
   if (data.comments.some(c => textContains(c.content, value))) return true;
-  if (data.followUps.some(f => textContains(f.content, value))) return true;
+  if (data.raisedItems.some(r => textContains(r.content, value))) return true;
   return false;
 }
 
@@ -179,6 +216,11 @@ export function buildSearchResults(
   const results: SearchResult[] = [];
   const taskCode = data.task.code ?? null;
   const taskGoal = data.task.goal;
+  // The task's own "last change", the way the `updated:` filter reads it
+  // (evaluateDateFilter) — completed_at when there is one, created_at
+  // otherwise. The record has no updated_at; a task-level row's recency is
+  // this, so ranking orders tasks honestly within the tier.
+  const taskTime = data.task.completed_at ?? data.task.created_at;
 
   // Collect all text terms from the query for context extraction
   const textTerms = extractTextTerms(node);
@@ -198,6 +240,7 @@ export function buildSearchResults(
         task_goal: taskGoal,
         content: `code: ${taskCode}`,
         match_context: taskCode,
+        entity_time: taskTime,
       });
     }
 
@@ -211,6 +254,7 @@ export function buildSearchResults(
         task_goal: taskGoal,
         content: data.task.goal,
         match_context: extractContext(data.task.goal, term),
+        entity_time: taskTime,
       });
     }
 
@@ -224,6 +268,7 @@ export function buildSearchResults(
         task_goal: taskGoal,
         content: data.task.prompt,
         match_context: extractContext(data.task.prompt, term),
+        entity_time: taskTime,
       });
     }
 
@@ -244,6 +289,7 @@ export function buildSearchResults(
           match_context: extractContext(turn.content, term),
           entity_index: index,
           turn_sequence: turn.sequence,
+          entity_time: turn.timestamp,
         });
       }
     }
@@ -260,6 +306,7 @@ export function buildSearchResults(
           content: commit.message,
           match_context: commit.message,
           entity_index: index,
+          entity_time: commit.timestamp,
         });
       }
     }
@@ -276,22 +323,24 @@ export function buildSearchResults(
           content: comment.content,
           match_context: extractContext(comment.content, term),
           entity_index: index,
+          entity_time: comment.created_at,
         });
       }
     }
 
-    // Follow-ups
-    for (const [index, followUp] of data.followUps.entries()) {
-      if (textContains(followUp.content, term)) {
+    // Raised items — blocking and non-blocking alike, one entity_type.
+    for (const [index, item] of data.raisedItems.entries()) {
+      if (textContains(item.content, term)) {
         results.push({
-          entity_type: 'followup',
-          entity_id: followUp.id,
+          entity_type: 'raised',
+          entity_id: item.id,
           task_id: data.task.id,
           task_code: taskCode,
           task_goal: taskGoal,
-          content: followUp.content,
-          match_context: extractContext(followUp.content, term),
+          content: item.content,
+          match_context: extractContext(item.content, term),
           entity_index: index,
+          entity_time: item.created_at,
         });
       }
     }
@@ -311,6 +360,7 @@ export function buildSearchResults(
       task_goal: taskGoal,
       content: taskGoal,
       match_context: taskGoal,
+      entity_time: taskTime,
     });
   }
 

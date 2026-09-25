@@ -16,6 +16,7 @@
  */
 
 import { describe, test, expect, mock, beforeEach, afterAll } from 'bun:test';
+import { ANTHROPIC_DEFAULT_TARGET } from '../../src/utils/role-target';
 import { mockModule, restoreMockedModules } from '../helpers/mock-module';
 import { resolve } from 'path';
 import { RpcError as RealRpcError } from '../../src/daemon/rpc-handlers';
@@ -39,12 +40,17 @@ await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => (
   loadConfig: async () => ({
     remote: { driver: 'github', git_remote: 'origin', auto_approve: false, offline: false },
     storage: { backend: 'external', external_path: '' },
+    // ResolvedConfig always carries a fully-populated `review` section, and
+    // the accept gate reads `config.review.mode` unguarded like every other
+    // required section. `separate` keeps these doubles on the pre-2026-09-21
+    // behaviour, where every recorded review turn gates.
+    review: { mode: 'separate', auto_fix: false, draft_effort: 'low', review_effort: 'xhigh' },
     // ResolvedConfig always carries a fully-populated `automation` section, and
     // acceptTask reads `config.automation.pre_accept` unguarded like every other
     // required section. This test is about the merging-state race, not the
     // pre-accept turn, so the step is disabled here.
-    automation: { maintain: [], pre_accept: { enabled: false, commands: [], timeout: 600 } },
-    models: { default: 'claude-opus-4-7', roles: { builder: { backend: 'anthropic', model: '', endpoint: '' }, agent: { backend: 'anthropic', model: '', endpoint: '' } } },
+    automation: { maintain: [], react: [], pre_accept: { enabled: false, commands: [], timeout: 600 }, accept_check: '', accept_check_timeout: 300 },
+    models: { default: 'claude-opus-4-7', roles: { builder: ANTHROPIC_DEFAULT_TARGET, agent: ANTHROPIC_DEFAULT_TARGET } },
     git: { default_branch_prefix: 'lazy' },
     // Race behavior under test predates the edge gate; gate scenarios are
     // covered by test/unit/edge-gate.test.ts + test/e2e/approve.test.ts.
@@ -74,11 +80,10 @@ await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
     getPRState: async () => null,
     getChecksStatus: async () => ({ status: 'passed' as const, failed: [] }),
     getTaskUrl: async () => null,
-    postAcceptReview: async () => null,
+    approveForMerge: async () => null,
     checkAcceptGates: async () => [],
     merge: async () => ({ status: 'merged' as const, metadata: {} }),
     fastForwardLocal: async () => ({ success: true }),
-    postTurnSummary: async () => {},
     fetchRemoteState: async () => {},
     getFailedCIJobs: async () => [],
     recoverRemoteRef: async () => null,
@@ -118,7 +123,7 @@ await mockModule(resolve(import.meta.dir, '../../src/utils/lock.ts'), () => ({
   removeLock: () => {},
 }));
 
-await mockModule(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/task/identity.ts'), () => ({
   shortId: (id: string) => id.substring(0, 8),
   displayId: (task: any) => task.code ?? task.id.substring(0, 8),
   taskRef: (task: any) => task.code ?? task.id.substring(0, 8),
@@ -127,7 +132,7 @@ await mockModule(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
   getBranchNameFromId: async () => 'lazy/parent-branch',
 }));
 
-await mockModule(resolve(import.meta.dir, '../../src/cli/orphan.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/task/orphan.ts'), () => ({
   checkOrphanedChild: async () => null,
   retargetOrphanedChild: async () => {},
   getActiveChildren: async () => [],
@@ -135,17 +140,21 @@ await mockModule(resolve(import.meta.dir, '../../src/cli/orphan.ts'), () => ({
   formatReparentWarning: () => null,
 }));
 
-await mockModule(resolve(import.meta.dir, '../../src/cli/commands/shared.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/task/turn-context.ts'), () => ({
   buildNotesContext: () => '',
   buildSystemPrompt: () => '',
   buildPromptWithInstructions: () => '',
   buildTurnHistoryContext: () => '',
   getNewNotesSince: async () => [],
+}));
+await mockModule(resolve(import.meta.dir, '../../src/task/sync-remote.ts'), () => ({
   runSyncWithRemote: async () => {},
+  syncTaskFromRemote: async () => {},
+}));
+await mockModule(resolve(import.meta.dir, '../../src/task/cleanup.ts'), () => ({
   cleanupWorktree: () => {},
   cleanupWorktreeAndBranch: () => {},
   cleanupTaskContainer: async () => {},
-  syncTaskFromRemote: async () => {},
 }));
 
 await mockModule(resolve(import.meta.dir, '../../src/protocol/index.ts'), () => ({
@@ -173,11 +182,23 @@ function createMockStorage() {
       return { ...mockTask, status: liveStatus };
     },
     getSessionByTaskId: async () => mockSession,
-    getSessionTurns: async () => [],
+    // Fixture finality: the accept gate (final-turn §5.1) refuses a task
+    // nobody has declared done. This suite targets merge routing, not
+    // finality, so the session carries one final-carrying marker turn; no
+    // work turns follow it, so nothing un-finals.
+    getSessionTurns: async () => [{
+      id: 'turn-final', sequence: 1, role: 'human',
+      content: '[system] Finalize declared', turn_type: 'pre_accept',
+      created_at: Date.now(),
+      final: { sha: 'abc123', actor: 'human', at: Date.now(), wrap_up_steps: [] },
+    }],
     getSessionCommits: async () => mockCommits,
     // Consumed by the fidelity summarizer (regenerateFidelity) during accept.
+    getTaskReviewComments: async () => [],
     getTaskComments: async () => [],
     getChildTasks: async () => [],
+    getTaskRaisedItems: async () => [],
+    resolveRaisedItem: async () => { throw new Error('unexpected resolveRaisedItem in merging-race test'); },
     updateTaskStatus: async (_id: string, to: TaskStatus) => {
       // Use the "true" current status — overridden by race when set, else live.
       const from = raceTaskStatusOverride ?? liveStatus;

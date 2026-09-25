@@ -6,3 +6,6 @@
 # (wired into the test scripts in package.json) and setDefaultTimeout(). See the
 # End-to-End Testing section of CLAUDE.md.
 preload = ["./test/preload-generate.ts"]
+
+# playground/ is a separate repository with its own tests (and its own CI).
+pathIgnorePatterns = ["playground/**"]

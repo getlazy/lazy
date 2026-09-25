@@ -86,7 +86,15 @@ export function applyCredential(
   headers: Headers,
   presented: PresentedCredential[],
   token: string,
-  placement: { kind: 'header'; header: string; value: string } | { kind: 'in-place'; value: string },
+  placement:
+    | {
+        kind: 'header';
+        header: string;
+        value: string;
+        requiredBeta?: string;
+        companionHeaders?: Record<string, string | null>;
+      }
+    | { kind: 'in-place'; value: string },
 ): void {
   if (placement.kind === 'in-place') {
     // Collect first: mutating while iterating the same header repeatedly would
@@ -103,6 +111,45 @@ export function applyCredential(
 
   stripPresentedCredential(headers, presented, token);
   headers.set(placement.header, placement.value);
+  if (placement.requiredBeta) mergeBetaFlag(headers, placement.requiredBeta);
+  // SET OR DELETE, never merge, and never "leave it alone": a companion header
+  // identifies the ACCOUNT the credential belongs to, so the host's answer must
+  // win over anything the container sent under the same name. A client that
+  // cannot know which real credential sits behind its placeholder cannot know
+  // the right account either.
+  //
+  // `null` means the host has no value — and it must still DELETE. The forwarding
+  // path copies every client header through, so merely omitting the entry would
+  // leave the container's own value standing next to the user's real bearer,
+  // letting an agent choose which account its turn is attributed to. Absence of a
+  // host answer is not permission for the client to supply one.
+  for (const [name, value] of Object.entries(placement.companionHeaders ?? {})) {
+    if (value === null) headers.delete(name);
+    else headers.set(name, value);
+  }
+}
+
+/**
+ * Add a beta flag to `anthropic-beta` without disturbing the client's own.
+ *
+ * MERGE, never set: the flag belongs to the credential FORM the proxy just
+ * substituted in (an OAuth token is a bearer plus `oauth-2025-04-20`), while
+ * the flags already on the request belong to the client's own feature use.
+ * Overwriting would silently switch off whatever the agent asked for; a client
+ * that already sent this flag — Claude Code always does — must see no change at
+ * all, which is why the value is compared before appending.
+ *
+ * Exported for its own tests: this is the only place the header is composed.
+ */
+export function mergeBetaFlag(headers: Headers, flag: string): void {
+  const existing = headers.get('anthropic-beta');
+  if (!existing || !existing.trim()) {
+    headers.set('anthropic-beta', flag);
+    return;
+  }
+  const present = existing.split(',').some((f) => f.trim() === flag);
+  if (present) return;
+  headers.set('anthropic-beta', `${existing.trim()},${flag}`);
 }
 
 /**

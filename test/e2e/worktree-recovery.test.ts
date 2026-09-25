@@ -92,17 +92,27 @@ async function linkTask(
     comments: [],
   });
 
-  const result = await ctx.lazyMocked(
-    ['link', 'https://github.com/org/repo/pull/1'],
-    MOCK_CLAUDE_SUCCESS,
-    { env: { LAZY_MOCK_IMPORT_RESULT: mockImport } },
-  );
+  writeFileSync(join(ctx.protocolBase, 'mock-import-result.json'), mockImport);
 
-  if (result.exitCode !== 0) {
-    throw new Error(`lazy link failed: ${result.stderr}\n${result.stdout}`);
+  try {
+    const result = await ctx.lazyMocked(
+      ['link', 'https://github.com/org/repo/pull/1'],
+      MOCK_CLAUDE_SUCCESS,
+      { env: { LAZY_MOCK_IMPORT_RESULT: mockImport } },
+    );
+
+    if (result.exitCode !== 0) {
+      throw new Error(`lazy link failed: ${result.stderr}\n${result.stdout}`);
+    }
+
+    return extractLinkedTaskCode(result.stdout);
+  } finally {
+    try {
+      rmSync(join(ctx.protocolBase, 'mock-import-result.json'), { force: true });
+    } catch {
+      // gone already
+    }
   }
-
-  return extractLinkedTaskCode(result.stdout);
 }
 
 // ============================================================

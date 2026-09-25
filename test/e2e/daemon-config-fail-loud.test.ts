@@ -142,7 +142,6 @@ describe('daemon startup fails loudly on an unloadable lazy.toml', () => {
     startDaemonServer({
       projectRoot: ctx.root,
       token: 'cfgfail-token',
-      socketPath: socket,
       webPort: port,
       _forceBindWebInTest: true,
     });
@@ -246,7 +245,6 @@ describe('daemon startup fails loudly on an unloadable lazy.toml', () => {
     const daemon = await startDaemonServer({
       projectRoot: ctx.root,
       token: 'cfgfixed-token',
-      socketPath: join(tmpDir, 'fixed.sock'),
       webPort: port,
       _forceBindWebInTest: true,
     });
@@ -286,7 +284,6 @@ describe('daemon startup fails loudly on an unloadable lazy.toml', () => {
     const daemon = await startDaemonServer({
       projectRoot: ctx.root,
       token: 'cfgmissing-token',
-      socketPath: join(tmpDir, 'missing.sock'),
       webPort: port,
       _forceBindWebInTest: true,
     });

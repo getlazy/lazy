@@ -110,7 +110,7 @@ describe('merge turns run under the two guards', () => {
       sleep 60
     `);
 
-    const result = await runSyncWithUpstream(repo, 'main', undefined, undefined, undefined, {
+    const result = await runSyncWithUpstream(repo, 'main', 'test-model', undefined, undefined, {
       noProgressTimeoutMs: 0,
       windDownTimeoutMs: 500,
     });
@@ -135,7 +135,7 @@ describe('merge turns run under the two guards', () => {
     `);
 
     await expect(
-      runSyncWithUpstream(repo, 'main', undefined, undefined, undefined, {
+      runSyncWithUpstream(repo, 'main', 'test-model', undefined, undefined, {
         noProgressTimeoutMs: 1000,
         windDownTimeoutMs: 500,
       }),
@@ -158,7 +158,7 @@ describe('merge turns run under the two guards', () => {
       echo '${RESULT_LINE}'
     `);
 
-    const result = await runSyncWithUpstream(repo, 'main', undefined, undefined, undefined, {
+    const result = await runSyncWithUpstream(repo, 'main', 'test-model', undefined, undefined, {
       noProgressTimeoutMs: 10000,
       windDownTimeoutMs: 5000,
     });

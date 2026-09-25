@@ -173,6 +173,21 @@ function listSandboxSessions(sandboxProjectDir: string): string[] {
   }
 }
 
+/**
+ * Session IDs the agent has written in this task's sandbox, newest-agnostic.
+ *
+ * In-container pairing needs this WITHOUT bridging: the agent reads the sandbox
+ * directly (it is its own `~/.claude`), so the only question left is whether the
+ * session ID lazy stored still names a file that exists. Bridging — creating
+ * host symlinks so a HOST agent can reach the same files — is not part of that
+ * question and must not be a side effect of asking it.
+ */
+export function listSandboxSessionIds(worktreePath: string): string[] {
+  return listSandboxSessions(
+    join(worktreePath, SANDBOX_DIR, '.claude', 'projects', encodeProjectPath(worktreePath)),
+  );
+}
+
 export function bridgeSessionFiles(worktreePath: string, sessionId?: string): BridgeResult {
   const diagnostics: string[] = [];
   const sandboxClaudeDir = join(worktreePath, SANDBOX_DIR, '.claude');

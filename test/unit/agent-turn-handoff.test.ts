@@ -31,7 +31,7 @@ import { FileStorage } from '../../src/storage';
 import { handleCompletedResponses, handleErrorResponse } from '../../src/utils/reconcile';
 import { protocolDir as getProtocolDir } from '../../src/protocol';
 import type { CompletedResponse, ErrorResponse } from '../../src/protocol';
-import { getWorktreePathForRef, taskRef } from '../../src/cli/helpers';
+import { getWorktreePathForRef, taskRef } from '../../src/task/identity';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 import { SANDBOX_DIR } from '../../src/utils/sandbox';
 import {
@@ -39,6 +39,7 @@ import {
   collectTurnHandoff,
   appendTurnHandoff,
   turnHandoffPath,
+  handoffTurnEnding,
   TURN_HANDOFF_FILENAME,
 } from '../../src/supervisor/turn-handoff';
 
@@ -68,13 +69,30 @@ describe('turn handoff file (agent side)', () => {
     expect(await collectTurnHandoff(dir)).toEqual([]);
   });
 
-  test('collects journal entries and follow-ups in order', async () => {
+  test('collects journal entries and raised items in order', async () => {
     await appendTurnHandoff(dir, { kind: 'journal', content: 'Chose X over Y.' });
-    await appendTurnHandoff(dir, { kind: 'followup', content: 'foo.ts swallows errors.' });
+    await appendTurnHandoff(dir, { kind: 'raised', content: 'foo.ts swallows errors.' });
 
     expect(await collectTurnHandoff(dir)).toEqual([
       { kind: 'journal', content: 'Chose X over Y.' },
-      { kind: 'followup', content: 'foo.ts swallows errors.' },
+      { kind: 'raised', content: 'foo.ts swallows errors.' },
+    ]);
+  });
+
+  // INVARIANT: `followup` is the pre-unification spelling and still parses —
+  // an agent that wrote the file with an older prompt must not lose the entry.
+  // It carries no blocking flag, so it lands as a non-blocking raised item.
+  test('the legacy `followup` kind still parses', async () => {
+    await appendTurnHandoff(dir, { kind: 'followup', content: 'orthogonal idea' });
+    expect(await collectTurnHandoff(dir)).toEqual([
+      { kind: 'followup', content: 'orthogonal idea' },
+    ]);
+  });
+
+  test('a raised entry keeps an explicit blocking flag', async () => {
+    await appendTurnHandoff(dir, { kind: 'raised', blocking: true, content: 'How far should this go?' });
+    expect(await collectTurnHandoff(dir)).toEqual([
+      { kind: 'raised', blocking: true, content: 'How far should this go?' },
     ]);
   });
 
@@ -86,16 +104,55 @@ describe('turn handoff file (agent side)', () => {
       'not json at all',
       '{"kind":"nonsense","content":"wrong kind"}',
       '{"kind":"journal"}',
-      '{"kind":"followup","content":"   "}',
+      '{"kind":"raised","content":"   "}',
       '{"kind":"journal","content":"also kept"',   // truncated mid-write
-      '{"kind":"followup","content":"kept too"}',
+      '{"kind":"raised","content":"kept too"}',
       '',
     ].join('\n'));
 
     expect(await collectTurnHandoff(dir)).toEqual([
       { kind: 'journal', content: 'kept' },
-      { kind: 'followup', content: 'kept too' },
+      { kind: 'raised', content: 'kept too' },
     ]);
+  });
+
+  // INVARIANT (final-turn design §2.4): a turn that lost its tool channel can
+  // still say PENCILS DOWN. `final` is the one kind whose content is optional —
+  // it is only the agent's note — because discarding a declaration over a
+  // missing nicety is exactly the silent loss this channel exists to prevent.
+  test('a `final` entry parses with or without a note', async () => {
+    await appendTurnHandoff(dir, { kind: 'final', content: '' });
+    await appendTurnHandoff(dir, { kind: 'final', content: 'migration is reversible' });
+
+    expect(await collectTurnHandoff(dir)).toEqual([
+      { kind: 'final', content: '' },
+      { kind: 'final', content: 'migration is reversible' },
+    ]);
+  });
+
+  // The supervisor asks ONE question of the handoff file before deciding
+  // whether to nudge: did the agent already say how the turn was ending?
+  test('handoffTurnEnding reports a final, a blocking raise, or nothing', async () => {
+    expect(await handoffTurnEnding(dir)).toBeNull();
+
+    await appendTurnHandoff(dir, { kind: 'journal', content: 'just a note' });
+    expect(await handoffTurnEnding(dir)).toBeNull();
+
+    // A blocking raise is the OTHER declared ending, and it suppresses the
+    // nudge for the same reason a final does: the agent already said.
+    await appendTurnHandoff(dir, { kind: 'raised', blocking: true, content: 'Which default?' });
+    expect(await handoffTurnEnding(dir)).toEqual({ ending: 'needs_input' });
+
+    await appendTurnHandoff(dir, { kind: 'final', content: 'done here' });
+    expect(await handoffTurnEnding(dir)).toEqual({ ending: 'final', note: 'done here' });
+  });
+
+  // A NON-blocking raise is a passive note for later triage, not a statement
+  // about where the turn ended — it must not suppress the question.
+  test('a non-blocking raise is not a turn ending', async () => {
+    await appendTurnHandoff(dir, { kind: 'raised', content: 'orthogonal idea' });
+    await appendTurnHandoff(dir, { kind: 'followup', content: 'another one' });
+    expect(await handoffTurnEnding(dir)).toBeNull();
   });
 
   // INVARIANT 2: a file left by a previous turn would be re-journaled against a
@@ -193,6 +250,7 @@ describe('reconciler: persisting an agent handoff', () => {
       agent_handoff: [
         { kind: 'journal', content: 'Chose the handoff file over a daemon-routed CLI.' },
         { kind: 'followup', content: 'The retry path in foo.ts swallows errors.' },
+        { kind: 'raised', blocking: true, content: 'Should the new flag default on?' },
       ],
     };
 
@@ -202,8 +260,14 @@ describe('reconciler: persisting an agent handoff', () => {
     expect(journal.map(e => e.content)).toContain('Chose the handoff file over a daemon-routed CLI.');
     expect(journal.find(e => e.content.startsWith('Chose the handoff'))!.actor).toBe('agent');
 
-    const followUps = await env.storage.getTaskFollowUps(taskId);
-    expect(followUps.map(f => f.content)).toEqual(['The retry path in foo.ts swallows errors.']);
+    // INVARIANT: both handoff spellings land in ONE store. The blocking flag
+    // comes from the entry, never from the kind: a `followup` line (and a
+    // `raised` line without the flag) is non-blocking and does not gate accept.
+    const raised = await env.storage.getTaskRaisedItems(taskId);
+    expect(raised.map(r => [r.content, r.blocking])).toEqual([
+      ['The retry path in foo.ts swallows errors.', false],
+      ['Should the new flag default on?', true],
+    ]);
   });
 
   // INVARIANT 4: the reconciler can re-run over a response it already consumed,

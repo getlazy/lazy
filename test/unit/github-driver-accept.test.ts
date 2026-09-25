@@ -1,4 +1,5 @@
 import { describe, test, expect } from 'bun:test';
+import { ANTHROPIC_DEFAULT_TARGET } from '../../src/utils/role-target';
 import { DEFAULT_CONFIG } from '../../src/config/loader';
 import { GitHubDriver } from '../../src/remote/github-driver';
 import type { Task } from '../../src/types';
@@ -11,16 +12,18 @@ import type { DriverDeps, GhResult } from '../../src/remote/github-driver';
  */
 
 const mockConfig: ResolvedConfig = {
-  models: { default: 'claude-sonnet-4-5-20250929', roles: { builder: { backend: 'anthropic', model: '', endpoint: '' }, agent: { backend: 'anthropic', model: '', endpoint: '' } } },
+  models: { default: 'claude-sonnet-4-5-20250929', roles: { builder: ANTHROPIC_DEFAULT_TARGET, agent: ANTHROPIC_DEFAULT_TARGET } },
   session: { verbose: false, debug: false, auto_commit_instructions: false },
   data: { path: '/tmp/test/.lazy' },
-  storage: { backend: 'external', external_path: '', postgres_ssl: false },
+  storage: { backend: 'external', external_path: '' },
   git: { default_branch_prefix: 'lazy', lfs_check: 'refuse' },
   output: { shortid_length: 8 },
+  agents: {},
   agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0, wind_down_timeout_ms: 0, effort: 'medium' },
+  review: { mode: 'low_high', auto_fix: false, gate: 'auto', draft_effort: 'low', review_effort: 'xhigh' },
   builder: { effort: 'high' },
   chattiness: { default: '', builder: '', agent: '' },
-  server: { port: 3000, sync_interval: 1000, bind: '127.0.0.1' },
+  server: { port: 3000, sync_interval: 1000, bind: '127.0.0.1', dashboard_url: '' },
   remote: {
     driver: 'github',
     git_remote: 'origin',
@@ -31,18 +34,20 @@ const mockConfig: ResolvedConfig = {
     gitlab_auto_push: true,
     gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
   },
-  docker: { dockerfile: '' },
-  runner: { type: 'docker' as const, permission_mode: 'sandbox' as const, sandbox_allowed_domains: ['*.anthropic.com'], sandbox_deny_read: [], sandbox_deny_write: [], sandbox_allow_weaker_nested: false },
+  docker: { dockerfile: '', build_inputs: [], run_args: [] },
+  runner: { type: 'docker' as const, permission_mode: 'sandbox' as const, sandbox_allowed_domains: ['*.anthropic.com'], sandbox_deny_read: [], sandbox_deny_write: [], sandbox_allow_weaker_nested: false, verify_sandbox_boundary: 'off' as const },
   documents: { path: '' },
   features: {},
   worktree: { include: [] },
   permissions: { protected: [] },
   protection: { enabled: false, protected_branches: [], protected_tasks: [], gate_default_branch: true },
-  automation: { maintain: [], pre_accept: { enabled: false, commands: [], timeout: 600 } },
+  automation: { maintain: [], react: [], pre_accept: { enabled: false, commands: [], timeout: 600 }, pre_turn: '', pre_turn_timeout: 120, pre_turn_required: false, post_turn: '', post_turn_timeout: 300, accept_check: '', accept_check_timeout: 300 },
   mounts: [],
-  checks: { post_turn: '', post_turn_timeout: 300 },
-  ollama: { enabled: false, model: '', endpoint: 'http://host.docker.internal:11434' },
-  limits: { max_concurrent_agents: 8, max_concurrent_builders: 8, idle_grace_minutes: 10, max_turns_without_human: 10 },
+  serve: { services: [], start_services_cmd: '' },
+  credentials: { backend: 'auto' },
+  limits: { max_concurrent_builders: 8, max_turns_without_human: 10 },
+  cluster: { max_child_fix_rounds: 3 },
+  usage_pause: { threshold_percent: 0, credentials: {} },
   daemon: {
     auto_react_ci: true,
     auto_react_comments: true,
@@ -68,7 +73,6 @@ function makeTask(overrides?: Partial<Task>): Task {
     prompt: 'Test prompt',
     type: 'task',
     status: 'working' as const,
-    priority: 'normal',
     created_at: Date.now(),
     completed_at: null,
     target: { kind: 'branch' as const, branch: 'main' },
@@ -682,5 +686,82 @@ describe('GitHubDriver checkAcceptGates', () => {
     const warnings = await driver.checkAcceptGates(makeTask());
 
     expect(warnings).toEqual([]);
+  });
+});
+
+describe('GitHubDriver.merge on a resumed accept (real git)', () => {
+  // INVARIANT: the forge SQUASH-merges, so a resumed accept's branch is never an
+  // ancestor of the target, and `isBranchMerged` (an ancestry check) cannot see
+  // a merge that already landed. On a resume the driver must ask the trees and
+  // answer `merged` — never push again and open a replacement PR for work that
+  // is already on the target (the 2026-09-08 incident, forge flavour).
+  async function repoWithLandedSquash(): Promise<{ root: string; cleanup: () => Promise<void> }> {
+    const { mkdtemp, rm, writeFile, realpath } = await import('fs/promises');
+    const { tmpdir } = await import('os');
+    const { join } = await import('path');
+    const base = await realpath(await mkdtemp(join(tmpdir(), 'lazy-gh-resume-')));
+    const bare = join(base, 'origin.git');
+    const root = join(base, 'repo');
+    const sh = (cwd: string, ...args: string[]) => {
+      const r = Bun.spawnSync(['git', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
+      if (r.exitCode !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr.toString()}`);
+    };
+    sh(base, 'init', '--bare', '-b', 'main', bare);
+    sh(base, 'init', '-b', 'main', root);
+    sh(root, 'config', 'user.email', 't@example.com');
+    sh(root, 'config', 'user.name', 'T');
+    await writeFile(join(root, 'base.txt'), 'base\n');
+    sh(root, 'add', '.'); sh(root, 'commit', '-m', 'base');
+    sh(root, 'remote', 'add', 'origin', bare);
+    sh(root, 'push', '-u', 'origin', 'main');
+    sh(root, 'checkout', '-b', 'lazy/child');
+    await writeFile(join(root, 'feature.txt'), 'feature\n');
+    sh(root, 'add', '.'); sh(root, 'commit', '-m', 'feature');
+    // The forge's squash merge, landed on origin/main.
+    sh(root, 'checkout', 'main');
+    sh(root, 'merge', '--squash', 'lazy/child');
+    sh(root, 'commit', '-m', 'Squash PR #7');
+    sh(root, 'push', 'origin', 'main');
+    sh(root, 'reset', '--hard', 'HEAD~1');
+    sh(root, 'fetch', 'origin');
+    return { root, cleanup: () => rm(base, { recursive: true, force: true }) };
+  }
+
+  test('a resume recognises the landed squash and calls no forge', async () => {
+    const { runGit } = await import('../../src/utils/git');
+    const { root, cleanup } = await repoWithLandedSquash();
+    try {
+      const ghCalls: string[][] = [];
+      const driver = new GitHubDriver(mockConfig, {
+        runGh: async (args) => { ghCalls.push(args); return fail('no forge in this test'); },
+        runGit: (args, cwd) => runGit(args, cwd),
+      });
+      const result = await driver.merge({
+        sourceBranch: 'lazy/child', targetBranch: 'main', task: makeTask(), taskShortId: 'child', root, resume: true,
+      });
+      expect(result).toMatchObject({ status: 'merged', alreadyLanded: true });
+      expect(ghCalls).toEqual([]);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  // The ancestry check alone does NOT see it — which is why the resume check exists.
+  test('without resume the ancestry check misses the squash and does not report merged', async () => {
+    const { runGit } = await import('../../src/utils/git');
+    const { root, cleanup } = await repoWithLandedSquash();
+    try {
+      const ghCalls: string[][] = [];
+      const driver = new GitHubDriver(mockConfig, {
+        runGh: async (args) => { ghCalls.push(args); return fail('no forge in this test'); },
+        runGit: (args, cwd) => runGit(args, cwd),
+      });
+      const result = await driver.merge({
+        sourceBranch: 'lazy/child', targetBranch: 'main', task: makeTask(), taskShortId: 'child', root,
+      });
+      expect(result.status).not.toBe('merged');
+    } finally {
+      await cleanup();
+    }
   });
 });

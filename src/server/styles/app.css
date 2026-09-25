@@ -1,317 +1,664 @@
-:root {
-  --bg: #ffffff;
-  --bg-secondary: #f9fafb;
-  --text: #111827;
-  --text-secondary: #6b7280;
-  --border: #e5e7eb;
-  --link: #2563eb;
-  /* ui-monospace is what actually resolves SF Mono on macOS — naming
-     'SF Mono' does not, because it is not exposed to the browser under that
-     name, so the old stack silently fell through to Menlo. */
-  --font-mono: ui-monospace, 'SF Mono', SFMono-Regular, 'Cascadia Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
-  /* Prose, labels and chrome. Code is the exception on this surface, not the
-     rule — only things whose alignment or literalness matters get --font-mono. */
-  --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, 'Helvetica Neue', Arial, sans-serif;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #111827;
-    --bg-secondary: #1f2937;
-    --text: #f9fafb;
-    --text-secondary: #9ca3af;
-    --border: #374151;
-    --link: #60a5fa;
-  }
-}
-* { box-sizing: border-box; margin: 0; padding: 0; }
+/*
+ * The dashboard's own rules: page frame, task detail, turns, commits, notes.
+ *
+ * Everything here is built from Industry's tokens (loaded first) and the roles
+ * theme.css adds on top. No hex literal belongs in this file — a colour that
+ * cannot be said in tokens is a gap in the design system, not a licence to
+ * invent one here.
+ */
+
+/* — page frame —
+   Industry sizes a marketing page: 15px body, a 42px h1. This is a dense
+   operational surface read at a glance, so the type scale steps down one
+   notch. Everything else — family, colour, ground — comes from Industry. */
 body {
-  font-family: var(--font-ui);
   font-size: 14px;
   line-height: 1.6;
-  color: var(--text);
-  background: var(--bg);
   max-width: 1200px;
   margin: 0 auto;
-  padding: 20px;
+  padding: var(--space-6);
 }
-a { color: var(--link); text-decoration: none; }
+
+/* Top-of-viewport bar while a full navigation or tab fragment is in flight.
+   Feedback, not a performance fix: a slow server render must never look like
+   a dead click. Hidden until lzNavProgress.start; pageshow / fragment swap
+   hide it again. */
+.lz-nav-progress {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  z-index: 200;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--color-accent) 20%, transparent);
+  overflow: hidden;
+}
+.lz-nav-progress::after {
+  content: '';
+  display: block;
+  height: 100%;
+  width: 35%;
+  background: var(--color-accent);
+  animation: lz-nav-indeterminate 1.05s ease-in-out infinite;
+}
+@keyframes lz-nav-indeterminate {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(380%); }
+}
+a { text-decoration: none; }
 a:hover { text-decoration: underline; }
-nav {
-  display: flex;
-  gap: 16px;
-  align-items: center;
-  padding: 12px 0;
-  border-bottom: 1px solid var(--border);
-  margin-bottom: 24px;
+h1 { font-size: 24px; margin: 0 0 var(--space-4); }
+h2 { font-size: 18px; margin: var(--space-8) 0 var(--space-3); }
+h3 { font-size: 16px; margin: var(--space-6) 0 var(--space-2); }
+
+/* — navigation —
+   Industry's `.nav` is full-bleed; this page is a centred column, so the nav
+   loses the horizontal gutter and gains the rule that separates it from the
+   page. `.nav` sets the `padding` shorthand, so both edges are restated. */
+nav.nav {
+  padding: var(--space-3) 0;
+  border-bottom: 1px solid var(--color-divider);
+  margin-bottom: var(--space-8);
 }
-nav .brand { font-weight: bold; font-size: 16px; }
-nav .sep { color: var(--text-secondary); }
 .search-form { margin-left: auto; }
-.search-form input {
-  font-family: var(--font-ui);
-  font-size: 13px;
-  padding: 4px 8px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  background: var(--bg-secondary);
-  color: var(--text);
-  width: 200px;
-}
-h1 { font-size: 18px; margin-bottom: 16px; }
-h2 { font-size: 16px; margin: 24px 0 12px; }
-table {
-  width: 100%;
-  border-collapse: collapse;
-  margin-bottom: 24px;
-  font-family: var(--font-mono);
-  font-size: 13px;
-}
-/* Goal/prose cells opt back out of the tabular font. */
-td.goal, td.wrap, th { font-family: var(--font-ui); }
-th, td {
-  text-align: left;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border);
-  white-space: nowrap;
-}
-th {
-  color: var(--text-secondary);
-  font-weight: normal;
-  font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-}
-td.goal { white-space: normal; max-width: 400px; }
-td.wrap { white-space: normal; }
-tr:hover { background: var(--bg-secondary); }
-.badge {
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 4px;
-  font-size: 12px;
-  color: #fff;
-}
+.search-form .input { width: 220px; min-height: 30px; padding: 3px 8px; font-size: 13px; }
+
+/* — tables —
+   Industry's `.table` supplies the frame; the tabular font and the wrapping
+   rules are this surface's own. Ids, shas, branches and timestamps are literal
+   strings where a stray ligature or a proportional digit is a readability bug;
+   prose cells opt back out. */
+.table { margin-bottom: var(--space-8); font-family: var(--font-mono); font-size: 13px; }
+.table th, .table td { white-space: nowrap; }
+.table th { font-family: var(--font-body); }
+.table td.goal, .table td.wrap { font-family: var(--font-body); white-space: normal; }
+.table td.goal { max-width: 400px; }
+
+/* — task detail —
+   A framed region per section, the way lazy-teams frames a panel. */
 .detail-section {
-  margin-bottom: 24px;
-  padding: 16px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg-secondary);
+  margin-bottom: var(--space-8);
+  padding: var(--space-4);
+  border: 1px solid var(--color-divider);
+  background: var(--color-surface);
 }
 .detail-section h2 { margin-top: 0; }
-.detail-row {
-  display: flex;
-  gap: 8px;
-  padding: 4px 0;
-}
+.detail-row { display: flex; gap: var(--space-2); padding: var(--space-1) 0; }
 .detail-label {
-  color: var(--text-secondary);
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
   min-width: 140px;
   flex: none;
 }
-/* Detail values are ids, shas, branches and timestamps — literal strings where
-   a stray ligature or proportional digit is a readability bug. */
 .detail-row > span:last-child { font-family: var(--font-mono); }
 .detail-row > span:last-child a { font-family: inherit; }
-.turn-chunk {
-  margin-bottom: 16px;
-  padding: 8px 8px 4px 8px;
-  border-left: 3px solid var(--border);
-  background: var(--bg-secondary);
-  border-radius: 4px;
+
+/* Signal block at the top of /tasks/:id — goal, status, parent only.
+   Everything else lives in the collapsed Metadata <details> below. */
+.task-signal {
+  margin-bottom: var(--space-6);
 }
-.turn-chunk-header {
-  font-size: 11px;
-  font-weight: 600;
+.task-goal {
+  font-size: 18px;
+  line-height: 1.4;
+  margin: 0 0 var(--space-3);
+}
+.task-signal-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: center;
+}
+.task-parent {
+  font-size: 13px;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}
+.task-parent a { font-family: var(--font-mono); }
+
+/* Collapsed by default: agent, model, tokens, branch, session, ids. */
+.task-metadata summary {
+  cursor: pointer;
+  font-family: var(--font-heading);
+  font-weight: var(--font-heading-weight);
+  font-size: 14px;
+  list-style: none;
+}
+.task-metadata summary::-webkit-details-marker { display: none; }
+.task-metadata summary::before {
+  content: '▸ ';
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}
+.task-metadata[open] summary::before { content: '▾ '; }
+.task-metadata summary + .detail-row,
+.task-metadata .task-metadata-subhead { margin-top: var(--space-3); }
+.task-metadata-subhead {
+  font-size: 13px;
+  margin: var(--space-4) 0 var(--space-2);
+  color: color-mix(in srgb, var(--color-text) 60%, transparent);
   text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--text-secondary);
-  margin-bottom: 8px;
+  letter-spacing: 0.06em;
 }
+
+.turns-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+.turns-heading h2 { margin: 0; }
+.chunk-order-toggle {
+  font-size: 12px;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}
+/* Why turns are grouped: the rule is not a UI concept, so say it in one line. */
+.turns-chunk-explain {
+  font-size: 12px;
+  color: color-mix(in srgb, var(--color-text) 60%, transparent);
+  margin: 0 0 var(--space-3);
+}
+
+/* — turns —
+   A chunk is a review boundary: one human turn plus everything it caused, and
+   it is also the UNIT OF REVIEW — a viewable card (`.md-card`) with its own
+   tick, collapse and j/k stop. The accent edge marks it as one thing; the
+   turns inside are plain <details>, not cards, so they never look like
+   separate items to work through. */
+.turn-chunk {
+  margin-bottom: var(--space-4);
+  border-left: 3px solid var(--color-accent);
+  background: var(--color-surface);
+}
+.turn-chunk > .md-card-head { align-items: baseline; flex-wrap: wrap; }
+.turn-chunk-header {
+  font-family: var(--font-heading);
+  font-weight: var(--font-heading-weight);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: color-mix(in srgb, var(--color-text) 60%, transparent);
+}
+/* What the human asked for, at the top of the chunk they asked it in —
+   newest-first puts their actual turn at the BOTTOM of its own chunk. */
+.turn-chunk-intent {
+  display: block;
+  margin-top: var(--space-1);
+  font-size: 13px;
+  color: var(--color-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.turn-chunk-body { background: var(--color-bg); }
+/* One turn inside a chunk. Collapsible on its own, but visibly a part of the
+   chunk rather than a card beside it: a rule, not a border box. */
+.chunk-turn, .chunk-note {
+  border-bottom: 1px solid var(--color-divider);
+  padding: var(--space-2) 0;
+}
+.chunk-turn:last-child, .chunk-note:last-child { border-bottom: 0; }
+.chunk-turn-head, .chunk-note-head {
+  cursor: pointer;
+  font-size: 12px;
+  color: color-mix(in srgb, var(--color-text) 60%, transparent);
+  list-style-position: outside;
+}
+.chunk-turn-head:hover, .chunk-note-head:hover { color: var(--color-text); }
+.chunk-turn > .turn-content, .chunk-note > .note-content { margin-top: var(--space-2); }
+/* Where the turn sits in the task — "3 of 9". Quiet: the sequence beside it is
+   the identifier links are written against; this is the orientation. */
+.turn-ordinal {
+  font-size: 11px;
+  color: color-mix(in srgb, var(--color-text) 45%, transparent);
+}
+/* "Ran as": which agent, model and effort launched this turn. Always present,
+   so its absence can never be mistaken for a rendering gap — a turn lazy wrote
+   itself says so in words and is dimmed to match. */
+.turn-ran-as {
+  margin-top: var(--space-1);
+  font-size: 11px;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}
+.turn-ran-as-label {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: color-mix(in srgb, var(--color-text) 40%, transparent);
+}
+.turn-ran-as-value { font-family: var(--font-mono); }
+.turn-ran-as-none .turn-ran-as-value {
+  font-family: var(--font-body);
+  font-style: italic;
+}
+/* Timestamps: relative text to scan, exact time in the tooltip. */
+.lz-when {
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+  border-bottom: 1px dotted color-mix(in srgb, var(--color-text) 25%, transparent);
+  cursor: help;
+}
+/* Automation provenance — an auto-resume or nudge turn, not the human's. */
 .turn-auto {
   display: inline-block;
   font-size: 10px;
   padding: 0 5px;
-  border-radius: 3px;
-  background: var(--border);
-  color: var(--text-secondary);
+  background: var(--color-neutral-100);
+  color: color-mix(in srgb, var(--color-text) 60%, transparent);
 }
 .turn {
-  margin-bottom: 12px;
-  padding: 12px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  background: var(--bg);
+  margin-bottom: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--color-divider);
+  background: var(--color-bg);
 }
 .turn-header {
   font-size: 12px;
-  color: var(--text-secondary);
-  margin-bottom: 8px;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+  margin-bottom: var(--space-2);
   display: flex;
   justify-content: space-between;
   align-items: center;
 }
 .turn-tokens {
-  color: var(--text-secondary);
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
   font-size: 11px;
-  margin-left: 8px;
+  margin-left: var(--space-2);
 }
 /* Which agent/model/effort a turn ran under — same weight as the token counts:
    present on every turn, but never louder than the turn itself. */
 .turn-launch {
-  color: var(--text-secondary);
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
   font-size: 11px;
-  margin-left: 8px;
+  margin-left: var(--space-2);
 }
-.turn-content {
-  font-family: var(--font-ui);
-  font-size: 13px;
-  max-height: 300px;
-  overflow-y: auto;
+.turn-model-warning {
+  color: var(--color-warning, #b45309);
+  font-size: 11px;
+  margin-left: var(--space-2);
 }
-.turn-content p { margin-bottom: 8px; }
+/* Work this turn left in the worktree and never committed — so it is in no
+   diff, no walkthrough and no merge. Danger weight, not warning: unlike a model
+   mismatch, what this names is about to disappear. */
+.turn-uncommitted {
+  color: var(--color-danger, #b91c1c);
+  font-weight: 600;
+  font-size: 11px;
+  margin-left: var(--space-2);
+}
+.turn-unparsed {
+  color: var(--color-danger, #b91c1c);
+  font-weight: 600;
+  font-size: 11px;
+  margin-left: var(--space-2);
+}
+/* INVARIANT: rendered markdown is never a scroll container. No max-height and
+   no overflow-y here — a card shows its full text, however tall, and a reader
+   who is done with it ticks "Viewed" to collapse it (see cards.css). A 300px
+   scroll box inside a scrolling page made the page unreadable and hid the end
+   of every long turn and report. `pre { overflow-x: auto }` below is a
+   different thing: a long LINE, not a long card. */
+.turn-content { font-size: 13px; }
+.turn-content p { margin-bottom: var(--space-2); }
 .turn-content pre {
-  background: var(--bg-secondary);
-  padding: 8px;
-  border-radius: 4px;
+  background: var(--color-neutral-100);
+  border: 1px solid var(--color-divider);
+  padding: var(--space-2);
   overflow-x: auto;
-  margin: 8px 0;
+  margin: var(--space-2) 0;
 }
-.turn-content code {
-  font-family: var(--font-mono);
-  font-size: 12px;
-}
+.turn-content code { font-family: var(--font-mono); font-size: 12px; }
 .turn-content p code {
-  background: var(--bg-secondary);
+  background: var(--color-neutral-100);
   padding: 1px 4px;
-  border-radius: 2px;
 }
 .turn-content h1, .turn-content h2, .turn-content h3,
 .turn-content h4, .turn-content h5, .turn-content h6 {
-  margin: 12px 0 6px;
+  margin: var(--space-3) 0 var(--space-1);
   font-size: 14px;
 }
 .turn-content h1 { font-size: 16px; }
 .turn-content h2 { font-size: 15px; }
-.turn-content ul, .turn-content ol {
-  margin: 4px 0 8px 20px;
-}
+.turn-content ul, .turn-content ol { margin: var(--space-1) 0 var(--space-2); padding-left: var(--space-6); }
 .turn-content blockquote {
-  border-left: 3px solid var(--border);
-  padding-left: 12px;
-  color: var(--text-secondary);
-  margin: 8px 0;
+  border-left: 3px solid var(--color-divider);
+  padding-left: var(--space-3);
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+  margin: var(--space-2) 0;
 }
 .turn-content hr {
   border: none;
-  border-top: 1px solid var(--border);
-  margin: 12px 0;
+  border-top: 1px solid var(--color-divider);
+  margin: var(--space-3) 0;
 }
-.commit-row {
-  padding: 8px 0;
-  border-bottom: 1px solid var(--border);
-}
-.commit-sha {
-  font-family: var(--font-mono);
-  font-weight: bold;
-}
-.commit-message {
-  color: var(--text);
-}
-.note {
-  padding: 12px;
-  margin-bottom: 8px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  background: var(--bg);
-}
-.note-date {
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-.note-content {
-  white-space: pre-wrap;
-  margin-top: 4px;
-}
-.filter-bar {
-  display: flex;
-  gap: 8px;
-  margin-bottom: 16px;
-}
-.filter-bar a {
-  padding: 4px 12px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
+
+/* Markdown pipe tables. Cells wrap rather than the table scrolling — a card is
+   never a scroll container, and a verification table is exactly the thing a
+   reviewer must be able to read at a glance. */
+.md-table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: var(--space-2) 0;
   font-size: 13px;
 }
-.filter-bar a.active {
-  background: var(--link);
-  color: #fff;
-  border-color: var(--link);
+.md-table th, .md-table td {
+  border: 1px solid var(--color-divider);
+  padding: 4px 8px;
+  text-align: left;
+  vertical-align: top;
 }
+.md-table th {
+  font-family: var(--font-heading);
+  font-weight: var(--font-heading-weight);
+  background: color-mix(in srgb, var(--color-text) 5%, transparent);
+}
+
+/* — commits and notes — */
+.commit-row {
+  padding: var(--space-2) 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--color-text) 8%, transparent);
+}
+.commit-sha { font-family: var(--font-mono); color: var(--color-accent); }
+.commit-message { color: var(--color-text); }
+/* Commits nested under the agent/work turn that produced them. */
+.turn-commits {
+  margin: 0 0 var(--space-3) var(--space-4);
+  padding-left: var(--space-3);
+  border-left: 2px solid color-mix(in srgb, var(--color-text) 12%, transparent);
+}
+.note {
+  padding: var(--space-3);
+  margin-bottom: var(--space-2);
+  border: 1px solid var(--color-divider);
+  background: var(--color-bg);
+}
+.note-date { font-size: 12px; color: color-mix(in srgb, var(--color-text) 55%, transparent); }
+/* Note bodies (comments, journal entries, follow-ups) are rendered markdown —
+   they carry `.turn-content` too, for its heading/list/code styling. No
+   `white-space: pre-wrap` here: the renderer already produces the block
+   structure, and pre-wrap would turn the markup's own indentation into gaps.
+   No max-height override any more: nothing scrolls inside a card, so there is
+   nothing left to override. */
+.note-content { margin-top: var(--space-1); }
+
+/* — chrome —
+   Filters and actions are `.btn`s in the markup; only their arrangement and
+   the active state live here. */
+.filter-bar { display: flex; gap: var(--space-2); margin-bottom: var(--space-4); flex-wrap: wrap; }
+.filter-bar a.active {
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+  color: var(--color-bg);
+}
+.action-links { display: flex; gap: var(--space-3); margin-bottom: var(--space-4); flex-wrap: wrap; align-items: flex-start; }
+.action-links a.active {
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+  color: var(--color-bg);
+}
+
+/* Lifecycle action row on /tasks/:id — buttons open the shared action dialog
+   so a reason form never reflows the page. Without JS the forms sit in
+   <noscript> next to each template. */
+.prompt-link { margin: 0 var(--space-2) var(--space-1) 0; }
+.review-link { font-size: 11px; white-space: nowrap; margin-left: 6px; }
+
+/* — empty states —
+   A dashed frame says "nothing here yet" without the corner marks a real
+   object wears. Same construction as lazy-teams'. */
 .empty-state {
-  color: var(--text-secondary);
-  padding: 40px;
+  border: 1px dashed var(--color-divider);
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+  padding: var(--space-8);
   text-align: center;
 }
+
+/* — search — */
 .search-result {
-  padding: 12px;
-  margin-bottom: 8px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
+  padding: var(--space-3);
+  margin-bottom: var(--space-2);
+  border: 1px solid var(--color-divider);
 }
 .search-result-type {
+  font-family: var(--font-heading);
+  font-weight: var(--font-heading-weight);
   font-size: 11px;
   text-transform: uppercase;
-  color: var(--text-secondary);
-  letter-spacing: 0.5px;
+  letter-spacing: 0.08em;
+  color: var(--color-accent);
 }
 .search-result-context {
   white-space: pre-wrap;
-  font-size: 13px;
-  color: var(--text-secondary);
-  margin-top: 4px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: color-mix(in srgb, var(--color-text) 65%, transparent);
+  margin-top: var(--space-1);
   max-height: 100px;
   overflow: hidden;
 }
-.prompt-link {
-  display: inline-block;
-  padding: 4px 12px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  font-size: 13px;
-  margin-right: 8px;
-  margin-bottom: 4px;
+
+/* — search: the inline query-language cheat sheet — */
+.search-help {
+  border: 1px solid var(--color-divider);
+  margin: var(--space-3) 0 var(--space-5);
+  max-width: 900px;
 }
+.search-help > summary {
+  cursor: pointer;
+  padding: var(--space-2) var(--space-3);
+  font-family: var(--font-heading);
+  font-weight: var(--font-heading-weight);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--color-accent);
+}
+.search-help-body {
+  padding: 0 var(--space-3) var(--space-3);
+  border-top: 1px solid var(--color-divider);
+}
+.search-help-section {
+  margin-top: var(--space-3);
+}
+.search-help-section h3 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin: 0 0 var(--space-1);
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
+}
+.search-help-list {
+  display: grid;
+  /* One fixed first column across every section, so the syntax and the prose
+     line up down the whole panel rather than per-section. */
+  grid-template-columns: minmax(0, 230px) minmax(0, 1fr);
+  gap: 2px var(--space-3);
+  margin: 0;
+  font-size: 13px;
+}
+.search-help-list dt {
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+.search-help-list dd {
+  margin: 0;
+  color: color-mix(in srgb, var(--color-text) 75%, transparent);
+}
+.search-help-notes,
+.search-help-examples {
+  margin: 0;
+  padding-left: var(--space-4);
+  font-size: 13px;
+}
+.search-help-notes li,
+.search-help-examples li {
+  margin-bottom: var(--space-1);
+  color: color-mix(in srgb, var(--color-text) 75%, transparent);
+}
+.search-help-example code {
+  font-family: var(--font-mono);
+}
+.search-hint {
+  white-space: pre-wrap;
+  font-size: 13px;
+  border-left: 3px solid var(--color-accent);
+  padding: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-4);
+  max-width: 900px;
+}
+
+/* — command palette (Cmd/Ctrl+K) — */
+dialog.lz-palette {
+  width: min(640px, calc(100vw - 40px));
+  padding: 0;
+  overflow: hidden;
+}
+.lz-palette-close {
+  display: flex;
+  justify-content: flex-end;
+  padding: var(--space-3) var(--space-4) 0;
+}
+.lz-palette-body {
+  padding: 0 var(--space-4) var(--space-4);
+}
+.lz-palette-input {
+  width: 100%;
+  font-size: 16px;
+  padding: 10px 12px;
+}
+.lz-palette-hint {
+  font-size: 12px;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+  min-height: 1.2em;
+  margin: var(--space-2) 0;
+}
+.lz-palette-results {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: min(420px, calc(100vh - 220px));
+  overflow: auto;
+  border: 1px solid var(--color-divider);
+}
+.lz-palette-item {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--color-divider);
+  cursor: pointer;
+}
+.lz-palette-item:last-child { border-bottom: 0; }
+.lz-palette-item-active,
+.lz-palette-item:hover {
+  background: color-mix(in srgb, var(--color-accent) 12%, var(--color-bg));
+}
+.lz-palette-item-primary {
+  font-size: 14px;
+  line-height: 1.35;
+}
+.lz-palette-item-secondary {
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: color-mix(in srgb, var(--color-text) 60%, transparent);
+  margin-top: 2px;
+  white-space: pre-wrap;
+  max-height: 3.2em;
+  overflow: hidden;
+}
+.lz-palette-empty {
+  padding: 16px 12px;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+  font-size: 13px;
+}
+
+dialog.lz-create-dialog {
+  width: min(720px, calc(100vw - 40px));
+  max-height: calc(100vh - 40px);
+  padding: 0;
+  overflow: hidden;
+}
+.lz-create-dialog-close {
+  display: flex;
+  justify-content: flex-end;
+  padding: var(--space-3) var(--space-4) 0;
+}
+.lz-create-dialog-body {
+  overflow: auto;
+  max-height: calc(100vh - 80px);
+  padding: 0 var(--space-8) var(--space-8);
+}
+.lz-create-dialog-title {
+  margin: 0 0 var(--space-3);
+  font-size: 1.15rem;
+}
+.lz-create-form .input,
+.lz-create-form textarea,
+.lz-create-form select {
+  width: 100%;
+}
+
 .breadcrumb {
   font-size: 13px;
-  color: var(--text-secondary);
-  margin-bottom: 16px;
-}
-.breadcrumb a { color: var(--link); }
-.action-links {
-  display: flex;
-  gap: 12px;
-  margin-bottom: 16px;
-}
-.action-links a {
-  padding: 6px 16px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  font-size: 13px;
-}
-.action-links a.primary {
-  background: var(--link);
-  color: #fff;
-  border-color: var(--link);
-}
-.review-link {
-  font-size: 11px;
-  white-space: nowrap;
-  margin-left: 6px;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+  margin-bottom: var(--space-4);
 }
 .protection-note {
-  color: var(--text-secondary);
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
   font-size: 0.9em;
   margin-top: 0.25em;
 }
+
+/*
+ * Anything the page scrolls to clears the chrome stuck above it.
+ *
+ * Sticky card headers made this mandatory rather than merely nice: without it,
+ * following a permalink parks the target UNDERNEATH the very header that was
+ * made sticky to keep it identifiable — the feedback inverted. `:target` covers
+ * every fragment link on every page (a file section, a diff line, a turn, a
+ * chunk note, a presentation group, a raised panel); the selectors beside it
+ * cover what scripts scroll to WITHOUT a hash, where :target never matches.
+ *
+ * `--lz-sticky-top` is the measured height of ALL the chrome stuck above a card
+ * — the tab strip plus the diff toolbar, which parks under the strip and above
+ * the cards (review-navigation.ts publishes it; it is 0 where nothing sticks).
+ * Its companion `--lz-strip-top` is the strip ALONE, and is for the toolbar's
+ * own `top` only: anything that has to clear everything wants this one.
+ * diff.css and cards.css refine this for diff rows and cards, and come after
+ * this file in STYLESHEET_PARTS.
+ */
+:target,
+.rv-pres-group,
+[data-raised-id] {
+  scroll-margin-top: calc(var(--lz-sticky-top, 0px) + 8px);
+}
+
+/* A turn or a chunk note lives INSIDE a card whose header is sticky too, so it
+   has to clear both — same reason diff rows do. */
+.chunk-note,
+[id^="turn-"] {
+  scroll-margin-top: calc(var(--lz-sticky-top, 0px) + 3rem);
+}
+
+/* — the Loops page —
+   One card per loop task: heading, derived k-of-n line, children table. The
+   card is a container rather than a row because a loop is a small tree and the
+   page's job is showing where each one is without a click. */
+.lz-clusters-explainer { max-width: 72ch; }
+.lz-clusters-create { margin-bottom: var(--space-6); }
+.lz-clusters-create > summary { cursor: pointer; font-weight: 600; }
+.lz-cluster-card {
+  border: 1px solid var(--color-divider);
+  background: var(--color-surface);
+  border-radius: 6px;
+  padding: var(--space-4);
+  margin-bottom: var(--space-6);
+}
+.lz-cluster-card-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin: 0;
+  font-size: 16px;
+}
+.lz-cluster-goal { font-weight: 400; }
+.lz-cluster-meta { margin: var(--space-1) 0 var(--space-2); font-size: 13px; }
+.lz-cluster-card .lz-cluster-progress { margin-bottom: var(--space-3); }
+.lz-clusters-children { margin-bottom: 0; }
+.lz-clusters-empty-children { margin: 0; }

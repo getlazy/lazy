@@ -138,6 +138,40 @@ describe('sync retry', () => {
       expect(taskData.pending_sync).toBe(0);
     });
 
+    // INVARIANT: the retry loop reaches every status sync can be DISPATCHED
+    // from, and `submitted` is one of them (src/task/sync-dispatch.ts).
+    //
+    // The loop used to carry its own list of three, missing `submitted`. That
+    // was invisible while a synced task always landed back in `blocked` — the
+    // next tick caught its pending_sync under the other label. Once a sync
+    // restores `submitted`, a submitted task whose fetch failed would hold a
+    // counter nobody drains and fall quietly behind its parent with its PR open.
+    test('attempts sync for submitted tasks with pending_sync > 0', async () => {
+      const taskId = await createTask(ctx, 'Submitted sync test', 'Do work');
+
+      const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
+        env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
+      });
+      expectSuccess(startResult);
+
+      setTaskStatus(ctx.root, taskId, 'submitted');
+      setTaskPendingSync(ctx.root, taskId, 1);
+
+      const backoffState = new Map();
+      const result = await runSyncRetryTick(ctx.root, backoffState);
+
+      // The load-bearing assertion: the task was VISITED. A filter that skips
+      // `submitted` leaves `attempted` empty and the counter untouched.
+      expect(result.attempted).toHaveLength(1);
+
+      // Local driver, no upstream changes — the sync resolves `up_to_date` and
+      // drains the counter, which is the debt the loop exists to clear.
+      const taskData = readTaskJson(ctx.root, taskId);
+      expect(taskData.pending_sync).toBe(0);
+      // And the visit did not cost the task its label.
+      expect(taskData.status).toBe('submitted');
+    });
+
     // INVARIANT: Unblock proceeds even when pending_sync > 0.
     // Unblock has zero dependency on sync — the sync debt is not forgotten,
     // it stays for the retry loop to pick up when the task blocks again.

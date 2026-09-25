@@ -1,3 +1,5 @@
+import { isRunningProcessSync } from '../../src/utils/process-identity';
+
 /**
  * A PID that is guaranteed NOT to name a live process.
  *
@@ -28,3 +30,26 @@ export function findDeadPid(): number {
 
 /** Memoized `findDeadPid()` — the answer cannot become wrong mid-run. */
 export const DEAD_PID = findDeadPid();
+
+/**
+ * Is this pid a process that is still RUNNING — as opposed to merely present?
+ *
+ * `process.kill(pid, 0)` answers "does the pid exist in the process table", and
+ * a ZOMBIE answers yes. That distinction is normally academic and is exactly not
+ * academic here: every suite that asserts an agent died first kills the process
+ * that was its PARENT, so the agent is reparented to PID 1 and stays a zombie
+ * until PID 1 reaps it. Whether that happens promptly is a property of the
+ * ENVIRONMENT, not of the code under test — this project's agent container runs
+ * `docker-init` (tini) as PID 1, which reaps (verified: an orphaned child left
+ * no `/proc` entry), but a CI container running the test process itself as PID 1
+ * would not. Keying on `kill(pid, 0)` alone would therefore fail for a process
+ * that is genuinely dead, and the failure would read as though the fix regressed.
+ *
+ * The procfs-vs-`ps` split and the "cannot tell means running" rule belong to
+ * src/utils/process-identity.ts, which owns process reading for the storage
+ * lock; this is a named re-export so the test suites read the intent rather
+ * than the mechanism.
+ */
+export function isProcessRunning(pid: number): boolean {
+  return isRunningProcessSync(pid);
+}

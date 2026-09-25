@@ -1,7 +1,7 @@
 # Shared memory
 
 Lazy owns a shared memory store: many small, named records of **curated,
-cross-task knowledge** — who the engineer is, guidance they gave and why,
+cross-task knowledge** — who the user is, guidance they gave and why,
 project constraints that aren't derivable from the code, and pointers to
 external resources.
 
@@ -12,7 +12,7 @@ Once the store grows, `lazy memory compact` replaces that index with a smaller
 
 ```bash
 lazy memory list                     # the index
-lazy memory show vm-credentials-idea # one record in full
+lazy memory show deploy-checklist # one record in full
 lazy memory save <name> -t project -d "one line"   # create or update
 lazy memory rm <name>                # tombstone (history preserved)
 lazy memory history [<name>]         # who wrote what, when
@@ -24,16 +24,14 @@ lazy search 'in:memories "credentials"'            # search bodies
 
 Claude Code has its own memory feature that writes markdown files into the
 harness's memory directory. In lazy, that directory lives **inside each
-builder's per-builder projects overlay** (`<data>/builder-projects/<id>/…`).
-Consequences, all verified in practice:
+builder's own projects directory**. As a result that memory is:
 
-- never shared between builders (seeding copies only session JSONLs),
-- garbage-collected by the overlay prune,
+- never shared between builders,
+- cleaned up along with the builder's directory,
 - invisible to agents and to other machines,
 - outside lazy state entirely (not in storage, not searchable, not backed up).
 
-Months of builder sessions accumulated zero shared memory. Lazy memory replaces
-it: storage-backed, actor-attributed, searchable, and injected where it's
+Lazy memory replaces it: storage-backed, actor-attributed, searchable, and injected where it's
 actually needed. Builder and agent prompts explicitly redirect from the harness
 feature to `lazy_memory_*` — the harness feature cannot be disabled, so the
 prompts tell the model not to use it.
@@ -46,8 +44,8 @@ memory section is replaced with an explicit marker — `MEMORY INDEX UNAVAILABLE
 `lazy_memory_recall` / `lazy_search`, and the underlying error is logged loudly.
 This is deliberately *not* the same as the empty-section case: rendering nothing
 would say "this project has no recorded knowledge", turning an unreadable store
-into apparent absence of knowledge. All five agent launch paths and the builder
-share the same renderer, so they behave identically.
+into apparent absence of knowledge. Every agent launch and the builder behave
+identically here.
 
 ## Compaction
 
@@ -112,8 +110,7 @@ Five rules define the feature:
    and what actually helps. The comparison is made on the **assembled body** —
    the summary plus the compact's own explanatory preamble plus any newer
    records injected alongside it — versus that same body with no compact, since
-   that is what a prompt really pays for. (Comparing the raw summary text to the
-   raw index is how a 6.0KB → 6.4KB run once reported success.) A consequence
+   that is what a prompt really pays for. A consequence
    worth knowing: the preamble is a fixed cost, and one-line descriptions are
    already dense, so a small or already-tight store *cannot* be compacted below
    its plain index — mechanical compaction only starts paying for itself at
@@ -151,12 +148,45 @@ as its live index line, superseding the summary) and every name removed since.
 When nothing is outstanding it says so explicitly, so "is my newest memory
 actually reaching sessions?" is answerable without launching anything.
 
+### In the browser
+
+The daemon's web UI serves the same store under **Settings → Memories** (the
+dashboard's address is printed by `lazy daemon status`):
+
+- **`/settings/memory`** — the live index, one row per record. `?all=1` includes
+  removed records (tombstones; the write history is kept). `/memory` redirects
+  here.
+- **`/memory/new`** and **`/memory/<name>`** — create, read, and edit a
+  record. These are the same writes as `lazy memory save` / `lazy memory rm`:
+  a human surface, so they may write. Task agents stay read-only.
+- **`/memory/compact`** — the current compact (exactly the derived summary
+  injected into launches), its size against `[memory] warn_bytes`, and whether
+  any records have been written or removed since it. **Run compact** uses the
+  same modes as the CLI (`auto`, mechanical, llm) and streams progress so a
+  model call is never a silent wait. Clearing the compact is always safe:
+  injection falls back to the full index.
+
+The pages work with JavaScript turned off. Lazy Teams offers the same pages
+under a project's **Memory** tab — list, read, create, edit, remove, and run or
+clear the compact, with the same size figures and the same list of records the
+compact does not cover — writing to the same store, so it reads the same either
+way. Any team member can write there; people viewing as someone else cannot.
+
+Every write names who made it. The record page and its write history show the
+person — on a laptop, the git identity the daemon runs with; in Lazy Teams, the
+signed-in member — and fall back to the role (`human`) for older records.
+
+In Lazy Teams, an **Auto** or **LLM** compact runs a model on the Claude account
+of the member who pressed **Run compact**, and is refused if they have not
+connected one; **Mechanical** runs no model and needs no account. The page
+shows each step while the compact runs.
+
 ## Memory vs journal vs CLAUDE.md
 
 | | scope | injected into prompts? | who writes |
 |---|---|---|---|
 | **CLAUDE.md** | how to work in this repo | read by Claude Code automatically | humans, in git |
-| **Journal** (`lazy journal`) | one task | **never** — prompt-immune by design | humans, builder, agents |
+| **Journal** (`lazy journal`) | one task | **entry text, never** — the agent's prompt gets a one-line count of new entries and reads them on demand | humans, builder, agents |
 | **Memory** (`lazy memory`) | the project, across tasks | yes — the index, on every launch | humans, builder |
 
 The journal is the *raw per-task record* ("chose K=3 because…", "stubbed retry").
@@ -175,7 +205,7 @@ memory record — promoting it is a deliberate act, not automatic.
 
 Types mirror the harness categories so imported records keep their meaning:
 
-- `user` — who the engineer is (role, expertise, preferences)
+- `user` — who the user is (role, expertise, preferences)
 - `feedback` — guidance they've given about how to work, **with the why**
 - `project` — goals and constraints not derivable from code or git history
 - `reference` — pointers to external resources (dashboards, tickets, docs)
@@ -249,7 +279,7 @@ lazy doctor --import-memory --yes  # non-interactive
 ```
 
 It scans the shared `~/.claude/projects/<encoded-cwd>/memory/` directory **and
-every per-builder overlay** under `<data>/builder-projects/*/`, dedupes by
+every builder's own projects directory**, dedupes by
 record name (newest copy wins), and imports what lazy doesn't already have.
 Imported records are attributed to `system` — lazy performed the write, and the
 harness format doesn't record who authored the file.
@@ -271,14 +301,13 @@ declining just prints the `lazy doctor --import-memory` hint.
 
 ## Storage
 
-Memory lives behind the Storage interface like every other entity — records
-plus an append-only write history — and is implemented in all three backends
-(file, Postgres, daemon-remote). With file storage that is `memories.json` and
-`memory-history.json` under the storage root; never read or write those
-directly.
+Memory lives in lazy's store like every other entity — records plus an
+append-only write history. With file storage that is `memories.json` and
+`memory-history.json` under the storage root; use `lazy memory` or the web UI
+rather than editing those files directly.
 
-The compact is stored separately as a single overwritable slot (`memory-compact.json`
-with file storage, one row in Postgres) with no history and no lock: it is derived
-state, so overwriting it destroys nothing and last-writer-wins is harmless — both
-writers regenerated from the same records. Deleting it is always safe; injection
+The compact is stored separately as a single overwritable slot
+(`memory-compact.json` with file storage) with no history: it is derived state,
+so overwriting it destroys nothing — every run regenerates it from the same
+records. Deleting it is always safe; injection
 falls back to the full index.

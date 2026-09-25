@@ -38,12 +38,25 @@ export interface McpToolObservation {
   lazyToolCount: number;
 }
 
+/**
+ * Reason string when session-start carried neither inventory field.
+ *
+ * This is the EXPECTED path for Cursor, Codex and Pi — their streams never
+ * put `mcp_servers` / `tools` on session-start — so the supervisor must not
+ * INFO-log it every turn (that line looked like a failure while tools worked).
+ * Exported so `work.ts` can skip the noisy log without string-matching prose.
+ */
+export const MCP_VERIFY_NO_INVENTORY_REASON =
+  'the agent\'s session-start event reported neither `mcp_servers` nor `tools`';
+
 export type McpVerification =
   /** The agent reported lazy tools. */
   | { outcome: 'ok'; observation: McpToolObservation }
   /**
    * The agent said nothing we can judge (no init event, or an init event with
-   * neither field). Log and carry on — see `verifyInitMcpTools`.
+   * neither field). Carry on — see `verifyInitMcpTools`. The supervisor INFO-
+   * logs other unknown reasons; {@link MCP_VERIFY_NO_INVENTORY_REASON} is
+   * silence expected from several agents and is not logged at INFO.
    */
   | { outcome: 'unknown'; reason: string }
   /** Positive evidence the turn has NO lazy tools. */
@@ -77,7 +90,7 @@ export function verifyInitMcpTools(event: AgentActivityEvent | null | undefined)
   if (mcpServers === undefined && toolNames === undefined) {
     return {
       outcome: 'unknown',
-      reason: 'the agent\'s session-start event reported neither `mcp_servers` nor `tools`',
+      reason: MCP_VERIFY_NO_INVENTORY_REASON,
     };
   }
 

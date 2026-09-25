@@ -1,5 +1,9 @@
 import { describe, test, expect } from 'bun:test';
-import { unresolvedAuthRejection } from '../../src/proxy/auth-verdict';
+import {
+  rejectionAgainstCurrentCredential,
+  unresolvedAuthRejection,
+  unresolvedAuthRejectionsByUser,
+} from '../../src/proxy/auth-verdict';
 import type { ProxyAuditRecord } from '../../src/storage/types';
 
 function rec(ts: number, status: number | null, extra: Partial<ProxyAuditRecord> = {}): ProxyAuditRecord {
@@ -83,5 +87,108 @@ describe('unresolvedAuthRejection', () => {
   test('reports the most recent rejection when several are unresolved', () => {
     const verdict = unresolvedAuthRejection([rec(1, 401), rec(2, 401, { role: 'agent' })]);
     expect(verdict).toMatchObject({ ts: 2, role: 'agent' });
+  });
+});
+
+/**
+ * In team mode each request carries a placeholder the proxy swapped for ONE
+ * member's real token, so a 401 condemns exactly that member's credential.
+ *
+ * INVARIANT: verdicts are per owner and never pooled. Pooling them would send a
+ * whole team to re-authorize because one person's setup-token expired — the
+ * same false alarm that trains people to ignore the prompt.
+ */
+describe('unresolvedAuthRejectionsByUser', () => {
+  test('empty when there is no evidence at all', () => {
+    expect(unresolvedAuthRejectionsByUser([]).size).toBe(0);
+  });
+
+  test('attributes a rejection to its own owner and no one else', () => {
+    const byUser = unresolvedAuthRejectionsByUser([
+      rec(1, 200, { userId: 'ada' }),
+      rec(2, 401, { userId: 'bob', error: 'expired' }),
+    ]);
+    expect(byUser.get('bob')).toMatchObject({ ts: 2, status: 401, error: 'expired' });
+    expect(byUser.has('ada')).toBe(false);
+  });
+
+  // Self-clearing, scoped: Ada re-authorizing must not clear Bob's dead token,
+  // and Bob's dead token must not survive Ada's success.
+  test('clears per owner, independently', () => {
+    const byUser = unresolvedAuthRejectionsByUser([
+      rec(1, 401, { userId: 'ada' }),
+      rec(2, 401, { userId: 'bob' }),
+      rec(3, 200, { userId: 'ada' }),
+    ]);
+    expect(byUser.has('ada')).toBe(false);
+    expect(byUser.get('bob')?.status).toBe(401);
+  });
+
+  // INVARIANT: records with no owner are the daemon-env path, whose verdict
+  // `lazy doctor` already reports daemon-wide. Bucketing them under some
+  // stand-in id would invent a member to blame.
+  test('ignores records with no owner rather than bucketing them', () => {
+    const byUser = unresolvedAuthRejectionsByUser([rec(1, 401), rec(2, 401, { userId: null })]);
+    expect(byUser.size).toBe(0);
+  });
+
+  // Same rule as the daemon-wide verdict: a request that never reached the
+  // upstream neither raises nor clears its owner's verdict.
+  test('unreachable-upstream records neither raise nor clear', () => {
+    const byUser = unresolvedAuthRejectionsByUser([
+      rec(1, 401, { userId: 'ada' }),
+      rec(2, null, { userId: 'ada' }),
+    ]);
+    expect(byUser.get('ada')?.status).toBe(401);
+    expect(unresolvedAuthRejectionsByUser([rec(1, null, { userId: 'ada' })]).size).toBe(0);
+  });
+
+  test('keeps the most recent rejection for an owner', () => {
+    const byUser = unresolvedAuthRejectionsByUser([
+      rec(1, 401, { userId: 'ada' }),
+      rec(2, 403, { userId: 'ada', role: 'agent' }),
+    ]);
+    expect(byUser.get('ada')).toMatchObject({ ts: 2, status: 403, role: 'agent' });
+  });
+});
+
+/**
+ * INVARIANT: a rejection is evidence about the TOKEN that was presented, not
+ * about the person who presented it. The audit log is append-only and only a
+ * later success clears a verdict, so without this rule the one remedy every
+ * surface offers — "paste a new one" — provably does not clear the warning it
+ * is attached to. That is how a valid, freshly stored credential came to be
+ * reported as dead on the lazy-teams credentials page.
+ */
+describe('rejectionAgainstCurrentCredential', () => {
+  const rejection = { ts: 2_000, status: 401, role: 'agent', error: 'expired' };
+
+  test('no rejection stays no rejection', () => {
+    expect(rejectionAgainstCurrentCredential(null, '1970-01-01T00:00:01.000Z')).toBeNull();
+    expect(rejectionAgainstCurrentCredential(undefined, '1970-01-01T00:00:01.000Z')).toBeNull();
+  });
+
+  test('drops a rejection the current credential predates it — replaced token', () => {
+    // Stored at t=3000ms; the 401 at t=2000ms was earned by whatever was there before.
+    expect(rejectionAgainstCurrentCredential(rejection, '1970-01-01T00:00:03.000Z')).toBeNull();
+  });
+
+  test('keeps a rejection the current credential earned itself', () => {
+    // Stored at t=1000ms, rejected at t=2000ms: this token is genuinely dead.
+    expect(rejectionAgainstCurrentCredential(rejection, '1970-01-01T00:00:01.000Z')).toEqual(rejection);
+  });
+
+  // Inclusive on purpose: a request in flight when the replacement lands can be
+  // answered a millisecond after it, and "possibly still true" is the honest
+  // reading. It clears on the next success or an explicit check.
+  test('keeps a rejection recorded in the same millisecond', () => {
+    expect(rejectionAgainstCurrentCredential(rejection, '1970-01-01T00:00:02.000Z')).toEqual(rejection);
+  });
+
+  // Suppressing a real dead-token warning because a timestamp is unreadable
+  // would be the worse failure of the two.
+  test('reports the rejection when the stored timestamp is missing or unparseable', () => {
+    expect(rejectionAgainstCurrentCredential(rejection, undefined)).toEqual(rejection);
+    expect(rejectionAgainstCurrentCredential(rejection, 'not a date')).toEqual(rejection);
   });
 });

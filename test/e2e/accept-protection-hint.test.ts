@@ -17,6 +17,7 @@ import { readFile, writeFile } from 'fs/promises';
 import { writeFileSync } from 'fs';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
+import { seedFinal } from '../helpers/final';
 import { expectSuccess, expectOutput, expectOutputExcludes, extractTaskId } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 
@@ -54,6 +55,9 @@ describe('lazy accept: the branch-protection discovery hint', () => {
     writeFileSync(join(worktreePath, `${name}.txt`), 'content\n');
     ctx.git('-C', worktreePath, 'add', `${name}.txt`);
     ctx.git('-C', worktreePath, 'commit', '-m', `Add ${name}.txt`);
+    // Fixture setup, not the subject: the finality gate needs a standing final
+    // before any accept of a committed task (see test/helpers/final.ts).
+    await seedFinal(ctx, taskId);
     return taskId;
   }
 
@@ -106,6 +110,9 @@ describe('lazy accept: the branch-protection discovery hint', () => {
     writeFileSync(join(worktreePath, 'child.txt'), 'content\n');
     ctx.git('-C', worktreePath, 'add', 'child.txt');
     ctx.git('-C', worktreePath, 'commit', '-m', 'Add child.txt');
+
+    // Fixture setup: the child needs a standing final before its accept.
+    await seedFinal(ctx, childId);
 
     const result = await ctx.lazy(['accept', childId, '--yes']);
     expectSuccess(result);

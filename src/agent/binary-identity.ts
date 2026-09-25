@@ -17,11 +17,15 @@
  * what it just installed BEFORE a container ever mounts it, so the failure is
  * reported on the host, by name, at the moment it is caused.
  *
- * The check is content-based on purpose: the binary is a Linux cross-compile, so
- * a macOS host cannot exec it to ask.
+ * Content checks (ELF magic + embedded sentinel) catch most wrong files on any
+ * host. Where the host can run the Linux binary — directly on Linux, or inside
+ * the freshly-built container image on macOS — we also exec `lazy-agent
+ * selfcheck`, the same probe the builder preflight uses at container launch.
  */
 
 import { open, stat } from 'fs/promises';
+import { spawn } from '../utils/spawn';
+import { spawnSyncUnsupervised } from '../utils/spawn';
 
 /**
  * Sentinel the compiled agent prints for `lazy-agent selfcheck`.
@@ -166,4 +170,185 @@ export function formatAgentBinaryError(
       ? `Rebuild it with: bun run build (then 'lazy upgrade').`
       : `Reinstall lazy, then run: lazy upgrade.`)
   );
+}
+
+/** Parse the output of `lazy-agent selfcheck` the way the builder preflight does. */
+export function selfcheckOutputVerdict(
+  stdout: string,
+  stderr: string,
+  exitCode: number | null,
+): AgentBinaryVerdict {
+  const out = stdout.trim();
+  const err = stderr.trim();
+
+  if (exitCode === 0 && out.includes(AGENT_SELFCHECK_SENTINEL)) {
+    return { ok: true };
+  }
+
+  if (err.includes('Script not found') && err.includes('selfcheck')) {
+    return {
+      ok: false,
+      reason:
+        `selfcheck failed (exit ${exitCode ?? 'null'}): a bare Bun runtime — ` +
+        `${err || 'stderr empty'}`,
+    };
+  }
+
+  if (exitCode === 0 && !out.includes(AGENT_SELFCHECK_SENTINEL)) {
+    return {
+      ok: false,
+      reason:
+        `selfcheck exited 0 but stdout did not contain '${AGENT_SELFCHECK_SENTINEL}' ` +
+        `(output: ${out || '<empty>'})`,
+    };
+  }
+
+  const detail = out || err || '<no output>';
+  return {
+    ok: false,
+    reason: `selfcheck failed (exit ${exitCode ?? 'null'}, output: ${detail})`,
+  };
+}
+
+/**
+ * Exec `lazy-agent selfcheck` directly. Only meaningful on a Linux host running
+ * the Linux cross-compile; macOS hosts must use the container probe instead.
+ */
+export function verifyAgentBinarySelfcheckExec(path: string): AgentBinaryVerdict {
+  try {
+    const proc = spawnSyncUnsupervised([path, 'selfcheck'], { stdout: 'pipe', stderr: 'pipe' });
+    return selfcheckOutputVerdict(
+      proc.stdout.toString(),
+      proc.stderr.toString(),
+      proc.exitCode,
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, reason: `could not exec selfcheck (${message})` };
+  }
+}
+
+export interface AgentBinaryContainerProbeOptions {
+  /** Container image to run the probe in (required on non-Linux hosts). */
+  containerImage: string;
+  dockerBinary?: string;
+}
+
+const CONTAINER_SELFCHECK_TIMEOUT_MS = 60_000;
+
+/**
+ * Run `lazy-agent selfcheck` inside a throwaway container with the candidate
+ * binary bind-mounted at /usr/local/bin/lazy-agent — the same mount path every
+ * builder and task container uses. This is the build-time guard that catches a
+ * bare Bun runtime on macOS hosts, which cannot exec the Linux binary directly.
+ */
+export async function verifyAgentBinarySelfcheckInContainer(
+  agentBinaryPath: string,
+  opts: AgentBinaryContainerProbeOptions,
+): Promise<AgentBinaryVerdict> {
+  const dockerBinary = opts.dockerBinary ?? 'docker';
+  let proc;
+  try {
+    proc = spawn(
+      [
+        dockerBinary, 'run', '--rm', '--network', 'none',
+        '-v', `${agentBinaryPath}:/usr/local/bin/lazy-agent:ro`,
+        '--entrypoint', '/usr/local/bin/lazy-agent',
+        opts.containerImage,
+        'selfcheck',
+      ],
+      { stdout: 'pipe', stderr: 'pipe', timeout: CONTAINER_SELFCHECK_TIMEOUT_MS },
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, reason: `container selfcheck probe failed (${message})` };
+  }
+
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+
+  return selfcheckOutputVerdict(stdout, stderr, exitCode);
+}
+
+/** True when a probe failed because the container runtime is unavailable. */
+function containerRuntimeUnavailable(reason: string): boolean {
+  return reason.includes('not found') && (
+    reason.includes("'docker'") ||
+    reason.includes("'podman'") ||
+    reason.includes('container selfcheck probe failed')
+  );
+}
+
+/**
+ * Verify an on-disk agent binary is safe to bind-mount: content check first,
+ * then the live selfcheck exec when a Linux host or container image makes that
+ * possible.
+ */
+export async function verifyAgentBinaryForContainerLaunch(
+  path: string,
+  opts: AgentBinaryContainerProbeOptions | undefined = undefined,
+): Promise<AgentBinaryVerdict> {
+  const content = await verifyAgentBinary(path);
+  if (!content.ok) return content;
+
+  let exec: AgentBinaryVerdict | null = null;
+  if (process.platform === 'linux') {
+    exec = verifyAgentBinarySelfcheckExec(path);
+    if (exec.ok) return exec;
+  }
+
+  if (opts?.containerImage) {
+    const container = await verifyAgentBinarySelfcheckInContainer(path, opts);
+    if (container.ok) return container;
+
+    // Content already passed; runtime missing or file not executable here —
+    // do not fail an upgrade e2e or a host without docker when the bytes are good.
+    if (containerRuntimeUnavailable(container.reason)) {
+      if (!exec || exec.reason.includes('ENOEXEC') || exec.reason.includes('could not exec selfcheck')) {
+        return { ok: true };
+      }
+    }
+    return container;
+  }
+
+  if (exec && !exec.ok) {
+    if (exec.reason.includes('ENOEXEC') || exec.reason.includes('could not exec selfcheck')) {
+      return { ok: true };
+    }
+    return exec;
+  }
+
+  return { ok: true };
+}
+
+/**
+ * After a container image build, prove the agent binary that will be mounted at
+ * launch passes the same selfcheck the builder preflight runs. Skipped when no
+ * verified agent binary exists yet (first install builds both on first launch).
+ */
+export async function assertAgentBinarySelfcheckForImage(
+  imageRef: string,
+  agentBinaryPath: string,
+  dockerBinary: string = 'docker',
+): Promise<void> {
+  const content = await verifyAgentBinary(agentBinaryPath);
+  if (!content.ok) {
+    // Nothing to mount yet — first launch will build/extract the agent binary.
+    return;
+  }
+
+  const verdict = await verifyAgentBinaryForContainerLaunch(agentBinaryPath, {
+    containerImage: imageRef,
+    dockerBinary,
+  });
+  if (!verdict.ok) {
+    throw new Error(
+      `Refusing to tag container image ${imageRef}: the agent binary at ${agentBinaryPath} ` +
+      `would break every builder and task container (${verdict.reason}). ` +
+      `Fix the agent binary before rebuilding the image.`,
+    );
+  }
 }

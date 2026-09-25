@@ -64,7 +64,7 @@ describe('lazy sync <task> — live remote upstream', () => {
 
     // Commit the github-driver config BEFORE pushing/branching: the task worktree
     // is checked out from origin/main, so config must be in the committed tree
-    // for syncTask's `loadConfig(projectRoot, { cwd: worktreePath })` to see it.
+    // for syncTask's `loadConfig(projectRoot)` to see it.
     await writeFile(join(ctx.root, 'lazy.toml'), '[remote]\ndriver = "github"\n');
     expect(ctx.git('add', 'lazy.toml').exitCode).toBe(0);
     expect(ctx.git('commit', '-m', 'Use github driver').exitCode).toBe(0);

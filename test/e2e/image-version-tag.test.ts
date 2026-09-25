@@ -32,7 +32,7 @@ import { installFakeDocker, type FakeDocker } from '../helpers/fake-docker';
 import {
   ensureImage,
   resolveImageName,
-  calculateDockerfileHash,
+  calculateImageInputsHash,
   preflightAgentBinaryInImage,
   listLazyImages,
   isImageTooOld,
@@ -41,10 +41,14 @@ import {
   IMAGE_MAX_AGE_MS,
   enableUpgradeImageBuild,
   resetUpgradeImageBuild,
+  evaluateUpgradeRebuild,
 } from '../../src/capture/claude';
 import { imageTagFor } from '../../src/capture/image-tag';
 import { startBackgroundImageBuild } from '../../src/upgrade/background-image-build';
 import { checkStaleLazyImages } from '../../src/cli/commands/doctor';
+import { findStaleLazyImages } from '../../src/cli/commands/doctor-remedies';
+import { createTask } from '../helpers/fixtures';
+import { setTaskMetadata } from '../helpers/storage';
 import { VERSION } from '../../src/version';
 import { pinDaemonBaseDir } from '../helpers/daemon-base-dir';
 import { commitAll } from '../helpers/git-repo';
@@ -119,7 +123,7 @@ describe('runner image identity and freshness', () => {
   // This is the regression test for the incident — the old image is present and
   // even carries a matching Dockerfile hash, and the build must happen anyway.
   test('an existing :latest image does not satisfy a version-tagged lookup', async () => {
-    const currentHash = await calculateDockerfileHash(ctx.root);
+    const currentHash = await calculateImageInputsHash(ctx.root);
     await docker.seedImage('lazy-runner:latest', { dockerfileHash: currentHash, id: 'sha256:stale' });
 
     const used = await ensureImage(docker.binPath);
@@ -175,10 +179,68 @@ describe('runner image identity and freshness', () => {
     expect(builds[1]).toContain(`-t lazy-runner:${IMAGE_TAG}-upgrade`);
   });
 
+  // The one exception to trigger 1, and it lives in the COMMAND, not in the
+  // build path above: `lazy upgrade --images` followed minutes later by
+  // `lazy upgrade` ran the identical --no-cache build twice. The build path
+  // stays unconditional (the test above); `evaluateUpgradeRebuild` is what
+  // `lazy upgrade` (never `--images`) asks first — and when the image identity
+  // is unchanged it answers `ask`, not "skip". There is deliberately no timer:
+  // the rebuild would only re-resolve unpinned contents, which is worth minutes
+  // some days and not others, so the age goes into a QUESTION to the human
+  // rather than into a threshold nobody can see.
+  test('evaluateUpgradeRebuild asks about a same-identity image instead of deciding', async () => {
+    const currentHash = await calculateImageInputsHash(ctx.root);
+    await docker.seedImage(IMAGE_REF, {
+      dockerfileHash: currentHash,
+      createdAt: ago(5 * 60_000),
+    });
+
+    const decision = await evaluateUpgradeRebuild(ctx.root, docker.binPath);
+
+    expect(decision.verdict).toBe('ask');
+    expect(decision.imageName).toBe(IMAGE_REF);
+    // The reason is printed to the human, so it must say why, not just "ask".
+    expect(decision.reason).toContain(IMAGE_REF);
+    // The age is part of the question ("built 5 minutes ago"), not a threshold.
+    expect(decision.builtAgo).toBe('5 minutes');
+    expect(decision.reason).toContain('5 minutes');
+    expect((await docker.builds()).length).toBe(0);
+  });
+
+  // Age alone never flips the answer to `rebuild`: an old same-identity image is
+  // still the human's call, only with a bigger number in the question.
+  test('evaluateUpgradeRebuild still asks about an old same-identity image', async () => {
+    const currentHash = await calculateImageInputsHash(ctx.root);
+    await docker.seedImage(IMAGE_REF, {
+      dockerfileHash: currentHash,
+      createdAt: ago(9 * 24 * 60 * 60 * 1000),
+    });
+
+    const decision = await evaluateUpgradeRebuild(ctx.root, docker.binPath);
+
+    expect(decision.verdict).toBe('ask');
+    expect(decision.builtAgo).toBe('9 days');
+  });
+
+  test('evaluateUpgradeRebuild rebuilds when the image identity changed', async () => {
+    await docker.seedImage(IMAGE_REF, { dockerfileHash: 'hash-from-an-older-dockerfile' });
+
+    const decision = await evaluateUpgradeRebuild(ctx.root, docker.binPath);
+
+    expect(decision.verdict).toBe('rebuild');
+  });
+
+  test('evaluateUpgradeRebuild rebuilds when no image exists on this host', async () => {
+    const decision = await evaluateUpgradeRebuild(ctx.root, docker.binPath);
+
+    expect(decision.verdict).toBe('rebuild');
+    expect(decision.reason).toContain('not built on this host');
+  });
+
   // --- trigger 2: age ------------------------------------------------------
 
   test(`an image older than ${IMAGE_MAX_AGE_DAYS} days is rebuilt`, async () => {
-    const currentHash = await calculateDockerfileHash(ctx.root);
+    const currentHash = await calculateImageInputsHash(ctx.root);
     await docker.seedImage(IMAGE_REF, {
       dockerfileHash: currentHash,
       createdAt: ago(IMAGE_MAX_AGE_MS + 60_000),
@@ -195,7 +257,7 @@ describe('runner image identity and freshness', () => {
   });
 
   test(`an image just under ${IMAGE_MAX_AGE_DAYS} days old is left alone`, async () => {
-    const currentHash = await calculateDockerfileHash(ctx.root);
+    const currentHash = await calculateImageInputsHash(ctx.root);
     await docker.seedImage(IMAGE_REF, {
       dockerfileHash: currentHash,
       createdAt: ago(IMAGE_MAX_AGE_MS - 60 * 60_000),
@@ -211,7 +273,7 @@ describe('runner image identity and freshness', () => {
   // timestamp. Without --no-cache the age rebuild would never reset the clock,
   // and every launch from then on would rebuild. One rebuild, then quiet.
   test('the age rebuild resets the clock — it does not fire again on the next launch', async () => {
-    const currentHash = await calculateDockerfileHash(ctx.root);
+    const currentHash = await calculateImageInputsHash(ctx.root);
     await docker.seedImage(IMAGE_REF, {
       dockerfileHash: currentHash,
       createdAt: ago(IMAGE_MAX_AGE_MS * 3),
@@ -254,7 +316,8 @@ describe('runner image identity and freshness', () => {
     expect(result.warning).toBeDefined();
     expect(result.warning).toContain('lazy-runner:0.1');
     expect(result.warning).toContain('2.5GB');
-    expect(result.warning).toContain('image rm');
+    // The remedy is lazy's own flag, never a docker command to paste.
+    expect(result.warning).toContain('lazy doctor --clean-docker-images');
     // The alias shares the current image's ID — it is the same image, not junk.
     expect(result.warning).not.toContain('lazy-runner:latest');
   });
@@ -268,6 +331,48 @@ describe('runner image identity and freshness', () => {
     await docker.failBuilds();
 
     await expect(ensureImage(docker.binPath)).rejects.toThrow(/build failed/i);
+  });
+
+  // INVARIANT: an image a launch on this machine still needs is never stale.
+  // Doctor used to name the image the daemon had just adopted as reclaimable —
+  // it escaped the list only when a container happened to be running on it — so
+  // the advice was to delete the very image the next turn would launch with. A
+  // task's pinned image is worse: a launch whose pinned image is gone fails
+  // LOUDLY by design, so deleting it wedges that task rather than degrading it.
+  test('doctor never lists the adopted or a task-pinned image as stale', async () => {
+    await ensureImage(docker.binPath);
+
+    // A valid adoption: Dockerfile present at the recorded path, content hash
+    // matching what was consented, this lazy's image tag.
+    const { writeAdoptedImage, hashDockerfileContent } = await import('../../src/daemon/adopted-image');
+    const adoptedDockerfile = join(ctx.root, 'Dockerfile.adopted');
+    const adoptedContent = 'FROM debian:bookworm\nRUN echo adopted\n';
+    await writeFile(adoptedDockerfile, adoptedContent);
+    const adoptedImage = `lazy-custom-adopted:${IMAGE_TAG}`;
+    await writeAdoptedImage(ctx.root, {
+      dockerfilePath: adoptedDockerfile,
+      contentHash: hashDockerfileContent(adoptedContent),
+      imageName: adoptedImage,
+    }, { content: adoptedContent });
+    await docker.seedImage(adoptedImage, { id: 'sha256:adopted' });
+
+    // A task whose turns are pinned to their own image.
+    const pinnedImage = `lazy-custom-pinned:${IMAGE_TAG}`;
+    await docker.seedImage(pinnedImage, { id: 'sha256:pinned' });
+    const taskId = await createTask(ctx, 'Pinned image task');
+    setTaskMetadata(ctx.root, taskId, 'custom_image', pinnedImage);
+
+    // ...and one image nothing can reach, so the check is not passing by
+    // reporting nothing at all.
+    await docker.seedImage('lazy-runner:0.1', { id: 'sha256:ancient', size: '2.5GB' });
+
+    const stale = await findStaleLazyImages(IMAGE_REF, docker.binPath, ctx.root);
+    const refs = stale.map(i => i.ref);
+
+    expect(refs).toContain('lazy-runner:0.1');
+    expect(refs).not.toContain(adoptedImage);
+    expect(refs).not.toContain(pinnedImage);
+    expect(refs).not.toContain(IMAGE_REF);
   });
 
   test('doctor is quiet when only the current image is present', async () => {
@@ -286,7 +391,7 @@ describe('runner image identity and freshness', () => {
   // that never collides with the base lazy-runner image.
 
   test('a cursor-default project resolves an agent-suffixed repository with a distinct hash', async () => {
-    const baseHash = await calculateDockerfileHash(ctx.root);
+    const baseHash = await calculateImageInputsHash(ctx.root);
 
     const configPath = join(ctx.root, 'lazy.toml');
     const toml = await readFile(configPath, 'utf-8');
@@ -297,7 +402,7 @@ describe('runner image identity and freshness', () => {
     const ref = await resolveImageName(ctx.root);
     expect(ref).toBe(`lazy-runner-cursor:${IMAGE_TAG}`);
 
-    const cursorHash = await calculateDockerfileHash(ctx.root);
+    const cursorHash = await calculateImageInputsHash(ctx.root);
     expect(cursorHash).not.toBe(baseHash);
   });
 
@@ -341,7 +446,9 @@ describe('runner image identity and freshness', () => {
     await preflightAgentBinaryInImage('lazy-custom-abc:0.21', docker.binPath, 'cursor');
     const runs = (await docker.invocations()).filter(line => line.startsWith('run '));
     expect(runs.length).toBe(1);
-    expect(runs[0]).toContain('which cursor-agent');
+    expect(runs[0]).toContain('--entrypoint which');
+    expect(runs[0]).toContain('--network none');
+    expect(runs[0]).toContain('cursor-agent');
   });
 
   test('preflight is a no-op for claude-code and for the agent-aware default image', async () => {
@@ -457,10 +564,11 @@ describe('runner image identity and freshness', () => {
       expect(cwd).not.toMatch(/lazy-build-ctx-/);
       // Trailing `.` — a directory context rooted at that cwd.
       expect(builds[0].endsWith(' .')).toBe(true);
-      // Byte-for-byte argv: `build`, the tags, the hash label, `-f <temp>`, `.`
-      // — no extra flags, and nothing pointing into an extracted tree.
+      // Byte-for-byte argv: `build`, the tags, the identity labels (content hash
+      // + the build-inputs manifest), `-f <temp>`, `.` — no extra flags, and
+      // nothing pointing into an extracted tree.
       expect(builds[0]).toMatch(
-        /^build(?: -t \S+)+ --label lazy\.dockerfile\.hash=[0-9a-f]{64} -f \S+\/Dockerfile \.$/,
+        /^build(?: -t \S+)+ --label lazy\.dockerfile\.hash=[0-9a-f]{64} --label lazy\.image\.inputs=\S+ -f \S+\/Dockerfile \.$/,
       );
       // The context this build saw is the project root's real tree, not an
       // extraction: the file only the branch has must be absent.

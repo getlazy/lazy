@@ -32,7 +32,8 @@ import { hostname } from 'os';
 import { which } from 'bun';
 import { spawn } from '../utils/spawn';
 import { getHome } from '../utils/home';
-import { READ_ONLY_TOOL_NAMES, TOOL_ACCESS } from '../mcp/tool-access';
+import { TOOL_ACCESS, isReadOnlyTool } from '../mcp/tool-access';
+import { isToolForRole } from '../mcp/tool-roles';
 
 /** One diagnosed link in the chain. */
 export interface DoctorCheck {
@@ -366,7 +367,14 @@ function checkReadOnlyMode(entry?: ClaudeJsonLazyEntry): DoctorCheck {
   const envReadOnly = process.env.LAZY_MCP_READ_ONLY === '1';
   const argvReadOnly = entry?.args.includes('--read-only') ?? false;
   const readOnly = envReadOnly || argvReadOnly;
-  const allToolCount = Object.keys(TOOL_ACCESS).length;
+
+  // The advertised set is role-scoped: a builder session is not served the
+  // agent-only tools and vice versa, so a count taken from the whole table
+  // would tell a reader to expect tools this session can never see.
+  const role = argValue(entry?.args ?? [], '--task-id') ? 'agent' : 'builder';
+  const roleTools = Object.keys(TOOL_ACCESS).filter(n => isToolForRole(n, role));
+  const allToolCount = roleTools.length;
+  const readOnlyCount = roleTools.filter(n => isReadOnlyTool(n)).length;
 
   // Not a failure in either state — an ask turn is SUPPOSED to be read-only.
   // It is reported because it changes what a healthy tool count looks like,
@@ -377,13 +385,14 @@ function checkReadOnlyMode(entry?: ClaudeJsonLazyEntry): DoctorCheck {
     ok: true,
     detail: readOnly
       ? `on (env=${envReadOnly ? '1' : 'unset'}, argv ${argvReadOnly ? 'has' : 'lacks'} --read-only) — ` +
-        `expect ${READ_ONLY_TOOL_NAMES.length} read-only tools`
+        `expect ${readOnlyCount} read-only tools`
       : `off — expect the full set of ${allToolCount} tools`,
     data: {
       readOnly,
       env: envReadOnly,
       argv: argvReadOnly,
-      expectedToolCount: readOnly ? READ_ONLY_TOOL_NAMES.length : allToolCount,
+      role,
+      expectedToolCount: readOnly ? readOnlyCount : allToolCount,
     },
   };
 }

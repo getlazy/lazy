@@ -4,6 +4,8 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
+import { readTaskStatus, readTaskJson, setTaskMetadata } from '../helpers/storage';
 
 /**
  * Regression tests for task `fix-push-after-local-merge`.
@@ -79,6 +81,8 @@ describe('lazy accept: push parent after local merge', () => {
     });
     expectSuccess(startResult);
     expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
+    // Fixture setup, not the subject (see test/helpers/final.ts).
+    await seedFinal(ctx, taskId);
 
     // Add a real commit in the worktree so the squash merge produces a commit.
     const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
@@ -106,6 +110,51 @@ describe('lazy accept: push parent after local merge', () => {
     expect(originMainAfter).toBe(localMainAfter);
   });
 
+  // INVARIANT (accept-merge-is-commit-point): the merge is the last fallible
+  // step of an accept. A parent push that fails AFTER the local merge is still
+  // a FAILURE (non-zero exit, named step — "fail hard on remote failures"), but
+  // it no longer un-accepts merged work: the task is `complete`, and the daemon
+  // retries the push until it lands.
+  test('a failed parent push after the merge leaves the task accepted, fails loudly, and the daemon retries it', async () => {
+    const taskId = await createTask(ctx, 'Push-fails-after-merge test', 'Add a file');
+    const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
+    });
+    expectSuccess(startResult);
+    expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
+    await seedFinal(ctx, taskId);
+    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
+    writeFileSync(join(worktreePath, 'pushed-later.txt'), 'content\n');
+    expect(ctx.git('-C', worktreePath, 'add', 'pushed-later.txt').exitCode).toBe(0);
+    expect(ctx.git('-C', worktreePath, 'commit', '-m', 'Add file').exitCode).toBe(0);
+
+    const bareRemotePath = switchToGitHubDriver();
+    // Break the remote only for the push: the pre-merge checks read local refs.
+    expect(ctx.git('remote', 'set-url', '--push', 'origin', join(ctx.root, 'no-such-remote.git')).exitCode).toBe(0);
+
+    const acceptResult = await ctx.lazy(['accept', taskId]);
+    expect(acceptResult.exitCode).not.toBe(0);
+    expect(acceptResult.stdout + acceptResult.stderr).toContain('push-parent');
+    expect(acceptResult.stdout + acceptResult.stderr).toContain('FAILED');
+    // Accepted all the same: the merge landed, and the store says so.
+    expect(readTaskStatus(ctx.root, taskId)).toBe('complete');
+    const localMain = ctx.git('rev-parse', 'main').stdout.trim();
+    expect(ctx.git('show', 'main:pushed-later.txt').exitCode).toBe(0);
+    const owed = JSON.parse(readTaskJson(ctx.root, taskId).metadata.accept_followthrough);
+    expect(owed.done).not.toContain('push-parent');
+
+    // The remote comes back; skip the backoff and let the daemon's sweep retry.
+    expect(ctx.git('remote', 'set-url', '--push', 'origin', bareRemotePath).exitCode).toBe(0);
+    setTaskMetadata(ctx.root, taskId, 'accept_followthrough', JSON.stringify({ ...owed, nextAttemptAt: 0 }));
+    const deadline = Date.now() + 60_000;
+    while (readTaskJson(ctx.root, taskId).metadata?.accept_followthrough && Date.now() < deadline) {
+      await Bun.sleep(500);
+    }
+    expect(readTaskJson(ctx.root, taskId).metadata?.accept_followthrough ?? '').toBe('');
+    expect(bareSha(bareRemotePath, 'main')).toBe(localMain);
+    expect(readTaskStatus(ctx.root, taskId)).toBe('complete');
+  }, 120_000);
+
   // INVARIANT: because the parent push keeps origin fresh, `lazy sync` reads a
   // live upstream and no longer falsely reports "Already up to date". This is the
   // exact downstream regression the engineer hit. We assert the root cause is
@@ -119,6 +168,8 @@ describe('lazy accept: push parent after local merge', () => {
     });
     expectSuccess(startResult);
     expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
+    // Fixture setup, not the subject (see test/helpers/final.ts).
+    await seedFinal(ctx, taskId);
 
     const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
     writeFileSync(join(worktreePath, 'feature.txt'), 'feature\n');

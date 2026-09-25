@@ -22,8 +22,31 @@ import type { ResolvedConfig } from '../config/types';
 import { logger } from '../utils/logger';
 import { localDayKey, nextLocalMidnight } from '../utils/local-day';
 
-/** Trigger types that can cause auto-unblocks. */
-export type AutoReactTrigger = 'ci_failure' | 'upstream_sync' | 'comment' | 'child_completed' | 'crash';
+/**
+ * Trigger types that can cause auto-unblocks.
+ *
+ * ONE list, exported, because the enumeration was written out by hand in three
+ * places (counter reset, `lazy status`, the budget report) and a trigger added
+ * to the union but missed in one of them is a counter that never resets and a
+ * report that silently omits a turn class.
+ *
+ * `child_added` is cluster-only — see src/daemon/cluster-restart.ts.
+ *
+ * `auto_review` is the daemon-dispatched review after a task's final
+ * declaration (final-turn design §8): one dispatch consumes one daily-budget
+ * turn exactly like every other daemon-started turn.
+ */
+export const AUTO_REACT_TRIGGERS = [
+  'ci_failure',
+  'upstream_sync',
+  'comment',
+  'child_completed',
+  'child_added',
+  'crash',
+  'auto_review',
+] as const;
+
+export type AutoReactTrigger = (typeof AUTO_REACT_TRIGGERS)[number];
 
 /** Metadata key prefix for per-task auto-react counters. */
 const COUNTER_PREFIX = 'auto_react_count_';
@@ -81,15 +104,67 @@ export async function getLastAutoReactTimestamp(
  * Called when a human manually unblocks or the task reaches a terminal state.
  */
 export async function resetAutoReactCounters(storage: Storage, taskId: string): Promise<void> {
-  const triggers: AutoReactTrigger[] = ['ci_failure', 'upstream_sync', 'comment', 'child_completed', 'crash'];
+  const triggers: readonly AutoReactTrigger[] = AUTO_REACT_TRIGGERS;
   for (const trigger of triggers) {
     await storage.updateTaskMetadata(taskId, `${COUNTER_PREFIX}${trigger}`, '');
     await storage.updateTaskMetadata(taskId, `${TIMESTAMP_PREFIX}${trigger}`, '');
   }
+  // The auto-review round counter rides every reset site, so a human taking
+  // over (or crash recovery re-arming the task) starts a fresh review cycle.
+  await resetFinalReviewRound(storage, taskId);
   await storage.updateTaskMetadata(taskId, PAUSED_KEY, '');
   await storage.updateTaskMetadata(taskId, PAUSED_REASON_KEY, '');
   // Also reset the consecutive auto-turn counter
   await resetConsecutiveAutoTurns(storage, taskId);
+}
+
+// --- Auto-review round counter (final-turn design §8.1) ---
+
+/**
+ * Metadata key counting COMPLETED auto-review rounds that filed at least one
+ * non-blocking Raise.
+ *
+ * INVARIANT (final-turn §8.1, review-round-cap): an auto-review cycle gets two
+ * rounds, then parks the task with its Raises outstanding for a person — the
+ * round counter is what makes the third "final → review → fix" turn
+ * never fire. It governs NON-blocking findings only: a blocking finding ends
+ * the rounds on the first one without touching this counter, because no
+ * auto-fix turn can clear it by working harder (the accept gate's
+ * `review-issues-unaddressed` keeps holding until a human decides).
+ *
+ * Unlike the per-trigger auto-react counters above, this one also resets when
+ * an AGENT intervenes: for a cluster's child the cluster is "the human" (§8.2),
+ * and the cluster hands a capped child back by unblocking it over MCP with actor
+ * `agent` — which must start a fresh cycle. Only a daemon round's own
+ * auto-fix (actor `system`) leaves it standing.
+ */
+export const FINAL_REVIEW_ROUND_KEY = 'final_review_round';
+
+/** How many review rounds an auto-review cycle gets before it parks. */
+export const FINAL_REVIEW_CAP = 2;
+
+/** Get the completed auto-review round count for a task (0 when unset). */
+export async function getFinalReviewRound(storage: Storage, taskId: string): Promise<number> {
+  const value = await storage.getTaskMetadata(taskId, FINAL_REVIEW_ROUND_KEY);
+  return value ? parseInt(value, 10) || 0 : 0;
+}
+
+/**
+ * Count one more completed auto-review round that filed Raises.
+ * Returns the new count.
+ */
+export async function incrementFinalReviewRound(storage: Storage, taskId: string): Promise<number> {
+  const next = (await getFinalReviewRound(storage, taskId)) + 1;
+  await storage.updateTaskMetadata(taskId, FINAL_REVIEW_ROUND_KEY, String(next));
+  return next;
+}
+
+/**
+ * Reset the auto-review round counter — a fresh cycle is owed.
+ * Best-effort at every call site; see the callers for why.
+ */
+export async function resetFinalReviewRound(storage: Storage, taskId: string): Promise<void> {
+  await storage.updateTaskMetadata(taskId, FINAL_REVIEW_ROUND_KEY, '');
 }
 
 /**
@@ -456,11 +531,45 @@ export async function checkAutoTurnBudget(
 
 // --- Combined gate: should an auto-react be allowed? ---
 
+/**
+ * WHICH gate refused, as a token rather than as prose.
+ *
+ * The `reason` string is written for a person to read; a caller that has to
+ * BEHAVE differently per gate must not parse it. The auto-review catchup is the
+ * caller that needs the distinction: a gate that clears itself within seconds
+ * (`backoff`) is invisible bookkeeping, while one that stands until a day rolls
+ * over or a person acts leaves a task parked with no review and has to be
+ * recorded (`src/daemon/auto-review.ts`). Deriving that from the reason text
+ * would put the rule in a sentence anyone is free to reword.
+ */
+export type AutoReactGate =
+  | 'global_pause'
+  | 'task_paused'
+  | 'auto_turn_budget'
+  | 'daily_budget'
+  | 'trigger_limit'
+  | 'backoff';
+
 export interface AutoReactDecision {
   allowed: boolean;
   reason?: string;
+  /** Which gate refused. Absent when `allowed`. */
+  gate?: AutoReactGate;
   /** Remaining backoff delay in ms (only set when blocked by backoff). */
   backoffRemainingMs?: number;
+  /**
+   * The numbers behind a `daily_budget` refusal. Set only on that gate.
+   *
+   * `effective` is today's cap and `configured` is the lazy.toml value, and the
+   * pair is here because they differ in what WAITING buys. A today-only
+   * override expires at local midnight and the configured value returns; the
+   * configured value itself does not move, so `auto_react_daily_budget = 0`
+   * refuses forever — midnight resets `used` to 0, and `0 >= 0` still refuses.
+   * A caller that tells an operator whether to wait or to act has to be able to
+   * tell those apart (`src/daemon/auto-review.ts`), and the only alternative
+   * was parsing them back out of `reason`.
+   */
+  dailyBudget?: { used: number; effective: number; configured: number };
 }
 
 /**
@@ -488,13 +597,17 @@ export async function shouldAutoReact(
   // Gate 0: global pause
   const globalPause = await isGlobalAutoReactPaused(dataDir);
   if (globalPause.paused) {
-    return { allowed: false, reason: globalPause.reason || 'Auto-react globally paused' };
+    return {
+      allowed: false,
+      gate: 'global_pause',
+      reason: globalPause.reason || 'Auto-react globally paused',
+    };
   }
 
   // Gate 1: task already paused
   if (await isAutoReactPaused(storage, taskId)) {
     const reason = await getAutoReactPausedReason(storage, taskId);
-    return { allowed: false, reason: reason || 'Auto-react paused' };
+    return { allowed: false, gate: 'task_paused', reason: reason || 'Auto-react paused' };
   }
 
   // Gate 2: per-task consecutive auto-turn budget
@@ -502,7 +615,7 @@ export async function shouldAutoReact(
   if (!autoTurnCheck.allowed) {
     await pauseAutoReact(storage, taskId, autoTurnCheck.reason!);
     logger.warn(`Task ${taskShortId}: ${autoTurnCheck.reason}`);
-    return { allowed: false, reason: autoTurnCheck.reason };
+    return { allowed: false, gate: 'auto_turn_budget', reason: autoTurnCheck.reason };
   }
 
   // Gate 3: global daily budget (respects today-only cap override)
@@ -510,7 +623,16 @@ export async function shouldAutoReact(
     const budget = await readDailyBudget(dataDir);
     const limit = effectiveDailyLimit(budget, auto_react_daily_budget);
     logger.warn(`Auto-react budget exhausted: ${budget.used}/${limit} turns used today`);
-    return { allowed: false, reason: `Daily auto-react budget exhausted (${budget.used}/${limit})` };
+    return {
+      allowed: false,
+      gate: 'daily_budget',
+      reason: `Daily auto-react budget exhausted (${budget.used}/${limit})`,
+      dailyBudget: {
+        used: budget.used,
+        effective: limit,
+        configured: auto_react_daily_budget,
+      },
+    };
   }
 
   // Gate 4: per-task per-trigger limit
@@ -519,7 +641,7 @@ export async function shouldAutoReact(
     const reason = `Auto-react paused: ${count} ${trigger.replace('_', ' ')} retries exhausted`;
     await pauseAutoReact(storage, taskId, reason);
     logger.warn(`Task ${taskShortId}: ${reason}`);
-    return { allowed: false, reason };
+    return { allowed: false, gate: 'trigger_limit', reason };
   }
 
   // Gate 5: backoff delay
@@ -527,7 +649,12 @@ export async function shouldAutoReact(
   if (!backoff.allowed) {
     const secs = Math.ceil(backoff.remainingMs / 1000);
     logger.debug(`Task ${taskShortId}: backoff not elapsed, ${secs}s remaining for ${trigger}`);
-    return { allowed: false, reason: `Backoff: ${secs}s remaining`, backoffRemainingMs: backoff.remainingMs };
+    return {
+      allowed: false,
+      gate: 'backoff',
+      reason: `Backoff: ${secs}s remaining`,
+      backoffRemainingMs: backoff.remainingMs,
+    };
   }
 
   return { allowed: true };
@@ -566,7 +693,7 @@ export async function getAutoReactSummary(
   storage: Storage,
   taskId: string,
 ): Promise<{ paused: boolean; reason: string | null; counts: Record<AutoReactTrigger, number>; consecutiveAutoTurns: number }> {
-  const triggers: AutoReactTrigger[] = ['ci_failure', 'upstream_sync', 'comment', 'child_completed', 'crash'];
+  const triggers: readonly AutoReactTrigger[] = AUTO_REACT_TRIGGERS;
   const counts = {} as Record<AutoReactTrigger, number>;
 
   for (const trigger of triggers) {

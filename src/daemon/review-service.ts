@@ -22,17 +22,31 @@
  * actually launched.
  */
 
-import { getOrCreateStorage, handleDiff, RpcError } from './rpc-handlers';
-import { launchAskTask, launchUnblockTask, acceptTask, approveTask, syncTask } from './task-lifecycle';
-import { acceptRefusal } from './accept-refusal';
+import { getOrCreateStorage, handleDiff, handleFileLines, RpcError } from './rpc-handlers';
+import { launchAskTaskAwaited, launchUnblockTask, acceptTask, syncTask } from './task-lifecycle';
+import type { ProgressEmitter } from './progress';
 import { logger } from '../utils/logger';
 import { saveRecoveryFileAsync, removeRecoveryFileAsync } from '../utils/recovery';
-import type { FileViolation, ReviewComment, ReviewCommentSide, ReviewCommentIntent } from '../types';
+import type { ActorInput, FileViolation, ReviewComment, ReviewCommentSide, ReviewCommentIntent, RaisedItemResolution, RaisedItemResolveAction, ReviewDraftState, ReviewDraftPatch } from '../types';
+import { isBlockedStatus } from '../types';
+import { descendantCounts } from '../task-target';
+import { emptyReviewDraft } from '../review-draft';
+import { resolveOneRaisedItem } from './raised-items';
 import { latestViolationTurn } from '../utils/turns';
+import { resolveOutstandingViolations } from '../protection/outstanding-resolver';
+import { mergedViolationRecords } from '../protection/outstanding';
 import { askUnavailableReason, isPendingDelivery, withdrawRefusalReason } from '../server/review-actions';
-import type { ReviewActions, PostReviewCommentInput, ReviewQueueEntry } from '../server/review-actions';
+import { buildAskContext } from '../task/ask-context';
+import type { ReviewActions, PostReviewCommentInput, PromoteDiscussionResult, ReviewQueueEntry, FileLinesQuery, FileLinesResult } from '../server/review-actions';
+import { createPromotedTask } from '../raised/promote-task';
+import { buildDiscussionTaskPrompt, defaultDiscussionGoal, discussionPromoteSeed, type DiscussionPromoteSeed } from '../review/promote-discussion';
+import { validateCode } from '../task/identity';
 import askPromptTemplate from '../prompts/review-comment-ask.md' with { type: 'text' };
-import unblockPromptTemplate from '../prompts/review-comments-unblock.md' with { type: 'text' };
+import taskAskPromptTemplate from '../prompts/review-task-ask.md' with { type: 'text' };
+import proseAskPromptTemplate from '../prompts/review-prose-ask.md' with { type: 'text' };
+import { isTaskLevelReviewAnchor } from '../review/task-level-anchor';
+import { isProseReviewAnchor, proseAnchorAgentWhere } from '../review/prose-anchor';
+import { quotedProse, buildUnblockPrompt } from '../review/unblock-prompt';
 
 /**
  * Per-task serialization of everything that resumes the agent.
@@ -45,6 +59,18 @@ import unblockPromptTemplate from '../prompts/review-comments-unblock.md' with {
  * dropped once the chain drains, so it cannot grow unbounded.
  */
 const askChains = new Map<string, Promise<void>>();
+
+/**
+
+/**
+ * Who decided, when the caller did not say.
+ *
+ * The review surface is a person either way; what a caller can add is WHICH
+ * person, which only a per-user token knows. The daemon's own dashboard has no
+ * user identity at all, so it passes nothing and the record reads exactly as it
+ * did before per-user attribution existed.
+ */
+const HUMAN_DECIDER: ActorInput = 'human';
 
 /** Queue work behind this task's in-flight asks. Resolves when the work does. */
 function enqueue<T>(taskId: string, work: () => Promise<T>): Promise<T> {
@@ -70,10 +96,26 @@ function enqueue<T>(taskId: string, work: () => Promise<T>): Promise<T> {
   return result;
 }
 
-function buildAskPrompt(thread: ReviewComment[], latest: ReviewComment): string {
+export function buildAskPrompt(thread: ReviewComment[], latest: ReviewComment): string {
   const transcript = thread
     .map((c) => `**${c.role === 'agent' ? 'You' : 'Reviewer'}:** ${c.content}`)
     .join('\n\n');
+
+  if (isTaskLevelReviewAnchor(latest.file, latest.line)) {
+    return taskAskPromptTemplate.replace('{{thread}}', transcript);
+  }
+
+  // A prose anchor points at the agent's own words, not at code: the agent
+  // gets the quote and where it came from — never the pseudo-file or the
+  // content-hash line, which would read as a fake file/line.
+  if (isProseReviewAnchor(latest.file)) {
+    // A reply may not re-carry the snippet; the thread's first message has it.
+    const snippet = latest.anchor_snippet ?? thread.find((c) => c.anchor_snippet)?.anchor_snippet;
+    return proseAskPromptTemplate
+      .replace('{{where}}', proseAnchorAgentWhere(latest.file))
+      .replace('{{quote}}', quotedProse(snippet))
+      .replace('{{thread}}', transcript);
+  }
 
   return askPromptTemplate
     .replace('{{file}}', latest.file)
@@ -93,44 +135,31 @@ function buildAskPrompt(thread: ReviewComment[], latest: ReviewComment): string 
 export { isPendingDelivery };
 
 /**
- * Render undelivered comments as one block for the unblock work turn. Each
- * comment carries its anchor so the agent can go straight to the line, plus any
- * ask conversation that already happened on that thread — the reviewer may well
- * be saying "do what we just agreed", and without the thread that reads as a
- * non-sequitur.
+ * Re-exported from src/review/unblock-prompt.ts, where the batching block
+ * moved so that `launchUnblockTask` (which the review service imports) can
+ * build it too — CLI, MCP and web unblocks all carry queued comments through
+ * literally the same code.
  */
-export function buildUnblockPrompt(
-  pending: ReviewComment[],
-  all: ReviewComment[],
-  message: string,
-): string {
-  const blocks = pending.map((c, i) => {
-    const anchor = c.anchor_snippet ? `\n\n\`\`\`\n${c.anchor_snippet}\n\`\`\`` : '';
-    // Everything on this thread that came before the comment — the reviewer's
-    // earlier questions and the answers you gave.
-    const priorThread = all.filter(
-      (o) => o.thread_id === c.thread_id && o.id !== c.id && o.created_at <= c.created_at,
-    );
-    const context = priorThread.length
-      ? `\n\nEarlier on this thread:\n${priorThread
-          .map((o) => `> **${o.role === 'agent' ? 'You' : 'Reviewer'}:** ${o.content.replace(/\n/g, '\n> ')}`)
-          .join('\n>\n')}`
-      : '';
-    const side = c.side === 'old' ? 'removed/original' : 'added/new';
-    return `### ${i + 1}. \`${c.file}\` line ${c.line} (${side} side)${anchor}\n\n${c.content}${context}`;
-  });
-
-  return unblockPromptTemplate
-    .replace('{{count}}', String(pending.length))
-    .replace('{{comments}}', blocks.join('\n\n'))
-    .replace('{{message}}', message);
-}
+export { buildUnblockPrompt };
 
 export function createReviewActions(projectRoot: string): ReviewActions {
   return {
     async listQueue(): Promise<ReviewQueueEntry[]> {
       const storage = await getOrCreateStorage();
-      const tasks = await storage.listTasksWithOptions({ blockedOnly: true });
+      // The FULL task set, then filter in memory: a queue entry's subtask count
+      // covers descendants of EVERY status (a release hub's children are mostly
+      // complete), and descent walks parent links, so counting from the blocked
+      // subset would truncate every subtree to nothing.
+      //
+      // On FileStorage this is free — listTasksWithOptions reads and sweeps
+      // every task before applying any filter, so `{}` does the same work
+      // `{ blockedOnly: true }` would. On RemoteStorage the filter is evaluated
+      // on the far side, so the unfiltered call genuinely moves every task over
+      // the wire. That is the price of a real descendant count; if it ever
+      // shows up, the fix is a storage-level count, not a smaller walk here.
+      const allTasks = await storage.listTasksWithOptions({});
+      const descendants = descendantCounts(allTasks);
+      const tasks = allTasks.filter((task) => isBlockedStatus(task.status));
       const entries: ReviewQueueEntry[] = [];
       for (const task of tasks) {
         const [comments, session] = await Promise.all([
@@ -151,20 +180,81 @@ export function createReviewActions(projectRoot: string): ReviewActions {
           commentCount: comments.length,
           pendingAsks: unanswered,
           pendingComments: comments.filter(isPendingDelivery).length,
+          lastActiveAt: session?.last_interaction_at ?? null,
+          descendantCount: descendants.get(task.id) ?? 0,
         });
       }
       return entries;
     },
 
-    async getDiff(taskId: string): Promise<string> {
+    async getDiff(taskId: string, opts?: { region?: string }): Promise<string> {
       // includeComments: false — the review page PARSES this as a unified
       // diff, and the synthetic `diff --lazy a/comments b/comments` section is
       // not a git patch. The page renders comments as threads anyway; sending
       // them as diff text once produced a phantom "comments" file.
       const result = (await handleDiff(projectRoot, {
-        taskId, full: true, includeComments: false,
+        taskId, full: true, includeComments: false, region: opts?.region,
       })) as { output: string };
       return result.output ?? '';
+    },
+
+    async listRegions(taskId: string) {
+      // A read that cannot be answered must not take the Changes tab with
+      // it: the diff above is the thing the reviewer came for, and regions
+      // are a navigation aid on top of it.
+      //
+      // §6.3: this reads the task's PRESENTED regions — the walkthrough a
+      // human-facing park declared. A HUB with no walkthrough falls through to
+      // its children, derived from the carve; a leaf with none gets the empty
+      // cover whose note says so, which is the different and honest answer.
+      try {
+        const { loadPresentedRegions } = await import('./regions-presentation');
+        const { regionSummary } = await import('../regions');
+        const storage = await getOrCreateStorage();
+        const { cover, hashes } = await loadPresentedRegions(storage, projectRoot, taskId, {
+          // Navigation on top of the diff: a hub's first carve must not hold
+          // the Changes tab, and a stale map scopes exactly as correctly.
+          lenientHubCarve: true,
+        });
+        return {
+          regions: cover.regions.map((r) =>
+            // Staleness is answered by the region's OWN content hash, not the
+            // head: a sign-off survives a commit that touched another region.
+            regionSummary(r, { headSha: hashes.get(r.id) ?? cover.head_sha })),
+          notes: cover.notes,
+        };
+      } catch (err) {
+        logger.debug(
+          `regions unavailable for ${taskId}: ${err instanceof Error ? err.message : err}`,
+        );
+        return { regions: [], notes: [] };
+      }
+    },
+
+    async lineAttribution(taskId: string, paths: readonly string[]) {
+      // Same posture as listRegions: the gutter is a reading aid on top of the
+      // diff, so a cover that cannot be read costs the annotation and never
+      // the Changes tab.
+      try {
+        const { fileLineAttribution } = await import('./regions-service');
+        const storage = await getOrCreateStorage();
+        return await fileLineAttribution(storage, projectRoot, taskId, paths);
+      } catch (err) {
+        logger.debug(
+          `line attribution unavailable for ${taskId}: ${err instanceof Error ? err.message : err}`,
+        );
+        return new Map();
+      }
+    },
+
+    async getFileLines(taskId: string, input: FileLinesQuery): Promise<FileLinesResult> {
+      return (await handleFileLines(projectRoot, {
+        taskId,
+        path: input.path,
+        side: input.side,
+        start: input.start,
+        end: input.end,
+      })) as FileLinesResult;
     },
 
     async listComments(taskId: string): Promise<ReviewComment[]> {
@@ -172,7 +262,11 @@ export function createReviewActions(projectRoot: string): ReviewActions {
       return storage.getTaskReviewComments(taskId);
     },
 
-    async postComment(taskId: string, input: PostReviewCommentInput): Promise<ReviewComment> {
+    async postComment(
+      taskId: string,
+      input: PostReviewCommentInput,
+      options?: { waitForAsk?: boolean; onProgress?: ProgressEmitter },
+    ): Promise<ReviewComment> {
       const storage = await getOrCreateStorage();
       const resolved = await storage.resolveTask(taskId);
       if (!resolved.task) {
@@ -180,6 +274,34 @@ export function createReviewActions(projectRoot: string): ReviewActions {
       }
       const task = resolved.task;
       const intent: ReviewCommentIntent = input.intent === 'comment' ? 'comment' : 'ask';
+
+      // A comment normally anchors to something the agent can go and look at:
+      // a diff line, or a prose anchor on one of the agent's own report,
+      // follow-up or raised lines. The (task) sentinel anchors none of those —
+      // it is the conversation about the work as a whole — so a comment may use
+      // it ONLY as a reply on an existing task-level thread: after reading the
+      // agent's answer, "alright, do that" is a plain comment that rides the
+      // next unblock, and making the reviewer hunt for a code line to hang it on
+      // is the bug this exception exists to fix. A FRESH task-level comment is
+      // refused, because that is exactly what the Unblock tab's message box
+      // already is. Guard here so both the RPC adapter and the web route share
+      // the same protection.
+      if (intent === 'comment' && isTaskLevelReviewAnchor(input.file, input.line)) {
+        const replyingTo = input.threadId
+          ? (await storage.getTaskReviewComments(task.id)).filter(
+              (c) => c.thread_id === input.threadId,
+            )
+          : [];
+        const onTaskLevelThread =
+          replyingTo.length > 0 &&
+          replyingTo.every((c) => isTaskLevelReviewAnchor(c.file, c.line));
+        if (!onTaskLevelThread) {
+          throw new RpcError(
+            400,
+            "Comments must anchor to a diff line, to a line of the agent's own report, follow-up or raised item, or reply on an existing task-level conversation. For a general note to the agent, write it in the Unblock message; to start a task-level question, use the Ask tab or POST /review/:id/ask.",
+          );
+        }
+      }
 
       // ---- SAVE FIRST ----------------------------------------------------
       // Everything below this write may fail (status gate, worktree lock,
@@ -208,7 +330,7 @@ export function createReviewActions(projectRoot: string): ReviewActions {
       // or not yet askable, and the notes keep until they can be delivered.
       if (intent === 'comment') return comment;
 
-      const unavailable = askUnavailableReason(task.status);
+      const unavailable = askUnavailableReason(await buildAskContext(storage, task, { projectRoot }));
       if (unavailable) {
         // Not askable right now (task is working, submitted, terminal…). The
         // comment stays; it is simply marked as undelivered with a reason the
@@ -225,7 +347,19 @@ export function createReviewActions(projectRoot: string): ReviewActions {
       // too long to hold an HTTP request open. Dispatch in the background; the
       // browser polls the threads endpoint for the reply. Errors are recorded
       // on the comment by dispatchAsk itself, hence the deliberate no-op catch.
-      void enqueue(task.id, () => dispatchAsk(projectRoot, task.id, comment)).catch(() => {});
+      //
+      // The action dialog waits: it needs the same phase events `lazy ask`
+      // prints, and it stays open until the ask settles (close on success,
+      // stay on failure). Line-anchored asks keep the fire-and-forget path.
+      const dispatched = enqueue(task.id, () =>
+        dispatchAsk(projectRoot, task.id, comment, options?.onProgress),
+      );
+      if (options?.waitForAsk) {
+        await dispatched;
+        const latest = (await storage.getTaskReviewComments(task.id)).find((c) => c.id === comment.id);
+        return latest ?? comment;
+      }
+      void dispatched.catch(() => {});
 
       return comment;
     },
@@ -249,7 +383,7 @@ export function createReviewActions(projectRoot: string): ReviewActions {
       // and 409 the second attempt. Report the current state instead.
       if (comment.ask_state === 'pending') return comment;
 
-      const unavailable = askUnavailableReason(task.status);
+      const unavailable = askUnavailableReason(await buildAskContext(storage, task, { projectRoot }));
       if (unavailable) {
         // Still not askable. Re-record the (now current) reason so the reviewer
         // sees why this attempt failed too; the question itself is untouched.
@@ -297,7 +431,13 @@ export function createReviewActions(projectRoot: string): ReviewActions {
       return storage.updateReviewComment(task.id, comment.id, { withdrawnAt: Date.now() });
     },
 
-    async unblock(taskId: string, message: string) {
+    async unblock(
+      taskId: string,
+      message: string,
+      raisedResolutions?: RaisedItemResolution[],
+      onProgress?: ProgressEmitter,
+      options?: { keepFeedbackDraft?: boolean },
+    ) {
       const storage = await getOrCreateStorage();
       const resolved = await storage.resolveTask(taskId);
       if (!resolved.task) {
@@ -314,83 +454,84 @@ export function createReviewActions(projectRoot: string): ReviewActions {
       // Queue behind any in-flight asks so the conversation the reviewer
       // started finishes before the work turn that acts on their comments.
       return enqueue(fullId, async () => {
-        const all = await storage.getTaskReviewComments(fullId);
-        const pending = all.filter(isPendingDelivery);
-        const prompt = pending.length ? buildUnblockPrompt(pending, all, message) : message;
-
         let result;
         try {
-          // launchUnblockTask recomputes every violation's status from this
-          // list alone — anything absent is rejected and git-reverted. So it
-          // must carry the reviewer's stored ✅ decisions, or unblocking would
-          // throw away changes they had already approved.
+          // launchUnblockTask batches every pending_delivery review comment
+          // into the turn prompt and marks them delivered once the turn has
+          // launched — the same code the CLI and MCP unblocks run, so the web
+          // path cannot drift from them.
+          //
+          // No protected-file decision travels with an unblock any more
+          // (move-file-approval-to-accept): a pending violation stays pending,
+          // the file keeps the agent's content, and the ✅/⛔ the reviewer sets
+          // on this page is read at ACCEPT.
           result = await launchUnblockTask(projectRoot, {
             taskId: fullId,
-            message: prompt,
+            message,
             actor: 'human',
-            approvedFiles: await approvedViolationFiles(storage, fullId),
+            // The dashboard's signed-in person: may use the one-shot usage-pause override.
+            usagePauseOverrideEligible: true,
+            // The reviewer pressed Unblock on their own review: it carries
+            // their queued comments, so it files their asks too.
+            filesReview: true,
+            // Optional partial raise resolutions from the review page — never
+            // inferred from the feedback textarea.
+            ...(raisedResolutions && raisedResolutions.length > 0
+              ? { raisedResolutions }
+              : {}),
+            ...(options?.keepFeedbackDraft ? { keepFeedbackDraft: true } : {}),
+            onProgress,
           });
         } catch (err) {
           // The turn never launched, so the comments stay pending_delivery and
-          // will ride the next unblock. Nothing is marked delivered here.
+          // will ride the next unblock. Nothing is marked delivered.
           const detail = recoveryPath ? ` Your feedback was saved to ${recoveryPath}.` : '';
           throw new Error(`${err instanceof Error ? err.message : String(err)}${detail}`);
         }
 
-        // Delivered — and only now, because the turn actually launched.
-        for (const c of pending) {
-          try {
-            await storage.updateReviewComment(fullId, c.id, {
-              deliveryState: 'delivered',
-              deliveredTurn: result.turnNumber,
-            });
-          } catch (err) {
-            // The agent has the comment; we only failed to record that. Log
-            // loudly — the symptom would be a comment re-delivered next unblock.
-            logger.error(
-              `Delivered review comment ${c.id} but could not mark it delivered: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          }
-        }
         if (recoveryPath) await removeRecoveryFileAsync(recoveryPath);
         return result;
       });
     },
 
-    async accept(taskId: string, reason?: string, passphrase?: string) {
-      // A supplied passphrase is verified FIRST, through the very same
-      // approveTask the CLI's `lazy approve` calls — one verifier, one audit
-      // comment, one one-shot approval that the merge below consumes. The
-      // passphrase is not stored, not echoed back, and not logged: it exists
-      // only as this argument.
-      if (passphrase !== undefined) {
-        try {
-          await approveTask(projectRoot, { taskId, token: passphrase });
-        } catch (err) {
-          const status = err instanceof RpcError ? err.status : 500;
-          // 400 (nothing entered) and 403 (wrong passphrase) are both the
-          // reviewer's to retry, so they come back as the SAME refusal that
-          // asked for the passphrase — the form is offered again rather than
-          // dead-ending on a message.
-          if (status === 400 || status === 403) {
-            throw acceptRefusal(status, err instanceof Error ? err.message : String(err), {
-              reason: 'approval-invalid',
-              next: 'Enter the approval passphrase again — nothing you typed on this page is lost.',
-              command: `lazy approve ${taskId}`,
-              uiAction: 'passphrase',
-            });
-          }
-          throw err;
-        }
-      }
-      // No approvedFiles: a ✅ decision is already stored as `approved`, so the
-      // preflight sees no `pending` violation to object to. A file still ⛔ is
-      // still `pending`, and the preflight refuses — which is the intent.
-      return acceptTask(projectRoot, { taskId, reason });
+    async accept(
+      taskId: string,
+      reason?: string,
+      passphrase?: string,
+      raisedResolutions?: RaisedItemResolution[],
+      onProgress?: ProgressEmitter,
+      approvedFiles?: string[],
+      options?: { allowQueuedComments?: boolean },
+    ) {
+      // A supplied passphrase rides INTO the accept as its inline token — the
+      // same argument `lazy accept` fills from its TTY prompt, verified by the
+      // one edge gate inside the merge it authorizes. It is not stored, not
+      // echoed back, and not logged: it exists only as this argument. A wrong
+      // one comes back as the same `uiAction: 'passphrase'` refusal that asked
+      // for it, so the form is offered again rather than dead-ending.
+      //
+      // approvedFiles is the same list the first submit carried. A ✅ on the
+      // page is already stored as `approved`, so omitting the list still
+      // works — but the passphrase retry must submit exactly what the first
+      // accept submitted, or a conflict task's approved file can vanish.
+      return acceptTask(projectRoot, {
+        taskId,
+        reason,
+        token: passphrase,
+        actor: 'human',
+        ...(raisedResolutions && raisedResolutions.length > 0
+          ? { raisedResolutions }
+          : {}),
+        ...(approvedFiles && approvedFiles.length > 0
+          ? { approvedFiles }
+          : {}),
+        ...(options?.allowQueuedComments ? { allowQueuedComments: true } : {}),
+        onProgress,
+      });
     },
 
-    async sync(taskId: string) {
-      return syncTask(projectRoot, { taskId });
+    async sync(taskId: string, onProgress?: ProgressEmitter) {
+      return syncTask(projectRoot, { taskId, onProgress, liftPin: true });
     },
 
     async setViolationDecision(taskId: string, file: string, approved: boolean) {
@@ -404,14 +545,29 @@ export function createReviewActions(projectRoot: string): ReviewActions {
         throw new RpcError(409, `Task ${taskId} has no session, so it has no protected-file changes to decide on.`);
       }
       const turns = await storage.getSessionTurns(session.id);
-      const turn = latestViolationTurn(turns);
-      if (!turn?.violations?.length) {
+      // WHAT IS DECIDABLE IS THE WHOLE-BRANCH SET, not one turn's record
+      // (move-file-approval-to-accept). A conflict task runs many turns now, so
+      // a file violated on an earlier turn can be outstanding — and listed on
+      // the page, and refused at accept — while the newest violation turn has
+      // no record of it at all. Gating this write on that turn made the ✅ the
+      // page offers 404, leaving the reviewer no way to clear a file accept
+      // would keep refusing.
+      const state = await resolveOutstandingViolations(projectRoot, resolved.task, session, turns, storage);
+      const decidable = new Set([...state.outstanding.map((v) => v.file), ...state.approved]);
+      if (decidable.size === 0) {
         throw new RpcError(409, `Task ${taskId} has no protected-file violations to decide on.`);
       }
-      if (!turn.violations.some((v) => v.file === file)) {
+      if (!decidable.has(file)) {
         throw new RpcError(404, `${file} is not a protected file this task violated.`);
       }
-      const updated: FileViolation[] = turn.violations.map((v) =>
+      // Written as the complete ledger onto ONE turn: the merged record set, so
+      // the decision survives however many turns run after it.
+      const ledgerTurn = latestViolationTurn(turns) ?? [...turns].reverse().find((t) => t.role === 'agent');
+      if (!ledgerTurn) {
+        throw new RpcError(409, `Task ${taskId} has no agent turn to record the decision on.`);
+      }
+      const merged = mergedViolationRecords(turns, state.detected, approved ? [file] : []);
+      const updated: FileViolation[] = merged.map((v) =>
         v.file === file
           // Back to 'pending', never 'rejected' — see setViolationDecision on
           // the port for why writing 'rejected' here would let a later accept
@@ -419,27 +575,184 @@ export function createReviewActions(projectRoot: string): ReviewActions {
           ? { ...v, status: approved ? ('approved' as const) : ('pending' as const) }
           : v,
       );
-      await storage.updateTurnViolations(resolved.task.id, turn.id, updated);
+      await storage.updateTurnViolations(resolved.task.id, ledgerTurn.id, updated);
       return updated;
     },
-  };
-}
 
-/**
- * The files the reviewer has marked ✅ on this task's violation turn.
- *
- * Read fresh at unblock time rather than carried through the request, so the
- * decision that gets applied is the one currently on record.
- */
-async function approvedViolationFiles(
-  storage: Awaited<ReturnType<typeof getOrCreateStorage>>,
-  taskId: string,
-): Promise<string[]> {
-  const session = await storage.getSessionByTaskId(taskId);
-  if (!session) return [];
-  const turns = await storage.getSessionTurns(session.id);
-  const violations = latestViolationTurn(turns)?.violations ?? [];
-  return violations.filter((v) => v.status === 'approved').map((v) => v.file);
+    async resolveRaisedItem(
+      taskId: string,
+      itemId: string,
+      resolution: { action: RaisedItemResolveAction; response?: string | null },
+      actor?: ActorInput,
+    ) {
+      const storage = await getOrCreateStorage();
+      const resolved = await storage.resolveTask(taskId);
+      if (!resolved.task) {
+        throw new RpcError(404, `Task not found: ${taskId}`);
+      }
+      return resolveOneRaisedItem(storage, resolved.task.id, itemId, {
+        action: resolution.action,
+        actor: actor ?? HUMAN_DECIDER,
+        response: resolution.response ?? null,
+      });
+    },
+
+    async unresolveRaisedItem(taskId: string, itemId: string, actor?: ActorInput) {
+      const storage = await getOrCreateStorage();
+      const resolved = await storage.resolveTask(taskId);
+      if (!resolved.task) {
+        throw new RpcError(404, `Task not found: ${taskId}`);
+      }
+      return storage.unresolveRaisedItem(resolved.task.id, itemId, actor ?? HUMAN_DECIDER);
+    },
+
+    async setRaisedItemBlocking(taskId: string, itemId: string, blocking: boolean, actor?: ActorInput) {
+      const storage = await getOrCreateStorage();
+      const resolved = await storage.resolveTask(taskId);
+      if (!resolved.task) {
+        throw new RpcError(404, `Task not found: ${taskId}`);
+      }
+      return storage.setRaisedItemBlocking(resolved.task.id, itemId, blocking, actor ?? HUMAN_DECIDER);
+    },
+
+    async promoteRaisedItem(
+      taskId: string,
+      itemId: string,
+      options: { goal?: string; code?: string; relation?: 'peer' | 'subtask'; actor?: ActorInput },
+    ) {
+      const storage = await getOrCreateStorage();
+      const resolved = await storage.resolveTask(taskId);
+      if (!resolved.task) {
+        throw new RpcError(404, `Task not found: ${taskId}`);
+      }
+      const code = options.code?.trim() || undefined;
+      if (code) {
+        const codeError = validateCode(code);
+        if (codeError) {
+          throw new RpcError(400, `Invalid code '${code}': ${codeError}`);
+        }
+      }
+      return storage.promoteRaisedItem(resolved.task.id, itemId, {
+        goal: options.goal?.trim() || undefined,
+        code,
+        relation: options.relation ?? 'peer',
+        actor: options.actor ?? HUMAN_DECIDER,
+      });
+    },
+
+    async promoteDiscussion(
+      taskId: string,
+      threadId: string,
+      options: { goal?: string; prompt?: string; code?: string; relation?: 'peer' | 'subtask' },
+    ): Promise<PromoteDiscussionResult> {
+      const storage = await getOrCreateStorage();
+      const resolved = await storage.resolveTask(taskId);
+      if (!resolved.task) {
+        throw new RpcError(404, `Task not found: ${taskId}`);
+      }
+      const task = resolved.task;
+
+      const all = await storage.getTaskReviewComments(task.id);
+      const messages = all.filter(c => c.thread_id === threadId);
+      if (messages.length === 0) {
+        throw new RpcError(404, `No discussion found on task ${taskId} with thread id ${threadId}`);
+      }
+      // The root comment carries the thread's promotion link — it is the one
+      // message guaranteed to exist for the life of the thread.
+      const root = messages.find(c => c.id === threadId) ?? messages[0];
+      if (root.promoted_task_id) {
+        throw new RpcError(
+          409,
+          `This discussion was already promoted to task ` +
+          `${root.promoted_task_code ?? root.promoted_task_id.slice(0, 8)}.`,
+        );
+      }
+
+      const code = options.code?.trim() || undefined;
+      if (code) {
+        const codeError = validateCode(code);
+        if (codeError) {
+          throw new RpcError(400, `Invalid code '${code}': ${codeError}`);
+        }
+      }
+
+      const goal = options.goal?.trim() || defaultDiscussionGoal(messages, task);
+      const prompt = options.prompt?.trim() || buildDiscussionTaskPrompt(messages, task);
+
+      // Shared seeding path — the same one raised-item promotion uses. Creates
+      // a BACKLOG task and nothing else: no start, no turn, no status change on
+      // the task the discussion happened on.
+      const created = await createPromotedTask(storage, {
+        originatingTask: task,
+        relation: options.relation ?? 'subtask',
+        goal,
+        prompt,
+        code,
+        actor: 'human',
+      });
+
+      const rootComment = await storage.updateReviewComment(task.id, root.id, {
+        promotedTaskId: created.id,
+        ...(created.code ? { promotedTaskCode: created.code } : {}),
+      });
+
+      return { task: created, rootComment };
+    },
+
+    async promoteConversation(
+      sessionId: string,
+      options: { from?: number; to?: number; goal?: string; prompt?: string; code?: string; parent?: string },
+    ) {
+      const storage = await getOrCreateStorage();
+      const code = options.code?.trim() || undefined;
+      if (code) {
+        const codeError = validateCode(code);
+        if (codeError) {
+          throw new RpcError(400, `Invalid code '${code}': ${codeError}`);
+        }
+      }
+      // Everything else — resolving the session id, validating the range,
+      // refusing an exact re-promote, seeding the task — is Storage's, the
+      // same as raised-item promotion. This layer only turns the human's
+      // typed code into a 400 before any of it runs.
+      return storage.promoteConversation(sessionId, {
+        ...(options.from != null ? { from: options.from } : {}),
+        ...(options.to != null ? { to: options.to } : {}),
+        ...(options.goal?.trim() ? { goal: options.goal.trim() } : {}),
+        ...(options.prompt?.trim() ? { prompt: options.prompt.trim() } : {}),
+        ...(code ? { code } : {}),
+        ...(options.parent?.trim() ? { parent: options.parent.trim() } : {}),
+        actor: 'human',
+      });
+    },
+
+    async getDraft(taskId: string, reviewer: string): Promise<ReviewDraftState> {
+      const storage = await getOrCreateStorage();
+      const resolved = await storage.resolveTask(taskId);
+      if (!resolved.task) {
+        throw new RpcError(404, `Task not found: ${taskId}`);
+      }
+      // An empty draft rather than null: "nobody has typed anything yet" is a
+      // first visit, not an error, and every surface renders the same shape.
+      return (
+        (await storage.getReviewDraft(resolved.task.id, reviewer)) ??
+        emptyReviewDraft(resolved.task.id, reviewer)
+      );
+    },
+
+    async saveDraft(
+      taskId: string,
+      reviewer: string,
+      patch: ReviewDraftPatch,
+    ): Promise<ReviewDraftState> {
+      const storage = await getOrCreateStorage();
+      const resolved = await storage.resolveTask(taskId);
+      if (!resolved.task) {
+        throw new RpcError(404, `Task not found: ${taskId}`);
+      }
+      return storage.saveReviewDraft(resolved.task.id, reviewer, patch);
+    },
+  };
 }
 
 /**
@@ -450,6 +763,7 @@ async function dispatchAsk(
   projectRoot: string,
   taskId: string,
   comment: ReviewComment,
+  onProgress?: ProgressEmitter,
 ): Promise<void> {
   const storage = await getOrCreateStorage();
   try {
@@ -457,21 +771,36 @@ async function dispatchAsk(
     const thread = all.filter((c) => c.thread_id === comment.thread_id);
     const prompt = buildAskPrompt(thread, comment);
 
-    const result = await launchAskTask(projectRoot, {
+    const result = await launchAskTaskAwaited(projectRoot, {
       taskId,
       message: prompt,
       actor: 'human',
+      // The dashboard's signed-in person: may use the one-shot usage-pause override.
+      usagePauseOverrideEligible: true,
+      onProgress,
     });
 
     // The agent's answer joins the thread at the same anchor, so a page reload
     // renders the full back-and-forth in place on the diff.
+    //
+    // Provenance is written INTO the stored message, not just rendered beside
+    // it: a reply read off the task's stored record must not read as the live
+    // agent looking at a live worktree — including to whoever reads the thread
+    // (or a promoted task seeded from it) months later.
+    // Plain prose, deliberately — no markdown emphasis. A thread message is not
+    // guaranteed to be rendered as markdown on every surface, and a provenance
+    // line that shows up as literal `_underscores_` reads worse than the
+    // sentence it is trying to soften.
+    const content = result.provenance
+      ? `${result.provenance}\n\n${result.answer}`
+      : result.answer;
     await storage.createReviewComment(taskId, {
       threadId: comment.thread_id,
       file: comment.file,
       line: comment.line,
       side: comment.side,
       role: 'agent',
-      content: result.answer,
+      content,
       turnNumber: result.turnNumber,
       anchorSnippet: comment.anchor_snippet,
     });
@@ -496,5 +825,34 @@ async function dispatchAsk(
         `Could not mark review comment ${comment.id} as failed: ${updateErr instanceof Error ? updateErr.message : String(updateErr)}`,
       );
     }
+    throw err;
   }
+}
+
+/**
+ * The "Promote to a task" answer for every task-level discussion, keyed by
+ * thread id: the seeded goal/code/prompt, or the task it was already promoted
+ * to. A thread with nothing to promote yet (no answer) is absent. Sent as the
+ * ANSWER so a remote client (Lazy Teams) never re-derives the seed rule.
+ */
+export async function discussionPromotions(
+  taskId: string,
+  comments: ReviewComment[],
+): Promise<Record<string, DiscussionPromoteSeed>> {
+  const promotions: Record<string, DiscussionPromoteSeed> = {};
+  const taskLevel = comments.filter((c) => isTaskLevelReviewAnchor(c.file, c.line));
+  if (taskLevel.length === 0) return promotions;
+  const task = (await (await getOrCreateStorage()).resolveTask(taskId)).task;
+  if (!task) return promotions;
+  const byThread = new Map<string, ReviewComment[]>();
+  for (const c of taskLevel) {
+    const list = byThread.get(c.thread_id) ?? [];
+    list.push(c);
+    byThread.set(c.thread_id, list);
+  }
+  for (const [threadId, messages] of byThread) {
+    const seed = discussionPromoteSeed(task, threadId, messages);
+    if (seed) promotions[threadId] = seed;
+  }
+  return promotions;
 }

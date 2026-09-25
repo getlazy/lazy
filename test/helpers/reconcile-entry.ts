@@ -17,7 +17,8 @@
  * argv[2] = project root.
  */
 import { reconcileTasks } from '../../src/utils/reconcile';
-import { openProjectStorage } from '../../src/daemon/rpc-handlers';
+import { settleAcceptResumes } from '../../src/daemon/stranded-merge';
+import { initDaemonStorage, getOrCreateStorage } from '../../src/daemon/rpc-handlers';
 
 const root = process.argv[2];
 if (!root) {
@@ -25,9 +26,17 @@ if (!root) {
   process.exit(2);
 }
 
-const storage = await openProjectStorage(root);
+// The daemon's own storage singleton, exactly as the daemon runs a tick: some
+// sweeps call back into daemon operations (the stranded-merge sweep resumes a
+// dead accept through acceptTask), which reach storage through it.
+initDaemonStorage(root);
+const storage = await getOrCreateStorage();
 try {
   await reconcileTasks(storage, root);
+  // The stranded-merge sweep resumes dead accepts without awaiting them (a
+  // daemon tick must not stall); this one-shot pass exits right after, so let
+  // them finish first.
+  await settleAcceptResumes();
 } finally {
   await storage.close();
 }

@@ -15,22 +15,15 @@
  */
 
 import { existsSync } from 'fs';
+import { displayId, shortId, getWorktreePath, taskRef } from '../../task/identity';
 import { parkTaskPaused } from '../../utils/paused-status';
 import { getActor } from '../../constants';
 import type { Task, Session } from '../../types';
 import type { Storage } from '../../storage';
 import { isTerminalStatus } from '../../task-state-machine';
 import { parentTaskIdOf, targetBranchOf, taskTarget, branchTarget } from '../../task-target';
-import { theme } from '../theme';
-import {
-  displayId,
-  shortId,
-  getWorktreePath,
-  resolveTaskOrExit,
-  requireLazyRoot,
-  requireStorage,
-  taskRef,
-} from '../helpers';
+import { theme } from '../../render/theme';
+import { resolveTaskOrExit, requireLazyRoot, requireStorage } from '../helpers';
 import { promptYesNo, isTTY } from '../editor';
 import {
   localBranchExists,

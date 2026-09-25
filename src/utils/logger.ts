@@ -1,6 +1,6 @@
 import { appendFileSync, mkdirSync, statSync, renameSync, unlinkSync } from 'fs';
 import { join } from 'path';
-import { getDataDir } from '../cli/init';
+import { getDataDir } from '../project-paths';
 import { redactSecretValues } from './redact';
 
 /**
@@ -146,6 +146,21 @@ class Logger {
         // Best effort logging
       }
     }
+  }
+
+  /**
+   * Whether a `debug()` call would reach the console or the log file.
+   *
+   * Exposed so a caller can skip BUILDING an expensive debug message rather
+   * than build it and have it dropped on the floor. Only worth consulting when
+   * assembling the message itself costs something — an ordinary
+   * `logger.debug('...')` should just be called.
+   *
+   * Note the default config has `fileLevel: DEBUG`, so this is normally true:
+   * debug messages land in the log file even when the console is quieter.
+   */
+  isDebugEnabled(): boolean {
+    return this.config.fileLevel <= LogLevel.DEBUG || this.config.consoleLevel <= LogLevel.DEBUG;
   }
 
   debug(rawMessage: string): void {

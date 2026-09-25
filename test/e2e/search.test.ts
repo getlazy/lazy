@@ -1,7 +1,14 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS, startAndReconcile } from '../helpers/fixtures';
+import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes, extractTaskId } from '../helpers/assertions';
+import {
+  createTask,
+  disablePreAccept,
+  MOCK_CLAUDE_SUCCESS,
+  startAndAccept,
+  startAndReconcile,
+} from '../helpers/fixtures';
+import { writeRaisedItemsFile, type StoredRaisedItem } from '../helpers/storage';
 
 describe('lazy search', () => {
   let ctx: TestContext;
@@ -98,14 +105,14 @@ describe('lazy search', () => {
       expectOutputExcludes(result, 'database');
     });
 
-    test('code: field filter', async () => {
+    test('task: field filter', async () => {
       // createTask uses --goal, the task gets auto-assigned a code or no code
-      // We need to test that code: works if the task has a code
+      // We need to test that task: works if the task has a code
       const taskId = await createTask(ctx, 'Auth module');
       // Set a code on it
       await ctx.lazy(['edit', taskId, '--code', 'auth-mod']);
 
-      const result = await ctx.lazy(['search', 'code:auth-mod']);
+      const result = await ctx.lazy(['search', 'task:auth-mod']);
 
       expectSuccess(result);
       expectOutput(result, 'Auth module');
@@ -181,6 +188,53 @@ describe('lazy search', () => {
       expectOutput(result, 'reconciler');
     });
 
+    test('in:tasks searches content attached to tasks', async () => {
+      const taskId = await createTask(ctx, 'Task-wide search target');
+      await ctx.lazy(['comment', taskId, '--message', 'task_scope_comment_marker']);
+
+      const result = await ctx.lazy(['search', 'in:tasks task_scope_comment_marker', '--group']);
+
+      expectSuccess(result);
+      expectOutput(result, 'Task-wide search target');
+      expectOutput(result, 'task_scope_comment_marker');
+    });
+
+    test('in:active and in:backlog filter task-wide content by lifecycle stage', async () => {
+      const activeId = await createTask(ctx, 'scope_stage_marker active task', 'Do the work');
+      await createTask(ctx, 'scope_stage_marker backlog task');
+      await startAndReconcile(ctx, activeId);
+
+      const active = await ctx.lazy(['search', 'in:active scope_stage_marker', '--group']);
+      expectSuccess(active);
+      expectOutput(active, 'active task');
+      expectOutputExcludes(active, 'backlog task');
+
+      const backlog = await ctx.lazy(['search', 'in:backlog scope_stage_marker', '--group']);
+      expectSuccess(backlog);
+      expectOutput(backlog, 'backlog task');
+      expectOutputExcludes(backlog, 'active task');
+    });
+
+    test('in:finished finds accepted, closed, and rejected tasks', async () => {
+      disablePreAccept(ctx.root);
+      const acceptedId = await createTask(ctx, 'finished_scope_marker accepted task', 'Do accepted work');
+      const closedId = await createTask(ctx, 'finished_scope_marker closed task');
+      const rejectedId = await createTask(ctx, 'finished_scope_marker rejected task', 'Do rejected work');
+      await createTask(ctx, 'finished_scope_marker backlog task');
+
+      await startAndAccept(ctx, acceptedId);
+      expectSuccess(await ctx.lazy(['close', closedId, '--reason', 'No longer needed', '--yes']));
+      await startAndReconcile(ctx, rejectedId);
+      expectSuccess(await ctx.lazy(['reject', rejectedId, '--reason', 'Wrong approach', '--yes']));
+
+      const result = await ctx.lazy(['search', 'in:finished finished_scope_marker', '--group']);
+      expectSuccess(result);
+      expectOutput(result, 'accepted task');
+      expectOutput(result, 'closed task');
+      expectOutput(result, 'rejected task');
+      expectOutputExcludes(result, 'backlog task');
+    });
+
     test('quoted multi-word text search', async () => {
       await createTask(ctx, 'Fix error handling in auth');
       await createTask(ctx, 'Error in database');
@@ -229,53 +283,61 @@ describe('lazy search', () => {
       expectOutput(result, 'function');
     });
 
-    // code: field filter with hyphenated values — the original reported bug.
+    // task: field filter with hyphenated values — the original reported bug.
     // The tokenizer must handle hyphens in field values correctly.
-    test('code: matches hyphenated codes', async () => {
+    test('task: matches hyphenated codes', async () => {
       const taskId = await createTask(ctx, 'Document search syntax');
       await ctx.lazy(['edit', taskId, '--code', 'doc-search-syntax']);
 
-      const result = await ctx.lazy(['search', 'code:doc-search-syntax']);
+      const result = await ctx.lazy(['search', 'task:doc-search-syntax']);
 
       expectSuccess(result);
       expectOutput(result, 'Document search syntax');
     });
 
-    // code: is case-insensitive — searching with different case should still match.
-    test('code: is case-insensitive', async () => {
+    // task: is case-insensitive — searching with different case should still match.
+    test('task: is case-insensitive', async () => {
       const taskId = await createTask(ctx, 'Auth module');
       await ctx.lazy(['edit', taskId, '--code', 'auth-mod']);
 
-      const result = await ctx.lazy(['search', 'code:AUTH-MOD']);
+      const result = await ctx.lazy(['search', 'task:AUTH-MOD']);
 
       expectSuccess(result);
       expectOutput(result, 'Auth module');
     });
 
-    // code: excludes tasks without matching code.
-    test('code: excludes non-matching tasks', async () => {
+    // task: excludes tasks whose code does not contain the value.
+    test('task: excludes non-matching tasks', async () => {
       const taskId1 = await createTask(ctx, 'First task');
       await ctx.lazy(['edit', taskId1, '--code', 'first-code']);
       const taskId2 = await createTask(ctx, 'Second task');
       await ctx.lazy(['edit', taskId2, '--code', 'second-code']);
 
-      const result = await ctx.lazy(['search', 'code:first-code']);
+      const result = await ctx.lazy(['search', 'task:first-code']);
 
       expectSuccess(result);
       expectOutput(result, 'First task');
       expectOutputExcludes(result, 'Second task');
     });
 
-    // code: requires exact match (not substring).
-    test('code: requires exact match', async () => {
+    // INVARIANT: task: is a SUBSTRING match over the code, in any position.
+    // It was `code:` and required the code in full, which made the obvious
+    // query answer nothing: `code:spike` found none of a project's `spike-*`
+    // tasks. Engineer decision on the rename, 2026-09-13. The semantics are
+    // documented in src/search/grammar.ts and rendered by every surface, so
+    // changing them here means changing them there.
+    test('task: matches a substring of the code, anywhere in it', async () => {
       const taskId = await createTask(ctx, 'Some task');
       await ctx.lazy(['edit', taskId, '--code', 'full-code-name']);
+      const other = await createTask(ctx, 'Other task');
+      await ctx.lazy(['edit', other, '--code', 'unrelated-thing']);
 
-      // Partial code should NOT match with code: field filter
-      const result = await ctx.lazy(['search', 'code:full-code']);
-
-      expectSuccess(result);
-      expectOutput(result, 'No matches');
+      for (const query of ['task:full-code', 'task:code-name', 'task:code']) {
+        const result = await ctx.lazy(['search', query]);
+        expectSuccess(result);
+        expectOutput(result, 'Some task');
+        expectOutputExcludes(result, 'Other task');
+      }
     });
 
     // status: is case-insensitive.
@@ -324,18 +386,18 @@ describe('lazy search', () => {
       const taskId = await createTask(ctx, 'Auth module task');
       await ctx.lazy(['edit', taskId, '--code', 'auth-mod']);
 
-      const result = await ctx.lazy(['search', 'code:auth-mod AND status:backlog']);
+      const result = await ctx.lazy(['search', 'task:auth-mod AND status:backlog']);
 
       expectSuccess(result);
       expectOutput(result, 'Auth module task');
     });
 
-    // Multiple field filters: code AND wrong status returns nothing.
+    // Multiple field filters: task AND wrong status returns nothing.
     test('combined filters: correct code but wrong status returns nothing', async () => {
       const taskId = await createTask(ctx, 'Auth module task');
       await ctx.lazy(['edit', taskId, '--code', 'auth-mod']);
 
-      const result = await ctx.lazy(['search', 'code:auth-mod AND status:working']);
+      const result = await ctx.lazy(['search', 'task:auth-mod AND status:working']);
 
       expectSuccess(result);
       expectOutput(result, 'No matches');
@@ -396,12 +458,31 @@ describe('lazy search', () => {
       expectError(result, 'Query parse error');
     });
 
-    // code: without a value gives a parse error.
-    test('code: without value gives parse error', async () => {
-      const result = await ctx.lazy(['search', 'code: AND status:backlog']);
+    // task: without a value gives a parse error.
+    test('task: without value gives parse error', async () => {
+      const result = await ctx.lazy(['search', 'task: AND status:backlog']);
 
       expectFailure(result);
       expectError(result, 'Query parse error');
+    });
+
+    // INVARIANT: `code:` is retired, not aliased, and says so. The engineer
+    // waived backward compatibility; the point of the rename was that
+    // `code:spike` meant two different things on two surfaces, so the retired
+    // spelling must not quietly become a third (a literal text search).
+    test('code:<value> is rejected and names task: as the replacement', async () => {
+      const result = await ctx.lazy(['search', 'code:spike']);
+
+      expectFailure(result);
+      expectError(result, 'task:spike');
+    });
+
+    // ...but only when it carries a value: "exit code: 1" is prose people
+    // genuinely search for.
+    test('a bare code: in prose is still an ordinary text search', async () => {
+      const result = await ctx.lazy(['search', 'exit code: 1']);
+
+      expectSuccess(result);
     });
   });
 
@@ -543,6 +624,32 @@ describe('lazy search', () => {
       const grouped = await ctx.lazy(['search', 'in:commits "Mock agent commit"', '--group']);
       expectSuccess(grouped);
       expectOutput(grouped, 'Commit search task');
+    });
+
+    // INVARIANT: `--followups` is the pre-unification spelling of the raised
+    // item, and must return the same rows `--raised` returns. Before the
+    // type filter honoured the legacy spelling, this flag matched nothing at
+    // all — no producer emits a 'followup' row — and silently returned zero
+    // results.
+    test('--followups returns raised items, like --raised', async () => {
+      const taskId = await createTask(ctx, 'Follow-up search task', 'Answer questions');
+      const raised: StoredRaisedItem[] = [{
+        id: 'raised-followup-e2e',
+        task_id: taskId,
+        content: 'should the retry path keep its backoff',
+        created_at: Date.now(),
+        blocking: false,
+        status: 'open',
+      }];
+      writeRaisedItemsFile(ctx.root, taskId, raised);
+
+      const byFollowups = await ctx.lazy(['search', 'retry path', '--followups']);
+      const byRaised = await ctx.lazy(['search', 'retry path', '--raised']);
+
+      expectSuccess(byFollowups);
+      expectOutput(byFollowups, 'retry path');
+      expectSuccess(byRaised);
+      expectOutput(byRaised, 'retry path');
     });
   });
 

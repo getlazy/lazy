@@ -109,17 +109,27 @@ function pushabilityNote(parentBranch: string, remoteName: string): string {
  * - Local has commits origin lacks: whichever ref accept will merge into, with
  *   a warning naming both refs, which one was used, and how the local commits
  *   could reach origin. NEVER auto-pushes the parent.
+ *
+ * `refreshRemote: false` takes the same decisions from the refs already on
+ * disk, skipping only the fetch. Read-only surfaces (a rendered diff) need the
+ * same answer as the launcher without doing network I/O and without failing
+ * offline; a three-dot diff is merge-base-based, so a remote-tracking ref that
+ * is a few commits stale produces an identical diff.
  */
 export async function resolveUpstreamMergeRef(
-  driver: Pick<RepositoryDriver, 'needsSync' | 'isTargetBranchProtected' | 'resolveUpstreamRef'>,
+  driver: Pick<RepositoryDriver, 'needsSync' | 'isTargetBranchProtected' | 'resolveUpstreamRef'>
+    & Partial<Pick<RepositoryDriver, 'upstreamRefName'>>,
   parentBranch: string,
   cwd: string,
-  opts: { remoteName?: string; git?: GitFn } = {},
+  opts: { remoteName?: string; git?: GitFn; refreshRemote?: boolean } = {},
 ): Promise<UpstreamRefResolution> {
   const git = opts.git ?? defaultGit;
   const remoteName = opts.remoteName ?? 'origin';
 
-  const resolved = await driver.resolveUpstreamRef(parentBranch, cwd);
+  const resolved = opts.refreshRemote === false
+    ? (driver.upstreamRefName?.(parentBranch)
+      ?? (driver.needsSync ? `${remoteName}/${parentBranch}` : parentBranch))
+    : await driver.resolveUpstreamRef(parentBranch, cwd);
   const base: UpstreamRefResolution = {
     ref: resolved,
     remoteRef: resolved === parentBranch ? null : resolved,

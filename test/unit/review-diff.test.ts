@@ -16,9 +16,18 @@ import {
   threadsJson,
   reviewQueueHtml,
   reviewTaskHtml,
+  reviewScript,
   relativeTime,
+  statusBarHtml,
 } from '../../src/server/review';
-import { acceptBlockedByViolations } from '../../src/server/review-actions';
+import {
+  asksBarLabel,
+  queuedBarLabel,
+  ASKS_BAR_TITLE,
+  QUEUED_BAR_TITLE,
+  STATUS_BAR_LABELS_JS,
+} from '../../src/server/status-bar-labels';
+import { acceptBlockedByViolations, type ReviewQueueEntry } from '../../src/server/review-actions';
 import { bundledStylesheet } from '../../src/server/styles';
 import type { FileViolation, ReviewComment, Task } from '../../src/types';
 
@@ -65,7 +74,6 @@ function task(over: Partial<Task> = {}): Task {
     prompt: '',
     type: 'task',
     status: 'blocked',
-    priority: 'normal',
     created_at: 1,
     completed_at: null,
     target: { kind: 'branch', branch: 'main' },
@@ -249,6 +257,24 @@ describe('renderReviewDiff', () => {
     expect(html).toContain('&lt;script&gt;');
   });
 
+  // INVARIANT: the context-expand buttons show ARROWS, not the source text of
+  // an HTML entity. Their glyphs pass through escapeHtml with every other
+  // dynamic value, so they must be real characters — an escaping sweep changed
+  // the button to escape its glyph while the call sites still passed `&uarr;`,
+  // and `&` became `&amp;`, printing the entity to every reviewer on any diff
+  // with a context gap. Nothing covered these buttons, so it shipped silently.
+  test('context-expand buttons render arrow characters, not entity source', () => {
+    const gapped = 'diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -10,2 +10,3 @@\n intro\n+added line\n outro\n';
+    const html = renderReviewDiff(parseUnifiedDiff(gapped), new Map(), { allowExpand: true });
+    expect(html).toContain('rv-expand-btn');
+    expect(html).toContain('>↔</button>');
+    expect(html).toContain('>↓</button>');
+    // The failure this pins: `&uarr;` escaped to `&amp;uarr;` and shown raw.
+    expect(html).not.toContain('&amp;uarr;');
+    expect(html).not.toContain('&amp;darr;');
+    expect(html).not.toContain('&amp;harr;');
+  });
+
   test('empty file list renders an empty state', () => {
     expect(renderReviewDiff([], new Map())).toContain('empty-state');
   });
@@ -294,7 +320,7 @@ describe('thread grouping', () => {
     ]);
     expect(json.pendingDelivery).toBe(1);
     expect(json.queued).toEqual([
-      { id: 'q1', file: 'src/foo.ts', side: 'new', line: 2, content: 'x'.repeat(400) },
+      { id: 'q1', file: 'src/foo.ts', side: 'new', line: 2, content: 'x'.repeat(400), anchor_snippet: null },
     ]);
   });
 
@@ -347,14 +373,19 @@ describe('reviewTaskHtml', () => {
     content: 'This needs a null check before the cast, and a test for the empty case.',
   });
 
-  // The reviewer reads top-to-bottom; making them scroll back up to unblock is
-  // the abrupt ending this mirrors away. Both copies must be complete, working
-  // forms — with scripting off there is no dialog to fall back on.
-  test('renders the actions block above AND below the diff', () => {
+  // INVARIANT: the action block is rendered once. The second copy existed
+  // because a long diff made the bottom unreachable; the diff now lives on
+  // Changes, so a duplicate form (and the island that synced them) is gone.
+  test('renders the actions block once', () => {
     const html = reviewTaskHtml(task(), PATCH, []);
-    expect(html.split('class="rv-actions"').length - 1).toBe(2);
-    expect(html.split('action="/review/task1234abcd/unblock"').length - 1).toBe(2);
-    expect(html.split('class="rv-accept-form"').length - 1).toBe(2);
+    expect(html.split('class="rv-actions"').length - 1).toBe(1);
+    expect(html).toContain('data-lz-action-open="unblock"');
+    expect(html).toContain('data-lz-action-open="ask"');
+    expect(html).toContain('data-lz-action-open="accept"');
+    // Task URLs carry the task's code.
+    expect(html).toContain('/tasks/demo-task/review/ask"');
+    expect(html).not.toContain('data-rv-tab=');
+    expect(html).not.toContain('rv-tablist');
   });
 
   // INVARIANT: queued comments are shown in full. This list is the reviewer's
@@ -402,7 +433,7 @@ describe('reviewTaskHtml', () => {
   // a comment back must not depend on JavaScript being alive.
   test('a queued comment offers a plain-form Withdraw', () => {
     const html = reviewTaskHtml(task(), PATCH, [queuedComment]);
-    expect(html).toContain('action="/review/task1234abcd/comment/q1/withdraw"');
+    expect(html).toContain('action="/tasks/demo-task/review/comment/q1/withdraw"');
     expect(html).toContain('Withdraw');
   });
 
@@ -445,7 +476,7 @@ describe('reviewTaskHtml', () => {
     expect(html).toContain('why did you drop the retry here?');
     expect(html).toContain('not sent:');
     expect(html).toContain('your question is saved');
-    expect(html).toContain('action="/review/task1234abcd/comment/f1/retry"');
+    expect(html).toContain('action="/tasks/demo-task/review/comment/f1/retry"');
     expect(html).toContain('Re-send to agent');
   });
 
@@ -465,8 +496,10 @@ describe('reviewTaskHtml', () => {
     expect(html).toContain('data-rv-sb="status">status: working');
     expect(html).toContain('4 turns');
     expect(html).toContain('active 2m ago');
-    expect(html).toContain('1 queued');
-    expect(html).toContain('agent busy');
+    expect(html).toContain('1 comment queued');
+    // Not-askable now means "nothing recorded to answer from" — a busy task is
+    // answered from its record, not refused (see test/unit/ask-availability).
+    expect(html).toContain('nothing recorded yet');
   });
 
   test('without an explicit state the bar falls back to the task status', () => {
@@ -477,23 +510,154 @@ describe('reviewTaskHtml', () => {
   });
 });
 
+describe('statusBarHtml counters', () => {
+  const live = {
+    status: 'blocked',
+    turns: 1,
+    lastActiveAt: null,
+    askable: true,
+    askUnavailable: null,
+  };
+
+  // The bar renders on EVERY tab, so its back-link must be absolute — a bare
+  // `href="demo-task"` only resolved while the browser sat exactly at
+  // `/tasks/` and 404ed from Current review or Turns.
+  test('the task-detail link is absolute, by code, by id when the code is duplicated', () => {
+    const html = statusBarHtml(task(), live, 0, 0);
+    expect(html).toContain('href="/tasks/demo-task">task detail</a>');
+    expect(html).not.toContain('href="demo-task');
+    const dup = statusBarHtml(task(), live, 0, 0, { duplicatedCodes: new Set(['demo-task']) });
+    expect(dup).toContain('href="/tasks/task1234abcd">task detail</a>');
+  });
+
+  // The engineer read "0 queued / 0 awaiting agent" as a work queue, which is
+  // a fair reading of those words on a page about one task's work. Neither
+  // number is about a queue of tasks: say what is counted.
+  test('names what each number counts, and explains it on hover', () => {
+    const html = statusBarHtml(task(), live, 2, 3, { everQueued: true, everAsked: true });
+    expect(html).toContain('2 comments queued');
+    expect(html).toContain('3 asks awaiting an answer');
+    expect(html).toContain(QUEUED_BAR_TITLE);
+    expect(html).toContain(ASKS_BAR_TITLE);
+    expect(html).not.toContain('awaiting agent<');
+  });
+
+  test('singular for one', () => {
+    const html = statusBarHtml(task(), live, 1, 1, { everQueued: true, everAsked: true });
+    expect(html).toContain('1 comment queued');
+    expect(html).toContain('1 ask awaiting an answer');
+  });
+
+  // A counter that has never counted anything is clutter — that permanent
+  // "0" is what made the bar read as broken. One that has counted stays
+  // visible at zero so the reviewer can watch it drain.
+  test('a counter nothing has ever put a number in is hidden, a drained one is not', () => {
+    const fresh = statusBarHtml(task(), live, 0, 0);
+    expect(fresh).toContain('data-rv-sb="queued"');
+    expect(fresh).toMatch(/data-rv-sb="queued"[^>]* hidden>/);
+    expect(fresh).toMatch(/data-rv-sb="asks"[^>]* hidden>/);
+
+    const drained = statusBarHtml(task(), live, 0, 0, { everQueued: true, everAsked: true });
+    expect(drained).not.toMatch(/data-rv-sb="queued"[^>]* hidden>/);
+    expect(drained).toContain('0 comments queued');
+  });
+
+  // INVARIANT: the server-rendered wording and the wording the poll rewrites
+  // into the same span come from one definition. A label changed in only one
+  // of the two flickers back to the old words on the first poll.
+  test('the island rewrites the bar with the same wording the server rendered', () => {
+    const labels = new Function(`${STATUS_BAR_LABELS_JS}; return { queuedBarLabel, asksBarLabel };`)();
+    for (const n of [0, 1, 2, 11]) {
+      expect(labels.queuedBarLabel(n)).toBe(queuedBarLabel(n));
+      expect(labels.asksBarLabel(n)).toBe(asksBarLabel(n));
+    }
+    // And the island is actually carrying that definition, not its own copy.
+    const script = reviewScript('task1234abcd');
+    expect(script).toContain('function queuedBarLabel(n)');
+    expect(script).toContain('setBarItem(\'queued\', queuedBarLabel(data.pendingDelivery)');
+    expect(script).toContain('setBarItem(\'asks\', asksBarLabel(data.pending)');
+  });
+
+  // The island's hide rule needs the same two facts the server render used, or
+  // the first poll resurrects the permanent zero.
+  test('the threads poll carries whether anything was ever queued or asked', () => {
+    expect(threadsJson([])).toMatchObject({ everQueued: false, everAsked: false });
+    const asked = comment({ id: 'a1', thread_id: 'a1', intent: 'ask', ask_state: 'answered' });
+    expect(threadsJson([asked])).toMatchObject({ everQueued: false, everAsked: true });
+    const sent = comment({ id: 'q1', thread_id: 'q1', intent: 'comment', delivery_state: 'delivered' });
+    expect(threadsJson([sent])).toMatchObject({ everQueued: true, everAsked: false });
+  });
+});
+
+describe('statusBarHtml loop progress', () => {
+  const live = {
+    status: 'blocked',
+    turns: 1,
+    lastActiveAt: null,
+    askable: true,
+    askUnavailable: null,
+  };
+  const child = (id: string, status: string): Task =>
+    task({ id, code: id, status, target: { kind: 'task', parentTaskId: 'task1234abcd' } } as Partial<Task>);
+
+  // The bar is where a reviewer sits while scrolling a loop's diff, and a loop's
+  // whole state is its children. Same derivation as `lazy show` and the
+  // Subtasks rollup — never recomputed here.
+  test('a loop task gets k-of-n and a link to the running child', () => {
+    const html = statusBarHtml(task({ type: 'cluster', code: 'fix-review' }), live, 0, 0, {
+      children: [child('a', 'complete'), child('b', 'complete'), child('c', 'working'), child('d', 'backlog')],
+    });
+    expect(html).toContain('data-rv-sb="cluster"');
+    expect(html).toContain('2/4');
+    expect(html).toContain('accepted');
+    expect(html).toContain('running <a href="/tasks/c">c</a>');
+  });
+
+  test('a non-loop task has no loop line at all', () => {
+    const html = statusBarHtml(task(), live, 0, 0, { children: [child('a', 'complete')] });
+    expect(html).not.toContain('data-rv-sb="cluster"');
+  });
+
+  // Omitting `children` means the caller never loaded them. Deriving 0/0 from
+  // a list that was never read would print a k/n disagreeing with `lazy show`.
+  test('a loop whose children were not loaded shows no progress rather than 0/0', () => {
+    const html = statusBarHtml(task({ type: 'cluster' }), live, 0, 0);
+    expect(html).not.toContain('data-rv-sb="cluster"');
+  });
+});
+
 describe('reviewQueueHtml', () => {
+  function entry(over: Partial<ReviewQueueEntry> = {}): ReviewQueueEntry {
+    return {
+      id: 'abcd1234ef',
+      code: 'demo-task',
+      goal: 'Do the thing',
+      status: 'blocked',
+      type: 'task',
+      updatedAt: 0,
+      hasSession: true,
+      commentCount: 0,
+      pendingAsks: 0,
+      pendingComments: 0,
+      lastActiveAt: null,
+      descendantCount: 0,
+      ...over,
+    };
+  }
+
+  /** Row order as the reviewer sees it, by task label. */
+  function rowOrder(html: string, labels: string[]): string[] {
+    return [...labels]
+      .map(label => ({ label, at: html.indexOf(`>${label}</a>`) }))
+      .filter(x => x.at >= 0)
+      .sort((a, b) => a.at - b.at)
+      .map(x => x.label);
+  }
+
   test('lists blocked tasks with a link into the review view', () => {
-    const html = reviewQueueHtml([
-      {
-        id: 'abcd1234ef',
-        code: 'demo-task',
-        goal: 'Do the thing',
-        status: 'blocked',
-        type: 'task',
-        updatedAt: 0,
-        hasSession: true,
-        commentCount: 2,
-        pendingAsks: 1,
-        pendingComments: 0,
-      },
-    ]);
-    expect(html).toContain('href="/review/abcd1234ef"');
+    const html = reviewQueueHtml([entry({ commentCount: 2, pendingAsks: 1 })]);
+    // The queue row links by the task's code.
+    expect(html).toContain('href="/tasks/demo-task"');
     expect(html).toContain('demo-task');
     expect(html).toContain('1 awaiting agent');
   });
@@ -502,26 +666,98 @@ describe('reviewQueueHtml', () => {
   // an ask is mid-conversation, a queued comment is work the reviewer has not
   // sent yet and could otherwise forget entirely.
   test('queued comments are counted separately from asks awaiting an answer', () => {
-    const html = reviewQueueHtml([
-      {
-        id: 'abcd1234ef',
-        code: 'demo-task',
-        goal: 'Do the thing',
-        status: 'blocked',
-        type: 'task',
-        updatedAt: 0,
-        hasSession: true,
-        commentCount: 4,
-        pendingAsks: 0,
-        pendingComments: 3,
-      },
-    ]);
+    const html = reviewQueueHtml([entry({ commentCount: 4, pendingComments: 3 })]);
     expect(html).toContain('3 comments to deliver');
     expect(html).not.toContain('awaiting agent');
   });
 
   test('empty queue renders an empty state, not a broken table', () => {
     expect(reviewQueueHtml([])).toContain('Nothing awaiting review');
+  });
+
+  test('every row carries a last activity and a subtask count', () => {
+    const html = reviewQueueHtml([
+      entry({ code: 'release-v022', lastActiveAt: Date.now() - 2 * 3600_000, descendantCount: 17 }),
+      entry({ id: 'ff00', code: 'lonely-task' }),
+    ]);
+    expect(html).toContain('Last activity');
+    expect(html).toContain('Subtasks');
+    expect(html).toContain('2h ago');
+    expect(html).toContain('>17<');
+    // A task with no session and no children says so rather than showing a 0
+    // that looks like a measurement.
+    expect(html).toContain('never');
+    expect(html).toContain('>-<');
+  });
+
+  // INVARIANT: the page states its own order. The reviewer could not tell what
+  // the queue was ranked by, which is the whole reason these columns are here.
+  test('the default order is last activity, newest first, and the page says so', () => {
+    const html = reviewQueueHtml([
+      entry({ id: 'a1', code: 'stale', lastActiveAt: 1_000 }),
+      entry({ id: 'b2', code: 'fresh', lastActiveAt: 9_000 }),
+    ]);
+    expect(html).toContain('Sorted by <strong>last activity</strong>, newest first');
+    expect(rowOrder(html, ['fresh', 'stale'])).toEqual(['fresh', 'stale']);
+  });
+
+  test('?sort=-subtasks is the "show me the release hubs" view', () => {
+    const html = reviewQueueHtml(
+      [
+        entry({ id: 'a1', code: 'small', descendantCount: 1, lastActiveAt: 9_000 }),
+        entry({ id: 'b2', code: 'hub', descendantCount: 24, lastActiveAt: 1_000 }),
+      ],
+      '-subtasks',
+    );
+    expect(html).toContain('Sorted by <strong>subtasks</strong>, most first');
+    expect(rowOrder(html, ['hub', 'small'])).toEqual(['hub', 'small']);
+  });
+
+  test('a field without a leading dash sorts ascending', () => {
+    const html = reviewQueueHtml(
+      [
+        entry({ id: 'a1', code: 'stale', lastActiveAt: 1_000 }),
+        entry({ id: 'b2', code: 'fresh', lastActiveAt: 9_000 }),
+      ],
+      'last_active',
+    );
+    expect(html).toContain('oldest first');
+    expect(rowOrder(html, ['fresh', 'stale'])).toEqual(['stale', 'fresh']);
+  });
+
+  // A task whose agent never ran has no activity to rank. Sorting it to the top
+  // of "oldest first" would bury the tasks the reviewer actually left waiting.
+  test('tasks with no activity sort last whichever way the column points', () => {
+    const entries = [
+      entry({ id: 'a1', code: 'never-ran', lastActiveAt: null, hasSession: false }),
+      entry({ id: 'b2', code: 'ran', lastActiveAt: 5_000 }),
+    ];
+    expect(rowOrder(reviewQueueHtml(entries, '-last_active'), ['ran', 'never-ran']))
+      .toEqual(['ran', 'never-ran']);
+    expect(rowOrder(reviewQueueHtml(entries, 'last_active'), ['ran', 'never-ran']))
+      .toEqual(['ran', 'never-ran']);
+  });
+
+  test('an unrecognised sort field falls back to the default order', () => {
+    const html = reviewQueueHtml(
+      [
+        entry({ id: 'a1', code: 'stale', lastActiveAt: 1_000 }),
+        entry({ id: 'b2', code: 'fresh', lastActiveAt: 9_000 }),
+      ],
+      '-nonsense',
+    );
+    expect(html).toContain('Sorted by <strong>last activity</strong>, newest first');
+    expect(rowOrder(html, ['fresh', 'stale'])).toEqual(['fresh', 'stale']);
+  });
+
+  test('column headers link to the next sort and mark the active one', () => {
+    const html = reviewQueueHtml([entry()]);
+    // Every column is reachable...
+    expect(html).toContain('href="/review?sort=-subtasks"');
+    expect(html).toContain('href="/review?sort=-goal"');
+    // ...and the active column toggles rather than re-asking for what it shows.
+    expect(html).toContain('href="/review?sort=last_active" class="sort-link sort-active"');
+    expect(html).toContain('▼');
   });
 });
 
@@ -575,8 +811,115 @@ describe('protected-file violations on the review surface', () => {
 
   test('the control posts to the decision route and names its file', () => {
     const html = render();
-    expect(html).toContain('action="/review/task1234abcd/violation"');
+    expect(html).toContain('action="/tasks/demo-task/review/violation"');
     expect(html).toContain('<input type="hidden" name="file" value="src/foo.ts">');
+  });
+
+  test('showDecision: false omits the control but keeps the file-section token', () => {
+    const files = parseUnifiedDiff(PATCH);
+    const html = renderReviewDiff(files, new Map(), {
+      violations: new Map([['src/foo.ts', 'pending']]),
+      taskId: 't1',
+      showDecision: false,
+      assignSectionId: false,
+    });
+    expect(html).not.toContain('data-rv-decide=');
+    expect(html).not.toContain(`id="${fileSectionId('src/foo.ts')}"`);
+    expect(html).toContain(`data-file-section="${fileSectionId('src/foo.ts')}"`);
+    expect(html).toContain('rv-file-protected');
+  });
+
+  test('Presented consecutive snippets share one decision; Raw keeps its own copy without a duplicate id', () => {
+    const html = reviewTaskHtml(
+      task({ status: 'conflict' }),
+      PATCH,
+      [],
+      undefined,
+      undefined,
+      [{ file: 'src/foo.ts', base_sha: 'base1111', status: 'pending' }],
+      {
+        turnReport: {
+          id: 'r1',
+          task_id: 'task1234abcd',
+          session_id: 's1',
+          sections: [],
+          created_at: 1,
+          presentation: {
+            groups: [
+              {
+                title: 'Core',
+                tier: 'core',
+                items: [
+                  { kind: 'snippet', file: 'src/foo.ts', start: 1, end: 6 },
+                  { kind: 'snippet', file: 'src/foo.ts', start: 1, end: 6 },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    );
+    const presented = html.split('id="rv-presented"')[1]?.split('id="rv-root"')[0] ?? '';
+    // Bounded at the first <script>, not left open to end-of-document: the
+    // raw pane's closing </div> is immediately followed by changesScripts
+    // (diffViewScript etc.) and then reviewScript, both full of literal
+    // markup-shaped strings ('rv-add-comment', 'data-rv-decide="..."' in
+    // comments/regex sources) that would otherwise silently satisfy an
+    // assertion meant to check the RENDERED pane, not the whole page.
+    const raw = html.split('id="rv-root"')[1]?.split('<script>')[0] ?? '';
+    expect((presented.match(/data-rv-decide="src\/foo\.ts"/g) ?? []).length).toBe(1);
+    // PATCH also has README.md, which residual "Other changes" still cards.
+    // The walkthrough's two foo.ts snippets must be one file card, not two.
+    expect((presented.match(/data-viewed-key="src\/foo\.ts"/g) ?? []).length).toBe(1);
+    expect((raw.match(/data-rv-decide="src\/foo\.ts"/g) ?? []).length).toBe(1);
+    expect(presented).toContain(`id="${fileSectionId('src/foo.ts')}"`);
+    expect(raw).not.toContain(`id="${fileSectionId('src/foo.ts')}"`);
+    expect(raw).toContain(`data-file-section="${fileSectionId('src/foo.ts')}"`);
+  });
+
+  // A file the agent's walkthrough never mentions still lands in the
+  // system-added "Other changes" residual group (appendResidualGroup is
+  // "non-suppressible" by design), rendered as a full renderReviewDiff card —
+  // so it inherits the SAME allowComments default (true) as every other file.
+  // "I saw the raw file and still could not comment" traced to the tab-local
+  // island never re-running after an in-place switch (see task-tabs.ts),
+  // not to a per-file gate on comments — this pins that a file with no
+  // presented form of its own is always commentable, whichever pane renders it.
+  test('a file the walkthrough never mentions is still commentable, in Presented and in Raw', () => {
+    const html = reviewTaskHtml(
+      task({ status: 'conflict' }),
+      PATCH,
+      [],
+      undefined,
+      undefined,
+      undefined,
+      {
+        turnReport: {
+          id: 'r1',
+          task_id: 'task1234abcd',
+          session_id: 's1',
+          sections: [],
+          created_at: 1,
+          presentation: {
+            groups: [
+              { title: 'Core', tier: 'core', items: [{ kind: 'file', file: 'src/foo.ts' }] },
+            ],
+          },
+        },
+      },
+    );
+    const presented = html.split('id="rv-presented"')[1]?.split('id="rv-root"')[0] ?? '';
+    // Bounded at the first <script>: unbounded, this ran to end-of-document
+    // and swallowed three literal `rv-add-comment` occurrences inside island
+    // SOURCE (review-diff.ts, review.ts) — the assertion below passed even
+    // with allowComments forced false for README, which is not what it
+    // claims to test.
+    const raw = html.split('id="rv-root"')[1]?.split('<script>')[0] ?? '';
+    const presentedReadme = presented.slice(presented.indexOf('data-file="README.md"'));
+    const rawReadme = raw.slice(raw.indexOf('data-file="README.md"'));
+    expect(presented).toContain('Other changes');
+    expect(presentedReadme).toContain('rv-add-comment');
+    expect(rawReadme).toContain('rv-add-comment');
   });
 
   // The summary REPORTS; it must not let the reviewer approve a change without
@@ -596,6 +939,45 @@ describe('protected-file violations on the review surface', () => {
     // .rv-violations on every page, so assert on the MARKUP these produce.
     expect(html).not.toContain('data-rv-decide="');
     expect(html).not.toContain('<div class="rv-violations"');
+  });
+
+  // INVARIANT: a leaf task (no accepted children) must keep today's Changes
+  // HTML. The hub list is additive and must not wrap or retitle the diff.
+  test('empty hub-children extras leave the Changes block byte-identical', () => {
+    const leaf = reviewTaskHtml(task(), PATCH, []);
+    const empty = reviewTaskHtml(task(), PATCH, [], undefined, undefined, [], {
+      hubChildren: { accepted: [], inProgress: [] },
+    });
+    expect(empty).toBe(leaf);
+    expect(leaf).not.toContain('Accepted subtasks');
+    expect(leaf).not.toContain('rv-hub-children');
+  });
+
+  test('a hub Changes block links to Subtasks instead of listing children', () => {
+    const html = reviewTaskHtml(task(), PATCH, [], undefined, undefined, [], {
+      hubChildren: {
+        accepted: [task({
+          id: 'child-accepted-id',
+          code: 'child-a',
+          goal: 'Landed child work',
+          status: 'complete',
+          completed_at: Date.now() - 60_000,
+        })],
+        inProgress: [task({
+          id: 'child-live-id',
+          code: 'child-b',
+          goal: 'Still running',
+          status: 'blocked',
+        })],
+      },
+    });
+    expect(html).toContain('rv-hub-children');
+    expect(html).toContain('href="/tasks/demo-task/subtasks"');
+    expect(html).toContain('grouped by status');
+    expect(html).not.toContain('Accepted subtasks');
+    expect(html).not.toContain('Landed child work');
+    // The hub's own diff is still there — the link does not replace it.
+    expect(html).toContain('data-file="src/foo.ts"');
   });
 
   test('the violated file is marked in the diff, and other files are not', () => {
@@ -741,5 +1123,25 @@ describe('side-by-side layout', () => {
     expect(bundledStylesheet()).toContain('tr.rv-pair td.rv-code');
     expect(bundledStylesheet()).toContain('td.rv-c-nil');
     expect(bundledStylesheet()).toContain('td.rv-code:target');
+  });
+
+  // The toolbar used to sit above the diff and scroll out of view on the
+  // first screen of a long review, so it is sticky and opaque. One instance
+  // only: making it reachable everywhere means it must not also grow a
+  // duplicate.
+  //
+  // It parks under --lz-strip-top (the tab strip), NOT --lz-sticky-top. This
+  // assertion used to demand --lz-sticky-top, on the stated premise that the
+  // toolbar parks at "the same measured offset a file's own header parks
+  // under". That premise was the bug: the toolbar is opaque and a z-index
+  // above the file headers, so sharing their offset painted it directly over
+  // every one of them, and a reviewer saw the header vanish on the first
+  // scroll. The chrome is a two-level stack and the two levels need two
+  // offsets — see review-navigation.ts and the browser-level proof in
+  // test/e2e/server-sticky-card-headers.test.ts.
+  test('the toolbar is sticky under the tab strip, not a second floating control', () => {
+    const css = bundledStylesheet();
+    expect(css).toMatch(/\.rv-viewopts \{[^}]*position: sticky;[^}]*top: var\(--lz-strip-top, 0px\);/);
+    expect(css).toMatch(/\.rv-viewopts \{[^}]*background: var\(--color-bg\);/);
   });
 });

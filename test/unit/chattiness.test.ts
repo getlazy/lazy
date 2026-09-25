@@ -2,7 +2,7 @@ import { describe, test, expect } from 'bun:test';
 import { DEFAULT_CONFIG } from '../../src/config/loader';
 import type { ResolvedConfig, ChattinessLevel } from '../../src/config/types';
 import { resolveBuilderChattiness, resolveAgentChattiness, renderChattinessSnippet } from '../../src/config/chattiness';
-import { buildSystemPrompt } from '../../src/cli/commands/shared';
+import { buildSystemPrompt } from '../../src/task/turn-context';
 import builderSystemPrompt from '../../src/prompts/builder-system-prompt.md' with { type: 'text' };
 
 function makeConfig(chattiness: Partial<ResolvedConfig['chattiness']>): ResolvedConfig {

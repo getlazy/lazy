@@ -40,39 +40,66 @@ import type {
   AskCommand,
   SyncCommand,
   StopCommand,
-  PreAcceptCommand,
+  AcceptGateCommand,
+  ReviewCommand,
   SupervisorStatus,
   SupervisorPhase,
   CompletedResponse,
   ErrorResponse,
   WorktreeRecovery,
+  Response,
+  CorrelatedCommand,
 } from '../protocol/types';
-import type { MergeConflict } from '../types';
-import { runSyncWithUpstream, runSyncWithRemote, type MergeGuardOptions, hasUnmergedFiles, abortMergeIfInProgress, settleConflictedWorktree } from './merge';
+import {
+  attachCommandId,
+  commandCorrelationId,
+  PROTOCOL_VERSION,
+} from '../protocol/types';
+import type { MergeConflict, FileViolation, AgentTokenUsage } from '../types';
+import { runSyncWithUpstream, runSyncWithRemote, type MergeTurnOptions, type SyncWithUpstreamResult, hasUnmergedFiles, abortMergeIfInProgress, settleConflictedWorktree } from './merge';
+import { saveWorktreePatch } from './recovery-patch';
 import { readWorktreeMergeState, describeMergeState, isMidMerge, hasUncommittedChanges } from '../git/operations';
-import { runWork, CrashError, WatchdogTimeoutError, GracefulExitTimeoutError, FatalAgentError, CrashLoopError } from './work';
+import { runWork, CrashError, WatchdogTimeoutError, GracefulExitTimeoutError, FatalAgentError, CrashLoopError, turnErrorSessionId } from './work';
 import { makeRetryStatusHandler } from './retry-status';
 import askSystemPrompt from '../prompts/ask-system-prompt.md' with { type: 'text' };
-import { runPostTurnCheck } from './post-turn-check';
+import reviewSystemPrompt from '../prompts/review-system-prompt.md' with { type: 'text' };
+import { runTurnHookCommand, formatHookOutput } from './post-turn-check';
 import { resolveWatchdogTimeout } from './watchdog';
-import { readUsage } from './usage';
+import { addAgentUsage, readUsage } from './usage';
 import { getAgent, getAgentPackaging } from '../agent/registry';
 import { log, logError, logWarn, resetTimer } from './log';
 import { prepareTurnMcp } from './mcp-setup';
-import { clearTurnHandoff, handoffField } from './turn-handoff';
+import { clearTurnHandoff, handoffField, handoffTurnEnding } from './turn-handoff';
 import { createRunnerFromType } from '../runner';
 import type { Runner, RunnerType } from '../runner/types';
-import { PROTOCOL_VERSION } from '../protocol/types';
 import { VERSION } from '../version';
 import { spawn } from '../utils/spawn';
+import { startTestParentWatch, TEST_PARENT_PID_ENV } from '../daemon/test-parent-watch';
 import { runGit } from '../utils/git';
 import { elevatedResetHardHead, elevatedTag } from './elevated-git';
-import { detectViolations } from './permissions';
+import { detectViolations, ViolationScanError } from './permissions';
 import { runPermissionPushback } from './pushback';
-import { detectSkippedMaintainEntries, runMaintainFollowup, renderMaintainContext } from './maintain';
-import { runPreAcceptGate, DEFAULT_PRE_ACCEPT_TIMEOUT_SECS } from './pre-accept';
-import type { CompletedResponseBundle } from '../protocol/types';
+import { runLowHighReview, runLowHighRevise, reviewApproved } from './low-high-loop';
+import { renderMaintainContext } from './maintain';
+import { renderReactContext } from './react';
+import { runWrapUpSteps, computeBranchPointSha } from './wrap-up';
+import { detectUncommittedPaths, MAX_REPORTED_PATHS } from './leftovers';
+import { runReviewVerdictReask } from './review-reask';
+import { parseReviewReport } from '../review/parse-report';
+import { resolveReviewVerdict } from '../review/verdict';
+import { clearFinalMarker, readFinalMarker } from '../protocol/final-marker';
+import { runAcceptanceGate, DEFAULT_PRE_ACCEPT_TIMEOUT_SECS } from './accept-gate';
+import type { CompletedResponseBundle, FinalDeclaration } from '../protocol/types';
 import { truncateLog } from '../utils/log-truncate';
+
+/** Write a response with the originating command's correlation id echoed back. */
+function writeCorrelatedResponse(
+  protocolDir: string,
+  response: Response,
+  command: CorrelatedCommand,
+): void {
+  writeResponse(protocolDir, attachCommandId(response, commandCorrelationId(command)));
+}
 
 export interface SupervisorConfig {
   /** Protocol directory path (shared via volume) */
@@ -112,6 +139,32 @@ async function checkRequiredTools(runner: Runner): Promise<void> {
 }
 
 /**
+ * Harness assumed when a command carries neither `harness` nor `agent_id`.
+ *
+ * Only reachable for commands written by a daemon that predates those fields,
+ * where claude-code is the historical answer.
+ */
+const DEFAULT_HARNESS = 'claude-code';
+
+/**
+ * Which agent BINARY this command's turn runs.
+ *
+ * The supervisor has no config and cannot resolve a profile, so the daemon does
+ * it at dispatch and states the answer on the command. Everything here that
+ * touches the agent REGISTRY — `getAgent`, `getAgentPackaging`, the per-agent
+ * config writers in `prepareTurnMcp` — goes through this, because the registry
+ * is keyed by harness and `cmd.agent_id` is a PROFILE name that need not be one.
+ *
+ * The `agent_id` fallback is exact for every project that has not defined a
+ * custom profile (built-in profiles are named after their harnesses), which is
+ * what lets an older daemon and a newer supervisor keep working together. See
+ * the note above `CommandType` in src/protocol/types.ts.
+ */
+function commandHarness(cmd: { harness?: string; agent_id?: string }): string {
+  return cmd.harness ?? cmd.agent_id ?? DEFAULT_HARNESS;
+}
+
+/**
  * Verify the COMMAND's agent binary exists before running its turn.
  *
  * The startup tool checks above cannot do this: they run before any command
@@ -125,8 +178,8 @@ async function checkRequiredTools(runner: Runner): Promise<void> {
  * Throws (handlers' catch writes the ErrorResponse) — a missing binary can
  * never heal by retrying.
  */
-async function checkCommandAgentBinary(agentId: string | undefined): Promise<void> {
-  const pkg = getAgentPackaging(agentId ?? 'claude-code');
+async function checkCommandAgentBinary(harness: string | undefined): Promise<void> {
+  const pkg = getAgentPackaging(harness ?? DEFAULT_HARNESS);
   const binaryName = pkg.binaryName();
   const proc = spawn(['which', binaryName], { stdout: 'ignore', stderr: 'ignore' });
   if (await proc.exited !== 0) {
@@ -153,9 +206,9 @@ export const ONE_SHOT_STOP_EXIT_CODE = 42;
  * `--model` value the daemon sent — usually a tier alias); it lands on the
  * response as `model`. `reportedModelId` is what the agent said it actually ran,
  * and lands as `model_id`. Omitting a field is meaningful: it records that the
- * setting was not in force / not reported, rather than guessing a default. A
- * `SyncCommand` carries neither `agent_id` nor `effort`, so its
- * conflict-resolution turn records model alone rather than inventing them.
+ * setting was not in force / not reported, rather than guessing a default —
+ * which is how a command from a daemon predating one of these fields yields an
+ * unlabelled turn instead of a turn labelled with a guess.
  *
  * Called per invocation, not per bundle: push-back and maintain are separate
  * agent runs and can report a different concrete model than the work phase.
@@ -163,12 +216,14 @@ export const ONE_SHOT_STOP_EXIT_CODE = 42;
 function launchSettings(
   cmd: { agent_id?: string; model_id?: string; effort?: string },
   reportedModelId?: string,
+  effortOverride?: string,
 ): { agent?: string; model?: string; model_id?: string; effort?: string } {
+  const effort = effortOverride ?? cmd.effort;
   return {
     ...(cmd.agent_id ? { agent: cmd.agent_id } : {}),
     ...(cmd.model_id ? { model: cmd.model_id } : {}),
     ...(reportedModelId ? { model_id: reportedModelId } : {}),
-    ...(cmd.effort ? { effort: cmd.effort } : {}),
+    ...(effort ? { effort } : {}),
   };
 }
 
@@ -213,6 +268,25 @@ export async function runSupervisor(config: SupervisorConfig): Promise<void> {
     log('[supervisor] Running in one-shot mode (will exit after one command)');
   }
 
+  // Test-only: a supervisor spawned by an e2e run must die with that run.
+  //
+  // The host-process runner spawns `lazy supervise` DETACHED and `unref()`s it,
+  // so it is not a child of `bun test` and nothing in that process reaps it by
+  // parentage. The harness now kills supervisors by root in cleanup and in its
+  // process-death net (test/helpers/daemon-registry.ts), but both of those live
+  // inside the `bun test` process — a SIGKILL of that process skips them, and
+  // the leaked supervisor then keeps rewriting the shared ~/.claude.json MCP
+  // entry, which is exactly how one hijacked another agent's tool channel.
+  // This watch is the only layer that survives that, mirroring the daemon's.
+  // No-op unless LAZY_TEST_PARENT_PID is set — see daemon/test-parent-watch.ts.
+  startTestParentWatch(() => {
+    logWarn(
+      `[supervisor] ${TEST_PARENT_PID_ENV} process ${process.env[TEST_PARENT_PID_ENV]} exited — ` +
+      `exiting (PID ${process.pid})`,
+    );
+    process.exit(0);
+  });
+
   // Check required tools before doing any work
   await checkRequiredTools(runner);
 
@@ -253,8 +327,8 @@ export async function runSupervisor(config: SupervisorConfig): Promise<void> {
     const command = await waitForCommand(protocolDir, pollIntervalMs);
     if (!command) continue; // timeout (shouldn't happen with default 0 timeout)
 
-    const turnStartedAt = (command.type === 'start' || command.type === 'unblock' || command.type === 'ask' || command.type === 'pre_accept')
-      ? (command as StartCommand | UnblockCommand | AskCommand | PreAcceptCommand).turn_started_at
+    const turnStartedAt = (command.type === 'start' || command.type === 'unblock' || command.type === 'ask')
+      ? (command as StartCommand | UnblockCommand | AskCommand | ReviewCommand).turn_started_at
       : undefined;
     resetTimer(turnStartedAt);
     log(`[supervisor] Received command: ${command.type} for task ${command.task_id}`);
@@ -290,7 +364,7 @@ export async function runSupervisor(config: SupervisorConfig): Promise<void> {
         error: versionError,
         phase: 'reading_command',
       };
-      writeResponse(protocolDir, versionErrorResponse);
+      writeCorrelatedResponse(protocolDir, versionErrorResponse, command);
       log('[supervisor] Turn complete (protocol version mismatch).');
       if (oneShot) {
         log('[supervisor] One-shot mode: exiting with code 0 (turn done).');
@@ -310,7 +384,7 @@ export async function runSupervisor(config: SupervisorConfig): Promise<void> {
         error: errorMessage,
         phase: 'reading_command',
       };
-      writeResponse(protocolDir, errorResponse);
+      writeCorrelatedResponse(protocolDir, errorResponse, command);
     }
 
     log(`[supervisor] Turn complete.`);
@@ -322,36 +396,6 @@ export async function runSupervisor(config: SupervisorConfig): Promise<void> {
   }
 
   log('[supervisor] Shutting down.');
-}
-
-/**
- * Save the worktree's current diff against HEAD so a rollback is recoverable.
- *
- * Rolling back a mid-merge worktree destroys whatever resolution was in it.
- * CLAUDE.md's recovery-file rule exists for exactly this: work that cannot be
- * kept must at least be retrievable. `.lazy/recovery/` is gitignored, so writing
- * here never dirties the worktree the caller is about to clean.
- *
- * Returns the patch path, or null when nothing could be saved — saving is
- * best-effort and must never stop the recovery it precedes.
- */
-async function saveWorktreeRollbackPatch(worktreePath: string): Promise<string | null> {
-  try {
-    const diff = await runGit(['diff', 'HEAD'], { cwd: worktreePath });
-    if (diff.exitCode !== 0 || !diff.stdout.trim()) return null;
-    const dir = join(worktreePath, '.lazy', 'recovery');
-    await mkdir(dir, { recursive: true });
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const patchPath = join(dir, `merge-rollback-${stamp}.patch`);
-    await writeFile(patchPath, diff.stdout.endsWith('\n') ? diff.stdout : `${diff.stdout}\n`, 'utf-8');
-    return patchPath;
-  } catch (err) {
-    logWarn(
-      `[supervisor] Could not save a rollback patch before recovering the worktree: ` +
-      `${err instanceof Error ? err.message : String(err)}`,
-    );
-    return null;
-  }
 }
 
 /**
@@ -381,9 +425,18 @@ async function recoverWorktreeState(
     `(${describeMergeState(state)}). Rolling it back — any resolution in it is being discarded.`,
   );
 
-  const patchPath = await saveWorktreeRollbackPatch(worktreePath);
+  const saved = await saveWorktreePatch(worktreePath, 'merge-rollback');
+  const patchPath = saved.outcome === 'saved' ? saved.path : null;
   if (patchPath) {
     logWarn(`[supervisor] Saved the discarded worktree state to ${patchPath}`);
+  } else if (saved.outcome === 'failed') {
+    // The rollback still has to happen — a turn cannot start on a half-merged
+    // worktree — but the human must be told the discard was unwitnessed rather
+    // than being left to assume there was nothing in it.
+    logError(
+      `[supervisor] Could NOT capture the worktree diff before rolling back (${saved.reason}). ` +
+      `Anything uncommitted here is being discarded without a recovery patch.`,
+    );
   }
 
   if (state.mergeInProgress) {
@@ -402,6 +455,10 @@ async function recoverWorktreeState(
     `Rolled back a half-merged worktree found before the ${context} command ` +
     `(${describeMergeState(state)})` +
     (patchPath ? `. The discarded changes were saved to ${patchPath}` : '') +
+    (saved.outcome === 'failed'
+      ? `. WARNING: the worktree diff could not be captured first (${saved.reason}), so anything ` +
+        'uncommitted was discarded without a recovery patch'
+      : '') +
     (settled ? '.' : `. WARNING: the worktree is STILL mid-merge (${describeMergeState(after)}).`);
   if (!settled) logError(`[supervisor] ${summary}`);
 
@@ -415,24 +472,201 @@ async function recoverWorktreeState(
 }
 
 /**
- * Guard timeouts for merge-resolution agent turns.
+ * Per-turn options for merge-resolution agent turns.
  *
  * A merge turn is an ordinary agent turn — it edits files, runs tests, and
- * commits — so it gets the same two guards as the work phase, from the same
- * config. The merge phase shells out to `claude` directly rather than through
- * the agent abstraction, so the "0 = use the agent default" fallback resolves
- * against claude-code.
+ * commits — so it runs the TASK'S agent and gets the same two guards as the
+ * work phase, from the same config. The "0 = use the agent default" fallback
+ * therefore resolves against that same agent: cursor declares a non-zero
+ * default precisely because it is known to hang, and resolving against
+ * claude-code (which declares 0) would have left a cursor merge turn unguarded.
+ *
+ * It also carries the command's `effort` for the same reason it carries the
+ * model: a merge turn runs on the task's own agent, model and effort (INVARIANT
+ * turn-launch-continuity, src/daemon/launch-identity.ts). Neither is resolved
+ * here — both arrive on the command, already resolved from the task record.
  */
-function mergeGuards(cmd: {
+function mergeTurnOptions(cmd: {
   watchdog_output_timeout_ms?: number;
   wind_down_timeout_ms?: number;
-}): MergeGuardOptions {
+  harness?: string;
+  agent_id?: string;
+  effort?: string;
+}): MergeTurnOptions {
+  const harness = commandHarness(cmd);
   return {
+    harness,
     noProgressTimeoutMs: resolveWatchdogTimeout(
       cmd.watchdog_output_timeout_ms ?? 0,
-      getAgent('claude-code').defaultWatchdogTimeoutMs(),
+      getAgent(harness).defaultWatchdogTimeoutMs(),
     ),
     windDownTimeoutMs: cmd.wind_down_timeout_ms ?? 0,
+    ...(cmd.effort ? { effort: cmd.effort } : {}),
+  };
+}
+
+/** Default pre-turn hook timeout (seconds) when the command omits one. */
+const DEFAULT_PRE_TURN_TIMEOUT_SECS = 120;
+
+interface PreTurnHookOutcome {
+  /** Set when the hook ran; mirrors the post-turn check's exit-code convention. */
+  exitCode?: number;
+  /** Captured, labelled output — recorded on the turn. Only set on failure. */
+  output?: string;
+  /** One-line-plus-detail failure summary to prepend to the agent's prompt. */
+  promptPrefix?: string;
+  /** When set, the turn must not run: write this response and return. */
+  abort?: ErrorResponse;
+}
+
+/**
+ * Run the `[automation] pre_turn` setup hook, if configured.
+ *
+ * Failure policy (engineer decision): NON-FATAL, but loud. The default is that
+ * a failing hook does not cost the turn — the agent may well be able to work,
+ * or to fix the setup itself — but it is never swallowed: the failure is logged,
+ * recorded on the turn for the reviewer, and prepended to the agent's prompt so
+ * it starts out knowing the environment is degraded. Projects whose turns are
+ * worthless without their services set `pre_turn_required = true` to fail the
+ * turn instead.
+ */
+async function runPreTurnHook(
+  cmd: StartCommand | UnblockCommand,
+  worktreePath: string,
+  status: SupervisorStatus,
+  protocolDir: string,
+  config: SupervisorConfig,
+): Promise<PreTurnHookOutcome> {
+  if (!cmd.pre_turn_hook) return {};
+
+  const timeoutSecs = cmd.pre_turn_timeout ?? DEFAULT_PRE_TURN_TIMEOUT_SECS;
+  const required = cmd.pre_turn_required === true;
+  log(`[supervisor] Pre-turn hook: "${cmd.pre_turn_hook}" (timeout: ${timeoutSecs}s, required: ${required})`);
+
+  // §3.5: on the host-process runner the hook runs on the HOST, unsandboxed,
+  // and whatever it starts outlives the turn with nothing to sweep it up. That
+  // is a real change in blast radius from the container runners, so it is
+  // announced every turn rather than mentioned once in the docs.
+  if ((config.runnerType ?? 'docker') === 'dangerously-host-process-without-any-isolation') {
+    logWarn(
+      `[supervisor] Pre-turn hook runs on the HOST (host-process runner), not in a container: ` +
+        `"${cmd.pre_turn_hook}" in ${worktreePath}. Anything it starts keeps running after this turn ` +
+        `and after the task ends — nothing sweeps it up. Stop it yourself when you are done.`,
+    );
+  }
+
+  updatePhase(status, 'pre_turn_hook', protocolDir);
+  let exitCode: number;
+  let detail: string;
+  try {
+    const result = await runTurnHookCommand(
+      cmd.pre_turn_hook,
+      worktreePath,
+      timeoutSecs * 1000,
+      'Pre-turn hook',
+    );
+    exitCode = result.exitCode;
+    if (result.timedOut) {
+      detail =
+        `Pre-turn hook timed out after ${timeoutSecs}s ` +
+        `(killed with ${result.killSignal ?? 'SIGTERM'} after ${result.elapsedMs}ms)\n\n` +
+        `--- output at timeout ---\n${truncateLog(formatHookOutput(result))}`;
+    } else {
+      detail = truncateLog(formatHookOutput(result));
+    }
+  } catch (err) {
+    exitCode = -1;
+    detail = err instanceof Error ? err.message : String(err);
+  } finally {
+    updatePhase(status, 'pre_turn_hook_done', protocolDir);
+  }
+
+  if (exitCode === 0) {
+    log('[supervisor] Pre-turn hook succeeded');
+    return {};
+  }
+
+  const headline = `Pre-turn hook failed (exit ${exitCode}): ${cmd.pre_turn_hook}`;
+  logWarn(`[supervisor] ${headline}`);
+  const output = `${headline}\n\n${detail}`;
+
+  if (required) {
+    return {
+      exitCode,
+      output,
+      abort: {
+        status: 'error',
+        error:
+          `${headline}\n\n${detail}\n\n` +
+          `The turn was not run because [automation] pre_turn_required = true. ` +
+          `Fix the setup command, or set pre_turn_required = false to run turns anyway.`,
+        phase: 'pre_turn_hook',
+        // Classified fatal on purpose: a required setup hook that fails is an
+        // environment/config problem only a human can fix, and it fails the
+        // same way every time. Left unclassified the task would land in
+        // `interrupted` and auto-resume would re-run the same failing hook on
+        // a timer. `fatal_config` lands it in the human's queue instead.
+        failure_class: 'fatal_config',
+        failure_reason: `[automation] pre_turn failed and pre_turn_required = true`,
+      },
+    };
+  }
+
+  return {
+    exitCode,
+    output,
+    promptPrefix:
+      `## Environment warning: the pre-turn setup hook failed\n\n` +
+      `${headline}\n\n` +
+      `Your environment may be missing services this project expects to be running. ` +
+      `Take this into account before concluding that something is broken in the code, ` +
+      `and fix the setup if you can.\n\n` +
+      `\`\`\`\n${detail}\n\`\`\``,
+  };
+}
+
+/**
+ * Per-turn capture of the agent's turn-ending declaration (final-turn design
+ * §2.4), shared by the work path and the wrap-up command — both drive multiple
+ * agent invocations, and each invocation gets its own chance to declare and
+ * its own claim.
+ *
+ * Read-and-clear: returns the pencils-down claim when THIS invocation made
+ * one, so it rides home on THAT invocation's response and the reconciler
+ * records it on the turn that made it. A `needs_input` mark sets `wasDeclared`
+ * — which is how this supervisor knows the invocation reached the daemon, and
+ * so that the MCP-down handoff file is not worth re-reading — but is not
+ * carried, because the raise itself is already in the store.
+ *
+ * INVARIANT (§13.10): the marker is read and cleared on EVERY capture, so a
+ * stale `final.json` can never make an unfinished turn look declared-done.
+ */
+function makeTurnEndingCapture(protocolDir: string): {
+  captureTurnEnding: () => Promise<FinalDeclaration | undefined>;
+  /** Whether ANY invocation so far said how it was ending. */
+  wasDeclared: () => boolean;
+  /** Record a declaration that arrived outside a marker (the handoff fallback). */
+  markDeclared: () => void;
+} {
+  let declaredTurnEnding = false;
+  return {
+    captureTurnEnding: async (): Promise<FinalDeclaration | undefined> => {
+      const marker = await readFinalMarker(protocolDir, log);
+      await clearFinalMarker(protocolDir, log);
+      if (!marker) return undefined;
+      declaredTurnEnding = true;
+      if (!marker.final) return undefined;
+      log(`[supervisor] Agent declared final at ${marker.final.sha.substring(0, 8)}`);
+      return {
+        sha: marker.final.sha,
+        declared_at: marker.final.declared_at,
+        ...(marker.final.note ? { note: marker.final.note } : {}),
+      };
+    },
+    wasDeclared: () => declaredTurnEnding,
+    markDeclared: () => {
+      declaredTurnEnding = true;
+    },
   };
 }
 
@@ -458,12 +692,18 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     return;
   }
 
-  // Pre-accept commands run the agent's final validation turn (write mode), then
-  // re-run the configured gate commands as the authoritative merge gate. No
-  // upstream/post-turn sync or violation detection — the daemon owns this turn
-  // end-to-end and drives the merge from the response.
-  if (command.type === 'pre_accept') {
-    await handlePreAcceptCommand(command as PreAcceptCommand, config, runner);
+  // Acceptance-gate commands are MECHANICAL: run the configured gate commands
+  // in the worktree and report the outcome. No agent runs, no session, no
+  // turn — the daemon drives the merge from the response's `accept_gate` field.
+  if (command.type === 'accept_gate') {
+    await handleAcceptGateCommand(command as AcceptGateCommand, config);
+    return;
+  }
+
+  // Review commands are ask-shaped (read-only, no integration) but start a
+  // NEW agent session — never --resume the implementer's context.
+  if (command.type === 'review') {
+    await handleReviewCommand(command as ReviewCommand, config, runner);
     return;
   }
 
@@ -505,14 +745,14 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       const remoteSyncSessionId = command.type === 'unblock'
         ? (command as UnblockCommand).agent_session_id
         : undefined;
-      const conflicts = await runSyncWithRemote(
+      const remoteResult = await runSyncWithRemote(
         worktreePath,
         cmd.remote_branch,
         cmd.model_id,
         remoteSyncSessionId,
-        mergeGuards(cmd),
+        mergeTurnOptions(cmd),
       );
-      allMergeConflicts.push(...conflicts);
+      allMergeConflicts.push(...remoteResult.conflicts);
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       logError(`[supervisor] Sync-with-remote failed: ${errorMessage}`);
@@ -528,7 +768,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
         merge_state: mergeState,
         ...(turnRecovery ? { worktree_recovery: turnRecovery } : {}),
       };
-      writeResponse(protocolDir, errorResponse);
+      writeCorrelatedResponse(protocolDir, errorResponse, command);
       return;
     }
 
@@ -564,7 +804,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
         cmd.model_id,
         mergeSessionId,
         undefined,
-        mergeGuards(cmd),
+        mergeTurnOptions(cmd),
       );
       allMergeConflicts.push(...syncResult.conflicts);
     } catch (err) {
@@ -580,7 +820,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
         merge_state: mergeState,
         ...(turnRecovery ? { worktree_recovery: turnRecovery } : {}),
       };
-      writeResponse(protocolDir, errorResponse);
+      writeCorrelatedResponse(protocolDir, errorResponse, command);
       return;
     }
 
@@ -594,13 +834,44 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     await tagHead(worktreePath, tagName);
   }
 
+  // Phase 2b: Pre-turn setup hook (`[automation] pre_turn`).
+  //
+  // Runs in the worktree AFTER the upstream merge and BEFORE the agent starts,
+  // so the agent finds a working environment (dev server, database, queue) on
+  // its first tool call rather than discovering it is missing halfway through.
+  //
+  // It runs on EVERY work turn, including resumes. Nothing restarts services
+  // between turns any more — agent-started processes survive turn boundaries —
+  // so the hook's job is "ensure services are up" (first turn of a fresh
+  // container, or one that crashed since), not "restart after the per-turn
+  // kill". That makes idempotence a hard requirement for hook scripts, and it
+  // is documented as such in lazy.toml.example and docs/lazy-toml.md.
+  //
+  // Deliberately NOT run for `ask` (read-only, no work) or the mechanical
+  // acceptance gate (no agent, no work).
+  const preTurn = await runPreTurnHook(cmd, worktreePath, status, protocolDir, config);
+  if (preTurn.abort) {
+    writeCorrelatedResponse(protocolDir, preTurn.abort, cmd);
+    return;
+  }
+
   // Write this turn's MCP server config + permissions so Claude Code discovers
   // the lazy tools. Write mode — this turn may commit, journal, and run subtasks.
-  await prepareTurnMcp(runner, cmd.task_id, worktreePath, { readOnly: false, agentId: cmd.agent_id });
+  await prepareTurnMcp(runner, cmd.task_id, worktreePath, { readOnly: false, harness: commandHarness(cmd), model: cmd.model_id });
 
   // Start the turn with an empty handoff file, so anything collected afterwards
   // is unambiguously from THIS turn's agent.
   await clearTurnHandoff(worktreePath, log);
+
+  // ...and with no turn-ending marker, for the same reason and a sharper one:
+  // INVARIANT (final-turn design §13.10) — a stale `final.json` must never make
+  // an unfinished turn look declared-done. It is cleared before EVERY agent
+  // invocation below, not just this one, because each invocation gets its own
+  // chance to declare and its own claim.
+  await clearFinalMarker(protocolDir, log);
+
+  /** Per-turn capture of the marker each invocation leaves (§2.4). */
+  const turnEnding = makeTurnEndingCapture(protocolDir);
 
   // Phase 3: Work (actual task work via Claude Code)
   updatePhase(status, 'work', protocolDir);
@@ -613,10 +884,11 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     // Callback to update status when entering retry mode
     const onRetryStateChange = makeRetryStatusHandler(status, protocolDir);
 
-    // Resolve the agent from the command (defaults to claude-code for backward compat)
-    const agent = getAgent(cmd.agent_id ?? 'claude-code');
-    log(`[supervisor] Using agent: ${agent.id}`);
-    await checkCommandAgentBinary(cmd.agent_id);
+    // Resolve the harness from the command (defaults to claude-code for backward compat)
+    const harness = commandHarness(cmd);
+    const agent = getAgent(harness);
+    log(`[supervisor] Using agent: ${agent.id}${cmd.agent_id && cmd.agent_id !== agent.id ? ` (profile "${cmd.agent_id}")` : ''}`);
+    await checkCommandAgentBinary(harness);
 
     // Resolve effective watchdog timeout: config value (0 = use agent default)
     const effectiveWatchdogMs = resolveWatchdogTimeout(
@@ -628,18 +900,27 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       ? (command as UnblockCommand).permission_mode
       : undefined;
 
-    // Up-front maintained-file context: tell the agent which files this project
-    // expects kept up to date (and why) while it works. No-op when unconfigured.
+    // Up-front maintained-file + reactive-automation context: tell the agent
+    // which files this project expects kept up to date / which path matches
+    // trigger a follow-up reaction. No-op when unconfigured.
     const maintainContext = renderMaintainContext(cmd.maintain);
-    const systemPromptForWork = maintainContext
-      ? `${cmd.system_prompt ?? ''}\n\n${maintainContext}`
+    const reactContext = renderReactContext(cmd.react);
+    const automationContext = [maintainContext, reactContext].filter(Boolean).join('\n\n');
+    const systemPromptForWork = automationContext
+      ? `${cmd.system_prompt ?? ''}\n\n${automationContext}`
       : cmd.system_prompt;
+
+    // A non-fatal pre-turn hook failure is prepended to the prompt so the agent
+    // knows its environment is degraded before it starts assuming otherwise.
+    const promptForWork = preTurn.promptPrefix
+      ? `${preTurn.promptPrefix}\n\n${cmd.prompt}`
+      : cmd.prompt;
 
     const result = await runWork(
       agent,
       runner,
       worktreePath,
-      cmd.prompt,
+      promptForWork,
       systemPromptForWork,
       cmd.model_id,
       claudeSessionId,
@@ -651,10 +932,18 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       permissionMode,
       cmd.wind_down_timeout_ms,
       cmd.agent_extra_args,
+      undefined, // _sleepOverride
+      { taskId: cmd.task_id, agentId: cmd.agent_id },
     );
 
     updatePhase(status, 'work_done', protocolDir);
     log(`[supervisor] Agent result: session_id=${result.session_id?.substring(0, 8)}, result_length=${result.result.length}`);
+
+    // How the WORK invocation ended, read before any follow-up invocation can
+    // clear the marker. Carried on the work response further down. Reassigned
+    // only by the handoff fallback below, which is the same claim arriving on
+    // the other channel.
+    let workFinalDeclared = await turnEnding.captureTurnEnding();
 
     // Record agent's work endpoint (before any post-turn sync)
     const postWorkSha = await getHeadSha(worktreePath);
@@ -666,43 +955,12 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     await tagHead(worktreePath, tagName);
     log(`[supervisor] Tagged HEAD: ${tagName}`);
 
-    // Phase 3b: Check for file permission violations and push back if needed
-    const protectedPatterns = cmd.protected_patterns ?? [];
-    const startShaWork = status.post_merge_sha ?? status.pre_turn_sha ?? preTurnSha;
-
-    // Compute branch point SHA: the point before the task created any files.
-    // Files not present at the branch point were created by the task itself and are
-    // exempt from permission violations (they're not pre-existing files).
-    //
-    // Primary: merge-base with parent branch (accounts for upstream merges).
-    // Fallback: cmd.branch_point_sha (the session's git_start_sha, always available).
-    let branchPointSha: string | undefined = cmd.branch_point_sha;
-    if (cmd.parent_branch && protectedPatterns.length > 0) {
-      const mergeBaseResult = await runGit(
-        ['merge-base', cmd.parent_branch, 'HEAD'],
-        { cwd: worktreePath },
-      );
-      if (mergeBaseResult.exitCode === 0 && mergeBaseResult.stdout.trim()) {
-        branchPointSha = mergeBaseResult.stdout.trim();
-        log(`[supervisor] Branch point SHA (merge-base with ${cmd.parent_branch}): ${branchPointSha.substring(0, 8)}`);
-      } else {
-        log(`[supervisor] Could not compute merge-base with ${cmd.parent_branch} — using branch_point_sha fallback`);
-      }
-    }
-    if (branchPointSha) {
-      log(`[supervisor] Using branch point SHA: ${branchPointSha.substring(0, 8)}${!cmd.parent_branch ? ' (from command)' : ''}`);
-    }
-
-    log(`[supervisor] Checking permissions: ${protectedPatterns.length} pattern(s) [${protectedPatterns.join(', ')}], diff ${startShaWork.substring(0, 8)}..${postWorkSha.substring(0, 8)}`);
-    log(`[supervisor] status.post_merge_sha=${status.post_merge_sha?.substring(0, 8)}, status.pre_turn_sha=${status.pre_turn_sha?.substring(0, 8)}, preTurnSha=${preTurnSha.substring(0, 8)}`);
-    let violations = await detectViolations(worktreePath, startShaWork, postWorkSha, protectedPatterns, branchPointSha);
-    log(`[supervisor] Violations detected: ${violations.length}`);
-
-    // Supervised follow-up invocations (push-back, maintain nudge). Each is a
-    // SEPARATE `claude -p` invocation and becomes a FULL CompletedResponse in the
-    // bundle — its own commits/SHAs, usage (incl. cache), and (for push-back) its
-    // own re-detected violation set. The work turn's response stays clean; the
-    // reconciler materializes each as a discrete supervisor→agent turn pair.
+    // Supervised follow-up invocations (low-high loop phases, push-back, maintain
+    // nudge). Each is a SEPARATE `claude -p` invocation and becomes a FULL
+    // CompletedResponse in the bundle — its own commits/SHAs, usage (incl.
+    // cache), per-invocation effort, and (for push-back) its own re-detected
+    // violation set. The work turn's response stays clean; the reconciler
+    // materializes each as a discrete supervisor→agent turn pair.
     //
     // INVARIANT: status.post_work_sha stays pinned at the WORK end (postWorkSha)
     // — it is NOT advanced past supervised commits. That kills the double-count:
@@ -711,125 +969,192 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     const supervisedResponses: CompletedResponse[] = [];
     let lastInvocationSha = postWorkSha;
     // The session the next supervised invocation resumes from. Starts at the work
-    // session; advances to the push-back session so the maintain nudge continues the
-    // conversation AFTER the push-back exchange rather than branching off the work turn.
+    // session; advances through each supervised invocation (each resume can
+    // rotate the session id) so every follow-up continues ONE conversation.
     let lastSessionId = result.session_id;
-    // Whether the push-back exchange ran this command. Tracked explicitly (not derived
-    // from the FINAL violation set) so it stays true even when the agent RESOLVED the
-    // violations. The maintain step reads it to guarantee it never loops back into a
-    // second push-back round.
-    let pushedBack = false;
 
-    // Push-back: give the agent one chance to self-correct before blocking
-    if (violations.length > 0) {
-      pushedBack = true;
-      log(`[supervisor] Detected ${violations.length} file permission violation(s). Pushing back...`);
-      updatePhase(status, 'permission_pushback', protocolDir);
-
-      const pushbackResult = await runPermissionPushback(
-        agent,
-        worktreePath,
-        result.session_id,
-        violations,
-        cmd.model_id,
-        cmd.effort,
-        cmd.agent_extra_args,
-      );
-
-      // Re-check violations on the new HEAD (agent may have reverted some files).
-      const postPushbackSha = await getHeadSha(worktreePath);
-      violations = await detectViolations(worktreePath, startShaWork, postPushbackSha, protectedPatterns, branchPointSha);
-      log(`[supervisor] After push-back: ${violations.length} violation(s) remaining`);
-      updatePhase(status, 'permission_pushback_done', protocolDir);
-
-      // The push-back response owns exactly the commits made during ITS invocation
-      // (lastInvocationSha..postPushbackSha) and carries the FINAL violation set
-      // (empty array when the agent resolved them — so the reconciler sees "checked,
-      // none remain" rather than falling back to the work response's stale set).
+    // Phase 3a-2 (EXPERIMENTAL low-high loop): one bounded review→revise cycle.
+    // The work phase above was the DRAFT (it ran at the command's low effort);
+    // now a high-effort read-only self-review produces revision instructions,
+    // and unless it approved, one revise invocation back at the draft effort
+    // applies them. Runs BEFORE violation detection/push-back so the final
+    // violation scan covers revise commits too.
+    if (cmd.low_high_loop) {
+      updatePhase(status, 'low_high_review', protocolDir);
+      log(`[supervisor] Low-high loop: reviewing draft at effort=${cmd.low_high_loop.review_effort}`);
+      const review = await runLowHighReview(agent, worktreePath, lastSessionId, {
+        modelId: cmd.model_id,
+        effort: cmd.low_high_loop.review_effort,
+        watchdogTimeoutMs: effectiveWatchdogMs,
+        extraArgs: cmd.agent_extra_args,
+      });
+      // The review is read-only (plan mode) — its SHA window is empty by
+      // construction, but read HEAD anyway so an unexpected write is attributed
+      // rather than hidden.
+      const postReviewSha = await getHeadSha(worktreePath);
+      const reviewFinal = await turnEnding.captureTurnEnding();
       supervisedResponses.push({
         status: 'completed',
-        result: pushbackResult.response,
-        session_id: pushbackResult.session_id,
-        usage: pushbackResult.usage,
-        ...launchSettings(cmd, pushbackResult.model_id),
+        result: review.response,
+        session_id: review.session_id,
+        usage: review.usage,
+        ...launchSettings(cmd, review.model_id, cmd.low_high_loop.review_effort),
         start_sha_work: lastInvocationSha,
-        end_sha_work: postPushbackSha,
-        violations,
-        supervised: { kind: 'permission_pushback', prompt: pushbackResult.prompt },
+        end_sha_work: postReviewSha,
+        ...(reviewFinal ? { final: reviewFinal } : {}),
+        supervised: { kind: 'low_high_review', prompt: review.prompt },
       });
+      lastInvocationSha = postReviewSha;
+      lastSessionId = review.session_id;
+      updatePhase(status, 'low_high_review_done', protocolDir);
 
-      if (postPushbackSha !== lastInvocationSha) {
-        const pushbackTagName = `turn/${cmd.task_id.substring(0, 8)}/post-work/${postPushbackSha.substring(0, 8)}`;
-        await tagHead(worktreePath, pushbackTagName);
-      }
-      lastInvocationSha = postPushbackSha;
-      // Resume the maintain nudge from the push-back session so it lands AFTER the
-      // push-back exchange in one continuous conversation.
-      lastSessionId = pushbackResult.session_id;
-    }
-
-    // Phase 3b-2: Maintained-file skip check. The inverse of protected files —
-    // groups the project expects kept up to date. When the turn touched none of
-    // a group's files, nudge the agent once to update or justify skipping.
-    //
-    // PRECEDENCE INVARIANT (maintain-nudge-violation-precedence): the maintain
-    // nudge runs AFTER the push-back exchange and is INDEPENDENT of its outcome.
-    //   - It fires whether push-back left violations or the agent resolved them —
-    //     it is NOT gated on `violations.length === 0`. (Rationale: lazy.toml is
-    //     itself a protected file, so every turn that edits it would otherwise
-    //     never get a maintain nudge, making the feature look inert.)
-    //   - It must NEVER re-trigger push-back. Push-back is single-shot and already
-    //     ran above when `pushedBack` is set; this step only ever sends a maintain
-    //     nudge, so there is no second push-back round. `pushedBack` is referenced
-    //     here to document that the ordering (work → push-back → maintain) is
-    //     deliberate and that re-running push-back is structurally impossible.
-    //   - Sequencing: this nudge resumes `lastSessionId`, which advanced to the
-    //     push-back session above, so the nudge lands after the push-back reply.
-    //   - The maintain response carries NO `violations` field, so the reconciler's
-    //     "last response with violations wins" rule still reads the push-back set —
-    //     a still-violating turn stays `conflict` even though it also got nudged.
-    const maintainEntries = cmd.maintain ?? [];
-    if (maintainEntries.length > 0) {
-      const maintainEndSha = await getHeadSha(worktreePath);
-      const { skipped, turnHadChanges } = await detectSkippedMaintainEntries(
-        worktreePath,
-        startShaWork,
-        maintainEndSha,
-        maintainEntries,
-      );
-      log(`[supervisor] Maintained-file check: ${maintainEntries.length} group(s), turnHadChanges=${turnHadChanges}, skipped=${skipped.length}, violationsRemaining=${violations.length}, pushedBack=${pushedBack}`);
-
-      if (skipped.length > 0) {
-        log(`[supervisor] ${skipped.length} maintained group(s) skipped — prompting agent...`);
-        const followup = await runMaintainFollowup(
-          agent,
-          worktreePath,
-          lastSessionId,
-          skipped,
-          cmd.model_id,
-          cmd.effort,
-        );
-
-        // The follow-up may have committed updates (it can do real work). Those
-        // commits belong to the maintain turn — attribute them via its own SHA
-        // window (lastInvocationSha..postFollowupSha), not the work turn.
-        const postFollowupSha = await getHeadSha(worktreePath);
+      const approved = reviewApproved(review.response);
+      if (!review.ok) {
+        log('[supervisor] Low-high loop: review failed — skipping the revise phase, draft work stands.');
+      } else if (approved) {
+        log('[supervisor] Low-high loop: review approved the draft — no revise phase.');
+      } else {
+        updatePhase(status, 'low_high_revise', protocolDir);
+        log(`[supervisor] Low-high loop: applying review instructions at effort=${cmd.effort ?? 'default'}`);
+        const revise = await runLowHighRevise(agent, worktreePath, lastSessionId, {
+          modelId: cmd.model_id,
+          effort: cmd.effort ?? 'low',
+          watchdogTimeoutMs: effectiveWatchdogMs,
+          extraArgs: cmd.agent_extra_args,
+        });
+        const postReviseSha = await getHeadSha(worktreePath);
+        const reviseFinal = await turnEnding.captureTurnEnding();
         supervisedResponses.push({
           status: 'completed',
-          result: followup.response,
-          session_id: followup.session_id,
-          usage: followup.usage,
-          ...launchSettings(cmd, followup.model_id),
+          result: revise.response,
+          session_id: revise.session_id,
+          usage: revise.usage,
+          ...launchSettings(cmd, revise.model_id),
           start_sha_work: lastInvocationSha,
-          end_sha_work: postFollowupSha,
-          supervised: { kind: 'maintain', prompt: followup.prompt },
+          end_sha_work: postReviseSha,
+          ...(reviseFinal ? { final: reviseFinal } : {}),
+          supervised: { kind: 'low_high_revise', prompt: revise.prompt },
         });
-
-        if (postFollowupSha !== lastInvocationSha) {
-          await tagHead(worktreePath, `turn/${cmd.task_id.substring(0, 8)}/post-work/${postFollowupSha.substring(0, 8)}`);
+        if (postReviseSha !== lastInvocationSha) {
+          await tagHead(worktreePath, `turn/${cmd.task_id.substring(0, 8)}/post-work/${postReviseSha.substring(0, 8)}`);
         }
-        lastInvocationSha = postFollowupSha;
+        lastInvocationSha = postReviseSha;
+        lastSessionId = revise.session_id;
+        updatePhase(status, 'low_high_revise_done', protocolDir);
       }
+    }
+
+    // Phase 3b: The wrap-up chain. Protected-file push-back runs on every work
+    // turn so each turn persists the same violation set the whole-branch scan
+    // derives. The maintained-file and reactive nudges remain final-only.
+    //
+    // The PRESENTATION is the exception, and it is why the daemon sends two
+    // lists. A walkthrough exists to inform the human's accept decision, so it
+    // is owed on every human-facing park — needs-input and plain blocked
+    // included — not only when the agent declared done. Gating it on the
+    // declaration made the human ask for it by hand at exactly the moment they
+    // were being asked to decide. So `park_steps` runs permission push-back
+    // plus the presentation when the turn parked without a final.
+    //
+    // The chain is skipped in plan mode: a plan-mode agent cannot revert a
+    // protected edit, so the push-back exchange could not resolve anything, and
+    // a whole-branch scan would flag work the mode exists to preview. The final
+    // declaration still rides home on the work response; a human accepting a
+    // plan-mode task gets the accept-time remedies instead.
+    const protectedPatterns = cmd.protected_patterns ?? [];
+    const startShaWork = status.post_merge_sha ?? status.pre_turn_sha ?? preTurnSha;
+    const upstreamMergeRef = 'upstream_merge_ref' in cmd
+      ? (cmd as { upstream_merge_ref?: string }).upstream_merge_ref ?? cmd.parent_branch
+      : cmd.parent_branch;
+    // The handoff file is the MCP-down fallback for both declared endings, and
+    // it is consulted BEFORE the wrap-up decision: a turn whose tools died and
+    // which said pencils down in a file has declared its ending, and that
+    // declaration must select the FULL chain exactly as a marker declaration
+    // would. The claim SHA is read at the post-LOOP head — the head the agent
+    // declared at — rather than after the wrap-up steps have committed.
+    // Consulted only when no marker declared, and once per turn: a handoff
+    // entry written by a wrap-up step's own invocation is collected onto the
+    // work response by handoffField below, but no longer re-decides the ending
+    // — the wrap-up steps run with a working MCP channel and their own marker
+    // capture.
+    const handoffEnding = turnEnding.wasDeclared() ? null : await handoffTurnEnding(worktreePath);
+    if (handoffEnding) {
+      log(`[supervisor] Turn ending declared via the handoff file (${handoffEnding.ending})`);
+      turnEnding.markDeclared();
+      if (handoffEnding.ending === 'final') {
+        workFinalDeclared = {
+          sha: await getHeadSha(worktreePath),
+          declared_at: new Date().toISOString(),
+          ...(handoffEnding.note ? { note: handoffEnding.note } : {}),
+        };
+      }
+    }
+
+    // HOW THE TURN ENDED picks the list. Declared final → the full chain;
+    // parked without one → the park plan. Both come from the daemon on the
+    // command, because the ending is not knowable when the command is written.
+    const declaredFinal = workFinalDeclared !== undefined;
+    const wrapUpSteps = declaredFinal
+      ? cmd.wrap_up?.steps ?? []
+      : cmd.wrap_up?.park_steps ?? [];
+
+    let violations: FileViolation[] = [];
+    let pushedBack = false;
+    if (wrapUpSteps.length > 0 && permissionMode !== 'plan') {
+      // Branch point = the commit before the task created any files — files not
+      // present there are the task's own and exempt from permission violations.
+      // Computed in the shared resolver (wrap-up.ts) so the wrap-up command's
+      // scans exempt exactly the same file set as this one.
+      const branchPointSha = await computeBranchPointSha({
+        worktreePath,
+        parentBranch: cmd.parent_branch,
+        hasProtectedPatterns: protectedPatterns.length > 0,
+        fallbackSha: cmd.branch_point_sha,
+      });
+
+      log(
+        `[supervisor] Wrap-up phase: ${declaredFinal ? 'final declared' : 'parked without a final'}, ` +
+        `${wrapUpSteps.length} step(s) [${wrapUpSteps.join(', ')}], ` +
+        `scan window ${startShaWork.substring(0, 8)}..${lastInvocationSha.substring(0, 8)}`,
+      );
+      // Across the seam for `lazy_final`'s walkthrough-step refusal: set on a
+      // declared turn, CLEARED on a park, so a claim from an earlier turn can
+      // never answer this one. Written before the phase update, which is what
+      // flushes the status file.
+      status.declared_final = workFinalDeclared
+        ? { sha: workFinalDeclared.sha, declared_at: workFinalDeclared.declared_at }
+        : undefined;
+      updatePhase(status, 'wrap_up', protocolDir);
+      const outcome = await runWrapUpSteps({
+        agent,
+        worktreePath,
+        protocolDir,
+        status,
+        updatePhase: (phase) => updatePhase(status, phase, protocolDir),
+        cmd,
+        steps: wrapUpSteps,
+        startSha: startShaWork,
+        startSessionId: lastSessionId,
+        protectedPatterns,
+        branchPointSha,
+        upstreamMergeRef,
+        maintainEntries: cmd.maintain ?? [],
+        reactEntries: cmd.react ?? [],
+        captureTurnEnding: turnEnding.captureTurnEnding,
+        supervisedResponses,
+        presentedSha: cmd.wrap_up?.presented_sha,
+        declaredFinal,
+      });
+      violations = outcome.violations;
+      pushedBack = outcome.pushedBack;
+      lastInvocationSha = outcome.lastInvocationSha;
+      lastSessionId = outcome.lastSessionId;
+      updatePhase(status, 'wrap_up_done', protocolDir);
+      log(`[supervisor] Wrap-up phase done: violations=${violations.length}, pushedBack=${pushedBack}, supervised=${supervisedResponses.length}`);
+    } else if (wrapUpSteps.length > 0 && permissionMode === 'plan') {
+      log('[supervisor] Plan mode — wrap-up skipped (a plan-mode agent cannot resolve violations); accept-time remedies apply');
+    } else {
+      log(`[supervisor] No wrap-up steps for this ending (${declaredFinal ? 'final' : 'parked'}) — nothing to run`);
     }
 
     // Phase 3c: Post-turn check (run configurable command and capture output)
@@ -841,24 +1166,26 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       log(`[supervisor] Running post-turn check (timeout: ${timeoutSecs}s)`);
       updatePhase(status, 'post_turn_check', protocolDir);
       try {
-        const result = await runPostTurnCheck(
+        const result = await runTurnHookCommand(
           cmd.post_turn_check,
           worktreePath,
           timeoutSecs * 1000,
         );
         checkExitCode = result.exitCode;
-        const truncatedStderr = truncateLog(result.stderr);
+        // Both streams, separately labelled: service-style scripts routinely
+        // report failure on stdout and say nothing on stderr.
+        const truncatedOutput = truncateLog(formatHookOutput(result));
         if (result.timedOut) {
           checkOutput =
             `Post-turn check timed out after ${timeoutSecs}s ` +
             `(killed with ${result.killSignal ?? 'SIGTERM'} after ${result.elapsedMs}ms)\n\n` +
-            `--- stderr at timeout ---\n${truncatedStderr}`;
+            `--- output at timeout ---\n${truncatedOutput}`;
           logWarn(
             `[supervisor] Post-turn check timed out after ${timeoutSecs}s ` +
               `(killSignal=${result.killSignal}, elapsedMs=${result.elapsedMs})`,
           );
         } else {
-          checkOutput = truncatedStderr;
+          checkOutput = truncatedOutput;
           log(
             `[supervisor] Post-turn check exited with code ${checkExitCode} (elapsedMs=${result.elapsedMs})`,
           );
@@ -890,7 +1217,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
           cmd.model_id,
           result.session_id,
           undefined,
-          mergeGuards(cmd),
+          mergeTurnOptions(cmd),
         );
         allMergeConflicts.push(...postTurnSync.conflicts);
         updatePhase(status, 'post_turn_sync_done', protocolDir);
@@ -924,6 +1251,24 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     // unreachable. Absent in the normal case.
     const handoff = await handoffField(worktreePath, log);
 
+    // What is still loose in the worktree now the turn is over — after the
+    // wrap-up chain, the post-turn check and the post-turn sync, so this is the
+    // state the task is actually parked in. None of it is on the branch.
+    //
+    // Recorded on EVERY work turn, whatever the plan said: the
+    // `commit_leftovers` step belongs to finals, but a park that quietly holds
+    // an edit nobody has seen is exactly what cost four tasks their end-of-turn
+    // docs. A scan is one `git status`; the step is a model invocation.
+    // A failed scan (null) writes nothing rather than an empty set — "I could
+    // not look" must not reach a reviewer as "there was nothing there".
+    const leftoverPaths = await detectUncommittedPaths(worktreePath);
+    if (leftoverPaths && leftoverPaths.length > 0) {
+      logWarn(
+        `[supervisor] Turn ending with ${leftoverPaths.length} uncommitted path(s), none of them on the branch: ` +
+        leftoverPaths.slice(0, MAX_REPORTED_PATHS).join(', '),
+      );
+    }
+
     const workResponse: CompletedResponse = {
       status: 'completed',
       result: result.result,
@@ -933,10 +1278,20 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       ...(result.mcp_tools ? { mcp_tools: result.mcp_tools } : {}),
       ...(turnRecovery ? { worktree_recovery: turnRecovery } : {}),
       ...handoff,
+      // Pencils down, when the WORK invocation declared it (or the handoff
+      // fallback did). A claim made during a follow-up rides on that
+      // follow-up's own response instead — the claim belongs to the invocation
+      // that made it.
+      ...(workFinalDeclared ? { final: workFinalDeclared } : {}),
       ...(allMergeConflicts.length > 0 ? { merge_conflicts: allMergeConflicts } : {}),
       ...(pushedBack ? { pushed_back: true } : {}),
       ...(checkExitCode !== undefined ? { check_exit_code: checkExitCode } : {}),
       ...(checkOutput !== undefined ? { check_output: checkOutput } : {}),
+      ...(preTurn.exitCode !== undefined ? { pre_turn_exit_code: preTurn.exitCode } : {}),
+      ...(preTurn.output !== undefined ? { pre_turn_output: preTurn.output } : {}),
+      ...(leftoverPaths && leftoverPaths.length > 0
+        ? { uncommitted: leftoverPaths.slice(0, MAX_REPORTED_PATHS) }
+        : {}),
     };
 
     const bundle: CompletedResponseBundle = {
@@ -944,7 +1299,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       responses: [workResponse, ...supervisedResponses],
     };
     log(`[supervisor] Response written: ${bundle.responses.length} invocation response(s), final violations=${violations.length}`);
-    writeResponse(protocolDir, bundle);
+    writeCorrelatedResponse(protocolDir, bundle, cmd);
 
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
@@ -953,15 +1308,31 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     // Detect whether the agent had any effect on the branch. If the turn failed
     // AND there are no new commits AND the worktree is clean, the agent provably
     // did not influence the branch — downstream consumers can skip mechanisms
-    // that only make sense when work was done (e.g., pre-accept reflection).
+    // that only make sense when work was done (e.g., a wrap-up step).
     let agentHadNoEffect: boolean | undefined;
+    // And WHICH paths are loose, from the same scan. A crashed or
+    // watchdog-killed turn never reaches the wrap-up, so nothing asks it to
+    // commit what it wrote — this is the case where loose work is most at risk
+    // and, until now, the only one that recorded nothing about it.
+    let failedTurnPaths: string[] | null = null;
     try {
       const currentSha = await getHeadSha(worktreePath);
       const hasNewCommits = currentSha !== preTurnSha && preTurnSha !== 'unknown' && currentSha !== 'unknown';
-      const hasUncommitted = await hasUncommittedChanges(worktreePath);
+      failedTurnPaths = await detectUncommittedPaths(worktreePath);
+      // `null` is "could not look", which must not read as "clean" in either
+      // answer: fall back to the predicate, which is allowed to say false.
+      const hasUncommitted = failedTurnPaths !== null
+        ? failedTurnPaths.length > 0
+        : await hasUncommittedChanges(worktreePath);
       agentHadNoEffect = !hasNewCommits && !hasUncommitted;
       if (agentHadNoEffect) {
         log('[supervisor] Agent had no effect on the branch (no commits, clean worktree).');
+      }
+      if (failedTurnPaths && failedTurnPaths.length > 0) {
+        logWarn(
+          `[supervisor] Failed turn left ${failedTurnPaths.length} uncommitted path(s) in the worktree: ` +
+          failedTurnPaths.slice(0, MAX_REPORTED_PATHS).join(', '),
+        );
       }
     } catch (detectErr) {
       logWarn(`[supervisor] Could not detect if agent had effect: ${detectErr instanceof Error ? detectErr.message : detectErr}`);
@@ -977,11 +1348,14 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       ...(turnRecovery ? { worktree_recovery: turnRecovery } : {}),
       ...(await handoffField(worktreePath, log)),
       ...(agentHadNoEffect !== undefined ? { agent_had_no_effect: agentHadNoEffect } : {}),
+      ...(failedTurnPaths && failedTurnPaths.length > 0
+        ? { uncommitted: failedTurnPaths.slice(0, MAX_REPORTED_PATHS) }
+        : {}),
     };
 
     describeTurnFailure(errorResponse, err);
 
-    writeResponse(protocolDir, errorResponse);
+    writeCorrelatedResponse(protocolDir, errorResponse, cmd);
   }
 }
 
@@ -996,7 +1370,7 @@ async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, run
   const syncRecovery = await recoverWorktreeState(worktreePath, 'sync');
 
   const preTurnSha = await getHeadSha(worktreePath);
-  log(`[supervisor] Sync command: pre-turn SHA ${preTurnSha.substring(0, 8)}, parent_branch=${cmd.parent_branch}`);
+  log(`[supervisor] Sync command: pre-turn SHA ${preTurnSha.substring(0, 8)}, parent_branch=${cmd.parent_branch}, remote_branch=${cmd.remote_branch ?? '(none)'}`);
 
   const syncNow = new Date().toISOString();
   const status: SupervisorStatus = {
@@ -1012,14 +1386,117 @@ async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, run
   writeStatus(protocolDir, status);
 
   // MCP config for the conflict-resolution agent. Write mode: resolving a merge
-  // means editing and committing. No agentId: the conflict-resolution turn
-  // always runs Claude Code (src/supervisor/merge.ts), whatever the task agent.
-  await prepareTurnMcp(runner, cmd.task_id, worktreePath, { readOnly: false });
+  // means editing and committing. The harness matters: the conflict-resolution
+  // turn runs the TASK'S agent (src/supervisor/merge.ts), and cursor discovers
+  // MCP servers from a different file — without it a cursor merge turn has no
+  // `lazy_commit`, which is the only way it can conclude the merge.
+  await prepareTurnMcp(runner, cmd.task_id, worktreePath, { readOnly: false, harness: commandHarness(cmd), model: cmd.model_id });
   await clearTurnHandoff(worktreePath, log);
 
   const allMergeConflicts: MergeConflict[] = [];
 
-  // Merge upstream branch
+  // The sync response is a bundle of per-STEP pairs, in the order the steps ran:
+  // each step contributes a `supervisor`-authored merge announcement (marked with
+  // `sync`) and, only when that step hit conflicts, the agent's resolution reply
+  // right after it. The reconciler reads that structure positionally — see
+  // recordSyncTurns — so a step's reply must always follow its own announcement.
+  const responses: CompletedResponse[] = [];
+  let firstStep = true;
+
+  function pushStep(label: string, result: SyncWithUpstreamResult): void {
+    // Never claim a merge that did not happen (fix-sync-no-merge).
+    const resultMessage = result.merged
+      ? (result.conflicts.length > 0
+        ? `Merged ${label} @ ${result.targetSha.substring(0, 8)} with ${result.conflicts.length} resolved conflict(s). HEAD: ${result.preMergeSha.substring(0, 8)} → ${result.postMergeSha.substring(0, 8)}.`
+        : `Merged ${label} @ ${result.targetSha.substring(0, 8)}. HEAD: ${result.preMergeSha.substring(0, 8)} → ${result.postMergeSha.substring(0, 8)}.`)
+      : `Already up to date: HEAD (${result.preMergeSha.substring(0, 8)}) already contains ${label} @ ${result.targetSha.substring(0, 8)}. No merge performed.`;
+
+    responses.push({
+      status: 'completed',
+      result: resultMessage,
+      session_id: '',
+      usage: { input_tokens: 0, output_tokens: 0 },
+      sync: { merged: result.merged, conflicts: result.conflicts.length },
+      // Deliberately NO launchSettings: a clean merge invokes no agent at all, so
+      // this announcement ran no model and must not be labelled with one. The
+      // conflict-resolution response below is the invocation, and carries them.
+      // A rollback performed before this sync is reported on the first response
+      // even when the sync itself succeeded — the reconciler journals it against
+      // the task so a discarded resolution is never invisible (fix-sync-silent-conflict).
+      ...(firstStep && syncRecovery ? { worktree_recovery: syncRecovery } : {}),
+      ...(result.conflicts.length > 0 ? { merge_conflicts: result.conflicts } : {}),
+      // For a CLEAN merge the merge commit belongs to the announcement turn (SHA
+      // window attached here); for a conflict merge the commit is the agent's and
+      // is attributed to the resolution turn instead.
+      ...(result.merged && result.conflicts.length === 0
+        ? { start_sha_work: result.preMergeSha, end_sha_work: result.postMergeSha }
+        : {}),
+    });
+    firstStep = false;
+
+    if (result.merged && result.resolution) {
+      responses.push({
+        status: 'completed',
+        result: result.resolution.result,
+        session_id: result.resolution.session_id,
+        usage: result.resolution.usage,
+        // A sync command carries the task's agent, model and effort, so the
+        // conflict-resolution turn is labelled with all three — the same
+        // launch settings the merge turn actually ran on.
+        ...launchSettings(cmd, result.resolution.model_id),
+        start_sha_work: result.preMergeSha,
+        end_sha_work: result.postMergeSha,
+      });
+    }
+  }
+
+  // Step 1: reconcile the task's OWN branch with origin — a colleague may have
+  // pushed to it. Runs before the parent merge for the same reason the
+  // start/unblock path orders them this way: settle what the branch is meant to
+  // contain, then merge approved upstream work on top. The host has already
+  // fetched; `remote_branch` is only set when it found new commits.
+  if (cmd.remote_branch) {
+    updatePhase(status, 'sync_with_remote', protocolDir);
+    try {
+      const remoteResult = await runSyncWithRemote(
+        worktreePath,
+        cmd.remote_branch,
+        cmd.model_id,
+        cmd.agent_session_id,
+        mergeTurnOptions(cmd),
+      );
+      allMergeConflicts.push(...remoteResult.conflicts);
+      pushStep(cmd.remote_branch, remoteResult);
+
+      const postRemoteSyncSha = await getHeadSha(worktreePath);
+      status.post_remote_sync_sha = postRemoteSyncSha;
+      updatePhase(status, 'sync_with_remote_done', protocolDir);
+      await tagHead(
+        worktreePath,
+        `turn/${cmd.task_id.substring(0, 8)}/post-remote-sync/${postRemoteSyncSha.substring(0, 8)}`,
+      );
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      logError(`[supervisor] Sync-with-remote failed: ${errorMessage}`);
+
+      // INVARIANT (fix-sync-silent-conflict): a failed merge phase never returns
+      // with a half-merged worktree, and the parent step does NOT run on top of
+      // an unreconciled branch — the whole sync fails, loudly and re-runnably.
+      const mergeState = await settleConflictedWorktree(worktreePath);
+      const errorResponse: ErrorResponse = {
+        status: 'error',
+        error: `Sync-with-remote failed: ${errorMessage}${mergeState.settled ? '' : ` — ${mergeState.detail}`}`,
+        phase: 'sync_with_remote',
+        merge_state: mergeState,
+        ...(syncRecovery ? { worktree_recovery: syncRecovery } : {}),
+        ...(await handoffField(worktreePath, log)),
+      };
+      writeCorrelatedResponse(protocolDir, errorResponse, cmd);
+      return;
+    }
+  }
+
+  // Step 2: merge the parent/upstream branch (unchanged behaviour).
   updatePhase(status, 'merge_and_fix', protocolDir);
 
   // Prefer the host-resolved SHA so the supervisor merges the exact commit
@@ -1058,7 +1535,7 @@ async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, run
       cmd.model_id,
       cmd.agent_session_id,
       commandUpstreamSha,
-      mergeGuards(cmd),
+      mergeTurnOptions(cmd),
     );
     allMergeConflicts.push(...syncResult.conflicts);
   } catch (err) {
@@ -1079,7 +1556,7 @@ async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, run
       ...(syncRecovery ? { worktree_recovery: syncRecovery } : {}),
       ...(await handoffField(worktreePath, log)),
     };
-    writeResponse(protocolDir, errorResponse);
+    writeCorrelatedResponse(protocolDir, errorResponse, cmd);
     return;
   }
 
@@ -1108,7 +1585,7 @@ async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, run
       ...(syncRecovery ? { worktree_recovery: syncRecovery } : {}),
       ...(await handoffField(worktreePath, log)),
     };
-    writeResponse(protocolDir, errorResponse);
+    writeCorrelatedResponse(protocolDir, errorResponse, cmd);
     return;
   }
 
@@ -1121,60 +1598,21 @@ async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, run
 
   // Write completed response
   updatePhase(status, 'writing_response', protocolDir);
-  log(`[supervisor] Sync complete. merged=${syncResult.merged} pre=${syncResult.preMergeSha.substring(0, 8)} post=${postMergeSha.substring(0, 8)} target=${syncResult.targetSha.substring(0, 8)}`);
+  log(`[supervisor] Sync complete. merged=${syncResult.merged} pre=${syncResult.preMergeSha.substring(0, 8)} post=${postMergeSha.substring(0, 8)} target=${syncResult.targetSha.substring(0, 8)} conflicts=${allMergeConflicts.length}`);
 
-  // Build an honest result message — never claim "Sync merge completed
-  // successfully" when no merge actually happened (fix-sync-no-merge).
-  const resultMessage = syncResult.merged
-    ? (syncResult.conflicts.length > 0
-      ? `Merged ${cmd.parent_branch} @ ${syncResult.targetSha.substring(0, 8)} with ${syncResult.conflicts.length} resolved conflict(s). HEAD: ${syncResult.preMergeSha.substring(0, 8)} → ${postMergeSha.substring(0, 8)}.`
-      : `Merged ${cmd.parent_branch} @ ${syncResult.targetSha.substring(0, 8)}. HEAD: ${syncResult.preMergeSha.substring(0, 8)} → ${postMergeSha.substring(0, 8)}.`)
-    : `Already up to date: HEAD (${syncResult.preMergeSha.substring(0, 8)}) already contains ${cmd.parent_branch} @ ${syncResult.targetSha.substring(0, 8)}. No merge performed.`;
+  pushStep(cmd.parent_branch, syncResult);
 
-  // The sync response is a bundle: the `supervisor`-authored merge announcement,
-  // plus (only when the merge had conflicts) the agent's conflict-resolution reply
-  // as a second full response. The `sync` marker tells the reconciler how to
-  // record turns — a no-op merge (merged: false) records NO turn at all. For a
-  // CLEAN merge the merge commit belongs to the announcement turn (SHA window
-  // attached here); for a conflict merge the commit is the agent's and is
-  // attributed to the resolution turn instead.
-  const mergeResponse: CompletedResponse = {
-    status: 'completed',
-    result: resultMessage,
-    session_id: '',
-    usage: { input_tokens: 0, output_tokens: 0 },
-    sync: { merged: syncResult.merged, conflicts: syncResult.conflicts.length },
-    // A rollback performed before this sync is reported on the response even
-    // when the sync itself succeeded — the reconciler journals it against the
-    // task so a discarded resolution is never invisible (fix-sync-silent-conflict).
-    ...(syncRecovery ? { worktree_recovery: syncRecovery } : {}),
-    ...(allMergeConflicts.length > 0 ? { merge_conflicts: allMergeConflicts } : {}),
-    ...(syncResult.merged && syncResult.conflicts.length === 0
-      ? { start_sha_work: syncResult.preMergeSha, end_sha_work: postMergeSha }
-      : {}),
-  };
-
-  const responses: CompletedResponse[] = [mergeResponse];
-  if (syncResult.merged && syncResult.resolution) {
-    responses.push({
-      status: 'completed',
-      result: syncResult.resolution.result,
-      session_id: syncResult.resolution.session_id,
-      usage: syncResult.resolution.usage,
-      // A SyncCommand carries no `effort` (the daemon never resolves one for a
-      // merge), so the conflict-resolution turn honestly records model only —
-      // `effort` stays absent rather than being invented from the task default.
-      ...launchSettings(cmd, syncResult.resolution.model_id),
-      start_sha_work: syncResult.preMergeSha,
-      end_sha_work: postMergeSha,
-      // The conflict-resolution agent is the only agent this command runs, so
-      // any handoff it left belongs to this turn.
-      ...(await handoffField(worktreePath, log)),
-    });
+  // Any handoff the sync's agent turns left belongs to the LAST agent this
+  // command ran — the announcements run no agent at all, so a handoff on one of
+  // them would attribute an agent's note to the supervisor.
+  const handoff = await handoffField(worktreePath, log);
+  if (Object.keys(handoff).length > 0) {
+    const lastAgentResponse = [...responses].reverse().find(r => !r.sync);
+    if (lastAgentResponse) Object.assign(lastAgentResponse, handoff);
   }
 
   const bundle: CompletedResponseBundle = { status: 'completed', responses };
-  writeResponse(protocolDir, bundle);
+  writeCorrelatedResponse(protocolDir, bundle, cmd);
 }
 
 /**
@@ -1203,8 +1641,9 @@ async function handleAskCommand(cmd: AskCommand, config: SupervisorConfig, runne
   writeStatus(protocolDir, status);
 
   try {
-    const agent = getAgent(cmd.agent_id ?? 'claude-code');
-    await checkCommandAgentBinary(cmd.agent_id);
+    const harness = commandHarness(cmd);
+    const agent = getAgent(harness);
+    await checkCommandAgentBinary(harness);
     const effectiveWatchdogMs = resolveWatchdogTimeout(
       cmd.watchdog_output_timeout_ms ?? 0,
       agent.defaultWatchdogTimeoutMs(),
@@ -1226,12 +1665,13 @@ async function handleAskCommand(cmd: AskCommand, config: SupervisorConfig, runne
     //      sees this variable. Layer 2 is what covers that case.
     //   4. Stern ask-system-prompt steering the agent to answer in text only.
     process.env.LAZY_MCP_READ_ONLY = '1';
+    delete process.env.LAZY_MCP_REVIEW;
 
     // An ask is still an agent turn, and it needs the READ-ONLY lazy tools to
     // answer questions about live task state. Without this the turn ran with
     // whatever ~/.claude.json the container happened to have — nothing at all
     // after a container relaunch, which is how asks lost their lazy tools.
-    await prepareTurnMcp(runner, cmd.task_id, worktreePath, { readOnly: true, agentId: cmd.agent_id });
+    await prepareTurnMcp(runner, cmd.task_id, worktreePath, { toolset: 'read', harness: commandHarness(cmd), model: cmd.model_id });
 
     const askPrompt = cmd.system_prompt
       ? `${askSystemPrompt}\n\n---\n\n${cmd.system_prompt}`
@@ -1254,6 +1694,8 @@ async function handleAskCommand(cmd: AskCommand, config: SupervisorConfig, runne
       'plan',
       undefined, // windDownTimeoutMs — n/a for read-only ask turns
       cmd.agent_extra_args,
+      undefined, // _sleepOverride
+      { taskId: cmd.task_id, agentId: cmd.agent_id },
     );
     const agentDurationMs = Date.now() - agentStart;
 
@@ -1267,7 +1709,7 @@ async function handleAskCommand(cmd: AskCommand, config: SupervisorConfig, runne
       ...(result.mcp_tools ? { mcp_tools: result.mcp_tools } : {}),
       agent_duration_ms: agentDurationMs,
     };
-    writeResponse(protocolDir, response);
+    writeCorrelatedResponse(protocolDir, response, cmd);
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     logError(`[supervisor] Ask work phase failed: ${errorMessage}`);
@@ -1279,46 +1721,39 @@ async function handleAskCommand(cmd: AskCommand, config: SupervisorConfig, runne
       ...launchSettings(cmd),
     };
     describeTurnFailure(errorResponse, err);
-    writeResponse(protocolDir, errorResponse);
+    writeCorrelatedResponse(protocolDir, errorResponse, cmd);
   }
 }
 
 /**
- * Handle a pre-accept command: run the agent's final validation turn (WRITE
- * mode — it may fix failures, update maintained files, and commit), then re-run
- * the configured gate commands as the AUTHORITATIVE merge gate.
+ * Handle a review command: a read-only review turn in a NEW agent session.
  *
- * The agent's self-report is NOT trusted for the gate decision: after its turn,
- * the supervisor runs `pre_accept_commands` itself and reports the outcome in
- * `response.pre_accept`. The daemon aborts the merge when `passed` is false.
- * Like ask, this is daemon-owned end-to-end — no upstream/post-turn sync, no
- * violation detection.
+ * Same lockdown as ask (plan mode, read-only MCP, no integration phases).
+ * The difference that must not regress: we pass no session id to runWork, so
+ * the agent binary does not get `--resume` and cannot inherit the
+ * implementer's conversation.
  */
-async function handlePreAcceptCommand(cmd: PreAcceptCommand, config: SupervisorConfig, runner: Runner): Promise<void> {
+async function handleReviewCommand(cmd: ReviewCommand, config: SupervisorConfig, runner: Runner): Promise<void> {
   const { protocolDir, worktreePath } = config;
 
-  log(`[supervisor] Pre-accept command for task ${cmd.task_id.substring(0, 8)} (${cmd.pre_accept_commands.length} gate command(s), effort=${cmd.effort ?? 'default'})`);
+  log(`[supervisor] Review command for task ${cmd.task_id.substring(0, 8)} (effort=${cmd.effort ?? 'default'}, new session)`);
 
-  // Pre-turn worktree health + SHA so the daemon can attribute this turn's commits.
-  const preAcceptRecovery = await recoverWorktreeState(worktreePath, 'pre-accept');
-  const preTurnSha = await getHeadSha(worktreePath);
-
-  const now = new Date().toISOString();
+  const reviewNow = new Date().toISOString();
   const status: SupervisorStatus = {
     phase: 'work',
     task_id: cmd.task_id,
-    command_type: 'pre_accept',
-    started_at: now,
-    updated_at: now,
-    phase_started_at: now,
-    pre_turn_sha: preTurnSha,
+    command_type: 'review',
+    started_at: reviewNow,
+    updated_at: reviewNow,
+    phase_started_at: reviewNow,
     pid: process.pid,
   };
   writeStatus(protocolDir, status);
 
   try {
-    const agent = getAgent(cmd.agent_id ?? 'claude-code');
-    await checkCommandAgentBinary(cmd.agent_id);
+    const harness = commandHarness(cmd);
+    const agent = getAgent(harness);
+    await checkCommandAgentBinary(harness);
     const effectiveWatchdogMs = resolveWatchdogTimeout(
       cmd.watchdog_output_timeout_ms ?? 0,
       agent.defaultWatchdogTimeoutMs(),
@@ -1326,12 +1761,22 @@ async function handlePreAcceptCommand(cmd: PreAcceptCommand, config: SupervisorC
 
     const onRetryStateChange = makeRetryStatusHandler(status, protocolDir);
 
-    // WRITE mode: no plan-mode lockdown, no LAZY_MCP_READ_ONLY — the agent must
-    // be able to run commands, edit files, commit, and journal the post-mortem.
-    // Which is exactly why this turn needs its own MCP config written: like ask,
-    // it can be the first turn in a freshly launched container.
-    await prepareTurnMcp(runner, cmd.task_id, worktreePath, { readOnly: false, agentId: cmd.agent_id });
+    // Review lockdown: worktree writes stay blocked (plan mode / disallowed
+    // tools), but lazy_raise is advertised so findings land as Raises.
+    // LAZY_MCP_READ_ONLY + LAZY_MCP_REVIEW gate the in-process handlers;
+    // --review on the MCP argv withholds every other write before proxying.
+    process.env.LAZY_MCP_READ_ONLY = '1';
+    process.env.LAZY_MCP_REVIEW = '1';
+    await prepareTurnMcp(runner, cmd.task_id, worktreePath, { toolset: 'review', harness: commandHarness(cmd), model: cmd.model_id });
+
+    // Same handoff clear as work/ask: if MCP dies mid-review the
+    // agent writes raised entries to turn-handoff.jsonl; a stale file from a
+    // prior turn must not be attributed to this one.
     await clearTurnHandoff(worktreePath, log);
+
+    const reviewPrompt = cmd.system_prompt
+      ? `${reviewSystemPrompt}\n\n---\n\n${cmd.system_prompt}`
+      : reviewSystemPrompt;
 
     const agentStart = Date.now();
     const result = await runWork(
@@ -1339,70 +1784,145 @@ async function handlePreAcceptCommand(cmd: PreAcceptCommand, config: SupervisorC
       runner,
       worktreePath,
       cmd.prompt,
-      cmd.system_prompt,
+      reviewPrompt,
       cmd.model_id,
-      cmd.agent_session_id,
+      // INVARIANT: a review never resumes the work session. Passing undefined
+      // here is what keeps `--resume` off the agent argv.
+      undefined,
       protocolDir,
       onRetryStateChange,
       undefined,
       effectiveWatchdogMs,
       cmd.effort,
-      undefined, // permissionMode: default (write)
-      cmd.wind_down_timeout_ms,
+      'plan',
+      undefined,
+      cmd.agent_extra_args,
+      undefined,
+      { taskId: cmd.task_id, agentId: cmd.agent_id },
     );
     const agentDurationMs = Date.now() - agentStart;
 
-    const postWorkSha = await getHeadSha(worktreePath);
-    log(`[supervisor] Pre-accept post-work SHA: ${postWorkSha.substring(0, 8)}`);
-    status.post_work_sha = postWorkSha;
-    writeStatus(protocolDir, status);
-
-    // Authoritative gate: re-run the configured commands. Empty list passes.
-    updatePhase(status, 'post_turn_check', protocolDir);
-    const gate = await runPreAcceptGate(
-      cmd.pre_accept_commands,
-      worktreePath,
-      cmd.pre_accept_timeout ?? DEFAULT_PRE_ACCEPT_TIMEOUT_SECS,
-    );
-    updatePhase(status, 'post_turn_check_done', protocolDir);
-    log(`[supervisor] Pre-accept gate: ${gate.passed ? 'PASSED' : `FAILED (${gate.failedCommand})`}`);
+    // THE ONE RE-ASK. A report the daemon cannot act on is unusable — it can
+    // neither auto-fix, park nor gate on it — so ask the same session once more
+    // for the JSON block alone. Single-shot, like the maintain follow-up; the answer
+    // rides home separately so the first reply stays the turn's content. See
+    // ./review-reask.ts.
+    //
+    // INVARIANT: the trigger is `resolveReviewVerdict`, the SAME predicate the
+    // daemon fails a review by — never the verdict word alone. A report whose
+    // `security` or `data_integrity` statement is missing is unparsed too
+    // (src/review/parse-report.ts), and gating on the word let exactly that case
+    // skip the recovery: `{"verdict":"clean"}` with no sweeps parsed its verdict,
+    // got no re-ask, and was then recorded FAILED with a park reason claiming a
+    // re-ask had happened. A forgotten sweep line is the cheapest failure there
+    // is to recover from, and it is precisely what one re-ask exists for.
+    let reask: Awaited<ReturnType<typeof runReviewVerdictReask>> | undefined;
+    let reaskUsage: AgentTokenUsage | undefined;
+    if (resolveReviewVerdict(parseReviewReport(result.result)) === 'unparsed') {
+      updatePhase(status, 'review_reask', protocolDir);
+      reask = await runReviewVerdictReask(
+        agent,
+        worktreePath,
+        result.session_id,
+        cmd.model_id,
+        cmd.effort,
+        cmd.agent_extra_args,
+      );
+      reaskUsage = reask.usage;
+      updatePhase(status, 'review_reask_done', protocolDir);
+    }
 
     updatePhase(status, 'writing_response', protocolDir);
     const response: CompletedResponse = {
       status: 'completed',
       result: result.result,
       session_id: result.session_id,
-      usage: result.usage,
+      // The re-ask is part of this turn's spend: one response, one turn, so its
+      // tokens are rolled into the review's usage rather than being lost.
+      usage: addAgentUsage(result.usage, reaskUsage) ?? result.usage,
       ...launchSettings(cmd, result.model_id),
       ...(result.mcp_tools ? { mcp_tools: result.mcp_tools } : {}),
+      ...(reask && !reask.failed && reask.response ? { review_reask: reask.response } : {}),
       agent_duration_ms: agentDurationMs,
-      start_sha_work: preTurnSha,
-      end_sha_work: postWorkSha,
-      ...(preAcceptRecovery ? { worktree_recovery: preAcceptRecovery } : {}),
+      // Collect raises the agent could not file via lazy_raise (MCP down).
       ...(await handoffField(worktreePath, log)),
-      pre_accept: {
-        passed: gate.passed,
-        ...(gate.failedCommand !== undefined ? { failed_command: gate.failedCommand } : {}),
-        ...(gate.exitCode !== undefined ? { exit_code: gate.exitCode } : {}),
-        ...(gate.output !== undefined ? { output: gate.output } : {}),
-      },
     };
-    writeResponse(protocolDir, response);
+    writeCorrelatedResponse(protocolDir, response, cmd);
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
-    logError(`[supervisor] Pre-accept work phase failed: ${errorMessage}`);
+    logError(`[supervisor] Review work phase failed: ${errorMessage}`);
 
     const errorResponse: ErrorResponse = {
       status: 'error',
-      error: `Pre-accept turn failed: ${errorMessage}`,
+      error: `Work phase failed: ${errorMessage}`,
       phase: 'work',
       ...launchSettings(cmd),
-      ...(preAcceptRecovery ? { worktree_recovery: preAcceptRecovery } : {}),
+      // Still collect: a crash after the agent wrote the handoff must not lose
+      // findings that never reached lazy_raise.
       ...(await handoffField(worktreePath, log)),
     };
     describeTurnFailure(errorResponse, err);
-    writeResponse(protocolDir, errorResponse);
+    writeCorrelatedResponse(protocolDir, errorResponse, cmd);
   }
+}
+
+/**
+ * Handle an acceptance-gate command: run the configured gate commands in the
+ * worktree, mechanically, and report the outcome. This is the supervisor-side
+ * of the MECHANICAL gate at accept — there is deliberately NO agent here: no
+ * session, no model, no MCP config, no handoff, no retry/watchdog machinery.
+ * The daemon drives the merge from the response's `accept_gate` field.
+ *
+ * A half-merged worktree is rolled back first (the same per-command recovery
+ * every command gets), and the recovery report rides the response so the daemon
+ * can journal it — the gate records no turn, so nothing else would surface it.
+ */
+async function handleAcceptGateCommand(cmd: AcceptGateCommand, config: SupervisorConfig): Promise<void> {
+  const { protocolDir, worktreePath } = config;
+
+  log(`[supervisor] Acceptance gate for task ${cmd.task_id.substring(0, 8)} (${cmd.accept_gate_commands.length} command(s))`);
+
+  const gateRecovery = await recoverWorktreeState(worktreePath, 'acceptance gate');
+
+  const now = new Date().toISOString();
+  const status: SupervisorStatus = {
+    phase: 'accept_gate',
+    task_id: cmd.task_id,
+    command_type: 'accept_gate',
+    started_at: now,
+    updated_at: now,
+    phase_started_at: now,
+    pid: process.pid,
+  };
+  writeStatus(protocolDir, status);
+
+  const gate = await runAcceptanceGate(
+    cmd.accept_gate_commands,
+    worktreePath,
+    cmd.accept_gate_timeout ?? DEFAULT_PRE_ACCEPT_TIMEOUT_SECS,
+  );
+  log(`[supervisor] Acceptance gate: ${gate.passed ? 'PASSED' : `FAILED (${gate.failedCommand})`}`);
+
+  updatePhase(status, 'writing_response', protocolDir);
+  // session_id/usage: no agent ran, but CompletedResponse requires both. The
+  // sentinel and zero usage are the mechanical gate's honest shape — nothing
+  // reads them (no turn is recorded from this response).
+  const response: CompletedResponse = {
+    status: 'completed',
+    result: gate.passed
+      ? `Acceptance gate passed (${cmd.accept_gate_commands.length} command(s)).`
+      : `Acceptance gate failed: ${gate.failedCommand ?? 'a configured check'}`,
+    session_id: 'mechanical-gate',
+    usage: { input_tokens: 0, output_tokens: 0 },
+    accept_gate: {
+      passed: gate.passed,
+      ...(gate.failedCommand !== undefined ? { failed_command: gate.failedCommand } : {}),
+      ...(gate.exitCode !== undefined ? { exit_code: gate.exitCode } : {}),
+      ...(gate.output !== undefined ? { output: gate.output } : {}),
+    },
+    ...(gateRecovery ? { worktree_recovery: gateRecovery } : {}),
+  };
+  writeCorrelatedResponse(protocolDir, response, cmd);
 }
 
 // --- Helpers ---
@@ -1410,9 +1930,9 @@ async function handlePreAcceptCommand(cmd: PreAcceptCommand, config: SupervisorC
 /**
  * Put everything we know about a failed turn onto its ErrorResponse.
  *
- * One function for every failure path (work, ask, pre-accept) on purpose: this
- * used to be three near-identical copies, and they had already drifted — only
- * the work copy handled a wind-down kill, so an ask or pre-accept killed that
+ * One function for every failure path (work, ask, review, wrap-up) on purpose: this
+ * used to be several near-identical copies, and they had already drifted — only
+ * the work copy handled a wind-down kill, so an ask or pre-accept turn killed that
  * way lost its recovered session id. A detail added to one copy and not the
  * others is exactly the class of hole this consolidation closes.
  *
@@ -1422,6 +1942,19 @@ async function handlePreAcceptCommand(cmd: PreAcceptCommand, config: SupervisorC
  * session alone is what produced `session.total_usage > sum(turns)` gaps.
  */
 export function describeTurnFailure(errorResponse: ErrorResponse, err: unknown): void {
+  // INVARIANT: a session id the turn's own stream reported is recorded on the
+  // error response for EVERY failure class, before anything else — it is what
+  // lets auto-resume (and `lazy unblock`) continue the conversation instead of
+  // starting a new one. The 2026-09-16 pi incident lost exactly this: the
+  // crashed turn knew its session id, the response dropped it, and the
+  // auto-resume an hour later re-sent the full prompt to a brand-new session.
+  // A newer turn's completion later overwrites it via
+  // shouldReconcileAgentSessionId, so a stale id cannot outlive the truth.
+  const errSessionId = turnErrorSessionId(err);
+  if (errSessionId && !errorResponse.session_id) {
+    errorResponse.session_id = errSessionId;
+  }
+
   if (err instanceof CrashLoopError) {
     // The fast-crash-loop backstop. It carries the same three fields, but the
     // class is always `unknown` (the detector runs for nothing else), and the
@@ -1454,12 +1987,10 @@ export function describeTurnFailure(errorResponse: ErrorResponse, err: unknown):
     // The agent already committed its work — the marker that triggered this
     // kill is written by lazy_commit. The commit is preserved in git either
     // way. The agent's JSON response (summary) is lost, but the session_id
-    // is recovered when possible (resume case or jsonl tail) so the human
-    // can `lazy unblock` to resume the conversation cleanly.
+    // was recovered when possible (resume case or jsonl tail) and is assigned
+    // generically at the top of this function.
     errorResponse.duration_ms = err.durationMs;
-    if (err.sessionId) {
-      errorResponse.session_id = err.sessionId;
-    } else {
+    if (!err.sessionId) {
       logWarn('[supervisor] GracefulExitTimeoutError: no session_id recovered — agent likely died before writing any JSONL.');
     }
   }

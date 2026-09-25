@@ -41,8 +41,7 @@ export function isBlockedStatus(status: TaskStatus): boolean {
  * and abandonTask across CLI commands, reconciler, and auto-resume.
  *
  * Key transitions by command/system:
- *   start:       backlog → working (or backlog → queued at the concurrency cap)
- *   drain:       queued → working (reconciler launches a queued task as a slot frees)
+ *   start:       backlog → working
  *   reconciler:  working → blocked (turn completes)
  *                working → conflict (turn completes with violations)
  *                working → interrupted (container stopped/crashed)
@@ -52,12 +51,12 @@ export function isBlockedStatus(status: TaskStatus): boolean {
  *   unblock:     blocked/conflict → working, merging → blocked
  *   submit:      blocked/conflict → submitted (creates PR, ready for review)
  *   accept:      blocked/conflict/submitted → merging → complete, merging → blocked (checks fail)
- *                working → blocked/conflict/submitted (pre-accept turn ends, task
- *                  restored to the status it had before the accept)
+ *                working → blocked/conflict/submitted (the acceptance gate or merge
+ *                  phase aborts, task restored to the status it had before the accept)
  *                merging → conflict/submitted (merge phase aborts, same restore)
  *
  * INVARIANT (accept restores the TRUE prior status): an accept moves the task
- * through `working` (pre-accept turn) and `merging` (merge phase). When it
+ * through `working` (the acceptance gate) and `merging` (merge phase). When it
  * aborts, the task must return to the status it actually had — a task that was
  * in `conflict` or `submitted` before the accept is NOT blocked, and silently
  * rewriting it to `blocked` loses a real signal (unresolved violations, an open
@@ -70,13 +69,14 @@ export function isBlockedStatus(status: TaskStatus): boolean {
  * which is why `blocked → conflict`, `conflict → blocked` and `pairing →
  * conflict` are in the table. Before they were, a side-channel turn on a
  * `conflict` task (an ask, a sync, the end of a pairing session) could only park
- * it as `blocked`, orphaning a pending violation set: the reviewer surfaces then
- * refused `approved_files` while the daemon still reverted the unapproved files,
- * silently destroying committed agent work (fix-ask-nukes-violations).
+ * it as `blocked`, orphaning a pending violation set — which the accept gate then
+ * never saw, merging changes to protected files nobody had approved. The label
+ * gates nothing else: since move-file-approval-to-accept, `conflict` differs from
+ * `blocked` only in that `lazy accept` refuses until every violation is approved.
  *   remote-sync: working/interrupted → merging → complete (externally merged MR)
  *   abandon:     blocked/conflict/interrupted/submitted/backlog → abandoned
  *   pair:        blocked/conflict/interrupted/submitted → pairing, pairing → blocked
- *   resume:      interrupted → working
+ *   resume:      interrupted/blocked/conflict → working
  *   reopen:      complete/abandoned → blocked (with session) or backlog (no session)
  *   zombie:      any non-terminal → zombie (system only), zombie → complete
  *
@@ -96,13 +96,16 @@ export function isBlockedStatus(status: TaskStatus): boolean {
  * (fix-stranded-merging).
  */
 export const VALID_TRANSITIONS: Record<TaskStatus, readonly TaskStatus[]> = {
-  backlog:     ['working', 'blocked', 'abandoned', 'queued'],
-  queued:      ['working', 'backlog', 'abandoned'],
+  backlog:     ['working', 'blocked', 'abandoned'],
   working:     ['blocked', 'conflict', 'interrupted', 'merging', 'submitted'],
   blocked:     ['working', 'conflict', 'submitted', 'merging', 'pairing', 'abandoned', 'backlog'],
   conflict:    ['working', 'blocked', 'submitted', 'merging', 'pairing', 'abandoned'],
   interrupted: ['working', 'merging', 'pairing', 'abandoned'],
-  submitted:   ['working', 'merging', 'pairing', 'abandoned'],
+  // `submitted → blocked` is the system's only: a reparent moved the task's
+  // target, the forge refused to retarget its PR, so lazy CLOSED the PR
+  // (src/daemon/review-retarget.ts) — the task no longer awaits a forge review.
+  // Syncs and reviews still restore `submitted` rather than use this edge.
+  submitted:   ['working', 'merging', 'pairing', 'abandoned', 'blocked'],
   pairing:     ['blocked', 'conflict'],
   merging:     ['complete', 'blocked', 'conflict', 'submitted'],
   zombie:      ['complete'],

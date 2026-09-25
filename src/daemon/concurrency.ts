@@ -1,80 +1,59 @@
 /**
- * Concurrency limits for agent-task and builder containers.
+ * Concurrency limit for interactive builder containers.
  *
- * Two independently-configurable caps (lazy.toml `[limits]`, default 8 each):
- *  - `max_concurrent_agents`  — concurrently *working* agent-task supervisors.
+ * One configurable cap (lazy.toml `[limits]`, default 8):
  *  - `max_concurrent_builders` — concurrent interactive builder containers.
  *
- * Rationale: when many tasks launch at once, Docker struggles (slow launches,
- * probe timeouts — see fix-resume-probe-flip). These caps are operational
- * backpressure, not a scheduler (see spike-night-scheduler for the distinct
- * scheduling concern).
+ * Agent tasks are deliberately UNCAPPED: the old `max_concurrent_agents` cap,
+ * its backlog→queued machinery, and the idle-container reaper were removed
+ * (remove-reaper-cap-sweep) — their DX cost outweighed the rare Docker
+ * launch-storm incidents they prevented. `lazy start` always launches
+ * immediately, and a blocked task's container lives until the task reaches a
+ * terminal state.
  *
- * Slot model: a slot is held by each agent task that currently has a LIVE
- * supervisor container — tracked as a non-terminal task whose session carries a
- * `container_name` (plus in-flight reservations, below).
- *
- * Why live-container, not just `working`: a supervisor container is NOT torn
- * down when a turn finishes. The PID-1 wrapper restarts the one-shot supervisor,
- * which then blocks in `waitForCommand` with an infinite timeout, polling
- * `command.json` every 500ms (src/protocol/io.ts). A `blocked` task awaiting
- * human review therefore keeps a live, resident container. Since the cap exists
- * precisely to bound Docker load, those lingering containers MUST count —
- * otherwise a backlog of blocked-but-alive containers would blow past the cap
- * while `working` reads 0. `container_name` is cleared when a container is
- * removed (crash cleanup, terminal sweep, stop, or the idle reaper), so it
- * tracks the live set and self-corrects. The idle reaper
- * ({@link selectContainersToReap}, driven by the reconciler) frees these
- * lingering containers after a grace period, or immediately when higher-priority
- * work is queued, so idle containers never hold slots forever.
- *
- * Runtime override: the daemon holds an in-memory override per cap that
+ * Runtime override: the daemon holds an in-memory override that
  * `lazy daemon config set` mutates over RPC. Overrides are EPHEMERAL — they live
  * only in the running daemon process and are lost on restart, which reverts to
  * lazy.toml. Nothing here writes lazy.toml.
  *
- * Agent enforcement lives in the daemon (that is where launches happen).
- * `tryAdmitAgentSlot` serializes the count→decide→reserve critical section under
- * a process-global mutex so two concurrent launches cannot both grab the last
- * slot, and a short-lived reservation set covers the window between "admitted"
- * and "status flipped to working" in storage.
+ * Builder enforcement lives in the daemon, even though the builder container is
+ * spawned by the client rather than by the daemon. The daemon owns the count
+ * (live `lazy-builder-*` containers for this project, plus in-flight
+ * reservations) and owns the decision (`tryAdmitBuilderSlot`, over the
+ * `builderSlot` RPC). A launcher that only asks — the CLI today, a web UI
+ * tomorrow — gets one race-free answer instead of reimplementing the comparison
+ * per surface, which is how the cap came to be enforceable only from the CLI.
+ * The client keeps a friendly pre-check for UX, but it is not the authority.
  *
- * Builder enforcement is fail-fast at the client launch site — an interactive
- * session a human is waiting on must not be silently queued.
+ * The daemon cannot physically stop a process that spawns a container without
+ * asking; that is a property of client-side spawning, not of this module. What
+ * it can guarantee — and does — is that the count and the verdict have exactly
+ * one implementation, and that two launches racing for the last slot cannot both
+ * win.
+ *
+ * Builder admission is fail-FAST, never queued: an interactive session a human
+ * is waiting on must not be silently parked behind other builders.
  */
 
 import type { ResolvedConfig } from '../config/types';
-import type { Storage } from '../storage';
-import type { Task, TaskPriority } from '../types';
-import { PRIORITY_RANK } from '../types';
 
-/** The two configurable concurrency caps, keyed by their lazy.toml name. */
-export type LimitKey = 'max_concurrent_agents' | 'max_concurrent_builders';
+/** The configurable concurrency caps, keyed by their lazy.toml name. */
+export type LimitKey = 'max_concurrent_builders';
 
-export const LIMIT_KEYS: readonly LimitKey[] = [
-  'max_concurrent_agents',
-  'max_concurrent_builders',
-] as const;
+export const LIMIT_KEYS: readonly LimitKey[] = ['max_concurrent_builders'] as const;
 
 // --- Ephemeral overrides (daemon-process memory only) ---
 
-let agentLimitOverride: number | undefined;
 let builderLimitOverride: number | undefined;
 
 /** Set (or clear, with `undefined`) the ephemeral override for a cap. */
-export function setLimitOverride(key: LimitKey, value: number | undefined): void {
-  if (key === 'max_concurrent_agents') agentLimitOverride = value;
-  else builderLimitOverride = value;
+export function setLimitOverride(_key: LimitKey, value: number | undefined): void {
+  builderLimitOverride = value;
 }
 
 /** The current ephemeral override for a cap, or undefined when none is set. */
-export function getLimitOverride(key: LimitKey): number | undefined {
-  return key === 'max_concurrent_agents' ? agentLimitOverride : builderLimitOverride;
-}
-
-/** Effective agent cap: ephemeral override if set, else the lazy.toml value. */
-export function effectiveAgentLimit(config: ResolvedConfig): number {
-  return agentLimitOverride ?? config.limits.max_concurrent_agents;
+export function getLimitOverride(_key: LimitKey): number | undefined {
+  return builderLimitOverride;
 }
 
 /** Effective builder cap: ephemeral override if set, else the lazy.toml value. */
@@ -84,15 +63,9 @@ export function effectiveBuilderLimit(config: ResolvedConfig): number {
 
 /** Test-only: clear all ephemeral overrides and reservations. */
 export function resetConcurrencyStateForTest(): void {
-  agentLimitOverride = undefined;
   builderLimitOverride = undefined;
-  reservedSlots.clear();
+  builderReservations.clear();
 }
-
-// --- Agent slot accounting ---
-
-/** Task IDs mid-launch: admitted but not yet flipped to `working` in storage. */
-const reservedSlots = new Set<string>();
 
 /** Serialize the count→decide→reserve critical section (daemon is single-process). */
 let lockTail: Promise<unknown> = Promise.resolve();
@@ -106,240 +79,119 @@ function withLock<T>(fn: () => Promise<T>): Promise<T> {
   return result;
 }
 
-/**
- * Count agent slots in use: distinct tasks that currently hold a LIVE supervisor
- * container (non-terminal + session `container_name` set) OR are reserved
- * mid-launch. This counts blocked-but-alive containers too — see the slot-model
- * note above. Exported for unit testing and for the reconciler drain /
- * `lazy daemon config` reporting.
- */
-export async function countActiveAgents(storage: Storage): Promise<number> {
-  const tasks = await storage.listTasksWithOptions({ nonTerminalOnly: true });
-  const ids = new Set<string>();
-  for (const task of tasks) {
-    // A queued task never has a container; skip the session lookup for it.
-    if (task.status === 'queued') continue;
-    const session = await storage.getSessionByTaskId(task.id);
-    if (session?.container_name) ids.add(task.id);
-  }
-  for (const id of reservedSlots) ids.add(id);
-  return ids.size;
-}
-
 export interface SlotDecision {
-  /** True if the task may launch now. */
+  /** True if the builder may launch now. */
   admitted: boolean;
-  /** Slots in use AFTER this decision (a newly-admitted task is counted). */
+  /** Slots in use AFTER this decision (a newly-admitted builder is counted). */
   running: number;
   /** The effective cap this decision was made against. */
   limit: number;
 }
 
+// --- Builder slot accounting ---
+
 /**
- * Pure slot decision — exported for unit tests.
+ * How long an in-flight builder reservation survives without being released.
  *
- * @param running       Slots in use right now (working + reserved), NOT counting
- *                      this task when it is new.
- * @param limit         The effective cap.
- * @param alreadyRunning True when this task already holds a slot (idempotent
- *                      relaunch of a working/reserved task — never consumes a new
- *                      one, so it is always admitted).
+ * A builder holds a slot for as long as its container is alive, and the live set
+ * is read back from the runner — so a reservation only has to cover the window
+ * between "the daemon admitted this launch" and "the container is visible to
+ * `docker ps`". A client that dies inside that window (Ctrl-C between admit and
+ * spawn, SIGKILL, a crashed web request) never releases, so the reservation must
+ * expire on its own or a slot would leak for the daemon's lifetime. Generous
+ * relative to a container start, short relative to a human noticing.
  */
-export function decideAgentSlot(
-  running: number,
-  limit: number,
-  alreadyRunning: boolean,
-): SlotDecision {
-  if (alreadyRunning) return { admitted: true, running, limit };
+export const BUILDER_RESERVATION_TTL_MS = 60_000;
+
+/** builderId → epoch ms the reservation stops counting. */
+const builderReservations = new Map<string, number>();
+
+/**
+ * Container name prefix for builders. `discoverProjectBuilderRuns` returns full
+ * `lazy-builder-<id>` names; reservations are keyed by the bare `<id>` the
+ * launcher generated, so one is mapped onto the other before they are unioned.
+ */
+const BUILDER_RUN_PREFIX = 'lazy-builder-';
+
+/** Bare builder id from a discovered run name (unprefixed names pass through). */
+export function builderIdFromRunName(name: string): string {
+  return name.startsWith(BUILDER_RUN_PREFIX) ? name.slice(BUILDER_RUN_PREFIX.length) : name;
+}
+
+/** Drop reservations that have outlived {@link BUILDER_RESERVATION_TTL_MS}. */
+function pruneBuilderReservations(nowMs: number): void {
+  for (const [id, expiresAt] of builderReservations) {
+    if (expiresAt <= nowMs) builderReservations.delete(id);
+  }
+}
+
+/**
+ * Count builder slots in use: distinct builder ids that either have a live
+ * container right now or are reserved mid-launch.
+ *
+ * Deduplicated by id on purpose — a reservation and the container it produced
+ * are the same builder, and the overlap between "container is up" and "the
+ * reservation has not expired yet" is the normal case, not an edge case. Double
+ * counting there would make every launch consume two slots for a minute.
+ *
+ * @param discoverRunNames Returns live builder container names for the project.
+ *                         Injected so this stays free of runner/Docker imports
+ *                         and testable without a container engine.
+ */
+export async function countActiveBuilders(
+  discoverRunNames: () => Promise<string[]>,
+  nowMs: number = Date.now(),
+): Promise<number> {
+  pruneBuilderReservations(nowMs);
+  const ids = new Set<string>();
+  for (const name of await discoverRunNames()) ids.add(builderIdFromRunName(name));
+  for (const id of builderReservations.keys()) ids.add(id);
+  return ids.size;
+}
+
+/**
+ * Pure builder slot decision — exported for unit tests.
+ *
+ * There is no "already running" case: a builder id is minted per launch, so an
+ * admit request is always for a NEW builder. A relaunch after `lazy upgrade`
+ * stopped the container is deliberately not re-admitted by the caller — see the
+ * launch site in `lazy builder`.
+ */
+export function decideBuilderSlot(running: number, limit: number): SlotDecision {
   if (running >= limit) return { admitted: false, running, limit };
   return { admitted: true, running: running + 1, limit };
 }
 
 /**
- * Atomically decide whether `taskId` may launch now and, if so, reserve its slot.
+ * Atomically decide whether a builder may launch now and, if so, reserve its
+ * slot. The count→decide→reserve critical section runs under a process-global
+ * mutex — both sections are short, and the daemon is single-process — so it can
+ * never interleave with another.
  *
- * Call {@link releaseAgentSlot} once the launch has flipped the task to `working`
- * in storage (or failed). Re-entrant: a task already `working` or reserved is
- * always admitted without consuming a new slot, so an idempotent relaunch of a
- * running task never trips the cap.
+ * Re-admitting an id that already holds a reservation refreshes it rather than
+ * consuming a second slot, so a retried request is idempotent.
  */
-export async function tryAdmitAgentSlot(
-  storage: Storage,
-  taskId: string,
+export async function tryAdmitBuilderSlot(
+  discoverRunNames: () => Promise<string[]>,
+  builderId: string,
   limit: number,
+  nowMs: number = Date.now(),
 ): Promise<SlotDecision> {
   return withLock(async () => {
-    const task = await storage.getTask(taskId);
-    const already = task?.status === 'working' || reservedSlots.has(taskId);
-    const running = await countActiveAgents(storage);
-    const decision = decideAgentSlot(running, limit, already);
-    if (decision.admitted && !already) reservedSlots.add(taskId);
+    const already = builderReservations.has(builderId);
+    const running = await countActiveBuilders(discoverRunNames, nowMs);
+    // An id that is already counted must not be charged for a second slot.
+    const decision = already
+      ? { admitted: true, running, limit }
+      : decideBuilderSlot(running, limit);
+    if (decision.admitted) {
+      builderReservations.set(builderId, nowMs + BUILDER_RESERVATION_TTL_MS);
+    }
     return decision;
   });
 }
 
-/** Release a reservation taken by {@link tryAdmitAgentSlot}. Idempotent. */
-export function releaseAgentSlot(taskId: string): void {
-  reservedSlots.delete(taskId);
-}
-
-// --- Queue ordering (pure, reusable) ---
-
-/**
- * Order queued tasks for the drain sweep: highest priority first, ties broken
- * FIFO by `created_at` (oldest first). Pure and total — a stable, deterministic
- * ordering used by both the reconciler drain and the queue-position display.
- *
- * Kept deliberately separate from the reconciler loop so a future scheduler
- * (spike-night-scheduler) can layer time-window logic on the same primitive
- * rather than reimplementing ordering. Does not mutate its input.
- */
-export function orderQueuedTasks<T extends Pick<Task, 'priority' | 'created_at'>>(tasks: readonly T[]): T[] {
-  return [...tasks].sort((a, b) => {
-    const rankDelta = (PRIORITY_RANK[b.priority] ?? 0) - (PRIORITY_RANK[a.priority] ?? 0);
-    if (rankDelta !== 0) return rankDelta; // higher priority first
-    return a.created_at - b.created_at; // FIFO tie-break (oldest first)
-  });
-}
-
-/**
- * 1-based queue position of `taskId` within the queued set, plus the total, per
- * {@link orderQueuedTasks}. Returns null when the task is not in the set.
- * Exported for the `lazy active` / lazy_active "queued #N of M" display.
- */
-export function queuePosition(
-  tasks: readonly Pick<Task, 'id' | 'priority' | 'created_at'>[],
-  taskId: string,
-): { position: number; total: number } | null {
-  const ordered = orderQueuedTasks(tasks);
-  const idx = ordered.findIndex((t) => t.id === taskId);
-  if (idx === -1) return null;
-  return { position: idx + 1, total: ordered.length };
-}
-
-// --- Idle-container reaping (pure decision, priority-aware) ---
-
-/** An idle blocked task still holding a live container (a reap candidate). */
-export interface ReapCandidate {
-  taskId: string;
-  priority: TaskPriority;
-  /** Epoch ms the container went idle (its last turn completed). */
-  idleSinceMs: number;
-}
-
-/** A queued task waiting for a slot (drives demand-driven reaping). */
-export interface ReapDemand {
-  taskId: string;
-  priority: TaskPriority;
-  created_at: number;
-}
-
-/** A task currently running a turn (its slot will free when it finishes). */
-export interface ReapWorking {
-  taskId: string;
-  priority: TaskPriority;
-}
-
-export interface ReapDecisionInput {
-  /** Idle blocked tasks holding live containers. */
-  blocked: readonly ReapCandidate[];
-  /** Tasks queued for a slot. */
-  queued: readonly ReapDemand[];
-  /** Tasks currently working (holding slots that will free later). */
-  working: readonly ReapWorking[];
-  /** Effective agent cap. */
-  limit: number;
-  /** Idle grace period in ms (config `[limits] idle_grace_minutes`). */
-  graceMs: number;
-  /** Current time (epoch ms). */
-  nowMs: number;
-  /**
-   * Whether the runner's idle runs justify unconditional base reaping
-   * (`runner.reapsIdleRuns`). When false (host-process), idle runs are exempt
-   * from the RAM-bound base reap but still demand-reapable.
-   */
-  baseReapEnabled: boolean;
-}
-
-const rank = (p: TaskPriority): number => PRIORITY_RANK[p] ?? 0;
-
-/**
- * Decide which idle blocked containers to reap this tick. Pure and total —
- * exported for unit testing and kept beside {@link orderQueuedTasks} so a future
- * scheduler can reuse it rather than reimplementing the policy in the loop.
- *
- * Two independent reasons to reap:
- *
- *  1. **Base reap (RAM bound, demand-independent):** an idle container older than
- *     `graceMs` is reaped unconditionally — but only when `baseReapEnabled`
- *     (container runners), since a cheap idle host process needs no RAM cap.
- *
- *  2. **Demand-driven reap (queued work, no free slot):** grace only exists to
- *     keep a warm container for a *likely next turn*; it must never starve
- *     equal-or-higher-priority queued demand. For each queued task that can't be
- *     served by a free slot (highest priority first):
- *       - a strictly-LOWER-priority queued task cannot break a blocked task's
- *         grace (never a reap candidate for it);
- *       - a same-or-higher-priority queued task overrides grace → reap, choosing
- *         the lowest-priority then oldest-idle blocked candidate first;
- *       - EXCEPTION (heuristic): if a strictly-lower-priority task is currently
- *         *working*, its slot will free and — per drain ordering — go to this
- *         higher-priority queued task first, so the blocked task keeps its grace.
- *         (A working task may run long; we accept that risk to avoid needless
- *         cold-starts.) Corollary: a task that blocks while a strictly-higher
- *         task is queued gets no grace — it is reaped immediately.
- *
- * Reaping is applied by the caller via the Runner (`removeRun`) + clearing
- * `container_name`; the existing slot accounting then frees the slot naturally.
- */
-export function selectContainersToReap(input: ReapDecisionInput): string[] {
-  const { blocked, queued, working, limit, graceMs, nowMs, baseReapEnabled } = input;
-  const reap = new Set<string>();
-
-  // Rule 1: base reap — idle past grace, unconditional (container runners only).
-  const inGrace: ReapCandidate[] = [];
-  for (const c of blocked) {
-    if (baseReapEnabled && nowMs - c.idleSinceMs >= graceMs) reap.add(c.taskId);
-    else inGrace.push(c);
-  }
-
-  if (queued.length === 0) return [...reap];
-
-  // Slots in use after base reaps free their containers.
-  const liveAfterBase = working.length + inGrace.length;
-  const freeSlots = Math.max(0, limit - liveAfterBase);
-
-  // The drain sweep fills free slots with the highest-priority queued tasks;
-  // everything past that needs a slot created by reaping.
-  const unmet = orderQueuedTasks(queued).slice(freeSlots);
-  if (unmet.length === 0) return [...reap];
-
-  // Exception pool: ranks of strictly-lower-priority working tasks, each of which
-  // can reserve one higher-priority queued task (its slot will free and drain to it).
-  const reservations = working.map((w) => rank(w.priority)).sort((a, b) => a - b);
-
-  // Candidates: reap lowest-priority, then oldest-idle (longest waiting) first.
-  const candidates = [...inGrace].sort((a, b) => {
-    const r = rank(a.priority) - rank(b.priority);
-    return r !== 0 ? r : a.idleSinceMs - b.idleSinceMs;
-  });
-
-  for (const q of unmet) {
-    const qRank = rank(q.priority);
-    // Heuristic exception: a strictly-lower-priority working slot covers q.
-    const resIdx = reservations.findIndex((r) => r < qRank);
-    if (resIdx !== -1) {
-      reservations.splice(resIdx, 1);
-      continue; // grace preserved
-    }
-    // Reap a blocked candidate q is same-or-higher priority than.
-    const candIdx = candidates.findIndex((c) => rank(c.priority) <= qRank);
-    if (candIdx !== -1) {
-      reap.add(candidates[candIdx].taskId);
-      candidates.splice(candIdx, 1);
-    }
-    // else: only higher-priority blocked containers remain → grace holds for them.
-  }
-
-  return [...reap];
+/** Release a reservation taken by {@link tryAdmitBuilderSlot}. Idempotent. */
+export function releaseBuilderSlot(builderId: string): void {
+  builderReservations.delete(builderId);
 }

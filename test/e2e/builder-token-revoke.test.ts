@@ -42,7 +42,7 @@ isolateInProcessDaemonEnv();
 describe('builder MCP token revocation on supervisor exit', () => {
   let ctx: TestContext;
   let tmpDir: string;
-  let socketPath: string;
+  let daemonUrl: string;
   let daemon: RunningDaemon | undefined;
   let restoreConfig: (() => void) | undefined;
   let daemonBaseDir: string;
@@ -65,8 +65,8 @@ describe('builder MCP token revocation on supervisor exit', () => {
     builderToken = await mintMcpToken(ctx.root, { kind: 'builder' }, BUILDER_NAME);
 
     tmpDir = await mkdtemp(join(tmpdir(), 'lazy-builder-revoke-'));
-    socketPath = join(tmpDir, 'test.sock');
-    daemon = await startDaemonServer({ socketPath, token: SHARED_TOKEN, projectRoot: ctx.root });
+    daemon = await startDaemonServer({ token: SHARED_TOKEN, projectRoot: ctx.root });
+    daemonUrl = `http://127.0.0.1:${daemon.webPort}`;
   });
 
   afterEach(async () => {
@@ -87,8 +87,7 @@ describe('builder MCP token revocation on supervisor exit', () => {
 
   /** A builder-surface MCP tool call (`_` = the unscoped builder segment). */
   function mcpCall(token: string, toolName: string): Promise<Response> {
-    return fetch(`http://localhost/mcp/_/${toolName}`, {
-      unix: socketPath,
+    return fetch(`${daemonUrl}/mcp/_/${toolName}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -101,8 +100,7 @@ describe('builder MCP token revocation on supervisor exit', () => {
 
   /** The exact RPC `lazy builder` issues once the builder supervisor exits. */
   function revokeRpc(name: string): Promise<Response> {
-    return fetch('http://localhost/rpc/revokeDaemonMcpToken', {
-      unix: socketPath,
+    return fetch(`${daemonUrl}/rpc/revokeDaemonMcpToken`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

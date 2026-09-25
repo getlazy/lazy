@@ -11,22 +11,26 @@
  * and direct (non-lazy) commits by collaborators not using lazy.
  */
 
-import { writeFile, rm, access } from 'fs/promises';
+import { writeFile, rm } from 'fs/promises';
+import { displayId, getBranchName } from '../../task/identity';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
-import { requireLazyRoot, requireStorage, displayId, parseFlags, getBranchName } from '../helpers';
+import { requireLazyRoot, requireStorage, parseFlags } from '../helpers';
 import type { Storage, Task, Turn, Commit, Comment, StoredConversation, StatusChange } from '../../storage';
-import { runClaudeOneshot } from '../../capture/claude';
-import { loadConfig } from '../../config/loader';
+import { admitOneshotCommand, runOneshot } from '../../oneshot';
 import { logger } from '../../utils/logger';
 import { runGit } from '../../utils/git';
 import { getCommitDiff, getRemoteDefaultBranch } from '../../git/operations';
 import { spawn } from '../../utils/spawn';
+import { findChromeBinary, CHROME_NOT_FOUND_HINT } from '../../utils/chrome';
 import { renderMarkdown } from '../../server/markdown';
 import reportTaskPrompt from '../../prompts/report-task.md' with { type: 'text' };
 import reportCommitPrompt from '../../prompts/report-commit.md' with { type: 'text' };
 import reportReducePrompt from '../../prompts/report-reduce.md' with { type: 'text' };
 import { turnText } from '../../utils/turn-content';
+import { formatTurnTypeSuffix } from '../../utils/turn-labels';
+import { formatUnparsedReviewSuffix } from '../../review/parse-report';
+import { overrideEligibleActor } from '../human-terminal';
 
 interface Window {
   startMs: number;
@@ -112,7 +116,7 @@ async function collectLazyActivity(storage: Storage, win: Window): Promise<LazyA
   const claimedConvSessionIds = new Set<string>();
 
   // Serialize storage calls. Fanning out with Promise.all over N tasks
-  // overwhelms the daemon's unix-socket accept queue on busy projects,
+  // overwhelms the daemon's accept queue on busy projects,
   // surfacing as `RemoteStorage.<method> failed: Was there a typo in the
   // url or port?` (Bun fetch's ECONNREFUSED text). The CLI runs once and
   // the daemon is local — sequential calls are cheap enough.
@@ -272,7 +276,7 @@ function formatTaskActivityBundle(a: TaskActivity): string {
     lines.push(`- turns (${a.turns.length}):`);
     for (const turn of a.turns) {
       const who = turn.role === 'human' ? (turn.actor ?? 'human') : 'agent';
-      lines.push(`  - ${formatIso(turn.timestamp)} [${who}]${turn.turn_type === 'ask' ? ' (ask)' : turn.turn_type === 'nudge' ? ' (nudge)' : turn.turn_type === 'sync' ? ' (sync)' : ''}`);
+      lines.push(`  - ${formatIso(turn.timestamp)} [${who}]${formatTurnTypeSuffix(turn)}${formatUnparsedReviewSuffix(turn)}`);
       lines.push(`    ${turnText(turn)}`);
     }
   }
@@ -359,13 +363,12 @@ interface FailedUnit {
 async function mapTaskUnit(
   activity: TaskActivity,
   win: Window,
-  model: string | undefined,
 ): Promise<MapResult> {
   const bundle = formatTaskActivityBundle(activity);
   const prompt = reportTaskPrompt
     .replace('{{window}}', `${formatIso(win.startMs)} → ${formatIso(win.endMs)}`)
     .replace('{{bundle}}', bundle);
-  const response = await runClaudeOneshot(prompt, model);
+  const response = await runOneshot({ prompt, effort: 'medium', repoAccess: 'read-only' });
   const code = displayId(activity.task);
   return {
     unitId: `task:${code}`,
@@ -378,13 +381,12 @@ async function mapCommitUnit(
   root: string,
   commit: MainBranchCommit,
   win: Window,
-  model: string | undefined,
 ): Promise<MapResult> {
   const bundle = await formatCommitBundle(root, commit);
   const prompt = reportCommitPrompt
     .replace('{{window}}', `${formatIso(win.startMs)} → ${formatIso(win.endMs)}`)
     .replace('{{bundle}}', bundle);
-  const response = await runClaudeOneshot(prompt, model);
+  const response = await runOneshot({ prompt, effort: 'medium', repoAccess: 'read-only' });
   const sha7 = commit.sha.slice(0, 7);
   return {
     unitId: `commit:${sha7}`,
@@ -461,36 +463,6 @@ ${body}
 </html>`;
 }
 
-/** Locate a Chrome/Chromium binary suitable for headless PDF rendering. */
-async function findChromeBinary(): Promise<string | null> {
-  // macOS .app bundles (most likely on this user's environment).
-  const macAppPaths = [
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    '/Applications/Chromium.app/Contents/MacOS/Chromium',
-    '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
-    '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
-  ];
-  for (const p of macAppPaths) {
-    try {
-      await access(p);
-      return p;
-    } catch {
-      // Not present — try the next candidate.
-    }
-  }
-  // PATH-based lookup (Linux, or macOS via Homebrew).
-  for (const name of ['chromium', 'chromium-browser', 'google-chrome', 'chrome']) {
-    const proc = spawn(['which', name], { stdout: 'pipe', stderr: 'ignore' });
-    const [stdout, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      proc.exited,
-    ]);
-    const path = stdout.trim();
-    if (exitCode === 0 && path) return path;
-  }
-  return null;
-}
-
 /**
  * Render markdown to a PDF on disk using headless Chrome.
  * Throws with an actionable message if no Chrome variant is available.
@@ -513,10 +485,9 @@ async function renderPdf(markdown: string, outPath: string): Promise<void> {
   const chrome = await findChromeBinary();
   if (!chrome) {
     throw new Error(
-      'No headless Chrome found. `lazy report --pdf` uses an existing ' +
-      'Chrome/Chromium/Brave/Edge install in headless mode; lazy does not ' +
-      'bundle one. Install any of those, or drop `--pdf` and redirect ' +
-      'markdown to a file: `lazy report > report.md`.',
+      `${CHROME_NOT_FOUND_HINT} \`lazy report --pdf\` renders through one and ` +
+      'does not bundle it. Or drop `--pdf` and redirect markdown to a file: ' +
+      '`lazy report > report.md`.',
     );
   }
 
@@ -602,181 +573,190 @@ export async function commandReport(args: string[]): Promise<void> {
   const root = requireLazyRoot();
   const storage = await requireStorage();
 
+  // [usage_pause]: the report is one command of many model calls, admitted
+  // once — here, before any work, so a paused credential refuses it up front
+  // and a one-shot override carries it to the end.
+  const oneshotCommand = await admitOneshotCommand({ actor: await overrideEligibleActor() });
+
   const windowDescription = `${formatIso(startMs)} → ${formatIso(endMs)}`;
   logger.info(`lazy report: window ${windowDescription}`);
 
   try {
-    logger.info(`lazy report: collecting lazy task activity...`);
-    const lazyActivity = await collectLazyActivity(storage, win);
-    logger.info(`lazy report: collected ${lazyActivity.tasks.length} lazy task(s) with in-window activity`);
+    await oneshotCommand.run(async () => {
+      logger.info(`lazy report: collecting lazy task activity...`);
+      const lazyActivity = await collectLazyActivity(storage, win);
+      logger.info(`lazy report: collected ${lazyActivity.tasks.length} lazy task(s) with in-window activity`);
 
-    // Resolve the main branch and enumerate its commits in-window.
-    const mainBranch = await getRemoteDefaultBranch(root).catch(() => 'main');
-    logger.info(`lazy report: enumerating main-branch commits on '${mainBranch}'...`);
-    const mainCommits = await enumerateMainCommits(root, mainBranch, win);
-    logger.info(`lazy report: found ${mainCommits.length} main-branch commit(s) in window; classifying...`);
+      // Resolve the main branch and enumerate its commits in-window.
+      const mainBranch = await getRemoteDefaultBranch(root).catch(() => 'main');
+      logger.info(`lazy report: enumerating main-branch commits on '${mainBranch}'...`);
+      const mainCommits = await enumerateMainCommits(root, mainBranch, win);
+      logger.info(`lazy report: found ${mainCommits.length} main-branch commit(s) in window; classifying...`);
 
-    // Classify each main commit. Cross-reference lazy-managed accept
-    // commits to their task so the lazy-task map call includes them.
-    // Serialized to keep the daemon's socket accept queue happy — see
-    // the comment in collectLazyActivity.
-    const classified: ClassifiedMainCommit[] = [];
-    for (const c of mainCommits) {
-      classified.push(await classifyMainCommit(c, lazyActivity.sessionCommitShas, storage));
-    }
-    const nonLazyCommits: MainBranchCommit[] = [];
-    for (const c of classified) {
-      if (c.kind === 'non-lazy') {
-        nonLazyCommits.push(c.commit);
-      } else if (c.resolvedTaskId) {
-        const taskActivity = lazyActivity.tasksById.get(c.resolvedTaskId);
-        if (taskActivity) {
-          taskActivity.mainBranchCommits.push(c.commit);
-        } else {
-          // Accept commit for a task whose own activity is outside the
-          // window — synthesize a minimal activity entry so we still
-          // surface the merge.
-          const task = await storage.getTask(c.resolvedTaskId);
-          if (task) {
-            const synthetic: TaskActivity = {
-              task,
-              createdInWindow: false,
-              completedInWindow: false,
-              statusChanges: [],
-              turns: [],
-              commits: [],
-              comments: [],
-              conversations: [],
-              mainBranchCommits: [c.commit],
-            };
-            lazyActivity.tasks.push(synthetic);
-            lazyActivity.tasksById.set(task.id, synthetic);
+      // Classify each main commit. Cross-reference lazy-managed accept
+      // commits to their task so the lazy-task map call includes them.
+      // Serialized to keep the daemon's accept queue happy — see
+      // the comment in collectLazyActivity.
+      const classified: ClassifiedMainCommit[] = [];
+      for (const c of mainCommits) {
+        classified.push(await classifyMainCommit(c, lazyActivity.sessionCommitShas, storage));
+      }
+      const nonLazyCommits: MainBranchCommit[] = [];
+      for (const c of classified) {
+        if (c.kind === 'non-lazy') {
+          nonLazyCommits.push(c.commit);
+        } else if (c.resolvedTaskId) {
+          const taskActivity = lazyActivity.tasksById.get(c.resolvedTaskId);
+          if (taskActivity) {
+            taskActivity.mainBranchCommits.push(c.commit);
+          } else {
+            // Accept commit for a task whose own activity is outside the
+            // window — synthesize a minimal activity entry so we still
+            // surface the merge.
+            const task = await storage.getTask(c.resolvedTaskId);
+            if (task) {
+              const synthetic: TaskActivity = {
+                task,
+                createdInWindow: false,
+                completedInWindow: false,
+                statusChanges: [],
+                turns: [],
+                commits: [],
+                comments: [],
+                conversations: [],
+                mainBranchCommits: [c.commit],
+              };
+              lazyActivity.tasks.push(synthetic);
+              lazyActivity.tasksById.set(task.id, synthetic);
+            }
           }
         }
       }
-    }
 
-    logger.info(`lazy report: ${lazyActivity.tasks.length} lazy task unit(s), ${nonLazyCommits.length} non-lazy commit unit(s), ${lazyActivity.orphanConversations.length} orphan conversation(s)`);
+      logger.info(`lazy report: ${lazyActivity.tasks.length} lazy task unit(s), ${nonLazyCommits.length} non-lazy commit unit(s), ${lazyActivity.orphanConversations.length} orphan conversation(s)`);
 
-    const config = await loadConfig(root);
-    const model = config.models.default;
+      // No model is named here, deliberately: a machine one-shot runs on the
+      // BUILDER role target's model, not on `[models] default`. Naming the
+      // project default would send an Anthropic model id to whatever upstream the
+      // builder profile actually resolves to.
 
-    // -----------------------------------------------------------------
-    // Map phase — run all unit calls in parallel; per-call failures are
-    // logged and recorded in failedUnits but do not abort the report.
-    // Each call gets a label so progress messages are meaningful (the
-    // human watching this CLI sees N+1 Claude calls fire and wants to
-    // know what each one is for).
-    // -----------------------------------------------------------------
-    type Unit =
-      | { kind: 'task'; activity: TaskActivity; label: string; unitId: string }
-      | { kind: 'commit'; commit: MainBranchCommit; label: string; unitId: string };
-    const units: Unit[] = [
-      ...lazyActivity.tasks.map(a => ({
-        kind: 'task' as const,
-        activity: a,
-        label: `lazy task \`${displayId(a.task)}\``,
-        unitId: `task:${displayId(a.task)}`,
-      })),
-      ...nonLazyCommits.map(c => ({
-        kind: 'commit' as const,
-        commit: c,
-        label: `non-lazy commit \`${c.sha.slice(0, 7)}\` (${c.author})`,
-        unitId: `commit:${c.sha.slice(0, 7)}`,
-      })),
-    ];
+      // -----------------------------------------------------------------
+      // Map phase — run all unit calls in parallel; per-call failures are
+      // logged and recorded in failedUnits but do not abort the report.
+      // Each call gets a label so progress messages are meaningful (the
+      // human watching this CLI sees N+1 Claude calls fire and wants to
+      // know what each one is for).
+      // -----------------------------------------------------------------
+      type Unit =
+        | { kind: 'task'; activity: TaskActivity; label: string; unitId: string }
+        | { kind: 'commit'; commit: MainBranchCommit; label: string; unitId: string };
+      const units: Unit[] = [
+        ...lazyActivity.tasks.map(a => ({
+          kind: 'task' as const,
+          activity: a,
+          label: `lazy task \`${displayId(a.task)}\``,
+          unitId: `task:${displayId(a.task)}`,
+        })),
+        ...nonLazyCommits.map(c => ({
+          kind: 'commit' as const,
+          commit: c,
+          label: `non-lazy commit \`${c.sha.slice(0, 7)}\` (${c.author})`,
+          unitId: `commit:${c.sha.slice(0, 7)}`,
+        })),
+      ];
 
-    const totalMap = units.length;
-    if (totalMap === 0) {
-      logger.info(`lazy report: no units to summarize; skipping map phase`);
-    } else {
-      logger.info(`lazy report: map phase — running ${totalMap} Claude call(s) in parallel`);
-    }
-
-    // Wrap each map call so we can log per-unit start + finish progress.
-    // `started` ticks first, then each settles to either `done` or
-    // `failed`. `completed` is the running tally across both outcomes.
-    let started = 0;
-    let completed = 0;
-    const settled = await Promise.allSettled(
-      units.map(async u => {
-        started += 1;
-        const idx = started;
-        logger.info(`lazy report: [${idx}/${totalMap}] summarizing ${u.label}...`);
-        try {
-          const result = u.kind === 'task'
-            ? await mapTaskUnit(u.activity, win, model)
-            : await mapCommitUnit(root, u.commit, win, model);
-          completed += 1;
-          logger.info(`lazy report: [${completed}/${totalMap}] done: ${u.label}`);
-          return result;
-        } catch (err) {
-          completed += 1;
-          const msg = err instanceof Error ? err.message : String(err);
-          logger.warn(`lazy report: [${completed}/${totalMap}] FAILED: ${u.label}: ${msg}`);
-          throw err;
-        }
-      }),
-    );
-
-    const mapResults: MapResult[] = [];
-    const failedUnits: FailedUnit[] = [];
-    settled.forEach((s, idx) => {
-      const u = units[idx];
-      if (s.status === 'fulfilled') {
-        mapResults.push(s.value);
+      const totalMap = units.length;
+      if (totalMap === 0) {
+        logger.info(`lazy report: no units to summarize; skipping map phase`);
       } else {
-        const error = s.reason instanceof Error ? s.reason.message : String(s.reason);
-        failedUnits.push({ unitId: u.unitId, label: u.label, error });
+        logger.info(`lazy report: map phase — running ${totalMap} Claude call(s) in parallel`);
+      }
+
+      // Wrap each map call so we can log per-unit start + finish progress.
+      // `started` ticks first, then each settles to either `done` or
+      // `failed`. `completed` is the running tally across both outcomes.
+      let started = 0;
+      let completed = 0;
+      const settled = await Promise.allSettled(
+        units.map(async u => {
+          started += 1;
+          const idx = started;
+          logger.info(`lazy report: [${idx}/${totalMap}] summarizing ${u.label}...`);
+          try {
+            const result = u.kind === 'task'
+              ? await mapTaskUnit(u.activity, win)
+              : await mapCommitUnit(root, u.commit, win);
+            completed += 1;
+            logger.info(`lazy report: [${completed}/${totalMap}] done: ${u.label}`);
+            return result;
+          } catch (err) {
+            completed += 1;
+            const msg = err instanceof Error ? err.message : String(err);
+            logger.warn(`lazy report: [${completed}/${totalMap}] FAILED: ${u.label}: ${msg}`);
+            throw err;
+          }
+        }),
+      );
+
+      const mapResults: MapResult[] = [];
+      const failedUnits: FailedUnit[] = [];
+      settled.forEach((s, idx) => {
+        const u = units[idx];
+        if (s.status === 'fulfilled') {
+          mapResults.push(s.value);
+        } else {
+          const error = s.reason instanceof Error ? s.reason.message : String(s.reason);
+          failedUnits.push({ unitId: u.unitId, label: u.label, error });
+        }
+      });
+
+      // -----------------------------------------------------------------
+      // Reduce phase
+      // -----------------------------------------------------------------
+      const reducePrompt = reportReducePrompt
+        .replace('{{window}}', windowDescription)
+        .replace('{{units}}', formatUnitsBundle(mapResults))
+        .replace('{{orphan_conversations}}', formatOrphanConversationsBundle(lazyActivity.orphanConversations))
+        .replace('{{failed_units}}', formatFailedUnits(failedUnits));
+
+      logger.info(`lazy report: reduce phase — composing digest from ${mapResults.length} unit summary(ies)${failedUnits.length > 0 ? ` (${failedUnits.length} failed)` : ''}`);
+      logger.debug(`lazy report: reduce prompt size = ${reducePrompt.length} chars`);
+
+      const reduceResponse = await runOneshot({ prompt: reducePrompt, effort: 'medium', repoAccess: 'read-only' });
+
+      // Assemble the full markdown digest (used either as stdout output
+      // or as PDF input).
+      const markdownLines: string[] = [
+        '# Lazy activity report',
+        '',
+        `**Window:** ${windowDescription}`,
+        '',
+      ];
+      if (failedUnits.length > 0) {
+        markdownLines.push(`> ${failedUnits.length} unit(s) could not be summarized (see stderr).`);
+        markdownLines.push('');
+      }
+      markdownLines.push(reduceResponse.result.trim());
+      const markdown = markdownLines.join('\n');
+
+      if (wantPdf) {
+        // Auto-open only on the "no --out" convenience path. When the
+        // user supplied --out, they signaled they're archiving / managing
+        // the file themselves — don't surprise them by popping a viewer.
+        const usingTmp = outSpec === undefined;
+        const outPath = resolve(outSpec ?? join(tmpdir(), `lazy-report-${Date.now()}.pdf`));
+        logger.info(`lazy report: rendering PDF to ${outPath}...`);
+        await renderPdf(markdown, outPath);
+        logger.info(`lazy report: done`);
+        console.log(`Wrote PDF: ${outPath}`);
+        if (usingTmp) {
+          openWithDefaultApp(outPath);
+        }
+      } else {
+        logger.info(`lazy report: done`);
+        console.log(markdown);
       }
     });
-
-    // -----------------------------------------------------------------
-    // Reduce phase
-    // -----------------------------------------------------------------
-    const reducePrompt = reportReducePrompt
-      .replace('{{window}}', windowDescription)
-      .replace('{{units}}', formatUnitsBundle(mapResults))
-      .replace('{{orphan_conversations}}', formatOrphanConversationsBundle(lazyActivity.orphanConversations))
-      .replace('{{failed_units}}', formatFailedUnits(failedUnits));
-
-    logger.info(`lazy report: reduce phase — composing digest from ${mapResults.length} unit summary(ies)${failedUnits.length > 0 ? ` (${failedUnits.length} failed)` : ''}`);
-    logger.debug(`lazy report: reduce prompt size = ${reducePrompt.length} chars`);
-
-    const reduceResponse = await runClaudeOneshot(reducePrompt, model);
-
-    // Assemble the full markdown digest (used either as stdout output
-    // or as PDF input).
-    const markdownLines: string[] = [
-      '# Lazy activity report',
-      '',
-      `**Window:** ${windowDescription}`,
-      '',
-    ];
-    if (failedUnits.length > 0) {
-      markdownLines.push(`> ${failedUnits.length} unit(s) could not be summarized (see stderr).`);
-      markdownLines.push('');
-    }
-    markdownLines.push(reduceResponse.result.trim());
-    const markdown = markdownLines.join('\n');
-
-    if (wantPdf) {
-      // Auto-open only on the "no --out" convenience path. When the
-      // user supplied --out, they signaled they're archiving / managing
-      // the file themselves — don't surprise them by popping a viewer.
-      const usingTmp = outSpec === undefined;
-      const outPath = resolve(outSpec ?? join(tmpdir(), `lazy-report-${Date.now()}.pdf`));
-      logger.info(`lazy report: rendering PDF to ${outPath}...`);
-      await renderPdf(markdown, outPath);
-      logger.info(`lazy report: done`);
-      console.log(`Wrote PDF: ${outPath}`);
-      if (usingTmp) {
-        openWithDefaultApp(outPath);
-      }
-    } else {
-      logger.info(`lazy report: done`);
-      console.log(markdown);
-    }
   } finally {
     await storage.close();
   }

@@ -4,6 +4,7 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
 import { createTask, disablePreAccept, startAndReconcile } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 import { worktreePathFor } from '../helpers/storage';
 
 /**
@@ -46,6 +47,27 @@ describe('dirty worktree check — hard gate for accept/close', () => {
     expectError(acceptResult, 'Commit or stash changes before running accept');
   });
 
+  // INVARIANT (turn-end-dirty-worktree-loss): the refusal NAMES the paths.
+  // This is the last thing standing between work an agent left loose and a
+  // merge that drops it, and an unnamed "uncommitted changes" reads like lint —
+  // the cheapest way past it is to discard and retry, which IS the loss. Four
+  // tasks left their end-of-turn docs uncommitted and every one was caught only
+  // by a human running `git status` by hand; this runs it for them.
+  test('the accept refusal names the uncommitted paths and says they are not on the branch', async () => {
+    const taskId = await createTask(ctx, 'Accept names dirty paths', 'Add a file');
+    await startAndReconcile(ctx, taskId);
+
+    const worktreePath = worktreePathFor(ctx.root, taskId);
+    writeFileSync(join(worktreePath, 'docs-note.md'), 'the doc nobody committed\n');
+    writeFileSync(join(worktreePath, 'second.txt'), 'and another\n');
+
+    const acceptResult = await ctx.lazy(['accept', taskId]);
+    expectFailure(acceptResult, 1);
+    expectError(acceptResult, 'docs-note.md');
+    expectError(acceptResult, 'second.txt');
+    expectError(acceptResult, 'None of it is on the branch');
+  });
+
   test('accept succeeds when worktree is clean', async () => {
     // 1. Create and start a task
     const taskId = await createTask(ctx, 'Accept test with clean worktree', 'Add a file');
@@ -53,6 +75,9 @@ describe('dirty worktree check — hard gate for accept/close', () => {
     // Reconcile too: accept/close refuse a task that is still 'working', and
     // only a reconcile pass moves it to 'blocked'.
     await startAndReconcile(ctx, taskId);
+
+    // Fixture setup, not the subject (see test/helpers/final.ts).
+    seedFinal(ctx, taskId);
 
     // 2. Worktree should be clean — accept should succeed
     const acceptResult = await ctx.lazy(['accept', taskId]);

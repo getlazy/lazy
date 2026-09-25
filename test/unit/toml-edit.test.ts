@@ -8,7 +8,7 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { setSectionStringArray, setSectionBoolean, setSectionString, TomlEditError } from '../../src/config/toml-edit';
+import { setSectionStringArray, setSectionBoolean, setSectionString, removeSectionKey, removeSection, TomlEditError } from '../../src/config/toml-edit';
 
 describe('setSectionStringArray', () => {
   test('adds a key to an existing section without touching its comments', () => {
@@ -206,5 +206,99 @@ describe('setSectionString', () => {
     const out = setSectionString('', 'agent', 'agent_id', 'we"ird\\name');
     const parsed = Bun.TOML.parse(out) as { agent: Record<string, unknown> };
     expect(parsed.agent.agent_id).toBe('we"ird\\name');
+  });
+
+  // INVARIANT: a TOML basic string is one physical line. An unescaped newline
+  // closes the quotes and the rest of lazy.toml is parsed as new keys — which
+  // is how a dashboard paste once made the whole config unreadable. quote()
+  // must emit a legal escape so Bun.TOML.parse still loads the original value.
+  test('escapes newlines and other controls so the file still parses', () => {
+    const value = 'bin/dev\ncurl evil\r\tnext';
+    const out = setSectionString('', 'serve', 'start_services_cmd', value);
+    expect(out).not.toMatch(/start_services_cmd = "[^"]*\n/);
+    const parsed = Bun.TOML.parse(out) as { serve: Record<string, unknown> };
+    expect(parsed.serve.start_services_cmd).toBe(value);
+  });
+});
+
+/**
+ * Removal, added for `lazy doctor --fix agents`: the migration off role-wide
+ * backends deletes keys (`[models.roles.agent] backend`) and whole sections
+ * (`[ollama]`) as well as writing new ones.
+ */
+describe('removeSectionKey', () => {
+  test('removes the key and leaves the rest of the section alone', () => {
+    const input = '[models.roles.agent]\n# which server\nbackend = "ollama"\nmodel = "qwen3:8b"\n';
+    const out = removeSectionKey(input, 'models.roles.agent', 'backend');
+    expect(out).toBe('[models.roles.agent]\n# which server\nmodel = "qwen3:8b"\n');
+  });
+
+  // A caller migrating a config asks for every legacy key unconditionally; a
+  // missing one is not an error, it is just nothing to do.
+  test('an absent key and an absent section both leave the content untouched', () => {
+    const input = '[agent]\nagent_id = "codex"\n';
+    expect(removeSectionKey(input, 'agent', 'backend')).toBe(input);
+    expect(removeSectionKey(input, 'ollama', 'endpoint')).toBe(input);
+  });
+
+  // INVARIANT: only ACTIVE keys are values. A commented-out example is
+  // documentation and survives every edit, removal included.
+  test('a commented-out key of the same name is not removed', () => {
+    const input = '[proxy]\n# openai_upstream = "https://example.com"\nport = 8766\n';
+    expect(removeSectionKey(input, 'proxy', 'openai_upstream')).toBe(input);
+  });
+
+  test('removes a multi-line array value entirely', () => {
+    const input = '[proxy.policy]\negress_allowlist = [\n  "a.example",\n  "b.example",\n]\nenforce = true\n';
+    const out = removeSectionKey(input, 'proxy.policy', 'egress_allowlist');
+    expect(out).toBe('[proxy.policy]\nenforce = true\n');
+  });
+});
+
+describe('removeSection', () => {
+  test('removes header, body, caption comment and the separating blank line', () => {
+    const input = '[project]\nname = "demo"\n\n# Point everything at the local box\n[ollama]\nmodel = "qwen3:8b"\n\n[agent]\nagent_id = "pi"\n';
+    const out = removeSection(input, 'ollama');
+    expect(out).toBe('[project]\nname = "demo"\n\n[agent]\nagent_id = "pi"\n');
+  });
+
+  test('removing the last section keeps the file newline-terminated', () => {
+    const out = removeSection('[project]\nname = "demo"\n\n[ollama]\nmodel = "m"\n', 'ollama');
+    expect(out).toBe('[project]\nname = "demo"\n');
+  });
+
+  test('an absent section leaves the content untouched', () => {
+    const input = '[agent]\nagent_id = "codex"\n';
+    expect(removeSection(input, 'ollama')).toBe(input);
+  });
+
+  // Only the section's OWN caption goes. A comment separated from the header by
+  // a blank line belongs to the document, not to the table below it.
+  test('a comment separated by a blank line survives', () => {
+    const input = '# a note about the project\n\n[ollama]\nmodel = "m"\n\n[agent]\nagent_id = "pi"\n';
+    const out = removeSection(input, 'ollama');
+    expect(out).toBe('# a note about the project\n\n[agent]\nagent_id = "pi"\n');
+  });
+});
+
+/**
+ * REGRESSION: the root-table guards (dotted key, inline table) must look at the
+ * ROOT table only. Checking every key meant `agent = "x"` inside
+ * `[models.roles.agent]` was read as a top-level `agent = { … }` inline table,
+ * and refused a file that was perfectly editable — which is precisely the shape
+ * the agent-profile migration writes.
+ */
+describe('root-table guards', () => {
+  test('a key sharing the section name inside another section is an ordinary key', () => {
+    const input = '[models.roles.agent]\nagent = "claude-code"\n';
+    const out = setSectionString(input, 'agent', 'agent_id', 'pi');
+    const parsed = Bun.TOML.parse(out) as { agent: Record<string, unknown>; models: any };
+    expect(parsed.agent.agent_id).toBe('pi');
+    expect(parsed.models.roles.agent.agent).toBe('claude-code');
+  });
+
+  test('a real top-level inline table is still refused', () => {
+    expect(() => setSectionString('agent = { agent_id = "pi" }\n', 'agent', 'agent_id', 'codex'))
+      .toThrow(TomlEditError);
   });
 });

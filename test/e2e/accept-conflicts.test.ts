@@ -4,6 +4,7 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 
 /**
  * Tests for accept command behavior when conflicts are detected.
@@ -41,6 +42,10 @@ describe('lazy accept with conflicts', () => {
     if (waitResult.exitCode !== 0) {
       throw new Error(`wait failed for ${taskId}: ${waitResult.stderr}\n${waitResult.stdout}`);
     }
+    // Fixture setup, not the subject (see test/helpers/final.ts): every accept
+    // in this suite — including the refusal tests, whose expected refusals fire
+    // after the finality gate — needs a standing final first.
+    await seedFinal(ctx, taskId);
   }
 
   // INVARIANT: Non-interactive accept auto-invokes sync-with-upstream on conflict.

@@ -1,8 +1,22 @@
 import { readdir, readFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, basename } from 'path';
-import { theme } from '../theme';
-import { PROMPT_BUNDLE } from '../../prompts-bundle';
+import { theme } from '../../render/theme';
+
+/**
+ * The compiled-in prompt bundle, loaded ON DEMAND and only in compiled mode.
+ *
+ * INVARIANT: nothing in src/ imports src/prompts-bundle.ts statically. It is a
+ * generated, gitignored file with one `import './prompts/<name>.md'` per prompt,
+ * so a copy generated on another branch names prompts that do not exist here —
+ * and a static import turned that into a module-resolution failure of EVERY
+ * `bun run src/index.ts` invocation, before any code could run. Dev mode reads
+ * src/prompts/ live and never needs the bundle; the literal specifier keeps
+ * `bun build --compile` embedding it for the binary.
+ */
+async function loadPromptBundle(): Promise<Record<string, string>> {
+  return (await import('../../prompts-bundle')).PROMPT_BUNDLE;
+}
 
 /**
  * Represents a built-in prompt file from src/prompts/.
@@ -115,6 +129,7 @@ export async function listBuiltinPrompts(): Promise<BuiltinPrompt[]> {
   }
 
   // Compiled binary: source the list from the embedded bundle.
+  const PROMPT_BUNDLE = await loadPromptBundle();
   return Object.keys(PROMPT_BUNDLE)
     .sort()
     .map(filename => ({
@@ -145,7 +160,7 @@ export async function readBuiltinPrompt(code: string): Promise<string | null> {
   }
 
   // Compiled binary: read from the embedded bundle.
-  return PROMPT_BUNDLE[filename] ?? null;
+  return (await loadPromptBundle())[filename] ?? null;
 }
 
 export async function printBuiltinPrompts(): Promise<void> {

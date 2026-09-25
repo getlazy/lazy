@@ -14,7 +14,12 @@ import { mkdtemp, rm, mkdir, writeFile } from 'fs/promises';
 import { join, resolve } from 'path';
 import { tmpdir } from 'os';
 import { getPidPath, getDaemonDir } from '../../src/daemon/paths';
-import { isDaemonCommandForRoot, killDaemonsForRoot } from '../helpers/daemon-registry';
+import {
+  isDaemonCommandForRoot,
+  killDaemonsForRoot,
+  isSupervisorCommandForRoot,
+  killSupervisorsForRoot,
+} from '../helpers/daemon-registry';
 
 const DRIVER = resolve(__dirname, '../helpers/daemon-registry-driver.ts');
 
@@ -69,7 +74,8 @@ describe('daemon-registry safety net', () => {
   });
 
   // INVARIANT: Ctrl-C (SIGINT) — the common local-iteration interrupt that
-  // skips afterEach — still reaps the daemon, and the driver exits 130.
+  // skips afterEach — still reaps the daemon. Re-raising reports signalCode
+  // SIGINT (exitCode null); the old process.exit(130) path is gone.
   test('reaps registered daemon on SIGINT', async () => {
     const proc = Bun.spawn(['bun', 'run', DRIVER, root, 'hang'], {
       stdout: 'pipe',
@@ -93,7 +99,7 @@ describe('daemon-registry safety net', () => {
     await proc.exited;
 
     expect(await waitUntilDead(dummy!.pid)).toBe(true);
-    expect(proc.exitCode).toBe(130);
+    expect(proc.exitCode === 130 || proc.signalCode === 'SIGINT').toBe(true);
   });
 });
 
@@ -162,5 +168,89 @@ describe('daemon-registry command-line sweep', () => {
     const killed = killDaemonsForRoot(`${root}-someone-elses-run`);
     expect(killed).toEqual([]);
     expect(isAlive(disguised.pid)).toBe(true);
+  });
+});
+
+/**
+ * Supervisors leak the same way daemons do, and cost more when they do.
+ *
+ * A fake-binary (host-process) suite makes the daemon spawn a REAL
+ * `lazy supervise` subprocess, detached and unref'd. Killing the daemon does not
+ * kill it, and it has no pidfile the harness reads — so before this sweep
+ * existed, nothing reaped it. A leaked supervisor keeps rewriting the single
+ * `mcpServers.lazy` entry in the shared `$HOME/.claude.json`, which is how a
+ * stray test supervisor came to answer a real agent's `lazy_commit` against a
+ * deleted /tmp worktree.
+ */
+describe('daemon-registry supervisor sweep', () => {
+  let root: string;
+  let disguised: ReturnType<typeof Bun.spawn> | null = null;
+
+  const superviseArgv = (worktree: string) =>
+    `bun /repo/src/index.ts supervise --protocol-dir /tmp/p --worktree ${worktree}` +
+    ` --runner dangerously-host-process-without-any-isolation`;
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'lazy-e2e-supervise-'));
+  });
+
+  afterEach(async () => {
+    if (disguised && isAlive(disguised.pid)) {
+      try { disguised.kill('SIGKILL'); } catch { /* already gone */ }
+    }
+    disguised = null;
+    await rm(root, { recursive: true, force: true });
+  });
+
+  test('matches only a supervisor whose worktree lives under this root', () => {
+    const cmd = superviseArgv(join(root, '.lazy', 'worktrees', 't1'));
+    expect(isSupervisorCommandForRoot(cmd, root)).toBe(true);
+    // The worktree may be the root itself (a task run in place).
+    expect(isSupervisorCommandForRoot(superviseArgv(root), root)).toBe(true);
+    // A sibling temp root must never match — prefix matching without the path
+    // separator would let one run's teardown kill another run's supervisor.
+    expect(isSupervisorCommandForRoot(cmd, `${root}-other`)).toBe(false);
+    expect(isSupervisorCommandForRoot(superviseArgv(`${root}x/w`), root)).toBe(false);
+    // Not a supervisor at all — a CLI call that merely names the same worktree
+    // must survive the sweep.
+    expect(isSupervisorCommandForRoot(`bun run src/index.ts show --worktree ${root}`, root)).toBe(false);
+    // A supervisor for some other root is somebody else's process.
+    expect(isSupervisorCommandForRoot(superviseArgv('/tmp/elsewhere/w'), root)).toBe(false);
+  });
+
+  // INVARIANT: a supervisor for this root is reaped even though it has no
+  // pidfile — the command-line sweep is its ONLY in-process reaper.
+  test('kills a leaked supervisor for the root', async () => {
+    disguised = Bun.spawn(
+      ['bash', '-c', `exec -a "${superviseArgv(join(root, '.lazy', 'worktrees', 't1'))}" sleep 300`],
+      { stdout: 'ignore', stderr: 'ignore' },
+    );
+    await new Promise(r => setTimeout(r, 300));
+
+    const killed = killSupervisorsForRoot(root);
+    expect(killed).toContain(disguised.pid);
+    expect(await waitUntilDead(disguised.pid)).toBe(true);
+  });
+
+  test('leaves supervisors for other roots alone', async () => {
+    disguised = Bun.spawn(
+      ['bash', '-c', `exec -a "${superviseArgv(join(root, '.lazy', 'worktrees', 't1'))}" sleep 300`],
+      { stdout: 'ignore', stderr: 'ignore' },
+    );
+    await new Promise(r => setTimeout(r, 300));
+
+    const killed = killSupervisorsForRoot(`${root}-someone-elses-run`);
+    expect(killed).toEqual([]);
+    expect(isAlive(disguised.pid)).toBe(true);
+  });
+
+  // The daemon sweep and the supervisor sweep must not poach each other's
+  // processes: a supervisor is not a daemon, and vice versa.
+  test('the daemon sweep does not match a supervisor', () => {
+    const cmd = superviseArgv(join(root, '.lazy', 'worktrees', 't1'));
+    expect(isDaemonCommandForRoot(cmd, root)).toBe(false);
+    expect(
+      isSupervisorCommandForRoot(`bun /repo/src/index.ts daemon start --foreground --project ${root}`, root),
+    ).toBe(false);
   });
 });

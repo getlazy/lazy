@@ -7,18 +7,53 @@ import { existsSync, readFileSync, writeFileSync } from 'fs';
 import type { TestContext, MockAgentResponse } from './setup';
 import { extractTaskId } from './assertions';
 import { runReconcile } from './reconcile';
+import { getTokenPath } from '../../src/daemon/paths';
+import { seedFinal } from './final';
+
+/**
+ * Run `run` with the CLI presenting `token` instead of the shared daemon token.
+ *
+ * The daemon client resolves its bearer from ONE trusted local file
+ * (getTokenPath), and a CLI subprocess re-reads it at startup. Swapping the
+ * file's contents around a call is therefore the supported route for a test to
+ * present a per-user token through the CLI — the same file a member's client
+ * would hold their credential in. The daemon itself compares the shared token
+ * it holds in memory, so a swapped file is invisible to it; the restore matters
+ * only for the NEXT CLI call, which must present the shared token again.
+ */
+export async function withPresentedToken<T>(
+  ctx: TestContext,
+  token: string,
+  run: () => Promise<T>,
+): Promise<T> {
+  const tokenPath = getTokenPath(ctx.root);
+  const shared = readFileSync(tokenPath, 'utf-8');
+  try {
+    writeFileSync(tokenPath, token, { mode: 0o600 });
+    return await run();
+  } finally {
+    writeFileSync(tokenPath, shared, { mode: 0o600 });
+  }
+}
 
 /** Create a task with goal and optional prompt, return the short task ID */
 export async function createTask(
   ctx: TestContext,
   goal: string,
   prompt?: string,
+  /** `--agent <profile>`: which agent profile the task runs; `token`: a per-user token the CLI presents on this call. */
+  opts?: { agent?: string; token?: string },
 ): Promise<string> {
   const args = ['create', '--goal', goal];
   if (prompt) {
     args.push('--prompt', prompt);
   }
-  const result = await ctx.lazy(args);
+  if (opts?.agent) {
+    args.push('--agent', opts.agent);
+  }
+  const result = await (opts?.token
+    ? withPresentedToken(ctx, opts.token, () => ctx.lazy(args))
+    : ctx.lazy(args));
   if (result.exitCode !== 0) {
     throw new Error(`Failed to create task: ${result.stderr}\n${result.stdout}`);
   }
@@ -167,6 +202,10 @@ export async function startAndAccept(
   options: StartOptions = {},
 ): Promise<void> {
   await startAndReconcile(ctx, taskId, options);
+  // Fixture setup, not the subject: the finality gate needs a standing final
+  // before any accept of a committed task (see test/helpers/final.ts). Suites
+  // whose subject IS the finality flow assert it themselves instead.
+  seedFinal(ctx, taskId);
   const result = await ctx.lazy(['accept', taskId, '--yes']);
   if (result.exitCode !== 0) {
     throw new Error(`accept failed for ${taskId}: ${result.stderr}\n${result.stdout}`);

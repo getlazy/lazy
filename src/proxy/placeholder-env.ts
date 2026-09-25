@@ -36,6 +36,17 @@ export interface LaunchIdentity {
    * distinguishes builder sessions from each other; diagnostics otherwise.
    */
   label: string;
+  /**
+   * Agent profile this launch runs, which is what the proxy routes by.
+   *
+   * REQUIRED, in the same spirit as `LaunchSurface` on the role target: a launch
+   * always knows which profile it is launching, and an optional field here would
+   * make "routed to the primary upstream" the silent default for a call site
+   * that simply forgot to pass one. Legacy grants already on disk are the only
+   * profile-less case, and they are handled where they actually arise — at
+   * lookup, not at mint.
+   */
+  profile: string;
 }
 
 /**
@@ -66,6 +77,7 @@ export async function placeholderizeAuthEnv(
       taskId: identity.taskId ?? null,
       label: identity.label,
       envKey: v.key,
+      profile: identity.profile,
     });
     out.push({ key: v.key, value: token });
   }

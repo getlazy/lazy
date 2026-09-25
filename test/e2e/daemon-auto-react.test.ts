@@ -71,7 +71,7 @@ auto_react_comments = false
 `);
 
       const { loadConfig } = await import('../../src/config/loader');
-      const config = await loadConfig(tempDir, { cwd: tempDir });
+      const config = await loadConfig(tempDir);
 
       expect(config.daemon.auto_react_ci).toBe(false);
       expect(config.daemon.auto_react_comments).toBe(false);
@@ -96,7 +96,7 @@ auto_react_comments = true
 `);
 
       const { loadConfig } = await import('../../src/config/loader');
-      const config = await loadConfig(tempDir, { cwd: tempDir });
+      const config = await loadConfig(tempDir);
 
       expect(config.daemon.auto_react_ci).toBe(false);
       expect(config.daemon.auto_react_comments).toBe(true);
@@ -340,7 +340,7 @@ auto_react_comments = true
     const { runAutoReact } = await import('../../src/daemon/auto-react');
     const { loadConfig } = await import('../../src/config/loader');
 
-    const config = await loadConfig(tempDir, { cwd: tempDir });
+    const config = await loadConfig(tempDir);
 
     // Mock storage with non-submitted tasks
     const mockStorage = {

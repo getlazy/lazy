@@ -15,8 +15,9 @@
  * AUDIT_SEGMENT_MAX_BYTES and exactly AUDIT_RETAINED_SEGMENTS older segments
  * are kept, so the whole log can never exceed
  * (AUDIT_RETAINED_SEGMENTS + 1) * AUDIT_SEGMENT_MAX_BYTES. Retention is
- * deliberately small: the only reader is the recent-history auth verdict
- * (`lazy doctor`). This stream is not an analytics archive — anything that
+ * deliberately small: the readers are the recent-history auth verdict
+ * (`lazy doctor`) and the one-time seed of the latest usage-limit reading
+ * per credential (src/proxy/usage-limits.ts). This stream is not an analytics archive — anything that
  * wants statistics should tap the stream as it flows, not re-read the file.
  *
  * The writer is daemon-side only (`createProxyServer` is constructed solely by
@@ -27,6 +28,7 @@
 
 import { appendFile, mkdir, readFile, rename, rm, stat } from 'fs/promises';
 import { join } from 'path';
+import { hasScrubbableCredentials, redactSecretValues } from '../utils/redact';
 import type { ListAuditRecordsOptions, ProxyAuditRecord } from '../storage/types';
 
 /** File name of the live audit segment. */
@@ -91,6 +93,68 @@ async function readSegment(path: string): Promise<ProxyAuditRecord[]> {
 }
 
 /**
+ * Scrub live credential values out of the free-text fields of an audit record.
+ *
+ * Contains no redaction logic of its own — it only routes named fields through
+ * `redactSecretValues` (src/utils/redact.ts), which owns the rules and the
+ * short-value threshold. It lives here rather than in that module so the
+ * generic helper stays free of storage types.
+ *
+ * WHY THESE FIELDS: most of a ProxyAuditRecord is structured metadata (model,
+ * status, token counts) that cannot carry a secret. Five fields carry free text
+ * that can:
+ *
+ *  - `toolUses[].command` — the raw Bash command string. An agent running `env`,
+ *    `echo $ANTHROPIC_API_KEY`, or an export lands the LIVE value here. This is
+ *    the real path, not a hypothetical one.
+ *  - `toolUses[].inputPreview` — a JSON snippet of the same tool input, so it
+ *    carries the same content by another route.
+ *  - `toolResults[].contentPreview` — the result of a prior action; the spike
+ *    that motivated this record type proved unguessable file contents cross
+ *    here, and a credentials file read is exactly that.
+ *  - `error` — an upstream fetch error message, which can embed a URL with
+ *    userinfo. Insurance: no observed path today.
+ *  - `upstream` — a configured base URL, which a user could write with
+ *    credentials in it. Insurance likewise.
+ *
+ * WHY AT APPEND, NOT AT RENDER: one write, many reads. `lazy audit <id>` prints
+ * these fields to a terminal a human pastes into a bug report, but so would any
+ * future reader; scrubbing on the way in covers all of them and keeps the cost
+ * off the proxy's request path (appends are chained behind the response).
+ *
+ * Returns the input unchanged — the same object, not a copy — when nothing was
+ * scrubbed, which is every request on a setup with no long credential in env.
+ */
+export function redactAuditRecordContent(record: ProxyAuditRecord): ProxyAuditRecord {
+  // Building the scrubbed copy walks every tool_use and tool_result. Skip that
+  // walk entirely when the environment holds nothing that could be replaced.
+  if (!hasScrubbableCredentials()) return record;
+
+  let changed = false;
+  const scrub = <T extends string | null>(value: T): T => {
+    if (value === null || value === '') return value;
+    const out = redactSecretValues(value) as T;
+    if (out !== value) changed = true;
+    return out;
+  };
+
+  const toolUses = record.toolUses.map((use) => ({
+    ...use,
+    command: scrub(use.command),
+    inputPreview: scrub(use.inputPreview),
+  }));
+  const toolResults = record.toolResults.map((result) => ({
+    ...result,
+    contentPreview: scrub(result.contentPreview),
+  }));
+  const error = scrub(record.error);
+  const upstream = scrub(record.upstream);
+
+  if (!changed) return record;
+  return { ...record, toolUses, toolResults, error, upstream };
+}
+
+/**
  * The bounded audit log for one project.
  *
  * Appends are expected to be serialised by the caller (AuditQueue chains them),
@@ -139,7 +203,9 @@ export class ProxyAuditLog {
     await mkdir(auditLogDir(this.dataDir), { recursive: true });
     if (this.liveBytes === null) this.liveBytes = await this.liveSize();
 
-    const line = JSON.stringify(record) + '\n';
+    // Scrub on the way in, so no reader of this file — `lazy audit`, a doctor
+    // run, or a human with `cat` — can surface a credential the agent echoed.
+    const line = JSON.stringify(redactAuditRecordContent(record)) + '\n';
     await appendFile(this.path, line, 'utf-8');
     this.liveBytes += Buffer.byteLength(line, 'utf-8');
 

@@ -5,6 +5,7 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { runReconcile } from '../helpers/reconcile';
 import { expectSuccess, expectFailure, expectOutput, expectOutputExcludes } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 
 /**
  * Resolve the tasks directory for a test project. Test projects init with
@@ -92,6 +93,12 @@ describe('lazy unblock', () => {
     await runReconcile(ctx.root, ctx.protocolBase);
   }
 
+  /** Accept an already-started task — with the fixture final the gate needs. */
+  async function acceptForList(taskId: string): Promise<void> {
+    seedFinal(ctx, taskId);
+    expectSuccess(await ctx.lazy(['accept', taskId]));
+  }
+
   test('shows usage when no task ID provided', async () => {
     const result = await ctx.lazy(['unblock']);
     expectFailure(result);
@@ -145,8 +152,7 @@ describe('lazy unblock', () => {
     expectOutput(blockedResult, 'Accept blocked');
 
     // Accept the task
-    const acceptResult = await ctx.lazy(['accept', taskId]);
-    expectSuccess(acceptResult);
+    await acceptForList(taskId);
 
     // Now it should NOT appear in blocked
     blockedResult = await ctx.lazy(['blocked']);
@@ -235,8 +241,7 @@ describe('lazy unblock', () => {
     await startAndReconcile(taskId2);
 
     // Accept first task
-    const acceptResult = await ctx.lazy(['accept', taskId1]);
-    expectSuccess(acceptResult);
+    await acceptForList(taskId1);
 
     // Only second task should appear in blocked
     const blockedResult = await ctx.lazy(['blocked']);

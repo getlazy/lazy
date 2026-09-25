@@ -8,8 +8,176 @@ lazy doctor
 ```
 
 `lazy doctor` is the single diagnosis surface — every check prints what failed,
-why, and the command that fixes it. The sections below expand on the failures
-users hit most often.
+why, and the command that fixes it. When a run finds errors, it also files
+one alert in the inbox (`lazy messages`, and Inbox on the dashboard) so
+people who never run doctor still see the findings. Re-running doctor does
+not stack a second alert for the same failures. The same report and the same
+cleanup flags are on the dashboard under **Settings → Doctor**. The sections
+below expand on the failures users hit most often.
+
+## Doctor's cleanup flags
+
+A plain `lazy doctor` only **reports**. Anything it can clean up for you is a
+flag you choose to run, so nothing happens to your worktrees, images,
+containers, branches or tasks unless you ask:
+
+```
+lazy doctor --clean-worktrees
+lazy doctor --clean-docker-images
+lazy doctor --clean-orphaned-containers
+lazy doctor --unset-upstream-tracking
+lazy doctor --resume-interrupted-tasks
+lazy doctor --clean-local-command-conversations
+```
+
+Every one of them has the same shape:
+
+1. It lists what it would touch — one line per item, with the size on disk
+   where that is the point.
+2. `--dry-run` stops there.
+3. Otherwise it asks before acting. `--yes` skips the question; without a
+   terminal and without `--yes` it refuses rather than guessing, so a script
+   can never clean up by accident.
+4. It then acts and prints one line per item, plus a count.
+
+A failure on one item is printed and the rest still run — one worktree git
+refuses to drop shouldn't strand the other four. The count says how many
+actually happened (`Removed 2 of 3 worktree(s).`) and the command exits non-zero
+whenever anything failed, so a script or `&&` chain sees it.
+
+Run one remedy at a time — doctor refuses two in one invocation, so you always
+know which listing you just approved.
+
+What each one does:
+
+- **`--clean-worktrees`** removes the worktrees of finished (complete or
+  abandoned) tasks. This is the one that reclaims real disk: a worktree keeps
+  its own `node_modules`, `target/`, `build/` and every other dependency and
+  build tree, and finished tasks hold onto them indefinitely. **Branches are
+  kept** — the work itself is still there, only the checkout goes.
+- **`--clean-docker-images`** removes stale lazy runner images. It never
+  removes the image your current lazy version uses, an image this machine has
+  adopted, or an image pinned on a task — deleting one of those would break the
+  next launch.
+- **`--clean-orphaned-containers`** removes lazy containers no task references
+  any more.
+- **`--unset-upstream-tracking`** drops leftover upstream tracking config from
+  lazy task branches. Tracking on a task branch is harmless in itself; doctor
+  calls out the one case that is not — a branch whose tracking names a
+  *different* branch, where a plain `git pull` on it would merge that other
+  branch in.
+- **`--resume-interrupted-tasks`** starts the next turn of interrupted tasks
+  now. An interrupted task is resumable, not broken, and a running daemon offers
+  to resume each one every few seconds — but it holds back a task you stopped
+  yourself, one that has been interrupted repeatedly in a row, or one that has
+  used up its automatic-resume budget for the day. This flag starts them anyway,
+  and it is the only way to resume a task the daemon is holding back.
+- **`--clean-local-command-conversations`** drops Claude Code's local-command
+  boilerplate (the caveat, a built-in slash command such as `/clear`, and its
+  output) out of conversations that were stored before lazy started filtering it,
+  so each conversation's summary is the first thing you actually said. On its
+  own it deletes nothing: a stored row that holds nothing but boilerplate is
+  listed and then left alone. Add
+  `--delete-empty-local-command-conversations` to delete exactly those rows —
+  it asks separately, `--yes` alone never implies it, and deletion is
+  permanent. See
+  [Conversation import](conversation-import.md#local-command-transcripts).
+
+The two that need Docker (or Podman) say so and stop if the runtime isn't
+running: an empty listing would look like a clean bill of health when in fact
+nothing was inspected.
+
+## Sessions start with a lot of the context window already used
+
+Every session — the builder and every task agent — begins with a fixed block of
+text already in its context: the `CLAUDE.md` files the agent harness loads,
+lazy's own system prompt, your shared memory index, and the schemas for lazy's
+tools. None of it is wasted, but on a mature project it adds up, and the first
+place most people notice is a startup line from the agent harness about
+`CLAUDE.md` being over its size limit.
+
+`lazy doctor` prints the whole breakdown, so you never have to go looking for
+it:
+
+```
+lazy doctor
+```
+
+Under **Context budget** you get one block per role, because a builder session
+and a task agent session are not the same:
+
+```
+Context budget (injected into every session, before the first message):
+  Builder session
+    ≥10,412 tok  41,903 chars  CLAUDE.md (project)
+      ! over the 40,000-char per-file limit Claude Code 2.1.266 warns at
+        It is still injected in full — nothing is truncated — but the harness
+        warns at every startup and re-reads the whole file every turn. …
+    ≥12,829 tok  55,002 chars  lazy system prompt
+      ≥4,001 tok  16,004 chars  of which shared memory index
+    ≥14,442 tok  64,389 chars  MCP tool schemas (52 tools)
+     ≥3,059 tok  13,172 chars  MCP server instructions
+    174,466 chars, ≥40,742 tokens before the first message (≥4% of a 1M-token window)
+    Context window: 1M tokens — claude-opus-5 is a 1M-window model and this launch presents a first-party base URL
+  Task agent session
+    …
+```
+
+Reading it:
+
+- **Character counts are exact; token figures are a floor.** They come from an
+  offline tokenizer that undercounts Claude's own by roughly 15–20% on prose and
+  more on code, which is why they are printed as `≥`. The real cost is higher,
+  never lower — so a total that already looks large is worth acting on, and one
+  that looks comfortable has less headroom than it says.
+- **Indented lines break down the line above them** and are not added again to
+  the total. The shared memory index is part of the system prompt, so it is
+  shown inside it.
+- **Nothing here is ever truncated.** The per-file `CLAUDE.md` limit is a
+  warning from the agent harness, not a cut-off — an oversized file is still
+  loaded in full, it just costs you that much of every session and gets re-read
+  on every turn. The limit is per file, not a budget across all of them: two
+  30,000-character files draw no warning even though they total 60,000.
+- **The warning names the Claude Code release the limit was read from.** The
+  limit is not published as an API; it was read out of the harness bundle, and a
+  later release could move it. If your harness is much newer than the release
+  named on that line and the numbers look wrong, trust your harness.
+- **The two roles differ for real reasons**: different system prompts,
+  different memory templates, an extra preamble that introduces a task agent to
+  its own task, and the builder additionally loads your personal
+  `~/.claude/CLAUDE.md`, which a task agent never sees. The tool schemas are the
+  same for both.
+- **This is what *lazy* costs, not the whole session.** The agent harness has
+  its own system prompt and built-in tools on top, and everything specific to a
+  turn — the task's goal and prompt, previous turns, your comments — arrives
+  afterwards. Expect the harness's own `/context` screen to show a bigger
+  number; the gap is the harness's, and not something lazy can shrink for you.
+- **The window is the one this role's next launch will actually get**, not a
+  fixed 200k. A 1M-window Anthropic model through lazy's proxy gets 1M; a 200k
+  model stays 200k. Doctor prints that number under each role, and names a
+  remedy if the project's upstream is pointed somewhere that would cap a 1M
+  model. The CLAUDE.md per-file warning uses the same window, so a 1M session
+  is allowed a larger file before the harness complains.
+
+When a role's total goes past a fifth of the window, doctor adds one line naming
+the largest thing *you* can shrink. There are only two:
+
+- **A `CLAUDE.md` that has grown into a manual.** Move the parts only some tasks
+  need into a separate document they can read when it is relevant. Instructions
+  every task must follow belong in `CLAUDE.md`; reference material does not.
+- **The shared memory index.** Shrink it with `lazy memory compact`, or curate
+  the records directly with `lazy memory save` and `lazy memory rm`. See
+  [memory.md](memory.md).
+
+Lazy's own system prompt and tool schemas are not something a project can trim,
+so doctor never suggests it — if they are the whole of your total, it says so
+and leaves you alone.
+
+Measuring a session means assembling the prompt a launch would send, which needs
+a working runner. When there isn't one — the daemon is down, typically — the
+section prints `Could not measure` and points at the check that explains why,
+rather than quietly disappearing and leaving you to conclude lazy injects
+nothing.
 
 ## The daemon won't start
 
@@ -21,8 +189,9 @@ already running, and reports the failure rather than proceeding when it can't:
 Error: <what the daemon reported>
 ```
 
-The daemon writes the same message, with a timestamp, to its log. Find the log
-path with `lazy daemon status`, and read it with:
+The daemon writes the same message, with a timestamp, to its log — as the last
+thing it writes before giving up, so the end of the log is where to look. Find
+the log path with `lazy daemon status`, and read it with:
 
 ```
 lazy daemon logs
@@ -53,15 +222,12 @@ one command that must never die of the problem it exists to diagnose.
 Every so often the daemon is up — the web dashboard answers, agents keep
 working — but `lazy daemon status` insists it isn't running, and
 `lazy daemon start` then fails because the running daemon still holds the
-storage lock. There is a specific cause: the daemon's PID and socket files
-(`lazy.pid`, `lazy.sock` in the daemon's state directory) were deleted while it
-was running.
+storage lock. There is a specific cause: the daemon's PID file (`lazy.pid` in
+the daemon's state directory) was deleted while it was running.
 
-That mattered because a unix socket file exists only while its listener holds
-it, so you cannot put one back by hand. The daemon now notices and repairs both
-files itself within a few seconds. `lazy doctor` reports the state in these
-terms — naming the live daemon's PID, recovered from the lock file — instead of
-repeating "daemon is not running":
+The daemon now notices and rewrites the file itself within a few seconds.
+`lazy doctor` reports the state in these terms — naming the live daemon's PID,
+recovered from the lock file — instead of repeating "daemon is not running":
 
 ```
 lazy doctor
@@ -104,9 +270,11 @@ lazy daemon restart
 
 No hand-rolled `kill` is needed. `lazy daemon stop` (which `restart` runs first)
 escalates on its own and narrates each step: bounded shutdown request → SIGTERM →
-SIGKILL. The escalation exists because the daemon's SIGTERM handler runs on the
-same loop that is stuck, so a polite signal may never be processed — and until
-the wedged process is gone it holds the daemon lock, so no replacement can start.
+SIGKILL. The escalation exists because a polite signal may not finish the job:
+a frozen daemon cannot act on it at all, and a busy one may still be shutting
+down when the clock runs out. Either way, until the process is gone it holds the
+daemon lock, so no replacement can start — which is why stop finishes the job
+itself rather than telling you to reach for `kill -9`.
 
 The grace period before the SIGKILL depends on what the daemon did with the
 shutdown request. One that *accepted* it is winding down deliberately (closing
@@ -119,10 +287,77 @@ A process that survives SIGKILL is stuck in the kernel — uninterruptible I/O,
 usually a hung network mount. `lazy daemon stop` says so explicitly instead of
 reporting a clean stop; nothing in user space can clear it.
 
-To see whether the daemon's reconcile loop is the thing stuck, run it with debug
-logging: each tick logs a line when it starts and another when it completes, so a
-start with no matching completion is the wedge, and the last phase logged before
-it points at the cause.
+To see whether the daemon's reconcile loop is the thing stuck, run
+`lazy daemon health` (next section): its **Reconcile loop** row says when the
+last tick finished and, if one has been running too long, which phase it is in.
+For the full story, run the daemon with debug logging: each tick logs a line when
+it starts and another when it completes, so a start with no matching completion is
+the wedge, and the last phase logged before it points at the cause.
+
+## The daemon answers, but work has stopped: `lazy daemon health`
+
+Most things that go wrong inside a running daemon do not crash it — by design. A
+background loop that hangs, a recovery step that fails on every pass, a proxy that
+stopped answering, a task left saying `working` with nothing running: each is
+caught and logged, and the daemon keeps serving. `lazy daemon status` then says
+"running", and it is, while the work it exists for has quietly stopped.
+
+`lazy daemon health` asks the daemon about each of its moving parts and prints one
+row per check, **OK**, **WARN** or **FAIL**, with a one-line reason. Rows that are
+not OK say what to do:
+
+```
+$ lazy daemon health
+Daemon health — /home/you/src/my-project
+
+Daemon
+  ✓ Version and uptime — lazy 0.23.1, pid 41287, up 3h12m04s, source 5d1e… (computed)
+  ✓ Daemon runs the CLI's build — same build (5d1e…)
+
+Loops
+  ✗ Reconcile loop — last tick finished 7m02s ago (took 180ms); 2210 ticks since start,
+    every 5s; the current tick has been running 7m01s, in 'runAutoReact'
+      → `lazy daemon logs` shows what the tick is waiting on …
+  ✓ Sync retry loop — last tick finished 2s ago (took 3ms); …
+  ✓ Remote sync loop — last tick finished 41s ago (took 2.1s); …
+
+Reconciler sweeps
+  ✓ 25 sweeps healthy (--verbose lists each)
+
+Proxy
+  ✓ Proxy answering — listening on 127.0.0.1:52811; self-check answered in 1ms
+  ✓ Proxy audit log writable — /home/you/src/my-project/.lazy/logs; last record 12s ago
+…
+14 OK, 0 WARN, 1 FAIL
+```
+
+What it checks:
+
+| Section | Rows |
+|---|---|
+| Daemon | Version, pid and uptime; whether the daemon runs the same build as the CLI you typed the command in |
+| Loops | The reconcile, sync-retry and remote-sync loops: when each last completed a tick, how long it took, how many ticks since start. A loop whose last completed tick is far older than its interval is a WARN, then a FAIL, and the row names the phase the running tick is stuck in |
+| Reconciler sweeps | Each recovery sweep and reconcile phase: last run, duration and last error. A sweep that just failed is a WARN; one that has failed on every run for five minutes is a FAIL. Healthy sweeps are folded into one line unless you pass `--verbose` |
+| Proxy | Where the proxy listens, and a real request to its own health path with the round-trip time — that request carries no credential and reaches no model, so it costs nothing. Also whether the proxy's audit log can be written |
+| Storage | Who holds the storage lock (the daemon itself is the only healthy answer; a dead holder, or a pid that now belongs to a different process, is called out) and whether writes are completing |
+| Runner | Docker or Podman reachable (or, for the host runner, the agent binary), and whether the container image is built |
+| Tasks | Tasks that say `working` but have no live run, and for how long; tasks with queued syncs and where their retries stand; interrupted tasks that nothing will resume on its own (auto-resume gave up, or is turned off) |
+| Dashboard | Whether the web dashboard is bound, on which addresses, and why an extra address for containers could not be bound |
+
+Each check runs under its own time limit, so a part that hangs shows up as a FAIL
+row naming it rather than a command that never returns. Rows print as each check
+completes. The command never starts a daemon: with none running, it reports that
+as its one row.
+
+It exits 1 when any row FAILs, and 0 otherwise, so it can gate a script. `--json`
+prints the whole report for tools:
+
+```
+lazy daemon health --json | jq '.rows[] | select(.state != "ok")'
+```
+
+`lazy doctor` includes a single **Daemon health** line summarising this report and
+pointing here; the rows and their remedies live only in `lazy daemon health`.
 
 ## What stopping the daemon costs
 
@@ -132,17 +367,22 @@ differently, so they are reported separately rather than as one count:
 
 - **Working task agents** are stopped with the daemon. The in-flight turn is
   lost (committed work is kept) and the task resumes from its last checkpoint
-  once a daemon is running again.
-- **Builder sessions** (`lazy builder`) are *not* stopped and *not* resumed.
-  They keep running, but they reach the model through the daemon's proxy, which
-  dies with it — and a restart binds a new proxy port a live builder never picks
-  up. Exit and relaunch each builder afterwards.
+  once a daemon is running again. This is not special to `lazy daemon stop`:
+  a daemon told to quit any other way — a service manager stopping it, a plain
+  `kill`, or closing the terminal it is running in — stops its agents the same
+  way and records why each turn ended, which is why it takes a moment to exit
+  rather than vanishing instantly.
+- **Builder sessions** (`lazy builder`) are *not* stopped with the daemon.
+  They keep running and reconnect in place when the daemon comes back — the
+  in-container supervisor refreshes the proxy address and relaunches Claude with
+  `--resume`. While the daemon is down they cannot reach the model through the
+  audit proxy; restart the daemon and wait for the one-line reconnect notice
+  rather than relaunching by hand.
 - **Pair sessions** are not stopped either, and nothing resumes them: the task
   stays locked in `pairing` until you exit the session.
 
-Two things cannot be enumerated yet and are named as such in the warning rather
-than silently omitted: a `lazy pair` started outside a task (on main), and
-builder sessions on the host-process runner, which have no pidfile.
+One thing cannot be enumerated yet and is named as such in the warning rather
+than silently omitted: a `lazy pair` started outside a task (on main).
 
 A daemon that has wedged is the most common reason to stop one, so the warning
 is built to survive it: each lookup is bounded separately, one that fails or
@@ -156,12 +396,48 @@ still prints the warning but never blocks; scripts are not held up. Nothing
 about what stopping *does* changed; this is only the courtesy of saying so
 first, the same one `lazy upgrade` already had.
 
+## Where one task's pieces live
+
+Troubleshooting a single task means knowing four locations, and none of them is
+guessable from the outside: the worktree depends on the project's data dir *and*
+on the task's ref, and the store root is wherever `[storage] external_path`
+points.
+
+- **Worktree** — `<project root>/<data dir>/worktrees/<task ref>`. Removed when
+  the task ends, so its absence is ordinary for a finished task and a real
+  finding for a working one. `lazy doctor <task-id>` prints it and says whether
+  it is there.
+- **Store root** and **task data dir** — where the task's own records live,
+  under `[storage] external_path` when one is set.
+- **Container / run name** — on the task's session, next to `runner_type`. A
+  docker session is found by container name, a host one by pidfile.
+- **Daemon log** — `daemon.log` under the daemon's own dir; `lazy daemon logs`
+  tails it and prints the path it is tailing.
+
+The daemon reports the worktree, the store root and the task data dir as a
+`paths` block on its `show` RPC, for clients that are not a shell on this host;
+the container name and runner are already on the session there.
+
+A browser client can render all of these on the task page for an operator,
+alongside the task's full id, its session id and the session's
+`interrupt_reason`. Locations only — a path to a token file is shown so an
+operator can read it with their own credentials; no value ever is.
+
+When the daemon itself is down there is no task page to read: every task read
+fails and the browser lands back on the project page. That page carries a
+**Diagnostics** control in its header for an elevated admin — and, when the
+project is not answering, says so and points at the same place — so the project
+diagnostics (supervisor state, restart history, daemon log tail) stay one click
+away in the state they exist for. Members see none of it; a daemon is not
+theirs to operate.
+
 ## lazy.toml won't parse
 
 A `lazy.toml` that exists but cannot be read is always a hard error, never a
 silent fallback to defaults: running with settings you didn't write is worse
 than not running. The message names the file, the line that failed and its
-text, and what the parser objected to:
+text, and what the parser objected to — so a 300-line config does not turn into
+a hunt:
 
 ```
 Failed to parse /path/to/lazy.toml: line 8: port = = 26024 — TOML Parse error: Expected a value but found '='
@@ -182,54 +458,136 @@ The full key-by-key reference is [lazy.toml](./lazy-toml.md).
 ## No model credential
 
 The daemon — not your shell — is what launches agents, so the credential has to
-be in the **daemon's** environment. Set one and restart it:
+reach the **daemon**. The durable fix is to store it, which takes the shell out
+of the picture entirely:
 
 ```
-claude setup-token
+claude setup-token | lazy auth set anthropic
+lazy daemon restart
+```
+
+The daemon reads the store at startup, so it no longer matters which terminal
+started it. This is also what stops `lazy upgrade` aborting with "no
+authentication credential found in the environment" when you run it from a shell
+that never exported a token. See [Credentials](./credentials.md).
+
+Exporting still works and still wins over the store, if you prefer it:
+
+```
 export CLAUDE_CODE_OAUTH_TOKEN=…      # or ANTHROPIC_API_KEY
 lazy daemon restart
 ```
 
-`lazy doctor` reports which credential it found and whose environment it came
-from, saying so explicitly when it had to fall back to your shell's because the
-daemon couldn't be asked.
+`lazy doctor` prints one line per credential your [agent
+profiles](./lazy-toml.md#agentsname--named-agent-profiles) bill — the profiles
+the **builder** and **agent** roles default to, plus every `[agents.<name>]`
+block in your lazy.toml — naming the credential, where it was found, and which
+profiles need it:
 
-## `lazy pair` refuses on a Cursor task
+```
+✓ Anthropic credential present (daemon env: ANTHROPIC_API_KEY; needed by claude-code)
+✓ OpenAI credential present (credential store: keychain; needed by openai-pi)
+✗ OpenRouter credential present (needed by openrouter-codex)
+```
 
-Expected, and deliberate. Pairing is opt-in per agent and only Claude Code opts
-in; `lazy pair` refuses on any other agent's task before it takes a lock, moves
-the task's status, or launches anything.
+A missing credential fails the check by name, with the profiles it strands, how
+to obtain one, and the `lazy auth set <name>` command that stores it. The source
+is the daemon's environment, the credential store (naming its backend), or the
+agent key file written by `lazy system agent set-key`. When the daemon cannot be
+asked, doctor falls back to your shell's environment and the store and says so
+on every line — that answer may not be what lazy actually uses, so check the
+daemon and run it again.
 
-The reason is that pairing on a Cursor task would be dangerous *and* useless. A
-task that ran in a container wrote its chat history *inside* the container,
-under `<worktree>/.lazy-task-sandbox/.cursor/`. `cursor-agent` on your host
-reads your real `~/.cursor` and cannot see it.
+Doctor is deliberately stricter than the daemon's startup check. The daemon
+starts as long as the two **role defaults** have their credentials, so a profile
+you declared but never selected never blocks it; a task that selects such a
+profile fails at launch, naming the profile and the credential. Doctor reports
+that credential as missing up front, so you learn it before a task does.
 
-lazy will **not** close that gap by copying the history onto your host. It used
-to, and that was a container→host escalation channel: the transcript is written
-by the task's agent, so importing it turns agent-authored text into input for a
-host session running as you, with your credentials — and `--autonomous` then
-resumed it with approvals off. Prompt injection in a task's chat log became a
-host session with no guardrails.
+If every profile your configuration uses points at an upstream that takes no
+credential — `credential = "none"`, the default for a local model server — no
+credential is required at all, the daemon starts without one, and doctor says
+so:
 
-Without the import there is nothing left to join: you would get an empty session
-with no memory of the work. So the capability is removed rather than kept in a
-weakened form.
+```
+✓ Model credential present (none needed — every configured profile uses an upstream that takes no credential)
+```
 
-What to do instead:
+## A Codex task answers, then can't touch any file
 
-- `lazy show <task>` — the task's turns, in a form that is safe to read.
-- `lazy unblock <task> -m "..."` — steer the agent with feedback.
-- `lazy chat <task>` — a read-only conversation about the work.
+Symptom: a Codex task authenticates, the model clearly replies, and then the
+turn stops without changing anything — reporting something like
+`failed to spawn code-mode host …/codex-code-mode-host: No such file or
+directory`.
 
-This is expected to change when pairing itself moves into the container: there
-the session is already on the same side of the boundary as the agent that wrote
-it, and nothing has to be imported across it.
+Cause: the task image is older than this fix. Codex ships its tool runner as a
+second binary next to the CLI, and some models route every tool call through it.
+An image built without that binary gives you an agent that can talk and nothing
+else.
 
-Claude Code tasks do pair, via a narrower mechanism: lazy symlinks the sandbox's
-session files into `~/.claude/projects/<encoded worktree>` for the duration of
-the session and removes them on exit. Symlinks only, never replacing an existing
-host entry, and no config file is touched.
+Fix: rebuild the task image.
+
+```
+lazy upgrade --images
+```
+
+`lazy doctor` reports this one directly — look for "Codex code-mode host
+installed" — so you can check before starting a task rather than after losing a
+turn.
+
+## Cursor review says "MCP calls were rejected"
+
+Symptom: a formal `lazy review` (or `lazy ask`) on a Cursor task produces a
+turn that says MCP calls were rejected / Shell is blocked, skips
+`lazy_show` / `lazy_raise`, and dumps findings only in the verdict JSON. Claude
+reviews on the same project keep their lazy tools.
+
+Cause (fixed in current lazy): Cursor's `--mode plan` refused MCP tool calls.
+Read-only Cursor turns now exclude write tools by name and leave lazy MCP
+available, the same way Claude Code excludes `Bash` / `Write` / `Edit`.
+
+If you still see the rejection on an older binary, upgrade lazy and re-run the
+review. Findings from a review that already lost MCP can still land as Raises
+via the turn handoff / verdict recovery path.
+
+## One Cursor task fails auth while others work
+
+Symptom: most Cursor tasks run fine, but one task dies immediately with
+`fatal_auth` / "Cursor CLI is not authenticated" / "set CURSOR_API_KEY", and
+resuming it fails the same way. It can also look like the task "switched to
+Claude" — the container was built with Claude credentials while the task still
+says Cursor.
+
+Cause: that task's container was created without the Cursor key in its
+environment. Credentials are fixed at container create time, so resume keeps
+reusing the broken container.
+
+Fix: recreate that task's container, then resume or unblock:
+
+```
+lazy shell <task> --restart
+lazy resume <task>
+```
+
+## `lazy pair` refuses to run on my machine
+
+Expected. Pairing runs **inside the task's container**, where the task's own
+turns run — not as a host process against the worktree. **Branchless pairing**
+(`lazy pair` on a non-task branch: no task, no worktree) has no container and
+requires an explicit `lazy pair --host`, which says what it is doing before it
+launches. There is no automatic fallback: if the container path fails, pairing
+fails loudly. See [Pairing](pairing.md).
+
+Cursor tasks now pair too — the refusal that used to apply to them was about
+host pairing needing to copy container-written chat history onto your host, and
+in-container pairing does not copy anything. Conversation capture and the
+end-of-session AI summary remain Claude Code only, and pairing says so when it
+starts.
+
+`--host` itself is claude-code-only, and refuses on a task running any other
+agent. The host launcher runs Claude Code whatever the task's agent is, so
+`--host` on a Cursor task would open the wrong agent against that task's work.
+Pair it in its container instead.
 
 ## `lazy pair` or `lazy chat` asks me to `/login`
 
@@ -242,8 +600,9 @@ lazy daemon status
 lazy doctor
 ```
 
-Restart the daemon from a shell that has the credential exported
-(`lazy daemon restart`) and the next `lazy pair` picks it up.
+Store a credential (`claude setup-token | lazy auth set anthropic`) or restart
+the daemon from a shell that has one exported — either way, `lazy daemon restart`
+and the next `lazy pair` picks it up.
 
 Your shell is deliberately not consulted, even when it does export a token. That
 used to be the fallback, and it was the cause of this symptom rather than a cure:
@@ -417,6 +776,33 @@ message names.
 Only `lazy doctor` fails fast like this. Every other command keeps queueing on
 a contended lock, which is what you want from a command that has work to do.
 
+## Accept fails with `index.lock: File exists`
+
+```
+Accept failed: git could not update the index because a lock file already exists at
+…/.git/worktrees/<task>/index.lock. …
+```
+
+Git creates an `index.lock` while it updates a worktree's index, then renames
+it into place. If that git process is killed mid-write — a crash, a forced
+daemon stop, a container teardown — the lock file is left behind, and every
+later accept whose merge target is that worktree fails until the lock is gone.
+
+Lazy checks whether any process still has the lock open before removing it. When
+nothing holds it, accept clears the lock, says so, and continues. When a live
+process still has it open, accept refuses and names the process — deleting a
+lock out from under a live git corrupts the repository.
+
+If lazy cannot check (no way to list open files in that environment) it also
+refuses, and tells you the exact `rm` path to use only when you are sure no git
+is using that worktree:
+
+```
+rm …/.git/worktrees/<task>/index.lock
+```
+
+Then retry the accept. The task is left as it was — the merge did not start.
+
 ## "Could not register the lazy MCP tools … refusing to run it"
 
 A turn failed before the agent started, with something like:
@@ -430,10 +816,9 @@ run with NO lazy_* tools at all — refusing to run it.
 ```
 
 That is deliberate. An agent without `lazy_*` tools cannot read task history,
-record follow-ups, commit through lazy, or reach any lazy state — it would do
-the work with the wrong picture and no way to say so. Until v0.21 this was
-swallowed and the turn ran anyway; the only trace was a warn line inside the
-container, which is why one such turn went undiagnosed for days.
+raise items, commit through lazy, or reach any lazy state — it would do
+the work with the wrong picture and no way to say so, so lazy refuses the turn
+loudly rather than letting it run blind.
 
 The message names everything you need:
 
@@ -447,6 +832,83 @@ Check the daemon is up (`lazy daemon status`), then resume the task — the
 relaunch fixes the common case. `lazy doctor` reports launch-path problems.
 Any other cause (`EACCES`, `EISDIR`, `ENOSPC`) is a filesystem problem where the
 agent's `~/.claude.json` is written.
+
+## "Refusing to serve lazy MCP tools: … configured for a different task"
+
+A turn's agent has no `lazy_*` tools, and the MCP server's output says:
+
+```
+Refusing to serve lazy MCP tools: this server was configured for a different task
+than the turn it was spawned in.
+  This turn expects: task 6148d734-… in /repo/.lazy/worktrees/my-task
+  The MCP entry says: task 91290431-… in /repo/.lazy/worktrees/old-task
+```
+
+Claude Code discovers MCP servers in exactly one place — `$HOME/.claude.json` —
+and every lazy supervisor rewrites the single `mcpServers.lazy` entry there
+before each turn, stamping in that turn's task and worktree. Containerized tasks
+each have their own HOME, so supervisors for different tasks do not share an MCP
+config file on the host.
+
+A stray `lazy supervise` process left behind by an earlier run can keep
+rewriting that entry while a real agent works, so the agent's tools would be
+served against the stray's (possibly already deleted) worktree. The server
+compares its own `--task-id`/`--worktree` against what the supervisor exported
+for this turn and exits instead, so an agent gets its own task's tools or none —
+never another task's.
+
+The remedy is in the message: find the stray supervisor and kill it.
+
+```bash
+ps ax | grep "lazy supervise"
+kill <pid>
+```
+
+Then re-run the turn. If the process it names belongs to a live task you care
+about, that task is the one to stop cleanly (`lazy stop <task>`) rather than
+kill. Note that "no tools" is itself fatal and visible — the turn is aborted, not
+run blind.
+
+
+## A lazy tool fails, then every later tool says "Connection closed"
+
+What it looks like in an agent's transcript:
+
+```
+lazy_commit → git commit failed: fatal: cannot change to
+              '/repo/.lazy/worktrees/482b10cc': No such file or directory
+lazy_status → Connection closed
+```
+
+Two separate faults, one after the other.
+
+**The dead directory** is the shared-`~/.claude.json` hijack described in the
+section above: the MCP server this agent was talking to had been spawned from an
+entry another supervisor overwrote, so it was bound to a worktree that had
+already been cleaned up. The agent's own worktree was never involved. That entry
+can now only be served by the task it names, and if a bound worktree does go
+missing anyway the tool says so itself — naming the path, the task, the likely
+cause and the remedy — rather than passing git's wording through.
+
+**"Connection closed" is not a network problem.** It is what an MCP client reports
+when the server process is simply gone. The `lazy_status` that followed could not
+reach the daemon, and older versions treated that the way a one-shot `lazy`
+command does — print the error and quit. Quitting is right for a command that was
+about to finish anyway, and wrong for a server in the middle of a session: it took
+the whole tool channel down, so the agent lost every remaining `lazy_*` tool for
+the rest of the turn, including the ones it would have used to report the problem.
+
+An unreachable daemon now comes back as an ordinary tool error and the session
+keeps working, so a single failing tool no longer costs you the rest of them. If
+you see "Connection closed" today, the server really did die: look at the
+supervisor log for a `[lazy-mcp]` line, which reports the reason.
+
+If a tool ever answers with the missing-worktree message, do what it says — report
+it and stop. Every tool on that connection is bound to the same dead path, so
+retrying, or reaching for a different lazy tool, will only produce the same
+failure. Nothing was read or written in the missing directory, and your own
+worktree is untouched.
+
 
 ## `claude mcp list` says "✔ Connected" but the agent has no tools
 
@@ -544,12 +1006,46 @@ Two deliberate limits on that check:
 What was observed is recorded on the turn, so `lazy show` can answer "did that
 turn have its tools?" long after the container is gone.
 
+## `<redacted>` in logs and audit records
+
+Lazy scrubs live credential values out of anything it writes for a human to
+read, so a log you paste into a bug report cannot carry your token. You will see
+`<redacted>` in place of the value at four places:
+
+- the `[session] debug = true` command echo
+- lazy's log files and console output
+- the supervisor and builder logs
+- `lazy stats audit` records — including the agent's own Bash command strings
+  and tool results, which is where an agent that runs `env` or reads a
+  credentials file would otherwise land a live value on disk
+
+Only the *value* is replaced. Env var names, mounts, image tags, commands, file
+paths and everything else stay intact, so the output is still diagnosable.
+
+Redaction is driven by env var **key names** (anything matching `*_TOKEN`,
+`*_KEY`, `*_SECRET`, `*_PASSWORD`, `*_CREDENTIAL(S)`, `*_AUTH`), never by
+guessing which values look secret. Two consequences worth knowing:
+
+- A credential lazy does not have in its own environment is not scrubbed —
+  redaction covers what lazy launches agents with, not arbitrary secrets in your
+  repo.
+- Values shorter than 12 characters are left alone on purpose. Ollama sets
+  `ANTHROPIC_API_KEY=ollama` and the QA agent uses `none`; substring-replacing
+  words that short would corrupt unrelated log lines while protecting nothing.
+
 ## `Script not found "builder"`, or a selfcheck with no output
 
 Both are the same fault: the file at `/usr/local/bin/lazy-agent` inside the
-container is **not** the compiled lazy agent. Containers bind-mount
-`~/.lazy/bin/lazy-agent` there, so whatever is at that path on your host is what
-runs.
+container is **not** the compiled lazy agent. Containers bind-mount an agent
+binary from `~/.lazy/bin` there, so whatever that host file is is what runs.
+
+Each install lives under a name derived from its own bytes
+(`~/.lazy/bin/lazy-agent-<id>`) and is never written to again once installed;
+`~/.lazy/bin/lazy-agent-current` is a symlink pointing at the current one. That is
+why `lazy upgrade` no longer disturbs containers that are already running — they
+keep mounting the file they started with. (`~/.lazy/bin/lazy-agent`, if you still
+have one, is from an older layout: lazy leaves it alone for containers that
+mount it and removes it once none do.)
 
 The case seen in the field was a bare Bun runtime, which produces two
 unrelated-looking errors from one cause:
@@ -574,15 +1070,74 @@ lazy upgrade         # installed build
 bun run build        # source checkout, then lazy upgrade
 ```
 
-Every producer of that file now verifies it before installing it: the extraction
-from the compiled `lazy` binary, the dev-mode rebuild, and `lazy upgrade` itself.
-A rebuild that produces a non-agent is refused and the previous working binary is
-left in place, so a bad build degrades to a stale agent rather than a broken one.
+Every producer of that file now verifies it before installing it: `bun run build`
+(before embedding the agent into the compiled `lazy` binary), extraction from that
+embedded copy, the dev-mode rebuild, container image tagging (a throwaway
+container runs `lazy-agent selfcheck` with the mount path), and `lazy upgrade`
+itself. A rebuild that produces a non-agent is refused and the previous working
+binary is left in place, so a bad build degrades to a stale agent rather than a
+broken one.
 
 If `lazy upgrade` reports the failure instead of fixing it, the source it is
 building *from* is wrong — in a source checkout, check that `./lazy-agent` in the
 repo is either the 12-byte placeholder or a real build, and re-run
 `bun run build`.
+
+## `lazy sync` / `lazy unblock` sits silent for minutes after an upgrade
+
+Launching a turn builds the container image if one is missing, so a command that
+starts a turn can block for as long as a build takes. That is expected the first
+time you use a project on a new machine. It is **not** expected right after an
+upgrade that already built the image.
+
+Look at `lazy daemon logs`. Every container build lazy runs now announces itself
+on one line before any build output, and one line after:
+
+```
+Building container image lazy-runner:0.23 from the embedded default Dockerfile
+  — missing on this host — first build for lazy 0.23.1670 (this can take several minutes).
+Built container image lazy-runner:0.23 from the embedded default Dockerfile in 4m12s.
+```
+
+The build's own progress output is streamed between the two, tagged with the
+image name (`[build lazy-runner:0.23]`). Two things to read off it:
+
+- **Which image, and from which Dockerfile.** If the Dockerfile path is not one
+  you recognise — or the image name is not one of yours — the build belongs to a
+  different project's daemon on the same machine.
+- **Why.** The reason is on the first line: `missing on this host`,
+  `too old: built N days ago`, or the name of the input file whose content
+  changed.
+
+If the reason says `missing on this host` immediately after an upgrade, the
+upgrade built one image and the daemon then resolved a different one. The usual
+cause is a worktree Dockerfile adoption that was cleared: adoption is scoped to
+lazy's `major.minor`, so a genuine minor-version bump expires it and the daemon
+falls back to the project root Dockerfile. `lazy doctor` reports the adoption's
+state and why it was cleared.
+
+## The fix isn't working after `lazy upgrade`
+
+When you rebuild from a source checkout, `lazy upgrade` prints which checkout
+produced the agent binary — path, branch, short commit, and whether the tree was
+clean or dirty — on the `rebuilt agent binary (verified)` line. If you ran upgrade
+from the wrong branch, that line is the first place to look.
+
+After the fact, the same metadata is embedded in the binary:
+
+```bash
+lazy --version
+lazy-agent selfcheck
+```
+
+Both append branch, commit, clean/dirty, and source path when the binary was built
+from a checkout (dev-mode `bun run ./src/index.ts` runs show `dev` instead).
+`lazy daemon status` includes branch and path on its **Built:** line for compiled
+daemons.
+
+Building from `main` while fixes live on a release branch is fine — the failure
+mode is when that choice is invisible. Check the provenance lines before chasing
+behavior that simply is not in the binary you installed.
 
 ## `detected dubious ownership in repository at …`
 
@@ -650,6 +1205,102 @@ part-way through work on that branch.
 
 If you see this warning and the outcome still surprises you, `lazy diff <task>`
 shows what the task is actually built on.
+
+## A colleague pushed to my task's branch
+
+Run `lazy sync <task>`. Before it merges the parent branch, sync checks the
+task's OWN branch on origin, and merges `origin/<task-branch>` into the worktree
+when it has commits your copy lacks — a fast-forward when the branch is only
+behind, a real merge when both sides moved. Conflicts are handed to the task's
+agent to resolve, so you do not have to pair into the worktree and run `git
+merge` by hand.
+
+The step names itself in the output, including when it does nothing:
+
+```
+✓ [1/5] Check task branch on origin — origin/lazy/my-task has new commits
+– [1/5] Check task branch on origin skipped — origin/lazy/my-task has no new commits
+```
+
+It is also skipped, with the reason on that line, when your remote driver is
+`local`, when lazy is offline, or when the branch has never been pushed. Sync
+does not push the result back — the push after the next turn, or `lazy accept`,
+does that.
+
+## A task lists hundreds of commits it never made
+
+A task's Commits tab — in `lazy show`, in the web review, in search — should
+list what its own branch carries. Before v0.23, a task that merged its upstream
+branch also recorded everything that branch brought along, and the error grew
+every turn: long-running tasks ended up listing hundreds of other people's
+commits, going back months. Only the stored list was wrong; the branch, the
+diff and the review were never affected.
+
+Turns started on v0.23 or later record correctly. Lists already stored that way
+do not fix themselves, because nothing else ever deletes a commit record — clean
+them up explicitly:
+
+```
+lazy system repair-commits --all
+```
+
+That reports what it would change and writes nothing. It lists the records it
+would remove, with their commit subjects, so you can see what is about to go
+rather than approving a number. On a large project the scan takes a while, so
+it prints each task as it checks it.
+
+When the report looks right, apply it:
+
+```
+lazy system repair-commits --all --apply
+```
+
+Name a single task instead of `--all` to check just that one. Add `--json` for
+machine-readable output; with `--apply` it also needs `--yes`, since there is
+nobody to confirm with.
+
+Some tasks are reported as **skipped** and left exactly as they are. That
+happens when the correct list can no longer be computed with confidence, and in
+every case the records are kept rather than guessed at:
+
+- The task's branch is gone entirely — accepted long ago, worktree removed, no
+  remaining ref.
+- The branch survives only as a ref, and that ref does not contain some of the
+  recorded commits. Usually this means the worktree was removed while its last
+  commits had never been pushed, so the ref is behind the work: those records
+  may well be real, and deleting them would destroy the only trace of them.
+
+A skipped task is not a failure, and re-running later can resolve it — for the
+second case, restoring or re-fetching the branch is what gives the command
+something trustworthy to compare against.
+
+## The daemon can't fetch from the remote
+
+The daemon polls your remote about once a minute so it can notice branches that
+were merged or closed elsewhere. If it cannot authenticate, `daemon.log` says
+so once, with what to do:
+
+```
+Fetch from 'origin' failed for /path/to/project: fatal: could not read Username for 'https://github.com': terminal prompts disabled
+  The remote needs credentials this machine does not have. Authenticate git for it
+  (a credential helper, `gh auth login`, or an SSH key), or set `sync_interval = 0`
+  under [server] in lazy.toml to stop syncing this project.
+```
+
+The daemon keeps retrying on its normal schedule — a network blip should heal
+by itself — but it only writes that message again when the reason changes, so a
+remote you have no credentials for does not fill the log.
+
+**Git never prompts here, on purpose.** The daemon runs in the background,
+often sharing a terminal with whatever started it, and a background `git` asking
+`Username for 'https://github.com':` takes over that terminal with nothing to
+say which process wants an answer. A fetch without credentials fails
+immediately instead. Everything else — your own `lazy` commands, agents in their
+containers — is unaffected.
+
+Fix it the same way you would for any other git on the machine: log in with
+`gh auth login`, configure a credential helper, or use an SSH remote with a key
+the daemon's user can read.
 
 ## Documentation links
 

@@ -29,7 +29,8 @@ import type { McpTool, McpToolHandler } from './types';
 import { INTERNAL_GIT_TOOL_NAME } from './types';
 import { type McpToolContext, mcpActor } from './tools';
 import { runGit } from '../utils/git';
-import { requireStorage } from '../cli/helpers';
+import { resolveStorage } from '../preconditions';
+import { assertWorktreeUsable } from './turn-identity';
 import type { Storage } from '../storage';
 import { loadConfig } from '../config/loader';
 import { resolveParentBranchWithFallback } from '../daemon/task-lifecycle';
@@ -71,7 +72,7 @@ export interface InternalGitResult {
 }
 
 async function getStorage(ctx: McpToolContext): Promise<Storage> {
-  return ctx.storage ?? (await requireStorage());
+  return ctx.storage ?? (await resolveStorage());
 }
 
 /**
@@ -110,7 +111,7 @@ async function allowedMergeRefs(
   }
 
   const projectRoot = await projectRootOf(worktreePath);
-  const config = await loadConfig(projectRoot, { cwd: worktreePath });
+  const config = await loadConfig(projectRoot);
   const remote = config.remote.git_remote;
 
   const refs: string[] = [];
@@ -210,6 +211,10 @@ export function createInternalGitHandler(ctx: McpToolContext): McpToolHandler {
       throw new Error(`${INTERNAL_GIT_TOOL_NAME} requires a task context.`);
     }
     const cwd = ctx.worktreePath;
+    // Same guard the agent-facing tools use: every op below runs git in this
+    // directory, and if it has gone missing the supervisor should be told which
+    // worktree and why rather than reading git's "cannot change to ...".
+    await assertWorktreeUsable(INTERNAL_GIT_TOOL_NAME, cwd, ctx.taskId);
     const op = args.op as string;
 
     let result: { exitCode: number; stdout: string; stderr: string };

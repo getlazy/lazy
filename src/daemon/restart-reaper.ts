@@ -55,9 +55,11 @@
  *  - **Task agents** are stopped with a grace period and moved to `interrupted`
  *    with an honest reason, which the reconciler auto-resumes (see
  *    `interruptForDaemonRestart` in src/utils/reconcile.ts).
- *  - **Builders** get a durable resume intent stamped `reason: 'daemon-restart'`
- *    and are stopped with a grace period; the host-side relaunch wrapper
- *    (src/builder/relaunch.ts) sees the intent and resumes the session in place.
+ *  - **Builders** are NOT stopped here. They supervise themselves in-container
+ *    (src/builder/continuity.ts) — same as pair/chat on the host
+ *    (src/supervisor/interactive.ts). The in-container supervisor notices the
+ *    daemon generation, refreshes launch env from GET /builder/launch-env, and
+ *    relaunches Claude Code with `--resume`.
  *
  * Pair sessions are NOT handled here. They are host processes that own a human's
  * terminal, so they supervise themselves and resume in place — see
@@ -68,6 +70,7 @@
 import { loadConfig } from '../config/loader';
 import { createRunner } from '../runner';
 import type { Runner, RunnerType } from '../runner/types';
+import { indexRunsByName } from '../runner/run-ownership';
 import type { Storage } from '../storage/interface';
 import { logger } from '../utils/logger';
 import { interruptForDaemonRestart } from '../utils/reconcile';
@@ -75,7 +78,7 @@ import { interruptForDaemonRestart } from '../utils/reconcile';
 /**
  * Seconds a stopped child gets to shut down cleanly before the runner escalates.
  *
- * Matches `BUILDER_STOP_GRACE_SECONDS` in `lazy upgrade` — the same courtesy,
+ * Matches the task-agent grace period on daemon restart — the same courtesy,
  * fired on a different trigger. Stops run in parallel, so the whole reap costs
  * one grace period, not one per child.
  */
@@ -139,23 +142,12 @@ async function runnerTypesInUse(projectRoot: string, storage: Storage): Promise<
   return types;
 }
 
-/**
- * Does this run name belong to a task in THIS project's storage?
- *
- * Returns both ids: the run name carries the SHORT id, while the status
- * transition downstream wants the full one.
- */
-async function ownedTask(storage: Storage, runName: string): Promise<{ shortId: string; taskId: string } | null> {
-  const shortId = runName.replace(/^lazy-/, '');
-  if (!shortId) return null;
-  try {
-    const task = await storage.getTask(shortId);
-    return task ? { shortId, taskId: task.id } : null;
-  } catch {
-    // Not in this project's storage — belongs to another project. Never touch
-    // another project's containers.
-    return null;
-  }
+/** A snapshotted run that resolved to one of this project's tasks. */
+interface OwnedRun {
+  /** The name the run actually carries — never re-derived; see reapTaskAgents. */
+  runName: string;
+  shortId: string;
+  taskId: string;
 }
 
 /**
@@ -227,18 +219,28 @@ export async function reapTaskAgents(
   runNames: string[],
 ): Promise<string[]> {
   const names = runNames;
-  const owned: Array<{ shortId: string; taskId: string }> = [];
+  // Ownership is resolved through the SAME naming function that named the run
+  // (src/runner/run-ownership.ts). Looking the name's suffix up as a task id
+  // does not work: a run is named for the task's REF, which is its code for
+  // every task a human creates.
+  const index = await indexRunsByName(storage, runner);
+  const owned: OwnedRun[] = [];
   for (const name of names) {
     // Builder containers also match `lazy-*`; they are handled separately
     // (different stop semantics, different resume path).
     if (name.startsWith('lazy-builder-')) continue;
-    const task = await ownedTask(storage, name);
-    if (task) owned.push(task);
+    const task = index.get(name);
+    // Not in this project's storage — belongs to another project. Never touch
+    // another project's containers.
+    if (task) owned.push({ runName: name, shortId: task.id.substring(0, 8), taskId: task.id });
   }
   if (owned.length === 0) return [];
 
   const stopped = await Promise.all(owned.map(async entry => {
-    const runName = `lazy-${entry.shortId}`;
+    // The DISCOVERED name, not one rebuilt from the short id: rebuilding it
+    // aimed the stop at a run that does not exist for any coded task, so the
+    // real supervisor survived the reap and went on answering `isRunning()`.
+    const runName = entry.runName;
     try {
       logger.info(`Daemon restart: stopping task supervisor ${runner.runDisplayName(runName)}...`);
       await runner.stopRun(runName, { gracefulTimeoutSeconds: RESTART_STOP_GRACE_SECONDS });
@@ -269,47 +271,19 @@ export async function reapTaskAgents(
 }
 
 /**
- * Stop this project's previous-generation builders on ONE runner, leaving a
- * durable resume intent behind. Exported for tests, which inject a fake Runner.
+ * Previous-generation builders are NOT stopped by the restart reaper.
  *
- * `builderRunNames` comes from the pre-listen snapshot, for the same reason as
- * {@link reapTaskAgents}.
+ * Builders supervise themselves in-container (src/builder/continuity.ts). The
+ * host-side relaunch wrapper (src/builder/relaunch.ts) remains for containers
+ * that exit for other reasons; this reap deliberately does nothing.
  */
 export async function reapBuilders(
-  runner: Runner,
-  storage: Storage,
-  projectRoot: string,
-  builderRunNames: string[],
+  _runner: Runner,
+  _storage: Storage,
+  _projectRoot: string,
+  _builderRunNames: string[],
 ): Promise<string[]> {
-  const names = builderRunNames;
-  if (names.length === 0) return [];
-
-  const results = await Promise.all(names.map(async name => {
-    // Canonical intent key is the SHORT builder id, as `lazy upgrade` writes it.
-    const builderId = name.replace(/^lazy-builder-/, '');
-    if (!builderId) return null;
-    try {
-      // Intent FIRST, stop second: the host-side wrapper unblocks the moment
-      // the container dies and immediately looks for an intent. Writing it
-      // afterwards would race, and a missed intent means a live session that
-      // silently does not come back.
-      await storage.saveBuilderResumeIntent({
-        builderId,
-        projectRoot,
-        createdAt: new Date().toISOString(),
-        reason: 'daemon-restart',
-      });
-      logger.info(`Daemon restart: stopping builder ${runner.runDisplayName(name)}...`);
-      await runner.stopRun(name, { gracefulTimeoutSeconds: RESTART_STOP_GRACE_SECONDS });
-      return builderId;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      logger.warn(`Daemon restart: could not stop builder ${name}: ${msg}`);
-      return null;
-    }
-  }));
-
-  return results.filter((id): id is string => id !== null);
+  return [];
 }
 
 /**
@@ -355,10 +329,9 @@ export async function reapPreviousGenerationChildren(
     }
   }
 
-  if (result.tasks.length > 0 || result.builders.length > 0) {
+  if (result.tasks.length > 0) {
     logger.info(
-      `Daemon restart: stopped ${result.tasks.length} task supervisor(s) and ` +
-      `${result.builders.length} builder(s) launched by the previous daemon; ` +
+      `Daemon restart: stopped ${result.tasks.length} task supervisor(s) launched by the previous daemon; ` +
       'each resumes against this one.'
     );
   }

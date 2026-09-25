@@ -32,6 +32,8 @@ import {
   readSessionRecord,
   waitForStatus,
   turnPrompts,
+  waitForTurnPrompt,
+  allTurns,
 } from '../helpers/agent-seam';
 
 /** Long enough that the guard, not the script, decides when the turn dies. */
@@ -127,6 +129,50 @@ describe('auto-resume after a real agent crash (real supervisor, fake claude)', 
     expect(session.consecutive_interruptions).toBe(0);
   }, 180_000);
 
+/*
+   * THE RECOVERY PATHS RUN THE SELF-REVIEW TOO — the round-4 HIGH.
+   *
+   * `low_high_loop` reached the command only from the three launch literals;
+   * `autoResumeTask` builds its own and skipped it. Invisible while the loop
+   * was opt-in, load-bearing once `low_high` became the default: a task whose
+   * FINAL turn is an auto-resume ran single-phase, produced no self-review, and
+   * parked with nothing recorded and nothing gating. CLAUDE.md names the class
+   * — "the recovery paths are exactly the ones that forgot" — which is why this
+   * is asserted on the real seam rather than at the resolver.
+   */
+  test('an auto-resumed turn still runs both low-high phases', async () => {
+    await setGuards(ctx, { noProgressMs: NO_PROGRESS_MS });
+
+    const taskId = await createTask(ctx, 'Crash then self-review', 'Do the work');
+    await ctx.setClaudeScenario({
+      sequence: [
+        // Turn 1 dies on the watchdog, so turn 2 is the AUTO-RESUME — the path
+        // under test. Its three invocations are the draft, the self-review and
+        // the revise pass.
+        goSilentScenario({ sessionId: 'fake-sess-resumeloop', silentMs: SILENT_MS }),
+        successScenario({
+          result: 'Draft after the resume.',
+          sessionId: 'low-high-draft',
+          commit: { message: 'Draft', files: [{ path: 'resumed.txt', content: 'draft\n' }] },
+        }),
+        successScenario({ result: 'LOW_HIGH_LOOP_APPROVED', sessionId: 'low-high-review' }),
+      ],
+    });
+
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    await ctx.lazy(['wait', taskId]);
+    expect(await waitForStatus(ctx.root, taskId, ['blocked'], RECOVERY_MS)).toBe('blocked');
+
+    // The phase the resume path used to skip. The supervisor turn carries the
+    // heading; the agent turn beside it carries what the self-review replied —
+    // both are absent entirely when the resume runs single-phase, which is what
+    // it did before this fix.
+    const all = await allTurns(ctx.root, taskId);
+    const content = all.map((t) => String(t.content)).join('\n');
+    expect(content).toContain('## Low-High Loop Self-Review');
+    expect(content).toContain('LOW_HIGH_LOOP_APPROVED');
+  }, 180_000);
+
   // INVARIANT (src/utils/auto-resume.ts): the resumed agent is TOLD it is being
   // resumed after a crash, so it verifies its state instead of assuming its
   // previous work survived. The assertion is on the argv the fake agent
@@ -142,15 +188,24 @@ describe('auto-resume after a real agent crash (real supervisor, fake claude)', 
       ],
     });
 
-    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    // Keep this assertion focused on crash recovery. The default low-high
+    // review adds agent invocations of its own, while the final wrap-up still
+    // exercises the ordering that originally made a "last prompt" assertion
+    // observe the wrong invocation.
+    expectSuccess(await ctx.lazy(['start', taskId, '--review', 'off', '--yes']));
     await ctx.lazy(['wait', taskId]);
+    const resumedPrompt = await waitForTurnPrompt(
+      ctx,
+      prompt => prompt.includes('You are being resumed after a crash'),
+      RECOVERY_MS,
+    );
     await waitForStatus(ctx.root, taskId, ['blocked'], RECOVERY_MS);
 
     const prompts = await turnPrompts(ctx);
     expect(prompts.length).toBeGreaterThanOrEqual(2);
     // The first turn got the ordinary task prompt; the resumed one is prefixed.
     expect(prompts[0]).not.toContain('You are being resumed after a crash');
-    expect(prompts[prompts.length - 1]).toContain('You are being resumed after a crash');
+    expect(resumedPrompt).toContain('You are being resumed after a crash');
   }, 180_000);
 
   // INVARIANT (CLAUDE.md — never lose human feedback): feedback stays `pending`
@@ -172,15 +227,20 @@ describe('auto-resume after a real agent crash (real supervisor, fake claude)', 
       sequence: [
         // Turn 1: a normal turn, so the task lands in `blocked` and can be unblocked.
         successScenario({ result: 'First turn done.', sessionId: 'fake-sess-feedback' }),
+        // The completed work turn runs its end-of-turn wrap-up before parking.
+        successScenario({ result: 'First turn wrapped up.', sessionId: 'fake-sess-feedback' }),
         // Turn 2: the unblock turn — dies before completing, leaving the
         // feedback turn `pending`.
-        goSilentScenario({ sessionId: 'fake-sess-feedback', silentMs: SILENT_MS }),
+        workedThenSilentScenario({ sessionId: 'fake-sess-feedback', silentMs: SILENT_MS }),
         // Turn 3: the auto-resumed turn, which must carry the feedback again.
         successScenario({ result: 'Second turn done.', sessionId: 'fake-sess-feedback' }),
       ],
     });
 
-    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    // Each scenario entry belongs to an agent invocation, not a logical turn.
+    // Disable the default low-high review so this sequence models exactly the
+    // initial work and wrap-up, the crashing feedback turn, and its resume.
+    expectSuccess(await ctx.lazy(['start', taskId, '--review', 'off', '--yes']));
     expectSuccess(await ctx.lazy(['wait', taskId]));
 
     expectSuccess(await ctx.lazy(['unblock', taskId, '--message', FEEDBACK]));
@@ -188,6 +248,12 @@ describe('auto-resume after a real agent crash (real supervisor, fake claude)', 
     // assertion — the recovery is observed from storage.
     await ctx.lazy(['wait', taskId]);
 
+    const redeliveredPrompt = await waitForTurnPrompt(
+      ctx,
+      prompt => prompt.includes('## Re-delivered feedback — your previous turn was interrupted') &&
+        prompt.includes(FEEDBACK),
+      RECOVERY_MS,
+    );
     await waitForStatus(ctx.root, taskId, ['blocked'], RECOVERY_MS);
 
     const prompts = await turnPrompts(ctx);
@@ -199,7 +265,7 @@ describe('auto-resume after a real agent crash (real supervisor, fake claude)', 
     expect(withFeedback.length).toBe(2);
 
     // And the re-delivery is the resumed turn, not a coincidental repeat.
-    expect(prompts[prompts.length - 1]).toContain(FEEDBACK);
+    expect(redeliveredPrompt).toContain(FEEDBACK);
 
     const turns = await agentTurns(ctx.root, taskId);
     expect(String(turns[turns.length - 1].content)).toContain('Second turn done.');

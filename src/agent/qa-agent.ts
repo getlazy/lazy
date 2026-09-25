@@ -110,8 +110,14 @@ export class QaAgent implements Agent {
 
   supportsPairing(): boolean {
     // Scriptable and LLM-free: it replays a scenario file, so there is no
-    // conversation for a human to join.
+    // conversation for a human to join. Unchanged by pairing moving into the
+    // container — the reason was never about where it runs.
     return false;
+  }
+
+  buildInteractiveArgs(): null {
+    // No interactive mode at all; supportsPairing() already refuses.
+    return null;
   }
 
   discoverSessionFiles(_opts: {

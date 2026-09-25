@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test';
-import { InteractiveCredentialError } from '../../src/cli/interactive-auth';
+import { InteractiveCredentialError } from '../../src/credentials/interactive-auth';
 
 /**
  * INVARIANT (fail loud BEFORE the launch): when `lazy pair` / `lazy chat`

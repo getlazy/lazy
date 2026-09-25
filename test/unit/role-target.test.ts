@@ -2,15 +2,24 @@ import { describe, test, expect } from 'bun:test';
 import type { ResolvedConfig, RoleTarget } from '../../src/config/types';
 import {
   resolveRoleTarget,
+  roleTargetForProfile,
   targetEnvVars,
   proxyAuditHeaderEnv,
   proxyBaseUrlForRunner,
   checkTargetConnectivity,
   preflightRoleTarget,
+  upstreamRefused,
   isKnownAnthropicModel,
   targetForSurface,
+  ANTHROPIC_DEFAULT_TARGET,
   LOCAL_BACKEND_CREDS,
 } from '../../src/utils/role-target';
+import {
+  agentProfilesFor,
+  DEFAULT_AGENT_PROFILE_NAME,
+  NO_CREDENTIAL,
+  type AgentProfile,
+} from '../../src/config/agent-profiles';
 
 /**
  * Build a minimal ResolvedConfig carrying only the fields resolveRoleTarget reads.
@@ -20,99 +29,162 @@ function configWith(roles: { builder: RoleTarget; agent: RoleTarget }, dflt = 'c
   return { models: { default: dflt, roles } } as unknown as ResolvedConfig;
 }
 
-const anthropic = (model = ''): RoleTarget => ({ backend: 'anthropic', model, endpoint: '' });
-const ollama = (model: string, endpoint = 'http://host.docker.internal:11434'): RoleTarget => ({ backend: 'ollama', model, endpoint });
+/** The built-in claude-code profile: no endpoint of its own, nothing pinned. */
+const anthropic = (model = ''): RoleTarget => ({ ...ANTHROPIC_DEFAULT_TARGET, model });
+
+/**
+ * A profile pinned to a local Ollama box — the successor to `backend = "ollama"`.
+ * `pinned` is what the old backend name encoded: a human named this endpoint.
+ */
+const ollama = (model: string, endpoint = 'http://host.docker.internal:11434'): RoleTarget => ({
+  profile: 'local-ollama',
+  harness: 'claude-code',
+  model,
+  endpoint,
+  pinned: true,
+  wire: 'anthropic',
+  credential: NO_CREDENTIAL,
+});
+
+/** A profile pinned to an Anthropic-compatible gateway — the old `backend = "proxy"`. */
+const gateway = (model: string, endpoint = 'https://gw.example.com'): RoleTarget => ({
+  profile: 'gateway',
+  harness: 'claude-code',
+  model,
+  endpoint,
+  pinned: true,
+  wire: 'anthropic',
+  credential: 'anthropic',
+});
+
+describe('ANTHROPIC_DEFAULT_TARGET', () => {
+  // INVARIANT: the constant is spelled out by hand (role-target must stay a leaf
+  // module — resolving profiles reaches the agent registry and closes a cycle),
+  // so nothing but a test keeps it in step with the built-in profile it claims to
+  // be. A drift here means runners with no per-role target launch a profile that
+  // does not exist as written.
+  test('matches the built-in claude-code profile', () => {
+    const builtin = agentProfilesFor({}).get(DEFAULT_AGENT_PROFILE_NAME)!;
+    expect(builtin).toBeDefined();
+    expect(ANTHROPIC_DEFAULT_TARGET).toEqual(roleTargetForProfile(builtin));
+  });
+});
 
 describe('resolveRoleTarget', () => {
-  test('anthropic role honors the caller preferred model', () => {
+  test('unpinned profile honors the caller preferred model', () => {
     const config = configWith({ builder: anthropic(), agent: anthropic() });
     const r = resolveRoleTarget('agent', config, { preferredModel: 'claude-haiku-4-5-20251001' });
-    expect(r.backend).toBe('anthropic');
+    expect(r.pinned).toBe(false);
     expect(r.model).toBe('claude-haiku-4-5-20251001');
   });
 
   // Fable 5.1 is a concrete Anthropic id, not a short alias. Pass-through must
   // keep the full id so the agent (and the API) get 5.1 rather than whatever
   // Claude Code currently binds `fable` to.
-  test('anthropic role passes claude-fable-5-1 through unchanged', () => {
+  test('unpinned profile passes claude-fable-5-1 through unchanged', () => {
     const config = configWith({ builder: anthropic('claude-fable-5-1'), agent: anthropic() });
     expect(resolveRoleTarget('builder', config).model).toBe('claude-fable-5-1');
     const r = resolveRoleTarget('agent', config, { preferredModel: 'claude-fable-5-1' });
-    expect(r.backend).toBe('anthropic');
+    expect(r.pinned).toBe(false);
     expect(r.model).toBe('claude-fable-5-1');
   });
 
-  test('anthropic role with no preferred model falls back to the configured model', () => {
+  test('unpinned profile with no preferred model falls back to the profile model', () => {
     const config = configWith({ builder: anthropic('claude-opus-4-8'), agent: anthropic() });
     expect(resolveRoleTarget('builder', config).model).toBe('claude-opus-4-8');
   });
 
-  // INVARIANT: For a local backend (ollama/proxy) the configured model is
-  // authoritative and a caller's preferred alias (e.g. "claude-opus-4-8") is
-  // intentionally ignored — that name does not exist in the local registry.
-  test('ollama role ignores the preferred model and uses the configured one', () => {
+  // INVARIANT: on a PINNED profile the configured model is authoritative and a
+  // caller's preferred alias (e.g. "claude-opus-4-8") is intentionally ignored —
+  // that name does not exist on someone's Ollama box.
+  test('pinned profile ignores the preferred model and uses the configured one', () => {
     const config = configWith({ builder: anthropic(), agent: ollama('qwen3-coder') });
     const r = resolveRoleTarget('agent', config, { preferredModel: 'claude-opus-4-8' });
-    expect(r.backend).toBe('ollama');
+    expect(r.pinned).toBe(true);
     expect(r.model).toBe('qwen3-coder');
     expect(r.endpoint).toBe('http://host.docker.internal:11434');
   });
 
-  // INVARIANT: Local backends only work through Claude Code. Any other agent
-  // forces the anthropic path rather than passing a local model name to a
-  // backend that can't serve it.
-  test('non-claude agent forces anthropic even when the role is ollama', () => {
+  // INVARIANT: a pinned ANTHROPIC-WIRE upstream only works through a harness lazy
+  // can point at a lazy-controlled base URL (claude-code, pi). Any other harness
+  // drops the pin rather than passing a local model name to a backend that can't
+  // serve it. Compared against the HARNESS, never the profile name.
+  test('a harness that cannot honour an anthropic pin falls back to the model chain', () => {
     const config = configWith({ builder: anthropic(), agent: ollama('qwen3-coder') });
-    const r = resolveRoleTarget('agent', config, { preferredModel: 'claude-opus-4-8', agentId: 'qa-agent' });
-    expect(r.backend).toBe('anthropic');
+    const r = resolveRoleTarget('agent', config, { preferredModel: 'claude-opus-4-8', harness: 'qa-agent' });
+    expect(r.pinned).toBe(false);
     expect(r.model).toBe('claude-opus-4-8');
   });
 
-  // INVARIANT: No silent name substitution — a hand-built ollama target with no
-  // model throws rather than guessing a default.
-  test('throws on an ollama role with no model', () => {
+  // INVARIANT: No silent name substitution — a hand-built pinned target with no
+  // model throws rather than guessing a default. (Config load refuses this shape;
+  // the guard is here for targets constructed in code.)
+  test('throws on a pinned profile with no model', () => {
     const config = configWith({ builder: anthropic(), agent: ollama('') });
     expect(() => resolveRoleTarget('agent', config)).toThrow(/No model configured/);
   });
 
   // INVARIANT (fix-builder-model-ollama-precedence): an EXPLICIT override (e.g.
-  // `lazy builder --model X`) wins over the configured model on a local backend,
-  // while the backend + endpoint (the "server") stay as configured. This makes a
-  // local [models.roles.*] entry effectively *server* configuration — its model
-  // is just a default the explicit flag overrides. Contrast the soft
-  // preferredModel above, which an ollama role intentionally ignores.
-  test('ollama role: overrideModel wins over the configured model but keeps the server', () => {
+  // `lazy builder --model X`) wins over the configured model on a pinned profile,
+  // while the endpoint (the "server") stays as configured. This makes a pinned
+  // `[agents.<name>]` entry effectively *server* configuration — its model is just
+  // a default the explicit flag overrides. Contrast the soft preferredModel above,
+  // which a pinned profile intentionally ignores.
+  test('pinned profile: overrideModel wins over the configured model but keeps the server', () => {
     const config = configWith({ builder: ollama('ollama-local-model'), agent: anthropic() });
     const r = resolveRoleTarget('builder', config, { overrideModel: 'mythos' });
-    expect(r.backend).toBe('ollama');
+    expect(r.pinned).toBe(true);
     expect(r.model).toBe('mythos');
     expect(r.endpoint).toBe('http://host.docker.internal:11434');
   });
 
-  // INVARIANT: a hard override beats the soft preferredModel on every backend.
-  test('overrideModel takes precedence over preferredModel (anthropic)', () => {
+  // INVARIANT: a hard override beats the soft preferredModel on every profile.
+  test('overrideModel takes precedence over preferredModel (unpinned)', () => {
     const config = configWith({ builder: anthropic('claude-opus-4-8'), agent: anthropic() });
     const r = resolveRoleTarget('builder', config, { preferredModel: 'claude-haiku-4-5-20251001', overrideModel: 'mythos' });
-    expect(r.backend).toBe('anthropic');
+    expect(r.pinned).toBe(false);
     expect(r.model).toBe('mythos');
   });
 
   // INVARIANT: an explicit override satisfies the "no model configured" guard for
-  // a local backend — server pinned in config, model supplied by the flag.
-  test('overrideModel supplies the model for an ollama role with no configured model', () => {
+  // a pinned profile — server pinned in config, model supplied by the flag.
+  test('overrideModel supplies the model for a pinned profile with no configured model', () => {
     const config = configWith({ builder: ollama(''), agent: anthropic() });
     const r = resolveRoleTarget('builder', config, { overrideModel: 'mythos' });
-    expect(r.backend).toBe('ollama');
+    expect(r.pinned).toBe(true);
     expect(r.model).toBe('mythos');
   });
 
-  // INVARIANT: the soft preferredModel must NEVER override an authoritative local
-  // model — otherwise an opus-defaulted agent task would break every ollama
-  // launch. Only the explicit overrideModel may.
-  test('ollama role still ignores preferredModel (only overrideModel wins)', () => {
+  // INVARIANT: the soft preferredModel must NEVER override an authoritative pinned
+  // model — otherwise an opus-defaulted agent task would break every local launch.
+  // Only the explicit overrideModel may.
+  test('pinned profile still ignores preferredModel (only overrideModel wins)', () => {
     const config = configWith({ builder: anthropic(), agent: ollama('qwen3-coder') });
     const r = resolveRoleTarget('agent', config, { preferredModel: 'claude-opus-4-8' });
     expect(r.model).toBe('qwen3-coder');
+  });
+
+  // INVARIANT (the whole point of profiles): `[models.roles.*]` is only the
+  // fallback for a task that named no profile. A launch that resolved its OWN
+  // profile runs THAT one — resolving against the role default regardless is what
+  // made "pi on local Ollama" reroute every claude-code task too.
+  test('an explicit profile overrides the role default entirely', () => {
+    const config = configWith({ builder: anthropic(), agent: anthropic() });
+    const profile: AgentProfile = {
+      name: 'local-ollama-pi',
+      builtin: false,
+      harness: 'pi',
+      model: 'qwen3.8:latest',
+      endpoint: 'http://localhost:11434',
+      endpointPinned: true,
+      wire: 'anthropic',
+      credential: NO_CREDENTIAL,
+    };
+    const r = resolveRoleTarget('agent', config, { profile, preferredModel: 'claude-opus-4-8' });
+    expect(r.profile).toBe('local-ollama-pi');
+    expect(r.harness).toBe('pi');
+    expect(r.model).toBe('qwen3.8:latest');
+    expect(r.endpoint).toBe('http://localhost:11434');
   });
 });
 
@@ -136,7 +208,8 @@ describe('isKnownAnthropicModel', () => {
   });
 
   // INVARIANT: an arbitrary (e.g. local) model name is NOT an Anthropic model —
-  // it needs a configured local server, so it's rejected against the anthropic backend.
+  // it needs a profile with an endpoint that serves it, so it's rejected against
+  // an unpinned profile.
   test('rejects arbitrary / local model names', () => {
     expect(isKnownAnthropicModel('qwen3-coder')).toBe(false);
     expect(isKnownAnthropicModel('llama3')).toBe(false);
@@ -145,11 +218,12 @@ describe('isKnownAnthropicModel', () => {
 });
 
 describe('targetEnvVars', () => {
-  // LOCAL_BACKEND_CREDS is the credential SOURCE for an ollama role — the server
-  // ignores auth, and an ollama-only project may hold no Anthropic credential at
-  // all, so requiring a real one would break exactly the setup ollama serves.
-  // The single slot is deliberate: one placeholder, one grant, per launch.
-  test('ollama gets synthetic credentials + the proxy base URL + stability flags', () => {
+  // LOCAL_BACKEND_CREDS is the credential SOURCE for a `credential = "none"`
+  // profile — the server ignores auth, and a local-only project may hold no
+  // Anthropic credential at all, so requiring a real one would break exactly the
+  // setup such a profile serves. The single slot is deliberate: one placeholder,
+  // one grant, per launch.
+  test('a none-credential profile gets synthetic credentials + the proxy base URL + stability flags', () => {
     const env = targetEnvVars(
       { ...ollama('qwen3-coder', 'http://localhost:11434'), proxyUrl: 'http://127.0.0.1:8766' },
       LOCAL_BACKEND_CREDS,
@@ -162,13 +236,13 @@ describe('targetEnvVars', () => {
     expect(LOCAL_BACKEND_CREDS).toHaveLength(1);
   });
 
-  // INVARIANT: a role's `endpoint` is the upstream the PROXY forwards to — it is
-  // never handed to the launched process. The base URL always comes from
+  // INVARIANT: a profile's `endpoint` is the upstream the PROXY forwards to — it
+  // is never handed to the launched process. The base URL always comes from
   // `proxyUrl`. Emitting `endpoint` here is exactly the direct connection this
   // module exists to prevent, so the assertion is on its ABSENCE too.
-  test('proxy backend gets the proxy address, never its own endpoint', () => {
+  test('a pinned gateway gets the proxy address, never its own endpoint', () => {
     const env = targetEnvVars(
-      { backend: 'proxy', model: 'claude-opus-4-8', endpoint: 'http://localhost:8080', proxyUrl: 'http://127.0.0.1:8766' },
+      { ...gateway('claude-opus-4-8', 'http://localhost:8080'), proxyUrl: 'http://127.0.0.1:8766' },
       [{ key: 'ANTHROPIC_API_KEY', value: 'sk-real' }],
       'container',
     );
@@ -178,7 +252,7 @@ describe('targetEnvVars', () => {
     expect(env.some(v => v.value.includes('localhost:8080'))).toBe(false);
   });
 
-  test('anthropic with no proxyUrl passes the credential through unchanged (proxy disabled)', () => {
+  test('unpinned with no proxyUrl passes the credential through unchanged (proxy disabled)', () => {
     const env = targetEnvVars(anthropic('claude-opus-4-8'), [{ key: 'CLAUDE_CODE_OAUTH_TOKEN', value: 'tok' }], 'container');
     expect(env).toEqual([{ key: 'CLAUDE_CODE_OAUTH_TOKEN', value: 'tok' }]);
   });
@@ -186,7 +260,7 @@ describe('targetEnvVars', () => {
   // INVARIANT (default-on proxy): anthropic traffic routes through lazy's local
   // audit/policy proxy whenever one is live. Without this, the default-on posture
   // is a lie — the proxy would run but nothing would flow through it.
-  test('anthropic WITH proxyUrl routes through the proxy, credential passed through', () => {
+  test('unpinned WITH proxyUrl routes through the proxy, credential passed through', () => {
     const env = targetEnvVars(
       { ...anthropic('claude-opus-4-8'), proxyUrl: 'http://127.0.0.1:8766' },
       [{ key: 'CLAUDE_CODE_OAUTH_TOKEN', value: 'tok' }],
@@ -212,12 +286,12 @@ describe('targetEnvVars', () => {
     expect(map.ANTHROPIC_API_KEY).toBe('sk-real');
   });
 
-  // INVARIANT (proxy-role-upstreams): ollama roles ARE routed through the proxy.
-  // They used to be the documented carve-out — ANTHROPIC_BASE_URL pointed at the
-  // ollama server and the traffic never touched the audit plane. The endpoint is
-  // now the upstream the PROXY forwards to, so the launch gets the proxy address
-  // and the ollama URL must not appear in the env at all.
-  test('ollama routes through proxyUrl and never leaks its endpoint', () => {
+  // INVARIANT (proxy-role-upstreams): local-model profiles ARE routed through the
+  // proxy. They used to be the documented carve-out — ANTHROPIC_BASE_URL pointed
+  // at the ollama server and the traffic never touched the audit plane. The
+  // endpoint is now the upstream the PROXY forwards to, so the launch gets the
+  // proxy address and the ollama URL must not appear in the env at all.
+  test('a local-model profile routes through proxyUrl and never leaks its endpoint', () => {
     const env = targetEnvVars(
       { ...ollama('qwen3-coder', 'http://localhost:11434'), proxyUrl: 'http://127.0.0.1:8766' },
       LOCAL_BACKEND_CREDS,
@@ -226,17 +300,48 @@ describe('targetEnvVars', () => {
     const map = Object.fromEntries(env.map(v => [v.key, v.value]));
     expect(map.ANTHROPIC_BASE_URL).toBe('http://127.0.0.1:8766');
     expect(env.some(v => v.value.includes('11434'))).toBe(false);
-    // The stability flags a local backend needs are still applied.
+    // The stability flags a non-Anthropic Anthropic-wire server needs are applied.
     expect(map.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBeDefined();
+  });
+
+  // BEHAVIOUR CHANGE, NOT AN INVARIANT — and the question is OPEN (raised item
+  // 0f2ba9c7). The flags are now gated on "pinned Anthropic-wire upstream that is
+  // not api.anthropic.com" rather than on the backend NAME `ollama`, so a
+  // self-hosted Anthropic-compatible gateway gains them — it stops hitting the
+  // 404s and hangs they exist to avoid, but it also silently loses telemetry and
+  // error reporting it used to have. This test pins what the code does TODAY; it
+  // does not assert that this is the right gate. If the human picks the narrower
+  // local-only gate, this test changes with it.
+  test('a pinned non-ollama anthropic-wire gateway also gets the stability flags', () => {
+    const env = targetEnvVars(
+      { ...gateway('claude-opus-4-8'), proxyUrl: 'http://127.0.0.1:8766' },
+      [{ key: 'ANTHROPIC_API_KEY', value: 'sk' }],
+      'container',
+    );
+    const map = Object.fromEntries(env.map(v => [v.key, v.value]));
+    expect(map.DISABLE_TELEMETRY).toBe('1');
+    expect(map.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBe('1');
+  });
+
+  // INVARIANT: Anthropic's own API keeps its default behaviour — an unpinned
+  // profile must never get the flags, or every ordinary launch silently loses
+  // telemetry and error reporting.
+  test('an unpinned profile never gets the stability flags', () => {
+    const env = targetEnvVars(
+      { ...anthropic('claude-opus-4-8'), proxyUrl: 'http://127.0.0.1:8766' },
+      [{ key: 'ANTHROPIC_API_KEY', value: 'sk' }],
+      'container',
+    );
+    expect(env.find(v => v.key === 'DISABLE_TELEMETRY')).toBeUndefined();
   });
 
   // INVARIANT: proxied traffic carries x-lazy-role / x-lazy-task-id (via
   // ANTHROPIC_CUSTOM_HEADERS) so the audit plane can attribute each request to
   // the agent + task that made it. Without this the audit record's role/taskId
   // are always null (the proxy reads headers nobody sets).
-  test('proxy emits ANTHROPIC_CUSTOM_HEADERS from audit hints', () => {
+  test('emits ANTHROPIC_CUSTOM_HEADERS from audit hints', () => {
     const env = targetEnvVars(
-      { backend: 'proxy', model: 'claude-opus-4-8', endpoint: '', proxyUrl: 'http://127.0.0.1:8766' },
+      { ...gateway('claude-opus-4-8', ''), proxyUrl: 'http://127.0.0.1:8766' },
       [{ key: 'ANTHROPIC_API_KEY', value: 'sk-real' }],
       'container',
       { role: 'agent', taskId: 'abc12345' },
@@ -258,7 +363,7 @@ describe('targetEnvVars', () => {
 
   test('proxied launch without hints emits no audit header (backwards compatible)', () => {
     const env = targetEnvVars(
-      { backend: 'proxy', model: 'm', endpoint: '', proxyUrl: 'http://127.0.0.1:8766' },
+      { ...gateway('m', ''), proxyUrl: 'http://127.0.0.1:8766' },
       [{ key: 'ANTHROPIC_API_KEY', value: 'sk' }],
       'container',
     );
@@ -266,7 +371,7 @@ describe('targetEnvVars', () => {
   });
 
   // INVARIANT — THE load-bearing one for this module (proxy-role-upstreams):
-  // NO role target ever yields a non-proxy base URL. Every backend, every
+  // NO role target ever yields a non-proxy base URL. Every profile shape, every
   // surface, every endpoint spelling: if ANTHROPIC_BASE_URL is set at all, it is
   // the proxy's address. This is the assertion that would catch a third carve-out
   // being reintroduced — the first two (ollama, explicit endpoints) were direct
@@ -274,19 +379,23 @@ describe('targetEnvVars', () => {
   test('no role target ever yields a non-proxy base URL', () => {
     const PROXY = 'http://127.0.0.1:8766';
     const UPSTREAMS = ['', 'http://localhost:11434', 'http://host.docker.internal:11434', 'https://api.example.com'];
-    const backends = ['anthropic', 'ollama', 'proxy'] as const;
-    for (const backend of backends) {
-      for (const endpoint of UPSTREAMS) {
-        for (const surface of ['host', 'container'] as const) {
-          const env = targetEnvVars(
-            { backend, model: 'm', endpoint, proxyUrl: PROXY },
-            [{ key: 'ANTHROPIC_API_KEY', value: 'sk' }],
-            surface,
-          );
-          const map = Object.fromEntries(env.map(v => [v.key, v.value]));
-          expect(map.ANTHROPIC_BASE_URL).toBe(PROXY);
-          // ...and the upstream never rides along in some other variable.
-          if (endpoint) expect(env.some(v => v.value.includes(endpoint))).toBe(false);
+    for (const pinned of [false, true]) {
+      for (const credential of ['anthropic', NO_CREDENTIAL, 'work-openai']) {
+        for (const endpoint of UPSTREAMS) {
+          for (const surface of ['host', 'container'] as const) {
+            const env = targetEnvVars(
+              {
+                profile: 'p', harness: 'claude-code', model: 'm',
+                endpoint, pinned, wire: 'anthropic', credential, proxyUrl: PROXY,
+              },
+              [{ key: 'ANTHROPIC_API_KEY', value: 'sk' }],
+              surface,
+            );
+            const map = Object.fromEntries(env.map(v => [v.key, v.value]));
+            expect(map.ANTHROPIC_BASE_URL).toBe(PROXY);
+            // ...and the upstream never rides along in some other variable.
+            if (endpoint) expect(env.some(v => v.value.includes(endpoint))).toBe(false);
+          }
         }
       }
     }
@@ -299,13 +408,89 @@ describe('targetEnvVars', () => {
   // resolution failure lives in daemon/auth-env, not here.
   test('a target with no proxyUrl sets no base URL at all', () => {
     const env = targetEnvVars(
-      { backend: 'proxy', model: 'm', endpoint: 'http://localhost:8080' },
+      gateway('m', 'http://localhost:8080'),
       [{ key: 'ANTHROPIC_API_KEY', value: 'sk' }],
       'container',
     );
     expect(env.find(v => v.key === 'ANTHROPIC_BASE_URL')).toBeUndefined();
     // Emphatically not the endpoint, either.
     expect(env.some(v => v.value.includes('localhost:8080'))).toBe(false);
+  });
+});
+
+describe('targetEnvVars: the first-party base-URL assumption', () => {
+  const FLAG = '_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL';
+  const PROXY = 'http://127.0.0.1:8766';
+  const ANTHROPIC_UPSTREAM = 'https://api.anthropic.com';
+
+  const flagOf = (target: RoleTarget) =>
+    Object.fromEntries(
+      targetEnvVars(target, [{ key: 'ANTHROPIC_API_KEY', value: 'sk' }], 'container').map(v => [v.key, v.value]),
+    )[FLAG];
+
+  // INVARIANT: a launch whose traffic really lands at Anthropic's own API must
+  // tell Claude Code so. Claude Code caps EVERY model at a 200k context window
+  // unless it believes its base URL is first-party, and it decides that by
+  // matching ANTHROPIC_BASE_URL against a literal `api.anthropic.com` allowlist.
+  // Lazy always points that variable at its own proxy, so without this flag a
+  // 1M-window model silently runs at 200k (verified against Claude Code 2.1.266:
+  // `claude --model claude-fable-5-1 -p "/context"` reports 200k with the proxy
+  // base URL and 1m with the flag).
+  test('an unpinned Anthropic profile riding the default upstream gets the flag', () => {
+    expect(flagOf({ ...anthropic('claude-fable-5-1'), proxyUrl: PROXY, primaryUpstream: ANTHROPIC_UPSTREAM })).toBe('1');
+  });
+
+  // ...and a profile PINNED to Anthropic's own API is the same claim, made
+  // explicitly rather than inherited from `[proxy] upstream`.
+  test('a profile pinned to api.anthropic.com gets the flag', () => {
+    expect(flagOf({ ...gateway('claude-opus-5', 'https://api.anthropic.com'), proxyUrl: PROXY })).toBe('1');
+  });
+
+  // INVARIANT: the flag is a factual claim about what sits on the far side of
+  // the proxy, not a capability switch to turn on for everyone. It gates the 1M
+  // window, the small/fast haiku model, model-alias resolution, org memory and
+  // the billing headers — all of which mean "behave as if talking to Anthropic's
+  // API". Setting it for an upstream that is NOT Anthropic tells Claude Code it
+  // has capabilities that upstream lacks, which fails at request time instead of
+  // at launch. Each row below is an upstream that is not Anthropic's API.
+  test('never set for an upstream that is not Anthropic', () => {
+    const cases: Array<[string, RoleTarget]> = [
+      // A local model server, whatever address it answers on.
+      ['ollama', { ...ollama('qwen3-coder'), proxyUrl: PROXY, primaryUpstream: ANTHROPIC_UPSTREAM }],
+      // A third-party Anthropic-compatible gateway.
+      ['pinned gateway', { ...gateway('claude-opus-5', 'https://gw.example.com'), proxyUrl: PROXY }],
+      // An OpenAI-wire profile: not Claude Code, and not Anthropic's API.
+      ['openai wire', {
+        profile: 'work-openai', harness: 'codex', model: 'gpt-5', endpoint: 'https://api.openai.com',
+        pinned: true, wire: 'openai', credential: 'work-openai', proxyUrl: PROXY,
+      }],
+      // The case `endpoint` alone cannot see: an unpinned profile whose traffic
+      // rides a `[proxy] upstream` pointed at a self-hosted gateway.
+      ['redirected primary upstream', {
+        ...anthropic('claude-fable-5-1'), proxyUrl: PROXY, primaryUpstream: 'https://llm.internal.example.com',
+      }],
+      // Unknown is not Anthropic. A caller that did not resolve the upstream
+      // leaves it undefined, and losing the 1M window is a smaller failure than
+      // claiming capabilities the upstream may not have.
+      ['unresolved upstream', { ...anthropic('claude-fable-5-1'), proxyUrl: PROXY }],
+    ];
+    for (const [label, target] of cases) {
+      expect(`${label}:${flagOf(target)}`).toBe(`${label}:undefined`);
+    }
+  });
+
+  // INVARIANT: the flag qualifies ANTHROPIC_BASE_URL — it says "the URL in that
+  // variable is a passthrough to Anthropic". A launch that sets no base URL
+  // inherits one from its parent or is in an RPC-bypass mode, so emitting the
+  // flag there would be a claim about somebody else's variable.
+  test('never set without the base URL it qualifies', () => {
+    const env = targetEnvVars(
+      { ...anthropic('claude-fable-5-1'), primaryUpstream: ANTHROPIC_UPSTREAM },
+      [{ key: 'ANTHROPIC_API_KEY', value: 'sk' }],
+      'container',
+    );
+    expect(env.find(v => v.key === FLAG)).toBeUndefined();
+    expect(env.find(v => v.key === 'ANTHROPIC_BASE_URL')).toBeUndefined();
   });
 });
 
@@ -359,21 +544,159 @@ describe('proxyAuditHeaderEnv', () => {
 
 describe('connectivity preflight', () => {
   // Anthropic reachability is the credential gate's job, not the network probe's.
-  test('anthropic targets are always reported reachable', async () => {
+  test('unpinned targets are always reported reachable', async () => {
     const check = await checkTargetConnectivity(anthropic('claude-opus-4-8'));
     expect(check.reachable).toBe(true);
   });
 
-  test('anthropic preflight never throws', async () => {
+  test('unpinned preflight never throws', async () => {
     await preflightRoleTarget('agent', anthropic('claude-opus-4-8'));
   });
 
-  // INVARIANT: An unreachable local backend fails hard with an actionable error —
-  // lazy must NEVER silently fall back to a different backend.
-  test('preflight throws an actionable error for an unreachable ollama backend', async () => {
+  // INVARIANT: An unreachable pinned upstream fails hard with an actionable error —
+  // lazy must NEVER silently fall back to a different upstream.
+  test('preflight throws an actionable error for an unreachable pinned upstream', async () => {
     // Port 1 is reserved/unused, so the probe fails fast with a connection error.
-    const target: RoleTarget = { backend: 'ollama', model: 'qwen3-coder', endpoint: 'http://127.0.0.1:1' };
+    const target = ollama('qwen3-coder', 'http://127.0.0.1:1');
     await expect(preflightRoleTarget('agent', target)).rejects.toThrow(/Preflight failed for the "agent" role/);
+  });
+
+  // INVARIANT: a LOCAL upstream is probed whether or not a human pinned it. The
+  // built-in `pi` profile's default IS a local Ollama, so "is the server
+  // running?" is a real question for a target nobody wrote in lazy.toml — and
+  // skipping it turns "start ollama" into an opaque proxy failure mid-turn.
+  test('an unpinned LOCAL endpoint is still probed, and fails actionably when nothing answers', async () => {
+    const builtinPi: RoleTarget = {
+      profile: 'pi',
+      harness: 'pi',
+      model: 'qwen3.8:latest',
+      // Port 1 is reserved/unused, so the probe fails fast.
+      endpoint: 'http://127.0.0.1:1',
+      pinned: false,
+      wire: 'anthropic',
+      credential: NO_CREDENTIAL,
+    };
+    const check = await checkTargetConnectivity(builtinPi);
+    expect(check.reachable).toBe(false);
+    await expect(preflightRoleTarget('agent', builtinPi)).rejects.toThrow(/Preflight failed/);
+  });
+
+  // …but a hosted DEFAULT nobody chose (codex's api.openai.com) is not: that
+  // would add a network round-trip to every launch to answer a question the
+  // first request answers anyway.
+  test('an unpinned HOSTED default endpoint is not probed', async () => {
+    const builtinCodex: RoleTarget = {
+      profile: 'codex',
+      harness: 'codex',
+      model: '',
+      endpoint: 'https://api.openai.com',
+      pinned: false,
+      wire: 'openai',
+      credential: 'openai',
+    };
+    const check = await checkTargetConnectivity(builtinCodex);
+    expect(check.reachable).toBe(true);
+    expect(check.endpoint).toBe('anthropic');
+  });
+
+  // The error must name the profile to edit: under profiles the endpoint lives in
+  // `[agents.<name>]`, and a message pointing at a role would send the user to a
+  // block that no longer carries an endpoint at all.
+  test('the preflight error names the profile whose block holds the endpoint', async () => {
+    const target = ollama('qwen3-coder', 'http://127.0.0.1:1');
+    await expect(preflightRoleTarget('agent', target)).rejects.toThrow(/\[agents\.local-ollama\]/);
+  });
+
+  // The remedy depends on WHO is reading, and managed mode is the case where
+  // getting it wrong costs more than saying nothing. These two tests are a pair:
+  // the unmanaged one is what keeps the managed one honest, because both run the
+  // same unreachable target through the same call and differ only in the
+  // environment.
+  describe('the remedy on a managed host', () => {
+    async function preflightMessage(managed: boolean): Promise<string> {
+      const before = process.env.LAZY_MANAGED;
+      if (managed) process.env.LAZY_MANAGED = '1';
+      else delete process.env.LAZY_MANAGED;
+      try {
+        // Port 1 is reserved/unused, so the probe fails fast with a connection error.
+        await preflightRoleTarget('agent', ollama('qwen3-coder', 'http://127.0.0.1:1'));
+        throw new Error('preflight was expected to reject for an unreachable upstream');
+      } catch (err) {
+        return (err as Error).message;
+      } finally {
+        if (before === undefined) delete process.env.LAZY_MANAGED;
+        else process.env.LAZY_MANAGED = before;
+      }
+    }
+
+    // INVARIANT: the preflight NEVER tells a reader on a managed host to put an
+    // endpoint in the repository's lazy.toml. `agents.*.endpoint` is `refused`
+    // by the managed policy, so following that advice does not fix the launch —
+    // it makes the whole project stop loading with `managed config refused`,
+    // which is strictly worse than the failure being explained.
+    test('does not send the reader to a repository key the host refuses', async () => {
+      const message = await preflightMessage(true);
+      expect(message).toMatch(/Preflight failed for the "agent" role/);
+      expect(message).not.toMatch(/change \[agents\.[^\]]+\] in lazy\.toml/);
+      expect(message).toMatch(/refused/);
+      expect(message).toMatch(/installation/);
+    });
+
+    // Unmanaged, the reader owns the file and the old advice is the right advice.
+    test('still points at [agents.<name>] when the project is not managed', async () => {
+      const message = await preflightMessage(false);
+      expect(message).toMatch(/change \[agents\.local-ollama\] in lazy\.toml/);
+    });
+  });
+});
+
+/**
+ * `upstreamRefused` is the question asked before TAKING A CHOICE AWAY from
+ * somebody (the create-time gate in `daemon/agent-profile-check.ts`), which is
+ * why it is a different question from `checkTargetConnectivity` and why the
+ * difference is tested rather than assumed.
+ */
+describe('conclusively-refused upstreams', () => {
+  // INVARIANT: only a connection the host actively refused counts. A gate that
+  // acted on its own timeout would refuse creates because the network was slow,
+  // which is a worse failure than the dead task it exists to prevent.
+  test('a port nothing is listening on is conclusive', async () => {
+    // Port 1 is privileged and unbindable here, so the connect is refused at once.
+    expect(await upstreamRefused(ollama('qwen3-coder', 'http://127.0.0.1:1'), 1_500)).toBe(true);
+  });
+
+  test('an upstream that accepts the connection and then says nothing is NOT conclusive', async () => {
+    // A real blackhole rather than an unroutable address: the TCP connect
+    // succeeds and no bytes ever come back, so curl can only time out. An
+    // unroutable IP would be refused by the kernel and prove the opposite thing.
+    const blackhole = Bun.listen({
+      hostname: '127.0.0.1',
+      port: 0,
+      socket: { data() { /* deliberately never answers */ } },
+    });
+    try {
+      const target = ollama('qwen3-coder', `http://127.0.0.1:${blackhole.port}`);
+      expect(await upstreamRefused(target, 500)).toBe(false);
+    } finally {
+      blackhole.stop(true);
+    }
+  });
+
+  test('an upstream that answers is not refused, whatever it answers', async () => {
+    const server = Bun.serve({ port: 0, fetch: () => new Response('nope', { status: 503 }) });
+    try {
+      const target = ollama('qwen3-coder', `http://127.0.0.1:${server.port}`);
+      expect(await upstreamRefused(target, 1_500)).toBe(false);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  // The same narrowing `checkTargetConnectivity` applies: a role riding the
+  // proxy's primary upstream has no local component, and nothing to be
+  // conclusive about.
+  test('a target lazy does not probe is never conclusive', async () => {
+    expect(await upstreamRefused(anthropic('claude-opus-4-8'), 1_500)).toBe(false);
   });
 });
 
@@ -381,10 +704,10 @@ describe('launch surface (host vs container endpoints)', () => {
   const DOCKER_OLLAMA = 'http://host.docker.internal:11434';
 
   // INVARIANT (proxy-role-upstreams): surface translation applies to the PROXY
-  // ADDRESS ONLY. A role's `endpoint` is dialed by the daemon, a host process,
+  // ADDRESS ONLY. A profile's `endpoint` is dialed by the daemon, a host process,
   // so it has exactly one perspective and nothing to translate — and it is not
   // in the launch env to translate in the first place.
-  test('a role endpoint is untouched by surface, because it never reaches the env', () => {
+  test('a profile endpoint is untouched by surface, because it never reaches the env', () => {
     for (const surface of ['host', 'container'] as const) {
       const target = { ...ollama('qwen3-coder', DOCKER_OLLAMA), proxyUrl: 'http://127.0.0.1:8766' };
       expect(targetForSurface(target, surface).endpoint).toBe(DOCKER_OLLAMA);
@@ -398,7 +721,7 @@ describe('launch surface (host vs container endpoints)', () => {
   // a docker-runner project it hands back `host.docker.internal`, which a host
   // launch (pair/chat) must not pass through verbatim. This is the default-on
   // proxy half of the same bug and is NOT covered by `endpoint`.
-  test('host surface rewrites an injected proxyUrl on an anthropic role', () => {
+  test('host surface rewrites an injected proxyUrl on an unpinned profile', () => {
     const target: RoleTarget = { ...anthropic('claude-opus-4-8'), proxyUrl: 'http://host.docker.internal:8766' };
     const hostMap = Object.fromEntries(
       targetEnvVars(target, [{ key: 'ANTHROPIC_API_KEY', value: 'sk' }], 'host').map(v => [v.key, v.value]),
@@ -413,9 +736,9 @@ describe('launch surface (host vs container endpoints)', () => {
 
   // Only the exact hostname is rewritten — never a substring match.
   test('targetForSurface leaves unrelated hostnames alone', () => {
-    const t: RoleTarget = { backend: 'ollama', model: 'm', endpoint: '', proxyUrl: 'http://host.docker.internal.example.com:11434' };
+    const t: RoleTarget = { ...ollama('m', ''), proxyUrl: 'http://host.docker.internal.example.com:11434' };
     expect(targetForSurface(t, 'host').proxyUrl).toBe('http://host.docker.internal.example.com:11434');
-    expect(targetForSurface({ backend: 'ollama', model: 'm', endpoint: '', proxyUrl: 'http://192.168.1.5:11434' }, 'host').proxyUrl)
+    expect(targetForSurface({ ...ollama('m', ''), proxyUrl: 'http://192.168.1.5:11434' }, 'host').proxyUrl)
       .toBe('http://192.168.1.5:11434');
   });
 
@@ -430,9 +753,7 @@ describe('launch surface (host vs container endpoints)', () => {
     try {
       const endpoint = `http://localhost:${server.port}`;
       const target: RoleTarget = {
-        backend: 'proxy',
-        model: 'claude-opus-4-8',
-        endpoint,
+        ...gateway('claude-opus-4-8', endpoint),
         proxyUrl: 'http://127.0.0.1:8766',
       };
       const probed = await preflightRoleTarget('builder', target);
@@ -446,7 +767,7 @@ describe('launch surface (host vs container endpoints)', () => {
     }
   });
 
-  test('preflight reports "anthropic" for an anthropic target', async () => {
+  test('preflight reports "anthropic" for an unpinned target', async () => {
     expect(await preflightRoleTarget('builder', anthropic('claude-opus-4-8'))).toBe('anthropic');
   });
 });

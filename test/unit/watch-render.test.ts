@@ -8,7 +8,7 @@
  */
 
 import { describe, test, expect, afterEach } from 'bun:test';
-import { stripAnsi } from '../../src/cli/theme';
+import { stripAnsi } from '../../src/render/theme';
 import {
   thinkingSeparatorOpen,
   thinkingSeparatorClose,
@@ -20,7 +20,7 @@ import {
   renderEntry,
   type RawContentBlock,
   type RawLogEntry,
-} from '../../src/cli/watch-renderer';
+} from '../../src/render/watch-renderer';
 
 // ── Console capture helper ──────────────────────────────────────────────
 

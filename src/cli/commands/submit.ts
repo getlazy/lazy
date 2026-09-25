@@ -1,9 +1,16 @@
 import { join } from 'path';
+import { requireActorIdentity } from '../identity-preflight';
 import { parseFlags, requireLazyRoot } from '../helpers';
-import { querySubmitTask } from '../../daemon/rpc-fallback';
+import { querySubmitTask, querySubmitTaskPreflight } from '../../daemon/rpc-fallback';
 import { isOfflineMode } from '../../utils/offline';
 import { loadConfig } from '../../config/loader';
-import { theme } from '../theme';
+import { isTTY, promptLine, promptYesNo } from '../editor';
+import {
+  submitPlainConfirmText,
+  submitStrongConfirmText,
+  submitConfirmMatches,
+} from '../../submit-confirmation';
+import { theme } from '../../render/theme';
 
 export async function commandSubmit(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [
@@ -16,6 +23,12 @@ export async function commandSubmit(args: string[]): Promise<void> {
     process.exit(1);
   }
 
+  // Before the submit confirmation is typed: the daemon refuses a write it cannot
+  // attribute, and a refusal must never cost the human what they wrote.
+  await requireActorIdentity();
+
+  const yes = parsed.flags.get('yes') === true;
+
   // Early offline check — submit requires remote operations (PR creation),
   // so fail fast before attempting the daemon RPC call.
   const root = requireLazyRoot();
@@ -26,6 +39,35 @@ export async function commandSubmit(args: string[]): Promise<void> {
   }
 
   try {
+    // Preflight before any prompt: a refusal must not ask the human to type
+    // a branch name and then throw it away.
+    const preflight = await querySubmitTaskPreflight({ taskId });
+    if (!preflight.canSubmit) {
+      console.error(`Error: ${preflight.refusal ?? 'Submit is not available.'}`);
+      process.exit(1);
+    }
+
+    if (!yes) {
+      if (!isTTY()) {
+        console.error('Error: Submit requires confirmation. Re-run with --yes to skip the prompt.');
+        process.exit(1);
+      }
+      if (preflight.confirmationTier === 'plain') {
+        const ok = await promptYesNo(submitPlainConfirmText(preflight), false);
+        if (!ok) {
+          console.error('Aborted.');
+          process.exit(1);
+        }
+      } else if (preflight.confirmationTier === 'strong') {
+        console.log(submitStrongConfirmText(preflight));
+        const typed = await promptLine('Type the target branch or task code');
+        if (!submitConfirmMatches(typed, preflight, preflight.taskCode)) {
+          console.error('Error: Confirmation did not match. Aborted.');
+          process.exit(1);
+        }
+      }
+    }
+
     const result = await querySubmitTask({ taskId });
 
     // Print warnings
@@ -46,12 +88,15 @@ export async function commandSubmit(args: string[]): Promise<void> {
 }
 
 export function submitUsage(): void {
-  console.log(`Usage: lazy submit <task_id>
+  console.log(`Usage: lazy submit <task_id> [options]
 
 Submit a task for review by creating or updating a pull request.
 
 Arguments:
   <task_id>    ID of the task to submit
+
+Options:
+  -y, --yes    Skip the confirmation prompt
 
 Behavior:
   - Pushes the task branch to the remote
@@ -65,14 +110,23 @@ Pre-conditions:
   - A remote driver must be configured (e.g., [remote] driver = "github" in lazy.toml)
 
 Notes:
+  - A subtask integrates into its parent task's branch, and lazy never opens
+    a PR for it on its own. Submitting one explicitly opens the PR against
+    the parent's branch, which must already be on the remote (submit never
+    pushes it). Accept still merges locally, then closes the PR
+  - An open PR you opened by hand for the task's branch is adopted rather
+    than duplicated, as long as it targets the task's target branch
   - Until submit, the branch is pushed by daemon auto-push and CI runs,
     but there is no PR and no review comments. With
     [remote] <driver>_auto_push = false there is no automatic push either,
     and submit is the first thing to publish the branch
   - Use 'lazy accept <task_id>' to merge after review
   - Use 'lazy unblock <task_id>' to send feedback and return to working
+  - Protected targets get a yes/no prompt (default No). Unprotected or
+    unknown targets require typing the target branch or the task code.
+  - --yes skips the prompt; MCP has no equivalent (confirmation_code instead)
 
 Examples:
   lazy submit abc12345          # Submit task for review
-  lazy submit fix-auth          # Submit by task code`);
+  lazy submit fix-auth --yes    # Submit by task code, skip confirmation`);
 }

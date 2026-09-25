@@ -12,14 +12,25 @@
  * This helper closes that gap: client launch paths call it to obtain the auth
  * env from the daemon over RPC, never from their own environment.
  *
- * Secrets hygiene: the credential travels over the local, token-authenticated
- * unix socket only and is never written to disk or logged here.
+ * Secrets hygiene: the credential travels only over the token-authenticated
+ * daemon RPC channel (loopback by default) and is never written to disk or
+ * logged here.
  */
 
 import { tryRpc, isDaemonRpcBypassed } from './client';
 import { getAuthEnvVars } from '../capture/claude';
+import { findLazyRoot } from '../project-paths';
 import type { RoleTarget, ResolvedConfig } from '../config/types';
-import { targetEnvVars, ANTHROPIC_DEFAULT_TARGET, proxyBaseUrlForRunner, LOCAL_BACKEND_CREDS, type ProxyAuditHints, type LaunchSurface } from '../utils/role-target';
+import {
+  targetEnvVars,
+  ANTHROPIC_DEFAULT_TARGET,
+  proxyBaseUrlForRunner,
+  LOCAL_BACKEND_CREDS,
+  resolveProfileLaunchCreds,
+  usesSyntheticCreds,
+  type ProxyAuditHints,
+  type LaunchSurface,
+} from '../utils/role-target';
 import type { LaunchIdentity } from '../proxy/placeholder-env';
 import { hasDaemonContext, getDaemonContext } from './context';
 
@@ -29,16 +40,78 @@ export interface AuthEnvVar {
 }
 
 /**
- * What the DAEMON's environment holds, credential-wise — presence and label
+ * One credential the daemon's project requires, and whether the daemon can pay
+ * with it. Presence and handles only — no field ever carries a secret or a
+ * value derived from one.
+ */
+export interface DaemonCredentialEntry {
+  /** Credential name — a provider (`anthropic`) or a user-chosen one (`work-openai`). */
+  name: string;
+  /** Human-facing label: a provider's display name, or the name itself. */
+  label: string;
+  /** Profiles whose `credential` slot bills it, sorted. */
+  requiredBy: string[];
+  present: boolean;
+  /** Where the daemon found it — its environment, the store's index, the agent key file — or null. */
+  source: 'env' | 'store' | 'file' | null;
+  /** The env var NAME, the store backend id, or the key file's path. Null when absent. */
+  via: string | null;
+  /**
+   * Which FORM is in effect — `oauth` (a subscription) or `api-key` (a metered
+   * key) — or null when unknowable. Known from the store's non-secret index; an
+   * env var carries a bare value that says nothing about its form. Reported
+   * because on a provider issuing both, this is the difference between spending
+   * a subscription and spending metered credit.
+   */
+  kind: 'oauth' | 'api-key' | null;
+  /**
+   * DEGRADED: the credential store cannot be read, so the daemon is serving the
+   * copy it loaded at startup while the stored secret has moved on. Reported so
+   * a client cannot print `via` as though requests were being paid for from
+   * there — the same flag `ResolvedCredential` and `CredentialSource` carry.
+   * Only a running daemon can be in this state, which is why this wire shape is
+   * where it matters.
+   */
+  stale?: boolean;
+  /**
+   * Set when presence could not be determined — the store's index or the key
+   * file exists but could not be read. Carries the read error verbatim so the
+   * line `lazy doctor` prints says what to fix; the other entries are answered
+   * normally.
+   */
+  error?: string;
+}
+
+/**
+ * What the DAEMON's environment holds, credential-wise — presence and labels
  * only, never the secret. See `handleGetCredentialState`.
  */
 export interface DaemonCredentialState {
-  /** Is a usable (present, non-blank) credential in the daemon's env? */
+  /** Is a usable (present, non-blank) ANTHROPIC credential in the daemon's env? */
   present: boolean;
   /** Which env var carries it (e.g. `CLAUDE_CODE_OAUTH_TOKEN`), or null. */
   source: string | null;
-  /** Ollama-backed project: a local dummy credential is used, none needed. */
-  ollama: boolean;
+  /**
+   * Does either role's default profile bill the Anthropic credential?
+   *
+   * False when both roles point at another provider or at a local server that
+   * authenticates nobody — there is then no Anthropic credential to be missing,
+   * and a diagnostic that reported one absent would be reporting a non-problem.
+   * Read through the same `requiredProviders` the credential gate starts the
+   * daemon by, so the report and the gate cannot disagree.
+   */
+  anthropicRequired: boolean;
+  /**
+   * One entry per credential the project's CONFIGURED profiles bill — the role
+   * defaults plus every `[agents.<name>]` block — in `requiredCredentials`
+   * order. Empty when no configured profile needs a credential at all.
+   *
+   * Optional only because a daemon older than this field answers without it;
+   * `present` / `source` / `anthropicRequired` above are what such a daemon
+   * can say, and a client that gets no `providers` must not present that
+   * Anthropic-only answer as the whole picture.
+   */
+  providers?: DaemonCredentialEntry[];
 }
 
 /**
@@ -178,10 +251,10 @@ export async function resolveLiveProxyUrl(config: ResolvedConfig): Promise<strin
  * fail-loud contract is structural instead of repeated at each call site.
  *
  * EVERY backend gets `proxyUrl`, with no exceptions — that is the point. An
- * ollama role and a role with an explicit `endpoint` used to be skipped here and
- * connected direct; now their `endpoint` is the upstream the PROXY forwards to
- * (src/proxy/role-upstreams.ts), so they need the proxy's address like everyone
- * else and they trigger the same fail-loud gate.
+ * ollama profile and a profile with an explicit `endpoint` used to be skipped
+ * here and connected direct; now their `endpoint` is the upstream the PROXY
+ * forwards to (src/proxy/agent-upstreams.ts), so they need the proxy's address
+ * like everyone else and they trigger the same fail-loud gate.
  *
  * A target that already carries a `proxyUrl` is returned unchanged: it was
  * resolved by whoever stamped it (the runner factory), and re-resolving would
@@ -195,7 +268,7 @@ export async function withLiveProxyTarget(
   const proxyUrl = await resolveLiveProxyUrl(config);
   // Undefined only reaches here in the explicit bypass modes (test harness /
   // daemon-self); every genuine resolution failure threw above.
-  return proxyUrl ? applyLiveProxyUrl(target, proxyUrl) : target;
+  return proxyUrl ? applyLiveProxyUrl(target, proxyUrl, config.proxy.upstream) : target;
 }
 
 /**
@@ -219,23 +292,35 @@ export function needsLiveProxyUrl(target: RoleTarget): boolean {
  * incompatible things depending on who had written it last. `endpoint` is now
  * exclusively the upstream the proxy forwards this role to, and clobbering it
  * here would erase the very routing the daemon reads at request time.
+ *
+ * `primaryUpstream` (`[proxy] upstream`) rides along because this is the seam
+ * where a launch stops being config and becomes an address: the same call that
+ * knows which proxy the agent dials is the only one that also knows where that
+ * proxy forwards an UNPINNED profile. See {@link RoleTarget.primaryUpstream}.
  */
-export function applyLiveProxyUrl(target: RoleTarget, proxyUrl: string): RoleTarget {
-  return { ...target, proxyUrl };
+export function applyLiveProxyUrl(
+  target: RoleTarget,
+  proxyUrl: string,
+  primaryUpstream: string,
+): RoleTarget {
+  return { ...target, proxyUrl, primaryUpstream };
 }
 
 /**
  * Resolve the auth env vars for a client-launched container, preferring the
  * daemon as the credential source.
  *
- * - Ollama: the ollama server ignores auth, so there is no real credential to
- *   fetch — but the launch still needs the proxy's address and a placeholder to
- *   present to it, so the RPC is told the caller is self-credentialed and mints
- *   a grant over {@link LOCAL_BACKEND_CREDS} instead of the user's token. This
- *   is what keeps ollama-only projects (which legitimately have no Anthropic
- *   credential at all) launchable while still being fully proxied.
- * - anthropic/proxy: the Anthropic credential is fetched from the daemon via the
- *   `getAuthEnv` RPC, then wrapped for the target (proxy prepends its base URL).
+ * - credential `none` (a local model server): the server ignores auth, so there
+ *   is no real credential to fetch — but the launch still needs the proxy's
+ *   address and a placeholder to present to it, so the RPC is told the caller is
+ *   self-credentialed and mints a grant over {@link LOCAL_BACKEND_CREDS} instead
+ *   of the user's token. This is what keeps local-model projects (which
+ *   legitimately have no Anthropic credential at all) launchable while still
+ *   being fully proxied.
+ * - credential `anthropic`: the Anthropic credential is fetched from the daemon
+ *   via the `getAuthEnv` RPC, then wrapped for the target (proxy prepends its
+ *   base URL).
+ * - any other slot: read from the credential store for this profile.
  * - Test (LAZY_TEST=1) / daemon-self (LAZY_IS_DAEMON=1): `tryRpc` returns null,
  *   so we fall back to the local env — in those modes the credential lives in
  *   this very process (tests set it; the daemon process holds it directly).
@@ -260,12 +345,14 @@ export async function resolveAuthEnvFromDaemon(
 ): Promise<AuthEnvVar[]> {
   const resolved = target ?? ANTHROPIC_DEFAULT_TARGET;
 
-  // The ollama server ignores auth, so the daemon has no real credential to
-  // source for this role — and demanding one would break the very projects
-  // ollama exists to serve. The launch is proxied all the same: the daemon
+  // A local model server ignores auth, so the daemon has no real credential to
+  // source for this profile — and demanding one would break the very projects
+  // that setup exists to serve. The launch is proxied all the same: the daemon
   // mints a placeholder over these synthetic vars, and the proxy strips it
-  // before forwarding to an upstream mapped to "no credential".
-  const selfCredentialed = resolved.backend === 'ollama';
+  // before forwarding to an upstream mapped to "no credential". Every other
+  // slot — including hosted ollama.com — has a real key, minted as a placeholder
+  // like any other credential.
+  const selfCredentialed = usesSyntheticCreds(resolved);
 
   // JIT CREDENTIALS: every role's traffic reaches lazy's proxy now, so the only
   // question left is whether this caller identified itself well enough to mint
@@ -278,7 +365,14 @@ export async function resolveAuthEnvFromDaemon(
   const rpc = await tryRpc<{ authEnvVars: AuthEnvVar[]; proxyBaseUrl?: string }>('getAuthEnv', {
     proxied,
     ...(selfCredentialed ? { selfCredentialed: true } : {}),
-    ...(proxied ? { role: identity!.role, taskId: identity!.taskId ?? null, label: identity!.label } : {}),
+    ...(proxied
+      ? {
+        role: identity!.role,
+        taskId: identity!.taskId ?? null,
+        label: identity!.label,
+        profile: identity!.profile,
+      }
+      : {}),
   });
   if (rpc) {
     // The RPC returns the bare credential; the base URL (and the audit headers)
@@ -290,7 +384,17 @@ export async function resolveAuthEnvFromDaemon(
     // PROXY forwards to, never an address this launch dials.
     const proxyUrl = resolved.proxyUrl ?? rpc.proxyBaseUrl;
     if (proxyUrl) {
-      return targetEnvVars({ ...resolved, proxyUrl }, rpc.authEnvVars, surface, hints);
+      // Same fallback shape for the upstream: prefer what the target already
+      // carries (it went through withLiveProxyTarget), else this caller's own
+      // config. Left undefined when the caller passed none — unknown, never
+      // assumed to be Anthropic. See RoleTarget.primaryUpstream.
+      const primaryUpstream = resolved.primaryUpstream ?? config?.proxy.upstream;
+      return targetEnvVars(
+        { ...resolved, proxyUrl, primaryUpstream },
+        rpc.authEnvVars,
+        surface,
+        hints,
+      );
     }
     // No proxy address for a role that should have one: the audit plane would
     // be silently bypassed, so fail loud (same contract as resolveLiveProxyUrl).
@@ -303,14 +407,16 @@ export async function resolveAuthEnvFromDaemon(
   }
 
   // Daemon bypassed (test or daemon-self mode): the credential is in this
-  // process — or, for an ollama role, is synthetic and needs no process at all.
-  // getAuthEnvVars throws an actionable error if it is genuinely absent, which
-  // is the correct behavior for those modes.
+  // process — or, for a profile on a local server, is synthetic and needs no
+  // process at all. getAuthEnvVars throws an actionable error if it is genuinely
+  // absent, which is the correct behavior for those modes.
   //
   // No placeholder swap here on purpose: these are the modes with no daemon,
   // and therefore no proxy to exchange a placeholder against. The daemon-self
   // case never reaches this function for a launch — in-daemon launches go
   // through getLaunchAuthEnvVars, which does swap.
-  if (selfCredentialed) return targetEnvVars(resolved, LOCAL_BACKEND_CREDS, surface, hints);
+  const lazyRoot = findLazyRoot() ?? process.cwd();
+  const creds = await resolveProfileLaunchCreds(lazyRoot, resolved);
+  if (creds) return targetEnvVars(resolved, creds, surface, hints);
   return getAuthEnvVars(resolved, hints, surface);
 }

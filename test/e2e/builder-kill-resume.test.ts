@@ -23,10 +23,13 @@
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { installFakeAgentBinary } from '../helpers/fake-agent-binary';
+import { writeBuilderClaudeConfig } from '../helpers/builder-claude-config';
+import { TURN_IDENTITY_ENV_PINS } from '../helpers/mcp-env';
 import { mkdir, mkdtemp, readFile, rm, writeFile, access } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
-import { getTokenPath, getWebPortPath } from '../../src/daemon/paths';
+import { getWebPortPath } from '../../src/daemon/paths';
+import { mintMcpToken } from '../../src/daemon/mcp-tokens';
 import { DaemonClient } from '../../src/daemon/client';
 import { RemoteStorage } from '../../src/storage/remote-storage';
 import { encodeProjectPath } from '../../src/import/claude-code-logs';
@@ -36,13 +39,16 @@ import type { BuilderResumeIntent } from '../../src/storage/types';
 const AGENT_ENTRY = resolve(__dirname, '../../src/agent-entry.ts');
 const BUILDER_ID = 'testbuilder';
 
+/** Everything the supervisor subprocess printed, so a timeout can report it. */
+let supervisorOutput = '';
+
 async function waitFor(check: () => Promise<boolean>, timeoutMs: number, label: string): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await check()) return;
     await new Promise(r => setTimeout(r, 200));
   }
-  throw new Error(`timed out waiting for ${label}`);
+  throw new Error(`timed out waiting for ${label}\n--- supervisor output ---\n${supervisorOutput}`);
 }
 
 describe('builder killed mid-session → resumable', () => {
@@ -54,8 +60,15 @@ describe('builder killed mid-session → resumable', () => {
     ctx = await setupTestLazy({ fakeClaude: true });
     home = await mkdtemp(join(tmpdir(), 'lazy-e2e-home-'));
     await mkdir(join(home, '.claude', 'projects'), { recursive: true });
+    supervisorOutput = '';
     binDir = await mkdtemp(join(tmpdir(), 'lazy-e2e-bin-'));
-    await installFakeAgentBinary(binDir);
+    // Same shape as builder-live-capture.test.ts. AGENT_ENTRY makes
+    // `lazy-agent mcp` serve a real MCP server; the launch preflight
+    // (probeLazyMcpServerStartup) actually runs the `mcpServers.lazy` entry from
+    // $HOME/.claude.json, which writeBuilderClaudeConfig already points at
+    // agent-entry — so this is belt-and-braces for any path that reaches the
+    // server through the BINARY, not the thing that unblocked this suite.
+    await installFakeAgentBinary(binDir, AGENT_ENTRY);
   });
 
   afterEach(async () => {
@@ -70,7 +83,7 @@ describe('builder killed mid-session → resumable', () => {
    * surface, so this is also what production reads back.
    */
   async function daemonStorage(): Promise<RemoteStorage> {
-    const client = DaemonClient.create(ctx.root);
+    const client = await DaemonClient.create(ctx.root);
     if (!client) throw new Error('no daemon client for the test project');
     const storagePath = await client.rpc('storage', ctx.root, {
       method: 'getStoragePath',
@@ -79,9 +92,17 @@ describe('builder killed mid-session → resumable', () => {
     return new RemoteStorage(client, ctx.root, storagePath);
   }
 
-  /** Write the daemon MCP config the supervisor reads (as the runner mounts it). */
+  /**
+   * Write the daemon MCP config the supervisor reads (as the runner mounts it),
+   * plus the `$HOME/.claude.json` that must name it — the supervisor's MCP
+   * preflight requires the two to agree before it will launch Claude Code.
+   */
   async function writeDaemonConfig(): Promise<string> {
-    const token = (await readFile(getTokenPath(ctx.root), 'utf-8')).trim();
+    // A BUILDER-kind MCP token, exactly what `writeDaemonMcpConfig` mints in
+    // production — never the shared daemon token. Capture posts to
+    // `/builder/storage`, which takes this token and 401s the shared one, and
+    // the supervisor's capture preflight refuses to launch on that 401.
+    const token = await mintMcpToken(ctx.root, { kind: 'builder' }, `builder-${BUILDER_ID}`);
     const port = (await readFile(getWebPortPath(ctx.root), 'utf-8')).trim();
     const path = join(ctx.root, '.lazy', 'tmp', 'daemon-mcp-builder-kill.json');
     await mkdir(join(ctx.root, '.lazy', 'tmp'), { recursive: true });
@@ -89,6 +110,7 @@ describe('builder killed mid-session → resumable', () => {
       path,
       JSON.stringify({ token, projectRoot: ctx.root, taskId: '', target: `http://127.0.0.1:${port}` }, null, 2),
     );
+    await writeBuilderClaudeConfig(home, path, ctx.root);
     return path;
   }
 
@@ -101,7 +123,7 @@ describe('builder killed mid-session → resumable', () => {
       builderConfigPath,
       JSON.stringify({ host: '127.0.0.1', port: 1, token: 'unused', lazyRoot: ctx.root }),
     );
-    return Bun.spawn(
+    const proc = Bun.spawn(
       [
         'bun', 'run', AGENT_ENTRY, 'builder',
         '--system-prompt-file', promptFile,
@@ -119,9 +141,21 @@ describe('builder killed mid-session → resumable', () => {
           ...process.env,
           HOME: home,
           PATH: `${binDir}:${ctx.fakeClaudeBinDir}:${process.env.PATH ?? ''}`,
+          // A production builder belongs to no task turn. Whoever runs this
+          // suite may — `bun test` under a lazy agent inherits that agent's
+          // turn identity, and the MCP server the preflight spawns would then
+          // refuse to serve "another task's" tools. See mcp-env.ts.
+          ...TURN_IDENTITY_ENV_PINS,
         },
       },
     );
+    // Drain both streams into `supervisorOutput` so a failure can SAY why the
+    // supervisor never got as far as Claude Code. Without this the suite's only
+    // symptom is a 45s timeout with the real error (a refused preflight, a 401)
+    // sitting unread in a pipe — which is how it stayed silently red on main.
+    void new Response(proc.stdout).text().then(t => { supervisorOutput += t; });
+    void new Response(proc.stderr).text().then(t => { supervisorOutput += t; });
+    return proc;
   }
 
   /** Seed the intent `lazy upgrade` writes just before it stops a builder. */

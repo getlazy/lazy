@@ -311,6 +311,30 @@ describe('auto-resume on reconciliation', () => {
     expect(command.prompt).toContain('uncommitted changes in your worktree');
   });
 
+  // INVARIANT: a task pinned to a base commit (lazy clone --same-base / --base)
+  // is never merged with its parent by auto-resume, even on a clean worktree —
+  // one silent merge destroys the like-for-like comparison the pin exists for.
+  test('auto-resume skips upstream merge on a pinned clone', async () => {
+    const sourceId = await createTask(ctx, 'Pinned source', 'Do work');
+    const cloned = await ctx.lazy(['clone', sourceId, '--base', 'HEAD']);
+    expectSuccess(cloned);
+    const taskId = cloned.stdout.match(/Created task (\S+) —/)![1].replace(/\x1b\[[0-9;]*m/g, '');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
+
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+    setTaskStatus(ctx.root, fullTaskId, 'working');
+    consumeResponse(getProtocolDir(fullTaskId));
+
+    await runReconcileSubprocess(ctx.root, ctx.protocolBase);
+
+    const command = readCommand(getProtocolDir(fullTaskId)) as UnblockCommand;
+    expect(command).not.toBeNull();
+    expect(command.type).toBe('unblock');
+    expect(command.parent_branch).toBeUndefined();
+    expect(command.sync_before_work).toBe(false);
+  });
+
   test('consecutive_interruptions resets on successful turn completion', async () => {
     // 1. Create and start a task
     const taskId = await createTask(ctx, 'Reset counter test', 'Do work');

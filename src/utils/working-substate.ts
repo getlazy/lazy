@@ -4,9 +4,11 @@
  *
  *   - working(agent)            the agent (claude/cursor) is doing real work
  *   - working(agent:answering)  the agent is answering a question (`lazy ask`)
- *   - working(agent:pre-accept) the accept path is running its validation turn
+ *   - working(agent:reviewing)  a `lazy review` turn is running
  *   - working(waiting on X)     the agent is BLOCKED on a subtask (`lazy_wait`)
  *   - working(harness:<phase>)  the supervisor is doing pre/post-turn work
+ *   - working(launching)        no run YET: the daemon is still starting it
+ *                               (an image build can take minutes)
  *   - not-alive                 no live run and no response — a stranded candidate
  *
  * A task in `working` is otherwise opaque: a long `post_turn_check` (e.g.
@@ -24,6 +26,7 @@
 import { join } from 'path';
 import { readFile, stat } from 'fs/promises';
 import type { SupervisorPhase, SupervisorStatus } from '../protocol/types';
+import { normalizeSupervisorStatus } from '../protocol/types';
 import { readActiveWaits, type WaitingEntry } from '../protocol/waiting';
 import { readTaskProgress, type ProgressEntry } from '../protocol/progress';
 import { elapsedFrom } from './elapsed';
@@ -35,13 +38,8 @@ type WorkingSubstateKind =
       kind: 'agent';
       /** The turn is an `lazy ask` question, not ordinary work. */
       answering?: boolean;
-      /**
-       * The turn is the accept path's pre-accept validation turn. The task is
-       * genuinely `working` for its whole duration, and without this the only
-       * observable state during an accept was a bare `working` that looked
-       * exactly like the human having unblocked the task by hand.
-       */
-      preAccept?: boolean;
+      /** The turn is a `lazy review` agent review, not ordinary work. */
+      reviewing?: boolean;
     }
   | {
       kind: 'harness';
@@ -77,6 +75,16 @@ type WorkingSubstateKind =
       /** ISO timestamp the earliest in-flight wait started. */
       since?: string;
     }
+  | {
+      /**
+       * No run yet because the daemon is still STARTING one — resolving or
+       * building the image, then starting the container/process. The
+       * reconciler skips a task in this state (src/runner/launch-in-flight.ts),
+       * so rendering it `not-alive` would name a dead run nothing is about to
+       * act on — for the minutes an image build takes.
+       */
+      kind: 'launching';
+    }
   | { kind: 'not-alive' };
 
 /**
@@ -108,7 +116,71 @@ export interface LivenessContext {
    * before this existed.
    */
   progress?: ProgressEntry | null;
+  /**
+   * True when a launch of this task's run is in progress in the daemon
+   * (src/runner/launch-in-flight.ts). Only meaningful while the run is not
+   * alive yet. Process-local: only a surface running inside the daemon can
+   * know it, and every other surface leaves it unset.
+   */
+  launching?: boolean;
 }
+
+/**
+ * Supervisor phases that mean active post-work harness machinery is still
+ * running for a turn — the supervisor has NOT handed the task back.
+ *
+ * These legitimately run for minutes AFTER the agent is "done" (a
+ * `post_turn_check` can be a full `cargo build`; `post_turn_sync` merges
+ * upstream; pushback and the wrap-up steps re-invoke the agent) and only THEN
+ * does the supervisor write `response.json` to finalize the turn.
+ *
+ * Two readers, one rule:
+ *
+ *   - stranded-completion recovery (`src/utils/reconcile.ts`, which re-exports
+ *     this set) must never fire while one of these is the recorded phase: doing
+ *     so races the supervisor's own `writeResponse`, records commits before
+ *     post-turn sync settles (wrong end_sha / diff scope), and drops the
+ *     agent's real report. Only the supervisor's `response.json` finalizes a
+ *     turn — recovery is a fallback for when that will NEVER come (the run is
+ *     dead), not a shortcut around legitimate finalization.
+ *   - the daemon's own automatic launches (`src/daemon/supervisor-handback.ts`)
+ *     must not act on a task while one of these stands: the engineer's rule is
+ *     that the daemon reacts to a turn only once the supervisor has returned
+ *     control.
+ *
+ * It lives HERE, in the leaf module that already owns the phase vocabulary, so
+ * the daemon can read it without importing the reconciler's whole graph.
+ */
+export const ACTIVE_HARNESS_PHASES: ReadonlySet<string> = new Set([
+  'sync_with_remote',
+  'merge_and_fix',
+  'pre_turn_hook',
+  'permission_pushback',
+  // Maintained-files and reactive-automation follow-ups resume the agent for up
+  // to 10 minutes (screenshots, docs updates). Without these, stranded-completion
+  // recovery treats work_done as idle and can finalize the turn while the
+  // follow-up is still running — the same race permission_pushback was shielded against.
+  'maintain',
+  'react',
+  // The wrap-up phase runs the supervised chain (protected push-back, maintain,
+  // react, presentation) at the end of a turn — the same multi-minute agent
+  // invocations, so the same shield.
+  'wrap_up',
+  // The wrap-up's own steps: the presentation step resumes the agent for up to
+  // 10 minutes — the same shield applies to the individual step, not just the
+  // wrap_up umbrella, because updatePhase moves through the per-step phases
+  // while steps run.
+  'present',
+  // The leftovers nudge resumes the agent to commit or discard what the turn
+  // left in the worktree — another multi-minute invocation, and the one whose
+  // interruption costs the most: the turn is finalized with the very work it
+  // was in the middle of saving still uncommitted.
+  'commit_leftovers',
+  'post_turn_check',
+  'post_turn_sync',
+  'writing_response',
+  'retrying',
+]);
 
 /** Phases where the agent itself is the active thing. Everything else is harness work. */
 const AGENT_PHASES: ReadonlySet<SupervisorPhase> = new Set<SupervisorPhase>([
@@ -139,8 +211,8 @@ export function deriveWorkingSubstate(
     if (AGENT_PHASES.has(status.phase)) {
       // PRECEDENCE: waiting is the most specific thing we can say about an
       // agent-phase turn — the agent is provably parked inside a lazy tool call
-      // right now — so it outranks the ask/pre-accept flavors, which describe
-      // what the turn IS rather than what it is doing this second.
+      // right now — so it outranks the ask/review/wrap-up flavors, which
+      // describe what the turn IS rather than what it is doing this second.
       const waiting = deriveWaiting(ctx.waits);
       // The progress line is the AGENT's own account of what it is doing, so it
       // decorates only the kinds where the agent is the active thing. A harness
@@ -149,7 +221,7 @@ export function deriveWorkingSubstate(
       const progress = ctx.progress?.message || undefined;
       if (waiting) return { ...waiting, progress };
       if (status.command_type === 'ask') return { kind: 'agent', answering: true, progress };
-      if (status.command_type === 'pre_accept') return { kind: 'agent', preAccept: true, progress };
+      if (status.command_type === 'review') return { kind: 'agent', reviewing: true, progress };
       return { kind: 'agent', progress };
     }
     // A harness phase outranks any lingering wait marker: the supervisor, not
@@ -175,6 +247,9 @@ export function deriveWorkingSubstate(
   // is imminent — a finishing task, NOT a stranded one. Degrade to no substate
   // so we don't flag a healthy completion as not-alive.
   if (ctx.hasResponse) return null;
+
+  // Not started yet, rather than dead: the reconciler waits for this too.
+  if (ctx.launching) return { kind: 'launching' };
 
   // No live run and no response: a genuine stranded-completion candidate.
   return { kind: 'not-alive' };
@@ -218,7 +293,10 @@ export async function readSupervisorStatusAsync(protoDir: string): Promise<Super
     return null;
   }
   try {
-    return JSON.parse(raw) as SupervisorStatus;
+    // Normalized like the sync `readStatus`: a status file written by a
+    // pre-rename supervisor still spells the loop phases `ivan_*`, and every
+    // substate consumer switches on the current spelling only.
+    return normalizeSupervisorStatus(JSON.parse(raw) as SupervisorStatus);
   } catch (err) {
     logger.warn(`working-substate: corrupt status.json at ${filePath}: ${(err as Error).message}`);
     return null;
@@ -248,14 +326,26 @@ async function responseExists(protoDir: string): Promise<boolean> {
 export async function computeWorkingSubstate(
   protoDir: string,
   isAlive: boolean,
+  opts: {
+    /**
+     * Where the DAEMON-owned files (`waiting.json`, `progress.json`) live. They
+     * are keyed by task, so they are always in the task's own protocol dir —
+     * which is not `protoDir` when the run speaking for the task is a claimed
+     * review with a mailbox of its own (see src/utils/working-run.ts).
+     */
+    taskProtoDir?: string;
+    /** See {@link LivenessContext.launching}. */
+    launching?: boolean;
+  } = {},
 ): Promise<WorkingSubstate | null> {
+  const taskProtoDir = opts.taskProtoDir ?? protoDir;
   const [status, hasResponse, waits, progress] = await Promise.all([
     readSupervisorStatusAsync(protoDir),
     responseExists(protoDir),
-    readActiveWaits(protoDir),
-    readTaskProgress(protoDir),
+    readActiveWaits(taskProtoDir),
+    readTaskProgress(taskProtoDir),
   ]);
-  return deriveWorkingSubstate(status, { isAlive, hasResponse, waits, progress });
+  return deriveWorkingSubstate(status, { isAlive, hasResponse, waits, progress, launching: opts.launching });
 }
 
 /** Max error-snippet length inside a substate label (tighter than the watch header). */
@@ -298,7 +388,7 @@ function formatSubstateKind(
   switch (substate.kind) {
     case 'agent':
       if (substate.answering) return 'agent:answering';
-      if (substate.preAccept) return 'agent:pre-accept';
+      if (substate.reviewing) return 'agent:reviewing';
       return 'agent';
     case 'waiting': {
       // Name what is being waited on when we cheaply can — "waiting" alone
@@ -318,6 +408,8 @@ function formatSubstateKind(
       if (elapsed !== null) label += ` (${elapsed})`;
       return label;
     }
+    case 'launching':
+      return 'launching';
     case 'not-alive':
       return 'not-alive';
     case 'harness': {

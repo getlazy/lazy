@@ -16,9 +16,9 @@
  * A daemon restart is therefore a LIFECYCLE EVENT that invalidates every child
  * the previous daemon launched. This module is the shared signal for detecting
  * it. Nothing here decides what to do about it — see src/daemon/restart-reaper.ts
- * (task agents and builders, stopped by the new daemon at startup) and
- * src/supervisor/interactive.ts (pair sessions, which supervise themselves because
- * only the host side can resume an interactive terminal).
+ * (task agents, stopped by the new daemon at startup), src/builder/continuity.ts
+ * (builders, which supervise themselves in-container), and
+ * src/supervisor/interactive.ts (pair/chat on the host).
  *
  * WHY AN EXPLICIT INSTANCE ID
  * ---------------------------

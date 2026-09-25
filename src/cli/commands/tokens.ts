@@ -11,10 +11,12 @@
  * What it cannot cover is a process lazy did not launch.
  */
 import { join } from 'path';
-import { requireLazyRoot, parseFlags } from '../helpers';
+import { requireLazyRoot, requireStorage, resolveTaskOrExit, parseFlags } from '../helpers';
+import { displayId } from '../../task/identity';
+import { collectDescendantTasks } from '../../task/stats-data';
 import { loadConfig } from '../../config/loader';
 import { readAuditRecords } from '../../proxy/audit-log';
-import { theme, dim } from '../theme';
+import { theme, dim } from '../../render/theme';
 import { aggregateUsage, type TokenGroup, type TokenReport } from '../../proxy/aggregate';
 import { parseSince, parsePositiveInt } from './stats-flags';
 
@@ -99,6 +101,7 @@ export async function commandTokens(args: string[]): Promise<void> {
       { name: 'top', takesValue: true },
       { name: 'role', takesValue: true },
       { name: 'task', takesValue: true },
+      { name: 'subtree', takesValue: false },
       { name: 'json', takesValue: false },
     ],
     'stats tokens',
@@ -109,12 +112,43 @@ export async function commandTokens(args: string[]): Promise<void> {
   const top = parsePositiveInt(parsed.flags.get('top') as string | undefined, 'top', 10);
   const role = parsed.flags.get('role') as string | undefined;
   const taskId = parsed.flags.get('task') as string | undefined;
+  const subtree = parsed.flags.get('subtree') === true;
   const json = parsed.flags.get('json') === true;
 
+  if (subtree && !taskId) {
+    console.error('--subtree needs a task to descend from. Pass --task <id>.');
+    process.exit(1);
+  }
+
   const root = requireLazyRoot();
+
+  // `--task` alone is a plain id-prefix filter over the trail and needs no
+  // store. `--subtree` does: which tasks are under this one is a fact only the
+  // store knows, and the same walk the Stats tab uses answers it.
+  let subtreeIds: string[] | undefined;
+  let subtreeLabel = '';
+  if (subtree && taskId) {
+    const storage = await requireStorage();
+    try {
+      const task = await resolveTaskOrExit(storage, taskId);
+      const descendants = await collectDescendantTasks(storage, task.id);
+      subtreeIds = [task.id, ...descendants.map((d) => d.id)];
+      subtreeLabel = `${displayId(task)} + ${descendants.length} nested task(s)`;
+    } finally {
+      await storage.close();
+    }
+  }
+
   const config = await loadConfig(root);
   const records = await readAuditRecords(join(root, config.data.path), { limit });
-  const report = aggregateUsage(records, { sinceMs, role, taskId });
+  const report = aggregateUsage(records, {
+    sinceMs,
+    role,
+    // With --subtree the id set IS the filter; keeping the raw prefix too would
+    // narrow it back down to the root task.
+    taskId: subtreeIds ? undefined : taskId,
+    taskIds: subtreeIds,
+  });
 
   if (json) {
     console.log(JSON.stringify(report, null, 2));
@@ -123,17 +157,20 @@ export async function commandTokens(args: string[]): Promise<void> {
 
   if (report.totals.requests === 0) {
     console.log(
-      'No proxied requests recorded yet — run a task and retry.',
+      subtreeLabel
+        ? `No proxied requests recorded for ${subtreeLabel}.`
+        : 'No proxied requests recorded yet — run a task and retry.',
     );
     return;
   }
 
+  if (subtreeLabel) console.log(theme.label(`Subtree: ${subtreeLabel}`));
   renderReport(report, top);
   console.log('');
 }
 
 export function tokensUsage(): void {
-  console.log(`Usage: lazy stats tokens [--since <duration>] [--limit <n>] [--top <n>] [--role <role>] [--task <id>] [--json]
+  console.log(`Usage: lazy stats tokens [--since <duration>] [--limit <n>] [--top <n>] [--role <role>] [--task <id>] [--subtree] [--json]
 
 Token accounting from the proxy audit trail. The lazy proxy records one audit
 record per forwarded request — attributed to a role (builder/agent) and a task
@@ -156,6 +193,9 @@ Options:
   --top <n>            Max rows per breakdown (default 10)
   --role <role>        Only count this role (e.g. agent, builder)
   --task <id>          Only count this task (short-id prefix match)
+  --subtree            With --task, also count every descendant at every depth
+                       — what a hub (a release task, a loop) really spent. The
+                       By task breakdown then has one row per task in it.
   --json               Emit the full rollup as JSON (ignores --top)
 
 Examples:
@@ -163,5 +203,6 @@ Examples:
   lazy stats tokens --since 24h            # the last day
   lazy stats tokens --role agent --top 20  # agent traffic, 20 rows per breakdown
   lazy stats tokens --task add-proxy       # one task's spend
+  lazy stats tokens --task release-v022 --subtree   # that task and everything under it
   lazy stats tokens --json                 # machine-readable rollup`);
 }

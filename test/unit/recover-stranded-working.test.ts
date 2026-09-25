@@ -41,7 +41,7 @@ import { tmpdir } from 'os';
 import { FileStorage } from '../../src/storage';
 import { recoverStrandedWorkingTasks } from '../../src/utils/reconcile';
 import { protocolDir as getProtocolDir, ensureProtocolDir, writeStatus } from '../../src/protocol';
-import { getWorktreePathForRef, taskRef } from '../../src/cli/helpers';
+import { getWorktreePathForRef, taskRef } from '../../src/task/identity';
 import type { Runner } from '../../src/runner';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 
@@ -107,8 +107,8 @@ async function setupEnv(): Promise<Env> {
  * that changes the tree; otherwise it carries only an empty init commit.
  * Returns the task's short ref and full id.
  */
-async function makeWorkingTask(env: Env, goal: string, realWork: boolean): Promise<{ ref: string; taskId: string }> {
-  const task = await env.storage.createTask(goal, undefined, env.baseSha);
+async function makeWorkingTask(env: Env, goal: string, realWork: boolean, type?: string): Promise<{ ref: string; taskId: string }> {
+  const task = await env.storage.createTask(goal, undefined, env.baseSha, undefined, type);
   const ref = taskRef(task);
   const branch = `lazy/${ref}`;
 
@@ -180,6 +180,61 @@ describe('recoverStrandedWorkingTasks', () => {
     expect(commits.length).toBe(0);
   });
 
+  /** Advance main with a commit that adds a file, and merge it into the task's worktree the way self-sync does. */
+  async function mergeUpstreamInto(ref: string): Promise<void> {
+    await writeFile(join(env.lazyRoot, 'upstream.txt'), 'from the parent\n');
+    git(env.lazyRoot, 'add', 'upstream.txt');
+    git(env.lazyRoot, 'commit', '-m', 'parent moved');
+    const wt = getWorktreePathForRef(env.lazyRoot, ref);
+    expect(git(wt, 'merge', 'main', '--no-ff', '-m', 'Merge main').exitCode).toBe(0);
+  }
+
+  // INVARIANT: a merge commit is never evidence the agent finished. A working
+  // agent that self-synced and crashed has only the unrecorded sync merge; it
+  // must fall through to interrupted/auto-resume, not be parked as recovered.
+  test('does NOT recover a task whose only unrecorded work is a sync merge', async () => {
+    const { ref } = await makeWorkingTask(env, 'synced then crashed', false);
+    const session = await env.storage.getSessionByTaskId(ref);
+    const wt = getWorktreePathForRef(env.lazyRoot, ref);
+    // Record the init commit, as a finalized earlier turn would have.
+    await env.storage.createCommit(session!.id, git(wt, 'rev-parse', 'HEAD').stdout, 'init');
+    await mergeUpstreamInto(ref);
+
+    await recoverStrandedWorkingTasks(env.storage, env.lazyRoot, makeRunner(false));
+
+    expect((await env.storage.getTask(ref))?.status).toBe('working');
+  });
+
+  // INVARIANT: the real-work gate asks each non-merge commit about ITS OWN
+  // change. A range spanning a sync merge would count the upstream content the
+  // merge brought in as the agent's work and recover an empty turn.
+  test('does NOT recover an empty commit followed by a merge bringing upstream content', async () => {
+    const { ref } = await makeWorkingTask(env, 'empty then synced', false);
+    await mergeUpstreamInto(ref);
+
+    await recoverStrandedWorkingTasks(env.storage, env.lazyRoot, makeRunner(false));
+
+    expect((await env.storage.getTask(ref))?.status).toBe('working');
+  });
+
+  // INVARIANT: merges are excluded from the INFERENCE only. Real work alongside
+  // a merge still recovers, and the merge is backfilled with it.
+  test('recovers real work followed by a merge, and backfills both commits', async () => {
+    const { ref } = await makeWorkingTask(env, 'worked then synced', true);
+    await mergeUpstreamInto(ref);
+    const wt = getWorktreePathForRef(env.lazyRoot, ref);
+    const mergeSha = git(wt, 'rev-parse', 'HEAD').stdout;
+    const workSha = git(wt, 'rev-parse', 'HEAD^1').stdout;
+
+    await recoverStrandedWorkingTasks(env.storage, env.lazyRoot, makeRunner(false));
+
+    expect((await env.storage.getTask(ref))?.status).toBe('blocked');
+    const session = await env.storage.getSessionByTaskId(ref);
+    const shas = (await env.storage.getSessionCommits(session!.id)).map(c => c.sha);
+    expect(shas).toContain(mergeSha);
+    expect(shas).toContain(workSha);
+  });
+
   // INVARIANT 3: liveness is authoritative — a genuinely-alive run is NEVER
   // recovered, even with committed work.
   test('does NOT recover a task whose run is still alive', async () => {
@@ -225,6 +280,32 @@ describe('recoverStrandedWorkingTasks', () => {
     const session = await env.storage.getSessionByTaskId(ref);
     const commits = await env.storage.getSessionCommits(session!.id);
     expect(commits.length).toBe(0);
+  });
+
+  // INVARIANT 5: a `loop` task is NEVER a stranded completion. A loop's turn is
+  // orchestration: every `lazy_accept` of a child lands that child's work on the
+  // loop's branch DURING the loop's turn, so unrecorded commits are not evidence
+  // the loop's own turn finished. Recovering it to `blocked` strands it for good
+  // — only a newly added child wakes a blocked loop — which is exactly what
+  // happened when `lazy upgrade` killed identity-remote-clients-loop mid-turn
+  // (2026-09-14). Loops must fall through to interrupted/auto-resume instead.
+  test('does NOT recover a loop task whose branch carries child-accept merge commits', async () => {
+    const { ref } = await makeWorkingTask(env, 'drive the children serially', true, 'cluster');
+
+    await recoverStrandedWorkingTasks(env.storage, env.lazyRoot, makeRunner(false));
+
+    const task = await env.storage.getTask(ref);
+    expect(task?.type).toBe('cluster');
+    // Left for reconcileTask's interrupted path — never parked in `blocked`.
+    expect(task?.status).toBe('working');
+
+    const session = await env.storage.getSessionByTaskId(ref);
+    // The children's commits are not backfilled as the loop's own work, and no
+    // "[Recovered]" turn claims the loop finished.
+    const commits = await env.storage.getSessionCommits(session!.id);
+    expect(commits.length).toBe(0);
+    const turns = await env.storage.getSessionTurns(session!.id);
+    expect(turns.filter(t => t.role === 'agent').length).toBe(0);
   });
 
   // INVARIANT 4: re-running the sweep is idempotent — once blocked, the task is

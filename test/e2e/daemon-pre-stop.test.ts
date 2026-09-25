@@ -2,7 +2,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { chmod, mkdir, readFile, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { makeDaemonBaseDir, pinDaemonBaseDir } from '../helpers/daemon-base-dir';
-import { getDaemonDir, getSocketPath, getTokenPath } from '../../src/daemon/paths';
+import { getDaemonDir, getTokenPath, getWebPortPath } from '../../src/daemon/paths';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput, expectOutputExcludes } from '../helpers/assertions';
 import { createTask } from '../helpers/fixtures';
@@ -281,6 +281,9 @@ describe('lazy daemon stop — pre-stop warning', () => {
   // The stall is real, not simulated: a socket that accepts the connection and
   // never answers is exactly what a wedged daemon looks like to a client.
   test('reports builders as unknown when the storage lookup stalls', async () => {
+    const priorAllow = process.env.LAZY_ALLOW_HOST_RUNNER;
+    process.env.LAZY_ALLOW_HOST_RUNNER = '1';
+    try {
     const configPath = join(ctx.root, 'lazy.toml');
     const before = await readFile(configPath, 'utf-8');
     const after = before.replace(
@@ -294,13 +297,16 @@ describe('lazy daemon stop — pre-stop warning', () => {
     // real test daemon (or with the developer's own ~/.lazy/daemon).
     const baseDir = await makeDaemonBaseDir();
     const unpinBase = pinDaemonBaseDir(baseDir);
-    let server: ReturnType<typeof Bun.listen> | undefined;
+    let server: import('bun').TCPSocketListener | undefined;
     let inv: DaemonStopInventory;
     try {
       await mkdir(getDaemonDir(ctx.root), { recursive: true });
       await writeFile(getTokenPath(ctx.root), 'fake-token-for-a-wedged-daemon');
       // Accepts, then never replies — the client hangs until our deadline.
-      server = Bun.listen({ unix: getSocketPath(ctx.root), socket: { data() {}, open() {} } });
+      // Loopback, exactly like the daemon's default bind, with the web-port
+      // marker pointing at it so the client discovers this listener.
+      server = Bun.listen({ hostname: '127.0.0.1', port: 0, socket: { data() {}, open() {} } });
+      await writeFile(getWebPortPath(ctx.root), String(server.port));
 
       inv = await withPinnedConfig(() => collectDaemonStopInventory(ctx.root));
     } finally {
@@ -316,6 +322,10 @@ describe('lazy daemon stop — pre-stop warning', () => {
     // The report must never imply zero builders it did not verify.
     expect(out).toContain("builder sessions on this project's runner");
     expect(out).toContain('This list is INCOMPLETE');
+    } finally {
+      if (priorAllow === undefined) delete process.env.LAZY_ALLOW_HOST_RUNNER;
+      else process.env.LAZY_ALLOW_HOST_RUNNER = priorAllow;
+    }
   });
 
   test('lists discovered builder containers on a docker project', async () => {

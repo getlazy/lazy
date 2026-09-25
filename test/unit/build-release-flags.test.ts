@@ -30,10 +30,37 @@ const workflowsDir = join(projectRoot, '.github', 'workflows');
 
 /** Every environment variable that must not survive into a released binary. */
 const PROMPT_SEAMS = ['LAZY_FORCE_TTY', 'LAZY_PROMPT_DEFAULTS', 'LAZY_PROMPT_SECRET'];
+const HOST_RUNNER_SEAM = 'LAZY_ALLOW_HOST_RUNNER';
 
 async function bundleEditor(release: boolean): Promise<string> {
   const result = await Bun.build({
     entrypoints: [join(projectRoot, 'src', 'cli', 'editor.ts')],
+    target: 'bun',
+    minify: { syntax: true, whitespace: false, identifiers: false },
+    ...(release ? { define: { LAZY_RELEASE_BUILD: 'true' } } : {}),
+  });
+  expect(result.success).toBe(true);
+  const js = result.outputs.find((o) => o.path.endsWith('.js'));
+  expect(js).toBeDefined();
+  return await js!.text();
+}
+
+async function bundleManagedConfig(release: boolean): Promise<string> {
+  const result = await Bun.build({
+    entrypoints: [join(projectRoot, 'src', 'config', 'managed.ts')],
+    target: 'bun',
+    minify: { syntax: true, whitespace: false, identifiers: false },
+    ...(release ? { define: { LAZY_RELEASE_BUILD: 'true' } } : {}),
+  });
+  expect(result.success).toBe(true);
+  const js = result.outputs.find((o) => o.path.endsWith('.js'));
+  expect(js).toBeDefined();
+  return await js!.text();
+}
+
+async function bundleHostRunnerGate(release: boolean): Promise<string> {
+  const result = await Bun.build({
+    entrypoints: [join(projectRoot, 'src', 'runner', 'host-runner-gate.ts')],
     target: 'bun',
     minify: { syntax: true, whitespace: false, identifiers: false },
     ...(release ? { define: { LAZY_RELEASE_BUILD: 'true' } } : {}),
@@ -78,6 +105,26 @@ describe('release build strips the prompt test seams', () => {
     for (const seam of PROMPT_SEAMS) {
       expect(bundled).toContain(seam);
     }
+  });
+
+  test('the release managed-config bundle contains no read of LAZY_TEST_FORCE_MANAGED', async () => {
+    const bundled = await bundleManagedConfig(true);
+    expect(bundled).not.toContain('LAZY_TEST_FORCE_MANAGED');
+  });
+
+  test('a source managed-config build keeps LAZY_TEST_FORCE_MANAGED for the test seam', async () => {
+    const bundled = await bundleManagedConfig(false);
+    expect(bundled).toContain('LAZY_TEST_FORCE_MANAGED');
+  });
+
+  test('the release host-runner gate bundle contains no read of LAZY_ALLOW_HOST_RUNNER', async () => {
+    const bundled = await bundleHostRunnerGate(true);
+    expect(bundled).not.toContain(HOST_RUNNER_SEAM);
+  });
+
+  test('a source host-runner gate build keeps LAZY_ALLOW_HOST_RUNNER for the test seam', async () => {
+    const bundled = await bundleHostRunnerGate(false);
+    expect(bundled).toContain(HOST_RUNNER_SEAM);
   });
 
   // INVARIANT: --define alone is not enough. On bun 1.4.0 it folds the constant

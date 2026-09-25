@@ -10,6 +10,7 @@ import type { SearchResult } from '../storage/types';
 import type { Turn, Commit } from '../types';
 import { parseQuery, type QueryNode } from './parser';
 import { evaluateQuery, buildSearchResults, type TaskData } from './evaluator';
+import { entityTimeFromIso } from './ranking';
 import { levenshteinDistance } from '../utils/levenshtein';
 
 /** Substring match, tolerant of a missing haystack (see evaluator.ts). */
@@ -66,6 +67,26 @@ function extractMemoryTerms(node: QueryNode): string[] {
       return [];
     case 'in':
       if (node.scope === 'memories') return [node.value];
+      return [];
+    default:
+      return [];
+  }
+}
+
+/**
+ * Extract `in:scratch` search terms from a query AST.
+ * Captured builder scratch files are project-level entities (like conversations
+ * and memories), so they are searched separately from the per-task evaluation.
+ */
+function extractScratchTerms(node: QueryNode): string[] {
+  switch (node.type) {
+    case 'and':
+    case 'or':
+      return [...extractScratchTerms(node.left), ...extractScratchTerms(node.right)];
+    case 'not':
+      return [];
+    case 'in':
+      if (node.scope === 'scratch') return [node.value];
       return [];
     default:
       return [];
@@ -181,7 +202,7 @@ export async function structuredSearch(storage: Storage, query: string): Promise
   const tasks = await storage.listTasks();
   for (const task of tasks) {
     const comments = await storage.getTaskComments(task.id);
-    const followUps = await storage.getTaskFollowUps(task.id);
+    const raisedItems = await storage.getTaskRaisedItems(task.id);
     const session = await storage.getSessionByTaskId(task.id);
 
     let turns: Turn[] = [];
@@ -191,7 +212,7 @@ export async function structuredSearch(storage: Storage, query: string): Promise
       commits = await storage.getSessionCommits(session.id);
     }
 
-    const data: TaskData = { task, turns, commits, comments, followUps };
+    const data: TaskData = { task, turns, commits, comments, raisedItems };
 
     if (evaluateQuery(ast, data)) {
       const results = buildSearchResults(ast, data);
@@ -212,6 +233,7 @@ export async function structuredSearch(storage: Storage, query: string): Promise
             const key = `${conv.sessionId}:${term}`;
             if (!seen.has(key)) {
               seen.add(key);
+              const messageTime = entityTimeFromIso(msg.timestamp);
               allResults.push({
                 entity_type: 'conversation',
                 entity_id: conv.sessionId,
@@ -220,6 +242,7 @@ export async function structuredSearch(storage: Storage, query: string): Promise
                 task_goal: conv.summary || '(conversation)',
                 content: msg.text,
                 match_context: extractSearchContext(msg.text, term),
+                ...(messageTime !== undefined ? { entity_time: messageTime } : {}),
               });
             }
             break;
@@ -230,6 +253,9 @@ export async function structuredSearch(storage: Storage, query: string): Promise
           const key = `${conv.sessionId}:summary:${term}`;
           if (!seen.has(key)) {
             seen.add(key);
+            // The summary row speaks for the whole conversation; its recency
+            // is the conversation's end, falling back to import time.
+            const summaryTime = entityTimeFromIso(conv.endedAt) ?? conv.importedAt;
             allResults.push({
               entity_type: 'conversation',
               entity_id: conv.sessionId,
@@ -238,6 +264,7 @@ export async function structuredSearch(storage: Storage, query: string): Promise
               task_goal: conv.summary,
               content: conv.summary,
               match_context: conv.summary,
+              ...(summaryTime !== undefined ? { entity_time: summaryTime } : {}),
             });
           }
         }
@@ -268,6 +295,37 @@ export async function structuredSearch(storage: Storage, query: string): Promise
           task_goal: `memory: ${memory.name}`,
           content: memory.body,
           match_context: extractSearchContext(haystack, term),
+          entity_time: memory.updated_at,
+        });
+      }
+    }
+  }
+
+  // --- Builder scratch evaluation ---
+  // Path is searched alongside content so a file recorded by name only (binary
+  // or over-cap) is still findable — knowing the artifact exists, and that lazy
+  // declined to persist its body, is the useful answer in that case.
+  const scratchTerms = extractScratchTerms(ast);
+  if (scratchTerms.length > 0) {
+    const scratchFiles = await storage.listScratchFiles();
+    const seen = new Set<string>();
+
+    for (const file of scratchFiles) {
+      for (const term of scratchTerms) {
+        const haystack = `${file.path}\n${file.content}`;
+        if (!textContains(haystack, term)) continue;
+        const key = `${file.path}:${term}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        allResults.push({
+          entity_type: 'scratch',
+          entity_id: file.path,
+          task_id: file.path,
+          task_code: null,
+          task_goal: `scratch: ${file.path}`,
+          content: file.content,
+          match_context: extractSearchContext(haystack, term),
+          entity_time: file.updated_at,
         });
       }
     }

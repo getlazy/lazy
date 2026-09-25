@@ -28,8 +28,9 @@ import { join } from 'path';
  *      at two-space indentation, and the help listing lives in `usage()`
  *   2. completion's three tables are array/object literals of string literals
  *   3. flags are registered through `parseFlags(args, [...], '<label>')`, where
- *      the label is the command name (`'accept'`) or `'<parent> <sub>'`
- *      (`'daemon start'`)
+ *      the label is the command name (`'accept'` or `"doctor"`) or
+ *      `'<parent> <sub>'` (`'daemon start'`). Flag `name:` fields and the
+ *      label may use either quote style — the scanner must accept both.
  */
 
 const SRC = join(import.meta.dir, '../../src');
@@ -59,14 +60,42 @@ const LABEL_OWNER: Record<string, string> = {
  * Everything else a command accepts must tab-complete.
  */
 const UNCOMPLETED_FLAGS: Record<string, Array<{ flag: string; why: string }>> = {
+  'browse': [
+    { flag: 'stub-agent', why: 'test-only hook; not documented in browseUsage' },
+  ],
   'review': [
-    { flag: 'stub-agent', why: 'test-only hook; not documented in reviewUsage' },
+    // Lazy writes no reviews to a forge (engineer decision, 2026-09-21), so
+    // there is nothing left for --post to turn on. Registered only so an old
+    // script gets a message saying that, rather than "unknown flag" — same
+    // reason as `start --low-high-loop` below. Completing it would advertise a
+    // flag that does nothing.
+    { flag: 'post', why: 'retired no-op, registered only to explain that lazy does not post reviews to a PR' },
+  ],
+  'start': [
+    // Both registered only so a retired spelling gets a message naming its
+    // replacement instead of a generic "unknown flag". Offering either for
+    // completion would advertise a flag that always exits non-zero.
+    { flag: 'ivan-loop', why: 'removed spelling, registered only to reject with a pointer' },
+    // The low-high loop became a review MODE, so its flag is `--review` now.
+    // NOT aliased, deliberately: `--review off` means no review at all, which
+    // is not what `--low-high-loop off` meant (that is `--review separate`),
+    // and guessing between them on a flag that decides what a task costs to
+    // review is the wrong direction.
+    { flag: 'low-high-loop', why: 'retired spelling, registered only to reject with a pointer to --review' },
   ],
   'unblock': [
     // Registered as `{ name: 'f', aliases: ['f'] }` purely so the documented
     // `-f` spelling parses. `--f` is an artifact of that registration, not a
     // spelling anyone should be offered.
     { flag: 'f', why: 'artifact of registering the documented -f short flag' },
+    // Retired by move-file-approval-to-accept: protected-file approval happens
+    // at accept, and unblock reverts nothing. Both stay REGISTERED so a stale
+    // script gets an error naming `lazy accept` rather than "unknown flag" —
+    // same reason as `start --ivan-loop` above. Completing them is the one
+    // place that has no upside: it teaches the retired spelling to someone
+    // typing it fresh.
+    { flag: 'approve-file', why: 'retired spelling, registered only to reject with a pointer to accept' },
+    { flag: 'no-approve-files', why: 'retired spelling, registered only to reject with a pointer to accept' },
   ],
 };
 
@@ -121,9 +150,34 @@ export function stringArrayMapLiteral(src: string, decl: string): Record<string,
 }
 
 /**
+ * `name: 'foo'` or `name: "foo"` — both quote styles are legal in a
+ * parseFlags table. A scanner that only recognised single quotes treated
+ * doctor.ts (double-quoted names) as registering nothing, so every doctor
+ * flag looked like a stale completion.
+ */
+function flagNamesIn(src: string): string[] {
+  return [...src.matchAll(/name:\s*(?:'([^']+)'|"([^"]+)")/g)].map((m) => m[1] ?? m[2]);
+}
+
+/** Flag names of a `const <IDENT>[: type] = [ ... ];` array literal in `src`. */
+export function flagTableLiteral(src: string, ident: string): string[] | null {
+  const table = new RegExp(`const ${ident}[^=]*=\\s*\\[([\\s\\S]*?)\\n\\s*\\];`).exec(src);
+  if (!table) return null;
+  return flagNamesIn(table[1]);
+}
+
+/**
  * `parseFlags(<args>, <table>, '<label>')` calls in a source file, with the
- * flag names of the table. The table is either an inline array literal or an
- * identifier naming a `const <IDENT> = [...]` in the same file.
+ * flag names of the table. The table is an inline array literal, an identifier
+ * naming a `const <IDENT> = [...]`, or an inline literal that spreads such an
+ * identifier in (`[{ name: 'yes' }, ...RAISED_RESOLUTION_FLAGS]`).
+ *
+ * Identifiers defined in the same file are resolved here. Ones defined
+ * elsewhere are reported in `tables` for the caller to resolve by following the
+ * file's imports — `accept.ts` and `unblock.ts` both spread in the shared
+ * `RAISED_RESOLUTION_FLAGS` from `src/cli/raised-resolutions.ts`, and a scan
+ * that only looked in-file silently credited them with zero flags, so every
+ * shared flag read as "completion offers a flag parseFlags would reject".
  *
  * `label` is the string literal when there is one. `lazy show` passes a
  * variable (it reports itself as whichever alias invoked it), so the enclosing
@@ -131,8 +185,13 @@ export function stringArrayMapLiteral(src: string, decl: string): Record<string,
  */
 export function parseFlagsCalls(
   src: string,
-): Array<{ label: string | null; fn: string | null; names: string[] }> {
-  const out: Array<{ label: string | null; fn: string | null; names: string[] }> = [];
+): Array<{ label: string | null; fn: string | null; names: string[]; tables: string[] }> {
+  const out: Array<{
+    label: string | null;
+    fn: string | null;
+    names: string[];
+    tables: string[];
+  }> = [];
   let idx = 0;
   while ((idx = src.indexOf('parseFlags(', idx)) !== -1) {
     let depth = 0;
@@ -148,26 +207,51 @@ export function parseFlagsCalls(
     const call = src.slice(open + 1, i);
     idx = i;
 
-    const names = [...call.matchAll(/name:\s*'([^']+)'/g)].map((m) => m[1]);
-    // An identifier flag table: `parseFlags(args, BUILDER_FLAGS, 'builder')`.
-    const ident = /^\s*[A-Za-z0-9_]+\s*,\s*([A-Z][A-Za-z0-9_]*)\s*,/.exec(call);
-    if (ident) {
-      const table = new RegExp(`const ${ident[1]}[^=]*=\\s*\\[([\\s\\S]*?)\\n\\s*\\];`).exec(src);
-      if (table) names.push(...[...table[1].matchAll(/name:\s*'([^']+)'/g)].map((m) => m[1]));
+    const names = flagNamesIn(call);
+
+    // An identifier flag table: `parseFlags(args, BUILDER_FLAGS, 'builder')`,
+    // plus any table spread into an inline literal: `[..., ...SHARED_FLAGS]`.
+    const idents = [
+      ...(/^\s*[A-Za-z0-9_]+\s*,\s*([A-Z][A-Za-z0-9_]*)\s*,/.exec(call)?.slice(1, 2) ?? []),
+      ...[...call.matchAll(/\.\.\.([A-Z][A-Za-z0-9_]*)/g)].map((m) => m[1]),
+    ];
+    const tables: string[] = [];
+    for (const ident of idents) {
+      const resolved = flagTableLiteral(src, ident);
+      if (resolved) names.push(...resolved);
+      else tables.push(ident);
     }
 
-    // Trailing comma is optional — multi-line calls carry one.
-    const label = /,\s*'([a-z][a-z0-9 -]*)'\s*,?\s*$/.exec(call.trim());
+    // Trailing comma is optional — multi-line calls carry one. Single or
+    // double quotes: doctor.ts labels itself `"doctor"`.
+    const label = /,\s*(?:'([a-z][a-z0-9 -]*)'|"([a-z][a-z0-9 -]*)")\s*,?\s*$/.exec(
+      call.trim(),
+    );
     const enclosing = [
       ...src.slice(0, idx).matchAll(/function\s+command([A-Za-z0-9]+)\s*\(/g),
     ].pop();
     out.push({
-      label: label ? label[1] : null,
+      label: label ? (label[1] ?? label[2]) : null,
       fn: enclosing ? enclosing[1] : null,
       names,
+      tables: [...new Set(tables)],
     });
   }
   return out;
+}
+
+/**
+ * Resolve an identifier imported into `src` to the file that defines it,
+ * relative to `dir`. Only direct `import { X } from './rel/path'` is followed:
+ * that is how the shared flag tables are written, and anything else should
+ * fail loudly rather than be credited with no flags.
+ */
+export function importedFrom(src: string, ident: string, dir: string): string | null {
+  for (const m of src.matchAll(/import\s+(?:type\s+)?\{([^}]*)\}\s*from\s*'(\.[^']*)'/g)) {
+    const names = m[1].split(',').map((n) => n.trim().split(/\s+as\s+/).pop()!.trim());
+    if (names.includes(ident)) return join(dir, `${m[2]}.ts`);
+  }
+  return null;
 }
 
 /** `case '<sub>':` labels of a multiplexer's dispatcher switch. */
@@ -219,6 +303,33 @@ interface Surface {
   realFlags: Map<string, Set<string>>;
   /** parseFlags labels that don't start with a dispatch-table command name. */
   orphanLabels: string[];
+  /** `<file>: <IDENT>` flag tables the scan could not resolve to a literal. */
+  unresolvedTables: string[];
+}
+
+/**
+ * Completions that name a flag the command's parseFlags table would reject.
+ * Split out from the test so a planted drift can be run through the same
+ * comparison the real scan uses.
+ */
+export function staleCompletions(
+  commandFlags: Record<string, string[]>,
+  realFlags: Map<string, Set<string>>,
+): string[] {
+  const offenders: string[] = [];
+  for (const [cmd, flags] of Object.entries(commandFlags)) {
+    if (NO_PARSE_FLAGS_TABLE.has(cmd)) continue;
+    const real = realFlags.get(cmd);
+    if (!real) continue; // reported by the coverage guard below
+    const stale = flags.map((f) => f.replace(/^--/, '')).filter((f) => !real.has(f));
+    if (stale.length > 0) {
+      offenders.push(
+        `'${cmd}' tab-completes ${stale.map((f) => `--${f}`).join(', ')} but ` +
+          `parseFlags does not register ${stale.length > 1 ? 'them' : 'it'}`
+      );
+    }
+  }
+  return offenders;
 }
 
 async function readSurface(): Promise<Surface> {
@@ -229,9 +340,21 @@ async function readSurface(): Promise<Surface> {
 
   const realFlags = new Map<string, Set<string>>();
   const orphanLabels: string[] = [];
+  const unresolvedTables: string[] = [];
   for (const file of (await readdir(COMMANDS_DIR)).filter((f) => f.endsWith('.ts'))) {
     const src = await readFile(join(COMMANDS_DIR, file), 'utf-8');
     for (const call of parseFlagsCalls(src)) {
+      // A flag table defined in a sibling module (shared between commands):
+      // follow the import and read the literal there.
+      for (const ident of call.tables) {
+        const from = importedFrom(src, ident, COMMANDS_DIR);
+        const resolved = from
+          ? flagTableLiteral(await readFile(from, 'utf-8').catch(() => ''), ident)
+          : null;
+        if (resolved) call.names.push(...resolved);
+        else unresolvedTables.push(`${file}: ${ident}`);
+      }
+
       // `'daemon start'` belongs to `daemon`; `'accept'` to `accept`. With no
       // literal label, fall back to the enclosing `command<Name>()`.
       const label =
@@ -261,6 +384,7 @@ async function readSurface(): Promise<Surface> {
     commandFlags: stringArrayMapLiteral(compSrc, 'COMMAND_FLAGS'),
     realFlags,
     orphanLabels: [...new Set(orphanLabels)].sort(),
+    unresolvedTables: [...new Set(unresolvedTables)].sort(),
   };
 }
 
@@ -357,22 +481,39 @@ describe('CLI command discoverability', () => {
 
   test('COMMAND_FLAGS lists no flag the command would reject', async () => {
     const s = await readSurface();
-    const offenders: string[] = [];
 
-    for (const [cmd, flags] of Object.entries(s.commandFlags)) {
-      if (NO_PARSE_FLAGS_TABLE.has(cmd)) continue;
-      const real = s.realFlags.get(cmd);
-      if (!real) continue; // reported by the coverage guard below
-      const stale = flags.map((f) => f.replace(/^--/, '')).filter((f) => !real.has(f));
-      if (stale.length > 0) {
-        offenders.push(
-          `'${cmd}' tab-completes ${stale.map((f) => `--${f}`).join(', ')} but ` +
-            `parseFlags does not register ${stale.length > 1 ? 'them' : 'it'}`
-        );
-      }
+    expect(staleCompletions(s.commandFlags, s.realFlags)).toEqual([]);
+  });
+
+  // REGRESSION: `accept` and `unblock` spread the shared RAISED_RESOLUTION_FLAGS
+  // table in from src/cli/raised-resolutions.ts. The scan used to look for flag
+  // tables only inside src/cli/commands/, so both commands resolved to zero
+  // raised-resolution flags and the guard reported four correct completions as
+  // stale. Pin that the shared table now reaches both commands.
+  test('flags spread in from a shared table are attributed to both commands', async () => {
+    const s = await readSurface();
+
+    for (const cmd of ['accept', 'unblock']) {
+      expect([...s.realFlags.get(cmd)!]).toEqual(
+        expect.arrayContaining([
+          'respond-raised',
+          'promote-raised-subtask',
+          'promote-raised-peer',
+          'dismiss-raised',
+        ])
+      );
     }
+  });
 
-    expect(offenders).toEqual([]);
+  // The fix must not blunt the guard: a completion naming a flag no command
+  // registers still has to be reported.
+  test('a completion naming an unregistered flag is still reported', () => {
+    const real = new Map([['widget', new Set(['quiet'])]]);
+
+    expect(staleCompletions({ widget: ['--quiet', '--verbose'] }, real)).toEqual([
+      "'widget' tab-completes --verbose but parseFlags does not register it",
+    ]);
+    expect(staleCompletions({ widget: ['--quiet'] }, real)).toEqual([]);
   });
 
   test('every flag a command accepts is in COMMAND_FLAGS', async () => {
@@ -409,7 +550,7 @@ describe('CLI command discoverability', () => {
     // being scanned.
     expect([...s.realFlags.get('stats')!].sort()).toEqual(
       [
-        'json', 'limit', 'role', 'since', 'task', 'top', 'tree',
+        'json', 'limit', 'role', 'since', 'task', 'top', 'tree', 'subtree',
         'denied', 'errors', 'last', 'model', 'reroutes', 'scan',
       ].sort()
     );
@@ -423,14 +564,21 @@ describe('CLI command discoverability', () => {
     expect(s.dispatch.length).toBeGreaterThan(50);
     expect(s.allCommands.length).toBeGreaterThan(50);
     expect(Object.keys(s.commandFlags).length).toBeGreaterThan(40);
-    expect(Object.keys(s.multiplexers).sort()).toEqual(['daemon', 'memory', 'stats', 'system']);
+    expect(Object.keys(s.multiplexers).sort()).toEqual([
+      'artifact', 'conversations', 'customize', 'daemon', 'env', 'memory', 'messages', 'raised', 'scratch', 'stats', 'system',
+    ]);
     expect(Object.keys(s.subcommands).sort()).toEqual([
-      'config', 'daemon', 'memory', 'stats', 'system',
+      'artifact', 'config', 'conversations', 'customize', 'daemon', 'env', 'memory', 'messages', 'playground', 'raised', 'scratch', 'stats', 'system',
     ]);
 
     // Every unattributable parseFlags label must be explained. A new one means
     // a command's flags silently stopped being checked.
     expect(s.orphanLabels).toEqual(Object.keys(LABEL_OWNER).sort());
+
+    // Every flag table an identifier points at must resolve to a literal. An
+    // unresolved one credits its command with fewer flags than it accepts,
+    // which reads as "completion offers a flag parseFlags would reject".
+    expect(s.unresolvedTables).toEqual([]);
 
     // Every dispatch-table command either has a resolved flag table, has no
     // flags at all, or is a documented exception. Anything else means the
@@ -480,7 +628,7 @@ describe('CLI command discoverability', () => {
     ].join('\n');
 
     expect(parseFlagsCalls(src)).toEqual([
-      { label: 'widget', fn: 'Widget', names: ['quiet', 'output'] },
+      { label: 'widget', fn: 'Widget', names: ['quiet', 'output'], tables: [] },
     ]);
     expect(stringArrayMapLiteral(compSrc, 'COMMAND_FLAGS')).toEqual({
       widget: ['--quiet', '--verbose'],
@@ -499,8 +647,71 @@ describe('CLI command discoverability', () => {
     ].join('\n');
 
     expect(parseFlagsCalls(src)).toEqual([
-      { label: 'gadget widget', fn: 'Widget', names: ['force'] },
+      { label: 'gadget widget', fn: 'Widget', names: ['force'], tables: [] },
     ]);
+  });
+
+  test('reads a spread flag table, in-file and imported', () => {
+    const inFile = [
+      'const SHARED_FLAGS: FlagDefinition[] = [',
+      "  { name: 'shared', takesValue: true },",
+      '];',
+      'export async function commandWidget(args: string[]): Promise<void> {',
+      '  const parsed = parseFlags(args, [',
+      "    { name: 'quiet', takesValue: false },",
+      '    ...SHARED_FLAGS,',
+      "  ], 'widget');",
+      '}',
+    ].join('\n');
+
+    expect(parseFlagsCalls(inFile)).toEqual([
+      { label: 'widget', fn: 'Widget', names: ['quiet', 'shared'], tables: [] },
+    ]);
+
+    // Defined elsewhere: reported for the caller to resolve by import, never
+    // silently dropped.
+    const imported = [
+      "import { SHARED_FLAGS } from '../shared-flags';",
+      'export async function commandWidget(args: string[]): Promise<void> {',
+      '  const parsed = parseFlags(args, [',
+      "    { name: 'quiet', takesValue: false },",
+      '    ...SHARED_FLAGS,',
+      "  ], 'widget');",
+      '}',
+    ].join('\n');
+
+    expect(parseFlagsCalls(imported)).toEqual([
+      { label: 'widget', fn: 'Widget', names: ['quiet'], tables: ['SHARED_FLAGS'] },
+    ]);
+    expect(importedFrom(imported, 'SHARED_FLAGS', '/src/cli/commands')).toBe(
+      '/src/cli/shared-flags.ts'
+    );
+    expect(importedFrom(imported, 'OTHER_FLAGS', '/src/cli/commands')).toBeNull();
+    expect(flagTableLiteral(inFile, 'SHARED_FLAGS')).toEqual(['shared']);
+    expect(flagTableLiteral(inFile, 'MISSING_FLAGS')).toBeNull();
+  });
+
+  // INVARIANT: parseFlags tables may quote names and the label with " or '.
+  // A single-quote-only scanner treated doctor.ts as registering no flags.
+  test('reads double-quoted flag names and labels', () => {
+    const src = [
+      'export async function commandWidget(args: string[]): Promise<void> {',
+      '  const parsed = parseFlags(args, [',
+      '    { name: "quiet", takesValue: false },',
+      '    { name: "fix", takesValue: true },',
+      '  ], "widget");',
+      '}',
+    ].join('\n');
+    expect(parseFlagsCalls(src)).toEqual([
+      { label: 'widget', fn: 'Widget', names: ['quiet', 'fix'], tables: [] },
+    ]);
+
+    const tableSrc = [
+      'const SHARED_FLAGS: FlagDefinition[] = [',
+      '  { name: "shared", takesValue: true },',
+      '];',
+    ].join('\n');
+    expect(flagTableLiteral(tableSrc, 'SHARED_FLAGS')).toEqual(['shared']);
   });
 
   test('reads documented subcommands and switch cases', () => {

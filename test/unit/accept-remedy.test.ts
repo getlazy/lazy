@@ -96,4 +96,17 @@ describe('command composition', () => {
     expect(shellQuote("it's.md")).toBe(String.raw`'it'\''s.md'`);
     expect(acceptWithApprovedFilesCommand('abc', ['a b.ts'])).toBe("lazy accept abc --approve-file 'a b.ts'");
   });
+
+  // A protection-gate paste of `lazy accept <id>` on a conflict task would
+  // miss --approve-file and look like a revert. The typed --reason belongs
+  // on the same line so the human does not retype it.
+  test('appends --reason after the approved files', () => {
+    expect(acceptWithApprovedFilesCommand('abc123', ['src/a.ts'], { reason: 'ship it' })).toBe(
+      'lazy accept abc123 --approve-file src/a.ts --reason \'ship it\'',
+    );
+  });
+
+  test('omits --reason when it is blank', () => {
+    expect(acceptWithApprovedFilesCommand('abc123', [], { reason: '  ' })).toBe('lazy accept abc123');
+  });
 });

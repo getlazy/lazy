@@ -1,203 +1,21 @@
 import { join } from 'path';
-import { requireLazyRoot, requireStorage, displayId, buildDisplayIdMap, formatDate, formatDuration, formatTokenUsage, parseFlags, taskRef, resolveTaskOrExit } from '../helpers';
-import type { Task, Session, Storage } from '../../storage';
-
-import { protocolDir as getProtocolDir, readStatus } from '../../protocol';
-import { createRunner } from '../../runner';
-import { theme } from '../theme';
+import { formatDate, formatDuration } from '../../utils/format';
+import { displayId, buildDisplayIdMap } from '../../task/identity';
+import { requireLazyRoot, requireStorage, parseFlags, resolveTaskOrExit } from '../helpers';
+import type { Task } from '../../storage';
+import { buildTaskTree, collectActiveTasks, type TaskWithSession } from '../../task/tree';
+import { theme } from '../../render/theme';
 import { queryTaskList, queryBlockedTasks, queryActiveTasks } from '../../daemon/rpc-fallback';
 import { parentTaskIdOf, collectSubtreeIds, pruneTasksToDepth } from '../../task-target';
 import { normalizeTag } from '../../utils/tags';
-import { computeWorkingSubstate, renderWorkingStatus, type WorkingSubstate } from '../../utils/working-substate';
-import { orderQueuedTasks } from '../../daemon/concurrency';
-import { loadConfig } from '../../config/loader';
-import { logger } from '../../utils/logger';
-import { listSlowLaneQueue, getLastProjectAutoResumeAt } from '../../daemon/auto-resume-queue';
+import { renderWorkingStatus } from '../../utils/working-substate';
 import { describeExpiry } from '../../utils/local-day';
 import {
-  loadProtectionContext,
-  contextIsInert,
-  protectionStatusForTask,
   protectionMarkers,
   PROTECTION_MARKER_LEGEND,
-  type TaskProtectionStatus,
 } from '../../protection/status';
-
-export interface TaskWithSession {
-  task: Task;
-  session: Session | null;
-  turnCount: number;
-  children: TaskWithSession[];
-  retryCount?: number;
-  crashed?: boolean;
-  /**
-   * Derived working substate (agent / harness:<phase> / not-alive) for `working`
-   * tasks. Observational only — never changes task state. Undefined for
-   * non-working tasks or when no substate can be derived.
-   */
-  workingSubstate?: WorkingSubstate;
-  /**
-   * 1-based drain position for a `queued` task (highest priority / oldest first),
-   * with the total queued count. Undefined for non-queued tasks. Computed against
-   * ALL queued tasks in the project, so it is correct in any filtered view.
-   */
-  queuePosition?: { position: number; total: number };
-  /**
-   * Read-only protection status, present only when the project protects
-   * anything. Undefined in a stock project so nothing is computed and nothing
-   * is rendered — list output stays byte-for-byte what it was.
-   */
-  protection?: TaskProtectionStatus;
-  /**
-   * Slow-lane auto-resume queue position (src/daemon/auto-resume-queue.ts),
-   * present only for `interrupted` tasks whose fast-lane circuit breaker has
-   * tripped and are now waiting for a round-robin retry. Undefined otherwise —
-   * including when daemon.auto_resume is off, since nothing is queued then.
-   */
-  autoResume?: { attempts: number; maxAttempts: number; nextEligibleAt: number };
-  /**
-   * How many descendants of this task were elided by a `--levels` limit.
-   * Present only on the deepest visible rows of a depth-limited listing, so a
-   * truncated view always says what it is not showing. Undefined otherwise.
-   */
-  hiddenDescendants?: number;
-}
-
-export async function buildTaskTree(
-  storage: Storage,
-  tasks: Task[],
-  lazyRoot: string,
-  opts: { hiddenDescendants?: Map<string, number> } = {},
-): Promise<TaskWithSession[]> {
-  const runner = await createRunner(lazyRoot);
-  const taskMap = new Map<string, TaskWithSession>();
-
-  // Protection facts resolved ONCE for the whole listing: one config read, one
-  // default-branch lookup, one resolve per protected entry — not N of each. An
-  // inert context (nothing protected anywhere) skips the per-task work below.
-  let protectionCtx = null as Awaited<ReturnType<typeof loadProtectionContext>> | null;
-  const config = await loadConfig(lazyRoot);
-  try {
-    const ctx = await loadProtectionContext(storage, config, lazyRoot);
-    if (!contextIsInert(ctx)) protectionCtx = ctx;
-  } catch (err) {
-    // A listing must never fail over an advisory marker.
-    logger.debug(`Protection markers unavailable for this listing: ${err instanceof Error ? err.message : err}`);
-  }
-
-  // Slow-lane auto-resume queue positions, computed once against ALL tasks
-  // (same reasoning as queuePos below — the queue's round-robin order is a
-  // project-wide fact, not scoped to this view). Skipped entirely when
-  // nothing is interrupted or auto_resume is off, so a stock listing pays
-  // nothing extra.
-  const autoResumeMap = new Map<string, { attempts: number; maxAttempts: number; nextEligibleAt: number }>();
-  if (config.daemon.auto_resume && tasks.some(t => t.status === 'interrupted')) {
-    try {
-      const now = Date.now();
-      const queue = await listSlowLaneQueue(storage, config, now);
-      const dataDir = join(lazyRoot, config.data.path);
-      const lastProjectAttempt = await getLastProjectAutoResumeAt(dataDir);
-      const gapMs = config.daemon.auto_resume_gap_minutes * 60_000;
-      const gapEligibleAt = lastProjectAttempt === null ? now : lastProjectAttempt + gapMs;
-      queue.forEach((entry, i) => {
-        const nextEligibleAt = Math.max(entry.intervalEligibleAt, i === 0 ? gapEligibleAt : 0);
-        autoResumeMap.set(entry.task.id, { attempts: entry.attempts, maxAttempts: entry.maxAttempts, nextEligibleAt });
-      });
-    } catch (err) {
-      // Observational only — never fail a listing over queue visibility.
-      logger.debug(`Slow-lane queue unavailable for this listing: ${err instanceof Error ? err.message : err}`);
-    }
-  }
-
-  // Drain-order positions for queued tasks, computed once against ALL queued
-  // tasks in the project (not just this view) so "#N of M" is globally correct.
-  const queuePos = new Map<string, { position: number; total: number }>();
-  if (tasks.some(t => t.status === 'queued')) {
-    const allQueued = await storage.listTasksWithOptions({ queuedOnly: true });
-    const ordered = orderQueuedTasks(allQueued);
-    ordered.forEach((t, i) => queuePos.set(t.id, { position: i + 1, total: ordered.length }));
-  }
-
-  // Create nodes for all tasks
-  for (const task of tasks) {
-    const session = await storage.getSessionByTaskId(task.id);
-    let retryCount: number | undefined;
-    let crashed = false;
-    let isAlive = false;
-    let workingSubstate: WorkingSubstate | undefined;
-
-    // Probe run liveness for non-terminal tasks. One runner call feeds both the
-    // crashed indicator and the working-substate derivation.
-    if (session && !['complete', 'abandoned'].includes(task.status)) {
-      const tRef = taskRef(task);
-      const cn = session.container_name ?? runner.runNameForTask(tRef);
-      const info = await runner.getRunInfo(cn);
-      if (info && !info.running) {
-        crashed = true;
-      }
-      isAlive = info?.running === true;
-    }
-
-    if (task.status === 'working' && session) {
-      const protoDir = getProtocolDir(task.id);
-
-      // Derive the working substate (agent / harness:<phase> / not-alive) from
-      // status.json + liveness — the single shared derivation used by every
-      // read surface.
-      workingSubstate = (await computeWorkingSubstate(protoDir, isAlive)) ?? undefined;
-
-      // Retry count (when retrying) is surfaced separately alongside the substate.
-      const status = readStatus(protoDir);
-      if (status?.phase === 'retrying' && status.retryCount !== undefined) {
-        retryCount = status.retryCount;
-      }
-    }
-
-    let protection: TaskProtectionStatus | undefined;
-    if (protectionCtx) {
-      try {
-        protection = await protectionStatusForTask(storage, protectionCtx, task, {
-          hasBranch: Boolean(session?.git_branch),
-        });
-      } catch (err) {
-        logger.debug(`Task ${task.id}: could not resolve protection status: ${err instanceof Error ? err.message : err}`);
-      }
-    }
-
-    taskMap.set(task.id, {
-      task,
-      session,
-      turnCount: await storage.getTurnCountByTaskId(task.id),
-      children: [],
-      retryCount,
-      crashed,
-      workingSubstate,
-      queuePosition: task.status === 'queued' ? queuePos.get(task.id) : undefined,
-      protection,
-      autoResume: autoResumeMap.get(task.id),
-      hiddenDescendants: opts.hiddenDescendants?.get(task.id),
-    });
-  }
-
-  // Build tree structure
-  const roots: TaskWithSession[] = [];
-  for (const node of taskMap.values()) {
-    const parentId = parentTaskIdOf(node.task);
-    if (parentId) {
-      const parent = taskMap.get(parentId);
-      if (parent) {
-        parent.children.push(node);
-      } else {
-        // Parent not in filtered list, treat as root
-        roots.push(node);
-      }
-    } else {
-      roots.push(node);
-    }
-  }
-
-  return roots;
-}
+import { isLinkedTask } from '../../task/linked';
+import { isStoppedParked } from '../../task/user-stop';
 
 /**
  * Sort TaskWithSession nodes by last_interaction_at DESC (most recently active first).
@@ -219,6 +37,58 @@ function formatTurnCount(turnCount: number): string {
   return String(turnCount);
 }
 
+/** Fixed width for the AGENT column — fits the longest registered agent id. */
+const TASK_LIST_AGENT_COL_WIDTH = 12;
+
+/** Bare agent id for listing rows (always shown, including the project default). */
+function taskListAgentLabel(task: Task): string {
+  return task.agent_id || '-';
+}
+
+/** Tree-view column headers shared by list, active, blocked, and loop. */
+export function printTaskListTreeHeader(): void {
+  console.log(
+    `${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ` +
+    `${theme.header('TYPE'.padEnd(10))} ${theme.header('TURNS'.padEnd(8))} ${theme.header('LAST ACTIVE'.padEnd(18))} ` +
+    `${theme.header('DURATION'.padEnd(10))} ${theme.header('AGENT'.padEnd(TASK_LIST_AGENT_COL_WIDTH))} ${theme.header('GOAL')}`,
+  );
+  console.log(theme.separator(
+    `${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(8)} ` +
+    `${'─'.repeat(18)} ${'─'.repeat(10)} ${'─'.repeat(TASK_LIST_AGENT_COL_WIDTH)} ${'─'.repeat(30)}`,
+  ));
+}
+
+/** Flat-view column headers shared by list, active, and blocked. */
+function printTaskListFlatHeader(): void {
+  console.log(
+    `${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ` +
+    `${theme.header('AGENT'.padEnd(TASK_LIST_AGENT_COL_WIDTH))} ${theme.header('TYPE'.padEnd(10))} ` +
+    `${theme.header('PARENT'.padEnd(18))} ${theme.header('CREATED'.padEnd(18))} ${theme.header('GOAL')}`,
+  );
+  console.log(theme.separator(
+    `${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(TASK_LIST_AGENT_COL_WIDTH)} ` +
+    `${'─'.repeat(10)} ${'─'.repeat(18)} ${'─'.repeat(18)} ${'─'.repeat(30)}`,
+  ));
+}
+
+/** Format the fixed-width data columns for a tree-view row (excludes CODE/connector). */
+function formatTaskListTreeDataCells(node: TaskWithSession, status: string): string {
+  const task = node.task;
+  const sess = node.session;
+  const lastInteraction = sess?.last_interaction_at ? formatDate(sess.last_interaction_at) : '-';
+  const duration = sess ? formatDuration(sess.total_duration_ms) : '-';
+  const turns = formatTurnCount(node.turnCount);
+  const model = task.model ?? '-';
+  const taskType = task.type ?? 'task';
+  const agent = taskListAgentLabel(task);
+
+  return (
+    `${theme.pad(theme.status(status), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ` +
+    `${turns.padEnd(8)} ${theme.pad(theme.timestamp(lastInteraction), 18)} ${theme.pad(theme.duration(duration), 10)} ` +
+    `${theme.pad(agent, TASK_LIST_AGENT_COL_WIDTH)}`
+  );
+}
+
 /** Count tasks with crashed containers across a tree. */
 export function countCrashed(nodes: TaskWithSession[]): number {
   let count = 0;
@@ -234,7 +104,11 @@ export function printCrashedFootnote(crashedCount: number): void {
   if (crashedCount > 0) {
     console.log('');
     console.log(theme.warning(
-      `${crashedCount} task(s) have crashed containers. Run \`lazy doctor\` for details and auto-resume.`
+      // Doctor reports these and never resumes any of them on its own. It does
+      // not promise more than that here: this count is "the run is gone",
+      // whatever status the task holds, and only the INTERRUPTED subset is
+      // resumable at all (`lazy doctor --resume-interrupted-tasks`).
+      `${crashedCount} task(s) have crashed containers. Run \`lazy doctor\` for details.`
     ));
   }
 }
@@ -259,17 +133,6 @@ export function printTaskTree(node: TaskWithSession, prefix: string = '', isLast
     status = renderWorkingStatus(node.workingSubstate);
   }
 
-  // Queued tasks: show drain position ("queued #2 of 3") and priority so a
-  // glance at list/active reveals which tasks are waiting and in what order.
-  if (task.status === 'queued') {
-    if (node.queuePosition) {
-      status = `queued #${node.queuePosition.position} of ${node.queuePosition.total}`;
-    }
-    if (task.priority !== 'normal') {
-      status = `${status} (${task.priority})`;
-    }
-  }
-
   // Add retry count to status if retrying — unless the substate label already
   // carries it (working(harness:retrying attempt N: ...)), which would otherwise
   // print the same number twice on one line.
@@ -290,10 +153,14 @@ export function printTaskTree(node: TaskWithSession, prefix: string = '', isLast
     status = `${status} [CRASHED]`;
   }
 
-  // Indicate user-stopped interrupted tasks (parallel to [CRASHED]).
-  // [STOPPED] means the reconciler will NOT auto-resume; a manual
-  // resume/unblock is required.
-  if (task.status === 'interrupted' && sess?.user_stopped) {
+  // Indicate user-stopped tasks (parallel to [CRASHED]). [STOPPED] means the
+  // reconciler will NOT auto-resume; a manual resume/unblock is required. A
+  // stop parks the task `blocked` (or `conflict` with pending file
+  // violations), indistinguishable from a finished turn without this marker;
+  // `interrupted` covers sessions stopped before that change. Not `working`:
+  // a builder unblock leaves the flag set until that turn completes.
+  // The rule is shared with lazy_list's `stopped` field (isStoppedParked).
+  if (isStoppedParked(task.status, sess)) {
     status = `${status} [STOPPED]`;
   }
 
@@ -316,15 +183,7 @@ export function printTaskTree(node: TaskWithSession, prefix: string = '', isLast
   const childPrefix = depth === 0 ? '' : (isLast ? '   ' : '│  ');
 
   // Format session info
-  const lastInteraction = sess?.last_interaction_at ? formatDate(sess.last_interaction_at) : '-';
-  const duration = sess ? formatDuration(sess.total_duration_ms) : '-';
-  const turns = formatTurnCount(node.turnCount);
-  const tokens = formatTokenUsage(sess?.total_usage ?? null);
-
-  // Print task row
   const code = displayId(task);
-  const model = task.model ?? '-';
-  const taskType = task.type ?? 'task';
   const goal = task.goal.length > 30
     ? task.goal.substring(0, 28) + '..'
     : task.goal;
@@ -332,20 +191,19 @@ export function printTaskTree(node: TaskWithSession, prefix: string = '', isLast
 
   const codeWithPrefix = `${prefix}${connector}${code}`;
   const fitsOnOneLine = codeWithPrefix.length <= 20;
+  const dataCells = formatTaskListTreeDataCells(node, status);
 
   if (fitsOnOneLine) {
     // Code fits in CODE column — single line
     console.log(
-      `${prefix}${connector}${theme.pad(theme.taskId(code), 20 - prefix.length - connector.length)} ${theme.pad(theme.status(status), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${turns.padEnd(8)} ${theme.pad(theme.timestamp(lastInteraction), 18)} ${theme.pad(theme.duration(duration), 10)} ${theme.pad(theme.duration(tokens), 14)} ${goalWithTags}`
+      `${prefix}${connector}${theme.pad(theme.taskId(code), 20 - prefix.length - connector.length)} ${dataCells} ${goalWithTags}`,
     );
   } else {
     // Code too wide — code on first line, data on second
     console.log(`${prefix}${connector}${theme.taskId(code)}`);
     const dataPrefix = prefix + childPrefix;
     const dataPad = Math.max(0, 20 - dataPrefix.length);
-    console.log(
-      `${dataPrefix}${' '.repeat(dataPad)} ${theme.pad(theme.status(status), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${turns.padEnd(8)} ${theme.pad(theme.timestamp(lastInteraction), 18)} ${theme.pad(theme.duration(duration), 10)} ${theme.pad(theme.duration(tokens), 14)} ${goalWithTags}`
-    );
+    console.log(`${dataPrefix}${' '.repeat(dataPad)} ${dataCells} ${goalWithTags}`);
   }
 
   // Print children
@@ -422,11 +280,12 @@ function filterTreeByTag(tree: TaskWithSession[], tag: string): TaskWithSession[
 function goalCell(node: TaskWithSession, goal: string): string {
   const markers = node.protection ? protectionMarkers(node.protection) : '';
   const prefix = markers ? `${theme.warning(markers)} ` : '';
+  const linked = isLinkedTask(node.task) ? ` ${theme.label('[linked]')}` : '';
   // Elision note last: a depth-limited listing must never look complete.
   const hidden = node.hiddenDescendants
     ? ` ${theme.warning(`(+${node.hiddenDescendants} hidden)`)}`
     : '';
-  return `${prefix}${goal}${tagSuffix(node.task)}${hidden}`;
+  return `${prefix}${goal}${linked}${tagSuffix(node.task)}${hidden}`;
 }
 
 /** Total descendants elided by a `--levels` limit across a rendered tree. */
@@ -509,8 +368,7 @@ function renderListOutput(
   }
 
   if (opts.showTree) {
-    console.log(`${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ${theme.header('TYPE'.padEnd(10))} ${theme.header('TURNS'.padEnd(8))} ${theme.header('LAST ACTIVE'.padEnd(18))} ${theme.header('DURATION'.padEnd(10))} ${theme.header('TOKENS IN/OUT'.padEnd(14))} ${theme.header('GOAL')}`);
-    console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(8)} ${'─'.repeat(18)} ${'─'.repeat(10)} ${'─'.repeat(14)} ${'─'.repeat(30)}`));
+    printTaskListTreeHeader();
 
     for (const rootNode of tree) {
       printTaskTree(rootNode);
@@ -519,19 +377,10 @@ function renderListOutput(
     // Flat list
     const nodes = flattenTree(tree);
     const parentDisplayId = buildDisplayIdMap(nodes.map(n => n.task));
-    console.log(`${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ${theme.header('TYPE'.padEnd(10))} ${theme.header('PARENT'.padEnd(18))} ${theme.header('CREATED'.padEnd(18))} ${theme.header('GOAL')}`);
-    console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(18)} ${'─'.repeat(18)} ${'─'.repeat(30)}`));
+    printTaskListFlatHeader();
 
     for (const node of nodes) {
-      const task = node.task;
-      const parentId = parentTaskIdOf(task);
-      const parent = parentId ? theme.taskId(parentDisplayId(parentId)) : '-';
-      const code = displayId(task);
-      const model = task.model ?? '-';
-      const taskType = task.type ?? 'task';
-      console.log(
-        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(flatStatusText(node)), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${goalCell(node, task.goal)}`
-      );
+      console.log(formatTaskListFlatRow(node, parentDisplayId));
     }
   }
 
@@ -548,12 +397,27 @@ function flatStatusText(node: TaskWithSession): string {
   if (node.task.status === 'working' && node.workingSubstate) {
     return renderWorkingStatus(node.workingSubstate);
   }
-  // Queued: drain position + non-default priority, matching the tree view.
-  if (node.task.status === 'queued' && node.queuePosition) {
-    const base = `queued #${node.queuePosition.position}/${node.queuePosition.total}`;
-    return node.task.priority !== 'normal' ? `${base} (${node.task.priority})` : base;
-  }
   return node.task.status;
+}
+
+/** Format one flat-list row (shared by list, active, and blocked). */
+function formatTaskListFlatRow(
+  node: TaskWithSession,
+  parentDisplayId: ReturnType<typeof buildDisplayIdMap>,
+): string {
+  const task = node.task;
+  const parentId = parentTaskIdOf(task);
+  const parent = parentId ? theme.taskId(parentDisplayId(parentId)) : '-';
+  const code = displayId(task);
+  const model = task.model ?? '-';
+  const taskType = task.type ?? 'task';
+  const agent = taskListAgentLabel(task);
+
+  return (
+    `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(flatStatusText(node)), 12)} ` +
+    `${theme.pad(theme.model(model), 8)} ${theme.pad(agent, TASK_LIST_AGENT_COL_WIDTH)} ${theme.pad(taskType, 10)} ` +
+    `${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${goalCell(node, task.goal)}`
+  );
 }
 
 /** Flatten a TaskWithSession tree into a flat array, depth-first. */
@@ -564,22 +428,6 @@ function flattenTree(nodes: TaskWithSession[]): TaskWithSession[] {
     result.push(...flattenTree(node.children));
   }
   return result;
-}
-
-/**
- * The task set the `active` views show: non-terminal tasks with a session, plus
- * queued tasks. Queued tasks have no session yet (they were gated before session
- * creation), so `withSessionsOnly` misses them — but they ARE in flight and
- * belong in the active view so a queued backlog is diagnosable.
- *
- * Shared by the daemon `active` RPC handler and the CLI's follow loop so both
- * views always agree on what "active" means.
- */
-export async function collectActiveTasks(storage: Storage): Promise<Task[]> {
-  const active = await storage.listTasksWithOptions({ withSessionsOnly: true, nonTerminalOnly: true });
-  const queued = await storage.listTasksWithOptions({ queuedOnly: true });
-  const seen = new Set(active.map(t => t.id));
-  return [...active, ...queued.filter(t => !seen.has(t.id))];
 }
 
 export async function commandActive(args: string[]): Promise<void> {
@@ -680,8 +528,7 @@ function renderActiveOutput(
   }
 
   if (opts.showTree) {
-    console.log(`${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ${theme.header('TYPE'.padEnd(10))} ${theme.header('TURNS'.padEnd(8))} ${theme.header('LAST ACTIVE'.padEnd(18))} ${theme.header('DURATION'.padEnd(10))} ${theme.header('COST'.padEnd(10))} ${theme.header('GOAL')}`);
-    console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(8)} ${'─'.repeat(18)} ${'─'.repeat(10)} ${'─'.repeat(10)} ${'─'.repeat(30)}`));
+    printTaskListTreeHeader();
 
     for (const rootNode of tree) {
       printTaskTree(rootNode);
@@ -689,19 +536,10 @@ function renderActiveOutput(
   } else {
     const nodes = flattenTree(tree);
     const parentDisplayId = buildDisplayIdMap(nodes.map(n => n.task));
-    console.log(`${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ${theme.header('TYPE'.padEnd(10))} ${theme.header('PARENT'.padEnd(18))} ${theme.header('CREATED'.padEnd(18))} ${theme.header('GOAL')}`);
-    console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(18)} ${'─'.repeat(18)} ${'─'.repeat(30)}`));
+    printTaskListFlatHeader();
 
     for (const node of nodes) {
-      const task = node.task;
-      const parentId = parentTaskIdOf(task);
-      const parent = parentId ? theme.taskId(parentDisplayId(parentId)) : '-';
-      const code = displayId(task);
-      const model = task.model ?? '-';
-      const taskType = task.type ?? 'task';
-      console.log(
-        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(flatStatusText(node)), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${goalCell(node, task.goal)}`
-      );
+      console.log(formatTaskListFlatRow(node, parentDisplayId));
     }
   }
 
@@ -750,8 +588,7 @@ function renderBlockedOutput(
   }
 
   if (showTree) {
-    console.log(`${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ${theme.header('TYPE'.padEnd(10))} ${theme.header('TURNS'.padEnd(8))} ${theme.header('LAST ACTIVE'.padEnd(18))} ${theme.header('DURATION'.padEnd(10))} ${theme.header('TOKENS IN/OUT'.padEnd(14))} ${theme.header('GOAL')}`);
-    console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(8)} ${'─'.repeat(18)} ${'─'.repeat(10)} ${'─'.repeat(14)} ${'─'.repeat(30)}`));
+    printTaskListTreeHeader();
 
     for (const rootNode of tree) {
       printTaskTree(rootNode);
@@ -759,19 +596,10 @@ function renderBlockedOutput(
   } else {
     const flatNodes = flattenTree(tree);
     const parentDisplayId = buildDisplayIdMap(flatNodes.map(n => n.task));
-    console.log(`${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ${theme.header('TYPE'.padEnd(10))} ${theme.header('PARENT'.padEnd(18))} ${theme.header('CREATED'.padEnd(18))} ${theme.header('GOAL')}`);
-    console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(18)} ${'─'.repeat(18)} ${'─'.repeat(30)}`));
+    printTaskListFlatHeader();
 
     for (const node of flatNodes) {
-      const task = node.task;
-      const parentId = parentTaskIdOf(task);
-      const parent = parentId ? theme.taskId(parentDisplayId(parentId)) : '-';
-      const code = displayId(task);
-      const model = task.model ?? '-';
-      const taskType = task.type ?? 'task';
-      console.log(
-        `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(flatStatusText(node)), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${goalCell(node, task.goal)}`
-      );
+      console.log(formatTaskListFlatRow(node, parentDisplayId));
     }
   }
 

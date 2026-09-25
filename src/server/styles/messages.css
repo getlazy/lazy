@@ -1,0 +1,80 @@
+/* — system messages inbox —
+   The inbox reuses the shared table, tag and button vocabulary; what is local
+   to it is the unread emphasis and the row-level action controls.
+
+   Unread is carried by WEIGHT and an edge marker, not by colour alone: the
+   state tag already says the word, and a colour-only distinction would be the
+   one thing the human cannot see at a glance in the wrong light. */
+.msg-table td { vertical-align: middle; }
+.msg-table td.msg-title { font-family: var(--font-body); white-space: normal; max-width: 480px; }
+.msg-id { color: color-mix(in srgb, var(--color-text) 55%, transparent); }
+
+.msg-row-unread td.msg-title a { font-weight: 700; }
+.msg-row-unread td:first-child {
+  box-shadow: inset 2px 0 0 var(--color-warning);
+}
+.msg-row-dismissed td { opacity: 0.65; }
+
+/* Two forms side by side in one cell: they are buttons, not a stacked pair. */
+.msg-actions { white-space: nowrap; }
+.msg-action { display: inline-block; margin-right: var(--space-2); }
+.msg-note { color: color-mix(in srgb, var(--color-text) 55%, transparent); font-size: 12px; }
+
+.msg-meta {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: color-mix(in srgb, var(--color-text) 60%, transparent);
+  margin-bottom: var(--space-4);
+}
+.msg-detail-actions { margin-bottom: var(--space-6); }
+
+.msg-notice {
+  border: 1px solid var(--color-divider);
+  border-left: 3px solid var(--color-success);
+  padding: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+.msg-notice-error { border-left-color: var(--color-danger); }
+
+/* The legend spells out read vs dismissed in the shared wording — the whole
+   decision the human makes on this page is between those two. */
+.msg-legend {
+  margin-top: var(--space-6);
+  font-size: 12px;
+  color: color-mix(in srgb, var(--color-text) 60%, transparent);
+}
+.msg-legend div { margin-bottom: var(--space-1); }
+
+/* — the nav badges —
+   A count beside Review, Loop, Inbox, Raised and Conversations, so a task
+   waiting to be reviewed, an alert filed, a raised item left untriaged or a
+   conversation captured while the human was looking at a task page is noticed
+   without navigating there on purpose. Loop copies the Review number rather
+   than issuing a second query. ONE class for all of them on purpose: they
+   answer the same question ("how many are waiting for you"), so they should
+   look identical — a per-link colour would imply a distinction the counts do
+   not have. Hidden until it has something to report, which is also how a zero
+   count disappears. */
+.nav-badge {
+  display: inline-block;
+  min-width: 18px;
+  padding: 0 5px;
+  margin-left: 4px;
+  border-radius: 9px;
+  background: var(--color-warning);
+  color: var(--color-neutral-100);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 18px;
+  text-align: center;
+}
+.nav-badge:empty { display: none; }
+
+/* The dashboard's unread panel: the no-script path to the same signal. */
+.msg-panel-item { margin-bottom: var(--space-2); }
+.msg-panel-item .msg-panel-meta {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+  margin-left: var(--space-2);
+}

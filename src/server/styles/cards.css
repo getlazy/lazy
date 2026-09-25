@@ -1,0 +1,153 @@
+/*
+ * Viewable sections — the shared look of anything that can be ticked off and
+ * collapsed: a file in the review diff and a markdown card (turn, agent report,
+ * comment, journal entry, follow-up, prompt).
+ *
+ * THE RULE THIS FILE EXISTS FOR: a markdown card is never a scroll container.
+ * There is no max-height and no overflow-y here, and `.turn-content` no longer
+ * declares them either. A card 4000 pixels tall is 4000 pixels tall; the page
+ * scrolls, the card does not, and a reader who is done with it ticks Viewed.
+ *
+ * Code blocks inside a card still scroll SIDEWAYS (`pre { overflow-x: auto }`
+ * in app.css) — that is a long line, not a long card.
+ */
+
+.rv-viewable[data-collapsed="1"] .rv-vw-toggle { transform: rotate(-90deg); }
+.rv-viewable[data-collapsed="1"] .rv-vw-body { display: none; }
+
+/* Markdown cards: quieter than a diff file — a hairline and a header row. */
+.md-card {
+  border: 1px solid var(--color-divider);
+  background: var(--color-bg);
+  margin-bottom: var(--space-3);
+}
+/* Sticky, for the same reason a file's header is (diff.css): a card taller
+   than the viewport must not hide what it is or its Viewed tick while it is
+   being read. Opaque background is required — the body scrolls underneath it. */
+.md-card-head {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  padding: var(--space-2) var(--space-3);
+  font-size: 12px;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+  border-bottom: 1px solid var(--color-divider);
+  background: var(--color-bg);
+  position: sticky;
+  top: var(--lz-sticky-top, 0px);
+  z-index: 3;
+}
+.md-card[data-collapsed="1"] .md-card-head { border-bottom: 0; }
+.md-card-head-text { flex: 1; min-width: 0; }
+.md-card[data-viewed="1"] .md-card-head-text { opacity: 0.65; }
+.md-card > .rv-vw-body { padding: var(--space-3); }
+
+/* Whatever the page scrolls to clears the chrome stuck above it, so a card
+   reached by a fragment link is not hidden behind the tab strip. */
+.rv-viewable { scroll-margin-top: calc(var(--lz-sticky-top, 0px) + 8px); }
+
+/* The chevron: same control on a file and on a card. */
+.rv-vw-toggle {
+  font-family: var(--font-body); font-size: 11px; line-height: 1; padding: 2px 5px;
+  border: 1px solid transparent; background: none;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent); cursor: pointer;
+}
+.rv-vw-toggle:hover { border-color: var(--color-divider); }
+
+/* The "Viewed" tick: same control on a file and on a card. */
+.rv-viewed {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-family: var(--font-body); font-size: 11px;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+  cursor: pointer; user-select: none; margin-left: 4px;
+}
+/* The tick ships `hidden` and the viewed-cards island unhides it, because
+   with JS off it is a checkbox that cannot record anything. `display` above
+   is an AUTHOR rule, so it beats the UA's `[hidden] { display: none }` and
+   the attribute did nothing on its own — the control flashed up on every
+   load and then sat there, permanently visible and permanently dead with JS
+   off. Same shape as `.rv-viewopts[hidden]` in diff.css; there is no global
+   `[hidden]` reset in this bundle, so every element that ships hidden AND
+   sets `display` needs its own companion rule. */
+.rv-viewed[hidden] { display: none; }
+.rv-viewable[data-viewed="1"] .rv-viewed { color: var(--color-success); }
+
+/* The CURRENT section — explicit navigation state (review-navigation.ts), on
+   exactly one section at a time. Accent bar as an inset shadow rather than a
+   border so becoming current never shifts layout; the outline makes it
+   unambiguous against both a file's border and a card's hairline. */
+.rv-viewable[data-current] {
+  outline: 1px solid var(--color-accent);
+  box-shadow: inset 3px 0 0 0 var(--color-accent);
+}
+
+/* --- The Services card (services-card.ts): [serve] URLs + liveness --- */
+.svc-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+.svc-row { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
+.svc-name { font-weight: 600; min-width: 6ch; }
+.svc-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; display: inline-block; }
+.svc-dot-on { background: var(--color-success); }
+/* Down is a STATE, not an absence: a hollow ring reads as "checked, and the
+   answer was no", where a faint grey dot read as decoration. */
+.svc-dot-off { background: none; border: 2px solid var(--color-danger); }
+.svc-dot-unknown { background: transparent; border: 1px dashed color-mix(in srgb, var(--color-text) 35%, transparent); }
+.svc-cmd { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; }
+.svc-cmd code { user-select: all; }
+.svc-copy {
+  font-family: var(--font-body); font-size: 11px; padding: 1px 7px; cursor: pointer;
+  border: 1px solid var(--color-divider); background: none;
+  color: color-mix(in srgb, var(--color-text) 70%, transparent); border-radius: 3px;
+}
+.svc-copy:hover { border-color: color-mix(in srgb, var(--color-text) 40%, transparent); }
+
+/* A published port with nothing behind it. Deliberately NOT a link and
+   deliberately not the same colour as a URL — clicking it could only ever
+   produce a connection-refused page. */
+.svc-dead { color: var(--color-danger); font-style: italic; }
+.svc-off .svc-name { color: color-mix(in srgb, var(--color-text) 60%, transparent); }
+
+/* Container down: one line for the whole card, with its remedy on it. */
+.svc-down { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; margin: 0; }
+.svc-start { margin: var(--space-3) 0 0; }
+/* The button + copyable command. The mount slot for the in-place terminal
+   (`.lz-shell-mount`, tabs.css) follows as its own block below this row. */
+.svc-start-row { display: flex; align-items: center; gap: var(--space-2); margin: 0; flex-wrap: wrap; }
+.svc-designate { margin: var(--space-3) 0 0; padding-top: var(--space-3); border-top: 1px solid var(--border, #e5e5e5); }
+.svc-designate-head { margin: 0 0 var(--space-1); font-weight: 600; }
+.svc-designate-form { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin-top: var(--space-2); }
+.svc-designate-label { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); border: 0; }
+.svc-designate-form .input { flex: 1 1 12rem; min-width: 10rem; font-family: var(--font-mono); font-size: 13px; }
+
+/* The "you opened a service and nothing answered" banner (serve-notice.ts).
+   Sits above the Services card, so it is loud enough to be the first thing read
+   and quiet enough not to look like a failure of the page itself. */
+.lz-serve-notice {
+  margin: 0 0 var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--color-warning);
+  border-left-width: 3px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--color-warning) 8%, transparent);
+}
+.lz-serve-notice-head { margin: 0; }
+/* Wraps the actions row and its shell-mount slot as siblings, so a live
+   terminal is a block below the buttons instead of a flex item squeezed to
+   button width inside .lz-serve-notice-actions. */
+.lz-serve-notice-body { margin: var(--space-3) 0 0; }
+.lz-serve-notice-actions {
+  display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap;
+  margin: 0;
+}
+
+/* Start container: the button, or the live progress of a start already running. */
+.lz-container-start { display: inline-flex; align-items: center; gap: var(--space-2); }
+.lz-inline-form { display: inline; }
+.lz-container-error { color: var(--color-danger); }
+.lz-container-spinner {
+  width: 10px; height: 10px; flex: none; border-radius: 50%;
+  border: 2px solid color-mix(in srgb, var(--color-text) 25%, transparent);
+  border-top-color: var(--color-text);
+  animation: lz-container-spin 0.8s linear infinite;
+}
+@keyframes lz-container-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .lz-container-spinner { animation: none; } }

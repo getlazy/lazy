@@ -1,23 +1,18 @@
 import { join } from 'path';
+import { shortId, displayId, getWorktreePath, taskRef } from '../../task/identity';
 import { mkdir, writeFile, readFile } from 'fs/promises';
 import { getHome } from '../../utils/home';
 import { pathExists } from '../../utils/fs';
-import {
-  requireLazyRoot,
-  requireStorage,
-  shortId,
-  displayId,
-  parseFlags,
-  resolveTaskOrExit,
-  getWorktreePath,
-  rejectIfPairing,
-  taskRef,
-} from '../helpers';
-import { theme } from '../theme';
+import { requireLazyRoot, requireStorage, parseFlags, resolveTaskOrExit, rejectIfPairing } from '../helpers';
+import { theme } from '../../render/theme';
 import { encodeProjectPath } from '../../import/claude-code-logs';
 import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 import { logger } from '../../utils/logger';
 import { runInteractiveSupervisor } from '../../supervisor/interactive';
+import { admitInteractive, admitInteractiveOrExit } from '../usage-pause-preflight';
+import { loadConfig } from '../../config/loader';
+import { pairSessionModel } from '../../task/launch-identity-view';
+import { readProjectSettings, resolveProjectModel } from '../../daemon/project-settings';
 import { checkLock, acquireLock, removeLock } from '../../utils/lock';
 import { bridgeSessionFiles } from './pair-bridge';
 import { captureAgentSessionLog } from '../../import/capture-agent-session-log';
@@ -91,6 +86,14 @@ export async function commandChat(args: string[]): Promise<void> {
 
   try {
     const task = await resolveTaskOrExit(storage, taskId);
+
+    // [usage_pause]: a chat runs a model on the builder role's credential; a
+    // paused one refuses it before any lock is taken or anything launches.
+    // PEEKED here, so the refusal comes early; admitted — the one-shot override
+    // taken, if that is what lets it through — only just before Claude Code
+    // launches, after chat's own refusals, so a chat refused for its own reasons
+    // never spends the override.
+    await admitInteractiveOrExit('chat', task.id, { peek: true });
 
     // Mode selection is derived from task state, never guessed: a task that is
     // not finished and still has an open session has a live agent and a live
@@ -191,6 +194,7 @@ async function chatLive(
   // inside the try below — that skips the finally blocks and would leave the
   // worktree lock behind for the next command to trip over.
   let bridgeFailed = false;
+  let usageRefusal: string | null = null;
   try {
     // Docker runner: the session JSONL lives in the worktree sandbox, so it has
     // to be visible at ~/.claude/projects/ before `claude --resume` can find it.
@@ -205,6 +209,13 @@ async function chatLive(
         for (const line of bridge.diagnostics) {
           console.error(`  ${line}`);
         }
+        bridgeFailed = true;
+        exitCode = 1;
+      } else if ((usageRefusal = await admitInteractive('chat', task.id)) !== null) {
+        // [usage_pause]: every refusal of chat's own is behind us; this is the
+        // admission that may take the override (see commandChat). Refused here
+        // inside the lock, so it exits through the cleanup below.
+        console.error(usageRefusal);
         bridgeFailed = true;
         exitCode = 1;
       } else {
@@ -224,6 +235,7 @@ async function chatLive(
           effort,
           systemPrompt: chatLiveSystemPrompt,
           taskShortId,
+          model: await chatSessionModel(root, storage, task),
         });
       }
     } finally {
@@ -285,6 +297,9 @@ async function chatTerminal(
     process.exit(1);
   }
 
+  // [usage_pause]: chat's own refusals are behind us — admit (see commandChat).
+  await admitInteractiveOrExit('chat', task.id);
+
   const sessionId = log.sessionId;
 
   // --- Rehydrate: place the JSONL where `claude --resume` will find it ---
@@ -314,6 +329,7 @@ async function chatTerminal(
       effort,
       systemPrompt: chatSystemPrompt,
       taskShortId,
+      model: await chatSessionModel(root, storage, task),
     });
   } finally {
     // --- Write back: persist the (possibly extended) JSONL into storage ---
@@ -342,6 +358,19 @@ async function chatTerminal(
 }
 
 /**
+ * The model a chat on `task` runs: the same resolution `lazy pair` uses
+ * (pairSessionModel), so a chat never runs a model the task's turns would not.
+ */
+async function chatSessionModel(root: string, storage: Storage, task: Task): Promise<string> {
+  const config = await loadConfig(root);
+  return pairSessionModel({
+    task,
+    config,
+    projectModel: resolveProjectModel(await readProjectSettings(storage), config),
+  });
+}
+
+/**
  * Launch Claude Code interactively for a chat and wait for the human to exit.
  * Shared by both modes so the read-only lockdown and the builder-role target
  * resolution cannot drift between them. Returns Claude Code's exit code.
@@ -353,6 +382,8 @@ async function launchChatClaude(opts: {
   effort: EffortLevel;
   systemPrompt: string;
   taskShortId: string;
+  /** The task's model — a chat resumes the task's session, so it runs what its turns run. */
+  model: string;
 }): Promise<number> {
   // Claude Code runs UNDER the interactive supervisor, not directly. A daemon
   // restart moves the audit proxy to a new OS-assigned port and Claude Code
@@ -375,6 +406,7 @@ async function launchChatClaude(opts: {
     cwd: opts.cwd,
     taskId: opts.taskShortId,
     resumeSessionId: opts.sessionId,
+    model: opts.model,
     extraArgs: [
       '--permission-mode', 'plan',
       '--disallowedTools', DISALLOWED_TOOLS,

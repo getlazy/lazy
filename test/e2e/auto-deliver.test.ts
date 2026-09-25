@@ -10,6 +10,7 @@
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { join } from 'path';
+import { readFile, writeFile } from 'fs/promises';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask } from '../helpers/fixtures';
 import { openProjectStorage } from '../../src/daemon/rpc-handlers';
@@ -235,7 +236,7 @@ describe('auto-deliver', () => {
         const task = allTasks.find(t => t.id.startsWith(taskShortId))!;
 
         const { loadConfig } = await import('../../src/config/loader');
-        const config = await loadConfig(ctx.root, { cwd: ctx.root });
+        const config = await loadConfig(ctx.root);
         const dataDir = join(ctx.root, '.lazy');
 
         // Exhaust the budget for upstream_sync trigger
@@ -263,7 +264,7 @@ describe('auto-deliver', () => {
         const task = allTasks.find(t => t.id.startsWith(taskShortId))!;
 
         const { loadConfig } = await import('../../src/config/loader');
-        const config = await loadConfig(ctx.root, { cwd: ctx.root });
+        const config = await loadConfig(ctx.root);
         const dataDir = join(ctx.root, '.lazy');
 
         // Exhaust the daily budget. incrementDailyBudget is async (it does a
@@ -308,7 +309,7 @@ describe('auto-deliver', () => {
         await storage.updateTaskStatus(childB.id, 'blocked', 'system');
 
         const { loadConfig } = await import('../../src/config/loader');
-        const config = await loadConfig(ctx.root, { cwd: ctx.root });
+        const config = await loadConfig(ctx.root);
         const dataDir = join(ctx.root, '.lazy');
 
         // Simulate multiple cascades consuming budget
@@ -566,7 +567,11 @@ describe('auto-deliver', () => {
     // INVARIANT: Event-driven signal delivery — signals emitted at source
     // are delivered by runBlockedTaskCatchup. Comment signals are no longer
     // emitted by catchup itself.
-    test('delivers pre-emitted comment signals for blocked task', async () => {
+    //
+    // The signal is remote-sourced on purpose: only FORGE comments may start a
+    // turn. A lazy comment is feedback for the next human-started turn, and its
+    // signal is consumed without delivery — see the test below.
+    test('delivers pre-emitted remote comment signals for blocked task', async () => {
       const taskShortId = await createTask(ctx, 'Signal delivery task');
 
       const storage = await openProjectStorage(ctx.root);
@@ -578,12 +583,12 @@ describe('auto-deliver', () => {
         await storage.updateTaskStatus(task.id, 'working', 'system');
         await storage.updateTaskStatus(task.id, 'blocked', 'system');
 
-        // Emit a comment signal (as if from fetchRemoteComments or lazy comment)
+        // Emit a comment signal (as if from fetchRemoteComments)
         const { emitSignal } = await import('../../src/daemon/signals');
         emitSignal(task.id, {
           type: 'comment',
           summary: 'Please fix the edge case',
-          details: { comment_id: 'c1', actor: 'human' },
+          details: { comment_id: 'c1', actor: 'human', source: 'remote' },
         });
 
         // Verify signal is pending
@@ -599,6 +604,94 @@ describe('auto-deliver', () => {
         expect(signalsAfter.filter(s => s.type === 'comment').length).toBe(1);
       } finally {
         await storage.close();
+      }
+    });
+
+    // INVARIANT (fix-comment-auto-launch): a comment made through lazy itself
+    // never launches a turn. Nothing emits a local comment signal any more, but
+    // queues written before the fix (and any future emitter that forgets the
+    // rule) must not auto-unblock the task on the next tick — the signal is
+    // consumed without delivery, and the comment rides the next human-started
+    // turn from storage.
+    test('consumes local comment signals without delivering', async () => {
+      const taskShortId = await createTask(ctx, 'Local comment signal task');
+
+      const storage = await openProjectStorage(ctx.root);
+      try {
+        const allTasks = await storage.listTasks();
+        const task = allTasks.find(t => t.id.startsWith(taskShortId))!;
+
+        await storage.updateTaskStatus(task.id, 'working', 'system');
+        await storage.updateTaskStatus(task.id, 'blocked', 'system');
+
+        // A signal as `lazy comment` used to emit it: no remote source.
+        const { emitSignal } = await import('../../src/daemon/signals');
+        emitSignal(task.id, {
+          type: 'comment',
+          summary: 'Please fix the edge case',
+          details: { comment_id: 'c1', actor: 'human', source: 'local' },
+        });
+        // And one from before `source` was tagged at all.
+        emitSignal(task.id, {
+          type: 'comment',
+          summary: 'Legacy untagged comment',
+          details: { comment_id: 'c2', actor: 'human' },
+        });
+
+        expect(readSignals(task.id).filter(s => s.type === 'comment').length).toBe(2);
+
+        await runBlockedTaskCatchup(storage, ctx.root);
+
+        // Both consumed, and the task was never claimed for a turn.
+        expect(readSignals(task.id).filter(s => s.type === 'comment').length).toBe(0);
+        const after = await storage.getTask(task.id);
+        expect(after!.status).toBe('blocked');
+      } finally {
+        await storage.close();
+      }
+    });
+
+    // INVARIANT: `auto_react_comments = false` means DISABLED, not deferred. A
+    // remote comment signal left pending would be re-evaluated on every 5s tick
+    // for the life of the task, so the queue grows without bound. The comment
+    // itself is untouched in storage and still shows up at review.
+    test('consumes remote comment signals when auto_react_comments is off', async () => {
+      const tomlPath = join(ctx.root, 'lazy.toml');
+      const before = await readFile(tomlPath, 'utf-8');
+      // The key ships commented out, so switch it on by uncommenting it as
+      // `false` rather than overwriting the file (which would throw away the
+      // external_path init wrote).
+      const after = before.replace('# auto_react_comments = true', 'auto_react_comments = false');
+      expect(after).not.toBe(before);
+      await writeFile(tomlPath, after);
+
+      const taskShortId = await createTask(ctx, 'Disabled forge auto-react task');
+
+      const storage = await openProjectStorage(ctx.root);
+      try {
+        const allTasks = await storage.listTasks();
+        const task = allTasks.find(t => t.id.startsWith(taskShortId))!;
+
+        await storage.updateTaskStatus(task.id, 'working', 'system');
+        await storage.updateTaskStatus(task.id, 'blocked', 'system');
+
+        const { emitSignal } = await import('../../src/daemon/signals');
+        emitSignal(task.id, {
+          type: 'comment',
+          summary: 'Forge reviewer says fix the edge case',
+          details: { comment_id: 'c1', actor: 'human', source: 'remote' },
+        });
+
+        expect(readSignals(task.id).filter(s => s.type === 'comment').length).toBe(1);
+
+        await runBlockedTaskCatchup(storage, ctx.root);
+
+        expect(readSignals(task.id).filter(s => s.type === 'comment').length).toBe(0);
+        const taskAfter = await storage.getTask(task.id);
+        expect(taskAfter!.status).toBe('blocked');
+      } finally {
+        await storage.close();
+        await writeFile(tomlPath, before);
       }
     });
 

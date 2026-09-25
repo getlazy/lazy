@@ -109,6 +109,15 @@ export class BackgroundImageBuild {
   }
 
   /**
+   * Wait for the background build subprocess to finish without promoting or
+   * throwing. Callers that block on stdin use this so docker build output
+   * cannot scroll the prompt away while the human is still expected to read it.
+   */
+  async awaitSettled(): Promise<void> {
+    await this.settled;
+  }
+
+  /**
    * Wait for the build to finish. Throws (loudly, with context) if it failed —
    * the upgrade must not continue onto a stale image.
    */

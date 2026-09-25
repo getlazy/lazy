@@ -24,6 +24,7 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask } from '../helpers/fixtures';
 import { startDevWebServer, DevWebServerError } from '../../src/dev/web-server';
+import { signInToDashboard, dashboardFetch, type DashboardFetch } from '../helpers/dashboard-session';
 
 /** A port in a range nothing else in this repo binds. */
 function probeFreePort(): number {
@@ -44,18 +45,45 @@ describe('dev web server (daemon client)', () => {
   let ctx: TestContext;
   let server: { stop: (closeActive?: boolean) => void } | null = null;
   let base = '';
+  // The dev server serves the same dashboard from the same store on a loopback
+  // port, so it carries the same sign-in gate — and the same session, since the
+  // cookie is scoped to the host rather than the port.
+  let fetch: DashboardFetch;
+  let cookie: string;
 
   beforeEach(async () => {
     ctx = await setupTestLazy({ withDaemon: true });
     const started = await startDevWebServer({ projectRoot: ctx.root, port: probeFreePort() });
     server = started.server;
     base = started.url;
+    ({ fetch, cookie } = await signInToDashboard(ctx));
   });
 
   afterEach(async () => {
     server?.stop(true);
     server = null;
     await ctx.cleanup();
+  });
+
+  // The dev server is a second door onto the same store, on a port a task
+  // container can reach exactly as it reaches the daemon's. It gets the same
+  // gate — otherwise running the dev loop would silently reopen the hole
+  // authenticating the daemon dashboard just closed.
+  test('an unauthenticated request is refused here too', async () => {
+    const res = await dashboardFetch(`${base}/api/tasks`);
+    expect(res.status).toBe(401);
+    expect(await res.text()).toContain('lazy dashboard');
+  });
+
+  // The dev server shares the daemon's session because it shares its HOSTNAME —
+  // so it has to enforce the hostname for the same reason the daemon does: a
+  // cookie accepted at `127.0.0.1:<devPort>` would be sent to the task apps
+  // published on 127.0.0.1 too.
+  test('the same session is refused when the dev server is reached on 127.0.0.1', async () => {
+    const onLoopback = new URL(base);
+    onLoopback.hostname = '127.0.0.1';
+    const res = await globalThis.fetch(`${onLoopback.origin}/api/tasks`, { headers: { cookie } });
+    expect(res.status).toBe(421);
   });
 
   test('serves the dashboard from source against the running daemon', async () => {
@@ -71,7 +99,7 @@ describe('dev web server (daemon client)', () => {
   test('a review comment posted here is visible through the daemon dashboard', async () => {
     const taskId = await createTask(ctx, 'Dev server review target');
 
-    const posted = await fetch(`${base}/review/${taskId}/comment`, {
+    const posted = await fetch(`${base}/tasks/${taskId}/review/comment`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -94,6 +122,7 @@ describe('dev web server (daemon client)', () => {
     const daemonBase = dashboardUrlCmd.stdout.trim();
     expect(daemonBase).toBeTruthy();
 
+    // Same cookie: the session is per host, not per port.
     const threads = await fetch(`${daemonBase}/api/review/${taskId}/threads`);
     expect(threads.status).toBe(200);
     expect(JSON.stringify(await threads.json())).toContain('posted from the dev web server');
@@ -103,7 +132,7 @@ describe('dev web server (daemon client)', () => {
   // commands are an external surface and parse their inputs.
   test('an invalid comment is rejected rather than stored', async () => {
     const taskId = await createTask(ctx, 'Dev server validation target');
-    const response = await fetch(`${base}/review/${taskId}/comment`, {
+    const response = await fetch(`${base}/tasks/${taskId}/review/comment`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ file: 'src/example.ts', line: 12, side: 'sideways', content: 'x' }),

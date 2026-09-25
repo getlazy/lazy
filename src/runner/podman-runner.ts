@@ -12,6 +12,7 @@
  */
 
 import { DockerRunner } from './docker-runner';
+import { assertSiblingContainerLaunchSupported } from './sibling-containers';
 import { logger } from '../utils/logger';
 import { spawn } from '../utils/spawn';
 
@@ -28,6 +29,18 @@ export class PodmanRunner extends DockerRunner {
    * message. We provide a better Podman-specific message.
    */
   override async checkAvailability(): Promise<void> {
+    // FIRST, exactly as DockerRunner does it, and NOT via `super` — the whole
+    // point of this override is that the base method's probe is Docker-themed.
+    // Re-stating the gate is the cost of that.
+    //
+    // It has to be here rather than only at the launch sites: this is the
+    // preflight every task-turn path runs before a worktree, a branch, a
+    // session row or a credential placeholder exists. An override that skipped
+    // it left podman with the failure mode the gate was moved to avoid — the
+    // task recorded `interrupted`, auto-resumed, re-queued, and rebuilt all of
+    // that on every attempt just to be refused at the launch site again.
+    assertSiblingContainerLaunchSupported('use the podman runner');
+
     logger.debug('Checking Podman...');
 
     const proc = spawn(['podman', 'info'], {

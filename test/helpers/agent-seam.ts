@@ -19,19 +19,21 @@ import type { TestContext } from './setup';
  * for a test. These are the real config keys the daemon reads and puts on the
  * wire, so tightening them exercises the same plumbing a user would.
  *
- * The commit is not optional: the daemon resolves a turn's config from the
- * TASK WORKTREE (loadConfig(root, { cwd: worktreePath })), and the worktree is
- * branched from main. An uncommitted lazy.toml edit would simply never reach
- * the supervisor — the turn would run with the 2h default and the test would
- * time out with no useful signal.
+ * The keys are written to the PROJECT ROOT's lazy.toml, which is the only
+ * lazy.toml the daemon ever reads (see findConfigDir in src/config/loader.ts) —
+ * a copy inside the task worktree has no authority and would change nothing.
+ * The change is committed so the root repository stays clean: task branches are
+ * cut from it and turn diffs are rendered against it, and an uncommitted edit
+ * there shows up as noise in both.
  *
  * The keys are rewritten IN the `[agent]` table `lazy init` already writes, per
  * CLAUDE.md ("change a test's lazy.toml by EDITING the key, never by
  * overwriting the file"). Appending a second `[agent]` section is a TOML
  * redefinition error — which is exactly what this helper used to do, killing
  * every suite that called it the moment `[agent]` entered the init template.
- * Each rewrite is checked, so a template rename fails loudly here instead of
- * silently running the turn on the 30-minute production default.
+ * Each rewrite is checked, because a `.replace()` that matches nothing is a
+ * silent no-op: a template rename fails loudly here instead of running the
+ * turn on the production defaults and failing for the wrong reason.
  */
 export async function setGuards(
   ctx: TestContext,
@@ -44,7 +46,10 @@ export async function setGuards(
     const before = toml;
     toml = toml.replace(new RegExp(`^#?\\s*${key}\\s*=.*$`, 'm'), `${key} = ${value}`);
     if (toml === before) {
-      throw new Error(`setGuards: no \`${key}\` line in the lazy.toml template to rewrite`);
+      throw new Error(
+        `setGuards: no \`${key}\` line in ${configPath} to rewrite — the lazy init ` +
+          `template changed and this helper needs updating.`,
+      );
     }
   };
 
@@ -90,11 +95,16 @@ export async function sessionInterrupt(
   };
 }
 
-/** The agent turns recorded for a task, in order. */
-export async function agentTurns(root: string, shortId: string): Promise<Array<Record<string, unknown>>> {
+/** Every turn recorded for a task, in order — request (human) and agent alike. */
+export async function allTurns(root: string, shortId: string): Promise<Array<Record<string, unknown>>> {
   const raw = await readFile(join(await taskDir(root, shortId), 'turns.json'), 'utf-8');
   const parsed = JSON.parse(raw) as { turns: Array<Record<string, unknown>> };
-  return parsed.turns.filter(t => t.role === 'agent');
+  return parsed.turns;
+}
+
+/** The agent turns recorded for a task, in order. */
+export async function agentTurns(root: string, shortId: string): Promise<Array<Record<string, unknown>>> {
+  return (await allTurns(root, shortId)).filter(t => t.role === 'agent');
 }
 
 /** The task's current status, straight from storage. */
@@ -139,4 +149,21 @@ export async function turnPrompts(ctx: TestContext): Promise<string[]> {
   return invocations
     .filter(i => i.argv.includes('-p'))
     .map(i => i.argv[i.argv.indexOf('-p') + 1] ?? '');
+}
+
+/** Poll until the fake agent receives a prompt matching a semantic work-turn condition. */
+export async function waitForTurnPrompt(
+  ctx: TestContext,
+  predicate: (prompt: string) => boolean,
+  timeoutMs: number,
+): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  let prompts: string[] = [];
+  while (Date.now() < deadline) {
+    prompts = await turnPrompts(ctx);
+    const match = prompts.find(predicate);
+    if (match !== undefined) return match;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  throw new Error(`No matching agent prompt within ${timeoutMs}ms (${prompts.length} prompts observed)`);
 }

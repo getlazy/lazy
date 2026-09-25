@@ -167,7 +167,10 @@ describe('lazy_internal_git', () => {
       `turn/${short}/pre/${head}/extra`,         // too many segments
       `turns/${short}/pre/${head}`,              // wrong literal prefix
       `turn/${short}/PRE/${head}`,               // phase charset
-      `turn/${short}/pre/${head.toUpperCase()}`, // sha charset
+      // A FIXED upper-case sha, never `head.toUpperCase()`: a real HEAD whose
+      // first 8 hex digits are all numeric (~2.3% of runs) upper-cases to
+      // itself, so the name was VALID and the test failed intermittently.
+      `turn/${short}/pre/ABCDEF12`,               // sha charset
       `turn/${short}/pre/abcdef`,                // sha too short
     ]) {
       await expect(handler({ op: 'tag', name })).rejects.toThrow(/Refusing to write tag/);

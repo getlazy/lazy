@@ -68,7 +68,7 @@ async function drainPushQueue(projectRoot: string): Promise<void> {
     let driver: RepositoryDriver | null = null;
 
     try {
-      const config = await loadConfig(projectRoot, { cwd: projectRoot });
+      const config = await loadConfig(projectRoot);
 
       // The post-turn push is an AUTOMATIC push — exactly what
       // `<driver>_auto_push = false` opts out of. Drop the queue rather than

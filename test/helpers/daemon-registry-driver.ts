@@ -1,8 +1,8 @@
 /**
  * Subprocess driver for daemon-registry.test.ts.
  *
- * The registry's safety net calls `process.exit()`, so it cannot be exercised
- * in the test runner's own process. This tiny program registers a root and then
+ * The registry's safety net re-raises SIGINT/SIGTERM (it cannot be exercised
+ * in the test runner's own process without killing it). This tiny program registers a root and then
  * dies in a chosen way, letting the parent assert the registered daemon was
  * reaped even though no `afterEach` ran.
  *

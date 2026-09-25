@@ -4,6 +4,7 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 
 /**
  * Helper: create a task, start it, wait for the reconciler to move it out of
@@ -38,6 +39,11 @@ async function createStartedTaskWithCommit(ctx: TestContext, goal: string): Prom
 
   const gitCommit = ctx.git('-C', worktreePath, 'commit', '-m', 'Add feature');
   expect(gitCommit.exitCode).toBe(0);
+
+  // Fixture finality: the accept gate (final-turn §5.1) refuses a task nobody
+  // has declared done, and every test here drives an accept to a verdict
+  // other than no-final.
+  await seedFinal(ctx, taskId);
 
   return taskId;
 }

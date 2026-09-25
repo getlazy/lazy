@@ -45,7 +45,6 @@ function makeTask(overrides: Partial<Task> & { id: string }): Task {
     model: overrides.model ?? null,
     code: overrides.code ?? null,
     type: overrides.type ?? 'task',
-    priority: overrides.priority ?? 'normal',
     agent_id: overrides.agent_id ?? 'claude-code',
     runner_type: overrides.runner_type ?? null,
     created_at: overrides.created_at ?? Date.now(),

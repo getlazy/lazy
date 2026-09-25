@@ -63,6 +63,8 @@ describe('runner/agent capability gating', () => {
   // qa-agent keeps its pre-existing host-only posture.
   test('qa-agent + docker runner is refused with an actionable error', async () => {
     await setAgent(ctx.root, 'qa-agent');
-    await expect(createRunner(ctx.root)).rejects.toThrow(/only supports host-process runner/);
+    // Message reworded by remove-host-runner (the old text named the removed
+    // host-process option); the invariant is the actionable refusal itself.
+    await expect(createRunner(ctx.root)).rejects.toThrow(/does not support container runners/);
   });
 });

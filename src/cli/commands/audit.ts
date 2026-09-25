@@ -20,7 +20,7 @@ import { join } from 'path';
 import { requireLazyRoot, parseFlags } from '../helpers';
 import { loadConfig } from '../../config/loader';
 import { readAuditRecords } from '../../proxy/audit-log';
-import { theme, dim } from '../theme';
+import { theme, dim } from '../../render/theme';
 import { parseSince, parsePositiveInt } from './stats-flags';
 import {
   filterAuditRecords,
@@ -195,7 +195,13 @@ function renderDetail(record: ProxyAuditRecord): void {
     );
     for (const t of record.toolResults) {
       const flag = t.isError ? theme.error('error ') : '';
-      console.log(`    ${flag}${dim(`${num(t.contentLen)} chars`)}  ${dim(t.contentPreview)}`);
+      // Tokens only when the record carries them — older records do not, and a
+      // "0 tokens" there would read as a free result.
+      const size =
+        t.contentTokens != null
+          ? `${num(t.contentLen)} chars / ~${num(t.contentTokens)} tokens`
+          : `${num(t.contentLen)} chars`;
+      console.log(`    ${flag}${dim(size)}  ${dim(t.contentPreview)}`);
     }
   }
 

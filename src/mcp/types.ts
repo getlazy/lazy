@@ -16,8 +16,16 @@ export interface McpToolPropertySchema {
   minLength?: number;
   maxLength?: number;
   pattern?: string;
-  /** For array types: schema of each element. */
-  items?: { type: string; enum?: string[] };
+  /**
+   * For array types: schema of each element. May itself be an object schema
+   * (`type: 'object'` + `properties` / `required`) — used by tools that take
+   * arrays of structured records (e.g. raised_resolutions).
+   */
+  items?: McpToolPropertySchema;
+  /** For object types: nested property schemas. */
+  properties?: Record<string, McpToolPropertySchema>;
+  /** For object types: required nested property names. */
+  required?: string[];
 }
 
 export interface McpToolInputSchema {

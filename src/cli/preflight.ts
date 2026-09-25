@@ -156,7 +156,7 @@ async function ensureAccessible(path: string): Promise<PreflightFailure | null> 
  *
  * Probes:
  *  - `cwd`                            (read)       — git-root discovery, config loading
- *  - `~/.lazy`                        (read+write) — daemon state (socket, PID, logs) and user-global config
+ *  - `~/.lazy`                        (read+write) — daemon state (PID, token, port markers, logs) and user-global config
  *  - project `.lazy/` or `.workshop/` (read+write) — task storage, worktrees, recovery files
  *
  * On failure: prints an actionable error naming the path, the operation that

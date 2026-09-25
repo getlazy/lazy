@@ -1,0 +1,149 @@
+/* — builder conversations —
+   The listing reuses the shared table vocabulary; what is local here is the
+   transcript: a run of role-labelled message cards, and the search results that
+   point into them. */
+
+.conv-intro { max-width: 62ch; }
+
+.conv-search {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  margin-bottom: var(--space-5);
+}
+.conv-search .input { min-width: 280px; }
+
+.conv-table td { vertical-align: middle; }
+.conv-table td.conv-summary { font-family: var(--font-body); white-space: normal; max-width: 520px; }
+.conv-id a, .conv-turns { font-family: var(--font-mono); font-size: 13px; }
+
+/* — search results —
+   Each hit is the conversation plus the passages that matched, so the human can
+   tell from the list alone whether it is the one they meant. Excerpts come from
+   the shared search module and are shown verbatim, monospaced, because they are
+   raw transcript rather than prose this page composed. */
+.conv-hit {
+  border: 1px solid var(--color-divider);
+  border-left: 3px solid var(--color-accent);
+  padding: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+.conv-hit-title { font-weight: 600; margin-bottom: var(--space-1); }
+.conv-hit-meta {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+  margin-bottom: var(--space-3);
+}
+.conv-excerpt {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin-bottom: var(--space-2);
+}
+.conv-excerpt-role {
+  display: inline-block;
+  margin-right: var(--space-2);
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}
+
+/* — one conversation — */
+.conv-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-5);
+  margin-bottom: var(--space-6);
+  font-size: 13px;
+}
+.conv-meta dt {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}
+.conv-meta dd { margin: 0; font-family: var(--font-mono); }
+
+/* Who said what is carried by the role tag AND by the card's leading edge, so
+   the two sides of the dialogue stay separable without relying on colour. */
+.conv-message {
+  border: 1px solid var(--color-divider);
+  padding: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+.conv-message-user { border-left: 3px solid var(--color-accent); }
+.conv-message-assistant { border-left: 3px solid var(--color-divider); }
+
+.conv-message-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-2);
+}
+.conv-model, .conv-time {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}
+.conv-model { margin-left: var(--space-2); }
+
+.conv-empty-message {
+  font-size: 12px;
+  font-style: italic;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}
+
+.conv-pagination { margin-top: var(--space-6); display: flex; gap: var(--space-2); }
+
+/* — promoting part of a transcript —
+   Selection is two links per message and a highlighted run, so a human can see
+   exactly which messages the task will be seeded from before creating it. The
+   selected run is marked by weight and a filled leading edge, never by colour
+   alone. */
+.conv-number {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  margin-right: var(--space-2);
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}
+.conv-select { display: flex; gap: var(--space-2); }
+.conv-select-link {
+  font-size: 12px;
+  color: color-mix(in srgb, var(--color-text) 60%, transparent);
+}
+.conv-message-selected {
+  border-left-width: 6px;
+  border-left-color: var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+}
+
+.conv-promote { margin-bottom: var(--space-6); }
+.conv-promotions h2 { font-size: 14px; margin-bottom: var(--space-2); }
+.conv-promotions ul { margin: 0 0 var(--space-4); padding-left: var(--space-5); }
+.conv-promote-form summary { cursor: pointer; font-weight: 600; }
+.conv-promote-form form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+  max-width: 780px;
+}
+.conv-promote-form label {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}
+.conv-promote-actions { display: flex; gap: var(--space-2); }
+.conv-promote-form textarea.input {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--color-text);
+}

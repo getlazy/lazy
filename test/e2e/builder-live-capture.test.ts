@@ -20,14 +20,28 @@
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { installFakeAgentBinary } from '../helpers/fake-agent-binary';
+import { writeBuilderClaudeConfig } from '../helpers/builder-claude-config';
+import { TURN_IDENTITY_ENV_PINS } from '../helpers/mcp-env';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { getWebPortPath } from '../../src/daemon/paths';
 import { mintMcpToken } from '../../src/daemon/mcp-tokens';
-import { mergeBuilderClaudeConfig } from '../../src/builder/claude-home';
+import { builderScratchDir } from '../../src/builder/scratch';
 
 const AGENT_ENTRY = resolve(__dirname, '../../src/agent-entry.ts');
+
+/** Scratch dir as the supervisor subprocess sees it (matches setupTestLazy's pin). */
+function scratchDirFor(ctx: TestContext): string {
+  const previous = process.env.LAZY_SCRATCH_BASE_DIR;
+  process.env.LAZY_SCRATCH_BASE_DIR = ctx.scratchBaseDir;
+  try {
+    return builderScratchDir(ctx.root);
+  } finally {
+    if (previous === undefined) delete process.env.LAZY_SCRATCH_BASE_DIR;
+    else process.env.LAZY_SCRATCH_BASE_DIR = previous;
+  }
+}
 
 /** Poll until `check` passes or the deadline expires. */
 async function waitFor(check: () => Promise<boolean>, timeoutMs: number, label: string): Promise<void> {
@@ -62,7 +76,8 @@ describe('builder live conversation capture', () => {
 
   /**
    * Write the daemon MCP config the supervisor reads (as the runner mounts it),
-   * and the `~/.claude.json` the launcher writes next to it.
+   * plus the `$HOME/.claude.json` that must name it — the supervisor's MCP
+   * preflight requires the two to agree before it will launch Claude Code.
    *
    * The token must be a BUILDER-kind MCP token, exactly what
    * `writeDaemonMcpConfig` mints in production — never the shared daemon token.
@@ -81,22 +96,15 @@ describe('builder live conversation capture', () => {
       path,
       JSON.stringify({ token, projectRoot: ctx.root, taskId: '', target: `http://127.0.0.1:${port}` }, null, 2),
     );
-
-    // The launcher writes this on the host and bind-mounts it to $HOME in the
-    // container (src/builder/claude-home.ts); the supervisor's preflight reads
-    // it to find the MCP server it must probe.
-    await writeFile(
-      join(home, '.claude.json'),
-      JSON.stringify(
-        mergeBuilderClaudeConfig({}, ['mcp', '--daemon-config', path, '--worktree', ctx.root]),
-        null, 2,
-      ),
-    );
+    await writeBuilderClaudeConfig(home, path, ctx.root);
     return path;
   }
 
   /** Run the real builder supervisor to completion; returns its exit code + output. */
-  async function runSupervisor(daemonConfigPath: string): Promise<{ exitCode: number; stderr: string }> {
+  async function runSupervisor(
+    daemonConfigPath: string,
+    extraEnv: Record<string, string> = {},
+  ): Promise<{ exitCode: number; stderr: string }> {
     const promptFile = join(ctx.root, '.lazy', 'tmp', 'builder-prompt.txt');
     await writeFile(promptFile, 'You are the builder.');
     const builderConfigPath = join(ctx.root, '.lazy', 'tmp', 'builder-cfg.json');
@@ -125,6 +133,12 @@ describe('builder live conversation capture', () => {
           // ctx.fakeClaudeBinDir must be on PATH or the supervisor spawns the
           // REAL claude (it is not in process.env.PATH — see TestContext).
           PATH: `${binDir}:${ctx.fakeClaudeBinDir}:${process.env.PATH ?? ''}`,
+          // A production builder belongs to no task turn. Whoever runs this
+          // suite may — `bun test` under a lazy agent inherits that agent's
+          // turn identity, and the MCP server the preflight spawns would then
+          // refuse to serve "another task's" tools. See mcp-env.ts.
+          ...TURN_IDENTITY_ENV_PINS,
+          ...extraEnv,
         },
       },
     );
@@ -172,4 +186,37 @@ describe('builder live conversation capture', () => {
     expect(list.stdout).toContain('seg-a');
     expect(list.stdout).toContain('seg-b');
   }, 90_000);
+
+  // INVARIANT: scratch capture rides the supervisor's capture monitor, not only
+  // `lazy scratch sync`. Unit tests call syncScratchDir directly; without this,
+  // a missing /builder/storage allowlist entry ships with green tests.
+  test('scratch files reach the store on the capture cadence while the session runs', async () => {
+    const scratchDir = scratchDirFor(ctx);
+    await mkdir(scratchDir, { recursive: true });
+    await writeFile(join(scratchDir, 'mid-session.md'), 'builder left this during the run\n');
+
+    await ctx.setClaudeScenario({
+      steps: [
+        { kind: 'session-jsonl', sessionId: 'scratch-sess', userText: 'hi', assistantText: 'hello' },
+        { kind: 'sleep', ms: 5_000 },
+      ],
+    });
+    const daemonConfigPath = await writeDaemonConfig();
+    const running = runSupervisor(daemonConfigPath, {
+      LAZY_SCRATCH_DIR: scratchDir,
+      LAZY_TEST: '1',
+      LAZY_FORCE_BUILDER_CAPTURE_INTERVAL_MS: '1000',
+    });
+
+    await waitFor(
+      async () => {
+        const list = await ctx.lazy(['scratch', 'list']);
+        return list.stdout.includes('mid-session.md');
+      },
+      15_000,
+      'scratch capture of mid-session.md while the builder supervisor is still running',
+    );
+
+    await running;
+  }, 60_000);
 });

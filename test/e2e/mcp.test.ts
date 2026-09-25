@@ -11,7 +11,7 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { extractTaskId } from '../helpers/assertions';
 import { writeFileSync } from 'fs';
-import { readTaskJson } from '../helpers/storage';
+import { readSystemMessagesFile, readTaskJson } from '../helpers/storage';
 import { MCP_SERVER_ENV_PINS } from '../helpers/mcp-env';
 
 const AGENT_ENTRY = resolve(__dirname, '../../src/agent-entry.ts');
@@ -88,11 +88,11 @@ describe('lazy-agent mcp', () => {
 
   beforeEach(async () => {
     // Storage-dependent MCP tools (lazy_status/create/show/comment/...) reach
-    // storage through requireStorage(). The MCP server is spawned WITHOUT
+    // storage through resolveStorage(). The MCP server is spawned WITHOUT
     // LAZY_TEST=1 (runMcpSession pins it off, see MCP_SERVER_ENV_PINS), so it must
     // reach a real daemon over RPC — exactly like the pairing/builder MCP
     // server does in production. A daemonless setup leaves those tools with no
-    // storage backend (requireStorage exits "Daemon is not running"), and the
+    // storage backend (resolveStorage throws "Daemon is not running"), and the
     // lazy_active test's start→wait lifecycle can't run without a daemon at all.
     // Mirrors the sibling mcp-start / mcp-actor / mcp-lifecycle suites.
     ctx = await setupTestLazy({ withDaemon: true });
@@ -131,7 +131,7 @@ describe('lazy-agent mcp', () => {
     expect(result.instructions as string).toContain('lazy_search');
   });
 
-  test('lists all tools', async () => {
+  test('lists the tools an AGENT is served', async () => {
     const taskId = '00000000-0000-0000-0000-000000000001';
 
     const responses = await runMcpSession(ctx.root, taskId, ctx.root, [
@@ -145,29 +145,53 @@ describe('lazy-agent mcp', () => {
 
     const result = toolsResponse!.result as { tools: Array<{ name: string; description: string; inputSchema: unknown }> };
     expect(result.tools).toBeArray();
-    // INVARIANT: this asserts the FULL set of MCP tools lazy exposes. If you
-    // add/remove a tool, update BOTH the count and the sorted name list below so
-    // the surface stays pinned (a silently-dropped tool is a regression).
-    // lazy_propose has been removed from every surface — agents and the builder
-    // decompose/run work via lazy_create + lazy_start (+ the self-orchestration
-    // tools); orthogonal work is recorded with lazy_add_followup / lazy_journal.
-    // lazy_propose must NOT reappear. Upstream's lazy_journal, lazy_add_followup,
-    // lazy_prioritize, lazy_tag, and lazy_untag are all present. The memory
-    // tools (lazy_memory_save / lazy_memory_recall) are registered for BOTH
-    // surfaces — the agent read-only gate lives inside lazy_memory_save's
-    // handler, not in tool registration, so agents still see the tool and get a
-    // clear server-side rejection instead of a mystery missing tool.
-    expect(result.tools.length).toBe(38);
+    // INVARIANT: this pins the tool surface an AGENT is served — the session is
+    // spawned with --task-id, and a non-empty task id IS the agent role. If you
+    // add/remove a tool, or change which role it is advertised to, update BOTH
+    // the count and the sorted name list (a silently-dropped tool is a
+    // regression, and a silently-added one is context every turn pays for).
+    //
+    // Absent by ROLE, not by removal: the builder-only tools (lazy_memory_save,
+    // lazy_scratch, lazy_raised_promote, lazy_message_dismiss, lazy_clone,
+    // lazy_redo, lazy_reparent) are still REGISTERED for this session — their
+    // handlers answer with the same server-side refusal as before — but they are
+    // not advertised, so an agent does not pay ~9k characters of context for
+    // tools it can never call. The refusal, not the advertisement, is the
+    // security boundary; see test/unit/mcp-tool-roles.test.ts.
+    //
+    // Advertised to agents ON PURPOSE, each with its own subtree gate rather
+    // than a role hide: lazy_link (an agent may only adopt a branch/PR as a
+    // child of its own task), lazy_review (own task or a direct subtask), and
+    // lazy_raised_item_comment (agent-only — its handler refuses builder mode,
+    // since it annotates "the current task"'s Raises).
+    //
+    // Removed outright and must NOT reappear: lazy_propose (agents decompose via
+    // lazy_create + lazy_start), lazy_prioritize (removed with the agent
+    // concurrency cap), and the pre-unification aliases lazy_add_followup /
+    // lazy_followups / lazy_followup_promote — raised items are one entity now,
+    // and lazy_raise / lazy_raised_items / lazy_raised_promote are the surface.
+    // 48 since lazy_usage_limits; 47 since the final-turn slice 1 added `lazy_final`; 46 before that, when
+    // the release-v022 merge added `lazy_regions`. Agent-advertised by design,
+    // not by omission: reading a task's regions is open on both surfaces
+    // (public-docs/surface-asymmetries.md §25) — an agent reviewing a large
+    // branch a region at a time is what the tool exists for. Only the human
+    // OVERLAY (naming, sign-off) is CLI-only, and that is a separate tool.
+    expect(result.tools.length).toBe(48);
 
     const toolNames = result.tools.map(t => t.name).sort();
     expect(toolNames).not.toContain('lazy_propose');
+    expect(toolNames).not.toContain('lazy_prioritize');
+    expect(toolNames).not.toContain('lazy_add_followup');
+    expect(toolNames).not.toContain('lazy_followups');
+    expect(toolNames).not.toContain('lazy_followup_promote');
     expect(toolNames).toEqual([
       'lazy_accept',
       'lazy_active',
-      'lazy_add_followup',
+      'lazy_artifact_add',
+      'lazy_artifact_get',
+      'lazy_artifact_list',
       'lazy_ask',
       'lazy_blocked',
-      'lazy_clone',
       'lazy_close',
       'lazy_comment',
       'lazy_commit',
@@ -178,16 +202,24 @@ describe('lazy-agent mcp', () => {
       'lazy_create',
       'lazy_diff',
       'lazy_edit',
+      'lazy_final',
       'lazy_journal',
+      'lazy_justify_maintain',
+      'lazy_justify_protected',
+      'lazy_link',
       'lazy_list',
       'lazy_memory_recall',
-      'lazy_memory_save',
-      'lazy_prioritize',
-      'lazy_redo',
+      'lazy_message_post',
+      'lazy_messages',
+      'lazy_raise',
+      'lazy_raised_item_comment',
+      'lazy_raised_items',
+      'lazy_regions',
       'lazy_reject',
       'lazy_reopen',
-      'lazy_reparent',
+      'lazy_report',
       'lazy_resume',
+      'lazy_review',
       'lazy_search',
       'lazy_show',
       'lazy_start',
@@ -199,6 +231,7 @@ describe('lazy-agent mcp', () => {
       'lazy_unblock',
       'lazy_untag',
       'lazy_update_progress',
+      'lazy_usage_limits',
       'lazy_wait',
     ]);
 
@@ -208,6 +241,33 @@ describe('lazy-agent mcp', () => {
       expect(tool.inputSchema).toBeDefined();
       expect((tool.inputSchema as Record<string, unknown>).type).toBe('object');
     }
+  });
+
+  // INVARIANT: hiding a tool from a role is an ADVERTISEMENT decision, never an
+  // enforcement one. A builder-only tool stays registered for an agent session,
+  // so an agent whose context still lists it (a stale system prompt, a resumed
+  // conversation) gets the tool's own actionable refusal rather than the useless
+  // "Unknown tool: lazy_memory_save".
+  test('an unadvertised builder-only tool still answers with its refusal', async () => {
+    const taskId = '00000000-0000-0000-0000-000000000001';
+
+    const responses = await runMcpSession(ctx.root, taskId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      {
+        method: 'tools/call',
+        id: 2,
+        params: {
+          name: 'lazy_memory_save',
+          arguments: { name: 'x', description: 'd', type: 'project', body: 'b' },
+        },
+      },
+    ]);
+
+    const call = responses.find(r => r.id === 2);
+    expect(call).toBeDefined();
+    const text = JSON.stringify(call);
+    expect(text).not.toContain('Unknown tool');
+    expect(text.toLowerCase()).toContain('memory');
   });
 
   // INVARIANT: lazy_start must expose the `force_local` escape hatch so a
@@ -231,6 +291,68 @@ describe('lazy-agent mcp', () => {
     expect(startTool!.inputSchema.properties?.force_local?.type).toBe('boolean');
     // Optional — must not be in the required list.
     expect(startTool!.inputSchema.required ?? []).not.toContain('force_local');
+  });
+
+  // INVARIANT: `lazy_message_post` is the channel an agent uses MID-TASK to
+  // report an environment problem only the human can fix. It survived the
+  // removal of the wrap-up's systemic check, which was a different mechanism
+  // (one prompt at the end of every final, asking what about the project got
+  // in the way) — nothing in a turn's lifecycle files a message on the agent's
+  // behalf, so this call is the only way one is created.
+  test('lazy_message_post files a system message from an agent session', async () => {
+    const taskShortId = await createTask(ctx, 'Infra reporter', 'Do work');
+    const taskFullId = await fullTaskId(ctx, taskShortId);
+
+    const responses = await runMcpSession(ctx.root, taskFullId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      {
+        method: 'tools/call',
+        id: 2,
+        params: {
+          name: 'lazy_message_post',
+          arguments: {
+            title: 'Flaky e2e suite on slow machines',
+            body: 'The agent suite flakes on slow machines; needs an explicit timeout.',
+            kind: 'notice',
+          },
+        },
+      },
+    ]);
+
+    const call = responses.find(r => r.id === 2)!;
+    expect(call.error).toBeUndefined();
+    const result = call.result as { content: Array<{ type: string; text: string }>; isError?: boolean };
+    expect(result.isError).toBeFalsy();
+    const parsed = JSON.parse(result.content[0].text) as {
+      id: string;
+      short_id: string;
+      source: string;
+      title: string;
+      kind: string;
+      created_at: string;
+    };
+    expect(parsed.kind).toBe('notice');
+    expect(parsed.title).toBe('Flaky e2e suite on slow machines');
+    // The reply's short_id is the MESSAGE's (the read tool takes it) — the
+    // task attribution rides `source`.
+    expect(parsed.short_id).toBe(parsed.id.slice(0, 8));
+    // Source is attributed to the filing task (no code set → the short id).
+    expect(parsed.source).toBe(taskShortId);
+
+    // It landed in the store, unread, verbatim.
+    const messages = readSystemMessagesFile(ctx.root);
+    expect(messages.length).toBe(1);
+    expect(messages[0]!.id).toBe(parsed.id);
+    expect(messages[0]!.kind).toBe('notice');
+    expect(messages[0]!.title).toBe('Flaky e2e suite on slow machines');
+    expect(messages[0]!.body).toContain('needs an explicit timeout');
+    expect(messages[0]!.source).toBe(taskShortId);
+    expect(messages[0]!.read_at).toBeUndefined();
+
+    // And the human surface shows it.
+    const listResult = await ctx.lazy(['messages']);
+    expect(listResult.exitCode).toBe(0);
+    expect(listResult.stdout).toContain('Flaky e2e suite on slow machines');
   });
 
   test('responds to ping', async () => {
@@ -488,19 +610,19 @@ describe('lazy-agent mcp', () => {
   });
 
   // ── Self-orchestration ownership boundary ────────────────────────────────
-  // An agent may run its OWN subtasks end-to-end, but every task-targeting
+  // An agent may run its OWN subtasks end-to-end, but every task-MUTATING
   // self-orchestration tool is confined to the agent's own task or a direct
   // child. These tests encode that security boundary.
+  //
+  // It is a WRITE boundary only. Read-only tools are deliberately absent from
+  // GATED_TOOLS — see the "reads are open tree-wide" block below.
 
-  // INVARIANT: each self-orchestration tool rejects a target the agent does
-  // not own (neither its own task nor a direct subtask), server-side.
-  // `phrase` defaults to the shared own-task-or-direct-child refusal. Accept is
-  // stricter (direct children ONLY — see the child-only tests below), so it
-  // carries its own phrase.
+  // INVARIANT: each state-changing self-orchestration tool rejects a target the
+  // agent does not own (neither its own task nor a direct subtask),
+  // server-side. `phrase` defaults to the shared own-task-or-direct-child
+  // refusal. Accept is stricter (direct children ONLY — see the child-only
+  // tests below), so it carries its own phrase.
   const GATED_TOOLS: Array<{ name: string; extraArgs: Record<string, unknown>; phrase?: string }> = [
-    { name: 'lazy_show', extraArgs: {} },
-    { name: 'lazy_diff', extraArgs: {} },
-    { name: 'lazy_wait', extraArgs: { timeout: 1 } },
     { name: 'lazy_unblock', extraArgs: { feedback: 'do x' } },
     { name: 'lazy_accept', extraArgs: {}, phrase: 'own direct subtasks' },
     { name: 'lazy_reject', extraArgs: {} },
@@ -582,7 +704,89 @@ describe('lazy-agent mcp', () => {
     });
   }
 
-  // An agent CAN review its own direct subtask (read gate passes).
+  // ── Reads are open tree-wide (the lazy flywheel) ─────────────────────────
+  // INVARIANT: read-only MCP tools are NOT ownership-gated for agent callers.
+  // An agent may read ANY task in the project — its own, a child's, a
+  // stranger's. Agents learning from the work of the agents before them is the
+  // day-one intent of lazy; gating reads defeated it (a spike told by its own
+  // prompt to read a prior spike with lazy_show was refused and had to
+  // reconstruct it from 500-char search excerpts). Explicit engineer decision,
+  // 2026-08-06 — memory record `lazy-flywheel-agents-read-everything`, task
+  // `agent-tree-read-access`. Writes stay gated (GATED_TOOLS above).
+  // Do NOT re-add read gating or file its absence as a bug.
+  test('lazy_show reads a task the agent does not own, in full', async () => {
+    const myShortId = await createTask(ctx, 'My agent task');
+    const myFullId = await fullTaskId(ctx, myShortId);
+    const otherShortId = await createTask(ctx, 'Unrelated prior task', 'Prior task prompt body');
+
+    const responses = await runMcpSession(ctx.root, myFullId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_show', arguments: { task_id: otherShortId, sections: ['turns'] } } },
+    ]);
+
+    const resp = responses.find(r => r.id === 2);
+    const result = resp!.result as { content: Array<{ type: string; text: string }>; isError?: boolean };
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.goal).toBe('Unrelated prior task');
+    // The full prompt, untruncated — this is the depth search excerpts cannot give.
+    expect(parsed.prompt).toBe('Prior task prompt body');
+  });
+
+  // INVARIANT (flywheel, as above): lazy_diff and lazy_wait are read-only and
+  // therefore ungated. A backlog task has no branch/session, so these calls may
+  // still fail on task STATE — what must never appear is the ownership refusal.
+  for (const tool of [
+    { name: 'lazy_diff', extraArgs: {} },
+    { name: 'lazy_wait', extraArgs: { timeout: 1 } },
+  ]) {
+    test(`${tool.name} does not refuse a task the agent does not own`, async () => {
+      const myShortId = await createTask(ctx, 'My agent task');
+      const myFullId = await fullTaskId(ctx, myShortId);
+      const otherShortId = await createTask(ctx, 'Unrelated task', 'Do work');
+
+      const responses = await runMcpSession(ctx.root, myFullId, ctx.root, [
+        { method: 'initialize', id: 1, params: {} },
+        { method: 'tools/call', id: 2, params: { name: tool.name, arguments: { task_id: otherShortId, ...tool.extraArgs } } },
+      ]);
+
+      const resp = responses.find(r => r.id === 2);
+      const result = resp!.result as { content: Array<{ type: string; text: string }>; isError?: boolean };
+      if (result.isError) {
+        const parsed = JSON.parse(result.content[0].text);
+        expect(parsed.error).not.toContain('own task or its direct subtasks');
+      }
+    });
+  }
+
+  // INVARIANT: lazy_wait refuses exactly ONE target — the caller's own task.
+  //
+  // This is NOT an ownership rule (wait is open across the whole tree, per the
+  // flywheel block above); it is mechanical. The caller's turn ending is
+  // precisely the event the wait is waiting for, so an agent waiting on itself
+  // can only sit there until the timeout expires. Refusing it up front, with a
+  // message that says why, turns a silent 600 s stall into an immediate,
+  // actionable error. Engineer decision, 2026-08-07 (task
+  // `agent-tree-read-access`).
+  test('lazy_wait rejects an agent waiting on its own task', async () => {
+    const myShortId = await createTask(ctx, 'My agent task');
+    const myFullId = await fullTaskId(ctx, myShortId);
+
+    const responses = await runMcpSession(ctx.root, myFullId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_wait', arguments: { task_id: myShortId, timeout: 1 } } },
+    ]);
+
+    const resp = responses.find(r => r.id === 2);
+    const result = resp!.result as { content: Array<{ type: string; text: string }>; isError?: boolean };
+    expect(result.isError).toBe(true);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toContain('may not wait on their own task');
+    // The message must explain the mechanism, not just refuse.
+    expect(parsed.error).toContain('can only time out');
+  });
+
+  // An agent CAN review its own direct subtask.
   test('lazy_show allows an agent to inspect its own subtask', async () => {
     const myShortId = await createTask(ctx, 'My agent task');
     const myFullId = await fullTaskId(ctx, myShortId);
@@ -616,6 +820,10 @@ describe('lazy-agent mcp', () => {
     expect(result.isError).toBeUndefined();
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.goal).toBe('My own agent task');
+    // INVARIANT: lazy_show carries the "Before you can accept" rows the show
+    // RPC serves, so an agent can see what holds its own accept. Empty here —
+    // nothing has run — but present, never absent.
+    expect(parsed.accept_gate).toEqual({ rows: [] });
   });
 
   // The ownership gate must NOT block a lifecycle tool on an own subtask. The
@@ -659,7 +867,8 @@ describe('lazy-agent mcp', () => {
   });
 
   test('lazy_show returns task details', async () => {
-    // The agent shows its OWN task (ownership gate allows own + direct children).
+    // The agent shows its OWN task (reads are open on any task; this is the
+    // ordinary shape).
     const taskShortId = await createTask(ctx, 'Show test task');
     const taskFullId = await fullTaskId(ctx, taskShortId);
 
@@ -710,18 +919,22 @@ describe('lazy-agent mcp', () => {
     expect(result.isError).toBe(true);
   });
 
-  test('lazy_comment adds a comment to current task', async () => {
-    // Create a task first and use its ID as the "current" task
+  // This used to comment on the CALLER'S OWN task with `task_id` omitted. That
+  // is now refused: an agent may only comment on a DIRECT SUBTASK, because a
+  // comment is delivered into the target's next turn prompt and a comment on
+  // yourself just lands in your own. Engineer decision, 2026-08-07 (task
+  // `agent-tree-read-access`) — the refusal itself is asserted in
+  // test/e2e/mcp-annotation-gate.test.ts; this test keeps the end-to-end
+  // happy path over MCP, retargeted at a subtask.
+  test('lazy_comment adds a comment to a direct subtask', async () => {
     const taskShortId = await createTask(ctx, 'Comment test task');
+    const myFullId = await fullTaskId(ctx, taskShortId);
+    const childRes = await ctx.lazy(['create', '--goal', 'Comment target', '--prompt', 'do', '--parent', taskShortId]);
+    const childShortId = extractTaskId(childRes.stdout);
 
-    // We need the full UUID to pass to MCP. Look it up via show.
-    const showResult = await ctx.lazy(['show', taskShortId, '--full']);
-    const idMatch = showResult.stdout.match(/ID:\s+([a-f0-9-]{36})/);
-
-    // The MCP server takes a full UUID but the comment tool also accepts short IDs
-    const responses = await runMcpSession(ctx.root, idMatch![1], ctx.root, [
+    const responses = await runMcpSession(ctx.root, myFullId, ctx.root, [
       { method: 'initialize', id: 1, params: {} },
-      { method: 'tools/call', id: 2, params: { name: 'lazy_comment', arguments: { message: 'MCP comment test' } } },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_comment', arguments: { task_id: childShortId, message: 'MCP comment test' } } },
     ]);
 
     const commentResponse = responses.find(r => r.id === 2);
@@ -730,7 +943,7 @@ describe('lazy-agent mcp', () => {
     const result = commentResponse!.result as { content: Array<{ type: string; text: string }> };
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.content).toBe('MCP comment test');
-    expect(parsed.task_id).toBe(taskShortId);
+    expect(parsed.task_id).toBe(childShortId);
   });
 
   // INVARIANT: lazy_propose is no longer exposed as an MCP tool. Calling it
@@ -1109,6 +1322,26 @@ describe('lazy-agent mcp', () => {
     expect(parsed.worktree.uncommitted_changes).toBeNull();
   });
 
+  // INVARIANT: lazy_status carries the same dashboard base URL as
+  // `lazy daemon dashboard-url`, so agents can construct clickable links
+  // without a dedicated tool. Not a guessed host: it comes from the daemon.
+  test('lazy_status includes dashboard_url matching the daemon dashboard', async () => {
+    const urlResult = await ctx.lazy(['daemon', 'dashboard-url']);
+    expect(urlResult.exitCode).toBe(0);
+    const expected = urlResult.stdout.trim();
+
+    const responses = await runMcpSession(ctx.root, '00000000-0000-0000-0000-000000000001', ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_status', arguments: {} } },
+    ]);
+
+    const statusResponse = responses.find(r => r.id === 2);
+    const result = statusResponse!.result as { content: Array<{ type: string; text: string }> };
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.dashboard_url).toBe(expected);
+  });
+
   // -----------------------------------------------------------------------
   // lazy_active tests - verifies it returns ALL non-terminal tasks with sessions
   // -----------------------------------------------------------------------
@@ -1352,17 +1585,16 @@ describe('lazy-agent mcp', () => {
   });
 
   // -----------------------------------------------------------------------
-  // lazy_create: runner and priority on the AGENT path
+  // lazy_create: runner on the AGENT path
   // -----------------------------------------------------------------------
 
   // INVARIANT: every field lazy_create advertises on its schema is applied on
-  // the agent path too. runner and priority used to be read and then dropped
-  // when ctx.taskId was set: an agent asking for priority 'urgent' got a
-  // normal-priority task and no error at all. Neither field widens the agent's
-  // blast radius — the parent is still forced to the calling task — so they are
-  // honored; silent acceptance was the one unacceptable option.
-  test('lazy_create applies runner and priority when called by an agent', async () => {
-    const parentShortId = await createTask(ctx, 'Runner/priority parent');
+  // the agent path too. runner used to be read and then dropped when ctx.taskId
+  // was set. It does not widen the agent's blast radius — the parent is still
+  // forced to the calling task — so it is honored; silent acceptance was the
+  // one unacceptable option.
+  test('lazy_create applies runner when called by an agent', async () => {
+    const parentShortId = await createTask(ctx, 'Runner parent');
     const parentFullId = await fullTaskId(ctx, parentShortId);
 
     const responses = await runMcpSession(ctx.root, parentFullId, ctx.root, [
@@ -1372,7 +1604,7 @@ describe('lazy-agent mcp', () => {
         id: 2,
         params: {
           name: 'lazy_create',
-          arguments: { goal: 'Honors runner and priority', runner: 'host', priority: 'urgent' },
+          arguments: { goal: 'Honors runner', runner: 'podman' },
         },
       },
     ]);
@@ -1381,15 +1613,95 @@ describe('lazy-agent mcp', () => {
     expect(result.isError).toBeUndefined();
     const parsed = JSON.parse(result.content[0].text);
 
-    // Echoed back, so the caller can see what it actually got. 'host' is the
-    // user-facing alias; the stored runner type is the canonical spelling.
-    expect(parsed.runner).toBe('dangerously-host-process-without-any-isolation');
-    expect(parsed.priority).toBe('urgent');
+    expect(parsed.runner).toBe('podman');
     expect(parsed.parent_task_id).toBe(parentShortId);
 
-    // And PERSISTED — the response echoing them would be worthless on its own.
     const stored = readTaskJson(ctx.root, parsed.id);
-    expect(stored.priority).toBe('urgent');
-    expect(stored.runner_type).toBe('dangerously-host-process-without-any-isolation');
+    expect(stored.runner_type).toBe('podman');
+  });
+
+  // --- artifacts ---
+
+  test('lazy_artifact_add attaches a worktree file, and list/get read it back', async () => {
+    const myShortId = await createTask(ctx, 'Artifact publisher');
+    const myFullId = await fullTaskId(ctx, myShortId);
+    writeFileSync(join(ctx.root, 'report.md'), '# findings\n');
+
+    // The write and the reads are separate sessions on purpose: runMcpSession
+    // pipelines requests without waiting for each response, so a read issued in
+    // the same session can overtake the write it depends on.
+    const responses = await runMcpSession(ctx.root, myFullId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_artifact_add', arguments: { path: 'report.md' } } },
+    ]);
+    const reads = await runMcpSession(ctx.root, myFullId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 3, params: { name: 'lazy_artifact_list', arguments: {} } },
+      { method: 'tools/call', id: 4, params: { name: 'lazy_artifact_get', arguments: { name: 'report.md' } } },
+    ]);
+
+    const added = JSON.parse((responses.find(r => r.id === 2)!.result as any).content[0].text);
+    expect(added.name).toBe('report.md');
+    // An agent's own attach defaults to `output` — it is publishing something,
+    // not being handed something.
+    expect(added.origin).toBe('output');
+    expect(added.worktree_path).toBe('.lazy-task-sandbox/artifacts/report.md');
+
+    const listed = JSON.parse((reads.find(r => r.id === 3)!.result as any).content[0].text);
+    expect(listed.artifacts.map((a: any) => a.name)).toEqual(['report.md']);
+    expect(listed.remaining_slots).toBeGreaterThan(0);
+
+    const got = JSON.parse((reads.find(r => r.id === 4)!.result as any).content[0].text);
+    expect(got.content).toBe('# findings\n');
+  });
+
+  test('lazy_artifact_add accepts inline content and rejects two sources at once', async () => {
+    const myFullId = await fullTaskId(ctx, await createTask(ctx, 'Inline artifact'));
+
+    const responses = await runMcpSession(ctx.root, myFullId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_artifact_add', arguments: { name: 'note.txt', content: 'inline' } } },
+      { method: 'tools/call', id: 3, params: { name: 'lazy_artifact_add', arguments: { name: 'note.txt', content: 'inline', path: 'note.txt' } } },
+    ]);
+
+    const added = JSON.parse((responses.find(r => r.id === 2)!.result as any).content[0].text);
+    expect(added.size).toBe(6);
+
+    // Two content sources is an ambiguity we refuse rather than resolve by
+    // precedence — the caller would never learn which one it got.
+    const bad = responses.find(r => r.id === 3)!.result as { content: Array<{ text: string }>; isError?: boolean };
+    expect(bad.isError).toBe(true);
+  });
+
+  // INVARIANT: attach is ownership-gated like every other agent write — an agent
+  // cannot push files onto a task that is neither its own nor a direct subtask.
+  test('lazy_artifact_add rejects an agent targeting an unrelated task', async () => {
+    const myFullId = await fullTaskId(ctx, await createTask(ctx, 'My task'));
+    const otherShortId = await createTask(ctx, 'Unrelated task');
+
+    const responses = await runMcpSession(ctx.root, myFullId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_artifact_add', arguments: { task_id: otherShortId, name: 'x.txt', content: 'x' } } },
+    ]);
+
+    const result = responses.find(r => r.id === 2)!.result as { content: Array<{ text: string }>; isError?: boolean };
+    expect(result.isError).toBe(true);
+  });
+
+  // Reads stay open tree-wide (the lazy flywheel): an agent may read what
+  // another task published without being able to write to it.
+  test('lazy_artifact_list reads an unrelated task', async () => {
+    const myFullId = await fullTaskId(ctx, await createTask(ctx, 'Reader'));
+    const otherShortId = await createTask(ctx, 'Publisher');
+    writeFileSync(join(ctx.root, 'out.txt'), 'published\n');
+    await ctx.lazy(['artifact', 'add', otherShortId, 'out.txt']);
+
+    const responses = await runMcpSession(ctx.root, myFullId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_artifact_list', arguments: { task_id: otherShortId } } },
+    ]);
+
+    const listed = JSON.parse((responses.find(r => r.id === 2)!.result as any).content[0].text);
+    expect(listed.artifacts.map((a: any) => a.name)).toEqual(['out.txt']);
   });
 });

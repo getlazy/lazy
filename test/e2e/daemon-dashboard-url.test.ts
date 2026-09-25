@@ -1,15 +1,22 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask } from '../helpers/fixtures';
+import { signInToDashboard, type DashboardFetch } from '../helpers/dashboard-session';
+import { DASHBOARD_HOSTNAME } from '../../src/daemon/dashboard-url';
 
 describe('lazy daemon dashboard-url', () => {
   let ctx: TestContext;
+  // `dashboard-url` prints the ADDRESS; signing in is `lazy dashboard`'s job.
+  // These tests still have to fetch pages, so they hold a session from the one
+  // sign-in helper rather than each growing a cookie header.
+  let fetch: DashboardFetch;
 
   // `lazy daemon dashboard-url` reads the running daemon's web dashboard port
   // and prints its URL. Unlike the old `lazy server` alias, it does NOT
   // auto-start the daemon — every test needs a real one running already.
   beforeEach(async () => {
     ctx = await setupTestLazy({ withDaemon: true });
+    ({ fetch } = await signInToDashboard(ctx));
   });
 
   afterEach(async () => {
@@ -20,10 +27,9 @@ describe('lazy daemon dashboard-url', () => {
   async function dashboardUrl(): Promise<string> {
     const result = await ctx.lazy(['daemon', 'dashboard-url']);
     expect(result.exitCode).toBe(0);
-    // The daemon binds to 127.0.0.1 (loopback) by default, so the printed URL
-    // uses the real interface, not a hardcoded `localhost` (which can resolve
-    // to IPv6 ::1 and miss the IPv4 bind).
-    const match = result.stdout.match(/(http:\/\/[\d.]+:\d+)/);
+    // The printed URL is on the dashboard's own hostname (see below); the
+    // sign-in helper's `fetch` transports it to the loopback bind.
+    const match = result.stdout.match(/(http:\/\/\S+:\d+)/);
     if (!match) {
       throw new Error(`No dashboard URL in output.\nstdout: ${result.stdout}\nstderr: ${result.stderr}`);
     }
@@ -35,10 +41,19 @@ describe('lazy daemon dashboard-url', () => {
   test('prints just the daemon dashboard URL and exits 0', async () => {
     const result = await ctx.lazy(['daemon', 'dashboard-url']);
     expect(result.exitCode).toBe(0);
-    // INVARIANT: the URL reflects the actual loopback bind (127.0.0.1), not a
-    // hardcoded `localhost` — `localhost` can resolve to IPv6 ::1 and fail to
-    // reach the IPv4-only 127.0.0.1 bind, leaving the user on an empty page.
-    expect(result.stdout.trim()).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+    // INVARIANT: the URL is on the dashboard's OWN hostname, and specifically
+    // not the bare `localhost` — `localhost` can resolve to IPv6 ::1 and fail
+    // to reach the IPv4-only 127.0.0.1 bind, leaving the user on an empty page.
+    //
+    // It used to assert the literal 127.0.0.1 the daemon binds. That changed
+    // for a security reason, not a cosmetic one: cookies are scoped by host and
+    // not by port, so a dashboard session valid at 127.0.0.1 would also be sent
+    // to the task app ports `[serve]` publishes there (src/daemon/dashboard-url.ts).
+    // What the invariant protects — a connectable, unambiguous host that the
+    // whole CLI prints identically — is unchanged.
+    const printed = result.stdout.trim();
+    expect(printed).toMatch(new RegExp(`^http://${DASHBOARD_HOSTNAME}:\\d+$`));
+    expect(new URL(printed).hostname).not.toBe('localhost');
   });
 
   // INVARIANT: unlike the old `lazy server` alias, dashboard-url does NOT
@@ -136,12 +151,17 @@ describe('lazy daemon dashboard-url', () => {
     expect(html).toMatch(/"date":"\d{4}-\d{2}-\d{2}"/);
   });
 
+  // Labels are title-cased (Dashboard / Loops / Tasks) since the Teams-CSS
+  // restyle. Match the exact casing so a later accidental change is caught.
+  // Search is deliberately NOT a nav link: the box and the palette are its two
+  // entry points.
   test('dashboard navigation links are correct', async () => {
     const base = await dashboardUrl();
     const res = await fetch(`${base}/`);
     const html = await res.text();
-    expect(html).toContain('href="/">dashboard</a>');
-    expect(html).toContain('href="/tasks">tasks</a>');
-    expect(html).toContain('href="/search">search</a>');
+    expect(html).toContain('href="/">Dashboard</a>');
+    expect(html).toContain('href="/tasks">Tasks</a>');
+    expect(html).toContain('href="/clusters">Clusters');
+    expect(html).not.toContain('>Search</a>');
   });
 });

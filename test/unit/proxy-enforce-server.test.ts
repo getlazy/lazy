@@ -168,6 +168,28 @@ describe('proxy enforcement (server integration)', () => {
     proxy.stop();
   });
 
+  // REGRESSION: `.env.example` is a committed placeholder template, not a
+  // credential — the enforcement path must let the tool_use through intact.
+  test('lets a .env.example Read tool_use through', async () => {
+    nextResponse = () =>
+      new Response(toolUseSSE('Read', { path: '/app/deploy/.env.example' }, 'toolu_tpl'), {
+        headers: { 'content-type': 'text/event-stream' },
+      });
+    const { proxy, ms, port } = startProxy();
+    await new Promise((r) => setTimeout(r, 20));
+
+    const resp = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...reqWithTools, tools: [{ name: 'Read' }] }),
+    });
+    const msg = parseSSEMessage(await resp.text())!;
+    expect(msg.content.filter((b) => b.type === 'tool_use')).toHaveLength(1);
+    await new Promise((r) => setTimeout(r, 40));
+    expect(ms.records[ms.records.length - 1].enforcement).toBeNull();
+    proxy.stop();
+  });
+
   test('a request with NO tools streams through untouched (passthrough preserved)', async () => {
     // Even if the (impossible) response carried a connector, a no-tools request
     // is never buffered — verify the body is returned verbatim and unenforced.

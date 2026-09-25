@@ -1,4 +1,5 @@
 import { describe, test, expect } from 'bun:test';
+import { ANTHROPIC_DEFAULT_TARGET } from '../../src/utils/role-target';
 import { DEFAULT_CONFIG } from '../../src/config/loader';
 import {
   applyFidelitySection,
@@ -6,6 +7,7 @@ import {
   composeInitialBody,
   synthesizeFidelityBody,
   regenerateFidelity,
+  writeFidelityBody,
   FIDELITY_BEGIN,
   FIDELITY_END,
 } from '../../src/synthesis/fidelity';
@@ -78,7 +80,6 @@ function makeTask(overrides?: Partial<Task>): Task {
     prompt: 'Original prompt',
     type: 'task',
     status: 'blocked',
-    priority: 'normal',
     created_at: Date.now(),
     completed_at: null,
     target: { kind: 'branch' as const, branch: 'main' },
@@ -187,6 +188,7 @@ describe('regenerateFidelity', () => {
     expect(result.fidelityBody).toContain('ECHO:Original goal');
     expect(updatedWith).toContain('ECHO:Original goal');
     expect(result.warning).toBeUndefined();
+    expect(result.outcome).toBe('written');
   });
 
   // INVARIANT: on synthesis failure we must NOT push a remote body update and
@@ -201,6 +203,13 @@ describe('regenerateFidelity', () => {
     const result = await regenerateFidelity(storage, makeTask(), driver, failingSummarizer);
     expect(called).toBe(false);
     expect(result.fidelityBody).toBeUndefined();
+    // INVARIANT: this path reports itself distinctly, and carries NO warning.
+    // A caller tracking which turns are reflected in the description must be
+    // able to tell "deliberately did not write" from "wrote successfully" —
+    // reading the absent warning as success is what let a synthesis outage
+    // silently freeze a PR description.
+    expect(result.outcome).toBe('synthesis-fallback');
+    expect(result.warning).toBeUndefined();
   });
 
   // A remote WRITE failure is surfaced as a warning but never thrown — the
@@ -211,8 +220,10 @@ describe('regenerateFidelity', () => {
 
     const result = await regenerateFidelity(storage, makeTask(), driver, echoSummarizer);
     expect(result.warning).toContain('gh down');
-    // Still returns the synthesized body for the local squash path.
+    // Still returns the synthesized body for the local squash path — and for a
+    // caller that wants to retry the write later without re-synthesizing.
     expect(result.fidelityBody).toContain('ECHO:Original goal');
+    expect(result.outcome).toBe('write-failed');
   });
 
   test('skips remote write for non-hosted drivers but still returns fidelityBody', async () => {
@@ -223,6 +234,46 @@ describe('regenerateFidelity', () => {
     const result = await regenerateFidelity(storage, makeTask(), driver, echoSummarizer);
     expect(called).toBe(false);
     expect(result.fidelityBody).toContain('ECHO:Original goal');
+    // Distinct from a failed write: there is no remote description to be
+    // stale, so a staleness-tracking caller must not treat this as pending.
+    expect(result.outcome).toBe('not-attempted');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// writeFidelityBody — the write half, reusable without re-synthesizing
+// ---------------------------------------------------------------------------
+
+describe('writeFidelityBody', () => {
+  // INVARIANT: the write is separable from synthesis so a caller holding a
+  // summary whose write failed can retry the WRITE alone. Re-running
+  // regenerateFidelity instead spends a summarizer one-shot to re-derive
+  // identical text from storage that has not changed.
+  test('writes an already-synthesized summary without consulting a summarizer', async () => {
+    let updatedWith: string | undefined;
+    const driver = fakeDriver({ updateRemoteBody: async (_t, s) => { updatedWith = s; } });
+
+    const result = await writeFidelityBody(makeTask(), driver, 'a summary from an earlier pass');
+    expect(result.outcome).toBe('written');
+    expect(result.warning).toBeUndefined();
+    expect(updatedWith).toBe('a summary from an earlier pass');
+  });
+
+  test('reports a failed write as a warning and never throws', async () => {
+    const driver = fakeDriver({ updateRemoteBody: async () => { throw new Error('gh down'); } });
+
+    const result = await writeFidelityBody(makeTask(), driver, 'summary');
+    expect(result.outcome).toBe('write-failed');
+    expect(result.warning).toContain('gh down');
+  });
+
+  test('does not attempt a write for a driver with no remote body', async () => {
+    let called = false;
+    const driver = fakeDriver({ needsSync: false, updateRemoteBody: async () => { called = true; } });
+
+    const result = await writeFidelityBody(makeTask(), driver, 'summary');
+    expect(result.outcome).toBe('not-attempted');
+    expect(called).toBe(false);
   });
 });
 
@@ -231,16 +282,18 @@ describe('regenerateFidelity', () => {
 // ---------------------------------------------------------------------------
 
 const mockConfig: ResolvedConfig = {
-  models: { default: 'claude-sonnet-4-5-20250929', roles: { builder: { backend: 'anthropic', model: '', endpoint: '' }, agent: { backend: 'anthropic', model: '', endpoint: '' } } },
+  models: { default: 'claude-sonnet-4-5-20250929', roles: { builder: ANTHROPIC_DEFAULT_TARGET, agent: ANTHROPIC_DEFAULT_TARGET } },
   session: { verbose: false, debug: false, auto_commit_instructions: false },
   data: { path: '/tmp/test/.lazy' },
-  storage: { backend: 'external', external_path: '', postgres_ssl: false },
+  storage: { backend: 'external', external_path: '' },
   git: { default_branch_prefix: 'lazy', lfs_check: 'refuse' },
   output: { shortid_length: 8 },
+  agents: {},
   agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0, wind_down_timeout_ms: 0, effort: 'medium' },
+  review: { mode: 'low_high', auto_fix: false, gate: 'auto', draft_effort: 'low', review_effort: 'xhigh' },
   builder: { effort: 'high' },
   chattiness: { default: '', builder: '', agent: '' },
-  server: { port: 3000, sync_interval: 1000, bind: '127.0.0.1' },
+  server: { port: 3000, sync_interval: 1000, bind: '127.0.0.1', dashboard_url: '' },
   remote: {
     driver: 'github',
     git_remote: 'origin',
@@ -251,18 +304,20 @@ const mockConfig: ResolvedConfig = {
     gitlab_auto_push: true,
     gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
   },
-  docker: { dockerfile: '' },
-  runner: { type: 'docker' as const, permission_mode: 'sandbox' as const, sandbox_allowed_domains: ['*.anthropic.com'], sandbox_deny_read: [], sandbox_deny_write: [], sandbox_allow_weaker_nested: false },
+  docker: { dockerfile: '', build_inputs: [], run_args: [] },
+  runner: { type: 'docker' as const, permission_mode: 'sandbox' as const, sandbox_allowed_domains: ['*.anthropic.com'], sandbox_deny_read: [], sandbox_deny_write: [], sandbox_allow_weaker_nested: false, verify_sandbox_boundary: 'off' as const },
   documents: { path: '' },
   features: {},
   worktree: { include: [] },
   permissions: { protected: [] },
   protection: { enabled: false, protected_branches: [], protected_tasks: [], gate_default_branch: true },
-  automation: { maintain: [], pre_accept: { enabled: false, commands: [], timeout: 600 } },
+  automation: { maintain: [], react: [], pre_accept: { enabled: false, commands: [], timeout: 600 }, pre_turn: '', pre_turn_timeout: 120, pre_turn_required: false, post_turn: '', post_turn_timeout: 300, accept_check: '', accept_check_timeout: 300 },
   mounts: [],
-  checks: { post_turn: '', post_turn_timeout: 300 },
-  ollama: { enabled: false, model: '', endpoint: 'http://host.docker.internal:11434' },
-  limits: { max_concurrent_agents: 8, max_concurrent_builders: 8, idle_grace_minutes: 10, max_turns_without_human: 10 },
+  serve: { services: [], start_services_cmd: '' },
+  credentials: { backend: 'auto' },
+  limits: { max_concurrent_builders: 8, max_turns_without_human: 10 },
+  cluster: { max_child_fix_rounds: 3 },
+  usage_pause: { threshold_percent: 0, credentials: {} },
   daemon: {
     auto_react_ci: true,
     auto_react_comments: true,

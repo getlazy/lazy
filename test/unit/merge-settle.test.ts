@@ -16,7 +16,7 @@
  */
 
 import { describe, test, expect, afterEach } from 'bun:test';
-import { mkdtemp, rm, writeFile } from 'fs/promises';
+import { mkdtemp, rm, writeFile, readdir } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
@@ -156,18 +156,43 @@ describe('settleConflictedWorktree', () => {
     expect(git(repoDir, 'rev-parse', 'HEAD').stdout).toBe(headBefore);
   });
 
-  test('reports settled: false with an actionable message when the abort fails', async () => {
-    // INVARIANT (fix-sync-silent-conflict): a failed abort is NOT swallowed. The
-    // one situation that absolutely has to be shouted about is a worktree we
-    // could not put back — the caller gets `settled: false` and a command to run.
+  test('recovers a half-state the abort cannot fix, saving a patch before it resets', async () => {
+    // INVARIANT (fix-sync-silent-conflict): a failed abort is NOT swallowed.
+    // AMENDED (fix-merge-agent-nonclaude): this state used to be unrecoverable
+    // and the assertion here was `settled: false`. It is recoverable now —
+    // settle's last rung saves the worktree diff to `.lazy/recovery/` and then
+    // resets to HEAD — so the invariant this test guards is unchanged in
+    // substance (never leave a worktree wedged, never discard work silently)
+    // while the outcome is strictly better: the task continues instead of
+    // waiting for a human with a terminal.
     repoDir = await createConflictingRepo();
     startConflictingMerge(repoDir);
 
     // Unmerged paths with no MERGE_HEAD: `git merge --abort` refuses ("There is
-    // no merge to abort"), so settling cannot succeed. This is the shape the
-    // live incident left behind after something reset the merge out from under
-    // the conflict markers.
+    // no merge to abort"). This is the shape the live incident left behind
+    // after something reset the merge out from under the conflict markers.
     await rm(join(repoDir, '.git', 'MERGE_HEAD'), { force: true });
+
+    const result = await settleConflictedWorktree(repoDir);
+    expect(result.settled).toBe(true);
+    expect(isMidMerge(await readWorktreeMergeState(repoDir))).toBe(false);
+
+    // Nothing is discarded silently: the patch exists and the detail names it.
+    const patches = await readdir(join(repoDir, '.lazy', 'recovery'));
+    expect(patches.length).toBe(1);
+    expect(result.detail).toContain(patches[0]!);
+  });
+
+  test('reports settled: false with an actionable message when nothing can settle it', async () => {
+    // INVARIANT (fix-sync-silent-conflict): the one situation that absolutely
+    // has to be shouted about is a worktree we could not put back — the caller
+    // gets `settled: false` and a command to run, never a quiet success.
+    repoDir = await createConflictingRepo();
+    startConflictingMerge(repoDir);
+
+    // A stale index.lock is the real-world shape of "no git command that writes
+    // the index can run here": both the abort and the reset fail on it.
+    await writeFile(join(repoDir, '.git', 'index.lock'), '');
 
     const result = await settleConflictedWorktree(repoDir);
     expect(result.settled).toBe(false);

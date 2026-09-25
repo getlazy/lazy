@@ -1,22 +1,137 @@
+/* Task list chrome: sortable headers, protection markers, stat cards. */
+
 .sort-link {
-  color: var(--text-secondary);
+  color: inherit;
   text-decoration: none;
   white-space: nowrap;
 }
-.sort-link:hover {
-  color: var(--text);
-  text-decoration: none;
-}
-.sort-link.sort-active {
-  color: var(--text);
-}
+.sort-link:hover, .sort-link.sort-active { color: var(--color-accent); text-decoration: none; }
+
+/* The `[P]` marker from src/protection/status.ts — the shared vocabulary, in
+   the shared "needs your attention" tone. */
 .protection-badge {
-  color: var(--warning, #d29922);
+  color: var(--color-warning);
   font-weight: 600;
   cursor: help;
 }
 .protection-legend {
-  color: var(--text-secondary);
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
   font-size: 0.85em;
   margin-top: 0.75em;
 }
+
+/* — dashboard counters —
+   A row of framed figures. Same hairline frame as every other object on the
+   surface; the number carries the state's colour, set in the markup from the
+   role tokens. */
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: var(--space-3);
+  margin-bottom: var(--space-8);
+}
+.stat-card {
+  padding: var(--space-4);
+  border: 1px solid var(--color-divider);
+  background: var(--color-surface);
+  text-align: center;
+  text-decoration: none;
+  color: inherit;
+}
+.stat-card-link:hover {
+  border-color: var(--color-accent);
+  text-decoration: none;
+}
+.stat-value {
+  font-family: var(--font-heading);
+  font-weight: var(--font-heading-weight);
+  font-size: 30px;
+  line-height: 1.1;
+}
+.stat-label {
+  font-size: 11px;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-top: var(--space-1);
+}
+
+/* — the active-states rail beside the throughput chart —
+   One framed row per non-empty state, edged in that state's colour. */
+.state-rail { display: flex; flex-direction: column; gap: var(--space-2); }
+.state-row {
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-surface);
+  border-left: 3px solid var(--color-neutral-500);
+}
+.state-row-label {
+  font-size: 11px;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.state-row-value {
+  font-family: var(--font-heading);
+  font-weight: var(--font-heading-weight);
+  font-size: 20px;
+}
+.state-working { border-left-color: var(--color-accent); }
+.state-blocked { border-left-color: var(--color-warning); }
+.state-interrupted { border-left-color: var(--color-violet-800); }
+.state-merging { border-left-color: var(--color-accent-2); }
+.state-pairing { border-left-color: var(--color-success); }
+.state-submitted { border-left-color: var(--color-indigo-800); }
+
+/* — the task edit form (/tasks/:id/edit) —
+   A plain stacked form: label, control, label, control. The prompt preview sits
+   in a <details> above its textarea so the rendered Markdown is visible without
+   a line of JavaScript. */
+.edit-notice {
+  border: 1px solid var(--color-divider);
+  border-left: 3px solid var(--color-success);
+  padding: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+.edit-notice-err { border-left-color: var(--color-danger); }
+.edit-notice-locked { border-left-color: var(--color-warning); }
+
+.edit-form { max-width: 900px; }
+.edit-form .input { width: 100%; }
+.edit-label {
+  display: block;
+  margin-top: var(--space-4);
+  margin-bottom: var(--space-1);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: color-mix(in srgb, var(--color-text) 60%, transparent);
+}
+.edit-prompt { font-family: var(--font-mono); min-height: 320px; }
+.edit-check {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
+  font-size: 14px;
+}
+.edit-check input { margin: 0; }
+.page-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+.page-head h1 { margin: 0; }
+.page-head-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.edit-preview-wrap {
+  border: 1px solid var(--color-divider);
+  padding: var(--space-3);
+  margin-bottom: var(--space-2);
+}
+.edit-preview-wrap > summary { cursor: pointer; }
+.edit-preview { margin-top: var(--space-3); }

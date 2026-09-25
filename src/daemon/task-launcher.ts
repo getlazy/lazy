@@ -18,47 +18,76 @@
  * daemon code — it causes deadlocks and storage lock contention.
  */
 
+import { actorRole } from '../actor-ref';
+import type { ReviewSettingsOverrides } from '../review/mode';
+
 import { join } from 'path';
 import { mkdir, readdir, readFile, writeFile } from 'fs/promises';
 import { pathExists } from '../utils/fs';
 import { setupSandbox } from '../utils/sandbox';
 import { loadConfig } from '../config/loader';
-import type { RunnerType } from '../config/types';
-import { resolveAgentModel } from '../agent/agent-model';
+import type { EffortLevel, RunnerType } from '../config/types';
+import { resolveProjectModel } from './project-settings';
+import { switchTaskAgent, formatAgentSwitchAnnouncement } from './agent-switch';
+import { resolveAndPersistLowHighLoop } from './effort';
+import { resolveTurnLaunchIdentity } from './launch-identity';
 import { resolveAgentChattiness, renderChattinessSnippet } from '../config/chattiness';
 import { createRunner } from '../runner';
-import { stampSessionRunner } from '../runner/session-launch';
+import { stampSessionRunner, removeTaskRun, mustRecreateForContainerAgent } from '../runner/session-launch';
 import { pinnedCustomImage } from '../docker/worktree-image';
 import { createDriver, resolveUpstreamMergeRef } from '../remote';
 import { autoPushEnabled, autoPushConfigKey } from '../remote/auto-push';
 import { getOrCreateStorage } from './rpc-handlers';
 import { getDaemonContext, hasDaemonContext } from './context';
 import { mintMcpToken, type McpIdentity, type MintMcpTokenOptions } from './mcp-tokens';
+import {
+  planTurnCredential,
+  refuseLaunchWhileMemberInside,
+  TurnCredentialUnavailableError,
+  type TurnCredentialPlan,
+} from './turn-credentials';
+import { assertTurnStartAllowed, holdAgentStart } from './usage-pause';
+import { isUsagePauseRefusal } from './rpc-error';
 import { getMcpConfigDir } from './paths';
 import { getCurrentSha, getRemoteDefaultBranch, createWorktreeFromSha, recoverMissingWorktree, copyUntrackedFilesIntoWorktree } from '../git/operations';
 import { checkLock, acquireLock, removeLock } from '../utils/lock';
-import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../protocol';
-import { shortId, displayId, taskRef, deriveTaskRef, getWorktreePath, getWorktreePathForRef, getBranchNameFromId } from '../cli/helpers';
+import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields, containerHandoffFileModeFor } from '../protocol';
+import { shortId, displayId, taskRef, deriveTaskRef, getWorktreePath, getWorktreePathForRef, getBranchNameFromId } from '../task/identity';
 import { taskBranchFor, looksLikeTaskBranch } from '../git/branch-prefix';
-import { buildNotesContext, buildSystemPrompt } from '../cli/commands/shared';
+import { buildNotesContext, buildJournalNotice, buildArtifactNotice, buildSystemPrompt } from '../task/turn-context';
 import { buildMemorySection } from '../memory';
-import { checkOrphanedChild, retargetOrphanedChild } from '../cli/orphan';
+import { buildLazyMdSection } from '../task/lazy-md';
+import { checkOrphanedChild, retargetOrphanedChild } from '../task/orphan';
+import { typeConstraintsSection } from '../task/type-constraints';
+import { pinnedBaseOf } from '../task/base-pin';
 import { parentTaskIdOf, branchTarget } from '../task-target';
-import { getAgent, getAgentPackaging, listAgents } from '../agent/registry';
-import { getDataDir } from '../cli/init';
+import { isLinkedTask as isLinkedTaskFn } from '../task/linked';
+import { getAgentPackaging } from '../agent/registry';
+import { profileForAgentName, profileNameForAgent } from '../config/agent-profiles';
+import { applyRunnerAgent } from './task-harness';
+import { assertKnownAgentProfile } from './agent-profile-check';
+import { getDataDir } from '../project-paths';
 import { isFeatureEnabled } from '../utils/features';
 import { logger } from '../utils/logger';
+import { retargetReviewsAfterReparent } from './review-retarget';
 import { getActor } from '../constants';
 import { getNonHumanTurnCount, incrementNonHumanTurnCount, resetNonHumanTurnCount, checkTurnBudget } from './turn-budget';
-import type { Actor } from '../types';
+import type { Actor, ActorInput } from '../types';
 import { runGit } from '../utils/git';
 import { withSpan } from '../tracing';
+import { withTaskLifecycleLock } from './task-lifecycle-lock';
 import { RpcError } from './rpc-handlers';
 import { isOfflineMode } from '../utils/offline';
-import { resolveAndPersistEffort } from './effort';
-import { tryAdmitAgentSlot, releaseAgentSlot, effectiveAgentLimit } from './concurrency';
+import { resetClusterFixRound } from './cluster-fix-rounds';
+import { resolveWrapUpCommandFields } from './wrap-up-plan';
 import type { StartCommand } from '../protocol';
 import type { Task, Storage } from '../storage';
+import {
+  PhaseReporter,
+  START_PHASES,
+  startPhasePlan,
+  type ProgressEmitter,
+} from './progress';
 
 import goalContextStartText from '../prompts/goal-context-start.md' with { type: 'text' };
 import goalContextContinueText from '../prompts/goal-context-continue.md' with { type: 'text' };
@@ -67,6 +96,12 @@ import goalContextContinueText from '../prompts/goal-context-continue.md' with {
 
 export interface StartTaskParams {
   taskId: string;
+  /**
+   * The caller is a person who may use the one-shot usage-pause override
+   * (src/daemon/usage-pause.ts, `overrideEligible`). Required: absent means
+   * judged on the configured threshold alone, and refused without naming it.
+   */
+  usagePauseOverrideEligible?: boolean;
   modelOverride?: string;
   agentId?: string;
   forceLocal?: boolean;
@@ -75,6 +110,13 @@ export interface StartTaskParams {
   /** CLI `--effort` override. Persists on the task so resumes see the same value. */
   effortOverride?: string;
   /**
+   * `--review` / `--review-gate` / `--review-auto-fix` overrides. Each is
+   * persisted on task metadata, so later turns stay in the same review arm and
+   * a `lazy start --review` sticks with no second flag on every later command.
+   * Whatever is not supplied is inherited: task > parent task > project.
+   */
+  reviewOverrides?: ReviewSettingsOverrides;
+  /**
    * Per-task runner override (already resolved to a canonical RunnerType by the
    * CLI/MCP boundary). Highest precedence at launch and PERSISTED onto the task
    * so subsequent turns stay on the chosen runner (avoiding a cross-runner
@@ -82,12 +124,22 @@ export interface StartTaskParams {
    */
   runnerOverride?: RunnerType;
   /**
-   * Who submitted this command, by channel: MCP boundary → 'builder', CLI → 'human'.
-   * When absent, falls back to getActor() (env-var / 'human'). Set explicitly by
-   * the MCP boundary because the turn is persisted in the daemon process, where
-   * the env-var default cannot see the caller's channel. See {@link MCP_ACTOR}.
+   * Who submitted this command, by channel: MCP boundary → 'builder' / 'agent',
+   * CLI → 'human'. Persisted on the turn this launch writes.
+   *
+   * REQUIRED, deliberately. It used to default to `getActor()` — an env-var
+   * read that answers `human` unless `LAZY_ACTOR=builder` is set — which meant
+   * any launch path that forgot to thread the channel silently reported a HUMAN
+   * launch. That is not merely an attribution slip: audience is derived from
+   * who ran the task (`audienceOf`, src/task/audience.ts), so a child a cluster
+   * started through a path that dropped the actor would be treated as work a
+   * person is going to read, and pay for a presentation, screenshots and a
+   * CHANGELOG pass that nobody opens. A required field makes the omission a
+   * type error at the two call sites instead of a wrong answer at review time.
    */
-  actor?: Actor;
+  actor: ActorInput;
+  /** Phase-narration sink (see ./progress.ts). Supplied by the transport — CLI only. */
+  onProgress?: ProgressEmitter;
 }
 
 export interface StartTaskResult {
@@ -100,25 +152,76 @@ export interface StartTaskResult {
   runnerType: string;
   warnings: string[];
   /**
-   * Set when the launch was deferred at the concurrency cap: the task is now in
-   * `queued` status and the reconciler will launch it as a slot frees up. When
-   * true, the container/session/worktree fields are placeholders (empty/null).
+   * Set when the start was HELD by the usage pause rather than launched: a
+   * task's own agent started its subtask while the credential was paused
+   * (src/daemon/usage-pause.ts, `holdAgentStart`). Nothing was launched, the
+   * session/branch fields are empty, and `message` is what the agent is told.
    */
-  queued?: boolean;
-  /** Agent slots in use at the moment this task was queued (for "N/N running"). */
-  queueRunning?: number;
-  /** The effective agent cap this task was queued against. */
-  queueLimit?: number;
+  usagePauseHeld?: { message: string };
 }
 
 // --- Helper functions ---
 
-function buildPromptWithInstructions(userPrompt: string, goal: string, isFirstTurn: boolean, lazyRoot: string, notesContext?: string): string {
+/**
+ * The parameters a start the usage pause HELD is replayed with once the window
+ * resets (src/daemon/usage-pause.ts, `holdAgentStart`): everything the agent
+ * asked for except the task, the channel (the replay is always the agent's)
+ * and the transport's progress sink.
+ */
+function heldStartParams(params: StartTaskParams): Record<string, unknown> {
+  const { taskId: _task, actor: _actor, onProgress: _progress, ...rest } = params;
+  return JSON.parse(JSON.stringify(rest)) as Record<string, unknown>;
+}
+
+/**
+ * May the usage pause HOLD this start (store it for a replay after the reset)?
+ * Only when the start could otherwise go ahead as a FIRST start: the task is
+ * `backlog` and has no session with turns. Anything else — a task already
+ * started, running, parked or finished — gets its ordinary answer (the pause
+ * refusal, or whatever the start path says), and nothing is written: a held
+ * start on a task that is not waiting to start would replay into a 409, or
+ * leave a pending-start mark on a task that can never honour it.
+ */
+async function startIsHoldable(storage: Storage, task: Task): Promise<boolean> {
+  if (task.status !== 'backlog') return false;
+  const session = await storage.getSessionByTaskId(task.id);
+  return !session || (await storage.getTurnCountByTaskId(task.id)) === 0;
+}
+
+/** What a held start answers with: nothing launched, and what the agent is told. */
+function heldStartResult(message: string): StartTaskResult {
+  return {
+    sessionId: '', containerName: '', worktreePath: '', branchName: '',
+    parentBranch: null, parentDisplayId: null, runnerType: '',
+    warnings: [message],
+    usagePauseHeld: { message },
+  };
+}
+
+/**
+ * Replay a start the usage pause held, for the reconciler's pass once the
+ * window resets (`processUsagePauseHolds`). Always as the AGENT that asked:
+ * if the pause has tripped again by now, the launch path holds it anew.
+ */
+export async function launchHeldStart(
+  projectRoot: string,
+  taskId: string,
+  params: Record<string, unknown>,
+): Promise<'started' | 'held'> {
+  const result = await launchTask(projectRoot, { ...(params as Partial<StartTaskParams>), taskId, actor: 'agent' });
+  return result.usagePauseHeld ? 'held' : 'started';
+}
+
+function buildPromptWithInstructions(userPrompt: string, goal: string, isFirstTurn: boolean, lazyRoot: string, notesContext?: string, journalNotice?: string, artifactNotice?: string): string {
   const goalContext = (isFirstTurn ? goalContextStartText : goalContextContinueText)
     .replace(/\{\{goal\}\}/g, goal) + '\n\n';
 
   const notesSection = notesContext ?? '';
-  return goalContext + notesSection + userPrompt;
+  // Count-only journal notice — never entry content. See buildJournalNotice.
+  const journalSection = journalNotice ?? '';
+  // Pointer to materialized files, never their content. See buildArtifactNotice.
+  const artifactSection = artifactNotice ?? '';
+  return goalContext + notesSection + journalSection + artifactSection + userPrompt;
 }
 
 async function buildLinkedTaskPreamble(worktreePath: string, branchName: string, parentBranch: string): Promise<string> {
@@ -220,8 +323,10 @@ export async function writeDaemonMcpConfig(
     target: daemonMcpTarget(webPort),
   };
   // 0600: the file carries a bearer credential. It is bind-mounted read-only
-  // into exactly one container, by absolute path.
-  await writeFile(configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
+  // into exactly one container, by absolute path. A root daemon on native
+  // Linux widens it to 0644 so that container's user can read it at all —
+  // see containerHandoffFileModeFor.
+  await writeFile(configPath, JSON.stringify(config, null, 2), { mode: containerHandoffFileModeFor(process.getuid?.()) });
 
   return configPath;
 }
@@ -359,6 +464,26 @@ function unresolvableTargetMessage(branch: string, task: Task, detail?: string):
 
 // --- Pre-flight validation ---
 
+/*
+ * REMOVED, DELIBERATELY: `assertLoopHasNoRunningChild`.
+ *
+ * INVARIANT: a cluster task may have ANY number of running children, and no
+ * launch path may refuse a start because a sibling is running.
+ *
+ * The type was called `loop` and this file refused to START a second child
+ * while one was active, on the argument that serial children cost no sibling
+ * merges. Ten days of running them settled it the other way (engineer,
+ * 2026-09-20): the merges it avoided were mostly micro-conflicts, and the
+ * serialisation cost so much that two small children took 1h46m and 1h10m of
+ * wall-clock apiece. The driver now decides concurrency itself, on file overlap
+ * and dependency, in src/prompts/cluster-constraints.md.
+ *
+ * Do not reintroduce this as a cap or a queue: agent tasks are uncapped by
+ * design (the agent concurrency cap, its queue machinery and the idle reaper
+ * were all removed in 2026-08). If a cluster is starting children that collide,
+ * the fix is the driver's judgement, not a daemon refusal.
+ */
+
 async function validateTask(storage: Storage, taskId: string, root: string, agentIdOverride?: string, retargetOrphan?: boolean) {
   const result = await storage.resolveTask(taskId);
   if (!result.task) {
@@ -375,12 +500,7 @@ async function validateTask(storage: Storage, taskId: string, root: string, agen
   }
 
   // Validate agent
-  if (agentIdOverride) {
-    const validAgents = listAgents();
-    if (!validAgents.includes(agentIdOverride)) {
-      throw new RpcError(400, `Unknown agent '${agentIdOverride}'. Available agents: ${validAgents.join(', ')}`);
-    }
-  }
+  if (agentIdOverride) await assertKnownAgentProfile(root, agentIdOverride);
 
   // Handle orphaned child (parent accepted, branch gone) FIRST.
   // CLI prompts the user and passes retargetOrphan=true if confirmed.
@@ -397,6 +517,9 @@ async function validateTask(storage: Storage, taskId: string, root: string, agen
       await retargetOrphanedChild(t, storage, orphanStatus.retargetBranch);
       // Refresh task
       t = (await storage.getTask(t.id))!;
+      // Its open PR/MR follows the new target (./review-retarget.ts;
+      // best-effort, never throws).
+      for (const note of await retargetReviewsAfterReparent(root, storage, [t])) logger.info(note);
     }
   }
 
@@ -441,19 +564,82 @@ export async function launchTask(
   projectRoot: string,
   params: StartTaskParams,
 ): Promise<StartTaskResult> {
+  const phases = new PhaseReporter(params.onProgress, 'start');
+  try {
+    return await launchTaskRun(projectRoot, params, phases);
+  } catch (err) {
+    phases.fail(err instanceof Error ? err.message : String(err));
+    throw err;
+  }
+}
+
+async function launchTaskRun(
+  projectRoot: string,
+  params: StartTaskParams,
+  phases: PhaseReporter,
+): Promise<StartTaskResult> {
   const storage = await getOrCreateStorage();
   const warnings: string[] = [];
   // Channel actor: MCP-originated starts are 'builder'/'agent', CLI 'human'.
-  // Falls back to getActor() for CLI (env-var / 'human').
-  const actor = params.actor ?? getActor();
+  // Required at this boundary — see StartTaskParams.actor for why there is no
+  // fallback any more.
+  const actor = params.actor;
+
+  phases.begin(START_PHASES.preflight);
 
   // --- Validate task ---
   let t = await withSpan('start.validate', { 'lazy.task_id': params.taskId }, () =>
     validateTask(storage, params.taskId, projectRoot, params.agentId, params.retargetOrphan),
   );
 
-  // Apply agent override
-  if (params.agentId) {
+  // Config needed for agent-switch re-resolution and later launch steps.
+  // Loaded here (before runner preflight) so a mid-start --agent change can
+  // re-resolve model/effort with the same ladder as edit/unblock.
+  const config = await loadConfig(projectRoot);
+
+  // --- Usage pause, judged BEFORE the agent/runner writes below ---
+  // On the task as this start will run it (`--agent` applied), and without
+  // spending the one-shot override: a refused start must leave the task exactly
+  // as it was, stored agent included. The gate further down takes the override.
+  //
+  // A task's own AGENT starting its subtask (a cluster driver) is HELD rather
+  // than refused: the start is stored on the subtask and the reconciler
+  // launches it by itself once the window resets (see `holdAgentStart`).
+  const verdictTask = params.agentId ? { ...t, agent_id: params.agentId } : t;
+  try {
+    await assertTurnStartAllowed(projectRoot, {
+      task: verdictTask, config, actor, verb: 'start', peek: true,
+      overrideEligible: params.usagePauseOverrideEligible === true,
+    });
+  } catch (err) {
+    if (!isUsagePauseRefusal(err) || actorRole(actor) !== 'agent' || !(await startIsHoldable(storage, t))) throw err;
+    const message = await holdAgentStart(projectRoot, storage, t, verdictTask, heldStartParams(params));
+    phases.end(`${displayId(t)} held by the usage pause`);
+    return heldStartResult(message);
+  }
+
+  // Apply agent override — persist + re-resolve model/effort when the agent
+  // actually changes (same helper as edit/unblock). An in-memory-only override
+  // used to leave task.agent_id stale and keep the previous agent's model.
+  if (params.agentId && params.agentId !== t.agent_id) {
+    const projectSettingsForSwitch = await storage.getProjectSettings();
+    const switchResult = await switchTaskAgent({
+      storage,
+      task: t,
+      newAgentId: params.agentId,
+      config,
+      projectModel: resolveProjectModel(projectSettingsForSwitch, config),
+      modelOverride: params.modelOverride,
+      effortOverride: params.effortOverride,
+    });
+    t = (await storage.getTask(t.id))!;
+    for (const line of formatAgentSwitchAnnouncement(switchResult)) {
+      warnings.push(line);
+    }
+    // Switch already applied co-supplied overrides; launch resolve below
+    // should not treat them as a second durable write.
+    params = { ...params, modelOverride: undefined, effortOverride: undefined };
+  } else if (params.agentId) {
     t = { ...t, agent_id: params.agentId };
   }
 
@@ -467,33 +653,42 @@ export async function launchTask(
   }
   const runner = await createRunner(projectRoot, t.runner_type ?? undefined);
 
+  // `t.agent_id` names a PROFILE; packaging and the agent class are properties
+  // of the HARNESS the profile runs. Resolve once here, at the daemon boundary
+  // where the project's config is in hand, and hand the harness down — nothing
+  // below this line should have to know that a profile is not an agent id.
+  const profile = profileForAgentName(config, t.agent_id, `task ${displayId(t)}`);
+  const harness = profile.harness;
+
   // Validate runner/agent compatibility against the RESOLVED runner. The
   // capability comes from the agent's packaging, not a hardcoded id list.
   if (
     runner.type !== 'dangerously-host-process-without-any-isolation' &&
-    !getAgentPackaging(t.agent_id).supportsContainerRunner()
+    !getAgentPackaging(harness).supportsContainerRunner()
   ) {
-    throw new RpcError(400, `Agent "${t.agent_id}" only supports host-process runner. Set runner type to "dangerously-host-process-without-any-isolation" in lazy.toml.`);
+    throw new RpcError(
+      400,
+      `Agent profile "${t.agent_id}" runs harness "${harness}", which does not support container runners. ` +
+      `Select a profile whose harness is "claude-code", "codex", "cursor", or "pi" with [runner] type = "docker".`,
+    );
   }
 
   // Set the configured agent on the runner so it uses the correct auth.
   // Without this, HostProcessRunner defaults to the ClaudeCodeAgent singleton
   // which requires ANTHROPIC_API_KEY/CLAUDE_CODE_OAUTH_TOKEN even for agents
-  // that don't need them (e.g., qa-agent).
-  const agent = getAgent(t.agent_id);
-  if ('setAgent' in runner && typeof (runner as any).setAgent === 'function') {
-    (runner as any).setAgent(agent);
-  }
+  // that don't need them (e.g., qa-agent). The profile rides along so the launch
+  // preflights ITS upstream, mints against ITS credential slot, and carries a
+  // grant saying which upstream this turn's traffic belongs to.
+  applyRunnerAgent(runner, profile);
   await runner.checkAvailability();
 
-  const config = await loadConfig(projectRoot);
+  phases.end(displayId(t));
 
   // --- Turn budget: cap consecutive turns without a human in the loop ---
   // Builder/agent-initiated starts count; a human start resets the count.
-  // Checked before the queue gate so a task that would be refused never even
-  // joins the queue — refusing after queueing would still consume a turn once
-  // the reconciler drained it.
-  if (actor !== 'human') {
+  // Checked before anything is provisioned so a task that would be refused
+  // never consumes a turn.
+  if (actorRole(actor) !== 'human') {
     const nonHumanTurnCount = await getNonHumanTurnCount(storage, t.id);
     const budgetDecision = checkTurnBudget(nonHumanTurnCount, config.limits.max_turns_without_human);
     if (!budgetDecision.allowed) {
@@ -501,48 +696,20 @@ export async function launchTask(
     }
   }
 
-  // --- Concurrency gate (agent slot) ---
-  // A slot is held by each *working* agent task. At the cap, queue instead of
-  // launching: mark the task `queued` and let the reconciler drain it when a
-  // slot frees (respecting the cap). Re-entrant for an already-working task, so
-  // an idempotent relaunch never trips the cap. See src/daemon/concurrency.ts.
-  const agentLimit = effectiveAgentLimit(config);
-  const slot = await tryAdmitAgentSlot(storage, t.id, agentLimit);
-  // Only backlog/queued tasks can transition to `queued`. `lazy start` is a
-  // backlog operation; a task that already has a session falls through to the
-  // session check below, which returns the proper "already has a session" error
-  // rather than an invalid-transition crash.
-  const queueEligible = t.status === 'backlog' || t.status === 'queued';
-  if (!slot.admitted && queueEligible) {
-    // Persist model/effort overrides so the drained relaunch reuses them — the
-    // reconciler re-enters launchTask with only the taskId.
-    if (params.modelOverride) await storage.updateTaskModel(t.id, params.modelOverride);
-    if (params.effortOverride) {
-      await resolveAndPersistEffort(t, params.effortOverride, config.agent.effort, storage);
-    }
-    if (t.status !== 'queued') {
-      await storage.updateTaskStatus(t.id, 'queued', actor);
-    }
-    logger.info(`Task ${displayId(t)} queued (${slot.running}/${slot.limit} agents running)`);
-    return {
-      queued: true,
-      queueRunning: slot.running,
-      queueLimit: slot.limit,
-      sessionId: '',
-      containerName: '',
-      worktreePath: '',
-      branchName: '',
-      parentBranch: null,
-      parentDisplayId: null,
-      runnerType: runner.type,
-      warnings,
-    };
-  }
-
-  // Slot reserved — release it once the launch settles. Success flips the task
-  // to `working` (which keeps the slot counted); any failure frees it. The
-  // whole launch body runs inside this try so an early throw can't leak a slot.
+  // --- Usage pause ([usage_pause], src/daemon/usage-pause.ts) ---
+  // The decision was already made (peek, above, before any write); this call
+  // is where a one-shot override that decision relied on is TAKEN — after the
+  // runner preflight, so it is not spent on a start that fails there. An agent's
+  // start that a reading arriving since the peek now pauses is held like above.
   try {
+    await assertTurnStartAllowed(projectRoot, {
+      task: t, config, actor, verb: 'start',
+      overrideEligible: params.usagePauseOverrideEligible === true,
+    });
+  } catch (err) {
+    if (!isUsagePauseRefusal(err) || actorRole(actor) !== 'agent' || !(await startIsHoldable(storage, t))) throw err;
+    return heldStartResult(await holdAgentStart(projectRoot, storage, t, t, heldStartParams(params)));
+  }
 
   // --- Offline mode: auto-enable forceLocal and use local driver ---
   // Mirrors sync/reparent: when offline we branch from the LOCAL parent/integration
@@ -569,15 +736,30 @@ export async function launchTask(
   const driver = createDriver(config, undefined, { offline });
 
   // --- Session check ---
-  const isLinkedTask = !!t.metadata?.import_source_url;
+  const isLinkedTask = isLinkedTaskFn(t);
   const existingSession = await storage.getSessionByTaskId(t.id);
-  if (existingSession && !isLinkedTask) {
+  // A start refused at the credential plan (below) leaves exactly this behind:
+  // an open session with NO turn, and the task still in its pre-start status.
+  // The session exists only because the plan records the turn owner and binds
+  // the credential against a session id; nothing ran on it. A retried start
+  // reuses it — refusing with "already has an active session" would wedge the
+  // task the refusal was careful not to touch.
+  const refusedStartSession = existingSession && !isLinkedTask && !existingSession.ended_at
+    && (await storage.getSessionTurns(existingSession.id)).length === 0
+    ? existingSession
+    : null;
+  if (existingSession && !isLinkedTask && !refusedStartSession) {
     if (!existingSession.ended_at) {
       throw new RpcError(409, `Task ${displayId(t)} already has an active session. Unblock it with: lazy unblock ${displayId(t)}`);
     } else {
       throw new RpcError(409, `Task ${displayId(t)} session has ended (${existingSession.outcome}). Create a variant with: lazy branch ${displayId(t)}`);
     }
   }
+
+  const lfsCheckEnabled = config.git.lfs_check !== 'off';
+  phases.announce(startPhasePlan(lfsCheckEnabled, !isLinkedTask), displayId(t));
+
+  phases.begin(START_PHASES.resolveBase);
 
   // --- Task ref ---
   if (!t.metadata?.task_ref) {
@@ -715,6 +897,31 @@ export async function launchTask(
     }
   }
 
+  // --- Pinned base (lazy clone --same-base / --base) ---
+  // INVARIANT: a pinned task's branch is cut from its pinned commit, never from
+  // the parent's current head. The pin is the whole point of a like-for-like
+  // re-run; starting it anywhere else makes the comparison meaningless. The
+  // parent branch is still resolved above: it is where accept merges to.
+  // A refused start's turnless session is a first start that never ran — pin it.
+  const pinnedBase = !isLinkedTask && (!existingSession || refusedStartSession) ? pinnedBaseOf(t) : null;
+  if (pinnedBase) {
+    const pinned = await runGit(['rev-parse', '--verify', '--quiet', `${pinnedBase}^{commit}`], { cwd: projectRoot });
+    if (pinned.exitCode !== 0) {
+      throw new RpcError(
+        409,
+        `Task ${displayId(t)} is pinned to ${pinnedBase.substring(0, 12)}, but that commit is no longer in this repository ` +
+        `(git pruned it after the branch that held it was deleted). Fetch it from a remote that still has it, ` +
+        `or clone the source again without a pinned base.`,
+      );
+    }
+    startSha = pinned.stdout.trim();
+    await storage.updateTaskBranchedFromSha(t.id, startSha);
+    t.branched_from_sha = startSha;
+    phases.note(`Pinned to ${startSha.substring(0, 12)} — the parent is not merged in`);
+  }
+
+  phases.end(parentBranch ?? undefined);
+
   // --- Git LFS environment preflight ---
   // INVARIANT: never launch an agent into an environment where a commit would
   // silently store raw file content on an LFS-tracked path. Git only errors on
@@ -730,7 +937,8 @@ export async function launchTask(
   //
   // The message is deliberately one line plus a doctor referral: `lazy doctor`
   // is the single diagnosis surface and carries the full remedy.
-  if (config.git.lfs_check !== 'off') {
+  if (lfsCheckEnabled) {
+    phases.begin(START_PHASES.lfs);
     const { inspectLfsEnvironment } = await import('../git/lfs');
     const lfs = await inspectLfsEnvironment(projectRoot, startSha);
     if (lfs.problems.length > 0) {
@@ -740,6 +948,7 @@ export async function launchTask(
         `producing a branch that cannot be pushed.`;
       if (config.git.lfs_check === 'warn') {
         warnings.push(`${summary} Run \`lazy doctor\` for details.`);
+        phases.end('warn only');
       } else {
         throw new RpcError(
           400,
@@ -747,8 +956,12 @@ export async function launchTask(
           `Run \`lazy doctor\` for details.`,
         );
       }
+    } else {
+      phases.end();
     }
   }
+
+  phases.begin(START_PHASES.worktree);
 
   // --- Worktree creation ---
   const worktreeBase = join(projectRoot, getDataDir(projectRoot), 'worktrees');
@@ -766,7 +979,7 @@ export async function launchTask(
 
   let worktreeExisted = worktreeExists;
   if (worktreeExisted) {
-    // Reusing existing worktree
+    phases.note(`Reusing existing worktree on ${branchName}`);
   } else if (isLinkedTask || existingSession) {
     const recovery = await recoverMissingWorktree(worktreePath, branchName, projectRoot);
     if (recovery.recovered) {
@@ -784,7 +997,25 @@ export async function launchTask(
     await withSpan('git.worktree.create', {
       'git.branch': branchName,
       'git.start_sha': startSha,
-    }, () => createWorktreeFromSha(worktreePath, branchName, startSha, projectRoot));
+    }, async () => {
+      // A pinned clone's branch was cut at clone time to keep its base commit
+      // referenced (src/daemon/clone-redo.ts createPinnedBranch) — check it out
+      // as it is rather than trying to create it a second time.
+      if (pinnedBase) {
+        const existing = await runGit(
+          ['rev-parse', '--verify', '--quiet', `refs/heads/${branchName}`],
+          { cwd: projectRoot },
+        );
+        if (existing.exitCode === 0) {
+          const added = await runGit(['worktree', 'add', worktreePath, branchName], { cwd: projectRoot });
+          if (added.exitCode !== 0) {
+            throw new Error(`git worktree add ${branchName} failed: ${added.stderr}`);
+          }
+          return;
+        }
+      }
+      await createWorktreeFromSha(worktreePath, branchName, startSha, projectRoot);
+    });
   }
 
   // Empty initial commit
@@ -808,29 +1039,61 @@ export async function launchTask(
   // Acquire lock
   await acquireLock(worktreePath, 'lazy start');
 
+  phases.end(branchName);
+
   const containerName = runner.runNameForTask(tRef);
 
   try {
-    const sandbox = await withSpan('sandbox.setup', {}, () => setupSandbox(worktreePath));
+    const sandbox = await withSpan('sandbox.setup', {}, () => setupSandbox(worktreePath, { storage, taskId: t.id }));
 
-    // --- Model resolution ---
-    // Per-role model resolution: a local backend (ollama/proxy) forces its
-    // authoritative model; otherwise CLI flag > task.model > default.
-    const modelName = resolveAgentModel(config, {
-      preferredModel: params.modelOverride ?? t.model,
-      agentId: t.agent_id,
+    // --- Agent / model / effort resolution ---
+    // One rule for every turn type — see resolveTurnLaunchIdentity. For turn 1
+    // there is no previous turn to follow, so this resolves the task's stored
+    // choice (`lazy create --model`) or the defaults, and pins the result.
+    const { model: modelName, effort: effortValue } = await resolveTurnLaunchIdentity({
+      storage,
+      task: t,
+      config,
+      modelOverride: params.modelOverride,
+      effortOverride: params.effortOverride,
     });
     const modelId = modelName;
 
-    if (!t.model) {
-      await storage.updateTaskModel(t.id, modelName);
-    }
-
-    const effortValue = await resolveAndPersistEffort(t, params.effortOverride, config.agent.effort, storage);
+    // `low_high` review mode: the whole work turn runs two-phase. The draft
+    // effort replaces the task's normal effort ONLY when nobody chose one —
+    // `resolveAndPersistLowHighLoop` is handed the resolved effort and decides,
+    // because substituting `draft_effort` for an effort someone deliberately set
+    // is a silent downgrade of their task.
+    const lowHighLoop = await resolveAndPersistLowHighLoop(
+      t, params.reviewOverrides, config, storage, effortValue as EffortLevel,
+    );
+    const turnEffort = lowHighLoop ? lowHighLoop.draftEffort : effortValue;
 
     // --- Build prompts ---
+    // Timestamp taken BEFORE the read: everything created after this instant is
+    // by definition not in `existingComments` and must stay undelivered.
+    const notesReadAt = Date.now();
     const existingComments = await storage.getTaskComments(t.id);
     const notesCtx = existingComments.length > 0 ? buildNotesContext(existingComments) : undefined;
+    // Turn 1 delivers every existing comment, so it ESTABLISHES the delivery
+    // high-water mark (recorded once the session exists, below) — always, even
+    // with nothing to deliver. A session that never records one falls back to
+    // the last-agent-turn cutoff, which is the very bug this replaces: an ask or
+    // sync in between would then swallow the first comment ever written.
+    const notesDeliveredThrough = existingComments.length > 0
+      ? Math.max(notesReadAt, ...existingComments.map(c => c.created_at))
+      : notesReadAt;
+
+    // Journal notice for turn 1: with no prior agent turn there is no cutoff, so
+    // every existing entry counts as new — the same rule the notes above follow.
+    // Count only; entry content is never injected.
+    const existingJournal = await storage.getTaskJournal(t.id);
+    const journalNotice = buildJournalNotice(existingJournal.length, existingJournal.length, t.code ?? shortId(t.id)) || undefined;
+
+    // Artifacts were written into the worktree by setupSandbox above; this is
+    // the pointer telling the agent they are there. Names and sizes only.
+    const artifacts = await storage.listTaskArtifacts(t.id);
+    const artifactNotice = buildArtifactNotice(artifacts, t.code ?? shortId(t.id)) || undefined;
 
     // Re-read the task immediately before composing turn 1. `t` was captured by
     // validateTask() at the top of launchTask, and everything since — runner
@@ -844,20 +1107,25 @@ export async function launchTask(
     const taskPrompt = fresh?.prompt ?? t.prompt;
     const taskGoal = fresh?.goal ?? t.goal;
 
-    let turnPrompt = taskPrompt;
+    // Type constraints ride the TURN, not the stored prompt — see
+    // src/task/type-constraints.ts for why a cluster's rules cannot be baked in
+    // at creation. Empty for every type but `cluster`.
+    let turnPrompt = typeConstraintsSection(fresh ?? t) + taskPrompt;
     if (isLinkedTask) {
       const linkedParentBranch = t.metadata?.parent_branch ?? await getRemoteDefaultBranch(projectRoot, config.remote.git_remote);
       const preamble = await buildLinkedTaskPreamble(worktreePath, branchName, linkedParentBranch);
       turnPrompt = preamble + '\n---\n\n' + taskPrompt;
     }
 
-    const systemPrompt = buildSystemPrompt(runner.getAgentInstructions(), renderChattinessSnippet(resolveAgentChattiness(config)), await buildMemorySection(storage, 'agent', { warnBytes: config.memory.warn_bytes }));
-    const fullPrompt = buildPromptWithInstructions(turnPrompt, taskGoal, true, projectRoot, notesCtx);
+    const systemPrompt = buildSystemPrompt(runner.getAgentInstructions(), renderChattinessSnippet(resolveAgentChattiness(config)), await buildMemorySection(storage, 'agent', { warnBytes: config.memory.warn_bytes }), await buildLazyMdSection(worktreePath));
+    const fullPrompt = buildPromptWithInstructions(turnPrompt, taskGoal, true, projectRoot, notesCtx, journalNotice, artifactNotice);
 
     // --- Persist state BEFORE launch (crash-safe) ---
     let sess;
     if (isLinkedTask && existingSession) {
       sess = existingSession;
+    } else if (refusedStartSession) {
+      sess = refusedStartSession;
     } else {
       sess = await storage.createSession(t.id, t.agent_id, branchName, startSha);
     }
@@ -867,27 +1135,137 @@ export async function launchTask(
     // session across a runner boundary if the runner changed since it last ran.
     await stampSessionRunner(storage, projectRoot, sess, worktreePath, runner.type);
 
-    await storage.createTurn({
+    // --- Decide whose credential this turn runs on ---
+    // After the session exists (the plan records the turn owner on it and binds
+    // the credential to its id) but BEFORE the turn is recorded or the task
+    // moves to `working`. A refused plan therefore leaves the task in its
+    // pre-start status with a turnless session a retried start reuses — never
+    // `working` with a turn and no supervisor, which nothing retries and
+    // `lazy unblock` refuses (409). Same order as unblock's prepareTurnLaunch.
+    // A single-user install gets `daemon-env` and nothing below changes.
+    let credentialPlan: TurnCredentialPlan;
+    try {
+      credentialPlan = await planTurnCredential(projectRoot, { taskId: t.id, sessionId: sess.id, storage });
+    } catch (err) {
+      if (err instanceof TurnCredentialUnavailableError) throw new RpcError(400, err.message);
+      throw err;
+    }
+
+    // --- Every fallible launch step runs BEFORE the flip to `working` ---
+    // A throw after the flip left the task `working` with a recorded turn and
+    // no supervisor: `lazy unblock` answers 409 and a retried start finds an
+    // active session. So the forge fetch behind the supervisor's upstream-merge
+    // ref, the protocol dir, the wrap-up plan and the MCP config all happen
+    // here, where a failure leaves the pre-start status and a turnless session
+    // a retried start reuses. After the flip come local store writes, the
+    // (non-fatal) publish and the supervisor launch, whose own failure parks
+    // the task `interrupted` for auto-resume; a daemon dying mid-launch is
+    // caught by the reconciler's "working, no run, no response" path.
+    //
+    // The upstream-merge ref is what the supervisor's pre-work sync merges:
+    // the LIVE remote-tracking ref (e.g. `origin/main`) for a protected target,
+    // so it never merges a stale local branch — but the LOCAL branch for an
+    // unprotected parent that accept merges into locally and whose agent
+    // commits are not on origin. Per CLAUDE.md "fail hard on remote failures —
+    // no silent fallbacks": a fetch failure here must be visible, never
+    // swallowed. With `--force-local` the caller has opted into local HEAD, so
+    // degrade to the local branch name but still surface a warning.
+    phases.begin(START_PHASES.upstreamRef);
+    let upstreamMergeRef = parentBranch;
+    if (parentBranch) {
+      try {
+        const resolution = await resolveUpstreamMergeRef(driver, parentBranch, worktreePath, {
+          remoteName: config.remote.git_remote,
+        });
+        warnings.push(...resolution.warnings);
+        upstreamMergeRef = resolution.ref;
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        if (params.forceLocal) {
+          warnings.push(
+            `Failed to resolve upstream ref for ${parentBranch} (using local branch, --force-local): ${detail}`,
+          );
+        } else {
+          throw new RpcError(
+            500,
+            `Failed to resolve upstream ref for parent branch ${parentBranch}: ${detail}. ` +
+              `Refusing to fall back to a stale local ref. Use --force-local to start from the local branch.`,
+          );
+        }
+      }
+    }
+    if (parentBranch) phases.end(upstreamMergeRef ?? undefined);
+    else phases.skip(START_PHASES.upstreamRef, 'no parent branch');
+
+    const protoDir = getProtocolDir(t.id);
+    ensureProtocolDir(protoDir);
+
+    const branchConfig = await loadConfig(projectRoot);
+    const autoSyncAfterTurn = isFeatureEnabled('auto_sync_after_turn', branchConfig);
+    // The wrap-up plan rides every work command: finality is declared DURING
+    // the turn, after the command is written, so it cannot be sent later (§3.3).
+    const wrapUpFields = await resolveWrapUpCommandFields({
+      storage,
+      task: t,
       sessionId: sess.id,
-      sequence: 1,
-      role: 'human',
-      content: turnPrompt,
-      agent: t.agent_id,
-      model: modelName,
-      effort: effortValue,
-      prompt: fullPrompt,
-      actor,
-      // INVARIANT: the task prompt is the human's first and most important
-      // feedback. If the very first turn crashes before the agent reads it,
-      // resume must re-deliver it verbatim rather than say "carry on".
-      carriesFeedback: true,
+      session: sess,
+      projectRoot,
+      worktreePath,
+      config: branchConfig,
+      // Turn 1 is recorded after this (below the flip); its actor decides the
+      // audience, so hand it over rather than let the creator's actor decide.
+      pendingLaunchActor: actorRole(actor),
     });
 
-    await storage.updateTaskStatus(t.id, 'working', actor);
+    // UNDER THE TASK'S LIFECYCLE LOCK, like every other launch path: the
+    // member check, the MCP config this turn's container reads, turn 1 and the
+    // flip to `working`. A member's entry (src/daemon/member-entry.ts) takes
+    // the same lock and refuses a session with no turn yet, so it sees either
+    // the turnless session before this block or the `working` task after it.
+    let daemonConfigPath: string | null = null;
+    await withTaskLifecycleLock(t.id, async () => {
+      // No turn starts while a member has a terminal open on the task
+      // (./turn-credentials.ts). A first start cannot meet one — entry needs a
+      // turn — but a restart of a started task can.
+      await refuseLaunchWhileMemberInside(projectRoot, t.id);
+
+      // --- Generate daemon MCP config ---
+      // The daemon knows its own webPort — no health check, no fallback.
+      // Skip when running outside the daemon (in-process RPC fallback) since
+      // there's no daemon for the container to connect to.
+      if (runner.usesSandbox() && hasDaemonContext()) {
+        daemonConfigPath = await writeDaemonMcpConfig(projectRoot, containerName, { kind: 'task', taskId: t.id });
+      }
+
+      await storage.markNotesDelivered(sess.id, notesDeliveredThrough);
+
+      await storage.createTurn({
+        sessionId: sess.id,
+        sequence: 1,
+        role: 'human',
+        content: turnPrompt,
+        agent: t.agent_id,
+        model: modelName,
+        effort: turnEffort,
+        prompt: fullPrompt,
+        actor,
+        // INVARIANT: the task prompt is the human's first and most important
+        // feedback. If the very first turn crashes before the agent reads it,
+        // resume must re-deliver it verbatim rather than say "carry on".
+        carriesFeedback: true,
+      });
+
+      await storage.updateTaskStatus(t.id, 'working', actor);
+    });
+
+    // A fresh START is a fresh child as far as the cluster's fix-round budget
+    // is concerned: the count is "how many times has the cluster sent THIS
+    // child back since it last started". See src/daemon/cluster-fix-rounds.ts.
+    await resetClusterFixRound(storage, t.id);
 
     // BUG FIX (same class as unblock/resume): only a human taking over clears
     // the turn budget counter; a builder/agent-initiated start increments it.
-    if (actor === 'human') {
+    if (actorRole(actor) === 'human') {
       try {
         await resetNonHumanTurnCount(storage, t.id);
       } catch {
@@ -909,6 +1287,7 @@ export async function launchTask(
     }
 
     if (!isLinkedTask) {
+      phases.begin(START_PHASES.publish);
       const mergeTarget = parentBranch ?? await getRemoteDefaultBranch(projectRoot, config.remote.git_remote);
       // Only a top-level task's integration target is a named branch. A child
       // task's target is its parent (kind: 'task') and must not be clobbered —
@@ -947,45 +1326,16 @@ export async function launchTask(
           warnings.push(`Failed to publish branch (non-fatal): ${err instanceof Error ? err.message : err}`);
         }
       }
+      phases.end();
+    } else {
+      phases.skip(START_PHASES.publish, 'linked task');
     }
 
-    // --- Write protocol command ---
-    const protoDir = getProtocolDir(t.id);
-    ensureProtocolDir(protoDir);
+    phases.begin(START_PHASES.launch);
 
-    if (parentBranch) {
-      // Resolve to the ref the supervisor's pre-work sync should merge: the
-      // LIVE remote-tracking ref (e.g. `origin/main`) for a protected target, so
-      // it never merges a stale local branch — but the LOCAL branch for an
-      // unprotected parent that accept merges into locally and whose agent
-      // commits are not on origin. Per CLAUDE.md "fail hard on remote failures —
-      // no silent fallbacks": a fetch failure here must be visible, never
-      // swallowed. With `--force-local` the caller has opted into local HEAD, so
-      // degrade to the local branch name but still surface a warning.
-      try {
-        const resolution = await resolveUpstreamMergeRef(driver, parentBranch, worktreePath, {
-          remoteName: config.remote.git_remote,
-        });
-        warnings.push(...resolution.warnings);
-        parentBranch = resolution.ref;
-      } catch (err) {
-        const detail = err instanceof Error ? err.message : String(err);
-        if (params.forceLocal) {
-          warnings.push(
-            `Failed to resolve upstream ref for ${parentBranch} (using local branch, --force-local): ${detail}`,
-          );
-        } else {
-          throw new RpcError(
-            500,
-            `Failed to resolve upstream ref for parent branch ${parentBranch}: ${detail}. ` +
-              `Refusing to fall back to a stale local ref. Use --force-local to start from the local branch.`,
-          );
-        }
-      }
-    }
-
-    const branchConfig = await loadConfig(projectRoot, { cwd: worktreePath });
-    const autoSyncAfterTurn = isFeatureEnabled('auto_sync_after_turn', branchConfig);
+    // Resolved before the flip (see "Every fallible launch step" above). The
+    // start result reports it; the publish above used the parent's own name.
+    if (parentBranch) parentBranch = upstreamMergeRef;
 
     const startCommand: StartCommand = {
       type: 'start',
@@ -993,36 +1343,56 @@ export async function launchTask(
       goal: t.goal,
       prompt: fullPrompt,
       agent_id: t.agent_id,
+      harness,
       system_prompt: systemPrompt,
       model_id: modelId,
-      effort: effortValue,
+      effort: turnEffort,
       parent_branch: parentBranch ?? undefined,
+      upstream_merge_ref: parentBranch ?? undefined,
       sync_before_work: false,
-      sync_after_work: autoSyncAfterTurn,
+      sync_after_work: autoSyncAfterTurn && !isLinkedTaskFn(t),
+      ...(lowHighLoop ? { low_high_loop: { review_effort: lowHighLoop.reviewEffort } } : {}),
+      ...wrapUpFields,
       ...commonCommandFields(branchConfig),
     };
     writeCommand(protoDir, startCommand);
 
-    // --- Generate daemon MCP config ---
-    // The daemon knows its own webPort — no health check, no fallback.
-    // Skip when running outside the daemon (in-process RPC fallback) since
-    // there's no daemon for the container to connect to.
-    let daemonConfigPath: string | null = null;
-    if (runner.usesSandbox() && hasDaemonContext()) {
-      daemonConfigPath = await writeDaemonMcpConfig(projectRoot, containerName, { kind: 'task', taskId: t.id });
+    // --- Launch supervisor ---
+    // A running container's env was fixed when it was created, so a turn whose
+    // placeholder must now live in a DIFFERENT env var (its owner's credential
+    // kind changed, or a system turn took over from a human) cannot be served by
+    // it — the client would emit the wrong request shape and the proxy would
+    // refuse with auth_kind_mismatch. Recreate instead. The token VALUE is
+    // deliberately stable across turns for exactly this reason: only a KIND
+    // change costs a container.
+    const mustRecreateForCredential = credentialPlan.mode === 'session' && credentialPlan.kindChanged;
+    if (credentialPlan.mode === 'session' && credentialPlan.kindChanged && (await runner.isRunning(containerName))) {
+      logger.info(
+        `[${tRef}] Recreating container: this turn's credential is a different kind ` +
+        `(${credentialPlan.kind}) than the running container was launched with.`,
+      );
+      await runner.removeRun(containerName);
     }
 
-    // --- Launch supervisor ---
-    if (await runner.isRunning(containerName)) {
+    const mustRecreateForAgent = mustRecreateForContainerAgent(sess, t.agent_id);
+    if (mustRecreateForAgent) {
+      logger.info(
+        `[${tRef}] Recreating container: agent changed ` +
+        `(${sess.container_agent_id} → ${t.agent_id}) — launch env is fixed at create time`,
+      );
+    }
+
+    if (!mustRecreateForCredential && !mustRecreateForAgent && (await runner.isRunning(containerName))) {
       // Supervisor already running — it will pick up the new command
+      phases.note(`reusing running container ${containerName}`);
     } else {
-      await runner.removeRun(containerName);
+      await removeTaskRun(runner, storage, sess, containerName);
 
       try {
         await withSpan('docker.launch_supervisor', {
           'lazy.runner': runner.type,
           'lazy.container': containerName,
-        }, () => runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef, pinnedCustomImage(t)));
+        }, () => runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef, t.id, pinnedCustomImage(t), phases.notify));
       } catch (err) {
         await storage.updateTaskStatus(t.id, 'interrupted', getActor());
         if (!worktreeExisted) {
@@ -1038,8 +1408,11 @@ export async function launchTask(
     }
 
     // Store container name
-    await storage.updateSessionContainerName(sess.id, containerName);
+    await storage.updateSessionContainerName(sess.id, containerName, t.agent_id);
+    sess.container_agent_id = t.agent_id;
     await storage.updateSessionInteraction(sess.id, 0);
+
+    phases.end(containerName);
 
     return {
       sessionId: sess.id,
@@ -1053,9 +1426,5 @@ export async function launchTask(
     };
   } finally {
     await removeLock(worktreePath);
-  }
-
-  } finally {
-    releaseAgentSlot(t.id);
   }
 }

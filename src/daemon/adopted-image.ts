@@ -11,7 +11,24 @@
  * The adopted image applies to the daemon and ALL launches that do not already
  * have a Part 1 per-task pin. It STICKS until the next upgrade rebuild decides
  * again (clear or rewrite), and it MUST NOT silently outlive a binary version
- * change: on read, if lazyVersion !== current VERSION the file is deleted.
+ * change that would leave the daemon pointing at an image built for a different
+ * lazy: on read, if the adoption's version no longer maps to the current image
+ * tag (`imageTagFor`, i.e. major.minor) the file is deleted.
+ *
+ * WHY THE IMAGE TAG AND NOT THE FULL VERSION (fix-upgrade-image-rebuild-churn).
+ * This rule is a LIFECYCLE rule, not a security one — the security posture is
+ * the soft pin + content-hash drift + snapshot below, and none of it keys off
+ * lazyVersion. Comparing the full VERSION expired every adoption on every
+ * upgrade in a source checkout, because VERSION's patch component is the commit
+ * count (scripts/version-string.ts): 0.23.1651 → 0.23.1658 across one upgrade.
+ * The upgrade then built and promoted the adopted image, the restarted daemon
+ * immediately expired the adoption, fell back to the ROOT Dockerfile identity
+ * that nothing had built, and rebuilt it synchronously inside the first
+ * sync/unblock RPC — a multi-minute stall right after an upgrade that had just
+ * spent minutes building. The adopted image ref itself is only ever tagged
+ * `:${IMAGE_TAG}` (major.minor — see src/capture/image-tag.ts for why that
+ * granularity), so expiring at a finer granularity than the tag could not
+ * describe a real image change. A genuine minor-version bump still expires.
  *
  * SECURITY: launches treat adoption as a soft pin on `imageName` — they never
  * re-hash / rebuild from `dockerfilePath`. A task agent can edit the worktree
@@ -35,6 +52,7 @@ import { createHash } from 'crypto';
 import { mkdir, readFile, unlink, writeFile } from 'fs/promises';
 import { dirname } from 'path';
 import { VERSION } from '../version';
+import { IMAGE_TAG, imageTagFor } from '../capture/image-tag';
 import { pathExists } from '../utils/fs';
 import { logger } from '../utils/logger';
 import { getAdoptedDockerfilePath, getAdoptedImagePath } from './paths';
@@ -50,7 +68,11 @@ export interface AdoptedImageState {
   contentHash: string;
   /** Full image ref, e.g. lazy-custom-abc123def456:0.22 */
   imageName: string;
-  /** Lazy VERSION string at adoption — must match current VERSION to stay valid. */
+  /**
+   * Lazy VERSION string at adoption. Adoption stays valid while this version
+   * maps to the SAME image tag as the running binary (`imageTagFor`, major.minor)
+   * — see the header for why not the full VERSION.
+   */
   lazyVersion: string;
   /** ISO timestamp when adoption was written. */
   adoptedAt: string;
@@ -180,7 +202,7 @@ export async function writeAdoptedImage(
 /**
  * Delete the adoption file and its Dockerfile snapshot. No-op when absent.
  * Called at the start of every upgrade rebuild so a prior adoption cannot
- * outlive the next decision, and on VERSION expiry / missing Dockerfile /
+ * outlive the next decision, and on image-tag expiry / missing Dockerfile /
  * content drift.
  */
 export async function clearAdoptedImage(projectRoot: string): Promise<boolean> {
@@ -223,7 +245,7 @@ export type AdoptedImageLoadResult =
   | { status: 'content-drifted'; state: AdoptedImageState };
 
 /**
- * Load adoption and enforce the lifecycle: VERSION must match, Dockerfile
+ * Load adoption and enforce the lifecycle: the image tag must match, Dockerfile
  * must still exist with the consented content hash. Expired / missing /
  * drifted states are cleared so they cannot wedge launches or rebuild from
  * post-consent agent edits.
@@ -242,7 +264,8 @@ export async function loadValidAdoptedImage(
 
   if (result.status === 'expired') {
     logger.info(
-      `Adopted image expired (was for lazy ${result.state.lazyVersion}, now ${VERSION}) — ` +
+      `Adopted image expired (was for lazy ${result.state.lazyVersion} → image tag ` +
+        `${imageTagFor(result.state.lazyVersion)}, now ${VERSION} → ${IMAGE_TAG}) — ` +
         `clearing ${getAdoptedImagePath(projectRoot)}. Re-run \`lazy upgrade\` from a worktree to adopt again.`,
     );
     if (expire) await clearAdoptedImage(projectRoot);
@@ -289,7 +312,11 @@ export async function inspectAdoptedImage(
   const state = await readAdoptedImage(projectRoot);
   if (!state) return { status: 'none' };
 
-  if (state.lazyVersion !== VERSION) {
+  // Expire at the granularity the adopted image ref itself uses (major.minor),
+  // not the full VERSION — see the header: the commit-count patch component
+  // advances on every upgrade in a source checkout, and expiring on it made
+  // every upgrade throw away the image it had just built.
+  if (imageTagFor(state.lazyVersion) !== IMAGE_TAG) {
     return { status: 'expired', state };
   }
 

@@ -13,7 +13,7 @@
  */
 
 import { join } from 'path';
-import { readFileSync, writeFileSync, readdirSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync } from 'fs';
 
 /**
  * Resolve the external storage base directory for a test project by reading
@@ -46,9 +46,38 @@ export function taskDirFor(root: string, shortId: string): string {
   return join(tasksDirFor(root), findFullTaskId(root, shortId));
 }
 
+/**
+ * Resolve a task's storage directory by short id, code, or task_ref — whatever
+ * the caller has. CLI arg resolution accepts all three; this is the test-side
+ * equivalent for helpers that read storage directly. Codes and refs do not
+ * prefix-match the UUID directory names, so fall back to reading task.json.
+ */
+export function taskDirByRef(root: string, ref: string): string {
+  const tasksDir = tasksDirFor(root);
+  try {
+    return taskDirFor(root, ref);
+  } catch {
+    // Not a UUID prefix — scan for code / task_ref / short id inside task.json.
+    for (const dir of readdirSync(tasksDir)) {
+      if (dir.includes('.tmp') || dir.includes('.backup')) continue;
+      const taskPath = join(tasksDir, dir, 'task.json');
+      if (!existsSync(taskPath)) continue;
+      const data = JSON.parse(readFileSync(taskPath, 'utf-8')) as Record<string, any>;
+      if (
+        data.code === ref ||
+        (data.metadata?.task_ref as string | undefined) === ref ||
+        data.id?.startsWith(ref)
+      ) {
+        return join(tasksDir, dir);
+      }
+    }
+    throw new Error(`Task directory not found for ${ref} in ${tasksDir} (by code/task_ref/id)`);
+  }
+}
+
 /** Absolute path to a file inside a task's storage directory. */
 export function taskFilePath(root: string, shortId: string, file: string): string {
-  return join(taskDirFor(root, shortId), file);
+  return join(taskDirByRef(root, shortId), file);
 }
 
 /**
@@ -56,7 +85,7 @@ export function taskFilePath(root: string, shortId: string, file: string): strin
  *
  * Worktrees are NOT external storage — they live in the repo's data dir
  * (`<root>/.lazy/worktrees/<task_ref>`, see `getWorktreePath` in
- * src/cli/helpers.ts). Test tasks are created without a code, so the ref is the
+ * src/task/identity.ts). Test tasks are created without a code, so the ref is the
  * short id.
  */
 export function worktreePathFor(root: string, shortId: string): string {
@@ -118,6 +147,10 @@ export interface StoredTurn {
   content: string;
   turn_type?: string;
   actor?: string;
+  /** WHICH person acted, when the acting token identified one. */
+  actor_email?: string;
+  /** Their display name at the time, when the write carried one. */
+  actor_name?: string;
   sequence?: number;
   usage?: { cacheCreationTokens?: number; cacheReadTokens?: number };
   violations?: Array<{ file: string; base_sha: string; status: string }>;
@@ -138,4 +171,142 @@ export function readTurns(root: string, shortId: string): StoredTurn[] {
  */
 export function writeTurns(root: string, shortId: string, turns: StoredTurn[]): void {
   writeJson(taskFilePath(root, shortId, 'turns.json'), { turns });
+}
+
+export interface StoredRaisedItem {
+  id: string;
+  task_id: string;
+  content: string;
+  created_at: number;
+  /** The whole difference between the two former entities. */
+  blocking?: boolean;
+  title?: string;
+  /** Absent means open — that back-compat default is worth exercising. */
+  triage_status?: 'open' | 'acknowledged' | 'dismissed' | 'promoted';
+  status?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * Seed a task's raised items. The only authoring path is an agent calling
+ * `lazy_raise` mid-turn, so a suite that needs a task carrying triaged and
+ * untriaged items — blocking and not — cannot get there through the CLI. It
+ * writes the records the listing reads.
+ */
+export function writeRaisedItemsFile(root: string, shortId: string, items: StoredRaisedItem[]): void {
+  writeJson(taskFilePath(root, shortId, 'raised-items.json'), { raised_items: items });
+}
+
+/** Read a task's raised items straight from storage. */
+export function readRaisedItems(root: string, shortId: string): StoredRaisedItem[] {
+  const path = taskFilePath(root, shortId, 'raised-items.json');
+  if (!existsSync(path)) return [];
+  return readJson<{ raised_items: StoredRaisedItem[] }>(path).raised_items;
+}
+
+export interface StoredJournalEntry {
+  id?: string;
+  task_id?: string;
+  content: string;
+  created_at?: number;
+  actor?: string;
+  [key: string]: unknown;
+}
+
+/** Read a task's journal entries straight from storage. */
+export function readJournal(root: string, shortId: string): StoredJournalEntry[] {
+  const path = taskFilePath(root, shortId, 'journal.json');
+  if (!existsSync(path)) return [];
+  return readJson<{ journal: StoredJournalEntry[] }>(path).journal ?? [];
+}
+
+/** @deprecated Legacy shape — use {@link StoredRaisedItem}. */
+export type StoredFollowUp = StoredRaisedItem;
+
+/**
+ * Seed a task's PRE-UNIFICATION `follow-ups.json`.
+ *
+ * This is a MIGRATION fixture, not an ordinary seeding helper: follow-ups are
+ * raised items with `blocking: false` now, and the file this writes is only
+ * ever read by the one-time conversion that runs at daemon start. Seed it
+ * BEFORE the daemon comes up, or the records stay invisible — the migration
+ * does not re-run. For ordinary seeding use `writeRaisedItemsFile`.
+ */
+export function writeFollowUpsFile(root: string, shortId: string, followUps: StoredFollowUp[]): void {
+  writeJson(taskFilePath(root, shortId, 'follow-ups.json'), { follow_ups: followUps });
+}
+
+export interface StoredSystemMessage {
+  id: string;
+  created_at: number;
+  source: string;
+  title: string;
+  body: string;
+  kind: string;
+  read_at?: number;
+  dismissed_at?: number;
+  dismissed_by?: string;
+  [key: string]: unknown;
+}
+
+/** Read the project's system messages straight from storage. */
+export function readSystemMessagesFile(root: string): StoredSystemMessage[] {
+  const path = join(storageDirFor(root), 'system-messages.json');
+  if (!existsSync(path)) return [];
+  return readJson<{ system_messages: StoredSystemMessage[] }>(path).system_messages;
+}
+
+/**
+ * Seed the project's system messages. Only for e2e suites: the CLI has no
+ * create surface on purpose (producers file messages via `lazy_message_post`
+ * or the daemon), so tests seed the store directly to exercise list/read/
+ * dismiss and the builder-launch injection.
+ */
+export function writeSystemMessagesFile(root: string, messages: StoredSystemMessage[]): void {
+  writeJson(join(storageDirFor(root), 'system-messages.json'), { system_messages: messages });
+}
+
+/** Write one stored conversation JSON file into the external store. */
+export function writeConversationFile(root: string, conversation: Record<string, unknown>): void {
+  const dir = join(storageDirFor(root), 'conversations');
+  const sessionId = conversation.sessionId as string;
+  if (!sessionId) throw new Error('writeConversationFile: conversation.sessionId is required');
+  mkdirSync(dir, { recursive: true });
+  writeJson(join(dir, `${sessionId}.json`), conversation);
+}
+
+/**
+ * Seed shared-memory records by writing `memories.json` in the external store.
+ *
+ * Prefer `lazy memory save` when a few records will do — that is the real
+ * authoring path. Direct writes exist for bulk fixtures (mechanical compact
+ * only pays off at ~50+ records) where 60 CLI subprocesses would dominate
+ * the suite, and for asserting store state after a web POST. The daemon's
+ * FileStorage re-reads this file on every call, so a write then a fetch is
+ * visible; do not open a second Storage instance in a withDaemon suite
+ * (the daemon holds `.storage-lock`).
+ */
+export function writeMemoriesFile(root: string, memories: Array<Record<string, unknown>>): void {
+  writeJson(join(storageDirFor(root), 'memories.json'), { memories });
+}
+
+/** Read the project's memory records straight from storage. */
+export function readMemoriesFile(root: string): Array<Record<string, unknown>> {
+  const path = join(storageDirFor(root), 'memories.json');
+  if (!existsSync(path)) return [];
+  return readJson<{ memories: Array<Record<string, unknown>> }>(path).memories ?? [];
+}
+
+/** Read the derived memory compact, or null when none has been generated. */
+export function readMemoryCompactFile(root: string): Record<string, unknown> | null {
+  const path = join(storageDirFor(root), 'memory-compact.json');
+  if (!existsSync(path)) return null;
+  return readJson<{ compact: Record<string, unknown> }>(path).compact ?? null;
+}
+
+/** Read the project settings record (the store's overlay), or null when none. */
+export function readProjectSettingsFile(root: string): Record<string, unknown> | null {
+  const path = join(storageDirFor(root), 'project-settings.json');
+  if (!existsSync(path)) return null;
+  return readJson<Record<string, unknown>>(path);
 }

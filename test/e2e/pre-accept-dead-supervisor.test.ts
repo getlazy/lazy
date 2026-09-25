@@ -1,7 +1,8 @@
 /**
- * E2E: a pre-accept turn whose supervisor never answers must abort in SECONDS.
+ * E2E: an acceptance gate whose supervisor never answers must abort in SECONDS.
  *
- * Field report from the released version: `lazy accept` sat at
+ * Field report from the released version (then the pre-accept AGENT turn, the
+ * gate's predecessor): `lazy accept` sat at
  *
  *     · [4/12] Pre-accept validation turn… 2m43s (and climbing)
  *
@@ -9,20 +10,22 @@
  * The daemon's pre-accept wait polled only for `response.json`, with no liveness
  * check anywhere in the loop, so a supervisor that died before answering — or
  * one that was never launched because a stale `isRunning` said one was already
- * up — held the accept for `agent.watchdog_output_timeout_ms + 5m` (~35 minutes
- * by default) before the timeout path fired.
+ * up — held the accept for its whole wait budget before the timeout path fired.
+ * The mechanical gate waits through the same liveness-aware helper
+ * (src/daemon/supervisor-wait.ts), and this suite pins that the property
+ * survived the replacement.
  *
- * INVARIANT: the pre-accept wait aborts on supervisor death, not on the
+ * INVARIANT: the acceptance-gate wait aborts on supervisor death, not on the
  * timeout. The task returns to its prior status and the reason is recorded on
  * the task itself, exactly as the timeout and launch-failure paths already do —
  * this abort can outlive the client that asked for it, so the CLI's error is not
  * the only place the explanation may land.
  *
- * The seam: `LAZY_MOCK_PRE_ACCEPT_SUPERVISOR_DIES` makes the mock supervisor
- * return from a `pre_accept` command without writing anything, and this mock's
+ * The seam: `LAZY_MOCK_ACCEPT_GATE_SUPERVISOR_DIES` makes the mock supervisor
+ * return from an `accept_gate` command without writing anything, and this mock's
  * `isContainerRunning` always reports false — together, a run that answers
- * nothing and is not there. It is set as `daemonEnv` because the pre-accept turn
- * is launched by the DAEMON's mock, which per-test env never reaches.
+ * nothing and is not there. It is set as `daemonEnv` because the gate is
+ * launched by the DAEMON's mock, which per-test env never reaches.
  *
  * The whole abort is bounded by the helper's two graces (a startup grace so a
  * slow launch is not mistaken for a death, then a death grace so the normal
@@ -36,14 +39,15 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 
 /** Generous per-test budget; the assertion below is what actually pins the speed. */
 const TEST_TIMEOUT_MS = 120_000;
 
 /**
- * The abort must be nowhere near the real pre-accept budget. The default
- * watchdog is 30 minutes and the daemon adds a 5-minute margin, so anything
- * under a minute proves the wait no longer runs to that deadline.
+ * The abort must be nowhere near the real gate budget. With the suite's config
+ * (one command, timeout 60) the daemon's wait is 60s + a 5-minute margin, so
+ * anything under a minute proves the wait no longer runs to that deadline.
  */
 const ABORT_BUDGET_MS = 60_000;
 
@@ -82,6 +86,11 @@ async function setupBlockedTask(ctx: TestContext, goal: string): Promise<string>
   expect(ctx.git('-C', worktreePath, 'add', 'feature.txt').exitCode).toBe(0);
   expect(ctx.git('-C', worktreePath, 'commit', '-m', 'Add feature').exitCode).toBe(0);
 
+  // Fixture finality, not the subject (see test/helpers/final.ts): the suite's
+  // accepts test the GATE abort, which fires after the finality gate. `seedFinal`
+  // runs a real wrap-up turn — unaffected by the gate-only die env below.
+  await seedFinal(ctx, taskId);
+
   return taskId;
 }
 
@@ -91,7 +100,7 @@ describe('pre-accept aborts when the supervisor never answers', () => {
   beforeEach(async () => {
     ctx = await setupTestLazy({
       withDaemon: true,
-      daemonEnv: { LAZY_MOCK_PRE_ACCEPT_SUPERVISOR_DIES: '1' },
+      daemonEnv: { LAZY_MOCK_ACCEPT_GATE_SUPERVISOR_DIES: '1' },
     });
   });
 
@@ -138,21 +147,22 @@ describe('pre-accept aborts when the supervisor never answers', () => {
 
 /**
  * INVARIANT: a merge never proceeds on a response that did not answer the
- * pre-accept command.
+ * acceptance gate.
  *
- * The protocol dir has no command↔response correlation id — the wait consumes
- * whatever `response.json` holds — so if another command takes over the channel
- * mid-wait (an auto-resume's `unblock`, an auto-delivered comment, a manual
- * turn), the accept gets that turn's ordinary work response instead. It has no
- * `pre_accept` block, because only `handlePreAcceptCommand` ever writes one, and
- * it writes one on EVERY completed pre-accept answer — the empty-command-list
- * case included, as `{ passed: true }`.
+ * The gate's protocol dir is DEDICATED (`<taskId>-gate`, a sibling of the task
+ * dir) — an ordinary turn can no longer take the channel over mid-wait the way
+ * the old shared dir allowed, and only `handleAcceptGateCommand` writes there.
+ * The wait still consumes whatever `response.json` holds, though, so the last
+ * check is the payload itself: only `handleAcceptGateCommand` ever sets the
+ * `accept_gate` block, and it sets one on EVERY completed gate answer — the
+ * empty-command-list case included, as `{ passed: true }`.
  *
- * The daemon used to read that as `gate && !gate.passed` → falsy → pass, so the
- * accept merged having validated nothing, and recorded the foreign turn under
- * the "Pre-accept validation" heading so the task history claimed a validation
- * that never ran. This is the "proceeded and merged successfully" half of the
- * field report the ownership guard alone did not explain.
+ * The daemon used to read a gate-less response as `gate && !gate.passed` →
+ * falsy → pass, so the accept merged having validated nothing. (That is the
+ * "proceeded and merged successfully" half of the field report the ownership
+ * guard alone did not explain.) The dedicated mailbox makes the takeover
+ * scenario unreachable; the refusal stays as the belt behind it, simulated
+ * here by `LAZY_MOCK_ACCEPT_GATE_FOREIGN_RESPONSE`.
  */
 describe('pre-accept refuses to merge on a response that is not its own', () => {
   let ctx: TestContext;
@@ -160,7 +170,7 @@ describe('pre-accept refuses to merge on a response that is not its own', () => 
   beforeEach(async () => {
     ctx = await setupTestLazy({
       withDaemon: true,
-      daemonEnv: { LAZY_MOCK_PRE_ACCEPT_FOREIGN_RESPONSE: '1' },
+      daemonEnv: { LAZY_MOCK_ACCEPT_GATE_FOREIGN_RESPONSE: '1' },
     });
   });
 
@@ -183,6 +193,6 @@ describe('pre-accept refuses to merge on a response that is not its own', () => 
     expectSuccess(show);
     expectOutput(show, 'blocked');
     // `lazy show` truncates comment bodies, so assert on the opening clause.
-    expectOutput(show, 'Pre-accept validation aborted');
+    expectOutput(show, 'Acceptance gate aborted');
   }, TEST_TIMEOUT_MS);
 });

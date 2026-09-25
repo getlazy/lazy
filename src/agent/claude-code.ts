@@ -12,12 +12,16 @@ import type { AgentResponse } from '../types';
 import type { Agent } from './interface';
 import { ClaudeCodeActivityStream } from './activity-stream';
 import { safeArgvPrompt } from './argv-safety';
+import { classifyNoModelRefusal, requireLaunchModel } from './launch-model';
+import { ClaudeCodePackaging } from './claude-code-packaging';
 import {
   classifyCommonFailureSignals,
   failureHaystack,
   type AgentFailure,
   type AgentFailureInput,
 } from './failure-taxonomy';
+
+const LAUNCH_BINARY = new ClaudeCodePackaging().binaryName();
 
 /**
  * Tools disallowed for the agent in ask/plan mode (read-only Q&A turns).
@@ -165,9 +169,8 @@ export class ClaudeCodeAgent implements Agent {
       args.push('--resume', opts.sessionId);
     }
 
-    if (opts.modelId) {
-      args.push('--model', opts.modelId);
-    }
+    // Always: see requireLaunchModel (src/agent/launch-model.ts).
+    args.push('--model', requireLaunchModel('claude-code', opts.modelId));
 
     if (opts.effort) {
       args.push('--effort', opts.effort);
@@ -246,6 +249,10 @@ export class ClaudeCodeAgent implements Agent {
   classifyFailure(input: AgentFailureInput): AgentFailure {
     const text = failureHaystack(input);
 
+    // lazy's own refusal to launch without a model (src/agent/launch-model.ts).
+    const noModel = classifyNoModelRefusal(input);
+    if (noModel) return noModel;
+
     // lazy's own pre-flight auth error (see getAuthEnvVars above) — no
     // credential exists at all, so every launch will fail identically.
     if (text.includes('authentication required. set claude_code_oauth_token')) {
@@ -265,7 +272,7 @@ export class ClaudeCodeAgent implements Agent {
     }
 
     return (
-      classifyCommonFailureSignals(input) ?? {
+      classifyCommonFailureSignals(input, [LAUNCH_BINARY]) ?? {
         class: 'unknown',
         reason: 'unrecognized Claude Code failure',
       }
@@ -293,11 +300,25 @@ export class ClaudeCodeAgent implements Agent {
   }
 
   supportsPairing(): boolean {
-    // The one agent whose container-written sessions lazy can surface to a host
-    // session deliberately: bridgeSessionFiles symlinks the sandbox JSONL into
-    // ~/.claude/projects for the session and removes it after, rather than
-    // copying agent-written bytes onto the host. See pair-bridge.ts.
+    // Task-mode pairing runs in the task's container, where the session is
+    // simply read and written on the mounted ~/.claude — nothing crosses the
+    // boundary. On the host paths that remain (`--host`, branchless), lazy
+    // bridges the sandbox JSONL by symlink for the session and removes it
+    // after, rather than copying agent-written bytes onto the host — the one
+    // narrow crossing, see pair-bridge.ts.
     return true;
+  }
+
+  buildInteractiveArgs(opts: {
+    sessionId?: string | null;
+    modelId?: string | null;
+    dangerouslySkipPermissions: boolean;
+  }): string[] {
+    const args = ['claude'];
+    if (opts.sessionId) args.push('--resume', opts.sessionId);
+    if (opts.dangerouslySkipPermissions) args.push('--dangerously-skip-permissions');
+    args.push('--model', requireLaunchModel('claude-code', opts.modelId));
+    return args;
   }
 
   discoverSessionFiles(opts: {

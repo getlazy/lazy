@@ -123,13 +123,22 @@ export async function writeCursorMcpConfig(mcpServerConfig: { command: string; a
  * Since we control the lazy MCP server, all lazy tools should be pre-approved
  * to avoid noisy permission prompts during agent work.
  *
- * Writes tool entries as `mcp__lazy__<tool_name>` to ~/.claude/settings.json.
+ * Writes tool entries as `mcp__lazy__<tool_name>` to `<home>/.claude/settings.json`.
  * Merges with existing settings, removing stale lazy tool entries first.
  *
+ * `home` is the home directory the LAUNCH mounts as /home/user — the file must
+ * be written where the launched container will read it, which is only the host
+ * user's home for the launch paths that mount it (launchBuilderInteractive,
+ * launchBuilderHeadless). A launch that mounts a per-member home instead must
+ * pass that home, or the permissions land somewhere nothing mounts and the
+ * session starts prompting for every lazy tool — while silently rewriting the
+ * host operator's real settings as a side effect.
+ *
  * @param toolNames - Tool names to approve (e.g., ['lazy_search', 'lazy_show', ...])
+ * @param home - Home directory to write under; defaults to the process user's home
  */
-export async function writeToolPermissions(toolNames: string[]): Promise<void> {
-  const claudeDir = join(getHome(), '.claude');
+export async function writeToolPermissions(toolNames: string[], home: string = getHome()): Promise<void> {
+  const claudeDir = join(home, '.claude');
   await ensureDir(claudeDir);
 
   const settingsPath = join(claudeDir, 'settings.json');

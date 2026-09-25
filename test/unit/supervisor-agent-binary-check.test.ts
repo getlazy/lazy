@@ -13,6 +13,11 @@
  * Same source-text coverage pattern as test/unit/supervisor-mcp-setup.test.ts:
  * a new agent-running handler that forgets the call would fail silently, and
  * only in environments whose image lacks the agent.
+ *
+ * What is checked is the HARNESS, not `cmd.agent_id`: since agent profiles,
+ * `agent_id` carries a PROFILE name (`local-ollama-pi`), and there is no binary
+ * by that name — `commandHarness(cmd)` resolves the profile to the registered
+ * implementation whose binary the image must actually contain.
  */
 import { describe, test, expect } from 'bun:test';
 import { readFile } from 'fs/promises';
@@ -28,7 +33,7 @@ describe('supervisor agent-binary coverage', () => {
     // handleSyncCommand is deliberately absent: its conflict-resolution turn
     // always runs Claude Code (src/supervisor/merge.ts), whatever the task's
     // agent, and claude is in every base image.
-    const handlers = ['handleTurnCommand', 'handleAskCommand', 'handlePreAcceptCommand'];
+    const handlers = ['handleTurnCommand', 'handleAskCommand'];
     const allHandlers = [...handlers, 'handleSyncCommand'];
 
     for (const name of handlers) {
@@ -40,8 +45,14 @@ describe('supervisor agent-binary coverage', () => {
       const end = next.length ? Math.min(...next) : source.length;
       const body = source.slice(start, end);
       expect(
-        body.includes('await checkCommandAgentBinary(cmd.agent_id)'),
+        body.includes('await checkCommandAgentBinary(harness)'),
         `${name} must call checkCommandAgentBinary before running the agent`,
+      ).toBe(true);
+      // ...and on the harness it is about to RUN, resolved from the command,
+      // rather than on a name that happens to be in scope.
+      expect(
+        body.includes('const harness = commandHarness(cmd)'),
+        `${name} must resolve the harness from the command`,
       ).toBe(true);
     }
   });

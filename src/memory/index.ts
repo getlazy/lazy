@@ -11,7 +11,7 @@
  * must not import storage.
  */
 
-import type { MemoryRecord, MemoryType, MemoryCompact } from '../types';
+import type { MemoryRecord, MemoryType, MemoryCompact, MemoryWriteInput } from '../types';
 import type { Storage } from '../storage/interface';
 import { VALID_MEMORY_TYPES } from '../types';
 import { DEFAULT_MEMORY_WARN_BYTES } from '../config/constants';
@@ -112,6 +112,61 @@ export function normalizeAuthoredMemoryDescription(input: string): string {
     );
   }
   return oneLine;
+}
+
+/**
+ * Fields an AUTHORING surface collects before `storage.saveMemory`.
+ *
+ * `description` and `type` are required for a new record and optional on an
+ * update (an omitted field keeps the stored value — same rule as
+ * `lazy memory save`). The import path does not use this: it stores verbatim.
+ */
+export interface AuthoredMemoryFields {
+  name: string;
+  description?: string;
+  type?: string;
+  body: string;
+}
+
+/**
+ * Validate and normalize a write from a lazy authoring surface (CLI, MCP,
+ * the daemon web UI). Returns the `MemoryWriteInput` storage accepts.
+ *
+ * AUTHORING ONLY: name slug, type enum, description length budget, non-empty
+ * body. Import paths must not call this — they have a different contract
+ * (verbatim intake, no truncation).
+ *
+ * `existing` is the live record when this is an update. A new record (no
+ * existing) requires description and type, matching `lazy memory save`.
+ */
+export function prepareAuthoredMemoryWrite(
+  fields: AuthoredMemoryFields,
+  existing?: MemoryRecord | null,
+): MemoryWriteInput {
+  const name = normalizeMemoryName(fields.name);
+
+  if (fields.description === undefined && !existing) {
+    throw new Error(
+      `A new memory record needs a description: one line, at most ${MAX_MEMORY_DESCRIPTION_LENGTH} characters.`,
+    );
+  }
+  const description = fields.description !== undefined
+    ? normalizeAuthoredMemoryDescription(fields.description)
+    : existing!.description;
+
+  if (fields.type === undefined && !existing) {
+    throw new Error(
+      `A new memory record needs a type. Valid types: ${VALID_MEMORY_TYPES.join(', ')}.`,
+    );
+  }
+  const type = fields.type !== undefined ? validateMemoryType(fields.type) : existing!.type;
+
+  const body = fields.body.trim();
+  if (!body) {
+    throw new Error('A memory record needs a body — put the actual knowledge there.');
+  }
+
+  return { name, description, type, body };
 }
 
 /**
@@ -380,11 +435,16 @@ export function renderMemoryUnavailableSection(error: string): string {
  * size, threshold, whether a compact exists, how stale it is, what to run)
  * belongs to doctor's memory-context check, so a launch does not grow its own
  * bespoke advisory. See `checkMemoryContext` in src/cli/commands/doctor.ts.
+ *
+ * `announceOverThreshold: false` suppresses that one line for callers that
+ * assemble a prompt only to MEASURE it — doctor's context budget does — because
+ * a diagnostic that tells you to run the command you are already running is
+ * noise. It changes nothing about the section itself.
  */
 export async function buildMemorySection(
   storage: Storage,
   surface: 'agent' | 'builder',
-  options: { warnBytes?: number } = {},
+  options: { warnBytes?: number; announceOverThreshold?: boolean } = {},
 ): Promise<string> {
   try {
     const records = await storage.listMemories();
@@ -392,7 +452,7 @@ export async function buildMemorySection(
     const warnBytes = options.warnBytes ?? DEFAULT_MEMORY_WARN_BYTES;
     const { section, measured } = assembleMemorySection(records, surface, { compact, warnBytes });
 
-    if (measured.overThreshold) {
+    if (measured.overThreshold && options.announceOverThreshold !== false) {
       logger.warn(MEMORY_CONTEXT_CTA);
     }
     return section;

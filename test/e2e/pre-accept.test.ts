@@ -4,29 +4,30 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 
 /**
- * E2E tests for the pre-accept validation step ([automation.pre_accept]).
+ * E2E tests for the mechanical acceptance gate ([automation.pre_accept]).
  *
- * The step is OPT-IN: `enabled` defaults to false, so every test here that
- * wants the step must set `enabled = true` explicitly.
+ * The gate is OPT-IN: `enabled` defaults to false, so every test here that
+ * wants the gate must set `enabled = true` explicitly.
  *
- * When enabled, on accept, BEFORE the merge, the daemon runs a final agent turn (recorded
- * under a "Pre-accept validation" heading) where the agent runs the configured
- * commands, brings maintained files up to date, and records a post-mortem. The
- * supervisor then re-runs the configured commands as the AUTHORITATIVE merge
- * gate — a non-zero exit aborts the accept and returns the task to blocked
- * (never a silent merge).
+ * When enabled with commands configured, on accept, BEFORE the merge, the
+ * daemon runs the configured commands MECHANICALLY in their own ephemeral
+ * container — no agent, no session, no recorded turn (final-turn design §5.3:
+ * the chance to fix what the checks surface was every work turn; at accept the
+ * commands run independently). A non-zero exit aborts the accept and returns
+ * the task to its prior status (never a silent merge).
  *
  * INVARIANT: pre-accept command failure blocks the merge. There is no override
  * flag — the user fixes the issue and re-accepts.
  *
- * The gate commands come from config (via the pre_accept command file), NOT
+ * The gate commands come from config (via the accept_gate command file), NOT
  * from env, so no daemon env plumbing is needed: the mock supervisor
- * (test/mocks/claude.ts#handleMockPreAccept) re-runs cmd.pre_accept_commands in
- * the worktree exactly like the real handler. `loadConfig` is un-memoized and
- * the accept path re-reads lazy.toml per accept, so writing config after the
- * daemon starts takes effect immediately.
+ * (test/mocks/claude.ts#handleMockAcceptGate) re-runs cmd.accept_gate_commands
+ * in the worktree exactly like the real handler. `loadConfig` is un-memoized
+ * and the accept path re-reads lazy.toml per accept, so writing config after
+ * the daemon starts takes effect immediately.
  */
 describe('lazy accept pre-accept step', () => {
   let ctx: TestContext;
@@ -84,6 +85,12 @@ describe('lazy accept pre-accept step', () => {
     writeFileSync(join(worktreePath, 'feature.txt'), 'feature content\n');
     expect(ctx.git('-C', worktreePath, 'add', 'feature.txt').exitCode).toBe(0);
     expect(ctx.git('-C', worktreePath, 'commit', '-m', 'Add feature').exitCode).toBe(0);
+
+    // Fixture finality: the accept gate (final-turn §5.1) refuses a task nobody
+    // has declared done, and every test here drives an accept to a verdict
+    // other than no-final. Runs no wrap-up commit (no LAZY_MOCK_SHOULD_COMMIT
+    // on the daemon), so the gate's no-turn assertions below stay intact.
+    await seedFinal(ctx, taskId);
 
     return taskId;
   }
@@ -155,9 +162,10 @@ describe('lazy accept pre-accept step', () => {
   });
 
   // The gate runs in the TASK WORKTREE against the final diff: a command that
-  // checks for the task's committed file passes; the pre-accept turn is recorded
-  // (this is where maintained-files + CHANGELOG + post-mortem work happens).
-  test('runs the gate in the worktree and records the pre-accept turn', async () => {
+  // checks for the task's committed file passes only if the gate really ran
+  // there. And the gate records NO agent turn (§5.3) — the reviewer sees the
+  // verdict in the accept output, not a validation turn in the history.
+  test('runs the gate in the worktree and records no agent turn', async () => {
     const taskId = await setupBlockedTask('Pre-accept worktree test');
     configurePreAccept({ enabled: true, commands: ['test -f feature.txt'], timeout: 60 });
 
@@ -165,11 +173,12 @@ describe('lazy accept pre-accept step', () => {
     expectSuccess(result);
     expectOutput(result, 'accepted and merged');
 
-    // The pre-accept turn is persisted under its heading — the reviewer can see
-    // the accept-time validation turn in the task history.
+    // No pre-accept turn is persisted under its old heading — the mechanical
+    // gate replaced that turn (asserting the turn did NOT happen is the
+    // load-bearing half of this suite now).
     const show = await ctx.lazy(['show', taskId]);
     expectSuccess(show);
-    expectOutput(show, 'Pre-accept validation');
+    expect(show.stdout).not.toContain('Pre-accept validation');
   });
 
   // INVARIANT: enabled = false opts the project out of the whole step — the

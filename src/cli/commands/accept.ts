@@ -1,20 +1,26 @@
-import { requireLazyRoot, requireStorage, shortId, displayId, displayIdFor, parseFlags, resolveTaskOrExit, validateCode, taskRef } from '../helpers';
-import { resolveDetachedHead } from '../../git/operations';
+import { requireLazyRoot, requireStorage, parseFlags, resolveTaskOrExit } from '../helpers';
+import { requireActorIdentity } from '../identity-preflight';
+import { shortId, displayId, validateCode } from '../../task/identity';
 import { targetBranchOf } from '../../task-target';
-import { isTTY, promptYesNo, promptLine, readStdinIfPiped } from '../editor';
+import { isTTY, promptYesNo, promptLine, promptSecret, PromptCancelledError, readStdinIfPiped } from '../editor';
 import { commandSyncTask } from './sync';
 import { loadConfig, loadRawConfig } from '../../config/loader';
-import { resolveAgentForNewTask } from '../../agent/task-agent';
+import { resolveAgentForNewTaskFromConfig } from '../../agent/task-agent';
 import { protectionHintForAccept } from '../../protection/discovery';
 import { logger } from '../../utils/logger';
 import { createDriver } from '../../remote';
-import { getActiveChildren } from '../orphan';
+import { getActiveChildren } from '../../task/orphan';
 import { queryAcceptTaskPreflight, queryAcceptTask } from '../../daemon/rpc-fallback';
+import {
+  collectRaisedResolutionsForAccept,
+  RAISED_RESOLUTION_FLAGS,
+} from '../raised-resolutions';
+import type { RaisedItemResolution } from '../../types';
 
-import { theme } from '../theme';
+import { theme } from '../../render/theme';
 import { createPhaseDisplay } from '../phase-display';
-import { getActor } from '../../constants';
 import { docsFooter, docsUrl } from '../../docs/links';
+import { revertedProtectedFilesNotice } from '../../protection/reverted-files';
 
 export async function commandAccept(args: string[]): Promise<void> {
   // Parse and validate flags
@@ -23,6 +29,10 @@ export async function commandAccept(args: string[]): Promise<void> {
     { name: 'reason', takesValue: true },
     { name: 'wait', takesValue: false },
     { name: 'approve-file', takesValue: true, accumulate: true },
+    ...RAISED_RESOLUTION_FLAGS,
+    { name: 'allow-broken', takesValue: false },
+    { name: 'allow-review-issues', takesValue: false },
+    { name: 'allow-queued-comments', takesValue: false },
   ], 'accept');
 
   const taskId = parsed.positional[0];
@@ -35,6 +45,25 @@ export async function commandAccept(args: string[]): Promise<void> {
   const wait = parsed.flags.get('wait') === true;
   const reasonFromFlag = parsed.flags.get('reason') as string | undefined;
   const approvedFiles = (parsed.flags.get('approve-file') as string[] | undefined) ?? [];
+  // Named, explicit, and only ever supplied by a human at this surface: the
+  // accept check refuses a task that does not build, and this is the way to
+  // say "I know, merge it anyway". There is no config key that disables the
+  // refusal — an override people can set once and forget is not an override.
+  const allowBroken = parsed.flags.get('allow-broken') === true;
+  // The other named override, and the only route past a review that left
+  // issues outstanding or failed to parse. Findings are fix feedback, not
+  // rows a human can dismiss one by one, so without this a reviewer facing a
+  // broken review would have to spend another agent turn to accept work they
+  // have already read. CLI-only, like every override that is a human's
+  // judgement standing in for a check.
+  const allowReviewIssues = parsed.flags.get('allow-review-issues') === true;
+  // Accept refuses while comments a human queued have not reached the agent;
+  // this is "I know, merge without them".
+  const allowQueuedComments = parsed.flags.get('allow-queued-comments') === true;
+
+  // Before the accept reason and, on a protected merge, the approval passphrase is typed: the daemon refuses a write it cannot
+  // attribute, and a refusal must never cost the human what they wrote.
+  await requireActorIdentity();
 
   const root = requireLazyRoot();
 
@@ -77,21 +106,167 @@ export async function commandAccept(args: string[]): Promise<void> {
     }
   }
 
-  // Heads-up about the pre-accept validation turn. The step is OPT-IN
-  // ([automation.pre_accept] enabled = true); when it is on, accept runs a
-  // final agent turn BEFORE the merge and the CLI blocks on it — so tell the
-  // user why this may take a while rather than letting them stare at a silent
-  // prompt. When it is off (the default) accept says nothing extra and merges
-  // straight away.
+  // Heads-up about the mechanical acceptance gate. The gate is OPT-IN
+  // ([automation.pre_accept] enabled = true with commands configured); when it
+  // is on, accept runs the configured checks in their own container BEFORE the
+  // merge and the CLI blocks on it — so tell the user why this may take a while
+  // rather than letting them stare at a silent prompt. When the gate is off or
+  // has no commands (an empty list launches nothing at all), accept says
+  // nothing extra and merges straight away.
   {
     const config = await loadConfig(root);
     const preAccept = config.automation.pre_accept;
-    if (preAccept.enabled) {
-      const gateNote = preAccept.commands.length > 0
-        ? ` running ${preAccept.commands.length} configured check(s) (re-run as the merge gate), plus maintained files and a post-mortem`
-        : ' updating maintained files and recording a post-mortem';
+    if (preAccept.enabled && preAccept.commands.length > 0) {
+      const gateNote = ` running ${preAccept.commands.length} configured check(s) as the merge gate`;
       console.log(theme.separator(`Running pre-accept validation before merge —${gateNote}. This may take a while; the merge aborts if a check fails.`));
     }
+  }
+
+  // --- Raised items: collect resolutions BEFORE passphrase / accept ---
+  // Same spirit as protected-file walk-through and the passphrase gate:
+  // every failable / frictional check runs before the human types the
+  // passphrase. Flags supply a complete set; a TTY with no flags walks each
+  // open item; non-interactive without flags refuses with a pasteable command.
+  //
+  // INVARIANT: --yes does NOT skip raised-item resolution. Unlike ordinary
+  // confirmations, this friction cannot be automated away with --yes — the
+  // caller must supply --respond-raised / --promote-raised-subtask /
+  // --promote-raised-peer / --dismiss-raised
+  // or walk the items on a TTY.
+  let raisedResolutions: RaisedItemResolution[] | undefined;
+  {
+    const storage = await requireStorage();
+    try {
+      const task = await resolveTaskOrExit(storage, taskId);
+      const openItems = await storage.getTaskRaisedItems(task.id);
+      raisedResolutions = await collectRaisedResolutionsForAccept({
+        flags: parsed.flags,
+        openItems,
+        displayId: displayId(task),
+      });
+    } finally {
+      await storage.close();
+    }
+  }
+
+  // --- Branch protection: collect the passphrase BEFORE delegating ---
+  // The gate facts come from the daemon's pre-flight (enrollment probed
+  // daemon-side — a CLI-side check from a task worktree resolves the wrong
+  // root), so every failable check runs before the human types anything
+  // (CLAUDE.md). The prompt is TTY-only BY DESIGN: there is no flag, env var,
+  // or stdin route for the passphrase — a non-interactive value would sit in
+  // shell history and agent transcripts, which is the one property the
+  // mechanism must keep (the token originates outside the builder's context).
+  //
+  // INVARIANT: --yes skips prompts, not the gate. The passphrase branch below
+  // never consults `yes`, and the daemon has no parameter that means "skip the
+  // gate" — a --yes accept of a protected merge prompts like any other, or
+  // refuses without a TTY.
+  let token: string | undefined;
+  /** Warnings this surface already printed before the merge, verbatim. */
+  const printedWarnings = new Set<string>();
+  /** The reverted-files notice this surface already printed, if any. */
+  let printedRevertedNotice: string | undefined;
+  try {
+    const preflight = await queryAcceptTaskPreflight({
+      taskId,
+      approvedFiles: approvedFiles.length > 0 ? approvedFiles : undefined,
+      raisedResolutions,
+      // The gate must see the override BEFORE the run: the review gate is a
+      // preflight refusal, so a flag that stands it down has to reach the
+      // preflight or the accept is refused before the run begins.
+      allowReviewIssues: allowReviewIssues || undefined,
+      allowQueuedComments: allowQueuedComments || undefined,
+    });
+    const gate = preflight.gate;
+
+    // Preflight is not read-only: approving `--approve-file` violations happens
+    // HERE, and its warning ("Approved N protected file change(s)") is only ever
+    // on this result — the run's own preflight sees them already approved and
+    // says nothing. Printing it later would also be too late: what the reviewer
+    // needs to know about protected files belongs before the merge, not after.
+    for (const w of preflight.warnings) {
+      console.log(theme.warning(w));
+      printedWarnings.add(w);
+    }
+
+    if (gate.pendingReview) {
+      const r = gate.pendingReview;
+      const staleLabel =
+        r.staleBy === null
+          ? ' — recorded against an earlier state of the branch'
+          : r.staleBy > 0
+            ? ` — recorded before ${r.staleBy} later commit(s)`
+            : '';
+      console.log(theme.separator(`\nReview by ${r.actor} (recorded ${r.recordedAt}${staleLabel}):`));
+      console.log(r.text);
+      console.log('');
+    }
+
+    // Say it BEFORE the merge, while the decision is still open. A reverted
+    // protected file is absent from the diff, which reads exactly like "the
+    // task never touched it" — the reviewer has to be told, not left to infer.
+    if (preflight.revertedProtectedFiles.length > 0) {
+      printedRevertedNotice = revertedProtectedFilesNotice(preflight.revertedProtectedFiles);
+      console.log(theme.warning(`\n${printedRevertedNotice}`));
+      console.log('');
+    }
+
+    if (gate.gated && !gate.satisfiedByForge) {
+      console.log(theme.warning(`This merge is protected: ${gate.reason}`));
+
+      if (gate.enrollment === 'not-enrolled') {
+        console.error(`Error: ${gate.enrollmentMessage}`);
+        process.exit(1);
+      }
+      if (!isTTY()) {
+        console.error(
+          `Error: accepting a protected merge needs the approval passphrase, which is only ` +
+          `ever typed at an interactive prompt — there is deliberately no flag, env var, or ` +
+          `stdin route for it. Run \`lazy accept ${preflight.displayId}\` from a terminal, ` +
+          `or approve the task's PR/MR on the forge.`,
+        );
+        process.exit(1);
+      }
+
+      const promptLabel = gate.sourceLabel
+        ? `Approval passphrase (from ${gate.sourceLabel})`
+        : 'Approval passphrase';
+      // Masked on purpose — the passphrase must never reach the screen or
+      // scrollback. promptSecret refuses outright when it cannot mask.
+      try {
+        // Sent RAW — the store is the one place that normalizes a passphrase,
+        // so nothing here may trim it. The emptiness check below trims only to
+        // decide whether the human just pressed Enter.
+        token = await promptSecret(promptLabel);
+      } catch (err) {
+        if (err instanceof PromptCancelledError) {
+          console.error('Accept cancelled.');
+          process.exit(1);
+        }
+        // Never assert a cause we did not verify: only the not-a-TTY failure
+        // gets the "run it from a terminal" advice. Anything else (a raw-mode
+        // failure, a closed stdin mid-read) is reported as what it was.
+        const message = err instanceof Error ? err.message : String(err);
+        if (message.includes('not an interactive terminal')) {
+          console.error(
+            'Error: cannot read the approval passphrase without echoing it: stdin is not an ' +
+            'interactive terminal. Run `lazy accept` from a terminal, or approve the task\'s ' +
+            'PR/MR on the forge.',
+          );
+        } else {
+          console.error(`Error: could not read the approval passphrase: ${message}`);
+        }
+        process.exit(1);
+      }
+      if (!token.trim()) {
+        console.error('Error: an approval passphrase is required to accept a protected merge.');
+        process.exit(1);
+      }
+    }
+  } catch (err) {
+    console.error(`Error: ${err instanceof Error ? err.message : err}`);
+    process.exit(1);
   }
 
   // --- Delegate to daemon RPC ---
@@ -105,14 +280,24 @@ export async function commandAccept(args: string[]): Promise<void> {
       result = await queryAcceptTask({
         taskId,
         reason: reason.trim(),
+        token,
         approvedFiles: approvedFiles.length > 0 ? approvedFiles : undefined,
-      }, display.onProgress);
+        raisedResolutions,
+        allowBroken: allowBroken || undefined,
+        allowReviewIssues: allowReviewIssues || undefined,
+        allowQueuedComments: allowQueuedComments || undefined,
+      }, display);
     } finally {
       display.close();
     }
 
-    // Print warnings
+    // Print warnings. The daemon repeats the reverted-files notice here for
+    // surfaces whose ONLY channel is result.warnings (MCP, the review page);
+    // this surface already printed it before the merge, so printing it again
+    // would be the same message twice in one command's output.
     for (const w of result.warnings) {
+      if (printedRevertedNotice && w === printedRevertedNotice) continue;
+      if (printedWarnings.has(w)) continue;
       console.log(w);
     }
 
@@ -128,10 +313,21 @@ export async function commandAccept(args: string[]): Promise<void> {
 
       // Check for continuation task offer (revert tasks)
       await handleContinuationTaskOffer(taskId, result.displayId, yes);
+
+      // The task IS accepted (the merge is the commit point), but a step after
+      // it failed — e.g. the parent push. That is a failure, not a warning:
+      // say so and exit non-zero. The daemon keeps retrying it.
+      if (result.followThroughPending) {
+        console.error(theme.error(
+          `\nFinishing the accept FAILED at ${result.followThroughPending.error}. ` +
+          `Still pending: ${result.followThroughPending.steps.join(', ')} — the daemon retries automatically.`,
+        ));
+        process.exit(1);
+      }
     } else if (result.status === 'pending') {
       if (wait) {
         // Poll for CI checks and retry
-        await handleWaitForMerge(taskId, result.displayId, reason, approvedFiles, yes);
+        await handleWaitForMerge(taskId, result.displayId, reason, approvedFiles, raisedResolutions, yes);
       } else {
         console.log(`Task ${result.displayId} approved. Merge pending: ${result.reason}`);
         console.log('The reconciler will complete the merge when ready.');
@@ -180,8 +376,8 @@ export async function commandAccept(args: string[]): Promise<void> {
  * provably not in the way (the merge already happened).
  *
  * CLI-only on purpose: the equivalent MCP accept is run by a builder, which
- * cannot turn protection on anyway (`lazy protect` has no MCP form, for the
- * same reason it cannot run `lazy approve`).
+ * cannot turn protection on anyway (`lazy protect` has no MCP form — arranging
+ * gates is a human act).
  *
  * A tip must never be able to fail an accept that already succeeded, so a
  * failure here is logged with its context and swallowed — the user has their
@@ -228,6 +424,7 @@ async function handleWaitForMerge(
   taskDisplayId: string,
   reason: string,
   approvedFiles: string[],
+  raisedResolutions: RaisedItemResolution[] | undefined,
   yes: boolean,
 ): Promise<void> {
   console.log('Waiting for CI checks to complete...\n');
@@ -254,7 +451,10 @@ async function handleWaitForMerge(
             taskId,
             reason: reason.trim(),
             approvedFiles: approvedFiles.length > 0 ? approvedFiles : undefined,
-          }, retryDisplay.onProgress);
+            // Items were already resolved on the first accept; re-passing is a
+            // no-op when nothing is open (see validateRaisedResolutions).
+            raisedResolutions,
+          }, retryDisplay);
         } finally {
           retryDisplay.close();
         }
@@ -369,16 +569,21 @@ async function handleContinuationTaskOffer(
 
       // A continuation redoes the reverted task's work, so it runs on that
       // task's agent (falling back to the project default if it is unknown).
+      const [config, projectSettings] = await Promise.all([
+        loadConfig(requireLazyRoot()),
+        storage.getProjectSettings(),
+      ]);
       const contTask = await storage.createTask(
         originalGoal,
         undefined,
         undefined,
         continuationCode || undefined,
         undefined,
-        resolveAgentForNewTask({
-          inheritFrom: originalTask,
-          configDefault: (await loadConfig(requireLazyRoot())).agent.agent_id,
-        }),
+        resolveAgentForNewTaskFromConfig(
+          { inheritFrom: originalTask },
+          config.agent,
+          projectSettings,
+        ).agentId,
       );
       await storage.updateTaskPrompt(contTask.id, continuationPrompt);
 
@@ -397,6 +602,9 @@ async function handleContinuationTaskOffer(
 
 export function acceptUsage(): void {
   console.log(`Usage: lazy accept <task_id> [--reason "..."] [--yes] [--wait] [--approve-file <file>...]
+                        [--respond-raised <id>=<text>...] [--promote-raised-subtask <id>...]
+                        [--promote-raised-peer <id>...] [--dismiss-raised <id>=<reason>...]
+                        [--acknowledge-raised <id>...]
 
 Accept a task's work and merge it into the appropriate branch.
 
@@ -408,7 +616,8 @@ Arguments:
 
 Options:
   --reason "..."        Provide accept reason inline (default: "LGTM")
-  --yes                 Skip interactive prompts (non-interactive mode)
+  --yes                 Skip interactive prompts (non-interactive mode). Does NOT
+                        skip raised-item resolution or the protection passphrase.
   --wait                If merge fails due to pending CI checks, poll until checks
                         complete, then retry the merge. Timeout: 10 minutes.
   --approve-file <file> Approve a file (repeatable). Required when accepting a conflict
@@ -416,19 +625,61 @@ Options:
                         merge would re-add a file the target branch deleted; accept
                         refuses and names the files until each one is approved.
                         All-or-nothing: a file left out makes accept REFUSE. Accept
-                        never reverts anything — unlike 'lazy unblock --approve-file',
-                        where a file left out is reverted to its base commit.
+                        never reverts anything.
+  --respond-raised <id>=<text>
+                        Respond to the agent on an open raised item (repeatable).
+                        Schedules a comment quoting the item; delivered on this
+                        accept (or the next unblock). Required (with promote/dismiss)
+                        for every open item — all-or-nothing, like --approve-file.
+  --promote-raised-subtask <id>
+                        Create a child task under this one for the item on accept
+                        (repeatable; optional =<note>). Re-parented onto the accept
+                        target with the task's other children.
+  --promote-raised-peer <id>
+                        Create a sibling task for the item on accept (repeatable;
+                        optional =<note>). Lazy creates either promoted task
+                        itself, and the agent is told so it stops re-raising.
+  --dismiss-raised <id>=<reason>
+                        Dismiss an open raised item with a reason (repeatable).
+  --acknowledge-raised <id>
+                        Acknowledge an open raised item — "seen, maybe later"
+                        (repeatable; optional =<note>). Same act as dismiss with
+                        a different valence, and it clears the accept gate the
+                        same way, so it counts toward the all-or-nothing set.
+  --allow-broken        Merge even though the accept check failed. The failure is
+                        still reported as a warning — this suppresses the refusal,
+                        never the fact.
+  --allow-review-issues Merge even though the latest review left issues
+                        outstanding or failed outright. Review findings are fix
+                        feedback, not items you can dismiss one at a time, so
+                        this is how a human who has read the work says "I have
+                        decided" instead of paying for another agent turn. There
+                        is no MCP equivalent — an agent may not overrule a
+                        review for you.
+  --allow-queued-comments
+                        Merge even though comments a person queued for the
+                        agent (lazy comment, web review comments) have not
+                        been delivered. Without it accept refuses, because merging
+                        ends the task with that feedback never read.
 
 Reason input priority: --reason flag > piped stdin > interactive prompt > "LGTM"
 
 Behavior:
   - Merges directly by default. If [automation.pre_accept] enabled = true is
-    set, accept first runs the pre-accept validation turn BEFORE merging: a
-    final agent turn that runs the configured commands, brings maintained files
-    up to date (e.g. CHANGELOG), and records a post-mortem. The supervisor
-    re-runs the commands as the merge gate — if any fails, the task returns to
-    blocked and the accept is aborted (never a silent merge). This can take a
-    while; the CLI waits for it.
+    set, accept first runs the configured commands as the MECHANICAL acceptance
+    gate in an ephemeral container on the task's worktree BEFORE merging — no
+    agent turn runs. If any command fails, the task returns to blocked and the
+    accept is aborted (never a silent merge). This can take a while; the CLI
+    waits for it.
+  - Runs the accept check before merging, when [automation] accept_check is set:
+    the project's own command (e.g. "bun run typecheck") is run in the TASK's
+    worktree, and a non-zero exit REFUSES the accept — a task that does not
+    build would break the branch it is merged into. Unset means no gate, and
+    accept says the step was skipped rather than guessing a command. Override a
+    refusal knowingly with --allow-broken.
+  - Names any protected files that were REVERTED during the task. A reverted
+    file is absent from the diff, which reads identically to "the task never
+    touched it" — so accept says it outright before the merge.
   - Checks pre-merge gates (CI, reviews, unresolved comments) before merging.
     If any gates are failing, accept refuses to merge and prints a link to the
     PR/MR so the user can resolve the issues there.
@@ -441,6 +692,32 @@ Behavior:
   - When a GitHub PR exists, the reason is posted as an approving PR review
   - With --wait: if the merge fails (e.g., required CI checks pending), polls
     check status every 10s for up to 10 minutes, then retries the merge
+
+Protected merges ([protection] in lazy.toml):
+  - Accepting a protected merge prompts for the approval passphrase and merges
+    in the same invocation — the approval is bound to the exact commits merged.
+  - The prompt is TTY-only. There is deliberately no flag, env var, or stdin
+    route for the passphrase, and --yes skips other prompts but NEVER this one.
+  - A human approval on the task's PR/MR satisfies the same gate — then no
+    passphrase is asked.
+  - The passphrase is enrolled once per MACHINE, hashed and outside every
+    repository: 'lazy system passphrase set'. With nothing enrolled here, a
+    protected merge refuses with that instruction rather than prompting.
+  - A review recorded by the builder's refused accept is shown before the
+    prompt and attached to the merge (task comment and PR/MR review).
+
+Raised items (agent questions/decisions that gate accept):
+  - Accept refuses while any raised item is open. Every open item must be
+    responded to, promoted (subtask or peer), or dismissed — all-or-nothing.
+  - Interactive TTY with no flags: walks each open item (content + options)
+    and prompts respond / promote-subtask / promote-peer / dismiss. --yes does
+    NOT skip this walk.
+  - Non-interactive without flags: refuses with a pasteable command naming
+    --respond-raised for each open id.
+  - Comments stay pending until accept/unblock writes them; change the
+    resolution on the review page before then to undo.
+  - See also: lazy show (lists raised items), lazy followup (triage follow-ups —
+    those do NOT gate accept).
 
 Conflict Resolution:
   Interactive mode (TTY available, no --yes flag):
@@ -460,5 +737,7 @@ Examples:
   lazy accept abc12345 --yes                    # Accept without prompts (uses "LGTM")
   lazy accept abc12345 --reason "Ship it" --yes # Accept with reason, no prompts
   lazy accept abc12345 --wait                   # Wait for CI checks before merging
-  lazy accept abc12345 --approve-file a.ts --approve-file b.ts --yes  # Accept conflict task, approving violated files${docsFooter('protected-branches')}`);
+  lazy accept abc12345 --approve-file a.ts --approve-file b.ts --yes  # Accept conflict task, approving violated files
+  lazy accept abc12345 --respond-raised a1b2c3d4="use option 2" --dismiss-raised e5f6a7b8="not in scope" --yes
+  lazy accept abc12345 --promote-raised-subtask a1b2c3d4 --promote-raised-peer e5f6a7b8 --yes${docsFooter('raised-items')}`);
 }

@@ -9,10 +9,10 @@
  */
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { mkdir, writeFile } from 'fs/promises';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
-import { storageDirFor } from '../helpers/storage';
+import { auditLogPath } from '../../src/proxy/audit-log';
 
 interface SeedRecord {
   id: string;
@@ -26,7 +26,7 @@ interface SeedRecord {
   denials?: Array<{ name: string; rule: string; reason: string }>;
   reroute?: { trigger: string; toUpstream: string; toModel: string } | null;
   toolUses?: Array<{ name: string; path?: string; command?: string; connector?: boolean }>;
-  toolResults?: Array<{ len: number; preview: string; isError?: boolean }>;
+  toolResults?: Array<{ len: number; preview: string; isError?: boolean; tokens?: number }>;
 }
 
 function seedLine(seq: number, r: SeedRecord): string {
@@ -68,6 +68,7 @@ function seedLine(seq: number, r: SeedRecord): string {
       isError: t.isError ?? false,
       contentPreview: t.preview,
       contentLen: t.len,
+      contentTokens: t.tokens ?? null,
     })),
     status: r.status === undefined ? 200 : r.status,
     usage: r.usage
@@ -97,14 +98,18 @@ function seedLine(seq: number, r: SeedRecord): string {
   });
 }
 
+/**
+ * Seed the live audit segment where the reader actually looks.
+ *
+ * `auditLogPath` rather than a hand-composed path: the log lives in the
+ * PROJECT-LOCAL data dir under `logs/`, not in the (possibly external) store
+ * root. This suite seeded the store root, which the reader stopped reading when
+ * the log moved — so every assertion below ran against an empty trail.
+ */
 async function seedAudit(root: string, records: SeedRecord[]): Promise<void> {
-  const dir = storageDirFor(root);
-  await mkdir(dir, { recursive: true });
-  await writeFile(
-    join(dir, 'proxy-audit.jsonl'),
-    records.map((r, i) => seedLine(i + 1, r)).join('\n') + '\n',
-    'utf-8',
-  );
+  const path = auditLogPath(join(root, '.lazy'));
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, records.map((r, i) => seedLine(i + 1, r)).join('\n') + '\n', 'utf-8');
 }
 
 const NOW = Date.now();
@@ -117,7 +122,7 @@ function sampleRecords(): SeedRecord[] {
       taskId: 'task-alpha',
       usage: { input: 1000, output: 100 },
       toolUses: [{ name: 'Read', path: '/repo/src/index.ts' }],
-      toolResults: [{ len: 4096, preview: 'file contents…' }],
+      toolResults: [{ len: 4096, preview: 'file contents…', tokens: 1024 }],
     },
     {
       id: 'bbbb2222-2222-2222-2222-222222222222',
@@ -301,6 +306,28 @@ describe('lazy stats audit', () => {
     expectOutput(result, 'file contents');
     expectOutput(result, '1,100 total');
     expectOutput(result, '4 message(s), 2 tool(s) declared');
+    // The result's size in tokens — what that tool's output added to the
+    // conversation — next to its size in characters.
+    expectOutput(result, '4,096 chars / ~1,024 tokens');
+  });
+
+  // INVARIANT: a record with no recorded result size shows only the character
+  // count. Printing "~0 tokens" would read as a free result; older records
+  // predate the measurement and must not be back-filled with a guess.
+  test('a result with no recorded token size shows chars alone', async () => {
+    await seedAudit(ctx.root, [
+      {
+        id: 'ffff6666-6666-6666-6666-666666666666',
+        ts: NOW,
+        taskId: 'task-alpha',
+        toolUses: [{ name: 'Read', path: '/repo/old.ts' }],
+        toolResults: [{ len: 512, preview: 'older record…' }],
+      },
+    ]);
+    const result = await ctx.lazy(['stats', 'audit', 'ffff6666']);
+    expectSuccess(result);
+    expectOutput(result, '512 chars');
+    expect(result.stdout).not.toContain('tokens');
   });
 
   test('the detail view shows reroute source and target', async () => {
@@ -402,10 +429,10 @@ describe('lazy stats audit', () => {
   });
 
   test('a corrupt audit line does not make the trail unreadable', async () => {
-    const dir = storageDirFor(ctx.root);
-    await mkdir(dir, { recursive: true });
+    const path = auditLogPath(join(ctx.root, '.lazy'));
+    await mkdir(dirname(path), { recursive: true });
     await writeFile(
-      join(dir, 'proxy-audit.jsonl'),
+      path,
       seedLine(1, sampleRecords()[0]) + '\n{partial write interrupted by a cra\n',
       'utf-8',
     );

@@ -132,6 +132,7 @@ function createSessionManually(ctx: TestContext, shortId: string): void {
     total_duration_ms: 0,
     total_usage: null,
     container_name: null,
+    container_agent_id: null,
     interrupt_reason: null,
     interrupt_exit_code: null,
     interrupt_at: null,

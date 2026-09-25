@@ -17,7 +17,6 @@
  */
 
 export { FileStorage } from './file-storage';
-export { PostgresStorage } from './postgres-storage';
 export { RemoteStorage } from './remote-storage';
 export type { Storage } from './interface';
 export type {
@@ -31,7 +30,7 @@ export type {
   Comment,
   Note,
   JournalEntry,
-  FollowUp,
+  RaisedItem,
   TaskPromptVersion,
   TaskStatus,
   SessionOutcome,
@@ -40,17 +39,21 @@ export type {
   WorktreeSnapshot,
   TaskTreeNode,
   ListTasksOptions,
+  TaskCodeEntry,
   StorageVersion,
   SearchResult,
   StoredConversation,
+  ConversationSummary,
   StoredMessage,
   StoredSubagent,
   ConversationStats,
+  ScratchFile,
+  ScratchFileInput,
+  ScratchSkipReason,
   StatusChange,
 } from './types';
 
 import { FileStorage } from './file-storage';
-import { PostgresStorage } from './postgres-storage';
 import type { Storage } from './interface';
 import { loadConfig } from '../config/loader';
 import { join } from 'path';
@@ -59,6 +62,11 @@ import { getHome } from '../utils/home';
 import { existsSync, mkdirSync } from 'fs';
 import { runGit } from '../utils/git';
 import { logger } from '../utils/logger';
+
+/** Actionable error when lazy.toml still names the removed postgres backend. */
+export const POSTGRES_BACKEND_REMOVED =
+  'Storage backend "postgres" was removed in v0.22. Export your store with the last release that has it, ' +
+  'or switch to backend = "external" (file storage). SQLite storage is the go-forward second backend.';
 
 /**
  * Extract project name from git remote URL or directory name.
@@ -87,9 +95,8 @@ export async function getProjectName(lazyRoot: string, remoteName: string = 'ori
 /**
  * Storage backend types:
  * - 'external': FileStorage with root at the configured external path (default)
- * - 'postgres': PostgresStorage backed by PostgreSQL database
  */
-export type StorageBackend = 'external' | 'postgres';
+export type StorageBackend = 'external';
 
 export interface CreateStorageOptions {
   /** Storage backend type (default: 'external') */
@@ -123,6 +130,11 @@ export async function createStorage(lazyRoot: string, options?: CreateStorageOpt
   }
 
   let storage: Storage;
+
+  // Loader rejects postgres in lazy.toml; this catches explicit callers that bypass it.
+  if (String(backend) === 'postgres') {
+    throw new Error(POSTGRES_BACKEND_REMOVED);
+  }
 
   switch (backend) {
     case 'external': {
@@ -176,24 +188,8 @@ export async function createStorage(lazyRoot: string, options?: CreateStorageOpt
       break;
     }
 
-    case 'postgres': {
-      // Credentials come from environment variables, never from lazy.toml.
-      // LAZY_POSTGRES_URL takes priority; falls back to standard PG* env vars.
-      const config = await loadConfig(lazyRoot);
-      storage = new PostgresStorage(lazyRoot, {
-        url: process.env.LAZY_POSTGRES_URL,
-        host: process.env.PGHOST,
-        port: process.env.PGPORT ? parseInt(process.env.PGPORT, 10) : undefined,
-        database: process.env.PGDATABASE,
-        user: process.env.PGUSER,
-        password: process.env.PGPASSWORD,
-        ssl: config.storage.postgres_ssl,
-      });
-      break;
-    }
-
     default:
-      throw new Error(`Unknown storage backend: "${backend}". Valid backends are "external" and "postgres".`);
+      throw new Error(`Unknown storage backend: "${backend}". Valid backend is "external".`);
   }
 
   await storage.initialize();

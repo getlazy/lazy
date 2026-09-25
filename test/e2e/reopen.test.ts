@@ -4,6 +4,7 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
 import { createTask, disablePreAccept, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 
 describe('lazy reopen', () => {
   let ctx: TestContext;
@@ -128,6 +129,10 @@ describe('lazy reopen', () => {
     const gitCommit = ctx.git('-C', worktreePath, 'commit', '-m', 'Add feature');
     expect(gitCommit.exitCode).toBe(0);
 
+    // Fixture setup, not the subject (see test/helpers/final.ts). Daemonless
+    // suite, so the final is seeded at the storage level.
+    await seedFinal(ctx, taskId);
+
     // Accept the task
     const acceptResult = await ctx.lazy(['accept', taskId, '--reason', 'Looks good']);
     expectSuccess(acceptResult);
@@ -163,6 +168,10 @@ describe('lazy reopen', () => {
     const gitCommit = ctx.git('-C', worktreePath, 'commit', '-m', 'Add feature');
     expect(gitCommit.exitCode).toBe(0);
 
+    // Fixture setup, not the subject (see test/helpers/final.ts). Daemonless
+    // suite, so the final is seeded at the storage level.
+    await seedFinal(ctx, taskId);
+
     // Accept the task
     const acceptResult = await ctx.lazy(['accept', taskId, '--reason', 'Looks good']);
     expectSuccess(acceptResult);
@@ -196,6 +205,10 @@ describe('lazy reopen', () => {
 
     const gitCommit = ctx.git('-C', worktreePath, 'commit', '-m', 'Add feature');
     expect(gitCommit.exitCode).toBe(0);
+
+    // Fixture setup, not the subject (see test/helpers/final.ts). Daemonless
+    // suite, so the final is seeded at the storage level.
+    await seedFinal(ctx, taskId);
 
     // Accept the task
     const acceptResult = await ctx.lazy(['accept', taskId, '--reason', 'Looks good']);

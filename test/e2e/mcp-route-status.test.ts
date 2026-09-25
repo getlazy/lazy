@@ -15,8 +15,8 @@
  *      `Task not found: <the token>` — the route passed the token straight into
  *      task resolution rather than rejecting the path.
  *
- * The daemon here is the REAL one (startDaemonServer on a unix socket), because
- * the status mapping lives in that route and nowhere else.
+ * The daemon here is the REAL one (startDaemonServer on an ephemeral TCP
+ * port), because the status mapping lives in that route and nowhere else.
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
@@ -40,7 +40,7 @@ isolateInProcessDaemonEnv();
 describe('MCP route preserves handler status', () => {
   let ctx: TestContext;
   let tmpDir: string;
-  let socketPath: string;
+  let daemonUrl: string;
   let daemon: RunningDaemon | undefined;
   let restoreConfig: (() => void) | undefined;
   let daemonBaseDir: string;
@@ -67,8 +67,8 @@ describe('MCP route preserves handler status', () => {
     clearMcpTokenCache();
     builderToken = await mintMcpToken(ctx.root, { kind: 'builder' }, 'builder-mcp-status');
     tmpDir = await mkdtemp(join(tmpdir(), 'lazy-mcp-status-'));
-    socketPath = join(tmpDir, 'test.sock');
-    daemon = await startDaemonServer({ socketPath, token: TOKEN, projectRoot: ctx.root });
+    daemon = await startDaemonServer({ token: TOKEN, projectRoot: ctx.root });
+    daemonUrl = `http://127.0.0.1:${daemon.webPort}`;
   });
 
   afterEach(async () => {
@@ -87,15 +87,14 @@ describe('MCP route preserves handler status', () => {
     await rm(tmpDir, { recursive: true, force: true });
   });
 
-  /** POST a tool call over the daemon's unix socket. */
+  /** POST a tool call over the daemon's TCP port. */
   function call(
     taskSegment: string,
     toolName: string,
     args: Record<string, unknown>,
     opts: { enveloped?: boolean } = {},
   ): Promise<Response> {
-    return fetch(`http://localhost/mcp/${encodeURIComponent(taskSegment)}/${encodeURIComponent(toolName)}`, {
-      unix: socketPath,
+    return fetch(`${daemonUrl}/mcp/${encodeURIComponent(taskSegment)}/${encodeURIComponent(toolName)}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

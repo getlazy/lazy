@@ -48,7 +48,7 @@ await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
 }));
 
 // Import after mocking
-const { runSyncWithRemote } = await import('../../src/cli/commands/shared');
+const { runSyncWithRemote } = await import('../../src/task/sync-remote');
 
 // Minimal task and session objects for testing
 function makeTask() {

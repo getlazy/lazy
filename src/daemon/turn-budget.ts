@@ -63,7 +63,9 @@ export function checkTurnBudget(count: number, maxTurnsWithoutHuman: number): Tu
       allowed: false,
       reason:
         `Task has run ${count}/${maxTurnsWithoutHuman} consecutive turns without a human in the loop ` +
-        `(limits.max_turns_without_human). A human must run 'lazy unblock' or 'lazy resume' to continue.`,
+        `(limits.max_turns_without_human). ` +
+        `A person must unblock or resume this task to continue — 'lazy unblock' or 'lazy resume' on the CLI, ` +
+        `or from the task page.`,
       count,
     };
   }

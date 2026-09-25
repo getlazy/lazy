@@ -1,26 +1,37 @@
 import { join } from 'path';
+import { shortId, displayId, taskRef, getWorktreePathForRef, getBranchNameFromId } from '../../task/identity';
 import { existsSync, readFileSync } from 'fs';
-import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, validateModel, resolveTaskOrExit, rejectIfPairing, taskRef, getWorktreePathForRef, getBranchNameFromId } from '../helpers';
+import { requireLazyRoot, requireStorage, parseFlags, validateModel, validateAgentProfileOrExit, resolveTaskOrExit, rejectIfPairing } from '../helpers';
 import { createRunner } from '../../runner';
 import { getCommitsBehindCount, getCurrentBranch, getRemoteDefaultBranch } from '../../git/operations';
 import { runGit } from '../../utils/git';
 import { isTTY, promptChoice, promptYesNo, readStdinIfPiped } from '../editor';
-import { showTaskContext, runFeedbackFlow, getEditorFeedback, syncTaskFromRemote, getNewNotesSince } from './shared';
+import { showTaskContext, runFeedbackFlow, getEditorFeedback } from './shared';
+import { refreshTaskFromRemote } from './shared';
+import { getNewNotesSince } from '../../task/turn-context';
 import { commandAccept } from './accept';
 import { commandReject } from './reject';
 import { commandRedo } from './redo';
-import { checkOrphanedChild } from '../orphan';
+import { checkOrphanedChild } from '../../task/orphan';
 import { isTerminalStatus } from '../../types';
 
 import { queryUnblockTask } from '../../daemon/rpc-fallback';
+import { requireActorIdentity } from '../identity-preflight';
+import { requireUsagePauseClear } from '../usage-pause-preflight';
 import { removeRecoveryFile } from '../editor';
 import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
+import {
+  argsHaveRaisedFlags,
+  collectRaisedResolutionsForUnblock,
+  RAISED_RESOLUTION_FLAGS,
+} from '../raised-resolutions';
 
-import { theme } from '../theme';
+import { theme } from '../../render/theme';
+import { createPhaseDisplay } from '../phase-display';
 import { parentTaskIdOf } from '../../task-target';
 import { sanitizeUserText } from '../../utils/sanitize-text';
-import { pendingViolations, violationRecords } from '../../utils/turns';
-import { listAgents, agentDisplayName } from '../../agent/registry';
+import { agentDisplayName } from '../../agent/registry';
+import { usagePauseOverrideEligibility } from '../human-terminal';
 
 /**
  * Determine whether unblock should run in interactive mode.
@@ -29,7 +40,7 @@ import { listAgents, agentDisplayName } from '../../agent/registry';
 function isInteractiveMode(args: string[]): boolean {
   if (!process.stdin.isTTY) return false;
   if (args.includes('--message') || args.includes('-m')) return false;
-  if (args.includes('--approve-file')) return false;
+  if (argsHaveRaisedFlags(args)) return false;
   if (args.includes('--yes')) return false;
   if (args.indexOf('-f') !== -1) return false;
   return true;
@@ -47,10 +58,13 @@ export async function commandUnblock(args: string[]): Promise<void> {
     { name: 'effort', takesValue: true },
     { name: 'agent', takesValue: true },
     { name: 'follow', takesValue: false },
-
+    // Retired (move-file-approval-to-accept): still REGISTERED so a stale
+    // script gets the error below naming `lazy accept` instead of a bare
+    // "Unknown flag". Never read as a decision — unblock has none to make.
     { name: 'approve-file', takesValue: true, accumulate: true },
     { name: 'no-approve-files', takesValue: false },
     { name: 'yes', takesValue: false },
+    ...RAISED_RESOLUTION_FLAGS,
   ], 'unblock');
 
   const taskId = parsed.positional[0];
@@ -63,9 +77,17 @@ export async function commandUnblock(args: string[]): Promise<void> {
   const follow = parsed.flags.get('follow') === true;
 
   const messageValue = parsed.flags.get('message') as string | undefined;
-  const approvedFiles = (parsed.flags.get('approve-file') as string[] | undefined) ?? [];
-  const noApproveFiles = parsed.flags.get('no-approve-files') === true;
+  const retiredApproveFile = (parsed.flags.get('approve-file') as string[] | undefined) ?? [];
+  const retiredNoApproveFiles = parsed.flags.get('no-approve-files') === true;
+  if (retiredApproveFile.length > 0 || retiredNoApproveFiles) {
+    console.error(`Error: ${retiredNoApproveFiles ? '--no-approve-files' : '--approve-file'} is no longer a flag of 'lazy unblock'.`);
+    console.error('Protected-file approval happens at merge time now: unblock never reverts a file.');
+    console.error(`Unblock with feedback alone, then approve when you accept: lazy accept ${taskId} --approve-file <file>`);
+    process.exit(1);
+  }
   const skipConfirmation = parsed.flags.get('yes') === true;
+  // Optional raised-item resolutions (partial OK on unblock — unlike accept).
+  const raisedResolutions = collectRaisedResolutionsForUnblock(parsed.flags);
 
   // Parse --model flag
   const modelValue = parsed.flags.get('model') as string | undefined;
@@ -89,11 +111,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
   let agentOverride: string | undefined;
   const agentValue = parsed.flags.get('agent') as string | undefined;
   if (agentValue !== undefined) {
-    const validAgents = listAgents();
-    if (!validAgents.includes(agentValue)) {
-      console.error(`Unknown agent '${agentValue}'. Available agents: ${validAgents.join(', ')}`);
-      process.exit(1);
-    }
+    await validateAgentProfileOrExit(process.cwd(), agentValue);
     agentOverride = agentValue;
   }
 
@@ -125,6 +143,11 @@ export async function commandUnblock(args: string[]): Promise<void> {
 
     // Lightweight status checks before any interactive work.
     // These prevent the user from entering an editor only to have the RPC reject them.
+    //
+    // The identity check is first among them for exactly that reason: the
+    // daemon refuses a turn it cannot attribute, and finding that out after the
+    // editor closes would cost the human their feedback.
+    await requireActorIdentity();
     if (task.status === 'working') {
       console.error(`Task ${displayId(task)} is still working. Wait for it to finish.`);
       console.error(`Check progress with: lazy blocked`);
@@ -134,69 +157,16 @@ export async function commandUnblock(args: string[]): Promise<void> {
       console.error(`Task ${displayId(task)} is locked (pairing in progress). End the pairing session first.`);
       process.exit(1);
     }
+    // Same reason as the identity check: a paused credential refuses the turn,
+    // and that must be said before the editor opens, not after.
+    // Judged on the agent this unblock will run, which `--agent` may change.
+    await requireUsagePauseClear(task.id, 'unblock', agentOverride);
 
-    // --- Guard: conflict tasks require an explicit approve/revert decision ---
-    // Protected files are protected by DEFAULT: anything the caller does not
-    // approve gets reverted to its base commit by the daemon. So neither flag
-    // may be inferred — omitting both is an error, not "revert all".
-    //
-    // This runs before the orphan prompt and before $EDITOR: a pre-flight that
-    // can fail must never fire after the human has typed feedback (CLAUDE.md,
-    // "Never Lose Human Feedback").
-    //
-    // REGRESSION NOTE: this guard shipped in fix-unblock-conflict-guard and was
-    // silently dropped by the v0.11 daemon-lifecycle-rpc refactor, while the
-    // help text describing it survived. Restored by fix-violation-turn-detection.
-    {
-      const existingTurns = await storage.getSessionTurns(sess.id);
-      const violations = pendingViolations(existingTurns);
-      // INVARIANT (approval-is-re-assertable — fix-violation-approval-sticky):
-      // whether a decision MAY be given is asked of every violation record, not
-      // only the pending ones. After the reviewer approves a set and the agent
-      // runs a turn that touches no protected file, nothing is pending — but
-      // `--approve-file` on those same files is still a legitimate call, and
-      // refusing it left the reviewer no option but the one that reverted them.
-      const records = violationRecords(existingTurns);
-      // INVARIANT (violations-are-the-source-of-truth — fix-ask-nukes-violations):
-      // gate on the pending SET, never on `task.status`. `conflict` is a derived
-      // label that any side-channel turn (an ask, a sync, a pairing session) can
-      // leave behind as `blocked` — and when it did, this guard rejected the
-      // --approve-file the reviewer needed while the daemon reverted those files
-      // anyway.
-      const hasViolations = violations.length > 0;
-
-      // Contradictory flags — approving specific files and reverting everything
-      // cannot both be meant.
-      if (approvedFiles.length > 0 && noApproveFiles) {
-        console.error('Error: Cannot use both --approve-file and --no-approve-files together.');
-        console.error('Choose one: approve specific files, or explicitly revert all.');
-        process.exit(1);
-      }
-
-      // Misuse — the flags only mean anything for a task that violated a
-      // protected file at some point.
-      if (records.length === 0 && (approvedFiles.length > 0 || noApproveFiles)) {
-        console.error(`Error: Task ${displayId(task)} has no file permission violations.`);
-        console.error('--approve-file and --no-approve-files are only meaningful for tasks that changed protected files.');
-        process.exit(1);
-      }
-
-      // Non-interactive: there is no prompt to fall back on, so the decision
-      // must already be on the command line. --yes does NOT bypass this.
-      if (hasViolations && !isInteractiveMode(args) && approvedFiles.length === 0 && !noApproveFiles) {
-        console.error(`Error: Task ${displayId(task)} has ${violations.length} file permission violation(s).`);
-        console.error('\nViolated files:');
-        for (const v of violations) {
-          console.error(`  - ${v.file}`);
-        }
-        console.error('\nNeither approving nor reverting is the default — choose one:');
-        console.error(`  Approve all:     ${violations.map(v => `--approve-file ${v.file}`).join(' ')}`);
-        console.error('  Approve some:    --approve-file <file> (repeatable)');
-        console.error('  Revert all:      --no-approve-files (destructive)');
-        console.error('\nApproving in the feedback text has no effect — only these flags are read.');
-        process.exit(1);
-      }
-    }
+    // INVARIANT (approval-happens-at-accept — move-file-approval-to-accept):
+    // there is no protected-file guard here at all. Unblock is a feedback
+    // channel and never reverts a file, so a `conflict` task unblocks exactly
+    // like a `blocked` one; the reviewer decides at `lazy accept`, which
+    // refuses until every pending violation is named.
 
     // Check for orphaned child — prompt in CLI, pass retargetOrphan to RPC
     let retargetOrphan = false;
@@ -232,7 +202,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
       // Interactive loop: allow returning to menu from editor-based feedback
       while (true) {
         // Sync PR comments and state from GitHub before showing context
-        await syncTaskFromRemote(task, storage, root);
+        await refreshTaskFromRemote(task.id);
 
         // Re-read task in case sync updated its status (e.g., PR merged/closed externally)
         const freshTask = await storage.getTask(task.id);
@@ -257,76 +227,6 @@ export async function commandUnblock(args: string[]): Promise<void> {
           sess.id,
           displayId(task),
         );
-
-        // --- Interactive mode: handle conflict tasks ---
-        // When task is in conflict status (file permission violations), prompt user
-        // to choose whether to approve or revert. Neither is "safe" — both require active choice.
-        // Gated on the pending violation set, not on `task.status` — see the
-        // violations-are-the-source-of-truth invariant above.
-        if (approvedFiles.length === 0 && !noApproveFiles) {
-          const existingTurns = await storage.getSessionTurns(sess.id);
-          // Must match what the daemon reverts against — see the
-          // violations-come-from-the-violation-turn invariant in utils/turns.ts.
-          const violations = pendingViolations(existingTurns);
-
-          if (violations.length > 0) {
-            console.log(`\n${theme.warning('⚠ File Permission Violations')}`);
-            console.log(`The agent modified ${violations.length} protected file(s):\n`);
-
-            // Show each violated file with diff stat (lines added/removed)
-            for (const v of violations) {
-              // Get diff stat for this specific file
-              const diffResult = await runGit(
-                ['diff', '--numstat', v.base_sha, 'HEAD', '--', v.file],
-                { cwd: worktreePath }
-              );
-
-              let statStr = '';
-              if (diffResult.exitCode === 0 && diffResult.stdout.trim()) {
-                const parts = diffResult.stdout.trim().split(/\s+/);
-                if (parts.length >= 2) {
-                  const added = parts[0];
-                  const removed = parts[1];
-                  statStr = ` (+${added} -${removed})`;
-                }
-              }
-
-              console.log(`  - ${v.file}${statStr}`);
-            }
-            console.log('');
-
-            // Present three choices with NO default
-            const choice = await promptChoice(
-              'What would you like to do with these violations?',
-              [
-                `Approve all ${violations.length} file(s) - keep agent's changes`,
-                `Reject all ${violations.length} file(s) - revert to original`,
-                'Stop - abort unblock (can retry with --approve-file flags)',
-              ]
-            );
-
-            if (choice === 0) {
-              // Approve all violations
-              approvedFiles.length = 0;
-              approvedFiles.push(...violations.map(v => v.file));
-              console.log(`\nApproved ${violations.length} file(s). Proceeding...\n`);
-            } else if (choice === 1) {
-              // Reject all violations - explicitly set empty approved list (revert all)
-              // Empty approvedFiles signals to daemon's launchUnblockTask to revert
-              // We'll pass an empty approvedFiles array which means "revert all"
-              approvedFiles.length = 0;
-              console.log(`\nRejecting ${violations.length} file(s). All will be reverted. Proceeding...\n`);
-            } else {
-              // Stop - abort
-              console.log(`\nUnblock aborted. To approve specific files, use:`);
-              console.log(`  ${theme.command(`lazy unblock ${displayId(task)} --approve-file <file1> --approve-file <file2>`)}`);
-              console.log(`\nOr to explicitly revert all:`);
-              console.log(`  ${theme.command(`lazy unblock ${displayId(task)} --no-approve-files --message "Try different approach"`)}`);
-              console.log('');
-              process.exit(0);
-            }
-          }
-        }
 
         // Detect staleness
         const STALE_THRESHOLD = 5;
@@ -394,7 +294,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
           const sess2 = await storage2.getSessionByTaskId(task2.id);
           if (!sess2) { console.error(`Task ${taskShortId} has no session.`); process.exit(1); }
 
-          const result = await runFeedbackFlow(task2, sess2, root, storage2, worktreePath, taskShortId, follow, modelOverride, effortOverride, agentOverride, approvedFiles);
+          const result = await runFeedbackFlow(task2, sess2, root, storage2, worktreePath, taskShortId, follow, modelOverride, effortOverride, agentOverride);
           shouldContinue = result === 'continue';
         } finally {
           await storage2.close();
@@ -418,7 +318,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
     // --- Imperative mode ---
 
     // Sync PR comments and state before collecting/sending feedback
-    await syncTaskFromRemote(task, storage, root);
+    await refreshTaskFromRemote(task.id);
 
     // Re-read task in case sync updated its status
     const freshTask = await storage.getTask(task.id);
@@ -486,17 +386,19 @@ export async function commandUnblock(args: string[]): Promise<void> {
     await storage.close();
 
     // --- Delegate to daemon RPC ---
+    const display = createPhaseDisplay();
     try {
       const rpcResult = await queryUnblockTask({
         taskId: task.id,
         message,
         modelOverride,
-        approvedFiles,
+        raisedResolutions,
         retargetOrphan,
         notesInEditor,
         effortOverride,
         agentOverride,
-      });
+        ...(await usagePauseOverrideEligibility()),
+      }, display);
 
       // Clean up recovery file — feedback is now durably persisted in daemon
       if (feedbackRecoveryPath) {
@@ -540,6 +442,8 @@ export async function commandUnblock(args: string[]): Promise<void> {
       }
       console.error(`Error: ${err instanceof Error ? err.message : err}`);
       process.exit(1);
+    } finally {
+      display.close();
     }
 
     return; // Storage already closed above
@@ -554,7 +458,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
 }
 
 export function unblockUsage(): void {
-  console.log(`Usage: lazy unblock <task_id> [-f <file> | -m|--message <text>] [--model <model>] [--effort <level>] [--agent <agent_id>] [--approve-file <file>... | --no-approve-files] [--yes] [--follow]
+  console.log(`Usage: lazy unblock <task_id> [-f <file> | -m|--message <text>] [--model <model>] [--effort <level>] [--agent <profile>] [--respond-raised <id>=<text>...] [--promote-raised-subtask <id>...] [--promote-raised-peer <id>...] [--dismiss-raised <id>=<reason>...] [--acknowledge-raised <id>...] [--yes] [--follow]
 
 Unblock a task by providing feedback, or interactively review and act on it.
 
@@ -565,6 +469,8 @@ When called with no flags (interactive mode), shows task context and lets you:
 
 If the task is in 'merging' state (stuck waiting for CI/merge), unblock moves it
 back to 'blocked' so you can give feedback, fix issues, and retry accept later.
+A task whose accept died mid-way is being resumed by the daemon instead; unblock
+refuses it until those resumes are exhausted (run 'lazy accept' to resume now).
 
 When called with flags (imperative mode), sends feedback directly.
 
@@ -579,17 +485,31 @@ Arguments:
 Options:
   -f <file>           Read feedback from a file
   -m, --message <text>  Provide inline feedback
-  --model <model>     Override model for this turn (e.g. opus, sonnet, claude-opus-4-8)
+  --model <model>     Override model for this turn (e.g. opus, sonnet, claude-opus-5)
   --effort <level>    Override Claude Code reasoning effort for this turn (low, medium, high, xhigh, max)
                       Persists on the task for future turns.
-  --agent <agent_id>  Switch to a different agent for this task (e.g. claude-code, cursor).
+  --agent <profile>   Switch this task to a different agent profile — an [agents.<name>]
+                      block in lazy.toml; harness names (claude-code, codex, cursor, pi)
+                      are the built-in profiles.
                       Persists on the task for future turns. When switching agents,
                       the session is reset (cannot resume across agents).
-  --approve-file <file>   Keep the agent's changes to a violated file (repeatable,
-                      conflict tasks only). Every file with a PENDING violation
-                      that you do NOT name is reverted to its base commit. Files
-                      you approved on an earlier unblock stay approved.
-  --no-approve-files  Explicitly revert all pending violated files (conflict tasks)
+  --respond-raised <id>=<text>
+                      Optionally respond to an open raised item (repeatable).
+                      Unlike accept, partial resolution is OK — unnamed items stay
+                      open for the next accept.
+  --promote-raised-subtask <id>
+                      Optionally create a child task under this one for the item
+                      (repeatable; optional =<note>).
+  --promote-raised-peer <id>
+                      Optionally create a sibling task for the item (repeatable;
+                      optional =<note>). Lazy creates either promoted task itself,
+                      and the agent is told so it stops re-raising.
+  --dismiss-raised <id>=<reason>
+                      Optionally dismiss an open raised item (repeatable).
+  --acknowledge-raised <id>
+                      Acknowledge an open raised item — "seen, maybe later"
+                      (repeatable; optional =<note>). Same act as dismiss, with
+                      a different valence; works on any item.
   --yes               Skip interactive prompts (non-interactive mode)
   --follow            Wait for the agent to finish, streaming output in real time
 
@@ -599,14 +519,8 @@ Interactive mode (no flags, TTY):
   Shows task summary, recent commits, diff summary, then presents choices:
   give feedback, accept, or reject.
 
-  For conflict tasks: shows violated files with diff stats, then presents three
-  choices (no default): approve all, reject all, or stop. You must actively choose.
-
 Imperative mode (any flag or piped stdin):
   Sends feedback directly without interactive preamble.
-
-  For conflict tasks: MUST use --approve-file or --no-approve-files explicitly.
-  Neither approve nor revert is the default — both require explicit intent.
 
 Upstream Merge:
   Unblock no longer merges upstream automatically. To merge upstream changes
@@ -615,46 +529,25 @@ Upstream Merge:
 
 File Permission Violations (conflict status):
   When the agent modifies protected files, the task enters 'conflict' status.
-  Protected files are protected by DEFAULT: every violated file you do not
-  approve is reverted to its base commit and committed. Because both outcomes
-  are destructive in one direction or the other, neither is inferred —
-  unblocking a conflict task requires an explicit decision:
+  That status means one thing: a decision is owed at MERGE time. Unblock does
+  not ask for it and never reverts a file — a conflict task is unblocked exactly
+  like a blocked one, as many times as the work needs.
 
-  Interactive mode:
-    - Lists violated files with diff stats (+lines -lines)
-    - Presents three choices with NO default:
-      1) Approve all - keep agent's changes
-      2) Reject all - revert to original
-      3) Stop - abort and retry with --approve-file flags
+  While the agent still has the context, each turn ends with a pushback asking it
+  to revert the file itself or record a keep reason. You decide at accept:
 
-  Non-interactive mode:
-    - --approve-file <file> ... : approve specific files (repeatable)
-    - --no-approve-files : explicitly revert all (destructive)
-    - Omitting both flags with a conflict task is an error
+    lazy accept <task_id> --approve-file <file> ...
 
-  Approval is sticky:
-    A file you approved on one unblock STAYS approved. A later unblock that says
-    nothing about it does not revert it — only PENDING violations are decided by
-    the call, and a turn that touches no protected file raises none. Naming an
-    already-approved file again is accepted and changes nothing, so replaying
-    your past decisions is always safe.
+  Accept is all-or-nothing: every pending violated file must be named or the
+  accept is refused, and nothing is ever reverted for you. Approvals are sticky,
+  so a file you approved stays approved; the web review page ('lazy dashboard')
+  has per-file controls and un-approving returns a file to pending.
 
-    To change your mind about a file you approved, there is no flag here — two
-    remedies: un-approve it on the review page (the web dashboard's
-    /review/<task>, URL from 'lazy daemon status'), which returns that record to
-    PENDING so the next unblock decides it again; or say so in the feedback text
-    and let the agent revert the file in the next turn.
-
-  Misuse errors:
-    - Using --approve-file and --no-approve-files together: error
-    - Using these flags on a task that never changed a protected file: error
-    - --yes does NOT bypass the conflict guard
-
-  Approving in the feedback text does nothing. Only these flags are read.
-
-  Not the same as 'lazy accept --approve-file': accept is all-or-nothing (every
-  pending violated file must be named or the accept is refused) and never reverts
-  anything. Unblock reverts the pending files you leave out.
+Raised items (optional on unblock):
+  The same --respond-raised / --promote-raised-subtask / --promote-raised-peer /
+  --dismiss-raised flags as accept. They are OPTIONAL here: resolve what the
+  feedback answers; leave the rest open for the next accept. Feedback prose is
+  never parsed for answers. Comments are written on this unblock.
 
 Examples:
   lazy unblock abc123                                   # Interactive review
@@ -665,13 +558,10 @@ Examples:
   lazy unblock abc123 --message "Fix it" --follow       # Wait for completion
   lazy unblock abc123 --message "Fix it" --yes          # Non-interactive
   echo "Fix the bug" | lazy unblock abc123              # Piped stdin as feedback
+  lazy unblock abc123 --respond-raised a1b2c3d4="go with option 2" --message "Agreed" --yes
 
   # Merge upstream first, then give feedback:
   lazy sync abc123
   lazy unblock abc123 --message "Fix the bug"
-
-  # Conflict task examples (file permission violations):
-  lazy unblock abc123 --approve-file a.ts --approve-file b.ts --message "OK" --yes  # Approve specific files
-  lazy unblock abc123 --approve-file src/config.ts --approve-file src/db.ts --yes   # Approve multiple files
-  lazy unblock abc123 --no-approve-files --message "Try different approach" --yes   # Explicitly revert all`);
+  lazy unblock abc123 --message "Keep going"                          # Conflict tasks unblock like any other`);
 }

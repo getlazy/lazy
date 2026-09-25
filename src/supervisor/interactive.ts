@@ -1,6 +1,20 @@
 /**
  * Interactive-session supervisor — the wrapper `lazy pair` and `lazy chat` run
- * Claude Code under.
+ * an interactive agent session under.
+ *
+ * WHERE THE SESSION RUNS IS A STRATEGY, NOT A BRANCH
+ * --------------------------------------------------
+ * The supervisor does not know (or care) whether the child it spawns is Claude
+ * Code on this machine or a `docker exec` into a task's container. That is the
+ * {@link InteractiveLauncher}: it resolves the launch environment fresh on every
+ * (re)launch and returns a plan — argv, cwd, env, where the session's JSONL
+ * lands, and how to stop a session that outlives the local child.
+ *
+ * `lazy pair <task>` uses the CONTAINER launcher (src/cli/commands/pair-container.ts),
+ * so a paired session runs exactly where the task's supervised turns run, on the
+ * same mounted `~/.claude` / `~/.cursor`. Everything below — register, watch the
+ * daemon generation, stop cleanly, resume in place — is identical either way,
+ * which is the point of making it a strategy rather than a second supervisor.
  *
  * WHAT THIS IS
  * ------------
@@ -83,11 +97,14 @@ import {
   unregisterInteractiveSession,
   type InteractiveSessionKind,
 } from '../daemon/interactive-registry';
-import { resolveInteractiveLaunch, launchEnvOverlay } from '../cli/interactive-auth';
+import { resolveInteractiveLaunch, launchEnvOverlay } from '../credentials/interactive-auth';
 import { discoverProjectSessionFiles } from '../import/claude-code-logs';
 import { excludeMachineOneshots } from '../import/machine-oneshot';
 import { pickLaunchSessionId } from '../builder/session-detect';
 import { getHome } from '../utils/home';
+import { getAgent } from '../agent/registry';
+import { resolveBuilderModel } from '../agent/agent-model';
+import { loadConfig } from '../config/loader';
 import { spawn } from '../utils/spawn';
 
 /**
@@ -104,6 +121,51 @@ export const INTERACTIVE_STOP_GRACE_MS = 10_000;
 const BASELINE_READ_ATTEMPTS = 3;
 /** Delay between baseline read attempts (ms). */
 const BASELINE_RETRY_MS = 200;
+
+/**
+ * One (re)launch of an interactive session, fully resolved.
+ *
+ * Produced fresh for every launch — including every relaunch — because the
+ * credential/proxy env in it goes stale on a daemon restart, and re-resolving it
+ * is the entire reason relaunching helps.
+ */
+export interface InteractiveLaunchPlan {
+  /** Argv to spawn. Whatever runs the agent: `claude …`, or `docker exec … `. */
+  argv: string[];
+  /** Working directory for the spawned process ON THIS HOST. */
+  cwd: string;
+  /** Complete environment for the child (the launcher decides what to inherit). */
+  env: Record<string, string>;
+  /**
+   * HOST-VISIBLE home whose `.claude/projects` holds this session's transcript,
+   * or null when the session id cannot be recovered from JSONL at all (a
+   * non-Claude agent). Null means "keep the id we launched with" rather than
+   * "no session": guessing is worse than admitting the gap.
+   */
+  sessionHomeDir: string | null;
+  /**
+   * The cwd AS THE AGENT SEES IT — it is what Claude encodes into the projects
+   * directory name. Same as `cwd` on the host; for a container it is the
+   * worktree path, which lazy mounts at the identical path inside (see
+   * buildSupervisorDockerArgs), so the two agree by construction.
+   */
+  sessionCwd?: string;
+  /**
+   * Stop a session that can outlive the spawned child, best-effort.
+   *
+   * Killing a `docker exec` client does not signal the process it started, so
+   * the container launcher needs a way to reach in. Called after the child is
+   * SIGTERMed; never throws.
+   */
+  stop?: () => Promise<void>;
+}
+
+/** Where an interactive session runs. See the header: strategy, not a branch. */
+export interface InteractiveLauncher {
+  /** Human-facing name of the launch surface, for messages ('host', 'container'). */
+  readonly surface: string;
+  plan(opts: { resumeSessionId: string | null; autonomous: boolean }): Promise<InteractiveLaunchPlan>;
+}
 
 export interface InteractiveSupervisorConfig {
   /** Which surface is running: names the launch, the registry entry and the hints. */
@@ -122,6 +184,18 @@ export interface InteractiveSupervisorConfig {
   extraArgs?: string[];
   /** Extra env for the child (e.g. `LAZY_TASK`). Never carries credentials. */
   extraEnv?: Record<string, string>;
+  /**
+   * The model to run, when the session belongs to a TASK (`lazy chat <task>`,
+   * `lazy pair <task> --host`): the task's persisted model, so the session runs
+   * what its turns run. Absent for a session with no task (branchless pair),
+   * which resolves the builder role's model instead.
+   */
+  model?: string;
+  /**
+   * Where the session runs. Defaults to the host launcher (Claude Code as a
+   * child of this process) — `lazy pair <task>` passes the container launcher.
+   */
+  launcher?: InteractiveLauncher;
   /** Where human-facing lines go. Only ever called when no child holds the tty. */
   log?: (msg: string) => void;
   /** Where actionable failures go. Same timing rule as `log`. */
@@ -181,19 +255,63 @@ export async function detectInteractiveSessionId(opts: {
   }
 }
 
-/** Build the Claude Code argv for one launch. Pure, so it is testable. */
+/**
+ * Build the Claude Code argv for one HOST launch. Pure, so it is testable.
+ *
+ * The flag spelling itself comes from the agent (`buildInteractiveArgs`) so the
+ * host and container paths cannot drift apart on it; what stays here is the
+ * host-only part — the surface's `extraArgs` (chat's lockdown flags).
+ */
 export function interactiveClaudeArgs(opts: {
   resumeSessionId?: string | null;
   autonomous?: boolean;
   extraArgs?: string[];
-  model?: string;
+  /** Required: Claude Code refuses a model-less launch (requireLaunchModel). */
+  model: string;
 }): string[] {
-  const args = ['claude'];
-  if (opts.resumeSessionId) args.push('--resume', opts.resumeSessionId);
-  if (opts.autonomous) args.push('--dangerously-skip-permissions');
+  const args = getAgent('claude-code').buildInteractiveArgs({
+    sessionId: opts.resumeSessionId ?? null,
+    dangerouslySkipPermissions: opts.autonomous === true,
+    modelId: opts.model,
+  }) ?? ['claude'];
   if (opts.extraArgs?.length) args.push(...opts.extraArgs);
-  if (opts.model) args.push('--model', opts.model);
   return args;
+}
+
+/**
+ * The default launcher: Claude Code as a child of this process, on this machine.
+ *
+ * Still the only launcher for `lazy chat` and for branchless `lazy pair`, where
+ * there is no task and therefore no container to run in.
+ */
+export function hostInteractiveLauncher(opts: {
+  root: string;
+  command: string;
+  cwd: string;
+  extraArgs?: string[];
+  extraEnv?: Record<string, string>;
+  /** A task session's model; wins over the builder resolution. */
+  model?: string;
+}): InteractiveLauncher {
+  return {
+    surface: 'host',
+    async plan({ resumeSessionId, autonomous }) {
+      const { target, envVars } = await resolveInteractiveLaunch(opts.root, opts.command);
+      return {
+        argv: interactiveClaudeArgs({
+          resumeSessionId,
+          autonomous,
+          extraArgs: opts.extraArgs ?? [],
+          model: resolveBuilderModel(
+            await loadConfig(opts.root), { harness: 'claude-code', model: target.model }, opts.model,
+          ),
+        }),
+        cwd: opts.cwd,
+        env: { ...process.env, ...launchEnvOverlay(envVars), ...(opts.extraEnv ?? {}) } as Record<string, string>,
+        sessionHomeDir: getHome(),
+      };
+    },
+  };
 }
 
 /**
@@ -242,6 +360,7 @@ export async function runInteractiveSupervisor(
     autonomous,
     extraArgs = [],
     extraEnv = {},
+    model,
     log = (m: string) => console.log(m),
     errorOut = (m: string) => console.error(m),
     readStatus = checkDaemonHealth,
@@ -250,11 +369,26 @@ export async function runInteractiveSupervisor(
   } = config;
 
   const command = commandName(kind);
+  const launcher = config.launcher
+    ?? hostInteractiveLauncher({ root, command, cwd, extraArgs, extraEnv, ...(model ? { model } : {}) });
   await registerInteractiveSession(root, { kind, cwd, ...(taskId ? { taskId } : {}) });
 
   // Signals. Installed for the supervisor's whole lifetime, not per launch, so
   // there is no window where a keystroke kills the wrapper mid-relaunch.
   let child: ReturnType<typeof spawn> | null = null;
+  /**
+   * The current plan's reach-in stop, when it has one.
+   *
+   * SIGTERMing the child is enough when the child IS the agent. When it is a
+   * `docker exec` client it is not: docker does not forward signals to an exec'd
+   * process, so killing the client leaves the agent running in the container,
+   * holding the session the relaunch is about to `--resume`. Fire-and-forget on
+   * both stop paths, never awaited — a stop must not hang on the container.
+   */
+  let stopInPlace: (() => Promise<void>) | null = null;
+  const reachInStop = () => {
+    stopInPlace?.().catch(() => { /* best-effort: the child SIGTERM is the primary path */ });
+  };
   /** Set when an EXTERNAL stop arrived — that ends the session, never resumes. */
   let externallyStopped = false;
 
@@ -266,6 +400,7 @@ export async function runInteractiveSupervisor(
     externallyStopped = true;
     // Forward rather than exit: the child owns unsaved state and the terminal.
     try { child?.kill('SIGTERM'); } catch { /* already gone */ }
+    reachInStop();
   };
   process.on('SIGINT', onSigint);
   process.on('SIGTERM', onSigterm);
@@ -279,9 +414,9 @@ export async function runInteractiveSupervisor(
       // Resolve the launch target and env FRESH every iteration. On the first
       // pass this is the ordinary launch path; on a relaunch it is the fix —
       // the proxy address is the value that went stale.
-      let target, envVars;
+      let plan: InteractiveLaunchPlan;
       try {
-        ({ target, envVars } = await resolveInteractiveLaunch(root, command));
+        plan = await launcher.plan({ resumeSessionId: resumeId, autonomous: autonomous === true });
       } catch (err) {
         if (restarts === 0) throw err; // First launch: caller reports it as today.
         const msg = err instanceof Error ? err.message : String(err);
@@ -307,18 +442,16 @@ export async function runInteractiveSupervisor(
       const baseline = await readGenerationBaseline(root, readStatus);
 
       const launchedAtMs = Date.now();
-      child = spawn(
-        interactiveClaudeArgs({ resumeSessionId: resumeId, autonomous, extraArgs, model: target.model }),
-        {
-          cwd,
-          stdin: 'inherit',
-          stdout: 'inherit',
-          stderr: 'inherit',
-          // Long-running: the session ends when the human ends it.
-          timeout: 0,
-          env: { ...process.env, ...launchEnvOverlay(envVars), ...extraEnv },
-        },
-      );
+      stopInPlace = plan.stop ?? null;
+      child = spawn(plan.argv, {
+        cwd: plan.cwd,
+        stdin: 'inherit',
+        stdout: 'inherit',
+        stderr: 'inherit',
+        // Long-running: the session ends when the human ends it.
+        timeout: 0,
+        env: plan.env,
+      });
 
       // Async spawn + await (never spawnSync) so the event loop keeps turning:
       // the generation watch below is a timer, and the command may have
@@ -338,6 +471,7 @@ export async function runInteractiveSupervisor(
           // it. If the child is still up after the grace period we say so, but
           // we keep waiting rather than escalating.
           try { child?.kill('SIGTERM'); } catch { /* already gone */ }
+          reachInStop();
           stopNoticeTimer = setTimeout(() => {
             errorOut('');
             errorOut('The lazy daemon restarted, so this session is talking to an audit proxy that');
@@ -352,8 +486,18 @@ export async function runInteractiveSupervisor(
       watch.stop();
       if (stopNoticeTimer) clearTimeout(stopNoticeTimer);
       child = null;
+      stopInPlace = null;
 
-      const sessionId = await detectInteractiveSessionId({ cwd, launchedAtMs, resumeId });
+      // A launcher that cannot see a Claude transcript (a non-Claude agent)
+      // reports null rather than a guess, and we keep the id we launched with.
+      const sessionId = plan.sessionHomeDir === null
+        ? resumeId
+        : await detectInteractiveSessionId({
+          cwd: plan.sessionCwd ?? plan.cwd,
+          launchedAtMs,
+          resumeId,
+          homeDirAbs: plan.sessionHomeDir,
+        });
 
       if (!restartDetected || externallyStopped) {
         // Ordinary end of the session (or an external stop that means "end it").

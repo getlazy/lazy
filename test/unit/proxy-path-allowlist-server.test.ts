@@ -17,10 +17,13 @@ import type { ProxyAuditRecord } from '../../src/storage/types';
 
 const AGENT_TOKEN = 'sk-ant-api03-lazy-agent-placeholder';
 
+/** The profile whose endpoint is the local Ollama box these tests probe. */
+const LOCAL_PROFILE = 'local-ollama';
+
 const grants: Record<string, CredentialGrant> = {
   [AGENT_TOKEN]: {
     token: AGENT_TOKEN, role: 'agent', taskId: 'task-42', label: 'lazy-task-42',
-    envKey: 'ANTHROPIC_API_KEY', createdAt: new Date().toISOString(),
+    envKey: 'ANTHROPIC_API_KEY', profile: LOCAL_PROFILE, createdAt: new Date().toISOString(),
   },
 };
 
@@ -28,12 +31,12 @@ const freePort = () => 41000 + Math.floor(Math.random() * 8000);
 
 describe('proxy forwarding-surface allowlist', () => {
   let primary: ReturnType<typeof Bun.serve>;
-  let roleTarget: ReturnType<typeof Bun.serve>;
+  let profileTarget: ReturnType<typeof Bun.serve>;
   let proxy: ReturnType<typeof Bun.serve>;
   let proxyPort: number;
   let records: ProxyAuditRecord[] = [];
   /** Every path each upstream was actually asked for. */
-  let hits: Record<string, string[]> = { primary: [], role: [] };
+  let hits: Record<string, string[]> = { primary: [], profile: [] };
 
   function upstreamServer(name: string, port: number) {
     return Bun.serve({
@@ -48,9 +51,9 @@ describe('proxy forwarding-surface allowlist', () => {
 
   beforeAll(async () => {
     const primaryPort = freePort();
-    const rolePort = freePort();
+    const profilePort = freePort();
     primary = upstreamServer('primary', primaryPort);
-    roleTarget = upstreamServer('role', rolePort);
+    profileTarget = upstreamServer('profile', profilePort);
 
     const credentials: ProxyCredentialDeps = {
       lookup: async (token: string) => grants[token] ?? null,
@@ -64,7 +67,7 @@ describe('proxy forwarding-surface allowlist', () => {
       {
         port: proxyPort, bind: '127.0.0.1',
         upstream: `http://127.0.0.1:${primaryPort}`,
-        roleUpstreams: { agent: `http://127.0.0.1:${rolePort}` },
+        agentUpstreams: { [LOCAL_PROFILE]: { upstream: `http://127.0.0.1:${profilePort}`, wire: 'anthropic' } },
       },
       sink,
       credentials,
@@ -73,12 +76,12 @@ describe('proxy forwarding-surface allowlist', () => {
   });
 
   afterAll(() => {
-    primary.stop(); roleTarget.stop(); proxy.stop();
+    primary.stop(); profileTarget.stop(); proxy.stop();
   });
 
   function reset() {
     records = [];
-    hits = { primary: [], role: [] };
+    hits = { primary: [], profile: [] };
   }
 
   const send = (path: string, init: RequestInit = {}) =>
@@ -105,9 +108,9 @@ describe('proxy forwarding-surface allowlist', () => {
   });
 
   // INVARIANT: this is the hole the allowlist exists to close. A granted agent
-  // routed to a role upstream (a local ollama server) must not be able to reach
+  // routed to a PROFILE upstream (a local ollama server) must not be able to reach
   // that server's administrative surface through lazy's own audit plane.
-  test('refuses an ollama admin endpoint on a role upstream and never forwards it', async () => {
+  test('refuses an ollama admin endpoint on a profile upstream and never forwards it', async () => {
     reset();
     const resp = await asAgent('/api/delete', {
       method: 'DELETE',
@@ -116,7 +119,7 @@ describe('proxy forwarding-surface allowlist', () => {
     });
     expect(resp.status).toBe(403);
     // The request reached NEITHER upstream — refusal happens before forwarding.
-    expect(hits.role).toEqual([]);
+    expect(hits.profile).toEqual([]);
     expect(hits.primary).toEqual([]);
 
     const body = await resp.json() as { error: { type: string; message: string } };
@@ -157,18 +160,18 @@ describe('proxy forwarding-surface allowlist', () => {
     expect(hits.primary).toEqual([]);
   });
 
-  // INVARIANT: a role upstream gets inference and nothing else, so a route the
+  // INVARIANT: a profile upstream gets inference and nothing else, so a route the
   // Anthropic primary legitimately serves can still be refused there.
-  test('model discovery reaches the primary but not a role upstream', async () => {
+  test('model discovery reaches the primary but not a profile upstream', async () => {
     reset();
     const onPrimary = await send('/v1/models');
     expect(onPrimary.status).toBe(200);
     expect(hits.primary).toEqual(['GET /v1/models']);
 
     reset();
-    const onRole = await asAgent('/v1/models');
-    expect(onRole.status).toBe(403);
-    expect(hits.role).toEqual([]);
+    const onProfile = await asAgent('/v1/models');
+    expect(onProfile.status).toBe(403);
+    expect(hits.profile).toEqual([]);
   });
 
   test('the unauthenticated reachability probe is still forwarded', async () => {

@@ -1,0 +1,689 @@
+/* Task-page tab strip. Sticky, WRAPPING onto as many rows as the tabs need;
+   Current review sits at the right of the last row.
+
+   The strip used to be one row with `overflow-x: auto`. With fifteen tabs that
+   row overflowed at any normal window width, and the overflowing tabs were
+   simply not on screen: a horizontal scrollbar inside a strip whose items are
+   all the same height reads as an edge, not as "there is more", so tabs a
+   reviewer had never seen looked like tabs that did not exist. Wrapping costs
+   vertical space (the sticky height is measured at runtime by
+   review-navigation.ts, so the rest of the page follows) and buys the one
+   thing a tab strip has to do: show every tab.
+
+   Every tab is a DIRECT child of this flex container. A wrapper around the
+   non-review tabs would be one full-width flex line, which would park Current
+   review on a row of its own even when the whole strip fits across. */
+
+.lz-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 0;
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: var(--color-bg);
+  border-bottom: 1px solid var(--color-divider);
+  margin: 0 0 var(--space-6);
+}
+
+.lz-tab {
+  flex: 0 0 auto;
+  padding: var(--space-3) var(--space-4);
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
+  text-decoration: none;
+  font-size: 13px;
+  white-space: nowrap;
+  border-bottom: 2px solid transparent;
+}
+
+.lz-tab:hover {
+  color: var(--color-text);
+  text-decoration: none;
+}
+
+.lz-tab-current {
+  color: var(--color-text);
+  border-bottom-color: var(--color-accent);
+  font-weight: 600;
+}
+
+/* Pressed tab while the server fragment is in flight — a silent click
+   otherwise looks like the UI ignored it (Turns / Subtasks are slow). */
+.lz-tab-pending {
+  opacity: 0.75;
+  border-bottom-style: dashed;
+  border-bottom-color: var(--color-accent);
+}
+
+.lz-tab-badge {
+  display: inline-block;
+  margin-left: 0.35em;
+  font-size: 11px;
+  font-weight: 600;
+  color: color-mix(in srgb, var(--color-text) 60%, transparent);
+}
+
+/* Last in the strip, set apart by colour rather than by position.
+
+   It was `margin-left: auto` plus `position: sticky`, which held it at the
+   right of a single scrolling row. Neither survives wrapping: an auto margin
+   eats the line's free space, so Chromium breaks the line before the item and
+   Current review lands alone on a row even when the strip fits across. A
+   left-hand rule has the opposite problem — on the row it happens to start,
+   it reads as a stray divider. Colour is the one marker that looks the same
+   wherever the wrap puts it. */
+.lz-tab-review {
+  flex: 0 0 auto;
+  color: var(--color-accent);
+}
+
+.lz-tab-review:hover {
+  color: var(--color-accent);
+}
+
+.lz-tab-body {
+  min-width: 0;
+}
+
+.lz-landing-header {
+  margin-bottom: var(--space-5);
+}
+
+/* Lifecycle buttons must sit in the same wrapping row as Watch / Edit /
+   Review with builder. The inner wrapper is only a grouping hook. */
+.lz-landing-header .lz-action-buttons {
+  display: contents;
+}
+
+.lz-landing-header .action-links {
+  align-items: center;
+}
+
+.lz-landing-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.lz-tag {
+  font-size: 12px;
+  padding: 0 0.5em;
+  border: 1px solid var(--color-divider);
+  border-radius: 999px;
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
+}
+
+.lz-linked {
+  display: inline-block;
+  font-size: 12px;
+  padding: 0 0.5em;
+  border: 1px solid var(--color-divider);
+  border-radius: 999px;
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
+  white-space: nowrap;
+}
+
+.lz-forge-link {
+  white-space: nowrap;
+}
+
+.lz-forge-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.25em;
+  height: 1.25em;
+  color: inherit;
+}
+
+.lz-forge-icon svg {
+  width: 14px;
+  height: 14px;
+  display: block;
+}
+
+.lz-progress {
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--color-divider);
+  background: var(--color-surface);
+  margin-bottom: var(--space-4);
+}
+
+.lz-progress-line {
+  font-weight: 600;
+}
+
+.lz-progress-age {
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+  font-size: 12px;
+  margin-left: 0.5em;
+}
+
+.lz-hub-rollup {
+  margin-bottom: var(--space-4);
+  font-size: 14px;
+}
+
+/* A loop task's k-of-n line, above the generic subtask rollup. */
+.lz-cluster-progress {
+  margin-bottom: var(--space-2);
+  font-size: 14px;
+}
+
+.lz-outcome {
+  padding: var(--space-4);
+  border: 1px solid var(--color-divider);
+  background: var(--color-surface);
+  margin-bottom: var(--space-4);
+}
+
+.lz-empty-tab {
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+  padding: var(--space-6) 0;
+}
+
+/* — Comments / Journal tabs —
+   Group headings inside one card section (delivered vs queued), the per-card
+   state marker, and the composer. All of it leans on the existing note-card
+   vocabulary; only the arrangement lives here. */
+.lz-note-group {
+  margin: var(--space-4) 0 var(--space-1);
+  font-size: 14px;
+}
+.lz-note-group:first-of-type { margin-top: var(--space-2); }
+.lz-note-mark { margin-left: var(--space-2); }
+.lz-note-src { font-size: 12px; color: color-mix(in srgb, var(--color-text) 55%, transparent); }
+
+.lz-comment-form {
+  margin-bottom: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.lz-comment-form textarea { width: 100%; font-family: var(--font-mono); }
+
+/* The text of a comment that could NOT be saved, echoed back so it can be
+   copied out. Wraps — a comment is prose, and a horizontal scrollbar is the
+   last thing someone wants when recovering their own words. */
+.lz-kept-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: var(--space-3);
+  border: 1px solid var(--color-divider);
+  background: var(--color-surface);
+}
+
+/* A markdown link whose URL scheme is not on the allowlist: shown as text, so
+   it reads as deliberately-not-a-link rather than as a broken one. */
+.md-blocked-link {
+  color: color-mix(in srgb, var(--color-text) 60%, transparent);
+  text-decoration: underline dotted;
+  cursor: not-allowed;
+}
+
+th.lz-forge-col,
+td.lz-forge-col {
+  width: 2em;
+  text-align: center;
+}
+
+/* Icon-only forge links keep a text label for screen readers. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Persist-host panels stay in the DOM across in-place tab switches so a
+   running web shell is not torn down. They are only *shown* on the tab
+   that owns them. */
+[data-lz-persist-shell] { display: none; }
+[data-lz-task-page][data-lz-current-tab="shell"] [data-lz-persist-shell] { display: block; }
+/* The persist host is a session manager, not a second Shell button — the
+   Shell tab's + New / Pair / Chat are the controls. */
+[data-lz-persist-shell] [data-lz-shell-open],
+[data-lz-persist-shell] .lz-shell-reason { display: none; }
+
+/* Verify tab: current steps, per-step ticks, superseded history. */
+.lz-verify-current-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+.lz-verify-progress {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  color: color-mix(in srgb, var(--color-text) 60%, transparent);
+}
+.lz-verify-step {
+  margin: 0 0 var(--space-4);
+}
+.lz-verify-step-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-1);
+}
+.lz-verify-step-n {
+  font-variant-numeric: tabular-nums;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}
+.lz-verified {
+  font-size: 12px;
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
+}
+.lz-verify-js-off {
+  margin-top: var(--space-4);
+}
+.lz-verify-history {
+  margin-top: var(--space-6);
+  border: 1px solid var(--color-divider);
+  background: var(--color-surface);
+  padding: var(--space-3) var(--space-4);
+}
+.lz-verify-superseded {
+  margin-top: var(--space-4);
+  opacity: 0.9;
+}
+.lz-verify-superseded h3 {
+  margin: 0 0 var(--space-2);
+  font-size: 14px;
+}
+.lz-shell-mount {
+  margin-top: var(--space-2);
+  min-height: 200px;
+}
+.lz-shell-mount.is-live { display: block; }
+
+.lz-shell-tab-page h2 {
+  margin-top: var(--space-5);
+}
+.lz-shell-tab-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+.lz-shell-index {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.lz-shell-index-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) 0;
+  border-bottom: 1px solid var(--color-divider);
+}
+.lz-shell-index-dot {
+  width: 0.55em;
+  height: 0.55em;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--color-text) 35%, transparent);
+}
+.lz-shell-index-dot.is-connected {
+  background: var(--color-accent);
+}
+
+/* Maximise-in-place: the element never moves in the DOM. */
+.lz-shell-session-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+  color: var(--color-text);
+  font-size: 0.85em;
+}
+.lz-shell-session.is-maximised {
+  position: fixed;
+  inset: 1.5rem;
+  z-index: 80;
+  display: flex;
+  flex-direction: column;
+  background: var(--color-bg);
+  border: 1px solid var(--color-divider);
+  padding: var(--space-3);
+  height: auto !important;
+}
+.lz-shell-session.is-maximised .lz-shell-term {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+body.lz-shell-maximised { overflow: hidden; }
+
+/* Subtasks tab: grouped by status, filter box, subtree column. */
+.lz-subtasks-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin-bottom: var(--space-3);
+}
+
+.lz-subtasks-heading h2 {
+  margin: 0;
+}
+
+.lz-subtasks-filter input {
+  min-width: 12em;
+}
+
+/* Jump bar: one pill per group, pinned while the groups scroll under it. It
+   parks UNDER the sticky tab strip (--lz-sticky-top, measured by
+   review-navigation.ts) — at top:0 it would stick behind the opaque strip and
+   vanish, the same trap diff.css documents for its toolbar. */
+.lz-subtasks-nav {
+  position: sticky;
+  top: var(--lz-sticky-top, 0px);
+  z-index: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: var(--space-2) 0;
+  margin-bottom: var(--space-3);
+  background: var(--color-bg);
+}
+
+.lz-subtasks-jump {
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--color-divider);
+  border-radius: 999px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.lz-subtasks-jump-count {
+  opacity: 0.7;
+  font-variant-numeric: tabular-nums;
+}
+
+.lz-subtasks-group {
+  /* Clear the strip AND the jump bar when a jump lands here. */
+  scroll-margin-top: calc(var(--lz-sticky-top, 0px) + 3.5rem);
+  margin: 0 0 var(--space-3);
+  border: 1px solid var(--color-divider);
+  background: var(--color-surface);
+}
+
+.lz-subtasks-summary {
+  padding: var(--space-3) var(--space-4);
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.lz-subtasks-table {
+  margin: 0;
+}
+
+/* Sortable headers: the button reads as header text; an arrow marks the sort. */
+.lz-subtasks-sort {
+  all: unset;
+  cursor: pointer;
+}
+
+.lz-subtasks-table th[aria-sort="descending"] .lz-subtasks-sort::after { content: " ▼"; }
+.lz-subtasks-table th[aria-sort="ascending"] .lz-subtasks-sort::after { content: " ▲"; }
+
+.lz-subtasks-subtree,
+.lz-subtasks-when {
+  white-space: nowrap;
+}
+
+.lz-subtasks-count {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Nothing nested: a dash, not a link — the row already says so. */
+.lz-subtasks-count-none {
+  opacity: 0.55;
+}
+
+.lz-branch-advice {
+  margin-top: var(--space-5);
+  padding: var(--space-4);
+  border: 1px solid var(--color-divider);
+  background: var(--color-surface);
+}
+
+.lz-branch-advice h3 {
+  margin: 0 0 var(--space-2);
+}
+
+.lz-branch-advice-item {
+  margin: var(--space-2) 0;
+}
+
+/* Current review tab — one action block, no mirrored forms. */
+.lz-current-review {
+  max-width: 52rem;
+}
+
+.lz-review-head h1 {
+  margin: 0 0 var(--space-2);
+}
+
+.lz-review-progress {
+  margin: 0 0 var(--space-2);
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
+}
+
+.lz-upstream {
+  display: inline-block;
+  margin-top: var(--space-1);
+}
+
+/* What this task runs on — profile · model · effort — on the header status line,
+   in the same subdued register as the upstream indicator next to it. */
+.lz-launch-identity {
+  display: inline-block;
+  font-size: 13px;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+  white-space: nowrap;
+}
+.lz-launch-item {
+  font-family: var(--font-mono);
+}
+.lz-launch-sep {
+  padding: 0 0.4em;
+}
+/* Resolved from lazy.toml, not chosen on this task: dimmer, so the line never
+   reads like someone picked it. The `title` says where it came from. */
+.lz-launch-default {
+  opacity: 0.65;
+  font-style: italic;
+}
+
+.lz-review-gate {
+  margin: var(--space-5) 0;
+  padding: var(--space-4);
+  border: 1px solid var(--color-divider);
+  background: var(--color-surface);
+}
+
+.lz-review-gate[data-resolved="1"] {
+  border-color: color-mix(in srgb, var(--color-accent) 35%, var(--color-divider));
+}
+
+.lz-review-gate h2,
+.lz-review-queued h2,
+.lz-review-asks h2 {
+  margin: 0 0 var(--space-2);
+  font-size: 1rem;
+}
+
+.lz-gate-list {
+  margin: 0;
+  padding-left: 1.2em;
+}
+
+.lz-gate-item {
+  margin: var(--space-2) 0;
+}
+
+.lz-review-queued,
+.lz-review-asks {
+  margin: var(--space-5) 0;
+}
+
+/* Asks submitted with an earlier review: still here, one click away. */
+.lz-review-asks-filed {
+  margin: var(--space-4) 0 0;
+  border-top: 1px solid var(--color-divider);
+  padding-top: var(--space-3);
+}
+
+.lz-review-asks-filed > summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
+.lz-review-actions {
+  margin-top: var(--space-6);
+}
+
+.lz-review-terminals {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: flex-start;
+  margin: var(--space-4) 0;
+}
+
+.lz-submit p {
+  margin: 0 0 var(--space-2);
+}
+
+.lz-confirm-check {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-2) 0;
+}
+
+/* Live regions: a tab whose body moved while the reader was on another tab.
+   A dot, not a swap — the body is refetched when they switch to it. */
+.lz-tab[data-lz-stale]::after {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 0.4em;
+  vertical-align: 0.35em;
+  border-radius: 50%;
+  background: var(--color-accent);
+}
+
+/* The reader's own affordance: Changes and Current review are never swapped
+   under them, and an update deferred by the interaction guard waits here. */
+.lz-live-pill {
+  position: fixed;
+  /* Clear of the sticky status bar (.rv-statusbar, fixed at bottom: 0 with
+     z-index 50), and above it — a pill hidden behind the bar is no offer. */
+  right: var(--space-6);
+  bottom: calc(var(--space-8) * 2);
+  z-index: 51;
+  padding: var(--space-2) var(--space-4);
+  border: 1px solid var(--color-accent);
+  border-radius: 999px;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-size: 13px;
+  cursor: pointer;
+  box-shadow: 0 2px 12px color-mix(in srgb, var(--color-text) 25%, transparent);
+}
+
+.lz-live-pill:hover {
+  background: color-mix(in srgb, var(--color-accent) 12%, var(--color-bg));
+}
+
+/* Reviews tab — a fixed layout so the columns get width by importance rather
+   than by whichever verdict happened to be longest. Auto layout gave the whole
+   row to `Verdict` (free text) and squeezed the timestamp onto two lines. */
+.lz-reviews-table {
+  table-layout: fixed;
+}
+
+/* A full `YYYY-MM-DD HH:MM:SS UTC` on one line at any window width. `.table`
+   already keeps cells on one line; the width is what makes that readable
+   instead of clipped. */
+.lz-reviews-col-when {
+  width: 13.5rem;
+}
+
+/* Narrow on purpose: the verdict is free text and carries `wrap`, so it takes
+   as many lines as it needs rather than a column as wide as its longest line. */
+.lz-reviews-col-verdict {
+  width: 22%;
+}
+
+/* The only cell whose content grows — a count plus one link per raise. */
+.lz-reviews-col-raises {
+  width: auto;
+}
+.lz-reviews-raises {
+  overflow-wrap: anywhere;
+}
+
+.lz-reviews-col-links {
+  width: 8rem;
+}
+
+.lz-reviews-raise-ids {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.lz-reviews-none {
+  opacity: 0.55;
+}
+
+/* Narrow windows: the timestamp keeps its line, the rest gives way. */
+@media (max-width: 60rem) {
+  .lz-reviews-col-verdict {
+    width: 26%;
+  }
+  .lz-reviews-col-links {
+    width: 6.5rem;
+  }
+}
+
+/* Phone width: every column goes proportional, because `When` + `Links` in rem
+   together outgrow the row here and a fixed layout hands the overflow to the
+   two columns a reviewer came to click. The timestamp gives up its single line
+   first — a date over a time is still readable, whereas a raise id broken one
+   character per line is not, and an off-screen raise link is unreachable. No
+   horizontal scroll: the raises and the turn link stay on screen. */
+@media (max-width: 45rem) {
+  .lz-reviews-col-when {
+    width: 27%;
+  }
+  .lz-reviews-col-verdict {
+    width: 27%;
+  }
+  .lz-reviews-col-links {
+    width: 20%;
+  }
+  /* `.table td` is nowrap, and beats a single class — hence the table prefix.
+     The parts inside stay nowrap, so a break lands between date, time and
+     zone and never inside one of them. */
+  .lz-reviews-table td.lz-reviews-when {
+    white-space: normal;
+  }
+}
+
+.lz-reviews-when-part {
+  white-space: nowrap;
+}

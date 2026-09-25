@@ -15,6 +15,7 @@
  */
 
 import { describe, test, expect, mock, beforeEach, afterAll } from 'bun:test';
+import { ANTHROPIC_DEFAULT_TARGET } from '../../src/utils/role-target';
 import { mockModule, restoreMockedModules } from '../helpers/mock-module';
 import { resolve } from 'path';
 import { parentTaskIdOf } from '../../src/task-target';
@@ -64,7 +65,7 @@ const mockStorage = {
 await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => ({
   loadConfig: async () => ({
     remote: { driver: 'github', git_remote: 'origin' },
-    models: { default: 'claude-opus-4-7', roles: { builder: { backend: 'anthropic', model: '', endpoint: '' }, agent: { backend: 'anthropic', model: '', endpoint: '' } } },
+    models: { default: 'claude-opus-4-7', roles: { builder: ANTHROPIC_DEFAULT_TARGET, agent: ANTHROPIC_DEFAULT_TARGET } },
   }),
   DEFAULT_CONFIG: {},
   getDefaultConfigTemplate: () => '',
@@ -74,6 +75,8 @@ await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => (
 let mockPRStates: Map<string, string> = new Map();
 const mockDriver = {
   hasRemoteRef: (task: any) => mockPRStates.has(task.id),
+  // The recorded PR merges into the task's own target (src/daemon/review-base.ts checks it).
+  getReviewBase: async (t: any) => (t.target?.kind === 'branch' ? (t.target.branch || 'main') : null),
   getPRState: async (task: any) => mockPRStates.get(task.id) ?? null,
   getChecksStatus: async () => ({ status: 'passed', failed: [] }),
   getFailedCIJobs: async () => [],
@@ -82,14 +85,11 @@ const mockDriver = {
   fetchBranch: async () => false,
   syncComments: async () => [],
   recoverRemoteRef: async () => null,
-  getLastPostedTurnSeq: () => 0,
-  getLastPostedNoteAt: () => null,
   getLastCIFailureSynced: () => null,
-  postedTurnSeqKey: () => 'last_posted_turn_seq',
-  postedNoteAtKey: () => 'last_posted_note_at',
   ciFailureSyncedKey: () => 'last_ci_failure_synced',
   isImportedComment: () => false,
-  postTurnSummary: async () => {},
+  fidelityTurnSeqKey: () => 'fidelity_turn_seq',
+  getLastFidelityTurnSeq: () => 0,
 };
 
 await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
@@ -98,7 +98,7 @@ await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
 }));
 
 // Mock orphan module — track reparent calls
-await mockModule(resolve(import.meta.dir, '../../src/cli/orphan.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/task/orphan.ts'), () => ({
   reparentChildren: async (task: any, _storage: any) => {
     const children = mockChildren.get(task.id) ?? [];
     for (const child of children) {
@@ -109,8 +109,10 @@ await mockModule(resolve(import.meta.dir, '../../src/cli/orphan.ts'), () => ({
 }));
 
 // Mock shared module (cleanup functions)
-await mockModule(resolve(import.meta.dir, '../../src/cli/commands/shared.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/task/sync-remote.ts'), () => ({
   syncTaskFromRemote: async () => {},
+}));
+await mockModule(resolve(import.meta.dir, '../../src/task/cleanup.ts'), () => ({
   cleanupWorktreeAndBranch: async () => {},
   cleanupTaskContainer: async () => {},
 }));
@@ -146,8 +148,8 @@ await mockModule(resolve(import.meta.dir, '../../src/daemon/signals.ts'), () => 
 
 // Mock helpers — import real functions to avoid breaking other tests when run together
 // (bun's mock.module replaces the entire module, so we must re-export everything)
-import { deriveTaskRef as realDeriveTaskRef, taskRef as realTaskRef } from '../../src/cli/helpers';
-await mockModule(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
+import { deriveTaskRef as realDeriveTaskRef, taskRef as realTaskRef } from '../../src/task/identity';
+await mockModule(resolve(import.meta.dir, '../../src/task/identity.ts'), () => ({
   shortId: (id: string) => id.substring(0, 8),
   displayId: (task: any) => task.code ?? task.id.substring(0, 8),
   getWorktreePath: () => '/tmp/worktree',
@@ -156,7 +158,7 @@ await mockModule(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
 }));
 
 // Mock theme
-await mockModule(resolve(import.meta.dir, '../../src/cli/theme.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/render/theme.ts'), () => ({
   theme: {
     taskId: (s: string) => s,
     success: (s: string) => s,

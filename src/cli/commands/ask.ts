@@ -24,15 +24,22 @@
  * never reaps an in-flight ask.
  */
 
-import { requireStorage, shortId, displayId, parseFlags, resolveTaskOrExit } from '../helpers';
+import { requireActorIdentity } from '../identity-preflight';
+import { usagePauseRefusalLines } from '../usage-pause-preflight';
+import { admitOneshotCommand, type OneshotCommand } from '../../oneshot';
+import { requireStorage, parseFlags, resolveTaskOrExit } from '../helpers';
+import { shortId, displayId } from '../../task/identity';
 import { isTTY, openEditor, readStdinIfPiped, removeRecoveryFile } from '../editor';
-import { theme, dim } from '../theme';
+import { theme, dim } from '../../render/theme';
 import { writeStdoutLine } from '../../utils/stdio';
 import { sanitizeUserText } from '../../utils/sanitize-text';
 import { resolveStoredConversation } from '../../conversation/ask';
+import { resolveAskAvailability, type AskRoute } from '../../server/review-actions';
+import { buildAskContext } from '../../task/ask-context';
 import type { Storage } from '../../storage/interface';
 import type { StoredConversation } from '../../storage/types';
 import type { Task } from '../../types';
+import { overrideEligibleActor, usagePauseOverrideEligibility } from '../human-terminal';
 
 /**
  * Emit an error in the shape the caller asked for, then exit non-zero.
@@ -70,24 +77,12 @@ function unwrapRpcMessage(err: unknown): string {
  * gate that matters — the daemon may flip a task to `working` between this
  * check and the RPC), with the same wording as the `lazy_ask` MCP tool.
  */
-async function preflight(storage: Storage, task: Task, jsonOutput: boolean): Promise<void> {
-  const sess = await storage.getSessionByTaskId(task.id);
-  if (!sess) {
-    fail(jsonOutput, `Task ${displayId(task)} has no session. Start it first with: lazy start ${displayId(task)}`);
+async function preflight(storage: Storage, task: Task, jsonOutput: boolean): Promise<{ route: AskRoute }> {
+  const availability = resolveAskAvailability(await buildAskContext(storage, task));
+  if (availability.unavailable) {
+    fail(jsonOutput, `Task ${displayId(task)}: ${availability.unavailable}`);
   }
-  if (sess.ended_at) {
-    fail(jsonOutput, `Task ${displayId(task)} session has ended. Create a variant with: lazy branch ${displayId(task)}`);
-  }
-  if (!sess.agent_session_id) {
-    fail(jsonOutput, `Task ${displayId(task)} has no agent session to resume — cannot ask until the agent has run at least once.`);
-  }
-  if (task.status !== 'blocked' && task.status !== 'conflict') {
-    fail(
-      jsonOutput,
-      `Task ${displayId(task)} is '${task.status}', not 'blocked' or 'conflict'. ` +
-      'Ask only runs against a blocked or conflict task — wait until the agent is paused for review.',
-    );
-  }
+  return { route: availability.route as AskRoute };
 }
 
 /**
@@ -179,6 +174,15 @@ async function askConversationTarget(
   jsonOutput: boolean,
 ): Promise<void> {
   const shortSession = conv.sessionId.substring(0, 8);
+  // [usage_pause]: the answer is one command of several model calls, admitted
+  // once — before the question is typed, so a paused credential never costs
+  // the human what they wrote, and a one-shot override carries every call.
+  let oneshotCommand: OneshotCommand;
+  try {
+    oneshotCommand = await admitOneshotCommand({ actor: await overrideEligibleActor() });
+  } catch (err) {
+    fail(jsonOutput, unwrapRpcMessage(err));
+  }
   const { question, recoveryPath } = await obtainQuestion({
     messageValue,
     jsonOutput,
@@ -204,18 +208,17 @@ async function askConversationTarget(
   }
 
   const { askConversation } = await import('../../conversation/ask');
-  const { loadConfig } = await import('../../config/loader');
-  const { requireLazyRoot } = await import('../helpers');
-  const config = await loadConfig(requireLazyRoot());
 
+  // No model is named: a machine one-shot runs on the BUILDER role target's
+  // model, not on `[models] default`. Naming the project default here would
+  // send that model id to whatever upstream the builder profile resolves to.
   let result;
   try {
-    result = await askConversation(conv, cleaned, {
-      model: config.models.default,
+    result = await oneshotCommand.run(() => askConversation(conv, cleaned, {
       // Progress on stderr, so it never contaminates a piped answer, and the
       // human is never left watching silence through a multi-pass read.
       onProgress: jsonOutput ? undefined : (message) => console.error(dim(message)),
-    });
+    }));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (recoveryPath) fail(jsonOutput, message, [`Your question was saved to: ${recoveryPath}`]);
@@ -249,9 +252,11 @@ export async function commandAsk(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [
     { name: 'message', aliases: ['m'], takesValue: true },
     { name: 'json', takesValue: false },
+    { name: 'no-wait', takesValue: false },
   ], 'ask');
 
   const jsonOutput = parsed.flags.get('json') === true;
+  const noWait = parsed.flags.get('no-wait') === true;
   const messageValue = parsed.flags.get('message') as string | undefined;
   const taskId = parsed.positional[0];
   if (!taskId) {
@@ -290,7 +295,18 @@ export async function commandAsk(args: string[]): Promise<void> {
       ? await resolveTaskForJson(storage, taskId)
       : await resolveTaskOrExit(storage, taskId);
 
-    await preflight(storage, task, jsonOutput);
+  // Before the question is typed: the daemon refuses a write it cannot
+  // attribute, and a refusal must never cost the human what they wrote.
+  await requireActorIdentity();
+
+    const { route } = await preflight(storage, task, jsonOutput);
+
+    // Before the question is typed, like the identity check: an ask on a paused
+    // credential is refused by the daemon ([usage_pause]). The live route spends
+    // the task's credential; the record route runs a one-shot on the builder
+    // role's, so that is the one peeked at there.
+    const paused = await usagePauseRefusalLines(task.id, 'ask', undefined, { beside: route === 'record' });
+    if (paused) fail(jsonOutput, paused[0]!, paused.slice(1));
 
     // --- Question: --message > piped stdin > interactive prompt (TTY only) ---
     const prompted = await obtainQuestion({
@@ -302,9 +318,17 @@ export async function commandAsk(args: string[]): Promise<void> {
         `# Task: ${displayId(task)}`,
         ...(task.goal ? [`# Goal: ${task.goal}`] : []),
         '#',
-        '# Enter your question for this task\'s agent.',
-        '# The agent answers read-only, reflectively: it will not commit,',
-        '# modify the worktree, or unblock the task.',
+        ...(route === 'record'
+          ? [
+              "# This task's agent session cannot be resumed, so the answer is",
+              '# derived from what lazy stored: its turns, raised items, commits',
+              '# and diff. Nothing is written back.',
+            ]
+          : [
+              "# Enter your question for this task's agent.",
+              '# The agent answers read-only, reflectively: it will not commit,',
+              '# modify the worktree, or unblock the task.',
+            ]),
         '# Lines starting with # will be ignored',
         '',
       ],
@@ -318,19 +342,73 @@ export async function commandAsk(args: string[]): Promise<void> {
     }
 
     if (!jsonOutput) {
-      console.error(dim(`Asking ${displayId(task)} (read-only, reflective) — this may take a minute…`));
+      console.error(dim(route === 'record'
+        ? `Asking ${displayId(task)} from its stored record (no live session to resume) — this may take a minute…`
+        : `Asking ${displayId(task)} (read-only, reflective) — this may take a minute…`));
     }
 
-    const { queryAskTask } = await import('../../daemon/rpc-fallback');
+    const { queryAskTask, queryAskTaskAwaited } = await import('../../daemon/rpc-fallback');
+    const { createPhaseDisplay } = await import('../phase-display');
+    // Ask's stdout is the ANSWER — a payload someone may pipe — so the checklist
+    // goes to stderr, alongside the "Asking…" line above. Under --json there is
+    // no checklist at all: that mode narrates nothing.
+    const display = jsonOutput ? undefined : createPhaseDisplay({ stream: 'stderr' });
+    // --no-wait exposes what the daemon does anyway: start the turn and return.
+    // The answer still lands as an ask turn on the task, so this is "do not sit
+    // here", not "do not ask".
+    if (noWait) {
+      try {
+        const started = await queryAskTask({ taskId: task.id, message: question, ...(await usagePauseOverrideEligibility()), }, display);
+        display?.close();
+        if (recoveryPath) removeRecoveryFile(recoveryPath);
+        if (jsonOutput) {
+          await writeStdoutLine(JSON.stringify({
+            type: 'task',
+            taskId: started.displayId,
+            fullTaskId: started.taskId,
+            started: started.outcome === 'started',
+            answer: started.answer ?? null,
+            sessionId: started.sessionId,
+            turnSequence: started.turnSequence ?? null,
+            derivedFrom: started.derivedFrom ?? null,
+            warnings: started.warnings ?? [],
+          }));
+          return;
+        }
+        // The record route has nothing to wait for — it already answered.
+        if (started.outcome === 'answered') {
+          if (started.provenance) console.error(dim(started.provenance));
+          await writeStdoutLine((started.answer ?? '').trim());
+          return;
+        }
+        await writeStdoutLine(
+          `Question sent to ${started.displayId}. There is no time limit on the answer.\n` +
+          `  Wait for it:  lazy wait ${started.displayId}\n` +
+          `  Read it:      lazy show ${started.displayId}\n` +
+          `  End it:       lazy stop ${started.displayId} --reason "..."`,
+        );
+        return;
+      } catch (err) {
+        display?.close();
+        const message = unwrapRpcMessage(err);
+        if (recoveryPath) fail(jsonOutput, message, [`Your question was saved to: ${recoveryPath}`]);
+        fail(jsonOutput, message);
+      }
+    }
+
     let result;
     try {
-      result = await queryAskTask({ taskId: task.id, message: question });
+      result = await queryAskTaskAwaited({ taskId: task.id, message: question, ...(await usagePauseOverrideEligibility()), }, display);
+      display?.close();
     } catch (err) {
       const message = unwrapRpcMessage(err);
       if (recoveryPath) {
         fail(jsonOutput, message, [`Your question was saved to: ${recoveryPath}`]);
       }
       fail(jsonOutput, message);
+    } finally {
+      // Idempotent — the success path closes it before the answer is written.
+      display?.close();
     }
 
     // Answered — the question is consumed, so the recovery file can go.
@@ -350,7 +428,9 @@ export async function commandAsk(args: string[]): Promise<void> {
         fullTaskId: task.id,
         answer: result.answer,
         sessionId: result.sessionId,
-        turnNumber: result.turnNumber,
+        turnNumber: result.turnNumber ?? null,
+        derivedFrom: result.derivedFrom,
+        provenance: result.provenance ?? null,
         usage: result.usage ?? null,
         warnings: result.warnings ?? [],
       }));
@@ -360,6 +440,10 @@ export async function commandAsk(args: string[]): Promise<void> {
     for (const warning of result.warnings ?? []) {
       console.error(theme.warning(`Warning: ${warning}`));
     }
+    // Provenance on stderr, alongside the warnings: stdout stays the answer
+    // alone so it can still be piped, but the human is told plainly when the
+    // answer was read off the record rather than given by the live agent.
+    if (result.provenance) console.error(dim(result.provenance));
     await writeStdoutLine(result.answer.trim());
   } finally {
     await storage.close();
@@ -367,7 +451,7 @@ export async function commandAsk(args: string[]): Promise<void> {
 }
 
 export function askUsage(): void {
-  console.log(`Usage: lazy ask <id> [-m|--message "..."] [--json]
+  console.log(`Usage: lazy ask <id> [-m|--message "..."] [--no-wait] [--json]
 
 Ask a question and print the answer. Read-only either way — an ask never writes.
 
@@ -375,10 +459,18 @@ Ask a question and print the answer. Read-only either way — an ask never write
 CONVERSATION.
 
 Asking a TASK (task id or code):
-  Resumes the paused agent's own session, reflectively. Does NOT unblock the
-  task, commit, or modify the worktree; the task's status is restored when the
-  answer comes back. The task must be 'blocked' or 'conflict' and must have run
-  at least once (there has to be an agent session to resume).
+  While the task is paused for review ('blocked' or 'conflict') with a session
+  that can still be resumed, this resumes the agent's own session, reflectively.
+  It does NOT unblock the task, commit, or modify the worktree; the task's
+  status is restored when the answer comes back.
+
+  Otherwise — a finished task, an ended session, a removed worktree — the
+  question is answered from what lazy STORED about the task: its turns, its
+  raised items, its commits and its diff, read by a throwaway read-only agent.
+  Nothing is written back and the task's status is untouched. The answer says
+  where it came from, so it is never mistaken for the live agent's.
+
+  Only a task that has never run has nothing to answer from.
 
 Asking a CONVERSATION (session id or unique prefix, from 'lazy builder list'):
   A throwaway read-only agent reads the stored transcript and answers from it —
@@ -394,6 +486,8 @@ Arguments:
 
 Options:
   -m, --message "..."   The question. Required when stdin is not a terminal.
+  --no-wait             Send the question and return; read the answer later with lazy show.
+                        Ignored on the record route, which answers immediately.
   --json                Print the answer as JSON instead of text.
                         Task:         {type, taskId, fullTaskId, answer,
                                        sessionId, turnNumber, usage, warnings}

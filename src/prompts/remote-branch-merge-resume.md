@@ -16,3 +16,15 @@ Steps:
 IMPORTANT: Your ONLY job is to resolve the conflicts. Do NOT make any other changes.
 
 Neither side is more authoritative than the other. Both your local changes and the remote changes are work in progress. Resolve conflicts by combining both sets of changes so that the merged result preserves the intent of both sides.
+
+Rules that decide the common cases:
+
+- Lists of entries (changelog sections, option tables) take the UNION of both sides' entries.
+- An enumerated list of names — a serializer's field list, a switch over an enum, an exported
+  symbol list — takes the UNION too, and dropping one side's entries compiles cleanly while
+  silently losing a feature. Verify by diffing the resolved file against BOTH parents
+  (`git diff HEAD -- <file>`, `git diff MERGE_HEAD -- <file>`).
+- Never finish by abandoning the merge and hand-copying the other branch's content in as new
+  commits: the deliverable is a commit with BOTH parents, created by `lazy_commit`.
+- After resolving, run what is cheap and relevant (type-check, the tests covering what you
+  touched) so neither side's behavior is broken.

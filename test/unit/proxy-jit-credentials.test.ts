@@ -178,7 +178,7 @@ describe('placeholderizeAuthEnv', () => {
         { key: 'CLAUDE_CODE_OAUTH_TOKEN', value: REAL },
         { key: 'ANTHROPIC_BASE_URL', value: 'http://127.0.0.1:8766' },
       ],
-      { role: 'agent', taskId: 'task-9', label: 'lazy-task-9' },
+      { role: 'agent', taskId: 'task-9', label: 'lazy-task-9', profile: 'claude-code' },
     );
 
     // The key must survive: the client picks its auth wire shape from WHICH
@@ -213,8 +213,13 @@ describe('per-target credential resolution', () => {
     expect(anthropicPlacement('ANTHROPIC_API_KEY', 'k')).toEqual({
       kind: 'header', header: 'x-api-key', value: 'k',
     });
+    // INVARIANT: an OAuth token is a bearer PLUS the OAuth beta flag — one
+    // credential form, both halves decided here. A client that cannot know
+    // which kind is behind its placeholder (pi, which is handed one and never
+    // learns) would otherwise present a subscription token as something else.
     expect(anthropicPlacement('CLAUDE_CODE_OAUTH_TOKEN', 'k')).toEqual({
       kind: 'header', header: 'authorization', value: 'Bearer k',
+      requiredBeta: 'oauth-2025-04-20',
     });
   });
 });
@@ -229,6 +234,39 @@ describe('header injection', () => {
     // x-api-key — the target's form wins, and the placeholder slot is gone.
     expect(fwd.get('x-api-key')).toBeNull();
     expect(fwd.get('authorization')).toBe(`Bearer ${REAL}`);
+  });
+
+  // INVARIANT: substituting an OAuth token also presents the flag that form
+  // requires. A pi turn's request carried the bearer without it and Anthropic
+  // answered it as non-subscription traffic (400 "out of extra usage", then
+  // 429) while Claude Code turns on the same credential succeeded.
+  test('an OAuth placement adds the OAuth beta flag the client could not know to send', () => {
+    const req = new Headers({ 'x-api-key': 'PLACEHOLDER' });
+    const fwd = new Headers(req);
+    applyCredential(fwd, collectPresentedCredentials(req), 'PLACEHOLDER', anthropicPlacement('CLAUDE_CODE_OAUTH_TOKEN', REAL));
+    expect(fwd.get('anthropic-beta')).toBe('oauth-2025-04-20');
+  });
+
+  test('an api-key placement adds no beta flag — it describes the credential, not the endpoint', () => {
+    const req = new Headers({ 'x-api-key': 'PLACEHOLDER' });
+    const fwd = new Headers(req);
+    applyCredential(fwd, collectPresentedCredentials(req), 'PLACEHOLDER', anthropicPlacement('ANTHROPIC_API_KEY', REAL));
+    expect(fwd.get('anthropic-beta')).toBeNull();
+  });
+
+  // INVARIANT: the client's own beta flags are feature requests of ITS turn.
+  // Merging, never setting, is what keeps Claude Code's request byte-identical
+  // apart from the secret.
+  test('the beta flag merges with the client\'s own, and never duplicates', () => {
+    const withOthers = new Headers({ 'x-api-key': 'PLACEHOLDER', 'anthropic-beta': 'fine-grained-tool-streaming-2025-05-14' });
+    const fwd = new Headers(withOthers);
+    applyCredential(fwd, collectPresentedCredentials(withOthers), 'PLACEHOLDER', anthropicPlacement('CLAUDE_CODE_OAUTH_TOKEN', REAL));
+    expect(fwd.get('anthropic-beta')).toBe('fine-grained-tool-streaming-2025-05-14,oauth-2025-04-20');
+
+    const already = new Headers({ 'x-api-key': 'PLACEHOLDER', 'anthropic-beta': 'oauth-2025-04-20, other-flag' });
+    const fwd2 = new Headers(already);
+    applyCredential(fwd2, collectPresentedCredentials(already), 'PLACEHOLDER', anthropicPlacement('CLAUDE_CODE_OAUTH_TOKEN', REAL));
+    expect(fwd2.get('anthropic-beta')).toBe('oauth-2025-04-20, other-flag');
   });
 
   test('an in-place placement preserves the client framing', () => {

@@ -17,20 +17,9 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectOutputExcludes, expectError } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { enrollPassphrase } from '../helpers/passphrase';
+import { seedFinal } from '../helpers/final';
 
 const PASSPHRASE = 'test-approval-passphrase';
-
-/**
- * Env that drives the masked `lazy approve` prompt as if a human typed the
- * correct passphrase at a TTY. The passphrase is TTY-only BY DESIGN — no flag,
- * no env var, no piped-stdin route — so this test-only pair is the only way a
- * test can supply it (see test/e2e/system-passphrase.test.ts).
- */
-const TYPES_PASSPHRASE = {
-  LAZY_FORCE_TTY: '1',
-  LAZY_PROMPT_DEFAULTS: '1',
-  LAZY_PROMPT_SECRET: PASSPHRASE,
-};
 
 /** Read lazy.toml and parse its [protection] section. */
 async function readProtection(ctx: TestContext): Promise<Record<string, unknown>> {
@@ -382,6 +371,9 @@ describe('lazy protect: the task form gates that task\'s accept', () => {
     writeFileSync(join(worktreePath, `${name}.txt`), 'content\n');
     ctx.git('-C', worktreePath, 'add', `${name}.txt`);
     ctx.git('-C', worktreePath, 'commit', '-m', `Add ${name}.txt`);
+    // Fixture setup, not the subject (see test/helpers/final.ts): the suite's
+    // accepts exercise the passphrase gate, not the no-final refusal.
+    await seedFinal(ctx, taskId);
     return taskId;
   }
 
@@ -389,7 +381,7 @@ describe('lazy protect: the task form gates that task\'s accept', () => {
   // that task's branch upward requires human approval. gate_default_branch is
   // switched off here so the ONLY thing that can gate the accept is the task
   // entry itself.
-  test('a protected task refuses its own accept, naming lazy approve', async () => {
+  test('a protected task refuses its own accept, naming the passphrase route', async () => {
     await enableProtection(ctx);
     const tomlPath = join(ctx.root, 'lazy.toml');
     await writeFile(
@@ -403,11 +395,12 @@ describe('lazy protect: the task form gates that task\'s accept', () => {
     expectSuccess(await ctx.lazy(['protect', taskId, 'on']));
     expect((await readProtection(ctx)).protected_tasks).toEqual([taskId]);
 
+    // Non-interactive: no way to type the passphrase, so the refusal points
+    // at running accept from a terminal.
     const refused = await ctx.lazy(['accept', taskId, '--yes']);
     expectFailure(refused);
-    expectError(refused, 'requires human approval');
-    expectError(refused, 'protected_tasks');
-    expectError(refused, `lazy approve ${taskId}`);
+    expectError(refused, 'approval passphrase');
+    expectError(refused, 'from a terminal');
 
     const log = ctx.git('log', '--oneline', 'main');
     expect(log.stdout).not.toContain('outgoing');
@@ -435,16 +428,16 @@ describe('lazy protect: the task form gates that task\'s accept', () => {
     expectOutput(accepted, 'accepted and merged');
   }, 30000);
 
-  // INVARIANT: `lazy approve` satisfies the outgoing gate exactly as it does
-  // the incoming one — one approval mechanism, not two.
-  test('lazy approve unlocks a protected task\'s accept', async () => {
+  // INVARIANT: the inline passphrase satisfies the outgoing gate exactly as it
+  // does the incoming one — one approval mechanism, not two.
+  test('the inline passphrase unlocks a protected task\'s accept', async () => {
     await enableProtection(ctx);
     const taskId = await setupBlockedTask('approve-outgoing');
     expectSuccess(await ctx.lazy(['protect', taskId, 'on']));
 
-    expectSuccess(await ctx.lazy(['approve', taskId], { env: TYPES_PASSPHRASE }));
-
-    const accepted = await ctx.lazy(['accept', taskId, '--yes']);
+    const accepted = await ctx.lazy(['accept', taskId], {
+      env: { LAZY_FORCE_TTY: '1', LAZY_PROMPT_DEFAULTS: '1', LAZY_PROMPT_SECRET: PASSPHRASE },
+    });
     expectSuccess(accepted);
     expectOutput(accepted, 'accepted and merged');
   }, 30000);

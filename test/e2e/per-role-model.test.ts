@@ -6,9 +6,18 @@ import { expectSuccess, expectFailure, expectError } from '../helpers/assertions
 import { createTask } from '../helpers/fixtures';
 
 /**
- * Per-role model targets: [models.roles.builder] / [models.roles.agent] config.
- * These tests exercise config-load validation (no daemon needed — `create`/`show`
- * never launch an agent), which is where the fail-hard config guardrails live.
+ * Per-role model targets: `[models.roles.builder]` / `[models.roles.agent]`.
+ *
+ * A role names the agent PROFILE it defaults to — `agent = "<profile>"` — and
+ * nothing else: harness, model, upstream and credential are the profile's, so
+ * that two tasks in the same role can run different agents against different
+ * upstreams. These tests exercise config-load validation (no daemon needed —
+ * `create`/`show` never launch an agent), which is where the fail-hard config
+ * guardrails live.
+ *
+ * The removed `backend` / `model` / `endpoint` role keys, and the removed
+ * `[ollama]` block, are covered by test/e2e/agent-profile-migration.test.ts,
+ * which asserts both the refusal and the `lazy doctor --fix agents` rewrite.
  */
 describe('per-role model targets', () => {
   let ctx: TestContext;
@@ -27,110 +36,72 @@ describe('per-role model targets', () => {
     await writeFile(configPath, existing + '\n' + extra, 'utf-8');
   }
 
-  test('per-role config with both roles parses and works', async () => {
+  test('both roles naming a profile parses and works', async () => {
     await appendConfig(`
 [models.roles.builder]
-backend = "anthropic"
-model = "claude-opus-4-8"
+agent = "claude-code"
 
 [models.roles.agent]
-backend = "ollama"
+agent = "local-ollama"
+
+[agents.local-ollama]
+harness = "claude-code"
 model = "qwen3.5:35b-a3b-coding-nvfp4"
-endpoint = "http://host.docker.internal:11434"
+endpoint = "http://localhost:11434"
 `);
     const taskId = await createTask(ctx, 'Per-role task');
     const result = await ctx.lazy(['show', taskId]);
     expectSuccess(result);
   });
 
-  // INVARIANT: No silent name substitution — an ollama/proxy role with no model
-  // is a config bug the user must see immediately, not a silent degrade.
-  test('fails when an agent role uses ollama backend without a model', async () => {
+  // INVARIANT: a role that names a profile the project does not define is a
+  // config error listing the alternatives — never a silent fall-back to the
+  // default profile, which would launch every task of that role somewhere the
+  // file plainly does not say.
+  test('fails on a role that names an unknown profile', async () => {
     await appendConfig(`
 [models.roles.agent]
-backend = "ollama"
+agent = "nope"
 `);
     const result = await ctx.lazy(['create', '--goal', 'test task']);
     expectFailure(result);
-    expectError(result, 'no model is set');
+    expectError(result, 'Unknown agent profile "nope"');
+    expectError(result, '[models.roles.agent] agent');
+    expectError(result, 'Available profiles');
   });
 
-  // INVARIANT (default-on proxy): a proxy role may omit `endpoint` — the daemon
-  // injects the live (OS-assigned) address at launch. With the proxy on by
-  // default this holds even with NO [proxy] section at all.
-  test('a proxy role with no endpoint is accepted with no [proxy] section (default-on)', async () => {
+  // INVARIANT: no silent name substitution — a profile that pins an endpoint
+  // must name its model. Model names belong to the endpoint ("opus" does not
+  // exist on an Ollama box), so lazy refuses at load rather than guess one.
+  test('fails when a role default profile pins an endpoint without a model', async () => {
     await appendConfig(`
-[models.roles.builder]
-backend = "proxy"
-model = "claude-opus-4-8"
+[models.roles.agent]
+agent = "local-ollama"
+
+[agents.local-ollama]
+harness = "claude-code"
+endpoint = "http://localhost:11434"
 `);
     const result = await ctx.lazy(['create', '--goal', 'test task']);
-    expectSuccess(result);
+    expectFailure(result);
+    expectError(result, 'sets endpoint but no model');
   });
 
-  test('a proxy role with no endpoint is accepted with an explicit [proxy] section', async () => {
-    await appendConfig(`
-[proxy]
-
-[models.roles.builder]
-backend = "proxy"
-model = "claude-opus-4-8"
-`);
-    const result = await ctx.lazy(['create', '--goal', 'test task']);
-    expectSuccess(result);
-  });
-
-  // INVARIANT: the one hard failure left — routing a role at a proxy that is
-  // switched off. Fail at load rather than launching with an empty base URL,
-  // which would silently bypass the audit/policy plane.
-  test('fails when a proxy role has no endpoint AND the proxy is disabled', async () => {
+  // INVARIANT (proxy-always-on): `[proxy] enabled = false` is rejected outright,
+  // however the roles are configured. The audit plane cannot be switched off —
+  // deliberate product change after the per-role opt-out and the enabled
+  // toggle were removed.
+  test('rejects [proxy] enabled = false even with roles configured', async () => {
     await appendConfig(`
 [proxy]
 enabled = false
 
 [models.roles.builder]
-backend = "proxy"
-model = "claude-opus-4-8"
+agent = "claude-code"
 `);
     const result = await ctx.lazy(['create', '--goal', 'test task']);
     expectFailure(result);
-    expectError(result, 'proxy is disabled');
-  });
-
-  // INVARIANT: An unknown backend is a config error — lazy supports exactly
-  // anthropic | ollama | proxy and must not silently ignore typos.
-  test('fails on an invalid backend value', async () => {
-    await appendConfig(`
-[models.roles.agent]
-backend = "openai"
-model = "gpt-4"
-`);
-    const result = await ctx.lazy(['create', '--goal', 'test task']);
-    expectFailure(result);
-    expectError(result, 'Invalid backend');
-  });
-
-  // INVARIANT: The legacy [ollama] block must keep working unchanged — it maps
-  // to "all roles → ollama" so existing configs are not broken by the per-role split.
-  test('legacy [ollama] block still works (maps to all roles)', async () => {
-    await appendConfig(`
-[ollama]
-enabled = true
-model = "qwen3-coder"
-`);
-    const taskId = await createTask(ctx, 'Legacy ollama task');
-    const result = await ctx.lazy(['show', taskId]);
-    expectSuccess(result);
-  });
-
-  test('ollama agent role defaults its endpoint when omitted', async () => {
-    await appendConfig(`
-[models.roles.agent]
-backend = "ollama"
-model = "qwen3-coder"
-`);
-    const taskId = await createTask(ctx, 'Ollama default endpoint role');
-    const result = await ctx.lazy(['show', taskId]);
-    expectSuccess(result);
+    expectError(result, 'has been removed');
+    expectError(result, 'always on');
   });
 });

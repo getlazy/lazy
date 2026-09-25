@@ -21,6 +21,7 @@ import {
   discoverCandidateSessions,
   reimportConversations,
   countMissingConversations,
+  listMissingConversationsByImportability,
 } from '../../src/import/reimport-conversations';
 import { ONESHOT_SESSION, oneshotBody } from '../helpers/oneshot-session';
 import type { StoredConversation } from '../../src/storage/types';
@@ -186,6 +187,38 @@ describe('reimport-conversations core', () => {
     expect(report.imported.map(i => i.sessionId)).toEqual(['ffffffff-0000-0000-0000-000000000002']);
     expect(report.skippedEmpty).toEqual(['eeeeeeee-0000-0000-0000-000000000001']);
     expect(storage.saved.has('eeeeeeee-0000-0000-0000-000000000001')).toBe(false);
+  });
+
+  // INVARIANT: the check and the remedy answer with the SAME predicate.
+  // Doctor used to warn about every uncaptured session on disk, `--reimport-
+  // conversations` then reported the content-free ones as "empty/unparseable
+  // skipped", and the next doctor warned about them again — forever, with no
+  // action that could ever clear it. Splitting the missing set by what reimport
+  // would actually do makes the loop impossible: only `recoverable` is offered
+  // as recoverable, and `unimportable` is stated as a fact with no remedy.
+  test('splits missing sessions into what reimport can and cannot recover', async () => {
+    await seedShared('a0000000-0000-0000-0000-000000000001', 2);            // real turns
+    await seedIsolation('builderA', 'b0000000-0000-0000-0000-000000000002', 0, '\n');   // empty shell
+    await seedIsolation('builderB', 'c0000000-0000-0000-0000-000000000003', 0, 'not json\n'); // unparseable
+    await seedShared('d0000000-0000-0000-0000-000000000004', 1);            // already stored
+
+    const storage = makeStorageStub(['d0000000-0000-0000-0000-000000000004']);
+    const { recoverable, unimportable } = await listMissingConversationsByImportability({
+      ...opts(),
+      storage,
+    });
+
+    expect(recoverable.map(m => m.sessionId)).toEqual(['a0000000-0000-0000-0000-000000000001']);
+    expect(unimportable.map(m => m.sessionId).sort()).toEqual([
+      'b0000000-0000-0000-0000-000000000002',
+      'c0000000-0000-0000-0000-000000000003',
+    ]);
+
+    // And the split matches what a real reimport does with the same files:
+    // exactly the recoverable one lands in the store, the other two are skipped.
+    const report = await reimportConversations({ ...opts(), storage });
+    expect(report.imported.map(i => i.sessionId)).toEqual(['a0000000-0000-0000-0000-000000000001']);
+    for (const m of unimportable) expect(storage.saved.has(m.sessionId)).toBe(false);
   });
 
   test('countMissingConversations counts only sessions not already in the store', async () => {

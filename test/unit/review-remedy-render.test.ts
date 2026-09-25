@@ -40,7 +40,7 @@ function task(): Task {
   } as unknown as Task;
 }
 
-function render(remedy: AcceptRemedy, draft: { reason?: string; feedback?: string } = {}): string {
+function render(remedy: AcceptRemedy, draft: { reason?: string; feedback?: string; approvedFiles?: string[] } = {}): string {
   return reviewTaskHtml(task(), PATCH, [], undefined, undefined, [], { remedy, draft });
 }
 
@@ -56,7 +56,8 @@ describe('remedy panel', () => {
     expect(html).toContain('This merge is protected.');
     expect(html).toContain('type="password" name="passphrase"');
     expect(html).toContain('lazy accept task1234abcd');
-    expect(html).toContain('action="/review/task1234abcd/accept"');
+    // Task URLs carry the task's code.
+    expect(html).toContain('action="/tasks/demo-task/review/accept"');
   });
 
   test('a sync remedy renders the sync button pointing at the sync route', () => {
@@ -66,7 +67,9 @@ describe('remedy panel', () => {
       command: 'lazy sync task1234abcd',
       uiAction: 'sync',
     });
-    expect(html).toContain('action="/review/task1234abcd/sync"');
+    // The review-page sync posts to /review/sync, not the generic
+    // /actions/sync, so the carried draft returns to this page.
+    expect(html).toContain('action="/tasks/demo-task/review/sync"');
     expect(html).toContain('Sync with parent');
     expect(html).not.toContain('name="passphrase"');
   });
@@ -100,6 +103,38 @@ describe('remedy panel', () => {
     expect(html).toContain('>rename the helper first</textarea>');
     expect(html).toContain('<input type="hidden" name="reason" value="looks good">');
     expect(html).toContain('<input type="hidden" name="feedback" value="rename the helper first">');
+  });
+
+  // INVARIANT: a passphrase retry submits the same approved files the first
+  // accept named. Dropping them is how a conflict task's approved file vanished
+  // on the in-page retry.
+  test('the passphrase form carries approved files as hidden fields', () => {
+    const html = render(
+      {
+        reason: 'approval-required',
+        next: 'Approve it.',
+        command: 'lazy accept task1234abcd --approve-file src/secret.ts --reason looks-good',
+        uiAction: 'passphrase',
+        files: ['src/secret.ts'],
+      },
+      { reason: 'looks-good', approvedFiles: ['src/secret.ts'] },
+    );
+    expect(html).toContain('name="approved_files" value="src/secret.ts"');
+    expect(html).toContain('--approve-file src/secret.ts');
+    expect(html).toContain('Or run this in the project directory');
+    expect(html).toContain('Approve and accept');
+  });
+
+  test('the accept form itself includes hidden approved_files for every ✅', () => {
+    const html = reviewTaskHtml(
+      task(),
+      PATCH,
+      [],
+      undefined,
+      undefined,
+      [{ file: 'src/secret.ts', base_sha: 'abc', status: 'approved' }],
+    );
+    expect(html).toContain('name="approved_files" value="src/secret.ts"');
   });
 
   test('no remedy renders no panel at all', () => {

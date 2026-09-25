@@ -14,9 +14,16 @@
  *      host put in `--model`, usually a tier alias); `model_id` is the CONCRETE
  *      id the agent self-reported. `model_id` is never back-filled from the
  *      alias — its absence is the signal that only the alias was ever known.
- *   2. Sticky-model resolution reads REQUEST-side turns only. Agent turns now
- *      carry `model` too; reading them would let a concrete snapshot harden
- *      into the pin for every later launch.
+ *   2. Labels are OUTPUT ONLY — `model`, `effort` and `agent` alike. No launch
+ *      reads a previous turn's back: resolution is `--model/--effort override >
+ *      task record > default`, for EVERY turn type, through
+ *      `resolveTurnLaunchIdentity` (covered in turn-launch-identity.test.ts).
+ *      The old previous-turn scan ("sticky model") outranked task.model and so
+ *      made `lazy edit --model` a no-op on a started task — removed in
+ *      fix-unblock-sticky-model; the precedence is pinned by
+ *      test/e2e/per-turn-model.test.ts, and the no-scan rule is generalised to
+ *      every launch path in fix-turn-model-continuity (see the removal note in
+ *      src/utils/turns.ts).
  *   3. Labels are recorded per INVOCATION, not per command: work, push-back and
  *      maintain follow-ups each carry their own.
  *   4. Old turns stay readable and stay unlabelled. A response from a supervisor
@@ -36,12 +43,21 @@ import { join, dirname } from 'path';
 import { tmpdir } from 'os';
 import { FileStorage } from '../../src/storage';
 import { handleCompletedResponses, handleErrorResponse } from '../../src/utils/reconcile';
-import { findStickyModel, launchSettingsFromResponse } from '../../src/utils/turns';
-import { formatTurnLaunchLabels, turnLaunchLabels, turnRanNoAgent } from '../../src/utils/turn-labels';
+import { launchSettingsFromResponse } from '../../src/utils/turns';
+import {
+  formatTurnLaunchLabels,
+  formatTurnModelLabel,
+  formatTurnModelWarning,
+  modelsLookTheSame,
+  parseModelHint,
+  turnLaunchLabels,
+  turnModelMismatchWarning,
+  turnRanNoAgent,
+} from '../../src/utils/turn-labels';
 import { extractModelId } from '../../src/agent/claude-code';
 import { protocolDir as getProtocolDir } from '../../src/protocol';
 import type { CompletedResponse } from '../../src/protocol';
-import { getWorktreePathForRef, taskRef } from '../../src/cli/helpers';
+import { getWorktreePathForRef, taskRef } from '../../src/task/identity';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 import type { Turn } from '../../src/types';
 
@@ -185,33 +201,20 @@ describe('launchSettingsFromResponse', () => {
   });
 });
 
-describe('findStickyModel', () => {
-  const turn = (over: Partial<Turn>): Turn => ({
-    id: 't', session_id: 's', sequence: 1, role: 'human', content: 'x', timestamp: 0, ...over,
-  } as Turn);
+// REMOVED (fix-unblock-sticky-model): `describe('findStickyModel')` — the cases
+// that pinned how a launch inherited a model by scanning turn history. They
+// asserted the shape of a resolution rung that no longer exists, so they could
+// not be kept as they were.
+//
+// Nothing they protected went uncovered. The same-agent guard moved to
+// test/unit/agent-switch.test.ts (a foreign agent's turn must not outrank the
+// re-resolved task.model). The broader rule is INVARIANT 2 above, enforced more
+// strictly than the deleted cases enforced it — they permitted the scan as long
+// as it read same-agent request turns, and that narrower rule is what let a
+// stale model outrank `lazy edit --model`. turn-launch-identity.test.ts covers
+// the replacement, including a source scan asserting no launch path resolves
+// agent/model/effort any other way.
 
-  test('returns the most recent request-side model', () => {
-    expect(findStickyModel([
-      turn({ sequence: 1, role: 'human', model: 'sonnet' }),
-      turn({ sequence: 2, role: 'human', model: 'opus' }),
-    ])).toBe('opus');
-  });
-
-  // INVARIANT 2 (sticky-model-is-request-side): agent turns record what RAN,
-  // including a concrete dated id. If the sticky scan read them, one turn's
-  // snapshot would pin every future launch to a model the human never chose.
-  test('skips agent turns even though they now carry a model', () => {
-    expect(findStickyModel([
-      turn({ sequence: 1, role: 'human', model: 'opus' }),
-      turn({ sequence: 2, role: 'agent', model: 'opus', model_id: 'claude-opus-4-6-20260101' }),
-    ])).toBe('opus');
-  });
-
-  test('returns undefined when no request-side turn recorded a model', () => {
-    expect(findStickyModel([turn({ role: 'agent', model: 'opus' })])).toBeUndefined();
-    expect(findStickyModel([])).toBeUndefined();
-  });
-});
 
 describe('turn launch labels: storage round-trip', () => {
   let env: Env;
@@ -401,11 +404,15 @@ describe('turn launch labels: rendering', () => {
       .toBe('agent: cursor · model: opus · effort: high');
   });
 
-  test('folds a differing concrete model_id into the model label', () => {
+  test('folds a differing concrete model_id into the model label as requested → actual', () => {
     expect(turnLaunchLabels(turn({ agent: 'claude-code', model: 'opus', model_id: 'claude-opus-4-6-20260101', effort: 'low' })))
-      .toEqual(['agent: claude-code', 'model: opus (claude-opus-4-6-20260101)', 'effort: low']);
+      .toEqual(['agent: claude-code', 'model: opus → claude-opus-4-6-20260101', 'effort: low']);
     // Nothing to add when the agent reported back the alias it was given.
     expect(turnLaunchLabels(turn({ model: 'opus', model_id: 'opus' }))[1]).toBe('model: opus');
+    // A dated snapshot of the same id is an obvious equality, not a redirect.
+    expect(turnLaunchLabels(turn({
+      model: 'claude-opus-4-5', model_id: 'claude-opus-4-5-20251101',
+    }))[1]).toBe('model: claude-opus-4-5');
   });
 
   // INVARIANT 5 (absent-renders-as-unknown): a turn that recorded no agent
@@ -475,5 +482,51 @@ describe('turn launch labels: rendering', () => {
   test('falls back to the concrete model_id when no alias was recorded', () => {
     expect(turnLaunchLabels(turn({ model_id: 'claude-opus-4-6-20260101' }))[1])
       .toBe('model: claude-opus-4-6-20260101');
+  });
+});
+
+describe('requested → actual model label', () => {
+  test('modelsLookTheSame is exact match, punctuation, or hyphen-bounded prefix', () => {
+    expect(modelsLookTheSame('opus', 'opus')).toBe(true);
+    expect(modelsLookTheSame('claude-opus-4.5', 'claude-opus-4-5')).toBe(true);
+    expect(modelsLookTheSame('claude-opus-4-5', 'claude-opus-4-5-20251101')).toBe(true);
+    // A short alias is NOT a prefix of the vendor-qualified id — that pair
+    // must stay visible as requested → actual.
+    expect(modelsLookTheSame('opus', 'claude-opus-4-5-20251101')).toBe(false);
+    expect(modelsLookTheSame('opus', 'claude-sonnet-4-5')).toBe(false);
+  });
+
+  test('formatTurnModelLabel uses the arrow only when they do not look the same', () => {
+    expect(formatTurnModelLabel('opus', 'opus')).toBe('opus');
+    expect(formatTurnModelLabel('claude-opus-4-5', 'claude-opus-4-5-20251101')).toBe('claude-opus-4-5');
+    expect(formatTurnModelLabel('opus', 'claude-opus-4-5-20251101')).toBe('opus → claude-opus-4-5-20251101');
+    expect(formatTurnModelLabel('opus', undefined)).toBe('opus');
+    expect(formatTurnModelLabel(undefined, 'claude-opus-4-5-20251101')).toBe('claude-opus-4-5-20251101');
+  });
+
+  test('parseModelHint pulls family and version without a catalog', () => {
+    expect(parseModelHint('opus')).toEqual({ family: 'opus' });
+    expect(parseModelHint('claude-opus-4-5-20251101')).toEqual({ family: 'opus', version: [4, 5] });
+    expect(parseModelHint('claude-opus-5')).toEqual({ family: 'opus', version: [5] });
+    expect(parseModelHint('grok-4.6')).toEqual({ family: 'grok', version: [4, 6] });
+    expect(parseModelHint('gpt-5')).toEqual({ family: 'gpt', version: [5] });
+    expect(parseModelHint('auto')).toEqual({});
+  });
+
+  test('warns on a different family or an older version', () => {
+    expect(turnModelMismatchWarning('opus', 'claude-sonnet-4-5'))
+      .toBe('actual model claude-sonnet-4-5 is a different family than requested opus');
+    expect(turnModelMismatchWarning('claude-opus-5', 'claude-opus-4-5-20251101'))
+      .toBe('actual model claude-opus-4-5-20251101 is older than requested claude-opus-5');
+    // Short alias vs older snapshot: only when the project default names a newer version.
+    expect(turnModelMismatchWarning('opus', 'claude-opus-4-5-20251101')).toBeUndefined();
+    expect(turnModelMismatchWarning('opus', 'claude-opus-4-5-20251101', 'claude-opus-5'))
+      .toBe('actual model claude-opus-4-5-20251101 is older than requested opus suggests (default claude-opus-5)');
+    // Same family, actual is not older than the default — no warning.
+    expect(turnModelMismatchWarning('opus', 'claude-opus-5', 'claude-opus-5')).toBeUndefined();
+    // Cursor picking for itself is never a mismatch.
+    expect(turnModelMismatchWarning('auto', 'claude-opus-4-5')).toBeUndefined();
+    expect(formatTurnModelWarning({ model: 'opus', model_id: 'claude-sonnet-4-5' }))
+      .toBe('actual model claude-sonnet-4-5 is a different family than requested opus');
   });
 });

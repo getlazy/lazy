@@ -1,46 +1,45 @@
 /**
- * Daemon HTTP server — dual-bind: unix socket + TCP port.
+ * Daemon HTTP server — a single TCP listener is the daemon's ONLY transport.
  *
- * The daemon binds to two listeners:
- *   1. Unix socket (for CLI/agent communication) — requires bearer token auth
- *   2. TCP port (for web browser access) — dashboard requires no auth; /mcp and
- *      /rpc require bearer token. Binds to loopback (127.0.0.1) by default;
- *      remote access is opt-in via [server] bind in lazy.toml.
+ * The daemon binds one TCP port (loopback 127.0.0.1 by default; remote access
+ * is opt-in via [server] bind in lazy.toml — see daemon-bind-localhost). The
+ * CLI, agents in containers, the builder, and the browser all reach the daemon
+ * on this port. There is deliberately no unix socket: it was a second code path
+ * that made Docker and Windows special cases, and everything it gated by
+ * filesystem permissions is gated here by the bearer token instead
+ * (drop-unix-socket).
  *
- * Unix socket endpoints:
- *   GET  /daemon/status          — health check / status endpoint
- *   POST /daemon/shutdown        — graceful shutdown
- *   POST /rpc/{command}          — CLI command pass-through
- *   POST /mcp/:taskId/:toolName  — MCP tool execution (agents in containers)
- *
- * TCP port endpoints (web dashboard):
- *   /             — Dashboard
- *   /tasks        — Task list
- *   /tasks/:id    — Task detail
- *   /api/*        — JSON API
- *   /search       — Full-text search
- *   /daemon/status — Health check (also available on TCP for convenience)
- *   /rpc/*         — RPC (requires bearer token, same as unix socket)
- *
- * Authentication: Bearer token in Authorization header (required for unix
- * socket, required for /rpc/* on TCP, not required for web dashboard routes).
+ * Endpoints:
+ *   GET  /daemon/status          — health check (no auth; liveness probe)
+ *   POST /daemon/shutdown        — graceful shutdown (shared daemon token)
+ *   POST /rpc/{command}          — CLI command pass-through (shared daemon token)
+ *   POST /mcp/:taskId/:toolName  — MCP tool execution (per-identity MCP token,
+ *                                  never the shared token — see mcp-routes.ts)
+ *   everything else              — web dashboard (no auth, read-only rendering;
+ *                                  mutations go through /rpc//mcp handlers)
  */
 
 import { randomUUID } from 'crypto';
-import { mkdirSync, existsSync, unlinkSync } from 'fs';
-import { mkdir, unlink, writeFile } from 'fs/promises';
-import { dirname, join } from 'path';
-import { getDaemonDir, getSocketPath, getStartupErrorPath } from './paths';
-import { writePid, generateToken, readToken, readWebPort, writeWebPort, cleanupOwnDaemonFiles, acquireDaemonLock, releaseDaemonLock, type AutoReactBudgetEntry } from './lifecycle';
+import { mkdirSync } from 'fs';
+import { mkdir, writeFile } from 'fs/promises';
+import { join } from 'path';
+import { getDaemonDir, getStartupErrorPath } from './paths';
+import { writePid, generateToken, readToken, readWebPort, writeWebPort, writeWebHost, cleanupOwnDaemonFiles, acquireDaemonLock, releaseDaemonLock, SIGNAL_SHUTDOWN_BUDGET_MS, SHUTDOWN_STOP_GRACE_SECONDS, type AutoReactBudgetEntry } from './lifecycle';
 import { startDaemonStateFileWatch } from './state-files';
 import { writeDaemonRoot } from './registry';
 import { startTestParentWatch, TEST_PARENT_PID_ENV } from './test-parent-watch';
+import { installDaemonProcessGuards } from './process-guards';
+import { readProjectInstanceId } from './project-instance';
 import { assertDaemonCredentials } from './credential-gate';
-import { handleRpc, handleBuilderStorageCall, openProjectStorage, initDaemonStorage, getOrCreateStorage, closeAllStorage } from './rpc-handlers';
+import { assertStoredCredentialsReachedEnv, hydrateCredentialEnv } from '../credentials/hydrate';
+import { handleRpc, handleBuilderStorageCall, handleGetBuilderLaunchEnv, handleGetAgentLaunchEnv, openProjectStorage, initDaemonStorage, getOrCreateStorage, closeAllStorage } from './rpc-handlers';
 import { lookupMcpIdentity } from './mcp-tokens';
 import { initTracing, shutdownTracing } from '../tracing';
 import { withRequestSpan } from './request-span';
 import { authorizeMcpCall, handleMcpToolCall, httpStatusForError, parseMcpToolCallBody } from './mcp-routes';
+import { resolveRpcActor, rpcAuthErrorMessage, describeActor } from './rpc-auth';
+import type { ActorIdentity } from './actor-tokens';
+import { lookupDaemonTokenLabel } from './actor-tokens';
 import { acceptRemedyOf } from '../types';
 
 /**
@@ -60,41 +59,77 @@ import { readJsonBody, readJsonObjectBody } from './http-body';
 import {
   clientAcceptsHeartbeat,
   heartbeatEnvelopeResponse,
-  DAEMON_IDLE_TIMEOUT_S,
   type EnvelopeResult,
 } from './heartbeat';
+import {
+  eventStreamResponse,
+  parseLastEventId,
+  subscriberCount,
+  closeAllEventStreams,
+  startDaemonHealthEvents,
+  MAX_EVENT_SUBSCRIBERS,
+} from './event-feed';
 import type { ProgressEmitter } from './progress';
-import { reconcileTasks } from '../utils/reconcile';
+import { reconcileTasks, interruptForDaemonStop } from '../utils/reconcile';
 import {
   reapPreviousGenerationChildren,
   snapshotPreviousGenerationChildren,
   type PreviousGenerationSnapshot,
 } from './restart-reaper';
 import { createRunner } from '../runner';
+import { indexRunsByName, type OwnedRuns } from '../runner/run-ownership';
+import type { Storage } from '../storage/interface';
 import { logger, LogLevel } from '../utils/logger';
 import { markLoggedToFile } from '../utils/logged-error';
 import { createWebRequestHandler, tryBindTcpPort } from '../server';
+import { createShellUpgrader } from '../server/shell-ws';
+import { createWatchUpgrader, createRpcWatchUpgrader } from '../server/watch-ws';
+import { revokeLeftoverMemberTerminalCredentials } from '../server/member-exec-credential';
+import { sweepLeftoverMemberEnvironments } from './member-leftovers';
+import { createActionRunUpgrader } from '../server/action-ws';
+import { createSessionAttachUpgrader } from '../server/session-attach-ws';
+import { multiMemberDaemon } from './session-attach';
+import { composeUpgraders } from '../server/ws';
+import { createServeProxy, createServeProxyUpgrader, type ServeProxyDeps } from '../server/serve-proxy';
+import { setDashboardAuthority } from '../serve/subdomain';
 import { createReviewActions } from './review-service';
-import { formatDashboardUrl } from './dashboard-url';
+import { createReviewSessionActions } from './review-session-service';
+import { createMessageActions } from './message-service';
+import { createMemoryActions } from './memory-service';
+import { createDoctorActions } from './doctor-service';
+import { createServeActions } from './serve-service';
+import { importStartServicesCmdFromConfig } from '../serve/start-cmd';
+import { createTaskEditActions } from './task-edit-service';
+import { dashboardHostFor, resolveDashboardUrl } from './dashboard-url';
+import { isManagedMode } from '../config/managed';
+import { guardDashboardRequest, serveDashboardRequest } from './dashboard-auth';
 import { getLogPath } from './paths';
 import { loadConfig, resolveConfigPath } from '../config/loader';
 import type { RunnerType } from '../config/types';
 import { DEFAULT_WEB_PORT, DEFAULT_SERVER_BIND, MAX_PORT_ATTEMPTS } from '../config/constants';
 import { buildProxyCredentialDeps } from '../proxy/credential-deps';
-import { roleUpstreamMap } from '../proxy/role-upstreams';
+import { agentUpstreamMap } from '../proxy/agent-upstreams';
+import { ProxyToolStatsRecorder } from '../proxy/tool-stats';
 import {
   createProxyServer,
+  type ProxyServer,
+  loadProxyRequestPlugins,
+  PLUGIN_DIR_RELATIVE,
   ProxyAuditLog,
   auditLogPath,
+  auditLogDir,
   pruneLegacyAuditLog,
   formatSize,
   AUDIT_SEGMENT_MAX_BYTES,
   AUDIT_RETAINED_SEGMENTS,
 } from '../proxy';
-import { resolveDaemonBindHosts } from './bind-hosts';
+import { teeTaskProgress } from './task-progress';
+import { createSessionCredentialResolver } from './turn-credentials';
+import { resolveDaemonBindHosts, resolveProxyBindHosts } from './bind-hosts';
 import { pushBranchAfterStateChange, retryFailedPushes } from './push';
 import { setDaemonContext, setDaemonProxyPort } from './context';
 import {
+  autoUnblockTask,
   createReconcileEventState,
   detectAndDeliverEvents,
   deliverStateChangeEvents,
@@ -103,41 +138,52 @@ import {
   type StateChange,
 } from './auto-deliver';
 import { runAutoReact } from './auto-react';
+import { runAutoReviewCatchup } from './auto-review';
 import { processAutoResumeQueue } from './auto-resume-queue';
+import { describeUsagePauseState, processUsagePauseHolds } from './usage-pause';
+import { flushUsageReadingWrites, installUsageReadingStore } from './usage-readings';
+import { resumeHeldReviewFix } from './task-lifecycle';
 import { closeSignalDb, initSignalDb } from './signals';
 import { startSyncRetryLoop } from './sync-retry';
 import { sweepConversations, createSweepCursor } from '../import/capture-sweep';
+import { findTerminalTaskWorktrees } from '../doctor/findings';
+import { cleanupWorktree } from '../task/cleanup';
+import { checkLock } from '../utils/lock';
 import { createDriver } from '../remote';
 import { runSync, debugSyncLogger } from './remote-sync';
 import { isOfflineMode } from '../utils/offline';
 import { parentTaskIdOf } from '../task-target';
+import {
+  daemonHealthRecorder,
+  forgetDaemonHealth,
+  runRecordedSweep,
+  RECONCILE_LOOP,
+  REMOTE_SYNC_LOOP,
+} from './health-registry';
 
 export interface DaemonServerOptions {
   /** Project root this daemon serves. Required — the daemon is per-project. */
   projectRoot: string;
   /** Use an existing token instead of generating a new one. For tests. */
   token?: string;
-  /** Override socket path. For tests. */
-  socketPath?: string;
   /** Override reconcile interval in seconds. For tests. */
   reconcileIntervalSeconds?: number;
-  /** TCP port for web dashboard. 0 disables TCP binding. */
+  /** TCP port to bind. 0 means an OS-assigned ephemeral port (tests). */
   webPort?: number;
   /** Maximum port attempts for auto-increment. */
   maxPortAttempts?: number;
-  /** Disable web dashboard TCP binding entirely. For tests. */
-  noWeb?: boolean;
   /**
-   * Test-only: force web binding even when LAZY_TEST=1.
-   * Used exclusively to exercise the web-bind failure path in tests.
+   * Test-only: run the FULL production web-bind path even when LAZY_TEST=1
+   * (config-driven port/bind resolution, port persistence, MCP config refresh,
+   * bridge binds). Without it, a LAZY_TEST daemon binds a minimal ephemeral
+   * loopback listener instead — reachable, but with none of the production
+   * side effects, so parallel suites never contend on the shared port window.
    * Not part of the daemon's public contract.
    */
   _forceBindWebInTest?: boolean;
 }
 
 export interface RunningDaemon {
-  server: ReturnType<typeof Bun.serve>;
-  socketPath: string;
   token: string;
   startedAt: number;
   /** The single project root this daemon serves. */
@@ -145,18 +191,20 @@ export interface RunningDaemon {
   /** Cache of task short IDs, populated by the reconcile loop.
    *  Used by stop() to filter supervisors to only this project's tasks. */
   knownTaskIds: Set<string>;
-  /** TCP web server instance (primary bind), if bound. */
-  webServer?: ReturnType<typeof Bun.serve>;
+  /** The daemon's TCP listener (primary bind) — its only transport. */
+  webServer: ReturnType<typeof Bun.serve>;
   /**
    * Additional TCP listeners on the same port for other interfaces (e.g. the
    * docker bridge gateway on native Linux so containers can reach the daemon).
    * Tracked separately so stop() tears them all down.
    */
   extraWebServers?: ReturnType<typeof Bun.serve>[];
-  /** TCP port the web dashboard is listening on, if bound. */
-  webPort?: number;
-  /** Interface the web dashboard bound to (= config.server.bind), if bound. */
-  bindHost?: string;
+  /** TCP port the daemon is listening on. */
+  webPort: number;
+  /** Interface the listener bound to (= config.server.bind). */
+  bindHost: string;
+  /** Public dashboard origin, including a configured reverse proxy. */
+  dashboardUrl: string;
   /** Anthropic passthrough proxy server — always started; undefined only if startup failed. */
   proxyServer?: ReturnType<typeof Bun.serve>;
   /**
@@ -183,18 +231,31 @@ function bearerToken(req: Request): string | null {
  * Record a hard startup failure and return the Error the caller must throw
  * (`throw await recordStartupFailure(...)` — returning rather than throwing
  * keeps the abort visible to the compiler's control-flow analysis at every call
- * site). Two steps, in this order:
+ * site). Three steps, in this order, and the order is the load-bearing part:
  *
- *  1. logger.error FIRST — the logger appends (O_APPEND), so the message lands
- *     at the END of daemon.log, after the earlier startup lines. This is what
- *     `tail daemon.log` shows.
- *  2. Write the startup-error marker so the parent process (the CLI that
- *     spawned this detached daemon via startDaemonBackground) can surface the
- *     reason in the user's terminal after its readiness poll times out, instead
- *     of a generic "Daemon did not start within 5 seconds". The parent cleared
- *     any stale marker before spawning, so its presence means "this child wrote
- *     it". Best-effort: the file-backed log remains the source of truth if the
- *     marker write fails.
+ *  1. Write the startup-error marker FIRST — before any teardown, so it is on
+ *     disk even if a teardown step never finishes. It is the channel that
+ *     reaches a human: the parent process (the CLI that spawned this detached
+ *     daemon via startDaemonBackground) reads it when its readiness poll times
+ *     out and prints the reason instead of a generic "Daemon did not start
+ *     within 5 seconds", and `lazy daemon status` prints it once the daemon is
+ *     down. The parent cleared any stale marker before spawning, so its
+ *     presence means "this child wrote it". Best-effort: the file-backed log
+ *     remains the source of truth if the marker write fails.
+ *  2. Run `teardown`, when the caller has something to tear down — a failure
+ *     late in startup must never leave half a daemon running. The earliest
+ *     preconditions (config, credentials) pass none: nothing exists yet.
+ *     Teardown logs as it goes: storage close at debug level, a warn if the
+ *     store refuses to close, per-step failures at debug level.
+ *  3. logger.error LAST, exactly once. The logger appends (O_APPEND), so the
+ *     message lands at the very END of daemon.log — which is the point: an
+ *     operator debugging a daemon that would not start runs `tail daemon.log`,
+ *     and the last thing there has to be why it died. Logging before teardown
+ *     (what this used to do) left the reason eleven lines up, buried under
+ *     teardown's own storage-close chatter, so a default ten-line tail showed
+ *     remediation bullets and debug noise but never the failure. Exactly one
+ *     copy: `test/e2e/daemon.test.ts` pins that too, because this message once
+ *     landed in the log three times over.
  *
  * The returned Error is marked already-logged so the top-level CLI catch in
  * src/index.ts doesn't append a second untimestamped copy (in background mode
@@ -206,14 +267,19 @@ function bearerToken(req: Request): string | null {
  * refusal whose marker silently failed to write is a refusal the user never
  * sees.
  */
-async function recordStartupFailure(projectRoot: string, errorMessage: string): Promise<Error> {
-  logger.error(errorMessage);
+async function recordStartupFailure(
+  projectRoot: string,
+  errorMessage: string,
+  teardown?: () => Promise<void>,
+): Promise<Error> {
   try {
     await mkdir(getDaemonDir(projectRoot), { recursive: true });
     await writeFile(getStartupErrorPath(projectRoot), errorMessage, { mode: 0o644 });
   } catch (markerErr) {
     logger.warn(`Failed to write startup-error marker: ${markerErr instanceof Error ? markerErr.message : String(markerErr)}`);
   }
+  if (teardown) await teardown();
+  logger.error(errorMessage);
   return markLoggedToFile(new Error(errorMessage));
 }
 
@@ -237,17 +303,17 @@ async function recordStartupFailure(projectRoot: string, errorMessage: string): 
  * parse error with no indication that it had stopped their daemon. Adding a
  * startup step that reads config BEFORE this call re-opens exactly that hole.
  *
- * Searching from projectRoot explicitly: loadConfig otherwise defaults its
- * search to process.cwd(), which for a detached daemon is whatever directory
- * the CLI that spawned it happened to be in (and for an in-process test daemon
- * is the test runner's cwd).
+ * The file read is always the PROJECT ROOT's: loadConfig takes no starting
+ * directory at all (see "A task worktree's lazy.toml has no authority" in
+ * src/config/loader.ts), so a detached daemon cannot be handed a different
+ * config by whatever directory the CLI that spawned it happened to be in.
  */
 async function loadDaemonConfigOrFail(projectRoot: string) {
   try {
-    return await loadConfig(projectRoot, { cwd: projectRoot });
+    return await loadConfig(projectRoot);
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
-    const configPath = await resolveConfigPath(projectRoot, projectRoot);
+    const configPath = resolveConfigPath(projectRoot);
     throw await recordStartupFailure(
       projectRoot,
       `Daemon failed to load ${configPath}: ${detail}\n` +
@@ -267,15 +333,30 @@ async function loadDaemonConfigOrFail(projectRoot: string) {
 }
 
 /**
- * Start the daemon HTTP server on a unix socket, with optional TCP web server.
+ * Start the daemon HTTP server on its TCP port — the daemon's only transport.
  *
- * Creates PID file, generates bearer token, binds to unix socket.
- * If web dashboard is enabled (default), also binds to a TCP port.
- * Returns the running server handle for lifecycle management.
+ * Creates PID file, generates bearer token, binds the TCP listener (which
+ * serves daemon routes AND the web dashboard). Returns the running server
+ * handle for lifecycle management.
  */
 export async function startDaemonServer(options: DaemonServerOptions): Promise<RunningDaemon> {
   // Mark this process as the daemon to prevent recursive RPC calls
   process.env.LAZY_IS_DAEMON = '1';
+
+  // No git the daemon runs may ever open a terminal prompt.
+  //
+  // The daemon is a BACKGROUND process, and it is detached but not setsid — it
+  // keeps the controlling terminal of whoever started it. Its sync loop runs
+  // `git fetch` every 60 seconds, and git asks for credentials by opening
+  // /dev/tty directly, not by reading stdin (which is 'ignore' here). So a
+  // project whose remote needs credentials the machine does not have turns into
+  // a `Username for 'https://...':` prompt on somebody's terminal, once a
+  // minute, forever — with no indication of which process is asking.
+  //
+  // Set on the process rather than per-call so it also covers the git run by
+  // anything the daemon spawns. Env still wins if an operator deliberately
+  // exported GIT_TERMINAL_PROMPT=1 to debug an auth problem.
+  process.env.GIT_TERMINAL_PROMPT ??= '0';
 
   const projectRoot = options.projectRoot;
 
@@ -310,6 +391,57 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // leaves nothing to clean up.
   const startupConfig = await loadDaemonConfigOrFail(projectRoot);
 
+  // Say which lazy this is, in the log, at the top, every time.
+  //
+  // A long-lived daemon serves whatever code it was started with, and the
+  // failure that produced this line was invisible precisely because nothing
+  // anywhere stated the answer: a daemon built from one ref silently did not
+  // render a feature that existed only on another, and it read as a lost
+  // feature rather than a version mismatch. Fire-and-forget so a slow
+  // filesystem cannot delay the listen; the fingerprint is ~90ms of reading.
+  void (async () => {
+    try {
+      const { getSourceIdentity } = await import('../utils/source-id');
+      const identity = await getSourceIdentity();
+      // Dynamic, like the status route's: the generated version file may not
+      // exist in a test tree, and a missing version must not cost the log line.
+      const version = await import('../version').then(m => m.VERSION).catch(() => 'unknown');
+      logger.info(
+        `Running lazy ${version} — source ${identity.id} (${identity.kind})` +
+        `${identity.checkoutPath ? ` from ${identity.checkoutPath}` : ''}`,
+      );
+    } catch (err) {
+      logger.warn(`Could not determine which lazy source this daemon is running: ${err instanceof Error ? err.message : err}`);
+    }
+  })();
+
+  // Load any stored credential into this process's environment BEFORE the gate.
+  // Everything downstream (getAuthEnvVars, the proxy, container env inheritance)
+  // reads env vars, so this is the one place the store has to be consulted —
+  // and doing it before the gate is what lets a daemon start from a shell that
+  // has no token exported (the `lazy upgrade` abort this task exists to fix).
+  // Env always wins; see hydrateCredentialEnv.
+  //
+  // Skipped under LAZY_TEST=1 for the same reason the gate below is: suites
+  // must not depend on what the developer's machine happens to have stored.
+  let hydrationError: unknown;
+  if (process.env.LAZY_TEST !== '1') {
+    try {
+      await hydrateCredentialEnv(projectRoot);
+    } catch (err) {
+      // Held, not swallowed. The gate below CANNOT catch this on its own: it
+      // answers from the same non-secret index whose disagreement with the
+      // backend is what made hydration throw, so it would pass and bring up a
+      // daemon with an empty environment. assertStoredCredentialsReachedEnv,
+      // run with the gate, is what turns that into a refusal — and this error
+      // is the only thing that says why, so it is carried there.
+      hydrationError = err;
+      logger.error(
+        `Failed to load stored credentials: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   // INVARIANT: a daemon never exists without a model credential.
   //
   // This is the AUTHORITATIVE enforcement point — the callers (auto-start,
@@ -335,6 +467,11 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // subprocess with LAZY_TEST=''.
   if (process.env.LAZY_TEST !== '1') {
     try {
+      // Order matters. The store's promise is checked FIRST, because a store
+      // that said "stored" and delivered nothing is a strictly more specific
+      // (and more actionable) failure than "no credential anywhere" — and it is
+      // a failure the gate itself is structurally unable to see.
+      await assertStoredCredentialsReachedEnv(projectRoot, hydrationError);
       await assertDaemonCredentials(projectRoot);
     } catch (err) {
       // The marker recordStartupFailure writes is what carries a detached
@@ -351,6 +488,10 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // doesn't need a parameter — the daemon is single-project.
   initDaemonStorage(projectRoot);
 
+  // [usage_pause] readings are written through to Storage and seeded from it,
+  // so a pause survives a restart after the audit log rotated its reading away.
+  installUsageReadingStore(getOrCreateStorage);
+
   // Initialize request tracing (always on). Finished spans are persisted
   // through the daemon's own Storage as JSONL — no collector.
   initTracing('daemon', async (spans) => {
@@ -361,6 +502,16 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // Initialize signal DB with the project root so signals are stored
   // per-project in .lazy/signals.db instead of globally.
   initSignalDb(projectRoot);
+
+  // File a system message if the daemon version changed since the last start
+  // (the built-in system-messages producer). Fire-and-forget: never blocks or
+  // fails the launch — the helper logs its own errors.
+  void (async () => {
+    const { maybePostUpgradeNotice } = await import('./upgrade-notice');
+    await maybePostUpgradeNotice(projectRoot, () => getOrCreateStorage());
+  })().catch(err => {
+    logger.error(`Upgrade-notice check failed: ${err instanceof Error ? err.message : String(err)}`);
+  });
 
   // Set daemon cwd to the project root so all relative paths resolve correctly.
   // This eliminates the need for call sites to pass { cwd: projectRoot } everywhere.
@@ -385,13 +536,22 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     }
   }
 
-  const socketPath = options.socketPath ?? getSocketPath(projectRoot);
   const startedAt = Date.now();
+  // A fresh record for `lazy daemon health`: an in-process restart must not
+  // inherit the previous daemon's ticks as its own.
+  forgetDaemonHealth(projectRoot);
+  daemonHealthRecorder(projectRoot).daemonStarted(startedAt);
   // Identity of THIS daemon process, minted once per start and never reused.
   // Children hold addresses this process issued (above all the OS-assigned
   // proxy port), so "is the daemon answering me the same one that launched me"
   // is the question they must be able to ask — see src/daemon/generation.ts.
   const instanceId = randomUUID();
+  // Identity of the PROJECT this daemon was started for, seeded by whoever
+  // started it (a fleet supervisor) rather than minted here. Read once, at
+  // startup, so a malformed value fails the start instead of every later probe
+  // — see src/daemon/project-instance.ts for why per-process identity and
+  // projectRoot both fail to answer "is this daemon mine".
+  const projectInstanceId = readProjectInstanceId();
   let stopped = false;
   let shutdownTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -408,6 +568,39 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // below); the reconcile loop reads it through a getter because the loop is
   // created first and the snapshot has to be taken as late as possible.
   let previousGenerationSnapshot: PreviousGenerationSnapshot | null = null;
+
+  // Member terminals (Teams Shell/Pair/Chat) run in containers of their own,
+  // each holding a credential minted for it; both are removed by the daemon
+  // when the member's session ends, which a restart cuts short. No terminal
+  // survives a restart, so every one left is removed here — the containers
+  // (and whatever the member left running in them) first, then their
+  // credentials — before the reconcile loop can launch a turn
+  // (src/daemon/member-container.ts, src/server/member-exec-credential.ts).
+  // A runtime that is not up yet does not lose anything: the sweep holds every
+  // task a leftover home names and retries until it succeeds
+  // (./member-leftovers.ts).
+  try {
+    const runnerType = (await loadConfig(projectRoot)).runner.type;
+    if (runnerType === 'docker' || runnerType === 'podman') {
+      await sweepLeftoverMemberEnvironments(projectRoot, runnerType, await getOrCreateStorage());
+    }
+  } catch (err) {
+    logger.error(
+      `Could not remove member terminal environments left by the previous daemon: ${err instanceof Error ? err.message : String(err)}. ` +
+      `Their credentials are still revoked below; run \`lazy doctor\` and restart the daemon.`,
+    );
+  }
+  try {
+    const leftover = await revokeLeftoverMemberTerminalCredentials(projectRoot);
+    if (leftover.bindings + leftover.grants > 0) {
+      logger.info(`Revoked ${leftover.bindings} member-terminal binding(s) and ${leftover.grants} grant(s) left by the previous daemon.`);
+    }
+  } catch (err) {
+    logger.error(
+      `Could not revoke member-terminal credentials left by the previous daemon: ${err instanceof Error ? err.message : String(err)}. ` +
+      `A placeholder a member could read may still resolve; run \`lazy doctor\` and restart the daemon.`,
+    );
+  }
 
   // Start reconcile loop
   const reconcileInterval = options.reconcileIntervalSeconds ?? 5;
@@ -428,8 +621,16 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // `claude` in the repo — plus a backstop for the in-container builder).
   const stopCaptureLoop = startConversationCaptureLoop(projectRoot);
 
+  // Reclaim worktrees left behind on tasks that finished (accepted/closed/
+  // rejected) but whose cleanup step never ran — see startTerminalWorktreeCleanupLoop.
+  const stopWorktreeCleanupLoop = startTerminalWorktreeCleanupLoop(projectRoot);
+
+  // Periodic `daemon.health` tick for SSE subscribers. The timer no-ops while
+  // nobody is subscribed, so it costs nothing on a daemon with no listener.
+  let stopHealthEvents: (() => void) | null = startDaemonHealthEvents();
+
   // Ensure daemon directory exists
-  mkdirSync(dirname(socketPath), { recursive: true });
+  mkdirSync(getDaemonDir(projectRoot), { recursive: true });
 
   // Singleton enforcement via flock(2).
   // The daemon ALWAYS acquires its own lock, regardless of how it was started
@@ -451,11 +652,6 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     }
   }
 
-  // Clean up stale socket file if it exists (process is dead or doesn't exist)
-  if (existsSync(socketPath)) {
-    try { unlinkSync(socketPath); } catch { /* ignore */ }
-  }
-
   // Write PID file
   writePid(projectRoot, process.pid);
 
@@ -469,6 +665,19 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // running containers/builders. Only generate a new token on first start.
   const existingToken = readToken(projectRoot);
   const token = options.token ?? existingToken ?? generateToken(projectRoot);
+  const sessionAttachUpgrader = () => createSessionAttachUpgrader({
+    getStorage: () => getOrCreateStorage(),
+    root: projectRoot,
+    authenticate: (req) => resolveRpcActor(projectRoot, token, req.headers.get('authorization')),
+    multiMember: () => multiMemberDaemon(projectRoot),
+  });
+  // Watch on the same /rpc gate, for the Teams relay (managed mode 404s the
+  // dashboard's own watch route).
+  const rpcWatchUpgrader = () => createRpcWatchUpgrader({
+    getStorage: () => getOrCreateStorage(),
+    root: projectRoot,
+    authenticate: (req) => resolveRpcActor(projectRoot, token, req.headers.get('authorization')),
+  });
 
   // Mutable web port — set after TCP binding, read by status endpoint
   let boundWebPort: number | undefined;
@@ -494,7 +703,29 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   //   POST /rpc/{command}          FRAMED   — `wait` long-polls up to 600s.
   //   POST /builder/storage        FRAMED   — saveConversation of a long builder
   //                                           session is a large write.
+  //   GET  /builder/launch-env     BOUNDED  — same work as the agent one below,
+  //                                           for the builder's own profile.
+  //   GET  /agent/launch-env       BOUNDED  — exhaustively: one token lookup, one
+  //                                           task read, loadConfig, a credential-
+  //                                           store read, and a locked append to
+  //                                           the grant registry. All local file
+  //                                           I/O on small files, no network and
+  //                                           no agent process; the registry lock
+  //                                           is held for a single append. Orders
+  //                                           of magnitude under the timeout, and
+  //                                           its CLIENT gives up first anyway
+  //                                           (see fetchAgentLaunchEnv).
+  //   GET  /rpc/events             STREAMED — see below.
   //   (no match) -> null -> 404    BOUNDED  — a constant JSON body, no I/O.
+  //
+  // STREAMED is a third category, and only this route is in it. It is an SSE
+  // feed that stays open indefinitely by design, so neither FRAMED (the
+  // envelope is NDJSON for a single RPC result) nor BOUNDED (there is no
+  // deadline) applies. It satisfies the same underlying requirement by the same
+  // means as FRAMED: it writes bytes — an SSE comment heartbeat every
+  // SSE_HEARTBEAT_INTERVAL_MS (15s, an 8x margin on the 120s idleTimeout) — so
+  // the connection's idle timer never expires. Do not add a second STREAMED
+  // route without the same guarantee.
   //
   // Dashboard routes are not here: they are served by createWebRequestHandler in
   // src/server/index.ts, which cannot use the envelope (the client is a browser)
@@ -504,7 +735,15 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // plus the dashboard — is wrapped in a request-lifetime span by
   // withRequestSpan at each listener's entry point, so a request reaped
   // mid-flight shows up in `lazy stats timings` as an error rather than as silence.
-  const handleDaemonRequest = async (req: Request, requireAuth: boolean): Promise<Response | null> => {
+  const handleDaemonRequest = async (
+    req: Request,
+    requireAuth: boolean,
+    // The actor the caller's token proves it to be, resolved by the listener
+    // before this handler runs (see resolveRpcActor). Only /rpc/* has one; the
+    // unauthenticated and MCP routes pass none, and RPC handlers fall back to
+    // `{kind:'control'}` for in-process callers that are the daemon itself.
+    rpcActor?: ActorIdentity,
+  ): Promise<Response | null> => {
     const url = new URL(req.url);
 
     // GET /daemon/status — health check (no auth required on TCP)
@@ -547,13 +786,21 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         version = mod.VERSION;
       } catch { /* version file may not exist in tests */ }
 
-      // Build timestamp embedded at compile time (UTC ISO string), or 'dev'
-      // when running from source (bun run ./src/index.ts) where there is no
-      // build step. Falls back gracefully so status never crashes.
+      // Build metadata embedded at compile time (UTC ISO string + git SHA +
+      // dirty flag), or dev defaults when running from source (bun run
+      // ./src/index.ts). Falls back gracefully so status never crashes.
       let buildTime = 'dev';
+      let buildSha = 'dev';
+      let buildDirty = false;
+      let buildBranch = 'dev';
+      let buildSourcePath = 'dev';
       try {
         const mod = await import('../build-info');
         buildTime = mod.BUILD_TIME;
+        buildSha = mod.BUILD_SHA ?? 'dev';
+        buildDirty = mod.BUILD_DIRTY ?? false;
+        buildBranch = mod.BUILD_BRANCH ?? 'dev';
+        buildSourcePath = mod.BUILD_SOURCE_PATH ?? 'dev';
       } catch { /* build-info file may not exist in some contexts */ }
 
       // Auto-react budget: file-based read only (no storage, no lock).
@@ -590,12 +837,28 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         codeSha = getRunningCodeSha();
       } catch { /* code-version module optional; never block status */ }
 
+      // Content identity of the source tree the daemon is RUNNING. Strictly more
+      // than codeSha: it moves with uncommitted edits, and it exists for a
+      // release build with no `.git`. This is what Lazy Teams compares against
+      // the tree it would launch the next daemon from, so a fleet can never
+      // quietly serve old code — see src/utils/source-id.ts.
+      let sourceId: string | null = null;
+      let sourceIdKind: string | null = null;
+      try {
+        const { getSourceIdentity } = await import('../utils/source-id');
+        const identity = await getSourceIdentity();
+        sourceId = identity.id;
+        sourceIdKind = identity.kind;
+      } catch { /* identity is diagnostic; never block the health probe */ }
+
       // Proxy status — so `lazy daemon status` can show where audited traffic
       // flows (the primary way to find the address now that the port is
       // OS-assigned by default). File read only; no storage/lock.
       let proxy: {
         running: boolean;
         bind: string;
+        /** Every address the proxy actually listens on: `bind`, then the container bridge gateway when bound. */
+        binds: string[];
         port: number | null;
         address: string | null;
         upstream: string;
@@ -603,13 +866,14 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         policyEnforce: boolean;
       } | undefined;
       try {
-        const config = await loadConfig(projectRoot, { cwd: projectRoot });
+        const config = await loadConfig(projectRoot);
         // The proxy is always configured — `running` is the only question, and
         // `false` means a degraded daemon, not an operator's choice.
         const port = proxyServer?.port ?? null;
         proxy = {
           running: proxyServer !== undefined,
           bind: config.proxy.bind,
+          binds: proxyServer?.binds ?? [config.proxy.bind],
           port,
           address: port !== null ? `http://${config.proxy.bind}:${port}` : null,
           upstream: config.proxy.upstream,
@@ -634,11 +898,28 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         // No new exposure: the unauthenticated dashboard on this same port
         // already renders this project's data.
         projectRoot,
+        // The identity the fleet supervisor seeded for this project, echoed
+        // verbatim. Omitted when nothing seeded one (every unsupervised daemon),
+        // so its presence is itself the signal that an identity check is
+        // possible. Costs an already-read variable — the health probe's budget
+        // is untouched.
+        ...(projectInstanceId ? { projectInstanceId } : {}),
         buildTime,
+        buildSha,
+        buildDirty,
+        buildBranch,
+        buildSourcePath,
         ...(codeSha ? { codeSha } : {}),
-        socketPath,
+        ...(sourceId ? { sourceId, sourceIdKind } : {}),
         webPort: boundWebPort,
         bindHost: boundBindHost,
+        // string when the dashboard is on; null when managed mode has it off.
+        // Callers must not invent a URL from bindHost+webPort when this is null.
+        dashboardUrl: isManagedMode()
+          ? null
+          : (boundWebPort
+            ? resolveDashboardUrl(boundBindHost, boundWebPort, startupConfig.server.dashboard_url)
+            : null),
         ...(autoReactBudget ? { autoReactBudget } : {}),
         ...(proxy ? { proxy } : {}),
       });
@@ -705,7 +986,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       const mcpStart = Date.now();
       // One source of truth for the outcome, used by both the plain and the
       // heartbeat-framed reply below. A tool call can run for minutes (accept,
-      // sync, a pre-accept turn launch), which is exactly the case Bun.serve's
+      // sync, a wrap-up turn launch), which is exactly the case Bun.serve's
       // idle timer kills — see src/daemon/heartbeat.ts.
       const produce = async (emit?: ProgressEmitter): Promise<EnvelopeResult> => {
         try {
@@ -718,7 +999,13 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
           const args = parseMcpToolCallBody(toolName, body);
           // The token's own task id ('' for the builder surface) — never the
           // caller's claim, which has already been proven to agree with it.
-          const result = await handleMcpToolCall(projectRoot, authorizedTaskId, toolName, args, emit);
+          // The builder surface also carries its token's label, which names a
+          // daemon-owned builder session (and so the member it bills).
+          const token = bearerToken(req);
+          const builderTokenLabel = !authorizedTaskId && token
+            ? await lookupDaemonTokenLabel(projectRoot, token)
+            : null;
+          const result = await handleMcpToolCall(projectRoot, authorizedTaskId, toolName, args, emit, builderTokenLabel);
           const durationMs = Date.now() - mcpStart;
           logger.info(`MCP ${toolName} for task ${taskIdParam.substring(0, 8)} completed in ${durationMs}ms`);
           return { status: 200, body: { result } };
@@ -759,7 +1046,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     // storage. Accept MCP tokens on /rpc/* and the anti-impersonation boundary
     // documented on the /mcp/ route collapses. So capture gets its own surface:
     // per-identity MCP auth like /mcp/*, restricted to a builder-kind token, and
-    // authorized against a four-method allowlist (BUILDER_STORAGE_METHODS).
+    // authorized against a six-method allowlist (BUILDER_STORAGE_METHODS).
     if (url.pathname === '/builder/storage' && req.method === 'POST') {
       const reqProject = req.headers.get('x-lazy-project');
       if (!reqProject) {
@@ -806,6 +1093,107 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       return Response.json(outcome.body, { status: outcome.status });
     }
 
+    // GET /builder/launch-env — fresh auth/proxy env for an in-container builder
+    // relaunching Claude Code after a daemon restart (see src/builder/launch-env.ts).
+    if (url.pathname === '/builder/launch-env' && req.method === 'GET') {
+      const reqProject = req.headers.get('x-lazy-project');
+      if (!reqProject) {
+        return Response.json({ error: 'Missing X-Lazy-Project header' }, { status: 400 });
+      }
+      if (reqProject !== projectRoot) {
+        return Response.json({ error: `Project mismatch: daemon serves ${projectRoot}, request is for ${reqProject}` }, { status: 400 });
+      }
+
+      const token = bearerToken(req);
+      if (!token) {
+        return Response.json({ error: 'Missing Authorization bearer token' }, { status: 401 });
+      }
+
+      try {
+        const body = await handleGetBuilderLaunchEnv(projectRoot, token);
+        return Response.json(body);
+      } catch (err) {
+        const status = httpStatusForError(err);
+        const message = err instanceof Error ? err.message : String(err);
+        const line = `Builder launch-env failed (${status}): ${message}`;
+        if (status >= 500) logger.error(line); else logger.info(line);
+        return Response.json(errorBody(err, message), { status });
+      }
+    }
+
+    // GET /agent/launch-env — fresh auth/proxy env for an in-container TASK
+    // supervisor relaunching its agent on a retry (see
+    // src/supervisor/launch-env.ts). Same shape and same authentication style as
+    // /builder/launch-env, with a task MCP token instead of a builder one.
+    if (url.pathname === '/agent/launch-env' && req.method === 'GET') {
+      const reqProject = req.headers.get('x-lazy-project');
+      if (!reqProject) {
+        return Response.json({ error: 'Missing X-Lazy-Project header' }, { status: 400 });
+      }
+      if (reqProject !== projectRoot) {
+        return Response.json({ error: `Project mismatch: daemon serves ${projectRoot}, request is for ${reqProject}` }, { status: 400 });
+      }
+
+      const token = bearerToken(req);
+      if (!token) {
+        return Response.json({ error: 'Missing Authorization bearer token' }, { status: 401 });
+      }
+
+      try {
+        const body = await handleGetAgentLaunchEnv(projectRoot, token);
+        return Response.json(body);
+      } catch (err) {
+        const status = httpStatusForError(err);
+        const message = err instanceof Error ? err.message : String(err);
+        const line = `Agent launch-env failed (${status}): ${message}`;
+        if (status >= 500) logger.error(line); else logger.info(line);
+        return Response.json(errorBody(err, message), { status });
+      }
+    }
+
+    // GET /rpc/events — SSE event feed (see src/daemon/event-feed.ts)
+    //
+    // Authenticated exactly like any other /rpc/* route: the listener has
+    // already resolved the actor from the Authorization header and refused the
+    // request if it could not. There is deliberately no query-parameter token
+    // path — the subscriber is a server-side listener process that can set
+    // headers, and browsers never talk to a daemon directly
+    // (docs/design/lazy-teams.md §2.3).
+    if (url.pathname === '/rpc/events' && req.method === 'GET') {
+      const reqProject = req.headers.get('x-lazy-project');
+      if (!reqProject) {
+        return Response.json({ error: 'Missing X-Lazy-Project header' }, { status: 400 });
+      }
+      if (reqProject !== projectRoot) {
+        return Response.json(
+          { error: `Project mismatch: daemon serves ${projectRoot}, request is for ${reqProject}` },
+          { status: 400 },
+        );
+      }
+
+      // An explicit query parameter beats the automatic header, so a client
+      // resuming from a cursor it stored itself is never overridden by whatever
+      // the last frame happened to set.
+      const raw = url.searchParams.get('last_event_id') ?? req.headers.get('last-event-id');
+      const lastEventId = parseLastEventId(raw);
+      if (lastEventId === null) {
+        return Response.json(
+          { error: `Invalid Last-Event-ID "${raw}" — expected a non-negative integer` },
+          { status: 400 },
+        );
+      }
+
+      if (subscriberCount() >= MAX_EVENT_SUBSCRIBERS) {
+        return Response.json(
+          { error: `Too many event subscribers (limit ${MAX_EVENT_SUBSCRIBERS})` },
+          { status: 503 },
+        );
+      }
+
+      logger.debug(`Event feed: subscriber connected (last_event_id=${lastEventId})`);
+      return eventStreamResponse({ lastEventId, signal: req.signal });
+    }
+
     // POST /rpc/{command} — CLI command pass-through
     if (url.pathname.startsWith('/rpc/') && req.method === 'POST') {
       const command = url.pathname.slice(5);
@@ -828,7 +1216,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
           // unparsable, or that is not an object of named parameters, is a 400
           // — not a silent `{}` that runs the command with no parameters.
           const params = await readJsonObjectBody(req, `RPC ${command} params`);
-          const rpcResult = await handleRpc(command, projectRoot, params, emit);
+          const rpcResult = await handleRpc(command, projectRoot, params, emit, rpcActor);
           const durationMs = Date.now() - rpcStart;
           logger.debug(`RPC ${command} completed in ${durationMs}ms`);
           // Void methods return undefined — normalize to null for JSON serialization
@@ -860,56 +1248,10 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     return null; // Not a daemon route
   };
 
-  // Unix socket server — all requests require bearer token auth
-  // Bun's default idleTimeout is 10s — far too short for RPC calls that wait on
-  // storage locks or reconcile yielding. Bun's unix socket types don't include
-  // idleTimeout but it works at runtime (same engine as TCP serve).
-  //
-  // This value is NOT what keeps long operations alive: Bun caps idleTimeout at
-  // 255s, and a handler that hasn't returned a Response writes no bytes, so the
-  // idle timer expires mid-operation regardless. Long routes are kept alive by
-  // the heartbeat envelope (src/daemon/heartbeat.ts). DAEMON_IDLE_TIMEOUT_S is
-  // the floor for a request that produces nothing at all.
-  //
-  // Extracted into a factory because the daemon must be able to RE-bind this
-  // listener: a unix socket file only exists while its listener holds it, so if
-  // something deletes lazy.sock underneath a running daemon there is no way to
-  // put it back by hand — re-binding is the only repair. See
-  // startDaemonStateFileWatch in src/daemon/state-files.ts.
-  const serveUnix = () => Bun.serve({
-    unix: socketPath,
-    idleTimeout: DAEMON_IDLE_TIMEOUT_S as never,
-
-    fetch(req: Request): Promise<Response> {
-      // Every request gets a lifetime span, including the ones that never reach
-      // a route (401, 404) — see src/daemon/request-span.ts for why the span
-      // must not be tied to the handler settling.
-      return withRequestSpan(req, 'unix', async () => {
-        // Auth check — all unix socket endpoints require the shared bearer token,
-        // EXCEPT /mcp/* and /builder/*, which authenticate with a per-identity
-        // MCP token and do so inside the route (see authorizeMcpCall and the
-        // /builder/storage route). Accepting the shared token here as well would
-        // reopen the impersonation hole on the socket.
-        const unixPath = new URL(req.url).pathname;
-        if (!unixPath.startsWith('/mcp/') && !unixPath.startsWith('/builder/')) {
-          const authHeader = req.headers.get('authorization');
-          if (authHeader !== `Bearer ${token}`) {
-            return Response.json({ error: 'Unauthorized' }, { status: 401 });
-          }
-        }
-
-        const daemonResponse = await handleDaemonRequest(req, false);
-        if (daemonResponse) return daemonResponse;
-
-        return Response.json({ error: 'Not found' }, { status: 404 });
-      });
-    },
-  });
-
   // LAST MOMENT AT WHICH "EVERYTHING ALIVE IS FROM THE PREVIOUS GENERATION" IS
-  // TRUE. Nothing can reach this daemon until serveUnix() binds below, so every
-  // run visible right now belongs to the daemon that died. Enumerate them here
-  // and let the reap (first reconcile tick) stop only these; see
+  // TRUE. Nothing can reach this daemon until the TCP listener binds below, so
+  // every run visible right now belongs to the daemon that died. Enumerate them
+  // here and let the reap (first reconcile tick) stop only these; see
   // src/daemon/restart-reaper.ts.
   //
   // Storage is already open by this point (initDaemonStorage, far above), and
@@ -919,16 +1261,20 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   //
   // A snapshot that cannot be taken degrades to an EMPTY one rather than to
   // null: reaping nothing is the safe outcome, and it keeps the one-shot from
-  // re-checking on every tick forever.
+  // re-checking on every tick forever. The storage acquisition is INSIDE the
+  // guard: opening storage reads lazy.toml, and a broken config must surface
+  // as the actionable "Daemon failed to load" error from the bind block below,
+  // not as a raw loadConfig throw from here.
   previousGenerationSnapshot =
-    (await snapshotPreviousGenerationChildren(projectRoot, await getOrCreateStorage()).catch(err => {
-      logger.warn(`Daemon restart: previous-generation snapshot failed: ${err instanceof Error ? err.message : err}`);
-      return null;
-    })) ?? { takenAt: new Date().toISOString(), runners: [] };
+    (await getOrCreateStorage()
+      .then((storage) => snapshotPreviousGenerationChildren(projectRoot, storage))
+      .catch(err => {
+        logger.warn(`Daemon restart: previous-generation snapshot failed: ${err instanceof Error ? err.message : err}`);
+        return null;
+      })) ?? { takenAt: new Date().toISOString(), runners: [] };
 
-  let server = serveUnix();
-
-  // TCP web server — serves web dashboard + daemon routes
+  // TCP server — serves daemon routes + web dashboard. The daemon's only
+  // transport.
   let webServer: ReturnType<typeof Bun.serve> | undefined;
   let webPort: number | undefined;
   // Additional listeners on the same port (e.g. docker bridge gateway on Linux).
@@ -936,7 +1282,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // Anthropic passthrough proxy — always started, after the web server.
   // Declared here (not in the start block below) so teardownPartialStart can stop
   // it if a LATER startup step fails.
-  let proxyServer: ReturnType<typeof Bun.serve> | undefined;
+  let proxyServer: ProxyServer | undefined;
   // Stops the state-file self-repair watch (see below). Declared here so
   // teardownPartialStart can clear it whenever it was already armed.
   let stopStateFileWatch: (() => void) | undefined;
@@ -964,32 +1310,24 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     await safeStep('stopSyncRetryLoop', () => stopSyncRetryLoop());
     await safeStep('stopSyncLoop', () => stopSyncLoop());
     await safeStep('stopCaptureLoop', () => stopCaptureLoop());
+    await safeStep('stopWorktreeCleanupLoop', () => stopWorktreeCleanupLoop());
+    await safeStep('stopHealthEvents', () => { stopHealthEvents?.(); stopHealthEvents = null; });
+    await safeStep('closeAllEventStreams', () => closeAllEventStreams());
     await safeStep('closeSignalDb', () => closeSignalDb());
     // Flush batched spans BEFORE storage closes — the span sink writes through
     // Storage, so it must still be open here.
     await safeStep('shutdownTracing', () => shutdownTracing());
     await safeStep('closeAllStorage', () => closeAllStorage());
-    await safeStep('server.stop', () => server.stop());
-    // Stop the TCP web listeners if they were already bound (they exist when a
+    // Stop the TCP listeners if they were already bound (they exist when a
     // LATER step — e.g. proxy start — fails; they are undefined/empty on an
     // early bind failure, where these are no-ops).
-    if (proxyServer) await safeStep('proxyServer.stop', () => proxyServer!.stop());
-    if (webServer) await safeStep('webServer.stop', () => webServer!.stop());
+    // stop(true) for the same reason as stop() below: lingering keep-alive
+    // connections must not answer for a port the next daemon will reuse.
+    if (proxyServer) await safeStep('proxyServer.stop', () => proxyServer!.stop(true));
+    if (webServer) await safeStep('webServer.stop', () => webServer!.stop(true));
     for (const extra of extraWebServers) {
-      await safeStep('extraWebServer.stop', () => extra.stop());
+      await safeStep('extraWebServer.stop', () => extra.stop(true));
     }
-    // The unix socket file we bound may not live at the default path
-    // (tests pass an explicit socketPath). Remove it explicitly before
-    // calling cleanupStaleFiles (which only touches default paths).
-    // ENOENT is expected here: the socket may have been cleaned up by
-    // server.stop() above, or never created if we teardown very early.
-    await safeStep('unlink socket', async () => {
-      try {
-        await unlink(socketPath);
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-      }
-    });
     // cleanupOwnDaemonFiles, not cleanupStaleFiles: these files are OURS —
     // we hold the daemon lock and lazy.pid names us, which is exactly what the
     // ownership guard in cleanupStaleFiles refuses on. The guard protects other
@@ -1008,24 +1346,145 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
    * abort visible to the compiler's control-flow analysis at every call site).
    *
    * This is the single shape every hard startup precondition from here on (web
-   * bind, proxy) ends in, so they stay consistent as more are added: log and
-   * record via {@link recordStartupFailure}, then tear the partial daemon down
-   * — never leave half a daemon running.
+   * bind, proxy) ends in, so they stay consistent as more are added: hand the
+   * teardown to {@link recordStartupFailure}, which writes the marker, tears
+   * the partial daemon down — never leave half a daemon running — and logs the
+   * reason LAST, so teardown's own chatter cannot bury it at the end of
+   * daemon.log.
    *
    * The preconditions that run before anything exists (config, credentials)
-   * call recordStartupFailure directly: there is nothing to tear down, and the
-   * teardown closes over bindings those steps precede.
+   * call recordStartupFailure without a teardown: there is nothing to tear
+   * down, and the teardown closes over bindings those steps precede.
    */
-  const failStartup = async (errorMessage: string): Promise<Error> => {
-    const error = await recordStartupFailure(projectRoot, errorMessage);
-    await teardownPartialStart();
-    return error;
+  const failStartup = (errorMessage: string): Promise<Error> =>
+    recordStartupFailure(projectRoot, errorMessage, teardownPartialStart);
+
+  // Build a minimal TCP handler that can accept the bind BEFORE we touch
+  // storage. Storage initialization is expensive and async — if we kicked
+  // it off before bind and bind then failed, the in-flight promise would
+  // race our teardown and reopen storage after we closed it. Defer the
+  // real handler wiring until after bind succeeds; until then, refuse
+  // requests so any client hitting the port during startup sees 503.
+  // Bun.serve calls fetch() lazily so in practice this placeholder only
+  // runs if a request slips in during the narrow bind→wire-up window.
+  let webRequestHandler: (req: Request) => Promise<Response> = async () =>
+    Response.json({ error: 'Daemon starting' }, { status: 503 });
+
+  // The live server handle Bun hands every request. Needed here because the
+  // serve proxy takes it: `server.timeout()` to exempt a proxied request from
+  // the daemon idle timeout, `server.requestIP()` for X-Forwarded-For.
+  type ServeHandle = Parameters<Parameters<typeof tryBindTcpPort>[1]>[1];
+
+  // The task-service reverse proxy: `<service>.<task>.lazy.localhost:<port>`
+  // forwarded to the container port `[serve]` published. It is a CLIENT of the
+  // serve-state path the daemon already owns (getTaskServeState), never a second
+  // resolver, and it lives in its own module so the sibling work on the
+  // dashboard's routes and templates never touches it.
+  //
+  // The dashboard host is read through a thunk because `boundBindHost` is only
+  // assigned after the bind below — same window, and same default fallback, as
+  // the dashboard gate at the end of this handler.
+  const serveProxyDeps: ServeProxyDeps = {
+    root: projectRoot,
+    getStorage: () => getOrCreateStorage(),
+    dashboardHost: () => dashboardHostFor(boundBindHost),
   };
+  const handleServeProxy = createServeProxy(serveProxyDeps);
 
-  const shouldBindWeb =
-    !options.noWeb && (options._forceBindWebInTest === true || !process.env.LAZY_TEST);
+  const tcpHandler = (req: Request, srv: ServeHandle): Promise<Response> => withRequestSpan(req, 'tcp', async () => {
+    // A request for a task's service leaves here for the container and never
+    // reaches a daemon route. It has to be FIRST: the dashboard gate below is an
+    // exact host match, so it would answer every serve host with a 421.
+    //
+    // Being ahead of the gate is also what keeps the session cookie out of task
+    // apps — the proxy never consults it, and strips it from what it forwards
+    // (see upstreamRequestHeaders). And it is what exempts a proxied request
+    // from WEB_REQUEST_DEADLINE_MS: a dev server holding an SSE stream open for
+    // an hour is normal, and cutting it at 105s would be the bug.
+    const proxied = await handleServeProxy(req, srv);
+    if (proxied) return proxied;
 
-  if (shouldBindWeb) {
+    // Daemon routes — RPC requires auth, status does not
+    const url = new URL(req.url);
+
+    // /daemon/status is available without auth — it is the liveness probe
+    if (url.pathname === '/daemon/status') {
+      const daemonResponse = await handleDaemonRequest(req, false);
+      if (daemonResponse) return daemonResponse;
+    }
+
+    // /mcp/*, /builder/* and /agent/* authenticate with a per-identity MCP
+    // token, inside the route (see authorizeMcpCall, the /builder/storage route
+    // and /agent/launch-env) — the shared daemon token is NOT accepted on any
+    // of them. A task container holds only its own per-task MCP token, which is
+    // exactly why its launch-env refresh is a route here rather than an /rpc/
+    // call it cannot authenticate.
+    if (
+      url.pathname.startsWith('/mcp/') ||
+      url.pathname.startsWith('/builder/') ||
+      url.pathname.startsWith('/agent/')
+    ) {
+      const daemonResponse = await handleDaemonRequest(req, false);
+      if (daemonResponse) return daemonResponse;
+    }
+
+    // /rpc/* and /daemon/shutdown authenticate as an ACTOR: the legacy shared
+    // daemon token (which maps to `control`, so single-user installs are
+    // unchanged) or an actor token minted for the control plane or one user.
+    // Agent MCP tokens are refused here — see src/daemon/rpc-auth.ts.
+    if (url.pathname.startsWith('/rpc/') || url.pathname === '/daemon/shutdown') {
+      const auth = await resolveRpcActor(projectRoot, token, req.headers.get('authorization'));
+      if (!auth.ok) {
+        return Response.json({ error: rpcAuthErrorMessage(auth.failure) }, { status: 401 });
+      }
+      // Shutting the daemon down is an operator action, not a user one: a
+      // per-user token exists so a human can work on TASKS through the daemon,
+      // and taking the daemon away from everyone else is not that.
+      if (url.pathname === '/daemon/shutdown' && auth.actor.kind !== 'control') {
+        logger.warn(`Refused shutdown from non-control actor: ${describeActor(auth.actor)}`);
+        return Response.json(
+          { error: 'Forbidden: only a control-plane actor may shut the daemon down.' },
+          { status: 403 },
+        );
+      }
+      const daemonResponse = await handleDaemonRequest(req, false, auth.actor);
+      if (daemonResponse) return daemonResponse;
+    }
+
+    // Web dashboard routes — every one requires a browser session (and none
+    // exist at all in managed mode). This is the single choke point for the
+    // dashboard: it sits BELOW /rpc, /mcp, /builder and /daemon/status, which
+    // have their own auth, and ABOVE every page, asset and /api route, so a new
+    // dashboard route cannot ship unauthenticated by omission. It is also where
+    // the anti-framing headers are stamped, for the same reason — and note it
+    // is BELOW the proxy above, which is what keeps them off a task's own app.
+    // The host is derived from the interface actually bound (see
+    // dashboardHostFor): on the loopback default that is `lazy.localhost`, a
+    // name no published task app port uses, which is what keeps the session
+    // cookie out of agent-written code the operator opens on 127.0.0.1.
+    // `boundBindHost` is assigned right after the bind below, so the fallback
+    // here is only ever taken for a request that arrives in that window — and
+    // it resolves to the same default.
+    const dashboardUrl = boundWebPort
+      ? resolveDashboardUrl(boundBindHost, boundWebPort, startupConfig.server.dashboard_url)
+      : undefined;
+    return serveDashboardRequest(
+      projectRoot,
+      req,
+      dashboardUrl ? new URL(dashboardUrl).hostname : dashboardHostFor(boundBindHost),
+      webRequestHandler,
+      dashboardUrl,
+    );
+  });
+
+  // The full production bind path resolves port/interface from config, persists
+  // the bound port, and refreshes mounted MCP configs. Under LAZY_TEST those
+  // side effects would contend on the shared port window and the developer's
+  // real state, so test daemons take the minimal ephemeral bind below instead —
+  // unless a suite opts into the full path with _forceBindWebInTest.
+  const fullBindPath = options._forceBindWebInTest === true || !process.env.LAZY_TEST;
+
+  if (fullBindPath) {
     // Port priority: explicit option > non-default config port > last-bound
     // port > default. Preferring the last-bound port over the default keeps a
     // restart on the SAME port, so daemon MCP configs already mounted into
@@ -1037,9 +1496,11 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     // for why a lazy.toml that will not load never reaches this far, and why
     // that check cannot live here.
     const configPort = startupConfig.server.port;
-    // Bind interface: defaults to loopback so the unauthenticated dashboard and
-    // the /mcp + /rpc endpoints are not exposed to the LAN. Users opt into
-    // remote access via [server] bind in lazy.toml.
+    // Bind interface: defaults to loopback so the dashboard and the /mcp + /rpc
+    // endpoints are not exposed to the LAN. Users opt into remote access via
+    // [server] bind in lazy.toml. The dashboard authenticates too (see
+    // ./dashboard-auth.ts) — loopback is the outer of two defenses, not the
+    // only one, because a task container reaches this port by design.
     const bindHost = startupConfig.server.bind;
     // Runner type decides whether containers need a bridge-reachable bind on
     // Linux.
@@ -1060,54 +1521,56 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       ?? DEFAULT_WEB_PORT;
     const attempts = options.maxPortAttempts ?? MAX_PORT_ATTEMPTS;
 
-
-    // Build a minimal TCP handler that can accept the bind BEFORE we touch
-    // storage. Storage initialization is expensive and async — if we kicked
-    // it off before bind and bind then failed, the in-flight promise would
-    // race our teardown and reopen storage after we closed it. Defer the
-    // real handler wiring until after bind succeeds; until then, refuse
-    // requests so any client hitting the port during startup sees 503.
-    // Bun.serve calls fetch() lazily so in practice this placeholder only
-    // runs if a request slips in during the narrow bind→wire-up window.
-    let webRequestHandler: (req: Request) => Promise<Response> = async () =>
-      Response.json({ error: 'Daemon starting' }, { status: 503 });
-
-    const tcpHandler = (req: Request): Promise<Response> => withRequestSpan(req, 'tcp', async () => {
-      // Daemon routes on TCP — RPC requires auth, status does not
-      const url = new URL(req.url);
-
-      // /daemon/status is available without auth on TCP
-      if (url.pathname === '/daemon/status') {
-        const daemonResponse = await handleDaemonRequest(req, false);
-        if (daemonResponse) return daemonResponse;
-      }
-
-      // /mcp/* and /builder/* authenticate with a per-identity MCP token, inside
-      // the route (see authorizeMcpCall and the /builder/storage route) — the
-      // shared daemon token is NOT accepted on either.
-      if (url.pathname.startsWith('/mcp/') || url.pathname.startsWith('/builder/')) {
-        const daemonResponse = await handleDaemonRequest(req, false);
-        if (daemonResponse) return daemonResponse;
-      }
-
-      // /rpc/* and /daemon/shutdown require the shared daemon token on TCP
-      if (url.pathname.startsWith('/rpc/') || url.pathname === '/daemon/shutdown') {
-        const authHeader = req.headers.get('authorization');
-        if (authHeader !== `Bearer ${token}`) {
-          return Response.json({ error: 'Unauthorized' }, { status: 401 });
-        }
-        const daemonResponse = await handleDaemonRequest(req, false);
-        if (daemonResponse) return daemonResponse;
-      }
-
-      // Web dashboard routes — no auth required
-      return webRequestHandler(req);
-    });
+    // WebSocket upgraders: the web shell (`/tasks/:id/shell/ws`) and the live
+    // watch panel (`/tasks/:id/watch/ws`), composed because Bun.serve takes one
+    // handler per bind. Storage is resolved lazily because the upgraders are
+    // built before storage init completes. They run AHEAD of tcpHandler's
+    // dashboard gate, so each applies the same guard itself — same host, same
+    // session cookie — on every upgrade (see src/daemon/dashboard-auth.ts).
+    const wsGuard = (req: Request) => {
+      const dashboardUrl = boundWebPort
+        ? resolveDashboardUrl(bindHost, boundWebPort, startupConfig.server.dashboard_url)
+        : undefined;
+      return guardDashboardRequest(
+        projectRoot,
+        req,
+        dashboardUrl ? new URL(dashboardUrl).hostname : dashboardHostFor(bindHost),
+        dashboardUrl,
+      );
+    };
+    const wsUpgrader = composeUpgraders([
+      // FIRST, for the same reason the HTTP proxy runs ahead of the dashboard
+      // gate: an HMR or ActionCable socket arrives on a serve host, which the
+      // dashboard's own guard would reject as the wrong host. It takes no guard
+      // — a task's app is unauthenticated on its published port today, and
+      // routing it through a name does not change who may open it.
+      createServeProxyUpgrader(serveProxyDeps),
+      // Second, right behind the serve proxy (as /rpc/* is in the HTTP order):
+      // it authenticates as /rpc/* does — an actor token, never the dashboard
+      // session — so it keeps working in managed mode, where every guarded
+      // upgrader below answers 404.
+      sessionAttachUpgrader(),
+      rpcWatchUpgrader(),
+      createShellUpgrader({
+        getStorage: () => getOrCreateStorage(),
+        root: projectRoot,
+        guard: wsGuard,
+      }),
+      createWatchUpgrader({
+        getStorage: () => getOrCreateStorage(),
+        root: projectRoot,
+        guard: wsGuard,
+      }),
+      createActionRunUpgrader({
+        getStorage: () => getOrCreateStorage(),
+        guard: wsGuard,
+      }),
+    ]);
 
     let bindResult: ReturnType<typeof tryBindTcpPort> = null;
     let bindThrownError: unknown = null;
     try {
-      bindResult = tryBindTcpPort(desiredPort, tcpHandler, attempts, bindHost);
+      bindResult = tryBindTcpPort(desiredPort, tcpHandler, attempts, bindHost, wsUpgrader);
     } catch (err) {
       // tryBindTcpPort rethrows anything that isn't EADDRINUSE (e.g., EACCES
       // on privileged ports, unexpected Bun.serve failures). Surface these
@@ -1157,13 +1620,12 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         context +
         `\n` +
         remediation;
-      // Logging BEFORE teardown is load-bearing here (see failStartup): the
-      // logger appends, so this is the line users see via `tail daemon.log`.
-      // Without it the error was only visible via the top-level process.exit
-      // handler's console.error, which was the direct cause of the reported
-      // "silent hang" symptom (log appeared frozen at "Daemon sync loop
-      // enabled" because the actual failure was written to stderr before the
-      // logger had a chance to flush it).
+      // failStartup logs this through the logger (appending, after teardown, so
+      // it is the last thing in daemon.log) rather than leaving it to the
+      // top-level process.exit handler's console.error — that was the direct
+      // cause of the reported "silent hang" symptom, where the log appeared
+      // frozen at "Daemon sync loop enabled" because the actual failure went to
+      // stderr before the logger had a chance to flush it.
       throw await failStartup(errorMessage);
     }
 
@@ -1172,13 +1634,28 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     webPort = actualPort;
     boundWebPort = actualPort;
     boundBindHost = bindHost;
+    // Task service URLs (`web.my-task.lazy.localhost:26024`) ride the dashboard's
+    // own host and port, so nothing can compose one until the bind has answered
+    // with a port. Set it here, once, and every surface rendering inside this
+    // process — the servePorts RPC, the Services card, the review page — gets
+    // the name form without composing a hostname itself.
+    setDashboardAuthority(`${dashboardHostFor(bindHost)}:${actualPort}`);
     // Persist the bound port so the next start prefers it (see readWebPort),
     // keeping already-mounted daemon MCP configs valid across a restart.
     // Best-effort — never blocks startup.
     writeWebPort(projectRoot, actualPort);
+    // Persist the interface too: with the TCP port as the only transport, the
+    // host-side CLI derives its connect address from these two files (see
+    // getDaemonTcpTarget in lifecycle.ts) — a non-loopback [server] bind would
+    // otherwise be unreachable from the CLI.
+    writeWebHost(projectRoot, bindHost);
     // Set daemon context so RPC handlers (e.g., task launcher) can access
     // the daemon's own webPort and token without health checks.
-    setDaemonContext({ webPort: actualPort, token });
+    const dashboardUrl = resolveDashboardUrl(bindHost, actualPort, startupConfig.server.dashboard_url);
+    setDaemonContext({ webPort: actualPort, token, bindHost, dashboardUrl });
+    const bindHealth = daemonHealthRecorder(projectRoot);
+    bindHealth.recordBind({ surface: 'dashboard', host: bindHost, port: actualPort, primary: true, ok: true });
+    bindHealth.recordDashboardUrl(dashboardUrl);
 
     // Persisting the port keeps a restart on the SAME port *when it can* — but
     // the port window is shared across projects, so another project's daemon
@@ -1208,26 +1685,10 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       );
     }
 
-    // Bind succeeded — now wire up the real web request handler. Storage
-    // initialization is kicked off eagerly so the first web request
-    // doesn't pay the cold-start cost, but we're past the bind failure
-    // window so there's no teardown race.
-    const handlerPromise = (async () => {
-      const storage = await getOrCreateStorage();
-      // The review surface mutates state (ask dispatch, unblock, accept). It
-      // does so only through this port, which runs in-process here — the web
-      // layer never becomes a second writer.
-      return createWebRequestHandler(storage, createReviewActions(projectRoot));
-    })();
-    webRequestHandler = async (req: Request) => {
-      const handler = await handlerPromise;
-      return handler(req);
-    };
-
-    logger.info(`Web dashboard: ${formatDashboardUrl(bindHost, webPort)}`);
+    logger.info(`Web dashboard: ${dashboardUrl}`);
     if (bindHost !== DEFAULT_SERVER_BIND) {
-      // Make the exposure visible: the dashboard is unauthenticated, so binding
-      // beyond loopback means anyone who can reach this interface can read it.
+      // Make the exposure visible: binding beyond loopback exposes the sign-in
+      // surface and daemon port to anyone who can reach this interface.
       logger.warn(
         `Daemon TCP server bound to ${bindHost}:${webPort} (not loopback). ` +
         `The web dashboard is unauthenticated and now reachable from other hosts ` +
@@ -1261,20 +1722,23 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         const extra = tryBindTcpPort(actualPort, tcpHandler, 1, host);
         if (extra) {
           extraWebServers.push(extra.server);
+          bindHealth.recordBind({ surface: 'dashboard', host, port: actualPort, primary: false, ok: true });
           logger.info(`Daemon TCP server also bound to ${host}:${actualPort} (container reachability)`);
         } else {
-          logger.warn(
+          const reason =
             `Could not also bind the daemon to ${host}:${actualPort} (port busy on that interface). ` +
             `Containers reaching the daemon via host.docker.internal:${actualPort} may fail. ` +
-            `If agents cannot reach the daemon, set a reachable interface via [server] bind in lazy.toml.`,
-          );
+            `If agents cannot reach the daemon, set a reachable interface via [server] bind in lazy.toml.`;
+          bindHealth.recordBind({ surface: 'dashboard', host, port: actualPort, primary: false, ok: false, reason });
+          logger.warn(reason);
         }
       } catch (err) {
-        logger.warn(
+        const reason =
           `Could not also bind the daemon to ${host}:${actualPort} (container reachability): ` +
           `${err instanceof Error ? err.message : String(err)}. ` +
-          `If agents cannot reach the daemon, set a reachable interface via [server] bind in lazy.toml.`,
-        );
+          `If agents cannot reach the daemon, set a reachable interface via [server] bind in lazy.toml.`;
+        bindHealth.recordBind({ surface: 'dashboard', host, port: actualPort, primary: false, ok: false, reason });
+        logger.warn(reason);
       }
     }
 
@@ -1283,17 +1747,206 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       // found — agents inside containers will silently fail to reach MCP/RPC.
       // Surface it loudly with an actionable remediation instead of letting the
       // failure show up later as opaque "Daemon context not initialized" errors.
-      logger.warn(
+      const bridgeReason =
         `Daemon is bound to loopback (${bindHost}:${actualPort}) but no docker/podman bridge ` +
         `interface was detected, and the configured runner is "${runnerType}". On native Linux ` +
         `Docker, containers reach the daemon via host.docker.internal -> the bridge gateway, which ` +
         `a loopback-only daemon refuses — agents/supervisor/MCP may fail to reach the daemon.\n` +
         `To fix, either ensure the docker bridge (docker0) is up, or set an explicit interface:\n` +
         `  [server]\n` +
-        `  bind = "0.0.0.0"   # or the docker bridge gateway IP (e.g. 172.17.0.1)`,
+        `  bind = "0.0.0.0"   # or the docker bridge gateway IP (e.g. 172.17.0.1)`;
+      bindHealth.recordBridgeUnreachable(bridgeReason);
+      logger.warn(bridgeReason);
+    }
+  } else {
+    // LAZY_TEST minimal bind. The TCP port is the daemon's only transport, so
+    // even an in-process test daemon must listen — but on an OS-assigned
+    // ephemeral loopback port (unless the test pins one), with none of the
+    // production side effects: no config-driven port resolution, no port/host
+    // persistence, no MCP config refresh, no bridge binds, no daemon context
+    // and no dashboard authority (multiple in-process daemons share this
+    // process, and both of those are module-level singletons they would clobber
+    // for each other — the authority would then print another daemon's port into
+    // this one's service URLs). The proxy itself is unaffected: it reads the
+    // suffix from the Host header of the request in front of it, not from that
+    // singleton, so an in-process daemon proxies normally and only the rendered
+    // `publicUrl` falls back to the direct loopback URL.
+    let bindThrownError: unknown = null;
+    let bindResult: ReturnType<typeof tryBindTcpPort> = null;
+    try {
+      bindResult = tryBindTcpPort(
+        options.webPort ?? 0,
+        tcpHandler,
+        1,
+        DEFAULT_SERVER_BIND,
+        (() => {
+          // Same dashboard gate as production — the test bind is loopback,
+          // and sessions are enforced on every bind by design. That includes
+          // `[server] dashboard_url`, exactly as the HTTP gate above reads it.
+          const guard = (req: Request) => {
+            const configured = startupConfig.server.dashboard_url || undefined;
+            return guardDashboardRequest(
+              projectRoot,
+              req,
+              configured ? new URL(configured).hostname : dashboardHostFor(DEFAULT_SERVER_BIND),
+              configured,
+            );
+          };
+          return composeUpgraders([
+            createServeProxyUpgrader(serveProxyDeps),
+            sessionAttachUpgrader(),
+            rpcWatchUpgrader(),
+            createShellUpgrader({ getStorage: () => getOrCreateStorage(), root: projectRoot, guard }),
+            createWatchUpgrader({ getStorage: () => getOrCreateStorage(), root: projectRoot, guard }),
+            createActionRunUpgrader({ getStorage: () => getOrCreateStorage(), guard }),
+          ]);
+        })(),
+      );
+    } catch (err) {
+      bindThrownError = err;
+    }
+    if (!bindResult) {
+      const detail = bindThrownError instanceof Error ? bindThrownError.message : String(bindThrownError ?? 'port busy');
+      throw await failStartup(`Daemon failed to bind its TCP port (test mode): ${detail}`);
+    }
+    webServer = bindResult.server;
+    webPort = webServer.port!;
+    boundWebPort = webPort;
+    boundBindHost = DEFAULT_SERVER_BIND;
+    const testBindHealth = daemonHealthRecorder(projectRoot);
+    testBindHealth.recordBind({ surface: 'dashboard', host: DEFAULT_SERVER_BIND, port: webPort, primary: true, ok: true });
+    testBindHealth.recordDashboardUrl(resolveDashboardUrl(DEFAULT_SERVER_BIND, webPort, startupConfig.server.dashboard_url));
+    // Persist the discovery markers even in test mode: with TCP as the only
+    // transport they are how any OTHER process (a CLI subprocess in an e2e
+    // test) finds this in-process daemon. The daemon base dir is redirected in
+    // tests, so this never touches real state.
+    writeWebPort(projectRoot, webPort);
+    writeWebHost(projectRoot, DEFAULT_SERVER_BIND);
+  }
+
+  // One-time migration: pre-unification follow-ups become non-blocking raised
+  // items (docs/design/raised-items-unified.md). Idempotent — a store that has
+  // already been migrated scans the task dirs, finds no legacy files, and
+  // returns zeroes — so it is safe on every start, and a run interrupted
+  // half-way converges on the next one.
+  //
+  // Deliberately awaited BEFORE the web handler and the RPC surface start
+  // answering: a surface that read raised items mid-migration would show a
+  // human an incomplete triage queue. And deliberately LOUD — there is a large
+  // stock of open follow-ups and losing one is the failure this exists to
+  // prevent, so any record that could not be converted is named at WARN and its
+  // source file is left in place for a retry.
+  try {
+    const migration = await (await getOrCreateStorage()).migrateFollowUpsToRaisedItems();
+    if (migration.converted > 0 || migration.failures.length > 0) {
+      logger.info(
+        `Migrated ${migration.converted} follow-up(s) to raised items across ` +
+        `${migration.tasks_scanned} task(s) (${migration.already_migrated} already migrated, ` +
+        `${migration.tasks_retired} legacy file(s) retired)`,
       );
     }
+    for (const failure of migration.failures) {
+      logger.warn(
+        `Follow-up migration could not convert a record on task ${failure.task_id}` +
+        `${failure.follow_up_id ? ` (follow-up ${failure.follow_up_id})` : ''}: ${failure.reason}. ` +
+        `The task's follow-ups.json was left in place — it will be retried on the next daemon start.`,
+      );
+    }
+  } catch (err) {
+    // A migration that cannot run is reported, not fatal: the daemon still
+    // serves, and every already-converted item is already visible.
+    logger.warn(
+      `Follow-up → raised-item migration failed: ${err instanceof Error ? err.message : String(err)}. ` +
+      `Any unconverted follow-ups are still on disk and will be retried on the next daemon start.`,
+    );
   }
+
+  // One-time migration: attribution stored as a control plane's user id becomes
+  // the email the store now names people by (docs/design/actor-identity-and-
+  // remote-clients.md §3.8). Idempotent — a migrated store is walked, rewrites
+  // nothing and reports zeroes — so it is safe on every start.
+  //
+  // Also before the surfaces answer, and for the same reason as the migration
+  // above: a page rendered mid-rewrite would attribute a row to nobody and then
+  // to somebody. And deliberately LOUD about what it CLEARED: an id this
+  // install cannot read as a person is dropped, so the count and the ids
+  // themselves are reported rather than left for somebody to notice later.
+  try {
+    const identity = await (await getOrCreateStorage()).migrateActorIdentity();
+    if (identity.carried > 0 || identity.files_rewritten > 0) {
+      logger.info(
+        `Migrated stored attribution to actor_email: ${identity.carried} carried forward across ` +
+        `${identity.files_rewritten} file(s) in ${identity.tasks_scanned} task(s)`,
+      );
+    }
+    if (identity.cleared > 0) {
+      const ids = identity.cleared_ids.join(', ') +
+        (identity.cleared_ids_truncated ? ', …' : '');
+      logger.warn(
+        `${identity.cleared} row(s) had an actor id this install cannot resolve to a person; ` +
+        `their attribution was cleared (the rows keep their actor role). ` +
+        `The ids were: ${ids}. If a control plane knows who these are, it can map them ` +
+        `and rewrite the rows — see docs/design/actor-identity-and-remote-clients.md §3.8.`,
+      );
+    }
+    for (const failure of identity.failures) {
+      logger.warn(
+        `Actor identity migration could not rewrite ${failure.file} on task ${failure.task_id}: ` +
+        `${failure.reason}. The file was left as it was and is retried on the next daemon start.`,
+      );
+    }
+  } catch (err) {
+    // Same posture as the migration above: reported, not fatal. Every row it
+    // did rewrite is already correct, and the rest are retried next start.
+    logger.warn(
+      `Actor identity migration failed: ${err instanceof Error ? err.message : String(err)}. ` +
+      `Any unmigrated attribution is still on disk and will be retried on the next daemon start.`,
+    );
+  }
+
+  // One-time import of lazy.toml's `[serve] start_services_cmd` into the store,
+  // where the Start services command now lives. Idempotent: a no-op once the
+  // store holds a command. Not fatal — until it succeeds, the command still
+  // resolves from lazy.toml, so no user's setting disappears either way.
+  try {
+    const imported = await importStartServicesCmdFromConfig(await getOrCreateStorage(), projectRoot);
+    if (imported) {
+      logger.info(
+        `Imported the Start services command "${imported}" from lazy.toml [serve] start_services_cmd ` +
+        `into the project store. Change it from a task's Services card; lazy.toml is no longer read for it.`,
+      );
+    }
+  } catch (err) {
+    logger.warn(
+      `Could not import [serve] start_services_cmd into the project store: ` +
+      `${err instanceof Error ? err.message : String(err)}. It is still read from lazy.toml; ` +
+      `the import is retried on the next daemon start.`,
+    );
+  }
+
+  // Bind succeeded — now wire up the real web request handler. Storage
+  // initialization is kicked off eagerly so the first web request
+  // doesn't pay the cold-start cost, but we're past the bind failure
+  // window so there's no teardown race.
+  const handlerPromise = (async () => {
+    const storage = await getOrCreateStorage();
+    // The review surface mutates state (ask dispatch, unblock, accept). It
+    // does so only through this port, which runs in-process here — the web
+    // layer never becomes a second writer.
+    return createWebRequestHandler(storage, createReviewActions(projectRoot), {
+      messageActions: createMessageActions(),
+      reviewSessionActions: createReviewSessionActions(projectRoot),
+      memoryActions: createMemoryActions(projectRoot),
+      doctorActions: createDoctorActions(projectRoot),
+      taskActions: createTaskEditActions(projectRoot),
+      serveActions: createServeActions(projectRoot),
+      usagePauseState: () => describeUsagePauseState(projectRoot, storage),
+    });
+  })();
+  webRequestHandler = async (req: Request) => {
+    const handler = await handlerPromise;
+    return handler(req);
+  };
 
   // Start the Anthropic passthrough proxy. This is ALWAYS ON — there is no
   // config option to turn it off — so the proxy is part of a normal daemon
@@ -1306,7 +1959,11 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     // Search from projectRoot explicitly — loadConfig otherwise defaults its
     // search to process.cwd(), which is the project root for a real daemon but
     // NOT for an in-process test daemon.
-    const cfg = await loadConfig(projectRoot, { cwd: projectRoot });
+    const cfg = await loadConfig(projectRoot);
+    // Managed mode deliberately pins `[data] path` to `.lazy` (managed.ts), so
+    // no fleet override here: the audit log is PROJECT-LOCAL telemetry by
+    // design (see the module comment in src/proxy/audit-log.ts), and the store
+    // dir is a synced artifact that a growing stream once broke a push on.
     const dataDir = join(projectRoot, cfg.data.path);
 
     // Upgrade path: earlier versions appended the audit stream to the STORE
@@ -1338,26 +1995,87 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       );
     }
 
+    // User-authored request plugins, loaded by convention from the MAIN
+    // checkout's .lazy/plugins (never a task worktree — see the loader). A
+    // broken plugin throws here and is handled by the catch below, exactly
+    // like a bad proxy config: loud, never silently ignored.
+    const requestPlugins = await loadProxyRequestPlugins(projectRoot);
     proxyServer = createProxyServer(
-      // ROLE UPSTREAMS: a role's `endpoint` is where the PROXY forwards that
-      // role's traffic — the launched agent always dials the proxy itself.
-      { ...cfg.proxy, roleUpstreams: roleUpstreamMap(cfg) },
-      new ProxyAuditLog(dataDir),
+      {
+        // PROFILE UPSTREAMS: an `endpoint` on `[agents.<name>]` is where the
+        // PROXY forwards that profile's traffic; the launched agent always dials
+        // the proxy itself.
+        ...cfg.proxy,
+        // Where a task container can reach it: the bridge gateway on native
+        // Linux, under the daemon port's own conditions (see bind-hosts.ts).
+        // `[proxy] bind` keeps its meaning and its managed-mode pin.
+        extraBindHosts: resolveProxyBindHosts({
+          configBind: cfg.proxy.bind,
+          platform: process.platform,
+          runnerType: cfg.runner.type,
+        }).hosts.slice(1),
+        agentUpstreams: agentUpstreamMap(cfg),
+        plugins: requestPlugins,
+        // Per-user credentials: lets the proxy turn a container's session
+        // placeholder into its owner's real token. Inert until a control
+        // plane has stored a per-user credential in this daemon.
+        resolveSessionCredential: createSessionCredentialResolver(projectRoot),
+      },
+      // The audit log, with a live per-task tally teed off it. The tee
+      // forwards every record to the log unchanged and adds one in-memory
+      // addition, which is what makes a mid-turn token counter possible
+      // without a new stream, a new file, or anything at all on the
+      // daemon→supervisor channel.
+      teeTaskProgress(new ProxyAuditLog(dataDir)),
       // JIT credentials: from here on the daemon is the only process that holds
       // a real one. Launched agents carry placeholders the proxy exchanges.
       buildProxyCredentialDeps(projectRoot, cfg),
+      {
+        // Durable per-task tool stats. The store is resolved per call rather
+        // than awaited here: `getOrCreateStorage` memoizes, and making proxy
+        // construction wait on storage init would hold up the bind for a
+        // number nobody is reading yet.
+        toolStats: new ProxyToolStatsRecorder({
+          getToolStats: async (taskId) => (await getOrCreateStorage()).getToolStats(taskId),
+          saveToolStats: async (record) => (await getOrCreateStorage()).saveToolStats(record),
+        }),
+      },
     );
     // Publish the ACTUAL bound port (OS-assigned when `[proxy] port` was
     // omitted) so per-launch env injection and `lazy daemon status` resolve
     // the real proxy address.
     if (proxyServer.port) setDaemonProxyPort(proxyServer.port);
+    // What `lazy daemon health` probes: the addresses, the audit directory and
+    // the audit queue's own record — never a credential.
+    {
+      const running = proxyServer;
+      daemonHealthRecorder(projectRoot).setProxy({
+        bind: cfg.proxy.bind,
+        binds: running.binds,
+        port: running.port ?? null,
+        auditDir: auditLogDir(dataDir),
+        auditHealth: () => running.auditHealth(),
+      });
+    }
     // Announce the proxy at INFO alongside the web-dashboard line, on start
     // and restart, so operators can see where audited traffic flows.
     const fbCount = cfg.proxy.fallbacks.length;
+    const alsoBound = proxyServer.binds.slice(1);
     logger.info(
       `Proxy: http://${cfg.proxy.bind}:${proxyServer.port} → ${cfg.proxy.upstream} ` +
-      `(${fbCount} fallback${fbCount === 1 ? '' : 's'}, policy ${cfg.proxy.policy.enforce ? 'on' : 'off'})`,
+      `(${fbCount} fallback${fbCount === 1 ? '' : 's'}, policy ${cfg.proxy.policy.enforce ? 'on' : 'off'}` +
+      `${alsoBound.length ? `, also on ${alsoBound.map((h: string) => `${h}:${proxyServer!.port}`).join(', ')} for containers` : ''})`,
     );
+    // A plugin rewrites outbound request bodies, so it must never be silently
+    // active. Announced by name and in chain order whenever any are loaded —
+    // the default (no .lazy/plugins directory) stays quiet.
+    if (requestPlugins.length > 0) {
+      logger.info(
+        `Proxy: ${requestPlugins.length} request plugin${requestPlugins.length === 1 ? '' : 's'} ` +
+        `loaded from ${PLUGIN_DIR_RELATIVE}, rewriting outbound requests in this order: ` +
+        requestPlugins.map((p) => p.name).join(' → '),
+      );
+    }
   } catch (err) {
     // A proxy startup failure is a CONTROLLED startup error — never an unhandled
     // rejection that silently kills reconcile/sync/web (that was the ~6s-after-boot
@@ -1391,16 +2109,15 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   }
 
   const result: RunningDaemon = {
-    server,
-    socketPath,
     token,
     startedAt,
     projectRoot,
     knownTaskIds,
-    webServer,
+    webServer: webServer!,
     extraWebServers,
-    webPort,
-    bindHost: boundBindHost,
+    webPort: webPort!,
+    bindHost: boundBindHost!,
+    dashboardUrl: resolveDashboardUrl(boundBindHost, webPort!, startupConfig.server.dashboard_url),
     proxyServer,
     stop: async () => {},
   };
@@ -1415,19 +2132,34 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     if (stopTestParentWatch) stopTestParentWatch();
     logger.info('Daemon shutting down...');
 
+    // [usage_pause] readings still waiting out their write throttle: written
+    // now, so a restart seeds from the latest one. Bounded, and never fatal.
+    await Promise.race([
+      flushUsageReadingWrites().catch((err) => {
+        logger.warn(`Shutdown: could not save the latest usage readings: ${err instanceof Error ? err.message : String(err)}`);
+      }),
+      new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
+    ]);
+
     // Terminate active supervisors before shutting down. Without this,
     // supervisors become orphans. discoverRunningRuns() is global (finds ALL
     // lazy-* containers/PIDs) but PER RUNNER TYPE — a docker runner can't see
     // host PIDs and vice versa. Since tasks may run on different runners
     // (per-task overrides), discover on each distinct runner type that this
     // project's sessions actually ran on (plus the global default), filtering
-    // to supervisors whose task IDs belong to this project. knownTaskIds is
-    // populated by the reconcile loop.
+    // to supervisors that belong to this project.
+    //
+    // OWNERSHIP comes from storage, via the same naming function that named the
+    // run (see src/runner/run-ownership.ts). knownTaskIds — short ids recorded
+    // by the reconcile loop — is only the fallback for when storage cannot be
+    // read at shutdown, and it can only ever match a task with no code, since
+    // every coded task's run is named for its code.
     try {
       const config = await loadConfig(projectRoot);
       const runnerTypes = new Set<RunnerType>([config.runner.type]);
+      let storage: Storage | null = null;
       try {
-        const storage = await getOrCreateStorage();
+        storage = await getOrCreateStorage();
         for (const session of await storage.listSessions(undefined, true)) {
           if (session.runner_type) runnerTypes.add(session.runner_type);
         }
@@ -1445,31 +2177,90 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
           logger.debug(`Shutdown: skipping runner ${runnerType}: ${err instanceof Error ? err.message : err}`);
           continue;
         }
-        const runs = await runner.discoverRunningRuns();
-        for (const runName of runs) {
-          // Extract task short ID from run name (e.g., "lazy-abcd1234" → "abcd1234")
-          const taskShortId = runName.replace(/^lazy-/, '');
-          if (!taskShortId) continue;
 
-          // Only stop supervisors whose tasks belong to this project.
-          // If knownTaskIds is empty (no reconcile tick yet), skip all — we can't
-          // verify ownership, and a just-started daemon has no orphans to clean up.
-          if (knownTaskIds.size === 0 || !knownTaskIds.has(taskShortId)) {
+        let owned: OwnedRuns | null = null;
+        if (storage) {
+          try {
+            owned = await indexRunsByName(storage, runner);
+          } catch (err) {
+            logger.warn(`Shutdown: could not index this project's runs: ${err instanceof Error ? err.message : err}`);
+          }
+        }
+
+        const runs = await runner.discoverRunningRuns();
+
+        /**
+         * A SHORT per-run grace for the HOST runner only.
+         *
+         * This sweep runs while whoever signalled us counts down to SIGKILL, and
+         * everything that must survive — the interrupt records below, the storage
+         * close at the end — sits on the far side of it. The host runner's
+         * standalone default is a 5s SIGTERM→SIGKILL window, which does not fit
+         * inside SIGNAL_SHUTDOWN_BUDGET_MS, so it is asked to escalate faster.
+         *
+         * Docker is deliberately left alone. There `gracefulTimeoutSeconds` is
+         * not "a shorter grace" at all — it is the switch from `docker kill`
+         * (immediate, the default) to `docker stop --time <n>` (SIGTERM, wait,
+         * SIGKILL), and it raises the CLI spawn timeout to match. Passing it
+         * would make production's runner spend real wall clock per container
+         * inside this budget, to buy a politeness its own default has already
+         * decided is worthless. Docker's default IS the fast path; only the host
+         * runner needs telling.
+         */
+        const shutdownStopOpts = runner.type === 'dangerously-host-process-without-any-isolation'
+          ? { gracefulTimeoutSeconds: SHUTDOWN_STOP_GRACE_SECONDS }
+          : undefined;
+
+        // Stopped in PARALLEL: each stop may wait out a SIGTERM grace period
+        // before escalating, and the whole shutdown has to fit inside the window
+        // its caller allows (see SIGNAL_SHUTDOWN_BUDGET_MS, and `lazy daemon
+        // stop`'s own 5s/15s clocks). Serially, two slow-to-die supervisors were
+        // already enough to make the CLI report the daemon as stuck.
+        const stoppedTaskIds: string[] = [];
+        await Promise.all(runs.map(async runName => {
+          // Extract task short ID from run name (e.g., "lazy-abcd1234" → "abcd1234").
+          // Only meaningful for an uncoded task — the knownTaskIds fallback below.
+          const taskShortId = runName.replace(/^lazy-/, '');
+          if (!taskShortId) return;
+
+          // Only stop supervisors that belong to this project. With no evidence
+          // of ownership (storage unreadable AND no reconcile tick yet) nothing
+          // is stopped: a wrongly-killed supervisor costs a human's turn, a
+          // missed one is cleaned up by the next daemon's restart reaper.
+          const ownedByStorage = owned?.has(runName) ?? false;
+          if (!ownedByStorage && (knownTaskIds.size === 0 || !knownTaskIds.has(taskShortId))) {
             logger.debug(`Skipping supervisor ${runName}: not owned by ${projectRoot}`);
-            continue;
+            return;
           }
 
           try {
             logger.info(`Stopping supervisor ${runner.runDisplayName(runName)}...`);
-            const ok = await runner.stopRun(runName);
+            const ok = await runner.stopRun(runName, shutdownStopOpts);
             if (ok) {
               logger.info(`Stopped supervisor ${runner.runDisplayName(runName)}`);
+              const task = owned?.get(runName);
+              if (task) stoppedTaskIds.push(task.id);
             } else {
               logger.warn(`Failed to stop supervisor ${runner.runDisplayName(runName)}`);
             }
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             logger.warn(`Error stopping supervisor ${runName}: ${msg}`);
+          }
+        }));
+
+        // Say what happened, in the task's own record. We just ended these
+        // turns; left to the next daemon's ordinary crash path they would read
+        // as "General error (exit code 1)", which sends whoever looks hunting
+        // for a bug in an agent that did nothing wrong. Recording it here also
+        // makes the task auto-resumable: `interrupted` is the status the next
+        // daemon's stranded-interrupt sweep picks up. No resume is attempted
+        // from here — this process is on its way out.
+        for (const taskId of stoppedTaskIds) {
+          try {
+            await interruptForDaemonStop(storage!, taskId, projectRoot);
+          } catch (err) {
+            logger.warn(`Shutdown: could not mark task ${taskId.substring(0, 8)} interrupted: ${err instanceof Error ? err.message : err}`);
           }
         }
       }
@@ -1484,7 +2275,15 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     stopSyncRetryLoop();
     stopSyncLoop();
     stopCaptureLoop();
+    stopWorktreeCleanupLoop();
     stopStateFileWatch?.();
+    // Close SSE subscribers explicitly rather than leaving them to
+    // webServer.stop(true) below: an ended stream lets the client see a clean
+    // EOF and reconnect, and it clears the heartbeat timers before the process
+    // is torn down.
+    stopHealthEvents?.();
+    stopHealthEvents = null;
+    closeAllEventStreams();
     closeSignalDb();
     // Clear the `waiting.json` markers this daemon owns. Readers already
     // disbelieve a marker whose daemon pid is dead, but a clean stop should not
@@ -1511,15 +2310,20 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       clearTimeout(shutdownTimer);
       shutdownTimer = null;
     }
-    server.stop();
+    // stop(true): close active connections too. A graceful stop leaves idle
+    // keep-alive connections answering after the listener unbinds — and once
+    // the OS (or the persisted-port logic) hands the same port to the NEXT
+    // daemon, a client's pooled connection gets its reply from this stopped
+    // daemon instead. With TCP as the only transport the port is reused by
+    // design, so lingering connections must die with the daemon.
     if (webServer) {
-      webServer.stop();
+      webServer.stop(true);
     }
     if (proxyServer) {
-      proxyServer.stop();
+      proxyServer.stop(true);
     }
     for (const extra of extraWebServers) {
-      extra.stop();
+      extra.stop(true);
     }
     // Our own files — see the note in teardownPartialStart. Using the guarded
     // cleanupStaleFiles here would refuse (we still hold the lock), leaving a
@@ -1533,20 +2337,93 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     logger.info('Daemon stopped');
     process.removeListener('SIGTERM', onSigterm);
     process.removeListener('SIGINT', onSigint);
+    process.removeListener('SIGHUP', onSighup);
+    // Same discipline as the signal listeners, and load-bearing for in-process
+    // test daemons: leaving the guards installed would keep a listener on the
+    // `bun test` process, and a present listener is exactly what stops Bun
+    // exiting on an unhandled rejection — masking real failures in later files.
+    uninstallProcessGuards();
+  }
+
+  /** Set once a signal-driven shutdown is in flight, so repeats join it. */
+  let signalShutdown: Promise<void> | null = null;
+
+  /**
+   * Shut down on a signal, giving `stop()` a bounded chance to finish first.
+   *
+   * It used to be `stop()` fire-and-forget followed immediately by
+   * `process.exit(0)`, which never got past `stop()`'s first `await` — so the
+   * supervisor sweep its own comment describes ("Without this, supervisors
+   * become orphans") did not happen at all on this path, and a `kill` of the
+   * daemon left every supervisor running, plus every agent under it on the
+   * host-process runner. That was invisible from a terminal, where Ctrl-C
+   * reached the whole foreground process group; supervisors now lead groups of
+   * their own so the daemon can stop the agents with them
+   * (src/runner/host-process-runner.ts), and this is the only thing that
+   * reaches them.
+   *
+   * Bounded by SIGNAL_SHUTDOWN_BUDGET_MS, because a signal is an instruction and
+   * not a request: if the shutdown cannot finish in time the daemon exits
+   * anyway. That budget is also the floor every caller allows before escalating
+   * to SIGKILL — the two numbers are one contract, written down once.
+   *
+   * A REPEAT signal joins the shutdown already in flight rather than exiting on
+   * the spot. `stop()` is idempotent, so a second call returns immediately —
+   * which meant a second Ctrl-C landed on `process.exit(0)` while the first was
+   * still inside `loadConfig`/`listSessions`/`discoverRunningRuns`, before a
+   * single supervisor had been signalled. That leaked exactly what this task
+   * exists to stop. The impatient caller is not made to wait long: the budget
+   * caps the whole thing either way.
+   */
+  function shutdownOnSignal(name: string) {
+    logger.info(`Received signal: ${name}`);
+
+    if (signalShutdown) {
+      logger.info(
+        `Shutdown already in progress — it stops this project's agents first and ` +
+        `gives up after ${SIGNAL_SHUTDOWN_BUDGET_MS / 1000}s.`,
+      );
+      return;
+    }
+
+    signalShutdown = stop().catch(err => {
+      logger.warn(`Shutdown after ${name} failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+    const capped = new Promise<void>(resolve => setTimeout(resolve, SIGNAL_SHUTDOWN_BUDGET_MS));
+    Promise.race([signalShutdown, capped]).then(() => process.exit(0));
   }
 
   function onSigterm() {
-    logger.info('Received signal: SIGTERM');
-    stop().catch(() => {}); // Fire and forget - signal handlers can't await
-    process.exit(0);
+    shutdownOnSignal('SIGTERM');
   }
   function onSigint() {
-    logger.info('Received signal: SIGINT');
-    stop().catch(() => {}); // Fire and forget - signal handlers can't await
-    process.exit(0);
+    shutdownOnSignal('SIGINT');
+  }
+  /**
+   * SIGHUP is a shutdown here, not a reload.
+   *
+   * A foreground daemon whose terminal closes gets SIGHUP, and with no handler
+   * the default disposition kills the process outright — `stop()` never runs, so
+   * every supervisor and agent is left behind. That used to be survivable by
+   * accident: the same terminal hangup reached them too, because they shared the
+   * daemon's process group. They lead their own groups now, so closing a
+   * terminal would strand them. Lazy has no reload semantics for SIGHUP to
+   * compete with, so the shutdown reading is the only one available.
+   */
+  function onSighup() {
+    shutdownOnSignal('SIGHUP');
   }
   process.on('SIGTERM', onSigterm);
   process.on('SIGINT', onSigint);
+  process.on('SIGHUP', onSighup);
+
+  // Last-resort net, installed only now that startup has SUCCEEDED — a daemon
+  // that could not bind, open its store or start its proxy still fails hard
+  // above (failStartup), because a half-running daemon is worse than none.
+  // From here on, the proxy shares this process with the RPC listener, so a
+  // stray rejection anywhere would otherwise end every task's turn at once.
+  // See ./process-guards.ts for why surviving beats crashing here.
+  const uninstallProcessGuards = installDaemonProcessGuards();
 
   // Test-only: a daemon spawned by an e2e run must die with that run, even when
   // the `bun test` process is SIGKILLed and none of its teardown hooks execute.
@@ -1562,45 +2439,16 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
 
   result.stop = stop;
 
-  // Self-repair for our own state files. A unix socket file exists only while
-  // its listener holds it, so if anything deletes lazy.sock underneath us the
-  // daemon becomes unreachable over the socket with no way to restore the file
-  // by hand — the only previous recovery was killing a healthy daemon, which
-  // strands every running builder/agent/pair session on a dead proxy address.
-  // Re-binding the listener re-creates it; the PID file we simply rewrite.
-  stopStateFileWatch = startDaemonStateFileWatch({
-    projectRoot,
-    socketPath,
-    rebindSocket: () => {
-      // Stop BEFORE re-serving: Bun unlinks the socket path when a unix
-      // listener stops, so binding first would have the old listener delete
-      // the file we just re-created. Nothing can connect during the gap —
-      // the socket file is already gone, which is why we are here.
-      //
-      // Verified against Bun's actual semantics, because both halves matter:
-      //  - stop() unlinks the path SYNCHRONOUSLY, before it returns, so the
-      //    old listener cannot come back later and unlink the new socket file
-      //    once its connections finish draining.
-      //  - stop() without closeActiveConnections is graceful: a request already
-      //    inside a handler runs to completion and its response is delivered on
-      //    the old listener, concurrently with the new one being bound. So a
-      //    repair never fails an in-flight CLI call.
-      //
-      // If serveUnix() throws (address in use, permissions), it throws out of
-      // this callback into the watch tick, which logs it with a `lazy doctor`
-      // pointer and tries again on the next tick. The daemon is NOT
-      // half-torn-down by that: everything except the unix listener — the web
-      // server, the proxy, the reconciler, every task under way — is untouched,
-      // and the unix socket was already unreachable before we tried. The web
-      // port therefore keeps answering throughout, which is what lets `lazy
-      // doctor` still recover and report the live PID.
-      server.stop();
-      server = serveUnix();
-      result.server = server;
-    },
-  });
+  // Self-repair for our own state files. If anything deletes lazy.pid
+  // underneath us (a tmp reaper, an over-eager cleanup script, an older lazy
+  // build), the file-based fallbacks — liveness when the lock verdict is
+  // 'unknown', `lazy doctor`'s reporting — stop naming this daemon. The PID
+  // file we simply rewrite. (The socket re-bind this watch was born for went
+  // away with the socket — a bound TCP listener cannot be deleted out from
+  // under the daemon.)
+  stopStateFileWatch = startDaemonStateFileWatch({ projectRoot });
 
-  logger.info(`Daemon ready (PID ${process.pid}, socket: ${socketPath}${webPort ? `, web: ${webPort}` : ''})`);
+  logger.info(`Daemon ready (PID ${process.pid}, ${boundBindHost}:${webPort})`);
 
   return result;
 }
@@ -1653,13 +2501,16 @@ function startDaemonReconcileLoop(
    * prevent subsequent phases from executing.
    */
   async function runPhase(label: string, fn: () => Promise<void>): Promise<void> {
-    try {
-      await fn();
-    } catch (err) {
+    // Recorded for `lazy daemon health` as well as logged: a phase failing on
+    // every tick is exactly the state nobody notices in a log.
+    await runRecordedSweep(projectRoot, RECONCILE_LOOP, label, fn, (err) => {
       const msg = err instanceof Error ? err.message : String(err);
       logger.error(`Reconcile phase '${label}' failed: ${msg}`);
-    }
+    });
   }
+
+  const health = daemonHealthRecorder(projectRoot);
+  health.loopStarted(RECONCILE_LOOP, intervalSeconds * 1_000);
 
   const doReconcile = async () => {
     if (stopped) return;
@@ -1677,6 +2528,7 @@ function startDaemonReconcileLoop(
         reconciling = false;
       } else {
         logger.debug('Daemon reconcile: skipping tick, previous reconcile still running');
+        health.tickSkipped(RECONCILE_LOOP);
         return;
       }
     }
@@ -1684,6 +2536,8 @@ function startDaemonReconcileLoop(
     reconciling = true;
     const myStartTime = Date.now();
     reconcileStartedAt = myStartTime;
+    health.tickStarted(RECONCILE_LOOP);
+    let tickError: unknown;
 
     // Announce the tick BEFORE doing anything in it. Until this line existed, a
     // tick that wedged in an early phase (storage open, listTasks, loadConfig,
@@ -1832,6 +2686,14 @@ function startDaemonReconcileLoop(
         await runBlockedTaskCatchup(storage, projectRoot);
       });
 
+      // §8 (final-turn design): every task parked with a standing final claim
+      // and no review turn after it is owed an auto-review. Derived, durable,
+      // daemon-dispatched — its round accounting lives at the settle side
+      // (task-lifecycle.ts settleAutoReviewRound).
+      await runPhase('runAutoReviewCatchup', async () => {
+        await runAutoReviewCatchup(storage, projectRoot);
+      });
+
       // --- Non-critical phases: network operations ---
       // These phases make network calls (git push, gh CLI) that can hang.
       // Subprocess-level timeouts (DEFAULT_SUBPROCESS_TIMEOUT_MS) kill hanging
@@ -1889,14 +2751,38 @@ function startDaemonReconcileLoop(
           }
         });
       }
+
+      // Usage pause: clear the "held" marks whose pause has lifted or whose task
+      // has moved on, so `lazy show` / `lazy doctor` never report a stale wait —
+      // and run the two held launches nothing else retries: a review auto-fix,
+      // and a subtask start its parent's agent asked for.
+      if (!stopped) {
+        await runPhase('processUsagePauseHolds', async () => {
+          await processUsagePauseHolds(
+            projectRoot,
+            storage,
+            (task) => resumeHeldReviewFix(projectRoot, storage, task),
+            async (task, params) => (await import('./task-launcher')).launchHeldStart(projectRoot, task.id, params),
+            // A parked parent whose held subtask start has now launched gets one
+            // turn saying so — budgeted and pause-held like every daemon launch.
+            async (parent, message) => {
+              const session = await storage.getSessionByTaskId(parent.id);
+              if (!session) return false;
+              return autoUnblockTask(storage, parent, session, projectRoot, message, 'child_added');
+            },
+          );
+        });
+      }
     } catch (err) {
       // This catches failures in storage init or task snapshot — phases above
       // have their own isolated error handling via runPhase.
       const msg = err instanceof Error ? err.message : String(err);
       logger.error(`Daemon reconcile error: ${msg}`);
+      tickError = err;
     } finally {
       const durationMs = Date.now() - reconcileStart;
       logger.debug(`Daemon reconcile tick completed in ${durationMs}ms`);
+      health.tickFinished(RECONCILE_LOOP, myStartTime, tickError);
       // Only reset the flag if this tick is still the active one.
       // If a newer tick force-reset us (timeout), don't clobber its flag.
       if (reconcileStartedAt === myStartTime) {
@@ -2002,6 +2888,83 @@ function startConversationCaptureLoop(projectRoot: string): () => void {
   };
 }
 
+/** How often the daemon sweeps for leftover worktrees on finished tasks. */
+const WORKTREE_CLEANUP_INTERVAL_MS = 15 * 60_000;
+/** Fast tick under test, mirroring the capture sweep's test-speedup pattern. */
+const WORKTREE_CLEANUP_TEST_INTERVAL_MS = 1_000;
+
+/**
+ * Sweep for worktrees still on disk for tasks that are already terminal
+ * (complete/abandoned) and remove them.
+ *
+ * `accept`/`reject`/`close` all reach `cleanupWorktree`/`cleanupWorktreeAndBranch`
+ * (src/task/cleanup.ts) as their last step, but several operations run BETWEEN
+ * the status flip to a terminal state and that cleanup call — reparenting
+ * children, regenerating parent PR/MR fidelity, revoking tokens, stopping the
+ * container/process. Any of those throwing (or the daemon/CLI process being
+ * killed, the machine sleeping, etc. mid-accept) leaves the task terminal
+ * forever with its worktree never reclaimed — nothing revisits a terminal task.
+ * `lazy doctor --clean-worktrees` already finds and fixes exactly this
+ * (`findTerminalTaskWorktrees` / `cleanupWorktree`, src/doctor/findings.ts and
+ * src/task/cleanup.ts); this loop is the same finder and the same cleanup,
+ * run automatically so the drift stays rare instead of accumulating until a
+ * human happens to run `lazy doctor`.
+ *
+ * Local disk + git work only — no network, no agent involvement — so it runs
+ * on its own slow timer rather than inside the reconcile tick. Sizes are not
+ * measured (unlike the doctor check): the loop only needs to decide what to
+ * remove, not report how much space it reclaimed.
+ */
+function startTerminalWorktreeCleanupLoop(projectRoot: string): () => void {
+  const forcedInTest = process.env.LAZY_FORCE_CAPTURE_SWEEP === '1';
+  if (process.env.LAZY_TEST === '1' && !forcedInTest) {
+    logger.debug('Worktree cleanup loop disabled under LAZY_TEST');
+    return () => {};
+  }
+  const intervalMs = forcedInTest ? WORKTREE_CLEANUP_TEST_INTERVAL_MS : WORKTREE_CLEANUP_INTERVAL_MS;
+
+  let sweeping = false;
+  let stopped = false;
+
+  const doSweep = async () => {
+    if (stopped || sweeping) return;
+    sweeping = true;
+    try {
+      const storage = await getOrCreateStorage();
+      const worktrees = await findTerminalTaskWorktrees(projectRoot, storage);
+      for (const w of worktrees) {
+        if (stopped) break;
+        // A live lock means some other process (an accept/close/reject still
+        // mid-flight, or a human in `lazy shell`) is using this worktree right
+        // now — skip it this tick rather than race its own cleanup step.
+        if (await checkLock(w.path)) continue;
+        try {
+          await cleanupWorktree(w.path, projectRoot, storage, w.taskId, w.sessionId);
+          logger.info(`Worktree cleanup: removed leftover worktree for finished task ${w.taskCode} (${w.path})`);
+        } catch (err) {
+          logger.warn(`Worktree cleanup failed for ${w.taskCode} (${w.path}): ${err instanceof Error ? err.message : err}`);
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.debug(`Worktree cleanup sweep failed: ${msg}`);
+    } finally {
+      sweeping = false;
+    }
+  };
+
+  // First sweep shortly after start, then on interval.
+  const initialTimeout = setTimeout(doSweep, forcedInTest ? 200 : 10_000);
+  const intervalId = setInterval(doSweep, intervalMs);
+  logger.debug(`Daemon worktree cleanup loop enabled: every ${intervalMs / 1000}s`);
+
+  return () => {
+    stopped = true;
+    clearTimeout(initialTimeout);
+    clearInterval(intervalId);
+  };
+}
+
 /**
  * Start an independent sync loop that runs remote operations
  * (upstream fetch, PR comment fetching, branch export, CI checks)
@@ -2014,16 +2977,20 @@ function startConversationCaptureLoop(projectRoot: string): () => void {
 function startDaemonSyncLoop(projectRoot: string): () => void {
   let syncing = false;
   let stopped = false;
+  const health = daemonHealthRecorder(projectRoot);
 
   const doSync = async () => {
     if (stopped) return;
     if (syncing) {
       logger.debug('Daemon sync: skipping tick, previous sync still running');
+      health.tickSkipped(REMOTE_SYNC_LOOP);
       return;
     }
 
     syncing = true;
     const syncStart = Date.now();
+    health.tickStarted(REMOTE_SYNC_LOOP);
+    let tickError: unknown;
     try {
       const config = await loadConfig(projectRoot);
       const syncInterval = config.server.sync_interval;
@@ -2045,8 +3012,10 @@ function startDaemonSyncLoop(projectRoot: string): () => void {
       const msg = err instanceof Error ? err.message : String(err);
       if (!msg.includes('Sync requires a remote driver')) {
         logger.debug(`Daemon sync error: ${msg}`);
+        tickError = err;
       }
     } finally {
+      health.tickFinished(REMOTE_SYNC_LOOP, syncStart, tickError);
       const durationMs = Date.now() - syncStart;
       logger.debug(`Daemon sync tick completed in ${durationMs}ms`);
       syncing = false;
@@ -2062,6 +3031,7 @@ function startDaemonSyncLoop(projectRoot: string): () => void {
   let intervalId: ReturnType<typeof setInterval>;
   loadConfig(projectRoot).then(config => {
     const syncIntervalMs = (config.server.sync_interval || 60) * 1_000;
+    health.loopStarted(REMOTE_SYNC_LOOP, syncIntervalMs);
     intervalId = setInterval(doSync, syncIntervalMs);
     logger.debug(`Daemon sync loop enabled: every ${config.server.sync_interval || 60}s`);
   }).catch(err => {
@@ -2073,6 +3043,7 @@ function startDaemonSyncLoop(projectRoot: string): () => void {
     // would be worse than syncing at the documented default interval. It is not
     // silent, though: warn level, with the cause, so the log says why the
     // interval isn't the configured one.
+    health.loopStarted(REMOTE_SYNC_LOOP, 60_000);
     intervalId = setInterval(doSync, 60_000);
     logger.warn(`Daemon sync loop falling back to every 60s — lazy.toml no longer loads: ${err instanceof Error ? err.message : err}`);
   });

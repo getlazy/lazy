@@ -111,4 +111,44 @@ describe('a dashboard route that overruns its deadline', () => {
     const response = await fetch(`http://localhost:${server.port}/api/tasks`);
     expect(response.status).toBe(200);
   });
+
+  // INVARIANT: API clients must never get HTML error pages — a thrown error on
+  // an /api/ route returns a JSON envelope so poll loops fail loudly, not on
+  // JSON.parse of text/html.
+  test('an API route returns JSON on an unexpected thrown error', async () => {
+    const storage = new Proxy({}, {
+      get(_target, prop) {
+        if (prop === 'resolveTask') {
+          return async () => {
+            throw new Error('storage blew up');
+          };
+        }
+        // Every unmocked method answers the interface's empty array, like the
+        // other storage Proxy mocks — a null here iterates as a TypeError
+        // wherever a route next gains a storage call, far from this mock.
+        return async () => [];
+      },
+    }) as unknown as Storage;
+
+    const sessionActions = {
+      get: async () => null,
+      getTranscript: async () => [],
+      start: async () => {
+        throw new Error('unused');
+      },
+      send: async () => {},
+    };
+
+    const server = Bun.serve({
+      port: 0,
+      fetch: createWebRequestHandler(storage, undefined, { reviewSessionActions: sessionActions }),
+    });
+    servers.push(server);
+
+    const response = await fetch(`http://127.0.0.1:${server.port}/api/review/deadbeef/session`);
+    expect(response.status).toBe(500);
+    expect(response.headers.get('content-type')).toContain('application/json');
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain('storage blew up');
+  });
 });

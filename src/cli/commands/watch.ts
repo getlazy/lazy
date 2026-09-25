@@ -26,26 +26,32 @@
  */
 
 import { open, stat } from 'fs/promises';
-import {
-  requireStorage, requireLazyRoot, displayId, parseFlags, taskRef,
-  resolveTaskOrExit, getWorktreePath,
-} from '../helpers';
-import { theme, dim } from '../theme';
+import { displayId, taskRef, getWorktreePath } from '../../task/identity';
+import { requireStorage, requireLazyRoot, parseFlags, resolveTaskOrExit } from '../helpers';
+import { theme, dim } from '../../render/theme';
 import { findLatestSessionFile } from '../../agent/session-discovery';
-import { renderEntry, type RawLogEntry } from '../watch-renderer';
+import { renderEntry, type RawLogEntry } from '../../render/watch-renderer';
 import { createRunner } from '../../runner';
-import type { FollowHandle, Runner } from '../../runner/types';
+import type { FollowHandle } from '../../runner/types';
 import { protocolDir as getProtocolDir, readStatus } from '../../protocol';
-import { renderStatusHeader } from '../status-header';
-import { computeWorkingSubstate, formatWorkingSubstate } from '../../utils/working-substate';
+import { renderStatusHeader } from '../../render/status-header';
+import { formatWorkingSubstate, type WorkingSubstate } from '../../utils/working-substate';
+import { readTaskWorkingSubstate } from '../../utils/working-run';
 import { streamProxyActivity, type ProxyStreamHandle } from '../proxy-activity-stream';
-import { PROXY_LINE_PREFIX } from '../proxy-activity-renderer';
+import { PROXY_LINE_PREFIX } from '../../render/proxy-activity-renderer';
 
 const POLL_INTERVAL_MS = 500;
 const STATUS_CHECK_INTERVAL_MS = 5000;
 
 // ── Session file discovery ──────────────────────────────────────────────
 
+/**
+ * The newest AGENT session in the dir. Polled every tick, so watch follows a
+ * new session when the agent restarts — but never lazy's own machine one-shots,
+ * which land in the same dir and would otherwise win on mtime and splice a
+ * housekeeping prompt into the task's timeline (`findLatestSessionFile` filters
+ * them at the seam).
+ */
 async function findSessionFile(projectDir: string): Promise<string | null> {
   const info = await findLatestSessionFile(projectDir);
   return info?.path ?? null;
@@ -210,7 +216,8 @@ async function doWatch(
   }
 
   // Print initial header (if status.json exists)
-  await printHeader(protoDir, runner, runName);
+  const liveSubstate = () => readTaskWorkingSubstate(root, storage, task.id, runner);
+  await printHeader(protoDir, liveSubstate);
 
   let supervisorReaderDone = false;
   if (followHandle?.stdout) {
@@ -313,7 +320,7 @@ async function doWatch(
       // Refresh header every 5s alongside the status check
       if (now - lastHeaderPrint >= STATUS_CHECK_INTERVAL_MS) {
         lastHeaderPrint = now;
-        await printHeader(protoDir, runner, runName);
+        await printHeader(protoDir, liveSubstate);
       }
 
       if (now - lastStatusCheck >= STATUS_CHECK_INTERVAL_MS) {
@@ -342,29 +349,25 @@ async function doWatch(
 
 async function printHeader(
   protoDir: string,
-  runner: Runner | null,
-  runName: string | null,
+  liveSubstate: () => Promise<WorkingSubstate | null>,
 ): Promise<void> {
   const status = readStatus(protoDir);
   let line = renderStatusHeader(status);
 
-  // Append the derived substate (agent / harness:<phase> / not-alive), reconciled
-  // with run liveness via the shared derivation, when the runner is available.
-  if (runner && runName) {
-    try {
-      const info = await runner.getRunInfo(runName);
-      const substate = await computeWorkingSubstate(protoDir, info?.running === true);
-      // Drop the retry detail from the substate suffix — the header half already
-      // renders it, and repeating "attempt 7: <error>" twice on one line makes a
-      // long line longer without adding anything.
-      const suffix = substate && substate.kind === 'harness' && substate.retry
-        ? formatWorkingSubstate({ ...substate, retry: undefined })
-        : substate && formatWorkingSubstate(substate);
-      if (suffix) line += `  [${suffix}]`;
-    } catch {
-      // Liveness probe failed (runner hiccup) — the supervisor header is still
-      // useful on its own, so render it without the substate suffix.
-    }
+  // Append the derived substate (agent / harness:<phase> / not-alive), probed
+  // the way the reconciler probes it (src/utils/working-run.ts).
+  try {
+    const substate = await liveSubstate();
+    // Drop the retry detail from the substate suffix — the header half already
+    // renders it, and repeating "attempt 7: <error>" twice on one line makes a
+    // long line longer without adding anything.
+    const suffix = substate && substate.kind === 'harness' && substate.retry
+      ? formatWorkingSubstate({ ...substate, retry: undefined })
+      : substate && formatWorkingSubstate(substate);
+    if (suffix) line += `  [${suffix}]`;
+  } catch {
+    // Liveness probe failed (runner hiccup) — the supervisor header is still
+    // useful on its own, so render it without the substate suffix.
   }
 
   process.stdout.write(dim(line) + '\n');

@@ -1,42 +1,37 @@
+/*
+ * The activity heatmap.
+ *
+ * The two ramps used to be GitHub's green and orange, which are the one thing
+ * on this surface that could not be said in the design system's vocabulary.
+ * They are now built from the tokens: accent for human turns, success for tasks
+ * accepted — mixed toward the page ground, so the whole scale re-tunes with the
+ * theme and inverts correctly in dark mode without a second block of literals.
+ */
 :root {
-  --hm-empty: #ebedf0;
-  --hm-g1: #9be9a8;
-  --hm-g2: #40c463;
-  --hm-g3: #30a14e;
-  --hm-g4: #216e39;
-  --hm-o1: #fde0a7;
-  --hm-o2: #fdba5c;
-  --hm-o3: #f47d21;
-  --hm-o4: #c35711;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --hm-empty: #161b22;
-    --hm-g1: #0e4429;
-    --hm-g2: #006d32;
-    --hm-g3: #26a641;
-    --hm-g4: #39d353;
-    --hm-o1: #3d2000;
-    --hm-o2: #6d3a00;
-    --hm-o3: #d97706;
-    --hm-o4: #fdba5c;
-  }
+  --hm-empty: color-mix(in srgb, var(--color-text) 8%, transparent);
+  --hm-g1: color-mix(in srgb, var(--color-accent) 25%, var(--color-bg));
+  --hm-g2: color-mix(in srgb, var(--color-accent) 50%, var(--color-bg));
+  --hm-g3: color-mix(in srgb, var(--color-accent) 75%, var(--color-bg));
+  --hm-g4: var(--color-accent);
+  --hm-o1: color-mix(in srgb, var(--color-success) 25%, var(--color-bg));
+  --hm-o2: color-mix(in srgb, var(--color-success) 50%, var(--color-bg));
+  --hm-o3: color-mix(in srgb, var(--color-success) 75%, var(--color-bg));
+  --hm-o4: var(--color-success);
 }
 .hm-scroll { overflow-x: auto; }
 .hm-day {
   width: 13px;
   height: 13px;
   display: flex;
-  border-radius: 2px;
   overflow: hidden;
 }
 .hm-active { cursor: pointer; }
 .hm-active:hover {
-  outline: 1px solid var(--text-secondary);
+  outline: 1px solid var(--color-text);
   outline-offset: -1px;
 }
 .hm-selected {
-  outline: 2px solid var(--link) !important;
+  outline: 2px solid var(--color-accent) !important;
   outline-offset: -1px;
 }
 .hm-l, .hm-r {
@@ -47,20 +42,19 @@
   display: inline-block;
   width: 12px;
   height: 12px;
-  border-radius: 2px;
   vertical-align: middle;
 }
 .hm-legend-scale {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding-top: 20px;
+  gap: var(--space-3);
+  padding-top: var(--space-6);
   flex-shrink: 0;
 }
 .hm-legend-title {
   font-size: 11px;
-  color: var(--text-secondary);
-  margin-bottom: 4px;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+  margin-bottom: var(--space-1);
 }
 .hm-legend-bar {
   display: flex;
@@ -69,64 +63,32 @@
 }
 .hm-legend-text {
   font-size: 10px;
-  color: var(--text-secondary);
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
   padding: 0 4px;
 }
 .hm-months {
   font-size: 11px;
-  color: var(--text-secondary);
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
 }
 .hm-day-labels {
   font-size: 11px;
-  color: var(--text-secondary);
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
   text-align: right;
   padding-right: 4px;
   min-width: 28px;
 }
 .hm-report {
-  margin-top: 16px;
-  padding: 12px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  background: var(--bg);
+  margin-top: var(--space-4);
+  padding: var(--space-3);
+  border: 1px solid var(--color-divider);
+  background: var(--color-bg);
 }
 .hm-report h3 {
   font-size: 14px;
-  margin-bottom: 8px;
+  margin: 0 0 var(--space-2);
 }
 .hm-report-stats {
   display: flex;
-  gap: 24px;
+  gap: var(--space-6);
   font-size: 13px;
-}
-.stat-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-  gap: 12px;
-  margin-bottom: 24px;
-}
-.stat-card {
-  padding: 16px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg-secondary);
-  text-align: center;
-  text-decoration: none;
-  color: inherit;
-}
-.stat-card-link:hover {
-  border-color: var(--link);
-  text-decoration: none;
-}
-.stat-value {
-  font-size: 28px;
-  font-weight: bold;
-  line-height: 1.2;
-}
-.stat-label {
-  font-size: 12px;
-  color: var(--text-secondary);
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  margin-top: 4px;
 }

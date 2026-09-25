@@ -29,6 +29,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterAll } from 'bun:test';
+import { ANTHROPIC_DEFAULT_TARGET } from '../../src/utils/role-target';
 import { mockModule, restoreMockedModules } from '../helpers/mock-module';
 import { resolve } from 'path';
 import { RpcError as RealRpcError } from '../../src/daemon/rpc-handlers';
@@ -51,12 +52,17 @@ await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => (
   loadConfig: async () => ({
     remote: { driver: 'gitlab', git_remote: 'origin', auto_approve: false },
     storage: { backend: 'external', external_path: '' },
+    // ResolvedConfig always carries a fully-populated `review` section, and
+    // the accept gate reads `config.review.mode` unguarded like every other
+    // required section. `separate` keeps these doubles on the pre-2026-09-21
+    // behaviour, where every recorded review turn gates.
+    review: { mode: 'separate', auto_fix: false, draft_effort: 'low', review_effort: 'xhigh' },
     // ResolvedConfig always carries a fully-populated `automation` section, and
     // acceptTask reads `config.automation.pre_accept` unguarded like every other
     // required section. This test is about concurrent-accept mutual exclusion,
     // not the pre-accept turn, so the step is disabled here.
-    automation: { maintain: [], pre_accept: { enabled: false, commands: [], timeout: 600 } },
-    models: { default: 'claude-opus-4-7', roles: { builder: { backend: 'anthropic', model: '', endpoint: '' }, agent: { backend: 'anthropic', model: '', endpoint: '' } } },
+    automation: { maintain: [], react: [], pre_accept: { enabled: false, commands: [], timeout: 600 }, accept_check: '', accept_check_timeout: 300 },
+    models: { default: 'claude-opus-4-7', roles: { builder: ANTHROPIC_DEFAULT_TARGET, agent: ANTHROPIC_DEFAULT_TARGET } },
     git: { default_branch_prefix: 'lazy' },
     // Race behavior under test is orthogonal to the edge gate; gate scenarios
     // are covered by test/unit/edge-gate.test.ts + test/e2e/approve.test.ts.
@@ -86,7 +92,7 @@ await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => {
     async checkAcceptGates() { return []; }
     async merge() { return { status: 'merged' as const }; }
     async fastForwardLocal() { return { success: true }; }
-    async postAcceptReview() { return null; }
+    async approveForMerge() { return null; }
     async getTaskUrl() { return null; }
     async updateRemoteBody() {}
   };
@@ -100,10 +106,12 @@ await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => {
       isTargetBranchProtected: async () => true,
       pushBranch: async () => {},
       markReadyForReview: async () => ({ metadata: { gitlab_remote_ref_id: '1' } }),
+      // The recorded PR merges into the task's own target (src/daemon/review-base.ts checks it).
+      getReviewBase: async (t: any) => (t.target?.kind === 'branch' ? (t.target.branch || 'main') : null),
       getPRState: async () => 'MERGED',
       getChecksStatus: async () => ({ status: 'passed' as const, failed: [] }),
       getTaskUrl: async () => 'https://gitlab/mr/1',
-      postAcceptReview: async () => null,
+      approveForMerge: async () => null,
       checkAcceptGates: async () => [],
       merge: async () => {
         mergeCallCount++;
@@ -113,7 +121,6 @@ await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => {
         return { status: 'merged' as const, metadata: {} };
       },
       fastForwardLocal: async () => ({ success: true }),
-      postTurnSummary: async () => {},
       updateRemoteBody: async () => {},
       recoverRemoteRef: async () => null,
     }),
@@ -155,7 +162,7 @@ await mockModule(resolve(import.meta.dir, '../../src/utils/lock.ts'), () => ({
   removeLock: () => {},
 }));
 
-await mockModule(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/task/identity.ts'), () => ({
   shortId: (id: string) => id.substring(0, 8),
   displayId: (task: any) => task.code ?? task.id.substring(0, 8),
   taskRef: (task: any) => task.code ?? task.id.substring(0, 8),
@@ -164,7 +171,7 @@ await mockModule(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
   getBranchNameFromId: async () => 'lazy/parent-branch',
 }));
 
-await mockModule(resolve(import.meta.dir, '../../src/cli/orphan.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/task/orphan.ts'), () => ({
   checkOrphanedChild: async () => null,
   retargetOrphanedChild: async () => {},
   getActiveChildren: async () => [],
@@ -172,17 +179,21 @@ await mockModule(resolve(import.meta.dir, '../../src/cli/orphan.ts'), () => ({
   formatReparentWarning: () => null,
 }));
 
-await mockModule(resolve(import.meta.dir, '../../src/cli/commands/shared.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/task/turn-context.ts'), () => ({
   buildNotesContext: () => '',
   buildSystemPrompt: () => '',
   buildPromptWithInstructions: () => '',
   buildTurnHistoryContext: () => '',
   getNewNotesSince: async () => [],
+}));
+await mockModule(resolve(import.meta.dir, '../../src/task/sync-remote.ts'), () => ({
   runSyncWithRemote: async () => {},
+  syncTaskFromRemote: async () => {},
+}));
+await mockModule(resolve(import.meta.dir, '../../src/task/cleanup.ts'), () => ({
   cleanupWorktree: () => {},
   cleanupWorktreeAndBranch: () => {},
   cleanupTaskContainer: async () => {},
-  syncTaskFromRemote: async () => {},
 }));
 
 await mockModule(resolve(import.meta.dir, '../../src/protocol/index.ts'), () => ({
@@ -209,10 +220,20 @@ function createMockStorage() {
     resolveTask: async () => ({ task: mockTask, ambiguousMatches: [] }),
     getTask: async () => mockTask,
     getSessionByTaskId: async () => mockSession,
-    getSessionTurns: async () => [],
+    // One turn carrying a standing final claim: the finality gate (§5.1) is
+    // fixture setup here, not the subject — this suite is about concurrent
+    // accepts' mutual exclusion. See test/helpers/final.ts for the real shape.
+    getSessionTurns: async () => [{
+      id: 'seeded-final', sequence: 1, role: 'human', content: '[system] Finalize declared',
+      timestamp: 1, turn_type: 'pre_accept',
+      final: { sha: 'abc123', actor: 'human', at: 1, wrap_up_steps: [] },
+    }],
     getSessionCommits: async () => mockCommits,
+    getTaskReviewComments: async () => [],
     getTaskComments: async () => [],
     getChildTasks: async () => [],
+    getTaskRaisedItems: async () => [],
+    resolveRaisedItem: async () => { throw new Error('unexpected resolveRaisedItem in concurrent-race test'); },
     updateTaskStatus: async (_id: string, status: string) => {
       mockTask.status = status;
       statusHistory.push(status);

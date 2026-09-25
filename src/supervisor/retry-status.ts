@@ -1,7 +1,7 @@
 /**
  * Retry status projection — writes the retry loop's state into status.json.
  *
- * One implementation shared by every command path (work, ask, pre-accept) that
+ * One implementation shared by every command path (work, ask, review) that
  * calls runWork. Previously each path carried its own copy of this callback and
  * they had already drifted (only the work path logged). Presentation surfaces
  * (`lazy watch` header, `lazy show`, MCP) read these fields — including the

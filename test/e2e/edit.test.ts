@@ -4,6 +4,7 @@ import { readFileSync, readdirSync } from 'fs';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, extractTaskId } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { readTaskJson, readSessionJson, setTaskStatus } from '../helpers/storage';
 
 /**
  * Resolve the tasks directory for a test project. Test projects use external
@@ -384,5 +385,52 @@ describe('lazy edit on started tasks', () => {
     expectError(editResult, "Invalid effort 'banana'");
     expectError(editResult, 'low, medium, high, xhigh, max');
     expect(readTaskEffort(ctx.root, taskId)).toBeUndefined();
+  });
+
+  // INVARIANT (fix-edit-agent-status-gate): agent switches are refused while a
+  // turn is in flight. The gate lives in switchTaskAgent so every caller gets
+  // it; a refused edit must not clear agent_session_id or change agent_id.
+  test('agent edit is refused while the task is working', async () => {
+    const taskId = await startedTask();
+    const beforeAgent = readTaskJson(ctx.root, taskId).agent_id;
+    const beforeSession = readSessionJson(ctx.root, taskId);
+    expect(beforeSession).not.toBeNull();
+    const beforeAgentSessionId = beforeSession!.agent_session_id;
+
+    setTaskStatus(ctx.root, taskId, 'working');
+
+    const result = await ctx.lazy(['edit', taskId, '--agent', 'cursor']);
+    expectFailure(result);
+    expectError(result, 'turn is in flight');
+    expectError(result, 'lazy stop');
+
+    expect(readTaskJson(ctx.root, taskId).agent_id).toBe(beforeAgent);
+    const afterSession = readSessionJson(ctx.root, taskId);
+    expect(afterSession!.agent_id).toBe(beforeSession!.agent_id);
+    expect(afterSession!.agent_session_id).toBe(beforeAgentSessionId);
+  });
+
+  // INVARIANT (fix-edit-agent-status-gate): start calls switchTaskAgent before
+  // flipping status to working on a new turn, but does NOT refuse an
+  // already-working task at validateTask — so `lazy start --agent` on a
+  // stranded-working task hits the same gate as edit. Recovery is stop, then retry.
+  test('start --agent is refused while the task is working', async () => {
+    const taskId = await startedTask();
+    const beforeAgent = readTaskJson(ctx.root, taskId).agent_id;
+    const beforeSession = readSessionJson(ctx.root, taskId);
+    expect(beforeSession).not.toBeNull();
+    const beforeAgentSessionId = beforeSession!.agent_session_id;
+
+    setTaskStatus(ctx.root, taskId, 'working');
+
+    const result = await ctx.lazy(['start', taskId, '--agent', 'cursor', '--yes']);
+    expectFailure(result);
+    expectError(result, 'turn is in flight');
+    expectError(result, 'lazy stop');
+
+    expect(readTaskJson(ctx.root, taskId).agent_id).toBe(beforeAgent);
+    const afterSession = readSessionJson(ctx.root, taskId);
+    expect(afterSession!.agent_id).toBe(beforeSession!.agent_id);
+    expect(afterSession!.agent_session_id).toBe(beforeAgentSessionId);
   });
 });

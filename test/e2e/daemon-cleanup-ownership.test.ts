@@ -5,13 +5,14 @@
  * ---------------------------
  * `lazy daemon start` was run while a healthy daemon was already up. The start
  * lost (the incumbent held the storage lock) — but before losing it had already
- * unlinked `lazy.pid` and `lazy.sock`, which belonged to the LIVE daemon. Because
- * liveness was then decided from those very files, every subsequent CLI command
- * reported "Daemon is not running." against a daemon that was serving requests
- * fine, and every start attempt failed because the live daemon still held the
- * lock. A unix socket file exists only while its listener holds it, so it could
- * not be restored by hand: the only way out was killing a healthy daemon, which
- * strands every running builder, agent and pair session on a dead proxy address.
+ * unlinked the LIVE daemon's state files (then `lazy.pid` and the unix socket
+ * file; today just `lazy.pid` — the TCP listener cannot be deleted out from
+ * under a daemon). Because liveness was then decided from those very files,
+ * every subsequent CLI command reported "Daemon is not running." against a
+ * daemon that was serving requests fine, and every start attempt failed because
+ * the live daemon still held the lock: the only way out was killing a healthy
+ * daemon, which strands every running builder, agent and pair session on a dead
+ * proxy address.
  *
  * The three invariants below are each independently sufficient to prevent that,
  * and are asserted separately on purpose — a regression in any one of them is a
@@ -43,7 +44,7 @@ import {
 } from '../../src/daemon/lifecycle';
 import { spawn } from '../../src/utils/spawn';
 import { inspectDaemonStateFiles } from '../../src/daemon/state-files';
-import { getDaemonDir, getPidPath, getSocketPath } from '../../src/daemon/paths';
+import { getDaemonDir, getPidPath, getLegacySocketPath } from '../../src/daemon/paths';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput } from '../helpers/assertions';
 import { makeDaemonBaseDir, removeDaemonBaseDir } from '../helpers/daemon-base-dir';
@@ -102,12 +103,10 @@ describe('daemon state-file ownership', () => {
    * incumbent must remain discoverable both in-process and to the real CLI.
    */
   test('a losing start cannot delete the live daemon files, and the CLI still works', async () => {
-    daemon = await startDaemonServer({ projectRoot: ctx.root, noWeb: true });
+    daemon = await startDaemonServer({ projectRoot: ctx.root, webPort: 0 });
 
     const pidPath = getPidPath(ctx.root);
-    const socketPath = getSocketPath(ctx.root);
     expect(existsSync(pidPath)).toBe(true);
-    expect(existsSync(socketPath)).toBe(true);
 
     // The daemon really holds its lock — otherwise the rest of this test would
     // be asserting on the wrong mechanism (see the LAZY_TEST note in the header).
@@ -118,7 +117,6 @@ describe('daemon state-file ownership', () => {
     expect(cleanupStaleFiles(ctx.root)).toBe('refused-lock-held');
 
     expect(existsSync(pidPath)).toBe(true);
-    expect(existsSync(socketPath)).toBe(true);
     expect(isDaemonRunning(ctx.root)).toBe(true);
 
     const health = await checkDaemonHealth(ctx.root);
@@ -135,16 +133,15 @@ describe('daemon state-file ownership', () => {
 
   /**
    * INVARIANT: liveness rests on evidence a losing racer cannot destroy.
-   * Deleting the PID and socket files must not make a running daemon look dead,
-   * because those files are precisely what the old failure mode removed. The
+   * Deleting the PID file must not make a running daemon look dead,
+   * because that file is precisely what the old failure mode removed. The
    * daemon lock is the authoritative signal — it cannot be faked, and it cannot
    * be taken away from its holder.
    */
-  test('liveness survives deletion of the PID and socket files', async () => {
-    daemon = await startDaemonServer({ projectRoot: ctx.root, noWeb: true });
+  test('liveness survives deletion of the PID file', async () => {
+    daemon = await startDaemonServer({ projectRoot: ctx.root, webPort: 0 });
 
     await rm(getPidPath(ctx.root), { force: true });
-    await rm(getSocketPath(ctx.root), { force: true });
 
     expect(isDaemonRunning(ctx.root)).toBe(true);
 
@@ -156,22 +153,19 @@ describe('daemon state-file ownership', () => {
   });
 
   /**
-   * INVARIANT: the state is recoverable without killing a healthy daemon. A
-   * socket file cannot be re-created by hand — only its listener can make one —
-   * so the daemon repairs its own files, and the CLI can reach it again with no
-   * restart and no interrupted agent sessions.
+   * INVARIANT: the state is recoverable without killing a healthy daemon. The
+   * daemon repairs its own PID file, so file-based fallbacks (and `lazy
+   * doctor`) name it again with no restart and no interrupted agent sessions.
    */
-  test('the daemon re-creates its own PID and socket files and answers again', async () => {
-    daemon = await startDaemonServer({ projectRoot: ctx.root, noWeb: true });
+  test('the daemon re-creates its own PID file and answers again', async () => {
+    daemon = await startDaemonServer({ projectRoot: ctx.root, webPort: 0 });
     const pidPath = getPidPath(ctx.root);
-    const socketPath = getSocketPath(ctx.root);
 
     await rm(pidPath, { force: true });
-    await rm(socketPath, { force: true });
-    expect(existsSync(socketPath)).toBe(false);
+    expect(existsSync(pidPath)).toBe(false);
 
     const repaired = await waitFor(
-      () => existsSync(pidPath) && existsSync(socketPath),
+      () => existsSync(pidPath),
       REPAIR_TIMEOUT_MS,
     );
     expect(repaired).toBe(true);
@@ -191,16 +185,17 @@ describe('daemon state-file ownership', () => {
     const daemonDir = getDaemonDir(ctx.root);
     await mkdir(daemonDir, { recursive: true });
     await writeFile(join(daemonDir, 'lazy.pid'), String(DEAD_PID));
+    // A socket file left behind by a pre-v0.22 daemon (migration path).
     await writeFile(join(daemonDir, 'lazy.sock'), 'leftover');
 
     expect(cleanupStaleFiles(ctx.root)).toBe('removed');
     expect(existsSync(getPidPath(ctx.root))).toBe(false);
-    expect(existsSync(getSocketPath(ctx.root))).toBe(false);
+    expect(existsSync(getLegacySocketPath(ctx.root))).toBe(false);
   });
 
   /**
    * INVARIANT: the state-file diagnostic must stay silent whenever the lock
-   * cannot testify. A missing PID/socket pair is only evidence of the wedge if a
+   * cannot testify. A missing PID file is only evidence of the wedge if a
    * daemon demonstrably OWNS the directory — with no lock file (daemons started
    * under LAZY_TEST=1 skip the lock, and directories predating flock
    * enforcement have none) or a free lock (the daemon really is gone), absent
@@ -212,7 +207,7 @@ describe('daemon state-file ownership', () => {
     const daemonDir = getDaemonDir(ctx.root);
     await mkdir(daemonDir, { recursive: true });
 
-    // No lock file at all, and no PID/socket either.
+    // No lock file at all, and no PID file either.
     expect(probeDaemonLockSync(ctx.root)).toBe('unknown');
     const noLock = await inspectDaemonStateFiles(ctx.root);
     expect(noLock.lock).toBe('unknown');
@@ -324,7 +319,7 @@ describe('daemon state-file ownership', () => {
    * make it flake.
    */
   test('a real incumbent still refuses a second acquire, after retrying', async () => {
-    daemon = await startDaemonServer({ projectRoot: ctx.root, noWeb: true });
+    daemon = await startDaemonServer({ projectRoot: ctx.root, webPort: 0 });
 
     const startedAt = Date.now();
     expect(acquireDaemonLock(ctx.root)).toBeNull();

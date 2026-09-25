@@ -27,18 +27,32 @@ export const TOOL_ACCESS: Readonly<Record<string, ToolAccess>> = {
   lazy_blocked: 'read',
   lazy_active: 'read',
   lazy_diff: 'read',
+  lazy_regions: 'read',
   lazy_status: 'read',
   lazy_wait: 'read',
   lazy_conversations: 'read',
   lazy_conversation_search: 'read',
   lazy_conversation_read: 'read',
   lazy_memory_recall: 'read',
+  // Read-only by construction: builders write scratch by writing FILES into
+  // $LAZY_SCRATCH_DIR, and capture persists them. There is no write tool.
+  lazy_scratch: 'read',
+  // Pure read by design: it never marks messages read (read state tracks the
+  // human, set by `lazy messages read`) — see createMessagesHandler.
+  lazy_messages: 'read',
+  // Pure read of the proxy's latest readings and the pause state.
+  lazy_usage_limits: 'read',
+  lazy_raised_items: 'read',
+  lazy_raised_promote: 'write',
+  lazy_artifact_list: 'read',
+  lazy_artifact_get: 'read',
 
   // --- Writes ---
   lazy_create: 'write',
   lazy_start: 'write',
   lazy_unblock: 'write',
   lazy_ask: 'write',
+  lazy_review: 'write',
   // Writes nothing — the conversation is immutable and the answer goes to the
   // caller — but it launches a throwaway agent, and 'read' means "cannot launch
   // an agent". Classified by effect, not by what it persists.
@@ -55,12 +69,21 @@ export const TOOL_ACCESS: Readonly<Record<string, ToolAccess>> = {
   lazy_redo: 'write',
   lazy_sync: 'write',
   lazy_reparent: 'write',
-  lazy_prioritize: 'write',
+  lazy_link: 'write',
   lazy_comment: 'write',
   lazy_journal: 'write',
   lazy_tag: 'write',
   lazy_untag: 'write',
-  lazy_add_followup: 'write',
+  lazy_raise: 'write',
+  // Writes no task state and starts nothing, but it records a claim the accept
+  // gate will read and drops a marker the supervisor acts on. Classified by
+  // effect, like lazy_update_progress: 'read' is the promise that a tool is inert.
+  lazy_final: 'write',
+  lazy_raised_item_comment: 'write',
+  lazy_report: 'write',
+  lazy_justify_protected: 'write',
+  lazy_justify_maintain: 'write',
+  lazy_artifact_add: 'write',
   // Writes no task state, no worktree, launches nothing — but it does write a
   // per-turn observability marker the daemon owns, and 'read' is the promise
   // that a tool is inert. Classified by effect: an ask turn's contract is "your
@@ -69,6 +92,8 @@ export const TOOL_ACCESS: Readonly<Record<string, ToolAccess>> = {
   lazy_update_progress: 'write',
   lazy_commit: 'write',
   lazy_memory_save: 'write',
+  lazy_message_post: 'write',
+  lazy_message_dismiss: 'write',
 };
 
 /** Tool names that cannot mutate state, in table order. */
@@ -84,4 +109,40 @@ export const READ_ONLY_TOOL_NAMES: readonly string[] = Object.entries(TOOL_ACCES
  */
 export function isReadOnlyTool(name: string): boolean {
   return TOOL_ACCESS[name] === 'read';
+}
+
+/**
+ * Write tools a review turn may call. Findings are Raises — the reviewer files
+ * them with `lazy_raise` and otherwise stays read-only (no commits, no edits).
+ */
+export const REVIEW_WRITE_TOOLS = ['lazy_raise'] as const;
+
+/**
+ * MCP toolset for one turn.
+ *
+ * - `full` — work turns (every classified tool the role may see)
+ * - `read` — ask turns (inert tools only)
+ * - `review` — agent review turns (reads + {@link REVIEW_WRITE_TOOLS})
+ */
+export type McpToolset = 'full' | 'read' | 'review';
+
+/**
+ * May this tool be advertised / called on the given toolset?
+ *
+ * Unknown names fail closed on every non-full toolset.
+ */
+export function isToolAllowedOnToolset(name: string, toolset: McpToolset): boolean {
+  if (toolset === 'full') return name in TOOL_ACCESS;
+  if (toolset === 'read') return isReadOnlyTool(name);
+  return isReadOnlyTool(name) || (REVIEW_WRITE_TOOLS as readonly string[]).includes(name);
+}
+
+/** Resolve CLI flags (`--read-only`, `--review`) into a toolset. */
+export function mcpToolsetFromFlags(flags: {
+  readOnly?: boolean;
+  review?: boolean;
+}): McpToolset {
+  if (flags.review) return 'review';
+  if (flags.readOnly) return 'read';
+  return 'full';
 }

@@ -7,7 +7,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, writeFileSync, mkdirSync, readFileSync } from 'fs';
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { launchSupervisorAsync } from '../mocks/claude';
@@ -26,6 +26,11 @@ const MAINTAIN = [
 describe('mock supervisor: maintained-files follow-up', () => {
   let worktree: string;
   let protocolDir: string;
+  /** Existence declares final for the turn the mock supervisor runs (the
+   *  wrap-up chain fires only on a declared-final turn — final-turn design
+   *  §14 slice 3). These tests drive launchSupervisorAsync directly, so the
+   *  flag file is both created here and named in the env the mock reads. */
+  let finalFlag: string;
   const saved: Record<string, string | undefined> = {};
 
   function setEnv(vars: Record<string, string>) {
@@ -38,6 +43,7 @@ describe('mock supervisor: maintained-files follow-up', () => {
   beforeEach(() => {
     worktree = mkdtempSync(join(tmpdir(), 'lazy-mock-sup-'));
     protocolDir = mkdtempSync(join(tmpdir(), 'lazy-mock-proto-'));
+    finalFlag = join(tmpdir(), `lazy-final-flag-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     git(worktree, 'init');
     git(worktree, 'config', 'user.email', 't@t.com');
     git(worktree, 'config', 'user.name', 'T');
@@ -54,6 +60,7 @@ describe('mock supervisor: maintained-files follow-up', () => {
   });
 
   afterEach(async () => {
+    rmSync(finalFlag, { force: true });
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
@@ -66,6 +73,14 @@ describe('mock supervisor: maintained-files follow-up', () => {
 
   function writeCommand(extra: Record<string, unknown>) {
     writeFileSync(join(protocolDir, 'command.json'), JSON.stringify({ type: 'start', task_id: 'mock', ...extra }));
+  }
+
+  /** Seed a declared-final turn for the mock: write the flag file and put its
+   *  path into LAZY_MOCK_FINAL (the mock's seam, mirroring what the daemon
+   *  launcher puts on the command plus what the agent declares via the marker). */
+  function declareFinal() {
+    writeFileSync(finalFlag, '');
+    setEnv({ LAZY_MOCK_FINAL: finalFlag });
   }
 
   function runAndReadResult(): Record<string, unknown> {
@@ -92,7 +107,8 @@ describe('mock supervisor: maintained-files follow-up', () => {
   // prompt, usage (incl. cache), and SHA window. Nudge text is NEVER appended to
   // the work result; the reconciler materializes the nudge as its own turn pair.
   test('emits a maintain follow-up as a separate bundle response when a group is skipped', async () => {
-    writeCommand({ maintain: MAINTAIN });
+    writeCommand({ maintain: MAINTAIN, wrap_up: { steps: ['permission_pushback', 'maintain', 'react'] } });
+    declareFinal();
     setEnv({
       LAZY_MOCK_SHOULD_COMMIT: '1',
       LAZY_MOCK_FILES: JSON.stringify([{ path: 'src/x.ts', content: 'export const x = 1;\n' }]),
@@ -121,7 +137,8 @@ describe('mock supervisor: maintained-files follow-up', () => {
   });
 
   test('no follow-up when a maintained file was touched (work response only)', async () => {
-    writeCommand({ maintain: MAINTAIN });
+    writeCommand({ maintain: MAINTAIN, wrap_up: { steps: ['permission_pushback', 'maintain', 'react'] } });
+    declareFinal();
     setEnv({
       LAZY_MOCK_SHOULD_COMMIT: '1',
       LAZY_MOCK_FILES: JSON.stringify([
@@ -138,7 +155,8 @@ describe('mock supervisor: maintained-files follow-up', () => {
   });
 
   test('no follow-up on a no-op turn (no changes)', async () => {
-    writeCommand({ maintain: MAINTAIN });
+    writeCommand({ maintain: MAINTAIN, wrap_up: { steps: ['permission_pushback', 'maintain', 'react'] } });
+    declareFinal();
     // No LAZY_MOCK_SHOULD_COMMIT → mock makes no changes.
     setEnv({ LAZY_MOCK_MAINTAIN_RESPONSE: 'should-not-appear' });
     const resp = await runAndReadResult();
@@ -159,7 +177,8 @@ describe('mock supervisor: maintained-files follow-up', () => {
     git(worktree, 'add', '.');
     git(worktree, 'commit', '-m', 'add spec');
 
-    writeCommand({ maintain: MAINTAIN, protected_patterns: ['*.spec.*'] });
+    writeCommand({ maintain: MAINTAIN, protected_patterns: ['*.spec.*'], wrap_up: { steps: ['permission_pushback', 'maintain', 'react'] } });
+    declareFinal();
     setEnv({
       LAZY_MOCK_SHOULD_COMMIT: '1',
       // Touches a protected file (violation) AND a plain file (so a net non-maintained
@@ -197,7 +216,8 @@ describe('mock supervisor: maintained-files follow-up', () => {
     git(worktree, 'add', '.');
     git(worktree, 'commit', '-m', 'add spec');
 
-    writeCommand({ maintain: MAINTAIN, protected_patterns: ['*.spec.*'] });
+    writeCommand({ maintain: MAINTAIN, protected_patterns: ['*.spec.*'], wrap_up: { steps: ['permission_pushback', 'maintain', 'react'] } });
+    declareFinal();
     setEnv({
       LAZY_MOCK_SHOULD_COMMIT: '1',
       LAZY_MOCK_FILES: JSON.stringify([

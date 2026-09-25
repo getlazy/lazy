@@ -2,7 +2,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { expectSuccess } from '../helpers/assertions';
+import { expectSuccess, extractTaskId } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS, disablePreAccept } from '../helpers/fixtures';
 
 /**
@@ -82,7 +82,10 @@ describe('[git] default_branch_prefix', () => {
       'create', '--goal', 'Child task', '--prompt', 'Child prompt', '--parent', parentId,
     ]);
     expectSuccess(childResult);
-    const childId = childResult.stdout.match(/([a-f0-9]{8})/)![1];
+    // extractTaskId, not a bare 8-hex regex: `lazy create --parent` names the
+    // PARENT before the new task in its output, so the first hex token in the
+    // stream is the wrong task.
+    const childId = extractTaskId(childResult.stdout);
 
     expectSuccess(await ctx.lazyMocked(['start', childId, '--yes'], MOCK_CLAUDE_SUCCESS, {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },

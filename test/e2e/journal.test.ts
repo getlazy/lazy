@@ -115,9 +115,9 @@ describe('lazy journal', () => {
 
 });
 
-// The prompt-immunity invariant needs a real run (a `start`), which requires
-// the daemon-backed storage path — hence a separate, daemon-enabled context.
-describe('lazy journal — prompt immunity', () => {
+// The prompt contract needs a real run (a `start`), which requires the
+// daemon-backed storage path — hence a separate, daemon-enabled context.
+describe('lazy journal — prompt contract', () => {
   let ctx: TestContext;
 
   beforeEach(async () => {
@@ -128,15 +128,26 @@ describe('lazy journal — prompt immunity', () => {
     await ctx.cleanup();
   });
 
-  // INVARIANT: journal entries are prompt-immune — they must NEVER be injected
-  // into the agent/LLM prompt. This is the load-bearing reason the journal is a
-  // separate entity from comments (which DO enter the prompt as guidance) rather
-  // than a flag on Comment: with no shared code path, a journal entry cannot leak
-  // into a prompt. This test pins that guarantee end to end: on the next run, a
-  // comment IS present in the assembled prompt while a journal entry is NOT.
+  const firstHumanPrompt = async (taskId: string): Promise<string> => {
+    const showResult = await ctx.lazy(['show', taskId, '--json']);
+    expectSuccess(showResult);
+    const data = JSON.parse(showResult.stdout);
+    const humanTurn = (data.turns as Array<{ role: string; prompt: string | null }>)
+      .find(t => t.role === 'human');
+    expect(humanTurn).toBeDefined();
+    return humanTurn!.prompt ?? '';
+  };
+
+  // INVARIANT: journal entry BODIES must NEVER be injected into the agent/LLM
+  // prompt. This is the load-bearing reason the journal is a separate entity from
+  // comments (which DO enter the prompt as guidance) rather than a flag on
+  // Comment: with no shared code path, an entry body cannot leak into a prompt.
+  // This test pins that guarantee end to end: on the next run, a comment's text IS
+  // present in the assembled prompt while a journal entry's text is NOT — only the
+  // count notice is.
   // Do not weaken or delete this without explicit human approval (see CLAUDE.md).
-  test('journal entry does NOT appear in the agent prompt on the next run', async () => {
-    const taskId = await createTask(ctx, 'Prompt-immunity task', 'Do the work');
+  test('journal entry BODY does NOT appear in the agent prompt on the next run', async () => {
+    const taskId = await createTask(ctx, 'Prompt-contract task', 'Do the work');
 
     await ctx.lazy(['comment', taskId, '--message', 'COMMENT_MARKER_inject_me as guidance']);
     await ctx.lazy(['journal', taskId, '--message', 'JOURNAL_MARKER_keep_out of the prompt']);
@@ -144,17 +155,93 @@ describe('lazy journal — prompt immunity', () => {
     const startResult = await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(startResult);
 
-    const showResult = await ctx.lazy(['show', taskId, '--json']);
-    expectSuccess(showResult);
-    const data = JSON.parse(showResult.stdout);
-    const humanTurn = (data.turns as Array<{ role: string; prompt: string | null }>)
-      .find(t => t.role === 'human');
-    expect(humanTurn).toBeDefined();
-    const prompt = humanTurn!.prompt ?? '';
+    const prompt = await firstHumanPrompt(taskId);
 
     // Sanity: the comment DID reach the prompt (so the assertion below is meaningful).
     expect(prompt).toContain('COMMENT_MARKER_inject_me');
-    // The invariant: the journal entry did NOT.
+    // The invariant: the journal entry's text did NOT.
     expect(prompt).not.toContain('JOURNAL_MARKER_keep_out');
   });
+
+  // The count notice is the ONE thing prompt assembly may derive from the journal.
+  test('a count notice IS injected, naming how many entries are new', async () => {
+    const taskId = await createTask(ctx, 'Notice task', 'Do the work');
+
+    await ctx.lazy(['journal', taskId, '--message', 'JOURNAL_MARKER_one']);
+    await ctx.lazy(['journal', taskId, '--message', 'JOURNAL_MARKER_two']);
+
+    expectSuccess(await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS));
+
+    const prompt = await firstHumanPrompt(taskId);
+    expect(prompt).toContain('JOURNAL NOTICE');
+    expect(prompt).toContain('2 new journal entries since your last turn');
+    expect(prompt).toContain('sections=["journal"]');
+    // Count and pointer only — still no bodies.
+    expect(prompt).not.toContain('JOURNAL_MARKER_one');
+    expect(prompt).not.toContain('JOURNAL_MARKER_two');
+  });
+
+  test('no notice at all when the task has no journal entries', async () => {
+    const taskId = await createTask(ctx, 'No-journal task', 'Do the work');
+
+    expectSuccess(await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS));
+
+    const prompt = await firstHumanPrompt(taskId);
+    expect(prompt).not.toContain('JOURNAL NOTICE');
+  });
+
+  // The "since your last turn" cutoff is the last agent turn's timestamp — the
+  // same cursor comments already use, so no new per-agent state is stored. This
+  // covers the unblock path (task-lifecycle), not just turn 1 (task-launcher).
+  test('counts only entries added since the last agent turn', async () => {
+    const taskId = await createTask(ctx, 'Cutoff task', 'Do the work');
+
+    await ctx.lazy(['journal', taskId, '--message', 'JOURNAL_MARKER_before_turn_one']);
+    expectSuccess(await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+
+    // Only this one is new relative to the agent turn that just finished.
+    await ctx.lazy(['journal', taskId, '--message', 'JOURNAL_MARKER_after_turn_one']);
+
+    expectSuccess(await ctx.lazyMocked(['unblock', taskId, '--message', 'carry on'], MOCK_CLAUDE_SUCCESS));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+
+    const data = JSON.parse((await ctx.lazy(['show', taskId, '--json'])).stdout);
+    // The turn a HUMAN launched, named rather than taken as "the newest human
+    // turn": a human-facing park also records the wrap-up presentation step as
+    // a supervisor-actored prompt turn, and the journal cursor rides the
+    // unblock prompt, not that one.
+    const humanTurns = (data.turns as Array<{ role: string; actor: string | null; prompt: string | null }>)
+      .filter(t => t.role === 'human' && t.actor !== 'supervisor');
+    const secondPrompt = humanTurns[humanTurns.length - 1]?.prompt ?? '';
+
+    expect(secondPrompt).toContain('1 new journal entry since your last turn');
+    // Two entries total, one new → the cursor points past the pre-existing one.
+    expect(secondPrompt).toContain('offset=1');
+    // Neither body is present, new or old.
+    expect(secondPrompt).not.toContain('JOURNAL_MARKER_after_turn_one');
+    expect(secondPrompt).not.toContain('JOURNAL_MARKER_before_turn_one');
+  }, 90000);
+
+  // INVARIANT: appending a journal entry must never start, resume, or auto-react
+  // a turn. This is what makes ungated peer journaling safe — see
+  // docs/surface-asymmetries.md. A comment can wake an agent; a journal entry
+  // never can.
+  test('journaling on a blocked task does NOT trigger a turn', async () => {
+    const taskId = await createTask(ctx, 'Non-triggering task', 'Do the work');
+
+    expectSuccess(await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+
+    const before = JSON.parse((await ctx.lazy(['show', taskId, '--json'])).stdout);
+    const turnsBefore = (before.turns as unknown[]).length;
+
+    await ctx.lazy(['journal', taskId, '--message', 'a note that must not wake anyone']);
+    // Give any (nonexistent) trigger path a chance to fire before re-reading.
+    await Bun.sleep(2000);
+
+    const after = JSON.parse((await ctx.lazy(['show', taskId, '--json'])).stdout);
+    expect((after.turns as unknown[]).length).toBe(turnsBefore);
+    expect(after.status).toBe(before.status);
+  }, 60000);
 });

@@ -22,22 +22,23 @@
  */
 
 import { existsSync, unlinkSync } from 'fs';
-import { hostname } from 'os';
 import { join } from 'path';
 import { getHome } from '../../utils/home';
 import { requireLazyRoot, requireStorage, parseFlags } from '../helpers';
 import {
   ensureImage, ensureAgentBinary, resolveImageName, resolveCustomDockerfile,
-  enableUpgradeImageBuild, isAdoptedDockerfile,
+  enableUpgradeImageBuild, isAdoptedDockerfile, getLastSourceBuildProvenance,
+  evaluateUpgradeRebuild,
 } from '../../capture/claude';
-import { verifyAgentBinary, formatAgentBinaryError } from '../../agent/binary-identity';
+import { formatAgentBinaryRebuildSuccessLine } from '../../utils/build-provenance';
+import { verifyAgentBinary, formatAgentBinaryError, verifyAgentBinaryForContainerLaunch } from '../../agent/binary-identity';
 import { logger } from '../../utils/logger';
 import { loadConfig, resolveConfigPath } from '../../config/loader';
 import { createRunner } from '../../runner';
 import type { Runner } from '../../runner';
 import { isTTY } from '../editor';
-import { promptChoice, promptLine } from '../editor';
-import { theme } from '../theme';
+import { promptChoice, promptLine, promptYesNo } from '../editor';
+import { theme } from '../../render/theme';
 import type { Task } from '../../types';
 import type { Storage } from '../../storage';
 import { checkDaemonHealth, requestShutdown, waitForDaemonStop, cleanupStaleFiles, readPid } from '../../daemon';
@@ -57,17 +58,19 @@ import {
   type InteractiveSessionEntry,
 } from '../../daemon/interactive-registry';
 import { spawnSyncUnsupervised } from '../../utils/spawn';
+import {
+  printFullUpgradeCompletionSummary,
+  printImageRefreshCompletionSummary,
+  readPreviousDaemonVersion,
+} from '../../upgrade/completion-summary';
+import {
+  POST_BUILD_CHOICE_PROMPT,
+  POST_BUILD_ENTER_PROMPT,
+  waitForInterveningBuildOutput,
+} from '../../upgrade/interactive-prompt';
+import { VERSION } from '../../version';
 
 const DOCKER_TIMEOUT_MS = 10_000;
-
-/**
- * Grace period given to a builder container to shut down cleanly on upgrade.
- *
- * Long enough for the supervisor's SIGTERM handler to finish a final conversation
- * capture (a storage round-trip over the daemon's TCP web server) and stamp the
- * resume session id; short enough that a wedged builder cannot stall the upgrade.
- */
-const BUILDER_STOP_GRACE_SECONDS = 10;
 
 interface ContainerInfo {
   name: string;
@@ -166,6 +169,17 @@ async function discoverRunningContainers(storage: Storage, runner: Runner): Prom
  * host-process mode has no builder runs at all.
  */
 async function discoverProjectBuilderContainers(runner: Runner, projectRoot: string): Promise<string[]> {
+  // Test-only: e2e suites cannot stand up real builder containers, but the
+  // pre-stop prompt path must be exercised (same family as LAZY_FORCE_CRED_PREFLIGHT).
+  if (process.env.LAZY_TEST === '1') {
+    const raw = process.env.LAZY_TEST_UPGRADE_BUILDER_COUNT;
+    if (raw) {
+      const count = parseInt(raw, 10);
+      if (Number.isFinite(count) && count > 0) {
+        return Array.from({ length: count }, (_, i) => `lazy-builder-test-${i}`);
+      }
+    }
+  }
   return runner.discoverProjectBuilderRuns(projectRoot);
 }
 
@@ -209,11 +223,11 @@ async function waitForWorkingTasks(storage: Storage, workingContainers: Containe
 
 /**
  * Say exactly which files the image build reads. Printed unconditionally
- * before every upgrade image build (and its dry run): the config-override
- * warning is deliberately silent when a worktree's lazy.toml is byte-identical
- * to the root's (see findConfigDir), and building from an unexpected
- * Dockerfile once cost a whole debugging session — so upgrade always names
- * its inputs, including when a worktree Dockerfile was adopted.
+ * before every upgrade image build (and its dry run): building from an
+ * unexpected Dockerfile once cost a whole debugging session, so upgrade always
+ * names its inputs, including when a worktree Dockerfile was adopted. (The
+ * config is always the project root's — see findConfigDir — but the adopted
+ * Dockerfile need not be, which is exactly why this is printed.)
  */
 async function printImageSource(root: string): Promise<void> {
   const configPath = await resolveConfigPath(root);
@@ -296,13 +310,39 @@ export async function forceRebuildAgentBinary(): Promise<string> {
   }
 
   const path = await ensureAgentBinary();
-  const verdict = await verifyAgentBinary(path);
+  const verdict = await verifyAgentBinaryForContainerLaunch(path);
   if (!verdict.ok) {
     throw new Error(
       formatAgentBinaryError(path, verdict.reason, { canRebuild: !!getLazyDevSourceRoot() }),
     );
   }
   return path;
+}
+
+/**
+ * Final gate after upgrade has rebuilt BOTH the container image and the agent
+ * binary: exec selfcheck with the binary bind-mounted into the new image — the
+ * same probe the builder preflight runs at launch.
+ */
+export async function assertUpgradeAgentBinaryMount(
+  agentBinaryPath: string,
+  imageRef: string,
+  dockerBinary: string = 'docker',
+): Promise<void> {
+  const verdict = await verifyAgentBinaryForContainerLaunch(agentBinaryPath, {
+    containerImage: imageRef,
+    dockerBinary,
+  });
+  if (!verdict.ok) {
+    throw new Error(
+      formatAgentBinaryError(agentBinaryPath, verdict.reason, { canRebuild: !!getLazyDevSourceRoot() }),
+    );
+  }
+}
+
+/** Success line for upgrade's agent-binary rebuild step, with source provenance when known. */
+export function formatAgentBinaryRebuildLine(provenance = getLastSourceBuildProvenance()): string {
+  return formatAgentBinaryRebuildSuccessLine(provenance);
 }
 
 /**
@@ -338,15 +378,16 @@ export async function promptBuilderPreStop(
   builderCount: number,
   force: boolean,
   interactiveSessions: InteractiveSessionEntry[] = [],
+  imageBuild: BackgroundImageBuild | null = null,
 ): Promise<void> {
   if (builderCount === 0 && interactiveSessions.length === 0) return;
 
   console.log('');
   if (builderCount > 0) {
     const noun = builderCount === 1 ? 'builder session' : 'builder sessions';
-    console.log(theme.warning(`${builderCount} ${noun} will be restarted to apply the upgrade.`));
-    console.log('  The conversation is preserved and resumes automatically — but any message');
-    console.log('  typed into a builder and not yet submitted CANNOT be preserved.');
+    console.log(theme.warning(`${builderCount} live ${noun} will reconnect in place when the daemon restarts.`));
+    console.log('  The conversation is preserved — but any message typed into a builder and not yet');
+    console.log('  submitted CANNOT be preserved when Claude Code relaunches.');
   }
 
   // Interactive sessions (`lazy pair`, `lazy chat`) are NOT stopped from here.
@@ -373,94 +414,17 @@ export async function promptBuilderPreStop(
   }
 
   console.log('  If you have an unsent message in a builder or a pairing session, submit it now.');
+  // Background docker build output may scroll guidance away while the human
+  // submits in-progress input — wait for the build, then prompt once below it.
+  await waitForInterveningBuildOutput(imageBuild);
+  if (imageBuild) console.log('');
   // promptLine blocks until Enter. In test mode (LAZY_PROMPT_DEFAULTS) it returns
   // immediately without waiting, so e2e tests don't hang.
-  await promptLine('Press Enter when ready to continue (ctrl-c to cancel)');
-}
-
-/**
- * Write a durable builder-resume-intent for each builder about to be stopped.
- *
- * The relaunched host `lazy builder` wrapper (add-builder-relaunch-loop) reads
- * these to learn it was stopped by an upgrade and should resume in place, rather
- * than exiting. The intent MUST be durable: by the time it is read, the builder
- * container is dead and the daemon has restarted — the transient event plane
- * cannot carry it (docs/spikes/builder-upgrade-resume.md §3).
- *
- * CANONICAL KEY: the intent's `builderId` is the SHORT builder id — the
- * container name with the `lazy-builder-` prefix stripped. This is deliberate
- * and load-bearing: docker-runner derives `builderId = configBasename.replace(
- * 'builder-', '')` (the short id) and names the container `lazy-builder-<id>`
- * (docker-runner.ts), then launches the supervisor with `--builder-id <id>`.
- * The supervisor's sessionId stamp (add-builder-sessionid-stamp) keys its
- * `saveBuilderResumeIntent` update by that SAME short id, so writing the intent
- * under the short id is what lets the stamp find and populate it. Writing the
- * full run name here would make the stamp's lookup miss and silently defeat it.
- * `discoverProjectBuilderRuns` returns full `lazy-builder-<id>` names, so we
- * strip the prefix before writing. (The relaunch wrapper matches both forms
- * defensively, but the stamp must actually land.)
- *
- * `sessionId` is left undefined here: in docker mode the host never learns the
- * Claude sessionId (it is `null` to the host — §1.2). It is populated either by
- * the supervisor's stamp (keyed by the same short id) or resolved by the wrapper
- * from storage. Written BEFORE the stop ("save first, act second") so a stop
- * failure never loses the intent.
- */
-export async function writeBuilderResumeIntents(
-  storage: Storage,
-  builderNames: string[],
-  projectRoot: string,
-): Promise<void> {
-  const createdAt = new Date().toISOString();
-  // Stamp THIS upgrade process's identity so the waiting builder wrapper can
-  // tell "still rebuilding" from "the upgrade died" without resorting to a
-  // timeout (see BuilderResumeIntent.upgradePid).
-  const upgradePid = process.pid;
-  const upgradeHost = hostname();
-  for (const name of builderNames) {
-    // Strip the `lazy-builder-` run-name prefix to get the canonical short id.
-    const builderId = name.replace(/^lazy-builder-/, '');
-    await storage.saveBuilderResumeIntent({
-      builderId,
-      projectRoot,
-      createdAt,
-      upgradePid,
-      upgradeHost,
-    });
-  }
-}
-
-/**
- * Stop live builder containers GRACEFULLY (SIGTERM + grace, never SIGKILL).
- *
- * A builder's supervisor has real exit work: its signal handler flushes the
- * conversation capture (otherwise the last up-to-CAPTURE_INTERVAL_MS of the
- * human's session is lost from lazy's store) and stamps the detected Claude
- * sessionId onto the resume intent written just before the stop — which is how
- * the relaunched builder knows what to resume. `docker kill` ran neither, so an
- * upgraded builder came back into a brand-new conversation. Waiting a few
- * seconds once per builder is a trivial cost for not losing the session.
- *
- * Belt-and-braces with the host-side detection in src/builder/session-detect.ts:
- * that recovers the id no matter HOW the container died; this additionally
- * preserves the conversation tail.
- *
- * Builder containers run with `--rm`, so they auto-remove on stop.
- */
-export async function stopBuilderContainers(
-  runner: Pick<Runner, 'stopRun'>,
-  builderNames: string[],
-): Promise<void> {
-  for (const name of builderNames) {
-    const stopped = await runner.stopRun(name, {
-      gracefulTimeoutSeconds: BUILDER_STOP_GRACE_SECONDS,
-    });
-    if (stopped) {
-      console.log(`  ${theme.success('stopped')} ${name}`);
-    } else {
-      console.log(`  ${theme.error('failed')} ${name}`);
-    }
-  }
+  await promptLine(
+    imageBuild
+      ? POST_BUILD_ENTER_PROMPT
+      : 'Press Enter when ready to continue (ctrl-c to cancel)',
+  );
 }
 
 /**
@@ -548,7 +512,10 @@ async function refreshImagesOnly(root: string, dryRun: boolean, timeoutMs: numbe
   console.log(`  ${theme.success('rebuilt')} container image (${built})`);
   console.log('');
   printImageRefreshBoundary();
-  console.log(theme.success('\nImage refresh complete.'));
+  printImageRefreshCompletionSummary({
+    currentVersion: VERSION,
+    imageTags: [built],
+  });
 }
 
 /** How often to reassure the human that a slow background build is still alive. */
@@ -641,6 +608,9 @@ export async function commandUpgrade(args: string[]): Promise<void> {
 
   const storage = await requireStorage();
 
+  // Read before the daemon restarts — ensureDaemon rewrites the marker on startup.
+  const previousVersion = await readPreviousDaemonVersion(root);
+
   // Declared out here so the `finally` can abandon a still-running background
   // rebuild on every exit path that is not a completed upgrade.
   let imageBuild: BackgroundImageBuild | null = null;
@@ -675,9 +645,23 @@ export async function commandUpgrade(args: string[]): Promise<void> {
     if (dryRun) {
       console.log(theme.header('Upgrade dry run:'));
       console.log('');
-      console.log('  Rebuild: Docker image + agent binary');
-      console.log('  The image rebuild starts in the background while you decide, staged under');
-      console.log('  a temporary tag; the real image tag moves only once you proceed.');
+      const dryRunConfig = await loadConfig(root);
+      const dryRunHasImage =
+        dryRunConfig.runner.type === 'docker' || dryRunConfig.runner.type === 'podman';
+      const dryRunDecision = dryRunHasImage
+        ? await evaluateUpgradeRebuild(root, dryRunConfig.runner.type)
+        : null;
+      if (dryRunDecision && dryRunDecision.verdict === 'ask') {
+        console.log('  Rebuild: agent binary, and the container image if you say so');
+        console.log(`  ${dryRunDecision.reason}, so a real upgrade would ASK whether to`);
+        console.log('  rebuild it anyway to re-resolve its unpinned contents (default: yes).');
+        console.log('  Without a TTY it rebuilds. `lazy upgrade --images` never asks.');
+      } else {
+        console.log('  Rebuild: Docker image + agent binary');
+        if (dryRunDecision) console.log(`  Image rebuild reason: ${dryRunDecision.reason}.`);
+        console.log('  The image rebuild starts in the background while you decide, staged under');
+        console.log('  a temporary tag; the real image tag moves only once you proceed.');
+      }
       console.log('');
 
       const totalContainers = containers.length + builderContainers.length;
@@ -706,8 +690,9 @@ export async function commandUpgrade(args: string[]): Promise<void> {
             console.log(`    ${name}`);
           }
           console.log('');
-          console.log(theme.warning('  Builders will be stopped and resume in place. You will be prompted'));
-          console.log('  to submit any in-progress message first (unless --force / no TTY).');
+          console.log(theme.warning('  Builders are NOT stopped — each reconnects in place when the new daemon'));
+          console.log('  is up. You will be prompted to submit any in-progress message first (unless');
+          console.log('  --force / no TTY).');
         }
 
         if (interactiveSessions.length > 0) {
@@ -724,7 +709,7 @@ export async function commandUpgrade(args: string[]): Promise<void> {
 
       console.log('');
       console.log('  After rebuild: daemon restarts and auto-resumes interrupted tasks (~10s).');
-      console.log('  Running builder sessions resume in place after the upgrade.');
+      console.log('  Running builder sessions reconnect in place against the new daemon.');
 
       // Deleting files from the human's repo and rotating a credential are the
       // two most surprising things a real upgrade would do, so a dry run must
@@ -740,12 +725,18 @@ export async function commandUpgrade(args: string[]): Promise<void> {
 
       // A dry run changes nothing, so a failing credential preflight is a
       // warning here rather than an error — but it must be surfaced, because it
-      // is exactly what a real run would abort on.
+      // is exactly what a real run would abort on. Print the preflight message
+      // itself (`upgradeCredentialPreflight` → `daemonCredentialError`) rather
+      // than restating the remedy: that is the only way the dry-run path and
+      // the abort path cannot drift when a new provider is added.
       if (credentialError) {
         console.log('');
         console.log(theme.warning('  A real upgrade would abort immediately: no model credential in this'));
         console.log(theme.warning('  environment, so the daemon could not be restarted afterwards.'));
-        console.log('  Set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY before upgrading.');
+        console.log('');
+        for (const line of credentialError.split('\n')) {
+          console.log(line.length === 0 ? '' : `  ${line}`);
+        }
       }
       return;
     }
@@ -766,10 +757,42 @@ export async function commandUpgrade(args: string[]): Promise<void> {
       // gets built, and so adoption is cleared/rewritten for this rebuild.
       await maybePromptWorktreeDockerfileAdoption(root);
 
-      imageBuild = startBackgroundImageBuild(root, config.runner.type, undefined, timeoutMs);
-      console.log(`\nRebuilding the container image in the background (staged as :${imageBuild.stagingTag})...`);
-      await printImageSource(root);
-      console.log('  Running containers are untouched; the image is promoted only once you proceed.');
+      // Is there anything to rebuild FOR? Evaluated after the adoption prompt,
+      // because that answer decides which image resolves. When the identity is
+      // unchanged the only gain is re-resolving unpinned contents, so the human
+      // decides rather than a hidden timer — see evaluateUpgradeRebuild.
+      const decision = await evaluateUpgradeRebuild(root, config.runner.type);
+      let rebuildImage = decision.verdict === 'rebuild';
+      let rebuildReason = decision.reason;
+
+      if (decision.verdict === 'ask') {
+        console.log(`\n${decision.reason}.`);
+        console.log('  Rebuilding re-resolves everything unpinned inside it (the agent CLI, apt');
+        console.log('  packages, anything else the Dockerfile fetches) and takes several minutes.');
+        if (isTTY() && !force) {
+          rebuildImage = await promptYesNo('  Rebuild the container image anyway?', true);
+          rebuildReason = rebuildImage
+            ? `you asked for it — image unchanged, built ${decision.builtAgo} ago`
+            : decision.reason;
+        } else {
+          // Non-interactive: rebuild. `lazy upgrade` rebuilding the image is the
+          // documented behaviour, and a script must not get a different answer
+          // depending on how recently someone built the image by hand.
+          rebuildImage = true;
+          rebuildReason = `refreshing unpinned contents (not asking: ${force ? '--force' : 'no TTY'})`;
+        }
+      }
+
+      if (rebuildImage) {
+        imageBuild = startBackgroundImageBuild(root, config.runner.type, undefined, timeoutMs);
+        console.log(`\nRebuilding the container image in the background (staged as :${imageBuild.stagingTag})...`);
+        console.log(`  Reason: ${rebuildReason}.`);
+        await printImageSource(root);
+        console.log('  Running containers are untouched; the image is promoted only once you proceed.');
+      } else {
+        console.log(`\nKeeping the current container image ${decision.imageName} — not rebuilding.`);
+        console.log('  Run `lazy upgrade --images` later to refresh it without stopping anything.');
+      }
     }
 
     // Check for working containers
@@ -790,7 +813,11 @@ export async function commandUpgrade(args: string[]): Promise<void> {
         process.exit(1);
       }
 
-      const choice = await promptChoice('How would you like to proceed?', [
+      await waitForInterveningBuildOutput(imageBuild);
+      if (imageBuild) console.log('');
+      const choice = await promptChoice(
+        imageBuild ? POST_BUILD_CHOICE_PROMPT : 'How would you like to proceed?',
+        [
         'Stop and upgrade now',
         'Wait for all tasks to block, then upgrade',
         'Cancel',
@@ -831,34 +858,29 @@ export async function commandUpgrade(args: string[]): Promise<void> {
     // Pre-stop prompt: give the human a chance to submit any in-progress
     // message in a live builder before its container is killed. Honors
     // "never lose human feedback" (CLAUDE.md). Skipped under --force / non-TTY.
-    await promptBuilderPreStop(builderContainers.length, force, interactiveSessions);
+    await promptBuilderPreStop(builderContainers.length, force, interactiveSessions, imageBuild);
 
-    // Step 1: Stop all running containers/processes for this project
-    const totalContainers = containers.length + builderContainers.length;
-    if (totalContainers > 0) {
-      console.log(`\nStopping ${totalContainers} container(s)...`);
+    // Step 1: Stop task containers/processes for this project. Builders ride
+    // through — the in-container supervisor reconnects when the daemon restarts.
+    const totalContainers = containers.length;
+    if (totalContainers > 0 || builderContainers.length > 0) {
+      if (totalContainers > 0) {
+        console.log(`\nStopping ${totalContainers} task container(s)...`);
 
-      // Stop task containers
-      for (const c of containers) {
-        const stopped = await runner.stopRun(c.name);
-        if (stopped) {
-          console.log(`  ${theme.success('stopped')} ${c.name}`);
-        } else {
-          console.log(`  ${theme.error('failed')} ${c.name}`);
+        for (const c of containers) {
+          const stopped = await runner.stopRun(c.name);
+          if (stopped) {
+            console.log(`  ${theme.success('stopped')} ${c.name}`);
+          } else {
+            console.log(`  ${theme.error('failed')} ${c.name}`);
+          }
+          await runner.removeRun(c.name);
         }
-        // Remove the stopped container/process
-        await runner.removeRun(c.name);
       }
 
-      // Write durable resume intents BEFORE stopping any builder ("save first,
-      // act second"): the relaunched wrapper reads these to resume in place. The
-      // builder is still alive here, so its sessionId is unknown to the host —
-      // the wrapper resolves it from storage after the child exits.
       if (builderContainers.length > 0) {
-        await writeBuilderResumeIntents(storage, builderContainers, root);
+        console.log(`\n${builderContainers.length} builder session(s) stay running — they reconnect when the daemon restarts.`);
       }
-
-      await stopBuilderContainers(runner, builderContainers);
     } else {
       console.log('\nNo running containers to stop.');
     }
@@ -867,39 +889,51 @@ export async function commandUpgrade(args: string[]): Promise<void> {
     // while we waited and stopped containers), promote it onto the canonical
     // image tag, and rebuild the agent binary.
     console.log('\nRebuilding...');
+    let promotedImageTags: string[] | null = null;
+    let imageBuildSeconds: number | null = null;
     if (imageBuild) {
       // The binary rebuild is independent of the image — run it alongside the
       // (possibly still-running) build rather than after it.
       // A failed image build must still fail the upgrade — but only after the
       // binary rebuild has settled, so nothing is left half-awaited. Capture
       // the image error instead of racing it, then re-throw.
-      const [, imageError] = await Promise.all([
-        forceRebuildAgentBinary().then(() => console.log(`  ${theme.success('rebuilt')} agent binary (verified)`)),
-        promoteBackgroundImage(imageBuild).then(() => null, (err: unknown) => err),
+      const [agentBinaryPath, imageResult] = await Promise.all([
+        forceRebuildAgentBinary(),
+        promoteBackgroundImage(imageBuild),
       ]);
-      if (imageError) throw imageError;
+      promotedImageTags = imageResult;
+      imageBuildSeconds = imageBuild.elapsedSeconds();
+      if (imageResult.length > 0) {
+        const config = await loadConfig(root);
+        const dockerBinary = config.runner.type === 'podman' ? 'podman' : 'docker';
+        await assertUpgradeAgentBinaryMount(agentBinaryPath, imageResult[0], dockerBinary);
+      }
+      console.log(`  ${theme.success(formatAgentBinaryRebuildLine())}`);
     } else {
-      // Host-process mode: no container image, only the agent binary.
+      // No image build this run: either a host-process runner (which has no
+      // container image at all) or the rebuild was skipped as a repeat of one
+      // that just finished. Either way, only the agent binary is rebuilt.
       await forceRebuildAgentBinary();
-      console.log(`  ${theme.success('rebuilt')} agent binary (verified)`);
+      console.log(`  ${theme.success(formatAgentBinaryRebuildLine())}`);
     }
 
     // Step 3: Restart daemon with new code.
     // The new daemon will reconcile stopped containers (~5s) and auto-resume
     // interrupted tasks — no need for upgrade to do either of those.
     const daemonStatus = await checkDaemonHealth(root);
+    const daemonWasRunning = daemonStatus.running;
     if (daemonStatus.running) {
       console.log('\nRestarting daemon...');
       // Capture the OLD daemon's pid BEFORE shutdown — we wait for that exact
-      // process to die, not just for the socket to vanish.
+      // process to die, not just for its state files to vanish.
       const oldPid = daemonStatus.pid ?? readPid(root);
       await requestShutdown(root);
       // requestShutdown only DELIVERS the request — the daemon exits async, and
-      // it removes its own socket/PID files as the LAST steps before exit. We
+      // it removes its own PID file as one of the LAST steps before exit. We
       // must wait for the old PROCESS to fully die before starting a fresh
       // daemon; otherwise (a) ensureDaemon sees a live process and skips the
       // restart, or (b) the old daemon's trailing cleanup clobbers the new
-      // daemon's freshly-written socket/PID — leaving the project with no
+      // daemon's freshly-written PID file — leaving the project with no
       // reachable daemon. Both stranded the builder relaunch loop / broke the
       // next command ("Daemon is not running").
       const stopped = await waitForDaemonStop(root, 15000, oldPid);
@@ -921,9 +955,9 @@ export async function commandUpgrade(args: string[]): Promise<void> {
     // into the repo, and rotate that token.
     //
     // THIS IS THE ONLY SAFE POINT IN THE WHOLE FLOW, and the placement is the
-    // feature: every task and builder container was stopped in step 1 and the
-    // old daemon has just exited, so nobody is holding the shared token in a
-    // container (the one class that could not re-read it from disk). The new
+    // feature: every task container was stopped in step 1 and the old daemon has
+    // just exited, so nobody is holding the shared token in a container (the one
+    // class that could not re-read it from disk). The new
     // daemon has not started yet, so it adopts the fresh token on its first
     // read. Rotating any earlier — while the old daemon still served RPC —
     // would 401 the upgrade's own `requestShutdown`. See
@@ -931,13 +965,20 @@ export async function commandUpgrade(args: string[]): Promise<void> {
     await purgeLegacyDaemonMcpConfigsReporting(root);
 
     await ensureDaemon('upgrade', root);
-    console.log('  Daemon restarted with new version.');
 
-    if (containers.length > 0) {
-      console.log(`\n  ${containers.length} interrupted task(s) will auto-resume within ~10 seconds.`);
-    }
-
-    console.log(theme.success('\nUpgrade complete.'));
+    // Final block — always last so it sits below build output and any prompts
+    // that scrolled away during a long image rebuild.
+    await printFullUpgradeCompletionSummary({
+      previousVersion,
+      currentVersion: VERSION,
+      imageTags: promotedImageTags,
+      imageBuildSeconds,
+      agentBinaryProvenance: getLastSourceBuildProvenance(),
+      daemonRestarted: daemonWasRunning,
+      interruptedTaskCount: containers.length,
+      builderSessionCount: builderContainers.length,
+      interactiveSessionCount: interactiveSessions.length,
+    });
   } finally {
     // Abandon a background rebuild that was never promoted (cancelled upgrade,
     // ctrl-c out of a prompt, or a failure anywhere in the flow). cancel() is a
@@ -979,14 +1020,18 @@ Non-disruptive image refresh (--images):
 What happens:
   1. The Docker image rebuild starts immediately, in the BACKGROUND, under a
      temporary staging tag — it does not wait for your decisions and does not
-     touch running containers
+     touch running containers. When an image built from exactly these inputs
+     already exists, you are ASKED whether to rebuild it anyway (default: yes) —
+     the only gain is re-resolving its unpinned contents, and the question says
+     how old it is. Without a TTY it rebuilds; \`--images\` never asks.
   2. Live builder sessions are warned to submit any in-progress message
-  3. All running lazy containers are stopped (task supervisors and builders)
+  3. Task containers are stopped (builders stay running and reconnect in place)
   4. The background image is promoted onto the real image tag (usually already
      built by now) and the agent binary is force-rebuilt
   5. Daemon is restarted with new code
   6. Daemon auto-reconciles and auto-resumes interrupted tasks (~10 seconds)
-  7. Running builder sessions resume in place with their conversation intact
+  7. Running builder sessions reconnect against the new daemon with their
+     conversation intact (one-line notice in the session, not a stop/resume cycle)
 
 Because the image tag only moves in step 4, cancelling the upgrade (or ctrl-c)
 leaves your current image exactly as it was; the layers already built stay in
@@ -1015,7 +1060,8 @@ Options:
   --force     Don't prompt, stop everything including working containers
   --wait      Wait for all working tasks to block before upgrading
   --images    Non-disruptive: rebuild only the container image (--no-cache) for
-              future sessions; stop nothing, don't restart the daemon
+              future sessions; stop nothing, don't restart the daemon. Always
+              rebuilds and never asks — this is the force-refresh path
   --dry-run   Show what would be rebuilt and stopped, without doing anything
   --timeout <seconds>
               Kill the image build after N seconds (default: no timeout).

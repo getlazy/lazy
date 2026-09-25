@@ -5,6 +5,7 @@ import { homedir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
 import { createTask } from '../helpers/fixtures';
+import { successScenario } from '../helpers/fake-claude';
 
 describe('lazy comment', () => {
   let ctx: TestContext;
@@ -86,4 +87,74 @@ describe('lazy comment', () => {
     expect(data.comments[0].content).toBe('Local observation');
   });
 
+});
+
+describe('lazy comment --edit', () => {
+  let ctx: TestContext;
+
+  beforeEach(async () => {
+    ctx = await setupTestLazy();
+  });
+
+  afterEach(async () => {
+    await ctx.cleanup();
+  });
+
+  function commentIdFrom(output: string): string {
+    const m = output.match(/Comment ID: (\S+)/);
+    if (!m) throw new Error(`no comment id in: ${output}`);
+    return m[1];
+  }
+
+  // INVARIANT: a comment the agent has not been shown yet can be edited; the
+  // next prompt carries the edited text.
+  test('edits a comment the agent has not seen yet', async () => {
+    const taskId = await createTask(ctx, 'Task with an editable comment');
+    const added = await ctx.lazy(['comment', taskId, '-m', 'Typo in thsi comment']);
+    expectSuccess(added);
+    const commentId = commentIdFrom(added.stdout);
+
+    const edited = await ctx.lazy(['comment', taskId, '--edit', commentId, '-m', 'Typo fixed in this comment']);
+    expectSuccess(edited);
+    expectOutput(edited, 'Edited comment');
+
+    const show = await ctx.lazy(['show', taskId]);
+    expectOutput(show, 'Typo fixed in this comment');
+    expect(show.stdout).not.toContain('Typo in thsi comment');
+  });
+
+});
+
+describe('lazy comment --edit on a delivered comment', () => {
+  let ctx: TestContext;
+
+  beforeEach(async () => {
+    // A real delivery needs a real prompt: daemon + fake agent binary.
+    ctx = await setupTestLazy({ fakeClaude: true });
+  });
+
+  afterEach(async () => {
+    await ctx.cleanup();
+  });
+
+  // INVARIANT: once delivered to the agent a comment cannot be edited, and the
+  // refusal says why — the agent may have acted on what it read.
+  test('refuses, explaining why, and leaves the comment untouched', async () => {
+    const taskId = await createTask(ctx, 'Task whose comment was delivered', 'Do the work');
+    const added = await ctx.lazy(['comment', taskId, '-m', 'Original guidance']);
+    const commentId = added.stdout.match(/Comment ID: (\S+)/)![1];
+    await ctx.setClaudeScenario({ sequence: [successScenario({ result: 'Done.', sessionId: 'fake-sess-edit' })] });
+    // The first prompt carries queued comments.
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+
+    const edited = await ctx.lazy(['comment', taskId, '--edit', commentId, '-m', 'Rewritten guidance']);
+    expectFailure(edited);
+    expectError(edited, 'already been delivered to the agent');
+    expectError(edited, 'Add a new comment');
+
+    const show = await ctx.lazy(['show', taskId]);
+    expectOutput(show, 'Original guidance');
+    expect(show.stdout).not.toContain('Rewritten guidance');
+  });
 });

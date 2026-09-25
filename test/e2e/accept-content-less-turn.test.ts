@@ -16,6 +16,7 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput } from '../helpers/assertions';
 import { createTask, disablePreAccept, startAndReconcile } from '../helpers/fixtures';
 import { worktreePathFor, readTurns, writeTurns } from '../helpers/storage';
+import { seedFinal } from '../helpers/final';
 
 describe('lazy accept over a content-less turn', () => {
   let ctx: TestContext;
@@ -44,6 +45,10 @@ describe('lazy accept over a content-less turn', () => {
     writeFileSync(join(worktreePath, 'feature.txt'), 'feature content\n');
     expect(ctx.git('-C', worktreePath, 'add', 'feature.txt').exitCode).toBe(0);
     expect(ctx.git('-C', worktreePath, 'commit', '-m', 'Add feature').exitCode).toBe(0);
+    // Fixture setup, not the subject (see test/helpers/final.ts). Daemonless
+    // suite, so the final is seeded at the storage level — BEFORE the corrupt
+    // write below, so the seeded final turn itself keeps its content.
+    await seedFinal(ctx, taskId);
 
     // Corrupt storage exactly the way the crash/recovery path did: append a
     // turn record with NO `content` key at all.

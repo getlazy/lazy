@@ -5,7 +5,7 @@ import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
 import * as readline from 'readline';
 import { StringDecoder } from 'string_decoder';
-import { findLazyRoot, getDataDir } from './init';
+import { findLazyRoot, getDataDir } from '../project-paths';
 
 /**
  * Build-time flag, defined only in a compiled `lazy` / `lazy-agent` binary.
@@ -18,7 +18,7 @@ import { findLazyRoot, getDataDir } from './init';
  * from source the identifier is undefined and the seams work as always.
  *
  * A build-time constant, not a runtime check, precisely because a runtime check
- * is something an agent can satisfy too. `lazy approve`'s protected passphrase
+ * is something an agent can satisfy too. `lazy accept`'s protected passphrase
  * prompt is driven through these seams by e2e tests and must stay that way in
  * the tree — so the guard that matters for users has to live in the build.
  *

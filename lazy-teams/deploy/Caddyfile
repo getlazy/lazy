@@ -1,0 +1,22 @@
+# TLS front door for Lazy Teams. APP_HOST and ACME_EMAIL come from docker-compose.
+#
+# With a real public hostname and ports 80/443 reachable, Caddy obtains a
+# Let's Encrypt certificate automatically. For a LAN install, use the `direct`
+# compose profile instead (see public-docs/self-hosting-lazy-teams.md).
+
+{
+	email {$ACME_EMAIL}
+}
+
+# Plain HTTP for health checks and ACME http-01.
+:80 {
+	@not_acme not path /.well-known/acme-challenge/*
+	handle @not_acme {
+		redir https://{host}{uri} permanent
+	}
+}
+
+{$APP_HOST} {
+	encode gzip
+	reverse_proxy app:80
+}

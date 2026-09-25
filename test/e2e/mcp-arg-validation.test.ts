@@ -14,7 +14,7 @@
  * The "no commit was created" assertions are the point of this file. A 400 that
  * still wrote something would be the same corruption with better manners.
  *
- * The daemon is the REAL one (startDaemonServer on a unix socket) because the
+ * The daemon is the REAL one (startDaemonServer on a TCP port) because the
  * validation lives in that route.
  */
 
@@ -42,7 +42,7 @@ isolateInProcessDaemonEnv();
 describe('MCP route validates tool arguments', () => {
   let ctx: TestContext;
   let tmpDir: string;
-  let socketPath: string;
+  let daemonUrl: string;
   let daemon: RunningDaemon | undefined;
   let restoreConfig: (() => void) | undefined;
   let daemonBaseDir: string;
@@ -77,8 +77,8 @@ describe('MCP route validates tool arguments', () => {
     builderToken = await mintMcpToken(ctx.root, { kind: 'builder' }, 'builder-validate');
 
     tmpDir = await mkdtemp(join(tmpdir(), 'lazy-mcp-argval-'));
-    socketPath = join(tmpDir, 'test.sock');
-    daemon = await startDaemonServer({ socketPath, token: SHARED_TOKEN, projectRoot: ctx.root });
+    daemon = await startDaemonServer({ token: SHARED_TOKEN, projectRoot: ctx.root });
+    daemonUrl = `http://127.0.0.1:${daemon.webPort}`;
   });
 
   afterEach(async () => {
@@ -99,8 +99,7 @@ describe('MCP route validates tool arguments', () => {
 
   /** POST a RAW body (no envelope assumptions) to the MCP route. */
   function post(token: string, segment: string, tool: string, body: string): Promise<Response> {
-    return fetch(`http://localhost/mcp/${encodeURIComponent(segment)}/${encodeURIComponent(tool)}`, {
-      unix: socketPath,
+    return fetch(`${daemonUrl}/mcp/${encodeURIComponent(segment)}/${encodeURIComponent(tool)}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

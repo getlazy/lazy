@@ -1,0 +1,30 @@
+# Opt-in override: give the app container the host's Docker socket.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.docker-socket.yml up -d
+#
+# OFF BY DEFAULT, AND THAT IS A SECURITY DECISION, not an oversight. Bind-
+# mounting the socket is equivalent to giving root on the host to anything that
+# can execute code in the app container. The install ran that way to launch task
+# containers as siblings — a capability it turned out never to have had (see the
+# "Task turns" section of public-docs/self-hosting-lazy-teams.md), so the mount
+# was paying host-root for nothing.
+#
+# Add it only for one of these, and take it away again afterwards:
+#
+#   - LAZY_TEAMS_BUILD_RUNNER=1. The entrypoint builds the lazy-runner agent
+#     image on the host daemon. Nothing in this install can run that image; the
+#     flag exists for the day the packaged image launches agents again.
+#
+#   - bin/self-host-accept. Its final phase asks the host daemon which
+#     containers exist, to prove the refused launch created none. That check
+#     raises rather than passes when it cannot reach Docker, so the harness
+#     merges this file itself — you do not add it by hand for an acceptance run.
+#
+# Running the product does NOT need it. No Rails code opens the socket, the
+# project daemons refuse every container launch before reaching it, and the
+# entrypoint's socket handling is conditional on the socket being there.
+
+services:
+  app:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock

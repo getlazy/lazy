@@ -1,4 +1,5 @@
 import { describe, test, expect } from 'bun:test';
+import { ANTHROPIC_DEFAULT_TARGET } from '../../src/utils/role-target';
 import { DEFAULT_CONFIG } from '../../src/config/loader';
 import { GitHubDriver } from '../../src/remote/github-driver';
 import type { Task } from '../../src/types';
@@ -11,16 +12,18 @@ import type { DriverDeps, GhResult } from '../../src/remote/github-driver';
  */
 
 const mockConfig: ResolvedConfig = {
-  models: { default: 'claude-sonnet-4-5-20250929', roles: { builder: { backend: 'anthropic', model: '', endpoint: '' }, agent: { backend: 'anthropic', model: '', endpoint: '' } } },
+  models: { default: 'claude-sonnet-4-5-20250929', roles: { builder: ANTHROPIC_DEFAULT_TARGET, agent: ANTHROPIC_DEFAULT_TARGET } },
   session: { verbose: false, debug: false, auto_commit_instructions: false },
   data: { path: '/tmp/test/.lazy' },
-  storage: { backend: 'external', external_path: '', postgres_ssl: false },
+  storage: { backend: 'external', external_path: '' },
   git: { default_branch_prefix: 'lazy', lfs_check: 'refuse' },
   output: { shortid_length: 8 },
+  agents: {},
   agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0, wind_down_timeout_ms: 0, effort: 'medium' },
+  review: { mode: 'low_high', auto_fix: false, gate: 'auto', draft_effort: 'low', review_effort: 'xhigh' },
   builder: { effort: 'high' },
   chattiness: { default: '', builder: '', agent: '' },
-  server: { port: 3000, sync_interval: 1000, bind: '127.0.0.1' },
+  server: { port: 3000, sync_interval: 1000, bind: '127.0.0.1', dashboard_url: '' },
   remote: {
     driver: 'github',
     git_remote: 'origin',
@@ -31,18 +34,20 @@ const mockConfig: ResolvedConfig = {
     gitlab_auto_push: true,
     gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
   },
-  docker: { dockerfile: '' },
-  runner: { type: 'docker' as const, permission_mode: 'sandbox' as const, sandbox_allowed_domains: ['*.anthropic.com'], sandbox_deny_read: [], sandbox_deny_write: [], sandbox_allow_weaker_nested: false },
+  docker: { dockerfile: '', build_inputs: [], run_args: [] },
+  runner: { type: 'docker' as const, permission_mode: 'sandbox' as const, sandbox_allowed_domains: ['*.anthropic.com'], sandbox_deny_read: [], sandbox_deny_write: [], sandbox_allow_weaker_nested: false, verify_sandbox_boundary: 'off' as const },
   documents: { path: '' },
   features: {},
   worktree: { include: [] },
   permissions: { protected: [] },
   protection: { enabled: false, protected_branches: [], protected_tasks: [], gate_default_branch: true },
-  automation: { maintain: [], pre_accept: { enabled: false, commands: [], timeout: 600 } },
+  automation: { maintain: [], react: [], pre_accept: { enabled: false, commands: [], timeout: 600 }, pre_turn: '', pre_turn_timeout: 120, pre_turn_required: false, post_turn: '', post_turn_timeout: 300, accept_check: '', accept_check_timeout: 300 },
   mounts: [],
-  checks: { post_turn: '', post_turn_timeout: 300 },
-  ollama: { enabled: false, model: '', endpoint: 'http://host.docker.internal:11434' },
-  limits: { max_concurrent_agents: 8, max_concurrent_builders: 8, idle_grace_minutes: 10, max_turns_without_human: 10 },
+  serve: { services: [], start_services_cmd: '' },
+  credentials: { backend: 'auto' },
+  limits: { max_concurrent_builders: 8, max_turns_without_human: 10 },
+  cluster: { max_child_fix_rounds: 3 },
+  usage_pause: { threshold_percent: 0, credentials: {} },
   daemon: {
     auto_react_ci: true,
     auto_react_comments: true,
@@ -68,7 +73,6 @@ function makeTask(overrides?: Partial<Task>): Task {
     prompt: 'Test prompt',
     type: 'task',
     status: 'working' as const,
-    priority: 'normal',
     created_at: Date.now(),
     completed_at: null,
     target: { kind: 'branch' as const, branch: 'main' },
@@ -434,5 +438,132 @@ describe('GitHubDriver markReadyForReview', () => {
 
     // Must not call `gh pr ready` after the state check failed.
     expect(ghCalls.find(c => c[0] === 'pr' && c[1] === 'ready')).toBeUndefined();
+  });
+});
+
+// The seams an explicit human `lazy submit` into an intermediate branch uses
+// (src/daemon/submit-target.ts).
+describe('GitHubDriver intermediate-branch submit seams', () => {
+  const stacked = () => makeTask({ target: { kind: 'task' as const, parentTaskId: 'parent-id' } });
+
+  // INVARIANT: with no explicit base, a task stacked on another task is still
+  // REFUSED — the default "no PR for intermediate branches" lives in the
+  // driver too, so an automatic caller cannot open one by accident.
+  test('refuses a stacked task without an explicit base', async () => {
+    const driver = new GitHubDriver(mockConfig, {
+      runGh: async () => fail('gh must not be called'),
+      runGit: async () => ok('git@github.com:owner/repo.git'),
+    });
+    await expect(driver.markReadyForReview(stacked())).rejects.toThrow('stacked on another task');
+  });
+
+  // INVARIANT: an explicit base is used verbatim as the PR's --base.
+  test('opens the PR against an explicit base', async () => {
+    const ghCalls: string[][] = [];
+    const driver = new GitHubDriver(mockConfig, {
+      runGh: async (args) => {
+        ghCalls.push([...args]);
+        if (args[1] === 'create') return ok('https://github.com/owner/repo/pull/9');
+        if (args[1] === 'view') return ok(JSON.stringify({ number: 9 }));
+        return fail('unexpected gh call');
+      },
+      runGit: async () => ok('git@github.com:owner/repo.git'),
+    });
+    const result = await driver.markReadyForReview(stacked(), { baseBranch: 'lazy/parent' });
+    const create = ghCalls.find((c) => c[1] === 'create')!;
+    expect(create[create.indexOf('--base') + 1]).toBe('lazy/parent');
+    expect(result.metadata?.github_remote_ref_id).toBe('9');
+  });
+
+  test('findOpenReviewForBranch returns an open PR with its base, and null for none or closed', async () => {
+    let reply: GhResult = ok(JSON.stringify({ url: 'https://github.com/o/r/pull/3', number: 3, state: 'OPEN', baseRefName: 'lazy/parent' }));
+    const driver = new GitHubDriver(mockConfig, {
+      runGh: async () => reply,
+      runGit: async () => ok('git@github.com:owner/repo.git'),
+    });
+    expect(await driver.findOpenReviewForBranch('lazy/child')).toEqual({
+      url: 'https://github.com/o/r/pull/3',
+      baseBranch: 'lazy/parent',
+      metadata: { github_remote_ref_url: 'https://github.com/o/r/pull/3', github_remote_ref_id: '3' },
+    });
+    reply = ok(JSON.stringify({ url: 'https://github.com/o/r/pull/3', number: 3, state: 'CLOSED', baseRefName: 'main' }));
+    expect(await driver.findOpenReviewForBranch('lazy/child')).toBeNull();
+    reply = fail('no pull requests found for branch "lazy/child"');
+    expect(await driver.findOpenReviewForBranch('lazy/child')).toBeNull();
+  });
+
+  // INVARIANT: failing to ASK is not "no PR" — submit would then open a second one.
+  test('findOpenReviewForBranch throws when the forge cannot be asked', async () => {
+    const driver = new GitHubDriver(mockConfig, {
+      runGh: async () => fail('HTTP 401: Bad credentials'),
+      runGit: async () => ok('git@github.com:owner/repo.git'),
+    });
+    await expect(driver.findOpenReviewForBranch('lazy/child')).rejects.toThrow('Bad credentials');
+  });
+
+  test('remoteBranchHead: SHA when present, null when the remote has no such branch, throws otherwise', async () => {
+    let reply: GhResult = ok('0123abcd\trefs/heads/lazy/parent\n');
+    const driver = new GitHubDriver(mockConfig, {
+      runGh: async () => fail('unused'),
+      runGit: async () => reply,
+    });
+    expect(await driver.remoteBranchHead('lazy/parent')).toBe('0123abcd');
+    reply = { stdout: '', stderr: '', exitCode: 2 };
+    expect(await driver.remoteBranchHead('lazy/parent')).toBeNull();
+    reply = { stdout: '', stderr: 'fatal: unable to access', exitCode: 128 };
+    await expect(driver.remoteBranchHead('lazy/parent')).rejects.toThrow('unable to access');
+  });
+});
+
+describe('GitHubDriver getReviewBase', () => {
+  const withPr = () => makeTask({ metadata: { github_remote_ref_id: '9', github_remote_ref_url: 'https://github.com/o/r/pull/9' } });
+
+  test('reads the recorded PR\'s base from the forge; null when the task records no PR', async () => {
+    const calls: string[][] = [];
+    const driver = new GitHubDriver(mockConfig, {
+      runGh: async (args) => { calls.push([...args]); return ok(JSON.stringify({ baseRefName: 'lazy/parent' })); },
+      runGit: async () => ok('git@github.com:owner/repo.git'),
+    });
+    expect(await driver.getReviewBase(withPr())).toBe('lazy/parent');
+    expect(calls[0].slice(0, 5)).toEqual(['pr', 'view', '9', '--json', 'baseRefName']);
+    expect(await driver.getReviewBase(makeTask())).toBeNull();
+  });
+
+  // INVARIANT: a base that cannot be read is an error, never "no PR" — a forge
+  // merge checked against nothing would land wherever the PR points.
+  test('throws when the forge cannot be asked or answers without a base', async () => {
+    let reply: GhResult = fail('HTTP 502');
+    const driver = new GitHubDriver(mockConfig, {
+      runGh: async () => reply,
+      runGit: async () => ok('git@github.com:owner/repo.git'),
+    });
+    await expect(driver.getReviewBase(withPr())).rejects.toThrow('HTTP 502');
+    reply = ok('{}');
+    await expect(driver.getReviewBase(withPr())).rejects.toThrow('no usable base');
+  });
+});
+
+describe('GitHubDriver retargetReview', () => {
+  const withPr = () => makeTask({ metadata: { github_remote_ref_id: '9' } });
+
+  test('edits the recorded PR\'s base with gh pr edit --base', async () => {
+    const calls: string[][] = [];
+    const driver = new GitHubDriver(mockConfig, {
+      runGh: async (args) => { calls.push([...args]); return ok(); },
+      runGit: async () => ok('git@github.com:owner/repo.git'),
+    });
+    await driver.retargetReview(withPr(), 'main');
+    expect(calls[0].slice(0, 5)).toEqual(['pr', 'edit', '9', '--base', 'main']);
+  });
+
+  // INVARIANT: a refused retarget throws — the caller then CLOSES the PR
+  // rather than leave it merging into a branch the task no longer goes to.
+  test('throws when the forge refuses, and when the task records no PR', async () => {
+    const driver = new GitHubDriver(mockConfig, {
+      runGh: async () => fail('base branch does not exist'),
+      runGit: async () => ok('git@github.com:owner/repo.git'),
+    });
+    await expect(driver.retargetReview(withPr(), 'main')).rejects.toThrow('base branch does not exist');
+    await expect(driver.retargetReview(makeTask(), 'main')).rejects.toThrow('records no PR');
   });
 });

@@ -49,16 +49,16 @@ describe('deriveWorkingSubstate', () => {
     expect(s).toEqual({ kind: 'agent', answering: true });
   });
 
-  // INVARIANT: the accept path's pre-accept turn is its own substate. The task
-  // is genuinely `working` for the whole turn, and a bare `working` there is
-  // indistinguishable from a human having unblocked the task by hand — which is
-  // exactly the ambiguity accept observability exists to remove.
-  test('alive + work phase with command_type=pre_accept → agent:pre-accept', () => {
+  // The retired pre-accept turn has no substate: a legacy checkpoint still
+  // carrying command_type=pre_accept (an old supervisor image mid-turn)
+  // degrades to the generic agent substate — the turn it named no longer
+  // exists, and `agent:pre-accept` would advertise a phase nothing runs.
+  test('alive + work phase with legacy command_type=pre_accept → plain agent', () => {
     const s = deriveWorkingSubstate(
-      { ...baseStatus, command_type: 'pre_accept' },
+      { ...baseStatus, command_type: 'pre_accept' } as unknown as SupervisorStatus,
       { isAlive: true, hasResponse: false },
     );
-    expect(s).toEqual({ kind: 'agent', preAccept: true });
+    expect(s).toEqual({ kind: 'agent' });
   });
 
   // non-ask command_type during agent phases stays plain agent.
@@ -151,6 +151,23 @@ describe('deriveWorkingSubstate', () => {
   test('not alive + response present → null (finishing, not stranded)', () => {
     const s = deriveWorkingSubstate(baseStatus, { isAlive: false, hasResponse: true });
     expect(s).toBeNull();
+  });
+
+  // INVARIANT: a run the daemon is still STARTING is `launching`, never
+  // `not-alive`. The reconciler skips a launch in flight (an image build takes
+  // minutes), so `not-alive` there named a dead run nothing was about to act on.
+  test('not alive + launch in flight → launching', () => {
+    const s = deriveWorkingSubstate(null, { isAlive: false, hasResponse: false, launching: true });
+    expect(s).toEqual({ kind: 'launching' });
+  });
+
+  test('a present response still wins over a launch in flight', () => {
+    expect(deriveWorkingSubstate(baseStatus, { isAlive: false, hasResponse: true, launching: true })).toBeNull();
+  });
+
+  test('a live run is described by its phase, launch flag or not', () => {
+    const s = deriveWorkingSubstate(baseStatus, { isAlive: true, hasResponse: false, launching: true });
+    expect(s).toMatchObject({ kind: 'agent' });
   });
 
   // Alive but no checkpoint yet (container starting) — degrade to no substate.
@@ -269,16 +286,10 @@ describe('agent-reported progress', () => {
     expect(s).toEqual({ kind: 'agent', progress: 'running migration 3/7' });
   });
 
-  test('decorates agent:answering and agent:pre-accept', () => {
+  test('decorates agent:answering', () => {
     expect(
       deriveWorkingSubstate({ ...baseStatus, command_type: 'ask' }, { isAlive: true, hasResponse: false, progress }),
     ).toEqual({ kind: 'agent', answering: true, progress: 'running migration 3/7' });
-    expect(
-      deriveWorkingSubstate(
-        { ...baseStatus, command_type: 'pre_accept' },
-        { isAlive: true, hasResponse: false, progress },
-      ),
-    ).toEqual({ kind: 'agent', preAccept: true, progress: 'running migration 3/7' });
   });
 
   test('decorates a wait', () => {
@@ -344,13 +355,17 @@ describe('formatWorkingSubstate', () => {
     expect(formatWorkingSubstate({ kind: 'agent' }, now)).toBe('agent');
   });
 
+  test('launching', () => {
+    expect(renderWorkingStatus({ kind: 'launching' }, now)).toBe('working(launching)');
+  });
+
   // INVARIANT: answering substate formats with the agent:answering label.
   test('agent:answering', () => {
     expect(formatWorkingSubstate({ kind: 'agent', answering: true }, now)).toBe('agent:answering');
   });
 
-  test('agent:pre-accept', () => {
-    expect(formatWorkingSubstate({ kind: 'agent', preAccept: true }, now)).toBe('agent:pre-accept');
+  test('agent:reviewing', () => {
+    expect(formatWorkingSubstate({ kind: 'agent', reviewing: true }, now)).toBe('agent:reviewing');
   });
 
   test('not-alive', () => {

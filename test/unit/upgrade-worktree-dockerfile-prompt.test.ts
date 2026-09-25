@@ -3,8 +3,8 @@
  *
  * INVARIANT: a task worktree never governs the container image by default.
  * On a TTY, upgrade offers adoption; on yes it persists daemon runtime state
- * (adopted-image.json). Each rebuild clears first so adoption cannot silently
- * outlive the next decision. The old env-override path is gone.
+ * (adopted-image.json). Each rebuild re-decides adoption: announce any valid
+ * state (keep or clear), then optionally offer a new worktree Dockerfile.
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
@@ -18,12 +18,10 @@ import {
 import {
   readAdoptedImage,
 } from '../../src/daemon/adopted-image';
-import { getAdoptedImagePath } from '../../src/daemon/paths';
 import { pinDaemonBaseDir } from '../helpers/daemon-base-dir';
 import { initGitRepoWithCommit } from '../helpers/git-repo';
 import { VERSION } from '../../src/version';
 import { IMAGE_TAG } from '../../src/capture/image-tag';
-import { pathExists } from '../../src/utils/fs';
 
 describe('lazyTaskWorktreeCwd', () => {
   let root: string;
@@ -44,9 +42,30 @@ describe('lazyTaskWorktreeCwd', () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  test('returns the cwd when it is under .lazy/worktrees/', async () => {
+  test('returns the worktree root when cwd is under .lazy/worktrees/', async () => {
     process.chdir(worktree);
     expect(await lazyTaskWorktreeCwd(root)).toBe(worktree);
+  });
+
+  test('returns the worktree root when cwd is a subdirectory of the worktree', async () => {
+    const subdir = join(worktree, 'src', 'cli');
+    await mkdir(subdir, { recursive: true });
+    process.chdir(subdir);
+    expect(await lazyTaskWorktreeCwd(root)).toBe(worktree);
+  });
+
+  test('returns the worktree root when cwd is reached through a symlink', async () => {
+    const linkParent = await mkdtemp(join(tmpdir(), 'lazy-wt-link-'));
+    const link = join(linkParent, 'into-worktree');
+    try {
+      const { symlink } = await import('fs/promises');
+      await symlink(worktree, link);
+      process.chdir(link);
+      expect(await lazyTaskWorktreeCwd(root)).toBe(worktree);
+    } finally {
+      process.chdir(originalCwd);
+      await rm(linkParent, { recursive: true, force: true });
+    }
   });
 
   test('returns null from the project root', async () => {
@@ -106,10 +125,9 @@ describe('maybePromptWorktreeDockerfileAdoption', () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  test('does nothing without a TTY but still clears prior adoption', async () => {
+  test('keeps prior adoption without a TTY and logs the decision', async () => {
     delete process.env.LAZY_FORCE_TTY;
     delete process.env.LAZY_PROMPT_DEFAULTS;
-    // Seed a prior adoption so we can assert the clear.
     const { writeAdoptedImage, hashDockerfileContent } = await import('../../src/daemon/adopted-image');
     const dockerfilePath = join(worktree, 'Dockerfile.lazy');
     const content = await readFile(dockerfilePath, 'utf-8');
@@ -120,9 +138,11 @@ describe('maybePromptWorktreeDockerfileAdoption', () => {
     }, { content });
     expect(await readAdoptedImage(root)).not.toBeNull();
 
+    process.chdir(root);
     const result = await maybePromptWorktreeDockerfileAdoption(root);
-    expect(result).toBeNull();
-    expect(await readAdoptedImage(root)).toBeNull();
+    expect(result).not.toBeNull();
+    expect(result!.imageName).toBe('lazy-custom-abc:0.22');
+    expect(await readAdoptedImage(root)).not.toBeNull();
   });
 
   test('does nothing when worktree Dockerfile.lazy matches the root copy', async () => {
@@ -152,6 +172,38 @@ describe('maybePromptWorktreeDockerfileAdoption', () => {
     expect(onDisk).toEqual(result);
     // Adoption must not invent a process env override — it is daemon state only.
     expect(process.env.LAZY_DOCKERFILE_LAZY).toBeUndefined();
+  });
+
+  test('writes adoption from a subdirectory of the worktree on a TTY', async () => {
+    process.env.LAZY_FORCE_TTY = '1';
+    process.env.LAZY_PROMPT_DEFAULTS = 'accept';
+    const subdir = join(worktree, 'src');
+    await mkdir(subdir, { recursive: true });
+    process.chdir(subdir);
+
+    const result = await maybePromptWorktreeDockerfileAdoption(root);
+    expect(result).not.toBeNull();
+    expect(result!.dockerfilePath).toBe(join(worktree, 'Dockerfile.lazy'));
+  });
+
+  test('keeps existing adoption when upgrade runs from project root on a TTY', async () => {
+    process.env.LAZY_FORCE_TTY = '1';
+    process.env.LAZY_PROMPT_DEFAULTS = 'accept';
+    const { writeAdoptedImage, hashDockerfileContent } = await import('../../src/daemon/adopted-image');
+    const dockerfilePath = join(worktree, 'Dockerfile.lazy');
+    const content = await readFile(dockerfilePath, 'utf-8');
+    const hash = hashDockerfileContent(content);
+    await writeAdoptedImage(root, {
+      dockerfilePath,
+      contentHash: hash,
+      imageName: 'lazy-custom-keepme1234:0.22',
+    }, { content });
+
+    process.chdir(root);
+    const result = await maybePromptWorktreeDockerfileAdoption(root);
+    expect(result).not.toBeNull();
+    expect(result!.imageName).toBe('lazy-custom-keepme1234:0.22');
+    expect(await readAdoptedImage(root)).not.toBeNull();
   });
 
   // INVARIANT: the image name covers the build CONTEXT, not just the Dockerfile
@@ -193,19 +245,30 @@ describe('maybePromptWorktreeDockerfileAdoption', () => {
     expect(await readAdoptedImage(root)).not.toBeNull();
   });
 
-  test('leaves adoption cleared when the human declines', async () => {
+  test('clears existing adoption when the human declines keep on a TTY from project root', async () => {
     process.env.LAZY_FORCE_TTY = '1';
     process.env.LAZY_PROMPT_DEFAULTS = 'decline';
-    const { writeAdoptedImage } = await import('../../src/daemon/adopted-image');
+    const { writeAdoptedImage, hashDockerfileContent } = await import('../../src/daemon/adopted-image');
+    const dockerfilePath = join(worktree, 'Dockerfile.lazy');
+    const content = await readFile(dockerfilePath, 'utf-8');
     await writeAdoptedImage(root, {
-      dockerfilePath: '/old',
-      contentHash: 'old',
+      dockerfilePath,
+      contentHash: hashDockerfileContent(content),
       imageName: 'lazy-custom-old:0.22',
-    });
+    }, { content });
+
+    process.chdir(root);
+    const result = await maybePromptWorktreeDockerfileAdoption(root);
+    expect(result).toBeNull();
+    expect(await readAdoptedImage(root)).toBeNull();
+  });
+
+  test('does not write adoption when the human declines a new worktree offer', async () => {
+    process.env.LAZY_FORCE_TTY = '1';
+    process.env.LAZY_PROMPT_DEFAULTS = 'decline';
 
     const result = await maybePromptWorktreeDockerfileAdoption(root);
     expect(result).toBeNull();
     expect(await readAdoptedImage(root)).toBeNull();
-    expect(await pathExists(getAdoptedImagePath(root))).toBe(false);
   });
 });

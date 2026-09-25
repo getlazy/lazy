@@ -40,6 +40,19 @@ describe('ClaudeCodeActivityStream.parseLine', () => {
     expect(ev?.sessionId).toBe('sess-1');
   });
 
+  test('system/init carries the concrete model when the agent reports one', () => {
+    const ev = stream.parseLine(JSON.stringify({
+      type: 'system', subtype: 'init', session_id: 'sess-1', model: 'claude-opus-4-6-20260101',
+    }));
+    expect(ev?.kind).toBe('session_start');
+    expect(ev?.model).toBe('claude-opus-4-6-20260101');
+  });
+
+  test('system/init without a model leaves it undefined', () => {
+    const ev = stream.parseLine(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-1' }));
+    expect(ev?.model).toBeUndefined();
+  });
+
   // INVARIANT (init-line-is-ground-truth): the init line is the ONLY place the
   // agent reports what it actually loaded — which MCP servers connected and
   // which tools exist in its own process. Everything else lazy can observe is
@@ -159,6 +172,7 @@ describe('ClaudeCodeAgent.buildExecArgs', () => {
   // until exit and the no-progress guard becomes a launch deadline again.
   test('requests stream-json with --verbose', () => {
     const args = new ClaudeCodeAgent().buildExecArgs({
+      modelId: 'test-model',
       prompt: 'do the thing',
       dangerouslySkipPermissions: true,
     });

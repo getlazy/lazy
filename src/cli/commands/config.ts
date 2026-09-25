@@ -13,7 +13,8 @@
  * static config remain in lazy.toml.
  */
 
-import { requireLazyRoot, requireStorage, resolveTaskOrExit, displayId, parseFlags } from '../helpers';
+import { requireLazyRoot, requireStorage, resolveTaskOrExit, parseFlags } from '../helpers';
+import { displayId } from '../../task/identity';
 import { join } from 'path';
 import {
   isGlobalAutoReactPaused,
@@ -27,7 +28,7 @@ import {
 import { setOfflineMode, resolveOfflineStatus, formatOfflineExpiry } from '../../utils/offline';
 import { loadConfig } from '../../config/loader';
 import { describeExpiry, nextLocalMidnight } from '../../utils/local-day';
-import { theme } from '../theme';
+import { theme } from '../../render/theme';
 
 /** Known config keys and their allowed values. */
 const KNOWN_KEYS: Record<string, { values: string[]; description: string }> = {
@@ -211,6 +212,7 @@ async function getAutoReact(taskIdInput: string | undefined): Promise<void> {
         upstream_sync: 'Upstream syncs',
         comment: 'Comments',
         child_completed: 'Child completions',
+        child_added: 'Loop children added',
         crash: 'Crashes',
       };
       const hasCounts = Object.values(summary.counts).some(c => c > 0);

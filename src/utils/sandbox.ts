@@ -8,15 +8,28 @@
  * exist) and git operations inside the container have no user identity.
  */
 
-import { join } from 'path';
+import { join, dirname } from 'path';
 import { mkdir, copyFile, writeFile, rm, appendFile } from 'fs/promises';
 import { getHome } from './home';
 import { pathExists, dirExists } from './fs';
 import { runGit } from './git';
 import { logger } from './logger';
 import type { SandboxConfig } from '../capture/claude';
+import type { Storage } from '../storage/interface';
+import { ensureTaskClaudeConfig } from '../task/claude-home';
 
 export const SANDBOX_DIR = '.lazy-task-sandbox';
+
+/**
+ * Where a task's artifacts are materialized inside its worktree, relative to
+ * the worktree root.
+ *
+ * Deliberately under the sandbox dir rather than a new top-level `.lazy-artifacts/`:
+ * `.lazy-task-sandbox/` is already written into the project `.gitignore` by
+ * `lazy init` and is already excluded from every dirtiness check by pathspec, so
+ * materializing here cannot dirty a task's diff and needs no new git mechanics.
+ */
+export const ARTIFACTS_SUBDIR = `${SANDBOX_DIR}/artifacts`;
 
 const DEFAULT_GITCONFIG = '[user]\n\tname = Lazy Agent\n\temail = noreply@getlazy.dev\n';
 
@@ -91,7 +104,10 @@ async function safeDirectoryStanza(worktreePath: string): Promise<string> {
  * it in sync with the host's, and removes any stale directory Docker may have
  * created at that path on a previous run.
  */
-export async function setupSandbox(worktreePath: string): Promise<SandboxConfig> {
+export async function setupSandbox(
+  worktreePath: string,
+  artifacts?: { storage: Storage; taskId: string },
+): Promise<SandboxConfig> {
   const sandboxPath = join(worktreePath, SANDBOX_DIR);
   const claudeDir = join(sandboxPath, '.claude');
   await mkdir(claudeDir, { recursive: true });
@@ -100,6 +116,13 @@ export async function setupSandbox(worktreePath: string): Promise<SandboxConfig>
   // bind-mounts it to /home/user/.cursor so a Cursor task's chat state lands in
   // the sandbox instead of vanishing with the container.
   await mkdir(join(sandboxPath, '.cursor'), { recursive: true });
+  // pi's home-config dir (~/.pi/agent: sessions, models.json, the lazy MCP
+  // bridge extension). Same unconditional-create rationale as .cursor.
+  await mkdir(join(sandboxPath, '.pi'), { recursive: true });
+  // Codex's home-config dir, same arrangement: bind-mounted to
+  // /home/user/.codex so a Codex task's config.toml, auth state and session
+  // rollouts persist in the sandbox across the task's containers.
+  await mkdir(join(sandboxPath, '.codex'), { recursive: true });
 
   const hostGitconfig = join(getHome(), '.gitconfig');
   const sandboxGitconfig = join(sandboxPath, '.gitconfig');
@@ -123,5 +146,56 @@ export async function setupSandbox(worktreePath: string): Promise<SandboxConfig>
   // line, so there is no other place it can be set.
   await appendFile(sandboxGitconfig, await safeDirectoryStanza(worktreePath));
 
+  if (artifacts) {
+    await materializeArtifacts(worktreePath, artifacts.storage, artifacts.taskId);
+  }
+
+  // Seed the sandbox copy of ~/.claude.json (onboarding, theme, folder trust)
+  // before the first container bind-mounts it. MCP entries are merged per turn.
+  await ensureTaskClaudeConfig(sandboxPath);
+
   return { worktreePath, sandboxPath };
+}
+
+/**
+ * Write a task's artifacts into `<worktree>/.lazy-task-sandbox/artifacts/`.
+ *
+ * Wipe-and-rewrite, so the directory is always a faithful mirror of the store:
+ * an artifact removed since the last turn disappears, and an agent's local edit
+ * to a materialized file does not survive to look like an input. The store is
+ * the source of truth; this directory is derived.
+ *
+ * Failures are NOT swallowed — an agent that silently loses its inputs will
+ * produce confidently wrong work, so a launch that cannot deliver them fails.
+ */
+export async function materializeArtifacts(
+  worktreePath: string,
+  storage: Storage,
+  taskId: string,
+): Promise<number> {
+  const dir = join(worktreePath, ARTIFACTS_SUBDIR);
+  let artifacts;
+  try {
+    artifacts = await storage.listTaskArtifacts(taskId);
+  } catch (err) {
+    throw new Error(
+      `Failed to list artifacts for task ${taskId}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  await rm(dir, { recursive: true, force: true });
+  if (artifacts.length === 0) return 0;
+  await mkdir(dir, { recursive: true });
+
+  for (const meta of artifacts) {
+    const full = await storage.getTaskArtifact(taskId, meta.name);
+    if (!full) {
+      // Listed a moment ago but gone now — a concurrent remove, not corruption.
+      continue;
+    }
+    const dest = join(dir, meta.name);
+    await mkdir(dirname(dest), { recursive: true });
+    await writeFile(dest, Buffer.from(full.content_base64, 'base64'));
+  }
+  return artifacts.length;
 }

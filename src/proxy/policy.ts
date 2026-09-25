@@ -48,6 +48,47 @@ export const DEFAULT_SECRET_PATH_PATTERNS: readonly RegExp[] = [
   /credentials\.json$/,                // generic credential files
 ];
 
+/**
+ * Suffixes that mark a *template* rather than a real secret file. A file whose
+ * name ends in one of these is placeholder-valued by construction — `.env.example`
+ * is the canonical case: it is committed to the repo precisely so a human (or an
+ * agent updating deploy docs) can read it. Denying it blocks ordinary work and
+ * protects nothing.
+ *
+ * WHY SUFFIX, NOT GIT-TRACKED STATUS: "is this path tracked in git?" is the more
+ * precise question, but answering it means shelling out to git — I/O, async, and
+ * a repo root this engine does not have (the path may be anywhere on the
+ * filesystem). The engine is deliberately a pure, synchronous predicate over the
+ * tool_use block (see the file header): that purity is what makes the decision
+ * injection-proof and identical across backends. A per-tool-call `git ls-files`
+ * on the response-rewriting path would trade that away for a distinction that
+ * costs nothing real — an UNtracked `.env.example` is still a template, and a
+ * secret someone named `.env.example` was already readable by anything else on
+ * the machine.
+ */
+const TEMPLATE_SUFFIXES: readonly string[] = ['.example', '.sample', '.template'];
+
+/**
+ * Directory-scoped secret locations where the template carve-out does NOT apply.
+ * `~/.ssh`, `~/.aws` and friends hold live credentials; nothing legitimately
+ * committed as a template lives inside them, so a `.example` suffix there is far
+ * more likely to be an attempt to name its way past the rule than a real
+ * template. Keeping these directories absolute means the carve-out can only ever
+ * widen reads of *project* files.
+ */
+const SECRET_DIR_PATTERN = /(^|\/)\.(ssh|aws|gnupg|kube|docker)\//;
+
+/**
+ * True when `path` is a placeholder template that the secret-path rule must not
+ * deny. Exported for direct testing — the deny-side behaviour it carves out of is
+ * security-relevant, so both directions are covered in test/unit/proxy-policy.test.ts.
+ */
+export function isTemplatePath(path: string): boolean {
+  if (SECRET_DIR_PATTERN.test(path)) return false;
+  const name = path.slice(path.lastIndexOf('/') + 1).toLowerCase();
+  return TEMPLATE_SUFFIXES.some((suffix) => name.endsWith(suffix) && name !== suffix);
+}
+
 /** Tools that write to the filesystem — their path is checked against deny globs. */
 const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
 /** Tools that read a path — their path is checked against secret patterns. */
@@ -171,8 +212,12 @@ export function evaluateToolUse(
 
   const path = pathOf(input);
 
-  // Rule 2 — secret-path reads: deny reads of credential/key paths.
-  if (config.denySecretPathReads && path && READ_PATH_TOOLS.has(name)) {
+  // Rule 2 — secret-path reads: deny reads of credential/key paths. Templates
+  // (`.env.example` and friends) are carved out: they are placeholder files
+  // committed for humans and agents to read, and denying them ended real turns
+  // mid-task. The carve-out is deliberately NOT applied to rule 3's deny globs
+  // below — those are patterns the operator wrote by hand and must stay literal.
+  if (config.denySecretPathReads && path && READ_PATH_TOOLS.has(name) && !isTemplatePath(path)) {
     for (const pat of DEFAULT_SECRET_PATH_PATTERNS) {
       if (pat.test(path)) {
         return {

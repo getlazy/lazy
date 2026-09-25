@@ -1,3 +1,4 @@
+import { withLaunchInFlight } from './launch-in-flight';
 /**
  * DockerRunner — Runner implementation backed by Docker containers.
  *
@@ -7,10 +8,13 @@
 
 import type { SandboxConfig } from '../capture/claude';
 import type { AgentResponse } from '../types';
-import type { Runner, RunInfo, FollowHandle, HealthCheck } from './types';
+import type { Runner, RunInfo, FollowHandle, HealthCheck, RunStream, DiagnoseOptions, RunInfoProbe } from './types';
+import type { PhaseNotify } from '../daemon/progress';
+import { parsePortBindings, type PortBinding } from '../serve/ports';
 import type { RunnerType, RoleTarget } from '../config/types';
 
 import { mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
+import { mkdir as mkdirAsync, writeFile as writeFileAsync } from 'fs/promises';
 import { spawn } from '../utils/spawn';
 import { join, basename } from 'path';
 import { getHome } from '../utils/home';
@@ -19,6 +23,7 @@ import { redactSecrets } from '../utils/redact';
 import {
   checkTargetConnectivity,
   preflightRoleTarget,
+  probesUpstream,
   ANTHROPIC_DEFAULT_TARGET,
 } from '../utils/role-target';
 
@@ -29,12 +34,16 @@ import {
   containerNameForTask,
   launchSupervisorAsync,
   runClaude,
+  getLaunchAuthEnvVars,
   isContainerRunning,
   containerExists,
   getContainerInfo as dockerGetContainerInfo,
+  probeContainerInfo,
   getContainerExitCode,
   getContainerLogs,
   removeContainer,
+  resolveImageName,
+  localImageExists,
 } from '../capture/claude';
 
 import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
@@ -50,14 +59,36 @@ import {
   persistBuilderSessionClaudeConfig,
   writeBuilderSessionClaudeConfig,
   writeNeutralCredentialStore,
+  builderSessionLaunchDir,
 } from '../builder/claude-home';
 import { assertDaemonMcpConfigMounted } from '../builder/mcp-config-check';
+import { assertSiblingContainerLaunchSupported } from './sibling-containers';
+import { writeMcpLaunchWrapper } from '../builder/mcp-launch-wrapper';
 import { SANDBOX_DIR } from '../utils/sandbox';
 import { resolveAuthEnvFromDaemon } from '../daemon/auth-env';
+import type { LaunchIdentity } from '../proxy/placeholder-env';
+import { findLazyRoot } from '../project-paths';
+import { projectSlug } from '../daemon/paths';
+import type { OneshotRequest, OneshotRepoAccess } from '../oneshot/types';
+import type {
+  LaunchBuilderHeadlessParams, LaunchBuilderHeadlessResult,
+  LaunchBuilderDetachedParams, LaunchBuilderDetachedResult,
+} from './types';
+import {
+  buildOneshotAgentArgv,
+  resolveOneshotTimeoutMs,
+  DEFAULT_ONESHOT_TIMEOUT_MS,
+  ONESHOT_KILL_GRACE_MS,
+} from '../oneshot/args';
+import { execBoundedOneshot } from '../oneshot/exec';
+import { buildBuilderHeadlessClaudeArgs, builderHeadlessModel, parseBuilderHeadlessStdout } from './builder-headless';
+import { detectBuilderLaunchSessionId } from '../builder/session-detect';
+import { ensureOneshotAgentHome } from '../oneshot/state-dir';
 import dockerBuilderInstructions from '../prompts/docker-builder-runner-instructions.md' with { type: 'text' };
 import dockerAgentInstructions from '../prompts/docker-agent-instructions.md' with { type: 'text' };
 import { writeToolPermissions } from '../mcp/config';
 import { READ_ONLY_TOOL_NAMES } from '../mcp/tool-access';
+import { isToolForRole } from '../mcp/tool-roles';
 
 // Agent packaging for tool checks. Instantiated once; stateless.
 const agentPackaging = new ClaudeCodePackaging();
@@ -81,20 +112,138 @@ export const PROJECT_LABEL = 'lazy.project';
  * the builder's pre-approval list and the ask turn's read-only toolset can never
  * drift apart — a new write tool is a write tool for both, by default.
  */
-const BUILDER_READ_ONLY_TOOLS = [...READ_ONLY_TOOL_NAMES];
+const BUILDER_READ_ONLY_TOOLS = READ_ONLY_TOOL_NAMES.filter(n => isToolForRole(n, 'builder'));
 
 /** Docker label key used to scope containers to a project root. */
 export const PROJECT_LABEL_KEY = 'lazy.project';
 
+/**
+ * Label marking a container as a machine one-shot rather than a task run. Both
+ * carry PROJECT_LABEL, so this is what tells them apart without parsing names.
+ */
+export const ONESHOT_LABEL = 'lazy.oneshot=1';
+
+/**
+ * Distinct name per one-shot container. One-shots can overlap — `lazy report`
+ * fans out map units concurrently — so a fixed name would make the second run
+ * collide with the first.
+ */
+let oneshotCounter = 0;
+function oneshotContainerName(lazyRoot: string): string {
+  oneshotCounter += 1;
+  return `lazy-oneshot-${projectSlug(lazyRoot)}-${process.pid}-${oneshotCounter}`;
+}
+
+/**
+ * Who a one-shot's credential grant belongs to.
+ *
+ * Pure and exported for the same reason {@link buildOneshotDockerArgs} is: the
+ * credential posture of a one-shot is a property of this value, and a test that
+ * had to launch a container to check it would never be written.
+ *
+ * Three decisions are load-bearing:
+ *
+ * - **Role `builder`.** A one-shot is a fresh-context call lazy makes on the
+ *   HUMAN's behalf, not a turn on anyone's session: it strips
+ *   `--resume`/`--continue`, so it inherits no session and no prompt cache from
+ *   the task it may be about. It therefore runs the builder role's target
+ *   throughout — endpoint, credential, harness, model — and its grant says so,
+ *   because the role is what the audit trail records and what the proxy routes
+ *   on. An `agent`-role grant would redeem the placeholder against the task
+ *   agent's upstream while the argv was composed from the builder's.
+ * - **The profile is read off the target this launch was composed FROM.** The
+ *   proxy forwards a verified caller to the upstream its grant's profile
+ *   resolves to, and pays that upstream with the credential mapped to it
+ *   (`src/proxy/agent-upstreams.ts`), while the env in the argv came from
+ *   `builderTarget()` — that profile's endpoint, wire and credential. Naming any
+ *   other profile would redeem the placeholder against a different upstream
+ *   than the one this argv was built for; naming none would silently take the
+ *   proxy's PRIMARY upstream, which is the pre-profiles behaviour.
+ * - **The label is per-project, and per-TASK when there is a task.** A grant is
+ *   keyed on `identityKey`, which for the builder role ignores the task id and
+ *   uses the label alone — so a single `oneshot:<root>` label would hand every
+ *   later task the FIRST task's grant, and the proxy (which reads the task id
+ *   off the grant, not off the request header) would attribute all of them to
+ *   that first task. A `:<taskId>` suffix keeps attribution honest. The taskless
+ *   form stays stable and per-project: a taskless one-shot has no lifecycle
+ *   event to be revoked on, so a per-RUN label would leave one live placeholder
+ *   behind for every `lazy ask` / `lazy report`, forever.
+ *
+ * A one-shot ABOUT a task is attributed to that task and revoked with it —
+ * `revokeTaskCredentialGrants` filters on task id regardless of role, so these
+ * task-scoped builder grants are cleaned up at task end and are excluded from
+ * the builder-grant cap (see `src/proxy/credential-broker.ts`) rather than
+ * pressuring it and evicting a live builder session.
+ */
+export function oneshotLaunchIdentity(
+  lazyRoot: string,
+  profile: string,
+  taskId?: string | null,
+): LaunchIdentity {
+  return {
+    role: 'builder',
+    taskId: taskId ?? null,
+    label: taskId ? `oneshot:${lazyRoot}:${taskId}` : `oneshot:${lazyRoot}`,
+    profile,
+  };
+}
+
+/**
+ * Compose the full `docker run` argv for a one-shot.
+ *
+ * Pure and exported so the isolation posture is assertable without a Docker
+ * daemon: "no repo mount when none was asked for" and "`:ro` when it was" are
+ * properties of this array, and a test that has to spawn a container to check
+ * them is a test nobody runs.
+ */
+export function buildOneshotDockerArgs(opts: {
+  binary: string;
+  containerName: string;
+  lazyRoot: string;
+  repoAccess: OneshotRepoAccess;
+  agentStateHome: string;
+  imageName: string;
+  authEnvVars: { key: string; value: string }[];
+  /** The agent BINARY the one-shot runs — a harness, not a profile name. */
+  harness: string;
+  prompt: string;
+  model?: string;
+  /** Effort fixed by the one-shot's KIND. See OneshotRequest.effort. */
+  effort?: string;
+}): string[] {
+  const agentConfigDir = getAgentPackaging(opts.harness).configDirName();
+  return [
+    opts.binary, 'run', '--rm', '--init',
+    '--name', opts.containerName,
+    '--label', `${PROJECT_LABEL}=${opts.lazyRoot}`,
+    // Marks this container as a one-shot rather than a task run, so anything
+    // enumerating lazy containers can tell the two apart without parsing names.
+    '--label', ONESHOT_LABEL,
+    // The proxy listens on the host; without this the container cannot reach it.
+    '--add-host=host.docker.internal:host-gateway',
+    // INVARIANT: never `:rw`, and no mount at all unless the call site declared
+    // it needs the repo. A one-shot has no business writing to the project —
+    // this is what makes the accept-time commit-on-main bug structurally
+    // impossible rather than merely disallowed by argv.
+    ...(opts.repoAccess === 'read-only'
+      ? ['-v', `${opts.lazyRoot}:${opts.lazyRoot}:ro`, '-w', opts.lazyRoot]
+      : []),
+    '-v', `${opts.agentStateHome}:/home/user/${agentConfigDir}`,
+    ...opts.authEnvVars.flatMap(v => ['-e', `${v.key}=${v.value}`]),
+    opts.imageName,
+    ...buildOneshotAgentArgv(opts.harness, opts.prompt, opts.model, opts.effort),
+  ];
+}
+
 export class DockerRunner implements Runner {
   readonly type: RunnerType;
   readonly runLabel = 'Container';
-  // An idle container stays fully resident between turns → eligible for base reap.
-  readonly reapsIdleRuns = true;
   protected readonly binary: string;
   private lazyRoot: string | undefined;
   protected _roleTargets?: { builder: RoleTarget; agent: RoleTarget };
   protected _agent?: Agent;
+  /** The `[agents.<name>]` profile `_agent` was resolved from. See setAgent. */
+  protected _agentProfile?: string;
 
   constructor(binary: string = 'docker', type: RunnerType = 'docker', lazyRoot?: string) {
     this.binary = binary;
@@ -111,9 +260,37 @@ export class DockerRunner implements Runner {
    * Set the task's agent so launches build the right image, forward the right
    * credentials, and run the right tool checks. Called by the daemon's task
    * paths (task-lifecycle/task-launcher) after createRunner.
+   *
+   * `profileName` is the `[agents.<name>]` profile the task selected, which the
+   * daemon resolved `agent` FROM. Both travel together deliberately: the
+   * registry entry decides which binary runs, the profile name decides where
+   * the proxy forwards its traffic and whose credential pays, and a runner told
+   * only one of the two would have to guess the other.
    */
-  setAgent(agent: Agent): void {
+  setAgent(agent: Agent, profileName?: string): void {
     this._agent = agent;
+    this._agentProfile = profileName;
+  }
+
+  /**
+   * Point the agent role at the profile THIS task selected. See
+   * {@link Runner.setAgentTarget}.
+   *
+   * The live proxy address is carried across from the role target rather than
+   * re-resolved: it is a fact about the daemon serving this launch, not a
+   * property of any profile, and `withProxyTargets` already paid for it (and
+   * already failed loudly if it could not be resolved). `primaryUpstream`
+   * travels with it for the same reason — it is `[proxy] upstream`, a property
+   * of the daemon's proxy rather than of the profile being switched in.
+   */
+  setAgentTarget(target: RoleTarget): void {
+    const current = this.agentTarget();
+    this._roleTargets = {
+      builder: this._roleTargets?.builder ?? ANTHROPIC_DEFAULT_TARGET,
+      agent: current.proxyUrl
+        ? { ...target, proxyUrl: current.proxyUrl, primaryUpstream: current.primaryUpstream }
+        : target,
+    };
   }
 
   /** The resolved target for task/supervisor (agent) launches. */
@@ -131,18 +308,36 @@ export class DockerRunner implements Runner {
   }
 
   async checkAvailability(): Promise<void> {
+    // FIRST, and before Docker is even probed: a deployment whose Docker host
+    // is a foreign filesystem cannot run ANY workload container here.
+    //
+    // This is the placement that matters, not the two launch sites. Every
+    // task-turn path — start, unblock, resume, auto-resume, auto-delivery —
+    // calls this during preflight, BEFORE a worktree is created, a branch is
+    // cut, a session row is written or a credential placeholder is minted.
+    // Refusing at launch instead left the task `interrupted`, which reads as a
+    // crash: the reconciler auto-resumed it, the slow lane re-queued it, and
+    // each attempt rebuilt all of that just to refuse again. The condition is
+    // static and environment-only, so there is nothing to retry — refuse while
+    // the task still has its pre-start status and let the caller's 4xx/5xx say
+    // why. auto-resume catches this and skips, which is exactly right.
+    assertSiblingContainerLaunchSupported('use the docker runner');
     await checkDocker(this.binary);
     // Auth is NOT enforced here. The daemon credential gate
     // (src/daemon/credential-gate.ts) is the single enforcement point — every
     // path that launches containers goes through a daemon that refuses to start
     // without a credential, so a redundant client-side check here would just
     // duplicate (and risk diverging from) that gate.
-    // Early, non-fatal warning if a configured local backend looks unreachable.
-    // The fail-hard enforcement happens at launch (preflightRoleTarget); here we
-    // only nudge so the user gets feedback before they kick off a task.
+    // Early, non-fatal warning if a profile whose upstream lazy probes looks
+    // unreachable. The fail-hard enforcement happens at launch
+    // (preflightRoleTarget); here we only nudge so the user gets feedback before
+    // they kick off a task.
     for (const role of ['agent', 'builder'] as const) {
       const target = role === 'agent' ? this.agentTarget() : this.builderTarget();
-      if (target.backend === 'anthropic') continue;
+      // The same rule the launch-time preflight applies, so the nudge cannot
+      // go quiet for an upstream that will refuse the launch a moment later —
+      // which is exactly what a pi profile on the default local Ollama is.
+      if (!probesUpstream(target)) continue;
       const check = await checkTargetConnectivity(target);
       if (!check.reachable) {
         logger.warn(`[${role}] ${check.reason}`);
@@ -166,12 +361,43 @@ export class DockerRunner implements Runner {
     debug?: boolean,
     daemonConfigPath?: string,
     taskId?: string,
+    taskUuid?: string,
     pinnedImage?: string,
+    notify?: PhaseNotify,
   ): Promise<void> {
+    // Belt to checkAvailability's braces. That is where a start, unblock or
+    // resume is refused BEFORE any task state is written; this catches a launch
+    // path that reached here some other way, so the last thing before the argv
+    // is built is still a refusal rather than a container mounted on
+    // directories the host daemon invented. See src/runner/sibling-containers.ts.
+    assertSiblingContainerLaunchSupported('start a task turn');
     // Fail hard before launch if the agent's backend is unreachable — never
     // silently fall back to a different backend (CLAUDE.md: fail hard).
     await preflightRoleTarget('agent', this.agentTarget());
-    await launchSupervisorAsync(
+    // The PROFILE, not the harness: the launch mints its credential grant
+    // against this name, and that grant is how the proxy knows which upstream
+    // and which credential this turn's traffic belongs to. Handing it
+    // `_agent.id` would route every custom profile as if it were the built-in
+    // of the same harness. Falling back to the harness is exact rather than
+    // approximate — every harness name IS a built-in profile name.
+    //
+    // INVARIANT: a missing profile must FAIL, not default to claude-code.
+    // Call sites that forgot setRunnerAgentForTask used to pass undefined here;
+    // launchSupervisorAsync then resolved the default Anthropic profile, so a
+    // cursor task's container never got CURSOR_API_KEY and fatal_auth'd while
+    // sibling cursor tasks (launched on paths that did set the agent) worked.
+    const agentProfile = this._agentProfile ?? this._agent?.id;
+    if (!agentProfile) {
+      throw new Error(
+        `launchSupervisor called without an agent profile on the runner. ` +
+        `Every launch path must call setRunnerAgentForTask (or applyRunnerAgent) ` +
+        `before launch — otherwise a cursor/codex task silently gets the default ` +
+        `claude-code credential environment and fails with fatal_auth.`,
+      );
+    }
+    // Registered for the reconciler for as long as this takes — image build
+    // included. See launch-in-flight.ts for the false interrupt this prevents.
+    await withLaunchInFlight(runName, taskUuid, () => launchSupervisorAsync(
       sandbox,
       runName,
       protocolDir,
@@ -180,9 +406,11 @@ export class DockerRunner implements Runner {
       daemonConfigPath,
       this.agentTarget(),
       taskId,
-      this._agent?.id,
+      taskUuid,
+      agentProfile,
       pinnedImage,
-    );
+      notify,
+    ));
   }
 
   async runClaudeSync(
@@ -193,6 +421,129 @@ export class DockerRunner implements Runner {
     model?: string,
   ): Promise<AgentResponse> {
     return runClaude(prompt, sandbox, verbose ?? false, debug ?? false, model, this.binary, this.agentTarget());
+  }
+
+  /**
+   * One-shot in a throwaway container from the project's agent image.
+   *
+   * The isolation is structural rather than advisory, which is the whole point
+   * of moving one-shots behind the Runner: `repoAccess: 'none'` gets NO repo
+   * mount, so there is no working tree to commit into; `'read-only'` gets the
+   * project root mounted `:ro`, so a write fails at the kernel even if the tool
+   * denial in the argv were somehow bypassed.
+   *
+   * `--rm` plus the project label means a one-shot container is reaped exactly
+   * like every other lazy container — the host path's bespoke process reaper has
+   * no counterpart to grow here.
+   */
+  async runOneshot(req: OneshotRequest): Promise<AgentResponse> {
+    // Same gate as launchSupervisor, for the same reason: a one-shot mounts the
+    // project root and an agent state dir by absolute path, and redeems its
+    // credential placeholder against a proxy it reaches at host.docker.internal.
+    // `lazy report`, `lazy ask` over a stored conversation and memory compaction
+    // all come through here — the refusal names them.
+    assertSiblingContainerLaunchSupported('run this in an agent container');
+    const lazyRoot = this.lazyRoot ?? findLazyRoot();
+    if (!lazyRoot) {
+      throw new Error('Cannot run a one-shot: not in a lazy project. Run `lazy init` first.');
+    }
+    const repoAccess = req.repoAccess ?? 'none';
+
+    // One resolution of the target for the whole launch: what is preflighted,
+    // what the auth env is built from, and what the grant is minted for must be
+    // the same profile — see oneshotLaunchIdentity.
+    //
+    // INVARIANT: that target is the BUILDER role's, never the agent role's and
+    // never a task's. A one-shot is a fresh-context call lazy makes on the
+    // human's behalf — it strips `--resume`/`--continue`, so a task's model
+    // buys it no cache and no continuation, and a task's model id need not even
+    // be valid on the builder's harness. Everything downstream follows from
+    // this one line: endpoint, credential, wire, harness, model and image.
+    const target = this.builderTarget();
+
+    // Fail hard before launch if the backend is unreachable — a one-shot gets
+    // the same treatment as a supervisor launch, never a silent fallback.
+    await preflightRoleTarget('builder', target);
+
+    // The harness the one-shot's argv is composed for. `createOneshotRunner`
+    // sets `this._agent` from the builder profile's harness and refuses to build
+    // a runner whose harness cannot run containerised one-shots, so the fallback
+    // here only covers a runner assembled some other way.
+    const harness = this._agent?.id ?? target.harness;
+    // Always concrete: every harness refuses a model-less launch. A target with
+    // no model resolves through the harness's declared default, never to an
+    // omitted flag (see resolveBuilderModel).
+    const { loadConfig } = await import('../config/loader');
+    // Deferred for the same circular-init reason as buildOneshotAgentArgv's
+    // registry import (agent-model reaches the registry).
+    const { resolveBuilderModel } = await import('../agent/agent-model');
+    const effectiveModel = resolveBuilderModel(
+      await loadConfig(lazyRoot), { harness, model: target.model }, req.model,
+    );
+
+    // JIT CREDENTIALS: the container receives a redeemable PLACEHOLDER, never the
+    // real credential. `docker run` argv is readable by anything that can run `ps`
+    // or `docker inspect` for the life of the run, and a real key also means the
+    // traffic need not traverse lazy's proxy — so the one-shot would escape the
+    // wire allowlist, the audit trail and usage attribution along with it. The
+    // grant is also what the proxy ROUTES by, so a one-shot without one takes the
+    // primary upstream rather than its profile's.
+    //
+    // Minted LOCALLY rather than over the `getAuthEnv` RPC, because a one-shot
+    // only ever executes where that RPC is bypassed: `runOneshot`
+    // (src/oneshot/index.ts) reaches a Runner exclusively inside the daemon or
+    // under the test harness, so `resolveAuthEnvFromDaemon` would fall through to
+    // its daemon-self branch and hand back the real credential no matter what
+    // identity it was given. This is the same seam every other in-daemon launch
+    // uses (src/daemon/review-session-builder-turn.ts), and it degrades the same
+    // way when there is no daemon context: no proxy to redeem a placeholder
+    // against, so the credential is passed through unswapped as before.
+    const authEnvVars = await getLaunchAuthEnvVars(
+      oneshotLaunchIdentity(lazyRoot, target.profile, req.taskId),
+      target,
+      // Builder role, but still carrying the task id: the run is billed to the
+      // builder credential (or, for a team-mode link description, to the member
+      // in `ownerCredentialEnv`) and attributed to the task it is ABOUT, so accounting
+      // for an accept-time summary still lands on that task.
+      { role: 'builder', taskId: req.taskId },
+      'container',
+      // A human-owned run (a team-mode link description) carries its owner's
+      // session placeholder, passed through unswapped by getLaunchAuthEnvVars.
+      req.ownerCredentialEnv,
+    );
+
+    const agentConfigDir = getAgentPackaging(harness).configDirName();
+    const agentStateHome = await ensureOneshotAgentHome(lazyRoot, agentConfigDir);
+
+    const containerName = oneshotContainerName(lazyRoot);
+    const args = buildOneshotDockerArgs({
+      binary: this.binary,
+      containerName,
+      lazyRoot,
+      repoAccess,
+      agentStateHome,
+      // ensureImage resolves the PROFILE to the harness it must bake in — the
+      // builder's, so the image actually carries the binary this argv invokes.
+      imageName: await ensureImage(this.binary, { agentId: target.profile }),
+      authEnvVars,
+      harness,
+      prompt: req.prompt,
+      model: effectiveModel,
+      effort: req.effort,
+    });
+
+    logger.debug(`[oneshot] ${redactSecrets(args).join(' ')}`);
+
+    return execBoundedOneshot(args, {
+      timeoutMs: resolveOneshotTimeoutMs(req),
+      label: `${this.binary} one-shot`,
+      harness,
+      // Killing the `docker run` CLIENT does not stop the CONTAINER, so a
+      // timed-out one-shot would otherwise keep running with nobody watching it.
+      onTimeout: async () => {
+        await removeContainer(containerName, this.binary);
+      },
+    });
   }
 
   async isRunning(runName: string): Promise<boolean> {
@@ -207,6 +558,10 @@ export class DockerRunner implements Runner {
     return dockerGetContainerInfo(runName, this.binary);
   }
 
+  async probeRunInfo(runName: string): Promise<RunInfoProbe> {
+    return probeContainerInfo(runName, this.binary);
+  }
+
   async getRunExitCode(runName: string): Promise<number | null> {
     return getContainerExitCode(runName, this.binary);
   }
@@ -215,24 +570,88 @@ export class DockerRunner implements Runner {
     return getContainerLogs(runName, tailLines, this.binary);
   }
 
-  async execInRun(runName: string, argv: string[], opts?: { timeoutMs?: number }): Promise<number | null> {
+  async execInRun(
+    runName: string,
+    argv: string[],
+    opts?: { timeoutMs?: number; interactive?: boolean },
+  ): Promise<number | null> {
     // Output is inherited, not captured: the caller is passing a diagnostic
     // through to a human, and re-printing a captured buffer would reorder
     // stdout against stderr and delay every line to the end of the run.
     //
-    // No `-t`: allocating a pty would translate newlines and inject control
-    // characters into output that gets pasted into issues. Nothing lazy runs
-    // this way colorizes, so there is nothing to gain for the cost.
-    const proc = spawn([this.binary, 'exec', runName, ...argv], {
+    // No `-t` by default: allocating a pty would translate newlines and inject
+    // control characters into output that gets pasted into issues. Nothing lazy
+    // runs this way colorizes, so there is nothing to gain for the cost.
+    //
+    // `interactive` opts INTO `-it` for the one case that needs a terminal:
+    // `lazy shell --container`, where the human is typing at a real shell and
+    // wants line editing, job control and a working `clear`.
+    const execFlags = opts?.interactive ? ['-it'] : [];
+    const proc = spawn([this.binary, 'exec', ...execFlags, runName, ...argv], {
       stdin: 'inherit',
       stdout: 'inherit',
       stderr: 'inherit',
       // The default 60s subprocess timeout is too short for what runs in here
       // (the MCP self-test alone allows 20s, `--probe-agent` 90s), and a
       // timeout kill would look exactly like a failing check.
-      timeout: opts?.timeoutMs ?? 300_000,
+      //
+      // An interactive session has NO deadline: the human decides when their
+      // shell ends, and killing it out from under them after five minutes
+      // would be the definition of surprising.
+      timeout: opts?.timeoutMs ?? (opts?.interactive ? 0 : 300_000),
     });
     return await proc.exited;
+  }
+
+  openRunStream(runName: string, argv: string[]): RunStream | null {
+    // `-i` (stdin, no tty): a pty would translate newlines and inject control
+    // characters into a byte stream that is not text at all.
+    //
+    // `timeout: 0` — no deadline, deliberately. This carries one live connection
+    // for `lazy forward`, and a websocket or a psql session legitimately outlives
+    // any backstop we could pick. The caller kills it when its socket closes, and
+    // the command kills every one of them on the way out.
+    const proc = spawn([this.binary, 'exec', '-i', runName, ...argv], {
+      stdin: 'pipe',
+      stdout: 'pipe',
+      stderr: 'pipe',
+      timeout: 0,
+    });
+    return {
+      write: (chunk: Uint8Array) => {
+        proc.stdin.write(chunk);
+      },
+      end: () => {
+        proc.stdin.end();
+      },
+      stdout: proc.stdout,
+      stderr: proc.stderr,
+      exited: proc.exited,
+      kill: () => proc.kill(),
+    };
+  }
+
+  async getRunPortBindings(runName: string): Promise<PortBinding[] | null> {
+    // `docker port <name>` prints one `3000/tcp -> 127.0.0.1:49154` line per
+    // published port, and nothing at all when none are published. It is the
+    // source of truth precisely because the host ports are OS-assigned.
+    const proc = spawn([this.binary, 'port', runName], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+      timeout: 15_000,
+    });
+    const [stdout, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      proc.exited,
+    ]);
+    if (exitCode !== 0) {
+      // No such container (or docker is unreachable). "No bindings" and "no
+      // container" are different answers, but the caller has already checked
+      // the container is running before asking — so an error here is a
+      // genuinely empty result, not a state worth guessing about.
+      return [];
+    }
+    return parsePortBindings(stdout);
   }
 
   async stopRun(runName: string, opts?: { gracefulTimeoutSeconds?: number }): Promise<boolean> {
@@ -370,6 +789,14 @@ export class DockerRunner implements Runner {
     return join(worktreePath, SANDBOX_DIR, '.claude', 'projects', encoded);
   }
 
+  agentPiAgentDir(worktreePath: string): string {
+    // Docker/Podman bind-mount the sandbox .pi dir at /home/user/.pi (the
+    // launch args in capture/claude.ts, same arrangement as .claude and
+    // .cursor), so pi's agent config dir — its settings.json and the
+    // sessions/ tree — lives in the sandbox, not in the image's real HOME.
+    return join(worktreePath, SANDBOX_DIR, '.pi', 'agent');
+  }
+
   supervisorToolChecks(): { cmd: string; name: string; hint: string }[] {
     // Check the task's agent when one was set; the Claude Code default keeps
     // agent-less callers (builder paths) behaving as before.
@@ -380,7 +807,7 @@ export class DockerRunner implements Runner {
   mcpServerConfig(
     taskId: string,
     worktreePath: string,
-    opts?: { readOnly?: boolean },
+    opts?: { readOnly?: boolean; review?: boolean; toolset?: 'full' | 'read' | 'review' },
   ): { command: string; args: string[] } {
     // The daemon is required in v0.11+ and always provides LAZY_DAEMON_CONFIG
     // when launching containers. MCP tool calls route through the daemon's
@@ -398,6 +825,12 @@ export class DockerRunner implements Runner {
     // We must NOT write a task-scoped config file here — the daemon config
     // template is in .lazy/tmp/ which is under the container's read-only
     // repo mount. Writing next to it would fail with EROFS.
+    const toolset = opts?.toolset
+      ?? (opts?.review ? 'review' : opts?.readOnly ? 'read' : 'full');
+    const toolsetFlag =
+      toolset === 'review' ? ['--review'] :
+      toolset === 'read' ? ['--read-only'] :
+      [];
     return {
       command: 'lazy-agent',
       args: [
@@ -405,15 +838,73 @@ export class DockerRunner implements Runner {
         '--daemon-config', daemonConfigTemplate,
         '--task-id', taskId,
         '--worktree', worktreePath,
-        // Read-only turns must be scoped HERE. Proxy handlers run the tool in
+        // Restricted turns must be scoped HERE. Proxy handlers run the tool in
         // the daemon, which does not inherit the supervisor's
-        // LAZY_MCP_READ_ONLY, so the in-handler guard cannot see this turn.
-        ...(opts?.readOnly ? ['--read-only'] : []),
+        // LAZY_MCP_READ_ONLY / LAZY_MCP_REVIEW, so the in-handler guard cannot
+        // see this turn.
+        ...toolsetFlag,
       ],
     };
   }
 
-  async diagnose(): Promise<HealthCheck[]> {
+  /**
+   * The agent harness version baked into the runner IMAGE — not the host's.
+   *
+   * WHY IT IS WORTH A LINE. `Dockerfile.lazy` installs the harness unpinned
+   * (`curl … install.sh | bash`), so the version inside the image is whatever
+   * was current on the day it was built, and it never changes again until
+   * someone rebuilds. Every other version lazy reports is the HOST binary's,
+   * which is the one no task ever runs. The gap is invisible until it bites —
+   * an old harness has an older model table, and a model it does not know gets
+   * a smaller context window with no error anywhere.
+   *
+   * NEVER BUILDS. It runs only against an image already on this machine and
+   * says "not built yet" otherwise: a diagnostic that could kick off a
+   * multi-minute `docker build` is one nobody would run twice.
+   */
+  private async diagnoseImageHarnessVersion(): Promise<HealthCheck[]> {
+    const lazyRoot = this.lazyRoot;
+    if (!lazyRoot) return [];
+
+    const harness = this._agent?.id ?? 'claude-code';
+    const pkg = getAgentPackaging(harness);
+    if (!pkg.supportsContainerRunner()) return [];
+    const what = `${pkg.binaryName()} in the runner image`;
+
+    try {
+      const image = await resolveImageName(lazyRoot, this._agentProfile);
+      if (!(await localImageExists(image, this.binary))) {
+        return [{
+          state: 'ok',
+          what: `${what}: image not built yet (${image})`,
+        }];
+      }
+      const proc = spawn(
+        [this.binary, 'run', '--rm', '--entrypoint', pkg.binaryName(), image, '--version'],
+        { stdout: 'pipe', stderr: 'ignore', timeout: 20_000 },
+      );
+      const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+      if (exitCode !== 0) {
+        return [{
+          state: 'fail',
+          what,
+          reason:
+            `\`${pkg.binaryName()} --version\` failed inside ${image}. The image is present but ` +
+            `its agent binary is not usable — rebuild it with \`lazy upgrade\`.`,
+        }];
+      }
+      return [{ state: 'ok', what: `${what}: ${stdout.trim()} (${image})` }];
+    } catch (err) {
+      // Reported, never fatal: this is a nice-to-know line, and a docker hiccup
+      // here must not turn a healthy project's doctor run red.
+      return [{
+        state: 'ok',
+        what: `${what}: could not probe (${err instanceof Error ? err.message : String(err)})`,
+      }];
+    }
+  }
+
+  async diagnose(options: DiagnoseOptions = {}): Promise<HealthCheck[]> {
     const results: HealthCheck[] = [];
     const timeout = 10_000;
 
@@ -446,6 +937,7 @@ export class DockerRunner implements Runner {
     }
 
     // Check daemon running
+    let daemonRunning = false;
     try {
       const proc = spawn([this.binary, 'info'], {
         stdout: 'ignore', stderr: 'ignore', timeout,
@@ -454,6 +946,7 @@ export class DockerRunner implements Runner {
       if (exitCode === 0) {
         const name = this.binary === 'podman' ? 'Podman' : 'Docker';
         results.push({ state: 'ok', what: `${name} daemon running` });
+        daemonRunning = true;
       } else {
         if (this.binary === 'podman') {
           results.push({ state: 'fail', what: 'Podman daemon running', reason: 'Podman is not responsive. Start the Podman machine or run: podman machine start' });
@@ -466,15 +959,27 @@ export class DockerRunner implements Runner {
       results.push({ state: 'fail', what: `${name} daemon running`, reason: `${name} is not responsive.` });
     }
 
-    // Check connectivity for any per-role local backend (ollama/proxy).
+    // The image-harness probe needs a working daemon (`docker run` / `inspect`).
+    // Asking it while the daemon is down produces a confusing "could not probe"
+    // line on top of the failure already reported above.
+    // It is also the one probe that starts a container, so a caller that must
+    // stay cheap (`lazy daemon health`) opts out of it.
+    if (daemonRunning && options.launchProbes !== false) {
+      results.push(...(await this.diagnoseImageHarnessVersion()));
+    }
+
+    // Check connectivity for any role whose upstream lazy probes — see
+    // probesUpstream. `pinned` alone would skip the LOCAL default (the built-in
+    // pi profile's Ollama), so doctor would say nothing about a stopped server
+    // that refuses every launch, which is the one place diagnosis belongs.
     for (const role of ['agent', 'builder'] as const) {
       const target = role === 'agent' ? this.agentTarget() : this.builderTarget();
-      if (target.backend === 'anthropic') continue;
+      if (!probesUpstream(target)) continue;
       const check = await checkTargetConnectivity(target);
       if (check.reachable) {
-        results.push({ state: 'ok', what: `[${role}] ${target.backend} reachable at ${check.endpoint}` });
+        results.push({ state: 'ok', what: `[${role}] ${target.profile} reachable at ${check.endpoint}` });
       } else {
-        results.push({ state: 'fail', what: `[${role}] ${target.backend} reachable`, reason: check.reason });
+        results.push({ state: 'fail', what: `[${role}] ${target.profile} reachable`, reason: check.reason });
       }
     }
 
@@ -568,12 +1073,18 @@ export class DockerRunner implements Runner {
     // daemon MCP token is minted under (see src/cli/commands/builder.ts), so the
     // revoke on the way out clears both.
     const builderId = basename(builderConfigPath, '.json').replace('builder-', '');
+    // The grant's profile is what the proxy ROUTES by, so it must be the profile
+    // this launch actually resolved — not the built-in name. A builder pinned
+    // with `[models.roles.builder] agent = "..."` would otherwise be preflighted
+    // against its own endpoint and then have its traffic sent to the primary
+    // upstream on the primary credential.
+    const builderTarget = this.builderTarget();
     const authEnvVars = await resolveAuthEnvFromDaemon(
-      this.builderTarget(),
+      builderTarget,
       { role: 'builder' },
       'container',
       config,
-      { role: 'builder', taskId: null, label: `builder-${builderId}` },
+      { role: 'builder', taskId: null, label: `builder-${builderId}`, profile: builderTarget.profile },
     );
 
     // Read the builder config to get port for the container config
@@ -629,11 +1140,14 @@ export class DockerRunner implements Runner {
     // src/builder/claude-home.ts for the full mechanism.
     const persistedConfigFile = builderClaudeConfigPath(dataDir);
     const mergedConfigFile = builderClaudeSessionConfigPath(tmpDir, builderId);
+    const mcpWrapperPath = await writeMcpLaunchWrapper({ tmpDir, builderId });
+    tempFilesToClean.push(mcpWrapperPath);
     await writeBuilderSessionClaudeConfig({
       sessionPath: mergedConfigFile,
       persistedPath: persistedConfigFile,
       hostConfigPath: join(getHome(), '.claude.json'),
       mcpArgs,
+      mcpCommand: mcpWrapperPath,
       onWarn: (message) => logger.warn(message),
     });
     // Removed only AFTER its state is folded back into the persisted file.
@@ -704,6 +1218,7 @@ export class DockerRunner implements Runner {
       projectsHostDir: useProjectsMount ? projects!.hostDir : undefined,
       neutralCredentialStore,
       mergedConfigFile,
+      mcpWrapperPath,
       authEnvVars,
       imageName,
       promptFile,
@@ -755,6 +1270,302 @@ export class DockerRunner implements Runner {
 
     return { exitCode, sessionId: null };
   }
+
+  /**
+   * One non-interactive builder turn for the UI review-session path: same
+   * container mounts/MCP/credential posture as {@link launchBuilderInteractive},
+   * but runs `claude -p` directly and returns the parsed answer.
+   */
+  async launchBuilderHeadless(params: LaunchBuilderHeadlessParams): Promise<LaunchBuilderHeadlessResult> {
+    const {
+      lazyRoot, systemPrompt, prompt, resumeSessionId, builderId, daemonConfigPath,
+      projects, authEnvVars, debug,
+    } = params;
+
+    await preflightRoleTarget('builder', this.builderTarget());
+
+    const [imageName, agentBinaryPath] = await Promise.all([
+      ensureImage(this.binary),
+      ensureAgentBinary(),
+    ]);
+
+    const { loadConfig } = await import('../config/loader');
+    const config = await loadConfig(lazyRoot);
+    const dataDir = join(lazyRoot, config.data.path);
+
+    const { generateBuilderConfig } = await import('../builder/server');
+    const { configPath: builderConfigPath, config: builderConfig } =
+      generateBuilderConfig(lazyRoot, config.data.path);
+    writeFileSync(builderConfigPath, JSON.stringify(builderConfig, null, 2));
+
+    const tmpDir = join(dataDir, 'tmp');
+    mkdirSync(tmpDir, { recursive: true });
+    const containerConfigFile = join(tmpDir, `builder-container-${builderId}.json`);
+    writeFileSync(containerConfigFile, JSON.stringify({ ...builderConfig, host: 'host.docker.internal' }, null, 2));
+
+    const useDaemonProxy = !!daemonConfigPath;
+    const mcpArgs = useDaemonProxy
+      ? ['mcp', '--daemon-config', daemonConfigPath!, '--worktree', lazyRoot]
+      : ['mcp', '--builder-config', containerConfigFile, '--worktree', lazyRoot];
+
+    const persistedConfigFile = builderClaudeConfigPath(dataDir);
+    const mergedConfigFile = builderClaudeSessionConfigPath(tmpDir, builderId);
+    const mcpWrapperPath = await writeMcpLaunchWrapper({ tmpDir, builderId });
+    await writeBuilderSessionClaudeConfig({
+      sessionPath: mergedConfigFile,
+      persistedPath: persistedConfigFile,
+      hostConfigPath: join(getHome(), '.claude.json'),
+      mcpArgs,
+      mcpCommand: mcpWrapperPath,
+      onWarn: (message) => logger.warn(message),
+    });
+
+    const neutralCredentialStore = await writeNeutralCredentialStore(tmpDir, builderId);
+    await writeToolPermissions(BUILDER_READ_ONLY_TOOLS);
+
+    let useProjectsMount = false;
+    if (projects) {
+      const probeWritable = projects.trustWritable
+        ? true
+        : await this.probeProjectsDirWritable(projects.hostDir, imageName);
+      useProjectsMount = shouldMountProjectsDir({ trustWritable: projects.trustWritable, probeWritable });
+    }
+
+    const scratchDir = await ensureBuilderScratchDir(lazyRoot);
+    const claudeArgs = buildBuilderHeadlessClaudeArgs(systemPrompt, prompt, resumeSessionId, builderHeadlessModel(config, this.builderTarget()));
+    const launchedAtMs = Date.now();
+
+    const dockerArgs = buildBuilderDockerArgs({
+      binary: this.binary,
+      builderId,
+      lazyRoot,
+      scratchDir,
+      dataDir,
+      containerConfigFile,
+      agentBinaryPath,
+      home: getHome(),
+      projectsHostDir: useProjectsMount ? projects!.hostDir : undefined,
+      neutralCredentialStore,
+      mergedConfigFile,
+      mcpWrapperPath,
+      authEnvVars,
+      imageName,
+      promptFile: join(tmpDir, `builder-headless-${builderId}.txt`),
+      daemonConfigPath: useDaemonProxy ? daemonConfigPath : undefined,
+      claudeExtraArgs: [],
+      debug: debug ?? false,
+      headlessClaudeArgs: claudeArgs,
+    });
+
+    if (useDaemonProxy) {
+      await assertDaemonMcpConfigMounted(daemonConfigPath!, mergedConfigFile);
+    }
+
+    if (debug) {
+      console.log('[DEBUG] Running headless builder:', redactSecrets(dockerArgs).join(' '));
+    }
+
+    const proc = spawn(dockerArgs, { stdout: 'pipe', stderr: 'pipe', timeout: 0 });
+    const timeoutMs = DEFAULT_ONESHOT_TIMEOUT_MS;
+    let timedOut = false;
+    const timer = timeoutMs > 0
+      ? setTimeout(() => {
+          timedOut = true;
+          try { proc.kill('SIGTERM'); } catch { /* already exited */ }
+          setTimeout(() => {
+            try { proc.kill('SIGKILL'); } catch { /* already exited */ }
+          }, ONESHOT_KILL_GRACE_MS);
+        }, timeoutMs)
+      : null;
+
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    if (timer) clearTimeout(timer);
+
+    if (timedOut) {
+      await removeContainer(`lazy-builder-${builderId}`, this.binary);
+      throw new Error(
+        `Builder review-session turn timed out after ${timeoutMs}ms and was killed.`,
+      );
+    }
+
+    if (exitCode !== 0) {
+      const detail = stderr.trim() || stdout.trim();
+      throw new Error(
+        detail
+          ? `Headless builder turn failed (exit ${exitCode}): ${detail.slice(0, 500)}`
+          : `Headless builder turn failed with exit code ${exitCode}`,
+      );
+    }
+
+    const parsed = parseBuilderHeadlessStdout(stdout);
+    const sessionId = parsed.sessionId ?? await detectBuilderLaunchSessionId({
+      lazyRoot,
+      projectsHostDir: useProjectsMount ? projects!.hostDir : undefined,
+      launchedAtMs,
+      resumeId: resumeSessionId ?? null,
+    });
+
+    const tempFiles = [
+      builderConfigPath, containerConfigFile, mergedConfigFile, neutralCredentialStore,
+      mcpWrapperPath,
+    ];
+    for (const tmpFile of tempFiles) {
+      try { unlinkSync(tmpFile); } catch { /* best effort */ }
+    }
+
+    return { answer: parsed.answer, sessionId, exitCode };
+  }
+
+  /**
+   * Start a daemon-owned, detached interactive builder session and return as
+   * soon as `docker run -d` reports the container up — never blocks for the
+   * session's lifetime, unlike {@link launchBuilderInteractive}.
+   *
+   * Mirrors that function's mount/config assembly (neutral credential store,
+   * per-launch `~/.claude.json`, projects isolation) but launches the
+   * INTERACTIVE supervisor detached rather than `-it --rm` in this process's
+   * foreground, and mounts `homeDirAbs` in place of the host user's home — a
+   * per member+project Claude home (see the caller,
+   * src/daemon/builder-sessions.ts, and
+   * docs/design/actor-identity-and-remote-clients.md §5.5).
+   */
+  async launchBuilderDetached(params: LaunchBuilderDetachedParams): Promise<LaunchBuilderDetachedResult> {
+    const { lazyRoot, systemPrompt, builderId, daemonConfigPath, projects, authEnvVars, homeDirAbs, resumeSessionId, debug } = params;
+
+    await preflightRoleTarget('builder', this.builderTarget());
+
+    const [imageName, agentBinaryPath] = await Promise.all([
+      ensureImage(this.binary),
+      ensureAgentBinary(),
+    ]);
+
+    const { loadConfig } = await import('../config/loader');
+    const config = await loadConfig(lazyRoot);
+    const dataDir = join(lazyRoot, config.data.path);
+
+    // This method runs in the DAEMON's event loop, not a short-lived CLI
+    // process (unlike launchBuilderInteractive below) — a sync fs call here
+    // stalls the reconciler, every HTTP handler, and every other project's
+    // RPCs for as long as it takes (CLAUDE.md: sync fs is only for CLI
+    // startup, exit handlers, and test setup). fs/promises throughout.
+    // Per-launch files go in a directory under the MEMBER's home, never
+    // <dataDir>/tmp: every builder container mounts the data dir read-write,
+    // so files there (this session's live ~/.claude.json, its credential store,
+    // its container config) were readable and writable by every other member's
+    // container. Each file below is bind-mounted individually; the directory
+    // itself is mounted nowhere. See builderSessionLaunchDir.
+    const tmpDir = builderSessionLaunchDir(homeDirAbs, builderId);
+    await mkdirAsync(tmpDir, { recursive: true });
+    await mkdirAsync(join(homeDirAbs, '.claude'), { recursive: true });
+
+    const promptFile = join(tmpDir, `builder-prompt-${builderId}.txt`);
+    await writeFileAsync(promptFile, systemPrompt);
+
+    const { generateBuilderConfig } = await import('../builder/server');
+    const { configPath: builderConfigPath, config: builderConfig } =
+      generateBuilderConfig(lazyRoot, config.data.path);
+    await writeFileAsync(builderConfigPath, JSON.stringify(builderConfig, null, 2));
+
+    const containerConfigFile = join(tmpDir, `builder-container-${builderId}.json`);
+    await writeFileAsync(containerConfigFile, JSON.stringify({ ...builderConfig, host: 'host.docker.internal' }, null, 2));
+
+    const useDaemonProxy = !!daemonConfigPath;
+    const mcpArgs = useDaemonProxy
+      ? ['mcp', '--daemon-config', daemonConfigPath!, '--worktree', lazyRoot]
+      : ['mcp', '--builder-config', containerConfigFile, '--worktree', lazyRoot];
+
+    // Per-member+project state: seed/write-back file lives under this
+    // session's own home rather than the shared project-level one, so two
+    // members' onboarding/model choices never overwrite each other.
+    const persistedConfigFile = builderClaudeConfigPath(homeDirAbs);
+    const mergedConfigFile = builderClaudeSessionConfigPath(tmpDir, builderId);
+    const mcpWrapperPath = await writeMcpLaunchWrapper({ tmpDir, builderId });
+    await writeBuilderSessionClaudeConfig({
+      sessionPath: mergedConfigFile,
+      persistedPath: persistedConfigFile,
+      // NEVER the daemon host user's ~/.claude.json. This process runs as the
+      // daemon's user, whose home is nobody's (design §5.5): seeding from it
+      // gave every member the operator's oauthAccount, userID, project history
+      // and MCP server entries with their env secrets — on every launch, since
+      // the per-member file was never written back. A member's session seeds
+      // from their own persisted state, or from nothing on first launch.
+      hostConfigPath: null,
+      mcpArgs,
+      mcpCommand: mcpWrapperPath,
+      onWarn: (message) => logger.warn(message),
+    });
+
+    const neutralCredentialStore = await writeNeutralCredentialStore(tmpDir, builderId);
+    // This container mounts homeDirAbs/.claude, not the daemon host user's
+    // ~/.claude — so the permissions must be written THERE (and only there): a
+    // default-target write would both leave the session without its lazy tool
+    // permissions and silently rewrite the host operator's real settings.
+    await writeToolPermissions(BUILDER_READ_ONLY_TOOLS, homeDirAbs);
+
+    let useProjectsMount = false;
+    if (projects) {
+      const probeWritable = projects.trustWritable
+        ? true
+        : await this.probeProjectsDirWritable(projects.hostDir, imageName);
+      useProjectsMount = shouldMountProjectsDir({ trustWritable: projects.trustWritable, probeWritable });
+    }
+
+    const scratchDir = await ensureBuilderScratchDir(lazyRoot);
+    const claudeExtraArgs = resumeSessionId ? ['--resume', resumeSessionId] : [];
+
+    const dockerArgs = buildBuilderDockerArgs({
+      binary: this.binary,
+      builderId,
+      lazyRoot,
+      scratchDir,
+      dataDir,
+      containerConfigFile,
+      agentBinaryPath,
+      home: homeDirAbs,
+      projectsHostDir: useProjectsMount ? projects!.hostDir : undefined,
+      neutralCredentialStore,
+      mergedConfigFile,
+      mcpWrapperPath,
+      authEnvVars,
+      imageName,
+      promptFile,
+      daemonConfigPath: useDaemonProxy ? daemonConfigPath : undefined,
+      claudeExtraArgs,
+      debug: debug ?? false,
+      detached: true,
+    });
+
+    if (useDaemonProxy) {
+      await assertDaemonMcpConfigMounted(daemonConfigPath!, mergedConfigFile);
+    }
+
+    if (debug) {
+      console.log('[DEBUG] Launching detached builder session:', redactSecrets(dockerArgs).join(' '));
+    }
+
+    // `docker run -d` prints the container id and exits immediately — the
+    // container's own lifetime is what continues, not this process's.
+    const proc = spawn(dockerArgs, { stdout: 'pipe', stderr: 'pipe', timeout: DOCKER_TIMEOUT_MS });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    if (exitCode !== 0) {
+      const detail = stderr.trim() || stdout.trim();
+      throw new Error(
+        detail
+          ? `Failed to start detached builder session (exit ${exitCode}): ${detail.slice(0, 500)}`
+          : `Failed to start detached builder session (exit code ${exitCode})`,
+      );
+    }
+
+    return { containerName: `lazy-builder-${builderId}` };
+  }
 }
 
 export interface BuilderDockerArgsParams {
@@ -776,6 +1587,8 @@ export interface BuilderDockerArgsParams {
   projectsHostDir?: string;
   neutralCredentialStore: string;
   mergedConfigFile: string;
+  /** Selfcheck wrapper script for lazy MCP reconnect spawns. */
+  mcpWrapperPath?: string;
   authEnvVars: Array<{ key: string; value: string }>;
   imageName: string;
   promptFile: string;
@@ -783,6 +1596,20 @@ export interface BuilderDockerArgsParams {
   daemonConfigPath?: string;
   claudeExtraArgs: string[];
   debug: boolean;
+  /**
+   * When set, run these `claude` argv tokens directly instead of the interactive
+   * builder supervisor. Omits `-it` — headless review-session turns only.
+   */
+  headlessClaudeArgs?: string[];
+  /**
+   * Launch DAEMON-OWNED and DETACHED (`-d`, no `--rm`, no `-it`) rather than
+   * `-it --rm` in the caller's foreground. The container's lifetime is then the
+   * session's, not the launching process's — see
+   * docs/design/actor-identity-and-remote-clients.md §5.2. Mutually exclusive
+   * with `headlessClaudeArgs` (a detached session runs the interactive
+   * supervisor, never a one-shot `claude -p`).
+   */
+  detached?: boolean;
 }
 
 /**
@@ -802,11 +1629,21 @@ export function buildBuilderDockerArgs(params: BuilderDockerArgsParams): string[
   const {
     binary, builderId, lazyRoot, dataDir, scratchDir, containerConfigFile, agentBinaryPath,
     home, projectsHostDir, neutralCredentialStore, mergedConfigFile, authEnvVars,
-    imageName, promptFile, daemonConfigPath, claudeExtraArgs, debug,
+    mcpWrapperPath,
+    imageName, promptFile, daemonConfigPath, claudeExtraArgs, debug, headlessClaudeArgs,
+    detached,
   } = params;
 
+  const interactive = !headlessClaudeArgs?.length;
+
   const dockerArgs = [
-    binary, 'run', '-it', '--init', '--rm',
+    binary, 'run', '--init',
+    // A detached session still runs the INTERACTIVE supervisor, which spawns
+    // Claude Code with stdin inherited, expecting a pty — `-d` alone with no
+    // `-i`/`-t` gives it neither, so the TUI hits EOF immediately and the
+    // container exits within seconds. `-i -t` is also what a later `docker
+    // attach` requires to have anything to attach to.
+    ...(detached ? ['-d', '-i', '-t'] : [...(interactive ? ['-it'] : []), '--rm']),
     '--name', `lazy-builder-${builderId}`,
     // Scope this container to the project. Other projects' `lazy upgrade`,
     // discovery, and cleanup commands filter on this label to avoid
@@ -852,6 +1689,13 @@ export function buildBuilderDockerArgs(params: BuilderDockerArgsParams): string[
     // Persisted builder Claude config with MCP server entry (writable — Claude
     // Code updates it on startup and when the human answers a trust/model prompt)
     '-v', `${mergedConfigFile}:/home/user/.claude.json`,
+    // MCP selfcheck wrapper — Claude Code respawns this on reconnect; must
+    // verify the bind-mounted lazy-agent after every upgrade before exec.
+    ...(mcpWrapperPath ? ['-v', `${mcpWrapperPath}:${mcpWrapperPath}:ro`] : []),
+    // A detached session's prompt file lives in the member's own launch dir,
+    // outside the data-dir mount it used to ride in on, so it needs a mount of
+    // its own (read-only, at the path the supervisor is told to read).
+    ...(detached ? ['-v', `${promptFile}:${promptFile}:ro`] : []),
     // Auth
     ...authEnvVars.flatMap(v => ['-e', `${v.key}=${v.value}`]),
     // SSH: auto-accept new host keys without TTY prompt (accept-new still rejects changed keys)
@@ -867,28 +1711,32 @@ export function buildBuilderDockerArgs(params: BuilderDockerArgsParams): string[
     dockerArgs.push('-v', `${daemonConfigPath}:${daemonConfigPath}:ro`);
   }
 
-  dockerArgs.push(
-    imageName,
-    // Run the builder supervisor (not Claude directly)
-    'lazy-agent', 'builder',
-    '--system-prompt-file', promptFile,
-    '--worktree', lazyRoot,
-    // Use container config (host.docker.internal) not the host config (127.0.0.1)
-    '--builder-config', containerConfigFile,
-    // Stable builder id so the supervisor can stamp the detected Claude
-    // sessionId onto this builder's resume intent on exit (host gets
-    // sessionId: null from the runner — only the supervisor knows the id).
-    '--builder-id', builderId,
-  );
+  if (headlessClaudeArgs?.length) {
+    dockerArgs.push(imageName, ...headlessClaudeArgs);
+  } else {
+    dockerArgs.push(
+      imageName,
+      // Run the builder supervisor (not Claude directly)
+      'lazy-agent', 'builder',
+      '--system-prompt-file', promptFile,
+      '--worktree', lazyRoot,
+      // Use container config (host.docker.internal) not the host config (127.0.0.1)
+      '--builder-config', containerConfigFile,
+      // Stable builder id so the supervisor can stamp the detected Claude
+      // sessionId onto this builder's resume intent on exit (host gets
+      // sessionId: null from the runner — only the supervisor knows the id).
+      '--builder-id', builderId,
+    );
 
-  // Pass daemon config to builder supervisor if available
-  if (daemonConfigPath) {
-    dockerArgs.push('--daemon-config', daemonConfigPath);
-  }
+    // Pass daemon config to builder supervisor if available
+    if (daemonConfigPath) {
+      dockerArgs.push('--daemon-config', daemonConfigPath);
+    }
 
-  // Pass through extra Claude args after --
-  if (claudeExtraArgs.length > 0) {
-    dockerArgs.push('--', ...claudeExtraArgs);
+    // Pass through extra Claude args after --
+    if (claudeExtraArgs.length > 0) {
+      dockerArgs.push('--', ...claudeExtraArgs);
+    }
   }
 
   if (debug) {

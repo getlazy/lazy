@@ -1,5 +1,13 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
-import { join } from 'path';
+import { join, resolve } from 'path';
+import {
+  LAZY_DIR,
+  LEGACY_DIR,
+  CONFIG_FILENAME,
+  LEGACY_CONFIG_FILENAME,
+  getDataDir,
+  findLazyRoot,
+} from '../project-paths';
 import { basename } from 'path';
 import { getHome } from '../utils/home';
 import { getDefaultConfigTemplate } from '../config/loader';
@@ -9,13 +17,15 @@ import { repoHasCommits } from '../git/operations';
 import { detectRemote } from '../remote';
 import { renderSetupDockerfilePrompt } from './setup-dockerfile-prompt';
 import { agentDisplayName } from '../agent/registry';
+import { harnessForAgentName } from '../config/agent-profiles';
 import { detectShell, getCompletionSetupCommand } from '../shell/detect';
-import { theme } from './theme';
+import { theme } from '../render/theme';
 import { setSectionBoolean } from '../config/toml-edit';
 import { enrollAtInit } from './commands/system-passphrase';
 import { runGit } from '../utils/git';
 import { spawnSyncUnsupervised } from '../utils/spawn';
 import { loadConfig } from '../config/loader';
+import { isManagedMode, evaluateManagedConfig, ManagedConfigRefusedError } from '../config/managed';
 import { discoverCandidateSessions, reimportConversations } from '../import/reimport-conversations';
 import {
   countImportableMemories,
@@ -23,88 +33,8 @@ import {
   importHarnessMemory,
   formatLongDescriptionNotice,
 } from '../import/import-harness-memory';
+import { refuseIfBoundClone } from './helpers';
 
-const LAZY_DIR = '.lazy';
-const LEGACY_DIR = '.workshop';
-const CONFIG_FILENAME = 'lazy.toml';
-const LEGACY_CONFIG_FILENAME = 'workshop.toml';
-
-/**
- * Find the git repository root from startDir, walking up the directory tree.
- * Handles worktrees by following the .git file to the main repo path.
- * Returns the main repo path, or null if not in a git repo.
- */
-export function findGitRoot(startDir: string = process.cwd()): string | null {
-  let dir = startDir;
-
-  while (true) {
-    const gitPath = join(dir, '.git');
-
-    if (existsSync(gitPath)) {
-      // Check if .git is a file (worktree) or directory (main repo)
-      try {
-        const gitContent = readFileSync(gitPath, 'utf-8');
-        if (gitContent.startsWith('gitdir:')) {
-          // This is a worktree - extract the main repo path
-          const match = gitContent.match(/gitdir:\s*(.+?)\/\.git\/worktrees\//);
-          if (match) {
-            return match[1];
-          }
-        }
-      } catch {
-        // .git is a directory (main repo) - fall through
-      }
-      return dir;
-    }
-
-    const parent = join(dir, '..');
-    if (parent === dir) return null;
-    dir = parent;
-  }
-}
-
-/**
- * Find the lazy root, which is always in the main git repository (not worktrees).
- * In a worktree, .git is a file containing "gitdir: /path/to/main/.git/worktrees/xxx"
- * We parse this to find the main repository, which is where lazy.toml lives.
- *
- * A repo is considered a lazy project if it has:
- * 1. lazy.toml config file, OR
- * 2. .lazy/ directory (worktrees, logs, tmp), OR
- * 3. .workshop/ directory (legacy un-migrated repos)
- */
-export function findLazyRoot(startDir: string = process.cwd()): string | null {
-  const gitRoot = findGitRoot(startDir);
-  if (!gitRoot) return null;
-
-  // Check if the git root has lazy.toml, .lazy, or legacy .workshop
-  if (existsSync(join(gitRoot, CONFIG_FILENAME))) {
-    return gitRoot;
-  }
-  if (existsSync(join(gitRoot, LAZY_DIR))) {
-    return gitRoot;
-  }
-  if (existsSync(join(gitRoot, LEGACY_DIR))) {
-    return gitRoot;
-  }
-  return null;
-}
-
-/**
- * Get the data directory name for a lazy root.
- * Returns '.lazy' if it exists, otherwise '.workshop' for un-migrated repos.
- * Fallback: if .lazy/ does not exist but .workshop/ does, use .workshop/ (un-migrated repos).
- * If neither exists, returns '.lazy' (new projects).
- */
-export function getDataDir(lazyRoot: string): string {
-  if (existsSync(join(lazyRoot, LAZY_DIR))) {
-    return LAZY_DIR;
-  }
-  if (existsSync(join(lazyRoot, LEGACY_DIR))) {
-    return LEGACY_DIR;
-  }
-  return LAZY_DIR;
-}
 
 interface InitOptions {
   skipAuthCheck?: boolean;
@@ -114,6 +44,16 @@ interface InitOptions {
   skipCompletionCheck?: boolean;
   /** Allow init to run without a TTY (for CI/testing). Uses defaults for all prompts. */
   nonInteractive?: boolean;
+  /**
+   * Place the external store at this path instead of the derived default
+   * (`~/.lazy/<project-name>`). This is the seam a provisioning system needs:
+   * without a TTY there is no storage prompt, so the store path was previously
+   * unreachable from outside and a supervisor had to hand-edit lazy.toml
+   * afterwards. Applies whether or not lazy.toml already exists — a flag that
+   * silently did nothing on a repo shipping its own config would be worse than
+   * no flag at all.
+   */
+  externalPath?: string;
 }
 
 /**
@@ -147,6 +87,45 @@ function applyTomlOverrides(configPath: string, overrides: Record<string, string
 }
 
 /**
+ * Point an EXISTING lazy.toml at an external store at `externalPath`.
+ *
+ * Deliberately not applyTomlOverrides: that helper only rewrites a key that is
+ * already there, so on a repo whose committed lazy.toml has no `[storage]`
+ * section — or has one without `external_path` — it is a silent no-op. For a
+ * provisioning caller that means the daemon quietly opens the wrong store,
+ * which is the failure mode this whole flag exists to prevent. So this one
+ * upserts: replace the key, else insert into the section, else append the
+ * section.
+ */
+export function setExternalStoragePath(configPath: string, externalPath: string): void {
+  const content = readFileSync(configPath, 'utf-8');
+  const quoted = JSON.stringify(externalPath);
+
+  // The [storage] section body: from its header to the next section header
+  // (or EOF). `m` so ^ matches line starts; the lookahead stops at `[next]`.
+  const sectionMatch = content.match(/^\[storage\][^\n]*\n(?:(?!^\[)[\s\S])*/m);
+  if (!sectionMatch) {
+    const sep = content.endsWith('\n') ? '' : '\n';
+    writeFileSync(
+      configPath,
+      `${content}${sep}\n[storage]\nbackend = "external"\nexternal_path = ${quoted}\n`,
+    );
+    return;
+  }
+
+  let section = sectionMatch[0];
+  section = /^external_path\s*=/m.test(section)
+    ? section.replace(/^external_path\s*=.*$/m, `external_path = ${quoted}`)
+    : section.replace(/^(\[storage\][^\n]*\n)/, `$1external_path = ${quoted}\n`);
+
+  section = /^backend\s*=/m.test(section)
+    ? section.replace(/^backend\s*=.*$/m, 'backend = "external"')
+    : section.replace(/^(\[storage\][^\n]*\n)/, '$1backend = "external"\n');
+
+  writeFileSync(configPath, content.replace(sectionMatch[0], section));
+}
+
+/**
  * Run driver health check after configuration and report results.
  * Non-blocking: prints status but never fails init.
  */
@@ -176,7 +155,6 @@ async function checkDriverHealth(driverName: string): Promise<void> {
 }
 
 interface StorageChoice {
-  backend: 'external' | 'postgres';
   path?: string;
 }
 
@@ -273,33 +251,15 @@ async function chooseGitRemote(repoDir: string): Promise<string> {
 }
 
 /**
- * Prompt user for storage location choice.
- * Returns the chosen backend and path (for external storage).
+ * Prompt user for external storage path.
  */
 async function promptStorageChoice(targetDir: string, gitRemote: string = 'origin'): Promise<StorageChoice> {
-  const options = [
-    'External (recommended): Outside the repo in ~/.lazy/<project-name>\n     Keeps repo completely clean. Not tracked in git.',
-    'PostgreSQL: Shared database for team collaboration\n     Best for teams. Requires PostgreSQL server (configure via LAZY_POSTGRES_URL or PG* env vars).',
-  ];
-
+  const projectName = await getProjectName(targetDir, gitRemote);
+  const defaultPath = join(getHome(), '.lazy', projectName);
   console.log('');
-  const choice = await promptChoice('Where would you like to store lazy state?', options);
-
-  switch (choice) {
-    case 0: {
-      const projectName = await getProjectName(targetDir, gitRemote);
-      const defaultPath = join(getHome(), '.lazy', projectName);
-      console.log('');
-      const path = await promptLine('External storage path', defaultPath);
-      return { backend: 'external', path };
-    }
-
-    case 1:
-      return { backend: 'postgres' };
-
-    default:
-      return { backend: 'external' };
-  }
+  console.log('Lazy stores task state outside the repo by default (~/.lazy/<project-name>).');
+  const path = await promptLine('External storage path', defaultPath);
+  return { path };
 }
 
 /**
@@ -479,8 +439,57 @@ export async function warnAboutTrackedLazyFiles(targetDir: string): Promise<void
   console.log('  history you care about — lazy will not do it for you.');
 }
 
+/**
+ * On a managed (fleet) host, refuse a repository whose committed lazy.toml asks
+ * for something a shared installation does not allow — BEFORE init writes
+ * anything or reports success.
+ *
+ * Every other command reaches the policy through `loadConfig`. `init` does not:
+ * it WRITES a config rather than loading one, so without this gate a hostile
+ * lazy.toml sails through provisioning and only fails at `daemon start`. That
+ * failure is still loud and still carries the marker, but it names the wrong
+ * phase and arrives after the clone, the store and the manifest already exist.
+ * Failing here is the same diagnosis one step earlier and much cheaper.
+ *
+ * A STRICT NO-OP when managed mode is off: `evaluateManagedConfig` returns no
+ * refusals, and a normal single-user `lazy init` never reads this path's
+ * verdict. Deliberately narrower than a full `loadConfig` — a malformed or
+ * merely unusual config must still be init's to fix, not something this gate
+ * starts rejecting.
+ */
+async function refuseUnmanageableConfig(targetDir: string): Promise<void> {
+  if (!isManagedMode()) return;
+
+  const configPath = join(targetDir, CONFIG_FILENAME);
+  if (!existsSync(configPath)) return;
+
+  let raw: Record<string, unknown>;
+  try {
+    raw = Bun.TOML.parse(readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
+  } catch {
+    // A lazy.toml that does not parse is not this gate's problem — the next
+    // config load reports the parse error with the offending line, which is a
+    // far better message than anything this could say about it.
+    return;
+  }
+
+  const { refusals } = evaluateManagedConfig(raw);
+  if (refusals.length > 0) throw new ManagedConfigRefusedError(refusals, configPath);
+}
+
 export async function init(targetDir: string = process.cwd(), options: InitOptions = {}): Promise<void> {
   const lazyPath = join(targetDir, LAZY_DIR);
+
+  // Before every other check: a bound clone has no local daemon or store to
+  // initialize (design doc §4.4, §4.7). `lazy login` deliberately runs before
+  // `lazy init` (it anchors at the git root, not a lazy root), so a directory
+  // can be bound with no `.lazy/` here yet — the "already initialized"
+  // short-circuit below would never catch this case.
+  await refuseIfBoundClone('init', targetDir);
+
+  // Managed hosts only, and before the "already initialized" short-circuits: a
+  // repository that commits its own `.lazy` must not be able to skip the gate.
+  await refuseUnmanageableConfig(targetDir);
 
   // Check for both new and legacy directories
   if (existsSync(lazyPath)) {
@@ -524,9 +533,13 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
   // Detect the git remote to use before storage/config setup
   const gitRemote = await chooseGitRemote(targetDir);
 
-  // Prompt for storage location if interactive (and not --non-interactive)
-  let storageChoice: StorageChoice = { backend: 'external' };
-  if (isTTY() && !options.nonInteractive) {
+  // Prompt for storage location if interactive (and not --non-interactive).
+  // An explicit --external-path is the answer to that prompt, so it replaces
+  // it rather than being asked on top of it: the caller already decided.
+  let storageChoice: StorageChoice = {};
+  if (options.externalPath) {
+    storageChoice = { path: resolve(options.externalPath) };
+  } else if (isTTY() && !options.nonInteractive) {
     storageChoice = await promptStorageChoice(targetDir, gitRemote);
   }
 
@@ -540,34 +553,30 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
     console.log(`Creating ~/.lazy/ for internal housekeeping (agent binaries, protocol state, logs).`);
   }
 
-  // Determine storage path based on backend choice.
-  // Always resolve the full path so it can be persisted to lazy.toml.
-  // This prevents path drift when $HOME changes between sessions
-  // (e.g., Lima VMs, different user profiles, CI runners).
-  let storagePath: string;
-  if (storageChoice.backend === 'external') {
-    storagePath = storageChoice.path || join(getHome(), '.lazy', await getProjectName(targetDir, gitRemote));
-    // Create external directory if it doesn't exist
-    mkdirSync(storagePath, { recursive: true });
-  } else {
-    // PostgreSQL storage doesn't use local paths
-    storagePath = lazyPath;
-  }
+  // Determine storage path. Always resolve the full path so it can be persisted
+  // to lazy.toml — prevents path drift when $HOME changes between sessions.
+  const storagePath = storageChoice.path || join(getHome(), '.lazy', await getProjectName(targetDir, gitRemote));
+  mkdirSync(storagePath, { recursive: true });
 
   // Initialize file-based storage — pass the RESOLVED path, not the user input.
-  const externalPathForStorage = storageChoice.backend === 'external' ? storagePath : undefined;
   const storage = await createStorage(targetDir, {
-    backend: storageChoice.backend,
-    externalPath: externalPathForStorage,
+    backend: 'external',
+    externalPath: storagePath,
   });
   await storage.close();
 
   // Create default lazy.toml if it doesn't exist
   const configPath = join(targetDir, CONFIG_FILENAME);
   if (!existsSync(configPath)) {
-    const template = getDefaultConfigTemplate(storageChoice.backend, externalPathForStorage, gitRemote);
+    const template = getDefaultConfigTemplate('external', storagePath, gitRemote);
     writeFileSync(configPath, template);
     console.log(`Created ${CONFIG_FILENAME} with default configuration`);
+  } else if (options.externalPath) {
+    // The repo ships its own lazy.toml. Its committed `external_path` points
+    // wherever its authors' machines keep their store, so leaving it alone
+    // would send the daemon to a store the caller never asked for.
+    setExternalStoragePath(configPath, storagePath);
+    console.log(`Set storage.external_path = "${storagePath}" in ${CONFIG_FILENAME}`);
   }
 
   // Detect remote driver and offer to configure
@@ -597,20 +606,8 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
   console.log('Adding lazy entries to .gitignore');
   await warnAboutTrackedLazyFiles(targetDir);
 
-  // Display storage location
-  let storageDesc: string;
-  if (storageChoice.backend === 'postgres') {
-    const url = process.env.LAZY_POSTGRES_URL;
-    const host = process.env.PGHOST ?? 'localhost';
-    const database = process.env.PGDATABASE ?? 'lazy';
-    const connLabel = url ? 'LAZY_POSTGRES_URL' : `${host}/${database}`;
-    storageDesc = `postgres (${connLabel})`;
-  } else {
-    storageDesc = `external (${storagePath})`;
-  }
-
   console.log(`Initialized lazy in ${targetDir}`);
-  console.log(`  Storage: ${storageDesc}`);
+  console.log(`  Storage: external (${storagePath})`);
 
   if (!options.skipAuthCheck) {
     checkAuthSetup();
@@ -642,8 +639,8 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
 
     if (createFirstTask) {
       const firstTaskStorage = await createStorage(targetDir, {
-        backend: storageChoice.backend,
-        externalPath: externalPathForStorage,
+        backend: 'external',
+        externalPath: storagePath,
       });
       try {
         const task = await firstTaskStorage.createTask(
@@ -669,8 +666,16 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
     // The seeded prompt features the project's OWN agent CLI — lazy init runs
     // for cursor projects too, and a hardcoded Claude Code install would bake
     // the wrong agent into their image.
-    const dockerfileTaskAgentId = (await loadConfig(targetDir)).agent.agent_id;
-    const dockerfileTaskAgentName = agentDisplayName(dockerfileTaskAgentId);
+    //
+    // `[agent] agent_id` names a PROFILE; what gets installed into the image is
+    // its HARNESS. Lenient: seeding a task is best-effort context and must never
+    // be the thing that fails an init, so a name no profile defines falls back
+    // to itself and the prompt renderer degrades from there.
+    const dockerfileTaskConfig = await loadConfig(targetDir);
+    const dockerfileTaskProfile = dockerfileTaskConfig.agent.agent_id;
+    const dockerfileTaskHarness =
+      harnessForAgentName(dockerfileTaskConfig, dockerfileTaskProfile) ?? dockerfileTaskProfile;
+    const dockerfileTaskAgentName = agentDisplayName(dockerfileTaskHarness);
     console.log('');
     console.log('Found a Dockerfile in your project. Lazy can create a Dockerfile.lazy based on it');
     console.log(`that adds ${dockerfileTaskAgentName} to your existing environment — so agents work with your`);
@@ -684,8 +689,8 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
 
     if (createDockerfileTask) {
       const dockerfileTaskStorage = await createStorage(targetDir, {
-        backend: storageChoice.backend,
-        externalPath: externalPathForStorage,
+        backend: 'external',
+        externalPath: storagePath,
       });
       try {
         const task = await dockerfileTaskStorage.createTask(
@@ -696,7 +701,7 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
         );
         await dockerfileTaskStorage.updateTaskPrompt(
           task.id,
-          renderSetupDockerfilePrompt(dockerfileTaskAgentId),
+          renderSetupDockerfilePrompt(dockerfileTaskHarness),
         );
         console.log(`  Created task ${task.id.substring(0, 8)} (setup-dockerfile): Create Dockerfile.lazy from project Dockerfile`);
         console.log(`  To start it: ${theme.command('lazy start setup-dockerfile')}`);
@@ -731,8 +736,8 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
         // owner here (init already opens one for first-task creation). Opened
         // once for the whole block so both offers share one handle.
         const importStorage = await createStorage(targetDir, {
-          backend: storageChoice.backend,
-          externalPath: externalPathForStorage,
+          backend: 'external',
+          externalPath: storagePath,
         });
         try {
           // Re-running init on a repo that already imported memory must not

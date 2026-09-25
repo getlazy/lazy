@@ -22,6 +22,38 @@
  * equivalent to unset for every production reader (they test `=== '1'` or plain
  * truthiness).
  *
+ * The turn-identity pair is a third, subtler case with the same shape. When lazy
+ * is developed WITH lazy — the normal way — `bun test` runs inside a task agent's
+ * process tree, so `process.env` already carries that agent's
+ * `LAZY_MCP_EXPECTED_TASK_ID` / `LAZY_MCP_EXPECTED_WORKTREE`. A test-spawned MCP
+ * server inherits them, sees a `--task-id`/`--worktree` naming the temp project
+ * instead of the outer task, and correctly refuses to start
+ * (`assertMcpServesExpectedTurn`, src/mcp/turn-identity.ts) — killing every MCP
+ * and builder-supervisor e2e suite with an error about the AGENT's task that has
+ * nothing to do with the code under test. The guard is right; the inheritance is
+ * the bug. It stays covered at the function boundary in
+ * test/unit/mcp-turn-identity.test.ts, which is where its behavior belongs.
+ *
  * Spread this AFTER `...process.env` and after any per-test overrides.
  */
-export const MCP_SERVER_ENV_PINS = { LAZY_TEST: '', LAZY_IS_DAEMON: '' } as const;
+
+import {
+  MCP_EXPECTED_TASK_ID_ENV,
+  MCP_EXPECTED_WORKTREE_ENV,
+} from '../../src/mcp/turn-identity';
+
+/**
+ * Named from the production constants rather than re-spelled here: a rename in
+ * turn-identity.ts must not leave this pinning a variable nothing reads any
+ * more, which would revive the failure silently.
+ */
+export const TURN_IDENTITY_ENV_PINS = {
+  [MCP_EXPECTED_TASK_ID_ENV]: '',
+  [MCP_EXPECTED_WORKTREE_ENV]: '',
+} as const;
+
+export const MCP_SERVER_ENV_PINS = {
+  LAZY_TEST: '',
+  LAZY_IS_DAEMON: '',
+  ...TURN_IDENTITY_ENV_PINS,
+} as const;

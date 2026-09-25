@@ -27,9 +27,51 @@ export class TomlEditError extends Error {
   }
 }
 
-/** Escape a string for a TOML basic (double-quoted) string. */
+/**
+ * Escape a string for a TOML basic (double-quoted) string.
+ *
+ * A basic string is one physical line. An unescaped newline (or other C0
+ * control) closes the quotes; everything after it is parsed as new keys and
+ * tables, which is how a dashboard paste once made the whole lazy.toml
+ * unreadable. Escape every character the spec does not allow raw.
+ */
 function quote(value: string): string {
-  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  let out = '';
+  for (const ch of value) {
+    switch (ch) {
+      case '\\':
+        out += '\\\\';
+        break;
+      case '"':
+        out += '\\"';
+        break;
+      case '\b':
+        out += '\\b';
+        break;
+      case '\t':
+        out += '\\t';
+        break;
+      case '\n':
+        out += '\\n';
+        break;
+      case '\f':
+        out += '\\f';
+        break;
+      case '\r':
+        out += '\\r';
+        break;
+      default: {
+        const code = ch.codePointAt(0) ?? 0;
+        // Remaining C0 controls and DEL have no short escape — use \u00XX.
+        if (code < 0x20 || code === 0x7f) {
+          out += `\\u${code.toString(16).padStart(4, '0')}`;
+        } else {
+          out += ch;
+        }
+      }
+    }
+  }
+  return `"${out}"`;
 }
 
 /** Render `key = ["a", "b"]` (or `key = []`). */
@@ -85,6 +127,12 @@ interface SectionScan {
 function scanSection(lines: string[], section: string): SectionScan {
   const scan: SectionScan = { headerLine: -1, bodyEnd: -1, keys: new Map() };
   let inSection = false;
+  // Whether any `[header]` has been passed yet. The dotted-key and inline-table
+  // checks below are about the ROOT table only: after the first header every
+  // key belongs to some section, so `agent = "x"` inside [models.roles.agent] is
+  // an ordinary key — reading it as a top-level `agent = {…}` inline table
+  // refused a file that was fine.
+  let sawHeader = false;
   let depth = 0;
   let pending: { key: string; start: number } | null = null;
 
@@ -111,6 +159,7 @@ function scanSection(lines: string[], section: string): SectionScan {
         scan.bodyEnd = i;
         inSection = false;
       }
+      sawHeader = true;
       const name = header[1]!;
       if (name === section && scan.headerLine === -1) {
         scan.headerLine = i;
@@ -123,13 +172,13 @@ function scanSection(lines: string[], section: string): SectionScan {
     if (!keyMatch) continue;
     const key = keyMatch[1]!.trim();
 
-    if (!inSection && key.replace(/\s/g, '').startsWith(`${section}.`)) {
+    if (!sawHeader && key.replace(/\s/g, '').startsWith(`${section}.`)) {
       throw new TomlEditError(
         `lazy.toml uses the dotted key '${key}', which this editor cannot safely rewrite. ` +
         `Rewrite it as a [${section}] section (or edit the value by hand) and re-run.`,
       );
     }
-    if (!inSection && key === section) {
+    if (!sawHeader && key === section) {
       throw new TomlEditError(
         `lazy.toml defines '${section}' as an inline table on one line, which this editor cannot ` +
         `safely rewrite. Rewrite it as a [${section}] section (or edit the value by hand) and re-run.`,
@@ -195,6 +244,59 @@ export function setSectionString(
   value: string,
 ): string {
   return setSectionValue(content, section, key, `${key} = ${quote(value)}`);
+}
+
+/**
+ * Remove `key` from `[section]`. Returns the content unchanged when the section
+ * or the key is absent, so a caller can ask for a removal without first asking
+ * whether there is anything to remove.
+ *
+ * Only the key's own line range goes: a comment ABOVE the key documents the
+ * section as much as the key, and guessing which comment lines belong to a
+ * removed key is how a rewriter starts eating a user's notes.
+ */
+export function removeSectionKey(content: string, section: string, key: string): string {
+  const lines = content.split('\n');
+  const scan = scanSection(lines, section);
+  const existing = scan.keys.get(key);
+  if (!existing) return content;
+  lines.splice(existing.start, existing.end - existing.start + 1);
+  return lines.join('\n');
+}
+
+/**
+ * Remove the whole `[section]` table — its header, its body, the comment block
+ * sitting directly on top of the header, and the blank line that separated it
+ * from what follows. Returns the content unchanged when the section is absent.
+ *
+ * The header comment goes WITH the section, unlike a comment above a single key
+ * (see {@link removeSectionKey}), because a contiguous comment block immediately
+ * above `[section]` is that section's own caption. Leaving it behind does not
+ * preserve it — it re-attaches it to whatever section follows, so `# Point
+ * everything at the local box` ends up captioning something that does not.
+ *
+ * The blank-line collapse is deliberately LOCAL to the splice point. A
+ * document-wide `\n{3,}` normalization would silently reflow blank lines the
+ * user chose elsewhere in the file, which is a diff they did not ask for.
+ */
+export function removeSection(content: string, section: string): string {
+  const lines = content.split('\n');
+  const scan = scanSection(lines, section);
+  if (scan.headerLine === -1) return content;
+
+  const end = scan.bodyEnd === -1 ? lines.length : scan.bodyEnd;
+  // Take the blank lines that trailed the section with it, then, if the splice
+  // leaves a blank line touching a blank line, drop one.
+  let stop = end;
+  while (stop < lines.length && lines[stop]!.trim() === '') stop++;
+  let start = scan.headerLine;
+  while (start > 0 && lines[start - 1]!.trim().startsWith('#')) start--;
+  lines.splice(start, stop - start);
+  const at = start;
+  if (at > 0 && at < lines.length && lines[at - 1]!.trim() === '' && lines[at]!.trim() === '') {
+    lines.splice(at, 1);
+  }
+  return lines.join('\n');
 }
 
 /** Splice one already-rendered `key = value` line into `[section]`. */

@@ -1,11 +1,14 @@
+import { requireActorIdentity } from '../identity-preflight';
 import { existsSync } from 'fs';
-import { requireLazyRoot, requireStorage, displayId, displayIdFor, parseFlags, resolveTaskOrExit, getWorktreePath } from '../helpers';
+import { displayId, displayIdFor, getWorktreePath } from '../../task/identity';
+import { requireLazyRoot, requireStorage, parseFlags, resolveTaskOrExit } from '../helpers';
 import { openEditor, removeRecoveryFile, requireTTY, readStdinIfPiped } from '../editor';
 import { hasUncommittedChanges } from '../../git/operations';
 import { isTerminalStatus } from '../../types';
 import { queryCloseTask } from '../../daemon/rpc-fallback';
 
-import { theme } from '../theme';
+import { theme } from '../../render/theme';
+import { createPhaseDisplay } from '../phase-display';
 
 async function promptForReason(taskShortId: string, goal?: string): Promise<{ reason: string; recoveryPath: string | null }> {
   const headerLines = [
@@ -63,6 +66,9 @@ export async function commandClose(args: string[]): Promise<void> {
   // feedback only to have it discarded by a validation failure.
   let goal: string | undefined;
   {
+    // Among them: can the daemon attribute this close at all? Asked here so a
+    // refusal costs nothing but a retry.
+    await requireActorIdentity();
     const root = requireLazyRoot();
     const storage = await requireStorage();
     try {
@@ -120,11 +126,17 @@ export async function commandClose(args: string[]): Promise<void> {
   }
 
   try {
-    const result = await queryCloseTask({
-      taskId,
-      reason,
-      acceptDirtyWorktree,
-    });
+    const display = createPhaseDisplay();
+    let result;
+    try {
+      result = await queryCloseTask({
+        taskId,
+        reason,
+        acceptDirtyWorktree,
+      }, display);
+    } finally {
+      display.close();
+    }
 
     if (recoveryPath) removeRecoveryFile(recoveryPath);
 

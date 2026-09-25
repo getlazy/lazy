@@ -20,6 +20,7 @@ import { homedir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
 import { createTask, setProtectedPatterns } from '../helpers/fixtures';
+import { readTurns } from '../helpers/storage';
 import { MCP_SERVER_ENV_PINS } from '../helpers/mcp-env';
 
 const AGENT_ENTRY = resolve(__dirname, '../../src/agent-entry.ts');
@@ -176,9 +177,24 @@ describe('lazy_ask on conflict tasks', () => {
     expect(callResponse).toBeDefined();
     const result = callResponse!.result as { content: Array<{ text: string }>; isError?: boolean };
 
-    // The ask must NOT be rejected by the status gate, and must return the answer.
+    // The ask must NOT be rejected by the status gate. Over MCP it STARTS the
+    // turn and returns — the answer arrives as an ask turn, which is what the
+    // caller then waits for.
     expect(result.isError).toBeFalsy();
-    expect(result.content[0].text).toContain(ASK_ANSWER);
+    const started = JSON.parse(result.content[0].text) as {
+      started?: boolean; answered?: boolean; turn_sequence?: number;
+    };
+    expect(started.started).toBe(true);
+    expect(started.answered).toBe(false);
+    expect(typeof started.turn_sequence).toBe('number');
+
+    expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
+
+    const askTurn = readTurns(ctx.root, taskId).find(
+      (t) => t.role === 'agent' && t.turn_type === 'ask',
+    );
+    expect(askTurn?.content ?? '').toContain(ASK_ANSWER);
+    expect(askTurn?.sequence).toBe(started.turn_sequence!);
 
     // INVARIANT: a read-only ask leaves the task exactly as it found it.
     expect(readTaskStatus(ctx.root, taskId)).toBe('conflict');

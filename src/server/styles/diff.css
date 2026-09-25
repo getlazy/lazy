@@ -7,30 +7,86 @@
  * (@pierre/diffs) that put every line inside a Shadow DOM, where nothing
  * outside could address it — which is why per-line comments needed their own
  * renderer in the first place. That renderer is gone, and so are its rules.
+ *
+ * Colours are the design system's semantic roles, the same ones lazy-teams'
+ * diff uses: an addition is `success`, a deletion is `danger`, a hunk header is
+ * `accent`. Class names are unchanged — several are asserted on by tests, and
+ * a reskin is not a rename.
  */
 
-.rv-file { border: 1px solid var(--border); border-radius: 6px; margin-bottom: 20px; overflow: hidden; }
-.rv-file-head { display: flex; gap: 10px; align-items: center; padding: 8px 12px; background: var(--bg-secondary); border-bottom: 1px solid var(--border); }
+/* No `overflow: hidden` here, deliberately: it made the card a scroll
+   container, and a sticky header inside a scroll container that never
+   scrolls does not stick to anything — the file name scrolled away and the
+   reviewer had to scroll back up to see which file they were reading. The
+   diff's own horizontal overflow is handled one level in, by
+   .rv-diff-scroll. */
+.rv-file { border: 1px solid var(--color-divider); margin-bottom: var(--space-6); }
+/* Sticky header: while any part of this file is on screen its name, stats and
+   actions (accept/reject, Viewed) stay visible, parked under everything else
+   that is stuck up there. `--lz-sticky-top` is the measured height of ALL of
+   it — the tab strip PLUS the view-mode toolbar below (.rv-viewopts), which is
+   its own level of the stack and has its own `--lz-strip-top`. It is 0 on a
+   page with no such chrome, and the navigation island keeps it current — see
+   review-navigation.ts, which spells out why one offset for two levels put
+   this header underneath the toolbar and out of sight. Scrolling out of one
+   file and into the next swaps the header with no JS: each one is sticky
+   within its own section. */
+.rv-file-head {
+  display: flex; gap: var(--space-3); align-items: center;
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-surface); border-bottom: 1px solid var(--color-divider);
+  position: sticky;
+  top: var(--lz-sticky-top, 0px);
+  /* Above the diff rows, below the tab strip (z-index 20 in tabs.css). */
+  z-index: 3;
+}
 .rv-file-path { font-family: var(--font-mono); font-weight: 600; }
-.rv-file-toggle { font-family: var(--font-ui); font-size: 11px; line-height: 1; padding: 2px 5px; border: 1px solid transparent; border-radius: 4px; background: none; color: var(--text-secondary); cursor: pointer; }
-.rv-file-toggle:hover { border-color: var(--border); }
-.rv-file[data-collapsed="1"] .rv-file-toggle { transform: rotate(-90deg); }
+/* The chevron and the "Viewed" tick are styled in cards.css: a file and a
+   markdown card are the same affordance, so they share one look. */
 .rv-file[data-collapsed="1"] .rv-file-head { border-bottom: 0; }
 .rv-file[data-collapsed="1"] .rv-diff-scroll, .rv-file[data-collapsed="1"] .rv-binary { display: none; }
-.rv-viewed { display: inline-flex; align-items: center; gap: 5px; font-family: var(--font-ui); font-size: 11px; color: var(--text-secondary); cursor: pointer; user-select: none; margin-left: 4px; }
-.rv-file[data-viewed="1"] .rv-viewed { color: #16a34a; }
 .rv-file[data-viewed="1"] .rv-file-path { opacity: 0.65; text-decoration: line-through; }
-.rv-stat-add { color: #16a34a; margin-left: auto; }
-.rv-stat-del { color: #dc2626; }
-.rv-binary { padding: 10px 12px; color: var(--text-secondary); }
+.rv-stat-add { color: var(--color-success); margin-left: auto; }
+.rv-stat-del { color: var(--color-danger); }
+/* Partial snippet cards: visible +N −M, then the full-file total so a
+   one-line walkthrough never reads as "this file only added one line". */
+.rv-stat-of {
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+  font-weight: 400;
+  margin-left: 0;
+}
+.rv-binary { padding: var(--space-3); color: color-mix(in srgb, var(--color-text) 55%, transparent); }
 .rv-diff-scroll { overflow-x: auto; }
 table.rv-diff { min-width: 100%; border-collapse: collapse; margin: 0; font-family: var(--font-mono); font-size: 12.5px; line-height: 1.5; }
 table.rv-diff td { border: 0; padding: 0 6px; white-space: pre; vertical-align: top; }
-tr.rv-hunk td { background: var(--bg-secondary); color: var(--text-secondary); padding: 4px 12px; white-space: pre; }
-tr.rv-add { background: rgba(22,163,74,0.12); }
-tr.rv-del { background: rgba(220,38,38,0.12); }
-tr.rv-line:target { outline: 2px solid var(--link); outline-offset: -2px; }
-td.rv-num { width: 1%; text-align: right; color: var(--text-secondary); user-select: none; }
+tr.rv-hunk td {
+  background: var(--color-accent-100); color: var(--color-accent-800);
+  padding: var(--space-1) var(--space-3); white-space: pre; user-select: none;
+}
+/* The expand-context control, styled to read as a seam in the file rather than
+   as content: it stands between two hunks where lines are missing. */
+tr.rv-expand td {
+  background: var(--color-surface-2, var(--color-accent-100));
+  padding: 2px var(--space-3); white-space: normal; user-select: none;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}
+.rv-expand-btn {
+  cursor: pointer; font-family: inherit; line-height: 1; padding: 0 6px;
+  border: 1px solid var(--color-divider); background: var(--color-bg);
+  color: var(--color-text); margin-right: 4px;
+}
+.rv-expand-btn:hover { border-color: var(--color-accent); color: var(--color-accent); }
+.rv-expand-btn[disabled] { opacity: 0.5; cursor: default; }
+.rv-expand-count { margin-left: var(--space-2); font-size: 11.5px; }
+tr.rv-add { background: var(--color-success-100); }
+tr.rv-del { background: var(--color-danger-100); }
+/* A row reached by a fragment link (a queued comment, a thread permalink)
+   clears both the tab strip and its own file's sticky header. */
+tr.rv-line, tr.rv-pair, tr.rv-thread-row, td.rv-code {
+  scroll-margin-top: calc(var(--lz-sticky-top, 0px) + 3rem);
+}
+tr.rv-line:target { outline: 2px solid var(--color-accent); outline-offset: -2px; }
+td.rv-num { width: 1%; text-align: right; color: color-mix(in srgb, var(--color-text) 45%, transparent); user-select: none; }
 td.rv-gutter { width: 1%; }
 /* Default: never wrap. One diff line stays one row, so the row still lines up
    with the line number its comment anchor is keyed on, and .rv-diff-scroll
@@ -40,7 +96,11 @@ td.rv-gutter { width: 1%; }
 td.rv-code { width: 98%; white-space: pre; }
 .rv-wrap td.rv-code { white-space: pre-wrap; overflow-wrap: anywhere; }
 .rv-wrap .rv-diff-scroll { overflow-x: visible; }
-.rv-add-comment { visibility: hidden; cursor: pointer; border: 1px solid var(--border); background: var(--link); color: #fff; border-radius: 3px; line-height: 1; padding: 0 5px; font-family: inherit; }
+.rv-add-comment {
+  visibility: hidden; cursor: pointer;
+  border: 1px solid var(--color-accent); background: var(--color-accent);
+  color: var(--color-bg); line-height: 1; padding: 0 5px; font-family: inherit;
+}
 tr.rv-line:hover .rv-add-comment, tr.rv-pair:hover .rv-add-comment { visibility: visible; }
 
 /* Side-by-side. One <tr> per split row holds both panes, so a row is as tall
@@ -50,21 +110,222 @@ tr.rv-line:hover .rv-add-comment, tr.rv-pair:hover .rv-add-comment { visibility:
    onto the code cell of the side it belongs to, so there is still exactly one
    anchor per diff line: unchanged data, one level down the tree. */
 tr.rv-pair td.rv-code { width: 50%; }
-tr.rv-pair td.rv-c-add { background: rgba(22,163,74,0.12); }
-tr.rv-pair td.rv-c-del { background: rgba(220,38,38,0.12); }
+tr.rv-pair td.rv-c-add { background: var(--color-success-100); }
+tr.rv-pair td.rv-c-del { background: var(--color-danger-100); }
 /* Filler: the side of a change block that has no counterpart. Visibly inert,
    so a lone deletion reads as "nothing replaced this". */
-tr.rv-pair td.rv-c-nil { background: var(--bg-secondary); }
-tr.rv-pair td.rv-pane-new { border-left: 1px solid var(--border); }
-td.rv-code:target { outline: 2px solid var(--link); outline-offset: -2px; }
+tr.rv-pair td.rv-c-nil { background: var(--color-neutral-100); }
+tr.rv-pair td.rv-pane-new { border-left: 1px solid var(--color-divider); }
+td.rv-code:target { outline: 2px solid var(--color-accent); outline-offset: -2px; }
 /* Wrap needs no special case here: it targets td.rv-code, which is what both
    layouts use, and a paired row is as tall as its taller pane — so the two
    sides stay level however far either of them wraps. */
 
-.rv-viewopts { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font-family: var(--font-ui); font-size: 12px; color: var(--text-secondary); flex-wrap: wrap; }
-.rv-viewopts button { font-family: var(--font-ui); font-size: 12px; padding: 3px 10px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg); color: var(--text-secondary); cursor: pointer; }
-.rv-viewopts button:hover { border-color: var(--link); }
-.rv-viewopts button[aria-pressed="true"] { border-color: var(--link); color: var(--link); background: rgba(37,99,235,0.10); }
+/* Sticky, same as a file's own header (.rv-file-head above): on any review
+   longer than one screen this was the only control gone from sight for 99% of
+   the reading — parked under the tab strip so switching layout/wrap/presented
+   never needs a trip back to the top. Above file headers (z-index 3) so it is
+   never covered by the thing it controls; below the tab strip (20). A solid
+   background is required, not optional — sticky over a scrolling diff with a
+   transparent one lets diff rows show through the toolbar.
+
+   `--lz-strip-top`, NOT `--lz-sticky-top`: this bar is the SECOND level of the
+   sticky stack, so it parks under the tab strip alone, while card headers park
+   under the strip AND this bar. It used to take `--lz-sticky-top` — the same
+   offset the file headers take — and since it is opaque and a z-index above
+   them, every file header stuck itself directly underneath this bar and
+   vanished. Both offsets are measured in review-navigation.ts, which is where
+   the two levels are spelled out. */
+.rv-viewopts {
+  display: flex; align-items: center; gap: var(--space-2);
+  margin-bottom: var(--space-3);
+  font-size: 12px; color: color-mix(in srgb, var(--color-text) 55%, transparent);
+  flex-wrap: wrap;
+  position: sticky;
+  top: var(--lz-strip-top, 0px);
+  z-index: 4;
+  background: var(--color-bg);
+  padding: var(--space-2) 0;
+}
+/* This is the confirmed mechanism behind "the toolbar is visible but locked
+   in place": the element ships `hidden` and diffViewScript clears it once
+   bound, but `display: flex` above is an AUTHOR rule and beats the UA's
+   `[hidden] { display: none }` — so with no script bound to remove `hidden`
+   (the in-place-switch bug this whole task fixes), the toolbar rendered
+   fully visible and pressable, never actually hidden as review-diff.ts's own
+   comment on this markup assumed. The sibling `.rv-changes-viewopts` (the
+   Presented | Raw files bar, review.css) sets no `display` and so never had
+   this problem, which is why the engineer named these three groups
+   (Unified/Split, Scroll/Wrap, Presented/Source) and not that bar.
+
+   Not the only instance, though: `.rv-viewed` had it too (cards.css, now
+   fixed). There is no global `[hidden]` reset in this bundle, so the rule
+   is general — anything that ships `hidden` for an island to unhide AND
+   sets `display` needs its own `[hidden]` companion, or the attribute does
+   nothing. */
+.rv-viewopts[hidden] { display: none; }
+.rv-viewopts button {
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  font-size: 12px; padding: 3px 10px;
+  border: 1px solid var(--color-divider); background: transparent;
+  color: color-mix(in srgb, var(--color-text) 70%, transparent); cursor: pointer;
+}
+.rv-viewopts button:hover { border-color: var(--color-accent); }
+.rv-viewopts button[aria-pressed="true"] {
+  border-color: var(--color-accent); color: var(--color-accent-800);
+  background: var(--color-accent-100);
+}
 .rv-viewopts button[disabled] { opacity: 0.45; cursor: not-allowed; }
-.rv-viewopts button[disabled]:hover { border-color: var(--border); }
+.rv-viewopts button[disabled]:hover { border-color: var(--color-divider); }
 .rv-viewopt-group { display: flex; align-items: center; gap: 6px; margin-right: 10px; }
+
+/*
+ * Markdown files, rendered as Markdown (src/server/review-markdown.ts).
+ *
+ * The document reads as a document — body text, not code — so this pane
+ * deliberately drops the monospace grid of the table above it. What the diff
+ * carried in colour per line, this carries in three honest levels: unchanged
+ * context recedes, an open passage reads at full strength, and inside it the
+ * elements the change actually touched carry the green. Removed text is a muted
+ * struck-through inset, and a fold stands in for stretches nothing happened to.
+ *
+ * The levels have to be distinct, and the green has to be the NARROWEST of
+ * them: colouring the whole open passage reported a two-line CHANGELOG edit as
+ * a rewrite of thirty bullets, which is a lie the reviewer has to open the raw
+ * diff to catch.
+ */
+.rv-md { padding: var(--space-3) var(--space-4); }
+.rv-file[data-collapsed="1"] .rv-md { display: none; }
+.rv-md-head {
+  display: flex; align-items: center; gap: var(--space-2);
+  margin-bottom: var(--space-3);
+  font-size: 12px; color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}
+.rv-md-badge {
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  border: 1px solid var(--color-divider); padding: 2px 8px;
+}
+/* "Comment" on a presented document: the affordance a rendered pane had none
+   of. Styled like the Source button beside it — they are the two things a
+   reviewer can do with what they are looking at, and neither is the loud one. */
+.rv-md-ask {
+  margin-left: auto;
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  font-size: 12px; padding: 3px 10px;
+  border: 1px solid var(--color-accent); background: transparent;
+  color: var(--color-accent-800); cursor: pointer;
+}
+.rv-md-ask:hover { background: var(--color-accent-100); }
+/* With an ask button present, Source is no longer the element pushed right. */
+.rv-md-ask + .rv-md-source-btn { margin-left: 0; }
+.rv-md-source-btn {
+  margin-left: auto;
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  font-size: 12px; padding: 3px 10px;
+  border: 1px solid var(--color-divider); background: transparent;
+  color: color-mix(in srgb, var(--color-text) 70%, transparent); cursor: pointer;
+}
+.rv-md-source-btn:hover { border-color: var(--color-accent); }
+.rv-md-note { font-size: 12px; color: color-mix(in srgb, var(--color-text) 55%, transparent); }
+.rv-md-block { position: relative; }
+/* Unchanged prose is legible but recedes: it is context, not the change. */
+.rv-md-context { color: color-mix(in srgb, var(--color-text) 70%, transparent); }
+/* An open passage: full-strength text, no colour of its own. The padding is
+   what the "+" button sits in. */
+.rv-md-changed {
+  padding: var(--space-2) var(--space-3);
+  margin: var(--space-2) 0;
+}
+/* The change itself: the individual heading, paragraph, list item or table row
+   the diff added. The accent is a box-shadow rather than a border so marking an
+   <li> cannot reflow the list it sits in. */
+.rv-md-added {
+  background: var(--color-success-100);
+  box-shadow: -4px 0 0 var(--color-success);
+}
+/* A table row cannot carry the accent bar without breaking the table's own
+   borders; inside a table the fill alone says it. */
+tr.rv-md-added { box-shadow: none; }
+/* A whole file added or removed needs no per-block marking — the badge in the
+   header already says which, so the accent runs down the entire document. */
+.rv-md-whole-added { border-left: 3px solid var(--color-success); padding-left: var(--space-3); }
+.rv-md-whole-removed {
+  border-left: 3px solid var(--color-danger); padding-left: var(--space-3);
+  opacity: 0.75; text-decoration: line-through;
+}
+.rv-md-note-removed { color: var(--color-danger); }
+/* Removed text, in place: struck through and muted, so it reads as gone rather
+   than as something the reviewer still has to act on. */
+.rv-md-removed {
+  border-left: 3px solid var(--color-danger);
+  background: var(--color-danger-100);
+  padding: var(--space-1) var(--space-3);
+  margin: var(--space-2) 0;
+  opacity: 0.8; text-decoration: line-through;
+}
+.rv-md-removed-tag {
+  display: block; font-size: 11px; text-decoration: none;
+  color: var(--color-danger); text-transform: uppercase; letter-spacing: 0.04em;
+}
+.rv-md-fold { margin: var(--space-2) 0; }
+.rv-md-fold-summary {
+  cursor: pointer; font-size: 12px;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+  border-top: 1px dashed var(--color-divider);
+  border-bottom: 1px dashed var(--color-divider);
+  padding: var(--space-1) 0;
+}
+.rv-md-fold-summary:hover { color: var(--color-accent-800); }
+/* Same affordance as the diff's per-line "+", in the only place a rendered
+   block can offer it. */
+.rv-md-comment {
+  position: absolute; top: 2px; right: 2px;
+  border: 1px solid var(--color-divider); background: var(--color-bg);
+  color: color-mix(in srgb, var(--color-text) 60%, transparent);
+  font-size: 12px; line-height: 1; padding: 2px 6px; cursor: pointer;
+}
+.rv-md-comment:hover { border-color: var(--color-accent); color: var(--color-accent-800); }
+
+/* --- Subtask-blame gutter -------------------------------------------------
+   Which unit wrote each stretch of changed lines, the way `git blame` shows a
+   commit. A run of consecutive same-owner lines is ONE label on a spine, not a
+   link repeated on every row — a column of three hundred identical links is
+   noise, and the spine is what says how far the run reaches.
+   The column exists only inside .rv-blame-on, so a file the gutter is off for
+   renders exactly as it did before. */
+td.rv-blame {
+  width: 1%; padding: 0 0 0 var(--space-2); white-space: nowrap;
+  user-select: none; position: relative; font-size: 11px; line-height: 1;
+}
+.rv-blame-run::before {
+  content: ""; position: absolute; left: 4px; top: 0; bottom: 0;
+  border-left: 2px solid color-mix(in srgb, var(--color-accent) 45%, transparent);
+}
+/* The bracket's ends: a run that stops has a visible top and bottom, so two
+   adjacent runs of different units do not read as one continuous spine. */
+.rv-blame-first::before { top: 2px; border-top-left-radius: 3px; }
+.rv-blame-last::before { bottom: 2px; border-bottom-left-radius: 3px; }
+.rv-blame-first::after, .rv-blame-last::after {
+  content: ""; position: absolute; left: 4px; width: 5px;
+  border-top: 2px solid color-mix(in srgb, var(--color-accent) 45%, transparent);
+}
+.rv-blame-first::after { top: 2px; }
+.rv-blame-last::after { bottom: 0; }
+.rv-blame-label {
+  margin-left: 10px; color: var(--color-accent); text-decoration: none;
+  background: var(--color-bg); padding: 0 3px;
+}
+.rv-blame-label:hover { text-decoration: underline; }
+/* Hidden rather than unrendered: the toggle is instant and needs no fetch. */
+.rv-diff-scroll:not(.rv-blame-on) td.rv-blame { display: none; }
+.rv-blame-chip, .rv-blame-toggle {
+  font-size: 11.5px; margin-left: var(--space-2);
+  color: color-mix(in srgb, var(--color-text) 65%, transparent);
+}
+.rv-blame-toggle {
+  cursor: pointer; font-family: inherit; padding: 0 6px; line-height: 1.4;
+  border: 1px solid var(--color-divider); background: var(--color-bg);
+}
+.rv-blame-toggle[aria-pressed="true"] { border-color: var(--color-accent); color: var(--color-accent); }
+.rv-blame-chip a { color: var(--color-accent); text-decoration: none; }
+.rv-blame-chip a:hover { text-decoration: underline; }

@@ -20,10 +20,15 @@ import {
   type SessionFileInfo,
 } from './claude-code-logs';
 import { excludeMachineOneshots } from './machine-oneshot';
-import { toStoredConversation } from './conversation-storage';
+import { toStoredConversation, saveConversationWithoutRegression } from './conversation-storage';
+import { parsePiSessionFile, statPiSessionFiles, type PiSessionFileInfo } from './pi-session-logs';
+import type { ParsedConversation } from './claude-code-logs';
+import { getAgent } from '../agent/registry';
 import type { Storage } from '../storage';
-import { tryRemoteStorage } from '../cli/helpers';
+import { tryRemoteStorage } from '../preconditions';
 import { logger } from '../utils/logger';
+import { join } from 'path';
+import { SANDBOX_DIR } from '../utils/sandbox';
 
 /**
  * A point-in-time snapshot of a project's session files, keyed by sessionId.
@@ -176,4 +181,115 @@ export async function captureConversation(
   }
 
   return result.newestSessionId;
+}
+
+// --- Pi task sessions ---
+//
+// Pi tasks run in a container whose HOME is the worktree's sandbox mount, so
+// their session files live at `<worktree>/.lazy-task-sandbox/.pi/agent/
+// sessions/...` — a different tree from Claude's `~/.claude/projects/`, in
+// pi's own documented format (parsed by src/import/pi-session-logs.ts).
+// Discovery goes through PiAgent.discoverSessionFiles so the on-disk layout
+// stays known in exactly one place.
+
+function discoverPiTaskSessionFiles(worktreePath: string): string[] {
+  return getAgent('pi').discoverSessionFiles({
+    configDir: join(worktreePath, SANDBOX_DIR, '.pi'),
+  });
+}
+
+/**
+ * Snapshot the pi session files in a task's sandbox, keyed by session id.
+ * The pi analogue of {@link snapshotSessionFiles}, for diffing after a
+ * pairing session ends.
+ */
+export async function snapshotPiTaskSessionFiles(worktreePath: string): Promise<SessionSnapshot> {
+  const files = await statPiSessionFiles(discoverPiTaskSessionFiles(worktreePath));
+  const snapshot: SessionSnapshot = new Map();
+  for (const f of files) {
+    snapshot.set(f.sessionId, { mtimeMs: f.mtimeMs, size: f.size });
+  }
+  return snapshot;
+}
+
+/** {@link CaptureResult} plus the conversations capture actually parsed. */
+export interface PiCaptureResult extends CaptureResult {
+  /**
+   * Every owned conversation that had messages, oldest file first. Returned so
+   * a caller that wants the transcript (pairing's summary) reads what capture
+   * already parsed, instead of re-discovering a file by session id: a stored
+   * id can name a file this pairing never touched, and a pairing that wrote
+   * more than one session file (a daemon restart relaunches the agent) has
+   * more than one transcript to summarize.
+   */
+  conversations: ParsedConversation[];
+}
+
+/**
+ * Parse and persist every pi session file in the task sandbox that is new or
+ * modified relative to `before` — the pi analogue of
+ * {@link captureNewOrModifiedConversations}, with the same error posture:
+ * per-file failures are returned, never swallowed, and one bad file does not
+ * stop the others. Saves go through the no-regression guard so a stale copy
+ * can never shorten a stored conversation.
+ */
+export async function capturePiTaskConversations(
+  worktreePath: string,
+  before: SessionSnapshot,
+  storage: Storage,
+): Promise<PiCaptureResult> {
+  const files = await statPiSessionFiles(discoverPiTaskSessionFiles(worktreePath));
+
+  const isOwned = (file: PiSessionFileInfo): boolean => {
+    const prior = before.get(file.sessionId);
+    if (prior === undefined) return true;
+    return file.size !== prior.size || file.mtimeMs !== prior.mtimeMs;
+  };
+  // Oldest first, so the returned conversations read in the order they were
+  // written when one pairing produced more than one session file.
+  const owned = files.filter(isOwned).sort((a, b) => a.mtimeMs - b.mtimeMs);
+
+  const captured: string[] = [];
+  const errors: Array<{ sessionId: string; error: Error }> = [];
+  const conversations: ParsedConversation[] = [];
+
+  // Newest OWNED file, parsed or not — the same contract as the Claude
+  // function above: `newestSessionId` is the RESUME target (the file the agent
+  // would append to next), not a receipt of what was captured. An empty shell
+  // or an unparseable file is still the one a resume continues; `captured` and
+  // `conversations` answer the other question.
+  let newest: PiSessionFileInfo | null = null;
+  for (const file of owned) {
+    if (!newest || file.mtimeMs > newest.mtimeMs) newest = file;
+
+    let conversation: ParsedConversation;
+    try {
+      conversation = await parsePiSessionFile(file.filePath);
+    } catch (err) {
+      errors.push({ sessionId: file.sessionId, error: err instanceof Error ? err : new Error(String(err)) });
+      continue;
+    }
+
+    // A session file may exist with only header/settings entries and no
+    // conversation yet — same rule as Claude capture: don't persist an empty
+    // shell.
+    if (conversation.messages.length === 0) continue;
+
+    // Collected BEFORE the save is attempted, deliberately: persisting and
+    // summarizing are independent, so a storage failure must not also cost the
+    // caller the transcript it would have summarized.
+    conversations.push(conversation);
+
+    try {
+      const summary = extractSummary(conversation);
+      const stats = conversationStats(conversation);
+      const stored = toStoredConversation(conversation, summary, stats);
+      await saveConversationWithoutRegression(storage, stored);
+      captured.push(conversation.sessionId);
+    } catch (err) {
+      errors.push({ sessionId: conversation.sessionId, error: err instanceof Error ? err : new Error(String(err)) });
+    }
+  }
+
+  return { captured, newestSessionId: newest?.sessionId ?? null, errors, conversations };
 }

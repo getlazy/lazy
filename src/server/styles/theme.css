@@ -1,0 +1,205 @@
+/*
+ * The server UI's own layer, composed from the Industry tokens.
+ *
+ * Industry (`design/industry/styles.css`, loaded immediately before this file)
+ * is consumed VERBATIM and is never edited to suit this surface — a re-sync
+ * overwrites it, see design/README.md. Everything this surface needs that
+ * Industry does not ship lives here, built out of Industry's variables so a
+ * retuned theme carries through.
+ *
+ * This is the exact counterpart of lazy-teams' `application.css`, and it names
+ * the same roles with the same values on purpose: the two surfaces must agree
+ * on what "blocked" looks like.
+ */
+
+:root {
+  /* Machine-readable values — ids, shas, branches, diffs, timestamps. Industry
+     has no mono token; its own component demos use this stack for `code`.
+     ui-monospace is what actually resolves SF Mono on macOS — naming 'SF Mono'
+     does not, so the old stack silently fell through to Menlo. */
+  --font-mono: ui-monospace, 'SF Mono', SFMono-Regular, 'Cascadia Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
+
+  /* Semantic roles Industry does not ship. Industry is deliberately mono
+     steel-blue, but a task board has to say "succeeded", "needs you" and
+     "failed" at a glance. Same flat-tint construction as `.tag-accent`: a 100
+     for the fill, an 800 for the text, the base hue for the edge. Values are
+     lazy-teams' values. */
+  --color-success: #4a7c59;
+  --color-success-100: #e9f2eb;
+  --color-success-800: #274430;
+
+  --color-warning: #a3763f;
+  --color-warning-100: #f4eee4;
+  --color-warning-800: #543c20;
+
+  --color-danger: #a35555;
+  --color-danger-100: #f4e9e9;
+  --color-danger-800: #542b2b;
+
+  --color-indigo-100: #ececf6;
+  --color-indigo-800: #35355c;
+
+  --color-violet-100: #f1ecf6;
+  --color-violet-800: #45355c;
+
+  /* Aliases. The older variables are still read by hundreds of rules across
+     app/diff/review/tasks/heatmap; re-basing them onto Industry means the whole
+     surface moves with the design system without a find-and-replace that would
+     bury the interesting part of this change. New rules use the Industry names
+     directly. */
+  --bg: var(--color-bg);
+  --bg-secondary: var(--color-surface);
+  --text: var(--color-text);
+  --text-secondary: color-mix(in srgb, var(--color-text) 55%, transparent);
+  --border: var(--color-divider);
+  --link: var(--color-accent);
+  --font-ui: var(--font-body);
+}
+
+/*
+ * Dark mode.
+ *
+ * Industry is a light system and ships no dark theme; this surface is a local
+ * dashboard that has always honoured the OS setting, and dropping that would be
+ * a regression. So the tokens are RETUNED here rather than the components being
+ * restyled: every Industry class reads `--color-*`, so re-pointing the tokens
+ * carries the whole system — buttons, cards, tags, tables, dialogs — into dark
+ * without a single component override, and without touching Industry itself.
+ *
+ * The ramps flip end-for-end: a flat tint is a dark fill with a light label in
+ * dark mode, so `-100` becomes the dark step and `-800` the light one. That
+ * keeps every `background: …-100; color: …-800` pair legible as written.
+ */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-bg: #16191c;
+    --color-surface: #1e2226;
+    --color-text: #e8eaec;
+    --color-accent: #8fb3d6;
+    --color-accent-2: #9fb8d0;
+    --color-divider: color-mix(in srgb, #e8eaec 20%, transparent);
+
+    --color-neutral-100: #24282c;
+    --color-neutral-200: #2c3136;
+    --color-neutral-300: #3a4046;
+    --color-neutral-400: #4e565d;
+    --color-neutral-500: #6c757d;
+    --color-neutral-600: #8d959c;
+    --color-neutral-700: #adb4ba;
+    --color-neutral-800: #ccd1d5;
+    --color-neutral-900: #e8eaec;
+
+    --color-accent-100: #1c2733;
+    --color-accent-200: #24323f;
+    --color-accent-300: #2f4353;
+    --color-accent-400: #416080;
+    --color-accent-500: #5b7d9e;
+    --color-accent-600: #7ea1c2;
+    --color-accent-700: #9dbcd8;
+    --color-accent-800: #c3d8ea;
+    --color-accent-900: #e3eef7;
+
+    --color-accent-2-100: #1d262f;
+    --color-accent-2-200: #26313b;
+    --color-accent-2-300: #32404d;
+    --color-accent-2-400: #465b6d;
+    --color-accent-2-500: #62798e;
+    --color-accent-2-600: #8298ad;
+    --color-accent-2-700: #a3b6c8;
+    --color-accent-2-800: #c6d3de;
+    --color-accent-2-900: #e5ecf2;
+
+    --color-success: #6ea87f;
+    --color-success-100: #1b2a20;
+    --color-success-800: #b6d8c1;
+
+    --color-warning: #c79a5e;
+    --color-warning-100: #2c2418;
+    --color-warning-800: #e6cfa8;
+
+    --color-danger: #cf7b7b;
+    --color-danger-100: #2d1d1d;
+    --color-danger-800: #eebcbc;
+
+    --color-indigo-100: #20213a;
+    --color-indigo-800: #c3c4e4;
+
+    --color-violet-100: #271f38;
+    --color-violet-800: #d6c6e8;
+
+    /* An ink-tinted shadow is invisible on a dark ground; the elevation cue
+       there is ambient darkness, which is what Industry's own comment says. */
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.5);
+    --shadow-md: 0 3px 10px rgba(0, 0, 0, 0.55);
+    --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.6);
+
+    color-scheme: dark;
+  }
+}
+
+/* — tags —
+   Industry ships accent / accent-2 / neutral / outline. The task status
+   vocabulary needs more than four distinguishable tones; these are the same
+   names lazy-teams uses for the same statuses. */
+.tag-success { background: var(--color-success-100); color: var(--color-success-800); }
+.tag-warning { background: var(--color-warning-100); color: var(--color-warning-800); }
+.tag-danger { background: var(--color-danger-100); color: var(--color-danger-800); }
+.tag-indigo { background: var(--color-indigo-100); color: var(--color-indigo-800); }
+.tag-violet { background: var(--color-violet-100); color: var(--color-violet-800); }
+
+/* Raised-item state badges (🛑 Blocking / ⚠️ FYI / ✅ Responded …), rendered by
+   src/server/raised-badges.ts on every surface that shows a raised item. The
+   glyph sits slightly larger than the label and carries a hair of space after
+   it, so the pair reads as one badge rather than as an emoji stuck to a word.
+   The emoji is a cue, never the message — see src/raised/vocabulary.ts. */
+.lz-raised-badge { gap: 5px; white-space: nowrap; }
+.lz-raised-badge-glyph { font-size: 12px; line-height: 1; }
+.lz-raised-badge-link { color: inherit; text-decoration: underline; }
+/* The item id, spelled out once in a panel's provenance and nowhere else. */
+.lz-raised-id-line code { font-size: 11px; }
+
+/* — buttons —
+   Industry's `.btn` has one size. This surface is dense — filter chips, row
+   actions, per-line comment controls — so it needs a small one. Sizes restate
+   the padding rather than nudging it. */
+.btn-sm { padding: var(--space-1) var(--space-3); font-size: 13px; }
+.btn-xs { padding: 1px var(--space-2); font-size: 11px; }
+/* Re-asserted after the sizes, which set the `padding` shorthand: a ghost
+   button reads as inline text and keeps Industry's tighter inline padding. */
+.btn-ghost { padding-inline: var(--space-1); }
+/* A button is an anchor on most of this surface; Industry's `.btn` does not
+   defend against the global `a:hover { text-decoration: underline }`. */
+a.btn:hover { text-decoration: none; }
+/* A disabled button says "this control exists, but there is nowhere to go" —
+   the end of a stepped sequence (the first or last turn). Keeping it in place
+   rather than dropping it stops the prev/next pair jumping between pages. */
+.btn[disabled] { opacity: 0.45; cursor: not-allowed; }
+.btn[disabled]:hover { border-color: var(--color-divider); }
+/* `display` above is an author rule and beats the UA's `[hidden]`, so a
+   button that ships hidden for an island to reveal needs this or it is
+   simply always on screen — which the Reconnect buttons in the shell and
+   watch panels were, both of them toggled by `.hidden` and neither ever
+   actually hidden. Same shape as `.rv-viewopts[hidden]` in diff.css; there
+   is no global `[hidden]` reset in this bundle. */
+.btn[hidden] { display: none; }
+
+/* — panels —
+   A bordered block of rows: detail sections, note lists, turn chunks. Rows are
+   separated the way `.table` separates them, so a list and a table read as the
+   same object. Same construction as lazy-teams' `.panel`. */
+.panel { border: 1px solid var(--color-divider); background: transparent; }
+.panel > * + * { border-top: 1px solid color-mix(in srgb, var(--color-text) 8%, transparent); }
+.panel-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: var(--space-3); padding: var(--space-2) var(--space-3);
+  background: var(--color-surface); font-size: 12px;
+}
+
+/* — machine-readable text — */
+.mono { font-family: var(--font-mono); }
+
+/* — hints and small print — */
+.hint {
+  font-size: 11px;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}

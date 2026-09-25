@@ -1,7 +1,7 @@
 import { describe, test, beforeEach, afterEach } from 'bun:test';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { readFile, writeFile, unlink, mkdtemp } from 'fs/promises';
+import { readFile, writeFile, unlink, mkdtemp, mkdir } from 'fs/promises';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput, expectError, expectFailure, expectOutputExcludes } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
@@ -47,7 +47,10 @@ describe('lazy upgrade', () => {
     expectOutput(result, 'No running containers to stop.');
     expectOutput(result, 'Rebuilding...');
     expectOutput(result, 'rebuilt');
-    expectOutput(result, 'Upgrade complete.');
+    expectOutput(result, 'Upgrade complete');
+    expectOutput(result, 'Container image:');
+    expectOutput(result, 'Agent binary:');
+    expectOutput(result, 'Daemon:');
   });
 
   test('upgrade --dry-run shows what would happen', async () => {
@@ -69,7 +72,7 @@ describe('lazy upgrade', () => {
     const result = await ctx.lazyMocked(['upgrade', '--force'], MOCK_CLAUDE_SUCCESS);
 
     expectSuccess(result);
-    expectOutput(result, 'Upgrade complete.');
+    expectOutput(result, 'Upgrade complete');
   });
 
   test('upgrade rejects unknown flags', async () => {
@@ -94,7 +97,69 @@ describe('lazy upgrade', () => {
 
     expectSuccess(result);
     expectOutput(result, 'No running containers to stop.');
-    expectOutput(result, 'Upgrade complete.');
+    expectOutput(result, 'Upgrade complete');
+  });
+
+  // INVARIANT: the completion block is the last thing the human sees — it must
+  // sit below docker build progress (and any prompts that scrolled away).
+  test('prints the completion block after the mocked image build output', async () => {
+    const buildLogPath = join(ctx.root, 'upgrade-build-log.jsonl');
+    await writeFile(buildLogPath, '');
+
+    const result = await ctx.lazyMocked(['upgrade', '--force'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MOCK_BUILD_LOG: buildLogPath },
+    });
+
+    expectSuccess(result);
+    expectOutput(result, 'rebuilt');
+    expectOutput(result, 'Upgrade complete');
+    expectOutput(result, 'Container image:');
+    expectOutput(result, 'Next:');
+
+    const rebuiltAt = result.stdout.lastIndexOf('rebuilt container image');
+    const completionAt = result.stdout.lastIndexOf('Upgrade complete');
+    if (rebuiltAt < 0 || completionAt < 0 || completionAt <= rebuiltAt) {
+      throw new Error(
+        `Expected completion block after image rebuild output\n` +
+        `rebuiltAt=${rebuiltAt} completionAt=${completionAt}\nstdout tail:\n${result.stdout.slice(-1500)}`,
+      );
+    }
+
+    await unlink(buildLogPath);
+  });
+
+  // INVARIANT: a blocking stdin prompt must appear AFTER docker build output,
+  // not scrolled away above it while the process waits for Enter.
+  test('re-prompts to press Enter after mocked image build output finishes', async () => {
+    const buildLogPath = join(ctx.root, 'upgrade-build-log.jsonl');
+    await writeFile(buildLogPath, '');
+
+    const result = await ctx.lazyMocked(['upgrade'], MOCK_CLAUDE_SUCCESS, {
+      env: {
+        LAZY_MOCK_BUILD_LOG: buildLogPath,
+        LAZY_MOCK_BUILD_STDOUT: '#13 DONE 10.0s\n#14 DONE 24.5s',
+        LAZY_MOCK_BUILD_DELAY_MS: '50',
+        LAZY_FORCE_TTY: '1',
+        LAZY_PROMPT_DEFAULTS: '1',
+        LAZY_TEST_UPGRADE_BUILDER_COUNT: '1',
+      },
+    });
+
+    expectSuccess(result);
+    expectOutput(result, 'Image build finished');
+    expectOutput(result, '#14 DONE 24.5s');
+    expectOutput(result, 'Upgrade complete');
+
+    const buildDoneAt = result.stdout.lastIndexOf('#14 DONE 24.5s');
+    const repromptAt = result.stdout.lastIndexOf('Image build finished. Press Enter when ready');
+    if (buildDoneAt < 0 || repromptAt < 0 || repromptAt <= buildDoneAt) {
+      throw new Error(
+        `Expected re-prompt after mocked build output\n` +
+        `buildDoneAt=${buildDoneAt} repromptAt=${repromptAt}\nstdout tail:\n${result.stdout.slice(-2000)}`,
+      );
+    }
+
+    await unlink(buildLogPath);
   });
 
   // Interactive prompt presents three options when working containers exist.
@@ -136,7 +201,7 @@ describe('lazy upgrade', () => {
     // Nothing was stopped and nothing was built.
     expectOutputExcludes(result, 'Rebuilding...');
     expectOutputExcludes(result, 'Stopping');
-    expectOutputExcludes(result, 'Upgrade complete.');
+    expectOutputExcludes(result, 'Upgrade complete');
   });
 
   // A dry run changes nothing by design, so the failing preflight is a warning
@@ -152,6 +217,9 @@ describe('lazy upgrade', () => {
     expectSuccess(result);
     expectOutput(result, 'Upgrade dry run:');
     expectOutput(result, 'A real upgrade would abort immediately');
+    // Same provider-aware remedy the abort path prints — not the pre-`lazy auth`
+    // "Set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY" line.
+    expectOutput(result, 'lazy auth set');
   });
 
   // --- Non-disruptive image refresh (lazy upgrade --images) ---
@@ -171,12 +239,12 @@ describe('lazy upgrade', () => {
     expectSuccess(result);
     expectOutput(result, 'Refreshing container image for future sessions');
     expectOutput(result, 'rebuilt');
-    expectOutput(result, 'Image refresh complete.');
+    expectOutput(result, 'Image refresh complete');
     // INVARIANT: --images is non-disruptive — it must NOT stop containers,
     // rebuild the agent binary, or restart the daemon. Assert the disruptive
     // upgrade output never appears.
     expectOutputExcludes(result, 'Restarting daemon');
-    expectOutputExcludes(result, 'Upgrade complete.');
+    expectOutputExcludes(result, 'Upgrade complete');
     expectOutputExcludes(result, 'agent binary');
   });
 
@@ -196,7 +264,7 @@ describe('lazy upgrade', () => {
     expectSuccess(result);
     expectOutput(result, 'Image refresh dry run:');
     expectOutput(result, 'Rebuild (--no-cache)');
-    expectOutputExcludes(result, 'Image refresh complete.');
+    expectOutputExcludes(result, 'Image refresh complete');
   });
 
   // Every upgrade image build (and its dry run) names the exact lazy.toml and
@@ -286,6 +354,66 @@ describe('lazy upgrade', () => {
     expectOutput(result, 'Dockerfile: ');
   });
 
+  // INVARIANT: an existing daemon adoption is announced at every rebuild —
+  // never silently kept or dropped when upgrade runs from the project root.
+  test('announces and keeps an existing adoption when upgrade runs from project root', async () => {
+    const { pinDaemonBaseDir } = await import('../helpers/daemon-base-dir');
+    const daemonBase = await mkdtemp(join(tmpdir(), 'lazy-upgrade-keep-adopt-'));
+    const undoDaemonBase = pinDaemonBaseDir(daemonBase);
+
+    try {
+      const worktree = join(ctx.root, '.lazy', 'worktrees', 'adopt-task');
+      await mkdir(worktree, { recursive: true });
+      const dockerfilePath = join(worktree, 'Dockerfile.lazy');
+      const content = 'FROM debian:bookworm-slim\n# adopted worktree\n';
+      await writeFile(dockerfilePath, content);
+
+      const { writeAdoptedImage, hashDockerfileContent } = await import('../../src/daemon/adopted-image');
+      await writeAdoptedImage(ctx.root, {
+        dockerfilePath,
+        contentHash: hashDockerfileContent(content),
+        imageName: 'lazy-custom-keepannounce:0.22',
+      }, { content });
+
+      const result = await ctx.lazyMocked(['upgrade', '--images'], MOCK_CLAUDE_SUCCESS, {
+        env: {
+          LAZY_DAEMON_BASE_DIR: daemonBase,
+          LAZY_FORCE_TTY: '1',
+          LAZY_PROMPT_DEFAULTS: 'accept',
+        },
+      });
+
+      expectSuccess(result);
+      expectOutput(result, 'Currently adopted: lazy-custom-keepannounce:0.22');
+      expectOutput(result, 'Keeping lazy-custom-keepannounce:0.22');
+      expectOutput(result, 'Image refresh complete');
+    } finally {
+      undoDaemonBase();
+    }
+  });
+
+  // INVARIANT: cwd anywhere inside a task worktree counts — not only the root.
+  test('offers worktree Dockerfile adoption from a subdirectory on a TTY', async () => {
+    const worktree = join(ctx.root, '.lazy', 'worktrees', 'subdir-adopt');
+    const subdir = join(worktree, 'src', 'cli');
+    await mkdir(subdir, { recursive: true });
+    await writeFile(join(ctx.root, 'Dockerfile.lazy'), 'FROM debian:bookworm-slim\n# root\n');
+    await writeFile(join(worktree, 'Dockerfile.lazy'), 'FROM debian:bookworm-slim\n# worktree\n');
+
+    const result = await ctx.lazyMocked(['upgrade', '--images'], MOCK_CLAUDE_SUCCESS, {
+      cwd: subdir,
+      env: {
+        LAZY_FORCE_TTY: '1',
+        LAZY_PROMPT_DEFAULTS: 'accept',
+      },
+    });
+
+    expectSuccess(result);
+    expectOutput(result, 'Running `lazy upgrade` from a task worktree.');
+    expectOutput(result, join(worktree, 'Dockerfile.lazy'));
+    expectOutput(result, 'Adopted lazy-custom-');
+  });
+
   // INVARIANT: --images does not stop containers, so --force / --wait (which
   // only govern stopping working containers) are meaningless and rejected —
   // never silently ignored (principle of least surprise).
@@ -315,7 +443,7 @@ describe('lazy upgrade', () => {
     expectOutput(result, 'Rebuilding the container image in the background');
     expectOutput(result, 'promoted only once you proceed');
     expectOutput(result, 'rebuilt');
-    expectOutput(result, 'Upgrade complete.');
+    expectOutput(result, 'Upgrade complete');
 
     // The build must target the STAGING tag (not the canonical one) and bust
     // the layer cache — a hash-matching rebuild would be a no-op.
@@ -387,6 +515,6 @@ describe('lazy upgrade', () => {
     // but we can verify the basic flow completes.
     const upgradeResult = await ctx.lazyMocked(['upgrade', '--force'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(upgradeResult);
-    expectOutput(upgradeResult, 'Upgrade complete.');
+    expectOutput(upgradeResult, 'Upgrade complete');
   });
 });

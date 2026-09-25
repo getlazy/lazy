@@ -35,7 +35,7 @@
 import { AsyncLocalStorage } from 'async_hooks';
 import { existsSync, readFileSync, writeFileSync, unlinkSync, renameSync, openSync, closeSync, constants } from 'fs';
 import { join, dirname } from 'path';
-import { getDataDir } from '../cli/init';
+import { getDataDir } from '../project-paths';
 import { logger } from './logger';
 import {
   checkHolder,
@@ -311,6 +311,41 @@ export async function probeHeldStorageLock(
   };
 }
 
+/**
+ * What this process's locked sections on one store have been doing — for
+ * `lazy daemon health`, which must say "the store is wedged" without taking
+ * the lock to find out.
+ *
+ * Per lock path, process-wide, because the question is about the STORE: one
+ * FileStorage per store is the daemon's rule, but nothing here depends on it.
+ */
+export interface StorageLockActivity {
+  lockPath: string;
+  /** When a locked section last completed without throwing (epoch ms). */
+  lastSuccessAt: number | null;
+  /** When the locked section running right now started, or null when idle. */
+  activeSince: number | null;
+  /** Independent operations queued in this process behind the running one. */
+  waiting: number;
+}
+
+const lockActivity = new Map<string, StorageLockActivity>();
+
+function activityFor(lockPath: string): StorageLockActivity {
+  let entry = lockActivity.get(lockPath);
+  if (!entry) {
+    entry = { lockPath, lastSuccessAt: null, activeSince: null, waiting: 0 };
+    lockActivity.set(lockPath, entry);
+  }
+  return entry;
+}
+
+/** This process's activity on the store whose lock file is `lockPath`, or null if it never took it. */
+export function storageLockActivity(lockPath: string): StorageLockActivity | null {
+  const entry = lockActivity.get(lockPath);
+  return entry ? { ...entry } : null;
+}
+
 export interface StorageLockOptions {
   /**
    * Give up on acquiring after this long instead of running the default
@@ -492,15 +527,22 @@ export class StorageLock {
       done = resolve;
     });
 
+    const activity = activityFor(this.lockPath);
+    activity.waiting++;
     // A rejected predecessor must not poison the queue — every waiter releases
     // its gate in a finally, so `prev` only settles, never stays pending.
     await prev;
+    activity.waiting--;
 
     try {
       await this.acquire();
+      activity.activeSince = Date.now();
       try {
-        return await this.holder.run(true, fn);
+        const result = await this.holder.run(true, fn);
+        activity.lastSuccessAt = Date.now();
+        return result;
       } finally {
+        activity.activeSince = null;
         this.release();
       }
     } finally {

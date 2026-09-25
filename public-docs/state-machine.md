@@ -1,6 +1,84 @@
 # Task State Machine and Crash Recovery
 
-This document describes the task status state machine and the crash/resume lifecycle in Lazy.
+This page describes the statuses a lazy task moves through, which commands and
+events move it, and what lazy does when an agent crashes mid-turn.
+
+## How a turn ends
+
+A task's status says where the task IS. It cannot say whether the agent thought
+it was finished: `blocked` reads exactly the same whether the agent delivered
+the whole task or simply ran out of budget halfway through. So an agent says
+which, and a turn ends in one of three ways.
+
+Nothing asks the agent which of the three it was — lazy reads the ending off
+what the turn did.
+
+- **Declared done.** The agent calls `lazy_final` — pencils down. The claim
+  names the branch head at the moment it was made and is recorded on that turn,
+  along with an optional one-line note. It is not a turn-end signal: the turn
+  still ends when the agent stops, and an agent may keep working after declaring.
+  Declaring is what starts an automatic review; it does not gate acceptance.
+- **Needs input.** The agent raised a blocking item (see
+  [Raised items](raised-items.md)). The task parks for a human decision.
+- **Neither.** The turn simply stopped — budget, watchdog, crash, or the agent
+  said nothing. The task parks `blocked`.
+
+The last two look the same in the status: blocked is blocked whether or not
+anything was raised. What differs is the record — a blocking item, or none —
+and lazy labels the task from that.
+
+**You can accept from any of the three.** A human-facing task gets its
+walkthrough whichever way the turn ended, precisely so the decision you are
+being asked to make has something to go on.
+
+The first two are exclusive. `lazy_final` refuses while a blocking item is open
+on the task, and names the item, because filing one is the agent having already
+chosen the other ending. The task's journal records which items parked it.
+
+### Work left uncommitted when the turn ends
+
+A task is reviewed and merged from its **commits**. Anything an agent edits and
+never commits is in no diff, in no walkthrough, and in nothing `lazy accept`
+would carry — and it disappears with the worktree. The end of a turn is where
+this happens most: the checks that close a turn ask the agent to update docs or
+a changelog, and writing the file and forgetting the commit is an easy miss.
+
+Three things make that visible rather than silent.
+
+- **The agent is asked, once, before the turn closes.** When a turn that
+  declared itself done still has uncommitted paths, lazy puts them to the agent
+  by name and asks it to commit them or discard them. It is a question, not a
+  sweep: lazy never commits on an agent's behalf, because that would put content
+  nobody reviewed — scratch output, a half-finished edit, a key someone pasted
+  into the worktree — into the merge under the agent's name. A turn that parks
+  for input is not asked: an unfinished edit is normal there, the worktree
+  survives, and the next turn continues in it.
+- **The paths are on the turn record.** `lazy show` puts the count on the turn
+  and lists the paths in `--full`; the web review page shows the same count on
+  the turn, with the paths in the tooltip.
+- **Accept refuses, and says which files.** A task whose worktree still holds
+  uncommitted changes cannot be accepted, and the refusal names the paths and
+  states that none of them is on the branch. Commit what belongs to the task,
+  discard the rest, then accept.
+
+### A declaration is about a SHA, and it can go stale
+
+Because a final names the head it was made at, the head can move afterwards — a
+sync merge, a commit made while pairing, a subtask accepted into a parent. None
+of those cancel the declaration; every surface that shows a final instead says
+so:
+
+```
+declared final at 9f3c1a2b; head has since moved (a sync)
+```
+
+What DOES cancel it is an agent going back to work: a later agent work turn that
+produces commits clears the declaration, and whoever did that work declares
+again when they are finished. A turn that committed nothing, a sync, a review, a
+question and the automated follow-ups all leave it standing.
+
+`lazy show` prints the declaration (or `not declared`) next to the task's status,
+`lazy show --json` carries it as `final`, and the web review page leads with it.
 
 ## Task Status State Machine
 
@@ -11,15 +89,51 @@ Lazy tasks can be in one of the following statuses:
 - **`backlog`** — Task created but not yet started. No session exists.
 - **`working`** — Agent is actively working. Container/process is running.
 - **`blocked`** — Agent completed a turn and is waiting for human review/feedback.
-- **`conflict`** — Agent completed a turn but file permission violations were detected. Semantically "blocked with violations" — the task cannot be accepted until violations are resolved. Leaving `conflict` requires an explicit approve/revert decision on every *pending* violated file; neither `lazy unblock` nor `lazy accept` infers one. A decision already made is sticky: a later unblock decides only what is still pending, so silence never re-reverts an approved file, and re-naming one is always accepted. See [Resolving a conflict task](lazy-toml.md#resolving-a-conflict-task).
+- **`conflict`** — Agent completed a turn but file permission violations were detected. Semantically "blocked with a decision owed at merge time": the task is unblocked, resumed and paired exactly like a `blocked` one, and nothing reverts the violated files. Only `lazy accept` gates on them — every *pending* violated file must be approved there (all-or-nothing) or the accept is refused. A decision already made is sticky, and re-naming an approved file is always accepted. See [Resolving a conflict task](lazy-toml.md#resolving-a-conflict-task).
 
-  **`conflict` is DERIVED, never asserted.** The pending violation set is the source of truth; `conflict` is the label a paused task wears while that set is non-empty. Every path that parks a task as paused — reconciler turn completion, sync completion, a fatal-failure park, stranded recovery, pairing teardown, auto-deliver rollback, `lazy stop`, `lazy doctor <task>` — goes through `parkTaskPaused` in `src/utils/paused-status.ts` and re-derives the label from the set rather than writing `blocked` directly. Correspondingly, every reviewer-facing guard (the CLI and MCP unblock guards, the daemon's revert) reads violation records, not the status — the PENDING set for what must be decided, and the full record set for whether `approved_files` may be passed at all. Before this was true, a read-only `lazy_ask` could leave a task reading `blocked` with a violation still pending, which made the correct call unexpressible: passing `approved_files` was refused ("no violations") while omitting it silently reverted the agent's committed work.
-- **`pairing`** — Human is working interactively with Claude Code in the task worktree.
+  **`conflict` is derived, never set by hand.** The set of pending violations decides it: a paused task is labelled `conflict` while that set is non-empty and `blocked` once it is empty. Every way a task comes to rest — a turn or sync finishing, a failed turn being parked, crash recovery, a pairing session ending, `lazy stop`, `lazy doctor <task>` — re-checks the set rather than simply writing `blocked`.
+- **`submitted`** — The task's branch has an open pull/merge request waiting for review on the forge (`lazy submit`). It is a paused status like `blocked`: you can unblock it, review it, sync it, pair on it or accept it.
+
+  **A sync or review puts `submitted` back when it ends.** Merging upstream into the branch and running a review both move the task through `working` for the duration of the turn, because each needs an agent — but neither changes where the task stands with its reviewer, so each restores the status it found. That keeps the task in the submitted view and keeps PR-comment reactions (which only run on `submitted` tasks) switched on. A sync that fails in a way lazy will not retry — a dead credential, a bad model id, anything it parks for you rather than resuming — restores `submitted` too. A crash lazy *will* retry, or an agent killed outright without reporting, goes to `interrupted` instead and is resumed: the merge may be half applied, so the task is picked back up rather than called done. The other exception is a decision the reviewer still owes on a protected file: pending violations make the task `conflict` regardless, because that label is what `lazy accept` gates on.
+- **`pairing`** — Human is working interactively with the task's agent, in the task's container (see [Pairing](pairing.md)). `--host` is an explicit opt-in for tasks that have no container.
 - **`interrupted`** — Agent crashed or was killed unexpectedly.
-- **`merging`** — A merge is in flight. Two shapes, distinguished by the `accept_in_flight_from` task metadata key: without it, the merge lives on the forge (PR/MR submitted, waiting for CI and merge) and a later accept re-enters to ask the forge what happened; with it, a LOCAL merge phase is running right now inside an accept, and the marker records the status to restore if that phase aborts or dies. `merging` is stamped at the START of the merge phase, so a task reads `merging` for the whole time it is being merged — not for the last instant of it.
-- **`zombie`** — System-only recovery state for tasks whose branch was merged but status wasn't updated (e.g., `lazy accept` crashed after merge but before status update). Reconciler detects this and transitions through zombie → complete.
-- **`complete`** — Task accepted and merged successfully.
-- **`abandoned`** — Task rejected (`lazy reject`) or closed (`lazy close`, e.g. "won't do", duplicate) by a human. Both commands resolve to this single terminal status; there is no distinct `closed` status.
+- **`merging`** — A merge is in flight: either an accept is merging the branch locally right now, or the task's PR/MR has been handed to the forge and is waiting for CI and merge (a later `lazy accept` asks the forge what happened). The task reads `merging` for the whole merge phase. If an accept dies partway (daemon restart, crash), the daemon resumes it rather than undoing it — you already said accept.
+- **`zombie`** — System-only recovery state for tasks whose branch was merged but whose status was never updated (for example, `lazy accept` crashed after the merge). Lazy detects this and moves the task through `zombie` to `complete`.
+- **`complete`** — Task accepted and merged successfully. When the accepted
+  task had a parent *task* (a subtask, not a top-level task aimed at a bare
+  branch), lazy also leaves a `[Subtask accepted]` comment on that parent with
+  the merge commit SHA. The comment does not start a turn or unblock the
+  parent; it shows up in the parent's next notes. `lazy wait` reports the same
+  SHA as `head_sha` once the child is complete, so a parent that already waited
+  can ignore a duplicate note. The same comment is written when a forge merge
+  completes the task, and a missed comment is retried by the daemon.
+- **`abandoned`** — Task rejected (`lazy reject`) or closed (`lazy close`, e.g. "won't do", duplicate) by a human. Both commands resolve to this single terminal status; there is no distinct `closed` status. When the task had a parent *task*, that parent gets a `[Subtask removed]` comment naming the reason.
+
+### A parent task is told when its subtask list changes
+
+A task whose subtasks come and go gets a one-line comment each time, so its
+agent can see what happened on its next turn:
+
+- `[Subtask added] <child> — "<goal>"` when a subtask is created under it
+  (`lazy create --parent`, the web New-task form, a clone or redo of a subtask,
+  an agent creating one of its own subtasks), reparented into it, or reopened
+  after having been closed.
+- `[Subtask removed] <child> — "<reason>"` when a subtask is closed, rejected or
+  abandoned, and `[Subtask removed] <child> — reparented to <parent>` when it
+  moves elsewhere.
+- `[Subtask accepted] <child> …` when a subtask is accepted and merged (see
+  `complete` above). An accepted subtask is only ever reported this way — never
+  also as removed.
+
+The quotes are deliberate: text somebody typed — the subtask's goal, the reason
+it was closed — is quoted so it reads as a quotation rather than as instructions
+to the parent's agent. Lazy's own wording, like `reparented to <parent>`, is
+not.
+
+Like every other lazy comment, these never start a turn and never unblock the
+parent: they show up in its next notes. A top-level task has no parent task, so
+nothing is written for it, and neither is anything written to a parent that is
+already `complete` or `abandoned`.
 
 ### Status Categories
 
@@ -27,7 +141,7 @@ Lazy tasks can be in one of the following statuses:
 - `complete`, `abandoned`
 
 **Blocked statuses** (waiting for human action):
-- `blocked`, `conflict`
+- `blocked`, `conflict`, `submitted`
 
 **Active statuses** (has active worktree that should not be merged into):
 - `working`, `interrupted`, `pairing`, `merging`
@@ -37,74 +151,111 @@ Lazy tasks can be in one of the following statuses:
 ```
 backlog
   → working       lazy start (creates session, launches agent)
+  → blocked       daemon (a backlog task whose branch already has commits)
   → abandoned     lazy close (task canceled before starting)
 
 working
-  → blocked       reconciler (agent turn completes, response.json processed)
-                  | reconciler (supervisor reported an unrecoverable agent failure —
+  → blocked       daemon (agent turn completes)
+                  | daemon (the agent failed in a way retrying cannot fix —
                     see "Agent Failure Classification" below; NOT auto-resumed)
-  → conflict      reconciler (agent turn completes with file permission violations)
-                  | lazy accept (pre-accept turn ends, task restored to its pre-accept status)
+  → conflict      daemon (agent turn completes with file permission violations)
+                  | lazy accept (a failed acceptance gate restores the status the task had before)
   → submitted     lazy accept (same restore, for a task that was submitted)
-  → interrupted   reconciler (container dies without response.json)
+                  | daemon (a sync or review turn ends on a task that was
+                    submitted — the turn restores the status it found; a sync
+                    that failed in a way lazy will not retry restores it too,
+                    while one it will retry goes to `interrupted` instead)
+  → interrupted   daemon (the agent's container or process died without finishing the turn)
+  → merging       daemon (the task's PR/MR was merged on the forge)
   NOTE: working cannot transition to pairing or abandoned — the agent is running.
-  NOTE: accept moves the task through `working` for the pre-accept turn and
-        restores the status it ACTUALLY had — see the merging note below.
+  NOTE: accept flips the task to `working` while the acceptance gate runs and
+        restores the status it actually had if the gate fails.
 
 blocked
   → working       lazy unblock (human gives feedback)
-  → conflict      any park that re-derives the label and finds a pending
-                  violation set (see "conflict is DERIVED" above)
+  → conflict      any park that re-checks the label and finds pending
+                  violations (see "conflict is derived" above)
   → pairing       lazy pair (human wants to work interactively)
+  → submitted     lazy submit (opens a PR/MR for review)
   → merging       lazy accept (begins merge process)
   → abandoned     lazy reject (rejects the work) | lazy close (canceled without accept/reject)
-  → backlog       reconciler migration (blocked task with no session → backlog)
+  → backlog       daemon (a blocked task with no session is moved back to backlog)
   NOTE: blocked cannot go directly to complete — must go through merging first.
 
 conflict
-  → working       lazy unblock (human gives feedback to fix violations)
-  → blocked       any park that re-derives the label after every violation was
-                  resolved (approved or rejected)
+  → working       lazy unblock (feedback, like any blocked task) | lazy resume
+                  | auto-resume / auto-delivery
+  → blocked       any park that re-checks the label after every violation was
+                  approved on the review page
   → pairing       lazy pair (human wants to work interactively on violations)
+  → submitted     lazy submit
+  → merging       lazy accept (once every pending violation is approved)
   → abandoned     lazy reject | lazy close
+
+submitted
+  → working       lazy unblock | lazy sync | lazy review
+                  (each of these runs a turn; sync and review restore
+                  `submitted` when the turn ends, an unblock does not — feedback
+                  means the task is being worked on again)
+  NOTE: `lazy resume` and `lazy ask` do NOT apply to a submitted task. Resume is
+        for picking a task back up where its turn stopped (interrupted, blocked
+        or conflict only); a review question runs only on a blocked or conflict
+        task. Send feedback with `lazy unblock`, or run `lazy review`.
+  → merging       lazy accept (merges the reviewed branch)
+  → pairing       lazy pair (human wants to work interactively)
+  → abandoned     lazy reject | lazy close
+  → blocked       lazy itself, in one case only: the task was re-parented (its
+                  parent was accepted or closed, or `lazy reparent`), and its
+                  pull/merge request could not be moved to the new target, so
+                  lazy closed it — the task no longer awaits a forge review
+  NOTE: otherwise submitted does not go directly to blocked or conflict. It
+        leaves through a turn (via `working`), an accept, a pairing session, or
+        rejection — a finished sync or review puts `submitted` back rather than
+        re-labelling the task, unless a protected-file decision is owed.
 
 interrupted
-  → working       auto-resume (reconciler, circuit breaker allows) | lazy resume
-                  | reconciler stale-completed-response sweep (recovers a response
-                    written after the task was marked interrupted; routes through
-                    working, then working → blocked)
+  → working       auto-resume (daemon, circuit breaker allows) | lazy resume
+                  | daemon (the agent's answer arrived after the task was
+                    marked interrupted; it is recorded via working → blocked)
   → pairing       lazy pair (human investigates interactively)
+  → merging       daemon (the task's PR/MR was merged on the forge)
   → abandoned     lazy reject | lazy close
-  NOTE: interrupted cannot go to merging or complete — must unblock/review first.
+  NOTE: interrupted cannot go to complete directly, and `lazy accept` does not
+        take an interrupted task — resume or unblock it first.
 
 pairing
-  → blocked       pairing ends (Claude Code exits) | reconciler stale pairing sweep
+  → blocked       pairing ends (the session exits) | daemon (the pairing process is gone)
   → conflict      same two paths, when the task still owes a decision on
                   file-permission violations
 
 merging
-  → complete      lazy accept (checks pass, merge succeeds) | reconciler (merge completed)
-  → blocked       lazy accept (checks fail) | reconciler (PR/MR closed externally)
+  → complete      lazy accept (checks pass, merge succeeds) | daemon (merge completed)
+  → blocked       lazy accept (checks fail) | daemon (PR/MR closed on the forge)
   → conflict      lazy accept (merge phase aborts on a task that was in conflict)
   → submitted     lazy accept (merge phase aborts on a task that was submitted)
   NOTE: merging cannot go to abandoned — merge either succeeds or fails back to
         the status the task held before the accept. A task in `conflict`
         (unresolved violations) or `submitted` (open PR awaiting review) is not
-        `blocked`; rewriting it to `blocked` on an aborted accept would destroy
-        that signal, so every abort restores the TRUE prior status.
-  NOTE: an accept that DIES mid-merge (daemon restart, crash, kill) leaves the
-        task in `merging` with no owner. That is recovered, not transitioned
-        away: `lazy reject`, `close`, `submit` and `unblock` return the task to a
-        resting status first and then do their job, and the reconciler sweeps
-        such tasks on every tick — so a stranded merge escapes without anyone
-        needing to know an incantation. A merge that is genuinely in flight (an
-        accept holding the task's lifecycle lock) is refused instead, and a
-        forge-pending merge is left for remote-sync. See
-        `src/daemon/stranded-merge.ts`; `lazy doctor` reports anything sitting
-        in `merging`.
+        `blocked`, so every abort restores the true prior status.
+  NOTE: the merge is the accept's commit point. The moment it lands the task
+        becomes `complete`; fast-forwarding the local branch, pushing the
+        parent, tagging, re-parenting children and cleanup happen AFTER, and a
+        failure there is reported as a failure (non-zero exit, the step named)
+        and retried by the daemon — it never moves the task out of `complete`.
+  NOTE: an accept that DIES (daemon restart, crash, kill) leaves the task in
+        `merging`. The daemon RESUMES it, whether it died before or after its
+        merge landed: a merge that already landed is recognised and not
+        repeated. While that resume is pending, `lazy reject`, `close`, `submit`
+        and `unblock` refuse (they would undo an accept that may already have
+        merged); `lazy accept` resumes it immediately. After three failed
+        automatic resumes the daemon stops, files a system message, and those
+        commands work again to recover the task to a resting status — except
+        when the work has already landed on the target: then they refuse and
+        point you at `lazy accept`, which finishes the accept instead of
+        undoing it. `lazy doctor` reports anything sitting in `merging`.
 
 zombie (system-only)
-  → complete      reconciler (merged branch sweep completes the task)
+  → complete      daemon (the task's branch is found merged)
   NOTE: any non-terminal → zombie (system actor only). Terminal statuses cannot go to zombie.
 
 complete
@@ -119,999 +270,639 @@ abandoned
 ### Actors (turn & transition provenance)
 
 Every turn and status transition records an **actor** — who caused it. This is
-provenance metadata: it never gates behavior (a save is a save regardless of
-actor), it only records who did the thing.
+provenance only: it never changes what a command does, it records who did it.
 
-There are five actors (`Actor` in `src/types`):
+There are five actors:
 
-- **`human`** — a real person acting through the **CLI** boundary.
-- **`builder`** — the AI builder that drives Lazy through the **MCP** boundary
-  (the orchestrator that calls `lazy_start`, `lazy_unblock`, etc.).
-- **`agent`** — a task agent driving its OWN subtree through the same MCP
-  boundary (creating, starting, unblocking, and accepting its own subtasks).
-  Same channel as `builder`, told apart by scope: the tool context carries a
-  task id. Without it, an agent-driven subtask accept would read back as the
-  builder's — or a human's — decision.
-- **`system`** — the daemon acting on its own (reconciler transitions,
-  crash auto-resume). Not attributed to whoever happened to trigger the tick.
-- **`supervisor`** — the per-task supervisor authoring push-back/maintain
-  prompts as human-role turns.
+- **`human`** — a person using the `lazy` CLI.
+- **`builder`** — an AI orchestrator driving lazy through its MCP tools
+  (`lazy_start`, `lazy_unblock`, etc.).
+- **`agent`** — a task's own agent driving its OWN subtree through the same MCP
+  tools (creating, starting, unblocking, and accepting its own subtasks). An
+  agent accepting its subtask is therefore never recorded as a human's or the
+  builder's decision.
+- **`system`** — the daemon acting on its own (status changes it detects,
+  crash auto-resume).
+- **`supervisor`** — lazy's per-task supervisor, for the follow-up prompts it
+  sends the agent itself (push-back and maintain checks).
 
-**The discriminator is the channel, not the content source.** A command that
-arrives over MCP is `builder`; the same command over the CLI is `human`. This is
-deliberate: when the builder relays a human's feedback via `lazy_unblock`, the
-turn is still `builder` — the actor records *who submitted* (pressed the
-button), not who authored the words. The human's content is persisted as
-written either way (modulo control-character escaping, below); the tag is
-orthogonal to it.
+**The actor records the channel, not who wrote the words.** A command that
+arrives over MCP is `builder`; the same command over the CLI is `human`. When a
+builder relays a human's feedback through `lazy_unblock`, the turn is still
+`builder` — the actor records who submitted it, not who authored it. The content
+is stored as written either way.
 
-Mechanically: CLI commands default to `getActor()` (env-var / `human`). MCP tool
-handlers set the actor at origination — `MCP_ACTOR` (`builder`) for the builder,
-`AGENT_ACTOR` (`agent`) when the tool context carries a task id — and thread it
-through the RPC layer, because lifecycle ops persist their records in the
-**daemon** — a shared process that can't see the caller's channel from its own
-environment, and whose `getActor()` therefore reports `human` for every caller.
-Everything an operation writes carries that one threaded actor: the turn, every
-status transition it makes, and any comment it leaves. That covers the
-turn-creating ops (start, unblock, ask, resume, stop, sync) *and* the ones that
-never launch an agent (reject, close, submit, reparent), plus task creation —
-whose channel lands on the initial `backlog` status-changelog entry — and
-journal entries. Read surfaces
-(`lazy show`, the web dashboard, the MCP `lazy_show` turns section, fidelity /
-report digests) label a human-role turn by its authoring actor so `builder` and
-`supervisor` turns are distinguishable from what a person typed.
+Everything an operation writes carries its one actor: the turn, every status
+change it makes, and any comment it leaves — for commands that start a turn
+(start, unblock, ask, resume, stop, sync), for those that do not (reject, close,
+submit, reparent), for task creation and for journal entries. `lazy show`, the
+web dashboard and `lazy_show` label each human-side turn with its actor, so
+`builder` and `supervisor` turns are distinguishable from what a person typed.
 
-**An absent actor is not a bug — it means one of two things.** On a
-**`role: 'agent'`** turn, an actor is never written: the field records who
-submitted a *command*, and an agent's own reply is not one (`lazy show` labels
-those by role). On a **human-role** turn or a status change, absent means the
-default channel — a CLI/human action, or a record written before the actor was
-populated. Only the non-default channels (`builder`, `agent`, `system`,
-`supervisor`) are stamped, so legacy records and new CLI records read the same
-way. Turn-creating commands are the exception: they always write an explicit
-actor on the human-role turn, `human` included.
+**An absent actor means the default.** An agent's own reply never carries an
+actor (it is labelled by its role instead). On any other turn or status change,
+no actor means a CLI/human action. Commands that start a turn always record
+their actor explicitly, `human` included.
 
 ### Text intake is sanitized at the boundary
 
-Every prompt lazy sends an agent is passed as an **argv element**
-(`claude -p <prompt>`). A raw NUL byte in argv is illegal, so a single NUL in
-feedback used to kill the spawn instantly, trip crash-loop detection, and — via
-an auto-resume that restarts on a generic prompt — silently drop the feedback.
-
-Every text intake (CLI `unblock`/`comment`/`create`, the `$EDITOR` and piped-stdin
-paths, every MCP tool argument, the daemon's unblock/ask RPCs, and auto-delivered
-comment/CI text) therefore runs through `sanitizeUserText()`
-(`src/utils/sanitize-text.ts`) **before persistence**. Non-printable control
-characters — C0 except tab/LF/CR, DEL, and C1 — are replaced with their printable
-escapes (a NUL becomes the six characters `\u0000`).
+Every prompt lazy sends an agent is passed on the agent's command line, where a
+raw NUL byte is illegal. So every place lazy takes in text — `lazy unblock`,
+`comment` and `create`, the `$EDITOR` and piped-stdin paths, every MCP tool
+argument, and auto-delivered PR comment and CI text — sanitizes it **before
+saving it**. Non-printable control characters (C0 except tab/LF/CR, DEL, and C1)
+are replaced with printable escapes: a NUL becomes the six characters `\u0000`.
 
 For free-text arguments that become prose in a prompt (`feedback`, `message`,
 `prompt`, `note`, `reason`, `question`, `goal_context`), a short note is appended
-disclosing the substitution, so it is visible rather than a silent rewrite.
-Strings that are *not* prose are escaped **without** that note: short single-line
-fields like a task goal, and strings nested inside array arguments — `files`,
-`approved_files` — whose elements become git argv. Appending an explanatory
-paragraph to a file path would corrupt the path.
+saying a substitution was made, so it is visible rather than silent. Strings
+that are *not* prose are escaped **without** that note: short single-line fields
+like a task goal, and file-path lists such as `files` and `approved_files`,
+where an appended paragraph would corrupt the path.
 
 The policy is **sanitize and deliver, never reject**: rejecting would discard
-feedback at exactly the moment the human finished typing it, which the
-never-lose-human-feedback invariant forbids. Nothing is dropped — only re-encoded.
-Ordinary text is passed through byte-for-byte.
-
-The delivery side is guarded too, as defense in depth: the argv builders escape
-(and log loudly) rather than fail, and the `src/utils/spawn.ts` wrappers refuse a
-NUL-bearing argv with an actionable error instead of the opaque
-`args[N] must be a string without null bytes`.
+feedback at exactly the moment you finished typing it. Nothing is dropped — only
+re-encoded. Ordinary text passes through byte-for-byte.
 
 ### Transition Triggers
 
-The CLI commands below are the `human`-channel triggers; each has an MCP
-equivalent (`lazy_start`, `lazy_unblock`, …) that drives the same transition but
-records the actor as `builder` (or `agent`, when the caller is a task agent
-acting inside its own subtree).
+The CLI commands below record the `human` actor; each has an MCP equivalent
+(`lazy_start`, `lazy_unblock`, …) that makes the same transition but records
+`builder` (or `agent`, when the caller is a task agent acting inside its own
+subtree).
 
 #### Human Actions (CLI commands)
 
 - **`lazy start <task>`** — backlog → working
-  - Creates session, creates worktree, launches supervisor container
-  - Records human turn, transitions to working, launches agent
+  - Creates the session, the worktree and the container, then launches the agent
+  - Narrates itself phase by phase — see [Command observability](#command-observability)
 
-- **`lazy unblock <task>`** — blocked|interrupted → working
-  - Opens $EDITOR for human feedback (or reads from --message/stdin)
-  - Merges upstream before agent resumes (INVARIANT: every unblock merges upstream)
-  - Records human turn, transitions to working, launches agent
+- **`lazy unblock <task>`** — blocked|conflict|interrupted|submitted → working
+  - Opens $EDITOR for your feedback (or reads from `--message`/stdin)
+  - Records your feedback as a turn, then launches the agent
+  - To merge upstream first, run `lazy sync <task>` separately — unblock does not
+  - Narrates itself phase by phase — see [Command observability](#command-observability)
 
-- **`lazy resume <task>`** — interrupted → working
-  - Manual recovery after auto-resume circuit breaker fires
-  - Same mechanics as unblock but without requiring feedback
-  - Refuses while file-permission violations are pending: resume has no channel
-    to express an approve/revert decision, and starting a turn without one piles
-    more work onto files the eventual unblock may revert. Use `lazy unblock` with
-    `--approve-file` / `--no-approve-files` (or `approved_files` over MCP).
-    Auto-resume (reconciler and the auto-resume queue) skips such tasks for the
-    same reason
+- **`lazy resume <task>`** — interrupted|blocked|conflict → working
+  - Manual recovery, e.g. after the auto-resume circuit breaker fires
+  - Same as unblock but without feedback
+  - Pending protected-file violations do NOT refuse it: no turn reverts a file,
+    so the decision stays owed at `lazy accept` and the work can continue.
+    Auto-resume and auto-delivery treat such tasks the same way
+  - Narrates itself phase by phase — see [Command observability](#command-observability)
 
-- **`lazy pair <task>`** — blocked|conflict|interrupted → pairing
-  - Acquires pairing lock, transitions to pairing
-  - Launches Claude Code with --resume (if session exists)
-  - On exit, synthesizes summary turn, transitions back to blocked (or `conflict`,
-    if violations are still pending)
+- **`lazy pair <task>`** — blocked|conflict|interrupted|submitted → pairing
+  - Launches the task's agent interactively inside the task's container,
+    resuming its session if it has one (`--host` runs it on the host instead,
+    and is refused unless asked for — see [Pairing](pairing.md))
+  - On exit, records a summary turn and returns the task to blocked (or
+    `conflict`, if violations are still pending)
 
 - **`lazy ask <task>`** — blocked|conflict → working → blocked|conflict (status-neutral)
-  - Read-only and reflective: resumes the agent session (Claude Code plan mode plus
-    hard tool denials) to answer one question
-  - Opens $EDITOR for the question (or reads from --message/stdin)
-  - Records the question as a human turn before launching, the answer as an agent turn
-  - Restores the **pre-ask** status when the turn ends — on success, on an agent
-    error, and on any other throw — so an ask never mutates task state. The
-    transient `working` window exists only so the reconciler and concurrent
-    callers see the task as busy while the agent runs
-  - The one exception is a timeout: the task deliberately stays `working` so the
-    reconciler can still finalize an answer the supervisor may yet write. The
-    reconciler's park re-derives `blocked` vs `conflict`, so the label survives
+  - Read-only: resumes the agent session (plan mode plus hard tool denials) to
+    answer one question
+  - **Only when the session can be resumed.** For any other task — finished,
+    session ended, worktree gone — the question is answered from the task's
+    stored record by a throwaway read-only agent instead. That route touches no
+    status at all (not even the transient `working` below), takes no worktree
+    lock, and records no turn; the answer states where it came from. A task that
+    has never run is the one case with nothing to answer from.
+  - Opens $EDITOR for the question (or reads from `--message`/stdin)
+  - Records the question as a turn before launching, and the answer as an agent turn
+  - Restores the status the task had before the ask when the turn ends — on
+    success and on error — so an ask never changes task state. The brief
+    `working` just marks the task busy while the agent answers
+  - The one exception is a timeout: the task stays `working` so an answer that
+    still arrives can be recorded; it then parks as `blocked` or `conflict` as usual
   - If the agent crashes mid-ask the task lands in `interrupted` like any other turn
+  - A second `lazy ask` on a task that is already answering one is refused
+  - Narrates itself phase by phase — see [Command observability](#command-observability).
+    The narration goes to stderr, so the answer on stdout stays pipeable, and
+    `--json` prints no narration at all
 
 - **`lazy chat <task>`** — no transition at all (status-neutral)
-  - On a `blocked`/`conflict` task: resumes the live agent session interactively in the
-    worktree, read-only and reflective (same denials as ask). No status change, no turn,
-    no commits — the only durable effect is the session log captured to storage on exit
-  - Holds the worktree lock (`.lazy-lock`, command `lazy chat`) for the chat's duration,
-    so start/unblock/sync/resume refuse while a chat is open rather than starting a turn
-    underneath it
-  - On a terminal task: rehydrates the captured session JSONL and resumes it in the
-    project root (no worktree exists)
+  - On a `blocked`/`conflict` task: resumes the agent session interactively in the
+    worktree, read-only (same denials as ask). No status change, no turn, no
+    commits — the only lasting effect is the session log saved on exit
+  - Holds the worktree lock for the chat's duration, so start/unblock/sync/resume
+    refuse while a chat is open rather than starting a turn underneath it
+  - On a terminal task: resumes the saved session in the project root (no
+    worktree exists)
 
-- **`lazy accept <task>`** — blocked|merging → merging → complete
+- **`lazy accept <task>`** — blocked|conflict|submitted → merging → complete
   - Refuses if uncommitted changes exist
-  - For remote tasks: creates/updates PR/MR, waits for checks
-    - If merge succeeds immediately → merging → complete
-    - If checks pending or approval needed → merging
-  - For local tasks: transitions to merging, squash-merges into parent/main → complete
-  - Ends session, cleans up container/worktree/branch
-  - Narrates itself phase by phase — see [Accept observability](#accept-observability)
-  - Status tracks the phase in flight: `working` (with the `agent:pre-accept`
-    substate) for the pre-accept turn, `merging` for the whole merge phase.
-    Every abort restores the status the task actually had before the accept
-  - While it waits for the pre-accept turn, lazy also watches whether the
-    agent's run is still alive. If the run disappears without answering, the
-    accept aborts within seconds — reporting the run's exit code and last
-    output, restoring the task's prior status, and recording the reason on the
-    task — instead of waiting out the turn's full timeout. A brief grace period
-    covers the normal ending, where the agent answers and then exits.
-  - The merge only proceeds on a validation result that actually came from the
-    pre-accept turn. While the accept waits, the task is marked as having a turn
-    in flight, so an auto-resume or an auto-delivered comment holds off instead
-    of starting a turn on top of it — and the marker lives with the task, so it
-    still holds if the daemon restarts mid-accept. If a result nonetheless
-    arrives that did not come from the pre-accept turn, the accept stops and says
-    so rather than treating it as a pass. Re-accept once the task is idle and a
-    fresh pre-accept turn runs. `lazy ask` claims the same marker, so a second
-    `lazy ask` on a task that is already answering one is refused rather than
-    racing it.
-  - Concurrency: the whole accept orchestration runs under a process-level
-    per-task lifecycle lock (`src/daemon/task-lifecycle-lock.ts`). The daemon
-    serves RPCs concurrently, so without this a human accept and a builder
-    accept on the same task could both clear preflight and both run the merge —
-    leaving the task `blocked` while the merge was already applied. With the
-    lock the second accept waits, re-runs preflight, sees the accepted session
-    outcome, and returns "already accepted"; the merge runs exactly once.
-  - Parent must not be active (working/pairing/merging/interrupted) — merging
-    into a live worktree would corrupt whatever is running in it. ONE exemption:
-    a caller whose own task IS the merge destination, accepting one of its
-    subtasks over MCP. The exemption is an identity match on that destination
-    (`callerTaskId === parent.id`, set only at the MCP boundary from the tool
-    context, never from client input — so CLI callers can never reach it).
-    That "never from client input" is now literally true: the caller's task id
-    is derived from the per-session bearer token the daemon minted, and a
-    request whose URL claims a different task is refused outright. Until then
-    the id came from the URL path, which the caller wrote — so an agent could
-    name its own parent and take this exemption on a worktree it had no claim
-    to. See [Identity comes from the token, not the
-    URL](lazy-agent-design.md#identity-comes-from-the-token-not-the-url).
-    It covers two parent statuses, both of which mean "exactly one actor is in
-    that worktree, and it is the one blocked inside this very call":
-      - `working` — the parent's own agent is the caller.
-      - `pairing` — a human is driving that session interactively and is the
-        sole actor in the worktree, so an accept issued from it is that human's
-        decision.
-    `merging` and `interrupted` still refuse for everyone. Note that pairing
-    sessions are launched as builder-role Claude (`lazy pair` passes no
-    `--task-id`), so in practice a pairing session usually reaches MCP as the
-    builder with no `callerTaskId` and still gets the refusal; the exemption
-    fires only when the session really is task-scoped.
-  - A dirty destination worktree does not block the merge and is never lost:
-    the accept stashes the uncommitted work, merges, and pops it back. If the
-    stash cannot be reapplied the merge still stands and a
-    `DestinationRestoreConflict` surfaces with the retained stash SHA and
-    recovery steps. This is status-agnostic, so it covers the `pairing` parent —
-    the human's in-progress edits survive the accept. (`pairing`, like `working`,
-    is not in `UNBLOCKABLE_STATUSES`, so the conflict is surfaced to the human
-    as a warning rather than handed to an agent via unblock.)
-  - Actor attribution follows the channel: CLI → `human`, builder MCP →
-    `builder`, task-agent MCP → `agent`. An agent accepting its own subtask must
-    not read back later as a human's decision.
-  - Over MCP, a task agent may accept a DIRECT SUBTASK ONLY, never its own task
-    (`assertAgentMayTargetChildOnly` in `src/mcp/tools.ts`). Self-accept makes no
-    sense at any level of the hierarchy: accepting means "merge upward and mark
-    complete", so accepting yourself skips the review the task exists to be
-    subject to. Accepting a child merges into the agent's OWN branch, which a
-    human still reviews when the agent's task is accepted. Every other
-    task-targeting agent tool keeps the looser own-task-or-direct-child gate —
-    they merge and complete nothing, which keeps `lazy_unblock` reachable and the
-    create → start → wait → review → unblock → accept loop coherent. The builder
-    surface is unrestricted, so a builder-mode MCP session can still accept a
-    task directly.
+  - For remote tasks: creates/updates the PR/MR, waits for checks
+    - If the merge succeeds immediately → merging → complete
+    - If checks are pending or approval is needed → stays merging
+  - For local tasks: squash-merges into the parent branch → complete
+  - Ends the session and cleans up container/worktree/branch — after the task
+    is already `complete`: a failure there exits non-zero and is retried by the
+    daemon, but the accept stands
+  - Narrates itself phase by phase — see [Command observability](#command-observability)
+  - Status tracks the phase in flight: plain `working` while the opt-in
+    acceptance gate runs, `merging` for the whole merge phase. Every abort
+    restores the status the task actually had before the accept
+  - If the acceptance gate's run disappears without answering, the accept aborts
+    within seconds — reporting the run's exit code and last output, restoring
+    the task's prior status, and recording the reason on the task — instead of
+    waiting out the gate's full budget. The merge only proceeds on a verdict
+    that actually came from the gate
+  - Two accepts of the same task at once (say, a human and a builder) never
+    both merge: the second waits, sees the task already accepted, and says so
+  - The parent must not be active (working/pairing/merging/interrupted) —
+    merging into a live worktree would corrupt whatever is running in it. ONE
+    exemption: a task's own agent accepting one of its direct subtasks over MCP
+    while the parent is `working` (the agent asking is the one in that
+    worktree), or a human pairing on the parent in its container accepting from
+    that session while it is `pairing`. The caller's task identity comes from the token the daemon issued for its session, never
+    from anything the caller sends, so a CLI caller or a different task can
+    never claim it (see [Identity comes from the token, not the
+    URL](lazy-agent-design.md#identity-comes-from-the-token-not-the-url)).
+    `merging` and `interrupted` still refuse for everyone. Host pairing
+    (`lazy pair --host`) does not get the exemption
+  - Uncommitted work in the destination worktree does not block the merge and
+    is never lost: the accept sets it aside, merges, and puts it back. If it
+    cannot be put back cleanly, the merge still stands and lazy reports where the
+    work was kept and how to recover it
+  - Over MCP, a task agent may accept a DIRECT SUBTASK ONLY, never its own task:
+    accepting means "merge upward and mark complete", so accepting yourself
+    would skip the review the task exists for. Accepting a child merges into the
+    agent's own branch, which a human still reviews when that task is accepted.
+    Other agent tools allow the agent's own task or a direct child. The builder
+    is unrestricted
 
-- **`lazy reject <task>`** — blocked|interrupted → abandoned
-  - Opens $EDITOR for rejection reason
-  - Ends session, cleans up container/worktree/branch
+- **`lazy reject <task>`** — blocked|conflict|interrupted|submitted → abandoned
+  - On a `working` task, stops the agent first (working → interrupted → abandoned)
+  - Opens $EDITOR for the rejection reason
+  - Ends the session, cleans up container/worktree/branch
+  - Narrates itself phase by phase — see [Command observability](#command-observability)
 
-- **`lazy close <task>`** — blocked|interrupted → abandoned
-  - Opens $EDITOR for close reason
-  - Ends session, cleans up container/worktree/branch
-  - Resolves to the same `abandoned` terminal status as `lazy reject`; the two differ only in intent/reason, not status
+- **`lazy close <task>`** — backlog|blocked|conflict|interrupted|submitted → abandoned
+  - On a `working` task, stops the agent first (working → interrupted → abandoned)
+  - Opens $EDITOR for the close reason
+  - Ends the session, cleans up container/worktree/branch
+  - Resolves to the same `abandoned` status as `lazy reject`; the two differ only in intent/reason
+  - Narrates itself phase by phase — see [Command observability](#command-observability)
 
 - **`lazy reopen <task>`** — complete|abandoned → blocked|backlog
-  - For complete tasks: requires --reason, resets session, transitions to blocked
-  - For abandoned tasks: resets session if it exists, transitions to blocked or backlog
+  - For complete tasks: requires `--reason`, resets the session, returns to blocked
+  - For abandoned tasks: returns to blocked if the task had agent work, otherwise backlog
 
 #### Agent Actions
 
 - **Agent turn completes** — working → blocked | conflict
-  - Supervisor writes response.json with agent output
-  - Reconciler reads response.json, records agent turn
-  - If the response has file permission violations, or the session still carries
-    an unresolved pending set from an earlier turn → transitions to conflict
-  - Otherwise → transitions to blocked
-  - A turn that ran no permission check (an ask, a sync) reports nothing, and
-    "reported nothing" never clears a pending set
+  - The agent's turn is recorded
+  - If the turn produced file permission violations, or earlier ones are still
+    unresolved → conflict; otherwise → blocked
+  - A turn that runs no permission check (an ask, a sync) never clears
+    violations that are still pending
 
 - **Agent crashes** — working → interrupted
-  - Container exits without writing response.json
-  - Reconciler detects missing container, transitions to interrupted
-  - Auto-resume may kick in (see Crash/Resume Lifecycle below)
+  - The container or process exits without finishing the turn
+  - Auto-resume may kick in (see [Crash/Resume Lifecycle](#crashresume-lifecycle) below)
 
-#### System Actions (reconciler)
+#### System Actions (daemon)
 
-The reconciler runs automatically before `lazy list`, `lazy blocked`, `lazy active` commands. It performs several sweeps:
+The daemon keeps checking task state in the background and fixes up anything
+that has changed underneath it:
 
-1. **Working task sweep** — Process tasks in 'working' status:
-   - If response.json exists → record turn, transition to blocked
-   - If container running and no response → leave as working
-   - If container stopped without response → transition to interrupted, maybe auto-resume
-   - If no container and no response → transition to interrupted, maybe auto-resume
+- **Working tasks** — a finished turn is recorded and the task parks `blocked`
+  (or `conflict`). A task whose agent has died without finishing gets a crash
+  turn recorded — so `lazy show` shows what happened — and moves to
+  `interrupted`, where auto-resume may pick it up.
+- **Late answers** — if an agent's answer arrives after its task was already
+  marked `interrupted`, it is still recorded and the task parks `blocked`.
+- **Leftover containers** — containers still around for `complete` or
+  `abandoned` tasks are removed.
+- **Branches merged elsewhere** — a task whose branch is found merged into its
+  target is completed (via `zombie`).
+- **Dead pairing sessions** — a task left in `pairing` after its session ended
+  returns to `blocked`.
+- **Blocked tasks with no session** — moved back to `backlog`, which is where
+  unstarted work belongs.
 
-2. **Interrupted response sweep** — Process stale responses for interrupted tasks:
-   - Race condition fix: supervisor may write response.json after reconciler marks task interrupted
-   - If interrupted task has response.json → process it, transition to blocked
+## Only one turn runs at a time
 
-3. **Terminal container sweep** — Clean up orphaned containers:
-   - Tasks in complete/abandoned may have lingering containers if cleanup failed
-   - Remove container, clear container_name from session
+A task never has two turns dispatched at once. If an unblock, an ask and an
+automatic sync arrive together, the first one to claim the task wins, and the
+others see the task is busy:
 
-4. **Merged branch sweep** — Detect zombie tasks (branch merged but status not updated):
-   - For non-terminal tasks with sessions: check if branch merged into target
-   - If merged → set outcome='accepted', transition to zombie (system only) → complete
-   - Uses the `zombie` status as an intermediate state to maintain transition table integrity
-   - Prevents orphaned state where `lazy accept` succeeded but crashed before updating task
+- an ask or unblock is refused (409) **before** anything is recorded, so no
+  feedback is lost — send it again once the task is idle;
+- a sync re-queues itself and is reported as `pending_sync`, naming the status
+  it stood down for, and runs later.
 
-5. **Stale pairing sweep** — Recover tasks stuck in 'pairing':
-   - If pairing PID no longer exists → transition to blocked
-   - Cleans up pairing lock file
+A turn is only dispatched from `blocked`, `conflict`, `submitted` or
+`interrupted`. A task in `pairing` or `merging` is never handed a new turn.
 
-6. **Blocked-to-backlog migration** — One-time migration:
-   - If blocked task has no session → transition to backlog
-   - Separates "unstarted" (backlog) from "waiting for review" (blocked)
+## Command observability
 
-## Accept observability
+Several CLI commands can run for seconds or minutes — starting a task (worktree
+creation, branch publish, container launch), unblocking with feedback, merging
+upstream into a task, asking its agent a question, accepting a merge, or
+closing/rejecting a task (stopping the agent, remote PR cleanup, worktree
+teardown). They narrate what they are doing, phase by phase.
 
-An accept can run for minutes — a pre-accept agent turn, remote pushes, an
-LLM-written merge description, the merge itself. It used to print nothing for
-that whole window, which is indistinguishable from a hang. It now narrates.
+**How it looks on the terminal.** Before work begins, the command prints a
+numbered plan of the phases it expects to run. As each phase starts and
+finishes, you get a line — on a TTY the open phase repaints with a live elapsed
+counter; in piped or CI output the lines are append-only. Optional phases that
+do not apply (for example publishing a branch for a linked task, or stopping an
+agent that is not running) are listed up front and then reported as skipped with
+a reason.
 
-**The phase table is the single source of truth.** `src/daemon/progress.ts`
-declares every accept phase (id + label + whether it is optional) and the two
-plans built from it: the fresh-accept plan (`acceptPhasePlan`, which includes the
-pre-accept turn only when that step is enabled) and the remote-merge re-entry
-plan (`acceptReentryPhasePlan`: check remote state → finalize → clean up). The
-accept path executes phases from that same table, so the announced plan cannot
-drift from what actually runs.
+**A long phase keeps saying so.** Some phases do their work without anything to
+report as they go — fetching an upstream branch, creating a container. On a TTY
+the elapsed counter on the open line already shows that; in piped or CI output,
+where there is no line to repaint, the command adds a `still running (…)` line
+for the phase whenever roughly five seconds have passed with nothing printed. A
+phase that finishes quickly adds nothing. These lines follow the daemon's own
+liveness, so they stop when it stops — silence still means something is wrong.
 
-**How narration travels.** The daemon's `PhaseReporter` emits `ProgressEvent`s
-into the heartbeat envelope described in `src/daemon/heartbeat.ts` — the same
-NDJSON framing that already carried liveness, extended with a `{"progress": …}`
-line rather than forked:
+**Pre-flight is always a prelude.** Every command runs validation first — task
+and session checks, runner availability, dirty-worktree guards — and narrates
+that as an unnumbered step. The numbered plan is announced only once pre-flight
+knows which path applies.
 
-| Line | Meaning |
+The MCP tools for the same operations relay the same phases as progress
+notifications.
+
+| Command | Typical phases (after pre-flight) |
 | --- | --- |
-| `{"lazyEnvelope":1}` | preamble; the response is framed |
-| `{"heartbeat":<ms>,"phase":"Merge"}` | still alive, currently in this phase |
-| `{"progress":{…}}` | a plan announcement, or a phase start/done/skipped/failed |
-| `{"status":…,"body":…}` | the result |
+| `lazy start` | Resolve integration base → create worktree → publish branch (when applicable) → launch agent |
+| `lazy unblock` | Prepare worktree → record feedback turn → launch agent; plus resolve file-permission violations when the task has any |
+| `lazy sync` | Check task branch on origin → fetch and resolve upstream → compare with upstream → prepare worktree → launch agent to merge |
+| `lazy reparent` | Repoint task to new parent → then the whole sync plan above, as one continuous checklist |
+| `lazy resume` | Prepare worktree → launch agent |
+| `lazy ask` | Prepare worktree → launch agent → wait for the agent's answer |
+| `lazy accept` | Branch-protection and merge gates → merge description → merge → finalize → clean up |
+| `lazy close` | Update task status → clean up worktree (when the task had a session); stop running agent first when applicable |
+| `lazy reject` | Same as close, plus close the remote PR/MR when one exists. The reason is recorded on the task; nothing is written to the PR |
 
-A progress line also feeds the client's liveness callback: the daemon wrote it
-because its handler is running *now*, so a phase change resets any client
-deadline just as a heartbeat does.
+`lazy submit` is not in this table: it pushes the branch and marks the PR/MR
+ready for review, and launches no turn. It asks first: a protected target
+is a yes/no prompt (default No); an unprotected or unknown target requires
+typing the branch name or the task code. `--yes` skips that. MCP
+`lazy_submit` uses a `confirmation_code` instead — there is no `--yes`.
 
-Both client surfaces consume the same events:
+**Inside the launch phase.** Launching an agent is where a command can go quiet
+for the longest, because it may have to build the container image first. That
+interior is narrated under the launch phase itself, as indented continuation
+lines: which image is being resolved, whether a task-pinned or adopted image is
+in use, why a build is needed (no image for this lazy version yet, the Dockerfile
+or its inputs changed, or the image is older than the maximum age), the build's
+own output throttled to a readable rate, a `still building (…)` heartbeat while
+Docker is quiet, and finally whether the container was created or an already
+running one was reused. On a TTY these update the phase's line in place; piped,
+they append. The phase does not settle until the agent is actually launched, so
+the elapsed counter keeps running honestly throughout.
 
-| Surface | Rendering |
+Narration is strictly observational — it never changes whether the command
+succeeds or fails, and a phase is only marked failed when the command itself
+fails. A sync that finds nothing to merge still settles its compare phase with
+"already up to date" and reports the remaining phases as skipped, rather than
+ending in silence; a sync whose fetch fails is not an error either — it queues
+the task for retry and says so on the upstream phase's own line.
+
+### `lazy sync` reconciles two things, in order
+
+A task can be behind in two different ways, and sync handles both on the task's
+own branch:
+
+1. **The task's own branch on origin.** If a colleague has pushed commits to
+   `origin/<task-branch>` — a review fix, a rebase of your work, a hand-written
+   patch — those commits are merged into the worktree first. When the local
+   branch is simply behind, this fast-forwards; when both sides have moved, it
+   is a real merge, and any conflict is resolved by the task's own agent. The
+   step is skipped, with a one-line reason on its own phase, when the remote
+   driver is `local`, when lazy is offline, or when the branch is not on origin
+   yet.
+2. **The parent branch.** Fetched and merged into the task branch.
+
+Neither step ever touches, merges into, or pushes the parent branch — syncing a
+child does not reconcile its parent. Both merges are recorded on the task, so
+`lazy show` and the web review page name the ref and commit each one brought in
+("Merged origin/lazy/my-task @ 4f2ab19", then "Merged main @ 9c1de07").
+
+Sync itself never pushes. The reconciled branch reaches origin through the push
+that follows a turn, and through `lazy accept`.
+
+### Accept-specific behavior
+
+**Accept does not need a declaration.** It works from any park where the turn
+ended normally — declared done, parked for a decision, or simply stopped — and
+requires only that every open blocking item is resolved in the same command.
+Deciding those items with the work in front of you IS the declaration.
+
+The one park accept refuses is `interrupted`: a turn that was killed (watchdog,
+container death, `lazy stop`, a closed pairing session) has an unknown ending,
+because the agent never got to stop. Resume or unblock it first, or close it.
+Like every other acceptance precondition — branch sync, protection preflight,
+the review-issues gate — this is checked before anything is written, so a
+refusal leaves the task exactly as it was.
+
+An accept can run for minutes — an opt-in acceptance gate, remote pushes, an
+LLM-written merge description, the merge itself. The announced plan is the plan
+that runs: the acceptance gate appears in it only when enabled, and a later
+`lazy accept` on a task already waiting on the forge shows a shorter plan (check
+remote state → finalize → clean up).
+
+**The merge description is an enhancement, never a gate.** It is written by a
+one-shot agent run outside every git checkout, with write tools disabled and a
+ten-minute limit. If it fails or times out, the accept falls back to a plain
+list of the commits and proceeds. See
+[conversation-import.md](./conversation-import.md#where-a-one-shot-runs).
+
+**Status during an accept.** The narration tells the caller who is watching what
+the accept is doing; the task's status tells everyone else (`lazy list`,
+`lazy show`, MCP):
+
+| Accept phase | Status |
 | --- | --- |
-| `lazy accept` | `src/cli/phase-display.ts` — plan header, then one line per phase; on a TTY the open phase repaints with a live elapsed counter, off a TTY it is append-only |
-| MCP `lazy_accept` | `src/daemon/mcp-proxy.ts` relays each event as `notifications/progress` |
+| Acceptance gate (opt-in) | `working` |
+| Merge phase (description, merge, finalize) | `merging` |
+| Aborted at any point | the status held before the accept |
 
-Narration is strictly observational: a throwing or absent emitter cannot change
-the outcome of an accept, and an accept with nobody listening runs identically.
+No agent turn runs during the gate, so the task shows a bare `working` with no
+agent substate.
 
-**Pre-flight is a prelude, not a plan entry.** It runs before the plan is known
-(it is what decides which plan applies), so it is narrated with no `[n/m]`
-position and the plan is announced immediately after it.
+## Working, but not alive
 
-**Status during an accept.** The narration answers "what is it doing" for the
-caller who is watching; the task's own status answers it for everyone else
-(`lazy list`, `lazy show`, MCP):
+`working` is where the task is in its lifecycle; the part in brackets is what
+lazy can see running for it right now. `working(not-alive)` means the task is
+still recorded as mid-turn but nothing is running for it and no answer is
+waiting — the turn's process has died. It is a short-lived state: once the
+turn is at least 30 seconds old, the daemon's next check (every few seconds)
+either recovers a turn that had finished its work to `blocked`, or records the
+crash, moves the task to `interrupted` and resumes it automatically.
 
-| Accept phase | Status | Substate |
-| --- | --- | --- |
-| Pre-accept validation turn | `working` | `agent:pre-accept` |
-| Merge phase (description, merge, finalize) | `merging` | — |
-| Aborted at any point | the status held before the accept | — |
+Two things that look similar are not that:
 
-`agent:pre-accept` (`src/utils/working-substate.ts`, derived from the
-supervisor's `command_type`) exists because a bare `working` during an accept is
-indistinguishable from a human having unblocked the task by hand.
+- **`working(launching)`** — the daemon is still starting the turn's container
+  or process. Building the container image on a fresh machine or after an
+  upgrade can take minutes; the task is not dead, it has not started yet.
+- **A running review** — `lazy review` runs its reviewer separately from the
+  task's own agent, and the task reads `working(agent:reviewing)` for as long as
+  the reviewer is running. If the reviewer dies without answering, the review is
+  recorded as failed and the task goes back to the status it had before. A
+  review or `lazy ask` that was running when the daemon restarted cannot finish
+  — the restart cuts it off from the model — so the new daemon stops it, records
+  it as failed, and puts the task back the same way.
+- **Plain `working`, no brackets** — the run is starting up or its answer is
+  being collected, or the container runtime did not answer when lazy asked
+  about the run (a busy Docker, for example), so its liveness is unknown rather
+  than dead. `lazy daemon health` names that last case as a warning with the
+  reason.
+
+A task that reads `working(not-alive)` for more than a minute or so is a bug
+worth reporting. Include the `liveness` and `session` parts of
+`lazy show <task> --json` and the output of
+`lazy daemon logs <short-id> --no-follow -n 20000`, where `<short-id>` is the
+first 8 characters of the task's `id` in that JSON (daemon log lines name tasks
+that way).
 
 ## Waiting on subtasks
 
-An agent that decomposes its work into subtasks drives them with blocking lazy
-tools — `lazy_wait` (long-poll until a subtask finishes its turn) and `lazy_ask`
-(resume a subtask's agent and wait for its answer). For that whole stretch the
-parent agent is doing nothing, yet every read surface showed it as
-`working(agent)`: indistinguishable from an agent thinking hard for twenty
-minutes.
+An agent that splits its work into subtasks drives them with blocking lazy
+tools — `lazy_wait` (wait until a subtask finishes its turn) and `lazy_ask`
+(ask a subtask's agent a question and wait for the answer). While blocked in one
+of those calls the parent agent is doing nothing, and lazy shows that instead of
+a plain `working(agent)`:
 
-**The signal is the call itself, not the agent's output.** Every agent tool call
-— container runner and host-process runner alike — is forwarded by
-`src/daemon/mcp-proxy.ts` to the daemon's `POST /mcp/:taskId/:toolName` route and
-authenticates with a per-session MCP token. So `handleMcpToolCall` already knows
-which task is blocked, on what, and since when. Nothing here parses agent stdout.
+```
+working(waiting on fix-foo (2m10s))
+```
 
-| Piece | Where |
-| --- | --- |
-| Which tools park the caller | `BLOCKING_WAIT_TOOLS` in `src/daemon/wait-registry.ts` (`lazy_wait`, `lazy_ask`) |
-| Wrapping a blocking call | `trackWait()`, called from `handleMcpToolCall` |
-| Live marker readers see | `waiting.json` in the task's protocol dir (`src/protocol/waiting.ts`) |
-| Substate derivation + label | `src/utils/working-substate.ts` (`{ kind: 'waiting' }`) |
-| Durable intervals | `Storage.recordWaitStart/recordWaitEnd/readWaitIntervals` |
+This appears in `lazy list`, `lazy active`, `lazy status`, `lazy show`,
+`lazy watch`, and the MCP `substate` field. Two concurrent waits list both
+labels; a larger fan-out is summarized (`waiting on a, b +2`).
 
-**Rendering.** `working(waiting on fix-foo (2m10s))` across `lazy list`,
-`lazy active`, `lazy status`, `lazy show`, `lazy watch`, and the MCP `substate`
-field — all of them go through the shared derivation, so they cannot drift. Two
-concurrent waits list both labels; a larger fan-out summarizes
-(`waiting on a, b +2`).
+Waiting outranks the turn-flavour substates (`agent:answering`,
+`agent:reviewing`) — those say what the turn *is*, `waiting` says what it is
+doing this second. A lazy-side phase (`harness:<phase>`) outranks waiting, and a
+dead run still reads `not-alive`. If the daemon is killed mid-wait, the marker
+is disregarded and the task falls back to `working(agent)`.
 
-**Precedence.** Within an agent phase, `waiting` outranks `agent:answering` and
-`agent:pre-accept`: those say what the turn *is*, `waiting` says what it is doing
-this second. A harness phase outranks `waiting` — there the supervisor, not the
-agent, is the active thing. A dead run still reads `not-alive`; a wait marker
-never resurrects a stranded task.
-
-**Clearing is on settle, not on response delivery.** `trackWait` clears from a
-`finally`, so a call whose MCP client already disconnected — which the daemon
-finishes anyway (complete-anyway semantics) — still clears. The marker also
-carries the writing daemon's pid: a reader that finds that pid dead treats the
-whole file as stale and reports no waits, so a SIGKILLed daemon degrades to the
-pre-existing `working(agent)` rather than to a lie. `cleanProtocol` removes the
-file at turn teardown, and a clean daemon stop clears every marker it owns.
-
-### Persisted wait intervals
-
-The same bookkeeping writes a durable record, because waited time is not the
-agent's time: a turn that spent two hours blocked on a subtask must not bill
-those two hours to the agent in duration or economics reports.
-
-Intervals live in `<storagePath>/waits/intervals.jsonl` — shared JSONL used by
-every backend (the same reasoning as trace spans: telemetry-shaped, append-only
-data earns no table and no migration, and the cross-backend row shape is
-byte-identical by construction).
-
-The file is **event-structured**: a wait writes one `start` line when it begins
-and one `end` line when it settles, folded on read. That is what makes a crash
-readable — an interval whose `end` never arrived reads back with
-`ended_at: null` and `outcome: null`, the documented "died mid-wait" shape,
-rather than vanishing. Consumers should treat such an interval as open, bounded
-above by the turn's end.
-
-`turn_sequence` is **best-effort by construction**: agent turns are only written
-when the turn ends, so at wait time the only thing available is the next unused
-sequence. A consumer that needs certainty should attribute by time overlap with
-the turn's own window and use the field as a hint.
-
-Every write is wrapped in a catch: a wait that cannot be recorded still waits.
-An agent must never lose `lazy_wait` because an observability write failed.
+Time spent waiting is recorded separately from the agent's own working time, so
+a turn that spent two hours blocked on a subtask does not bill those two hours
+to the agent in duration or cost reports. A failure to record a wait never
+affects the wait itself.
 
 ## Agent-reported progress
 
-The working substate answers *who is active* — agent, harness, a wait, nothing.
-It cannot answer *doing what*: `working(agent)` looks identical for an agent
-reproducing a bug, running a migration, and re-reading the same file for the
-ninth time. `lazy_update_progress` is the complementary channel — the agent
-posts a short human-readable line and every surface that already renders the
-substate folds it in.
+The working substate answers *who is active* — agent, lazy, a wait, nothing.
+It cannot answer *doing what*. `lazy_update_progress` fills that gap: the agent
+posts a short line and every surface that shows the substate folds it in:
 
-**Ephemeral, latest-wins, never history.** A progress line is worthless five
-minutes after it was written, so it never reaches Storage: permanent storage of a
-self-reported status blurb would be a second, worse turn log. Each call replaces
-the previous message; there is no history and there must not be one. What *is*
-durable about a turn (rationale, decisions, deferrals) belongs in the journal.
+```
+working(agent: running migration 3/7)
+```
 
-| Piece | Where |
-| --- | --- |
-| The tool | `lazy_update_progress` (`src/mcp/tools.ts`) — agent-only, requires a task context |
-| Daemon-side writer | `recordProgress()` in `src/daemon/progress-registry.ts` |
-| Live marker readers see | `progress.json` in the task's protocol dir (`src/protocol/progress.ts`) |
-| Substate decoration + label | `src/utils/working-substate.ts` (`WorkingSubstate.progress`) |
+- **Latest wins, no history.** Each call replaces the previous line, and
+  nothing is kept — a progress line is worthless five minutes later. What is
+  worth keeping about a turn (rationale, decisions, deferrals) belongs in the
+  journal.
+- **Bounded.** The line is whitespace-collapsed and capped at 120 characters.
+  Longer messages are truncated, never rejected, and the agent is told.
+- **Only while the agent is active.** It decorates `agent`, `agent:answering`,
+  `agent:reviewing` and `waiting on …`, never `harness:<phase>` or `not-alive`.
+- **Cleared with the turn.** Every new turn starts with no progress line, so a
+  message from a finished turn never lingers.
 
-**Who writes it.** The daemon, for the same reason it writes `waiting.json`:
-every agent tool call authenticates with a per-session MCP token, so
-`handleMcpToolCall` already knows which task is reporting. Nothing parses agent
-stdout, and no client writes the marker directly.
-
-**Rendering.** `working(agent: running migration 3/7)` across `lazy list`,
-`lazy active`, `lazy status`, `lazy show`, `lazy watch`, and the MCP `substate`
-field — one shared derivation, so the surfaces cannot drift. The line is
-whitespace-collapsed and capped at 120 characters at the write boundary (and
-again on read, so a foreign file cannot break a table cell). Over-length messages
-are **truncated, never rejected**, and the truncation is echoed back to the agent
-rather than being silent.
-
-**Precedence.** The progress line decorates only the kinds where the *agent* is
-the active thing: `agent`, `agent:answering`, `agent:pre-accept`, and
-`waiting on …`. It is deliberately absent from `harness:<phase>` — that phase is
-the supervisor's work, and showing the agent's last line there would report a
-claim about a turn phase that has already ended — and from `not-alive`.
-
-**Clearing is structural, not remembered.** `writeCommand` deletes
-`progress.json`, and every turn begins with a command, so a new turn always begins
-with no progress: a message from a finished turn cannot linger. Belt and braces
-around that: the substate only renders while a live `status.json` exists,
-`cleanProtocol` removes the file at turn teardown, a clean daemon stop clears
-every marker it owns, and the marker carries the writing process's pid so a
-reader that finds it dead disbelieves the file and reports no progress.
-
-**Bookkeeping never breaks the call it observes.** Every write in the registry is
-wrapped in a catch. A progress post that cannot be recorded is a lost status
-line; losing a status line must never cost an agent its tool call, let alone its
-turn.
+A progress post that cannot be recorded is simply lost; it never costs the agent
+its tool call.
 
 ## Agent Failure Classification
 
-Not every agent failure deserves the same response. A rate limit clears on its own;
-a revoked credential never does. The supervisor therefore never inspects error text
-itself — it asks the **agent** what went wrong and acts on the class it gets back.
+Not every agent failure deserves the same response. A rate limit clears on its
+own; a revoked credential never does. So lazy sorts each failure into a class
+and acts on the class.
 
-This is the *runtime* half of credential handling. The *start-time* half is the
-daemon credential gate (`src/daemon/credential-gate.ts`): a daemon with no
-credential at all never comes up in the first place, on any start path, so the
-`fatal_auth` class below is about credentials that were present at start and
-stopped working — not about a daemon that never had one.
+This is about credentials and conditions that go bad *while a task runs*. A
+daemon with no credential at all refuses to start in the first place.
 
 ### The taxonomy
 
-Each agent implements `classifyFailure()` (`src/agent/interface.ts`) and maps its own
-raw stderr / stdout error / exit code onto the shared vocabulary in
-`src/agent/failure-taxonomy.ts`:
-
-| Class | Examples | Supervisor behavior |
+| Class | Examples | Behaviour |
 |---|---|---|
 | `fatal_auth` | 401/403, invalid API key, missing credential, credit balance exhausted | Stop on the first failure |
 | `fatal_config` | unknown flag, invalid model, agent binary missing (exit 127) | Stop on the first failure |
-| `transient_overload` | 429, 529, 503, "overloaded" | Retry forever, 5s→60s |
-| `transient_network` | ECONNRESET, ETIMEDOUT, socket hang up, `fetch failed` | Retry forever, 5s→60s |
-| `transient_unreachable` | ECONNREFUSED, ENOTFOUND | Retry 5s→60s, **bounded** at 12 attempts (~9 min), then treated as unrecoverable |
+| `transient_overload` | 429, 529, 503, "overloaded" | Retry indefinitely, 5s→60s |
+| `transient_network` | ECONNRESET, ETIMEDOUT, socket hang up, `fetch failed` | Retry indefinitely, 5s→60s |
+| `transient_unreachable` | ECONNREFUSED, ENOTFOUND | Retry 5s→60s, **bounded** at 12 attempts (~9 min), then stop |
 | `unknown` | anything unrecognized | Retry 15s→60s; the crash-loop detector still applies |
 
-A classifier that does not recognize a failure returns `unknown` rather than guessing.
-A wrong `fatal_*` blocks a task that would have recovered — the more expensive mistake.
+A failure lazy does not recognize is classed `unknown` rather than guessed at —
+wrongly calling a failure fatal would block a task that would have recovered.
 
-Agent-specific dialects (Claude Code's "Invalid API key · Please run /login", Cursor's
-"not logged in") are matched in that agent's implementation; shared HTTP/socket signals
-live in `classifyCommonFailureSignals()`.
+Each agent's own wording is recognized too (Claude Code's "Invalid API key ·
+Please run /login", Cursor's "not logged in").
 
 ### Retry pacing
 
-`src/supervisor/retry-policy.ts` is a pure function of `(class, attempt)` and is the only
-place cadence is decided. Transients use 5s → 10s → 20s → 40s → 60s (capped) — roughly 60
-retries an hour. The previous uniform ladder (30s → 300s) managed about 12, which in a live
-incident meant two attempts in five minutes on a condition that could never recover.
+Transient failures are retried at 5s → 10s → 20s → 40s → 60s (capped) —
+roughly 60 retries an hour.
 
-The fast-fail crash-loop detector (3 failures under 10s each) is **disabled** for transient
-classes: a 429 comes back in milliseconds, so three in a row would abort a turn that was
-about to succeed. It remains the bound for `unknown`.
+The crash-loop detector (3 failures in a row, each under 10s) does **not** apply
+to transient classes: a 429 comes back in milliseconds, so three in a row would
+abort a turn that was about to succeed. It remains the bound for `unknown`.
 
-`transient_unreachable` is the deliberate middle ground for the ConnectionRefused case:
-a refused connection to a local proxy can heal if the proxy restarts, so it is retried
-generously, but a proxy that never returns must not spin forever. After the attempt cap it
-escalates to a stop.
+`transient_unreachable` sits in between: a refused connection to a local proxy
+can heal if the proxy restarts, so it is retried generously, but not forever.
 
 ### What "stop" means
 
-When the policy says stop, the supervisor throws `FatalAgentError` and writes the class,
-reason, and attempt count into `response.json` (`failure_class`, `failure_reason`,
-`failure_attempts`). The reconciler treats a set, non-`unknown` `failure_class` as the signal
-to move the task to **`blocked`** — not `interrupted` — and records the classified reason as
-an interrupt. This matters because `maybeAutoResume` only ever fires on `interrupted` tasks;
-`blocked` is what actually stops the reconciler from relaunching into a dead condition, and
-puts the task in front of a human with the reason attached.
+When a failure is classed fatal (or `transient_unreachable` runs out of
+attempts), the turn ends and the task moves to **`blocked`** — not
+`interrupted` — with the class and reason recorded on it. Auto-resume only ever
+restarts `interrupted` tasks, so this is what keeps lazy from relaunching into a
+condition that will not clear, and puts the task in front of you with the reason
+attached.
 
-### The crash-loop backstop reports, it does not judge
+A crash loop is different: its class is always `unknown`, recorded for
+diagnosis only. The task goes to `interrupted` and is auto-resumed, because
+many crash-loop causes are transient.
 
-The fast-crash-loop detector (3 failures under 10s) throws `CrashLoopError`, which writes the
-same three fields. Its class is always `unknown` — the detector runs for no other class (see
-`appliesFastFailDetection`) — and `unknown` on the wire is **diagnosis only**: the task still
-goes to `interrupted` with auto-resume, because many crash-loop causes are transient. Before
-this, the backstop threw a bare `Error` and the whole classification was dropped, so the
-recorded turn said only `Crash loop detected: …` with no class or attempt count.
+Conditions that never clear on their own are kept out of `unknown`. A Cursor
+plan quota spent or a spend limit reached is `fatal_auth`; Claude's `usage limit
+reached` is a 5-hour window that clears by itself and stays
+`transient_overload`. A Cursor quota message is only fatal when nothing in it
+says the limit clears soon: a rate-limit marker or a short reset horizon
+("resets in 20 minutes") stays `transient_overload`, while a reset stated as a
+*date* ("when your monthly cycle ends on 9/19/2026") does not. When in doubt,
+lazy retries.
 
-Agent classifiers must therefore keep unrecoverable conditions *out* of `unknown`. Cursor's
-`ActionRequiredError` (plan quota spent, spend limit needed) is `fatal_auth` for exactly this
-reason; Claude's `usage limit reached` is a self-healing 5-hour window and stays
-`transient_overload`. Both live in each agent's own classifier, never in the shared signals.
+### Seeing what is being retried
 
-The Cursor verdict is narrower than the wording alone: quota phrasing is fatal only when
-nothing in the message says the wall clears by itself. A rate-limit marker, or a reset horizon
-stated as a short duration ("resets in 20 minutes"), falls through to the shared signals and
-stays `transient_overload` — a horizon stated as a *date* ("when your monthly cycle ends on
-9/19/2026") does not, because no retry ladder outlives it. Ambiguity resolves toward retrying:
-a wrong `fatal_*` blocks work that would have finished.
+While a turn is retrying, lazy shows one line saying what and why — for example
+`attempt 7 (transient_overload): API Error: 529 overloaded`, with the error
+snippet truncated — in all of:
 
-Live retry state (class, reason, next delay) is also projected into `status.json`
-(`retry_failure_class`, `retry_failure_reason`, `retry_next_delay_ms`) for presentation
-surfaces to render.
+- the `lazy watch` / `lazy status` header
+- the `lazy list` / `lazy active` substate
+- the "Retry State" block in `lazy show`
+- the supervisor log (`Phase: retrying …`)
+- `retry_status` in MCP `lazy_show`, so a builder can tell a task stuck retrying
+  from a healthy `working` one
 
-### Rendering "what is being retried"
+### Watchdog kills
 
-`phase=retrying` on its own tells a human nothing — the question in a live stall is always
-*retrying what, and why*. `src/utils/retry-summary.ts` is the single formatting seam:
-`formatRetrySummary()` turns the `status.json` retry projection into one line
-(`attempt 7 (transient_overload): API Error: 529 overloaded`), truncating the error
-snippet to a bounded length. Every surface renders through it, so they cannot drift:
+A no-progress watchdog kill has no error to classify — lazy killed the agent
+itself, after `[agent] watchdog_output_timeout_ms` (default **30 minutes**; the
+timer resets on every completed step) passed with no forward progress. What
+happens next depends on one question:
 
-| Surface | Where |
-| --- | --- |
-| `lazy watch` / `lazy status` header | `src/cli/status-header.ts` |
-| `lazy list` / `lazy active` substate | `src/utils/working-substate.ts` (harness variant carries `retry`) |
-| `lazy show` "Retry State" block | `src/cli/commands/show.ts` |
-| Supervisor log (`Phase: retrying …`) | `src/supervisor/retry-status.ts` |
-| MCP `lazy_show` → `retry_status` | `src/mcp/tools.ts` (`buildRetryStatus`) |
-
-The MCP field exists because a builder driving tasks over MCP has no host CLI: without it,
-a task stuck in the retry loop is indistinguishable from a healthy `working` one.
-
-Surfaces that render both a header and a substate suffix (watch) or a status word and a
-detail block (show) strip `retry` from the secondary copy — the detail is printed once per
-line, not two or three times.
-
-### Watchdog kills are outside the taxonomy
-
-A no-progress watchdog kill has no error text to classify — lazy killed the process itself,
-after `[agent] watchdog_output_timeout_ms` (default **30 minutes**, and the timer resets on
-every completed step) passed with no forward progress. So it is not routed through
-`classifyFailure()`; it is decided by one question, in `decideWatchdogRetry()`:
-
-| Did the turn capture anything? | Behavior |
+| Did the turn capture anything? | Behaviour |
 |---|---|
-| **Yes** — a final result was on the wire, or the turn added commits | Not retried. The work is already on disk, so relaunching would repeat it or wedge the same way; the turn ends and a human reads what was captured |
-| **No** — no result, no new commits | Relaunched in-turn with transient-style backoff (5s → 10s), bounded at 3 attempts. Each attempt costs a full no-progress window, so the bound is far tighter than `UNREACHABLE_MAX_ATTEMPTS` |
+| **Yes** — a final result, or new commits | Not retried. The work is already on disk, so relaunching would repeat it or hang the same way; the turn ends and you read what was captured |
+| **No** — no result, no new commits | Relaunched within the turn (5s → 10s backoff), at most 3 attempts. Each attempt costs a full no-progress window, so the bound is tight |
 
-The zero-work branch exists because the "work is already on disk" rationale is false in the
-case that hurts most: during a provider incident a task sat 45 minutes in `working` with its
-*first* model call hung — nothing captured, nothing to repeat — and a relaunch is exactly
-what heals it. If the commit probe cannot read git, the kill is treated as zero-work
-(fail toward retrying).
+If lazy cannot read git to check for commits, it treats the kill as having
+captured nothing and retries.
 
-A watchdog kill carries no `failure_class`, so when it does end the turn the reconciler
-routes it to **`interrupted`** with bounded auto-resume, not `blocked`. The recorded turn and
-the session's `interrupt_reason` are rendered by `src/utils/watchdog-turn.ts` — one place, shared
-by work turns and the ask path — and say which guard fired, what its limit was, that
-keep-alives are not progress, and whether lazy already relaunched.
+When a watchdog kill ends the turn, the task goes to **`interrupted`** with
+auto-resume, not `blocked`. The recorded turn and the interrupt reason say which
+guard fired, what its limit was, that keep-alive output does not count as
+progress, and whether lazy already relaunched.
 
 ## Crash/Resume Lifecycle
 
-When an agent crashes mid-turn, Lazy automatically detects the failure and attempts to resume the task. This section describes the full lifecycle.
-
-### 1. Detection
-
-The reconciler runs on every `lazy list`, `lazy blocked`, `lazy active` invocation. It scans tasks in 'working' status and checks:
-
-- Does the supervisor container/process still exist?
-- Has it written a response.json file?
-- How long has it been since the task transitioned to 'working'?
-
-**Grace period**: Newly-working tasks (last_interaction_at within 30 seconds) are skipped to give the container time to start. This prevents a race where reconciliation runs before the container finishes launching.
-
-If a working task has:
-- No response.json
-- No running container
-- Grace period expired
-
-Then the task is marked as interrupted.
-
-### 2. Classification: Clean vs Dirty Worktree
-
-Once a crash is detected, the reconciler checks `hasUncommittedChanges(worktreePath)` to classify the crash:
-
-- **Clean worktree**: Agent crashed before making edits, or successfully committed all changes before crashing
-- **Dirty worktree**: Agent was mid-edit when it crashed, leaving uncommitted changes
-
-This classification determines the auto-resume strategy.
-
-### 3. Recording the Interrupt
-
-The reconciler transitions the task to 'interrupted' and records diagnostics:
-
-```typescript
-await storage.updateTaskStatus(taskId, 'interrupted', 'system');
-await storage.recordInterrupt(session.id, {
-  reason: exitCodeToReason(exitCode),  // e.g., "OOM killed or SIGKILL (exit code 137)"
-  exit_code: exitCode,
-  logs: runner.getRunLogs(containerName, 50),  // Last 50 lines
-});
-```
-
-The `recordInterrupt` call increments the `consecutive_interruptions` counter, which is used by the circuit breaker.
-
-### 4. Circuit Breaker Check
-
-Before attempting auto-resume, the reconciler checks:
-
-```typescript
-if (session.consecutive_interruptions >= MAX_CONSECUTIVE_INTERRUPTIONS) {
-  // MAX_CONSECUTIVE_INTERRUPTIONS = 3
-  logger.warn('Circuit breaker triggered, not auto-resuming');
-  return;
-}
-```
-
-If the circuit breaker fires, the task stays in 'interrupted' state until a human manually intervenes with `lazy resume` or `lazy unblock`.
-
-**Rationale**: Prevents infinite crash loops. If an agent crashes 3 times in a row without completing a turn, something is fundamentally wrong (OOM, broken dependencies, infinite loop, etc.). A human needs to investigate.
-
-### 5. Auto-Resume: Clean Worktree Path
-
-If the worktree is clean (no uncommitted changes), the auto-resume flow is:
-
-1. **Resolve parent branch** (same logic as normal unblock):
-   - For child tasks: parent's branch (`lazy/<parent-ref>`)
-   - For root tasks: `task.metadata.remote_target_branch` or 'main'
-
-2. **Merge upstream** (INVARIANT: every unblock merges upstream):
-   - Set `sync_before_work: true` in the UnblockCommand
-   - Supervisor merges parent/main into task branch before agent resumes
-   - Prevents branch drift (see CLAUDE.md architectural invariants)
-
-3. **Build crash context prompt**:
-   ```
-   You are being resumed after a crash. Upstream has been merged into your branch
-   since your last turn. Don't assume your previous state is intact — verify before
-   continuing.
-   ```
-
-4. **Write UnblockCommand** to protocol directory with:
-   - `parent_branch` set (for upstream merge)
-   - `sync_before_work: true`
-   - Crash context prepended to the resume prompt
-
-5. **Record synthetic human turn**:
-   ```typescript
-   await storage.createTurn({
-     sessionId: session.id,
-     sequence: nextSeq,
-     role: 'human',
-     content: '[system] Session interrupted and auto-resumed',
-     actor: 'system',
-   });
-   ```
-
-6. **Transition to working**:
-   ```typescript
-   await storage.setAutoResumed(session.id, true);
-   await storage.updateTaskStatus(task.id, 'working', 'system');
-   ```
-
-7. **Launch supervisor** (or write command if already running):
-   - If container exists: just write UnblockCommand, supervisor picks it up
-   - If container gone: launch new supervisor container
-
-The agent resumes with full Claude Code `/resume` context (conversation history), but filesystem state reflects the crash — it must verify assumptions before continuing.
-
-### 6. Auto-Resume: Dirty Worktree Path
-
-If the worktree has uncommitted changes, the auto-resume flow is:
-
-1. **Skip upstream merge**:
-   - Set `sync_before_work: false`
-   - Merging upstream on a dirty worktree would fail (`git merge` refuses) or create confusing state (stashed changes, lost edits)
-
-2. **Build crash context prompt**:
-   ```
-   You are being resumed after a crash. There are uncommitted changes in your worktree
-   from your interrupted turn. Review them, decide what to keep, commit or discard,
-   then continue your work.
-   ```
-
-3. **Write UnblockCommand** with:
-   - No `parent_branch` (skip merge)
-   - `sync_before_work: false`
-   - Crash context prepended to resume prompt
-
-4. **Record synthetic human turn**, transition to working, launch supervisor** (same as clean path)
-
-The agent resumes and sees uncommitted changes. It must decide what to do with them (commit, discard, edit further) before making progress.
-
-### 7. Session Resume and Conversation Context
-
-When the supervisor launches, it:
-
-1. Looks for the Claude session ID in the sandbox's `.claude/projects/` directory
-2. Passes `agent_session_id` to the capture layer
-3. Claude Code's `/resume` functionality restores the full conversation history
-
-**Filesystem state depends on crash timing**:
-
-- **Crash before any edits**: Worktree clean, no conversation context lost
-- **Crash mid-edit**: Worktree dirty, conversation context intact, but file edits partially complete
-- **Crash after commit but before response.json**: Worktree clean (changes committed), conversation context intact, agent picks up from last commit
-
-The conversation transcript is preserved, but the agent must verify filesystem state — the crash may have interrupted file writes, git operations, or tool calls.
-
-### 7b. Feedback Redelivery (never lose human feedback)
-
-**INVARIANT (CLAUDE.md)**: a turn whose feedback was recorded but never consumed is
-re-delivered **verbatim** when the task resumes — for **any** crash cause.
-
-The gap this closes: feedback is persisted *before* the container launches (save first,
-act second). If the work phase then crashes, the feedback exists in the store but the
-agent never read it. Resuming with the generic "your previous session was interrupted,
-carry on" prompt leaves that feedback available only *implicitly* via turn-history
-injection — and in practice the agent does not act on it.
-
-**Tracking.** Delivery state lives explicitly on the turn (`Turn.feedback_delivery`):
-
-| Value | Meaning |
-| --- | --- |
-| absent | The turn carries no redeliverable feedback (system resume notices, supervisor `sync`/`nudge` turns, stop reasons). Never triggers redelivery. |
-| `pending` | Feedback is persisted but no agent response has consumed it. |
-| `consumed` | An agent response completed after this feedback was delivered. |
-
-Turns created with `carriesFeedback: true` start as `pending`: the initial task prompt
-(`task-launcher`), `lazy unblock`, `lazy ask`, and auto-delivered comments/CI output
-(`auto-deliver` — actor `system`, but the *content* is human).
-
-**Why an explicit marker and not "is there an agent turn after it?"** Because a crash
-records an agent *error* turn. That turn consumed nothing, so the positional proxy would
-mask exactly the case redelivery exists for.
-
-**Marking consumed.** `storage.markFeedbackConsumed(sessionId)` flips every `pending`
-turn in the session to `consumed`. It is called wherever an agent response completes
-normally — `handleCompletedResponse`, the stranded-session recovery, and the ask
-recorder — and deliberately **not** in the error paths. Clearing the whole backlog at
-once is what makes redelivery idempotent: a turn that *did* consume its feedback can
-never be re-delivered into.
-
-**Redelivering.** Both resume paths (`autoResumeTask` and `lazy resume`) call
-`findPendingFeedback()`; when it returns a turn, the redelivery block **replaces** the
-generic resume context in the prompt. The newest pending turn is reproduced verbatim
-(never summarized or truncated); if older pending turns exist, the prompt says how many
-so a queue is never silently collapsed. The synthetic resume turn itself does *not*
-carry feedback, so a crash during the resume re-delivers the same feedback again.
-
-Rows written before this field existed read as "carries no feedback" — the correct
-reading, since resurrecting them now would be a stale redelivery.
-
-### 8. Three Crash Scenarios in Detail
-
-#### Scenario A: Crash Before Any Edits
-
-```
-Agent starts turn → reads files → analyzes → CRASH
-```
-
-**State**:
-- Worktree clean (no edits made)
-- No commits made this turn
-- Conversation history intact (agent read messages, maybe sent partial response)
-
-**Auto-resume flow**:
-- Clean worktree path
-- Merge upstream
-- Agent resumes: "You crashed before making changes. Upstream was merged. Verify assumptions and continue."
-
-#### Scenario B: Crash Mid-Edit with Uncommitted Changes
-
-```
-Agent starts turn → edits file A → edits file B → CRASH (file B half-written)
-```
-
-**State**:
-- Worktree dirty (file A fully edited, file B partially edited)
-- No commits made
-- Conversation history intact (agent may have sent tool calls for edits)
-
-**Auto-resume flow**:
-- Dirty worktree path
-- Skip upstream merge
-- Agent resumes: "You crashed with uncommitted changes. Review them (file A done, file B partial). Commit, fix, or discard."
-
-#### Scenario C: Crash After Commit But Before response.json
-
-```
-Agent starts turn → edits files → commits → CRASH (before writing response.json)
-```
-
-**State**:
-- Worktree clean (changes committed)
-- Commits exist on branch
-- Conversation history intact but response may be incomplete
-- No response.json written → reconciler doesn't know about the commit yet
-
-**Auto-resume flow**:
-- Clean worktree path
-- Merge upstream
-- Agent resumes: "You crashed after committing. Upstream was merged. Your commit is on the branch. Verify and continue."
-
-**Reconciler behavior**: On next successful turn, the reconciler will detect the "new" commit (it compares session.git_start_sha with current HEAD) and record it.
-
-### 9. Special Cases and Edge Cases
-
-#### Merge-and-Fix Failures
-
-If the supervisor crashes during the `merge_and_fix` phase (upstream merge failed with conflicts), auto-resume is **disabled**:
-
-```typescript
-if (response.phase === 'merge_and_fix') {
-  logger.warn('merge-and-fix failed, not auto-resuming (task needs human investigation)');
-  // Task stays interrupted
-}
-```
-
-**Rationale**: The task cannot make progress without a successful upstream merge. Auto-resuming would start a new turn on a stale branch, diverging further from upstream. A human must investigate the merge conflict.
-
-#### Error Responses
-
-The supervisor can write an error response.json (instead of a completed response):
-
-```json
-{
-  "status": "error",
-  "phase": "capture" | "merge_and_fix" | "supervisor",
-  "error": "...",
-  "exit_code": 137,
-  "stderr": "..."
-}
-```
-
-When the reconciler sees an error response:
-
-1. Record agent error turn (visible in `lazy show`)
-2. Transition to interrupted
-3. Record interrupt diagnostics
-4. Auto-resume if allowed (unless merge-and-fix failure)
-
-This gives visibility into crash details while still attempting recovery.
-
-#### Interrupted Response Sweep (Race Condition Fix)
-
-**Problem**: The reconciler moves a task to 'interrupted' due to a supervisor error, but the supervisor may have already picked up the next command (written by `lazy resume` or `lazy unblock`) and completed it. The new response.json sits unconsumed because the reconciler only looked at working tasks.
-
-**Solution**: After the primary working task sweep, the reconciler runs a secondary sweep over interrupted tasks:
-
-```typescript
-const interruptedTasks = await storage.listTasksWithOptions({ interruptedOnly: true });
-for (const task of interruptedTasks) {
-  const response = readResponse(protoDir);
-  if (response?.status === 'completed') {
-    // Stale response found — process it, transition to blocked
-    await handleCompletedResponse(...);
-  }
-}
-```
-
-This ensures a response the reconciler has not read yet is still processed when the task has already moved to interrupted.
-
-#### Superseded Response Sweep
-
-The sweep above catches a response the reconciler had not looked at yet. It does
-not catch a response that was overwritten before anyone read it.
-
-**Problem**: every command the host sends the agent is a file, and so is every
-response the agent sends back. Sending a new command used to delete an unread
-response first, so that the agent's next turn did not look already-answered. If
-the agent had just finished a turn when you ran `lazy unblock`, that finished
-turn was deleted unread: it never appeared in `lazy show`, and because the same
-step is what records which agent session the turn ran in, `lazy pair` opened an
-empty session instead of resuming it.
-
-**Solution**: an unread response is now set aside rather than deleted, and a
-reconciler sweep records it. The displaced turn shows up in the task's history
-like any other turn, and the session it ran in is recovered, so `lazy pair`
-resumes where the agent left off.
-
-A recovered turn is recorded as **history only** — it does not change the task's
-status and does not disturb whatever turn is running now; the newer turn owns
-the task's current state. If a turn's output genuinely cannot be recovered, the
-daemon log says so and names the task, rather than the turn disappearing in
-silence.
-
-#### Consecutive Interruptions Counter Reset
-
-The `consecutive_interruptions` counter is reset to 0 when:
-
-- A turn completes successfully (agent writes response.json, reconciler processes it)
-- A human manually runs `lazy resume` or `lazy unblock` (considered human intervention)
-
-This means the circuit breaker is lenient: if the agent succeeds once, the counter resets. Only sustained consecutive crashes trigger the breaker.
-
-### 10. Manual Recovery
-
-If auto-resume fails or the circuit breaker fires, humans can recover manually:
-
-- **`lazy resume <task>`** — Same as unblock, but without requiring feedback. Resets the consecutive_interruptions counter.
-- **`lazy unblock <task> --message "..."`** — Give feedback and resume. Resets the counter.
-- **`lazy pair <task>`** — Jump into pairing mode to debug interactively.
-- **`lazy show <task>`** — View interrupt diagnostics (exit code, logs, crash reason).
-
-Interrupt diagnostics are stored in the session:
-
-```typescript
-interface Session {
-  interrupt_reason: string | null;        // "OOM killed or SIGKILL (exit code 137)"
-  interrupt_exit_code: number | null;     // 137
-  interrupt_at: number | null;            // timestamp
-  interrupt_logs: string | null;          // last 50 lines of container logs
-  consecutive_interruptions: number;      // circuit breaker counter
-  auto_resumed: boolean;                  // was this session auto-resumed?
-}
-```
-
-This gives humans full visibility into what went wrong.
-
-## Code References
-
-Key files implementing the state machine and crash recovery:
-
-- **`src/task-state-machine.ts`** — Centralized state machine: transition table, validation, status classification
-- **`src/types/index.ts`** — TaskStatus type definition, status classification functions (isTerminalStatus, isActiveStatus, isBlockedStatus)
-- **`src/utils/reconcile.ts`** — Main reconciler loop, state transitions, crash detection
-- **`src/utils/auto-resume.ts`** — Auto-resume logic (shared by reconciler and `lazy resume`)
-- **`src/utils/feedback-redelivery.ts`** — Selecting and rendering unconsumed feedback for redelivery on resume
-- **`src/cli/commands/start.ts`** — backlog → working transition
-- **`src/cli/commands/unblock.ts`** — blocked|interrupted → working transition
-- **`src/cli/commands/pair.ts`** — blocked|conflict|interrupted → pairing transition
-- **`src/cli/commands/accept.ts`** — blocked|interrupted|merging → complete|merging transitions
-- **`src/cli/commands/reject.ts`** — blocked|interrupted → abandoned transition
-- **`src/cli/commands/close.ts`** — blocked|interrupted → abandoned transition
-- **`src/cli/commands/reopen.ts`** — terminal → blocked|backlog transition
-- **`src/daemon/progress.ts`** — Accept phase table, the two phase plans, and the `PhaseReporter` that emits them
-- **`src/cli/phase-display.ts`** — Renders phase events in the terminal (TTY and plain)
-- **`src/storage/interface.ts`** — Storage methods for status updates, interrupt recording
-
-## Testing
-
-State machine behavior is tested in:
-
-- **`test/unit/task-state-machine.test.ts`** — Centralized transition table, zombie transitions, status classification, reverse lookups
-- **`test/e2e/reconcile.test.ts`** — Reconciler sweeps, crash detection, auto-resume
-- **`test/unit/feedback-redelivery.test.ts`** — Unconsumed-feedback selection and the resume-prompt seam
-- **`test/e2e/auto-resume.test.ts`** — Crash diagnostics, circuit breaker, and feedback redelivery on auto/manual resume
-- **`test/unit/merging-status.test.ts`** — Merging status transitions
-- **`test/e2e/pair.test.ts`** — Pairing state transitions and stale pairing sweep
-- **`test/e2e/agent-binary-seam.test.ts`** — `working → blocked` and `working → interrupted` driven by a REAL supervisor: watchdog kills (wind-down keeps the summary and blocks; no-progress interrupts), SIGTERM→SIGKILL escalation, in-turn crash retry, and session resume. Uses the fake-`claude`-binary seam (`setupTestLazy({ fakeClaude: true })`) so nothing in `src/` is mocked — the other e2e suites reach these transitions through a module mock that replaces the supervisor entirely. Also covers the sandbox permission posture (`hostPermissionMode: 'sandbox'`), which needs `bwrap` and `socat` on Linux
-- **`test/e2e/auto-resume-binary-seam.test.ts`** — `interrupted → working → blocked` closed autonomously after a REAL watchdog kill: the reconciler resumes a genuinely crashed turn, the resumed agent receives the crash-context prefix, and unconsumed feedback is re-delivered verbatim. Assertions are on the argv the fake agent actually received, so they cover the prompt as *delivered*, not as composed — the one step `auto-resume.test.ts` cannot reach, because it fabricates its crash and stops at `command.json`
-
-When modifying state transitions, ensure tests cover:
-- Valid transitions (should succeed)
-- Invalid transitions (should fail or be prevented)
-- Reconciler sweeps (should detect and fix inconsistent states)
-- Auto-resume circuit breaker (should stop after 3 consecutive crashes)
-- Manual recovery paths (should reset circuit breaker)
+When an agent crashes mid-turn, lazy detects it and tries to resume the task.
+
+### Detection
+
+The daemon watches `working` tasks. A task whose agent container or process is
+gone without having finished its turn is marked `interrupted`. A task that
+became `working` within the last 30 seconds is left alone, so a container still
+starting up is not mistaken for a dead one.
+
+### What is recorded
+
+The crash is recorded as a turn on the task (visible in `lazy show`), along with
+diagnostics: a reason (e.g. "OOM killed or SIGKILL (exit code 137)"), the exit
+code, the time, and the last lines of the container's logs. `lazy show <task>`
+displays them.
+
+Every turn that dies leaves a visible record, even when the same failure repeats
+turn after turn: two identical `fatal_auth` failures on consecutive unblocks are
+recorded as two turns.
+
+### Circuit breaker
+
+Each crash counts toward a limit of **3 consecutive interruptions**. Once it is
+reached, lazy stops auto-resuming and the task stays `interrupted` until you run
+`lazy resume` or `lazy unblock`. An agent that crashes three times in a row
+without finishing a turn has something fundamentally wrong — out of memory,
+broken dependencies, an infinite loop — and needs a human to look.
+
+The counter resets whenever a turn completes, and when you resume or unblock the
+task yourself. So only sustained, back-to-back crashes trip the breaker.
+
+### Auto-resume
+
+Auto-resume continues the agent's existing conversation, so it keeps its full
+history — but the files on disk reflect wherever the crash left them, and the
+agent is told to verify before continuing. What else happens depends on whether
+the worktree has uncommitted changes:
+
+- **Clean worktree** (the agent crashed before editing anything, or after
+  committing everything): the parent branch is merged into the task branch
+  first, so a resumed task does not drift behind, and the agent is told upstream
+  was merged. A task pinned to a fixed base commit (`lazy clone --same-base`)
+  is not merged.
+- **Uncommitted changes** (the agent crashed mid-edit): no merge — merging over
+  half-finished edits would fail or tangle them. The agent is told there are
+  uncommitted changes from the interrupted turn and asked to review them, keep
+  or discard what it finds, commit, and continue.
+
+The resume is recorded as a `system` turn, "Session interrupted and
+auto-resumed".
+
+If the crash happened while lazy was merging upstream into the task and the
+merge failed, the task is **not** auto-resumed: it cannot make progress without
+that merge, and a human needs to look at the conflict.
+
+### Feedback is redelivered after a crash
+
+Your feedback is saved before the agent is launched. If the turn then crashes
+before the agent finishes responding to it, the resume — automatic or
+`lazy resume` — delivers that feedback again **verbatim**, in place of the
+generic "you were interrupted" prompt. If several pieces of feedback went
+unanswered, the newest is reproduced and the prompt says how many others there
+are. A crash during the resume redelivers the same feedback again. Once an agent
+turn completes normally, all feedback before it counts as delivered and is never
+redelivered.
+
+This applies to your initial task prompt, `lazy unblock` feedback, `lazy ask`
+questions, and PR comments and CI output delivered automatically. A comment made
+through lazy itself (`lazy comment`, the web UI, `lazy_comment`) is different:
+it never starts a turn, and reaches the agent with the next `lazy unblock`.
+`lazy ask` and `lazy sync` neither carry a comment nor use it up.
+
+### Three crash scenarios
+
+| Crash | State after | On auto-resume |
+|---|---|---|
+| **Before any edits** — agent read files, then crashed | Worktree clean, no new commits | Upstream merged; agent verifies and continues |
+| **Mid-edit** — one file edited, another half-written | Worktree has uncommitted changes | No merge; agent reviews the changes, commits, fixes or discards them |
+| **After committing but before the turn finished** | Worktree clean, commits on the branch | Upstream merged; agent finds its commits on the branch and continues. The commits are recorded on the task when a later turn finishes |
+
+### A turn nobody read
+
+If you unblock a task just as its agent finishes a turn, that finished turn is
+not lost: lazy still records it in the task's history, and remembers the agent
+session it ran in, so `lazy pair` resumes where the agent left off. A turn
+recovered this way is history only — it does not change the task's status or
+disturb the turn now running. If a turn's output genuinely cannot be recovered,
+the daemon log says so and names the task.
+
+### Manual recovery
+
+If auto-resume fails or the circuit breaker fires:
+
+- **`lazy resume <task>`** — resume without feedback. Resets the crash counter.
+- **`lazy unblock <task> --message "..."`** — give feedback and resume. Resets the counter.
+- **`lazy pair <task>`** — work with the agent interactively to debug.
+- **`lazy show <task>`** — see the interrupt diagnostics: reason, exit code,
+  time, recent log lines, the consecutive-interruption count, and whether the
+  session was auto-resumed.

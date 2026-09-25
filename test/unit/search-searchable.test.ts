@@ -1,7 +1,7 @@
 /**
  * Unit test: the searchable content loader has ONE owner.
  *
- * `src/search/searchable.ts` and `src/cli/commands/search-data.ts` used to
+ * `src/search/searchable.ts` and `src/search/fuzzy.ts` used to
  * carry near-identical copies of `SearchableItem` + `getAllSearchableContent`,
  * one for the MCP fuzzy path and one for the CLI/daemon-RPC fuzzy path. They
  * drifted with nothing to catch it: the MCP copy never loaded conversations at
@@ -15,7 +15,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { getAllSearchableContent as loaderFromSearchModule } from '../../src/search';
-import { getAllSearchableContent as loaderFromCliModule } from '../../src/cli/commands/search-data';
+import { getAllSearchableContent as loaderFromFuzzyModule } from '../../src/search/fuzzy';
 import { createStorage, type Storage } from '../../src/storage';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 
@@ -42,11 +42,11 @@ describe('searchable content loader', () => {
     if (testDir) rmSync(testDir, { recursive: true, force: true });
   });
 
-  // INVARIANT: one implementation, two import paths. `search-data.ts` re-exports
+  // INVARIANT: one implementation, two import paths. `fuzzy.ts` re-exports
   // the loader rather than defining its own — if someone reintroduces a second
   // copy, these stop being the same function object and this fails.
   test('both import paths resolve to the same function', () => {
-    expect(loaderFromCliModule).toBe(loaderFromSearchModule);
+    expect(loaderFromFuzzyModule).toBe(loaderFromSearchModule);
   });
 
   // The exact drift that motivated the collapse: the MCP-side copy indexed

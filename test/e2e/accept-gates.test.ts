@@ -4,6 +4,7 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 
 /**
  * Tests for accept pre-merge gates (CI, reviews, unresolved comments).
@@ -76,6 +77,7 @@ describe('lazy accept gates', () => {
   // INVARIANT: Accept blocks when CI checks are failing.
   test('accept blocks on failing CI', async () => {
     const taskId = await setupBlockedTask();
+    await seedFinal(ctx, taskId);
 
     setGates([{ gate: 'ci', message: 'CI checks failing: lint, test' }]);
 
@@ -89,6 +91,7 @@ describe('lazy accept gates', () => {
   // INVARIANT: Accept blocks when reviews are pending.
   test('accept blocks on pending reviews', async () => {
     const taskId = await setupBlockedTask();
+    await seedFinal(ctx, taskId);
 
     setGates([{ gate: 'reviews', message: 'Changes requested (status: CHANGES_REQUESTED)' }]);
 
@@ -102,6 +105,7 @@ describe('lazy accept gates', () => {
   // INVARIANT: Accept blocks on unresolved review comments.
   test('accept blocks on unresolved comments', async () => {
     const taskId = await setupBlockedTask();
+    await seedFinal(ctx, taskId);
 
     setGates([{ gate: 'comments', message: '3 unresolved review threads' }]);
 
@@ -115,6 +119,7 @@ describe('lazy accept gates', () => {
   // INVARIANT: Accept succeeds normally when no gates are failing.
   test('accept succeeds when all gates pass', async () => {
     const taskId = await setupBlockedTask();
+    await seedFinal(ctx, taskId);
 
     // No gate file written — mock returns no warnings, accept proceeds.
     const result = await ctx.lazy(['accept', taskId, '--yes']);

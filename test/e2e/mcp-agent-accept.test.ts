@@ -34,6 +34,7 @@ import { spawn } from '../../src/utils/spawn';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 import { findFullTaskId, readSessionJson, readTaskStatus, setTaskMetadata, setTaskStatus } from '../helpers/storage';
 import { MCP_SERVER_ENV_PINS } from '../helpers/mcp-env';
 
@@ -177,6 +178,11 @@ async function startedSubtask(
   writeFileSync(join(worktree, file), `${goal} line\n`.repeat(lines));
   ctx.git('-C', worktree, 'add', file);
   ctx.git('-C', worktree, 'commit', '-m', `Work for ${goal}`);
+
+  // Fixture setup, not the subject: the finality gate needs a standing final
+  // before any accept of a committed task (see test/helpers/final.ts).
+  await seedFinal(ctx, childId);
+
   return childId;
 }
 

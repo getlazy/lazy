@@ -19,6 +19,7 @@ import {
   parentTaskIdOf,
   targetBranchOf,
   collectSubtreeIds,
+  descendantCounts,
 } from '../../src/task-target';
 import type { Task } from '../../src/types';
 
@@ -88,11 +89,10 @@ describe('legacy (parent_task_id, remote_target_branch) ↔ TaskTarget mapping',
     expect(targetFromLegacy(legacy.parent_task_id, legacy.remote_target_branch)).toEqual(t);
   });
 
-  // INVARIANT: PostgresStorage stores the canonical `target` JSONB but keeps a
-  // denormalized parent_task_id column for the ancestry CTE / child lookups.
-  // Both write paths set that column to targetToLegacy(target).parent_task_id,
-  // which must equal parentTaskIdOf(target) — so the column is a pure projection
-  // of the union and cannot drift from it.
+  // INVARIANT: storage keeps a denormalized parent_task_id column for the
+  // ancestry CTE / child lookups. Both write paths set that column to
+  // targetToLegacy(target).parent_task_id, which must equal parentTaskIdOf(target)
+  // — so the column is a pure projection of the union and cannot drift from it.
   test('parent_task_id column projection agrees with parentTaskIdOf', () => {
     const asTask = (target: Task['target']): Task => ({ target } as Task);
     for (const t of [taskTarget('parent-7'), branchTarget('main')] as const) {
@@ -137,5 +137,40 @@ describe('collectSubtreeIds', () => {
   test('terminates on a parent cycle', () => {
     const tasks = [child('a', 'b'), child('b', 'a')];
     expect([...collectSubtreeIds('a', tasks)].sort()).toEqual(['a', 'b']);
+  });
+});
+
+describe('descendantCounts', () => {
+  const child = (id: string, parentId: string): Task => ({ id, target: taskTarget(parentId) } as Task);
+  const root = (id: string): Task => ({ id, target: branchTarget('main') } as Task);
+
+  test('counts descendants at every depth, not just direct children', () => {
+    const counts = descendantCounts([
+      root('r'), child('c1', 'r'), child('c2', 'r'), child('g1', 'c1'), child('gg1', 'g1'), root('other'),
+    ]);
+    expect(counts.get('r')).toBe(4);
+    expect(counts.get('c1')).toBe(2);
+    expect(counts.get('c2')).toBe(0);
+    expect(counts.get('g1')).toBe(1);
+    expect(counts.get('other')).toBe(0);
+  });
+
+  test('every task in the set gets an entry, leaves included', () => {
+    const counts = descendantCounts([root('r'), child('c1', 'r')]);
+    expect([...counts.keys()].sort()).toEqual(['c1', 'r']);
+    expect(counts.get('c1')).toBe(0);
+  });
+
+  test('a parent outside the set is not invented', () => {
+    const counts = descendantCounts([child('orphan', 'gone')]);
+    expect(counts.has('gone')).toBe(false);
+    expect(counts.get('orphan')).toBe(0);
+  });
+
+  // INVARIANT: a corrupt store with a cyclic parent link must not hang the walk.
+  test('terminates on a parent cycle', () => {
+    const counts = descendantCounts([child('a', 'b'), child('b', 'a')]);
+    expect(counts.get('a')).toBe(1);
+    expect(counts.get('b')).toBe(1);
   });
 });

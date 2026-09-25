@@ -12,7 +12,7 @@ import {
   renderProxyActivity,
   credentialRefusalHint,
   PROXY_LINE_PREFIX,
-} from '../../src/cli/proxy-activity-renderer';
+} from '../../src/render/proxy-activity-renderer';
 import {
   CREDENTIAL_REFUSED_PREFIX,
   type ProxyActivityClose,

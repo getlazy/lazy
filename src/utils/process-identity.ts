@@ -33,7 +33,7 @@
  */
 
 import { readFileSync } from 'fs';
-import { readFile } from 'fs/promises';
+import { readFile, readdir, readlink } from 'fs/promises';
 import { spawn, spawnSyncUnsupervised } from './spawn';
 
 /**
@@ -375,4 +375,145 @@ export async function checkHolder(recorded: RecordedHolder): Promise<HolderVerdi
 export function checkHolderSync(recorded: RecordedHolder): HolderVerdict {
   if (!pidExists(recorded.pid)) return { alive: false, reason: 'no-process' };
   return judgeHolder(recorded, readProcessIdentitySync(recorded.pid));
+}
+
+// ---------------------------------------------------------------------------
+// Process GROUPS
+//
+// Signalling a process group is how one process reaches a whole tree, and it is
+// the only way to reach an agent whose supervisor has already died. Everything
+// below exists to make that signal VERIFIABLE rather than merely plausible: a
+// pgid is a pid, pids are recycled, and a SIGKILL aimed at a group on the
+// strength of a stale number kills whatever now occupies it.
+// ---------------------------------------------------------------------------
+
+/**
+ * The process-group id of a live pid, or null if it cannot be read.
+ *
+ * Same platform split as the identity readers above: procfs field 5, taken
+ * after the last `)` because the comm field is parenthesised and may itself
+ * contain spaces and parens; `ps -o pgid=` elsewhere. Null means "no answer",
+ * never "no group".
+ */
+export async function processGroupId(pid: number): Promise<number | null> {
+  if (process.platform === 'linux') {
+    try {
+      const stat = await readFile(`/proc/${pid}/stat`, 'utf-8');
+      const close = stat.lastIndexOf(')');
+      if (close === -1) return null;
+      // rest[0] is field 3 (state), so field 5 (pgrp) is rest[2].
+      return toPid(stat.slice(close + 1).trim().split(/\s+/)[2]);
+    } catch {
+      return null;
+    }
+  }
+  const out = spawnSyncUnsupervised(['ps', '-o', 'pgid=', '-p', String(pid)], { timeout: PS_TIMEOUT_MS });
+  if (out.exitCode !== 0) return null;
+  return toPid(out.stdout.toString().trim());
+}
+
+/**
+ * Every pid currently in `pgid`, or an empty list when it cannot be enumerated.
+ *
+ * Empty is deliberately indistinguishable from "could not read": both mean "no
+ * member was verified", and the only caller treats that as a reason NOT to
+ * signal. Erring towards signalling would be the whole hazard.
+ */
+export async function processesInGroup(pgid: number): Promise<number[]> {
+  const members: number[] = [];
+  if (process.platform === 'linux') {
+    let entries: string[];
+    try {
+      entries = await readdir('/proc');
+    } catch {
+      return [];
+    }
+    for (const entry of entries) {
+      const pid = toPid(entry);
+      if (pid === null) continue;
+      if ((await processGroupId(pid)) === pgid) members.push(pid);
+    }
+    return members;
+  }
+  const out = spawnSyncUnsupervised(['ps', '-eo', 'pid=,pgid='], { timeout: PS_TIMEOUT_MS });
+  if (out.exitCode !== 0) return [];
+  for (const line of out.stdout.toString().split('\n')) {
+    const [rawPid, rawPgid] = line.trim().split(/\s+/);
+    const pid = toPid(rawPid);
+    if (pid !== null && toPid(rawPgid) === pgid) members.push(pid);
+  }
+  return members;
+}
+
+/**
+ * The working directory of a live pid, or null when it cannot be read.
+ *
+ * Linux only, by design rather than omission. procfs answers it with a readlink;
+ * everything else would need `lsof`, which lazy does not depend on and will not
+ * start depending on for this. A null here makes its caller decline to signal a
+ * group — so the cost of the gap is a missed reap, never a wrong kill.
+ */
+export async function processCwd(pid: number): Promise<string | null> {
+  if (process.platform !== 'linux') return null;
+  try {
+    return await readlink(`/proc/${pid}/cwd`);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Is this pid a process that is still RUNNING, as opposed to merely present?
+ *
+ * `kill(pid, 0)` answers the second question, and a ZOMBIE answers it yes. A
+ * zombie holds nothing and will never exit again of its own accord, so treating
+ * one as alive makes every caller wait out a grace period for a process that is
+ * already dead — and, for a whole group of them, escalate to a SIGKILL with
+ * nothing to kill.
+ *
+ * "Cannot tell" resolves to TRUE: a process that was in the table a moment ago
+ * and whose state will not read is not evidence of death.
+ */
+export async function isRunningProcess(pid: number): Promise<boolean> {
+  if (!pidExists(pid)) return false;
+  const identity = await readProcessIdentity(pid);
+  return identity === null ? true : !isZombieState(identity.state);
+}
+
+/** Parse a pid-shaped string, rejecting anything that is not a positive integer. */
+function toPid(raw: string | undefined): number | null {
+  if (!raw) return null;
+  const n = Number(raw.trim());
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+/**
+ * Synchronous {@link isRunningProcess}, for callers that cannot await — test
+ * teardown and exit handlers, chiefly. Same rules, same "cannot tell is TRUE".
+ */
+export function isRunningProcessSync(pid: number): boolean {
+  if (!pidExists(pid)) return false;
+  const identity = readProcessIdentitySync(pid);
+  return identity === null ? true : !isZombieState(identity.state);
+}
+
+/**
+ * Synchronous {@link processGroupId}, for callers that cannot await — the test
+ * harness's exit-handler sweep, chiefly. Same platform split, same "null means
+ * no answer".
+ */
+export function processGroupIdSync(pid: number): number | null {
+  if (process.platform === 'linux') {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf-8');
+      const close = stat.lastIndexOf(')');
+      if (close === -1) return null;
+      return toPid(stat.slice(close + 1).trim().split(/\s+/)[2]);
+    } catch {
+      return null;
+    }
+  }
+  const out = spawnSyncUnsupervised(['ps', '-o', 'pgid=', '-p', String(pid)], { timeout: PS_TIMEOUT_MS });
+  if (out.exitCode !== 0) return null;
+  return toPid(out.stdout.toString().trim());
 }

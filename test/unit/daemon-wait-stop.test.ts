@@ -14,16 +14,16 @@ import { mkdtemp, rm, mkdir, writeFile, unlink } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { waitForDaemonStop } from '../../src/daemon';
-import { getSocketPath, getTokenPath, getPidPath, getDaemonDir } from '../../src/daemon/paths';
+import { getWebPortPath, getTokenPath, getPidPath, getDaemonDir } from '../../src/daemon/paths';
 
 describe('waitForDaemonStop', () => {
   let root: string;
 
-  // Make isDaemonRunning(root) report TRUE: socket + token files present and a
-  // live pid (this test process is alive).
+  // Make isDaemonRunning(root) report TRUE: token + web-port markers present
+  // and a live pid (this test process is alive).
   const markRunning = async () => {
     await mkdir(getDaemonDir(root), { recursive: true });
-    await writeFile(getSocketPath(root), '');
+    await writeFile(getWebPortPath(root), '26024');
     await writeFile(getTokenPath(root), 'test-token');
     await writeFile(getPidPath(root), String(process.pid));
   };
@@ -48,11 +48,11 @@ describe('waitForDaemonStop', () => {
     expect(Date.now() - start).toBeGreaterThanOrEqual(250);
   });
 
-  test('returns true once the daemon goes away (socket removed)', async () => {
+  test('returns true once the daemon goes away (pid file removed)', async () => {
     await markRunning();
-    // Remove the socket shortly after starting the wait — simulates the old
-    // daemon finishing its async shutdown.
-    setTimeout(() => { unlink(getSocketPath(root)).catch(() => {}); }, 150);
+    // Remove the pid file shortly after starting the wait — simulates the old
+    // daemon finishing its async shutdown (cleanupStaleFiles removes it).
+    setTimeout(() => { unlink(getPidPath(root)).catch(() => {}); }, 150);
     expect(await waitForDaemonStop(root, 3000)).toBe(true);
   });
 
@@ -61,7 +61,7 @@ describe('waitForDaemonStop', () => {
   const DEAD_PID = 2_000_000;
 
   test('with expectedPid, reports stopped only when that process is dead', async () => {
-    // Even with the socket/PID files still present (isDaemonRunning would say
+    // Even with the marker/PID files still present (isDaemonRunning would say
     // "running"), a dead expectedPid means the old daemon is truly gone.
     await markRunning();
     expect(await waitForDaemonStop(root, 1000, DEAD_PID)).toBe(true);
@@ -69,7 +69,7 @@ describe('waitForDaemonStop', () => {
 
   test('with expectedPid, keeps waiting while that process is alive', async () => {
     // This test process is alive — stands in for an old daemon that has not yet
-    // exited. The socket-based check is bypassed in favor of the pid.
+    // exited. The file-based check is bypassed in favor of the pid.
     const start = Date.now();
     expect(await waitForDaemonStop(root, 300, process.pid)).toBe(false);
     expect(Date.now() - start).toBeGreaterThanOrEqual(250);

@@ -4,6 +4,14 @@ node_modules/
 lazy
 lazy-agent
 
+# Build-time cache of this checkout's content identity (src/utils/source-id.ts),
+# written by `lazy system source-id --write` when an image is built. Every reader
+# PREFERS it over hashing the tree, so a committed copy would pin the identity of
+# whatever checkout it landed in — freezing every staleness check to "up to date"
+# and hiding exactly the stale daemon the fingerprint exists to expose. It is
+# per-build output, never source.
+.source-fingerprint
+
 # Per-task sandbox dir and the per-worktree session lock (src/utils/lock.ts).
 # Both are NOT covered by the `.lazy` rule below: gitignore matches whole path
 # components, so `.lazy` matches a file/dir named exactly `.lazy` and never the
@@ -47,3 +55,12 @@ dist/
 # LAZY_IGNORE_ENTRIES in src/cli/init.ts): one blanket `.lazy/` rule instead of
 # an enumeration that goes stale every time lazy writes a new file there.
 .lazy
+
+# smolvm Stage S probe output and the vendored, pinned smolvm binary.
+#
+# results/ is per-run measurement output (one timestamped dir per invocation);
+# the numbers that matter get transcribed into docs/spikes/smolvm.md §8, and
+# the raw dirs are disposable. vendor/ holds a downloaded multi-MB binary whose
+# integrity comes from pin.env plus fetch-smolvm.sh, not from git.
+scripts/smolvm-probes/results/
+scripts/smolvm-probes/vendor/

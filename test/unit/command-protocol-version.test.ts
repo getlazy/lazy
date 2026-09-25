@@ -23,8 +23,9 @@ function makeConfig(): ResolvedConfig {
   return {
     agent: { watchdog_output_timeout_ms: 0 },
     permissions: { protected: [] },
-  automation: { maintain: [], pre_accept: { enabled: false, commands: [], timeout: 600 } },
+  automation: { maintain: [], react: [], pre_accept: { enabled: false, commands: [], timeout: 600 } },
   mounts: [],
+  serve: { services: [], start_services_cmd: '' },
     checks: { post_turn: '', post_turn_timeout: 300 },
   } as unknown as ResolvedConfig;
 }
@@ -33,6 +34,20 @@ describe('commonCommandFields', () => {
   test('injects protocol_version equal to PROTOCOL_VERSION', () => {
     const fields = commonCommandFields(makeConfig());
     expect(fields.protocol_version).toBe(PROTOCOL_VERSION);
+  });
+
+  test('injects a unique command_id on every call', () => {
+    const first = commonCommandFields(makeConfig());
+    const second = commonCommandFields(makeConfig());
+    expect(first.command_id).toBeTruthy();
+    expect(second.command_id).toBeTruthy();
+    expect(first.command_id).not.toBe(second.command_id);
+  });
+
+  test('reuses a provided command_id when asked', () => {
+    const id = 'fixed-correlation-id';
+    const fields = commonCommandFields(makeConfig(), { command_id: id });
+    expect(fields.command_id).toBe(id);
   });
 });
 
@@ -78,14 +93,16 @@ describe('command builders include protocol_version', () => {
   // SyncCommand sets protocol_version directly rather than via the helper
   // (it doesn't need the other common fields). That's a deliberate choice,
   // but the version field is still required.
-  test('SyncCommand carries protocol_version', () => {
+  test('SyncCommand carries protocol_version and command_id', () => {
     const sync: SyncCommand = {
       type: 'sync',
       task_id: 't',
+      command_id: 'sync-cmd-id',
       protocol_version: PROTOCOL_VERSION,
       parent_branch: 'main',
     };
     expect(sync.protocol_version).toBe(PROTOCOL_VERSION);
+    expect(sync.command_id).toBe('sync-cmd-id');
   });
 
   // Parametrised guard: every non-stop command in the Command union must
@@ -105,7 +122,7 @@ describe('command builders include protocol_version', () => {
     // `true` or `never`.
     type HasVersion<T> = T extends { type: 'stop' }
       ? true
-      : T extends { protocol_version?: number }
+      : T extends { protocol_version?: number; command_id?: string }
         ? true
         : false;
     type AllHaveVersion =

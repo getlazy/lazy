@@ -11,7 +11,7 @@
 
 import { describe, test, expect } from 'bun:test';
 import type { AgentActivityEvent } from '../../src/agent/activity-stream';
-import { formatMcpObservation, verifyInitMcpTools } from '../../src/supervisor/mcp-verify';
+import { formatMcpObservation, MCP_VERIFY_NO_INVENTORY_REASON, verifyInitMcpTools } from '../../src/supervisor/mcp-verify';
 
 function initEvent(partial: Partial<AgentActivityEvent> = {}): AgentActivityEvent {
   return { kind: 'session_start', sessionId: 'sess-1', ...partial };
@@ -60,9 +60,15 @@ describe('verifyInitMcpTools', () => {
   // absence. A future agent release that stops reporting these fields, a
   // different agent (Cursor emits no equivalent), or a parser miss must never
   // take down a turn that was working fine.
+  //
+  // INVARIANT (no-inventory-reason-stable): work.ts skips INFO for this exact
+  // reason string — Cursor/Codex/Pi hit it every turn. Renaming it without
+  // updating the skip would re-spam supervisor logs.
   test('an init line reporting neither field is unknown, not a failure', () => {
     const verdict = verifyInitMcpTools(initEvent());
     expect(verdict.outcome).toBe('unknown');
+    if (verdict.outcome !== 'unknown') throw new Error('unreachable');
+    expect(verdict.reason).toBe(MCP_VERIFY_NO_INVENTORY_REASON);
   });
 
   test('no session-start event at all is unknown, not a failure', () => {

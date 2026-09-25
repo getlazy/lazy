@@ -1,20 +1,22 @@
 import { join } from 'path';
+import { formatDate } from '../../utils/format';
+import { shortId, displayId, displayIdFor, getWorktreePath } from '../../task/identity';
 import { existsSync } from 'fs';
-import { requireLazyRoot, requireStorage, shortId, displayId, displayIdFor, parseFlags, resolveTaskOrExit, formatDate, taskRef, getWorktreePath } from '../helpers';
+import { requireLazyRoot, requireStorage, parseFlags, resolveTaskOrExit } from '../helpers';
 import { getCurrentSha, hasUncommittedChanges, readWorktreeMergeState, isMidMerge, describeMergeState } from '../../git/operations';
-import { checkOrphanedChild } from '../orphan';
+import { checkOrphanedChild } from '../../task/orphan';
 import { isTerminalStatus } from '../../types';
 import type { Storage } from '../../storage';
 import type { Task } from '../../types';
 
-import { getDataDir } from '../init';
-import { theme } from '../theme';
+import { getDataDir } from '../../project-paths';
+import { theme } from '../../render/theme';
 import { loadConfig } from '../../config/loader';
 import { parentTaskIdOf } from '../../task-target';
 import { checkLock } from '../../utils/lock';
 import { createRunner } from '../../runner';
-import { protocolDir as getProtocolDir } from '../../protocol';
-import { computeWorkingSubstate, renderWorkingStatus } from '../../utils/working-substate';
+import { renderWorkingStatus } from '../../utils/working-substate';
+import { computeTaskWorkingSubstate } from '../../utils/working-run';
 import { loadTaskProtectionStatus, protectionSummary, protectionAdvice } from '../../protection/status';
 import { logger } from '../../utils/logger';
 import {
@@ -24,6 +26,7 @@ import {
   readDailyBudget,
   effectiveDailyLimit,
   checkBackoff,
+  AUTO_REACT_TRIGGERS,
   type AutoReactTrigger,
 } from '../../daemon/auto-react-budget';
 import { runGit } from '../../utils/git';
@@ -54,10 +57,8 @@ export async function commandStatus(args: string[]): Promise<void> {
     let statusText: string = task.status;
     if (task.status === 'working' && sess) {
       try {
-        const runner = await createRunner(root);
-        const cn = sess.container_name ?? runner.runNameForTask(taskRef(task));
-        const info = await runner.getRunInfo(cn);
-        const substate = await computeWorkingSubstate(getProtocolDir(task.id), info?.running === true);
+        // The reconciler's own liveness question — see src/utils/working-run.ts.
+        const substate = await computeTaskWorkingSubstate(root, task, sess, await createRunner(root));
         statusText = renderWorkingStatus(substate);
       } catch (err) {
         logger.debug(`Task ${shortId(task.id)}: could not derive working substate: ${err instanceof Error ? err.message : err}`);
@@ -241,7 +242,7 @@ async function printAutoReactDiagnostics(
   const dataDir = join(lazyRoot, getDataDir(lazyRoot));
   const { auto_react_max_retries, auto_react_backoff, auto_react_daily_budget } = config.daemon;
 
-  const triggers: AutoReactTrigger[] = ['ci_failure', 'upstream_sync', 'comment', 'child_completed', 'crash'];
+  const triggers: readonly AutoReactTrigger[] = AUTO_REACT_TRIGGERS;
   const blockReasons: string[] = [];
 
   console.log(`\n${theme.label('Auto-react:')}`);

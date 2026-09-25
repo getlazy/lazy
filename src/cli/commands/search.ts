@@ -1,11 +1,20 @@
-import { requireStorage, shortId, parseFlags } from '../helpers';
+import { requireStorage, parseFlags } from '../helpers';
+import { shortId } from '../../task/identity';
 import type { SearchResult } from '../../storage';
 import type { Storage } from '../../storage/interface';
-import { theme, stripAnsi } from '../theme';
+import { theme, stripAnsi } from '../../render/theme';
 import { docsFooter } from '../../docs/links';
-import { QueryParseError } from '../../search';
-import { loadTaskShowData, buildTaskShowLines } from './show';
+import {
+  QueryParseError,
+  GRAMMAR_EXAMPLES,
+  renderGrammarText,
+  renderGrammarNotesText,
+} from '../../search';
+import { buildTaskShowLines } from './show';
+import { loadTaskShowData } from '../../task/show-data';
 import { querySearch } from '../../daemon/rpc-fallback';
+import { RpcApplicationError } from '../../daemon/client';
+import { RpcError } from '../../daemon/rpc-error';
 
 function truncate(str: string, maxLen: number): string {
   const cleaned = str.replace(/\s+/g, ' ').trim();
@@ -206,6 +215,32 @@ async function printJsonResults(storage: Storage, results: SearchResult[], query
   console.log(JSON.stringify({ query, matches, ...(hint ? { hint } : {}) }));
 }
 
+/**
+ * Print a bad query legibly, then exit.
+ *
+ * The same rejection arrives three ways: as a QueryParseError when the search
+ * ran in-process with no daemon at all, as an RpcError when the in-process
+ * handler mapped it, and as an RpcApplicationError wrapped in `RPC search
+ * failed: 400 ` when a daemon ran it. All three are the human's query —
+ * `code:spike` after the rename is the common one — so all three must print the
+ * actionable sentence rather than a stack trace, and the SAME sentence. The
+ * daemon handler supplies the `Query parse error:` prefix, so unwrapping is all
+ * that is left here. Returns for anything else, so the caller can rethrow.
+ */
+function reportQueryError(err: unknown): void {
+  if (err instanceof QueryParseError) {
+    console.error(`Query parse error: ${err.message}`);
+    process.exit(1);
+  }
+  if ((err instanceof RpcError || err instanceof RpcApplicationError) && err.status === 400) {
+    // Strip the daemon client's `RPC search failed: 400 ` wrapper — the human
+    // typed a query, not an RPC.
+    const match = err.message.match(/^RPC \w+ failed: \d{3}\s+([\s\S]+)$/);
+    console.error((match ? match[1] : err.message).trim());
+    process.exit(1);
+  }
+}
+
 export async function commandSearch(args: string[]): Promise<void> {
   // Parse and validate flags
   const parsed = parseFlags(args, [
@@ -218,8 +253,10 @@ export async function commandSearch(args: string[]): Promise<void> {
     { name: 'commits', takesValue: false },
     { name: 'notes', takesValue: false },
     { name: 'followups', takesValue: false },
+    { name: 'raised', takesValue: false },
     { name: 'conversations', takesValue: false },
     { name: 'memories', takesValue: false },
+    { name: 'scratch', takesValue: false },
   ], 'search');
 
   // Parse options
@@ -234,11 +271,13 @@ export async function commandSearch(args: string[]): Promise<void> {
   const searchCommits = parsed.flags.get('commits') === true;
   const searchNotes = parsed.flags.get('notes') === true;
   const searchFollowUps = parsed.flags.get('followups') === true;
+  const searchRaised = parsed.flags.get('raised') === true;
   const searchConversations = parsed.flags.get('conversations') === true;
   const searchMemories = parsed.flags.get('memories') === true;
+  const searchScratch = parsed.flags.get('scratch') === true;
 
   // If no specific types, search all
-  const searchAll = !searchTasks && !searchPrompts && !searchTurns && !searchCommits && !searchNotes && !searchFollowUps && !searchConversations && !searchMemories;
+  const searchAll = !searchTasks && !searchPrompts && !searchTurns && !searchCommits && !searchNotes && !searchFollowUps && !searchRaised && !searchConversations && !searchMemories && !searchScratch;
 
   // Get query (remaining positional args)
   const query = parsed.positional.join(' ');
@@ -258,8 +297,10 @@ export async function commandSearch(args: string[]): Promise<void> {
     if (searchCommits) types.push('commit');
     if (searchNotes) types.push('comment');
     if (searchFollowUps) types.push('followup');
+    if (searchRaised) types.push('raised');
     if (searchConversations) types.push('conversation');
     if (searchMemories) types.push('memory');
+    if (searchScratch) types.push('scratch');
   }
 
   // For --json output, we need local show output computation for line numbers,
@@ -271,10 +312,7 @@ export async function commandSearch(args: string[]): Promise<void> {
       const { results, hint } = await querySearch({ query, fuzzy, types: types.length > 0 ? types : undefined });
       await printJsonResults(storage, results, query, hint);
     } catch (err) {
-      if (err instanceof QueryParseError) {
-        console.error(`Query parse error: ${err.message}`);
-        process.exit(1);
-      }
+      reportQueryError(err);
       throw err;
     } finally {
       await storage.close();
@@ -286,10 +324,7 @@ export async function commandSearch(args: string[]): Promise<void> {
     const { results, hint } = await querySearch({ query, fuzzy, types: types.length > 0 ? types : undefined });
     printResults(results, groupByTask, hint);
   } catch (err) {
-    if (err instanceof QueryParseError) {
-      console.error(`Query parse error: ${err.message}`);
-      process.exit(1);
-    }
+    reportQueryError(err);
     throw err;
   }
 }
@@ -312,68 +347,25 @@ Filter by type:
   --commits          Search commit messages only
   --notes            Search task notes only
   --followups        Search task follow-ups only
+  --raised           Search agent-raised questions/decisions only
   --conversations    Search captured builder conversations only
   --memories         Search shared memory records only
+  --scratch          Search captured builder scratch files only
 
 Query language:
   Supports Lucene-style syntax with boolean operators and field filters.
   When operators, field syntax, or a #tag are detected, structured search is
   used automatically. Plain text queries use regex (case-insensitive) matching.
+  The dashboard's search page shows this same grammar inline.
 
-  Quote the whole query in single quotes so the shell does not eat the syntax:
-  '#' starts a comment in most shells, and an unquoted multi-word value is
-  split into separate terms.
+${renderGrammarText('  ')}
 
-  Boolean operators:
-    AND                Both conditions must match
-    OR                 Either condition matches
-    NOT                Negation
-    (A OR B) AND C     Parentheses for grouping
-
-  Field operators:
-    status:<value>     Task status (working, blocked, interrupted, etc.)
-    goal:<text>        Match against task goal
-    code:<value>       Match task code
-    tag:<value>        Match tasks carrying this tag
-    #<value>           Shorthand for tag:<value>, also matching '#value' as text
-    in:turns <text>    Search within turn content
-    in:commits <text>  Search within commit messages
-    in:comments <text> Search within comments
-    in:followups <text>  Search within follow-ups
-    in:conversations <text>  Search within conversation messages
-    in:memories <text>       Search within shared memory records
-    has:commits        Task has commits
-    has:turns          Task has turns
-    has:comments       Task has comments
-    has:followups      Task has follow-ups
-    created:>YYYY-MM-DD / created:<YYYY-MM-DD   Date filter on creation
-    updated:>YYYY-MM-DD / updated:<YYYY-MM-DD   Date filter on last update
-
-Tags:
-  Tags are normalized on write AND on query — lowercased, with every run of
-  non-alphanumerics collapsed to a hyphen. So 'tag:My Feature!' and
-  'tag:my-feature' both look for the stored tag 'my-feature', and a leading
-  '#' is stripped ('tag:#launch' == 'tag:launch').
-
-  A multi-word tag MUST be quoted, or only the first word is treated as the
-  tag and the rest become separate text terms:
-
-    lazy search 'tag:"My Feature Work"'    # matches tag 'my-feature-work'
-    lazy search 'tag:My Feature Work'      # tag:my AND "Feature" AND "Work"
+Good to know:
+${renderGrammarNotesText('  ')}
 
 Examples:
-  lazy search "auth"                                       # Regex search everywhere
-  lazy search catchup --fuzzy                              # Fuzzy search
-  lazy search 'status:blocked AND in:turns "reconciler"'   # Structured query
-  lazy search 'in:conversations "design decision"'         # Search conversations
-  lazy search 'in:memories "credentials"'                  # Search shared memory
-  lazy search 'status:abandoned OR status:complete'         # Boolean OR
-  lazy search 'has:commits AND NOT in:commits "wip"'       # Negation
-  lazy search 'created:>2026-02-15 AND status:working'     # Date filter
-  lazy search 'tag:onboarding'                             # Tasks tagged 'onboarding'
-  lazy search '#onboarding'                                # Same, using the printed spelling
-  lazy search 'tag:"My Feature Work"'                      # Multi-word tag (quote it)
-  lazy search 'tag:launch AND status:blocked'              # Combine tag with status
-  lazy search "design decision" --conversations            # Filter to conversations only
-  lazy search "auth" --json                                  # JSON output with line numbers${docsFooter('search')}`);
+${GRAMMAR_EXAMPLES.map(ex => `  lazy search '${ex.query}'`.padEnd(58) + `# ${ex.summary}`).join('\n')}
+  lazy search 'catchup' --fuzzy                           # Typo-tolerant
+  lazy search 'design decision' --conversations           # Filter to conversations only
+  lazy search 'auth' --json                               # JSON output with line numbers${docsFooter('search')}`);
 }

@@ -14,8 +14,8 @@
  *
  * Returns null when the SHA can't be determined — a compiled/installed binary
  * (no source tree, git fails) or a non-git checkout. In those cases there is no
- * divergence warning; the existing version/buildTime fields already cover
- * compiled-binary staleness.
+ * divergence warning; the embedded buildSha/buildTime fields identify compiled
+ * binaries, and buildTime alone still signals a rebuild.
  */
 
 import { spawnSyncUnsupervised } from '../utils/spawn';

@@ -22,12 +22,22 @@
 import { describe, test, expect } from 'bun:test';
 import { join } from 'path';
 import { readFile } from 'fs/promises';
-import { KNOWN_CONFIG_SCHEMA, KNOWN_TOP_LEVEL_KEYS, findUnknownConfigKeys } from '../../src/config/schema';
+import { KNOWN_CONFIG_SCHEMA, KNOWN_TOP_LEVEL_KEYS, FREEFORM_SECTIONS, findUnknownConfigKeys } from '../../src/config/schema';
 
 const EXAMPLE_PATH = join(import.meta.dir, '..', '..', 'lazy.toml.example');
 
-/** `[section]`, `[[section]]`, `[section.sub]` — commented out or not. */
-const SECTION_RE = /^#?\s*\[\[?([A-Za-z0-9_.]+)\]\]?\s*(?:#.*)?$/;
+/**
+ * `[section]`, `[[section]]`, `[section.sub]` — commented out or not.
+ *
+ * `-` is in the charset because a freeform section's sub-table is named by the
+ * USER (`[agents.work-codex]`), and hyphens are ordinary there. Without it the
+ * scanner silently fails to recognise the header, leaves `current` pointing at
+ * the PREVIOUS section, and attributes that block's keys to it — inventing
+ * failures about keys that are perfectly valid where they actually are. That
+ * mis-attribution is the exact class of bug this suite exists to catch, so the
+ * charset makes the scan more accurate, not more permissive.
+ */
+const SECTION_RE = /^#?\s*\[\[?([A-Za-z0-9_.-]+)\]\]?\s*(?:#.*)?$/;
 /** `key = value`, commented out or not. Keys are lowercase snake_case by convention. */
 const KEY_RE = /^#?\s*([a-z_][a-z0-9_]*)\s*=/;
 
@@ -74,6 +84,11 @@ describe('KNOWN_CONFIG_SCHEMA vs the documented config surface', () => {
     const unknown = sections.filter(({ path }) => {
       const [top, sub] = path.split('.');
       if (!(top in KNOWN_CONFIG_SCHEMA) && !KNOWN_TOP_LEVEL_KEYS.includes(top)) return true;
+      // A freeform section's sub-tables are named by the user ([agents.<name>]),
+      // so there is nothing to register them against — the section itself being
+      // known is the whole check. Their inner keys are still a closed set,
+      // enforced by the config loader.
+      if (FREEFORM_SECTIONS.has(top)) return false;
       // A nested table ([proxy.policy], [models.roles.builder]) is reachable only
       // if its parent key is registered; deeper levels are the loader's job.
       if (sub !== undefined && !KNOWN_CONFIG_SCHEMA[top]?.includes(sub)) return true;

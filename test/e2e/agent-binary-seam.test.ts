@@ -28,6 +28,9 @@ import {
 } from '../helpers/fake-claude';
 import { setGuards, agentTurns, sessionInterrupt } from '../helpers/agent-seam';
 import { sandboxSuiteSkipped } from '../helpers/sandbox-deps';
+import { readCommand, readResponse, protocolDir as getProtocolDir } from '../../src/protocol';
+import type { StartCommand } from '../../src/protocol';
+import { findFullTaskId } from '../helpers/storage';
 
 describe('agent binary seam (real supervisor, fake claude)', () => {
   let ctx: TestContext;
@@ -42,11 +45,21 @@ describe('agent binary seam (real supervisor, fake claude)', () => {
 
   test('a scripted stream-json turn flows through the real supervisor into a blocked task', async () => {
     const taskId = await createTask(ctx, 'Fake binary happy path', 'Do the work');
-    await ctx.setClaudeScenario(successScenario({
-      result: 'Fake agent finished the work.',
-      sessionId: 'fake-sess-happy',
-      commit: { message: 'Fake agent commit', files: [{ path: 'agent-output.txt', content: 'done\n' }] },
-    }));
+    // Sequence form: entry 0 is the work invocation, entry 1 the §2.4 final
+    // nudge a turn with no declaration gets. Replaying the work scenario for
+    // the nudge would re-run its commit step (git commit fails on the second
+    // run) — the nudge scenario is deliberately commitless.
+    await ctx.setClaudeScenario({ sequence: [
+      successScenario({
+        result: 'Fake agent finished the work.',
+        sessionId: 'fake-sess-happy',
+        commit: { message: 'Fake agent commit', files: [{ path: 'agent-output.txt', content: 'done\n' }] },
+      }),
+      successScenario({
+        result: 'The work is complete; nothing else is needed.',
+        sessionId: 'fake-sess-happy',
+      }),
+    ] });
 
     expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
     expectSuccess(await ctx.lazy(['wait', taskId]));
@@ -55,10 +68,60 @@ describe('agent binary seam (real supervisor, fake claude)', () => {
     expectOutput(show, 'blocked');
 
     // The summary the fake agent emitted on its `result` line — parsed by the
-    // real ClaudeCodeAgent.parseResponse from the real watchdog's capture.
+    // real ClaudeCodeAgent.parseResponse from the real watchdog's capture —
+    // is the work invocation's turn, the first of the bundle.
     const turns = await agentTurns(ctx.root, taskId);
     expect(turns.length).toBeGreaterThan(0);
-    expect(String(turns[turns.length - 1].content)).toContain('Fake agent finished the work.');
+    expect(String(turns[0].content)).toContain('Fake agent finished the work.');
+    // The nudge ran (the turn declared nothing) and its scripted answer is the
+    // last word in the conversation.
+    expect(String(turns[turns.length - 1].content)).toContain('The work is complete; nothing else is needed.');
+  }, 90_000);
+
+  // INVARIANT: the real supervisor must echo the command's correlation id on the
+  // response. Module mocks replace launchSupervisorAsync and cannot exercise
+  // writeCorrelatedResponse — only this seam can.
+  test('the real supervisor echoes command_id on the response', async () => {
+    const taskId = await createTask(ctx, 'Command id echo', 'Do the work');
+    await ctx.setClaudeScenario(successScenario({
+      result: 'Correlation check done.',
+      sessionId: 'fake-sess-corr-id',
+    }));
+
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+    const protoDir = getProtocolDir(fullTaskId);
+
+    let capturedCommandId: string | undefined;
+    const captureCommand = async () => {
+      for (let i = 0; i < 500; i++) {
+        const cmd = readCommand(protoDir) as StartCommand | null;
+        if (cmd?.command_id) {
+          capturedCommandId = cmd.command_id;
+          return;
+        }
+        await Bun.sleep(5);
+      }
+    };
+
+    const [, startResult] = await Promise.all([
+      captureCommand(),
+      ctx.lazy(['start', taskId, '--yes']),
+    ]);
+    expectSuccess(startResult);
+    expect(capturedCommandId).toBeTruthy();
+
+    let echoedId: string | undefined;
+    for (let i = 0; i < 600; i++) {
+      const resp = readResponse(protoDir);
+      if (resp?.command_id) {
+        echoedId = resp.command_id;
+        break;
+      }
+      await Bun.sleep(50);
+    }
+    expect(echoedId).toBe(capturedCommandId);
+
+    expectSuccess(await ctx.lazy(['wait', taskId]));
   }, 90_000);
 
   // The argv lazy hands the agent is a production contract, not a mock detail:
@@ -93,11 +156,21 @@ describe('agent binary seam (real supervisor, fake claude)', () => {
   // it got.
   test('a turn records the requested model/effort and the concrete model id the agent reported', async () => {
     const taskId = await createTask(ctx, 'Per-turn launch labels', 'Do the work');
-    await ctx.setClaudeScenario(successScenario({
-      sessionId: 'fake-sess-labels',
-      modelId: 'claude-opus-4-6-20260101',
-      commit: { message: 'Labelled work', files: [{ path: 'labelled.txt', content: 'done\n' }] },
-    }));
+    // Sequence form: entry 0 is the work invocation, entry 1 the §2.4 final
+    // nudge a turn with no declaration gets. The nudge runs on the same
+    // cmd.model/effort labels (launchSettings), and reports the same concrete
+    // model id, so the LAST turn of the bundle carries all three.
+    await ctx.setClaudeScenario({ sequence: [
+      successScenario({
+        sessionId: 'fake-sess-labels',
+        modelId: 'claude-opus-4-6-20260101',
+        commit: { message: 'Labelled work', files: [{ path: 'labelled.txt', content: 'done\n' }] },
+      }),
+      successScenario({
+        sessionId: 'fake-sess-labels',
+        modelId: 'claude-opus-4-6-20260101',
+      }),
+    ] });
 
     expectSuccess(await ctx.lazy(['start', taskId, '--yes', '--model', 'opus', '--effort', 'high']));
     expectSuccess(await ctx.lazy(['wait', taskId]));
@@ -136,11 +209,21 @@ describe('agent binary seam (real supervisor, fake claude)', () => {
     await setGuards(ctx, { windDownMs: 2_000 });
 
     const taskId = await createTask(ctx, 'Wind-down kill', 'Do the work');
-    await ctx.setClaudeScenario(hangAfterResultScenario({
-      result: 'Summary emitted before the hang.',
-      sessionId: 'fake-sess-winddown',
-      hangMs: 120_000,
-    }));
+    await ctx.setClaudeScenario({ sequence: [
+      hangAfterResultScenario({
+        result: 'Summary emitted before the hang.',
+        sessionId: 'fake-sess-winddown',
+        hangMs: 120_000,
+      }),
+      // The wind-down kill is NOT a failed turn — the result was captured — so
+      // the §2.4 nudge still fires afterwards. Script it as a short entry: a
+      // replay of the hang scenario would leave the nudge waiting on its own
+      // no-output watchdog for far longer than the test budget.
+      successScenario({
+        result: 'Still done — the summary stands.',
+        sessionId: 'fake-sess-winddown',
+      }),
+    ] });
 
     expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
     expectSuccess(await ctx.lazy(['wait', taskId]));
@@ -149,7 +232,12 @@ describe('agent binary seam (real supervisor, fake claude)', () => {
     expectOutput(show, 'blocked');
 
     const turns = await agentTurns(ctx.root, taskId);
-    expect(String(turns[turns.length - 1].content)).toContain('Summary emitted before the hang.');
+    // The summary survives the wind-down kill: it is the work invocation's
+    // turn, first of the bundle.
+    expect(String(turns[0].content)).toContain('Summary emitted before the hang.');
+    // The nudge ran afterwards and its answer is the last word — proof the
+    // kill cost nothing but the exit, not the record.
+    expect(String(turns[turns.length - 1].content)).toContain('Still done — the summary stands.');
   }, 120_000);
 
   // INVARIANT: the no-progress guard kills an agent that has stopped advancing.
@@ -205,19 +293,31 @@ describe('agent binary seam (real supervisor, fake claude)', () => {
     await setGuards(ctx, { windDownMs: 2_000 });
 
     const taskId = await createTask(ctx, 'SIGKILL escalation', 'Do the work');
-    const scenario = hangAfterResultScenario({
+    const hang = hangAfterResultScenario({
       result: 'Summary emitted before the stubborn hang.',
       sessionId: 'fake-sess-sigkill',
       hangMs: 120_000,
     });
-    await ctx.setClaudeScenario({ ...scenario, ignoreSigterm: true });
+    await ctx.setClaudeScenario({ sequence: [
+      { ...hang, ignoreSigterm: true },
+      // The SIGKILL is not a failed turn — the result was captured — so the
+      // §2.4 nudge still fires. Script it short; a replay of the hang scenario
+      // would swallow its own SIGTERM and outlive the test budget.
+      successScenario({
+        result: 'Still done — the summary stands.',
+        sessionId: 'fake-sess-sigkill',
+      }),
+    ] });
 
     expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
     expectSuccess(await ctx.lazy(['wait', taskId]));
 
     expectOutput(await ctx.lazy(['show', taskId]), 'blocked');
     const turns = await agentTurns(ctx.root, taskId);
-    expect(String(turns[turns.length - 1].content)).toContain('Summary emitted before the stubborn hang.');
+    // The summary survives the SIGKILL: the work invocation's turn, first of
+    // the bundle.
+    expect(String(turns[0].content)).toContain('Summary emitted before the stubborn hang.');
+    expect(String(turns[turns.length - 1].content)).toContain('Still done — the summary stands.');
   }, 120_000);
 
   // INVARIANT (src/supervisor/work.ts + retry-policy.ts): a non-fatal agent
@@ -252,6 +352,45 @@ describe('agent binary seam (real supervisor, fake claude)', () => {
   // Session continuity is a real argv contract: turn 2 must resume turn 1's
   // session, using the id the agent itself reported on its `result` line. Only
   // this seam can observe both halves — the id going out and coming back.
+  // INVARIANT (turn-model stickiness): every claude launch a task's turns make
+  // — the work invocation, the supervisor's own follow-up (the final nudge a
+  // turn with no declaration gets), and a later unblock — carries the task's
+  // persisted model as `--model`. Claude Code launched without it runs whatever
+  // the account/settings default is, silently; the nudge leg is the one most
+  // easily forgotten because nobody asked for it.
+  test("a task's model rides every claude invocation: work, nudge and unblock", async () => {
+    const taskId = await createTask(ctx, 'Sticky claude model', 'Do the sticky work');
+    expectSuccess(await ctx.lazy(['edit', taskId, '--model', 'claude-sticky-model']));
+    await ctx.setClaudeScenario({ sequence: [
+      successScenario({
+        sessionId: 'fake-sess-sticky',
+        commit: { message: 'Sticky work', files: [{ path: 'sticky.txt', content: 's\n' }] },
+      }),
+      successScenario({ sessionId: 'fake-sess-sticky' }),
+      successScenario({ sessionId: 'fake-sess-sticky', result: 'Unblocked turn done.' }),
+      successScenario({ sessionId: 'fake-sess-sticky' }),
+    ] });
+
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+    expectSuccess(await ctx.lazy(['unblock', taskId, '--message', 'keep the model']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+
+    const turns = (await ctx.claudeInvocations()).filter(i => i.argv.includes('-p'));
+    const prompts = turns.map(t => String(t.argv[t.argv.indexOf('-p') + 1]));
+    const known = ['Do the sticky work', 'keep the model'];
+    expect(prompts.some(p => p.includes('Do the sticky work')), 'the work turn never ran').toBe(true);
+    expect(prompts.some(p => p.includes('keep the model')), 'the unblock turn never ran').toBe(true);
+    expect(
+      prompts.filter(p => !known.some(k => p.includes(k))).length,
+      'no supervisor follow-up (nudge/wrap-up) invocation ran, so stickiness across one is unproven',
+    ).toBeGreaterThan(0);
+    for (const turn of turns) {
+      expect(turn.argv).toContain('--model');
+      expect(turn.argv[turn.argv.indexOf('--model') + 1]).toBe('claude-sticky-model');
+    }
+  }, 180_000);
+
   test('a second turn resumes the session id the agent reported', async () => {
     const taskId = await createTask(ctx, 'Resume contract', 'Do the work');
     await ctx.setClaudeScenario({

@@ -65,7 +65,6 @@ describe('daemon stop supervisor termination', () => {
   let daemon: RunningDaemon;
   let ctx: TestContext;
   let tmpDir: string;
-  let socketPath: string;
   let token: string;
   let originalHome: string | undefined;
   let originalLazyConfig: string | undefined;
@@ -73,9 +72,9 @@ describe('daemon stop supervisor termination', () => {
 
   beforeEach(async () => {
     process.env.LAZY_TEST = '1';
+    process.env.LAZY_ALLOW_HOST_RUNNER = '1';
     ctx = await setupTestLazy();
     tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-stop-sup-'));
-    socketPath = join(tmpDir, 'test.sock');
     token = 'stop-sup-test-token';
     originalHome = process.env.HOME;
     originalLazyConfig = process.env.LAZY_CONFIG;
@@ -88,6 +87,7 @@ describe('daemon stop supervisor termination', () => {
 
   afterEach(async () => {
     process.env.HOME = originalHome;
+    delete process.env.LAZY_ALLOW_HOST_RUNNER;
     if (originalLazyConfig !== undefined) {
       process.env.LAZY_CONFIG = originalLazyConfig;
     } else {
@@ -120,7 +120,6 @@ describe('daemon stop supervisor termination', () => {
 
     // Start daemon and pre-populate knownTaskIds with this task
     daemon = await startDaemonServer({
-      socketPath,
       token,
       projectRoot: ctx.root,
       reconcileIntervalSeconds: 999,
@@ -135,6 +134,42 @@ describe('daemon stop supervisor termination', () => {
 
     expect(isAlive(dummy.pid)).toBe(false);
   }, 15_000); // stopRun blocks synchronously while waiting for SIGTERM
+
+  // INVARIANT: ownership at shutdown is decided by resolving the run name
+  // through storage, not by string-matching short ids.
+  //
+  // Run names are `lazy-<task_ref>`, and a task WITH A CODE refs by that code
+  // (deriveTaskRef) — which is every task a human creates. Matching the name
+  // suffix against a set of 8-char short ids therefore never matched in
+  // practice, so shutdown skipped every real supervisor as "not owned" and
+  // leaked it. A leaked supervisor keeps answering `isRunning()` for its run
+  // name and wedges the next task that refs the same way.
+  test('stop kills the supervisor of a task addressed by CODE, not short id', async () => {
+    configureHostProcessRunner(ctx.root);
+
+    const taskShortId = await createTaskBeforeDaemon(ctx, 'Coded supervisor task');
+    await ctx.lazy(['edit', taskShortId, '--code', 'coded-supervisor']);
+
+    const dummy = spawnDummyProcess();
+    dummyProcesses.push(dummy);
+    expect(isAlive(dummy.pid)).toBe(true);
+
+    // The run name production actually uses for a coded task.
+    writePidFile(tmpDir, 'lazy-coded-supervisor', dummy.pid);
+
+    daemon = await startDaemonServer({
+      token,
+      projectRoot: ctx.root,
+      reconcileIntervalSeconds: 999,
+    });
+    // The reconcile loop records SHORT IDS — never the ref the run is named for.
+    daemon.knownTaskIds.add(taskShortId);
+
+    await daemon.stop();
+    await new Promise(resolve => setTimeout(resolve, 500));
+
+    expect(isAlive(dummy.pid)).toBe(false);
+  }, 15_000);
 
   // INVARIANT: Daemon stop does NOT kill supervisors that belong to other
   // projects. discoverRunningRuns() is global, so stop() must filter by
@@ -158,7 +193,6 @@ describe('daemon stop supervisor termination', () => {
 
     // Start daemon and populate knownTaskIds with only this project's task
     daemon = await startDaemonServer({
-      socketPath,
       token,
       projectRoot: ctx.root,
       reconcileIntervalSeconds: 999,
@@ -189,7 +223,6 @@ describe('daemon stop supervisor termination', () => {
 
     // Start daemon WITHOUT populating knownTaskIds (simulates no reconcile tick)
     daemon = await startDaemonServer({
-      socketPath,
       token,
       projectRoot: ctx.root,
       reconcileIntervalSeconds: 999,
@@ -214,7 +247,6 @@ describe('daemon stop supervisor termination', () => {
 
     // Start daemon
     daemon = await startDaemonServer({
-      socketPath,
       token,
       projectRoot: ctx.root,
       reconcileIntervalSeconds: 999,
@@ -231,7 +263,6 @@ describe('daemon stop supervisor termination', () => {
 
     // Start daemon with no supervisors running
     daemon = await startDaemonServer({
-      socketPath,
       token,
       projectRoot: ctx.root,
       reconcileIntervalSeconds: 999,

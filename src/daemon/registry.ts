@@ -40,15 +40,16 @@ import {
   getDaemonDir,
   getRootPath,
   PID_FILE,
-  SOCKET_FILE,
-  TOKEN_FILE,
   ROOT_FILE,
+  WEB_PORT_FILE,
+  WEB_HOST_FILE,
 } from './paths';
 import { isProcessAlive } from './lifecycle';
 import { probeDaemonLock, readProcessCommands, commandVerdict } from './process-identity';
 
 /** Status payload returned by GET /daemon/status (subset we care about). */
 interface DaemonStatusPayload {
+  projectRoot?: string;
   uptime?: number;
   version?: string;
   buildTime?: string;
@@ -61,8 +62,9 @@ interface DaemonStatusPayload {
  * lazy daemon"; the last two mean "the recorded pid is not this daemon".
  */
 export type DaemonIdentity =
-  /** The daemon answered on its own unix socket — definitive. */
-  | 'socket'
+  /** The daemon answered /daemon/status on the dir's recorded TCP port AND
+   *  named this dir's project root — definitive. */
+  | 'status'
   /** Something holds the dir's `daemon.lock` — definitive. */
   | 'lock'
   /** The pid's command line looks like `lazy daemon start …`. */
@@ -77,11 +79,11 @@ export type DaemonIdentity =
   | 'no-process';
 
 /** Identities that count as a running lazy daemon. */
-const LIVE_IDENTITIES = new Set<DaemonIdentity>(['socket', 'lock', 'command', 'unverified']);
+const LIVE_IDENTITIES = new Set<DaemonIdentity>(['status', 'lock', 'command', 'unverified']);
 
 /** Strength ranking used to pick the winner when two dirs record one pid. */
 const IDENTITY_RANK: Record<DaemonIdentity, number> = {
-  socket: 4,
+  status: 4,
   lock: 3,
   command: 2,
   unverified: 1,
@@ -118,14 +120,14 @@ export interface DaemonRecord {
    * unknown root as stray — we can't prove its root is gone, so we leave it be.
    */
   stray: boolean;
-  /** Live status fields, present only when the daemon answered on its socket. */
+  /** Live status fields, present only when the daemon answered /daemon/status. */
   webPort?: number;
   bindHost?: string;
   version?: string;
   buildTime?: string;
-  /** Uptime in ms, from the live socket status. */
+  /** Uptime in ms, from the live status probe. */
   uptimeMs?: number;
-  /** mtime of the pidfile in epoch ms — age fallback when the socket is silent. */
+  /** mtime of the pidfile in epoch ms — age fallback when the status probe is silent. */
   pidMtimeMs?: number;
 }
 
@@ -177,24 +179,45 @@ async function dirExists(path: string): Promise<boolean> {
 }
 
 /**
- * Query a daemon's live status over its unix socket. The /daemon/status
- * endpoint requires no auth and is documented to respond immediately, so this
- * is a cheap liveness+metadata probe. Returns null if the socket is absent or
- * the daemon doesn't answer (dead, hung, or starting up).
+ * Query a daemon's live status over the TCP port recorded in its dir. The
+ * /daemon/status endpoint requires no auth and is documented to respond
+ * immediately, so this is a cheap liveness+metadata probe.
+ *
+ * IMPORTANT: unlike the old per-dir unix socket, a TCP port is NOT bound to a
+ * dir — the port window is shared across projects, so the recorded port may
+ * now be held by a DIFFERENT project's daemon. A response only proves this
+ * dir's daemon is alive when the payload's `projectRoot` matches the dir's
+ * recorded root. On any mismatch — or when the dir has no recorded root to
+ * compare against — return null and let the flock probe decide instead.
+ *
+ * Returns null when no port is recorded, nothing answers (dead, hung, or
+ * starting up), or the answering daemon serves another project.
  */
-async function fetchStatusInDir(dir: string): Promise<DaemonStatusPayload | null> {
-  const socketPath = join(dir, SOCKET_FILE);
+async function fetchStatusInDir(dir: string, expectedRoot: string | null): Promise<DaemonStatusPayload | null> {
+  if (expectedRoot === null) return null;
   if (!(await dirExists(dir))) return null;
+  let target: string;
   try {
-    const response = await fetch('http://localhost/daemon/status', {
-      unix: socketPath,
+    const port = parseInt((await readFile(join(dir, WEB_PORT_FILE), 'utf-8')).trim(), 10);
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+    const rawHost = await readFile(join(dir, WEB_HOST_FILE), 'utf-8').then(h => h.trim()).catch(() => '');
+    const host = rawHost === '' || rawHost === '0.0.0.0' || rawHost === '::' ? '127.0.0.1' : rawHost;
+    target = `http://${host}:${port}`;
+  } catch {
+    // No recorded port — nothing to probe.
+    return null;
+  }
+  try {
+    const response = await fetch(`${target}/daemon/status`, {
       // A wedged daemon should not hang the whole scan.
       signal: AbortSignal.timeout(1500),
-    } as any);
+    });
     if (!response.ok) return null;
-    return (await response.json()) as DaemonStatusPayload;
+    const payload = (await response.json()) as DaemonStatusPayload;
+    if (payload.projectRoot !== expectedRoot) return null;
+    return payload;
   } catch {
-    // No socket / connection refused / timeout — not reachable.
+    // Connection refused / timeout — not reachable.
     return null;
   }
 }
@@ -255,11 +278,11 @@ export async function enumerateDaemons(): Promise<DaemonRecord[]> {
       if (!pidAlive) return record;
 
       // Both identity probes are cheap and independent — run them together
-      // with the pidfile stat. The socket probe against a dir with no listener
-      // fails immediately (ENOENT/ECONNREFUSED); only a wedged daemon pays the
-      // timeout, and that daemon is genuinely alive.
+      // with the pidfile stat. The status probe against a port with no
+      // listener fails immediately (ECONNREFUSED); only a wedged daemon pays
+      // the timeout, and that daemon is genuinely alive.
       const [status, lock, mtime] = await Promise.all([
-        fetchStatusInDir(dir),
+        fetchStatusInDir(dir, projectRoot),
         probeDaemonLock(dir),
         pidMtimeInDir(dir),
       ]);
@@ -272,10 +295,10 @@ export async function enumerateDaemons(): Promise<DaemonRecord[]> {
         record.uptimeMs = status.uptime;
       }
 
-      // Strongest signal wins. When neither the socket nor the lock can decide,
-      // the record stays 'unverified' and the command-line fallback below
-      // refines it — batched, so the whole scan costs at most one `ps`.
-      if (status) record.identity = 'socket';
+      // Strongest signal wins. When neither the status probe nor the lock can
+      // decide, the record stays 'unverified' and the command-line fallback
+      // below refines it — batched, so the whole scan costs at most one `ps`.
+      if (status) record.identity = 'status';
       else if (lock === 'held') record.identity = 'lock';
       else if (lock === 'free') record.identity = 'pid-reused';
       else record.identity = 'unverified';

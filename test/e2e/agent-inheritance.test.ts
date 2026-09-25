@@ -17,7 +17,7 @@ import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectError, extractTaskId } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
-import { readTaskJson } from '../helpers/storage';
+import { readTaskJson, writeTaskJson } from '../helpers/storage';
 
 /** The agent recorded on a task, straight from storage. */
 function agentOf(root: string, taskId: string): string {
@@ -44,7 +44,7 @@ describe('agent inheritance on task creation', () => {
   });
 
   test('lazy create rejects an unknown agent, naming the valid ones', async () => {
-    const result = await ctx.lazy(['create', '--goal', 'Bad agent', '--agent', 'codex']);
+    const result = await ctx.lazy(['create', '--goal', 'Bad agent', '--agent', 'not-an-agent']);
     expectFailure(result);
     expectError(result, 'Unknown agent');
   });
@@ -118,7 +118,7 @@ describe('agent inheritance on task creation', () => {
   test('lazy edit rejects an unknown agent without changing anything', async () => {
     const taskId = await createTask(ctx, 'Keep my agent');
 
-    const result = await ctx.lazy(['edit', taskId, '--agent', 'codex']);
+    const result = await ctx.lazy(['edit', taskId, '--agent', 'not-an-agent']);
     expectFailure(result);
     expectError(result, 'Unknown agent');
 
@@ -193,6 +193,59 @@ describe('agent switching on started tasks', () => {
     expect(agentOf(ctx.root, taskId)).toBe(before);
   });
 
+  // INVARIANT: switching agents mid-task re-resolves model/effort for the new
+  // agent. Carrying a previous agent's `opus` into Cursor is what produced a
+  // fatal_auth on Cursor's Opus quota (fix-agent-switch-resolution).
+  test('edit --agent re-resolves a stored model and announces the change', async () => {
+    const taskId = await startedTask();
+    // Seed the claude-code default that a real launch would have persisted.
+    const before = readTaskJson(ctx.root, taskId);
+    writeTaskJson(ctx.root, taskId, {
+      ...before,
+      model: 'opus',
+      metadata: { ...(before.metadata ?? {}), effort: 'high' },
+    });
+
+    const result = await ctx.lazy(['edit', taskId, '--agent', 'cursor']);
+    expectSuccess(result);
+    expect(result.stdout).toContain('claude-code → cursor');
+    expect(result.stdout).toContain('opus → auto');
+    expect(result.stdout).toMatch(/Effort:.*high →/);
+
+    const after = readTaskJson(ctx.root, taskId);
+    expect(after.agent_id).toBe('cursor');
+    expect(after.model).toBe('auto');
+  });
+
+  // Co-supplied --model on the same write is "chosen for THIS agent" and must
+  // survive; an empty model with the switch must fail at switch time.
+  test('edit --agent --model keeps the co-supplied model for the new agent', async () => {
+    const taskId = await startedTask();
+    const before = readTaskJson(ctx.root, taskId);
+    writeTaskJson(ctx.root, taskId, { ...before, model: 'opus' });
+
+    const result = await ctx.lazy(['edit', taskId, '--agent', 'cursor', '--model', 'gpt-5']);
+    expectSuccess(result);
+    expect(result.stdout).toContain('gpt-5');
+
+    expect(readTaskJson(ctx.root, taskId).model).toBe('gpt-5');
+  });
+
+  test('edit --agent with an invalid effort fails at switch time', async () => {
+    const taskId = await startedTask();
+    const before = readTaskJson(ctx.root, taskId);
+    writeTaskJson(ctx.root, taskId, { ...before, model: 'opus' });
+
+    const result = await ctx.lazy(['edit', taskId, '--agent', 'cursor', '--effort', 'ludicrous']);
+    expectFailure(result);
+    expectError(result, 'Invalid effort');
+
+    // Nothing applied — agent and model unchanged.
+    const after = readTaskJson(ctx.root, taskId);
+    expect(after.agent_id).toBe('claude-code');
+    expect(after.model).toBe('opus');
+  });
+
   // `unblock --agent` is edit + unblock in one step: deliver the feedback AND
   // retarget the next turn, so the human does not have to run two commands.
   test('unblock --agent switches the agent while delivering feedback', async () => {
@@ -205,13 +258,15 @@ describe('agent switching on started tasks', () => {
     expectSuccess(result);
 
     expect(agentOf(ctx.root, taskId)).toBe('cursor');
+    // Re-resolve must have landed Cursor's default, not the prior turn's model.
+    expect(readTaskJson(ctx.root, taskId).model).toBe('auto');
   });
 
   test('unblock rejects an unknown agent', async () => {
     const taskId = await startedTask();
 
     const result = await ctx.lazyMocked(
-      ['unblock', taskId, '--message', 'go', '--agent', 'codex', '--yes'],
+      ['unblock', taskId, '--message', 'go', '--agent', 'not-an-agent', '--yes'],
       MOCK_CLAUDE_SUCCESS,
     );
     expectFailure(result);

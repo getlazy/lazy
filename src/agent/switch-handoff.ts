@@ -12,47 +12,30 @@
 
 import type { Turn } from '../types';
 import { getDiffStat, getNewCommits } from '../git/operations';
-import { runGit } from '../utils/git';
-import { buildTurnHistoryContext } from '../cli/commands/shared';
+import { buildTurnHistoryContext } from '../task/turn-context';
 import handoffTemplate from '../prompts/agent-switch-handoff.md' with { type: 'text' };
 
 /**
- * Classify whether a merge commit's tree matches one of its parents
- * (conflict-free / no unique content from the merge itself).
- * Returns null when the commit is not a merge or git fails.
- */
-async function mergeIsTreeEquivalent(
-  sha: string,
-  cwd: string,
-): Promise<{ parents: string[]; treeMatchesParent: boolean } | null> {
-  const parentsResult = await runGit(['rev-list', '--parents', '-n', '1', sha], { cwd });
-  if (parentsResult.exitCode !== 0 || !parentsResult.stdout.trim()) return null;
-
-  // Format: "<sha> <parent1> <parent2> ..."
-  const parts = parentsResult.stdout.trim().split(/\s+/);
-  if (parts.length < 3) return null; // not a merge
-  const parents = parts.slice(1);
-
-  const treeOf = async (ref: string): Promise<string | null> => {
-    const r = await runGit(['rev-parse', `${ref}^{tree}`], { cwd });
-    return r.exitCode === 0 ? r.stdout.trim() : null;
-  };
-
-  const mergeTree = await treeOf(sha);
-  if (!mergeTree) return null;
-
-  for (const parent of parents) {
-    const parentTree = await treeOf(parent);
-    if (parentTree && parentTree === mergeTree) {
-      return { parents, treeMatchesParent: true };
-    }
-  }
-  return { parents, treeMatchesParent: false };
-}
-
-/**
- * Build a short branch orientation block: changed-file stat + task commits,
- * omitting conflict-free merge commits when detectable.
+ * Build a short branch orientation block: changed-file stat + task commits.
+ *
+ * The list is a FIRST-PARENT walk, and that choice replaced an earlier
+ * noise filter that must not come back. The walk used to be
+ * `<base>..HEAD` — a reachability query — which listed every commit of every
+ * line the branch had ever merged, so a synced branch introduced itself to the
+ * new agent with months of other tasks' history. To keep that readable, merges
+ * whose tree equalled one of their parents were dropped from the list: safe at
+ * the time, because the commits that merge carried were listed individually
+ * anyway.
+ *
+ * Under a first-parent walk that filter INVERTS: the merge commit is the only
+ * representative of the line it brought in, so omitting it dropped that work
+ * from the handoff with nothing left to stand for it. First-parent already
+ * collapses a merged line to a single line of output, which is all the noise
+ * filter was ever for, so the filter is gone rather than repaired.
+ *
+ * Clean upstream syncs are still called out — from the TURN records via
+ * `cleanSyncTurnCount`, which knows a sync from a child accept; the shape of a
+ * commit's tree never did.
  */
 export async function buildTaskOrientationContext(opts: {
   branchName: string;
@@ -71,21 +54,20 @@ export async function buildTaskOrientationContext(opts: {
     // Orientation is best-effort — never block the turn.
   }
 
-  const commits = await getNewCommits(gitStartSha, worktreePath);
-  const kept: string[] = [];
-  let omittedMerges = 0;
-
-  for (const c of commits) {
-    const mergeInfo = await mergeIsTreeEquivalent(c.sha, worktreePath);
-    if (mergeInfo?.treeMatchesParent) {
-      omittedMerges += 1;
-      continue;
-    }
-    // Non-merge, or a merge that actually changed the tree (e.g. conflict resolution).
-    const subject = c.message.split('\n')[0] ?? c.message;
-    const tag = mergeInfo ? ' (merge with unique content)' : '';
-    kept.push(`- \`${c.sha.slice(0, 8)}\` ${subject}${tag}`);
+  // First-parent: orientation is what THIS branch did. Without it a branch that
+  // has synced its upstream lists that upstream's commits as its own work.
+  let commits: Awaited<ReturnType<typeof getNewCommits>> = [];
+  try {
+    commits = await getNewCommits(gitStartSha, worktreePath, { firstParent: true });
+  } catch {
+    // Same best-effort contract as the file stat above: orientation must never
+    // block a turn. An unreadable branch yields no commit list, and the block
+    // below says so rather than implying the branch is empty.
   }
+  const kept = commits.map(c => {
+    const subject = c.message.split('\n')[0] ?? c.message;
+    return `- \`${c.sha.slice(0, 8)}\` ${subject}`;
+  });
 
   const syncNote =
     opts.cleanSyncTurnCount && opts.cleanSyncTurnCount > 0
@@ -99,13 +81,12 @@ export async function buildTaskOrientationContext(opts: {
   const commitsBlock =
     kept.length > 0
       ? kept.join('\n')
-      : '(no non-omitted commits since base)';
+      : '(no commits since base, or the branch could not be read)';
 
   return `## Branch orientation
 
 - Branch: \`${branchName}\`
-- Base SHA: \`${baseShort}\`
-- Conflict-free merge commits omitted from the list below: ${omittedMerges}${syncNote}
+- Base SHA: \`${baseShort}\`${syncNote}
 
 ### Files changed since base
 
@@ -113,7 +94,7 @@ export async function buildTaskOrientationContext(opts: {
 ${filesBlock}
 \`\`\`
 
-### Task commits (conflict-free merges omitted)
+### Task commits (first-parent — a merge is one line, not the line it merged)
 
 ${commitsBlock}
 `;

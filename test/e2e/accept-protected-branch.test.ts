@@ -5,6 +5,7 @@ import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 
 /**
  * Tests for accept behavior on protected branches.
@@ -81,6 +82,8 @@ describe('lazy accept protected branch', () => {
     if (waitResult.exitCode !== 0) {
       throw new Error(`wait failed for ${taskId}: ${waitResult.stderr}\n${waitResult.stdout}`);
     }
+    // Fixture setup, not the subject (see test/helpers/final.ts).
+    await seedFinal(ctx, taskId);
 
     // Add a file in the worktree so there's something to merge
     const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);

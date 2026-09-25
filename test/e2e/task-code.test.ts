@@ -93,7 +93,7 @@ describe('task codes', () => {
     const result = await ctx.lazy(['create', '--goal', 'Test', '--code', 'x']);
 
     expectFailure(result);
-    expectError(result, 'Code must be 2-80 characters');
+    expectError(result, 'Code must be 2-63 characters');
   });
 
   test('accepts minimum length code (2 chars)', async () => {
@@ -103,20 +103,23 @@ describe('task codes', () => {
     expectOutput(result, 'Code:   ab');
   });
 
-  test('accepts maximum length code (80 chars)', async () => {
-    const code80 = 'a'.repeat(80);
-    const result = await ctx.lazy(['create', '--goal', 'Test', '--code', code80]);
+  // INVARIANT: a task code is a DNS label. Its services are served at
+  // <service>.<code>.lazy.localhost, and 63 octets is the label limit every
+  // resolver enforces — so the code limit is that limit, not a lazy choice.
+  test('accepts maximum length code (63 chars)', async () => {
+    const code63 = 'a'.repeat(63);
+    const result = await ctx.lazy(['create', '--goal', 'Test', '--code', code63]);
 
     expectSuccess(result);
-    expectOutput(result, `Code:   ${code80}`);
+    expectOutput(result, `Code:   ${code63}`);
   });
 
-  test('rejects code longer than 80 characters', async () => {
-    const code81 = 'a'.repeat(81);
-    const result = await ctx.lazy(['create', '--goal', 'Test', '--code', code81]);
+  test('rejects code longer than 63 characters', async () => {
+    const code64 = 'a'.repeat(64);
+    const result = await ctx.lazy(['create', '--goal', 'Test', '--code', code64]);
 
     expectFailure(result);
-    expectError(result, 'Task code must be 80 characters or fewer (got 81)');
+    expectError(result, 'Task code must be 63 characters or fewer (got 64)');
   });
 
   test('accepts a 40-character code', async () => {
@@ -262,25 +265,32 @@ describe('task codes', () => {
     expectOutput(result, 'Code:   42');
   });
 
-  test('code with dots is accepted', async () => {
+  // INVARIANT: a new code may not contain a dot. It becomes one label of
+  // <service>.<code>.lazy.localhost, and a dotted code would silently split
+  // into two labels there — addressing a task that does not exist. Codes
+  // created before this rule keep working; they are simply addressed by their
+  // short id in a hostname.
+  test('code with dots is rejected, and the error says why', async () => {
     const result = await ctx.lazy(['create', '--goal', 'Release v0.5', '--code', 'release-v0.5']);
 
-    expectSuccess(result);
-    expectOutput(result, 'Code:   release-v0.5');
+    expectFailure(result);
+    expectError(result, 'must not contain dots');
+    // The remedy, spelled out: the same code with hyphens.
+    expectError(result, 'release-v0-5');
   });
 
-  test('code with multiple dots is accepted', async () => {
+  test('code with multiple dots is rejected', async () => {
     const result = await ctx.lazy(['create', '--goal', 'Version 1.2.3', '--code', 'v1.2.3']);
 
-    expectSuccess(result);
-    expectOutput(result, 'Code:   v1.2.3');
+    expectFailure(result);
+    expectError(result, 'must not contain dots');
   });
 
-  test('code with dots and hyphens is accepted', async () => {
+  test('code with dots and hyphens is rejected', async () => {
     const result = await ctx.lazy(['create', '--goal', 'Hotfix version 2.1', '--code', 'hotfix-v2.1']);
 
-    expectSuccess(result);
-    expectOutput(result, 'Code:   hotfix-v2.1');
+    expectFailure(result);
+    expectError(result, 'must not contain dots');
   });
 
   test('code starting with dot is rejected', async () => {

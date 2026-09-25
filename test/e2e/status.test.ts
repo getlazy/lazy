@@ -5,6 +5,7 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput, expectOutputExcludes } from '../helpers/assertions';
 import { createTask, disablePreAccept, startAndReconcile } from '../helpers/fixtures';
 import { worktreePathFor } from '../helpers/storage';
+import { seedFinal } from '../helpers/final';
 
 /**
  * Helper: create a task, start it, make a commit in the worktree.
@@ -25,6 +26,10 @@ async function createStartedTaskWithCommit(ctx: TestContext, goal: string): Prom
 
   const gitCommit = ctx.git('-C', worktreePath, 'commit', '-m', 'Add feature');
   expect(gitCommit.exitCode).toBe(0);
+
+  // Fixture setup, not the subject (see test/helpers/final.ts). Daemonless
+  // suite, so the final is seeded at the storage level.
+  await seedFinal(ctx, taskId);
 
   return taskId;
 }

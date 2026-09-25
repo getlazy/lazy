@@ -1,17 +1,21 @@
 import { existsSync } from 'fs';
-import { requireLazyRoot, requireStorage, displayId, parseFlags, resolveTaskOrExit, parseLineRange, sliceLines, getWorktreePath, getBranchNameFromId } from '../helpers';
+import { displayId, getWorktreePath, getBranchNameFromId } from '../../task/identity';
+import { requireLazyRoot, requireStorage, parseFlags, resolveTaskOrExit, parseLineRange, sliceLines } from '../helpers';
 import { getCurrentBranch, getRemoteDefaultBranch, recoverMissingWorktreeWithFetch } from '../../git/operations';
 import { getTurnDiff } from '../../utils/diff';
 import { loadConfig } from '../../config/loader';
-import { createDriver, resolveUpstreamMergeRef } from '../../remote';
 import { queryDiff } from '../../daemon/rpc-fallback';
 import { parentTaskIdOf } from '../../task-target';
+import { resolveTaskDiffBase } from '../../task-diff-base';
+import type { Session, Task } from '../../types';
 
 export async function commandDiff(args: string[]): Promise<void> {
   // Parse and validate flags
   const parsed = parseFlags(args, [
     { name: 'turn', takesValue: true },
     { name: 'full', takesValue: false },
+    { name: 'full-branch', takesValue: false },
+    { name: 'region', aliases: ['r'], takesValue: true },
     { name: 'lines', takesValue: true },
   ], 'diff');
 
@@ -63,7 +67,7 @@ export async function commandDiff(args: string[]): Promise<void> {
           process.exit(1);
         }
       }
-      await handleTurnDiff(storage, sess.id, turnValue, worktreePath, parentTaskIdOf(task), root, lineRange);
+      await handleTurnDiff(storage, sess.id, turnValue, worktreePath, task, root, lineRange);
     } finally {
       await storage.close();
     }
@@ -72,7 +76,9 @@ export async function commandDiff(args: string[]): Promise<void> {
 
   // Default diff via daemon RPC
   const full = parsed.flags.get('full') === true;
-  const { output: diffOutput } = await queryDiff({ taskId, full });
+  const fullBranch = parsed.flags.get('full-branch') === true;
+  const region = parsed.flags.get('region') as string | undefined;
+  const { output: diffOutput } = await queryDiff({ taskId, full, fullBranch, region });
 
   let output = diffOutput;
   if (lineRange) {
@@ -90,7 +96,7 @@ async function handleTurnDiff(
   sessionId: string,
   turnValue: string,
   worktreePath: string,
-  parentTaskId: string | null,
+  task: Task,
   root: string,
   lineRange: ReturnType<typeof parseLineRange> | null = null,
 ): Promise<void> {
@@ -118,33 +124,31 @@ async function handleTurnDiff(
     }
   }
 
-  // Compute fallback ref for tasks without per-turn SHAs
-  // Resolve through driver to get origin/<branch> when using remote driver.
-  let fallbackFromRef: string | undefined;
-  if (parentTaskId) {
-    fallbackFromRef = await getBranchNameFromId(parentTaskId, storage);
-  } else {
-    fallbackFromRef = await getRemoteDefaultBranch(root);
-  }
-
-  // Resolve the base ref the same way accept and sync do: origin/<branch> for a
-  // protected target, the local branch when that is what accept merges into.
-  // Rendering a turn diff against a stale origin ref while the local parent has
-  // moved on shows the parent's commits as if the task had made them.
-  try {
-    const config = await loadConfig(root);
-    const driver = createDriver(config);
-    const resolution = await resolveUpstreamMergeRef(driver, fallbackFromRef, worktreePath, {
-      remoteName: config.remote.git_remote,
-    });
-    fallbackFromRef = resolution.ref;
-  } catch {
-    // Non-fatal: use the local ref if driver resolution fails
-  }
-
   // Get the session to access upstream_merge_sha for backward compat turns
   const session = await storage.getSession(sessionId);
   const upstreamMergeSha = session?.upstream_merge_sha ?? undefined;
+
+  // Fallback ref for turns without per-turn SHAs: the ref the task branch was
+  // cut from, resolved once through the shared resolver (src/task-diff-base.ts)
+  // so this cannot disagree with `lazy diff`, the review surface or accept.
+  let fallbackFromRef: string | undefined;
+  try {
+    const base = await resolveTaskDiffBase({
+      task,
+      session: session ?? ({} as Session),
+      storage,
+      projectRoot: root,
+      worktreePath,
+      config: await loadConfig(root),
+    });
+    fallbackFromRef = base.ref;
+  } catch {
+    // Non-fatal: a turn diff with per-turn SHAs does not need this at all.
+    const parentTaskId = parentTaskIdOf(task);
+    fallbackFromRef = parentTaskId
+      ? await getBranchNameFromId(parentTaskId, storage)
+      : await getRemoteDefaultBranch(root);
+  }
 
   const result = await getTurnDiff(targetTurn, worktreePath, fallbackFromRef, upstreamMergeSha);
 
@@ -173,9 +177,11 @@ async function handleTurnDiff(
 }
 
 export function diffUsage(): void {
-  console.log(`Usage: lazy diff <task_id> [--full] [--turn N|latest] [--lines N..M]
+  console.log(`Usage: lazy diff <task_id> [--full] [--full-branch] [--region <id>] [--turn N|latest] [--lines N..M]
 
 Show changes made by a task relative to its upstream branch.
+A task with accepted children (a release hub) shows only its own direct
+changes by default — the children's files were already reviewed at accept.
 Comments added since the last agent turn are shown as virtual diff additions.
 
 Arguments:
@@ -183,6 +189,9 @@ Arguments:
 
 Options:
   --full           Show full diff (default: stat summary)
+  --full-branch    Include accepted children's files (whole branch vs upstream)
+  -r, --region <id>  Scope the diff to one review region's files (implies
+                   --full-branch). List regions with: lazy regions <task_id>
   --turn N|latest  Show diff for a specific turn only
   --lines N..M     Return only lines N through M of the output (1-indexed, inclusive)
                    Formats: N..M (range), N.. (from N to end), ..M (start to M)
@@ -190,6 +199,8 @@ Options:
 Examples:
   lazy diff abc123                    # Summary of all changes vs upstream
   lazy diff abc123 --full             # Full diff vs upstream
+  lazy diff abc123 --full-branch      # Whole branch, including accepted children
+  lazy diff abc123 --region task:fix-x --full   # Just that region's files
   lazy diff abc123 --turn latest      # Diff for the most recent turn
   lazy diff abc123 --turn 1           # Diff for turn 1
   lazy diff abc123 --lines 10..50     # Show only lines 10-50 of diff output

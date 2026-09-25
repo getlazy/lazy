@@ -15,8 +15,9 @@
  * aborting" — with a 30-minute default for stdio servers
  * (CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT). Its hard ceiling is ~27.8h, so progress
  * is the whole game. This server emitted no progress at all, which is why a
- * `lazy_accept` whose pre-accept turn is itself bounded at 30 minutes was
- * guaranteed to straddle the limit and be abandoned mid-merge.
+ * `lazy_accept` whose mechanical gate and merge are themselves bounded well
+ * past 30 minutes was guaranteed to straddle the limit and be abandoned
+ * mid-merge.
  *
  * See {@link McpServer.handleToolCall} for what we do and do NOT emit progress
  * for — it is deliberately evidence-driven, not a keepalive ticker.

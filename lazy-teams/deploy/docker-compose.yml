@@ -1,0 +1,134 @@
+# Lazy Teams self-host stack (single box).
+#
+# Pull-and-go (operators):
+#
+#   cd lazy-teams/deploy
+#   ./bootstrap.sh
+#   docker compose pull
+#   docker compose up -d
+#
+# Build from source (developers):
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# See public-docs/self-hosting-lazy-teams.md for the full operator guide.
+
+name: lazy-teams
+
+services:
+  app:
+    image: ${LAZY_TEAMS_IMAGE:-ghcr.io/getlazy/lazy-teams:${LAZY_TEAMS_TAG:-latest}}
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Fleet supervisor defaults — explicit so operators know where data lives.
+      LAZY_FLEET_ROOT: /var/lib/lazy-fleet
+      LAZY_TEAMS_STORAGE_DIR: /lazy/lazy-teams/storage
+      SOLID_QUEUE_IN_PUMA: "true"
+      # Mail is optional; without SMTP_* the app boots and simply does not send.
+      RAILS_LOG_LEVEL: ${RAILS_LOG_LEVEL:-info}
+    volumes:
+      # REQUIRED: losing either volume loses the install.
+      #   lazy_teams_storage — Rails SQLite (teams, users, encrypted credentials)
+      #   lazy_teams_fleet   — per-project stores, git clones, daemon state
+      - lazy_teams_storage:/lazy/lazy-teams/storage
+      #
+      # THE FLEET ROOT CAN BE A DIRECTORY ON THIS HOST INSTEAD.
+      #
+      # Set LAZY_FLEET_HOST_PATH in .env to an absolute host path and the whole
+      # fleet root — every project's store, clones and daemon markers — lands
+      # there, where ordinary tools can see it: `ls`, a backup, an editor, and
+      # the store-adoption flow, which names a path on this host. Unset, it
+      # stays the named volume, which on Docker Desktop lives inside the VM and
+      # is reachable only through a container.
+      #
+      # On Docker Desktop a bind mount follows the HOST PATH, not the directory
+      # that was there when the container started: rename or replace the
+      # directory on the Mac and the running container sees the new one under
+      # the same path. So never move or re-create this directory under a running
+      # install — stop the stack, move it, point LAZY_FLEET_HOST_PATH at the new
+      # location, start again.
+      - ${LAZY_FLEET_HOST_PATH:-lazy_teams_fleet}:/var/lib/lazy-fleet
+      #
+      # THE HOST DOCKER SOCKET IS DELIBERATELY NOT MOUNTED HERE.
+      #
+      # It used to be, to launch task containers as siblings on the host daemon
+      # — and this install cannot do that (see the "Task turns" section of
+      # public-docs/self-hosting-lazy-teams.md). A bind mount of the socket is
+      # equivalent to handing root on the host to anything that can execute
+      # code in this container, so keeping it for a capability that no longer
+      # exists was pure cost.
+      #
+      # Nothing here needs it: no Rails code touches it, the daemons refuse
+      # every container launch before reaching it, and the entrypoint's socket
+      # handling is conditional on the socket existing, so boot succeeds
+      # without one.
+      #
+      # Two things still want it, both opt-in, and both add it back with
+      # deploy/docker-compose.docker-socket.yml:
+      #   - LAZY_TEAMS_BUILD_RUNNER=1, which builds the agent image on the host
+      #   - bin/self-host-accept, which asks the host daemon what it created
+      #
+      #   docker compose -f docker-compose.yml -f docker-compose.docker-socket.yml up -d
+    #
+    # /dev/kvm: HOW THIS INSTALL RUNS AGENT TURNS.
+    #
+    # Each project runs in its own microVM (the default `smolvm` fleet backend,
+    # vendored and digest-verified in the image). The device lets this
+    # container create VMs and nothing more: it is not the Docker socket, no
+    # capability is added, the container stays unprivileged, and the app runs
+    # smolvm as uid 1000 — never root — in the device's group, which the
+    # entrypoint joins by itself — unless that gid already belongs to another
+    # group in the image, which it refuses (the grant is the gid, not a name).
+    #
+    # A host with no KVM (no hardware virtualization, most small cloud VMs,
+    # Docker Desktop on a Mac) cannot start this service with the device
+    # listed. Run it with docker-compose.local-backend.yml added instead —
+    # bootstrap.sh does that for you when it finds no /dev/kvm — and you get
+    # the whole product except agent turns.
+    devices:
+      - /dev/kvm
+    # Direct HTTP, bound to the loopback interface by default.
+    #
+    # This port carries plain HTTP: the session cookie that identifies an
+    # administrator crosses it in the clear. Published on 0.0.0.0 it is the
+    # whole application, unencrypted, on the public internet — so the default
+    # is 127.0.0.1 and reaching it from another machine is a deliberate act
+    # (an SSH tunnel, a reverse proxy on this host, or APP_DIRECT_BIND).
+    #
+    # The `tls` profile is unaffected: Caddy reaches the app as `app:80` over
+    # the compose network, which never touches a published port.
+    ports:
+      - "${APP_DIRECT_BIND:-127.0.0.1}:${APP_DIRECT_PORT:-3000}:80"
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://127.0.0.1/up" ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 120s
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    profiles:
+      - tls
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    environment:
+      APP_HOST: ${APP_HOST:?set APP_HOST in .env — the public hostname for this install}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  lazy_teams_storage:
+  lazy_teams_fleet:
+  caddy_data:
+  caddy_config:

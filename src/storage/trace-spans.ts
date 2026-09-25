@@ -8,7 +8,7 @@
  * concurrency note in docs/spikes/timings.md).
  *
  * Kept out of the individual backend classes so the three implementations
- * (file/postgres/remote) stay one-liners delegating here with their own
+ * (file/remote) stay one-liners delegating here with their own
  * storage path — the Storage abstraction owns the API, this owns the format.
  */
 import { join } from 'path';

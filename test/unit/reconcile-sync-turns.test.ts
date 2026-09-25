@@ -30,7 +30,7 @@ import { FileStorage } from '../../src/storage';
 import { handleCompletedResponses } from '../../src/utils/reconcile';
 import { protocolDir as getProtocolDir } from '../../src/protocol';
 import type { CompletedResponse } from '../../src/protocol';
-import { getWorktreePathForRef, taskRef } from '../../src/cli/helpers';
+import { getWorktreePathForRef, taskRef } from '../../src/task/identity';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 
 function git(cwd: string, ...args: string[]): string {
@@ -263,6 +263,100 @@ describe('reconciler: upstream-merge (sync) turns', () => {
     expect((await env.storage.getSessionByTaskId(ref))!.agent_session_id).toBe('sess-merge-resolve');
 
     expect((await env.storage.getTask(taskId))!.status).toBe('blocked');
+  });
+
+  // INVARIANT 6: a sync is TWO steps — the task's own branch on origin first,
+  // then the parent — and each step's turns are recorded, in that order. The
+  // reconciler must group announcements with the agent reply that follows them,
+  // not assume a fixed "responses[0] is the merge, responses[1] is the agent".
+  test('two-step sync records the origin step before the parent step, each with its own agent reply', async () => {
+    const { ref, taskId, sessionId, worktreePath } = await makeWorkingTask(env, 'two-step sync');
+    const session = await env.storage.getSessionByTaskId(ref);
+    const protoDir = getProtocolDir(taskId);
+
+    const originSha = commitMerge(worktreePath, 'from-colleague.txt');
+    const parentSha = commitMerge(worktreePath, 'from-upstream.txt');
+
+    const responses: CompletedResponse[] = [
+      {
+        status: 'completed',
+        result: `Merged origin/lazy/twostep @ ${originSha.substring(0, 8)} with 1 resolved conflict(s). HEAD: ${env.baseSha.substring(0, 8)} → ${originSha.substring(0, 8)}.`,
+        session_id: '',
+        usage: { input_tokens: 0, output_tokens: 0 },
+        sync: { merged: true, conflicts: 1 },
+      },
+      {
+        status: 'completed',
+        result: 'Resolved the colleague conflict by keeping both edits.',
+        session_id: 'sess-origin-resolve',
+        usage: SYNC_USAGE,
+        start_sha_work: env.baseSha,
+        end_sha_work: originSha,
+      },
+      {
+        status: 'completed',
+        result: `Merged main @ ${parentSha.substring(0, 8)}. HEAD: ${originSha.substring(0, 8)} → ${parentSha.substring(0, 8)}.`,
+        session_id: '',
+        usage: { input_tokens: 0, output_tokens: 0 },
+        sync: { merged: true, conflicts: 0 },
+        start_sha_work: originSha,
+        end_sha_work: parentSha,
+      },
+    ];
+
+    await handleCompletedResponses(env.storage, taskId, sessionArg(session!), responses, worktreePath, protoDir);
+
+    const syncTurns = (await env.storage.getSessionTurns(sessionId)).filter(t => t.turn_type === 'sync');
+    expect(syncTurns).toHaveLength(3);
+    expect(syncTurns[0].content).toContain('Merged origin/lazy/twostep');
+    expect(syncTurns[1].role).toBe('agent');
+    expect(syncTurns[1].content).toContain('keeping both edits');
+    expect(syncTurns[2].content).toContain('Merged main');
+
+    // Both merge commits land on the session, from the pre-sync HEAD forward.
+    const commits = await env.storage.getSessionCommits(sessionId);
+    expect(commits.some(c => c.sha === originSha)).toBe(true);
+    expect(commits.some(c => c.sha === parentSha)).toBe(true);
+
+    // The resolution turn's session id is what the session carries afterwards.
+    expect((await env.storage.getSessionByTaskId(ref))!.agent_session_id).toBe('sess-origin-resolve');
+    expect((await env.storage.getTask(taskId))!.status).toBe('blocked');
+  });
+
+  // INVARIANT 1 again, per step: the "already current" step is silent. An
+  // origin-only sync must not manufacture a parent turn saying nothing happened.
+  test('a step that was already current records no turn for that step', async () => {
+    const { ref, taskId, sessionId, worktreePath } = await makeWorkingTask(env, 'origin only sync');
+    const session = await env.storage.getSessionByTaskId(ref);
+    const protoDir = getProtocolDir(taskId);
+
+    const originSha = commitMerge(worktreePath, 'from-colleague.txt');
+
+    const responses: CompletedResponse[] = [
+      {
+        status: 'completed',
+        result: `Merged origin/lazy/originonly @ ${originSha.substring(0, 8)}. HEAD: ${env.baseSha.substring(0, 8)} → ${originSha.substring(0, 8)}.`,
+        session_id: '',
+        usage: { input_tokens: 0, output_tokens: 0 },
+        sync: { merged: true, conflicts: 0 },
+        start_sha_work: env.baseSha,
+        end_sha_work: originSha,
+      },
+      {
+        status: 'completed',
+        result: 'Already up to date: HEAD already contains main. No merge performed.',
+        session_id: '',
+        usage: { input_tokens: 0, output_tokens: 0 },
+        sync: { merged: false, conflicts: 0 },
+      },
+    ];
+
+    await handleCompletedResponses(env.storage, taskId, sessionArg(session!), responses, worktreePath, protoDir);
+
+    const syncTurns = (await env.storage.getSessionTurns(sessionId)).filter(t => t.turn_type === 'sync');
+    expect(syncTurns).toHaveLength(1);
+    expect(syncTurns[0].content).toContain('Merged origin/lazy/originonly');
+    expect(syncTurns.some(t => t.content.includes('Already up to date'))).toBe(false);
   });
 
   // INVARIANT 5: a second reconcile pass does not duplicate the sync turn.

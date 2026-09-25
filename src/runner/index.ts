@@ -8,7 +8,7 @@
  *   await runner.launchSupervisor(...);
  */
 
-export type { Runner, RunInfo, FollowHandle, RunnerType, HealthCheck } from './types';
+export type { Runner, RunInfo, FollowHandle, RunnerType, HealthCheck, DiagnoseOptions, RunInfoProbe } from './types';
 export { PROJECT_LABEL_KEY } from './docker-runner';
 
 import type { Runner } from './types';
@@ -16,8 +16,14 @@ import type { RunnerType, ResolvedConfig, RoleTarget } from '../config/types';
 import { DockerRunner } from './docker-runner';
 import { PodmanRunner } from './podman-runner';
 import { HostProcessRunner } from './host-process-runner';
+import {
+  assertHostRunnerConfigAllowed,
+  HOST_RUNNER_TYPE,
+  isHostRunnerType,
+} from './host-runner-gate';
 import { loadConfig } from '../config/loader';
 import { getAgentPackaging } from '../agent/registry';
+import { profileForAgentName } from '../config/agent-profiles';
 import { resolveLiveProxyUrl, needsLiveProxyUrl, applyLiveProxyUrl } from '../daemon/auth-env';
 
 /**
@@ -46,7 +52,9 @@ async function withProxyTargets(
   const proxyUrl = await resolveLiveProxyUrl(config);
   if (!proxyUrl) return roles; // explicit RPC-bypass modes only (test / daemon-self)
   const filled = { ...roles };
-  for (const role of needed) filled[role] = applyLiveProxyUrl(roles[role], proxyUrl);
+  for (const role of needed) {
+    filled[role] = applyLiveProxyUrl(roles[role], proxyUrl, config.proxy.upstream);
+  }
   return filled;
 }
 
@@ -92,18 +100,30 @@ export async function createRunner(lazyRoot: string, overrideType?: RunnerType):
   const config = await loadConfig(lazyRoot);
   const runnerType = overrideType ?? config.runner.type;
 
+  if (isHostRunnerType(runnerType)) {
+    assertHostRunnerConfigAllowed(
+      overrideType ? 'task runner override' : 'lazy.toml [runner] type',
+    );
+  }
+
   // Host-only agents cannot use container runners. Check against the RESOLVED
   // runner type, not the global default — a per-task host override is exactly
   // how a host-only agent is meant to run on a container-default project.
   // Capability comes from the agent's packaging, not a hardcoded id list.
-  const agentId = config.agent.agent_id;
+  //
+  // `[agent] agent_id` names a PROFILE; packaging is a property of its HARNESS.
+  // The profile is guaranteed to exist here — config load validates every
+  // profile reference — so this resolution cannot be the thing that fails.
+  const profileName = config.agent.agent_id;
+  const harness = profileForAgentName(config, profileName, 'lazy.toml [agent] agent_id').harness;
   if (
     (runnerType === 'docker' || runnerType === 'podman') &&
-    !getAgentPackaging(agentId).supportsContainerRunner()
+    !getAgentPackaging(harness).supportsContainerRunner()
   ) {
     throw new Error(
-      `The "${agentId}" agent only supports host-process runner. ` +
-      `Set runner = "dangerously-host-process-without-any-isolation" in lazy.toml or use a different agent.`
+      `The "${profileName}" agent profile runs ${harness}, which does not support container ` +
+      `runners. Point [agent] agent_id at a profile whose harness is claude-code, codex, ` +
+      `cursor, or pi to use [runner] type = "docker".`,
     );
   }
 
@@ -123,7 +143,7 @@ export async function createRunner(lazyRoot: string, overrideType?: RunnerType):
       runner.setRoleTargets(roleTargets);
       return runner;
     }
-    case 'dangerously-host-process-without-any-isolation': {
+    case HOST_RUNNER_TYPE: {
       const runner = new HostProcessRunner(lazyRoot);
       runner.setRoleTargets(roleTargets);
       runner.setHostPermission({
@@ -133,23 +153,26 @@ export async function createRunner(lazyRoot: string, overrideType?: RunnerType):
         denyRead: config.runner.sandbox_deny_read,
         denyWrite: config.runner.sandbox_deny_write,
       });
+      runner.setBoundaryVerification(config.runner.verify_sandbox_boundary);
       return runner;
     }
     default:
-      throw new Error(`Unknown runner type: ${runnerType}. Valid values: docker, podman, dangerously-host-process-without-any-isolation`);
+      throw new Error(`Unknown runner type: ${runnerType}. Valid values: docker, podman`);
   }
 }
 
-/** Create a Runner from an explicit runner type (used by supervisor inside container). */
+/**
+ * Create a Runner from an explicit runner type (used by supervisor inside container).
+ */
 export function createRunnerFromType(runnerType: RunnerType): Runner {
   switch (runnerType) {
     case 'docker':
       return new DockerRunner();
     case 'podman':
       return new PodmanRunner();
-    case 'dangerously-host-process-without-any-isolation':
+    case HOST_RUNNER_TYPE:
       return new HostProcessRunner();
     default:
-      throw new Error(`Unknown runner type: ${runnerType}. Valid values: docker, podman, dangerously-host-process-without-any-isolation`);
+      throw new Error(`Unknown runner type: ${runnerType}. Valid values: docker, podman`);
   }
 }

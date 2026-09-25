@@ -1,358 +1,109 @@
 /**
- * CLI helper functions
+ * CLI helper functions.
  *
- * Common utilities shared across CLI commands.
+ * Everything here is specific to being a one-shot command-line program: flag
+ * parsing, interactive disambiguation, and the wrappers that turn a
+ * precondition failure into stderr + exit(1). Anything a server could also want
+ * lives outside `src/cli/` — task identity in `src/task/identity.ts`, value
+ * formatting in `src/utils/format.ts`, the throwing precondition core in
+ * `src/preconditions.ts`.
  */
 
-import { join } from 'path';
-import { findLazyRoot, getDataDir } from './init';
 import type { Storage } from '../storage';
-import { repoHasCommits } from '../git/operations';
-import { taskBranchFor } from '../git/branch-prefix';
 import { checkPairingLock } from '../utils/pairing-lock';
 import { isTTY, promptChoice } from './editor';
-import type { Task, TokenUsage } from '../types';
-import { DaemonClient, RpcApplicationError } from '../daemon/client';
-import { RemoteStorage } from '../storage/remote-storage';
+import { loadConfig } from '../config/loader';
+import { agentProfileOrThrow, agentProfilesFor } from '../config/agent-profiles';
+import { LazyPreconditionError, resolveLazyRoot, resolveStorage } from '../preconditions';
+import { getWorktreePathForRef, shortId } from '../task/identity';
+import { formatDate } from '../utils/format';
+import { findGitRoot } from '../project-paths';
+import { readTeamsLogin, MultipleTeamsLoginsError } from '../teams/login';
 
 /**
- * Maximum length for task codes (in characters).
- * Used for validation in CLI and MCP tool schemas.
- */
-export const MAX_TASK_CODE_LENGTH = 80;
-
-/**
- * Get the lazy root directory or exit with an error
+ * Get the lazy root directory or exit with an error.
+ *
+ * CLI-only: exiting is correct for a one-shot command and wrong everywhere else.
+ * In a server, use `resolveLazyRoot()`.
  */
 export function requireLazyRoot(): string {
-  const root = findLazyRoot();
-  if (!root) {
-    console.error('Error: not in a lazy project. Run `lazy init` first.');
-    process.exit(1);
-  }
-  if (!repoHasCommits(root)) {
-    console.error('Error: repository has no commits. Lazy requires at least one commit to function.');
-    console.error("Run: git commit --allow-empty -m 'Initial commit'");
-    process.exit(1);
-  }
-  return root;
-}
-
-/**
- * Try to create a RemoteStorage that proxies through the daemon.
- * Returns null if the daemon is unavailable or in test/daemon mode.
- */
-export async function tryRemoteStorage(root: string): Promise<Storage | null> {
-  // Skip daemon in test mode or when we ARE the daemon
-  if (process.env.LAZY_TEST === '1') return null;
-  if (process.env.LAZY_IS_DAEMON === '1') return null;
-
-  const client = DaemonClient.create(root);
-  if (!client) return null;
-
   try {
-    // Fetch the storage path from the daemon so getStoragePath()/getTaskDir() work.
-    const info = await client.rpc('storage', root, {
-      method: 'getStoragePath',
-      args: {},
-    }) as string;
-
-    return new RemoteStorage(client, root, info);
+    return resolveLazyRoot();
   } catch (err) {
-    // The daemon RESPONDED but the operation failed (e.g. storage-lock
-    // contention, a 500). That is NOT "daemon not running" — surface it so the
-    // real problem is visible instead of sending the user to restart a healthy
-    // daemon. Only a transport failure (daemon genuinely unreachable) should
-    // fall through to the null → "Daemon is not running" path.
-    if (err instanceof RpcApplicationError) throw err;
-    return null;
+    if (err instanceof LazyPreconditionError) {
+      console.error(`Error: ${err.message}`);
+      process.exit(1);
+    }
+    throw err;
   }
 }
 
 /**
  * Create and initialize storage, or exit with an error.
- * Routes all calls through the daemon via RemoteStorage — CLI processes
- * never touch .storage-lock directly. Only the daemon creates FileStorage.
  *
- * Exits with an error if the daemon is not running.
+ * CLI-only wrapper around `resolveStorage()` — see `requireLazyRoot()`.
+ *
+ * The bound-clone announcement (design doc §4.7) is NOT here: it used to be,
+ * but this is not where every remote-routed command actually goes — several
+ * read commands (`list`, `blocked`, `active`, …) call
+ * `src/daemon/rpc-fallback.ts`'s typed wrappers straight over `tryRpc`
+ * instead and never touched it. It is printed once, centrally, in the
+ * dispatcher (`src/index.ts`'s `resolveCloneBinding` call site), which every
+ * command passes through regardless of which path it takes to the daemon.
  */
 export async function requireStorage(): Promise<Storage> {
-  const root = requireLazyRoot();
-
-  const remote = await tryRemoteStorage(root);
-  if (remote) return remote;
-
-  // Test-mode fallback: under LAZY_TEST no daemon runs (tryRemoteStorage returns
-  // null by design, see above), so the CLI process opens storage directly. This
-  // restores the direct-storage path requireStorage had before the daemon-
-  // required refactor (commit 48be24a3), which removed it so production fails
-  // fast when the daemon is down — but left no test-mode escape hatch,
-  // deterministically breaking every LAZY_TEST e2e suite. We reuse the daemon-
-  // storage singleton (getOrCreateStorage) rather than a fresh FileStorage so
-  // that requireStorage and any in-process rpc-fallback handlers share ONE
-  // StorageLock: two instances in one process would contend on .storage-lock
-  // (each has its own re-entrancy counter) and deadlock. Safe: each e2e test is
-  // a single CLI subprocess against its own temp project. NOT a production path
-  // — real invocations never set LAZY_TEST and fail fast below.
-  if (process.env.LAZY_TEST === '1') {
-    // Dynamic import avoids a static cli/helpers ↔ daemon/rpc-handlers cycle.
-    const { initDaemonStorage, getOrCreateStorage } = await import('../daemon/rpc-handlers');
-    initDaemonStorage(root);
-    return getOrCreateStorage();
+  try {
+    return await resolveStorage();
+  } catch (err) {
+    if (err instanceof LazyPreconditionError) {
+      console.error(`Error: ${err.message}`);
+      process.exit(1);
+    }
+    throw err;
   }
+}
 
-  console.error('Error: Daemon is not running. Start it with: lazy daemon start');
+/**
+ * Refuse a command that operates the LOCAL machine — a daemon, the local
+ * dashboard, `lazy init` — when this clone is bound to a Teams install
+ * (design doc §4.4, §4.7). A bound clone has no local daemon and no local
+ * store to operate; naming the refusal explicitly, with `lazy logout` as the
+ * way back, is what the design calls for instead of the command failing
+ * obscurely against infrastructure that was never there.
+ *
+ * Anchored at the GIT root, like `lazy login` itself — these are exactly the
+ * commands a clone may need to run BEFORE `lazy init`, so `resolveLazyRoot()`
+ * (which requires an initialized project) would be the wrong anchor here.
+ */
+export async function refuseIfBoundClone(commandName: string, cwd: string = process.cwd()): Promise<void> {
+  const root = findGitRoot(cwd);
+  if (!root) return;
+
+  let login;
+  try {
+    login = await readTeamsLogin(root);
+  } catch (err) {
+    // A clone holding two Teams logins is unambiguously "some kind of bound"
+    // — refuse by name, exactly as a clean single binding does, so the
+    // documented recovery (`lazy logout`) is what a human reaches for. Any
+    // OTHER read failure (a corrupted credential index, which breaks every
+    // credential it holds, Teams or not) answers a different question than
+    // "is this clone bound", and this local-machine command must not crash
+    // on it — that would take down `lazy doctor`'s own diagnosis of exactly
+    // that corruption, for one.
+    if (!(err instanceof MultipleTeamsLoginsError)) return;
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  }
+  if (!login) return;
+
+  console.error(
+    `Error: this clone is bound to ${login.binding.teams_url} (${login.binding.project}).\n` +
+    `\`lazy ${commandName}\` operates this machine, and a bound clone has no local daemon or ` +
+    'store to operate — the daemon is Teams\' own.\n' +
+    'Run `lazy logout` first if you want to work on this project locally instead.',
+  );
   process.exit(1);
-}
-
-/**
- * Shorten a UUID to 8 characters
- */
-export function shortId(id: string): string {
-  return id.substring(0, 8);
-}
-
-/**
- * Return the preferred display identifier for a task.
- * If the task has a code, return it; otherwise return the short hex ID.
- */
-export function displayId(task: Task): string {
-  return task.code ?? shortId(task.id);
-}
-
-/**
- * Look up a task by ID and return its display identifier.
- * Falls back to shortId if the task cannot be found.
- */
-export async function displayIdFor(storage: Storage, taskId: string): Promise<string> {
-  const task = await storage.getTask(taskId);
-  return task ? displayId(task) : shortId(taskId);
-}
-
-/**
- * Get the stable task ref for a task.
- * Returns the stored task_ref metadata if available, falling back to shortId.
- * New tasks have task_ref stored at creation time; old tasks use shortId.
- */
-export function taskRef(task: Task): string {
-  return task.metadata?.task_ref ?? shortId(task.id);
-}
-
-/**
- * Look up a task's ref by ID. Falls back to shortId if task not found.
- */
-export async function taskRefFromId(taskId: string, storage: Storage): Promise<string> {
-  const task = await storage.getTask(taskId);
-  return task ? taskRef(task) : shortId(taskId);
-}
-
-/**
- * Get the worktree path for a task.
- */
-export function getWorktreePath(root: string, task: Task): string {
-  return join(root, getDataDir(root), 'worktrees', taskRef(task));
-}
-
-/**
- * Get the worktree path for a task ref string (already resolved).
- */
-export function getWorktreePathForRef(root: string, tRef: string): string {
-  return join(root, getDataDir(root), 'worktrees', tRef);
-}
-
-/**
- * Get the git branch name for a task.
- *
- * The namespace comes from `[git] default_branch_prefix`, installed process-wide
- * by loadConfig — never a `lazy/` literal (see src/git/branch-prefix.ts).
- */
-export function getBranchName(task: Task): string {
-  return taskBranchFor(taskRef(task));
-}
-
-/**
- * Get the git branch name for a task by ID.
- */
-export async function getBranchNameFromId(taskId: string, storage: Storage): Promise<string> {
-  return taskBranchFor(await taskRefFromId(taskId, storage));
-}
-
-/**
- * Format a timestamp as YY-MM-DD for use in task refs.
- */
-function formatDateForRef(ts: number): string {
-  const d = new Date(ts);
-  const yy = String(d.getUTCFullYear()).slice(-2);
-  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-  const dd = String(d.getUTCDate()).padStart(2, '0');
-  return `${yy}-${mm}-${dd}`;
-}
-
-/**
- * Derive a stable, human-readable reference for a task.
- * Used for branch names (lazy/<ref>), worktree dirs, and container names.
- *
- * Progressive disambiguation:
- * 1. <code>                    — when code is unique across all tasks
- * 2. <code>-<yy-mm-dd>        — when another task shares the same code
- * 3. <code>-<yy-mm-dd>-<id>   — when ambiguous on both code and date
- * 4. <shortId>                 — fallback when no code is set
- *
- * @param task The task to derive a ref for
- * @param allTasks All tasks (including terminal) for ambiguity checking
- */
-export function deriveTaskRef(task: Task, allTasks: Task[]): string {
-  if (!task.code) {
-    return shortId(task.id);
-  }
-
-  // Check for other tasks with the same code (excluding this task)
-  const sameCode = allTasks.filter(t => t.id !== task.id && t.code === task.code);
-
-  if (sameCode.length === 0) {
-    // Unique code
-    return task.code;
-  }
-
-  // Need date disambiguation
-  const dateStr = formatDateForRef(task.created_at);
-
-  // Check if any same-code tasks also share the same date
-  const sameDateAndCode = sameCode.filter(t => formatDateForRef(t.created_at) === dateStr);
-
-  if (sameDateAndCode.length === 0) {
-    // Date disambiguates
-    return `${task.code}-${dateStr}`;
-  }
-
-  // Full disambiguation with task ID
-  return `${task.code}-${dateStr}-${shortId(task.id)}`;
-}
-
-/**
- * Build a map from task ID → display identifier for a list of tasks.
- * Useful for resolving parent_task_id in list views without extra lookups.
- * Falls back to shortId for IDs not in the map.
- */
-export function buildDisplayIdMap(tasks: Task[]): (taskId: string) => string {
-  const map = new Map<string, string>();
-  for (const t of tasks) {
-    map.set(t.id, displayId(t));
-  }
-  return (taskId: string) => map.get(taskId) ?? shortId(taskId);
-}
-
-/**
- * Derive a task code from a branch name or title string.
- * Rules: lowercase, replace `/` and non-alphanumeric (except dots) with `-`, collapse runs of `-` and `.`, truncate to 80 chars.
- * Returns null if the derived code would be invalid (too short, reserved, etc.).
- */
-export function deriveCode(input: string): string | null {
-  const derived = input
-    .toLowerCase()
-    .replace(/[^a-z0-9.]+/g, '-')  // replace non-alphanumeric runs (except dots) with single `-`
-    .replace(/\.{2,}/g, '.')       // collapse multiple consecutive dots to single dot
-    .replace(/^[-.]+/, '')         // strip leading hyphens and dots
-    .replace(/[-.]+$/, '')         // strip trailing hyphens and dots
-    .slice(0, MAX_TASK_CODE_LENGTH)  // truncate to max code length
-    .replace(/[-.]+$/, '');        // strip any trailing hyphens or dots created by truncation
-
-  if (validateCode(derived) !== null) {
-    return null;
-  }
-  return derived;
-}
-
-/**
- * Validate a task code.
- * Rules: lowercase alphanumeric + hyphens + dots, 2-80 chars, starts and ends with a letter or digit.
- * Returns null if valid, or an error message string if invalid.
- */
-export function validateCode(code: string): string | null {
-  if (code.length < 2) {
-    return `Code must be 2-${MAX_TASK_CODE_LENGTH} characters long`;
-  }
-  if (code.length > MAX_TASK_CODE_LENGTH) {
-    return `Task code must be ${MAX_TASK_CODE_LENGTH} characters or fewer (got ${code.length}). Shorten it.`;
-  }
-  if (!/^[a-z0-9][a-z0-9.-]*[a-z0-9]$/.test(code)) {
-    return 'Code must be lowercase alphanumeric + hyphens + dots, starting and ending with a letter or digit';
-  }
-  if (code.startsWith('lazy-')) {
-    return "Codes starting with 'lazy-' are reserved for system entities";
-  }
-  return null;
-}
-
-/**
- * Format a unix timestamp (ms since epoch) for display.
- * Returns "YYYY-MM-DD HH:MM" in UTC.
- */
-export function formatDate(ts: number): string {
-  const d = new Date(ts);
-  const year = d.getUTCFullYear();
-  const month = String(d.getUTCMonth() + 1).padStart(2, '0');
-  const day = String(d.getUTCDate()).padStart(2, '0');
-  const hours = String(d.getUTCHours()).padStart(2, '0');
-  const minutes = String(d.getUTCMinutes()).padStart(2, '0');
-  return `${year}-${month}-${day} ${hours}:${minutes}`;
-}
-
-/**
- * Format milliseconds as a human-readable duration
- */
-export function formatDuration(ms: number): string {
-  const seconds = Math.floor(ms / 1000);
-  const minutes = Math.floor(seconds / 60);
-  const hours = Math.floor(minutes / 60);
-
-  if (hours > 0) {
-    const remainingMinutes = minutes % 60;
-    return `${hours}h ${remainingMinutes}m`;
-  } else if (minutes > 0) {
-    const remainingSeconds = seconds % 60;
-    return `${minutes}m ${remainingSeconds}s`;
-  } else {
-    return `${seconds}s`;
-  }
-}
-
-/**
- * Format a token count compactly (e.g., 1234 -> "1.2k", 1234567 -> "1.2M")
- */
-export function formatTokenCount(tokens: number): string {
-  if (tokens >= 1_000_000) {
-    return `${(tokens / 1_000_000).toFixed(1)}M`;
-  } else if (tokens >= 1_000) {
-    return `${(tokens / 1_000).toFixed(1)}k`;
-  }
-  return String(tokens);
-}
-
-/**
- * Get total input tokens including cached tokens.
- * Claude Code reports non-cached input separately from cache creation and cache read tokens,
- * but they all count as input tokens.
- */
-export function totalInputTokens(usage: TokenUsage): number {
-  return usage.inputTokens + usage.cacheCreationTokens + usage.cacheReadTokens;
-}
-
-/**
- * Get total tokens (input + output) from a TokenUsage object
- */
-export function totalTokens(usage: TokenUsage | null): number {
-  if (!usage) return 0;
-  return totalInputTokens(usage) + usage.outputTokens;
-}
-
-/**
- * Format token usage as a compact string showing input and output tokens.
- * Example: "1.2k/350" (1.2k input, 350 output)
- */
-export function formatTokenUsage(usage: TokenUsage | null): string {
-  if (!usage) return '-';
-  return `${formatTokenCount(totalInputTokens(usage))}/${formatTokenCount(usage.outputTokens)}`;
 }
 
 /**
@@ -548,6 +299,31 @@ export function validateModel(value: string): string {
     process.exit(1);
   }
   return value;
+}
+
+/**
+ * Validate an `--agent <profile>` flag against the project's agent profiles,
+ * or exit 1 naming the ones that exist.
+ *
+ * `--agent` names a PROFILE (`[agents.<name>]`), not a harness — the built-in
+ * profiles are named after the harnesses, so the flag's old spellings all still
+ * resolve, but a project can define `local-ollama-pi` and select it here.
+ *
+ * The daemon validates again when it launches, and it is the authority (its
+ * lazy.toml is the one a turn will actually run under). This check exists so a
+ * typo is answered instantly, by the surface the user typed it at, with the
+ * project's real list — not after a round trip.
+ */
+export async function validateAgentProfileOrExit(root: string, value: string): Promise<void> {
+  try {
+    // agentProfileOrThrow, not profileForAgentName: `--agent ""` must be
+    // rejected. Resolving the empty name to the default profile belongs to the
+    // paths that read a task's stored agent, not to a user who typed the flag.
+    agentProfileOrThrow(agentProfilesFor(await loadConfig(root)), value, '--agent');
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
 }
 
 /**

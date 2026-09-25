@@ -13,6 +13,17 @@ import {
   acceptPhasePlan,
   acceptReentryPhasePlan,
   ACCEPT_PHASES,
+  startPhasePlan,
+  unblockPhasePlan,
+  closePhasePlan,
+  rejectPhasePlan,
+  syncPhasePlan,
+  reparentPhasePlan,
+  askPhasePlan,
+  claimedTurnWaitPhasePlan,
+  resumePhasePlan,
+  throttleNotes,
+  NOTE_THROTTLE_MS,
   type ProgressEvent,
 } from '../../src/daemon/progress';
 
@@ -176,12 +187,146 @@ describe('accept phase plans', () => {
 
   test('the fresh plan is in execution order and ends with cleanup', () => {
     expect(acceptPhasePlan(true).map(p => p.id)).toEqual([
-      'edge-gate', 'resurrection', 'lfs', 'pre-accept', 'protection', 'remote-ref', 'merge-gates',
+      'edge-gate', 'resurrection', 'lfs', 'accept-check', 'pre-accept', 'protection', 'remote-ref', 'merge-gates',
       'push-parent', 'description', 'merge', 'finalize', 'cleanup',
     ]);
   });
 
   test('the re-entry plan re-runs nothing local', () => {
     expect(acceptReentryPhasePlan().map(p => p.id)).toEqual(['remote-state', 'finalize', 'cleanup']);
+  });
+});
+
+describe('start/unblock/close/reject phase plans', () => {
+  test('start plan omits LFS and publish when not applicable', () => {
+    expect(startPhasePlan(false, false).map(p => p.id)).toEqual([
+      'resolve-base', 'worktree', 'upstream-ref', 'launch',
+    ]);
+    expect(startPhasePlan(true, true).map(p => p.id)).toEqual([
+      'resolve-base', 'lfs', 'worktree', 'upstream-ref', 'publish', 'launch',
+    ]);
+  });
+
+  // INVARIANT (approval-happens-at-accept — move-file-approval-to-accept): an
+  // unblock has no violation-resolution phase, because it resolves nothing.
+  // The plan is the same whatever the task's violation set looks like.
+  test('unblock plan has no violation phase', () => {
+    expect(unblockPhasePlan().map(p => p.id)).toEqual(['prepare', 'feedback', 'launch']);
+  });
+
+  test('close plan skips stop and cleanup when not applicable', () => {
+    expect(closePhasePlan(false, false).map(p => p.id)).toEqual(['finalize']);
+    expect(closePhasePlan(true, true).map(p => p.id)).toEqual(['stop', 'finalize', 'cleanup']);
+  });
+
+  test('reject plan always includes remote cleanup and worktree teardown', () => {
+    expect(rejectPhasePlan(false).map(p => p.id)).toEqual(['finalize', 'remote', 'cleanup']);
+    expect(rejectPhasePlan(true).map(p => p.id)).toEqual(['stop', 'finalize', 'remote', 'cleanup']);
+  });
+});
+
+describe('turn-launching phase plans', () => {
+  // The `origin` step comes FIRST and is part of the plan, not an aside: a sync
+  // reconciles the task's own branch with origin BEFORE merging the parent, so a
+  // reader watching the checklist sees the two merges in the order they happen.
+  // (The expectation predates that step and listed only the parent-merge walk.)
+  test('sync plan walks origin → upstream → compare → worktree → launch', () => {
+    expect(syncPhasePlan().map(p => p.id)).toEqual([
+      'origin',
+      'upstream',
+      'compare',
+      'prepare',
+      'launch',
+    ]);
+  });
+
+  // INVARIANT: a reparent runs its own repoint and then delegates to syncTask,
+  // which narrates into the SAME reporter. One operation announces one plan, so
+  // reparent's plan must literally contain sync's — otherwise the client's
+  // checklist restarts mid-operation when the sync half begins.
+  test('reparent plan is its own step followed by the whole sync plan', () => {
+    expect(reparentPhasePlan().map(p => p.id)).toEqual([
+      'repoint', ...syncPhasePlan().map(p => p.id),
+    ]);
+  });
+
+  // An ask STARTS the turn and returns, so its plan stops at `launch`; waiting
+  // for the answer is a separate call with its own one-step plan. Announcing
+  // `answer` as part of the start would leave that checklist item hanging open
+  // the moment the start returned — the plan a client renders must end where
+  // the operation it narrates ends. (It listed `answer` while ask was still a
+  // synchronous RPC that blocked on the agent.)
+  test('ask stops at launch; the wait owns the answer phase; resume just launches', () => {
+    expect(askPhasePlan().map(p => p.id)).toEqual(['prepare', 'launch']);
+    expect(claimedTurnWaitPhasePlan().map(p => p.id)).toEqual(['answer']);
+    expect(resumePhasePlan().map(p => p.id)).toEqual(['prepare', 'launch']);
+  });
+});
+
+describe('PhaseReporter.note', () => {
+  test('a note narrates inside the open phase without closing it', () => {
+    const h = harness();
+    h.reporter.announce([ACCEPT_PHASES.merge]);
+    h.reporter.begin(ACCEPT_PHASES.merge);
+    h.advance(700);
+    h.reporter.note('building lazy-agent:0.22.0');
+
+    expect(h.events.at(-1)).toMatchObject({
+      kind: 'phase', id: 'merge', state: 'progress',
+      detail: 'building lazy-agent:0.22.0', elapsedMs: 700,
+    });
+    // Still open: the phase can still be ended normally afterwards.
+    expect(h.reporter.currentLabel()).toBe('Merge');
+  });
+
+  test('a note with nothing open is a no-op', () => {
+    const h = harness();
+    h.reporter.note('stray line');
+    expect(h.events).toEqual([]);
+  });
+
+  test('notify is a bound sink usable by code that knows nothing of phases', () => {
+    const h = harness();
+    h.reporter.begin(ACCEPT_PHASES.merge);
+    const notify = h.reporter.notify;
+    notify('#3 exporting layers');
+    expect(h.events.at(-1)).toMatchObject({ state: 'progress', detail: '#3 exporting layers' });
+  });
+
+  test('describeProgress renders a note as a continuation of its phase', () => {
+    expect(describeProgress({
+      kind: 'phase', id: 'launch', label: 'Launch agent', index: 3, total: 4,
+      state: 'progress', detail: 'building image', elapsedMs: 1000,
+    })).toBe('[3/4] Launch agent… — building image');
+  });
+});
+
+describe('throttleNotes', () => {
+  test('drops notes inside the interval and passes the next one through', () => {
+    const seen: string[] = [];
+    let clock = 0;
+    const note = throttleNotes(d => seen.push(d), NOTE_THROTTLE_MS, () => clock);
+
+    note('first');
+    note('dropped');
+    clock += NOTE_THROTTLE_MS;
+    note('second');
+
+    expect(seen).toEqual(['first', 'second']);
+  });
+
+  // Docker's build output can be quiet for minutes; a forced note is how the
+  // "still building (Nm)" heartbeat gets through the throttle.
+  test('a forced note bypasses the interval', () => {
+    const seen: string[] = [];
+    const note = throttleNotes(d => seen.push(d), NOTE_THROTTLE_MS, () => 0);
+    note('first');
+    note('still building (2m00s)', true);
+    expect(seen).toEqual(['first', 'still building (2m00s)']);
+  });
+
+  test('with no sink it is inert', () => {
+    const note = throttleNotes(undefined);
+    expect(() => note('anything')).not.toThrow();
   });
 });

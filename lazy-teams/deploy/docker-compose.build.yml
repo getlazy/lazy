@@ -1,0 +1,16 @@
+# Build-from-source override for developers and acceptance tests.
+#
+# Pull-and-go operators use docker-compose.yml alone. When you are hacking on
+# lazy-teams or lazy itself, merge this file so compose builds the app image
+# from the repository checkout:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# See public-docs/self-hosting-lazy-teams.md § "Building from source".
+
+services:
+  app:
+    build:
+      context: ../..
+      dockerfile: lazy-teams/deploy/Dockerfile
+    image: ${LAZY_TEAMS_IMAGE:-lazy-teams:local}

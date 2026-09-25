@@ -16,15 +16,16 @@
  *
  * CLI-only on purpose: there is no MCP equivalent for writing, so the builder
  * cannot arrange its own gates. Reading the state is harmless; changing it is
- * a human act, like `lazy approve`.
+ * a human act, like typing the approval passphrase at accept.
  */
 
 import { readFile, writeFile } from 'fs/promises';
-import { requireLazyRoot, requireStorage, parseFlags, shortId, displayId } from '../helpers';
+import { shortId, displayId } from '../../task/identity';
+import { requireLazyRoot, requireStorage, parseFlags } from '../helpers';
 import { loadConfig, resolveConfigPath } from '../../config/loader';
 import { setSectionStringArray, setSectionBoolean, TomlEditError } from '../../config/toml-edit';
 import { branchExists, getRemoteDefaultBranch } from '../../git/operations';
-import { theme } from '../theme';
+import { theme } from '../../render/theme';
 import { docsFooter } from '../../docs/links';
 import { isPassphraseEnrolled, readPassphraseEnrollment } from '../../protection/passphrase-store';
 import type { Storage } from '../../storage';
@@ -246,7 +247,7 @@ async function setProtection(
 
   if (on) {
     if (target.kind === 'branch') {
-      console.log(`  Accepting a task into \`${target.branch}\` now requires ${theme.command('lazy approve <task>')}.`);
+      console.log(`  Accepting a task into \`${target.branch}\` now prompts for the approval passphrase.`);
       if (!(await branchExists(target.branch, projectRoot))) {
         console.log(theme.warning(`  Note: no branch named \`${target.branch}\` exists yet — the entry takes effect when it does.`));
       }
@@ -255,7 +256,7 @@ async function setProtection(
       const branch = session?.git_branch;
       console.log(
         `  Merging this task's work upward${branch ? ` (\`${branch}\`)` : ''} — into any target — ` +
-        `now requires ${theme.command(`lazy approve ${target.listedAs}`)}.`,
+        `now prompts for the approval passphrase at ${theme.command('lazy accept')}.`,
       );
       if (!branch) {
         console.log(theme.warning('  Note: the task has no branch yet (never started) — the gate arms when it does.'));
@@ -394,9 +395,10 @@ async function showProtectionState(): Promise<void> {
 export function protectUsage(): void {
   console.log(`Usage: lazy protect [<branch|task>] [on|off] [--branch|--task]
 
-Manage branch protection — which merges require a one-time HUMAN approval
-(recorded with 'lazy approve'). All settings live in the [protection] section
-of lazy.toml; this command edits that section, preserving its comments.
+Manage branch protection — which merges require a HUMAN approval (the
+passphrase typed at 'lazy accept''s own prompt). All settings live in the
+[protection] section of lazy.toml; this command edits that section, preserving
+its comments.
 
 The passphrase itself is NOT configured here or anywhere in the repository: it
 lives hashed outside every repo, one per machine. Enroll it once with

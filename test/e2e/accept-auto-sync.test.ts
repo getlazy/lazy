@@ -4,6 +4,7 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 
 /**
  * Tests for accept behavior when the GitHub driver is configured but the task
@@ -87,6 +88,8 @@ describe('lazy accept auto-sync', () => {
     // Wait for the daemon reconciler to pick up the supervisor's response
     // and move the task to a non-'working' state before calling accept.
     expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
+    // Fixture setup, not the subject (see test/helpers/final.ts).
+    await seedFinal(ctx, taskId);
 
     // 2. Add a commit in the worktree
     const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
@@ -127,6 +130,8 @@ describe('lazy accept auto-sync', () => {
 
     // Wait for the daemon reconciler (see test above for rationale).
     expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
+    // Fixture setup, not the subject (see test/helpers/final.ts).
+    await seedFinal(ctx, taskId);
 
     // 2. Add a commit in the worktree
     const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
@@ -163,6 +168,8 @@ describe('lazy accept auto-sync', () => {
 
     // Wait for the daemon reconciler (see tests above for rationale).
     expect((await ctx.lazy(['wait', taskId])).exitCode).toBe(0);
+    // Fixture setup, not the subject (see test/helpers/final.ts).
+    await seedFinal(ctx, taskId);
 
     // Add a commit in the worktree
     const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);

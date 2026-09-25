@@ -166,7 +166,7 @@ describe('automation.maintain config parsing', () => {
   // INVARIANT: maintain is opt-in — the default config ships an empty list.
   test('defaults to an empty maintain list when unconfigured', async () => {
     await writeFile(join(dir, 'lazy.toml'), 'models.default = "sonnet"\n');
-    const config = await loadConfig(dir, { cwd: dir });
+    const config = await loadConfig(dir);
     expect(config.automation.maintain).toEqual([]);
   });
 
@@ -184,7 +184,7 @@ pattern = "CHANGELOG.md"
 instructions = "Add a line; skip if intra-release."
 `;
     await writeFile(join(dir, 'lazy.toml'), toml);
-    const config = await loadConfig(dir, { cwd: dir });
+    const config = await loadConfig(dir);
     expect(config.automation.maintain).toEqual([
       { title: 'docs', pattern: 'docs/**/*', instructions: 'Update affected docs.' },
       { title: 'changelog', pattern: 'CHANGELOG.md', instructions: 'Add a line; skip if intra-release.' },

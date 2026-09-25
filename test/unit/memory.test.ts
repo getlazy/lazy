@@ -30,8 +30,9 @@ import {
   renderMemorySection,
   buildMemorySection,
   elideMemoryDescription,
+  prepareAuthoredMemoryWrite,
 } from '../../src/memory';
-import { buildSystemPrompt } from '../../src/cli/commands/shared';
+import { buildSystemPrompt } from '../../src/task/turn-context';
 import type { Task, MemoryRecord } from '../../src/types';
 
 describe('shared memory', () => {
@@ -330,6 +331,57 @@ describe('shared memory', () => {
     const atLimit = 'x'.repeat(MAX_MEMORY_DESCRIPTION_LENGTH);
     expect(normalizeAuthoredMemoryDescription(atLimit)).toBe(atLimit);
     expect(exceedsAuthoringDescriptionLimit(atLimit)).toBe(false);
+  });
+
+  // INVARIANT: authoring validation (name slug, type enum, description budget,
+  // non-empty body) lives OUTSIDE storage, on every surface a human types
+  // into. `storage.saveMemory` is mechanistic so importers can store verbatim.
+  // CLI, MCP, and the daemon web UI all call prepareAuthoredMemoryWrite —
+  // these tests pin that shared gate, not one surface's copy of it.
+  test('a new authored record requires a description, a type, and a body', () => {
+    expect(() => prepareAuthoredMemoryWrite({
+      name: 'deploy-window',
+      body: 'Ask first.',
+    })).toThrow(/needs a description/);
+    expect(() => prepareAuthoredMemoryWrite({
+      name: 'deploy-window',
+      description: 'Deploys are Tue/Thu',
+      body: 'Ask first.',
+    })).toThrow(/needs a type/);
+    expect(() => prepareAuthoredMemoryWrite({
+      name: 'deploy-window',
+      description: 'Deploys are Tue/Thu',
+      type: 'project',
+      body: '   ',
+    })).toThrow(/needs a body/);
+  });
+
+  test('an update may omit description and type, keeping the stored values', () => {
+    const existing: MemoryRecord = {
+      name: 'deploy-window',
+      description: 'Deploys are Tue/Thu 10am',
+      type: 'reference',
+      body: 'Ask first.',
+      created_at: 1, updated_at: 1,
+      created_by: 'human', updated_by: 'human', revision: 1,
+    };
+    const prepared = prepareAuthoredMemoryWrite(
+      { name: 'deploy-window', body: 'Ask, then wait.' },
+      existing,
+    );
+    expect(prepared.description).toBe('Deploys are Tue/Thu 10am');
+    expect(prepared.type).toBe('reference');
+    expect(prepared.body).toBe('Ask, then wait.');
+  });
+
+  test('authored names normalize to kebab-case before storage sees them', () => {
+    const prepared = prepareAuthoredMemoryWrite({
+      name: 'VM Credentials Idea',
+      description: 'Inject VM credentials at boot',
+      type: 'project',
+      body: 'Push to a host-side clone.',
+    });
+    expect(prepared.name).toBe('vm-credentials-idea');
   });
 
   // Rendering ADAPTS to stored data; it never mutates or truncates it. The only

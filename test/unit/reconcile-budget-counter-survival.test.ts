@@ -3,7 +3,7 @@
  *
  * `handleCompletedResponses` (the reconciler's turn finalizer) must NOT reset the
  * per-task auto-react counters, the consecutive auto-turn counter, or the
- * auto-react paused flag. Rationale, from public-docs/release/v0.11-walkthrough.md
+ * auto-react paused flag. Rationale, from docs/release/v0.11-walkthrough.md
  * ("Reset triggers"):
  *
  *   > Counters reset only when a human manually unblocks or resumes the task —
@@ -47,7 +47,7 @@ import {
 import { protocolDir as getProtocolDir } from '../../src/protocol';
 import type { CompletedResponse } from '../../src/protocol';
 import type { ResolvedConfig } from '../../src/config/types';
-import { getWorktreePathForRef, taskRef } from '../../src/cli/helpers';
+import { getWorktreePathForRef, taskRef } from '../../src/task/identity';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 
 function git(cwd: string, ...args: string[]): string {

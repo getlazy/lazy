@@ -30,7 +30,7 @@ import { FileStorage } from '../../src/storage';
 import { recoverStrandedWorkingTasks, handleCompletedResponse } from '../../src/utils/reconcile';
 import { encodeProjectPath } from '../../src/import/claude-code-logs';
 import { protocolDir as getProtocolDir } from '../../src/protocol';
-import { getWorktreePathForRef, taskRef } from '../../src/cli/helpers';
+import { getWorktreePathForRef, taskRef } from '../../src/task/identity';
 import type { Runner } from '../../src/runner';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 

@@ -73,7 +73,7 @@ describe('lazy init', () => {
     const result = await runLazy(tmpDir, ['init', '--non-interactive']);
     expect(result.exitCode).toBe(0);
 
-    const config = await loadConfig(tmpDir, { cwd: tmpDir });
+    const config = await loadConfig(tmpDir);
     expect(config.proxy).not.toBeNull();
     expect(config.proxy?.upstream).toBe('https://api.anthropic.com');
     expect(config.proxy?.port).toBe(0); // OS-assigned

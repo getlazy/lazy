@@ -17,22 +17,14 @@
  * RemoteStorage is deliberately not exercised: it is a JSON-RPC pass-through
  * that forwards resolution to the daemon's own backend, so it inherits whichever
  * backend below is in play.
- *
- * The Postgres half requires a real database. Set LAZY_POSTGRES_URL, e.g.
- *   LAZY_POSTGRES_URL=$(lazy-pg-start)
- * Without it, only the FileStorage half runs.
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { mkdtemp, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import postgres from 'postgres';
 import { FileStorage } from '../../src/storage/file-storage';
-import { PostgresStorage } from '../../src/storage/postgres-storage';
 import type { Storage } from '../../src/storage/interface';
-
-const TEST_URL = process.env.LAZY_POSTGRES_URL;
 
 interface Backend {
   name: string;
@@ -56,25 +48,6 @@ const backends: Backend[] = [
     },
   },
 ];
-
-if (TEST_URL) {
-  backends.push({
-    name: 'PostgresStorage',
-    make: async () => {
-      // onnotice: DROP SCHEMA CASCADE emits a NOTICE per dependent table,
-      // which postgres.js logs to the console and drowns the test output.
-      const admin = postgres(TEST_URL, { max: 1, onnotice: () => {} });
-      await admin`DROP SCHEMA public CASCADE`;
-      await admin`CREATE SCHEMA public`;
-      await admin.end();
-      const storage = new PostgresStorage('/tmp/lazy-resolve-pg', { url: TEST_URL });
-      await storage.initialize();
-      return { storage, cleanup: () => storage.close() };
-    },
-  });
-} else {
-  console.log('storage-resolve-task: Postgres half skipped — set LAZY_POSTGRES_URL to run it');
-}
 
 /** The real code that triggered the bug. Exactly 36 characters. */
 const CODE_36 = 'fix-approval-burned-on-failed-accept';

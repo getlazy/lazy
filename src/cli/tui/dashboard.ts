@@ -1,5 +1,5 @@
 /**
- * Dashboard TUI for `lazy review` (no task ID).
+ * Dashboard TUI for `lazy browse` (no task ID).
  *
  * Shows all non-terminal tasks in a tree rooted at "main", with periodic
  * auto-refresh. Selecting a task drills into the existing single-task
@@ -7,8 +7,9 @@
  */
 
 import { Terminal, getTerminalSize, ansi, truncateVisible, visibleLength } from './terminal';
+import { shortId, displayId } from '../../task/identity';
 import { statusColor } from './renderer';
-import { shortId, displayId, formatDate } from '../helpers';
+import { formatDate } from '../../utils/format';
 import { isTerminalStatus } from '../../task-state-machine';
 import { runReviewTUI } from './review';
 import type { Task } from '../../types';
@@ -112,7 +113,6 @@ function statusOrder(status: string): number {
     case 'working': return 5;
     case 'interrupted': return 6;
     case 'zombie': return 7;
-    case 'queued': return 8;
     case 'backlog': return 9;
     default: return 10;
   }
@@ -128,7 +128,7 @@ function renderDashboard(state: DashboardState): string {
   const lines: string[] = [];
 
   // Header
-  const headerText = ' lazy review — Active Tasks';
+  const headerText = ' lazy browse — Active Tasks';
   const headerPadded = headerText + ' '.repeat(Math.max(0, cols - visibleLength(headerText)));
   lines.push(ansi.bg.blue + ansi.fg.white + ansi.bold + headerPadded + ansi.reset + ansi.clearToEOL);
 

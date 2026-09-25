@@ -8,7 +8,7 @@
  * confirmation prompt and the merge result, which for a multi-minute accept is
  * indistinguishable from a hang.
  *
- * Two renderings, chosen by whether stdout is a terminal:
+ * Two renderings, chosen by whether the chosen stream is a terminal:
  *
  *   TTY      one line per phase, rewritten in place with a live elapsed
  *            counter while the phase runs, then settled to its final form.
@@ -23,12 +23,19 @@
 
 import type { ProgressEvent, ProgressEmitter } from '../daemon/progress';
 import { formatDuration } from '../daemon/progress';
-import { theme } from './theme';
+import { HEARTBEAT_INTERVAL_MS } from '../daemon/heartbeat';
+import { theme } from '../render/theme';
 
 /** A live phase display; call {@link PhaseDisplay.close} when the op settles. */
 export interface PhaseDisplay {
   /** Feed this to the daemon query as its progress sink. */
   onProgress: ProgressEmitter;
+  /**
+   * Feed this the daemon's liveness ticks. Shape matches `RpcObservers`, so a
+   * command hands the whole display to the query rather than picking callbacks
+   * off it one at a time.
+   */
+  onHeartbeat: (elapsedMs: number, phase?: string) => void;
   /** Stop the ticker and leave the cursor on a fresh line. */
   close(): void;
 }
@@ -36,14 +43,44 @@ export interface PhaseDisplay {
 const TICK_MS = 1000;
 
 /**
- * Build a phase display writing to stdout.
+ * How long the append-only rendering may print nothing before a heartbeat
+ * line is due.
  *
- * `force` overrides TTY detection (tests). When neither a TTY nor forced, the
- * append-only rendering is used.
+ * Derived from the daemon's heartbeat interval, minus a second of slack: the
+ * ticks are the only input this rendering has, so a threshold at or above the
+ * interval would push the first line out to the SECOND tick (a tick arriving
+ * 4.999s after the phase's start line would be judged "not quiet yet"). One
+ * second under means the tick that crosses five seconds of silence prints.
  */
-export function createPhaseDisplay(options?: { tty?: boolean }): PhaseDisplay {
-  const tty = options?.tty ?? (process.stdout.isTTY ?? false);
-  return tty ? createTtyDisplay() : createPlainDisplay();
+const QUIET_PHASE_MS = HEARTBEAT_INTERVAL_MS - 1_000;
+
+/**
+ * Build a phase display, writing to stdout by default.
+ *
+ * `tty` overrides TTY detection (tests). When neither a TTY nor forced, the
+ * append-only rendering is used.
+ *
+ * `stream: 'stderr'` is for commands whose stdout is a PAYLOAD rather than a
+ * transcript — `lazy ask` prints the agent's answer there, and a checklist
+ * mixed into it would corrupt anything piping the answer somewhere.
+ *
+ * `now` is the clock the quiet-phase check reads; injectable so a test can
+ * exercise a five-second silence without waiting five seconds.
+ */
+export function createPhaseDisplay(options?: {
+  tty?: boolean;
+  stream?: 'stdout' | 'stderr';
+  now?: () => number;
+}): PhaseDisplay {
+  const toStderr = options?.stream === 'stderr';
+  const out = toStderr ? process.stderr : process.stdout;
+  const tty = options?.tty ?? (out.isTTY ?? false);
+  return tty
+    ? createTtyDisplay((s: string) => out.write(s))
+    : createPlainDisplay(
+      toStderr ? (s: string) => console.error(s) : (s: string) => console.log(s),
+      options?.now ?? Date.now,
+    );
 }
 
 /** `[3/9]` position prefix, or '' for an unplanned prelude phase. */
@@ -74,45 +111,82 @@ function planHeader(event: Extract<ProgressEvent, { kind: 'plan' }>): string {
   return `\n${theme.header(`${event.operation}${target} — ${event.phases.length} phases`)}\n${names}\n`;
 }
 
-function createPlainDisplay(): PhaseDisplay {
+function createPlainDisplay(log: (line: string) => void, now: () => number): PhaseDisplay {
+  // The phase currently running, and when this rendering last put anything on
+  // screen. There is no cursor to rewrite here, so a long phase would print its
+  // start line and then nothing at all — which is the silence this display
+  // exists to prevent. See `onHeartbeat` below.
+  let open: { text: string; startedAt: number } | null = null;
+  let lastLineAt = now();
+
+  const emit = (line: string) => {
+    log(line);
+    lastLineAt = now();
+  };
+
   const onProgress: ProgressEmitter = (event) => {
     if (event.kind === 'plan') {
-      console.log(planHeader(event));
+      emit(planHeader(event));
       return;
     }
     // Activity events belong to a live subscription (proxy traffic), not to a
     // phased operation — the subscriber renders those itself. See ../daemon/progress.ts.
     if (event.kind === 'activity') return;
     const pos = position(event);
+    if (event.state === 'start') open = { text: `${pos}${event.label}`, startedAt: now() };
+    else if (event.state !== 'progress') open = null;
     switch (event.state) {
       case 'start':
-        console.log(`${theme.separator('·')} ${startText(event)}`);
+        emit(`${theme.separator('·')} ${startText(event)}`);
+        break;
+      case 'progress':
+        // Append-only: no cursor to rewrite. Indented under the phase's start
+        // line so a long interior (a docker build) reads as belonging to it.
+        emit(`${theme.separator('  ↳')} ${event.detail ?? ''} ${theme.duration(`(${formatDuration(event.elapsedMs ?? 0)})`)}`);
         break;
       case 'done':
-        console.log(`${theme.success('✓')} ${pos}${event.label} ${theme.duration(`(${formatDuration(event.elapsedMs ?? 0)})`)}${detailSuffix(event.detail)}`);
+        emit(`${theme.success('✓')} ${pos}${event.label} ${theme.duration(`(${formatDuration(event.elapsedMs ?? 0)})`)}${detailSuffix(event.detail)}`);
         break;
       case 'skipped':
-        console.log(`${theme.separator('–')} ${pos}${event.label} ${theme.separator('skipped')}${detailSuffix(event.detail)}`);
+        emit(`${theme.separator('–')} ${pos}${event.label} ${theme.separator('skipped')}${detailSuffix(event.detail)}`);
         break;
       case 'failed':
-        console.log(`${theme.error('✗')} ${pos}${event.label} ${theme.duration(`(${formatDuration(event.elapsedMs ?? 0)})`)}${detailSuffix(event.detail)}`);
+        emit(`${theme.error('✗')} ${pos}${event.label} ${theme.duration(`(${formatDuration(event.elapsedMs ?? 0)})`)}${detailSuffix(event.detail)}`);
         break;
     }
   };
-  return { onProgress, close() { /* nothing buffered */ } };
+
+  /**
+   * A daemon liveness tick. Prints "still here, still on this phase" only when
+   * the screen has actually gone quiet, so a phase that settles in under a
+   * second adds no noise.
+   *
+   * INVARIANT: driven by the DAEMON's ticks, never by a local timer. The
+   * elapsed number is local (it counts the open phase, where the daemon's
+   * counts the whole request), but the LINE only exists because the daemon
+   * wrote a heartbeat — if the daemon stops, so does this, which is the honest
+   * signal. See readHeartbeatEnvelope in ../daemon/heartbeat.ts.
+   */
+  const onHeartbeat = () => {
+    if (!open) return;
+    if (now() - lastLineAt < QUIET_PHASE_MS) return;
+    emit(`${theme.separator('  ⋯')} ${open.text} ${theme.separator('still running')} ${theme.duration(`(${formatDuration(now() - open.startedAt)})`)}`);
+  };
+
+  return { onProgress, onHeartbeat, close() { /* nothing buffered */ } };
 }
 
-function createTtyDisplay(): PhaseDisplay {
-  let open: { line: string; startedAt: number } | null = null;
+function createTtyDisplay(write: (s: string) => void): PhaseDisplay {
+  let open: { line: string; note?: string; startedAt: number } | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
 
-  const write = (s: string) => process.stdout.write(s);
   const clearLine = () => write('\r\x1b[2K');
 
   const paint = () => {
     if (!open) return;
     clearLine();
-    write(`${theme.separator('·')} ${open.line} ${theme.duration(formatDuration(Date.now() - open.startedAt))}`);
+    const note = open.note ? theme.separator(` ↳ ${open.note}`) : '';
+    write(`${theme.separator('·')} ${open.line}${note} ${theme.duration(formatDuration(Date.now() - open.startedAt))}`);
   };
 
   const stopTicker = () => {
@@ -153,6 +227,15 @@ function createTtyDisplay(): PhaseDisplay {
         (timer as unknown as { unref?: () => void }).unref?.();
         break;
       }
+      case 'progress':
+        // A note updates the open row in place — the phase has not finished, so
+        // it must not settle onto its own line. Ignored when nothing is open:
+        // the daemon closed the phase before this note reached us.
+        if (open) {
+          open.note = event.detail;
+          paint();
+        }
+        break;
       case 'done':
         settle(`${theme.success('✓')} ${pos}${event.label} ${elapsed}${detailSuffix(event.detail)}`);
         break;
@@ -167,6 +250,10 @@ function createTtyDisplay(): PhaseDisplay {
 
   return {
     onProgress,
+    // Nothing to do: the in-place line is already repainted every second with a
+    // live counter, so this rendering is never silent and a heartbeat has
+    // nothing to add. Present so both renderings satisfy the same interface.
+    onHeartbeat() { /* the ticker already shows liveness */ },
     close() {
       clearOpen();
     },

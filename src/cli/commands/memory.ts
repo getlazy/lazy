@@ -16,10 +16,12 @@
  *   compact              — (re)generate the DERIVED compact used for injection
  */
 
+import { requireActorIdentity } from '../identity-preflight';
 import { join } from 'path';
-import { requireStorage, requireLazyRoot, parseFlags, formatDate } from '../helpers';
+import { formatDate } from '../../utils/format';
+import { requireStorage, requireLazyRoot, parseFlags } from '../helpers';
 import { openEditor, removeRecoveryFile, readStdinIfPiped, promptYesNo } from '../editor';
-import { theme } from '../theme';
+import { theme } from '../../render/theme';
 import { docsFooter } from '../../docs/links';
 import { sanitizeUserText } from '../../utils/sanitize-text';
 import { getActor } from '../../constants';
@@ -205,6 +207,10 @@ async function commandMemorySave(args: string[]): Promise<void> {
     process.exit(1);
   }
 
+  // Before the memory record is typed is typed: the daemon refuses a write it cannot
+  // attribute, and a refusal must never cost the human what they wrote.
+  await requireActorIdentity();
+
   const name = normalizeMemoryName(nameInput);
 
   const storage = await requireStorage();
@@ -299,6 +305,10 @@ async function commandMemoryRemove(args: string[]): Promise<void> {
     console.error('Usage: lazy memory rm <name> [--yes]');
     process.exit(1);
   }
+
+  // Before the removal is confirmed is typed: the daemon refuses a write it cannot
+  // attribute, and a refusal must never cost the human what they wrote.
+  await requireActorIdentity();
 
   const name = normalizeMemoryName(nameInput);
   const storage = await requireStorage();
@@ -628,8 +638,9 @@ agents are READ-ONLY — memory is injected into every future session, so an
 agent-writable store would be a prompt-injection channel. Agents read it with
 lazy_memory_recall and lazy_search 'in:memories <text>'.
 
-Memory vs journal: the journal (lazy journal) is a raw, per-task, prompt-immune
-record of one task; memory is curated, cross-task knowledge that IS injected.
+Memory vs journal: the journal (lazy journal) is a raw, per-task record read on
+demand — its text is never injected, only its new-entry count; memory is curated,
+cross-task knowledge that IS injected.
 
 Examples:
   lazy memory list

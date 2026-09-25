@@ -30,6 +30,23 @@ export interface RunGitOptions {
    * `check-attr --source`.
    */
   env?: Record<string, string>;
+  /**
+   * Return stdout VERBATIM, with no `.trim()`. Default is to trim, because
+   * almost every caller wants one value off a command that prints a trailing
+   * newline.
+   *
+   * Set it when the output is a PATCH, or anything else whose whitespace is
+   * content. `git diff` writes an empty context line as a single space, so a
+   * section ending on a blank line ends `" \n"` — and trimming takes both the
+   * space and the newline, leaving a hunk body one line shorter than its `@@`
+   * header promises. `git apply` answers `corrupt patch at line N` and rejects
+   * the ENTIRE patch, not just that file, so one blank line at the wrong place
+   * costs every other file's edits too. It cannot be repaired afterwards
+   * either: the capture concatenates sections, so a blank line lost at the end
+   * of the staged section is gone in the middle of the patch, where no
+   * end-of-string fixup can reach it.
+   */
+  trim?: boolean;
 }
 
 /**
@@ -65,7 +82,10 @@ export async function runGit(args: string[], opts?: RunGitOptions | string): Pro
   try {
     const proc = spawn(['git', ...args], spawnOpts) as any;
     const result = await proc.exited;
-    const stdout = stdoutMode === 'pipe' ? (await Bun.readableStreamToText(proc.stdout)).trim() : '';
+    const rawStdout = stdoutMode === 'pipe' ? await Bun.readableStreamToText(proc.stdout) : '';
+    // Trimmed unless the caller says its output is content (see `trim` above).
+    // stderr is always trimmed: it is a message, never a payload.
+    const stdout = options.trim === false ? rawStdout : rawStdout.trim();
     let stderr = stderrMode === 'pipe' ? (await Bun.readableStreamToText(proc.stderr)).trim() : '';
     const exitCode = proc.exitCode ?? result;
 

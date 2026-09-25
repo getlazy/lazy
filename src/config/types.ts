@@ -1,7 +1,9 @@
+import type { AgentProfileConfig, AgentWire } from './agent-profiles';
+import type { BackendSelection } from '../credentials/backends';
 import type { ProxyPolicyConfig } from '../proxy/policy';
-
-/** Ollama configuration for local model inference. */
-export type OllamaConfig = ResolvedConfig['ollama'];
+import type { ReviewGate, ReviewMode } from '../review/mode';
+import type { ServicePort } from '../serve/ports';
+import type { TaskType } from '../types';
 
 /**
  * Fully-resolved mechanistic proxy policy (§6.3 layer 1). Alias of the engine's
@@ -10,42 +12,62 @@ export type OllamaConfig = ResolvedConfig['ollama'];
  */
 export type ResolvedProxyPolicy = ProxyPolicyConfig;
 
-/**
- * Model backend for a per-role target.
- * - `anthropic`: real Anthropic API (or whatever CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY point at).
- * - `ollama`: local Ollama serving the Anthropic Messages API (no credential needed).
- * - `proxy`: another Anthropic-compatible endpoint, forwarded with the real credential.
- *
- * All three are Anthropic-native targets — lazy never translates between API shapes.
- *
- * The backend chooses the UPSTREAM and the credential it gets; it never chooses
- * whether the role is proxied. Every role's traffic goes through lazy's proxy,
- * which then forwards it to that upstream.
- */
-export type RoleBackend = 'anthropic' | 'ollama' | 'proxy';
-
-export const VALID_ROLE_BACKENDS: readonly RoleBackend[] = ['anthropic', 'ollama', 'proxy'] as const;
-
 /** The two model roles lazy distinguishes: the interactive builder vs. task agents. */
 export type RoleName = 'builder' | 'agent';
 
-/** A per-role model target as written in lazy.toml `[models.roles.*]` (all optional). */
+/**
+ * Which credential the proxy injects when it reroutes to a `[[proxy.fallback]]`
+ * target. Default "none": a fallback is by definition a DIFFERENT backend, and
+ * handing it a credential it was not explicitly granted is a leak. Every value
+ * except "none"/"anthropic" names a provider in the `lazy auth` store.
+ *
+ * NOTE: the fallback chain is Anthropic-WIRE — the proxy re-sends the same
+ * `/v1/messages` body. `openrouter` is a valid fallback credential because
+ * OpenRouter serves an Anthropic-compatible Messages endpoint
+ * (https://openrouter.ai/api); `openai` is accepted for symmetry but only
+ * useful against a gateway that speaks the Anthropic wire with an OpenAI key.
+ */
+export type ProxyFallbackCredential = 'anthropic' | 'ollama' | 'openai' | 'openrouter' | 'none';
+
+export const VALID_PROXY_FALLBACK_CREDENTIALS: readonly ProxyFallbackCredential[] =
+  ['anthropic', 'ollama', 'openai', 'openrouter', 'none'] as const;
+
+/**
+ * A per-role model target as written in lazy.toml `[models.roles.*]`.
+ *
+ * One key: which agent PROFILE the role runs by default. The role no longer
+ * carries a backend, a model or an endpoint — those are properties of the
+ * profile (`[agents.<name>]`), because they have to differ between two tasks in
+ * the SAME role. `[models.roles.agent] backend = …` is refused at load with the
+ * replacement config printed; see `resolveRole` in ./loader.ts.
+ */
 export interface RoleTargetConfig {
-  backend?: RoleBackend;
-  model?: string;
-  endpoint?: string;
+  agent?: string;
 }
 
 /**
  * A fully-resolved per-role model target (produced by the config loader).
  * Always present for both roles after `loadConfig`.
+ *
+ * This is a PROFILE, flattened: every field except `proxyUrl` is copied from the
+ * {@link AgentProfileConfig}-derived profile the role defaults to. It stays a
+ * separate shape because a role target also carries the launch-time proxy
+ * address, which is not a property of any profile.
+ *
+ * A role target answers "what does this role run when a task names no agent of
+ * its own" — the builder's profile, and the project default for task agents. A
+ * TASK's own profile overrides it, which is the whole point of profiles.
  */
 export interface RoleTarget {
-  backend: RoleBackend;
+  /** Profile name this role defaults to (`[agent] agent_id` for the agent role). */
+  profile: string;
+  /** Registered agent implementation behind {@link RoleTarget.profile}. */
+  harness: string;
   /**
-   * Model passed to the agent via `--model`. For the `anthropic` backend an
-   * empty string means "use the normal model chain / models.default". For
-   * `ollama`/`proxy` it is the authoritative model name (never substituted).
+   * Model passed to the agent via `--model`. Empty means "use the normal model
+   * chain / models.default". On a profile with a PINNED endpoint it is the
+   * authoritative model name (never substituted) — see
+   * {@link RoleTarget.pinned}.
    */
   model: string;
   /**
@@ -53,18 +75,36 @@ export interface RoleTarget {
    * proxy's primary upstream" (`[proxy] upstream`, i.e. api.anthropic.com).
    *
    * NEVER an address the launched agent dials itself, and never turned into an
-   * env var — see src/proxy/role-upstreams.ts for the routing and
+   * env var — see src/proxy/agent-upstreams.ts for the routing and
    * src/utils/role-target.ts for the env it does (not) produce. Host-perspective
    * by definition, because the daemon makes the upstream call.
    */
   endpoint: string;
   /**
+   * True when the profile's own `[agents.<name>]` block named the endpoint.
+   *
+   * The successor to the old `backend !== 'anthropic'` test, and NOT the same as
+   * `endpoint !== ''`: the built-in `codex` profile carries a default OpenAI
+   * upstream with no model, so "has an endpoint" would wrongly claim the model
+   * is authoritative. Pinned means a human chose this service, so its model name
+   * is its own and lazy never substitutes one.
+   */
+  pinned: boolean;
+  /** Protocol spoken to {@link RoleTarget.endpoint}. Derived, never configured. */
+  wire: AgentWire;
+  /**
+   * Stored credential the upstream is paid with — a provider name, or `"none"`
+   * for an upstream that authenticates nobody (a local model server).
+   */
+  credential: string;
+  /**
    * Live lazy-proxy base URL to route this role's traffic through, filled in at
    * launch when the (always-on) proxy is running.
    *
-   * The ONLY base URL a launch ever receives, for every backend — an ollama role
-   * and a role pinned at an explicit `endpoint` get this address too, and the
-   * proxy forwards them onward. There is no backend for which this is skipped.
+   * The ONLY base URL a launch ever receives, for every profile — a local-Ollama
+   * profile and one pinned at an explicit `endpoint` get this address too, and
+   * the proxy forwards them onward. There is no profile for which this is
+   * skipped.
    *
    * Undefined does NOT mean "connect direct" — the proxy is always on and has
    * no off switch. It means either that the launching process inherits an
@@ -76,10 +116,27 @@ export interface RoleTarget {
    * rather than leaving this undefined and connecting direct.
    */
   proxyUrl?: string;
+  /**
+   * The proxy's primary upstream (`[proxy] upstream`), filled in beside
+   * {@link RoleTarget.proxyUrl} by the same launch paths.
+   *
+   * It answers the one question `endpoint` alone cannot: WHERE an unpinned
+   * profile's traffic actually lands. `endpoint` is empty for such a profile,
+   * meaning "wherever the proxy's primary upstream is", and that is a config
+   * value — `https://api.anthropic.com` by default but freely overridable — so a
+   * launch reading only `endpoint` cannot tell Anthropic's own API from a
+   * self-hosted Anthropic-compatible gateway.
+   *
+   * Undefined means "not resolved here", never "Anthropic". Every consumer must
+   * treat it as unknown and take the conservative branch: the paths that leave
+   * it undefined are exactly the ones that also leave `proxyUrl` undefined
+   * (in-container relaunches, RPC-bypass modes), which stamp no base URL at all.
+   */
+  primaryUpstream?: string;
 }
 
 /** Storage backend types — duplicated here to avoid circular dependency with storage module */
-export type StorageBackendConfig = 'external' | 'postgres';
+export type StorageBackendConfig = 'external';
 
 /** Runner types for task execution */
 export type RunnerType = 'docker' | 'podman' | 'dangerously-host-process-without-any-isolation';
@@ -89,14 +146,10 @@ export const VALID_RUNNER_TYPES: readonly RunnerType[] = ['docker', 'podman', 'd
 
 /**
  * Friendly CLI/MCP aliases mapped to canonical {@link RunnerType} values.
- * Accepts the short, human-typeable names (`host`, `docker`, `container`,
- * `podman`) as well as the canonical values themselves. The full
- * `dangerously-host-process-without-any-isolation` string is intentionally
- * verbose in lazy.toml, so `host` is the friendly alias for it.
+ * Host-process runner aliases are deliberately absent — that runner is
+ * test-harness-only (see src/runner/host-runner-gate.ts).
  */
 export const RUNNER_ALIASES: Readonly<Record<string, RunnerType>> = {
-  host: 'dangerously-host-process-without-any-isolation',
-  'dangerously-host-process-without-any-isolation': 'dangerously-host-process-without-any-isolation',
   docker: 'docker',
   container: 'docker',
   podman: 'podman',
@@ -106,13 +159,16 @@ export const RUNNER_ALIASES: Readonly<Record<string, RunnerType>> = {
  * Resolve a friendly runner alias (or canonical value) to a {@link RunnerType}.
  * Case-insensitive and whitespace-tolerant. Returns null for unknown values so
  * callers can produce an actionable error listing the accepted aliases.
+ *
+ * Does NOT accept host-process names — use {@link isRemovedHostRunnerInput}
+ * first so callers can surface the docker requirement instead of "invalid runner".
  */
 export function resolveRunnerType(input: string): RunnerType | null {
   return RUNNER_ALIASES[input.trim().toLowerCase()] ?? null;
 }
 
 /** Human-readable list of accepted runner aliases, for error messages. */
-export const RUNNER_ALIAS_HINT = 'host, docker, container, podman';
+export const RUNNER_ALIAS_HINT = 'docker, container, podman';
 
 /**
  * Permission posture for HOST execution (host-process runner only; ignored for
@@ -126,6 +182,29 @@ export const RUNNER_ALIAS_HINT = 'host, docker, container, podman';
 export type HostPermissionMode = 'sandbox' | 'bypass';
 
 export const VALID_HOST_PERMISSION_MODES: readonly HostPermissionMode[] = ['sandbox', 'bypass'] as const;
+
+/**
+ * Whether lazy verifies the host FILE-TOOL boundary before launching host agents
+ * under `permission_mode = "sandbox"`.
+ *
+ * The OS sandbox covers Bash; the Read/Edit/Write tools are held back only by
+ * the `permissions.deny` rules lazy passes to Claude Code — an upstream behavior
+ * lazy depends on but does not control.
+ *   - 'off' (default): no runtime check. The standing signal is the CI guard
+ *     workflow plus `lazy system verify-host-boundary` on demand. Default because
+ *     the guard costs three real headless sessions and needs a logged-in
+ *     `claude`, which a daemon host may not have.
+ *   - 'once-per-version': verify on the first host launch for each Claude Code
+ *     version + platform + deny posture, cache the verdict, and REFUSE to launch
+ *     if a deny rule was violated.
+ * See src/runner/host-boundary-guard.ts and public-docs/host-boundary-guard.md.
+ */
+export type SandboxBoundaryVerification = 'off' | 'once-per-version';
+
+export const VALID_SANDBOX_BOUNDARY_VERIFICATIONS: readonly SandboxBoundaryVerification[] = [
+  'off',
+  'once-per-version',
+] as const;
 
 /**
  * Claude Code `--effort` levels. Controls how hard the model thinks before responding.
@@ -176,6 +255,24 @@ export interface MaintainEntry {
 }
 
 /**
+ * A single reactive-automation group. The generalized case of protected-file
+ * push-back: when a turn's commits *touch* `pattern`, the supervisor prompts
+ * the agent once with `instructions` (e.g. "take UI screenshots"). Same shape
+ * as {@link MaintainEntry}; the trigger is inverted (matched → nudge, not
+ * skipped → nudge). The nudge itself is not a gate and never re-triggers
+ * push-back; the supervisor still re-detects protected-file violations after
+ * the follow-up so edits made during react can still park the turn in conflict.
+ */
+export interface ReactEntry {
+  /** Short human label for the group (e.g. "take-UI-snapshots"). */
+  title: string;
+  /** Glob pattern matched against the turn's changed files. */
+  pattern: string;
+  /** What to do when those files change — shown to the agent verbatim. */
+  instructions: string;
+}
+
+/**
  * A single custom mount ([[mounts]]) injected into task agent containers.
  *
  * Either a bind mount (a host `source` path) or a container-local `volume`
@@ -185,23 +282,21 @@ export interface MaintainEntry {
  */
 /**
  * Accept-time validation ([automation.pre_accept]). OPT-IN: `enabled` defaults
- * to false, because the step costs a full agent turn on every accept and the
- * accept path blocks on it.
+ * to false, because the accept path blocks on the gate and some projects gate
+ * elsewhere (CI).
  *
- * A single agent turn that
- * runs when a task is being accepted, BEFORE the merge — the home for expensive
- * one-time validation (full test suite, build) and for maintained-files
- * completeness (the CHANGELOG entry, written once against the final diff). The
- * turn always includes a built-in post-mortem (recorded to the task journal);
- * that is not configurable.
+ * The MECHANICAL acceptance gate: the configured commands run in an ephemeral
+ * container on the task's worktree when the task is accepted, BEFORE the merge
+ * — the home for expensive one-time validation (full test suite, build). No
+ * agent turn runs here.
  *
- * `commands` are the merge GATE: the supervisor re-runs them after the agent's
- * turn, and a non-zero exit aborts the accept and returns the task to blocked.
+ * A non-zero exit aborts the accept and returns the task to blocked with the
+ * failure surfaced.
  */
 export interface PreAcceptConfig {
-  /** Run the pre-accept turn at all. Default false — opt in to pay a turn per accept. */
+  /** Run the acceptance gate at all. Default false — opt in to pay commands-time per accept. */
   enabled?: boolean;
-  /** Gate commands run (in order) after the agent turn; first non-zero exit aborts the merge. */
+  /** Gate commands run (in order); first non-zero exit aborts the merge. */
   commands?: string[];
   /** Timeout in seconds for EACH gate command (default: 600). */
   timeout?: number;
@@ -223,7 +318,7 @@ export interface MountConfigEntry {
 export interface LazyConfig {
   models?: {
     default?: string;
-    /** Per-role model targets. When set, they override the legacy [ollama] block for that role. */
+    /** Per-role default agent profile: what a role runs when a task names none. */
     roles?: {
       builder?: RoleTargetConfig;
       agent?: RoleTargetConfig;
@@ -240,8 +335,6 @@ export interface LazyConfig {
   storage?: {
     backend?: StorageBackendConfig;
     external_path?: string;
-    /** Enable SSL/TLS for PostgreSQL (required for cloud databases like Neon, Supabase) */
-    postgres_ssl?: boolean;
   };
   git?: {
     default_branch_prefix?: string;
@@ -257,8 +350,21 @@ export interface LazyConfig {
   output?: {
     shortid_length?: number;
   };
+  /**
+   * Named agent profiles — `[agents.<name>]`. Each is harness + model +
+   * endpoint + credential, selectable per task with `--agent <name>`. Built-in
+   * profiles named after each harness exist implicitly; a block of the same
+   * name overrides one. See ./agent-profiles.ts.
+   */
+  agents?: Record<string, AgentProfileConfig>;
   agent?: {
     agent_id?: string;
+    /**
+     * Per-task-type agent overrides. Unmapped types fall back to `agent_id`.
+     * An explicit `--agent` at create/start still wins. Subtasks, clones, redo
+     * and rework inherit the source task's agent and ignore this table.
+     */
+    by_type?: Partial<Record<TaskType, string>>;
     /**
      * Kill the agent process after this many ms without progress. For agents
      * with an activity stream (Claude Code) "progress" means a forward-progress
@@ -280,6 +386,46 @@ export interface LazyConfig {
     graceful_exit_timeout_ms?: number;
     /** Default reasoning effort level passed to Claude Code via --effort for task agents. */
     effort?: EffortLevel;
+    /**
+     * @deprecated Folded into `[review] mode`. `true` is now
+     * `mode = "low_high"`, `false` is `mode = "separate"` — which is what it
+     * meant before the default flipped: no in-session loop, and the daemon
+     * dispatching a reviewer of its own. Still honoured; `lazy doctor` says so.
+     */
+    low_high_loop?: boolean;
+    /** @deprecated Folded into `[review] draft_effort`. Still honoured. */
+    low_high_loop_draft_effort?: EffortLevel;
+    /** @deprecated Folded into `[review] review_effort`. Still honoured. */
+    low_high_loop_review_effort?: EffortLevel;
+  };
+  review?: {
+    /**
+     * How a task is reviewed once it declares final: "off", "low_high"
+     * (default) or "separate". See `src/review/mode.ts` for the vocabulary and
+     * the decision behind the default.
+     */
+    mode?: ReviewMode;
+    /**
+     * Whether a `separate` review that comes back `needs_work` starts a fix
+     * turn by itself (default: false).
+     *
+     * False parks the task with its findings attached and hands back to
+     * whoever is driving — a person, or a cluster's driver — so the decision
+     * "is another round worth it" is made by someone who can see the whole
+     * board rather than by the daemon. In `low_high` mode the fix is in-session
+     * by definition and this key does not apply.
+     */
+    auto_fix?: boolean;
+    /**
+     * WHEN a recorded review holds the merge: "auto" (default, the mode
+     * decides and a review you asked for always gates), "always" (any recorded
+     * review gates, the low-high self-review included), or "never".
+     */
+    gate?: ReviewGate;
+    /** Effort for the low-high draft and revise phases (default "low"). */
+    draft_effort?: EffortLevel;
+    /** Effort for the low-high self-review phase (default "xhigh"). */
+    review_effort?: EffortLevel;
   };
   builder?: {
     /** Default reasoning effort level passed to Claude Code via --effort for builder sessions. */
@@ -297,6 +443,7 @@ export interface LazyConfig {
     port?: number;
     sync_interval?: number;
     bind?: string;
+    dashboard_url?: string;
   };
   remote?: {
     driver?: string;
@@ -316,6 +463,8 @@ export interface LazyConfig {
   };
   docker?: {
     dockerfile?: string;
+    build_inputs?: string[];
+    run_args?: string[];
   };
   runner?: RunnerType | {
     type?: RunnerType;
@@ -339,6 +488,11 @@ export interface LazyConfig {
      * unprivileged container (no user namespaces). Weakens isolation — opt-in.
      */
     sandbox_allow_weaker_nested?: boolean;
+    /**
+     * Verify the file-tool deny boundary before launching host agents under
+     * sandbox mode: "off" (default) or "once-per-version".
+     */
+    verify_sandbox_boundary?: SandboxBoundaryVerification;
   };
   documents?: {
     path?: string;
@@ -351,10 +505,10 @@ export interface LazyConfig {
     protected?: string[];
   };
   /**
-   * Protected branches: merges into a protected branch require a
-   * human-recorded approval (`lazy approve <task>`) before `lazy accept`
-   * will complete. This is friction against an over-eager builder, not a
-   * security boundary — see public-docs/protected-branches.md.
+   * Protected branches: merges into a protected branch require a human
+   * approval — the passphrase typed at `lazy accept`'s own prompt, in the
+   * invocation that merges. This is friction against an over-eager builder,
+   * not a security boundary — see public-docs/protected-branches.md.
    */
   protection?: {
     /**
@@ -379,23 +533,85 @@ export interface LazyConfig {
   automation?: {
     /** Files agents are nudged to keep up to date (docs, CHANGELOG, etc.). Opt-in; empty by default. */
     maintain?: MaintainEntry[];
+    /**
+     * Reactive automations: when a turn's commits touch a group's pattern, the
+     * supervisor prompts the agent once with that group's instructions. Opt-in;
+     * empty by default. Generalized protected-file push-back (custom instructions,
+     * nudge not gate).
+     */
+    react?: ReactEntry[];
     /** Accept-time validation step: heavy checks + maintained-files completeness + built-in post-mortem. */
     pre_accept?: PreAcceptConfig;
-  };
-  /** Custom mounts injected into task agent containers. Opt-in; empty by default. */
-  mounts?: MountConfigEntry[];
-  checks?: {
+    /**
+     * Command run in the worktree BEFORE each agent turn (after the upstream
+     * merge, before the agent starts). Intended for "ensure services are up"
+     * setup — must be idempotent, because agent-started processes survive turn
+     * boundaries and the hook runs on every turn regardless.
+     */
+    pre_turn?: string;
+    /** Timeout in seconds for the pre_turn hook (default: 120). */
+    pre_turn_timeout?: number;
+    /**
+     * When true, a failing pre_turn hook fails the whole turn instead of
+     * warning. Default false: the failure is loud and prepended to the agent's
+     * prompt, but the turn still runs.
+     */
+    pre_turn_required?: boolean;
     /** Command to run after each agent turn. Output is captured and attached to the turn. */
     post_turn?: string;
     /** Timeout in seconds for post_turn check command (default: 300). */
     post_turn_timeout?: number;
+    /**
+     * Command run in the TASK WORKTREE at accept time, before the merge. A
+     * non-zero exit refuses the accept: the task's own tree does not build, so
+     * merging it would break the target branch.
+     *
+     * Empty by default — a project that configures nothing gets no gate, and
+     * accept says so rather than inventing a command. Keep it cheap (a
+     * typecheck, not a full test suite): every accept pays for it.
+     */
+    accept_check?: string;
+    /** Timeout in seconds for the accept_check command (default: 300). */
+    accept_check_timeout?: number;
   };
-  ollama?: {
-    enabled?: boolean;
-    /** Model name to pass to Claude Code via --model (e.g., "qwen3.5:35b-a3b-coding-nvfp4") */
-    model?: string;
-    /** Ollama API endpoint the PROXY dials, host-perspective (e.g., "http://localhost:11434") */
-    endpoint?: string;
+  /** Custom mounts injected into task agent containers. Opt-in; empty by default. */
+  mounts?: MountConfigEntry[];
+  /** Ports the task environment serves, published to ephemeral loopback host ports. */
+  serve?: {
+    /** Container-side ports; each is identified by its own number. */
+    ports?: number[];
+    /** Named services: `name = port`. Same list as `ports`, with names. */
+    services?: Record<string, number>;
+    /**
+     * Command that starts the project's services INSIDE a task's environment
+     * (`bin/dev`, `npm run dev`, …). Optional. When set, the web review and
+     * task pages offer a one-click "Start services" that runs it in the task's
+     * container shell.
+     */
+    start_services_cmd?: string;
+  };
+  /**
+   * DEPRECATED — migrated to `[automation]`. Still honored (never silently
+   * ignored), but `lazy doctor` reports it and setting both spellings to
+   * DIFFERENT values is a hard config error.
+   */
+  checks?: {
+    /** @deprecated Use `[automation] post_turn`. */
+    post_turn?: string;
+    /** @deprecated Use `[automation] post_turn_timeout`. */
+    post_turn_timeout?: number;
+  };
+  /**
+   * Where `lazy auth` keeps model-provider credentials. Never a credential
+   * itself — lazy.toml is a committed file, and secrets must never land in one.
+   */
+  credentials?: {
+    /**
+     * "auto" (default) probes macOS Keychain → libsecret → a 0600 file.
+     * Naming one pins it, and an unusable pinned backend is an error rather
+     * than a silent downgrade to a plaintext file the user did not choose.
+     */
+    backend?: string;
   };
   /**
    * Built-in Anthropic-native passthrough proxy (Tier-1 audit plane).
@@ -438,8 +654,9 @@ export interface LazyConfig {
       model?: string;
       /**
        * Which credential the proxy injects when it reroutes here:
-       * "anthropic" (this target really is Anthropic) or "none" (default — the
-       * target authenticates some other way, or not at all).
+       * "anthropic" (Anthropic-native), "ollama" (Ollama Cloud), "openrouter"
+       * (OpenRouter's Anthropic-compatible endpoint), "openai", or "none"
+       * (default — no credential). See {@link ProxyFallbackCredential}.
        */
       credential?: string;
     }>;
@@ -448,6 +665,13 @@ export interface LazyConfig {
      * retry the primary once before failing over (default 5).
      */
     retry_after_threshold?: number;
+    /**
+     * Seconds the proxy waits for an upstream to answer one request before
+     * giving up (default 1800 — the supervisor's own no-progress watchdog).
+     * Raise it for a local model that loads slowly or queues requests; 0 means
+     * no ceiling at all.
+     */
+    upstream_timeout?: number;
     /**
      * Mechanistic policy plane (§6.3 layer 1). Deterministic, injection-proof
      * deny-rules applied to each `tool_use` before it executes. Absent =
@@ -465,6 +689,9 @@ export interface LazyConfig {
       /** Allowlisted egress hosts for WebFetch. Empty/absent = egress unrestricted. */
       egress_allowlist?: string[];
     };
+    // NOTE: outbound request plugins are NOT configured here. They are loaded
+    // by convention from the project's `.lazy/plugins/` directory — presence is
+    // the enable switch. See src/proxy/plugins/loader.ts.
   };
   memory?: {
     /**
@@ -488,18 +715,54 @@ export interface LazyConfig {
     url?: string | false;
   };
   limits?: {
-    /** Max live agent task containers before new starts queue (default: 8). */
-    max_concurrent_agents?: number;
     /** Max concurrent interactive builder containers before new builders fail fast (default: 8). */
     max_concurrent_builders?: number;
-    /** Minutes an idle blocked container may linger before the reaper frees its slot (default: 10). */
-    idle_grace_minutes?: number;
     /**
      * Max consecutive work turns a task may run without a human in the loop.
      * Builder (MCP) and agent-driven turns count; a human turn resets the count to 0.
      * 0 = unlimited (default: 10).
      */
     max_turns_without_human?: number;
+  };
+  cluster?: {
+    /**
+     * How many times a CLUSTER task may unblock the SAME child with review
+     * feedback before the daemon refuses and makes it decide (default: 3).
+     *
+     * A mechanical budget, not advice. A cluster drives its children unattended,
+     * and a child that keeps not-quite-passing review can absorb an unbounded
+     * number of full agent turns without anybody watching. At the budget the
+     * driver's `lazy_unblock` of that child is refused, naming the three things
+     * it may do instead: accept it, close it, or defer it with a blocking raise
+     * of its own.
+     *
+     * Counted per child, reset when that child is started or accepted. Only an
+     * AGENT-actored unblock counts: a human unblocking the child is never
+     * refused (CLAUDE.md, "Never Lose Human Feedback") and starts a fresh
+     * budget, and neither are the daemon's own recovery turns.
+     *
+     * 0 = unlimited.
+     */
+    max_child_fix_rounds?: number;
+  };
+  /**
+   * Automatic pausing at a share of a SUBSCRIPTION usage window (opt-in).
+   *
+   * Past the threshold, lazy stops STARTING turns that would spend that
+   * credential: human starts/unblocks/resumes are refused with the reading,
+   * and the daemon's own launches (auto-resume, auto-delivery, cluster
+   * restarts) wait and go ahead by themselves once the window resets. A turn
+   * already running is never stopped. Off unless `threshold_percent` is set.
+   */
+  usage_pause?: {
+    /** Percent (1–100) of a usage window past which new turns wait. 0 / absent = off. */
+    threshold_percent?: number;
+    /**
+     * Per-credential thresholds, keyed by the credential name `lazy stats
+     * limits` prints (e.g. `credential:CLAUDE_CODE_OAUTH_TOKEN`, `user:<email>`).
+     * Wins over `threshold_percent` for that credential; 0 = never pause it.
+     */
+    credentials?: Record<string, number>;
   };
   daemon?: {
     /** React to CI failures (default: true). */
@@ -530,8 +793,9 @@ export interface ResolvedConfig {
     default: string;
     /**
      * Fully-resolved per-role model targets. Always present after loadConfig:
-     * resolved from explicit [models.roles.*], else the legacy [ollama] block
-     * (maps to all roles → ollama), else the anthropic default.
+     * the profile named by `[models.roles.<role>] agent`, else the role's own
+     * default profile (`[agent] agent_id` for tasks, claude-code for the
+     * builder), flattened with its model, endpoint, wire and credential.
      */
     roles: {
       builder: RoleTarget;
@@ -549,8 +813,6 @@ export interface ResolvedConfig {
   storage: {
     backend: StorageBackendConfig;
     external_path: string;
-    /** Enable SSL/TLS for PostgreSQL (required for cloud databases like Neon, Supabase) */
-    postgres_ssl: boolean;
   };
   git: {
     default_branch_prefix: string;
@@ -559,8 +821,17 @@ export interface ResolvedConfig {
   output: {
     shortid_length: number;
   };
+  /**
+   * `[agents.<name>]` blocks as written, validated at load. Resolution to full
+   * profiles (built-ins merged in, wire and credential inferred) goes through
+   * `agentProfilesFor()` in ./agent-profiles.ts — the raw table is kept here so
+   * ResolvedConfig stays a plain, cloneable, serialisable object.
+   */
+  agents: Record<string, AgentProfileConfig>;
   agent: {
     agent_id: string;
+    /** Per-task-type agent overrides. Empty when unset. */
+    by_type?: Partial<Record<TaskType, string>>;
     /**
      * Kill the agent process after this many ms without progress.
      * 0 = use agent default.
@@ -573,6 +844,18 @@ export interface ResolvedConfig {
     wind_down_timeout_ms: number;
     /** Default reasoning effort level passed to Claude Code via --effort for task agents. */
     effort: EffortLevel;
+  };
+  review: {
+    /** How a task is reviewed once it declares final. Default `low_high`. */
+    mode: ReviewMode;
+    /** Does a `separate` review's `needs_work` start a fix turn by itself? Default false. */
+    auto_fix: boolean;
+    /** When a recorded review holds the merge. Default `auto`. */
+    gate: ReviewGate;
+    /** Effort for the low-high draft and revise phases. */
+    draft_effort: EffortLevel;
+    /** Effort for the low-high self-review phase. */
+    review_effort: EffortLevel;
   };
   builder: {
     /** Default reasoning effort level passed to Claude Code via --effort for builder sessions. */
@@ -597,6 +880,8 @@ export interface ResolvedConfig {
      * deliberately expose the daemon to the LAN/remote hosts.
      */
     bind: string;
+    /** Exact public origin used to reach the dashboard through a trusted reverse proxy. */
+    dashboard_url: string;
   };
   remote: {
     driver: string;
@@ -615,6 +900,24 @@ export interface ResolvedConfig {
   };
   docker: {
     dockerfile: string;
+    /**
+     * Files whose CONTENTS are part of the image's identity, relative to the
+     * project root. Changing one rebuilds the image on the next container
+     * start, exactly as editing the Dockerfile does.
+     *
+     * Only meaningful for files the Dockerfile actually COPYs: Docker keys a
+     * `RUN bundle install` layer on the Dockerfile text alone, so without a
+     * COPY of the lockfile the rebuild it triggers is a guaranteed no-op.
+     */
+    build_inputs: string[];
+    /**
+     * Extra `docker run` arguments applied verbatim, in order, before the
+     * image name when a TASK container is created (e.g.
+     * `["--cap-add=SYS_PTRACE"]` for seccomp-notify based sandboxes). Resolved
+     * from the PROJECT ROOT's lazy.toml only — a task worktree's copy is
+     * agent-writable and must never govern container privileges.
+     */
+    run_args: string[];
   };
   runner: {
     type: RunnerType;
@@ -634,6 +937,8 @@ export interface ResolvedConfig {
      * unprivileged container (no user namespaces). Weakens isolation — opt-in.
      */
     sandbox_allow_weaker_nested: boolean;
+    /** Runtime file-tool boundary verification (see LazyConfig.runner). */
+    verify_sandbox_boundary: SandboxBoundaryVerification;
   };
   documents: {
     path: string;
@@ -655,27 +960,65 @@ export interface ResolvedConfig {
   automation: {
     /** Files agents are nudged to keep up to date (docs, CHANGELOG, etc.). Opt-in; empty by default. */
     maintain: MaintainEntry[];
+    /**
+     * Reactive automations: pattern match → one-shot supervisor prompt with
+     * instructions. Opt-in; empty by default.
+     */
+    react: ReactEntry[];
     /** Accept-time validation step. Always present after loadConfig; opt-in (enabled defaults false). */
     pre_accept: {
       enabled: boolean;
       commands: string[];
       timeout: number;
     };
+    /** Setup command run in the worktree before each agent turn. Empty = disabled. */
+    pre_turn: string;
+    /** Timeout in seconds for the pre_turn hook. */
+    pre_turn_timeout: number;
+    /** When true, a failing pre_turn hook fails the turn instead of warning. */
+    pre_turn_required: boolean;
+    /**
+     * Command to run after each agent turn. Output is captured and attached to
+     * the turn. Resolved from `[automation] post_turn`, falling back to the
+     * deprecated `[checks] post_turn`.
+     */
+    post_turn: string;
+    /** Timeout in seconds for post_turn check command. */
+    post_turn_timeout: number;
+    /**
+     * Command run in the task worktree at accept time, before the merge. A
+     * non-zero exit refuses the accept. Empty = no gate (accept says so).
+     */
+    accept_check: string;
+    /** Timeout in seconds for the accept_check command. */
+    accept_check_timeout: number;
   };
   /** Custom mounts injected into task agent containers. Opt-in; empty by default. */
   mounts: MountConfigEntry[];
-  checks: {
-    /** Command to run after each agent turn. Output is captured and attached to the turn. */
-    post_turn: string;
-    /** Timeout in seconds for post_turn check command (default: 300). */
-    post_turn_timeout: number;
+  /**
+   * The resolved `[serve]` section. A TABLE rather than a bare array (which is
+   * what `serve` used to resolve to) so that everything the section declares
+   * stays under one key: managed-mode policy and the DEFAULT_CONFIG walk are
+   * both keyed by resolved path, and a second top-level `serve_*` key would
+   * have to invent a policy name that matches no lazy.toml key.
+   */
+  serve: {
+    /**
+     * Ports the task environment serves, already resolved to `{ name, port }`
+     * and validated at load time. Empty by default — a project with no
+     * `[serve]` section publishes nothing and its launch argv is unchanged.
+     */
+    services: ServicePort[];
+    /**
+     * Command that starts the project's services inside a task environment.
+     * Empty string when unset.
+     */
+    start_services_cmd: string;
   };
-  ollama: {
-    enabled: boolean;
-    /** Model name to pass to Claude Code via --model (e.g., "qwen3.5:35b-a3b-coding-nvfp4") */
-    model: string;
-    /** Ollama API endpoint the PROXY dials, host-perspective (e.g., "http://localhost:11434") */
-    endpoint: string;
+  /** Where `lazy auth` keeps model-provider credentials. */
+  credentials: {
+    /** Validated at load time against src/credentials/backends.ts. */
+    backend: BackendSelection;
   };
   /**
    * Resolved proxy config. ALWAYS present — the proxy has no off switch, so
@@ -706,9 +1049,15 @@ export interface ResolvedConfig {
      * `credential = "anthropic"` on a fallback that really is Anthropic
      * (a second tier, a gateway that proxies to Anthropic).
      */
-    fallbacks: { upstream: string; model?: string; credential: 'anthropic' | 'none' }[];
+    fallbacks: { upstream: string; model?: string; credential: ProxyFallbackCredential }[];
     /** Retry-After threshold (seconds) below which the primary is waited-out and retried before failover. */
     retryAfterThreshold: number;
+    /**
+     * Seconds the proxy waits for one upstream request (0 = no ceiling). Always
+     * present: it REPLACES Bun's hidden default fetch timeout, which used to
+     * abort slow local-model requests at a number lazy never chose.
+     */
+    upstreamTimeoutSeconds: number;
     /** Fully-resolved mechanistic policy (§6.3 layer 1). Always present. */
     policy: ResolvedProxyPolicy;
   };
@@ -729,18 +1078,29 @@ export interface ResolvedConfig {
     url: string | null;
   };
   limits: {
-    /** Max live agent task containers before new starts queue (default: 8). */
-    max_concurrent_agents: number;
     /** Max concurrent interactive builder containers before new builders fail fast (default: 8). */
     max_concurrent_builders: number;
-    /** Minutes an idle blocked container may linger before the reaper frees its slot (default: 10). */
-    idle_grace_minutes: number;
     /**
      * Max consecutive work turns a task may run without a human in the loop.
      * Builder (MCP) and agent-driven turns count; a human turn resets the count to 0.
      * 0 = unlimited (default: 10).
      */
     max_turns_without_human: number;
+  };
+  cluster: {
+    /**
+     * How many times a CLUSTER task may unblock the SAME child with review
+     * feedback before the daemon refuses and makes it decide (default: 3).
+     * 0 = unlimited. See the `LazyConfig` twin above for why it exists.
+     */
+    max_child_fix_rounds: number;
+  };
+  /** Automatic pausing at a share of a subscription usage window. See the `LazyConfig` twin. */
+  usage_pause: {
+    /** 0 = off. */
+    threshold_percent: number;
+    /** Per-credential thresholds; 0 = never pause that credential. */
+    credentials: Record<string, number>;
   };
   daemon: {
     /** React to CI failures (default: true). */

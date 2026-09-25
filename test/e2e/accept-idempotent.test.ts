@@ -3,8 +3,10 @@ import { writeFileSync } from 'fs';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput, expectFailure, expectError } from '../helpers/assertions';
-import { createTask, disablePreAccept, startAndReconcile } from '../helpers/fixtures';
+import { createTask, disablePreAccept, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { setTaskStatus } from '../helpers/storage';
 import { worktreePathFor } from '../helpers/storage';
+import { seedFinal } from '../helpers/final';
 
 /**
  * Helper: create a task, start it, make a commit in the worktree so accept has something to merge.
@@ -25,6 +27,10 @@ async function createStartedTaskWithCommit(ctx: TestContext, goal: string): Prom
 
   const gitCommit = ctx.git('-C', worktreePath, 'commit', '-m', 'Add feature');
   expect(gitCommit.exitCode).toBe(0);
+
+  // Fixture setup, not the subject (see test/helpers/final.ts). Daemonless
+  // suite, so the final is seeded at the storage level.
+  await seedFinal(ctx, taskId);
 
   return taskId;
 }
@@ -101,6 +107,21 @@ describe('lazy accept idempotent transitions', () => {
     expectOutput(showAfterSecond, 'abandoned');
   });
 
+  // INVARIANT: a reject never replaces another terminal verdict — a closed task
+  // stays closed with its reason. A stale Reject form used to relabel it "rejected".
+  test('reject cannot replace a close verdict on an abandoned task', async () => {
+    const taskId = await createStartedTaskWithCommit(ctx, 'Close then stale reject');
+
+    expectSuccess(await ctx.lazy(['close', taskId, '--reason', 'No longer wanted']));
+    const reject = await ctx.lazy(['reject', taskId, '--reason', 'Stale browser verdict', '--yes']);
+
+    expectFailure(reject);
+    expectError(reject, 'already abandoned');
+    const shown = await ctx.lazy(['show', taskId]);
+    expectSuccess(shown);
+    expectOutput(shown, 'No longer wanted');
+  });
+
   // `lazy abandon` was removed; `lazy close` is its direct successor (same
   // --reason contract, same 'abandoned' terminal status).
   test('close twice fails (not idempotent)', async () => {
@@ -165,13 +186,37 @@ describe('lazy accept idempotent transitions', () => {
     expect(ctx.git('-C', worktreePath, 'add', 'followup.txt').exitCode).toBe(0);
     expect(ctx.git('-C', worktreePath, 'commit', '-m', 'Add follow-up').exitCode).toBe(0);
 
-    // Accept again (should work - not terminal anymore)
-    const secondAccept = await ctx.lazy(['accept', taskId, '--yes']);
+    // The reopen reason is human feedback no prompt has carried, so accept
+    // refuses on it — and on it alone: the first accept's own [Accepted]
+    // record is not feedback and must not count.
+    const gated = await ctx.lazy(['accept', taskId, '--yes']);
+    expect(gated.exitCode).not.toBe(0);
+    expect(gated.stdout + gated.stderr).toContain('1 queued comment ');
+
+    // Here the human did the follow-up work themselves, so the reason needs no
+    // agent turn: accept again, saying so (not terminal anymore).
+    const secondAccept = await ctx.lazy(['accept', taskId, '--yes', '--allow-queued-comments']);
     expectSuccess(secondAccept);
 
     // Verify task is complete again
     const showAfterSecondAccept = await ctx.lazy(['show', taskId]);
     expectSuccess(showAfterSecondAccept);
     expectOutput(showAfterSecondAccept, 'complete');
+  });
+
+  // INVARIANT: lazy's own bookkeeping comments (here reparent's "[Reparented]"
+  // record) are not human feedback the agent has yet to read, so they never
+  // refuse accept. Counting them wedged accept after every reparent.
+  test('reparenting a task does not block accepting it', async () => {
+    const parentId = await createTask(ctx, 'New parent', 'Parent work');
+    await startAndReconcile(ctx, parentId);
+    const taskId = await createStartedTaskWithCommit(ctx, 'Reparent then accept');
+
+    const reparent = await ctx.lazyMocked(['reparent', taskId, '--parent', parentId, '--yes'], MOCK_CLAUDE_SUCCESS);
+    expectSuccess(reparent);
+    setTaskStatus(ctx.root, taskId, 'blocked');
+
+    const accepted = await ctx.lazy(['accept', taskId, '--yes']);
+    expectSuccess(accepted);
   });
 });

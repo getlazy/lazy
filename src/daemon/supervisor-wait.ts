@@ -1,16 +1,20 @@
 /**
  * Liveness-aware wait for a supervisor's protocol response.
  *
- * The daemon runs two turns SYNCHRONOUSLY — `ask` and `pre_accept` — by writing
- * a command into the protocol dir, launching (or reusing) the supervisor run,
- * and polling for `response.json`. A bare `waitForResponse` poll only ever asks
- * "has the response appeared yet?", so a supervisor that dies before writing one
+ * The daemon waits on supervisors SYNCHRONOUSLY in two places — the `ask` turn
+ * (in-flight record + turn wait) and the MECHANICAL acceptance gate, which runs
+ * `lazy accept`'s configured checks in its own ephemeral container and writes
+ * the verdict straight into its dedicated protocol dir — by writing a command
+ * into the protocol dir, launching (or reusing) the supervisor run, and polling
+ * for `response.json`. A bare `waitForResponse` poll only ever asks "has the
+ * response appeared yet?", so a supervisor that dies before writing one
  * — crash at startup, a broken image, an OOM kill, `docker kill`, or a run that
  * was never launched because a stale `isRunning` said one was already up —
  * leaves the daemon polling a directory nothing will ever write to, until the
- * whole timeout expires. For pre-accept that is `watchdog_output_timeout_ms + 5m`
- * (~35 minutes by default): `lazy accept` sits on a spinner while nothing at all
- * is running. This helper closes that gap for both call sites.
+ * whole timeout expires. For the gate that is commands × per-command timeout
+ * plus margin (tens of minutes by default): `lazy accept` sits on a spinner
+ * while nothing at all is running. This helper closes that gap for both call
+ * sites.
  *
  * Two graces make the check safe rather than merely fast:
  *

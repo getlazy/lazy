@@ -1,6 +1,6 @@
 import { join } from 'path';
 import { mkdir, writeFile, unlink } from 'fs/promises';
-import { getDataDir } from '../cli/init';
+import { getDataDir } from '../project-paths';
 
 /**
  * Async twin of src/cli/editor.ts's saveRecoveryFile, for use inside the daemon.

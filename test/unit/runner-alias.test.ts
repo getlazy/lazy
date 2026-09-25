@@ -4,13 +4,14 @@ import {
   VALID_RUNNER_TYPES,
   RUNNER_ALIASES,
 } from '../../src/config/types';
+import { isRemovedHostRunnerInput } from '../../src/runner/host-runner-gate';
 
 describe('runner alias resolution', () => {
-  // INVARIANT: friendly CLI/MCP aliases map to canonical RunnerType values so a
-  // user can type `host`/`docker`/`container`/`podman` without knowing the
-  // verbose `dangerously-host-process-without-any-isolation` string.
-  test('host alias maps to the verbose host-process runner', () => {
-    expect(resolveRunnerType('host')).toBe('dangerously-host-process-without-any-isolation');
+  // INVARIANT: user-facing CLI/MCP aliases map to container runners only.
+  // Host-process runner is test-harness-internal (see host-runner-gate.ts).
+  test('host alias is rejected as a removed runner input', () => {
+    expect(isRemovedHostRunnerInput('host')).toBe(true);
+    expect(resolveRunnerType('host')).toBeNull();
   });
 
   test('docker and container both map to docker', () => {
@@ -22,15 +23,14 @@ describe('runner alias resolution', () => {
     expect(resolveRunnerType('podman')).toBe('podman');
   });
 
-  test('canonical values resolve to themselves', () => {
-    for (const t of VALID_RUNNER_TYPES) {
-      expect(resolveRunnerType(t)).toBe(t);
-    }
+  test('container runner canonical values resolve through aliases', () => {
+    expect(resolveRunnerType('docker')).toBe('docker');
+    expect(resolveRunnerType('podman')).toBe('podman');
   });
 
   test('case-insensitive and whitespace-tolerant', () => {
-    expect(resolveRunnerType('  HOST ')).toBe('dangerously-host-process-without-any-isolation');
     expect(resolveRunnerType('Docker')).toBe('docker');
+    expect(resolveRunnerType('  podman ')).toBe('podman');
   });
 
   test('unknown values return null (caller produces an actionable error)', () => {

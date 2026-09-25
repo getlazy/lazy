@@ -2,17 +2,20 @@ import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { join } from 'path';
 import { existsSync, readFileSync, writeFileSync, readdirSync } from 'fs';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { expectSuccess, expectOutput } from '../helpers/assertions';
+import { expectSuccess, expectOutput, extractTaskId } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import {
   writeResponse,
   consumeResponse,
   hasResponse,
+  writeStatus,
   protocolDir as getProtocolDir,
 } from '../../src/protocol';
 import type { CompletedResponse, ErrorResponse } from '../../src/protocol';
 import { reconcileTasks } from '../../src/utils/reconcile';
+import { beginLaunch, endLaunch } from '../../src/runner/launch-in-flight';
 import { openProjectStorage } from '../../src/daemon/rpc-handlers';
+import { readTaskStatus } from '../helpers/storage';
 import { enableInProcessTestMode } from '../helpers/in-process-test-mode';
 
 // This suite awaits reconcileTasks() IN-PROCESS, so the `bun test` process itself
@@ -93,6 +96,13 @@ async function runReconcile(root: string): Promise<void> {
   } finally {
     await storage.close();
   }
+}
+
+/** Every turn recorded on a task's session, in order. */
+function readTurns(root: string, fullTaskId: string): Array<Record<string, unknown>> {
+  const turnsPath = join(tasksDirFor(root), fullTaskId, 'turns.json');
+  if (!existsSync(turnsPath)) return [];
+  return (JSON.parse(readFileSync(turnsPath, 'utf-8')) as { turns: Array<Record<string, unknown>> }).turns;
 }
 
 /**
@@ -186,6 +196,113 @@ describe('lazy reconciliation grace period', () => {
     const showResult = await ctx.lazy(['show', taskId]);
     expectSuccess(showResult);
     expectOutput(showResult, 'interrupted');
+  });
+
+  // INVARIANT: a launch this daemon process is still performing is never
+  // reconciled as a vanished container. `launchSupervisor` resolves — and on a
+  // fresh host BUILDS — the agent image before it runs the container, minutes
+  // during which the task is `working` with no run and no run name recorded.
+  // The worktree lock is re-entrant on pid (the launch runs in this process)
+  // and the grace period is 30 s, so neither covers it. Seen on the fleet
+  // demo's first turn: the reconciler recorded "Container disappeared (no exit
+  // code)" at one minute, the build finished at two, and the container then
+  // ran a real turn against a task the UI showed as interrupted.
+  test('a launch still in progress in this process is never reconciled as a vanished container', async () => {
+    const taskId = await createTask(ctx, 'Launch in flight', 'Do the work');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+    await runReconcile(ctx.root);
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+
+    // The shape of a launch mid-build: working, past the grace period, no run.
+    setTaskStatus(ctx.root, fullTaskId, 'working');
+    setLastInteractionAt(ctx.root, fullTaskId, new Date(Date.now() - 3600000).toISOString());
+
+    beginLaunch('some-run-name-the-reconciler-does-not-know', fullTaskId);
+    try {
+      await runReconcile(ctx.root);
+      expect(readTaskStatus(ctx.root, fullTaskId)).toBe('working');
+    } finally {
+      endLaunch('some-run-name-the-reconciler-does-not-know', fullTaskId);
+    }
+
+    // The launch is over and still no run: now it is a vanished container.
+    await runReconcile(ctx.root);
+    expect(readTaskStatus(ctx.root, fullTaskId)).toBe('interrupted');
+  });
+
+  // INVARIANT (fix-empty-failed-turn): a turn that dies must always leave a
+  // VISIBLE record — a turn, not only `session.interrupt_reason`. A run that
+  // vanishes never writes a response, so the supervisor's error path never
+  // runs; before this, the turns list showed nothing at all and the task simply
+  // came back from `working` looking like it had done nothing.
+  test('a run that dies without writing a response still records a crash turn', async () => {
+    const taskId = await createTask(ctx, 'Silent death', 'Do the work');
+    // No commit, for the same reason as the test above: committed work would
+    // legitimately route through recoverStrandedCompletion instead.
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+    await runReconcile(ctx.root);
+
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+    const before = readTurns(ctx.root, fullTaskId).length;
+
+    // Back to working with no container and no response — the run is simply gone.
+    setTaskStatus(ctx.root, fullTaskId, 'working');
+    await runReconcile(ctx.root);
+
+    const turns = readTurns(ctx.root, fullTaskId);
+    expect(turns.length).toBeGreaterThan(before);
+    const crash = turns.filter(t => t.role === 'agent' && String(t.content).includes('[Agent crashed]'));
+    expect(crash.length).toBe(1);
+    expect(String(crash[0]!.content)).toContain('without the supervisor reporting a result');
+  });
+
+  // INVARIANT: a `loop` task killed mid-turn is INTERRUPTED, never "recovered"
+  // to blocked. Stranded-completion recovery reads unrecorded branch commits as
+  // proof the agent finished — but a loop's branch carries its children's work,
+  // merged there by `lazy_accept` DURING the loop's own turn. So from its first
+  // accept onwards, a loop killed at any point (lazy upgrade stopping every
+  // container, a daemon restart, a crash) looked finished, was parked in
+  // `blocked`, and stayed there: only a newly added child wakes a blocked loop.
+  // That is the identity-remote-clients-loop incident (2026-09-14), five and a
+  // half hours parked with six child-accept merges backfilled as its own work.
+  test('a loop task with unrecorded branch commits reconciles to interrupted, not blocked', async () => {
+    const created = await ctx.lazy([
+      'create', '--goal', 'Loop: drive the children serially',
+      '--prompt', 'Run each child in order', '--type', 'cluster',
+    ]);
+    expectSuccess(created);
+    const taskId = extractTaskId(created.stdout);
+
+    // The mock commits. On a real loop those commits are the `lazy_accept`
+    // merges of children landing on the loop's branch mid-turn.
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
+    });
+
+    // The supervisor died at finalize: response gone, run gone, real commits on
+    // the branch that storage never recorded.
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+    consumeResponse(getProtocolDir(fullTaskId));
+    setTaskStatus(ctx.root, fullTaskId, 'working');
+
+    await runReconcile(ctx.root);
+
+    const show = await ctx.lazy(['show', taskId]);
+    expectSuccess(show);
+    expect(show.stdout).not.toContain('blocked');
+
+    // No turn may claim the loop finished, and its children's commits are not
+    // backfilled as its own — the next finalized turn records them anyway.
+    const turns = readTurns(ctx.root, fullTaskId);
+    expect(turns.some(t => String(t.content).includes('[Recovered]'))).toBe(false);
+    expect(turns.some(t => String(t.content).includes('[Agent crashed]'))).toBe(true);
+
+    // What the resumed turn's PROMPT carries is not assertable here: this suite
+    // is daemonless, so `maybeAutoResume` reaches `autoResumeTask` and stops at
+    // `runner.checkAvailability()` (no docker), leaving the previous `start`
+    // command in the protocol dir. That every launch path injects the loop
+    // contract is covered as a source invariant in
+    // test/unit/cluster-type-constraints.test.ts.
   });
 
 });
@@ -811,6 +928,56 @@ describe('reconciliation sweep: stranded working tasks', () => {
     const showAfter = await ctx.lazy(['show', taskId]);
     expectSuccess(showAfter);
     expectOutput(showAfter, 'interrupted');
+  });
+
+  // INVARIANT: a killed SYNC turn is never a stranded completion — the same
+  // carve-out a cluster task gets, for the same reason: unrecorded commits are
+  // not evidence that THIS turn finished.
+  //
+  // A sync's commits are the MERGE, landed by the supervisor mid-turn. Killed
+  // after the task-branch merge but before the parent one, a sync has commits
+  // and is half done. Recovering it records "[Recovered] …" and parks the task
+  // looking settled over a branch that is only partly synced, and parks it
+  // through the plain paused label — so a `submitted` task with an open PR
+  // dropped out of the review queue exactly as it did before sync learned to
+  // restore (src/task/sync-restore-status.ts). It must fall through to
+  // `interrupted`, where auto-resume owns it.
+  test('a killed sync turn is not treated as a stranded completion', async () => {
+    const taskId = await createTask(ctx, 'Killed sync stranded test', 'Do work');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
+    });
+
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+    const protoDir = getProtocolDir(fullTaskId);
+
+    // The supervisor got as far as landing a merge and then died: commits on the
+    // branch, no response, and a status whose command_type says what the turn
+    // WAS. `merge_and_fix_done` deliberately: `merge_and_fix` is already shielded
+    // as an active harness phase, so the gate under test is the only thing
+    // standing between this task and a bogus recovery.
+    consumeResponse(protoDir);
+    const now = new Date().toISOString();
+    writeStatus(protoDir, {
+      phase: 'merge_and_fix_done',
+      task_id: fullTaskId,
+      command_type: 'sync',
+      started_at: now,
+      updated_at: now,
+      pid: process.pid,
+    });
+    setTaskStatus(ctx.root, fullTaskId, 'working');
+
+    await runReconcile(ctx.root);
+
+    const showAfter = await ctx.lazy(['show', taskId]);
+    expectSuccess(showAfter);
+    expectOutput(showAfter, 'interrupted');
+
+    // And no recovery turn was fabricated for a merge that never finished.
+    const showFull = await ctx.lazy(['show', taskId, '--full']);
+    expectSuccess(showFull);
+    expect(showFull.stdout.includes('Recovered')).toBe(false);
   });
 });
 

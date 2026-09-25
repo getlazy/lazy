@@ -131,7 +131,7 @@ describe('agent git-and-transport discipline prompts', () => {
  */
 describe('composed agent system prompts', () => {
   test('buildSystemPrompt includes the discipline section', async () => {
-    const { buildSystemPrompt } = await import('../../src/cli/commands/shared');
+    const { buildSystemPrompt } = await import('../../src/task/turn-context');
     expect(buildSystemPrompt()).toContain('### Git and transport discipline');
   });
 

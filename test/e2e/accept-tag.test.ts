@@ -4,6 +4,8 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
+import { readTaskStatus, readTaskJson, readSessionJson, setTaskMetadata } from '../helpers/storage';
 
 /**
  * Resolve the tasks directory for the test project. Test projects init with
@@ -45,6 +47,8 @@ async function createStartedTaskWithCommit(ctx: TestContext, goal: string): Prom
   writeFileSync(join(worktreePath, 'feature.txt'), 'feature content\n');
   expect(ctx.git('-C', worktreePath, 'add', 'feature.txt').exitCode).toBe(0);
   expect(ctx.git('-C', worktreePath, 'commit', '-m', 'Add feature').exitCode).toBe(0);
+  // Fixture setup, not the subject (see test/helpers/final.ts).
+  await seedFinal(ctx, taskId);
   return taskId;
 }
 
@@ -60,6 +64,41 @@ describe('lazy accept creates the authoritative accept tag', () => {
   afterEach(async () => {
     await ctx.cleanup();
   });
+
+  // INVARIANT (accept-merge-is-commit-point): the tag is follow-through, after
+  // the merge. A tag that cannot be written fails the accept LOUDLY (non-zero
+  // exit, the step named) but never un-accepts merged work — the task is
+  // `complete` with its session `accepted`, and the daemon writes the tag once
+  // it can. No module mocks: the failure is a real git ref conflict.
+  test('a tag that cannot be written leaves the task accepted, fails loudly, and the daemon writes it later', async () => {
+    const taskId = await createStartedTaskWithCommit(ctx, 'Tag fails after merge');
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+    // A ref UNDER the tag's name makes `git tag lazy-accept-<id>` fail (D/F conflict).
+    const blocker = `refs/tags/lazy-accept-${fullTaskId}/blocker`;
+    expect(ctx.git('update-ref', blocker, 'HEAD').exitCode).toBe(0);
+
+    const result = await ctx.lazy(['accept', taskId, '--yes']);
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout + result.stderr).toContain('accept-tag');
+    expect(result.stdout + result.stderr).toContain('FAILED');
+    expect(readTaskStatus(ctx.root, taskId)).toBe('complete');
+    expect(readSessionJson(ctx.root, taskId)?.outcome).toBe('accepted');
+    expect(ctx.git('show', 'main:feature.txt').exitCode).toBe(0);
+    const owed = JSON.parse(readTaskJson(ctx.root, taskId).metadata.accept_followthrough);
+    expect(owed.done).not.toContain('accept-tag');
+    // Independent steps did not wait on the tag.
+    expect(owed.done).toContain('cleanup');
+
+    expect(ctx.git('update-ref', '-d', blocker).exitCode).toBe(0);
+    setTaskMetadata(ctx.root, taskId, 'accept_followthrough', JSON.stringify({ ...owed, nextAttemptAt: 0 }));
+    const deadline = Date.now() + 60_000;
+    while (readTaskJson(ctx.root, taskId).metadata?.accept_followthrough && Date.now() < deadline) {
+      await Bun.sleep(500);
+    }
+    expect(readTaskJson(ctx.root, taskId).metadata?.accept_followthrough ?? '').toBe('');
+    expect(ctx.git('rev-parse', '--verify', `refs/tags/lazy-accept-${fullTaskId}^{commit}`).exitCode).toBe(0);
+    expect(readTaskStatus(ctx.root, taskId)).toBe('complete');
+  }, 120_000);
 
   // The accept tag `lazy-accept-<full-task-id>` is the authoritative signal the zombie
   // sweep gates on. The local driver uses the squash merge path; verify the tag is created

@@ -1,69 +1,6 @@
-import { requireLazyRoot, requireStorage, shortId, displayId, parseFlags, validateModel, validateCode, resolveTaskOrExit, displayIdFor, MAX_TASK_CODE_LENGTH } from '../helpers';
-import { logger } from '../../utils/logger';
-
-import type { Storage } from '../../storage/interface';
-import { theme } from '../theme';
-import { escapeRegex } from '../../utils/regex';
-import { parentTaskIdOf } from '../../task-target';
-import { loadConfig } from '../../config/loader';
-import { resolveAgentForNewTask } from '../../agent/task-agent';
-import {
-  droppedCustomImagePinWarning,
-} from '../../docker/worktree-image';
-
-const TERMINAL_STATUSES = ['complete', 'abandoned'];
-
-/**
- * Generate a clone code from the old task's code, scanning existing tasks to avoid collisions.
- * Convention: append -clone-1, -clone-2, etc. Truncate base if needed to fit max code length limit.
- */
-async function generateCloneCode(oldCode: string, storage: Storage): Promise<string> {
-  // Check if old code already has a -clone-N suffix
-  const cloneMatch = oldCode.match(/^(.+)-clone-(\d+)$/);
-  let base: string;
-
-  if (cloneMatch) {
-    base = cloneMatch[1];
-  } else {
-    base = oldCode;
-  }
-
-  // Scan existing tasks to find the highest -clone-N suffix for this base
-  const allTasks = await storage.listTasks();
-  let maxN = 0;
-
-  const clonePattern = new RegExp(`^${escapeRegex(base)}-clone-(\\d+)$`);
-  for (const task of allTasks) {
-    if (task.code) {
-      const match = task.code.match(clonePattern);
-      if (match) {
-        const n = parseInt(match[1], 10);
-        if (n > maxN) {
-          maxN = n;
-        }
-      }
-    }
-  }
-
-  const nextN = maxN + 1;
-  const suffix = `-clone-${nextN}`;
-
-  // Truncate base to fit within max code length limit
-  const maxBase = MAX_TASK_CODE_LENGTH - suffix.length;
-  let finalBase = base;
-  if (base.length > maxBase) {
-    finalBase = base.substring(0, maxBase);
-    // Remove trailing hyphen from truncation
-    finalBase = finalBase.replace(/-$/, '');
-  }
-
-  const code = finalBase + suffix;
-  // Validate the generated code — if it's invalid, skip setting code
-  if (validateCode(code) !== null) {
-    return '';
-  }
-  return code;
-}
+import { parseFlags, validateModel, validateAgentProfileOrExit } from '../helpers';
+import { validateCode } from '../../task/identity';
+import { theme } from '../../render/theme';
 
 export async function commandClone(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [
@@ -71,6 +8,9 @@ export async function commandClone(args: string[]): Promise<void> {
     { name: 'default-parent', takesValue: false },
     { name: 'code', takesValue: true },
     { name: 'model', takesValue: true },
+    { name: 'agent', takesValue: true },
+    { name: 'same-base', takesValue: false },
+    { name: 'base', takesValue: true },
   ], 'clone');
 
   const taskId = parsed.positional[0];
@@ -83,14 +23,19 @@ export async function commandClone(args: string[]): Promise<void> {
   const defaultParent = parsed.flags.get('default-parent') as boolean;
   const codeValue = parsed.flags.get('code') as string | undefined;
   const modelValue = parsed.flags.get('model') as string | undefined;
+  const agentValue = parsed.flags.get('agent') as string | undefined;
+  const sameBase = parsed.flags.get('same-base') as boolean;
+  const baseValue = parsed.flags.get('base') as string | undefined;
 
-  // Check for conflicting flags
   if (parentValue !== undefined && defaultParent) {
     console.error('Error: Cannot use both --parent and --default-parent flags');
     process.exit(1);
   }
+  if (sameBase && baseValue !== undefined) {
+    console.error('Error: Cannot use both --same-base and --base flags');
+    process.exit(1);
+  }
 
-  // Validate --code flag if provided
   if (codeValue !== undefined) {
     const codeError = validateCode(codeValue);
     if (codeError) {
@@ -99,107 +44,62 @@ export async function commandClone(args: string[]): Promise<void> {
     }
   }
 
-  // Validate --model flag if provided
-  let modelOverride: string | undefined;
-  if (modelValue !== undefined) {
-    modelOverride = validateModel(modelValue);
+  const model = modelValue !== undefined ? validateModel(modelValue) : undefined;
+  if (agentValue !== undefined) {
+    await validateAgentProfileOrExit(process.cwd(), agentValue);
   }
 
-  const root = requireLazyRoot();
-  const storage = await requireStorage();
-
+  // The daemon owns the clone: parent, code, agent and base resolution all
+  // live in src/daemon/clone-redo.ts, shared with the dashboard.
+  const { queryCloneTask } = await import('../../daemon/rpc-fallback');
+  let result: Awaited<ReturnType<typeof queryCloneTask>>;
   try {
-    // Resolve source task
-    const sourceTask = await resolveTaskOrExit(storage, taskId);
-
-    // Get the latest prompt version
-    const promptHistory = await storage.getPromptHistory(sourceTask.id);
-    const latestPrompt = promptHistory.length > 0
-      ? promptHistory[promptHistory.length - 1].content
-      : sourceTask.prompt;
-
-    // Resolve and validate parent
-    let newParentTaskId: string | undefined;
-    if (parentValue !== undefined) {
-      // Explicit --parent flag: use the specified parent
-      const parentTask = await resolveTaskOrExit(storage, parentValue);
-      if (TERMINAL_STATUSES.includes(parentTask.status)) {
-        console.error(`Cannot use task ${displayId(parentTask)} as parent: task is ${parentTask.status}`);
-        process.exit(1);
-      }
-      newParentTaskId = parentTask.id;
-    } else if (defaultParent) {
-      // --default-parent flag: use default parent (null, root task)
-      newParentTaskId = undefined;
-    } else {
-      // No flags: inherit parent from source task (default behavior)
-      newParentTaskId = parentTaskIdOf(sourceTask) ?? undefined;
-    }
-
-    // Determine code: explicit > auto-generated > none
-    let cloneCode: string | undefined = codeValue;
-    if (!cloneCode && sourceTask.code) {
-      cloneCode = await generateCloneCode(sourceTask.code, storage);
-    }
-
-    // Create cloned task. The agent is inherited alongside goal/type/model:
-    // a clone of a Cursor task is still a Cursor task, and without this it
-    // would silently fall back to Claude Code (see resolveAgentForNewTask).
-    const clonedTask = await storage.createTask(
-      sourceTask.goal,
-      newParentTaskId,
-      undefined,
-      cloneCode,
-      sourceTask.type,
-      resolveAgentForNewTask({
-        inheritFrom: sourceTask,
-        configDefault: (await loadConfig(requireLazyRoot())).agent.agent_id,
-      })
-    );
-
-    // Set prompt
-    await storage.updateTaskPrompt(clonedTask.id, latestPrompt);
-
-    // Set model: CLI override > source task model
-    const finalModel = modelOverride ?? sourceTask.model;
-    if (finalModel) {
-      await storage.updateTaskModel(clonedTask.id, finalModel);
-    }
-
-    // Set cloned_from metadata to link back to source task
-    await storage.updateTaskMetadata(clonedTask.id, 'cloned_from', sourceTask.id);
-
-    // INVARIANT: clone is a fresh start — do NOT inherit the source's image pin
-    // (may be missing/stale and fail late). Warn so the human can re-pin via TTY.
-    const imagePinWarning = droppedCustomImagePinWarning(sourceTask);
-
-    console.log(`Created task ${theme.taskId(displayId(clonedTask))} — clone of ${displayId(sourceTask)}`);
-    console.log(`  ${theme.label('Goal:')} ${clonedTask.goal}`);
-    if (clonedTask.code) {
-      console.log(`  ${theme.label('Code:')} ${clonedTask.code}`);
-    }
-    if (newParentTaskId) {
-      console.log(`  ${theme.label('Parent:')} ${await displayIdFor(storage, newParentTaskId)}`);
-    }
-    if (finalModel) {
-      console.log(`  ${theme.label('Model:')} ${finalModel}`);
-    }
-    if (clonedTask.type !== 'task') {
-      console.log(`  ${theme.label('Type:')} ${clonedTask.type}`);
-    }
-    if (imagePinWarning) {
-      console.log(`  ${theme.warning('Warning:')} ${imagePinWarning}`);
-    }
-
-    console.log(`\nTask is in backlog. Start it with: ${theme.command('lazy start ' + shortId(clonedTask.id))}`);
-
-  } finally {
-    await storage.close();
+    result = await queryCloneTask({
+      taskId,
+      parent: parentValue,
+      defaultParent,
+      code: codeValue,
+      model,
+      agent: agentValue,
+      sameBase,
+      base: baseValue,
+      actor: 'human',
+    });
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
   }
+
+  console.log(`Created task ${theme.taskId(result.displayId)} — clone of ${result.sourceDisplayId}`);
+  console.log(`  ${theme.label('Goal:')} ${result.goal}`);
+  if (result.code) {
+    console.log(`  ${theme.label('Code:')} ${result.code}`);
+  }
+  if (result.parentDisplayId) {
+    console.log(`  ${theme.label('Parent:')} ${result.parentDisplayId}`);
+  }
+  if (result.model) {
+    console.log(`  ${theme.label('Model:')} ${result.model}`);
+  }
+  if (agentValue !== undefined) {
+    console.log(`  ${theme.label('Agent:')} ${result.agentId}`);
+  }
+  if (result.type !== 'task') {
+    console.log(`  ${theme.label('Type:')} ${result.type}`);
+  }
+  if (result.pinnedBase) {
+    console.log(`  ${theme.label('Pinned to:')} ${theme.commitSha(result.pinnedBase.substring(0, 12))} — no upstream is merged in until you run ${theme.command('lazy sync ' + result.displayId)}`);
+  }
+  if (result.imagePinWarning) {
+    console.log(`  ${theme.warning('Warning:')} ${result.imagePinWarning}`);
+  }
+
+  console.log(`\nTask is in backlog. Start it with: ${theme.command('lazy start ' + result.displayId)}`);
 }
 
 export function cloneUsage(): void {
   console.log(`Usage: lazy clone <task_id> [--parent <task_id> | --default-parent] [--code <code>] [--model <model>]
+                  [--agent <profile>] [--same-base | --base <sha>]
 
 Duplicate a task with the same goal, prompt, model, and type. Creates a fresh task
 in the backlog with no session history. By default, inherits the source task's parent.
@@ -212,19 +112,30 @@ Options:
   --default-parent   Use default parent (null, root task) instead of inheriting from source
                      (conflicts with --parent)
   --code <code>      Set a custom code for the cloned task (default: auto-generated)
-  --model <model>    Override model for the cloned task (e.g. opus, sonnet, claude-opus-4-8)
+  --model <model>    Override model for the cloned task (e.g. opus, sonnet, claude-opus-5)
+                     Default: inherit from source task — or, with --agent naming a
+                     different agent, that agent's default model
+  --agent <profile>  Run the clone on another agent profile (e.g. cursor)
                      Default: inherit from source task
+  --same-base        Branch from the exact commit the source task started from
+                     (not the parent's current head) and PIN the clone there, so a
+                     re-run on another agent or model sees the same code. Works on
+                     finished tasks. Nothing merges the parent in automatically;
+                     an explicit "lazy sync" lifts the pin.
+  --base <sha>       Like --same-base, but pinned to a commit you name
 
 What gets carried over:
   - Goal (always)
   - Prompt (latest version)
-  - Model (unless --model overrides)
+  - Agent and model (unless --agent / --model override; both stay on the clone.
+    --agent alone switches to the new agent's default model, never the source's)
   - Task type (task, fix, spike, etc.)
   - Code (auto-suffixed with -clone-N, or explicit via --code)
 
 What starts fresh:
   - No session, no turns, no commits
-  - New git branch from parent's HEAD (or main if no parent)
+  - New git branch from parent's HEAD (or main if no parent) — or from the
+    pinned commit with --same-base / --base
   - Status: backlog
   - Container image (root-resolved; warns if source had a per-task pin)
   - Metadata: cloned_from=<source_task_id> recorded
@@ -240,6 +151,7 @@ Examples:
   lazy clone abc123 --code my-new-code        # Clone with explicit code
   lazy clone abc123 --model opus                         # Clone with different model
   lazy clone fix-auth --parent main-task      # Reparent a task
+  lazy clone abc123 --same-base --agent cursor --model gpt-5  # Like-for-like re-run
 
 After cloning:
   lazy start <cloned_task_id>                 # Start working on the clone`);

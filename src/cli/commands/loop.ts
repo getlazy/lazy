@@ -1,5 +1,7 @@
-import { requireLazyRoot, requireStorage, shortId, displayId, validateModel, parseFlags, formatDate, taskRef, getWorktreePath, getBranchNameFromId, resolveTaskOrExit } from '../helpers';
-import { pendingViolations } from '../../utils/turns';
+import { requireLazyRoot, requireStorage, validateModel, parseFlags, resolveTaskOrExit } from '../helpers';
+import { requireActorIdentity } from '../identity-preflight';
+import { formatDate } from '../../utils/format';
+import { shortId, displayId, taskRef, getWorktreePath, getBranchNameFromId } from '../../task/identity';
 import { promptChoice, promptYesNo, isTTY } from '../editor';
 import { commandStart } from './start';
 import { runInteractiveReview } from '../tui/per-hunk-review';
@@ -9,17 +11,19 @@ import type { Task, TaskStatus } from '../../types';
 import { commandAccept } from './accept';
 import { commandReject } from './reject';
 import { commandUnblock } from './unblock';
-import { showTaskContext, runFeedbackFlow, syncTaskFromRemote } from './shared';
+import { showTaskContext, runFeedbackFlow } from './shared';
+import { refreshTaskFromRemote } from './shared';
 import { commandSyncTask } from './sync';
-import { buildTaskTree, printTaskTree } from './list';
+import { printTaskTree, printTaskListTreeHeader } from './list';
+import { buildTaskTree } from '../../task/tree';
 
 import { isTerminalStatus } from '../../types';
-import { theme, dim } from '../theme';
+import { theme, dim } from '../../render/theme';
 
 import { ActivityMonitor } from '../activity-monitor';
 
 
-import { cleanupWorktreeAndBranch, cleanupTaskContainer } from './shared';
+import { cleanupWorktreeAndBranch, cleanupTaskContainer } from '../../task/cleanup';
 import { getActor } from '../../constants';
 import { parentTaskIdOf } from '../../task-target';
 
@@ -259,24 +263,14 @@ type GateDecision = 'feedback' | 'deep-review' | 'accept' | 'reject' | 'sync' | 
 /** What the loop should do with the current task after acting on a decision. */
 type GateOutcome = 'advance' | 'regate' | 'stop';
 
-/** Statuses that mean "the turn is not over yet — keep waiting". */
-function isUnsettled(status: string): boolean {
-  // `queued` is waiting for a concurrency slot, not a finished turn. The daemon
-  // wait RPC returns immediately for it (it only polls `working`), so the loop
-  // has to recognize it or it would gate a task that never ran.
-  return status === 'working' || status === 'queued';
-}
-
 /**
  * Block until a task's turn is genuinely over.
  *
  * The daemon wait RPC is capped at 600s per request and returns immediately for
- * any non-`working` status, so a single call is not enough: re-issue on timeout
- * and on `queued`. Returns the settled status.
+ * any non-`working` status, so a single call is not enough: re-issue on
+ * timeout. Returns the settled status.
  */
 async function waitUntilSettled(ref: string): Promise<TaskStatus> {
-  const QUEUED_POLL_MS = 3000;
-  let announcedQueued = false;
   while (true) {
     let result;
     try {
@@ -287,18 +281,6 @@ async function waitUntilSettled(ref: string): Promise<TaskStatus> {
 
     if (result.timed_out) {
       console.log(dim(`  still working (${ref}) — continuing to wait…`));
-      continue;
-    }
-
-    if (isUnsettled(result.status)) {
-      if (result.status === 'queued') {
-        // Announce once, then poll quietly — a queue wait can be long.
-        if (!announcedQueued) {
-          console.log(dim(`  ${ref} is queued for an agent slot — waiting…`));
-          announcedQueued = true;
-        }
-        await new Promise(resolve => setTimeout(resolve, QUEUED_POLL_MS));
-      }
       continue;
     }
 
@@ -348,7 +330,7 @@ async function presentGate(
 
   const menu: Array<[string, GateDecision]> = [
     [feedbackLabel, 'feedback'],
-    ['Review hunk-by-hunk (lazy review -i)', 'deep-review'],
+    ['Review hunk-by-hunk (lazy browse -i)', 'deep-review'],
     [acceptLabel, 'accept'],
     ['Reject (discard work)', 'reject'],
     ['Sync upstream (lazy sync)', 'sync'],
@@ -397,7 +379,7 @@ async function executeGateDecision(
       return 'regate';
 
     case 'deep-review': {
-      // Reuse `lazy review -i` wholesale. It may submit feedback itself (the
+      // Reuse `lazy browse -i` wholesale. It may submit feedback itself (the
       // `q` path offers to unblock), so re-gate rather than advance: the loop
       // re-reads status and will wait again if the task went back to working.
       const storage = await requireStorage();
@@ -431,18 +413,14 @@ async function executeGateDecision(
           return 'advance';
         }
 
-        // Conflict tasks have file permission violations that require explicit
-        // approval/rejection decisions. Loop doesn't have the UI for that — use
-        // `lazy unblock` directly, which prompts for each violated file.
-        // Gated on the pending violation SET, not the `conflict` label: a
-        // side-channel turn can leave a task labelled `blocked` while the set is
-        // still pending, and running the feedback flow there would revert the
-        // agent's committed work (fix-ask-nukes-violations).
-        if (pendingViolations(await storage.getSessionTurns(sess.id)).length > 0) {
-          console.log(theme.warning(`\nTask ${taskShortId} has file permission violations.`));
-          console.log(`Use ${theme.command(`lazy unblock ${taskShortId}`)} to handle them interactively.`);
-          return 'advance';
-        }
+        // INVARIANT (a conflict task is reviewable from the loop —
+        // move-file-approval-to-accept): NO protected-file gate here. This used
+        // to skip the feedback flow whenever a violation was pending and send
+        // the human to `lazy unblock` "to handle them interactively", because
+        // the flow would otherwise revert the agent's committed work. Nothing
+        // reverts any more and that interactive prompt is gone, so the advice
+        // led nowhere and the loop silently advanced past exactly the tasks a
+        // reviewer most wanted to nudge. The decision is owed at accept.
 
         const worktreePath = getWorktreePath(root, fresh);
         await runFeedbackFlow(fresh, sess, root, storage, worktreePath, taskShortId, follow, modelOverride);
@@ -655,7 +633,7 @@ async function runQueueMode(
               break;
             }
             // Pick up PR state/comments before showing context, as reactive mode does.
-            await syncTaskFromRemote(fresh, s, root);
+            await refreshTaskFromRemote(fresh.id);
             const refreshed = await s.getTask(queued.id);
             if (refreshed && isTerminalStatus(refreshed.status)) {
               console.log(`\nTask ${ref} is now ${refreshed.status}. Moving on.`);
@@ -709,6 +687,10 @@ export async function commandLoop(args: string[]): Promise<void> {
     { name: 'parent', takesValue: true },
     { name: 'tag', takesValue: true },
   ], 'loop');
+
+  // Before the loop asks for feedback on a task is typed: the daemon refuses a write it cannot
+  // attribute, and a refusal must never cost the human what they wrote.
+  await requireActorIdentity();
 
   // Parse --model flag
   const modelValue = parsed.flags.get('model') as string | undefined;
@@ -854,8 +836,7 @@ export async function commandLoop(args: string[]): Promise<void> {
             drainActivityMonitors();
 
             const tree = await buildTaskTree(storage, activeTasks, root);
-            console.log(`${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ${theme.header('TURNS'.padEnd(8))} ${theme.header('LAST ACTIVE'.padEnd(18))} ${theme.header('DURATION'.padEnd(10))} ${theme.header('TOKENS IN/OUT'.padEnd(14))} ${theme.header('GOAL')}`);
-            console.log(theme.separator(`${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(8)} ${'─'.repeat(18)} ${'─'.repeat(10)} ${'─'.repeat(14)} ${'─'.repeat(30)}`));
+            printTaskListTreeHeader();
             for (const rootNode of tree) {
               printTaskTree(rootNode);
             }
@@ -904,7 +885,7 @@ export async function commandLoop(args: string[]): Promise<void> {
       const worktreePath = getWorktreePath(root, task);
 
       // Sync PR comments and state from GitHub before showing context
-      await syncTaskFromRemote(task, storage, root);
+      await refreshTaskFromRemote(task.id);
 
       // Re-read task in case sync updated its status (e.g., PR merged/closed externally)
       const freshTask = await storage.getTask(task.id);
@@ -985,14 +966,8 @@ export async function commandLoop(args: string[]): Promise<void> {
             const sess2 = await storage2.getSessionByTaskId(task2.id);
             if (!sess2) { console.error(`Task ${taskShortId} has no session.`); process.exit(1); }
 
-            // Conflict tasks have file permission violations that require explicit
-            // approval/rejection decisions. Loop doesn't have the UI for that.
-            // Same violation-set gate as above (fix-ask-nukes-violations).
-            if (pendingViolations(await storage2.getSessionTurns(sess2.id)).length > 0) {
-              console.log(theme.warning(`\nTask ${taskShortId} has file permission violations.`));
-              console.log(`Use ${theme.command(`lazy unblock ${taskShortId}`)} to handle them interactively.`);
-              break;
-            }
+            // No protected-file gate — same reason as the regate path above
+            // (move-file-approval-to-accept).
 
             await runFeedbackFlow(task2, sess2, root, storage2, worktreePath, taskShortId, follow, modelOverride);
           } finally {
@@ -1026,7 +1001,7 @@ Queue (task IDs, or a --backlog/--parent/--tag selection):
   Backlog-processing for a hub's pile of small tasks.
 
 At each gate you choose: give feedback, review hunk-by-hunk (the same surface as
-'lazy review --interactive'), accept, reject, sync upstream, skip (leave the task
+'lazy browse --interactive'), accept, reject, sync upstream, skip (leave the task
 exactly as it is), or stop.
 Feedback and sync return to the same task; accept, reject and skip move on.
 
@@ -1034,12 +1009,16 @@ The queue is not persisted. Stopping (or Ctrl+C) prints the command that resumes
 the rest, and re-running is idempotent: finished tasks are skipped, started ones
 are not restarted.
 
+This command is YOU driving the loop, at a review gate, task by task. For a batch
+an agent drives on its own, create a task of type 'cluster'
+(lazy create --type cluster) and let its agent run its subtasks.
+
 Options:
   --backlog         Select backlog tasks instead of naming them (confirmed interactively)
   --parent <task>   Restrict the selection to this task's direct children
   --tag <tag>       Restrict the selection to tasks carrying this tag
   --pipeline        Start the NEXT queued task while you review the current one
-  --model <model>   Override model for feedback turns (e.g. opus, sonnet, claude-opus-4-8)
+  --model <model>   Override model for feedback turns (e.g. opus, sonnet, claude-opus-5)
   --follow          Wait for agent after giving feedback
 
 Examples:

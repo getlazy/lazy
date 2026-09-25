@@ -11,6 +11,8 @@
  *             access via stdio JSON-RPC).
  *   builder:  Builder supervisor (runs an interactive Claude Code session with
  *             MCP tools and conversation capture).
+ *   pair:     Interactive pairing session for a task (the in-container half of
+ *             `lazy pair <task>` — MCP wiring, then the agent's own TUI).
  *   doctor:   In-container MCP diagnosis (why does the agent have no lazy tools?).
  */
 
@@ -33,6 +35,7 @@ Usage:
   lazy-agent --protocol-dir <path> --worktree <path>   Run supervisor (default)
   lazy-agent mcp [--task-id <uuid>] --worktree <path>   Start MCP server
   lazy-agent builder --system-prompt-file <path> --worktree <path>   Run builder
+  lazy-agent pair --task-id <uuid> --worktree <path> --agent <id>   Pair on a task
   lazy-agent doctor [--probe-agent] [--json]           Diagnose MCP wiring here
 
 The default mode runs the supervisor loop: it watches for commands from the
@@ -73,8 +76,9 @@ Options:
 // sentinel and the exit code distinguish the real agent from bare Bun.
 if (command === 'selfcheck' || command === '--version' || command === '-v' || command === '--revision') {
   const { VERSION } = await import('./version');
+  const { formatVersionWithEmbeddedProvenance } = await import('./utils/build-provenance');
   // Sentinel string the preflight matches on. Keep 'lazy-agent ok' stable.
-  console.log(`${AGENT_SELFCHECK_SENTINEL} ${VERSION}`);
+  console.log(`${AGENT_SELFCHECK_SENTINEL} ${await formatVersionWithEmbeddedProvenance(VERSION)}`);
   process.exit(0);
 }
 
@@ -182,10 +186,71 @@ Options:
     claudeExtraArgs,
     debug: args.includes('--debug'),
   });
+} else if (command === 'pair') {
+// Handle pair subcommand — the in-container half of `lazy pair <task>`.
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log(`Usage: lazy-agent pair --task-id <uuid> --worktree <path> --agent <id> [options]
+
+Run an interactive pairing session in this container: registers this session's
+lazy MCP tools, then hands the terminal to the agent's own interactive CLI.
+
+Spawned by \`lazy pair <task>\` on the host via \`docker exec -it\`. Not meant to be
+run by hand, though doing so from \`lazy shell\` works.
+
+Options:
+  --task-id <uuid>      Full task UUID (required)
+  --worktree <path>     Worktree path (required)
+  --agent <id>          Agent binary to launch: claude-code, codex, cursor, pi (required)
+  --runner <type>       Runner type for MCP config (default: docker)
+  --resume <id>         Session to resume
+  --model <id>          Model to pin
+  --autonomous          Run without permission prompts
+  --chat                Reflective read-only chat (no pairing lock; MCP read-only)
+  --member-session      A member's own terminal container: lazy-built home only, no MCP, no project settings`);
+    process.exit(0);
+  }
+
+  const flagValue = (name: string): string | undefined => {
+    const idx = args.indexOf(name);
+    return idx !== -1 && idx + 1 < args.length ? args[idx + 1] : undefined;
+  };
+
+  const taskId = flagValue('--task-id');
+  const worktreePath = flagValue('--worktree');
+  const agentId = flagValue('--agent');
+  for (const [flag, value] of [['--task-id', taskId], ['--worktree', worktreePath], ['--agent', agentId]] as const) {
+    if (!value) {
+      console.error(`Missing required flag: ${flag} <value>`);
+      process.exit(1);
+    }
+  }
+
+  const { runInContainerPair } = await import('./supervisor/pair');
+  const { resolveRunnerType } = await import('./config/types');
+  const runnerFlag = flagValue('--runner');
+  const runnerType = runnerFlag ? resolveRunnerType(runnerFlag) : 'docker';
+  if (!runnerType) {
+    // Validate at the boundary rather than trusting the caller: this is an
+    // external surface even though only lazy invokes it today.
+    console.error(`Unknown --runner value: ${runnerFlag}`);
+    process.exit(1);
+  }
+  const exitCode = await runInContainerPair({
+    taskId: taskId!,
+    worktreePath: worktreePath!,
+    harness: agentId!,
+    runnerType,
+    sessionId: flagValue('--resume') ?? null,
+    modelId: flagValue('--model') ?? null,
+    autonomous: args.includes('--autonomous'),
+    chat: args.includes('--chat'),
+    memberSession: args.includes('--member-session'),
+  });
+  process.exit(exitCode);
 } else if (command === 'mcp') {
 // Handle mcp subcommand
   if (args.includes('--help') || args.includes('-h')) {
-    console.log(`Usage: lazy-agent mcp [--task-id <uuid>] --worktree <path> [--daemon-config <path>] [--builder-config <path>] [--read-only]
+    console.log(`Usage: lazy-agent mcp [--task-id <uuid>] --worktree <path> [--daemon-config <path>] [--builder-config <path>] [--read-only | --review]
 
 Start a stdio-based MCP server that exposes lazy tools to Claude Code.
 The server reads JSON-RPC requests from stdin and writes responses to stdout.
@@ -196,6 +261,7 @@ Options:
   --daemon-config <path>     Path to daemon MCP config for proxy mode (preferred)
   --builder-config <path>    Path to builder config JSON for legacy proxy mode
   --read-only                Serve only read-only tools (used for ask turns)
+  --review                   Serve read-only tools plus lazy_raise (agent review turns)
 
 When --daemon-config is provided, the MCP server runs in daemon proxy mode: tool
 calls are forwarded to the daemon's /mcp routes over HTTP. This is the preferred
@@ -208,6 +274,7 @@ When neither proxy config is provided, tools execute locally.
 
 With --read-only, only tools that cannot mutate state are advertised. A write
 tool called anyway is refused with a message telling the agent to answer in text.
+With --review, the same plus lazy_raise (findings are Raises).
 
 When --task-id is omitted, the MCP server runs in project-scoped (builder) mode.
 Tools that require a task context (lazy_commit) are unavailable.
@@ -220,36 +287,39 @@ The MCP server is spawned automatically by Claude Code via ~/.claude.json.`);
   const worktreeIdx = args.indexOf('--worktree');
   const daemonConfigIdx = args.indexOf('--daemon-config');
   const builderConfigIdx = args.indexOf('--builder-config');
-  // Read-only turns (ask) get a toolset with the write tools withheld. The
-  // supervisor writes this flag into ~/.claude.json per turn — see
+  // Ask turns get --read-only; review turns get --review (reads + lazy_raise).
+  // The supervisor writes the flag into ~/.claude.json per turn — see
   // src/supervisor/mcp-setup.ts.
   const readOnly = args.includes('--read-only');
+  const review = args.includes('--review');
 
   if (worktreeIdx === -1 || worktreeIdx + 1 >= args.length) {
     console.error('Missing required flag: --worktree <path>');
     process.exit(1);
   }
 
-  // Keep this process alive through an unexpected throw.
-  //
-  // This process IS the agent's only channel to lazy state. Claude Code does not
-  // respawn an MCP server that exits, so any uncaught throw here — a rejected
-  // promise from an async path the per-call handlers do not cover, an error on
-  // an idle socket — silently removes every lazy_* tool for the REST OF THE TURN.
-  // That is how agents ended up unable to record a journal entry or follow-ups
-  // at end of turn. Every tool call already has its own error path (the server
-  // answers with a JSON-RPC error and stays up), so anything reaching here is by
-  // definition not a reason to take the whole channel down: log it loudly on
-  // stderr (stdout is the protocol channel) and keep serving.
-  //
-  // Scoped to `mcp` deliberately — the supervisor and builder paths must keep
-  // failing loudly, since there a crash is visible and recoverable.
-  process.on('uncaughtException', (err) => {
-    console.error(`[lazy-mcp] uncaught exception (server staying up): ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
-  });
-  process.on('unhandledRejection', (reason) => {
-    console.error(`[lazy-mcp] unhandled rejection (server staying up): ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}`);
-  });
+  // Fail closed if the MCP entry this server was spawned from names a different
+  // task than the turn it landed in. ~/.claude.json is shared per HOME, so a
+  // second supervisor can overwrite it between the write and the spawn; serving
+  // the other task's tools would hand this agent the wrong task's state. See
+  // src/mcp/turn-identity.ts. Checked before the keep-alive handlers below:
+  // this is a startup refusal, not a mid-session error to survive.
+  {
+    const { assertMcpServesExpectedTurn } = await import('./mcp/turn-identity');
+    const claimedTaskId = (taskIdIdx !== -1 && taskIdIdx + 1 < args.length) ? args[taskIdIdx + 1] : undefined;
+    try {
+      assertMcpServesExpectedTurn({ taskId: claimedTaskId, worktreePath: args[worktreeIdx + 1] });
+    } catch (err) {
+      console.error(`[lazy-mcp] ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  }
+
+  // Keep this process alive through an unexpected throw, and report a startup
+  // failure the same way `lazy mcp` does — see src/mcp/process-guards.ts for
+  // why both entries must behave identically here.
+  const { installMcpKeepAlive, reportMcpStartupFailure } = await import('./mcp/process-guards');
+  installMcpKeepAlive();
 
   try {
     // Daemon proxy mode (preferred): forward all tool calls to the daemon
@@ -261,7 +331,7 @@ The MCP server is spawned automatically by Claude Code via ~/.claude.json.`);
       // refuses the call if the claim disagrees with the token.
       const taskIdOverride = (taskIdIdx !== -1 && taskIdIdx + 1 < args.length) ? args[taskIdIdx + 1] : undefined;
       const { startMcpServerDaemonProxy } = await import('./mcp/index');
-      await startMcpServerDaemonProxy(daemonConfigPath, taskIdOverride, { readOnly });
+      await startMcpServerDaemonProxy(daemonConfigPath, taskIdOverride, { readOnly, review });
     } else if (builderConfigIdx !== -1 && builderConfigIdx + 1 < args.length) {
       // Legacy builder proxy mode: forward to per-session builder HTTP server
       const builderConfigPath = args[builderConfigIdx + 1];
@@ -272,14 +342,10 @@ The MCP server is spawned automatically by Claude Code via ~/.claude.json.`);
       const taskId = (taskIdIdx !== -1 && taskIdIdx + 1 < args.length) ? args[taskIdIdx + 1] : '';
       const worktreePath = args[worktreeIdx + 1];
       const { startMcpServer } = await import('./mcp/index');
-      await startMcpServer({ taskId, worktreePath }, { readOnly });
+      await startMcpServer({ taskId, worktreePath }, { readOnly, review });
     }
   } catch (err) {
-    // Startup failed, so there is no server to keep alive — say why on stderr
-    // (Claude Code otherwise reports only an opaque connection error) and exit
-    // non-zero rather than lingering as a process that serves nothing.
-    console.error(`[lazy-mcp] server failed to start: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
-    process.exit(1);
+    reportMcpStartupFailure(err);
   }
 } else {
   // Default mode: supervisor

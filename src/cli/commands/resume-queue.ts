@@ -9,9 +9,10 @@
  */
 
 import { join } from 'path';
-import { requireLazyRoot, requireStorage, displayId, parseFlags } from '../helpers';
+import { displayId } from '../../task/identity';
+import { requireLazyRoot, requireStorage, parseFlags } from '../helpers';
 import { loadConfig } from '../../config/loader';
-import { theme } from '../theme';
+import { theme } from '../../render/theme';
 import { describeExpiry } from '../../utils/local-day';
 import { listSlowLaneQueue, getLastProjectAutoResumeAt } from '../../daemon/auto-resume-queue';
 

@@ -37,13 +37,10 @@ describe('MCP runner override', () => {
     if (testDir) rmSync(testDir, { recursive: true, force: true });
   });
 
-  test('lazy_create with runner: host persists the host runner on the task', async () => {
+  test('lazy_create with runner: host is rejected', async () => {
     const handlers = createAllHandlers(ctx);
-    const result = await handlers.get('lazy_create')!({ goal: 'Host task', runner: 'host' });
-
-    expect((result as any).runner).toBe('dangerously-host-process-without-any-isolation');
-    const task = await storage.getTask((result as any).full_id);
-    expect(task?.runner_type).toBe('dangerously-host-process-without-any-isolation');
+    await expect(handlers.get('lazy_create')!({ goal: 'Host task', runner: 'host' }))
+      .rejects.toThrow('Host-process runner is no longer supported');
   });
 
   test('lazy_create with runner: container maps to docker', async () => {

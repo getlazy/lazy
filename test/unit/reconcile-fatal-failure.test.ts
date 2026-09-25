@@ -21,6 +21,7 @@ import { handleErrorResponse } from '../../src/utils/reconcile';
 import { protocolDir as getProtocolDir, writeResponse } from '../../src/protocol';
 import type { ErrorResponse } from '../../src/protocol';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
+import { consumeSyncRestoreStatus, markSyncRestoreStatus } from '../../src/task/sync-restore-status';
 
 function git(cwd: string, ...args: string[]): string {
   const result = spawnSyncUnsupervised(['git', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
@@ -176,6 +177,52 @@ describe('reconciler: classified agent failures', () => {
     expect(task?.status).toBe('blocked');
   });
 
+  // INVARIANT (fix-empty-failed-turn): a turn that dies must always leave a
+  // visible record. Idempotency for the error turn is scoped to the CURRENT turn
+  // attempt — an identical failure from an EARLIER attempt is a new occurrence.
+  //
+  // This regressed in the field: with a dead credential, the first unblock
+  // recorded a fatal_auth turn, and the SECOND unblock recorded nothing at all
+  // (a FatalAgentError response carries no duration_ms/exit_code, so two
+  // consecutive fatal_auth failures produce byte-identical turn content). The
+  // task came back from 'working' in seconds with an empty turns list.
+  test('a repeat of the same fatal failure on a NEW attempt is recorded again', async () => {
+    const { taskId, sessionId, protoDir } = await makeTask(env, 'working');
+
+    await handleErrorResponse(env.storage, taskId, { id: sessionId }, fatalResponse, protoDir, env.lazyRoot);
+    const afterFirst = await env.storage.getSessionTurns(sessionId);
+    expect(afterFirst.filter(t => t.role === 'agent')).toHaveLength(1);
+
+    // Second unblock: human feedback turn, back to working, same failure.
+    await env.storage.createTurn({
+      sessionId,
+      sequence: await env.storage.getNextTurnSequence(sessionId),
+      role: 'human',
+      content: 'Try again.',
+      actor: 'human',
+    });
+    await env.storage.updateTaskStatus(taskId, 'working', 'human');
+
+    await handleErrorResponse(env.storage, taskId, { id: sessionId }, fatalResponse, protoDir, env.lazyRoot);
+
+    const afterSecond = await env.storage.getSessionTurns(sessionId);
+    expect(afterSecond.filter(t => t.role === 'agent')).toHaveLength(2);
+    expect(afterSecond[afterSecond.length - 1]!.content).toContain('fatal_auth');
+  });
+
+  // The other half of the same invariant: re-processing the SAME response within
+  // one attempt (reconcile pass racing the stale-response sweep) must not
+  // duplicate the turn.
+  test('re-processing the same response within one attempt records one turn', async () => {
+    const { taskId, sessionId, protoDir } = await makeTask(env, 'working');
+
+    await handleErrorResponse(env.storage, taskId, { id: sessionId }, fatalResponse, protoDir, env.lazyRoot);
+    await handleErrorResponse(env.storage, taskId, { id: sessionId }, fatalResponse, protoDir, env.lazyRoot);
+
+    const turns = await env.storage.getSessionTurns(sessionId);
+    expect(turns.filter(t => t.role === 'agent')).toHaveLength(1);
+  });
+
   test('an unclassified crash keeps the interrupted + auto-resume path', async () => {
     const { taskId, sessionId, protoDir } = await makeTask(env, 'working');
 
@@ -211,5 +258,92 @@ describe('reconciler: classified agent failures', () => {
     expect(last.content).not.toContain('unrecoverable');
     expect(last.content).toContain('Failure class: unknown');
     expect(last.content).toContain('Attempts before giving up: 3');
+  });
+});
+
+
+/**
+ * A crashed SYNC restores the status it found — and ONLY for the sync that
+ * recorded it.
+ *
+ * A merge that died says no more about where the task stands with its reviewer
+ * than one that succeeded, so the marker `syncTaskRun` leaves is honoured on the
+ * crash path too, not only by `recordSyncTurns`. That reader sees EVERY turn
+ * type, which is why the marker names the command that wrote it. See
+ * src/task/sync-restore-status.ts and docs/sync-restores-submitted.md.
+ */
+describe('reconciler: a crashed sync and the restore marker', () => {
+  let env: Env;
+
+  const SYNC_CMD = 'cmd-the-sync-that-died';
+
+  /** The same crash report, correlated to a given command, as the supervisor writes it. */
+  function correlated(response: ErrorResponse, commandId: string): ErrorResponse {
+    return { ...response, command_id: commandId };
+  }
+
+  beforeEach(async () => { env = await setupEnv(); });
+  afterEach(async () => { await env.cleanup(); });
+
+  // INVARIANT: a fatal crash during a sync parks the task in the status the
+  // sync found, not `blocked`. Parking `blocked` here loses the open PR from
+  // the review queue in exactly the way the successful path no longer does.
+  test('a fatal crash restores submitted instead of parking blocked', async () => {
+    const { taskId, sessionId, protoDir } = await makeTask(env, 'working');
+    await markSyncRestoreStatus(env.storage, taskId, 'submitted', SYNC_CMD);
+
+    const crash = correlated(fatalResponse, SYNC_CMD);
+    deliver(protoDir, crash);
+    await handleErrorResponse(env.storage, taskId, { id: sessionId }, crash, protoDir, env.lazyRoot);
+
+    expect((await env.storage.getTask(taskId))?.status).toBe('submitted');
+  });
+
+  // INVARIANT (the marker names its own turn): a marker a dead sync left behind
+  // must never be claimable by an unrelated LATER turn.
+  //
+  // The sequence this forbids: a sync on a submitted task writes the marker and
+  // then dies with no response at all (killed supervisor, or a throw between the
+  // two writes); the task parks; turns later an ordinary WORK turn crashes
+  // fatally and reaches this same reader. Without the id it would claim that
+  // marker and park `submitted` — putting a task nobody submitted into the
+  // review queue and onto PR-comment auto-react, with no PR behind it.
+  test('an unrelated work turn crashing cannot claim a dead sync’s marker', async () => {
+    const { taskId, sessionId, protoDir } = await makeTask(env, 'working');
+    await markSyncRestoreStatus(env.storage, taskId, 'submitted', SYNC_CMD);
+
+    const otherTurnCrash = correlated(fatalResponse, 'cmd-an-ordinary-work-turn');
+    deliver(protoDir, otherTurnCrash);
+    await handleErrorResponse(env.storage, taskId, { id: sessionId }, otherTurnCrash, protoDir, env.lazyRoot);
+
+    expect((await env.storage.getTask(taskId))?.status).toBe('blocked');
+    // The mismatch left the marker ALONE — it is still owed to the turn it
+    // names, and it is inert until (never) that turn presents itself.
+    expect(await consumeSyncRestoreStatus(env.storage, taskId, SYNC_CMD)).toBe('submitted');
+  });
+
+  // Version skew: a crash report from an older supervisor carries no command id.
+  // It names no turn, so it claims nothing — losing a restore is the safe
+  // direction, asserting `submitted` on an unidentified turn is not.
+  test('a crash report with no command id claims nothing', async () => {
+    const { taskId, sessionId, protoDir } = await makeTask(env, 'working');
+    await markSyncRestoreStatus(env.storage, taskId, 'submitted', SYNC_CMD);
+
+    deliver(protoDir, fatalResponse);
+    await handleErrorResponse(env.storage, taskId, { id: sessionId }, fatalResponse, protoDir, env.lazyRoot);
+
+    expect((await env.storage.getTask(taskId))?.status).toBe('blocked');
+  });
+
+  // A crashed turn on a task that never synced has no marker, so nothing
+  // changes: the fatal park is `blocked`, exactly as before.
+  test('a crash with no marker still parks blocked', async () => {
+    const { taskId, sessionId, protoDir } = await makeTask(env, 'working');
+
+    const crash = correlated(fatalResponse, SYNC_CMD);
+    deliver(protoDir, crash);
+    await handleErrorResponse(env.storage, taskId, { id: sessionId }, crash, protoDir, env.lazyRoot);
+
+    expect((await env.storage.getTask(taskId))?.status).toBe('blocked');
   });
 });

@@ -21,7 +21,7 @@ import { requireLazyRoot } from '../helpers';
 import { loadConfig } from '../../config/loader';
 import { resolveOfflineStatus, formatOfflineExpiry } from '../../utils/offline';
 import { isDaemonRunning, readPid } from '../../daemon';
-import { theme } from '../theme';
+import { theme } from '../../render/theme';
 import { VERSION } from '../../version';
 import { builderScratchDir } from '../../builder/scratch';
 

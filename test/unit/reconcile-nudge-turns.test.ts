@@ -17,9 +17,19 @@
  *      'supervisor' on the prompt turn.
  *   3. Supervised reply turns carry their OWN usage (incl. cache write/read tokens)
  *      and their OWN per-invocation SHA window.
- *   4. Violation finality: the FINAL (post-push-back) violation set drives the
- *      conflict/blocked decision and lands on the push-back turn — never the work
- *      turn. A resolved push-back ([] violations) yields 'blocked'.
+ *   4. Violation finality: the FINAL (post-push-back / post-react) violation set
+ *      lands on that follow-up turn — never the work turn — and an explicit
+ *      empty re-detect ([]) is persisted rather than dropped.
+ *
+ *      WHAT DECIDES the conflict/blocked label changed in
+ *      move-file-approval-to-accept: a later turn's empty record no longer
+ *      CLEARS an earlier pending one by itself, because across turns the two
+ *      scanned different ranges and reading the newest as the whole story let an
+ *      earlier turn's unapproved protected file merge in silence. The label is
+ *      now settled by re-detecting over the whole branch, which is why these
+ *      tests hand `handleCompletedResponses` the project root: a file the
+ *      follow-up really did revert is absent from the branch diff and the task
+ *      parks 'blocked', while one that is still there keeps its 'conflict'.
  *   5. Session token usage sums EVERY invocation (work + supervised).
  *   6. Idempotency: re-running the reconciler does not duplicate turns.
  */
@@ -33,7 +43,7 @@ import { handleCompletedResponses } from '../../src/utils/reconcile';
 import { latestWorkAgentTurn, latestViolationTurn } from '../../src/utils/turns';
 import { protocolDir as getProtocolDir } from '../../src/protocol';
 import type { CompletedResponse } from '../../src/protocol';
-import { getWorktreePathForRef, taskRef } from '../../src/cli/helpers';
+import { getWorktreePathForRef, taskRef } from '../../src/task/identity';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 
 function git(cwd: string, ...args: string[]): string {
@@ -57,6 +67,11 @@ async function setupEnv(): Promise<Env> {
   git(lazyRoot, 'config', 'user.name', 'Lazy Test');
   git(lazyRoot, 'checkout', '-b', 'main');
   await writeFile(join(lazyRoot, 'README.md'), '# base\n');
+  // A real protected pattern, because the end-of-turn park now settles the
+  // conflict label with a whole-branch scan when it is given a project root
+  // (move-file-approval-to-accept). Without a pattern there is nothing to scan
+  // and the park falls back to the recorded set.
+  await writeFile(join(lazyRoot, 'lazy.toml'), '[permissions]\nprotected = ["*.spec.*"]\n');
   git(lazyRoot, 'add', '.');
   git(lazyRoot, 'commit', '-m', 'base');
   const baseSha = git(lazyRoot, 'rev-parse', 'HEAD');
@@ -145,7 +160,7 @@ describe('reconciler: supervised follow-up turns', () => {
       },
     ];
 
-    await handleCompletedResponses(env.storage, taskId, sessionArg(session!), responses, worktreePath, protoDir);
+    await handleCompletedResponses(env.storage, taskId, sessionArg(session!), responses, worktreePath, protoDir, env.lazyRoot);
 
     const turns = await env.storage.getSessionTurns(sessionId);
     const agentTurns = turns.filter(t => t.role === 'agent');
@@ -197,7 +212,7 @@ describe('reconciler: supervised follow-up turns', () => {
       },
     ];
 
-    await handleCompletedResponses(env.storage, taskId, sessionArg(session!), responses, worktreePath, protoDir);
+    await handleCompletedResponses(env.storage, taskId, sessionArg(session!), responses, worktreePath, protoDir, env.lazyRoot);
 
     const turns = await env.storage.getSessionTurns(sessionId);
     const workTurn = latestWorkAgentTurn(turns)!;
@@ -220,9 +235,9 @@ describe('reconciler: supervised follow-up turns', () => {
   });
 
   // INVARIANT 4 (resolved): a push-back that re-detects NO violations ([]) must
-  // yield 'blocked' — the final empty set overrides the work response, and no turn
-  // carries violations (latestViolationTurn is undefined).
-  test('push-back that resolves all violations → blocked, no violation turn', async () => {
+  // yield 'blocked'. The empty array is persisted so latestViolationTurn lands
+  // on that turn with no pending entries (not undefined — empty is authoritative).
+  test('push-back that resolves all violations → blocked, empty violation turn', async () => {
     const { ref, taskId, sessionId } = await makeWorkingTask(env, 'push-back resolved');
     const session = await env.storage.getSessionByTaskId(ref);
     const worktreePath = getWorktreePathForRef(env.lazyRoot, ref);
@@ -238,11 +253,75 @@ describe('reconciler: supervised follow-up turns', () => {
       },
     ];
 
-    await handleCompletedResponses(env.storage, taskId, sessionArg(session!), responses, worktreePath, protoDir);
+    await handleCompletedResponses(env.storage, taskId, sessionArg(session!), responses, worktreePath, protoDir, env.lazyRoot);
 
     const turns = await env.storage.getSessionTurns(sessionId);
-    expect(latestViolationTurn(turns)).toBeUndefined();
+    const violationTurn = latestViolationTurn(turns);
+    expect(violationTurn).toBeDefined();
+    expect(violationTurn!.violations).toEqual([]);
     expect((await env.storage.getTask(taskId))!.status).toBe('blocked');
+  });
+
+  // INVARIANT: react (or any later supervised re-detect) with [] must clear a
+  // pending set already stored on the push-back turn — otherwise unblock still
+  // demands approve/revert against files the follow-up already cleaned.
+  test('react re-detect of [] after push-back pending → blocked, not stale conflict', async () => {
+    const { ref, taskId, sessionId } = await makeWorkingTask(env, 'react clears push-back');
+    const session = await env.storage.getSessionByTaskId(ref);
+    const worktreePath = getWorktreePathForRef(env.lazyRoot, ref);
+    const protoDir = getProtocolDir(taskId);
+
+    const pending = [{ file: 'test.spec.ts', base_sha: 'abc', status: 'pending' as const }];
+    const responses: CompletedResponse[] = [
+      { status: 'completed', result: 'Work summary.', session_id: 'sess-work', usage: WORK_USAGE, pushed_back: true },
+      {
+        status: 'completed', result: 'Justified keeping the file.', session_id: 'sess-pb', usage: SUP_USAGE,
+        start_sha_work: env.baseSha, end_sha_work: env.baseSha,
+        violations: pending,
+        supervised: { kind: 'permission_pushback', prompt: 'You modified a protected file.' },
+      },
+      {
+        status: 'completed', result: 'Took screenshots; also reverted the protected edit.', session_id: 'sess-react', usage: SUP_USAGE,
+        start_sha_work: env.baseSha, end_sha_work: env.baseSha,
+        violations: [], // react re-detect: nothing left on HEAD
+        supervised: { kind: 'react', prompt: 'Reactive automation: take screenshots.' },
+      },
+    ];
+
+    await handleCompletedResponses(env.storage, taskId, sessionArg(session!), responses, worktreePath, protoDir, env.lazyRoot);
+
+    const turns = await env.storage.getSessionTurns(sessionId);
+    const violationTurn = latestViolationTurn(turns)!;
+    expect(violationTurn.turn_type).toBe('nudge');
+    expect(violationTurn.violations).toEqual([]);
+    expect((await env.storage.getTask(taskId))!.status).toBe('blocked');
+  });
+
+  // INVARIANT: a react re-detect with remaining protected edits parks as conflict
+  // (same finality as push-back) — complements the empty-clear test above.
+  test('react re-detect with pending violations → conflict', async () => {
+    const { ref, taskId, sessionId } = await makeWorkingTask(env, 'react introduces protected');
+    const session = await env.storage.getSessionByTaskId(ref);
+    const worktreePath = getWorktreePathForRef(env.lazyRoot, ref);
+    const protoDir = getProtocolDir(taskId);
+
+    const pending = [{ file: 'test.spec.ts', base_sha: 'abc', status: 'pending' as const }];
+    const responses: CompletedResponse[] = [
+      { status: 'completed', result: 'Work summary.', session_id: 'sess-work', usage: WORK_USAGE },
+      {
+        status: 'completed', result: 'Took screenshots and also edited a protected test.', session_id: 'sess-react', usage: SUP_USAGE,
+        start_sha_work: env.baseSha, end_sha_work: env.baseSha,
+        violations: pending,
+        supervised: { kind: 'react', prompt: 'Reactive automation: take screenshots.' },
+      },
+    ];
+
+    await handleCompletedResponses(env.storage, taskId, sessionArg(session!), responses, worktreePath, protoDir, env.lazyRoot);
+
+    const turns = await env.storage.getSessionTurns(sessionId);
+    const violationTurn = latestViolationTurn(turns)!;
+    expect(violationTurn.violations).toEqual(pending);
+    expect((await env.storage.getTask(taskId))!.status).toBe('conflict');
   });
 
   // INVARIANT 5: session usage rolls up EVERY invocation (work + supervised).
@@ -261,7 +340,7 @@ describe('reconciler: supervised follow-up turns', () => {
       },
     ];
 
-    await handleCompletedResponses(env.storage, taskId, sessionArg(session!), responses, worktreePath, protoDir);
+    await handleCompletedResponses(env.storage, taskId, sessionArg(session!), responses, worktreePath, protoDir, env.lazyRoot);
 
     const updated = await env.storage.getSessionByTaskId(ref);
     const usage = updated!.total_usage!;
@@ -288,8 +367,8 @@ describe('reconciler: supervised follow-up turns', () => {
       },
     ];
 
-    await handleCompletedResponses(env.storage, taskId, sessionArg(session!), responses, worktreePath, protoDir);
-    await handleCompletedResponses(env.storage, taskId, sessionArg(session!), responses, worktreePath, protoDir);
+    await handleCompletedResponses(env.storage, taskId, sessionArg(session!), responses, worktreePath, protoDir, env.lazyRoot);
+    await handleCompletedResponses(env.storage, taskId, sessionArg(session!), responses, worktreePath, protoDir, env.lazyRoot);
 
     const turns = await env.storage.getSessionTurns(sessionId);
     expect(turns.filter(t => t.turn_type === 'nudge')).toHaveLength(2);

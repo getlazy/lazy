@@ -158,6 +158,8 @@ describe('lazy doctor: --no-resume flag', () => {
     const result = await ctx.lazy(['doctor', '--help']);
     expectSuccess(result);
     expectOutput(result, '--no-resume');
-    expectOutput(result, 'Crashed task containers');
+    // Doctor reports these and never resumes them itself, so the usage text
+    // names them as resumable rather than as crashed containers to fix.
+    expectOutput(result, 'Interrupted tasks (resumable)');
   });
 });

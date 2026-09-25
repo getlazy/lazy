@@ -84,7 +84,7 @@ describe('lazy completion', () => {
 
   // REGRESSION: the COMMAND_FLAGS table drifted from the real parseFlags tables
   // — `start` was missing --effort/--runner and `create` was missing
-  // --priority/--effort/--runner, so flags that have shipped for months never
+  // --effort/--runner, so flags that have shipped for months never
   // tab-completed. These two commands are the ones a user types most.
   for (const shell of ['--bash', '--zsh'] as const) {
     test(`${shell} script completes every start and create flag`, async () => {
@@ -108,7 +108,7 @@ describe('lazy completion', () => {
 
       const createLine = lineFor('create');
       expect(createLine, 'no flag line found for `create`').toBeDefined();
-      for (const flag of ['--goal', '--prompt', '--model', '--type', '--priority', '--code', '--parent', '--agent', '--effort', '--runner', '--tag']) {
+      for (const flag of ['--goal', '--prompt', '--model', '--type', '--code', '--parent', '--agent', '--effort', '--runner', '--tag']) {
         expect(createLine!, `create completion missing ${flag}`).toContain(flag);
       }
     });

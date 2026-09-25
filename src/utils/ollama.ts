@@ -1,63 +1,47 @@
-import type { OllamaConfig } from '../config/types';
-import { spawnSyncUnsupervised } from './spawn';
-
-export type OllamaCheckResult =
-  | { reachable: true; endpoint: string }
-  | { reachable: false; endpoint: string; reason: string };
+/**
+ * Ollama endpoint predicate.
+ *
+ * One rule, used by every surface that has to decide what an Ollama endpoint
+ * costs: hosted Ollama bills a real key, local Ollama bills nobody. Sibling to
+ * `isOpenRouterEndpoint` (./openai-compat.ts) and `isLocalEndpoint`
+ * (./endpoint.ts) — see the header there for why hostname, not config, decides
+ * which credential an upstream is paid with.
+ *
+ * This module used to also carry a reachability probe and a model-fallback
+ * helper for the removed `[ollama]` config block. Both went with it: an Ollama
+ * server is now just an `endpoint` on an agent profile, so reachability is
+ * `checkTargetConnectivity` (src/utils/role-target.ts) like any other upstream,
+ * and the model comes from the profile.
+ */
 
 /**
- * Check if Ollama is reachable at the configured endpoint.
- * Replaces host.docker.internal with localhost for the check (the host-side
- * process can't reach the Docker-internal alias).
+ * True when the endpoint is Ollama Cloud (ollama.com), which requires a real API
+ * key. Local Ollama (localhost, LAN, Docker-internal aliases) ignores auth.
  */
-export function checkOllamaConnectivity(ollamaConfig: OllamaConfig): OllamaCheckResult {
-  const endpoint = ollamaEndpointForHost(ollamaConfig.endpoint);
+export function isHostedOllamaEndpoint(endpoint: string): boolean {
+  if (!endpoint.trim()) return false;
   try {
-    const result = spawnSyncUnsupervised(
-      ['curl', '-s', '-o', '/dev/null', '-w', '%{http_code}', `${endpoint}/api/tags`],
-      { stdout: 'pipe', stderr: 'ignore', timeout: 5_000 },
-    );
-    const statusCode = result.stdout.toString().trim();
-    if (result.exitCode === 0 && statusCode === '200') {
-      return { reachable: true, endpoint };
-    }
-    return {
-      reachable: false,
-      endpoint,
-      reason: `Ollama is not responding at ${endpoint}. Start it with: ollama serve`,
-    };
+    const host = new URL(endpoint).hostname.toLowerCase();
+    return host === 'ollama.com' || host.endsWith('.ollama.com');
   } catch {
-    return {
-      reachable: false,
-      endpoint,
-      reason: `Could not check Ollama at ${endpoint}. Ensure Ollama is running: ollama serve`,
-    };
+    return false;
   }
 }
 
 /**
- * Resolve the effective model: use the explicit model if provided,
- * otherwise fall back to the Ollama model when Ollama is enabled.
+ * The local Ollama a `pi` profile talks to when it names no endpoint, and the
+ * model it asks for. Together they are the built-in `pi` profile's whole
+ * upstream — see HARNESS_DEFAULT_ENDPOINT in src/config/agent-profiles.ts for
+ * why pi defaults local rather than to Anthropic.
+ *
+ * Ollama's default port, and the address from the HOST's perspective, because
+ * the proxy is what dials it.
  */
-export function getEffectiveModel(model: string | undefined, ollamaConfig?: OllamaConfig): string | undefined {
-  return model ?? (ollamaConfig?.enabled ? ollamaConfig.model : undefined);
-}
+export const DEFAULT_LOCAL_OLLAMA_ENDPOINT = 'http://localhost:11434';
 
 /**
- * Convert a Docker-internal Ollama endpoint to one reachable from the host.
- * Uses URL parsing so it only replaces the hostname, not substrings that
- * happen to contain "host.docker.internal" (e.g. host.docker.internal.example.com).
+ * Chosen by the engineer (2026-09-13) and verified present on their machine.
+ * `latest` rather than a pinned digest deliberately: it names whatever the user
+ * pulled under that tag, which is how Ollama users refer to their own models.
  */
-export function ollamaEndpointForHost(endpoint: string): string {
-  try {
-    const url = new URL(endpoint);
-    if (url.hostname === 'host.docker.internal') {
-      url.hostname = 'localhost';
-      return url.toString().replace(/\/$/, ''); // strip trailing slash added by URL
-    }
-    return endpoint;
-  } catch {
-    // If the endpoint isn't a valid URL, fall back to the original string.
-    return endpoint;
-  }
-}
+export const DEFAULT_LOCAL_OLLAMA_MODEL = 'qwen3.8:latest';

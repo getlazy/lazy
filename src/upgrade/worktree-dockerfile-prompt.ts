@@ -16,11 +16,12 @@
 import { readFile } from 'fs/promises';
 import { join } from 'path';
 import { isTTY, promptYesNo } from '../cli/editor';
-import { theme } from '../cli/theme';
+import { theme } from '../render/theme';
 import { consentedBuildIdentity, IMAGE_TAG } from '../capture/image-tag';
 import {
   clearAdoptedImage,
   hashDockerfileContent,
+  inspectAdoptedImage,
   writeAdoptedImage,
   type AdoptedImageState,
 } from '../daemon/adopted-image';
@@ -47,45 +48,121 @@ async function filesEqual(a: string, b: string): Promise<boolean> {
 }
 
 /**
- * Every upgrade that rebuilds re-decides adoption: clear first, then optionally
- * rewrite on yes. Call this BEFORE any container image build (foreground or
- * background) so resolveCustomDockerfile / the build see the new state.
+ * Ask whether to keep a valid daemon adoption before this rebuild. TTY: prompt
+ * (default yes). Non-TTY: keep and print — never silently drop or keep.
+ */
+async function promptKeepExistingAdoption(
+  existing: AdoptedImageState,
+): Promise<AdoptedImageState | null> {
+  if (isTTY()) {
+    console.log('');
+    console.log(
+      `  Currently adopted: ${theme.command(existing.imageName)} from ${existing.dockerfilePath}`,
+    );
+    console.log('');
+
+    const keep = await promptYesNo(
+      'Keep this adoption for the image build and the daemon?',
+      true,
+    );
+    if (!keep) {
+      console.log('  Clearing daemon adoption — the project root Dockerfile will be used.');
+      console.log('');
+      return null;
+    }
+
+    console.log(
+      `  ${theme.success('Keeping')} ${existing.imageName} until you decline at a future upgrade.`,
+    );
+    console.log('');
+    return existing;
+  }
+
+  // Non-TTY: explicit keep — scripts and CI must not silently lose adoption.
+  console.log('');
+  console.log(
+    `  Keeping daemon-adopted image ${existing.imageName} from ${existing.dockerfilePath} ` +
+      '(non-interactive upgrade; re-run from a TTY to change adoption).',
+  );
+  console.log('');
+  return existing;
+}
+
+/**
+ * Every upgrade that rebuilds re-decides adoption: announce any existing valid
+ * adoption (keep or clear), then optionally offer a NEW worktree Dockerfile when
+ * cwd is inside that worktree. Call BEFORE any container image build so
+ * resolveCustomDockerfile / the build see the final state.
  *
- * Returns the written adoption on yes, null when skipped or declined.
- * No-op without a TTY or when the worktree has nothing different to offer —
- * but still clears any prior adoption so it cannot outlive this rebuild.
+ * SECURITY: a NEW worktree Dockerfile is offered only when cwd is genuinely
+ * inside that worktree — never when upgrade runs from the project root alone.
+ *
+ * Returns the adoption in effect after prompts, or null when none.
  */
 export async function maybePromptWorktreeDockerfileAdoption(
   projectRoot: string,
 ): Promise<AdoptedImageState | null> {
-  // Lifecycle: each rebuild clears, then the prompt may rewrite. Doing this
-  // unconditionally (even without a TTY / worktree) is what stops an adoption
-  // from silently outliving the next upgrade.
-  await clearAdoptedImage(projectRoot);
+  const inspection = await inspectAdoptedImage(projectRoot);
 
-  if (!isTTY()) return null;
+  // Expired / drifted / missing adoption cannot wedge a rebuild — clear without
+  // a keep prompt (inspectAdoptedImage already classifies why).
+  if (
+    inspection.status === 'expired' ||
+    inspection.status === 'missing-dockerfile' ||
+    inspection.status === 'content-drifted'
+  ) {
+    await clearAdoptedImage(projectRoot);
+  }
 
-  const worktreeCwd = await lazyTaskWorktreeCwd(projectRoot);
-  if (!worktreeCwd) return null;
+  let currentAdoption =
+    inspection.status === 'valid' ? inspection.state : null;
 
-  const worktreeDockerfile = join(worktreeCwd, WORKTREE_DOCKERFILE);
-  if (!(await pathExists(worktreeDockerfile))) return null;
+  if (currentAdoption) {
+    const kept = await promptKeepExistingAdoption(currentAdoption);
+    if (!kept) {
+      await clearAdoptedImage(projectRoot);
+      currentAdoption = null;
+    }
+  }
+
+  // New worktree adoption is TTY-only — same security posture as Part 1 pins.
+  if (!isTTY()) {
+    return currentAdoption;
+  }
+
+  const worktreeRoot = await lazyTaskWorktreeCwd(projectRoot);
+  if (!worktreeRoot) return currentAdoption;
+
+  const worktreeDockerfile = join(worktreeRoot, WORKTREE_DOCKERFILE);
+  if (!(await pathExists(worktreeDockerfile))) return currentAdoption;
 
   const rootDockerfile = join(projectRoot, WORKTREE_DOCKERFILE);
   if ((await pathExists(rootDockerfile)) && await filesEqual(worktreeDockerfile, rootDockerfile)) {
-    return null;
+    return currentAdoption;
   }
 
   const content = await readFile(worktreeDockerfile, 'utf-8');
+  const contentHash = hashDockerfileContent(content);
+
+  // Already adopted this exact content FROM THIS SAME worktree — no need to
+  // re-prompt. The path matters as much as the bytes: the image identity covers
+  // the build context too, so a byte-identical Dockerfile in another worktree is
+  // a different image and must still be offered.
+  if (
+    currentAdoption?.contentHash === contentHash &&
+    currentAdoption.dockerfilePath === worktreeDockerfile
+  ) {
+    return currentAdoption;
+  }
 
   console.log('');
   console.log(theme.warning('Running `lazy upgrade` from a task worktree.'));
-  console.log(`  Directory:  ${worktreeCwd}`);
+  console.log(`  Directory:  ${worktreeRoot}`);
   console.log(`  Default:    ${rootDockerfile}`);
   console.log(`  Here:       ${worktreeDockerfile}`);
   // Name the build context: adopting consents to a docker build over this whole
   // directory, not just to the Dockerfile on screen.
-  console.log(`  Context:    ${worktreeCwd} (this worktree, as it is on disk)`);
+  console.log(`  Context:    ${worktreeRoot} (this worktree, as it is on disk)`);
   console.log('');
   console.log('  By default the image build uses the project root Dockerfile, not this');
   console.log("  worktree's copy. Adopting builds from the worktree AND keeps the daemon");
@@ -98,24 +175,23 @@ export async function maybePromptWorktreeDockerfileAdoption(
     false,
   );
   if (!useWorktree) {
-    console.log('  Using the project root Dockerfile (no adoption).');
+    console.log('  Using the project root Dockerfile (no new adoption).');
     console.log('');
-    return null;
+    return currentAdoption;
   }
 
-  const contentHash = hashDockerfileContent(content);
   // The image name covers the Dockerfile bytes AND the directory they build
   // against, so the same Dockerfile in two worktrees cannot share one image.
   // contentHash stays a pure content hash: drift detection compares the live
   // worktree file against it.
-  const shortHash = consentedBuildIdentity(contentHash, worktreeCwd).substring(0, 12);
+  const shortHash = consentedBuildIdentity(contentHash, worktreeRoot).substring(0, 12);
   const imageName = `lazy-custom-${shortHash}:${IMAGE_TAG}`;
 
   // Snapshot the consented bytes at prompt time (adopted-Dockerfile) so the
   // later upgrade build cannot re-read a post-consent agent edit of the
   // worktree file. contextCommit is provenance only — the build reads the
   // worktree live.
-  const head = await worktreeHead(worktreeCwd);
+  const head = await worktreeHead(worktreeRoot);
   const state = await writeAdoptedImage(
     projectRoot,
     {
@@ -133,7 +209,7 @@ export async function maybePromptWorktreeDockerfileAdoption(
   );
   console.log(
     `  Daemon + launches will use it until the next \`lazy upgrade\` rebuild ` +
-      `(lazy ${state.lazyVersion}).`,
+      `decides again, or lazy moves off ${IMAGE_TAG} (adopted on lazy ${state.lazyVersion}).`,
   );
   console.log('');
 

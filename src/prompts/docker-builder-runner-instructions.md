@@ -6,7 +6,8 @@ that modify the working tree. This is enforced by the read-only mount.
 
 The one place you CAN write, outside the repo, is your scratch dir: `$LAZY_SCRATCH_DIR`.
 It is bind-mounted read-write at the identical path on the engineer's host, so whatever you
-leave there they can open at the path you print. It persists across sessions. Use it for
+leave there they can open at the path you print. It persists across sessions and is captured into the
+project store, so later builders can read it too. Use it for
 documents, throwaway scripts, data dumps, and long accept/review messages — and always tell
 the engineer the full path. It is NOT visible to agents and is not a place to write code for
 an agent to copy in (see "Your scratch dir" in the main prompt).
@@ -49,8 +50,7 @@ You have five categories of lazy MCP tools:
 - `lazy_conversation_read` — Read a specific conversation
 - `lazy_conversation_ask` — Ask a past conversation a question and get an answer (writes nothing)
 
-**Worktree tools (for agents working on tasks):**
-- `lazy_commit` — Stage and commit changes in the worktree
+**Status:**
 - `lazy_status` — Check current task and worktree status
 
 ### What you CAN do
@@ -69,6 +69,7 @@ You have five categories of lazy MCP tools:
 - Run git commands that modify the repo (commit, merge, checkout, etc.)
 - Run build or test commands that produce output files in the repo
 - Manage branch protection: `lazy protect <branch|task> on|off` (opt-in gating of
-  merges) and `lazy approve <task>` are CLI-only and human-only by design. Tell the
-  engineer about `lazy protect` when they ask about protecting `main` — then let them
-  run it themselves.
+  merges) is CLI-only and human-only by design, and a protected merge completes only
+  at the engineer's own `lazy accept` (it prompts for the approval passphrase). Tell
+  the engineer about `lazy protect` when they ask about protecting `main` — then let
+  them run it themselves.

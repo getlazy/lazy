@@ -16,18 +16,20 @@
  */
 
 import { join } from 'path';
+import { tryRemoteStorage } from '../../preconditions';
 import { existsSync, writeFileSync, mkdirSync, unlinkSync } from 'fs';
 import { getHome } from '../../utils/home';
-import { requireLazyRoot, requireStorage, tryRemoteStorage, parseFlags, type FlagDefinition } from '../helpers';
-import { loadConfig, hasExplicitModelConfig } from '../../config/loader';
+import { requireLazyRoot, requireStorage, parseFlags, type FlagDefinition } from '../helpers';
+import { loadConfig } from '../../config/loader';
 import { resolveRoleTarget, isKnownAnthropicModel, KNOWN_ANTHROPIC_SHORT_NAMES } from '../../utils/role-target';
+import { builderProfileAdvice } from '../../config/agent-profile-advice';
 import { isTTY, promptLine } from '../editor';
 import { getProjectName } from '../../storage';
-import { theme } from '../theme';
+import { theme } from '../../render/theme';
 import { createRunner, refreshRunnerProxyTargets, type Runner } from '../../runner';
 import { buildBuilderPermissionArgs } from '../../runner/host-sandbox';
 import { generateBuilderConfig } from '../../builder/server';
-import { queryDaemonMcpConfig, queryConcurrency } from '../../daemon/rpc-fallback';
+import { queryDaemonMcpConfig, queryConcurrency, admitBuilder, releaseBuilder } from '../../daemon/rpc-fallback';
 import { checkDaemonHealth } from '../../daemon/lifecycle';
 import { runBuilderRelaunchLoop, type BuilderLaunchResult } from '../../builder/relaunch';
 import { revokeBuilderMcpToken } from '../../builder/mcp-session';
@@ -41,49 +43,20 @@ import {
 import { detectBuilderLaunchSessionId } from '../../builder/session-detect';
 import { ensureBuilderScratchDir } from '../../builder/scratch';
 import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
-import { resolveBuilderChattiness, renderChattinessSnippet } from '../../config/chattiness';
-import { buildMemorySection } from '../../memory';
 import { agentDisplayName } from '../../agent/registry';
-
-// Embedded at build/compile time — changes to these files require rebuild
-import lazySystemPrompt from '../../prompts/builder-system-prompt.md' with { type: 'text' };
-import modelGuidance from '../../prompts/model-guidance.md' with { type: 'text' };
+import { printConversationList } from '../../conversation/list';
+import { assembleBuilderSystemPrompt } from '../../builder/system-prompt';
+import { boundCloneLogin, commandBuilderBound } from './bound-session';
 
 async function buildSystemPrompt(lazyRoot: string, runner: Runner): Promise<string> {
-  const config = await loadConfig(lazyRoot);
-
-  // Inject runner-specific instructions into the template
-  const runnerInstructions = runner.getBuilderInstructions().trimEnd();
-  let prompt = lazySystemPrompt.replace('{{RUNNER_INSTRUCTIONS}}', runnerInstructions);
-
-  // Inject the verbosity snippet near the top (placeholder sits right after the
-  // intro). Empty when unset, so the placeholder collapses to nothing.
-  const chattinessSnippet = renderChattinessSnippet(resolveBuilderChattiness(config));
-  prompt = prompt.replace('{{CHATTINESS}}', chattinessSnippet ? chattinessSnippet + '\n\n' : '');
-  prompt = prompt.trimEnd();
-
-  // Auto-inject the shared-memory index (see src/memory). Empty when the
-  // project has no records, so nothing is appended until there is something to
-  // recall. Storage is opened just for this read and closed immediately.
+  // Storage is opened just for the memory/messages reads inside assembly and
+  // closed immediately — the prompt is a string from here on.
   const storage = await requireStorage();
   try {
-    const memorySection = await buildMemorySection(storage, 'builder', { warnBytes: config.memory.warn_bytes });
-    if (memorySection) {
-      prompt += '\n\n' + memorySection;
-    }
+    return await assembleBuilderSystemPrompt({ lazyRoot, runner, storage });
   } finally {
     await storage.close();
   }
-
-  if (await hasExplicitModelConfig(lazyRoot)) {
-    // User configured a default model — tell builder to respect it
-    const defaultModel = config.models.default;
-    prompt += `\n\n## Model selection\n\nThe project is configured to use **${defaultModel}** as the default model (in lazy.toml).\nDo NOT pass \`--model\` when creating or starting tasks unless the engineer explicitly asks for a different model.\nOmitting \`--model\` lets the CLI use the configured default automatically.`;
-  } else {
-    prompt += '\n\n' + modelGuidance.trimEnd();
-  }
-
-  return prompt;
 }
 
 /**
@@ -112,13 +85,27 @@ async function markBuilderRun(root: string): Promise<void> {
   writeFileSync(join(markerDir, '.builder-launched'), new Date().toISOString());
 }
 
+/**
+ * The one place the "builder cap reached" message is written, so the friendly
+ * pre-check and the daemon's authoritative refusal read identically — a human
+ * denied by either must get the same count and the same remedy.
+ */
+function printBuilderLimitReached(running: number, limit: number): void {
+  console.error(
+    `Builder limit reached: ${running}/${limit} builder container(s) already running.`,
+  );
+  console.error('Wait for one to exit, or raise the cap for this daemon session:');
+  console.error('  lazy daemon config set max_concurrent_builders <N>');
+  console.error('(ephemeral — resets on daemon restart; set [limits] max_concurrent_builders in lazy.toml to persist)');
+}
+
 // --- Subcommand: list ---
 
 async function commandBuilderList(_lazyRoot: string): Promise<void> {
   const storage = await requireStorage();
 
   try {
-    const conversations = await storage.listConversations();
+    const conversations = await storage.listConversationSummaries();
 
     if (conversations.length === 0) {
       console.log('No captured builder conversations yet.');
@@ -126,36 +113,10 @@ async function commandBuilderList(_lazyRoot: string): Promise<void> {
       return;
     }
 
-    console.log(`${conversations.length} captured conversation(s):\n`);
+    printConversationList(conversations);
 
-    const header = `${'SESSION'.padEnd(10)} ${'STARTED'.padEnd(18)} ${'LAST'.padEnd(18)} ${'TURNS'.padEnd(12)} FIRST PROMPT`;
-    console.log(header);
-
-    for (const conv of conversations) {
-      const shortId = conv.sessionId.substring(0, 8);
-      // Format ISO timestamps as "YYYY-MM-DD HH:MM"
-      const started = conv.startedAt
-        ? conv.startedAt.replace('T', ' ').substring(0, 16)
-        : '-';
-      const ended = conv.endedAt
-        ? conv.endedAt.replace('T', ' ').substring(0, 16)
-        : '-';
-
-      const humanTurns = conv.stats.userMessageCount;
-      const agentTurns = conv.stats.assistantMessageCount;
-      const turns = `${humanTurns}h/${agentTurns}a`;
-
-      // First line of first user prompt
-      const firstUserMsg = conv.messages.find(m => m.role === 'user');
-      const firstLine = firstUserMsg
-        ? firstUserMsg.text.split('\n')[0].substring(0, 60)
-        : '(no prompt)';
-      const truncated = firstUserMsg && firstUserMsg.text.split('\n')[0].length > 60 ? '...' : '';
-
-      console.log(`${theme.taskId(shortId).padEnd(19)} ${started.padEnd(18)} ${ended.padEnd(18)} ${turns.padEnd(12)} ${firstLine}${truncated}`);
-    }
-
-    console.log(`\nUse 'lazy show <session-id>' to view a full conversation.`);
+    console.log(`\nBrowse with: ${theme.command('lazy conversations')}`);
+    console.log(`Read one with: ${theme.command('lazy conversations show <session-id>')}`);
   } finally {
     await storage.close();
   }
@@ -170,6 +131,14 @@ export async function commandBuilder(args: string[]): Promise<void> {
   const subcommand = args[0];
   if (subcommand === 'list' || subcommand === 'ls') {
     await commandBuilderList(root);
+    return;
+  }
+
+  // A clone bound to Lazy Teams launches nothing here: the builder session
+  // runs on the server and this terminal attaches to it (design doc §5.1).
+  const login = await boundCloneLogin(root);
+  if (login) {
+    await commandBuilderBound(root, login, args);
     return;
   }
 
@@ -306,27 +275,28 @@ export async function commandBuilder(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  // Concurrency cap: fail fast when the builder limit is reached. An interactive
+  // Concurrency cap, part 1 of 2: a FRIENDLY EARLY CHECK, not the authority.
+  //
+  // The gate that actually holds is the daemon's `admitBuilder` immediately
+  // before the container launch (below) — it counts and decides in one atomic
+  // step, so it binds every launcher and cannot race with itself. This read-only
+  // pre-check exists purely so a human at a full cap is told NOW, instead of
+  // after the disclosure prompts and the system-prompt build. An interactive
   // session a human is waiting on must never be silently queued — tell them the
   // count and how to raise the cap. The effective limit comes from the daemon so
   // an ephemeral `lazy daemon config` override is honored. Best-effort: a daemon
-  // hiccup must not block launching a builder, so a failed query is non-fatal.
+  // hiccup must not block launching a builder, so a failed query is non-fatal
+  // (the authoritative gate runs regardless).
   try {
     const limits = await queryConcurrency();
     if (limits.builders.running >= limits.builders.limit) {
-      console.error(
-        `Builder limit reached: ${limits.builders.running}/${limits.builders.limit} builder ` +
-        `container(s) already running.`,
-      );
-      console.error('Wait for one to exit, or raise the cap for this daemon session:');
-      console.error('  lazy daemon config set max_concurrent_builders <N>');
-      console.error('(ephemeral — resets on daemon restart; set [limits] max_concurrent_builders in lazy.toml to persist)');
+      printBuilderLimitReached(limits.builders.running, limits.builders.limit);
       process.exit(1);
     }
   } catch (err) {
     // Non-fatal: never block an interactive builder on a limits-query failure.
     if (config.session.debug) {
-      console.error(`[DEBUG] builder concurrency check skipped: ${err instanceof Error ? err.message : err}`);
+      console.error(`[DEBUG] builder concurrency pre-check skipped: ${err instanceof Error ? err.message : err}`);
     }
   }
 
@@ -472,7 +442,17 @@ export async function commandBuilder(args: string[]): Promise<void> {
       )
     : (autonomous ? ['--dangerously-skip-permissions'] : []);
 
+  // Which pass through launchOnce this is. Only the FIRST consumes a builder
+  // slot: later passes are the upgrade relaunch loop resuming a session that
+  // already exists, whose container was stopped by `lazy upgrade` moments ago.
+  // Re-admitting there could refuse a human's live session because someone else
+  // took the slot it had just vacated — a relaunch is a continuation, not a new
+  // builder. Its container is discovered by the daemon the moment it is up, so
+  // the count stays honest either way.
+  let launchAttempt = 0;
+
   const launchOnce = async (rid: string | null): Promise<BuilderLaunchResult> => {
+    const isFirstLaunch = ++launchAttempt === 1;
     // Locate the projects dir that holds this launch's resume target (or the
     // shared dir when the session lives there). undefined outside sandbox mode.
     // Pair it with a trustWritable signal so the runner can mount a known-writable
@@ -496,26 +476,28 @@ export async function commandBuilder(args: string[]): Promise<void> {
     // --resume <id>, then the resolved model and effort.
     //
     // Resolve the builder's model via the per-role target. The explicit --model
-    // flag is a hard override: it wins over a configured model on EVERY backend,
-    // including ollama/proxy, while the backend+endpoint (the "server") stay as
-    // configured — so `lazy builder --model X` runs model X against whatever
-    // server the role points at. Without the flag, a local backend keeps forcing
-    // its authoritative model. An empty result means "omit --model" so Claude
+    // flag is a hard override: it wins over a profile's configured model, while
+    // the profile's endpoint (the "server") stays as configured — so
+    // `lazy builder --model X` runs model X against whatever server the role's
+    // profile points at. Without the flag, a profile that names a model keeps
+    // forcing it. An empty result means "omit --model" so Claude
     // Code uses its own default — we resolve to a single value here so we never
     // append two --model args to the Claude Code child (which would be ambiguous).
     const builderTarget = resolveRoleTarget('builder', config, { overrideModel: modelOverride });
-    // An explicit --model that resolves to the anthropic backend (no local server
-    // configured for this role) must be a model the Anthropic API can actually
-    // serve. Reject an unrecognized name up front instead of handing it to Claude
-    // Code and failing opaquely at runtime. `claude-*` is the escape hatch for
-    // models newer than our known list; to run anything else (e.g. a local model),
-    // configure a server in lazy.toml [models.roles.builder].
-    if (modelOverride && builderTarget.backend === 'anthropic' && !isKnownAnthropicModel(modelOverride)) {
+    // An explicit --model on a profile that pins no endpoint of its own goes to
+    // the Anthropic API, so it must be a model that API can actually serve.
+    // Reject an unrecognized name up front instead of handing it to Claude Code
+    // and failing opaquely at runtime. `claude-*` is the escape hatch for models
+    // newer than our known list; to run anything else (e.g. a local model), point
+    // the builder at a profile whose endpoint serves it.
+    if (modelOverride && !builderTarget.pinned && !isKnownAnthropicModel(modelOverride)) {
       console.error(
         `Unknown --model "${modelOverride}". lazy recognizes Anthropic models ` +
-        `(claude-*, or ${KNOWN_ANTHROPIC_SHORT_NAMES.join('/')}). To run a different model, ` +
-        `configure a local server in lazy.toml [models.roles.builder] ` +
-        `(backend = "ollama" or "proxy", with an endpoint).`,
+        `(claude-*, or ${KNOWN_ANTHROPIC_SHORT_NAMES.join('/')}). ` +
+        // The "write yourself a profile" half is the advice module's to phrase:
+        // on a managed host that block is refused and would stop the project
+        // loading, so it must not be recommended there.
+        `To run a different model, ${builderProfileAdvice()}`,
       );
       process.exit(1);
     }
@@ -546,6 +528,45 @@ export async function commandBuilder(args: string[]): Promise<void> {
       const dataDir = config.data.path;
       const { configPath, config: builderConfig, id } = generateBuilderConfig(root, dataDir);
       writeFileSync(configPath, JSON.stringify(builderConfig, null, 2));
+
+      // Concurrency cap, part 2 of 2: the AUTHORITATIVE gate. The daemon counts
+      // live builders and decides in one atomic step, and reserves this id's slot
+      // — so two builders started at the same instant cannot both take the last
+      // one, and any other launcher (a web UI, a script) is bound by the same
+      // decision instead of re-implementing it. Done here, after `id` exists and
+      // before anything is minted or spawned for this builder.
+      //
+      // A daemon that cannot answer at all does NOT block the launch: builders
+      // are interactive sessions a human is waiting on, and the pre-existing
+      // behavior on a limits-query failure was to proceed. That is fail-open by
+      // choice, and it is why this call is not the last word on a rogue client —
+      // see the module header of src/daemon/concurrency.ts.
+      let admittedBuilderId: string | null = null;
+      if (isFirstLaunch) {
+        try {
+          const admission = await admitBuilder(id);
+          if (!admission.admitted) {
+            // Exiting here skips the `finally` below, so remove the config we
+            // just wrote by hand: it carries this builder's token, and nothing
+            // would ever clean it up otherwise.
+            try {
+              if (existsSync(configPath)) unlinkSync(configPath);
+            } catch (cleanupErr) {
+              console.error(
+                `Warning: could not remove ${configPath}: ` +
+                `${cleanupErr instanceof Error ? cleanupErr.message : cleanupErr}`,
+              );
+            }
+            printBuilderLimitReached(admission.running, admission.limit);
+            process.exit(1);
+          }
+          admittedBuilderId = id;
+        } catch (err) {
+          if (config.session.debug) {
+            console.error(`[DEBUG] builder admission skipped: ${err instanceof Error ? err.message : err}`);
+          }
+        }
+      }
 
       // This builder session's MCP identity label: the daemon binds the minted
       // token to it, and we hand it back on exit to revoke that token (see
@@ -614,6 +635,19 @@ export async function commandBuilder(args: string[]): Promise<void> {
         // daemon must never break builder exit.
         await mcpReissue.stop();
         await revokeBuilderMcpToken(daemonMcpName);
+        // Drop the launch reservation: from here the daemon counts this builder
+        // by its container, and by the time we get here the container is gone.
+        // The reservation also expires on its own (BUILDER_RESERVATION_TTL_MS),
+        // which is what covers a client killed before it reaches this line.
+        if (admittedBuilderId) {
+          try {
+            await releaseBuilder(admittedBuilderId);
+          } catch (err) {
+            if (config.session.debug) {
+              console.error(`[DEBUG] builder slot release failed: ${err instanceof Error ? err.message : err}`);
+            }
+          }
+        }
         for (const tmpFile of [daemonConfigPath, configPath]) {
           try {
             if (existsSync(tmpFile)) unlinkSync(tmpFile);
@@ -680,6 +714,13 @@ into lazy's store so they're searchable alongside task data.
 Subcommands:
   list, ls             List captured builder conversations
 
+In a clone logged in to Lazy Teams:
+  Your builder runs on the server; 'lazy builder' attaches this terminal to it
+  (starting it if needed — a second run joins the same session). ctrl-] detaches
+  and leaves it running.
+  stop [<id>]          Stop it, keeping its conversation to resume
+  end [<id>]           End it for good
+
 Resume options:
   --resume <id>        Resume a specific session by Claude session ID
   --import             Adopt a session that has never run under lazy's builder
@@ -703,7 +744,9 @@ Auto-resume across upgrade (docker/podman only):
   If 'lazy upgrade' stops this builder to rebuild the image, the session is
   automatically relaunched in place — same conversation, same terminal — once
   the upgrade finishes; no manual --resume needed. (Host-process builders are
-  not stopped by upgrade, so there is nothing to relaunch there.) Finish typing
+  not stopped by upgrade, so there is nothing to relaunch there.) The wait has
+  no time limit — progress lines print every ~15s, and ctrl-c cancels the wait
+  while preserving your session (resume with --resume when ready). Finish typing
   any in-progress message before upgrading: unsent input cannot be recovered.
   If the relaunch can't complete, the command prints the exact
   'lazy builder --resume <id>' to run.

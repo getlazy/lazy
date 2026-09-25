@@ -60,3 +60,18 @@ export const MCP_ACTOR: Actor = 'builder';
  * decision when someone later audits how a subtask landed.
  */
 export const AGENT_ACTOR: Actor = 'agent';
+
+/**
+ * The actor for work NOBODY asked for — a turn the daemon started by itself
+ * (auto-resume, auto-deliver, a sync nothing typed) and the rows it writes.
+ *
+ * Not a channel like the two above but a statement about origin, and it
+ * OVERRIDES the channel when the two would both apply: an agent writing during
+ * a turn the reconciler resumed records `system`, not `agent`. That is the
+ * point of it — the person on such a row is whoever CONFIGURED the automation
+ * (src/identity/system-identity.ts), which on a one-person install is the same
+ * human who shows up as `human` and `agent` elsewhere, so the role is the only
+ * thing that keeps "they did it" apart from "their daemon did it"
+ * (docs/design/actor-identity-and-remote-clients.md §3.3 case 3, §3.4).
+ */
+export const SYSTEM_ACTOR: Actor = 'system';

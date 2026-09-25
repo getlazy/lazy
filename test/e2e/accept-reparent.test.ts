@@ -12,6 +12,7 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput, expectOutputExcludes } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 
 /** Extract child task ID from "Created variant task <id>" output */
 function extractVariantTaskId(output: string): string {
@@ -67,6 +68,10 @@ describe('accept re-parents unfinished children', () => {
     writeFileSync(join(worktreePath, 'work.txt'), `work for ${taskId}\n`);
     ctx.git('-C', worktreePath, 'add', 'work.txt');
     ctx.git('-C', worktreePath, 'commit', '-m', 'Work commit');
+
+    // Fixture setup, not the subject: the finality gate needs a standing final
+    // before any accept of a committed task (see test/helpers/final.ts).
+    await seedFinal(ctx, taskId);
   }
 
   // INVARIANT: When a parent is accepted, its backlog children are re-parented
@@ -225,7 +230,7 @@ describe('accept re-parents unfinished children', () => {
   //
   // This test previously asserted the note said "no action needed". That was
   // false: re-parenting only rewrites parent_task_id — it never touches the
-  // child's worktree (see reparentChildren in src/cli/orphan.ts), so until the
+  // child's worktree (see reparentChildren in src/task/orphan.ts), so until the
   // child is synced its merge base is behind the merge that just landed. That
   // is precisely the stale-base condition that let the v0.12 release resurrect
   // deleted files (public-docs/resurrection-guard.md), so the note now names

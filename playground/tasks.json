@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "tasks": [
+    {
+      "code": "fix-mixed-case-slugs",
+      "type": "fix",
+      "goal": "Short links with capital letters in their slug do not work",
+      "prompt": "Creating a link with a custom slug like `Docs` succeeds and the response says the short link is `/docs`, but visiting `/Docs` returns 404 (and so does `/links/Docs/stats`). Slugs are stored lowercase, so lookups should be case-insensitive too.\n\nFirst add a test to test/app.test.ts that creates `{\"slug\": \"Docs\"}` and asserts that both `/Docs` and `/docs` redirect; confirm it fails. Then fix the lookups so it passes. Done when `bun test` is green and the new test would have caught the bug."
+    },
+    {
+      "code": "link-expiry",
+      "type": "feature",
+      "goal": "Links can expire after a number of days",
+      "prompt": "Let `POST /links` accept an optional `expiresInDays` (a positive integer). Visiting an expired link returns 410 Gone with a short JSON error instead of redirecting, and its stats show when it expired. Links without the field never expire.\n\nThe schema lives in src/schema.sql; add to it rather than changing existing columns, and make sure an existing database still opens. Cover: a link that has not expired yet, one that has (pass a fixed `now` rather than sleeping), and a link with no expiry."
+    },
+    {
+      "code": "route-table",
+      "type": "refactor",
+      "goal": "Replace the chain of ifs in the router with a route table",
+      "prompt": "src/app.ts decides which handler runs with a long sequence of `if (method === ... && path ...)` checks and regexes. Replace it with a small route table: a list of `{ method, pattern, handler }` entries where patterns like `/links/:slug/stats` bind named parameters. Keep every route's behaviour exactly the same — no test should need to change. No new dependencies."
+    },
+    {
+      "code": "api-docs",
+      "type": "document",
+      "goal": "Document the HTTP API with runnable examples",
+      "prompt": "Write docs/api.md describing every route: method and path, request body, the responses it can give (with status codes) and a curl example for each that works against `bun run start`. Link it from the README's \"What it does\" section. Check each example by running it."
+    },
+    {
+      "code": "spike-accounts",
+      "type": "spike",
+      "goal": "How would we add user accounts?",
+      "prompt": "Today every link is public and anyone can delete any link. Investigate what it would take to give links owners: sign-in options that fit a Bun + SQLite app with no dependencies, how ownership would change the schema, what the delete and stats routes would check, and how existing links would be migrated.\n\nDeliver docs/spikes/accounts.md with a recommendation and the two alternatives you rejected, each with a reason. No code changes."
+    },
+    {
+      "code": "stats-chart",
+      "type": "feature",
+      "goal": "Show a clicks-per-day chart on a link's stats page",
+      "prompt": "The stats page (`/links/<slug>/stats` in a browser) only shows a total. Add a small bar chart of clicks per day for the last 14 days, drawn as inline SVG — no chart library. Days with no clicks show as empty bars.\n\nStart the app with `bun run dev` so the reviewer can open it: the project's lazy.toml publishes port 3000 as the `web` service. Add a store-level test for the per-day counts."
+    },
+    {
+      "code": "paginate-home",
+      "type": "feature",
+      "goal": "Page through links on the home page",
+      "prompt": "The home page shows only the newest 20 links. Add \"Newer\" and \"Older\" links under the table, driven by a `?page=N` query parameter, using the same paging the `GET /links` JSON route already has. Hide \"Older\" on the last page and \"Newer\" on the first. Cover the page boundaries with tests, including a store with exactly 20 and exactly 40 links."
+    },
+    {
+      "code": "link-titles",
+      "type": "feature",
+      "goal": "Give links an optional title shown on the home page",
+      "prompt": "Let `POST /links` and the home page form take an optional `title` (up to 100 characters). Show it on the home page instead of the raw URL when present, with the URL beneath it in smaller text.\n\nAdd `title TEXT` as the last column of the `links` table definition in src/schema.sql (after `created_at`), not as a separate `ALTER TABLE`. The project protects that file, so editing its existing lines is held for a human decision: explain the schema change in your summary, including what happens to a database created before it."
+    }
+  ]
+}

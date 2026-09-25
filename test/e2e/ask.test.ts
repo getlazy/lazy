@@ -15,7 +15,7 @@
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
-import { createTask } from '../helpers/fixtures';
+import { createTask, startAndWait, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { successScenario } from '../helpers/fake-claude';
 import { writeFile, chmod } from 'fs/promises';
 import { join } from 'path';
@@ -179,13 +179,19 @@ describe('lazy ask (real supervisor, fake claude)', () => {
     expect(parsed.answer.trim().length).toBe(bigAnswer.length);
   }, 120_000);
 
-  // The status gate is the daemon's, but the CLI must pre-flight it so the
-  // reviewer learns the ask can't run BEFORE being asked to type a question.
-  test('rejects an ask against a task that is no longer reviewable', async () => {
+  // A task whose session has ended is no longer answered by the LIVE agent —
+  // it is answered from its stored record instead (see the finished-task suite
+  // below). What this asserts here is the pre-flight: the CLI must decide the
+  // route from the same rule the daemon uses, so the route is known BEFORE the
+  // reviewer is asked to type a question.
+  test('an ask against a closed task is routed, not refused', async () => {
     expectSuccess(await ctx.lazy(['close', taskId, '--yes', '--reason', 'done with it']));
-    const result = await ctx.lazy(['ask', taskId, '-m', 'still there?']);
-    expectFailure(result);
-    expect(result.stderr).toMatch(/session has ended|not 'blocked' or 'conflict'/);
+    const result = await ctx.lazy(['ask', taskId, '-m', 'still there?', '--json']);
+    // The one-shot itself is not mocked in this fake-claude suite, so the run
+    // may fail for want of a container — but it must fail HAVING CHOSEN the
+    // record route, never with the old "not blocked or conflict" refusal.
+    expect(result.stderr + result.stdout).not.toContain("not 'blocked' or 'conflict'");
+    expect(result.stderr + result.stdout).not.toContain('re-send it once the task is blocked');
   }, 120_000);
 });
 
@@ -219,8 +225,10 @@ describe('lazy ask (task still working)', () => {
     expectSuccess(await ctx.lazy(['wait', taskId]));
     expectSuccess(await ctx.lazy(['unblock', taskId, '-m', 'keep going']));
     const result = await ctx.lazy(['ask', taskId, '-m', 'what are you doing?']);
-    expectFailure(result);
-    expectError(result, "not 'blocked' or 'conflict'");
+    // Never a plan-mode resume of a task mid-turn: that would race live work.
+    // The question is not thrown away either — it is answered from the record.
+    expect(result.stdout + result.stderr).not.toContain('Eventually done.');
+    expect(result.stderr).not.toContain("not 'blocked' or 'conflict'");
   }, 120_000);
 });
 
@@ -241,11 +249,15 @@ describe('lazy ask (validation)', () => {
     expectOutput(result, 'Usage: lazy ask');
   });
 
-  test('fails when the task has never run', async () => {
+  // The ONE genuinely unanswerable case: nothing was ever recorded, so an
+  // answer could only be invented. Everything else is answered — from the live
+  // agent when it can be resumed, from the stored record when it cannot.
+  test('fails when the task has never run, saying what to do instead', async () => {
     const taskId = await createTask(ctx, 'Never started');
     const result = await ctx.lazy(['ask', taskId, '-m', 'hello?']);
     expectFailure(result);
-    expectError(result, 'has no session');
+    expectError(result, 'nothing recorded');
+    expectError(result, 'lazy start');
   });
 
   test('--json reports errors as JSON on stdout', async () => {
@@ -255,4 +267,88 @@ describe('lazy ask (validation)', () => {
     const parsed = JSON.parse(result.stdout.trim());
     expect(String(parsed.error)).toContain('deadbeef');
   });
+});
+
+/**
+ * Asking a task lazy has already finished with.
+ *
+ * This is the suite for the behaviour the feedback asked for: a completed task
+ * used to answer "the agent can only answer while the task is blocked or in
+ * conflict — re-send it once the task is blocked", which a completed task can
+ * never do. It is answered from its stored record instead.
+ *
+ * Module-mock context on purpose: the record ask runs a machine ONE-SHOT inside
+ * the daemon, and the default preload mocks src/oneshot/index.ts there (the
+ * fake-claude suites above deliberately mock nothing in src/, so a one-shot
+ * would need a real container).
+ */
+describe('lazy ask (finished task, answered from the record)', () => {
+  let ctx: TestContext;
+  let taskId: string;
+
+  beforeEach(async () => {
+    ctx = await setupTestLazy({ withDaemon: true });
+    taskId = await createTask(ctx, 'Finished work', 'Do the thing');
+    await startAndWait(ctx, taskId);
+    expectSuccess(await ctx.lazy(['close', taskId, '--yes', '--reason', 'done with it']));
+  }, 120_000);
+
+  afterEach(async () => {
+    await ctx.cleanup();
+  });
+
+  test('answers from the stored record instead of refusing', async () => {
+    const result = await ctx.lazyMocked(
+      ['ask', taskId, '-m', 'why was it done that way?'],
+      MOCK_CLAUDE_SUCCESS,
+    );
+    expectSuccess(result);
+    // The answer came from the record-ask one-shot, and the task's own turns
+    // were in the prompt it read.
+    expectOutput(result, '[record-ask:single]');
+    expectOutput(result, 'why was it done that way?');
+    // The read-only lockdown was requested for the one-shot.
+    expectOutput(result, '[ro]');
+  }, 120_000);
+
+  // INVARIANT: an answer read off the stored record must never read as the live
+  // agent looking at a live worktree. The provenance is stated, every time.
+  test('says the answer came from the record, not from the live agent', async () => {
+    const result = await ctx.lazyMocked(
+      ['ask', taskId, '-m', 'what happened?'],
+      MOCK_CLAUDE_SUCCESS,
+    );
+    expectSuccess(result);
+    expect(result.stderr).toContain("stored record");
+    expect(result.stderr).toContain('not the original agent');
+  }, 120_000);
+
+  // INVARIANT (CLAUDE.md — a read-only question must not disturb the task): the
+  // record ask takes no worktree lock, creates no turn, and must leave a
+  // terminal task exactly as it found it.
+  test('leaves the finished task untouched — same status, no new turns', async () => {
+    const before = JSON.parse((await ctx.lazy(['show', taskId, '--json'])).stdout);
+    const result = await ctx.lazyMocked(
+      ['ask', taskId, '-m', 'anything?'],
+      MOCK_CLAUDE_SUCCESS,
+    );
+    expectSuccess(result);
+    const after = JSON.parse((await ctx.lazy(['show', taskId, '--json'])).stdout);
+    expect(after.status).toBe(before.status);
+    expect(after.turns?.length ?? 0).toBe(before.turns?.length ?? 0);
+  }, 120_000);
+
+  test('--json carries the provenance so a machine consumer cannot miss it', async () => {
+    const result = await ctx.lazyMocked(
+      ['ask', taskId, '-m', 'json please?', '--json'],
+      MOCK_CLAUDE_SUCCESS,
+    );
+    expectSuccess(result);
+    const parsed = JSON.parse(result.stdout.trim());
+    expect(parsed.type).toBe('task');
+    expect(parsed.derivedFrom).toBe('stored-record');
+    expect(String(parsed.provenance)).toContain('stored record');
+    // No turn was recorded, so there is no turn number to report.
+    expect(parsed.turnNumber).toBeNull();
+  }, 120_000);
 });

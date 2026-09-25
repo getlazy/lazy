@@ -26,9 +26,10 @@
  *   stays locked in `pairing` until the human exits the session.
  */
 
-import { theme } from '../theme';
+import { theme } from '../../render/theme';
+import { displayId } from '../../task/identity';
 import { isTTY, promptYesNo } from '../editor';
-import { displayId, tryRemoteStorage } from '../helpers';
+import { tryRemoteStorage } from '../../preconditions';
 import { checkDaemonHealth } from '../../daemon';
 import { RpcApplicationError } from '../../daemon/client';
 import { createRunnerFromType } from '../../runner';

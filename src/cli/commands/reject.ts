@@ -1,10 +1,13 @@
+import { requireActorIdentity } from '../identity-preflight';
 import { existsSync } from 'fs';
-import { requireLazyRoot, requireStorage, shortId, displayId, displayIdFor, parseFlags, resolveTaskOrExit, rejectIfPairing, getWorktreePath } from '../helpers';
+import { shortId, displayId, displayIdFor, getWorktreePath } from '../../task/identity';
+import { requireLazyRoot, requireStorage, parseFlags, resolveTaskOrExit, rejectIfPairing } from '../helpers';
 import { promptYesNo, openEditor, removeRecoveryFile, requireTTY, readStdinIfPiped } from '../editor';
 import { hasUncommittedChanges } from '../../git/operations';
 import { queryRejectTask } from '../../daemon/rpc-fallback';
 
-import { theme } from '../theme';
+import { theme } from '../../render/theme';
+import { createPhaseDisplay } from '../phase-display';
 
 export async function commandReject(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [
@@ -27,6 +30,9 @@ export async function commandReject(args: string[]): Promise<void> {
   // feedback only to have it discarded by a validation failure.
   let taskDisplayId = taskId;
   {
+    // Among them: can the daemon attribute this rejection at all? Asked here so
+    // a refusal costs nothing but a retry.
+    await requireActorIdentity();
     const root = requireLazyRoot();
     const storage = await requireStorage();
     try {
@@ -126,11 +132,17 @@ export async function commandReject(args: string[]): Promise<void> {
   }
 
   try {
-    const result = await queryRejectTask({
-      taskId,
-      reason: reason.trim(),
-      acceptDirtyWorktree,
-    });
+    const display = createPhaseDisplay();
+    let result;
+    try {
+      result = await queryRejectTask({
+        taskId,
+        reason: reason.trim(),
+        acceptDirtyWorktree,
+      }, display);
+    } finally {
+      display.close();
+    }
 
     if (reasonRecoveryPath) removeRecoveryFile(reasonRecoveryPath);
 

@@ -24,6 +24,7 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 
 /**
  * Resolve the tasks directory for the test project. Test projects init with
@@ -201,6 +202,9 @@ describe('accept with working parent', () => {
     //    works normally when parent is blocked — no guard should fire.)
     const parentWorktree = join(ctx.root, '.lazy', 'worktrees', parentId);
     ctx.git('worktree', 'remove', '--force', parentWorktree);
+
+    // Fixture setup, not the subject (see test/helpers/final.ts).
+    await seedFinal(ctx, childId);
 
     // 5. Parent is in 'blocked' state (default after mock completes) — accept
     //    should work (no working-parent guard fires). The success message is

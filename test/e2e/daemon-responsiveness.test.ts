@@ -62,7 +62,7 @@ describe('daemon responsiveness under a long operation', () => {
   let ctx: TestContext;
   let daemon: RunningDaemon;
   let tmpDir: string;
-  let socketPath: string;
+  let daemonUrl: string;
   let client: DaemonClient;
   let shortTaskId: string;
 
@@ -70,18 +70,17 @@ describe('daemon responsiveness under a long operation', () => {
     ctx = await setupTestLazy();
     shortTaskId = await createTaskBeforeDaemon(ctx, 'Long operation task');
     tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-responsive-'));
-    socketPath = join(tmpDir, 'test.sock');
     // A long reconcile interval keeps the reconciler from transitioning the
     // hand-made 'working' task to 'interrupted' and cutting the long-poll short.
     // The loop's first tick still fires ~1s after start, before the task is set
     // to 'working' below, so nothing is left un-reconciled by accident.
     daemon = await startDaemonServer({
-      socketPath,
       token: TOKEN,
       projectRoot: ctx.root,
       reconcileIntervalSeconds: 600,
     });
-    client = DaemonClient.fromTarget(socketPath, TOKEN);
+    daemonUrl = `http://127.0.0.1:${daemon.webPort}`;
+    client = DaemonClient.fromTarget(daemonUrl, TOKEN);
   });
 
   afterEach(async () => {
@@ -130,9 +129,8 @@ describe('daemon responsiveness under a long operation', () => {
 
     // Raw fetch so the wire format itself is observable, rather than trusting
     // the client's unwrapping.
-    const response = await fetch(`http://localhost/rpc/wait`, {
+    const response = await fetch(`${daemonUrl}/rpc/wait`, {
       method: 'POST',
-      unix: socketPath,
       headers: {
         'Authorization': `Bearer ${TOKEN}`,
         'Content-Type': 'application/json',
@@ -198,9 +196,8 @@ describe('daemon responsiveness under a long operation', () => {
   // client that cannot parse NDJSON; a daemon upgrade underneath them must not
   // break their RPCs. A request without the header gets plain JSON.
   test('a request without the heartbeat header still gets plain JSON', async () => {
-    const response = await fetch('http://localhost/rpc/list', {
+    const response = await fetch(`${daemonUrl}/rpc/list`, {
       method: 'POST',
-      unix: socketPath,
       headers: {
         'Authorization': `Bearer ${TOKEN}`,
         'Content-Type': 'application/json',

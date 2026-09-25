@@ -1,15 +1,23 @@
-import { requireStorage, shortId, displayId, formatDate, parseFlags, resolveTaskOrExit } from '../helpers';
+import { requireStorage, parseFlags, resolveTaskOrExit } from '../helpers';
+import { requireActorIdentity } from '../identity-preflight';
+import { formatDate } from '../../utils/format';
+import { shortId, displayId } from '../../task/identity';
 import { openEditor, removeRecoveryFile, readStdinIfPiped } from '../editor';
 import { sanitizeUserText } from '../../utils/sanitize-text';
 import { getActor } from '../../constants';
+import { attributionLabel } from '../../actor-ref';
 
 /**
  * `lazy journal <task>` — read or append to a task's journal.
  *
- * The journal is an append-only, prompt-immune side channel for orchestration
+ * The journal is an append-only, pull-based side channel for orchestration
  * metadata, decision rationale, and cross-run memories. Unlike `lazy comment`,
- * a journal entry is NEVER delivered to the agent — so this command deliberately
- * does NOT emit any daemon signal or trigger auto-react. It only persists.
+ * a journal entry is never DELIVERED to the agent: its text is never injected
+ * into a prompt, and writing one must never start a turn — so this command
+ * deliberately does NOT emit any daemon signal or trigger auto-react. It only
+ * persists. If the task's agent takes another turn later, that prompt carries a
+ * one-line count of entries new since its last turn (see `buildJournalNotice`);
+ * the agent reads the entries on demand or not at all.
  *
  * Modes:
  *   - `--message "..."`            append inline
@@ -28,6 +36,10 @@ export async function commandJournal(args: string[]): Promise<void> {
     journalUsage();
     process.exit(1);
   }
+
+  // Before the journal entry is typed: the daemon refuses a write it cannot
+  // attribute, and a refusal must never cost the human what they wrote.
+  await requireActorIdentity();
 
   const storage = await requireStorage();
   try {
@@ -80,7 +92,10 @@ export async function commandJournal(args: string[]): Promise<void> {
       }
       console.log(`Journal for task ${displayId(task)} (${entries.length}):\n`);
       for (const entry of entries) {
-        const who = entry.actor ? ` (${entry.actor})` : '';
+        const person = attributionLabel(null, entry.actor_email, entry.actor_name);
+        const who = entry.actor
+          ? ` (${entry.actor}${person ? `, ${person}` : ''})`
+          : person ? ` (${person})` : '';
         console.log(`[${formatDate(entry.created_at)}]${who}`);
         for (const line of entry.content.split('\n')) {
           console.log(`  ${line}`);
@@ -115,7 +130,8 @@ export async function commandJournal(args: string[]): Promise<void> {
 export function journalUsage(): void {
   console.log(`Usage: lazy journal <task_id> [-m|--message "..."] [--add]
 
-Read or append to a task's journal — an append-only, prompt-immune side channel.
+Read or append to a task's journal — an append-only side channel that never
+triggers a turn and whose text is never injected into an agent prompt.
 
 Arguments:
   <task_id>    ID of the task (can be shortened)
@@ -131,6 +147,9 @@ The journal is for orchestration metadata and memories that should NOT reach
 the agent's prompt — decisions and their rationale, things deferred for later,
 cross-run notes. Unlike comments, journal entries are never delivered to the
 agent as guidance; they are for the human and for future runs.
+
+Entries are markdown — headings, lists and code fences render on the task page
+in the web UI, and multi-paragraph entries are normal.
 
 Examples:
   lazy journal abc12345                                   # Read entries

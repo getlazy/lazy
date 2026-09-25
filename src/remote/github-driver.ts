@@ -47,20 +47,24 @@ import type {
   ImportResult,
   CIJobFailure,
   AcceptGateWarning,
+  MarkReadyOptions,
+  OpenReview,
 } from './driver';
 import { truncateMRTitle } from './driver';
 import type { Task } from '../types';
 import { targetBranchOf } from '../task-target';
 import type { ResolvedConfig } from '../config/types';
 import { logger } from '../utils/logger';
+import { reportFetchFailure, clearFetchFailure } from './fetch-failure';
+import { getBranchName, getWorktreePath } from '../task/identity';
 import { looksLikeTaskBranch } from '../git/branch-prefix';
-import { getBranchName, getWorktreePath } from '../cli/helpers';
 import { runGit as defaultRunGit, fastForwardLocal as sharedFastForwardLocal, findWorktreeForBranch, tryFastForwardInWorktree, type GitResult } from '../utils/git';
 import { spawn, spawnSyncUnsupervised } from '../utils/spawn';
 import { truncateLog } from '../utils/log-truncate';
 import { withRemoteRetry, type RetryOptions } from '../utils/retry';
 import { applyFidelitySection, composeInitialBody } from '../synthesis/fidelity';
 import { remoteUrlHasHost, remoteUrlHost, remoteUrlHostContains, remoteUrlPath } from './remote-url';
+import { parsePaginatedApiJson } from './paginated-json';
 
 export interface GhResult {
   stdout: string;
@@ -342,8 +346,12 @@ export class GitHubDriver implements RepositoryDriver {
     return true;
   }
 
+  upstreamRefName(parentBranch: string): string {
+    return `${this.remoteName}/${parentBranch}`;
+  }
+
   async resolveUpstreamRef(parentBranch: string, worktreePath: string): Promise<string> {
-    const remoteRef = `${this.remoteName}/${parentBranch}`;
+    const remoteRef = this.upstreamRefName(parentBranch);
     await withRemoteRetry(
       async () => {
         const fetchResult = await this.git(['fetch', this.remoteName, parentBranch], worktreePath);
@@ -387,7 +395,7 @@ export class GitHubDriver implements RepositoryDriver {
     return { metadata: {} };
   }
 
-  async markReadyForReview(task: Task): Promise<{ metadata?: Record<string, string> }> {
+  async markReadyForReview(task: Task, opts?: MarkReadyOptions): Promise<{ metadata?: Record<string, string> }> {
     const existingPrNumber = this.prNumber(task);
 
     if (existingPrNumber) {
@@ -428,7 +436,9 @@ export class GitHubDriver implements RepositoryDriver {
 
     // No PR yet — create one (non-draft, since we're marking ready)
     const branchName = getBranchName(task);
-    const targetBranch = await this.targetBranch(task);
+    // An explicit base is an explicit human submit into an intermediate branch
+    // (see RepositoryDriver.markReadyForReview); everything else derives it.
+    const targetBranch = opts?.baseBranch ?? await this.targetBranch(task);
 
     // Guard against empty targetBranch — the ?? operator doesn't catch empty strings
     if (!targetBranch || targetBranch.trim() === '') {
@@ -493,6 +503,15 @@ export class GitHubDriver implements RepositoryDriver {
     if (await this.isBranchMerged(sourceBranch, targetBranch, root)) {
       logger.info('Branch is already merged into target — nothing to do.');
       return { status: 'merged' };
+    }
+
+    // Resume of a dead accept: the forge SQUASH-merges, so the branch is never
+    // an ancestor of the target and the check above cannot see a merge that
+    // already landed. Ask the trees instead — and never open a replacement
+    // PR/MR for work that is already on the target.
+    if (opts.resume && await this.changesAlreadyOnRemoteTarget(sourceBranch, targetBranch, root)) {
+      logger.info('Resume: the branch\'s changes are already on the remote target — nothing to merge.');
+      return { status: 'merged', alreadyLanded: true };
     }
 
     // Step 1: Push latest commits
@@ -883,102 +902,52 @@ export class GitHubDriver implements RepositoryDriver {
     }
   }
 
-  async postAcceptReview(task: Task, reason: string): Promise<string | null> {
+  async approveForMerge(task: Task, reason: string): Promise<string | null> {
     const prNumber = this.prNumber(task);
     if (!prNumber) {
-      logger.debug('postAcceptReview: no PR number in task metadata, skipping');
+      logger.debug('approveForMerge: no PR number in task metadata, skipping');
       return null;
     }
 
-    // Step 1: Try submitting an approving PR review via the GitHub API
+    // Step 1: Try submitting an approving PR review via the GitHub API.
+    //
+    // SECURITY: the body goes through `--raw-field`, never `--field`. `gh`
+    // treats a `--field` value starting with `@` as "read this FILE and send
+    // its contents" (and coerces `true`/`false`/numbers besides). `reason` is
+    // the accept reason a human or the builder typed, so under `auto_approve`
+    // an accept reason of `@~/.claude/.credentials.json` would publish that
+    // file into a public PR review. `--raw-field` sends the value literally.
+    // The deleted review-posting code did exactly this, for exactly this
+    // reason; `event` stays typed because it is a hardcoded constant here.
     const reviewResult = await this.ghApi([
       `repos/{owner}/{repo}/pulls/${prNumber}/reviews`,
       '--method', 'POST',
-      '--field', `body=${reason}`,
+      '--raw-field', `body=${reason}`,
       '--field', 'event=APPROVE',
     ]);
 
     if (reviewResult.exitCode === 0) {
-      logger.debug(`postAcceptReview: posted approving review to PR #${prNumber}`);
+      logger.debug(`approveForMerge: posted approving review to PR #${prNumber}`);
       return null;
     }
 
-    // Step 2: APPROVE failed — check if it's a 422 (self-approval not allowed)
-    const is422 = reviewResult.stderr.includes('422') ||
-                  reviewResult.stderr.includes('Unprocessable Entity');
-
-    if (is422) {
-      // Self-approval is expected to fail — log at debug level only
-      logger.debug(`postAcceptReview: self-approval not allowed for PR #${prNumber} (expected), falling back to comment`);
-    } else {
-      // Other errors (auth, network, etc.) should be visible
-      logger.warn(`postAcceptReview: approving review failed for PR #${prNumber}: ${reviewResult.stderr}`);
-    }
-
-    // Fall back to a regular comment
-    const commentBody = `[Lazy Accept] ${reason}`;
-    const commentResult = await this.gh([
-      'pr', 'comment', prNumber, '--body', commentBody,
-    ]);
-
-    if (commentResult.exitCode === 0) {
-      logger.debug(`postAcceptReview: posted accept comment to PR #${prNumber} (review fallback)`);
+    // Step 2: APPROVE failed. There is deliberately NO comment fallback: a
+    // comment is not an approval, so it would not unblock the merge, and
+    // lazy no longer writes comments to a PR at all (engineer decision,
+    // 2026-09-21). Report the failure to the caller instead.
+    //
+    // A refusal lazy expected is debug + null, never a warning — see
+    // isExpectedApprovalRefusal below. GitLabDriver.approveForMerge has the
+    // same two branches in the same order; the strings differ, the shape
+    // must not.
+    if (isExpectedApprovalRefusal(reviewResult.stderr)) {
+      logger.debug(`approveForMerge: self-approval not allowed for PR #${prNumber} (expected)`);
       return null;
     }
 
-    // Both review and comment failed — return warning for the caller to display
-    const warning = `Could not post accept review to PR #${prNumber}: ${reviewResult.stderr}`;
-    logger.warn(`postAcceptReview: comment fallback also failed for PR #${prNumber}: ${commentResult.stderr}`);
-    return warning;
-  }
-
-  async postRejectReview(task: Task, reason: string): Promise<string | null> {
-    const prNumber = this.prNumber(task);
-    if (!prNumber) {
-      logger.debug('postRejectReview: no PR number in task metadata, skipping');
-      return null;
-    }
-
-    // Step 1: Try submitting a REQUEST_CHANGES PR review via the GitHub API
-    const reviewResult = await this.ghApi([
-      `repos/{owner}/{repo}/pulls/${prNumber}/reviews`,
-      '--method', 'POST',
-      '--field', `body=${reason}`,
-      '--field', 'event=REQUEST_CHANGES',
-    ]);
-
-    if (reviewResult.exitCode === 0) {
-      logger.debug(`postRejectReview: posted requesting-changes review to PR #${prNumber}`);
-      return null;
-    }
-
-    // Step 2: REQUEST_CHANGES failed — check if it's a 422 (self-review not allowed)
-    const is422 = reviewResult.stderr.includes('422') ||
-                  reviewResult.stderr.includes('Unprocessable Entity');
-
-    if (is422) {
-      // Self-review is expected to fail — log at debug level only
-      logger.debug(`postRejectReview: self-review not allowed for PR #${prNumber} (expected), falling back to comment`);
-    } else {
-      // Other errors (auth, network, etc.) should be visible
-      logger.warn(`postRejectReview: requesting-changes review failed for PR #${prNumber}: ${reviewResult.stderr}`);
-    }
-
-    // Fall back to a regular comment
-    const commentBody = `[Lazy Reject] ${reason}`;
-    const commentResult = await this.gh([
-      'pr', 'comment', prNumber, '--body', commentBody,
-    ]);
-
-    if (commentResult.exitCode === 0) {
-      logger.debug(`postRejectReview: posted reject comment to PR #${prNumber} (review fallback)`);
-      return null;
-    }
-
-    // Both review and comment failed — return warning for the caller to display
-    const warning = `Could not post reject review to PR #${prNumber}: ${reviewResult.stderr}`;
-    logger.warn(`postRejectReview: comment fallback also failed for PR #${prNumber}: ${commentResult.stderr}`);
-    return warning;
+    // Anything else — auth, network, a missing PR, a broken token — is real.
+    logger.warn(`approveForMerge: approving review failed for PR #${prNumber}: ${reviewResult.stderr}`);
+    return `Could not approve PR #${prNumber}: ${reviewResult.stderr}`;
   }
 
   async cleanup(branch: string): Promise<void> {
@@ -996,7 +965,7 @@ export class GitHubDriver implements RepositoryDriver {
     // Do NOT delete remote branch (user preference — GitHub soft-deletes anyway)
   }
 
-  async syncComments(task: Task, since: string): Promise<RemoteComment[]> {
+  async syncComments(task: Task, since?: string): Promise<RemoteComment[]> {
     const taskLabel = task.code ?? task.id.substring(0, 8);
     const prNumber = this.prNumber(task);
     if (!prNumber) {
@@ -1031,6 +1000,8 @@ export class GitHubDriver implements RepositoryDriver {
         }
         const user = c.user as Record<string, unknown> | undefined;
         comments.push({
+          forge: 'github',
+          kind: 'issue_comment',
           id: String(c.id),
           body,
           author: (user?.login as string) ?? 'unknown',
@@ -1056,6 +1027,8 @@ export class GitHubDriver implements RepositoryDriver {
         }
         const user = c.user as Record<string, unknown> | undefined;
         comments.push({
+          forge: 'github',
+          kind: 'line_comment',
           id: String(c.id),
           body,
           author: (user?.login as string) ?? 'unknown',
@@ -1068,15 +1041,53 @@ export class GitHubDriver implements RepositoryDriver {
       logger.warn(`syncComments [${taskLabel}]: failed to fetch review comments: ${err instanceof Error ? err.message : err}`);
     }
 
+    // Fetch PR review BODIES — the summary a reviewer submits with a review
+    // (e.g. a bot's "Pull request overview"). They live on their own endpoint
+    // and are in neither comment list above. Review ids come from a different
+    // table than comment ids; the `review_body` kind keeps them from ever
+    // colliding with a comment id.
+    try {
+      const reviews = await this.fetchPaginatedComments(
+        `repos/{owner}/{repo}/pulls/${prNumber}/reviews`,
+        since,
+        'submitted_at',
+      );
+      for (const r of reviews) {
+        const body = (r.body as string) ?? '';
+        // A review with no summary (only line comments, or a bare approval)
+        // carries nothing to import; its line comments arrive above.
+        if (!body.trim()) continue;
+        // A PENDING review is the viewer's own unsubmitted draft: nobody else
+        // can see it yet, and it has no submitted_at.
+        if (r.state === 'PENDING') continue;
+        if (body.includes('<!-- lazy:')) {
+          logger.debug(`syncComments [${taskLabel}]: skipping own review (id: ${r.id})`);
+          continue;
+        }
+        const user = r.user as Record<string, unknown> | undefined;
+        comments.push({
+          forge: 'github',
+          kind: 'review_body',
+          id: String(r.id),
+          body,
+          author: (user?.login as string) ?? 'unknown',
+          createdAt: (r.submitted_at as string) ?? '',
+        });
+      }
+    } catch (err) {
+      logger.warn(`syncComments [${taskLabel}]: failed to fetch reviews: ${err instanceof Error ? err.message : err}`);
+    }
+
     // Filter out comments posted by lazy itself (identified by hidden markers).
-    // This prevents lazy from re-ingesting its own turn summaries, review feedback,
-    // and notes as external PR comments.
+    // Per-turn mirroring is gone, but older threads may still carry lazy's own
+    // marker-bearing turn/review/note comments — and lazy's review reports use
+    // the same marker. Never re-ingest them as external PR comments.
     const externalComments = comments.filter(c => !c.body.startsWith('<!-- lazy:'));
 
     // Sort by creation time (oldest first)
     externalComments.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 
-    logger.debug(`syncComments [${taskLabel}]: fetched ${comments.length} comments since ${since}, ${externalComments.length} external (filtered ${comments.length - externalComments.length} lazy-posted)`);
+    logger.debug(`syncComments [${taskLabel}]: fetched ${comments.length} comments since ${since ?? 'the beginning'}, ${externalComments.length} external (filtered ${comments.length - externalComments.length} lazy-posted)`);
     return externalComments;
   }
 
@@ -1100,25 +1111,6 @@ export class GitHubDriver implements RepositoryDriver {
     } catch {
       logger.debug(`getPRState: failed to parse response for PR #${prNumber}`);
       return null;
-    }
-  }
-
-  async postTurnSummary(task: Task, content: string): Promise<void> {
-    const prNumber = this.prNumber(task);
-    if (!prNumber) {
-      logger.debug('postTurnSummary: no PR number in task metadata, skipping');
-      return;
-    }
-
-    // Prepend hidden HTML marker to identify this comment as lazy's own output.
-    // The marker is invisible in GitHub's rendered view but detectable by syncComments.
-    const markedContent = '<!-- lazy:turn -->\n' + content;
-
-    const result = await this.gh(['pr', 'comment', prNumber, '--body', markedContent]);
-    if (result.exitCode !== 0) {
-      logger.warn(`postTurnSummary: failed to post comment to PR #${prNumber}: ${result.stderr}`);
-    } else {
-      logger.debug(`postTurnSummary: posted turn summary to PR #${prNumber}`);
     }
   }
 
@@ -1282,42 +1274,126 @@ export class GitHubDriver implements RepositoryDriver {
       throw new Error(`PR #${prNumber} has no head branch`);
     }
 
-    // Fetch PR comments for import as notes
-    const comments: string[] = [];
-    const commentsResult = await this.gh([
-      'pr', 'view', prNumber,
-      '--json', 'comments',
-    ]);
-    if (commentsResult.exitCode === 0) {
-      try {
-        const commentsData = JSON.parse(commentsResult.stdout);
-        const prComments = commentsData.comments as Array<Record<string, unknown>> | undefined;
-        if (prComments) {
-          for (const c of prComments) {
-            const author = (c.author as Record<string, unknown>)?.login as string ?? 'unknown';
-            const body = (c.body as string) ?? '';
-            if (body.trim()) {
-              comments.push(`[${author}] ${body}`);
-            }
-          }
-        }
-      } catch {
-        // Non-fatal: continue without comments
-        logger.debug(`Failed to parse comments for PR #${prNumber}`);
-      }
+    // Fetch PR conversation comments for import as notes — through the SAME
+    // REST endpoint syncComments reads, so a link-imported comment carries the
+    // id every later sync pass dedups against. (`gh pr view --json comments`
+    // answers with GraphQL node ids, which no sync pass can match.)
+    const comments: RemoteComment[] = [];
+    for (const c of await this.fetchPaginatedComments(`repos/{owner}/{repo}/issues/${prNumber}/comments`, undefined)) {
+      const body = (c.body as string) ?? '';
+      if (!body.trim()) continue;
+      const user = c.user as Record<string, unknown> | undefined;
+      comments.push({
+        forge: 'github',
+        kind: 'issue_comment',
+        id: String(c.id),
+        body,
+        author: (user?.login as string) ?? 'unknown',
+        createdAt: (c.created_at as string) ?? '',
+      });
     }
 
     return {
       goal: title,
+      description: typeof prData.body === 'string' ? prData.body : undefined,
       branch,
       metadata: {
         github_remote_ref_url: prUrl,
         github_remote_ref_id: prNum,
         github_remote_ref_state: state,
         import_source_url: url,
+        import_source_branch: branch,
       },
       comments,
     };
+  }
+
+  /**
+   * Open PR for this git branch, if any. Skips CLOSED/MERGED so a stale PR
+   * cannot auto-complete a freshly linked task. Uses the real branch name —
+   * never `lazy/<task-ref>`.
+   */
+  async findPullRequestForBranch(branch: string): Promise<ImportResult | null> {
+    const existing = await this.findExistingPR(branch);
+    if (!existing) return null;
+    return this.importUrl(existing.url, {});
+  }
+
+  async findOpenReviewForBranch(branch: string): Promise<OpenReview | null> {
+    const args = ['pr', 'view', branch, '--json', 'url,number,state,baseRefName'];
+    const repoIdentifier = await this.getRepoIdentifier();
+    if (repoIdentifier) args.push('--repo', repoIdentifier);
+    const result = await this.gh(args);
+    if (result.exitCode !== 0) {
+      // `gh pr view <branch>` exits 1 with this message when the branch has no
+      // PR at all. Anything else (auth, network) is a failure to ask, and must
+      // not read as "no PR" — submit would then try to open a second one.
+      if (/no pull requests? found/i.test(result.stderr)) return null;
+      throw new Error(`gh pr view ${branch} failed (exit ${result.exitCode}): ${result.stderr.trim()}`);
+    }
+    let data: { url?: string; number?: number; state?: string; baseRefName?: string };
+    try {
+      data = JSON.parse(result.stdout);
+    } catch (err) {
+      throw new Error(`gh pr view ${branch} returned unparseable JSON: ${err instanceof Error ? err.message : err}`);
+    }
+    if (data.state !== 'OPEN' || !data.url || data.number === undefined) return null;
+    return {
+      url: data.url,
+      baseBranch: data.baseRefName ?? '',
+      metadata: {
+        github_remote_ref_url: data.url,
+        github_remote_ref_id: String(data.number),
+      },
+    };
+  }
+
+  async getReviewBase(task: Task): Promise<string | null> {
+    const number = this.prNumber(task);
+    if (!number) return null;
+    const args = ['pr', 'view', number, '--json', 'baseRefName'];
+    const repoIdentifier = await this.getRepoIdentifier();
+    if (repoIdentifier) args.push('--repo', repoIdentifier);
+    const result = await this.gh(args);
+    if (result.exitCode !== 0) {
+      throw new Error(`gh pr view ${number} failed (exit ${result.exitCode}): ${result.stderr.trim()}`);
+    }
+    try {
+      const base = (JSON.parse(result.stdout) as { baseRefName?: string }).baseRefName;
+      if (!base) throw new Error('no baseRefName in the reply');
+      return base;
+    } catch (err) {
+      throw new Error(`gh pr view ${number} returned no usable base: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  async retargetReview(task: Task, base: string): Promise<void> {
+    const number = this.prNumber(task);
+    if (!number) throw new Error(`Task ${task.id} records no PR to retarget.`);
+    const args = ['pr', 'edit', number, '--base', base];
+    const repoIdentifier = await this.getRepoIdentifier();
+    if (repoIdentifier) args.push('--repo', repoIdentifier);
+    const result = await this.gh(args);
+    if (result.exitCode !== 0) {
+      throw new Error(`gh pr edit ${number} --base ${base} failed (exit ${result.exitCode}): ${result.stderr.trim()}`);
+    }
+    logger.info(`Retargeted PR #${number} onto ${base}`);
+  }
+
+  async remoteBranchHead(branch: string): Promise<string | null> {
+    return await withRemoteRetry(
+      async () => {
+        const result = await this.git(['ls-remote', '--exit-code', '--heads', this.remoteName, `refs/heads/${branch}`]);
+        // --exit-code: 2 means the remote answered and has no such ref.
+        if (result.exitCode === 2) return null;
+        if (result.exitCode !== 0) {
+          throw new Error(`git ls-remote ${this.remoteName} ${branch} failed: ${result.stderr.trim()}`);
+        }
+        return result.stdout.trim().split(/\s+/)[0] || null;
+      },
+      `look up ${branch} on ${this.remoteName}`,
+      this.retryOpts,
+    );
   }
 
   // --- Private helpers ---
@@ -1553,7 +1629,22 @@ export class GitHubDriver implements RepositoryDriver {
     );
   }
 
-  /** Check if sourceBranch is already fully merged into targetBranch via git. */
+  /**
+   * Would merging sourceBranch into <remote>/<targetBranch> change nothing?
+   * The squash-aware twin of isBranchMerged, used only on a resumed accept.
+   * Any git failure answers false (the ordinary merge path then reports it).
+   */
+  private async changesAlreadyOnRemoteTarget(sourceBranch: string, targetBranch: string, cwd: string): Promise<boolean> {
+    const remoteRef = `${this.remoteName}/${targetBranch}`;
+    const merged = await this.git(['merge-tree', '--write-tree', remoteRef, sourceBranch], cwd);
+    if (merged.exitCode !== 0) return false;
+    const tree = await this.git(['rev-parse', '--verify', `${remoteRef}^{tree}`], cwd);
+    if (tree.exitCode !== 0) return false;
+    const mergedTree = merged.stdout.split('\n')[0]?.trim();
+    return !!mergedTree && mergedTree === tree.stdout.trim();
+  }
+
+  /** Check if sourceBranch is already fully merged into targetBranch via git (ancestry, so it cannot see a squash). */
   private async isBranchMerged(sourceBranch: string, targetBranch: string, cwd: string): Promise<boolean> {
     // git merge-base --is-ancestor <branch> <remote>/<target> returns 0 if branch is an ancestor
     const result = await this.git(
@@ -1587,17 +1678,22 @@ export class GitHubDriver implements RepositoryDriver {
   }
 
   /**
-   * Fetch all comments from a paginated GitHub API endpoint since a given timestamp.
-   * Uses gh api with --paginate to deterministically fetch all pages.
-   * Returns raw JSON objects from the API.
+   * Fetch every item from a paginated GitHub API endpoint, optionally keeping
+   * only those whose `timeField` is at or after `since`.
+   *
+   * `since` is a DISPLAY window, never an import watermark: `timeField` is when
+   * the item was written, not when it became visible (a line comment drafted
+   * inside a pending review carries its drafting time and appears only when
+   * the review is submitted). Importers pass no `since` and dedup by id.
    */
   private async fetchPaginatedComments(
     endpoint: string,
-    since: string,
+    since: string | undefined,
+    timeField = 'created_at',
   ): Promise<Array<Record<string, unknown>>> {
-    // Use since parameter on the API request for issue comments (supported natively).
-    // For review comments, the API supports since but only for updated_at, so we
-    // fetch all and filter in code for consistency.
+    // `gh api --paginate` already requests 100 per page (GitHub's maximum) on
+    // REST endpoints — see addPerPage in gh's pkg/cmd/api — so no page-size
+    // flag is needed.
     const result = await this.ghApi([
       endpoint,
       '--paginate',
@@ -1611,25 +1707,11 @@ export class GitHubDriver implements RepositoryDriver {
     if (!result.stdout.trim()) return [];
 
     try {
-      // gh api --paginate concatenates JSON arrays: [...][...][...]
-      const raw = result.stdout.trim();
-      let allComments: Array<Record<string, unknown>>;
-
-      if (raw.startsWith('[')) {
-        const normalized = '[' + raw.replace(/\]\s*\[/g, '],[') + ']';
-        const pages: Array<Array<Record<string, unknown>>> = JSON.parse(normalized);
-        allComments = pages.flat();
-      } else {
-        // Single object or NDJSON
-        allComments = raw.split('\n')
-          .filter(line => line.trim())
-          .map(line => JSON.parse(line));
-      }
-
-      // Filter by since timestamp
-      return allComments.filter(c => {
-        const createdAt = c.created_at as string | undefined;
-        return createdAt && createdAt >= since;
+      const all = parsePaginatedApiJson(result.stdout);
+      if (since === undefined) return all;
+      return all.filter(c => {
+        const at = c[timeField] as string | undefined;
+        return at && at >= since;
       });
     } catch (err) {
       logger.warn(`fetchPaginatedComments: failed to parse response: ${err instanceof Error ? err.message : err}`);
@@ -1837,8 +1919,12 @@ export class GitHubDriver implements RepositoryDriver {
     logger.info('Fetching from remote...');
     const fetchResult = await this.git(['fetch', this.remoteName], root);
     if (fetchResult.exitCode !== 0) {
-      logger.warn(`Fetch failed: ${fetchResult.stderr}`);
+      // Reported through the deduplicating helper: the daemon fetches once a
+      // minute, and an indefinite failure (missing credentials, most often)
+      // would otherwise write the same line into daemon.log forever.
+      reportFetchFailure(root, this.remoteName, fetchResult.stderr);
     } else {
+      clearFetchFailure(root, this.remoteName);
       logger.debug('Fetched latest from remote');
     }
 
@@ -1921,29 +2007,15 @@ export class GitHubDriver implements RepositoryDriver {
     }
   }
 
-  getLastCommentSyncedAt(task: Task): string | undefined {
-    return task.metadata?.github_remote_last_comment_synced_at ?? task.metadata?.remote_last_comment_synced_at ?? task.metadata?.github_last_comment_synced_at;
-  }
-
-  commentSyncedAtKey(): string {
-    return 'github_remote_last_comment_synced_at';
-  }
-
-  getLastPostedTurnSeq(task: Task): number {
-    const val = task.metadata?.github_remote_last_posted_turn_seq ?? task.metadata?.remote_last_posted_turn_seq ?? task.metadata?.github_last_posted_turn_seq;
+  getLastFidelityTurnSeq(task: Task): number {
+    // Canonical key first, then the pre-fidelity "posted turn" keys so stores
+    // written by the removed per-turn mirroring keep their watermark.
+    const val = task.metadata?.github_fidelity_turn_seq ?? task.metadata?.github_remote_last_posted_turn_seq ?? task.metadata?.remote_last_posted_turn_seq ?? task.metadata?.github_last_posted_turn_seq;
     return val ? Number(val) : -1;
   }
 
-  postedTurnSeqKey(): string {
-    return 'github_remote_last_posted_turn_seq';
-  }
-
-  getLastPostedNoteAt(task: Task): string | undefined {
-    return task.metadata?.github_remote_last_posted_note_at ?? task.metadata?.remote_last_posted_note_at ?? task.metadata?.github_last_posted_note_at;
-  }
-
-  postedNoteAtKey(): string {
-    return 'github_remote_last_posted_note_at';
+  fidelityTurnSeqKey(): string {
+    return 'github_fidelity_turn_seq';
   }
 
   getLastCIFailureSynced(task: Task): string | undefined {
@@ -1956,9 +2028,9 @@ export class GitHubDriver implements RepositoryDriver {
 
   formatImportedComment(comment: RemoteComment, task: Task): string {
     const prNum = this.prNumber(task) ?? '?';
-    // Format: [PR #N @author] {remote:id} body
-    // The {remote:id} tag enables deduplication on subsequent syncs
-    let content = `[PR #${prNum} @${comment.author}] {remote:${comment.id}} ${comment.body}`;
+    // Format: [PR #N @author] body. Identity rides as structured metadata
+    // (Comment.external), not as a marker in the text.
+    let content = `[PR #${prNum} @${comment.author}] ${comment.body}`;
     if (comment.path) {
       content += `\n(on file: ${comment.path}`;
       if (comment.line) content += `, line ${comment.line}`;
@@ -1971,4 +2043,28 @@ export class GitHubDriver implements RepositoryDriver {
     // Matches both new {remote:id} and old {gh:id} formats for backward compatibility
     return /^\[PR #\d+ @[^\]]+\] \{(?:remote|gh):\w+\}/.test(noteContent);
   }
+}
+
+/**
+ * A GitHub refusal that means "this approval was never going to work", not
+ * "something is broken".
+ *
+ * GitHub answers 422 when the PR's own author tries to approve it, which is
+ * the NORMAL outcome for the sole developer `[remote] auto_approve` is
+ * documented for. Warning about it would surface `Auto-approve warning: …422`
+ * on every accept they run, which trains the reader to ignore the warnings
+ * that do matter. It was already quiet before the 2026-09-21 removal, because
+ * the comment fallback swallowed it.
+ *
+ * The GitLab twin is `isApprovalRefusalStatus` in gitlab-driver.ts, and it
+ * needs a credential probe this one does not: GitLab answers 401 both when it
+ * declines an approval and when the token is dead, so the status there cannot
+ * classify on its own, while GitHub separates the two (422 for the refusal,
+ * 401 for a bad credential). Both drivers must agree on what EXPECTED means —
+ * the forge declining an approval it was never going to accept, with a working
+ * credential — and on the SHAPE: expected refusal is debug + null, anything
+ * else warns and returns a warning.
+ */
+function isExpectedApprovalRefusal(stderr: string): boolean {
+  return stderr.includes('422') || stderr.includes('Unprocessable Entity');
 }

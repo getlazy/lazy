@@ -94,11 +94,19 @@ export class WatchdogTimeoutError extends Error {
    * puts it on the wire so the killed turn's cost lands on a turn record.
    */
   usage?: AgentTokenUsage;
+  /**
+   * The agent's session id as parsed off its own stream before the kill — the
+   * conversation a resume of this turn should continue. Without it, a turn
+   * killed by the watchdog loses its place: the next launch would start a new
+   * conversation instead of resuming this one (the 2026-09-16 pi incident —
+   * watchdog kills every turn, auto-resume started over from scratch).
+   */
+  sessionId?: string;
 
   constructor(
     timeoutMs: number,
     durationMs: number,
-    opts?: { progressBased?: boolean; capturedResult?: boolean; attempts?: number; usage?: AgentTokenUsage },
+    opts?: { progressBased?: boolean; capturedResult?: boolean; attempts?: number; usage?: AgentTokenUsage; sessionId?: string },
   ) {
     const window = formatWatchdogMs(timeoutMs);
     super(
@@ -115,6 +123,7 @@ export class WatchdogTimeoutError extends Error {
     this.capturedWork = opts?.capturedResult ?? false;
     this.attempts = opts?.attempts ?? 1;
     this.usage = opts?.usage;
+    this.sessionId = opts?.sessionId;
   }
 }
 
@@ -153,6 +162,18 @@ export class GracefulExitTimeoutError extends Error {
    * really spent. See src/supervisor/usage.ts.
    */
   usage?: AgentTokenUsage;
+  /**
+   * WHY the captured result was unusable, verbatim from the agent's own parser.
+   *
+   * INVARIANT: this reason rides the error message, not just a log line. It is
+   * frequently the only statement of what actually went wrong — an
+   * error-terminated final message says so here ("pi turn ended in error: 502
+   * … proxy_error … The operation timed out."), and during the 2026-09-16
+   * local-Ollama incident that sentence existed only in the supervisor log,
+   * while every human-facing surface said "the captured result could not be
+   * parsed" and nothing else.
+   */
+  parseError?: string;
 
   constructor(opts: {
     timeoutMs: number;
@@ -160,11 +181,13 @@ export class GracefulExitTimeoutError extends Error {
     elapsedSinceSignalMs: number;
     sessionId?: string;
     usage?: AgentTokenUsage;
+    parseError?: string;
   }) {
     super(
       `Killed ${Math.round(opts.elapsedSinceSignalMs / 1000)}s after the agent emitted its final ` +
       `result — the process did not exit within the ${Math.round(opts.timeoutMs / 1000)}s wind-down ` +
-      `window, and the captured result could not be parsed`,
+      `window, and the captured result could not be parsed` +
+      (opts.parseError ? `: ${opts.parseError}` : ''),
     );
     this.name = 'GracefulExitTimeoutError';
     this.timeoutMs = opts.timeoutMs;
@@ -172,6 +195,7 @@ export class GracefulExitTimeoutError extends Error {
     this.elapsedSinceSignalMs = opts.elapsedSinceSignalMs;
     this.sessionId = opts.sessionId;
     this.usage = opts.usage;
+    this.parseError = opts.parseError;
   }
 }
 
@@ -264,9 +288,16 @@ export async function execWithWatchdog(
      * means; the lazy-specific judgement lives in `supervisor/mcp-verify.ts`.
      */
     abortOnSessionStart?: (event: AgentActivityEvent) => string | null;
+    /**
+     * Called once the child is spawned, with a function that sends it SIGTERM
+     * (then SIGKILL after the usual grace). Used by the daemon-generation watch
+     * in runWork: when the audit proxy's daemon restarts mid-turn, the agent must
+     * be stopped so the retry relaunch picks up a fresh `ANTHROPIC_BASE_URL`.
+     */
+    registerKill?: (kill: (signal?: 'SIGTERM' | 'SIGKILL') => void) => void;
   },
 ): Promise<WatchdogResult> {
-  const { cwd, env, timeoutMs, activityStream, windDownTimeoutMs, abortOnSessionStart } = opts;
+  const { cwd, env, timeoutMs, activityStream, windDownTimeoutMs, abortOnSessionStart, registerKill } = opts;
   const enabled = timeoutMs > 0;
   const windDownEnabled = !!activityStream && (windDownTimeoutMs ?? 0) > 0;
 
@@ -285,6 +316,14 @@ export async function execWithWatchdog(
     stderr: 'pipe',
     env,
     timeout: 0, // Long-running: this function has its own progress-based guards
+  });
+
+  registerKill?.((signal = 'SIGTERM') => {
+    try {
+      proc.kill(signal);
+    } catch {
+      /* already gone */
+    }
   });
 
   const stderrChunks: Buffer[] = [];

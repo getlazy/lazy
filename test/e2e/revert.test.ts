@@ -5,6 +5,7 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, extractTaskId } from '../helpers/assertions';
 import { createTask, disablePreAccept, startAndAccept, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { taskDirFor } from '../helpers/storage';
+import { seedFinal } from '../helpers/final';
 
 /**
  * Helper: create a task, start it (mocked), and accept it.
@@ -192,6 +193,7 @@ describe('lazy accept revert task (continuation)', () => {
     // 3. Start the revert task and drive the reconcile pass that moves it out
     // of 'working' -- accept refuses a working task.
     await startAndReconcile(ctx, 'revert-orig-work');
+    seedFinal(ctx, 'revert-orig-work');
 
     // Accept the revert task (--yes will auto-create continuation)
     const acceptResult = await ctx.lazy(['accept', 'revert-orig-work', '--yes']);
@@ -208,6 +210,7 @@ describe('lazy accept revert task (continuation)', () => {
     await ctx.lazy(['revert', taskId, '--reason', 'Fix the approach']);
 
     await startAndReconcile(ctx, 'revert-cont-test');
+    seedFinal(ctx, 'revert-cont-test');
     await ctx.lazy(['accept', 'revert-cont-test', '--yes']);
 
     // Show the continuation task
@@ -228,6 +231,7 @@ describe('lazy accept revert task (continuation)', () => {
     // Create and accept the revert
     await ctx.lazy(['revert', taskId, '--reason', 'V2 exists test']);
     await startAndReconcile(ctx, 'revert-ver-test');
+    seedFinal(ctx, 'revert-ver-test');
     const acceptResult = await ctx.lazy(['accept', 'revert-ver-test', '--yes']);
     expectSuccess(acceptResult);
     expectOutput(acceptResult, 'ver-test-v3');

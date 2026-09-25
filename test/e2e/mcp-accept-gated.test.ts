@@ -4,11 +4,13 @@
  *
  * The old confirmation-code mechanism is self-satisfiable — the daemon hands
  * the builder a code and the builder echoes it back. On a protected merge that
- * must no longer count: lazy_accept refuses up front, never issues a code, and
- * a code cannot complete the accept. Only a human `lazy approve` (CLI-only —
- * there is deliberately no MCP equivalent) unlocks the merge. On UNPROTECTED
- * merges the confirmation protocol keeps working as before (covered by
- * confirm-protocol.test.ts).
+ * must not count: lazy_accept refuses UNCONDITIONALLY, never issues a code,
+ * and a code cannot complete the accept. Only a human completes the merge —
+ * `lazy accept` at a terminal prompts for the approval passphrase (there is
+ * deliberately no MCP equivalent and no non-interactive path). The reason the
+ * builder handed the refused accept is captured as a pending review the
+ * human's accept surfaces and attaches. On UNPROTECTED merges the confirmation
+ * protocol keeps working as before (covered by confirm-protocol.test.ts).
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
@@ -16,25 +18,14 @@ import { resolve, join } from 'path';
 import { readFile, writeFile } from 'fs/promises';
 import { writeFileSync } from 'fs';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
+import { seedFinal } from '../helpers/final';
 import { expectSuccess } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
-import { MCP_SERVER_ENV_PINS } from '../helpers/mcp-env';
 import { enrollPassphrase } from '../helpers/passphrase';
+import { MCP_SERVER_ENV_PINS } from '../helpers/mcp-env';
 
 const AGENT_ENTRY = resolve(__dirname, '../../src/agent-entry.ts');
 const PASSPHRASE = 'test-approval-passphrase';
-
-/**
- * Env that drives the masked `lazy approve` prompt as if a human typed the
- * correct passphrase at a TTY. The passphrase is TTY-only BY DESIGN — no flag,
- * no env var, no piped-stdin route — so this test-only pair is the only way a
- * test can supply it (see test/e2e/system-passphrase.test.ts).
- */
-const TYPES_PASSPHRASE = {
-  LAZY_FORCE_TTY: '1',
-  LAZY_PROMPT_DEFAULTS: '1',
-  LAZY_PROMPT_SECRET: PASSPHRASE,
-};
 
 interface JsonRpcResponse {
   jsonrpc: '2.0';
@@ -141,6 +132,10 @@ async function setupBlockedTask(ctx: TestContext, name: string): Promise<string>
   writeFileSync(join(worktreePath, `${name}.txt`), 'content\n');
   ctx.git('-C', worktreePath, 'add', `${name}.txt`);
   ctx.git('-C', worktreePath, 'commit', '-m', `Add ${name}.txt`);
+  // Fixture setup, not the subject (see test/helpers/final.ts): the suite's
+  // accepts are gated-accept refusals and passphrase accepts, none of which is
+  // the no-final refusal.
+  await seedFinal(ctx, taskId);
   return taskId;
 }
 
@@ -160,16 +155,18 @@ describe('MCP lazy_accept into protected branches (P0.2d)', () => {
     await ctx.cleanup();
   });
 
-  // INVARIANT: on a protected merge with no pending human approval,
-  // lazy_accept refuses up front and never issues a confirmation code — a code
-  // the builder can echo back is not authorization for a protected merge.
+  // INVARIANT: on a protected merge, lazy_accept refuses UNCONDITIONALLY and
+  // never issues a confirmation code — a code the builder can echo back is not
+  // authorization for a protected merge, and there is no pre-approval that
+  // could let it through (the stored-approval mechanism was removed as a
+  // floating credential).
   test('lazy_accept into a protected branch refuses and issues NO confirmation code', async () => {
     const taskId = await setupBlockedTask(ctx, 'no-code');
 
     const text = await session.callText('lazy_accept', { task_id: taskId });
 
     expect(text).toContain('requires human approval');
-    expect(text).toContain(`lazy approve ${taskId}`);
+    expect(text).toContain(`lazy accept ${taskId}`);
     // No confirmation code anywhere in the refusal (codes look like "ac-1a2b").
     expect(text).not.toMatch(/\b[a-z]{2}-[0-9a-f]{4}\b/);
   }, 30000);
@@ -191,27 +188,60 @@ describe('MCP lazy_accept into protected branches (P0.2d)', () => {
     expect(log.stdout).not.toContain('forged-code');
   }, 30000);
 
-  // INVARIANT: a human `lazy approve` (CLI) is what unlocks the protected
-  // accept, and the MCP flow then completes it.
-  test('after human lazy approve, MCP lazy_accept completes the merge', async () => {
-    const taskId = await setupBlockedTask(ctx, 'approved-mcp');
+  // Capture-on-refusal: the reason handed to a refused gated accept is often a
+  // real code review. It is kept on the task and the refusal says so; the
+  // human's passphrase accept then shows it before the prompt and attaches it
+  // to the merge ([Accepted] comment). Last-write-wins: a retry with an
+  // updated reason replaces the earlier review, never accumulates copies.
+  test('a refused gated accept records the builder review; the human accept attaches it', async () => {
+    const taskId = await setupBlockedTask(ctx, 'review-capture');
 
-    const approveResult = await ctx.lazy(['approve', taskId], { env: TYPES_PASSPHRASE });
-    expectSuccess(approveResult);
+    const first = await session.callText('lazy_accept', {
+      task_id: taskId,
+      reason: 'First pass: looks solid overall.',
+    });
+    expect(first).toContain('requires human approval');
+    expect(first).toContain('review has been RECORDED');
 
-    // Tiny diff → confirmation level 'none' → executes directly; the daemon
-    // consumes the recorded approval.
+    // Retry with an updated review — replaces, does not accumulate.
+    const second = await session.callText('lazy_accept', {
+      task_id: taskId,
+      reason: 'Reviewed the diff thoroughly: correct and well tested.',
+    });
+    expect(second).toContain('review has been RECORDED');
+
+    // The human accepts with the passphrase; the captured review is shown
+    // before the prompt and lands in the [Accepted] comment, attributed.
+    const acceptResult = await ctx.lazy(['accept', taskId], {
+      env: {
+        LAZY_FORCE_TTY: '1',
+        LAZY_PROMPT_DEFAULTS: '1',
+        LAZY_PROMPT_SECRET: PASSPHRASE,
+      },
+    });
+    expect(acceptResult.exitCode).toBe(0);
+    expect(acceptResult.stdout).toContain('Review by builder');
+    expect(acceptResult.stdout).toContain('Reviewed the diff thoroughly');
+    expect(acceptResult.stdout).not.toContain('First pass');
+
+    const show = await ctx.lazy(['show', taskId, '--full']);
+    expect(show.stdout).toContain('Reviewed the diff thoroughly');
+    expect(show.stdout).toContain('Review by builder');
+  }, 60000);
+
+  // INVARIANT: a gated refusal without a reason records nothing and says so —
+  // an empty review would be noise in front of the human.
+  test('a refused gated accept without a reason records no review', async () => {
+    const taskId = await setupBlockedTask(ctx, 'no-review');
+
     const text = await session.callText('lazy_accept', { task_id: taskId });
-    expect(text).toContain('accepted and merged');
-
-    const log = ctx.git('log', '--oneline', 'main');
-    expect(log.stdout).toContain('MCP gate test approved-mcp');
+    expect(text).toContain('No review text was recorded');
   }, 30000);
 
-  // INVARIANT: there is no MCP tool that records a human approval. If one
+  // INVARIANT: there is no MCP tool that can approve a protected merge. If one
   // existed, the builder could approve its own work and the friction model
   // would be theatre.
-  test('no MCP tool exposes lazy approve', async () => {
+  test('no MCP tool exposes an approval route', async () => {
     const names = await session.listToolNames();
     expect(names).not.toContain('lazy_approve');
     expect(names.join(',')).not.toContain('approve');

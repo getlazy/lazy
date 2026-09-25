@@ -61,9 +61,9 @@ await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => (
 
 // Mock getBranchNameFromId — import real functions to avoid breaking other tests
 // (bun's mock.module replaces the entire module, so we must re-export everything)
-import { deriveTaskRef as realDeriveTaskRef, taskRef as realTaskRef } from '../../src/cli/helpers';
+import { deriveTaskRef as realDeriveTaskRef, taskRef as realTaskRef } from '../../src/task/identity';
 const branchNameMap = new Map<string, string>();
-await mockModule(resolve(import.meta.dir, '../../src/cli/helpers.ts'), () => ({
+await mockModule(resolve(import.meta.dir, '../../src/task/identity.ts'), () => ({
   getBranchNameFromId: async (taskId: string) => {
     return branchNameMap.get(taskId) ?? `lazy/${taskId.substring(0, 8)}`;
   },
@@ -292,6 +292,31 @@ describe('resolveParentBranch stale parent fallback', () => {
     expect(result.branch).toBe('main');
     expect(loggedErrors.length).toBe(1);
     expect(loggedErrors[0]).toContain(parent.id);
+  });
+
+  // INVARIANT: the resolution reports `retargeted` exactly when it rewrote the
+  // task's target. The daemon's callers (unblock, sync) move the task's open
+  // PR/MR onto the new target on that signal (src/daemon/review-retarget.ts);
+  // a rewrite it failed to report would leave a PR merging into a branch the
+  // task no longer goes to.
+  test('reports retargeted exactly when the target was rewritten', async () => {
+    const alive = { id: 'parent-id-1234', status: 'blocked', code: 'parent-task', target: branchT('main') };
+    taskStore.set(alive.id, alive);
+    branchNameMap.set(alive.id, 'lazy/parent-task');
+    const kept = await resolveParentBranchWithFallback(
+      { id: 'child-id-1234', target: taskT(alive.id), metadata: {} } as any, mockStorage as any, '/project');
+    expect(kept.retargeted).toBe(false);
+    expect(targetUpdates).toEqual([]);
+
+    taskStore.set(alive.id, { ...alive, status: 'complete' });
+    const moved = await resolveParentBranchWithFallback(
+      { id: 'child-id-1234', target: taskT(alive.id), metadata: {} } as any, mockStorage as any, '/project');
+    expect(moved.retargeted).toBe(true);
+    expect(targetUpdates.length).toBe(1);
+
+    const healed = await resolveParentBranchWithFallback(
+      { id: 'child-id-1234', target: branchT('lazy/stale'), metadata: {} } as any, mockStorage as any, '/project');
+    expect(healed.retargeted).toBe(true);
   });
 });
 

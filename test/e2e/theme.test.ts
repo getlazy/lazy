@@ -3,7 +3,7 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput } from '../helpers/assertions';
 
 /**
- * Tests for the centralized terminal coloring system (src/cli/theme.ts).
+ * Tests for the centralized terminal coloring system (src/render/theme.ts).
  *
  * These tests verify:
  * - Colors are disabled when NO_COLOR is set
@@ -13,7 +13,7 @@ import { expectSuccess, expectOutput } from '../helpers/assertions';
  */
 
 // Import theme directly for unit-style tests
-import { theme, bold, dim, red, green, yellow, blue, magenta, cyan, stripAnsi, resetColorCache } from '../../src/cli/theme';
+import { theme, bold, dim, red, green, yellow, blue, magenta, cyan, stripAnsi, resetColorCache } from '../../src/render/theme';
 
 describe('theme', () => {
   describe('stripAnsi', () => {

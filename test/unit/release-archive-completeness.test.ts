@@ -191,4 +191,13 @@ describe('release archive completeness', () => {
     // in the public repo) require()s it; without it `bun test` cannot start.
     expect(patterns).toContain('scripts/generate-prompt-bundle.ts');
   });
+
+  /**
+   * INVARIANT: operators following public-docs/self-hosting-lazy-teams.md must
+   * find lazy-teams/deploy/ in a lazy release tarball — not only in the dev repo.
+   */
+  test('.releaseinclude ships the lazy-teams self-host deploy bundle', async () => {
+    const patterns = parseReleaseInclude(await readRepoFile('.releaseinclude'));
+    expect(patterns).toContain('lazy-teams/deploy/**');
+  });
 });

@@ -12,11 +12,13 @@
  * WHERE the session log lives depends on the runner (its HOME differs), so the
  * monitor asks the runner via `runner.agentSessionProjectDir()` and discovers
  * the active file with the shared `findLatestSessionFile` helper — no private,
- * sandbox-only copy of that logic.
+ * sandbox-only copy of that logic. That helper also skips lazy's own machine
+ * one-shots, which write into the same dir and would otherwise be picked as the
+ * newest session and narrated as the task's activity.
  */
 
 import { readFile, stat } from 'fs/promises';
-import { theme, dim } from './theme';
+import { theme, dim } from '../render/theme';
 import { findLatestSessionFile } from '../agent/session-discovery';
 import type { Runner } from '../runner/types';
 
@@ -334,8 +336,22 @@ function formatPhase(phase: string): string | null {
     case 'merge_and_fix_done': return 'Upstream sync complete';
     case 'work': return 'Agent working...';
     case 'work_done': return 'Agent finished';
+    case 'low_high_review': return 'Low-high loop: self-reviewing draft...';
+    case 'low_high_review_done': return 'Low-high loop: self-review complete';
+    case 'low_high_revise': return 'Low-high loop: applying review instructions...';
+    case 'low_high_revise_done': return 'Low-high loop: revision complete';
     case 'permission_pushback': return 'Permission violation detected, pushing back...';
     case 'permission_pushback_done': return 'Permission pushback complete';
+    case 'maintain': return 'Maintained files skipped — prompting agent...';
+    case 'maintain_done': return 'Maintained-files follow-up complete';
+    case 'react': return 'Reactive automation matched — prompting agent...';
+    case 'react_done': return 'Reactive-automation follow-up complete';
+    case 'wrap_up': return 'Wrap-up phase: running this turn\'s closing steps...';
+    case 'wrap_up_done': return 'Wrap-up phase complete';
+    case 'commit_leftovers': return 'Uncommitted work found — asking the agent to commit or discard it...';
+    case 'commit_leftovers_done': return 'Uncommitted-work follow-up complete';
+    case 'present': return 'Presentation step: agent is authoring the walkthrough...';
+    case 'present_done': return 'Presentation step complete';
     case 'post_turn_check': return 'Running post-turn check...';
     case 'post_turn_check_done': return 'Post-turn check complete';
     case 'post_turn_sync': return 'Post-turn sync...';

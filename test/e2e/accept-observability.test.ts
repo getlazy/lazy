@@ -4,13 +4,14 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 import { readTaskStatus, setTaskStatus } from '../helpers/storage';
 
 /**
  * Accept observability: what the human sees while an accept runs, and what the
  * task's status says at each moment.
  *
- * WHY: an accept can run for minutes (pre-accept turn, pushes, an LLM-written
+ * WHY: an accept can run for minutes (the merge gate, pushes, an LLM-written
  * merge description, the merge). It used to print nothing at all for that whole
  * window, and the task read `blocked` throughout — so a running accept was
  * indistinguishable from a hung one, and from a task nobody was accepting.
@@ -60,6 +61,11 @@ describe('lazy accept observability', () => {
     writeFileSync(join(worktreePath, 'feature.txt'), 'feature content\n');
     expect(ctx.git('-C', worktreePath, 'add', 'feature.txt').exitCode).toBe(0);
     expect(ctx.git('-C', worktreePath, 'commit', '-m', 'Add feature').exitCode).toBe(0);
+
+    // Fixture setup, not the subject (see test/helpers/final.ts): every accept
+    // in this suite — including the abort tests, whose expected behavior fires
+    // after the finality gate — needs a standing final first.
+    await seedFinal(ctx, taskId);
 
     return taskId;
   }
@@ -122,7 +128,7 @@ describe('lazy accept observability', () => {
     setTaskStatus(ctx.root, taskId, 'conflict');
     expect(readTaskStatus(ctx.root, taskId)).toBe('conflict');
 
-    // A gate that always fails: the accept aborts after the pre-accept turn.
+    // A gate that always fails: the accept aborts at the merge gate.
     configurePreAccept({ enabled: true, commands: ['exit 1'], timeout: 60 });
 
     const result = await ctx.lazy(['accept', taskId, '--yes']);

@@ -6,14 +6,15 @@
  *
  *  1. When a project protects something, every read surface SAYS so — `lazy
  *     show`, `lazy status`, `lazy list`, and MCP `lazy_show` — including
- *     whether a `lazy approve` is already recorded and pending.
+ *     whether a builder review captured by a refused accept is pending.
  *  2. When a project protects nothing, the output is byte-for-byte what it was.
  *     Surfacing is additive; a stock project's `list`/`show` must not grow a
  *     marker, a column, or a line that a script would trip over.
  *
- * INVARIANT: these surfaces are read-only. There is no `lazy_protect` /
- * `lazy_approve` tool and nothing here creates one — arranging your own gates
- * is a human act (public-docs/surface-asymmetries.md).
+ * INVARIANT: these surfaces are read-only. There is no `lazy_protect` tool and
+ * nothing here creates one — arranging your own gates is a human act
+ * (public-docs/surface-asymmetries.md), and completing a gated merge is the
+ * passphrase typed at `lazy accept`'s own prompt.
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
@@ -22,22 +23,10 @@ import { readFile, writeFile } from 'fs/promises';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
-import { runMcpSession } from '../helpers/mcp-session';
 import { enrollPassphrase } from '../helpers/passphrase';
+import { runMcpSession } from '../helpers/mcp-session';
 
 const PASSPHRASE = 'test-approval-passphrase';
-
-/**
- * Env that drives the masked `lazy approve` prompt as if a human typed the
- * correct passphrase at a TTY. The passphrase is TTY-only BY DESIGN — no flag,
- * no env var, no piped-stdin route — so this test-only pair is the only way a
- * test can supply it (see test/e2e/system-passphrase.test.ts).
- */
-const TYPES_PASSPHRASE = {
-  LAZY_FORCE_TTY: '1',
-  LAZY_PROMPT_DEFAULTS: '1',
-  LAZY_PROMPT_SECRET: PASSPHRASE,
-};
 
 /**
  * Opt in to branch protection (OFF by default) and enroll the passphrase.
@@ -99,21 +88,25 @@ describe('protection surfacing (read-only)', () => {
     expectSuccess(result);
     expect(result.stdout).toContain('Protected: yes (branch gate)');
     expect(result.stdout).toContain('the repo default branch');
-    expect(result.stdout).toContain('No approval recorded');
-    expect(result.stdout).toContain(`lazy approve ${taskId}`);
+    expect(result.stdout).toContain(`lazy accept ${taskId}`);
+    expect(result.stdout).toContain('passphrase');
   }, 60000);
 
-  test('lazy show reports a recorded approval as pending', async () => {
+  test('lazy show reports a captured builder review as waiting', async () => {
     await enableProtection(ctx);
-    const taskId = await startedTask(ctx, 'Show pending approval');
+    const taskId = await startedTask(ctx, 'Show pending review');
 
-    expectSuccess(await ctx.lazy(['approve', taskId], { env: TYPES_PASSPHRASE }));
+    // A refused gated accept over MCP records the builder's review.
+    const responses = await runMcpSession(ctx.root, '', ctx.root, [
+      { method: 'initialize', id: 1, params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '1.0' } } },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_accept', arguments: { task_id: taskId, reason: 'A thorough review.' } } },
+    ]);
+    expect(responses.find(r => r.id === 2)).toBeDefined();
 
     const result = await ctx.lazy(['show', taskId]);
     expectSuccess(result);
     expect(result.stdout).toContain('Protected: yes (branch gate)');
-    expect(result.stdout).toContain('Approval pending');
-    expect(result.stdout).not.toContain('No approval recorded');
+    expect(result.stdout).toContain('review by builder');
   }, 60000);
 
   test('lazy status reports protection in the same words as show', async () => {
@@ -127,20 +120,15 @@ describe('protection surfacing (read-only)', () => {
 
   test('lazy list marks protected tasks and prints the legend', async () => {
     await enableProtection(ctx);
-    const taskId = await startedTask(ctx, 'List marker task');
+    await startedTask(ctx, 'List marker task');
 
-    const before = await ctx.lazy(['list']);
-    expectSuccess(before);
-    expect(before.stdout).toContain('[P]');
-    expect(before.stdout).not.toContain('[P][A]');
-    expect(before.stdout).toContain('protected — accepting needs');
-
-    expectSuccess(await ctx.lazy(['approve', taskId], { env: TYPES_PASSPHRASE }));
-
-    const after = await ctx.lazy(['list']);
-    expectSuccess(after);
-    expect(after.stdout).toContain('[P][A]');
-    expect(after.stdout).toContain('approval recorded and pending');
+    const result = await ctx.lazy(['list']);
+    expectSuccess(result);
+    expect(result.stdout).toContain('[P]');
+    expect(result.stdout).toContain('prompts for the approval passphrase');
+    // The pre-v0.22 [A] marker reported a stored `lazy approve`; that store
+    // no longer exists, so the marker must never reappear.
+    expect(result.stdout).not.toContain('[P][A]');
   }, 60000);
 
   // A task the human wrote into [protection].protected_tasks while the master
@@ -173,7 +161,7 @@ describe('protection surfacing (read-only)', () => {
     const list = await ctx.lazy(['list']);
     expectSuccess(list);
     expect(list.stdout).not.toContain('[P]');
-    expect(list.stdout).not.toContain('protected — accepting needs');
+    expect(list.stdout).not.toContain('prompts for the approval passphrase');
   }, 60000);
 
   // The builder sees the same gate the human sees — read-only, so it can plan
@@ -181,21 +169,24 @@ describe('protection surfacing (read-only)', () => {
   test('MCP lazy_show carries the protection object', async () => {
     await enableProtection(ctx);
     const taskId = await startedTask(ctx, 'MCP protection field');
-    expectSuccess(await ctx.lazy(['approve', taskId], { env: TYPES_PASSPHRASE }));
 
     const responses = await runMcpSession(ctx.root, '', ctx.root, [
       { method: 'initialize', id: 1, params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '1.0' } } },
-      { method: 'tools/call', id: 2, params: { name: 'lazy_show', arguments: { task_id: taskId } } },
+      // A refused gated accept records the builder's review, which the
+      // protection object must then report as pending.
+      { method: 'tools/call', id: 2, params: { name: 'lazy_accept', arguments: { task_id: taskId, reason: 'MCP review text.' } } },
+      { method: 'tools/call', id: 3, params: { name: 'lazy_show', arguments: { task_id: taskId } } },
     ]);
 
-    const reply = responses.find(r => r.id === 2);
+    const reply = responses.find(r => r.id === 3);
     expect(reply).toBeDefined();
     const text = reply!.result?.content?.map(c => c.text).join('\n') ?? '';
     const payload = JSON.parse(text) as { protection?: Record<string, unknown> };
     expect(payload.protection).toBeDefined();
     expect(payload.protection!.gated).toBe(true);
-    expect(payload.protection!.markers).toBe('[P][A]');
+    expect(payload.protection!.markers).toBe('[P]');
     expect((payload.protection!.branch_gate as { source: string }).source).toBe('default-branch');
-    expect(payload.protection!.approval_pending).not.toBeNull();
+    expect(payload.protection!.pending_review).not.toBeNull();
+    expect((payload.protection!.pending_review as { actor: string }).actor).toBe('builder');
   }, 60000);
 });

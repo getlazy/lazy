@@ -22,9 +22,9 @@
 import { createHash } from 'crypto';
 import { readFile, realpath } from 'fs/promises';
 import { dirname, isAbsolute, join, relative } from 'path';
-import { getDataDir } from '../cli/init';
+import { getDataDir } from '../project-paths';
 import { isTTY, promptYesNo } from '../cli/editor';
-import { theme } from '../cli/theme';
+import { theme } from '../render/theme';
 import {
   buildImageFromDockerfilePath,
   localImageExists,
@@ -55,9 +55,12 @@ export const CUSTOM_IMAGE_HASH_META_KEY = 'custom_image_hash';
 export const CUSTOM_IMAGE_CONTEXT_META_KEY = 'custom_image_context';
 
 /**
- * Return the absolute cwd when it is a lazy task worktree under `projectRoot`,
- * otherwise null. Uses realpath so symlink spellings (macOS /var vs /private/var)
- * do not false-negative.
+ * Return the task worktree root when cwd is anywhere inside one under
+ * `projectRoot`, otherwise null. Uses realpath so symlink spellings (macOS
+ * /var vs /private/var) do not false-negative.
+ *
+ * Cwd may be a subdirectory of the worktree — same rule as config discovery:
+ * anywhere inside the worktree counts, not only its root directory.
  */
 export async function lazyTaskWorktreeCwd(projectRoot: string): Promise<string | null> {
   let cwd: string;
@@ -86,7 +89,16 @@ export async function lazyTaskWorktreeCwd(projectRoot: string): Promise<string |
   const rel = relative(worktreesReal, cwd);
   if (!rel || rel.startsWith('..') || isAbsolute(rel)) return null;
 
-  return cwd;
+  // First path segment is the worktree name — cwd may be nested deeper.
+  const worktreeName = rel.split(/[/\\]/)[0];
+  if (!worktreeName) return null;
+
+  const worktreeRoot = join(worktreesReal, worktreeName);
+  try {
+    return await realpath(worktreeRoot);
+  } catch {
+    return null;
+  }
 }
 
 /**

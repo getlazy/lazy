@@ -135,11 +135,14 @@ function supervisorArgs(binary: string, daemonConfigPath?: string): string[] {
     agentBinaryPath: '/usr/local/share/lazy-agent',
     authEnvVars: [{ key: 'ANTHROPIC_API_KEY', value: 'x' }],
     customMountArgs: [],
+    taskEnvArgs: [],
     gitMountArgs: [
       '-v', `${PROJECT_ROOT}/.git:${PROJECT_ROOT}/.git:ro`,
       '-v', `${PROJECT_ROOT}/.git/objects:${PROJECT_ROOT}/.git/objects`,
       '-v', `${PROJECT_ROOT}/.git/worktrees/task-a:${PROJECT_ROOT}/.git/worktrees/task-a`,
     ],
+    publishArgs: [],
+    runArgs: [],
     wrapperScript: 'sleep 1',
     daemonConfigPath,
   });

@@ -2,7 +2,8 @@
  * E2E tests for `lazy daemon` command.
  *
  * Tests the daemon lifecycle: start, status, stop, restart.
- * Uses isolated socket paths to avoid conflicting with a real daemon.
+ * In-process daemons bind OS-assigned ephemeral loopback ports, so they never
+ * conflict with a real daemon or with each other.
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
@@ -11,7 +12,12 @@ import { existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { startDaemonServer, type RunningDaemon } from '../../src/daemon/server';
-import { formatDashboardUrl } from '../../src/daemon/dashboard-url';
+import { DASHBOARD_HOSTNAME, formatDashboardUrl } from '../../src/daemon/dashboard-url';
+import { DASHBOARD_COOKIE_NAME } from '../../src/daemon/dashboard-auth';
+import {
+  mintDashboardLoginTicket,
+  redeemDashboardLoginTicket,
+} from '../../src/daemon/dashboard-sessions';
 import {
   readPid,
   readToken,
@@ -62,6 +68,33 @@ const SQUAT_HOST = DEFAULT_SERVER_BIND;
 const STABLE_CWD = tmpdir();
 
 /**
+ * Assert that `phrase` is in `logContent` AND that nothing was logged after the
+ * entry carrying it — i.e. `tail daemon.log` ends on that entry.
+ *
+ * "Ends on it" is the property an operator actually depends on; "the phrase is
+ * somewhere in the last N lines" is only a proxy for it. Startup failures are
+ * multi-line messages, so N has to be guessed, and one more line of remedy text
+ * or one more teardown log line quietly invalidates the guess. That is exactly
+ * how this regressed: the reason was logged BEFORE the partial-daemon teardown,
+ * teardown's two storage-close debug lines landed after it, and the headline
+ * slid to eleven lines from the end — outside a default `tail`.
+ *
+ * Every logger entry starts `<ISO timestamp> [LEVEL] : `; the continuation lines
+ * of a multi-line message carry no prefix. So any prefixed line after the phrase
+ * is a LATER entry, and there must be none.
+ */
+function expectLastLogEntry(logContent: string, phrase: string): void {
+  const entryStart = logContent.indexOf(phrase);
+  expect(entryStart).toBeGreaterThan(-1);
+  const laterEntries = logContent
+    .slice(entryStart)
+    .split('\n')
+    .slice(1)
+    .filter(line => /^\d{4}-\d{2}-\d{2}T\S+ \[[A-Z]+\s*\] : /.test(line));
+  expect(laterEntries).toEqual([]);
+}
+
+/**
  * Rewrite a test project's `[server] port` to a port the OS reports free, so a
  * real `lazy daemon start` does not depend on the shared 26024+ window being
  * available on the machine running the suite.
@@ -99,12 +132,10 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
     let daemon: RunningDaemon;
     let ctx: TestContext;
     let tmpDir: string;
-    let socketPath: string;
 
     beforeEach(async () => {
       ctx = await setupTestLazy();
       tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-test-'));
-      socketPath = join(tmpDir, 'test.sock');
     });
 
     afterEach(async () => {
@@ -115,16 +146,15 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
       await rm(tmpDir, { recursive: true, force: true });
     });
 
-    // INVARIANT: Daemon server binds to unix socket and responds to health checks.
-    // This is the foundation for all daemon functionality — if the socket doesn't
+    // INVARIANT: Daemon server binds its TCP port and responds to health checks.
+    // This is the foundation for all daemon functionality — if the port doesn't
     // work, nothing else (CLI pass-through, MCP proxy, auto-start) will work.
-    test('starts server on unix socket and responds to health check', async () => {
-      daemon = await startDaemonServer({ socketPath, token: 'test-token-123', projectRoot: ctx.root });
+    test('starts server on its TCP port and responds to health check', async () => {
+      daemon = await startDaemonServer({ token: 'test-token-123', projectRoot: ctx.root });
 
-      const resp = await fetch('http://localhost/daemon/status', {
-        unix: socketPath,
+      const resp = await fetch(`http://127.0.0.1:${daemon.webPort}/daemon/status`, {
         headers: { 'Authorization': 'Bearer test-token-123' },
-      } as any);
+      });
 
       expect(resp.ok).toBe(true);
       const data = await resp.json() as any;
@@ -133,34 +163,51 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
       expect(typeof data.uptime).toBe('number');
     });
 
-    // INVARIANT: All daemon endpoints require bearer token authentication.
-    // Without auth, any local process could control the daemon.
-    test('rejects requests without valid bearer token', async () => {
-      daemon = await startDaemonServer({ socketPath, token: 'test-token-123', projectRoot: ctx.root });
+    // INVARIANT: the control endpoints (/rpc/*, /daemon/shutdown) require the
+    // shared bearer token. Without auth, any local process could control the
+    // daemon. /daemon/status is deliberately unauthenticated — it is the
+    // liveness probe (curl, health checks, the registry scan) and exposes only
+    // status metadata; that has been its TCP posture since the dual-bind days.
+    test('rejects control requests without valid bearer token', async () => {
+      daemon = await startDaemonServer({ token: 'test-token-123', projectRoot: ctx.root });
+      const base = `http://127.0.0.1:${daemon.webPort}`;
 
       // No auth header
-      const resp1 = await fetch('http://localhost/daemon/status', {
-        unix: socketPath,
-      } as any);
+      const resp1 = await fetch(`${base}/rpc/list`, { method: 'POST', body: '{}' });
       expect(resp1.status).toBe(401);
 
       // Wrong token
-      const resp2 = await fetch('http://localhost/daemon/status', {
-        unix: socketPath,
+      const resp2 = await fetch(`${base}/daemon/shutdown`, {
+        method: 'POST',
         headers: { 'Authorization': 'Bearer wrong-token' },
-      } as any);
+      });
       expect(resp2.status).toBe(401);
     });
 
     // INVARIANT: Unknown routes return 404, not 500 or silent success.
     // Predictable error handling is essential for debugging.
     test('returns 404 for unknown routes', async () => {
-      daemon = await startDaemonServer({ socketPath, token: 'test-token-123', projectRoot: ctx.root });
+      daemon = await startDaemonServer({ token: 'test-token-123', projectRoot: ctx.root });
 
-      const resp = await fetch('http://localhost/unknown/path', {
-        unix: socketPath,
-        headers: { 'Authorization': 'Bearer test-token-123' },
-      } as any);
+      // An unknown path falls through to the dashboard, which now wants a
+      // browser session — so this asks with one. The distinction under test is
+      // still 404-not-500 for a route nobody serves; without the cookie the
+      // answer would be the sign-in page and the assertion would be about
+      // authentication instead.
+      const sessionId = await redeemDashboardLoginTicket(
+        ctx.root,
+        await mintDashboardLoginTicket(ctx.root),
+      );
+      // The Host header names the dashboard's hostname (the gate refuses a
+      // session presented on any other host); the packets still go to the
+      // loopback address the daemon actually bound, exactly as a browser does.
+      const resp = await fetch(`http://127.0.0.1:${daemon.webPort}/unknown/path`, {
+        headers: {
+          'Authorization': 'Bearer test-token-123',
+          host: `${DASHBOARD_HOSTNAME}:${daemon.webPort}`,
+          cookie: `${DASHBOARD_COOKIE_NAME}=${sessionId}`,
+        },
+      });
 
       expect(resp.status).toBe(404);
     });
@@ -168,13 +215,12 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
     // INVARIANT: Shutdown endpoint responds before stopping the server.
     // The CLI needs to know the shutdown was accepted before the connection drops.
     test('shutdown endpoint responds with ok', async () => {
-      daemon = await startDaemonServer({ socketPath, token: 'test-token-123', projectRoot: ctx.root });
+      daemon = await startDaemonServer({ token: 'test-token-123', projectRoot: ctx.root });
 
-      const resp = await fetch('http://localhost/daemon/shutdown', {
+      const resp = await fetch(`http://127.0.0.1:${daemon.webPort}/daemon/shutdown`, {
         method: 'POST',
-        unix: socketPath,
         headers: { 'Authorization': 'Bearer test-token-123' },
-      } as any);
+      });
 
       expect(resp.ok).toBe(true);
       const data = await resp.json() as any;
@@ -188,7 +234,7 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
     // unhandled rejection that half-starts the daemon. When [proxy] is configured
     // but the proxy cannot bind (here: its port is already taken), startDaemonServer
     // must reject with an actionable message AND tear down the partial daemon so no
-    // stale socket/lock is left behind. Regression guard for the live-testing crash
+    // stale state/lock is left behind. Regression guard for the live-testing crash
     // where a failed proxy start took the whole daemon down ~6s after boot.
     test('proxy startup failure is a controlled error that tears down the daemon', async () => {
       // Occupy a port so the proxy's bind fails with EADDRINUSE.
@@ -201,11 +247,10 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
         await writeFile(configPath, `${original}\n[proxy]\nport = ${takenPort}\n`);
 
         await expect(
-          startDaemonServer({ socketPath, token: 'proxy-fail-token', projectRoot: ctx.root }),
+          startDaemonServer({ token: 'proxy-fail-token', projectRoot: ctx.root }),
         ).rejects.toThrow(/failed to start the \[proxy\] server/i);
 
-        // Controlled teardown: no running daemon, no stale unix socket.
-        expect(existsSync(socketPath)).toBe(false);
+        // Controlled teardown: no running daemon left behind.
         expect(await isDaemonRunning(ctx.root)).toBe(false);
       } finally {
         squatter.stop();
@@ -327,60 +372,75 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
       expect(isDaemonRunning(fakeProjectRoot)).toBe(false);
     });
 
-    // INVARIANT: isDaemonRunning returns false when socket exists but PID is dead.
+    // INVARIANT: isDaemonRunning returns false when markers exist but PID is dead.
     // This is the crash recovery case — daemon died but left stale files behind.
     // Previously, ensureDaemon and daemonStart only checked file existence, which
     // caused "already running" when the daemon was actually dead.
-    test('isDaemonRunning returns false when socket exists but PID is dead (crash recovery)', async () => {
+    test('isDaemonRunning returns false when markers exist but PID is dead (crash recovery)', async () => {
       const { mkdirSync, writeFileSync } = await import('fs');
       const daemonDir = getDaemonDir(fakeProjectRoot);
       mkdirSync(daemonDir, { recursive: true });
 
-      // Simulate crash: socket file, token, and PID file all exist,
+      // Simulate crash: port marker, token, and PID file all exist,
       // but the PID points to a dead process.
-      writeFileSync(join(daemonDir, 'lazy.sock'), 'stale-socket');
+      writeFileSync(join(daemonDir, 'web-port'), '26024');
       writeFileSync(join(daemonDir, 'token'), 'stale-token');
       writeFileSync(join(daemonDir, 'lazy.pid'), '999999'); // very likely dead PID
 
       expect(isDaemonRunning(fakeProjectRoot)).toBe(false);
     });
 
-    // INVARIANT: isDaemonRunning returns false when socket exists but no PID file.
+    // INVARIANT: isDaemonRunning returns false when markers exist but no PID file.
     // PID file missing means we can't verify the process is alive.
-    test('isDaemonRunning returns false when socket exists but no PID file', async () => {
+    test('isDaemonRunning returns false when markers exist but no PID file', async () => {
       const { mkdirSync, writeFileSync } = await import('fs');
       const daemonDir = getDaemonDir(fakeProjectRoot);
       mkdirSync(daemonDir, { recursive: true });
 
-      writeFileSync(join(daemonDir, 'lazy.sock'), 'stale-socket');
+      writeFileSync(join(daemonDir, 'web-port'), '26024');
       writeFileSync(join(daemonDir, 'token'), 'some-token');
       // No PID file
 
       expect(isDaemonRunning(fakeProjectRoot)).toBe(false);
     });
 
-    // INVARIANT: isDaemonRunning returns false when socket exists but no token.
+    // INVARIANT: isDaemonRunning returns false when there is no token.
     // Without a token, the daemon can't be authenticated.
-    test('isDaemonRunning returns false when socket exists but no token', async () => {
+    test('isDaemonRunning returns false when markers exist but no token', async () => {
       const { mkdirSync, writeFileSync } = await import('fs');
       const daemonDir = getDaemonDir(fakeProjectRoot);
       mkdirSync(daemonDir, { recursive: true });
 
-      writeFileSync(join(daemonDir, 'lazy.sock'), 'stale-socket');
+      writeFileSync(join(daemonDir, 'web-port'), '26024');
       writeFileSync(join(daemonDir, 'lazy.pid'), String(process.pid));
       // No token file
 
       expect(isDaemonRunning(fakeProjectRoot)).toBe(false);
     });
 
-    // INVARIANT: isDaemonRunning returns true when all signals are present
-    // and the PID is alive (using current process PID as a known-alive process).
-    test('isDaemonRunning returns true when socket, token, and PID are alive', async () => {
+    // INVARIANT: isDaemonRunning returns false when there is no web-port marker.
+    // With TCP as the only transport, a daemon nobody can reach is not "running"
+    // for any practical purpose — clients would have no address to try.
+    test('isDaemonRunning returns false when no web-port marker exists', async () => {
       const { mkdirSync, writeFileSync } = await import('fs');
       const daemonDir = getDaemonDir(fakeProjectRoot);
       mkdirSync(daemonDir, { recursive: true });
 
-      writeFileSync(join(daemonDir, 'lazy.sock'), 'socket-placeholder');
+      writeFileSync(join(daemonDir, 'token'), 'test-token');
+      writeFileSync(join(daemonDir, 'lazy.pid'), String(process.pid));
+      // No web-port marker
+
+      expect(isDaemonRunning(fakeProjectRoot)).toBe(false);
+    });
+
+    // INVARIANT: isDaemonRunning returns true when all signals are present
+    // and the PID is alive (using current process PID as a known-alive process).
+    test('isDaemonRunning returns true when port marker, token, and PID are alive', async () => {
+      const { mkdirSync, writeFileSync } = await import('fs');
+      const daemonDir = getDaemonDir(fakeProjectRoot);
+      mkdirSync(daemonDir, { recursive: true });
+
+      writeFileSync(join(daemonDir, 'web-port'), '26024');
       writeFileSync(join(daemonDir, 'token'), 'test-token');
       writeFileSync(join(daemonDir, 'lazy.pid'), String(process.pid)); // current process is alive
 
@@ -463,13 +523,11 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
   describe('daemon start/stop lifecycle (integration)', () => {
     let ctx: TestContext;
     let tmpDir: string;
-    let socketPath: string;
     let daemon: RunningDaemon;
 
     beforeEach(async () => {
       ctx = await setupTestLazy();
       tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-integ-'));
-      socketPath = join(tmpDir, 'lazy.sock');
     });
 
     afterEach(async () => {
@@ -484,13 +542,12 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
     // This is the core lifecycle that all daemon features depend on.
     test('start, health check, and stop cycle works', async () => {
       // Start
-      daemon = await startDaemonServer({ socketPath, token: 'lifecycle-token', projectRoot: ctx.root });
+      daemon = await startDaemonServer({ token: 'lifecycle-token', projectRoot: ctx.root });
 
       // Health check
-      const resp = await fetch('http://localhost/daemon/status', {
-        unix: socketPath,
+      const resp = await fetch(`http://127.0.0.1:${daemon.webPort}/daemon/status`, {
         headers: { 'Authorization': 'Bearer lifecycle-token' },
-      } as any);
+      });
       expect(resp.ok).toBe(true);
       const data = await resp.json() as any;
       expect(data.status).toBe('running');
@@ -498,8 +555,7 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
       // Stop
       await daemon.stop();
 
-      // Verify socket is cleaned up
-      // Note: stop() calls cleanupOwnDaemonFiles, which removes PID and socket.
+      // Note: stop() calls cleanupOwnDaemonFiles, which removes the PID file.
       // The owner deletes its own files unconditionally — the ownership guard in
       // cleanupStaleFiles is for OTHER processes, and would refuse here.
     });
@@ -507,21 +563,19 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
     // INVARIANT: Daemon reports increasing uptime over time.
     // This confirms the daemon is actually a persistent process, not restarting.
     test('uptime increases between health checks', async () => {
-      daemon = await startDaemonServer({ socketPath, token: 'uptime-token', projectRoot: ctx.root });
+      daemon = await startDaemonServer({ token: 'uptime-token', projectRoot: ctx.root });
 
-      const resp1 = await fetch('http://localhost/daemon/status', {
-        unix: socketPath,
+      const resp1 = await fetch(`http://127.0.0.1:${daemon.webPort}/daemon/status`, {
         headers: { 'Authorization': 'Bearer uptime-token' },
-      } as any);
+      });
       const data1 = await resp1.json() as any;
 
       // Wait a bit
       await new Promise(resolve => setTimeout(resolve, 50));
 
-      const resp2 = await fetch('http://localhost/daemon/status', {
-        unix: socketPath,
+      const resp2 = await fetch(`http://127.0.0.1:${daemon.webPort}/daemon/status`, {
         headers: { 'Authorization': 'Bearer uptime-token' },
-      } as any);
+      });
       const data2 = await resp2.json() as any;
 
       expect(data2.uptime).toBeGreaterThan(data1.uptime);
@@ -532,7 +586,6 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
     let daemon: RunningDaemon;
     let ctx: TestContext;
     let tmpDir: string;
-    let socketPath: string;
     let token: string;
     let fixtureTaskId: string;
 
@@ -566,9 +619,8 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
         await setupStorage.close();
       }
       tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-rpc-'));
-      socketPath = join(tmpDir, 'rpc-test.sock');
       token = 'rpc-test-token';
-      daemon = await startDaemonServer({ socketPath, token, projectRoot: ctx.root });
+      daemon = await startDaemonServer({ token, projectRoot: ctx.root });
     });
 
     afterEach(async () => {
@@ -580,31 +632,29 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
     });
 
     async function rpc(command: string, params: Record<string, unknown> = {}): Promise<any> {
-      const response = await fetch(`http://localhost/rpc/${command}`, {
+      const response = await fetch(`http://127.0.0.1:${daemon.webPort}/rpc/${command}`, {
         method: 'POST',
-        unix: socketPath,
         headers: {
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json',
           'X-Lazy-Project': ctx.root,
         },
         body: JSON.stringify(params),
-      } as any);
+      });
       return { status: response.status, data: await response.json() };
     }
 
     // INVARIANT: RPC endpoints require the X-Lazy-Project header.
     // Without it, the daemon can't open storage for the correct project.
     test('rejects RPC without X-Lazy-Project header', async () => {
-      const response = await fetch('http://localhost/rpc/list', {
+      const response = await fetch(`http://127.0.0.1:${daemon.webPort}/rpc/list`, {
         method: 'POST',
-        unix: socketPath,
         headers: {
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json',
         },
         body: '{}',
-      } as any);
+      });
       expect(response.status).toBe(400);
       const data = await response.json() as any;
       expect(data.error).toContain('X-Lazy-Project');
@@ -756,16 +806,14 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
     let daemon: RunningDaemon;
     let ctx: TestContext;
     let tmpDir: string;
-    let socketPath: string;
     let token: string;
 
     beforeEach(async () => {
       ctx = await setupTestLazy();
       await createTaskBeforeDaemon(ctx, 'Matching project task');
       tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-mismatch-'));
-      socketPath = join(tmpDir, 'mismatch-test.sock');
       token = 'mismatch-token';
-      daemon = await startDaemonServer({ socketPath, token, projectRoot: ctx.root });
+      daemon = await startDaemonServer({ token, projectRoot: ctx.root });
     });
 
     afterEach(async () => {
@@ -780,9 +828,8 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
     // The daemon is per-project — clients for other projects should connect to
     // that project's daemon instead.
     test('rejects RPC for wrong project with 400', async () => {
-      const response = await fetch('http://localhost/rpc/list', {
+      const response = await fetch(`http://127.0.0.1:${daemon.webPort}/rpc/list`, {
         method: 'POST',
-        unix: socketPath,
         headers: {
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json',
@@ -797,9 +844,8 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
 
     // INVARIANT: MCP requests for a different project are rejected with 400.
     test('rejects MCP for wrong project with 400', async () => {
-      const response = await fetch('http://localhost/mcp/task123/toolName', {
+      const response = await fetch(`http://127.0.0.1:${daemon.webPort}/mcp/task123/toolName`, {
         method: 'POST',
-        unix: socketPath,
         headers: {
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json',
@@ -814,9 +860,8 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
 
     // INVARIANT: Requests matching the daemon's project root succeed.
     test('accepts RPC for matching project', async () => {
-      const response = await fetch('http://localhost/rpc/list', {
+      const response = await fetch(`http://127.0.0.1:${daemon.webPort}/rpc/list`, {
         method: 'POST',
-        unix: socketPath,
         headers: {
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json',
@@ -853,35 +898,27 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
       await rm(tmpDir, { recursive: true, force: true });
     });
 
-    // INVARIANT: Two projects get separate daemon sockets.
+    // INVARIANT: Two projects get separate daemon ports.
     // This is the core guarantee of per-project daemon isolation.
-    test('two projects get separate daemon sockets and respond independently', async () => {
-      const socketA = join(tmpDir, 'project-a.sock');
-      const socketB = join(tmpDir, 'project-b.sock');
+    test('two projects get separate daemon ports and respond independently', async () => {
+      daemonA = await startDaemonServer({ token: 'token-a', projectRoot: ctxA.root });
+      daemonB = await startDaemonServer({ token: 'token-b', projectRoot: ctxB.root });
 
-      daemonA = await startDaemonServer({ socketPath: socketA, token: 'token-a', projectRoot: ctxA.root });
-      daemonB = await startDaemonServer({ socketPath: socketB, token: 'token-b', projectRoot: ctxB.root });
+      expect(daemonA.webPort).not.toBe(daemonB.webPort);
 
-      // Both respond to health checks independently
-      const respA = await fetch('http://localhost/daemon/status', {
-        unix: socketA,
-        headers: { 'Authorization': 'Bearer token-a' },
-      } as any);
+      // Both respond to health checks independently, each naming its own project.
+      const respA = await fetch(`http://127.0.0.1:${daemonA.webPort}/daemon/status`);
       expect(respA.ok).toBe(true);
+      expect(((await respA.json()) as any).projectRoot).toBe(ctxA.root);
 
-      const respB = await fetch('http://localhost/daemon/status', {
-        unix: socketB,
-        headers: { 'Authorization': 'Bearer token-b' },
-      } as any);
+      const respB = await fetch(`http://127.0.0.1:${daemonB.webPort}/daemon/status`);
       expect(respB.ok).toBe(true);
+      expect(((await respB.json()) as any).projectRoot).toBe(ctxB.root);
 
       // Stop one daemon, the other should still work
       await daemonA.stop();
 
-      const respB2 = await fetch('http://localhost/daemon/status', {
-        unix: socketB,
-        headers: { 'Authorization': 'Bearer token-b' },
-      } as any);
+      const respB2 = await fetch(`http://127.0.0.1:${daemonB.webPort}/daemon/status`);
       expect(respB2.ok).toBe(true);
     });
   });
@@ -890,7 +927,6 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
     let daemon: RunningDaemon;
     let ctx: TestContext;
     let tmpDir: string;
-    let socketPath: string;
     let token: string;
 
     let workingTaskId: string;
@@ -900,7 +936,6 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
       process.env.LAZY_TEST = '1';
       ctx = await setupTestLazy();
       tmpDir = await mkdtemp(join(tmpdir(), 'lazy-daemon-reconcile-'));
-      socketPath = join(tmpDir, 'reconcile-test.sock');
       token = 'reconcile-test-token';
 
       // Put the task in 'working' with a session BEFORE the daemon starts: the
@@ -920,7 +955,7 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
       }
 
       // Use a short reconcile interval for tests
-      daemon = await startDaemonServer({ socketPath, token, reconcileIntervalSeconds: 1, projectRoot: ctx.root });
+      daemon = await startDaemonServer({ token, reconcileIntervalSeconds: 1, projectRoot: ctx.root });
     });
 
     afterEach(async () => {
@@ -932,16 +967,15 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
     });
 
     async function rpc(command: string, params: Record<string, unknown> = {}): Promise<any> {
-      const response = await fetch(`http://localhost/rpc/${command}`, {
+      const response = await fetch(`http://127.0.0.1:${daemon.webPort}/rpc/${command}`, {
         method: 'POST',
-        unix: socketPath,
         headers: {
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json',
           'X-Lazy-Project': ctx.root,
         },
         body: JSON.stringify(params),
-      } as any);
+      });
       return { status: response.status, data: await response.json() };
     }
 
@@ -979,11 +1013,17 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
     let tmpDir: string;
     let originalBaseDir: string | undefined;
     let squatter: ReturnType<typeof Bun.serve> | undefined;
+    let restoreConfig: (() => void) | undefined;
 
     beforeEach(async () => {
       process.env.LAZY_TEST = '1';
       ctx = await setupTestLazy();
-      // Isolate daemon state (PID, lock, token, socket) from the real
+      // Pin config resolution to the test project: the daemon opens storage
+      // (previous-generation snapshot) BEFORE the web bind, and an unpinned
+      // loadConfig would walk up from bun test's cwd into lazy's OWN lazy.toml
+      // — dying on its external_path instead of on the bind under test.
+      restoreConfig = pinConfig(ctx.root);
+      // Isolate daemon state (PID, lock, token, port markers) from the real
       // ~/.lazy/daemon to avoid colliding with a developer's running daemon.
       // LAZY_DAEMON_BASE_DIR (not HOME) is the documented seam: it moves daemon
       // paths and nothing else — see test/helpers/daemon-base-dir.ts.
@@ -997,6 +1037,8 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
         try { squatter.stop(true); } catch { /* ignore */ }
         squatter = undefined;
       }
+      restoreConfig?.();
+      restoreConfig = undefined;
       if (originalBaseDir === undefined) delete process.env.LAZY_DAEMON_BASE_DIR;
       else process.env.LAZY_DAEMON_BASE_DIR = originalBaseDir;
       await ctx.cleanup();
@@ -1019,7 +1061,6 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
         await startDaemonServer({
           projectRoot: ctx.root,
           token: 'webbind-test-token',
-          socketPath: join(tmpDir, 'webbind.sock'),
           webPort: squattedPort,
           maxPortAttempts: 1,
           _forceBindWebInTest: true,
@@ -1086,7 +1127,6 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
           await startDaemonServer({
             projectRoot: ctx.root,
             token: 'window-exhaust-token',
-            socketPath: join(tmpDir, 'window-exhaust.sock'),
             webPort: basePort,
             maxPortAttempts: WINDOW,
             _forceBindWebInTest: true,
@@ -1111,19 +1151,17 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
     });
 
     // INVARIANT: after a web-bind failure, the daemon leaves no partial state
-    // behind — no stale PID file, no stale unix socket, no leaked flock. A
-    // subsequent start (once the port is freed) must succeed without manual
+    // behind — no stale PID file, no leaked flock. A subsequent start (once
+    // the port conflict is out of the way) must succeed without manual
     // cleanup, and isDaemonRunning() must report false in the interim.
     test('no stale daemon state remains after failed startup', async () => {
       squatter = Bun.serve({ hostname: SQUAT_HOST, port: 0, fetch: () => new Response('squatter') });
       const squattedPort = squatter.port;
-      const sockPath = join(tmpDir, 'webbind-stale.sock');
 
       await expect(
         startDaemonServer({
           projectRoot: ctx.root,
           token: 'webbind-stale-token',
-          socketPath: sockPath,
           webPort: squattedPort,
           maxPortAttempts: 1,
           _forceBindWebInTest: true,
@@ -1135,27 +1173,21 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
       // refuse with "already running" despite no daemon actually existing.
       expect(isDaemonRunning(ctx.root)).toBe(false);
 
-      // The socket file we passed is cleaned up.
-      expect(existsSync(sockPath)).toBe(false);
-
       // PID file in the default location (under $HOME/.lazy/daemon/<slug>/)
       // is cleaned up.
       const { getPidPath } = await import('../../src/daemon/paths');
       expect(existsSync(getPidPath(ctx.root))).toBe(false);
 
-      // Starting a fresh daemon — this time with noWeb so we don't need to
-      // free the squatted port — succeeds cleanly.
+      // Starting a fresh daemon — on an ephemeral port, so the squatted port
+      // does not need to be freed — succeeds cleanly.
       const fresh = await startDaemonServer({
         projectRoot: ctx.root,
         token: 'webbind-fresh-token',
-        socketPath: join(tmpDir, 'webbind-fresh.sock'),
-        noWeb: true,
       });
       try {
-        const resp = await fetch('http://localhost/daemon/status', {
-          unix: join(tmpDir, 'webbind-fresh.sock'),
+        const resp = await fetch(`http://127.0.0.1:${fresh.webPort}/daemon/status`, {
           headers: { 'Authorization': 'Bearer webbind-fresh-token' },
-        } as any);
+        });
         expect(resp.ok).toBe(true);
       } finally {
         await fresh.stop();
@@ -1171,11 +1203,17 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
     // Users ran `tail daemon.log` and saw the log appear frozen at
     // "Daemon sync loop enabled", with no indication of the actual failure.
     //
-    // The fix has two parts: (1) logger.error is called BEFORE throw so the
-    // error is guaranteed to appear via appendFileSync at end-of-file, and
+    // The fix has three parts: (1) logger.error is called BEFORE throw so the
+    // error is guaranteed to appear via appendFileSync at end-of-file,
     // (2) auto-start.ts opens the log file with O_APPEND so the child's
-    // stderr also appends rather than overwriting at position 0. This test
-    // verifies part (1); part (2) is tested via the fd behavior of spawn().
+    // stderr also appends rather than overwriting at position 0, and
+    // (3) the daemon logs the reason AFTER tearing the partial daemon down,
+    // so teardown's own output can never land on top of it. Part (3) is a
+    // later regression of the same user-facing symptom: the reason was logged
+    // first, teardown's two storage-close debug lines were appended after it,
+    // and `tail daemon.log` ended on debug noise with the headline eleven
+    // lines up. This test verifies parts (1) and (3); part (2) is tested via
+    // the fd behavior of spawn().
     test('bind failure logs actionable error to end of daemon log', async () => {
       const { logger } = await import('../../src/utils/logger');
       const logPath = join(tmpDir, 'daemon.log');
@@ -1203,7 +1241,6 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
           startDaemonServer({
             projectRoot: ctx.root,
             token: 'webbind-tail-token',
-            socketPath: join(tmpDir, 'webbind-tail.sock'),
             webPort: squattedPort,
             maxPortAttempts: 1,
             _forceBindWebInTest: true,
@@ -1228,12 +1265,88 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
 
         // The error must appear in the LAST section of the log, so that
         // `tail daemon.log` surfaces it. This is the critical user-facing
-        // property — users debug by tailing the log.
+        // property — users debug by tailing the log. The window is wider than
+        // the multi-line bind error itself because startup teardown appends a
+        // couple of debug lines (storage close) after it.
         const lines = logContent.trim().split('\n').filter(l => l.length > 0);
         const lastTenLines = lines.slice(-10).join('\n');
         expect(lastTenLines).toContain('Daemon failed to bind web dashboard');
+
+        // Stronger, and the property the ten-line window is standing in for:
+        // NOTHING is logged after the failure entry, so a tail of any length
+        // ends inside it. Teardown runs before the error is logged, so its
+        // storage-close debug lines cannot push the headline out of view.
+        expectLastLogEntry(logContent, 'Daemon failed to bind web dashboard');
       } finally {
         // Reset logger to prior state so this test doesn't bleed into others.
+        if (originalLogFile) {
+          logger.setLogFile(originalLogFile);
+        } else {
+          (logger as any).config.logFile = undefined;
+        }
+      }
+    });
+  });
+
+  // INVARIANT: "the reason is the last thing in daemon.log" belongs to the
+  // daemon's SHARED startup-failure path, not to the web-bind branch that first
+  // exposed it. Every fatal startup failure — web bind, proxy start, a config
+  // the daemon refuses — goes through one helper that writes the startup-error
+  // marker, tears the partial daemon down, and only then logs. Covering the
+  // proxy branch here keeps a future "log it early, it's safer" change from
+  // fixing one caller's tail and quietly re-breaking the others.
+  describe('startup failure log tail (non-bind callers)', () => {
+    let ctx: TestContext;
+    let tmpDir: string;
+    let originalBaseDir: string | undefined;
+    let squatter: ReturnType<typeof Bun.serve> | undefined;
+
+    beforeEach(async () => {
+      // LAZY_TEST=1 keeps startDaemonServer from repointing the logger at the
+      // real daemon.log — the test wires it to its own file below.
+      process.env.LAZY_TEST = '1';
+      ctx = await setupTestLazy();
+      tmpDir = await makeDaemonBaseDir();
+      originalBaseDir = process.env.LAZY_DAEMON_BASE_DIR;
+      process.env.LAZY_DAEMON_BASE_DIR = tmpDir;
+    });
+
+    afterEach(async () => {
+      if (squatter) {
+        try { squatter.stop(true); } catch { /* ignore */ }
+        squatter = undefined;
+      }
+      if (originalBaseDir === undefined) delete process.env.LAZY_DAEMON_BASE_DIR;
+      else process.env.LAZY_DAEMON_BASE_DIR = originalBaseDir;
+      await ctx.cleanup();
+      await removeDaemonBaseDir(tmpDir);
+    });
+
+    test('proxy startup failure is the last entry in daemon.log', async () => {
+      const { logger } = await import('../../src/utils/logger');
+      const logPath = join(tmpDir, 'daemon.log');
+      const originalLogFile = (logger as any).config.logFile;
+      logger.setLogFile(logPath);
+
+      try {
+        // Pin [proxy] to an occupied port so the proxy's bind fails — the same
+        // controlled failure the sibling teardown test above exercises.
+        squatter = Bun.serve({ hostname: SQUAT_HOST, port: 0, fetch: () => new Response('squatter') });
+        const configPath = join(ctx.root, 'lazy.toml');
+        const existing = await readFile(configPath, 'utf-8');
+        await writeFile(configPath, `${existing}\n[proxy]\nport = ${squatter.port}\n`);
+
+        await expect(
+          startDaemonServer({
+            projectRoot: ctx.root,
+            token: 'proxy-tail-token',
+          }),
+        ).rejects.toThrow(/failed to start the \[proxy\] server/i);
+
+        const logContent = await readFile(logPath, 'utf-8');
+        expect(logContent).toContain('Daemon failed to start the [proxy] server');
+        expectLastLogEntry(logContent, 'Daemon failed to start the [proxy] server');
+      } finally {
         if (originalLogFile) {
           logger.setLogFile(originalLogFile);
         } else {
@@ -1285,7 +1398,6 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
       daemon = await startDaemonServer({
         projectRoot: ctx.root,
         token: 'bind-default-token',
-        socketPath: join(tmpDir, 'bind-default.sock'),
         webPort: 0, // ephemeral free port — never collides
         _forceBindWebInTest: true,
       });
@@ -1294,28 +1406,40 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
     });
 
     // INVARIANT: /daemon/status reports the ACTUAL bind interface (127.0.0.1),
-    // not a hardcoded `localhost`. The CLI threads this through to the printed
-    // dashboard URL — `localhost` can resolve to IPv6 ::1 and miss an IPv4-only
+    // never a name. The CLI threads this through to the printed dashboard URL,
+    // and plain `localhost` can resolve to IPv6 ::1 and miss an IPv4-only
     // 127.0.0.1 bind, leaving users staring at an empty dashboard.
+    //
+    // The URL the user is SHOWN is now `lazy.localhost` rather than the bind
+    // address (add-dashboard-auth): browser cookies are scoped by host and not
+    // by port, and task app ports are published on 127.0.0.1, so the dashboard
+    // needs a hostname of its own or its session cookie is handed to
+    // agent-written app code. Both halves of the original invariant survive
+    // that: the payload still carries the real interface, and the displayed
+    // host is still never bare `localhost`.
     test('status payload reports bindHost=127.0.0.1 and a real port (not localhost)', async () => {
       daemon = await startDaemonServer({
         projectRoot: ctx.root,
         token: 'bind-status-token',
-        socketPath: join(tmpDir, 'bind-status.sock'),
         webPort: 0,
         _forceBindWebInTest: true,
       });
-      const resp = await fetch('http://localhost/daemon/status', {
-        unix: join(tmpDir, 'bind-status.sock'),
+      const resp = await fetch(`http://127.0.0.1:${daemon.webPort}/daemon/status`, {
         headers: { 'Authorization': 'Bearer bind-status-token' },
-      } as any);
+      });
       expect(resp.ok).toBe(true);
       const data = await resp.json() as any;
       expect(data.bindHost).toBe('127.0.0.1');
       expect(data.webPort).toBeGreaterThan(0);
-      // The user-facing URL must point at the real interface + port.
-      expect(formatDashboardUrl(data.bindHost, data.webPort)).toBe(`http://127.0.0.1:${data.webPort}`);
-      expect(formatDashboardUrl(data.bindHost, data.webPort)).not.toContain('localhost');
+      // The user-facing URL is on the payload too, so agents and the builder
+      // prompt do not have to re-derive it (and must not, in managed mode).
+      expect(data.dashboardUrl).toBe(formatDashboardUrl(data.bindHost, data.webPort));
+      // The user-facing URL carries the real port on the dashboard's own host,
+      // and never the bare `localhost` that may resolve to ::1.
+      const shown = new URL(formatDashboardUrl(data.bindHost, data.webPort));
+      expect(shown.port).toBe(String(data.webPort));
+      expect(shown.hostname).toBe(DASHBOARD_HOSTNAME);
+      expect(shown.hostname).not.toBe('localhost');
     });
 
     test('opt-in: [server] bind in lazy.toml changes the bind address', async () => {
@@ -1331,7 +1455,6 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
       daemon = await startDaemonServer({
         projectRoot: ctx.root,
         token: 'bind-optin-token',
-        socketPath: join(tmpDir, 'bind-optin.sock'),
         webPort: 0,
         _forceBindWebInTest: true,
       });
@@ -1339,10 +1462,11 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
       expect(daemon.webServer!.hostname).toBe('0.0.0.0');
       expect(daemon.bindHost).toBe('0.0.0.0');
       // Display rule: a 0.0.0.0 (all-interfaces) bind is reachable locally via
-      // loopback, so the convenient URL we show the user is 127.0.0.1 — never
-      // a literal `0.0.0.0`, which is not a connectable address in a browser.
+      // loopback, so the URL we show the user is the dashboard host (which
+      // resolves to loopback) — never a literal `0.0.0.0`, which is not a
+      // connectable address in a browser.
       expect(formatDashboardUrl(daemon.bindHost, daemon.webServer!.port!)).toBe(
-        `http://127.0.0.1:${daemon.webServer!.port}`,
+        `http://${DASHBOARD_HOSTNAME}:${daemon.webServer!.port}`,
       );
     });
   });
@@ -1350,19 +1474,30 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
   // Pure unit coverage for the host→display-URL formatting rule. Centralizing
   // this in one helper (formatDashboardUrl) is what keeps the ~5 print sites
   // from drifting back to a hardcoded `localhost`.
+  //
+  // A loopback bind now displays as DASHBOARD_HOSTNAME rather than the literal
+  // 127.0.0.1 these cases used to assert. That is deliberate and load-bearing:
+  // the dashboard needs a hostname of its own so its session cookie is not also
+  // sent to the task app ports `[serve]` publishes on 127.0.0.1 — see
+  // src/daemon/dashboard-url.ts. The invariants that mattered are unchanged and
+  // still asserted here: a display URL is always a CONNECTABLE address (never a
+  // literal 0.0.0.0/::), never the bare `localhost` that may resolve to ::1 and
+  // miss an IPv4-only bind, and a specific interface IP is shown untouched.
   describe('formatDashboardUrl', () => {
-    test('loopback bind prints 127.0.0.1', () => {
-      expect(formatDashboardUrl('127.0.0.1', 26024)).toBe('http://127.0.0.1:26024');
+    test('loopback bind prints the dashboard hostname', () => {
+      expect(formatDashboardUrl('127.0.0.1', 26024)).toBe(`http://${DASHBOARD_HOSTNAME}:26024`);
+      expect(formatDashboardUrl('::1', 26024)).toBe(`http://${DASHBOARD_HOSTNAME}:26024`);
+      expect(DASHBOARD_HOSTNAME).not.toBe('localhost');
     });
-    test('all-interfaces binds (0.0.0.0 / ::) collapse to loopback for local convenience', () => {
-      expect(formatDashboardUrl('0.0.0.0', 26024)).toBe('http://127.0.0.1:26024');
-      expect(formatDashboardUrl('::', 26024)).toBe('http://127.0.0.1:26024');
+    test('all-interfaces binds (0.0.0.0 / ::) collapse to the dashboard hostname', () => {
+      expect(formatDashboardUrl('0.0.0.0', 26024)).toBe(`http://${DASHBOARD_HOSTNAME}:26024`);
+      expect(formatDashboardUrl('::', 26024)).toBe(`http://${DASHBOARD_HOSTNAME}:26024`);
     });
     test('a specific interface IP is shown as-is', () => {
       expect(formatDashboardUrl('192.168.1.50', 8080)).toBe('http://192.168.1.50:8080');
     });
-    test('missing bindHost (older daemon payload) falls back to loopback', () => {
-      expect(formatDashboardUrl(undefined, 26024)).toBe('http://127.0.0.1:26024');
+    test('missing bindHost (older daemon payload) falls back to the dashboard hostname', () => {
+      expect(formatDashboardUrl(undefined, 26024)).toBe(`http://${DASHBOARD_HOSTNAME}:26024`);
     });
   });
 
@@ -1379,17 +1514,14 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
 
     // INVARIANT: `lazy daemon status` must always print the Web: line when
     // the daemon is running. Silently omitting it (as the pre-fix code did)
-    // hid the degraded state — users saw "daemon running" while container
-    // RPCs blew up with "Daemon context not initialized". This is a defensive
-    // test — post-fix the daemon refuses to start without a web port, so the
-    // degraded branch should never be hit in practice, but the output must
-    // never silently regress.
-    test('daemonStatus output includes Web line when webPort is missing', async () => {
-      // Test the CLI's formatting decision directly. We spin up a real
-      // daemon with noWeb:true (which leaves status.webPort undefined) and
-      // invoke the status command against it through the default socket
-      // path. This requires routing LAZY_DAEMON_BASE_DIR so the default
-      // socket path lands in our temp dir (see test/helpers/daemon-base-dir.ts).
+    // hid the daemon's address — and with TCP as the only transport, the Web
+    // line IS how a user finds the daemon at all. The "not bound" degraded
+    // branch in the CLI is no longer reachable against a current daemon (a
+    // daemon without a port refuses to start), so this asserts the positive
+    // form: the line is printed with the real bound address.
+    test('daemonStatus output includes the Web line with the bound address', async () => {
+      // Routing LAZY_DAEMON_BASE_DIR puts the daemon's discovery markers in a
+      // temp dir the CLI subprocess also reads (see test/helpers/daemon-base-dir.ts).
       const tmpDir = await makeDaemonBaseDir();
       const originalBaseDir = process.env.LAZY_DAEMON_BASE_DIR;
       process.env.LAZY_DAEMON_BASE_DIR = tmpDir;
@@ -1397,16 +1529,12 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
       process.env.LAZY_TEST = '1';
 
       try {
-        const { getSocketPath } = await import('../../src/daemon/paths');
-        const defaultSocket = getSocketPath(ctx.root);
         // Do NOT pass `token` — startDaemonServer only persists the token
         // file when it generates one itself. isDaemonRunning() in the CLI
         // subprocess needs the token file to exist to pass its readToken()
         // check.
         const daemon = await startDaemonServer({
           projectRoot: ctx.root,
-          socketPath: defaultSocket,
-          noWeb: true,
         });
         try {
           // Pass --project explicitly so the subprocess doesn't walk up to
@@ -1416,9 +1544,12 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
           });
           expectSuccess(result);
           expectOutput(result, 'Daemon is running');
-          // Critical: the Web: line is always printed, even in degraded mode.
+          // Critical: the Web: line is always printed, with the real port on
+          // the dashboard's own hostname (which is what every other print site
+          // shows too — see the formatDashboardUrl block below for why it is
+          // not the literal 127.0.0.1 the daemon binds).
           expectOutput(result, 'Web:');
-          expectOutput(result, 'not bound');
+          expectOutput(result, `http://${DASHBOARD_HOSTNAME}:${daemon.webPort}`);
         } finally {
           await daemon.stop();
         }
@@ -1467,11 +1598,8 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
         const existing = await readFile(configPath, 'utf-8');
         await writeFile(configPath, `${existing}\n[proxy]\nupstream = "https://api.anthropic.com"\n`);
 
-        const { getSocketPath } = await import('../../src/daemon/paths');
-        const defaultSocket = getSocketPath(ctx.root);
         const daemon = await startDaemonServer({
           projectRoot: ctx.root,
-          socketPath: defaultSocket,
         });
         try {
           const result = await ctx.lazy(['daemon', 'status', '--project', ctx.root], {
@@ -1511,10 +1639,8 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
 
       try {
         // Deliberately do NOT write a [proxy] section.
-        const { getSocketPath } = await import('../../src/daemon/paths');
         const daemon = await startDaemonServer({
           projectRoot: ctx.root,
-          socketPath: getSocketPath(ctx.root),
         });
         try {
           // The proxy is listening on an OS-assigned port with no config at all.
@@ -1563,10 +1689,8 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
         const existing = await readFile(configPath, 'utf-8');
         await writeFile(configPath, `${existing}\n[proxy]\nenabled = false\n`);
 
-        const { getSocketPath } = await import('../../src/daemon/paths');
         await expect(startDaemonServer({
           projectRoot: ctx.root,
-          socketPath: getSocketPath(ctx.root),
         })).rejects.toThrow(/`enabled` option has been removed/);
       } finally {
         process.chdir(STABLE_CWD);
@@ -1603,7 +1727,7 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
     let tmpHome: string;
     // Daemon state goes here rather than under tmpHome. tmpHome exists to hide
     // the developer's real ~/.claude from the credential gate; it should NOT
-    // also be deciding where the socket, PID and log live — that is
+    // also be deciding where the daemon markers, PID and log live — that is
     // LAZY_DAEMON_BASE_DIR's job. See test/helpers/daemon-base-dir.ts.
     let daemonBaseDir: string;
     let squatter: ReturnType<typeof Bun.serve> | undefined;
@@ -1696,6 +1820,13 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
       // raw stderr write. Logger entries are prefixed with an ISO timestamp
       // and the `[ERROR]` tag — a raw console.error write has neither.
       expect(logContent).toMatch(/\[ERROR\]\s*:\s*Daemon failed to bind web dashboard/);
+
+      // ...and it is the LAST entry in the log, in a real background daemon:
+      // an operator whose daemon would not start runs `tail daemon.log` and
+      // must land on the reason, not on the teardown chatter that follows it.
+      // The in-process sibling above asserts the same thing on the startup
+      // path; this one covers the whole real process, exit handler included.
+      expectLastLogEntry(logContent, 'Daemon failed to bind web dashboard');
     }, 20_000);
 
     // INVARIANT: startDaemonBackground throws the daemon's actionable error
@@ -1846,12 +1977,8 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
       process.env.LAZY_TEST = '1';
 
       try {
-        const { getSocketPath } = await import('../../src/daemon/paths');
-        const defaultSocket = getSocketPath(ctx.root);
         const daemon = await startDaemonServer({
           projectRoot: ctx.root,
-          socketPath: defaultSocket,
-          noWeb: true,
         });
         try {
           const result = await ctx.lazy(['daemon', 'status', '--project', ctx.root], {

@@ -35,7 +35,6 @@ function makeTask(overrides?: Partial<Task>): Task {
     prompt: 'do the thing',
     type: 'task',
     status: 'blocked',
-    priority: 'normal',
     created_at: Date.now(),
     completed_at: null,
     target: { kind: 'branch' as const, branch: 'main' },
@@ -161,6 +160,7 @@ describe('search over a content-less turn', () => {
       commits: [],
       comments: [],
       followUps: [],
+      raisedItems: [],
       promptHistory: [],
     } as unknown as TaskData;
   }

@@ -39,8 +39,24 @@ import {
   type SessionSnapshot,
 } from '../import/capture-session';
 
+// Build-time flag from `scripts/build.ts --define LAZY_RELEASE_BUILD=true`; undefined
+// when running from source. Inline `typeof` at each use site so bun can fold it.
+declare const LAZY_RELEASE_BUILD: boolean;
+
 /** How often to check for JSONL changes and re-capture (ms) */
-const CAPTURE_INTERVAL_MS = 30_000;
+const DEFAULT_CAPTURE_INTERVAL_MS = 30_000;
+
+/** Capture cadence — 30s in production; overridable in tests (see CLAUDE.md). */
+function captureIntervalMs(): number {
+  if (typeof LAZY_RELEASE_BUILD === 'undefined' && process.env.LAZY_TEST === '1') {
+    const override = process.env.LAZY_FORCE_BUILDER_CAPTURE_INTERVAL_MS;
+    if (override) {
+      const ms = Number(override);
+      if (Number.isFinite(ms) && ms > 0) return ms;
+    }
+  }
+  return DEFAULT_CAPTURE_INTERVAL_MS;
+}
 
 export interface BuilderSupervisorConfig {
   /** Path to the repo root (working directory for Claude Code) */
@@ -157,26 +173,28 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
   const beforeSnapshot = await snapshotSessionFiles(config.worktreePath);
 
   // When launched with `--resume <id>`, that session is where the run STARTED —
-  // Claude appends to <id>.jsonl in place until /clear, compaction, or resume
-  // rolls it to a fresh segment. The resume target stamped at exit is always the
-  // NEWEST owned segment, not <id>; the resume id only serves as a tiebreaker so
-  // an unrelated, merely-touched session in the shared ~/.claude/projects/<proj>
-  // dir can't hijack detection when no new segment rolled. See
-  // pickActiveSessionFile.
-  const resumeSessionId = parseResumeSessionId(config.claudeExtraArgs);
+  const initialResumeSessionId = parseResumeSessionId(config.claudeExtraArgs);
+  const resumeSessionId = initialResumeSessionId;
   if (resumeSessionId) {
     log(`[builder] Launched with --resume ${resumeSessionId}; anchoring capture to it`);
   }
 
-  // Build Claude args
-  const claudeArgs = [
-    'claude',
-    '--append-system-prompt', safeArgvPrompt(systemPrompt, 'builder system prompt'),
-    ...(config.claudeExtraArgs ?? []),
-  ];
+  // Build Claude args — continuity relaunches pass an explicit resume id; the
+  // initial launch keeps whatever `--resume` arrived via CLI after `--`.
+  const claudeExtraWithoutResume = stripResumeFromClaudeArgs(config.claudeExtraArgs);
+  const buildClaudeArgs = (resumeId: string | null): string[] => {
+    const args = [
+      'claude',
+      '--append-system-prompt', safeArgvPrompt(systemPrompt, 'builder system prompt'),
+    ];
+    const id = resumeId ?? initialResumeSessionId;
+    if (id) args.push('--resume', id);
+    args.push(...claudeExtraWithoutResume);
+    return args;
+  };
 
   if (config.debug) {
-    log(`[builder] Claude args: ${claudeArgs.join(' ')}`);
+    log(`[builder] Claude args: ${buildClaudeArgs(initialResumeSessionId).join(' ')}`);
   }
 
   // Start background incremental capture. This is the primary safety net for
@@ -202,16 +220,33 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
 
   log('[builder] Launching Claude Code interactively...');
 
-  // Launch Claude Code with inherited stdin/stdout/stderr
-  const proc = spawn(claudeArgs, {
-    cwd: config.worktreePath,
-    stdin: 'inherit',
-    stdout: 'inherit',
-    stderr: 'inherit',
-    timeout: 0, // Long-running: builder Claude Code session can run for hours
-  });
-
-  const exitCode = await proc.exited;
+  let exitCode: number;
+  if (config.daemonConfigPath) {
+    const { runBuilderWithContinuity } = await import('../builder/continuity');
+    const continuity = await runBuilderWithContinuity({
+      daemonConfigPath: config.daemonConfigPath,
+      projectRoot: config.worktreePath,
+      buildClaudeArgs,
+      worktreePath: config.worktreePath,
+      baseEnv: process.env as Record<string, string | undefined>,
+      log,
+      errorOut: (msg) => console.error(msg),
+      resolveResumeId: () => monitor.activeSessionId(),
+    });
+    exitCode = continuity.exitCode;
+    if (continuity.restarts > 0) {
+      log(`[builder] Continuity: ${continuity.restarts} in-place relaunch(es) across daemon restart(s)`);
+    }
+  } else {
+    const proc = spawn(buildClaudeArgs(null), {
+      cwd: config.worktreePath,
+      stdin: 'inherit',
+      stdout: 'inherit',
+      stderr: 'inherit',
+      timeout: 0,
+    });
+    exitCode = await proc.exited;
+  }
   log(`[builder] Claude Code exited with code ${exitCode}`);
 
   // The launch probe proves the MCP server can start; it cannot see a loss that
@@ -261,7 +296,7 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
       `Check \`lazy daemon status\`, then \`lazy doctor\` for details. ` +
       `\`lazy doctor --reimport-conversations\` can re-import from the session files on disk.`,
     );
-    log(`[builder] Conversation capture failures this session: ${captureFailures.length}`);
+    log(`[builder] Conversation capture failures this session: ${monitor.failureCount()}`);
   }
 
   if (detectedSessionId) {
@@ -349,6 +384,71 @@ export async function preflightAgentBinary(command: string): Promise<void> {
   }
 
   log(`[builder] Preflight OK: ${stdout.trim()}`);
+}
+
+/** Total wall-clock budget for continuity relaunch preflight retries. */
+export const PREFLIGHT_RETRY_TOTAL_MS = 30_000;
+
+/** Pause between relaunch preflight attempts while an upgrade finishes writing. */
+export const PREFLIGHT_RETRY_INTERVAL_MS = 5_000;
+
+/**
+ * True when a preflight failure is plausibly transient — the host is mid-way
+ * through installing a new agent binary during `lazy upgrade`.
+ * Missing/unexecutable binaries are not retried.
+ */
+export function isTransientAgentBinaryPreflightError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const msg = err.message;
+  if (msg.includes('could not exec')) return false;
+  return (
+    msg.includes('did not identify the lazy agent') ||
+    msg.includes('BARE BUN RUNTIME') ||
+    /Script not found/i.test(msg)
+  );
+}
+
+export interface PreflightAgentBinaryRetryOptions {
+  log?: (msg: string) => void;
+  sleep?: (ms: number) => Promise<void>;
+  preflight?: (command: string) => Promise<void>;
+  totalMs?: number;
+  intervalMs?: number;
+}
+
+/**
+ * Run {@link preflightAgentBinary} with bounded retries for continuity relaunches.
+ * A mid-upgrade extract/rename can briefly expose a bare Bun runtime at the bind
+ * mount; waiting for the host write to finish is the legitimate fix — a genuinely
+ * bad binary still fails loud once retries exhaust.
+ */
+export async function preflightAgentBinaryWithRetry(
+  command: string,
+  opts: PreflightAgentBinaryRetryOptions = {},
+): Promise<void> {
+  const writeLog = opts.log ?? log;
+  const sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const preflight = opts.preflight ?? preflightAgentBinary;
+  const deadline = Date.now() + (opts.totalMs ?? PREFLIGHT_RETRY_TOTAL_MS);
+  const intervalMs = opts.intervalMs ?? PREFLIGHT_RETRY_INTERVAL_MS;
+
+  let attempt = 0;
+  while (true) {
+    attempt += 1;
+    try {
+      await preflight(command);
+      return;
+    } catch (err) {
+      if (!isTransientAgentBinaryPreflightError(err) || Date.now() >= deadline) {
+        throw err;
+      }
+      writeLog(
+        `[builder] Agent binary changed mid-read — waiting for the upgrade to finish writing it ` +
+        `(attempt ${attempt})...`,
+      );
+      await sleep(intervalMs);
+    }
+  }
 }
 
 /**
@@ -462,6 +562,15 @@ export function parseResumeSessionId(args: string[] | undefined): string | null 
   return null;
 }
 
+/** Remove a `--resume <id>` pair so continuity can inject its own resume target. */
+export function stripResumeFromClaudeArgs(args: string[] | undefined): string[] {
+  if (!args?.length) return [];
+  const out = [...args];
+  const i = out.indexOf('--resume');
+  if (i >= 0) out.splice(i, 2);
+  return out;
+}
+
 /**
  * Decide which JSONL file holds the live builder session, given the mtimes
  * before launch and after, plus the explicit `--resume` id (if any).
@@ -540,6 +649,31 @@ async function findActiveSessionFile(
 type StorageFactory = (lazyRoot: string) => Promise<import('../storage/interface').Storage>;
 
 /**
+ * Render an error for a capture-failure report — message, plus the machine
+ * detail a bare message leaves out.
+ *
+ * A capture failure is read ONCE, hours later, by an engineer who cannot
+ * reproduce it, so `err.message` alone is often not enough to act on. Measured
+ * on Bun 1.4.2: a refused connection from `fetch` is a TypeError reading
+ * "Unable to connect. Is the computer able to access the url?" — no address, no
+ * port, no errno, and `cause` undefined; the errno lives on `code`
+ * ("ConnectionRefused"). fs errors put theirs on `code` too (ENOENT, EACCES),
+ * and wrapped errors put the real fault under `cause`. Include whichever exist.
+ */
+export function describeError(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  const code = (err as { code?: unknown }).code;
+  const codePart = typeof code === 'string' && !err.message.includes(code) ? ` [${code}]` : '';
+  const cause = (err as { cause?: unknown }).cause;
+  const causePart = cause instanceof Error
+    ? ` (cause: ${cause.message})`
+    : cause !== undefined && cause !== null
+      ? ` (cause: ${String(cause)})`
+      : '';
+  return `${err.message}${codePart}${causePart}`;
+}
+
+/**
  * Build a Storage that persists through the daemon over its TCP web server.
  *
  * The daemon MCP config (mounted into the container) carries the daemon's TCP
@@ -579,10 +713,22 @@ export async function daemonRemoteStorage(
   // unreachable this throws here, surfacing the failure instead of silently
   // dropping the conversation. RemoteStorage needs the path for
   // getStoragePath()/getTaskDir(); capture itself only uses saveConversation.
-  const storagePath = await client.rpc('storage', cfg.projectRoot, {
-    method: 'getStoragePath',
-    args: {},
-  }) as string;
+  let storagePath: string;
+  try {
+    storagePath = await client.rpc('storage', cfg.projectRoot, {
+      method: 'getStoragePath',
+      args: {},
+    }) as string;
+  } catch (err) {
+    // Name the target and the surface. This error is read hours later out of a
+    // capture-failure report, where the bare transport message is unactionable:
+    // Bun's refused-connection TypeError does not name the address it failed to
+    // reach, so without this the report cannot distinguish an unreachable
+    // host.docker.internal from a wrong port or a rejected credential.
+    throw new Error(
+      `daemon storage handshake failed against ${cfg.target} (POST /builder/storage): ${describeError(err)}`,
+    );
+  }
   return new RemoteStorage(client, cfg.projectRoot, storagePath);
 }
 
@@ -623,8 +769,23 @@ export async function preflightBuilderCapture(
       `\`lazy daemon status\` and relaunch the builder.`,
     );
   }
+  // Scratch capture rides the same cadence and the same RemoteStorage handle.
+  // A missing allowlist entry here is the exact failure mode that made every
+  // tick 403 while conversation capture worked — list+save must be proven too.
+  try {
+    await storage.listScratchFiles();
+  } catch (err) {
+    throw new Error(
+      `Builder preflight failed: scratch capture cannot reach the lazy store.\n` +
+      `  daemon config: ${daemonConfigPath}\n` +
+      `  error:         ${err instanceof Error ? err.message : String(err)}\n` +
+      `Scratch sync uses the same POST /builder/storage surface as conversation ` +
+      `capture. A 403 here means listScratchFiles/saveScratchFile are missing from ` +
+      `the builder allowlist.`,
+    );
+  }
   await storage.close();
-  log('[builder] Preflight OK: conversation capture can reach the store');
+  log('[builder] Preflight OK: conversation and scratch capture can reach the store');
 }
 
 /**
@@ -652,7 +813,7 @@ export function buildBuilderStorageFactory(
  * /clear, compaction, and resume — single-file capture silently drops the rest)
  * and is resilient to non-graceful exit:
  *
- *   - A timer re-captures all new-or-modified files every CAPTURE_INTERVAL_MS,
+ *   - A timer re-captures all new-or-modified files every captureIntervalMs(),
  *     so a builder killed by Ctrl-C / SIGTERM / container stop / crash still has
  *     its conversations saved up to the last tick.
  *   - SIGINT/SIGTERM handlers trigger an immediate final flush before the
@@ -681,7 +842,12 @@ export function startCaptureMonitor(
     storage: import('../storage/interface').Storage,
     sessionId: string,
   ) => Promise<void>,
-): { stop: () => Promise<string | null>; failures: () => string[] } {
+): {
+  stop: () => Promise<string | null>;
+  failures: () => string[];
+  failureCount: () => number;
+  activeSessionId: () => Promise<string | null>;
+} {
   const beforeTimes = snapshotToFileTimes(beforeSnapshot);
   // Tracks what we've already persisted so each pass only re-saves files that
   // actually changed since last capture.
@@ -691,11 +857,44 @@ export function startCaptureMonitor(
   let storage: import('../storage/interface').Storage | null = null;
   let lastDetectedSessionId: string | null = resumeSessionId;
 
-  const { record: recordFailure, list: listFailures } = createCaptureFailureRecorder(logError);
+  const {
+    record: recordFailure,
+    list: listFailures,
+    count: countFailures,
+  } = createCaptureFailureRecorder(logError);
 
   async function getStorage(): Promise<import('../storage/interface').Storage> {
     if (!storage) storage = await storageFactory(lazyRoot);
     return storage;
+  }
+
+  /**
+   * Persist the builder's scratch dir into the store.
+   *
+   * Rides the conversation-capture cadence deliberately: scratch artifacts are
+   * lost to a non-graceful exit exactly the way conversations are, so they want
+   * the same timer + signal + final-flush safety net rather than a second one.
+   *
+   * Its own failure domain — a scratch dir that cannot be read (permissions, a
+   * vanished mount) must not cost the session its conversation capture, which is
+   * the more valuable of the two.
+   */
+  async function syncScratchOnce(storage: import('../storage/interface').Storage): Promise<void> {
+    const { resolveScratchDirForCapture } = await import('../builder/scratch');
+    const { syncScratchDir } = await import('../builder/scratch-sync');
+    const scratchDir = resolveScratchDirForCapture(lazyRoot);
+    const result = await syncScratchDir({
+      scratchDir,
+      storage,
+      actor: 'builder',
+      ...(lastDetectedSessionId ? { sessionId: lastDetectedSessionId } : {}),
+    });
+    if (result.stored.length > 0) {
+      log(`[builder] Scratch capture: persisted ${result.stored.length} file(s) from ${scratchDir}`);
+    }
+    // Every skip is surfaced, never swallowed: an artifact the engineer believes
+    // is saved but is not is the failure mode this whole feature exists to avoid.
+    for (const warning of result.warnings) logError(`[builder] Scratch capture: ${warning}`);
   }
 
   /** Capture all new-or-modified files once. Returns true if anything was saved. */
@@ -703,7 +902,7 @@ export function startCaptureMonitor(
     const s = await getStorage();
     const result = await captureNewOrModifiedConversations(lazyRoot, beforeSnapshot, s, captured);
     for (const { sessionId, error } of result.errors) {
-      recordFailure(`[builder] Incremental capture failed for ${sessionId}: ${error.message}`);
+      recordFailure(`[builder] Incremental capture failed for ${sessionId}: ${describeError(error)}`);
     }
     if (result.captured.length > 0) {
       log(`[builder] Incremental capture: saved ${result.captured.length} session file(s)`);
@@ -714,6 +913,17 @@ export function startCaptureMonitor(
     const activeFile = await findActiveSessionFile(beforeTimes, lazyRoot, resumeSessionId);
     if (activeFile) lastDetectedSessionId = basename(activeFile, '.jsonl');
     else if (result.newestSessionId) lastDetectedSessionId = result.newestSessionId;
+
+    // After the session id is resolved, so scratch files are stamped with the
+    // conversation that produced them. Isolated failure domain for the THROW
+    // (conversation capture must not be lost), but failures still accumulate in
+    // failures() so the human is told at session end — a log in /tmp is not.
+    try {
+      await syncScratchOnce(s);
+    } catch (err) {
+      const msg = describeError(err);
+      recordFailure(`[builder] Scratch capture failed: ${msg}`);
+    }
   }
 
   const timer = setInterval(async () => {
@@ -722,12 +932,12 @@ export function startCaptureMonitor(
     try {
       await captureOnce();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeError(err);
       recordFailure(`[builder] Incremental capture failed: ${msg}`);
     } finally {
       inFlight = false;
     }
-  }, CAPTURE_INTERVAL_MS);
+  }, captureIntervalMs());
 
   // Non-graceful exit safety net: flush on signal, then re-raise so the process
   // exits with the conventional code. Without this, Ctrl-C / docker stop would
@@ -743,7 +953,7 @@ export function startCaptureMonitor(
       try {
         await stopInternal();
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describeError(err);
         recordFailure(`[builder] Signal-triggered capture failed: ${msg}`);
       } finally {
         process.removeListener('SIGINT', onSignal);
@@ -769,7 +979,7 @@ export function startCaptureMonitor(
       await captureOnce();
       log('[builder] Final conversation capture completed');
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeError(err);
       recordFailure(`[builder] Final capture failed: ${msg}`);
     }
 
@@ -781,7 +991,7 @@ export function startCaptureMonitor(
       try {
         await onFinalSession(await getStorage(), lastDetectedSessionId);
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describeError(err);
         recordFailure(`[builder] Failed to stamp sessionId onto resume intent: ${msg}`);
       }
     }
@@ -790,7 +1000,7 @@ export function startCaptureMonitor(
       try {
         await storage.close();
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describeError(err);
         logError(`[builder] Failed to close storage after final capture: ${msg}`);
       }
       storage = null;
@@ -805,7 +1015,15 @@ export function startCaptureMonitor(
   // `failures` is the whole point of recordFailure: the caller prints it to the
   // terminal once the session ends, so a capture that has been failing silently
   // into /tmp for hours is something the human is TOLD about.
-  return { stop: stopInternal, failures: listFailures };
+  async function activeSessionId(): Promise<string | null> {
+    // Continuity may relaunch within the first CAPTURE_INTERVAL_MS after Claude
+    // starts — before the timer tick would have learned the session id. Scan the
+    // projects dir now so `--resume` targets this conversation, not a fresh one.
+    const activeFile = await findActiveSessionFile(beforeTimes, lazyRoot, resumeSessionId);
+    if (activeFile) lastDetectedSessionId = basename(activeFile, '.jsonl');
+    return lastDetectedSessionId;
+  }
+  return { stop: stopInternal, failures: listFailures, failureCount: countFailures, activeSessionId };
 }
 
 /**
@@ -821,17 +1039,54 @@ export function startCaptureMonitor(
  * A capture failure is normally the same failure repeating (a wrong credential,
  * an unreachable daemon), so the report dedupes by message; the cap bounds a
  * pathological session where each tick fails differently.
+ *
+ * The cap SAYS SO when it bites, and `count` still counts what it dropped. A
+ * message carries the failing session id (`… failed for ${sessionId}: …`), so
+ * distinct messages are not exotic — six failing conversations reach the cap on
+ * their own. A report that showed five and quietly hid the sixth would be the
+ * same silent loss this recorder exists to prevent, one layer up.
  */
 export function createCaptureFailureRecorder(
   logFailure: (message: string) => void,
   max = 5,
-): { record: (message: string) => void; list: () => string[] } {
+): { record: (message: string) => void; list: () => string[]; count: () => number } {
+  // `seen` dedupes; `failures` is only the DISPLAY slice. Dedupe must happen
+  // across everything seen, not just what fits: capture retries every 30
+  // seconds, so counting dropped occurrences instead of dropped DISTINCT
+  // failures would report "and 240 further" for one repeating error. `seen`
+  // holds short strings and only ever grows by a genuinely new failure mode —
+  // the cap is here to bound the terminal report, not this set.
+  const seen = new Set<string>();
   const failures: string[] = [];
   return {
     record(message: string): void {
-      logFailure(message);
-      if (!failures.includes(message) && failures.length < max) failures.push(message);
+      // Accumulate BEFORE logging, and never let the logger's failure become
+      // the recorder's. The end-of-session report is the durable half of this
+      // (a log line inside a container is not "telling the human"), so it must
+      // not depend on the log write succeeding — the crash this ordering exists
+      // for was exactly a log write throwing out of `record` and killing the
+      // supervisor mid-report. src/supervisor/log.ts no longer throws; this
+      // keeps the guarantee independent of which logger a caller injects.
+      if (!seen.has(message)) {
+        seen.add(message);
+        if (failures.length < max) failures.push(message);
+      }
+      try {
+        logFailure(message);
+      } catch {
+        // Nowhere to report the reporting failure to. The message is already
+        // recorded above and will reach the human when the session ends.
+      }
     },
-    list: () => [...failures],
+    list: () => {
+      const dropped = seen.size - failures.length;
+      if (dropped === 0) return [...failures];
+      return [
+        ...failures,
+        `…and ${dropped} further distinct capture failure${dropped === 1 ? '' : 's'} ` +
+        `not shown — see the supervisor log for all of them`,
+      ];
+    },
+    count: () => seen.size,
   };
 }

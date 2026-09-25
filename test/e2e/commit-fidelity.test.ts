@@ -13,6 +13,7 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
 import { createTask, disablePreAccept, startAndReconcile } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 
 /** Latest commit body on the given branch. */
 function lastCommitBody(ctx: TestContext, branch: string): string {
@@ -26,6 +27,8 @@ async function startCommittedTask(ctx: TestContext, goal: string): Promise<strin
   // Reconcile too: accept refuses a task that is still 'working', and only a
   // reconcile pass moves it to 'blocked'.
   await startAndReconcile(ctx, id);
+  // Fixture setup, not the subject (see test/helpers/final.ts).
+  seedFinal(ctx, id);
   return id;
 }
 

@@ -27,31 +27,28 @@ describe('runner configuration', () => {
     expectOutput(result, 'Docker installed');
   });
 
-  test('host-process runner config is recognized', async () => {
+  // INVARIANT: host-process runner is test-harness-only — user lazy.toml must fail loud.
+  test('host-process runner config is rejected with docker guidance', async () => {
     const configPath = join(ctx.root, 'lazy.toml');
     const existingConfig = readFileSync(configPath, 'utf-8');
     writeFileSync(configPath, setRunnerType(existingConfig, 'dangerously-host-process-without-any-isolation'));
 
     const result = await ctx.lazy(['doctor']);
-    // Should show host-process mode checks instead of Docker checks
-    expectOutput(result, 'Runner mode: host-process');
-    expectOutputExcludes(result, 'Docker installed');
-    expectOutputExcludes(result, 'Docker daemon');
+    expectFailure(result);
+    expectOutput(result, 'Host-process runner is no longer supported');
+    expectOutput(result, 'Docker');
   });
 
-  test('list works with host-process runner', async () => {
-    // Create a task first (before changing runner config)
+  test('list fails when lazy.toml requests host-process runner', async () => {
     const taskId = await createTask(ctx, 'Host process test');
 
-    // Switch to host-process runner
     const configPath = join(ctx.root, 'lazy.toml');
     const existingConfig = readFileSync(configPath, 'utf-8');
     writeFileSync(configPath, setRunnerType(existingConfig, 'dangerously-host-process-without-any-isolation'));
 
-    // List should work — it uses the runner for crash detection only
     const result = await ctx.lazy(['list', '--all']);
-    expectSuccess(result);
-    expectOutput(result, 'Host process test');
+    expectFailure(result);
+    expectError(result, 'Host-process runner is no longer supported');
   });
 
   test('invalid runner config fails with error', async () => {
@@ -62,27 +59,7 @@ describe('runner configuration', () => {
     // doctor always creates a runner, so it should fail with an invalid runner type
     const result = await ctx.lazy(['doctor']);
     expectFailure(result);
-    expectError(result, 'Unknown runner type');
-  });
-
-  test('doctor shows claude CLI check for host-process mode', async () => {
-    const configPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, setRunnerType(existingConfig, 'dangerously-host-process-without-any-isolation'));
-
-    const result = await ctx.lazy(['doctor']);
-    // Should check for Claude Code CLI instead of Docker
-    expectOutput(result, 'Claude Code CLI');
-  });
-
-  test('doctor skips Docker image checks in host-process mode', async () => {
-    const configPath = join(ctx.root, 'lazy.toml');
-    const existingConfig = readFileSync(configPath, 'utf-8');
-    writeFileSync(configPath, setRunnerType(existingConfig, 'dangerously-host-process-without-any-isolation'));
-
-    const result = await ctx.lazy(['doctor']);
-    expectOutputExcludes(result, 'Container image');
-    expectOutputExcludes(result, 'orphaned containers');
+    expectOutput(result, 'Invalid runner type');
   });
 
   test('runner section is not reported as unknown by doctor', async () => {
@@ -91,30 +68,25 @@ describe('runner configuration', () => {
     expectOutput(result, 'No unknown config options');
   });
 
-  test('show works with host-process runner', async () => {
+  test('show fails when lazy.toml requests host-process runner', async () => {
     const taskId = await createTask(ctx, 'Show in host-process mode');
 
-    // Switch to host-process runner
     const configPath = join(ctx.root, 'lazy.toml');
     const existingConfig = readFileSync(configPath, 'utf-8');
     writeFileSync(configPath, setRunnerType(existingConfig, 'dangerously-host-process-without-any-isolation'));
 
     const result = await ctx.lazy(['show', taskId]);
-    expectSuccess(result);
-    expectOutput(result, 'Show in host-process mode');
+    expectFailure(result);
+    expectError(result, 'Host-process runner is no longer supported');
   });
 
-  // INVARIANT: Old top-level `runner = "docker"` format still works (backward compat).
-  // Users with existing configs shouldn't break on upgrade.
-  test('backward compat: top-level runner string is accepted with deprecation warning', async () => {
+  // INVARIANT: Old top-level `runner = "host"` fails loud — never silently maps to docker.
+  test('backward compat: top-level host runner string is rejected', async () => {
     const configPath = join(ctx.root, 'lazy.toml');
-    // Write a minimal config with old format only (no [runner] section)
-    writeFileSync(configPath, `runner = "dangerously-host-process-without-any-isolation"\n[models]\ndefault = "sonnet"\n`);
+    writeFileSync(configPath, `runner = "host"\n[models]\ndefault = "sonnet"\n`);
 
     const result = await ctx.lazy(['doctor']);
-    // Should work — backward compat converts string to section format
-    expectOutput(result, 'Claude Code CLI');
-    // Deprecation warning goes to stderr
-    expectError(result, "deprecated");
+    expectFailure(result);
+    expectOutput(result, 'Host-process runner is no longer supported');
   });
 });

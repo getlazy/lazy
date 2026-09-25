@@ -12,8 +12,8 @@
 import { tryRpc, NotALazyProjectError } from '../daemon/client';
 import { parseProxyActivityEvent } from '../proxy/activity';
 import { PROXY_ACTIVITY_CHANNEL } from '../daemon/proxy-watch';
-import { renderProxyActivity, credentialRefusalHint } from './proxy-activity-renderer';
-import { dim, yellow } from './theme';
+import { renderProxyActivity, credentialRefusalHint } from '../render/proxy-activity-renderer';
+import { dim, yellow } from '../render/theme';
 
 /**
  * Does this error mean the daemon does not know the command at all?

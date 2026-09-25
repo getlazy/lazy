@@ -5,23 +5,29 @@
  * Delegates: all launch orchestration to daemon via `queryStartTask` RPC.
  */
 
+import { parseReviewFlags, REVIEW_FLAGS, REVIEW_FLAGS_USAGE } from '../review-flags';
+import { TeamsCommandRefusedError } from '../../daemon/client';
 import { existsSync } from 'fs';
-import { requireLazyRoot, requireStorage, shortId, displayId, displayIdFor, parseFlags, validateModel, resolveTaskOrExit, getWorktreePath } from '../helpers';
+import { shortId, displayId, displayIdFor, getWorktreePath } from '../../task/identity';
+import { requireLazyRoot, requireStorage, parseFlags, validateModel, validateAgentProfileOrExit, resolveTaskOrExit } from '../helpers';
 import { getRemoteDefaultBranch } from '../../git/operations';
 import { promptYesNo, isTTY } from '../editor';
 import { followContainer } from './shared';
-import { checkOrphanedChild } from '../orphan';
+import { checkOrphanedChild } from '../../task/orphan';
 import { protocolDir as getProtocolDir } from '../../protocol';
 
-import { listAgents } from '../../agent/registry';
-import { queryStartTask } from '../../daemon/rpc-fallback';
+import { queryStartTask, queryTaskEnv } from '../../daemon/rpc-fallback';
+import { collectTaskEnvVars } from './env';
 import { VALID_EFFORT_LEVELS, type EffortLevel, type RunnerType, resolveRunnerType, RUNNER_ALIAS_HINT } from '../../config/types';
+import { hostRunnerRemovedMessage, isRemovedHostRunnerInput } from '../../runner/host-runner-gate';
 
-import { theme } from '../theme';
+import { theme } from '../../render/theme';
+import { createPhaseDisplay } from '../phase-display';
 import { parentTaskIdOf } from '../../task-target';
 import { formatMarkdown } from '../../utils/markdown';
 import { initTracing, shutdownTracing, withSpan, currentTraceparent } from '../../tracing';
 import { maybeOfferWorktreeImageForTask } from '../../docker/worktree-image';
+import { usagePauseOverrideEligibility } from '../human-terminal';
 
 
 export async function commandStart(args: string[]): Promise<void> {
@@ -34,6 +40,15 @@ export async function commandStart(args: string[]): Promise<void> {
     { name: 'force-local', takesValue: false },
     { name: 'effort', takesValue: true },
     { name: 'runner', takesValue: true },
+    ...REVIEW_FLAGS,
+    // Registered only so the pre-fold spelling gets a message naming its
+    // replacement instead of a generic "unknown flag" (rejected below).
+    { name: 'low-high-loop', takesValue: true },
+    // Registered only so the pre-rename spelling gets a message naming its
+    // replacement instead of a generic "unknown flag" (rejected below).
+    { name: 'ivan-loop', takesValue: true },
+    { name: 'env', takesValue: true, accumulate: true },
+    { name: 'env-file', takesValue: true },
 
   ], 'start');
 
@@ -59,10 +74,44 @@ export async function commandStart(args: string[]): Promise<void> {
     effortOverride = effortValue as EffortLevel;
   }
 
+  // The loop was renamed; the old flag is gone rather than silently aliased, so
+  // a script still passing it is told rather than quietly getting a plain turn.
+  if (parsed.flags.get('ivan-loop') !== undefined) {
+    console.error("--ivan-loop has been renamed. Use --review low-high instead.");
+    process.exit(1);
+  }
+
+  // The low-high loop stopped being an experiment and became one of three
+  // review MODES, so its flag is gone rather than silently aliased: --review
+  // takes a mode, and "off" now means NO review at all, which is not what
+  // --low-high-loop off meant. Guessing between them would be the wrong
+  // direction on a flag that decides how much a task costs to review.
+  if (parsed.flags.get('low-high-loop') !== undefined) {
+    console.error(
+      "--low-high-loop is now --review. Use --review low-high for the same behaviour, " +
+      "or --review separate for what --low-high-loop off used to do (a reviewer in its " +
+      "own session after the final). --review off means no review at all.",
+    );
+    process.exit(1);
+  }
+
+  // The three --review* flags, each independent: supplying one leaves the
+  // other two inherited (task > parent task > project).
+  const reviewFlags = parseReviewFlags(parsed.flags);
+  if ('error' in reviewFlags) {
+    console.error(reviewFlags.error);
+    process.exit(1);
+  }
+  const reviewOverrides = reviewFlags.overrides;
+
   // Parse --runner flag (per-task runner override; persists onto the task)
   let runnerOverride: RunnerType | undefined;
   const runnerValue = parsed.flags.get('runner') as string | undefined;
   if (runnerValue !== undefined) {
+    if (isRemovedHostRunnerInput(runnerValue)) {
+      console.error(hostRunnerRemovedMessage('per-task --runner'));
+      process.exit(1);
+    }
     const resolved = resolveRunnerType(runnerValue);
     if (!resolved) {
       console.error(`Invalid runner '${runnerValue}'. Must be one of: ${RUNNER_ALIAS_HINT}`);
@@ -75,11 +124,7 @@ export async function commandStart(args: string[]): Promise<void> {
   const agentFlag = parsed.flags.get('agent') as string | undefined;
   let agentId: string | undefined;
   if (agentFlag !== undefined) {
-    const validAgents = listAgents();
-    if (!validAgents.includes(agentFlag)) {
-      console.error(`Unknown agent '${agentFlag}'. Available agents: ${validAgents.join(', ')}`);
-      process.exit(1);
-    }
+    await validateAgentProfileOrExit(process.cwd(), agentFlag);
     agentId = agentFlag;
   }
 
@@ -207,6 +252,30 @@ export async function commandStart(args: string[]): Promise<void> {
     }
   }
 
+  // --- Per-task environment variables (--env / --env-file) ---
+  // Sugar over `lazy env set`, applied BEFORE the launch RPC so the values are
+  // in place when the agent's container/process is created. Deliberately not
+  // part of StartTaskParams: a secret must not travel through launch params,
+  // task state, or a turn — only through the daemon's own 0600 host file.
+  const envSpecs = (parsed.flags.get('env') as string[] | undefined) ?? [];
+  const envFileFlag = parsed.flags.get('env-file') as string | undefined;
+  if (envSpecs.length > 0 || envFileFlag) {
+    try {
+      const vars = await collectTaskEnvVars(envSpecs, envFileFlag);
+      if (Object.keys(vars).length > 0) {
+        const envResult = await queryTaskEnv({ action: 'set', taskId, vars });
+        console.log(
+          `Set ${envResult.changed?.length ?? 0} task environment variable(s): ${(envResult.changed ?? []).join(', ')}`,
+        );
+      }
+    } catch (err) {
+      // Fail before launching: starting the agent without the token it was
+      // meant to have produces a confusing failure deep inside the container.
+      console.error(`Error: ${err instanceof Error ? err.message : err}`);
+      process.exit(1);
+    }
+  }
+
   // --- Delegate to daemon RPC ---
   // The CLI's `lazy.start` span is the true user-perceived request boundary;
   // its `traceparent` is propagated to the daemon so the daemon's launch spans
@@ -215,50 +284,54 @@ export async function commandStart(args: string[]): Promise<void> {
     const s = await requireStorage();
     try {
       await s.appendTraceSpans(spans);
+    } catch (err) {
+      // A clone bound to Lazy Teams has no store of its own to keep the CLI's
+      // spans in, and Teams does not accept them: the launch's own spans are
+      // recorded by the daemon that ran it. Anything else is a real failure.
+      // Without this the refused flush at shutdown turned a start that HAD
+      // happened into "Error:" and exit 1.
+      if (err instanceof TeamsCommandRefusedError || (err instanceof Error && err.cause instanceof TeamsCommandRefusedError)) return;
+      throw err;
     } finally {
       await s.close();
     }
   });
+  // Only a person at their own terminal may TAKE the one-shot usage-pause
+  // override — the builder's shell is the CLI's human channel too.
+  const overrideEligibility = await usagePauseOverrideEligibility();
   try {
-    const result = await withSpan('lazy.start', {
-      'lazy.command': 'start',
-      'lazy.task_id': taskId,
-    }, () => queryStartTask({
-      taskId,
-      modelOverride,
-      agentId,
-      forceLocal,
-      retargetOrphan,
-      effortOverride,
-      runnerOverride,
-      traceparent: currentTraceparent() ?? undefined,
-    }));
+    const display = createPhaseDisplay();
+    let result;
+    try {
+      result = await withSpan('lazy.start', {
+        'lazy.command': 'start',
+        'lazy.task_id': taskId,
+      }, () => queryStartTask({
+        taskId,
+        modelOverride,
+        agentId,
+        forceLocal,
+        retargetOrphan,
+        effortOverride,
+        reviewOverrides,
+        runnerOverride,
+        // The CLI IS the human channel, and the daemon requires the actor to be
+        // named rather than defaulted: the turn this writes decides whether the
+        // task's work is written for a person. (A user-kind caller's `userId`
+        // is pinned over this by the daemon, never taken from here.)
+        actor: 'human',
+        ...overrideEligibility,
+        traceparent: currentTraceparent() ?? undefined,
+      }, display));
+    } finally {
+      display.close();
+    }
     // Flush the CLI root span before we continue (CLI is short-lived).
     await shutdownTracing();
 
     // Print warnings
     for (const w of result.warnings) {
       console.log(w);
-    }
-
-    // Queued at the concurrency cap — the daemon will launch it automatically
-    // when a slot frees up. Not an error: surface it plainly and return.
-    if (result.queued) {
-      const storage = await requireStorage();
-      try {
-        const t = await resolveTaskOrExit(storage, taskId);
-        console.log(
-          theme.warning(
-            `\nTask ${displayId(t)} queued (${result.queueRunning}/${result.queueLimit} agents running).`,
-          ),
-        );
-        console.log('It will start automatically when an agent slot frees up (a running task finishes or a blocked one is reviewed).');
-        console.log(`  Watch the queue: ${theme.command('lazy active')}`);
-        console.log(`  Raise the cap for this daemon session: ${theme.command('lazy daemon config set max_concurrent_agents <N>')}`);
-      } finally {
-        await storage.close();
-      }
-      return;
     }
 
     // Print summary — task is now running asynchronously
@@ -300,7 +373,7 @@ export async function commandStart(args: string[]): Promise<void> {
 }
 
 export function startUsage(): void {
-  console.log(`Usage: lazy start <task_id> [--model <model>] [--agent <agent_id>] [--effort <level>] [--runner <host|docker|container|podman>] [--follow] [--yes] [--force-local]
+  console.log(`Usage: lazy start <task_id> [--model <model>] [--agent <profile>] [--effort <level>] [--review <mode>] [--review-gate <g>] [--review-auto-fix <on|off>] [--runner <docker|container|podman>] [--env KEY=VALUE] [--env-file <path>] [--follow] [--yes] [--force-local]
 
 Start an existing task. The daemon handles worktree creation, agent launch,
 and lifecycle management.
@@ -318,13 +391,27 @@ Arguments:
   <task_id>          ID of the task to start (short hex prefix or task code)
 
 Options:
-  --model <model>    Override model for this session (e.g. opus, sonnet, claude-opus-4-8)
-  --agent <agent_id> Agent to use for this task (default: from task or lazy.toml)
+  --model <model>    Override model for this session (e.g. opus, sonnet, claude-opus-5)
+  --agent <profile>  Agent profile to run this task with — an [agents.<name>] block in
+                     lazy.toml; harness names (claude-code, codex, cursor, pi) are the
+                     built-in profiles. Default: from the task or lazy.toml.
   --effort <level>   Override Claude Code reasoning effort (low, medium, high, xhigh, max)
-                     Persists on the task so resumes use the same value.
+                     Persists on the task so resumes use the same value, and it
+                     is respected in low-high review mode: the draft runs at the
+                     effort you set, not at [review] draft_effort. A project-wide
+                     [agent] effort does not do that — only a choice about this
+                     task.
+${REVIEW_FLAGS_USAGE}
   --runner <type>    Run this task on a specific runner regardless of the global
-                     [runner] type: host, docker, container, or podman.
+                     [runner] type: docker, container, or podman.
                      Persists on the task; takes effect this turn.
+  --env KEY=VALUE    Give this task an environment variable (repeatable). A bare
+                     --env KEY prompts for the value without echoing it, which
+                     keeps a secret out of shell history and the process table.
+                     Values live on this host only — never in task state, turns,
+                     prompts, or logs — and are deleted when the task ends.
+                     Manage them later with 'lazy env'.
+  --env-file <path>  Read KEY=VALUE lines for this task from a dotenv-style file
   --follow           Wait for the agent to finish, streaming output in real time
   --yes              Skip confirmation prompts
   --force-local      Start from local HEAD even if remote fetch fails (use with caution)
@@ -335,7 +422,7 @@ Model Selection:
   2. Task's model setting (if set during task creation)
   3. The agent's own default, if it has one (Cursor: "auto" — Cursor picks)
   4. lazy.toml default model
-  5. Built-in default (claude-opus-4-8)
+  5. Built-in default (claude-opus-5)
 
 Notes:
   - Each task can only have one session (1:1 relationship)

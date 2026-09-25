@@ -41,6 +41,9 @@ describe('lazy doctor', () => {
   // REGRESSION (fix-stranded-merging): a task whose accept died mid-merge used to
   // be invisible — `lazy doctor` said nothing and every exit refused. Doctor now
   // names the task and the remedy.
+  // INVARIANT (a dead accept is resumed, never restored): for a MARKED task the
+  // remedy is `lazy accept` (resume now) — unblock/reject/close refuse while the
+  // daemon's resumes are pending, so advertising them would be a dead end.
   test('reports a task stranded in merging and names the remedy', async () => {
     const create = await ctx.lazy(['create', '--goal', 'Wedged task']);
     expectSuccess(create);
@@ -50,7 +53,8 @@ describe('lazy doctor', () => {
 
     const result = await ctx.lazy(['doctor']);
     expectOutput(result, "task(s) in 'merging'");
-    expectOutput(result, 'lazy unblock');
+    expectOutput(result, 'lazy accept');
+    expectOutput(result, 'accept died');
   });
 
   // `lazy doctor` is the single surface that spells out the memory-context size
@@ -118,6 +122,114 @@ describe('lazy doctor', () => {
       expectOutput(result, '12 live record(s)');
       expectOutput(result, 'No compact');
       expectOutput(result, 'lazy memory compact');
+      // INVARIANT: doctor assembles both roles' prompts to MEASURE them, and a
+      // real launch logs a generic "run lazy doctor" line when memory is over
+      // the threshold. Doctor must not emit it — telling the human to run the
+      // command they are running is the noise the single-surface rule exists
+      // to prevent. Checked on both streams — the launch line is a logger
+      // warning, so asserting stdout alone would pass vacuously.
+      expect(`${result.stdout}${result.stderr}`).not.toContain('Run `lazy doctor` for details');
+    });
+  });
+
+  // The numbers behind "why does this session start at 108k tokens" — the same
+  // single-surface rule as the memory check above: Claude Code shows them on a
+  // /context screen nobody opens, so doctor is where they live.
+  describe('context budget section', () => {
+    test('reports both roles, their contributors and a total each', async () => {
+      const result = await ctx.lazy(['doctor']);
+      expectOutput(result, 'Context budget (injected into every session, before the first message)');
+      // Builder and task agent are measured separately because they differ.
+      expectOutput(result, 'Builder session');
+      expectOutput(result, 'Task agent session');
+      expectOutput(result, 'lazy system prompt');
+      expectOutput(result, 'MCP tool schemas');
+      expectOutput(result, 'tokens before the first message');
+      // The caveat is stated once, not per line.
+      expectOutput(result, 'Character counts are exact');
+    });
+
+    // INVARIANT: doctor reports the window the launch will actually get. The
+    // default Anthropic model is a 1M-window model, and without this line the
+    // only place to find out was Claude Code's own /context screen — which is
+    // how a silent 200k cap on lazy's proxy went unnoticed.
+    test('reports the 1M context window a default Anthropic launch actually gets', async () => {
+      const result = await ctx.lazy(['doctor']);
+      expectOutput(result, 'Context window: 1M tokens');
+      expectOutput(result, 'first-party base URL');
+      expectOutput(result, 'of a 1M-token window');
+    });
+
+    // INVARIANT: the token column is a FLOOR, and says so. The offline
+    // tokenizer's own module forbids publishing an absolute Claude count from
+    // it ("Never publish an absolute Claude token count from this tier"), and
+    // its documented error is one-directional — so a bound is publishable where
+    // an estimate is not. A "≈" here would be the claim the estimator refuses.
+    test('presents token figures as a lower bound, not an estimate', async () => {
+      const result = await ctx.lazy(['doctor']);
+      expectOutput(result, 'Token figures are a floor, not an estimate');
+      expectOutput(result, 'undercounts Claude');
+      expectOutput(result, 'under-fires rather than over-fires');
+      // The bound marker reaches the per-line numbers, not just the footnote.
+      expectOutput(result, '≥');
+    });
+
+    // The number that motivated this section came off Claude Code's /context
+    // screen, so a reader will compare the two. Doctor measures what LAZY
+    // injects plus the CLAUDE.md files it warns about — not the harness's own
+    // prompt and built-in tools — and must say so rather than let a reader
+    // conclude one of the two numbers is broken.
+    test('states what it does and does not count', async () => {
+      const result = await ctx.lazy(['doctor']);
+      expectOutput(result, 'This is what lazy costs a session');
+      expectOutput(result, "not the agent's own system prompt and built-in tools");
+      expectOutput(result, '/context');
+    });
+
+    // The goal-context preamble is small but unconditional, and only task
+    // agents get one — the builder's first message is the human's. Listing it
+    // is what makes the contributor lines add up to the total exactly.
+    test('counts the goal-context preamble for task agents only', async () => {
+      const result = await ctx.lazy(['doctor']);
+      const occurrences = result.stdout.split('goal context preamble').length - 1;
+      expect(occurrences).toBe(1);
+      expect(result.stdout.indexOf('goal context preamble')).toBeGreaterThan(
+        result.stdout.indexOf('Task agent session'),
+      );
+    });
+
+    // INVARIANT: Claude Code's per-file limit is a WARNING — the file is still
+    // injected in full. Doctor must say so, or a reader assumes truncation.
+    // The release the limit was read from is named on the line: nothing in lazy
+    // detects a change to it (Claude Code installs unpinned), so a reader who
+    // suspects the number must be able to see what it was verified against.
+    //
+    // The limit follows the window. A default Anthropic launch is 1M tokens,
+    // which raises the limit to 200,000 chars — so this test pins a 200k-window
+    // model to keep exercising the 40,000 floor the harness still uses there.
+    test('warns about an oversized CLAUDE.md and names what to do', async () => {
+      const configPath = join(ctx.root, 'lazy.toml');
+      const before = readFileSync(configPath, 'utf-8');
+      const after = before.replace('default = "claude-opus-5"', 'default = "claude-sonnet-4-6"');
+      expect(after).not.toBe(before);
+      writeFileSync(configPath, after);
+
+      writeFileSync(join(ctx.root, 'CLAUDE.md'), `# Project\n\n${'Guidance line.\n'.repeat(3000)}`);
+
+      const result = await ctx.lazy(['doctor']);
+      expectOutput(result, 'CLAUDE.md (project)');
+      expectOutput(result, 'over the 40,000-char per-file limit Claude Code 2.1.266 warns at');
+      expectOutput(result, 'It is still injected in full — nothing is truncated');
+      expectOutput(result, 'read on demand');
+      expectOutput(result, 'Context window: 200k tokens');
+    });
+
+    test('says nothing about a limit when CLAUDE.md is comfortably under it', async () => {
+      writeFileSync(join(ctx.root, 'CLAUDE.md'), '# Project\n\nBe careful.\n');
+
+      const result = await ctx.lazy(['doctor']);
+      expectOutput(result, 'CLAUDE.md (project)');
+      expectOutputExcludes(result, 'per-file limit');
     });
   });
 
@@ -331,7 +443,9 @@ describe('lazy doctor', () => {
   test('reports auth status', async () => {
     const result = await ctx.lazy(['doctor']);
     // Auth may or may not be configured in test env; just check the check ran
-    const hasAuth = result.stdout.includes('Model credential present');
+    // One line per credential the profiles bill ("Anthropic credential present"),
+    // or the none-needed line ("Model credential present (none needed …)").
+    const hasAuth = result.stdout.includes('credential present');
     if (!hasAuth) {
       throw new Error(`Expected auth check in output\nstdout: ${result.stdout}`);
     }
@@ -427,6 +541,17 @@ describe('lazy doctor', () => {
     const result = await ctx.lazy(['doctor']);
     expectOutput(result, "'remote.token_env' is obsolete");
     expectOutput(result, 'gh auth login');
+  });
+
+  // `lazy doctor` is the ONE surface that carries the full [checks] migration
+  // remedy; the config loader only prints a generic line pointing here.
+  test('reports the deprecated [checks] section and where to move it', async () => {
+    const configPath = join(ctx.root, 'lazy.toml');
+    writeFileSync(configPath, `[checks]\npost_turn = "bun test"\n`);
+
+    const result = await ctx.lazy(['doctor']);
+    expectOutput(result, '[checks] is deprecated');
+    expectOutput(result, '[automation] post_turn');
   });
 
   test('clean config shows no unknown or deprecated warnings', async () => {

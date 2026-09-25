@@ -1,5 +1,141 @@
 # Changelog
 
+## [0.90.1170] - 2026-09-25 - Lazy Teams, identity and per-user billing
+
+Every action and every agent turn is now attributed to the person who asked for it, and billed to their own credential. Lazy Teams, a self-hostable web app for sharing a lazy project with your team, is new: it runs each project's agent turns in its own microVM by default, `lazy login` binds a local clone to a Teams project (your own builder and Claude Code included), and its web UI brings most of the local dashboard. Agents now declare when they are done and their work is reviewed automatically (by default the writer reviews and revises its own work), and you can opt in to pausing work before a subscription window runs out.
+
+### Added
+
+**Identity, billing and Lazy Teams clients**
+- **Your work is recorded under your git identity** — every action names you as `Name <email>` from `user.name` / `user.email`, and lazy refuses to write until git knows who you are; reading and setup always work
+- **An agent's work is recorded under whoever asked for the turn** — the next person's unblock switches it; turns lazy starts by itself are marked as the system, under the account that configured the automation
+- **Per-user billing** — a turn spends the Claude credential of the person who started it, swapped in at the proxy so containers never hold one; nobody is billed for an automatic turn
+- **`lazy login` / `lazy logout`** — bind a clone to a Lazy Teams project by approving a short code in the browser; `lazy list`, `show`, `diff`, `unblock`, `accept` and the rest then run through Teams
+- **`lazy builder` and your own Claude Code in a bound clone** — the builder attaches to your session running on the server (also on the Teams Builder page), and lazy's MCP tools reach the project through Teams
+- **`lazy auth`** — store model credentials in your OS keychain so the daemon starts from any shell; `lazy auth import codex-subscription` and `lazy auth set ollama` cover ChatGPT plans and Ollama Cloud
+
+**Self-hosted Lazy Teams**
+- **Self-host Lazy Teams** — a docker-compose install, a published multi-architecture image, a first-run setup that creates the site admin, and `bin/deploy-remote` to install on a server over SSH
+- **Agent turns in microVMs** — self-hosted Lazy Teams runs each project's turns in its own microVM by default; the compose install needs `/dev/kvm` and an unprivileged user in the `kvm` group — confirm yours with the setup guide
+- **Hand an existing lazy project to Lazy Teams** — adopt a store your local daemon has been writing, whole task history included; `lazy system store-check` says whether it is ready
+- **Hosted git** — an install can host repositories and serve clone and push over authenticated HTTP, alongside GitHub and GitLab connections
+- **Slack project rooms** — each project and task gets a channel, `/lazy create` works there, and thread replies become comments; connects without a public address
+- **A fleet that looks after itself** — dead projects restart on their own, every project rolls onto a new version at upgrade, and `lazy doctor` runs hourly per project
+- **Admin ("god") mode** — the first user is site admin: diagnostics for any project or task, read-only view-as-user, email setup, backups and a project data download
+- **Published images** — the Lazy Teams image and the lazy daemon image ship for arm64 and amd64 with every release
+
+**Lazy Teams web UI** — most of the local dashboard's task, review and project pages:
+- **Task page** — Record, Changes, Turns, Commits, Comments, Journal, Reviews, Subtasks, Stats and Verify tabs; start, stop, resume, reopen, reject, close, edit, sync, submit and reparent from the page
+- **Review** — rendered Markdown and diagrams, expandable context, review regions and sign-off, a "Before you can accept" checklist, keyboard navigation, and ask or comment on any paragraph of the agent's report
+- **Project pages** — Raised queue, Messages, Search with its syntax beside the box, Review queue, Clusters, memory editing, builder conversations, scratch files, a command palette (Cmd/Ctrl+K) and nav counts
+- **Agents and credentials** — pick an agent, model and effort per task, set project defaults, and connect your own Claude, GitHub and GitLab accounts
+- **Shell tab** — Shell, Pair, Chat and Watch on a task, plus Run in shell on Verify steps, each in your own environment on your own Claude account
+- **Task artifacts and journals** — attach files and download a task's inputs and outputs, and append Markdown journal entries without starting a turn or sending the text to the agent
+- **Link a branch or pull request as a task**, and promote an answered question or part of a conversation into a backlog task
+- **Works on a phone** — the core task loop is usable one-handed and installable as a web app
+
+**Reviewing work**
+- **An agent says when it is done** — `lazy_final` records "pencils down"; every task surface shows whether the work was declared finished
+- **Auto-review on final** — declaring done starts a review: `[review] mode` is `low_high` (the default: the writer self-reviews in its own session), `separate` or `off`; each ends `clean`, `needs_work` or `needs_human`, only critical and high findings can hold a merge (`[review] gate`), and a separate reviewer's findings park the task for you unless `[review] auto_fix` is on — all inherited from parent tasks
+- **Walkthroughs** — agents file structured reports (behaviour first) and a semantic walkthrough of their changes, with screenshots at the top; the raw diff is one click away
+- **Review regions** — carve a large branch into units with their own diff and owner, and sign them off: a Regions tab, `lazy regions`, `lazy diff --region`, `lazy_regions`
+- **`lazy_raise`** — agents raise questions and FYIs; blocking ones hold `lazy accept` until you respond, promote or dismiss them, and `lazy raised` is the one queue for all of them
+- **`lazy review`** — a read-only agent review of a paused task in its own session, security and data integrity first; `lazy browse` is the old artifact browser
+- **`lazy accept --allow-review-issues`** — merge over an unfinished or failed review once you have read the work yourself
+- **Edit a comment the agent has not seen yet** — `lazy comment --edit`, the task page, and Lazy Teams
+
+**Local dashboard**
+- **`lazy dashboard`** — signs your browser in with a one-time link; the dashboard now lives at `http://lazy.localhost:<port>`; behind a reverse proxy such as ngrok, set `[server] dashboard_url`
+- **Tabbed task page** — Summary, Changes, Verify, Turns, Commits, Subtasks, Raised, Stats, Shell, Services and Current review, with every task action as a dialog
+- **Create, edit, link and review tasks in the browser**, plus Settings (memory, doctor), a Conversations tab, a Messages inbox and a command palette (Ctrl/Cmd+K)
+- **Web shell, Pair and Chat** — terminals inside a task's container, or take over or talk to its agent, from the Shell tab
+- **Review niceties** — rendered Markdown and mermaid diagrams in diffs, expandable context, keyboard navigation, "since you last looked", a screenshot lightbox, and review state that survives reloads and other tabs
+
+**Agents and models**
+- **Agent profiles** — `[agents.<name>]` names a harness, model, upstream and credential; pick one per task with `--agent`, route task types with `[agent.by_type]`
+- **Codex** — `--agent codex` runs OpenAI's Codex CLI; `--agent codex-subscription` runs it on a ChatGPT plan instead of a metered key
+- **Pi** — `--agent pi` runs the Pi coding agent, on your local Ollama by default or on Anthropic, OpenAI or OpenRouter through a profile
+- **OpenAI-compatible upstreams** — profiles can point at OpenAI or OpenRouter with token-counted, proxied access
+- **`lazy clone --same-base`** — re-run any task from the exact commit it started from, optionally on another `--agent` or `--model`
+- **`LAZY.md`** — project instructions that only agents running lazy tasks see
+
+**Usage and stats**
+- **`[usage_pause]`** — opt in to stop starting turns, reviews, asks and conflict syncs once a subscription window reaches your threshold, avoiding paid overage; pairing and chats are gated too, and it warns when it has no reading to act on and says whether paid overage is on
+- **`lazy stats limits`** — how much of each credential's subscription window or rate limit is used; `--json` prints readings, overage and pause state as one object
+- **`lazy_usage_limits`** — the builder reads the same usage numbers over MCP, to plan work within what is left
+- **`lazy stats tools <task>` and the Stats tab** — where a task's time and tokens went, per turn and per tool; `--subtree` folds in every nested task
+
+**Tasks and projects**
+- **Cluster tasks (`--type cluster`)** — a task whose agent briefs, runs, reviews and accepts its own subtasks, several at once; `[cluster] max_child_fix_rounds` caps send-backs per subtask
+- **`lazy artifact`** — attach files to a task and have it publish files back
+- **`lazy messages`** — an inbox of reports lazy writes for you, also in the dashboard and the builder's launch context
+- **`lazy conversations` and `lazy scratch`** — list, search and read captured builder conversations and scratch files, and promote a conversation into a task
+- **`lazy link`** — link a git branch or pull request as a reviewable task; `lazy describe` rewrites its description
+- **Parent notified of subtask changes** — a subtask added, removed or accepted leaves a comment on its parent
+- **Task search scopes** — `in:tasks`, `in:active`, `in:backlog` and `in:finished`
+
+**Containers, services and setup**
+- **`[serve]` ports, `lazy url` and `lazy forward`** — reach a task's dev server at `http://<service>.<task>.lazy.localhost:<port>`, or any container port for as long as the command runs; the command that starts a task's services is set from the Services card
+- **`lazy env`** — give one task a secret no other task gets; it never reaches task state or logs
+- **`[automation] pre_turn` and `[automation] accept_check`** — run setup before every turn, and refuse to accept a task whose tree fails your build (`--allow-broken` overrides)
+- **`[[automation.react]]`** — give the agent extra instructions when its commits touch a path pattern
+- **`[docker] run_args` and `[docker] build_inputs`** — extra `docker run` arguments, and lockfiles that trigger an image rebuild when they change
+- **Chromium in the task image** — agents can screenshot UI work without installing a browser
+- **`lazy system verify-host-boundary`** — check that host agents' file tools are still denied; `[runner] verify_sandbox_boundary` can refuse launches when they are not
+- **Managed mode** — on a shared host, a repository's `lazy.toml` can no longer choose the runner, store, mounts or model endpoints
+- **Proxy request plugins** — a module in `.lazy/plugins/` can transform outbound model requests; `lazy customize proxy-plugin` scaffolds one
+- **`lazy doctor` cleanup flags and inbox alerts** — reclaim worktrees, images and containers after listing and asking; errors it finds also reach your inbox
+- **`lazy playground up`** — a throwaway project with tasks in every state for trying the dashboard and Lazy Teams (source checkout only); `--repo` adopts any repository as the playground, and stand-in agent turns take a few seconds and report progress, so a task is seen working
+- **Versioned documentation site** — docs.getlazy.dev publishes with every release, and its front page lists every documentation version, newest first
+- **`lazy daemon health`** — one OK / WARN / FAIL row per daemon part (loops, sweeps, proxy, storage lock, runner, stuck tasks, dashboard), with remedies and `--json`
+
+### Changed
+- **Lazy no longer writes comments or reviews to pull requests** — it opens the PR and keeps its own description section current, nothing else
+- **`lazy raised` replaces follow-ups** — follow-ups and raised items are one queue with a blocking flag; the follow-up MCP tools are gone
+- **Protected files are approved at `lazy accept`, not at unblock**
+- **`lazy approve` is gone** — `lazy accept` prompts for the passphrase and merges in one step
+- **Agent starts are uncapped and containers live until the task ends** — `max_concurrent_agents`, the `queued` status, `lazy prioritize` and the idle reaper are gone
+- **Docker (or Podman) is required** — the host-process runner is removed; `lazy pair`, `lazy ask`, `lazy report` and memory compaction run in containers
+- **`lazy shell` opens inside the task's container** — `--host` gives the old worktree shell
+- **`lazy sync` also merges commits a colleague pushed to the task's own branch**
+- **The daemon listens on TCP only** — the unix socket is gone, so older CLIs must upgrade
+- **Default model is `claude-opus-5`** — only where no model is set
+- **Removed config** — `[storage] backend = "postgres"`, `[ollama]`, `[models.roles.*] backend` and `[proxy] openai_upstream`; `lazy doctor --fix agents` rewrites the latter into profiles
+- **`[checks]` is deprecated** — `post_turn` moved to `[automation]`; the old spelling still works
+- **Search** — `task:` replaces `code:`, and results rank by relevance on every surface
+- **Task pages live at `/tasks/<code>`** — old `/review/<id>` links redirect there
+- **Task codes are hostname labels** — letters, digits and hyphens only; existing codes are untouched
+- **Agents can read any task and change only their own**
+- **`lazy accept` refuses while comments are queued** — unblock to deliver them, or pass `--allow-queued-comments`
+- **The dashboard is redesigned** — it shares one design system with Lazy Teams
+- **`lazy list` / `active` / `blocked`** — show each task's agent and no longer print token totals (still on `lazy show` and `lazy stats`)
+- **Long commands narrate their phases** — `start`, `unblock`, `sync`, `resume`, `ask`, `reparent` and `upgrade` show progress instead of sitting silent
+- **`lazy submit` on a subtask** — opens a PR/MR against the parent task's branch when a person asks; it follows the subtask if the parent lands first, and closes after a local accept
+
+### Fixed
+- **`lazy accept` keeps a landed merge** — later failures are retried instead of undoing the accept, an interrupted accept is finished, and a leftover `index.lock` no longer stops it
+- **An edited prompt is the one used** — `lazy clone`, `lazy redo` and agents' `lazy_show` no longer use the superseded prompt
+- **1M context through the proxy** — Claude Code gets a 1M-context model's full window instead of a silent 200k cap
+- **A lazy comment never starts a turn** — it rides your next unblock instead of racing it
+- **A submitted task stays submitted after a sync**
+- **A task's recorded commits are its own** — merges no longer record upstream history against the task; `lazy system repair-commits` cleans up old records
+- **Every setting comes from the project root's `lazy.toml`** — a copy on a task branch no longer governs that task
+- **Task diffs use the branch's real base** — a freshly cloned project no longer shows the whole repository as one task's changes
+- **The task's model, effort and agent apply to every turn** — including nudges, syncs, resumes and conflict resolution, and every agent launch names its model
+- **Crashes and restarts** — a task that crashes resumes on its own; stopping the daemon stops its agents first; a failing proxy request no longer kills the daemon; `lazy ask`, `lazy report` and `lazy memory compact` no longer hang; an automatic sync no longer steals an ask's answer; a wrong model or spent balance stops the task instead of crash-looping; a turn that dies always leaves a record
+- **Long Cursor turns** — no longer killed as silent every 30 minutes
+- **Slow models** — a slow local model no longer kills the turn after four minutes (`[proxy] upstream_timeout`), and provider errors reach the turn record
+- **Credentials stay out of logs** — supervisor logs and `lazy stats audit` records are scrubbed, and an agent's lazy tools can no longer be answered for another task
+- **Agent containers work on a Linux host whose daemon runs as root**, and the credential proxy is reachable from them on a fresh host
+- **Uncommitted agent work is no longer lost quietly** — the agent is asked to commit or discard it, and review shows the paths
+- **Big stores load fast** — task trees and task detail no longer rescan the whole project
+- **Search** — the same query returns the same results on every surface, and a pathological regex is refused instead of hanging the daemon
+- **Dashboard safety** — rendered pages escape agent and human text, and links only open `http`, `https` and `mailto` URLs
+- **`lazy upgrade`** — one image build per upgrade, and running containers and builders survive it
+- **A daemon that fails to start ends its log with the reason**
+- **`working(not-alive)`** — no longer shown for a task still starting (`working(launching)`) or answering `lazy ask`; an ask in flight across a daemon restart is ended instead of holding the task for a day; plain `working` when the runtime does not answer
+- **`lazy stop`** — a stopped task stays blocked and stopped instead of turning interrupted seconds later; `lazy list` marks it `[STOPPED]` and agents' `lazy_list` reports `stopped: true`, so they no longer mistake it for a task waiting on review
+
 ## [0.22.1148] - 2026-09-08 - Hotfix
 
 ### Fixed

@@ -22,6 +22,11 @@
  *
  * Do not relax any of this. Weakening a security property is a review with the
  * human, not a test edit.
+ *
+ * STILL LOAD-BEARING AFTER `pair-in-container`. Pairing's DEFAULT surface is now
+ * the task's container, where no host home is involved at all — but host pairing
+ * did not disappear, it became the explicit `--host` opt-in (host-process-runner
+ * tasks and branchless mode). Every assertion below guards that surviving path.
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { readFileSync, mkdirSync, writeFileSync, rmSync, mkdtempSync, lstatSync, existsSync, readdirSync } from 'fs';

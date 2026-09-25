@@ -33,6 +33,9 @@
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtemp, rm, writeFile } from 'fs/promises';
+// Sync write in a test fixture: allowed by CLAUDE.md ("test setup/teardown"),
+// and this helper is called from synchronous git-fixture code.
+import { writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { FileStorage } from '../../src/storage';
@@ -95,7 +98,16 @@ async function makeBacklogTask(env: Env, goal: string): Promise<string> {
   return task.id.substring(0, 8);
 }
 
-/** Create the conventional `lazy/<ref>` branch with N extra commits beyond base. */
+/**
+ * Create the conventional `lazy/<ref>` branch with N extra commits beyond base.
+ *
+ * The commits CHANGE THE TREE, because that is what the sweep means by work.
+ * They used to be `--allow-empty`, which made this fixture indistinguishable
+ * from the empty `Initialize task …` commit `lazy start` writes while the task
+ * is still `backlog` — the launch artifact the sweep must ignore (see the
+ * empty-commit test below). Only the fixture changed; every assertion in this
+ * file is the one it has always made.
+ */
 function makeBranchWithCommits(env: Env, ref: string, count: number): void {
   git(env.lazyRoot, 'branch', `lazy/${ref}`, env.baseSha);
   if (count === 0) return;
@@ -103,8 +115,19 @@ function makeBranchWithCommits(env: Env, ref: string, count: number): void {
   const wt = join(env.lazyRoot, '..', `${ref}-wt`);
   git(env.lazyRoot, 'worktree', 'add', wt, `lazy/${ref}`);
   for (let i = 0; i < count; i++) {
-    git(wt, 'commit', '--allow-empty', '-m', `agent commit ${i + 1}`);
+    writeFileSync(join(wt, `work-${i + 1}.txt`), `agent work ${i + 1}\n`);
+    git(wt, 'add', '.');
+    git(wt, 'commit', '-m', `agent commit ${i + 1}`);
   }
+  git(env.lazyRoot, 'worktree', 'remove', wt, '--force');
+}
+
+/** Create `lazy/<ref>` carrying only the empty commit `lazy start` writes. */
+function makeBranchWithInitCommitOnly(env: Env, ref: string): void {
+  git(env.lazyRoot, 'branch', `lazy/${ref}`, env.baseSha);
+  const wt = join(env.lazyRoot, '..', `${ref}-init-wt`);
+  git(env.lazyRoot, 'worktree', 'add', wt, `lazy/${ref}`);
+  git(wt, 'commit', '--allow-empty', '-m', `Initialize task ${ref}: do the work`);
   git(env.lazyRoot, 'worktree', 'remove', wt, '--force');
 }
 
@@ -186,6 +209,42 @@ describe('recoverBacklogWithCommits', () => {
 
     const task = await env.storage.getTask(ref);
     expect(task?.status).toBe('blocked');
+  });
+
+  // INVARIANT 2, sharpened: "commits beyond base" is not the same question as
+  // "work exists". `lazy start` writes an EMPTY `Initialize task …` commit while
+  // the task is still `backlog`, so during every launch this sweep sees a branch
+  // one commit ahead — and used to write `blocked` straight over the `working`
+  // the launcher was about to set, six milliseconds later, stranding the turn
+  // that was already running. A commit that changes no tree is a launch
+  // artifact, not work.
+  test('does NOT recover a backlog task whose branch carries only the empty init commit', async () => {
+    const ref = await makeBacklogTask(env, 'mid-launch');
+    makeBranchWithInitCommitOnly(env, ref);
+
+    await recoverBacklogWithCommits(env.storage, env.lazyRoot);
+
+    const task = await env.storage.getTask(ref);
+    expect(task?.status).toBe('backlog');
+  });
+
+  // INVARIANT 2, second half: the sweep's own listing is a SNAPSHOT, and the git
+  // calls it makes per task are awaits. A `lazy start` that lands in between
+  // takes the task to `working`, and the sweep must not write `blocked` from its
+  // stale copy — `working → blocked` is a legal transition, so nothing else
+  // stops it. The stale listing is injected because in the wild the window is
+  // milliseconds wide, and what must happen is fully determined either way.
+  test('does NOT clobber a task that left backlog while the sweep was running', async () => {
+    const ref = await makeBacklogTask(env, 'started mid-sweep');
+    makeBranchWithCommits(env, ref, 1);
+
+    const stale = (await env.storage.getTask(ref))!;
+    await env.storage.updateTaskStatus(ref, 'working', 'system');
+    env.storage.listTasksWithOptions = async () => [stale];
+
+    await recoverBacklogWithCommits(env.storage, env.lazyRoot);
+
+    expect((await env.storage.getTask(ref))?.status).toBe('working');
   });
 
   // Mixed batch: only the tasks that actually have work get recovered.

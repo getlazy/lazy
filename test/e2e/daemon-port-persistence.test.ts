@@ -93,7 +93,6 @@ describe('daemon restart resilience', () => {
     const d1 = await startDaemonServer({
       projectRoot: ctx.root,
       token: 'persist-token-1',
-      socketPath: join(tmpDir, 'p1.sock'),
       webPort: port,
       _forceBindWebInTest: true,
     });
@@ -110,7 +109,6 @@ describe('daemon restart resilience', () => {
     const d2 = await startDaemonServer({
       projectRoot: ctx.root,
       token: 'persist-token-2',
-      socketPath: join(tmpDir, 'p2.sock'),
       _forceBindWebInTest: true,
     });
     daemons.push(d2);
@@ -127,7 +125,6 @@ describe('daemon restart resilience', () => {
     // First start with NO explicit token -> generates and persists one.
     const d1 = await startDaemonServer({
       projectRoot: ctx.root,
-      socketPath: join(tmpDir, 't1.sock'),
       webPort: port,
       _forceBindWebInTest: true,
     });
@@ -140,7 +137,6 @@ describe('daemon restart resilience', () => {
     // Restart with NO explicit token -> must reuse the same token.
     const d2 = await startDaemonServer({
       projectRoot: ctx.root,
-      socketPath: join(tmpDir, 't2.sock'),
       webPort: port,
       _forceBindWebInTest: true,
     });
@@ -173,7 +169,6 @@ describe('daemon restart resilience', () => {
       const d = await startDaemonServer({
         projectRoot: ctx.root,
         token: 'pinned-token',
-        socketPath: join(tmpDir, 'pin.sock'),
         _forceBindWebInTest: true,
       });
       daemons.push(d);
@@ -221,7 +216,6 @@ describe('daemon restart resilience', () => {
     try {
       const d = await startDaemonServer({
         projectRoot: ctx.root,
-        socketPath: join(tmpDir, 'refresh.sock'),
         webPort: port,
         _forceBindWebInTest: true,
       });

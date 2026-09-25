@@ -14,13 +14,14 @@ import { existsSync } from 'fs';
 import { createAllHandlers, type McpToolContext } from '../mcp/tools';
 import { findToolDefinition, parseAndValidateToolCallBody } from '../mcp/tool-registry';
 import { validateToolArgs, describeArgsFailure } from '../mcp/validate-args';
-import { getWorktreePath } from '../cli/helpers';
+import { getWorktreePath } from '../task/identity';
 import { logger } from '../utils/logger';
 import { RpcError, getOrCreateStorage } from './rpc-handlers';
 import { RpcApplicationError } from './client';
 import { lookupMcpIdentity } from './mcp-tokens';
 import type { ProgressEmitter } from './progress';
 import { trackWait, BLOCKING_WAIT_TOOLS } from './wait-registry';
+import { taskTurnOwner } from './turn-owner';
 import type { Storage } from '../storage/interface';
 
 /**
@@ -205,6 +206,8 @@ export async function handleMcpToolCall(
   toolName: string,
   args: Record<string, unknown>,
   progress?: ProgressEmitter,
+  /** The builder surface's MCP token label, resolved by the route from the token. */
+  builderTokenLabel?: string | null,
 ): Promise<unknown> {
   if (!existsSync(projectRoot)) {
     throw new RpcError(400, `Project root does not exist: ${projectRoot}`);
@@ -243,11 +246,43 @@ export async function handleMcpToolCall(
   // Create tool context scoped to this task's worktree.
   // Pass the daemon's storage singleton so handlers can access it without
   // needing to create their own (which would fail with LAZY_IS_DAEMON=1).
+  // WHOSE WORK THIS IS. The agent has already been authenticated as this task
+  // (authorizeMcpCall); the person is looked up FROM THE TASK, exactly as the
+  // launch path looks up whose credential to spend, and never sent by the
+  // caller — an identity a request could carry is one an agent could choose.
+  // No recorded owner means the turn was system-initiated, and the rows record
+  // the channel and nobody, as they always have.
+  //
+  // DELIBERATELY NOT the configured system identity the TURN rows of such a
+  // turn carry (§3.3 case 3, src/identity/system-identity.ts). That identity
+  // comes with the role `system`, and `actor` on this door is read as the
+  // CHANNEL by code that decides behaviour, not only by surfaces: a loop task
+  // asks whether a new child's creating actor was `agent` to tell its own
+  // agent's subtasks from ones a human added, and a loop whose turn the
+  // reconciler had resumed would have started answering "somebody else" to its
+  // own children — and woken itself forever. Widening these rows means giving
+  // each such reader the distinction first.
+  //
+  // KNOWN GAP, deliberately not closed here (raised item `36a893f4`): this
+  // resolves the person from the task's CURRENT session on every call, so it is
+  // per-TASK, not per-TURN. A task MCP token is minted per task and lives until
+  // the task ends, so a superseded agent that still holds a valid one has its
+  // late write (lazy_journal, lazy_raise, lazy_comment) stamped with whoever
+  // asked for the NEWER turn — the same defect the turn ROWS were fixed for,
+  // through this door. Turn rows got a per-turn capture on the in-flight claim
+  // (`InFlightTurn.turn_owner_email`); MCP writes have no equivalent, because
+  // closing it means binding the person to the TURN at this boundary — on the
+  // token, or on the per-turn binding the proxy already keys — which is a
+  // change of its own. Do not assume this is per-turn just because the turn
+  // rows are.
   const ctx: McpToolContext = {
     taskId,
     worktreePath,
+    projectRoot,
+    ...(taskId ? {} : { builderTokenLabel: builderTokenLabel ?? null }),
     storage,
     progress,
+    ...(taskId ? { actorPerson: (await taskTurnOwner(storage, taskId)) ?? undefined } : {}),
   };
 
   const handlers = createAllHandlers(ctx);

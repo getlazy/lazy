@@ -23,9 +23,16 @@
  * That is why freshness is time-based rather than version-tagged. Three
  * independent triggers rebuild the image, and they cover different axes:
  *
- *   1. `lazy upgrade`      — always, unconditionally, with --no-cache. The
- *                            primary mechanism: upgrading lazy rebuilds the
- *                            image, which is what users already expect.
+ *   1. `lazy upgrade`      — with --no-cache. The primary mechanism: upgrading
+ *                            lazy rebuilds the image, which is what users
+ *                            already expect. When nothing about the image's
+ *                            identity has changed since the last build, the
+ *                            interactive upgrade ASKS rather than deciding on a
+ *                            timer (`evaluateUpgradeRebuild`), because the only
+ *                            thing a rebuild would buy is re-resolving unpinned
+ *                            contents — worth minutes some days, not others,
+ *                            and only the human knows which. Non-interactive
+ *                            runs and `--images` always rebuild.
  *   2. age > MAX_AGE_DAYS  — the backstop, for people who never run `lazy
  *                            upgrade` and for source checkouts where "upgrade"
  *                            is not a thing you do.
@@ -42,8 +49,27 @@ import { majorMinor } from '../utils/version-parts';
 /** Repository name of the base runner image. */
 export const IMAGE_NAME = 'lazy-runner';
 
-/** Label carrying the sha256 of the Dockerfile text an image was built from. */
+/**
+ * Label carrying the sha256 of everything an image's identity is derived from:
+ * the Dockerfile text, plus the contents of every `[docker] build_inputs` file.
+ *
+ * The name is historical — it predates `build_inputs`, and renaming it would
+ * make every image already on every developer's host look unlabelled and
+ * trigger a multi-minute rebuild for nothing.
+ */
 export const DOCKERFILE_HASH_LABEL = 'lazy.dockerfile.hash';
+
+/**
+ * Label carrying a JSON map of `path → short sha256` for each input that fed
+ * DOCKERFILE_HASH_LABEL. Purely EXPLANATORY: the rebuild decision is made on
+ * the combined hash above, and this exists only so a rebuild can say WHICH file
+ * changed instead of "something did". Absent on images built by older lazy
+ * versions, which is why every reader treats it as best-effort.
+ */
+export const IMAGE_INPUTS_LABEL = 'lazy.image.inputs';
+
+/** Manifest key used for the Dockerfile itself, which is never a real path. */
+export const DOCKERFILE_INPUT_KEY = 'Dockerfile';
 
 /**
  * Maximum age of a runner image before `ensureImage` rebuilds it.

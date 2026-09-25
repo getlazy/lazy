@@ -24,11 +24,10 @@ on one more key:
 The second row is the whole problem. Nothing errors, nothing warns, and the
 commit looks normal until a push hits the forge's blob-size limit.
 
-This is not hypothetical. In a lazy-managed project in August 2026, a clone had
-`filter.lfs.process` set but **empty** and `required = false`. A 335 MB dataset
-file was committed verbatim where a 134-byte pointer belonged. The task branch
-became unpushable, and recovery took manual history surgery on a branch lazy
-owned.
+For example, a clone with `filter.lfs.process` set but **empty** and
+`required = false` will commit a 335 MB dataset file verbatim where a 134-byte
+pointer belongs. The task branch becomes unpushable, and recovery takes manual
+history surgery.
 
 ## Layer 1: the start-time preflight
 
@@ -47,13 +46,12 @@ file content instead of LFS pointers, producing a branch that cannot be pushed.
 Run `lazy doctor` for details.
 ```
 
-`lazy doctor` carries the full diagnosis and the exact commands — that split is a
-project convention, not an oversight: the point of occurrence gets one generic
+`lazy doctor` carries the full diagnosis and the exact commands — that split is
+deliberate: the point of occurrence gets one generic
 line, doctor is the single place remedies live.
 
 **Lazy never repairs the config for you.** Writing to a user's git config as a
-side effect of `lazy start` is exactly the hidden side effect the project
-forbids. Lazy detects and refuses; you fix it deliberately:
+side effect of `lazy start` is a hidden side effect lazy avoids by design. Lazy detects and refuses; you fix it deliberately:
 
 ```bash
 git lfs install --local          # writes filter.lfs.process/clean/smudge + required
@@ -139,7 +137,5 @@ LFS usage or to find raw blobs. The binary is consulted for exactly one question
   says so in the accept's warnings rather than reporting a clean result.
 - **No repair tooling.** Neither layer rewrites config or history.
 
-Implementation: [`src/git/lfs.ts`](../src/git/lfs.ts) (detection and scanning),
-[`src/protection/lfs-guard.ts`](../src/protection/lfs-guard.ts) (accept-time
-enforcement), with the preflight in the daemon's task launcher so both runners
-are covered.
+The accept-time check runs in the daemon, and the launch preflight runs in the
+daemon's task launcher, so both runners and every caller are covered.

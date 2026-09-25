@@ -17,5 +17,6 @@ existing record (same `name`) rather than creating near-duplicates.
 Do NOT use your harness's own memory feature (the memory directory under your
 Claude Code project dir) — it lives in a per-builder overlay, is never shared
 with other builders or machines, is invisible to agents, and gets pruned. Use
-`lazy_memory_save` instead. For per-task rationale that should stay OUT of
-prompts, use `lazy_journal`.
+`lazy_memory_save` instead. For per-task rationale whose text should stay OUT of
+prompts, use `lazy_journal` — the agent's next prompt gets only a count of new
+entries and reads them on demand, so journaling never steers or starts a turn.

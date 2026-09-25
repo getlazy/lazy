@@ -5,6 +5,7 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS, disablePreAccept } from '../helpers/fixtures';
 import { runReconcile } from '../helpers/reconcile';
+import { seedFinal } from '../helpers/final';
 
 /** Extract child task ID from "Created variant task <id>" output */
 function extractVariantTaskId(output: string): string {
@@ -299,6 +300,8 @@ describe('lazy branch', () => {
     // never reaches the merge this test is about.
     await runReconcile(ctx.root, ctx.protocolBase);
 
+    seedFinal(ctx, childId);
+
     const acceptResult = await ctx.lazy(['accept', childId, '--yes']);
     expectSuccess(acceptResult);
     expectOutput(acceptResult, 'accepted and merged');
@@ -332,6 +335,8 @@ describe('lazy branch', () => {
     // Daemonless suite: reconcile the started child out of `working` so accept
     // gets past the status gate (see the sibling test above).
     await runReconcile(ctx.root, ctx.protocolBase);
+
+    seedFinal(ctx, childId);
 
     const acceptResult = await ctx.lazy(['accept', childId, '--yes']);
     expectSuccess(acceptResult);

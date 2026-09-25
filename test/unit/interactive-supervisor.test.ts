@@ -19,7 +19,7 @@ import { mockModule, restoreMockedModules } from '../helpers/mock-module';
 import type { DaemonStatus } from '../../src/daemon/lifecycle';
 
 const SPAWN_PATH = resolve(import.meta.dir, '../../src/utils/spawn.ts');
-const AUTH_PATH = resolve(import.meta.dir, '../../src/cli/interactive-auth.ts');
+const AUTH_PATH = resolve(import.meta.dir, '../../src/credentials/interactive-auth.ts');
 const REGISTRY_PATH = resolve(import.meta.dir, '../../src/daemon/interactive-registry.ts');
 
 interface Launch {
@@ -268,8 +268,30 @@ describe('runInteractiveSupervisor — chat', () => {
     }
 
     // Order matters: extras sit after --resume, exactly as the pre-supervisor
-    // chat command composed them.
-    expect(state.launches[0]!.argv).toEqual(['claude', '--resume', 'chat-sess', ...chatArgs]);
+    // chat command composed them. --model is always there (no harness launches
+    // without one); with no builder model configured it is [models] default.
+    expect(state.launches[0]!.argv).toEqual(['claude', '--resume', 'chat-sess', '--model', 'claude-opus-5', ...chatArgs]);
+  });
+
+  // INVARIANT (turn-model stickiness): a session that belongs to a TASK (chat,
+  // host pair) runs the task's model on every launch, restarts included — never
+  // the builder role's. Without it a chat resumed the task's session on
+  // [models] default (or, before, on Claude Code's own default).
+  test('a task session runs the task model on every launch, not the builder model', async () => {
+    const { runInteractiveSupervisor, state } = await harness({ exitPlan: ['wait', 'exit'] });
+
+    await runInteractiveSupervisor({
+      ...base,
+      kind: 'chat',
+      resumeSessionId: 'chat-sess',
+      model: 'task-model-x',
+      readStatus: generationReader(1),
+    });
+
+    expect(state.launches.length).toBe(2);
+    for (const launch of state.launches) {
+      expect(launch.argv[launch.argv.indexOf('--model') + 1]).toBe('task-model-x');
+    }
   });
 
   test('a chat session registers as chat, not as a pair session', async () => {
@@ -346,9 +368,18 @@ describe('runInteractiveSupervisor — generation baseline', () => {
 });
 
 describe('interactiveClaudeArgs', () => {
-  test('a fresh session is a bare `claude`', async () => {
+  test('a fresh session is `claude` plus its model', async () => {
     const { interactiveClaudeArgs } = await import('../../src/supervisor/interactive');
-    expect(interactiveClaudeArgs({})).toEqual(['claude']);
+    expect(interactiveClaudeArgs({ model: 'opus' })).toEqual(['claude', '--model', 'opus']);
+  });
+
+  // INVARIANT (turn-model stickiness): a host interactive session (chat,
+  // branchless pair) never launches Claude Code without --model. Omitting it
+  // ran whatever Claude Code picks by default whenever the builder profile
+  // named no model.
+  test('refuses an empty model rather than omitting --model', async () => {
+    const { interactiveClaudeArgs } = await import('../../src/supervisor/interactive');
+    expect(() => interactiveClaudeArgs({ model: '  ' })).toThrow(/claude-code launch names no model/);
   });
 
   test('resume, autonomous and model are all threaded through', async () => {
@@ -357,9 +388,9 @@ describe('interactiveClaudeArgs', () => {
       .toEqual(['claude', '--resume', 's1', '--dangerously-skip-permissions', '--model', 'opus']);
   });
 
-  test('extraArgs land after the supervisor flags and before --model', async () => {
+  test('extraArgs land after the supervisor flags', async () => {
     const { interactiveClaudeArgs } = await import('../../src/supervisor/interactive');
     expect(interactiveClaudeArgs({ resumeSessionId: 's1', extraArgs: ['--effort', 'high'], model: 'opus' }))
-      .toEqual(['claude', '--resume', 's1', '--effort', 'high', '--model', 'opus']);
+      .toEqual(['claude', '--resume', 's1', '--model', 'opus', '--effort', 'high']);
   });
 });

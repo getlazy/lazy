@@ -49,9 +49,38 @@ import { pathExists } from '../utils/fs';
 import { getHome } from '../utils/home';
 import { logger } from '../utils/logger';
 
-/** Parent directory that holds all per-builder isolation dirs for a project. */
+/**
+ * Parent directory that holds all per-builder isolation dirs for a project.
+ *
+ * The CLI `lazy builder` path roots its isolation dirs here. A DAEMON-OWNED
+ * builder session must NOT: every builder container mounts the whole data dir
+ * read-write, so dirs under it are readable and writable by every member's
+ * container. Daemon-owned sessions root theirs in the member's own home —
+ * see builderSessionProjectsRoot.
+ */
 export function builderProjectsRoot(dataDirAbs: string): string {
   return join(dataDirAbs, 'builder-projects');
+}
+
+/**
+ * Member-scoped isolation root for a DAEMON-OWNED builder session:
+ * `<memberHome>/builder-projects/<runId>`, beside the member's per-member
+ * `.claude` (src/builder/claude-home.ts).
+ *
+ * WHY NOT builderProjectsRoot: every builder container mounts the whole
+ * project data dir read-write (`-v ${dataDir}:${dataDir}`), so isolation dirs
+ * under it — full conversation JSONLs — are readable AND writable by every
+ * other member's container, and seedProjectsDirFromHistory would seed them
+ * across members by design. Under the member's home the home fix's placement
+ * rule holds (claude-home.ts): only the ONE run dir a launch resolves is ever
+ * bind-mounted into a container, and the root itself is host-side bookkeeping
+ * (resume resolution, seeding, pruning) no container ever sees. The sibling
+ * dirs seeding unions are therefore always this member's own prior runs —
+ * cross-member seeding is impossible structurally, and a member's own prior
+ * sessions still seed, which is the behaviour that is wanted.
+ */
+export function builderSessionProjectsRoot(homeDirAbs: string): string {
+  return join(homeDirAbs, 'builder-projects');
 }
 
 /**
@@ -518,6 +547,10 @@ export async function classifyResumeSession(opts: {
  * - no resumeId (fresh run) → mint a new id and create a fresh empty dir.
  *
  * @param lazyRoot  Repo root — its encoded form is the projects subdir name.
+ * @param projectsRootAbs  Optional override for the isolation root. A
+ *   daemon-owned builder session passes builderSessionProjectsRoot(memberHome)
+ *   so its per-run dirs live in the member's own home; unset, the root is the
+ *   project's `<dataDir>/builder-projects` (the CLI builder path).
  */
 export async function resolveBuilderProjectsDir(opts: {
   dataDirAbs: string;
@@ -527,9 +560,11 @@ export async function resolveBuilderProjectsDir(opts: {
   homeDirAbs?: string;
   /** `--import`: deliberately adopt a session that has never run under isolation. */
   adopt?: boolean;
+  /** Isolation-root override for member-scoped (daemon-owned) launches. */
+  projectsRootAbs?: string;
 }): Promise<BuilderProjectsIsolation | null> {
   const { dataDirAbs, lazyRoot, resumeId, homeDirAbs = getHome(), adopt = false } = opts;
-  const root = builderProjectsRoot(dataDirAbs);
+  const root = opts.projectsRootAbs ?? builderProjectsRoot(dataDirAbs);
   const encodedCwd = encodeProjectPath(lazyRoot);
 
   /** Mint a new, distinct isolation dir for a run with no dir of its own yet. */
@@ -589,7 +624,7 @@ export async function resolveBuilderProjectsDir(opts: {
   // launch (the builder still works; /resume just shows fewer sessions).
   try {
     await seedProjectsDirFromHistory({
-      dataDirAbs,
+      root,
       homeDirAbs,
       encodedCwd,
       targetHostDir: target.hostDir,
@@ -692,14 +727,20 @@ export async function resolveBuilderProjectsDirForLaunch(opts: {
   homeDirAbs?: string;
   /** `--import`: deliberately adopt a session that has never run under isolation. */
   adopt?: boolean;
+  /** Isolation-root override for member-scoped (daemon-owned) launches. */
+  projectsRootAbs?: string;
 }): Promise<string | undefined> {
   const { dataDirAbs, lazyRoot, resumeId, homeDirAbs, adopt } = opts;
+  const projectsRoot = opts.projectsRootAbs ?? builderProjectsRoot(dataDirAbs);
   try {
-    const isolation = await resolveBuilderProjectsDir({ dataDirAbs, lazyRoot, resumeId, homeDirAbs, adopt });
+    const isolation = await resolveBuilderProjectsDir({ dataDirAbs, lazyRoot, resumeId, homeDirAbs, adopt, projectsRootAbs: projectsRoot });
     // Opportunistic cleanup so per-builder dirs don't accumulate. Best-effort —
-    // never block launching on a prune failure. Keep the active dir.
+    // never block launching on a prune failure. Keep the active dir. Pruned
+    // against the SAME root the dir was resolved from: a member-scoped launch
+    // must not age-prune another population's dirs (e.g. review-session runs
+    // under the data-dir root) just because its own keepId is not there.
     try {
-      const removed = await pruneStaleBuilderProjectsDirs(dataDirAbs, isolation?.id ?? null);
+      const removed = await pruneStaleBuilderProjectsDirs(projectsRoot, isolation?.id ?? null);
       if (removed.length > 0) {
         logger.info(`Cleaned up ${removed.length} stale builder session dir(s).`);
       }
@@ -788,18 +829,17 @@ export async function isTrustedResumeProjectsDir(opts: {
  * recency and the snapshot sees them as pre-launch, not fresh.
  */
 async function seedProjectsDirFromHistory(opts: {
-  dataDirAbs: string;
+  root: string;
   homeDirAbs: string;
   encodedCwd: string;
   targetHostDir: string;
 }): Promise<void> {
-  const { dataDirAbs, homeDirAbs, encodedCwd, targetHostDir } = opts;
+  const { root, homeDirAbs, encodedCwd, targetHostDir } = opts;
   const targetDir = join(targetHostDir, encodedCwd);
   await mkdir(targetDir, { recursive: true });
 
   // Collect source dirs: the shared host projects dir + all OTHER isolation dirs.
   const sourceDirs = [join(homeDirAbs, '.claude', 'projects', encodedCwd)];
-  const root = builderProjectsRoot(dataDirAbs);
   let isolationChildren: string[] = [];
   try {
     isolationChildren = await readdir(root);
@@ -912,15 +952,18 @@ const DEFAULT_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000; // 14 days
  * Best-effort: failures to remove a single stale dir are logged by the caller's
  * choice, not thrown — pruning must never block launching a builder.
  *
+ * @param root  The isolation root whose stale run dirs to prune —
+ *   `builderProjectsRoot(dataDirAbs)` for the CLI builder path,
+ *   `builderSessionProjectsRoot(memberHome)` for a daemon-owned session.
+ * @param keepId  The currently-active dir's id — always kept.
  * @returns the ids that were removed.
  */
 export async function pruneStaleBuilderProjectsDirs(
-  dataDirAbs: string,
+  root: string,
   keepId: string | null,
   maxAgeMs: number = DEFAULT_MAX_AGE_MS,
   now: number = Date.now(),
 ): Promise<string[]> {
-  const root = builderProjectsRoot(dataDirAbs);
   let children: string[];
   try {
     children = await readdir(root);

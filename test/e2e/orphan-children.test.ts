@@ -11,6 +11,7 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes, extractTaskId } from '../helpers/assertions';
 import { createTask, disablePreAccept, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 import { findFullTaskId, taskFilePath, worktreePathFor } from '../helpers/storage';
 
 // Storage lives at the project's external_path, NOT <root>/.lazy/tasks --
@@ -76,6 +77,11 @@ async function acceptParent(
   writeFileSync(join(worktreePath, 'parent-work.txt'), 'parent work content\n');
   ctx.git('-C', worktreePath, 'add', 'parent-work.txt');
   ctx.git('-C', worktreePath, 'commit', '-m', 'Parent work commit');
+
+  // Fixture setup, not the subject: the finality gate needs a standing final
+  // before any accept of a committed task. Daemonless suite — the storage-level
+  // seed (see test/helpers/final.ts).
+  seedFinal(ctx, parentId);
 
   return ctx.lazy(['accept', parentId, '--reason', 'LGTM']);
 }

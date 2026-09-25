@@ -102,11 +102,11 @@ export interface RelaunchLoopDeps {
   /** Poll cadence while awaiting the upgrade (default 2s). */
   pollIntervalMs?: number;
   /**
-   * How long to wait quietly before the first reassurance line (default 5 min).
+   * How long to wait quietly before the first reassurance line (default 15s).
    * This is NOT a timeout — nothing is abandoned when it elapses.
    */
   reassureAfterMs?: number;
-  /** Cadence of subsequent reassurance lines (default 2 min). */
+  /** Cadence of subsequent reassurance lines (default 15s). */
   reassureIntervalMs?: number;
   /**
    * Is the `lazy upgrade` process still alive? Injectable for tests; the default
@@ -118,6 +118,11 @@ export interface RelaunchLoopDeps {
   currentHost?: () => string;
   /** Sleep impl (injectable for tests). */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Test seam: when set, used as the upgrade-wait abort signal instead of
+   * installing a SIGINT handler. Production leaves this unset.
+   */
+  upgradeWaitAbortSignal?: AbortSignal;
 }
 
 export interface RelaunchLoopResult {
@@ -129,8 +134,10 @@ export interface RelaunchLoopResult {
   sessionId: string | null;
 }
 
-const DEFAULT_REASSURE_AFTER_MS = 5 * 60 * 1000;
-const DEFAULT_REASSURE_INTERVAL_MS = 2 * 60 * 1000;
+// Match `BUILD_PROGRESS_INTERVAL_MS` in src/cli/commands/upgrade.ts — long silent
+// stretches make a deliberate unbounded wait look hung.
+const DEFAULT_REASSURE_AFTER_MS = 15_000;
+const DEFAULT_REASSURE_INTERVAL_MS = 15_000;
 const DEFAULT_POLL_INTERVAL_MS = 2000;
 
 /**
@@ -166,7 +173,45 @@ export type UpgradeWaitOutcome =
   /** The daemon came back with the new version — the upgrade finished. */
   | 'complete'
   /** The upgrade process is gone and the daemon never came back — it failed. */
-  | 'upgrade-died';
+  | 'upgrade-died'
+  /** The human cancelled the wait (ctrl-c). The resume intent is left intact. */
+  | 'interrupted';
+
+/** Thrown by {@link sleepOrAbort} when `abortSignal` fires mid-wait. */
+export class UpgradeWaitInterruptedError extends Error {
+  constructor() {
+    super('upgrade wait interrupted');
+    this.name = 'UpgradeWaitInterruptedError';
+  }
+}
+
+/** Sleep for `ms`, or reject promptly when `abortSignal` aborts. Always routes through `sleep`. */
+async function sleepOrAbort(
+  ms: number,
+  sleep: (ms: number) => Promise<void>,
+  abortSignal?: AbortSignal,
+): Promise<void> {
+  if (abortSignal?.aborted) throw new UpgradeWaitInterruptedError();
+  if (!abortSignal) {
+    await sleep(ms);
+    return;
+  }
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      abortSignal.removeEventListener('abort', onAbort);
+      fn();
+    };
+    const onAbort = () => finish(() => reject(new UpgradeWaitInterruptedError()));
+    abortSignal.addEventListener('abort', onAbort);
+    sleep(ms).then(
+      () => finish(resolve),
+      (err) => finish(() => reject(err)),
+    );
+  });
+}
 
 /** Render a duration as a human-friendly "5m" / "1h 12m". */
 export function formatWaited(ms: number): string {
@@ -241,7 +286,7 @@ async function newestBuilderSessionId(storage: RelaunchStorage): Promise<string 
  * There is deliberately NO timeout. Waiting costs nothing but patience; giving
  * up costs the human their live session, which is exactly the outcome the wait
  * exists to prevent. The only way out other than success is a real signal that
- * the upgrade will never finish.
+ * the upgrade will never finish, or the human cancelling with ctrl-c.
  *
  * Elapsed time is accumulated from the poll interval rather than a wall clock so
  * the reassurance cadence is deterministic under an injected `sleep` in tests.
@@ -257,10 +302,12 @@ export async function waitForUpgradeComplete(opts: {
   reassureIntervalMs: number;
   /** Called with the elapsed wait each time a reassurance line is due. */
   onReassure: (elapsedMs: number) => void;
+  /** When aborted (ctrl-c), returns `'interrupted'` and leaves the resume intent intact. */
+  abortSignal?: AbortSignal;
 }): Promise<UpgradeWaitOutcome> {
   const {
     baseline, daemonStatus, pollIntervalMs, sleep, upgradeAlive,
-    reassureAfterMs, reassureIntervalMs, onReassure,
+    reassureAfterMs, reassureIntervalMs, onReassure, abortSignal,
   } = opts;
 
   let elapsedMs = 0;
@@ -269,6 +316,8 @@ export async function waitForUpgradeComplete(opts: {
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
+    if (abortSignal?.aborted) return 'interrupted';
+
     // Completion is always checked FIRST, so a successful upgrade wins every
     // race against its own process exiting.
     if (isUpgradeComplete(baseline, await daemonStatus())) return 'complete';
@@ -281,7 +330,12 @@ export async function waitForUpgradeComplete(opts: {
       }
     }
 
-    await sleep(pollIntervalMs);
+    try {
+      await sleepOrAbort(pollIntervalMs, sleep, abortSignal);
+    } catch (err) {
+      if (err instanceof UpgradeWaitInterruptedError) return 'interrupted';
+      throw err;
+    }
     elapsedMs += pollIntervalMs;
 
     if (elapsedMs >= nextReassureAtMs) {
@@ -312,6 +366,7 @@ export async function runBuilderRelaunchLoop(deps: RelaunchLoopDeps): Promise<Re
     isProcessAlive = defaultIsProcessAlive,
     currentHost = hostname,
     sleep = defaultSleep,
+    upgradeWaitAbortSignal,
   } = deps;
 
   let resumeId = deps.initialResumeId;
@@ -367,6 +422,7 @@ export async function runBuilderRelaunchLoop(deps: RelaunchLoopDeps): Promise<Re
     // against the very daemon that caused it and never return. Nothing to wait
     // for; go straight to relaunching against the daemon that is already there.
     let ready: boolean;
+    let upgradeWaitOutcome: UpgradeWaitOutcome | undefined;
     if (intent.reason === 'daemon-restart') {
       log('');
       log("The lazy daemon restarted, which invalidated this builder's connection to its");
@@ -382,6 +438,7 @@ export async function runBuilderRelaunchLoop(deps: RelaunchLoopDeps): Promise<Re
       log('');
       log("Builder was stopped by 'lazy upgrade'. Waiting for the new version to finish building...");
       log('This session is not lost — it resumes here automatically when the upgrade completes.');
+      log(`  Polling every ${Math.round(pollIntervalMs / 1000)}s (ctrl-c to cancel — your session stays recoverable).`);
       const baseline = await daemonStatus();
 
       // Only trust a pid stamped on THIS host: with a shared store the intent may
@@ -393,27 +450,38 @@ export async function runBuilderRelaunchLoop(deps: RelaunchLoopDeps): Promise<Re
           ? () => isProcessAlive(intent.upgradePid as number)
           : null;
 
-      const outcome = await waitForUpgradeComplete({
-        baseline,
-        daemonStatus,
-        pollIntervalMs,
-        sleep,
-        upgradeAlive,
-        reassureAfterMs,
-        reassureIntervalMs,
-        onReassure: (elapsedMs) => {
-          log('');
-          log(`Still waiting for 'lazy upgrade' to finish (${formatWaited(elapsedMs)} so far). This is not stuck —`);
-          log('a full rebuild can take a while. Your builder session will resume here on its own.');
-          if (hintId) {
-            log(`If you would rather not wait, ctrl-c and resume later with:  lazy builder --resume ${hintId}`);
-          } else {
-            log('If you would rather not wait, ctrl-c and resume later with:  lazy builder --resume <id>');
-            log('  (find session ids with: lazy builder list)');
-          }
-        },
-      });
-      ready = outcome === 'complete';
+      // Ctrl-c during the wait must not consume the resume intent — same cleanup
+      // the old timer exit performed (leave intent, print manual resume).
+      const abort = upgradeWaitAbortSignal ? null : new AbortController();
+      const waitAbortSignal = upgradeWaitAbortSignal ?? abort!.signal;
+      const onSigint = abort ? () => abort.abort() : undefined;
+      if (onSigint) process.on('SIGINT', onSigint);
+      try {
+        upgradeWaitOutcome = await waitForUpgradeComplete({
+          baseline,
+          daemonStatus,
+          pollIntervalMs,
+          sleep,
+          upgradeAlive,
+          reassureAfterMs,
+          reassureIntervalMs,
+          abortSignal: waitAbortSignal,
+          onReassure: (elapsedMs) => {
+            log('');
+            log(`Still waiting for 'lazy upgrade' to finish (${formatWaited(elapsedMs)} so far). This is not stuck —`);
+            log('a full rebuild can take as long as it needs. Your builder session will resume here on its own.');
+            if (hintId) {
+              log(`If you would rather not wait, ctrl-c and resume later with:  lazy builder --resume ${hintId}`);
+            } else {
+              log('If you would rather not wait, ctrl-c and resume later with:  lazy builder --resume <id>');
+              log('  (find session ids with: lazy builder list)');
+            }
+          },
+        });
+      } finally {
+        if (onSigint) process.removeListener('SIGINT', onSigint);
+      }
+      ready = upgradeWaitOutcome === 'complete';
     }
 
     // Resolve which session to resume: prefer the id stamped on the intent, then
@@ -439,6 +507,10 @@ export async function runBuilderRelaunchLoop(deps: RelaunchLoopDeps): Promise<Re
       if (!ready && intent.reason === 'daemon-restart') {
         // Already explained above (the daemon went away again) — adding the
         // upgrade copy here would blame an upgrade that never ran.
+      } else if (!ready && upgradeWaitOutcome === 'interrupted') {
+        errorOut('');
+        errorOut('Upgrade wait cancelled (ctrl-c). Your builder session is preserved.');
+        errorOut('Resume when you are ready — the upgrade can still finish in its own terminal:');
       } else if (!ready) {
         // The ONLY non-success exit from the wait: the upgrade process is gone
         // and the daemon never came back with the new version. Say that — it
@@ -465,7 +537,8 @@ export async function runBuilderRelaunchLoop(deps: RelaunchLoopDeps): Promise<Re
         errorOut(`  (find session ids with: lazy builder list)`);
       }
       // Suppress the normal footer — we already printed actionable guidance.
-      return { exitCode: 1, sessionId: null };
+      const exitCode = upgradeWaitOutcome === 'interrupted' ? 130 : 1;
+      return { exitCode, sessionId: null };
     }
 
     // Re-resolve the live proxy address against the daemon that came back.

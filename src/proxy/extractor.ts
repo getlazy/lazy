@@ -4,13 +4,15 @@
  * Parses the Anthropic /v1/messages body and extracts:
  *   - coarse request shape (model, streaming, system size, message roles, tools)
  *   - tool_use blocks (intended actions — file paths, bash commands, network targets)
- *   - tool_result blocks (action results — bounded content preview)
+ *   - tool_result blocks (action results — bounded content preview, plus the
+ *     token size of the full result, attributed to the tool_use id it answers)
  *
  * All fields are extracted from the request body only — the response is
  * streamed through untouched so nothing here touches the upstream response.
  */
 
 import type { ProxyRequestShape, ProxyToolUseAudit, ProxyToolResultAudit } from '../storage/types';
+import { toolResultTokens } from './tool-result-tokens';
 
 const TOOL_INPUT_PREVIEW_BYTES = 512;
 const TOOL_RESULT_PREVIEW_BYTES = 256;
@@ -92,11 +94,18 @@ function extractToolResult(block: unknown): ProxyToolResultAudit {
     ? contentStr.slice(0, TOOL_RESULT_PREVIEW_BYTES) + '…'
     : contentStr;
 
+  const toolUseId = typeof b?.tool_use_id === 'string' ? b.tool_use_id : null;
+
   return {
-    toolUseId: typeof b?.tool_use_id === 'string' ? b.tool_use_id : null,
+    toolUseId,
     isError: b?.is_error === true,
     contentPreview,
     contentLen,
+    // Sized here because this is the only place holding the full result text —
+    // everything downstream has the bounded preview. Cached per tool_use id, so
+    // the same result replayed on every later request costs a map lookup. Null
+    // means "not measured", never "free" (see proxy/tool-result-tokens.ts).
+    contentTokens: toolResultTokens(toolUseId, contentStr),
   };
 }
 
@@ -163,17 +172,38 @@ export function extractRequest(path: string, body: unknown): ExtractedRequest {
     bodyBytes: 0, // caller fills this in
   };
 
-  // Scan messages for tool_use and tool_result content blocks
+  // Scan messages for tool_use and tool_result content blocks.
+  //
+  // THE TAIL. Every request replays the whole conversation, so nearly every
+  // block here is history that earlier requests already carried. The one place
+  // a NEW block can be is the conversation tail: the agent's most recent
+  // response (the LAST assistant message, which holds the calls it just made)
+  // and everything after it (the user turn carrying those calls' results).
+  // Marking the tail here — where the message array is in hand — is what lets
+  // the durable per-task stats (src/proxy/tool-stats.ts) count a call once
+  // without remembering every id a long conversation ever produced. It is only
+  // a marker: it says "this block could be new", never "this block is new", and
+  // the fold still guards against re-counting a replayed tail.
   const toolUses: ProxyToolUseAudit[] = [];
   const toolResults: ProxyToolResultAudit[] = [];
 
-  for (const msg of messages) {
-    const m = msg as Record<string, unknown>;
+  let lastAssistant = -1;
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i] as Record<string, unknown>;
+    if (msg?.role === 'assistant') lastAssistant = i;
+  }
+
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i] as Record<string, unknown>;
     if (!Array.isArray(m?.content)) continue;
+    const isTailAssistant = i === lastAssistant;
+    const isAfterTailAssistant = lastAssistant >= 0 && i > lastAssistant;
     for (const block of m.content as unknown[]) {
       const blk = block as Record<string, unknown>;
-      if (blk?.type === 'tool_use') toolUses.push(extractToolUse(block));
-      if (blk?.type === 'tool_result') toolResults.push(extractToolResult(block));
+      if (blk?.type === 'tool_use') toolUses.push({ ...extractToolUse(block), tail: isTailAssistant });
+      if (blk?.type === 'tool_result') {
+        toolResults.push({ ...extractToolResult(block), tail: isAfterTailAssistant });
+      }
     }
   }
 

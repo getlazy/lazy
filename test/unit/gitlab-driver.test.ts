@@ -1,4 +1,5 @@
 import { describe, test, expect } from 'bun:test';
+import { ANTHROPIC_DEFAULT_TARGET } from '../../src/utils/role-target';
 import { DEFAULT_CONFIG } from '../../src/config/loader';
 import { GitLabDriver } from '../../src/remote/gitlab-driver';
 import type { Task } from '../../src/types';
@@ -13,16 +14,18 @@ import type { GitLabDriverDeps, GlResult } from '../../src/remote/gitlab-driver'
  */
 
 const mockConfig: ResolvedConfig = {
-  models: { default: 'claude-sonnet-4-5-20250929', roles: { builder: { backend: 'anthropic', model: '', endpoint: '' }, agent: { backend: 'anthropic', model: '', endpoint: '' } } },
+  models: { default: 'claude-sonnet-4-5-20250929', roles: { builder: ANTHROPIC_DEFAULT_TARGET, agent: ANTHROPIC_DEFAULT_TARGET } },
   session: { verbose: false, debug: false, auto_commit_instructions: false },
   data: { path: '/tmp/test/.lazy' },
-  storage: { backend: 'external', external_path: '', postgres_ssl: false },
+  storage: { backend: 'external', external_path: '' },
   git: { default_branch_prefix: 'lazy', lfs_check: 'refuse' },
   output: { shortid_length: 8 },
+  agents: {},
   agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0, wind_down_timeout_ms: 0, effort: 'medium' },
+  review: { mode: 'low_high', auto_fix: false, gate: 'auto', draft_effort: 'low', review_effort: 'xhigh' },
   builder: { effort: 'high' },
   chattiness: { default: '', builder: '', agent: '' },
-  server: { port: 3000, sync_interval: 1000, bind: '127.0.0.1' },
+  server: { port: 3000, sync_interval: 1000, bind: '127.0.0.1', dashboard_url: '' },
   remote: {
     driver: 'gitlab',
     git_remote: 'origin',
@@ -33,18 +36,20 @@ const mockConfig: ResolvedConfig = {
     gitlab_auto_push: true,
     gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
   },
-  docker: { dockerfile: '' },
-  runner: { type: 'docker' as const, permission_mode: 'sandbox' as const, sandbox_allowed_domains: ['*.anthropic.com'], sandbox_deny_read: [], sandbox_deny_write: [], sandbox_allow_weaker_nested: false },
+  docker: { dockerfile: '', build_inputs: [], run_args: [] },
+  runner: { type: 'docker' as const, permission_mode: 'sandbox' as const, sandbox_allowed_domains: ['*.anthropic.com'], sandbox_deny_read: [], sandbox_deny_write: [], sandbox_allow_weaker_nested: false, verify_sandbox_boundary: 'off' as const },
   documents: { path: '' },
   features: {},
   worktree: { include: [] },
   permissions: { protected: [] },
   protection: { enabled: false, protected_branches: [], protected_tasks: [], gate_default_branch: true },
-  automation: { maintain: [], pre_accept: { enabled: false, commands: [], timeout: 600 } },
+  automation: { maintain: [], react: [], pre_accept: { enabled: false, commands: [], timeout: 600 }, pre_turn: '', pre_turn_timeout: 120, pre_turn_required: false, post_turn: '', post_turn_timeout: 300, accept_check: '', accept_check_timeout: 300 },
   mounts: [],
-  checks: { post_turn: '', post_turn_timeout: 300 },
-  ollama: { enabled: false, model: '', endpoint: 'http://host.docker.internal:11434' },
-  limits: { max_concurrent_agents: 8, max_concurrent_builders: 8, idle_grace_minutes: 10, max_turns_without_human: 10 },
+  serve: { services: [], start_services_cmd: '' },
+  credentials: { backend: 'auto' },
+  limits: { max_concurrent_builders: 8, max_turns_without_human: 10 },
+  cluster: { max_child_fix_rounds: 3 },
+  usage_pause: { threshold_percent: 0, credentials: {} },
   daemon: {
     auto_react_ci: true,
     auto_react_comments: true,
@@ -70,7 +75,6 @@ function makeTask(overrides?: Partial<Task>): Task {
     prompt: 'Test prompt',
     type: 'task',
     status: 'working' as const,
-    priority: 'normal',
     created_at: Date.now(),
     completed_at: null,
     target: { kind: 'branch' as const, branch: 'main' },
@@ -90,60 +94,127 @@ const ok = (stdout = ''): GlResult => ({ stdout, stderr: '', exitCode: 0 });
 const fail = (stderr = 'error'): GlResult => ({ stdout: '', stderr, exitCode: 1 });
 
 describe('GitLabDriver', () => {
-  describe('postAcceptReview', () => {
-    test('approves MR and posts comment', async () => {
+  describe('approveForMerge', () => {
+    // INVARIANT: this is the ONLY write lazy makes to an MR besides creating
+    // it and keeping its lazy-owned description section current, and it runs
+    // only under `[remote] auto_approve` on a protected target. It approves
+    // and posts NOTHING: the `[Lazy Accept]` note it used to leave alongside
+    // the approval was a notification for every watcher, and lazy stopped
+    // writing those (engineer decision, 2026-09-21).
+    test('approves the MR and posts no comment', async () => {
       const glCalls: string[][] = [];
       const mockDeps: GitLabDriverDeps = {
         runGl: async (args: string[]) => {
           glCalls.push([...args]);
           if (args[0] === 'mr' && args[1] === 'approve') return Promise.resolve(ok());
-          if (args[0] === 'mr' && args[1] === 'comment') return Promise.resolve(ok());
           return Promise.resolve(fail('unexpected call'));
         },
         runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
-      const warning = await driver.postAcceptReview(makeTask(), 'LGTM');
+      const warning = await driver.approveForMerge(makeTask(), 'LGTM');
 
       expect(warning).toBeNull();
-      // Should have called both approve and comment
       expect(glCalls.some(c => c[0] === 'mr' && c[1] === 'approve')).toBe(true);
-      expect(glCalls.some(c => c[0] === 'mr' && c[1] === 'comment')).toBe(true);
+      expect(glCalls.some(c => c[0] === 'mr' && c[1] === 'comment')).toBe(false);
     });
 
-    test('posts comment even when approve fails (self-approval)', async () => {
+    // INVARIANT: a refusal lazy EXPECTED is silent — debug log, null return —
+    // and the two drivers agree on that shape. `[remote] auto_approve` is
+    // documented for the sole developer who does not want to approve their
+    // own MRs by hand, and GitLab refuses exactly that because they authored
+    // it; warning on every accept trains the reader to ignore the warnings
+    // that matter. GitHub's twin is the 422 case in github-driver-422.test.ts.
+    //
+    // GitLab says it with HTTP 401 and nothing else: the approve endpoint
+    // ends in `unauthorized! unless result.success?`, so the author case, the
+    // already-approved case and the no-permission case are one indivisible
+    // response, `{"message":"401 Unauthorized"}`. The fixtures below are that
+    // response as glab surfaces it — NOT prose GitLab has never sent.
+    test.each([
+      ['plain 401 body', '{"message":"401 Unauthorized"}'],
+      ['glab-wrapped 401', 'POST https://gitlab.com/api/v4/projects/1/merge_requests/42/approve: 401 {message: 401 Unauthorized}'],
+      ['bare status word', 'Unauthorized'],
+    ])('an expected refusal (%s) is quiet: no warning, no comment', async (_label, stderr) => {
+      const glCalls: string[][] = [];
       const mockDeps: GitLabDriverDeps = {
         runGl: async (args: string[]) => {
-          if (args[0] === 'mr' && args[1] === 'approve') return Promise.resolve(fail('You cannot approve your own MR'));
-          if (args[0] === 'mr' && args[1] === 'comment') return Promise.resolve(ok());
-          return Promise.resolve(fail('unexpected call'));
+          glCalls.push([...args]);
+          // The credential itself is fine — only the approval was refused.
+          if (args[0] === 'auth') return Promise.resolve(ok('logged in to gitlab.com'));
+          return Promise.resolve(fail(stderr));
         },
         runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
-      const warning = await driver.postAcceptReview(makeTask(), 'LGTM');
 
-      // Should still succeed (comment posted)
-      expect(warning).toBeNull();
+      expect(await driver.approveForMerge(makeTask(), 'LGTM')).toBeNull();
+      expect(glCalls.some(c => c[0] === 'mr' && c[1] === 'comment')).toBe(false);
     });
 
-    test('returns warning when comment fails', async () => {
+    // INVARIANT: a 401 caused by a BROKEN CREDENTIAL is a real failure and
+    // must be distinguishable from the refusal above — GitLab sends the same
+    // body for both, so the only thing that separates them is whether the
+    // token still works. `glab auth status` is the tiebreaker, and it runs
+    // only on the failure path.
+    test('a 401 with a dead credential is a real failure naming the credential', async () => {
+      const glCalls: string[][] = [];
       const mockDeps: GitLabDriverDeps = {
         runGl: async (args: string[]) => {
-          if (args[0] === 'mr' && args[1] === 'approve') return Promise.resolve(ok());
-          if (args[0] === 'mr' && args[1] === 'comment') return Promise.resolve(fail('Network error'));
-          return Promise.resolve(fail('unexpected call'));
+          glCalls.push([...args]);
+          if (args[0] === 'auth') return Promise.resolve(fail('token expired'));
+          return Promise.resolve(fail('{"message":"401 Unauthorized"}'));
         },
         runGit: async () => Promise.resolve(ok()),
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
-      const warning = await driver.postAcceptReview(makeTask(), 'LGTM');
+      const warning = await driver.approveForMerge(makeTask(), 'LGTM');
 
-      expect(warning).not.toBeNull();
-      expect(warning).toContain('Could not post accept review');
+      expect(warning).toContain('Could not approve MR');
+      expect(warning).toContain('token expired');
+      expect(warning).toContain('glab auth login');
+      expect(glCalls.some(c => c[0] === 'auth' && c[1] === 'status')).toBe(true);
+      expect(glCalls.some(c => c[0] === 'mr' && c[1] === 'comment')).toBe(false);
+    });
+
+    // A REAL failure is still reported — and still not papered over with a
+    // comment: a comment is not an approval, so it would leave the merge just
+    // as blocked while notifying everyone watching. A failure that is not a
+    // 401 needs no credential probe at all.
+    //
+    // INVARIANT: the classification reads the STATUS WORD, never a bare 401.
+    // glab formats an API error as `<METHOD> <URL>: <code> <body>`, so the
+    // project id and the MR iid are inside the string being classified — and
+    // a numeric match therefore swallowed every approve failure on a project
+    // or MR numbered 401, silently, because the credential probe passes. The
+    // second case below is that exact string.
+    test.each([
+      ['network failure', 'dial tcp: lookup gitlab.com: no such host', 'no such host'],
+      [
+        'a 404 whose URL contains 401',
+        'POST https://gitlab.com/api/v4/projects/401/merge_requests/401/approve: 404 {message: 404 Not found}',
+        '404 Not found',
+      ],
+    ])('a non-401 failure (%s) warns without probing the credential', async (_label, stderr, expected) => {
+      const glCalls: string[][] = [];
+      const mockDeps: GitLabDriverDeps = {
+        runGl: async (args: string[]) => {
+          glCalls.push([...args]);
+          return Promise.resolve(fail(stderr));
+        },
+        runGit: async () => Promise.resolve(ok()),
+      };
+
+      const driver = new GitLabDriver(mockConfig, mockDeps);
+      const warning = await driver.approveForMerge(makeTask(), 'LGTM');
+
+      expect(warning).toContain('Could not approve MR');
+      expect(warning).toContain(expected);
+      expect(glCalls.some(c => c[0] === 'auth')).toBe(false);
+      expect(glCalls.some(c => c[0] === 'mr' && c[1] === 'comment')).toBe(false);
     });
 
     test('skips when no MR number', async () => {
@@ -154,110 +225,25 @@ describe('GitLabDriver', () => {
       };
 
       const driver = new GitLabDriver(mockConfig, mockDeps);
-      const warning = await driver.postAcceptReview(makeTask({ metadata: null }), 'LGTM');
+      const warning = await driver.approveForMerge(makeTask({ metadata: null }), 'LGTM');
 
       expect(warning).toBeNull();
       expect(glCalled).toBe(false);
     });
   });
 
-  describe('postRejectReview', () => {
-    // INVARIANT: GitLab has no "request changes" review state.
-    // Reject review is implemented as a comment.
-    test('posts reject comment (GitLab has no request-changes state)', async () => {
-      let postedBody = '';
-      const mockDeps: GitLabDriverDeps = {
-        runGl: async (args: string[]) => {
-          if (args[0] === 'mr' && args[1] === 'comment') {
-            const msgIdx = args.indexOf('--message');
-            postedBody = msgIdx >= 0 ? args[msgIdx + 1] : '';
-            return Promise.resolve(ok());
-          }
-          return Promise.resolve(fail('unexpected call'));
-        },
-        runGit: async () => Promise.resolve(ok()),
-      };
-
-      const driver = new GitLabDriver(mockConfig, mockDeps);
-      const warning = await driver.postRejectReview(makeTask(), 'Needs changes');
-
-      expect(warning).toBeNull();
-      expect(postedBody).toContain('[Lazy Reject]');
-      expect(postedBody).toContain('Needs changes');
-    });
-
-    test('returns warning when comment fails', async () => {
-      const mockDeps: GitLabDriverDeps = {
-        runGl: async () => Promise.resolve(fail('Network error')),
-        runGit: async () => Promise.resolve(ok()),
-      };
-
-      const driver = new GitLabDriver(mockConfig, mockDeps);
-      const warning = await driver.postRejectReview(makeTask(), 'Needs changes');
-
-      expect(warning).not.toBeNull();
-      expect(warning).toContain('Could not post reject review');
-    });
-
-    test('skips when no MR number', async () => {
-      let glCalled = false;
-      const mockDeps: GitLabDriverDeps = {
-        runGl: async () => { glCalled = true; return Promise.resolve(fail()); },
-        runGit: async () => Promise.resolve(ok()),
-      };
-
-      const driver = new GitLabDriver(mockConfig, mockDeps);
-      const warning = await driver.postRejectReview(makeTask({ metadata: null }), 'Needs changes');
-
-      expect(warning).toBeNull();
-      expect(glCalled).toBe(false);
-    });
-  });
-
-  describe('postTurnSummary', () => {
-    test('posts comment with lazy marker to MR', async () => {
-      let postedBody = '';
-      const mockDeps: GitLabDriverDeps = {
-        runGl: async (args: string[]) => {
-          if (args[0] === 'mr' && args[1] === 'comment') {
-            const msgIdx = args.indexOf('--message');
-            postedBody = msgIdx >= 0 ? args[msgIdx + 1] : '';
-            return Promise.resolve(ok());
-          }
-          return Promise.resolve(fail('unexpected'));
-        },
-        runGit: async () => Promise.resolve(ok()),
-      };
-
-      const driver = new GitLabDriver(mockConfig, mockDeps);
-      await driver.postTurnSummary(makeTask(), 'Turn 1: did things');
-
-      expect(postedBody).toContain('<!-- lazy:turn -->');
-      expect(postedBody).toContain('Turn 1: did things');
-      expect(postedBody.startsWith('<!-- lazy:turn -->\n')).toBe(true);
-    });
-
-    test('skips when no MR number', async () => {
-      let glCalled = false;
-      const mockDeps: GitLabDriverDeps = {
-        runGl: async () => { glCalled = true; return Promise.resolve(fail()); },
-        runGit: async () => Promise.resolve(ok()),
-      };
-
-      const driver = new GitLabDriver(mockConfig, mockDeps);
-      await driver.postTurnSummary(makeTask({ metadata: null }), 'summary');
-
-      expect(glCalled).toBe(false);
-    });
-
-    test('does not throw when posting fails', async () => {
-      const mockDeps: GitLabDriverDeps = {
-        runGl: async () => Promise.resolve(fail('Network error')),
-        runGit: async () => Promise.resolve(ok()),
-      };
-
-      const driver = new GitLabDriver(mockConfig, mockDeps);
-      await driver.postTurnSummary(makeTask(), 'summary');
+  // INVARIANT: lazy writes no reviews or comments to a forge, so the driver
+  // has no method that could (engineer decision, 2026-09-21). The removed
+  // methods reappearing is the regression this guards.
+  describe('no review/comment posting methods exist', () => {
+    test('postReviewReport / postAcceptReview / postRejectReview are gone', () => {
+      const driver = new GitLabDriver(mockConfig, {
+        runGl: async () => ok(),
+        runGit: async () => ok(),
+      }) as unknown as Record<string, unknown>;
+      expect(driver.postReviewReport).toBeUndefined();
+      expect(driver.postAcceptReview).toBeUndefined();
+      expect(driver.postRejectReview).toBeUndefined();
     });
   });
 
@@ -374,6 +360,26 @@ describe('GitLabDriver', () => {
       expect(result[0].author).toBe('alice');
       expect(result[0].body).toBe('Looks good!');
       expect(result[1].author).toBe('bob');
+    });
+
+    // INVARIANT: without `since` every visible note is returned — importers
+    // dedup by id, since a note's created_at is not when it became visible.
+    test('returns every note, however old, when no since is given', async () => {
+      const notes = [
+        { id: 1, body: 'Ancient', author: { username: 'alice' }, created_at: '2001-01-01T00:00:00Z', system: false },
+        { id: 2, body: 'merged', author: { username: 'gitlab' }, created_at: '2001-01-02T00:00:00Z', system: true },
+        { id: 3, body: '<!-- lazy:note -->\nown', author: { username: 'me' }, created_at: '2001-01-03T00:00:00Z', system: false },
+      ];
+      const mockDeps: GitLabDriverDeps = {
+        runGl: privateRepoGl((args) => {
+          if (args[0] === 'api' && args[1].includes('notes')) return ok(JSON.stringify(notes));
+          return fail('unexpected');
+        }),
+        runGit: async () => Promise.resolve(ok()),
+      };
+      const driver = new GitLabDriver(mockConfig, mockDeps);
+      const result = await driver.syncComments(makeTask());
+      expect(result.map(c => c.body)).toEqual(['Ancient']);
     });
 
     test('filters out system notes', async () => {
@@ -1511,48 +1517,29 @@ describe('GitLabDriver', () => {
     // collision with GitHub driver metadata when switching drivers.
     test('metadata key methods return gitlab_remote_* prefixed names', () => {
       const driver = new GitLabDriver(mockConfig);
-      expect(driver.commentSyncedAtKey()).toBe('gitlab_remote_last_comment_synced_at');
-      expect(driver.postedTurnSeqKey()).toBe('gitlab_remote_last_posted_turn_seq');
-      expect(driver.postedNoteAtKey()).toBe('gitlab_remote_last_posted_note_at');
+      expect(driver.fidelityTurnSeqKey()).toBe('gitlab_fidelity_turn_seq');
     });
 
-    test('getLastCommentSyncedAt reads only gitlab_remote_* key', () => {
+    test('getLastFidelityTurnSeq reads gitlab keys with legacy fallback', () => {
       const driver = new GitLabDriver(mockConfig);
 
-      const task1 = makeTask({ metadata: { gitlab_remote_last_comment_synced_at: '2024-06-01T00:00:00Z' } });
-      expect(driver.getLastCommentSyncedAt(task1)).toBe('2024-06-01T00:00:00Z');
+      // INVARIANT: stores written before the per-turn forge mirroring was
+      // removed kept the watermark under gitlab_remote_last_posted_turn_seq.
+      // The fidelity refresher must keep reading it, or every upgrade would
+      // treat all existing turns as new work and regenerate every MR
+      // description once.
+      const task1 = makeTask({ metadata: { gitlab_remote_last_posted_turn_seq: '5' } });
+      expect(driver.getLastFidelityTurnSeq(task1)).toBe(5);
+
+      const task1b = makeTask({ metadata: { gitlab_fidelity_turn_seq: '7' } });
+      expect(driver.getLastFidelityTurnSeq(task1b)).toBe(7);
 
       // Does NOT fall back to unprefixed keys (isolation from GitHub)
-      const task2 = makeTask({ metadata: { remote_last_comment_synced_at: '2024-01-01T00:00:00Z' } });
-      expect(driver.getLastCommentSyncedAt(task2)).toBeUndefined();
-
-      const task3 = makeTask({ metadata: null });
-      expect(driver.getLastCommentSyncedAt(task3)).toBeUndefined();
-    });
-
-    test('getLastPostedTurnSeq reads only gitlab_remote_* key', () => {
-      const driver = new GitLabDriver(mockConfig);
-
-      const task1 = makeTask({ metadata: { gitlab_remote_last_posted_turn_seq: '5' } });
-      expect(driver.getLastPostedTurnSeq(task1)).toBe(5);
-
-      // Does NOT fall back to unprefixed keys
       const task2 = makeTask({ metadata: { remote_last_posted_turn_seq: '3' } });
-      expect(driver.getLastPostedTurnSeq(task2)).toBe(-1);
+      expect(driver.getLastFidelityTurnSeq(task2)).toBe(-1);
 
       const task3 = makeTask({ metadata: null });
-      expect(driver.getLastPostedTurnSeq(task3)).toBe(-1);
-    });
-
-    test('getLastPostedNoteAt reads only gitlab_remote_* key', () => {
-      const driver = new GitLabDriver(mockConfig);
-
-      const task1 = makeTask({ metadata: { gitlab_remote_last_posted_note_at: '2024-06-01' } });
-      expect(driver.getLastPostedNoteAt(task1)).toBe('2024-06-01');
-
-      // Does NOT fall back to unprefixed keys
-      const task2 = makeTask({ metadata: { remote_last_posted_note_at: '2024-01-01' } });
-      expect(driver.getLastPostedNoteAt(task2)).toBeUndefined();
+      expect(driver.getLastFidelityTurnSeq(task3)).toBe(-1);
     });
 
     test('validateAccept returns error when no remote ref', () => {
@@ -1645,21 +1632,23 @@ describe('GitLabDriver', () => {
   });
 
   describe('formatImportedComment', () => {
-    test('formats MR comment with remote dedup marker', () => {
+    test('formats MR comment without an identity marker in the text', () => {
       const driver = new GitLabDriver(mockConfig);
-      const comment = { id: '123', body: 'Review comment', author: 'alice', createdAt: '2024-06-01' };
+      const comment = { forge: 'gitlab' as const, kind: 'mr_note' as const, id: '123', body: 'Review comment', author: 'alice', createdAt: '2024-06-01' };
       const task = makeTask();
 
       const result = driver.formatImportedComment(comment, task);
 
       expect(result).toContain('[MR !42 @alice]');
-      expect(result).toContain('{remote:123}');
+      // INVARIANT: identity is structured metadata (Comment.external), never
+      // text in the content.
+      expect(result).not.toContain('{remote:');
       expect(result).toContain('Review comment');
     });
 
     test('includes file path and line for inline comments', () => {
       const driver = new GitLabDriver(mockConfig);
-      const comment = { id: '123', body: 'Fix this', author: 'bob', createdAt: '2024-06-01', path: 'src/main.ts', line: 42 };
+      const comment = { forge: 'gitlab' as const, kind: 'mr_note' as const, id: '123', body: 'Fix this', author: 'bob', createdAt: '2024-06-01', path: 'src/main.ts', line: 42 };
       const task = makeTask();
 
       const result = driver.formatImportedComment(comment, task);

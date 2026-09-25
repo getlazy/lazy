@@ -4,6 +4,7 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { seedFinal } from '../helpers/final';
 
 /**
  * Regression tests for task `fix-branch-prefix-and-auto-push-config`.
@@ -122,6 +123,9 @@ describe('[remote] <driver>_auto_push', () => {
     writeFileSync(join(worktreePath, 'accepted.txt'), 'content\n');
     expect(ctx.git('-C', worktreePath, 'add', 'accepted.txt').exitCode).toBe(0);
     expect(ctx.git('-C', worktreePath, 'commit', '-m', 'Add accepted file').exitCode).toBe(0);
+
+    // Fixture setup, not the subject (see test/helpers/final.ts).
+    await seedFinal(ctx, taskId);
 
     expectSuccess(await ctx.lazy(['accept', taskId]));
 

@@ -22,6 +22,14 @@ export const DEFAULT_WEB_PORT = 26024;
 export const DEFAULT_SERVER_BIND = '127.0.0.1';
 
 /**
+ * Default interface the credential proxy binds to — loopback, and managed mode
+ * pins it there. Like the daemon's TCP port it is ALSO bound on the container
+ * bridge gateway on native Linux (see src/daemon/bind-hosts.ts), because that
+ * is what `host.docker.internal` resolves to for a task container there.
+ */
+export const DEFAULT_PROXY_BIND = '127.0.0.1';
+
+/**
  * How many consecutive ports the daemon web server tries (starting at the
  * desired port) before it gives up and fails with an actionable error.
  *

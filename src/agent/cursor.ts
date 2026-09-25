@@ -9,13 +9,17 @@
  * - No system-prompt flag exists (verified against 2026.08.11 --help) — the
  *   system prompt is prepended to the user prompt
  * - Prompt is a positional argument (at end of command), not a flag value
- * - Plan/ask turns use the native read-only `--mode plan` (no tool-blocklist hack)
+ * - Plan/ask/review turns do NOT use `--mode plan`: that mode rejects MCP tool
+ *   calls (every Cursor review turn said "MCP calls were rejected" / "Shell is
+ *   blocked in this review mode"). Instead they pass `--exclude-tools` for the
+ *   write-capable ToolCall oneofs — same shape as Claude's `--disallowedTools`.
  * - Headless workspace trust has a first-class flag: `--trust`. The sibling
  *   `--approve-mcps` is deliberately NOT used — it would auto-approve a repo's
  *   own <cwd>/.cursor/mcp.json (arbitrary-exec-by-checkout); lazy's own MCP
  *   lives in ~/.cursor/mcp.json (home) and loads without approval. See
  *   buildExecArgs for the keyless probe results.
- * - Historic hanging bug in --print mode — uses non-zero default watchdog timeout
+ * - Headless turns run on `--output-format stream-json`, so the supervisor sees
+ *   live progress events (CursorActivityStream) instead of one blob at exit
  * - Session/chat files live under ~/.cursor/projects/<encoded-path>/ (layout
  *   mirrors Claude's ~/.claude/projects but the file format is unverified — see
  *   discoverSessionFiles)
@@ -24,9 +28,11 @@
 
 import type { AgentResponse } from '../types';
 import { CURSOR_ENDPOINT_ENV } from '../proxy/cursor-route';
+import type { AgentActivityEvent, AgentActivityStream } from './activity-stream';
 import type { Agent } from './interface';
 import { safeArgvPrompt } from './argv-safety';
-import { CURSOR_INSTALL_HINT } from './cursor-packaging';
+import { classifyNoModelRefusal, requireLaunchModel } from './launch-model';
+import { CURSOR_INSTALL_HINT, CursorPackaging } from './cursor-packaging';
 import {
   classifyCommonFailureSignals,
   failureHaystack,
@@ -34,19 +40,44 @@ import {
   type AgentFailureInput,
 } from './failure-taxonomy';
 
+const LAUNCH_BINARY = new CursorPackaging().binaryName();
+
+/**
+ * Write-capable Cursor tools excluded on ask / review / other read-only turns.
+ *
+ * These are the proto `ToolCall` oneof field names `cursor-agent --exclude-tools`
+ * accepts (verified against cursor-agent 2026.09.10's `exclude-tools.ts`, which
+ * builds the allow-list from `ToolCall.fields`). Parallel to Claude Code's
+ * `Bash Write Edit` denylist:
+ *   - shellToolCall / writeShellStdinToolCall ≈ Bash
+ *   - editToolCall / deleteToolCall ≈ Edit / Write
+ *
+ * Why not `--mode plan`: Cursor's native plan mode also refuses MCP tool calls
+ * (and Shell). Review turns need lazy_* (reads + lazy_raise); ask turns need
+ * lazy_* reads. Excluding only the write oneofs keeps MCP available — the same
+ * reason Claude Code uses `--disallowedTools` instead of `--permission-mode plan`.
+ *
+ * `--exclude-tools` is a hidden/internal CLI flag; lazy depends on it the same
+ * way it depends on other headless Cursor flags. If a future cursor-agent drops
+ * the flag, buildExecArgs will still pass it and the turn will fail loudly.
+ */
+const EXCLUDED_TOOLS_IN_PLAN_MODE =
+  'shellToolCall,editToolCall,deleteToolCall,writeShellStdinToolCall';
+
 /**
  * Field aliases accepted when parsing the final response object.
  *
- * The success-path JSON of `cursor-agent --output-format json` could not be
- * captured without credentials (auth is checked before any turn starts), so the
- * parser accepts the plausible spellings and fails with a diagnostic that lists
- * the keys it actually saw — making the real-key pairing fix a one-line alias
- * addition rather than an investigation.
+ * A live success-path turn still cannot be captured without credentials (auth
+ * is checked before any turn starts). The result object's shape is known from
+ * the shipped bundle's emitters (docs/cursor-stream-json.md) — `result` is what
+ * it writes — but the aliases stay: the parser accepts the plausible spellings
+ * and fails with a diagnostic listing the keys it actually saw, so a version
+ * that renames one is a one-line alias addition rather than an investigation.
  */
 /**
  * The model name meaning "let Cursor choose". Recorded on the task/turn as a
- * concrete, human-readable name, and translated back into "no --model flag" in
- * buildExecArgs — see the comment there for why omission is the right spelling.
+ * concrete, human-readable name, and passed through to `--model auto` — see
+ * buildExecArgs for why it must be passed rather than omitted.
  */
 export const CURSOR_AUTO_MODEL = 'auto';
 
@@ -91,33 +122,40 @@ function extractContentText(content: unknown): string | null {
 /**
  * Post-process Cursor result text to ensure proper formatting.
  *
- * Cursor CLI may concatenate logical blocks (thinking steps, summaries)
- * without proper line breaks. This function adds newlines before common
- * structural markers to improve readability.
+ * Cursor's final `result` string often concatenates every mid-turn assistant
+ * bubble with no separator — reviewers see walls like
+ * `...before anything else.MCP calls were rejected...directly.Shell is blocked...`.
+ * This is a best-effort un-flatten: it cannot perfectly reconstruct intentional
+ * structure, but it restores the sentence / heading / fence breaks that make
+ * review turns readable.
  *
- * Patterns that get a newline before them:
- * - Markdown headings (##, ###, etc.)
- * - Common thinking step markers ("Let me...", "Now I...", "I'll...")
- *
- * This is a best-effort heuristic — it cannot perfectly reconstruct
- * intentional structure from a flattened string, but it prevents the
- * worst case of a wall of unreadable text.
+ * Patterns that get a break:
+ * - Sentence end (`.!?`) immediately followed by a capital letter (no space)
+ * - Markdown headings (##, ###, …) stuck to previous text
+ * - Fenced code blocks (```) stuck to previous text
+ * - Common step starters ("Let me…", "I'll…", …) after sentence-ending punctuation
  */
 function formatCursorResultText(text: string): string {
   if (!text) return text;
 
+  // The dominant Cursor failure: "...else.MCP calls..." / "...directly.Shell..."
+  // — sentence terminator with no whitespace before the next sentence's capital.
+  // Run this FIRST so later step-marker rules see already-separated sentences.
+  let formatted = text.replace(/([.!?])([A-Z])/g, '$1\n\n$2');
+
+  // Code fences glued to the preceding sentence ("...JSON.```json").
+  formatted = formatted.replace(/([^\n`])(```)/g, '$1\n\n$2');
+
   // Add newlines before markdown headings that are stuck to previous text.
   // Match cases like "...text## Heading" or "...text### Heading"
-  let formatted = text.replace(/([^\n])(\n?)(#{2,6}\s+)/g, (match, before, existingNewline, heading) => {
+  formatted = formatted.replace(/([^\n])(\n?)(#{2,6}\s+)/g, (match, before, existingNewline, heading) => {
     // If there's already a newline, keep it. Otherwise add two.
     return existingNewline ? match : `${before}\n\n${heading}`;
   });
 
-  // Add newlines before common "step" phrases that are stuck to previous text.
-  // These patterns indicate a new logical step and should start on a new line.
-  // Only match when NOT at the start of the string and preceded by a sentence-ending character.
+  // Add newlines before common "step" phrases that are stuck to previous text
+  // with only spaces (the no-space case is already handled above).
   const stepPatterns = [
-    // Common step starters (only after sentence-ending punctuation)
     /([.!?])(\s*)(Let me\s)/gi,
     /([.!?])(\s*)(Now I\s)/gi,
     /([.!?])(\s*)(I'll\s)/gi,
@@ -228,6 +266,120 @@ function capHealsOnItsOwn(text: string): boolean {
   );
 }
 
+/**
+ * Parser for `cursor-agent --print --output-format stream-json` NDJSON.
+ *
+ * PROVENANCE — every shape below was read off the stdout emitters in the
+ * shipped cursor-agent bundle (2026.09.02-c22c1a3,
+ * `~/.local/share/cursor-agent/versions/<v>/1931.index.js`), not inferred from
+ * the single-blob `json` format and not invented. In that bundle the
+ * stream-json branch is `outputFormat === 'stream-json' || streamPartialOutput`
+ * and it writes exactly these objects, one JSON per line:
+ *
+ *   {"type":"system","subtype":"init","session_id":…,"model":…,"cwd":…,
+ *    "apiKeySource":…,"permissionMode":"default"}       ← first line
+ *   {"type":"user","message":{…},"session_id":…}
+ *   {"type":"tool_call","subtype":"started","call_id":…,"tool_call":…,
+ *    "model_call_id":…,"session_id":…,"timestamp_ms":…}
+ *   {"type":"tool_call","subtype":"completed","call_id":…,"tool_call":…,…}
+ *   {"type":"thinking","subtype":"delta"|"completed",…}
+ *   {"type":"assistant","message":{…},…}                ← only with --stream-partial-output
+ *   {"type":"interaction_query","subtype":"request"|"response",…}
+ *   {"type":"system","subtype":"background_shell_timeout"|"task_notification",…}
+ *   {"type":"result","subtype":"success","result":…,"session_id":…,"usage":{…},…}
+ *
+ * Two consequences worth stating, because they are what make the guard correct:
+ *
+ *  - There is NO keep-alive event. Cursor writes only on real state changes, so
+ *    nothing here maps to `heartbeat` and every event is genuine forward
+ *    progress. (A long tool call is still silent between `started` and
+ *    `completed` — same situation as Claude Code, same guard semantics.)
+ *  - The final `result` object is shape-identical to what `--output-format json`
+ *    emitted, so `CursorAgent.parseResponse` needs no change: the watchdog hands
+ *    it the isolated result line.
+ */
+export class CursorActivityStream implements AgentActivityStream {
+  private sessionId: string | undefined;
+
+  parseLine(line: string): AgentActivityEvent | null {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed[0] !== '{') return null;
+
+    let msg: Record<string, unknown>;
+    try {
+      msg = JSON.parse(trimmed) as Record<string, unknown>;
+    } catch {
+      // Partial line at a kill boundary, or non-JSON chatter — not an error,
+      // and deliberately not progress (we cannot tell what it was).
+      return null;
+    }
+
+    const type = typeof msg.type === 'string' ? msg.type : '';
+    const subtype = typeof msg.subtype === 'string' ? msg.subtype : '';
+    const sessionId = pickString(msg, SESSION_KEYS);
+    if (sessionId) this.sessionId = sessionId;
+
+    if (type === 'system' && subtype === 'init') {
+      // mcpServers/toolNames stay undefined: Cursor's init reports neither, and
+      // `undefined` is what verifyInitMcpTools reads as "said nothing I can
+      // judge". Manufacturing empty arrays here would read as positive evidence
+      // of zero tools and abort every Cursor turn at session start.
+      //
+      // `model` is the one init field we do keep: it is the concrete id
+      // cursor-agent resolved from `--model` (an alias like `opus` becomes
+      // `claude-opus-4-5-…`). The result object does not repeat it, so this
+      // is the only place a Cursor turn learns what actually ran.
+      const model = typeof msg.model === 'string' && msg.model.trim()
+        ? msg.model.trim()
+        : undefined;
+      return { kind: 'session_start', sessionId: this.sessionId, ...(model ? { model } : {}) };
+    }
+
+    if (type === 'result') {
+      return { kind: 'result', sessionId: this.sessionId, raw: trimmed };
+    }
+
+    if (type === 'tool_call' && subtype === 'started') {
+      return {
+        kind: 'tool_start',
+        toolUseId: pickString(msg, ['call_id']),
+        toolName: cursorToolName(msg.tool_call),
+      };
+    }
+
+    if (type === 'tool_call' && subtype === 'completed') {
+      return {
+        kind: 'tool_end',
+        toolUseId: pickString(msg, ['call_id']),
+        toolName: cursorToolName(msg.tool_call),
+      };
+    }
+
+    // Everything else — the echoed user message, thinking deltas, assistant
+    // text, interaction queries, other system subtypes — is evidence the turn
+    // is advancing. Unknown future event types count as progress for the same
+    // reason ClaudeCodeActivityStream counts them: mistaking real progress for
+    // silence is the expensive error, and it is the exact bug this stream was
+    // added to fix.
+    return { kind: 'progress' };
+  }
+}
+
+/**
+ * Best-effort tool name from a `tool_call` payload. Cursor serializes it as a
+ * protobuf-style oneof — `{ tool: { case: "readToolCall", value: {…} } }` — so
+ * the case name minus its suffix is the readable label. Undefined when the
+ * shape is anything else; the name is only ever used for logging.
+ */
+function cursorToolName(toolCall: unknown): string | undefined {
+  if (!toolCall || typeof toolCall !== 'object') return undefined;
+  const tool = (toolCall as Record<string, unknown>).tool;
+  if (!tool || typeof tool !== 'object') return undefined;
+  const kase = (tool as Record<string, unknown>).case;
+  if (typeof kase !== 'string' || !kase) return undefined;
+  return kase.endsWith('ToolCall') ? kase.slice(0, -'ToolCall'.length) : kase;
+}
+
 export class CursorAgent implements Agent {
   readonly id = 'cursor';
 
@@ -289,13 +441,30 @@ export class CursorAgent implements Agent {
     // is checked before MCP loading, and `mcp list` never spawns), so omitting
     // the flag is the safe default; see the pairing checklist for the with-key
     // confirmation step.
-    const args = ['cursor-agent', '--print', '--output-format', 'json', '--trust'];
+    // --output-format stream-json (NOT the single-blob `json`): cursor-agent in
+    // `json` mode writes nothing at all until the turn ends, so the supervisor's
+    // no-progress guard saw pure silence and killed every turn that ran longer
+    // than the window — the agent was working the whole time (2026-09-08, the
+    // polish-ux-v022 loop: three consecutive 30-minute kills on one task, work
+    // landing only because the retry ladder resumed the dirty worktree).
+    // stream-json emits the same final `{"type":"result",…}` object plus a live
+    // NDJSON event stream (see CursorActivityStream for the verified shapes),
+    // so silence now means silence. parseResponse handles both.
+    const args = ['cursor-agent', '--print', '--output-format', 'stream-json', '--trust'];
 
     if (opts.permissionMode === 'plan') {
-      // Native read-only mode: analyze/propose, no edits. Unlike Claude Code
-      // there is no interactive plan-exit prompt in --print mode, so the real
-      // mode flag is safe to use headless.
-      args.push('--mode', 'plan');
+      // Read-only via tool denylist, NOT `--mode plan`. Cursor's plan mode
+      // blocks Shell AND rejects MCP calls — which is exactly why every Cursor
+      // `lazy review` turn lost lazy_show / lazy_raise and fell back to a
+      // mangled file-only pass. Claude Code already made this trade-off
+      // (`--disallowedTools` instead of `--permission-mode plan`); Cursor now
+      // mirrors it with `--exclude-tools` (proto ToolCall oneof names).
+      args.push('--exclude-tools', EXCLUDED_TOOLS_IN_PLAN_MODE);
+      if (opts.dangerouslySkipPermissions) {
+        // Same as a work turn: auto-run the tools that remain (reads + MCP).
+        // Without --force, Cursor may still prompt and stall headless.
+        args.push('--force', '--sandbox', 'disabled');
+      }
     } else if (opts.dangerouslySkipPermissions) {
       // Run-everything, and disable Cursor's own sandbox: lazy only sets this
       // when the process is already externally isolated (container) or the
@@ -307,18 +476,34 @@ export class CursorAgent implements Agent {
       args.push('--resume', opts.sessionId);
     }
 
-    if (opts.modelId && opts.modelId.trim().toLowerCase() !== CURSOR_AUTO_MODEL) {
-      // Plain ids and Cursor's bracket-parameter syntax
-      // (e.g. 'claude-opus-4-8[context=1m,effort=high]') both pass through.
-      args.push('--model', opts.modelId);
-    }
-    // `auto` is spelled by OMITTING --model: the flag is optional and
-    // cursor-agent then applies its own model selection, which is precisely
-    // what "auto" means. Passing the literal string would be a guess — the CLI
-    // does no client-side model validation (verified against cursor-agent
-    // 2026.08.11: an unknown --model value is not rejected locally, auth is
-    // checked first), so a name the server does not know surfaces only as a
-    // failed turn. Omitting is verifiable and cannot be wrong.
+    // A launch with no model at all is refused (requireLaunchModel,
+    // src/agent/launch-model.ts) — omission is exactly the silent fallback
+    // described below.
+    requireLaunchModel('cursor', opts.modelId);
+    // ALWAYS pass the resolved model, `auto` included. Plain ids and Cursor's
+    // bracket-parameter syntax (e.g. 'claude-opus-4-8[context=1m,effort=high]')
+    // both pass through.
+    //
+    // `auto` used to be spelled by OMITTING --model, on the theory that the
+    // flag is optional and cursor-agent then "picks for itself". That is not
+    // what omission means. cursor-agent resolves an absent --model against
+    // its OWN persisted default in `~/.cursor/cli-config.json` (`model` /
+    // `selectedModel`, guarded by `hasChangedDefaultModel`), which is the
+    // model the human last selected in Cursor — verified in a real task
+    // sandbox, where that file read `"model": {"modelId": "claude-opus-4-5"}`
+    // and every turn ran Opus while lazy recorded `auto`. Changing the task's
+    // model to `auto` then looked like a no-op: lazy dropped the flag and
+    // Cursor went on using the model it had been set to (fix-cursor-model-turn-setting).
+    //
+    // `auto` IS a model in Cursor's catalog (id `default`, displayed `auto`),
+    // and cursor-agent's `--model` resolution matches on model id, display
+    // id, display name and aliases, all lowercased — so the literal string
+    // resolves. If an account's catalog ever lacks it, cursor-agent exits
+    // with "Cannot use this model: auto. Available models: …", which
+    // classifyFailure already reports as fatal_config. A loud, named failure
+    // is the right outcome; silently running a model nobody chose is not.
+    // Verbatim (not the trimmed copy): the recorded id is what Cursor receives.
+    args.push('--model', opts.modelId as string);
 
     // `effort` has no Cursor flag — express it via the model's bracket syntax
     // in the model id instead; silently dropping it here is deliberate.
@@ -350,10 +535,13 @@ export class CursorAgent implements Agent {
   /**
    * Parse Cursor output into an AgentResponse.
    *
-   * Accepts a single JSON object (`--output-format json`) and, defensively, a
-   * newline-delimited stream from which the last `{"type":"result",…}` line is
-   * taken (in case a future switch to stream-json lands before this parser is
-   * revisited). Field names are matched against a small alias set because the
+   * Turns run on `--output-format stream-json`, whose final `{"type":"result",…}`
+   * object is shape-identical to the single blob `--output-format json` used to
+   * emit — so both are accepted: a lone JSON object, or a newline-delimited
+   * stream from which the last result-typed line is taken. (The supervisor
+   * normally hands over just the isolated result line the watchdog kept; the
+   * stream scan covers the paths that pass raw stdout.) Field names are matched
+   * against a small alias set because the
    * success-path shape could not be verified without credentials — the error
    * message lists the keys actually seen so a mismatch is trivial to fix.
    *
@@ -368,6 +556,14 @@ export class CursorAgent implements Agent {
     }
 
     let obj = tryParseObject(trimmed);
+    // The concrete model cursor-agent reported on its init line. Only a raw
+    // stream carries one: the result object never repeats it, and the paths
+    // that hand over just the isolated result line (the work turn) attach the
+    // init model from the activity stream themselves. The supervisor's
+    // follow-up invocations (self-review, wrap-up, walkthrough…) pass raw
+    // stdout, and without this every one of their turns recorded no model_id —
+    // looking like it ran the requested alias.
+    let initModel: string | undefined;
     if (!obj) {
       // Stream fallback: scan backwards for a result-typed line.
       const lines = trimmed.split('\n');
@@ -375,6 +571,16 @@ export class CursorAgent implements Agent {
         const candidate = tryParseObject(lines[i]!.trim());
         if (candidate && (candidate.type === 'result' || pickString(candidate, RESULT_KEYS))) {
           obj = candidate;
+          break;
+        }
+      }
+      // Read through the activity stream's parser so the init shape is
+      // interpreted in exactly one place.
+      const stream = new CursorActivityStream();
+      for (const line of lines) {
+        const event = stream.parseLine(line);
+        if (event?.kind === 'session_start') {
+          initModel = event.model;
           break;
         }
       }
@@ -423,7 +629,8 @@ export class CursorAgent implements Agent {
     // that may have been concatenated without proper line breaks.
     const formattedResult = formatCursorResultText(result);
 
-    return { ...(obj as unknown as AgentResponse), result: formattedResult, session_id: sessionId };
+    const response: AgentResponse = { ...(obj as unknown as AgentResponse), result: formattedResult, session_id: sessionId };
+    return !response.model_id && initModel ? { ...response, model_id: initModel } : response;
   }
 
   isPromptTooLongError(errorMessage: string): boolean {
@@ -457,6 +664,10 @@ export class CursorAgent implements Agent {
    */
   classifyFailure(input: AgentFailureInput): AgentFailure {
     const text = failureHaystack(input);
+
+    // lazy's own refusal to launch without a model (src/agent/launch-model.ts).
+    const noModel = classifyNoModelRefusal(input);
+    if (noModel) return noModel;
 
     // Binary not installed (the spawn wrapper's ENOENT diagnosis). Fatal —
     // retrying can never install it — and the reason carries the install
@@ -516,7 +727,7 @@ export class CursorAgent implements Agent {
       // `transient` merely costs the retry ladder before a human sees it.
       if (capHealsOnItsOwn(text)) {
         return (
-          classifyCommonFailureSignals(input) ?? {
+          classifyCommonFailureSignals(input, [LAUNCH_BINARY]) ?? {
             class: 'transient_overload',
             reason: 'Cursor capped this window — its own message says the cap clears shortly',
           }
@@ -525,12 +736,20 @@ export class CursorAgent implements Agent {
       return { class: 'fatal_auth', reason: actionRequiredReason(input) };
     }
 
-    if (text.includes('unknown option') || text.includes('unknown model')) {
+    // "cannot use this model:" is cursor-agent's own wording when --model names
+    // something outside the account's catalog (it prints the available ids
+    // alongside). It is fatal for the same reason an unknown flag is: nothing
+    // heals inside the turn, a human has to pick a different model.
+    if (
+      text.includes('unknown option') ||
+      text.includes('unknown model') ||
+      text.includes('cannot use this model')
+    ) {
       return { class: 'fatal_config', reason: 'Cursor rejected the invocation (model or flag)' };
     }
 
     return (
-      classifyCommonFailureSignals(input) ?? {
+      classifyCommonFailureSignals(input, [LAUNCH_BINARY]) ?? {
         class: 'unknown',
         reason: 'unrecognized Cursor failure',
       }
@@ -538,10 +757,19 @@ export class CursorAgent implements Agent {
   }
 
   defaultWatchdogTimeoutMs(): number {
-    // Cursor CLI has a historic hanging bug in --print mode (unconfirmed
-    // whether it still exists — kept as belt-and-suspenders).
-    // Default to 5 minutes of no output before killing the process.
-    return 5 * 60 * 1000;
+    // 0 = "no agent-specific default"; the configured
+    // `[agent] watchdog_output_timeout_ms` applies, same as Claude Code, Codex
+    // and pi. Cursor now emits an activity stream (see CursorActivityStream),
+    // so the supervisor measures silence between *forward progress* events
+    // rather than between bytes.
+    //
+    // This used to be 5 minutes, as belt-and-braces against a historic --print
+    // hang. On the single-blob `json` format that number was measuring the
+    // wrong thing entirely — a working turn emits nothing until it ends, so the
+    // window was really "how long may a Cursor turn take", and every longer
+    // turn was killed and retried. A hang still trips the ceiling; a long turn
+    // no longer does.
+    return 0;
   }
 
   defaultModel(): string {
@@ -553,30 +781,65 @@ export class CursorAgent implements Agent {
     return CURSOR_AUTO_MODEL;
   }
 
-  activityStream(): null {
-    // No incremental event stream: `cursor-agent --print --output-format json`
-    // emits a single blob at exit. The watchdog therefore keeps its byte-level
-    // behavior for Cursor — any output is liveness, and the 5-minute default
-    // above is what catches the --print hang. `--output-format stream-json`
-    // exists but its event shapes are unverified without credentials; do not
-    // "upgrade" this without capturing the real stream first — returning a
-    // stream the agent doesn't produce would make every Cursor turn look silent.
-    return null;
+  activityStream(): AgentActivityStream {
+    // Verified, not assumed: the event shapes come from the stdout emitters in
+    // the shipped cursor-agent bundle (2026.09.02-c22c1a3) — see the
+    // CursorActivityStream docblock for the provenance and the exact objects.
+    // buildExecArgs passes `--output-format stream-json`, so this stream is the
+    // format the process really produces; the two must change together.
+    return new CursorActivityStream();
   }
 
   supportsPairing(): boolean {
-    // SECURITY + utility, and it fails both tests.
+    // Was false, and the refusal named its own expiry: "revisit when pairing
+    // itself moves into the container, where the session is already on the
+    // right side of the boundary and nothing needs importing." That is what
+    // pair-in-container did, so this is that revisit, not a flip-to-fix.
     //
-    // A Cursor task that ran in a container wrote its chat under the worktree
-    // sandbox, which `cursor-agent` on the host cannot read. lazy will not copy
-    // it over: that history is agent-written, and importing it makes it input to
-    // a host session running as the human (it used to, and --autonomous then
-    // resumed it with approvals off). So the human would get an EMPTY session
-    // with no memory of the work — the danger without the benefit.
+    // Both conditions in Agent.supportsPairing() now hold for Cursor:
+    //  1. Nothing is imported. `lazy pair <task>` execs cursor-agent INSIDE the
+    //     task's container, on the same `<sandbox>/.cursor` the supervised
+    //     turns wrote. Agent-written chat is never carried onto the host, and
+    //     the human's own ~/.cursor is never read, written or consulted.
+    //  2. It is useful. The chat id is on the task's session record (see
+    //     SESSION_KEYS / parseResponse), so the session resumes with the work
+    //     in it rather than starting empty — the exact gap that made pairing
+    //     pointless before.
     //
-    // Revisit when pairing itself moves into the container, where the session is
-    // already on the right side of the boundary and nothing needs importing.
-    return false;
+    // KNOWN GAP, deliberately not papered over: discoverSessionFiles() is still
+    // [], so lazy cannot detect the id of a chat STARTED during pairing and
+    // cannot read the transcript afterwards. A Cursor pairing session therefore
+    // gets no AI summary turn, and `lazy pair` says so at exit rather than
+    // silently recording nothing.
+    return true;
+  }
+
+  buildInteractiveArgs(opts: {
+    sessionId?: string | null;
+    modelId?: string | null;
+    dangerouslySkipPermissions: boolean;
+  }): string[] {
+    // Interactive: no --print/--output-format (those make it headless and
+    // machine-parsed), no prompt positional. --trust for the same reason the
+    // headless path passes it, and --approve-mcps omitted for the same security
+    // reason — see buildExecArgs.
+    const args = ['cursor-agent', '--trust'];
+    if (opts.dangerouslySkipPermissions) {
+      // Same trust decision as a supervised turn: this runs in the task's
+      // container, so Cursor's own sandbox is redundant and breaks git/network.
+      args.push('--force', '--sandbox', 'disabled');
+    }
+    if (opts.sessionId) args.push('--resume', opts.sessionId);
+    // Always, `auto` included — the same reason buildExecArgs passes it: an
+    // omitted --model reads the human's persisted selection in
+    // ~/.cursor/cli-config.json, so a pair session on an `auto` task ran a
+    // model nobody chose for it.
+    args.push('--model', requireLaunchModel('cursor', opts.modelId));
+    // Resolved INSIDE the container, where this argv is built — the endpoint
+    // that matters is the one that process can reach.
+    const agentEndpoint = process.env[CURSOR_ENDPOINT_ENV];
+    if (agentEndpoint) args.push('--agent-endpoint', agentEndpoint);
+    return args;
   }
 
   discoverSessionFiles(_opts: {

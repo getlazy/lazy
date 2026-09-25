@@ -2,7 +2,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtemp, mkdir, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { loadConfig, resetConfigOverrideWarning } from '../../src/config/loader';
+import { loadConfig } from '../../src/config/loader';
 import {
   DEFAULT_BRANCH_PREFIX,
   branchPrefixError,
@@ -19,14 +19,15 @@ import {
  * rejected.
  *
  * INVARIANT: the prefix is installed PROCESS-WIDE by loadConfig, and always from
- * the PROJECT ROOT's lazy.toml. Most settings come from the nearest lazy.toml
- * walking up from `cwd`, and the daemon deliberately loads a task's config with
- * `cwd` set to its worktree. lazy.toml is tracked in git, so every task worktree
- * carries a copy on an agent-writable branch: taking the prefix from the
- * resolved file would let one task's committed config re-point branch naming for
- * every other task in the same long-lived daemon, and re-point
+ * the PROJECT ROOT's lazy.toml. lazy.toml is tracked in git, so every task
+ * worktree carries a copy on an agent-writable branch: taking the prefix from a
+ * worktree's copy would let one task's committed config re-point branch naming
+ * for every other task in the same long-lived daemon, and re-point
  * `looksLikeTaskBranch`, which decides whether accept merges locally or through
- * the forge.
+ * the forge. Here that falls out of the loader having no starting-directory
+ * parameter at all — no key is read from a worktree config (see "A task
+ * worktree's lazy.toml has no authority" in src/config/loader.ts) — rather than
+ * from a carve-out for this one key.
  *
  * INVARIANT: an unusable prefix is rejected at the config boundary, not by
  * `git branch` partway through starting a task.
@@ -40,14 +41,12 @@ describe('[git] default_branch_prefix', () => {
     worktree = join(root, '.lazy', 'worktrees', 'wt');
     await mkdir(worktree, { recursive: true });
     resetBranchPrefix();
-    resetConfigOverrideWarning();
   });
 
   afterEach(async () => {
     // The prefix is process-global: leaving a fixture's value installed would
     // rename task branches in every suite that runs after this one.
     resetBranchPrefix();
-    resetConfigOverrideWarning();
     await rm(root, { recursive: true, force: true });
   });
 
@@ -55,12 +54,10 @@ describe('[git] default_branch_prefix', () => {
   const writeWorktree = (body: string) => writeFile(join(worktree, 'lazy.toml'), body, 'utf-8');
 
   /**
-   * Load the fixture project. `cwd` is passed explicitly because findConfigDir
-   * defaults to `process.cwd()` — under `bun test` that is lazy's OWN checkout,
-   * which sits outside the fixture root, so the walk would resolve lazy's own
-   * lazy.toml instead of the one written here.
+   * Load the fixture project. No cwd to pass: loadConfig resolves the project
+   * root's lazy.toml and nothing else, whatever the caller's cwd is.
    */
-  const loadFromRoot = () => loadConfig(root, { cwd: root });
+  const loadFromRoot = () => loadConfig(root);
 
   describe('installation', () => {
     test('a configured prefix reaches the process-global branch namespace', async () => {
@@ -98,7 +95,7 @@ describe('[git] default_branch_prefix', () => {
       await writeRoot('[git]\ndefault_branch_prefix = "wip"\n');
       await writeWorktree('[git]\ndefault_branch_prefix = "evil"\n');
 
-      const config = await loadConfig(root, { cwd: worktree });
+      const config = await loadConfig(root);
 
       expect(getBranchPrefix()).toBe('wip');
       expect(config.git.default_branch_prefix).toBe('wip');
@@ -113,28 +110,32 @@ describe('[git] default_branch_prefix', () => {
       await writeRoot('[git]\ndefault_branch_prefix = "wip"\n');
       await writeWorktree('[git]\ndefault_branch_prefix = "release"\n');
 
-      await loadConfig(root, { cwd: worktree });
+      await loadConfig(root);
 
       expect(looksLikeTaskBranch('release/2.0')).toBe(false);
     });
 
-    test('other settings still come from the worktree config', async () => {
+    // The prefix needs no carve-out here: NO setting is read from a worktree
+    // config, so a worktree copy cannot reach any of them. See
+    // test/e2e/worktree-config-authority.test.ts and
+    // test/unit/config-root-anchored.test.ts for that rule in general.
+    test('no setting comes from the worktree config, prefix included', async () => {
       await writeRoot('[git]\ndefault_branch_prefix = "wip"\n[session]\nverbose = false\n');
       await writeWorktree('[git]\ndefault_branch_prefix = "evil"\n[session]\nverbose = true\n');
 
-      const config = await loadConfig(root, { cwd: worktree });
+      const config = await loadConfig(root);
 
-      expect(config.session.verbose).toBe(true);
+      expect(config.session.verbose).toBe(false);
       expect(config.git.default_branch_prefix).toBe('wip');
     });
 
-    test('a worktree config is used when the project has no root lazy.toml', async () => {
+    test('a project with no root lazy.toml gets the default, not a worktree copy', async () => {
       await writeWorktree('[git]\ndefault_branch_prefix = "wip"\n');
 
-      const config = await loadConfig(root, { cwd: worktree });
+      const config = await loadConfig(root);
 
-      expect(config.git.default_branch_prefix).toBe('wip');
-      expect(getBranchPrefix()).toBe('wip');
+      expect(config.git.default_branch_prefix).toBe(DEFAULT_BRANCH_PREFIX);
+      expect(getBranchPrefix()).toBe(DEFAULT_BRANCH_PREFIX);
     });
   });
 
@@ -201,7 +202,7 @@ describe('[git] default_branch_prefix', () => {
       await writeRoot('[git]\ndefault_branch_prefix = "wip"\n');
       await writeWorktree('[git]\ndefault_branch_prefix = "/nonsense"\n');
 
-      const config = await loadConfig(root, { cwd: worktree });
+      const config = await loadConfig(root);
 
       expect(config.git.default_branch_prefix).toBe('wip');
     });

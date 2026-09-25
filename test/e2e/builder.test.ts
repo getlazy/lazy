@@ -67,7 +67,10 @@ function useHostProcessRunner(root: string): void {
 function launchableBuilderEnv(root: string): Record<string, string> {
   useHostProcessRunner(root);
   const binDir = installFakeClaude(root, join(root, 'claude-args.log'));
-  return { PATH: `${binDir}:${process.env.PATH}` };
+  return {
+    LAZY_ALLOW_HOST_RUNNER: '1',
+    PATH: `${binDir}:${process.env.PATH}`,
+  };
 }
 
 /**
@@ -101,6 +104,16 @@ function startFakeOllama(): { endpoint: string; stop: () => void } {
  * The fake also satisfies the host-process runner's `claude --version`
  * availability check (it exits 0 for any argv).
  */
+/** Enable the init template's existing [ollama] table — never append a second one. */
+function enableOllamaInConfig(config: string, model: string, endpoint: string): string {
+  const after = config.replace(
+    /^\[ollama\][\s\S]*?(?=\n\n# \[proxy\])/m,
+    `[ollama]\nenabled = true\nmodel = "${model}"\nendpoint = "${endpoint}"`,
+  );
+  if (after === config) throw new Error('enableOllamaInConfig: [ollama] section not updated');
+  return after;
+}
+
 function installFakeClaude(root: string, logPath: string): string {
   const binDir = join(root, 'fakebin');
   mkdirSync(binDir, { recursive: true });
@@ -122,7 +135,7 @@ describe('lazy builder', () => {
   let markerDir: string;
 
   beforeEach(async () => {
-    ctx = await setupTestLazy();
+    ctx = await setupTestLazy({ allowHostRunner: true });
     // The marker now lives under ~/.lazy/<project>/ where project = basename of root
     // (no git remote in test repos, so getProjectName falls back to basename)
     markerDir = join(homedir(), '.lazy', basename(ctx.root));
@@ -427,6 +440,51 @@ describe('lazy builder', () => {
     expectOutput(result, "BUILDER's model");
   });
 
+  // INVARIANT: unread system messages are injected into the builder's launch
+  // prompt as compact one-liners (title + attribution); bodies stay on demand
+  // via lazy_messages. Read/dismissed messages are NOT injected.
+  test('unread system messages reach the builder system prompt', async () => {
+    const { writeSystemMessagesFile } = await import('../helpers/storage');
+    const { randomUUID } = await import('crypto');
+    writeSystemMessagesFile(ctx.root, [
+      {
+        id: randomUUID(),
+        created_at: Date.now(),
+        source: 'daemon',
+        title: 'Daemon version changed: 0.19.0 → 0.20.0',
+        body: 'INJECTION-BODY-MUST-NOT-APPEAR',
+        kind: 'notice',
+      },
+      {
+        id: randomUUID(),
+        created_at: Date.now(),
+        source: 'weekly-report',
+        title: 'Already-read report',
+        body: 'b',
+        kind: 'report',
+        read_at: Date.now(),
+      },
+    ]);
+
+    const logPath = join(ctx.root, 'claude-args.log');
+    const result = await ctx.lazy(['builder', '--yes'], {
+      env: launchableBuilderEnv(ctx.root),
+    });
+    expectSuccess(result);
+
+    // The fake claude logs one argv entry per LINE, so the multi-line prompt
+    // spans many log lines — assert on the whole log, after the flag.
+    const args = readClaudeArgs(logPath);
+    expect(args).toContain('--append-system-prompt');
+    const prompt = args.join('\n');
+    expect(prompt).toContain('System messages (unread)');
+    expect(prompt).toContain('Daemon version changed: 0.19.0 → 0.20.0');
+    expect(prompt).toContain('from daemon');
+    // Index only — the body is read on demand, and read messages stay out.
+    expect(prompt).not.toContain('INJECTION-BODY-MUST-NOT-APPEAR');
+    expect(prompt).not.toContain('Already-read report');
+  });
+
   // INVARIANT: `lazy builder --model <id>` passes `--model <id>` straight
   // through to the Claude Code invocation. This is the builder's own model
   // (distinct from the per-task --model used when starting tasks), and there is
@@ -459,9 +517,11 @@ describe('lazy builder', () => {
     try {
       const lazyTomlPath = join(ctx.root, 'lazy.toml');
       let cfg = readFileSync(lazyTomlPath, 'utf-8');
-      cfg = setRunnerType(cfg, 'dangerously-host-process-without-any-isolation');
-      // Enable Ollama with its own model — this would normally inject --model.
-      cfg += `\n[ollama]\nenabled = true\nmodel = "ollama-local-model"\nendpoint = "${ollama.endpoint}"\n`;
+      cfg = enableOllamaInConfig(
+        setRunnerType(cfg, 'dangerously-host-process-without-any-isolation'),
+        'ollama-local-model',
+        ollama.endpoint,
+      );
       writeFileSync(lazyTomlPath, cfg);
 
       const logPath = join(ctx.root, 'claude-args.log');
@@ -490,8 +550,11 @@ describe('lazy builder', () => {
     try {
       const lazyTomlPath = join(ctx.root, 'lazy.toml');
       let cfg = readFileSync(lazyTomlPath, 'utf-8');
-      cfg = setRunnerType(cfg, 'dangerously-host-process-without-any-isolation');
-      cfg += `\n[ollama]\nenabled = true\nmodel = "ollama-local-model"\nendpoint = "${ollama.endpoint}"\n`;
+      cfg = enableOllamaInConfig(
+        setRunnerType(cfg, 'dangerously-host-process-without-any-isolation'),
+        'ollama-local-model',
+        ollama.endpoint,
+      );
       writeFileSync(lazyTomlPath, cfg);
 
       const logPath = join(ctx.root, 'claude-args.log');
@@ -582,7 +645,7 @@ describe.skipIf(sandboxSuiteSkipped('lazy builder sandbox posture'))(
     let ctx: TestContext;
 
     beforeEach(async () => {
-      ctx = await setupTestLazy();
+      ctx = await setupTestLazy({ allowHostRunner: true });
     });
 
     afterEach(async () => {
@@ -601,8 +664,9 @@ describe.skipIf(sandboxSuiteSkipped('lazy builder sandbox posture'))(
         setRunnerType(existingConfig, 'dangerously-host-process-without-any-isolation', 'sandbox'),
       );
 
+      const binDir = installFakeClaude(ctx.root, join(ctx.root, 'claude-args.log'));
       const result = await ctx.lazy(['builder', '--autonomous', '--yes'], {
-        env: { PATH: '/usr/local/bin:/usr/bin:/bin' },
+        env: { PATH: `${binDir}:/usr/local/bin:/usr/bin:/bin` },
       });
 
       expectOutput(result, '⚠ Autonomous mode (the default): the builder will run without permission prompts.');

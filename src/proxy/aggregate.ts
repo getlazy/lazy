@@ -102,6 +102,13 @@ export interface AggregateOptions {
   role?: string;
   /** Only count records whose taskId starts with this (short-id friendly). */
   taskId?: string;
+  /**
+   * Only count records whose taskId starts with ANY of these — the same
+   * prefix rule as `taskId`, widened to a set so a caller can ask for a whole
+   * subtree (a task plus every descendant) in one pass. Applied in addition to
+   * `taskId` when both are given.
+   */
+  taskIds?: string[];
 }
 
 /**
@@ -123,6 +130,10 @@ export function aggregateUsage(
     if (options.sinceMs !== undefined && record.ts < options.sinceMs) continue;
     if (options.role !== undefined && (record.role ?? '') !== options.role) continue;
     if (options.taskId !== undefined && !(record.taskId ?? '').startsWith(options.taskId)) continue;
+    if (options.taskIds !== undefined) {
+      const id = record.taskId ?? '';
+      if (!id || !options.taskIds.some((prefix) => id.startsWith(prefix))) continue;
+    }
 
     add(totals, record);
     bucket(byRole, record.role || UNATTRIBUTED, record);

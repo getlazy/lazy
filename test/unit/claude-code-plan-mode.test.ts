@@ -15,6 +15,7 @@ describe('ClaudeCodeAgent plan-mode lockdown', () => {
 
   test('plan mode pushes --disallowedTools and NOT --permission-mode plan', () => {
     const args = agent.buildExecArgs({
+      modelId: 'test-model',
       prompt: 'What does X do?',
       dangerouslySkipPermissions: true,
       permissionMode: 'plan',
@@ -29,6 +30,7 @@ describe('ClaudeCodeAgent plan-mode lockdown', () => {
 
   test('non-plan mode still pushes --dangerously-skip-permissions', () => {
     const args = agent.buildExecArgs({
+      modelId: 'test-model',
       prompt: 'Do the thing',
       dangerouslySkipPermissions: true,
     });
@@ -40,6 +42,7 @@ describe('ClaudeCodeAgent plan-mode lockdown', () => {
 
   test('plan mode keeps --dangerously-skip-permissions when caller asked for it', () => {
     const args = agent.buildExecArgs({
+      modelId: 'test-model',
       prompt: 'What does X do?',
       dangerouslySkipPermissions: true,
       permissionMode: 'plan',

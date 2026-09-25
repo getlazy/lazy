@@ -24,6 +24,7 @@ import { needsLiveProxyUrl, ProxyUnavailableError } from '../../src/daemon/auth-
 import { setDaemonContext, setDaemonProxyPort, clearDaemonContext } from '../../src/daemon/context';
 import type { Runner } from '../../src/runner';
 import type { RoleTarget, ResolvedConfig } from '../../src/config/types';
+import { ANTHROPIC_DEFAULT_TARGET } from '../../src/config/default-target';
 
 /**
  * Minimal Runner stand-in: role targets are the only surface under test, and a
@@ -58,7 +59,7 @@ describe('builder proxy target refresh across an upgrade', () => {
     await writeFile(configPath, toml);
     process.env.LAZY_CONFIG = configPath;
     const { loadConfig } = await import('../../src/config/loader');
-    return loadConfig(projectRoot, { cwd: projectRoot });
+    return loadConfig(projectRoot);
   }
 
   /**
@@ -71,7 +72,7 @@ describe('builder proxy target refresh across an upgrade', () => {
    */
   test('an already-stamped proxyUrl is never re-resolved on its own', async () => {
     const config = await configWith('');
-    const fresh: RoleTarget = { backend: 'anthropic', model: '', endpoint: '' };
+    const fresh: RoleTarget = ANTHROPIC_DEFAULT_TARGET;
     const stamped: RoleTarget = { ...fresh, proxyUrl: 'http://127.0.0.1:40001' };
 
     expect(needsLiveProxyUrl(fresh)).toBe(true);
@@ -81,6 +82,7 @@ describe('builder proxy target refresh across an upgrade', () => {
   // The headline behavior: the daemon comes back on a different OS-assigned
   // port, and the refresh moves the runner onto it.
   test('re-resolves onto the restarted daemon\'s new proxy port', async () => {
+    process.env.LAZY_ALLOW_HOST_RUNNER = '1';
     await configWith('[runner]\ntype = "dangerously-host-process-without-any-isolation"\n');
     // Pre-upgrade daemon: proxy on 40001. Resolution reads the daemon context
     // directly (the in-daemon path), so no socket or RPC is involved here.
@@ -114,17 +116,19 @@ describe('builder proxy target refresh across an upgrade', () => {
   });
 
   // The proxy is always on, so there is no "opt out" branch left to be a no-op.
-  // INVARIANT (proxy-role-upstreams): a role with an explicit endpoint is NOT a
-  // no-op any more. That endpoint is where the PROXY forwards the role, so the
-  // role still needs the proxy's live address — and with the gate armed and no
-  // daemon to answer, the refresh must FAIL rather than quietly leave the role
-  // with no address and let the launch connect somewhere unaudited.
-  test('a role with an explicit endpoint still needs the proxy address', async () => {
+  // INVARIANT (proxy-role-upstreams): a role whose PROFILE pins an endpoint is
+  // NOT a no-op any more. That endpoint is where the PROXY forwards the
+  // profile's traffic, so the role still needs the proxy's live address — and
+  // with the gate armed and no daemon to answer, the refresh must FAIL rather
+  // than quietly leave the role with no address and let the launch connect
+  // somewhere unaudited.
+  test('a role on an endpoint-pinned profile still needs the proxy address', async () => {
     process.env.LAZY_TEST = '1';
     process.env.LAZY_FORCE_PROXY_GATE = '1';
     await configWith(
-      '[models.roles.builder]\nbackend = "proxy"\nmodel = "m"\nendpoint = "http://127.0.0.1:9999"\n' +
-      '[models.roles.agent]\nbackend = "proxy"\nmodel = "m"\nendpoint = "http://127.0.0.1:9999"\n',
+      '[agents.gateway]\nharness = "claude-code"\nmodel = "m"\nendpoint = "http://127.0.0.1:9999"\n' +
+      '[models.roles.builder]\nagent = "gateway"\n' +
+      '[models.roles.agent]\nagent = "gateway"\n',
     );
     const runner = fakeRunner();
     await expect(refreshRunnerProxyTargets(runner, projectRoot)).rejects.toThrow(/proxy address/i);

@@ -1,0 +1,69 @@
+#!/bin/sh
+#
+# lazy — the guest's `lazy` command.
+#
+# SmolvmSupervisor reaches into the machine exactly one way:
+#
+#   machine exec --name <handle> -- sh -c 'cd <dir>; . env.sh; exec lazy …'
+#
+# There is no init system, no login shell profile and no other hook, so this
+# wrapper is where per-boot guest preparation has to live. It runs
+# lazy-guest-init (docker data-root + dockerd, idempotent, marker in tmpfs) and
+# then execs the real CLI from the checkout.
+#
+# Preparation failure is fatal only for commands that need Docker. `lazy
+# --version` is the supervisor's readiness check and the first line of the
+# operator's real-hardware checklist: it must answer even in a guest whose
+# dockerd is broken, or a diagnosable problem becomes an unreadable one. The
+# same reasoning covers `lazy init`, which clones and writes a store and never
+# touches Docker. `lazy daemon start` does need it, and refuses rather than
+# starting a daemon that will fail every task later for reasons nothing
+# connects back to here.
+#
+# Overrides:
+#   LAZY_GUEST_SKIP_INIT=1      skip preparation entirely
+#   LAZY_GUEST_REQUIRE_DOCKER=1 make preparation failure fatal for every command
+#   LAZY_GUEST_REQUIRE_DOCKER=0 make it fatal for none
+#   LAZY_CHECKOUT=<path>        lazy sources to run (default /opt/lazy)
+
+set -eu
+
+CHECKOUT="${LAZY_CHECKOUT:-/opt/lazy}"
+
+needs_docker=0
+case "${1:-} ${2:-}" in
+  "daemon start") needs_docker=1 ;;
+esac
+
+case "${LAZY_GUEST_REQUIRE_DOCKER:-}" in
+  1) needs_docker=1 ;;
+  0) needs_docker=0 ;;
+esac
+
+skip_init=0
+case "${1:-}" in
+  --version|-v|--help|-h|"") skip_init=1 ;;
+esac
+if [ "${LAZY_GUEST_SKIP_INIT:-}" = "1" ]; then
+  skip_init=1
+fi
+
+if [ "$skip_init" = "0" ]; then
+  # The init's key=value lines are the diagnosis; they go to stderr on failure
+  # so the daemon's log (which the fleet supervisor quotes into its health-check
+  # failure) says WHICH piece was missing — the forwarder that carries the VM's
+  # relay to the daemon's loopback, or dockerd — rather than "preparation failed".
+  init_report="$(lazy-guest-init --ensure 2>&1)" || init_failed=1
+  if [ "${init_failed:-0}" = "1" ]; then
+    printf '%s\n' "$init_report" >&2
+    if [ "$needs_docker" = "1" ]; then
+      echo "lazy: guest preparation failed and '${1:-} ${2:-}' needs it (the port forwarder and Docker). \
+Run 'lazy-guest-init --print-plan' in the machine for the forwarder's state and the intended \
+data-root, and read /var/log/lazy-forwarder.log and /var/log/lazy-dockerd.log." >&2
+      exit 1
+    fi
+    echo "lazy: guest preparation failed; continuing because '${1:-}' does not need it." >&2
+  fi
+fi
+
+exec bun run "${CHECKOUT}/src/index.ts" "$@"

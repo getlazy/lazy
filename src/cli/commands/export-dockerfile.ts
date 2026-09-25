@@ -15,7 +15,7 @@ import { requireLazyRoot } from '../helpers';
 import { parseFlags } from '../helpers';
 import { writeStdout } from '../../utils/stdio';
 import { isTTY, promptYesNo } from '../editor';
-import { theme } from '../theme';
+import { theme } from '../../render/theme';
 import { DEFAULT_DOCKERFILE } from '../../capture/claude';
 
 const DEFAULT_OUTPUT = 'Dockerfile.lazy';

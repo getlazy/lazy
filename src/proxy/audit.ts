@@ -39,6 +39,9 @@ export class AuditQueue {
   private chain: Promise<void> = Promise.resolve();
   private lastFailure: string | null = null;
   private repeatCount = 0;
+  private lastSuccessAt: number | null = null;
+  private lastFailureAt: number | null = null;
+  private droppedSinceSuccess = 0;
 
   /**
    * `tap` is the LIVE observer (src/proxy/activity.ts), called synchronously on
@@ -70,8 +73,12 @@ export class AuditQueue {
         await this.sink.append(record);
         this.lastFailure = null;
         this.repeatCount = 0;
+        this.lastSuccessAt = Date.now();
+        this.droppedSinceSuccess = 0;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+        this.lastFailureAt = Date.now();
+        this.droppedSinceSuccess++;
         if (message !== this.lastFailure) {
           this.lastFailure = message;
           this.repeatCount = 0;
@@ -86,6 +93,20 @@ export class AuditQueue {
         }
       }
     });
+  }
+
+  /**
+   * The append history `lazy daemon health` reports: when a record last
+   * landed, and — while appends are failing — the failure and how many records
+   * it has cost. `lastFailure` is null once an append succeeds again.
+   */
+  health(): { lastSuccessAt: number | null; lastFailure: string | null; lastFailureAt: number | null; droppedSinceSuccess: number } {
+    return {
+      lastSuccessAt: this.lastSuccessAt,
+      lastFailure: this.lastFailure,
+      lastFailureAt: this.lastFailure === null ? null : this.lastFailureAt,
+      droppedSinceSuccess: this.droppedSinceSuccess,
+    };
   }
 
   /** Drain: wait for all enqueued writes to complete (used in tests / shutdown). */

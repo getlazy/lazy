@@ -1,6 +1,6 @@
 /**
  * E2E regression test: a pending file-permission violation outlives the status
- * label, and the reviewer can always express the decision it demands.
+ * label — the SET is the source of truth, never `task.status`.
  *
  * THE INCIDENT (fix-ask-nukes-violations), observed live on task
  * `fix-cursor-action-required`:
@@ -8,19 +8,22 @@
  *   1. the task sat in `conflict` with one pending violation;
  *   2. a `lazy_ask` — documented read-only — ran against it, and afterwards the
  *      task read `blocked` while the violation was still pending;
- *   3. `lazy_unblock` WITH the approval was REFUSED — "this task has no file
- *      permission violations" — because that guard read `task.status`;
- *   4. the reviewer dropped the approval, unblocked, and the daemon's revert
- *      (which reads the violation SET, not the status) destroyed the agent's
- *      committed test coverage. Silently: the response said success.
+ *   3. every reviewer-facing guard keyed on the LABEL and so saw nothing to
+ *      decide, while the daemon's revert read the SET and fired anyway,
+ *      destroying the agent's committed test coverage.
  *
- * Steps 3 and 4 are the destructive half, and they are what this file walks.
+ * Since move-file-approval-to-accept there is no revert and no unblock-time
+ * decision, so the destructive half of that incident cannot recur. The half
+ * that still matters is the other one: a drifted label must not let a merge
+ * through with an undecided protected file in it. That is what this file walks
+ * now — the accept gate reads the violation set, whatever the label says.
+ *
  * The drift of step 2 is seeded directly into storage rather than produced by a
  * real ask, deliberately: an ask is only ONE of the side-channel turns that can
  * park a paused task (sync, pairing teardown, stop, the reconciler's own flush
  * of an errored or timed-out ask all park too). Seeding the end state tests the
- * daemon gate against the whole family, and against any future path that lets
- * the label drift again. `src/utils/paused-status.ts` and
+ * gate against the whole family, and against any future path that lets the
+ * label drift again. `src/utils/paused-status.ts` and
  * test/unit/paused-status.test.ts cover the other half — deriving the label so
  * it does not drift in the first place.
  *
@@ -32,10 +35,11 @@ import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { join } from 'path';
 import { readFileSync, writeFileSync } from 'fs';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { expectSuccess, expectFailure, expectError, expectOutput } from '../helpers/assertions';
+import { expectSuccess, expectFailure, expectError, expectOutputExcludes } from '../helpers/assertions';
 import { createTask, disablePreAccept, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { runReconcile } from '../helpers/reconcile';
 import { readTaskStatus, readTurns, setTaskStatus, worktreePathFor } from '../helpers/storage';
+import { seedFinal } from '../helpers/final';
 
 const ORIGINAL = 'describe("existing tests", () => {});\n';
 const AGENT_WORK = 'describe("agent added coverage", () => { /* the work at stake */ });\n';
@@ -97,72 +101,54 @@ describe('violations survive a status-label drift', () => {
 
     return taskId;
   }
-
-  // INVARIANT: an unblock can never revert a file the caller was refused
-  // permission to approve. If violations are pending, the approval MUST be
-  // expressible — whatever the status label happens to say. This is the exact
-  // call the incident refused, and refusing it is what led to the destruction.
-  test('the approval is accepted on a drifted task, and the agent work survives', async () => {
+  // INVARIANT (approval-happens-at-accept): a drifted label changes nothing
+  // about an unblock, because an unblock has no file decision to get wrong. The
+  // agent's work survives, and what the reviewer owes survives with it.
+  test('a drifted task unblocks normally and the agent work survives', async () => {
     const taskId = await driftedTask();
 
     const result = await ctx.lazyMocked(
-      ['unblock', taskId, '--approve-file', 'test.spec.ts', '--message', 'Keep the coverage', '--follow'],
+      ['unblock', taskId, '--message', 'Keep going', '--follow'],
       MOCK_CLAUDE_SUCCESS,
       {},
     );
     await runReconcile(ctx.root, ctx.protocolBase);
-
-    // Pre-fix this failed with "has no file permission violations. The
-    // approved_files parameter is only meaningful for conflict tasks."
     expectSuccess(result);
+    expectOutputExcludes(result, 'Reverted');
 
-    const violations = readTurns(ctx.root, taskId).flatMap(t => t.violations ?? []);
-    expect(violations.find(v => v.file === 'test.spec.ts')!.status).toBe('approved');
-
-    // The whole point: the agent's committed work is still there.
     const content = readFileSync(join(worktreePathFor(ctx.root, taskId), 'test.spec.ts'), 'utf-8');
     expect(content).toBe(AGENT_WORK);
+
+    const pending = readTurns(ctx.root, taskId)
+      .flatMap(t => t.violations ?? [])
+      .filter(v => v.status === 'pending');
+    expect(pending.map(v => v.file)).toEqual(['test.spec.ts']);
   });
 
-  // INVARIANT: the protection model is NOT weakened to make the above easy.
-  // Omitting a decision is still refused, on a drifted task as on a `conflict`
-  // one — a protected file the reviewer never ruled on must not be destroyed on
-  // their behalf. Pre-fix this call SUCCEEDED and reverted the file.
-  test('omitting a decision on a drifted task is refused, and nothing is touched', async () => {
+  // INVARIANT (violations-are-the-source-of-truth): the accept gate reads the
+  // violation SET, not `task.status`. A task wearing `blocked` with a pending
+  // violation must still be refused — otherwise the drift silently merges a
+  // protected-file change nobody approved, which is the same incident with the
+  // damage moved from the worktree to the target branch.
+  test('accept is refused on a drifted task until the file is approved', async () => {
     const taskId = await driftedTask();
+    // Fixture setup, not the subject (see test/helpers/final.ts). Daemonless
+    // suite, so the final is seeded at the storage level.
+    await seedFinal(ctx, taskId);
 
-    const refused = await ctx.lazyMocked(
-      ['unblock', taskId, '--message', 'Fix it without touching tests', '--follow'],
-      MOCK_CLAUDE_SUCCESS,
-      {},
-    );
-
+    const refused = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {});
     expectFailure(refused);
-    expectError(refused, 'file permission violation');
     expectError(refused, 'test.spec.ts');
 
     const content = readFileSync(join(worktreePathFor(ctx.root, taskId), 'test.spec.ts'), 'utf-8');
     expect(content).toBe(AGENT_WORK);
-  });
 
-  // INVARIANT: reverting committed work is never silent. The reviewer asked for
-  // the revert here, and the response still has to say what it destroyed —
-  // naming the files is the only record the reviewer gets.
-  test('an explicit revert-all reverts, and says so by name', async () => {
-    const taskId = await driftedTask();
-
-    const result = await ctx.lazyMocked(
-      ['unblock', taskId, '--no-approve-files', '--message', 'Revert them', '--follow'],
+    const accepted = await ctx.lazyMocked(
+      ['accept', taskId, '--approve-file', 'test.spec.ts', '--yes'],
       MOCK_CLAUDE_SUCCESS,
       {},
     );
-    await runReconcile(ctx.root, ctx.protocolBase);
-    expectSuccess(result);
-
-    expectOutput(result, 'Reverted');
-    expectOutput(result, 'test.spec.ts');
-
-    const content = readFileSync(join(worktreePathFor(ctx.root, taskId), 'test.spec.ts'), 'utf-8');
-    expect(content).toBe(ORIGINAL);
+    expectSuccess(accepted);
+    expect(readFileSync(join(ctx.root, 'test.spec.ts'), 'utf-8')).toBe(AGENT_WORK);
   });
 });

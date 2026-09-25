@@ -4,25 +4,27 @@
  * INVARIANT: a diagnostic must never hang on the thing it diagnoses, and must
  * never report a wedged daemon as "not running".
  *
- * A frozen event loop still leaves the kernel listener up, so the socket accepts
+ * A frozen event loop still leaves the kernel listener up, so the port accepts
  * the connection and then nothing ever answers. `lazy daemon status` used to
  * hang there forever — the one command run to explain the freeze became another
  * symptom of it (see fix-markdown-crlf-daemon-hang). It must now come back
  * within seconds, name the state explicitly, and print a recovery that accounts
  * for SIGTERM being handled on the very loop that is stuck.
  *
- * The freeze is simulated by binding the daemon's socket path in THIS process
- * with a listener that accepts and never replies, alongside the token/pid state
- * files that make `isDaemonRunning` report a live daemon. No real daemon is
- * started: a genuinely frozen one cannot be produced on demand, and the client
- * behavior under test depends only on what the socket does.
+ * The freeze is simulated by binding a loopback port in THIS process with a
+ * listener that accepts and never replies, and pointing the daemon's port/host
+ * markers at it (the TCP port is the daemon's only transport and THE discovery
+ * mechanism — drop-unix-socket), alongside the token/pid state files that make
+ * `isDaemonRunning` report a live daemon. No real daemon is started: a genuinely
+ * frozen one cannot be produced on demand, and the client behavior under test
+ * depends only on what the port does.
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { mkdir, writeFile, rm } from 'fs/promises';
+import { mkdir, writeFile } from 'fs/promises';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectOutput } from '../helpers/assertions';
-import { getSocketPath, getTokenPath, getPidPath, getDaemonDir } from '../../src/daemon/paths';
+import { getWebPortPath, getWebHostPath, getTokenPath, getPidPath, getDaemonDir } from '../../src/daemon/paths';
 import { makeDaemonBaseDir, removeDaemonBaseDir } from '../helpers/daemon-base-dir';
 
 /** Room for the 3s probe in the child plus process spawn overhead. */
@@ -31,7 +33,7 @@ const TEST_TIMEOUT_MS = 30_000;
 describe('lazy daemon status — alive but unresponsive', () => {
   let ctx: TestContext;
   let baseDir: string;
-  let listener: { stop: (closeActiveConnections?: boolean) => void } | null = null;
+  let listener: { port: number; stop: (closeActiveConnections?: boolean) => void } | null = null;
 
   beforeEach(async () => {
     ctx = await setupTestLazy();
@@ -46,32 +48,34 @@ describe('lazy daemon status — alive but unresponsive', () => {
   });
 
   test('reports the freeze with pid and recovery instead of hanging', async () => {
+    // Bind first: the port marker has to name a port that is really stalling.
+    listener = Bun.listen({
+      hostname: '127.0.0.1',
+      port: 0, // OS-assigned: never collides with another suite's daemon
+      socket: {
+        data() { /* Deliberately silent: this IS the freeze. */ },
+        open() { /* Accept and stall. */ },
+      },
+    }) as unknown as { port: number; stop: (closeActiveConnections?: boolean) => void };
+
     // LAZY_DAEMON_BASE_DIR is passed to the CHILD only — the parent never
     // resolves daemon paths through the env, so nothing leaks into other suites.
     // We compute the same paths here by pinning it around the path helpers.
     const priorBaseDir = process.env.LAZY_DAEMON_BASE_DIR;
     process.env.LAZY_DAEMON_BASE_DIR = baseDir;
-    let socketPath: string;
     try {
       await mkdir(getDaemonDir(ctx.root), { recursive: true });
-      socketPath = getSocketPath(ctx.root);
-      // A live pid + token + socket is what isDaemonRunning falls back to when
-      // the dir has no lock file, so the CLI gets past its liveness gate and
-      // actually probes the socket — which is the code path under test.
+      // A live pid + token + port marker is what isDaemonRunning falls back to
+      // when the dir has no lock file, so the CLI gets past its liveness gate
+      // and actually probes the port — which is the code path under test.
       await writeFile(getTokenPath(ctx.root), 'test-token');
       await writeFile(getPidPath(ctx.root), String(process.pid));
+      await writeFile(getWebPortPath(ctx.root), String(listener.port));
+      await writeFile(getWebHostPath(ctx.root), '127.0.0.1');
     } finally {
       if (priorBaseDir === undefined) delete process.env.LAZY_DAEMON_BASE_DIR;
       else process.env.LAZY_DAEMON_BASE_DIR = priorBaseDir;
     }
-
-    listener = Bun.listen({
-      unix: socketPath,
-      socket: {
-        data() { /* Deliberately silent: this IS the freeze. */ },
-        open() { /* Accept and stall. */ },
-      },
-    }) as unknown as { stop: (closeActiveConnections?: boolean) => void };
 
     const start = Date.now();
     const result = await ctx.lazy(['daemon', 'status'], {

@@ -46,20 +46,24 @@ import type {
   ImportResult,
   CIJobFailure,
   AcceptGateWarning,
+  MarkReadyOptions,
+  OpenReview,
 } from './driver';
 import { truncateMRTitle } from './driver';
 import type { Task } from '../types';
 import { targetBranchOf } from '../task-target';
 import type { ResolvedConfig } from '../config/types';
 import { logger } from '../utils/logger';
+import { reportFetchFailure, clearFetchFailure } from './fetch-failure';
+import { getBranchName, getWorktreePath } from '../task/identity';
 import { looksLikeTaskBranch } from '../git/branch-prefix';
-import { getBranchName, getWorktreePath } from '../cli/helpers';
 import { runGit as defaultRunGit, fastForwardLocal as sharedFastForwardLocal, findWorktreeForBranch, tryFastForwardInWorktree, type GitResult } from '../utils/git';
 import { spawn, spawnSyncUnsupervised } from '../utils/spawn';
 import { truncateLog } from '../utils/log-truncate';
 import { withRemoteRetry, type RetryOptions } from '../utils/retry';
 import { applyFidelitySection, composeInitialBody } from '../synthesis/fidelity';
 import { remoteUrlHasHost, remoteUrlHostContains } from './remote-url';
+import { parsePaginatedApiJson } from './paginated-json';
 
 export interface GlResult {
   stdout: string;
@@ -216,8 +220,12 @@ export class GitLabDriver implements RepositoryDriver {
     return true;
   }
 
+  upstreamRefName(parentBranch: string): string {
+    return `${this.remoteName}/${parentBranch}`;
+  }
+
   async resolveUpstreamRef(parentBranch: string, worktreePath: string): Promise<string> {
-    const remoteRef = `${this.remoteName}/${parentBranch}`;
+    const remoteRef = this.upstreamRefName(parentBranch);
     await withRemoteRetry(
       async () => {
         const fetchResult = await this.git(['fetch', this.remoteName, parentBranch], worktreePath);
@@ -260,7 +268,7 @@ export class GitLabDriver implements RepositoryDriver {
     return { metadata: {} };
   }
 
-  async markReadyForReview(task: Task): Promise<{ metadata?: Record<string, string> }> {
+  async markReadyForReview(task: Task, opts?: MarkReadyOptions): Promise<{ metadata?: Record<string, string> }> {
     const existingMrIid = this.mrNumber(task);
 
     if (existingMrIid) {
@@ -302,7 +310,9 @@ export class GitLabDriver implements RepositoryDriver {
 
     // No MR yet — create one (non-draft, since we're marking ready)
     const branchName = getBranchName(task);
-    const targetBranch = await this.targetBranch(task);
+    // An explicit base is an explicit human submit into an intermediate branch
+    // (see RepositoryDriver.markReadyForReview); everything else derives it.
+    const targetBranch = opts?.baseBranch ?? await this.targetBranch(task);
 
     const body = this.buildMRBody(task);
 
@@ -343,6 +353,15 @@ export class GitLabDriver implements RepositoryDriver {
     if (await this.isBranchMerged(sourceBranch, targetBranch, root)) {
       logger.info('Branch is already merged into target — nothing to do.');
       return { status: 'merged' };
+    }
+
+    // Resume of a dead accept: the forge SQUASH-merges, so the branch is never
+    // an ancestor of the target and the check above cannot see a merge that
+    // already landed. Ask the trees instead — and never open a replacement
+    // PR/MR for work that is already on the target.
+    if (opts.resume && await this.changesAlreadyOnRemoteTarget(sourceBranch, targetBranch, root)) {
+      logger.info('Resume: the branch\'s changes are already on the remote target — nothing to merge.');
+      return { status: 'merged', alreadyLanded: true };
     }
 
     // Step 1: Push latest commits
@@ -761,55 +780,55 @@ export class GitLabDriver implements RepositoryDriver {
     }
   }
 
-  async postAcceptReview(task: Task, reason: string): Promise<string | null> {
+  /**
+   * `reason` is deliberately unused: GitLab's approve endpoint takes no body,
+   * and the note that used to carry the reason is exactly the notification
+   * lazy stopped writing (engineer decision, 2026-09-21). The reason stays on
+   * the task and in the merge commit.
+   */
+  async approveForMerge(task: Task, _reason: string): Promise<string | null> {
     const mrIid = this.mrNumber(task);
     if (!mrIid) {
-      logger.debug('postAcceptReview: no MR number in task metadata, skipping');
+      logger.debug('approveForMerge: no MR number in task metadata, skipping');
       return null;
     }
 
-    // Step 1: Try approving the MR via glab
     const approveResult = await this.gl(['mr', 'approve', mrIid]);
     if (approveResult.exitCode === 0) {
-      logger.debug(`postAcceptReview: approved MR !${mrIid}`);
-    } else {
-      // Approval may fail (self-approval, already approved, etc.) — log and continue
-      logger.debug(`postAcceptReview: MR approve failed for !${mrIid} (non-fatal): ${approveResult.stderr}`);
-    }
-
-    // Step 2: Post a comment with the reason
-    const commentBody = `[Lazy Accept] ${reason}`;
-    const commentResult = await this.gl(['mr', 'comment', mrIid, '--message', commentBody]);
-
-    if (commentResult.exitCode === 0) {
-      logger.debug(`postAcceptReview: posted accept comment to MR !${mrIid}`);
+      logger.debug(`approveForMerge: approved MR !${mrIid}`);
       return null;
     }
 
-    const warning = `Could not post accept review to MR !${mrIid}: ${commentResult.stderr}`;
-    logger.warn(`postAcceptReview: comment failed for MR !${mrIid}: ${commentResult.stderr}`);
-    return warning;
-  }
-
-  async postRejectReview(task: Task, reason: string): Promise<string | null> {
-    const mrIid = this.mrNumber(task);
-    if (!mrIid) {
-      logger.debug('postRejectReview: no MR number in task metadata, skipping');
-      return null;
+    // Same rule as GitHubDriver.approveForMerge: a forge REFUSING the
+    // approval for an expected reason is debug + null, and only a real
+    // failure warns. GitLab spells every refusal 401 — including an expired
+    // token — so the status alone cannot classify: see
+    // isApprovalRefusalStatus below. On a 401, ask glab whether the
+    // credential still works. It does → GitLab declined the approval itself
+    // (author, already approved, no permission), which is the expected
+    // outcome under `[remote] auto_approve` and must stay quiet. It does not
+    // → the credential is the problem, and that is a real failure the human
+    // needs to see. The probe runs on the failure path only.
+    if (isApprovalRefusalStatus(approveResult.stderr)) {
+      const authStatus = await this.gl(['auth', 'status']);
+      if (authStatus.exitCode === 0) {
+        logger.debug(
+          `approveForMerge: MR !${mrIid} approval refused as expected: ${approveResult.stderr}`,
+        );
+        return null;
+      }
+      const detail = (authStatus.stderr || authStatus.stdout).trim()
+        || 'glab auth status failed with no output';
+      logger.warn(
+        `approveForMerge: MR !${mrIid} approval returned 401 (${approveResult.stderr.trim()}) `
+        + `and 'glab auth status' failed too: ${detail}`,
+      );
+      return `Could not approve MR !${mrIid}: GitLab returned 401 and the glab credential is not working `
+        + `(run 'glab auth login'): ${detail}`;
     }
 
-    // GitLab has no "request changes" review state — use a comment instead
-    const commentBody = `[Lazy Reject] ${reason}`;
-    const commentResult = await this.gl(['mr', 'comment', mrIid, '--message', commentBody]);
-
-    if (commentResult.exitCode === 0) {
-      logger.debug(`postRejectReview: posted reject comment to MR !${mrIid}`);
-      return null;
-    }
-
-    const warning = `Could not post reject review to MR !${mrIid}: ${commentResult.stderr}`;
-    logger.warn(`postRejectReview: comment failed for MR !${mrIid}: ${commentResult.stderr}`);
-    return warning;
+    logger.warn(`approveForMerge: MR approve failed for !${mrIid}: ${approveResult.stderr}`);
+    return `Could not approve MR !${mrIid}: ${approveResult.stderr}`;
   }
 
   async cleanup(branch: string): Promise<void> {
@@ -825,7 +844,7 @@ export class GitLabDriver implements RepositoryDriver {
     }
   }
 
-  async syncComments(task: Task, since: string): Promise<RemoteComment[]> {
+  async syncComments(task: Task, since?: string): Promise<RemoteComment[]> {
     const taskLabel = task.code ?? task.id.substring(0, 8);
     const mrIid = this.mrNumber(task);
     if (!mrIid) {
@@ -852,13 +871,16 @@ export class GitLabDriver implements RepositoryDriver {
         const body = (note.body as string) ?? '';
         // Skip system notes (merge status changes, label additions, etc.)
         if (note.system === true) continue;
-        // Skip comments marked as lazy's own output
+        // Skip comments marked as lazy's own output (older turn/note comments
+        // and review reports carry the hidden marker)
         if (body.includes('<!-- lazy:')) {
           logger.debug(`syncComments [${taskLabel}]: skipping own comment (id: ${note.id})`);
           continue;
         }
         const author = (note.author as Record<string, unknown> | undefined);
         comments.push({
+          forge: 'gitlab',
+          kind: 'mr_note',
           id: String(note.id),
           body,
           author: (author?.username as string) ?? 'unknown',
@@ -872,13 +894,15 @@ export class GitLabDriver implements RepositoryDriver {
       logger.warn(`syncComments [${taskLabel}]: failed to fetch MR notes: ${err instanceof Error ? err.message : err}`);
     }
 
-    // Filter out comments posted by lazy itself
+    // Filter out comments posted by lazy itself. Per-turn mirroring is gone,
+    // but older threads may still carry lazy's own marker-bearing turn/note
+    // comments — and lazy's review reports use the same marker.
     const externalComments = comments.filter(c => !c.body.startsWith('<!-- lazy:'));
 
     // Sort by creation time (oldest first)
     externalComments.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 
-    logger.debug(`syncComments [${taskLabel}]: fetched ${comments.length} comments since ${since}, ${externalComments.length} external`);
+    logger.debug(`syncComments [${taskLabel}]: fetched ${comments.length} comments since ${since ?? 'the beginning'}, ${externalComments.length} external`);
     return externalComments;
   }
 
@@ -903,24 +927,6 @@ export class GitLabDriver implements RepositoryDriver {
     } catch {
       logger.debug(`getPRState: failed to parse response for MR !${mrIid}`);
       return null;
-    }
-  }
-
-  async postTurnSummary(task: Task, content: string): Promise<void> {
-    const mrIid = this.mrNumber(task);
-    if (!mrIid) {
-      logger.debug('postTurnSummary: no MR number in task metadata, skipping');
-      return;
-    }
-
-    // Prepend hidden HTML marker to identify this comment as lazy's own output.
-    const markedContent = '<!-- lazy:turn -->\n' + content;
-
-    const result = await this.gl(['mr', 'comment', mrIid, '--message', markedContent]);
-    if (result.exitCode !== 0) {
-      logger.warn(`postTurnSummary: failed to post comment to MR !${mrIid}: ${result.stderr}`);
-    } else {
-      logger.debug(`postTurnSummary: posted turn summary to MR !${mrIid}`);
     }
   }
 
@@ -1054,19 +1060,26 @@ export class GitLabDriver implements RepositoryDriver {
     }
 
     // Fetch MR notes for import as comments
-    const comments: string[] = [];
+    const comments: RemoteComment[] = [];
     const notesResult = await this.gl([
       'api', `projects/:id/merge_requests/${mrIid}/notes`, '--paginate',
     ]);
     if (notesResult.exitCode === 0) {
       try {
-        const notes = this.parsePaginatedJson(notesResult.stdout);
+        const notes = parsePaginatedApiJson(notesResult.stdout);
         for (const note of notes) {
           if (note.system === true) continue;
           const author = (note.author as Record<string, unknown>)?.username as string ?? 'unknown';
           const body = (note.body as string) ?? '';
           if (body.trim()) {
-            comments.push(`[${author}] ${body}`);
+            comments.push({
+              forge: 'gitlab',
+              kind: 'mr_note',
+              id: String(note.id),
+              body,
+              author,
+              createdAt: (note.created_at as string) ?? '',
+            });
           }
         }
       } catch {
@@ -1076,15 +1089,98 @@ export class GitLabDriver implements RepositoryDriver {
 
     return {
       goal: title,
+      description: typeof mrData.description === 'string' ? mrData.description : undefined,
       branch,
       metadata: {
         gitlab_remote_ref_url: mrUrl,
         gitlab_remote_ref_id: mrNum,
         gitlab_remote_ref_state: state,
         import_source_url: url,
+        import_source_branch: branch,
       },
       comments,
     };
+  }
+
+  /**
+   * Open MR for this git branch, if any. Skips closed/merged so a stale MR
+   * cannot auto-complete a freshly linked task. Uses the real branch name —
+   * never `lazy/<task-ref>`.
+   */
+  async findPullRequestForBranch(branch: string): Promise<ImportResult | null> {
+    const existing = await this.findExistingMR(branch);
+    if (!existing) return null;
+    const state = (existing.state ?? '').toLowerCase();
+    if (state === 'merged' || state === 'closed') return null;
+    return this.importUrl(existing.url, {});
+  }
+
+  async findOpenReviewForBranch(branch: string): Promise<OpenReview | null> {
+    const result = await this.gl(['mr', 'view', branch, '--output', 'json']);
+    if (result.exitCode !== 0) {
+      // glab reports a branch with no MR this way. Anything else (auth,
+      // network) is a failure to ask, and must not read as "no MR" — submit
+      // would then try to open a second one.
+      if (/no (open )?merge requests? (available|found)/i.test(result.stderr)) return null;
+      throw new Error(`glab mr view ${branch} failed (exit ${result.exitCode}): ${result.stderr.trim()}`);
+    }
+    let data: { web_url?: string; iid?: number; state?: string; target_branch?: string };
+    try {
+      data = JSON.parse(result.stdout);
+    } catch (err) {
+      throw new Error(`glab mr view ${branch} returned unparseable JSON: ${err instanceof Error ? err.message : err}`);
+    }
+    if ((data.state ?? '').toLowerCase() !== 'opened' || !data.web_url || data.iid === undefined) return null;
+    return {
+      url: data.web_url,
+      baseBranch: data.target_branch ?? '',
+      metadata: {
+        gitlab_remote_ref_url: data.web_url,
+        gitlab_remote_ref_id: String(data.iid),
+      },
+    };
+  }
+
+  async getReviewBase(task: Task): Promise<string | null> {
+    const iid = this.mrNumber(task);
+    if (!iid) return null;
+    const result = await this.gl(['mr', 'view', iid, '--output', 'json']);
+    if (result.exitCode !== 0) {
+      throw new Error(`glab mr view ${iid} failed (exit ${result.exitCode}): ${result.stderr.trim()}`);
+    }
+    try {
+      const base = (JSON.parse(result.stdout) as { target_branch?: string }).target_branch;
+      if (!base) throw new Error('no target_branch in the reply');
+      return base;
+    } catch (err) {
+      throw new Error(`glab mr view ${iid} returned no usable target branch: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  async retargetReview(task: Task, base: string): Promise<void> {
+    const iid = this.mrNumber(task);
+    if (!iid) throw new Error(`Task ${task.id} records no MR to retarget.`);
+    const result = await this.gl(['mr', 'update', iid, '--target-branch', base]);
+    if (result.exitCode !== 0) {
+      throw new Error(`glab mr update ${iid} --target-branch ${base} failed (exit ${result.exitCode}): ${result.stderr.trim()}`);
+    }
+    logger.info(`Retargeted MR !${iid} onto ${base}`);
+  }
+
+  async remoteBranchHead(branch: string): Promise<string | null> {
+    return await withRemoteRetry(
+      async () => {
+        const result = await this.git(['ls-remote', '--exit-code', '--heads', this.remoteName, `refs/heads/${branch}`]);
+        // --exit-code: 2 means the remote answered and has no such ref.
+        if (result.exitCode === 2) return null;
+        if (result.exitCode !== 0) {
+          throw new Error(`git ls-remote ${this.remoteName} ${branch} failed: ${result.stderr.trim()}`);
+        }
+        return result.stdout.trim().split(/\s+/)[0] || null;
+      },
+      `look up ${branch} on ${this.remoteName}`,
+      this.retryOpts,
+    );
   }
 
   // --- Task URL and remote ref ---
@@ -1261,8 +1357,12 @@ export class GitLabDriver implements RepositoryDriver {
     logger.info('Fetching from remote...');
     const fetchResult = await this.git(['fetch', this.remoteName], root);
     if (fetchResult.exitCode !== 0) {
-      logger.warn(`Fetch failed: ${fetchResult.stderr}`);
+      // Reported through the deduplicating helper: the daemon fetches once a
+      // minute, and an indefinite failure (missing credentials, most often)
+      // would otherwise write the same line into daemon.log forever.
+      reportFetchFailure(root, this.remoteName, fetchResult.stderr);
     } else {
+      clearFetchFailure(root, this.remoteName);
       logger.debug('Fetched latest from remote');
     }
 
@@ -1333,29 +1433,15 @@ export class GitLabDriver implements RepositoryDriver {
 
   // --- Metadata accessors ---
 
-  getLastCommentSyncedAt(task: Task): string | undefined {
-    return task.metadata?.gitlab_remote_last_comment_synced_at;
-  }
-
-  commentSyncedAtKey(): string {
-    return 'gitlab_remote_last_comment_synced_at';
-  }
-
-  getLastPostedTurnSeq(task: Task): number {
-    const val = task.metadata?.gitlab_remote_last_posted_turn_seq;
+  getLastFidelityTurnSeq(task: Task): number {
+    // Canonical key first, then the pre-fidelity "posted turn" key so stores
+    // written by the removed per-turn mirroring keep their watermark.
+    const val = task.metadata?.gitlab_fidelity_turn_seq ?? task.metadata?.gitlab_remote_last_posted_turn_seq;
     return val ? Number(val) : -1;
   }
 
-  postedTurnSeqKey(): string {
-    return 'gitlab_remote_last_posted_turn_seq';
-  }
-
-  getLastPostedNoteAt(task: Task): string | undefined {
-    return task.metadata?.gitlab_remote_last_posted_note_at;
-  }
-
-  postedNoteAtKey(): string {
-    return 'gitlab_remote_last_posted_note_at';
+  fidelityTurnSeqKey(): string {
+    return 'gitlab_fidelity_turn_seq';
   }
 
   getLastCIFailureSynced(task: Task): string | undefined {
@@ -1368,7 +1454,7 @@ export class GitLabDriver implements RepositoryDriver {
 
   formatImportedComment(comment: RemoteComment, task: Task): string {
     const mrNum = this.mrNumber(task) ?? '?';
-    let content = `[MR !${mrNum} @${comment.author}] {remote:${comment.id}} ${comment.body}`;
+    let content = `[MR !${mrNum} @${comment.author}] ${comment.body}`;
     if (comment.path) {
       content += `\n(on file: ${comment.path}`;
       if (comment.line) content += `, line ${comment.line}`;
@@ -1530,7 +1616,22 @@ export class GitLabDriver implements RepositoryDriver {
     );
   }
 
-  /** Check if sourceBranch is already fully merged into targetBranch via git. */
+  /**
+   * Would merging sourceBranch into <remote>/<targetBranch> change nothing?
+   * The squash-aware twin of isBranchMerged, used only on a resumed accept.
+   * Any git failure answers false (the ordinary merge path then reports it).
+   */
+  private async changesAlreadyOnRemoteTarget(sourceBranch: string, targetBranch: string, cwd: string): Promise<boolean> {
+    const remoteRef = `${this.remoteName}/${targetBranch}`;
+    const merged = await this.git(['merge-tree', '--write-tree', remoteRef, sourceBranch], cwd);
+    if (merged.exitCode !== 0) return false;
+    const tree = await this.git(['rev-parse', '--verify', `${remoteRef}^{tree}`], cwd);
+    if (tree.exitCode !== 0) return false;
+    const mergedTree = merged.stdout.split('\n')[0]?.trim();
+    return !!mergedTree && mergedTree === tree.stdout.trim();
+  }
+
+  /** Check if sourceBranch is already fully merged into targetBranch via git (ancestry, so it cannot see a squash). */
   private async isBranchMerged(sourceBranch: string, targetBranch: string, cwd: string): Promise<boolean> {
     const result = await this.git(
       ['merge-base', '--is-ancestor', sourceBranch, `${this.remoteName}/${targetBranch}`],
@@ -1552,12 +1653,14 @@ export class GitLabDriver implements RepositoryDriver {
   }
 
   /**
-   * Fetch all notes from a MR since a given timestamp.
+   * Fetch all notes from a MR, optionally only those created at or after
+   * `since`. As in GitHubDriver.fetchPaginatedComments, `since` is a display
+   * window, never an import watermark: importers pass none and dedup by id.
    * Uses glab api with --paginate.
    */
   private async fetchPaginatedNotes(
     mrIid: string,
-    since: string,
+    since: string | undefined,
   ): Promise<Array<Record<string, unknown>>> {
     const result = await this.gl([
       'api', `projects/:id/merge_requests/${mrIid}/notes`,
@@ -1572,9 +1675,9 @@ export class GitLabDriver implements RepositoryDriver {
     if (!result.stdout.trim()) return [];
 
     try {
-      const allNotes = this.parsePaginatedJson(result.stdout);
+      const allNotes = parsePaginatedApiJson(result.stdout);
 
-      // Filter by since timestamp
+      if (since === undefined) return allNotes;
       return allNotes.filter(n => {
         const createdAt = n.created_at as string | undefined;
         return createdAt && createdAt >= since;
@@ -1582,23 +1685,6 @@ export class GitLabDriver implements RepositoryDriver {
     } catch (err) {
       logger.warn(`fetchPaginatedNotes: failed to parse response: ${err instanceof Error ? err.message : err}`);
       return [];
-    }
-  }
-
-  /**
-   * Parse potentially paginated JSON output from glab api.
-   * glab api --paginate may concatenate JSON arrays: [...][...][...]
-   */
-  private parsePaginatedJson(raw: string): Array<Record<string, unknown>> {
-    const trimmed = raw.trim();
-    if (trimmed.startsWith('[')) {
-      const normalized = '[' + trimmed.replace(/\]\s*\[/g, '],[') + ']';
-      const pages: Array<Array<Record<string, unknown>>> = JSON.parse(normalized);
-      return pages.flat();
-    } else {
-      return trimmed.split('\n')
-        .filter(line => line.trim())
-        .map(line => JSON.parse(line));
     }
   }
 
@@ -1628,4 +1714,45 @@ export class GitLabDriver implements RepositoryDriver {
     }
     return undefined;
   }
+}
+
+
+/**
+ * GitLab's approve endpoint says "you may not approve this" with HTTP 401,
+ * and nothing else.
+ *
+ * `POST /projects/:id/merge_requests/:iid/approve` ends in `unauthorized!
+ * unless result.success?` (lib/api/merge_request_approvals.rb), so EVERY
+ * disallowed approval — the author approving their own MR, an approval that
+ * already exists, a user without the permission — comes back as 401 with the
+ * body `{"message":"401 Unauthorized"}`. GitLab does not distinguish them,
+ * and neither can lazy: the earlier prose-matching predicate looked for
+ * phrases ("cannot approve your own", "already approved") that the API never
+ * sends, so the normal outcome for the sole developer `[remote] auto_approve`
+ * is documented for warned on every single accept.
+ *
+ * The catch is that an invalid or expired token is ALSO a 401 with the very
+ * same body (GitLab's REST authentication docs). So the status alone cannot
+ * classify, and `approveForMerge` disambiguates with the credential probe
+ * below, on the failure path only.
+ *
+ * The match is on the STATUS WORD, never on the bare number. glab surfaces an
+ * API error through go-gitlab's `ErrorResponse`, formatted
+ * `<METHOD> <URL>: <code> <body>` — so the request URL, and with it the
+ * project id and the MR iid, is inside the string read here. A `\b401\b` test
+ * therefore matched EVERY approve failure on a project whose id is 401 (or on
+ * MR !401): a 404, a 409, a 5xx would each be taken for a refusal and, with a
+ * healthy credential, silently swallowed. Every genuine refusal carries
+ * `401 Unauthorized`, so the word costs no coverage and cannot be spelled by
+ * an id.
+ *
+ * The GitHub twin is `isExpectedApprovalRefusal` in github-driver.ts, where
+ * the forge is unambiguous (422 for a refusal, 401 for a bad credential) and
+ * no probe is needed. Both drivers mean the same thing by "expected" — the
+ * forge itself declining an approval it was never going to accept, with a
+ * working credential — and both answer it the same way: debug + null, while
+ * anything else warns and returns a warning.
+ */
+function isApprovalRefusalStatus(stderr: string): boolean {
+  return stderr.toLowerCase().includes('unauthorized');
 }

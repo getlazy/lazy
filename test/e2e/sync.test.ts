@@ -38,8 +38,18 @@ describe('lazy sync', () => {
     const result = await ctx.lazy(['sync', '--help']);
     expectSuccess(result);
     expectOutput(result, 'Usage: lazy sync <task_id>');
-    expectOutput(result, "Merge upstream changes into a task's worktree by task ID.");
-    expectOutput(result, 'Task must be blocked/conflict/interrupted (not working)');
+    // Both steps are named in the help: the task's own branch on origin first,
+    // then the parent — a human reading `--help` should not have to discover
+    // the origin step from a phase line at runtime.
+    expectOutput(result, "The task's own branch on origin");
+    expectOutput(result, 'The parent/upstream branch');
+    // The dispatchable statuses, spelled the way src/task/sync-dispatch.ts has
+    // them — `submitted` included. The help text said three for as long as a
+    // synced task always came back `blocked`; it is the fourth that a reader
+    // now has to be told about, because syncing a submitted task keeps it
+    // submitted instead of quietly taking its PR out of the review queue.
+    expectOutput(result, 'Task must be blocked/conflict/submitted/interrupted (not working)');
+    expectOutput(result, 'A submitted task stays submitted');
     expectOutput(result, 'Global remote sync');
   });
 

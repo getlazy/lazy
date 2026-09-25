@@ -1,4 +1,5 @@
 import { describe, test, expect } from 'bun:test';
+import { ANTHROPIC_DEFAULT_TARGET } from '../../src/utils/role-target';
 import { DEFAULT_CONFIG } from '../../src/config/loader';
 import { GitHubDriver } from '../../src/remote/github-driver';
 import { GitLabDriver } from '../../src/remote/gitlab-driver';
@@ -18,16 +19,18 @@ import type { Task } from '../../src/storage/types';
  */
 
 const mockConfig: ResolvedConfig = {
-  models: { default: 'claude-sonnet-4-5-20250929', roles: { builder: { backend: 'anthropic', model: '', endpoint: '' }, agent: { backend: 'anthropic', model: '', endpoint: '' } } },
+  models: { default: 'claude-sonnet-4-5-20250929', roles: { builder: ANTHROPIC_DEFAULT_TARGET, agent: ANTHROPIC_DEFAULT_TARGET } },
   session: { verbose: false, debug: false, auto_commit_instructions: false },
   data: { path: '/tmp/test/.lazy' },
-  storage: { backend: 'external', external_path: '', postgres_ssl: false },
+  storage: { backend: 'external', external_path: '' },
   git: { default_branch_prefix: 'lazy', lfs_check: 'refuse' },
   output: { shortid_length: 8 },
+  agents: {},
   agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0, wind_down_timeout_ms: 0, effort: 'medium' },
+  review: { mode: 'low_high', auto_fix: false, gate: 'auto', draft_effort: 'low', review_effort: 'xhigh' },
   builder: { effort: 'high' },
   chattiness: { default: '', builder: '', agent: '' },
-  server: { port: 3000, sync_interval: 1000, bind: '127.0.0.1' },
+  server: { port: 3000, sync_interval: 1000, bind: '127.0.0.1', dashboard_url: '' },
   remote: {
     driver: 'github',
     git_remote: 'origin',
@@ -38,18 +41,20 @@ const mockConfig: ResolvedConfig = {
     gitlab_auto_push: true,
     gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection: false,
   },
-  docker: { dockerfile: '' },
-  runner: { type: 'docker' as const, permission_mode: 'sandbox' as const, sandbox_allowed_domains: ['*.anthropic.com'], sandbox_deny_read: [], sandbox_deny_write: [], sandbox_allow_weaker_nested: false },
+  docker: { dockerfile: '', build_inputs: [], run_args: [] },
+  runner: { type: 'docker' as const, permission_mode: 'sandbox' as const, sandbox_allowed_domains: ['*.anthropic.com'], sandbox_deny_read: [], sandbox_deny_write: [], sandbox_allow_weaker_nested: false, verify_sandbox_boundary: 'off' as const },
   documents: { path: '' },
   features: {},
   worktree: { include: [] },
   permissions: { protected: [] },
   protection: { enabled: false, protected_branches: [], protected_tasks: [], gate_default_branch: true },
-  automation: { maintain: [], pre_accept: { enabled: false, commands: [], timeout: 600 } },
+  automation: { maintain: [], react: [], pre_accept: { enabled: false, commands: [], timeout: 600 }, pre_turn: '', pre_turn_timeout: 120, pre_turn_required: false, post_turn: '', post_turn_timeout: 300, accept_check: '', accept_check_timeout: 300 },
   mounts: [],
-  checks: { post_turn: '', post_turn_timeout: 300 },
-  ollama: { enabled: false, model: '', endpoint: 'http://host.docker.internal:11434' },
-  limits: { max_concurrent_agents: 8, max_concurrent_builders: 8, idle_grace_minutes: 10, max_turns_without_human: 10 },
+  serve: { services: [], start_services_cmd: '' },
+  credentials: { backend: 'auto' },
+  limits: { max_concurrent_builders: 8, max_turns_without_human: 10 },
+  cluster: { max_child_fix_rounds: 3 },
+  usage_pause: { threshold_percent: 0, credentials: {} },
   daemon: {
     auto_react_ci: true,
     auto_react_comments: true,
@@ -160,7 +165,6 @@ function makeTask(targetBranch: string): Task {
     goal: 'Test task',
     prompt: 'Test prompt',
     status: 'working',
-    priority: 'normal',
     type: 'task',
     agent_id: 'test-agent',
     created_at: Date.now(),

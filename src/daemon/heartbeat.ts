@@ -17,11 +17,10 @@
  *
  * None of the obvious escapes work:
  *   - `Bun.serve` refuses `idleTimeout > 255`, so no value covers a 600s wait.
- *   - `server.timeout(req, n)` extends the deadline on a TCP listener but is
- *     ignored on a unix-socket listener (verified), and re-arming it on a timer
- *     does not reliably reset the deadline.
+ *   - `server.timeout(req, n)` extends the deadline, but re-arming it on a
+ *     timer does not reliably reset the deadline.
  *
- * What DOES work on both transports: writing bytes. A streamed response body
+ * What DOES work: writing bytes. A streamed response body
  * resets the idle timer (verified: a 26s response survived a 5s idleTimeout with
  * 2s between writes), so this module frames the reply as newline-delimited JSON
  * and emits a heartbeat line every few seconds until the real result is ready:
@@ -46,7 +45,7 @@ import { startEnvelopeSpan } from './envelope-span';
 import type { ProgressEmitter, ProgressEvent } from './progress';
 
 /**
- * `idleTimeout` used by every daemon listener (unix socket and TCP web server).
+ * `idleTimeout` used by every daemon TCP listener.
  *
  * Bun rejects any value above 255. It is deliberately NOT the mechanism that
  * keeps long operations alive — the heartbeat envelope is. This is the ceiling
@@ -198,7 +197,10 @@ export function heartbeatEnvelopeResponse(
       const emit: ProgressEmitter = (event) => {
         if (settled) return;
         if (event.kind === 'phase') {
-          currentPhase = event.state === 'start' ? event.label : undefined;
+          // `progress` is a note on the phase that is already open — it must not
+          // clear the label the heartbeats are annotated with.
+          if (event.state === 'start') currentPhase = event.label;
+          else if (event.state !== 'progress') currentPhase = undefined;
         }
         try {
           controller.enqueue(line({ progress: event } satisfies EnvelopeProgressLine));

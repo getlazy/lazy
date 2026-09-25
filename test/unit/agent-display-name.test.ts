@@ -29,7 +29,8 @@ describe('agentDisplayName', () => {
   });
 
   test('unknown ids pass through verbatim rather than naming another agent', () => {
-    expect(agentDisplayName('codex')).toBe('codex');
+    // 'codex' used to be the example here; it is a registered agent now.
+    expect(agentDisplayName('some-future-agent')).toBe('some-future-agent');
   });
 
   test('a missing agent id falls back to the generic word', () => {
