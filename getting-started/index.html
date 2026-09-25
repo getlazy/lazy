@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Getting started: your first task — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="getting-started-your-first-task"><a class="anchor" href="#getting-started-your-first-task" aria-hidden="true">#</a>Getting started: your first task</h1>
+<p>This page takes you from installing lazy to reviewing and merging the work of
+your first agent task. It is for someone who has not used lazy before. Each
+step names the command to run and what you should see; the other pages go
+deeper into each part.</p>
+<h2 id="what-you-need"><a class="anchor" href="#what-you-need" aria-hidden="true">#</a>What you need</h2>
+<ul>
+<li><strong>git</strong> and a git repository you want an agent to work on.</li>
+<li><strong><a href="https://bun.sh" rel="noopener noreferrer">Bun</a></strong>, to build lazy from source.</li>
+<li><strong>Docker</strong> (Docker Desktop on a Mac). Every task&#39;s agent runs in its own
+container.</li>
+<li><strong>A model credential</strong>, for example a Claude subscription or an Anthropic API
+key. See <a href="../credentials/">Credentials</a>.</li>
+</ul>
+<h2 id="1-install-lazy"><a class="anchor" href="#1-install-lazy" aria-hidden="true">#</a>1. Install lazy</h2>
+<pre><code class="language-bash">git clone https://github.com/getlazy/lazy.git
+cd lazy
+bun run install:local
+</code></pre>
+<p>This builds lazy and installs it into <code>~/.lazy/bin</code>. If <code>lazy</code> is not found
+afterwards, add that directory to your <code>PATH</code>, as the install prints.</p>
+<h2 id="2-set-lazy-up-in-your-repository"><a class="anchor" href="#2-set-lazy-up-in-your-repository" aria-hidden="true">#</a>2. Set lazy up in your repository</h2>
+<pre><code class="language-bash">cd your-project/
+lazy init
+</code></pre>
+<p><code>lazy init</code> writes a <code>lazy.toml</code> at the root of your repository and sets up
+where lazy keeps its task history. It detects your git remote and, for GitHub
+or GitLab, offers to turn on the integration that pushes branches and opens pull
+requests. It then reports the model credential it found, or tells you how to
+set one up. Every setting is described in
+<a href="../lazy-toml/">lazy.toml</a>. If something is not right, <code>lazy doctor</code> says what
+and how to fix it; see <a href="../troubleshooting/">Troubleshooting</a>.</p>
+<h2 id="3-create-and-start-a-task"><a class="anchor" href="#3-create-and-start-a-task" aria-hidden="true">#</a>3. Create and start a task</h2>
+<p>A task is one piece of work: a goal, a prompt, and a branch of its own.</p>
+<pre><code class="language-bash">lazy create --code add-auth --goal &quot;Add user authentication&quot; --prompt &quot;Use JWT tokens, bcrypt for passwords&quot;
+lazy start add-auth
+</code></pre>
+<p>The agent works in its own worktree and container, on its own branch. Your
+checkout is not touched.</p>
+<h2 id="4-wait-for-it-and-look-at-the-work"><a class="anchor" href="#4-wait-for-it-and-look-at-the-work" aria-hidden="true">#</a>4. Wait for it and look at the work</h2>
+<pre><code class="language-bash">lazy wait add-auth
+lazy show add-auth
+lazy diff add-auth
+</code></pre>
+<p><code>lazy show</code> prints the task&#39;s status, the agent&#39;s report, and any questions it
+raised for you. <code>lazy diff</code> shows what it changed. For a browser view, run
+<code>lazy dashboard</code>; see <a href="../web-review/">Reviewing in the browser</a>.</p>
+<p>To ask a question about the work without the agent changing anything:</p>
+<pre><code class="language-bash">lazy ask add-auth --message &quot;why did you choose JWT over sessions?&quot;
+</code></pre>
+<h2 id="5-give-feedback-or-accept"><a class="anchor" href="#5-give-feedback-or-accept" aria-hidden="true">#</a>5. Give feedback, or accept</h2>
+<p>If the work needs changes, send the agent feedback and it continues:</p>
+<pre><code class="language-bash">lazy unblock add-auth --message &quot;Store refresh tokens server-side&quot;
+</code></pre>
+<p>When you are happy with it, merge it into the branch it came from:</p>
+<pre><code class="language-bash">lazy accept add-auth
+</code></pre>
+<p>If it should not land, <code>lazy reject add-auth --reason &quot;...&quot;</code> or
+<code>lazy close add-auth --reason &quot;...&quot;</code> ends the task without merging.</p>
+<h2 id="where-to-go-next"><a class="anchor" href="#where-to-go-next" aria-hidden="true">#</a>Where to go next</h2>
+<ul>
+<li><a href="../review-paradigm/">How lazy reviews work</a> — what happens between the
+agent finishing and you accepting.</li>
+<li><a href="../raised-items/">Raised items</a> — questions and decisions an agent leaves for
+you.</li>
+<li><a href="../protected-branches/">Protected branches</a> — requiring your approval before
+work merges into a branch.</li>
+<li><a href="../cluster-tasks/">Cluster tasks</a> — letting one task drive several others.</li>
+<li><a href="../self-hosting-lazy-teams/">Self-hosting Lazy Teams</a> — running lazy for a
+team, in the browser.</li>
+</ul>
+
+</main>
+</body>
+</html>

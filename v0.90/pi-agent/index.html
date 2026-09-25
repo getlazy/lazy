@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Running tasks with the Pi coding agent — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="running-tasks-with-the-pi-coding-agent"><a class="anchor" href="#running-tasks-with-the-pi-coding-agent" aria-hidden="true">#</a>Running tasks with the Pi coding agent</h1>
+<p>Lazy can run task agents on <a href="https://pi.dev" rel="noopener noreferrer">Pi</a> (<code>pi</code>, the Pi coding agent
+CLI) as an alternative to Claude Code. Pi is a first-class task agent: turns,
+session resume across turns, <code>lazy ask</code>, merge-conflict turns, pairing, the
+<code>lazy_*</code> tool set, and the audit proxy all work the same way they do for other
+agents.</p>
+<h2 id="switching-to-pi"><a class="anchor" href="#switching-to-pi" aria-hidden="true">#</a>Switching to Pi</h2>
+<pre><code class="language-bash">lazy system agent           # readiness view: profiles, harness, upstream, auth
+lazy system agent set pi    # project default
+lazy create --agent pi &quot;…&quot;  # or per task
+</code></pre>
+<p>The built-in <code>pi</code> profile runs a local Ollama (see below), so this needs Ollama
+running with that model pulled — no API key, and nothing hosted.</p>
+<p><code>pi</code> here is the name of the built-in <a href="../lazy-toml/#agentsname--named-agent-profiles">agent
+profile</a> whose harness is Pi.
+Subtasks, clones, redo and rework inherit the profile of the task they came
+from, exactly as with other agents.</p>
+<h2 id="upstreams-and-models"><a class="anchor" href="#upstreams-and-models" aria-hidden="true">#</a>Upstreams and models</h2>
+<p>Pi itself can talk to many model providers. Under lazy, every byte of agent
+traffic leaves through lazy&#39;s audit proxy, so where a Pi task&#39;s traffic goes is
+decided by its profile&#39;s <code>endpoint</code>.</p>
+<p><strong>Out of the box, Pi runs on your own machine.</strong> The built-in <code>pi</code> profile
+points at a local Ollama — <code>http://localhost:11434</code>, model <code>qwen3.8:latest</code> —
+and spends no credential at all. Pi is lazy&#39;s local-model agent, so
+<code>lazy create --agent pi &quot;…&quot;</code> does not quietly bill a hosted provider. You need
+Ollama running with that model pulled:</p>
+<pre><code class="language-bash">ollama pull qwen3.8:latest
+</code></pre>
+<p>Everything else is a profile you declare:</p>
+<ul>
+<li><p><strong>A different Ollama, or a different local model</strong> — the same shape as the
+built-in, with your address and model:</p>
+<pre><code class="language-toml">[agents.remote-ollama-pi]
+harness = &quot;pi&quot;
+model = &quot;qwen3:32b&quot;
+endpoint = &quot;http://ollama.lan:11434&quot;
+</code></pre>
+<p>Then <code>lazy create --agent remote-ollama-pi &quot;…&quot;</code>, or make it the project
+default with <code>lazy system agent set remote-ollama-pi</code>. Because the upstream
+is a property of the profile, one project can run some Pi tasks on one server
+and others somewhere else at the same time.</p>
+</li>
+<li><p><strong>Anthropic</strong> — available, but never the default, because it spends your
+Anthropic credential. Note the <code>endpoint</code> line: a profile that omits it
+inherits Pi&#39;s default (the local Ollama), so it is what keeps this one on
+Anthropic:</p>
+<pre><code class="language-toml">[agents.anthropic-pi]
+harness = &quot;pi&quot;
+model = &quot;claude-opus-5&quot;
+endpoint = &quot;https://api.anthropic.com&quot;
+</code></pre>
+</li>
+<li><p><strong>OpenAI</strong> — a profile pointed at <code>api.openai.com</code> runs Pi&#39;s OpenAI provider
+instead, over the OpenAI wire:</p>
+<pre><code class="language-toml">[agents.openai-pi]
+harness = &quot;pi&quot;
+model = &quot;gpt-5.2&quot;
+endpoint = &quot;https://api.openai.com&quot;
+</code></pre>
+<p>The key comes from <code>lazy auth set openai</code> (or <code>OPENAI_API_KEY</code> in the
+daemon&#39;s environment), and the turn is proxied and audited exactly like an
+Anthropic one.</p>
+</li>
+<li><p><strong>OpenRouter</strong> — a profile pointed at <code>openrouter.ai</code> runs the same OpenAI
+provider against OpenRouter, billed to <code>lazy auth set openrouter</code> (or
+<code>OPENROUTER_API_KEY</code>). OpenRouter&#39;s model ids are used as they are, slash
+and all:</p>
+<pre><code class="language-toml">[agents.openrouter-pi]
+harness = &quot;pi&quot;
+model = &quot;anthropic/claude-sonnet-4.5&quot;
+endpoint = &quot;https://openrouter.ai/api&quot;
+</code></pre>
+</li>
+</ul>
+<p>Those two wires are all Pi speaks under lazy, and the endpoint&#39;s hostname
+decides which one a profile gets: <code>api.openai.com</code> and <code>openrouter.ai</code> put Pi
+on the OpenAI wire, any other host on the Anthropic one. So a self-hosted
+gateway, or any host lazy does not know by name, runs Pi&#39;s Anthropic-wire
+provider — point such a profile at the upstream&#39;s Anthropic-compatible path. A
+gateway that speaks only the OpenAI API is not reachable from Pi today. There
+is no Pi-specific model syntax: models and upstreams are chosen through lazy&#39;s
+normal configuration, never per prompt. On an Anthropic profile a model name
+carrying a Pi provider prefix (<code>openai/gpt-4o</code>) is rejected, because it is not
+an Anthropic model.</p>
+<p>A profile with an explicit <code>endpoint</code> runs under a custom Pi provider, which
+only offers the models it declares — so such a profile is required to set
+<code>model</code>, and config load rejects it otherwise. A task-level model override still
+works: lazy declares both the profile&#39;s model and the turn&#39;s own on every turn.</p>
+<p>Lazy pins Pi&#39;s provider endpoints to the proxy on every turn (via Pi&#39;s own
+<code>models.json</code> override mechanism, written into the task&#39;s sandbox home), so a
+Pi task cannot dial a model provider directly.</p>
+<p><strong>A Pi profile pointed at a hosted provider bills the same credential Claude
+Code turns do</strong>, including a Claude subscription token: lazy presents it to the
+upstream in the full form that kind of credential requires, so such a Pi task is
+not treated as some other kind of traffic. The default local profile bills
+nothing — a local model server takes no key, and lazy does not send it one.</p>
+<p><strong>If you already had a Pi profile that omitted <code>endpoint</code>, it moved with the
+default.</strong> A block like <code>[agents.my-pi] harness = &quot;pi&quot;, model = &quot;claude-opus-5&quot;</code>
+used to mean Anthropic and now means the local Ollama, which does not have that
+model. Lazy warns at startup when a profile pairs a harness default upstream
+with a recognizably Anthropic model, naming the profile and the
+<code>endpoint = &quot;https://api.anthropic.com&quot;</code> line that puts it back. It warns rather
+than refuses: only you can say which service you meant.</p>
+<p><strong>If the model and the profile disagree, the turn stops instead of retrying.</strong>
+Giving a task a model its profile&#39;s upstream does not have — an Anthropic model
+name on a profile pointed at Ollama, or a model you never pulled — gets a <code>404</code>
+from that upstream. Lazy reports it as a configuration failure naming both
+halves, and the traffic view (<code>lazy net</code>) carries a line saying which upstream
+has no such model. The fix is either a model that upstream serves, or a profile
+whose <code>endpoint</code> points at the server that has it.</p>
+<p><strong>A slow local model is allowed to be slow.</strong> A large model that is still
+loading, queued behind other sessions on the same GPU, or prefilling a very
+large prompt can take minutes before it emits its first byte, and lazy waits:
+the proxy&#39;s ceiling is half an hour by default, and it keeps the connection to
+the agent alive while the model thinks. If your upstream legitimately needs
+longer, raise <code>[proxy] upstream_timeout</code> (seconds; <code>0</code> waits indefinitely). When
+the proxy does give up it says so in those words — naming the upstream, the
+ceiling that fired and the setting that changes it — rather than reporting a
+network failure. Pi itself gets the same grace on the client side: lazy raises
+Pi&#39;s own request idle timeout (five minutes by default) to sit above the proxy&#39;s
+ceiling with an extra minute of headroom, so the client cannot give up before
+the proxy does. Raising <code>[proxy] upstream_timeout</code> moves both together.</p>
+<h2 id="pi-on-a-managed-installation"><a class="anchor" href="#pi-on-a-managed-installation" aria-hidden="true">#</a>Pi on a managed installation</h2>
+<p>On an installation that <a href="../managed-config/">manages configuration for you</a> —
+Lazy Teams is one — a repository is not allowed to choose an agent profile&#39;s
+<code>endpoint</code>, because that endpoint receives the installation&#39;s model credential.
+Every example on this page that sets <code>endpoint</code> is therefore something to keep
+out of a managed project&#39;s <code>lazy.toml</code>: committing one does not just fail to
+take effect, it stops the project loading at all, with <code>managed config refused</code>
+naming the key.</p>
+<p>That leaves the built-in <code>pi</code> profile and its local Ollama, so Pi runs there
+only if whoever operates the installation runs an Ollama the project&#39;s daemon
+can reach. If they do not, <strong>creating</strong> a Pi task is refused — not just starting
+one — so you are told before you have a task that nothing will run, and the
+message points at the operator rather than at your <code>lazy.toml</code>. Pick an agent
+the installation does provide, or ask them for a model server.</p>
+<p>The create-time refusal is deliberately narrow. It applies only where
+configuration is managed for you, and only when the upstream actively refuses
+the connection: if the probe is merely slow or cannot answer, the task is
+created and the launch check remains the backstop, as it has always been. On
+your own machine nothing is refused at create time at all — an Ollama you have
+not started yet is a normal thing to create a task against.</p>
+<h2 id="thinking-effort"><a class="anchor" href="#thinking-effort" aria-hidden="true">#</a>Thinking effort</h2>
+<p>A task&#39;s effort (<code>lazy create --effort high</code>, or <code>[agent] effort</code> in
+lazy.toml) sets how hard a Pi turn thinks: lazy&#39;s <code>low</code>, <code>medium</code>, <code>high</code>,
+<code>xhigh</code> and <code>max</code> are passed to Pi as its own thinking levels, and lazy declares
+the model as reasoning-capable so the level actually applies rather than being
+dropped.</p>
+<p>What the top two levels do depends on the upstream, because Pi maps its levels
+onto each provider&#39;s own controls: on an Anthropic-wire upstream (Anthropic, a
+local or hosted Ollama, a gateway) <code>xhigh</code> and <code>max</code> arrive as themselves, while
+on an OpenAI or OpenRouter profile — where the provider&#39;s scale stops one step
+lower — a <code>max</code> task runs at <code>xhigh</code>. A model that cannot reason at all simply
+answers without thinking; on a legacy OpenAI model that rejects the reasoning
+parameter outright, the turn fails with that provider&#39;s error, and the fix is a
+model that supports reasoning.</p>
+<p>Lazy also raises the output-token ceiling it declares for Anthropic-wire Pi
+profiles, because on that wire thinking is funded out of the same budget as the
+answer — without the headroom, a high-effort turn can spend nearly all of it
+thinking and get cut off mid-answer.</p>
+<p>Pi turns run with its own startup network activity disabled (<code>PI_OFFLINE</code>,
+<code>PI_SKIP_VERSION_CHECK</code>, <code>PI_TELEMETRY</code>): no update check, no model-catalog
+refresh, no telemetry, so nothing leaves the task container outside lazy&#39;s
+proxy. This is not an offline model: the turn&#39;s model traffic is unaffected and
+goes to the profile&#39;s upstream through the proxy as usual.</p>
+<h2 id="credentials"><a class="anchor" href="#credentials" aria-hidden="true">#</a>Credentials</h2>
+<p>Pi has no API key of its own. Its turns run on the same credentials lazy
+already manages:</p>
+<ul>
+<li>Anthropic — <code>lazy auth set anthropic</code> (or the environment the daemon runs in),</li>
+<li>hosted Ollama — <code>lazy auth set ollama</code>; local Ollama needs no credential,</li>
+<li>OpenAI — <code>lazy auth set openai</code>; OpenRouter — <code>lazy auth set openrouter</code>
+(inferred from the profile&#39;s endpoint, or named by its <code>credential</code> key).</li>
+</ul>
+<p><code>lazy system agent set-key pi</code> is refused by design — there is nothing
+pi-specific to store. As with every agent, the task container only ever holds
+a per-launch placeholder; real credentials stay with the daemon and are
+attached per request at the proxy.</p>
+<h2 id="lazy-tools"><a class="anchor" href="#lazy-tools" aria-hidden="true">#</a>Lazy tools</h2>
+<p>Pi has no built-in MCP support. Lazy bridges its tool server into Pi with a
+small Pi extension written into the task&#39;s sandbox home on every turn, so a Pi
+task gets the full <code>lazy_*</code> tool set (read-only on <code>lazy ask</code> turns), with the
+same per-task scoping as other agents.</p>
+<h2 id="read-only-turns"><a class="anchor" href="#read-only-turns" aria-hidden="true">#</a>Read-only turns</h2>
+<p>Pi has no plan mode and no permission prompts. On <code>lazy ask</code> (and other
+read-only turns) lazy disables Pi&#39;s write-capable built-in tools (<code>bash</code>,
+<code>edit</code>, <code>write</code>) and the lazy tool server withholds its write tools, so the
+agent can read code and task state but not change anything.</p>
+<h2 id="project-trust"><a class="anchor" href="#project-trust" aria-hidden="true">#</a>Project trust</h2>
+<p>Pi can load extensions, skills, and system-prompt overrides from a <code>.pi/</code>
+directory inside a repository. Lazy always launches Pi with that loading
+disabled (<code>--no-approve</code>): a task branch is agent-writable, and a checked-in
+<code>.pi/extensions/</code> must never execute on checkout. <code>AGENTS.md</code> context files
+still load normally.</p>
+<h2 id="sessions-and-pairing"><a class="anchor" href="#sessions-and-pairing" aria-hidden="true">#</a>Sessions and pairing</h2>
+<p>Pi sessions persist in the task&#39;s sandbox and resume across turns. When a turn
+dies partway — a crash, a watchdog kill, a model error — the session id it was
+using is kept, so the resumed turn (automatic or <code>lazy unblock</code>) continues that
+same conversation with its history instead of re-sending the prompt from
+scratch. <code>lazy pair</code>
+on a Pi task launches Pi interactively inside the task container, resuming the
+task&#39;s session with its history when it has one (otherwise a fresh session
+starts, and pairing says which). When the session ends, every session file it
+wrote is captured into lazy&#39;s conversation store — searchable with
+<code>lazy search</code> — and the end-of-session AI summary is synthesized from that
+transcript, the same as for Claude Code. This holds for any profile whose
+harness is Pi, not only the built-in <code>pi</code> profile. See
+<a href="../pairing/#pi-pairing">Pairing</a> for the details.</p>
+<h2 id="container-image"><a class="anchor" href="#container-image" aria-hidden="true">#</a>Container image</h2>
+<p>The default lazy runner image family gets Pi installed automatically when a
+project&#39;s agent is <code>pi</code> (a <code>lazy-runner-pi</code> image is built from the default
+Dockerfile plus Pi&#39;s install). Projects with a custom <code>Dockerfile.lazy</code> add
+Pi&#39;s install line themselves — <code>lazy</code> prints it when the image is missing the
+binary. The install is pinned to a specific Pi version that lazy&#39;s
+integration was verified against.</p>
+
+</main>
+</body>
+</html>

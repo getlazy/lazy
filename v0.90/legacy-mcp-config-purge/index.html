@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Leaked pre-v0.20 MCP configs, and the token rotation that closes them — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="leaked-pre-v020-mcp-configs-and-the-token-rotation-that-closes-them"><a class="anchor" href="#leaked-pre-v020-mcp-configs-and-the-token-rotation-that-closes-them" aria-hidden="true">#</a>Leaked pre-v0.20 MCP configs, and the token rotation that closes them</h1>
+<p>If your project was created before lazy v0.20, <code>lazy upgrade</code> may tell you:</p>
+<pre><code>Removed 820 leaked pre-v0.20 MCP config(s) from /path/to/repo/.lazy/tmp
+  (each contained the shared daemon token and was readable by every agent).
+  Rotated the shared daemon token — the leaked one no longer works.
+</code></pre>
+<p>This page explains what those files were, why they mattered, and why the
+rotation is safe.</p>
+<h2 id="what-leaked"><a class="anchor" href="#what-leaked" aria-hidden="true">#</a>What leaked</h2>
+<p>Before v0.20, every agent launch wrote its MCP config to
+<code>&lt;project&gt;/.lazy/tmp/daemon-mcp-&lt;name&gt;.json</code> — inside the repository, at the
+default <code>0644</code>, containing the <strong>shared daemon bearer token</strong>.</p>
+<p>Three facts turned that into a live problem rather than clutter:</p>
+<ul>
+<li>the shared token is reused across daemon restarts and never rotates on its own;</li>
+<li>every task container bind-mounts the whole repository read-only, so every agent
+that has ever run could read every one of those files;</li>
+<li>the daemon&#39;s <code>/rpc/*</code> routes accept <code>Bearer &lt;shared token&gt;</code>.</li>
+</ul>
+<p>So any agent could lift the token out of the repo and call <code>/rpc/acceptTask</code>,
+<code>/rpc/closeTask</code> and the rest <strong>as the daemon</strong> — bypassing the ownership gates
+that stop an agent acting on tasks that are not its own.</p>
+<p>v0.20 moved new configs to the daemon state dir
+(<code>~/.lazy/daemon/&lt;slug&gt;/mcp/</code>), which is deliberately never mounted into an
+agent. It did not remove the files already sitting in the repo. That is what the
+purge does.</p>
+<h2 id="what-the-purge-touches"><a class="anchor" href="#what-the-purge-touches" aria-hidden="true">#</a>What the purge touches</h2>
+<p>Only <code>&lt;project&gt;/.lazy/tmp/daemon-mcp-*.json</code> — the historical in-repo path.</p>
+<p>It never touches <code>~/.lazy/daemon/&lt;slug&gt;/mcp/</code>. Those are the live per-identity
+configs, bind-mounted into running containers; deleting one takes an agent&#39;s
+tools away mid-turn.</p>
+<p>Files in <code>.lazy/tmp</code> that do not match that name are left alone.</p>
+<p>The purge is idempotent: a project with nothing to clean removes nothing,
+rotates nothing, and prints nothing.</p>
+<h2 id="why-the-token-is-rotated-too"><a class="anchor" href="#why-the-token-is-rotated-too" aria-hidden="true">#</a>Why the token is rotated too</h2>
+<p>Deleting the files does not un-leak a credential that every agent has been able
+to read for months. Any agent that copied it still holds a working key, so the
+token itself has to be replaced. The rotation happens only on an upgrade that
+actually removed leaked files — a project that never leaked keeps its token.</p>
+<p>If some files could not be deleted, the token is <strong>not</strong> rotated and the upgrade
+says so: rotating while readable copies remain would claim a fix that was not
+made.</p>
+<h2 id="why-nothing-is-stranded-by-the-rotation"><a class="anchor" href="#why-nothing-is-stranded-by-the-rotation" aria-hidden="true">#</a>Why nothing is stranded by the rotation</h2>
+<p>Chat, pair, builder and running agents all keep working. Who holds the shared
+token, and what happens to each:</p>
+<table>
+<thead>
+<tr>
+<th>Holder</th>
+<th>Effect of rotation</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Host CLI clients (<code>lazy …</code>, the builder&#39;s host side)</td>
+<td>Heal automatically — the client re-reads the token file on a 401 and retries.</td>
+</tr>
+<tr>
+<td>Task and builder <strong>agents</strong></td>
+<td>Unaffected. Their <code>lazy_*</code> tools go to <code>/mcp/*</code>, which authenticates against the per-identity token registry (<code>~/.lazy/daemon/&lt;slug&gt;/mcp-tokens.json</code>) and refuses the shared token outright.</td>
+</tr>
+<tr>
+<td>A process <strong>inside a container</strong> holding the shared token</td>
+<td>Cannot re-read a host-side file — the one class that could be stranded.</td>
+</tr>
+</tbody></table>
+<p>The last row is why the purge runs where it does: after <code>lazy upgrade</code> has
+stopped every task and builder container and the old daemon has exited, and
+before the new daemon starts and adopts a token. In that window the un-healable
+class is empty by construction. Rotating any earlier would 401 the upgrade&#39;s own
+shutdown call.</p>
+<h2 id="seeing-it-before-it-happens"><a class="anchor" href="#seeing-it-before-it-happens" aria-hidden="true">#</a>Seeing it before it happens</h2>
+<p><code>lazy upgrade --dry-run</code> names the count and the rotation without changing
+anything.</p>
+
+</main>
+</body>
+</html>

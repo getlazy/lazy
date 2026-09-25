@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Proxy request plugins — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="proxy-request-plugins"><a class="anchor" href="#proxy-request-plugins" aria-hidden="true">#</a>Proxy request plugins</h1>
+<p>Lazy runs a local Anthropic-native passthrough proxy that every agent&#39;s model
+traffic flows through. A <strong>request plugin</strong> receives the parsed JSON body of each
+outbound request just before it is forwarded upstream, and may return a
+replacement body.</p>
+<p>Lazy ships the <strong>seam</strong>, not plugins. There is no built-in plugin and nothing to
+turn off: a project extends the proxy by dropping a module into
+<code>.lazy/plugins/</code>, and a project that does not is byte-for-byte identical to a
+build without the seam.</p>
+<h2 id="installing-a-plugin"><a class="anchor" href="#installing-a-plugin" aria-hidden="true">#</a>Installing a plugin</h2>
+<p>Presence is the enable switch. There is no <code>lazy.toml</code> key.</p>
+<pre><code>&lt;project&gt;/.lazy/plugins/
+  10-redact-secrets.ts
+  20-tag-system.ts
+</code></pre>
+<ul>
+<li>Every <code>.ts</code> / <code>.mts</code> / <code>.js</code> / <code>.mjs</code> module in that directory is loaded, in
+<strong>sorted-filename order</strong>. The chain is a fold: each plugin sees the previous
+one&#39;s output, so a numeric prefix gives an explicit, reviewable order.</li>
+<li>Dotfiles, <code>_</code>-prefixed files (shared helpers), <code>*.d.ts</code> and <code>*.test.*</code> /
+<code>*.spec.*</code> are <strong>not</strong> loaded — so a plugin&#39;s test can live right next to it.</li>
+<li><code>.lazy/</code> is deliberately not gitignored. Commit your plugins and the whole team
+gets them.</li>
+<li>Plugins are loaded <strong>once per daemon process</strong>. After editing one, run
+<code>lazy daemon restart</code>.</li>
+</ul>
+<p>Scaffold one with:</p>
+<pre><code class="language-bash">lazy customize proxy-plugin redact-secrets
+</code></pre>
+<p>That writes a working no-op plugin plus a smoke test into <code>.lazy/plugins/</code>, and
+prints a guide prompt you can hand to your own agent to develop it further.</p>
+<h2 id="the-module-shape"><a class="anchor" href="#the-module-shape" aria-hidden="true">#</a>The module shape</h2>
+<p>The default export is either the plugin object:</p>
+<pre><code class="language-ts">// .lazy/plugins/tag-system.ts
+export default {
+  name: &#39;tag-system&#39;,
+  transformRequest(body, ctx) {
+    const b = body as { system?: unknown };
+    if (typeof b.system !== &#39;string&#39;) return null;   // null = no change
+    return { ...(body as object), system: `[tagged] ${b.system}` };
+  },
+};
+</code></pre>
+<p>…or a zero-argument factory returning one, useful when the plugin needs to
+precompute something at load time:</p>
+<pre><code class="language-ts">export default () =&gt; {
+  const table = buildTable();          // runs ONCE, at daemon startup
+  return { name: &#39;my-plugin&#39;, transformRequest: (body) =&gt; rewrite(body, table) };
+};
+</code></pre>
+<p><code>ctx</code> carries read-only request facts: <code>method</code>, <code>path</code>, and <code>endpoint</code>
+(<code>&quot;messages&quot;</code>, <code>&quot;count_tokens&quot;</code> or <code>&quot;other&quot;</code>).</p>
+<h2 id="the-contract"><a class="anchor" href="#the-contract" aria-hidden="true">#</a>The contract</h2>
+<ol>
+<li><strong>Pure, synchronous, deterministic.</strong> Same body in, same body out. No I/O, no
+clock, no random, no state carried between calls. This is not style: the
+upstream caches on the request prefix, so a transform that varies between
+turns invalidates that cache on every single request and costs more than any
+transform is likely to save. A pure transform invalidates it exactly once.</li>
+<li><strong>Never mutate <code>body</code> in place.</strong> Build and return a new object.</li>
+<li><strong>Return <code>null</code> when there is nothing to do.</strong> That is the cheap path, and it
+is what keeps requests you do not care about forwarded byte-for-byte — the
+proxy only re-serialises when a plugin actually changed something.</li>
+<li><strong>Treat <code>messages</code>, <code>tools[].input_schema</code>, <code>cache_control</code>, <code>model</code>,
+<code>max_tokens</code>, <code>stream</code>, <code>tool_choice</code>, <code>metadata</code> and non-text content blocks
+as off limits</strong> unless changing them is the explicit point of your plugin.
+<code>messages</code> is the conversation transcript; rewriting it falsifies the record
+the model itself produced and moves the cached prefix every turn.</li>
+</ol>
+<h2 id="failure-posture-loud-at-load-open-at-run"><a class="anchor" href="#failure-posture-loud-at-load-open-at-run" aria-hidden="true">#</a>Failure posture: loud at load, open at run</h2>
+<p>The two halves are deliberately different.</p>
+<p><strong>Load time fails loud.</strong> A file that will not import, does not default-export
+the expected shape, has no <code>name</code>, has no <code>transformRequest</code>, or duplicates
+another plugin&#39;s name aborts the daemon&#39;s proxy startup with an error naming the
+file — the same posture as a malformed <code>lazy.toml</code>. You wrote that file on
+purpose; a proxy that comes up healthy while your transform silently never runs
+is the worst possible outcome.</p>
+<p><strong>Run time fails open.</strong> Once loaded, a plugin that throws on a request is logged
+and skipped, and the original body is forwarded unmodified. The proxy is on every
+agent&#39;s critical path, so a buggy transform degrades to passthrough, never to a
+failed request.</p>
+<p>When any plugins are loaded, the daemon announces them at startup by name and in
+chain order. A transform rewriting outbound requests is never silently active.</p>
+<h2 id="trust-and-scope"><a class="anchor" href="#trust-and-scope" aria-hidden="true">#</a>Trust and scope</h2>
+<p>Plugin code runs <strong>inside the lazy daemon process, on the host, with the daemon&#39;s
+privileges. It is not sandboxed.</strong> Installing a plugin is exactly as much of a
+trust decision as running any other code from the repository — review it as such,
+and keep it small enough to read in one sitting.</p>
+<p>Plugins are loaded from the <strong>main project checkout only</strong>, never from a task
+worktree. A worktree is agent output; a plugin appearing there would let one task
+agent rewrite every other agent&#39;s outbound requests.</p>
+<h2 id="measure-before-you-keep-one"><a class="anchor" href="#measure-before-you-keep-one" aria-hidden="true">#</a>Measure before you keep one</h2>
+<p>A transform that sounds like it should help, sitting on every agent&#39;s critical
+path, is a liability until it is measured. <code>lazy stats audit</code> and
+<code>lazy stats tokens</code> show the real effect on real traffic. A transform that saves
+tokens can still cost more than it saves — for example by invalidating the
+upstream&#39;s prompt cache — so keep only what the numbers support.</p>
+
+</main>
+</body>
+</html>

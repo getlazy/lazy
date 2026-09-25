@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lazy documentation — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href=".">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1>lazy documentation</h1>
+<p>Every page of lazy's documentation. This is <strong>v0.90</strong>.</p>
+<ul class="pages">
+<li><a href="./accept-check/">The accept check</a><span class="path">accept-check</span></li>
+<li><a href="./agent-container/">The agent container</a><span class="path">agent-container</span></li>
+<li><a href="./artifacts/">Task artifacts</a><span class="path">artifacts</span></li>
+<li><a href="./builder-scratch-dir/">Builder scratch dir</a><span class="path">builder-scratch-dir</span></li>
+<li><a href="./cluster-tasks/">Cluster tasks</a><span class="path">cluster-tasks</span></li>
+<li><a href="./comparing-runs/">Comparing runs: lazy clone --same-base</a><span class="path">comparing-runs</span></li>
+<li><a href="./conversation-import/">Importing Claude Code conversations</a><span class="path">conversation-import</span></li>
+<li><a href="./credentials/">Credentials</a><span class="path">credentials</span></li>
+<li><a href="./deploying-lazy-teams-digitalocean/">Deploying Lazy Teams on DigitalOcean with Kamal</a><span class="path">deploying-lazy-teams-digitalocean</span></li>
+<li><a href="./getting-started/">Getting started: your first task</a><span class="path">getting-started</span></li>
+<li><a href="./host-boundary-guard/">The host file-tool boundary guard</a><span class="path">host-boundary-guard</span></li>
+<li><a href="./identity/">Who lazy says did it</a><span class="path">identity</span></li>
+<li><a href="./lazy-agent-design/">lazy-agent Design</a><span class="path">lazy-agent-design</span></li>
+<li><a href="./lazy-md/">LAZY.md — instructions for agents running lazy tasks</a><span class="path">lazy-md</span></li>
+<li><a href="./lazy-report-example-20260523/">Lazy activity report</a><span class="path">lazy-report-example-20260523</span></li>
+<li><a href="./lazy-teams-agents/">Agents in Lazy Teams</a><span class="path">lazy-teams-agents</span></li>
+<li><a href="./lazy-teams-setup/">Lazy Teams first-run setup</a><span class="path">lazy-teams-setup</span></li>
+<li><a href="./lazy-teams-task-review/">Reviewing tasks in Lazy Teams</a><span class="path">lazy-teams-task-review</span></li>
+<li><a href="./lazy-toml/">lazy.toml Configuration Reference</a><span class="path">lazy-toml</span></li>
+<li><a href="./legacy-mcp-config-purge/">Leaked pre-v0.20 MCP configs, and the token rotation that closes them</a><span class="path">legacy-mcp-config-purge</span></li>
+<li><a href="./lfs-guard/">The git LFS guard</a><span class="path">lfs-guard</span></li>
+<li><a href="./link/">lazy link — adopt a pull request or branch as a task</a><span class="path">link</span></li>
+<li><a href="./low-high-loop/">The low-high loop</a><span class="path">low-high-loop</span></li>
+<li><a href="./managed-config/">Managed mode: which parts of lazy.toml a shared host honours</a><span class="path">managed-config</span></li>
+<li><a href="./memory/">Shared memory</a><span class="path">memory</span></li>
+<li><a href="./pairing/">Pairing</a><span class="path">pairing</span></li>
+<li><a href="./pi-agent/">Running tasks with the Pi coding agent</a><span class="path">pi-agent</span></li>
+<li><a href="./playground/">The playground</a><span class="path">playground</span></li>
+<li><a href="./protected-branches/">Protected branches and human approvals</a><span class="path">protected-branches</span></li>
+<li><a href="./proxy-jit-credentials/">Just-in-time credential injection</a><span class="path">proxy-jit-credentials</span></li>
+<li><a href="./proxy-plugins/">Proxy request plugins</a><span class="path">proxy-plugins</span></li>
+<li><a href="./raised-items/">Raised items</a><span class="path">raised-items</span></li>
+<li><a href="./resurrection-guard/">The deleted-file resurrection guard</a><span class="path">resurrection-guard</span></li>
+<li><a href="./review/">lazy review — agent review of a task&amp;#39;s work</a><span class="path">review</span></li>
+<li><a href="./review-paradigm/">The review paradigm — what lazy does by default, and why</a><span class="path">review-paradigm</span></li>
+<li><a href="./review-regions/">Review regions</a><span class="path">review-regions</span></li>
+<li><a href="./search/">Searching tasks</a><span class="path">search</span></li>
+<li><a href="./self-hosting-lazy-teams/">Self-hosting Lazy Teams</a><span class="path">self-hosting-lazy-teams</span></li>
+<li><a href="./serve-ports/">Reaching a task&amp;#39;s dev server</a><span class="path">serve-ports</span></li>
+<li><a href="./slack-rooms/">Lazy Teams Slack rooms</a><span class="path">slack-rooms</span></li>
+<li><a href="./state-machine/">Task State Machine and Crash Recovery</a><span class="path">state-machine</span></li>
+<li><a href="./surface-asymmetries/">Surface asymmetries: CLI vs MCP</a><span class="path">surface-asymmetries</span></li>
+<li><a href="./system-messages/">System messages</a><span class="path">system-messages</span></li>
+<li><a href="./task-env/">Per-task environment variables</a><span class="path">task-env</span></li>
+<li><a href="./teams-bound-clone-agents/">Claude Code against a Lazy Teams project</a><span class="path">teams-bound-clone-agents</span></li>
+<li><a href="./teams-login/">Logging a machine in to Lazy Teams</a><span class="path">teams-login</span></li>
+<li><a href="./troubleshooting/">Troubleshooting</a><span class="path">troubleshooting</span></li>
+<li><a href="./turn-reports/">Structured turn reports</a><span class="path">turn-reports</span></li>
+<li><a href="./upgrade-image-rebuild/">How lazy upgrade rebuilds the container image</a><span class="path">upgrade-image-rebuild</span></li>
+<li><a href="./web-review/">Web review surface</a><span class="path">web-review</span></li>
+<li><a href="./web-shell/">Web shell</a><span class="path">web-shell</span></li>
+</ul>
+</main>
+</body>
+</html>

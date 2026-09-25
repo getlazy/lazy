@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Self-hosting Lazy Teams — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="self-hosting-lazy-teams"><a class="anchor" href="#self-hosting-lazy-teams" aria-hidden="true">#</a>Self-hosting Lazy Teams</h1>
+<p>Lazy Teams is a web application your team runs on a server you control. This guide takes you from a fresh Linux machine to a running install where every project, and every agent turn it runs, gets its own microVM.</p>
+<h2 id="what-you-need"><a class="anchor" href="#what-you-need" aria-hidden="true">#</a>What you need</h2>
+<ul>
+<li>A Linux server with <strong>Docker Engine</strong> and <strong>Docker Compose v2</strong> (v2.24 or later) installed</li>
+<li><strong>Hardware virtualization (KVM)</strong>: a <code>/dev/kvm</code> device on the server. Bare-metal servers have it; many cloud VMs do not, because they do not offer nested virtualization. Without it the install still runs everything except agent turns — see <a href="#task-turns">Task turns</a></li>
+<li>At least <strong>4 GB RAM</strong> and <strong>20 GB disk</strong> (more if many projects or large repositories)</li>
+<li>For automatic HTTPS: a <strong>public DNS name</strong> pointing at the server, with ports <strong>80</strong> and <strong>443</strong> open</li>
+</ul>
+<p>You do <strong>not</strong> need Ruby, Bun, lazy, or a git checkout on the host — pull the published image and go.</p>
+<p>Running on a <strong>Mac</strong> instead? The published image cannot run agent turns there, because Docker Desktop does not pass hardware virtualization into containers. A route that runs Lazy Teams directly on the Mac, without Docker, exists but is not published yet.</p>
+<h2 id="quick-install-pull-and-go"><a class="anchor" href="#quick-install-pull-and-go" aria-hidden="true">#</a>Quick install (pull-and-go)</h2>
+<p>Copy the deploy bundle from a <a href="https://github.com/getlazy/lazy/releases" rel="noopener noreferrer">lazy release</a> (the <code>lazy-teams/deploy/</code> directory) onto your server, or clone the repository if you prefer.</p>
+<pre><code class="language-bash">cd lazy-teams/deploy
+./bootstrap.sh
+docker compose pull
+docker compose up -d
+</code></pre>
+<p><code>bootstrap.sh</code> writes a <code>.env</code> file with generated secrets. Edit <code>.env</code> and set <code>APP_HOST</code> to the hostname people will use in the browser before enabling TLS.</p>
+<p><code>bootstrap.sh</code> also checks for <code>/dev/kvm</code>. If the server has none, it adds a <code>COMPOSE_FILE</code> line to <code>.env</code> so that <code>docker compose</code> starts the install without microVMs, and says so. See <a href="#task-turns">Task turns</a> for what that means and how to undo it once the server has KVM.</p>
+<p>Use <code>docker-compose</code> instead of <code>docker compose</code> if your host has the standalone binary but not the Compose plugin — <code>bootstrap.sh</code> accepts either.</p>
+<p>The default image is <code>ghcr.io/getlazy/lazy-teams:latest</code>. Pin a specific release in <code>.env</code>, replacing <code>&lt;release-tag&gt;</code> with the tag of the release you are installing (for example <code>v0.23.1234</code>, as listed on the <a href="https://github.com/getlazy/lazy/releases" rel="noopener noreferrer">releases page</a>):</p>
+<pre><code>LAZY_TEAMS_TAG=&lt;release-tag&gt;
+</code></pre>
+<p>Open <code>http://localhost:3000/</code> (or the port in <code>APP_DIRECT_PORT</code>). The in-browser setup flow walks you through creating the first administrator account, naming your installation, and inviting teammates. <strong>This guide stops where the browser takes over</strong> — you do not need a shell account to finish onboarding.</p>
+<h3 id="first-boot-takes-a-minute-or-two"><a class="anchor" href="#first-boot-takes-a-minute-or-two" aria-hidden="true">#</a>First boot takes a minute or two</h3>
+<p>The container prepares its database and starts the web app. Watch progress with:</p>
+<pre><code class="language-bash">docker compose logs -f app
+</code></pre>
+<h2 id="the-direct-port-is-local-only"><a class="anchor" href="#the-direct-port-is-local-only" aria-hidden="true">#</a>The direct port is local-only</h2>
+<p>The port in <code>APP_DIRECT_PORT</code> is published on the loopback interface, so it is reachable from the server itself and nowhere else. It carries plain HTTP: the session cookie that identifies an administrator crosses it in the clear, and published on every interface it would put the whole application, unencrypted, on whatever network the server sits on.</p>
+<p>To use it from your laptop, forward it over SSH rather than opening it up:</p>
+<pre><code class="language-bash">ssh -L 3000:127.0.0.1:3000 you@your-server
+</code></pre>
+<p>For a permanent install, put HTTPS in front instead — either option below. If you have your own edge that already terminates TLS and needs to reach the container directly, set <code>APP_DIRECT_BIND=0.0.0.0</code> in <code>.env</code> deliberately, and firewall the port.</p>
+<h2 id="automatic-https"><a class="anchor" href="#automatic-https" aria-hidden="true">#</a>Automatic HTTPS</h2>
+<p>When your server has a real public hostname:</p>
+<ol>
+<li>Set <code>APP_HOST=teams.example.com</code> in <code>.env</code></li>
+<li>Set <code>FORCE_SSL=true</code> in <code>.env</code> (<code>bootstrap.sh</code> writes <code>false</code> for a <code>localhost</code> install)</li>
+<li>Optionally set <code>ACME_EMAIL</code> for Let&#39;s Encrypt expiry notices</li>
+<li>Start with the TLS profile:</li>
+</ol>
+<pre><code class="language-bash">docker compose --profile tls up -d
+</code></pre>
+<p>Caddy obtains a certificate and proxies HTTPS to the application. Caddy reaches the app over the internal compose network, so the direct port stays local-only and needs no change.</p>
+<h2 id="behind-your-own-reverse-proxy"><a class="anchor" href="#behind-your-own-reverse-proxy" aria-hidden="true">#</a>Behind your own reverse proxy</h2>
+<p>If you already terminate TLS elsewhere (nginx, Traefik, Caddy of your own, a cloud load balancer, Tailscale serve, a Cloudflare Tunnel):</p>
+<ol>
+<li>Run without the <code>tls</code> profile: <code>docker compose up -d</code></li>
+<li>Proxy HTTPS to <code>http://127.0.0.1:3000</code> (or your <code>APP_DIRECT_PORT</code>) on the server</li>
+<li>Set <code>APP_HOST</code> to the public hostname, so links in emails are correct and the app answers to that name</li>
+<li>Leave <code>FORCE_SSL</code> at its default of <code>true</code></li>
+</ol>
+<p>Step 4 works whether or not your proxy sends an <code>X-Forwarded-Proto</code> header. Some terminators — Tailscale serve and Cloudflare Tunnel among them — do not, and an app that judged the scheme from that header alone would redirect such a request to HTTPS forever. This install treats traffic arriving on the direct port as already-encrypted, which is true when the only thing that can reach that port is your own proxy.</p>
+<h2 id="serving-over-plain-http"><a class="anchor" href="#serving-over-plain-http" aria-hidden="true">#</a>Serving over plain HTTP</h2>
+<p>An install on a trusted internal network with no TLS anywhere needs <code>FORCE_SSL=false</code> in <code>.env</code>. Without it, cookies are marked <code>secure</code> and browsers will not send them back over plain HTTP, so sign-in appears to silently fail.</p>
+<p>This also switches emailed links to <code>http://</code>. It is the right setting for a loopback quick start and for a lab network; it is the wrong setting for anything reachable from the internet, where it puts the administrator&#39;s session cookie on the wire in the clear.</p>
+<h2 id="which-hostnames-the-install-answers-to"><a class="anchor" href="#which-hostnames-the-install-answers-to" aria-hidden="true">#</a>Which hostnames the install answers to</h2>
+<p>The app answers requests for <code>APP_HOST</code>, <code>localhost</code> and <code>127.0.0.1</code>, and refuses everything else with <strong>Blocked host</strong>. This is what stops a request carrying a forged <code>Host</code> header from turning a password-reset email into a link to somebody else&#39;s server.</p>
+<p>Two consequences worth knowing before they surprise you:</p>
+<ul>
+<li>Change <code>APP_HOST</code> when you move the install to a new name, or it will refuse the new one.</li>
+<li>A second name, or a health check that arrives with an internal <code>Host</code> header, goes in <code>ALLOWED_HOSTS</code> as a comma-separated list. The health check at <code>/up</code> is exempt, so an uptime monitor hitting it by IP works without any configuration.</li>
+</ul>
+<h2 id="sign-in-and-git-rate-limits"><a class="anchor" href="#sign-in-and-git-rate-limits" aria-hidden="true">#</a>Sign-in and git rate limits</h2>
+<p>Repeated failed sign-ins from one address are refused for a few minutes, and so are repeated password-reset requests. The same applies to the git endpoints when you host repositories on the install — but there the count is of <strong>failed</strong> authentications, not requests, so ordinary <code>git clone</code>, <code>fetch</code> and <code>push</code> traffic is never throttled no matter how much of it there is.</p>
+<p>Nothing is configurable here, and nothing needs to be turned on.</p>
+<h2 id="outgoing-email-optional"><a class="anchor" href="#outgoing-email-optional" aria-hidden="true">#</a>Outgoing email (optional)</h2>
+<p>The install <strong>boots without SMTP</strong>. Password resets and invitations are created, but nothing is sent until you configure mail.</p>
+<p>Add to <code>.env</code> (see <code>.env.example</code> for the full list):</p>
+<pre><code>SMTP_ADDRESS=smtp.example.com
+SMTP_PORT=587
+SMTP_USER_NAME=lazy-teams@example.com
+SMTP_PASSWORD=…
+MAILER_FROM=no-reply@example.com
+</code></pre>
+<p>After restarting, an administrator can verify delivery from <strong>Settings → Email</strong> in god mode.</p>
+<h2 id="where-data-lives"><a class="anchor" href="#where-data-lives" aria-hidden="true">#</a>Where data lives</h2>
+<p>Two Docker volumes hold everything that must survive an upgrade. <strong>Back up both</strong> — losing either loses the install:</p>
+<table>
+<thead>
+<tr>
+<th>Volume</th>
+<th>Contents</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>lazy_teams_storage</code></td>
+<td>Rails database (teams, users, encrypted credentials)</td>
+</tr>
+<tr>
+<td><code>lazy_teams_fleet</code></td>
+<td>Per-project task stores, git clones, daemon state, and install-hosted bare repositories</td>
+</tr>
+</tbody></table>
+<p>Project task history lives in the fleet volume; team membership lives in the storage volume.</p>
+<h3 id="keeping-the-fleet-on-your-own-filesystem"><a class="anchor" href="#keeping-the-fleet-on-your-own-filesystem" aria-hidden="true">#</a>Keeping the fleet on your own filesystem</h3>
+<p>The fleet volume is a Docker named volume. On Docker Desktop that lives inside
+Docker&#39;s Linux VM: you cannot <code>ls</code> it, point a backup tool at it, or open a file
+in it without going through a container.</p>
+<p>Set <code>LAZY_FLEET_HOST_PATH</code> in <code>deploy/.env</code> to an absolute path on this machine
+and the whole fleet root lives there instead:</p>
+<pre><code>LAZY_FLEET_HOST_PATH=/Users/you/lazy-fleet
+</code></pre>
+<p>Create the directory first, then start the stack as usual. Everything the fleet
+owns — every project&#39;s task store, its clone, its daemon state — appears under
+that path. This is what makes the stores ordinary files you can back up, and it
+is required if you want to hand an existing store to the install (below).</p>
+<p>Unset, nothing changes: the install keeps using the named volume.</p>
+<p><strong>Do not move or re-create that directory while the install is running.</strong> A bind
+mount follows the <em>path</em>, not the directory that was there at startup, so
+replacing it swaps what the running containers see. Stop the stack, move the
+directory, point <code>LAZY_FLEET_HOST_PATH</code> at the new location, and start again.</p>
+<h2 id="adopting-an-existing-store"><a class="anchor" href="#adopting-an-existing-store" aria-hidden="true">#</a>Adopting an existing store</h2>
+<p>If you have been running lazy locally on a project — a daemon on your own
+machine, with its task history in a store directory — you can hand that history
+to a Lazy Teams install instead of starting over. Hundreds of tasks, their
+turns, their commits and their reviews come across intact.</p>
+<p><strong>This is a one-way move, done once.</strong> Afterwards Lazy Teams owns the daemon and
+the store. There is no syncing back, and no way to run both.</p>
+<h3 id="before-you-start"><a class="anchor" href="#before-you-start" aria-hidden="true">#</a>Before you start</h3>
+<ul>
+<li>The fleet root must be on this machine&#39;s filesystem —
+<code>LAZY_FLEET_HOST_PATH</code>, above. The adoption names a directory, and the install
+has to be able to reach it.</li>
+<li>Know where your store is. It is the directory named by <code>external_path</code> under
+<code>[storage]</code> in the project&#39;s <code>lazy.toml</code>; if there is no such key the store is
+<code>.lazy/</code> inside the checkout.</li>
+<li>Upgrade the install first if it is behind the lazy that wrote the store.
+Adoption refuses a store whose <strong>storage format</strong> is newer than the install
+understands, but that format changes rarely — so this check will not catch
+every version difference, and running the newer lazy is on you.</li>
+</ul>
+<h3 id="1-stop-the-local-daemon"><a class="anchor" href="#1-stop-the-local-daemon" aria-hidden="true">#</a>1. Stop the local daemon</h3>
+<p>On the machine that owns the store, in the project checkout:</p>
+<pre><code>lazy daemon stop
+</code></pre>
+<p>Then check nothing is holding it any more:</p>
+<pre><code>lazy system store-check ~/.lazy/my-project
+</code></pre>
+<p>That prints the store&#39;s task count, its schema version, whether anything holds
+its lock, and which people its rows name. <code>Lock: none</code> is what you are waiting
+for. It writes nothing and is safe to run against a store that is still in use —
+if a daemon is up it will say so, with the process id.</p>
+<h3 id="2-adopt-it"><a class="anchor" href="#2-adopt-it" aria-hidden="true">#</a>2. Adopt it</h3>
+<p>On the machine running Lazy Teams, from the deploy directory:</p>
+<pre><code>docker compose exec app bin/rails lazy:adopt_store \
+  TEAM=your-team NAME=&quot;My Project&quot; \
+  REPO_URL=https://github.com/you/my-project.git \
+  STORE=/var/lib/lazy-fleet/incoming/my-project \
+  DRY_RUN=1
+</code></pre>
+<p><code>STORE</code> is the path <strong>as the app container sees it</strong>. With
+<code>LAZY_FLEET_HOST_PATH=/Users/you/lazy-fleet</code>, a store you put at
+<code>/Users/you/lazy-fleet/incoming/my-project</code> on your Mac is
+<code>/var/lib/lazy-fleet/incoming/my-project</code> in the container. Copy or move your
+store under the fleet root first — it does not have to be there permanently, but
+the container can only see paths that are mounted into it.</p>
+<p><code>DRY_RUN=1</code> runs every check and changes nothing. Drop it to do the adoption:</p>
+<pre><code>docker compose exec app bin/rails lazy:adopt_store \
+  TEAM=your-team NAME=&quot;My Project&quot; \
+  REPO_URL=https://github.com/you/my-project.git \
+  STORE=/var/lib/lazy-fleet/incoming/my-project
+</code></pre>
+<p>The store is adopted <strong>where it is</strong> — nothing is copied and your directory is
+not rewritten. Add <code>COPY=1</code> to copy it into the fleet&#39;s own layout instead,
+leaving your original untouched. The output says which happened.</p>
+<h3 id="what-it-refuses-and-why"><a class="anchor" href="#what-it-refuses-and-why" aria-hidden="true">#</a>What it refuses, and why</h3>
+<table>
+<thead>
+<tr>
+<th>Refusal</th>
+<th>What to do</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>The store&#39;s lock is still held</td>
+<td>Something is serving that store right now. Stop the daemon on the machine that owns it (step 1). Adopting anyway would give one store two writers.</td>
+</tr>
+<tr>
+<td>The store&#39;s format is newer than this install understands</td>
+<td>Upgrade this install first. Older code reading a newer store drops what it does not understand, silently.</td>
+</tr>
+<tr>
+<td>The store still names people by old account numbers</td>
+<td>It was written before Lazy named people by email. Back it up, run the attribution rewrite the error prints, then adopt again.</td>
+</tr>
+<tr>
+<td>The store names people this install cannot identify</td>
+<td>Its rows were written by a different Lazy Teams install, whose account numbering is not this one&#39;s. Adopting would show one person&#39;s work under another person&#39;s name. Create the matching accounts first, or adopt into the install that wrote it.</td>
+</tr>
+</tbody></table>
+<p>A store from a personal, single-person install names nobody and passes the last
+check without anything to do.</p>
+<h3 id="3-verify-in-teams"><a class="anchor" href="#3-verify-in-teams" aria-hidden="true">#</a>3. Verify in Teams</h3>
+<p>Open the project in the web UI. The task list is your history: the same tasks,
+the same turns, the same reviews. If the project shows a start-up failure
+instead, the project page says what went wrong.</p>
+<h3 id="4-never-run-a-local-daemon-against-that-store-again"><a class="anchor" href="#4-never-run-a-local-daemon-against-that-store-again" aria-hidden="true">#</a>4. Never run a local daemon against that store again</h3>
+<p>This is the part with no undo. Two daemons writing one store corrupt it, and
+nothing warns you while it is happening. On the machine you moved it from:</p>
+<ul>
+<li><strong>before running any other <code>lazy</code> command in that checkout</strong>, move or rename
+the store directory the old <code>lazy.toml</code> points at. <code>lazy login</code> and
+<code>lazy logout</code> never start a local daemon, but until the checkout is bound,
+any other <code>lazy</code> command in it can start one against that path;</li>
+<li>only then bind the checkout with <code>lazy login</code> (below). A bound checkout never
+starts a local daemon.</li>
+</ul>
+<h3 id="working-on-the-project-afterwards"><a class="anchor" href="#working-on-the-project-afterwards" aria-hidden="true">#</a>Working on the project afterwards</h3>
+<p>Your checkout keeps working — it talks to Lazy Teams instead of a daemon on
+your machine. Bind it once, inside the checkout, and pick the adopted project
+when asked:</p>
+<pre><code>lazy login https://teams.example.com
+</code></pre>
+<p>The whole flow is in <a href="../teams-login/">logging a machine in</a>. From a bound
+clone:</p>
+<ul>
+<li><strong>The ordinary commands work</strong> — <code>lazy list</code>, <code>lazy show</code>, <code>lazy diff</code>,
+<code>lazy create</code>, <code>lazy start</code>, <code>lazy unblock</code>, <code>lazy accept</code> and the rest — run
+through the install, as you, exactly as if you had used the browser.</li>
+<li><strong><code>lazy builder</code> attaches to your builder on the server</strong>, next to the
+project. It is the same session the <strong>Builder</strong> page opens, and its
+conversation stays with the project.</li>
+<li><strong>A Claude Code you run yourself</strong> can use the project&#39;s <code>lazy_*</code> tools
+through the install, with fewer capabilities than the server-side builder —
+see <a href="../teams-bound-clone-agents/">Claude Code against a Lazy Teams project</a>.</li>
+</ul>
+<p>Some things are refused. Each refusal says why, and what to use instead where
+there is an alternative:</p>
+<ul>
+<li>commands that manage a local daemon — <code>lazy daemon start</code> / <code>stop</code> /
+<code>status</code>, <code>lazy init</code>, <code>lazy doctor</code>, <code>lazy dashboard</code> — because a bound
+clone has none. These refusals suggest <code>lazy logout</code> as the way back to
+working locally; <strong>in an adopted checkout, do not follow that suggestion</strong>;</li>
+<li>options that go beyond what the browser can do, or skip a check it enforces;</li>
+<li><code>lazy pair</code> and <code>lazy shell</code>: a task&#39;s container runs on the account of
+whoever started the task, so entering it in your name is not offered on a
+Teams install;</li>
+<li>a few tools only a server-side builder or the web UI can use.</li>
+</ul>
+<p>What does not change is the warning above: <strong>never run a local daemon against
+the adopted store.</strong> A bound clone never starts one. <code>lazy logout</code> returns a
+checkout to working locally — never do that in a checkout whose store you
+handed over.</p>
+<h2 id="hosting-repositories-on-the-install"><a class="anchor" href="#hosting-repositories-on-the-install" aria-hidden="true">#</a>Hosting repositories on the install</h2>
+<p>When you add a project, choose <strong>Host on this install</strong> instead of pasting a GitHub or GitLab URL. The install keeps a bare repository for that project and serves <code>git clone</code>, <code>fetch</code>, and <code>push</code> over HTTPS (smart HTTP) at a URL under your <code>APP_HOST</code>.</p>
+<p>Git prompts for credentials over HTTP Basic. Use any username git accepts and an
+<strong>API token that includes git access</strong> as the password. Tokens are scoped: git
+smart HTTP accepts only git-capable tokens, so a token minted for CLI or MCP
+access alone is refused even if it is otherwise valid.</p>
+<p>When you choose <strong>Host on this install</strong>, Lazy Teams provisions or reuses a
+git-scoped token for clone/push operations automatically. For manual
+<code>git clone</code>, <code>fetch</code>, or <code>push</code> from your own machine, create a token with git
+access from <strong>Account menu → API tokens</strong> in the web UI. Pick a label, enable
+<strong>Git</strong>, and copy the value when it is shown — it cannot be displayed again.
+Tokens created before scoping was introduced still include both git and CLI
+access until you rotate them.</p>
+<p>Every team member can clone and fetch; only team admins and owners can push.</p>
+<p>To connect a machine&#39;s command line to the install instead, use
+<a href="../teams-login/"><code>lazy login</code></a> — it mints a CLI-scoped token for you through a
+browser approval, so nothing is pasted.</p>
+<p>This path is for teams that want Lazy Teams to be the only shared server — no external forge required. External remotes (GitHub, GitLab, and so on) still work the same way when you register a project with their URL instead.</p>
+<h2 id="task-turns"><a class="anchor" href="#task-turns" aria-hidden="true">#</a>Task turns</h2>
+<p><strong>With hardware virtualization, each project gets its own microVM,</strong> and its agent turns run inside it. What has been confirmed on real hardware so far: a project provisioned and ran an agent turn in a microVM on an Apple Silicon Mac, and the microVM runtime passed its hardware checks on a Linux server with KVM, both with Lazy Teams running directly on the machine. <strong>Running it from inside the published container, as the compose install does, has not yet been confirmed on real hardware</strong> — <a href="#confirming-it-on-your-server">Confirming it on your server</a> below is how to check yours before you rely on it.</p>
+<p>Each project gets its own microVM, and its agent turns run inside it. A project&#39;s repository is cloned inside its VM and never touches your server&#39;s filesystem. The server shares only that project&#39;s task store with it. The VM carries its own Docker engine, so a task&#39;s agent container runs next to the project process that launched it, and no Docker socket is shared with anything.</p>
+<p>The compose install passes one device into the application container: <code>/dev/kvm</code>, which lets it create virtual machines and nothing more. It is not the Docker socket, no capability is added, and the container stays unprivileged. The application runs the microVM runtime as an ordinary user (uid 1000) in the device&#39;s group, which the container joins by itself unless that group id is already used by another group inside the image (see <a href="#run-it-as-an-unprivileged-user-in-the-kvm-group-never-as-root">below</a>). The runtime ships inside the image, fetched at build time from a pinned release and checked against a recorded checksum. The image each project boots defaults to <code>ghcr.io/getlazy/lazy-daemon</code> at the <strong>same version tag as the Lazy Teams image you run</strong>, so an application and its projects are always the same version of lazy.</p>
+<p>Everything else that runs an agent — generating a report, asking a question about a stored conversation, compacting memory, resolving a sync&#39;s merge conflicts — runs in the project&#39;s microVM too.</p>
+<h3 id="confirming-it-on-your-server"><a class="anchor" href="#confirming-it-on-your-server" aria-hidden="true">#</a>Confirming it on your server</h3>
+<p>Run these on the server, in the deploy directory, once setup&#39;s readiness step shows <strong>MicroVM host</strong>, <strong>MicroVM runtime</strong> and <strong>Project image</strong> passing.</p>
+<p><strong>1. The runtime&#39;s own checks, inside the application container, as the user the application runs as.</strong> This starts short-lived test microVMs, checks that a port inside one can be reached, that the project folder is shared into it correctly, and that the project image boots, then removes everything it created:</p>
+<pre><code class="language-bash">docker compose exec --user rails app sh -c &#39;LAZY_DAEMON_IMAGE=&quot;${LAZY_DAEMON_IMAGE:-ghcr.io/getlazy/lazy-daemon:$LAZY_TEAMS_VERSION}&quot; bin/smolvm-hardware-probe --stage 1,2,3&#39;
+</code></pre>
+<p>It takes a few minutes and ends with a summary of <code>RESULT &lt;name&gt; PASS|FAIL|INFO|SKIP -- &lt;detail&gt;</code> lines, plus the path of a report directory with a log per step. <strong>Every line should read <code>PASS</code></strong> (<code>INFO</code> and <code>SKIP</code> are informational). A <code>FAIL</code> names the step; keep the report directory, which says what it saw. Do not run it as root: the runtime refuses to work that way (see below).</p>
+<p><strong>2. A real task.</strong> Create a project, start a task on it, and let the agent finish a turn. The first start of a project boots its microVM and pulls the project image, and its first task builds a task-container image inside the VM, so allow several minutes. The turn finishing, with its commits on the task, is the confirmation that matters.</p>
+<p>If either fails and the logs point at the container rather than your server — the microVM refusing to start although the same server runs it outside a container — please report it with the report directory. Do not widen what the container is given (privileged mode, extra capabilities) to get past it.</p>
+<h3 id="a-server-without-kvm"><a class="anchor" href="#a-server-without-kvm" aria-hidden="true">#</a>A server without KVM</h3>
+<p>Without <code>/dev/kvm</code> the install runs <strong>everything except agent turns</strong>: accounts, teams, projects, hosted repositories, the task list, reviewing and accepting work. Starting a task reports that agent containers cannot be launched, and the task does not run. The same goes for anything else that needs an agent. A sync with no merge conflicts works, because it needs no agent.</p>
+<p>Compose cannot start a service whose device does not exist, so on such a server the install has to be started without it. <code>bootstrap.sh</code> does that for you when it finds no <code>/dev/kvm</code>, by writing this line to <code>.env</code>:</p>
+<pre><code>COMPOSE_FILE=docker-compose.yml:docker-compose.local-backend.yml
+</code></pre>
+<p><code>docker-compose.local-backend.yml</code> drops the device and sets <code>LAZY_FLEET_BACKEND=local</code>, so every project&#39;s process runs inside the application container instead of in a microVM. If you pass compose files with <code>-f</code>, add it yourself:</p>
+<pre><code class="language-bash">docker compose -f docker-compose.yml -f docker-compose.local-backend.yml up -d
+</code></pre>
+<p>Once the server has KVM, delete the <code>COMPOSE_FILE</code> line from <code>.env</code> and run <code>docker compose up -d</code> again. Until you do, the install keeps running without microVMs; re-running <code>bootstrap.sh</code> points out a line left behind like that.</p>
+<p>If <code>LAZY_FLEET_BACKEND</code> is left at its default on a server that cannot run microVMs, nothing fails silently. The readiness step in setup, and the Installation page in god mode, show which of <strong>MicroVM host</strong>, <strong>MicroVM runtime</strong> and <strong>Project image</strong> failed, with the fix for each and this escape hatch. Setup does not continue until they pass or the backend is set to <code>local</code>.</p>
+<p>Most cloud VMs cannot run microVMs, because their provider does not offer nested virtualization. Bare-metal servers can.</p>
+<h3 id="why-the-local-backend-cannot-run-turns-in-the-container"><a class="anchor" href="#why-the-local-backend-cannot-run-turns-in-the-container" aria-hidden="true">#</a>Why the <code>local</code> backend cannot run turns in the container</h3>
+<p>On the <code>local</code> backend, every project&#39;s process runs <em>inside</em> the application container. An agent turn runs in its own container created by your host&#39;s Docker, and the project process that asks for it would be describing files and network addresses that exist only inside the application container. The project checkout, the task&#39;s working copy and the agent binary would all name paths the host does not have, and the agent would have no route back to the process that launched it. Rather than start a container that cannot work, the project refuses and says so.</p>
+<p>Giving the application your host&#39;s Docker would not change that — the problem is the paths, not permission — and the install does not ask for that access at all; see <a href="#your-docker-socket-stays-on-your-host">below</a>.</p>
+<h3 id="reaching-a-tasks-running-services"><a class="anchor" href="#reaching-a-tasks-running-services" aria-hidden="true">#</a>Reaching a task&#39;s running services</h3>
+<p>A task that declares services to run (a web server, say) is reached through its project&#39;s process, and in the compose install that process listens on the application container&#39;s own loopback interface. The addresses the project page shows for those services therefore do not answer from a browser on the server or elsewhere. Running agent turns does not depend on this.</p>
+<h2 id="how-the-pieces-fit-together"><a class="anchor" href="#how-the-pieces-fit-together" aria-hidden="true">#</a>How the pieces fit together</h2>
+<p>The application container runs:</p>
+<ul>
+<li><strong>Rails + Solid Queue</strong> — the product UI and background jobs</li>
+<li><strong>the microVM runtime</strong> (<code>smolvm</code>), which starts one microVM per project, with the project&#39;s lazy process inside it</li>
+</ul>
+<p>The application image is laid out the way the lazy repository is — the lazy
+sources at <code>/lazy</code> with the web app at <code>/lazy/lazy-teams</code> — so the app finds
+lazy without any path configuration, and the same layout works everywhere.</p>
+<p>Where a project&#39;s process lives is what <code>LAZY_FLEET_BACKEND</code> selects.</p>
+<h3 id="smolvm-default-one-project-per-microvm"><a class="anchor" href="#smolvm-default-one-project-per-microvm" aria-hidden="true">#</a><code>smolvm</code> (default, one project per microVM)</h3>
+<p>Each project gets its own microVM. Its repository is cloned inside the VM and never touches your host&#39;s filesystem; the host mounts only that project&#39;s store directory. No Docker socket is shared with anything, and a project&#39;s process is reachable from the application only through a port published on the loopback interface. The VM carries its own Docker engine, so a task&#39;s agent container runs inside the VM next to the process that launched it.</p>
+<p>Outbound network access from a VM is open to the public internet and closed to everything else: the VM cannot reach your host&#39;s loopback, your LAN (RFC 1918 ranges), link-local and cloud-metadata addresses, or other VMs. There is nothing to configure — a project&#39;s first turn builds its task-runner image from <code>Dockerfile.lazy</code>, which reaches package mirrors, container registries and language toolchains, and you should not have to enumerate those. The rule is enforced on destination IP addresses after name resolution, so a hostname that resolves to an internal address is refused just as the bare address would be.</p>
+<p>It runs on a Linux host with KVM (x86_64 or arm64) and on an Apple Silicon Mac. It needs three settings, and the published image sets all three for you:</p>
+<pre><code>LAZY_FLEET_BACKEND=smolvm        # the default
+LAZY_SMOLVM_BINARY=/opt/smolvm/smolvm
+LAZY_DAEMON_IMAGE=ghcr.io/getlazy/lazy-daemon:&lt;the Lazy Teams image&#39;s version&gt;
+</code></pre>
+<p>The binary must be an absolute path to a copy whose checksum was recorded when it was obtained. A bare command name is refused, and so is a binary that no longer matches what was recorded.</p>
+<p><code>LAZY_DAEMON_IMAGE</code> names the image each project&#39;s microVM boots. The published Lazy Teams image defaults it to <code>ghcr.io/getlazy/lazy-daemon</code> at its own version tag. Anywhere else — an image you built yourself, for instance — there is no default, and a project refuses to start until it is set. The image is published for <code>linux/arm64</code> and <code>linux/amd64</code> as <code>ghcr.io/getlazy/lazy-daemon</code> and <code>docker.io/getlazy/lazy-daemon</code>, tagged with each exact build <code>v&lt;major&gt;.&lt;minor&gt;.&lt;n&gt;</code>. Pin that exact tag, the one matching your Lazy Teams version, and not <code>latest</code>: the application and its projects must run the same version of lazy. You can also build the image yourself from a lazy checkout with <code>scripts/publish-lazy-daemon-image.sh</code>. Its <code>--save &lt;path&gt;</code> writes a tar you can point <code>LAZY_DAEMON_IMAGE</code> at directly, which is also how you run with no registry access. A plain build leaves a local image tag you can name instead.</p>
+<p>An unknown <code>LAZY_FLEET_BACKEND</code> refuses to start rather than falling back, so a typo cannot silently put you on a weaker boundary than you asked for.</p>
+<h4 id="run-it-as-an-unprivileged-user-in-the-kvm-group-never-as-root"><a class="anchor" href="#run-it-as-an-unprivileged-user-in-the-kvm-group-never-as-root" aria-hidden="true">#</a>Run it as an unprivileged user in the <code>kvm</code> group, never as root</h4>
+<p>The process running Lazy Teams — and so running smolvm — must be an ordinary user that can open <code>/dev/kvm</code>. <strong>Running as root does not work.</strong> As root, smolvm runs each microVM under its own separate unprivileged user id, and that id cannot read the project files Lazy Teams writes for it (they are private to the account that wrote them), so no project can start. Lazy Teams checks this before touching smolvm and refuses with the steps below. The readiness checks in setup, and the Installation page in god mode, show a <strong>MicroVM host</strong> row saying the same.</p>
+<p><strong>The compose install already does this</strong>: the application runs as uid 1000 and, at start, joins the group id your server gave <code>/dev/kvm</code> — unless that id already belongs to a group inside the image other than <code>kvm</code> (joining it would grant whatever that group can open there, not just the device), in which case it refuses and says so in the container log. The steps below are for a native install on Linux.</p>
+<p>On a fresh server, as root:</p>
+<pre><code>useradd --create-home --groups kvm lazy
+chown -R lazy: /path/to/fleet-root /path/to/vendored/smolvm /path/to/lazy-teams/storage
+</code></pre>
+<p>For an existing account, use <code>usermod -aG kvm &lt;user&gt;</code> instead and log in again so the new group applies. The user must own the fleet root (<code>LAZY_FLEET_ROOT</code>), the vendored smolvm directory, and the application&#39;s own database folder (<code>LAZY_TEAMS_STORAGE_DIR</code>, by default <code>storage/</code> beside the application), and Lazy Teams is then started as that user. If Lazy Teams was ever started as root, everything it created in those folders is owned by root, which is why the <code>chown</code> above is recursive.</p>
+<p>The same check confirms that user can open <code>/dev/kvm</code>. If the device does not exist, enable hardware virtualization on the host; if Lazy Teams runs in a container, pass the device in (<code>--device /dev/kvm</code>, or <code>devices: [&quot;/dev/kvm&quot;]</code> in compose). If it exists but cannot be opened, the user is not in the device&#39;s group. In the compose install the container joins that group by itself, unless <code>/dev/kvm</code> belongs to group 0 (root) or to a group id the image already uses for something else, which it will not join: give the device its own dedicated group on the host (a <code>kvm</code> group, mode <code>0660</code>).</p>
+<p>Do not work around this by turning off smolvm&#39;s per-VM user isolation. It is what keeps each microVM from running as root on your host.</p>
+<h4 id="services-on-the-hosts-public-address-are-reachable-from-projects"><a class="anchor" href="#services-on-the-hosts-public-address-are-reachable-from-projects" aria-hidden="true">#</a>Services on the host&#39;s public address are reachable from projects</h4>
+<p>A microVM may reach any public internet address, and that includes your server&#39;s <strong>own</strong> public address if its network card carries one (common on rented bare-metal servers). A service on the host that listens on all interfaces and is hidden only by a firewall in front of the server — your provider&#39;s edge firewall, say — is therefore reachable from every project. Bind host services to <code>127.0.0.1</code> where they do not need outside access, or firewall them on the host itself (for example with <code>nftables</code> or <code>ufw</code>), not only at the edge.</p>
+<p>This includes Lazy Teams itself: the compose file publishes the application on <code>127.0.0.1</code> by default for this reason as well as the one in <a href="#the-direct-port-is-local-only">The direct port is local-only</a>. If you set <code>APP_DIRECT_BIND=0.0.0.0</code> or publish Caddy&#39;s ports, projects can reach them through your public address like anything else on the internet can.</p>
+<h3 id="local-no-microvms"><a class="anchor" href="#local-no-microvms" aria-hidden="true">#</a><code>local</code> (no microVMs)</h3>
+<p>Every project&#39;s process runs beside the application — in the compose install, inside the application container. That is the arrangement <a href="#a-server-without-kvm">A server without KVM</a> describes: the product surface works, and agent turns do not run from it. Nothing is shared with your host&#39;s Docker in the compose install; see <a href="#your-docker-socket-stays-on-your-host">below</a>.</p>
+<h3 id="your-docker-socket-stays-on-your-host"><a class="anchor" href="#your-docker-socket-stays-on-your-host" aria-hidden="true">#</a>Your Docker socket stays on your host</h3>
+<p>The application container is <strong>not</strong> given access to your host&#39;s Docker. It
+used to be, so that it could start agent containers alongside itself — which,
+as <a href="#task-turns">Task turns</a> explains, it was never actually able to do. Agent
+turns run in each project&#39;s microVM instead, on that VM&#39;s own Docker engine. Handing
+a container your Docker socket is equivalent to giving root on the machine to
+anything that can run code inside it, so it is no longer mounted.</p>
+<p>You do not need to do anything about this, and nothing about running the
+product needs it back: no part of the application opens the socket, and on the
+<code>local</code> backend the per-project processes refuse to start agent work before
+ever reaching for it.</p>
+<p>Two optional things do want it, and both are opt-in:</p>
+<ul>
+<li><strong>The acceptance script</strong>, which asks your Docker what it created in order to
+prove that a refused task really started nothing. It adds the socket itself
+for the throwaway stack it runs, and removes it afterwards.</li>
+<li><strong><code>LAZY_TEAMS_BUILD_RUNNER=1</code></strong>, which builds the agent image on your host.
+Nothing in this install runs agents from that image: agent turns run inside
+each project&#39;s microVM.</li>
+</ul>
+<p>If you are doing one of those, start the stack with the socket override merged:</p>
+<pre><code class="language-bash">docker compose -f docker-compose.yml -f docker-compose.docker-socket.yml up -d
+</code></pre>
+<p>Take it away again when you are finished. While it is in place, anyone who can
+execute code inside the application container can control Docker on your host:
+run only trusted administrators, and keep the host patched.</p>
+<p>If the container then reports that it cannot use Docker, it prints what it saw —
+the socket&#39;s owner, its permissions, whether it could join the socket&#39;s group,
+and Docker&#39;s own error. Read that first; it tells a permissions problem apart
+from a Docker daemon that is not running, which need different fixes. Two host-
+side ones are common:</p>
+<ul>
+<li><strong>Docker Desktop (macOS or Windows)</strong> — turn on <strong>Settings → Advanced →
+&quot;Allow the default Docker socket to be used&quot;</strong>, then recreate the stack.
+Without it, <code>/var/run/docker.sock</code> may not be the socket your Docker is
+actually listening on.</li>
+<li><strong>Do not</strong> loosen the socket with <code>chmod 666</code>. That gives every process on
+the machine full control of Docker, which is equivalent to giving them root.</li>
+</ul>
+<p>Running the application as root to get past this is not supported and is not a
+workaround — it removes the boundary the rest of this page depends on.</p>
+<h2 id="environment-reference"><a class="anchor" href="#environment-reference" aria-hidden="true">#</a>Environment reference</h2>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Required</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>APP_HOST</code></td>
+<td>yes</td>
+<td>Public hostname for links, TLS, and the hosts the app answers to</td>
+</tr>
+<tr>
+<td><code>SECRET_KEY_BASE</code></td>
+<td>yes</td>
+<td>Session signing (<code>bootstrap.sh</code> generates)</td>
+</tr>
+<tr>
+<td><code>AR_ENCRYPTION_*</code></td>
+<td>yes</td>
+<td>Encrypts stored credentials (<code>bootstrap.sh</code> generates)</td>
+</tr>
+<tr>
+<td><code>LAZY_TEAMS_TAG</code></td>
+<td>no</td>
+<td>Pin a published image tag (default: <code>latest</code>)</td>
+</tr>
+<tr>
+<td><code>LAZY_TEAMS_IMAGE</code></td>
+<td>no</td>
+<td>Full image reference override (private registry)</td>
+</tr>
+<tr>
+<td><code>APP_DIRECT_PORT</code></td>
+<td>no</td>
+<td>Direct HTTP port (default 3000)</td>
+</tr>
+<tr>
+<td><code>APP_DIRECT_BIND</code></td>
+<td>no</td>
+<td>Interface the direct port publishes on (default <code>127.0.0.1</code>)</td>
+</tr>
+<tr>
+<td><code>FORCE_SSL</code></td>
+<td>no</td>
+<td>HTTPS redirect, <code>secure</code> cookies, HSTS (default on)</td>
+</tr>
+<tr>
+<td><code>ASSUME_SSL</code></td>
+<td>no</td>
+<td>Treat incoming traffic as encrypted (defaults to <code>FORCE_SSL</code>)</td>
+</tr>
+<tr>
+<td><code>APP_PROTOCOL</code></td>
+<td>no</td>
+<td>Scheme in emailed links (defaults from <code>FORCE_SSL</code>)</td>
+</tr>
+<tr>
+<td><code>ALLOWED_HOSTS</code></td>
+<td>no</td>
+<td>Extra hostnames the install answers to, comma-separated</td>
+</tr>
+<tr>
+<td><code>SMTP_*</code>, <code>MAILER_FROM</code></td>
+<td>no</td>
+<td>Outgoing email</td>
+</tr>
+<tr>
+<td><code>ACME_EMAIL</code></td>
+<td>no</td>
+<td>Let&#39;s Encrypt contact when using the <code>tls</code> profile</td>
+</tr>
+<tr>
+<td><code>LAZY_FLEET_BACKEND</code></td>
+<td>no</td>
+<td>Where projects run: <code>smolvm</code>, one microVM per project (default), or <code>local</code>, the escape hatch for a host without hardware virtualization (no agent turns in the compose install)</td>
+</tr>
+<tr>
+<td><code>LAZY_SMOLVM_BINARY</code></td>
+<td>no</td>
+<td>Absolute path to the verified smolvm binary. The published image sets it</td>
+</tr>
+<tr>
+<td><code>LAZY_DAEMON_IMAGE</code></td>
+<td>no</td>
+<td>The image each project&#39;s microVM boots — the published <code>getlazy/lazy-daemon</code> at the exact version tag matching your Lazy Teams, a local image tag, or the path to a saved image tar. The published Lazy Teams image defaults it to its own version tag; never use <code>latest</code></td>
+</tr>
+<tr>
+<td><code>COMPOSE_FILE</code></td>
+<td>no</td>
+<td>Written by <code>bootstrap.sh</code> on a server without <code>/dev/kvm</code> to start the install without microVMs; delete it once the server has KVM</td>
+</tr>
+<tr>
+<td><code>LAZY_SMOLVM_CPUS</code>, <code>LAZY_SMOLVM_MEMORY_MIB</code>, <code>LAZY_SMOLVM_STORAGE_GIB</code></td>
+<td>no</td>
+<td>Per-project VM size (defaults: 2 CPUs, 4096 MiB, 32 GiB)</td>
+</tr>
+<tr>
+<td><code>LAZY_FLEET_HOST_PATH</code></td>
+<td>no</td>
+<td>Absolute path on this machine to keep the fleet root in, instead of the <code>lazy_teams_fleet</code> Docker volume. Compose installs only</td>
+</tr>
+<tr>
+<td><code>LAZY_FLEET_ROOT</code></td>
+<td>no</td>
+<td>Folder holding project data. Set in <code>docker-compose.yml</code> for the container install and normally not changed there</td>
+</tr>
+<tr>
+<td><code>LAZY_TEAMS_STORAGE_DIR</code></td>
+<td>no</td>
+<td>Where the application&#39;s own database files go (default: <code>storage/</code> beside the application).</td>
+</tr>
+</tbody></table>
+<h2 id="what-an-upgrade-does"><a class="anchor" href="#what-an-upgrade-does" aria-hidden="true">#</a>What an upgrade does</h2>
+<p>Pull the new image and bring the stack back up as usual. On the <code>local</code>
+backend, your projects are restarted on the new version automatically, within a
+minute or so of the app coming back — there is nothing to run and nothing to
+wait for. Work that was in progress resumes on its own, keeping its
+conversation and its uncommitted changes.</p>
+<p><strong>On the microVM backend, an upgrade does not move existing projects to the
+new version.</strong> A project keeps running the image its microVM was created with;
+projects created after the upgrade get the new one. The Installation page in god
+mode does not list them as out of date, because it cannot compare a VM&#39;s version
+with the application&#39;s.</p>
+<p>If your install predates the image-layout change, also refresh the deploy bundle from the release along with the image — see <a href="#upgrading">Upgrading</a> below.</p>
+<p>If a project cannot be brought back — its data folder is unreadable, say, or
+something is holding it open — Lazy Teams retries it a few times, waiting longer
+between attempts, and then stops trying and leaves it alone rather than
+restarting it every minute. The Installation page in god mode names any project
+in that state and the project&#39;s own page says what went wrong. Deal with the
+cause, then use <strong>Restart all project daemons</strong> to pick it up again.</p>
+<h2 id="building-from-source-development"><a class="anchor" href="#building-from-source-development" aria-hidden="true">#</a>Building from source (development)</h2>
+<p>When you are developing lazy or Lazy Teams itself, build the application image from the repository checkout instead of pulling:</p>
+<pre><code class="language-bash">cd lazy-teams/deploy
+./bootstrap.sh
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+</code></pre>
+<p>This path requires the full lazy source tree (the compose build context is the repository root). Operators on a production server should use the pull-and-go flow above.</p>
+<p><strong>Naming compose files with <code>-f</code> replaces the <code>COMPOSE_FILE</code> line in <code>.env</code>.</strong> On a server without <code>/dev/kvm</code>, add <code>-f docker-compose.local-backend.yml</code> after <code>docker-compose.yml</code> in every such command — here and for the socket override below — or compose brings the device back and refuses to start. <code>bootstrap.sh</code> prints its commands with it already included when it chose it.</p>
+<p>The published <code>ghcr.io/getlazy/lazy-teams</code> image is multi-architecture (<code>linux/arm64</code> and <code>linux/amd64</code>); <code>scripts/publish-lazy-teams-image.sh --platform linux/arm64,linux/amd64 --push</code> builds the same thing from a checkout.</p>
+<h2 id="verifying-the-install"><a class="anchor" href="#verifying-the-install" aria-hidden="true">#</a>Verifying the install</h2>
+<p>From the source tree, an acceptance script checks the packaged topology end to end on the <code>local</code> backend, so it runs on any Docker host: health check, web UI, hosted git, project provisioning, and that starting a task reports the documented <a href="#task-turns">task turns</a> limitation rather than hanging or failing obscurely:</p>
+<pre><code class="language-bash">bin/self-host-accept
+</code></pre>
+<p>The first run builds images and may take several minutes.</p>
+<h2 id="deploy-from-your-workstation"><a class="anchor" href="#deploy-from-your-workstation" aria-hidden="true">#</a>Deploy from your workstation</h2>
+<p>If you have SSH access to the server, one command from a source checkout does the whole install — no shell session on the box, no copy-and-paste:</p>
+<pre><code class="language-bash">lazy-teams/bin/deploy-remote root@your-server
+</code></pre>
+<p>It runs over your own SSH agent (no credentials are stored on the server, and no secret from the server is ever printed) and announces each step before it runs: it records what the box is, installs Docker Engine and the Compose plugin from Docker&#39;s official apt repository if they are missing, puts the source on the box, writes only the <code>.env</code> keys the flags below name, brings the stack up, waits for it to become healthy, and then runs acceptance checks. A failure names the step, the command, the remote output, and the last 200 lines of container logs. The run ends with a pass/fail report and exits non-zero if anything failed.</p>
+<p>The install it produces is reachable on the loopback interface only — the report tells you the <code>ssh -L</code> command to open it in your browser. Add HTTPS with one of the options above when you want it permanently reachable.</p>
+<p>Useful flags:</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>--diagnose</code></td>
+<td>Report the box as it is and change nothing: OS, Docker versions, containers, listening ports, volumes, disk and memory, <code>.env</code> keys with secret values masked, and recent container logs</td>
+</tr>
+<tr>
+<td><code>--dry-run</code></td>
+<td>Print every remote command that would run, in order, and contact nothing</td>
+</tr>
+<tr>
+<td><code>--teardown</code></td>
+<td>Stop and remove the containers <strong>and their volumes</strong>, after you type a confirmation word</td>
+</tr>
+<tr>
+<td><code>--branch &lt;ref&gt;</code></td>
+<td>Deploy a specific branch or tag</td>
+</tr>
+<tr>
+<td><code>--image &lt;ref&gt;</code></td>
+<td>Deploy a published image instead of building from source</td>
+</tr>
+<tr>
+<td><code>--app-host &lt;name&gt;</code></td>
+<td><code>APP_HOST</code> for the install (default: the server&#39;s hostname)</td>
+</tr>
+<tr>
+<td><code>--source rsync</code></td>
+<td>Push the source from your workstation instead of having the box clone it — for a server with no git access of its own</td>
+</tr>
+<tr>
+<td><code>--accept-only</code></td>
+<td>Re-run the acceptance checks against what is already deployed</td>
+</tr>
+</tbody></table>
+<p>The acceptance checks run in a throwaway compose project of their own, on a separate port, and remove it afterwards, so they never write into the install they are checking.</p>
+<p>Re-running the command is safe at any point: every step is idempotent, and an interrupted deploy is resumed by running it again.</p>
+<h2 id="upgrading"><a class="anchor" href="#upgrading" aria-hidden="true">#</a>Upgrading</h2>
+<p>Pull the new image tag and restart:</p>
+<pre><code class="language-bash">docker compose pull
+docker compose up -d
+</code></pre>
+<p>If your install already has projects that were set up without microVMs, set <code>LAZY_FLEET_BACKEND=local</code> in <code>.env</code> before upgrading: an install never hands a project to a different backend than the one that set it up, and setup and the Installation page say so until the backend matches. A project set up before Lazy Teams recorded which backend made it, on a microVM backend, is refused too rather than guessed at; the refusal gives the one command that records its backend.</p>
+<p>Project data in the two volumes above is preserved. On the <code>local</code> backend your projects restart on the new version automatically, within a minute or so of the app coming up; on the microVM backend existing projects keep their version for now — see <a href="#what-an-upgrade-does">What an upgrade does</a>.</p>
+<p>Your existing <code>.env</code> is never rewritten, so two of the defaults above change under an install that predates them:</p>
+<ul>
+<li>The direct port moves to the loopback interface. If you were reaching it across a network, set <code>APP_DIRECT_BIND=0.0.0.0</code> to keep that working — or better, put HTTPS in front and leave it local.</li>
+<li>HTTPS is assumed. An install genuinely served over plain HTTP needs <code>FORCE_SSL=false</code>, or browsers will hold back the <code>secure</code> session cookie and sign-in will appear to fail.</li>
+</ul>
+<p>An install that predates the image-layout change also needs the <strong>deploy bundle refreshed, not just the image</strong>: the storage volume&#39;s mount point inside the image moved from <code>/rails/storage</code> to <code>/lazy/lazy-teams/storage</code> (the <code>lazy_teams_storage</code> volume and your data are unchanged). Pulling the new image under a bundle that still mounts the old path would leave the app writing its database inside the container instead of the volume — a later container replacement would lose it. Copy the new <code>lazy-teams/deploy/</code> bundle from the release and run <code>docker compose up -d</code> again.</p>
+<h2 id="kamal-and-cloud-deployment"><a class="anchor" href="#kamal-and-cloud-deployment" aria-hidden="true">#</a>Kamal and cloud deployment</h2>
+<p>For a <strong>cloud VPS</strong> (DigitalOcean droplet or similar) with Kamal — private by default (SSH tunnel / Tailscale), optional public HTTPS — see <a href="../deploying-lazy-teams-digitalocean/">Deploying Lazy Teams on DigitalOcean with Kamal</a>.</p>
+<p>The lazy-teams repository ships <code>config/deploy.yml</code> and <code>.kamal/secrets</code> for that path. For <strong>local or single-box</strong> self-hosting without SSH keys or a registry account, the docker-compose bundle above remains the supported path.</p>
+<h2 id="getting-help"><a class="anchor" href="#getting-help" aria-hidden="true">#</a>Getting help</h2>
+<p>If a project is stuck after install, sign in as a site administrator and use <strong>God mode</strong> to read daemon logs and paths. See the operator troubleshooting guide shipped with lazy-teams (<code>/admin/troubleshooting</code> when signed in as an administrator).</p>
+<p>Lazy Teams also runs <code>lazy doctor</code> against every running project once an hour. What it finds is handled one of three ways:</p>
+<ul>
+<li><strong>Safe housekeeping is fixed automatically</strong>: finished-task worktrees, orphaned containers, leftover upstream tracking on task branches, and conversations missing from the store. Every fix is logged. Removing stale runner images is left to an administrator, because projects on one machine share its images.</li>
+<li><strong>Problems that affect people&#39;s work</strong> (for example a model credential that is refused, an unreachable repository host, or low disk) are shown to the project&#39;s members as a short notice on the project page. The notice says what is affected, not how to fix it.</li>
+<li><strong>Everything else is shown only in god mode.</strong> Open the project and choose <strong>Doctor</strong> to see the full report: every check with its detail and remedy, what Lazy Teams has already fixed and who started it, a <strong>Run doctor</strong> button, and an <strong>Apply</strong> button for each remedy that doctor can perform itself. Apply first lists exactly what the remedy would touch, and acts only when you confirm.</li>
+</ul>
+<h2 id="agents-and-credentials"><a class="anchor" href="#agents-and-credentials" aria-hidden="true">#</a>Agents and credentials</h2>
+<p>Once your team is running tasks, see <a href="../lazy-teams-agents/">Agents in Lazy Teams</a> for choosing Claude Code or Cursor, setting a project default agent, and connecting your Anthropic account.</p>
+
+</main>
+</body>
+</html>

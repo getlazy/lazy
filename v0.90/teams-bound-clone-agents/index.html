@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Code against a Lazy Teams project — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="claude-code-against-a-lazy-teams-project"><a class="anchor" href="#claude-code-against-a-lazy-teams-project" aria-hidden="true">#</a>Claude Code against a Lazy Teams project</h1>
+<p>This page is for Lazy Teams members who want to use Claude Code on a project.
+Once a clone is bound to a project on Lazy Teams (see
+<a href="../teams-login/">logging a machine in</a>), there are two ways to drive that
+project with Claude Code. They are not equals.</p>
+<h2 id="the-primary-way-your-builder-on-the-server"><a class="anchor" href="#the-primary-way-your-builder-on-the-server" aria-hidden="true">#</a>The primary way: your builder on the server</h2>
+<p>Run <code>lazy builder</code> in the bound clone, or open the <strong>Builder</strong> page in your
+browser. Your builder runs on the Teams install, next to the project, and your
+terminal attaches to it. This is the full experience:</p>
+<ul>
+<li>it is a real builder session of the project, with the builder instructions
+lazy assembles for it;</li>
+<li>its conversation is kept with the project, where you and your teammates can
+search and read it later;</li>
+<li>it can do everything a builder can, because it runs where the task
+worktrees, containers and branches live;</li>
+<li>you can leave it and come back from any machine, or from your phone.</li>
+</ul>
+<p>If you want Claude Code working on a Teams project, start here.</p>
+<h2 id="the-secondary-way-your-own-claude-code-on-your-machine"><a class="anchor" href="#the-secondary-way-your-own-claude-code-on-your-machine" aria-hidden="true">#</a>The secondary way: your own Claude Code on your machine</h2>
+<p>You can also point a Claude Code you run yourself — in your own editor, with
+your own settings — at the bound clone, by registering lazy&#39;s MCP server with
+it. Run this on your machine, inside the clone:</p>
+<pre><code>claude mcp add lazy -- lazy mcp --task-id &quot;&quot; --worktree /path/to/your/clone
+</code></pre>
+<p>Then start Claude Code from inside the clone. The MCP server works out which
+project it serves from the directory it is started in, not from
+<code>--worktree</code>, so a Claude Code started elsewhere does not reach this project.</p>
+<p>Its <code>lazy_*</code> tools then reach the project through your Teams install, on your
+login. This is supported and useful when you want your own environment, but
+know what you are giving up:</p>
+<ul>
+<li><strong>It is not a builder session.</strong> Teams has no record of it, and it does not
+get the builder instructions a server-side session gets.</li>
+<li><strong>Its conversation stays on your machine</strong>, in your own Claude Code history,
+not with the project.</li>
+<li><strong>It acts as you.</strong> Everything it writes is recorded as yours, exactly as if
+you had typed the command — there is no way for Teams to tell your own
+Claude Code from you, so it does not pretend otherwise.</li>
+<li><strong>It can never do more than the Teams web UI</strong>, and a few things the web UI
+does are not offered to it (listed below).</li>
+</ul>
+<h3 id="what-works"><a class="anchor" href="#what-works" aria-hidden="true">#</a>What works</h3>
+<p>Every read: searching, showing, listing, diffs, review regions, waiting on a
+task, memory, messages, raised items, artifacts, and listing, searching and
+reading past conversations.</p>
+<p>The task lifecycle: create, edit, clone, comment, tag, journal, attach
+artifacts, and start, unblock, resume, ask, review, stop, accept, reject,
+close, reopen and sync a task.</p>
+<h3 id="what-refuses-and-says-so"><a class="anchor" href="#what-refuses-and-says-so" aria-hidden="true">#</a>What refuses, and says so</h3>
+<p>Each of these answers with an error naming the Teams install and project, and
+what to do instead — usually &quot;use your server-side builder&quot; — rather than
+failing obscurely:</p>
+<ul>
+<li><strong>Not in the browser either:</strong> saving shared memory, the builder&#39;s scratch
+files, posting system messages, submitting a pull request, reparenting a
+task, linking an existing branch as a task, and promoting a raised item into
+a task. Use a server-side builder for these.</li>
+<li><strong>In the browser, but not offered to a clone:</strong> dismissing a system message,
+and redoing a task (several steps, not all of them relayed). Use the Teams
+web UI for these.</li>
+<li><strong>Asking a past conversation a question.</strong> It runs a model on the server,
+which a clone cannot ask for. Use a server-side builder.</li>
+<li><strong>Switching a task&#39;s agent</strong> on edit. Leave <code>agent</code> out, or switch it from a
+server-side builder.</li>
+<li><strong>Some arguments:</strong> a <code>runner</code> or review setting on create or edit, a git
+branch (rather than a task) as a parent, and options that skip a check the
+browser enforces. The same call without them works.</li>
+<li><strong>Tools that belong to a running task&#39;s own agent</strong> — committing, declaring
+a task finished, raising items for review, reporting, and progress updates.
+Your own Claude Code has no task of its own, so these are refused the same
+way they are for any builder.</li>
+</ul>
+<p>Nothing is left half done: a call that could not complete on Teams refuses
+before it writes anything.</p>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lazy Teams Slack rooms — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="lazy-teams-slack-rooms"><a class="anchor" href="#lazy-teams-slack-rooms" aria-hidden="true">#</a>Lazy Teams Slack rooms</h1>
+<p>Lazy Teams can connect a Slack workspace so a piece of work gets its own private
+channel, status and turn summaries are posted there (one paragraph per message),
+and thread replies become task comments or unblock feedback. Subtasks stay in
+that same channel, each in a thread of its own, so one piece of work is one
+place to look. A project can have a channel of its own too, and work you start
+there belongs to that project.</p>
+<h2 id="operator-setup"><a class="anchor" href="#operator-setup" aria-hidden="true">#</a>Operator setup</h2>
+<p><strong>Your install does not need a public address.</strong> Lazy opens the connection to
+Slack and holds it open, so Slack never dials this app. An install on
+<code>localhost</code>, on a laptop, or behind a firewall with no inbound ports is a
+supported install: there is no Events URL to publish, no tunnel to run, and no
+signing secret to keep in step.</p>
+<p>Setup is two steps on the <strong>Integrations</strong> page (account menu → <strong>Team
+administration</strong>).</p>
+<ol>
+<li><p><strong>Create and install the app in Slack.</strong> The page shows a manifest for this
+install, with a <strong>Copy manifest</strong> button beside it. Copy it, go to
+<a href="https://api.slack.com/apps" rel="noopener noreferrer">api.slack.com/apps</a>, choose
+<strong>Create New App → From a manifest</strong>, pick your workspace and paste it.
+Slack creates the app with the bot scopes, the <code>/lazy</code> slash command, the
+event subscriptions and Socket Mode already switched on — nothing to
+transcribe by hand.</p>
+<p>The manifest asks for these bot scopes, and the page lists them beside it:</p>
+<ul>
+<li><code>groups:write</code> — create, invite to and archive private task channels</li>
+<li><code>groups:read</code> — check whether anybody is in a channel before closing it</li>
+<li><code>groups:history</code> — read thread context in those channels</li>
+<li><code>channels:manage</code>, <code>channels:history</code> — reserved for future public-channel rooms</li>
+<li><code>app_mentions:read</code> — hear @lazy mentions, including outside its own rooms</li>
+<li><code>chat:write</code> — post status lines and turn summaries</li>
+<li><code>commands</code> — the <code>/lazy</code> slash command</li>
+<li><code>users:read</code> — display names when inviting members to a room</li>
+</ul>
+<p><strong>Creating the app does not produce either token.</strong> Slack makes you do two
+more things in the app you just created, and each one hands you one token:</p>
+<ol>
+<li><strong>Generate the app-level token.</strong> Open <strong>Settings → Basic Information</strong>,
+scroll to <strong>App-Level Tokens</strong> and click <strong>Generate Token and Scopes</strong>.
+Name it anything, add the <code>connections:write</code> scope, and click
+<strong>Generate</strong>. Copy the token — it starts with <code>xapp-</code>.</li>
+<li><strong>Install the app to your workspace.</strong> Open <strong>Settings → Install App</strong>
+(or <strong>Features → OAuth &amp; Permissions</strong>), click <strong>Install to Workspace</strong>
+and approve the permissions. Slack then shows the <strong>Bot User OAuth
+Token</strong>, starting with <code>xoxb-</code>. Copy that too.</li>
+</ol>
+</li>
+<li><p><strong>Paste the two tokens</strong> back on the Integrations page:</p>
+<ul>
+<li><strong>Bot User OAuth Token</strong> (<code>xoxb-…</code>) — Lazy posts to Slack with it.</li>
+<li><strong>App-Level Token</strong> (<code>xapp-…</code>) — Lazy opens the Socket Mode connection
+with it, and everything you type in Slack arrives over that connection.</li>
+</ul>
+<p>Save them together. Lazy confirms the workspace name from the tokens
+themselves. Both are stored encrypted and shown afterwards as
+<em>Configured — paste to replace</em>; a save that Slack refuses keeps what you
+typed so you can correct one value rather than paste both again.</p>
+</li>
+</ol>
+<p>Then choose the project Slack-created tasks land in, and use <strong>Test connection</strong>
+to confirm both tokens: it authenticates the bot token and opens a Socket Mode
+connection with the app-level token, so an app with Socket Mode switched off
+fails here rather than silently receiving nothing.</p>
+<h3 id="project-rooms"><a class="anchor" href="#project-rooms" aria-hidden="true">#</a>Project rooms</h3>
+<p>The default project is where work started outside any Lazy channel lands. Once
+you have more than one project, give the others a channel of their own: on the
+Integrations page, <strong>Project rooms</strong> lists every project in the team with a
+<strong>Create room</strong> button beside the ones that do not have a channel yet.</p>
+<p>A project&#39;s channel is named <code>lazy-project_&lt;project&gt;</code>, so it sorts next to the
+task channels in the sidebar and still reads at a glance as the project rather
+than a task. Once a project has one, its name on the Integrations page and a
+<strong>Slack room</strong> button on the project&#39;s own page both open the channel in Slack.</p>
+<p>Creating one is safe to repeat. Asking twice shows you the channel that already
+exists instead of making a second one, and adds you to it if you were not in it
+— a room is a private channel, so it stays invisible to anyone nobody invited.
+If a channel with that exact name is already in your workspace and is not
+standing for anything else, Lazy uses that channel rather than creating one
+beside it, so you can make the channel yourself first if you prefer.</p>
+<p>If the room cannot be made, the Integrations page says so and what to do about
+it. The two common answers:</p>
+<ul>
+<li><strong>Lazy is missing a permission in Slack.</strong> Reinstall the app from the manifest
+on that page and paste the new bot token — the same remedy the permissions
+warning names.</li>
+<li><strong>The name is taken by a channel Lazy cannot see.</strong> Private channels are
+invisible to Lazy until it is invited, so it cannot tell you what is in there.
+Invite Lazy to that channel and press <strong>Create room</strong> again to use it, or
+rename or archive it if it is not the channel you meant.</li>
+</ul>
+<p>Anything typed in a project&#39;s channel belongs to that project. Giving a project
+a channel also puts its work on Slack: until then Lazy only followed tasks in
+the default project, and now each task in that project gets its own channel and
+its own updates, exactly as the default project&#39;s tasks always did.</p>
+<h3 id="what-must-be-running"><a class="anchor" href="#what-must-be-running" aria-hidden="true">#</a>What must be running</h3>
+<p>Saved tokens are not a working Slack. Lazy has to be running and holding its
+connection open for <code>/lazy</code> and thread replies to reach it — a workspace whose
+tokens are perfect still answers &quot;the app did not respond&quot; if nothing is
+listening on this end.</p>
+<p>Lazy holds that connection from its own background work, and starting the app
+starts that work: the standard way of running Lazy Teams — the deployment
+bundle, or the app&#39;s own start command — runs everything it needs in one go.
+There is nothing extra to start. If your deployment was set up to run background
+work as a separate process, that process must be up too.</p>
+<p>The <strong>Connection status</strong> line on the Integrations page is the answer either
+way. It reads <em>Listening to Slack</em> while a connection is open, with when it was
+last established, and <em>Not listening to Slack</em> when there is none — read fresh
+every time you load the page, so it cannot disagree with what Slack is telling
+people right now. If it says Lazy is not listening while your tokens are saved,
+the usual cause is that this install is not running its background work; if it
+is, use <strong>Test connection</strong>, because Slack may have revoked one of the two
+tokens.</p>
+<p>If you change the app&#39;s scopes later, reinstall the app in Slack and paste the
+new bot token. The Integrations page warns when the installed app is missing a
+permission the current setup needs (for example, checking who is in a channel)
+and tells you to reinstall — it does not leave a fully configured-looking page
+while background cleanups fail quietly.</p>
+<h3 id="more-than-one-copy-of-lazy-in-one-slack-workspace"><a class="anchor" href="#more-than-one-copy-of-lazy-in-one-slack-workspace" aria-hidden="true">#</a>More than one copy of Lazy in one Slack workspace</h3>
+<p>Two copies of Lazy — say one on your laptop and one on a server — can share a
+Slack workspace, but <strong>each copy needs its own Slack app</strong>. Give both copies the
+same app and Slack hands each message to only one of them, chosen at random and
+with no error anywhere: half of what you type reaches a copy that knows nothing
+about it, and the other half works. It looks like Lazy ignoring people.</p>
+<p>To add a second copy, create a second Slack app from <em>that copy&#39;s</em> manifest, and
+change one thing before you paste it: the slash command name, from <code>lazy</code> to
+something you can tell apart, such as <code>lazy-dev</code>. Slack does not keep slash
+commands apart by app — two apps claiming <code>/lazy</code> in one workspace means the one
+installed most recently silently takes it, whichever copy you meant. Everything
+else in the manifest can stay as it is, and the renamed command behaves
+identically.</p>
+<p>Lazy watches for the mistake: if it sees another copy connected with the same
+Slack app, the Integrations page says so and tells you what to do about it.</p>
+<p><strong>Channel names are shared even when the copies are not.</strong> Slack keeps one list
+of channel names for the whole workspace, and it never gives a name back — an
+archived channel still holds its own. So if the other copy already made
+<code>lazy-fix-checkout</code>, this copy cannot use that name and cannot see inside the
+channel either. It makes <code>lazy-fix-checkout-2</code> instead and carries on; the
+number is the only difference, and each copy&#39;s channels stay its own.</p>
+<h3 id="upgrading-an-install-that-used-the-older-setup"><a class="anchor" href="#upgrading-an-install-that-used-the-older-setup" aria-hidden="true">#</a>Upgrading an install that used the older setup</h3>
+<p>An install connected under the previous flow already has a working bot token and
+no app-level token. The Integrations page says so and asks for that one value:
+in the same Slack app, turn Socket Mode on, then generate an app-level token
+under <strong>Settings → Basic Information → App-Level Tokens → Generate Token and
+Scopes</strong> with the <code>connections:write</code> scope, and paste it. The Client ID, Client Secret and Signing
+Secret are no longer used and can be removed from your environment.</p>
+<h2 id="members"><a class="anchor" href="#members" aria-hidden="true">#</a>Members</h2>
+<ol>
+<li>Open <strong>Slack linking</strong> from the account menu (<strong>You</strong>) and generate a link code.</li>
+<li>In Slack: <code>/lazy link &lt;code&gt;</code>.</li>
+<li>Create work with <code>/lazy create &lt;goal&gt;</code>. Lazy creates a private channel named
+<code>lazy-&lt;task-code&gt;</code> and adds you to it — look for that channel in your Slack
+sidebar. Lazy&#39;s reply always names the project the task landed in and links
+its channel, so you can see where it went without going looking.</li>
+<li>Reply in a thread under a task-room message to comment or send feedback when
+the task is waiting for review. If your Lazy account is not linked yet, Slack
+replies in the thread with instructions instead of delivering the message.</li>
+</ol>
+<p><strong>Where a task lands depends on where you type.</strong> <code>/lazy create</code> in a project&#39;s
+channel creates the task in that project. In a task&#39;s own channel it creates a
+subtask of that task — work that builds on it, rather than a second, unrelated
+task. Anywhere else — a general channel, a DM — it goes to the default project.
+All three say so in the reply.</p>
+<h3 id="one-channel-per-piece-of-work-threads-for-the-rest"><a class="anchor" href="#one-channel-per-piece-of-work-threads-for-the-rest" aria-hidden="true">#</a>One channel per piece of work, threads for the rest</h3>
+<p>A channel is made for a piece of work you started, and everything that work
+breaks itself into stays inside it:</p>
+<ul>
+<li><strong>A task with nothing above it gets a channel</strong> — the one you asked for, or a
+task Lazy started that has somebody to put in the channel with it.</li>
+<li><strong>A subtask gets a thread</strong> in that channel instead, opened by a single
+<em>Subtask <code>&lt;code&gt;</code> — started</em> message. Its status lines and turn summaries are
+replies under it, so the channel reads as a list of the parts the work broke
+into rather than an interleaved stream.</li>
+<li><strong>Anything deeper joins the nearest thread above it</strong>, with its own task code
+in front of each line. Work can nest as far as it likes; Slack stays two
+levels deep, which is as deep as Slack goes.</li>
+<li><strong>Reply where the work is.</strong> A reply in a subtask&#39;s thread reaches that
+subtask — it comments on it, or sends it feedback when it is waiting for
+review — not the task whose channel you are in.</li>
+</ul>
+<p>When a task ends, its channel is archived. If the task is reopened or started
+again, Lazy brings that same channel back rather than making a second one, so
+its history is where you left it.</p>
+<p>If two channels with the same name ever appeared for one piece of work — one
+where everything happens and one that stays empty — that was two parts of Lazy
+asking for the channel at the same moment. Only one channel is made now, whoever
+asks first, and the other request joins it. An empty duplicate left behind by an
+older version is archived on its own the first time Lazy runs after the upgrade;
+a duplicate somebody was added to is left alone, since Lazy cannot tell which of
+the two you have been reading.</p>
+<p>Earlier versions of Lazy gave every subtask a channel of its own, and those
+channels had nobody in them but Lazy — invisible in every sidebar. If your
+install has some, Lazy tidies them up on its own the first time it runs after
+the upgrade: it archives the empty ones and moves that work into a thread where
+you can see it. A channel somebody was actually added to is left exactly as it
+is.</p>
+<p>A task Lazy started by itself, with nobody it can add to a channel, gets no
+channel: a private channel with only Lazy in it cannot be found, opened or
+searched by anyone, so it is worse than none at all. Its work is still there in
+the web UI, and starting the task from Slack (or giving its project a channel)
+is what puts it on Slack.</p>
+<p>Unlinked users cannot create tasks or deliver thread replies until they complete
+step 1–2.</p>
+<h2 id="when-slack-goes-quiet"><a class="anchor" href="#when-slack-goes-quiet" aria-hidden="true">#</a>When Slack goes quiet</h2>
+<p>Lazy holds one connection to Slack and replaces it when Slack asks it to refresh,
+when the network drops, or on its own schedule — each connection starts its
+successor as it finishes, so the handover is a moment rather than a wait.
+Anything Slack could not deliver in that moment it retries, so messages and
+mentions arrive late rather than not at all. A slash command is the exception:
+Slack does not retry those, so one typed into a handover gets Slack&#39;s own
+&quot;couldn&#39;t reach the app&quot; — retype it.</p>
+<p>If nothing from Slack arrives at all, look at <strong>Connection status</strong> on the
+Integrations page first: it says whether Lazy is holding a connection open at
+this moment, which &quot;Test connection&quot; does not — that checks the two tokens.
+Not listening usually means this install is not running its background work
+(see <a href="#what-must-be-running">What must be running</a>); listening, with Slack still
+quiet, is a tokens question, and <strong>Test connection</strong> names which of the two is
+the problem.</p>
+
+</main>
+</body>
+</html>

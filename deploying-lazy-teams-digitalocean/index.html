@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deploying Lazy Teams on DigitalOcean with Kamal — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="deploying-lazy-teams-on-digitalocean-with-kamal"><a class="anchor" href="#deploying-lazy-teams-on-digitalocean-with-kamal" aria-hidden="true">#</a>Deploying Lazy Teams on DigitalOcean with Kamal</h1>
+<p>This guide puts Lazy Teams on a <strong>cloud VPS</strong> — a DigitalOcean droplet or any similar Linux server — with <a href="https://kamal-deploy.org/" rel="noopener noreferrer">Kamal</a>. Kamal pulls (or builds) a container image, SSHes into your server, and runs the app behind <strong>kamal-proxy</strong>.</p>
+<p>For a <strong>local or single-box install</strong> without SSH keys or a registry account, use the <a href="../self-hosting-lazy-teams/">docker compose bundle</a> instead. That path is pull-and-go; this path is for cloud deploy and Kamal-style upgrades.</p>
+<p>The default in this repository is a <strong>private install</strong>: the droplet is not exposed on the public internet, and you reach the UI over an SSH tunnel (or Tailscale). Public HTTPS with Let&#39;s Encrypt is an optional later step.</p>
+<h2 id="which-path-is-for-you"><a class="anchor" href="#which-path-is-for-you" aria-hidden="true">#</a>Which path is for you</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Compose (local path)</th>
+<th>Kamal (this guide)</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Best for</td>
+<td>Homelab, LAN, quick trial on one machine</td>
+<td>Cloud VPS you control over SSH</td>
+</tr>
+<tr>
+<td>Needs</td>
+<td>Docker Compose on the server</td>
+<td>SSH access, a container registry login, Kamal on your laptop</td>
+</tr>
+<tr>
+<td>Default reachability</td>
+<td>Loopback on the server</td>
+<td>Private (SSH tunnel / Tailscale); public HTTPS optional</td>
+</tr>
+<tr>
+<td>Upgrades</td>
+<td><code>docker compose pull &amp;&amp; up -d</code></td>
+<td><code>kamal deploy</code> from your machine</td>
+</tr>
+</tbody></table>
+<p>Both paths use the <strong>same</strong> published image (<code>ghcr.io/getlazy/lazy-teams</code>) and the <strong>same</strong> two data volumes. Neither gives the application container your host&#39;s Docker socket — see <a href="../self-hosting-lazy-teams/#your-docker-socket-stays-on-your-host">your Docker socket stays on your host</a>. Slack uses <strong>outbound</strong> Socket Mode only — nothing on this box needs an inbound Slack URL.</p>
+<blockquote>
+<p><strong>This install does not run agent turns.</strong> Agent turns run in one microVM per project, which needs hardware virtualization, and a droplet has none: DigitalOcean does not offer nested virtualization. Both paths therefore run without microVMs — the Kamal config sets <code>LAZY_FLEET_BACKEND=local</code>, and <code>bootstrap.sh</code> selects the same for compose when it finds no <code>/dev/kvm</code> — and starting a task is refused with the reason. See <a href="../self-hosting-lazy-teams/#task-turns">task turns</a> for what does run them: a server with KVM, such as a bare-metal one.</p>
+</blockquote>
+<h2 id="what-you-need"><a class="anchor" href="#what-you-need" aria-hidden="true">#</a>What you need</h2>
+<ul>
+<li>A <strong>DigitalOcean droplet</strong> (or any amd64 Linux VPS) with <strong>4 GB RAM</strong> and <strong>40 GB disk</strong> recommended — fleet data grows with projects</li>
+<li>On your <strong>laptop</strong>: Ruby (for Kamal), SSH access to the droplet as <code>root</code> (or another user you configure in <code>config/deploy.yml</code>), and a <strong>GitHub personal access token</strong> with <code>read:packages</code> (and <code>write:packages</code> if you build and push images yourself)</li>
+<li>For <strong>public HTTPS only</strong>: a domain name with an A record pointing at the droplet, and ports <strong>80</strong> and <strong>443</strong> open</li>
+</ul>
+<p>You do <strong>not</strong> need Ruby, Bun, or lazy installed on the droplet itself. You do <strong>not</strong> need a public DNS name for the private posture.</p>
+<h2 id="1-prepare-the-droplet"><a class="anchor" href="#1-prepare-the-droplet" aria-hidden="true">#</a>1. Prepare the droplet</h2>
+<p>Create an Ubuntu 24.04 droplet on DigitalOcean. The one-click <strong>Docker</strong> image works; otherwise install Docker Engine:</p>
+<pre><code class="language-bash">ssh root@YOUR_DROPLET_IP
+
+apt-get update
+apt-get install -y ca-certificates curl
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+echo &quot;deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+  https://download.docker.com/linux/ubuntu $(. /etc/os-release &amp;&amp; echo ${VERSION_CODENAME}) stable&quot; \
+  &gt; /etc/apt/sources.list.d/docker.list
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+</code></pre>
+<p>Confirm Docker runs:</p>
+<pre><code class="language-bash">docker info
+</code></pre>
+<h3 id="firewall-for-a-private-install"><a class="anchor" href="#firewall-for-a-private-install" aria-hidden="true">#</a>Firewall for a private install</h3>
+<p>Keep the app off the public internet. Allow SSH from your IP (or VPN) only; leave <strong>80</strong> and <strong>443</strong> closed until you deliberately choose public HTTPS:</p>
+<pre><code class="language-bash"># Example with ufw — adjust to your cloud firewall if you prefer that
+ufw default deny incoming
+ufw allow from YOUR_LAPTOP_IP to any port 22
+ufw enable
+ufw status
+</code></pre>
+<p>DigitalOcean Cloud Firewalls work the same way: inbound <strong>22</strong> from your IP, no public <strong>80</strong>/<strong>443</strong>.</p>
+<h2 id="2-prepare-your-laptop"><a class="anchor" href="#2-prepare-your-laptop" aria-hidden="true">#</a>2. Prepare your laptop</h2>
+<p>Clone the <a href="https://github.com/getlazy/lazy" rel="noopener noreferrer">lazy repository</a> (or use a release tarball) and install Ruby for the Lazy Teams app:</p>
+<pre><code class="language-bash">cd lazy-teams
+gem install bundler
+bundle install
+</code></pre>
+<p>Log in to GitHub Container Registry (same registry the compose bundle uses):</p>
+<pre><code class="language-bash">echo &quot;$GITHUB_TOKEN&quot; | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
+</code></pre>
+<p>Generate application secrets once — <strong>save them somewhere safe</strong>; losing them loses encrypted credentials in the database:</p>
+<pre><code class="language-bash">export SECRET_KEY_BASE=&quot;$(openssl rand -hex 64)&quot;
+bin/rails db:encryption:init   # prints three AR_ENCRYPTION_* lines — export each
+export KAMAL_REGISTRY_PASSWORD=&quot;$GITHUB_TOKEN&quot;
+</code></pre>
+<p>Add those exports to your shell profile or a password manager. They are the same variables <code>bootstrap.sh</code> writes for compose.</p>
+<h3 id="verify-secrets-before-deploy"><a class="anchor" href="#verify-secrets-before-deploy" aria-hidden="true">#</a>Verify secrets before deploy</h3>
+<p>Kamal reads <code>.kamal/secrets</code> with a <strong>dotenv</strong> parser — not a bash shell. Do <strong>not</strong> put <code>${VAR:?…}</code> or <code>${VAR:-…}</code> expansions in that file; they corrupt the stored value. After exporting, print what Kamal will inject:</p>
+<pre><code class="language-bash">bin/kamal secrets print
+</code></pre>
+<p>Check each line: the value must be exactly what you exported (a long hex string for <code>SECRET_KEY_BASE</code>, and so on). If you see a <code>:?</code> or <code>:-</code> suffix glued onto the value, stop and fix <code>.kamal/secrets</code> before deploying — encrypting under a wrong key makes existing rows unreadable later.</p>
+<h2 id="3-configure-kamal"><a class="anchor" href="#3-configure-kamal" aria-hidden="true">#</a>3. Configure Kamal</h2>
+<p>Edit <code>lazy-teams/config/deploy.yml</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Placeholder</th>
+<th>Set to</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>servers.web</code></td>
+<td>Droplet public IP</td>
+</tr>
+<tr>
+<td><code>registry.username</code></td>
+<td>Your GitHub username</td>
+</tr>
+</tbody></table>
+<p>The shipped defaults already match a <strong>private</strong> install (<code>proxy.ssl: false</code>, <code>APP_HOST: localhost</code>, <code>FORCE_SSL: false</code>). Pick an access method below before you deploy — only Option C needs DNS and open HTTP(S) ports.</p>
+<p>Optional mail: add <code>SMTP_PASSWORD</code> and the <code>SMTP_*</code> / <code>MAILER_FROM</code> values under <code>env.clear</code> in <code>deploy.yml</code>, matching <a href="../self-hosting-lazy-teams/#environment-reference">self-hosting environment reference</a>.</p>
+<h3 id="building-from-source-maintainers"><a class="anchor" href="#building-from-source-maintainers" aria-hidden="true">#</a>Building from source (maintainers)</h3>
+<p>By default the config <strong>pulls</strong> the pre-built image from <code>ghcr.io/getlazy/lazy-teams</code>. To build from your checkout instead, uncomment <code>builder.context</code> and <code>builder.dockerfile</code> in <code>deploy.yml</code>.</p>
+<p>On an <strong>Apple Silicon Mac</strong> targeting amd64 droplets, also uncomment <code>builder.remote</code> and point it at an amd64 machine with Docker (a second small droplet works):</p>
+<pre><code class="language-yaml">builder:
+  arch: amd64
+  context: ..
+  dockerfile: lazy-teams/deploy/Dockerfile
+  remote: ssh://root@YOUR_AMD64_BUILDER_IP
+</code></pre>
+<p>Kamal builds on the remote host and pushes to ghcr — your laptop does not need amd64 emulation.</p>
+<h2 id="4-choose-an-access-method"><a class="anchor" href="#4-choose-an-access-method" aria-hidden="true">#</a>4. Choose an access method</h2>
+<h3 id="option-a-ssh-tunnel-default--not-exposed"><a class="anchor" href="#option-a-ssh-tunnel-default--not-exposed" aria-hidden="true">#</a>Option A: SSH tunnel (default — not exposed)</h3>
+<p>Use this when you want to kick the tires on a cloud box without putting Lazy Teams on the public internet.</p>
+<ol>
+<li>Leave <code>proxy.ssl: false</code>, <code>APP_HOST: localhost</code>, and <code>FORCE_SSL: false</code> as shipped.</li>
+<li>Keep ports <strong>80</strong> and <strong>443</strong> closed in the firewall.</li>
+<li>Deploy (section 5).</li>
+<li>On your laptop, forward the proxy port:</li>
+</ol>
+<pre><code class="language-bash">ssh -L 3000:127.0.0.1:80 root@YOUR_DROPLET_IP
+</code></pre>
+<ol start="5">
+<li>Open <code>http://localhost:3000/</code> and complete the in-browser setup.</li>
+</ol>
+<p>Plain HTTP over the tunnel is intentional: <code>FORCE_SSL=false</code> keeps the session cookie working. Do not open the droplet&#39;s port 80 to <code>0.0.0.0</code> for this option.</p>
+<h3 id="option-b-tailscale"><a class="anchor" href="#option-b-tailscale" aria-hidden="true">#</a>Option B: Tailscale</h3>
+<p>Use this when the droplet joins your Tailscale network and you want HTTPS without a public DNS name.</p>
+<ol>
+<li>Install Tailscale on the droplet and your laptop; note the MagicDNS name (e.g. <code>teams-droplet.tailnet-name.ts.net</code>).</li>
+<li>In <code>deploy.yml</code> set:</li>
+</ol>
+<pre><code class="language-yaml">proxy:
+  ssl: false
+  # …healthcheck unchanged…
+
+env:
+  clear:
+    APP_HOST: teams-droplet.tailnet-name.ts.net
+    FORCE_SSL: true
+    ASSUME_SSL: true
+</code></pre>
+<p><code>ASSUME_SSL</code> is required when Tailscale Serve (or a Cloudflare Tunnel) terminates TLS <strong>without</strong> sending <code>X-Forwarded-Proto</code> — otherwise the app redirect-loops. Leave the cloud firewall closed on 80/443; reach the install over the tailnet (or Tailscale Serve on the droplet).</p>
+<ol start="3">
+<li>Deploy, then open <code>https://teams-droplet.tailnet-name.ts.net/</code> (or your Serve URL).</li>
+</ol>
+<h3 id="option-c-public-https-with-lets-encrypt"><a class="anchor" href="#option-c-public-https-with-lets-encrypt" aria-hidden="true">#</a>Option C: Public HTTPS with Let&#39;s Encrypt</h3>
+<p>Use this only when you intentionally want a public hostname.</p>
+<ol>
+<li>Point an A record at the droplet. Open ports <strong>80</strong> and <strong>443</strong> (and keep <strong>22</strong> restricted).</li>
+<li>In <code>deploy.yml</code>:</li>
+</ol>
+<pre><code class="language-yaml">proxy:
+  ssl: true
+  host: teams.example.com
+  app_port: 80
+  healthcheck:
+    path: /up
+    interval: 3
+    timeout: 5
+
+env:
+  clear:
+    APP_HOST: teams.example.com
+    # FORCE_SSL defaults to true when unset — omit FORCE_SSL: false
+</code></pre>
+<p><code>proxy.host</code> and <code>APP_HOST</code> must match. Deploy, then open <code>https://teams.example.com/</code>.</p>
+<h2 id="5-deploy"><a class="anchor" href="#5-deploy" aria-hidden="true">#</a>5. Deploy</h2>
+<p>From <code>lazy-teams/</code> on your laptop:</p>
+<pre><code class="language-bash">bin/kamal secrets print   # confirm values look right — no garbage suffixes
+bin/kamal config          # config renders without error
+bin/kamal setup           # once: Docker network, kamal-proxy, registry login on the server
+bin/kamal deploy --skip-push --version=&lt;release-tag&gt;   # the release tag you are deploying, e.g. v0.23.1234
+</code></pre>
+<p>Use <code>--skip-push</code> when deploying the <strong>pre-built</strong> image from ghcr without rebuilding on your laptop. Images built from <code>lazy-teams/deploy/Dockerfile</code> include a <code>service=lazy_teams</code> label so Kamal can prune old images cleanly; older published tags without that label still deploy, but pruning may leave unused images behind.</p>
+<p><strong>First boot takes a minute or two</strong> while the database is prepared and Rails boots. Watch logs:</p>
+<pre><code class="language-bash">bin/kamal logs
+</code></pre>
+<p>When deploy finishes, open the URL for your access method (section 4) and complete the in-browser setup (first administrator, team name, invitations) — same as the compose path.</p>
+<h2 id="6-smoke-checks"><a class="anchor" href="#6-smoke-checks" aria-hidden="true">#</a>6. Smoke checks</h2>
+<p>After deploy, verify:</p>
+<pre><code class="language-bash"># Option A — with the SSH tunnel up:
+curl -fsS &quot;http://localhost:3000/up&quot; &amp;&amp; echo OK
+
+# Option C — public HTTPS:
+# curl -fsS &quot;https://teams.example.com/up&quot; &amp;&amp; echo OK
+
+# Both named volumes exist on the droplet
+ssh root@YOUR_DROPLET_IP docker volume ls | grep lazy_teams
+</code></pre>
+<p>The app container is deliberately not given your Docker socket, so there is
+nothing to check there — <code>docker info</code> inside it is expected to fail, and that
+is the install behaving correctly.</p>
+<p>Sign in and create a project — that proves provisioning, hosted git and the project daemon are working. Starting a task is refused on purpose; see <a href="../self-hosting-lazy-teams/#task-turns">task turns</a>.</p>
+<h2 id="upgrading"><a class="anchor" href="#upgrading" aria-hidden="true">#</a>Upgrading</h2>
+<pre><code class="language-bash">bin/kamal deploy --skip-push --version=NEW_TAG
+</code></pre>
+<p>Project data in the two volumes survives container replacement. Your projects restart on the new version automatically, within a minute or so of the app coming up.</p>
+<p>If your install predates the image-layout change, update the repository checkout along with the image tag. The storage volume&#39;s mount point inside the image moved from <code>/rails/storage</code> to <code>/lazy/lazy-teams/storage</code> — the <code>lazy_teams_storage</code> volume and your data are unchanged — and deploying the new image under the old <code>deploy.yml</code> would mount the volume where the app no longer looks, so the app would come up against an empty database. Deploying from an up-to-date checkout is all it takes.</p>
+<h2 id="backing-up-and-moving-off-the-box"><a class="anchor" href="#backing-up-and-moving-off-the-box" aria-hidden="true">#</a>Backing up and moving off the box</h2>
+<p>All durable state lives in two Docker volumes on the droplet:</p>
+<table>
+<thead>
+<tr>
+<th>Volume</th>
+<th>Contents</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>lazy_teams_storage</code></td>
+<td>Rails SQLite databases (teams, users, encrypted credentials, Solid Queue/Cache/Cable DBs)</td>
+</tr>
+<tr>
+<td><code>lazy_teams_fleet</code></td>
+<td>Per-project task stores, git clones, daemon state, hosted bare repos</td>
+</tr>
+</tbody></table>
+<p>Back up both before major changes or migration:</p>
+<pre><code class="language-bash"># From your laptop — stop the app so SQLite files are quiesced
+cd lazy-teams
+bin/kamal app stop
+
+ssh root@YOUR_DROPLET_IP &#39;mkdir -p /root/lazy-teams-backup &amp;&amp; docker run --rm \
+  -v lazy_teams_storage:/from/storage:ro \
+  -v lazy_teams_fleet:/from/fleet:ro \
+  -v /root/lazy-teams-backup:/backup \
+  alpine sh -c &quot;tar czf /backup/lazy-teams-\$(date +%Y%m%d).tgz -C /from storage fleet&quot; &amp;&amp; \
+  ls -lh /root/lazy-teams-backup/&#39;
+</code></pre>
+<p>Copy the tarball off the droplet with <code>scp</code>. Restart with <code>bin/kamal deploy</code> (or <code>bin/kamal app boot</code> if you only stopped). To restore on a new server, recreate the volumes and extract before your first <code>kamal deploy</code>.</p>
+<p>DigitalOcean <strong>Volumes</strong> (block storage) can hold tarball backups off-droplet; the running install uses Docker named volumes on the droplet disk by default, which is enough for a single-box deployment.</p>
+<h2 id="what-this-guide-cannot-verify-for-you"><a class="anchor" href="#what-this-guide-cannot-verify-for-you" aria-hidden="true">#</a>What this guide cannot verify for you</h2>
+<p>The steps above were written and validated against the Kamal configuration and production boot requirements in the repository. A full end-to-end deploy needs <strong>your</strong> DigitalOcean account and registry credentials. Run these yourself and treat the output as the source of truth:</p>
+<pre><code class="language-bash">cd lazy-teams
+bin/kamal secrets print
+bin/kamal config
+bin/kamal setup
+bin/kamal deploy --skip-push --version=YOUR_TAG
+bin/kamal logs -f
+</code></pre>
+<p>If something fails, use <strong>God mode → Troubleshooting</strong> in the web UI (site administrator).</p>
+<h2 id="getting-help"><a class="anchor" href="#getting-help" aria-hidden="true">#</a>Getting help</h2>
+<ul>
+<li><a href="../self-hosting-lazy-teams/">Self-hosting Lazy Teams (compose path)</a> — environment variables, task isolation, hosted git</li>
+<li><a href="../lazy-teams-agents/">Agents in Lazy Teams</a> — Claude/Cursor credentials after install</li>
+<li><a href="../slack-rooms/">Slack rooms</a> — Socket Mode setup (no public URL required for Slack)</li>
+</ul>
+
+</main>
+</body>
+</html>

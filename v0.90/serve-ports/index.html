@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reaching a task&amp;#39;s dev server — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="reaching-a-tasks-dev-server"><a class="anchor" href="#reaching-a-tasks-dev-server" aria-hidden="true">#</a>Reaching a task&#39;s dev server</h1>
+<p>A task runs in its own environment. When the work is a web app, that environment
+has a dev server in it — and until you can open it in a browser, the task is only
+half usable.</p>
+<p>Declare the ports your project serves on, and every task&#39;s dev server gets its
+own name in the browser. <code>lazy url</code> tells you where.</p>
+<pre><code class="language-toml"># lazy.toml
+[serve]
+ports = [3000, 5173]
+</code></pre>
+<pre><code class="language-bash">lazy start my-task
+lazy url my-task
+# 3000  http://3000.my-task.lazy.localhost:26024  ● listening
+# 5173  http://5173.my-task.lazy.localhost:26024  ○ not listening
+
+open &quot;$(lazy url my-task 3000)&quot;
+</code></pre>
+<p>The dot is a liveness check: ● means a plain TCP connect to the port the
+container publishes succeeds — something is listening behind the URL right now;
+○ means the port is published but nothing answers yet (the dev server has not
+started, or has stopped). The check connects and immediately closes without
+sending a byte, so it never counts as a request to your app. With a service
+argument (<code>lazy url my-task 3000</code>) the output stays exactly one bare URL, so it
+keeps composing in scripts.</p>
+<h2 id="naming-services"><a class="anchor" href="#naming-services" aria-hidden="true">#</a>Naming services</h2>
+<p>With more than a port or two, the number stops being a good name. Give them one:</p>
+<pre><code class="language-toml">[serve.services]
+web = 3000
+api = 8080
+storybook = 6006
+</code></pre>
+<pre><code class="language-bash">lazy url my-task            # web  http://web.my-task.lazy.localhost:26024
+                            # api  http://api.my-task.lazy.localhost:26024
+                            # ...
+lazy url my-task web        # http://web.my-task.lazy.localhost:26024
+</code></pre>
+<p>Both spellings can be used together — <code>ports</code> for the ones whose number <em>is</em> the
+name, <code>[serve.services]</code> for the ones worth naming. A bare port from <code>ports</code> is
+addressed by its number (<code>lazy url my-task 5173</code>); a named service is addressed
+by name or by its container port, case-insensitively. Service names must start
+with a letter, so a name is never mistaken for a port.</p>
+<p>The same mapping shows up in <code>lazy show</code>, and in the web UI as a <strong>Services</strong>
+card on both the task detail page and the review page: each service with its
+URL as a link, a green/grey liveness dot from the same TCP check <code>lazy url</code>
+uses, and the <code>lazy url &lt;task&gt; &lt;service&gt;</code> command ready to copy. The task
+<em>list</em> does not show it: the live mapping means a runtime call per task, which
+is not a cost a list render should pay for information nobody asked for yet.</p>
+<h2 id="the-url-is-a-name-servicetasklazylocalhost"><a class="anchor" href="#the-url-is-a-name-servicetasklazylocalhost" aria-hidden="true">#</a>The URL is a name: <code>&lt;service&gt;.&lt;task&gt;.lazy.localhost</code></h2>
+<p>That URL is served by the running lazy daemon, on the same port as the
+dashboard. The daemon reads the hostname, finds the task&#39;s container and the
+port it publishes, and forwards the request there — including WebSockets, so
+hot reload and ActionCable work through it.</p>
+<p>Two things that gets you, both of which a bare <code>127.0.0.1:49154</code> cannot:</p>
+<ul>
+<li><strong>Each task gets its own cookie jar.</strong> Cookies ignore ports, so every task app
+on <code>127.0.0.1</code> shares one — two tasks running the same Rails app would log
+each other out on every page load. <code>my-task</code> and <code>other-task</code> are different
+hosts, so their sessions no longer collide.</li>
+<li><strong>The URL stops moving.</strong> The published host port is assigned when the
+container is created, so it changes on every recreate. The name does not: a
+browser tab, a bookmark, or a note in a PR keeps working across restarts.</li>
+</ul>
+<p>The task part is the task&#39;s <strong>code</strong> when it has one, and its short id
+otherwise (<code>http://web.a1b2c3d4.lazy.localhost:26024</code>). That is why task codes
+are restricted to what a hostname allows — lowercase letters, digits and
+hyphens, up to 63 characters. Older tasks whose code does not fit keep it
+and keep working everywhere else; in a URL they are addressed by
+short id, which is what <code>lazy url</code> prints for them. The service part is the
+service name, or the container port for a bare <code>[serve] ports</code> entry.</p>
+<h3 id="--direct-for-curl-and-scripts"><a class="anchor" href="#--direct-for-curl-and-scripts" aria-hidden="true">#</a><code>--direct</code> for curl and scripts</h3>
+<p>Chromium and Firefox resolve <code>*.localhost</code> to loopback themselves, so nothing
+has to be installed for a browser to reach these names. <strong>The OS resolver
+usually does not</strong>, and a wildcard cannot go in <code>/etc/hosts</code> — so <code>curl</code>, an
+HTTP client in a script, and anything else that is not a browser needs the raw
+mapping:</p>
+<pre><code class="language-bash">curl &quot;$(lazy url my-task web --direct)&quot;   # http://127.0.0.1:49154
+</code></pre>
+<p><code>--direct</code> works in both shapes — with a service argument it prints the one
+bare loopback URL, and without one it lists them all.</p>
+<h2 id="when-nothing-is-listening"><a class="anchor" href="#when-nothing-is-listening" aria-hidden="true">#</a>When nothing is listening</h2>
+<p>Opening a task service in a browser when the dev server is not up does not
+give you the browser&#39;s own &quot;connection refused&quot; page. The daemon knows why it
+could not forward, so it sends you to that task&#39;s page in the web UI with a
+banner saying which service you opened and what is wrong — the container is not
+running, or it is running and nothing is listening on that port — followed by
+the same <strong>Start container</strong> and <strong>Start services</strong> buttons the page already
+has, and a <em>Try again</em> link back to the URL you tried.</p>
+<p>Only browser <em>navigations</em> are redirected. An asset, an XHR or a <code>fetch</code> gets a
+<code>502</code> with a one-line explanation instead, because answering those with an HTML
+page produces a confusing failure rather than a clear one.</p>
+<p>Nothing on that page starts anything by itself. Pressing a button does; opening
+a URL never does, and no page you visit elsewhere can start a container by
+embedding a task URL.</p>
+<h2 id="what-the-host-port-is-and-why-it-isnt-3000"><a class="anchor" href="#what-the-host-port-is-and-why-it-isnt-3000" aria-hidden="true">#</a>What the host port is, and why it isn&#39;t 3000</h2>
+<p>Every task gets an <strong>OS-assigned</strong> host port (docker&#39;s <code>-p 127.0.0.1:0:3000</code>),
+not a fixed one. That is what makes five tasks that all serve on 3000 able to run
+at once — a fixed host port would mean the second task&#39;s container fails to
+start. The runtime is the source of truth for the mapping; <code>lazy url</code> asks it,
+so a mapping is never stale.</p>
+<p>The binding is <strong>loopback only</strong>. A task&#39;s dev server is for the person driving
+the task, not for the coffee-shop network the laptop is on.</p>
+<h2 id="changing-serve-takes-effect-on-the-next-container"><a class="anchor" href="#changing-serve-takes-effect-on-the-next-container" aria-hidden="true">#</a>Changing <code>[serve]</code> takes effect on the next container</h2>
+<p>Published ports are fixed when a container is <strong>created</strong> — neither docker nor
+podman can add a mapping to a running container. So editing <code>[serve]</code> does not
+change a task that is already up. <code>lazy show</code> says so plainly:</p>
+<pre><code>  Serving:
+    web → http://web.my-task.lazy.localhost:26024
+    api → (not published — restart to pick up [serve])
+</code></pre>
+<p>To pick the change up on a task that is already up:</p>
+<pre><code class="language-bash">lazy shell my-task --restart
+</code></pre>
+<p>That recreates the container with the current <code>[serve]</code> and drops you into it —
+so anything running inside (including a dev server) stops. It is refused while
+the agent is mid-turn; <code>lazy stop &lt;task&gt;</code> first, or wait for the turn to end.</p>
+<p><code>[serve]</code> is read from the <strong>project root&#39;s</strong> <code>lazy.toml</code>, like every other
+setting — a copy inside a task worktree is ignored. A branch that adds a service
+gets it once the change is on the root, which is also the config a task&#39;s
+container is created from. The Services tab on the task page still <em>shows</em>
+those branch-only ports, each with <code>lazy forward &lt;task&gt; &lt;port&gt;</code> so you can
+reach them while the container is up, without treating the worktree file as
+config.</p>
+<h2 id="one-off-ports-lazy-forward"><a class="anchor" href="#one-off-ports-lazy-forward" aria-hidden="true">#</a>One-off ports: <code>lazy forward</code></h2>
+<p><code>[serve]</code> is for the ports a project <em>always</em> serves on. For the ones you want
+once — a database you feel like poking at, a debug server, a port you never
+declared — there is <code>lazy forward</code>:</p>
+<pre><code class="language-bash">lazy forward my-task 5432
+# Forwarding 127.0.0.1:49231 -&gt; lazy-my-task:5432
+#
+# Forwarding while this command runs. Press Ctrl-C to stop.
+</code></pre>
+<p>It runs in the foreground and forwards for exactly as long as it runs. Ctrl-C
+closes every listener and every connection it was carrying; nothing is left
+published, and nothing is registered anywhere to clean up later.</p>
+<p>Each argument is a port pair:</p>
+<pre><code class="language-bash">lazy forward my-task 3000                 # container 3000 → an assigned host port
+lazy forward my-task 8080:3000            # container 3000 → 127.0.0.1:8080
+lazy forward my-task 8080:3000 5433:5432  # as many pairs as you like
+</code></pre>
+<p>A bare number means &quot;assign me a free host port&quot;, which is the spelling that can
+never collide with something already on your machine. Either way the resolved
+address is printed as soon as the listener is up, one line per pair.</p>
+<p>Like <code>[serve]</code>, the listener is <strong>loopback only</strong> — a forwarded port is never
+exposed to the network the machine is on.</p>
+<p>Two things it deliberately does not do. It never starts a container: a freshly
+created one has nothing listening yet, so a forward into it would be dead on
+arrival. Bring the task up with <code>lazy shell my-task</code> first, start
+whatever should be listening, then forward in another terminal. And it does not
+show up in <code>lazy url</code>, which reports what the <em>container</em> publishes — a forward
+lives only in the terminal you started it in.</p>
+<p>If the task&#39;s image is old enough to predate lazy shipping <code>socat</code> (which is how
+a forwarded connection reaches a port inside the container), the command says so
+up front and points at <code>lazy upgrade --images</code>.</p>
+<h2 id="working-inside-the-tasks-environment"><a class="anchor" href="#working-inside-the-tasks-environment" aria-hidden="true">#</a>Working inside the task&#39;s environment</h2>
+<p>The typical loop: get a shell in the container, set things up, start the server,
+open it.</p>
+<pre><code class="language-bash">lazy shell my-task      # a shell inside the task&#39;s container
+# ... npm install, npm run dev ...
+
+# in another terminal
+lazy url my-task web
+</code></pre>
+<p><code>lazy shell &lt;task&gt;</code> opens a shell inside the task&#39;s container by default: the
+same node, the same installed packages, the same network as the agent sees.
+<code>lazy shell &lt;task&gt; --host</code> gives you a shell in the task&#39;s worktree on your own
+machine instead, which is the right thing for git and host editors.
+(<code>--container</code> is still accepted as a deprecated no-op alias for the default.)</p>
+<p>If the task&#39;s container is not running, <code>lazy shell</code> starts it first and says so
+— which also means the container is created fresh, picking up the current
+<code>[serve]</code>.</p>
+<h2 id="runners-without-containers"><a class="anchor" href="#runners-without-containers" aria-hidden="true">#</a>Runners without containers</h2>
+<p>Everything on this page needs a container runner (<code>docker</code> or <code>podman</code>): task
+servers are reached through the container&#39;s published ports. The
+<code>dangerously-host-process-without-any-isolation</code> runner has no container and so
+no port mapping — a dev server a task starts there listens directly on your
+machine.</p>
+
+</main>
+</body>
+</html>

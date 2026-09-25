@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lazy review — agent review of a task&amp;#39;s work — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="lazy-review--agent-review-of-a-tasks-work"><a class="anchor" href="#lazy-review--agent-review-of-a-tasks-work" aria-hidden="true">#</a><code>lazy review</code> — agent review of a task&#39;s work</h1>
+<p><code>lazy review &lt;task&gt;</code> runs a <strong>reviewer agent</strong> against a task&#39;s branch. It is
+an action, not a browser.</p>
+<h2 id="when-this-reviewer-runs-at-all"><a class="anchor" href="#when-this-reviewer-runs-at-all" aria-hidden="true">#</a>When this reviewer runs at all</h2>
+<p><strong>Only in <code>separate</code> mode.</strong> A task&#39;s <a href="../review-paradigm/">review mode</a> decides
+how it gets read, and the default is <code>low_high</code>: the writer reviews its own work
+inside its own session, with the diff still in context, and nothing here runs.
+Put a task in <code>separate</code> mode — <code>lazy create</code>/<code>start</code>/<code>edit --review separate</code>,
+or <code>[review] mode</code> for the whole project — and everything on this page applies
+to it.</p>
+<p><strong>You can run <code>lazy review &lt;task&gt;</code> by hand in any mode, and what it finds
+GATES.</strong> A review you asked for is a deliberate act — nobody spends a review
+turn they did not want — so its findings above medium hold the accept whatever
+mode the task is in. Only lazy&#39;s own automatic dispatch follows the mode. It is
+still never <em>required</em> to reach an accept; it is just not ignorable once it has
+run. (<code>[review] gate = &quot;never&quot;</code> switches even that off, and is the only thing
+that does.)</p>
+<h2 id="the-review-that-starts-itself"><a class="anchor" href="#the-review-that-starts-itself" aria-hidden="true">#</a>The review that starts itself</h2>
+<p>In <code>separate</code> mode, declaring a task&#39;s work done starts a review on it without
+anyone asking, and its verdict gates acceptance: <code>lazy accept</code> refuses while the
+latest review left something above medium severity outstanding, failed, or never
+ran. (<a href="../review-paradigm/">Why lazy reviews by default, and why the default is the fast
+one</a>.)</p>
+<p><strong>Accept never disregards a review in silence.</strong> If your settings let a merge
+through over a review that found something — the mode ignores lazy&#39;s own
+dispatch, or the gate is <code>never</code> — the accept output says so in one line and
+points you at the report.</p>
+<p>If that review finds something, what happens next is <code>[review] auto_fix</code>, and it
+is <strong>off by default</strong>: the task parks with the findings on its review turn, and
+whoever is driving — you, or a <a href="../cluster-tasks/">cluster</a> driver — decides
+whether another round is worth its half hour. Turn <code>auto_fix</code> on and the
+findings go straight back to the agent as the brief for its next turn instead,
+the work is declared done again, and the next review starts: two rounds like
+that, then the task parks anyway. A task parked either way resumes the moment
+you unblock it with direction, and every fresh start of the cycle begins the
+rounds anew.</p>
+<p><strong>Findings are feedback, not items to triage.</strong> They are recorded on the review
+turn and handed to the fixer; nothing is left on your Raised tab afterwards for
+a defect that was fixed two turns later. What you should find at the end is the
+last review, clean, and the history behind it.</p>
+<p>The reviewer raises something for you in exactly one case: <strong>the task cannot be
+completed without compromising security or data integrity, or its goal
+contradicts itself.</strong> That is a decision only you can make, and it parks the task
+at once. A defect that can simply be fixed — of any severity, security and data
+integrity included — is a finding, because there is nothing there to decide.</p>
+<p>Each declaration is reviewed once: re-running <code>lazy review</code> yourself is never
+required to reach an accept, and a review you start by hand is a second
+opinion — it never counts towards the automatic rounds.</p>
+<h2 id="the-verdict-is-one-of-three-words"><a class="anchor" href="#the-verdict-is-one-of-three-words" aria-hidden="true">#</a>The verdict is one of three words</h2>
+<p>Every review ends with <strong><code>clean</code></strong>, <strong><code>needs_work</code></strong>, or <strong><code>needs_human</code></strong>, and
+lazy acts on that word mechanically:</p>
+<table>
+<thead>
+<tr>
+<th>Verdict</th>
+<th>What happens</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>clean</code></td>
+<td>nothing to fix — acceptance is clear</td>
+</tr>
+<tr>
+<td><code>needs_work</code></td>
+<td>the task parks with the findings, or — with <code>[review] auto_fix</code> on — they become the next turn&#39;s brief, up to the two-round cap</td>
+</tr>
+<tr>
+<td><code>needs_human</code></td>
+<td>the task parks for your decision</td>
+</tr>
+</tbody></table>
+<p>A <code>clean</code> that contradicts itself is not clean. If the review lists findings at
+critical or high severity, or its security or data-integrity statement describes
+a real problem, that problem holds acceptance whatever the verdict word says.</p>
+<p><strong>Findings at medium or below do not hold acceptance.</strong> They are recorded, they
+are handed to the fixer when a round runs, and they ride along on a merge you
+decide to make — a reviewer&#39;s opinion about work you are about to read anyway is
+not a reason to spend an agent turn or interrupt a person.</p>
+<p>Anything else — &quot;approve&quot;, &quot;LGTM&quot;, a sentence — is a <strong>failed review</strong>. The
+reviewer gets one chance to restate its verdict, and if it still will not, the
+review is recorded as failed: it is listed with a failure banner and it holds
+acceptance exactly as <code>needs_work</code> would. A verdict nobody can act on is not a
+pass.</p>
+<p>A reviewer that crashes, or that never starts at all (a provider outage, a
+runner that will not launch), is treated the same way: you see a failed review
+rather than a task that quietly looks un-reviewed. A crash also releases the
+task — whether the reviewer died loudly or its container simply vanished — so
+asking for another review afterwards just works, and <code>lazy stop</code> can end a
+review that is still running however the task&#39;s own status reads.</p>
+<p>One thing is <strong>not</strong> a failed review: a review that was simply refused because
+the task was busy. Only one turn runs on a task at a time, so a review asked for
+while another turn — including another review — is running is turned away with
+&quot;the task is busy&quot;; the automatic review waits and tries again, and the turn
+that was already running is left to finish. Nothing is recorded against the task
+for that, and nothing holds acceptance because of it.</p>
+<p>To accept anyway, decide it yourself: <code>lazy accept &lt;task&gt; --allow-review-issues</code>.</p>
+<h2 id="what-the-reviewer-is"><a class="anchor" href="#what-the-reviewer-is" aria-hidden="true">#</a>What the reviewer is</h2>
+<p>The reviewer:</p>
+<ul>
+<li>runs in a <strong>short-lived container of its own</strong>, mounting the <strong>same worktree</strong>
+as the task (it does not reuse the implementer&#39;s container or its command
+channel — the implementer&#39;s waiting supervisor cannot pick up the review)</li>
+<li>starts a <strong>new session</strong> — it does not resume the implementer&#39;s conversation</li>
+<li>is <strong>read-only on the worktree</strong>: Claude Code write tools are disallowed,
+Cursor runs in its native read-only mode, and most lazy write tools are not
+advertised — except <strong><code>lazy_raise</code></strong>, for the one <code>needs_human</code> decision</li>
+<li>records its issues as <strong>findings</strong> in its report, which lazy hands to the
+implementer as the brief for its next turn</li>
+<li>sweeps <strong>security</strong> and <strong>data integrity</strong> first, then correctness, tests,
+incomplete work, and style</li>
+<li>must say explicitly whether it found a security issue and whether it found a
+data-integrity issue (<code>none found</code> when that sweep is clean — silence is not
+a pass). A report that omitted those statements, or whose verdict is not one
+of the three words, is labelled <code>FAILED REVIEW (unparsed)</code> and holds
+acceptance. A sweep that names an issue no finding covers is recorded as a
+finding of its own, so it still reaches the fixer</li>
+<li>runs on a paused task (<code>blocked</code>, <code>conflict</code>, <code>submitted</code>, or <code>interrupted</code>).
+Finished tasks (<code>complete</code>, <code>abandoned</code>) are refused — their worktree is
+normally gone</li>
+<li>leaves the task in the status it found (submitted stays submitted)</li>
+</ul>
+<pre><code>lazy review &lt;task-id&gt;
+lazy review &lt;task-id&gt; --yes --effort max
+</code></pre>
+<p><code>--yes</code> skips the confirmation. <code>--no-wait</code> starts the review and returns
+without waiting for the report. <code>--model</code> and <code>--effort</code> apply to this review
+only and are not written back to the task.</p>
+<h2 id="how-long-a-review-may-take-and-how-to-stop-one"><a class="anchor" href="#how-long-a-review-may-take-and-how-to-stop-one" aria-hidden="true">#</a>How long a review may take, and how to stop one</h2>
+<p><strong>There is no time limit on a review.</strong> A large diff at high effort routinely
+takes many minutes, and lazy lets it finish. The only guard is the ordinary
+agent watchdog — the same one that catches a work turn that has stopped
+producing output.</p>
+<p><code>lazy review</code> waits for the report and prints it. If you would rather not sit
+there, interrupt the command: the review keeps running, and its report lands as
+a <code>review</code> turn on the task (<code>lazy show &lt;task&gt;</code>, the Reviews tab, the task
+page) with its findings on it.</p>
+<p>To end a review you no longer want at all, <strong><code>lazy stop &lt;task&gt;</code></strong>. That stops
+the reviewer itself, records the stop as the review&#39;s ending, keeps anything it
+had already filed, and puts the task back in the status the review found.
+The same goes for a question started with <code>lazy ask</code>.</p>
+<p>Agents work the other way round: <code>lazy_review</code> and <code>lazy_ask</code> <strong>start</strong> the turn
+and return immediately, and the agent waits with <code>lazy_wait</code> before reading the
+turn. See <a href="../surface-asymmetries/">surface asymmetries</a>.</p>
+<p>Issues live on the review turn as <strong>findings</strong>. After a review that found
+something, the web Review dialog can start an <strong>auto-fix</strong> work turn that
+injects those findings into the agent&#39;s brief; the agent fixes them, and says so
+in its response if it thinks one is wrong — the next review then either agrees
+or files it again. A <code>needs_human</code> decision is the one thing that arrives as a
+Raise, and the agent replies to it with <code>lazy_raised_item_comment</code> (which does
+not dismiss it — only you do that). MCP callers use <code>lazy_review</code> with the same
+ownership gate as the other write verbs (own task or a direct subtask; the
+builder is unrestricted). In the web UI, <strong>Review</strong> on the task page runs this
+same verb; the <strong>Reviews</strong> tab lists every review, failed ones included. See
+<a href="../web-review/#agent-review-from-the-task-page">the web review page</a>.</p>
+<h3 id="reviews-stay-on-the-task"><a class="anchor" href="#reviews-stay-on-the-task" aria-hidden="true">#</a>Reviews stay on the task</h3>
+<p><strong>A review is never posted to a pull or merge request.</strong> The report lives on
+the task — <code>lazy show &lt;task&gt;</code>, the Reviews tab, the task page — and nowhere
+else. That is true whether the PR is one lazy opened or one you
+<a href="../link/">linked</a>, and there is no setting that turns posting back on.</p>
+<p>Lazy writes only these things to a PR: it creates it (<code>lazy submit</code>), it keeps
+its own delimited section of the description current, and — only when you turn
+on <code>[remote] auto_approve</code> for a protected target that requires an approval —
+it submits an approving review so the merge can go through. It also closes a
+PR it tracks when you reject or close the task, or when <code>lazy accept</code> merged
+the work locally rather than through the forge. It posts no comments, so
+watchers of the pull request are not notified for every review round.</p>
+<p><code>lazy review --post</code> is still accepted so older scripts do not fail on an
+unknown flag, but it does nothing and says so.</p>
+<p>The former full-screen artifact browser is now <code>lazy browse</code> (including <code>-i</code>
+for hunk-by-hunk Q&amp;A).</p>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agents in Lazy Teams — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="agents-in-lazy-teams"><a class="anchor" href="#agents-in-lazy-teams" aria-hidden="true">#</a>Agents in Lazy Teams</h1>
+<p>This page is for Lazy Teams members and admins choosing which coding agent runs
+a task and connecting the credentials those agents use. Lazy ships <strong>Claude
+Code</strong>, <strong>Codex</strong>, <strong>Cursor</strong> and <strong>Pi</strong>, and a project can define more of its
+own. Each agent bills turns to a different account, so the product keeps agent
+choice and credentials explicit.</p>
+<h2 id="choosing-an-agent-for-a-task"><a class="anchor" href="#choosing-an-agent-for-a-task" aria-hidden="true">#</a>Choosing an agent for a task</h2>
+<p>When you create a task, the <strong>Agent</strong> field lets you pick which agent runs it.
+The form preselects your project&#39;s default (see below). Pick another agent to
+override for that task only.</p>
+<h3 id="the-agents-your-project-offers"><a class="anchor" href="#the-agents-your-project-offers" aria-hidden="true">#</a>The agents your project offers</h3>
+<p>The list is your project&#39;s own. A project can name its own agents in its
+lazy.toml — a named combination of which agent software drives the work and
+which model it asks for — and those are offered first, above the ones lazy
+ships with. Each one says what it runs beside its name, so two agents built on
+the same software but pointed at different models are told apart without
+opening a config file.</p>
+<p>You choose an agent by name and nothing else: where its traffic goes and which
+key pays for it are set where the project is configured, and are never part of
+filling in a task form.</p>
+<p>If a project&#39;s agents cannot be read just now, the form falls back to the ones
+lazy ships with rather than guessing.</p>
+<p>The agent is fixed for a task once work has started. Change it only on tasks
+still in the backlog, before the first turn.</p>
+<h2 id="project-default-agent"><a class="anchor" href="#project-default-agent" aria-hidden="true">#</a>Project default agent</h2>
+<p>Team <strong>admins</strong> set the default under <strong>Settings</strong> on a project page. The control
+shows what the repository&#39;s lazy.toml specifies and what this Lazy Teams install
+overrides, so you always see both values and which one wins.</p>
+<p>Clearing the override returns new tasks to the repository default. Changing the
+default affects tasks that have not started yet; a task already running keeps the
+agent it began with.</p>
+<h2 id="model-and-reasoning-effort"><a class="anchor" href="#model-and-reasoning-effort" aria-hidden="true">#</a>Model and reasoning effort</h2>
+<p>Beside the agent, the new-task form takes a <strong>Model</strong> and an <strong>Effort</strong> — how
+hard the agent thinks before it acts. Leave either blank and the project&#39;s own
+default decides.</p>
+<p>What you pick is kept on the task, not just on the run you are about to start.
+A task added to the backlog with <strong>Very high</strong> effort still runs at very high
+effort when somebody starts it days later from its own page.</p>
+<h2 id="agent-credentials"><a class="anchor" href="#agent-credentials" aria-hidden="true">#</a>Agent credentials</h2>
+<p>Open <strong>Agent credentials</strong> from your account menu (top right).</p>
+<h3 id="claude-code"><a class="anchor" href="#claude-code" aria-hidden="true">#</a>Claude Code</h3>
+<p>Connect your own Anthropic account here — subscription token or API key. Lazy
+Teams stores it encrypted, never shows it again, and uses it for Claude Code
+turns <strong>you</strong> start. Use <strong>Test credential</strong> to check it before running work.</p>
+<p>Each project can also designate one member&#39;s credential for <strong>automations</strong>
+(turns nobody started). Only an admin can set that, and only from their own
+connected account.</p>
+<h3 id="cursor"><a class="anchor" href="#cursor" aria-hidden="true">#</a>Cursor</h3>
+<p>Cursor turns use an API key configured <strong>for each project</strong> by your team&#39;s
+operators — not a personal credential you connect in this menu. Every member on
+a Cursor task shares that project&#39;s key until per-user Cursor credentials exist.</p>
+<h3 id="pi"><a class="anchor" href="#pi" aria-hidden="true">#</a>Pi</h3>
+<p>Pi turns have no Pi-specific credential at all: they run on the same Anthropic
+(or Ollama) credentials as Claude Code turns, so the per-user credential you
+connect for Claude Code covers Pi tasks too.</p>
+<h2 id="cli-vs-teams"><a class="anchor" href="#cli-vs-teams" aria-hidden="true">#</a>CLI vs Teams</h2>
+<p>The lazy CLI chooses agents with <code>agent_id</code> in lazy.toml and <code>--agent</code> on
+<code>lazy create</code> / <code>lazy start</code>. A <strong>project default agent</strong> set in Lazy Teams
+(or via the daemon&#39;s project settings) applies when you omit <code>--agent</code> on
+<code>lazy create</code> and on MCP task creation too — the same overlay, not a separate
+Teams-only default.</p>
+
+</main>
+</body>
+</html>

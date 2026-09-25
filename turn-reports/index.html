@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Structured turn reports — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="structured-turn-reports"><a class="anchor" href="#structured-turn-reports" aria-hidden="true">#</a>Structured turn reports</h1>
+<p>At the end of a turn, an agent can deliver a <strong>typed report</strong> instead of only a
+long prose summary. Review surfaces (<code>lazy show</code>, web review, the review TUI,
+<strong>Lazy Teams</strong> task and accept pages) prefer that structured payload when it is
+present; if the agent skips the tool, the final message is shown as prose —
+same as before.</p>
+<h2 id="lazy_report"><a class="anchor" href="#lazy_report" aria-hidden="true">#</a><code>lazy_report</code></h2>
+<p>From a task agent, call <code>lazy_report</code> with one or more sections. You choose
+<strong>authoring</strong> order; reviewers see what changed for a user before how it was
+done (agent order is kept within each of those). Kinds:</p>
+<table>
+<thead>
+<tr>
+<th>Kind</th>
+<th>Use for</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>behavior_change</code></td>
+<td>What a user or operator observes differently. Write this for someone who will not read the diff: no file or function names. Screenshots and diagrams belong here.</td>
+</tr>
+<tr>
+<td><code>capabilities_lost</code></td>
+<td>Broken, degraded, or missing capability — shown next to behavior, not buried below code</td>
+</tr>
+<tr>
+<td><code>how_to_verify</code></td>
+<td>Concrete steps a human can take to check it — one step per paragraph, every command in its own fenced code block (rendered as a one-click-copy panel on review), URLs of anything started</td>
+</tr>
+<tr>
+<td><code>implementation</code></td>
+<td>How it was done; this is where names belong.</td>
+</tr>
+<tr>
+<td><code>what_was_done</code></td>
+<td>The older combined narrative. Stored reports still render on Summary under <strong>What was done</strong> — not as implementation, and not as a &quot;no behavioral change&quot; claim.</td>
+</tr>
+<tr>
+<td><code>commentary</code></td>
+<td>Anything else (context, caveats)</td>
+</tr>
+</tbody></table>
+<p>On the tabbed task page, <strong>Summary</strong> shows <code>behavior_change</code>, <code>capabilities_lost</code>, and any stored <code>what_was_done</code>; <strong>Changes</strong> shows <code>implementation</code>. A report that has the new <code>implementation</code> kind but no <code>behavior_change</code> shows an explicit &quot;Agent declared no behavioral change&quot; line on Summary rather than silence.</p>
+<p>Link a presentation group with <code>[the retry path](#group-retry)</code> when that
+group&#39;s <code>id</code> is <code>retry</code>. A backticked name in the report that matches a
+function, class or type in the diff becomes a jump link to that line.</p>
+<p>Skip kinds that do not apply. Duplicate kinds in one call are allowed (for
+example two commentary blocks).</p>
+<p>Questions and merge decisions still belong in <strong><code>lazy_raise</code></strong> — pass those ids
+in <code>raised_item_ids</code> if helpful. Do not invent a &quot;questions&quot; section.</p>
+<p>Calling <code>lazy_report</code>:</p>
+<ul>
+<li>does <strong>not</strong> end the turn</li>
+<li>does <strong>not</strong> change task status</li>
+<li>is <strong>not</strong> required — skipping it only means review falls back to prose</li>
+</ul>
+<h3 id="the-presentation-walkthrough"><a class="anchor" href="#the-presentation-walkthrough" aria-hidden="true">#</a>The presentation walkthrough</h3>
+<p>Pass <strong><code>presentation</code></strong> on the same call when the change spans files or tiers
+of unequal weight. You choose <strong>group order</strong> (the story), <strong>tiers</strong> (<code>core</code>,
+<code>tests</code>, <code>docs</code>, <code>generated</code>, <code>other</code>), and <strong>snippets</strong> (line ranges) vs whole
+files. The web review <strong>Changes</strong> block shows this walkthrough first; the
+reviewer can switch to <strong>Raw files</strong> in one click. Skip presentation for a
+small one-file change.</p>
+<p>The walkthrough is a <strong>partition of the change</strong>: every file in the review
+lands in exactly one group, and the groups&#39; file lists add up to the whole
+change. A file claimed whole by two groups is refused at the source, naming
+both groups and the file — an overlapping claim is an error, not a rendering
+detail. A <strong>snippet</strong> into another group&#39;s file is accepted, though: two
+groups can each show particular line ranges of one file, and the file belongs
+wholly to the group that claimed it whole. Whatever you claim nothing of
+appears in a last group, <strong>Other changes</strong>, that lazy appends itself — it
+cannot be suppressed or renamed, because an unclaimed file is exactly the
+thing a reviewer most needs pointed at, and it states how many of the change&#39;s
+files the walkthrough did not name. When the change is fully accounted for,
+there is no residual group at all.</p>
+<p>One item can claim <strong>many files</strong>. Alongside a path, a <code>file</code> item takes a
+<strong>directory</strong> (<code>src/review/</code> — the trailing slash is required) or a <strong>glob</strong>
+(<code>test/e2e/regions*.test.ts</code>), and every changed file it matches belongs to
+that group. A pattern matching nothing the task changed is refused, naming it.
+A path is always safe to write as itself: if the value is exactly one of the
+files the task changed it is taken literally, so a dynamic route such as
+<code>app/blog/[slug]/page.tsx</code> needs no escaping.
+This is what keeps a several-hundred-file branch presentable: a walkthrough
+may carry at most 512 file items, 64 snippets and prose paragraphs, and 32
+groups, and a release-sized branch fits because its test and docs masses cost
+one item each rather than forty. If a walkthrough is refused for exceeding one
+of those, lazy records that against the task and says so on <strong>Other changes</strong> —
+a walkthrough cut down to fit should not read like one that chose to leave
+things out. The refusal never discards a walkthrough already stored for that
+turn, and if no smaller one is ever sent the review still names the cap rather
+than reporting no walkthrough at all.</p>
+<p>These groups are the review&#39;s map afterwards: every region surface — the
+Regions tab, <code>lazy regions</code>, the <code>lazy_regions</code> tool — reads this walkthrough
+by default, scopes diffs by it, and judges a region sign-off against the
+region&#39;s own files. See <a href="../review-regions/">Review regions</a>.</p>
+<p>On a task an agent is going to review (no human in the loop), that is the whole
+story. When a human will review it, lazy runs a dedicated presentation step
+<strong>every time the task parks for you</strong> — whether the agent declared the work done,
+raised something blocking, or simply stopped. The walkthrough is what you decide
+from, so you get it whichever way the turn ended. The step asks the agent to
+author the report WITH the walkthrough in one <code>lazy_report</code> call.</p>
+<p>Two rules keep that cheap and honest:</p>
+<ul>
+<li><strong>It is re-authored only when the branch has moved</strong> since the walkthrough on
+record was written. A task that parks three times for decisions pays for one
+walkthrough, not three.</li>
+<li><strong>On a declared-done turn the walkthrough is required</strong>: a step that ends
+without the declaration fails the turn and parks the task. On an ordinary park
+it is asked for and not enforced — the task is already stopping for you, and
+failing the turn would cost you the agent&#39;s own account of where it got to on
+top of the walkthrough you did not get.</li>
+</ul>
+<p>A task with SUBTASKS is presented differently and asks nothing of the agent:
+its regions are its accepted children, derived from the merge history, plus a
+note naming the children that can still land. &quot;What is in, and what is still
+out&quot; is the question a parent task raises, and it is one lazy can answer without a model
+turn. A subtask you closed or rejected does not count — it will never land, so
+it neither makes a task a parent nor appears in that note. An agent that files a
+walkthrough on a parent task anyway still wins.</p>
+<h3 id="optional-screenshots"><a class="anchor" href="#optional-screenshots" aria-hidden="true">#</a>Optional: screenshots</h3>
+<p>When the work is visual — a web page, a TUI, a command&#39;s output — the agent can
+show it. It attaches an image to the task with <code>lazy_artifact_add</code> and lists it
+in <code>presentation.screenshots</code>:</p>
+<pre><code class="language-json">{
+  &quot;presentation&quot;: {
+    &quot;screenshots&quot;: [
+      { &quot;artifact&quot;: &quot;shots/settings.png&quot;, &quot;caption&quot;: &quot;Settings page, dark theme&quot; }
+    ]
+  }
+}
+</code></pre>
+<p>The web review page renders those images in a <strong>Screenshots</strong> card at the very
+top, above the raised items and the agent&#39;s report, each with its caption. A
+click opens the picture over the page, and the arrow keys walk the whole set
+without leaving it. Images are served from the task&#39;s artifact store
+behind the same sign-in as the rest of the dashboard — never from the task&#39;s
+worktree.</p>
+<p>Each entry must name an image artifact that is already attached to the task, and
+a raster one (png, jpeg, gif, webp). A name that is missing, an artifact that is
+not an image, or an SVG makes the <code>lazy_report</code> call fail and say which artifact
+was at fault, so a report never renders a broken image. A presentation may carry
+screenshots, groups, or both.</p>
+<p>There is no CLI command to author a report. Humans read reports via <code>lazy show</code>
+and review; they do not write them.</p>
+<h2 id="keep--skip-justifications"><a class="anchor" href="#keep--skip-justifications" aria-hidden="true">#</a>Keep / skip justifications</h2>
+<p>When an agent is nudged about <strong>protected files</strong> or <strong>maintained file groups</strong>,
+it records structured reasons instead of burying them in prose:</p>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>When</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>lazy_justify_protected</code></td>
+<td>Keeping a protected-file change</td>
+<td>One file, one short reason</td>
+</tr>
+<tr>
+<td><code>lazy_justify_maintain</code></td>
+<td>Skipping a maintained group</td>
+<td>One group title, one short reason</td>
+</tr>
+</tbody></table>
+<p><strong>Important:</strong> a keep reason does <strong>not</strong> approve the protected file. You still
+decide on the review surface. Files the agent reverts need no justify call —
+re-detection drops them from the pending set.</p>
+<h2 id="related"><a class="anchor" href="#related" aria-hidden="true">#</a>Related</h2>
+<ul>
+<li><a href="../raised-items/">Raised items</a> — decisions that gate accept</li>
+<li><a href="../surface-asymmetries/">Surface asymmetries</a> — why report/justify are agent-only writes</li>
+</ul>
+
+</main>
+</body>
+</html>

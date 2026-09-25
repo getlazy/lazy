@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Per-task environment variables — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="per-task-environment-variables"><a class="anchor" href="#per-task-environment-variables" aria-hidden="true">#</a>Per-task environment variables</h1>
+<p>This page explains how to give <strong>one</strong> task an API token without exposing it to every other task.</p>
+<pre><code class="language-bash">lazy env set my-task STRIPE_API_KEY          # prompts for the value, echo off
+lazy env list my-task                        # names only — never values
+lazy env unset my-task STRIPE_API_KEY
+lazy env clear my-task
+
+lazy start my-task --env STRIPE_API_KEY      # same thing, at start time
+lazy start my-task --env-file ./task.env
+</code></pre>
+<p>The variable is injected into that task&#39;s agent process (or container) at every
+launch, and into no other task&#39;s.</p>
+<h2 id="when-this-is-the-right-tool"><a class="anchor" href="#when-this-is-the-right-tool" aria-hidden="true">#</a>When this is the right tool</h2>
+<p>Use it when exactly one task needs a credential or endpoint: a task integrating
+against a payment sandbox, a task that must call an internal API, a task pointed
+at a staging database.</p>
+<p>Do <strong>not</strong> use it for something every task should have — that belongs in your
+shell environment or in the agent image, where it costs nothing per task. The
+whole point of this feature is the granularity: the other tasks don&#39;t get it.</p>
+<p>Do not use it for large values either. It is capped at 64 variables and 128 KiB
+per task; if you need to hand a task a file, mount it with <code>[[mounts]]</code>.</p>
+<h2 id="the-security-model"><a class="anchor" href="#the-security-model" aria-hidden="true">#</a>The security model</h2>
+<p><strong>Values live on this host only.</strong> They are written to the daemon&#39;s own state
+directory — <code>~/.lazy/daemon/&lt;project-slug&gt;/task-env.json</code>, mode <code>0600</code> — and
+nowhere else.</p>
+<p>That placement is the whole property, and it is the same one the per-task MCP
+token already relies on:</p>
+<ul>
+<li>A task&#39;s container bind-mounts the project root <strong>read-only</strong>
+(<code>-v &lt;repo&gt;:&lt;repo&gt;:ro</code>). Anything under <code>&lt;project&gt;/.lazy/</code> is therefore
+readable by <em>every</em> agent — which is exactly the separation this feature
+exists to provide. So the values cannot live there.</li>
+<li>The daemon state directory is never mounted into anything: lazy refuses any
+mount source inside it.</li>
+</ul>
+<p><strong>Values never become durable project state.</strong> They do not enter task state,
+turns, prompts, comments, the journal, or any log line. This is deliberate and
+load-bearing: turns and prompts are durable and human-visible, and a token
+leaked into a turn cannot be un-leaked. It is also why the values are not kept
+in the project&#39;s task store, which can be pushed to an external or shared
+store — a task&#39;s API token must not travel with the project.</p>
+<p><strong>Nothing prints a value back.</strong> There is no <code>lazy env get</code> and no
+<code>--show-values</code> flag. <code>lazy env list</code> prints names only, so its output is safe
+to paste into a bug report. Debug output that shows the launch command redacts
+the task&#39;s own keys by name, whatever they are called — you set them because
+they were sensitive, so <code>STRIPE_SANDBOX</code> is treated exactly like
+<code>STRIPE_API_KEY</code>.</p>
+<p><strong>Agents cannot reach this at all.</strong> There is no MCP tool for <code>lazy env</code>, for
+reads or writes. The agent gets its variable by finding it in <code>process.env</code> and
+by no other route; it cannot enumerate its task&#39;s secret store, and it cannot
+hand a token to a subtask it spawned. This is the one place where even a <em>read</em>
+is withheld from agents — see
+<a href="../surface-asymmetries/#4-human-only-commands-with-no-mcp-equivalent">surface-asymmetries.md</a>.</p>
+<h3 id="keep-the-value-out-of-your-shell-history"><a class="anchor" href="#keep-the-value-out-of-your-shell-history" aria-hidden="true">#</a>Keep the value out of your shell history</h3>
+<p>Prefer the bare-key form:</p>
+<pre><code class="language-bash">lazy env set my-task STRIPE_API_KEY       # prompts, echo off
+lazy start my-task --env STRIPE_API_KEY   # same
+</code></pre>
+<p><code>--env KEY=VALUE</code> is fine for a non-secret (an endpoint, a feature flag), but a
+value typed that way lands in your shell history and, while the command runs, in
+the process table where any other user on the machine can read it with <code>ps</code>.</p>
+<p>Under the Docker runner the value is also visible in <code>docker inspect</code> for the
+container&#39;s lifetime to anyone in the <code>docker</code> group on the host — the same
+posture as the Anthropic credentials lazy already passes to every task container,
+so this is not a new exposure, but it is worth knowing before you hand a
+production token to a task.</p>
+<h2 id="lifetime-set-once-cleared-when-the-task-ends"><a class="anchor" href="#lifetime-set-once-cleared-when-the-task-ends" aria-hidden="true">#</a>Lifetime: set once, cleared when the task ends</h2>
+<p>A variable is supplied <strong>once</strong> and persists for the task&#39;s lifetime. It is
+injected at <em>every</em> launch — <code>start</code>, <code>unblock</code>, <code>sync</code>, <code>ask</code>, and automatic
+resumes — and deleted when the task reaches a terminal state (accepted,
+rejected, or closed), next to the task&#39;s MCP token.</p>
+<p>Lazy does not ask for <code>--env</code> on every unblock because many launches have no
+human in the loop at all — an automatic resume after a crash, for example. Those
+launches would carry no value, so the
+variable would silently vanish mid-task and the agent would fail in a way that
+looks like a bug in your own code.</p>
+<p>The cost is that the value sits at rest in a <code>0600</code> host file until the
+task ends. Clear it early with <code>lazy env clear &lt;task&gt;</code> if you want it gone
+sooner; you never need to run that at the end of a task, because accept, reject,
+and close each clear it for you.</p>
+<h3 id="a-running-agent-keeps-the-environment-it-launched-with"><a class="anchor" href="#a-running-agent-keeps-the-environment-it-launched-with" aria-hidden="true">#</a>A running agent keeps the environment it launched with</h3>
+<p>Docker fixes a container&#39;s environment at creation time, and lazy reuses a live
+supervisor container across turns. So a change made while a task is <code>working</code>
+takes effect at the task&#39;s <strong>next</strong> launch — typically after the agent
+blocks and you unblock it. <code>lazy env set</code>/<code>unset</code>/<code>clear</code> say so when the task is
+working.</p>
+<h2 id="reserved-names"><a class="anchor" href="#reserved-names" aria-hidden="true">#</a>Reserved names</h2>
+<p>Lazy refuses, at the moment you type it, any name it sets itself:</p>
+<ul>
+<li>exactly: <code>PATH</code>, <code>HOME</code>, <code>USER</code>, <code>SHELL</code>, <code>PWD</code>, <code>TMPDIR</code>, <code>GIT_SSH_COMMAND</code>,
+<code>CLAUDECODE</code></li>
+<li>any name starting with <code>LAZY_</code>, <code>ANTHROPIC_</code>, <code>CLAUDE_</code>, <code>CURSOR_</code>, or <code>PI_</code></li>
+</ul>
+<p>These carry the agent&#39;s credentials, its model routing, and its connection back
+to the daemon. Overriding one would not be &quot;a per-task variable&quot; — it would be a
+per-task hijack of where model traffic goes or which credential is used. Names
+must also be valid POSIX identifiers (<code>[A-Za-z_][A-Za-z0-9_]*</code>).</p>
+<p>For belt and braces, the container runner merges the task&#39;s variables <em>after</em>
+lazy&#39;s own credential and routing variables are set, so lazy wins on reserved names.</p>
+<h2 id="env-files"><a class="anchor" href="#env-files" aria-hidden="true">#</a>Env files</h2>
+<p><code>--env-file</code> reads dotenv-style lines: <code>KEY=VALUE</code> one per line, <code>#</code> comments
+and blank lines ignored, an optional leading <code>export </code> stripped, and surrounding
+quotes removed. Everything after the first <code>=</code> is the value verbatim.</p>
+<pre><code># task.env
+STRIPE_API_KEY=sk_test_...
+export API_BASE=&quot;https://sandbox.example.test&quot;
+</code></pre>
+<p>A file you name but that cannot be read is an error, not &quot;no variables&quot; —
+launching the agent without the token it was meant to have fails much later and
+much more confusingly, as an unexplained 401 inside the container.</p>
+<h2 id="runner-support"><a class="anchor" href="#runner-support" aria-hidden="true">#</a>Runner support</h2>
+<p>Both runners are covered:</p>
+<ul>
+<li><strong>Docker/Podman</strong> — passed as <code>-e KEY=VALUE</code> on <code>docker run</code>, before the image
+name.</li>
+<li><strong>Host process</strong> (<code>dangerously-host-process-without-any-isolation</code>) — merged
+into the supervisor process&#39;s spawn environment.</li>
+</ul>
+<h2 id="troubleshooting"><a class="anchor" href="#troubleshooting" aria-hidden="true">#</a>Troubleshooting</h2>
+<p><strong>The agent says the variable is not set.</strong> Check <code>lazy env list &lt;task&gt;</code> for the
+name, then check whether the task was already running when you set it (see
+<a href="#a-running-agent-keeps-the-environment-it-launched-with">above</a>) — the change
+lands at the next launch.</p>
+<p><strong><code>lazy env set</code> says the name is reserved.</strong> Pick another name; the reserved
+ones are listed above. If you are trying to point a task at a different model
+endpoint, that is an <a href="../lazy-toml/#agentsname--named-agent-profiles">agent
+profile</a> in <code>lazy.toml</code> —
+declare one with the <code>endpoint</code> you want and select it with
+<code>lazy edit --agent &lt;name&gt;</code> — not this.</p>
+<p><strong>I lost the value.</strong> Lazy cannot give it back to you — by design, nothing reads
+a value back out. Re-run <code>lazy env set</code>.</p>
+
+</main>
+</body>
+</html>

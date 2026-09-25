@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The low-high loop — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="the-low-high-loop"><a class="anchor" href="#the-low-high-loop" aria-hidden="true">#</a>The low-high loop</h1>
+<p>A two-phase shape for agent work turns: a cheap low-effort <strong>draft</strong>,
+immediately followed by a high-effort <strong>self-review</strong> in the same agent session,
+whose instructions a final low-effort <strong>revise</strong> pass applies.</p>
+<p>This is lazy&#39;s <strong>default review mode</strong> (<code>[review] mode = &quot;low_high&quot;</code>). Where the
+other modes fit, and why this one is the default, is
+<a href="../review-paradigm/">the review paradigm</a>; this page is the mechanism.</p>
+<h2 id="why"><a class="anchor" href="#why" aria-hidden="true">#</a>Why</h2>
+<p>Output and thinking tokens are only a small fraction of what a task costs —
+conversation length dominates, and every extra feedback round multiplies it,
+with the median cost rising several-fold from a one-turn task to a five-to-
+eight-turn one. The winning shape is therefore: maximum thinking on a <em>review</em>
+(short output, warm cache) and minimum effort on <em>drafting</em>. The alternative —
+a second agent in a new session, reading the whole diff cold — pays the
+conversation cost twice for the same change, which is what made it three to four
+times as expensive in wall-clock and tokens.</p>
+<h2 id="mechanism"><a class="anchor" href="#mechanism" aria-hidden="true">#</a>Mechanism</h2>
+<p>When enabled, a <code>start</code>/<code>unblock</code>/<code>resume</code> work turn runs as up to three agent
+invocations of ONE session (warm cache throughout):</p>
+<ol>
+<li><strong>Draft</strong> — the task prompt runs at the task&#39;s own effort when somebody
+chose one, and otherwise at <code>[review] draft_effort</code> (default
+<code>low</code>). This is the ordinary work phase.</li>
+<li><strong>Self-review</strong> — the supervisor resumes the session at
+<code>[review] review_effort</code> (default <code>xhigh</code>) in read-only (reflective)
+mode — or at the draft&#39;s effort if that is higher, since a review must never
+run weaker than the work it reviews. The reviewer replies with either the
+token <code>LOW_HIGH_LOOP_APPROVED</code> or a numbered list of revision instructions.
+It cannot edit files.</li>
+<li><strong>Revise</strong> — unless approved, one invocation back at the draft effort
+applies the instructions (they are already in the session&#39;s context).</li>
+</ol>
+<p><strong>Exactly one review→revise cycle, by design.</strong> Iterating would grow the
+conversation — the dominant cost axis — for diminishing returns; one cycle
+mirrors the review round it tries to pre-empt, and anything the revise pass
+still gets wrong is caught by your own reading exactly as it would have been
+anyway.</p>
+<p><strong>Its outcome is recorded as a review, and can be made to gate.</strong> The
+self-review emits the same verdict / sweeps / findings report every other lazy
+review does, and it is stored on a review turn of its own — so the Reviews tab
+lists it, <code>lazy show</code> renders it, and you read it exactly as you read a
+reviewer&#39;s. Under the default gate it does not hold your accept: it is the
+writer&#39;s own account of its own work, and the revise pass has already acted on
+it. <code>[review] gate = &quot;always&quot;</code> makes it hold one anyway, on findings above
+medium or a sweep that found something.</p>
+<p>A self-review whose report does not parse records no review turn at all. The
+loop is non-fatal at every phase by design, and a malformed reply must not wedge
+a merge on a project running <code>always</code> — the reviewer&#39;s full text is still on the
+supervised turn, which is what a person reads.</p>
+<p>And under <code>always</code>, a self-review the <strong>revise pass already applied</strong> does not
+hold the merge: the recorded report is what the reviewer wrote <em>before</em> the fix,
+so treating it as outstanding would stop a project on that setting ever landing
+a task the mode worked on. A revise that ran but changed nothing applied
+nothing, and that one still holds.</p>
+<p>The review and revise phases use the same supervised-invocation machinery as
+permission push-back and the maintain nudge: each is recorded as its own
+supervisor→agent turn pair (<code>## Low-High Loop Self-Review</code>, <code>## Low-High Loop Revision</code>) with its own token usage, commit SHA window, and its own per-turn
+<code>effort</code>. <code>lazy show &lt;task&gt;</code>
+therefore shows the phase boundaries, what the review caught, and what the
+revision changed. Protected-file violation detection runs after the loop, so
+revise commits are scanned too.</p>
+<p>Failure posture: a crashed or unparseable review/revise phase is non-fatal.
+The draft&#39;s work stands, the failure is recorded on the phase&#39;s turn, and the
+turn completes normally.</p>
+<h2 id="configuration"><a class="anchor" href="#configuration" aria-hidden="true">#</a>Configuration</h2>
+<pre><code class="language-toml">[review]
+# mode = &quot;low_high&quot;          # the default; &quot;separate&quot; or &quot;off&quot; turn this shape off
+# draft_effort = &quot;low&quot;       # draft + revise phases
+# review_effort = &quot;xhigh&quot;    # self-review phase
+</code></pre>
+<p><strong>An effort you chose FOR THIS TASK is never replaced.</strong> <code>--effort</code> on this
+task — on <code>create</code>, <code>start</code>, <code>edit</code> or an unblock — wins for the draft and the
+revise pass alike, because running a task you set to <code>high</code> at <code>low</code> would be a
+silent downgrade of your work.</p>
+<p>A project-wide <code>[agent] effort</code> does <strong>not</strong> win: it is the fallback the other
+phases resolve from, and the draft still runs at <code>draft_effort</code>. That is the
+point of the mode — if a project effort outranked it, <code>draft_effort</code> would do
+nothing on any project that sets one, which is most of them.</p>
+<p><strong>Its outcome can be made to gate.</strong> By default it does not, which is the point
+of the fast mode; <code>[review] gate = &quot;always&quot;</code> makes findings above medium (or a
+sweep that found something) hold the accept anyway. See
+<a href="../review-paradigm/">the review paradigm</a>.</p>
+<p>Per-task: <code>lazy create/start/edit --review low-high</code> (or <code>separate</code>, or <code>off</code>).
+The choice persists on task metadata (like <code>--effort</code>), so later unblocks and
+resumes stay in the same mode even if the project default changes mid-task. When
+this mode is on and the task has no effort of its own, the draft effort
+<strong>replaces</strong> the project-wide <code>effort</code> for work turns.</p>
+<p>The three <code>[agent] low_high_loop*</code> keys are the previous spelling. They are
+still honoured — <code>lazy doctor</code> names the replacement for each — and
+<code>low_high_loop = false</code> maps to <code>mode = &quot;separate&quot;</code>, which is what it meant.</p>
+<p>Turns that never run the loop, regardless of the flag: ask turns and
+<code>lazy browse -i</code> Q&amp;A (read-only — no draft to review), sync/merge turns,
+daemon auto-delivered comment turns, and crash auto-resumes
+(the latter two also run without an explicit effort today).</p>
+<h2 id="judging-whether-it-helps"><a class="anchor" href="#judging-whether-it-helps" aria-hidden="true">#</a>Judging whether it helps</h2>
+<p>The comparison that matters is this mode against <code>--review separate</code>, on cost
+per accepted task and wall-clock. Per-turn <code>model</code>/<code>effort</code> labels plus the
+recorded review/revise turn kinds identify which shape a turn ran under. Judge
+qualitatively from <code>lazy show</code>: did the
+self-review catch things a second reader would otherwise have had to flag?</p>
+
+</main>
+</body>
+</html>

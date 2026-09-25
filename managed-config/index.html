@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Managed mode: which parts of lazy.toml a shared host honours — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="managed-mode-which-parts-of-lazytoml-a-shared-host-honours"><a class="anchor" href="#managed-mode-which-parts-of-lazytoml-a-shared-host-honours" aria-hidden="true">#</a>Managed mode: which parts of <code>lazy.toml</code> a shared host honours</h1>
+<p>Normally, <code>lazy.toml</code> is yours. You committed it, you run lazy on your own
+machine, and every key in it is honoured exactly as written. <strong>Nothing on this
+page applies to that.</strong> Managed mode is off by default and, when off, changes
+nothing at all.</p>
+<p>Managed mode is for a <strong>shared host</strong> — any fleet where one machine runs
+daemons for projects belonging to different people. There,
+<code>lazy.toml</code> arrives with the repository, and a repository is untrusted input.
+A committed config that says &quot;run agents outside the container, as the fleet
+user&quot; is not a preference; it is an escape. So on a managed host lazy sorts
+every config key into three buckets:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>what happens</th>
+<th>how you find out</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Respected</strong></td>
+<td>honoured exactly as written</td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>Overridden</strong></td>
+<td>the fleet&#39;s value is used; your ask is recorded</td>
+<td><code>lazy doctor</code></td>
+</tr>
+<tr>
+<td><strong>Refused</strong></td>
+<td>the project does not start until the key is removed</td>
+<td>the start/provisioning error, and <code>lazy doctor</code></td>
+</tr>
+</tbody></table>
+<h2 id="why-override-some-keys-and-refuse-others"><a class="anchor" href="#why-override-some-keys-and-refuse-others" aria-hidden="true">#</a>Why override some keys and refuse others</h2>
+<p>Both are equally safe — neither honours the repository. The choice is about
+<strong>diagnosability</strong>:</p>
+<ul>
+<li><strong>Override</strong> when the fleet&#39;s value is a drop-in substitute and your project
+still does what you meant. You asked for a specific <code>[server] port</code>; you get
+a different one; everything works. Silently substituting is fine because
+nothing about your project&#39;s behaviour changed.</li>
+<li><strong>Refuse</strong> when the fleet does not offer the capability at all. Silently
+dropping <code>[[mounts]]</code> would leave your project running as something
+materially different from what you configured, with no failure to trace. A
+refusal is loud, once, at the moment you&#39;d otherwise start debugging.</li>
+</ul>
+<h2 id="unclassified-keys-fail-closed"><a class="anchor" href="#unclassified-keys-fail-closed" aria-hidden="true">#</a>Unclassified keys fail closed</h2>
+<p>A config key with no entry in the classification is <strong>refused</strong>, not
+overridden. Overriding to a default asserts that the default is safe — which is
+exactly the judgement nobody made for a key that nobody classified.</p>
+<p>In practice you should never see this: lazy&#39;s own test suite fails when a
+config key it knows has no classification, so an unclassified key cannot reach
+a release. The runtime refusal is the backstop.</p>
+<p>A key lazy does not know at all — a typo, or a stale option from an older
+version — is <strong>not</strong> refused. Lazy never reads it, so it cannot do anything.
+Those still show up in <code>lazy doctor</code> as unknown options, exactly as they always
+have.</p>
+<h2 id="finding-out-why-your-config-is-being-ignored"><a class="anchor" href="#finding-out-why-your-config-is-being-ignored" aria-hidden="true">#</a>Finding out why your config is being ignored</h2>
+<p>Run <code>lazy doctor</code> in the project. On a managed host it prints one line per key
+the fleet is not honouring:</p>
+<pre><code>⚠ lazy.toml &#39;runner.type&#39;
+  This repository&#39;s lazy.toml asks for &quot;host&quot;; managed mode uses &quot;docker&quot;.
+  A host runner would run agent code outside any container, as the fleet user,
+  on a machine shared with other projects.
+</code></pre>
+<p>That is the only surface that explains it. Everything else — a start failure, a
+provisioning error — carries one generic pointer here rather than repeating the
+diagnosis, because an override warning printed on every config load would land
+in the middle of every agent turn.</p>
+<p>A <strong>refusal</strong> is different: it is not a warning to go looking for, it is the
+error you already got. It fires at the earliest possible moment — <code>lazy init</code>
+checks the repository&#39;s committed config before it writes anything — and then
+on every command afterwards, naming each refused key and what to do about it.</p>
+<h2 id="how-a-host-becomes-managed"><a class="anchor" href="#how-a-host-becomes-managed" aria-hidden="true">#</a>How a host becomes managed</h2>
+<p>Three environment variables, read at daemon start:</p>
+<table>
+<thead>
+<tr>
+<th>variable</th>
+<th>required</th>
+<th>meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>LAZY_MANAGED</code></td>
+<td>—</td>
+<td><code>1</code> or <code>true</code> arms managed mode. Anything else, including unset, leaves lazy completely unchanged.</td>
+</tr>
+<tr>
+<td><code>LAZY_MANAGED_STORAGE_PATH</code></td>
+<td>yes</td>
+<td>Absolute path to the store the fleet assigned this project.</td>
+</tr>
+<tr>
+<td><code>LAZY_MANAGED_RUNNER</code></td>
+<td>no</td>
+<td><code>docker</code> (default) or <code>podman</code>. Nothing else is accepted — including <code>host</code>.</td>
+</tr>
+</tbody></table>
+<p>Deliberately <strong>not</strong> a <code>lazy.toml</code> key: <code>lazy.toml</code> is the untrusted input this
+whole mechanism exists to bound. A managed host armed without a storage path
+refuses to run rather than falling back to the repository&#39;s <code>external_path</code>.</p>
+<p>A fleet host sets these in the environment of each project&#39;s daemon when it
+starts it; Lazy Teams does this for every project it runs.</p>
+<h2 id="the-classification-in-full"><a class="anchor" href="#the-classification-in-full" aria-hidden="true">#</a>The classification, in full</h2>
+<p>Every key lazy resolves appears below. Non-respected keys carry the reason.</p>
+<h3 id="refused"><a class="anchor" href="#refused" aria-hidden="true">#</a>Refused</h3>
+<table>
+<thead>
+<tr>
+<th>key</th>
+<th>why</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>agents.*.endpoint</code></td>
+<td>An <a href="../lazy-toml/#agentsname--named-agent-profiles">agent profile</a>&#39;s endpoint is the upstream the proxy forwards to, carrying the real model credential — a repository choosing it is credential redirection. A profile with no <code>endpoint</code> is fine.</td>
+</tr>
+<tr>
+<td><code>agents.*.credential</code></td>
+<td>A credential name the fleet did not assign reaches for a secret slot nobody gave this repository. Naming one of lazy&#39;s own providers (<code>anthropic</code>, <code>openai</code>, <code>openrouter</code>, <code>ollama</code>, <code>cursor</code>) or <code>none</code> is fine.</td>
+</tr>
+<tr>
+<td><code>models.roles.*.backend</code></td>
+<td>A non-Anthropic role backend sends the model credential somewhere the fleet did not choose; team-level backends are configured by the team, not by a repository. Stating <code>&quot;anthropic&quot;</code> explicitly is fine. (The key was since removed from lazy.toml altogether — a config that still has it does not load.)</td>
+</tr>
+<tr>
+<td><code>models.roles.*.endpoint</code></td>
+<td>An arbitrary endpoint URL from a repository receives the real model credential. (Also removed from lazy.toml — see <code>agents.*.endpoint</code> above.)</td>
+</tr>
+<tr>
+<td><code>proxy.upstream</code></td>
+<td>The daemon fetches this URL from the host carrying the real model credential — a repository choosing it is credential redirection.</td>
+</tr>
+<tr>
+<td><code>proxy.cursor_upstream</code></td>
+<td>Same, for the cursor passthrough route: the fleet host dials it carrying the real cursor credential.</td>
+</tr>
+<tr>
+<td><code>proxy.fallback[].upstream</code></td>
+<td>A failover target receives the same credential as the primary upstream.</td>
+</tr>
+<tr>
+<td><code>proxy.fallback[].model</code></td>
+<td>A failover entry cannot exist without the upstream it belongs to, which is refused.</td>
+</tr>
+<tr>
+<td><code>[[mounts]]</code> (whole section, every field)</td>
+<td>A repository cannot mount host paths into its agent container on a shared machine. This is the worst case in the whole file: mounts are read-write by default, and the mount validator is a denylist, not an allowlist.</td>
+</tr>
+<tr>
+<td><code>docker.run_args</code></td>
+<td>Extra <code>docker run</code> arguments shape the container itself: <code>--privileged</code> or a <code>-v /:/host</code> from a cloned lazy.toml would be a host handover — the same class of ask as <code>[[mounts]]</code>. Stating an empty array is fine.</td>
+</tr>
+<tr>
+<td><code>remote.github_dangerously_sync_comments_in_public_repos_…</code></td>
+<td>Feeds public comment text to the agent as instructions; on a shared host a prompt-injected agent is a foothold. The key&#39;s own name is the argument. Stating <code>false</code> is fine.</td>
+</tr>
+<tr>
+<td><code>remote.gitlab_dangerously_sync_comments_in_public_repos_…</code></td>
+<td>Same.</td>
+</tr>
+<tr>
+<td><em>anything unclassified</em></td>
+<td>See &quot;fail closed&quot; above.</td>
+</tr>
+</tbody></table>
+<h3 id="overridden"><a class="anchor" href="#overridden" aria-hidden="true">#</a>Overridden</h3>
+<table>
+<thead>
+<tr>
+<th>key</th>
+<th>why the fleet&#39;s value wins</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>runner.type</code></td>
+<td>A host runner would run agent code outside any container, as the fleet user, on a machine shared with other projects. <strong>This is the linchpin of the whole classification</strong> — every &quot;safe because it runs in the container&quot; judgement below rests on it.</td>
+</tr>
+<tr>
+<td><code>runner.permission_mode</code></td>
+<td>The permission posture is the fleet&#39;s, and <code>bypass</code> removes the sandbox the host relies on.</td>
+</tr>
+<tr>
+<td><code>runner.sandbox_allowed_domains</code></td>
+<td>The reachable-domain list is host policy; a repository widening it widens the host.</td>
+</tr>
+<tr>
+<td><code>runner.sandbox_deny_read</code> / <code>runner.sandbox_deny_write</code></td>
+<td>Sandbox denials are the fleet&#39;s floor and are not negotiated per repository.</td>
+</tr>
+<tr>
+<td><code>runner.sandbox_allow_weaker_nested</code></td>
+<td>Permitting a weaker nested sandbox is exactly the escalation a shared host must not accept from a repository.</td>
+</tr>
+<tr>
+<td><code>runner.verify_sandbox_boundary</code></td>
+<td>The boundary self-check spends real agent sessions on the host, so the fleet decides when it runs.</td>
+</tr>
+<tr>
+<td><code>proxy.port</code></td>
+<td>A fixed port collides across the projects sharing this host.</td>
+</tr>
+<tr>
+<td><code>proxy.bind</code></td>
+<td>The bind address decides who else on the host can reach this project&#39;s proxy.</td>
+</tr>
+<tr>
+<td><code>proxy.policy.enforce</code></td>
+<td>Enforcement is the fleet&#39;s posture; a repository turning it off would disable its own tool-call policy.</td>
+</tr>
+<tr>
+<td><code>proxy.policy.deny_secret_path_reads</code></td>
+<td>The secret-path denylist is the fleet&#39;s floor, not a project preference.</td>
+</tr>
+<tr>
+<td><code>proxy.policy.connector_allowlist</code></td>
+<td>Re-allowing a denied connector widens what agents on this host can reach.</td>
+</tr>
+<tr>
+<td><code>proxy.policy.egress_allowlist</code></td>
+<td>The egress posture belongs to the host every project shares.</td>
+</tr>
+<tr>
+<td><code>credentials.backend</code></td>
+<td>Which secret store the daemon writes to is a property of the host it runs on: a fleet host has one secret service, or none, and a repository asking for the plaintext <code>file</code> fallback would write a credential onto a machine it does not own.</td>
+</tr>
+<tr>
+<td><code>storage.backend</code></td>
+<td>The project&#39;s store is assigned by the fleet, not stated by the repository.</td>
+</tr>
+<tr>
+<td><code>storage.external_path</code></td>
+<td>A repository naming a store path could point the daemon at another project&#39;s state.</td>
+</tr>
+<tr>
+<td><code>data.path</code></td>
+<td>The daemon&#39;s state directory is placed by the fleet, and a repository-chosen path writes wherever it points.</td>
+</tr>
+<tr>
+<td><code>server.port</code></td>
+<td>A fixed port collides across the projects sharing this host.</td>
+</tr>
+<tr>
+<td><code>server.bind</code></td>
+<td>The bind address decides who else on the host can reach this project.</td>
+</tr>
+<tr>
+<td><code>server.dashboard_url</code></td>
+<td>The dashboard is disabled on a managed host, so a public dashboard origin has no effect.</td>
+</tr>
+<tr>
+<td><code>server.sync_interval</code></td>
+<td>The poll interval is load on a machine shared with every other project.</td>
+</tr>
+<tr>
+<td><code>limits.max_concurrent_builders</code></td>
+<td>Concurrency is host capacity, and one repository must not be able to claim it all.</td>
+</tr>
+<tr>
+<td><code>[features]</code> (whole section)</td>
+<td>Feature flags are freeform, so none of them can be classified in advance; a managed host runs the fleet&#39;s set. This is the fail-closed rule applied to a section that can never be enumerated.</td>
+</tr>
+</tbody></table>
+<h3 id="respected-with-a-containment-guard"><a class="anchor" href="#respected-with-a-containment-guard" aria-hidden="true">#</a>Respected, with a containment guard</h3>
+<p>These are honoured, but the value must stay inside the project directory. An
+absolute path or a <code>..</code> that escapes the checkout is refused — it would reach
+host files that are not this project&#39;s.</p>
+<p><code>docker.dockerfile</code> · <code>worktree.include</code> · <code>documents.path</code></p>
+<h3 id="respected"><a class="anchor" href="#respected" aria-hidden="true">#</a>Respected</h3>
+<p>Everything else. In full:</p>
+<p><code>models.default</code> · <code>models.roles.*.model</code> · <code>models.roles.*.agent</code> ·
+<code>agents.*.harness</code> · <code>agents.*.model</code> ·
+<code>proxy.retry_after_threshold</code> · <code>proxy.upstream_timeout</code> ·
+<code>proxy.policy.deny_path_globs</code> (it can only ever
+ADD denials) · <code>docker.build_inputs</code> · <code>remote.driver</code> · <code>remote.git_remote</code> ·
+<code>remote.auto_approve</code> · <code>remote.offline</code> · <code>remote.github_auto_push</code> ·
+<code>remote.gitlab_auto_push</code> · <code>automation.maintain</code> · <code>automation.react</code> · <code>automation.pre_accept</code> ·
+<code>automation.pre_accept.enabled</code> · <code>automation.pre_accept.commands</code> ·
+<code>automation.pre_accept.timeout</code> · <code>automation.pre_turn</code> ·
+<code>automation.pre_turn_timeout</code> · <code>automation.pre_turn_required</code> ·
+<code>automation.post_turn</code> · <code>automation.post_turn_timeout</code> ·
+<code>automation.accept_check</code> · <code>automation.accept_check_timeout</code> · <code>checks.post_turn</code> ·
+<code>checks.post_turn_timeout</code> · <code>session.verbose</code> · <code>session.debug</code> ·
+<code>session.auto_commit_instructions</code> · <code>git.default_branch_prefix</code> ·
+<code>git.lfs_check</code> · <code>output.shortid_length</code> · <code>agent.agent_id</code> ·
+<code>agent.by_type</code> · <code>agent.watchdog_output_timeout_ms</code> · <code>agent.wind_down_timeout_ms</code> ·
+<code>agent.graceful_exit_timeout_ms</code> · <code>agent.effort</code> · <code>agent.low_high_loop</code> ·
+<code>agent.low_high_loop_draft_effort</code> · <code>agent.low_high_loop_review_effort</code> ·
+<code>builder.effort</code> · <code>chattiness.default</code> · <code>chattiness.builder</code> ·
+<code>chattiness.agent</code> · <code>permissions.protected</code> · <code>protection.enabled</code> ·
+<code>protection.protected_branches</code> · <code>protection.protected_tasks</code> ·
+<code>protection.gate_default_branch</code> ·
+<code>serve.ports</code> · <code>serve.services</code> · <code>serve.start_services_cmd</code> ·
+<code>memory.warn_bytes</code> · <code>docs.url</code> ·
+<code>daemon.auto_react_ci</code> · <code>daemon.auto_react_comments</code> ·
+<code>daemon.auto_react_max_retries</code> · <code>daemon.auto_react_backoff</code> ·
+<code>daemon.auto_react_daily_budget</code> · <code>daemon.max_auto_turns</code> ·
+<code>limits.max_turns_without_human</code> · <code>cluster.max_child_fix_rounds</code> ·
+<code>loop.max_child_fix_rounds</code> (the deprecated spelling, still honoured) ·
+<code>usage_pause.threshold_percent</code> · <code>usage_pause.credentials</code> ·
+<code>review.mode</code> · <code>review.auto_fix</code> · <code>review.gate</code> · <code>review.draft_effort</code> ·
+<code>review.review_effort</code> ·
+<code>agent.low_high_loop</code> · <code>agent.low_high_loop_draft_effort</code> ·
+<code>agent.low_high_loop_review_effort</code> (the deprecated spellings of the three
+<code>[review]</code> keys above, still honoured) ·
+<code>daemon.auto_resume</code> ·
+<code>daemon.auto_resume_interval_minutes</code> · <code>daemon.auto_resume_gap_minutes</code> ·
+<code>daemon.auto_resume_max_attempts</code></p>
+<p>A resolved role is a flattened agent profile, so lazy&#39;s own resolution puts a
+few more fields on it than any <code>lazy.toml</code> key spells —
+<code>models.roles.*.harness</code>, <code>models.roles.*.credential</code>, <code>models.roles.*.wire</code>,
+<code>models.roles.*.pinned</code> and <code>models.roles.*.profile</code>. They are classified as
+respected because their values come from asks that were already classified
+above (<code>models.roles.*.agent</code> and the <code>[agents.&lt;name&gt;]</code> block it names), never
+from a string a repository put there.</p>
+<p>The automation hooks deserve a note, because &quot;does this run on the host?&quot;
+is the question that decides the whole table. <code>automation.pre_turn</code> and
+<code>automation.post_turn</code> run <strong>inside the agent container</strong> — but only because
+<code>runner.type</code> is overridden. Under a host runner
+they would execute on the fleet machine. <code>automation.pre_accept</code> — the
+acceptance gate — runs in its own ephemeral gate container (same runner type,
+no agent inside), so it never executes on the fleet machine either way. That
+is why the runner is the linchpin,
+and why it is not negotiable.</p>
+<h2 id="what-lives-where"><a class="anchor" href="#what-lives-where" aria-hidden="true">#</a>What lives where</h2>
+<p>The classification is a property of <strong>lazy</strong> itself, not of any one fleet
+product: a self-hosted single-tenant managed install needs exactly the same
+table, and <code>lazy doctor</code>
+needs to point somewhere that renders. So the table and the mechanism live in
+lazy itself; the fleet-side decisions (how the daemon is
+armed, how a refusal is surfaced in the UI) belong to the managed product
+itself.</p>
+
+</main>
+</body>
+</html>

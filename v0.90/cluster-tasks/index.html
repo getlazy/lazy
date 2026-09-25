@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cluster tasks — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="cluster-tasks"><a class="anchor" href="#cluster-tasks" aria-hidden="true">#</a>Cluster tasks</h1>
+<p>A <strong>cluster task</strong> is a task whose agent drives <em>other</em> tasks instead of writing
+code itself. You give it a set of subtasks; its agent — the <strong>driver</strong> — decides
+which of them can run at the same time, starts them, reviews each one as it
+comes back, sends it back with feedback or accepts it, and hands back when there
+is nothing left it can usefully run.</p>
+<p>It is the shape you want when you have a pile of related work that should land
+in one branch and be reviewed as one change: everything a review turned up,
+every follow-up from a release, every item on a checklist.</p>
+<h2 id="creating-one"><a class="anchor" href="#creating-one" aria-hidden="true">#</a>Creating one</h2>
+<pre><code class="language-bash">lazy create --type cluster --goal &quot;Fix everything the API review found&quot;
+</code></pre>
+<p>The type is available everywhere a type is: <code>lazy create --type cluster</code>,
+<code>lazy edit &lt;task&gt; --type cluster</code>, the <code>type</code> field of the <code>lazy_create</code> MCP
+tool, and the type dropdown on the dashboard&#39;s create form.</p>
+<p>Give the cluster a prompt that says what the children are for. You can list the
+work in the prompt and let the cluster create the subtasks itself, or create the
+subtasks up front and let it find them.</p>
+<p>Adding existing backlog tasks to a cluster is a reparent:</p>
+<pre><code class="language-bash">lazy reparent &lt;task&gt; --parent &lt;cluster&gt;
+</code></pre>
+<h2 id="what-the-driver-does"><a class="anchor" href="#what-the-driver-does" aria-hidden="true">#</a>What the driver does</h2>
+<p>Every turn a cluster takes, it runs under a contract lazy injects for you:</p>
+<ul>
+<li>Read the tree (<code>lazy list &lt;cluster&gt;</code>) to see what its children are and what
+state each one is in. The tree is the source of truth, not its memory of it —
+children can be added and removed while it works.</li>
+<li><strong>Decide what can run now, and start all of it.</strong> The driver weighs whether
+two children touch the same files, whether one needs another&#39;s work first, and
+what each accept will cost the children still running, then starts everything
+that is safe to run at once. Nothing in lazy caps how many that is.</li>
+<li>Wait on all of the running children together and act on whichever finishes
+first.</li>
+<li>Read what that child came back with — its report and its raised items, not its
+diff. By default a child has already reviewed its own work inside its own
+session before it parked (<a href="../review-paradigm/">the review paradigm</a>), so the
+work that reaches the driver has been read once and fixed once. A cluster of a
+dozen children would run out of context if it read every diff.</li>
+<li>Accept it, unless something serious is recorded. That is the instruction the
+driver has: accept is the default, and a round is a full agent turn spent on
+work nobody has shown is needed. &quot;Serious&quot; means a security or data-integrity
+problem, a capability lost, a stated goal not met, or a finding at critical or
+high severity — not a nit, and not polish. The driver writes the child&#39;s
+verdict in its journal first, so you can read afterwards how many rounds each
+child took and what went wrong. An accepted child&#39;s work merges into the
+cluster&#39;s branch, so the whole cluster lands as one change.</li>
+<li>The driver sets review settings ONCE on itself and every child follows: a
+child that says nothing inherits its parent task&#39;s mode, gate and auto-fix
+(<a href="../review-paradigm/">the review paradigm</a>). A child that overrides one keeps
+inheriting the rest.</li>
+<li>The driver may <strong>escalate one child to a separate review</strong> when the stakes
+justify a cold second read — a security or data-integrity change, a migration,
+something it cannot judge from the report. It sets that child&#39;s review mode to
+<code>separate</code>, and then that child gets a reviewer of its own whose verdict gates
+the accept. It costs three to four times the wall-clock and the tokens, which
+is why it is per child and not how a cluster runs by default. A child whose
+separate review stalls — a decision only a person can make, findings the driver
+must weigh, the round cap, or a review that failed or never ran — is handed
+back to the driver with the findings, not parked on you. Whatever it decides,
+you see the outcome at the cluster&#39;s own review.</li>
+<li>Repeat until nothing is left to run.</li>
+</ul>
+<h3 id="how-many-children-run-at-once"><a class="anchor" href="#how-many-children-run-at-once" aria-hidden="true">#</a>How many children run at once</h3>
+<p>That is the driver&#39;s call, and lazy does not second-guess it. There is no cap,
+no queue and no setting.</p>
+<p>Running children one at a time would avoid ever merging siblings&#39; work, but
+those merges are mostly trivial, and serialisation is slow enough to dominate
+everything else. The judgement about when running children side by side is
+safe lives with the agent that can actually see the work.</p>
+<h3 id="how-many-rounds-one-child-may-have"><a class="anchor" href="#how-many-rounds-one-child-may-have" aria-hidden="true">#</a>How many rounds one child may have</h3>
+<p>A cluster runs unattended, so one child that keeps not-quite-passing review could
+otherwise absorb any number of agent turns with nobody watching the spend.
+<code>[cluster] max_child_fix_rounds</code> (default <strong>3</strong>) bounds it: after that many rounds
+on the same child, lazy refuses the driver&#39;s next send-back and tells it to
+accept the child, close it, or set it aside with a question for you.</p>
+<p>The count is <strong>per child</strong>, so one stubborn child never eats another&#39;s budget,
+and children running at the same time never interfere with each other&#39;s.</p>
+<p>The bound is on the driver&#39;s own judgement, never on yours. <strong>Unblocking that
+child yourself is never refused</strong>, and it starts a fresh budget — as does
+starting the child again, accepting it, or reopening it. Set the key to <code>0</code> to
+remove the bound entirely.</p>
+<p>This key is one of the levers in
+<a href="../review-paradigm/#when-tokens-are-still-the-constraint">the review paradigm</a>,
+which explains what each one costs you when you turn it down.</p>
+<h3 id="it-keeps-its-own-branch-current"><a class="anchor" href="#it-keeps-its-own-branch-current" aria-hidden="true">#</a>It keeps its own branch current</h3>
+<p>A cluster can sync itself: it merges its own branch on origin, then its parent,
+into its branch. This matters on a long run. Work keeps landing on the parent
+while the cluster runs, and without the sync every child would branch from the
+base the parent had when the cluster began, so a fix that landed an hour ago
+would never reach any of them. Children started after the sync branch from the
+cluster&#39;s current state.</p>
+<p>The driver is told to do this before starting a new wave rather than after every
+accept, because a sync costs a merge for every child currently running.</p>
+<p>The sync merges everything outstanding and stops at the first conflict, which
+the driver resolves itself before carrying on — so a conflict costs one cycle,
+not the cluster. A cluster is the only thing that can sync a running task, and it
+can only do it to itself: see <a href="../surface-asymmetries/">surface asymmetries</a>.</p>
+<h3 id="children-it-cannot-finish"><a class="anchor" href="#children-it-cannot-finish" aria-hidden="true">#</a>Children it cannot finish</h3>
+<p>Some tasks turn out to be impossible as written, or far bigger than the prompt
+suggests. A driver is expected to recognise those, set them aside, and carry on
+with the rest rather than grinding to a halt on the first hard one. A child it
+sets aside is tagged <code>deferred-by-&lt;cluster&gt;</code>, so you can find them all:</p>
+<pre><code class="language-bash">lazy search &#39;tag:deferred-by-my-cluster&#39;
+</code></pre>
+<p>When the cluster stops, it raises one <strong>blocking</strong> item per deferred child saying
+what it needs from you. Blocking means accepting the cluster is refused until you
+have answered them, so a cluster can never quietly hand back a pile of work it
+never did.</p>
+<h2 id="watching-it"><a class="anchor" href="#watching-it" aria-hidden="true">#</a>Watching it</h2>
+<p><code>lazy show &lt;cluster&gt;</code> prints the cluster&#39;s progress: how many children have been
+accepted out of how many are still expected to land, which are running, which
+are deferred, and how many were closed. The same line is at the top of the
+cluster&#39;s page on the dashboard, with each child linked, and the dashboard&#39;s
+<strong>Clusters</strong> page lists every cluster with its progress and its children.
+<code>lazy show &lt;cluster&gt; --json</code> carries the same numbers, under <code>cluster_progress</code>.
+That key was called <code>loop_progress</code> before the type was renamed, and there is no
+second spelling: a script that reads the old name finds nothing there, exactly as
+it would for a task that is not a cluster.</p>
+<p>In <strong>Lazy Teams</strong> the same line is on the cluster&#39;s own page, and the project nav
+has a page listing every cluster with its progress and its children — including
+which ones were set aside — so you can see what all of them are doing without
+opening each one.</p>
+<p>All of it is derived from the tree, so it is correct whether the driver accepted
+a child or you did.</p>
+<h2 id="stopping-and-resuming"><a class="anchor" href="#stopping-and-resuming" aria-hidden="true">#</a>Stopping and resuming</h2>
+<p>A cluster that has stopped is <code>blocked</code>, like any other task, and you resume it
+the usual way:</p>
+<pre><code class="language-bash">lazy unblock &lt;cluster&gt;
+</code></pre>
+<p>With one exception: <strong>if you add a child to a cluster that is parked after its
+own turn, lazy starts it again by itself</strong>, telling it which child arrived. That
+is the only case in lazy where something other than you starts a turn on a local
+event, and it is limited to cluster tasks — adding work to a cluster should not
+need a second step to take effect.</p>
+<p>Three things to know about it:</p>
+<ul>
+<li><strong>A cluster you stopped with <code>lazy stop</code> stays stopped</strong>, until it next
+completes a turn — see below. Adding a child does not start it again: the
+arrival is written onto the cluster as a note instead, which it reads when you
+unblock it. (<code>lazy resume</code> deliberately carries no new context, so it does not
+hand over that note. The cluster re-reads its subtask tree either way, which is
+where the new child actually is, but <code>lazy unblock</code> is what puts the note in
+front of it.)</li>
+<li>Children the driver&#39;s own agent created never wake it. Otherwise a cluster that
+spawns its own subtasks would wake itself forever.</li>
+<li>Automatic restarts come out of the same budget as every other turn lazy starts
+on its own (<code>auto_react_max_retries</code> and <code>max_auto_turns</code> in
+<a href="../lazy-toml/">lazy.toml</a>). Once that budget is spent the cluster simply stays
+blocked until you unblock it, which resets the counters.</li>
+</ul>
+<p><strong>What ends a stop.</strong> Any turn the cluster completes does — not only one you
+meant as a restart. Unblocking it obviously does, but so does <strong>asking it a
+question with <code>lazy ask</code>, or running a review on it</strong>: both run the agent, and a
+completed turn clears the stop. From then on the cluster is an ordinary parked
+cluster again, so the next child added to it starts a turn.</p>
+<p>This matters if you are relying on a stop. A cluster you stopped, read, and then
+handed more work to is no longer stopped — it will pick that work up. If you
+need it to stay parked, leave it alone, or close the children you are not ready
+for it to run.</p>
+<h3 id="if-a-clusters-turn-is-killed"><a class="anchor" href="#if-a-clusters-turn-is-killed" aria-hidden="true">#</a>If a cluster&#39;s turn is killed</h3>
+<p>A cluster can be cut off mid-turn — you upgrade lazy, the daemon restarts, the
+machine reboots, the agent crashes. That is not &quot;stopped&quot;: nothing was handed
+back to you and nothing was decided. Such a cluster is marked <code>interrupted</code> and
+lazy starts it again for you, out of the same automatic-turn budget as above. It
+picks up by re-reading its tree, which is where the state of every child lives,
+so a child that finished while the cluster was down is simply there when it
+looks.</p>
+<p>You do not need to unblock a cluster in that state, and you should not see it
+waiting for you.</p>
+<h2 id="cluster-tasks-and-the-lazy-loop-command"><a class="anchor" href="#cluster-tasks-and-the-lazy-loop-command" aria-hidden="true">#</a>Cluster tasks and the <code>lazy loop</code> command</h2>
+<p>They are two answers to the same question, and you pick by who is doing the
+reviewing. <code>lazy loop</code> drives a queue of tasks <em>with you at the keyboard</em>: it
+starts each one, waits, and presents a review gate where you choose. A cluster
+<strong>task</strong> is the unattended version — its agent makes those calls itself, and you
+review the whole thing once at the end.</p>
+<h2 id="what-a-cluster-does-not-do"><a class="anchor" href="#what-a-cluster-does-not-do" aria-hidden="true">#</a>What a cluster does not do</h2>
+<ul>
+<li>It does not do its children&#39;s work. A child&#39;s changes reach the cluster&#39;s
+branch by being accepted, never by the driver re-implementing them.</li>
+<li>It does not schedule from a queue you configure — the driver decides what runs
+next, and how much of it, every cycle.</li>
+</ul>
+
+</main>
+</body>
+</html>

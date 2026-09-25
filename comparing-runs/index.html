@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Comparing runs: lazy clone --same-base — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="comparing-runs-lazy-clone---same-base"><a class="anchor" href="#comparing-runs-lazy-clone---same-base" aria-hidden="true">#</a>Comparing runs: <code>lazy clone --same-base</code></h1>
+<p>To find out how another agent or model handles the same work, re-run a task on
+exactly the code the original saw:</p>
+<pre><code class="language-bash">lazy clone fix-auth --same-base --agent cursor --model gpt-5
+lazy start fix-auth-clone-1
+</code></pre>
+<p>The clone gets the source task&#39;s goal, current prompt and type, and the same
+parent. It works for any task, finished ones included.</p>
+<h2 id="what---same-base-does"><a class="anchor" href="#what---same-base-does" aria-hidden="true">#</a>What <code>--same-base</code> does</h2>
+<ul>
+<li><strong>The branch starts from the source task&#39;s starting commit.</strong> That is the
+commit the source task&#39;s branch was created from when it was first started,
+before any of its turns ran. It is <em>not</em> the parent branch&#39;s current head, so
+work that landed on the parent since then is not in the clone.</li>
+<li><strong>The clone is pinned there.</strong> Nothing merges the parent in automatically: no
+sync after another task is accepted, no retry of a queued sync, no merge before
+a resumed turn, and the task&#39;s own agent cannot sync it either. Otherwise a
+single silent merge would quietly spoil the comparison.</li>
+<li><strong><code>lazy sync &lt;clone&gt;</code> lifts the pin.</strong> Run by you (or the builder), sync merges
+the parent in as usual, and from then on the clone is an ordinary task.</li>
+<li><strong>Accepting works as usual.</strong> A pinned clone is merged into its parent like any
+other task.</li>
+</ul>
+<p>Anywhere a task&#39;s upstream status is shown (<code>lazy show</code>, the dashboard&#39;s task
+header), a pinned task reads like
+<code>pinned to 1a2b3c4d5e6f, 7 behind main (no automatic sync; lazy sync lifts the pin)</code>.</p>
+<h2 id="options"><a class="anchor" href="#options" aria-hidden="true">#</a>Options</h2>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>--same-base</code></td>
+<td>Branch from the source task&#39;s starting commit and pin the clone there.</td>
+</tr>
+<tr>
+<td><code>--base &lt;sha&gt;</code></td>
+<td>The same, but pinned to a commit you name (any SHA or ref git resolves).</td>
+</tr>
+<tr>
+<td><code>--agent &lt;profile&gt;</code></td>
+<td>Run the clone on another agent profile. Default: the source&#39;s.</td>
+</tr>
+<tr>
+<td><code>--model &lt;model&gt;</code></td>
+<td>Run the clone on another model. Default: the source&#39;s model, or the new agent&#39;s default model when <code>--agent</code> names a different agent.</td>
+</tr>
+</tbody></table>
+<p>The agent and model are stored on the clone, so every later turn keeps them. Model names are not portable between agents, so switching <code>--agent</code> without <code>--model</code> never carries the source&#39;s model over.</p>
+<p>The dashboard&#39;s and Lazy Teams&#39; <strong>Clone</strong> / <strong>Make a copy</strong> action offers the
+same choices: agent, model, and a &quot;Same base&quot; checkbox. Over MCP, <code>lazy_clone</code>
+takes <code>same_base</code>, <code>base</code> and <code>agent</code>; with <code>same_base</code> or <code>base</code> it creates the
+same kind of sibling clone <code>lazy clone</code> does.</p>
+<h2 id="when-the-starting-commit-is-gone"><a class="anchor" href="#when-the-starting-commit-is-gone" aria-hidden="true">#</a>When the starting commit is gone</h2>
+<p>An old task&#39;s starting commit may only have been reachable from a branch that
+has since been deleted. If git has already removed it, the clone is refused with
+a message saying so and nothing is created. Fetch the commit from a remote that
+still has it and try again, or clone without a pinned base.</p>
+<p>Once the clone exists, its own branch keeps the commit alive: the branch is
+created at the pinned commit by <code>lazy clone</code> itself, and <code>lazy start</code> works on
+it. Closing a clone that was never started leaves that branch in place.</p>
+
+</main>
+</body>
+</html>

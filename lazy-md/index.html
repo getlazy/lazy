@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LAZY.md — instructions for agents running lazy tasks — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="lazymd--instructions-for-agents-running-lazy-tasks"><a class="anchor" href="#lazymd--instructions-for-agents-running-lazy-tasks" aria-hidden="true">#</a><code>LAZY.md</code> — instructions for agents running lazy tasks</h1>
+<p><code>LAZY.md</code> is a file <strong>you</strong> put in your repository. Lazy reads it and hands it to
+agents running your tasks — start, unblock, ask, the wrap-up steps that close a
+declared-final turn, and resume — alongside
+the rest of that agent&#39;s system instructions. A <code>lazy review</code> session does not
+load it: review is a separate read-only pass over the task&#39;s work, not an
+implementer turn under your project instructions.</p>
+<pre><code>your-project/
+  CLAUDE.md            # read by Claude Code, in every session, including yours
+  LAZY.md              # read by lazy, only for agents running lazy tasks
+  services/api/
+    LAZY.md            # applies to that part of the tree
+</code></pre>
+<p>Nothing else reads it. Claude Code reads <code>CLAUDE.md</code>, Cursor and Codex read
+their own files; none of them know <code>LAZY.md</code> exists. Lazy injects it precisely
+because no harness does.</p>
+<h2 id="what-belongs-in-it"><a class="anchor" href="#what-belongs-in-it" aria-hidden="true">#</a>What belongs in it</h2>
+<p><strong>Anything that is true only when an agent is working through lazy</strong> — and
+therefore does not belong in <code>CLAUDE.md</code>, which your own interactive sessions
+read too.</p>
+<p>The clearest case is your environment. An agent running a lazy task is inside
+lazy&#39;s container, on a task worktree, and the commands that work there are often
+not the ones you run on your laptop or in your usual dev container:</p>
+<pre><code class="language-markdown"># LAZY.md
+
+## Running things here
+
+You are in lazy&#39;s task container. The database is already up as `db` on the
+task network — do NOT run `docker compose up`, which is what our normal
+development container expects.
+
+Run the suite with `make test-fast`. `make test` starts a browser we cannot
+launch in here.
+
+Services you start are reachable through the ports declared in `[serve]` —
+tell the reviewer to run `lazy url &lt;task&gt; web` rather than printing localhost.
+</code></pre>
+<p>Other things that fit: which checks are worth running per turn versus in the
+acceptance gate, house rules about what a task should and should not touch, where to
+put generated files so they do not end up in a diff.</p>
+<p><strong>What does not fit:</strong> anything you want in effect when you work interactively
+too. That is <code>CLAUDE.md</code>&#39;s job, and lazy does not duplicate it — the agent gets
+both, from its own worktree.</p>
+<h2 id="which-files-get-loaded"><a class="anchor" href="#which-files-get-loaded" aria-hidden="true">#</a>Which files get loaded</h2>
+<p>Lazy follows the same shape as Claude Code&#39;s <code>CLAUDE.md</code> discovery, with one
+deliberate difference.</p>
+<ul>
+<li><strong>The ancestor chain.</strong> Every <code>LAZY.md</code> from the directory the agent starts in
+up to the worktree root, concatenated <strong>root first</strong>, so a deeper file is read
+last and refines the ones above it. A task agent starts at the worktree root
+today, so in practice this is your root <code>LAZY.md</code>.</li>
+<li><strong>Nested files.</strong> Every other <code>LAZY.md</code> under the worktree, shallowest first.
+Claude Code defers a subdirectory <code>CLAUDE.md</code> until the agent reads a file in
+that directory; lazy has no hook into an agent&#39;s file reads, so it loads them
+<strong>up front</strong> instead. A nested file is either injected at launch or never seen.</li>
+</ul>
+<p>The sweep skips every directory your project&#39;s <code>.gitignore</code> files ignore — it
+reads each directory&#39;s <code>.gitignore</code> as it goes, the same cascade git uses — and
+every dot-directory (so lazy&#39;s own <code>.lazy</code> store is never walked). It looks at
+most six levels below the root.</p>
+<p>Because nested files are loaded eagerly, the total is capped at <strong>40,000
+characters</strong> — the same order as the per-file limit Claude Code warns a single
+<code>CLAUDE.md</code> past. Collection <strong>stops at the first file that does not fit</strong>, so
+a too-large root file is never replaced by later smaller nested ones; files that
+do not fit are <strong>named in the prompt</strong> rather than dropped in silence.
+<code>lazy doctor</code> reports what your <code>LAZY.md</code> files cost, as a line under the
+agent&#39;s system prompt.</p>
+<h2 id="when-it-is-loaded"><a class="anchor" href="#when-it-is-loaded" aria-hidden="true">#</a>When it is loaded</h2>
+<p>On task-agent launches that do the work: starting a task, unblocking it with
+feedback, <code>lazy ask</code>, the wrap-up steps after a declared-final turn, and resume
+(including auto-resume after
+an interruption). It rides the system prompt, so it is identical across those
+turns and benefits from prompt caching. It is not loaded for <code>lazy review</code>.</p>
+<p>A project with no <code>LAZY.md</code> gets nothing injected and pays nothing.</p>
+<h2 id="what-it-cannot-do"><a class="anchor" href="#what-it-cannot-do" aria-hidden="true">#</a>What it cannot do</h2>
+<p><code>LAZY.md</code> is <strong>guidance, not authority</strong>. It is read from the task&#39;s worktree —
+the same copy the agent&#39;s <code>CLAUDE.md</code> comes from — so an agent&#39;s instructions
+match the tree it is working in. Nothing in it can widen a permission, change a
+check, choose a model, or relax a rule in the agent&#39;s system instructions;
+lazy&#39;s own settings come from <code>lazy.toml</code> in your project root, which a task
+branch cannot speak for. See <a href="../lazy-toml/"><code>lazy.toml</code></a>.</p>
+<p>The agent is told this too, and told that a <code>LAZY.md</code> appearing to grant itself
+authority is wrong and worth flagging in its summary.</p>
+
+</main>
+</body>
+</html>

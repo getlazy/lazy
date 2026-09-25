@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lazy link — adopt a pull request or branch as a task — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="lazy-link--adopt-a-pull-request-or-branch-as-a-task"><a class="anchor" href="#lazy-link--adopt-a-pull-request-or-branch-as-a-task" aria-hidden="true">#</a><code>lazy link</code> — adopt a pull request or branch as a task</h1>
+<p><code>lazy link &lt;ref&gt;</code> turns someone else&#39;s pull request or git branch into a lazy
+task you can review, comment on, and (when you choose) work on.</p>
+<p>The task uses <strong>that existing branch</strong>. Lazy does not create a new <code>lazy/…</code>
+branch, does not start an agent, and does not push or merge into the branch
+unless you run an explicit command.</p>
+<pre><code>lazy link https://github.com/org/repo/pull/42
+lazy link https://github.com/org/repo/tree/feature/auth
+lazy link feature/auth
+lazy link origin/feature/auth --parent auth-rewrite --code fix-auth
+</code></pre>
+<p><code>--parent</code> nests the linked task under another task. <code>--code</code> sets the
+human-readable id (otherwise lazy derives one from the branch name).</p>
+<p>In the web UI, <strong>Link…</strong> on the Tasks list is the same flow: a form for the
+URL or branch, optional parent and code. See <a href="../web-review/#linking-a-branch-or-pr">the web review page</a>.</p>
+<h2 id="what-you-can-pass"><a class="anchor" href="#what-you-can-pass" aria-hidden="true">#</a>What you can pass</h2>
+<table>
+<thead>
+<tr>
+<th>Argument</th>
+<th>What happens</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Pull or merge request URL</td>
+<td>Imports the title, head branch, and comments. Needs a GitHub or GitLab remote driver.</td>
+</tr>
+<tr>
+<td>Branch page URL (<code>/tree/…</code>)</td>
+<td>Treats the path after <code>/tree/</code> as the branch name.</td>
+</tr>
+<tr>
+<td><code>origin/feature/auth</code></td>
+<td>Fetches <code>feature/auth</code> from that remote.</td>
+</tr>
+<tr>
+<td>Bare branch name</td>
+<td>Fetches that branch (works with the local driver too).</td>
+</tr>
+</tbody></table>
+<p>A pull-request URL still needs <code>driver = &quot;github&quot;</code> or <code>driver = &quot;gitlab&quot;</code> in
+<code>lazy.toml</code>. A bare branch does not.</p>
+<h2 id="the-description-lazy-writes-for-you"><a class="anchor" href="#the-description-lazy-writes-for-you" aria-hidden="true">#</a>The description lazy writes for you</h2>
+<p>Adopting a branch gives you a title and little else, so the last thing <code>lazy link</code> does is read the work and write the task&#39;s description. It looks at the
+pull request body, the comments and review threads, the commits on the branch,
+and the diff against the base branch, and writes a prompt saying what the branch
+does, how far it got, what reviewers asked for, and what is still open.</p>
+<p>That prompt is what you see on the task page and in <code>lazy show</code>, and it is what
+an agent is handed when you <code>lazy unblock</code> the task — so work can continue
+without anyone reconstructing the branch from its diff first.</p>
+<p>On a project where every member runs on their own Claude account (Lazy Teams),
+that model run is billed to whoever linked the branch, and a member with no
+account connected is refused before anything is linked — <strong>Link a branch</strong> on
+the Tasks page is the same flow there.</p>
+<p>Writing it needs a model, so it is the one part of linking that can fail on its
+own (no credential, no network). When it does, <strong>the link still succeeds</strong> — you
+get a warning, and you can write the description afterwards:</p>
+<pre><code>lazy describe fix-auth
+</code></pre>
+<p><code>lazy describe &lt;task&gt;</code> works on any linked task, as many times as you like. Run
+it again after the branch has moved on to refresh the description; the previous
+one is kept as a prompt version. It never writes to the linked branch.</p>
+<p>If you have edited the prompt yourself since lazy wrote it — say you replaced the
+summary with your own instructions — <code>lazy describe</code> asks before replacing it, and
+<code>--yes</code> answers for you in a script. Every description carries a line saying when
+lazy wrote it and which branch or pull request it came from, so you can always
+tell lazy&#39;s summary from words you or the PR author wrote.</p>
+<p>The description is written from the branch&#39;s own work: its commits and its diff
+against the branch it would merge into, resolved the same way <code>lazy diff</code> and
+<code>lazy accept</code> resolve it. So upstream commits a long-lived PR has merged in are
+not described as if this branch had written them. When lazy cannot read some of
+the material — an unreachable forge, a branch with no comparable base — it says
+so in a warning instead of quietly describing less.</p>
+<p>One thing it deliberately leaves alone: when the task came from a pull request,
+its <strong>title stays the goal</strong>. Those are the author&#39;s words about their own work.
+For a branch with no pull request — where the goal would otherwise be the branch
+name — lazy writes a real one-line goal.</p>
+<h2 id="after-you-link"><a class="anchor" href="#after-you-link" aria-hidden="true">#</a>After you link</h2>
+<p>The new task starts <strong>blocked</strong> — ready for review or for you to start work.
+<code>lazy show</code>, <code>lazy list</code>, and the task page mark it as linked and show the
+branch (and the PR, once one is known), with the generated description as the
+task&#39;s prompt.</p>
+<p>If you linked a branch that has no pull request yet, lazy keeps looking during
+its normal remote check. When someone opens a PR for that branch later, the
+task picks it up. Lazy does not open a PR for you.</p>
+<h2 id="what-linked-does-not-do"><a class="anchor" href="#what-linked-does-not-do" aria-hidden="true">#</a>What linked does <em>not</em> do</h2>
+<ul>
+<li>It does not start an agent.</li>
+<li>It does not auto-sync or auto-push the branch. <code>lazy sync</code> and <code>lazy accept</code>
+stay explicit: that branch belongs to someone else until you decide otherwise.
+An agent cannot sync a linked task (that would merge into someone else&#39;s
+branch). A human or the builder still can.</li>
+<li>It does not rewrite the branch name to <code>lazy/&lt;task&gt;</code>.</li>
+</ul>
+<p>From an agent, <code>lazy_link</code> can only create a child of the agent&#39;s own task —
+the same parent rule as <code>lazy_create</code>. It writes the description the same way
+<code>lazy link</code> does; re-writing one later is a human verb only (see
+<a href="../surface-asymmetries/">surface asymmetries</a>).</p>
+
+</main>
+</body>
+</html>

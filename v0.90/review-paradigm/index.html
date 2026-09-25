@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The review paradigm — what lazy does by default, and why — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="the-review-paradigm--what-lazy-does-by-default-and-why"><a class="anchor" href="#the-review-paradigm--what-lazy-does-by-default-and-why" aria-hidden="true">#</a>The review paradigm — what lazy does by default, and why</h1>
+<p>Lazy reviews every task before you merge it, without being asked. What changed
+is <em>how</em>: the default review is <strong>fast</strong> — one session, self-reviewed, with the
+diff still in context — and the separate reviewer is the <strong>optimization you opt
+into</strong> when quality is worth three to four times the wall-clock and the tokens.</p>
+<p>This page is the reasoning behind that. For the mechanics of a single review —
+the verdicts, what the reviewer may touch, how to stop one — see
+<a href="../review/">agent reviews</a>.</p>
+<h2 id="what-a-review-is-for"><a class="anchor" href="#what-a-review-is-for" aria-hidden="true">#</a>What a review is for</h2>
+<p>A review does three jobs, and the trade-offs later hang on which one you care
+about.</p>
+<p>It is a <strong>merge gate</strong>: a second reader who catches what the writer missed. A
+writer that has just spent eight turns on a change is the worst possible
+auditor of it.</p>
+<p>It is a <strong>substitute for your own reading</strong>: the reason you can accept without
+opening every file. Someone went through this branch, swept it for security and
+data-integrity problems, and said so in writing.</p>
+<p>And it is a <strong>feedback loop</strong>: what turns a cheaper writer into acceptable
+output over a bounded number of rounds. A model told precisely what it got
+wrong can land work it would never have produced in one pass.</p>
+<h2 id="three-modes"><a class="anchor" href="#three-modes" aria-hidden="true">#</a>Three modes</h2>
+<p><code>[review] mode</code> in lazy.toml picks how a task is reviewed, and every task
+carries its own. The default is <code>low_high</code>.</p>
+<table>
+<thead>
+<tr>
+<th>mode</th>
+<th>who reads the work</th>
+<th>gates accept</th>
+<th>relative cost</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>low_high</code> <em>(default)</em></td>
+<td>the writer, in its own session</td>
+<td>no</td>
+<td>1x</td>
+</tr>
+<tr>
+<td><code>separate</code></td>
+<td>a reviewer in a new session</td>
+<td>yes</td>
+<td>3–4x</td>
+</tr>
+<tr>
+<td><code>off</code></td>
+<td>nobody</td>
+<td>no</td>
+<td>0</td>
+</tr>
+</tbody></table>
+<p>The &quot;gates accept&quot; column is the DEFAULT answer — what lazy&#39;s own automatic
+review does in each mode. A review you asked for yourself gates in all three,
+and <a href="#the-gate-when-a-review-actually-holds-a-merge"><code>[review] gate</code></a> overrides
+the column either way.</p>
+<p><strong><code>low_high</code> — the writer reviews itself.</strong> The work turn runs at
+<code>draft_effort</code> (<code>low</code>), then the <em>same session</em> is resumed for a hostile
+read-only self-review at <code>review_effort</code> (<code>xhigh</code>, raised to match the draft
+when a task&#39;s own effort puts it higher — a review never runs weaker than the
+work it reviews), then one revise pass
+applies what that review found. The diff is already in context, so nothing is
+re-read, and no second container starts. Its outcome is <strong>recorded as a review</strong>
+— the same verdict / sweeps / findings shape every other review has, so you read
+it the same way — and under the default gate it does not hold your accept. Set
+<a href="#the-gate-when-a-review-actually-holds-a-merge"><code>gate = &quot;always&quot;</code></a> and it does.
+See <a href="../low-high-loop/">the low-high loop</a> for the phases in detail.</p>
+<p><strong><code>separate</code> — a reviewer in its own session.</strong> After the task declares done, a
+new agent in a short-lived container of its own reads the branch cold,
+read-only, and files a verdict that <strong>gates your accept</strong>. It is never weaker
+than the writer: it runs on the task&#39;s own model and effort. This is what every
+task used to do.</p>
+<p><strong><code>off</code> — nothing.</strong> A final triggers no review, and accept is not gated on
+one, because there is none.</p>
+<p>Set it per project:</p>
+<pre><code class="language-toml">[review]
+mode = &quot;low_high&quot;
+</code></pre>
+<p>or per task, which wins and sticks for that task&#39;s whole life:</p>
+<pre><code>lazy create --review separate --goal &quot;Rotate the signing keys&quot;
+lazy edit &lt;task&gt; --review low-high
+</code></pre>
+<h2 id="settings-are-inherited-not-just-defaulted"><a class="anchor" href="#settings-are-inherited-not-just-defaulted" aria-hidden="true">#</a>Settings are inherited, not just defaulted</h2>
+<p><code>[review]</code> is the project&#39;s <strong>default</strong>, and a task can say otherwise. There are
+three levels, and each setting resolves through them independently:</p>
+<pre><code>project config  →  parent task  →  task
+</code></pre>
+<p>A task that says nothing inherits its <strong>parent task&#39;s</strong> value; a top-level task
+inherits the project&#39;s. That is what makes a <a href="../cluster-tasks/">cluster</a> cheap
+to configure: the driver sets a mode once on itself and every child follows,
+unless a child overrides — and a child that overrides only the mode still
+inherits its parent&#39;s gate.</p>
+<p><strong>Only a choice is inherited.</strong> A task picks up what somebody explicitly <em>set</em>
+on an ancestor — <code>--review*</code> on create, start or edit, the same arguments over
+MCP, or the web form. It does not pick up a value that ancestor merely ended up
+with, such as the project default its own launch pinned on it. So setting a mode
+on a cluster driver still configures every child, while a parent task that was never
+configured leaves its children on the project default, which is what you would
+expect of a default.</p>
+<p><strong>A choice travels the whole tree</strong>, not one generation: configure a parent task and its
+grandchildren follow too, and lazy keeps naming the task where the choice was
+actually made rather than whichever task passed it on.</p>
+<p>The resolved values are pinned on the task the first time it launches, the way
+<code>--model</code> and <code>--effort</code> are. A project default you change later moves new
+tasks and leaves running ones exactly where they were. <code>lazy show &lt;task&gt;</code> prints
+the effective values, so you never have to reconstruct them.</p>
+<h2 id="reading-the-review-line"><a class="anchor" href="#reading-the-review-line" aria-hidden="true">#</a>Reading the Review line</h2>
+<p><code>lazy show &lt;task&gt;</code> and the task page both carry one line for this:</p>
+<pre><code>Review:  low-high, gate auto, auto-fix off
+         mode low-high — the writer reviews its own work in its own session, then revises (project default)
+         gate auto — the mode decides whether a review holds the merge; a review you asked for always does (project default)
+         auto-fix off — a review that finds something parks the task instead of starting a fix round (project default)
+</code></pre>
+<p>Three values — the <a href="#three-modes">mode</a>, the <a href="#the-gate-when-a-review-actually-holds-a-merge">gate</a>
+and the <a href="#what-still-holds-in-every-mode">auto-fix switch</a> — and, for each one,
+<strong>where it came from</strong>:</p>
+<table>
+<thead>
+<tr>
+<th>provenance</th>
+<th>what it means</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>project default</code></td>
+<td>nothing was set for this task or any task above it; <code>[review]</code> in lazy.toml decided</td>
+</tr>
+<tr>
+<td><code>inherited from &lt;task&gt;</code></td>
+<td>somebody set it on that task — a parent or a further ancestor — and nothing below it overrode</td>
+</tr>
+<tr>
+<td><code>set on this task</code></td>
+<td>somebody set it here, with <code>--review*</code>, the MCP tools or the web form</td>
+</tr>
+<tr>
+<td><code>already recorded on this task, with no choice on record</code></td>
+<td>the task was launched by a version of lazy that pinned the value without recording who decided it</td>
+</tr>
+<tr>
+<td><code>recorded on this task before [review] existed</code></td>
+<td>the task predates these settings and keeps the arm it was running under (see <a href="#migrating-from-agent-low_high_loop">migrating</a>)</td>
+</tr>
+</tbody></table>
+<p>On the task page the same clauses are the tooltip on the <code>Review:</code> item, and the
+item links here. Over MCP, <code>lazy_show</code> returns them as <code>review.explanations</code>
+with the machine-readable <code>review.sources</code>.</p>
+<p>If a value is not what you expect, the provenance says which level to change:
+the project&#39;s <code>[review]</code> section, the parent task, or this task.</p>
+<h2 id="the-gate-when-a-review-actually-holds-a-merge"><a class="anchor" href="#the-gate-when-a-review-actually-holds-a-merge" aria-hidden="true">#</a>The gate: when a review actually holds a merge</h2>
+<p>The mode says who reads the work. <code>[review] gate</code> says whether what they found
+can refuse a merge, and it is the master switch over the mode rule.</p>
+<table>
+<thead>
+<tr>
+<th>gate</th>
+<th>what holds a merge</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>auto</code> <em>(default)</em></td>
+<td>the mode decides for a review <strong>lazy dispatched</strong> — plus any review <strong>you asked for</strong>, in any mode</td>
+</tr>
+<tr>
+<td><code>always</code></td>
+<td>every recorded review, the low-high self-review&#39;s own outcome included</td>
+</tr>
+<tr>
+<td><code>never</code></td>
+<td>nothing, in any mode, manual reviews included</td>
+</tr>
+</tbody></table>
+<p><strong>A review you asked for always counts, under the default.</strong> <code>lazy review</code> and
+a driver&#39;s <code>lazy_review</code> are deliberate acts — nobody spends a review turn they
+did not want — so ignoring what one found because the task is in the fast mode
+would make the command a no-op at exactly the moment you reached for it. Only
+lazy&#39;s own automatic dispatch follows the mode.</p>
+<p><code>always</code> is for the project that wants the fast shape and still wants a bad
+self-review to stop a merge: findings above medium, or a sweep that found
+something, hold the accept until addressed or overridden. It does <strong>not</strong> hold
+on findings the revise pass already applied — a self-review that found
+something and fixed it is a self-review that worked, and a setting that stranded
+those tasks would be unusable. <code>never</code> is the one
+setting that also switches off a manual review&#39;s gate, because a human who
+writes <code>never</code> has said exactly that.</p>
+<p><strong>Nothing is disregarded silently.</strong> When your settings let a merge through over
+a review that found something, accept says so in one line and points you at the
+report. A review that gates refuses instead, which is its own notice.</p>
+<h2 id="why-the-default-is-the-fast-one"><a class="anchor" href="#why-the-default-is-the-fast-one" aria-hidden="true">#</a>Why the default is the fast one</h2>
+<p>Because the slow one can stop the work from advancing. With many tasks running
+at once under the separate reviewer, each can take three or more rounds of
+review-then-fix at roughly half an hour each — enough to exhaust an
+organisation&#39;s spend limit, at which point everything running stops.</p>
+<p>The reasoning that produced the old default was &quot;your time is the scarce
+resource, tokens are not&quot;. It was half right. Money is limited the same way
+time and attention are, and when the spend runs out the work does not merely
+get more expensive — it <strong>stops</strong>, and you wait. Performance per token is what
+actually decides how much gets done, and a second agent re-reading a diff that
+is already warm in the writer&#39;s own context is the worst deal on that axis.</p>
+<p>So: fast first, ponderously slow as an optimization on quality. The escalation
+is per task, because that is where you can see whether the stakes justify it.</p>
+<h2 id="what-still-holds-in-every-mode"><a class="anchor" href="#what-still-holds-in-every-mode" aria-hidden="true">#</a>What still holds, in every mode</h2>
+<p>The declaration is still the trigger. An agent declares its work done with
+<code>lazy_final</code>, and that is the only thing the declaration does: accept does not
+need one, so a task that parked for a decision — or simply stopped — is yours to
+merge whenever you have read it.</p>
+<p>Whenever a review COUNTS — in <code>separate</code> mode, or because you asked for it, or
+because the gate is <code>always</code> — everything it can conclude still gates your
+accept: a verdict that needs work, a blocking decision, a review that could not
+be parsed, one that crashed, one that never started. &quot;Nobody knows what it
+concluded&quot; may not read as a pass. <code>lazy accept &lt;task&gt; --allow-review-issues</code> is
+your override, deliberately CLI-only: an agent may not overrule a review on your
+behalf.</p>
+<p><strong>What no longer gates: findings at medium or below.</strong> A finding is a reviewer&#39;s
+opinion about work you are about to read anyway. Holding the merge on every
+style nit cost a full agent turn or a person per finding, and left a cluster&#39;s
+driver — told to accept liberally — unable to accept anything, since the
+override is CLI-only. Critical and high findings still hold; so do a failed
+review, an outstanding blocking raise, and a report whose own security or
+data-integrity sweep names something no finding covers.</p>
+<p><strong>Fixing is its own switch.</strong> <code>auto_fix</code> is <code>false</code> by default: a
+<code>separate</code> review that finds something parks the task with the findings
+attached instead of spending another round on the daemon&#39;s own initiative.
+Whether that round is worth half an hour is a judgement made by whoever can see
+the whole board — you, or a cluster&#39;s driver. Turn it on to get the old
+behaviour:</p>
+<pre><code class="language-toml">[review]
+mode = &quot;separate&quot;
+auto_fix = true
+</code></pre>
+<p>The rounds that <em>are</em> started stay bounded: at most two review-then-fix rounds
+before the task parks with its findings, and <code>[cluster] max_child_fix_rounds</code>
+(default 3) per child for a cluster.</p>
+<p>Automatic reviews still come out of <code>[daemon] auto_react_daily_budget</code>, the
+shared daily allowance for every turn the daemon starts on its own (default 50,
+reset at local midnight). Lower it and reviews arrive late rather than never.
+Setting it to <code>0</code> is blunter than it looks: it stops every self-started turn,
+including the recovery of a crashed one. A <code>separate</code> task whose review was
+never dispatched does not quietly become acceptable — the skip is recorded, with
+the reason, and it holds acceptance exactly as an unclean review does.</p>
+<h2 id="migrating-from-agent-low_high_loop"><a class="anchor" href="#migrating-from-agent-low_high_loop" aria-hidden="true">#</a>Migrating from <code>[agent] low_high_loop</code></h2>
+<p>The low-high loop used to be an experiment under <code>[agent]</code>, off by default. Its
+three keys moved into <code>[review]</code> and are still honoured meanwhile, with
+<code>lazy doctor</code> naming the replacement for each:</p>
+<table>
+<thead>
+<tr>
+<th>old</th>
+<th>new</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>[agent] low_high_loop = true</code></td>
+<td><code>[review] mode = &quot;low_high&quot;</code></td>
+</tr>
+<tr>
+<td><code>[agent] low_high_loop = false</code></td>
+<td><code>[review] mode = &quot;separate&quot;</code></td>
+</tr>
+<tr>
+<td><code>[agent] low_high_loop_draft_effort</code></td>
+<td><code>[review] draft_effort</code></td>
+</tr>
+<tr>
+<td><code>[agent] low_high_loop_review_effort</code></td>
+<td><code>[review] review_effort</code></td>
+</tr>
+</tbody></table>
+<p>Note the second row. <code>false</code> never meant &quot;no review&quot; — it meant &quot;no in-session
+loop, and the daemon dispatches a reviewer of its own&quot;, which is exactly
+<code>separate</code>. Reading it as the new default would switch your existing projects
+into a different mode on upgrade, so it does not. Setting both spellings to
+things that disagree is refused at load rather than guessed.</p>
+<p>Tasks already in flight keep the mode they were running under, for the same
+reason: the mode is written onto a task the first time it launches, so a project
+default you change later moves new tasks and leaves running ones alone.</p>
+<p>Their <strong>children</strong> do not. <code>low_high_loop = false</code> was recorded on every task
+alive, whether or not anyone had an opinion, so it says what that task was
+doing and nothing about what its subtasks should do: a task created under an
+existing parent task takes the project default. Escalate the ones that deserve it with
+<code>lazy edit &lt;task&gt; --review separate</code>.</p>
+<p><code>lazy start --low-high-loop on|off</code> is gone. Use <code>--review low-high</code> for what
+<code>on</code> did, and <code>--review separate</code> for what <code>off</code> did.</p>
+<p><strong>The effort you chose for a task is not discarded.</strong> <code>low_high</code> never
+silently downgrades a task somebody set to <code>high</code>: an <code>--effort</code> on THIS TASK wins,
+for the draft and the revise pass alike.</p>
+<p>A project-wide <code>[agent] effort</code> is the fallback the other phases resolve from
+and does not outrank <code>draft_effort</code> for the draft — otherwise the setting would
+do nothing on any project that states an effort, which is most of them.</p>
+<h2 id="when-tokens-are-still-the-constraint"><a class="anchor" href="#when-tokens-are-still-the-constraint" aria-hidden="true">#</a>When tokens are still the constraint</h2>
+<p>Every lever below is real, and every one trades something away.</p>
+<p><strong>Run a cheaper writer.</strong> <code>lazy create</code>/<code>start</code>/<code>edit</code> take <code>--model</code>, and
+<code>--agent &lt;name&gt;</code> picks an <a href="../lazy-toml/#agentsname--named-agent-profiles">agent profile</a>
+with its own model, harness and credential. <em>What it trades:</em> in <code>separate</code>
+mode the review inherits the <strong>task&#39;s own</strong> model and effort, so a cheaper
+writer is also a cheaper reviewer. <code>lazy review &lt;task&gt; --model &lt;strong&gt; --effort high</code> buys back a strong reader for one review.</p>
+<p><strong>Use <code>--review off</code> for work you are going to read yourself.</strong> A one-line
+config change, a doc fix, a revert. <em>What it trades:</em> everything — you are the
+reviewer, and nothing records that anyone read it.</p>
+<p><strong>Lower <code>[cluster] max_child_fix_rounds</code>.</strong> Fewer rounds per child before the
+cluster must accept it, close it, or ask you. Lower means a smaller number — <code>0</code>
+is not a floor, it removes the bound and is the most expensive setting there is.
+<em>What it trades:</em> the cluster hands you more decisions.</p>
+<p><strong>Keep briefs small.</strong> One coherent goal makes a small diff, and a small diff
+is a cheap review — the reviewer walks the change in the
+<a href="../review-regions/">regions</a> the writing agent grouped itself. <em>What it
+trades:</em> more tasks to create and accept.</p>
+<p><strong>Accept with <code>--allow-review-issues</code> when you have read it yourself.</strong>
+<code>lazy accept &lt;task&gt; --allow-review-issues</code> merges over a review that left
+issues outstanding or could not produce a verdict. <em>What it trades:</em> everything
+above — you are the reviewer now.</p>
+<h2 id="what-lazy-records-so-you-can-judge-the-trade"><a class="anchor" href="#what-lazy-records-so-you-can-judge-the-trade" aria-hidden="true">#</a>What lazy records, so you can judge the trade</h2>
+<p>Two surfaces answer this, and they count <strong>different things</strong> — expect two
+numbers, and know which one you are reading.</p>
+<p>The task page&#39;s <strong>Stats</strong> tab is <em>what the agent reported, per turn</em>, for the
+task or its whole subtree
+(<a href="../web-review/#what-the-stats-tab-means">what it means</a>). Its caveat: usage is
+recorded only when the agent reports it, which today means Claude Code turns —
+a turn that reported none is left out rather than drawn as a free turn.</p>
+<p><code>lazy stats tokens</code> is <em>what went over the wire</em>: one record per request the
+lazy proxy forwarded, rolled up by role, task and model. Every launch is
+proxied, so nothing escapes the trail — but token counts are read off the wire,
+and only the Anthropic and OpenAI wires are read. A <strong>Cursor</strong> task is
+forwarded opaquely, so its requests appear with no tokens and no model against
+them. Its other caveat: the trail is a <strong>bounded rotating window</strong>, so old
+traffic ages out. <code>lazy stats tools &lt;task&gt;</code> breaks it down by tool.</p>
+
+</main>
+</body>
+</html>

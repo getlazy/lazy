@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pairing — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="pairing"><a class="anchor" href="#pairing" aria-hidden="true">#</a>Pairing</h1>
+<p><code>lazy pair &lt;task&gt;</code> drops you into an interactive agent session on a task — the
+same session its supervised turns run, with the same history, on the same
+branch. You talk to the agent directly, it edits the worktree, and when you exit
+lazy records a summary turn and puts the task back to <code>blocked</code>.</p>
+<h2 id="where-the-session-runs"><a class="anchor" href="#where-the-session-runs" aria-hidden="true">#</a>Where the session runs</h2>
+<p><strong>In the task&#39;s container</strong>, alongside the task&#39;s own turns. Pairing joins the
+existing container with <code>docker exec</code> rather than starting a new one, so
+whatever else is running in it — dev servers, watchers, published ports — keeps
+running. If the container is gone (daemon restart, <code>lazy upgrade</code>, a manual
+<code>docker rm</code>), pairing starts one, the same way a supervised turn would.</p>
+<p>This is a change from earlier versions, where pairing launched the agent as a
+<strong>host</strong> process against the task worktree. That had three problems, and moving
+into the container fixes all three:</p>
+<ul>
+<li><strong>Session state.</strong> The agent&#39;s home directory is now the sandbox mount the
+task&#39;s own turns already write (<code>&lt;worktree&gt;/.lazy-task-sandbox/</code>), so resuming
+a container-written session Just Works: it is the same directory, not a copy.
+Nothing is imported across the container boundary, which closes the
+escalation channel described in <a href="#cursor-and-codex-pairing">Cursor pairing</a> below.</li>
+<li><strong>Blast radius.</strong> <code>--autonomous</code> (permission prompts off) is now the same
+trust decision as any supervised turn, not &quot;an agent with your privileges on
+your machine&quot;.</li>
+<li><strong>Honesty.</strong> Host pairing was the escape hatch for everything that did not
+work in a container. Anything that does not work in a paired session is now a
+container bug to fix.</li>
+</ul>
+<h2 id="the---host-escape-hatch"><a class="anchor" href="#the---host-escape-hatch" aria-hidden="true">#</a>The <code>--host</code> escape hatch</h2>
+<p><strong>Branchless mode</strong> — <code>lazy pair</code> with no task, on a non-task branch — has no
+container to join. It requires an explicit <code>--host</code>, and prints what that means
+before launching.</p>
+<p>On a normal task, <code>--host</code> is an optional claude-code-only opt-in to run the
+agent on your machine instead of in the task&#39;s container. There is deliberately
+<strong>no automatic fallback</strong>: if the container path fails, pairing fails loudly
+rather than quietly running an agent on your machine instead.</p>
+<pre><code>lazy pair &lt;task&gt;          # in the task&#39;s container (the normal case)
+lazy pair &lt;task&gt; --host   # claude-code only: on your machine instead of the container
+lazy pair --host          # branchless: no task, no worktree, no container
+</code></pre>
+<h2 id="tools-the-paired-session-gets"><a class="anchor" href="#tools-the-paired-session-gets" aria-hidden="true">#</a>Tools the paired session gets</h2>
+<p>A paired session is wired with <strong>this task&#39;s</strong> <code>lazy_*</code> MCP tools — the same
+scoped toolset the task&#39;s own agent gets, not the broader builder toolset. That
+is deliberate: the session is operating on one task, in that task&#39;s worktree, so
+it gets that task&#39;s tool channel or none. Tool registration fails loudly; a
+paired session with no lazy tools is broken, not degraded.</p>
+<h2 id="cursor-and-codex-pairing"><a class="anchor" href="#cursor-and-codex-pairing" aria-hidden="true">#</a>Cursor and Codex pairing</h2>
+<p>Cursor and Codex tasks pair the same in-container way: the interactive CLI runs
+inside the task&#39;s container on the same mounted home (<code>~/.cursor</code> / <code>~/.codex</code>)
+the supervised turns used, resuming the task&#39;s own session. For Cursor this was
+previously a hard refusal, for a security reason
+that in-container pairing removed: a container-written Cursor chat lives in the
+worktree sandbox, a <em>host</em> <code>cursor-agent</code> reads your real <code>~/.cursor</code> and cannot
+see it, and lazy will not close that gap by copying agent-authored history into
+your host home — that turns a task&#39;s chat log into a prompt-injection channel
+into a session running as you. Since the session now runs on the same side of
+the boundary as the agent that wrote the history, nothing is copied and there is
+nothing to escalate.</p>
+<p><strong>Honest gap:</strong> conversation capture and the AI end-of-session summary need
+session files lazy can read back, and Cursor&#39;s and Codex&#39;s are not that — so
+pairing on a Cursor or Codex task records the commits you made and skips the
+transcript and summary. Pairing says so rather than silently omitting them.</p>
+<h2 id="pi-pairing"><a class="anchor" href="#pi-pairing" aria-hidden="true">#</a>Pi pairing</h2>
+<p>Pi tasks pair the same in-container way: <code>lazy pair</code> launches <code>pi</code>
+interactively in the task container. When the task already has a session, the
+paired one resumes it with its history and continues the supervised work;
+otherwise a fresh session starts, and pairing says which it did.</p>
+<p>Pi&#39;s session files are in Pi&#39;s own documented format, which lazy reads back:
+when the session ends, every session file the pairing wrote is captured into
+lazy&#39;s conversation store (searchable with <code>lazy search</code>), and the
+end-of-session summary is synthesized from that transcript — the same as for
+Claude Code. If saving a conversation fails, pairing says so and still writes
+the summary; the session file is untouched on disk either way.</p>
+<h2 id="ending-a-session"><a class="anchor" href="#ending-a-session" aria-hidden="true">#</a>Ending a session</h2>
+<p>Exit the agent. Lazy releases the pairing lock, restores the task&#39;s status, and
+(for Claude Code and Pi) captures the conversation and synthesizes a summary
+turn from it.</p>
+<p>If the host side is killed — a daemon restart, <code>lazy upgrade</code> — the in-container
+process is signalled through a pidfile in the shared sandbox directory rather
+than left holding the session, because <code>docker exec</code> does not forward signals to
+the process it started.</p>
+<pre><code>lazy pair &lt;task&gt; --unlock
+</code></pre>
+<p>recovers a session that outlived its host command. It signals the in-container
+agent through that same pidfile, removes the pairing lock, and restores the task
+to <code>blocked</code>. If no pidfile is present there is nothing running to signal, and
+<code>--unlock</code> just clears the lock and status — it will not start a stopped
+container to go looking.</p>
+<p><code>--host</code> sessions have no pidfile: they are ordinary child processes of your
+shell, so exiting or killing the terminal is what ends them.</p>
+
+</main>
+</body>
+</html>

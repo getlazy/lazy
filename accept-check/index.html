@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The accept check — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="the-accept-check"><a class="anchor" href="#the-accept-check" aria-hidden="true">#</a>The accept check</h1>
+<p><code>lazy accept</code> refuses to merge a task whose own worktree does not build, and
+names any protected files that were reverted during the task. This document
+explains the defect both halves exist for, how to configure the check, what the
+refusal looks like, and how to override it.</p>
+<h2 id="the-defect"><a class="anchor" href="#the-defect" aria-hidden="true">#</a>The defect</h2>
+<p>A branch can reach accept in a state that does not build. A typical way: some
+files the task changed get reverted to their base versions (older versions of
+lazy did this for protected files a human rejected during review; nothing
+reverts a protected file for you any more — approval happens once, at accept),
+and the rest of the branch still depends on the reverted changes.</p>
+<p>The agent usually notices at once — its next turn says the tree no longer
+compiles. But nothing on the accept path reads a turn title, so the task can be
+accepted anyway and break the target branch. A stale local build can hide it
+from human review too: a generated or gitignored file left over in an old
+checkout lets the branch build everywhere it is looked at and nowhere it is used.</p>
+<p>Two separate gaps let that through:</p>
+<ol>
+<li><strong>Nothing that says a task is broken was load-bearing on accept.</strong> Turn
+titles, post-turn check output, an agent&#39;s own summary — all advisory.</li>
+<li><strong>The revert was invisible in the diff.</strong> A reverted file is simply absent
+from the diff, which reads identically to &quot;the task never touched that file&quot;.</li>
+</ol>
+<h2 id="half-one-the-check"><a class="anchor" href="#half-one-the-check" aria-hidden="true">#</a>Half one: the check</h2>
+<p>When <code>[automation] accept_check</code> is set, accept runs that command <strong>in the task&#39;s
+own worktree</strong>, before the merge. A non-zero exit refuses the accept.</p>
+<pre><code class="language-toml">[automation]
+# Run in the TASK worktree at accept time. Non-zero exit refuses the merge.
+accept_check = &quot;bun run typecheck&quot;
+accept_check_timeout = 300   # seconds; a timeout is a refusal, not a pass
+</code></pre>
+<p>Notes on the shape, each deliberate:</p>
+<ul>
+<li><strong>It is the project&#39;s configured command, never one lazy guessed.</strong> lazy does
+not know how your project builds. If <code>accept_check</code> is unset there is no gate,
+and accept says the step was skipped rather than inventing a command.</li>
+<li><strong>Run the command the way a human would</strong> — <code>bun run typecheck</code>, <code>make check</code>,
+<code>npm run build</code>. Do <strong>not</strong> name a binary under <code>node_modules/.bin</code> directly:
+those are <code>#!/usr/bin/env node</code> shims, and in an environment without <code>node</code> on
+PATH they exit <strong>127 before the compiler reads a single file</strong>.</li>
+<li><strong>Exit 127 gets its own refusal</strong>, worded &quot;COULD NOT RUN&quot;, because a check
+whose interpreter is missing verified nothing. It still refuses — a gate that
+passes because nothing ran is the exact failure this exists to prevent.</li>
+<li><strong>A timeout is a refusal.</strong> A check that never answered is not a pass.</li>
+<li><strong>Host-side, in the worktree.</strong> No agent turn, no container, no network, and
+no daemon state beyond what accept already has. Read the trust boundary below
+before enabling it — that last property is a real tradeoff.</li>
+</ul>
+<h3 id="where-it-runs-and-what-an-agent-can-influence"><a class="anchor" href="#where-it-runs-and-what-an-agent-can-influence" aria-hidden="true">#</a>Where it runs, and what an agent can influence</h3>
+<p>The check runs as a plain <code>sh -c</code> <strong>on the daemon host</strong>, as the user running the
+daemon, with its working directory set to the task worktree. That worktree is
+written by an agent.</p>
+<p>The <strong>command</strong> is yours: it comes from the project root&#39;s <code>lazy.toml</code>, never
+from the task branch&#39;s copy of it, so a task cannot edit or disable its own gate.
+But what the command <strong>resolves to</strong> is not: <code>bun run typecheck</code> reads the
+worktree&#39;s <code>package.json</code> scripts, <code>make check</code> reads its <code>Makefile</code>, <code>tsc</code> reads
+its <code>tsconfig.json</code> and anything that extends. An agent that can commit to its
+own branch can change what your check actually executes.</p>
+<p>This differs from <code>[automation] pre_accept</code>, which runs its commands in an
+ephemeral gate container under the same runner — under a container runner, the
+gate executes <em>inside</em> a container (with no agent in it). The accept check does
+not. It must not depend on the runner, the network, or daemon health beyond what
+accept already requires, so it
+executes outside every container guard — including on fully automated MCP accepts
+of subtasks, where no human is watching the accept at all.</p>
+<p><strong>If you run a container runner, treat <code>accept_check</code> like a CI hook running over
+untrusted input.</strong> Point it at a command whose behaviour you are willing to have
+resolved by the branch under review, keep the timeout tight, and do not enable it
+at all on a project whose agents you would not let run a shell command on the
+host. A project on the host runner already grants that, so nothing changes there.</p>
+<h3 id="what-a-refusal-looks-like"><a class="anchor" href="#what-a-refusal-looks-like" aria-hidden="true">#</a>What a refusal looks like</h3>
+<pre><code>Task fix-parser does not build: its accept check failed (exit 2) in the task&#39;s
+own worktree, so merging it into `main` would break `main`.
+
+  command: bun run typecheck
+  elapsed: 6.2s
+
+--- stdout ---
+src/parser.ts(41,7): error TS2551: Property &#39;tokens&#39; does not exist on type &#39;Lexer&#39;.
+
+Fix it in the task and re-run the accept, or — if you know this tree is broken
+and want it merged anyway — say so explicitly:
+
+  lazy accept fix-parser --allow-broken
+</code></pre>
+<h3 id="the-override"><a class="anchor" href="#the-override" aria-hidden="true">#</a>The override</h3>
+<p><code>lazy accept &lt;task&gt; --allow-broken</code> merges despite a failing check. The failure
+is still printed, as a warning naming the exit code — the flag suppresses the
+refusal, never the fact. There is deliberately no config key that turns the gate
+into a silent pass, and <code>--allow-broken</code> is CLI-only (see
+<a href="../surface-asymmetries/">surface-asymmetries.md</a>): an agent may not decide on its
+own that a broken tree should be merged.</p>
+<p>Because it is CLI-only, the refusal is worded for the surface that receives it.
+Over MCP the last paragraph reads <em>&quot;There is no override on this surface:
+<code>--allow-broken</code> is a CLI flag with no equivalent here, so merging a tree that
+does not build takes a human at a terminal&quot;</em> — the refusal states that the escape
+hatch exists and is out of reach, rather than naming a flag the caller cannot
+pass.</p>
+<h3 id="cost"><a class="anchor" href="#cost" aria-hidden="true">#</a>Cost</h3>
+<p>One process per accept, bounded by <code>accept_check_timeout</code>, and zero for a project
+that leaves <code>accept_check</code> unset. The gate adds nothing measurable on top of the command
+itself — one <code>sh -c</code> spawn and the same output handling accept already does for
+hooks; a full <code>tsc --noEmit</code> over ~900 files takes a few seconds. Paid
+once, at the moment a mistake would otherwise become the branch&#39;s problem.</p>
+<h2 id="half-two-reverted-protected-files-historical-records-only"><a class="anchor" href="#half-two-reverted-protected-files-historical-records-only" aria-hidden="true">#</a>Half two: reverted protected files (historical records only)</h2>
+<p>Independently of the check — and with no configuration at all — accept names
+protected files that were reverted during the task:</p>
+<pre><code>6 protected files were reverted during this task:
+  - test/fixtures/schema.sql
+  - test/helpers/setup.ts
+  ...
+
+Those changes are NOT in the diff you are reviewing — the tree being merged is
+not the tree the agent last built against.
+</code></pre>
+<p>This is a report, not a gate: it never refuses. It exists because absence is not
+visible, and the reviewer needs to know that the tree in front of them is not the
+tree the agent last worked in.</p>
+<p>Since protected-file approval moved to accept, <strong>lazy itself never reverts a
+file</strong>, so this notice is empty for any task started after that change. It is
+kept for tasks whose records still carry a revert from the old behaviour, and
+for the one remaining way a protected file leaves the diff: the agent reverting
+it itself, when asked to.</p>
+<h2 id="related"><a class="anchor" href="#related" aria-hidden="true">#</a>Related</h2>
+<ul>
+<li><a href="../protected-branches/">protected-branches.md</a> — protected files and branches</li>
+<li><a href="../lazy-toml/">lazy-toml.md</a> — the full configuration reference</li>
+</ul>
+
+</main>
+</body>
+</html>

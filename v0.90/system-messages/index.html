@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>System messages — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="system-messages"><a class="anchor" href="#system-messages" aria-hidden="true">#</a>System messages</h1>
+<p>System messages are proactive reports the system writes <strong>for the human</strong>: a
+first-class inbox that report tasks, the daemon, and the builder file into,
+and that every surface can always display.</p>
+<p>Lazy should help you unprompted — a task whose job is to produce a report (a
+post-mortem, a tool-call pattern analysis, a token usage summary) files its
+findings here, and system messages are how those findings reach you. The same inbox is how an agent
+tells you that something in your environment is broken and only you can fix it.
+You don&#39;t have to remember to run anything: unread messages appear in the
+builder&#39;s launch context, and <code>lazy messages</code> shows the inbox at any time.</p>
+<h2 id="what-a-message-is"><a class="anchor" href="#what-a-message-is" aria-hidden="true">#</a>What a message is</h2>
+<p>Each message carries:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>id</code></td>
+<td>UUID; any unique prefix works on the CLI and MCP tools</td>
+</tr>
+<tr>
+<td><code>source</code></td>
+<td>What produced it — a task code, <code>daemon</code>, or <code>builder</code>. Derived from the producer&#39;s identity, never free-form input</td>
+</tr>
+<tr>
+<td><code>title</code></td>
+<td>One-line headline; compact surfaces render only this. Single-line by contract: newlines and control characters are rejected at the post boundary (unread titles are rendered into the builder&#39;s prompt, and the builder is an agent too)</td>
+</tr>
+<tr>
+<td><code>body</code></td>
+<td>The full report (markdown)</td>
+</tr>
+<tr>
+<td><code>kind</code></td>
+<td><code>report</code> (a produced analysis), <code>notice</code> (a system event worth knowing), or <code>alert</code> (needs attention soon)</td>
+</tr>
+<tr>
+<td><code>read_at</code> / <code>dismissed_at</code></td>
+<td>Lifecycle state — see below</td>
+</tr>
+</tbody></table>
+<h2 id="lifecycle-append-only-never-deleted"><a class="anchor" href="#lifecycle-append-only-never-deleted" aria-hidden="true">#</a>Lifecycle: append-only, never deleted</h2>
+<p>Creation is append-only. Messages are never edited or deleted — reading and
+dismissal are state changes on the message, so the record of what the system
+told you is permanent:</p>
+<ul>
+<li><strong>unread</strong> — neither read nor dismissed. Injected into the builder&#39;s launch
+prompt (as one-liners; bodies stay on demand) until you deal with it.</li>
+<li><strong>read</strong> — you saw the full body (<code>lazy messages read &lt;id&gt;</code> marks it; the
+first read wins and the timestamp never moves). Read messages stop being
+injected but stay in <code>lazy messages list</code>.</li>
+<li><strong>dismissed</strong> — hidden from default surfaces. <code>lazy messages list --all</code>
+still shows it, forever.</li>
+</ul>
+<h2 id="surfaces"><a class="anchor" href="#surfaces" aria-hidden="true">#</a>Surfaces</h2>
+<p><strong>Builder launch.</strong> Unread messages are injected compactly into the builder&#39;s
+system prompt — the same shape as the memory index: title + attribution per
+message, bodies on demand via <code>lazy_messages(id=&quot;...&quot;)</code>. The builder is
+expected to relay them to you. A storage failure logs loudly and skips the
+section; it never blocks the launch.</p>
+<p><strong>CLI.</strong></p>
+<pre><code class="language-bash">lazy messages                 # the inbox (dismissed hidden)
+lazy messages read 3f9a01b2   # full body; marks it read
+lazy messages dismiss 3f9a01b2
+lazy messages list --all      # everything, including dismissed
+</code></pre>
+<p><strong>MCP tools.</strong></p>
+<ul>
+<li><code>lazy_message_post(title, body, kind)</code> — file a message. Open to the builder
+<em>and</em> task agents: report tasks run as agents and must be able to file their
+report. The <code>source</code> is attributed automatically from the caller&#39;s identity
+(its task code, or <code>builder</code>) — a producer cannot impersonate another.</li>
+<li><code>lazy_messages(id?, include_dismissed?)</code> — the index, or one message in
+full. A pure read: it never flips read state (read/unread tracks the
+<em>human</em> having seen a message, so only <code>lazy messages read</code> marks it).</li>
+<li><code>lazy_message_dismiss(id)</code> — <strong>human/builder only.</strong> Rejected server-side
+for task agents: the inbox belongs to the human, and an agent must not be
+able to empty it.</li>
+</ul>
+<p><strong>Web inbox.</strong> The daemon&#39;s built-in dashboard — <code>lazy daemon dashboard-url</code>
+prints its address — serves the same inbox at <code>/messages</code>:</p>
+<ul>
+<li><strong><code>/messages</code></strong> — undismissed messages, newest first, with kind, source, date
+and state. Unread rows are marked with a bold title and an edge marker, not
+colour alone.</li>
+<li><strong><code>/messages?all=1</code></strong> — everything, including dismissed ones. A dismissed row
+says when it was dismissed and by whom, and that the record is kept.</li>
+<li><strong><code>/messages/&lt;id&gt;</code></strong> — one message in full, its body rendered as markdown.
+Opening it marks it read: <code>read_at</code> records that you have <em>seen</em> the message,
+and the body being on your screen is the most direct evidence of that. This
+matches <code>lazy messages read &lt;id&gt;</code>.</li>
+<li><strong>Dismiss</strong> is a button on both the list and the message itself. <strong>Mark read</strong>
+is offered too, on unread rows, for filing something you have decided about
+from the title alone.</li>
+<li>The nav carries an unread badge and the dashboard shows an unread panel, so a
+new alert is visible without going looking for it. Review, Raised and
+Conversations carry the same badge — see <a href="../web-review/#the-nav-counts">the nav
+counts</a>.</li>
+</ul>
+<p>Both actions are ordinary form submissions — the inbox works with scripting
+turned off. The dashboard is a loopback surface for the person sitting at the
+machine; dismissals from it are recorded as <code>human</code>, exactly as the CLI&#39;s are.</p>
+<h2 id="why-agents-may-post-but-not-dismiss"><a class="anchor" href="#why-agents-may-post-but-not-dismiss" aria-hidden="true">#</a>Why agents may post but not dismiss</h2>
+<p>Shared memory is agent-read-only because memory records are injected into every
+future session as guidance — an agent-writable store would be a prompt-injection
+channel. System messages are different: they are attributed data displayed <em>to
+the human</em>, never injected into agent prompts as guidance, so agent creation is
+safe — and necessary, because report tasks run as agents. Dismissal
+is the human&#39;s (or their builder&#39;s) decision alone.</p>
+<h2 id="environment-blockers-agents-cannot-fix"><a class="anchor" href="#environment-blockers-agents-cannot-fix" aria-hidden="true">#</a>Environment blockers agents cannot fix</h2>
+<p>The other thing that lands in your inbox is a blocker an agent hit and cannot do
+anything about from inside its task: a wedged CI runner, a stuck process holding
+a lock, an expired credential, a broken shared fixture, a machine out of disk.</p>
+<p>Agents are told to investigate a failing check on their own branch rather than
+call it &quot;out of scope&quot; — and when the cause turns out to be infrastructure
+rather than the code, to tell you what is broken, the evidence, the concrete
+remedy, and which task hit it. The kind says how urgent it is: <code>alert</code> when the
+blocker is holding up that task&#39;s acceptance, <code>notice</code> when it isn&#39;t. You are
+the only one who can fix these, and you can&#39;t fix what nobody reported; a
+message is also how a recurring blocker becomes a permanent fix instead of
+something every future task works around.</p>
+<p>This is distinct from the per-task channel an agent has. A <strong>raised item</strong>
+(<code>lazy raised</code>) is either a <em>decision</em> about that task&#39;s own scope or diff — one
+that blocks accept until you answer it — or orthogonal <em>code</em> work for you to
+triage later, which never blocks.
+A system message is neither — it&#39;s a report about your environment, and it
+belongs to the project rather than to one task.</p>
+<h2 id="boundary-not-lazys-own-diagnosis-channel"><a class="anchor" href="#boundary-not-lazys-own-diagnosis-channel" aria-hidden="true">#</a>Boundary: not lazy&#39;s own diagnosis channel</h2>
+<p><code>lazy doctor</code> remains the single diagnosis surface for lazy&#39;s <em>own</em>
+configuration and health — commands print one generic &quot;Run <code>lazy doctor</code>&quot;
+pointer and doctor owns the details, so other commands do not file
+doctor-shaped warnings here. Doctor itself files <strong>one</strong> inbox
+alert when a run finds errors, so people who never run <code>lazy doctor</code> still
+see the findings. System messages otherwise carry things written <strong>for you</strong>:
+proactive reports and analyses, and blockers in your project&#39;s environment
+that only you can clear.</p>
+<h2 id="built-in-producers"><a class="anchor" href="#built-in-producers" aria-hidden="true">#</a>Built-in producers</h2>
+<ul>
+<li><strong>Doctor findings</strong> (<code>alert</code>, source <code>doctor</code>): when <code>lazy doctor</code> (or the
+daemon&#39;s doctor run) finishes with any error-level check, it files one
+alert summarising those failures and their remedies. A still-open
+doctor alert is reused, so re-running doctor does not stack copies.</li>
+<li><strong>Daemon upgrade notice</strong> (<code>notice</code>, source <code>daemon</code>): when the daemon starts
+with a different version than the previous start on this project, it files
+one message noting the change.</li>
+<li><strong>Usage pause</strong> (<code>notice</code>, source <code>daemon</code>): when new turns on a model
+credential are held because its usage window is nearly spent, one message per
+pause says which credential, until when, and what is held.</li>
+<li><strong>Accept that could not be finished</strong> (<code>alert</code>, source <code>daemon</code>): when an
+accept died mid-flight and the daemon&#39;s repeated attempts to finish it failed,
+an alert names the task and the last error.</li>
+<li>Report tasks (post-mortems, tool-call patterns, token usage) file their
+findings here as <code>report</code> messages.</li>
+</ul>
+
+</main>
+</body>
+</html>

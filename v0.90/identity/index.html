@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Who lazy says did it — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="who-lazy-says-did-it"><a class="anchor" href="#who-lazy-says-did-it" aria-hidden="true">#</a>Who lazy says did it</h1>
+<p>Every row lazy stores carries the person who caused it — the task you created,
+the feedback you gave, the accept you signed off. On your own machine lazy takes
+that person from <strong>git</strong>:</p>
+<pre><code class="language-bash">git config --get user.email
+git config --get user.name
+</code></pre>
+<p>Whatever <code>git commit</code> would stamp on a commit in this repository is what lazy
+records on the work around it. Repository-local config wins over your global
+config, exactly as it does for git, so a repo where you commit as
+<code>you@work.example</code> is a repo where lazy attributes your actions to
+<code>you@work.example</code> too.</p>
+<p>There is no lazy-side setting for this, on purpose. If you want lazy to record a
+different address, change your git config — one identity, one place.</p>
+<h2 id="when-lazy-does-not-know-who-you-are"><a class="anchor" href="#when-lazy-does-not-know-who-you-are" aria-hidden="true">#</a>When lazy does not know who you are</h2>
+<p>If <code>user.email</code> is not set anywhere, lazy refuses anything that writes to its
+store, in the same words git uses when it cannot sign a commit:</p>
+<pre><code>Actor identity unknown.
+
+*** Please tell me who you are.
+
+Run
+
+  git config --global user.email &quot;you@example.com&quot;
+  git config --global user.name &quot;Your Name&quot;
+
+to set your account&#39;s default identity.
+Omit --global to set the identity only in this repository.
+
+lazy records who performed every action, and takes that identity from git.
+</code></pre>
+<p><strong>Reading always works.</strong> <code>lazy list</code>, <code>lazy show</code>, <code>lazy diff</code>, <code>lazy search</code>,
+<code>lazy doctor</code> and the dashboard keep working with no identity configured —
+looking at your work is the most likely moment to discover the problem, and
+lazy does not take that away from you.</p>
+<p><strong>Setting the machine up also works.</strong> Nothing lazy needs in order to <em>become</em>
+usable is refused for want of an identity — daemon settings such as
+<code>lazy daemon config</code>, handing lazy a model credential, and issuing access
+for another client on this machine all work on a fresh install with no git
+config at all. So does every <code>lazy doctor</code> repair.</p>
+<p><strong>Writing is refused</strong> until the identity is set: creating a task, starting or
+unblocking one, commenting, accepting, rejecting, closing. What is refused is
+what records who did it — plus anything that would start an agent turn, since
+the work that turn records arrives long after you have walked away from it.</p>
+<p>Every command that asks you to type something — an editor, a task prompt, an
+accept reason — checks first, before the prompt opens, so a refusal never costs
+you text you have already written.</p>
+<h2 id="fixing-it"><a class="anchor" href="#fixing-it" aria-hidden="true">#</a>Fixing it</h2>
+<pre><code class="language-bash">git config --global user.email &quot;you@example.com&quot;
+git config --global user.name &quot;Your Name&quot;
+</code></pre>
+<p>Then run the command again. Nothing needs restarting: lazy re-asks git for the
+identity within a minute, and a failure is never remembered at all — the very
+next command after the fix is accepted.</p>
+<p>Two things lazy will not accept:</p>
+<ul>
+<li><strong>A <code>user.email</code> that is not an email address.</strong> lazy stores the address
+itself so that every row names somebody you can write to, so <code>user.email = ivan</code> is refused with the same remedy.</li>
+<li><strong>A different identity supplied by a client.</strong> Identity comes from the
+environment lazy itself runs in, never from a request — nothing you can pass
+on a command line changes who an action is attributed to.</li>
+</ul>
+<p><code>lazy doctor</code> shows the resolved identity as its own check, and explains the
+remedy in full when there is none.</p>
+<h2 id="what-the-agent-does-is-yours"><a class="anchor" href="#what-the-agent-does-is-yours" aria-hidden="true">#</a>What the agent does is yours</h2>
+<p>An agent never has an identity of its own. Its work belongs to whoever asked for
+the turn: if you unblocked the task, everything the agent writes for the length
+of that turn — its answer, the notes it leaves, the tags it sets — carries your
+name. If somebody else unblocks the next turn, that turn&#39;s work carries theirs.</p>
+<p>Rows still say <em>how</em> the work arrived, so &quot;you asked for this&quot; stays readable
+apart from &quot;you typed this&quot;: an agent&#39;s write is shown as the agent acting, with
+your address alongside.</p>
+<p>Lazy remembers this for as long as the turn runs, so restarting the daemon
+mid-turn does not lose track of whose work is in flight.</p>
+<p><strong>Work nobody asked for is the automation&#39;s.</strong> When lazy resumes a crashed turn
+by itself, delivers an event to a waiting agent, or merges an upstream change
+without being asked, no person asked for it — so rather than borrowing the name
+of whoever last touched the task, lazy records the account the automation is
+configured under. On your own machine that is your git identity; on a team it is
+the account whose model credential the project&#39;s automatic turns already run on.</p>
+<p>Such a turn is marked as the system&#39;s rather than as yours, which is what keeps
+&quot;I did this&quot; readable apart from &quot;my lazy did this&quot; on a one-person install,
+where both name the same person.</p>
+<p>Only a turn lazy positively recorded as its own is attributed that way. Where no
+account is configured, and in the cases where lazy simply could not record who
+asked for a turn, the work names <strong>nobody</strong>.
+Lazy never fills that gap in by guessing, because &quot;we do not know who asked for
+this&quot; and &quot;the automation account did it&quot; are different claims, and only the
+first one can be corrected later.</p>
+<h2 id="on-a-team"><a class="anchor" href="#on-a-team" aria-hidden="true">#</a>On a team</h2>
+<p>In a hosted, multi-person deployment the rule is different: nothing about a
+shared server identifies a person, so nobody is assumed. Each person&#39;s client
+authenticates as them and every action goes out under that identity. Git config
+on the server is not consulted, and there is nothing to configure per machine.</p>
+<p>That credential carries who the person is, and lazy takes it from there and never
+from the request. So a task the team can see says <code>ada@example.com</code> accepted it,
+whether Ada pressed accept in a browser or from her terminal, and a client cannot
+sign somebody else&#39;s name to anything even if it asks to.</p>
+<p>The address is what identifies somebody and is always there. A display name rides
+along where the client has one to offer — a terminal takes it from git config, so
+the same person&#39;s terminal actions read <code>Ada Lovelace &lt;ada@example.com&gt;</code> — and
+rows simply show the address where it does not.</p>
+<p>An address identifies one person however it is typed: lazy matches it ignoring
+surrounding spaces and upper/lower case, so <code>Ada@Example.com</code> and
+<code>ada@example.com</code> are the same member, with one history and one set of
+credentials rather than two half-populated ones.</p>
+<p><strong>An action a person takes must be taken as that person.</strong> The operator
+credential a shared host runs on names the system, not anybody in particular, so
+lazy refuses it for the things a person does — accepting, rejecting, closing,
+stopping, starting, editing, creating, commenting, signing off, curating shared
+memory — and says to use the acting person&#39;s credential instead. Reads are never
+refused, and neither is the operator&#39;s own work: issuing and withdrawing
+someone&#39;s access, handing lazy a model credential, configuring a project, and
+the plumbing a turn runs on. The point is that the history never claims the
+server made somebody&#39;s decision.</p>
+<p>Changing what a task runs on is one of those actions, and it is recorded: a
+model, effort, agent or goal change appears in the task&#39;s journal as
+&quot;Task edited: model → opus&quot; with the person who made it, so &quot;who put this task
+on the expensive model?&quot; has an answer.</p>
+<p>None of this applies to your own machine. There is no operator credential
+there — the one credential is yours, and per-person credentials are refused
+outright rather than sitting unused.</p>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The host file-tool boundary guard — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="the-host-file-tool-boundary-guard"><a class="anchor" href="#the-host-file-tool-boundary-guard" aria-hidden="true">#</a>The host file-tool boundary guard</h1>
+<p>This page describes the guard that checks whether Claude Code still honours
+lazy&#39;s file-tool deny rules when an agent runs directly on a host, and how to run
+it yourself with <code>lazy system verify-host-boundary</code>.</p>
+<blockquote>
+<p><strong>Note:</strong> Lazy does not offer a user-facing host-process runner — agents run
+in Docker or Podman containers. The guard remains for operators who want to
+probe Claude Code&#39;s file-tool deny posture on a host; the host-runner
+machinery itself exists only for lazy&#39;s own test harness.</p>
+</blockquote>
+<p>A host-process runner leans on <strong>one Claude Code behavior that lazy does not
+control</strong>: <code>permissions.deny</code> rules must keep governing the <code>Read</code>/<code>Edit</code>/<code>Write</code>
+tools even when the agent runs with <code>--dangerously-skip-permissions</code>.</p>
+<p>That dependency is unavoidable, because the two host boundaries cover different
+things:</p>
+<table>
+<thead>
+<tr>
+<th>Boundary</th>
+<th>What it covers</th>
+<th>Enforced by</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>OS sandbox (Seatbelt / bubblewrap)</td>
+<td><code>Bash</code> and its children</td>
+<td>the OS</td>
+</tr>
+<tr>
+<td><code>permissions.deny</code> in <code>--settings</code></td>
+<td>the <code>Read</code> / <code>Edit</code> / <code>Write</code> <strong>file tools</strong></td>
+<td>Claude Code</td>
+</tr>
+</tbody></table>
+<p>The file tools <strong>bypass the OS sandbox entirely</strong>. So if a Claude Code upgrade ever
+stops honoring deny rules under bypass, every host agent silently becomes porous —
+able to read <code>~/.ssh</code> and write outside its worktree, with no error anywhere and
+nothing in lazy&#39;s own code to notice. Verified once on v2.1.170 and again on
+v2.1.227; not guaranteed for v-next.</p>
+<p>This document describes the standing guard against that regression.</p>
+<blockquote>
+<p>Network is <strong>not</strong> one of these boundaries. <code>sandbox_allowed_domains</code> only
+pre-approves domains so Bash doesn&#39;t prompt; under bypass a non-allowlisted
+domain is still reachable. Never describe it as network confinement.</p>
+</blockquote>
+<h2 id="the-probe-and-its-exit-code-contract"><a class="anchor" href="#the-probe-and-its-exit-code-contract" aria-hidden="true">#</a>The probe and its exit-code contract</h2>
+<p>The probe (a shell script built into lazy) drives <strong>real headless <code>claude</code> sessions</strong> against
+the posture lazy actually emits and observes what the file tools were allowed to
+do. Three modes:</p>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>--check</code></td>
+<td>one session: can this host run the guard at all?</td>
+</tr>
+<tr>
+<td><code>--guard</code></td>
+<td>must-deny checks only — the blocking regression gate</td>
+</tr>
+<tr>
+<td>(no flag)</td>
+<td>the full evidence matrix, including expected SILENT-ALLOWs</td>
+</tr>
+</tbody></table>
+<p>Exit codes are the verdict, and there are three of them because &quot;we couldn&#39;t
+tell&quot; is a distinct outcome from &quot;it&#39;s fine&quot;:</p>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Verdict</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>0</code></td>
+<td><code>intact</code></td>
+<td>nothing violated (with <code>--check</code>: the guard can run here)</td>
+</tr>
+<tr>
+<td><code>1</code></td>
+<td><code>violation</code></td>
+<td>a file-tool deny rule was violated — <strong>the boundary is broken</strong></td>
+</tr>
+<tr>
+<td><code>2</code></td>
+<td><code>inconclusive</code></td>
+<td>no verdict reached: missing deps, no auth, or a session hung</td>
+</tr>
+</tbody></table>
+<p><strong>Neither 1 nor 2 is green.</strong> An inconclusive run proved nothing and must never be
+reported as a pass — that false-pass mode is the whole reason the guard exists.</p>
+<p>The anti-false-pass mechanism inside the probe is the <strong>control vector</strong>, which
+runs first in <code>--guard</code>/<code>--check</code> mode: it confirms a session can do legitimate
+work <em>inside</em> its own worktree. Without that check, a session that cannot write
+anywhere at all (no auth, broken sandbox) would &quot;pass&quot; every deny check trivially.</p>
+<p>Lazy&#39;s own CI runs the <code>--guard</code> check weekly on macOS and Linux against the latest Claude Code; the two checks below let you verify your own host.</p>
+<h2 id="runtime-preflight--opt-in-off-by-default"><a class="anchor" href="#runtime-preflight--opt-in-off-by-default" aria-hidden="true">#</a>Runtime preflight — opt-in, off by default</h2>
+<p><code>[runner] verify_sandbox_boundary</code> only affects the host-process runner, which is
+not a user-facing option, so in a normal project the key has no effect. It is
+still accepted and validated:</p>
+<pre><code class="language-toml">[runner]
+type = &quot;docker&quot;
+# verify_sandbox_boundary = &quot;off&quot;          # default
+# verify_sandbox_boundary = &quot;once-per-version&quot;
+</code></pre>
+<p>With it on, the host runner verifies the boundary before an agent launches and
+refuses the launch on a violation. The error names
+the Claude Code version, the consequence, and the four ways out (pin an older CC,
+switch <code>type = &quot;docker&quot;</code>, drop to <code>permission_mode = &quot;bypass&quot;</code> knowingly, or set
+<code>verify_sandbox_boundary = &quot;off&quot;</code> and accept the risk).</p>
+<h3 id="why-off-is-the-default"><a class="anchor" href="#why-off-is-the-default" aria-hidden="true">#</a>Why <code>off</code> is the default</h3>
+<p>Preflight on <em>every</em> launch is indefensible: the guard spends <strong>three real headless
+Claude sessions</strong> (~1–2 min, billed) per run. Even once-per-machine would stall the
+first launch on any host without an interactive <code>claude</code> login — including CI
+sandboxes and containers — over a check the operator never asked for. The weekly CI check is the
+standing signal; the runtime knob is for operators who want a machine that refuses
+to run host agents on an unverified Claude Code.</p>
+<h3 id="inconclusive-does-not-refuse-the-launch"><a class="anchor" href="#inconclusive-does-not-refuse-the-launch" aria-hidden="true">#</a>Inconclusive does not refuse the launch</h3>
+<p><code>violation</code> is positive evidence of breakage: refuse. <code>inconclusive</code> means <em>this
+machine couldn&#39;t answer</em> — usually no interactive login. Refusing there would let a
+missing credential brick an otherwise healthy daemon over a check the operator only
+asked to be <em>informed</em> by, so the guard logs a prominent <code>logger.warn</code> (&quot;the
+boundary is UNVERIFIED on this launch&quot;) and proceeds. This is the one deliberate
+narrowing of fail-hard here.</p>
+<h3 id="caching"><a class="anchor" href="#caching" aria-hidden="true">#</a>Caching</h3>
+<p>Decisive verdicts are cached in <code>~/.lazy/host-boundary-guard.json</code> — machine-scoped,
+because the verdict is a property of the host&#39;s Claude Code install, not of one
+project. The cache key is a fingerprint of:</p>
+<pre><code>claude --version  +  process.platform  +  the exact --settings JSON lazy emits
+</code></pre>
+<p>so a Claude Code upgrade, a platform change, or <em>any</em> edit to the deny posture
+(<code>sandbox_deny_read</code>, <code>sandbox_deny_write</code>, <code>permission_mode</code>, …) invalidates it
+automatically. At most 20 entries are kept. <strong>Inconclusive verdicts are never
+cached</strong> — an unanswered question must be re-asked, and caching it would make a
+one-off missing login look like a permanent state.</p>
+<p>Both writers share one cache: the launch preflight and <code>lazy system verify-host-boundary</code> (in guard mode) write through the same helper with the same
+rules. That is what makes <code>--refresh</code> genuinely <em>replace</em> a stale entry, and lets an operator warm
+the cache <strong>before</strong> switching <code>verify_sandbox_boundary</code> to <code>&quot;once-per-version&quot;</code>
+— so the first real task launch does not stall on three headless sessions.
+<code>--check</code> never writes: &quot;this host can run the guard&quot; is not a verdict about the
+boundary.</p>
+<p>A cache that cannot be <em>written</em> (EACCES, a read-only home, a full disk) warns
+and lets the run continue, exactly as a corrupt cache does. It holds nothing that
+cannot be recomputed, so the cost is a re-probe — never a refused launch. The
+verdict itself is unaffected: a violation still refuses, cached or not.</p>
+<h2 id="on-demand--lazy-system-verify-host-boundary"><a class="anchor" href="#on-demand--lazy-system-verify-host-boundary" aria-hidden="true">#</a>On demand — <code>lazy system verify-host-boundary</code></h2>
+<pre><code class="language-bash">lazy system verify-host-boundary            # verdict for this project&#39;s posture
+lazy system verify-host-boundary --check    # can this host run the guard at all?
+lazy system verify-host-boundary --refresh  # re-probe after a Claude Code upgrade
+lazy system verify-host-boundary --json v.json
+</code></pre>
+<p>It probes the <strong>exact</strong> <code>--settings</code> posture this project would give a host agent
+(built from your lazy.toml exactly as the runner builds it
+), prints a cached verdict when one exists, and exits <code>0</code>/<code>1</code>/<code>2</code> on the same
+contract as the probe — so it composes in scripts. Under
+<code>permission_mode = &quot;bypass&quot;</code> it exits 2 and says there is no file-tool boundary to
+verify in that posture, rather than probing something meaningless.</p>
+<p>A decisive verdict from a guard-mode run is cached here, so the launch preflight
+sees it.</p>
+<h2 id="one-definition-of-the-boundary"><a class="anchor" href="#one-definition-of-the-boundary" aria-hidden="true">#</a>One definition of the boundary</h2>
+<p>The check <code>lazy system verify-host-boundary</code> and the runtime preflight run is
+the same probe script lazy&#39;s CI runs, built into the <code>lazy</code> binary, and it is
+given the exact deny settings lazy uses for its agents — so what is verified is
+what your agents actually run under.</p>
+<h2 id="requirements"><a class="anchor" href="#requirements" aria-hidden="true">#</a>Requirements</h2>
+<ul>
+<li>a logged-in <code>claude</code> (or <code>CLAUDE_CODE_OAUTH_TOKEN</code> / <code>ANTHROPIC_API_KEY</code>)</li>
+<li><code>jq</code></li>
+<li>a working OS sandbox — on Linux, <code>bubblewrap</code> and <code>socat</code> on PATH</li>
+</ul>
+<p>Any of these missing yields exit 2 (<code>inconclusive</code>), never 0.</p>
+<h2 id="related"><a class="anchor" href="#related" aria-hidden="true">#</a>Related</h2>
+<ul>
+<li><a href="../lazy-toml/">lazy-toml.md</a> — the <code>[runner]</code> host permission keys</li>
+</ul>
+
+</main>
+</body>
+</html>

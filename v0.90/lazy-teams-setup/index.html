@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lazy Teams first-run setup — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="lazy-teams-first-run-setup"><a class="anchor" href="#lazy-teams-first-run-setup" aria-hidden="true">#</a>Lazy Teams first-run setup</h1>
+<p>When you deploy Lazy Teams on a fresh server with an empty database, the app
+guides you through setup before anyone reaches the normal product. The goal is
+simple: hoist a server, create your administrator account, and invite your team
+— without opening a console.</p>
+<h2 id="what-you-see"><a class="anchor" href="#what-you-see" aria-hidden="true">#</a>What you see</h2>
+<p>On first visit, any page redirects into a four-step wizard:</p>
+<ol>
+<li><p><strong>Your account</strong> — Create the first sign-in. That account is a <strong>site
+administrator</strong> automatically: it can manage the installation, create teams,
+and invite people. There is no separate signup page after this. Passwords
+must be at least <strong>12 characters</strong> (length only — no special-character rules).</p>
+</li>
+<li><p><strong>Name</strong> — Give the installation a short label (for example your company
+name). Teammates see it in the page header so they know which Lazy Teams
+instance they are on.</p>
+</li>
+<li><p><strong>Readiness</strong> — The checks run one at a time so you can see progress:</p>
+<ul>
+<li><strong>Project data folder</strong> — where Lazy Teams stores project data on disk.
+It must exist and be writable by the app process.</li>
+<li><strong>Lazy</strong> — a checkout of the lazy CLI on the host, used when projects are
+provisioned.</li>
+<li><strong>Existing projects</strong> — every project already on the install was set up
+on the backend the install now runs (see <code>LAZY_FLEET_BACKEND</code> in
+<a href="../self-hosting-lazy-teams/#environment-reference">Self-hosting Lazy Teams</a>).</li>
+<li><strong>Email</strong> — outgoing mail is configured, or you choose to continue without
+it and share set-password links yourself.</li>
+<li>On the default microVM backend, three more: <strong>MicroVM host</strong>, <strong>MicroVM
+runtime</strong> and <strong>Project image</strong> — see
+<a href="../self-hosting-lazy-teams/#task-turns">Task turns</a>.</li>
+</ul>
+</li>
+<li><p><strong>Your team</strong> — Create your first team and optionally invite someone. With
+email on, they receive an invitation. With email off, you copy a set-password
+link from the finish screen.</p>
+</li>
+</ol>
+<p>When you complete step 4, setup is finished and the wizard stops redirecting
+every request.</p>
+<h2 id="picking-up-where-you-left-off"><a class="anchor" href="#picking-up-where-you-left-off" aria-hidden="true">#</a>Picking up where you left off</h2>
+<p>Progress is saved as you go:</p>
+<ul>
+<li>Stop after creating your account → next visit resumes at <strong>Name</strong>.</li>
+<li>Stop after naming → resumes at <strong>Readiness</strong>.</li>
+<li>Stop after checks → resumes at <strong>Your team</strong>.</li>
+</ul>
+<p>Sign-in works normally once the first account exists. Only an incomplete setup
+pulls a signed-in administrator back into the wizard.</p>
+<h2 id="after-setup"><a class="anchor" href="#after-setup" aria-hidden="true">#</a>After setup</h2>
+<p>The same readiness checklist stays available under <strong>God mode → Installation</strong>
+if you later change where project data lives, which lazy checkout is used, or how
+mail is sent.</p>
+<p>Email itself is configured separately under <strong>God mode → Email</strong>. That page
+lists which settings are present, how to set them on your host, and lets you
+send yourself a test message.</p>
+<h2 id="what-to-configure-on-the-host"><a class="anchor" href="#what-to-configure-on-the-host" aria-hidden="true">#</a>What to configure on the host</h2>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>LAZY_FLEET_ROOT</code></td>
+<td>Directory where project data is stored (optional; a default exists for your OS)</td>
+</tr>
+<tr>
+<td><code>LAZY_CHECKOUT</code></td>
+<td>Path to a lazy checkout on the host (optional; the parent of this app is used by default)</td>
+</tr>
+<tr>
+<td><code>SMTP_ADDRESS</code>, <code>MAILER_FROM</code>, <code>APP_HOST</code></td>
+<td>Outgoing email (optional at first run; required for automatic invitations and password resets)</td>
+</tr>
+</tbody></table>
+<p>Set these in the environment where the Rails app runs, then restart the app.
+The readiness step tells you which items still need attention.</p>
+<h2 id="projects-run-the-version-of-lazy-the-app-does"><a class="anchor" href="#projects-run-the-version-of-lazy-the-app-does" aria-hidden="true">#</a>Projects run the version of Lazy the app does</h2>
+<p>On the <code>local</code> backend, Lazy Teams and every project it runs use the <strong>same</strong>
+Lazy, from the checkout above. There is no second version to keep in step.</p>
+<p>On the default microVM backend, each project runs the image named by
+<code>LAZY_DAEMON_IMAGE</code>, and an upgrade does not move existing projects to the
+new version — see
+<a href="../self-hosting-lazy-teams/#what-an-upgrade-does">What an upgrade does</a>. The
+rest of this section describes the <code>local</code> backend.</p>
+<p>That is kept true automatically. When you upgrade Lazy Teams and restart it, each
+project restarts on the new version within a minute or so. You do not have to ask
+for it, and you do not have to wait for anything to finish first: work that was
+running is picked up again where it left off, with its conversation and its
+uncommitted changes intact.</p>
+<p>The readiness check names the version it found, and the Installation page in god
+mode shows it alongside any project not yet on it. There is a <strong>Restart all
+project daemons</strong> button there for the rare case where you want it now; if a
+routine restart happens to be in progress it waits its turn rather than being
+dropped.</p>
+<p>A project that repeatedly fails to come back is retried a few times, then left
+alone rather than restarted every minute. The Installation page lists those
+separately, so &quot;still catching up&quot; and &quot;stuck, and nothing more is coming&quot; are
+never confused for one another.</p>
+<h2 id="continuing-without-email"><a class="anchor" href="#continuing-without-email" aria-hidden="true">#</a>Continuing without email</h2>
+<p>If you have not configured SMTP yet, choose <strong>Continue without email</strong> on the
+readiness step. You can still create accounts and add people to teams; when you
+invite someone, Lazy Teams shows you a set-password link to copy and send
+yourself (by chat, ticket, or any channel you already use). The link is valid
+for three days, and team administrators can mint a fresh one from the team&#39;s
+members page while email remains off.</p>
+<p>Configure email later from <strong>God mode → Email</strong> when you are ready for automatic
+invitations and password resets.</p>
+<h2 id="passwords"><a class="anchor" href="#passwords" aria-hidden="true">#</a>Passwords</h2>
+<p>Every account password — the first administrator, invitations, and password
+resets — must be at least <strong>12 characters</strong>. Lazy Teams checks length only; it
+does not require symbols, numbers, or mixed case. Existing sessions stay signed
+in when a password is changed elsewhere.</p>
+
+</main>
+</body>
+</html>

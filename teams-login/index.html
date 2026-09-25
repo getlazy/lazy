@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Logging a machine in to Lazy Teams — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="logging-a-machine-in-to-lazy-teams"><a class="anchor" href="#logging-a-machine-in-to-lazy-teams" aria-hidden="true">#</a>Logging a machine in to Lazy Teams</h1>
+<p><code>lazy login</code> connects a machine to a Lazy Teams install and binds the clone you
+run it in to one project on that install. Nothing secret is typed, pasted or
+displayed: you approve a short code in a browser that is already signed in, and
+the credential travels from the install to the machine directly.</p>
+<h2 id="logging-in"><a class="anchor" href="#logging-in" aria-hidden="true">#</a>Logging in</h2>
+<p>Run it inside a clone of the repository:</p>
+<pre><code>$ cd ~/src/api-server
+$ lazy login https://teams.example.com
+
+  Open https://teams.example.com/device and enter:  KTPX-9QFD
+  (or, with the code already in it: https://teams.example.com/device?code=KTPX-9QFD)
+
+  ✓ Approved as ada@example.com
+
+  Which project is this clone?
+    1) acme/api-server
+    2) acme/web
+  &gt; 1
+
+  Bound to acme/api-server on teams.example.com.
+</code></pre>
+<p>What happens, step by step:</p>
+<ol>
+<li>Lazy asks the install to start a login and prints a short code.</li>
+<li>You open the URL in a browser — on this machine or any other — and type the
+code. You see a page naming the machine that is asking, where it asked from,
+and who you would be approving as. The second link has the code already in
+it; it is a convenience, and typing the code yourself is the safer habit,
+because it means you know which request you are approving.</li>
+<li>You approve. The install creates an API token named after the machine.</li>
+<li>Lazy collects the token, asks which project this clone is, and saves both.</li>
+</ol>
+<p>The code expires after 15 minutes. If nobody approves it in time, run
+<code>lazy login</code> again for a fresh one. Expiry is the whole window, not just the
+approval: a code approved but never collected stops working at the same moment.</p>
+<p>A brief network or server hiccup while lazy is waiting does not end the login —
+it keeps waiting until the code expires. If the install asks it to check less
+often, it waits progressively longer between checks, so several people logging in
+from one network at the same time do not crowd each other out.</p>
+<p>If a login ends after you approved it — you interrupt it, the install becomes
+unreachable, or the project you named is not one you are a member of — the token
+it created still exists. Lazy says so, and you can retire it at
+<strong>Settings → API tokens</strong>.</p>
+<p><strong>Only you can approve your own logins.</strong> An administrator viewing the site as
+you cannot approve one on your behalf, even with writes enabled — approving puts
+a long-lived token on a machine, and that token would keep working long after
+they stopped viewing as you. The approval page says so instead of offering the
+button.</p>
+<h2 id="what-a-bound-clone-can-do"><a class="anchor" href="#what-a-bound-clone-can-do" aria-hidden="true">#</a>What a bound clone can do</h2>
+<p>Once a clone is bound, the ordinary commands work exactly as they do against a
+local project — <code>lazy list</code>, <code>lazy show</code>, <code>lazy diff</code>, <code>lazy create</code>,
+<code>lazy edit</code>, <code>lazy unblock</code>, <code>lazy accept</code>, and the rest — except they run
+through your Teams install instead of a daemon on your machine. Everything you
+do is authenticated as you and shows up under your name, the same as if you
+had used the browser.</p>
+<p>A bound clone has no daemon of its own, so a handful of commands that manage
+<em>this machine</em> refuse instead of trying to operate infrastructure that was
+never there: <code>lazy daemon start</code> / <code>stop</code> / <code>status</code>, <code>lazy init</code>,
+<code>lazy doctor</code> (there is nothing local left to diagnose), and <code>lazy dashboard</code>
+(there is no local dashboard to open — the install&#39;s own web pages are it).
+Each one says the clone is bound and points at <code>lazy logout</code> as the way back
+to working locally.</p>
+<p>A bound clone can never do more than the browser can. A few task settings have
+no control in the browser, so the command-line options that set them are
+refused from a bound clone: <code>--runner</code> and the <code>--review</code> settings on
+<code>lazy create</code> / <code>lazy edit</code>, and <code>--parent</code> naming a git branch rather than a
+task. You can still set a task&#39;s parent task, or clear it, the same way the
+browser&#39;s edit page does.</p>
+<p>For the same reason, the options that let a command skip a check the browser
+enforces are refused too: <code>lazy accept --allow-broken</code> and
+<code>--allow-review-issues</code>, <code>lazy start --force-local</code>, <code>lazy unblock --agent</code>,
+and <code>lazy review --auto-fix</code> / <code>--model</code>. The refusal says what was refused, and the
+command works without it.</p>
+<h2 id="your-builder-from-a-bound-clone"><a class="anchor" href="#your-builder-from-a-bound-clone" aria-hidden="true">#</a>Your builder, from a bound clone</h2>
+<p><code>lazy builder</code> in a bound clone does not start anything on your machine. Your
+builder runs on the Teams install, next to the project, and <code>lazy builder</code>
+opens a terminal on it. Running <code>lazy builder</code> again — from this clone, another
+machine, or the <strong>Builder</strong> page in your browser — reaches the same session, so
+you can start something on your laptop and pick it up from your phone. Its
+conversation is kept with the project, like any other builder conversation.</p>
+<ul>
+<li><strong>ctrl-]</strong> leaves the terminal. The builder keeps running.</li>
+<li><code>lazy builder stop</code> stops it and keeps its conversation; the next
+<code>lazy builder</code> resumes it.</li>
+<li><code>lazy builder end</code> ends it for good.</li>
+</ul>
+<p>A builder runs until you stop or end it — there is no idle timeout. It runs on
+your own Claude account, so connect one in Teams first. Options that choose how
+a local builder runs (<code>--model</code>, <code>--effort</code>, <code>--resume</code>, <code>--no-autonomous</code>)
+are refused from a bound clone: the server decides how its sessions run.</p>
+<p>To use a Claude Code you run yourself against the project instead, see
+<a href="../teams-bound-clone-agents/">Claude Code against a Lazy Teams project</a> — it
+works, with fewer capabilities than the server-side builder.</p>
+<p><code>lazy pair</code> and <code>lazy shell</code> likewise go through Teams rather than opening
+anything locally. On a Teams install they are refused: a task&#39;s
+container runs on the account of whoever started the task, so entering it in
+your name is not offered.</p>
+<h2 id="which-project-this-clone-is"><a class="anchor" href="#which-project-this-clone-is" aria-hidden="true">#</a>Which project this clone is</h2>
+<p><strong>Lazy never guesses from the git remote.</strong> Two clones of the same repository can
+belong to different projects, so the project is always chosen out loud: from the
+list when there is a terminal to ask, or with <code>--project</code> when there is not.</p>
+<pre><code>lazy login teams.example.com --project acme/api-server
+</code></pre>
+<p>In a script or anywhere without a terminal, <code>--project</code> is required. A login
+without it is an error rather than a guess, and it is refused before anything is
+created on the install.</p>
+<p><strong>One clone, one project.</strong> Logging in again replaces the binding and says so.
+There is no command to switch a clone between projects: if you work on two
+projects, you have two clones — which you have anyway, because a clone is a
+checkout of one repository.</p>
+<h2 id="seeing-where-a-clone-points"><a class="anchor" href="#seeing-where-a-clone-points" aria-hidden="true">#</a>Seeing where a clone points</h2>
+<p>Run <code>lazy login</code> with no arguments. It prints the binding and starts nothing:</p>
+<pre><code>$ lazy login
+Bound to acme/api-server on https://teams.example.com
+  bound 12/03/2026, 09:41:00
+  lazy logout unbinds this clone
+</code></pre>
+<h2 id="logging-out"><a class="anchor" href="#logging-out" aria-hidden="true">#</a>Logging out</h2>
+<pre><code>lazy logout
+</code></pre>
+<p>This deletes the stored login, which is also how the clone is unbound. If a clone
+somehow ends up holding more than one login — a state every other command refuses
+to act on — <code>lazy logout</code> clears all of them and says how many it removed. It stops
+<em>this machine</em> using the token; it does not retire the token. To end access
+altogether, revoke it at <strong>Settings → API tokens</strong> on the install — that takes
+effect on the next request, from anywhere.</p>
+<h2 id="where-the-login-is-kept"><a class="anchor" href="#where-the-login-is-kept" aria-hidden="true">#</a>Where the login is kept</h2>
+<p>In lazy&#39;s own <a href="../credentials/">credential store</a>, for this project, split the
+same way every credential there is:</p>
+<ul>
+<li>the <strong>token</strong> goes to the OS keychain (macOS Keychain, libsecret on Linux, or a
+mode-0600 file on a host with neither), and</li>
+<li>the <strong>binding</strong> — which install, which project, when — sits beside it in the
+non-secret index.</li>
+</ul>
+<p>That split is why <code>lazy login</code> with no arguments can tell you where a clone
+points without unlocking a keychain to do it.</p>
+<h2 id="the-tokens-this-creates"><a class="anchor" href="#the-tokens-this-creates" aria-hidden="true">#</a>The tokens this creates</h2>
+<p>A login creates an ordinary API token with <strong>CLI and MCP</strong> access, named after
+the machine. It appears at <strong>Settings → API tokens</strong> alongside any token you
+created by hand, showing when it was last used, and it is revoked there like any
+other. Logging the same machine in twice gives the second token a distinguishing
+suffix rather than failing.</p>
+<p>A CLI token is not a git password: tokens carry separate access for git and for
+the command line, and one is refused where the other is expected. If you also
+clone over HTTPS from the install, that needs a git-capable token — see
+<a href="../self-hosting-lazy-teams/#hosting-repositories-on-the-install">hosting repositories</a>.</p>
+<h2 id="approving-from-the-browser"><a class="anchor" href="#approving-from-the-browser" aria-hidden="true">#</a>Approving from the browser</h2>
+<p>The approval page lives at <code>/device</code> on your install and is also reachable from
+<strong>Settings → API tokens</strong>. Open it and type the code in — it is case-insensitive
+and the dash is optional. The prefilled link lazy prints underneath works too,
+and is a convenience rather than the mechanism.</p>
+<p>If you did not just run <code>lazy login</code>, <strong>deny it</strong>. Approving would let whoever
+did act as you.</p>
+<h2 id="human-only-deliberately"><a class="anchor" href="#human-only-deliberately" aria-hidden="true">#</a>Human-only, deliberately</h2>
+<p>There is no MCP tool for logging in or out. Connecting a machine to an install is
+a decision a person makes at a keyboard, in a browser they are already signed in
+to; an agent must never do it. See
+<a href="../surface-asymmetries/">surface asymmetries</a>.</p>
+
+</main>
+</body>
+</html>

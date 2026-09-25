@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Task artifacts — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.90</span></div></header>
+<main class="wrap">
+<h1 id="task-artifacts"><a class="anchor" href="#task-artifacts" aria-hidden="true">#</a>Task artifacts</h1>
+<p>An <strong>artifact</strong> is a named file attached to a task: either something handed <em>to</em>
+the task (a design file, a spec, a screenshot, a data dump) or something the task
+publishes <em>back</em> (a report, a rendered image, an export the human should be able
+to retrieve without digging through a worktree).</p>
+<pre><code class="language-bash">lazy artifact add &lt;task&gt; design/index.html design/app.css   # attach files
+lazy artifact list &lt;task&gt;                                   # what is attached
+lazy artifact get &lt;task&gt; design/index.html                  # print one
+lazy artifact get &lt;task&gt; shot.png -o /tmp/shot.png          # write one out
+lazy artifact rm &lt;task&gt; design/app.css                      # remove one
+</code></pre>
+<p>Every artifact of a task is materialized into its worktree at turn launch, so
+the agent reads them with ordinary file tools:</p>
+<pre><code>&lt;worktree&gt;/.lazy-task-sandbox/artifacts/design/index.html
+</code></pre>
+<h2 id="why-this-exists"><a class="anchor" href="#why-this-exists" aria-hidden="true">#</a>Why this exists</h2>
+<p>Without artifacts, the only way to hand a task a file is to paste its content
+into a comment and ask the agent to write it back out: no integrity check, no
+binary, bounded only by whatever the comment surface tolerates, and it pollutes
+the notes the agent is told to <em>act on</em>. Files — a set of HTML/CSS/JSON design
+exports, say — should travel as files.</p>
+<h2 id="artifacts-are-data-never-guidance"><a class="anchor" href="#artifacts-are-data-never-guidance" aria-hidden="true">#</a>Artifacts are data, never guidance</h2>
+<p>This is the load-bearing rule, and it is enforced in three places at once:</p>
+<ul>
+<li>Attaching an artifact creates no comment, changes no status, and triggers no
+turn. It is a passive write, the same contract as raised items and journal
+entries.</li>
+<li>Artifact <strong>content</strong> is never injected into any prompt. A task launch carries
+only a short notice listing names, sizes and the directory they live in.</li>
+<li>The notice says explicitly that the files are data the agent was handed, not
+instructions to follow.</li>
+</ul>
+<p>A file you want the agent to <em>act on</em> is a comment (or a prompt) that references
+the artifact. The artifact itself is just the bytes.</p>
+<h2 id="delivery-materialized-into-the-worktree"><a class="anchor" href="#delivery-materialized-into-the-worktree" aria-hidden="true">#</a>Delivery: materialized into the worktree</h2>
+<p>On every turn launch, lazy writes the task&#39;s artifacts into
+<code>.lazy-task-sandbox/artifacts/</code> in its worktree. <code>.lazy-task-sandbox/</code> is in the
+ignore entries <code>lazy init</code> writes and is excluded from lazy&#39;s dirty-worktree
+checks, so artifacts cannot dirty a task&#39;s diff.</p>
+<p>The directory is <strong>derived state, wiped and rewritten each turn</strong>:</p>
+<ul>
+<li>an artifact removed since the last turn disappears from it,</li>
+<li>an agent&#39;s local edit to a file there does not survive and is not saved,</li>
+<li>it is never committed.</li>
+</ul>
+<p>An agent that wants to publish something back attaches it (below) rather than
+editing the mirror.</p>
+<p>If the artifacts cannot be materialized, the launch <strong>fails loudly</strong>. An agent
+that silently lost its inputs would produce confidently wrong work.</p>
+<p>Reading over MCP (<code>lazy_artifact_get</code>) is the secondary path — the only path for
+the builder, which has no worktree, and the way to read another task&#39;s published
+output.</p>
+<h2 id="publishing-back"><a class="anchor" href="#publishing-back" aria-hidden="true">#</a>Publishing back</h2>
+<p>A task agent attaches an output with <code>lazy_artifact_add</code>, giving either a path in
+its worktree (preferred, and the only cheap way to attach binary) or inline
+content:</p>
+<pre><code>lazy_artifact_add(path=&quot;report.html&quot;, name=&quot;report.html&quot;)
+</code></pre>
+<p>The human retrieves it without opening the worktree:</p>
+<pre><code class="language-bash">lazy artifact get &lt;task&gt; report.html -o ~/Desktop/report.html
+</code></pre>
+<p>Artifacts are <strong>not</strong> a place to put work. Code belongs in commits; an artifact
+is for things a commit is the wrong shape for.</p>
+<h2 id="bounds"><a class="anchor" href="#bounds" aria-hidden="true">#</a>Bounds</h2>
+<table>
+<thead>
+<tr>
+<th>Bound</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>One artifact</td>
+<td>1 MiB</td>
+</tr>
+<tr>
+<td>All artifacts on one task</td>
+<td>8 MiB</td>
+</tr>
+<tr>
+<td>Artifacts per task</td>
+<td>64</td>
+</tr>
+<tr>
+<td>Artifact name</td>
+<td>200 characters</td>
+</tr>
+</tbody></table>
+<p>These are fixed limits, not config keys. They are enforced in storage itself,
+so every writer (CLI, MCP, the daemon) is held to the same numbers. Their job is
+to stop a task&#39;s history — and the store holding it — from growing without
+bound.</p>
+<h2 id="names"><a class="anchor" href="#names" aria-hidden="true">#</a>Names</h2>
+<p>An artifact name is a relative POSIX path — <code>design/index.html</code> keeps its
+directory. Absolute paths, drive letters, <code>..</code> segments and empty names are
+<strong>rejected</strong>, never silently rewritten: a name that quietly became something else
+is how a file ends up where nobody looks for it. When you attach by path, the
+default name is that relative path (or the basename, if the path is absolute or
+escapes upward).</p>
+<p><strong>One name, one artifact.</strong> Re-attaching a name replaces it. There is
+deliberately no versioning, no dedup and no external blob backend.</p>
+<p>Every artifact carries a SHA-256 of its content as an integrity check.</p>
+<h2 id="origin"><a class="anchor" href="#origin" aria-hidden="true">#</a>Origin</h2>
+<p><code>origin</code> is <code>input</code> (given to the task) or <code>output</code> (published by it). It is a
+descriptive label so a human scanning <code>lazy artifact list</code> can tell the two apart
+without reading names — never a permission. Both are stored, bounded and
+retrieved identically. The default follows the caller: a task agent&#39;s attach is
+an <code>output</code>, the builder&#39;s and the CLI&#39;s is an <code>input</code>.</p>
+<h2 id="surfaces"><a class="anchor" href="#surfaces" aria-hidden="true">#</a>Surfaces</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>CLI</th>
+<th>MCP</th>
+<th>Lazy Teams</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>attach</td>
+<td><code>lazy artifact add</code></td>
+<td><code>lazy_artifact_add</code></td>
+<td>task page, <strong>Artifacts</strong> section</td>
+</tr>
+<tr>
+<td>list</td>
+<td><code>lazy artifact list</code></td>
+<td><code>lazy_artifact_list</code></td>
+<td>task page, <strong>Artifacts</strong> section</td>
+</tr>
+<tr>
+<td>read</td>
+<td><code>lazy artifact get</code></td>
+<td><code>lazy_artifact_get</code></td>
+<td><strong>Download</strong> link</td>
+</tr>
+<tr>
+<td>remove</td>
+<td><code>lazy artifact rm</code></td>
+<td><em>(none — deliberate)</em></td>
+<td><em>(none — use the CLI)</em></td>
+</tr>
+</tbody></table>
+<p>Removal is CLI-only: an artifact is often the only copy of something a human
+handed the task, deleting is the one artifact operation that destroys something
+the caller did not create, and it takes two seconds at a terminal. Attach is
+ownership-gated for agents (own task or a direct subtask); list and read are open
+tree-wide like every other read. See
+<a href="../surface-asymmetries/#12-artifacts-attach-and-read-over-mcp-remove-only-at-a-terminal">surface-asymmetries.md</a>.</p>
+<p><code>lazy show</code> lists a task&#39;s artifacts (metadata only), and <code>lazy_show</code> returns the
+same as <code>artifacts</code>.</p>
+<h3 id="lazy-teams"><a class="anchor" href="#lazy-teams" aria-hidden="true">#</a>Lazy Teams</h3>
+<p>A task&#39;s <strong>Record</strong> tab has an <strong>Artifacts</strong> section listing its inputs and
+outputs, each with its size, type and a <strong>Download</strong> link. Any member who can
+leave a note on the task can attach a file there, optionally under a name of
+their choosing (for example <code>design/spec.md</code>). The file is stored as an input
+and nothing else happens: the agent finds it on its next turn, and attaching
+does not start one. A file with the same name as an existing artifact replaces
+it, and the page says so. Oversized files and invalid names are refused with the same
+explanation the CLI gives.</p>
+<p>Downloads are always delivered as file attachments, never displayed in the
+browser, so an HTML or SVG file a task published cannot run in your Teams
+session. Screenshots in an agent&#39;s report are the one exception: raster images (never
+SVG) render inline.</p>
+<h2 id="events"><a class="anchor" href="#events" aria-hidden="true">#</a>Events</h2>
+<p>Attaching and removing publish <code>artifact.added</code> / <code>artifact.removed</code> on the
+daemon event feed, carrying metadata only (name, size, origin, who) — the feed
+is an invalidation hint, and artifact content can be a megabyte of binary.</p>
+
+</main>
+</body>
+</html>
