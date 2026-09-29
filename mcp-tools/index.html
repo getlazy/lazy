@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCP tools for agents and builders — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<main class="wrap">
+<h1 id="mcp-tools-for-agents-and-builders"><a class="anchor" href="#mcp-tools-for-agents-and-builders" aria-hidden="true">#</a>MCP tools for agents and builders</h1>
+<p>Every task agent and every builder session talks to lazy through a set of MCP
+tools named <code>lazy_*</code>. This page lists them. Most reads work on any task in
+the project; a few answer only about the caller (its status, its usage, its
+own pull request — noted below). Writes are scoped: a task agent writes only to
+its own task and its direct subtasks. Tools marked <strong>builder only</strong> are not
+offered to task agents, and tools marked <strong>agent only</strong> act on &quot;the current
+task&quot;, which the builder does not have. The deliberate
+differences from the <code>lazy</code> CLI are listed in
+<a href="../surface-asymmetries/">Surface asymmetries</a>.</p>
+<h2 id="reading-the-task-tree"><a class="anchor" href="#reading-the-task-tree" aria-hidden="true">#</a>Reading the task tree</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>What it answers</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>lazy_search</code></td>
+<td>Search tasks, prompts, turns, commits, comments, raised items and memory (<a href="../search/">query syntax</a>)</td>
+</tr>
+<tr>
+<td><code>lazy_show</code>, <code>lazy_list</code>, <code>lazy_blocked</code>, <code>lazy_active</code></td>
+<td>A task in detail; lists of tasks by state</td>
+</tr>
+<tr>
+<td><code>lazy_diff</code>, <code>lazy_regions</code></td>
+<td>What a task changed, whole or <a href="../review-regions/">region by region</a></td>
+</tr>
+<tr>
+<td><code>lazy_status</code></td>
+<td>The caller&#39;s own task and worktree (caller only)</td>
+</tr>
+<tr>
+<td><code>lazy_wait</code></td>
+<td>Block until another task finishes its turn</td>
+</tr>
+<tr>
+<td><code>lazy_memory_recall</code></td>
+<td>Shared project <a href="../memory/">memory</a></td>
+</tr>
+<tr>
+<td><code>lazy_conversations</code>, <code>lazy_conversation_search</code>, <code>lazy_conversation_read</code></td>
+<td>Past builder conversations — one entry per Builder (start or <code>/clear</code> to the next <code>/clear</code>)</td>
+</tr>
+<tr>
+<td><code>lazy_messages</code></td>
+<td><a href="../system-messages/">System messages</a></td>
+</tr>
+<tr>
+<td><code>lazy_raised_items</code></td>
+<td><a href="../raised-items/">Raised items</a> across tasks</td>
+</tr>
+<tr>
+<td><code>lazy_artifact_list</code>, <code>lazy_artifact_get</code></td>
+<td>A task&#39;s <a href="../artifacts/">artifacts</a></td>
+</tr>
+<tr>
+<td><code>lazy_usage_limits</code>, <code>lazy_token_stats</code></td>
+<td>Usage-window readings and token spend, narrowed to what the caller may see (<a href="../token-budgets/">token budgets</a>)</td>
+</tr>
+<tr>
+<td><code>lazy_scratch</code></td>
+<td>The builder&#39;s <a href="../builder-scratch-dir/">scratch directory</a> — <strong>builder only</strong></td>
+</tr>
+<tr>
+<td><code>lazy_review_comments</code>, <code>lazy_review_status</code></td>
+<td>A task&#39;s pull/merge request on the forge — an agent&#39;s own task only; see below</td>
+</tr>
+</tbody></table>
+<h2 id="working-on-tasks"><a class="anchor" href="#working-on-tasks" aria-hidden="true">#</a>Working on tasks</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>lazy_create</code>, <code>lazy_start</code>, <code>lazy_edit</code></td>
+<td>Create, start and edit (sub)tasks</td>
+</tr>
+<tr>
+<td><code>lazy_clone</code>, <code>lazy_redo</code></td>
+<td>Variant or fresh replacement of a task — <strong>builder only</strong></td>
+</tr>
+<tr>
+<td><code>lazy_unblock</code>, <code>lazy_resume</code>, <code>lazy_ask</code>, <code>lazy_review</code>, <code>lazy_stop</code></td>
+<td>Drive a task&#39;s turns</td>
+</tr>
+<tr>
+<td><code>lazy_accept</code>, <code>lazy_reject</code>, <code>lazy_close</code>, <code>lazy_reopen</code>, <code>lazy_submit</code></td>
+<td>Finish a task</td>
+</tr>
+<tr>
+<td><code>lazy_sync</code>, <code>lazy_link</code></td>
+<td>Branch plumbing</td>
+</tr>
+<tr>
+<td><code>lazy_reparent</code></td>
+<td>Move a task under a new parent — <strong>builder only</strong></td>
+</tr>
+<tr>
+<td><code>lazy_commit</code></td>
+<td>Commit the caller&#39;s worktree — <strong>agent only</strong></td>
+</tr>
+<tr>
+<td><code>lazy_comment</code>, <code>lazy_journal</code>, <code>lazy_tag</code>, <code>lazy_untag</code></td>
+<td>Annotate tasks</td>
+</tr>
+<tr>
+<td><code>lazy_final</code>, <code>lazy_raise</code>, <code>lazy_raised_item_comment</code>, <code>lazy_report</code>, <code>lazy_update_progress</code></td>
+<td>Report on the caller&#39;s own task (<a href="../turn-reports/">turn reports</a>) — <strong>agent only</strong></td>
+</tr>
+<tr>
+<td><code>lazy_justify_protected</code>, <code>lazy_justify_maintain</code></td>
+<td>Answer protected-file and maintained-file checks — <strong>agent only</strong></td>
+</tr>
+<tr>
+<td><code>lazy_artifact_add</code></td>
+<td>Attach a file to a task</td>
+</tr>
+<tr>
+<td><code>lazy_conversation_ask</code></td>
+<td>Ask a question about a past builder conversation</td>
+</tr>
+<tr>
+<td><code>lazy_message_post</code></td>
+<td>File a system message for the human</td>
+</tr>
+<tr>
+<td><code>lazy_memory_save</code>, <code>lazy_message_dismiss</code>, <code>lazy_raised_promote</code></td>
+<td>Curate memory, the message inbox and raised items — <strong>builder only</strong></td>
+</tr>
+</tbody></table>
+<h2 id="reading-a-tasks-pullmerge-request"><a class="anchor" href="#reading-a-tasks-pullmerge-request" aria-hidden="true">#</a>Reading a task&#39;s pull/merge request</h2>
+<p><code>lazy_review_comments</code> and <code>lazy_review_status</code> let an agent see review feedback
+whenever it wants, instead of only when lazy syncs the task:</p>
+<ul>
+<li><strong><code>lazy_review_comments</code></strong> — the PR/MR conversation: top-level comments,
+inline comments with their file, line and resolved state, and submitted
+reviews with their verdict.</li>
+<li><strong><code>lazy_review_status</code></strong> — the PR/MR state, each reviewer&#39;s latest verdict
+(and GitHub&#39;s overall review decision), the forge&#39;s mergeability, and the CI
+checks with their names and results.</li>
+</ul>
+<p>How they work:</p>
+<ul>
+<li><strong>No token reaches the agent.</strong> lazy reads the forge itself, with the
+credential it already uses for pull requests (<code>gh</code> / <code>glab</code> on the machine
+running lazy), and hands back the answer.</li>
+<li><strong>Only the task&#39;s own PR/MR.</strong> The pull request read is the one lazy recorded
+for the task when it was submitted or linked; there is no URL or repository
+argument. A task agent reads only its own task&#39;s PR/MR. The builder names a
+task with <code>task</code> and may read any task in the project.</li>
+<li><strong>Cached for 60 seconds</strong> per task. A second call within that window gets the
+same answer (<code>cached: true</code>, with <code>fetchedAt</code> saying when the forge was asked),
+so polling cannot use up the forge&#39;s rate limit.</li>
+<li><strong>Public repositories:</strong> comments are not shown unless the project opted in
+with the same <code>[remote]</code> setting that lets lazy import public PR comments
+(<code>github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection</code>,
+or the <code>gitlab_</code> one) — anyone can write a comment on a public repository, and
+this puts it in an agent&#39;s context. <code>lazy_review_status</code> is unaffected.</li>
+<li><strong>Refusals</strong> say why: the project has no forge (the <code>local</code> driver), lazy is
+offline, the task has no PR/MR recorded, or the forge could not be read
+(including when lazy cannot tell whether the repository is public).</li>
+</ul>
+<p>These tools only read. An agent that must run <code>gh</code> or <code>git push</code> itself still
+needs a token of its own.</p>
+
+</main>
+</body>
+</html>
