@@ -113,6 +113,91 @@ function bareModelApi404(text: string): boolean {
 }
 
 /**
+ * Evidence of a quota/billing wall rather than a per-minute rate limit:
+ * Ollama's "monthly usage limit" / "add usage credits", OpenAI's
+ * `insufficient_quota`, Anthropic `rate_limit_error` bodies asking for credits.
+ * A bare "rate limit" or 429 is NOT evidence and stays transient.
+ */
+export function mentionsQuotaWall(text: string): boolean {
+  return (
+    // Monthly/weekly only: a window that long needs a purchase to clear in
+    // any useful time. Shorter windows are healing evidence (quotaHealsSoon).
+    /\b(monthly|weekly) usage limit/.test(text) ||
+    text.includes('usage credits') ||
+    text.includes('add credits') ||
+    text.includes('purchase credits') ||
+    text.includes('insufficient_quota') ||
+    text.includes('exceeded your current quota') ||
+    // Anthropic's monthly spend-cap 429 (documented, not yet seen live):
+    // error.details.error_code = enforced_spend_limit_reached, no retry-after.
+    text.includes('enforced_spend_limit_reached') ||
+    // Anthropic's workspace/org spend-limit wording (documented).
+    (text.includes('api usage limits') && text.includes('regain access on'))
+  );
+}
+
+/**
+ * A reset horizon stated as a SHORT duration ("resets in 20 minutes", "try
+ * again in an hour", "retry after 30"). Shared with Cursor's classifier so
+ * the two cannot disagree about what "clears soon" means. A horizon stated as
+ * a DATE deliberately does not match.
+ */
+export function statesShortResetHorizon(text: string): boolean {
+  return (
+    text.includes('retry-after') ||
+    text.includes('retry after') ||
+    /\b(resets?|resetting|retry|try again|available again)\b[^.\n]{0,24}\bin\s+(an?|\d+)\s*(s\b|secs?\b|seconds?|m\b|minutes?|mins?\b|h\b|hours?|hrs?\b)/.test(text)
+  );
+}
+
+/**
+ * The provider's own words say the cap clears on its own shortly: a short
+ * reset horizon, or a short-window cap named as such. Ollama attaches the same
+ * "upgrade … or add usage credits" remedy to its shorter limits, so the remedy
+ * text alone must not make those fatal.
+ */
+function quotaHealsSoon(text: string): boolean {
+  return (
+    statesShortResetHorizon(text) ||
+    /\b(hourly|session|per-minute|5-hour|five-hour|daily) (usage |rate )?limit/.test(text)
+  );
+}
+
+const QUOTA_DETAIL_MAX = 320;
+
+/**
+ * Reason for a quota wall, quoting the provider's message (single-lined and
+ * clipped) — the remedy it names is knowledge only the provider has.
+ */
+function quotaWallReason(input: AgentFailureInput): string {
+  const raw =
+    [input.stdoutError, input.stderr, input.message]
+      .filter((s): s is string => !!s)
+      .find((s) => mentionsQuotaWall(s.toLowerCase())) ?? input.message;
+  // Prefer the JSON "message" that is itself about the quota — a stderr tail
+  // can carry several — decoded so escapes do not reach the human raw.
+  let message: string | undefined;
+  for (const m of raw.matchAll(/"message"\s*:\s*"((?:[^"\\]|\\.)*)"/g)) {
+    let decoded = m[1]!;
+    try {
+      decoded = JSON.parse(`"${m[1]}"`) as string;
+    } catch (err) {
+      // Not valid JSON string content — keep the raw capture, which is still
+      // the provider's words; nothing is lost by showing it undecoded.
+      void err;
+    }
+    if (mentionsQuotaWall(decoded.toLowerCase())) {
+      message = decoded;
+      break;
+    }
+  }
+  const detail = (message ?? raw).replace(/\s+/g, ' ').trim();
+  const clipped =
+    detail.length > QUOTA_DETAIL_MAX ? `${detail.slice(0, QUOTA_DETAIL_MAX - 1).trimEnd()}…` : detail;
+  return `model provider quota exhausted — a human must add credits or upgrade: ${clipped}`;
+}
+
+/**
  * Signals shared by every HTTP/LLM-backed CLI agent (Anthropic, Cursor, …).
  * An agent calls this AFTER trying its own agent-specific patterns, so agent
  * dialect always wins over the generic fallback.
@@ -171,6 +256,20 @@ export function classifyCommonFailureSignals(
     text.includes('out of extra usage')
   ) {
     return { class: 'fatal_auth', reason: 'agent rejected the credential (auth/billing)' };
+  }
+
+  // A provider's QUOTA/BILLING wall usually arrives as a 429, so it has to be
+  // decided before the overload check below. Seen live (2026-09-18, Ollama
+  // Cloud via pi): `429 {"type":"error","error":{"type":"rate_limit_error",
+  // "message":"you (…) have reached your monthly usage limit, upgrade for
+  // higher limits: https://ollama.com/upgrade or add usage credits: …"}}` —
+  // filed as transient_overload and retried every 60s, uncapped, for hours.
+  // A monthly quota heals only when a human pays, so it is fatal_auth (the
+  // taxonomy's "exhausted credential — billing"), and the reason quotes the
+  // provider's message so its remedy (the upgrade/credits URL) reaches the
+  // human. A cap whose own words say it clears shortly stays transient.
+  if (mentionsQuotaWall(text) && !quotaHealsSoon(text)) {
+    return { class: 'fatal_auth', reason: quotaWallReason(input) };
   }
 
   if (

@@ -53,8 +53,10 @@ async function createFakeConversation(
       cacheReadTokens: 0,
     },
     messages: (options.messages ?? []).map((msg, i) => ({
-      uuid: `msg-${i}`,
-      parentUuid: i > 0 ? `msg-${i - 1}` : null,
+      // Unique per session, as real Claude record uuids are: Builder stitching
+      // treats a shared record uuid as shared history (a copy-on-resume).
+      uuid: `${sessionId}-msg-${i}`,
+      parentUuid: i > 0 ? `${sessionId}-msg-${i - 1}` : null,
       timestamp: '2026-02-19T10:00:00Z',
       role: msg.role,
       text: msg.text,
@@ -249,28 +251,29 @@ describe('lazy import-conversation --show', () => {
     const result = await ctx.lazy(['builder', 'list']);
 
     expectSuccess(result);
-    expectOutput(result, '2 captured conversation(s)');
+    expectOutput(result, '2 Builder(s)');
     // Shows session IDs
     expectOutput(result, '11111111');
     expectOutput(result, '66666666');
     // Shows turn counts
     expectOutput(result, '2h/1a');
     expectOutput(result, '1h/1a');
-    // Shows first line of first user prompt
-    expectOutput(result, 'Let us redesign the API from scratch');
-    expectOutput(result, 'The cache is returning stale data');
+    // Shows each Builder's title (the stored summary — capture sets it to the
+    // first human line; these fixtures set it explicitly)
+    expectOutput(result, 'Planning the API redesign');
+    expectOutput(result, 'Debugging the cache layer');
     // Shows column headers
-    expectOutput(result, 'SESSION');
+    expectOutput(result, 'BUILDER');
     expectOutput(result, 'STARTED');
     expectOutput(result, 'TURNS');
-    expectOutput(result, 'FIRST PROMPT');
+    expectOutput(result, 'TITLE');
   });
 
   test('lazy builder list shows empty state', async () => {
     const result = await ctx.lazy(['builder', 'list']);
 
     expectSuccess(result);
-    expectOutput(result, 'No captured builder conversations yet');
+    expectOutput(result, 'No captured Builders yet');
   });
 
   test('--show-imported lists captured conversations', async () => {
@@ -366,6 +369,6 @@ describe('lazy show conversation via daemon RPC', () => {
     const result = await ctx.lazy(['show', '12345678']);
 
     expectFailure(result);
-    expectError(result, 'Multiple conversations match');
+    expectError(result, 'Multiple Builders match');
   });
 });

@@ -114,12 +114,52 @@ export async function resolveChatGptSession(
   name: string = CHATGPT_CREDENTIAL,
   opts: { force?: boolean } = {},
 ): Promise<ChatGptSession | null> {
-  const stored = await resolveCredential(projectRoot, name);
+  return resolveChatGptSessionFrom({
+    key: chainKey(projectRoot, name),
+    read: () => resolveCredential(projectRoot, name),
+    describe: (source, envVar) =>
+      source === 'env' ? `the ${envVar} environment variable` : `the stored "${name}" credential`,
+    persist: async (secret) => {
+      await setCredential(projectRoot, { provider: name, kind: 'oauth', secret });
+    },
+    label: `"${name}"`,
+  }, opts);
+}
+
+/**
+ * Where a ChatGPT session lives, for {@link resolveChatGptSessionFrom}: the
+ * project's credential store (above), or a member's own credential held by the
+ * daemon in team mode (src/daemon/member-credentials.ts). Everything about
+ * renewal — the serialized chain, the renewed-session memory, refresh-before-
+ * hand-out — is the same for both, which is why it is one function.
+ */
+export interface ChatGptSessionSource {
+  /** Identifies this one session: renewals of it are serialized on this key. */
+  key: string;
+  read(): Promise<{ value: string; source: 'env' | 'store'; envVar: string } | null>;
+  /** "the stored … credential", for error messages. */
+  describe(source: 'env' | 'store', envVar: string): string;
+  /**
+   * Write a renewed session back where `read` will find it. `renewedFrom` is
+   * the exact value that was renewed: a source that can change underneath a
+   * renewal (a member reconnecting a NEW session while this one refreshes)
+   * writes back only while it still holds that value.
+   */
+  persist(secret: string, renewedFrom: string): Promise<void>;
+  /** Names the session in the renewal log line. */
+  label: string;
+}
+
+/** {@link resolveChatGptSession}, from any {@link ChatGptSessionSource}. */
+export async function resolveChatGptSessionFrom(
+  src: ChatGptSessionSource,
+  opts: { force?: boolean } = {},
+): Promise<ChatGptSession | null> {
+  const stored = await src.read();
   if (!stored) return null;
 
-  const key = chainKey(projectRoot, name);
-  const describe = (source: 'env' | 'store'): string =>
-    source === 'env' ? `the ${stored.envVar} environment variable` : `the stored "${name}" credential`;
+  const key = src.key;
+  const describe = (source: 'env' | 'store'): string => src.describe(source, stored.envVar);
 
   // A session this daemon already renewed from exactly this source value beats
   // the source itself — for the env path it is the ONLY place the renewal went.
@@ -137,7 +177,7 @@ export async function resolveChatGptSession(
     // Re-read inside the chain: a refresh that completed while this call was
     // queued has already produced a fresh token, and refreshing again would
     // retire a perfectly good refresh token for nothing.
-    const current = await resolveCredential(projectRoot, name);
+    const current = await src.read();
     const source = current?.source ?? stored.source;
     const sourceValue = current?.value ?? stored.value;
 
@@ -169,15 +209,11 @@ export async function resolveChatGptSession(
     if (source === 'store') {
       // Persisted too, so it survives this daemon. A failure here is loud rather
       // than deferred, for the same reason.
-      await setCredential(projectRoot, {
-        provider: name,
-        kind: 'oauth',
-        secret: serializeChatGptTokens(refreshed),
-      });
-      logger.info(`[credentials] refreshed the ChatGPT subscription token ("${name}")`);
+      await src.persist(serializeChatGptTokens(refreshed), sourceValue);
+      logger.info(`[credentials] refreshed the ChatGPT subscription token (${src.label})`);
     } else {
       logger.warn(
-        `[credentials] refreshed the ChatGPT subscription token from the environment ("${name}"). ` +
+        `[credentials] refreshed the ChatGPT subscription token from the environment (${src.label}). ` +
         `An environment variable cannot be written back, so the renewed session lives only as long ` +
         `as this daemon — and the refresh token in ${stored.envVar} is now retired upstream. ` +
         `Store it instead, so it survives a restart: lazy auth import chatgpt`,

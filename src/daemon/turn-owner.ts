@@ -40,6 +40,7 @@
  */
 
 import { AsyncLocalStorage } from 'async_hooks';
+import { redactSecretValues } from '../utils/redact';
 import { logger } from '../utils/logger';
 import { actorEmail, actorRole, canonicalPersonEmail } from '../actor-ref';
 import { AGENT_ACTOR, SYSTEM_ACTOR } from '../constants';
@@ -406,6 +407,7 @@ export async function createAgentTurn(
   options: CreateTurnOptions,
   projectRoot?: string,
 ): Promise<Turn> {
+  options = scrubTurnContent(options);
   const person = await personForCurrentTurn(storage, options.sessionId, projectRoot);
   if (!person) return storage.createTurn(options);
   if (!person.system) return createRecoveredAgentTurn(storage, options, person);
@@ -545,12 +547,23 @@ export async function createRecoveredAgentTurn(
   owner: TurnOwner | null,
 ): Promise<Turn> {
   assertOneNamedPerson(options.actor, owner);
+  options = scrubTurnContent(options);
   if (!owner) return storage.createTurn(options);
   const role = actorRole(options.actor) ?? AGENT_ACTOR;
   return storage.createTurn({
     ...options,
     actor: { role, email: owner.email, ...(owner.name ? { name: owner.name } : {}) },
   });
+}
+
+/**
+ * Scrub live secret values (env credentials, per-task `lazy env set` values)
+ * out of an agent turn's text before it becomes a durable, human-visible row.
+ * An agent that echoes its own token would otherwise record it for good.
+ */
+function scrubTurnContent(options: CreateTurnOptions): CreateTurnOptions {
+  const content = redactSecretValues(options.content);
+  return content === options.content ? options : { ...options, content };
 }
 
 /**

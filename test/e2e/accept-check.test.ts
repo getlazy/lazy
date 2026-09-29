@@ -226,11 +226,10 @@ describe('lazy accept — reverted protected files', () => {
   // indistinguishable from "the task never touched it". Accept says it
   // outright. This reports; it never refuses.
   //
-  // HISTORICAL RECORDS ONLY since move-file-approval-to-accept: nothing in lazy
-  // reverts a protected file any more, so the `rejected` record and the revert
-  // commit are SEEDED here rather than produced by an unblock. That is the
-  // state this notice exists for — a session recorded under the old behaviour —
-  // and it must keep working for as long as such sessions can be accepted.
+  // The `rejected` record and the revert commit are SEEDED here — the shape both
+  // sessions from before move-file-approval-to-accept and, since
+  // supervisor-restores-rejected-files, lazy's own supervisor restore leave
+  // behind (the real-stack restore is supervisor-restores-rejected.test.ts).
   test('accept names protected files that were reverted during the task', async () => {
     setProtectedPatterns(ctx.root, ['*.spec.*']);
     ctx.git('add', 'lazy.toml');

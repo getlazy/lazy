@@ -400,7 +400,7 @@ export async function inspectLfsEnvironment(
     problems.push({
       code: 'binary-missing',
       message: 'the `git-lfs` binary is not installed or not on PATH',
-      remedy: 'Install git-lfs (https://git-lfs.com), then run `git lfs install --local` in the repository.',
+      remedy: 'Install git-lfs (https://git-lfs.com), then run `git lfs install --local` in the repository (if an existing pre-push hook blocks installation, preserve it before deliberately retrying with --force (which replaces it)).',
     });
   }
 
@@ -413,7 +413,7 @@ export async function inspectLfsEnvironment(
     problems.push({
       code: 'filter-unset',
       message: `the LFS clean/smudge filter is not configured here (${unset.map((k) => `filter.lfs.${k}`).join(', ')} unset or empty)`,
-      remedy: 'Run `git lfs install --local` in the repository to write the filter config.',
+      remedy: 'Run `git lfs install --local` in the repository to write the filter config (if an existing pre-push hook blocks installation, preserve it before deliberately retrying with --force (which replaces it)).',
     });
   }
 
@@ -421,7 +421,7 @@ export async function inspectLfsEnvironment(
     problems.push({
       code: 'not-required',
       message: '`filter.lfs.required` is false, so git commits raw file contents instead of failing when the filter is broken',
-      remedy: 'Run `git config filter.lfs.required true` in the repository (`git lfs install --local` sets it too).',
+      remedy: 'Run `git config filter.lfs.required true` in the repository (`git lfs install --local` sets it too; if an existing pre-push hook blocks installation, preserve it before deliberately retrying with --force (which replaces it)).',
     });
   }
 

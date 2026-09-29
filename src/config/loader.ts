@@ -13,8 +13,9 @@ import { DEFAULT_CURSOR_UPSTREAM, DEFAULT_UPSTREAM_TIMEOUT_SECONDS } from '../pr
 import { defaultPolicyConfig, type ProxyPolicyConfig } from '../proxy/policy';
 import { DEFAULT_DOCS_URL, normalizeDocsUrl, setDocsBaseUrl } from '../docs/links';
 import { ANTHROPIC_DEFAULT_TARGET, roleTargetForProfile } from './default-target';
-import { applyManagedPolicy, isManagedMode } from './managed';
+import { applyManagedPolicy, isManagedMode, managedConfigPath, type ManagedConfigOrigin } from './managed';
 import { generatedConfigProfileExamples, replaceWithProfileAdvice } from './agent-profile-advice';
+import { CLAUDE_DEFAULT_MODEL } from './default-models';
 import { findRemovedConfigKeys, DEPRECATED_KEY_HINTS } from './schema';
 import {
   DEFAULT_REVIEW_AUTO_FIX,
@@ -81,7 +82,7 @@ function findConfigDir(lazyRoot: string): string {
 // Default configuration values
 export const DEFAULT_CONFIG: ResolvedConfig = {
   models: {
-    default: 'claude-opus-5',
+    default: CLAUDE_DEFAULT_MODEL,
     roles: {
       // Both roles default to the built-in `claude-code` profile: no pinned
       // endpoint, and an empty model meaning "use the normal model chain /
@@ -106,6 +107,7 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   git: {
     default_branch_prefix: 'lazy',
     lfs_check: 'refuse',
+    coauthor_trailer: true,
   },
   output: {
     shortid_length: 8,
@@ -181,7 +183,7 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
     sandbox_deny_read: [],
     sandbox_deny_write: [],
     sandbox_allow_weaker_nested: false,
-    // Off by default: the guard costs three real headless sessions and needs an
+    // Off by default: the guard costs nine real headless sessions and needs an
     // interactively logged-in `claude`, which a daemon host may not have. CI
     // (.github/workflows/host-sandbox-guard.yml) is the standing signal.
     verify_sandbox_boundary: 'off',
@@ -516,9 +518,19 @@ function refuseOllamaBlock(raw: unknown, harnessName: string): void {
 /**
  * Resolve the path to the lazy.toml that would be loaded for the given root.
  * Honors LAZY_CONFIG (absolute path or filename). Always the project root's
- * copy — see findConfigDir. Does NOT check whether the file exists.
+ * copy — see findConfigDir — except once a control plane's own copy exists
+ * (below), which is the only case that checks the filesystem.
+ * Does NOT otherwise check whether the file exists.
  */
-export function resolveConfigPath(lazyRoot: string): string {
+export async function resolveConfigPath(lazyRoot: string): Promise<string> {
+  // AFTER A CONTROL PLANE'S IMPORT: it owns this project's config
+  // and keeps it in a file OUTSIDE the clone (MANAGED_CONFIG_ENV in
+  // ./managed). Once that file exists the repository's lazy.toml is never read
+  // again, whatever it later says. Before it exists — a project the control
+  // plane has not imported yet — the root lazy.toml is the config, as it always
+  // was, and the import reads it from there.
+  const managedPath = managedConfigPath(lazyRoot);
+  if (managedPath && await pathExists(managedPath)) return managedPath;
   if (process.env.LAZY_CONFIG && isAbsolute(process.env.LAZY_CONFIG)) {
     return process.env.LAZY_CONFIG;
   }
@@ -1024,7 +1036,7 @@ function validateAutomationEntries(
  * the project root's, whatever the caller's cwd is. See findConfigDir.
  */
 export async function loadConfig(lazyRoot: string): Promise<ResolvedConfig> {
-  const configPath = resolveConfigPath(lazyRoot);
+  const configPath = await resolveConfigPath(lazyRoot);
 
   // If LAZY_CONFIG is explicitly set but the file doesn't exist, fail hard
   if (process.env.LAZY_CONFIG && !(await pathExists(configPath))) {
@@ -1055,7 +1067,6 @@ export async function loadConfig(lazyRoot: string): Promise<ResolvedConfig> {
     return structuredClone(DEFAULT_CONFIG);
   }
 
-  let parsed: LazyConfig;
   // Read outside the parse try so the error path can quote the offending line —
   // and so an unreadable file is not reported as a syntax error, which it is not.
   let configContent: string;
@@ -1066,6 +1077,43 @@ export async function loadConfig(lazyRoot: string): Promise<ResolvedConfig> {
       `Failed to read ${configPath}: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
+  return resolveConfigText(configContent, configPath);
+}
+
+/** Options for {@link resolveConfigText}. */
+export interface ResolveConfigTextOptions {
+  /**
+   * Install the process-wide values a load sets as a side effect (the docs base
+   * URL and the task-branch prefix). True for a real load; false when the text
+   * is only a CANDIDATE being judged — validating a config somebody has not
+   * saved yet must not change how this process names branches.
+   */
+  install?: boolean;
+  /**
+   * Who wrote the text, for the managed-mode policy. Omitted, it is read off
+   * `configPath`: the control plane's own file is `control-plane`, anything
+   * else `repository`. A CANDIDATE bound for the control plane's file (the
+   * validation RPC) says so explicitly, since it has no path yet.
+   */
+  origin?: ManagedConfigOrigin;
+}
+
+/**
+ * Resolve lazy.toml TEXT into a config, exactly as {@link loadConfig} resolves
+ * the file: parse, every validation, the managed-mode policy. Throws on the
+ * first problem with the same message a load would.
+ *
+ * Split out of loadConfig so a candidate config is judged by the one resolver
+ * the daemon runs on (the project-config validation RPC), never by a second
+ * copy of the rules.
+ */
+export function resolveConfigText(
+  configContent: string,
+  configPath: string,
+  options: ResolveConfigTextOptions = {},
+): ResolvedConfig {
+  const install = options.install ?? true;
+  let parsed: LazyConfig;
   try {
     parsed = Bun.TOML.parse(configContent) as LazyConfig;
   } catch (error) {
@@ -1431,6 +1479,13 @@ export async function loadConfig(lazyRoot: string): Promise<ResolvedConfig> {
     );
   }
 
+  if (typeof config.git.coauthor_trailer !== 'boolean') {
+    throw new Error(
+      `Invalid coauthor_trailer value "${String(config.git.coauthor_trailer)}" in lazy.toml [git] section. ` +
+      'Expected true or false.'
+    );
+  }
+
   // Validate the builder concurrency limit — a positive integer (a cap < 1
   // would wedge every launch). Fail loud at load time rather than silently
   // clamping.
@@ -1703,7 +1758,7 @@ export async function loadConfig(lazyRoot: string): Promise<ResolvedConfig> {
   //
   // Applied AFTER validation on purpose: a project whose config is malformed
   // should hear about the malformation, not about a policy it also trips.
-  applyManagedPolicy(config, parsed as Record<string, unknown>, configPath);
+  applyManagedPolicy(config, parsed as Record<string, unknown>, configPath, process.env, options.origin);
 
   // Reject the removed host-process runner after managed policy so a fleet host
   // can override a repository's hostile host-runner ask to docker first.
@@ -1714,7 +1769,7 @@ export async function loadConfig(lazyRoot: string): Promise<ResolvedConfig> {
   // Install the docs base for this process. Doc pointers are built deep inside
   // guards and thrown errors that never see a ResolvedConfig; this is the one
   // place the configured value reaches them. See src/docs/links.ts.
-  setDocsBaseUrl(config.docs.url);
+  if (install) setDocsBaseUrl(config.docs.url);
 
   // Same reason, same shape: task branch names are built by synchronous helpers
   // all over the CLI, daemon and drivers that never see a ResolvedConfig. This
@@ -1745,8 +1800,10 @@ export async function loadConfig(lazyRoot: string): Promise<ResolvedConfig> {
     );
   }
 
-  setBranchPrefix(branchPrefix);
-  config.git.default_branch_prefix = getBranchPrefix();
+  if (install) {
+    setBranchPrefix(branchPrefix);
+    config.git.default_branch_prefix = getBranchPrefix();
+  }
 
   return config;
 }
@@ -1757,7 +1814,7 @@ export async function loadConfig(lazyRoot: string): Promise<ResolvedConfig> {
  * Used to decide whether to inject model guidance into the builder prompt.
  */
 export async function hasExplicitModelConfig(lazyRoot: string): Promise<boolean> {
-  const configPath = resolveConfigPath(lazyRoot);
+  const configPath = await resolveConfigPath(lazyRoot);
   if (!(await pathExists(configPath))) return false;
 
   try {
@@ -1784,9 +1841,9 @@ export function getDefaultConfigTemplate(storageBackend?: StorageBackendConfig, 
 # (e.g., LAZY_CONFIG=lazy.lima.toml lazy list)
 
 [models]
-# Default model for sessions — use raw model IDs (e.g., "claude-opus-5",
-# "claude-sonnet-5", "qwen3.5:35b-a3b-coding-nvfp4")
-default = "claude-opus-5"
+# Default model for sessions — use raw model IDs (e.g., "${CLAUDE_DEFAULT_MODEL}",
+# "claude-sonnet-5-5", "qwen3.5:35b-a3b-coding-nvfp4")
+default = "${CLAUDE_DEFAULT_MODEL}"
 
 # Named agent profiles (optional). A profile is an agent harness plus the model,
 # upstream and credential it runs with; a task selects one with
@@ -1840,6 +1897,8 @@ default_branch_prefix = "lazy"
 # "warn" starts anyway and records a warning, "off" disables the check.
 # The accept-time guard against raw blobs on LFS paths always runs.
 # lfs_check = "refuse"
+# Add "Co-Authored-By: Lazy <noreply@getlazy.dev>" to commits lazy makes (default true)
+# coauthor_trailer = true
 
 [output]
 # Length of shortened IDs displayed in output
@@ -1981,7 +2040,7 @@ type = "docker"
 # depends on but does not control, so an upgrade could silently regress it.
 #   "off" (default)    — no runtime check. CI + "lazy system verify-host-boundary" cover it.
 #   "once-per-version" — on the first host launch for each Claude Code version, run the
-#                        real boundary probe (3 headless sessions, ~1-2 min, needs a
+#                        real boundary probe (9 headless sessions, ~4-6 min, needs a
 #                        logged-in claude), cache the verdict, and REFUSE to launch if a
 #                        deny rule was violated. An inconclusive run warns loudly and is
 #                        never cached — it is not a pass.

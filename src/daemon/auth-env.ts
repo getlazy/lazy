@@ -97,8 +97,7 @@ export interface DaemonCredentialState {
    * False when both roles point at another provider or at a local server that
    * authenticates nobody — there is then no Anthropic credential to be missing,
    * and a diagnostic that reported one absent would be reporting a non-problem.
-   * Read through the same `requiredProviders` the credential gate starts the
-   * daemon by, so the report and the gate cannot disagree.
+   * Kept for clients older than `providers`.
    */
   anthropicRequired: boolean;
   /**

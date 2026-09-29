@@ -164,7 +164,7 @@ describe('file permission violations', () => {
   // (pre-fix-unblock-conflict-guard), then "omission is an error and
   // --no-approve-files reverts all". Both belonged to a design where unblock
   // could destroy the agent's committed work; the engineer retired it on
-  // 2026-09-13. The full contract lives in test/e2e/unblock-never-reverts.test.ts.
+  // 2026-09-13. The full contract lives in test/e2e/unblock-protected-files.test.ts.
   test('unblock needs no file decision and leaves the violated file alone', async () => {
     setProtectedPatterns(ctx.root, ["*.spec.*"]);
     ctx.git('add', 'lazy.toml');

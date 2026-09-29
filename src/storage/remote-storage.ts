@@ -822,6 +822,14 @@ export class RemoteStorage implements Storage {
     return this.call<ConversationSummary[]>('listConversationSummaries');
   }
 
+  async listBuilders(): Promise<import('./types').BuilderSummary[]> {
+    return this.call<import('./types').BuilderSummary[]>('listBuilders');
+  }
+
+  async getBuilder(idOrSegmentId: string): Promise<import('./types').BuilderSummary | null> {
+    return this.call<import('./types').BuilderSummary | null>('getBuilder', { idOrSegmentId });
+  }
+
   async isConversationImported(sessionId: string): Promise<boolean> {
     return this.call<boolean>('isConversationImported', { sessionId });
   }

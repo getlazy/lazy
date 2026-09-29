@@ -42,6 +42,11 @@ describe('effectiveContextWindow — pinned facts', () => {
     expect(LARGE_CONTEXT_WINDOW_TOKENS).toBe(1_000_000);
     expect(NATIVE_1M_MODELS).toContain('claude-fable-5-1');
     expect(NATIVE_1M_MODELS).toContain('claude-opus-5');
+    expect(NATIVE_1M_MODELS).toContain('claude-sonnet-5-5');
+    expect(NATIVE_1M_MODELS).toContain('claude-opus-5-5');
+    const w = effectiveContextWindow(claude({ model: 'claude-sonnet-5-5' }));
+    expect(w.tokens).toBe(LARGE_CONTEXT_WINDOW_TOKENS);
+    expect(w.known).toBe(true);
     expect(KNOWN_200K_MODELS).toContain('claude-sonnet-4-6');
   });
 });

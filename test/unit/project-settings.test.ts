@@ -1,3 +1,4 @@
+import { CODEX_LATEST_MODEL } from '../../src/config/default-models';
 import { describe, test, expect } from 'bun:test';
 import type { ResolvedConfig } from '../../src/config/types';
 import type { ProjectSettings } from '../../src/storage/types';
@@ -15,7 +16,7 @@ function configWith(opts: {
   runner?: string;
   effort?: string;
   agent?: string;
-  agents?: Record<string, { harness?: string; model?: string; endpoint?: string; credential?: string }>;
+  agents?: Record<string, { harness?: string; model?: string; endpoint?: string; credential?: string; description?: string }>;
 } = {}): ResolvedConfig {
   return {
     models: { default: opts.model ?? 'claude-opus-4-8', roles: {} },
@@ -129,6 +130,18 @@ describe('effectiveProjectSettings', () => {
     });
   });
 
+  // INVARIANT: the daemon ANSWERS each profile's `description` (when to use
+  // it), so every client renders it without reading lazy.toml; a built-in
+  // carries lazy's own.
+  test('reports each profile\'s description, a built-in\'s included', () => {
+    const result = effectiveProjectSettings(null, configWith({
+      agents: { security: { harness: 'claude-code', description: 'Use whenever a security aspect comes up.' } },
+    }));
+    const byName = new Map(result.agentProfiles.map((p) => [p.name, p]));
+    expect(byName.get('security')!.description).toBe('Use whenever a security aspect comes up.');
+    expect(byName.get('claude-code')!.description).not.toBe('');
+  });
+
   // INVARIANT: a profile's endpoint and the credential that pays for it are
   // operator configuration, not a choice in a task form — and nothing that
   // merely describes auth should cross the wire (the line
@@ -146,7 +159,7 @@ describe('effectiveProjectSettings', () => {
     }));
     const local = result.agentProfiles.find((p) => p.name === 'local');
     expect(local).toBeDefined();
-    expect(Object.keys(local!).sort()).toEqual(['builtin', 'harness', 'model', 'name']);
+    expect(Object.keys(local!).sort()).toEqual(['builtin', 'description', 'harness', 'model', 'name']);
   });
 
   // INVARIANT: lazy's own picker hides internal agents (qa-agent), and a remote
@@ -154,6 +167,59 @@ describe('effectiveProjectSettings', () => {
   test('excludes lazy\'s internal agents, as the daemon\'s own picker does', () => {
     const result = effectiveProjectSettings(null, configWith());
     expect(result.agentProfiles.map((p) => p.name)).not.toContain('qa-agent');
+  });
+
+  // INVARIANT: the model a task runs when its Model field is left empty follows
+  // the chosen PROFILE — its own model, else its harness's default, else the
+  // project default — and remote forms read that answer rather than re-deriving
+  // it. A form that showed the project default next to a codex profile named a
+  // model the task would never run.
+  test('reports each profile\'s own default model', () => {
+    const result = effectiveProjectSettings(
+      { defaultModel: 'claude-sonnet-5' },
+      configWith({ agents: { 'work-opus': { harness: 'claude-code', model: 'claude-opus-5' } } }),
+    );
+    expect(result.agentDefaultModels['work-opus']).toBe('claude-opus-5');
+    expect(result.agentDefaultModels['claude-code']).toBe('claude-sonnet-5');
+  });
+
+  // INVARIANT: a profile whose model is its harness's "pick it yourself"
+  // placeholder (codex `default`, cursor `auto`) is reported as such, never as
+  // the placeholder id — "this agent's default (default)" is what the form
+  // showed for a codex profile otherwise.
+  test('a profile whose harness picks its own model is flagged, not named', () => {
+    const result = effectiveProjectSettings(null, configWith({ agents: {
+      'codex-sub': { harness: 'codex', model: 'default' },
+      'cursor-auto': { harness: 'cursor', model: 'auto' },
+    } }));
+    expect(result.agentHarnessChoosesModel).toContain('codex-sub');
+    expect(result.agentHarnessChoosesModel).toContain('cursor-auto');
+    expect(result.agentDefaultModels['codex-sub']).toBeUndefined();
+    expect(result.agentDefaultModels['cursor-auto']).toBeUndefined();
+  });
+
+  // The "let the tool pick" names are per harness: Codex passes `auto` through
+  // as `-m auto`, so a Codex profile pinned to it is a named model, not a pick.
+  test('a codex profile pinned to auto is named, not flagged', () => {
+    const result = effectiveProjectSettings(null, configWith({ agents: { 'codex-auto': { harness: 'codex', model: 'auto' } } }));
+    expect(result.agentHarnessChoosesModel).not.toContain('codex-auto');
+    expect(result.agentDefaultModels['codex-auto']).toBe('auto');
+  });
+
+  // Codex declares a concrete default id, so a profile that leaves Model
+  // empty names that id rather than claiming the harness chooses.
+  test('a harness declared default is named', () => {
+    const result = effectiveProjectSettings(null, configWith({ agents: { 'codex-plain': { harness: 'codex' } } }));
+    expect(result.agentDefaultModels['codex-plain']).toBe(CODEX_LATEST_MODEL);
+  });
+
+  // INVARIANT: Cursor's own default is `auto`, so an unpinned Cursor profile
+  // is reported as "Cursor chooses". Cursor's catalog is server-side and per
+  // plan; a hard-coded id (grok-4) failed every unpinned Cursor task.
+  test('an unpinned Cursor profile is reported as Cursor chooses', () => {
+    const result = effectiveProjectSettings(null, configWith());
+    expect(result.agentHarnessChoosesModel).toContain('cursor');
+    expect(result.agentDefaultModels['cursor']).toBeUndefined();
   });
 
   test('carries overlay metadata when present, omits it when not', () => {

@@ -15,8 +15,8 @@ Slack and holds it open, so Slack never dials this app. An install on
 supported install: there is no Events URL to publish, no tunnel to run, and no
 signing secret to keep in step.
 
-Setup is two steps on the **Integrations** page (account menu → **Team
-administration**).
+Setup is two steps on the **Integrations** page (avatar menu → **Account settings** → *your team's*
+**integrations** tab).
 
 1. **Create and install the app in Slack.** The page shows a manifest for this
    install, with a **Copy manifest** button beside it. Copy it, go to
@@ -165,7 +165,7 @@ Secret are no longer used and can be removed from your environment.
 
 ## Members
 
-1. Open **Slack linking** from the account menu (**You**) and generate a link code.
+1. Open **Account settings → Slack** from the avatar menu and generate a link code.
 2. In Slack: `/lazy link <code>`.
 3. Create work with `/lazy create <goal>`. Lazy creates a private channel named
    `lazy-<task-code>` and adds you to it — look for that channel in your Slack

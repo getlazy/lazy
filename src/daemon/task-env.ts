@@ -42,20 +42,45 @@
  * exactly what the per-task MCP token already does.
  */
 
-import { mkdir, readFile, writeFile } from 'fs/promises';
-import { dirname } from 'path';
-import { getTaskEnvPath } from './paths';
+import { createHash } from 'crypto';
+import { mkdir, readFile, rm, writeFile } from 'fs/promises';
+import { dirname, join } from 'path';
+import { getDaemonDir, getTaskEnvPath } from './paths';
+import { setRegisteredSecretValues, TASK_ENV_KEYS_VAR } from '../utils/redact';
+import { logger } from '../utils/logger';
+
+/**
+ * Keep the free-text scrubber's view of per-task values equal to the file.
+ *
+ * Called on every read and write of the registry, so the daemon's logger (and
+ * everything else that goes through redactSecretValues — turn text included)
+ * scrubs a value from the moment it is set until the moment it is unset or the
+ * task ends. The registry is bounded by the caps below, so the scrub set is too.
+ */
+function registerForRedaction(registry: TaskEnvFile): void {
+  setRegisteredSecretValues(
+    'task-env',
+    Object.values(registry.tasks).flatMap(vars => Object.values(vars)),
+  );
+}
 
 /** On-disk shape. Keyed by full task UUID, mirroring the token registry. */
 interface TaskEnvFile {
   version: 1;
   /** taskId -> { KEY: VALUE }. */
   tasks: Record<string, Record<string, string>>;
+  /**
+   * taskId -> runName -> fingerprint of the env that run (container or host
+   * supervisor) was launched with (see taskEnvFingerprint). Absent = none.
+   * Keyed by RUN, not task: a task's review and accept-gate containers are
+   * launched with the task's id too, and must not stand in for the work run.
+   */
+  launched?: Record<string, Record<string, string>>;
 }
 
 /**
- * Caps. Docker passes each var as a separate `-e KEY=VALUE` argv element and
- * the whole argv shares one ARG_MAX; more importantly an unbounded secret file
+ * Caps. Values reach docker through an env file (argv for multi-line or very
+ * long values — see planTaskEnvLaunchFile); more importantly an unbounded secret file
  * is not the "bounded by construction" thing the non-Storage carve-out
  * requires. These are far above any legitimate use (a handful of tokens).
  */
@@ -174,7 +199,7 @@ async function loadRegistry(projectRoot: string): Promise<TaskEnvFile> {
     raw = await readFile(path, 'utf-8');
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      return { version: 1, tasks: {} };
+      return { version: 1, tasks: {}, launched: {} };
     }
     throw new Error(
       `Failed to read per-task env registry ${path}: ` +
@@ -197,7 +222,13 @@ async function loadRegistry(projectRoot: string): Promise<TaskEnvFile> {
       `(expected { version, tasks: {} }).`,
     );
   }
-  return { version: 1, tasks: parsed.tasks };
+  const launched: Record<string, Record<string, string>> = {};
+  for (const [id, runs] of Object.entries(parsed.launched ?? {})) {
+    if (runs && typeof runs === 'object') launched[id] = runs;
+  }
+  const registry: TaskEnvFile = { version: 1, tasks: parsed.tasks, launched };
+  registerForRedaction(registry);
+  return registry;
 }
 
 async function persist(projectRoot: string, registry: TaskEnvFile): Promise<void> {
@@ -205,6 +236,7 @@ async function persist(projectRoot: string, registry: TaskEnvFile): Promise<void
   await mkdir(dirname(path), { recursive: true });
   // 0600: these are user secrets. Same posture as the token files next to it.
   await writeFile(path, JSON.stringify(registry, null, 2), { mode: 0o600 });
+  registerForRedaction(registry);
 }
 
 /**
@@ -268,8 +300,8 @@ export async function setTaskEnv(
 
 /**
  * Every variable for one task, as `{ KEY: VALUE }`. This is the ONE function
- * that hands out values; it exists for the launch path (docker `-e` args / the
- * host spawn env) and nothing else. Empty object when the task has none, which
+ * that hands out values; it exists for the launch path (the docker env file /
+ * the host spawn env) and nothing else. Empty object when the task has none, which
  * is the overwhelmingly common case — behavior is then byte-identical to before
  * this feature existed.
  */
@@ -279,6 +311,21 @@ export async function getTaskEnv(
 ): Promise<Record<string, string>> {
   const registry = await loadRegistry(projectRoot);
   return { ...(registry.tasks[taskId] ?? {}) };
+}
+
+/**
+ * Load the registry once so every value in it is registered with the free-text
+ * scrubber. Called at daemon start; every later read and write re-registers.
+ */
+export async function primeTaskEnvRedaction(projectRoot: string): Promise<void> {
+  // A launch file outlives its `docker run` only if the daemon died mid-launch;
+  // no launch is in flight at start, so every one left is stale and holds values.
+  await rm(launchFileDir(projectRoot), { recursive: true, force: true });
+  await loadRegistry(projectRoot);
+}
+
+function launchFileDir(projectRoot: string): string {
+  return join(getDaemonDir(projectRoot), 'task-env-launch');
 }
 
 /** Key names only, sorted. The read path for anything user-facing. */
@@ -315,15 +362,20 @@ export async function unsetTaskEnv(
 export async function clearTaskEnv(projectRoot: string, taskId: string): Promise<number> {
   return mutate(projectRoot, async registry => {
     const count = Object.keys(registry.tasks[taskId] ?? {}).length;
-    if (count === 0) return 0;
+    const runs = Object.keys(registry.launched?.[taskId] ?? {});
+    // Belt to the finally in the launcher: a crashed launch's file goes with the task.
+    await Promise.all(runs.map(run => rm(launchFilePath(projectRoot, run), { force: true })));
+    if (count === 0 && runs.length === 0) return 0;
     delete registry.tasks[taskId];
+    delete registry.launched?.[taskId];
     await persist(projectRoot, registry);
     return count;
   });
 }
 
 /**
- * `['-e', 'KEY=VALUE', ...]` for `docker run`. Sorted so the argv is stable and
+ * `['-e', 'KEY=VALUE', ...]` for `docker run` — the argv shape, which launches
+ * now use only for values an env file cannot carry (planTaskEnvLaunchFile). Sorted so the argv is stable and
  * diffable in tests. Pure — takes the already-read values, so the argv builder
  * stays inspectable without touching the filesystem.
  */
@@ -331,4 +383,133 @@ export function buildTaskEnvArgs(vars: Record<string, string>): string[] {
   return Object.keys(vars)
     .sort()
     .flatMap(key => ['-e', `${key}=${vars[key]}`]);
+}
+
+/**
+ * `{ LAZY_TASK_ENV_KEYS: 'A,B' }` — tells the launched supervisor which of its
+ * env vars are per-task values so ITS log scrubber covers them too (it has no
+ * access to this file). Key names only. Empty when the task has none.
+ */
+export function taskEnvKeysEnv(vars: Record<string, string>): Record<string, string> {
+  const keys = Object.keys(vars).sort();
+  return keys.length > 0 ? { [TASK_ENV_KEYS_VAR]: keys.join(',') } : {};
+}
+
+/**
+ * Deliver a task's env to `docker run` through a 0600 `--env-file` in the
+ * daemon's own state dir instead of `-e KEY=VALUE` argv, so the values are not
+ * in the host process table (`ps`) while docker runs. The caller MUST call
+ * `write()` just before spawning `docker run` and `cleanup()` once it has
+ * exited, success or not. Planning is pure, so the argv can be built (and
+ * tested) before anything touches the filesystem.
+ *
+ * What this does NOT hide: `docker inspect <container>` still shows every
+ * value for the container's life — env is part of a container's config, and
+ * no delivery mechanism changes that. Anyone who can reach the docker socket
+ * can read it.
+ *
+ * Docker's env-file format is one literal `KEY=VALUE` per line with no quoting
+ * or escapes, so a value containing a line break cannot be written there, and
+ * the docker CLI reads it with a line scanner capped at 64 KiB; such values are
+ * passed as `-e` argv, as every value was before.
+ *
+ * The file is not a mount — docker reads it on the host — so the daemon dir
+ * still never enters a container (test/unit/daemon-dir-never-mounted.test.ts).
+ */
+/** Below the docker CLI's 64 KiB env-file line limit, with headroom. */
+const MAX_ENV_FILE_LINE_BYTES = 60 * 1024;
+
+function launchFilePath(projectRoot: string, runName: string): string {
+  return join(launchFileDir(projectRoot), `${runName}.env`);
+}
+
+export function planTaskEnvLaunchFile(
+  projectRoot: string,
+  runName: string,
+  vars: Record<string, string>,
+): { args: string[]; write: () => Promise<void>; cleanup: () => Promise<void> } {
+  const keys = Object.keys(vars).sort();
+  const argvOnly = (k: string) =>
+    /[\r\n]/.test(vars[k]) || Buffer.byteLength(`${k}=${vars[k]}`, 'utf-8') > MAX_ENV_FILE_LINE_BYTES;
+  const lineSafe = keys.filter(k => !argvOnly(k));
+  const multiLine = keys.filter(argvOnly);
+  const keysArgs = Object.entries(taskEnvKeysEnv(vars)).flatMap(([k, v]) => ['-e', `${k}=${v}`]);
+  const argvArgs = multiLine.flatMap(k => ['-e', `${k}=${vars[k]}`]);
+  if (lineSafe.length === 0) {
+    return { args: [...argvArgs, ...keysArgs], write: async () => {}, cleanup: async () => {} };
+  }
+  const dir = launchFileDir(projectRoot);
+  const path = launchFilePath(projectRoot, runName);
+  return {
+    args: ['--env-file', path, ...argvArgs, ...keysArgs],
+    write: async () => {
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+      await writeFile(path, lineSafe.map(k => `${k}=${vars[k]}\n`).join(''), { mode: 0o600 });
+    },
+    cleanup: () => rm(path, { force: true }),
+  };
+}
+
+/**
+ * Stable fingerprint of a task's env. Stored only in this same 0600 file, next
+ * to the values themselves, so it discloses nothing the file does not.
+ */
+export function taskEnvFingerprint(vars: Record<string, string>): string {
+  const canonical = JSON.stringify(Object.keys(vars).sort().map(k => [k, vars[k]]));
+  return createHash('sha256').update(canonical).digest('hex');
+}
+
+const EMPTY_FINGERPRINT = taskEnvFingerprint({});
+
+/**
+ * Record the env a task's container/supervisor is being launched with. Called
+ * by the runners at the one point that reads the values for a launch.
+ */
+export async function recordTaskEnvLaunched(
+  projectRoot: string,
+  taskId: string,
+  runName: string,
+  vars: Record<string, string>,
+): Promise<void> {
+  const fingerprint = taskEnvFingerprint(vars);
+  await mutate(projectRoot, async registry => {
+    const launched = registry.launched ?? {};
+    const runs = { ...(launched[taskId] ?? {}) };
+    if ((runs[runName] ?? EMPTY_FINGERPRINT) === fingerprint) return;
+    if (fingerprint === EMPTY_FINGERPRINT) delete runs[runName];
+    else runs[runName] = fingerprint;
+    if (Object.keys(runs).length === 0) delete launched[taskId];
+    else launched[taskId] = runs;
+    registry.launched = launched;
+    await persist(projectRoot, registry);
+  });
+}
+
+/**
+ * Whether a RUNNING container/supervisor for this task was launched with a
+ * different env than the task has now.
+ *
+ * Env is fixed when a container is created and launch paths reuse a running
+ * one, so without this a `lazy env set` made while the container was alive
+ * never reached a later turn. Every reuse site asks this and recreates on true;
+ * the new container simply carries the new values (no notice is sent).
+ *
+ * An unreadable registry answers true rather than throwing: the reuse sites run
+ * outside the launch's revert-on-failure guard, and a recreate re-reads the
+ * registry inside it, where the same error fails the launch loudly.
+ */
+export async function mustRecreateForTaskEnv(
+  projectRoot: string,
+  taskId: string,
+  runName: string,
+): Promise<boolean> {
+  let registry: TaskEnvFile;
+  try {
+    registry = await loadRegistry(projectRoot);
+  } catch (err) {
+    logger.error(`Cannot check task ${taskId}'s environment for container reuse; recreating: ${err instanceof Error ? err.message : String(err)}`);
+    return true;
+  }
+  const launched = registry.launched?.[taskId]?.[runName] ?? EMPTY_FINGERPRINT;
+  return launched !== taskEnvFingerprint(registry.tasks[taskId] ?? {});
 }

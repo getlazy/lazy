@@ -25,6 +25,7 @@ import { join } from 'path';
 import { getHome } from '../utils/home';
 import { pathExists, readFileSafe } from '../utils/fs';
 import { SANDBOX_DIR } from '../utils/sandbox';
+import { applyClaudeFirstRunDefaults } from '../agent/claude-first-run';
 
 /** Sandbox-relative filename — mounted to `/home/user/.claude.json`. */
 export const TASK_CLAUDE_CONFIG_BASENAME = '.claude.json';
@@ -64,10 +65,8 @@ export function extractClaudePreferenceSeed(
   }
   // Pairing is never the first-run moment — skip the wizard even when the host
   // has no config yet (brand-new lazy user pairing before running a turn).
-  if (seed.hasCompletedOnboarding === undefined) {
-    seed.hasCompletedOnboarding = true;
-  }
-  return seed;
+  // Shared with the builder seed so the two never drift.
+  return applyClaudeFirstRunDefaults(seed);
 }
 
 /**

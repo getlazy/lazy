@@ -23,7 +23,7 @@ const githubConfig: ResolvedConfig = {
     backend: 'external',
     external_path: '',
   },
-  git: { default_branch_prefix: 'lazy', lfs_check: 'refuse' },
+  git: { default_branch_prefix: 'lazy', lfs_check: 'refuse', coauthor_trailer: true },
   output: { shortid_length: 8 },
   agents: {},
   agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0, wind_down_timeout_ms: 0, effort: 'medium' },

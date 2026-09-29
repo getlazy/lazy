@@ -180,8 +180,8 @@ export function diffUsage(): void {
   console.log(`Usage: lazy diff <task_id> [--full] [--full-branch] [--region <id>] [--turn N|latest] [--lines N..M]
 
 Show changes made by a task relative to its upstream branch.
-A task with accepted children (a release hub) shows only its own direct
-changes by default — the children's files were already reviewed at accept.
+The diff is always the task's whole branch, including work that accepted
+subtasks brought in. Use --region to look at one subtask's share.
 Comments added since the last agent turn are shown as virtual diff additions.
 
 Arguments:
@@ -189,9 +189,9 @@ Arguments:
 
 Options:
   --full           Show full diff (default: stat summary)
-  --full-branch    Include accepted children's files (whole branch vs upstream)
-  -r, --region <id>  Scope the diff to one review region's files (implies
-                   --full-branch). List regions with: lazy regions <task_id>
+  --full-branch    No-op, kept for old scripts (the diff is always the whole branch)
+  -r, --region <id>  Scope the diff to one review region's files.
+                   List regions with: lazy regions <task_id>
   --turn N|latest  Show diff for a specific turn only
   --lines N..M     Return only lines N through M of the output (1-indexed, inclusive)
                    Formats: N..M (range), N.. (from N to end), ..M (start to M)
@@ -199,7 +199,6 @@ Options:
 Examples:
   lazy diff abc123                    # Summary of all changes vs upstream
   lazy diff abc123 --full             # Full diff vs upstream
-  lazy diff abc123 --full-branch      # Whole branch, including accepted children
   lazy diff abc123 --region task:fix-x --full   # Just that region's files
   lazy diff abc123 --turn latest      # Diff for the most recent turn
   lazy diff abc123 --turn 1           # Diff for turn 1

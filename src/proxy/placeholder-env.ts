@@ -47,6 +47,8 @@ export interface LaunchIdentity {
    * lookup, not at mint.
    */
   profile: string;
+  /** The task's UUID, when the launch knows it — see `CredentialGrant.taskUuid`. */
+  taskUuid?: string;
 }
 
 /**
@@ -78,6 +80,7 @@ export async function placeholderizeAuthEnv(
       label: identity.label,
       envKey: v.key,
       profile: identity.profile,
+      ...(identity.taskUuid ? { taskUuid: identity.taskUuid } : {}),
     });
     out.push({ key: v.key, value: token });
   }

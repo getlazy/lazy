@@ -124,7 +124,7 @@ describe('daemon conversation capture sweep', () => {
     }
     expect(list.stdout).toContain('beef0000');
     expect(list.stdout).not.toContain('f00d0000');
-    expect(list.stdout).toContain('1 captured conversation(s)');
+    expect(list.stdout).toContain('1 Builder(s)');
 
     // And the skipped one-shot must not read as capture rot.
     const doctor = await ctx.lazy(['doctor']);

@@ -36,8 +36,9 @@
  * tell the engineer their daemons were current when they were not.
  *
  * BAKED BEATS COMPUTED. A `.source-fingerprint` at the checkout root is used
- * verbatim. It is a build-time CACHE of this same function (the Dockerfile calls
- * `lazy system source-id --write` to produce it), not a second implementation —
+ * verbatim. It is a build-time CACHE of this same function (the daemon image's
+ * Dockerfile calls `lazy system source-id --write` to produce it; the Teams
+ * image copies that checkout), not a second implementation —
  * which is the whole point of the file surviving the rewrite that deleted the
  * shell pipeline.
  */

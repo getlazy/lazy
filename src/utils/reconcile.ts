@@ -10,6 +10,7 @@
  * Called automatically by list/blocked commands before displaying results.
  */
 
+import { RESTORE_COMMIT_EMAIL, restoredViolationRecords } from '../protection/rejected-restore';
 import { join } from 'path';
 import { existsSync, readdirSync, statSync, readFileSync } from 'fs';
 import type { Storage } from '../storage';
@@ -328,6 +329,70 @@ export async function reconcileTasks(
       logger.warn(`Post-accept follow-through sweep failed: ${describe(err)}`);
     });
 
+    // Sweep 10: repair task worktrees whose git pointers (.git, commondir,
+    // gitdir) or submodule git dirs were changed from what lazy created — within a tick, before a
+    // human's own git in that worktree follows them. lazy's own git already
+    // refuses there (src/git/worktree-pointers.ts); this puts them back.
+    await sweep('git-pointers', async () => {
+      const { repairTamperedWorktrees } = await import('../git/worktree-pointers');
+      // A running turn's own git writes its submodule git dirs, so those are
+      // repaired between turns only (src/git/submodule-gitdirs.ts).
+      const live = new Set((await storage.listTasksWithOptions({ workingOnly: true })).map(t => taskRef(t)));
+      for (const r of await repairTamperedWorktrees(lazyRoot, { turnIsLive: async (name) => live.has(name) })) {
+        if (r.repaired) {
+          logger.error(`Task worktree ${r.name} had tampered git pointers (${r.problem}); repaired ${r.repaired.join(', ')}`);
+        } else if (!unrepairableReported.has(`${r.name}\0${r.error}`)) {
+          // Once per worktree and reason per process: it is refused every tick
+          // until a human acts, and the doctor check carries it meanwhile.
+          unrepairableReported.add(`${r.name}\0${r.error}`);
+          logger.error(`Task worktree ${r.name} has tampered git pointers (${r.problem}) and could not be repaired: ${r.error}. lazy refuses to run git there; see lazy doctor.`);
+        }
+      }
+    }, (err) => {
+      logger.warn(`Git pointer repair sweep failed: ${describe(err)}`);
+    });
+
+    // Sweep 10b: point a task worktree's HEAD back at the task's own branch
+    // when the task redirected it. lazy's commit, sync and accept already
+    // refuse there (src/git/worktree-pointers.ts); this lets them run again.
+    await sweep('task-heads', async () => {
+      const { repairRedirectedTaskHeads } = await import('../git/worktree-pointers');
+      const { taskWorktreeBranches } = await import('../task/worktree-branches');
+      // Never under a live turn or pairing session, and never a detached HEAD
+      // (an inspection checkout or a rebase in progress): rewriting HEAD there
+      // leaves the index behind and the next commit would revert work. Those
+      // are left to doctor and to whoever is in the worktree.
+      const branches = await taskWorktreeBranches(storage, { excludeLive: true });
+      for (const r of await repairRedirectedTaskHeads(lazyRoot, branches, { skipDetached: true })) {
+        if (!r.error) {
+          logger.error(`Task worktree ${r.name} had its HEAD redirected (${r.problem}); pointed it back at ${r.branch}`);
+        } else if (!unrepairableReported.has(`${r.name}\0head\0${r.error}`)) {
+          unrepairableReported.add(`${r.name}\0head\0${r.error}`);
+          logger.error(`Task worktree ${r.name} has its HEAD redirected (${r.problem}) and could not be repaired: ${r.error}. lazy refuses to commit, sync or accept there; see lazy doctor.`);
+        }
+      }
+    }, (err) => {
+      logger.warn(`Task HEAD repair sweep failed: ${describe(err)}`);
+    });
+
+    // Sweep 10c: quarantine nested repositories a task planted inside its
+    // worktree (`<sub>/.git` whose config runs code for the human's own git or
+    // IDE) — moved aside, never deleted, and never under a live turn
+    // (src/git/nested-git.ts). Accept refuses while one is present.
+    await sweep('nested-git', async () => {
+      const { sweepNestedGit } = await import('../git/nested-git');
+      for (const r of await sweepNestedGit(lazyRoot, storage)) {
+        if (r.moved.length > 0) {
+          logger.error(`Task worktree ${r.name} held nested git repositories its base branch does not have; quarantined ${r.moved.map(m => `${m.rel} → ${m.movedTo}`).join(', ')}`);
+        } else if (r.error && !unrepairableReported.has(`nested\0${r.name}\0${r.error}`)) {
+          unrepairableReported.add(`nested\0${r.name}\0${r.error}`);
+          logger.error(`Task worktree ${r.name} could not be checked for nested git repositories: ${r.error}. See lazy doctor.`);
+        }
+      }
+    }, (err) => {
+      logger.warn(`Nested git repository sweep failed: ${describe(err)}`);
+    });
+
     // NOTE (remove-reaper-cap-sweep): there is deliberately no idle-container
     // reaper and no queued-task drain here. A blocked task keeps its warm
     // supervisor container until the task reaches a terminal state (accept /
@@ -347,6 +412,9 @@ export async function reconcileTasks(
  * never a wrong abandonment.
  */
 const claimedRunGoneSince = new Map<string, number>();
+
+/** Unrepairable git-pointer findings already logged by Sweep 10 (this process only). */
+const unrepairableReported = new Set<string>();
 
 /** How long a claimed turn's run must be continuously gone before it is abandoned. */
 const CLAIMED_RUN_DEATH_GRACE_MS = 10_000;
@@ -1170,7 +1238,7 @@ export async function buildStrandedRecoveryTurnContent(
 async function recoverStrandedCompletion(
   storage: Storage,
   task: Pick<Task, 'id' | 'type'>,
-  session: { id: string; git_start_sha: string; agent_session_id: string | null },
+  session: { id: string; git_start_sha: string; agent_session_id: string | null; git_branch?: string },
   worktreePath: string,
   protoDir: string,
   lazyRoot?: string,
@@ -1224,6 +1292,18 @@ async function recoverStrandedCompletion(
     return false;
   }
 
+  // The scan walks HEAD: with HEAD redirected to another branch, that branch's
+  // commits would read as this agent's finished work. Not a stranded completion.
+  if (session.git_branch) {
+    const { assertTaskWorktreeHead } = await import('../git/worktree-pointers');
+    try {
+      await assertTaskWorktreeHead(worktreePath, session.git_branch);
+    } catch (err) {
+      logger.warn(`Task ${taskShortId}: stranded-completion recovery skipped — ${err instanceof Error ? err.message : err}`);
+      return false;
+    }
+  }
+
   let scan;
   try {
     scan = await scanSessionCommits(storage, session, worktreePath);
@@ -1250,10 +1330,16 @@ async function recoverStrandedCompletion(
   const evidence: string[] = [];
   for (const c of scan.commits) {
     const second = await runGit(['rev-parse', '--verify', '--quiet', `${c.sha}^2`], { cwd: worktreePath });
-    if (second.exitCode !== 0) evidence.push(c.sha);
+    if (second.exitCode === 0) continue;
+    // Nor is lazy's own restore of rejected protected files: the supervisor
+    // commits it BEFORE the agent runs (src/protection/rejected-restore.ts), so
+    // a supervisor killed after it has done nothing of the agent's turn yet.
+    const author = await runGit(['log', '-1', '--format=%ae', c.sha], { cwd: worktreePath });
+    if (author.exitCode === 0 && author.stdout.trim() === RESTORE_COMMIT_EMAIL) continue;
+    evidence.push(c.sha);
   }
   if (evidence.length === 0) {
-    logger.debug(`Task ${taskShortId}: only merge commits are unrecorded — not a stranded completion, falling through to interrupted.`);
+    logger.debug(`Task ${taskShortId}: only merge or lazy restore commits are unrecorded — not a stranded completion, falling through to interrupted.`);
     return false;
   }
 
@@ -2041,7 +2127,7 @@ export async function handleCompletedResponses(
   let turnEndSha: string | undefined;
   if (status) {
     turnStartSha = status.pre_turn_sha;
-    turnStartShaWork = status.post_merge_sha ?? status.pre_turn_sha;
+    turnStartShaWork = status.post_restore_sha ?? status.post_merge_sha ?? status.pre_turn_sha;
     turnEndShaWork = status.post_work_sha;
     try {
       turnEndSha = await getCurrentSha(worktreePath);
@@ -2082,6 +2168,14 @@ export async function handleCompletedResponses(
       mergeConflicts: work.merge_conflicts,
       // The work turn carries NO violations — when present they were re-detected
       // and attributed to the push-back turn (the FINAL set). See recordSupervisedTurns.
+      // The one exception is not a detection: rejected protected files lazy's
+      // supervisor RESTORED before this turn's agent ran are recorded here as
+      // `rejected` + `restored_*` — what accept reads to tell the reviewer the
+      // merged tree holds a lazy-made restore. A re-edit in this same turn is
+      // re-detected on the later push-back turn as `pending`, and wins.
+      ...(work.restored_protected_files?.length
+        ? { violations: restoredViolationRecords(work.restored_protected_files, Date.now()) }
+        : {}),
       ...(work.check_exit_code !== undefined ? { checkExitCode: work.check_exit_code } : {}),
       ...(work.check_output !== undefined ? { checkOutput: work.check_output } : {}),
       // What the turn left loose in the worktree — recorded on the work turn
@@ -2466,6 +2560,11 @@ export async function handleErrorResponse(
       // nothing asked the agent to commit it — without this, the turn record of
       // the riskiest case is the only one saying nothing about the worktree.
       ...(response.uncommitted?.length ? { uncommitted: response.uncommitted } : {}),
+      // A restore of rejected protected files that landed before the crash —
+      // recorded so accept still names it (src/protection/rejected-restore.ts).
+      ...(response.restored_protected_files?.length
+        ? { violations: restoredViolationRecords(response.restored_protected_files, Date.now()) }
+        : {}),
     }, lazyRoot);
     // Roll the same tokens into the session total, inside the same idempotency
     // guard as the turn write (see rollUpSessionUsage). A crashed turn's tokens
@@ -3220,7 +3319,8 @@ async function sweepTerminalContainers(storage: Storage, lazyRoot: string, runne
  * Detection is gated SOLELY on the authoritative accept tag `lazy-accept-<full-task-id>`,
  * which accept creates during the merge step, before the status→complete transition
  * (see createAcceptTag). A task is recovered iff that tag exists and points at a real
- * commit.
+ * commit — unless the store records that a reopen SUPERSEDED the accept at that very
+ * commit (src/task/reopen-after-accept.ts); a later accept moves the tag and re-arms it.
  *
  * The tag is created on BOTH accept paths and is global to the repo, so the sweep does
  * not need to compute a merge target or care which branch the work landed on — this
@@ -3258,6 +3358,15 @@ async function sweepMergedBranches(storage: Storage, lazyRoot: string): Promise<
       // accepted → leave it alone.
       const acceptCommit = await getAcceptTagCommit(task.id, lazyRoot);
       if (!acceptCommit) continue;
+
+      // A reopen after this very accept spent it: the tag outlives the reopen,
+      // and healing from it would undo what a person just did
+      // (src/task/reopen-after-accept.ts). A later accept moves the tag.
+      const { readReopenedAfterAccept, isAcceptSpent } = await import('../task/reopen-after-accept');
+      if (isAcceptSpent(acceptCommit, await readReopenedAfterAccept(storage, task.id))) {
+        logger.debug(`Task ${taskShortId}: skipping zombie sweep — accept ${acceptCommit.slice(0, 8)} was superseded by a reopen`);
+        continue;
+      }
 
       // A region carve reading this worktree makes the teardown below fail.
       // The tick's drain above settles the carves the RECONCILER started; a

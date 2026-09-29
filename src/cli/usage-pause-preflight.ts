@@ -6,8 +6,9 @@
  * closes would leave the human's feedback in a recovery file, so the commands
  * that collect text ask first, next to the identity pre-flight. The daemon is
  * still the authority: this only saves the human typing into a turn that
- * cannot start, and a pending one-shot override is counted exactly as the
- * launch will count it.
+ * cannot start, and the task's pending allowance ("let its next turn
+ * through") is counted exactly as the launch will count it — including the one
+ * `--past-usage-pause` is about to set.
  */
 
 import { queryUsagePause } from '../daemon/rpc-fallback';
@@ -46,7 +47,7 @@ export async function usagePauseRefusalLines(
   verb: PreflightVerb,
   /** The agent an `--agent` switch will run the turn on; the daemon judges that one. */
   agentId?: string,
-  opts: { beside?: boolean } = {},
+  opts: { beside?: boolean; pastUsagePause?: boolean } = {},
 ): Promise<string[] | null> {
   let verdict;
   // Judged as the launch will be: without the pending override unless a
@@ -65,18 +66,26 @@ export async function usagePauseRefusalLines(
     return null;
   }
   if (!verdict) return null;
-  return preflightRefusalLines(verdict, verb, eligible);
+  // `--past-usage-pause` sets the task's allowance with the launch, which lets
+  // it through anything but unreadable readings. (A run BESIDE the task is not
+  // the task's turn, and no task allowance covers it.)
+  if (opts.pastUsagePause && !opts.beside && !verdict.storeError) return null;
+  return preflightRefusalLines(verdict, verb, eligible, opts.beside ? undefined : taskId);
 }
 
 /**
- * The pre-flight's refusal for `verdict`. `offerOverride` names the one-shot
- * override command — only to a person who could use it
- * (`mayOfferUsagePauseOverride`), never to the builder or an agent.
+ * The pre-flight's refusal for `verdict`. `offerOverride` names the way
+ * through — only to a person at their own terminal
+ * (`mayOfferUsagePauseOverride`); the builder has its own MCP parameter and an
+ * agent none. With `taskRef` that is the task's own allowance, `lazy <verb>
+ * <task> --past-usage-pause`; without (a run beside the task) the daemon-wide
+ * one-shot override.
  */
 export function preflightRefusalLines(
   verdict: UsagePauseVerdict,
   verb: PreflightVerb,
   offerOverride: boolean,
+  taskRef?: string,
 ): string[] {
   if (verdict.storeError) {
     // No override lifts this one: a person fixes the file.
@@ -90,7 +99,9 @@ export function preflightRefusalLines(
     `The task cannot be ${NOT_DONE[verb]} right now: new turns on this credential are paused.`,
     `  ${describeUsagePause(verdict)}`,
     ...(offerOverride
-      ? [`  To let ONE turn start anyway: ${theme.command(`lazy daemon config set ${USAGE_PAUSE_OVERRIDE_KEY} off`)}`]
+      ? [taskRef
+        ? `  To let this task's next turn start anyway: ${theme.command(`lazy ${verb} ${taskRef} --past-usage-pause`)}`
+        : `  To let ONE turn start anyway: ${theme.command(`lazy daemon config set ${USAGE_PAUSE_OVERRIDE_KEY} off`)}`]
       : [`  New turns on this credential can start again once the window resets.`]),
     `Run ${theme.command('lazy doctor')} for the full diagnosis.`,
   ];
@@ -101,8 +112,9 @@ export async function requireUsagePauseClear(
   taskId: string,
   verb: PreflightVerb,
   agentId?: string,
+  opts: { pastUsagePause?: boolean } = {},
 ): Promise<void> {
-  const lines = await usagePauseRefusalLines(taskId, verb, agentId);
+  const lines = await usagePauseRefusalLines(taskId, verb, agentId, opts);
   if (!lines) return;
   for (const line of lines) console.error(line);
   process.exit(1);

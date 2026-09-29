@@ -9,6 +9,8 @@
  * precisely the one a stale/clobbered `~/.claude.json` points at.
  */
 
+import { startTestParentWatch, TEST_PARENT_PID_ENV } from '../daemon/test-parent-watch';
+
 /**
  * Keep the server alive through an unexpected throw.
  *
@@ -29,6 +31,19 @@ export function installMcpKeepAlive(): void {
   });
   process.on('unhandledRejection', (reason) => {
     console.error(`[lazy-mcp] unhandled rejection (server staying up): ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}`);
+  });
+
+  // A server launched under a test harness exits when the test run does. The
+  // keep-alive above makes this process hard to kill by accident, and one
+  // spawned by a 2026-09-28 fleet e2e run was still alive hours later, bound to
+  // a worktree teardown had deleted. The supervisor and daemon carry the same
+  // watch; this is the third process class under it. No-op unless
+  // LAZY_TEST_PARENT_PID is set — see src/daemon/test-parent-watch.ts.
+  startTestParentWatch(() => {
+    console.error(
+      `[lazy-mcp] ${TEST_PARENT_PID_ENV} process ${process.env[TEST_PARENT_PID_ENV]} exited — exiting (PID ${process.pid})`,
+    );
+    process.exit(0);
   });
 }
 

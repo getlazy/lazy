@@ -20,7 +20,11 @@ import type {
   AcceptGateWarning,
   MarkReadyOptions,
   OpenReview,
+  ReviewConversationItem,
+  ReviewStatus,
 } from './driver';
+
+const NO_FORGE = 'This project uses the local driver: there is no forge, so no PR/MR to read.';
 import type { Task } from '../types';
 import { checkMergeConflicts, checkMergeConflictsIntoTarget, squashMergeTaskBranch, branchChangesAlreadyIn } from '../git/operations';
 import type { DestinationRestoreConflict } from '../git/operations';
@@ -35,7 +39,7 @@ export class LocalDriver implements RepositoryDriver {
   }
 
   async merge(opts: MergeOptions): Promise<MergeResult> {
-    const { sourceBranch, targetBranch, task, taskShortId, root, fidelityBody, resume } = opts;
+    const { sourceBranch, targetBranch, task, taskShortId, root, fidelityBody, resume, coauthorTrailer } = opts;
 
     // Resume of a dead accept: if merging the branch would change nothing, the
     // squash already landed. Asked of the TREES, never of a tag or marker, so an
@@ -78,7 +82,7 @@ export class LocalDriver implements RepositoryDriver {
     // Perform the squash merge — local merges are always immediate, never pending
     let restoreConflict: DestinationRestoreConflict | null = null;
     try {
-      restoreConflict = await squashMergeTaskBranch(sourceBranch, targetBranch, taskShortId, task.goal, root, fidelityBody);
+      restoreConflict = await squashMergeTaskBranch(sourceBranch, targetBranch, taskShortId, task.goal, root, fidelityBody, coauthorTrailer ?? true);
     } catch (err) {
       // Pass the underlying message through. Re-wrapping as "Merge failed: …"
       // on top of an already-complete error produced the triple-nested
@@ -172,6 +176,14 @@ export class LocalDriver implements RepositoryDriver {
 
   async getPRState(_task: Task): Promise<PRState | null> {
     return null;
+  }
+
+  async readReviewConversation(_task: Task): Promise<ReviewConversationItem[]> {
+    throw new Error(NO_FORGE);
+  }
+
+  async readReviewStatus(_task: Task): Promise<ReviewStatus> {
+    throw new Error(NO_FORGE);
   }
 
   async updateRemoteBody(_task: Task, _summary: string): Promise<void> {

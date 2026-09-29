@@ -30,7 +30,7 @@ export interface BackoffEntry {
   /** Current attempt count (0 = first retry). */
   attempt: number;
   /** Why the last attempt did not sync — what `lazy daemon health` reports. */
-  reason?: 'fetch-failed' | 'usage-pause';
+  reason?: 'fetch-failed' | 'usage-pause' | 'no-credential';
 }
 
 /**
@@ -155,14 +155,16 @@ export async function runSyncRetryTick(
         backoffState.set(task.id, {
           nextRetryAt: now + delay,
           attempt,
-          reason: syncResult.usagePauseHeld ? 'usage-pause' : 'fetch-failed',
+          reason: syncResult.usagePauseHeld ? 'usage-pause' : syncResult.credentialHeld ? 'no-credential' : 'fetch-failed',
         });
         result.backedOff.push(shortTaskId);
         // Said as what it is: a held sync is not a failed fetch, and a log that
         // called it one sent whoever read it after the network.
         const why = syncResult.usagePauseHeld
           ? 'held by the usage pause (its conflict needs an agent; it runs after the window resets)'
-          : 'fetch failed';
+          : syncResult.credentialHeld
+            ? 'held: its conflict needs an agent, and there is no model credential for its profile'
+            : 'fetch failed';
         logger.info(`Sync retry: ${shortTaskId} ${why}, backoff ${Math.round(delay / 1000)}s (attempt ${attempt + 1})`);
       } else if (syncResult.status === 'up_to_date' || syncResult.status === 'sync_launched') {
         // Success — reset backoff

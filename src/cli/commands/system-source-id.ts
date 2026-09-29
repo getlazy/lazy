@@ -4,7 +4,7 @@
  * Two readers, and they are the reason this is a command rather than an
  * internal function:
  *
- *  - **The self-host image build**, with `--write`, to bake
+ *  - **The daemon image build** (whose checkout the self-host image copies), with `--write`, to bake
  *    `.source-fingerprint` into the shipped lazy checkout. It used to compute
  *    that with a `find | xargs sha256sum | sha256sum | awk` pipeline, which was
  *    a second implementation of src/utils/source-id.ts that nothing kept honest.

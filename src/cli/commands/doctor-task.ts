@@ -15,6 +15,7 @@
  */
 
 import { existsSync } from 'fs';
+import { ensureLazyExcludeBestEffort } from '../../git/lazy-exclude';
 import { displayId, shortId, getWorktreePath, taskRef } from '../../task/identity';
 import { parkTaskPaused } from '../../utils/paused-status';
 import { getActor } from '../../constants';
@@ -391,6 +392,7 @@ async function checkOrphanedWorktree(
         const { rmSync } = await import('fs');
         rmSync(worktreePath, { recursive: true, force: true });
 
+        await ensureLazyExcludeBestEffort(root);
         const result = await runGit(
           ['worktree', 'add', worktreePath, session.git_branch],
           { cwd: root },

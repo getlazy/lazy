@@ -322,6 +322,23 @@ describe('dashboard framing headers', () => {
     expectUnframeable(res);
   });
 
+  // INVARIANT: a route that sets its own CSP (the artifact bytes route
+  // sandboxes what it serves) keeps its directives AND gains frame-ancestors —
+  // the framing guard is merged, never displaced and never displacing.
+  test('a routed response with its own CSP keeps it and still refuses framing', async () => {
+    const cookie = await signIn();
+    const res = await serveDashboardRequest(
+      projectRoot,
+      req('/tasks/x/artifacts/file?name=a', { headers: { cookie } }),
+      DASHBOARD_HOST,
+      () => new Response('x', { headers: { 'Content-Security-Policy': "default-src 'none'; sandbox" } }),
+    );
+    const csp = res.headers.get('content-security-policy') ?? '';
+    expect(csp).toContain("default-src 'none'; sandbox");
+    expect(csp).toContain("frame-ancestors 'none'");
+    expect(res.headers.get('x-frame-options')).toBe('DENY');
+  });
+
   // A route that redirects is the shape most likely to come back immutable
   // from a future runtime (the Fetch standard gives `Response.redirect` an
   // immutable header guard; Bun does not enforce it). If that ever changes,

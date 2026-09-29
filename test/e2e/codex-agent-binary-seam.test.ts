@@ -19,6 +19,7 @@
  * is stacked on.
  */
 
+import { CODEX_LATEST_MODEL } from '../../src/config/default-models';
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { readFile } from 'fs/promises';
 import { join } from 'path';
@@ -122,9 +123,8 @@ describe('codex turns through the fake-binary seam', () => {
     // Bypass permission mode → codex's own sandbox off; lazy only sets this
     // where the process is already isolated, which is what this seam runs as.
     expect(argv).toContain('--dangerously-bypass-approvals-and-sandbox');
-    // The default model omits -m: codex's own default applies, and lazy's
-    // managed config.toml never writes a `model` key that could hijack it.
-    expect(argv).not.toContain('-m');
+    // A task with no model runs Codex's declared default, passed explicitly.
+    expect(argv[argv.indexOf('-m') + 1]).toBe(CODEX_LATEST_MODEL);
     // Prompt is the last positional and carries the task's own prompt.
     expect(argv[argv.length - 1]).toContain('Do the codex thing');
 

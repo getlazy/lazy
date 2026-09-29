@@ -39,7 +39,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
-import { mkdtemp, mkdir, readFile, rename, rm, writeFile, chmod } from 'fs/promises';
+import { mkdtemp, mkdir, readFile, rename, rm, writeFile, chmod, stat } from 'fs/promises';
 import { tmpdir } from 'os';
 import { createHash } from 'crypto';
 
@@ -56,7 +56,10 @@ import {
 } from '../../src/capture/claude';
 import { agentBinaryContentIdOfFile, versionedAgentBinaryName } from '../../src/agent/binary-install';
 import type { BuilderSession } from '../../src/storage/types';
-import { builderClaudeConfigPath, resolveBuilderSessionHomeDir } from '../../src/builder/claude-home';
+import { builderClaudeConfigPath, builderSessionLaunchDir, resolveBuilderSessionHomeDir } from '../../src/builder/claude-home';
+import { builderSupervisorLogHostPath } from '../../src/builder/supervisor-log-path';
+import { encodeProjectPath } from '../../src/import/claude-code-logs';
+import { BUILDER_CONTAINER_PATHS } from '../../src/runner/docker-runner';
 
 const ALICE_EMAIL = 'alice@example.com';
 const ALICE_OAUTH = 'sk-ant-oat01-alice-real-secret-for-resume-proof';
@@ -174,6 +177,20 @@ ${JSON.stringify(process.execPath)} run ${JSON.stringify(script)} "\$1" ${JSON.s
     await docker.onStop(`bash ${JSON.stringify(hook)} "$1"`);
   }
 
+  /**
+   * What a real builder container leaves behind: Claude Code writes its
+   * conversation as `<projects dir>/<encoded cwd>/<id>.jsonl`, in the projects
+   * dir that launch mounted. The fake runtime runs no Claude, so a test that
+   * resumes a conversation writes it here, where the container would have.
+   */
+  async function writeSessionFileAsContainer(launchArgv: string, sessionId: string): Promise<void> {
+    const mount = launchArgv.split(' ').find(t => t.endsWith(':/home/user/.claude/projects'));
+    if (!mount) throw new Error(`launch mounted no projects dir: ${launchArgv}`);
+    const dir = join(mount.slice(0, -':/home/user/.claude/projects'.length), encodeProjectPath(ctx.root));
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, `${sessionId}.jsonl`), '{"type":"user","sessionId":"' + sessionId + '"}\n');
+  }
+
   /** Everything a launch needs to succeed against the fake runtime. */
   async function armLaunchEnvironment(): Promise<void> {
     const manifest = await calculateImageInputManifest(ctx.root);
@@ -217,6 +234,9 @@ ${JSON.stringify(process.execPath)} run ${JSON.stringify(script)} "\$1" ${JSON.s
     if (patched === before) throw new Error('could not restore [runner] type = "docker" in the generated lazy.toml');
     await writeFile(configPath, patched);
 
+    // Seeded BEFORE the managed daemon starts: its launch warmup prepares the
+    // image and agent binary at once, and unseeded it would compile a real one.
+    await armLaunchEnvironment();
     await startDaemonWithFakes();
   });
 
@@ -238,6 +258,8 @@ ${JSON.stringify(process.execPath)} run ${JSON.stringify(script)} "\$1" ${JSON.s
     expect(started.agentSessionId).toBeNull();
     const firstContainer = started.containerName;
     expect(firstContainer).not.toBeNull();
+    // The conversation the live container writes (the fake runs no Claude).
+    await writeSessionFileAsContainer((await detachedLaunches())[0]!, CLAUDE_SESSION_ID);
     // The runtime really has it running — so the stop below is a real state
     // change and its graceful window is a real window.
     expect(await docker.containers()).toContain(firstContainer!);
@@ -279,6 +301,383 @@ ${JSON.stringify(process.execPath)} run ${JSON.stringify(script)} "\$1" ${JSON.s
     expect(launches[0]).not.toContain('--resume');
     expect(launches[1]).toContain(`-- --resume ${CLAUDE_SESSION_ID}`);
     expect(launches[1]).toContain(`--name ${resumed.containerName}`);
+  }, 180_000);
+
+  // INVARIANT: a builder whose container died on its own is never reported
+  // "running". Every read of the registry asks the runtime first and records
+  // the death — stopped, resumable, with how it ended — so the badge, the
+  // terminal refusal and the next start all give one answer. Before this, the
+  // row said "running" forever while the terminal said "not running any more".
+  test('a builder container that dies on its own reads as stopped, says how it ended, and resumes', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const alice = await mintUserToken(ALICE_EMAIL, 'Alice');
+    await armLaunchEnvironment();
+
+    const started = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    expect(started.state).toBe('running');
+    await docker.crash(started.containerName!, 137, 'claude: fatal: cannot open /home/member/.claude.json');
+
+    const list = await rpc(alice, 'storage', { method: 'listBuilderSessions', args: { projectRoot: ctx.root } }) as BuilderSession[];
+    expect(list.map(s => s.state)).toEqual(['stopped']);
+    expect(list[0]!.containerName).toBeNull();
+    expect(list[0]!.lastExit).toContain('exit code 137');
+    expect(list[0]!.lastExit).toContain('cannot open /home/member/.claude.json');
+    // The dead container was cleaned up with the row.
+    expect(await docker.containers()).not.toContain(started.containerName!);
+
+    // The attach answer agrees with the listing.
+    const refusal = await rpcStatus(alice, 'attachSession', { id: started.id });
+    expect(refusal.status).toBe(409);
+    expect(refusal.message).toContain('Your builder is stopped');
+    expect(refusal.message).toContain('Resume');
+
+    // Resuming it launches again and clears the recorded death.
+    const resumed = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    expect(resumed.id).toBe(started.id);
+    expect(resumed.state).toBe('running');
+    expect(resumed.lastExit ?? null).toBeNull();
+
+    // Dying again, with the terminal asked FIRST: the refusal says how it
+    // ended, and the listing read afterwards already agrees.
+    await docker.crash(resumed.containerName!, 1, 'boom');
+    const second = await rpcStatus(alice, 'attachSession', { id: started.id });
+    expect(second.status).toBe(409);
+    expect(second.message).toContain('not running any more');
+    expect(second.message).toContain('exit code 1');
+    const row = await rpc(alice, 'storage', { method: 'getBuilderSession', args: { id: started.id } }) as BuilderSession;
+    expect(row.state).toBe('stopped');
+  }, 180_000);
+
+  // INVARIANT: a builder that dies in its first minute is recorded by the
+  // daemon ITSELF, with nobody reading anything. The dead-builder recovery used
+  // to run only when a page or command next read the registry, so a start that
+  // failed while nobody looked left no line in the daemon log and removed
+  // nothing; the launch watch settles it within seconds. Proven here without a
+  // single registry read between the crash and the check: the container is
+  // removed and the row already says how it ended.
+  test('a builder that dies right after launch is settled by the daemon without anyone reading', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const alice = await mintUserToken(ALICE_EMAIL, 'Alice');
+    await armLaunchEnvironment();
+
+    const started = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    await docker.crash(started.containerName!, 1, 'Builder preflight failed: nope');
+
+    const deadline = Date.now() + 20_000;
+    while ((await docker.containers()).includes(started.containerName!) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    expect(await docker.containers()).not.toContain(started.containerName!);
+    const row = await rpc(alice, 'storage', { method: 'getBuilderSession', args: { id: started.id } }) as BuilderSession;
+    expect(row.state).toBe('stopped');
+    expect(row.lastExit).toContain('exit code 1');
+    expect(row.lastExit).toContain('Builder preflight failed: nope');
+  }, 180_000);
+
+  // INVARIANT: a start's timeline is recorded on its run row — every step with
+  // its duration and the outcome — so the run's page can show where a start got
+  // to without a log search. It is the daemon's record, never a client's.
+  test('a start records its timeline on the run', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const alice = await mintUserToken(ALICE_EMAIL, 'Alice');
+    await armLaunchEnvironment();
+
+    const started = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    const row = await rpc(alice, 'storage', { method: 'getBuilderSession', args: { id: started.id } }) as BuilderSession;
+    const timeline = row.startTimeline ?? [];
+    const steps = timeline.filter((e) => e.kind === 'step').map((e) => e.step);
+    expect(steps).toContain('container image');
+    expect(steps).toContain('docker run');
+    expect(timeline.at(-1)?.kind).toBe('done');
+    expect(timeline.every((e) => typeof e.offsetMs === 'number' && e.at)).toBe(true);
+  }, 180_000);
+
+  // INVARIANT: one RPC answers everything about a builder run — its row with
+  // the start timeline, the warmup, and the container's current state and
+  // output — for the control plane only: it quotes the daemon's own log, so a
+  // member's token is refused.
+  test('a run report answers the control token and refuses a member', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const alice = await mintUserToken(ALICE_EMAIL, 'Alice');
+    await armLaunchEnvironment();
+
+    const started = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    const report = await rpc(sharedToken, 'builderRunReport', { id: started.id }) as {
+      run: BuilderSession; warmup: { state: string }; container: { name: string; evidence: string } | null; log: { lines: string[] };
+    };
+    expect(report.run.id).toBe(started.id);
+    expect(report.run.startTimeline?.length).toBeGreaterThan(0);
+    expect(report.container?.name).toBe(started.containerName!);
+    expect(report.container?.evidence).toContain('Container:');
+    expect(Array.isArray(report.log.lines)).toBe(true);
+    expect(typeof report.warmup.state).toBe('string');
+
+    const refused = await rpcStatus(alice, 'builderRunReport', { id: started.id });
+    expect(refused.status).toBe(403);
+  }, 180_000);
+
+  // INVARIANT: the supervisor's log survives its container. It is written to a
+  // file on the project's persistent disk, so a builder whose container is
+  // already gone (a replaced machine) still leaves its supervisor log on the run.
+  test('a dead builder\'s supervisor log is read from the persistent copy', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const alice = await mintUserToken(ALICE_EMAIL, 'Alice');
+    await armLaunchEnvironment();
+
+    const started = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    const hostLog = builderSupervisorLogHostPath(
+      builderSessionLaunchDir(resolveBuilderSessionHomeDir(ctx.root, ALICE_EMAIL), started.builderId),
+      started.builderId,
+    );
+    await writeFile(hostLog, '[builder] Launching Claude Code interactively...\n[builder] KEPT-ON-DISK marker\n');
+    await docker.crash(started.containerName!, 1, '');
+
+    const list = await rpc(alice, 'storage', { method: 'listBuilderSessions', args: { projectRoot: ctx.root } }) as BuilderSession[];
+    expect(list[0]!.lastExit).toContain('kept on the project disk');
+    expect(list[0]!.lastExit).toContain('KEPT-ON-DISK marker');
+  }, 180_000);
+
+  // INVARIANT: the launch watch never turns a member's own Stop into a crash
+  // record: a builder stopped in its first seconds stays a clean stop, with no
+  // "stopped unexpectedly", after the watch's first checks have run. (The
+  // watch's log wording for this case is not observable here — a LAZY_TEST
+  // daemon writes no log file — so this guards the row only.)
+  test('a builder its member stops right after launch is not recorded as a crash', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const alice = await mintUserToken(ALICE_EMAIL, 'Alice');
+    await armLaunchEnvironment();
+
+    const started = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    await rpc(alice, 'stopBuilderSession', { id: started.id });
+    await new Promise((r) => setTimeout(r, 6_000));
+
+    const row = await rpc(alice, 'storage', { method: 'getBuilderSession', args: { id: started.id } }) as BuilderSession;
+    expect(row.state).toBe('stopped');
+    expect(row.lastExit ?? null).toBeNull();
+  }, 180_000);
+
+  // INVARIANT: a start's launch watch writes only its OWN start's timeline. A
+  // member who stops and starts again within the watch window keeps the new
+  // start's timeline on the run; the first watch, finding its container gone,
+  // must not overwrite it.
+  test('a restart within the watch window keeps the new start\'s timeline', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const alice = await mintUserToken(ALICE_EMAIL, 'Alice');
+    await armLaunchEnvironment();
+
+    const first = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    await rpc(alice, 'stopBuilderSession', { id: first.id });
+    const second = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    expect(second.builderId).not.toBe(first.builderId);
+    // Past the first watch's 2s and 5s checks.
+    await new Promise((r) => setTimeout(r, 6_000));
+
+    const row = await rpc(alice, 'storage', { method: 'getBuilderSession', args: { id: first.id } }) as BuilderSession;
+    const timeline = row.startTimeline ?? [];
+    expect(timeline.some((e) => e.step.includes(`builder ${second.builderId}`))).toBe(true);
+    // The first start's watch found its container gone; its note must not be here.
+    expect(timeline.some((e) => e.step.includes('not a crash'))).toBe(false);
+  }, 180_000);
+
+  // INVARIANT: a builder that dies printing NOTHING still leaves evidence on
+  // its row: the runtime's state record, an explicit "printed nothing" (never
+  // a silent gap a failed log read also produces), and the in-container
+  // supervisor's own log file, copied out before the container is removed.
+  // The engineer's builders died with exit 1 and no output at all; that log
+  // is where the supervisor writes what it did.
+  test('a builder that dies silently still records its state and its supervisor log', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const alice = await mintUserToken(ALICE_EMAIL, 'Alice');
+    await armLaunchEnvironment();
+
+    const started = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    await docker.crash(started.containerName!, 1, '', '[builder] Launching Claude Code interactively...\n[builder] Claude Code exited with code 1\n');
+
+    const list = await rpc(alice, 'storage', { method: 'listBuilderSessions', args: { projectRoot: ctx.root } }) as BuilderSession[];
+    expect(list[0]!.state).toBe('stopped');
+    const lastExit = list[0]!.lastExit ?? '';
+    expect(lastExit).toStartWith('The builder stopped unexpectedly (exit code 1).');
+    expect(lastExit).toContain('Container: exit code 1, started 2026-09-27T12:00:00Z, finished 2026-09-27T12:00:02Z');
+    expect(lastExit).toContain('It printed nothing.');
+    expect(lastExit).toContain('[builder] Claude Code exited with code 1');
+  }, 180_000);
+
+  // INVARIANT: the dead builder's supervisor log is read as ONE regular file.
+  // The container decides what sits at that path; a symlink there must never
+  // make the daemon read a file of its own host into a row the member can read.
+  test('a supervisor log that is a symlink to a host file is refused, not followed', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const alice = await mintUserToken(ALICE_EMAIL, 'Alice');
+    await armLaunchEnvironment();
+    const secret = join(proofDir, 'host-secret.txt');
+    await writeFile(secret, 'HOST-SECRET-MARKER\n');
+
+    const started = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    await docker.crash(started.containerName!, 1, 'boom', { symlinkTo: secret });
+
+    const list = await rpc(alice, 'storage', { method: 'listBuilderSessions', args: { projectRoot: ctx.root } }) as BuilderSession[];
+    const lastExit = list[0]!.lastExit ?? '';
+    expect(lastExit).not.toContain('HOST-SECRET-MARKER');
+    expect(lastExit).toContain('is not a regular file; not read.');
+    expect(lastExit).toContain('boom');
+  }, 180_000);
+
+  // INVARIANT: an error printed before a screen full of escape codes survives.
+  // A TTY program's last lines can be pure control sequences; a short raw tail
+  // stripped to nothing and read as "no output".
+  test('an error followed by terminal-only lines is still recorded', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const alice = await mintUserToken(ALICE_EMAIL, 'Alice');
+    await armLaunchEnvironment();
+
+    const started = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    const screen = Array.from({ length: 60 }, () => '\u001b[2K\u001b[1A').join('\n');
+    await docker.crash(started.containerName!, 1, `Error: the real reason\n${screen}\n`);
+
+    const list = await rpc(alice, 'storage', { method: 'listBuilderSessions', args: { projectRoot: ctx.root } }) as BuilderSession[];
+    const lastExit = list[0]!.lastExit ?? '';
+    expect(lastExit).toContain('Error: the real reason');
+    expect(lastExit).toContain('It left no supervisor log');
+  }, 180_000);
+
+  // INVARIANT: starting a builder opens a LIVE builder, even when the
+  // conversation its row names cannot be resumed. Start on a stopped session
+  // passes `--resume <id>`; when the projects dir the container sees does not
+  // hold <id>.jsonl, Claude prints "No conversation found" and exits, so the
+  // container is dead seconds after launch and the terminal is refused — on
+  // every later start too, because the row kept the id. (One candidate cause
+  // of the member's failed "new builder" terminal; not confirmed on hardware.) A
+  // resume whose conversation is not there starts a fresh conversation instead
+  // (the old one stays readable under Builders) and forgets the id.
+  test('a resume whose conversation file is missing starts a live builder instead of one that dies at once', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const alice = await mintUserToken(ALICE_EMAIL, 'Alice');
+    await armLaunchEnvironment();
+    await installSupervisorStandIn(alice);
+
+    const started = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    // Stopped with a captured id, but no conversation file anywhere — what a
+    // builder stopped before its conversation reached disk (or whose dir was
+    // pruned) leaves behind.
+    const stopped = await rpc(alice, 'stopBuilderSession', { id: started.id }) as BuilderSession;
+    expect(stopped.agentSessionId).toBe(CLAUDE_SESSION_ID);
+
+    const again = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    expect(again.id).toBe(started.id);
+    // The terminal opens: the container is alive and the listing agrees.
+    const attach = await rpcStatus(alice, 'attachSession', { id: started.id });
+    expect(attach).toEqual({ status: 200, message: '' });
+    const list = await rpc(alice, 'storage', { method: 'listBuilderSessions', args: { projectRoot: ctx.root } }) as BuilderSession[];
+    expect(list.map(s => s.state)).toEqual(['running']);
+    expect(list[0]!.agentSessionId).toBeNull();
+    expect((await detachedLaunches())[1]).not.toContain('--resume');
+  }, 180_000);
+
+  // INVARIANT: the resume check follows the mount the container really gets.
+  // A failed write probe drops the per-builder overlay, so the container sees
+  // the member home's projects dir; a conversation that lives only in the
+  // overlay cannot be resumed there, and the launch must start fresh rather
+  // than pass `--resume` into a container that dies at once.
+  test('a resume whose overlay is not mounted starts fresh and stays alive', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const alice = await mintUserToken(ALICE_EMAIL, 'Alice');
+    await armLaunchEnvironment();
+    await installSupervisorStandIn(alice);
+
+    const started = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    const firstLaunch = (await detachedLaunches())[0]!;
+    await writeSessionFileAsContainer(firstLaunch, CLAUDE_SESSION_ID);
+    await rpc(alice, 'stopBuilderSession', { id: started.id });
+    // A dir with no seed manifest (written before manifests existed) carries no
+    // proof it is writable, so the launch probes it — and the probe fails.
+    const overlay = firstLaunch.split(' ').find(t => t.endsWith(':/home/user/.claude/projects'))!
+      .slice(0, -':/home/user/.claude/projects'.length);
+    await rm(join(overlay, '.lazy-seeded.json'), { force: true });
+    await docker.failWriteProbe();
+
+    await rpc(alice, 'startBuilderSession', {});
+    const relaunch = (await detachedLaunches())[1]!;
+    expect(relaunch).not.toContain(':/home/user/.claude/projects');
+    expect(relaunch).not.toContain('--resume');
+    const attach = await rpcStatus(alice, 'attachSession', { id: started.id });
+    expect(attach).toEqual({ status: 200, message: '' });
+    const row = await rpc(alice, 'storage', { method: 'getBuilderSession', args: { id: started.id } }) as BuilderSession;
+    expect(row.state).toBe('running');
+    expect(row.agentSessionId).toBeNull();
+  }, 180_000);
+
+  // INVARIANT: a runtime that does not ANSWER is not a dead builder. A read
+  // while `docker inspect`/`ps` fail leaves a live builder's row, container
+  // and resources exactly as they were, and the terminal says it could not
+  // check rather than "not running any more". Treating "no answer" as "dead"
+  // would stop a member's live builder because one probe was slow.
+  test('a runtime that does not answer leaves a live builder alone', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const alice = await mintUserToken(ALICE_EMAIL, 'Alice');
+    await armLaunchEnvironment();
+
+    const started = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    await docker.failInspect();
+    const list = await rpc(alice, 'storage', { method: 'listBuilderSessions', args: { projectRoot: ctx.root } }) as BuilderSession[];
+    expect(list.map(s => s.state)).toEqual(['running']);
+    const refusal = await rpcStatus(alice, 'attachSession', { id: started.id });
+    expect(refusal.status).toBe(503);
+    expect(refusal.message).toContain('Could not check whether your builder is running');
+    // Start asks the same question: no answer is a refusal, not a relaunch
+    // over a live container.
+    const start = await rpcStatus(alice, 'startBuilderSession', {});
+    expect(start.status).toBe(503);
+    expect(start.message).toContain('Could not check whether your builder is running');
+    // Stop too: no answer is not "already gone", so the row is not recorded
+    // stopped over a builder that may be live (with no conversation captured).
+    const stop = await rpcStatus(alice, 'stopBuilderSession', { id: started.id });
+    expect(stop.status).toBe(502);
+    expect(stop.message).toContain('could not determine whether the container is running');
+    await docker.failInspect(false);
+
+    const after = await rpc(alice, 'storage', { method: 'getBuilderSession', args: { id: started.id } }) as BuilderSession;
+    expect(after.state).toBe('running');
+    expect(after.containerName).toBe(started.containerName);
+    expect(await docker.containers()).toContain(started.containerName!);
+    expect((await docker.invocations()).filter(l => l.startsWith('stop ') || l.startsWith('rm '))).toEqual([]);
+  }, 180_000);
+
+  // INVARIANT: a read landing inside a member's Stop (container already gone,
+  // row not yet written) does not take the stop over: the stop succeeds, and
+  // the row does not claim the builder "stopped unexpectedly".
+  test('a listing read during a stop leaves the stop to finish as a clean stop', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const alice = await mintUserToken(ALICE_EMAIL, 'Alice');
+    await armLaunchEnvironment();
+    const started = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+
+    // During the stop's `docker rm` (after the container has exited), read the
+    // registry through the real RPC, as a page load would.
+    const script = join(proofDir, 'read-during-rm.ts');
+    await writeFile(script, `
+import { DaemonClient } from ${JSON.stringify(join(REPO_ROOT, 'src/daemon/client.ts'))};
+await DaemonClient.fromTarget(${JSON.stringify(target)}, ${JSON.stringify(alice)})
+  .rpc('storage', ${JSON.stringify(ctx.root)}, { method: 'listBuilderSessions', args: { projectRoot: ${JSON.stringify(ctx.root)} } });
+`);
+    await docker.onRm(`${JSON.stringify(process.execPath)} run ${JSON.stringify(script)} || true`);
+
+    const stopped = await rpc(alice, 'stopBuilderSession', { id: started.id }) as BuilderSession;
+    expect(stopped.state).toBe('stopped');
+    expect(stopped.lastExit ?? null).toBeNull();
   }, 180_000);
 
   test('a member cannot stop or end another member\'s session, and the victim keeps running', async () => {
@@ -466,6 +865,16 @@ ${JSON.stringify(process.execPath)} run ${JSON.stringify(script)} "\$1" ${JSON.s
     expect(JSON.parse(content).mcpServers?.lazy).toBeDefined();
     // …and nothing of the operator's is.
     expect(content).not.toContain(HOST_SENTINEL);
+    // INVARIANT: a first launch answers Claude Code's first-run prompts itself
+    // (never identity). Seeding from `{}` opened the theme picker in Teams.
+    const doc = JSON.parse(content);
+    expect(doc.hasCompletedOnboarding).toBe(true);
+    expect(doc.theme).toBeDefined();
+    const trusted = Object.entries(doc.projects ?? {}) as Array<[string, { hasTrustDialogAccepted?: boolean }]>;
+    expect(trusted.length).toBe(1);
+    expect(trusted[0]![1].hasTrustDialogAccepted).toBe(true);
+    expect(launch).toContain(`-w ${trusted[0]![0]}`);
+    for (const key of ['oauthAccount', 'userID', 'primaryApiKey']) expect(doc[key]).toBeUndefined();
   }, 180_000);
   test('what the session wrote into its Claude config survives a stop and resume', async () => {
     await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
@@ -497,8 +906,11 @@ ${JSON.stringify(process.execPath)} run ${JSON.stringify(script)} "\$1" ${JSON.s
     expect(resumed.model).toBe('member-chosen-model-7d2');
     expect(resumed.hasCompletedOnboarding).toBe(true);
     expect(resumed.projects?.[ctx.root]?.hasTrustDialogAccepted).toBe(true);
-    // …and this launch's own lazy entry, not the previous launch's.
-    expect(resumed.mcpServers.lazy.command).not.toBe(live.mcpServers.lazy.command);
+    // …and a lazy entry naming the fixed CONTAINER paths each launch mounts
+    // its own files at — never a host path, which a root daemon puts under
+    // the image's closed /root (see BUILDER_CONTAINER_DIR).
+    expect(resumed.mcpServers.lazy.command).toBe(BUILDER_CONTAINER_PATHS.mcpWrapper);
+    expect(resumed.mcpServers.lazy.args).toContain(BUILDER_CONTAINER_PATHS.daemonConfig);
   }, 180_000);
   test('a stop that fails does not persist the still-running session\'s config', async () => {
     await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
@@ -526,8 +938,9 @@ ${JSON.stringify(process.execPath)} run ${JSON.stringify(script)} "\$1" ${JSON.s
     const [launch] = await detachedLaunches();
     const one = (re: RegExp) => launch!.match(re)![1]!;
     const perLaunch = {
-      prompt: one(/--system-prompt-file (\S+)/),
-      containerConfig: one(/--builder-config (\S+)/),
+      // Host sources: the container sees each at its fixed container path.
+      prompt: one(/-v (\S+):\/lazy-builder\/builder-prompt\.txt:ro/),
+      containerConfig: one(/-v (\S+):\/lazy-builder\/builder-container\.json:ro/),
       claudeJson: one(/-v (\S+):\/home\/user\/\.claude\.json/),
       credentialStore: one(/-v (\S+):\/home\/user\/\.claude\/\.credentials\.json/),
       mcpWrapper: one(/-v (\S+lazy-mcp-wrapper\S+?):\S+:ro/),
@@ -544,6 +957,16 @@ ${JSON.stringify(process.execPath)} run ${JSON.stringify(script)} "\$1" ${JSON.s
       // nothing else puts it there.
       expect(launch).toContain(`-v ${path}:`);
     }
+
+    // INVARIANT: the container user may not be the daemon's uid (a root daemon
+    // on native Linux), so what it reads is 0644 / 0755 whatever the daemon's
+    // umask, never writable by others; the dir holding tokens stays 0700.
+    const modeOf = async (p: string) => (await stat(p)).mode & 0o777;
+    expect(await modeOf(join(perLaunch.prompt, '..'))).toBe(0o700);
+    for (const what of ['prompt', 'containerConfig', 'claudeJson', 'credentialStore'] as const) {
+      expect({ what, mode: await modeOf(perLaunch[what]) }).toEqual({ what, mode: 0o644 });
+    }
+    expect(await modeOf(perLaunch.mcpWrapper)).toBe(0o755);
 
     await rpc(alice, 'endBuilderSession', { id: started.id });
     for (const [what, path] of Object.entries(perLaunch)) {

@@ -44,6 +44,7 @@ import { protocolDir as getProtocolDir, ensureProtocolDir, writeStatus } from '.
 import { getWorktreePathForRef, taskRef } from '../../src/task/identity';
 import type { Runner } from '../../src/runner';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
+import { RESTORE_COMMIT_AUTHOR } from '../../src/protection/rejected-restore';
 
 function git(cwd: string, ...args: string[]): { stdout: string; stderr: string; exitCode: number } {
   const result = spawnSyncUnsupervised(['git', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
@@ -199,6 +200,24 @@ describe('recoverStrandedWorkingTasks', () => {
     // Record the init commit, as a finalized earlier turn would have.
     await env.storage.createCommit(session!.id, git(wt, 'rev-parse', 'HEAD').stdout, 'init');
     await mergeUpstreamInto(ref);
+
+    await recoverStrandedWorkingTasks(env.storage, env.lazyRoot, makeRunner(false));
+
+    expect((await env.storage.getTask(ref))?.status).toBe('working');
+  });
+
+  // INVARIANT (supervisor-restores-rejected-files): lazy's restore of rejected
+  // protected files is committed by the supervisor BEFORE the agent runs, so a
+  // supervisor killed right after it has not done the agent's turn. Reading it
+  // as finished work parked the task with no agent turn after the restore.
+  test('does NOT recover a task whose only unrecorded commit is lazy\'s restore', async () => {
+    const { ref } = await makeWorkingTask(env, 'restored then killed', false);
+    const session = await env.storage.getSessionByTaskId(ref);
+    const wt = getWorktreePathForRef(env.lazyRoot, ref);
+    await env.storage.createCommit(session!.id, git(wt, 'rev-parse', 'HEAD').stdout, 'init');
+    await writeFile(join(wt, 'restored.txt'), 'base again\n');
+    git(wt, 'add', 'restored.txt');
+    expect(git(wt, 'commit', '-m', 'lazy: restore', `--author=${RESTORE_COMMIT_AUTHOR}`).exitCode).toBe(0);
 
     await recoverStrandedWorkingTasks(env.storage, env.lazyRoot, makeRunner(false));
 

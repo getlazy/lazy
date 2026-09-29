@@ -62,7 +62,8 @@ describe('promote a discussion', () => {
     expect(prompt).toContain('Why is the retry path unbounded?');
     expect(prompt).toContain('budget on the queue');
     expect(prompt).toContain('Promoted from a review discussion on task fix-retries');
-    expect(prompt).toContain('Bound the retry path');
+    // INVARIANT: provenance ends at the task code — a trailing goal read as a second ask.
+    expect(prompt).not.toContain('Bound the retry path');
   });
 
   // INVARIANT: a withdrawn message is retracted, so it must not become part of

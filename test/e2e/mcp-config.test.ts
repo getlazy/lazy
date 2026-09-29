@@ -3,44 +3,36 @@
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { mkdtemp, rm, writeFile, readFile } from 'fs/promises';
+import { mkdtemp, rm } from 'fs/promises';
 import { join } from 'path';
-import { tmpdir, homedir } from 'os';
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
+import { tmpdir } from 'os';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
 
-// We test the writeMcpConfig function by importing it directly
-// and manipulating the home directory via env.
-// Note: writeMcpConfig uses homedir() which reads the real home.
-// We'll test it by reading the actual ~/.claude.json before and after.
+// writeMcpConfig resolves HOME through getHome() ($HOME first), so each test
+// points HOME at a throwaway directory. INVARIANT: this suite never reads or
+// writes the real ~/.claude.json. It used to — saving, deleting and restoring
+// the file of whoever ran it — which briefly cut any live agent or builder
+// sharing that HOME off from its lazy tools.
 
 describe('MCP config', () => {
-  const claudeConfigPath = join(homedir(), '.claude.json');
-  let originalContent: string | null = null;
+  let home: string;
+  let claudeConfigPath: string;
+  let prevHome: string | undefined;
 
-  beforeEach(() => {
-    // Save original config if it exists
-    if (existsSync(claudeConfigPath)) {
-      originalContent = readFileSync(claudeConfigPath, 'utf-8');
-    } else {
-      originalContent = null;
-    }
+  beforeEach(async () => {
+    home = await mkdtemp(join(tmpdir(), 'lazy-mcp-config-home-'));
+    claudeConfigPath = join(home, '.claude.json');
+    prevHome = process.env.HOME;
+    process.env.HOME = home;
   });
 
-  afterEach(() => {
-    // Restore original config
-    if (originalContent !== null) {
-      writeFileSync(claudeConfigPath, originalContent);
-    } else if (existsSync(claudeConfigPath)) {
-      unlinkSync(claudeConfigPath);
-    }
+  afterEach(async () => {
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    await rm(home, { recursive: true, force: true });
   });
 
   test('creates ~/.claude.json with lazy MCP server entry', async () => {
-    // Remove existing config
-    if (existsSync(claudeConfigPath)) {
-      unlinkSync(claudeConfigPath);
-    }
-
     const { writeMcpConfig } = await import('../../src/mcp/config');
     await writeMcpConfig({ command: 'lazy-agent', args: ['mcp', '--task-id', 'test-task-uuid', '--worktree', '/test/worktree'] });
 

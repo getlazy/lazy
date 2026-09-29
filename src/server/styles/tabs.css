@@ -687,3 +687,18 @@ body.lz-shell-maximised { overflow: hidden; }
 .lz-reviews-when-part {
   white-space: nowrap;
 }
+
+/* Artifacts tab. One row per file; the preview folds under it. Images are
+   capped to the column so a phone-width screenshot of a desktop page does not
+   scroll sideways. */
+.lz-artifact-list { list-style: none; padding: 0; margin: 0 0 var(--space-4); display: flex; flex-direction: column; gap: var(--space-3); }
+.lz-artifact { border: 1px solid var(--border); border-radius: 6px; padding: var(--space-2) var(--space-3); }
+.lz-artifact-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+.lz-artifact-name { font-weight: 600; word-break: break-all; }
+.lz-artifact-head .btn { margin-left: auto; }
+.lz-artifact-preview { margin-top: var(--space-2); }
+.lz-artifact-image { display: block; max-width: 100%; height: auto; margin-top: var(--space-2); border: 1px solid var(--border); }
+pre.lz-artifact-text { max-height: 32rem; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+div.lz-artifact-text { max-height: 32rem; overflow: auto; }
+.lz-artifact-upload { display: flex; flex-direction: column; gap: var(--space-2); border-top: 1px solid var(--border); padding-top: var(--space-3); }
+.lz-artifact-upload label { display: flex; flex-direction: column; gap: var(--space-1); max-width: 32rem; }

@@ -66,9 +66,8 @@ export function buildDiscussionTaskPrompt(
     .join('\n\n');
 
   const ref = taskDisplayRef(originatingTask);
-  const goal = originatingTask.goal.trim();
-  const provenance =
-    `Promoted from a review discussion on task ${ref}` + (goal ? `: ${goal}` : '.');
+  // Stops at the task code — a trailing goal read as a second instruction.
+  const provenance = `Promoted from a review discussion on task ${ref}.`;
 
   return `${body}\n\n---\n\n${provenance}`;
 }

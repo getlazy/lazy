@@ -167,7 +167,7 @@ dashboard's address is printed by `lazy daemon status`):
   injection falls back to the full index.
 
 The pages work with JavaScript turned off. Lazy Teams offers the same pages
-under a project's **Memory** tab — list, read, create, edit, remove, and run or
+under a project's **Settings → Memory** tab — list, read, create, edit, remove, and run or
 clear the compact, with the same size figures and the same list of records the
 compact does not cover — writing to the same store, so it reads the same either
 way. Any team member can write there; people viewing as someone else cannot.

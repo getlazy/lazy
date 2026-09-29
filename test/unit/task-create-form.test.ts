@@ -121,6 +121,32 @@ describe('taskCreateHtml', () => {
     expect(html).toContain('[agents.&lt;name&gt;]');
   });
 
+  test('the agent picker shows when to use each profile', () => {
+    // INVARIANT: a profile's `description` (when to choose it) is shown with
+    // the picker — as the option's tooltip and in a list beneath — so a human
+    // can pick the right agent. It informs; nothing is selected from it.
+    const html = taskCreateHtml(
+      { goal: '', prompt: '', code: '', parent: '', type: 'task', model: '', effort: '', review: '',
+        reviewGate: '', reviewAutoFix: '', agent: '', startNow: false },
+      {
+        agents: [
+          { name: 'security', summary: 'claude-code · claude-opus-5-5', group: 'configured',
+            description: 'Use whenever a security aspect comes up.' },
+          { name: 'plain', summary: 'cursor', group: 'configured', description: '' },
+        ],
+        efforts: ['low'],
+        types: ['task'],
+        parentTargets: { tasks: [], branches: ['main'] },
+      },
+    );
+    expect(html).toContain('<option value="security" title="Use whenever a security aspect comes up.">');
+    expect(html).toContain('<option value="plain">');
+    expect(html).toContain('When to use each agent');
+    expect(html).toContain('<dt><code>security</code></dt><dd>Use whenever a security aspect comes up.</dd>');
+    expect(html).not.toContain('<dt><code>plain</code>');
+    expect(html).toContain('<option value="" selected>');
+  });
+
   test('a degraded picker says so instead of calling everything built-in', () => {
     // INVARIANT: when the project's profiles cannot be read the form still
     // renders, but it must SAY the set is degraded. Silently relabelling a

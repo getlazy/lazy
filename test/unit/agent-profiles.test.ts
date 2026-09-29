@@ -24,8 +24,13 @@ import {
   BUILTIN_PROFILES,
   NO_CREDENTIAL,
   DEFAULT_AGENT_PROFILE_NAME,
+  DESCRIPTION_MAX,
+  renderAgentProfileList,
 } from '../../src/config/agent-profiles';
 import { listAgents } from '../../src/agent/registry';
+import { renderBuilderAgentProfilesSection } from '../../src/builder/system-prompt';
+import { DEFAULT_CONFIG } from '../../src/config/loader';
+import type { ResolvedConfig } from '../../src/config/types';
 import { CHATGPT_CODEX_UPSTREAM, DEFAULT_OPENAI_UPSTREAM } from '../../src/utils/openai-compat';
 import {
   DEFAULT_LOCAL_OLLAMA_ENDPOINT,
@@ -575,5 +580,66 @@ describe('picker order and summary', () => {
     // A built-in with no model of its own reads as the harness default rather
     // than as an empty field.
     expect(agentProfileSummary(profiles.get('claude-code')!)).toContain('claude-code default model');
+  });
+});
+
+describe('profile description', () => {
+  const silent = () => {};
+
+  test('is plain text carried onto the profile, trimmed', () => {
+    const p = resolveAgentProfiles({ security: { harness: 'claude-code', description: '  Use for security work.  ' } }, silent);
+    expect(p.get('security')!.description).toBe('Use for security work.');
+  });
+
+  test('every offered built-in has one of its own', () => {
+    const p = resolveAgentProfiles(undefined, silent);
+    for (const profile of selectableAgentProfiles(p)) expect(profile.description).not.toBe('');
+  });
+
+  test('a block overriding a built-in keeps its description unless it writes one', () => {
+    const p = resolveAgentProfiles({ cursor: { model: 'gpt-5' }, pi: { harness: 'pi', description: 'Mine.' } }, silent);
+    expect(p.get('cursor')!.description).toBe(BUILTIN_PROFILES.cursor.description);
+    expect(p.get('pi')!.description).toBe('Mine.');
+  });
+
+  test('an override that repoints the endpoint does not inherit the built-in description', () => {
+    const p = resolveAgentProfiles({ 'claude-code': { endpoint: 'http://localhost:11434', model: 'qwen3.8:latest' } }, silent);
+    expect(p.get('claude-code')!.description).toBe('');
+  });
+
+  test('whitespace, including newlines, collapses to one line', () => {
+    const p = resolveAgentProfiles({ security: { harness: 'claude-code', description: 'Use for\n  security\twork.' } }, silent);
+    expect(p.get('security')!.description).toBe('Use for security work.');
+  });
+
+  test('a non-string description is refused, naming the profile', () => {
+    expect(() => resolveAgentProfiles({ security: { harness: 'claude-code', description: 42 as unknown as string } }, silent))
+      .toThrow(/\[agents\.security\] description must be a string/);
+  });
+
+  test('an over-long description is refused, naming the profile and the limit', () => {
+    expect(() => resolveAgentProfiles({ security: { harness: 'claude-code', description: 'x'.repeat(DESCRIPTION_MAX + 1) } }, silent))
+      .toThrow(new RegExp(`\\[agents\\.security\\] description is ${DESCRIPTION_MAX + 1} characters; the limit is ${DESCRIPTION_MAX}`));
+  });
+
+  test('the builder list names each offered profile with its use-when note', () => {
+    const list = renderAgentProfileList(resolveAgentProfiles({ security: { harness: 'claude-code', description: 'Security.' } }, silent));
+    expect(list).toContain('- `security` (claude-code, ');
+    expect(list).toContain('use when: Security.');
+    expect(list).not.toContain('qa-agent');
+  });
+});
+
+describe('builder agent-profiles section', () => {
+  // INVARIANT: the builder is told the project's offered profiles with their
+  // "use when" notes and the REAL default for new tasks — the settings overlay
+  // included, as lazy_create resolves it — so its proposals match what runs.
+  test('lists profiles with their notes and names the given default', () => {
+    const config = { ...DEFAULT_CONFIG, agents: { security: { harness: 'claude-code', description: 'Costs $$ and $& — literal.' } } } as unknown as ResolvedConfig;
+    const section = renderBuilderAgentProfilesSection(config, 'security');
+    expect(section).toContain('## Agent profiles');
+    expect(section).toContain('**security** is the project default for new top-level tasks');
+    expect(section).toContain('use when: Costs $$ and $& — literal.');
+    expect(section).not.toContain('{{');
   });
 });

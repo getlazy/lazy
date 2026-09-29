@@ -310,8 +310,9 @@ numbers, and know which one you are reading.
 The task page's **Stats** tab is *what the agent reported, per turn*, for the
 task or its whole subtree
 ([what it means](web-review.md#what-the-stats-tab-means)). Its caveat: usage is
-recorded only when the agent reports it, which today means Claude Code turns —
-a turn that reported none is left out rather than drawn as a free turn.
+recorded only when the harness reports it. Claude Code, Pi, Codex and Cursor
+measurements are retained with their turns; a turn that reported none is left
+out rather than drawn as a free turn.
 
 `lazy stats tokens` is *what went over the wire*: one record per request the
 lazy proxy forwarded, rolled up by role, task and model. Every launch is

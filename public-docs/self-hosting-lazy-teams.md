@@ -36,7 +36,9 @@ The default image is `ghcr.io/getlazy/lazy-teams:latest`. Pin a specific release
 LAZY_TEAMS_TAG=<release-tag>
 ```
 
-Open `http://localhost:3000/` (or the port in `APP_DIRECT_PORT`). The in-browser setup flow walks you through creating the first administrator account, naming your installation, and inviting teammates. **This guide stops where the browser takes over** — you do not need a shell account to finish onboarding.
+The same image, with the same tags, is also published on Docker Hub as `docker.io/getlazy/lazy-teams`. To pull from there instead, set `LAZY_TEAMS_IMAGE=docker.io/getlazy/lazy-teams:<release-tag>` in `.env`. `LAZY_TEAMS_IMAGE` replaces the whole image reference, so put the tag in that value; `LAZY_TEAMS_TAG` has no effect once it is set.
+
+Open `http://localhost:3000/` (or the port in `APP_DIRECT_PORT`). The in-browser setup flow walks you through creating the first administrator account, naming your installation, and inviting teammates. **This guide stops where the browser takes over** — you do not need a shell account to finish onboarding. Registering, cloning and starting a project need no model credential. To run tasks, every person — you and each teammate you invite — connects their own model credential (for example their Claude account), because each task bills the account of whoever starts it; setup and the project page link straight to that settings page.
 
 ### First boot takes a minute or two
 
@@ -101,7 +103,7 @@ Two consequences worth knowing before they surprise you:
 
 ## Sign-in and git rate limits
 
-Repeated failed sign-ins from one address are refused for a few minutes, and so are repeated password-reset requests. The same applies to the git endpoints when you host repositories on the install — but there the count is of **failed** authentications, not requests, so ordinary `git clone`, `fetch` and `push` traffic is never throttled no matter how much of it there is.
+Repeated failed sign-ins from one address are refused for a few minutes, and so are repeated password-reset requests. The same applies to the git endpoints when you host repositories on the install — but there the count is of **failed** authentications, not requests, so ordinary `git clone`, `fetch` and `push` traffic is never throttled no matter how much of it there is. Git failures are counted per token, so one broken token does not block any other token — not even another of the same member's; a pause is shown on that member's project page and on the administrator's project diagnostics page.
 
 Nothing is configurable here, and nothing needs to be turned on.
 
@@ -120,6 +122,24 @@ MAILER_FROM=no-reply@example.com
 ```
 
 After restarting, an administrator can verify delivery from **Settings → Email** in god mode.
+
+## Private repositories and forge connections
+
+Each member brings their own GitHub or GitLab connection (**Account settings → Forge connections**, from your avatar menu), the same way each member brings their own Claude credential. Your connection clones and pushes as you:
+
+- **Cloning.** A project clones with the connection of the member who registered or started it — never another member's. When the fleet retries a project by itself (for example after you connect an account), it clones as the member who registered the project. The token reaches git as a credential only: it is never put in the repository URL, the clone's configuration, logs or error messages.
+- **Registering.** If you register a GitHub or GitLab URL and have no connection for that forge, Lazy Teams says so before cloning anything: connect one, or confirm the repository is public — public repositories need no connection.
+- **Pushing and pull requests.** Pushes, pull and merge requests (`lazy submit`) and review reads use the connection of whoever last set the project up or started it. Projects that run on their own machine (the default) include the `gh` and `glab` command-line tools, which use that connection directly — there is nothing to log in to.
+- **Use the HTTPS URL.** A token authenticates only over HTTPS, so SSH addresses (`git@github.com:owner/repo.git`) are refused with the HTTPS address to use instead.
+
+## If a repository cannot be cloned
+
+When a project's repository cannot be cloned, its page says so: the project shows as **failed**, with the cause in plain words and the next step.
+
+- **"This repository needs a GitHub (or GitLab) connection with access to it"** — the repository is private, or the connected token cannot read it. Follow **Connect GitHub →**, connect an account whose token can read the repository, and press **Retry setup** — the Forge connections page offers it too.
+- **"The repository URL could not be reached"** — the URL is wrong or points at nothing. A team admin corrects it on the project's **Settings → General** page and presses **Retry setup** there.
+
+Team admins also see what git said, with any credential removed. Retry setup is available to team admins and to whoever registered the project. You do not need to read the server's logs for either case.
 
 ## Where data lives
 
@@ -278,7 +298,7 @@ clone:
   `lazy create`, `lazy start`, `lazy unblock`, `lazy accept` and the rest — run
   through the install, as you, exactly as if you had used the browser.
 - **`lazy builder` attaches to your builder on the server**, next to the
-  project. It is the same session the **Builder** page opens, and its
+  project. It is the same session the **Builders** page opens, and its
   conversation stays with the project.
 - **A Claude Code you run yourself** can use the project's `lazy_*` tools
   through the install, with fewer capabilities than the server-side builder —
@@ -307,19 +327,21 @@ handed over.
 When you add a project, choose **Host on this install** instead of pasting a GitHub or GitLab URL. The install keeps a bare repository for that project and serves `git clone`, `fetch`, and `push` over HTTPS (smart HTTP) at a URL under your `APP_HOST`.
 
 Git prompts for credentials over HTTP Basic. Use any username git accepts and an
-**API token that includes git access** as the password. Tokens are scoped: git
+**Git & CLI token that includes git access** as the password. Tokens are scoped: git
 smart HTTP accepts only git-capable tokens, so a token minted for CLI or MCP
 access alone is refused even if it is otherwise valid.
 
 When you choose **Host on this install**, Lazy Teams provisions or reuses a
 git-scoped token for clone/push operations automatically. For manual
 `git clone`, `fetch`, or `push` from your own machine, create a token with git
-access from **Account menu → API tokens** in the web UI. Pick a label, enable
+access from **Account settings → Git & CLI tokens** (from your avatar menu) in the web UI. Pick a label, enable
 **Git**, and copy the value when it is shown — it cannot be displayed again.
 Tokens created before scoping was introduced still include both git and CLI
 access until you rotate them.
 
 Every team member can clone and fetch; only team admins and owners can push.
+
+The URL shown on the project page is the public one under `APP_HOST`. Inside a project's microVM that address is usually unreachable (on a single machine it is `localhost`, which inside the VM is the VM itself), so the project's own copy of the repository uses the install's internal git address instead — see [`smolvm`](#smolvm-default-one-project-per-microvm). You do not configure anything for this.
 
 To connect a machine's command line to the install instead, use
 [`lazy login`](teams-login.md) — it mints a CLI-scoped token for you through a
@@ -403,6 +425,8 @@ Where a project's process lives is what `LAZY_FLEET_BACKEND` selects.
 Each project gets its own microVM. Its repository is cloned inside the VM and never touches your host's filesystem; the host mounts only that project's store directory. No Docker socket is shared with anything, and a project's process is reachable from the application only through a port published on the loopback interface. The VM carries its own Docker engine, so a task's agent container runs inside the VM next to the process that launched it.
 
 Outbound network access from a VM is open to the public internet and closed to everything else: the VM cannot reach your host's loopback, your LAN (RFC 1918 ranges), link-local and cloud-metadata addresses, or other VMs. There is nothing to configure — a project's first turn builds its task-runner image from `Dockerfile.lazy`, which reaches package mirrors, container registries and language toolchains, and you should not have to enumerate those. The rule is enforced on destination IP addresses after name resolution, so a hostname that resolves to an internal address is refused just as the bare address would be.
+
+There is one exception, and it is a single port. So that a repository hosted on the install can be cloned, fetched and pushed from inside a project's VM, each VM can reach one listener on the host's loopback, under the name `git.lazy.internal`. That listener serves the install's hosted repositories and nothing else — the same git access, with the same tokens, as the public address — and refuses any other request. Nothing else on the host becomes reachable. The listener binds `127.0.0.1` on the port one above the application's own (3001 beside 3000); set `LAZY_GIT_LISTENER_PORT` to choose another, or to `off` to run without it, in which case hosted repositories cannot be used from a VM.
 
 It runs on a Linux host with KVM (x86_64 or arm64) and on an Apple Silicon Mac. It needs three settings, and the published image sets all three for you:
 
@@ -504,7 +528,7 @@ workaround — it removes the boundary the rest of this page depends on.
 | `SECRET_KEY_BASE` | yes | Session signing (`bootstrap.sh` generates) |
 | `AR_ENCRYPTION_*` | yes | Encrypts stored credentials (`bootstrap.sh` generates) |
 | `LAZY_TEAMS_TAG` | no | Pin a published image tag (default: `latest`) |
-| `LAZY_TEAMS_IMAGE` | no | Full image reference override (private registry) |
+| `LAZY_TEAMS_IMAGE` | no | Full image reference override (Docker Hub or a private registry); `LAZY_TEAMS_TAG` is ignored when set |
 | `APP_DIRECT_PORT` | no | Direct HTTP port (default 3000) |
 | `APP_DIRECT_BIND` | no | Interface the direct port publishes on (default `127.0.0.1`) |
 | `FORCE_SSL` | no | HTTPS redirect, `secure` cookies, HSTS (default on) |
@@ -518,6 +542,8 @@ workaround — it removes the boundary the rest of this page depends on.
 | `LAZY_DAEMON_IMAGE` | no | The image each project's microVM boots — the published `getlazy/lazy-daemon` at the exact version tag matching your Lazy Teams, a local image tag, or the path to a saved image tar. The published Lazy Teams image defaults it to its own version tag; never use `latest` |
 | `COMPOSE_FILE` | no | Written by `bootstrap.sh` on a server without `/dev/kvm` to start the install without microVMs; delete it once the server has KVM |
 | `LAZY_SMOLVM_CPUS`, `LAZY_SMOLVM_MEMORY_MIB`, `LAZY_SMOLVM_STORAGE_GIB` | no | Per-project VM size (defaults: 2 CPUs, 4096 MiB, 32 GiB) |
+| `LAZY_SMOLVM_CREATE_TIMEOUT` | no | Seconds allowed for creating a project's VM, which includes the first download of the project image (default: 600). Raise it on a slow connection |
+| `LAZY_GIT_LISTENER_PORT` | no | Loopback port of the listener project VMs reach hosted repositories through (default: one above the application's port, e.g. 3001). `off` disables it. Set it explicitly if background jobs run in a separate process from the web server |
 | `LAZY_FLEET_HOST_PATH` | no | Absolute path on this machine to keep the fleet root in, instead of the `lazy_teams_fleet` Docker volume. Compose installs only |
 | `LAZY_FLEET_ROOT` | no | Folder holding project data. Set in `docker-compose.yml` for the container install and normally not changed there |
 | `LAZY_TEAMS_STORAGE_DIR` | no | Where the application's own database files go (default: `storage/` beside the application). |
@@ -530,19 +556,43 @@ minute or so of the app coming back — there is nothing to run and nothing to
 wait for. Work that was in progress resumes on its own, keeping its
 conversation and its uncommitted changes.
 
-**On the microVM backend, an upgrade does not move existing projects to the
-new version.** A project keeps running the image its microVM was created with;
-projects created after the upgrade get the new one. The Installation page in god
-mode does not list them as out of date, because it cannot compare a VM's version
-with the application's.
+**On the microVM backend, existing projects move to the new version too**,
+automatically and within a few minutes. A project's version there is the project
+image its microVM was created from, so each project whose image differs from the
+one the install is now configured with is listed as out of date on the
+Installation page in god mode. Lazy Teams then replaces its microVM with one
+built from the new image. Nothing is lost that belongs to you:
+
+- The project's task history lives outside the microVM and is not touched.
+- The project's clone is carried across byte-for-byte. That includes every
+  task's worktree, uncommitted changes, unpushed task branches and each agent's
+  conversation.
+- A turn that was running is interrupted and resumes by itself on the new
+  version, as it does on the `local` backend.
+
+What does not carry over is anything else inside the old microVM: tools an agent
+installed outside its worktree, and the container images and task containers it
+had built. Each open task's next turn opens with a note saying its environment
+was replaced, so the agent knows to reinstall what it needs. The first turn
+afterwards also rebuilds the task container image, which takes a few minutes.
+
+Carrying the clone needs free disk on this machine roughly the size of the
+project's clone and worktrees, for the length of the replacement. If a microVM
+cannot be replaced, for example because the clone could not be saved, the old
+microVM is left exactly as it was and keeps running the old version. The project
+is then retried and named on the Installation page, as below. If no project image
+is configured, or the configured image file is missing, no project is replaced:
+the Installation page says the version could not be read.
 
 If your install predates the image-layout change, also refresh the deploy bundle from the release along with the image — see [Upgrading](#upgrading) below.
 
 If a project cannot be brought back — its data folder is unreadable, say, or
 something is holding it open — Lazy Teams retries it a few times, waiting longer
 between attempts, and then stops trying and leaves it alone rather than
-restarting it every minute. The Installation page in god mode names any project
-in that state and the project's own page says what went wrong. Deal with the
+restarting it every minute. While a project is being retried, the Installation page in god mode shows what
+the last attempt said and when the next one is due. It also says if the
+automatic restart is not running at all. The Installation page names any project
+in the given-up state too, and the project's own page says what went wrong. Deal with the
 cause, then use **Restart all project daemons** to pick it up again.
 
 ## Building from source (development)
@@ -552,14 +602,27 @@ When you are developing lazy or Lazy Teams itself, build the application image f
 ```bash
 cd lazy-teams/deploy
 ./bootstrap.sh
+docker build $(../../scripts/source-stamp-build-args.sh) -f daemon-image/Dockerfile -t lazy-daemon:local ../..
 docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
 
-This path requires the full lazy source tree (the compose build context is the repository root). Operators on a production server should use the pull-and-go flow above.
+This path requires the full lazy source tree (the compose build context is the repository root). The application image takes lazy itself from the lazy daemon image, so that is built first; set `LAZY_DAEMON_BUILD_IMAGE` to build against a different one (not `LAZY_DAEMON_IMAGE`, which chooses the image project machines boot). Operators on a production server should use the pull-and-go flow above.
 
 **Naming compose files with `-f` replaces the `COMPOSE_FILE` line in `.env`.** On a server without `/dev/kvm`, add `-f docker-compose.local-backend.yml` after `docker-compose.yml` in every such command — here and for the socket override below — or compose brings the device back and refuses to start. `bootstrap.sh` prints its commands with it already included when it chose it.
 
-The published `ghcr.io/getlazy/lazy-teams` image is multi-architecture (`linux/arm64` and `linux/amd64`); `scripts/publish-lazy-teams-image.sh --platform linux/arm64,linux/amd64 --push` builds the same thing from a checkout.
+The published `ghcr.io/getlazy/lazy-teams` image (also on Docker Hub as `docker.io/getlazy/lazy-teams`) is multi-architecture (`linux/arm64` and `linux/amd64`); `scripts/publish-lazy-teams-image.sh --platform linux/arm64,linux/amd64 --push` builds the same thing from a checkout.
+
+## Which build is running
+
+Every Lazy Teams page shows its build in the footer — version, branch, commit and
+whether it was built from a clean tree, e.g. `Lazy Teams v0.90.4100 (main@1a2b3c4, clean)`.
+The same answer is available without signing in:
+
+```bash
+curl -s https://teams.example.com/version
+```
+
+In god mode, each project's page lists the build its daemon runs next to the app's.
 
 ## Verifying the install
 
@@ -611,7 +674,7 @@ docker compose up -d
 
 If your install already has projects that were set up without microVMs, set `LAZY_FLEET_BACKEND=local` in `.env` before upgrading: an install never hands a project to a different backend than the one that set it up, and setup and the Installation page say so until the backend matches. A project set up before Lazy Teams recorded which backend made it, on a microVM backend, is refused too rather than guessed at; the refusal gives the one command that records its backend.
 
-Project data in the two volumes above is preserved. On the `local` backend your projects restart on the new version automatically, within a minute or so of the app coming up; on the microVM backend existing projects keep their version for now — see [What an upgrade does](#what-an-upgrade-does).
+Project data in the two volumes above is preserved. On the `local` backend your projects restart on the new version automatically, within a minute or so of the app coming up; on the microVM backend each project's microVM is replaced on the new image shortly after — see [What an upgrade does](#what-an-upgrade-does).
 
 Your existing `.env` is never rewritten, so two of the defaults above change under an install that predates them:
 
@@ -628,14 +691,29 @@ The lazy-teams repository ships `config/deploy.yml` and `.kamal/secrets` for tha
 
 ## Getting help
 
-If a project is stuck after install, sign in as a site administrator and use **God mode** to read daemon logs and paths. See the operator troubleshooting guide shipped with lazy-teams (`/admin/troubleshooting` when signed in as an administrator).
+If a project is stuck after install, sign in as a site administrator and use **God mode**: each project's **Logs** page shows its most recent setup attempt, the setup commands and their output, the app's log lines about it and its daemon log, with credentials redacted; **App log** on the God mode dashboard searches the whole installation's — the app's lines and every project daemon's own log, filterable by project and by source. See the operator troubleshooting guide shipped with lazy-teams (`/admin/troubleshooting` when signed in as an administrator).
+
+On the microVM backend, a project's god-mode page also has **Shell**: a terminal inside that project's microVM, opened in its repository with its daemon's environment, so `lazy` commands there talk to the project's running daemon. It is for site administrators only (not operators), it carries the daemon's credentials, leaving the page hangs up the connection, and every open is recorded in the project's logs. On the `local` backend there is no machine, and the page says so.
 
 Lazy Teams also runs `lazy doctor` against every running project once an hour. What it finds is handled one of three ways:
 
 - **Safe housekeeping is fixed automatically**: finished-task worktrees, orphaned containers, leftover upstream tracking on task branches, and conversations missing from the store. Every fix is logged. Removing stale runner images is left to an administrator, because projects on one machine share its images.
-- **Problems that affect people's work** (for example a model credential that is refused, an unreachable repository host, or low disk) are shown to the project's members as a short notice on the project page. The notice says what is affected, not how to fix it.
-- **Everything else is shown only in god mode.** Open the project and choose **Doctor** to see the full report: every check with its detail and remedy, what Lazy Teams has already fixed and who started it, a **Run doctor** button, and an **Apply** button for each remedy that doctor can perform itself. Apply first lists exactly what the remedy would touch, and acts only when you confirm.
+- **Problems that affect people's work** (for example a model credential that is refused, an unreachable repository host, or low disk) are shown to the project's members as a short notice on the project page and under the project's **Settings → Doctor**, which also says when the checks last ran (or that a recent result is not available). The notice says what is affected, not how to fix it, and when it was last checked. A project's admins also see which check failed and can press **Report this to support**, which sends the full finding to the installation's administrator. The notice then tells the admin who received it, whether support has seen it yet, and that it clears itself once the problem is fixed. In god mode, waiting reports are announced on the landing page and listed under **Support reports**, each linking to the project's doctor; **Mark as seen** lets the reporting admin know somebody looked. Reports also appear on the project's god-mode pages and in the app log. Viewed in god mode, the same notice shows the full finding, what can be done about it from Lazy Teams as a button — **Restart this project's daemon**, **Apply** for a remedy doctor can perform, or **Download support bundle** when Lazy Teams cannot fix it — plus **Check again** and an **Open doctor** link.
+- **Everything else is shown only in god mode.** Open the project and choose **Doctor** to see the full report: every check with its detail, its remedy and since when it has been reported, what Lazy Teams has already fixed and who started it, a **Run doctor** button, and an **Apply** button for each remedy that doctor can perform itself. Apply first lists exactly what the remedy would touch, and acts only when you confirm. Doctor findings are not written to the app log; the project's **Logs** page links to Doctor. Starting, restarting or retrying setup of a project runs doctor again as soon as its daemon answers, so a fixed problem disappears from the project page within a minute. The support bundle is one JSON file — the doctor report, the installed lazy version, what admins reported and the project's recent log lines — with every credential the installation holds removed; send it to the lazy team.
 
 ## Agents and credentials
 
-Once your team is running tasks, see [Agents in Lazy Teams](./lazy-teams-agents.md) for choosing Claude Code or Cursor, setting a project default agent, and connecting your Anthropic account.
+Once your team is running tasks, see [Agents in Lazy Teams](./lazy-teams-agents.md) for choosing an agent, setting a project default agent, and connecting your own credential for each agent a project offers.
+
+## Diagnosing a builder that is slow to start or fails
+
+Pressing **Start your builder** opens a page that follows the start: it says the builder is starting, moves to the builder's terminal once it is running, or shows why it could not start. The first start after an update can take a few minutes while the project prepares its container image; later starts are quick.
+
+As a site administrator in god mode you have four places to look, all keyed by the **run id** — the id in the builder's address (`…/builders/runs/<run id>`):
+
+- **The run's page** shows its latest **Start timeline**: every step with how long it took, and, for a start that failed, the step it stopped at and the error.
+- **The project's Doctor page** lists **Builder runs** — each run's state and how its last start or run ended — with **Download run report** for each.
+- **The project's Logs page**: search the run id. `Builder start: …` lines are the web app's half, `builder start [run …]` lines the project's. A start that failed before it had a run id is found by searching `builder start`.
+- **`bin/builder-run-report <run id>`**, run on the machine that runs Lazy Teams from its `lazy-teams` directory. It reads the install `bin/native-start` runs (the environment file in `~/lazy-fleet` by default; name another with `--env-file`); for a development install prefix `RAILS_ENV=development` (for the Docker install: `docker compose exec app bin/builder-run-report <run id> --out - > run.txt`), writes everything about one run into one file: the timeline, the builder's current state and output, its log lines, and what the web app recorded. Credentials are removed.
+
+A builder that stops on its own — at any point, not only while starting — has its exit code, last output and its own log recorded within a minute, and its log is kept on the project's disk, so it survives the builder and the project's machine being replaced. Once the builder is recorded as stopped, the end of that log is kept with the run and the file itself is removed. The support bundle includes the recent builder runs and the full report for the newest ones.

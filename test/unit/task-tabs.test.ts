@@ -1,12 +1,12 @@
 /**
  * The task-page tab slug set is closed and disjoint from the non-tab
- * sub-routes, so a future `/tasks/:id/artifacts` cannot quietly become a tab
+ * sub-routes, so a new first segment cannot quietly become a tab
  * and a tab cannot shadow `edit` / `actions` / `prompts`.
  *
  * INVARIANT: the tabs under `/tasks/:id` are Landing (bare path) plus
  * the slugs in TASK_TAB_SLUGS (Changes … Current review). The reserved
  * non-tab first segments are TASK_NON_TAB_SEGMENTS. `turns`, `shell`,
- * `commits` and `comments` are shared on purpose (index + leaf) and are
+ * `commits`, `comments` and `artifacts` are shared on purpose (index + leaf) and are
  * therefore tabs, not in the non-tab-segment list.
  */
 
@@ -40,6 +40,7 @@ describe('task tab slug set', () => {
       'raised',
       'comments',
       'journal',
+      'artifacts',
       'stats',
       'shell',
       'services',
@@ -50,7 +51,7 @@ describe('task tab slug set', () => {
   test('Landing is the bare path and is first in reading order', () => {
     expect(TASK_TAB_ORDER[0]).toBe('landing');
     expect(TASK_TAB_ORDER[TASK_TAB_ORDER.length - 1]).toBe('review');
-    expect(TASK_TAB_ORDER).toHaveLength(15);
+    expect(TASK_TAB_ORDER).toHaveLength(16);
     // INVARIANT: Regions comes before Changes, and Verify before both.
     // That is the reading order for a large branch — what was I asked to
     // check, what units of work are in here, then the diff itself. Regions
@@ -98,6 +99,8 @@ describe('task tab slug set', () => {
       'container/state',
       'comments/add',
       'comments/:commentId/edit',
+      'artifacts/file',
+      'artifacts/upload',
       'shell/ws',
       'watch/ws',
       'live-status',
@@ -120,7 +123,8 @@ describe('task tab slug set', () => {
     expect(parseTaskTabSegment('commits')).toBe('commits');
     expect(parseTaskTabSegment('review')).toBe('review');
     expect(parseTaskTabSegment('edit')).toBeNull();
-    expect(parseTaskTabSegment('artifacts')).toBeNull();
+    expect(parseTaskTabSegment('artifacts')).toBe('artifacts');
+    expect(parseTaskTabSegment('nonsense')).toBeNull();
   });
 
   test('digit keys are 1–9; Services, Reviews, Commits, Comments, Journal and Stats have none; Current review is 9', () => {
@@ -138,6 +142,7 @@ describe('task tab slug set', () => {
     expect(TASK_TAB_KEY_INDEX.comments).toBeUndefined();
     expect(TASK_TAB_KEY_INDEX.journal).toBeUndefined();
     expect(TASK_TAB_KEY_INDEX.stats).toBeUndefined();
+    expect(TASK_TAB_KEY_INDEX.artifacts).toBeUndefined();
     expect(Object.keys(TASK_TAB_KEY_INDEX)).toHaveLength(9);
   });
 });

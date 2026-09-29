@@ -4,15 +4,16 @@
  *
  * WHY A CLOSED SET
  * `/tasks/:id/<slug>` is both a tab and a place later leaves nest
- * (`/turns/3`, `/shell/ws`). A future `/tasks/:id/artifacts` must not quietly
+ * (`/turns/3`, `/shell/ws`). A new first segment must not quietly
  * become a tab, and a tab slug must not collide with a non-tab first segment
  * (`edit`, `actions`, `prompts`, …). The unit test in
  * `test/unit/task-tabs.test.ts` pins both: the slug list is this array, and
  * it is disjoint from the reserved non-tab first segments.
  *
- * `turns`, `shell`, `commits` and `comments` appear as tabs that also host a
- * leaf (`/turns/:seq`, `/shell/ws`, `/commits/:id`, `/comments/add`). The
- * disjoint check is on first segments that are ONLY leaves — those four are
+ * `turns`, `shell`, `commits`, `comments` and `artifacts` appear as tabs that
+ * also host a leaf (`/turns/:seq`, `/shell/ws`, `/commits/:id`,
+ * `/comments/add`, `/artifacts/file`). The
+ * disjoint check is on first segments that are ONLY leaves — those five are
  * tabs, not in TASK_NON_TAB_SEGMENTS.
  *
  * Landing has no slug: it is the bare `/tasks/:id`.
@@ -34,6 +35,7 @@ export const TASK_TAB_SLUGS = [
   'raised',
   'comments',
   'journal',
+  'artifacts',
   'stats',
   'shell',
   'services',
@@ -48,8 +50,9 @@ export type TaskTabId = 'landing' | TaskTabSlug;
 /**
  * First path segments under `/tasks/:id/` that are NOT tabs.
  *
- * `turns`, `shell`, `commits` and `comments` are omitted: they are tabs that
- * also host a leaf (`turns/:seq`, `shell/ws`, `commits/:id`, `comments/add`).
+ * `turns`, `shell`, `commits`, `comments` and `artifacts` are omitted: they
+ * are tabs that also host a leaf (`turns/:seq`, `shell/ws`, `commits/:id`,
+ * `comments/add`, `artifacts/file`).
  */
 export const TASK_NON_TAB_SEGMENTS = [
   'edit',
@@ -79,6 +82,8 @@ export const TASK_NON_TAB_ROUTES = [
   'container/state',
   'comments/add',
   'comments/:commentId/edit',
+  'artifacts/file',
+  'artifacts/upload',
   'shell/ws',
   'watch/ws',
   'live-status',
@@ -168,6 +173,7 @@ const TAB_LABELS: Record<TaskTabId, string> = {
   raised: 'Raised',
   comments: 'Comments',
   journal: 'Journal',
+  artifacts: 'Artifacts',
   stats: 'Stats',
   shell: 'Shell',
   services: 'Services',
@@ -183,8 +189,8 @@ const TAB_LABELS: Record<TaskTabId, string> = {
  * the diff itself (Changes). Regions used to be a strip buried at the top of
  * Changes, which put the map after the territory.
  *
- * Fifteen tabs, nine digit keys (1–9). Services, Reviews, Commits, Comments,
- * Journal and Stats have no number — less visited than Shell / Current review,
+ * Sixteen tabs, nine digit keys (1–9). Services, Reviews, Commits, Comments,
+ * Journal, Artifacts and Stats have no number — less visited than Shell / Current review,
  * and `[` / `]` still reach them. Keys stay stable when Shell is hidden (its
  * index is reserved).
  *
@@ -204,6 +210,7 @@ export const TASK_TAB_ORDER: readonly TaskTabId[] = [
   'raised',
   'comments',
   'journal',
+  'artifacts',
   'stats',
   'shell',
   'services',
@@ -213,7 +220,7 @@ export const TASK_TAB_ORDER: readonly TaskTabId[] = [
 /**
  * Digit-key index (0 → key "1", …, 8 → key "9") for each tab that has one.
  *
- * Services, Reviews, Commits, Comments, Journal and Stats are omitted on
+ * Services, Reviews, Commits, Comments, Journal, Artifacts and Stats are omitted on
  * purpose — see TASK_TAB_ORDER. Commits lost its number when Regions gained
  * one: there are nine digits and more tabs than that, and a per-commit list is
  * the one a reviewer reaches for least often.

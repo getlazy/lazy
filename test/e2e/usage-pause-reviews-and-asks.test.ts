@@ -29,7 +29,7 @@ import { writeFileSync } from 'fs';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask } from '../helpers/fixtures';
 import { expectSuccess } from '../helpers/assertions';
-import { launchAsPerson, setUsagePauseOverrideRpc } from '../helpers/usage-pause';
+import { allowTaskRpc, launchAsPerson, setUsagePauseOverrideRpc } from '../helpers/usage-pause';
 import { sessionStartEvent, resultEvent, type ClaudeScenario } from '../helpers/fake-claude';
 import {
   findFullTaskId,
@@ -285,15 +285,14 @@ describe('usage pause: reviews, asks and syncs', () => {
     const turnsBefore = readTurns(ctx.root, taskId).length;
     const invocationsBefore = (await ctx.claudeInvocations()).length;
 
-    // A person's launch: a test's CLI has no terminal, so its refusal would not
-    // name the override (test/helpers/usage-pause.ts, launchAsPerson).
+    // A person's launch: the refusal names this task's own way through.
     const review = await launchAsPerson(ctx, 'reviewTask', { taskId: findFullTaskId(ctx.root, taskId) });
     expect(review.exitCode).not.toBe(0);
     const reviewOut = review.stderr + review.stdout;
     expect(reviewOut).toContain('was not reviewed');
     expect(reviewOut).toContain('paused');
     expect(reviewOut).toContain('97%');
-    expect(reviewOut).toContain('usage_pause_threshold');
+    expect(reviewOut).toContain('--past-usage-pause');
 
     // The CLI refuses before the question is typed…
     const ask = await ctx.lazy(['ask', taskId, '-m', 'why this way?']);
@@ -315,14 +314,12 @@ describe('usage pause: reviews, asks and syncs', () => {
     expect(await readTaskStatus(ctx.root, taskId)).toBe('blocked');
     expect((await ctx.claudeInvocations()).length).toBe(invocationsBefore);
 
-    // The override lets ONE review through, and is then gone.
+    // The task's allowance lets ONE review through, and is then gone.
     await ctx.setClaudeScenario(proxiedTurn('reviewer-1', CLEAN_REPORT));
-    await setUsagePauseOverrideRpc(ctx, 'off');
-    // A person's launch: a test's CLI has no terminal, so it could never take
-    // the override (test/helpers/usage-pause.ts, launchAsPerson).
+    await allowTaskRpc(ctx, findFullTaskId(ctx.root, taskId), 'human');
     expectSuccess(await launchAsPerson(ctx, 'reviewTask', { taskId: findFullTaskId(ctx.root, taskId) }));
     expect(ranReviews(ctx, taskId).length).toBeGreaterThan(0);
-    expect((await ctx.lazy(['daemon', 'config', 'get'])).stdout).not.toContain('One-shot override');
+    expect((await ctx.lazy(['daemon', 'config', 'get'])).stdout).not.toContain('Let through:');
     const again = await launchAsPerson(ctx, 'reviewTask', { taskId: findFullTaskId(ctx.root, taskId) });
     expect(again.exitCode).not.toBe(0);
     expect(again.stderr + again.stdout).toContain('was not reviewed');

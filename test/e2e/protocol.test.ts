@@ -157,10 +157,10 @@ describe('protocol I/O', () => {
     const completed = read as CompletedResponse;
     expect(completed.result).toBe('I fixed the bug and committed the changes.');
     expect(completed.session_id).toBe('claude-sess-abc');
-    expect(completed.usage.input_tokens).toBe(500);
-    expect(completed.usage.output_tokens).toBe(1000);
-    expect(completed.usage.cache_creation_input_tokens).toBe(50);
-    expect(completed.usage.cache_read_input_tokens).toBe(200);
+    expect(completed.usage!.input_tokens).toBe(500);
+    expect(completed.usage!.output_tokens).toBe(1000);
+    expect(completed.usage!.cache_creation_input_tokens).toBe(50);
+    expect(completed.usage!.cache_read_input_tokens).toBe(200);
   });
 
   test('writeResponse / readResponse round-trip for error response', () => {

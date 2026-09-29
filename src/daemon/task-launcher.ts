@@ -18,6 +18,7 @@
  * daemon code — it causes deadlocks and storage lock contention.
  */
 
+import { ensureLazyExcludeBestEffort } from '../git/lazy-exclude';
 import { actorRole } from '../actor-ref';
 import type { ReviewSettingsOverrides } from '../review/mode';
 
@@ -34,6 +35,7 @@ import { resolveTurnLaunchIdentity } from './launch-identity';
 import { resolveAgentChattiness, renderChattinessSnippet } from '../config/chattiness';
 import { createRunner } from '../runner';
 import { stampSessionRunner, removeTaskRun, mustRecreateForContainerAgent } from '../runner/session-launch';
+import { mustRecreateForTaskEnv } from './task-env';
 import { pinnedCustomImage } from '../docker/worktree-image';
 import { createDriver, resolveUpstreamMergeRef } from '../remote';
 import { autoPushEnabled, autoPushConfigKey } from '../remote/auto-push';
@@ -59,6 +61,7 @@ import { buildMemorySection } from '../memory';
 import { buildLazyMdSection } from '../task/lazy-md';
 import { checkOrphanedChild, retargetOrphanedChild } from '../task/orphan';
 import { typeConstraintsSection } from '../task/type-constraints';
+import { recordRecreationIfRunning, recreationReason, environmentReplacedPrefix, clearEnvironmentReplaced } from '../task/environment-replaced';
 import { pinnedBaseOf } from '../task/base-pin';
 import { parentTaskIdOf, branchTarget } from '../task-target';
 import { isLinkedTask as isLinkedTaskFn } from '../task/linked';
@@ -1007,6 +1010,7 @@ async function launchTaskRun(
           { cwd: projectRoot },
         );
         if (existing.exitCode === 0) {
+          await ensureLazyExcludeBestEffort(projectRoot);
           const added = await runGit(['worktree', 'add', worktreePath, branchName], { cwd: projectRoot });
           if (added.exitCode !== 0) {
             throw new Error(`git worktree add ${branchName} failed: ${added.stderr}`);
@@ -1337,11 +1341,28 @@ async function launchTaskRun(
     // start result reports it; the publish above used the parent's own name.
     if (parentBranch) parentBranch = upstreamMergeRef;
 
+    // A start can find a container left from an earlier run of this task (a
+    // restart after a stop); replacing it is told to this turn, and a replacement
+    // recorded earlier rides it too. See src/task/environment-replaced.ts.
+    // `lazy env set` since this container was created: env is fixed at create.
+    const mustRecreateForEnv = await mustRecreateForTaskEnv(projectRoot, t.id, containerName);
+    await recordRecreationIfRunning(
+      storage,
+      t.id,
+      recreationReason(
+        credentialPlan.mode === 'session' && credentialPlan.kindChanged,
+        mustRecreateForContainerAgent(sess, t.agent_id),
+        mustRecreateForEnv,
+      ),
+      runner, containerName,
+    );
+    const envNotice = await environmentReplacedPrefix(storage, t.id);
+
     const startCommand: StartCommand = {
       type: 'start',
       task_id: t.id,
       goal: t.goal,
-      prompt: fullPrompt,
+      prompt: envNotice + fullPrompt,
       agent_id: t.agent_id,
       harness,
       system_prompt: systemPrompt,
@@ -1382,7 +1403,11 @@ async function launchTaskRun(
       );
     }
 
-    if (!mustRecreateForCredential && !mustRecreateForAgent && (await runner.isRunning(containerName))) {
+    if (mustRecreateForEnv) {
+      logger.info(`[${tRef}] Recreating container: task environment changed (lazy env) — launch env is fixed at create time`);
+    }
+
+    if (!mustRecreateForCredential && !mustRecreateForAgent && !mustRecreateForEnv && (await runner.isRunning(containerName))) {
       // Supervisor already running — it will pick up the new command
       phases.note(`reusing running container ${containerName}`);
     } else {
@@ -1406,6 +1431,7 @@ async function launchTaskRun(
         throw new RpcError(500, `Failed to launch supervisor: ${err instanceof Error ? err.message : err}`);
       }
     }
+    if (envNotice) await clearEnvironmentReplaced(storage, t.id);
 
     // Store container name
     await storage.updateSessionContainerName(sess.id, containerName, t.agent_id);

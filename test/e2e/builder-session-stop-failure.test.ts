@@ -9,33 +9,26 @@
  * `state === 'ended'`, and nothing can reach the container through lazy
  * again.
  *
- * Needs a REAL out-of-process daemon (`setupTestLazy({ withDaemon: true })`),
- * for two independent reasons discovered while writing this suite:
- *
- *  - `isRunning` reaches `isContainerRunning` from `src/capture/claude.ts`,
- *    which the e2e module mock (`test/mocks/claude.ts`, loaded via
- *    `--preload` for every `withDaemon` daemon) REPLACES: the mock's version
- *    ignores the real docker binary entirely and instead reports "running"
- *    based on the mere EXISTENCE of a file named by
- *    `LAZY_MOCK_RUNNING_CONTAINERS` (test/mocks/claude.ts's own doc comment).
- *    So the "is it running" half of this test is driven by that marker file,
- *    not a fake `docker ps`.
- *  - `stopRun` (`DockerRunner.stopRun`, docker-runner.ts) is NOT part of that
- *    mock's replaced surface — it is a real method that really shells out —
- *    so the "does the stop fail" half needs a real fake `docker` binary on
- *    PATH. That only works if the daemon PROCESS itself is started with that
- *    PATH baked into its own environment at spawn time: `Bun.spawn` does not
- *    pick up a live mutation of `process.env.PATH` made after a process
- *    starts (confirmed empirically — an in-process daemon's spawn calls kept
- *    resolving the ambient `docker` lookup, never a PATH-mutated one).
- *    `daemonEnv` gives the child daemon process that PATH from birth.
+ * Needs a REAL out-of-process daemon with NOTHING in `src/` mocked
+ * (`setupTestLazy({ fakeClaude: true })`, which starts the daemon without the
+ * module-mock preload). The end path decides "is it running" with a real
+ * `docker inspect` (`probeContainerInfo` via `DockerRunner.probeRunInfo`), and
+ * the module mock (`test/mocks/claude.ts`) replaces that function wholesale —
+ * under it the probe never reaches any binary, so a mocked daemon cannot
+ * express "running, and the stop fails". Both halves are therefore scripted
+ * with the fake `docker` binary (`test/helpers/fake-docker.ts`): a seeded
+ * running container answers `inspect`, and `failStops()` makes `stop` refuse.
+ * The binary reaches the daemon through the PATH it is (re)started with —
+ * `Bun.spawn` does not pick up a live mutation of `process.env.PATH` made
+ * after a process starts.
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { mkdtemp, writeFile, chmod, rm } from 'fs/promises';
+import { mkdtemp, readFile, writeFile, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
+import { installFakeDocker, type FakeDocker } from '../helpers/fake-docker';
 import { getDaemonTcpTarget, readToken } from '../../src/daemon/lifecycle';
 import { DaemonClient, RpcApplicationError } from '../../src/daemon/client';
 import { RemoteStorage } from '../../src/storage/remote-storage';
@@ -44,35 +37,28 @@ const CONTAINER_NAME = 'lazy-builder-5709fa11';
 
 describe('endBuilderSession: a genuinely failed stop is not reported as success', () => {
   let ctx: TestContext;
-  let fakeBinDir: string;
-  let runningMarker: string;
+  let fakeDir: string;
+  let docker: FakeDocker;
   let target: string;
   let token: string;
 
   beforeEach(async () => {
-    fakeBinDir = await mkdtemp(join(tmpdir(), 'lazy-fake-docker-'));
-    runningMarker = join(fakeBinDir, 'running-containers-marker');
+    fakeDir = await mkdtemp(join(tmpdir(), 'lazy-fake-docker-'));
+    docker = await installFakeDocker(fakeDir);
 
-    // Only `stop` needs to be scripted — `isRunning` is answered by the
-    // module mock via LAZY_MOCK_RUNNING_CONTAINERS (see the header comment).
-    // `docker stop --time ...` -> exit 1: the stop genuinely fails.
-    // Anything else -> exit 0, so unrelated docker calls do not blow up.
-    const script = `#!/bin/sh
-case "$*" in
-  *"stop --time"*) exit 1 ;;
-  *) exit 0 ;;
-esac
-`;
-    await writeFile(join(fakeBinDir, 'docker'), script);
-    await chmod(join(fakeBinDir, 'docker'), 0o755);
+    ctx = await setupTestLazy({ fakeClaude: true });
+    // fakeClaude switches the project to the host-process runner; a builder
+    // session's container is the docker runner's, so put that back.
+    const configPath = join(ctx.root, 'lazy.toml');
+    const before = await readFile(configPath, 'utf-8');
+    const patched = before.replace(
+      'type = "dangerously-host-process-without-any-isolation"',
+      'type = "docker"',
+    );
+    if (patched === before) throw new Error('could not restore [runner] type = "docker" in the generated lazy.toml');
+    await writeFile(configPath, patched);
+    await ctx.restartDaemon({ PATH: `${docker.binDir}:${process.env.PATH ?? ''}` });
 
-    ctx = await setupTestLazy({
-      withDaemon: true,
-      daemonEnv: {
-        PATH: `${fakeBinDir}:${process.env.PATH ?? ''}`,
-        LAZY_MOCK_RUNNING_CONTAINERS: runningMarker,
-      },
-    });
     const resolvedTarget = getDaemonTcpTarget(ctx.root);
     const resolvedToken = readToken(ctx.root);
     if (!resolvedTarget || !resolvedToken) throw new Error('test daemon did not record a TCP target and token');
@@ -82,7 +68,7 @@ esac
 
   afterEach(async () => {
     await ctx.cleanup();
-    await rm(fakeBinDir, { recursive: true, force: true });
+    await rm(fakeDir, { recursive: true, force: true });
   });
 
   function client() {
@@ -104,8 +90,9 @@ esac
   }
 
   test('a failed stop is reported as an error, and the session is NOT marked ended', async () => {
-    // The marker file's mere existence is what the mocked isRunning() checks.
-    await writeFile(runningMarker, '');
+    // The runtime says the container is up, and refuses to stop it.
+    await docker.seedContainer(CONTAINER_NAME, { state: 'running', project: ctx.root });
+    await docker.failStops();
 
     const now = new Date().toISOString();
     await storage().createBuilderSession({
@@ -125,6 +112,9 @@ esac
     const { status, body } = await rpcStatus('endBuilderSession', { id: 'sess-5709fa11' });
     expect(status).toBe(502);
     expect((body as { error?: string }).error ?? '').toContain('could not stop container');
+    // The refusal is the STOP's, not an unanswered liveness probe's.
+    expect((body as { error?: string }).error ?? '').toContain('refused or could not reach');
+    expect((await docker.invocations()).some(line => line.startsWith('stop ') && line.includes(CONTAINER_NAME))).toBe(true);
 
     const after = await storage().getBuilderSession('sess-5709fa11');
     expect(after?.state).toBe('running');
@@ -133,7 +123,7 @@ esac
 
   // Contrast case: a container that is genuinely already gone (never started,
   // or reaped earlier) IS a successful end — this is not "always refuse".
-  // No running-marker file is written, so the mocked isRunning() reports false.
+  // No container is seeded, so `docker inspect` answers "No such container".
   test('a container that is already gone still ends successfully', async () => {
     const now = new Date().toISOString();
     await storage().createBuilderSession({

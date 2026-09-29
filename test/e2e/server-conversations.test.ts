@@ -97,10 +97,10 @@ describe('web builder conversations', () => {
   });
 
   test('an empty store says so rather than rendering a blank table', async () => {
-    const res = await fetch(`${base}/conversations`);
+    const res = await fetch(`${base}/builders`);
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).toContain('No builder conversations yet');
+    expect(html).toContain('No Builders yet');
   });
 
   test('the listing shows captured conversations newest first', async () => {
@@ -115,8 +115,8 @@ describe('web builder conversations', () => {
       startedAt: '2026-08-30T09:00:00.000Z',
     }));
 
-    const html = await (await fetch(`${base}/conversations`)).text();
-    expect(html).toContain('2 conversations');
+    const html = await (await fetch(`${base}/builders`)).text();
+    expect(html).toContain('2 Builders');
     expect(html).toContain('Older: how do I reparent a task?');
     expect(html).toContain('Newer: what is left for the release?');
     // Short ids are what the listing shows, and what the detail route accepts.
@@ -127,7 +127,7 @@ describe('web builder conversations', () => {
 
   test('a conversation with no summary is titled rather than left blank', async () => {
     writeConversationFile(ctx.root, seedConversation({ summary: '   ' }));
-    const html = await (await fetch(`${base}/conversations`)).text();
+    const html = await (await fetch(`${base}/builders`)).text();
     expect(html).toContain('(no summary)');
   });
 
@@ -141,7 +141,7 @@ describe('web builder conversations', () => {
       ],
     }));
 
-    const html = await (await fetch(`${base}/conversations/${sessionId}`)).text();
+    const html = await (await fetch(`${base}/builders/${sessionId}`)).text();
     expect(html).toContain('Which tasks are blocked?');
     expect(html).toContain('Two of them.');
     // The stored roles are user/assistant; the page speaks the human's terms.
@@ -157,11 +157,11 @@ describe('web builder conversations', () => {
       summary: 'Resolvable by prefix',
     }));
 
-    const short = await fetch(`${base}/conversations/dddddddd`);
+    const short = await fetch(`${base}/builders/dddddddd`);
     expect(short.status).toBe(200);
     expect(await short.text()).toContain('Resolvable by prefix');
 
-    const missing = await fetch(`${base}/conversations/zzzzzzzz`);
+    const missing = await fetch(`${base}/builders/zzzzzzzz`);
     expect(missing.status).toBe(404);
   });
 
@@ -179,7 +179,7 @@ describe('web builder conversations', () => {
       summary: 'Second collision',
     }));
 
-    const res = await fetch(`${base}/conversations/eeeeeeee`);
+    const res = await fetch(`${base}/builders/eeeeeeee`);
     expect(res.status).toBe(404);
     const html = await res.text();
     expect(html).toContain('more than one');
@@ -194,7 +194,7 @@ describe('web builder conversations', () => {
     }
     writeConversationFile(ctx.root, seedConversation({ sessionId, messages }));
 
-    const first = await (await fetch(`${base}/conversations/${sessionId}`)).text();
+    const first = await (await fetch(`${base}/builders/${sessionId}`)).text();
     expect(first).toContain('Showing 1&ndash;40 of 45');
     expect(first).toContain('message-body-0');
     expect(first).toContain('message-body-39');
@@ -203,7 +203,7 @@ describe('web builder conversations', () => {
     // Nothing to go back to on the first page.
     expect(first).not.toContain('Earlier');
 
-    const second = await (await fetch(`${base}/conversations/${sessionId}?offset=40`)).text();
+    const second = await (await fetch(`${base}/builders/${sessionId}?offset=40`)).text();
     expect(second).toContain('Showing 41&ndash;45 of 45');
     expect(second).toContain('message-body-40');
     expect(second).toContain('message-body-44');
@@ -222,7 +222,7 @@ describe('web builder conversations', () => {
       ],
     }));
 
-    const res = await fetch(`${base}/conversations/${sessionId}?offset=9999`);
+    const res = await fetch(`${base}/builders/${sessionId}?offset=9999`);
     expect(res.status).toBe(200);
     expect(await res.text()).toContain('only-answer');
   });
@@ -242,18 +242,18 @@ describe('web builder conversations', () => {
       messages: [{ role: 'user', text: 'Nothing to do with the topic.' }],
     }));
 
-    const html = await (await fetch(`${base}/conversations?q=resurrection`)).text();
-    expect(html).toContain('1 conversation matched');
+    const html = await (await fetch(`${base}/builders?q=resurrection`)).text();
+    expect(html).toContain('1 Builder matched');
     expect(html).toContain('Release endgame');
     expect(html).toContain('resurrection guard');
     expect(html).not.toContain('Unrelated chatter');
-    expect(html).toContain('/conversations/aa000000-9999-4999-8999-999999999999');
+    expect(html).toContain('/builders/aa000000-9999-4999-8999-999999999999');
   });
 
   test('a search with no hits says so instead of showing the full list', async () => {
     writeConversationFile(ctx.root, seedConversation({ summary: 'Release endgame' }));
-    const html = await (await fetch(`${base}/conversations?q=nothingmatchesthis`)).text();
-    expect(html).toContain('No conversation mentions');
+    const html = await (await fetch(`${base}/builders?q=nothingmatchesthis`)).text();
+    expect(html).toContain('No Builder mentions');
     expect(html).not.toContain('Release endgame');
   });
 
@@ -261,7 +261,7 @@ describe('web builder conversations', () => {
   // the page must name the problem and keep the box filled in, never 500.
   test('an unusable search pattern is reported, not thrown', async () => {
     writeConversationFile(ctx.root, seedConversation({}));
-    const res = await fetch(`${base}/conversations?q=${encodeURIComponent('[unclosed')}`);
+    const res = await fetch(`${base}/builders?q=${encodeURIComponent('[unclosed')}`);
     expect(res.status).toBe(400);
     const html = await res.text();
     expect(html).toContain('Invalid search pattern');
@@ -282,8 +282,8 @@ describe('web builder conversations', () => {
       messages: [{ role: 'user', text: `${'a'.repeat(80)}!` }],
     }));
 
-    const evil = fetch(`${base}/conversations?q=${encodeURIComponent('a*a*a*a*a*a*a*$')}`);
-    const listing = await fetch(`${base}/conversations`);
+    const evil = fetch(`${base}/builders?q=${encodeURIComponent('a*a*a*a*a*a*a*$')}`);
+    const listing = await fetch(`${base}/builders`);
     expect(listing.status).toBe(200);
     expect(await listing.text()).toContain('Listing still reachable');
 
@@ -331,7 +331,7 @@ describe('web builder conversations', () => {
     const indexPath = join(storageDirFor(ctx.root), 'conversations-index.json');
     expect(existsSync(indexPath)).toBe(false);
 
-    const html = await (await fetch(`${base}/conversations`)).text();
+    const html = await (await fetch(`${base}/builders`)).text();
     expect(html).toContain('Listing title only');
     expect(html).not.toContain('secret-transcript-body-must-not-enter-index');
 
@@ -340,7 +340,7 @@ describe('web builder conversations', () => {
       version: number;
       entries: Array<{ sessionId: string; summary: string }>;
     };
-    expect(index.version).toBe(1);
+    expect(index.version).toBe(2);
     expect(index.entries).toHaveLength(1);
     expect(index.entries[0].sessionId).toBe('dd000000-cccc-4ccc-8ccc-cccccccccccc');
     expect(index.entries[0].summary).toBe('Listing title only');
@@ -353,13 +353,13 @@ describe('web builder conversations', () => {
       sessionId,
       summary: 'Original title',
     }));
-    await fetch(`${base}/conversations`);
+    await fetch(`${base}/builders`);
 
     writeConversationFile(ctx.root, seedConversation({
       sessionId,
       summary: 'Edited on disk',
     }));
-    const html = await (await fetch(`${base}/conversations`)).text();
+    const html = await (await fetch(`${base}/builders`)).text();
     expect(html).toContain('Edited on disk');
     expect(html).not.toContain('Original title');
   });
@@ -367,7 +367,7 @@ describe('web builder conversations', () => {
   // INVARIANT: this surface is read-only. Conversations reach the store only
   // through the capture pipeline; the web layer must never become a writer.
   test('the surface refuses writes', async () => {
-    const res = await fetch(`${base}/conversations`, { method: 'POST' });
+    const res = await fetch(`${base}/builders`, { method: 'POST' });
     expect(res.status).toBe(405);
   });
 
@@ -391,7 +391,7 @@ describe('web builder conversations', () => {
     }
 
     async function promote(form: Record<string, string>): Promise<Response> {
-      return await fetch(`${base}/conversations/${sessionId}/promote`, {
+      return await fetch(`${base}/builders/${sessionId}/promote`, {
         method: 'POST',
         headers: { 'content-type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams(form).toString(),
@@ -401,7 +401,7 @@ describe('web builder conversations', () => {
 
     test('a selected range seeds the form with those messages, and nothing else', async () => {
       seedDecision();
-      const html = await (await fetch(`${base}/conversations/${sessionId}?from=3&to=4`)).text();
+      const html = await (await fetch(`${base}/builders/${sessionId}?from=3&to=4`)).text();
       expect(html).toContain('Promote messages 3–4 of 4');
       // The seed is the selected exchange verbatim, with provenance.
       expect(html).toContain('should rotate instead of growing forever');
@@ -413,7 +413,7 @@ describe('web builder conversations', () => {
 
     test('with nothing selected the page asks for a range rather than offering the lot', async () => {
       seedDecision();
-      const html = await (await fetch(`${base}/conversations/${sessionId}`)).text();
+      const html = await (await fetch(`${base}/builders/${sessionId}`)).text();
       expect(html).toContain('Start here');
       expect(html).toContain('Pick the exchange the task should come from');
       expect(html).not.toContain('Create backlog task');
@@ -431,7 +431,7 @@ describe('web builder conversations', () => {
       expect(res.status).toBe(303);
       expect(res.headers.get('location')).toContain('promoted=rotate-proxy-audit-log');
 
-      const html = await (await fetch(`${base}/conversations/${sessionId}`)).text();
+      const html = await (await fetch(`${base}/builders/${sessionId}`)).text();
       expect(html).toContain('Already promoted');
       expect(html).toContain('rotate-proxy-audit-log');
       expect(html).toContain('Messages 3–4');
@@ -456,7 +456,7 @@ describe('web builder conversations', () => {
       seedDecision();
       expect((await promote({ from: '3', to: '4', code: 'rotate-proxy-audit-log' })).status).toBe(303);
 
-      const html = await (await fetch(`${base}/conversations/${sessionId}?from=4&to=4`)).text();
+      const html = await (await fetch(`${base}/builders/${sessionId}?from=4&to=4`)).text();
       expect(html).toContain('overlap');
       expect(html).toContain('rotate-proxy-audit-log');
       expect(html).toContain('Create backlog task');
@@ -472,8 +472,18 @@ describe('web builder conversations', () => {
     });
   });
 
-  test('every page links to conversations from the nav', async () => {
+  test('every page links to Builders from the nav', async () => {
     const html = await (await fetch(`${base}/tasks`)).text();
-    expect(html).toContain('href="/conversations"');
+    expect(html).toContain('href="/builders"');
+    expect(html).toContain('>Builders<');
+  });
+
+  // INVARIANT: /conversations is the old name of the Builders pages. Every
+  // link to it (bookmarks, Teams, older scratch pages) keeps working by
+  // redirecting to the same page under /builders, query string included.
+  test('old /conversations links redirect to /builders', async () => {
+    const res = await fetch(`${base}/conversations/abc?offset=3`, { redirect: 'manual' });
+    expect(res.status).toBe(301);
+    expect(res.headers.get('location')).toEndWith('/builders/abc?offset=3');
   });
 });

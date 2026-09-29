@@ -295,7 +295,7 @@ export function proxyAuditHeaderEnv(hints: ProxyAuditHints | undefined): AuthEnv
  * Credentials a profile whose `credential` is `none` uses in place of a real one.
  *
  * A model server on this machine ignores auth entirely, and such a profile is
- * the documented escape hatch from the daemon's credential gate — so it must
+ * the documented way to need no credential at all — so it must
  * never need the user's real credential to launch. A single slot is emitted (not
  * the two lazy used to set) because the launch path swaps this value for a
  * per-launch PLACEHOLDER, and one placeholder per launch is one grant per
@@ -307,10 +307,67 @@ export const LOCAL_BACKEND_CREDS: AuthEnvVar[] = [
 ];
 
 /**
+ * What an Anthropic-wire launch (claude-code, pi) carries in TEAM MODE when its
+ * profile is paid by a member's credential through the proxy rather than by the
+ * owner's session placeholder: a stand-in the launch swaps for a per-launch
+ * PLACEHOLDER like any other. The grant that placeholder proves names the task
+ * and the profile, which is everything the proxy needs to route the request to
+ * the profile's upstream and pay it with the turn principal's own credential
+ * for that profile (resolveMemberCredential, src/proxy/credential-deps.ts). It
+ * is never a secret and never reaches an upstream: the proxy replaces it, or
+ * strips it for a profile that takes no credential.
+ */
+export const MEMBER_PAID_CREDS: AuthEnvVar[] = [
+  { key: 'ANTHROPIC_AUTH_TOKEN', value: 'lazy-member-credential' },
+];
+
+/**
+ * In team mode, does this Anthropic-wire launch ride the owner's SESSION
+ * placeholder (the proxy swaps in their Claude credential and forwards to the
+ * primary upstream), rather than a grant paid per profile? Only a profile that
+ * bills `anthropic` with no endpoint of its own: every other profile must be
+ * ROUTED to its own upstream, which only a grant can ask for.
+ */
+export function teamSessionPathTarget(target: Pick<RoleTarget, 'credential' | 'endpoint'>): boolean {
+  return target.credential === 'anthropic' && target.endpoint === '';
+}
+
+/**
+ * What a TEAM-MODE launch carries for its Anthropic env, given the turn's
+ * session placeholders: the one rule, shared by the initial launch
+ * (`getLaunchAuthEnvVars`) and the in-container relaunch refresh
+ * (`handleGetAgentLaunchEnv`) so a refreshed agent is paid exactly the way the
+ * launch was.
+ *
+ *   - claude-code / pi on the primary Anthropic profile → the session
+ *     placeholders themselves, passed through unchanged (the owner's Claude
+ *     credential);
+ *   - claude-code / pi on any other profile → {@link MEMBER_PAID_CREDS}, which
+ *     the caller placeholderizes into a grant the proxy resolves to the turn
+ *     principal's credential for the profile;
+ *   - any other harness (codex, cursor) → NOTHING. The session placeholder
+ *     resolves to the owner's CLAUDE credential and no part of such a turn
+ *     uses it — its merge phase runs the task's own harness
+ *     (src/supervisor/merge.ts) — so handing it over would only let a codex or
+ *     cursor agent spend the member's Anthropic account.
+ *
+ * Neither the daemon's own credential nor the project's store is read: in team
+ * mode neither pays for a turn.
+ */
+export function teamModeLaunchCreds(
+  target: Pick<RoleTarget, 'harness' | 'credential' | 'endpoint'>,
+  sessionCreds: AuthEnvVar[],
+): AuthEnvVar[] {
+  const anthropicHarness = target.harness === 'claude-code' || target.harness === 'pi';
+  if (!anthropicHarness) return [];
+  return teamSessionPathTarget(target) ? sessionCreds : MEMBER_PAID_CREDS;
+}
+
+/**
  * True when this profile's launch carries no real secret at all.
  *
- * The `none` credential slot is the documented escape hatch from the daemon's
- * credential gate: a project whose profiles all point at local model servers has
+ * The `none` credential slot is the documented way to need no credential: a
+ * project whose profiles all point at local model servers has
  * no credential to hold, and must still launch. Callers use this to tell the
  * daemon they are self-credentialed rather than asking it for a token it does
  * not have.

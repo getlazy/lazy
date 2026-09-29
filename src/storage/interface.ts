@@ -1360,6 +1360,24 @@ export interface Storage {
    */
   listConversationSummaries(): Promise<ConversationSummary[]>;
 
+  // --- Builders (docs/design/builder-identity.md) ---
+
+  /**
+   * Every Builder — one conversation in the human sense, stitched by lineage
+   * from the stored conversation segments — newest first, each with its run
+   * badge. DERIVED on every call from the segment index and the builder-run
+   * registry; nothing is stored, so a newly captured segment joins its Builder
+   * without any migration.
+   */
+  listBuilders(): Promise<import('./types').BuilderSummary[]>;
+
+  /**
+   * The Builder named by a Builder id or by ANY of its segment ids (or a unique
+   * prefix of one), or null. A segment id typed by hand resolves to the Builder
+   * it belongs to.
+   */
+  getBuilder(idOrSegmentId: string): Promise<import('./types').BuilderSummary | null>;
+
   /**
    * Check if a conversation has been imported
    */

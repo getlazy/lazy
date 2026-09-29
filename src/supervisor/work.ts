@@ -50,7 +50,7 @@ export interface WorkLaunchContext {
 export interface WorkResult {
   result: string;
   session_id: string;
-  usage: AgentTokenUsage;
+  usage?: AgentTokenUsage;
   /** Concrete model id the agent reported, when it reports one (see AgentResponse). */
   model_id?: string;
   /**

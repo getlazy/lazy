@@ -158,17 +158,32 @@ function tryParseObject(text: string): Record<string, unknown> | null {
   }
 }
 
-/** Empty usage — pi reports usage per assistant message; missing means zero. */
-function zeroUsage(): AgentTokenUsage {
-  return { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
-}
-
 interface PiAssistantSummary {
   text: string;
-  usage: AgentTokenUsage;
+  usage?: AgentTokenUsage;
   modelId?: string;
   errorMessage?: string;
   stopReason?: string;
+}
+
+/** One complete per-request usage block from pi, or null when it is not trustworthy. */
+function parsePiUsage(raw: unknown): AgentTokenUsage | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const usage = raw as Record<string, unknown>;
+  const required = [usage.input, usage.output];
+  const optional = [usage.cacheWrite, usage.cacheRead];
+  if (!required.every((value) => typeof value === 'number' && Number.isFinite(value) && value >= 0)) {
+    return null;
+  }
+  if (!optional.every((value) => value === undefined || (typeof value === 'number' && Number.isFinite(value) && value >= 0))) {
+    return null;
+  }
+  return {
+    input_tokens: usage.input as number,
+    output_tokens: usage.output as number,
+    cache_creation_input_tokens: (usage.cacheWrite as number | undefined) ?? 0,
+    cache_read_input_tokens: (usage.cacheRead as number | undefined) ?? 0,
+  };
 }
 
 /**
@@ -179,20 +194,31 @@ interface PiAssistantSummary {
  */
 function summarizeAssistantMessages(messages: unknown): PiAssistantSummary | null {
   if (!Array.isArray(messages)) return null;
-  const usage = zeroUsage();
+  const usage: AgentTokenUsage = {
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+  };
+  let usageComplete = true;
   let last: Record<string, unknown> | null = null;
   for (const entry of messages) {
     if (!entry || typeof entry !== 'object') continue;
     const msg = entry as Record<string, unknown>;
     if (msg.role !== 'assistant') continue;
     last = msg;
-    const u = msg.usage as Record<string, unknown> | undefined;
-    if (u && typeof u === 'object') {
-      usage.input_tokens += Number(u.input) || 0;
-      usage.output_tokens += Number(u.output) || 0;
-      usage.cache_creation_input_tokens! += Number(u.cacheWrite) || 0;
-      usage.cache_read_input_tokens! += Number(u.cacheRead) || 0;
+    const measured = parsePiUsage(msg.usage);
+    if (!measured) {
+      // A turn is the sum of EVERY model request. Keeping a partial sum would
+      // look complete in storage and under-report the turn, so one missing or
+      // malformed request makes the whole measurement unavailable.
+      usageComplete = false;
+      continue;
     }
+    usage.input_tokens += measured.input_tokens;
+    usage.output_tokens += measured.output_tokens;
+    usage.cache_creation_input_tokens! += measured.cache_creation_input_tokens ?? 0;
+    usage.cache_read_input_tokens! += measured.cache_read_input_tokens ?? 0;
   }
   if (!last) return null;
 
@@ -208,7 +234,7 @@ function summarizeAssistantMessages(messages: unknown): PiAssistantSummary | nul
   }
   return {
     text: parts.join('\n\n').trim(),
-    usage,
+    ...(usageComplete ? { usage } : {}),
     modelId: typeof last.model === 'string' && last.model.trim() ? last.model.trim() : undefined,
     errorMessage: typeof last.errorMessage === 'string' ? last.errorMessage : undefined,
     stopReason: typeof last.stopReason === 'string' ? last.stopReason : undefined,
@@ -228,7 +254,7 @@ interface PiResultLine {
   type: 'pi_result';
   result: string;
   session_id: string;
-  usage: AgentTokenUsage;
+  usage?: AgentTokenUsage;
   model_id?: string;
   error_message?: string;
   stop_reason?: string;
@@ -239,7 +265,7 @@ function buildPiResultLine(sessionId: string, summary: PiAssistantSummary): PiRe
     type: 'pi_result',
     result: summary.text,
     session_id: sessionId,
-    usage: summary.usage,
+    ...(summary.usage ? { usage: summary.usage } : {}),
     ...(summary.modelId ? { model_id: summary.modelId } : {}),
     ...(summary.errorMessage ? { error_message: summary.errorMessage } : {}),
     ...(summary.stopReason ? { stop_reason: summary.stopReason } : {}),
@@ -278,7 +304,7 @@ function responseFromResultLine(obj: PiResultLine): AgentResponse {
   const response: AgentResponse = {
     result: obj.result,
     session_id: obj.session_id,
-    usage: obj.usage ?? zeroUsage(),
+    ...(obj.usage ? { usage: obj.usage } : {}),
   };
   return obj.model_id ? { ...response, model_id: obj.model_id } : response;
 }

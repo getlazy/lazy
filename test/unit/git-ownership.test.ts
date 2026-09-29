@@ -62,15 +62,26 @@ describe('dubious-ownership explanation', () => {
   });
 
   test('host message tells the human not to paper over it', () => {
-    const msg = explainDubiousOwnership('/w/t', false);
+    const msg = explainDubiousOwnership('/w/t', false, 1000);
     expect(msg).toContain('/w/t');
     expect(msg).toContain('do not add a');
     expect(msg).toContain('safe.directory');
   });
 
+  // INVARIANT: a root lazy on Linux gives task worktrees to the container user by
+  // design, so its refusal must not tell the operator to make lazy's uid the
+  // owner — that would undo what lets the agent write at all.
+  test('root daemon message explains the ownership split instead', () => {
+    const msg = explainDubiousOwnership('/w/t', false, 0);
+    expect(msg).toContain('on purpose');
+    expect(msg).toContain('older image');
+    expect(msg).not.toContain('should be the same user');
+    expect(msg).not.toContain("safe.directory '*'");
+  });
+
   test('never tells the human to blanket-trust every repository', () => {
     for (const inContainer of [true, false]) {
-      const msg = explainDubiousOwnership('/w/t', inContainer);
+      const msg = explainDubiousOwnership('/w/t', inContainer, 1000);
       expect(msg).not.toContain("safe.directory '*'");
       expect(msg).not.toContain('safe.directory=*');
     }

@@ -224,7 +224,7 @@ export class UsageLimitTracker {
     const next: UsageLimitReading = {
       ...reading,
       headers: { ...reading.headers },
-      windows: usageWindows(reading.headers, reading.ts),
+      windows: usageWindows(reading.headers, reading.ts, reading.status),
     };
     this.latest.set(reading.credential, next);
     this.listener?.reading(next);
@@ -311,10 +311,17 @@ function round1(n: number): number {
  * src/usage-pause/policy.ts) acts on these windows and reads no header itself.
  * The Claude subscription family (`anthropic-ratelimit-unified-*`) matches a
  * real capture (2026-09-24, docs/spikes/usage-limit-signals.md "Seen"); the
- * Codex family (`x-codex-*`) is still UNVERIFIED, built from public reports. If
- * a real capture differs, correct it here and only here.
+ * Codex family's header SHAPE is read off codex-cli 0.152.1's own parser, but
+ * no raw capture of a Codex refusal survives yet (docs/spikes/
+ * usage-limit-signals.md, "Codex"), so a usage-limit refusal is also a
+ * window of its own. `httpStatus` is the response status the headers came with. If a
+ * real capture differs, correct it here and only here.
  */
-export function usageWindows(headers: Record<string, string>, ts: number): UsageWindow[] {
+export function usageWindows(
+  headers: Record<string, string>,
+  ts: number,
+  httpStatus: number | null = null,
+): UsageWindow[] {
   const windows: UsageWindow[] = [];
   for (const name of Object.keys(headers)) {
     // Subscription (Claude.ai OAuth): utilization is a 0–1 fraction, reset is epoch seconds.
@@ -383,23 +390,90 @@ export function usageWindows(headers: Record<string, string>, ts: number): Usage
       });
       continue;
     }
-    // Codex / ChatGPT subscription (unverified): used-percent is already 0–100.
-    m = /^x-codex-(primary|secondary)-used-percent$/.exec(name);
+    // Codex / ChatGPT subscription. The header SHAPE is read off codex-cli
+    // 0.152.1's own parser (docs/spikes/usage-limit-signals.md, "Codex"):
+    // `x-<limit>-{primary,secondary}-{used-percent,window-minutes,reset-at}`,
+    // one family per metered limit — `x-codex-*` is the default one, and a
+    // model with its own limit arrives as `x-codex-<id>-*` beside it. Every
+    // family is read: the refusing limit need not be the default one.
+    m = /^x-(codex(?:-[a-z0-9-]+?)?)-(primary|secondary)-used-percent$/.exec(name);
     if (m) {
-      const k = m[1];
+      const [, family, k] = m;
       const used = num(headers[name]);
-      const after = num(headers[`x-codex-${k}-reset-after-seconds`]);
-      // Seen both ways in the wild: a countdown, or an absolute epoch-seconds reset.
-      const at = num(headers[`x-codex-${k}-reset-at`]);
+      // codex-cli 0.152.1 reads `reset-at` (epoch s); older reports saw a
+      // `reset-after-seconds` countdown, still honoured when that is all there is.
+      const at = num(headers[`x-${family}-${k}-reset-at`]);
+      const after = num(headers[`x-${family}-${k}-reset-after-seconds`]);
       windows.push({
-        name: `codex-${k}`,
+        name: `${family}-${k}`,
         usedPercent: used,
-        resetsAt: after !== null ? ts + after * 1000 : at !== null ? at * 1000 : null,
+        resetsAt: at !== null ? at * 1000 : after !== null ? ts + after * 1000 : null,
         status: null,
       });
     }
   }
+  // A Codex USAGE-LIMIT REFUSAL is the limit speaking for itself, whatever
+  // the percentages beside it say: on 2026-09-25 Codex refused while the
+  // readings lazy held sat far under the threshold. It becomes a `rejected`
+  // window, which pauses at any threshold, until the reset Codex STATED in the
+  // refusal body (carried here as {@link CODEX_REFUSAL_RESETS_AT}, see
+  // {@link codexRefusalHeaders}). Without a body, a 429 counts only when it
+  // shows a window full or names the limit reached; its reset is then the
+  // latest full window's, else untimed (re-checked after
+  // STALE_UNTIMED_READING_MS). Any other 429 is a rate limit, not a refusal.
+  const codex = windows.filter((w) => w.name.startsWith('codex-'));
+  const full = codex.filter((w) => w.usedPercent !== null && w.usedPercent >= 100 && w.resetsAt !== null);
+  const stated = headers[CODEX_REFUSAL] !== undefined;
+  const inferred =
+    httpStatus === 429 &&
+    (codex.some((w) => w.usedPercent !== null && w.usedPercent >= 100) ||
+      headers['x-codex-rate-limit-reached-type'] !== undefined);
+  if (stated || inferred) {
+    const statedAt = num(headers[CODEX_REFUSAL_RESETS_AT]);
+    windows.push({
+      name: 'codex-refused',
+      usedPercent: null,
+      resetsAt: statedAt !== null ? statedAt * 1000
+        : full.length > 0 ? Math.max(...full.map((w) => w.resetsAt!)) : null,
+      status: 'rejected',
+    });
+  }
   return windows.sort((x, y) => x.name.localeCompare(y.name));
+}
+
+/**
+ * Keys lazy adds to a reading's headers for a Codex usage-limit refusal. They
+ * are NOT upstream headers: the refusal and its reset arrive in the 429's JSON
+ * body (`{"error":{"type":"usage_limit_reached","resets_at":<epoch s>,
+ * "resets_in_seconds":<n>}}`, the shape codex-cli 0.152.1 parses), and a
+ * reading is headers only, so the proxy writes what it read there under these
+ * names. The `lazy-` prefix keeps them apart from anything upstream sends.
+ */
+export const CODEX_REFUSAL = 'lazy-codex-refusal';
+export const CODEX_REFUSAL_RESETS_AT = 'lazy-codex-refusal-resets-at';
+
+/**
+ * Read a Codex 429 body: the refusal keys to add to the reading, or null when
+ * the body is not a usage-limit refusal (a plain rate limit, unparseable JSON).
+ * `ts` anchors `resets_in_seconds` when `resets_at` is absent.
+ */
+export function codexRefusalHeaders(body: string, ts: number): Record<string, string> | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    // Not JSON: not the refusal shape, so there is nothing to read — the
+    // header-only rule in usageWindows() still judges this 429.
+    return null;
+  }
+  const err = (parsed as { error?: Record<string, unknown> } | null)?.error;
+  if (!err || typeof err !== 'object' || err.type !== 'usage_limit_reached') return null;
+  const at = typeof err.resets_at === 'number' ? err.resets_at
+    : typeof err.resets_in_seconds === 'number' ? Math.floor(ts / 1000) + err.resets_in_seconds
+    : null;
+  return at === null
+    ? { [CODEX_REFUSAL]: 'usage_limit_reached' }
+    : { [CODEX_REFUSAL]: 'usage_limit_reached', [CODEX_REFUSAL_RESETS_AT]: String(Math.floor(at)) };
 }
 
 /** Fold a list of audit records into the latest reading per credential. */

@@ -40,6 +40,13 @@ set one up. Every setting is described in
 [lazy.toml](lazy-toml.md). If something is not right, `lazy doctor` says what
 and how to fix it; see [Troubleshooting](troubleshooting.md).
 
+`lazy init` also keeps lazy's own runtime files — `.lazy/`, `.lazy-task-sandbox/`
+and `.lazy-lock` — out of git. It adds them to your `.gitignore` (commit it so
+other clones are covered too) and to the repository's `.git/info/exclude`,
+which applies to every task worktree even before that `.gitignore` is
+committed. lazy refreshes the `info/exclude` entries whenever its daemon
+starts and before it creates a task worktree.
+
 ## 3. Create and start a task
 
 A task is one piece of work: a goal, a prompt, and a branch of its own.

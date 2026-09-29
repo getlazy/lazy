@@ -18,7 +18,9 @@
  *      reading of 0%).
  *
  * VERIFIED for Claude by a real capture on 2026-09-24 (the spike's "Seen" table,
- * docs/spikes/usage-limit-signals.md); the Codex headers are still unverified.
+ * docs/spikes/usage-limit-signals.md). The Codex header SHAPE is read off
+ * codex-cli's own parser, and a Codex usage-limit refusal pauses on its own, because no raw
+ * capture of a Codex refusal has been kept yet.
  * `usageWindows()` is the one place to correct if a capture ever differs.
  */
 
@@ -47,7 +49,10 @@ const CLAUDE_SUBSCRIPTION: HarnessUsageSource = {
 
 const CODEX_SUBSCRIPTION: HarnessUsageSource = {
   harness: 'codex',
-  // UNVERIFIED: community-observed `x-codex-*` headers only.
+  // Every `x-codex[-<id>]-*` limit family, and `codex-refused` — a Codex
+  // usage-limit refusal, which pauses until its stated reset whatever the
+  // percentages say.
+  // Header shape from codex-cli 0.152.1's parser; see usageWindows().
   pauseWindows: (windows) => windows.filter((w) => w.name.startsWith('codex-')),
 };
 
@@ -82,6 +87,21 @@ export function anySourcePauseWindows(windows: UsageWindow[]): UsageWindow[] {
  * let through — which is also what refreshes it.
  */
 export const STALE_UNTIMED_READING_MS = 30 * 60_000;
+
+/**
+ * When did this window stop being described by its reading? Its reset time
+ * once that has passed, or — untimed — the moment the reading aged past
+ * {@link STALE_UNTIMED_READING_MS}. Null while the reading still holds.
+ *
+ * THE ONE ANSWER to "has this window reset": the pause below skips such a
+ * window and every surface that shows a reading renders it as reset, so a
+ * display can never show 100% used of a window the pause already treats as empty.
+ */
+export function windowResetSince(w: UsageWindow, readingTs: number, now: number): number | null {
+  if (w.resetsAt !== null) return w.resetsAt <= now ? w.resetsAt : null;
+  const agedOut = readingTs + STALE_UNTIMED_READING_MS;
+  return now > agedOut ? agedOut : null;
+}
 
 /** The configured threshold for one credential: its own entry, else the global one. 0 = off. */
 export function thresholdFor(
@@ -148,8 +168,7 @@ export function evaluateUsagePause(
   if (!reading || threshold <= 0) return null;
   const tripped: UsageWindow[] = [];
   for (const w of pauseWindows(reading.windows)) {
-    if (w.resetsAt !== null && w.resetsAt <= now) continue;
-    if (w.resetsAt === null && now - reading.ts > STALE_UNTIMED_READING_MS) continue;
+    if (windowResetSince(w, reading.ts, now) !== null) continue;
     const over = w.usedPercent !== null && w.usedPercent >= threshold;
     if (over || w.status === 'rejected') tripped.push(w);
   }
@@ -172,6 +191,7 @@ export function evaluateUsagePause(
 /** Plain-language window name: `unified-5h` → `5-hour window`. */
 export function windowLabel(name: string): string {
   if (name === 'unified') return 'overall subscription limit';
+  if (name === 'codex-refused') return 'Codex usage limit (refused)';
   const m = /^unified-(\d+)([hd])$/.exec(name);
   if (m) return `${m[1]}-${m[2] === 'h' ? 'hour' : 'day'} window`;
   return `${name} window`;
@@ -229,8 +249,7 @@ export function readingCoverage(
   // keep the account out of overage — so it does not count as a reading here.
   const windows = pauseWindows(reading.windows).filter((w) => w.usedPercent !== null);
   if (windows.length === 0) return 'none';
-  const current = windows.some((w) =>
-    w.resetsAt !== null ? w.resetsAt > now : now - reading.ts <= STALE_UNTIMED_READING_MS);
+  const current = windows.some((w) => windowResetSince(w, reading.ts, now) === null);
   return current ? 'reading' : 'stale';
 }
 

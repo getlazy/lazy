@@ -63,7 +63,7 @@ Everything else is a profile you declare:
   ```toml
   [agents.anthropic-pi]
   harness = "pi"
-  model = "claude-opus-5"
+  model = "claude-opus-5-5"
   endpoint = "https://api.anthropic.com"
   ```
 
@@ -73,7 +73,7 @@ Everything else is a profile you declare:
   ```toml
   [agents.openai-pi]
   harness = "pi"
-  model = "gpt-5.2"
+  model = "gpt-6-sol"
   endpoint = "https://api.openai.com"
   ```
 
@@ -120,7 +120,7 @@ not treated as some other kind of traffic. The default local profile bills
 nothing — a local model server takes no key, and lazy does not send it one.
 
 **If you already had a Pi profile that omitted `endpoint`, it moved with the
-default.** A block like `[agents.my-pi] harness = "pi", model = "claude-opus-5"`
+default.** A block like `[agents.my-pi] harness = "pi", model = "claude-opus-5-5"`
 used to mean Anthropic and now means the local Ollama, which does not have that
 model. Lazy warns at startup when a profile pairs a harness default upstream
 with a recognizably Anthropic model, naming the profile and the

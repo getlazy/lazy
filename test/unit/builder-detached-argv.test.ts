@@ -17,7 +17,7 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { buildBuilderDockerArgs } from '../../src/runner/docker-runner';
+import { buildBuilderDockerArgs, BUILDER_CONTAINER_PATHS } from '../../src/runner/docker-runner';
 
 const PROJECT_ROOT = '/tmp/lazy-invariant-project';
 
@@ -87,7 +87,10 @@ describe('detached builder session prompt mount', () => {
   test('a detached launch mounts its prompt file read-only; a foreground one does not add it', () => {
     const detached = argsFor({ detached: true });
     const prompt = `${PROJECT_ROOT}/.lazy/tmp/builder-prompt-1.txt`;
-    expect(detached.join(' ')).toContain(`-v ${prompt}:${prompt}:ro`);
-    expect(argsFor({ detached: false }).join(' ')).not.toContain(`${prompt}:${prompt}:ro`);
+    // At its fixed container path (the image's /root is closed to the
+    // container user, so a root daemon's host path is unreachable there).
+    expect(detached.join(' ')).toContain(`-v ${prompt}:${BUILDER_CONTAINER_PATHS.prompt}:ro`);
+    expect(detached[detached.indexOf('--system-prompt-file') + 1]).toBe(BUILDER_CONTAINER_PATHS.prompt);
+    expect(argsFor({ detached: false }).join(' ')).not.toContain(`${prompt}:`);
   });
 });

@@ -30,7 +30,7 @@ export interface BuilderContinuityDeps {
   daemonConfigPath: string;
   projectRoot: string;
   /** Build argv for one Claude launch; resume id null on first launch only. */
-  buildClaudeArgs: (resumeId: string | null) => string[];
+  buildClaudeArgs: (resumeId: string | null, directive?: BuilderLaunchEnv['directive']) => string[];
   worktreePath: string;
   /** Env inherited from the supervisor process (container entry env). */
   baseEnv: Record<string, string | undefined>;
@@ -141,7 +141,7 @@ export async function runBuilderWithContinuity(
       }
 
       const baseline = await readStatus(projectRoot);
-      const claudeArgs = buildClaudeArgs(resumeId);
+      const claudeArgs = buildClaudeArgs(resumeId, launchEnv.directive);
       const env = overlayLaunchEnv(baseEnv, launchEnv);
 
       log(`[builder] Launching Claude Code${resumeId ? ` (--resume ${resumeId.substring(0, 8)})` : ''}...`);

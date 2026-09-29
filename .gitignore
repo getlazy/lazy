@@ -35,6 +35,15 @@ src/version.ts
 # Generated build-info file (from scripts/generate-version.ts / scripts/build.ts)
 src/build-info.ts
 
+# Source identity written INSIDE an image build from LAZY_BUILD_* build args
+# (scripts/write-source-stamp.ts); never part of a real checkout
+source-stamp.json
+
+# Deploy state lazy-teams/bin/deploy-remote writes beside the checkout it builds
+# from; ignored so it never marks that build "dirty"
+.deployed-sha
+.deployed-build-args
+
 # Generated prompt bundle (from scripts/generate-prompt-bundle.ts)
 src/prompts-bundle.ts
 

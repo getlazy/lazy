@@ -1,14 +1,36 @@
 # Credentials
 
-Lazy's daemon holds the model credential for a project. It launches every task
-container, and those containers reach the model API through the daemon's proxy —
-so if the daemon has no credential, nothing lazy runs can talk to a model. That
-is why the daemon **refuses to start** without one.
+Lazy's daemon holds the model credentials for a project. It launches every task
+container, and those containers reach the model API through the daemon's proxy.
 
-A credential that lives only in an exported environment variable ties the
-daemon's ability to start to the shell that started it. `lazy auth` removes
-that dependency: store a credential once and the daemon reads it at startup,
-from any shell.
+**A credential is needed to run a turn, and for nothing else.** The daemon
+starts, clones, runs `lazy init`, serves the dashboard and every read, merges
+upstream work cleanly and accepts with no model credential at all. When a turn
+is about to launch — `lazy start`, `lazy unblock`, an automatic resume, or a
+sync whose merge conflicts (resolving it runs the task's agent) — lazy checks the credential
+the task's **agent profile** bills (Anthropic for `claude-code`, OpenAI for
+`codex`, a ChatGPT subscription for `codex-subscription`, and so on). If there
+is none, the turn is refused before anything runs, in plain words naming the
+profile and what it lacks:
+
+```
+No credential for agent profile "codex": it needs an OpenAI credential, and this
+daemon has none. Turns on this profile are refused until one is connected —
+store it with `lazy auth set openai`, or set OPENAI_API_KEY in the daemon's
+environment.
+```
+
+The task stays where it was, and nothing is recorded on it. An automatic sync
+that needs its agent waits and retries until a credential is connected. `lazy unblock` and
+`lazy ask` check this before they open your editor, so you are never asked to
+type feedback into a turn that cannot start. Connect the credential and try
+again.
+`lazy daemon health` and `lazy doctor` show the same gap as a warning before
+anyone runs into it.
+
+A credential that lives only in an exported environment variable ties lazy to
+the shell that started the daemon. `lazy auth` removes that dependency: store a
+credential once and the daemon reads it from any shell.
 
 ## Quick start
 
@@ -88,8 +110,9 @@ request, so a key stored or rotated now is used by the next turn with nothing to
 restart.
 
 The Anthropic credential is the exception: the daemon loads it into its own
-environment at startup, so a running daemon needs `lazy daemon restart` to pick
-up a new one. `lazy auth` says which case you are in after every write.
+environment. A daemon that started with none loads a newly stored one at the
+next turn that needs it; to replace one it already loaded, run
+`lazy daemon restart`. `lazy auth` says which case you are in after every write.
 
 Replacing a credential the daemon already had when it started is no different:
 it takes effect on the next turn too. A variable *you* export still overrides
@@ -108,7 +131,7 @@ and `-`, up to 64 characters), and an
 ```toml
 [agents.work-codex]
 harness = "codex"
-model = "gpt-5-codex"
+model = "gpt-6-sol"
 credential = "work-openai"    # lazy auth set work-openai
 ```
 
@@ -151,6 +174,12 @@ carry more than 4 KB at a time; lazy joins the pieces back together on the way
 out. If you are browsing Keychain Access, they belong together — remove them with
 `lazy auth rm`, which clears all of them.
 
+On macOS, lazy creates each keychain item so that it can be read without an
+access prompt — a background daemon has nobody to answer one. Later writes,
+such as the refreshed tokens of a ChatGPT subscription session, replace only the
+stored value and leave the item's access settings alone, so neither a token
+refresh nor a lazy upgrade asks you for permission again.
+
 ### If a stored credential goes bad
 
 Store it again — that is the whole remedy, and you never have to clear anything
@@ -173,7 +202,7 @@ repository would be readable by every agent on the project.
 
 Alongside the secret, lazy keeps a small **non-secret index** recording which
 credentials are stored, in which backend, and a last-four hint. That is
-what the startup gate and `lazy auth list` read, so neither has to open a
+what the turn check, `lazy daemon health` and `lazy auth list` read, so neither has to open a
 keychain item — on macOS, opening one from a background daemon can block on an
 unlock dialog nobody is there to answer.
 
@@ -200,48 +229,40 @@ A **blank** export (`export CLAUDE_CODE_OAUTH_TOKEN=` — the shape a failed
 
 ## Which credential does your project actually need?
 
-The daemon works this out from your configuration rather than assuming
-Anthropic. It resolves the agent profile each **role defaults to** — the builder
-and new task agents — and requires the credential each of those profiles bills:
+Whatever the profiles you run turns on bill — lazy works this out from your
+configuration rather than assuming Anthropic. Each turn needs the credential of
+the profile it runs on:
 
-- Both role defaults on a local model server → **no credential needed**, and the
-  daemon starts with an empty environment and an empty store.
-- Either one on Anthropic → an Anthropic credential is required.
-- Either one on hosted Ollama (`https://ollama.com`) → the `ollama` credential
+- A profile on a local model server (`credential = "none"`) → **no credential
+  needed**.
+- A profile on Anthropic (the built-in `claude-code`) → an Anthropic credential.
+- A profile on hosted Ollama (`https://ollama.com`) → the `ollama` credential
   (`OLLAMA_API_KEY` or `lazy auth set ollama`).
-- Either one on an OpenAI-compatible endpoint → the `openai` credential
+- A profile on an OpenAI-compatible endpoint → the `openai` credential
   (`OPENAI_API_KEY`) — or the `openrouter` credential (`OPENROUTER_API_KEY`)
   when the endpoint is `openrouter.ai`. The same hostname rule applies to a
   profile pinned at OpenRouter's Anthropic-compatible endpoint: it bills your
   OpenRouter key, never your Anthropic one.
-- Either one on the ChatGPT subscription backend
+- A profile on the ChatGPT subscription backend
   (`https://chatgpt.com/backend-api/codex`) → the `chatgpt` credential. See
   [Running Codex on a ChatGPT subscription](#running-codex-on-a-chatgpt-subscription).
 
-So a mixed setup — builder on Anthropic, new tasks on Ollama — still asks for
-the one credential it will really use, and an all-local setup is never asked for
-a token it would never present.
-
-The gate reads the **role defaults**, not every profile the project declares.
-Adding an `[agents.work-codex]` block is not a statement that anything runs it
-today, so it never blocks daemon startup; a task that actually selects that
-profile resolves its credential at launch and fails there, naming the profile. A
-profile whose `credential` is a name of your own is in the same position: there
-is no provider-level gate for one. Cursor is excluded for the same reason — a
-Cursor key is resolved per launch and a missing one warns there, rather than
-refusing a daemon for every task that is not a Cursor task. See
+So a mixed setup — builder on Anthropic, new tasks on Ollama — needs exactly
+the credentials it will really use, and an all-local setup is never asked for a
+token it would never present. Declaring an `[agents.<name>]` block costs
+nothing until a task selects it. See
 [`[agents.<name>]`](lazy-toml.md#agentsname--named-agent-profiles).
 
 ## When something is wrong
 
 `lazy doctor` is the diagnosis surface. It prints one line per credential your
-agent profiles bill — the role defaults plus every `[agents.<name>]` block, so a
-declared profile whose credential is missing shows up here even though it never
-blocks daemon startup — naming where the daemon found each one (its
-environment, the store and its backend, or the agent key file) and which
-profiles need it. A missing one is named, with the `lazy auth set` command that
-stores it. And — because the startup check is presence-only and never calls the
-API — doctor separately reports a credential that is present but *expired*, by
+agent profiles bill — the role defaults plus every `[agents.<name>]` block —
+naming where the daemon found each one (its environment, the store and its
+backend, or the agent key file) and which profiles need it. A missing one is a
+warning naming the profiles whose turns will be refused, with the `lazy auth set`
+command that stores it. `lazy daemon health` shows the same thing under
+**Model credentials**. And — because the turn check is presence-only and never
+calls the API — doctor separately reports a credential that is present but *expired*, by
 reading the proxy's record of recent 401/403 responses.
 
 `lazy auth` itself never needs a credential to run, and never starts a daemon:
@@ -249,25 +270,26 @@ it is the command that fixes not having one.
 
 ### "The credential store says a credential is stored, but it could not be loaded"
 
-The daemon refuses to start with this message when `lazy auth list` shows a
-credential in the store but the store cannot hand the secret over. It does not
-start anyway: a daemon with no usable credential answers RPC and launches
-containers perfectly happily, and then fails every model request with an
-authentication error that says nothing about the real cause.
+`lazy daemon health` shows this under **Model credentials** when `lazy auth
+list` shows a credential in the store but the store could not hand the secret
+over when the daemon started. The daemon runs anyway, and retries the load at
+the next turn that needs the credential; if it still cannot, that turn is
+refused with this reason rather than launched into an authentication error that
+says nothing about the real cause.
 
 Two things cause it:
 
 - **The store is locked.** A login keychain or keyring that no one unlocked in
   this session — the usual answer over SSH, on a headless host, or for a daemon
   started outside a desktop login. Unlock it (`security unlock-keychain` on
-  macOS, or start a keyring for the session on Linux) and start the daemon
-  again. Nothing is lost.
+  macOS, or start a keyring for the session on Linux) and start the task again.
+  Nothing is lost.
 - **The secret is gone but the record is not** — a keychain edited by hand, or a
   home directory restored without its keyring. Re-store it with
   `lazy auth set <provider>`, or drop the stale record with
   `lazy auth rm <provider>` and go back to an environment variable.
 
-The refusal quotes the underlying error, so it tells you which of the two you
+The message quotes the underlying error, so it tells you which of the two you
 are looking at.
 
 ## Agent API keys

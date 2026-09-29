@@ -27,10 +27,14 @@
 # by a key in this file — see public-docs/managed-config.md.
 
 [models]
-# Default model for sessions — use raw model IDs (e.g., "claude-opus-5",
-# "claude-sonnet-5", "qwen3.5:35b-a3b-coding-nvfp4"). Short names
+# Default model for task sessions — use raw model IDs (e.g., "claude-opus-5-5",
+# "claude-sonnet-5-5", "qwen3.5:35b-a3b-coding-nvfp4"). Short names
 # ("opus", "sonnet", "haiku") are also accepted and passed through as-is.
-# Lazy's built-in default when this key is absent: "claude-opus-5"
+# Lazy's built-in default when this key is absent: "claude-sonnet-5-5"
+# (needs Claude Code 2.1.284 or newer in the task image, as does
+# "claude-opus-5-5"). The BUILDER does not read this key: it runs its role's
+# profile model (or `lazy builder --model`), else "claude-opus-5-5" (see
+# [models.roles.*] below).
 # A control plane (lazy-teams) can override this per project without editing
 # this file; the override lives in the daemon's store and this value stays the
 # repository's own default. Precedence: per-turn override > the task's pinned
@@ -39,10 +43,11 @@
 #
 # "The launching agent's own default" is why this key is not the last word: it
 # is one Anthropic model name for the whole project, so an agent with a
-# different catalog declares its own instead (a Cursor task runs Cursor's
-# `auto`). The project override sits below that for the same reason — it is
-# also one project-wide name. Pin a single task with `--model` to outrank both.
-default = "claude-opus-5"
+# different catalog declares its own instead (a Cursor task runs `auto`,
+# Cursor's own choice; a Codex task `gpt-6-sol`). The project override
+# sits below that for the same reason — it is also one project-wide name.
+# Pin a single task with `--model` to outrank both.
+default = "claude-sonnet-5-5"
 
 # Per-role defaults (optional). Each role names an agent PROFILE (defined in
 # [agents.<name>] below) — that profile decides the harness, the model, the
@@ -106,6 +111,14 @@ default = "claude-opus-5"
 #              no key, so lazy does not send it one), otherwise the credential
 #              for the harness's API. Two profiles on the same provider share
 #              one credential unless one names its own.
+#   description when to choose this profile, in plain text (up to 500
+#              characters). Shown beside every agent picker — the web forms,
+#              `lazy system agent`, the builder, and `lazy_status` for agents
+#              creating subtasks — so people and the builder can PROPOSE the
+#              right profile. It never selects one by itself. Built-ins carry
+#              their own; a block overriding one keeps it unless it writes
+#              its own, runs a different harness, or sets its own endpoint
+#              (the built-in text would no longer be true of it).
 #
 # BUILT-IN PROFILES exist implicitly with the defaults below, so a project with
 # no [agents] section behaves exactly as it does without this feature. A block of
@@ -129,9 +142,10 @@ default = "claude-opus-5"
 #
 # [agents.company-tokens-codex]   # `lazy create --agent company-tokens-codex`,
 # harness = "codex"               # or pick it in the web Agent profile dropdown
-# model = "gpt-5-codex"
+# model = "gpt-6-sol"
 # endpoint = "https://api.openai.com"
 # credential = "company-openai"   # `lazy auth set company-openai`
+# description = "Use when the task should run on the company's OpenAI account"
 #
 # [agents.remote-ollama-pi]    # an Ollama that is not on this machine (the
 # harness = "pi"               # built-in pi profile already runs the local one)
@@ -140,12 +154,12 @@ default = "claude-opus-5"
 #
 # [agents.anthropic-pi]        # pi against Anthropic, which is NOT the default:
 # harness = "pi"               # it spends your Anthropic credential, so it is
-# model = "claude-opus-5"      # something you ask for by name
+# model = "claude-opus-5-5"    # something you ask for by name
 # endpoint = "https://api.anthropic.com"
 #
 # [agents.openai-pi]            # pi speaks both wires: an api.openai.com or
 # harness = "pi"                # openrouter.ai endpoint runs pi's OpenAI
-# model = "gpt-5.2"             # provider, any other endpoint its
+# model = "gpt-6-sol"           # provider, any other endpoint its
 # endpoint = "https://api.openai.com"   # Anthropic-wire one
 #
 # [agents.openrouter-pi]        # OpenRouter model ids are used as-is; key from
@@ -155,12 +169,12 @@ default = "claude-opus-5"
 #
 # [agents.claude-code]          # overrides the built-in profile of the same name
 # harness = "claude-code"
-# model = "claude-opus-5"
+# model = "claude-opus-5-5"
 #
 # [agents.openrouter-codex]
 # harness = "codex"
-# model = "gpt-5-codex"
-# endpoint = "https://openrouter.ai/api/v1"
+# model = "gpt-6-sol"
+# endpoint = "https://openrouter.ai/api"   # no /v1: lazy adds it
 # credential = "openrouter"     # `lazy auth set openrouter`; inferred from the
 #                               # endpoint when omitted
 #
@@ -172,8 +186,84 @@ default = "claude-opus-5"
 #
 # [agents.work-codex]           # same provider as the built-in codex profile,
 # harness = "codex"             # billed to a different key
-# model = "gpt-5-codex"
+# model = "gpt-6-sol"
 # credential = "work-openai"    # any name you choose: `lazy auth set work-openai`
+#
+# ---- Spreading work across models by tier ----
+#
+# Not every task needs the most capable model. Four tiers, one profile per
+# tier for each harness you use. Each description says when to pick it and is
+# shown beside every agent picker, so people and the builder choose well.
+#   normal     — the default: everyday features, fixes, tests, docs
+#   complex    — tasks that drive their own subtasks (type `cluster`) and
+#                highly complex work
+#   security   — authentication, credentials, permissions, sandboxing,
+#                untrusted input, security reviews
+#   on demand  — only when someone asks for it by name
+# Make the normal tier the default with [agent] agent_id = "claude-normal",
+# send subtask-driving tasks to the complex tier with
+# [agent.by_type] cluster = "claude-complex", and pick the others per task
+# with `--agent`. The Claude Code models need Claude Code 2.1.284 or newer.
+# Keep only the harnesses you use.
+#
+# [agents.claude-normal]
+# harness = "claude-code"
+# model = "claude-sonnet-5-5"
+# description = "Normal tier (default): everyday features, fixes, tests and docs"
+#
+# [agents.claude-complex]
+# harness = "claude-code"
+# model = "claude-opus-5-5"
+# description = "Complex tier: tasks that drive subtasks, cross-cutting design, subtle concurrency, large refactors"
+#
+# [agents.claude-security]
+# harness = "claude-code"
+# model = "claude-opus-5-5"
+# description = "Security tier: authentication, credentials, permissions, sandboxing, untrusted input, security reviews"
+#
+# [agents.claude-on-demand]
+# harness = "claude-code"
+# model = "claude-fable-5-1"
+# description = "On demand only: use when someone asks for it by name — the hardest problems or a second opinion"
+#
+# [agents.cursor-normal]
+# harness = "cursor"
+# model = "composer-2.5"
+# description = "Normal tier on Cursor: everyday features, fixes, tests and docs"
+#
+# [agents.cursor-complex]
+# harness = "cursor"
+# model = "grok-4-7"
+# description = "Complex tier on Cursor: tasks that drive subtasks, cross-cutting design, large refactors"
+#
+# [agents.cursor-security]
+# harness = "cursor"
+# model = "claude-opus-5-5"
+# description = "Security tier on Cursor: authentication, credentials, permissions, sandboxing, untrusted input"
+#
+# [agents.codex-normal]
+# harness = "codex"
+# model = "gpt-5.6-terra"
+# description = "Normal tier on Codex: everyday features, fixes, tests and docs"
+#
+# [agents.codex-complex]
+# harness = "codex"
+# model = "gpt-6-sol"
+# description = "Complex tier on Codex: tasks that drive subtasks, cross-cutting design, large refactors"
+#
+# [agents.codex-security]
+# harness = "codex"
+# model = "gpt-6-sol"
+# description = "Security tier on Codex: authentication, credentials, permissions, sandboxing, untrusted input"
+#
+# [agents.codex-on-demand]
+# harness = "codex"
+# model = "gpt-6-astra"
+# description = "On demand only on Codex: use when someone asks for it by name"
+#
+# Codex blocks run on the metered OpenAI key; add
+# endpoint = "https://chatgpt.com/backend-api/codex" to run one on a ChatGPT
+# subscription instead (as the built-in codex-subscription profile does).
 
 [session]
 # Show Docker output in real-time during session execution
@@ -214,6 +304,11 @@ default_branch_prefix = "lazy"
 #   "off"              — disable the check
 # The accept-time guard against raw blobs on LFS paths always runs regardless.
 # lfs_check = "refuse"
+# Lazy's own "Co-Authored-By: Lazy <noreply@getlazy.dev>" trailer on the commits
+# lazy writes for a task: lazy_commit commits, the accept squash and forge merge
+# commits. Set false to omit it everywhere. Commits an agent makes itself with
+# raw git are untouched. Read from the PROJECT ROOT's lazy.toml only.
+# coauthor_trailer = true
 
 [output]
 # Length of shortened IDs displayed in output
@@ -278,6 +373,7 @@ agent_id = "claude-code"
 # fix = "cursor"
 # refactor = "cursor"
 # feature = "claude-code"
+# cluster = "claude-complex"   # a model-tier profile from [agents.*] above
 
 # Hang backstop for agent processes (milliseconds). NOT a turn deadline: the
 # timer resets on every step the agent completes, so a turn made of many long

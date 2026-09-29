@@ -121,11 +121,11 @@ export function piUpstreamExamples(): string {
     return (
       'A pi agent profile that names no endpoint runs the local Ollama pi defaults to; one with ' +
       'an "endpoint" runs that upstream — over the Anthropic wire, e.g. ' +
-      '[agents.anthropic-pi] harness = "pi", model = "claude-opus-5", ' +
+      '[agents.anthropic-pi] harness = "pi", model = "claude-opus-5-5", ' +
       'endpoint = "https://api.anthropic.com", or [agents.remote-ollama-pi] harness = "pi", ' +
       'model = "…", endpoint = "http://ollama.lan:11434", or over the OpenAI wire when the ' +
       'endpoint is OpenAI\'s or OpenRouter\'s, e.g. [agents.openai-pi] harness = "pi", ' +
-      'model = "gpt-5.2", endpoint = "https://api.openai.com" or [agents.openrouter-pi] ' +
+      'model = "gpt-6-sol", endpoint = "https://api.openai.com" or [agents.openrouter-pi] ' +
       'harness = "pi", model = "anthropic/claude-sonnet-4.5", endpoint = "https://openrouter.ai/api".'
     );
   }
@@ -269,7 +269,7 @@ export function generatedConfigProfileExamples(): string {
       '#\n' +
       '# [agents.work-codex]\n' +
       '# harness = "codex"\n' +
-      '# model = "gpt-5-codex"'
+      '# model = "gpt-6-sol"'
     );
   }
   return (

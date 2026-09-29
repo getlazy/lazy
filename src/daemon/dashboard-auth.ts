@@ -526,12 +526,15 @@ const NO_FRAMING_HEADERS: ReadonlyArray<readonly [string, string]> = [
 /**
  * Stamp the framing headers on a dashboard response.
  *
- * The ONE place they are set. `set` rather than `append` because no dashboard
- * route sets a CSP of its own — if one ever needs to, it has to merge its
- * directives here rather than answer with a policy that drops frame-ancestors.
+ * The ONE place they are set. A route that sets a CSP of its own (the
+ * artifact bytes route sandboxes what it serves) keeps its directives and gets
+ * frame-ancestors appended — never a policy that drops either half.
  */
 function denyFraming(res: Response): Response {
-  for (const [name, value] of NO_FRAMING_HEADERS) res.headers.set(name, value);
+  for (const [name, value] of NO_FRAMING_HEADERS) {
+    const own = name === 'Content-Security-Policy' ? res.headers.get(name) : null;
+    res.headers.set(name, own ? `${own}; ${value}` : value);
+  }
   return res;
 }
 

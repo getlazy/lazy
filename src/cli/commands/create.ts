@@ -355,7 +355,7 @@ Create a new task. Interactive if no flags provided.
 Options:
   --goal <goal>      Task goal
   --prompt <text>    Task prompt/specification
-  --model <model>    Set model for this task (e.g. opus, sonnet, claude-opus-5)
+  --model <model>    Set model for this task (e.g. opus, sonnet, claude-opus-5-5)
   --type <type>      Set task type (task, fix, spike, refactor, test, audit, migrate, document, tidy, rework, feature, release, cluster)
                      Default: task
                      cluster: the task's own agent drives its subtasks instead of

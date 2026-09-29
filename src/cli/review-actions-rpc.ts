@@ -48,19 +48,32 @@ export function createRpcReviewActions(client: DaemonClient, projectRoot: string
       return queue;
     },
 
-    async getDiff(taskId: string, opts?: { region?: string }): Promise<string> {
-      const { diff } = (await call('reviewDiff', { taskId, region: opts?.region })) as { diff: string };
+    async getDiff(taskId: string, opts?: { region?: string; files?: string[] }): Promise<string> {
+      const { diff } = (await call('reviewDiff', { taskId, region: opts?.region, files: opts?.files })) as { diff: string };
       return diff ?? '';
+    },
+
+    async listDiffFiles(taskId: string, opts?: { region?: string }) {
+      const { files } = (await call('reviewDiffFiles', { taskId, region: opts?.region })) as {
+        files?: import('../git/operations').DiffFileEntry[];
+      };
+      return files ?? [];
     },
 
     async listRegions(taskId: string) {
       const result = (await call('reviewRegions', { taskId })) as {
         regions?: import('../regions').RegionSummary[];
         notes?: string[];
+        source?: 'presentation' | 'children';
+        staleWalkthrough?: boolean;
+        fileRegions?: Record<string, string>;
       };
       return {
         regions: result.regions ?? [],
         notes: result.notes ?? [],
+        ...(result.source ? { source: result.source } : {}),
+        staleWalkthrough: result.staleWalkthrough === true,
+        ...(result.fileRegions ? { fileRegions: result.fileRegions } : {}),
       };
     },
 

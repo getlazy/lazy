@@ -86,6 +86,7 @@ import { assembleBuilderSystemPrompt } from './builder/system-prompt';
 import { renderChattinessSnippet, resolveAgentChattiness } from './config/chattiness';
 import { serializedToolSurface } from './mcp/tool-surface';
 import { resolveRoleTarget } from './utils/role-target';
+import { BUILDER_DEFAULT_MODEL } from './config/default-models';
 import {
   DEFAULT_CONTEXT_WINDOW_TOKENS,
   effectiveContextWindow,
@@ -446,7 +447,7 @@ const UNRESOLVED_WINDOW: EffectiveContextWindow = {
  * answer is the same whether or not a daemon happens to be up right now. A
  * doctor run on a stopped project must still be able to say what the window is.
  *
- * `preferredModel` carries `[models] default` for the same reason the launch
+ * `preferredModel` carries `[models] default` (the builder default for the builder role) for the same reason the launch
  * does: an unpinned profile returns an empty model meaning "caller's default",
  * and reporting a window for the empty string would report nothing useful.
  *
@@ -455,7 +456,9 @@ const UNRESOLVED_WINDOW: EffectiveContextWindow = {
  */
 export function windowForRole(role: ContextRole, config: ResolvedConfig): EffectiveContextWindow {
   try {
-    const target = resolveRoleTarget(role, config, { preferredModel: config.models.default });
+    const target = resolveRoleTarget(role, config, {
+      preferredModel: role === 'builder' ? BUILDER_DEFAULT_MODEL : config.models.default,
+    });
     return effectiveContextWindow({ ...target, primaryUpstream: config.proxy.upstream });
   } catch (err) {
     return {

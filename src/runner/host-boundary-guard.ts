@@ -23,7 +23,7 @@
  *
  * WHY IT IS OPT-IN, AND WHY THE DEFAULT IS "off"
  * ----------------------------------------------
- * The guard spends three real headless Claude sessions (~1-2 min, billed) and
+ * The guard spends nine real headless Claude sessions (~4-6 min, billed) and
  * needs an interactively logged-in `claude`. Paying that on every task launch
  * would be indefensible, and paying it on *first* launch still stalls a launch
  * for minutes on a machine that may have no interactive auth at all (a CI box, a
@@ -60,7 +60,14 @@ import PROBE_SCRIPT from '../../scripts/host-sandbox-probe.sh' with { type: 'tex
 import { spawn } from '../utils/spawn';
 import { logger } from '../utils/logger';
 import { getHome } from '../utils/home';
-import { buildAgentSandboxArgs, type HostPermissionConfig } from './host-sandbox';
+import {
+  buildAgentSandboxArgs,
+  withGitPointerDenies,
+  PROBE_GIT_POINTERS,
+  PROBE_PROJECT_ROOT_SCOPE,
+  projectRootWriteDenyRules,
+  type HostPermissionConfig,
+} from './host-sandbox';
 import type { SandboxBoundaryVerification } from '../config/types';
 import type { HealthCheck } from './types';
 
@@ -78,6 +85,8 @@ export interface BoundaryGuardResult {
   fingerprint: string;
   /** ISO timestamp of the run. */
   checkedAt: string;
+  /** Per-case outcomes from the probe (e.g. `root / write-TOOL` → DENIED), when it reported them. */
+  cases?: Array<{ case: string; outcome: string }>;
 }
 
 interface CacheFile {
@@ -97,11 +106,11 @@ export function boundaryCachePath(): string {
 const MAX_CACHE_ENTRIES = 20;
 
 /**
- * The guard runs three headless sessions, each with a 90s alarm inside the
- * probe. 8 minutes leaves room for slow model responses without letting a wedged
- * probe hold a launch forever.
+ * The guard runs nine headless sessions, each with a 90s alarm inside the
+ * probe (13.5 min worst case). 15 minutes leaves room for slow model responses
+ * without letting a wedged probe hold a launch forever.
  */
-const GUARD_TIMEOUT_MS = 8 * 60_000;
+const GUARD_TIMEOUT_MS = 15 * 60_000;
 /** --check is a single session. */
 const CHECK_TIMEOUT_MS = 3 * 60_000;
 
@@ -116,15 +125,47 @@ export function agentSettingsJson(cfg: HostPermissionConfig): string | null {
   return i >= 0 ? (args[i + 1] ?? null) : null;
 }
 
+/**
+ * The project-root write rules the guard probes (`LAZY_PROBE_ROOT_SETTINGS`),
+ * built by the same function a turn's rules are, against the probe's
+ * placeholder root. Per-worktree rules cannot be fingerprinted per project, so
+ * the guard verifies the rule SHAPE on a real worktree instead.
+ */
+export function probeRootSettingsJson(): string {
+  return JSON.stringify({ permissions: { deny: projectRootWriteDenyRules(PROBE_PROJECT_ROOT_SCOPE) } });
+}
+
+/**
+ * Keyed on what was actually tested: the Claude Code version, the platform, the
+ * agent settings, the project-root rules and the probe script itself — so a
+ * verdict cached before a check was added is re-verified, not trusted.
+ */
 export function boundaryFingerprint(
   claudeVersion: string,
   platform: string,
   settingsJson: string,
 ): string {
+  // The verdict covers what was PROBED, not only the per-project settings:
+  // the probe script (its vectors) and the git-pointer settings it tests are
+  // part of the key, so changing either re-probes instead of trusting a
+  // verdict that never ran the new vectors.
   return createHash('sha256')
-    .update(`${claudeVersion}\0${platform}\0${settingsJson}`)
+    .update(`${claudeVersion}\0${platform}\0${settingsJson}\0${probedPointerSettings(settingsJson)}\0${PROBE_SCRIPT}`)
+    .update(`\0${probeRootSettingsJson()}`)
     .digest('hex')
     .slice(0, 16);
+}
+
+/** The pointer posture the probe tests; empty for settings with no sandbox object. */
+function probedPointerSettings(settingsJson: string): string {
+  try {
+    return withGitPointerDenies(settingsJson, PROBE_GIT_POINTERS);
+  } catch (err) {
+    // Unparseable or sandbox-less settings are refused by the probe itself
+    // (settingsJson below); here they only key the cache, so fall back to "".
+    logger.debug(`no git-pointer posture for the boundary fingerprint: ${err instanceof Error ? err.message : String(err)}`);
+    return '';
+  }
 }
 
 /** `claude --version`, or null when it cannot be determined. */
@@ -251,6 +292,7 @@ export interface BoundaryGuardSeams {
 }
 
 interface ProbeVerdictFile {
+  cases?: Array<{ case: string; outcome: string }>;
   verdict?: string;
   reason?: string;
   claude_version?: string;
@@ -267,16 +309,25 @@ export async function runBoundaryProbe(opts: BoundaryProbeOptions): Promise<Boun
   const dir = await mkdtemp(join(tmpdir(), 'lazy-boundary-'));
   const scriptPath = join(dir, 'host-sandbox-probe.sh');
   const settingsPath = join(dir, 'settings.json');
+  const rootSettingsPath = join(dir, 'root-settings.json');
+  const pointerSettingsPath = join(dir, 'pointer-settings.json');
   const verdictPath = join(dir, 'verdict.json');
   try {
     await writeFile(scriptPath, PROBE_SCRIPT, { encoding: 'utf-8', mode: 0o700 });
     await writeFile(settingsPath, settingsJson(opts.settingsJson), 'utf-8');
+    await writeFile(rootSettingsPath, probeRootSettingsJson(), 'utf-8');
+    // The git-pointer vectors probe the SAME settings with the per-worktree
+    // denies the supervisor adds, on placeholder paths the probe rewrites to
+    // a worktree it creates (PROBE_GIT_POINTERS).
+    await writeFile(pointerSettingsPath, withGitPointerDenies(settingsJson(opts.settingsJson), PROBE_GIT_POINTERS), 'utf-8');
 
     const env: Record<string, string | undefined> = {
       ...process.env,
       ...(opts.extraEnv ?? {}),
       HOME: getHome(),
       LAZY_PROBE_DENY_SETTINGS: settingsPath,
+      LAZY_PROBE_ROOT_SETTINGS: rootSettingsPath,
+      LAZY_PROBE_POINTER_SETTINGS: pointerSettingsPath,
     };
     // The probe launches `claude` itself. If we inherited CLAUDECODE from a
     // session that is running lazy, those launches would look like nested
@@ -325,6 +376,7 @@ export async function runBoundaryProbe(opts: BoundaryProbeOptions): Promise<Boun
       platform: process.platform,
       fingerprint: boundaryFingerprint(claudeVersion, process.platform, opts.settingsJson),
       checkedAt: new Date().toISOString(),
+      ...(Array.isArray(fromFile.cases) ? { cases: fromFile.cases } : {}),
     };
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -367,7 +419,7 @@ export function violationMessage(result: BoundaryGuardResult): string {
 
 /**
  * `lazy doctor` line for the file-tool half of the boundary. READ-ONLY: reports
- * the cached verdict and never spends three headless sessions of its own — doctor
+ * the cached verdict and never spends nine headless sessions of its own — doctor
  * is a diagnosis surface, not a place to silently bill the user for a probe.
  */
 export async function diagnoseBoundaryVerdict(
@@ -420,7 +472,7 @@ export class HostBoundaryBrokenError extends Error {
 }
 
 // Single-flight per fingerprint: several tasks can enter checkAvailability() at
-// once, and three headless sessions each is both slow and pointless.
+// once, and nine headless sessions each is both slow and pointless.
 const inFlight = new Map<string, Promise<BoundaryGuardResult>>();
 
 /**
@@ -471,7 +523,7 @@ export async function ensureHostBoundaryVerified(
     (async () => {
       logger.info(
         `Verifying the host file-tool boundary on ${claudeVersion} — first launch on this ` +
-        `Claude Code version and posture. Runs 3 real headless sessions (~1-2 min); the ` +
+        `Claude Code version and posture. Runs 9 real headless sessions (~4-6 min); the ` +
         `verdict is then cached per version.`,
       );
       const result = await runProbe({ mode: 'guard', settingsJson: settings, extraEnv, claudeVersion });

@@ -26,6 +26,7 @@
  * a fixed order, so the human sees progress and the output is stable.
  */
 
+import { runningBuildIdentity } from '../utils/build-provenance';
 import { access, readFile } from 'fs/promises';
 import { constants as fsConstants } from 'fs';
 import { dirname, join } from 'path';
@@ -56,10 +57,13 @@ import {
   type ProxyHealthHandle,
 } from './health-registry';
 import { getOrCreateStorage } from './rpc-handlers';
+import { getStartupCredentialProblem, missingTurnCredentials } from './credential-gate';
+import { teamModeEnabled } from './user-credentials';
 import { getWorkingGracePeriodMs } from '../utils/reconcile';
 import {
   buildAuditRow,
   buildBuildMatchRow,
+  buildCredentialRows,
   buildDashboardRow,
   buildHeldSyncsRow,
   buildImageRow,
@@ -313,9 +317,9 @@ export async function collectRunnerRows(projectRoot: string, type: string, runne
   // Only worth asking when the runtime itself answered.
   if (container && rows.every(row => row.state !== 'fail')) {
     const { resolveImageName } = await import('../capture/claude');
-    const { checkContainerImage } = await import('../doctor/sweep');
+    const { containerImagePresent } = await import('../doctor/sweep');
     const name = await resolveImageName(projectRoot);
-    image = { name, present: (await checkContainerImage(name, type)).ok };
+    image = { name, present: await containerImagePresent(name, type) };
   }
   // A container runtime that failed its own checks already explains why
   // nothing launches; an "image missing" row beside it would only guess.
@@ -460,6 +464,14 @@ export async function collectDaemonHealth(
         return [buildVersionRow(facts, now()), buildBuildMatchRow(facts, options.client)];
       },
     },
+    {
+      id: 'credentials:present', group: 'credentials', name: 'Model credentials',
+      run: async () => {
+        const perUser = await teamModeEnabled(projectRoot);
+        const missing = await missingTurnCredentials(projectRoot, { perUser, config: await config() });
+        return buildCredentialRows(missing, getStartupCredentialProblem(), perUser);
+      },
+    },
     ...[RECONCILE_LOOP, SYNC_RETRY_LOOP, REMOTE_SYNC_LOOP].map((name): PlannedCheck => ({
       id: `loop:${name}`, group: 'loops', name: LOOP_NAMES[name]!,
       run: async () => [buildLoopRow(name, snapshot.loops.find(l => l.name === name), now())],
@@ -591,5 +603,11 @@ async function daemonIdentity(startedAt: number | null): Promise<DaemonIdentityF
   } catch {
     // Identity is diagnostic; the version row still says what it can.
   }
-  return { pid: process.pid, startedAt, version, sourceId, sourceIdKind };
+  let build: string | null = null;
+  try {
+    build = await runningBuildIdentity();
+  } catch {
+    // Diagnostic like the source id above; the row names the version regardless.
+  }
+  return { pid: process.pid, startedAt, version, sourceId, sourceIdKind, build };
 }

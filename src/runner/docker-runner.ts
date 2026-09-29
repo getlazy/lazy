@@ -14,7 +14,7 @@ import { parsePortBindings, type PortBinding } from '../serve/ports';
 import type { RunnerType, RoleTarget } from '../config/types';
 
 import { mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
-import { mkdir as mkdirAsync, writeFile as writeFileAsync } from 'fs/promises';
+import { mkdir as mkdirAsync, writeFile as writeFileAsync, chmod as chmodAsync } from 'fs/promises';
 import { spawn } from '../utils/spawn';
 import { join, basename } from 'path';
 import { getHome } from '../utils/home';
@@ -50,7 +50,7 @@ import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
 import { getAgentPackaging } from '../agent/registry';
 import type { Agent } from '../agent/interface';
 import { encodeProjectPath } from '../import/claude-code-logs';
-import { shouldMountProjectsDir, type BuilderLaunchProjects } from '../builder/projects-isolation';
+import { projectsDirHoldsSession, shouldMountProjectsDir, type BuilderLaunchProjects } from '../builder/projects-isolation';
 import { ensureBuilderScratchDir, SCRATCH_ENV_VAR } from '../builder/scratch';
 import {
   CONTAINER_CREDENTIAL_STORE,
@@ -64,6 +64,8 @@ import {
 import { assertDaemonMcpConfigMounted } from '../builder/mcp-config-check';
 import { assertSiblingContainerLaunchSupported } from './sibling-containers';
 import { writeMcpLaunchWrapper } from '../builder/mcp-launch-wrapper';
+import { builderSupervisorLogPath, builderSupervisorLogHostPath } from '../builder/supervisor-log-path';
+import { printableTail } from '../utils/terminal-text';
 import { SANDBOX_DIR } from '../utils/sandbox';
 import { resolveAuthEnvFromDaemon } from '../daemon/auth-env';
 import type { LaunchIdentity } from '../proxy/placeholder-env';
@@ -94,6 +96,8 @@ import { isToolForRole } from '../mcp/tool-roles';
 const agentPackaging = new ClaudeCodePackaging();
 
 const DOCKER_TIMEOUT_MS = 10_000;
+/** At most this much of a dead builder's supervisor log is read. */
+const SUPERVISOR_LOG_READ_BYTES = 64 * 1024;
 
 /**
  * Label applied to every lazy-launched container that identifies the project
@@ -251,6 +255,16 @@ export class DockerRunner implements Runner {
     this.lazyRoot = lazyRoot;
   }
 
+  /**
+   * Prepare what every launch needs — the runner image and the agent binary —
+   * ahead of the first launch. Both are idempotent and cached; this only moves
+   * a cold build out of whichever launch would otherwise pay for it
+   * (src/daemon/launch-warmup.ts).
+   */
+  async prepareLaunchInputs(notify?: (detail: string) => void): Promise<void> {
+    await Promise.all([ensureImage(this.binary, notify ? { notify } : undefined), ensureAgentBinary()]);
+  }
+
   /** Set the per-role model targets (builder vs agent backends). */
   setRoleTargets(targets: { builder: RoleTarget; agent: RoleTarget }): void {
     this._roleTargets = targets;
@@ -323,11 +337,11 @@ export class DockerRunner implements Runner {
     // why. auto-resume catches this and skips, which is exactly right.
     assertSiblingContainerLaunchSupported('use the docker runner');
     await checkDocker(this.binary);
-    // Auth is NOT enforced here. The daemon credential gate
-    // (src/daemon/credential-gate.ts) is the single enforcement point — every
-    // path that launches containers goes through a daemon that refuses to start
-    // without a credential, so a redundant client-side check here would just
-    // duplicate (and risk diverging from) that gate.
+    // Auth is NOT enforced here. The turn credential gate
+    // (src/daemon/credential-gate.ts, asked by planTurnCredential before every
+    // turn launch) is the single enforcement point, and it refuses by PROFILE —
+    // a redundant runner-level check would duplicate (and risk diverging from)
+    // it, and would know nothing about which profile the turn runs on.
     // Early, non-fatal warning if a profile whose upstream lazy probes looks
     // unreachable. The fail-hard enforcement happens at launch
     // (preflightRoleTarget); here we only nudge so the user gets feedback before
@@ -568,6 +582,118 @@ export class DockerRunner implements Runner {
 
   async getRunLogs(runName: string, tailLines?: number): Promise<string | null> {
     return getContainerLogs(runName, tailLines, this.binary);
+  }
+
+  async describeExitedRun(runName: string, opts: { rawLines: number; keepLines: number; supervisorLogHostFile?: string }): Promise<string[]> {
+    const run = async (argv: string[]) => {
+      try {
+        const proc = spawn([this.binary, ...argv], { stdout: 'pipe', stderr: 'pipe', timeout: DOCKER_TIMEOUT_MS });
+        const [stdout, stderr, exitCode] = await Promise.all([
+          new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
+        ]);
+        return { stdout, stderr: stderr.trim(), exitCode };
+      } catch (err) {
+        return { stdout: '', stderr: err instanceof Error ? err.message : String(err), exitCode: null };
+      }
+    };
+    const lines: string[] = [];
+
+    // The runtime's record: a container that never got as far as running its
+    // command (a bad mount, a missing binary) says so in State.Error, and the
+    // start/finish times tell "died at once" from "ran, then exited".
+    const state = await run(['inspect', '--format', '{{json .State}}', runName]);
+    if (state.exitCode === 0) {
+      try {
+        const s = JSON.parse(state.stdout) as Record<string, unknown>;
+        lines.push(
+          `Container: exit code ${String(s.ExitCode)}, started ${String(s.StartedAt)}, finished ${String(s.FinishedAt)}` +
+          `${s.OOMKilled ? ', killed for running out of memory' : ''}${s.Error ? `, runtime error: ${String(s.Error)}` : ''}`,
+        );
+      } catch (err) {
+        lines.push(`Container state unreadable: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    } else {
+      lines.push(`Could not read the container's state: ${state.stderr || `exit ${state.exitCode}`}`);
+    }
+
+    // What it printed. `getContainerLogs` folds every failure into null,
+    // which read as "printed nothing"; here the two are told apart. Read wide
+    // and keep the lines that survive stripping: a TTY program's last screen
+    // can be pure escape codes, which a short raw tail reduces to nothing.
+    const logs = await run(['logs', '--tail', String(opts.rawLines), runName]);
+    if (logs.exitCode !== 0) {
+      lines.push(`Could not read its output: ${logs.stderr || `exit ${logs.exitCode}`}`);
+    } else {
+      const raw = logs.stdout + logs.stderr;
+      const printable = printableTail(raw, opts.keepLines);
+      if (printable) lines.push('Its output:', printable);
+      else if (raw.trim()) lines.push('It printed only terminal control sequences.');
+      else lines.push('It printed nothing.');
+    }
+
+    lines.push(await this.readSupervisorLog(runName, opts.keepLines, run, opts.supervisorLogHostFile));
+    return lines;
+  }
+
+  /**
+   * The in-container supervisor's own log (its stdout is the terminal's), which
+   * is removed with the container. Copies exactly ONE file — the fixed path
+   * for this builder id — never a directory the container filled, and refuses
+   * anything that is not a regular file: the container chooses what sits at
+   * that path, and a symlink there must not make the daemon read a host file.
+   * Never throws; says what went wrong instead.
+   */
+  private async readSupervisorLog(
+    runName: string,
+    keepLines: number,
+    run: (argv: string[]) => Promise<{ stdout: string; stderr: string; exitCode: number | null }>,
+    hostFile?: string,
+  ): Promise<string> {
+    const builderId = /^lazy-builder-([0-9a-f]{8})$/.exec(runName)?.[1];
+    if (!builderId) return 'Its supervisor log was not read (not a builder container).';
+    // The persistent copy first: it is there even when the container is not
+    // (a replaced machine, a removed container). Empty means the supervisor
+    // never wrote to it, and the container copy below is asked instead.
+    if (hostFile) {
+      const persisted = await readCappedLogFile(hostFile, keepLines);
+      if (persisted.kind === 'text') return `Supervisor log (kept on the project disk):\n${persisted.text}`;
+      if (persisted.kind === 'refused') return `Its kept supervisor log ${persisted.reason}; not read.`;
+    }
+    const { mkdtemp, lstat, open, rm } = await import('fs/promises');
+    const { constants } = await import('fs');
+    const { tmpdir } = await import('os');
+    const containerPath = builderSupervisorLogPath(builderId);
+    let dest: string | null = null;
+    try {
+      dest = await mkdtemp(join(tmpdir(), 'lazy-exited-run-'));
+      const local = join(dest, 'supervisor.log');
+      const cp = await run(['cp', `${runName}:${containerPath}`, local]);
+      if (cp.exitCode !== 0) {
+        return /no such file|could not find/i.test(cp.stderr)
+          ? `It left no supervisor log at ${containerPath} (it exited before the supervisor started).`
+          : `Could not copy its supervisor log: ${cp.stderr || `exit ${cp.exitCode}`}`;
+      }
+      const info = await lstat(local);
+      if (!info.isFile()) return `Its supervisor log at ${containerPath} is not a regular file; not read.`;
+      const handle = await open(local, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const size = (await handle.stat()).size;
+        const length = Math.min(size, SUPERVISOR_LOG_READ_BYTES);
+        const buffer = Buffer.alloc(length);
+        await handle.read(buffer, 0, length, size - length);
+        const text = printableTail(buffer.toString('utf-8'), keepLines);
+        return `Supervisor log (${containerPath}):\n${text || '(empty)'}`;
+      } finally {
+        await handle.close();
+      }
+    } catch (err) {
+      return `Could not read its supervisor log: ${err instanceof Error ? err.message : String(err)}`;
+    } finally {
+      if (dest) {
+        await rm(dest, { recursive: true, force: true }).catch((err: unknown) =>
+          logger.warn(`Could not remove ${dest}: ${err instanceof Error ? err.message : String(err)}`));
+      }
+    }
   }
 
   async execInRun(
@@ -1014,16 +1140,10 @@ export class DockerRunner implements Runner {
    * Conservative by design: any error (spawn failure, timeout, non-zero exit)
    * returns false so we degrade to the shared dir rather than risk a broken run.
    */
-  private async probeProjectsDirWritable(hostDir: string, imageName: string): Promise<boolean> {
+  private async probeProjectsDirWritable(hostDir: string, imageName: string, adopt = false): Promise<boolean> {
     try {
-      const probeTarget = '/home/user/.claude/projects/.lazy-write-probe';
       const proc = spawn(
-        [
-          this.binary, 'run', '--rm', '--init',
-          '-v', `${hostDir}:/home/user/.claude/projects`,
-          imageName,
-          'sh', '-c', `touch ${probeTarget} && rm -f ${probeTarget}`,
-        ],
+        builderProjectsProbeArgs({ binary: this.binary, hostDir, imageName, adopt }),
         { stdout: 'ignore', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
       );
       const exitCode = await proc.exited;
@@ -1434,13 +1554,23 @@ export class DockerRunner implements Runner {
    * docs/design/actor-identity-and-remote-clients.md §5.5).
    */
   async launchBuilderDetached(params: LaunchBuilderDetachedParams): Promise<LaunchBuilderDetachedResult> {
-    const { lazyRoot, systemPrompt, builderId, daemonConfigPath, projects, authEnvVars, homeDirAbs, resumeSessionId, debug } = params;
+    const { lazyRoot, systemPrompt, builderId, daemonConfigPath, projects, authEnvVars, homeDirAbs, debug } = params;
+    let resumeSessionId = params.resumeSessionId;
+    const trace = params.trace;
+    const phase = <T>(name: string, work: () => Promise<T>): Promise<T> => (trace ? trace.phase(name, work) : work());
 
-    await preflightRoleTarget('builder', this.builderTarget());
+    await phase('builder target preflight', () => preflightRoleTarget('builder', this.builderTarget()));
 
+    // Image resolution is the one phase that can take minutes (a missing or
+    // too-old image is BUILT here, or waits behind another launch's build), so
+    // its narration goes into the trail too, not only its duration.
     const [imageName, agentBinaryPath] = await Promise.all([
-      ensureImage(this.binary),
-      ensureAgentBinary(),
+      phase('container image', () => ensureImage(this.binary, trace ? {
+        // Build output and heartbeats are already logged by the build itself;
+        // only the decisions (up to date, rebuilding because…, waiting) go here.
+        notify: (d) => { if (!/^(building \S+: |still building )/.test(d)) trace.note(`image: ${d}`); },
+      } : undefined)),
+      phase('agent binary', () => ensureAgentBinary()),
     ]);
 
     const { loadConfig } = await import('../config/loader');
@@ -1474,9 +1604,12 @@ export class DockerRunner implements Runner {
     await writeFileAsync(containerConfigFile, JSON.stringify({ ...builderConfig, host: 'host.docker.internal' }, null, 2));
 
     const useDaemonProxy = !!daemonConfigPath;
+    // Every path the container is handed is its FIXED container path, never
+    // the host path: see BUILDER_CONTAINER_DIR.
+    const inContainer = BUILDER_CONTAINER_PATHS;
     const mcpArgs = useDaemonProxy
-      ? ['mcp', '--daemon-config', daemonConfigPath!, '--worktree', lazyRoot]
-      : ['mcp', '--builder-config', containerConfigFile, '--worktree', lazyRoot];
+      ? ['mcp', '--daemon-config', inContainer.daemonConfig, '--worktree', lazyRoot]
+      : ['mcp', '--builder-config', inContainer.containerConfig, '--worktree', lazyRoot];
 
     // Per-member+project state: seed/write-back file lives under this
     // session's own home rather than the shared project-level one, so two
@@ -1495,11 +1628,33 @@ export class DockerRunner implements Runner {
       // from their own persisted state, or from nothing on first launch.
       hostConfigPath: null,
       mcpArgs,
-      mcpCommand: mcpWrapperPath,
+      mcpCommand: inContainer.mcpWrapper,
+      // ...which on first launch is `{}`: a brand-new install to Claude Code,
+      // opening its theme picker/trust/key prompts. Fill those answers (never
+      // identity), trusting the directory the container runs in (`-w lazyRoot`).
+      firstRun: {
+        trustPaths: [lazyRoot],
+        apiKey: authEnvVars.find(v => v.key === 'ANTHROPIC_API_KEY')?.value,
+      },
       onWarn: (message) => logger.warn(message),
     });
 
     const neutralCredentialStore = await writeNeutralCredentialStore(tmpDir, builderId);
+    // Every file in the launch dir is bind-mounted into a container whose user
+    // is not necessarily the daemon's uid (a root daemon on native Linux).
+    await setBuilderLaunchModes(tmpDir, {
+      files: [promptFile, containerConfigFile, mergedConfigFile, neutralCredentialStore],
+      executables: [mcpWrapperPath],
+    });
+    // The in-container supervisor's log, on the member's launch dir (the
+    // project's persistent disk) rather than the container's /tmp: it survives
+    // the container's exit AND the machine being replaced, so a builder that
+    // dies at minute five leaves the same evidence as one that dies at once.
+    // World-writable because the container user need not be the daemon's uid;
+    // the launch dir itself is 0700.
+    const supervisorLogFile = builderSupervisorLogHostPath(tmpDir, builderId);
+    await writeFileAsync(supervisorLogFile, '');
+    await chmodAsync(supervisorLogFile, 0o666);
     // This container mounts homeDirAbs/.claude, not the daemon host user's
     // ~/.claude — so the permissions must be written THERE (and only there): a
     // default-target write would both leave the session without its lazy tool
@@ -1510,12 +1665,42 @@ export class DockerRunner implements Runner {
     if (projects) {
       const probeWritable = projects.trustWritable
         ? true
-        : await this.probeProjectsDirWritable(projects.hostDir, imageName);
+        // adopt: this dir is under the member's own lazy-owned home, and the
+        // container's entry adopts it too — probe what the builder will see.
+        : await phase('projects dir write probe', () => this.probeProjectsDirWritable(projects.hostDir, imageName, true));
       useProjectsMount = shouldMountProjectsDir({ trustWritable: projects.trustWritable, probeWritable });
     }
 
+    // Decided HERE, once the mount is known: a failed write probe drops the
+    // overlay, and then the container sees the member home's projects dir.
+    // `claude --resume <id>` exits at once ("No conversation found") when
+    // <id>.jsonl is not in the dir it sees, so such a launch would be dead in
+    // seconds — start a fresh conversation instead and say which was used.
+    if (resumeSessionId) {
+      const seen = useProjectsMount && projects ? projects.hostDir : join(homeDirAbs, '.claude', 'projects');
+      if (!(await projectsDirHoldsSession(seen, lazyRoot, resumeSessionId))) {
+        logger.warn(
+          `Builder ${builderId}: conversation ${resumeSessionId} is not in the projects dir the container will see ` +
+          `(${seen}), so it cannot be resumed; starting a fresh conversation instead.`,
+        );
+        resumeSessionId = null;
+      }
+    }
+    if (projects) {
+      trace?.note(`projects dir ${useProjectsMount ? 'mounted' : 'NOT mounted (write probe failed)'}; ` +
+        (resumeSessionId ? `resuming conversation ${resumeSessionId}` : 'fresh conversation'));
+    }
+
     const scratchDir = await ensureBuilderScratchDir(lazyRoot);
-    const claudeExtraArgs = resumeSessionId ? ['--resume', resumeSessionId] : [];
+    // The detached (Teams) builder composes its own argv, apart from `lazy builder`:
+    // it too runs the builder default unless the role's profile names a model.
+    const { resolveBuilderModel } = await import('../agent/agent-model');
+    const builderTarget = this.builderTarget();
+    const builderModel = resolveBuilderModel(config, { harness: builderTarget.harness, model: builderTarget.model });
+    const claudeExtraArgs = [
+      ...(resumeSessionId ? ['--resume', resumeSessionId] : []),
+      '--model', builderModel,
+    ];
 
     const dockerArgs = buildBuilderDockerArgs({
       binary: this.binary,
@@ -1528,6 +1713,7 @@ export class DockerRunner implements Runner {
       home: homeDirAbs,
       projectsHostDir: useProjectsMount ? projects!.hostDir : undefined,
       neutralCredentialStore,
+      supervisorLogFile,
       mergedConfigFile,
       mcpWrapperPath,
       authEnvVars,
@@ -1540,7 +1726,7 @@ export class DockerRunner implements Runner {
     });
 
     if (useDaemonProxy) {
-      await assertDaemonMcpConfigMounted(daemonConfigPath!, mergedConfigFile);
+      await assertDaemonMcpConfigMounted(daemonConfigPath!, mergedConfigFile, inContainer.daemonConfig);
     }
 
     if (debug) {
@@ -1549,22 +1735,24 @@ export class DockerRunner implements Runner {
 
     // `docker run -d` prints the container id and exits immediately — the
     // container's own lifetime is what continues, not this process's.
-    const proc = spawn(dockerArgs, { stdout: 'pipe', stderr: 'pipe', timeout: DOCKER_TIMEOUT_MS });
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
-    if (exitCode !== 0) {
-      const detail = stderr.trim() || stdout.trim();
-      throw new Error(
-        detail
-          ? `Failed to start detached builder session (exit ${exitCode}): ${detail.slice(0, 500)}`
-          : `Failed to start detached builder session (exit code ${exitCode})`,
-      );
-    }
+    await phase(`${this.binary} run`, async () => {
+      const proc = spawn(dockerArgs, { stdout: 'pipe', stderr: 'pipe', timeout: DOCKER_TIMEOUT_MS });
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+      if (exitCode !== 0) {
+        const detail = stderr.trim() || stdout.trim();
+        throw new Error(
+          detail
+            ? `Failed to start detached builder session (exit ${exitCode}): ${detail.slice(0, 500)}`
+            : `Failed to start detached builder session (exit code ${exitCode})`,
+        );
+      }
+    });
 
-    return { containerName: `lazy-builder-${builderId}` };
+    return { containerName: `lazy-builder-${builderId}`, resumed: resumeSessionId ?? null };
   }
 }
 
@@ -1586,6 +1774,11 @@ export interface BuilderDockerArgsParams {
   /** Per-builder Claude projects dir, when the write-probe cleared it. */
   projectsHostDir?: string;
   neutralCredentialStore: string;
+  /**
+   * Detached builders only: a daemon-created host file mounted read-write at
+   * the supervisor's log path, so the log outlives the container.
+   */
+  supervisorLogFile?: string;
   mergedConfigFile: string;
   /** Selfcheck wrapper script for lazy MCP reconnect spawns. */
   mcpWrapperPath?: string;
@@ -1628,13 +1821,27 @@ export interface BuilderDockerArgsParams {
 export function buildBuilderDockerArgs(params: BuilderDockerArgsParams): string[] {
   const {
     binary, builderId, lazyRoot, dataDir, scratchDir, containerConfigFile, agentBinaryPath,
-    home, projectsHostDir, neutralCredentialStore, mergedConfigFile, authEnvVars,
+    home, projectsHostDir, neutralCredentialStore, supervisorLogFile, mergedConfigFile, authEnvVars,
     mcpWrapperPath,
     imageName, promptFile, daemonConfigPath, claudeExtraArgs, debug, headlessClaudeArgs,
     detached,
   } = params;
 
   const interactive = !headlessClaudeArgs?.length;
+
+  // Where each launch file appears INSIDE the container. A detached (Teams)
+  // builder gets fixed paths under BUILDER_CONTAINER_DIR; the interactive and
+  // headless `lazy builder` launches keep identity mounts (host path ==
+  // container path) — their files live under the operator's own home.
+  const at = detached
+    ? {
+        scratchDir: BUILDER_CONTAINER_PATHS.scratchDir,
+        containerConfigFile: BUILDER_CONTAINER_PATHS.containerConfig,
+        promptFile: BUILDER_CONTAINER_PATHS.prompt,
+        mcpWrapperPath: BUILDER_CONTAINER_PATHS.mcpWrapper,
+        daemonConfigPath: BUILDER_CONTAINER_PATHS.daemonConfig,
+      }
+    : { scratchDir, containerConfigFile, promptFile, mcpWrapperPath, daemonConfigPath };
 
   const dockerArgs = [
     binary, 'run', '--init',
@@ -1660,10 +1867,12 @@ export function buildBuilderDockerArgs(params: BuilderDockerArgsParams): string[
     // the builder writes is readable by the human with the path as printed.
     // Lives outside the repo (~/.lazy/scratch/<project-slug>), so it can never
     // be committed. BUILDER ONLY — see src/builder/scratch.ts.
-    '-v', `${scratchDir}:${scratchDir}`,
-    '-e', `${SCRATCH_ENV_VAR}=${scratchDir}`,
+    // (A detached builder mounts it at a fixed container path instead — see
+    // BUILDER_CONTAINER_DIR; its human reads scratch through `lazy scratch`.)
+    '-v', `${scratchDir}:${at.scratchDir}`,
+    '-e', `${SCRATCH_ENV_VAR}=${at.scratchDir}`,
     // Container-specific builder config (has host.docker.internal)
-    '-v', `${containerConfigFile}:${containerConfigFile}:ro`,
+    '-v', `${containerConfigFile}:${at.containerConfigFile}:ro`,
     // MCP binary for proxy tool access
     '-v', `${agentBinaryPath}:/usr/local/bin/lazy-agent:ro`,
     // Claude config dir (settings, conversations, credentials) — mount to container's home
@@ -1691,11 +1900,12 @@ export function buildBuilderDockerArgs(params: BuilderDockerArgsParams): string[
     '-v', `${mergedConfigFile}:/home/user/.claude.json`,
     // MCP selfcheck wrapper — Claude Code respawns this on reconnect; must
     // verify the bind-mounted lazy-agent after every upgrade before exec.
-    ...(mcpWrapperPath ? ['-v', `${mcpWrapperPath}:${mcpWrapperPath}:ro`] : []),
+    ...(mcpWrapperPath ? ['-v', `${mcpWrapperPath}:${at.mcpWrapperPath}:ro`] : []),
     // A detached session's prompt file lives in the member's own launch dir,
     // outside the data-dir mount it used to ride in on, so it needs a mount of
     // its own (read-only, at the path the supervisor is told to read).
-    ...(detached ? ['-v', `${promptFile}:${promptFile}:ro`] : []),
+    ...(detached ? ['-v', `${promptFile}:${at.promptFile}:ro`] : []),
+    ...(detached && supervisorLogFile ? ['-v', `${supervisorLogFile}:${builderSupervisorLogPath(builderId)}`] : []),
     // Auth
     ...authEnvVars.flatMap(v => ['-e', `${v.key}=${v.value}`]),
     // SSH: auto-accept new host keys without TTY prompt (accept-new still rejects changed keys)
@@ -1708,7 +1918,7 @@ export function buildBuilderDockerArgs(params: BuilderDockerArgsParams): string[
   // thing from the daemon state dir a container may ever see: a single file,
   // read-only, holding just this builder's own token.
   if (daemonConfigPath) {
-    dockerArgs.push('-v', `${daemonConfigPath}:${daemonConfigPath}:ro`);
+    dockerArgs.push('-v', `${daemonConfigPath}:${at.daemonConfigPath}:ro`);
   }
 
   if (headlessClaudeArgs?.length) {
@@ -1718,10 +1928,10 @@ export function buildBuilderDockerArgs(params: BuilderDockerArgsParams): string[
       imageName,
       // Run the builder supervisor (not Claude directly)
       'lazy-agent', 'builder',
-      '--system-prompt-file', promptFile,
+      '--system-prompt-file', at.promptFile,
       '--worktree', lazyRoot,
       // Use container config (host.docker.internal) not the host config (127.0.0.1)
-      '--builder-config', containerConfigFile,
+      '--builder-config', at.containerConfigFile,
       // Stable builder id so the supervisor can stamp the detected Claude
       // sessionId onto this builder's resume intent on exit (host gets
       // sessionId: null from the runner — only the supervisor knows the id).
@@ -1730,7 +1940,7 @@ export function buildBuilderDockerArgs(params: BuilderDockerArgsParams): string[
 
     // Pass daemon config to builder supervisor if available
     if (daemonConfigPath) {
-      dockerArgs.push('--daemon-config', daemonConfigPath);
+      dockerArgs.push('--daemon-config', at.daemonConfigPath!);
     }
 
     // Pass through extra Claude args after --
@@ -1739,9 +1949,175 @@ export function buildBuilderDockerArgs(params: BuilderDockerArgsParams): string[
     }
   }
 
+  // The writable mounts under the container user's home are created by the
+  // daemon — root-owned for a root-run daemon on native Linux (the smolvm
+  // guest, a Linux server). Take ownership inside the container before the
+  // builder starts, as a task container's wrapper does
+  // (buildSupervisorWrapperScript, src/capture/claude.ts). Only these: they
+  // belong to this member alone; the data dir and repo are never adopted.
+  // DETACHED ONLY: there `home` is the lazy-owned per-member home under
+  // ~/.lazy/builder-homes/. The interactive and headless launches mount the
+  // operator's REAL ~/.claude, and a chown there would re-own the operator's
+  // own Claude config on the host.
+  if (detached) {
+    const adoptPaths = [
+      '/home/user/.claude',
+      '/home/user/.claude.json',
+      ...(projectsHostDir ? ['/home/user/.claude/projects'] : []),
+    ];
+    dockerArgs.splice(dockerArgs.indexOf(imageName) + 1, 0,
+      'sh', '-c', builderAdoptScript(adoptPaths), 'lazy-builder-entry');
+  }
+
   if (debug) {
     dockerArgs.splice(dockerArgs.indexOf(imageName), 0, '-e', 'DEBUG=1');
   }
 
   return dockerArgs;
+}
+
+/**
+ * Argv for the projects-dir write probe. With `adopt` (the detached,
+ * per-member launch only) the probe first takes ownership exactly as the
+ * builder's own entry will: a root daemon creates the dir root-owned, and a
+ * bare `touch` as the container user then failed on every Teams launch,
+ * silently dropping per-builder projects isolation. Never `adopt` for a dir in
+ * the operator's own home (the interactive `lazy builder` path).
+ */
+export function builderProjectsProbeArgs(opts: {
+  binary: string; hostDir: string; imageName: string; adopt: boolean;
+}): string[] {
+  const mount = '/home/user/.claude/projects';
+  const probeTarget = `${mount}/.lazy-write-probe`;
+  const touch = ['sh', '-c', `touch ${probeTarget} && rm -f ${probeTarget}`];
+  return [
+    opts.binary, 'run', '--rm', '--init',
+    '-v', `${opts.hostDir}:${mount}`,
+    opts.imageName,
+    ...(opts.adopt ? ['sh', '-c', builderAdoptScript([mount]), 'lazy-builder-probe'] : []),
+    ...touch,
+  ];
+}
+
+/**
+ * Fixed container-side home of a DETACHED (Teams) builder's launch files.
+ *
+ * These files are written under the daemon's HOME, which for a root-run daemon
+ * (the smolvm guest) is /root — and the runner image ships /root 0700 root, so
+ * identity-mounting them (host path == container path) left the container
+ * user (uid 1000) unable to traverse to its own prompt file: EACCES, exit 1.
+ * Reopening /root with a 0755 tmpfs does NOT work: when a tmpfs destination
+ * already exists in the rootfs, runc gives the tmpfs the IMAGE dir's mode
+ * (v1.0.x `mountToRootfs` chmods it back after mounting; v1.1+ prepends
+ * `mode=<image mode>` to the tmpfs data) — reproduced in the guest as a
+ * `drwx------ /root` tmpfs.
+ *
+ * So, like a task container's protocol dir (containerProtocolDir,
+ * src/capture/claude.ts), every file lands at a path the image does not have,
+ * whose missing parents the runtime creates 0755. Every path baked into the
+ * argv and the merged ~/.claude.json is one of these. One builder per
+ * container, so no per-builder component is needed.
+ *
+ * The scratch dir moves here too: "identical host path so the human reads it
+ * as printed" does not hold for a Teams builder, whose host is a VM nobody
+ * reads from — scratch is read through `lazy scratch` / the store capture, and
+ * LAZY_SCRATCH_DIR tells the builder where it is. Scratch is never adopted
+ * (chowned): it is per PROJECT, shared with other members and the operator,
+ * and ensureBuilderScratchDir already creates it 0777.
+ */
+export const BUILDER_CONTAINER_DIR = '/lazy-builder';
+
+export const BUILDER_CONTAINER_PATHS = {
+  prompt: `${BUILDER_CONTAINER_DIR}/builder-prompt.txt`,
+  containerConfig: `${BUILDER_CONTAINER_DIR}/builder-container.json`,
+  mcpWrapper: `${BUILDER_CONTAINER_DIR}/lazy-mcp-wrapper.sh`,
+  daemonConfig: `${BUILDER_CONTAINER_DIR}/daemon-mcp.json`,
+  scratchDir: `${BUILDER_CONTAINER_DIR}/scratch`,
+} as const;
+
+/**
+ * `sh -c` entry that takes ownership of the given mounted paths when the
+ * container user cannot write them, then execs the real command ("$@").
+ * Never fatal: a path it cannot adopt is reported and the builder still starts.
+ * One line, deliberately: it is a single argv token, and tooling that logs a
+ * container's argv line by line (and the fake docker in the e2e suites) must
+ * not see it split.
+ */
+export function builderAdoptScript(paths: string[]): string {
+  const quoted = paths.map((p) => `"${p}"`).join(' ');
+  return [
+    `for p in ${quoted}; do`,
+    '[ -e "$p" ] || continue;',
+    'find "$p" ! -writable -print -quit 2>/dev/null | grep -q . || continue;',
+    'if command -v sudo >/dev/null 2>&1; then',
+    'sudo -n chown -R "$(id -u):$(id -g)" "$p" || echo "lazy: could not take ownership of $p (a root-run daemon on Linux needs this to be writable)" >&2;',
+    'else',
+    'echo "lazy: $p is not writable by $(id -un) and sudo is unavailable — writes there will fail" >&2;',
+    'fi;',
+    'done;',
+    'exec "$@"',
+  ].join(' ');
+}
+
+/**
+ * Explicit modes for a builder launch dir and the files the container reads
+ * from it through individual bind mounts. A write honours the process umask,
+ * so the modes a container saw depended on how the daemon was started; and the
+ * container user is uid 1000 whatever uid the daemon runs as.
+ *
+ * - Files 0644, scripts 0755: readable by the container user, writable only by
+ *   their owner. (The two the container must WRITE — its `~/.claude.json` and
+ *   credential store — are taken over inside the container by the builder's
+ *   entry script, never widened here.)
+ * - The dir 0700: a bind mount's source is resolved by the container engine,
+ *   not by the container user, so the dir needs no bits for anyone else — and
+ *   keeping it closed keeps the tokens in these files away from other host users.
+ */
+export async function setBuilderLaunchModes(
+  launchDir: string,
+  opts: { files: string[]; executables: string[] },
+): Promise<void> {
+  await chmodAsync(launchDir, 0o700);
+  await Promise.all([
+    ...opts.files.map((f) => chmodAsync(f, 0o644)),
+    ...opts.executables.map((f) => chmodAsync(f, 0o755)),
+  ]);
+}
+
+/**
+ * Read the tail of a log file the CONTAINER could write to, without trusting
+ * it: refuses anything that is not a regular file and opens with O_NOFOLLOW, so
+ * a planted symlink never makes the daemon read a host file. Capped at
+ * SUPERVISOR_LOG_READ_BYTES. `empty` for a missing or zero-length file.
+ */
+export async function readCappedLogFile(
+  path: string,
+  keepLines: number,
+): Promise<{ kind: 'text'; text: string } | { kind: 'empty' } | { kind: 'refused'; reason: string }> {
+  const { lstat, open } = await import('fs/promises');
+  const { constants } = await import('fs');
+  let info;
+  try {
+    info = await lstat(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { kind: 'empty' };
+    return { kind: 'refused', reason: `could not be inspected (${err instanceof Error ? err.message : String(err)})` };
+  }
+  if (!info.isFile()) return { kind: 'refused', reason: 'is not a regular file' };
+  if (info.size === 0) return { kind: 'empty' };
+  let handle;
+  try {
+    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (err) {
+    return { kind: 'refused', reason: `could not be opened (${err instanceof Error ? err.message : String(err)})` };
+  }
+  try {
+    const size = (await handle.stat()).size;
+    const length = Math.min(size, SUPERVISOR_LOG_READ_BYTES);
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, size - length);
+    return { kind: 'text', text: printableTail(buffer.toString('utf-8'), keepLines) || '(only terminal control sequences)' };
+  } finally {
+    await handle.close();
+  }
 }

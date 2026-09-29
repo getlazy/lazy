@@ -57,7 +57,7 @@ export class PodmanRunner extends DockerRunner {
 
     logger.debug('Podman is running ✓');
 
-    // Auth is NOT enforced here. The daemon credential gate
+    // Auth is NOT enforced here. The turn credential gate
     // (src/daemon/credential-gate.ts) is the single enforcement point.
   }
 }

@@ -202,7 +202,7 @@ describe("the member container's home", () => {
         const cfg = JSON.parse(await readFile(join(home.dir, '.claude.json'), 'utf-8'));
         expect(cfg).toEqual({ theme: 'dark', hasCompletedOnboarding: true });
         expect(await readdir(join(home.dir, '.claude'))).toEqual(expect.arrayContaining(['settings.json', 'projects']));
-        expect((await readdir(join(home.dir, '.claude'))).sort()).toEqual(['projects', 'settings.json']);
+        expect((await readdir(join(home.dir, '.claude'))).sort()).toEqual(['lazy-member-session', 'projects', 'settings.json']);
         expect(await readdir(join(home.dir, '.claude', 'projects', encoded))).toEqual(['sess-1.jsonl']);
 
         // The member's side of the conversation goes back to the agent, and
@@ -963,6 +963,30 @@ describe("a member home's conversation", () => {
       await writeFile(join(home.dir, '.claude', 'projects', f.encoded, 'sess-8.jsonl'), 'TURN 1\nMEMBER\n');
       await home.close();
       expect(await readFile(sandboxTranscript, 'utf-8')).toBe('TURN 1\nMEMBER\n');
+    } finally {
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  // INVARIANT: a member copy the member never changed is neither written back
+  // nor saved. A home can be handed back after the task is free again (the
+  // member left before their container was ready), and rewriting the agent's
+  // transcript then could race a turn appending to it.
+  test('an unchanged member copy is left alone, even after the agent\'s copy moved on', async () => {
+    const f = await project();
+    try {
+      const sandboxTranscript = join(f.worktree, '.lazy-task-sandbox', '.claude', 'projects', f.encoded, 'sess-9.jsonl');
+      await mkdir(dirname(sandboxTranscript), { recursive: true });
+      await writeFile(sandboxTranscript, 'TURN 1\n');
+      const messages: unknown[] = [];
+      const storage = { createSystemMessage: async (m: unknown) => { messages.push(m); return m as never; } };
+      const home = await prepareMemberHome({ projectRoot: f.root, container: 'lazymember-abc-9', worktreePath: f.worktree, agentSessionId: 'sess-9', safeDirectories: [], storage: storage as never });
+      // A turn ran on the same session while the home was open; the member wrote nothing.
+      await writeFile(sandboxTranscript, 'TURN 1\nTURN 2\n');
+      await home.close();
+      expect(await readFile(sandboxTranscript, 'utf-8')).toBe('TURN 1\nTURN 2\n');
+      expect(messages).toEqual([]);
+      expect(await pathExists(home.dir)).toBe(false);
     } finally {
       await rm(f.root, { recursive: true, force: true });
     }

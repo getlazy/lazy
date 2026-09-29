@@ -19,21 +19,27 @@
  *                                  mutations go through /rpc//mcp handlers)
  */
 
+import { daemonStatusBuild, runningBuildIdentity } from '../utils/build-provenance';
+import { ensureLazyExcludeBestEffort } from '../git/lazy-exclude';
 import { randomUUID } from 'crypto';
 import { mkdirSync } from 'fs';
 import { mkdir, writeFile } from 'fs/promises';
 import { join } from 'path';
-import { getDaemonDir, getStartupErrorPath } from './paths';
+import { getDaemonBaseDir, getDaemonDir, getStartupErrorPath } from './paths';
+import { consumeHostReplacedMarker } from '../task/host-replaced-marker';
 import { writePid, generateToken, readToken, readWebPort, writeWebPort, writeWebHost, cleanupOwnDaemonFiles, acquireDaemonLock, releaseDaemonLock, SIGNAL_SHUTDOWN_BUDGET_MS, SHUTDOWN_STOP_GRACE_SECONDS, type AutoReactBudgetEntry } from './lifecycle';
+import { migrateBuilderStateRoot } from '../builder/state-root';
 import { startDaemonStateFileWatch } from './state-files';
 import { writeDaemonRoot } from './registry';
 import { startTestParentWatch, TEST_PARENT_PID_ENV } from './test-parent-watch';
 import { installDaemonProcessGuards } from './process-guards';
 import { readProjectInstanceId } from './project-instance';
-import { assertDaemonCredentials } from './credential-gate';
+import { recordStartupCredentialProblem, warnMissingTurnCredentials } from './credential-gate';
 import { assertStoredCredentialsReachedEnv, hydrateCredentialEnv } from '../credentials/hydrate';
-import { handleRpc, handleBuilderStorageCall, handleGetBuilderLaunchEnv, handleGetAgentLaunchEnv, openProjectStorage, initDaemonStorage, getOrCreateStorage, closeAllStorage } from './rpc-handlers';
+import { teamModeEnabled } from './user-credentials';
+import { handleRpc, handleBuilderStorageCall, handleGetBuilderLaunchEnv, handleGetAgentLaunchEnv, openProjectStorage, initDaemonStorage, getOrCreateStorage, closeAllStorage, storeAvailability } from './rpc-handlers';
 import { lookupMcpIdentity } from './mcp-tokens';
+import { primeTaskEnvRedaction } from './task-env';
 import { initTracing, shutdownTracing } from '../tracing';
 import { withRequestSpan } from './request-span';
 import { authorizeMcpCall, handleMcpToolCall, httpStatusForError, parseMcpToolCallBody } from './mcp-routes';
@@ -77,6 +83,8 @@ import {
   type PreviousGenerationSnapshot,
 } from './restart-reaper';
 import { createRunner } from '../runner';
+import { startLaunchWarmup } from './launch-warmup';
+import { settleDeadBuilderSessions } from './builder-sessions';
 import { indexRunsByName, type OwnedRuns } from '../runner/run-ownership';
 import type { Storage } from '../storage/interface';
 import { logger, LogLevel } from '../utils/logger';
@@ -102,6 +110,8 @@ import { importStartServicesCmdFromConfig } from '../serve/start-cmd';
 import { createTaskEditActions } from './task-edit-service';
 import { dashboardHostFor, resolveDashboardUrl } from './dashboard-url';
 import { isManagedMode } from '../config/managed';
+import { setGitAuthorFallback } from '../identity/git-author';
+import { systemGitAuthor } from '../identity/system-identity';
 import { guardDashboardRequest, serveDashboardRequest } from './dashboard-auth';
 import { getLogPath } from './paths';
 import { loadConfig, resolveConfigPath } from '../config/loader';
@@ -313,7 +323,7 @@ async function loadDaemonConfigOrFail(projectRoot: string) {
     return await loadConfig(projectRoot);
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
-    const configPath = resolveConfigPath(projectRoot);
+    const configPath = await resolveConfigPath(projectRoot);
     throw await recordStartupFailure(
       projectRoot,
       `Daemon failed to load ${configPath}: ${detail}\n` +
@@ -384,12 +394,86 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
 
   logger.info(`Daemon starting for project: ${projectRoot} (PID ${process.pid})`);
 
-  // The config precondition — see loadDaemonConfigOrFail. FIRST, before the
-  // credential gate and before any side effect, because both of the steps that
+  // Singleton enforcement via flock(2) — FIRST, before anything touches this
+  // project's store, its containers or its credentials.
+  //
+  // INVARIANT: a daemon that has not proved it is the project's only daemon
+  // does nothing to the project. This check used to sit far below, after
+  // credential hydration, storage initialization, the upgrade notice, the
+  // member-terminal sweep and the start of the reconcile/sync loops — so a
+  // second `lazy daemon start` for a project whose daemon was already up (a
+  // supervisor retrying a start that timed out, a fleet roll racing the
+  // reconciler) opened the store, took `.storage-lock`, removed the LIVE
+  // daemon's member-terminal containers, and only then found out it had no
+  // business being there. A start stalled anywhere in that stretch held the
+  // store lock under a live, identity-verified pid while a later start won the
+  // lock, and that daemon
+  // answered every storage RPC with "Failed to acquire storage lock".
+  //
+  // The daemon ALWAYS acquires its own lock, regardless of how it was started
+  // (foreground or background). Bun.spawn does not inherit arbitrary file
+  // descriptors — only stdin/stdout/stderr — so fd-passing from parent to
+  // child is not possible. The parent releases its lock before spawning so
+  // the child can acquire it here.
+  mkdirSync(getDaemonDir(projectRoot), { recursive: true });
+  let daemonLockFd: number | null = null;
+  // TODO(spike-rearchitecture): Remove LAZY_TEST skip once tests use isolated
+  // daemon instances with their own lock files instead of sharing a process.
+  if (!process.env.LAZY_TEST) {
+    daemonLockFd = acquireDaemonLock(projectRoot);
+    if (daemonLockFd === null) {
+      logger.error('Failed to acquire daemon lock — another daemon is running');
+      throw new Error(
+        'Another daemon is already running (lock held). ' +
+        "Stop it first with 'lazy daemon stop'."
+      );
+    }
+  }
+
+  // The PID file goes down the moment the lock is ours, so `lazy daemon stop`
+  // can find — and if need be signal — a daemon still starting up: one wedged
+  // before its listener binds is otherwise unstoppable by pid.
+  writePid(projectRoot, process.pid);
+
+  // A refusal before the full teardown exists (config, project identity) must
+  // still give back what the two lines above took: the lock, and our own PID
+  // file. Otherwise an in-process caller keeps the lock and a dead pid file
+  // outlives the start.
+  const abandonEarlyStart = <T>(err: T): T => {
+    cleanupOwnDaemonFiles(projectRoot);
+    if (daemonLockFd !== null) {
+      releaseDaemonLock(daemonLockFd);
+      daemonLockFd = null;
+    }
+    return err;
+  };
+
+
+  // The config precondition — see loadDaemonConfigOrFail. FIRST, before
+  // credential hydration and before any side effect, because the steps that
   // follow read config themselves and would otherwise surface the loader's raw
-  // error in place of this one. Nothing has been created yet, so a refusal here
-  // leaves nothing to clean up.
-  const startupConfig = await loadDaemonConfigOrFail(projectRoot);
+  // error in place of this one. Only the daemon lock and PID file exist yet, and a refusal here
+  // gives both back (abandonEarlyStart).
+  const startupConfig = await loadDaemonConfigOrFail(projectRoot).catch((err) => { throw abandonEarlyStart(err); });
+
+  // An existing project picks up lazy's runtime-file excludes without re-init.
+  await ensureLazyExcludeBestEffort(projectRoot);
+
+  // Every commit the daemon makes outside a member's request or an agent's
+  // tool call — a reconciler-driven sync, a stranded accept's resume — is
+  // authored by the configured system identity, never git's auto-detect
+  // (src/identity/git-author.ts).
+  setGitAuthorFallback(() => systemGitAuthor(projectRoot));
+
+  // Register every live per-task env value (`lazy env set`) with the log
+  // scrubber before anything below can log or record a turn: after a restart a
+  // task's container may still be running with those values, and nothing else
+  // reads the registry until that task's next launch. See src/daemon/task-env.ts.
+  try {
+    await primeTaskEnvRedaction(projectRoot);
+  } catch (err) {
+    logger.error(`Per-task env values are NOT being scrubbed from logs: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   // Say which lazy this is, in the log, at the top, every time.
   //
@@ -415,73 +499,44 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     }
   })();
 
-  // Load any stored credential into this process's environment BEFORE the gate.
-  // Everything downstream (getAuthEnvVars, the proxy, container env inheritance)
-  // reads env vars, so this is the one place the store has to be consulted —
-  // and doing it before the gate is what lets a daemon start from a shell that
-  // has no token exported (the `lazy upgrade` abort this task exists to fix).
-  // Env always wins; see hydrateCredentialEnv.
+  // Load any stored credential into this process's environment. Everything
+  // downstream (getAuthEnvVars, the proxy, container env inheritance) reads env
+  // vars, so this is where the store is consulted at startup — and doing it here
+  // is what lets a daemon started from a shell with no token exported still run
+  // turns on the stored one. Env always wins; see hydrateCredentialEnv.
   //
-  // Skipped under LAZY_TEST=1 for the same reason the gate below is: suites
-  // must not depend on what the developer's machine happens to have stored.
-  let hydrationError: unknown;
+  // NEVER FATAL. A daemon needs no model credential to exist: registering,
+  // cloning, provisioning, reads, a sync whose merge is clean and accept run
+  // without one, and a turn — including the one a conflicting sync launches to
+  // resolve its conflict — is the only thing that talks to a model. So a missing credential — or a stored
+  // one that could not be loaded — is a WARN here and in `lazy daemon health`,
+  // and the refusal happens where the credential is actually needed: at turn
+  // launch, naming the profile that lacks it (./credential-gate.ts). A stored
+  // credential that failed to load now is retried by that gate too.
+  //
+  // Skipped under LAZY_TEST=1: suites must not depend on what the developer's
+  // machine happens to have stored.
   if (process.env.LAZY_TEST !== '1') {
+    let hydrationError: unknown;
     try {
       await hydrateCredentialEnv(projectRoot);
     } catch (err) {
-      // Held, not swallowed. The gate below CANNOT catch this on its own: it
-      // answers from the same non-secret index whose disagreement with the
-      // backend is what made hydration throw, so it would pass and bring up a
-      // daemon with an empty environment. assertStoredCredentialsReachedEnv,
-      // run with the gate, is what turns that into a refusal — and this error
-      // is the only thing that says why, so it is carried there.
       hydrationError = err;
-      logger.error(
-        `Failed to load stored credentials: ${err instanceof Error ? err.message : String(err)}`,
-      );
     }
-  }
-
-  // INVARIANT: a daemon never exists without a model credential.
-  //
-  // This is the AUTHORITATIVE enforcement point — the callers (auto-start,
-  // `lazy daemon start`, `daemon restart`, `lazy upgrade`) pre-flight the same
-  // gate so the refusal lands in the user's terminal, but this is the single
-  // function that actually brings a daemon up, so enforcing here is what makes
-  // the invariant structural instead of a convention each new caller has to
-  // remember. A credential-less daemon is worse than no daemon: it runs,
-  // answers RPC, and launches containers that can't reach the model API, so
-  // tasks spin uselessly instead of failing fast.
-  //
-  // Runs BEFORE any side effect (storage, signal DB, loops, lock, PID file) so
-  // a refusal leaves nothing behind to clean up.
-  //
-  // Skipped under LAZY_TEST=1, matching the daemon's other test carve-outs
-  // (flock, chdir, logger). Suites that drive a daemon in-process would
-  // otherwise depend on whether the developer happens to have a credential
-  // exported — green on a laptop, red in CI. test/preload-generate.ts also
-  // pins a hermetic fake credential for the test process, so this carve-out is
-  // belt-and-braces rather than the only thing keeping those suites green.
-  // The production path is covered end-to-end by
-  // test/e2e/daemon-credential-gate.test.ts, which runs the real CLI as a
-  // subprocess with LAZY_TEST=''.
-  if (process.env.LAZY_TEST !== '1') {
     try {
-      // Order matters. The store's promise is checked FIRST, because a store
-      // that said "stored" and delivered nothing is a strictly more specific
-      // (and more actionable) failure than "no credential anywhere" — and it is
-      // a failure the gate itself is structurally unable to see.
+      // The store's promise, checked even when hydration did not throw: a
+      // stored kind with no env var is skipped with only a warning. What it
+      // says is the most specific explanation there is, so it is kept for the
+      // health report instead of being lost in the log.
       await assertStoredCredentialsReachedEnv(projectRoot, hydrationError);
-      await assertDaemonCredentials(projectRoot);
     } catch (err) {
-      // The marker recordStartupFailure writes is what carries a detached
-      // child's refusal to the caller's terminal (startDaemonBackground reads
-      // it after its readiness poll) and lets `lazy daemon status` explain why
-      // there is no daemon. The parent pre-flight normally catches this first;
-      // the marker covers the case where the child's environment differs from
-      // the spawning process's.
-      throw await recordStartupFailure(projectRoot, err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      recordStartupCredentialProblem(message);
+      logger.warn(`Stored credentials did not load at startup (turns needing them retry the load): ${message}`);
     }
+    await warnMissingTurnCredentials(projectRoot, {
+      perUser: await teamModeEnabled(projectRoot).catch(() => false),
+    });
   }
 
   // Initialize storage module with the project root so getOrCreateStorage()
@@ -551,7 +606,12 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // startup, so a malformed value fails the start instead of every later probe
   // — see src/daemon/project-instance.ts for why per-process identity and
   // projectRoot both fail to answer "is this daemon mine".
-  const projectInstanceId = readProjectInstanceId();
+  let projectInstanceId: ReturnType<typeof readProjectInstanceId>;
+  try {
+    projectInstanceId = readProjectInstanceId();
+  } catch (err) {
+    throw abandonEarlyStart(err);
+  }
   let stopped = false;
   let shutdownTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -568,6 +628,16 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // below); the reconcile loop reads it through a getter because the loop is
   // created first and the snapshot has to be taken as late as possible.
   let previousGenerationSnapshot: PreviousGenerationSnapshot | null = null;
+
+  // One-time move of builder homes/scratch onto a relocated state root
+  // (LAZY_BUILDER_STATE_DIR — a Teams machine's host-mounted disk). Before the
+  // member-home sweep below and before any builder can launch, so no launch ever resolves a home mid-move. A failure
+  // is loud but does not stop the daemon: the old content stays where it was.
+  try {
+    await migrateBuilderStateRoot();
+  } catch (err) {
+    logger.warn(`Builder state move failed: ${(err as Error).message}. The old builder homes were left in place; it will be retried on the next daemon start.`);
+  }
 
   // Member terminals (Teams Shell/Pair/Chat) run in containers of their own,
   // each holding a credential minted for it; both are removed by the daemon
@@ -629,31 +699,6 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // nobody is subscribed, so it costs nothing on a daemon with no listener.
   let stopHealthEvents: (() => void) | null = startDaemonHealthEvents();
 
-  // Ensure daemon directory exists
-  mkdirSync(getDaemonDir(projectRoot), { recursive: true });
-
-  // Singleton enforcement via flock(2).
-  // The daemon ALWAYS acquires its own lock, regardless of how it was started
-  // (foreground or background). Bun.spawn does not inherit arbitrary file
-  // descriptors — only stdin/stdout/stderr — so fd-passing from parent to
-  // child is not possible. The parent releases its lock before spawning so
-  // the child can acquire it here.
-  let daemonLockFd: number | null = null;
-  // TODO(spike-rearchitecture): Remove LAZY_TEST skip once tests use isolated
-  // daemon instances with their own lock files instead of sharing a process.
-  if (!process.env.LAZY_TEST) {
-    daemonLockFd = acquireDaemonLock(projectRoot);
-    if (daemonLockFd === null) {
-      logger.error('Failed to acquire daemon lock — another daemon is running');
-      throw new Error(
-        'Another daemon is already running (lock held). ' +
-        "Stop it first with 'lazy daemon stop'."
-      );
-    }
-  }
-
-  // Write PID file
-  writePid(projectRoot, process.pid);
 
   // Record the absolute project root this daemon serves. The slug is lossy, so
   // this marker is what lets `lazy daemon list/kill-stray` recover the real
@@ -882,6 +927,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         };
       } catch { /* proxy status is optional; never block the health probe */ }
 
+      const storeDown = storeAvailability();
       return Response.json({
         status: 'running',
         pid: process.pid,
@@ -910,6 +956,17 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         buildBranch,
         buildSourcePath,
         ...(codeSha ? { codeSha } : {}),
+        // The ANSWER to "which build is this", spelled once for every client
+        // (Lazy Teams renders it verbatim): `branch@sha, clean|dirty` from the
+        // stamped build info, else the running checkout's SHA for a source run.
+        // A source run asks git ONCE, synchronously, on the first call (the
+        // value is memoized for the process lifetime, and daemon startup primes
+        // it via the version-changed notice); every later call is a cache read.
+        // Same memoized value doctor's version row and the version-changed
+        // notice read, so the three can never disagree.
+        // Falls back to the build fields read above, so `build` can never be
+        // null while buildSha/buildBranch say which build this is.
+        build: await daemonStatusBuild(runningBuildIdentity, { buildSha, buildBranch, buildDirty }, codeSha),
         ...(sourceId ? { sourceId, sourceIdKind } : {}),
         webPort: boundWebPort,
         bindHost: boundBindHost,
@@ -922,6 +979,12 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
             : null),
         ...(autoReactBudget ? { autoReactBudget } : {}),
         ...(proxy ? { proxy } : {}),
+        // Present only while this daemon cannot open its store (another process
+        // holds it) — an in-memory read, so the probe's budget is untouched.
+        // A fleet supervisor reads it to tell "up" from "up and useless"; see
+        // storeAvailability. `unavailableForMs` is measured here, so a reader on
+        // another clock (a VM guest's) need not compare timestamps across clocks.
+        ...(storeDown ? { storeUnavailable: { since: new Date(storeDown.since).toISOString(), unavailableForMs: Date.now() - storeDown.since, error: storeDown.error } } : {}),
       });
     }
 
@@ -1237,7 +1300,16 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         }
       };
 
-      if (clientAcceptsHeartbeat(req)) return heartbeatEnvelopeResponse(produce, { signal: req.signal });
+      if (clientAcceptsHeartbeat(req)) return heartbeatEnvelopeResponse(produce, {
+        signal: req.signal,
+        // The one daemon-log line saying a caller left before its answer: a
+        // cut between the client and here (a relay, a forwarder) leaves this
+        // line with the work finished; a daemon that died leaves no line.
+        onCallerGone: ({ elapsedMs, heartbeats, resultStatus }) => logger.warn(
+          `RPC ${command}: the caller's connection was gone before its reply after ${elapsedMs}ms ` +
+          `(${heartbeats} heartbeats sent; ${resultStatus === null ? 'the work was still running' : `the work finished with ${resultStatus}`})`,
+        ),
+      });
       const outcome = await produce();
       return Response.json(outcome.body, { status: outcome.status });
     }
@@ -1265,6 +1337,14 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // guard: opening storage reads lazy.toml, and a broken config must surface
   // as the actionable "Daemon failed to load" error from the bind block below,
   // not as a raw loadConfig throw from here.
+  // A Lazy Teams microVM roll replaced the machine this daemon runs in and left
+  // a marker saying so; every open task's next work turn is told. Best-effort:
+  // failing to tell an agent must never stop the daemon from starting.
+  await getOrCreateStorage()
+    .then(storage => consumeHostReplacedMarker(storage, getDaemonBaseDir()))
+    .then(told => { if (told !== null) logger.info(`Daemon start: machine was replaced; told ${told} open task(s)`); })
+    .catch(err => logger.warn(`Daemon start: could not record the machine replacement: ${err instanceof Error ? err.message : err}`));
+
   previousGenerationSnapshot =
     (await getOrCreateStorage()
       .then((storage) => snapshotPreviousGenerationChildren(projectRoot, storage))
@@ -1940,7 +2020,8 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       doctorActions: createDoctorActions(projectRoot),
       taskActions: createTaskEditActions(projectRoot),
       serveActions: createServeActions(projectRoot),
-      usagePauseState: () => describeUsagePauseState(projectRoot, storage),
+      usagePauseState: () => describeUsagePauseState(projectRoot, storage, undefined, undefined, undefined, { pausedTasks: true }),
+      tokenBudget: async () => (await import('./token-budget')).describeProjectTokenBudget(projectRoot, storage),
     });
   })();
   webRequestHandler = async (req: Request) => {
@@ -2045,6 +2126,9 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     // omitted) so per-launch env injection and `lazy daemon status` resolve
     // the real proxy address.
     if (proxyServer.port) setDaemonProxyPort(proxyServer.port);
+    // What this proxy was built from: a later config change touching any of it
+    // needs a restart (src/daemon/proxy-fingerprint.ts).
+    (await import('./proxy-fingerprint')).recordRunningProxy(projectRoot, cfg);
     // What `lazy daemon health` probes: the addresses, the audit directory and
     // the audit queue's own record — never a credential.
     {
@@ -2275,6 +2359,9 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     stopSyncRetryLoop();
     stopSyncLoop();
     stopCaptureLoop();
+    // The git-author fallback is bound to this daemon's project root; an
+    // in-process daemon must not leave it answering for a root that is gone.
+    setGitAuthorFallback(null);
     stopWorktreeCleanupLoop();
     stopStateFileWatch?.();
     // Close SSE subscribers explicitly rather than leaving them to
@@ -2447,6 +2534,8 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // away with the socket — a bound TCP listener cannot be deleted out from
   // under the daemon.)
   stopStateFileWatch = startDaemonStateFileWatch({ projectRoot });
+
+  startLaunchWarmup(projectRoot);
 
   logger.info(`Daemon ready (PID ${process.pid}, ${boundBindHost}:${webPort})`);
 
@@ -2622,6 +2711,12 @@ function startDaemonReconcileLoop(
       await runPhase('reconcileTasks', async () => {
         await reconcileTasks(storage, projectRoot);
       });
+
+      // A builder that dies at ANY point of its life is recorded within one
+      // tick — exit evidence captured before its container is removed — not
+      // only when somebody next opens a page. Never throws; a no-op with no
+      // running builder rows.
+      await runPhase('settleDeadBuilderSessions', () => settleDeadBuilderSessions(projectRoot));
 
       // After reconciliation, detect state changes and route events + push branches.
       // These are lower priority than serving HTTP requests, so check for pending

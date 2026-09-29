@@ -51,7 +51,6 @@ import {
   legacyMcpConfigDir,
   purgeLegacyDaemonMcpConfigsReporting,
 } from '../../upgrade/legacy-mcp-purge';
-import { checkDaemonCredentials } from '../../daemon/credential-gate';
 import {
   listInteractiveSessions,
   describeInteractiveSession,
@@ -69,6 +68,7 @@ import {
   waitForInterveningBuildOutput,
 } from '../../upgrade/interactive-prompt';
 import { VERSION } from '../../version';
+import { missingCredentialNotice } from '../../daemon/credential-gate';
 
 const DOCKER_TIMEOUT_MS = 10_000;
 
@@ -77,53 +77,6 @@ interface ContainerInfo {
   taskShortId: string;
   task: Task | null;
   isWorking: boolean;
-}
-
-/**
- * Credential preflight for `lazy upgrade`.
- *
- * Step 4 of an upgrade restarts the daemon, and the daemon's credential gate
- * (src/daemon/credential-gate.ts) refuses to start without a model credential
- * in its environment. That gate used to fire only AFTER the upgrade had already
- * stopped every container and rebuilt the image — leaving the project with no
- * daemon, no builders, and a rebuild's worth of wasted time for a condition we
- * could have detected in the first millisecond.
- *
- * So check it FIRST, before anything is stopped or rebuilt. The check is exact,
- * not an approximation: the daemon child inherits this process's environment
- * (see startDaemonBackground → spawn with `{ ...process.env }`), so evaluating
- * the gate here evaluates the same env the daemon will be gated on.
- *
- * Why preflight rather than "inherit the credential from the daemon we are
- * about to stop": reading another process's environment is not portable (Linux
- * /proc only; macOS requires ptrace-level access) and would mean copying a live
- * secret through lazy's own memory and IPC for no benefit — the human has to
- * fix their shell environment either way, and telling them up front, with
- * nothing yet broken, is strictly better than papering over it for one run.
- *
- * Returns the actionable message when the upgrade must abort, or null to proceed.
- */
-export async function upgradeCredentialPreflight(projectRoot: string): Promise<string | null> {
-  // Test mode never starts a daemon (ensureDaemon bails on LAZY_TEST=1), so
-  // there is no gate to preflight and e2e suites need no credential. The
-  // LAZY_FORCE_CRED_PREFLIGHT hatch (test-only, same family as
-  // LAZY_FORCE_PREFLIGHT) lets the e2e suite exercise the real decision.
-  if (process.env.LAZY_TEST === '1' && process.env.LAZY_FORCE_CRED_PREFLIGHT !== '1') return null;
-
-  const gateMessage = await checkDaemonCredentials(projectRoot);
-  if (!gateMessage) return null;
-
-  return [
-    'Upgrade aborted before any changes were made.',
-    '',
-    'This upgrade would stop every container, rebuild the image and agent binary,',
-    'and then restart the daemon — but the daemon would refuse to start:',
-    '',
-    gateMessage,
-    '',
-    'Nothing was stopped, rebuilt, or changed. Your daemon and any live builder',
-    'sessions are still running. Set a credential and re-run `lazy upgrade`.',
-  ].join('\n');
 }
 
 /**
@@ -595,16 +548,11 @@ export async function commandUpgrade(args: string[]): Promise<void> {
     return;
   }
 
-  // Credential preflight — BEFORE the runner check, before storage, and above
-  // all before anything is stopped or rebuilt. A full upgrade always ends in a
-  // daemon restart, so a missing credential is fatal to the whole operation:
-  // say so now, while the running daemon and builders are still intact.
-  // --dry-run reports it as a warning instead (it changes nothing by design).
-  const credentialError = await upgradeCredentialPreflight(root);
-  if (credentialError && !dryRun) {
-    console.error(credentialError);
-    process.exit(1);
-  }
+  // One line, never a refusal: an upgrade restarts the daemon from THIS shell,
+  // which may not carry a credential the running one had. A daemon needs none
+  // to run; turns on those profiles are what will be refused.
+  const credentialNotice = await missingCredentialNotice(root);
+  if (credentialNotice) console.error(theme.warning(credentialNotice));
 
   const storage = await requireStorage();
 
@@ -692,7 +640,8 @@ export async function commandUpgrade(args: string[]): Promise<void> {
           console.log('');
           console.log(theme.warning('  Builders are NOT stopped — each reconnects in place when the new daemon'));
           console.log('  is up. You will be prompted to submit any in-progress message first (unless');
-          console.log('  --force / no TTY).');
+          console.log('  --force / no TTY). A reconnect refreshes the builder model and effort; the IMAGE');
+          console.log('  stays until the builder is restarted. `lazy doctor` lists builders whose image is behind.');
         }
 
         if (interactiveSessions.length > 0) {
@@ -723,21 +672,6 @@ export async function commandUpgrade(args: string[]): Promise<void> {
         console.log('  would be rotated in the same step (host CLI clients re-read it automatically).');
       }
 
-      // A dry run changes nothing, so a failing credential preflight is a
-      // warning here rather than an error — but it must be surfaced, because it
-      // is exactly what a real run would abort on. Print the preflight message
-      // itself (`upgradeCredentialPreflight` → `daemonCredentialError`) rather
-      // than restating the remedy: that is the only way the dry-run path and
-      // the abort path cannot drift when a new provider is added.
-      if (credentialError) {
-        console.log('');
-        console.log(theme.warning('  A real upgrade would abort immediately: no model credential in this'));
-        console.log(theme.warning('  environment, so the daemon could not be restarted afterwards.'));
-        console.log('');
-        for (const line of credentialError.split('\n')) {
-          console.log(line.length === 0 ? '' : `  ${line}`);
-        }
-      }
       return;
     }
 

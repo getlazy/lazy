@@ -217,6 +217,7 @@ async function statusView(root: string): Promise<void> {
 
     const marker = name === defaultName ? theme.success('● default') : '  ';
     console.log(`${name}  ${marker}  ${theme.separator(profile.builtin ? '(built-in)' : '([agents] in lazy.toml)')}`);
+    if (profile.description) console.log(`  ${theme.label('Use when:')}   ${profile.description}`);
     console.log(`  ${theme.label('Harness:')}    ${profile.harness} — ${binary} ${installed ? version : theme.warning('NOT INSTALLED')}`);
     console.log(`  ${theme.label('Model:')}      ${profile.model || `the ${profile.harness} default`}`);
     console.log(`  ${theme.label('Upstream:')}   ${profile.endpoint

@@ -18,6 +18,7 @@ import { isTerminalStatus } from '../../types';
 import { queryUnblockTask } from '../../daemon/rpc-fallback';
 import { requireActorIdentity } from '../identity-preflight';
 import { requireUsagePauseClear } from '../usage-pause-preflight';
+import { requireTurnCredential } from '../turn-credential-preflight';
 import { removeRecoveryFile } from '../editor';
 import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 import {
@@ -64,6 +65,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
     { name: 'approve-file', takesValue: true, accumulate: true },
     { name: 'no-approve-files', takesValue: false },
     { name: 'yes', takesValue: false },
+    { name: 'past-usage-pause', takesValue: false },
     ...RAISED_RESOLUTION_FLAGS,
   ], 'unblock');
 
@@ -81,7 +83,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
   const retiredNoApproveFiles = parsed.flags.get('no-approve-files') === true;
   if (retiredApproveFile.length > 0 || retiredNoApproveFiles) {
     console.error(`Error: ${retiredNoApproveFiles ? '--no-approve-files' : '--approve-file'} is no longer a flag of 'lazy unblock'.`);
-    console.error('Protected-file approval happens at merge time now: unblock never reverts a file.');
+    console.error('Protected-file approval happens at merge time now: unblock never reverts an undecided file (only one you Rejected in review is restored).');
     console.error(`Unblock with feedback alone, then approve when you accept: lazy accept ${taskId} --approve-file <file>`);
     process.exit(1);
   }
@@ -160,7 +162,12 @@ export async function commandUnblock(args: string[]): Promise<void> {
     // Same reason as the identity check: a paused credential refuses the turn,
     // and that must be said before the editor opens, not after.
     // Judged on the agent this unblock will run, which `--agent` may change.
-    await requireUsagePauseClear(task.id, 'unblock', agentOverride);
+    await requireUsagePauseClear(task.id, 'unblock', agentOverride, {
+      pastUsagePause: parsed.flags.get('past-usage-pause') === true,
+    });
+    // And for the same reason again: a turn on a profile with no model
+    // credential is refused at launch, and the daemon may be running with none.
+    await requireTurnCredential(task.id, { agentId: agentOverride });
 
     // INVARIANT (approval-happens-at-accept — move-file-approval-to-accept):
     // there is no protected-file guard here at all. Unblock is a feedback
@@ -398,6 +405,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
         effortOverride,
         agentOverride,
         ...(await usagePauseOverrideEligibility()),
+        ...(parsed.flags.get('past-usage-pause') === true ? { usagePausePastOnce: true as const } : {}),
       }, display);
 
       // Clean up recovery file — feedback is now durably persisted in daemon
@@ -458,7 +466,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
 }
 
 export function unblockUsage(): void {
-  console.log(`Usage: lazy unblock <task_id> [-f <file> | -m|--message <text>] [--model <model>] [--effort <level>] [--agent <profile>] [--respond-raised <id>=<text>...] [--promote-raised-subtask <id>...] [--promote-raised-peer <id>...] [--dismiss-raised <id>=<reason>...] [--acknowledge-raised <id>...] [--yes] [--follow]
+  console.log(`Usage: lazy unblock <task_id> [-f <file> | -m|--message <text>] [--model <model>] [--effort <level>] [--agent <profile>] [--respond-raised <id>=<text>...] [--promote-raised-subtask <id>...] [--promote-raised-peer <id>...] [--dismiss-raised <id>=<reason>...] [--acknowledge-raised <id>...] [--past-usage-pause] [--yes] [--follow]
 
 Unblock a task by providing feedback, or interactively review and act on it.
 
@@ -484,8 +492,10 @@ Arguments:
 
 Options:
   -f <file>           Read feedback from a file
+  --past-usage-pause   Let this task's next turn start even though its credential is past the
+                        usage-pause threshold (used up by that one turn)
   -m, --message <text>  Provide inline feedback
-  --model <model>     Override model for this turn (e.g. opus, sonnet, claude-opus-5)
+  --model <model>     Override model for this turn (e.g. opus, sonnet, claude-opus-5-5)
   --effort <level>    Override Claude Code reasoning effort for this turn (low, medium, high, xhigh, max)
                       Persists on the task for future turns.
   --agent <profile>   Switch this task to a different agent profile — an [agents.<name>]

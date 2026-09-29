@@ -76,6 +76,7 @@ describe('the unblock-time approval machinery is gone', () => {
 
   test('the Unblock form carries no per-file question, pending or rejected', () => {
     const html = actionsHtml(task(), [], [], live, {}, {
+      queuedFeedback: 0,
       fileViolations: [pending, rejected],
     });
     expect(html).toContain('review/unblock');
@@ -89,6 +90,7 @@ describe('the unblock-time approval machinery is gone', () => {
   // field, so a refused-and-retried accept cannot drop it.
   test('the Accept form still carries approved files', () => {
     const html = actionsHtml(task(), [], [], live, {}, {
+      queuedFeedback: 0,
       approvedFiles: ['kept.ts'],
       fileViolations: [pending],
     });

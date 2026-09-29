@@ -139,3 +139,63 @@ describe('runBuilderWithContinuity', () => {
     expect(launches).toHaveLength(1);
   });
 });
+
+describe('continuity relaunch takes the model from the daemon', () => {
+  afterEach(() => {
+    restoreMockedModules();
+  });
+
+  // INVARIANT: an in-place relaunch launches Claude with the model the daemon serves NOW, not the
+  // `--model` composed at first start, unless the person typed one. Otherwise a builder runs a
+  // model lazy.toml dropped days ago for as long as its container lives.
+  for (const typed of [false, true]) {
+    test(`model changes between generations (typed override: ${typed})`, async () => {
+      const launches: string[][] = [];
+      let pollCount = 0;
+      let finishFirst: ((code: number) => void) | undefined;
+      await mockModule(SPAWN_PATH, () => ({
+        spawn: (args: string[]) => {
+          launches.push([...args]);
+          if (launches.length === 1) {
+            return { exited: new Promise<number>((r) => { finishFirst = r; }), kill: () => { finishFirst?.(0); } };
+          }
+          return { exited: Promise.resolve(0), kill: () => {} };
+        },
+        spawnSyncUnsupervised: () => ({ exitCode: 0, stdout: Buffer.from(''), stderr: Buffer.from('') }),
+        DEFAULT_SUBPROCESS_TIMEOUT_MS: 60_000,
+      }));
+      const realSupervisor = await import(SUPERVISOR_BUILDER_PATH);
+      await mockModule(SUPERVISOR_BUILDER_PATH, () => ({ ...realSupervisor, preflightAgentBinaryWithRetry: async () => {} }));
+      const { runBuilderWithContinuity } = await import(CONTINUITY_PATH);
+      const { applyLaunchDirective, MODEL_OVERRIDE_FLAG } = await import('../../src/builder/launch-directive');
+
+      const composed = ['--model', 'claude-fable-5-1', ...(typed ? [MODEL_OVERRIDE_FLAG] : []), '--effort', 'high'];
+      const models = ['claude-fable-5-1', 'claude-opus-5-5'];
+      let fetches = 0;
+      const p = runBuilderWithContinuity({
+        daemonConfigPath: '/tmp/daemon-mcp.json',
+        projectRoot: '/proj',
+        worktreePath: '/proj',
+        baseEnv: {},
+        log: () => {},
+        errorOut: () => {},
+        readStatus: async () => (++pollCount <= 2 ? gen1() : gen2()),
+        fetchLaunchEnv: async () => ({
+          authEnvVars: [],
+          directive: { model: models[Math.min(fetches++, 1)], effort: 'high' },
+        }),
+        resolveResumeId: async () => 'sess',
+        pollMs: 5,
+        sleep: async () => {},
+        buildClaudeArgs: (_id: string | null, directive?: never) => ['claude', ...applyLaunchDirective(composed, directive)],
+      });
+      await new Promise((r) => setTimeout(r, 30));
+      await p;
+
+      const modelOf = (a: string[]) => a[a.indexOf('--model') + 1];
+      expect(modelOf(launches[0])).toBe('claude-fable-5-1');
+      expect(modelOf(launches[1])).toBe(typed ? 'claude-fable-5-1' : 'claude-opus-5-5');
+      expect(launches[1]).not.toContain(MODEL_OVERRIDE_FLAG);
+    });
+  }
+});

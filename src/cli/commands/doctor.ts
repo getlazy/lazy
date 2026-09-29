@@ -20,6 +20,7 @@ import {
   commandDoctorCleanDockerImages,
   commandDoctorCleanOrphanedContainers,
   commandDoctorUnsetUpstreamTracking,
+  commandDoctorRepairGitPointers,
   commandDoctorResumeInterrupted,
   commandDoctorCleanLocalCommandConversations,
   type RemedyOptions,
@@ -274,6 +275,7 @@ export async function commandDoctor(args: string[]): Promise<void> {
     { name: "unset-upstream-tracking", takesValue: false },
     { name: "resume-interrupted-tasks", takesValue: false },
     { name: "clean-local-command-conversations", takesValue: false },
+    { name: "repair-git-pointers", takesValue: false },
     { name: "delete-empty-local-command-conversations", takesValue: false },
   ], "doctor");
 
@@ -364,6 +366,7 @@ export async function commandDoctor(args: string[]): Promise<void> {
     { flag: "unset-upstream-tracking", run: commandDoctorUnsetUpstreamTracking },
     { flag: "resume-interrupted-tasks", run: commandDoctorResumeInterrupted },
     { flag: "clean-local-command-conversations", run: commandDoctorCleanLocalCommandConversations },
+    { flag: "repair-git-pointers", run: commandDoctorRepairGitPointers },
   ];
   // A modifier on one remedy, not a remedy of its own: on its own it would be a
   // delete flag with no listing in front of it, which is the shape this command
@@ -588,6 +591,7 @@ export function doctorUsage(): void {
        lazy doctor --unset-upstream-tracking [--dry-run] [--yes]
        lazy doctor --resume-interrupted-tasks [--dry-run] [--yes]
        lazy doctor --clean-local-command-conversations [--delete-empty-local-command-conversations] [--dry-run] [--yes]
+       lazy doctor --repair-git-pointers [--dry-run] [--yes]
        lazy doctor --reimport-conversations [--yes]
        lazy doctor --purge-housekeeping-conversations [--yes]
        lazy doctor --import-memory [--yes]
@@ -617,6 +621,11 @@ Remedies:
                              stored before lazy filtered it at import, so each listing
                              summary becomes the first real thing that was said. Deletes
                              nothing: a row left with no content is listed and left alone
+  --repair-git-pointers      Rewrite a task worktree's .git, commondir and gitdir pointer files
+                             back to what lazy created, when something changed them. lazy
+                             refuses to run git in such a worktree until they are repaired;
+                             also moves aside (never deletes) nested repositories a task
+                             planted in its worktree
   --delete-empty-local-command-conversations
                              Only with the flag above: also DELETE the stored conversations
                              that hold nothing but scaffolding. Never implied by --yes, asked

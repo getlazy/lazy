@@ -124,7 +124,16 @@ export async function submitTaskPreflight(
   // agents and the builder, and honoured for a person. Same rule, same words,
   // as submitTask — this preflight is what every client shows before its prompt.
   const submitTarget = await resolveSubmitTarget(task, storage);
-  const { targetBranch, intermediate } = submitTarget;
+  const { intermediate } = submitTarget;
+  // The base every client shows as "Into", and the branch the protection
+  // question is asked of: the parent task's branch for a subtask; for a root
+  // task with no named target, the remote default's REAL name — never the
+  // display fallback `main`, which is wrong for a repository whose default
+  // branch has another name. Local git only, the same resolution the adoption
+  // check uses.
+  const targetBranch = submitTarget.remoteDefault
+    ? await reviewComparisonBranch(submitTarget, projectRoot, config.remote.git_remote)
+    : submitTarget.targetBranch;
   if (intermediate && !mayOpenIntermediateReview(actor)) {
     return empty(intermediateSubmitRefusal(task, targetBranch), targetBranch);
   }

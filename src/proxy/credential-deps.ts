@@ -16,9 +16,9 @@ import type { ResolvedConfig } from '../config/types';
 import { getAuthEnvVars } from '../capture/claude';
 import { resolveAgentApiKey } from '../agent/credentials';
 import { resolveCredential } from '../credentials/store';
-import { resolveChatGptSession } from '../credentials/chatgpt-session';
+import { resolveChatGptSession, resolveChatGptSessionFrom } from '../credentials/chatgpt-session';
 import { isCredentialEnvKey } from '../utils/redact';
-import { lookupCredentialGrant } from './credential-broker';
+import { lookupCredentialGrant, type CredentialGrant } from './credential-broker';
 import {
   TargetCredentials,
   anthropicPlacement,
@@ -30,9 +30,31 @@ import {
   type TargetCredentialOutcome,
   type TargetCredentialResolver,
 } from './target-credentials';
-import type { ProxyCredentialDeps } from './server';
+import type { MemberCredentialResolution, ProxyCredentialDeps } from './server';
 import { resolveAgentUpstreams } from './agent-upstreams';
-import { NO_CREDENTIAL, type AgentWire } from '../config/agent-profiles';
+import {
+  NO_CREDENTIAL,
+  type AgentProfile,
+  type AgentWire,
+  agentProfilesFor,
+  profileNameForAgent,
+} from '../config/agent-profiles';
+import { loadConfig } from '../config/loader';
+import { isManagedMode } from '../config/managed-mode';
+import { getTaskSessionBinding } from '../daemon/session-credentials';
+import { forwardingOriginFor } from '../daemon/running-proxy-routes';
+import {
+  getUserCredential,
+  storeRenewedUserCredential,
+  teamModeEnabled,
+  type UserCredentialRecord,
+} from '../daemon/user-credentials';
+import {
+  memberCredentialFor,
+  principalPhrase,
+  profileLabel,
+  profileTakesChatGptSession,
+} from '../daemon/member-credentials';
 import { isChatGptEndpoint } from '../utils/openai-compat';
 import { namedCredentialEnvVar } from '../credentials/providers';
 import { logger } from '../utils/logger';
@@ -60,8 +82,9 @@ async function resolveAnthropic(): Promise<TargetCredentialOutcome> {
     return {
       kind: 'missing',
       reason:
-        'no Anthropic credential is available to the daemon. Run `claude setup-token` (or set ' +
-        'ANTHROPIC_API_KEY) in the environment the daemon starts from, then: lazy daemon restart',
+        'no Anthropic credential is available to the daemon. Store one with ' +
+        '`claude setup-token | lazy auth set anthropic` — the next turn loads it — or set ' +
+        'CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY where the daemon starts and restart it',
     };
   }
   return {
@@ -281,6 +304,17 @@ function resolverForSlot(
   }
 }
 
+/** The store-side answer for a managed project's pinned profile endpoint: none. */
+function managedPinnedResolver(profile: string): TargetCredentialResolver {
+  return async () => ({
+    kind: 'missing',
+    reason:
+      `agent profile "${profile}" sends its traffic to an endpoint this project chose, and on a managed ` +
+      `host that is paid only by the credential each member connects for the profile — never by the ` +
+      `host's own. Connect yours for "${profile}".`,
+  });
+}
+
 /**
  * Build the proxy's credential dependencies, and log the resulting map.
  *
@@ -300,7 +334,156 @@ export function buildProxyCredentialDeps(
   return {
     lookup: (token: string) => lookupCredentialGrant(projectRoot, token),
     targets,
+    member: (grant: CredentialGrant) => resolveMemberCredential(projectRoot, grant),
   };
+}
+
+/**
+ * TEAM MODE: the credential a verified task caller's traffic is paid with — the
+ * turn principal's OWN credential for the grant's profile — or null when this
+ * is not a team-mode task caller, and the per-upstream map decides as it
+ * always has.
+ *
+ * The principal is the owner of the task's LIVE session binding, which the
+ * launch re-points at every turn (src/daemon/turn-credentials.ts); the profile
+ * comes off the grant, which lazy minted for the launch, so neither is a claim
+ * the client makes. The project's credential store is never consulted here:
+ * per-user billing means a turn either spends its own principal's credential or
+ * is refused — no fallback to a shared key, or to anybody else's.
+ */
+export async function resolveMemberCredential(
+  projectRoot: string,
+  grant: CredentialGrant,
+): Promise<MemberCredentialResolution | null> {
+  if (grant.role !== 'agent' || !grant.taskId) return null;
+  if (!(await teamModeEnabled(projectRoot))) return null;
+
+  // EXACTLY the task UUID the grant was minted with: a code is mutable and
+  // reusable, so matching one could bill another task's principal. A grant
+  // with no UUID (minted before it was recorded) pays for nothing here.
+  const found = grant.taskUuid ? await getTaskSessionBinding(projectRoot, grant.taskUuid) : null;
+  const binding = found && found.revokedAt === null ? found : null;
+  if (!binding) {
+    return {
+      userId: null,
+      outcome: {
+        kind: 'missing',
+        reason:
+          'no turn of this task is running, so there is no member to bill for it. In a team every request ' +
+          'is paid by the member who asked for the turn; start or unblock the task to run one.',
+      },
+    };
+  }
+  const principal = binding.ownerUserId;
+  const profileName = profileNameForAgent(grant.profile);
+  const config = await loadConfig(projectRoot);
+  const profile = agentProfilesFor(config).get(profileName);
+  if (!profile) {
+    return {
+      userId: principal,
+      outcome: { kind: 'missing', reason: `agent profile "${profileName}" no longer exists in this project` },
+    };
+  }
+  const answer = await memberCredentialFor(projectRoot, principal, profile);
+  if (answer.kind === 'none-needed') {
+    return { userId: principal, outcome: { kind: 'none', reason: `agent profile "${profile.name}" takes no credential` } };
+  }
+  if (answer.kind === 'missing') {
+    return {
+      userId: principal,
+      outcome: {
+        kind: 'missing',
+        reason: `${principalPhrase(principal)} cannot pay for agent profile ${profileLabel(profile)}: ${answer.detail}`,
+      },
+    };
+  }
+  return {
+    userId: principal,
+    profile: answer.record.profile ?? null,
+    // Placed for where the RUNNING proxy sends this request (whether it is the
+    // ChatGPT backend decides the form), not for a saved config it has not
+    // been rebuilt from — which credential pays was decided the same way.
+    outcome: await memberPlacement(projectRoot, principal,
+      { ...profile, endpoint: forwardingOriginFor(projectRoot, profile.name, config) }, answer.record),
+  };
+}
+
+/**
+ * Where a member's credential goes on the wire — the SAME placements the
+ * store resolvers above produce for the same credential, so a team-mode
+ * request looks exactly like a single-user one to the upstream.
+ */
+async function memberPlacement(
+  projectRoot: string,
+  principal: string,
+  profile: AgentProfile,
+  record: UserCredentialRecord,
+): Promise<TargetCredentialOutcome> {
+  const label = `${principal} (${record.profile ? `profile ${record.profile}` : 'Claude'})`;
+  // Renewed and written back as the record's OWN owner: the service slot of a
+  // session profile answers with its holder's record, and the two uses must
+  // share that record's one renewal chain.
+  const owner = record.userId;
+  // A record paying through the Claude rule is an Anthropic credential,
+  // whatever else the profile names.
+  if (!record.profile) {
+    return { kind: 'credential', placement: anthropicPlacementForKind(record.kind, record.token), label };
+  }
+  if (profileTakesChatGptSession(profile)) {
+    let session: Awaited<ReturnType<typeof resolveChatGptSessionFrom>>;
+    try {
+      session = await resolveChatGptSessionFrom({
+        key: JSON.stringify([projectRoot, 'member', owner, record.profile]),
+        read: async () => {
+          const current = await getUserCredential(projectRoot, owner, record.profile);
+          return current ? { value: current.token, source: 'store', envVar: '' } : null;
+        },
+        describe: () => `the ChatGPT subscription ${owner} connected for agent profile "${record.profile}"`,
+        persist: async (secret, renewedFrom) => {
+          const stored = await storeRenewedUserCredential(projectRoot, owner, record.profile, secret, renewedFrom);
+          if (!stored) {
+            logger.warn(
+              `[credentials] a renewed ChatGPT session for ${owner} (profile ${record.profile}) was not ` +
+              `written back: the credential was replaced or removed while it renewed, and the newer one stands`,
+            );
+          }
+        },
+        label: `${owner}, profile ${record.profile}`,
+      });
+    } catch (err) {
+      return {
+        kind: 'missing',
+        reason:
+          `the ChatGPT subscription ${owner} connected for agent profile "${record.profile}" could not be ` +
+          `used: ${err instanceof Error ? err.message : String(err)}. Connect it again from a fresh \`codex login\`.`,
+      };
+    }
+    if (!session) return { kind: 'missing', reason: `${owner}'s ChatGPT subscription for "${record.profile}" is gone` };
+    return {
+      kind: 'credential',
+      placement: chatGptPlacement(session.tokens.accessToken, session.tokens.accountId),
+      label,
+    };
+  }
+  switch (profile.credential) {
+    case 'cursor':
+      return { kind: 'credential', placement: { kind: 'in-place', value: record.token }, label };
+    case 'ollama':
+      return { kind: 'credential', placement: ollamaPlacement(record.token), label };
+    case 'openai':
+    case 'openrouter':
+      return { kind: 'credential', placement: bearerPlacement(record.token), label };
+    case 'anthropic':
+      return { kind: 'credential', placement: anthropicPlacementForKind(record.kind, record.token), label };
+    default:
+      return {
+        kind: 'credential',
+        placement: profile.wire === 'openai'
+          ? bearerPlacement(record.token)
+          : anthropicPlacementForKind(record.kind, record.token),
+        label,
+      };
+  }
 }
 
 /**
@@ -383,6 +566,9 @@ export function buildTargetCredentials(
   // per-target model exists to close, and worse than the `none` case because it
   // spends a real secret. An origin already claimed by the SAME credential is
   // fine: that is "two profiles on the same provider share one key".
+  const pinnedProfiles = new Set(
+    [...agentProfilesFor(config).values()].filter((p) => p.endpointPinned).map((p) => p.name),
+  );
   for (const entry of resolveAgentUpstreams(config)) {
     const slot = entry.credential ?? NO_CREDENTIAL;
     const origin = originOf(entry.upstream);
@@ -400,7 +586,15 @@ export function buildTargetCredentials(
         `proxy.cursor_upstream, any [[proxy.fallback]], and the other profiles`,
       );
     }
-    const profileResolver = resolverForSlot(projectRoot, slot, entry.wire, entry.upstream);
+    const storeResolver = resolverForSlot(projectRoot, slot, entry.wire, entry.upstream);
+    // MANAGED: an endpoint the PROJECT pinned (its config, not lazy's built-in
+    // default) is paid only by the credential each member connects for that
+    // profile (resolveMemberCredential), never by the host's own store or
+    // environment — which is what lets a managed project pin one at all
+    // (src/config/managed.ts, `agents.*.endpoint`).
+    const profileResolver = storeResolver && isManagedMode() && pinnedProfiles.has(entry.profile)
+      ? managedPinnedResolver(entry.profile)
+      : storeResolver;
     claimed.set(origin, slot);
     if (profileResolver) {
       targets.set(entry.upstream, profileResolver);

@@ -27,6 +27,7 @@ import type { EffortLevel } from '../config/types';
 import { createRunner } from '../runner';
 import { harnessForTask, setRunnerAgentForTask } from './task-harness';
 import { stampSessionRunner, removeTaskRun, mustRecreateForContainerAgent } from '../runner/session-launch';
+import { mustRecreateForTaskEnv } from './task-env';
 import { pinnedCustomImage } from '../docker/worktree-image';
 import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../protocol';
 import type { UnblockCommand } from '../protocol';
@@ -48,11 +49,12 @@ import { emitSignal, readSignals, consumeSignals, consumeSignalsById } from './s
 import { writeDaemonMcpConfig } from './task-launcher';
 import { resolveWrapUpCommandFields } from './wrap-up-plan';
 import { planTurnCredential, mustRecreateForCredentialPlan, systemTurnBlock } from './turn-credentials';
-import { usagePauseHold } from './usage-pause';
+import { takeTaskAllowanceAtLaunch, usagePauseHold } from './usage-pause';
 import { hasDaemonContext } from './context';
 import { restartClusterForAddedChildren } from './cluster-restart';
 import { isClusterTask } from '../types';
 import { typeConstraintsSection } from '../task/type-constraints';
+import { recordRecreationIfRunning, recreationReason, environmentReplacedPrefix, clearEnvironmentReplaced } from '../task/environment-replaced';
 import { isUserStopped } from '../task/user-stop';
 
 import lazyToolInstructions from '../prompts/tool-instructions.md' with { type: 'text' };
@@ -62,6 +64,8 @@ import goalContextResumeText from '../prompts/goal-context-resume.md' with { typ
 import { parkTaskPaused } from '../utils/paused-status';
 import { pinnedBaseOf } from '../task/base-pin';
 import { systemActor } from '../identity/system-identity';
+import { resolveOutstandingViolations } from '../protection/outstanding-resolver';
+import { planRejectedRestores } from '../protection/rejected-restore';
 
 /**
  * Check whether a task's parent branch has commits that the task branch
@@ -211,7 +215,7 @@ export async function autoUnblockTask(
   // the project's service credential — and if there isn't one, it does not run.
   // Surfaced rather than debug-logged: a project that quietly stopped
   // auto-delivering would look like a bug in auto-delivery.
-  const systemBlock = await systemTurnBlock(lazyRoot);
+  const systemBlock = await systemTurnBlock(lazyRoot, task);
   if (systemBlock) {
     logger.warn(`Auto-unblock ${taskShortId}: skipped — ${systemBlock}`);
     return false;
@@ -262,6 +266,11 @@ export async function autoUnblockTask(
     return false;
   }
 
+  // [usage_pause]: the launch commits here, after every gate that could still
+  // skip it — so a pending "let its next turn through" is used now, not burned
+  // by a pass that then skipped (src/daemon/usage-pause.ts).
+  await takeTaskAllowanceAtLaunch(lazyRoot, task, trigger === 'child_added' ? 'cluster restart' : 'auto-delivery');
+
   // Bridge/stamp the resolved runner onto the session before launch.
   await stampSessionRunner(storage, lazyRoot, session, worktreePath, runner.type);
 
@@ -298,6 +307,13 @@ export async function autoUnblockTask(
     // INTAKE BOUNDARY: the message is assembled from comment/CI text that may
     // predate sanitization (older stored comments, external CI output). Escape
     // control characters here too — this prompt becomes argv[2] of `claude -p`.
+    // A reviewer's Reject on a protected file rides EVERY unblock, the daemon's
+    // own included: the supervisor restores it to base and commits that before
+    // the agent runs (src/protection/rejected-restore.ts) — the same plan
+    // launchUnblockTaskRun hands over for a person's unblock.
+    const restoreRejectedFiles = planRejectedRestores((await resolveOutstandingViolations(
+      lazyRoot, task, session, await storage.getSessionTurns(session.id), storage,
+    )).outstanding);
     const safeMessage = sanitizeUserText(message);
     const fullPrompt = safeMessage + '\n\n' + buildAutoDeliverPrompt(task.goal);
 
@@ -353,6 +369,18 @@ export async function autoUnblockTask(
       return recreate;
     });
     const mustRecreateForAgent = mustRecreateForContainerAgent(session, task.agent_id);
+    // `lazy env set` since this container was created: env is fixed at create.
+    const mustRecreateForEnv = await mustRecreateForTaskEnv(lazyRoot, task.id, containerName);
+    if (mustRecreateForEnv) logger.info('recreating container: task environment changed (lazy env) — launch env is fixed at create time');
+    // See src/task/environment-replaced.ts: a replaced container is told to the
+    // turn that runs in its successor.
+    await recordRecreationIfRunning(
+      storage,
+      task.id,
+      recreationReason(mustRecreateForCredential, mustRecreateForAgent, mustRecreateForEnv),
+      runner, containerName,
+    );
+    const envNotice = await environmentReplacedPrefix(storage, task.id);
     if (mustRecreateForAgent) {
       logger.info(
         `Auto-unblock ${taskShortId}: recreating container — agent changed ` +
@@ -373,7 +401,7 @@ export async function autoUnblockTask(
       // path that wakes a blocked cluster when a child is added to it
       // (cluster-restart.ts) as well as the one that resumes it after a crash.
       // Same injection `unblock` makes; see src/task/type-constraints.ts.
-      prompt: typeConstraintsSection(task) + fullPrompt,
+      prompt: envNotice + typeConstraintsSection(task) + fullPrompt,
       agent_id: task.agent_id,
       harness: harnessForTask(config, task),
       model_id: modelId,
@@ -381,6 +409,7 @@ export async function autoUnblockTask(
       ...(lowHighLoop ? { low_high_loop: { review_effort: lowHighLoop.reviewEffort } } : {}),
       agent_session_id: session.agent_session_id ?? undefined,
       sync_before_work: false,
+      ...(restoreRejectedFiles.length > 0 ? { restore_rejected_files: restoreRejectedFiles } : {}),
       // The wrap-up plan rides every work command: finality is declared DURING
       // the turn, after this write, so it cannot be sent later (§3.3).
       ...(await resolveWrapUpCommandFields({
@@ -403,7 +432,7 @@ export async function autoUnblockTask(
     }
 
     // Check if supervisor is already running
-    if (!mustRecreateForCredential && !mustRecreateForAgent && (await runner.isRunning(containerName))) {
+    if (!mustRecreateForCredential && !mustRecreateForAgent && !mustRecreateForEnv && (await runner.isRunning(containerName))) {
       logger.debug(`Auto-unblock ${taskShortId}: supervisor already running, command written`);
     } else {
       await removeTaskRun(runner, storage, session, containerName);
@@ -416,6 +445,7 @@ export async function autoUnblockTask(
         return false;
       }
     }
+    if (envNotice) await clearEnvironmentReplaced(storage, task.id);
 
     // Store container name and update interaction timestamp
     await storage.updateSessionContainerName(session.id, containerName, task.agent_id);
@@ -523,14 +553,18 @@ export async function deliverUpstreamUpdated(
     } else if (result.status === 'up_to_date') {
       logger.debug(`Auto-sync ${taskShortId}: already up to date`);
       return false;
-    } else if (result.usagePauseHeld) {
+    } else if (result.usagePauseHeld || result.credentialHeld) {
       // INVARIANT ([usage_pause]): a conflict sync the pause holds is owned by
       // the queued sync (`pending_sync`), which the retry loop re-offers with
       // backoff and which runs by itself after the reset. The upstream signal
       // is consumed here: left queued, every delivery pass for the whole pause
       // re-fetched and re-merged only to hit the same conflict and be held again.
       consumeSignalsById(task.id, upstreamSignalIds);
-      logger.info(`Auto-sync ${taskShortId}: held by the usage pause; the queued sync retries after the reset`);
+      logger.info(
+        result.credentialHeld
+          ? `Auto-sync ${taskShortId}: held — its conflict needs an agent with no model credential; the queued sync retries`
+          : `Auto-sync ${taskShortId}: held by the usage pause; the queued sync retries after the reset`,
+      );
       return false;
     } else {
       // pending_sync — the fetch failed or the task stopped being syncable; the

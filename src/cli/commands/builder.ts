@@ -19,9 +19,11 @@ import { join } from 'path';
 import { tryRemoteStorage } from '../../preconditions';
 import { existsSync, writeFileSync, mkdirSync, unlinkSync } from 'fs';
 import { getHome } from '../../utils/home';
+import { resolveStorage } from '../../preconditions';
 import { requireLazyRoot, requireStorage, parseFlags, type FlagDefinition } from '../helpers';
 import { loadConfig } from '../../config/loader';
 import { resolveRoleTarget, isKnownAnthropicModel, KNOWN_ANTHROPIC_SHORT_NAMES } from '../../utils/role-target';
+import { resolveBuilderModel } from '../../agent/agent-model';
 import { builderProfileAdvice } from '../../config/agent-profile-advice';
 import { isTTY, promptLine } from '../editor';
 import { getProjectName } from '../../storage';
@@ -44,14 +46,18 @@ import { detectBuilderLaunchSessionId } from '../../builder/session-detect';
 import { ensureBuilderScratchDir } from '../../builder/scratch';
 import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 import { agentDisplayName } from '../../agent/registry';
-import { printConversationList } from '../../conversation/list';
+import { printBuilderList } from '../../conversation/list';
 import { assembleBuilderSystemPrompt } from '../../builder/system-prompt';
+import { MODEL_OVERRIDE_FLAG, EFFORT_OVERRIDE_FLAG } from '../../builder/launch-directive';
+import { resolveBuilderLaunchInputs } from '../../builder/launch-inputs';
 import { boundCloneLogin, commandBuilderBound } from './bound-session';
 
-async function buildSystemPrompt(lazyRoot: string, runner: Runner): Promise<string> {
+async function buildSystemPrompt(lazyRoot: string, runner: Runner, relaunch = false): Promise<string> {
   // Storage is opened just for the memory/messages reads inside assembly and
   // closed immediately — the prompt is a string from here on.
-  const storage = await requireStorage();
+  // A relaunch must THROW on an unreachable store (the caller prints the resume
+  // hint); requireStorage would exit the process with the hint unsaid.
+  const storage = relaunch ? await resolveStorage() : await requireStorage();
   try {
     return await assembleBuilderSystemPrompt({ lazyRoot, runner, storage });
   } finally {
@@ -105,18 +111,18 @@ async function commandBuilderList(_lazyRoot: string): Promise<void> {
   const storage = await requireStorage();
 
   try {
-    const conversations = await storage.listConversationSummaries();
+    const builders = await storage.listBuilders();
 
-    if (conversations.length === 0) {
-      console.log('No captured builder conversations yet.');
-      console.log(`Run 'lazy builder' to start a builder session.`);
+    if (builders.length === 0) {
+      console.log('No captured Builders yet.');
+      console.log(`Run 'lazy builder' to start one.`);
       return;
     }
 
-    printConversationList(conversations);
+    printBuilderList(builders);
 
     console.log(`\nBrowse with: ${theme.command('lazy conversations')}`);
-    console.log(`Read one with: ${theme.command('lazy conversations show <session-id>')}`);
+    console.log(`Read one with: ${theme.command('lazy conversations show <builder-id>')}`);
   } finally {
     await storage.close();
   }
@@ -320,7 +326,10 @@ export async function commandBuilder(args: string[]): Promise<void> {
 
   const isResuming = resumeId !== null;
 
-  // Per-builder Claude projects-dir isolation lives under the data dir.
+  // Per-builder Claude projects-dir isolation lives under the data dir. Like the
+  // runner and the debug flag, this is process-level: changing [data] path or
+  // [runner] type needs a fresh `lazy builder`, not a relaunch. The model,
+  // profile, effort, sandbox flags and prompt ARE re-read per launch (launchOnce).
   const dataDirAbs = join(root, config.data.path);
 
   // Gate on ADOPTION before anything expensive or interactive runs. A session with
@@ -405,7 +414,6 @@ export async function commandBuilder(args: string[]): Promise<void> {
   await runner.ensureReady();
 
   // Resolve builder effort: --effort flag > config.builder.effort (default "high").
-  const builderEffort = effortOverride ?? config.builder.effort;
 
   // Per-builder Claude projects-dir isolation is resolved PER LAUNCH (see below),
   // not once up front: the relaunch loop re-launches with a resolved `--resume
@@ -429,14 +437,14 @@ export async function commandBuilder(args: string[]): Promise<void> {
   //   - Docker/Podman: the container is the boundary, so only --autonomous adds
   //     --dangerously-skip-permissions (inside the container).
   const isHostRunner = runner.type === 'dangerously-host-process-without-any-isolation';
-  const builderPermissionArgs = isHostRunner
+  const permissionArgsFor = (cfg: typeof config): string[] => isHostRunner
     ? buildBuilderPermissionArgs(
         {
-          mode: config.runner.permission_mode,
-          allowedDomains: config.runner.sandbox_allowed_domains,
-          allowWeakerNested: config.runner.sandbox_allow_weaker_nested,
-          denyRead: config.runner.sandbox_deny_read,
-          denyWrite: config.runner.sandbox_deny_write,
+          mode: cfg.runner.permission_mode,
+          allowedDomains: cfg.runner.sandbox_allowed_domains,
+          allowWeakerNested: cfg.runner.sandbox_allow_weaker_nested,
+          denyRead: cfg.runner.sandbox_deny_read,
+          denyWrite: cfg.runner.sandbox_deny_write,
         },
         autonomous,
       )
@@ -453,6 +461,31 @@ export async function commandBuilder(args: string[]): Promise<void> {
 
   const launchOnce = async (rid: string | null): Promise<BuilderLaunchResult> => {
     const isFirstLaunch = ++launchAttempt === 1;
+    // Every (re)launch re-reads lazy.toml and rebuilds the prompt: a relaunch
+    // after `lazy upgrade` may come days after the first start, and must not run
+    // the model/profile/prompt captured then. The first pass reuses what the
+    // disclosure prompts above already loaded.
+    let launchInputs: { config: typeof config; systemPrompt: string };
+    if (isFirstLaunch) {
+      launchInputs = { config, systemPrompt };
+    } else {
+      try {
+        launchInputs = await resolveBuilderLaunchInputs({
+          loadConfig: () => loadConfig(root),
+          buildSystemPrompt: () => buildSystemPrompt(root, runner, true),
+        });
+      } catch (err) {
+        // The resume intent is already consumed here, so say how to get back in.
+        console.error(`Could not relaunch the builder: ${err instanceof Error ? err.message : String(err)}`);
+        console.error('Fix the problem above, then resume the session with:');
+        console.error(`  lazy builder --resume ${rid ?? '<id>'}`);
+        return { exitCode: 1, sessionId: null, builderId: null };
+      }
+    }
+    const launchConfig = launchInputs.config;
+    const launchSystemPrompt = launchInputs.systemPrompt;
+    const builderPermissionArgs = permissionArgsFor(launchConfig);
+    const builderEffort = effortOverride ?? launchConfig.builder.effort;
     // Locate the projects dir that holds this launch's resume target (or the
     // shared dir when the session lives there). undefined outside sandbox mode.
     // Pair it with a trustWritable signal so the runner can mount a known-writable
@@ -480,10 +513,10 @@ export async function commandBuilder(args: string[]): Promise<void> {
     // the profile's endpoint (the "server") stays as configured — so
     // `lazy builder --model X` runs model X against whatever server the role's
     // profile points at. Without the flag, a profile that names a model keeps
-    // forcing it. An empty result means "omit --model" so Claude
-    // Code uses its own default — we resolve to a single value here so we never
+    // forcing it. With neither, the builder default (resolveBuilderModel) — never
+    // Claude Code's own pick and never the task default. We resolve to a single value here so we never
     // append two --model args to the Claude Code child (which would be ambiguous).
-    const builderTarget = resolveRoleTarget('builder', config, { overrideModel: modelOverride });
+    const builderTarget = resolveRoleTarget('builder', launchConfig, { overrideModel: modelOverride });
     // An explicit --model on a profile that pins no endpoint of its own goes to
     // the Anthropic API, so it must be a model that API can actually serve.
     // Reject an unrecognized name up front instead of handing it to Claude Code
@@ -501,7 +534,7 @@ export async function commandBuilder(args: string[]): Promise<void> {
       );
       process.exit(1);
     }
-    const resolvedModel = builderTarget.model || undefined;
+    const resolvedModel = resolveBuilderModel(launchConfig, { harness: builderTarget.harness, model: builderTarget.model });
 
     const claudeExtraArgs = [
       ...builderPermissionArgs,
@@ -512,7 +545,11 @@ export async function commandBuilder(args: string[]): Promise<void> {
       '--add-dir', scratchDir,
       ...(rid ? ['--resume', rid] : []),
       ...(resolvedModel ? ['--model', resolvedModel] : []),
+      // A TYPED value is marked so the in-container supervisor keeps it across
+      // relaunches; unmarked values are defaults the daemon re-resolves each time.
+      ...(modelOverride ? [MODEL_OVERRIDE_FLAG] : []),
       '--effort', builderEffort,
+      ...(effortOverride ? [EFFORT_OVERRIDE_FLAG] : []),
     ];
 
     if (runner.usesSandbox()) {
@@ -612,7 +649,7 @@ export async function commandBuilder(args: string[]): Promise<void> {
 
       try {
         const result = await runner.launchBuilderInteractive(
-          root, systemPrompt, configPath, claudeExtraArgs, undefined, daemonConfigPath, projects,
+          root, launchSystemPrompt, configPath, claudeExtraArgs, undefined, daemonConfigPath, projects,
         );
         // In docker mode the runner always reports `sessionId: null` — only the
         // in-container supervisor sees the id, and it can only stamp it when it
@@ -658,7 +695,7 @@ export async function commandBuilder(args: string[]): Promise<void> {
       // Host-process mode: launch Claude Code directly (no HTTP server needed).
       // The runner handles conversation capture internally. There is no container
       // for upgrade to stop, so builderId is null — the loop never relaunches.
-      const result = await runner.launchBuilderInteractive(root, systemPrompt, '', claudeExtraArgs);
+      const result = await runner.launchBuilderInteractive(root, launchSystemPrompt, '', claudeExtraArgs);
       return { exitCode: result.exitCode, sessionId: result.sessionId, builderId: null };
     }
   };

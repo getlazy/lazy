@@ -33,7 +33,7 @@ const ENV_KEYS = [
 ] as const;
 
 const OPENROUTER_CODEX =
-  '[agents.openrouter-codex]\nharness = "codex"\nmodel = "gpt-5-codex"\nendpoint = "https://openrouter.ai/api/v1"\n';
+  '[agents.openrouter-codex]\nharness = "codex"\nmodel = "gpt-5-codex"\nendpoint = "https://openrouter.ai/api"\n';
 
 describe('handleGetCredentialState', () => {
   let projectRoot: string;

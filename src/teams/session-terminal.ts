@@ -173,6 +173,9 @@ export async function runRemoteTerminal(opts: {
         if (!parsed.ok) return; // A malformed control frame is ignored, never fatal.
         if (parsed.message.type === 'exit') exited = { kind: 'exited', code: parsed.message.code };
         if (parsed.message.type === 'error') errorText = parsed.message.message;
+        // Preparation the daemon narrates before the terminal is ready (a
+        // member's own container being made). CRLF: stdin may already be raw.
+        if (parsed.message.type === 'status') io.stdout.write(`${parsed.message.message}\r\n`);
         return;
       }
       io.stdout.write(new Uint8Array(ev.data as ArrayBuffer));

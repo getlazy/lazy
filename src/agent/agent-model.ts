@@ -11,6 +11,7 @@ import type { ResolvedConfig } from '../config/types';
 import { resolveRoleTarget } from '../utils/role-target';
 import { profileForAgentNameOrNull } from '../config/agent-profiles';
 import { getAgent, listAgents } from './registry';
+import { BUILDER_DEFAULT_MODEL } from '../config/default-models';
 
 /**
  * The model a task has CHOSEN — an explicit override for this launch, else the
@@ -138,25 +139,26 @@ export function resolveAgentModel(
  *
  * The explicit model wins (a human's `--model`), then the role target's model
  * (a profile's own `model`, always concrete on a pinned endpoint), then the
- * harness's declared default, then the project default. Always non-empty:
+ * harness's declared default, then the BUILDER default. Always non-empty:
  * every harness refuses a model-less launch (requireLaunchModel,
  * src/agent/launch-model.ts). These launches used to omit the flag when the
  * builder profile named no model, which on the built-in claude-code profile
  * meant "whatever Claude Code picks" — the silent fallback that refusal ends.
  *
- * `[models] default` is only reached for a harness with no declared default,
- * i.e. claude-code, whose unpinned target speaks to the Anthropic API that
- * default is chosen for.
+ * `BUILDER_DEFAULT_MODEL` is only reached for a harness with no declared
+ * default, i.e. claude-code. It is deliberately NOT `[models] default`: that
+ * key is the TASK default (the cheaper tier), and lowering it must not also
+ * lower the builder's model.
  */
 export function resolveBuilderModel(
-  config: ResolvedConfig,
+  _config: ResolvedConfig,
   target: { harness: string; model?: string | null },
   explicitModel?: string | null,
 ): string {
   return explicitModel?.trim()
     || target.model?.trim()
     || agentDeclaredModel(target.harness)
-    || config.models.default;
+    || BUILDER_DEFAULT_MODEL;
 }
 
 /**
@@ -176,7 +178,7 @@ export function resolveBuilderModel(
  * hide the bug behind a model nobody chose (CLAUDE.md: no silent fallbacks).
  * Unreachable for the shipped agents — this is the guard rail for the next one.
  */
-function agentDeclaredModel(harness: string | undefined): string | null {
+export function agentDeclaredModel(harness: string | undefined): string | null {
   if (!harness || !listAgents().includes(harness)) return null;
 
   const declared = getAgent(harness).defaultModel();

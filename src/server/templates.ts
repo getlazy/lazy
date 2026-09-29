@@ -80,6 +80,7 @@ import { resolveTaskForgeLink, taskForgeIconHtml } from '../task-forge-link';
 import { isLinkedTask, formatLinkedMarker } from '../task/linked';
 import type { TaskLinkDraft } from './task-link-form';
 import { reviewReportHtml } from './review-findings';
+import { usagePausePastCheckboxHtml } from './usage-pause-banner';
 
 function linkedBadgeHtml(task: Task): string {
   const marker = formatLinkedMarker(task);
@@ -267,7 +268,7 @@ function navBadgeScript(): string {
         seen = window.localStorage.getItem(key);
       } catch (e) { /* storage blocked: no mark, so every conversation reads as new */ }
       var since = seen && /^[0-9]+$/.test(seen) ? seen : '';
-      var onListing = window.location.pathname === '/conversations'
+      var onListing = window.location.pathname === '/builders'
         && !new URLSearchParams(window.location.search).get('q');
       fetch('/api/nav-counts' + (since ? '?conversationsSince=' + since : ''))
         .then(function(r) { return r.ok ? r.json() : null; })
@@ -366,7 +367,7 @@ export function layoutOpenHtml(title: string, options?: { headExtraHtml?: string
     <a href="/tasks">Tasks</a>
     <a href="/review">Review<span class="nav-badge" id="nav-review"></span></a>
     <a href="/raised">Raised<span class="nav-badge" id="nav-raised"></span></a>
-    <a href="/conversations">Conversations<span class="nav-badge" id="nav-conversations"></span></a>
+    <a href="/builders">Builders<span class="nav-badge" id="nav-conversations"></span></a>
     <a href="/scratch">Scratch</a>
     <a href="/settings">Settings</a>
     <form class="search-form" action="/search" method="get">
@@ -708,6 +709,8 @@ export function taskActionRowHtml(
   hasOpenSession: boolean,
   /** Codes shared by more than one task — the action form's POST target falls back to the id. */
   duplicatedCodes?: ReadonlySet<string>,
+  /** The daemon judged this task's next turn paused: offer "let this turn through". */
+  usagePaused = false,
 ): string {
   // The claim, not just the status: a review still claimed on a parked task is
   // stoppable, and the button has to be drawn or the operator has no way out.
@@ -722,6 +725,7 @@ export function taskActionRowHtml(
     parts.push(actionDialogTemplateHtml('start', `
       <form method="post" action="${action('start')}" class="lz-action-form" data-lz-action-form>
         <p>Start this task? The agent will take a first turn.</p>
+        ${usagePausePastCheckboxHtml(usagePaused)}
         <div class="rv-form-actions"><button type="submit" class="btn btn-primary">Start</button></div>
       </form>`));
   }
@@ -730,6 +734,7 @@ export function taskActionRowHtml(
     parts.push(actionDialogTemplateHtml('resume', `
       <form method="post" action="${action('resume')}" class="lz-action-form" data-lz-action-form>
         <p>Resume the agent with no new feedback.</p>
+        ${usagePausePastCheckboxHtml(usagePaused)}
         <div class="rv-form-actions"><button type="submit" class="btn">Resume</button></div>
       </form>`));
   }
@@ -1614,6 +1619,8 @@ export function promptVersionHtml(
   allVersions: TaskPromptVersion[],
   /** Codes shared by more than one task — this page's links fall back to the id for those. */
   duplicatedCodes?: ReadonlySet<string>,
+  /** Task-code and id links for the prompt text. */
+  markdown?: RenderMarkdownOptions,
 ): string {
   const taskDisplayId = displayId(task);
   const breadcrumb = `<div class="breadcrumb"><a href="${taskPath(task, duplicatedCodes)}">Task ${escapeHtml(taskDisplayId)}</a> &rsaquo; Prompt</div>`;
@@ -1635,7 +1642,7 @@ export function promptVersionHtml(
         key: `prompt:${version ? `v${version.version}` : 'current'}`,
         content: promptContent,
         headHtml: `Prompt ${escapeHtml(title)}`,
-        bodyHtml: renderMarkdown(promptContent),
+        bodyHtml: renderMarkdown(promptContent, markdown),
         bodyClass: 'turn-content',
       })}
     </div>
@@ -1670,6 +1677,8 @@ export interface AgentChoice {
   name: string;
   summary: string;
   group: AgentChoiceGroup;
+  /** When to choose this profile, from its `description`; '' when none. */
+  description?: string;
 }
 
 /**
@@ -1713,7 +1722,8 @@ function agentChoiceOptions(choices: readonly AgentChoice[], selected: string): 
   const option = (choice: AgentChoice) => {
     const label = choice.summary ? `${choice.name} — ${choice.summary}` : choice.name;
     const sel = choice.name === selected ? ' selected' : '';
-    return `<option value="${escapeHtml(choice.name)}"${sel}>${escapeHtml(label)}</option>`;
+    const title = choice.description ? ` title="${escapeHtml(choice.description)}"` : '';
+    return `<option value="${escapeHtml(choice.name)}"${sel}${title}>${escapeHtml(label)}</option>`;
   };
   return AGENT_GROUP_ORDER.map((name) => {
     const members = choices.filter((c) => c.group === name);
@@ -1721,6 +1731,21 @@ function agentChoiceOptions(choices: readonly AgentChoice[], selected: string): 
       ? `<optgroup label="${escapeHtml(AGENT_GROUP_LABELS[name])}">${members.map(option).join('')}</optgroup>`
       : '';
   }).join('');
+}
+
+/**
+ * When to use each offered agent, from the profiles' `description`s — beneath
+ * the picker, because an `<option>` cannot hold a sentence people will read.
+ * Informs the choice; nothing selects a profile from it. Empty when no offered
+ * profile has one.
+ */
+export function agentDescriptionsHtml(choices: readonly AgentChoice[]): string {
+  const described = choices.filter((c) => c.description);
+  if (!described.length) return '';
+  const rows = described
+    .map((c) => `<dt><code>${escapeHtml(c.name)}</code></dt><dd>${escapeHtml(c.description!)}</dd>`)
+    .join('');
+  return `<details class="agent-descriptions"><summary class="text-muted">When to use each agent</summary><dl>${rows}</dl></details>`;
 }
 
 /** The degraded-path warning, rendered next to the picker it applies to. */
@@ -1849,6 +1874,7 @@ export function taskEditHtml(
       <label class="edit-label" for="edit-agent">Agent profile</label>
       <select class="input" id="edit-agent" name="agent">${agentOptions}</select>
       ${agentNoticeHtml(options.agentsNotice)}
+      ${agentDescriptionsHtml(options.agents)}
       ${AGENT_PICKER_HINT}
 
       <div class="action-links">
@@ -1986,6 +2012,7 @@ export function taskCreateFormHtml(
       <label class="edit-label" for="create-agent">Agent profile</label>
       <select class="input" id="create-agent" name="agent">${agentOptions}</select>
       ${agentNoticeHtml(options.agentsNotice)}
+      ${agentDescriptionsHtml(options.agents)}
       ${AGENT_PICKER_HINT}
 
       <label class="edit-label" for="create-model">Model</label>
@@ -2336,6 +2363,7 @@ export interface DashboardStats {
    * Empty when there is nothing to say or the daemon did not supply it.
    */
   usagePauseHtml?: string;
+  tokenBudgetHtml?: string;
 }
 
 function computeThresholds(values: number[]): [number, number, number] {
@@ -2858,6 +2886,7 @@ export function dashboardHtml(
     ${blockedSection}
     ${recentSection}
     ${viewAllLink}
+    ${stats.tokenBudgetHtml ?? ''}
     ${chartScript}
   `);
 }

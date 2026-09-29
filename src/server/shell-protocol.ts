@@ -30,11 +30,18 @@ export const DEFAULT_TERM_ROWS = 24;
 export type ShellClientMessage =
   | { type: 'resize'; cols: number; rows: number };
 
-/** Control messages the daemon sends. */
+/**
+ * Control messages the daemon sends. `status` narrates preparation that runs
+ * AFTER the upgrade was answered and before the terminal is `ready` — a
+ * member's own container can take minutes to make (an image build or pull),
+ * far longer than a relay in front of the daemon waits for a handshake.
+ */
 export type ShellServerMessage =
+  | { type: 'status'; message: string }
   | { type: 'ready'; container: string }
   | { type: 'exit'; code: number | null }
-  | { type: 'error'; message: string };
+  /** `detail` is what failed underneath — the Teams relay passes it to god mode only. */
+  | { type: 'error'; message: string; detail?: string };
 
 export type ParseResult =
   | { ok: true; message: ShellClientMessage }
@@ -113,6 +120,9 @@ export function parseShellServerMessage(raw: string): ServerParseResult {
   }
   const msg = parsed as Record<string, unknown>;
   switch (msg.type) {
+    case 'status':
+      if (typeof msg.message !== 'string') return { ok: false, error: 'status message has no text' };
+      return { ok: true, message: { type: 'status', message: msg.message } };
     case 'ready':
       if (typeof msg.container !== 'string') return { ok: false, error: 'ready message has no container' };
       return { ok: true, message: { type: 'ready', container: msg.container } };
@@ -123,7 +133,8 @@ export function parseShellServerMessage(raw: string): ServerParseResult {
       return { ok: true, message: { type: 'exit', code: msg.code as number | null } };
     case 'error':
       if (typeof msg.message !== 'string') return { ok: false, error: 'error message has no text' };
-      return { ok: true, message: { type: 'error', message: msg.message } };
+      if (msg.detail !== undefined && typeof msg.detail !== 'string') return { ok: false, error: 'error detail must be text' };
+      return { ok: true, message: { type: 'error', message: msg.message, ...(typeof msg.detail === 'string' ? { detail: msg.detail } : {}) } };
     default:
       return { ok: false, error: `unknown control message type: ${String(msg.type)}` };
   }

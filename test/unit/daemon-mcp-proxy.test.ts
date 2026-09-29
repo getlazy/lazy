@@ -318,6 +318,22 @@ describe('daemon MCP proxy long calls', () => {
     expect(err.message).toContain('got no answer either');
   });
 
+  // INVARIANT: the unreachable message names what the target's host resolved
+  // to, so an address this container cannot reach is not read as "down".
+  test('an unreachable named target reports what its host resolved to', async () => {
+    const probe = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('x') });
+    const deadPort = probe.port!;
+    probe.stop(true);
+
+    const err = await classifyTransportFailure(
+      'lazy_wait',
+      { ...configFor(deadPort), target: `http://localhost:${deadPort}` },
+      'fetch failed: something nobody has seen before',
+    );
+
+    expect(err.message).toContain('localhost resolved to');
+  });
+
   // A daemon that answers but serves a DIFFERENT project explains itself, since
   // relaunching the builder is genuinely the fix in that case.
   test('a foreign daemon on our port is named as the cause', async () => {

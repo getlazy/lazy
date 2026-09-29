@@ -14,10 +14,37 @@ import { tmpdir } from 'os';
 import { PiAgent, PiActivityStream, resolvePiProvider, LAZY_PI_PROVIDER_ENV } from '../../src/agent/pi';
 import { PiPackaging, PI_PINNED_VERSION } from '../../src/agent/pi-packaging';
 import { getAgent, getAgentPackaging, listAgents, agentDisplayName } from '../../src/agent/registry';
+import { extractUsage } from '../../src/proxy/usage';
+import { aggregateUsage } from '../../src/proxy/aggregate';
+import { toTurnUsage } from '../../src/utils/usage-recording';
+import type { ProxyAuditRecord } from '../../src/storage/types';
 
 const FIXTURES = join(import.meta.dir, '..', 'fixtures', 'pi');
 const PRINT_TURN = readFileSync(join(FIXTURES, 'print-turn.jsonl'), 'utf-8');
 const TOOL_USE_TURN = readFileSync(join(FIXTURES, 'tool-use-turn.jsonl'), 'utf-8');
+
+function rewriteAgentEnd(
+  stream: string,
+  rewrite: (messages: Array<Record<string, unknown>>) => void,
+): string {
+  return stream.split('\n').map((line) => {
+    if (!line.trim()) return line;
+    const event = JSON.parse(line) as Record<string, unknown>;
+    if (event.type !== 'agent_end' || !Array.isArray(event.messages)) return line;
+    rewrite(event.messages as Array<Record<string, unknown>>);
+    return JSON.stringify(event);
+  }).join('\n');
+}
+
+function auditRecord(usage: ProxyAuditRecord['usage'], seq: number): ProxyAuditRecord {
+  return {
+    id: `pi-${seq}`, seq, ts: seq, role: 'agent', taskId: 'pi-task', backend: 'proxy',
+    upstream: 'https://api.anthropic.com', method: 'POST', path: '/v1/messages',
+    endpoint: 'messages', model: 'claude-sonnet-4-5', tier: null, stream: false,
+    requestShape: null, toolUses: [], toolResults: [], status: 200, usage,
+    stopReason: null, error: null, durationMs: 1, reroute: null,
+  };
+}
 
 let agent: PiAgent;
 const savedEnv: Record<string, string | undefined> = {};
@@ -168,8 +195,8 @@ describe('PiAgent', () => {
       const response = agent.parseResponse(PRINT_TURN);
       expect(response.result).toBe('FAKE_OK hello from fake server');
       expect(response.session_id).toBe('11111111-2222-3333-4444-555555555555');
-      expect(response.usage.input_tokens).toBe(10);
-      expect(response.usage.output_tokens).toBe(8);
+      expect(response.usage!.input_tokens).toBe(10);
+      expect(response.usage!.output_tokens).toBe(8);
       expect(response.model_id).toBe('claude-sonnet-4-5');
     });
 
@@ -178,8 +205,8 @@ describe('PiAgent', () => {
       expect(response.result).toBe('FINAL: tool round-trip ok');
       expect(response.session_id).toBe('01a0648f-3066-706f-aac2-588d88248226');
       // Two LLM calls in the turn (tool_use + final): usage is the sum.
-      expect(response.usage.input_tokens).toBe(30);
-      expect(response.usage.output_tokens).toBe(11);
+      expect(response.usage!.input_tokens).toBe(30);
+      expect(response.usage!.output_tokens).toBe(11);
     });
 
     test('parses the synthesized self-contained pi_result line', () => {
@@ -193,7 +220,64 @@ describe('PiAgent', () => {
       const response = agent.parseResponse(raw!);
       expect(response.result).toBe('FINAL: tool round-trip ok');
       expect(response.session_id).toBe('01a0648f-3066-706f-aac2-588d88248226');
-      expect(response.usage.input_tokens).toBe(30);
+      expect(response.usage!.input_tokens).toBe(30);
+    });
+
+    test('leaves usage absent when pi reports no measurement', () => {
+      const line = JSON.stringify({ type: 'pi_result', result: 'done', session_id: 's1' });
+      expect(agent.parseResponse(line).usage).toBeUndefined();
+    });
+
+    test('leaves raw agent_end usage absent when any request is missing or malformed', () => {
+      const missing = rewriteAgentEnd(TOOL_USE_TURN, (messages) => {
+        const assistants = messages.filter((message) => message.role === 'assistant');
+        delete assistants[1]!.usage;
+      });
+      expect(agent.parseResponse(missing).usage).toBeUndefined();
+
+      for (const bad of [
+        {},
+        { input: 10 },
+        { input: '10', output: 5 },
+        { input: Number.NaN, output: 5 },
+        { input: 10, output: -1 },
+        { input: 10, output: 5, cacheRead: '0' },
+      ]) {
+        const malformed = rewriteAgentEnd(PRINT_TURN, (messages) => {
+          messages.find((message) => message.role === 'assistant')!.usage = bad;
+        });
+        expect(agent.parseResponse(malformed).usage).toBeUndefined();
+      }
+    });
+
+    test('matches proxy-audit totals for every request in a multi-request turn', () => {
+      const response = agent.parseResponse(TOOL_USE_TURN);
+      const end = TOOL_USE_TURN.split('\n')
+        .map((line) => line.trim() ? JSON.parse(line) as Record<string, unknown> : null)
+        .find((event) => event?.type === 'agent_end')!;
+      const assistants = (end.messages as Array<Record<string, unknown>>)
+        .filter((message) => message.role === 'assistant');
+      const records = assistants.map((message, index) => {
+        const usage = message.usage as Record<string, number>;
+        const wireBody = JSON.stringify({
+          usage: {
+            input_tokens: usage.input,
+            output_tokens: usage.output,
+            cache_creation_input_tokens: usage.cacheWrite,
+            cache_read_input_tokens: usage.cacheRead,
+          },
+        });
+        return auditRecord(extractUsage(false, wireBody), index + 1);
+      });
+
+      const stored = toTurnUsage(response.usage)!;
+      const proxy = aggregateUsage(records).totals;
+      expect(stored).toEqual({
+        inputTokens: proxy.inputTokens,
+        outputTokens: proxy.outputTokens,
+        cacheCreationTokens: proxy.cacheCreationInputTokens,
+        cacheReadTokens: proxy.cacheReadInputTokens,
+      });
     });
 
     test('surfaces an errored final message as a throw', () => {

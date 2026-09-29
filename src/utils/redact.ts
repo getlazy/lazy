@@ -22,6 +22,11 @@
  *    that `Logger` has no reach into, and the one that writes the builder log
  *  - the proxy audit log's free-text fields (src/proxy/audit-log.ts), where the
  *    agent's own Bash commands and tool results are recorded verbatim
+ *  - agent turn rows (src/daemon/turn-owner.ts), which are durable
+ *
+ * Beyond env credentials, the value set includes per-task `lazy env set`
+ * values: registered in-process by the daemon (setRegisteredSecretValues) and
+ * named by key to a launched supervisor through TASK_ENV_KEYS_VAR.
  *
  * Deliberately NOT applied to the proxy's per-request handling path or to
  * captured agent stdout/stderr beyond what `Logger` already scrubs: those are
@@ -165,11 +170,49 @@ function credentialKeysInEnv(): string[] {
  */
 function scrubbableCredentialValues(): string[] {
   const values: string[] = [];
-  for (const key of credentialKeysInEnv()) {
-    const value = process.env[key];
+  const push = (value: string | undefined) => {
     if (value && value.length >= MIN_SCRUBBABLE_VALUE_LENGTH) values.push(value);
+  };
+  for (const key of credentialKeysInEnv()) push(process.env[key]);
+  // Per-task env keys this process was launched with (the supervisor and the
+  // agent's process tree): secret whatever they are NAMED — see TASK_ENV_KEYS_VAR.
+  const taskKeys = process.env[TASK_ENV_KEYS_VAR];
+  if (taskKeys) {
+    for (const key of taskKeys.split(',')) if (key) push(process.env[key]);
+  }
+  for (const set of registeredSecretValues.values()) {
+    for (const value of set) push(value);
   }
   return values;
+}
+
+/**
+ * Env var through which a launched supervisor learns which of its env vars are
+ * per-task values (`lazy env set`), as a comma-separated KEY list — never the
+ * values, which it already has. Needed because the supervisor is a separate
+ * process (usually in a container) with no access to the daemon's task-env
+ * file, and those keys need not match any credential name shape.
+ */
+export const TASK_ENV_KEYS_VAR = 'LAZY_TASK_ENV_KEYS';
+
+/**
+ * Secret values registered by an in-process SOURCE that knows them without
+ * them being in process.env — today the daemon's per-task env registry
+ * (src/daemon/task-env.ts), which re-registers its whole value set every time
+ * it reads or writes the file, so an unset or cleared value stops being
+ * scrubbed.
+ */
+const registeredSecretValues = new Map<string, ReadonlySet<string>>();
+
+/**
+ * Replace the full set of secret values known to `source`. An empty set drops
+ * the source. Short values are held but never applied, by the same threshold
+ * as env credentials (MIN_SCRUBBABLE_VALUE_LENGTH).
+ */
+export function setRegisteredSecretValues(source: string, values: Iterable<string>): void {
+  const set = new Set(values);
+  if (set.size === 0) registeredSecretValues.delete(source);
+  else registeredSecretValues.set(source, set);
 }
 
 /**

@@ -23,10 +23,12 @@
  */
 
 import { readFile } from 'fs/promises';
+import { applyLaunchDirective, type BuilderLaunchDirective } from '../builder/launch-directive';
 import { spawn } from '../utils/spawn';
 import { basename, join } from 'path';
 import { getHome } from '../utils/home';
 import { log, logError, setLogFile } from './log';
+import { builderSupervisorLogPath } from '../builder/supervisor-log-path';
 
 // JSONL discovery / capture for conversation capture
 import { discoverProjectSessionFiles } from '../import/claude-code-logs';
@@ -109,7 +111,10 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
   // Redirect log output to a file so it doesn't leak into the interactive
   // Claude session (stdout/stderr are Claude's territory during the session).
   // Use /tmp since the repo may be mounted read-only in Docker mode.
-  const builderLogFile = `/tmp/lazy-builder-${Date.now()}.log`;
+  // Named by the builder id when there is one: the daemon copies exactly this
+  // one file out of a container that died (builderSupervisorLogPath), never a
+  // directory it would have to trust.
+  const builderLogFile = builderSupervisorLogPath(config.builderId);
   setLogFile(builderLogFile);
 
   log('[builder] Starting builder supervisor');
@@ -182,16 +187,13 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
   // Build Claude args — continuity relaunches pass an explicit resume id; the
   // initial launch keeps whatever `--resume` arrived via CLI after `--`.
   const claudeExtraWithoutResume = stripResumeFromClaudeArgs(config.claudeExtraArgs);
-  const buildClaudeArgs = (resumeId: string | null): string[] => {
-    const args = [
-      'claude',
-      '--append-system-prompt', safeArgvPrompt(systemPrompt, 'builder system prompt'),
-    ];
-    const id = resumeId ?? initialResumeSessionId;
-    if (id) args.push('--resume', id);
-    args.push(...claudeExtraWithoutResume);
-    return args;
-  };
+  const buildClaudeArgs = (resumeId: string | null, directive?: BuilderLaunchDirective): string[] =>
+    composeBuilderClaudeArgs({
+      systemPrompt,
+      resumeId: resumeId ?? initialResumeSessionId,
+      extraArgs: claudeExtraWithoutResume,
+      directive,
+    });
 
   if (config.debug) {
     log(`[builder] Claude args: ${buildClaudeArgs(initialResumeSessionId).join(' ')}`);
@@ -384,6 +386,19 @@ export async function preflightAgentBinary(command: string): Promise<void> {
   }
 
   log(`[builder] Preflight OK: ${stdout.trim()}`);
+}
+
+/** The claude argv for one builder launch. Exported so tests hit the real composition. */
+export function composeBuilderClaudeArgs(opts: {
+  systemPrompt: string;
+  resumeId: string | null;
+  extraArgs: string[];
+  directive?: BuilderLaunchDirective;
+}): string[] {
+  const args = ['claude', '--append-system-prompt', safeArgvPrompt(opts.systemPrompt, 'builder system prompt')];
+  if (opts.resumeId) args.push('--resume', opts.resumeId);
+  args.push(...applyLaunchDirective(opts.extraArgs, opts.directive));
+  return args;
 }
 
 /** Total wall-clock budget for continuity relaunch preflight retries. */

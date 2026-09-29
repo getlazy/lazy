@@ -1,17 +1,19 @@
 /**
  * THE ONE SHAPE of "how much of each credential's limits is used": what
  * `lazy stats limits --json` prints and what the `lazy_usage_limits` MCP tool
- * returns. Both build it here, so the two cannot drift.
+ * returns. Both build it here, so the two cannot drift — and both attach the
+ * token budget the same way (`attachBudget`, src/usage-pause/budget-view.ts).
  *
  * Pure: the readings come from the proxy's tracker (`usageLimits` RPC), the
  * pause state from `[usage_pause]` (`usagePause` RPC). Narrowing to one
  * credential — what a task agent is allowed to see — is `scopeUsageLimitsView`,
  * applied by the daemon before anything leaves it.
  */
-import type { UsageLimitReading } from '../proxy/usage-limits';
+import type { UsageLimitReading, UsageWindow } from '../proxy/usage-limits';
 import {
   describeReadingsStoreError,
   overageStatusOf,
+  windowResetSince,
   type OverageStatus,
   type UsagePauseCoverage,
   type UsagePauseVerdict,
@@ -25,7 +27,21 @@ export interface UsageLimitHoldView {
   hold: UsagePauseHold;
 }
 
-export interface UsageLimitsReadingView extends UsageLimitReading {
+export interface UsageLimitsWindowView extends UsageWindow {
+  /**
+   * Set when the window has reset since the reading (its reset time passed, or
+   * an untimed reading aged out): Unix ms of that moment. `usedPercent` and
+   * `status` are then null — nothing is known about the window until the next
+   * request. The stored numbers stay in the reading's `storedWindows`.
+   */
+  resetSince: number | null;
+}
+
+export interface UsageLimitsReadingView extends Omit<UsageLimitReading, 'windows'> {
+  /** The reading's windows as of now: one that has reset carries `resetSince` and no percentage. */
+  windows: UsageLimitsWindowView[];
+  /** The windows exactly as stored when the reading was taken — for forensics, never current usage. */
+  storedWindows: UsageWindow[];
   /** Paid overage on this credential, from its latest reading, or null when not reported. */
   overage: OverageStatus | null;
   /** The verdict `[usage_pause]` is holding this credential under right now, or null. */
@@ -61,6 +77,9 @@ export interface UsageLimitsPauseView {
   coverage: UsagePauseCoverage[];
 }
 
+/** How every unreadable-readings refusal begins — {@link attachBudget} keeps it loud. */
+export const UNREADABLE_PREFIX = "Could not read the proxy's usage-limit readings: ";
+
 /**
  * The one refusal every surface that builds a view gives while the saved
  * readings cannot be read — `lazy stats limits --json`, `lazy_usage_limits` on
@@ -68,7 +87,7 @@ export interface UsageLimitsPauseView {
  */
 export function usageLimitsUnreadableMessage(e: { path: string | null; message: string }): string {
   return (
-    `Could not read the proxy's usage-limit readings: ${describeReadingsStoreError(e)} ` +
+    `${UNREADABLE_PREFIX}${describeReadingsStoreError(e)} ` +
     `No numbers are shown rather than numbers that would look like nothing was used.`
   );
 }
@@ -97,6 +116,19 @@ export interface UsageLimitsView {
 }
 
 /**
+ * A stored window as it stands at `now`. INVARIANT: a window the pause treats
+ * as reset (`windowResetSince`) never carries its old percentage — a builder
+ * reading `usedPercent: 100` of a window that is empty would plan around a
+ * limit that is not there.
+ */
+export function currentWindow(w: UsageWindow, readingTs: number, now: number): UsageLimitsWindowView {
+  const resetSince = windowResetSince(w, readingTs, now);
+  return resetSince === null
+    ? { ...w, resetSince: null }
+    : { ...w, usedPercent: null, status: null, resetSince };
+}
+
+/**
  * INVARIANT: an empty reading list never means "the readings could not be
  * read", and "armed, NO READING" never drops out of the machine-readable view.
  * With the saved readings unreadable, the daemon's reading list is empty or
@@ -104,12 +136,18 @@ export interface UsageLimitsView {
  * as untouched headroom. And `coverage` rides along, scoped like the readings,
  * so a credential armed with no reading is listed rather than simply absent.
  */
-export function projectUsageLimits(readings: UsageLimitReading[], pause: UsageLimitsPauseInput): UsageLimitsView {
+export function projectUsageLimits(
+  readings: UsageLimitReading[],
+  pause: UsageLimitsPauseInput,
+  now: number = Date.now(),
+): UsageLimitsView {
   if (pause.storeError) throw new UsageLimitsUnreadableError(pause.storeError);
   return {
     scope: 'project',
     readings: readings.map((r) => ({
       ...r,
+      windows: r.windows.map((w) => currentWindow(w, r.ts, now)),
+      storedWindows: r.windows.map((w) => ({ ...w })),
       overage: overageStatusOf(r),
       paused: pause.paused.find((p) => p.credential === r.credential) ?? null,
     })),

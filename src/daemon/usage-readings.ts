@@ -86,7 +86,7 @@ function toStored(r: UsageLimitReading | StoredUsageLimitReading): StoredUsageLi
  */
 function materialKey(reading: StoredUsageLimitReading): string {
   return JSON.stringify(
-    usageWindows(reading.headers, reading.ts).map((w) => [
+    usageWindows(reading.headers, reading.ts, reading.status).map((w) => [
       w.name, w.usedPercent === null ? null : Math.floor(w.usedPercent), w.status, w.resetsAt,
     ]),
   );

@@ -29,6 +29,7 @@
  */
 
 import { join } from 'path';
+import { assertTestLaunchHasPrivateHome } from '../mcp/test-home-guard';
 import { writeFile, unlink } from 'fs/promises';
 import { prepareTurnMcp } from './mcp-setup';
 import { createRunnerFromType } from '../runner';
@@ -192,6 +193,9 @@ export async function runInContainerPair(opts: InContainerPairOptions): Promise<
     // Seed onboarding/theme state and align $HOME/.claude.json with the sandbox
     // copy. Containers launched after the mount lands read the bind-mounted file;
     // older containers still running get a one-shot copy onto the ephemeral path.
+    // Before the copy below, which replaces $HOME/.claude.json wholesale: a
+    // test-launched session must not touch a HOME its harness did not declare.
+    assertTestLaunchHasPrivateHome();
     await activateTaskClaudeConfig(opts.worktreePath);
 
     // Throws McpToolsUnavailableError when the tools cannot be registered. Let it

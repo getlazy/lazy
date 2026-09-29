@@ -24,9 +24,9 @@ import { theme } from '../../render/theme';
 /**
  * Statuses where a container/process for the task may already be running.
  *
- * Docker fixes a container's environment at creation time (`docker run -e`) and
- * lazy reuses a live supervisor container across turns, so a change made now
- * reaches the agent at the NEXT launch, not this instant. Saying so is the
+ * Docker fixes a container's environment at creation time, so a change made
+ * now cannot reach a turn already running; the NEXT launch recreates the
+ * container when the env changed (mustRecreateForTaskEnv), so it lands then. Saying so is the
  * difference between "lazy is broken" and "one more step" — see the
  * principle-of-least-surprise rule in CLAUDE.md.
  */

@@ -38,6 +38,7 @@ import {
 } from '../../import/reimport-conversations';
 import { toStoredConversation } from '../../import/conversation-storage';
 import type { Storage } from '../../storage/interface';
+import type { BuilderSummary, StoredConversation } from '../../storage/types';
 
 export async function commandImportConversation(args: string[]): Promise<void> {
   // Parse and validate flags
@@ -317,13 +318,33 @@ export async function showConversationTranscript(storage: Storage, sessionIdPref
     console.error(`Failed to load conversation: ${match.sessionId}`);
     process.exit(1);
   }
+  printConversationTranscript(conv, lineRange);
+}
 
+/**
+ * Print a transcript. `builder`, when given, is the Builder the transcript is
+ * (`lazy conversations show`): the header then names the Builder, its segments
+ * and its run badge instead of a single session.
+ */
+export function printConversationTranscript(
+  conv: StoredConversation,
+  lineRange: LineRange | null = null,
+  builder: BuilderSummary | null = null,
+): void {
   // Build output into a buffer
   const outputLines: string[] = [];
 
   // Header
-  outputLines.push(`Conversation ${theme.taskId(conv.sessionId.substring(0, 8))}`);
-  outputLines.push(`  ${theme.label('Session:')}  ${conv.sessionId}`);
+  if (builder) {
+    outputLines.push(`Builder ${theme.taskId(builder.id.substring(0, 8))}${builder.run?.live ? ` ${theme.success(`[${builder.run.state}]`)}` : ''}`);
+    outputLines.push(`  ${theme.label('Id:')}       ${builder.id}`);
+    if (builder.segments.length > 1) {
+      outputLines.push(`  ${theme.label('Segments:')} ${builder.segments.length} (${builder.segments.map((s) => s.substring(0, 8)).join(', ')})`);
+    }
+  } else {
+    outputLines.push(`Conversation ${theme.taskId(conv.sessionId.substring(0, 8))}`);
+    outputLines.push(`  ${theme.label('Session:')}  ${conv.sessionId}`);
+  }
   if (conv.gitBranch) {
     outputLines.push(`  ${theme.label('Branch:')}   ${conv.gitBranch}`);
   }

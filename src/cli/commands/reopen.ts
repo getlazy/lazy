@@ -1,9 +1,10 @@
 import { join } from 'path';
 import { requireActorIdentity } from '../identity-preflight';
-import { shortId, displayId, taskRef, getWorktreePath, getWorktreePathForRef } from '../../task/identity';
+import { shortId, displayId, taskRef, getWorktreePathForRef } from '../../task/identity';
 import { existsSync } from 'fs';
 import { requireLazyRoot, requireStorage, parseFlags, resolveTaskOrExit } from '../helpers';
-import { createWorktree, createWorktreeFromSha, getCurrentSha, copyUntrackedFilesIntoWorktree } from '../../git/operations';
+import { recoverMissingWorktree, copyUntrackedFilesIntoWorktree } from '../../git/operations';
+
 import { openEditor, removeRecoveryFile, requireTTY, readStdinIfPiped } from '../editor';
 import { checkOrphanedChild, retargetOrphanedChild } from '../../task/orphan';
 import { loadConfig } from '../../config/loader';
@@ -99,6 +100,14 @@ export async function commandReopen(args: string[]): Promise<void> {
             console.error(err instanceof Error ? err.message : err);
             process.exit(1);
           }
+          // Pre-flight before the editor (never lose feedback): a reopen that
+          // cannot find the task's work refuses NOW, before anything is typed.
+          try {
+            await queryReopenTask({ taskId: task.id, actor: getActor(), checkOnly: true });
+          } catch (err) {
+            console.error(`Error: ${err instanceof Error ? err.message : err}`);
+            process.exit(1);
+          }
           const result = await promptForReason(displayId(task), task.goal);
           reason = result.reason;
           reopenRecoveryPath = result.recoveryPath;
@@ -115,85 +124,53 @@ export async function commandReopen(args: string[]): Promise<void> {
     // Get session (abandoned tasks may not have one if they were never started)
     const sess = await storage.getSessionByTaskId(task.id);
 
-    // Check for orphaned child (parent accepted, branch gone) and retarget before recreating worktree
-    if (parentTaskIdOf(task)) {
-      const orphanStatus = await checkOrphanedChild(task, storage, root);
-      if (orphanStatus.isOrphaned && orphanStatus.retargetBranch) {
-        console.log(`\nParent task was accepted and its branch deleted.`);
-        console.log(`This task needs to be retargeted to ${orphanStatus.retargetBranch} before reopening.\n`);
-
-        // Auto-retarget (no prompt needed for reopen - the human already decided to reopen)
-        await retargetOrphanedChild(task, storage, orphanStatus.retargetBranch);
-        console.log(`Retargeted to ${orphanStatus.retargetBranch}.\n`);
-
-        // Refresh task reference — parent_task_id is now null
-        const refreshedTask = await storage.getTask(task.id);
-        if (refreshedTask) {
-          Object.assign(task, refreshedTask);
-        }
-      }
-    }
-
     const tRef = taskRef(task);
     const worktreePath = getWorktreePathForRef(root, tRef);
 
-    if (sess) {
-      // Determine start SHA: for child tasks, use parent's current HEAD; otherwise use main
-      let startSha: string | undefined;
-      const parentId = parentTaskIdOf(task);
-      if (parentId) {
-        // Child task: must branch from parent's current HEAD
-        const parentTask = await storage.getTask(parentId);
-        if (!parentTask) {
-          console.error(`Parent task not found: ${parentId}`);
-          process.exit(1);
-        }
-
-        const parentWorktreePath = getWorktreePath(root, parentTask);
-        if (!existsSync(parentWorktreePath)) {
-          // Reject instead of silently falling back to main
-          console.error(`Cannot reopen child task: parent task has no worktree.`);
-          console.error(`Start the parent first with: lazy start ${displayId(parentTask)}`);
-          console.error(`Or use 'lazy clone' to recreate under a different parent.`);
-          process.exit(1);
-        }
-
-        // Parent worktree exists - use its HEAD
-        startSha = await getCurrentSha(parentWorktreePath);
-        // Update branched_from_sha for future reference
-        await storage.updateTaskBranchedFromSha(task.id, startSha);
-      }
-
-      // Recreate worktree: reuses existing branch if preserved, or creates a fresh
-      // branch from parent's HEAD (if child task) or main (otherwise).
-      try {
-        if (startSha) {
-          await createWorktreeFromSha(worktreePath, sess.git_branch, startSha, root);
-        } else {
-          await createWorktree(worktreePath, sess.git_branch, root);
-        }
-      } catch (err) {
-        console.error(`Failed to recreate worktree: ${err instanceof Error ? err.message : err}`);
-        process.exit(1);
-      }
-
-      // Copy untracked files configured in worktree.include
-      const config = await loadConfig(root);
-      await copyUntrackedFilesIntoWorktree(root, worktreePath, config.worktree.include);
-    }
-
     // The one reopen implementation (src/daemon/task-lifecycle.ts), shared with
-    // lazy_reopen and the web task page: reason comment → reopen to
-    // blocked-or-backlog → session reset. Only the worktree recreation above is
-    // CLI-side, because it is host git work the other callers defer to the next
-    // start/unblock.
-    const result = await queryReopenTask({
-      taskId: task.id,
-      reason: reason ?? undefined,
-      actor: getActor(),
-    });
+    // lazy_reopen and the web task page: restore the task branch at its last
+    // head (or refuse, changing nothing) → reason comment → reopen to
+    // blocked-or-backlog → session reset. Only attaching the worktree below is
+    // CLI-side; the other callers defer it to the next start/unblock.
+    let result;
+    try {
+      result = await queryReopenTask({
+        taskId: task.id,
+        reason: reason ?? undefined,
+        actor: getActor(),
+      });
+    } catch (err) {
+      console.error(`Error: ${err instanceof Error ? err.message : err}`);
+      if (reopenRecoveryPath) console.error(`Your reason was kept in ${reopenRecoveryPath}`);
+      process.exit(1);
+    }
     // Reason (if any) is now durably persisted as a comment — clean up recovery file
     if (reopenRecoveryPath) removeRecoveryFile(reopenRecoveryPath);
+
+    if (result.restore) console.log(result.restore.message);
+
+    // An orphaned child (parent accepted, its branch gone) is retargeted —
+    // after the reopen succeeded, so a refused reopen changes nothing.
+    if (parentTaskIdOf(task)) {
+      const orphanStatus = await checkOrphanedChild(task, storage, root);
+      if (orphanStatus.isOrphaned && orphanStatus.retargetBranch) {
+        await retargetOrphanedChild(task, storage, orphanStatus.retargetBranch);
+        console.log(`Parent task was accepted and its branch deleted — retargeted to ${orphanStatus.retargetBranch}.`);
+      }
+    }
+
+    // Attach the worktree to the restored branch — never `-b`, which would cut
+    // a fresh, empty branch.
+    if (sess && !existsSync(worktreePath)) {
+      try {
+        const recovery = await recoverMissingWorktree(worktreePath, sess.git_branch, root);
+        if (!recovery.recovered) throw new Error(`branch ${sess.git_branch} is missing`);
+        const config = await loadConfig(root);
+        await copyUntrackedFilesIntoWorktree(root, worktreePath, config.worktree.include);
+      } catch (err) {
+        console.error(`Warning: could not recreate the worktree now (${err instanceof Error ? err.message : err}); 'lazy unblock' will recreate it from ${sess.git_branch}.`);
+      }
+    }
 
     const finalStatus = result.newStatus;
 
@@ -206,6 +183,7 @@ export async function commandReopen(args: string[]): Promise<void> {
       console.log(`  Branch: ${sess.git_branch}`);
     }
     console.log(`  Status: ${finalStatus}`);
+    if (result.restore?.syncHint) console.log(`\n${result.restore.syncHint}`);
     console.log(`\nContinue with: lazy ${sess ? 'unblock' : 'start'} ${displayId(task)}`);
 
   } finally {
@@ -218,9 +196,13 @@ export function reopenUsage(): void {
 
 Reopen a previously abandoned or accepted (complete) task.
 
-Restores the task to 'blocked' status and recreates the worktree.
-If the git branch still exists, it is reused; otherwise a fresh
-branch is created from main.
+Restores the task to 'blocked' status and brings back its branch at the
+task's last head: the local branch if it still exists, otherwise the
+task's branch on the remote (unless lazy recorded newer work the remote
+never received, which is restored instead), otherwise the last commit lazy
+recorded for it. If none can be found, reopen refuses and changes nothing — reopen
+never starts a task empty (use 'lazy clone' or 'lazy redo' for that).
+If the parent moved meanwhile, run 'lazy sync' afterwards.
 
 Arguments:
   <task_id>    ID of the abandoned or complete task to reopen

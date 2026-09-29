@@ -51,6 +51,12 @@ export interface Browser {
   click(selector: string): Promise<PageState>;
   /** The tab's current state. */
   state(): Promise<PageState>;
+  /** Evaluate an expression in the page and return its JSON-serialisable value (promises are awaited). */
+  evaluate<T>(expression: string): Promise<T>;
+  /** Emulate a viewport size (CSS pixels) for layouts gated on width. */
+  setViewport(width: number, height: number): Promise<void>;
+  /** PNG of the current viewport. */
+  screenshot(): Promise<Uint8Array>;
   close(): Promise<void>;
 }
 
@@ -182,6 +188,22 @@ export async function launchBrowser(hostMap: string[]): Promise<Browser> {
       return settle();
     },
     state,
+    async screenshot() {
+      const res = await send('Page.captureScreenshot', { format: 'png' }) as { data: string };
+      return Uint8Array.from(Buffer.from(res.data, 'base64'));
+    },
+    async setViewport(width: number, height: number) {
+      await send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
+    },
+    async evaluate<T>(expression: string): Promise<T> {
+      const res = await send('Runtime.evaluate', {
+        expression,
+        returnByValue: true,
+        awaitPromise: true,
+      }) as { result: { value: T }; exceptionDetails?: { text: string } };
+      if (res.exceptionDetails) throw new Error(`evaluate failed: ${res.exceptionDetails.text}`);
+      return res.result.value;
+    },
     async close() {
       ws.close();
       proc.kill();

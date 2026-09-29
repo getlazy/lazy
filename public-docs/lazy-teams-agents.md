@@ -12,6 +12,12 @@ When you create a task, the **Agent** field lets you pick which agent runs it.
 The form preselects your project's default (see below). Pick another agent to
 override for that task only.
 
+When an agent's configuration says when to use it (its `description`), a
+**When to use each agent** list opens beneath the field — for example "use this
+one whenever a security aspect comes up". It is guidance for your choice; the
+form never switches agent on its own. Project settings show the same list
+beside **Default agent**.
+
 ### The agents your project offers
 
 The list is your project's own. A project can name its own agents in its
@@ -33,7 +39,7 @@ still in the backlog, before the first turn.
 
 ## Project default agent
 
-Team **admins** set the default under **Settings** on a project page. The control
+Team **admins** set the default under **Settings → General** on a project page. The control
 shows what the repository's lazy.toml specifies and what this Lazy Teams install
 overrides, so you always see both values and which one wins.
 
@@ -53,29 +59,79 @@ effort when somebody starts it days later from its own page.
 
 ## Agent credentials
 
-Open **Agent credentials** from your account menu (top right).
+Every turn runs on the account of the person who starts it, **for the agent it
+runs on** — never a teammate's, and never one key the project shares. So each
+member connects their own credential for each agent they use.
 
-### Claude Code
+### Your Claude credential
 
-Connect your own Anthropic account here — subscription token or API key. Lazy
-Teams stores it encrypted, never shows it again, and uses it for Claude Code
-turns **you** start. Use **Test credential** to check it before running work.
+Open **Agent credentials** from your account menu (top right) and connect your
+own Anthropic account — subscription token or API key. Lazy Teams stores it
+encrypted, never shows it again, and uses it for every Claude agent whose
+traffic goes to Anthropic, on every project. Use **Test credential** to check
+it before running work.
 
-Each project can also designate one member's credential for **automations**
-(turns nobody started). Only an admin can set that, and only from their own
-connected account.
+### Account, team and project credentials
 
-### Cursor
+Each credential — Claude or any other agent — can be set at three levels, and
+the most specific one you set wins:
 
-Cursor turns use an API key configured **for each project** by your team's
-operators — not a personal credential you connect in this menu. Every member on
-a Cursor task shares that project's key until per-user Cursor credentials exist.
+1. **Account** (**Agent credentials** in your account menu) — used on every
+   project of yours.
+2. **Team** (the team page → **Your credentials**) — overrides your account
+   credential on that team's projects.
+3. **Project** (the project's **Settings → Your credentials**) — overrides both
+   on that one project. You never need one; it is there if a project really
+   needs a different key.
 
-### Pi
+Each page says which level currently applies ("Using your team credential").
+**Copy to team** on a project credential and **Copy to account** on a team
+credential copy it up a level on the server — the value is never shown, and you
+are asked before an existing credential at that level is replaced. Only your
+own credentials are ever read or copied.
 
-Pi turns have no Pi-specific credential at all: they run on the same Anthropic
-(or Ollama) credentials as Claude Code turns, so the per-user credential you
-connect for Claude Code covers Pi tasks too.
+A credential set at the team or account level carries the endpoint shown when
+you set it; a project whose agent sends its traffic somewhere else does not use
+it, and its Your credentials tab says so.
+
+### Credentials for a project's other agents
+
+On the project's **Settings → Your credentials** tab: Pi, Codex (on an OpenAI API key, or on a ChatGPT subscription), Cursor, and
+any agent the project defines with an endpoint of its own — for example a
+second Claude agent pointed at a gateway. The tab lists exactly the agents the
+project offers, and for each one:
+
+- what it needs — an API key, or for a ChatGPT subscription the contents of
+  `~/.codex/auth.json` after `codex login` (use a login made for this: lazy
+  keeps it renewed, which signs out any other copy);
+- **where your credential is sent** — the agent's own endpoint, when it has one;
+- whether it runs on your Claude credential instead, or needs no credential at
+  all (a model server that takes none).
+
+A credential you connect for an agent is sent only to that agent's endpoint. If
+the project later points the agent somewhere else, your credential stops being
+used until you connect it again — it never follows the agent to a new place on
+its own.
+
+Starting a task on an agent you have not connected is refused before anything
+runs, naming the agent, with a link to the Your credentials tab. Leaving a team
+removes the credentials you set for that team and its projects; your account
+credentials stay yours.
+
+
+### Agents the project adds
+
+The team owner adds and changes a project's agents on its **Settings → Configuration**
+page (`[agents.<name>]` blocks in the project's lazy.toml). An agent added
+there appears on every member's Your credentials tab and in the task form's **Agent**
+list once the project has picked it up.
+
+### Automations
+
+Each project can designate one member's credentials for **automations** (turns
+nobody started). Only an admin can set that, and only from their own connected
+account; automations on an agent then run on that member's own credential for
+it.
 
 ## CLI vs Teams
 

@@ -65,6 +65,8 @@ export interface AgentProfileConfig {
   model?: string;
   endpoint?: string;
   credential?: string;
+  /** When to choose this profile, in plain words — shown wherever an agent is picked. */
+  description?: string;
 }
 
 /** A profile after defaults, inference and validation. */
@@ -103,6 +105,12 @@ export interface AgentProfile {
   wire: AgentWire;
   /** True when no `[agents.<name>]` block declares it — a built-in. */
   builtin: boolean;
+  /**
+   * When to choose this profile, in plain words. Informs a human or the builder
+   * proposing an agent for a task; NOTHING selects a profile because of it.
+   * '' when none is written and no built-in supplies one.
+   */
+  description: string;
 }
 
 /** Credential name meaning "this upstream authenticates nobody". */
@@ -212,6 +220,8 @@ export const HARNESS_DEFAULT_MODEL: Record<string, string> = {
 interface BuiltinProfileSpec {
   /** Registered agent that drives the turn. */
   harness: string;
+  /** When to choose this profile — the built-in's own {@link AgentProfile.description}. */
+  description: string;
   /**
    * Upstream, when this profile means something narrower than its harness's
    * default. Behaves exactly like {@link HARNESS_DEFAULT_ENDPOINT}: it is lazy's
@@ -244,13 +254,33 @@ interface BuiltinProfileSpec {
  * it. It is the older spelling of "codex on an API key", kept working.
  */
 export const BUILTIN_PROFILES: Record<string, BuiltinProfileSpec> = {
-  'claude-code': { harness: 'claude-code' },
-  cursor: { harness: 'cursor' },
-  codex: { harness: 'codex' },
-  'codex-api': { harness: 'codex', endpoint: DEFAULT_OPENAI_UPSTREAM },
-  'codex-subscription': { harness: 'codex', endpoint: CHATGPT_CODEX_UPSTREAM },
-  pi: { harness: 'pi' },
-  'qa-agent': { harness: 'qa-agent' },
+  'claude-code': {
+    harness: 'claude-code',
+    description: 'Claude Code on your Anthropic account — the general-purpose default for most tasks.',
+  },
+  cursor: {
+    harness: 'cursor',
+    description: 'Cursor Agent on your Cursor subscription — implementation work when you would rather spend Cursor quota than Anthropic.',
+  },
+  codex: {
+    harness: 'codex',
+    description: 'OpenAI Codex on an OpenAI API key (the older name for codex-api).',
+  },
+  'codex-api': {
+    harness: 'codex',
+    endpoint: DEFAULT_OPENAI_UPSTREAM,
+    description: 'OpenAI Codex billed to an OpenAI API key — when a task should run on an OpenAI model.',
+  },
+  'codex-subscription': {
+    harness: 'codex',
+    endpoint: CHATGPT_CODEX_UPSTREAM,
+    description: 'OpenAI Codex on a ChatGPT subscription — an OpenAI model without API billing.',
+  },
+  pi: {
+    harness: 'pi',
+    description: 'The pi agent against a local model server — cheap or offline work where a smaller local model is enough.',
+  },
+  'qa-agent': { harness: 'qa-agent', description: "lazy's internal QA agent; not offered for tasks." },
 };
 
 /** Profiles that exist without an `[agents.<name>]` block declaring them. */
@@ -266,7 +296,14 @@ export const BUILTIN_PROFILE_NAMES: readonly string[] = Object.keys(BUILTIN_PROF
 const NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
 const NAME_MAX = 64;
 
-const PROFILE_KEYS = ['harness', 'model', 'endpoint', 'credential'] as const;
+const PROFILE_KEYS = ['harness', 'model', 'endpoint', 'credential', 'description'] as const;
+
+/**
+ * Longest `description` a profile may carry. It is rendered beside every agent
+ * picker and listed in the builder's launch context, so it is a sentence or
+ * two about WHEN to use the profile — not a prompt.
+ */
+export const DESCRIPTION_MAX = 500;
 
 /** Per-key guidance for the keys people are most likely to reach for. */
 const UNKNOWN_KEY_HINTS: Record<string, string> = {
@@ -447,8 +484,9 @@ function knownHarnessesHint(): string {
 /**
  * Resolve one `[agents.<name>]` block (or a built-in, when `raw` is undefined).
  *
- * `warn` receives non-fatal notes — today only the host-perspective endpoint
- * rewrite, which mirrors the one role targets already emit.
+ * `warn` receives non-fatal notes — the host-perspective endpoint rewrite, and a
+ * codex endpoint ending in `/v1` (which codex would request as `/v1/v1/...`).
+ * The rewrite mirrors the one role targets already emit.
  */
 function resolveProfile(
   name: string,
@@ -463,7 +501,7 @@ function resolveProfile(
     if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
       throw new Error(
         `lazy.toml ${where} must be a table of settings, e.g.\n\n` +
-        `  [agents.${name}]\n  harness = "claude-code"\n  model = "claude-opus-5"`,
+        `  [agents.${name}]\n  harness = "claude-code"\n  model = "claude-opus-5-5"`,
       );
     }
     for (const key of Object.keys(raw)) {
@@ -473,6 +511,24 @@ function resolveProfile(
         `Unknown option "${key}" in lazy.toml ${where}. ` +
         `Valid options: ${PROFILE_KEYS.join(', ')}.` +
         (hint ? ` (${hint})` : ''),
+      );
+    }
+  }
+
+  let description = '';
+  if (raw?.description !== undefined) {
+    if (typeof raw.description !== 'string') {
+      throw new Error(
+        `lazy.toml ${where} description must be a string of plain text, e.g. ` +
+        `description = "Use for anything touching security".`,
+      );
+    }
+    // One line: it is rendered as a list bullet and a single CLI line.
+    description = raw.description.trim().replace(/\s+/g, ' ');
+    if (description.length > DESCRIPTION_MAX) {
+      throw new Error(
+        `lazy.toml ${where} description is ${description.length} characters; the limit is ${DESCRIPTION_MAX}. ` +
+        `Say in a sentence or two when to choose this agent.`,
       );
     }
   }
@@ -537,6 +593,17 @@ function resolveProfile(
       );
       endpoint = hostSide;
     }
+    // codex's base_url already ends in `/v1` for every non-ChatGPT upstream and
+    // the proxy forwards endpoint + path verbatim, so an endpoint ending in
+    // `/v1` requests `/v1/v1/responses`. Warn rather than rewrite: routing
+    // stays exactly as configured.
+    if (harness === 'codex' && !isChatGptEndpoint(endpoint) && /\/v1$/.test(new URL(endpoint).pathname)) {
+      warn(
+        `lazy.toml ${where} endpoint = "${endpoint}" ends in /v1, but lazy adds /v1 to codex ` +
+        `requests itself, so they would go to ${endpoint}/v1/responses and fail. ` +
+        `Use endpoint = "${endpoint.replace(/\/v1$/, '')}" instead.`,
+      );
+    }
   }
 
   const wireResult = wireForProfile(harness, endpoint);
@@ -569,7 +636,7 @@ function resolveProfile(
   // local Ollama (2026-09-13). A block written the documented way for Anthropic
   // before that, e.g.
   //
-  //   [agents.my-pi]  harness = "pi"  model = "claude-opus-5"
+  //   [agents.my-pi]  harness = "pi"  model = "claude-opus-5-5"
   //
   // keeps its name and its model and quietly changes which service it talks to,
   // which is exactly the silent upstream substitution the rest of this codebase
@@ -632,6 +699,10 @@ function resolveProfile(
     credential,
     wire,
     builtin: raw === undefined,
+    // A block overriding a built-in keeps the built-in's description unless it
+    // writes its own — but only while it still runs that harness against the
+    // built-in's upstream: a repointed endpoint makes that text false.
+    description: description || (builtin?.harness === harness && !endpointSet ? builtin.description : ''),
   };
 }
 
@@ -676,6 +747,22 @@ export function agentProfilesFor(config: { agents?: Record<string, AgentProfileC
   const resolved = resolveAgentProfiles(raw);
   RESOLVED_CACHE.set(raw, resolved);
   return resolved;
+}
+
+/**
+ * The offered profiles as a markdown bullet list — name, what it runs, and its
+ * `description` as a "use when" note — for prompts that let an agent PROPOSE a
+ * profile (the builder's launch context). Informational: nothing selects a
+ * profile from this.
+ */
+export function renderAgentProfileList(profiles: Map<string, AgentProfile>): string {
+  return selectableAgentProfiles(profiles)
+    .map((p) => {
+      const runs = `${p.harness}, ${p.model || `${p.harness} default model`}`;
+      const origin = p.builtin ? 'built-in' : 'lazy.toml';
+      return `- \`${p.name}\` (${runs}; ${origin})` + (p.description ? ` — use when: ${p.description}` : '');
+    })
+    .join('\n');
 }
 
 /** Record an already-resolved table so {@link agentProfilesFor} reuses it. */

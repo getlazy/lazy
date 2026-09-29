@@ -24,7 +24,6 @@ export async function resolveTaskDiffContext(
   storage: Storage,
   projectRoot: string,
   taskRefInput: string,
-  opts: { fullBranch?: boolean } = {},
 ) {
   const result = await storage.resolveTask(taskRefInput);
   if (!result.task) {
@@ -69,9 +68,8 @@ export async function resolveTaskDiffContext(
   // so the merge base fell back to the clone commit and every upstream commit
   // since provisioning was attributed to the task.
   const diffConfig = await loadConfig(projectRoot);
-  // Direct-changes plan: same base as resolveTaskDiffBase, plus a path
-  // restriction when this task has accepted children. fullBranch is the
-  // escape hatch that restores today's whole-branch diff.
+  // INVARIANT: the WHOLE branch against its base, accepted children
+  // included (engineer decision 2026-09-25 — see TaskDirectDiffPlan).
   const direct = await resolveTaskDirectDiff({
     task,
     session: sess,
@@ -79,7 +77,6 @@ export async function resolveTaskDiffContext(
     projectRoot,
     worktreePath,
     config: diffConfig,
-    fullBranch: opts.fullBranch === true,
   });
 
   return {

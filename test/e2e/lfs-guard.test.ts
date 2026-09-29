@@ -121,6 +121,23 @@ describe('git LFS guard', () => {
     expectSuccess(await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS));
   });
 
+  (Bun.which('git-lfs') ? test : test.skip)('start succeeds after the repository installs its local LFS filter', async () => {
+    trackDatasetsWithLfs();
+    breakLfsFilter();
+    expect(ctx.git('-C', ctx.root, 'lfs', 'version').exitCode).toBe(0);
+
+    const installed = ctx.git('-C', ctx.root, 'lfs', 'install', '--local', '--force');
+    if (installed.exitCode !== 0) throw new Error(JSON.stringify(installed));
+    expect(ctx.git('-C', ctx.root, 'config', '--local', '--get', 'filter.lfs.required').stdout.trim()).toBe('true');
+
+    const taskId = await createTask(ctx, 'Work after LFS setup', 'Some work');
+    expectSuccess(await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS));
+    const worktree = join(ctx.root, '.lazy', 'worktrees', taskId);
+    expect(ctx.git('-C', worktree, 'config', '--get', 'filter.lfs.required').stdout.trim()).toBe('true');
+    commitInWorktree(taskId, 'datasets/actual.bin', 'raw dataset content', 'Add dataset');
+    expect(ctx.git('-C', worktree, 'show', 'HEAD:datasets/actual.bin').stdout).toStartWith('version https://git-lfs.github.com/spec/v1');
+  });
+
   // INVARIANT: the guard must be invisible on repos that do not use LFS at all.
   test('start is unaffected on a repo that does not use LFS', async () => {
     breakLfsFilter(); // broken config, but nothing is LFS-tracked

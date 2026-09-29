@@ -167,34 +167,28 @@ export function classifyHubChildren(children: Task[]): HubChildGroups {
 }
 
 /**
- * How a hub's "own" diff is scoped relative to the whole-branch three-dot
- * range `resolveTaskDiffBase` already named.
+ * A task's diff plan: the base `resolveTaskDiffBase` names, plus — ONLY when a
+ * caller asks for it with `directOnly` — the paths the task itself changed
+ * once accepted children's squash/merge commits are set aside.
  *
- * A release hub's branch contains every accepted child's squash. A tree-to-tree
- * `base...HEAD` is therefore the union of those children — hundreds of files
- * that were each already reviewed at accept. Direct changes are the first-parent
- * commits that are NOT those squash/merge commits, plus any uncommitted work
- * in the hub worktree.
+ * INVARIANT: every DISPLAY surface shows a task's WHOLE branch against its
+ * base — web Changes tab, review page, `lazy diff`, `lazy_diff`, TUI, `lazy
+ * show`. Engineer decision 2026-09-25, reversing the 2026-09-07 hub exclusion:
+ * hiding accepted children's files made a landing hub or finished cluster
+ * diff as "no changes" while its branch carried dozens of files. Per-child
+ * scoping is what review REGIONS are for; size is solved by loading the file
+ * list first and diffs file by file, never by hiding files.
  *
- * Why path-restrict the existing three-dot diff rather than concatenating
- * per-commit patches: the review page, file-lines expand, and `getDiffFull`
- * already speak one unified `git diff`. Restricting it to paths touched by
- * those first-parent commits reuses that pipeline and still drops the
- * children's files. The trade-off is honest and documented: if the hub later
- * edits a file a child also touched, the three-dot hunk for that file includes
- * the child's lines too. A release hub's own commits typically touch a handful
- * of files (changelog dating, version); the 1,843-file failure was the union
- * of 301 children, which this drops. A large *direct* diff is a later ToC
- * problem, not a reason to cap here.
- *
- * `fullBranch: true` is the escape hatch (`--full-branch` / `full_branch`):
- * same base, no path restriction, today's whole-branch diff.
+ * `directOnly` survives for the protected-file resolver, which asks a
+ * different question ("what did this task itself write that still owes a
+ * decision") and reads `paths` / `childAttribution` for it. It never decides
+ * what a reader sees.
  */
 export interface TaskDirectDiffPlan {
   base: TaskDiffBase;
   /**
    * Paths the diff is restricted to. `undefined` means unrestricted (no
-   * accepted children, or the caller asked for the whole branch). An empty
+   * accepted children, or the caller did not ask for `directOnly`). An empty
    * array means scoped and the hub has no files of its own — callers MUST
    * treat that as an empty diff, not pass `[]` to git (which means "all").
    */
@@ -253,7 +247,7 @@ export function gitDiffPaths(plan: TaskDirectDiffPlan): {
 
 /**
  * Resolve a task's *direct* diff: the same base as `resolveTaskDiffBase`,
- * optionally restricted to paths the task itself changed after excluding
+ * restricted — under `directOnly` only — to paths the task itself changed after excluding
  * accepted children's merge/squash commits.
  *
  * Never throws and never fetches. Git cost is constant in child count (one
@@ -274,8 +268,12 @@ export async function resolveTaskDirectDiff(opts: {
   projectRoot: string;
   worktreePath: string;
   config: ResolvedConfig;
-  /** Escape hatch: do not exclude accepted children. */
-  fullBranch?: boolean;
+  /**
+   * Restrict `paths` to the task's own work, excluding accepted children.
+   * The protected-file resolver only — never a display surface (see the
+   * invariant on `TaskDirectDiffPlan`).
+   */
+  directOnly?: boolean;
   /** Right-hand side of the range. Default HEAD (the worktree). */
   tipRef?: string;
 }): Promise<TaskDirectDiffPlan> {
@@ -284,7 +282,7 @@ export async function resolveTaskDirectDiff(opts: {
   const { accepted, inProgress } = classifyHubChildren(children);
   const tipRef = opts.tipRef ?? 'HEAD';
 
-  if (opts.fullBranch || accepted.length === 0) {
+  if (!opts.directOnly || accepted.length === 0) {
     return {
       base,
       paths: undefined,

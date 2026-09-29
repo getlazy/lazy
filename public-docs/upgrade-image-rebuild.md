@@ -9,7 +9,7 @@ first and runs in the background while the rest of the upgrade proceeds.
 
 ## The sequence
 
-1. **Preflight** — credential gate, container runtime availability, discovery of
+1. **Preflight** — container runtime availability, discovery of
    this project's running containers. Nothing has changed yet, and an abort here
    costs nothing.
 2. **Start the rebuild, in the background, to a staging tag.** The build writes

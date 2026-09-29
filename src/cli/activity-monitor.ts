@@ -334,6 +334,8 @@ function formatPhase(phase: string): string | null {
   switch (phase) {
     case 'merge_and_fix': return 'Syncing with upstream...';
     case 'merge_and_fix_done': return 'Upstream sync complete';
+    case 'restore_rejected': return 'Restoring rejected protected files...';
+    case 'restore_rejected_done': return 'Rejected protected files restored';
     case 'work': return 'Agent working...';
     case 'work_done': return 'Agent finished';
     case 'low_high_review': return 'Low-high loop: self-reviewing draft...';

@@ -27,7 +27,7 @@ import { tmpdir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask } from '../helpers/fixtures';
 import { expectSuccess } from '../helpers/assertions';
-import { launchAsPerson, setUsagePauseOverrideRpc } from '../helpers/usage-pause';
+import { allowTaskRpc, launchAsPerson, setUsagePauseOverrideRpc } from '../helpers/usage-pause';
 import { sessionStartEvent, resultEvent, toolUseEvent, type ClaudeScenario } from '../helpers/fake-claude';
 import { readTaskStatus, readTurns, readTaskJson, findFullTaskId } from '../helpers/storage';
 import { DaemonClient, RpcApplicationError } from '../../src/daemon/client';
@@ -224,43 +224,47 @@ describe('usage pause', () => {
     expect(readTaskJson(ctx.root, taskId).agent_id).toBe('cursor');
     expect(await readTaskStatus(ctx.root, taskId)).toBe('blocked');
 
-    // INVARIANT: an override that would not let a paused launch through is
-    // not used by it. 96% does not cover a 97% reading: the start is refused,
-    // says so, and the override stays pending.
-    await setUsagePauseOverrideRpc(ctx, '96');
-    // A person's launch: a test's CLI has no terminal, so it could never take
-    // the override (test/helpers/usage-pause.ts, launchAsPerson).
-    const tooLow = await launchAsPerson(ctx, 'startTask', { taskId: findFullTaskId(ctx.root, other) });
-    expect(tooLow.exitCode).not.toBe(0);
-    expect(tooLow.stderr + tooLow.stdout).toContain('does not cover this reading');
-    // …and says what does: `off`, the value every surface recommends.
-    expect(tooLow.stderr + tooLow.stdout).toContain('usage_pause_threshold off');
-    expect((await ctx.lazy(['daemon', 'config', 'get'])).stdout).toContain('One-shot override: 96%');
+    // INVARIANT (engineer decision 2026-09-26: the way past a pause is PER
+    // TASK): the daemon-wide one-shot override never lets a TASK's launch
+    // through — a value any launch could spend was spent on the wrong task. It
+    // stays pending, and the refusal names the task's own way through.
+    await setUsagePauseOverrideRpc(ctx, 'off');
+    const notByOverride = await launchAsPerson(ctx, 'startTask', { taskId: findFullTaskId(ctx.root, other) });
+    expect(notByOverride.exitCode).not.toBe(0);
+    expect(notByOverride.stderr).toContain(`lazy start ${other}`);
+    expect(notByOverride.stderr).toContain('--past-usage-pause');
+    expect((await ctx.lazy(['daemon', 'config', 'get'])).stdout).toContain('One-shot override: off');
 
     // INVARIANT: a launch the pause was not holding anyway never spends the
-    // override. The task is on cursor now, so this unblock starts without it —
-    // and the override its setter is about to use on a paused turn is still there.
-    await setUsagePauseOverrideRpc(ctx, 'off');
+    // task's allowance. The task is on cursor now, so this unblock starts
+    // without it — and the allowance is still there for the paused turn.
+    await allowTaskRpc(ctx, findFullTaskId(ctx.root, taskId), 'human');
     const cursorBefore = (await readCursorInvocations(fakeCursor)).length;
     expectSuccess(await launchAsPerson(ctx, 'unblockTask', { taskId: findFullTaskId(ctx.root, taskId), message: 'more cursor work' }));
     expectSuccess(await ctx.lazy(['wait', taskId]));
     expect((await readCursorInvocations(fakeCursor)).length).toBeGreaterThan(cursorBefore);
-    expect((await ctx.lazy(['daemon', 'config', 'get'])).stdout).toContain('One-shot override: off');
+    expect((await ctx.lazy(['daemon', 'config', 'get'])).stdout).toContain('Let through:');
 
-    // INVARIANT: the override is good for exactly ONE paused turn start, then
-    // reverts. Back on Claude the task is paused again; the override lets this
-    // one unblock through and is gone.
+    // INVARIANT: the allowance is good for exactly ONE paused launch of its
+    // task, then gone. Back on Claude the task is paused again; it lets this
+    // unblock through.
     expectSuccess(await launchAsPerson(ctx, 'unblockTask', {
       taskId: findFullTaskId(ctx.root, taskId), message: 'go on, once', agentOverride: 'claude-code',
     }));
     expectSuccess(await ctx.lazy(['wait', taskId]));
     expect(await readTaskStatus(ctx.root, taskId)).toBe('blocked');
-
-    const after = await ctx.lazy(['daemon', 'config', 'get']);
-    expect(after.stdout).not.toContain('One-shot override');
+    expect((await ctx.lazy(['daemon', 'config', 'get'])).stdout).not.toContain('Let through:');
     const refusedAgain = await launchAsPerson(ctx, 'unblockTask', { taskId: findFullTaskId(ctx.root, taskId), message: 'and again' });
     expect(refusedAgain.exitCode).not.toBe(0);
     expect(refusedAgain.stderr).toContain('paused');
+
+    // INVARIANT: the CLI's `--past-usage-pause` carries the allowance with the
+    // launch — no terminal needed, since the builder may take it too — and
+    // leaves nothing pending behind it.
+    expectSuccess(await ctx.lazy(['unblock', taskId, '-m', 'through, once more', '--past-usage-pause']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+    expect(await readTaskStatus(ctx.root, taskId)).toBe('blocked');
+    expect((await ctx.lazy(['daemon', 'config', 'get'])).stdout).not.toContain('Let through:');
   }, 240_000);
 
   test('an auto-resume the pause held goes ahead by itself once the window resets', async () => {
@@ -305,6 +309,33 @@ describe('usage pause', () => {
     expect(invocations.length).toBeGreaterThan(0);
     // And the mark is gone, so nothing reports a wait that is over.
     expect((await ctx.lazy(['show', taskId])).stdout).not.toContain('Usage pause');
+  }, 240_000);
+
+  // INVARIANT: "let its next turn through" on a task the pause is holding for
+  // auto-resume lets THAT auto-resume run now, and is used up by it. The hold
+  // check only counts the allowance; the launch takes it — taken at the check,
+  // auto-resume (which checks twice) used it and then held the task anyway.
+  test('an allowance lets a held auto-resume through before the reset', async () => {
+    const taskId = await createTask(ctx, 'Let-through resume task', 'Work slowly');
+    await ctx.setClaudeScenario(proxiedThenBusy('allow-1'));
+    utilization = '0.98';
+    resetAtSec = Math.floor(Date.now() / 1000) + 3600;
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    expect(await until(() => sawReading('0.98'), Boolean, 30_000)).toBe(true);
+
+    expectSuccess(await ctx.lazy(['daemon', 'stop']));
+    await settle(500);
+    expect(await readTaskStatus(ctx.root, taskId)).toBe('interrupted');
+    await ctx.clearClaudeInvocations();
+    await ctx.setClaudeScenario(proxiedThenBusy('allow-2'));
+    expectSuccess(await ctx.lazy(['daemon', 'start']));
+    await until(() => ctx.lazy(['show', taskId]).then((r) => r.stdout), (o) => o.includes('auto-resume is waiting'), 30_000, 500);
+    expect((await ctx.claudeInvocations()).length).toBe(0);
+
+    await allowTaskRpc(ctx, findFullTaskId(ctx.root, taskId), 'human');
+    const invocations = await until(() => ctx.claudeInvocations(), (inv) => inv.length > 0, 60_000, 500);
+    expect(invocations.length).toBeGreaterThan(0);
+    expect((await ctx.lazy(['daemon', 'config', 'get'])).stdout).not.toContain('Let through:');
   }, 240_000);
 
   test('a cluster restart the pause held is not used up, and goes ahead after the reset', async () => {

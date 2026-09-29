@@ -506,3 +506,39 @@ describe('transport failure classification', () => {
     }
   });
 });
+
+// INVARIANT: a caller that leaves before its reply is reported ONCE through
+// onCallerGone, so the daemon log (not only tracing) records a connection cut
+// mid-operation — the evidence that tells a cut outside the daemon from a
+// daemon that died. The work still runs to the end.
+describe('onCallerGone', () => {
+  test('an aborted request reports the caller gone once, and the work still finishes', async () => {
+    const controller = new AbortController();
+    const reports: Array<{ resultStatus: number | null }> = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let finished = false;
+    const response = heartbeatEnvelopeResponse(async () => {
+      await gate;
+      finished = true;
+      return { status: 200, body: { ok: true } };
+    }, { intervalMs: 10_000, signal: controller.signal, onCallerGone: (info) => reports.push(info) });
+    const reader = response.body!.getReader();
+    await reader.read(); // preamble: the stream has started
+    controller.abort();
+    expect(reports).toEqual([expect.objectContaining({ resultStatus: null })]);
+    release();
+    await Bun.sleep(20);
+    expect(finished).toBe(true);
+    expect(reports).toHaveLength(1);
+    await reader.cancel().catch(() => {});
+  });
+
+  test('a delivered reply never reports the caller gone', async () => {
+    const reports: unknown[] = [];
+    const response = heartbeatEnvelopeResponse(async () => ({ status: 200, body: 1 }),
+      { onCallerGone: (info) => reports.push(info) });
+    await response.text();
+    expect(reports).toEqual([]);
+  });
+});

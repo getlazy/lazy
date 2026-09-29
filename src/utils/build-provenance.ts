@@ -4,8 +4,11 @@
  */
 
 import { homedir } from 'os';
+import { join } from 'path';
 import { detectBranch } from '../../scripts/version-string';
 import { spawnSyncUnsupervised } from './spawn';
+import { readSourceStamp } from './source-stamp';
+import { logger } from './logger';
 
 /** Git probes during provenance capture should finish quickly or fall back. */
 const GIT_PROBE_TIMEOUT_MS = 5_000;
@@ -124,6 +127,13 @@ export function resolveBuildBranch(projectRoot: string): string {
  */
 export function captureBuildProvenance(projectRoot: string): BuildInfoValues {
   const { buildSha, buildDirty } = captureGitBuildMetadata(projectRoot);
+  if (buildSha === 'unknown') {
+    // No git here — an image build's checkout. Its source stamp is the identity
+    // the script that had the checkout handed in; without one, 'unknown' stays
+    // and every display says so rather than dropping the suffix.
+    const stamped = stampedBuildInfoValues(projectRoot);
+    if (stamped) return stamped;
+  }
   return {
     buildTime: new Date().toISOString(),
     buildSha,
@@ -131,6 +141,40 @@ export function captureBuildProvenance(projectRoot: string): BuildInfoValues {
     buildBranch: resolveBuildBranch(projectRoot),
     buildSourcePath: projectRoot,
   };
+}
+
+/**
+ * Build-info values from the checkout's source stamp, or null when it has none.
+ * For a checkout with no `.git` (an image build): `generate:version` stamps
+ * build-info.ts from this so a SOURCE run (`bun run src/index.ts`, which is how
+ * the daemon image runs lazy) identifies itself too, not only compiled binaries.
+ */
+export function stampedBuildInfoValues(projectRoot: string): BuildInfoValues | null {
+  const stamp = readSourceStamp(projectRoot);
+  if (!stamp) return null;
+  return {
+    // NEVER the wall clock: this is the RESTING content of build-info.ts, which
+    // the agent-binary source hash and the baked source fingerprint both read.
+    // A per-call time rebuilt lazy-agent on every task launch in an image.
+    buildTime: stamp.time ?? 'unknown',
+    buildSha: stamp.sha,
+    buildDirty: stamp.dirty,
+    buildBranch: stamp.branch ?? 'unknown',
+    buildSourcePath: projectRoot,
+  };
+}
+
+/**
+ * What src/build-info.ts holds when no compile is in progress: the dev defaults
+ * in a git checkout (git is asked live instead), the source stamp in a checkout
+ * with no `.git` that carries one. Shared by generate:version and the agent
+ * compile's restore, so neither can leave the other's answer behind.
+ */
+export function restingBuildInfoContent(projectRoot: string): string {
+  const stamped = captureGitBuildMetadata(projectRoot).buildSha === 'unknown'
+    ? stampedBuildInfoValues(projectRoot)
+    : null;
+  return formatBuildInfoContent(stamped ?? DEV_BUILD_INFO_VALUES);
 }
 
 /** Shorten an absolute path with a leading `~` when it lives under $HOME. */
@@ -152,14 +196,20 @@ export function formatSourceProvenanceLine(
   return `built from ${path} @ ${branch} (${provenance.buildSha}, ${dirtyLabel})`;
 }
 
+/** Suffix shown when a build could not learn its own source — never silently dropped. */
+export const UNKNOWN_SOURCE_SUFFIX = ' (source unknown: built without git or LAZY_BUILD_SHA)';
+
 /**
  * Suffix for `lazy --version` / `lazy-agent selfcheck` when build metadata was
- * embedded at compile time. Empty for dev defaults (source runs without compile).
+ * embedded at compile time. Empty for dev defaults (source runs in a git
+ * checkout); a build that had neither git nor a source stamp says so LOUDLY —
+ * an absent suffix reads as "nothing to report", which is the wrong answer.
  */
 export function formatEmbeddedBuildProvenance(
   provenance: Pick<BuildInfoValues, 'buildBranch' | 'buildSha' | 'buildDirty' | 'buildSourcePath'>,
 ): string {
-  if (provenance.buildSha === 'dev' || provenance.buildSha === 'unknown') return '';
+  if (provenance.buildSha === 'dev') return '';
+  if (provenance.buildSha === 'unknown' || !provenance.buildSha) return UNKNOWN_SOURCE_SUFFIX;
 
   const path = formatDisplayPath(provenance.buildSourcePath);
   const branch = provenance.buildBranch && provenance.buildBranch !== 'dev'
@@ -173,6 +223,22 @@ export function formatEmbeddedBuildProvenance(
   return ` (${provenance.buildSha}, ${dirtyLabel}, ${path})`;
 }
 
+/**
+ * The short `<branch>@<sha>, clean|dirty` identity, or null for dev defaults.
+ * One spelling for every surface that names a build beside its version (the
+ * daemon status payload Teams renders, the version-changed notice).
+ */
+export function formatBuildIdentity(
+  provenance: Pick<BuildInfoValues, 'buildBranch' | 'buildSha' | 'buildDirty'>,
+): string | null {
+  if (provenance.buildSha === 'dev') return null;
+  if (provenance.buildSha === 'unknown' || !provenance.buildSha) return 'source unknown';
+  const branch = provenance.buildBranch && !['dev', 'unknown', 'detached'].includes(provenance.buildBranch)
+    ? `${provenance.buildBranch}@`
+    : '';
+  return `${branch}${provenance.buildSha}, ${provenance.buildDirty ? 'dirty' : 'clean'}`;
+}
+
 /** Success line for `lazy upgrade`'s agent-binary rebuild step. */
 export function formatAgentBinaryRebuildSuccessLine(
   provenance: Pick<BuildInfoValues, 'buildSourcePath' | 'buildBranch' | 'buildSha' | 'buildDirty'> | null,
@@ -182,27 +248,111 @@ export function formatAgentBinaryRebuildSuccessLine(
   return `${base} — ${formatSourceProvenanceLine(provenance)}`;
 }
 
-/** Read compile-time build metadata from the generated module, when present. */
-export async function readEmbeddedBuildProvenance(): Promise<Pick<
-  BuildInfoValues,
-  'buildBranch' | 'buildSha' | 'buildDirty' | 'buildSourcePath'
-> | null> {
+type EmbeddedBuildModule = {
+  BUILD_BRANCH?: string;
+  BUILD_SHA?: string;
+  BUILD_DIRTY?: boolean;
+  BUILD_SOURCE_PATH?: string;
+};
+
+type RunningProvenance = Pick<BuildInfoValues, 'buildBranch' | 'buildSha' | 'buildDirty' | 'buildSourcePath'>;
+
+/** True for "the generated module is not there" — the one quiet failure. */
+function isModuleNotFound(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  if (code === 'ERR_MODULE_NOT_FOUND' || code === 'MODULE_NOT_FOUND') return true;
+  const message = err instanceof Error ? err.message : String(err);
+  return /cannot find module|module not found/i.test(message);
+}
+
+/**
+ * Read compile-time build metadata from the generated module, when present.
+ *
+ * A module that does not exist (a dev or test context with no generated file)
+ * is a quiet null. Any OTHER failure — a module that exists but will not load
+ * or parse, e.g. read while the daemon's own agent compile is rewriting it — is
+ * WARNED with its cause before returning null: that failure once left a
+ * daemon's `build` null for its whole lifetime with nothing saying why.
+ */
+export async function readEmbeddedBuildProvenance(
+  load: () => Promise<EmbeddedBuildModule> = () => import('../build-info'),
+): Promise<RunningProvenance | null> {
   try {
-    const mod = await import('../build-info');
+    const mod = await load();
     return {
       buildBranch: mod.BUILD_BRANCH ?? 'dev',
       buildSha: mod.BUILD_SHA ?? 'dev',
       buildDirty: mod.BUILD_DIRTY ?? false,
       buildSourcePath: mod.BUILD_SOURCE_PATH ?? 'dev',
     };
-  } catch {
+  } catch (err) {
+    if (!isModuleNotFound(err)) {
+      logger.warn(`Could not load the embedded build info (src/build-info.ts): ${err instanceof Error ? err.message : String(err)} — falling back to the checkout`);
+    }
     return null;
   }
 }
 
-/** Append embedded provenance to a version/selfcheck line when available. */
+/** Where the running code's provenance comes from. Injectable for tests. */
+export interface RunningProvenanceSources {
+  loadEmbedded: () => Promise<RunningProvenance | null>;
+  captureFromCheckout: () => RunningProvenance | null;
+}
+
+const defaultRunningProvenanceSources: RunningProvenanceSources = {
+  loadEmbedded: () => readEmbeddedBuildProvenance(),
+  captureFromCheckout: () => captureBuildProvenance(join(import.meta.dir, '..', '..')),
+};
+
+/**
+ * The provenance of the code THIS process runs: what was embedded at compile
+ * (or stamped into an image checkout), and for a plain source run — where
+ * nothing was stamped but the checkout is right here — git asked live, so a dev
+ * build answers "which commit" as well as a compiled one does. Sync git probes
+ * with a short deadline, as getRunningCodeSha already does at daemon startup.
+ */
+export function readRunningBuildProvenance(
+  sources: RunningProvenanceSources = defaultRunningProvenanceSources,
+): Promise<RunningProvenance | null> {
+  // MEMOIZED for the process lifetime, like getRunningCodeSha: a process cannot
+  // change the code it runs. Asking git again later would report the checkout's
+  // CURRENT head — a stale daemon claiming the new commit, the exact wrong
+  // answer — and would run sync git on the daemon's event loop per request.
+  //
+  // Only an ANSWER is memoized. An embedded module that failed to load used to
+  // short-circuit to null — `null?.buildSha !== 'dev'` is true — and that null
+  // was cached for the process lifetime, so /daemon/status reported `build:
+  // null` beside build fields its own later import read fine. A failed load now
+  // falls through to the checkout, and a null or rejected result is not cached:
+  // the next call asks again.
+  if (runningProvenance) return runningProvenance;
+  const attempt = (async () => {
+    const provenance = await sources.loadEmbedded();
+    if (provenance && provenance.buildSha !== 'dev') return provenance;
+    return sources.captureFromCheckout();
+  })();
+  runningProvenance = attempt;
+  const forget = () => { if (runningProvenance === attempt) runningProvenance = undefined; };
+  attempt.then((value) => { if (!value) forget(); }, forget);
+  return attempt;
+}
+
+let runningProvenance: Promise<RunningProvenance | null> | undefined;
+
+/** Reset the running-provenance cache. Testing only. */
+export function resetRunningBuildProvenanceCache(): void {
+  runningProvenance = undefined;
+}
+
+/** `branch@sha, clean|dirty` of the code this process runs, or null (dev without git). */
+export async function runningBuildIdentity(): Promise<string | null> {
+  const provenance = await readRunningBuildProvenance();
+  return provenance ? formatBuildIdentity(provenance) : null;
+}
+
+/** Append the running build's provenance to a version/selfcheck line. */
 export async function formatVersionWithEmbeddedProvenance(version: string): Promise<string> {
-  const provenance = await readEmbeddedBuildProvenance();
+  const provenance = await readRunningBuildProvenance();
   if (!provenance) return version;
   const suffix = formatEmbeddedBuildProvenance(provenance);
   return suffix ? `${version}${suffix}` : version;
@@ -233,4 +383,22 @@ export function formatDaemonBuiltLine(
   }
 
   return line;
+}
+
+/**
+ * The `build` field of /daemon/status: the running identity, else the same
+ * spelling built from the status's own build fields, else the checkout's SHA.
+ * `build` can therefore never be null while buildSha says which build this is.
+ * A failed identity lookup is warned, never swallowed.
+ */
+export async function daemonStatusBuild(
+  identity: () => Promise<string | null>,
+  fields: Pick<BuildInfoValues, 'buildSha' | 'buildBranch' | 'buildDirty'>,
+  codeSha: string | null,
+): Promise<string | null> {
+  const running = await identity().catch((err: unknown) => {
+    logger.warn(`Could not determine the daemon's build identity: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  });
+  return running ?? formatBuildIdentity(fields) ?? codeSha;
 }

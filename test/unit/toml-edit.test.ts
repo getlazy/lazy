@@ -302,3 +302,13 @@ describe('root-table guards', () => {
       .toThrow(TomlEditError);
   });
 });
+
+describe('setSectionNumber', () => {
+  test('writes a bare number and refuses a non-finite one', async () => {
+    const { setSectionNumber, TomlEditError } = await import('../../src/config/toml-edit');
+    expect(setSectionNumber('[usage_pause]\nthreshold_percent = 95\n', 'usage_pause', 'threshold_percent', 90))
+      .toBe('[usage_pause]\nthreshold_percent = 90\n');
+    expect(setSectionNumber('', 'x', 'y', 92.5)).toContain('y = 92.5');
+    expect(() => setSectionNumber('', 'x', 'y', Number.NaN)).toThrow(TomlEditError);
+  });
+});

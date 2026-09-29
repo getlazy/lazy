@@ -251,6 +251,10 @@ describe('agent switching on started tasks', () => {
   test('unblock --agent switches the agent while delivering feedback', async () => {
     const taskId = await startedTask();
 
+    // A turn on the cursor profile needs a Cursor credential in the DAEMON (the
+    // turn gate, src/daemon/credential-gate.ts) — the switch is what this test
+    // is about, so give it one.
+    await ctx.restartDaemon({ CURSOR_API_KEY: 'test-cursor-key' });
     const result = await ctx.lazyMocked(
       ['unblock', taskId, '--message', 'Try this on cursor', '--agent', 'cursor', '--yes'],
       MOCK_CLAUDE_SUCCESS,

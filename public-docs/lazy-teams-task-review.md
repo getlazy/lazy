@@ -21,12 +21,12 @@ last row always opens the full search page with your query.
 
 ## How the page is laid out
 
-The task page has **eleven sections** you move between, and below them everything
+The task page has **fourteen sections** you move between, and below them everything
 you act with.
 
 | Section | What is in it |
 | --- | --- |
-| **Record** | What the task is, what it has spent, and the agent's own report |
+| **Overview** | What the task is, its prompt, what it has spent, and the agent's own report |
 | **Regions** | The change carved into units of work, each with its own files and owner |
 | **Changes** | The diff, and the conversation about individual lines |
 | **Verify** | The agent's steps for checking its latest work, each with a **Verified** tick |
@@ -35,8 +35,14 @@ you act with.
 | **Comments** | Notes to the agent — saved now, delivered with your next feedback |
 | **Journal** | The agent's record of what it decided and why |
 | **Reviews** | Formal reviews an agent ran over the work |
+| **Artifacts** | Files attached for the agent to read, and files it published back |
 | **Subtasks** | Tasks stacked on this one, grouped by where they stand |
 | **Stats** | Where the time and the tokens went, per turn and per tool |
+| **Shell** | Terminals in the task's own environment |
+| **Current review** | Only what stands between the task and accept: the checklist, your queued comments, and the agent's open blocking questions |
+
+On a narrow window the section strip wraps onto more rows, so every section is
+always in view.
 
 Which section you are reading is part of the page's address, so reloading keeps
 you where you were and you can send somebody a link to the section you mean.
@@ -46,11 +52,19 @@ header of whatever card you are reading — the file, the turn, the note — sta
 just under it. However far down a long file you are, its name, its counts and
 its **Viewed** tick are still on screen.
 
-**Everything you act with stays below, on every section**: everything the agent
-raised — the questions that must be answered before a merge and the notes that
-need not be — the protected files, the feedback box, and the verdict. A task
-waiting for your answer says so wherever you are reading, and the feedback box
-is never a click away behind a tab.
+**Everything you act with is below Overview and Current review**: the feedback
+box, Ask, and the verdict. The other sections — Changes, Regions, Turns and the
+rest — are for reading, so they do not repeat it; while the task is waiting for
+you — or working, so you can stop it — each of them ends with one line saying
+so and a link to Current review.
+
+**Current review** shows only what blocks accept: the **Before you can accept**
+checklist, your queued comments, and the questions the agent raised that must
+be answered before a merge. Notes that never hold up a merge, and items already
+answered, acknowledged or dismissed, are on the project's **Raised** page
+instead. Beside its name the strip counts every reason accept would refuse (a
+blocking question, a protected file, a review, an undelivered comment), so a
+task that cannot be accepted yet says so wherever you are reading.
 
 At the top of the page, under the task's title, is a line saying what the task
 **runs on** — its agent, its model, and how hard it is asked to think. A value
@@ -58,9 +72,10 @@ that came from the project's own default is shown faded, so the line never
 presents a default as a choice somebody made. If the last turn actually ran on
 something different, the line says that too.
 
-The rest of the task's identity — branch, turn and commit counts, timestamps,
-the prompt — is on the **Record** section behind **Details**, one click away
-when you want it and out of the way when you do not.
+The **Overview** section shows the task's current **prompt** — what the agent was
+asked to do, including any later edit — with **Prompt history** one link away.
+The rest of the task's identity — branch, turn and commit counts, timestamps — is
+behind **Details** on the same section.
 
 ## Moving through a review with the keyboard
 
@@ -116,13 +131,13 @@ report is a link that takes you to the retry path.
 ## Agent report
 
 If the agent filed a structured end-of-turn report (`lazy_report`), it leads the
-**Record** section as labeled parts — **What was done**, **Commentary**, and so
+**Overview** section as labeled parts — **What was done**, **Commentary**, and so
 on — in the order the agent chose. It comes first because it is the summary of
 everything the other sections hold. See [Structured turn reports](turn-reports.md)
 for what agents can include.
 
-The one part that is **not** in that list is **How to verify**, which gets a
-block of its own — see below.
+The one part that is **not** in that list is **How to verify**, which lives on
+the **Verify** section — see below.
 
 When there is no structured report, turn history still shows the agent's last
 message in the **Turns** section.
@@ -142,20 +157,18 @@ screenshot simply opens the picture in a new tab.
 
 ## Before the diff: how to verify, what is running, what was left alone
 
-Three cards sit **above** the diff on **Changes**, and above the changes on the
-**Accept** page. They answer the questions a diff cannot, and they are worth
+Two cards — what is running and what was left alone — sit **above** the diff on
+**Changes**. The **Accept** page carries those two and **How to verify** above
+the changes. They answer the questions a diff cannot, and they are worth
 reading before you start on the code rather than after.
 
 ### How to verify
 
 The agent's own steps for checking the work: what to do, in order, with every
-command in a panel of its own and a **Copy** button beside it. It goes wherever
-the agent's report goes — the **Record** section and, in **Turns**, at the top
-of the chunk the report belongs to — so wherever you are reading, you can find
-out how to check the work without hunting for it.
-
-Nothing on this card runs anything: it shows you the commands to copy. The
-**Verify** section can run them for you (below).
+command in a panel of its own and a **Copy** button beside it. On the task page
+they are on the **Verify** section, where you can also run them and tick them
+off (below); **Turns** keeps each turn's steps beside that turn's report, and the
+**Accept** page shows the latest ones above what will be merged.
 
 If a command block is written in the console style, with each line starting
 `$ `, the prompt markers are dropped — what you see is what you can paste.
@@ -426,7 +439,7 @@ it says so, and points you at the task's own question box below.
 ### Asking about a sentence of the agent's report
 
 The agent's words take comments too. Hover any paragraph, list item, heading or
-code block of the **Agent report** on Record — or of a walkthrough group's own
+code block of the **Agent report** on Overview — or of a walkthrough group's own
 text on Changes — and the same **+** appears. The box opens under that passage
 and quotes it; **Ask the agent** and **Add comment** work exactly as they do on
 a diff line, and the agent is given the passage you quoted along with your
@@ -477,15 +490,16 @@ read or written. Unsent words are that person's.
 
 ## Questions and notes from the agent
 
+**Current review** lists only the open blocking questions — the ones that hold up
+accept. Everything else the agent raised, and every item already decided, is on
+the project's **Raised** page.
+
 Agents raise two kinds of thing, and every item says which it is:
 
 | Badge | What it means |
 | --- | --- |
 | 🛑 **Blocking — gates accept** | A decision that must be made before the work can merge — a scope call, a semantics choice, a "confirm before I proceed" |
 | ⚠️ **FYI — never gates accept** | Something you should see. Decide it whenever you like, or leave it open |
-
-They are one list, blocking first, so you read what stands between you and a
-merge before what is merely proposed.
 
 For each open item, choose:
 
@@ -512,7 +526,8 @@ starts a turn on its own:
   it has been read, so the only honest correction is saying so next time. A
   promoted item links straight to the task it became.
 
-Decided items stay on the page either way.
+A decided item leaves **Current review** at once, since it no longer holds up
+accept. Its **Undo** is on the item's own page under **Raised**.
 
 See [Raised items](raised-items.md) for the full accept-gate rules.
 
@@ -605,40 +620,50 @@ counted anything is hidden.
 
 Some files are protected: the agent may read them but is not allowed to leave
 them changed without a person saying so. When a task changes one, it stops and
-waits for you, and the task page lists the files under **Protected files**.
+waits for you. The files are listed under **Protected files** on **Current
+review**, each with the agent's reason for keeping it (if it gave one), a **See
+its diff** link, and two switches, **Approve** and **Reject**. Exactly one of
+them is lit once you have decided; a file you have not decided yet lights
+neither. Your decision is saved the moment you press it, survives a reload, and
+is the same on every screen (and in the command-line review).
 
-There is one moment the decision is made, and it is the merge.
+- **Approve** keeps the agent's version. Accept can merge it.
+- **Reject** refuses the change. Accept stays refused, and the **next time you
+  send feedback** (Unblock), lazy restores each rejected file to the version it
+  started from — as a commit of its own, before the agent starts — and tells
+  the agent to make the rest of the work fit. The page says so above the
+  feedback box. Nothing is restored until that turn runs. Once restored, the
+  file drops off the list, and Accept tells the reviewer the merged work
+  contains lazy's restore. If the agent changes the file again, it comes back
+  as undecided and needs a new decision.
 
-**Resuming the task.** The files are listed next to the feedback box and
-nothing is asked about them. Resuming changes nothing about them — the work
-carries on with the agent's version, and the decision is still owed. If you
-want one put back, say so in your feedback: asking the agent to revert it is
-the only way it leaves the branch.
+You can change your mind at any time: every file stays on the list with its
+switch, including approved ones.
+
+The same switches sit on each protected file's header on **Changes**, so you
+can decide while reading the diff. Changes and Regions also list the files still
+owed at the top, each with an **Approve or reject** link to its row on Current
+review. If you may not accept the task, the switches show the current decision
+but cannot be pressed, and the page says why.
+
+**Resuming the task.** Feedback on its own changes nothing about undecided or
+approved files — the work carries on with the agent's version. Only rejected
+files are sent back.
 
 Where the agent gave a reason for keeping a file, it is quoted under the file's
 name. It is an argument addressed to you, not a decision: the file is still
-waiting either way.
+undecided until you press a switch.
 
-**Accepting the task.** Accept is all of them or none: the confirmation page
-lists every file still waiting and asks you to confirm, in one tick, that the
-agent's version of **every** one of them should be merged. There is no per-file
-choice — to drop one, resume the task and ask the agent to revert it first,
-then accept.
-
-The list is the whole branch's, not the last turn's: a file changed early and
-never looked at again is still on it. If you try to accept with one of them
-unsettled, the merge is refused and the refusal names the files.
-
-A decision is final for the file it settles: once kept, a file stays kept, and
-a later merge is not asked about it again. Files already settled are listed
-under **Already decided** so you can see what was chosen.
-
-While files are waiting, the ahead-of-time accept check does not run — the page
-says so. Anything else wrong with the merge is still refused when you confirm.
+**Accepting the task.** Accept is refused while any protected file is rejected
+or undecided, and the page says so beside every Accept button. There is no
+blanket approval on the accept page — approve each file on Current review
+first. The list is the whole branch's, not the last turn's: a file changed
+early and never looked at again is still on it, and the refusal names the
+files.
 
 ## Give feedback
 
-Below the work are three tabs — **Unblock**, **Ask** and **Accept**. Unblock is
+Below Overview and Current review are three tabs — **Unblock**, **Ask** and **Accept**. Unblock is
 the feedback box described here, Ask is for questions about the task as a whole,
 and Accept is the same confirmation page as the Accept button further down, put
 within reach so you do not have to scroll for it.
@@ -734,7 +759,9 @@ still stands.
 **Reopen** is folded away and asks you to confirm, like the other controls that
 change a task's fate. Reopening a task that was accepted needs a reason — it
 goes on the task as a note. Reopening runs nothing by itself: the task comes
-back so you can start it or send it feedback when you are ready.
+back so you can start it or send it feedback when you are ready. It comes
+back with its own work, exactly as it was when it finished; if that work cannot
+be found, Reopen refuses and changes nothing rather than start the task empty.
 
 **Start** and **Resume** run the agent, so they spend your own Claude
 credential and are offered only if you have connected your Claude account. If
@@ -929,11 +956,15 @@ as never having run, and does not appear. A review whose statements could not be
 read but which did file questions still counts: it is listed, with a line saying
 a statement was unreadable, so the questions are not lost with it.
 
-A review that filed no questions is labelled **no questions filed** — not
-"clean". The distinction is deliberate: a review can write findings out without
-filing them as questions, and those are not shown here, so "no questions" is
-what this list knows and a clean bill of health is not. The review's own verdict
-and sweep statements are printed above it; read those.
+Each review carries a label saying what it concluded. It lists its findings,
+and the label counts them ("2 findings"). A review that lazy judged clean is
+labelled **clean**. That is a statement of the review's verdict, not a green
+light, and any finding it listed takes precedence over the word. A review whose
+verdict could not be read is labelled a **failed review**.
+
+When a review found something but your project's review settings mean it does
+not hold up accepting the task, it also carries a **not blocking** mark. The
+findings are still shown, so you can decide whether to act on them.
 
 Reviews here are a record, not a place to act — what a review found is answered
 with the task's raised items, where every other question on the task is.
@@ -1063,7 +1094,9 @@ checking out a colleague's branch and running it. Read what you run.
 About 30 seconds after you close your last terminal, the environment is
 discarded, together with anything still running in it. There is nothing to
 start beforehand and nothing to clean up afterwards. The first terminal can take
-a moment while the environment starts.
+a moment while the environment starts, and the terminal shows what it is doing
+meanwhile. Right after Lazy Teams has been upgraded, that first start can take a
+few minutes.
 
 **What your environment shares with other tasks.** The agent of this task is
 stopped while you work, but other tasks' agents keep running, and a few things
@@ -1156,7 +1189,8 @@ asking the agent to; or leave them for its next turn.
 - Opening your first terminal stops the agent's own environment, and it stays
   stopped until your session has ended. Anything a turn left running there — a
   dev server, a file watcher — stops with it, so nothing of the agent's runs
-  beside you. Its next turn starts it again as usual.
+  beside you. Its next turn starts a fresh one, and the agent is told so:
+  anything it installed or changed outside the task's files is gone.
 - One person at a time can work in a task, with as many terminals as they like.
   The tab says who it is.
 - A terminal left open doesn't hold the task forever. It closes after an hour
@@ -1170,3 +1204,22 @@ asking the agent to; or leave them for its next turn.
 - [Raised items](raised-items.md)
 - [Agent reviews](review.md)
 - [Self-hosting Lazy Teams](self-hosting-lazy-teams.md)
+
+## Ids in text are links
+
+You never need to paste an id into search. Wherever the web dashboard or Lazy
+Teams shows written text — prompts, turns, comments, journal entries, raised
+items, review reports, messages and conversations — these become links:
+
+- a **task code** (such as `fix-login-redirect`) or the **first 8 characters of
+  a task id** goes to that task;
+- a **raised-item id** (such as `29044bce`, with or without a leading `#`) goes
+  to that raised item;
+- a **commit sha** of 7 or more characters goes to that commit's page — only
+  for commits recorded on the task you are looking at.
+
+If one 8-character id matches more than one kind of record, a task wins over a
+raised item, and a raised item wins over a commit. An id that matches nothing,
+or matches two records of the same kind, stays plain text. Text inside code
+spans and code blocks is never linked, so commands and log excerpts read
+exactly as written.

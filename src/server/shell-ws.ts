@@ -75,6 +75,69 @@ export interface ShellSocketData {
   limits?: TerminalLimits;
   /** The running watch, when {@link limits} is set. */
   idle?: IdleWatch | null;
+  /**
+   * Work that runs AFTER the upgrade was answered and before the exec starts
+   * — a member's own container (./session-attach-ws.ts). `status` sends a
+   * `status` frame. On success it has set {@link container}; on failure it has
+   * already undone everything it held, and the socket gets its `error` frame.
+   */
+  prepare?: (status: (message: string) => void) => Promise<{ ok: true } | { ok: false; message: string; detail?: string }>;
+  /** Set while {@link prepare} runs. */
+  preparing?: boolean;
+  /** The socket closed while {@link prepare} ran: nothing is started, and
+   * {@link onClose} runs once preparation settles. */
+  closedWhilePreparing?: boolean;
+  /**
+   * Called at once when the client closes during {@link prepare}: frees what
+   * the socket held (a member's claim on the task) without waiting for the
+   * preparation, which may be a minutes-long image build. Must be idempotent.
+   */
+  releaseNow?: (() => void) | null;
+}
+
+/**
+ * Run a socket's {@link ShellSocketData.prepare}, if any. Returns whether the
+ * exec should start. A client that left meanwhile gets nothing started, and
+ * its release runs now that the hold it would release exists.
+ */
+async function runPreparation(ws: ServerWebSocket<ShellSocketData>): Promise<boolean> {
+  const data = ws.data;
+  if (!data.prepare) return true;
+  data.preparing = true;
+  let outcome: { ok: true } | { ok: false; message: string; detail?: string };
+  try {
+    outcome = await data.prepare((message) => {
+      if (data.closedWhilePreparing) return;
+      try { ws.send(shellServerMessage({ type: 'status', message })); } catch { /* socket closing */ }
+    });
+  } catch (err) {
+    // `prepare` reports its own failures; a throw here is a bug in it, still
+    // answered on the socket rather than left as an unhandled rejection.
+    outcome = { ok: false, message: err instanceof Error ? err.message : String(err) };
+  } finally {
+    data.preparing = false;
+  }
+  if (!outcome.ok) {
+    // Everything held was already undone by `prepare`: nothing to release twice.
+    data.onClose = null;
+    if (!data.closedWhilePreparing) {
+      try {
+        ws.send(shellServerMessage({ type: 'error', message: outcome.message, ...(outcome.detail ? { detail: outcome.detail } : {}) }));
+        ws.close(1011, 'terminal could not be prepared');
+      } catch { /* already closed */ }
+    }
+    return false;
+  }
+  if (data.closedWhilePreparing) {
+    try {
+      data.onClose?.();
+    } catch (err) {
+      logger.warn(`terminal release after an early close failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    data.onClose = null;
+    return false;
+  }
+  return true;
 }
 
 export interface ShellUpgraderDeps {
@@ -214,6 +277,7 @@ export function createShellRelayHandler(): import('bun').WebSocketHandler<unknow
   const handler = {
     async open(ws: ServerWebSocket<ShellSocketData>) {
       const data = ws.data;
+      if (!(await runPreparation(ws))) return;
       let socketPath: string;
       try {
         socketPath = await resolveDockerSocketPath(data.binary);
@@ -261,7 +325,19 @@ export function createShellRelayHandler(): import('bun').WebSocketHandler<unknow
 
     message(ws: ServerWebSocket<ShellSocketData>, message: string | Buffer) {
       const exec = ws.data.exec;
-      if (!exec) return;
+      if (!exec) {
+        // Still preparing: keystrokes have nowhere to go, but a resize is kept
+        // so the PTY opens at the size the terminal has NOW, not the one in
+        // the URL minutes ago.
+        if (typeof message === 'string') {
+          const parsed = parseShellClientMessage(message);
+          if (parsed.ok && parsed.message.type === 'resize') {
+            ws.data.cols = parsed.message.cols;
+            ws.data.rows = parsed.message.rows;
+          }
+        }
+        return;
+      }
       if (typeof message === 'string') {
         // TEXT frame — a JSON control message.
         const parsed = parseShellClientMessage(message);
@@ -284,6 +360,18 @@ export function createShellRelayHandler(): import('bun').WebSocketHandler<unknow
     },
 
     close(ws: ServerWebSocket<ShellSocketData>) {
+      // Still preparing: nothing is running to close. What the socket holds
+      // is released now (`releaseNow`); anything the preparation takes after
+      // this is released by runPreparation once it settles.
+      if (ws.data.preparing) {
+        ws.data.closedWhilePreparing = true;
+        try {
+          ws.data.releaseNow?.();
+        } catch (err) {
+          logger.warn(`terminal release on an early close failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        return;
+      }
       // Closing the exec closes the hijacked docker socket, which HUPs the
       // process inside the container — orphan reaping with no bookkeeping.
       ws.data.idle?.stop();

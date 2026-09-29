@@ -16,7 +16,7 @@ import { dirname } from 'path';
 import { spawn } from '../utils/spawn';
 import { waitForDaemon, cleanupStaleFiles, isDaemonRunning, getLogPath, getStartupErrorPath } from './index';
 import { getLazyCommand } from '../utils/cli-path';
-import { assertDaemonCredentials } from './credential-gate';
+import { findForeignDaemon, foreignDaemonRefusal, type ForeignDaemon } from './foreign-daemon';
 
 /** Commands that should NOT trigger auto-start (they work without daemon) */
 export const SKIP_AUTO_START = new Set([
@@ -24,18 +24,14 @@ export const SKIP_AUTO_START = new Set([
   'init',       // bootstrap command — must work before daemon exists
   'completion', // shell completion — must be fast
   'customize',  // writes template files into the project; touches no task state
-  // `lazy auth` is how you FIX a missing credential, so it must never be gated
-  // on having one: auto-start runs the credential gate, and a gated `auth set`
-  // would leave a credential-less machine with no way to store a credential.
-  // It touches no task state either — it writes to OS secure storage and the
+  // `lazy auth` is how you FIX a missing credential, and it needs no daemon:
+  // it touches no task state — it writes to OS secure storage and the
   // per-project daemon dir, both of which the daemon re-reads at startup.
   'auth',
   // `lazy playground` provisions a project of its OWN, under a throwaway root, and
   // starts that project's daemon itself with the environment a demo needs.
   // Whichever project the caller happens to be standing in is irrelevant to it,
-  // and starting THAT project's daemon would run the credential gate — so an
-  // agent asking for a demo inside its container, where no real credential is
-  // present by design, would be refused for a daemon it never wanted.
+  // and starting THAT project's daemon would be a daemon it never wanted.
   'playground',
   'demo', // the old spelling of `playground`, kept as an alias for one release
   // `lazy login` / `lazy logout` talk only to Lazy Teams and the clone's
@@ -59,15 +55,18 @@ export const SKIP_AUTO_START = new Set([
  *
  * @param projectRoot - Project root directory
  */
-export async function startDaemonBackground(projectRoot: string): Promise<void> {
-  // Credential gate (the single enforcement point for auth). Pre-flight here,
-  // before spawning the detached child, so a missing credential surfaces as an
-  // immediate actionable error in the caller's terminal — not a confusing
-  // "Daemon did not start within 5 seconds" timeout after the child dies.
-  await assertDaemonCredentials(projectRoot);
-
+export async function startDaemonBackground(
+  projectRoot: string,
+  scanned?: { foreign: ForeignDaemon | null },
+): Promise<void> {
   const logPath = getLogPath(projectRoot);
   const startupErrorPath = getStartupErrorPath(projectRoot);
+
+  // Never a second daemon for one project: a daemon started under another
+  // base dir (a managed guest's) is invisible to this shell's state files.
+  // ensureDaemon hands down the scan it already made.
+  const foreign = scanned ? scanned.foreign : await findForeignDaemon(projectRoot);
+  if (foreign) throw new Error(foreignDaemonRefusal(projectRoot, foreign));
 
   // Ensure daemon directory exists before spawning — Bun.spawn needs the
   // log file's parent directory to exist for stdout/stderr redirection.
@@ -148,6 +147,16 @@ export async function startDaemonBackground(projectRoot: string): Promise<void> 
 
   if (outcome === 'ready') return;
 
+  // Our child exiting early may just mean it LOST the singleton lock to a
+  // sibling CLI's daemon starting at the same moment — then that daemon serves
+  // us. A lock loser writes no startup-error marker, so a marker (a real
+  // startup failure) is reported at once below without this extra wait.
+  if (
+    outcome === 'exited' &&
+    !(await readStartupErrorMarker(startupErrorPath)) &&
+    (await waitForDaemon(projectRoot, 5000))
+  ) return;
+
   // Either the child exited early, or the readiness poll timed out while
   // the child is still alive but not responding. In both cases, check for
   // a startup-error marker first — it's the actionable message, and we
@@ -222,6 +231,23 @@ export async function ensureDaemon(command: string | undefined, projectRoot: str
     return true;
   }
 
+  // A live daemon for this project under ANOTHER base dir (a managed guest's
+  // daemon, seen from a shell without its env): talk to it when its base dir
+  // is readable and it answers there; startDaemonBackground refuses otherwise.
+  const foreign = await findForeignDaemon(projectRoot);
+  if (foreign?.baseDir) {
+    const previous = process.env.LAZY_DAEMON_BASE_DIR;
+    process.env.LAZY_DAEMON_BASE_DIR = foreign.baseDir;
+    if (isDaemonRunning(projectRoot)) {
+      console.error(`Using the running daemon (PID ${foreign.pid}) from ${foreign.baseDir}.`);
+      return true;
+    }
+    if (previous === undefined) delete process.env.LAZY_DAEMON_BASE_DIR;
+    else process.env.LAZY_DAEMON_BASE_DIR = previous;
+  }
+  // The scan may have waited out a sibling CLI's daemon starting in OUR dir.
+  if (!foreign && isDaemonRunning(projectRoot)) return true;
+
   // Daemon is dead or never started. Clean up stale files (PID, legacy socket)
   // left behind by a crash, then start a fresh daemon.
   // startDaemonServer's flock ensures only one daemon wins if multiple
@@ -232,6 +258,6 @@ export async function ensureDaemon(command: string | undefined, projectRoot: str
   // itself refuses while a live process holds the daemon lock, so a loser
   // cannot delete the winner's files.
   cleanupStaleFiles(projectRoot);
-  await startDaemonBackground(projectRoot);
+  await startDaemonBackground(projectRoot, { foreign });
   return true;
 }

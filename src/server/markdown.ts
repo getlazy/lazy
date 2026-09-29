@@ -250,6 +250,38 @@ function linkifyWords(html: string, tables: readonly MarkdownLinkifyTable[]): st
   }).join('');
 }
 
+/**
+ * Bare hex ids → links, outside <a> and <code>. Same text-node walk as
+ * linkifyWords; a token that does not resolve is left exactly as written.
+ */
+function linkifyIds(
+  html: string,
+  resolve: NonNullable<RenderMarkdownOptions['idLinks']>,
+): string {
+  const parts = html.split(/(<[^>]+>)/);
+  let inA = 0;
+  let inCode = 0;
+  return parts.map((part) => {
+    if (part.startsWith('<')) {
+      if (/^<a[\s>/]/i.test(part)) inA++;
+      else if (/^<\/a>/i.test(part)) inA = Math.max(0, inA - 1);
+      else if (/^<code[\s>/]/i.test(part)) inCode++;
+      else if (/^<\/code>/i.test(part)) inCode = Math.max(0, inCode - 1);
+      return part;
+    }
+    if (inA || inCode) return part;
+    // `/` and `.` keep a path or URL fragment from being read as a bare id.
+    // `#29044bce` is a natural way to write an id, so `#` is allowed; no
+    // escaped entity yields 7+ hex characters.
+    return part.replace(/(?<![A-Za-z0-9_\-/.])([0-9a-f]{7,40})(?![A-Za-z0-9_\-])/g, (match) => {
+      const hit = resolve(match);
+      if (!hit || safeLinkHref(escapeHtml(hit.href)) === null) return match;
+      const cls = hit.className ? ` class="${escapeHtml(hit.className)}"` : '';
+      return `<a href="${escapeHtml(hit.href)}"${cls}>${match}</a>`;
+    });
+  }).join('');
+}
+
 function renderInline(text: string, options: RenderMarkdownOptions = {}): string {
   let result = escapeHtml(text);
   const tables = options.linkify ?? [];
@@ -288,6 +320,7 @@ function renderInline(text: string, options: RenderMarkdownOptions = {}): string
   });
 
   if (hasTables) result = linkifyWords(result, tables);
+  if (options.idLinks) result = linkifyIds(result, options.idLinks);
 
   return result;
 }
@@ -390,6 +423,13 @@ export interface RenderMarkdownOptions {
    * still land when this prose is not on the Changes tab.
    */
   hashLinkBase?: string;
+  /**
+   * Resolve a bare hex token (short task id, raised-item id, commit sha) to a
+   * link. The caller owns WHICH ids exist (src/task/id-links.ts); this pass
+   * only finds candidates in prose — never inside code spans, fenced blocks or
+   * an existing link — and links the ones that resolve.
+   */
+  idLinks?: (token: string) => { href: string; className?: string } | null;
 }
 
 export function renderMarkdown(markdown: string, options: RenderMarkdownOptions = {}): string {
@@ -527,6 +567,7 @@ export function renderMarkdown(markdown: string, options: RenderMarkdownOptions 
         `<blockquote${markAttrs(quoteStart, i - 1)}>${renderMarkdown(quoteLines.join('\n'), {
           linkify: options.linkify,
           hashLinkBase: options.hashLinkBase,
+          idLinks: options.idLinks,
         })}</blockquote>`,
       );
       continue;

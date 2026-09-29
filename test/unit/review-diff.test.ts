@@ -764,6 +764,7 @@ describe('reviewQueueHtml', () => {
 describe('protected-file violations on the review surface', () => {
   const violations: FileViolation[] = [
     { file: 'src/foo.ts', base_sha: 'base1111', status: 'pending' },
+    { file: 'README.md', base_sha: 'base3333', status: 'pending', rejected_at: 1 },
     { file: 'src/bar.ts', base_sha: 'base2222', status: 'approved' },
   ];
 
@@ -787,13 +788,19 @@ describe('protected-file violations on the review surface', () => {
 
   // INVARIANT: the current answer must be VISIBLE, not implied by an empty
   // control. "Unticked means rejected" is a rule you have to be told.
-  test('the standing answer is shown for both the undecided and the approved file', () => {
+  // Amended (teams-protected-approve-reject): Reject is a decision of its own —
+  // the next unblock restores the file — so an UNDECIDED file lights
+  // neither switch and says so in words; the lit switch is always a decision.
+  test('the standing answer is shown for the undecided, rejected and approved file', () => {
     const html = render();
     const control = (file: string) =>
       (html.split(`data-rv-decide="${file}"`)[1] ?? '').split('</form>')[0];
-    // undecided → ⛔ is the lit button
-    expect(control('src/foo.ts')).toMatch(/value="0"[^>]*rv-decide-on/);
-    expect(control('src/foo.ts')).not.toMatch(/value="1"[^>]*rv-decide-on/);
+    // undecided → neither lit, and the state line says it is undecided
+    expect(control('src/foo.ts')).not.toMatch(/rv-decide-on/);
+    expect(control('src/foo.ts')).toContain('not decided yet');
+    // rejected → ⛔ is the lit button
+    expect(control('README.md')).toMatch(/value="0"[^>]*rv-decide-on/);
+    expect(control('README.md')).not.toMatch(/value="1"[^>]*rv-decide-on/);
     // approved → ✅ is the lit button
     expect(control('src/bar.ts')).toMatch(/value="1"[^>]*rv-decide-on/);
     expect(control('src/bar.ts')).not.toMatch(/value="0"[^>]*rv-decide-on/);
@@ -818,7 +825,7 @@ describe('protected-file violations on the review surface', () => {
   test('showDecision: false omits the control but keeps the file-section token', () => {
     const files = parseUnifiedDiff(PATCH);
     const html = renderReviewDiff(files, new Map(), {
-      violations: new Map([['src/foo.ts', 'pending']]),
+      violations: new Map([['src/foo.ts', 'undecided']]),
       taskId: 't1',
       showDecision: false,
       assignSectionId: false,
@@ -929,7 +936,7 @@ describe('protected-file violations on the review surface', () => {
     const html = render();
     const row = (html.split('data-rv-summary="src/foo.ts"')[1] ?? '').split('</li>')[0];
     expect(row).not.toContain('rv-decide-btn');
-    expect(html).toContain('1 of 2 protected files not yet accepted');
+    expect(html).toContain('2 of 3 protected files not yet accepted');
     expect(html).toContain(`href="#${fileSectionId('src/foo.ts')}"`);
   });
 

@@ -4,12 +4,11 @@
  *
  * THE ACCEPTANCE CASE (observed live, repeatedly): `lazy upgrade` restarts the
  * daemon from whatever shell ran the upgrade, and that shell routinely has no
- * token exported — so the restart hit the credential gate and the upgrade
- * aborted with "Daemon refuses to start: no authentication credential found in
- * the environment." The fix is that the daemon no longer depends on its
- * launching shell: it reads the credential store. The last two tests here pin
- * that down end to end — refusal with an empty environment, then the SAME empty
- * environment succeeding once a credential is stored.
+ * token exported. The daemon reads the credential store, so it has the stored
+ * credential whichever shell started it — and it no longer needs a credential
+ * to START at all (only a turn does). The tests at the end pin both: a daemon
+ * starts from an empty environment and says in `lazy daemon health` which
+ * profiles cannot run turns yet, and a stored credential clears that.
  *
  * These run the real CLI with LAZY_TEST='' (so the production daemon start path
  * really executes) and HOME pinned to a temp dir, so the developer's own daemon
@@ -178,9 +177,7 @@ describe('lazy auth', () => {
   });
 
   // INVARIANT: `lazy auth` must never be gated on having a credential — it is
-  // the command that FIXES not having one. It is therefore excluded from daemon
-  // auto-start; if that exclusion regresses, `auth set` starts failing with the
-  // gate's own refusal and a credential-less machine has no way out.
+  // the command that FIXES not having one — and it runs without a daemon.
   test('auth runs without a credential and without starting a daemon', async () => {
     const result = await ctx.lazy(['auth', 'list'], { env: emptyCredentialEnv() });
     expect(result.exitCode).toBe(0);
@@ -188,17 +185,20 @@ describe('lazy auth', () => {
   });
 
   describe('the daemon no longer depends on the shell that starts it', () => {
-    // Baseline: with an empty environment and nothing stored, the daemon
-    // refuses — this is the abort `lazy upgrade` used to die on.
-    test('an empty environment with nothing stored is refused', async () => {
-      const result = await ctx.lazy(['daemon', 'start', '--foreground'], {
-        env: emptyCredentialEnv(),
-      });
-      expect(result.exitCode).not.toBe(0);
-      expect(result.stderr).toContain('Daemon refuses to start');
-      // The refusal points at the store first, because that is the fix that
-      // survives closing the terminal.
-      expect(result.stderr).toContain('lazy auth set anthropic');
+    // INVARIANT: a daemon needs no model credential to start. With an empty
+    // environment and nothing stored it comes up, and `lazy daemon health`
+    // says which profile's turns will be refused — a WARN, not a refusal.
+    test('an empty environment with nothing stored starts, and health names the profile', async () => {
+      const result = await ctx.lazy(['daemon', 'start'], { env: emptyCredentialEnv() });
+      try {
+        expect(result.stderr).not.toContain('Daemon refuses to start');
+        expect(result.exitCode).toBe(0);
+        const health = await ctx.lazy(['daemon', 'health'], { env: emptyCredentialEnv() });
+        expect(health.stdout).toContain('no credential for profile claude-code; turns on it will be refused');
+        expect(health.stdout).toContain('lazy auth set anthropic');
+      } finally {
+        await ctx.lazy(['daemon', 'stop'], { env: emptyCredentialEnv() });
+      }
     });
 
     // THE ACCEPTANCE CASE: same empty environment, credential in the store —
@@ -219,16 +219,11 @@ describe('lazy auth', () => {
       }
     });
 
-    // INVARIANT: a store that says "stored" and delivers nothing must STOP the
-    // daemon, not merely log.
-    //
-    // The gate cannot see this: it answers from the non-secret index — on
-    // purpose, so a detached auto-start never blocks on a keychain unlock — and
-    // that is the very record disagreeing with the backend. So the index says
-    // "stored", the gate says "fine", and without the post-hydration check the
-    // daemon comes up with an empty environment and 401s on every model
-    // request, with one line in a log file nobody is watching as the only clue.
-    test('a store that cannot deliver its secret stops the daemon, naming why', async () => {
+    // INVARIANT: a store that says "stored" and delivers nothing must not be
+    // SILENT. It no longer stops the daemon (nothing but a turn needs the
+    // credential), so the reason is carried to `lazy daemon health` instead of
+    // being one line in a log nobody is watching.
+    test('a store that cannot deliver its secret is named in daemon health', async () => {
       const set = await ctx.lazy(['auth', 'set', 'anthropic'], {
         env: emptyCredentialEnv(),
         input: 'sk-ant-stored-secret-abcd\n',
@@ -241,16 +236,14 @@ describe('lazy auth', () => {
       expect(secretsFile).not.toBeNull();
       await rm(secretsFile!, { force: true });
 
-      const result = await ctx.lazy(['daemon', 'start', '--foreground'], {
-        env: emptyCredentialEnv(),
-      });
+      const result = await ctx.lazy(['daemon', 'start'], { env: emptyCredentialEnv() });
       try {
-        expect(result.exitCode).not.toBe(0);
-        expect(result.stderr).toContain('Refusing to start');
-        // The WHY has to survive all the way out to the terminal — the whole
-        // point is that this failure is not silent.
-        expect(result.stderr).toContain('the backend did not return one');
-        expect(result.stderr).toContain('lazy auth set anthropic');
+        expect(result.exitCode).toBe(0);
+        const health = await ctx.lazy(['daemon', 'health'], { env: emptyCredentialEnv() });
+        expect(health.stdout).toContain('could not be loaded');
+        // The WHY has to survive all the way out to the terminal.
+        expect(health.stdout).toContain('the backend did not return one');
+        expect(health.stdout).toContain('lazy auth set anthropic');
       } finally {
         await ctx.lazy(['daemon', 'stop'], { env: emptyCredentialEnv() });
       }

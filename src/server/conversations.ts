@@ -1,5 +1,8 @@
 /**
- * Builder conversations — the web half of `lazy conversations`.
+ * Builders — the web half of `lazy conversations`. A Builder is one
+ * conversation from a start or `/clear` to the next `/clear`, stitched from the
+ * session files compaction and resume roll through (docs/design/builder-identity.md);
+ * the pages live under `/builders`, and `/conversations` links redirect there.
  *
  * Past dialogues with this project's builder: a listing, keyword search across
  * their message bodies, and a paged read of one conversation's transcript. This
@@ -25,7 +28,7 @@
  * form — the whole surface works with scripting off, same posture as the inbox.
  */
 
-import type { ConversationSummary, StoredConversation, StoredMessage } from '../storage/types';
+import type { BuilderSummary, ConversationSummary, StoredConversation, StoredMessage } from '../storage/types';
 import {
   searchConversations,
   type ConversationSearchHit,
@@ -43,7 +46,7 @@ import {
 import { layoutHtml } from './templates';
 import { escapeHtml } from './review-diff';
 import { taskPath } from './task-urls';
-import { renderMarkdown } from './markdown';
+import { renderMarkdown, type RenderMarkdownOptions } from './markdown';
 
 /**
  * Messages rendered per transcript page.
@@ -93,11 +96,11 @@ function turnCounts(conv: Pick<ConversationSummary, 'stats'>): string {
 
 /** The search box. A GET form so a search is a linkable URL and needs no JS. */
 function searchFormHtml(query: string): string {
-  return `<form class="conv-search" method="get" action="/conversations">
+  return `<form class="conv-search" method="get" action="/builders">
     <input class="input" type="text" name="q" value="${escapeHtml(query)}"
-           placeholder="Keyword or pattern" aria-label="Search conversations">
+           placeholder="Keyword or pattern" aria-label="Search Builders">
     <button class="btn btn-sm btn-primary" type="submit">Search</button>
-    ${query ? '<a class="btn btn-sm" href="/conversations">Clear</a>' : ''}
+    ${query ? '<a class="btn btn-sm" href="/builders">Clear</a>' : ''}
   </form>`;
 }
 
@@ -116,31 +119,38 @@ const INTRO =
  * counts, summary — because the two listings are the same listing, and a human
  * moving between the terminal and the browser should not have to re-learn it.
  */
-export function conversationsIndexHtml(conversations: ConversationSummary[]): string {
-  const body = conversations.length === 0
-    ? `<div class="empty-state">No builder conversations yet. Dialogues with the builder appear here once they are captured.</div>`
-    : `<p class="text-muted">${conversations.length} conversation${conversations.length === 1 ? '' : 's'}.</p>
+export function conversationsIndexHtml(builders: BuilderSummary[]): string {
+  const body = builders.length === 0
+    ? `<div class="empty-state">No Builders yet. Dialogues with the builder appear here once they are captured.</div>`
+    : `<p class="text-muted">${builders.length} Builder${builders.length === 1 ? '' : 's'}.</p>
        <table class="table conv-table">
-         <thead><tr><th>Session</th><th>Started</th><th>Ended</th><th>Turns</th><th>Summary</th></tr></thead>
-         <tbody>${conversations.map(conversationRowHtml).join('\n')}</tbody>
+         <thead><tr><th>Builder</th><th>Started</th><th>Ended</th><th>Turns</th><th>Title</th></tr></thead>
+         <tbody>${builders.map(builderRowHtml).join('\n')}</tbody>
        </table>`;
 
-  return layoutHtml('Builder conversations', `
-    <h1>Builder conversations</h1>
+  return layoutHtml('Builders', `
+    <h1>Builders</h1>
     <p class="text-muted conv-intro">${INTRO}</p>
     ${searchFormHtml('')}
     ${body}
   `);
 }
 
-function conversationRowHtml(conv: ConversationSummary): string {
-  const href = `/conversations/${escapeHtml(encodeURIComponent(conv.sessionId))}`;
+/** The live run's state, as a badge on the Builder it is in — nothing more. */
+export function builderRunBadgeHtml(builder: Pick<BuilderSummary, 'run'>): string {
+  if (!builder.run?.live) return '';
+  return `<span class="tag tag-success builder-run-badge">${escapeHtml(builder.run.state)}</span>`;
+}
+
+function builderRowHtml(b: BuilderSummary): string {
+  const href = `/builders/${escapeHtml(encodeURIComponent(b.id))}`;
+  const badge = builderRunBadgeHtml(b);
   return `<tr class="conv-row">
-    <td class="conv-id"><a href="${href}">${escapeHtml(shortSessionId(conv.sessionId))}</a></td>
-    <td>${escapeHtml(formatConversationTimestamp(conv.startedAt))}</td>
-    <td>${escapeHtml(formatConversationTimestamp(conv.endedAt))}</td>
-    <td class="conv-turns">${conv.stats.userMessageCount}h/${conv.stats.assistantMessageCount}a</td>
-    <td class="wrap conv-summary"><a href="${href}">${escapeHtml(conversationTitle(conv))}</a></td>
+    <td class="conv-id"><a href="${href}">${escapeHtml(shortSessionId(b.id))}</a></td>
+    <td>${escapeHtml(formatConversationTimestamp(b.startedAt))}</td>
+    <td>${escapeHtml(formatConversationTimestamp(b.endedAt))}</td>
+    <td class="conv-turns">${b.stats.userMessageCount}h/${b.stats.assistantMessageCount}a</td>
+    <td class="wrap conv-summary">${badge ? badge + ' ' : ''}<a href="${href}">${escapeHtml(conversationTitle({ summary: b.title }))}</a></td>
   </tr>`;
 }
 
@@ -161,15 +171,15 @@ export function conversationsSearchHtml(
   if (error) {
     results = '';
   } else if (hits.length === 0) {
-    results = `<div class="empty-state">No conversation mentions &ldquo;${escapeHtml(query)}&rdquo;. Try a different keyword, or clear the search to see the full list.</div>`;
+    results = `<div class="empty-state">No Builder mentions &ldquo;${escapeHtml(query)}&rdquo;. Try a different keyword, or clear the search to see the full list.</div>`;
   } else {
-    results = `<p class="text-muted" id="conversations-search-summary">${hits.length} conversation${hits.length === 1 ? '' : 's'} matched &ldquo;${escapeHtml(query)}&rdquo; (at most 10 conversations, 5 passages each).</p>
+    results = `<p class="text-muted" id="conversations-search-summary">${hits.length} Builder${hits.length === 1 ? '' : 's'} matched &ldquo;${escapeHtml(query)}&rdquo; (at most 10 Builders, 5 passages each).</p>
       <div class="conv-hits" id="conversations-search-hits">${hits.map((hit) => hitHtml(hit, byId.get(hit.sessionId))).join('\n')}</div>`;
   }
 
   return layoutHtml(`Search: ${query}`, `
-    <div class="breadcrumb"><a href="/conversations">Builder conversations</a> &rsaquo; Search</div>
-    <h1>Builder conversations</h1>
+    <div class="breadcrumb"><a href="/builders">Builders</a> &rsaquo; Search</div>
+    <h1>Builders</h1>
     ${searchFormHtml(query)}
     ${error ? errorBannerHtml(error) : ''}
     ${results}
@@ -177,7 +187,7 @@ export function conversationsSearchHtml(
 }
 
 function hitHtml(hit: ConversationSearchHit, conv: StoredConversation | undefined): string {
-  const href = `/conversations/${escapeHtml(encodeURIComponent(hit.sessionId))}`;
+  const href = `/builders/${escapeHtml(encodeURIComponent(hit.sessionId))}`;
   const title = conv ? conversationTitle(conv) : elideConversationSummary(hit.summary, 120);
   const meta = [
     shortSessionId(hit.sessionId),
@@ -226,18 +236,23 @@ export function conversationDetailHtml(
   offset: number,
   promote?: ConversationPromoteView,
   duplicatedCodes?: ReadonlySet<string>,
+  markdown?: RenderMarkdownOptions,
+  builder?: BuilderSummary,
 ): string {
   const total = conv.messages.length;
   const title = conversationTitle(conv);
   const idHtml = escapeHtml(encodeURIComponent(conv.sessionId));
 
   const metaRows: Array<[string, string]> = [
-    ['Session', shortSessionId(conv.sessionId)],
+    ['Builder', shortSessionId(conv.sessionId)],
     ['Started', formatConversationTimestamp(conv.startedAt)],
     ['Ended', formatConversationTimestamp(conv.endedAt)],
     ['Messages', `${total} total · ${turnCounts(conv)}`],
   ];
   if (conv.gitBranch) metaRows.push(['Branch', conv.gitBranch]);
+  if (builder && builder.segments.length > 1) {
+    metaRows.push(['Session files', builder.segments.map(shortSessionId).join(', ')]);
+  }
 
   const meta = `<dl class="conv-meta">${metaRows.map(
     ([term, value]) => `<div><dt>${escapeHtml(term)}</dt><dd>${escapeHtml(value)}</dd></div>`
@@ -249,16 +264,16 @@ export function conversationDetailHtml(
 
   const selection = promote?.selection ?? null;
   const body = total === 0
-    ? `<div class="empty-state">Nothing was captured for this conversation.</div>`
+    ? `<div class="empty-state">Nothing was captured for this Builder.</div>`
     : `${pageNote}
        <div class="conv-messages" id="conversation-messages">${messages.map(
-         (msg, i) => messageHtml(msg, offset + i + 1, idHtml, offset, selection),
+         (msg, i) => messageHtml(msg, offset + i + 1, idHtml, offset, selection, markdown),
        ).join('\n')}</div>
        ${paginationHtml(idHtml, offset, messages.length, total)}`;
 
   return layoutHtml(title, `
-    <div class="breadcrumb"><a href="/conversations">Builder conversations</a> &rsaquo; Conversation</div>
-    <h1>${escapeHtml(title)}</h1>
+    <div class="breadcrumb"><a href="/builders">Builders</a> &rsaquo; Builder</div>
+    <h1>${escapeHtml(title)}${builder && builderRunBadgeHtml(builder) ? ' ' + builderRunBadgeHtml(builder) : ''}</h1>
     ${meta}
     ${promote ? promoteSectionHtml(conv, idHtml, offset, promote, duplicatedCodes) : ''}
     ${body}
@@ -345,7 +360,7 @@ function promoteFormHtml(
   return `<details class="conv-promote-form" id="conversation-promote" open>
     <summary>Promote messages ${escapeHtml(formatMessageRange(selection))} of ${total} into a task</summary>
     ${overlapNote}
-    <form method="post" action="/conversations/${idHtml}/promote">
+    <form method="post" action="/builders/${idHtml}/promote">
       <input type="hidden" name="from" value="${selection.from}">
       <input type="hidden" name="to" value="${selection.to}">
       <input type="hidden" name="offset" value="${offset}">
@@ -365,7 +380,7 @@ function promoteFormHtml(
       </label>
       <div class="conv-promote-actions">
         <button class="btn btn-sm btn-primary" type="submit">Create backlog task</button>
-        <a class="btn btn-sm" href="/conversations/${idHtml}?offset=${offset}">Clear selection</a>
+        <a class="btn btn-sm" href="/builders/${idHtml}?offset=${offset}">Clear selection</a>
       </div>
     </form>
   </details>`;
@@ -384,11 +399,12 @@ function messageHtml(
   idHtml: string,
   offset: number,
   selection: MessageRange | null,
+  markdown?: RenderMarkdownOptions,
 ): string {
   const stamp = msg.timestamp ? formatConversationTimestamp(msg.timestamp) : '';
   const model = msg.model ? `<span class="conv-model">${escapeHtml(msg.model)}</span>` : '';
   const content = msg.text.trim()
-    ? `<div class="turn-content">${renderMarkdown(msg.text)}</div>`
+    ? `<div class="turn-content">${renderMarkdown(msg.text, markdown)}</div>`
     : `<div class="conv-empty-message">This message recorded no text.</div>`;
 
   const selected = selection && number >= selection.from && number <= selection.to;
@@ -419,7 +435,7 @@ function selectionLinksHtml(
   selection: MessageRange | null,
 ): string {
   const href = (from: number, to: number) =>
-    `/conversations/${idHtml}?offset=${offset}&amp;from=${from}&amp;to=${to}#m${number}`;
+    `/builders/${idHtml}?offset=${offset}&amp;from=${from}&amp;to=${to}#m${number}`;
   const start = href(number, selection && selection.to > number ? selection.to : number);
   const end = href(selection && selection.from < number ? selection.from : number, number);
   return `<a class="conv-select-link" href="${start}">Start here</a>` +
@@ -430,10 +446,10 @@ function paginationHtml(idHtml: string, offset: number, shown: number, total: nu
   const links: string[] = [];
   if (offset > 0) {
     const earlier = Math.max(0, offset - MESSAGES_PER_PAGE);
-    links.push(`<a class="btn btn-sm" href="/conversations/${idHtml}?offset=${earlier}">&laquo; Earlier</a>`);
+    links.push(`<a class="btn btn-sm" href="/builders/${idHtml}?offset=${earlier}">&laquo; Earlier</a>`);
   }
   if (offset + shown < total) {
-    links.push(`<a class="btn btn-sm" href="/conversations/${idHtml}?offset=${offset + shown}">Later &raquo;</a>`);
+    links.push(`<a class="btn btn-sm" href="/builders/${idHtml}?offset=${offset + shown}">Later &raquo;</a>`);
   }
   if (links.length === 0) return '';
   return `<div class="action-links conv-pagination" id="conversation-pagination">${links.join('')}</div>`;
@@ -481,6 +497,30 @@ export async function runConversationSearch(
     // than 500-ing.
     return { hits: [], error: err instanceof Error ? err.message : String(err) };
   }
+}
+
+/**
+ * The Builders listing as JSON (`/api/builders`): metadata only. Same field
+ * names as the old per-session payload where the meaning carries over, plus
+ * the segments and the run badge (docs/design/builder-identity.md).
+ */
+export function buildersApiPayload(builders: BuilderSummary[]) {
+  return {
+    total: builders.length,
+    builders: builders.map((b) => ({
+      id: b.id,
+      short_id: shortSessionId(b.id),
+      title: conversationTitle({ summary: b.title }),
+      started_at: b.startedAt,
+      ended_at: b.endedAt,
+      git_branch: b.gitBranch,
+      message_count: b.stats.messageCount,
+      user_message_count: b.stats.userMessageCount,
+      assistant_message_count: b.stats.assistantMessageCount,
+      segments: b.segments,
+      run: b.run,
+    })),
+  };
 }
 
 /** The listing as JSON: metadata only, never transcripts. */

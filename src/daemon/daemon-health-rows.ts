@@ -27,10 +27,11 @@ import {
 export type HealthState = 'ok' | 'warn' | 'fail';
 
 /** Sections of the report, in the order they are rendered. */
-export type HealthGroup = 'daemon' | 'loops' | 'sweeps' | 'proxy' | 'storage' | 'runner' | 'tasks' | 'dashboard';
+export type HealthGroup = 'daemon' | 'credentials' | 'loops' | 'sweeps' | 'proxy' | 'storage' | 'runner' | 'tasks' | 'dashboard';
 
 export const HEALTH_GROUP_TITLES: Record<HealthGroup, string> = {
   daemon: 'Daemon',
+  credentials: 'Model credentials',
   loops: 'Loops',
   sweeps: 'Reconciler sweeps',
   proxy: 'Proxy',
@@ -171,6 +172,8 @@ export interface DaemonIdentityFacts {
   version: string;
   sourceId: string | null;
   sourceIdKind: string | null;
+  /** `branch@sha, clean|dirty` of the running code, or null when unknown. */
+  build?: string | null;
 }
 
 export function buildVersionRow(facts: DaemonIdentityFacts, now: number): DaemonHealthRow {
@@ -181,8 +184,68 @@ export function buildVersionRow(facts: DaemonIdentityFacts, now: number): Daemon
     group: 'daemon',
     name: 'Version and uptime',
     state: 'ok',
-    reason: `lazy ${facts.version}, pid ${facts.pid}, ${uptime}${source}`,
+    reason: `lazy ${facts.version}${facts.build ? ` (${facts.build})` : ''}, pid ${facts.pid}, ${uptime}${source}`,
   };
+}
+
+/** One credential turns on some profile would lack — see ./credential-gate.ts. */
+export interface MissingCredentialFact {
+  name: string;
+  label: string;
+  profiles: string[];
+  remedy: string;
+}
+
+/**
+ * The model-credential rows: one WARN per credential a configured profile
+ * bills and the daemon does not have, or one OK row.
+ *
+ * WARN, never FAIL. A daemon needs no model credential to run — it clones,
+ * serves reads, syncs and accepts without one — so a missing one is not a
+ * broken daemon. It is a set of profiles whose TURNS will be refused, and the
+ * row says exactly that, before anyone launches one.
+ *
+ * `startupProblem` is why stored credentials did not load when the daemon
+ * started (the store's index and backend disagreed): turns retry the load, so
+ * it is a WARN too, carrying the only explanation there is.
+ */
+export function buildCredentialRows(
+  missing: MissingCredentialFact[],
+  startupProblem: string | null,
+  perUser: boolean,
+): DaemonHealthRow[] {
+  const rows: DaemonHealthRow[] = missing.map((m) => ({
+    id: `credentials:${m.name}`,
+    group: 'credentials',
+    name: `${m.label} credential`,
+    state: 'warn',
+    reason:
+      `no credential for profile ${m.profiles.join(', ')}; turns on ${m.profiles.length === 1 ? 'it' : 'them'} ` +
+      `will be refused`,
+    remedy: `Connect one: ${m.remedy}. Everything else keeps working without it.`,
+  }));
+  if (startupProblem) {
+    rows.push({
+      id: 'credentials:startup-load',
+      group: 'credentials',
+      name: 'Stored credentials loaded',
+      state: 'warn',
+      reason: firstLine(startupProblem),
+      remedy: startupProblem.split('\n').slice(1).map((l) => l.trim()).filter(Boolean).join(' '),
+    });
+  }
+  if (rows.length === 0) {
+    rows.push({
+      id: 'credentials:present',
+      group: 'credentials',
+      name: 'Credentials for configured profiles',
+      state: 'ok',
+      reason: perUser
+        ? 'every turn runs on the credential its member connected for the turn\'s profile'
+        : 'every configured profile has one',
+    });
+  }
+  return rows;
 }
 
 /** Row id of the build comparison — doctor leaves it out, having its own check. */

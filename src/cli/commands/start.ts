@@ -28,6 +28,7 @@ import { formatMarkdown } from '../../utils/markdown';
 import { initTracing, shutdownTracing, withSpan, currentTraceparent } from '../../tracing';
 import { maybeOfferWorktreeImageForTask } from '../../docker/worktree-image';
 import { usagePauseOverrideEligibility } from '../human-terminal';
+import { CLAUDE_DEFAULT_MODEL, CODEX_LATEST_MODEL, CURSOR_DEFAULT_MODEL } from '../../config/default-models';
 
 
 export async function commandStart(args: string[]): Promise<void> {
@@ -38,6 +39,7 @@ export async function commandStart(args: string[]): Promise<void> {
     { name: 'follow', takesValue: false },
     { name: 'yes', takesValue: false },
     { name: 'force-local', takesValue: false },
+    { name: 'past-usage-pause', takesValue: false },
     { name: 'effort', takesValue: true },
     { name: 'runner', takesValue: true },
     ...REVIEW_FLAGS,
@@ -321,6 +323,7 @@ export async function commandStart(args: string[]): Promise<void> {
         // is pinned over this by the daemon, never taken from here.)
         actor: 'human',
         ...overrideEligibility,
+        ...(parsed.flags.get('past-usage-pause') === true ? { usagePausePastOnce: true as const } : {}),
         traceparent: currentTraceparent() ?? undefined,
       }, display));
     } finally {
@@ -373,7 +376,7 @@ export async function commandStart(args: string[]): Promise<void> {
 }
 
 export function startUsage(): void {
-  console.log(`Usage: lazy start <task_id> [--model <model>] [--agent <profile>] [--effort <level>] [--review <mode>] [--review-gate <g>] [--review-auto-fix <on|off>] [--runner <docker|container|podman>] [--env KEY=VALUE] [--env-file <path>] [--follow] [--yes] [--force-local]
+  console.log(`Usage: lazy start <task_id> [--model <model>] [--agent <profile>] [--effort <level>] [--review <mode>] [--review-gate <g>] [--review-auto-fix <on|off>] [--runner <docker|container|podman>] [--env KEY=VALUE] [--env-file <path>] [--follow] [--yes] [--force-local] [--past-usage-pause]
 
 Start an existing task. The daemon handles worktree creation, agent launch,
 and lifecycle management.
@@ -391,7 +394,9 @@ Arguments:
   <task_id>          ID of the task to start (short hex prefix or task code)
 
 Options:
-  --model <model>    Override model for this session (e.g. opus, sonnet, claude-opus-5)
+  --past-usage-pause  Let this task's next turn start even though its credential is past the
+                       usage-pause threshold (used up by that one turn)
+  --model <model>    Override model for this session (e.g. opus, sonnet, claude-opus-5-5)
   --agent <profile>  Agent profile to run this task with — an [agents.<name>] block in
                      lazy.toml; harness names (claude-code, codex, cursor, pi) are the
                      built-in profiles. Default: from the task or lazy.toml.
@@ -420,9 +425,9 @@ Model Selection:
   Models are selected in this priority order:
   1. --model flag (session override)
   2. Task's model setting (if set during task creation)
-  3. The agent's own default, if it has one (Cursor: "auto" — Cursor picks)
+  3. The agent's own default, if it has one (Cursor: "${CURSOR_DEFAULT_MODEL}" — Cursor picks; Codex: "${CODEX_LATEST_MODEL}")
   4. lazy.toml default model
-  5. Built-in default (claude-opus-5)
+  5. Built-in default (${CLAUDE_DEFAULT_MODEL})
 
 Notes:
   - Each task can only have one session (1:1 relationship)

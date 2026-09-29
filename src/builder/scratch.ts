@@ -35,14 +35,15 @@
 
 import { chmod, mkdir, readdir, stat } from 'fs/promises';
 import { join } from 'path';
-import { getHome } from '../utils/home';
+import { builderStateRoot } from './state-root';
 import { projectSlug } from '../daemon/paths';
 
 /** Env var carrying the scratch dir path into the builder process/container. */
 export const SCRATCH_ENV_VAR = 'LAZY_SCRATCH_DIR';
 
 /**
- * Root holding every project's scratch dir: `~/.lazy/scratch/`.
+ * Root holding every project's scratch dir: `<builder state root>/scratch/`
+ * (`~/.lazy/scratch/` by default; see src/builder/state-root.ts).
  *
  * `LAZY_SCRATCH_BASE_DIR` overrides the location. Same seam (and same reason) as
  * `LAZY_DAEMON_BASE_DIR` in src/daemon/paths.ts: tests must not write into — or
@@ -52,7 +53,7 @@ export const SCRATCH_ENV_VAR = 'LAZY_SCRATCH_DIR';
 export function getScratchBaseDir(): string {
   const override = process.env.LAZY_SCRATCH_BASE_DIR;
   if (override) return override;
-  return join(getHome(), '.lazy', 'scratch');
+  return join(builderStateRoot(), 'scratch');
 }
 
 /**

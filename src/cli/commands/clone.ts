@@ -112,7 +112,7 @@ Options:
   --default-parent   Use default parent (null, root task) instead of inheriting from source
                      (conflicts with --parent)
   --code <code>      Set a custom code for the cloned task (default: auto-generated)
-  --model <model>    Override model for the cloned task (e.g. opus, sonnet, claude-opus-5)
+  --model <model>    Override model for the cloned task (e.g. opus, sonnet, claude-opus-5-5)
                      Default: inherit from source task — or, with --agent naming a
                      different agent, that agent's default model
   --agent <profile>  Run the clone on another agent profile (e.g. cursor)

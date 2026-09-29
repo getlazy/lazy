@@ -134,6 +134,13 @@ describe('lazy builder in a clone bound to Lazy Teams', () => {
     const patched = before.replace('type = "dangerously-host-process-without-any-isolation"', 'type = "docker"');
     if (patched === before) throw new Error('could not restore [runner] type = "docker" in the generated lazy.toml');
     await writeFile(configPath, patched);
+    // Seeded BEFORE the managed daemon starts: its launch warmup prepares the
+    // image and agent binary at once, and unseeded it would compile a real one.
+    await docker.seedImage(`lazy-runner:${IMAGE_TAG}`, {
+      dockerfileHash: await calculateImageInputsHash(ctx.root),
+      inputs: await calculateImageInputManifest(ctx.root),
+    });
+    await seedAgentBinaryStamp(ctx.agentHome!);
     await ctx.restartDaemon({
       LAZY_TEST_FORCE_MANAGED: '1',
       LAZY_MANAGED_STORAGE_PATH: storageDirFor(ctx.root),
@@ -146,11 +153,6 @@ describe('lazy builder in a clone bound to Lazy Teams', () => {
     await rpc(shared, 'putUserCredential', { userId: ALICE, kind: 'oauth', token: 'sk-ant-oat01-alice-bound' });
     await rpc(shared, 'putUserCredential', { userId: SERVICE_CREDENTIAL_USER_ID, kind: 'oauth', token: 'sk-ant-oat01-svc-bound' });
     alice = (await rpc(shared, 'mintActorToken', { kind: 'user', email: ALICE }) as { token: string }).token;
-    await docker.seedImage(`lazy-runner:${IMAGE_TAG}`, {
-      dockerfileHash: await calculateImageInputsHash(ctx.root),
-      inputs: await calculateImageInputManifest(ctx.root),
-    });
-    await seedAgentBinaryStamp(ctx.agentHome!);
 
     // The laptop: a fresh clone with nothing but a Teams login.
     clone = join(workDir, 'clone');
@@ -329,7 +331,8 @@ describe('lazy builder in a clone bound to Lazy Teams', () => {
 
     // The daemon config the daemon mounted into THIS container's launch.
     const launch = (await docker.invocations()).find((l) => l.includes(' -d ') && l.includes(session.containerName!))!;
-    const configPath = /--daemon-config (\S+)/.exec(launch)?.[1];
+    // Host source of the mount; the container sees it at a fixed path.
+    const configPath = /-v (\S+):\/lazy-builder\/daemon-mcp\.json:ro/.exec(launch)?.[1];
     expect(configPath).toBeTruthy();
     const mounted = JSON.parse(await readFile(configPath!, 'utf-8')) as { target: string };
     // Inside a container the daemon is `host.docker.internal`; out here it is
@@ -361,6 +364,8 @@ describe('lazy builder in a clone bound to Lazy Teams', () => {
     const [out, err, code] = await Promise.all([new Response(listed.stdout).text(), new Response(listed.stderr).text(), listed.exited]);
     expect({ code, err }).toEqual({ code: 0, err: expect.any(String) });
     expect(out).toContain(sessionId.slice(0, 8));
-    expect(proxied).toContain('storage:listConversationSummaries');
+    // `lazy builder list` reads the project's builders through `listBuilders`;
+    // it must reach them through Teams, not a store on this laptop.
+    expect(proxied).toContain('storage:listBuilders');
   }, 240_000);
 });

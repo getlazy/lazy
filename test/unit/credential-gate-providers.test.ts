@@ -1,21 +1,22 @@
 /**
- * Unit tests: the PROVIDER-AWARE daemon credential gate, and the startup
- * hydration that lets a stored credential satisfy it.
+ * Unit tests: the PROVIDER-AWARE credential report behind `lazy daemon health`
+ * (which profiles would have their turns refused), and the startup hydration
+ * that lets a stored credential satisfy it.
  *
  * Two behaviours this file pins down, both of which used to be broken:
  *
- *  1. The gate asked "is an Anthropic env var set?" — a question that has
- *     nothing to do with what the project's roles will actually call. A project
- *     whose builder AND agent both point at an ollama backend was refused for an
- *     Anthropic token no role would ever use. The gate now derives the required
- *     PROVIDERS from the effective role targets and asks for exactly those.
+ *  1. "Is an Anthropic env var set?" has nothing to do with what the project's
+ *     profiles actually call. A project whose builder AND agent both point at an
+ *     ollama backend needs no Anthropic token. The report derives the required
+ *     credentials from the configured profiles and asks for exactly those.
  *
- *  2. The gate only ever looked at the environment, so the daemon's ability to
- *     start depended on which shell started it. `lazy upgrade` restarts the
- *     daemon from whatever shell ran the upgrade, and that shell routinely has
- *     no token exported — so the upgrade aborted. Startup hydration loads a
- *     STORED credential into the process env before the gate runs, so a machine
- *     with a stored credential starts from any shell.
+ *  2. Presence used to be read from the environment only, so it depended on
+ *     which shell started the daemon. Startup hydration loads a STORED
+ *     credential into the process env, so a machine with a stored credential
+ *     runs turns from any shell.
+ *
+ * The daemon no longer REFUSES to start over any of this — see
+ * test/unit/turn-credential-gate.test.ts for where a credential is required.
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
@@ -23,14 +24,19 @@ import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
-import { checkDaemonCredentials } from '../../src/daemon/credential-gate';
+import { missingTurnCredentials } from '../../src/daemon/credential-gate';
+
+/** The credential names turns would lack — the report the old start gate became. */
+async function missing(projectRoot: string): Promise<string[]> {
+  return (await missingTurnCredentials(projectRoot, { perUser: false })).map((m) => m.name);
+}
 import { getCredentialIndexPath, getCredentialsPath } from '../../src/daemon/paths';
 import { assertStoredCredentialsReachedEnv, hydrateCredentialEnv } from '../../src/credentials/hydrate';
 import { resolveCredential, setCredential } from '../../src/credentials/store';
 import { forgetHydratedEnvValues } from '../../src/credentials/hydrated-env';
 import { pinDaemonBaseDir } from '../helpers/daemon-base-dir';
 
-describe('provider-aware credential gate', () => {
+describe('provider-aware missing-credential report', () => {
   let projectRoot: string;
   let baseDir: string;
   let undoBaseDir: () => void;
@@ -91,13 +97,13 @@ describe('provider-aware credential gate', () => {
       '[models.roles.builder]\nagent = "local"\n\n' +
       '[models.roles.agent]\nagent = "local"\n',
     );
-    expect(await checkDaemonCredentials(projectRoot)).toBeNull();
+    expect(await missing(projectRoot)).toEqual([]);
   });
 
   // ...and the opposite miss must not appear. Widening the gate to "skip
   // whenever any role is local" would let a MIXED project start with no way to
   // authenticate the role that really does call Anthropic.
-  test('a mixed project is still refused for the anthropic role', async () => {
+  test('a mixed project still reports the anthropic role\'s credential', async () => {
     await writeConfig(
       '[credentials]\nbackend = "file"\n\n' +
       '[agents.local]\nharness = "claude-code"\nmodel = "qwen"\n' +
@@ -105,13 +111,14 @@ describe('provider-aware credential gate', () => {
       '[models.roles.builder]\nagent = "local"\n\n' +
       '[models.roles.agent]\nagent = "claude-code"\n',
     );
-    const message = await checkDaemonCredentials(projectRoot);
-    expect(message).toContain('Daemon refuses to start');
-    expect(message).toContain('Anthropic');
-    // The refusal must be ACTIONABLE: it names the command that fixes it and
-    // the env vars that would also satisfy it.
-    expect(message).toContain('lazy auth set anthropic');
-    expect(message).toContain('CLAUDE_CODE_OAUTH_TOKEN');
+    const report = await missingTurnCredentials(projectRoot, { perUser: false });
+    expect(report.map((m) => m.name)).toEqual(['anthropic']);
+    expect(report[0]!.label).toBe('Anthropic');
+    // Names the PROFILE whose turns would be refused, not just the credential.
+    expect(report[0]!.profiles).toEqual(['claude-code']);
+    // ACTIONABLE: the command that fixes it and the env vars that also would.
+    expect(report[0]!.remedy).toContain('lazy auth set anthropic');
+    expect(report[0]!.remedy).toContain('CLAUDE_CODE_OAUTH_TOKEN');
   });
 
   // WAS: "the legacy [ollama] enabled flag still skips the gate" — the global
@@ -126,7 +133,7 @@ describe('provider-aware credential gate', () => {
   // gate's job here is to surface the config refusal, actionably.
   test('a config still carrying the removed [ollama] flag is refused, loudly', async () => {
     await writeConfig('[ollama]\nenabled = true\nmodel = "qwen"\n');
-    await expect(checkDaemonCredentials(projectRoot)).rejects.toThrow(
+    await expect(missingTurnCredentials(projectRoot, { perUser: false })).rejects.toThrow(
       /\[ollama\] section — it has been removed[\s\S]*\[agents\.local-ollama\][\s\S]*lazy doctor --fix agents/,
     );
   });
@@ -135,20 +142,20 @@ describe('provider-aware credential gate', () => {
   // every pre-store setup starts exactly as it did before.
   test('an environment credential alone still satisfies the gate', async () => {
     process.env.CLAUDE_CODE_OAUTH_TOKEN = 'tok';
-    expect(await checkDaemonCredentials(projectRoot)).toBeNull();
+    expect(await missing(projectRoot)).toEqual([]);
   });
 
   // THE ACCEPTANCE CASE (unit half): a stored credential satisfies the gate with
   // a completely empty environment. This is what makes `lazy upgrade` — which
   // restarts the daemon from whatever shell ran it — stop aborting.
   test('a STORED credential satisfies the gate with an empty environment', async () => {
-    expect(await checkDaemonCredentials(projectRoot)).toContain('Daemon refuses to start');
+    expect(await missing(projectRoot)).toEqual(['anthropic']);
     await setCredential(projectRoot, {
       provider: 'anthropic',
       kind: 'oauth',
       secret: 'stored-oauth-token-value',
     });
-    expect(await checkDaemonCredentials(projectRoot)).toBeNull();
+    expect(await missing(projectRoot)).toEqual([]);
   });
 
   // INVARIANT: a blank env var is ABSENT, not present — the shape a failed
@@ -156,7 +163,7 @@ describe('provider-aware credential gate', () => {
   // waved it through and produced a running-but-useless daemon.
   test('a blank environment variable does not satisfy the gate', async () => {
     process.env.CLAUDE_CODE_OAUTH_TOKEN = '   ';
-    expect(await checkDaemonCredentials(projectRoot)).toContain('Daemon refuses to start');
+    expect(await missing(projectRoot)).toEqual(['anthropic']);
   });
 });
 
@@ -360,12 +367,12 @@ describe('startup credential hydration', () => {
       expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
     });
 
-    // The gate, on its own, is fooled — this is not a bug in the gate, it is
-    // why the check below has to exist. Pinned so nobody "fixes" the gate by
-    // making it open a backend.
-    test('the gate alone still passes, because it only reads the index', async () => {
+    // The presence report, on its own, is fooled — not a bug in it, but why the
+    // check below has to exist. Pinned so nobody "fixes" the report by making
+    // it open a backend (a health check must never block on a keychain).
+    test('the presence report alone still passes, because it only reads the index', async () => {
       await breakTheBackend();
-      expect(await checkDaemonCredentials(projectRoot)).toBeNull();
+      expect(await missing(projectRoot)).toEqual([]);
     });
 
     test('the check refuses, and carries the hydration error as the reason', async () => {
@@ -382,7 +389,7 @@ describe('startup credential hydration', () => {
         .then(() => null, (err: Error) => err);
 
       expect(failure).toBeInstanceOf(Error);
-      expect(failure!.message).toContain('Refusing to start');
+      expect(failure!.message).toContain('could not be loaded');
       // The WHY, not just the what — this is the only place the underlying
       // backend disagreement is stated.
       expect(failure!.message).toContain('the backend did not return one');
@@ -425,7 +432,7 @@ describe('startup credential hydration', () => {
       const env: NodeJS.ProcessEnv = {};
       await hydrateCredentialEnv(projectRoot, env); // warns, does not throw
       await expect(assertStoredCredentialsReachedEnv(projectRoot, undefined, env)).rejects.toThrow(
-        /Refusing to start/,
+        /could not be loaded/,
       );
     });
 

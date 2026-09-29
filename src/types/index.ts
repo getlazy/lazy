@@ -576,8 +576,28 @@ export interface FileViolation {
   file: string;
   /** SHA to revert to if rejected */
   base_sha: string;
-  /** Review status */
+  /**
+   * Review status. A reviewer's Reject is `pending` plus `rejected_at` until
+   * lazy carries it out; `rejected` means lazy RESTORED the file to its base
+   * (`restored_at` set — or, on sessions from before
+   * move-file-approval-to-accept, the old revert-at-unblock).
+   */
   status: 'pending' | 'approved' | 'rejected';
+  /**
+   * When a reviewer pressed Reject on this file. Only ever set alongside
+   * `status: 'pending'` — every accept gate keys off `pending`, so a rejected
+   * file keeps accept refused. Its one extra effect: the next work turn's
+   * supervisor restores it to its base before the agent runs
+   * (src/protection/rejected-restore.ts). Cleared by Approve.
+   */
+  rejected_at?: number;
+  /**
+   * When lazy's supervisor restored this file to `base_sha`, on the work turn
+   * that carries this record. Only ever set with `status: 'rejected'`.
+   */
+  restored_at?: number;
+  /** The commit holding that restore — lazy's own, never the agent's. */
+  restore_sha?: string;
 }
 
 export interface Turn {
@@ -1094,6 +1114,14 @@ export interface ScratchFile {
    * was doing when it wrote this.
    */
   session_id?: string;
+  /**
+   * The Builder (docs/design/builder-identity.md) that last wrote this file —
+   * stable across compaction and resume, unlike `session_id`, which names the
+   * segment that happened to be live. Stamped by the store from `session_id`
+   * when the Builder is known; absent otherwise, and readers then resolve
+   * `session_id` themselves.
+   */
+  builder_id?: string;
   created_at: number;
   /** Last capture that changed the content. Not a re-capture of identical bytes. */
   updated_at: number;
@@ -2235,7 +2263,8 @@ export interface HunkApprovalLineage {
 export interface AgentResponse {
   result: string;
   session_id: string;
-  usage: AgentTokenUsage;
+  /** Token usage reported by the harness. Absent means it was not recorded. */
+  usage?: AgentTokenUsage;
   /**
    * Concrete model id the agent reported for this invocation, when it reports
    * one. Normalized by the agent implementation — absent means the agent's

@@ -45,7 +45,7 @@ describe('GitHubDriver approveForMerge', () => {
     },
     git: {
       default_branch_prefix: 'lazy',
-      lfs_check: 'refuse',
+      lfs_check: 'refuse', coauthor_trailer: true,
     },
     output: {
       shortid_length: 8,

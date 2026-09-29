@@ -5,9 +5,18 @@
 # Operators pull a pre-built image (ghcr.io/getlazy/lazy-teams) — see
 # public-docs/self-hosting-lazy-teams.md. Developers build from the repo root:
 #
-#   docker build -f lazy-teams/deploy/Dockerfile -t lazy-teams:local .
-#   # or: docker compose -f lazy-teams/deploy/docker-compose.yml \
-#   #         -f lazy-teams/deploy/docker-compose.build.yml build
+#   docker build $(scripts/source-stamp-build-args.sh) -f lazy-teams/deploy/daemon-image/Dockerfile -t lazy-daemon:local .
+#   docker build -f lazy-teams/deploy/Dockerfile \
+#     --build-arg LAZY_DAEMON_IMAGE=lazy-daemon:local -t lazy-teams:local .
+#   # or: scripts/publish-lazy-teams-image.sh --daemon-image lazy-daemon:local
+#
+# LAZY IS BUILT ONCE PER RELEASE. This image does not build the lazy checkout:
+# it copies /opt/lazy (and the bun that resolved its lockfile) out of the lazy
+# daemon image named by LAZY_DAEMON_IMAGE — the guest image every project
+# daemon boots. The app and the daemons it launches therefore run
+# byte-identical lazy by construction. The publish script pins that image to
+# this commit's own version tag, never `latest`, and refuses to build when it
+# does not exist.
 #
 # The image is intentionally NOT the stock lazy-teams/Dockerfile: a fleet host
 # must shell out to lazy, talk to the host Docker daemon, and keep persistent
@@ -19,6 +28,11 @@
 # lazy path at all.
 
 ARG RUBY_VERSION=3.4.10
+# The lazy daemon image to take the lazy checkout from. Deliberately no default:
+# an empty value fails the build at the `lazy-daemon` stage below, naming this
+# argument. scripts/publish-lazy-teams-image.sh passes the daemon image of the
+# same commit (ghcr.io/getlazy/lazy-daemon:<its version tag>).
+ARG LAZY_DAEMON_IMAGE=
 # THE `-bookworm` SUFFIX IS LOAD-BEARING. `ruby:X-slim` follows whatever Debian
 # the official image currently tracks, and it moved from bookworm to trixie
 # under us. On trixie, `docker.io` (26.1.5) ships only `dockerd`,
@@ -43,7 +57,7 @@ WORKDIR /lazy/lazy-teams
 
 RUN apt-get update -qq && \
     apt-get install --no-install-recommends -y \
-      ca-certificates curl git libjemalloc2 libvips sqlite3 && \
+      ca-certificates curl git git-lfs libjemalloc2 libvips sqlite3 && \
     ln -s /usr/lib/$(uname -m)-linux-gnu/libjemalloc.so.2 /usr/local/lib/libjemalloc.so && \
     rm -rf /var/lib/apt/lists /var/cache/apt/archives
 
@@ -105,44 +119,16 @@ RUN case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
     esac && \
     SECRET_KEY_BASE_DUMMY=1 ./bin/vendor-smolvm --platform "${smolvm_platform}" --into /opt/smolvm
 
-# ── lazy CLI (bun + source checkout) ─────────────────────────────────────────
-
-FROM oven/bun:1.2.21 AS lazy-checkout
-
-WORKDIR /lazy
-
-# Copy only what `bun install` and `bun run src/index.ts` need. The full tree
-# is required because lazy runs from TypeScript sources, not a compiled bundle.
+# ── lazy CLI: the daemon image's checkout ────────────────────────────────────
 #
-# THIS LIST IS A MODULE GRAPH, NOT A GUESS. Anything `src/` imports from outside
-# `src/` has to be here or the first `bun run src/index.ts` below dies at import
-# time — which is how this image shipped unbuildable: `src/server/styles.ts`
-# imports the design stylesheet as text, `design/` was not copied, and nothing
-# noticed until somebody built the image. `test/unit/deploy-image-copy-graph.test.ts`
-# now resolves every escaping import and fails if one is missing from this list.
-COPY package.json bun.lock ./
-COPY scripts ./scripts
-COPY src ./src
-COPY public-docs ./public-docs
-COPY Dockerfile.lazy ./
-COPY tsconfig.json ./
-# Imported as text by src/server/styles.ts. The file itself, not the directory:
-# the rest of design/ is source material for humans and does not belong in a
-# runtime image.
-COPY design/industry/styles.css ./design/industry/styles.css
+# The daemon image (lazy-teams/deploy/daemon-image/Dockerfile) owns building
+# the checkout — the COPY list that is a module graph, `bun install`,
+# generate:version, the lazy-agent placeholder and `.source-fingerprint` (written
+# by `lazy system source-id --write`).
+# Its runtime is debian bookworm, the same release as this image's ruby base,
+# so its glibc-linked bun runs here unchanged.
 
-# lazy-agent is gitignored and excluded from the build context (.dockerignore);
-# create the placeholder the same way `bun run ensure:agent-placeholder` does.
-#
-# The fingerprint is computed by lazy itself (`system source-id --write`), not by
-# a shell pipeline here. It used to be the latter, and that made this file a
-# second implementation of an identity the daemon also reports and Rails also
-# compares — three spellings nothing kept in agreement. `.source-fingerprint` is
-# now a build-time CACHE of src/utils/source-id.ts and nothing else.
-RUN bun install && \
-    bun run generate:version && \
-    bun run ensure:agent-placeholder && \
-    bun run src/index.ts system source-id --write
+FROM ${LAZY_DAEMON_IMAGE} AS lazy-daemon
 
 # ── Runtime image ──────────────────────────────────────────────────────────
 
@@ -157,10 +143,9 @@ RUN apt-get update -qq && \
       docker.io gosu iproute2 unzip && \
     rm -rf /var/lib/apt/lists /var/cache/apt/archives
 
-# Bun for `bun run /lazy/src/index.ts` (LocalSupervisor's default command).
-RUN curl -fsSL https://bun.sh/install | bash && \
-    mv /root/.bun/bin/bun /usr/local/bin/bun && \
-    rm -rf /root/.bun
+# Bun for `bun run /lazy/src/index.ts` (LocalSupervisor's default command):
+# the exact bun that resolved the checkout's bun.lock, from the daemon image.
+COPY --from=lazy-daemon /usr/local/bin/bun /usr/local/bin/bun
 
 # The `docker` group is created by docker.io above with an arbitrary gid.
 # entrypoint.sh aligns it to the mounted socket at container start so one
@@ -197,16 +182,37 @@ COPY --from=rails-build --chown=root:root /opt/smolvm /opt/smolvm
 # SmolvmSupervisor defaults LAZY_DAEMON_IMAGE to
 # ghcr.io/getlazy/lazy-daemon:<this>. A local build passes nothing and gets no
 # default: then LAZY_DAEMON_IMAGE must be set, which setup health says.
+#
+# The same source identity the daemon image was built with (LAZY_BUILD_*,
+# src/utils/source-stamp.ts), for the app itself: the footer on every page and
+# GET /version read it (AppVersion). Passed by publish-lazy-teams-image.sh.
 ARG LAZY_TEAMS_VERSION=
+ARG LAZY_BUILD_SHA=
+ARG LAZY_BUILD_BRANCH=
+ARG LAZY_BUILD_DIRTY=
+# Part of the one shared arg set (scripts/source-stamp-build-args.sh) and unused
+# here — the version is LAZY_TEAMS_VERSION — declared so docker does not warn
+# about build args nothing consumed.
+ARG LAZY_BUILD_COMMIT_COUNT=
+ARG LAZY_BUILD_TIME=
 ENV LAZY_TEAMS_VERSION="${LAZY_TEAMS_VERSION}" \
+    LAZY_TEAMS_BUILD_SHA="${LAZY_BUILD_SHA}" \
+    LAZY_TEAMS_BUILD_BRANCH="${LAZY_BUILD_BRANCH}" \
+    LAZY_TEAMS_BUILD_DIRTY="${LAZY_BUILD_DIRTY}" \
     LAZY_SMOLVM_BINARY="/opt/smolvm/smolvm"
 
 COPY --from=rails-build --chown=rails:rails "${BUNDLE_PATH}" "${BUNDLE_PATH}"
-COPY --from=lazy-checkout --chown=rails:rails /lazy /lazy
+COPY --from=lazy-daemon --chown=rails:rails /opt/lazy /lazy
 COPY --from=rails-build --chown=rails:rails /lazy/lazy-teams /lazy/lazy-teams
 
 RUN mkdir -p /var/lib/lazy-fleet /lazy/lazy-teams/storage && \
     chown -R rails:rails /var/lib/lazy-fleet /lazy/lazy-teams/storage /lazy
+
+# PROVE THE COPIED LAZY RUNS HERE, AS RAILS, WHERE FAILING IS CHEAP. The
+# checkout and bun came from another image; this is the first time either runs
+# on this image's glibc, at /lazy, owned by uid 1000. It must answer from the
+# baked fingerprint the daemon image wrote, never by re-hashing.
+RUN gosu rails bun run /lazy/src/index.ts system source-id --json | tee /dev/stderr | grep -q '"kind": *"baked"'
 
 # PROVE THE VENDORED TREE, AS THE USER THAT RUNS IT, WHERE FAILING IS CHEAP.
 # (1) the launch-time verification passes for rails — every file in the tree

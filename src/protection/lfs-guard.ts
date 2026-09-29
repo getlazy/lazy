@@ -85,6 +85,7 @@ export function lfsRefusalMessage(
     `undoing it then means rewriting shared history. On the task branch it is still cheap to fix:\n\n` +
     `  1. Fix the environment first, or the re-commit repeats the mistake:\n` +
     `       git lfs install --local && git config filter.lfs.required true\n` +
+    `     If an existing pre-push hook blocks installation, preserve it before retrying with --force (which replaces it).\n` +
     `  2. Re-commit the affected path${one ? '' : 's'} through the filter, in the task worktree:\n` +
     `       git rm --cached ${violations.map((v) => v.path).join(' ')} && git add ${violations.map((v) => v.path).join(' ')}\n` +
     `     then commit — and confirm with \`git cat-file -s ${sourceBranch}:${violations[0]!.path}\` ` +

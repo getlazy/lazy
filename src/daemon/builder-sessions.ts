@@ -77,6 +77,10 @@ import {
   builderSessionProjectsRoot,
 } from '../builder/projects-isolation';
 import { logger } from '../utils/logger';
+import { BuilderStartTrace } from './builder-start-trace';
+import { describeLaunchWarmup } from './launch-warmup';
+import { builderSupervisorLogHostPath } from '../builder/supervisor-log-path';
+import { printableTail, TERMINAL_CONTROL } from '../utils/terminal-text';
 
 function newBuilderId(): string {
   return randomUUID().split('-')[0]!;
@@ -305,8 +309,9 @@ async function launchDetachedContainer(opts: {
   builderId: string;
   resumeSessionId: string | null;
   launchPlan: SessionLaunchPlan;
-}): Promise<string> {
-  const { projectRoot, memberEmail, builderId, resumeSessionId, launchPlan } = opts;
+  trace: BuilderStartTrace;
+}): Promise<{ containerName: string; resumed: string | null }> {
+  const { projectRoot, memberEmail, builderId, resumeSessionId, launchPlan, trace } = opts;
   const config = await loadConfig(projectRoot);
   const runner = await createRunner(projectRoot);
   if (!runner.usesSandbox() || !runner.launchBuilderDetached) {
@@ -326,7 +331,7 @@ async function launchDetachedContainer(opts: {
   const plan = launchPlan.credentialPlan;
 
   const daemonMcpName = `builder-${builderId}`;
-  const { configPath: daemonConfigPath } = await handleGetDaemonMcpConfig(projectRoot, { name: daemonMcpName });
+  const { configPath: daemonConfigPath } = await trace.phase('daemon MCP config', () => handleGetDaemonMcpConfig(projectRoot, { name: daemonMcpName }));
 
   // This code runs INSIDE the daemon (a dispatchRpc handler), never as a
   // separate client process — `resolveAuthEnvFromDaemon` is for the latter and
@@ -348,13 +353,13 @@ async function launchDetachedContainer(opts: {
   // this: the lazy-sess-… placeholder passes through unchanged (it is already
   // bound to a member; JIT placeholderization would replace it with an
   // unresolvable grant) and the proxy address is stamped alongside it.
-  const authEnvVars = await getLaunchAuthEnvVars(
+  const authEnvVars = await trace.phase('credential env', () => getLaunchAuthEnvVars(
     identity,
     builderTarget,
     { role: 'builder' },
     'container',
     credEnv ?? undefined,
-  );
+  ));
 
   const dataDirAbs = join(projectRoot, config.data.path);
   const homeDirAbs = await ensureBuilderSessionHomeDir(projectRoot, memberEmail);
@@ -366,13 +371,17 @@ async function launchDetachedContainer(opts: {
   // ever bind-mounted, and seeding unions only this member's own prior runs — one
   // member's conversation JSONLs can neither be read nor seeded into another
   // member's container. See builderSessionProjectsRoot and claude-home.ts.
-  const projectsHostDir = await resolveBuilderProjectsDirForLaunch({
+  const resolveProjects = (resumeId: string | null) => resolveBuilderProjectsDirForLaunch({
     dataDirAbs,
     lazyRoot: projectRoot,
-    resumeId: resumeSessionId,
+    resumeId,
     homeDirAbs,
     projectsRootAbs: builderSessionProjectsRoot(homeDirAbs),
   });
+  // Whether the conversation can really be resumed is decided in ONE place,
+  // the runner (launchBuilderDetached), once it knows which projects dir the
+  // container actually mounts; it reports back what it resumed.
+  const projectsHostDir = await resolveProjects(resumeSessionId);
   const projects = projectsHostDir
     ? {
         hostDir: projectsHostDir,
@@ -380,10 +389,10 @@ async function launchDetachedContainer(opts: {
       }
     : undefined;
 
-  const systemPrompt = await buildSystemPrompt(projectRoot, runner);
+  const systemPrompt = await trace.phase('system prompt', () => buildSystemPrompt(projectRoot, runner));
 
   try {
-    const { containerName } = await runner.launchBuilderDetached({
+    const { containerName, resumed } = await runner.launchBuilderDetached({
       lazyRoot: projectRoot,
       systemPrompt,
       builderId,
@@ -392,8 +401,9 @@ async function launchDetachedContainer(opts: {
       authEnvVars,
       homeDirAbs,
       resumeSessionId,
+      trace,
     });
-    return containerName;
+    return { containerName, resumed };
   } catch (err) {
     // The launch failed — this MCP token and slot were minted for a container
     // that will never exist. Release both rather than leaking them; a live
@@ -413,7 +423,8 @@ async function launchDetachedContainer(opts: {
 
 async function buildSystemPrompt(projectRoot: string, runner: Awaited<ReturnType<typeof createRunner>>): Promise<string> {
   const storage = await getOrCreateStorage();
-  return assembleBuilderSystemPrompt({ lazyRoot: projectRoot, runner, storage });
+  // Always the detached launch, whose scratch is a container-only path.
+  return assembleBuilderSystemPrompt({ lazyRoot: projectRoot, runner, storage, scratchAccess: 'store' });
 }
 
 /**
@@ -496,6 +507,7 @@ async function reconcileClaimedSession(
   projectRoot: string,
   claimed: BuilderSession,
   containerName: string,
+  extra: BuilderSessionUpdate = {},
 ): Promise<BuilderSession> {
   const storage = await getOrCreateStorage();
   const current = await storage.getBuilderSession(claimed.id);
@@ -506,7 +518,7 @@ async function reconcileClaimedSession(
     // CAS against the state the claim wrote: the member's end (or any other
     // writer) between the re-read above and this write is refused inside the
     // storage lock, closing the window the re-read only narrowed.
-    return await storage.updateBuilderSession(claimed.id, { state: 'running', containerName }, 'starting');
+    return await storage.updateBuilderSession(claimed.id, { ...extra, state: 'running', containerName }, 'starting');
   } catch (err) {
     if (!(err instanceof BuilderSessionStateConflictError)) throw err;
     // The row moved on while the launch was in flight — the member's end
@@ -536,6 +548,13 @@ async function standDownLaunchedSession(
 ): Promise<BuilderSession> {
   const stopped = await stopSessionContainer(projectRoot, { ...claimed, containerName });
   if (!stopped.ok) {
+    // The member's end already decided this container's fate, so an answer we
+    // could not get is no reason to leave it: remove it anyway, best effort.
+    const runner = await createRunner(projectRoot);
+    await runner.removeRun(containerName).catch((err: unknown) => logger.warn(
+      `Could not remove container ${containerName} of ended builder session ${claimed.id}: ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    ));
     logger.warn(
       `Builder session ${claimed.id} was ended while its launch was in flight; ` +
       `the just-launched container could not be stopped (${stopped.reason}). ` +
@@ -550,8 +569,9 @@ async function standDownLaunchedSession(
  * Demote a claimed row whose launch failed BEFORE any container existed
  * (`launchedContainer` was still null at the call site). The claim's purpose —
  * a record the launch cannot outrun — is discharged by recording the outcome:
- * a fresh claim becomes 'ended' (nothing is resumable), a resume claim stays
- * 'stopped' with its captured conversation id so the member can retry.
+ * a fresh claim becomes 'ended', a resume claim 'stopped' keeping its
+ * conversation id so the member can retry; both carry the launch error as
+ * `lastExit`.
  *
  * The launch's own catch has already released the MCP token and credential
  * binding it minted; this also calls releaseOutgoingSessionResources because
@@ -568,17 +588,23 @@ async function standDownLaunchedSession(
  * someone else, which is exactly the outcome recording was meant to avoid
  * clobbering.
  */
-async function demoteFailedLaunch(projectRoot: string, claimed: BuilderSession): Promise<void> {
+async function demoteFailedLaunch(projectRoot: string, claimed: BuilderSession, launchError: unknown): Promise<void> {
   const storage = await getOrCreateStorage();
   const current = await storage.getBuilderSession(claimed.id);
   if (!current || current.state !== 'starting') return;
   await releaseOutgoingSessionResources(projectRoot, claimed);
   // A resume claim keeps its conversation id — the member can retry the
   // resume. A fresh claim has nothing to resume: 'ended' is terminal (§5.7).
+  // Either way the row records WHY as `lastExit`: the start's caller may be
+  // gone by now (a connection that dropped mid-launch), and the row is then
+  // the only place the failure can still be read.
+  const message = (launchError instanceof Error ? launchError.message : String(launchError)).trim();
+  const [first, ...rest] = message.split('\n');
+  const lastExit = [`Your builder could not be started: ${first}`, ...rest].join('\n');
   try {
     await storage.updateBuilderSession(claimed.id, claimed.agentSessionId
-      ? { state: 'stopped', containerName: null }
-      : { state: 'ended', containerName: null, endedAt: new Date().toISOString() }, 'starting');
+      ? { state: 'stopped', containerName: null, lastExit }
+      : { state: 'ended', containerName: null, endedAt: new Date().toISOString(), lastExit }, 'starting');
   } catch (err) {
     if (!(err instanceof BuilderSessionStateConflictError)) throw err;
     // The row moved on between the re-read above and this write — the CAS
@@ -612,24 +638,322 @@ async function demoteFailedLaunch(projectRoot: string, claimed: BuilderSession):
  */
 const builderStartMutex = new TaskMutex();
 
+function builderStartLockKey(projectRoot: string, memberEmail: string | null): string {
+  return `builder-start:${projectRoot}:${memberEmail ?? '(no member)'}`;
+}
+
+/** Longest container-output tail kept on a row. */
+const LAST_EXIT_LOG_LINES = 40;
+/**
+ * How much raw TTY output is read to find those lines: a builder's last screen
+ * can be nothing but escape codes, so a short raw tail strips to nothing.
+ */
+const LAST_EXIT_RAW_LOG_LINES = 500;
+
+/**
+ * Sessions a member's stop or end is putting down RIGHT NOW, in this daemon.
+ * Neither takes the start mutex (a stop can take ten seconds and must not hold
+ * a start up), and between the container exiting and their guarded write the
+ * row still says `running` over a container that is gone — which a settle
+ * must not take over. An identity held for exactly the stop's duration, never
+ * a timestamp: one daemon serves a store.
+ */
+const releasingSessions = new Map<string, number>();
+
+/**
+ * Counted, not a set: two overlapping releases of one session (a double-
+ * clicked Stop, a Stop then an End) must keep the guard until the LAST ends.
+ */
+async function whileReleasing<T>(sessionId: string, work: () => Promise<T>): Promise<T> {
+  releasingSessions.set(sessionId, (releasingSessions.get(sessionId) ?? 0) + 1);
+  try {
+    return await work();
+  } finally {
+    const left = (releasingSessions.get(sessionId) ?? 1) - 1;
+    if (left <= 0) releasingSessions.delete(sessionId);
+    else releasingSessions.set(sessionId, left);
+  }
+}
+
+/**
+ * Whether a builder's container is running, as a THREE-way answer. A runtime
+ * that did not answer (docker unreachable, a timed-out inspect) is `unknown`,
+ * never "dead": `isRunning` folds every failure into `false`, and acting on
+ * that would stop a live builder because one `docker ps` was slow. Runners
+ * without a three-way probe (host-process, where nothing can time out) fall
+ * back to `isRunning`.
+ */
+export type BuilderRunProbe =
+  | { state: 'running' }
+  | { state: 'gone'; exitCode: number | null }
+  | { state: 'unknown'; reason: string };
+
+export async function probeBuilderRun(
+  runner: Awaited<ReturnType<typeof createRunner>>,
+  containerName: string,
+): Promise<BuilderRunProbe> {
+  if (!runner.probeRunInfo) {
+    return (await runner.isRunning(containerName)) ? { state: 'running' } : { state: 'gone', exitCode: null };
+  }
+  const probe = await runner.probeRunInfo(containerName);
+  if (probe.kind === 'no-answer') return { state: 'unknown', reason: probe.reason };
+  if (probe.info?.running) return { state: 'running' };
+  return { state: 'gone', exitCode: probe.info && Number.isFinite(probe.info.exitCode) ? probe.info.exitCode : null };
+}
+
+/**
+ * One line (plus an output tail) saying how a builder container that nobody
+ * stopped ended. A detached builder is launched without `--rm`, so its output
+ * is still readable until the recovery removes it.
+ */
+async function describeDeadContainer(
+  runner: Awaited<ReturnType<typeof createRunner>>,
+  containerName: string,
+  exitCode: number | null,
+  runId?: string,
+  supervisorLogHostFile?: string,
+): Promise<string> {
+  const head0 = exitCode === null
+    ? 'The builder stopped unexpectedly.'
+    : `The builder stopped unexpectedly (exit code ${exitCode}).`;
+  if (runner.describeExitedRun) {
+    // Every part of the evidence, each saying why when it is missing: a
+    // builder that died with exit 1 once showed nothing at all, because a
+    // failed `docker logs` and an empty one read the same.
+    const evidence = await runner.describeExitedRun(containerName, { rawLines: LAST_EXIT_RAW_LOG_LINES, keepLines: LAST_EXIT_LOG_LINES, supervisorLogHostFile }).catch((err: unknown) =>
+      [`Could not read how it ended: ${err instanceof Error ? err.message : String(err)}`]);
+    const body = evidence.join('\n').replace(/\r\n?/g, '\n').replace(TERMINAL_CONTROL, '').trim();
+    logger.warn(`${runId ? `builder start [run ${runId}]: ` : ''}Builder container ${containerName} exited on its own: ${head0}\n${body}`);
+    return `${head0}\n${body.slice(-6000)}`;
+  }
+  const logs = await runner.getRunLogs(containerName, LAST_EXIT_RAW_LOG_LINES).catch((err: unknown) => {
+    // The output is a courtesy on top of the exit code; losing it must not
+    // stop the row from being recorded truthfully, but it is said.
+    logger.warn(`Could not read the output of stopped builder container ${containerName}: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  });
+  const head = exitCode === null
+    ? 'The builder stopped unexpectedly.'
+    : `The builder stopped unexpectedly (exit code ${exitCode}).`;
+  const tail = logs ? printableTail(logs, LAST_EXIT_LOG_LINES) : '';
+  return tail ? `${head}\n${tail.slice(-4000)}` : head;
+}
+
+/**
+ * ONE ANSWER TO "IS THIS BUILDER RUNNING". The row's `running` is a claim the
+ * daemon wrote at launch; the container can die underneath it (a crash, a
+ * daemon roll, a VM restart) and nothing is watching. The attach route asks
+ * the runtime, so a list that reported the row's word said "Running" beside a
+ * terminal refusing with "not running any more".
+ *
+ * Every read of a project's builder runs calls this first (the registry reads
+ * and `listBuilders`/`getBuilder` through the storage RPC, `builderTranscript`,
+ * the daemon dashboard's Builders pages, and the attach liveness check): a
+ * `running` row whose container the runtime SAYS is gone is recovered exactly
+ * as the next start would recover it — exit reason recorded, resources
+ * released, row `stopped` and resumable.
+ *
+ * It acts only on a definite answer and never gets in anyone's way:
+ * - a runtime that does not answer leaves every row as it is;
+ * - a row whose start is in flight (the start mutex is held) is skipped rather
+ *   than waited for — that start owns it, and a page read must not wait out a
+ *   launch;
+ * - a row with a stop/end in flight (`releasingSessions`; neither takes the
+ *   start mutex) is left to that stop, whose capture and write it would
+ *   otherwise take over.
+ * Never throws.
+ */
+export async function settleDeadBuilderSessions(projectRoot: string): Promise<void> {
+  let rows: BuilderSession[];
+  let runner: Awaited<ReturnType<typeof createRunner>>;
+  try {
+    const storage = await getOrCreateStorage();
+    rows = (await storage.listBuilderSessions(projectRoot))
+      .filter((r) => r.state === 'running' && r.containerName);
+    if (rows.length === 0) return;
+    runner = await createRunner(projectRoot);
+  } catch (err) {
+    logger.warn(`Could not check builder sessions for dead containers: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
+  for (const row of rows) {
+    const lockKey = builderStartLockKey(projectRoot, row.memberEmail);
+    try {
+      if (builderStartMutex.isLocked(lockKey) || releasingSessions.has(row.id)) continue;
+      const first = await probeBuilderRun(runner, row.containerName!);
+      if (first.state === 'unknown') {
+        logger.warn(`Could not tell whether builder session ${row.id} is running: ${first.reason}. Left as it is.`);
+        continue;
+      }
+      if (first.state === 'running') continue;
+      if (builderStartMutex.isLocked(lockKey)) continue;
+      await builderStartMutex.withLock(lockKey, async () => {
+        const storage = await getOrCreateStorage();
+        const current = await storage.getBuilderSession(row.id);
+        // Re-read under the start lock: a start may have recovered or relaunched it.
+        if (!current || current.state !== 'running' || current.builderId !== row.builderId || !current.containerName) return;
+        if (releasingSessions.has(current.id)) return;
+        const probe = await probeBuilderRun(runner, current.containerName);
+        if (probe.state !== 'gone') return;
+        assertSessionRowActionable(current);
+        const lastExit = await describeDeadContainer(runner, current.containerName, probe.exitCode, current.id, await supervisorLogHostFileFor(projectRoot, current));
+        const stopResult = await stopSessionContainer(projectRoot, current, { knownGone: true });
+        await releaseOutgoingSessionResources(projectRoot, current);
+        try {
+          await storage.updateBuilderSession(current.id, {
+            state: 'stopped',
+            containerName: null,
+            agentSessionId: (stopResult.ok ? stopResult.agentSessionId : null) ?? current.agentSessionId,
+            lastExit,
+          }, 'running', current.builderId);
+        } catch (err) {
+          // Ended or stopped meanwhile by its member: that decision stands.
+          if (!(err instanceof BuilderSessionStateConflictError)) throw err;
+        }
+      });
+    } catch (err) {
+      logger.warn(
+        `Could not settle builder session ${row.id} whose container may be gone: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+}
+
 export async function handleStartBuilderSession(
   projectRoot: string,
   params: Record<string, unknown>,
 ): Promise<BuilderSession> {
   const memberEmail = actorEmail(params.actor as ActorInput | undefined) ?? null;
-  return builderStartMutex.withLock(
-    `builder-start:${projectRoot}:${memberEmail ?? '(no member)'}`,
-    () => startBuilderSessionLocked(projectRoot, memberEmail),
-  );
+  // Every phase of this start, and how long it took, lands in the daemon log
+  // under one prefix carrying the run id and builder id (BuilderStartTrace).
+  // How long a start took, success or not, is also the other half of reading a
+  // start whose caller's connection was cut (the RPC route logs that).
+  const trace = new BuilderStartTrace(newBuilderId(), memberEmail);
+  trace.begin();
+  const warmup = describeLaunchWarmup();
+  if (warmup) trace.note(warmup);
+  try {
+    const lockKey = builderStartLockKey(projectRoot, memberEmail);
+    if (builderStartMutex.isLocked(lockKey)) trace.note('waiting for this member\'s previous start to finish');
+    const row = await builderStartMutex.withLock(
+      lockKey,
+      () => startBuilderSessionLocked(projectRoot, memberEmail, trace),
+    );
+    trace.setRunId(row.id, row.builderId);
+    const launchedHere = row.builderId === trace.builderId;
+    trace.finish(`startBuilderSession: builder session ${row.id} is ${row.state}` +
+      (launchedHere ? '' : ' (already running; nothing launched)'));
+    if (launchedHere) await persistTimeline(trace);
+    if (row.state === 'running' && launchedHere && row.containerName) {
+      watchLaunchedBuilder(projectRoot, row, trace);
+    }
+    return row;
+  } catch (err) {
+    trace.fail(err);
+    await persistTimeline(trace);
+    throw err;
+  }
+}
+
+/**
+ * Record the start's timeline on its run row — only while the row is still on
+ * the builder THIS start launched (compare-and-set on the builder id), so a
+ * later start's timeline, or a running builder's from a rejoin that failed, is
+ * never overwritten. A no-op before the row exists or once it moved on.
+ */
+function persistTimeline(trace: BuilderStartTrace): Promise<void> {
+  if (!trace.ownsRun()) return Promise.resolve();
+  return trace.persist(async (runId, startTimeline) => {
+    try {
+      await (await getOrCreateStorage()).updateBuilderSession(runId, { startTimeline }, undefined, trace.builderId);
+    } catch (err) {
+      if (!(err instanceof BuilderSessionStateConflictError)) throw err;
+    }
+  });
+}
+
+/**
+ * How long after `docker run` returns the daemon keeps an eye on a freshly
+ * launched builder. `docker run -d` returning says the container was CREATED;
+ * a builder that dies in its first seconds (a failed preflight, Claude Code
+ * exiting) used to leave no trace until somebody next opened a page, and then
+ * only on that page. Each check is one `docker inspect`.
+ */
+export const LAUNCH_WATCH_CHECKS_MS = [2_000, 5_000, 15_000, 30_000, 60_000];
+
+/**
+ * Follow a just-launched builder through its first minute and write what
+ * happened into the start's trail: still up at each check, or dead — in which
+ * case the dead-builder recovery runs at once, recording the container's
+ * exit evidence on the row and in the log before the container is removed.
+ * Fire-and-forget; never throws.
+ */
+function watchLaunchedBuilder(projectRoot: string, row: BuilderSession, trace: BuilderStartTrace): void {
+  const containerName = row.containerName!;
+  void (async () => {
+    try {
+      const runner = await createRunner(projectRoot);
+      let waited = 0;
+      for (const at of LAUNCH_WATCH_CHECKS_MS) {
+        await new Promise((r) => { setTimeout(r, at - waited).unref?.(); });
+        waited = at;
+        const probe = await probeBuilderRun(runner, containerName);
+        if (probe.state === 'running') {
+          if (at === LAUNCH_WATCH_CHECKS_MS[LAUNCH_WATCH_CHECKS_MS.length - 1]) {
+            trace.note(`container ${containerName} still running ${at / 1000}s after launch`);
+            await persistTimeline(trace);
+          }
+          continue;
+        }
+        if (probe.state === 'unknown') {
+          trace.note(`could not tell whether ${containerName} is running ${at / 1000}s after launch: ${probe.reason}`);
+          continue;
+        }
+        // Gone because its member stopped or ended it is not a crash: only a
+        // row still `running` on THIS launch's container is reported and settled.
+        const storage = await getOrCreateStorage();
+        const current = await storage.getBuilderSession(row.id);
+        // Already settled as a crash by the reconcile tick (same builder, now
+        // stopped, with how it ended): that IS the crash — record it as one.
+        if (current && current.state === 'stopped' && current.builderId === row.builderId && current.lastExit) {
+          logger.warn(
+            `builder start [run ${row.id}, builder ${row.builderId}]: container ${containerName} EXITED by ` +
+            `${at / 1000}s after launch; ${current.lastExit.split('\n')[0]}`,
+          );
+          trace.record('failed', 'builder container', current.lastExit);
+          await persistTimeline(trace);
+          return;
+        }
+        if (!current || current.state !== 'running' || current.builderId !== row.builderId
+          || current.containerName !== containerName || releasingSessions.has(row.id)) {
+          trace.note(`container ${containerName} is gone ${at / 1000}s after launch because the builder was ${current?.state ?? 'removed'} (not a crash)`);
+          await persistTimeline(trace);
+          return;
+        }
+        const exited = `container ${containerName} EXITED within ${at / 1000}s of launch ` +
+          `(exit code ${probe.exitCode ?? 'unknown'}); its exit evidence is recorded on the run`;
+        logger.warn(`builder start [run ${row.id}, builder ${row.builderId}]: ${exited}`);
+        trace.record('failed', 'builder container', exited);
+        await settleDeadBuilderSessions(projectRoot);
+        await persistTimeline(trace);
+        return;
+      }
+    } catch (err) {
+      trace.note(`launch watch stopped: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  })();
 }
 
 async function startBuilderSessionLocked(
   projectRoot: string,
   memberEmail: string | null,
+  trace: BuilderStartTrace,
 ): Promise<BuilderSession> {
   const storage = await getOrCreateStorage();
 
   let existing = await storage.getActiveBuilderSessionForMember(projectRoot, memberEmail);
+  if (existing) trace.setRunId(existing.id, existing.builderId);
   // Everything below acts on this row's builder id and container name.
   if (existing) assertSessionRowActionable(existing);
   if (existing && existing.containerName && (existing.state === 'running' || existing.state === 'starting')) {
@@ -645,7 +969,15 @@ async function startBuilderSessionLocked(
     // serializes live starts), so the same treatment is the recovery path for
     // both row states.
     const runner = await createRunner(projectRoot);
-    if (await runner.isRunning(existing.containerName)) {
+    // Three-way, like every other reader (probeBuilderRun): a runtime that did
+    // not answer is refused, never read as "dead" — that reading stopped and
+    // relaunched a LIVE builder because one probe was slow.
+    const liveness = await probeBuilderRun(runner, existing.containerName);
+    if (liveness.state === 'unknown') {
+      logger.warn(`startBuilderSession: liveness of ${existing.containerName} unknown: ${liveness.reason}`);
+      throw new RpcError(503, 'Could not check whether your builder is running right now. Try again in a moment.');
+    }
+    if (liveness.state === 'running') {
       if (existing.state === 'starting') {
         // The container from a crashed start is already up; reconcile the row
         // rather than racing a second launch underneath it.
@@ -655,12 +987,16 @@ async function startBuilderSessionLocked(
       // a terminal to it; this call is idempotent discovery until then.
       return existing;
     }
+    // Read how it ended BEFORE the cleanup below removes the container.
+    const lastExit = existing.state === 'running'
+      ? await describeDeadContainer(runner, existing.containerName, liveness.exitCode, existing.id, await supervisorLogHostFileFor(projectRoot, existing))
+      : null;
     // Already confirmed dead above, so this is cleanup (release any lingering
     // resources, capture the resume intent) rather than a stop that can fail
     // the way endBuilderSession's can — a hiccup capturing the intent must
     // not block starting a fresh session underneath a container that is
     // already gone.
-    const stopResult = await stopSessionContainer(projectRoot, existing);
+    const stopResult = await stopSessionContainer(projectRoot, existing, { knownGone: true });
     // The outgoing launch is confirmed dead. Release what it held NOW, while
     // the row still carries the builder id those resources are keyed by —
     // releaseOutgoingSessionResources would otherwise only run on the resume
@@ -679,6 +1015,7 @@ async function startBuilderSessionLocked(
         state: 'stopped',
         containerName: null,
         agentSessionId: (stopResult.ok ? stopResult.agentSessionId : null) ?? existing.agentSessionId,
+        ...(lastExit ? { lastExit } : {}),
       }, expectedState);
     } catch (err) {
       if (!(err instanceof BuilderSessionStateConflictError)) throw err;
@@ -697,7 +1034,7 @@ async function startBuilderSessionLocked(
   // resolved plan rides into the launch so the credential is decided exactly
   // once. Failure past this point releases the admitted slot in the catch
   // below; nothing else exists yet to unwind.
-  const builderId = newBuilderId();
+  const builderId = trace.builderId;
   const admission = await handleBuilderSlot(projectRoot, { action: 'admit', builderId });
   if (!admission.admitted) {
     throw new RpcError(
@@ -706,7 +1043,7 @@ async function startBuilderSessionLocked(
       `Wait for another builder session to finish, then retry.`,
     );
   }
-  const launchPlan = await planSessionLaunchCredential(projectRoot, builderId, memberEmail);
+  const launchPlan = await trace.phase('credential plan', () => planSessionLaunchCredential(projectRoot, builderId, memberEmail));
 
   // Register the claim BEFORE the launch. This row is what keeps the
   // container from ever outrunning its record: a crash (write failure, daemon
@@ -738,6 +1075,7 @@ async function startBuilderSessionLocked(
           state: 'starting',
           containerName: builderRunName(builderId),
           builderId,
+          lastExit: null,
         }, 'stopped');
       } catch (err) {
         if (!(err instanceof BuilderSessionStateConflictError)) throw err;
@@ -752,15 +1090,21 @@ async function startBuilderSessionLocked(
           `start again to create a fresh session.`,
         );
       }
-      const containerName = await launchDetachedContainer({
+      trace.setRunId(claimed.id);
+      trace.note(`resuming stopped builder session ${claimed.id}`);
+      const launched = await launchDetachedContainer({
         projectRoot,
         memberEmail,
         builderId,
         resumeSessionId,
         launchPlan,
+        trace,
       });
-      launchedContainer = containerName;
-      return await reconcileClaimedSession(projectRoot, claimed, containerName);
+      launchedContainer = launched.containerName;
+      // A conversation that could not be resumed is forgotten, or the next
+      // start would try it again.
+      return await reconcileClaimedSession(projectRoot, claimed, launched.containerName,
+        launched.resumed === resumeSessionId ? {} : { agentSessionId: null });
     }
 
     const now = new Date().toISOString();
@@ -794,12 +1138,14 @@ async function startBuilderSessionLocked(
       if (!winner) throw err;
       return winner;
     }
-    const containerName = await launchDetachedContainer({
+    trace.setRunId(claimed.id);
+    const { containerName } = await launchDetachedContainer({
       projectRoot,
       memberEmail,
       builderId,
       resumeSessionId: null,
       launchPlan,
+      trace,
     });
     launchedContainer = containerName;
     return await reconcileClaimedSession(projectRoot, claimed, containerName);
@@ -812,7 +1158,7 @@ async function startBuilderSessionLocked(
     // check to adopt. Demoting a live container would recreate the orphan this
     // claim exists to prevent.
     if (claimed && !launchedContainer) {
-      await demoteFailedLaunch(projectRoot, claimed).catch((demoteErr) =>
+      await demoteFailedLaunch(projectRoot, claimed, err).catch((demoteErr) =>
         logger.warn(
           `Failed to demote builder session ${claimed?.id} after a failed launch: ` +
           `${demoteErr instanceof Error ? demoteErr.message : String(demoteErr)}. ` +
@@ -835,6 +1181,16 @@ async function startBuilderSessionLocked(
  * see src/builder/relaunch.ts) before it is captured onto this row.
  */
 export async function handleEndBuilderSession(
+  projectRoot: string,
+  params: Record<string, unknown>,
+): Promise<BuilderSession> {
+  const id = params.id;
+  if (typeof id !== 'string' || !id) throw new RpcError(400, 'endBuilderSession: `id` is required');
+  // Held for the whole end: a settle stays off this row until it is written.
+  return whileReleasing(id, () => endBuilderSessionHeld(projectRoot, params));
+}
+
+async function endBuilderSessionHeld(
   projectRoot: string,
   params: Record<string, unknown>,
 ): Promise<BuilderSession> {
@@ -939,6 +1295,16 @@ export async function handleStopBuilderSession(
 ): Promise<BuilderSession> {
   const id = params.id;
   if (typeof id !== 'string' || !id) throw new RpcError(400, 'stopBuilderSession: `id` is required');
+  // Held for the whole stop: a settle stays off this row until it is written.
+  return whileReleasing(id, () => stopBuilderSessionHeld(projectRoot, params));
+}
+
+async function stopBuilderSessionHeld(
+  projectRoot: string,
+  params: Record<string, unknown>,
+): Promise<BuilderSession> {
+  const id = params.id;
+  if (typeof id !== 'string' || !id) throw new RpcError(400, 'stopBuilderSession: `id` is required');
 
   const storage = await getOrCreateStorage();
   const session = await storage.getBuilderSession(id);
@@ -980,6 +1346,7 @@ export async function handleStopBuilderSession(
     state: 'stopped',
     containerName: null,
     agentSessionId: stopResult.agentSessionId ?? session.agentSessionId,
+    lastExit: null,
   });
 }
 
@@ -1047,14 +1414,28 @@ type StopSessionContainerResult =
  * right for its other callers but would be exactly the silent-success bug
  * this function exists to avoid.
  */
-async function stopSessionContainer(projectRoot: string, session: BuilderSession): Promise<StopSessionContainerResult> {
+async function stopSessionContainer(
+  projectRoot: string,
+  session: BuilderSession,
+  opts: { knownGone?: boolean } = {},
+): Promise<StopSessionContainerResult> {
   assertSessionRowActionable(session);
   if (!session.containerName) return { ok: true, agentSessionId: null };
   const runner = await createRunner(projectRoot);
 
-  let wasRunning: boolean;
-  try {
-    wasRunning = await runner.isRunning(session.containerName);
+  // Three-way: a runtime that does not answer is NOT "already gone" —
+  // reading it that way recorded a possibly live container as stopped, with
+  // no conversation captured. Refuse instead; the caller reports it. A caller
+  // that already had a definite "gone" (settle, start's recovery) says so and
+  // is not re-asked: a third probe that happened not to answer must not skip
+  // the removal and the config fold-back below.
+  let wasRunning = false;
+  if (!opts.knownGone) try {
+    const probe = await probeBuilderRun(runner, session.containerName);
+    if (probe.state === 'unknown') {
+      return { ok: false, reason: `could not determine whether the container is running: ${probe.reason}` };
+    }
+    wasRunning = probe.state === 'running';
   } catch (err) {
     return {
       ok: false,
@@ -1186,6 +1567,11 @@ async function persistSessionClaudeConfig(projectRoot: string, session: BuilderS
 /** Where one launch's per-launch files live — the member's own launch dir (see launchBuilderDetached). */
 async function sessionLaunchDir(projectRoot: string, session: BuilderSession): Promise<string> {
   return builderSessionLaunchDir(resolveBuilderSessionHomeDir(projectRoot, session.memberEmail), session.builderId);
+}
+
+/** The persistent host copy of this launch's supervisor log (see launchBuilderDetached). */
+async function supervisorLogHostFileFor(projectRoot: string, session: BuilderSession): Promise<string> {
+  return builderSupervisorLogHostPath(await sessionLaunchDir(projectRoot, session), session.builderId);
 }
 
 /**

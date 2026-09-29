@@ -8,7 +8,7 @@
  * These surfaces used to fill in the model credential from their own `process.env`
  * (`anthropicEnvVarsFromProcess`), which asks a different question than the rest
  * of lazy answers: the daemon is the single credential owner (see
- * credential-gate.ts) and refuses to start without one. In a daemon-only-env
+ * credential-gate.ts), and refuses a launch on a profile it has none for. In a daemon-only-env
  * setup — or simply a shell opened after the daemon was started, which is what
  * an upgrade leaves behind — the human's shell exports nothing, so pairing
  * handed Claude Code no credential at all and it fell through to the host

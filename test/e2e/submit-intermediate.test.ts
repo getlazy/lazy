@@ -25,7 +25,9 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
-import { readSessionJson, readTaskJson, readTaskStatus, setTaskMetadata } from '../helpers/storage';
+import { readSessionJson, readTaskJson, writeTaskJson, readTaskStatus, setTaskMetadata } from '../helpers/storage';
+import { DaemonClient } from '../../src/daemon/client';
+import { getDaemonTcpTarget, readToken } from '../../src/daemon/lifecycle';
 import { seedFinal } from '../helpers/final';
 import { runMcpSession } from '../helpers/mcp-session';
 
@@ -274,4 +276,42 @@ describe('lazy submit into an intermediate branch', () => {
     expect(createdReviews()).toEqual([]);
     expect(forgeCloses()).toEqual([]);
   }, 180_000);
+
+  /** The daemon's submit preflight, asked the way Lazy Teams asks it. */
+  async function preflight(taskId: string): Promise<Record<string, unknown>> {
+    const target = getDaemonTcpTarget(ctx.root);
+    const token = readToken(ctx.root);
+    if (!target || !token) throw new Error('test daemon did not record a TCP target and token');
+    return await DaemonClient.fromTarget(target, token)
+      .rpc('submitTaskPreflight', ctx.root, { taskId, actor: 'human' }) as Record<string, unknown>;
+  }
+
+  // INVARIANT: the preflight is the answer every surface renders as the PR's
+  // base ("Into"): a subtask's is its PARENT task's branch, and a person asking
+  // may submit it. Teams computes no base of its own.
+  test('the preflight answers a subtask\'s base as its parent task\'s branch', async () => {
+    const { childId, parentBranch } = await parentAndChild();
+    writeForge('mock-remote-branches.json', { [parentBranch]: 'abc123' });
+
+    const answer = await preflight(childId);
+    expect(answer.canSubmit).toBe(true);
+    expect(answer.targetBranch).toBe(parentBranch);
+    expect(answer.intermediate).toBe(true);
+  }, 120_000);
+
+  // INVARIANT: a top-level task with no named target integrates into the
+  // REMOTE'S default branch, and the preflight names it for real — `master`
+  // here — never the literal `main` a display fallback would print.
+  test('the preflight answers a top-level task\'s base as the remote\'s default branch', async () => {
+    const taskId = await createTask(ctx, 'Top-level work', 'Do it');
+    await startAndWait(taskId);
+    const task = readTaskJson(ctx.root, taskId);
+    writeTaskJson(ctx.root, taskId, { ...task, target: { kind: 'branch', branch: 'HEAD' } });
+    ctx.git('-C', ctx.root, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/master');
+
+    const answer = await preflight(taskId);
+    expect(answer.canSubmit).toBe(true);
+    expect(answer.targetBranch).toBe('master');
+    expect(answer.intermediate).toBe(false);
+  }, 120_000);
 });

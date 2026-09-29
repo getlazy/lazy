@@ -59,6 +59,13 @@ interface Hold {
   vacating: boolean;
   /** The member's container, once asked for — shared by all their terminals. */
   container: Promise<HeldContainer> | null;
+  /** Whether {@link container} has settled — a launch still running has not. */
+  containerSettled: boolean;
+  /**
+   * Set when the hold is let go while its container launch had not landed:
+   * what that launch makes is removed through this as soon as it lands.
+   */
+  orphanVacate?: ((container: HeldContainer | null) => Promise<void>) | null;
   /**
    * Serialises {@link memberTerminalContainer} for this hold: one look at the
    * container, and at most one replace, at a time. Two terminals opened
@@ -86,7 +93,7 @@ export function claimMemberTerminal(
     held.timer = null;
     held.count += 1;
   } else {
-    holds.set(taskId, { email, count: 1, timer: null, entered: false, vacating: false, container: null, queue: Promise.resolve() });
+    holds.set(taskId, { email, count: 1, timer: null, entered: false, vacating: false, container: null, containerSettled: false, queue: Promise.resolve() });
   }
   return { ok: true };
 }
@@ -128,6 +135,8 @@ async function containerFor(
   launch: () => Promise<HeldContainer>,
   isRunning: (c: HeldContainer) => Promise<boolean>,
 ): Promise<HeldContainer> {
+  // Let go before this launch even started (its terminal closed): start nothing.
+  if (holds.get(taskId) !== held) throw new Error(ABANDONED_LAUNCH);
   if (held.container) {
     const existing = await held.container.catch(() => null);
     if (existing && (await isRunning(existing))) return existing;
@@ -136,11 +145,21 @@ async function containerFor(
   }
   const pending = launch();
   held.container = pending;
+  held.containerSettled = false;
   try {
-    return await pending;
+    const container = await pending;
+    if (held.orphanVacate) {
+      // Nobody is waiting for it any more: remove it, retrying like any vacate.
+      const vacate = held.orphanVacate;
+      vacateUntilGone(taskId, held, () => vacate(container));
+      throw new Error(ABANDONED_LAUNCH);
+    }
+    return container;
   } catch (err) {
     if (held.container === pending) held.container = null;
     throw err;
+  } finally {
+    if (held.container === pending) held.containerSettled = true;
   }
 }
 
@@ -189,7 +208,7 @@ function vacateUntilGone(taskId: string, held: Hold, vacate: () => Promise<void>
  * it is gone.
  */
 export function holdLeftoverMemberContainer(taskId: string, remove: () => Promise<void>): void {
-  const held: Hold = { email: LEFTOVER_HOLDER, count: 0, timer: null, entered: true, vacating: true, container: null, queue: Promise.resolve() };
+  const held: Hold = { email: LEFTOVER_HOLDER, count: 0, timer: null, entered: true, vacating: true, container: null, containerSettled: false, queue: Promise.resolve() };
   holds.set(taskId, held);
   vacateUntilGone(taskId, held, remove);
 }
@@ -215,11 +234,19 @@ export function releaseMemberTerminal(
   held.count = Math.max(0, held.count - 1);
   if (held.count > 0) return;
   if (held.timer) clearTimeout(held.timer);
-  if (!held.entered || !held.container) {
-    // Nothing of this member's ever got in — refused at the entry, or its
-    // container never came up: there is nothing to discard, so free it now
-    // rather than keep other members and turns out for the whole grace.
+  if (!held.entered || !held.container || !held.containerSettled) {
+    // No terminal of this member's ever ran: refused at the entry, or they
+    // left while their container was still being made (an image build can
+    // take minutes). Nothing of theirs can be running, so free the task NOW
+    // rather than keep other members and turns out for the grace — or for the
+    // rest of a build. A launch not started yet never starts, and one still
+    // running is removed as soon as it lands (containerFor, through
+    // `orphanVacate`, retried like any vacate; the detached hold holds
+    // nothing). The build itself is not cancelled: the image is shared with
+    // turn launches. A terminal reopened meanwhile starts its own launch, and
+    // member container names are unique, so this removal can never reach it.
     holds.delete(taskId);
+    held.orphanVacate = onVacate ?? (async (c) => { await c?.remove(); });
     return;
   }
   held.timer = setTimeout(() => {
@@ -246,6 +273,9 @@ export function memberInsideTask(taskId: string): string | null {
   const held = holds.get(taskId);
   return held && (held.entered || held.vacating) ? held.email : null;
 }
+
+/** Why a launch was dropped: the terminal that asked for it is gone. */
+export const ABANDONED_LAUNCH = 'the terminal closed before its environment was ready';
 
 /** Why nobody can enter while an environment is being discarded. */
 export const MEMBER_VACATING_MESSAGE =

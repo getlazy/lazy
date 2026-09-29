@@ -69,7 +69,7 @@ describe('lazy.toml is root-anchored', () => {
 
     process.chdir(worktree);
 
-    expect(resolveConfigPath(root)).toBe(join(root, 'lazy.toml'));
+    expect(await resolveConfigPath(root)).toBe(join(root, 'lazy.toml'));
   });
 
   test('an ordinary subdirectory still resolves the root config — humans lose nothing', async () => {

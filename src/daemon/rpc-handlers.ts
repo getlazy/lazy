@@ -18,16 +18,26 @@
  * daemon code — it causes deadlocks and storage lock contention.
  */
 
+import { revertedProtectedFiles } from '../protection/reverted-files';
+import { resolveBuilderLaunchDirective, type BuilderLaunchDirective } from '../builder/launch-directive';
 import { createTask as createTaskFromInput } from './create-task';
 import { reviewSettingsViewOf } from '../review/mode';
 import { existsSync } from 'fs';
 import { getWorktreePath, getBranchNameFromId, displayId, shortId, taskRef } from '../task/identity';
 import { parseStatsScope } from '../task/stats';
-import { loadTaskStats } from '../task/stats-data';
+import { collectDescendantTasks, loadTaskStats } from '../task/stats-data';
+import {
+  describeTokenStats,
+  loadTokenReport,
+  parseTokenStatsTaskType,
+  type TokenStatsGroup,
+  type TokenStatsScope,
+} from './token-stats';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
 import { resolveTaskDiffContext } from './task-diff-context';
 import { RpcError } from './rpc-error';
+import { buildIdLinkIndex, type IdLinkTarget } from '../task/id-links';
 import {
   admitInteractiveSession,
   admitOneshotCommand,
@@ -36,6 +46,10 @@ import {
   describeBesideLaunch,
   describeUsagePauseState,
   mayUseUsagePauseOverride,
+  allowTaskPastUsagePause,
+  clearTaskUsagePauseAllowance,
+  mayAllowTaskPastUsagePause,
+  taskUsagePauseAllowance,
   parseUsagePauseOverride,
   setUsagePauseOverride,
   USAGE_PAUSE_OVERRIDE_KEY,
@@ -68,6 +82,7 @@ import {
   handleReviewQueue,
   handleNavCounts,
   handleReviewDiff,
+  handleReviewDiffFiles,
   handleReviewRegions,
   handleReviewLineAttribution,
   handleReviewFileLines,
@@ -106,7 +121,8 @@ import { getNonHumanTurnCount, checkTurnBudget } from './turn-budget';
 import { agentProfilesFor, agentProfileOrThrow, profileForAgentName, type AgentProfile } from '../config/agent-profiles';
 import type { ResolvedConfig } from '../config/types';
 import { getAuthEnvVars } from '../capture/claude';
-import { credentialFromEnv } from './credential-gate';
+import { credentialFromEnv, profileCredentialRefusal } from './credential-gate';
+import { sessionCredentialEnvFor, turnCredentialProblem } from './turn-credentials';
 import { credentialLabel, requiredCredentials, requiredProviders } from '../credentials/providers';
 import { locateProfileCredential } from '../agent/credentials';
 import type { DaemonCredentialEntry } from './auth-env';
@@ -126,6 +142,7 @@ import { parentTaskIdOf, targetBranchOf, collectSubtreeIds, pruneTasksToDepth } 
 import { buildTaskTree, collectActiveTasks } from '../task/tree';
 import { loadTaskShowData } from '../task/show-data';
 import { isDeferredBy, clusterProgressOf, clusterProgressPayload } from '../task/cluster-progress';
+import { reopenedAfterAcceptOf } from '../task/reopen-after-accept';
 import { activeClusterCount, listClusterEntries, sortClusterEntries } from '../task/cluster-entries';
 import {
   SHOW_SECTION_NAMES,
@@ -143,7 +160,9 @@ import { queuedHumanFeedbackCount } from '../task/queued-feedback';
 import { resolveOutstandingViolations } from '../protection/outstanding-resolver';
 import { violationRecordsByFile } from '../protection/outstanding';
 import { executeSearch, SearchPatternError, QueryParseError } from '../search';
-import { getDiffStat, getDiffFull, getDiffPathSets, getFileAtCommit, getMergeBase, getRemoteDefaultBranch, branchExists, recoverMissingWorktreeWithFetch, countNewCommits } from '../git/operations';
+import { findRecordedCommit } from '../task/recorded-commit';
+import { getCommitPatch, getCommitIdentities, type CommitIdentity } from '../git/operations';
+import { getDiffStat, getDiffFull, getDiffNumstat, getDiffPathSets, getFileAtCommit, getMergeBase, getRemoteDefaultBranch, branchExists, recoverMissingWorktreeWithFetch, countNewCommits } from '../git/operations';
 import { resolveCommitScanBase } from '../task/session-commits';
 import { validateFileLinesRequest, sliceFileLines } from '../review/file-lines';
 import { readWorktreeFileNoFollow } from '../review/worktree-read';
@@ -161,7 +180,7 @@ import { LOGIN_TICKET_TTL_MS, mintDashboardLoginTicket } from './dashboard-sessi
 import { DASHBOARD_LOGIN_PARAM } from './dashboard-auth';
 import { isManagedMode } from '../config/managed';
 import { describeIdentity, resolveGitIdentity } from '../identity';
-import { actorEmail, actorRole, canonicalPersonEmail, isPersonEmail } from '../actor-ref';
+import { actorEmail, actorName, actorRole, canonicalPersonEmail, isPersonEmail } from '../actor-ref';
 import { reviewerKey } from '../review-draft';
 import { getActor } from '../constants';
 import { isHumanInitiatedRpc, isStoreWritingRpc, PERSON_ATTRIBUTED_STORAGE_ACTORS } from './rpc-command-kinds';
@@ -172,11 +191,13 @@ import {
   lookupDaemonTokenLabel,
   type ActorIdentity,
 } from './actor-tokens';
+import { runWithGitAuthor } from '../identity/git-author';
 import {
   putUserCredential,
   revokeUserCredential,
   listUserCredentials,
   canonicalCredentialKey,
+  teamModeEnabled,
 } from './user-credentials';
 import { checkUserCredential, clearUserAuthRejection } from './credential-check';
 import {
@@ -198,7 +219,8 @@ import {
 import { hasDaemonContext, getDaemonContext } from './context';
 import type { ProgressEmitter } from './progress';
 import { handleWatchProxyActivity } from './proxy-watch';
-import { proxyBaseUrlForRunner, LOCAL_BACKEND_CREDS, resolveProfileLaunchCreds, resolveRoleTarget, roleTargetForProfile, targetEnvVars, usesSyntheticCreds, type LaunchSurface } from '../utils/role-target';
+import { proxyBaseUrlForRunner, LOCAL_BACKEND_CREDS, resolveProfileLaunchCreds, resolveRoleTarget, roleTargetForProfile, targetEnvVars, teamModeLaunchCreds, usesSyntheticCreds, type LaunchSurface } from '../utils/role-target';
+import { isSessionPlaceholderToken } from './session-credentials';
 import { placeholderizeAuthEnv, type LaunchIdentity } from '../proxy/placeholder-env';
 import { revokeBuilderCredentialGrant } from '../proxy/credential-broker';
 // `approve` is gone on this branch (rework-accept-approve-collapse folded it
@@ -256,6 +278,25 @@ let daemonStorageInit: Promise<Storage> | null = null;
 
 /** Module-level project root, set once by initDaemonStorage(). */
 let daemonProjectRoot: string | null = null;
+
+/**
+ * Since when this daemon has been unable to open its store, and why — null
+ * while it has it (or has not tried yet).
+ *
+ * The daemon holds the store for its whole life, so a daemon that CANNOT get it
+ * is not busy, it is useless: every storage RPC fails, and nothing in the
+ * process will change that while whatever holds the store stays alive. It still
+ * answers `/daemon/status` (which never touches storage), so without this a
+ * supervisor probing it sees a healthy daemon forever. Reported there as
+ * `storeUnavailable` so a fleet can recognise the wedge and restart the
+ * project cleanly instead of waiting for a human (see {@link storeAvailability}).
+ */
+let storeUnavailable: { since: number; error: string } | null = null;
+
+/** Whether this daemon has its store: null when it does (or has not tried yet). */
+export function storeAvailability(): { since: number; error: string } | null {
+  return storeUnavailable ? { ...storeUnavailable } : null;
+}
 
 /**
  * Initialize the daemon storage module with the project root.
@@ -318,6 +359,7 @@ export async function getOrCreateStorage(): Promise<Storage> {
       // published to the feed. See src/daemon/parent-child-tap.ts.
       const tapped = tapParentChildChanges(tapStorageEvents(storage));
       daemonStorage = tapped;
+      storeUnavailable = null;
       // debug, not info: this is internal storage-lifecycle chatter. In the daemon
       // it's captured in the debug-level file log. Under the LAZY_TEST in-process
       // fallback (see requireStorage) this runs INSIDE the CLI process, where an
@@ -333,6 +375,12 @@ export async function getOrCreateStorage(): Promise<Storage> {
       // Clear the memo so a later caller (e.g. the next reconcile tick, once a
       // contending lock holder releases) can retry — but surface THIS failure.
       daemonStorageInit = null;
+      // The FIRST failure's time is kept across retries: "unavailable since" is
+      // the question a supervisor asks, and each retry failing again is not news.
+      storeUnavailable = {
+        since: storeUnavailable?.since ?? Date.now(),
+        error: err instanceof Error ? err.message : String(err),
+      };
       throw err;
     });
   }
@@ -358,6 +406,7 @@ export async function closeAllStorage(): Promise<void> {
   // same process during tests) re-initializes cleanly instead of returning a
   // closed instance.
   daemonStorageInit = null;
+  storeUnavailable = null;
 }
 
 /**
@@ -405,6 +454,10 @@ export async function handleRpc(
   // what the command does — and because a refusal must land before a store
   // write or a turn launch, not after.
   assertHumanActionCarriesAPerson(command, params, caller);
+  // A run report quotes the daemon's own log: the control plane's read, never a member's.
+  if (command === 'builderRunReport' && caller.kind === 'user') {
+    throw new RpcError(403, 'builderRunReport is available to the project control token only');
+  }
 
   // Identity is applied ONCE, here, rather than in each handler: a mutating
   // handler added later would otherwise silently keep trusting a
@@ -412,6 +465,44 @@ export async function handleRpc(
   // enforcement point nobody wrote.
   params = await applyCallerActor(command, projectRoot, params, caller);
 
+  // "Let this task's next turn through", carried by the launch itself. Set
+  // for THIS launch: whatever it did not use is dropped when it returns, so a
+  // launch the pause did not stop leaves nothing pending behind it.
+  // A commit this request makes is authored by the member who sent it; a
+  // caller with no person behind it falls through to the daemon's configured
+  // system identity (src/identity/git-author.ts).
+  const gitAuthor = caller.kind === 'user' ? { email: caller.email, ...(caller.name ? { name: caller.name } : {}) } : null;
+  return runWithGitAuthor(gitAuthor, () =>
+    withLaunchAllowance(command, params, () => dispatchWithTurnOwner(command, projectRoot, params, progress, caller)));
+}
+
+/**
+ * Run a launch with the usage-pause allowance it carries (`usagePausePastOnce`)
+ * set for its task, dropping whatever it did not use once it returns. Shared
+ * with the in-process fallback (./rpc-fallback.ts), which calls the handlers
+ * without passing through handleRpc.
+ */
+export async function withLaunchAllowance<T>(
+  command: string,
+  params: Record<string, unknown> | object,
+  run: () => Promise<T>,
+): Promise<T> {
+  const allowance = await allowanceCarriedByLaunch(command, params as Record<string, unknown>);
+  if (!allowance) return run();
+  try {
+    return await run();
+  } finally {
+    clearTaskUsagePauseAllowance(allowance.taskId, allowance.id);
+  }
+}
+
+async function dispatchWithTurnOwner(
+  command: string,
+  projectRoot: string,
+  params: Record<string, unknown>,
+  progress: ProgressEmitter | undefined,
+  caller: ActorIdentity,
+): Promise<unknown> {
   // WHO ASKED FOR THIS TURN, decided once, here — because this is the only
   // place that both knows the caller's derived identity and sees every
   // turn-launching command; a handler-by-handler version would silently miss
@@ -466,11 +557,18 @@ async function dispatchRpc(
     case 'active': return handleActive(projectRoot, params);
     case 'show': return handleShow(projectRoot, params);
     case 'search': return handleSearch(projectRoot, params);
+    // Which bare hex ids in prose are tasks, raised items or commits (src/task/id-links.ts).
+    case 'resolveIds': return handleResolveIds(params);
+    // One RECORDED commit of a task, with its patch (`git show <sha>`).
+    case 'commitPatch': return handleCommitPatch(projectRoot, params);
     // Builder scratch, read-only, for the web surfaces (src/builder/scratch-view.ts).
     case 'scratchList': return handleScratchList();
     case 'scratchShow': return handleScratchShow(params);
     case 'scratchSearch': return handleScratchSearch(params);
     case 'scratchMentions': return handleScratchMentions(params);
+    case 'builderTranscript': return handleBuilderTranscript(projectRoot, params);
+    // Everything about one builder run, for god mode and the run-report command (src/daemon/builder-run-report.ts).
+    case 'builderRunReport': return (await import('./builder-run-report')).handleBuilderRunReport(projectRoot, params);
     case 'diff': return handleDiff(projectRoot, params);
     // Dynamic import for the same reason as `regions` below: it reaches back
     // into this module for getOrCreateStorage.
@@ -514,6 +612,7 @@ async function dispatchRpc(
     case 'serve.clearStartServicesCmd': return handleClearStartServicesCmd();
     case 'taskProgress': return handleTaskProgress(projectRoot, params);
     case 'taskStats': return handleTaskStats(projectRoot, params);
+    case 'tokenStats': return handleTokenStats(projectRoot, params);
     case 'submitTask': return handleSubmitTask(projectRoot, params);
     case 'submitTaskPreflight': return handleSubmitTaskPreflight(projectRoot, params);
     case 'getTaskUpstreamStatus': return handleGetTaskUpstreamStatus(projectRoot, params);
@@ -530,7 +629,20 @@ async function dispatchRpc(
     case 'describeLinkedTask': return handleDescribeLinkedTask(projectRoot, params, progress);
     case 'concurrency': return handleConcurrency(projectRoot, params);
     case 'usagePause': return handleUsagePause(projectRoot, params, caller);
+    case 'turnCredentialCheck': return handleTurnCredentialCheck(projectRoot, params, caller);
     case 'getProjectSettings': return handleGetProjectSettings(projectRoot);
+    case 'agentCredentialProfiles': return handleAgentCredentialProfiles(projectRoot, params, caller);
+    case 'getProjectConfig':
+      return (await import('./project-config')).readProjectConfig(projectRoot);
+    case 'validateProjectConfig':
+      return (await import('./project-config')).validateProjectConfig(params.toml, params.before);
+    case 'editProjectConfig':
+      return (await import('./project-config')).editProjectConfig(params.toml, params.set, params.unset);
+    case 'applyProjectConfig':
+      // The control plane's own configuration of the project: never a member's
+      // token, exactly like pushing a credential.
+      requireControlActor(caller, 'applyProjectConfig');
+      return (await import('./project-config')).applyProjectConfig(projectRoot, params.toml);
     case 'setProjectSettings': return handleSetProjectSettings(projectRoot, params);
     case 'builderSlot': return handleBuilderSlot(projectRoot, params);
     case 'getDaemonMcpConfig': return handleGetDaemonMcpConfig(projectRoot, params);
@@ -555,6 +667,7 @@ async function dispatchRpc(
     // can never discard feedback a human already typed.
     case 'identity': return handleIdentity(projectRoot);
     case 'usageLimits': return handleUsageLimits(projectRoot, caller);
+    case 'tokenBudget': return handleTokenBudget(projectRoot, caller);
     case 'getAuthEnv': return handleGetAuthEnv(projectRoot, params);
     case 'getCredentialState': return handleGetCredentialState(projectRoot, params);
     // The review surface. In-process this port is injected straight into the
@@ -563,6 +676,7 @@ async function dispatchRpc(
     case 'reviewQueue': return handleReviewQueue(projectRoot);
     case 'navCounts': return handleNavCounts(projectRoot, params);
     case 'reviewDiff': return handleReviewDiff(projectRoot, params);
+    case 'reviewDiffFiles': return handleReviewDiffFiles(projectRoot, params);
     case 'reviewRegions': return handleReviewRegions(projectRoot, params);
     case 'reviewLineAttribution': return handleReviewLineAttribution(projectRoot, params);
     case 'reviewFileLines': return handleReviewFileLines(projectRoot, params);
@@ -909,8 +1023,17 @@ export async function handleSetProjectSettings(projectRoot: string, params: Reco
     next.defaultAgent = agent;
   }
   next.updatedAt = new Date().toISOString();
-  const actor = optionalString(params, 'actor');
-  if (actor) next.updatedBy = actor;
+  // `applyCallerActor` widens a bare role string into a full ActorRef object
+  // for every real caller (a per-user token, or an unmanaged daemon with a
+  // resolved git identity) before this handler ever sees `params.actor` — so
+  // reading it with `optionalString` threw "actor must be a string, got
+  // object" for every caller except a bare control token naming no actor at
+  // all. `updatedBy` wants a person to display, and the email/name is exactly
+  // what the widening added; fall back to the bare role for the one caller
+  // that never gets widened.
+  const actorInput = params.actor as ActorInput | undefined;
+  const updatedBy = actorEmail(actorInput) ?? actorName(actorInput) ?? actorRole(actorInput);
+  if (updatedBy) next.updatedBy = updatedBy;
 
   const [storage, config] = await Promise.all([
     getOrCreateStorage(),
@@ -1120,7 +1243,9 @@ export async function handleShow(projectRoot: string, params: Record<string, unk
     task: data.task,
     session: data.session,
     turns: page('turns', data.turns),
-    commits: page('commits', data.commits),
+    // Each recorded commit carries who made it and when, read from git — the
+    // store records only the SHA, and a client must not run git itself.
+    commits: await withCommitIdentities(page('commits', data.commits), projectRoot),
     // Every comment carries whether the agent has SEEN it, so a client never
     // compares its own timestamps against the cutoff (CLAUDE.md: "A lazy
     // comment never starts a turn" — the cutoff is the last delivery).
@@ -1199,6 +1324,15 @@ export async function handleShow(projectRoot: string, params: Record<string, unk
       return progress ? clusterProgressPayload(progress) : null;
     })(),
 
+    /**
+     * Which accept a reopen superseded (`{ accept_commit, reopened_at }`), or
+     * null — including once the task is accepted again. The ANSWER, so no
+     * client parses task metadata or re-applies the "not while complete" rule
+     * (src/task/reopen-after-accept.ts). Never section-gated, same rule as
+     * `clusterProgress`.
+     */
+    reopenedAfterAccept: result.task.status === 'complete' ? null : reopenedAfterAcceptOf(result.task),
+
     // Explicit list (same rule as mergeState): omitting raisedItems / turnReport /
     // fileDecisions would silently drop those sections over RPC even when
     // loadTaskShowData computed them.
@@ -1244,6 +1378,12 @@ export async function handleShow(projectRoot: string, params: Record<string, unk
     // Teams) re-deriving any of that in another language would be a second copy
     // of a load-bearing invariant. Answer it here, once, in the daemon.
     fileViolations,
+    /**
+     * Protected files lazy RESTORED to base after a Reject (latest record per
+     * file, src/protection/reverted-files.ts). They are out of the diff, so a
+     * client says so beside Accept. An answer, never section-gated.
+     */
+    restoredProtectedFiles: revertedProtectedFiles(data.turns),
     /**
      * "Before you can accept": the rows the daemon's own Current review tab
      * renders, as data — built by the one function that renders them there
@@ -1297,6 +1437,79 @@ export async function handleShow(projectRoot: string, params: Record<string, unk
 
 // --- Search ---
 
+/** Upper bound on tokens per call — a page's prose, not a crawl. */
+const RESOLVE_IDS_MAX_TOKENS = 500;
+
+/** Recorded commits with git's author/committer identity merged in (absent when git does not know the SHA). */
+async function withCommitIdentities<T extends { sha: string }>(commits: T[], projectRoot: string): Promise<Array<T & Partial<CommitIdentity>>> {
+  if (commits.length === 0) return commits;
+  const ids = await getCommitIdentities(commits.map((c) => c.sha), projectRoot);
+  return commits.map((c) => ({ ...c, ...(ids.get(c.sha) ?? {}) }));
+}
+
+/**
+ * `commitPatch` — one commit this task RECORDED, and its patch. The commit is
+ * looked up among the session's recorded commits (by record id, full SHA, or a
+ * SHA prefix of at least 7 characters) — never an arbitrary SHA, so this cannot
+ * be used to read a commit that is not the task's. The patch is the commit
+ * against its first parent (`git show`), which needs no diff-base resolution.
+ * The same answer the dashboard's `/tasks/:id/commits/:commitId` renders.
+ */
+export async function handleCommitPatch(projectRoot: string, params: Record<string, unknown>) {
+  if (typeof params.taskId !== 'string' || !params.taskId) {
+    throw new RpcError(400, 'taskId is required');
+  }
+  if (typeof params.commitId !== 'string' || !params.commitId) {
+    throw new RpcError(400, 'commitId is required');
+  }
+  const wanted = params.commitId;
+  const storage = await getOrCreateStorage();
+  const result = await storage.resolveTask(params.taskId);
+  if (!result.task) throw new RpcError(404, `Task not found: ${params.taskId}`);
+  const commit = await findRecordedCommit(storage, result.task, wanted);
+  if (!commit) {
+    throw new RpcError(404, `Commit ${wanted} is not a recorded commit of task ${result.task.code ?? result.task.id}`);
+  }
+  const [withIdentity] = await withCommitIdentities([commit], projectRoot);
+  const { patch, missing } = await getCommitPatch(commit.sha, projectRoot);
+  return {
+    taskId: result.task.id,
+    commit: withIdentity,
+    patch,
+    patchAvailable: patch.length > 0,
+    // The object is gone from this repository — distinct from a commit that
+    // simply changed no files (patchAvailable false, missing false).
+    missing,
+  };
+}
+
+/**
+ * `resolveIds` — the daemon's answer to "which of these tokens name a task
+ * (by code or short id), a raised item or a commit on `taskId`". Remote renderers (Lazy Teams)
+ * send the candidate tokens they found in prose and link only what comes back,
+ * so what a string links to is decided here exactly as for the dashboard.
+ */
+export async function handleResolveIds(params: Record<string, unknown>) {
+  if (!Array.isArray(params.tokens) || !params.tokens.every((t) => typeof t === 'string')) {
+    throw new RpcError(400, 'tokens must be an array of strings');
+  }
+  if (params.tokens.length > RESOLVE_IDS_MAX_TOKENS) {
+    throw new RpcError(400, `tokens: at most ${RESOLVE_IDS_MAX_TOKENS} per call, got ${params.tokens.length}`);
+  }
+  if (params.taskId !== undefined && params.taskId !== null && typeof params.taskId !== 'string') {
+    throw new RpcError(400, 'taskId must be a string when given');
+  }
+  const storage = await getOrCreateStorage();
+  const tokens = params.tokens as string[];
+  const index = await buildIdLinkIndex(storage, { taskId: (params.taskId as string | undefined) ?? null, tokens });
+  const links: Record<string, IdLinkTarget> = {};
+  for (const token of tokens) {
+    const hit = index.resolve(token);
+    if (hit) links[token] = hit;
+  }
+  return { links };
+}
+
 export async function handleSearch(projectRoot: string, params: Record<string, unknown>) {
   if (typeof params.query !== 'string' || !params.query) {
     throw new RpcError(400, 'query is required');
@@ -1335,7 +1548,7 @@ export async function handleSearch(projectRoot: string, params: Record<string, u
 
 export async function handleScratchList() {
   const storage = await getOrCreateStorage();
-  return { groups: groupScratchBySession(await storage.listScratchFiles()) };
+  return { groups: groupScratchBySession(await storage.listScratchFiles(), await storage.listBuilders()) };
 }
 
 export async function handleScratchShow(params: Record<string, unknown>) {
@@ -1350,6 +1563,25 @@ export async function handleScratchSearch(params: Record<string, unknown>) {
   if (typeof params.query !== 'string' || !params.query.trim()) throw new RpcError(400, 'query is required');
   const storage = await getOrCreateStorage();
   return { query: params.query.trim(), hits: await searchScratch(storage, params.query.trim()) };
+}
+
+/**
+ * One Builder and its JOINED transcript (docs/design/builder-identity.md), by
+ * Builder id, any segment id or a unique prefix. The join — segment order and
+ * de-duplication of history a resume copied — is `resolveBuilderTranscript`'s,
+ * answered here so a remote page never re-implements it segment by segment.
+ */
+export async function handleBuilderTranscript(projectRoot: string, params: Record<string, unknown>) {
+  if (typeof params.id !== 'string' || !params.id.trim()) throw new RpcError(400, 'id is required');
+  await (await import('./builder-sessions')).settleDeadBuilderSessions(projectRoot);
+  const storage = await getOrCreateStorage();
+  const { resolveBuilderTranscript } = await import('../builder/identity-transcript');
+  const resolved = await resolveBuilderTranscript(storage, params.id);
+  if (!resolved) throw new RpcError(404, `No builder matches '${params.id}'`);
+  if ('ambiguous' in resolved) {
+    throw new RpcError(400, `'${params.id}' matches ${resolved.ambiguous.length} builders. Use a longer prefix.`);
+  }
+  return resolved;
 }
 
 export async function handleScratchMentions(params: Record<string, unknown>) {
@@ -1429,14 +1661,11 @@ export async function handleDiff(projectRoot: string, params: Record<string, unk
     : null;
 
   const diffStorage = await getOrCreateStorage();
-  // A region filter is inherently about the WHOLE branch: on a release hub the
-  // default diff excludes accepted children's files, and every child-task
-  // region is made of exactly those. Intersecting the two would hand back an
-  // empty diff for a region that plainly has files.
+  // INVARIANT: the diff is the task's WHOLE branch, accepted children
+  // included (engineer decision 2026-09-25). `fullBranch` is accepted and
+  // ignored so old callers keep working.
   const { storage, task, sess, worktreePath, fromRef, useTwoDotDiff, direct } =
-    await resolveTaskDiffContext(diffStorage, projectRoot, params.taskId, {
-      fullBranch: params.fullBranch === true || regionRef !== null,
-    });
+    await resolveTaskDiffContext(diffStorage, projectRoot, params.taskId);
 
   // Scoping is by the region's FILES against the task's own base..HEAD range,
   // not by re-diffing the region's commit range. Two reasons: review comments
@@ -1512,12 +1741,6 @@ export async function handleDiff(projectRoot: string, params: Record<string, unk
       parts.push(surface === 'mcp'
         ? `\nFor full diff: lazy_diff(task_id: "${displayId(task)}", full: true)`
         : `\nFor full diff: lazy diff ${displayId(task)} --full`);
-      if (direct.scopedToDirect) {
-        const n = direct.acceptedChildren.length;
-        parts.push(surface === 'mcp'
-          ? `Direct changes only (${n} accepted subtask${n === 1 ? '' : 's'} excluded). For the whole branch: lazy_diff(task_id: "${displayId(task)}", full_branch: true)`
-          : `Direct changes only (${n} accepted subtask${n === 1 ? '' : 's'} excluded). For the whole branch: lazy diff ${displayId(task)} --full-branch`);
-      }
       output = parts.join('\n');
     }
   }
@@ -1526,9 +1749,36 @@ export async function handleDiff(projectRoot: string, params: Record<string, unk
     output,
     diffRange,
     taskId: shortId(task.id),
-    scopedToDirect: direct.scopedToDirect,
-    acceptedSubtaskCount: direct.acceptedChildren.length,
   };
+}
+
+/**
+ * The files a task's diff touches, with +/− counts and no patch text — the
+ * review page's file list, rendered before any hunk so a 2,000-file branch
+ * paints at once. Same range as `handleDiff` (the task diff context), same
+ * `region` scoping (the presented region's files), so the list names exactly
+ * the files a full diff would render.
+ */
+export async function handleDiffFiles(projectRoot: string, params: Record<string, unknown>) {
+  if (typeof params.taskId !== 'string' || !params.taskId) {
+    throw new RpcError(400, 'taskId is required');
+  }
+  const regionRef = typeof params.region === 'string' && params.region.trim()
+    ? params.region.trim()
+    : null;
+  const diffStorage = await getOrCreateStorage();
+  const { worktreePath, fromRef, useTwoDotDiff } =
+    await resolveTaskDiffContext(diffStorage, projectRoot, params.taskId);
+  let paths: string[] | undefined;
+  if (regionRef) {
+    const { loadPresentedRegions } = await import('./regions-presentation');
+    const { requireRegion } = await import('./regions-service');
+    const { cover } = await loadPresentedRegions(diffStorage, projectRoot, params.taskId);
+    paths = requireRegion(cover, regionRef).files;
+    // `[]` is git's "whole tree" — a region with no files lists none.
+    if (paths.length === 0) return { files: [] };
+  }
+  return { files: await getDiffNumstat(fromRef, 'HEAD', worktreePath, useTwoDotDiff, paths) };
 }
 
 /**
@@ -1839,6 +2089,39 @@ function refuseCallerTaskIdFromUser(
       `'${command}' refused: callerTaskId identifies a task's own running agent and cannot be sent on a person's token.`,
     );
   }
+}
+
+/** The launch RPCs that may carry `usagePausePastOnce`. */
+const ALLOWANCE_CARRYING_COMMANDS = new Set(['startTask', 'unblockTask', 'resumeTask', 'reviewTask', 'askTask']);
+
+/**
+ * Set the per-task usage-pause allowance a launch asked for, judged on the
+ * actor identity has already been applied to (src/daemon/usage-pause.ts, "The
+ * per-task allowance": a person or the builder, never a task agent).
+ */
+async function allowanceCarriedByLaunch(
+  command: string,
+  params: Record<string, unknown>,
+): Promise<{ taskId: string; id: string } | null> {
+  if (params.usagePausePastOnce === undefined || params.usagePausePastOnce === false) return null;
+  if (params.usagePausePastOnce !== true) {
+    throw new RpcError(400, `Invalid 'usagePausePastOnce': expected true or false.`);
+  }
+  if (!ALLOWANCE_CARRYING_COMMANDS.has(command)) {
+    throw new RpcError(400, `'${command}' does not take usagePausePastOnce.`);
+  }
+  const { task } = await (await getOrCreateStorage()).resolveTask(requireString(params, 'taskId'));
+  if (!task) throw new RpcError(404, `Task not found: ${String(params.taskId)}`);
+  const actor = optionalActorInput(params);
+  // One already pending — set with a button or `--task` — is left exactly as
+  // it is: replacing it here and dropping the replacement unused would take
+  // back an allowance somebody set on purpose. The channel is still judged.
+  if (taskUsagePauseAllowance(task.id)) {
+    if (!mayAllowTaskPastUsagePause(actor)) allowTaskPastUsagePause(task.id, actor); // throws the 403
+    return null;
+  }
+  const allowance = allowTaskPastUsagePause(task.id, actor);
+  return { taskId: task.id, id: allowance.id };
 }
 
 async function applyCallerActor(
@@ -2185,6 +2468,25 @@ function pinnedActorOf(caller: Extract<ActorIdentity, { kind: 'user' }>): ActorR
 }
 
 /** Refuse a control-plane-only RPC to anyone else. */
+/**
+ * The agent profiles and what each takes — and, with `userId`, whether THAT
+ * principal has a credential a turn on each would find (the launch's own rule,
+ * ./member-credentials.ts). A user token may ask only about its own holder:
+ * whose credentials exist is the control plane's to know, not a teammate's.
+ */
+async function handleAgentCredentialProfiles(
+  projectRoot: string,
+  params: Record<string, unknown>,
+  caller?: ActorIdentity,
+) {
+  const asked = optionalString(params, 'userId');
+  if (asked !== undefined && caller?.kind === 'user' &&
+      canonicalCredentialKey(asked) !== canonicalCredentialKey(caller.email)) {
+    throw new RpcError(403, `Forbidden: agentCredentialProfiles for another user. This token identifies user ${caller.email}.`);
+  }
+  return (await import('./agent-credential-profiles')).agentCredentialProfiles(projectRoot, asked);
+}
+
 function requireControlActor(caller: ActorIdentity, command: string): void {
   if (caller.kind === 'control') return;
   throw new RpcError(
@@ -2467,6 +2769,7 @@ export async function handleReopenTask(projectRoot: string, params: Record<strin
     taskId: requireString(params, 'taskId'),
     reason: optionalString(params, 'reason'),
     actor: optionalActorInput(params),
+    checkOnly: params.checkOnly === true,
   };
   return reopenTask(projectRoot, reopenParams);
 }
@@ -2701,13 +3004,102 @@ export async function handleTaskStats(projectRoot: string, params: Record<string
   }
 
   const result = await loadTaskStats(storage, resolved.task, { scope });
+  const tokenTasks = result.scope === 'subtree'
+    ? [resolved.task, ...(await collectDescendantTasks(storage, resolved.task.id))]
+    : [resolved.task];
   return {
     taskId: resolved.task.id,
     displayId: displayId(resolved.task),
     scope: result.scope,
     descendantCount: result.descendantCount,
     stats: result.stats,
+    proxyTokens: await loadTokenReport(projectRoot, tokenTasks.map(task => task.id)),
   };
+}
+
+/** Daemon-owned token/tool/planning projection used by CLI and remote MCP clients. */
+export async function handleTokenStats(projectRoot: string, params: Record<string, unknown>) {
+  const storage = await getOrCreateStorage();
+  const mode = params.mode === undefined ? 'planning' : String(params.mode);
+  const taskRef = params.task === undefined ? undefined : String(params.task);
+  const subtree = params.subtree === true;
+  const sinceMs = params.sinceMs === undefined ? undefined : Number(params.sinceMs);
+  const limit = params.limit === undefined ? undefined : Number(params.limit);
+  if (sinceMs !== undefined && (!Number.isFinite(sinceMs) || sinceMs < 0)) {
+    throw new RpcError(400, 'sinceMs must be a non-negative timestamp');
+  }
+  if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) {
+    throw new RpcError(400, 'limit must be a positive integer');
+  }
+
+  if (mode === 'tokens-cli') {
+    let ids: string[] | undefined;
+    let taskId = taskRef;
+    let task: Task | undefined;
+    if (subtree) {
+      if (!taskRef) throw new RpcError(400, '--subtree needs a task');
+      const resolved = await storage.resolveTask(taskRef);
+      if (!resolved.task) throw new RpcError(404, `Task not found or ambiguous: ${taskRef}`);
+      task = resolved.task;
+      const descendants = await collectDescendantTasks(storage, task.id);
+      ids = [task.id, ...descendants.map(child => child.id)];
+      taskId = undefined;
+    }
+    return {
+      report: await loadTokenReport(projectRoot, ids, {
+        sinceMs,
+        limit,
+        role: params.role === undefined ? undefined : String(params.role),
+        taskId,
+      }),
+      task: task ? { id: task.id, code: task.code, descendants: (ids?.length ?? 1) - 1 } : null,
+    };
+  }
+
+  const resolveTask = async (): Promise<Task | undefined> => {
+    if (!taskRef) return undefined;
+    const resolved = await storage.resolveTask(taskRef);
+    if (!resolved.task) throw new RpcError(404, `Task not found or ambiguous: ${taskRef}`);
+    return resolved.task;
+  };
+  if (mode !== 'planning' && mode !== 'tools-cli') {
+    throw new RpcError(400, `Invalid token stats mode: ${mode}`);
+  }
+  const scope = mode === 'tools-cli' ? 'tools' : (params.scope === undefined ? undefined : String(params.scope));
+  if (scope !== undefined && scope !== 'tokens' && scope !== 'tools') {
+    throw new RpcError(400, "scope must be 'tokens' or 'tools'");
+  }
+  const groupBy = params.groupBy === undefined ? undefined : String(params.groupBy);
+  if (groupBy !== undefined && !['task', 'model', 'role'].includes(groupBy)) {
+    throw new RpcError(400, "group_by must be 'task', 'model', or 'role'");
+  }
+  const top = params.top === undefined ? undefined : Number(params.top);
+  const minTasks = params.minTasks === undefined ? undefined : Number(params.minTasks);
+  if (top !== undefined && (!Number.isInteger(top) || top < 1)) {
+    throw new RpcError(400, 'top must be a positive integer');
+  }
+  if (minTasks !== undefined && (!Number.isInteger(minTasks) || minTasks < 1)) {
+    throw new RpcError(400, 'min_tasks must be a positive integer');
+  }
+  return describeTokenStats(projectRoot, storage, {
+    scope: scope as TokenStatsScope | undefined,
+    task: await resolveTask(),
+    subtree,
+    groupBy: groupBy as TokenStatsGroup | undefined,
+    sinceMs,
+    top,
+    taskType: (() => {
+      try {
+        return parseTokenStatsTaskType(params.taskType);
+      } catch (err) {
+        throw new RpcError(400, (err as Error).message);
+      }
+    })(),
+    minTasks,
+    limit,
+    windowedTools: params.windowedTools === true,
+    caller: { kind: 'builder' },
+  });
 }
 
 // --- Per-task environment variables ---
@@ -3104,6 +3496,59 @@ export async function handleUsageLimits(
 }
 
 /**
+ * "Would this task's next turn be refused for want of a model credential?" —
+ * the PRE-FLIGHT a CLI verb asks before it opens `$EDITOR`, so a refusal never
+ * costs the human what they typed (CLAUDE.md: never lose human feedback).
+ *
+ * Answered by the same gate the launch runs (`turnCredentialRefusal`,
+ * ./credential-gate.ts), for the profile the turn will ACTUALLY run on: the
+ * `agentId` an `--agent` switch names, else the task's own; `beside` asks
+ * for a model run beside the task instead (a record-route ask spends the
+ * builder role's profile). Presence only (`load: false`) — a read must not
+ * open a keychain item; the launch loads, and refuses then if the load fails.
+ * The daemon stays the authority: this only saves typing into a turn that
+ * cannot start.
+ */
+export async function handleTurnCredentialCheck(
+  projectRoot: string,
+  params: Record<string, unknown>,
+  caller?: ActorIdentity,
+): Promise<{ refusal: string | null }> {
+  const taskId = optionalString(params, 'taskId');
+  if (!taskId) throw new RpcError(400, 'turnCredentialCheck: taskId is required');
+  const storage = await getOrCreateStorage();
+  if (!(await storage.getTask(taskId))) throw new RpcError(404, `turnCredentialCheck: no task ${taskId}`);
+  const config = await loadConfig(projectRoot);
+  const agentId = optionalBoolean(params, 'beside')
+    ? config.models.roles.builder.profile
+    : optionalString(params, 'agentId');
+  // Not a turn-launching command, so there is no request-scoped owner: resolve
+  // the one the launch WOULD have, the same way (a spendable person, else
+  // nobody — which in team mode means the service credential).
+  const owner = caller ? await turnOwnerForCaller(projectRoot, caller) : null;
+  const refusal = await turnCredentialProblem(projectRoot, {
+    taskId,
+    storage,
+    ...(agentId ? { agentId } : {}),
+    owner: owner?.spendable ? owner.email : null,
+    load: false,
+  });
+  return { refusal };
+}
+
+/**
+ * The token-budget view (src/usage-pause/budget-view.ts): per-credential
+ * windows with the tokens spent in them and an estimate of what is left, plus
+ * spend per harness, task and day. Control-plane only when a caller is named,
+ * like usageLimits: it names every member's credential.
+ */
+export async function handleTokenBudget(projectRoot: string, caller?: ActorIdentity) {
+  if (caller) requireControlActor(caller, 'tokenBudget');
+  const { describeProjectTokenBudget } = await import('./token-budget');
+  return describeProjectTokenBudget(projectRoot, await getOrCreateStorage());
+}
+
+/**
  * The [usage_pause] state: configured thresholds, the one-shot override, every
  * credential currently paused or armed without a reading, and every task whose
  * launch the pause is holding. `taskId` adds that task's own verdict — the
@@ -3117,6 +3562,13 @@ export async function handleUsageLimits(
  *    person's escape hatch, and the builder or an agent that could set it could
  *    talk its way past every pause (src/daemon/usage-pause.ts). The CLI adds a
  *    real-terminal requirement on top (src/cli/commands/daemon-config.ts).
+ *    It lets through only launches BESIDE any task; a task's launch is let
+ *    through by that task's own allowance instead:
+ *  - `allowTask` / `clearTask` (`taskId`) set or drop the per-task allowance —
+ *    "let this task's next turn through", used up by the first launch of that
+ *    task it lets past a pause. A person or the builder may; a task agent never
+ *    (src/daemon/usage-pause.ts, "The per-task allowance"). Every launch RPC
+ *    also takes `usagePausePastOnce: true`, which sets it for that launch.
  *  - `admitOneshot` admits one CLI one-shot command (`lazy report`, `lazy ask`
  *    on a stored conversation), judged once before its first call.
  *  - `admitInteractive` admits one interactive session a person opens — `lazy
@@ -3138,9 +3590,17 @@ export async function handleUsagePause(
 ): Promise<UsagePauseState> {
   if (caller) requireControlActor(caller, 'usagePause');
   const action = optionalEnum(
-    params, 'action', ['get', 'set', 'reset', 'admitOneshot', 'admitInteractive'] as const,
+    params, 'action', ['get', 'set', 'reset', 'allowTask', 'clearTask', 'admitOneshot', 'admitInteractive'] as const,
   ) ?? 'get';
   const actor = optionalActorInput(params);
+  if (action === 'allowTask' || action === 'clearTask') {
+    const { task } = await (await getOrCreateStorage()).resolveTask(requireString(params, 'taskId'));
+    if (!task) throw new RpcError(404, `Task not found: ${String(params.taskId)}`);
+    if (action === 'allowTask') allowTaskPastUsagePause(task.id, actor);
+    else if (!mayAllowTaskPastUsagePause(actor)) {
+      throw new RpcError(403, `Only a person or the builder may clear a task's usage-pause allowance.`);
+    } else clearTaskUsagePauseAllowance(task.id);
+  }
   if (action === 'reset') setUsagePauseOverride(null);
   if (action === 'set') {
     if (!mayUseUsagePauseOverride(actor)) {
@@ -3170,7 +3630,12 @@ export async function handleUsagePause(
   // The CLI pre-flight judges as its launch will: a caller that may not take
   // the override (usagePauseOverrideEligible: false) is judged without it.
   const judge = { overrideEligible: params.usagePauseOverrideEligible !== false };
-  const state = await describeUsagePauseState(projectRoot, storage, taskId, agentId, undefined, judge);
+  // `ownerEmail`: judge the task as that member's launch would (team mode only;
+  // control-plane only, like the rest of this command).
+  const ownerEmail = optionalString(params, 'ownerEmail');
+  const state = await describeUsagePauseState(
+    projectRoot, storage, taskId, agentId, undefined, { ...judge, ...(ownerEmail ? { ownerEmail } : {}) },
+  );
   const beside = optionalBoolean(params, 'beside')
     ? await describeBesideLaunch(projectRoot, actorEmail(actor) ?? null, undefined, judge)
     : undefined;
@@ -3362,6 +3827,12 @@ export async function handlePutUserCredential(
   const kind = requireNonBlankString(params, 'kind');
   const token = requireNonBlankString(params, 'token');
   const label = optionalString(params, 'label');
+  // The AGENT PROFILE this credential pays for; absent for the Claude
+  // credential. Judged against the profile as the daemon resolves it now for
+  // WHICH KINDS it takes. Where the secret may be sent is NOT taken from the
+  // profile: it is `endpoint`, the endpoint the member was shown, sent by the
+  // control plane and recorded as given (src/daemon/agent-credential-profiles.ts).
+  const profile = optionalString(params, 'profile');
   // WHOSE ACCOUNT pays for the project's automations, for the service
   // credential only (§3.3 case 3). A control-plane configuration field, not an
   // actor: it names the identity system-initiated writes are attributed to,
@@ -3369,6 +3840,14 @@ export async function handlePutUserCredential(
   // person is never taken from the caller of the write itself.
   const ownerEmail = optionalString(params, 'ownerEmail');
   const ownerName = optionalString(params, 'ownerName');
+
+  if (profile !== undefined) {
+    const { putProfileCredential } = await import('./agent-credential-profiles');
+    // The endpoint the member was SHOWN — their consent, recorded as stated.
+    // '' is a real value (the project's default upstream), so it is read raw.
+    const endpoint = typeof params.endpoint === 'string' ? params.endpoint : undefined;
+    return putProfileCredential(projectRoot, { userId, kind, token, label, ownerEmail, ownerName, profile, endpoint });
+  }
 
   if (kind !== 'oauth' && kind !== 'api-key') {
     throw new RpcError(
@@ -3407,11 +3886,15 @@ export async function handleRevokeUserCredential(
   requireControlActor(caller, 'revokeUserCredential');
 
   const userId = requireNonBlankString(params, 'userId');
-  const revoked = await revokeUserCredential(projectRoot, userId);
+  // One slot at a time: without `profile` the Claude credential, with it the
+  // one connected for that agent profile.
+  const profile = optionalString(params, 'profile');
+  const revoked = await revokeUserCredential(projectRoot, userId, profile);
+  const what = profile ? `credential for agent profile "${profile}"` : 'credential';
   logger.info(
     revoked
-      ? `Revoked stored credential for user ${userId}`
-      : `No stored credential for user ${userId} to revoke`,
+      ? `Revoked stored ${what} for user ${userId}`
+      : `No stored ${what} for user ${userId} to revoke`,
   );
   return { revoked };
 }
@@ -3611,9 +4094,9 @@ async function turnOwnerRequest(
 /**
  * Return the model auth credential from the DAEMON's environment.
  *
- * The daemon is the single owner of credentials (see credential-gate.ts): it
- * refuses to start without one, so by the time it can answer this RPC it is
- * guaranteed to hold a usable token (or be Ollama-backed, which needs none).
+ * The daemon is the single owner of credentials. It may run without one — only
+ * a turn needs a model credential — so a launch on a profile it holds none for
+ * is refused here, naming the profile (see credential-gate.ts).
  *
  * Client-side launch paths that spawn their OWN containers — notably
  * `lazy builder`, which the CLI client launches directly rather than through
@@ -3659,8 +4142,7 @@ export async function handleGetAuthEnv(projectRoot: string, params: Record<strin
   // (resolveAuthEnvFromDaemon) wrap it for their resolved role target, layering
   // the proxy's base URL on top.
   //
-  // Reads the daemon process env. Throws an actionable error if absent, but the
-  // credential gate makes that practically unreachable for a running daemon.
+  // Reads the daemon process env. Refuses, naming the profile, if absent.
   //
   // Also returns the daemon's live proxy base URL (with the actual bound port)
   // when the proxy is running, so a CLI-client launch (e.g. `lazy builder`) can
@@ -3693,8 +4175,8 @@ export async function handleGetAuthEnv(projectRoot: string, params: Record<strin
   const identity = parseLaunchIdentity(params, profiles);
 
   // A self-credentialed role never touches the daemon's own credential — which
-  // is the point: the daemon may not have one, and the gate lets it start
-  // anyway precisely because all-local projects do not need it. Every other
+  // is the point: the daemon may not have one, and all-local projects do not
+  // need it. Every other
   // credential slot the profile names — hosted ollama.com, OpenRouter, a named
   // `work-openai` — resolves from the credential store.
   let real: AuthEnvVar[];
@@ -3720,7 +4202,16 @@ export async function handleGetAuthEnv(projectRoot: string, params: Record<strin
       )
       : null;
     // null means "the profile bills Anthropic", whose source on THIS path is the
-    // daemon's own process env — the reason this RPC exists.
+    // daemon's own process env — the reason this RPC exists. The daemon may
+    // have started without one (only turns need it), so ask the turn gate
+    // first: it loads a credential stored since startup, and otherwise refuses
+    // naming the profile — never the bare "Authentication required".
+    if (identity && !fromProfile) {
+      const refusal = await profileCredentialRefusal(
+        projectRoot, agentProfileOrThrow(profiles, identity.profile), { perUser: false },
+      );
+      if (refusal) throw new RpcError(400, refusal);
+    }
     real = fromProfile ?? getAuthEnvVars();
   }
 
@@ -3814,14 +4305,25 @@ export async function handleGetAgentLaunchEnv(
   const target = roleTargetForProfile(profile);
   const selfCredentialed = usesSyntheticCreds(target);
 
-  const authResult = await handleGetAuthEnv(projectRoot, {
-    proxied: true,
-    role: 'agent',
-    label,
-    taskId: task.id,
-    profile: profile.name,
-    ...(selfCredentialed ? { selfCredentialed: true } : {}),
-  }) as { authEnvVars: AuthEnvVar[]; proxyBaseUrl?: string };
+  // TEAM MODE: the turn's principal pays, not the daemon — so the refresh
+  // carries exactly what the launch did (teamModeLaunchCreds, the rule the
+  // launch uses): the owner's session placeholder, or a fresh grant over the
+  // member-paid stand-in. Asking handleGetAuthEnv instead would read the
+  // daemon's own credential or the project's store, neither of which holds the
+  // member's key, and refuse a relaunch the launch itself allowed.
+  const sessionCreds = await sessionCredentialEnvFor(projectRoot, task.id);
+  const authResult = sessionCreds
+    ? await teamModeRefreshCreds(projectRoot, sessionCreds, target, {
+      role: 'agent', taskId: task.id, label, profile: profile.name, taskUuid: task.id,
+    })
+    : await handleGetAuthEnv(projectRoot, {
+      proxied: true,
+      role: 'agent',
+      label,
+      taskId: task.id,
+      profile: profile.name,
+      ...(selfCredentialed ? { selfCredentialed: true } : {}),
+    }) as { authEnvVars: AuthEnvVar[]; proxyBaseUrl?: string };
 
   let proxyUrl = authResult.proxyBaseUrl;
   if (!proxyUrl && hasDaemonContext() && getDaemonContext().proxyPort) {
@@ -3859,6 +4361,20 @@ export async function handleGetAgentLaunchEnv(
   };
 }
 
+/** The team-mode half of {@link handleGetAgentLaunchEnv}. */
+async function teamModeRefreshCreds(
+  projectRoot: string,
+  sessionCreds: AuthEnvVar[],
+  target: ReturnType<typeof roleTargetForProfile>,
+  identity: LaunchIdentity,
+): Promise<{ authEnvVars: AuthEnvVar[]; proxyBaseUrl?: string }> {
+  const real = teamModeLaunchCreds(target, sessionCreds);
+  // Session placeholders are already bound to the turn's owner; minting a grant
+  // over one would hand the container a value the swap path cannot resolve.
+  if (real.some((v) => isSessionPlaceholderToken(v.value))) return { authEnvVars: real };
+  return { authEnvVars: await placeholderizeAuthEnv(projectRoot, real, identity) };
+}
+
 /**
  * Fresh model/proxy launch environment for a builder container relaunching Claude
  * Code in place after a daemon restart or upgrade.
@@ -3871,7 +4387,7 @@ export async function handleGetAgentLaunchEnv(
 export async function handleGetBuilderLaunchEnv(
   projectRoot: string,
   presentedToken: string,
-): Promise<{ authEnvVars: AuthEnvVar[]; proxyBaseUrl?: string; lazyVersion: string }> {
+): Promise<{ authEnvVars: AuthEnvVar[]; proxyBaseUrl?: string; lazyVersion: string; directive: BuilderLaunchDirective }> {
   const identity = await lookupDaemonIdentity(projectRoot, presentedToken);
   if (!identity || identity.kind !== 'builder') {
     throw new RpcError(
@@ -3928,6 +4444,7 @@ export async function handleGetBuilderLaunchEnv(
     authEnvVars,
     ...(proxyUrl ? { proxyBaseUrl: proxyUrl } : {}),
     lazyVersion: VERSION,
+    directive: resolveBuilderLaunchDirective(config),
   };
 }
 
@@ -4047,18 +4564,16 @@ export async function handleRunOneshot(projectRoot: string, params: Record<strin
  *
  * Diagnostics (`lazy doctor`) need to answer "does lazy have the credentials it
  * needs?", and the only environment that matters is the DAEMON's: it is the
- * single owner (credential-gate.ts) and every agent it launches inherits its
+ * single owner and every agent it launches inherits its
  * env. Reading the CLI's own `process.env` answers a different question and
  * gets it wrong in both directions — a daemon-only-env deployment reads as "not
  * authenticated" while everything works, and a stale token in the user's shell
  * reads as healthy auth the daemon does not have.
  *
  * PER CREDENTIAL, over every CONFIGURED profile (`requiredCredentials`): the
- * role defaults plus every `[agents.<name>]` block. That is deliberately wider
- * than the startup gate, which reads the role defaults only — a declared profile
- * nobody runs must not refuse a daemon, but a task that selects it will refuse
- * to launch without its credential, and this report is where a user learns
- * that first. Each entry names the profiles billing it, so the line doctor
+ * role defaults plus every `[agents.<name>]` block. A task that selects a
+ * profile will refuse to launch without its credential, and this report is where
+ * a user learns that first. Each entry names the profiles billing it, so the line doctor
  * prints says who is affected.
  *
  * ONE BAD READ DEGRADES ONE ENTRY. Presence comes from the store's non-secret
@@ -4111,9 +4626,8 @@ export async function handleGetCredentialState(projectRoot: string, _params: Rec
     present: source !== null,
     // The env var NAME (e.g. CLAUDE_CODE_OAUTH_TOKEN), never its value.
     source,
-    // Whether an Anthropic token is needed by the ROLE DEFAULTS — the gate's
-    // scope, read through the same `requiredProviders` the credential gate
-    // starts the daemon by, so this flag and the gate cannot disagree.
+    // Whether an Anthropic token is needed by the ROLE DEFAULTS, for a client
+    // older than `providers`.
     anthropicRequired: requiredProviders(config).includes('anthropic'),
     providers,
   };
@@ -4475,6 +4989,8 @@ export const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<str
   loadConversation: (s, a) => s.loadConversation(a.sessionId as string),
   listConversations: (s) => s.listConversations(),
   listConversationSummaries: (s) => s.listConversationSummaries(),
+  listBuilders: (s) => s.listBuilders(),
+  getBuilder: (s, a) => s.getBuilder(a.idOrSegmentId as string),
   isConversationImported: (s, a) => s.isConversationImported(a.sessionId as string),
   deleteConversation: (s, a) => s.deleteConversation(a.sessionId as string),
 
@@ -4566,6 +5082,10 @@ export const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<str
  * Uses the daemon's long-lived Storage instance — no lock acquisition per call.
  * CLI processes never touch .storage-lock at all.
  */
+const BUILDER_RUN_READ_METHODS = new Set([
+  'listBuilderSessions', 'getBuilderSession', 'getActiveBuilderSessionForMember', 'listBuilders', 'getBuilder',
+]);
+
 export async function handleStorageCall(
   projectRoot: string,
   params: Record<string, unknown>,
@@ -4592,6 +5112,13 @@ export async function handleStorageCall(
   const handler = STORAGE_METHODS[method];
   if (!handler) {
     throw new RpcError(404, `Unknown storage method: ${method}`);
+  }
+
+  // Every read of builder runs (the rows, and the Builders listing that
+  // carries their badge) first settles runs whose container is gone, so the
+  // badge and the terminal read one answer (settleDeadBuilderSessions).
+  if (BUILDER_RUN_READ_METHODS.has(method)) {
+    await (await import('./builder-sessions')).settleDeadBuilderSessions(projectRoot);
   }
 
   // A builder session is its member's own view (./builder-sessions.ts):

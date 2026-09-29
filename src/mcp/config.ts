@@ -53,10 +53,56 @@ interface ClaudeSettings {
 }
 
 /**
+ * Who a `mcpServers.lazy` entry belongs to, read off the entry itself.
+ *
+ * A task entry names its task: every runner's `mcpServerConfig` writes
+ * `--task-id <uuid>`, so the id IS the owner record and nothing extra is
+ * stored. An entry with no `--task-id` is a builder's (the builder launch
+ * writes `mcp --daemon-config …` / `--builder-config …`) or a human's own —
+ * either way it is not a task supervisor's to replace.
+ */
+export type LazyMcpEntryOwner =
+  | { kind: 'task'; taskId: string; worktree?: string }
+  | { kind: 'other' };
+
+function argAfter(args: string[], flag: string): string | undefined {
+  const i = args.indexOf(flag);
+  return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
+}
+
+export function lazyMcpEntryOwner(entry: { args?: unknown }): LazyMcpEntryOwner {
+  const args = Array.isArray(entry.args) ? entry.args.filter((a): a is string => typeof a === 'string') : [];
+  const taskId = argAfter(args, '--task-id');
+  if (!taskId) return { kind: 'other' };
+  return { kind: 'task', taskId, worktree: argAfter(args, '--worktree') };
+}
+
+/** A task supervisor found someone else's `mcpServers.lazy` in its HOME. */
+export class ForeignMcpEntryError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ForeignMcpEntryError';
+  }
+}
+
+/**
  * Write the lazy MCP server entry to ~/.claude.json.
  *
  * Merges with any existing config (preserves other MCP servers and settings).
  * If the file doesn't exist, creates it with just the lazy MCP server entry.
+ *
+ * REFUSES to replace an entry that is not a task's (see `lazyMcpEntryOwner`):
+ * Claude Code reads ONE config per HOME, and on 2026-09-28 a supervisor that a
+ * test run started inside a builder container rewrote that builder's entry to a
+ * throwaway worktree — every lazy_* call the builder made afterwards failed
+ * against a healthy daemon. A task's supervisor never has a reason to find a
+ * builder's entry in its own HOME (task sandboxes never seed `mcpServers`), so
+ * finding one means the HOME is shared with something live: fail the turn and
+ * name both, never replace silently.
+ *
+ * Another TASK's entry is replaced. That is the host runner's ordinary shape —
+ * successive tasks' turns in one HOME — and a concurrent task in the same HOME
+ * is already refused on the serving side (`src/mcp/turn-identity.ts`).
  *
  * @param mcpServerConfig - The command and args for the MCP server, provided by the Runner.
  */
@@ -74,6 +120,19 @@ export async function writeMcpConfig(mcpServerConfig: { command: string; args: s
   // Ensure mcpServers object exists
   if (!config.mcpServers) {
     config.mcpServers = {};
+  }
+
+  const existing = config.mcpServers['lazy'];
+  const writer = lazyMcpEntryOwner(mcpServerConfig);
+  if (existing && writer.kind === 'task' && lazyMcpEntryOwner(existing).kind === 'other') {
+    throw new ForeignMcpEntryError(
+      `${claudeConfigPath} already has a lazy MCP entry that is not a task's — ` +
+      `${[existing.command, ...(existing.args ?? [])].join(' ')} — ` +
+      `and task ${writer.taskId} refuses to replace it. It is most likely a builder's or your own, ` +
+      `sharing this HOME with the task's supervisor; replacing it would cut that session off from lazy. ` +
+      `Run the task's supervisor with its own HOME (a test harness must give every launch a private HOME), ` +
+      `or remove the entry by hand if it is genuinely stale.`,
+    );
   }
 
   // Write the lazy MCP server entry

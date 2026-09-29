@@ -44,13 +44,14 @@ import { listInteractiveSessions, describeInteractiveSession } from '../../daemo
 import { startDaemonBackground } from '../../daemon/auto-start';
 import { getRunningCodeSha } from '../../daemon/code-version';
 import type { DaemonStatus } from '../../daemon/lifecycle';
-import { assertDaemonCredentials } from '../../daemon/credential-gate';
 import { collectDaemonStopInventory, confirmDaemonStop } from './daemon-pre-stop';
 import { commandLogs, logsUsage } from './logs';
 import { commandAutoBudget, autoBudgetUsage } from './auto-budget';
 import { commandDaemonConfig, daemonConfigUsage } from './daemon-config';
 import { commandResumeQueue, resumeQueueUsage } from './resume-queue';
 import { commandDaemonHealth, daemonHealthUsage } from './daemon-health';
+import { missingCredentialNotice } from '../../daemon/credential-gate';
+import { theme } from '../../render/theme';
 
 import { formatDaemonBuiltLine } from '../../utils/build-provenance';
 import { getSourceIdentity } from '../../utils/source-id';
@@ -166,12 +167,6 @@ async function daemonStart(args: string[]): Promise<void> {
   const projectRoot = resolveProjectRoot(parsed.flags);
 
   if (foreground) {
-    // Credential gate PRE-FLIGHT. startDaemonServer() enforces the same gate
-    // authoritatively, but running it here first means a foreground start
-    // refuses on the user's terminal before touching stale files or the log,
-    // with no marker-file round trip.
-    await assertDaemonCredentials(projectRoot);
-
     // Foreground mode: startDaemonServer() acquires the flock internally.
     // If lock held → throws "Already running." If not → starts. One path.
     //
@@ -183,6 +178,16 @@ async function daemonStart(args: string[]): Promise<void> {
     // against a daemon that was running fine. Nothing here needs the delete:
     // startDaemonServer() unlinks a stale socket and overwrites the PID file
     // itself, AFTER acquireDaemonLock has proved it owns the directory.
+    // Never a second daemon for one project, including a hand-typed foreground
+    // start. A background child was already checked by the CLI that spawned it.
+    if (process.env.LAZY_DAEMON_BACKGROUND !== '1') {
+      const { findForeignDaemon, foreignDaemonRefusal } = await import('../../daemon/foreign-daemon');
+      const foreign = await findForeignDaemon(projectRoot);
+      if (foreign) {
+        console.error(`Error: ${foreignDaemonRefusal(projectRoot, foreign)}`);
+        process.exit(1);
+      }
+    }
     console.log('Starting daemon in foreground mode...');
     const { startDaemonServer } = await import('../../daemon/server');
     const daemon = await startDaemonServer({ projectRoot });
@@ -432,11 +437,6 @@ async function waitForDaemonExit(
 }
 
 async function daemonRestart(args: string[]): Promise<void> {
-  // Credential gate PRE-FLIGHT, before the stop. Without it, a restart run from
-  // a shell that has no credential would kill a perfectly good daemon and only
-  // then discover it cannot start a replacement — leaving the project with no
-  // daemon at all. Same reasoning as `lazy upgrade`'s preflight: check what can
-  // refuse us BEFORE doing anything destructive.
   const parsed = parseFlags(args, [
     { name: 'foreground', takesValue: false },
     { name: 'background', takesValue: false },
@@ -444,7 +444,11 @@ async function daemonRestart(args: string[]): Promise<void> {
     { name: 'yes', aliases: ['y'], takesValue: false },
   ], 'daemon restart');
   const projectRoot = resolveProjectRoot(parsed.flags);
-  await assertDaemonCredentials(projectRoot);
+
+  // One line, never a refusal: the new daemon inherits THIS shell, which may
+  // not carry a credential the running one had (a daemon needs none to run).
+  const credentialNotice = await missingCredentialNotice(projectRoot);
+  if (credentialNotice) console.error(theme.warning(credentialNotice));
 
   // Pre-stop courtesy, in restart's own terms. A restart is a stop with extra
   // steps and has exactly the same blast radius, so it must not be quieter than

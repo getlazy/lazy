@@ -34,12 +34,34 @@ function resolveToolset(opts?: ToolSurfaceOpts): McpToolset {
   return opts?.readOnly === true ? 'read' : 'full';
 }
 
+/**
+ * Arguments only the builder may pass, withheld from a task agent's schema so
+ * it is neither offered them nor pays for them in context. The handlers refuse
+ * them from an agent regardless — this is advertisement, not enforcement.
+ * `past_usage_pause`: letting a task past the usage pause is a person's or the
+ * builder's call, never a task agent's (src/daemon/usage-pause.ts).
+ */
+const BUILDER_ONLY_ARGS: readonly string[] = ['past_usage_pause'];
+
+/** `tool`'s definition as `role` is served it (the MCP server registers this one). */
+export function definitionForRole(tool: McpTool, role: McpRole): McpTool {
+  return role === 'builder' ? tool : withoutBuilderOnlyArgs(tool);
+}
+
+function withoutBuilderOnlyArgs(tool: McpTool): McpTool {
+  const props = tool.inputSchema.properties;
+  if (!props || !BUILDER_ONLY_ARGS.some((k) => k in props)) return tool;
+  const kept = Object.fromEntries(Object.entries(props).filter(([k]) => !BUILDER_ONLY_ARGS.includes(k)));
+  return { ...tool, inputSchema: { ...tool.inputSchema, properties: kept } };
+}
+
 /** Tools advertised to `role` under the given toolset. */
 export function toolsForRole(role: McpRole, opts?: ToolSurfaceOpts): McpTool[] {
   const toolset = resolveToolset(opts);
-  return allTools.filter(
+  const tools = allTools.filter(
     (t) => isToolForRole(t.name, role) && isToolAllowedOnToolset(t.name, toolset),
   );
+  return tools.map((t) => definitionForRole(t, role));
 }
 
 /** Names of the tools advertised to `role`, in `allTools` order. */

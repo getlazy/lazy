@@ -10,6 +10,7 @@ import { mkdtemp, rm, writeFile, readFile, realpath } from 'fs/promises';
 import { tmpdir, homedir } from 'os';
 import { waitForDaemon, readPid, getDaemonDir, SIGNAL_SHUTDOWN_BUDGET_MS } from '../../src/daemon';
 import { TEST_PARENT_PID_ENV } from '../../src/daemon/test-parent-watch';
+import { TEST_AGENT_HOME_ENV } from '../../src/mcp/test-home-guard';
 import {
   registerTestDaemonRoot,
   unregisterTestDaemonRoot,
@@ -799,6 +800,8 @@ export async function setupTestLazy(options: SetupOptions = {}): Promise<TestCon
     // died of its own watchdog instead (daemon-restart-children).
     agentHome = await mkdtemp(join(tmpdir(), 'lazy-e2e-home-'));
     baseEnv.HOME = agentHome;
+    // Declared, so a supervisor can prove its HOME is this private one (src/mcp/test-home-guard.ts).
+    baseEnv[TEST_AGENT_HOME_ENV] = agentHome;
     baseEnv.LAZY_DAEMON_BASE_DIR =
       process.env.LAZY_DAEMON_BASE_DIR || join(process.env.HOME ?? homedir(), '.lazy', 'daemon');
   } else if (options.allowHostRunner) {

@@ -1,10 +1,12 @@
 /**
- * A release hub's review / `lazy diff` shows accepted children plus the hub's
- * own direct changes — not the union of every child's files against main.
+ * A hub's review / `lazy diff` shows its WHOLE branch — accepted children's
+ * files and its own direct changes together.
  *
- * Reproduces fix-hub-review-renders-whole-release: the review Changes block
- * used to render `main...lazy/<hub>` (every accepted squash), which on
- * release-v022 was 1,843 files / 12.4 MB in one synchronous response.
+ * INVARIANT: a task's diff is its whole branch on every surface. Engineer
+ * decision 2026-09-25, reversing the 2026-09-07 exclusion of accepted
+ * children's files: hiding them made a landing hub diff as "no changes".
+ * Size is solved by the progressive Changes tab
+ * (test/e2e/hub-all-children-changes.test.ts), not by hiding files.
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { writeFileSync } from 'fs';
@@ -44,7 +46,7 @@ async function addCommit(ctx: TestContext, taskId: string, file: string, body: s
   ctx.git('-C', worktree, 'commit', '-m', message);
 }
 
-describe('hub review shows direct changes, not the whole branch', () => {
+describe('hub review shows the whole branch', () => {
   let ctx: TestContext;
   let base: string;
   let fetch: DashboardFetch;
@@ -64,7 +66,7 @@ describe('hub review shows direct changes, not the whole branch', () => {
     await ctx.cleanup();
   });
 
-  test('Changes links to grouped Subtasks; accepted-child files drop out of the hub diff', async () => {
+  test('Changes links to grouped Subtasks; accepted-child files stay in the hub diff', async () => {
     const hubId = await startBlocked(ctx, 'Release hub', 'Hub work');
 
     const childA = await ctx.lazy(['create', '--goal', 'Hub child A', '--prompt', 'Add child-a', '--parent', hubId]);
@@ -107,22 +109,22 @@ describe('hub review shows direct changes, not the whole branch', () => {
     const childBFull = findFullTaskId(ctx.root, childBId);
     const liveFull = findFullTaskId(ctx.root, liveId);
 
-    const scoped = await ctx.lazy(['diff', hubId, '--full']);
-    expectSuccess(scoped);
-    expect(scoped.stdout).toContain('hub-direct.txt');
-    expect(scoped.stdout).not.toContain('hub-child-a.txt');
-    expect(scoped.stdout).not.toContain('hub-child-b.txt');
-
-    const whole = await ctx.lazy(['diff', hubId, '--full', '--full-branch']);
+    // INVARIANT: the default diff is the whole branch — children included.
+    const whole = await ctx.lazy(['diff', hubId, '--full']);
     expectSuccess(whole);
     expect(whole.stdout).toContain('hub-direct.txt');
     expect(whole.stdout).toContain('hub-child-a.txt');
     expect(whole.stdout).toContain('hub-child-b.txt');
 
+    // `--full-branch` is a harmless no-op kept for old scripts.
+    const legacy = await ctx.lazy(['diff', hubId, '--full', '--full-branch']);
+    expectSuccess(legacy);
+    expect(legacy.stdout).toBe(whole.stdout);
+
     const stat = await ctx.lazy(['diff', hubId]);
     expectSuccess(stat);
-    expect(stat.stdout).toContain('Direct changes only');
-    expect(stat.stdout).toContain('--full-branch');
+    expect(stat.stdout).toContain('hub-child-a.txt');
+    expect(stat.stdout).not.toContain('Direct changes only');
 
     const html = await (await fetch(`${base}/tasks/${hubId}/changes`)).text();
     expect(html).toContain('rv-hub-children');
@@ -130,8 +132,8 @@ describe('hub review shows direct changes, not the whole branch', () => {
     expect(html).toContain('grouped by status');
     expect(html).not.toContain('Accepted subtasks');
     expect(html).toContain('data-file="hub-direct.txt"');
-    expect(html).not.toContain('data-file="hub-child-a.txt"');
-    expect(html).not.toContain('data-file="hub-child-b.txt"');
+    expect(html).toContain('data-file="hub-child-a.txt"');
+    expect(html).toContain('data-file="hub-child-b.txt"');
 
     const subtasks = await (await fetch(`${base}/tasks/${hubId}/subtasks`)).text();
     expect(subtasks).toContain('Hub child A');

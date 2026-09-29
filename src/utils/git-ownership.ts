@@ -39,8 +39,26 @@ export function isDubiousOwnershipError(stderr: string): boolean {
  * human would search for. This adds what lazy knows and git cannot: that lazy
  * owns the directory, and where the trust is actually configured.
  */
-export function explainDubiousOwnership(cwd: string | undefined, inContainer: boolean): string {
+export function explainDubiousOwnership(
+  cwd: string | undefined,
+  inContainer: boolean,
+  uid: number | undefined = process.getuid?.(),
+): string {
   const where = cwd ? `\`${cwd}\`` : 'that path';
+
+  // A ROOT lazy on Linux (the Teams microVM guest, a Linux self-host) hands each
+  // task worktree to the container user on purpose, so "the owner should be
+  // the user that runs lazy" is exactly the wrong advice there.
+  if (!inContainer && uid === 0) {
+    return [
+      "lazy: git refused this repository because the directory's owner does not match the",
+      `user running git. lazy runs as root here, and ${where} is a task worktree it handed to`,
+      'the agent container\'s user on purpose, so that ownership is correct. What is missing is',
+      'the system git config that lets root git work in those worktrees: in Lazy Teams it ships',
+      'in the daemon image, so this machine is running an older image — update the install and',
+      'let the project restart onto the current image.',
+    ].join('\n');
+  }
 
   if (inContainer) {
     return [

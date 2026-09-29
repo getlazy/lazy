@@ -418,3 +418,117 @@ describe('lazy doctor: remedy dispatch', () => {
     expect(result.stdout + result.stderr).not.toContain("binary 'bun' not found");
   });
 });
+
+describe('lazy doctor --repair-git-pointers', () => {
+  let ctx: TestContext;
+
+  beforeEach(async () => { ctx = await setupTestLazy(); });
+  afterEach(async () => { await ctx.cleanup(); });
+
+  /** A real task worktree whose commondir a task redirected elsewhere. */
+  async function seedTamperedWorktree(): Promise<string> {
+    const wt = join(ctx.root, '.lazy', 'worktrees', 'tampered-task');
+    await ctx.git('worktree', 'add', '-q', '-b', 'lazy/tampered-task', wt);
+    const gitdir = join(ctx.root, '.git', 'worktrees', 'tampered-task');
+    await writeFile(join(gitdir, 'commondir'), '/somewhere/the/task/controls\n');
+    return gitdir;
+  }
+
+  test('says so plainly when every worktree is intact', async () => {
+    const result = await ctx.lazy(['doctor', '--repair-git-pointers']);
+    expectSuccess(result);
+    expectOutput(result, 'nothing to repair');
+  });
+
+  // INVARIANT: a tampered pointer is an ERROR in the plain report, naming the
+  // worktree and the remedy — the human must hear about it before they run
+  // git in that worktree themselves.
+  test('the plain report flags a tampered worktree as an error, and --yes repairs it', async () => {
+    const gitdir = await seedTamperedWorktree();
+
+    const report = await ctx.lazy(['doctor']);
+    expectOutput(report, 'tampered-task');
+    expectOutput(report, 'lazy doctor --repair-git-pointers');
+
+    const dry = await ctx.lazy(['doctor', '--repair-git-pointers', '--dry-run']);
+    expectSuccess(dry);
+    expectOutput(dry, 'tampered-task');
+    expectOutput(dry, 'Dry run — nothing repaired');
+    expect(await Bun.file(join(gitdir, 'commondir')).text()).toBe('/somewhere/the/task/controls\n');
+
+    const refused = await ctx.lazy(['doctor', '--repair-git-pointers']);
+    expectOutput(refused, 'Aborted — nothing was repaired.');
+
+    const result = await ctx.lazy(['doctor', '--repair-git-pointers', '--yes']);
+    expectSuccess(result);
+    expectOutput(result, 'Repaired tampered-task');
+    expectOutput(result, 'Repaired 1 of 1 worktree(s).');
+    expect(await Bun.file(join(gitdir, 'commondir')).text()).toBe('../..\n');
+  });
+});
+
+describe('lazy doctor --repair-git-pointers — redirected HEAD', () => {
+  let ctx: TestContext;
+
+  beforeEach(async () => { ctx = await setupTestLazy(); });
+  afterEach(async () => { await ctx.cleanup(); });
+
+  // INVARIANT: a task worktree whose HEAD a task pointed at another branch is
+  // repaired by pointing HEAD back at the task's own branch — HEAD only, no
+  // commit, branch or working file touched (src/git/worktree-pointers.ts).
+  test('points a redirected HEAD back at the task branch', async () => {
+    const taskId = await createTask(ctx, 'Head work', 'Do the work');
+    expectSuccess(await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS));
+    const wt = worktreePathFor(ctx.root, taskId);
+    const gitdir = (await Bun.file(join(wt, '.git')).text()).trim().replace(/^gitdir: /, '');
+    const own = await Bun.file(join(gitdir, 'HEAD')).text();
+    await writeFile(join(gitdir, 'HEAD'), 'ref: refs/heads/main\n');
+
+    // The refusal says "see lazy doctor": the plain report must name it.
+    const report = await ctx.lazy(['doctor']);
+    expectOutput(report, "HEAD is on the task's own branch");
+    expectOutput(report, 'points at branch main');
+    expectOutput(report, 'lazy doctor --repair-git-pointers');
+
+    const dry = await ctx.lazy(['doctor', '--repair-git-pointers', '--dry-run']);
+    expectSuccess(dry);
+    expectOutput(dry, 'points at branch main');
+    expect(await Bun.file(join(gitdir, 'HEAD')).text()).toBe('ref: refs/heads/main\n');
+
+    const result = await ctx.lazy(['doctor', '--repair-git-pointers', '--yes']);
+    expectSuccess(result);
+    expectOutput(result, 'Repaired 1 of 1 worktree(s).');
+    expect(await Bun.file(join(gitdir, 'HEAD')).text()).toBe(own);
+  });
+});
+
+describe('nested git repositories in a task worktree', () => {
+  let ctx: TestContext;
+
+  beforeEach(async () => { ctx = await setupTestLazy(); });
+  afterEach(async () => { await ctx.cleanup(); });
+
+  // INVARIANT: a repository a task planted below its worktree (`<sub>/.git`,
+  // whose config can run code for the human's git or IDE there) is an ERROR in
+  // the plain report naming the path, and the remedy MOVES it aside — never
+  // deletes it, since it is evidence and may hold work.
+  test('doctor reports a planted nested repository, and --repair-git-pointers quarantines it', async () => {
+    const wt = join(ctx.root, '.lazy', 'worktrees', 'nesting-task');
+    await ctx.git('worktree', 'add', '-q', '-b', 'lazy/nesting-task', wt);
+    await mkdir(join(wt, 'sub', '.git'), { recursive: true });
+    await writeFile(join(wt, 'sub', '.git', 'config'), '[core]\n\tfsmonitor = /tmp/payload.sh\n');
+
+    const report = await ctx.lazy(['doctor']);
+    expectOutput(report, 'nesting-task: sub/.git');
+    expectOutput(report, 'lazy doctor --repair-git-pointers');
+
+    const result = await ctx.lazy(['doctor', '--repair-git-pointers', '--yes']);
+    expectSuccess(result);
+    expectOutput(result, 'Quarantined in nesting-task: sub/.git');
+    expect(await stat(join(wt, 'sub', '.git')).then(() => true, () => false)).toBe(false);
+    expect(await Bun.file(join(wt, 'sub', '.git.lazy-quarantine-1', 'config')).text()).toContain('fsmonitor');
+
+    const again = await ctx.lazy(['doctor', '--repair-git-pointers']);
+    expectOutput(again, 'nothing to repair');
+  });
+});

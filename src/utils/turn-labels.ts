@@ -25,6 +25,8 @@
  * we failed to record, i.e. one written before these fields existed.
  */
 
+import { HARNESS_PICKS_MODEL_NAMES } from '../config/default-models';
+
 /**
  * The subset of a turn these labels are derived from.
  *
@@ -128,9 +130,6 @@ export function formatTurnModelLabel(requested?: string, actual?: string): strin
  */
 const VENDOR_ONLY_PREFIXES = new Set(['claude', 'anthropic', 'google', 'openai']);
 
-/** Cursor's "pick for me" names — no family, and never a mismatch warning. */
-const CURSOR_PICKS_NAMES = new Set(['auto', 'default']);
-
 interface ModelHint {
   /** First non-vendor alphabetic token (`opus`, `sonnet`, `grok`, …). */
   family?: string;
@@ -146,17 +145,17 @@ interface ModelHint {
 export function parseModelHint(name: string): ModelHint {
   const tokens = normalizeModelKey(name).split('-').filter(Boolean);
   if (tokens.length === 0) return {};
-  if (tokens.length === 1 && CURSOR_PICKS_NAMES.has(tokens[0]!)) return {};
+  if (tokens.length === 1 && HARNESS_PICKS_MODEL_NAMES.has(tokens[0]!)) return {};
 
   const hasLaterFamily = (from: number): boolean =>
-    tokens.slice(from + 1).some((t) => /^[a-z]/.test(t) && !CURSOR_PICKS_NAMES.has(t));
+    tokens.slice(from + 1).some((t) => /^[a-z]/.test(t) && !HARNESS_PICKS_MODEL_NAMES.has(t));
 
   let family: string | undefined;
   let familyIndex = -1;
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i]!;
     if (!/^[a-z]/.test(token)) continue;
-    if (CURSOR_PICKS_NAMES.has(token)) continue;
+    if (HARNESS_PICKS_MODEL_NAMES.has(token)) continue;
     if (VENDOR_ONLY_PREFIXES.has(token) && hasLaterFamily(i)) continue;
     family = token;
     familyIndex = i;

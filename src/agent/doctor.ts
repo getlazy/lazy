@@ -34,6 +34,8 @@ import { spawn } from '../utils/spawn';
 import { getHome } from '../utils/home';
 import { TOOL_ACCESS, isReadOnlyTool } from '../mcp/tool-access';
 import { isToolForRole } from '../mcp/tool-roles';
+import { MEMBER_SESSION_MARKER } from './member-session-marker';
+import { SCRATCH_ENV_VAR } from '../builder/scratch';
 
 /** One diagnosed link in the chain. */
 export interface DoctorCheck {
@@ -61,6 +63,8 @@ export interface DoctorCheck {
 export interface AgentDoctorResult {
   host: string;
   taskId: string | null;
+  /** A member's own terminal container, where lazy's MCP is absent by design. */
+  memberSession?: boolean;
   checks: DoctorCheck[];
   /** True when every check concluded ok (warnings do not fail). */
   ok: boolean;
@@ -132,8 +136,29 @@ interface DaemonConfigFacts {
   target?: string;
 }
 
+/**
+ * A builder session: the builder launch sets the scratch dir env var and hands
+ * its daemon config to the builder supervisor as argv — never through
+ * LAZY_DAEMON_CONFIG, which only task launches set.
+ */
+function isBuilderSession(): boolean {
+  return !process.env.LAZY_DAEMON_CONFIG && !!process.env[SCRATCH_ENV_VAR];
+}
+
 async function checkDaemonConfig(): Promise<{ check: DoctorCheck; facts: DaemonConfigFacts }> {
   const path = process.env.LAZY_DAEMON_CONFIG;
+  if (!path && isBuilderSession()) {
+    return {
+      facts: {},
+      check: {
+        id: 'daemon-config',
+        label: 'LAZY_DAEMON_CONFIG',
+        ok: true,
+        detail: 'not applicable — a builder gets its daemon config as the builder supervisor\'s argv',
+        data: { notApplicable: true },
+      },
+    };
+  }
   if (!path) {
     return {
       facts: {},
@@ -281,6 +306,34 @@ async function checkClaudeJson(
     );
   }
 
+  // An entry some OTHER process wrote. Claude Code reads one ~/.claude.json per
+  // HOME, so a stray `lazy mcp` started in this container (a leaked test
+  // supervisor, a hand-run server) can overwrite the entry lazy wrote and
+  // re-point this session's tools at a project that no longer exists: every
+  // call then fails as if the daemon were down. Seen 2026-09-28 in a builder.
+  //
+  // Only shapes lazy never writes count. A host-process task entry legitimately
+  // has no --daemon-config (it runs tools in-process), so its absence alone
+  // proves nothing for a task; a BUILDER entry always carries --daemon-config
+  // (or the legacy --builder-config) and never a --task-id.
+  const foreign: string[] = [];
+  const worktreeArg = argValue(entry.args, '--worktree');
+  if (worktreeArg && !(await exists(worktreeArg))) {
+    foreign.push(`--worktree '${worktreeArg}' does not exist in this container`);
+  }
+  if (facts.path && daemonConfigArg && daemonConfigArg !== facts.path) {
+    foreign.push(`--daemon-config '${daemonConfigArg}' is not this session's config ${facts.path}`);
+  }
+  if (isBuilderSession()) {
+    if (taskIdArg) {
+      foreign.push(`--task-id ${taskIdArg} on a builder session, which is scoped to no task`);
+    }
+    if (!daemonConfigArg && !argValue(entry.args, '--builder-config')) {
+      foreign.push('no --daemon-config: not the entry lazy writes for a builder');
+    }
+  }
+  problems.push(...foreign);
+
   const argvLine = [entry.command, ...entry.args].join(' ');
   if (problems.length > 0) {
     return {
@@ -290,9 +343,13 @@ async function checkClaudeJson(
         label: '~/.claude.json mcpServers.lazy',
         ok: false,
         detail: `${argvLine}\n    ${problems.join('\n    ')}`,
-        remedy:
-          'Restart the task so the host rewrites ~/.claude.json and remounts the config; if the ' +
-          'command itself does not resolve, the lazy-agent binary is missing from the image.',
+        remedy: foreign.length > 0
+          ? 'Another process overwrote this entry. Find it with ' +
+            `\`ps -eo pid,args | grep ' mcp '\`${worktreeArg ? ` (look for --worktree ${worktreeArg})` : ''} ` +
+            'and stop it, then restart this session (relaunch the builder, or stop and start the ' +
+            'task): lazy rewrites ~/.claude.json at launch, and the entry points back at this session.'
+          : 'Restart the task so the host rewrites ~/.claude.json and remounts the config; if the ' +
+            'command itself does not resolve, the lazy-agent binary is missing from the image.',
         data: { path, command: entry.command, args: entry.args, problems },
       },
     };
@@ -852,6 +909,32 @@ async function firstStdoutLine(
 export async function runAgentDoctor(opts: AgentDoctorOptions = {}): Promise<AgentDoctorResult> {
   const checks: DoctorCheck[] = [];
 
+  // A member's own terminal container has no lazy MCP server, no daemon
+  // config and no lazy tool permissions ON PURPOSE (it only holds their
+  // terminals). Reporting those as three failures told a member reading doctor
+  // their install was broken; they are shown as not applicable instead.
+  // Only when LAZY_DAEMON_CONFIG is unset too: a member container never has
+  // it, and a task container (whose home an agent can write) always does, so
+  // a planted marker cannot hide a real MCP failure.
+  if (!process.env.LAZY_DAEMON_CONFIG && (await exists(join(getHome(), MEMBER_SESSION_MARKER)))) {
+    const na = (id: string, label: string): DoctorCheck => ({
+      id, label, ok: true,
+      detail: 'not applicable — member terminal session: no MCP, no daemon config by design',
+      data: { notApplicable: true },
+    });
+    return {
+      host: hostname(),
+      taskId: null,
+      memberSession: true,
+      checks: [
+        na('daemon-config', 'LAZY_DAEMON_CONFIG'),
+        na('claude-json', '~/.claude.json mcpServers.lazy'),
+        na('tool-permissions', '~/.claude/settings.json permissions'),
+      ],
+      ok: true,
+    };
+  }
+
   const { check: configCheck, facts } = await checkDaemonConfig();
   checks.push(configCheck);
 
@@ -878,11 +961,12 @@ export function formatAgentDoctorReport(result: AgentDoctorResult): string {
   // Header first so a pasted transcript identifies itself without the reader
   // having to ask "which container was this?".
   lines.push(`lazy-agent doctor — container ${result.host}`);
-  lines.push(`task: ${result.taskId ?? '(none — builder or project-wide mode)'}`);
+  if (result.memberSession) lines.push('member terminal session: no MCP, no daemon config by design');
+  else lines.push(`task: ${result.taskId ?? '(none — builder or project-wide mode)'}`);
   lines.push('');
 
   for (const check of result.checks) {
-    const mark = check.ok ? (check.warning ? '!' : '✓') : '✗';
+    const mark = check.data?.notApplicable ? '–' : check.ok ? (check.warning ? '!' : '✓') : '✗';
     lines.push(`${mark} ${check.label}`);
     for (const line of check.detail.split('\n')) lines.push(`    ${line}`);
     if (check.remedy && (!check.ok || check.warning)) lines.push(`    → ${check.remedy}`);
@@ -890,7 +974,7 @@ export function formatAgentDoctorReport(result: AgentDoctorResult): string {
   }
 
   if (result.ok) {
-    lines.push('All checks passed.');
+    lines.push(result.memberSession ? 'Nothing to check: lazy\'s tools are not part of a member terminal.' : 'All checks passed.');
   } else {
     const failed = result.checks.filter(c => !c.ok).map(c => c.label);
     lines.push(`FAILED: ${failed.join(', ')}`);

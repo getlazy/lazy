@@ -1018,7 +1018,7 @@ Options:
   --parent <task>   Restrict the selection to this task's direct children
   --tag <tag>       Restrict the selection to tasks carrying this tag
   --pipeline        Start the NEXT queued task while you review the current one
-  --model <model>   Override model for feedback turns (e.g. opus, sonnet, claude-opus-5)
+  --model <model>   Override model for feedback turns (e.g. opus, sonnet, claude-opus-5-5)
   --follow          Wait for agent after giving feedback
 
 Examples:

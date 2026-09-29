@@ -106,9 +106,16 @@ export const USAGE_PAUSE_OVERRIDE_KEY = 'usage_pause_threshold';
 // --- The one-shot override (daemon memory only) ---
 
 /**
- * INVARIANT: the override is good for exactly ONE launch — the first start,
- * unblock, resume, review, ask, conflict sync, review-conversation turn or
- * one-shot a PERSON asks for that it LETS PAST A PAUSE. It is gone
+ * SCOPE: this daemon-wide override lets through only a launch BESIDE any task —
+ * a review-conversation turn, a one-shot (`lazy report`, `lazy ask` on a
+ * stored conversation), a chat, a branchless pair. A TASK's launch is let
+ * through only by that task's own allowance (see "The per-task allowance"
+ * below); a daemon-wide value there could be spent by a stray launch on some
+ * other task.
+ *
+ * INVARIANT: the override is good for exactly ONE launch — the first
+ * review-conversation turn or one-shot a PERSON asks for that it LETS PAST A
+ * PAUSE. It is gone
  * the moment it does that, reverting to lazy.toml. One use is one LAUNCH, not
  * one window: an override that lasted the rest of a window would be a second,
  * silent threshold.
@@ -118,6 +125,7 @@ export const USAGE_PAUSE_OVERRIDE_KEY = 'usage_pause_threshold';
  * usage signal, pausing off), and one it would not let through either (an
  * override below the reading). Otherwise a start on some other task would
  * spend the override its setter is about to use on the paused one.
+ * (The builder may set a TASK's allowance, below; this one stays a person's.)
  *
  * Taken synchronously, after the verdict and only if it is still the same
  * pending value, so two launches racing for it cannot both use it. Like every
@@ -164,8 +172,131 @@ export function mayUseUsagePauseOverride(actor: ActorInput | undefined): boolean
 export function resetUsagePauseStateForTest(): void {
   override = null;
   overrideSetAt = null;
+  taskAllowances.clear();
   postedEpisodes.clear();
   oneshotAllowances.clear();
+}
+
+// --- The per-task allowance: "let this task's next turn through" ---
+
+/**
+ * INVARIANT: a TASK's launch is let past a pause only by an allowance for THAT
+ * task, and the allowance is good for exactly ONE launch — the first launch of
+ * that task (a start, unblock, resume, review, ask, conflict sync, pair, or one
+ * of the daemon's own: auto-resume, auto-delivery, a review's auto-fix, a held
+ * subtask start) that it LETS PAST A PAUSE. It is gone the moment it does that.
+ * A launch the configured threshold already lets through leaves it pending.
+ * One launch, not one window: an allowance that lasted the rest of a window
+ * would be a second, silent threshold.
+ *
+ * INVARIANT: an allowance is set by a PERSON or by the BUILDER, per task —
+ * never by a task agent (engineer decision 2026-09-26). The daemon-wide
+ * override this replaced for task launches could be spent by a stray launch on
+ * any other task; scoped to one task, it lifts exactly what somebody asked to
+ * lift, so the builder acting on the engineer's behalf may set it too. A task
+ * agent may not: a model that could lift the pause on the work it is driving
+ * — its own subtasks included — turns the pause into a suggestion. So
+ * {@link mayAllowTaskPastUsagePause} is the one rule, every surface (the CLI's
+ * launch flag, the dashboard, Lazy Teams, the builder's MCP tools) reaches it
+ * through the daemon's RPC, and the MCP door refuses it on a task-scoped token
+ * before it gets here. Who may USE it is not a separate question: whatever
+ * launches that task next is what was asked for.
+ *
+ * Taken synchronously, so two launches of one task racing for it cannot both
+ * use it — and only when a launch COMMITS: a daemon launch's hold check
+ * (`usagePauseHold`) only counts it, and the launch takes it after its last
+ * gate (`takeTaskAllowanceAtLaunch`, or `assertTurnStartAllowed` on the
+ * explicit path), so a pass that checks twice or then skips does not burn it. It lives only in this process: a daemon restart drops it, like every
+ * `lazy daemon config` override. Unreadable saved readings are never lifted by
+ * it (see usagePauseForSpend) — a person fixes the file.
+ */
+export interface TaskUsagePauseAllowance {
+  /** When it was set (unix ms). */
+  setAt: number;
+  /** Who set it, for the surfaces that show it: an email, else the channel. */
+  setBy: string | null;
+  /** Identifies this setting, so a launch that set it can clear only its own. */
+  id: string;
+}
+
+const taskAllowances = new Map<string, TaskUsagePauseAllowance>();
+
+/** May this channel let a task's next turn past the pause? A person or the builder; never an agent. */
+export function mayAllowTaskPastUsagePause(actor: ActorInput | undefined): boolean {
+  const role = actorRole(actor);
+  return role === 'human' || role === 'builder';
+}
+
+/** Set the allowance for `taskId` (a full id), refusing a channel that may not. */
+export function allowTaskPastUsagePause(
+  taskId: string,
+  actor: ActorInput | undefined,
+  now: number = Date.now(),
+): TaskUsagePauseAllowance {
+  if (!mayAllowTaskPastUsagePause(actor)) {
+    throw new RpcError(
+      403,
+      `The usage pause was not lifted for this task: only a person or the builder may let a task's ` +
+        `next turn through, and this request came from ` +
+        `${actorRole(actor) ? `the '${actorRole(actor)}' channel` : 'no named channel'}.`,
+    );
+  }
+  const allowance = { setAt: now, setBy: actorEmail(actor) ?? actorRole(actor) ?? null, id: randomUUID() };
+  taskAllowances.set(taskId, allowance);
+  logger.info(`usage pause: ${allowance.setBy ?? 'somebody'} let the next turn of ${taskId} through the pause`);
+  return allowance;
+}
+
+/** Drop the allowance for `taskId`; with `id`, only if it is still that setting. */
+export function clearTaskUsagePauseAllowance(taskId: string, id?: string): void {
+  const current = taskAllowances.get(taskId);
+  if (!current || (id !== undefined && current.id !== id)) return;
+  taskAllowances.delete(taskId);
+}
+
+/** The pending allowance for `taskId`, or null. */
+export function taskUsagePauseAllowance(taskId: string): TaskUsagePauseAllowance | null {
+  return taskAllowances.get(taskId) ?? null;
+}
+
+/** Take the allowance (see the invariant): true when there was one to take. */
+function takeTaskAllowance(taskId: string, what: string): boolean {
+  const current = taskAllowances.get(taskId);
+  if (!current) return false;
+  taskAllowances.delete(taskId);
+  logger.info(`usage pause: the allowance set by ${current.setBy ?? 'somebody'} let ${what} past the pause`);
+  return true;
+}
+
+/**
+ * Take `task`'s allowance at the moment a DAEMON-started launch commits — after
+ * every gate that could still skip it (budget, lock, runner), right before the
+ * agent is launched. Taken only when the configured threshold pauses the launch
+ * (so an unpaused launch leaves it for the one it was meant for), and never past
+ * unreadable readings (which usagePauseHold already refused). See "The per-task
+ * allowance".
+ */
+export async function takeTaskAllowanceAtLaunch(projectRoot: string, task: Task, what: string): Promise<void> {
+  if (!taskAllowances.has(task.id)) return;
+  const config = await loadConfig(projectRoot);
+  const pause = await usagePauseForTask(projectRoot, config, task);
+  if (!pause || pause.verdict.storeError) return;
+  takeTaskAllowance(task.id, `the ${what} of ${displayId(task)}`);
+}
+
+/**
+ * Is a turn of `task` held back right now, counting a pending allowance as the
+ * launch would (never taking it)? For the loops that decide whether to offer a
+ * held launch at all.
+ */
+async function pausedDespiteAllowance(
+  projectRoot: string,
+  config: ResolvedConfig,
+  task: Task,
+): Promise<boolean> {
+  const pause = await usagePauseForTask(projectRoot, config, task);
+  if (!pause) return false;
+  return !!pause.verdict.storeError || !taskAllowances.has(task.id);
 }
 
 // --- Which credential a turn spends ---
@@ -438,6 +569,28 @@ const NOT_DONE: Record<UsagePauseVerb, string> = {
   chat: 'opened for a chat',
 };
 
+/** Launch verbs whose CLI command and builder MCP tool carry the per-task allowance themselves. */
+const ALLOWANCE_FLAG_VERBS: ReadonlySet<UsagePauseVerb> = new Set(['start', 'unblock', 'resume', 'review', 'ask']);
+/** Launch verbs whose builder MCP tool takes `past_usage_pause` (src/mcp/tools.ts). */
+const ALLOWANCE_MCP_VERBS: ReadonlySet<UsagePauseVerb> = new Set(['start', 'unblock', 'resume', 'review', 'ask']);
+
+/**
+ * How a refusal says to let THIS task's next turn through: the builder's MCP
+ * tool parameter, or a person's CLI flag (every surface is a client of the same
+ * allowance — the dashboard and Lazy Teams offer it as a button beside the
+ * refusal).
+ */
+export function usagePauseRetryCommand(verb: UsagePauseVerb, task: string, actor: ActorInput | undefined): string {
+  if (actorRole(actor) === 'builder') {
+    return ALLOWANCE_MCP_VERBS.has(verb)
+      ? `call lazy_${verb} on ${task} again with past_usage_pause: true`
+      : `run \`lazy daemon config set ${USAGE_PAUSE_OVERRIDE_KEY} off --task ${task}\` and retry`;
+  }
+  return ALLOWANCE_FLAG_VERBS.has(verb)
+    ? `lazy ${verb} ${task} --past-usage-pause`
+    : `lazy daemon config set ${USAGE_PAUSE_OVERRIDE_KEY} off --task ${task}`;
+}
+
 /**
  * The gate an explicit launch of a TURN of `task` passes before it writes
  * anything: start, unblock, resume — and a review, an ask, or the conflict
@@ -478,6 +631,7 @@ export async function assertTurnStartAllowed(
     what: `the ${input.verb} of ${displayId(task)}`,
     refused: `Task ${displayId(task)} was not ${NOT_DONE[input.verb]}`,
     note: input.note,
+    task: { id: task.id, retry: usagePauseRetryCommand(input.verb, displayId(task), input.actor) },
   });
 }
 
@@ -625,11 +779,32 @@ async function assertSpendAllowed(input: {
   what: string;
   refused: string;
   note?: string;
+  /**
+   * A launch of this TASK: judged against the task's own allowance, never the
+   * daemon-wide override (see "The per-task allowance"). `retry` is the command
+   * a refusal names for letting it through.
+   */
+  task?: { id: string; retry: string };
 }): Promise<void> {
   // The configured verdict first: a launch it already allows never touches the
   // override (see the invariant above).
   const pause = await input.judge();
   if (!pause) return;
+  if (input.task) {
+    const offer = !input.daemonLaunch && mayAllowTaskPastUsagePause(input.actor);
+    if (pause.verdict.storeError) {
+      throw usagePauseRefusal(pause.verdict, { refused: input.refused, note: input.note, human: offer });
+    }
+    if (taskAllowances.has(input.task.id)) {
+      if (input.peek) return;
+      if (takeTaskAllowance(input.task.id, input.what)) return;
+    }
+    throw usagePauseRefusal(pause.verdict, {
+      refused: input.refused, note: input.note, human: offer,
+      taskRetry: offer ? input.task.retry : undefined,
+      builder: actorRole(input.actor) === 'builder',
+    });
+  }
   // Only a person's own launch is offered the override — never the builder, an
   // agent, an unattributed call or a daemon-started launch, whatever actor it
   // is attributed to (see the override invariant above).
@@ -668,8 +843,32 @@ async function assertSpendAllowed(input: {
  */
 export function usagePauseRefusal(
   verdict: UsagePauseVerdict,
-  input: { refused: string; note?: string; human: boolean },
+  input: {
+    refused: string;
+    note?: string;
+    human: boolean;
+    /** A task launch: the command that lets THIS task's next turn through. */
+    taskRetry?: string;
+    /** Addressed to the builder: the allowance is the engineer's call, not its own. */
+    builder?: boolean;
+  },
 ): RpcError {
+  if (input.taskRetry && !verdict.storeError) {
+    const escape = input.builder
+      ? `  Only if the engineer asks you to let this task's next turn through, ${input.taskRetry}. ` +
+        `Otherwise wait for the reset — do not lift the pause on your own initiative.`
+      : `  To let THIS task's next turn start anyway (used up by the turn it lets through):\n` +
+        `    ${input.taskRetry}\n` +
+        `  Readings: lazy stats limits · Explanation: lazy doctor`;
+    return new RpcError(
+      429,
+      `${input.refused}: new turns on this credential are paused.\n` +
+        `  ${describeUsagePause(verdict)}\n` +
+        (input.note ? `  ${input.note}\n` : '') +
+        escape,
+      'usage_paused',
+    );
+  }
   if (verdict.storeError) {
     return new RpcError(
       429,
@@ -732,7 +931,14 @@ export async function usagePauseHold(
   const config = await loadConfig(projectRoot);
   const existing = parseUsagePauseHold(await storage.getTaskMetadata(task.id, USAGE_PAUSE_HELD_KEY));
   const pause = await usagePauseForTask(projectRoot, config, task);
-  if (!pause) {
+  // A person's (or the builder's) allowance for THIS task lets the daemon's own
+  // launch through too: "let its next turn through" means whichever turn is
+  // next, and for a held task that is the one lazy starts by itself. Only
+  // COUNTED here, never taken: this is a check, and callers run more gates (and
+  // sometimes this check twice) before anything launches. The launch takes it
+  // at its commit point — takeTaskAllowanceAtLaunch, or assertTurnStartAllowed
+  // for a daemon launch that goes through the explicit path.
+  if (!pause || (!pause.verdict.storeError && taskAllowances.has(task.id))) {
     if (existing) await clearHold(storage, task.id);
     return null;
   }
@@ -787,8 +993,9 @@ async function announceEpisode(storage: Storage, v: UsagePauseVerdict, task: Tas
         `**${displayId(task)}**) wait and go ahead on their own when the window resets. ` +
         `Starts, unblocks, resumes, reviews, asks and the other model runs you ask for are refused ` +
         `until then.\n\n` +
-        `To let ONE turn start anyway: \`lazy daemon config set ${USAGE_PAUSE_OVERRIDE_KEY} off\`, then ` +
-        `start, unblock, resume, review or ask. \`lazy doctor\` lists everything the pause is holding.`,
+        `To let one task's next turn start anyway, launch it with \`--past-usage-pause\` (e.g. ` +
+        `\`lazy resume <task> --past-usage-pause\`) or use the task's "Let its next turn through" button ` +
+        `on the dashboard. \`lazy doctor\` lists everything the pause is holding.`,
     });
   } catch (err) {
     logger.warn(`usage pause: could not file the pause notice: ${err instanceof Error ? err.message : err}`);
@@ -841,7 +1048,7 @@ export async function processUsagePauseHolds(
     }
     const hold = usagePauseHoldOf(task);
     const resting = ['interrupted', 'blocked', 'submitted', 'conflict'].includes(task.status);
-    if (resting && (await usagePauseForTask(projectRoot, config, task))) continue;
+    if (resting && (await pausedDespiteAllowance(projectRoot, config, task))) continue;
     if (task.metadata?.[USAGE_PAUSE_HELD_KEY]) {
       await clearHold(storage, task.id);
       logger.info(`usage pause: no longer holding ${displayId(task)}${hold ? ` (${hold.held})` : ''}`);
@@ -946,7 +1153,7 @@ async function processHeldStart(
   }
   const agentId = typeof pending.params.agentId === 'string' ? pending.params.agentId : undefined;
   const verdictTask = agentId ? { ...task, agent_id: agentId } : task;
-  if (await usagePauseForTask(projectRoot, config, verdictTask)) return;
+  if (await pausedDespiteAllowance(projectRoot, config, verdictTask)) return;
   if (!resumeHeldStart) return;
   let outcome: 'started' | 'held';
   try {
@@ -1076,6 +1283,11 @@ export interface UsagePauseState {
   /** Tasks whose daemon-started launch the pause is holding. */
   held: Array<{ taskId: string; task: string; hold: UsagePauseHold }>;
   /**
+   * Tasks whose next turn a person or the builder let through the pause, not
+   * yet used (see "The per-task allowance"). Absent from an older daemon.
+   */
+  allowed?: Array<{ taskId: string; task: string; setAt: number; setBy: string | null }>;
+  /**
    * The saved readings cannot be read (path and why), or null. While set, every
    * launch the pause would judge is refused — see usagePauseForSpend. Absent
    * from an older daemon's answer.
@@ -1083,16 +1295,26 @@ export interface UsagePauseState {
   storeError?: UsageReadingsStoreError | null;
   /**
    * With `taskId`: that task's next turn, judged as a human start would be
-   * (the pending override included, but NOT taken) — on `agentId` when given,
-   * the agent an `--agent` switch will run it on. Null verdict = would start.
+   * (the task's pending allowance included, but NOT taken) — on `agentId` when
+   * given, the agent an `--agent` switch will run it on. Null verdict = would
+   * start. `allowed`: an allowance is pending for this task.
    */
-  task?: { credential: string | null; harness: string | null; supported: boolean; verdict: UsagePauseVerdict | null };
+  task?: {
+    credential: string | null; harness: string | null; supported: boolean; verdict: UsagePauseVerdict | null;
+    allowed?: boolean;
+  };
   /**
    * With `beside`: a model run BESIDE a task (the builder role's credential —
    * `lazy ask` on a finished task, a chat), judged the same way. The CLI's
    * pre-flight before an editor opens for one.
    */
   beside?: { credential: string | null; harness: string | null; supported: boolean; verdict: UsagePauseVerdict | null };
+  /**
+   * With `opts.pausedTasks` and a credential paused: resting tasks (not held,
+   * no allowance) whose next turn would be paused. Never unreadable readings,
+   * which no allowance lifts.
+   */
+  pausedTasks?: Array<{ taskId: string; task: string; verdict: UsagePauseVerdict }>;
   /** Answer to `admitOneshot`: the allowance every call of that one-shot command carries. */
   oneshotAllowance?: string;
 }
@@ -1123,7 +1345,23 @@ export async function describeUsagePauseState(
    * that cannot take the override (src/cli/human-terminal.ts): the pending
    * override is not counted. Absent: counted, as before.
    */
-  opts: { overrideEligible?: boolean } = {},
+  opts: {
+    overrideEligible?: boolean;
+    /**
+     * Also judge every resting, un-held task while a credential is paused
+     * (`pausedTasks`) — the dashboard banner's list. Off by default: it
+     * judges each task, which only that surface needs.
+     */
+    pausedTasks?: boolean;
+    /**
+     * `ownerEmail` judges the task as a launch by THAT person would: in team
+     * mode a member's launch spends their own credential, while a caller
+     * outside any request (Lazy Teams' control token rendering a member's task
+     * page) would otherwise be judged on the service credential. Ignored
+     * outside team mode, where the credential does not depend on who asks.
+     */
+    ownerEmail?: string;
+  } = {},
 ): Promise<UsagePauseState> {
   const config = await loadConfig(projectRoot);
   await seedUsageReadings(projectRoot, config);
@@ -1139,30 +1377,25 @@ export async function describeUsagePauseState(
   }
   const held: UsagePauseState['held'] = [];
   let taskState: UsagePauseState['task'];
+  let pausedTasks: UsagePauseState['pausedTasks'];
   if (storage) {
-    for (const t of await storage.listTasks()) {
+    const tasks = await storage.listTasks();
+    for (const t of tasks) {
       const hold = usagePauseHoldOf(t);
       if (hold) held.push({ taskId: t.id, task: displayId(t), hold });
     }
     if (taskId) {
       const resolved = await storage.resolveTask(taskId);
       if (!resolved.task) throw new RpcError(404, `Task not found: ${taskId}`);
-      // The launch gate judges the task AFTER an `--agent` switch, so the
-      // pre-flight must judge the agent the turn will actually run on.
-      const task = agentId ? { ...resolved.task, agent_id: agentId } : resolved.task;
-      const spend = await turnSpendCredential(projectRoot, config, task);
-      const configured = await usagePauseForTask(projectRoot, config, task, undefined, now);
-      // Mirrors the gate: a pending override only matters to a paused launch,
-      // and only to a caller that may take it.
-      const pause = configured && override !== null && opts.overrideEligible !== false
-        ? await usagePauseForTask(projectRoot, config, task, override, now)
-        : configured;
-      taskState = {
-        credential: spend?.credential ?? null,
-        harness: spend?.harness ?? null,
-        supported: !!spend && usageSourceFor(spend.harness) !== null,
-        verdict: pause?.verdict ?? null,
-      };
+      taskState = await judgeTaskUsagePause(projectRoot, config, resolved.task, agentId, now, opts.ownerEmail);
+    }
+    if (opts.pausedTasks && paused.length > 0) {
+      pausedTasks = [];
+      for (const t of tasks) {
+        if (!PAUSABLE_RESTING_STATUSES.has(t.status) || usagePauseHoldOf(t) || taskAllowances.has(t.id)) continue;
+        const pause = await usagePauseForTask(projectRoot, config, t, undefined, now);
+        if (pause && !pause.verdict.storeError) pausedTasks.push({ taskId: t.id, task: displayId(t), verdict: pause.verdict });
+      }
     }
   }
   return {
@@ -1172,9 +1405,91 @@ export async function describeUsagePauseState(
     coverage: await usagePauseCoverage(projectRoot, config, now),
     paused,
     held,
+    allowed: await listAllowances(storage),
     storeError: usagePauseConfigured(config) ? usageReadingsStoreError() : null,
     ...(taskState ? { task: taskState } : {}),
+    ...(pausedTasks ? { pausedTasks } : {}),
   };
+}
+
+/**
+ * Statuses a paused task rests in with work under way (listed by the dashboard
+ * banner). Not `backlog`: a never-started task is launched only by a person,
+ * whose Start dialog already offers the way through — and judging every
+ * backlog task on each render of the home page scaled with the backlog.
+ */
+const PAUSABLE_RESTING_STATUSES = new Set(['blocked', 'interrupted', 'conflict', 'submitted']);
+
+/**
+ * `task`'s next turn, judged as a human start would be — the task's pending
+ * allowance counted (never taken), except past unreadable readings, which no
+ * allowance lifts. The one judgement behind `usagePause` get with a taskId and
+ * the dashboard's task page.
+ */
+async function judgeTaskUsagePause(
+  projectRoot: string,
+  config: ResolvedConfig,
+  resolvedTask: Task,
+  agentId: string | undefined,
+  now: number,
+  /** Judge as THIS member's launch (team mode only) — see describeUsagePauseState. */
+  ownerEmail?: string,
+): Promise<NonNullable<UsagePauseState['task']>> {
+  // The launch gate judges the task AFTER an `--agent` switch, so the
+  // pre-flight must judge the agent the turn will actually run on.
+  const task = agentId ? { ...resolvedTask, agent_id: agentId } : resolvedTask;
+  const spend = ownerEmail && await teamModeEnabled(projectRoot)
+    ? await spendCredentialFor(projectRoot, config, task.agent_id, ownerEmail, displayId(task))
+    : await turnSpendCredential(projectRoot, config, task);
+  const configured = usagePauseConfigured(config)
+    ? await usagePauseForSpend(projectRoot, config, spend, undefined, now)
+    : null;
+  // Mirrors the gate: the task's own allowance lets any launch of it
+  // through, except past unreadable readings.
+  const allowed = taskAllowances.has(task.id);
+  const pause = configured && allowed && !configured.verdict.storeError ? null : configured;
+  return {
+    credential: spend?.credential ?? null,
+    harness: spend?.harness ?? null,
+    supported: !!spend && usageSourceFor(spend.harness) !== null,
+    verdict: pause?.verdict ?? null,
+    allowed,
+  };
+}
+
+/**
+ * One task's usage-pause line for the dashboard's task page, without the
+ * project-wide state (no task listing, no coverage): the verdict, and the
+ * pending allowance. Cheap when pausing is off — only the allowance is read.
+ */
+export async function describeTaskUsagePause(
+  projectRoot: string,
+  storage: Storage,
+  taskId: string,
+  now: number = Date.now(),
+): Promise<{ verdict: UsagePauseVerdict | null; allowance: TaskUsagePauseAllowance | null }> {
+  const { task } = await storage.resolveTask(taskId);
+  if (!task) throw new RpcError(404, `Task not found: ${taskId}`);
+  const allowance = taskAllowances.get(task.id) ?? null;
+  const config = await loadConfig(projectRoot);
+  if (!usagePauseConfigured(config)) return { verdict: null, allowance };
+  await seedUsageReadings(projectRoot, config);
+  const judged = await judgeTaskUsagePause(projectRoot, config, task, undefined, now);
+  return { verdict: judged.verdict, allowance };
+}
+
+/** Pending allowances, named for display; an allowance whose task is gone is dropped. */
+async function listAllowances(storage: Storage | null): Promise<NonNullable<UsagePauseState['allowed']>> {
+  const out: NonNullable<UsagePauseState['allowed']> = [];
+  for (const [taskId, a] of taskAllowances) {
+    const task = storage ? await storage.getTask(taskId) : null;
+    if (storage && !task) {
+      taskAllowances.delete(taskId);
+      continue;
+    }
+    out.push({ taskId, task: task ? displayId(task) : taskId, setAt: a.setAt, setBy: a.setBy });
+  }
+  return out;
 }
 
 /**
@@ -1246,6 +1561,7 @@ export async function webInteractiveRefusal(
         actor: 'human',
         peek,
         judge: (threshold) => usagePauseForSpend(projectRoot, config, spend, threshold),
+        task: { id: task.id, retry: usagePauseRetryCommand(mode, displayId(task), 'human') },
         what: `the ${mode} of ${displayId(task)}`,
         refused: `Task ${displayId(task)} was not ${NOT_DONE[mode]}`,
       });

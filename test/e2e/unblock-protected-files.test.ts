@@ -1,5 +1,13 @@
 /**
- * E2E: unblock never reverts a protected file, and accept is the one gate.
+ * E2E: unblock never reverts an UNDECIDED protected file, and accept is the one gate.
+ *
+ * RENAMED from unblock-never-reverts.test.ts (supervisor-restores-rejected-files,
+ * engineer decision 2026-09-28). Its old name stated an invariant the engineer
+ * deliberately REVERSED for one case: a file a reviewer explicitly REJECTED is
+ * now restored by lazy's supervisor before the next work turn (the agent is no
+ * longer trusted to do it). Everything else here stands: an undecided file is
+ * never touched by an unblock, and accept refuses until every file is decided.
+ * The real-stack restore is covered by supervisor-restores-rejected.test.ts.
  *
  * THE CHANGE (move-file-approval-to-accept, engineer decision 2026-09-13).
  * Until now an unblock of a `conflict` task REQUIRED an approve/revert decision
@@ -41,7 +49,7 @@ const ORIGINAL_B = 'describe("existing B", () => {});\n';
 const AGENT_A = 'describe("agent coverage A", () => { /* the work at stake */ });\n';
 const AGENT_B = 'describe("agent coverage B", () => { /* later work */ });\n';
 
-describe('unblock never reverts a protected file', () => {
+describe('unblock never reverts an undecided protected file', () => {
   let ctx: TestContext;
 
   beforeEach(async () => {
@@ -138,6 +146,55 @@ describe('unblock never reverts a protected file', () => {
       expect(fileInWorktree(taskId, 'a.spec.ts')).toBe(AGENT_A);
     }
     expect(pendingFiles(taskId)).toEqual(['a.spec.ts']);
+  });
+
+  // INVARIANT (supervisor-restores-rejected-files — REVERSES the earlier
+  // "reject-means-restore by the agent", engineer decision 2026-09-28): a
+  // reviewer's Reject is carried out by lazy's SUPERVISOR, so the unblock hands
+  // it the restore plan instead of asking the agent in the prompt. Undecided files
+  // are never named: only an explicit Reject leads to a restore. The module mock
+  // replaces the supervisor, so the restore itself is asserted on the real stack
+  // in supervisor-restores-rejected.test.ts; here the file stays and accept refuses.
+  test('an unblock after Reject hands the restore to the supervisor, not the agent', async () => {
+    const taskId = await arrange();
+    // Reject as the review surfaces record it: still pending, plus rejected_at.
+    const turns = readTurns(ctx.root, taskId);
+    for (const t of turns) {
+      for (const v of t.violations ?? []) if (v.file === 'a.spec.ts') (v as { rejected_at?: number }).rejected_at = Date.now();
+    }
+    writeTurns(ctx.root, taskId, turns);
+
+    const result = await ctx.lazyMocked(
+      ['unblock', taskId, '--message', 'Now update the docs', '--follow'],
+      MOCK_CLAUDE_SUCCESS,
+      {},
+    );
+    await runReconcile(ctx.root, ctx.protocolBase);
+    expectSuccess(result);
+
+    expect(result.stdout + result.stderr).toContain('Restoring 1 rejected protected file(s)');
+    const human = readTurns(ctx.root, taskId).find(t => t.role === 'human' && t.content.includes('Now update the docs'))!;
+    expect(human.content).not.toContain('REJECTED PROTECTED FILES');
+    expect(human.content).not.toContain('git checkout');
+    // The mocked supervisor restored nothing; accept still refuses.
+    expect(fileInWorktree(taskId, 'a.spec.ts')).toBe(AGENT_A);
+    const refused = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {});
+    expectFailure(refused);
+    expectError(refused, 'a.spec.ts');
+  });
+
+  test('an unblock with an undecided file restores nothing', async () => {
+    const taskId = await arrange();
+    const result = await ctx.lazyMocked(
+      ['unblock', taskId, '--message', 'Keep going', '--follow'],
+      MOCK_CLAUDE_SUCCESS,
+      {},
+    );
+    await runReconcile(ctx.root, ctx.protocolBase);
+    expectSuccess(result);
+    const human = readTurns(ctx.root, taskId).find(t => t.role === 'human' && t.content.includes('Keep going'))!;
+    expect(human.content).not.toContain('REJECTED PROTECTED FILES');
+    expect(result.stdout + result.stderr).not.toContain('Restoring');
   });
 
   // INVARIANT: the retired flags are REMOVED, not ignored. `--no-approve-files`

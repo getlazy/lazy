@@ -154,3 +154,13 @@ on the expensive model?" has an answer.
 None of this applies to your own machine. There is no operator credential
 there — the one credential is yours, and per-person credentials are refused
 outright rather than sitting unused.
+
+### Who authors the commits
+
+The same rule decides the author of every commit lazy makes on a team server —
+an agent's commit, a sync's merge, an accept. The commit names the person who
+asked for the work, as both author and committer. Work lazy starts by itself,
+such as resuming an interrupted task, names the owner of the project's service
+credential. No git configuration on the server is involved, and none is needed.
+If lazy cannot name anybody, it refuses with "Please tell me who you are" before
+git runs; setting the project's service credential fixes that for automated work.

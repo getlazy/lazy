@@ -110,6 +110,11 @@ export interface MergeOptions {
    * answer `alreadyLanded` when it would not.
    */
   resume?: boolean;
+  /**
+   * Append lazy's co-author trailer to the merge commit — `[git]
+   * coauthor_trailer` from the project root's config. Absent means true.
+   */
+  coauthorTrailer?: boolean;
 }
 
 /**
@@ -167,6 +172,38 @@ export interface RemoteComment {
 
 /** State of a PR/MR on the remote forge. */
 export type PRState = 'OPEN' | 'MERGED' | 'CLOSED';
+
+/**
+ * One item of a PR/MR's conversation, as the on-demand read tools show it.
+ * Unlike {@link RemoteComment} (the import shape), this is a display view:
+ * review verdicts and resolution state ride along.
+ */
+export interface ReviewConversationItem {
+  /** `comment` = top-level, `inline` = on a line of the diff, `review` = a submitted review's summary. */
+  kind: 'comment' | 'inline' | 'review';
+  id: string;
+  author: string;
+  createdAt: string;
+  body: string;
+  path?: string;
+  line?: number;
+  /** Thread resolution, where the forge exposes it for this item. */
+  resolved?: boolean;
+  /** A review's verdict (e.g. APPROVED, CHANGES_REQUESTED, COMMENTED). */
+  state?: string;
+}
+
+/** A PR/MR's review verdicts, mergeability and CI, read on demand. */
+export interface ReviewStatus {
+  state: PRState | null;
+  /** The forge's overall verdict where it computes one (GitHub reviewDecision). */
+  decision: string | null;
+  /** Latest verdict per reviewer (GitLab: approvers, state APPROVED). */
+  reviews: Array<{ author: string; state: string; submittedAt: string }>;
+  /** The forge's own mergeability word (GitHub mergeStateStatus, GitLab detailed_merge_status). */
+  mergeable: string | null;
+  checks: Array<{ name: string; status: string; conclusion: string | null; url?: string }>;
+}
 
 /** A single health-check result reported by a driver. */
 export interface HealthCheck {
@@ -413,6 +450,16 @@ export interface RepositoryDriver {
    * No-op (returns null) for local driver.
    */
   getPRState(task: Task): Promise<PRState | null>;
+
+  /**
+   * Read the task's PR/MR conversation for display (the read-only MCP tools).
+   * Throws when the forge cannot be read — never an empty list standing in for
+   * a failure. Callers check {@link hasRemoteRef} first. LocalDriver throws: no forge.
+   */
+  readReviewConversation(task: Task): Promise<ReviewConversationItem[]>;
+
+  /** Read the task's PR/MR review verdicts, mergeability and checks. Same failure rules. */
+  readReviewStatus(task: Task): Promise<ReviewStatus>;
 
   /**
    * Update the lazy-owned, delimited section of the PR/MR body with a

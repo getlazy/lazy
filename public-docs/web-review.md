@@ -6,7 +6,7 @@ what each page and tab shows, and where its limits are. The daemon's embedded we
 — the task's code when it has one, its id otherwise, and either works — with
 tabs for everything you used to hunt across a task page and a review page:
 Summary, Verify, Regions, Changes, Turns, Commits, Reviews, Subtasks, Raised,
-Comments, Journal, Stats, Shell, Services, and **Current review**. Review is a tab on that page — the place your
+Comments, Journal, Artifacts, Stats, Shell, Services, and **Current review**. Review is a tab on that page — the place your
 queued comments, ticks, and Unblock / Ask / Accept live — not a second site.
 Old `/review/:id` links 308 there.
 
@@ -163,6 +163,7 @@ and only when the runner has no container to enter.
 | **Raised** | Questions and proposals; a row opens the item in a dialog. |
 | **Comments** | Every comment on the task, oldest first, split into the ones the agent has already been shown and the ones still queued for its next turn. Add one here in any status, finished tasks included — it is saved and nothing else, it reaches the agent in the prompt of the next Unblock, and it never starts a turn on its own. On a finished task a comment is an annotation for whoever reads the task later; if the task is reopened or redone, it rides that next turn. The tab's badge reads `queued/total` while any are waiting. If the store cannot be written, the page hands your text back so nothing you typed is lost. |
 | **Journal** | The task's out-of-prompt record — rationale, deferrals, notes to whoever picks the task up next. Newest first. Journal entries are never injected into an agent's prompt; a later turn is only told how many new ones exist. Append with `lazy journal <task>`. |
+| **Artifacts** | Files attached to the task — screenshots and reports its agent published, inputs handed to it. Previews images, text and Markdown; **Add an input file** attaches one for the agent's next turn without starting it. See [artifacts.md](artifacts.md). |
 | **Stats** | Where this task's time and tokens went, and — for a task with subtasks — its whole subtree's. See [What the Stats tab means](#what-the-stats-tab-means) below. The tab's badge is the total tokens recorded across its own turns. |
 | **Shell** | Terminals in the task's container, plus Pair and Chat. See [Web shell](web-shell.md). |
 | **Services** | Declared ports, liveness, Start container / Start services. |
@@ -174,7 +175,7 @@ still closes every shell. Without JavaScript each tab is a real page.
 
 Numbers 1–9 jump to Summary, Verify, Regions, Changes, Turns, Subtasks, Raised,
 Shell and Current review, in that order (Summary is 1, Current review is 9).
-Commits, Reviews, Comments, Journal, Stats and Services have no number — use `[` / `]`
+Commits, Reviews, Comments, Journal, Artifacts, Stats and Services have no number — use `[` / `]`
 or click them.
 Current review comes last, picked out in the accent colour.
 
@@ -261,6 +262,9 @@ never a second writer). The dashboard's base URL is printed by
 | `/tasks/:task/comments/add` | POST | Adds a comment and nothing else — no turn is started. Redirects back to the Comments tab |
 | `/tasks/:task/comments/:comment/edit` | POST | Replaces the text of a comment the agent has not been shown yet. A comment it has already seen is refused, with the reason and your text handed back. Redirects back to the Comments tab |
 | `/tasks/:task/journal` | GET | Journal tab — the task's out-of-prompt record, newest first |
+| `/tasks/:task/artifacts` | GET | Artifacts tab — the task's files, with previews and an upload form ([artifacts.md](artifacts.md)) |
+| `/tasks/:task/artifacts/file?name=…` | GET | One artifact's bytes; add `&download=1` to force a download |
+| `/tasks/:task/artifacts/upload` | POST | Attach an input file (multipart form: `file`, optional `name`) |
 | `/tasks/:task/stats` | GET | Stats tab — turn count, the time split, per-turn and cumulative token charts, and per-tool calls and result tokens when the proxy recorded any. `?scope=task` narrows it to the task alone; a task with descendants defaults to the whole subtree |
 | `/tasks/:task/shell` | GET | Shell tab — index of this page's terminals, Pair, Chat; hidden when the runner has no container |
 | `/tasks/:task/services` | GET | Services tab — declared ports, liveness, and ports this branch added that the project root does not publish |
@@ -278,12 +282,14 @@ never a second writer). The dashboard's base URL is printed by
 | `/raised/:id/blocking` | POST | Change whether that item gates accept (form; 303 → the item) |
 | `/followups`, `/followups/:id`, `/api/followups` | GET | The pre-unification paths — 308-redirected to their `/raised` equivalents rather than 404ing, because they are in old task prompts and bookmarks |
 | `/sessions` | GET | **410** — Review with builder was removed |
-| `/conversations` | GET | Captured builder conversations, newest first; `?q=` searches their message bodies (an invalid or too-slow pattern is refused, not a server error) |
-| `/conversations/:session` | GET | One conversation's transcript, paged 40 messages at a time (`?offset=`) |
-| `/api/conversations` | GET | The conversation listing as JSON — metadata only, never transcripts |
-| `/scratch` | GET | Captured builder scratch files, grouped by builder session, with size and capture time; files recorded by name only are marked with the reason. `?q=` searches within them |
+| `/builders` | GET | Builders — one per builder conversation (start or `/clear` to the next `/clear`), newest first; `?q=` searches their message bodies (an invalid or too-slow pattern is refused, not a server error) |
+| `/builders/:id` | GET | One Builder's transcript across all its session files, paged 40 messages at a time (`?offset=`); any of its session ids works |
+| `/api/builders` | GET | The Builders listing as JSON — metadata, session ids and run state, never transcripts |
+| `/conversations`, `/conversations/:session` | GET | The old paths — 301-redirected to their `/builders` equivalents |
+| `/api/conversations` | GET | The per-session-file listing as JSON, kept for existing clients |
+| `/scratch` | GET | Captured builder scratch files, grouped by the Builder that last wrote them, with size and capture time; files recorded by name only are marked with the reason. `?q=` searches within them |
 | `/scratch/file?path=` | GET | One scratch file — markdown rendered, `&raw=1` for the source; a name-only file says why it has no body |
-| `/api/scratch` | GET | The scratch listing as JSON — grouped by session, never file bodies |
+| `/api/scratch` | GET | The scratch listing as JSON — grouped by Builder, never file bodies |
 | `/settings` | GET | Settings — Memories tab (same listing as `/settings/memory`) |
 | `/settings/memory` | GET | Shared memory records — the Memories tab (live by default; `?all=1` includes removed ones) |
 | `/settings/doctor` | GET | Doctor — last health report this machine produced, or an empty state. Does not run checks. |
@@ -338,8 +344,7 @@ visible from whatever page you are already on:
   open blocking items and eleven open non-blocking ones — because they are one
   destination, not two. A zero blocking count is left out rather than shown as
   `0/11`.
-- **Conversations** — conversations captured since you last opened
-  `/conversations`.
+- **Builders** — Builders that grew since you last opened `/builders`.
 
 Each count is the count its own page shows — the badge runs the page's own
 query, so the two can't drift apart. A count of zero shows no badge at all,
@@ -357,15 +362,15 @@ absent and the others still appear. An absent badge is never lazy claiming
 there is nothing there — it is either a count of zero or a count it couldn't
 take, and the page itself remains the authority either way.
 
-**The Conversations count is per browser.** Conversations have no read state in
+**The Builders count is per browser.** Builders have no read state in
 the store — they are captured, never authored — so lazy does not invent one.
-Instead your browser remembers the newest conversation it has been shown (in
+Instead your browser remembers the newest capture it has been shown (in
 `localStorage`, under `lazy.conversationsSeenAt`), sends that back with the
-request, and the badge counts what arrived after it. Opening `/conversations`
+request, and the badge counts Builders that grew after it. Opening `/builders`
 clears the badge and sets the new mark. A second browser, a private window, or
-cleared site data therefore starts over and counts every conversation as new —
+cleared site data therefore starts over and counts every Builder as new —
 which is right: "since you last looked" is a fact about a person at a screen,
-not about the project. A search (`/conversations?q=`) shows a subset, so it
+not about the project. A search (`/builders?q=`) shows a subset, so it
 never advances the mark.
 
 ## Creating a task
@@ -519,7 +524,10 @@ enforces, so a button you can see is a button that will work:
   **Reparent**, **Redo** and **Clone** sit on Summary.
 - **Finished** (complete or abandoned) — **Reopen** brings the task back to
   blocked (if it had run) or backlog (if it never did). Reopening an accepted
-  task asks for a reason, which is recorded as a comment.
+  task asks for a reason, which is recorded as a comment. The task comes back
+  with its own work — its branch is restored from the remote or from what lazy
+  recorded if it is no longer local — and reopen refuses rather than start the
+  task empty.
 
 Every one of those verbs opens a dialog. The dialog shows the same steps the
 CLI prints for that command (`lazy accept`, `lazy stop`, `lazy sync`, …) as
@@ -544,6 +552,24 @@ so and stays open, so the next turn appears without reopening it. **Close**
 dismisses the panel. Watch needs scripting; with it off, reload the page to see
 the latest agent output.
 
+## Large changes
+
+A branch can carry thousands of files — a release, or a parent task whose
+subtasks all landed. Changes never hides or truncates any of them; it loads
+them in stages instead:
+
+- **The file list comes first.** Every file, with its +/− counts and the region
+  it belongs to, renders at once. Each row links to that file's diff.
+- **Diffs load as you scroll.** The first few dozen files arrive with the page;
+  the rest fill in a few at a time as you approach them. **Load all diffs**
+  fills in everything.
+- **Very large single files** (a lockfile, generated code) are listed like any
+  other file but load only when you click **Load diff** on them.
+
+Comments, expand controls, the Viewed tick and the side-by-side view work the
+same on files that loaded later. A small change loads in one go, exactly as
+before.
+
 ## Staying up to date without losing your place
 
 The task page keeps itself current on its own (when scripting is on), and it
@@ -563,6 +589,7 @@ What happens next depends on which tab you are reading:
 | Turns, Commits, Comments, Journal | New entries appear in place. They land at the top, so the page holds your viewport where it was and offers **New content above** if you want to jump. |
 | Changes, Current review, Regions, Stats | Never swapped under you. A small **updated — reload** button appears in the corner; you choose when. |
 | Shell, Verify | Never touched, so a terminal you have open keeps running. |
+| Artifacts | Not refreshed automatically — reload the page to see files attached meanwhile. |
 
 A tab you are *not* on is not refetched behind your back. It gets a dot in the
 tab strip, and its content is fetched fresh the moment you switch to it — so a
@@ -613,13 +640,14 @@ new lands.
    the task's declared `[serve]` ports. **Changes** is the diff: when the agent
    declared a presentation on `lazy_report`, a semantic walkthrough (groups,
    tiers, snippets) is shown first with a **Presented / Raw files** toggle;
-   otherwise the per-file diff appears as before. A task with accepted children
-   (a parent task) lists those children on **Subtasks** and shows only the
-   parent's own direct changes here — the children's files were already reviewed
-   when each child was accepted. `lazy diff` and `lazy_diff` use that same
-   scoped diff; pass `--full-branch` / `full_branch` for the whole branch.
-3. **Diff** renders the task branch vs. its parent, computed by the daemon — the same diff `lazy diff` shows. A parent task's
-   default diff is its own commits only (see above). A diff only
+   otherwise the per-file diff appears as before. Changes always shows the
+   task's **whole branch** — including everything its accepted subtasks
+   brought in — and the card above the diff offers the other view: one
+   **region** at a time (for a parent task, one region per accepted subtask).
+   `lazy diff` and `lazy_diff` show the same whole branch; `--full-branch` /
+   `full_branch` are still accepted and change nothing. See
+   [Large changes](#large-changes) for how a very big branch loads.
+3. **Diff** renders the task branch vs. its parent, computed by the daemon — the same diff `lazy diff` shows. A diff only
    shows a few lines around each change, so every gap — above the first hunk,
    between two hunks, and after the last one — carries **expand controls**: ↑ and
    ↓ reveal 20 more lines against the hunk they belong to, and ↔ reveals
@@ -1513,11 +1541,13 @@ said this work is finished, with who, when and at which commit. It is
 information, not a gate: a task nobody declared is still yours to accept, and
 what the declaration decides is whether lazy ran a review of it.
 
-Unblock asks nothing about protected files and never reverts one. A pending
-protected file neither blocks the Unblock dialog nor travels with it — the
-decision belongs to accept, and the per-file ✅/⛔ controls on Changes are where
-you make it, next to the diff it applies to. Unblock the agent as many times as
-the work needs; the files keep the content the agent left.
+Each protected file has an **Approve** / **Reject** control on its header in
+Changes, saved as you press it. An undecided file has neither pressed. Unblock
+never blocks on one. It restores every file you **rejected** to the version it
+started from — as lazy's own commit, before the agent starts, which is then
+told to make the rest of the work fit; undecided and approved files keep the
+content the agent left. Accept tells you when the work contains such a restore. Accept refuses while any
+protected file is rejected or undecided.
 
 The empty state is usable if you want to accept immediately: the checklist,
 a progress line (queued comments, files viewed, verified steps), the
@@ -1546,6 +1576,12 @@ reviewer's only record of what they have already written before they commit to
 sending it. Each entry links to where its anchor lives — a Changes line, a
 Summary report line, or a raised item. Diff-line anchors still use
 `#l-<encoded path>-<side>-<line>`.
+
+When you have queued comments the agent has not read, Accept refuses unless you
+say you mean it: the Accept dialog offers **Merge without delivering the queued
+comments**. The box follows the page's live refresh, so it also appears for a
+comment added after you opened the page, and an accept refused for this reason
+offers the same choice inside the dialog.
 
 ### The sticky status bar
 

@@ -43,6 +43,10 @@ describe('[docker] build_inputs', () => {
   beforeEach(async () => {
     ctx = await setupTestLazy();
     docker = await installFakeDocker(ctx.root);
+    // The fixture Dockerfile builds FROM lazy-runner (i.e. :latest). Without the
+    // base on the host, the base image is built first and every "exactly one
+    // build" assertion here would count that base build too.
+    await docker.seedImage('lazy-runner:latest');
     originalCwd = process.cwd();
     process.chdir(ctx.root);
   });

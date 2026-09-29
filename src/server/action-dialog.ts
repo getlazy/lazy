@@ -204,6 +204,31 @@ export function actionDialogScript(): string {
     if (focus && focus.focus) focus.focus();
   }
 
+  // Accept refused on queued human feedback: offer the explicit override right
+  // here, carrying everything the refused form sent. The page's own box can lag
+  // the comment by a poll interval; the refusal is the daemon's current answer.
+  // The failed step already shows the refusal; this adds only the browser's
+  // way past it (its text names a CLI flag a browser user cannot use).
+  function renderQueuedCommentsRemedy() {
+    if (!remedyEl) return;
+    var action = lastFormAction || '';
+    var html = '<p class="rv-hint">Merge without delivering them, or close this and Unblock so the agent reads them.</p>';
+    html += '<form method="post" action="' + escapeText(action) + '" class="lz-action-form lz-action-queued-override" data-lz-action-form>';
+    if (lastFormData) {
+      lastFormData.forEach(function (value, key) {
+        // Never echo a typed passphrase (see renderPassphraseRemedy); if the
+        // approval gate still applies, the daemon asks again.
+        if (key === 'allow_queued_comments' || key === 'passphrase') return;
+        html += '<input type="hidden" name="' + escapeText(key) + '" value="' + escapeText(String(value)) + '">';
+      });
+    }
+    html += '<input type="hidden" name="allow_queued_comments" value="1">';
+    html += '<div class="rv-form-actions"><button type="submit" class="rv-primary">Merge without delivering them</button></div>';
+    html += '</form>';
+    remedyEl.innerHTML = html;
+    remedyEl.hidden = false;
+  }
+
   function describeEvent(e) {
     if (!e || e.kind === 'activity') return '';
     if (e.kind === 'plan') {
@@ -312,6 +337,10 @@ export function actionDialogScript(): string {
         // passphrase field is the primary affordance; the CLI command is
         // secondary, composed by the daemon with every --approve-file.
         renderPassphraseRemedy(remedy);
+        return;
+      }
+      if (remedy && remedy.reason === 'queued-comments-undelivered') {
+        renderQueuedCommentsRemedy();
         return;
       }
       showError(snap.error || 'The action failed.');

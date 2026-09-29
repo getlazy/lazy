@@ -74,12 +74,13 @@ function launchableBuilderEnv(root: string): Record<string, string> {
 }
 
 /**
- * Serve just enough of the Ollama HTTP API for the role-target preflight.
+ * Stand in for a local model server for the role-target preflight.
  *
- * Enabling `[ollama]` makes the builder role resolve to the ollama backend, and
- * preflightRoleTarget then probes `<endpoint>/api/tags` and FAILS HARD when it
- * does not answer 200 (by design — lazy never silently falls back to another
- * backend). Tests about *which model gets forwarded* would otherwise be
+ * Pointing the builder role at a profile with its own endpoint makes
+ * preflightRoleTarget probe that endpoint's base URL. Any HTTP answer (even
+ * this fake's 404) passes; only a refused connection FAILS HARD (by design —
+ * lazy never silently falls back to another backend). The `/api/tags` branch
+ * is incidental. Tests about *which model gets forwarded* would otherwise be
  * asserting on a machine that happens to run `ollama serve`.
  */
 function startFakeOllama(): { endpoint: string; stop: () => void } {
@@ -97,6 +98,24 @@ function startFakeOllama(): { endpoint: string; stop: () => void } {
 }
 
 /**
+ * Point the builder role at a local-model profile — what replaced the removed
+ * `[ollama]` section. A `claude-code` profile with its own endpoint and model is
+ * how the builder targets a local server now. The init template writes neither
+ * table, so this appends — and refuses if it ever starts to, rather than
+ * producing a TOML redefinition.
+ */
+function pointBuilderAtLocalProfile(config: string, model: string, endpoint: string): string {
+  if (/^\[models\.roles\.builder\]/m.test(config) || /^\[agents\.local-builder\]/m.test(config)) {
+    throw new Error('pointBuilderAtLocalProfile: template already defines the builder role or profile');
+  }
+  return (
+    config +
+    `\n[agents.local-builder]\nharness = "claude-code"\nmodel = "${model}"\nendpoint = "${endpoint}"\n` +
+    `\n[models.roles.builder]\nagent = "local-builder"\n`
+  );
+}
+
+/**
  * Install a fake `claude` executable that records each argv entry (one per line)
  * to `logPath`, then exits 0. Used to capture exactly what flags the builder
  * passes to the Claude Code invocation. Returns the bin dir to prepend to PATH.
@@ -104,15 +123,6 @@ function startFakeOllama(): { endpoint: string; stop: () => void } {
  * The fake also satisfies the host-process runner's `claude --version`
  * availability check (it exits 0 for any argv).
  */
-/** Enable the init template's existing [ollama] table — never append a second one. */
-function enableOllamaInConfig(config: string, model: string, endpoint: string): string {
-  const after = config.replace(
-    /^\[ollama\][\s\S]*?(?=\n\n# \[proxy\])/m,
-    `[ollama]\nenabled = true\nmodel = "${model}"\nendpoint = "${endpoint}"`,
-  );
-  if (after === config) throw new Error('enableOllamaInConfig: [ollama] section not updated');
-  return after;
-}
 
 function installFakeClaude(root: string, logPath: string): string {
   const binDir = join(root, 'fakebin');
@@ -510,14 +520,14 @@ describe('lazy builder', () => {
   });
 
   // INVARIANT: an explicit --model flag takes precedence over the
-  // Ollama-injected model. We must end up with exactly ONE --model arg (the
+  // model pinned by the builder's agent profile. We must end up with exactly ONE --model arg (the
   // user's), never two — two would be ambiguous to Claude Code.
-  test('explicit --model wins over the Ollama-injected model', async () => {
+  test('explicit --model wins over the profile-pinned model', async () => {
     const ollama = startFakeOllama();
     try {
       const lazyTomlPath = join(ctx.root, 'lazy.toml');
       let cfg = readFileSync(lazyTomlPath, 'utf-8');
-      cfg = enableOllamaInConfig(
+      cfg = pointBuilderAtLocalProfile(
         setRunnerType(cfg, 'dangerously-host-process-without-any-isolation'),
         'ollama-local-model',
         ollama.endpoint,
@@ -543,14 +553,14 @@ describe('lazy builder', () => {
     }
   });
 
-  // Guards the existing behavior: with no --model flag, Ollama's model is still
-  // injected so Claude Code targets the local model rather than its opus default.
-  test('Ollama model is still injected when no --model flag is given', async () => {
+  // Guards the existing behavior: with no --model flag, the profile's pinned model is
+  // injected so Claude Code targets the local model rather than its own default.
+  test('the profile-pinned model is injected when no --model flag is given', async () => {
     const ollama = startFakeOllama();
     try {
       const lazyTomlPath = join(ctx.root, 'lazy.toml');
       let cfg = readFileSync(lazyTomlPath, 'utf-8');
-      cfg = enableOllamaInConfig(
+      cfg = pointBuilderAtLocalProfile(
         setRunnerType(cfg, 'dangerously-host-process-without-any-isolation'),
         'ollama-local-model',
         ollama.endpoint,
@@ -574,6 +584,24 @@ describe('lazy builder', () => {
     }
   });
 
+  // INVARIANT: with no --model flag and no model on the builder's profile, the
+  // interactive builder runs lazy's builder default (claude-opus-5-5) — never
+  // omits --model and lets Claude Code pick. Engineer decision 2026-09-28.
+  test('the builder default is passed when neither --model nor a profile model is given', async () => {
+    const lazyTomlPath = join(ctx.root, 'lazy.toml');
+    writeFileSync(lazyTomlPath, setRunnerType(readFileSync(lazyTomlPath, 'utf-8'), 'dangerously-host-process-without-any-isolation'));
+    const logPath = join(ctx.root, 'claude-args.log');
+    const binDir = installFakeClaude(ctx.root, logPath);
+
+    const result = await ctx.lazy(['builder', '--yes'], { env: { PATH: `${binDir}:${process.env.PATH}` } });
+    expectSuccess(result);
+
+    const args = readClaudeArgs(logPath);
+    const modelIndexes = args.flatMap((a, i) => (a === '--model' ? [i] : []));
+    expect(modelIndexes.length).toBe(1);
+    expect(args[modelIndexes[0] + 1]).toBe('claude-opus-5-5');
+  });
+
   // INVARIANT: --model requires a non-empty value so we never append a dangling
   // --model arg to Claude Code.
   test('--model with empty value is rejected', async () => {
@@ -586,7 +614,7 @@ describe('lazy builder', () => {
   // model with NO local server configured resolves to the anthropic backend,
   // which can't serve it — reject up front instead of failing opaquely at runtime.
   // (claude-* and the known short names are accepted; a local server would allow
-  // any name — that path is covered by the "wins over Ollama" test above.)
+  // any name — that path is covered by the "wins over the profile-pinned model" test above.)
   test('--model with an unknown name and no local server is rejected up front', async () => {
     useHostProcessRunner(ctx.root);
     const result = await ctx.lazy(['builder', '--model', 'qwen3-coder', '--yes']);

@@ -120,19 +120,18 @@ describe('review auto-fix under a usage pause', () => {
     const taskId = await createTask(ctx, 'Fix the retry path', 'Do the work');
     const fullId = findFullTaskId(ctx.root, taskId);
 
-    // The start is paused too; a person lets it through with the override.
-    // (No final is declared, so no automatic review is owed.)
-    await setUsagePauseOverrideRpc(ctx, 'off');
-    // A person's launch: a test's CLI has no terminal, so it could never take
-    // the override (test/helpers/usage-pause.ts, launchAsPerson).
-    expectSuccess(await launchAsPerson(ctx, 'startTask', { taskId: fullId }));
+    // The start is paused too; a person lets THIS task's turn through with the
+    // launch. (No final is declared, so no automatic review is owed.)
+    expectSuccess(await launchAsPerson(ctx, 'startTask', { taskId: fullId, usagePausePastOnce: true }));
     expectSuccess(await ctx.lazy(['wait', taskId]));
 
-    // A person asks for a review with auto-fix, and lets THAT through too.
-    await setUsagePauseOverrideRpc(ctx, 'off');
+    // A person asks for a review with auto-fix, and lets THAT through too —
+    // the allowance goes with the review's launch and nothing is left behind,
+    // so the auto-fix after it is held like any daemon launch.
     const client = DaemonClient.fromTarget(getDaemonTcpTarget(ctx.root)!, readToken(ctx.root)!);
-    await client.rpc('reviewTask', ctx.root, { taskId: fullId, autoFix: true, usagePauseOverrideEligible: true });
-    // …and sets it again. The daemon's own launches must never take it.
+    await client.rpc('reviewTask', ctx.root, { taskId: fullId, autoFix: true, actor: 'human', usagePausePastOnce: true });
+    // A daemon-wide override is pending too. The daemon's own launch of a task
+    // never takes it (only that task's allowance would let it through).
     await setUsagePauseOverrideRpc(ctx, 'off');
 
     const agentTurns = (): StoredTurn[] => readTurns(ctx.root, taskId).filter((t) => t.role === 'agent');

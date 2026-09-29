@@ -8,7 +8,8 @@
 import { withPromotedTaskCodes } from '../task/show-sections';
 import { reviewSettingsViewOf, type ReviewSettingsView } from '../review/mode';
 import type { Storage, Task, Session, StatusChange, Turn } from '../storage';
-import { getCommitDiff } from '../git/operations';
+import { getCommitPatch } from '../git/operations';
+import { findRecordedCommit } from '../task/recorded-commit';
 import { executeSearch, QueryParseError } from '../search';
 import { logger } from '../utils/logger';
 import { latestAgentWorkTurn } from '../task/turn-context';
@@ -33,14 +34,16 @@ import {
 import { parseSortParam, type SortConfig } from './sort';
 import type { DashboardStats, TaskWithSession, ActiveTaskInfo, ActivityDay, ActiveStates } from './templates';
 import { buildChartData } from './throughput-chart';
-import { reviewQueueHtml, reviewTaskHtml, threadsJson, parseRaisedResolutionsFromForm, parseReviewQueueSort, sortReviewQueue, type ReviewDraft, type ReviewLiveState } from './review';
+import { queuedFeedbackBoxHtml, reviewQueueHtml, reviewTaskHtml, reviewFileCardsHtml, threadsJson, parseRaisedResolutionsFromForm, parseReviewQueueSort, sortReviewQueue, type ReviewDraft, type ReviewLiveState } from './review';
+import { queuedHumanFeedbackForTask } from '../task/queued-feedback';
 import { regionExtras } from './review-regions';
 import { parseUnifiedDiff } from './review-diff';
 import { loadMarkdownSources } from './review-markdown';
-import { buildTaskCodeLinkify } from './task-code-links';
+import { buildTaskCodeLinkify, loadIdLinks } from './task-code-links';
 import { taskPath, taskPathSegment, taskCodeTables, duplicateTaskCodes, decodePathSegment, type TaskPathRef } from './task-urls';
 import { buildSymbolTable } from './review-symbols';
 import type { MarkdownLinkifyTable, RenderMarkdownOptions } from './markdown';
+import type { TaskCodeEntry } from '../storage/types';
 import { resolveShellContainer } from './shell-ws';
 import type { ShellAvailability } from './shell-ui';
 import { computeReviewActivity, type ReviewActivity } from './review-activity';
@@ -64,7 +67,7 @@ import {
 } from './review-actions';
 import { isValidMessageId, type MessageActions } from './message-actions';
 import type { ReviewSessionActions } from './review-session-actions';
-import type { TaskActions, TaskCreateInput, TaskEditInput } from './task-actions';
+import type { TaskActions, TaskCreateInput, TaskEditInput, TaskUsagePauseView } from './task-actions';
 import { parseCreateTaskForm, type TaskCreateDraft } from './task-create-form';
 import { parseLinkTaskForm, type TaskLinkDraft } from './task-link-form';
 import { taskCanOfferSubmit } from './submit-action';
@@ -89,6 +92,7 @@ import {
 import { messagesInboxHtml, messageDetailHtml, unreadCount } from './messages';
 import { computeNavCounts } from './nav-counts';
 import { scratchIndexHtml, scratchSearchHtml, scratchFileHtml } from './scratch';
+import { listBuilderTranscripts, resolveBuilderTranscript } from '../builder/identity-transcript';
 import { groupScratchBySession, scratchEntry, searchScratch, scratchPathsMentionedIn } from '../builder/scratch-view';
 import {
   raisedInboxHtml,
@@ -106,6 +110,7 @@ import {
   conversationsSearchHtml,
   conversationDetailHtml,
   conversationsApiPayload,
+  buildersApiPayload,
   resolveConversationSessionId,
   runConversationSearch,
   MESSAGES_PER_PAGE,
@@ -213,12 +218,19 @@ import type { ProgressEmitter } from '../daemon/progress';
 import { parseServeNotice } from './serve-notice';
 import type { WebSocketUpgrader } from './ws';
 import { taskPageHtml, type TaskPageReviewExtras, type TaskProgressLine } from './task-page';
+import { loadChangesDiff, BATCH_FILES, LOAD_ALL_BATCH_FACTOR, type ChangesLoadPlan } from './review-progressive';
+
+/** A progressive batch is BATCH_FILES; this is only a guard against a hand-built URL. */
+const MAX_FILE_CARDS_PER_REQUEST = BATCH_FILES * LOAD_ALL_BATCH_FACTOR * 5;
 import { commentSaveFailedHtml, commentEditRefusedHtml } from './task-notes';
 import { editUnseenComment, CommentAlreadySeenError, CommentNotFoundError } from '../task/comment-edit';
 import { relocatedReviewPath, isTaskTabSlug, type TaskTabId } from './task-tabs';
 import { buildLiveStatusPayload, type TaskLiveRegionSources } from './task-live-status';
 import { sanitizeUserText } from '../utils/sanitize-text';
 import { getActor } from '../constants';
+import { artifactFileResponse, hasTextPreview, inlineImageType } from './artifacts-tab';
+import { ArtifactLimitError } from '../artifacts/limits';
+import { ArtifactNameError, normalizeArtifactName } from '../artifacts/name';
 import { clustersPageHtml } from './cluster-tasks';
 import { activeClusterCount, listClusterEntries, type ClusterEntry } from '../task/cluster-entries';
 import { actionDialogChromeHtml, actionDialogScript } from './action-dialog';
@@ -226,6 +238,8 @@ import { protocolDir } from '../protocol';
 import { readTaskProgress } from '../protocol/progress';
 import type { TurnReport } from '../types';
 import { usagePauseBannerHtml } from './usage-pause-banner';
+import { tokenBudgetBoxHtml } from './token-budget-box';
+import type { TokenBudgetView } from '../usage-pause/budget-view';
 import type { UsagePauseState } from '../daemon/usage-pause';
 
 /**
@@ -515,6 +529,16 @@ async function buildActivityData(
  * The dashboard's usage-pause status line. A failure to read the state costs
  * the line, never the page: it is logged, and the rest of the dashboard renders.
  */
+async function dashboardTokenBudgetHtml(tokenBudget?: () => Promise<TokenBudgetView>): Promise<string> {
+  if (!tokenBudget) return '';
+  try {
+    return tokenBudgetBoxHtml(await tokenBudget());
+  } catch (err) {
+    logger.warn(`Dashboard: could not read the token budget: ${err instanceof Error ? err.message : String(err)}`);
+    return '';
+  }
+}
+
 async function dashboardUsagePauseHtml(usagePauseState?: () => Promise<UsagePauseState>): Promise<string> {
   if (!usagePauseState) return '';
   try {
@@ -528,6 +552,7 @@ async function dashboardUsagePauseHtml(usagePauseState?: () => Promise<UsagePaus
 async function handleDashboard(
   storage: Storage,
   usagePauseState?: () => Promise<UsagePauseState>,
+  tokenBudget?: () => Promise<TokenBudgetView>,
 ): Promise<Response> {
   const allTasks = await storage.listTasks();
 
@@ -664,6 +689,7 @@ async function handleDashboard(
     activeStates,
     unreadMessages,
     usagePauseHtml: await dashboardUsagePauseHtml(usagePauseState),
+    tokenBudgetHtml: await dashboardTokenBudgetHtml(tokenBudget),
   };
 
   return html(dashboardHtml(stats, duplicatedCodes));
@@ -840,6 +866,89 @@ async function containerControlsForTask(
     // without that port the form would 503, so it stays hidden.
     canDesignate: !!serveActions,
   };
+}
+
+/** The upload's result line, carried on the redirect back to the tab. */
+function artifactNoticeFrom(url: URL): { text: string; error?: boolean } | null {
+  const replaced = url.searchParams.get('replaced');
+  if (replaced) return { text: `Replaced ${replaced} with the uploaded file. The agent will find it in .lazy-task-sandbox/artifacts/ on its next turn.` };
+  const ok = url.searchParams.get('uploaded');
+  if (ok) return { text: `Uploaded ${ok}. The agent will find it in .lazy-task-sandbox/artifacts/ on its next turn.` };
+  const err = url.searchParams.get('upload_error');
+  if (err) return { text: `Upload failed: ${err}`, error: true };
+  return null;
+}
+
+/**
+ * GET /tasks/:id/artifacts/file?name=…[&download=1] — one artifact's bytes,
+ * read from the artifact store through Storage (never the worktree). Behind
+ * the same dashboard session guard as every other route; the headers that keep
+ * the content from running on this origin are {@link artifactFileResponse}'s.
+ */
+async function handleArtifactFile(storage: Storage, req: Request, url: URL, taskIdParam: string): Promise<Response> {
+  if (req.method !== 'GET') return json({ error: 'Method not allowed' }, 405);
+  const task = (await storage.resolveTask(taskIdParam)).task;
+  if (!task) return json({ error: `Task not found: ${taskIdParam}` }, 404);
+  const name = url.searchParams.get('name') ?? '';
+  if (!name) return json({ error: 'name is required' }, 400);
+  let artifact;
+  try {
+    artifact = await storage.getTaskArtifact(task.id, name);
+  } catch (err) {
+    // A malformed name is the caller's error, not a server fault.
+    if (err instanceof ArtifactNameError) return json({ error: err.message }, 400);
+    throw err;
+  }
+  if (!artifact) return json({ error: `Artifact not found: ${name}` }, 404);
+  return artifactFileResponse(artifact, url.searchParams.get('download') === '1');
+}
+
+/**
+ * POST /tasks/:id/artifacts/upload — attach an INPUT file for the agent, the
+ * web twin of `lazy artifact add`. Persists the artifact and nothing else:
+ * like a comment, it never starts a turn. Name and size rules are the store's
+ * own (`normalizeArtifactName`, the limits), so the refusal reads the same as
+ * the CLI's.
+ */
+async function handleArtifactUpload(storage: Storage, req: Request, url: URL, taskIdParam: string): Promise<Response> {
+  if (req.method !== 'POST') return json({ error: 'Method not allowed' }, 405);
+  const task = (await storage.resolveTask(taskIdParam)).task;
+  if (!task) return html(errorHtml('Not Found', `Task not found: ${taskIdParam}`), 404);
+  const back = await taskPageUrl(storage, url.origin, task, '/artifacts');
+  const redirect = (key: string, value: string) => {
+    const target = new URL(back);
+    target.searchParams.set(key, value);
+    return Response.redirect(target.toString(), 303);
+  };
+  let form: FormData;
+  try {
+    form = await req.formData();
+  } catch (err) {
+    return redirect('upload_error', `could not read the upload: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const file = form.get('file');
+  if (!(file instanceof Blob) || file.size === 0) {
+    return redirect('upload_error', 'choose a non-empty file to upload.');
+  }
+  const typed = form.get('name');
+  const rawName = (typeof typed === 'string' && typed.trim()) || (file as File).name || '';
+  try {
+    const name = normalizeArtifactName(rawName);
+    const bytes = Buffer.from(await file.arrayBuffer());
+    const existing = await storage.getTaskArtifact(task.id, name);
+    const artifact = await storage.createTaskArtifact(
+      task.id,
+      { name, content_base64: bytes.toString('base64'), origin: 'input' },
+      getActor(),
+    );
+    return redirect(existing ? 'replaced' : 'uploaded', artifact.name);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (!(err instanceof ArtifactLimitError) && !(err instanceof ArtifactNameError)) {
+      logger.error(`web: could not attach artifact on task ${task.id.slice(0, 8)}: ${message}`);
+    }
+    return redirect('upload_error', message);
+  }
 }
 
 /**
@@ -1034,6 +1143,63 @@ async function handleDesignateStartCmd(
   }
 
   return Response.redirect(await taskPageUrl(storage, url.origin, task, '/services'), 303);
+}
+
+/**
+ * POST /tasks/:id/usage-pause/allow and /usage-pause/clear — set or drop the
+ * task's usage-pause allowance ("let its next turn through"), one launch.
+ *
+ * The rule is the daemon's (`usagePause` allowTask / clearTask, see "The
+ * per-task allowance" in src/daemon/usage-pause.ts); this route only carries a
+ * person's click to it as the human channel. `back=dashboard` returns to the
+ * dashboard's usage-pause banner, anything else to the task page — never a
+ * caller-supplied URL.
+ */
+async function handleUsagePauseAllowance(
+  storage: Storage,
+  taskActions: TaskActions | undefined,
+  req: Request,
+  url: URL,
+  taskIdParam: string,
+  op: string,
+): Promise<Response> {
+  if (req.method !== 'POST') return json({ error: 'Method not allowed' }, 405);
+  if (op !== 'allow' && op !== 'clear') {
+    return html(errorHtml('Not Found', `Unknown usage-pause action: ${op}`), 404);
+  }
+  const task = await storage.getTask(taskIdParam);
+  if (!task) return html(errorHtml('Not Found', `Task not found: ${taskIdParam}`), 404);
+  if (!taskActions) {
+    return html(
+      errorHtml('Unavailable', 'The usage pause cannot be changed here: this dashboard was started without a daemon action port.'),
+      503,
+    );
+  }
+  let form: FormData;
+  try {
+    form = await req.formData();
+  } catch {
+    // An empty POST carries no `back`: the task page is the default target.
+    form = new FormData();
+  }
+  try {
+    if (op === 'allow') await taskActions.allowPastUsagePause(task.id);
+    else await taskActions.clearUsagePauseAllowance(task.id);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // The daemon's own answer: 403 (channel may not), 404 (task gone), …
+    const status = err instanceof RpcError ? err.status : 500;
+    const title = status === 403 ? 'Not Allowed' : status === 404 ? 'Not Found' : 'Failed';
+    return html(errorHtml(title, message), status);
+  }
+  const msg = op === 'allow'
+    ? 'Its next turn will be let through the usage pause.'
+    : 'The usage-pause allowance was cleared.';
+  // The dashboard shows the change in its banner itself; it has no flash line.
+  if (String(form.get('back') ?? '') === 'dashboard') {
+    return Response.redirect(`${url.origin}/#usage-pause-status`, 303);
+  }
+  return Response.redirect(`${await taskPageUrl(storage, url.origin, task)}?flash=${encodeURIComponent(msg)}`, 303);
 }
 
 /**
@@ -1414,6 +1580,20 @@ async function handleTaskDetail(
   // and `?scope=task` narrows back to the task alone. The proxy audit trail is
   // no longer read here at all: the tool table comes from records that do not
   // expire, so opening this tab no longer parses 20k log lines either.
+  // Artifact METADATA on every render (it is the strip badge); decoded text
+  // for previews only when the Artifacts tab itself is drawn.
+  const artifacts = await timings.measure('storage.artifacts', () => storage.listTaskArtifacts(task.id));
+  let artifactTexts: Map<string, string> | undefined;
+  if (tab === 'artifacts' && !omitBody) {
+    artifactTexts = new Map();
+    for (const a of artifacts) {
+      if (!hasTextPreview(a)) continue;
+      const content = await storage.getTaskArtifact(task.id, a.name);
+      if (content) artifactTexts.set(a.name, Buffer.from(content.content_base64, 'base64').toString('utf8'));
+    }
+  }
+  const artifactNotice = tab === 'artifacts' ? artifactNoticeFrom(url) : null;
+
   let stats: TaskStatsResult | undefined;
   if (tab === 'stats' && !omitBody) {
     const requested = parseStatsScope(url.searchParams.get('scope'));
@@ -1457,6 +1637,7 @@ async function handleTaskDetail(
   let upstream = null as Awaited<ReturnType<NonNullable<TaskActions>['getUpstreamStatus']>> | null;
   let reparentTargets = null as Awaited<ReturnType<NonNullable<TaskActions>['listReparentTargets']>> | null;
   let submitPreflight = null as Awaited<ReturnType<NonNullable<TaskActions>['submitPreflight']>> | null;
+  let usagePause: TaskUsagePauseView | null = null;
   if (taskActions) {
     // Both of these feed the always-on header. A plain fragment (tab switch)
     // does not emit the header — strip + body only — so skip the loads. A
@@ -1494,6 +1675,15 @@ async function handleTaskDetail(
         logger.debug(`submit preflight for ${task.id.slice(0, 8)}: ${err instanceof Error ? err.message : err}`);
       }
     }
+    // Header line + the launch dialogs' "let this turn through" box, and the
+    // Unblock dialog on Current review. The daemon judges; the page renders.
+    if (!isTerminalStatus(task.status) && (!fragment || chrome || tab === 'review')) {
+      try {
+        usagePause = await timings.measure('usage_pause', () => taskActions.usagePauseForTask(task.id));
+      } catch (err) {
+        logger.debug(`usage pause for ${task.id.slice(0, 8)}: ${err instanceof Error ? err.message : err}`);
+      }
+    }
   }
 
   // The `changes` freshness key, stamped only on the full page — a fragment
@@ -1510,8 +1700,14 @@ async function handleTaskDetail(
     const symbols = await loadSymbolLinkify(reviewActions, task.id, seg, timings);
     if (symbols) linkify.push(symbols);
   }
+  // Not on a body=0 live poll: it renders no prose, and the index reads every
+  // task's raised items.
+  const idLinks = omitBody
+    ? undefined
+    : await timings.measure('id_links', () => loadIdLinks(storage, task.id, taskCodes));
   const markdown: RenderMarkdownOptions = {
     linkify,
+    idLinks,
     // `seg` is the code-or-id segment, ALREADY escaped by taskPathSegment —
     // which is why it is interpolated raw here. That carries upstream's intent
     // (the id used to go in unescaped) and the code spelling together.
@@ -1561,10 +1757,14 @@ async function handleTaskDetail(
       reviewSettings,
       reparentTargets,
       submitPreflight,
+      usagePause,
       markdown,
       openRaisedId: extras?.openRaisedId,
       openRaisedPanel: extras?.openRaisedPanel,
       stats,
+      artifacts,
+      artifactTexts,
+      artifactNotice,
       duplicatedCodes: codeTables.duplicated,
     }),
   );
@@ -1748,8 +1948,9 @@ async function loadReviewEmbed(
   timings.count('region_count', regionRows.length);
 
   const diffPhase = timings.begin('diff');
+  let progressive: ChangesLoadPlan | null = null;
   try {
-    diffText = await actions.getDiff(task.id, activeRegion ? { region: activeRegion } : undefined);
+    ({ diffText, progressive } = await loadChangesDiff(actions, task.id, activeRegion));
   } catch (err) {
     notice = notice ?? {
       text: `Could not load the diff: ${err instanceof Error ? err.message : String(err)}`,
@@ -1787,6 +1988,7 @@ async function loadReviewEmbed(
     markdownSources,
     hubChildren,
     regions: regionExtras({ ...regionCover, regions: regionRows }, activeRegion),
+    ...(progressive ? { progressive } : {}),
     // Only the files this view actually renders. The gutter is a reading aid
     // on the diff in front of someone, and a release cover's whole per-line map
     // is proportional to LINES rather than files.
@@ -1933,10 +2135,12 @@ async function handleTaskAction(
     }
   }
 
+  // "Let this turn through the usage pause" (Start / Resume dialogs).
+  const pastUsagePause = String(form.get('past_usage_pause') ?? '') === '1';
   const runVerb = async (onProgress?: ProgressEmitter): Promise<string> => {
     switch (verb) {
       case 'start':
-        await taskActions.startTask(task.id, onProgress);
+        await taskActions.startTask(task.id, onProgress, { pastUsagePause });
         break;
       case 'stop':
         await taskActions.stopTask(task.id, reason, onProgress);
@@ -1948,11 +2152,15 @@ async function handleTaskAction(
         await taskActions.rejectTask(task.id, reason, onProgress);
         break;
       case 'resume':
-        await taskActions.resumeTask(task.id, onProgress);
+        await taskActions.resumeTask(task.id, onProgress, { pastUsagePause });
         break;
-      case 'reopen':
-        await taskActions.reopenTask(task.id, reason || undefined, onProgress);
-        break;
+      case 'reopen': {
+        // The restore line and the sync-due hint are what reopen has to say —
+        // the dashboard shows them like every other reopen surface.
+        const result = await taskActions.reopenTask(task.id, reason || undefined, onProgress);
+        const msg = ['Reopened.', ...(result.warnings ?? [])].filter(Boolean).join(' ');
+        return `${url.origin}${backPath}?flash=${encodeURIComponent(msg)}`;
+      }
       case 'sync': {
         const result = await taskActions.syncTask(task.id, onProgress);
         const msg = [result.message, ...(result.warnings ?? [])].filter(Boolean).join(' ');
@@ -2081,6 +2289,7 @@ async function selectableAgentsForTask(
       name: profile.name,
       summary: agentProfileSummary(profile),
       group: profile.builtin ? 'builtin' : 'configured',
+      description: profile.description,
     }));
     // A pinned name that resolves is a real profile the offered set merely hides
     // — today that is lazy's internal qa-agent — so it keeps its true summary
@@ -2573,19 +2782,13 @@ async function handleCommitDetail(storage: Storage, taskId: string, commitId: st
     return html(errorHtml('Not Found', `Task not found: ${taskId}`), 404);
   }
 
-  const session = await storage.getSessionByTaskId(task.id);
-  if (!session) {
-    return html(errorHtml('Not Found', 'Task has no session'), 404);
-  }
-
-  const commits = await storage.getSessionCommits(session.id);
-  const commit = commits.find(c => c.id === commitId);
+  const commit = await findRecordedCommit(storage, task, commitId);
   if (!commit) {
     return html(errorHtml('Not Found', `Commit not found: ${commitId}`), 404);
   }
 
-  // Fetch diff from git on demand (no longer stored in commits.json)
-  const diffText = await getCommitDiff(commit.sha);
+  // First-parent patch from git on demand, the same answer as the commitPatch RPC.
+  const { patch: diffText } = await getCommitPatch(commit.sha);
 
   return html(commitDetailHtml(task, commit, diffText, duplicateTaskCodes(await storage.listTaskCodes())));
 }
@@ -2643,7 +2846,7 @@ async function handlePromptVersion(storage: Storage, taskId: string, versionPara
   const duplicatedCodes = duplicateTaskCodes(codes);
 
   if (versionParam === 'current') {
-    return html(promptVersionHtml(task, null, 'current', allVersions, duplicatedCodes));
+    return html(promptVersionHtml(task, null, 'current', allVersions, duplicatedCodes, await taskProseLinksFor(storage, task.id, codes)));
   }
 
   const versionNum = parseInt(versionParam, 10);
@@ -2656,7 +2859,7 @@ async function handlePromptVersion(storage: Storage, taskId: string, versionPara
     return html(errorHtml('Not Found', `Prompt version ${versionNum} not found`), 404);
   }
 
-  return html(promptVersionHtml(task, version, versionParam, allVersions, duplicatedCodes));
+  return html(promptVersionHtml(task, version, versionParam, allVersions, duplicatedCodes, await taskProseLinksFor(storage, task.id, codes)));
 }
 
 async function handleSearch(storage: Storage, url: URL): Promise<Response> {
@@ -2895,6 +3098,8 @@ export function createWebRequestHandler(
     serveActions?: ServeActions;
     /** The daemon's [usage_pause] state, for the dashboard's status line. */
     usagePauseState?: () => Promise<UsagePauseState>;
+    /** The daemon's token-budget view, for the dashboard's budget box. */
+    tokenBudget?: () => Promise<TokenBudgetView>;
   },
 ): (req: Request) => Promise<Response> {
   const deadlineMs = options?.deadlineMs ?? WEB_REQUEST_DEADLINE_MS;
@@ -2906,6 +3111,7 @@ export function createWebRequestHandler(
   const taskActions = options?.taskActions;
   const serveActions = options?.serveActions;
   const usagePauseState = options?.usagePauseState;
+  const tokenBudget = options?.tokenBudget;
   return async (req: Request) => {
     const url = new URL(req.url);
     const path = url.pathname;
@@ -2925,6 +3131,7 @@ export function createWebRequestHandler(
         path,
         cssFromDisk,
         usagePauseState,
+        tokenBudget,
       ),
       deadlineMs,
     );
@@ -2994,6 +3201,7 @@ async function routeWebRequest(
   path: string,
   cssFromDisk: boolean,
   usagePauseState?: () => Promise<UsagePauseState>,
+  tokenBudget?: () => Promise<TokenBudgetView>,
 ): Promise<Response> {
   try {
     if (path === STYLESHEET_PATH) {
@@ -3064,9 +3272,19 @@ async function routeWebRequest(
     // Builder conversations. Reads come straight from Storage; the one
     // mutation — promoting part of a transcript into a task — goes through the
     // action port like every other write on this surface.
+    //
+    // The pages are named for what a human reads — Builders — and live under
+    // /builders. /conversations is the old name: its pages redirect (a GET only,
+    // so a stale POST is never replayed as a GET), and /api/conversations keeps
+    // answering for existing clients.
+    if ((path === '/conversations' || path.startsWith('/conversations/')) && req.method === 'GET') {
+      return Response.redirect(`${url.origin}/builders${path.slice('/conversations'.length)}${url.search}`, 301);
+    }
     if (
-      path === '/conversations' ||
+      path === '/builders' ||
+      path.startsWith('/builders/') ||
       path.startsWith('/conversations/') ||
+      path === '/api/builders' ||
       path === '/api/conversations'
     ) {
       return await handleConversationsRoute(storage, actions, req, url, path);
@@ -3093,7 +3311,7 @@ async function routeWebRequest(
 
     // HTML routes
     if (path === '/') {
-      return await handleDashboard(storage, usagePauseState);
+      return await handleDashboard(storage, usagePauseState, tokenBudget);
     }
 
     // Review with builder is gone: the listing was itself an entry point.
@@ -3161,6 +3379,12 @@ async function routeWebRequest(
       return await handleTaskAction(storage, taskActions, req, url, params.id, params.verb);
     }
 
+    // "Let its next turn through" the usage pause, and its Clear (POST-only).
+    params = matchRoute(path, '/tasks/:id/usage-pause/:op');
+    if (params) {
+      return await handleUsagePauseAllowance(storage, taskActions, req, url, params.id, params.op);
+    }
+
     // Container start: /tasks/:id/container/start (POST-only, form + redirect)
     params = matchRoute(path, '/tasks/:id/container/start');
     if (params) {
@@ -3185,6 +3409,17 @@ async function routeWebRequest(
     params = matchRoute(path, '/tasks/:id/comments/add');
     if (params) {
       return await handleAddComment(storage, req, url, params.id);
+    }
+
+    // Artifacts tab leaves: the bytes, and the upload. Before the generic
+    // /tasks/:id/:tab route, same reason as comments/add.
+    params = matchRoute(path, '/tasks/:id/artifacts/file');
+    if (params) {
+      return await handleArtifactFile(storage, req, url, params.id);
+    }
+    params = matchRoute(path, '/tasks/:id/artifacts/upload');
+    if (params) {
+      return await handleArtifactUpload(storage, req, url, params.id);
     }
 
     // Edit a comment the agent has not seen yet (POST-only), same ordering reason.
@@ -3312,6 +3547,14 @@ async function handleReviewRoute(
 ): Promise<Response> {
   const wantsJson = path.startsWith('/api/');
 
+  // The Builders pages carry each builder's run badge; settle runs whose
+  // container is gone first, so this page and the terminal give one answer
+  // (settleDeadBuilderSessions). Never throws.
+  if (req.method === 'GET' && (path === '/builders' || path === '/api/builders' || path.startsWith('/builders/'))) {
+    const root = findLazyRoot();
+    if (root) await (await import('../daemon/builder-sessions')).settleDeadBuilderSessions(root);
+  }
+
   // Redirect targets inside this route read the task's code (id when the code
   // is duplicated), so the browser lands on the task that was acted on and
   // the address bar reads like every other task URL.
@@ -3361,12 +3604,13 @@ async function handleReviewRoute(
     // Images only. Serving arbitrary artifact bytes inline on the dashboard's
     // own origin would let an agent-authored HTML or SVG artifact run script
     // against this page; a screenshot route has no reason to allow it.
-    if (!artifact.mime_type.startsWith('image/') || artifact.mime_type === 'image/svg+xml') {
+    const imageType = inlineImageType(artifact.mime_type);
+    if (!imageType) {
       return json({ error: `Artifact is not a renderable image: ${name} (${artifact.mime_type})` }, 415);
     }
     return new Response(Buffer.from(artifact.content_base64, 'base64'), {
       headers: {
-        'Content-Type': artifact.mime_type,
+        'Content-Type': imageType,
         'Content-Disposition': `inline; filename="${encodeURIComponent(artifact.name.split('/').pop() ?? 'screenshot')}"`,
         'X-Content-Type-Options': 'nosniff',
         'Cache-Control': 'no-store',
@@ -3406,9 +3650,14 @@ async function handleReviewRoute(
   if (params) {
     const resolved = await storage.resolveTask(params.id);
     if (!resolved.task) return json({ error: 'Task not found' }, 404);
-    return json(
-      threadsJson(await actions.listComments(resolved.task.id), await reviewLiveState(storage, resolved.task), resolved.task),
-    );
+    // What accept refuses on, by the accept gate's own rule — the island
+    // refills Accept's "merge without delivering" slot from it.
+    const queuedFeedback = await queuedHumanFeedbackForTask(storage, resolved.task.id);
+    return json({
+      ...threadsJson(await actions.listComments(resolved.task.id), await reviewLiveState(storage, resolved.task), resolved.task),
+      queuedFeedback,
+      queuedFeedbackHtml: queuedFeedbackBoxHtml(queuedFeedback),
+    });
   }
 
   // Unchanged context around a hunk, for the diff's expand controls. A GET
@@ -3431,6 +3680,47 @@ async function handleReviewRoute(
           side: sideParam,
           start: Number(q.get('start')),
           end: Number(q.get('end')),
+        }),
+      );
+    } catch (err) {
+      const status = err instanceof RpcError ? err.status : 500;
+      return json({ error: err instanceof Error ? err.message : String(err) }, status);
+    }
+  }
+
+  // A batch of file cards for the progressive Changes tab
+  // (src/server/review-progressive.ts): the path-scoped diff of just these
+  // files, rendered with the page's own threads, gutters and decisions. A GET
+  // because it reads; only files the task's diff actually contains come back,
+  // since the diff itself is scoped to the task's range.
+  params = matchRoute(path, '/api/review/:id/files');
+  if (params) {
+    if (req.method !== 'GET') return json({ error: 'Method not allowed' }, 405);
+    const resolved = await storage.resolveTask(params.id);
+    if (!resolved.task) return json({ error: 'Task not found' }, 404);
+    const wanted = url.searchParams.getAll('path').filter((p) => p.trim());
+    const old = url.searchParams.getAll('old').filter((p) => p.trim());
+    if (wanted.length === 0) return json({ error: 'at least one path is required' }, 400);
+    if (wanted.length > MAX_FILE_CARDS_PER_REQUEST) {
+      return json({ error: `at most ${MAX_FILE_CARDS_PER_REQUEST} paths per request, got ${wanted.length}` }, 400);
+    }
+    try {
+      const task = resolved.task;
+      const diffText = await actions.getDiff(task.id, { files: [...wanted, ...old] });
+      const diffFiles = parseUnifiedDiff(diffText).filter((f) => wanted.includes(f.path));
+      const [comments, violations, isMaintainedPath, markdownSources, lineAttribution] = await Promise.all([
+        actions.listComments(task.id),
+        taskFileViolations(storage, task.id),
+        maintainPathMatcher(),
+        loadMarkdownSources(diffFiles, (query) => actions.getFileLines(task.id, query)),
+        actions.lineAttribution(task.id, diffFiles.map((f) => f.path)),
+      ]);
+      return json(
+        reviewFileCardsHtml(task, diffText, comments, violations, wanted, {
+          isMaintainedPath,
+          markdownSources,
+          lineAttribution,
+          duplicatedCodes: await reviewDupCodes(),
         }),
       );
     } catch (err) {
@@ -3721,6 +4011,7 @@ async function handleReviewRoute(
     // by the dialog, which stays open with them on a refusal.
     if (fromFeedbackBox) await saveDraftQuietly(actions, resolved.task.id, { feedback: message });
     const raisedResolutions = parseRaisedResolutionsFromForm(form);
+    const pastUsagePause = String(form.get('past_usage_pause') ?? '') === '1';
     // INVARIANT (approval-happens-at-accept — move-file-approval-to-accept):
     // no protected-file gate here. Unblock reverts nothing, so a pending
     // violation neither blocks this POST nor travels with it.
@@ -3732,7 +4023,7 @@ async function handleReviewRoute(
           message,
           raisedResolutions.length > 0 ? raisedResolutions : undefined,
           onProgress,
-          { keepFeedbackDraft: !fromFeedbackBox },
+          { keepFeedbackDraft: !fromFeedbackBox, pastUsagePause },
         );
         return { redirect };
       });
@@ -3743,7 +4034,7 @@ async function handleReviewRoute(
         message,
         raisedResolutions.length > 0 ? raisedResolutions : undefined,
         undefined,
-        { keepFeedbackDraft: !fromFeedbackBox },
+        { keepFeedbackDraft: !fromFeedbackBox, pastUsagePause },
       );
     } catch (err) {
       return renderReviewPage(storage, actions, taskActions, resolved.task.id, {
@@ -4040,7 +4331,7 @@ async function handleReviewSessionRoute(
     if (!resolved.task) return json({ error: 'Task not found' }, 404);
     const session = await storage.getReviewSessionByTaskId(resolved.task.id);
     if (!session) return gone();
-    return json(reviewSessionPollJson(session, session.messages ?? []));
+    return json(reviewSessionPollJson(session, session.messages ?? [], await taskProseLinksFor(storage, resolved.task.id)));
   }
 
   // Start and send used to compose a live builder turn. 410 even when a
@@ -4061,7 +4352,7 @@ async function handleReviewSessionRoute(
     if (!resolved.task) return html(errorHtml('Not Found', 'Task not found'), 404);
     const session = await storage.getReviewSessionByTaskId(resolved.task.id);
     if (!session) return gone();
-    return html(reviewSessionPageHtml(resolved.task, session, session.messages ?? []));
+    return html(reviewSessionPageHtml(resolved.task, session, session.messages ?? [], undefined, await taskProseLinksFor(storage, resolved.task.id)));
   }
 
   return wantsJson ? json({ error: 'Not found' }, 404) : html(errorHtml('Not Found', 'Page not found'), 404);
@@ -4166,7 +4457,7 @@ async function handleMessagesRoute(
       messageDetailHtml(existing, {
         text: 'Read-only: this dashboard was started without a daemon action port, so this message was not marked read and cannot be dismissed here.',
         error: true,
-      }, await scratchMentionsFor(storage, existing)),
+      }, await scratchMentionsFor(storage, existing), await proseLinksFor(storage)),
     );
   }
   let message = existing;
@@ -4181,7 +4472,7 @@ async function handleMessagesRoute(
       error: true,
     };
   }
-  return html(messageDetailHtml(message, notice, await scratchMentionsFor(storage, message)));
+  return html(messageDetailHtml(message, notice, await scratchMentionsFor(storage, message), await proseLinksFor(storage)));
 }
 
 /**
@@ -4245,7 +4536,11 @@ async function handleRaisedRoute(
       }
     }
     return raisedPanelHtml(item, similarRaisedForDetail(item, allListed), {
-      markdown: { linkify, hashLinkBase: taskPath({ id: item.task_id, code: item.task_code }, raisedDup) + '/changes' },
+      markdown: {
+        linkify,
+        hashLinkBase: taskPath({ id: item.task_id, code: item.task_code }, raisedDup) + '/changes',
+        idLinks: await loadIdLinks(storage, item.task_id),
+      },
       taskCodes: raisedCodes,
       ...(decideError ? { decideError } : {}),
     });
@@ -4385,7 +4680,7 @@ async function handleScratchRoute(storage: Storage, req: Request, url: URL, path
       : html(errorHtml('Method Not Allowed', 'This page is read-only.'), 405);
   }
   if (path === '/api/scratch') {
-    return json({ groups: groupScratchBySession(await storage.listScratchFiles()) });
+    return json({ groups: groupScratchBySession(await storage.listScratchFiles(), await storage.listBuilders()) });
   }
   if (path === '/scratch/file') {
     const filePath = url.searchParams.get('path') ?? '';
@@ -4398,7 +4693,7 @@ async function handleScratchRoute(storage: Storage, req: Request, url: URL, path
   }
   if (path === '/scratch') {
     const query = (url.searchParams.get('q') ?? '').trim();
-    if (!query) return html(scratchIndexHtml(groupScratchBySession(await storage.listScratchFiles())));
+    if (!query) return html(scratchIndexHtml(groupScratchBySession(await storage.listScratchFiles(), await storage.listBuilders())));
     try {
       return html(scratchSearchHtml(query, await searchScratch(storage, query)));
     } catch (err) {
@@ -4451,7 +4746,8 @@ async function handleConversationsRoute(
 ): Promise<Response> {
   const wantsJson = path.startsWith('/api/');
 
-  const promoteParams = matchRoute(path, '/conversations/:sessionId/promote');
+  const promoteParams = matchRoute(path, '/builders/:sessionId/promote')
+    ?? matchRoute(path, '/conversations/:sessionId/promote');
   if (promoteParams) {
     if (req.method !== 'POST') return json({ error: 'Method not allowed' }, 405);
     if (!actions) {
@@ -4491,7 +4787,7 @@ async function handleConversationsRoute(
       const seg = taskPathSegment(result.task, duplicateTaskCodes(await storage.listTaskCodes()));
       const label = result.task.code ?? result.task.id.slice(0, 8);
       return Response.redirect(
-        `${url.origin}/conversations/${encodeURIComponent(result.session_id)}` +
+        `${url.origin}/builders/${encodeURIComponent(result.session_id)}` +
         `?offset=${offset}&promoted=${encodeURIComponent(label)}&promotedTask=${encodeURIComponent(seg)}`,
         303,
       );
@@ -4518,8 +4814,11 @@ async function handleConversationsRoute(
     const summaries = await storage.listConversationSummaries();
     return json(conversationsApiPayload(summaries));
   }
+  if (path === '/api/builders') {
+    return json(buildersApiPayload(await storage.listBuilders()));
+  }
 
-  const detailParams = matchRoute(path, '/conversations/:sessionId');
+  const detailParams = matchRoute(path, '/builders/:sessionId');
   if (detailParams) {
     const requestedOffset = parseInt(url.searchParams.get('offset') ?? '0', 10);
     const selectedFrom = parseInt(url.searchParams.get('from') ?? '', 10);
@@ -4536,13 +4835,12 @@ async function handleConversationsRoute(
     );
   }
 
-  if (path === '/conversations') {
+  if (path === '/builders') {
     const query = (url.searchParams.get('q') ?? '').trim();
     if (!query) {
-      const summaries = await storage.listConversationSummaries();
-      return html(conversationsIndexHtml(summaries));
+      return html(conversationsIndexHtml(await storage.listBuilders()));
     }
-    const conversations = await storage.listConversations();
+    const conversations = await listBuilderTranscripts(storage);
     const { hits, error } = await runConversationSearch(conversations, query);
     const byId = new Map(conversations.map((c) => [c.sessionId, c]));
     return html(conversationsSearchHtml(query, hits, byId, error), error ? 400 : 200);
@@ -4570,19 +4868,20 @@ async function renderConversationDetail(
   requestedOffset: number,
   selection: { from: number | null; to: number | null; error?: string },
 ): Promise<Response> {
-  const summaries = await storage.listConversationSummaries();
-  const sessionId = resolveConversationSessionId(summaries, requestedId);
-  const conv = sessionId ? await storage.loadConversation(sessionId) : null;
-  if (!conv) {
+  // A Builder id, any of its segments' session ids (old links, scratch
+  // provenance), or a unique prefix — resolved to the Builder's joined transcript.
+  const resolved = await resolveBuilderTranscript(storage, requestedId);
+  if (!resolved || 'ambiguous' in resolved) {
     return html(
       errorHtml(
         'Not Found',
-        'No builder conversation matches that id. If you used a short id, it may now match ' +
-        'more than one conversation — open it from the list instead.',
+        'No Builder matches that id. If you used a short id, it may now match ' +
+        'more than one Builder — open it from the list instead.',
       ),
       404,
     );
   }
+  const { builder, conversation: conv } = resolved;
 
   // Clamp rather than reject: an offset past the end is a stale link (the
   // transcript is append-only while capture runs), and landing on the last
@@ -4625,7 +4924,33 @@ async function renderConversationDetail(
     promotions,
     created: promotedLabel && promotedTask ? { id: promotedTask, label: promotedLabel } : null,
     error: selection.error ?? null,
-  }, duplicateTaskCodes(await storage.listTaskCodes())));
+  }, duplicateTaskCodes(await storage.listTaskCodes()), await proseLinksFor(storage), builder));
+}
+
+/**
+ * Link options for prose that belongs to no one task (a system message, a
+ * builder conversation): task codes plus task/raised ids. Commits need a task
+ * to resolve against, so they do not link here.
+ */
+/** Link options for prose that belongs to one task: codes, ids, and that task's commits. */
+async function taskProseLinksFor(
+  storage: Storage,
+  taskId: string,
+  codes?: TaskCodeEntry[],
+): Promise<RenderMarkdownOptions> {
+  const taskCodes = codes ?? await storage.listTaskCodes();
+  return {
+    linkify: [buildTaskCodeLinkify(taskCodes)],
+    idLinks: await loadIdLinks(storage, taskId, taskCodes),
+  };
+}
+
+async function proseLinksFor(storage: Storage): Promise<RenderMarkdownOptions> {
+  const codes = await storage.listTaskCodes();
+  return {
+    linkify: [buildTaskCodeLinkify(codes)],
+    idLinks: await loadIdLinks(storage, null, codes),
+  };
 }
 
 const MEMORY_ACTIONS_UNAVAILABLE =
@@ -5075,8 +5400,9 @@ async function renderReviewPage(
   let diffText = '';
   let diffNotice = notice;
   const diffPhase = timings.begin('diff');
+  let progressive: ChangesLoadPlan | null = null;
   try {
-    diffText = await actions.getDiff(resolved.task.id);
+    ({ diffText, progressive } = await loadChangesDiff(actions, resolved.task.id, null));
   } catch (err) {
     // A missing worktree or absent session must not blank the page — the
     // comment threads are the durable record and still have to render.

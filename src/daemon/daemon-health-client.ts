@@ -20,7 +20,7 @@ import type { ProgressEvent } from './progress';
 export const DAEMON_HEALTH_CLIENT_TIMEOUT_MS = 45_000;
 
 const STATES: ReadonlySet<string> = new Set<HealthState>(['ok', 'warn', 'fail']);
-const GROUPS: ReadonlySet<string> = new Set<HealthGroup>(['daemon', 'loops', 'sweeps', 'proxy', 'storage', 'runner', 'tasks', 'dashboard']);
+const GROUPS: ReadonlySet<string> = new Set<HealthGroup>(['daemon', 'credentials', 'loops', 'sweeps', 'proxy', 'storage', 'runner', 'tasks', 'dashboard']);
 
 /**
  * Validate one row off the wire. The daemon may be a different build than this

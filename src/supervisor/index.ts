@@ -20,8 +20,8 @@
  */
 
 import { existsSync } from 'fs';
-import { mkdir, writeFile } from 'fs/promises';
-import { join } from 'path';
+import { mkdir, realpath, writeFile } from 'fs/promises';
+import { basename, dirname, join } from 'path';
 import {
   readCommand,
   consumeCommand,
@@ -68,15 +68,18 @@ import { resolveWatchdogTimeout } from './watchdog';
 import { addAgentUsage, readUsage } from './usage';
 import { getAgent, getAgentPackaging } from '../agent/registry';
 import { log, logError, logWarn, resetTimer } from './log';
+import { adoptBeforeCommand } from '../utils/worktree-ownership';
 import { prepareTurnMcp } from './mcp-setup';
 import { clearTurnHandoff, handoffField, handoffTurnEnding } from './turn-handoff';
 import { createRunnerFromType } from '../runner';
 import type { Runner, RunnerType } from '../runner/types';
 import { VERSION } from '../version';
 import { spawn } from '../utils/spawn';
+import { getHome } from '../utils/home';
 import { startTestParentWatch, TEST_PARENT_PID_ENV } from '../daemon/test-parent-watch';
 import { runGit } from '../utils/git';
-import { elevatedResetHardHead, elevatedTag } from './elevated-git';
+import { elevatedResetHardHead, elevatedTag, elevatedRestoreRejected } from './elevated-git';
+import { buildRestoredProtectedFilesNotice } from '../protection/rejected-restore';
 import { detectViolations, ViolationScanError } from './permissions';
 import { runPermissionPushback } from './pushback';
 import { runLowHighReview, runLowHighRevise, reviewApproved } from './low-high-loop';
@@ -89,8 +92,10 @@ import { parseReviewReport } from '../review/parse-report';
 import { resolveReviewVerdict } from '../review/verdict';
 import { clearFinalMarker, readFinalMarker } from '../protocol/final-marker';
 import { runAcceptanceGate, DEFAULT_PRE_ACCEPT_TIMEOUT_SECS } from './accept-gate';
-import type { CompletedResponseBundle, FinalDeclaration } from '../protocol/types';
+import type { CompletedResponseBundle, FinalDeclaration, ProtectedRestoreDone } from '../protocol/types';
 import { truncateLog } from '../utils/log-truncate';
+import { hostGitPointerDenyPaths, taskWorktreeOf } from '../git/worktree-pointers';
+import { withGitPointerDenyArgs, withProjectRootWriteDenyArgs } from '../runner/host-sandbox';
 
 /** Write a response with the originating command's correlation id echoed back. */
 function writeCorrelatedResponse(
@@ -349,6 +354,14 @@ export async function runSupervisor(config: SupervisorConfig): Promise<void> {
       break;
     }
 
+    // A root daemon (native Linux, the Teams microVM) may have written into this
+    // worktree since the wrapper last adopted it — a sync, a child accept.
+    // Take those files back before anything in this turn needs to write them.
+    if (runnerType === 'docker') {
+      const adoptError = await adoptBeforeCommand(worktreePath);
+      if (adoptError) logWarn(`[supervisor] ${adoptError}`);
+    }
+
     // INVARIANT: Reject commands whose wire protocol doesn't match this supervisor.
     // When the protocol changes between releases, an older supervisor running in a
     // stale container can't safely execute commands written by a newer host (and
@@ -374,6 +387,8 @@ export async function runSupervisor(config: SupervisorConfig): Promise<void> {
     }
 
     try {
+      await addGitPointerDenies(command, worktreePath);
+      await addProjectRootWriteDenies(command, worktreePath);
       await handleTurnCommand(command, config, runner);
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -492,6 +507,7 @@ function mergeTurnOptions(cmd: {
   harness?: string;
   agent_id?: string;
   effort?: string;
+  agent_extra_args?: string[];
 }): MergeTurnOptions {
   const harness = commandHarness(cmd);
   return {
@@ -502,6 +518,7 @@ function mergeTurnOptions(cmd: {
     ),
     windDownTimeoutMs: cmd.wind_down_timeout_ms ?? 0,
     ...(cmd.effort ? { effort: cmd.effort } : {}),
+    ...(cmd.agent_extra_args?.length ? { extraArgs: cmd.agent_extra_args } : {}),
   };
 }
 
@@ -668,6 +685,62 @@ function makeTurnEndingCapture(protocolDir: string): {
       declaredTurnEnding = true;
     },
   };
+}
+
+/**
+ * Confine the agent's file tools to this worktree within the project root
+ * (docs/design/git-pointer-boundary.md, "Project root") by rewriting the
+ * command's `agent_extra_args` once, before anything launches an agent from it
+ * — every agent this turn runs takes its args from there. The daemon builds
+ * those args per project; the worktree is known here. Only args carrying a host
+ * `--settings` change, and only for a lazy task worktree.
+ */
+export async function addProjectRootWriteDenies(command: Command, worktreePath: string): Promise<void> {
+  const cmd = command as { agent_extra_args?: string[] };
+  if (!cmd.agent_extra_args?.includes('--settings')) return;
+  const wt = taskWorktreeOf(worktreePath);
+  if (!wt) return;
+  const projectRoots = [wt.projectRoot];
+  // File-tool rules match literal spellings: a symlinked root must not slip past.
+  const real = await realpath(wt.projectRoot).catch((err: NodeJS.ErrnoException) => {
+    throw new Error(`could not resolve project root ${wt.projectRoot} to confine the agent's file tools: ${err.message}`);
+  });
+  if (real !== wt.projectRoot) projectRoots.push(real);
+  // The home dir is denied too, except the way down to the root: the fixed
+  // sensitive-path list leaves ~/.gitconfig, ~/.zshenv, ~/Library/LaunchAgents…
+  const home = getHome();
+  const homeDirs = [home];
+  const realHome = await realpath(home).catch((err: NodeJS.ErrnoException) => {
+    throw new Error(`could not resolve home dir ${home} to confine the agent's file tools: ${err.message}`);
+  });
+  if (realHome !== home) homeDirs.push(realHome);
+  cmd.agent_extra_args = withProjectRootWriteDenyArgs(cmd.agent_extra_args, {
+    homeDirs,
+    projectRoots,
+    dataDir: basename(dirname(dirname(wt.worktreePath))),
+    worktreeName: basename(wt.worktreePath),
+  });
+  log(`[supervisor] Confined the agent's file tools to ${wt.worktreePath} within ${[...homeDirs, ...projectRoots].join(', ')}`);
+}
+
+/**
+ * Deny this worktree's git pointers to the agent's host sandbox
+ * (docs/design/git-pointer-boundary.md) by rewriting the command's
+ * `agent_extra_args` once, before anything launches an agent from it — every
+ * agent this turn runs (work, push-back, maintain, present, review re-ask)
+ * takes its args from there. The daemon builds those args per project; the
+ * pointers are per worktree, and this is where the worktree is known.
+ *
+ * Only args carrying a host `--settings` change. A tampered worktree throws,
+ * and the turn fails before any agent runs, as a container launch is refused.
+ */
+export async function addGitPointerDenies(command: Command, worktreePath: string): Promise<void> {
+  const cmd = command as { agent_extra_args?: string[] };
+  if (!cmd.agent_extra_args?.includes('--settings')) return;
+  const paths = await hostGitPointerDenyPaths(worktreePath);
+  if (!paths) return;
+  cmd.agent_extra_args = withGitPointerDenyArgs(cmd.agent_extra_args, paths);
+  log(`[supervisor] Denied ${paths.protectedPaths.length} git path(s) under ${paths.commonDirs.join(", ")} and the worktree to the agent sandbox`);
 }
 
 /**
@@ -855,6 +928,49 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     return;
   }
 
+  // Phase 2c: Restore REJECTED protected files (`restore_rejected_files`).
+  //
+  // A reviewer's Reject is carried out here, by lazy, never left to the agent:
+  // each file goes back to its base in ONE commit that is lazy's own, and only
+  // then does the agent run — told what was restored and that its job is to
+  // make the tree coherent with it (src/protection/rejected-restore.ts). After
+  // the merges, so an upstream merge cannot bring the rejected change back in
+  // under the restore; AFTER the pre-turn hook, so a hook that aborts the turn
+  // can never leave a restore with no agent turn after it. Once per turn,
+  // never retried within it. A failure does not fail the turn: the file stays
+  // rejected, accept keeps refusing, and the agent is told the restore did not
+  // happen.
+  const restorePlan = ('restore_rejected_files' in cmd ? cmd.restore_rejected_files : undefined) ?? [];
+  let restoredProtectedFiles: ProtectedRestoreDone[] = [];
+  let restoreNotice = '';
+  if (restorePlan.length > 0 && command.type === 'unblock' && (command as UnblockCommand).permission_mode !== 'plan') {
+    updatePhase(status, 'restore_rejected', protocolDir);
+    let restore: { exitCode: number; stdout: string; stderr: string };
+    try {
+      restore = await elevatedRestoreRejected(worktreePath, restorePlan);
+    } catch (err) {
+      // The daemon refused the plan or could not be reached: report it to the
+      // agent like any other failed restore, never fail the turn over it.
+      restore = { exitCode: 1, stdout: '', stderr: err instanceof Error ? err.message : String(err) };
+    }
+    if (restore.exitCode === 0) {
+      const commitSha = restore.stdout.trim();
+      if (commitSha) {
+        restoredProtectedFiles = restorePlan.map((r) => ({ ...r, commit_sha: commitSha }));
+        status.post_restore_sha = commitSha;
+        log(`[supervisor] Restored ${restorePlan.length} rejected protected file(s) in ${commitSha.substring(0, 8)}`);
+      } else {
+        log('[supervisor] Rejected protected files already match their base — nothing to restore');
+      }
+      restoreNotice = buildRestoredProtectedFilesNotice(restoredProtectedFiles);
+    } else {
+      const error = restore.stderr.trim() || `exit ${restore.exitCode}`;
+      logError(`[supervisor] Restoring rejected protected files failed: ${error}`);
+      restoreNotice = buildRestoredProtectedFilesNotice([], { plan: restorePlan, error });
+    }
+    updatePhase(status, 'restore_rejected_done', protocolDir);
+  }
+
   // Write this turn's MCP server config + permissions so Claude Code discovers
   // the lazy tools. Write mode — this turn may commit, journal, and run subtasks.
   await prepareTurnMcp(runner, cmd.task_id, worktreePath, { readOnly: false, harness: commandHarness(cmd), model: cmd.model_id });
@@ -912,9 +1028,9 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
 
     // A non-fatal pre-turn hook failure is prepended to the prompt so the agent
     // knows its environment is degraded before it starts assuming otherwise.
-    const promptForWork = preTurn.promptPrefix
-      ? `${preTurn.promptPrefix}\n\n${cmd.prompt}`
-      : cmd.prompt;
+    const promptForWork = [preTurn.promptPrefix, restoreNotice ? `${restoreNotice}\n\n---` : undefined, cmd.prompt]
+      .filter(Boolean)
+      .join('\n\n');
 
     const result = await runWork(
       agent,
@@ -997,7 +1113,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
         status: 'completed',
         result: review.response,
         session_id: review.session_id,
-        usage: review.usage,
+        ...(review.usage ? { usage: review.usage } : {}),
         ...launchSettings(cmd, review.model_id, cmd.low_high_loop.review_effort),
         start_sha_work: lastInvocationSha,
         end_sha_work: postReviewSha,
@@ -1028,7 +1144,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
           status: 'completed',
           result: revise.response,
           session_id: revise.session_id,
-          usage: revise.usage,
+          ...(revise.usage ? { usage: revise.usage } : {}),
           ...launchSettings(cmd, revise.model_id),
           start_sha_work: lastInvocationSha,
           end_sha_work: postReviseSha,
@@ -1062,7 +1178,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     // declaration still rides home on the work response; a human accepting a
     // plan-mode task gets the accept-time remedies instead.
     const protectedPatterns = cmd.protected_patterns ?? [];
-    const startShaWork = status.post_merge_sha ?? status.pre_turn_sha ?? preTurnSha;
+    const startShaWork = status.post_restore_sha ?? status.post_merge_sha ?? status.pre_turn_sha ?? preTurnSha;
     const upstreamMergeRef = 'upstream_merge_ref' in cmd
       ? (cmd as { upstream_merge_ref?: string }).upstream_merge_ref ?? cmd.parent_branch
       : cmd.parent_branch;
@@ -1273,10 +1389,11 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       status: 'completed',
       result: result.result,
       session_id: result.session_id,
-      usage: result.usage,
+      ...(result.usage ? { usage: result.usage } : {}),
       ...launchSettings(cmd, result.model_id),
       ...(result.mcp_tools ? { mcp_tools: result.mcp_tools } : {}),
       ...(turnRecovery ? { worktree_recovery: turnRecovery } : {}),
+      ...(restoredProtectedFiles.length > 0 ? { restored_protected_files: restoredProtectedFiles } : {}),
       ...handoff,
       // Pencils down, when the WORK invocation declared it (or the handoff
       // fallback did). A claim made during a follow-up rides on that
@@ -1346,6 +1463,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
       phase: 'work',
       ...launchSettings(cmd),
       ...(turnRecovery ? { worktree_recovery: turnRecovery } : {}),
+      ...(restoredProtectedFiles.length > 0 ? { restored_protected_files: restoredProtectedFiles } : {}),
       ...(await handoffField(worktreePath, log)),
       ...(agentHadNoEffect !== undefined ? { agent_had_no_effect: agentHadNoEffect } : {}),
       ...(failedTurnPaths && failedTurnPaths.length > 0
@@ -1439,7 +1557,7 @@ async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, run
         status: 'completed',
         result: result.resolution.result,
         session_id: result.resolution.session_id,
-        usage: result.resolution.usage,
+        ...(result.resolution.usage ? { usage: result.resolution.usage } : {}),
         // A sync command carries the task's agent, model and effort, so the
         // conflict-resolution turn is labelled with all three — the same
         // launch settings the merge turn actually ran on.
@@ -1704,7 +1822,7 @@ async function handleAskCommand(cmd: AskCommand, config: SupervisorConfig, runne
       status: 'completed',
       result: result.result,
       session_id: result.session_id,
-      usage: result.usage,
+      ...(result.usage ? { usage: result.usage } : {}),
       ...launchSettings(cmd, result.model_id),
       ...(result.mcp_tools ? { mcp_tools: result.mcp_tools } : {}),
       agent_duration_ms: agentDurationMs,
@@ -1833,13 +1951,14 @@ async function handleReviewCommand(cmd: ReviewCommand, config: SupervisorConfig,
     }
 
     updatePhase(status, 'writing_response', protocolDir);
+    const reviewUsage = addAgentUsage(result.usage, reaskUsage) ?? result.usage;
     const response: CompletedResponse = {
       status: 'completed',
       result: result.result,
       session_id: result.session_id,
       // The re-ask is part of this turn's spend: one response, one turn, so its
       // tokens are rolled into the review's usage rather than being lost.
-      usage: addAgentUsage(result.usage, reaskUsage) ?? result.usage,
+      ...(reviewUsage ? { usage: reviewUsage } : {}),
       ...launchSettings(cmd, result.model_id),
       ...(result.mcp_tools ? { mcp_tools: result.mcp_tools } : {}),
       ...(reask && !reask.failed && reask.response ? { review_reask: reask.response } : {}),

@@ -36,7 +36,7 @@ export interface PresentStepResult {
   /** Agent session id the invocation reported (for session reconciliation). */
   session_id: string;
   /** Full token usage of the invocation (incl. cache tokens). */
-  usage: AgentResponse['usage'];
+  usage?: AgentResponse['usage'];
   /** Concrete model id the agent reported for THIS invocation, when it reports one. */
   model_id?: string;
   /**
@@ -47,9 +47,6 @@ export interface PresentStepResult {
    */
   failed?: boolean;
 }
-
-/** Zero-usage fallback for a failed invocation (no agent tokens were spent). */
-const ZERO_USAGE: AgentResponse['usage'] = { input_tokens: 0, output_tokens: 0 };
 
 /**
  * Run the presentation step's invocation, resuming the wrap-up's session so the
@@ -103,7 +100,6 @@ export async function runPresentStep(
       prompt,
       response: 'Presentation step failed: agent exited with an error.',
       session_id: sessionId,
-      usage: { ...ZERO_USAGE },
       failed: true,
     };
   }
@@ -115,7 +111,7 @@ export async function runPresentStep(
       prompt,
       response: parsed.result,
       session_id: parsed.session_id,
-      usage: parsed.usage,
+      ...(parsed.usage ? { usage: parsed.usage } : {}),
       ...(parsed.model_id ? { model_id: parsed.model_id } : {}),
     };
   } catch (err) {
@@ -124,7 +120,6 @@ export async function runPresentStep(
       prompt,
       response: 'Presentation step failed: could not parse agent response.',
       session_id: sessionId,
-      usage: { ...ZERO_USAGE },
       failed: true,
     };
   }

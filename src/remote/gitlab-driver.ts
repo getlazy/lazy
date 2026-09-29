@@ -48,6 +48,8 @@ import type {
   AcceptGateWarning,
   MarkReadyOptions,
   OpenReview,
+  ReviewConversationItem,
+  ReviewStatus,
 } from './driver';
 import { truncateMRTitle } from './driver';
 import type { Task } from '../types';
@@ -83,6 +85,10 @@ async function runGl(args: string[], cwd?: string): Promise<GlResult> {
   const spawnOpts: Record<string, unknown> = {
     stdout: 'pipe',
     stderr: 'pipe',
+    // Explicit env: without it Bun resolves the binary on the PATH the process
+    // STARTED with, so this probe and the doctor's managed check (which passes
+    // env) could disagree about whether the CLI is installed.
+    env: process.env,
   };
   if (cwd) spawnOpts.cwd = cwd;
 
@@ -434,18 +440,19 @@ export class GitLabDriver implements RepositoryDriver {
     const mergeTarget = mrIid ?? sourceBranch;
 
     // Step 3: Squash merge via glab mr merge
-    const { LAZY_COAUTHOR_TRAILER } = await import('../constants');
+    const { withLazyCoauthorTrailer } = await import('../constants');
+    const trailer = opts.coauthorTrailer ?? true;
 
     // Fetch current MR description to preserve in commit message
     let commitMessage = task.goal;
-    let commitBody = LAZY_COAUTHOR_TRAILER;
+    let commitBody = withLazyCoauthorTrailer('', trailer);
     if (mrIid) {
       const viewResult = await this.gl(['mr', 'view', mrIid, '--output', 'json'], root);
       if (viewResult.exitCode === 0) {
         try {
           const mrData = JSON.parse(viewResult.stdout);
           const originalBody = mrData.description || '';
-          commitBody = originalBody ? `${originalBody}\n\n${LAZY_COAUTHOR_TRAILER}` : LAZY_COAUTHOR_TRAILER;
+          commitBody = withLazyCoauthorTrailer(originalBody, trailer);
         } catch {
           logger.debug('Failed to parse MR body, using co-author trailer only');
         }
@@ -458,7 +465,7 @@ export class GitLabDriver implements RepositoryDriver {
     // When the pipeline is already passing (or absent), GitLab will merge immediately;
     // when it is running/pending, GitLab queues "merge when pipeline succeeds".
     const mergeResult = await this.gl(
-      ['mr', 'merge', String(mergeTarget), '--squash', '--squash-message', `${commitMessage}\n\n${commitBody}`, '--auto-merge', '--yes'],
+      ['mr', 'merge', String(mergeTarget), '--squash', '--squash-message', [commitMessage, commitBody].filter(Boolean).join('\n\n'), '--auto-merge', '--yes'],
       root,
     );
     if (mergeResult.exitCode !== 0) {
@@ -904,6 +911,69 @@ export class GitLabDriver implements RepositoryDriver {
 
     logger.debug(`syncComments [${taskLabel}]: fetched ${comments.length} comments since ${since ?? 'the beginning'}, ${externalComments.length} external`);
     return externalComments;
+  }
+
+  async readReviewConversation(task: Task): Promise<ReviewConversationItem[]> {
+    const mrIid = this.requireMrNumber(task);
+    // Same prompt-injection gate as the import path.
+    if ((await this.readGlApi('projects/:id', false))[0]?.visibility !== 'private'
+      && !this.config.remote.gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection) {
+      throw new Error(
+        'This project is not private, so its MR comments are not shown to agents ' +
+        '(prompt injection risk). A human can opt in with gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection = true in [remote].',
+      );
+    }
+    const notes = await this.readGlApi(`projects/:id/merge_requests/${mrIid}/notes`, true);
+    const items: ReviewConversationItem[] = [];
+    for (const n of notes) {
+      if (n.system === true) continue;
+      const position = n.position as Record<string, unknown> | undefined;
+      items.push({
+        kind: position ? 'inline' : 'comment',
+        id: String(n.id),
+        author: ((n.author as Record<string, unknown> | undefined)?.username as string) ?? 'unknown',
+        createdAt: (n.created_at as string) ?? '',
+        body: (n.body as string) ?? '',
+        path: position?.new_path as string | undefined,
+        line: position?.new_line as number | undefined,
+        resolved: n.resolvable === true ? n.resolved === true : undefined,
+      });
+    }
+    items.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    return items;
+  }
+
+  async readReviewStatus(task: Task): Promise<ReviewStatus> {
+    const mrIid = this.requireMrNumber(task);
+    const [mr] = await this.readGlApi(`projects/:id/merge_requests/${mrIid}`, false);
+    const [approvals] = await this.readGlApi(`projects/:id/merge_requests/${mrIid}/approvals`, false);
+    const pipelines = await this.readGlApi(`projects/:id/merge_requests/${mrIid}/pipelines`, false);
+    const jobs = pipelines[0] ? await this.readGlApi(`projects/:id/pipelines/${pipelines[0].id}/jobs`, true) : [];
+    const state = mr.state === 'merged' ? 'MERGED' : mr.state === 'opened' ? 'OPEN' : mr.state === 'closed' || mr.state === 'locked' ? 'CLOSED' : null;
+    const approvedBy = (approvals.approved_by as Array<{ user?: { username?: string } }> | undefined) ?? [];
+    return {
+      state,
+      decision: null,
+      reviews: approvedBy.map((a) => ({ author: a.user?.username ?? 'unknown', state: 'APPROVED', submittedAt: '' })),
+      mergeable: (mr.detailed_merge_status as string) ?? (mr.merge_status as string) ?? null,
+      checks: jobs.map((j) => ({ name: String(j.name ?? ''), status: String(j.status ?? ''), conclusion: null, url: j.web_url as string | undefined })),
+    };
+  }
+
+  private requireMrNumber(task: Task): string {
+    const mrIid = this.mrNumber(task);
+    if (!mrIid) throw new Error('This task has no merge request recorded.');
+    return mrIid;
+  }
+
+  /** `glab api` that THROWS on failure; an object answer comes back as a one-element list. */
+  private async readGlApi(endpoint: string, paginate: boolean): Promise<Array<Record<string, unknown>>> {
+    const result = await this.gl(['api', endpoint, ...(paginate ? ['--paginate'] : [])]);
+    if (result.exitCode !== 0) throw new Error(`glab api ${endpoint} failed: ${result.stderr || `exit ${result.exitCode}`}`);
+    if (!result.stdout.trim()) return [];
+    if (paginate) return parsePaginatedApiJson(result.stdout);
+    const data = JSON.parse(result.stdout);
+    return Array.isArray(data) ? data : [data];
   }
 
   async getPRState(task: Task): Promise<PRState | null> {

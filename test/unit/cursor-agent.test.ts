@@ -334,6 +334,15 @@ describe('CursorAgent', () => {
       expect(response.result).toBe('Done!');
     });
 
+    test('preserves Cursor result usage and leaves an unreported measurement absent', () => {
+      const usage = { input_tokens: 31, output_tokens: 7, cache_read_input_tokens: 11 };
+      const measured = agent.parseResponse(JSON.stringify({ result: 'done', session_id: 's1', usage }));
+      expect(measured.usage).toEqual(usage);
+
+      const unmeasured = agent.parseResponse(JSON.stringify({ result: 'done', session_id: 's2' }));
+      expect(unmeasured.usage).toBeUndefined();
+    });
+
     test('scans a stream for the last result line', () => {
       const stdout = [
         JSON.stringify({ type: 'system', subtype: 'init' }),

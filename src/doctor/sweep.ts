@@ -12,6 +12,7 @@
 import { access, readFile, readdir } from 'fs/promises';
 import { join } from 'path';
 import { tryRemoteStorage } from '../preconditions';
+import { logger } from '../utils/logger';
 import { shortId, displayId, taskRef } from '../task/identity';
 import { checkHolder, describeDeadReason, type HolderVerdict } from '../utils/process-identity';
 import {
@@ -32,6 +33,7 @@ import { resolveImageName, calculateImageInputsHash } from '../capture/claude';
 import {
   loadConfig,
   loadRawConfig,
+  resolveConfigPath,
   usesDeprecatedChecksSection,
   usesDeprecatedLoopSection,
   usesDeprecatedLowHighKeys,
@@ -48,6 +50,7 @@ import {
   DEPRECATED_SECTION_KEYS,
   DEPRECATED_SECTIONS,
 } from '../config/schema';
+import { checkBuildersCurrent } from './builder-staleness';
 import { openDoctorStorage, withDoctorStorage } from './storage';
 import {
   measureContextBudget,
@@ -55,7 +58,13 @@ import {
   type ContextBudgetReport,
   type RoleContextBudget,
 } from '../context-budget';
-import { isManagedMode, evaluateManagedConfig, flattenConfigAsks } from '../config/managed';
+import {
+  isManagedMode,
+  evaluateManagedConfig,
+  flattenConfigAsks,
+  isControlPlaneConfigPath,
+  type ManagedConfigOrigin,
+} from '../config/managed';
 import { getKnownFeatures, getUnknownFlags, isFeatureEnabled } from '../utils/features';
 import { createDriver } from '../remote';
 import type { ResolvedConfig } from '../config/types';
@@ -64,7 +73,11 @@ import { resolveOfflineStatus, formatOfflineExpiry } from '../utils/offline';
 import { detectShell, getCompletionSetupCommand, getShellConfigFile } from '../shell/detect';
 import type { ShellInfo } from '../shell/detect';
 import { spawn } from '../utils/spawn';
+import { isForgeDriver, managedRepositoryHostChecks } from './managed-repository-host';
 import { runGit } from '../utils/git';
+import { assertWorktreeConfigOff, manualHeadRemedy, resolveProjectCommonDir, scanTaskWorktreeHeads, scanWorktreeGitPointers, UnsupportedGitLayoutError } from '../git/worktree-pointers';
+import { describeNestedGit, scanProjectNestedGit } from '../git/nested-git';
+import { taskWorktreeBranches } from '../task/worktree-branches';
 import { which } from 'bun';
 import {
   listMissingConversationsByImportability,
@@ -381,7 +394,7 @@ function credentialLabelLine(report: CredentialReport, envWord: 'daemon env' | '
   // spending metered credit, and doctor is where a user looks BEFORE launching —
   // "oauth" vs "api-key" is the only place that answer appears in this report.
   const kind = report.kind ? `${report.kind}, ` : '';
-  if (!report.present || !report.source) return `${report.label} credential present (${needed})`;
+  if (!report.present || !report.source) return `${report.label} credential missing (${needed})`;
   // DEGRADED beats the plain source word. Saying "credential store: keychain"
   // while every request is served the daemon's startup copy would send someone
   // debugging a rotation that has not taken to look anywhere but at the
@@ -390,6 +403,11 @@ function credentialLabelLine(report: CredentialReport, envWord: 'daemon env' | '
     ? 'store UNREADABLE — using the copy loaded at daemon startup'
     : `${credentialSourceWord(report.source, envWord)}: ${report.via}`;
   return `${report.label} credential present (${kind}${where}; ${needed})`;
+}
+
+/** The line for a credential whose presence could not be determined at all. */
+function credentialUnknownLine(report: CredentialReport): string {
+  return `${report.label} credential readable (needed by ${report.requiredBy.join(', ')})`;
 }
 
 /**
@@ -431,12 +449,11 @@ function missingCredentialRemedy(name: string): string {
  * PER CREDENTIAL. What to check comes from the credentials module — every
  * credential the configured agent profiles bill (`requiredCredentials`), never
  * a rule re-derived here — and each gets its own line: label, presence, where
- * it was found, and which profiles need it. A missing one fails by name with
- * the command that stores it. A project whose profiles all use upstreams that
- * take no credential passes with one line saying so. This is wider than the
- * daemon's startup gate on purpose: the gate reads the role defaults so that a
- * declared-but-unselected profile never refuses a daemon, but a task that
- * selects it WILL refuse to launch, and doctor is where that should show first.
+ * it was found, and which profiles need it. A missing one WARNS by name with
+ * the command that stores it — a daemon needs no credential to run, only turns
+ * on those profiles do. A project whose profiles all use upstreams that
+ * take no credential passes with one line saying so. A task on a profile with
+ * no credential is refused at launch, and doctor is where that should show first.
  *
  * The daemon reports presence + source labels only — no token travels to the
  * CLI just so we can print a checkmark (see `handleGetCredentialState`).
@@ -562,7 +579,7 @@ export function reportDaemonCredentials(entries: DaemonCredentialEntry[]): Check
       // other credentials were answered normally.
       return {
         ok: false,
-        label: credentialLabelLine(entry, 'daemon env'),
+        label: credentialUnknownLine(entry),
         detail:
           `The daemon could not tell whether a ${entry.label} credential is available ` +
           `(${profilesPhrase(entry.requiredBy)} bills it): ${entry.error}`,
@@ -570,15 +587,16 @@ export function reportDaemonCredentials(entries: DaemonCredentialEntry[]): Check
       };
     }
     if (entry.present) return { ok: true, label: credentialLabelLine(entry, 'daemon env') };
-    // Reachable: the gate guards only the ROLE DEFAULTS at startup, and config
-    // can change under a running daemon — a declared profile's credential can
-    // be missing while the daemon runs happily. Report it plainly.
+    // A WARNING, not a failure: the daemon runs, clones, syncs and serves reads
+    // with no model credential — only a TURN needs one, and a turn on these
+    // profiles is refused at launch naming the profile (src/daemon/credential-gate.ts).
+    // Doctor is where that shows BEFORE a turn is refused.
     return {
-      ok: false,
+      ok: true,
       label: credentialLabelLine(entry, 'daemon env'),
-      detail:
-        `The daemon holds no ${entry.label} credential — every launch of ${profilesPhrase(entry.requiredBy)} ` +
-        `fails to reach its model API.\n  ${missingCredentialRemedy(entry.name)}`,
+      warning:
+        `The daemon holds no ${entry.label} credential — turns on ${profilesPhrase(entry.requiredBy)} ` +
+        `will be refused until one is connected.\n  ${missingCredentialRemedy(entry.name)}`,
       docs: 'troubleshooting-credential',
     };
   }));
@@ -659,7 +677,7 @@ async function reportLocalCredentials(
       const msg = err instanceof Error ? err.message : String(err);
       results.push({
         ok: false,
-        label: credentialLabelLine(report, 'shell env'),
+        label: credentialUnknownLine(report),
         detail:
           `Could not tell whether a ${report.label} credential is available, and the daemon could not ` +
           `be asked (${daemonReason}): ${msg}`,
@@ -671,12 +689,13 @@ async function reportLocalCredentials(
       results.push({ ok: true, label: credentialLabelLine(report, 'shell env'), warning: caveat });
       continue;
     }
+    // A warning, for the reason reportDaemonCredentials gives: only turns need it.
     results.push({
-      ok: false,
+      ok: true,
       label: credentialLabelLine(report, 'shell env'),
-      detail:
+      warning:
         `No ${report.label} credential in ${consulted}, and the daemon could not be asked (${daemonReason}). ` +
-        `Every launch of ${profilesPhrase(requiredBy)} needs one.\n  ${missingCredentialRemedy(name)}`,
+        `Turns on ${profilesPhrase(requiredBy)} will be refused until one is connected.\n  ${missingCredentialRemedy(name)}`,
       docs: 'troubleshooting-credential',
     });
   }
@@ -789,8 +808,10 @@ export function usagePauseAdvice(offerOverride: boolean): string[] {
     'New turns on a paused credential are not started; turns already running continue. ' +
       'Work lazy started by itself goes ahead when the window resets.',
     offerOverride
-      ? `To let ONE turn start anyway: ${theme.command('lazy daemon config set usage_pause_threshold off')}, ` +
-        'then start, unblock, resume, review or ask.'
+      ? `To let one task's next turn start anyway: ${theme.command('lazy resume <task> --past-usage-pause')} ` +
+        `(start, unblock, review and ask take the flag too), or for work lazy is holding: ` +
+        `${theme.command('lazy daemon config set usage_pause_threshold off --task <task>')}. ` +
+        `A one-shot or chat beside any task: ${theme.command('lazy daemon config set usage_pause_threshold off')}.`
       : 'Starts, unblocks, resumes, reviews and asks go ahead again once the window resets.',
   ];
 }
@@ -866,7 +887,9 @@ async function checkLegacyProxyAuditLog(root: string): Promise<CheckResult> {
   let storage: Storage | null = null;
   let ownsStorage = false;
   try {
-    storage = await tryRemoteStorage(root);
+    // Inside the daemon reuse its handle: tryRemoteStorage is null there, and a
+    // second FileStorage in the daemon's own process contends on its lock.
+    storage = sweepStorage ?? await tryRemoteStorage(root);
     if (!storage) {
       storage = await createStorage(root);
       ownsStorage = true;
@@ -1077,6 +1100,7 @@ async function checkDaemonCodeCurrent(root: string): Promise<CheckResult | null>
       `serves the code it was launched with and never reloads.\n` +
       `  Restart it to pick the current code up: ${theme.command('lazy daemon restart')}\n` +
       `  That interrupts running agent and pair sessions; each agent turn resumes against the new daemon.`,
+    remedy: 'Restart the daemon (lazy daemon restart) so it runs the current code.',
   };
 }
 
@@ -1193,6 +1217,7 @@ async function checkDaemonStateFiles(root: string): Promise<CheckResult> {
       `  The daemon puts these files back itself within a few seconds — re-run ${theme.command('lazy doctor')} to confirm.\n` +
       `  If it persists, that daemon predates the self-repair: ${theme.command('lazy daemon restart')} clears it. ` +
       `Note that restarting interrupts running agent and pair sessions.`,
+    remedy: 'Re-run lazy doctor; if the state files are still missing, restart the daemon (lazy daemon restart).',
   };
 }
 
@@ -1271,7 +1296,8 @@ export async function checkAdoptedImage(root: string): Promise<CheckResult | nul
   };
 }
 
-export async function checkContainerImage(imageName: string, binary: string = 'docker'): Promise<CheckResult> {
+/** Whether the container runtime already holds `imageName`. */
+export async function containerImagePresent(imageName: string, binary: string = 'docker'): Promise<boolean> {
   try {
     const proc = spawn(
       [binary, 'image', 'inspect', imageName, '--format', '{{.Id}}'],
@@ -1281,14 +1307,28 @@ export async function checkContainerImage(imageName: string, binary: string = 'd
       new Response(proc.stdout).text(),
       proc.exited,
     ]);
-    if (exitCode === 0 && stdout.trim().length > 0) {
-      return { ok: true, label: `Container image exists (${imageName})` };
-    }
-  } catch { /* fall through */ }
+    return exitCode === 0 && stdout.trim().length > 0;
+  } catch (err) {
+    // A runtime that cannot be asked at all is the runner checks' finding, not this one's.
+    logger.debug(`image inspect ${imageName} failed: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
+/**
+ * A missing image is the expected state before a project's first task start,
+ * which builds or pulls it — so it is a note, never a failure. As a failure it
+ * told Teams members "tasks can't start" on every freshly provisioned project,
+ * a false alarm that cleared itself on the first start.
+ */
+export async function checkContainerImage(imageName: string, binary: string = 'docker'): Promise<CheckResult> {
+  if (await containerImagePresent(imageName, binary)) {
+    return { ok: true, label: `Container image exists (${imageName})` };
+  }
   return {
-    ok: false,
+    ok: true,
     label: 'Container image exists',
-    detail: `${imageName} image not found. It will be built automatically on first \`lazy start\`.`,
+    warning: `${imageName} is not built yet — it is built or pulled automatically on the first task start.`,
   };
 }
 
@@ -1559,9 +1599,12 @@ async function checkStorageLock(lockDir: string | null): Promise<{ result: Check
  *                          state through the daemon, not through the file lock.
  *   - `daemon-stuck`     — the holder is this project's daemon and it did NOT
  *                          answer in bounded time. Nothing can read task state.
+ *   - `daemon-unprobed`  — the holder is this project's daemon but doctor could
+ *                          not obtain a handle to ask it. Not evidence of a
+ *                          hang, so it is a warning, never a failure.
  *   - `foreign`          — somebody else is sitting on the lock.
  */
-type HeldLockAssessment = 'daemon-serving' | 'daemon-stuck' | 'foreign';
+export type HeldLockAssessment = 'daemon-serving' | 'daemon-stuck' | 'daemon-unprobed' | 'foreign';
 
 /**
  * Can doctor still read task state while this lock is held?
@@ -1589,22 +1632,54 @@ type HeldLockAssessment = 'daemon-serving' | 'daemon-stuck' | 'foreign';
  * A foreign holder is never probed: the daemon's own reads would queue behind
  * that lock, so the probe would buy nothing but its own timeout.
  */
-async function assessHeldLock(root: string, held: HeldLockReport): Promise<HeldLockAssessment> {
+export async function assessHeldLock(
+  root: string,
+  held: HeldLockReport,
+  inProcessStorage: Storage | undefined,
+): Promise<HeldLockAssessment> {
   const daemonPid = readDaemonLockPid(root) ?? readPid(root);
   if (daemonPid === null || daemonPid !== held.pid) return 'foreign';
-  return (await daemonAnswersStorageRead(root)) ? 'daemon-serving' : 'daemon-stuck';
+  return daemonAnswersStorageRead(root, inProcessStorage);
 }
 
-/** One bounded storage read through the daemon. Never throws, never blocks. */
-async function daemonAnswersStorageRead(root: string): Promise<boolean> {
+/**
+ * One bounded storage read through the daemon. Never throws, never blocks.
+ *
+ * INSIDE the daemon (Teams' doctor.run, the dashboard's Doctor page) the sweep
+ * is handed the daemon's own Storage — the handle the `storage` RPC serves —
+ * and the probe reads through it. tryRemoteStorage deliberately answers null
+ * there (the daemon must not RPC itself), and reading that null as "stuck" made
+ * every in-process doctor run report a healthy daemon as wedged. An absent client
+ * inside the daemon is `daemon-unprobed`; `daemon-stuck` is kept for a read that was really
+ * made and failed or outlived the budget.
+ */
+async function daemonAnswersStorageRead(
+  root: string,
+  inProcessStorage: Storage | undefined,
+): Promise<HeldLockAssessment> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<boolean>((resolve) => {
-    timer = setTimeout(() => resolve(false), DOCTOR_DAEMON_READ_PROBE_MS);
+  const timeout = new Promise<HeldLockAssessment>((resolve) => {
+    timer = setTimeout(() => resolve('daemon-stuck'), DOCTOR_DAEMON_READ_PROBE_MS);
   });
-  const read = (async () => {
+  const read = (async (): Promise<HeldLockAssessment> => {
+    let storage: Storage | null;
     try {
-      const storage = await tryRemoteStorage(root);
-      if (!storage) return false;
+      storage = inProcessStorage ?? await tryRemoteStorage(root);
+    } catch (err) {
+      // tryRemoteStorage makes a real `storage` RPC and throws when the daemon
+      // ANSWERS it with a failure (e.g. a 500 from a daemon that cannot reach
+      // its own store) — that is the stuck case, not an absent client.
+      logger.debug(`doctor: storage probe through the daemon failed: ${err instanceof Error ? err.message : String(err)}`);
+      return 'daemon-stuck';
+    }
+    if (!storage) {
+      // Inside the daemon the remote client is absent BY DESIGN (it must not
+      // RPC itself), so that absence says nothing about health. Outside it,
+      // a daemon holding the lock that no client can address IS the outage:
+      // every lazy command is equally unable to reach it.
+      return process.env.LAZY_IS_DAEMON === '1' ? 'daemon-unprobed' : 'daemon-stuck';
+    }
+    try {
       // A real read, not just a handshake: the daemon serves it under the same
       // lock it is holding, so answering proves the lock is not an obstruction.
       //
@@ -1618,13 +1693,13 @@ async function daemonAnswersStorageRead(root: string): Promise<boolean> {
       // serially. A miss returns null rather than throwing, and null is the
       // answer we want: we are probing liveness, not looking for a task.
       await storage.getTask(STORAGE_PROBE_TASK_ID);
-      return true;
+      return 'daemon-serving';
     } catch {
-      // Any failure — no reachable address, a 500 from a daemon that cannot reach its own
-      // store, a transport error — means doctor cannot read through the daemon.
+      // The read was made and failed — a 500 from a daemon that cannot reach its own
+      // store, a transport error — so doctor cannot read through the daemon.
       // The verdict is reported by the lock check itself, which names the
       // holder and the remedy; re-throwing here would kill the whole sweep.
-      return false;
+      return 'daemon-stuck';
     }
   })();
   try {
@@ -1660,7 +1735,7 @@ async function daemonAnswersStorageRead(root: string): Promise<boolean> {
  * design, so the age of the lock says nothing at all and the only question that
  * matters is whether it is still serving storage (see assessHeldLock).
  */
-function describeHeldStorageLock(
+export function describeHeldStorageLock(
   held: HeldLockReport | null,
   lockDir: string,
   assessment: HeldLockAssessment,
@@ -1691,7 +1766,20 @@ function describeHeldStorageLock(
         `${theme.command('lazy daemon restart')} clears it (that interrupts running agent and pair ` +
         `sessions). Do NOT delete ${lockPath} — the daemon is alive and removing its lock admits a ` +
         `second writer, which corrupts the store.`,
+      remedy:
+        'Restart the lazy daemon (lazy daemon restart); never delete the storage lock file while the daemon is alive.',
       docs: 'troubleshooting-storage-lock',
+    };
+  }
+
+  if (assessment === 'daemon-unprobed') {
+    return {
+      ok: true,
+      label: `Storage lock held by the daemon (pid ${held.pid})`,
+      warning:
+        `Doctor could not reach the daemon to confirm it is serving storage, so the checks that ` +
+        `read task state were skipped. This is not evidence the daemon is stuck — re-run ` +
+        `${theme.command('lazy doctor')}, and check ${theme.command('lazy daemon status')} if it repeats.`,
     };
   }
 
@@ -2081,12 +2169,12 @@ function checkFeatureFlags(config: ResolvedConfig): CheckResult {
  * Returns NOTHING when managed mode is off, so unmanaged `lazy doctor` output
  * is byte-identical to what it was before this feature existed.
  */
-function checkManagedConfig(raw: Record<string, unknown> | null): CheckResult[] {
+function checkManagedConfig(raw: Record<string, unknown> | null, origin: ManagedConfigOrigin): CheckResult[] {
   if (!isManagedMode()) return [];
 
   let evaluation;
   try {
-    evaluation = evaluateManagedConfig(raw ?? {});
+    evaluation = evaluateManagedConfig(raw ?? {}, process.env, origin);
   } catch (err) {
     // readFleetValues failed: the daemon was armed as managed without being
     // told which store/runner it manages. Nothing else here can be trusted.
@@ -2298,7 +2386,7 @@ function checkConfigKeys(raw: Record<string, unknown>, driver: RepositoryDriver)
   return results;
 }
 
-async function checkRemoteDriver(config: ResolvedConfig): Promise<{ driver: RepositoryDriver | null; driverResults: CheckResult[] }> {
+async function checkRemoteDriver(config: ResolvedConfig, root: string): Promise<{ driver: RepositoryDriver | null; driverResults: CheckResult[] }> {
   const driverResults: CheckResult[] = [];
   const driverName = config.remote.driver;
   let driver: RepositoryDriver | null = null;
@@ -2309,7 +2397,12 @@ async function checkRemoteDriver(config: ResolvedConfig): Promise<{ driver: Repo
   // Create the driver and render its health checks
   try {
     driver = createDriver(config);
-    const checks = await driver.checkHealth();
+    // A Teams daemon's git authenticates through the fleet's credential helper
+    // and its image carries no forge CLI — measure THAT, not a `gh` login it
+    // never has (see managed-repository-host.ts). A laptop keeps the driver's check.
+    const checks = isManagedMode() && isForgeDriver(driverName)
+      ? await managedRepositoryHostChecks(config, root, undefined, process.env, () => driver!.checkHealth())
+      : await driver.checkHealth();
 
     for (const check of checks) {
       const classification = REMOTE_DRIVER_DIAGNOSTIC_CLASS;
@@ -2376,7 +2469,8 @@ async function checkSplitStorage(root: string): Promise<CheckResult> {
  *
  * Report-only: doctor never runs `git lfs install`. Repairing a user's git
  * config as a side effect of a diagnostic is the hidden side effect CLAUDE.md
- * forbids; the human runs the printed command deliberately.
+ * forbids. In solo mode the owner runs the printed command; in managed mode
+ * provisioning and project start configure the filter outside the diagnostic.
  */
 async function checkLfsEnvironment(root: string, config: ResolvedConfig | null): Promise<CheckResult> {
   const label = 'Git LFS filter configured';
@@ -2393,6 +2487,15 @@ async function checkLfsEnvironment(root: string, config: ResolvedConfig | null):
     };
   }
 
+  return formatLfsEnvironmentCheck(report, config);
+}
+
+export function formatLfsEnvironmentCheck(
+  report: LfsEnvironmentReport,
+  config: ResolvedConfig | null,
+  managed = isManagedMode(),
+): CheckResult {
+  const label = 'Git LFS filter configured';
   if (!report.usesLfs) {
     return { ok: true, label: 'Git LFS not used by this repository' };
   }
@@ -2409,14 +2512,20 @@ async function checkLfsEnvironment(root: string, config: ResolvedConfig | null):
       ? 'Tasks still start ([git] lfs_check = "warn"), but their commits may be corrupt.'
       : 'The start-time check is disabled ([git] lfs_check = "off"), so nothing will stop it.';
 
+  const managedRemedy = (code: string): string => code === 'binary-missing'
+    ? 'The operator must rebuild and roll the daemon and task images with git-lfs installed.'
+    : 'Lazy configures the repository LFS filter on project start; retry after restarting the project.';
   const detail =
     `This repository tracks files with git LFS, but a commit made here would store raw file ` +
     `content instead of an LFS pointer — silently, because git only errors on a broken LFS ` +
     `filter when filter.lfs.required is true.\n\n` +
-    report.problems.map((p) => `  • ${p.message}\n    Fix: ${theme.command(p.remedy)}`).join('\n') +
+    report.problems.map((p) => `  • ${p.message}\n    Fix: ${managed ? managedRemedy(p.code) : theme.command(p.remedy)}`).join('\n') +
     `\n\n  ${consequence}`;
 
-  return { ok: false, label, detail, docs: 'lfs-guard' };
+  const remedy = managed
+    ? 'Restart the project to configure its LFS filter; if git-lfs is missing, rebuild and roll the daemon and task images.'
+    : 'Install git-lfs, then run git lfs install --local in this repository; if an existing pre-push hook blocks installation, preserve it before deliberately retrying with --force (which replaces it).';
+  return { ok: false, label, detail, remedy, docs: 'lfs-guard' };
 }
 
 /**
@@ -2469,6 +2578,130 @@ async function checkTaskBranchUpstreamTracking(root: string): Promise<CheckResul
       `${tracked.map(t => t.branch).join(', ')}. Harmless — ${theme.command('git pull')} only ever ` +
       `follows the branch you are on — but lazy does not need it. ${remedy}`,
     remedyFlag: 'unset-upstream-tracking',
+  };
+}
+
+/**
+ * Every task worktree's git pointers are what lazy created
+ * (src/git/worktree-pointers.ts). A changed pointer is how a task would get
+ * the next git outside its container — lazy's, or the human's own in that
+ * worktree — to run its code, so this is an ERROR, not a warning. lazy
+ * already refuses to run git there; the human's own git does not.
+ */
+async function checkWorktreeGitPointers(root: string): Promise<CheckResult> {
+  const label = "Task worktrees' git pointers and submodule git dirs are what lazy and git created";
+  let scan;
+  try {
+    scan = await scanWorktreeGitPointers(root);
+  } catch (err) {
+    return { ok: false, label, detail: `Could not scan task worktrees: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  const tampered = scan.filter(r => r.state === 'tampered');
+  const odd = scan.filter(r => r.state === 'not-a-worktree' || r.state === 'error');
+  const oddNote = odd.length > 0
+    ? `${odd.length} director(ies) under the worktrees dir could not be checked as git worktrees, so lazy will not run git in them: ` +
+      `${odd.map(r => `${r.name} (${r.problem})`).join('; ')}.`
+    : undefined;
+  if (tampered.length === 0) return oddNote ? { ok: true, label, warning: oddNote } : { ok: true, label };
+  return {
+    ok: false,
+    label,
+    detail:
+      `${tampered.length} task worktree(s) have git pointers or submodule git dirs lazy and git did not write — do NOT run git in them ` +
+      `until repaired, it could run code a task planted: ` +
+      `${tampered.map(r => `${r.name} (${r.problem})`).join('; ')}. ` +
+      `Repair with: ${theme.command('lazy doctor --repair-git-pointers')}`,
+    remedyFlag: 'repair-git-pointers',
+  };
+}
+
+/**
+ * Every task worktree's HEAD names its task's own branch. A HEAD pointed at
+ * another branch makes lazy refuse to commit, sync or accept there, and the
+ * human's own `git commit` in it would move that other branch — an ERROR.
+ */
+async function checkTaskWorktreeHeads(root: string): Promise<CheckResult> {
+  const label = "Task worktrees' HEAD is on the task's own branch";
+  let heads;
+  try {
+    heads = await scanTaskWorktreeHeads(root, await withSweepStorage(root, (s) => taskWorktreeBranches(s)));
+  } catch (err) {
+    return { ok: false, label, detail: `Could not scan task worktrees' HEAD: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  if (heads.length === 0) return { ok: true, label };
+  // Two remedies: the flag only for a HEAD rewritten over an index still on
+  // the task branch; a real checkout of another branch is the human's to undo.
+  const auto = heads.filter(r => !r.manual);
+  const manual = heads.filter(r => r.manual);
+  const parts: string[] = [];
+  if (auto.length > 0) {
+    parts.push(
+      `${auto.map(r => `${r.name} (HEAD ${r.problem}; task branch ${r.branch})`).join('; ')}. ` +
+      `Repair with: ${theme.command('lazy doctor --repair-git-pointers')}`,
+    );
+  }
+  if (manual.length > 0) {
+    parts.push(
+      `Checked out on another branch, so not repaired automatically: ` +
+      `${manual.map(r => `${r.name} (HEAD ${r.problem}) — ${manualHeadRemedy(r.path, r.branch)}`).join('; ')}.`,
+    );
+  }
+  return {
+    ok: false,
+    label,
+    detail:
+      `${heads.length} task worktree(s) have HEAD off their task's branch — lazy will not commit, sync or accept there: ` +
+      parts.join(' '),
+    ...(auto.length > 0 ? { remedyFlag: 'repair-git-pointers' as const } : {}),
+  };
+}
+
+/**
+ * The repository does not turn `extensions.worktreeConfig` on. A PROJECT
+ * setting, reported once: while it is on, lazy refuses to start task
+ * containers, because git would read a per-worktree config a task can write.
+ */
+async function checkWorktreeConfigOff(root: string): Promise<CheckResult> {
+  const label = 'Repository keeps extensions.worktreeConfig off';
+  try {
+    await assertWorktreeConfigOff(await resolveProjectCommonDir(root));
+    return { ok: true, label };
+  } catch (err) {
+    if (err instanceof UnsupportedGitLayoutError) return { ok: false, label, detail: err.detail };
+    return { ok: true, label: `${label} (check skipped)`, warning: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * No task worktree carries a nested repository the base branch does not
+ * account for (src/git/nested-git.ts). A planted `<sub>/.git` runs its config
+ * for the human who types git there, or the IDE that scans the folder — an
+ * ERROR, like a changed pointer.
+ */
+async function checkNestedGitDirs(root: string): Promise<CheckResult> {
+  const label = 'Task worktrees hold no nested git repositories';
+  let scan;
+  try {
+    scan = await withSweepStorage(root, storage => scanProjectNestedGit(root, storage));
+  } catch (err) {
+    return { ok: false, label, detail: `Could not scan task worktrees: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  const found = scan.filter(r => r.findings.length > 0);
+  const failed = scan.filter(r => r.error);
+  const failedNote = failed.length > 0
+    ? `${failed.length} worktree(s) could not be scanned: ${failed.map(r => `${r.name} (${r.error})`).join('; ')}.`
+    : undefined;
+  if (found.length === 0) return failedNote ? { ok: false, label, detail: failedNote } : { ok: true, label };
+  return {
+    ok: false,
+    label,
+    detail:
+      `${found.length} task worktree(s) contain nested git repositories their base branch does not have — do NOT run git ` +
+      `in those folders or open them in an IDE until quarantined, their config could run code a task planted: ` +
+      `${found.map(r => `${r.name}: ${describeNestedGit(r.findings)}`).join('; ')}. ` +
+      (failedNote ? `${failedNote} ` : '') +
+      `Move them aside with: ${theme.command('lazy doctor --repair-git-pointers')}`,
+    remedyFlag: 'repair-git-pointers',
   };
 }
 
@@ -3252,12 +3485,14 @@ export async function runDoctorReport(options: DoctorRunOptions): Promise<Doctor
   // task state THROUGH the daemon — so the normal, healthy case must run the
   // full sweep rather than skip half of it. See assessHeldLock.
   const lockAssessment: HeldLockAssessment = heldLock && root
-    ? await assessHeldLock(root, heldLock)
+    ? await assessHeldLock(root, heldLock, options.storage)
     : 'foreign';
   const lockBlocks = heldLock !== null && lockAssessment !== 'daemon-serving';
   const heldLockSummary = heldLock
     ? lockAssessment === 'daemon-stuck'
       ? `daemon pid ${heldLock.pid} is not serving storage`
+      : lockAssessment === 'daemon-unprobed'
+      ? `could not confirm daemon pid ${heldLock.pid} is serving storage`
       : `storage lock held by pid ${heldLock.pid}`
     : '';
   /** Report a check that was not run because it would have queued on the lock. */
@@ -3292,7 +3527,13 @@ export async function runDoctorReport(options: DoctorRunOptions): Promise<Doctor
     }
   }
   if (runnerError) {
-    results.push({ ok: false, label: 'Runner available', detail: runnerError, docs: 'troubleshooting-daemon' });
+    results.push({
+      ok: false,
+      label: 'Runner available',
+      detail: runnerError,
+      remedy: 'Start or restart the daemon (lazy daemon restart) so its proxy is running.',
+      docs: 'troubleshooting-daemon',
+    });
   }
 
   const isContainerRunner = runnerType === 'docker' || runnerType === 'podman';
@@ -3413,6 +3654,9 @@ export async function runDoctorReport(options: DoctorRunOptions): Promise<Doctor
       const imageName = await resolveImageName(root);
       results.push(await checkContainerImage(imageName, runnerType));
       results.push(await checkImageUpToDate(root, imageName, runnerType));
+      if (runner && config && (runnerType === 'docker' || runnerType === 'podman')) {
+        results.push(await checkBuildersCurrent({ root, runner, binary: runnerType, imageName, config }));
+      }
       // Passing `root` is what keeps the adopted and task-pinned images out of
       // the stale list; it reads tasks, so with the lock held it is skipped.
       results.push(
@@ -3521,12 +3765,19 @@ export async function runDoctorReport(options: DoctorRunOptions): Promise<Doctor
     results.push(await checkDefaultBranchProtectionResolvable(root, config!));
     results.push(...(await checkPassphraseEnrollment(root, config!)));
     results.push(await checkTaskBranchUpstreamTracking(root));
+    results.push(await checkWorktreeGitPointers(root));
+    // Both of these read task state through Storage, so under a held lock they
+    // are skipped with the holder named, like the block above — queuing would
+    // spend the acquire timeout and print the lock's own "stale" hint.
+    results.push(lockBlocks ? skippedForLock("Task worktrees' HEAD is on the task's own branch") : await checkTaskWorktreeHeads(root));
+    results.push(await checkWorktreeConfigOff(root));
+    results.push(lockBlocks ? skippedForLock('Task worktrees hold no nested git repositories') : await checkNestedGitDirs(root));
     results.push(await checkLfsEnvironment(root, config));
     results.push(await checkDiskSpace(root));
 
     // Remote driver checks and config validation
     const rawConfig = await loadRawConfig(root);
-    const { driver, driverResults } = await checkRemoteDriver(config!);
+    const { driver, driverResults } = await checkRemoteDriver(config!, root);
     results.push(...driverResults);
 
     // Config validation (uses driver to know valid/deprecated remote keys)
@@ -3537,7 +3788,10 @@ export async function runDoctorReport(options: DoctorRunOptions): Promise<Doctor
       results.push(checkProtectionConfigInert(rawConfig));
     }
     // Managed (fleet) hosts only — a strict no-op otherwise.
-    results.push(...checkManagedConfig(rawConfig));
+    results.push(...checkManagedConfig(
+      rawConfig,
+      isControlPlaneConfigPath(await resolveConfigPath(root)) ? 'control-plane' : 'repository',
+    ));
 
     // Feature flags status
     results.push(checkFeatureFlags(config!));

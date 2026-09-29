@@ -146,6 +146,23 @@ describe('the lazy daemon image contract', () => {
     expect(dockerfile).toContain('WORKDIR /opt/lazy');
   });
 
+  // INVARIANT: the guest ships gh and glab at exact versions, each tarball
+  // checked against a pinned sha256 for BOTH architectures. Without them a
+  // Teams project cannot open PRs/MRs or read reviews; an unpinned download
+  // would make two builds of one release carry different forge CLIs.
+  test('ships gh and glab, pinned and checksummed for amd64 and arm64', () => {
+    const gh = /^ARG GH_VERSION=(\d+\.\d+\.\d+)$/m.exec(dockerfile)?.[1];
+    const glab = /^ARG GLAB_VERSION=(\d+\.\d+\.\d+)$/m.exec(dockerfile)?.[1];
+    expect(gh).toBeTruthy();
+    expect(glab).toBeTruthy();
+    for (const arch of ['amd64', 'arm64']) {
+      expect(dockerfile).toMatch(new RegExp(`[0-9a-f]{64}  gh_${gh}_linux_${arch}\\.tar\\.gz`));
+      expect(dockerfile).toMatch(new RegExp(`[0-9a-f]{64}  glab_${glab}_linux_${arch}\\.tar\\.gz`));
+    }
+    expect(dockerfile).toContain('sha256sum -c');
+    expect(dockerfile).not.toMatch(/releases\/latest/);
+  });
+
   // The daemon builds the lazy-runner agent image from Dockerfile.lazy on the
   // guest's own dockerd. Without it in the checkout the build fails inside a VM
   // whose only diagnostic channel is `machine exec`.
@@ -184,7 +201,7 @@ describe('the guest lazy wrapper', () => {
 });
 
 // The COPY list itself is guarded by test/unit/deploy-image-copy-graph.test.ts,
-// which scans BOTH checkout stages (self-host image and this one) against every
+// which scans this image's checkout stage (the only one: the self-host image copies it) against every
 // import that leaves src/. What that scan does not cover is the publish script's
 // content fingerprint: an input the image carries but the fingerprint ignores
 // is an image that does not re-tag when that input changes.
@@ -279,5 +296,35 @@ describe('lazy daemon image forwards the relay to the daemon loopback', () => {
     const wrapper = readFileSync(WRAPPER, 'utf-8');
     expect(wrapper).toContain('init_report="$(lazy-guest-init --ensure 2>&1)"');
     expect(wrapper).toContain('lazy-forwarder.log');
+  });
+});
+
+describe('lazy daemon image trusts the worktrees its task containers adopt', () => {
+  // INVARIANT: the image installs the daemon-image gitconfig as the SYSTEM git
+  // config. The daemon runs as root; task containers take ownership of their
+  // worktree as uid 1000; without system-level safe.directory the daemon's own
+  // git (lazy_commit, lazy_final) refuses every such worktree. Behaviour is
+  // proven in guest-worktree-ownership.test.ts; this pins that it ships.
+  test('the Dockerfile copies gitconfig to /etc/gitconfig', () => {
+    expect(readFileSync(DOCKERFILE, 'utf-8')).toMatch(
+      /^COPY lazy-teams\/deploy\/daemon-image\/gitconfig \/etc\/gitconfig$/m,
+    );
+    expect(readFileSync(join(IMAGE_DIR, 'gitconfig'), 'utf-8')).toMatch(/^\[safe\]\n\tdirectory = \*$/m);
+  });
+});
+
+describe('the image tar carries the source id its daemon reports', () => {
+  const script = readFileSync(resolve(import.meta.dir, '../../scripts/publish-lazy-daemon-image.sh'), 'utf-8');
+
+  // INVARIANT: `<tar>.source-id` is COPIED OUT of the built image, never
+  // recomputed from the git archive. The image's tree holds generated,
+  // gitignored files (src/version.ts, src/build-info.ts) the archive lacks, so a
+  // recomputed id never equals the `sourceId` the daemon reports — and Lazy
+  // Teams would then judge every project stale and replace its machine on
+  // every roll.
+  test('the --save sidecar is read from /opt/lazy/.source-fingerprint in the image', () => {
+    expect(script).toContain('docker cp "${SOURCE_ID_CID}:/opt/lazy/.source-fingerprint"');
+    expect(script).toContain('${SAVE_PATH}.source-id');
+    expect(script).not.toContain('computeSourceIdentityOf');
   });
 });

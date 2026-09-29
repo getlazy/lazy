@@ -25,6 +25,7 @@
  * bug that hides the next one.
  */
 
+import { CLAUDE_DEFAULT_MODEL } from '../../src/config/default-models';
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { join } from 'path';
 import { readFile, writeFile } from 'fs/promises';
@@ -40,7 +41,7 @@ import { protocolDir as getProtocolDir } from '../../src/protocol';
 import { PRESENTATION_MARKER_FILE } from '../../src/protocol/presentation-marker';
 
 /** The model `lazy init` writes as `[models] default`, and the effort `[agent]` defaults to. */
-const PROJECT_DEFAULT_MODEL = 'claude-opus-5';
+const PROJECT_DEFAULT_MODEL = CLAUDE_DEFAULT_MODEL;
 const PROJECT_DEFAULT_EFFORT = 'medium';
 
 /** What the task is moved to mid-flight. Deliberately neither project default. */
@@ -73,6 +74,37 @@ async function enableMaintain(ctx: TestContext, group: { title: string; pattern:
   if (commit.exitCode !== 0) {
     throw new Error(`Failed to commit maintained-files config: ${commit.stderr}`);
   }
+}
+
+/**
+ * Pin `[review] mode = "off"` in the project root's lazy.toml.
+ *
+ * The invocation counts below enumerate the turn shapes this suite is about
+ * (work, nudge, presentation). Since `low_high` became the default review mode
+ * (engineer decision 2026-09-21, see src/review/mode.ts) every work turn also
+ * runs a self-review and a revise invocation, which would inflate each count
+ * by two without saying anything about model continuity. The low-high phases'
+ * model and effort are asserted by the dedicated test in this file that puts
+ * the default back; auto-resume-binary-seam.test.ts covers them running on the
+ * resume path. `off` also removes the `separate`-mode auto-review, so the
+ * auto-review filter in `turnInvocations` is only a safeguard here. init
+ * writes the key commented out under `[review]`, so the edit uncomments it.
+ */
+async function disableSelfReview(ctx: TestContext): Promise<void> {
+  const configPath = join(ctx.root, 'lazy.toml');
+  const existing = await readFile(configPath, 'utf-8');
+  const edited = existing.replace(/^#\s*mode = "low_high"$/m, 'mode = "off"');
+  if (edited === existing) throw new Error(`No commented [review] mode key found in ${configPath} to set to "off"`);
+  await writeFile(configPath, edited);
+}
+
+/** Rewrite the (uncommented) `[review] mode` key, failing loudly if it is not there. */
+async function setReviewMode(ctx: TestContext, from: string, to: string): Promise<void> {
+  const configPath = join(ctx.root, 'lazy.toml');
+  const existing = await readFile(configPath, 'utf-8');
+  const edited = existing.replace(new RegExp(`^mode = "${from}"$`, 'm'), `mode = "${to}"`);
+  if (edited === existing) throw new Error(`No [review] mode = "${from}" in ${configPath} to set to "${to}"`);
+  await writeFile(configPath, edited);
 }
 
 /**
@@ -122,6 +154,7 @@ describe('turn model/effort continuity (real supervisor, fake claude)', () => {
 
   beforeEach(async () => {
     ctx = await setupTestLazy({ fakeClaude: true });
+    await disableSelfReview(ctx);
   });
 
   afterEach(async () => {
@@ -300,6 +333,67 @@ describe('turn model/effort continuity (real supervisor, fake claude)', () => {
     expect(nudgePrompt!.model).toBeUndefined();
     expect(nudgePrompt!.effort).toBeUndefined();
     expect(nudgePrompt!.agent).toBeUndefined();
+  }, 180_000);
+
+  // INVARIANT (turn-launch-continuity): the default review mode's own
+  // supervisor follow-ups — the low-high self-review and its revise pass —
+  // launch on the task's CURRENT model like every other follow-up. The rest of
+  // this suite pins `[review] mode = "off"` to keep its counts about the turn
+  // shapes it enumerates, so this test puts the default back to cover the
+  // phases that exclusion would otherwise leave unchecked. Effort: the draft
+  // and revise run at the task's chosen effort (`lazy edit --effort` marks it
+  // chosen), the self-review at the stronger of that and `[review]
+  // review_effort` — a reviewer is never weaker than the writer.
+  test('the low-high self-review and revise run on the task\'s edited model', async () => {
+    await setReviewMode(ctx, 'off', 'low_high');
+    const taskId = await createTask(ctx, 'Continuity through self-review', 'Do the work');
+
+    await ctx.setClaudeScenario({
+      sequence: [
+        successScenario({
+          result: 'First pass done.',
+          sessionId: 'fake-sess-lowhigh-1',
+          commit: { message: 'First pass', files: [{ path: 'src/one.ts', content: 'export const one = 1;\n' }] },
+        }),
+        successScenario({ result: 'LOW_HIGH_LOOP_APPROVED', sessionId: 'fake-sess-lowhigh-1' }),
+        successScenario({ result: 'First pass done.', sessionId: 'fake-sess-lowhigh-1' }),
+      ],
+    });
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+    await ctx.clearClaudeInvocations();
+
+    expectSuccess(await ctx.lazy(['edit', taskId, '--model', EDITED_MODEL, '--effort', EDITED_EFFORT]));
+
+    await ctx.setClaudeScenario({
+      sequence: [
+        successScenario({
+          result: 'Second pass done.',
+          sessionId: 'fake-sess-lowhigh-2',
+          commit: { message: 'Second pass', files: [{ path: 'src/two.ts', content: 'export const two = 2;\n' }] },
+        }),
+        // Not approved, so the revise pass runs too.
+        successScenario({ result: '1. Rename the constant.', sessionId: 'fake-sess-lowhigh-2' }),
+        successScenario({ result: 'Revised.', sessionId: 'fake-sess-lowhigh-2' }),
+        successScenario({ result: 'Second pass done.', sessionId: 'fake-sess-lowhigh-2' }),
+      ],
+    });
+    expectSuccess(await ctx.lazy(['unblock', taskId, '--message', 'Second pass, please']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+
+    // Work, self-review, revise, presentation — in that order.
+    const invocations = await turnInvocations(ctx);
+    expect(invocations.length).toBe(4);
+    const [work, review, revise] = invocations;
+    expect(String(review.argv[1])).toContain('## Self-Review (low-high loop)');
+    expect(String(revise.argv[1])).toContain('## Apply Self-Review Instructions (low-high loop)');
+    for (const invocation of invocations) {
+      expect(flagValue(invocation.argv, '--model')).toBe(EDITED_MODEL);
+    }
+    expect(flagValue(work.argv, '--effort')).toBe(EDITED_EFFORT);
+    expect(flagValue(revise.argv, '--effort')).toBe(EDITED_EFFORT);
+    // max('high', review_effort default 'xhigh').
+    expect(flagValue(review.argv, '--effort')).toBe('xhigh');
   }, 180_000);
 
   // The same rule from the other direction: with nothing edited, turn 2 must run

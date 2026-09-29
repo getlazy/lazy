@@ -31,9 +31,13 @@ import { type McpToolContext, mcpActor } from './tools';
 import { runGit } from '../utils/git';
 import { resolveStorage } from '../preconditions';
 import { assertWorktreeUsable } from './turn-identity';
+import { assertTaskWorktreeHead, taskWorktreeOf } from '../git/worktree-pointers';
 import type { Storage } from '../storage';
 import { loadConfig } from '../config/loader';
 import { resolveParentBranchWithFallback } from '../daemon/task-lifecycle';
+import { resolveOutstandingViolations } from '../protection/outstanding-resolver';
+import { applyProtectedRestores, planRejectedRestores } from '../protection/rejected-restore';
+import type { ProtectedRestore } from '../protocol/types';
 
 export { INTERNAL_GIT_TOOL_NAME };
 
@@ -52,12 +56,17 @@ export const internalGitTool: McpTool = {
     properties: {
       op: {
         type: 'string',
-        enum: ['merge', 'merge_abort', 'merge_commit', 'reset_hard_head', 'tag'],
+        enum: ['merge', 'merge_abort', 'merge_commit', 'reset_hard_head', 'tag', 'restore_rejected'],
         description: 'The operation to perform',
       },
       target: { type: 'string', description: 'merge: ref or SHA to merge' },
       message: { type: 'string', description: 'merge: commit message' },
       name: { type: 'string', description: 'tag: tag name' },
+      files: {
+        type: 'array',
+        description: 'restore_rejected: the rejected protected files to restore ({ file, base_sha })',
+        items: { type: 'object' },
+      },
     },
     required: ['op'],
   },
@@ -200,6 +209,40 @@ function assertTagNameAllowed(taskId: string, name: string): void {
   }
 }
 
+
+/**
+ * The daemon's own answer to "which rejected files would I restore now", and
+ * the requested plan must be a subset of it, entry for entry. Returns the
+ * daemon's entries, never the caller's objects.
+ */
+async function assertRestorePlanAllowed(
+  ctx: McpToolContext,
+  worktreePath: string,
+  requested: unknown[],
+): Promise<ProtectedRestore[]> {
+  const storage = await getStorage(ctx);
+  const task = await storage.getTask(ctx.taskId);
+  const session = await storage.getSessionByTaskId(ctx.taskId);
+  if (!task || !session) throw new Error(`Task ${ctx.taskId} has no task record or session.`);
+  const projectRoot = await projectRootOf(worktreePath);
+  const allowed = planRejectedRestores((await resolveOutstandingViolations(
+    projectRoot, task, session, await storage.getSessionTurns(session.id), storage,
+  )).outstanding);
+  const plan: ProtectedRestore[] = [];
+  for (const entry of requested) {
+    const e = entry as Partial<ProtectedRestore> | null;
+    const match = allowed.find((a) => a.file === e?.file && a.base_sha === e?.base_sha);
+    if (!match) {
+      throw new Error(
+        `Refusing to restore ${JSON.stringify(entry)} for task ${ctx.taskId.substring(0, 8)}: it is not ` +
+        `a rejected protected file this task still owes a restore ` +
+        `(${allowed.map((a) => a.file).join(', ') || 'none'}).`,
+      );
+    }
+    plan.push(match);
+  }
+  return plan;
+}
 async function headOf(cwd: string): Promise<string> {
   const result = await runGit(['rev-parse', 'HEAD'], { cwd });
   return result.exitCode === 0 ? result.stdout.trim() : '';
@@ -216,6 +259,16 @@ export function createInternalGitHandler(ctx: McpToolContext): McpToolHandler {
     // worktree and why rather than reading git's "cannot change to ...".
     await assertWorktreeUsable(INTERNAL_GIT_TOOL_NAME, cwd, ctx.taskId);
     const op = args.op as string;
+
+    // Every op but merge_abort writes a commit or ref through HEAD: in a task
+    // worktree HEAD must be the task's own branch (src/git/worktree-pointers.ts),
+    // or a task that redirected it gets this host-side git to move another.
+    if (op !== 'merge_abort' && taskWorktreeOf(cwd)) {
+      const storage = await getStorage(ctx);
+      const branch = (await storage.getSessionByTaskId(ctx.taskId))?.git_branch;
+      if (!branch) throw new Error(`${INTERNAL_GIT_TOOL_NAME}: task ${ctx.taskId} has no session branch.`);
+      await assertTaskWorktreeHead(cwd, branch);
+    }
 
     let result: { exitCode: number; stdout: string; stderr: string };
 
@@ -269,6 +322,25 @@ export function createInternalGitHandler(ctx: McpToolContext): McpToolHandler {
         if (!name) throw new Error(`${INTERNAL_GIT_TOOL_NAME} tag requires "name".`);
         assertTagNameAllowed(ctx.taskId, name);
         result = await runGit(['tag', '-f', name], { cwd });
+        break;
+      }
+      case 'restore_rejected': {
+        // Put rejected protected files back to their base and commit that as
+        // lazy's own commit (src/protection/rejected-restore.ts). The plan
+        // came through the protocol dir, which the container can write, so it
+        // is honoured only where it matches EXACTLY what the daemon itself
+        // would restore: a rejected file still outstanding, at the same base.
+        const requested = args.files;
+        if (!Array.isArray(requested) || requested.length === 0) {
+          throw new Error(`${INTERNAL_GIT_TOOL_NAME} restore_rejected requires a non-empty "files" list.`);
+        }
+        const plan = await assertRestorePlanAllowed(ctx, cwd, requested);
+        try {
+          const sha = await applyProtectedRestores(cwd, plan);
+          result = { exitCode: 0, stdout: sha ?? '', stderr: '' };
+        } catch (err) {
+          result = { exitCode: 1, stdout: '', stderr: err instanceof Error ? err.message : String(err) };
+        }
         break;
       }
       default:

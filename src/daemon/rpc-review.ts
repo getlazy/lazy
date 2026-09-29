@@ -73,7 +73,28 @@ export async function handleReviewDiff(projectRoot: string, params: Record<strin
   const region = typeof params.region === 'string' && params.region.trim()
     ? params.region.trim()
     : undefined;
-  return { diff: await createReviewActions(projectRoot).getDiff(taskId, { region }) };
+  const files = optionalPathList(params.files);
+  return { diff: await createReviewActions(projectRoot).getDiff(taskId, { region, ...(files ? { files } : {}) }) };
+}
+
+/** The Changes tab's file list: every file of the diff with +/−, no patch. */
+export async function handleReviewDiffFiles(projectRoot: string, params: Record<string, unknown>) {
+  const taskId = requireString(params, 'taskId');
+  const region = typeof params.region === 'string' && params.region.trim()
+    ? params.region.trim()
+    : undefined;
+  // The daemon's own service always implements it; the port marks it optional
+  // only for adapters that predate it.
+  return { files: await createReviewActions(projectRoot).listDiffFiles!(taskId, { region }) };
+}
+
+/** An optional `files` param: absent, or an array of non-blank paths — anything else is a 400. */
+function optionalPathList(raw: unknown): string[] | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (!Array.isArray(raw) || raw.some((p) => typeof p !== 'string' || !p.trim())) {
+    throw new RpcError(400, 'files must be an array of non-empty file paths.');
+  }
+  return raw as string[];
 }
 
 /** The task's region cover as summary rows — the Changes tab's regions strip. */

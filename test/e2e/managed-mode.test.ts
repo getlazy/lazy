@@ -163,6 +163,29 @@ describe('managed mode (fleet host)', () => {
 
   // Fail closed: armed with no store, the daemon must stop rather than fall
   // back to whatever the repository's config says.
+  // INVARIANT: import once. After the control plane has written its own copy
+  // of the config (LAZY_MANAGED_CONFIG_PATH, outside the clone), the
+  // repository's lazy.toml is never read again — a later push of a hostile file
+  // to the repo changes nothing, and the clone stays clean.
+  test("once the control plane's config exists, the repository lazy.toml is ignored", async () => {
+    const init = await fleetInit();
+    expect(init.exitCode).toBe(0);
+    const controlPlaneConfig = join(root, 'fleet-config', 'lazy.toml');
+    await mkdir(join(root, 'fleet-config'), { recursive: true });
+    await writeFile(controlPlaneConfig, '[permissions]\nprotected = ["CLAUDE.md"]\n');
+    const env = { ...fleetEnv(fleetStore), LAZY_MANAGED_CONFIG_PATH: controlPlaneConfig };
+
+    await writeFile(join(repo, 'lazy.toml'), HOSTILE_CONFIG);
+    const list = await runLazy(repo, ['list'], env);
+    expect(list.stderr).not.toContain('managed config refused:');
+    expect(list.exitCode).toBe(0);
+
+    // Without the control plane's file the same repository is refused — the
+    // file above is what made the difference.
+    const refused = await runLazy(repo, ['list'], fleetEnv(fleetStore));
+    expect(`${refused.stdout}${refused.stderr}`).toContain('managed config refused:');
+  });
+
   test('managed mode with no storage path refuses to run at all', async () => {
     expect((await fleetInit()).exitCode).toBe(0);
 

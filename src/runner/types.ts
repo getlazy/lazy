@@ -79,11 +79,29 @@ export interface LaunchBuilderDetachedParams {
   /** Claude session id to `--resume`, or null for a fresh session. */
   resumeSessionId?: string | null;
   debug?: boolean;
+  /**
+   * Where the launch reports its phases (image, agent binary, projects probe,
+   * `docker run`) and their durations — the daemon's per-start log trail
+   * (src/daemon/builder-start-trace.ts). Optional: without it nothing is timed.
+   */
+  trace?: LaunchPhaseTrace;
+}
+
+/** A sink for one launch's timed phases and notes. */
+export interface LaunchPhaseTrace {
+  phase<T>(name: string, work: () => Promise<T>): Promise<T>;
+  note(message: string): void;
 }
 
 /** Outcome of starting a detached builder session's container. */
 export interface LaunchBuilderDetachedResult {
   containerName: string;
+  /**
+   * The conversation actually passed to `--resume`: the requested one, or
+   * null when the projects dir the container really mounts does not hold it
+   * and the launch started a fresh conversation instead.
+   */
+  resumed: string | null;
 }
 
 /** Information about a run (container or process). */
@@ -268,6 +286,16 @@ export interface Runner {
    * `getRunInfo` as an answer.
    */
   probeRunInfo?(runName: string): Promise<RunInfoProbe>;
+
+  /**
+   * Everything readable about how an EXITED run ended, as human-readable
+   * lines: the runtime's own state record, the run's output, and any log the
+   * process inside left behind. Each part that cannot be read says so and why
+   * — a silent gap is what made a builder that died with exit 1 show nothing.
+   * Must be called before the run is removed. Optional: host-process runs
+   * leave nothing to read after exit.
+   */
+  describeExitedRun?(runName: string, opts: { rawLines: number; keepLines: number; supervisorLogHostFile?: string }): Promise<string[]>;
 
   /** Get exit code of a stopped run. Returns null if still running or not found. */
   getRunExitCode(runName: string): Promise<number | null>;

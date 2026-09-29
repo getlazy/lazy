@@ -32,10 +32,12 @@ import type { AgentActivityEvent, AgentActivityStream } from './activity-stream'
 import type { Agent } from './interface';
 import { safeArgvPrompt } from './argv-safety';
 import { classifyNoModelRefusal, requireLaunchModel } from './launch-model';
+import { CURSOR_DEFAULT_MODEL } from '../config/default-models';
 import { CURSOR_INSTALL_HINT, CursorPackaging } from './cursor-packaging';
 import {
   classifyCommonFailureSignals,
   failureHaystack,
+  statesShortResetHorizon,
   type AgentFailure,
   type AgentFailureInput,
 } from './failure-taxonomy';
@@ -260,9 +262,7 @@ function capHealsOnItsOwn(text: string): boolean {
     /\b429\b/.test(text) ||
     text.includes('rate limit') ||
     text.includes('rate_limit') ||
-    text.includes('retry-after') ||
-    text.includes('retry after') ||
-    /\b(resets?|resetting|retry|try again|available again)\b[^.\n]{0,24}\bin\s+(an?|\d+)\s*(seconds?|minutes?|hours?|min\b|mins\b|hr\b|hrs\b)/.test(text)
+    statesShortResetHorizon(text)
   );
 }
 
@@ -773,12 +773,11 @@ export class CursorAgent implements Agent {
   }
 
   defaultModel(): string {
-    // Cursor picks the model itself, and that is the sensible default for a
-    // Cursor task: lazy's `[models] default` is an Anthropic model name chosen
-    // for Claude Code, and forcing it onto Cursor pins every Cursor turn to one
-    // (often plan-limited) model for no reason. An explicit per-task model
-    // still wins — see Agent.defaultModel() for the full precedence.
-    return CURSOR_AUTO_MODEL;
+    // Cursor picks the model itself (`auto`): its catalog is server-side and
+    // per plan, so any id lazy hard-codes can be rejected, and lazy's
+    // `[models] default` is an Anthropic name chosen for Claude Code. An
+    // explicit per-task model wins — see Agent.defaultModel().
+    return CURSOR_DEFAULT_MODEL;
   }
 
   activityStream(): AgentActivityStream {

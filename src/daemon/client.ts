@@ -20,6 +20,8 @@ import { readToken, getDaemonTcpTarget } from './lifecycle';
 import { findLazyRoot } from '../project-paths';
 import type { ProgressEmitter } from './progress';
 import { resolveTeamsLogin } from '../teams/login';
+import { CredentialIndexParseError } from '../credentials/store';
+import { resolveTargetAddresses, describeTargetResolution } from '../utils/target-resolution';
 
 /** Optional observers for a long RPC's mid-flight envelope lines. */
 export interface RpcObservers {
@@ -150,6 +152,11 @@ export class DaemonClient {
    */
   teams: TeamsTarget | null = null;
 
+  /** The http(s) base this client posts to — named by a failure to reach it. */
+  get baseUrl(): string {
+    return this.target;
+  }
+
   /**
    * Create a client for a specific project's daemon, at either of two
    * targets — a bound clone (design doc §4.4, §4.7) never has a local daemon
@@ -168,7 +175,17 @@ export class DaemonClient {
    * exists.
    */
   static async create(projectRoot: string): Promise<DaemonClient | null> {
-    const bound = await resolveTeamsLogin(projectRoot);
+    let bound: Awaited<ReturnType<typeof resolveTeamsLogin>>;
+    try {
+      bound = await resolveTeamsLogin(projectRoot);
+    } catch (err) {
+      // A corrupt index cannot say whether this clone is bound — but a bound
+      // clone never has a local daemon, so a recorded local target answers it.
+      // Without this, one bad line of JSON cut every command off the daemon,
+      // including `lazy doctor`, the surface that reports the broken file.
+      if (!(err instanceof CredentialIndexParseError) || !getDaemonTcpTarget(projectRoot)) throw err;
+      bound = null;
+    }
     if (bound) {
       // The path segment IS `/api/projects/<slug>/rpc` already, so the base
       // handed to `buildDaemonRpcRequest` must stop one segment short of
@@ -513,12 +530,15 @@ export async function tryRpc<T>(
       throw err;
     }
 
-    // Transport error (daemon unreachable, connection failed) — add troubleshooting advice
+    // Transport error: the recorded address did not answer. Name it and what
+    // it resolved to — a daemon that is up but not reachable at that address
+    // (a moved port, a name this process cannot route) looks exactly like this.
     const msg = err instanceof Error ? err.message : String(err);
+    const resolution = describeTargetResolution(await resolveTargetAddresses(client.baseUrl));
     throw new Error(
-      `Daemon RPC failed: ${msg}\n` +
-      'Check daemon status with: lazy daemon status\n' +
-      'Restart it with: lazy daemon restart',
+      `Daemon RPC to ${client.baseUrl} failed: ${msg}${resolution ? ` (${resolution})` : ''}\n` +
+      'Check daemon status with: lazy daemon status — if it is running, it is not\n' +
+      'reachable at that address from here; if it is not, start it with: lazy daemon start',
     );
   }
 }

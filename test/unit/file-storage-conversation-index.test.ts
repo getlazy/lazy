@@ -108,7 +108,7 @@ describe('FileStorage conversation listing index', () => {
 
     expect(existsSync(indexPath())).toBe(true);
     const index = readIndex();
-    expect(index.version).toBe(1);
+    expect(index.version).toBe(2);
     expect(index.entries).toHaveLength(1);
     expect(index.entries[0].sessionId).toBe(conv.sessionId);
     expect(index.entries[0].summary).toBe('what is left for the release?');
@@ -158,7 +158,7 @@ describe('FileStorage conversation listing index', () => {
     const summaries = await storage.listConversationSummaries();
     expect(summaries).toHaveLength(1);
     expect(summaries[0].summary).toBe('still listed');
-    expect(readIndex().version).toBe(1);
+    expect(readIndex().version).toBe(2);
   });
 
   test('an out-of-band transcript write is picked up as stale and rebuilt', async () => {

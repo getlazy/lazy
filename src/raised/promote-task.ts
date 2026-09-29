@@ -127,10 +127,9 @@ export function appendPromotedProvenance(
   originatingTask: Task,
 ): string {
   const ref = taskDisplayRef(originatingTask);
-  const goal = originatingTask.goal.trim();
-  const provenance =
-    `Promoted from raised item ${item.id} on task ${ref}` +
-    (goal ? `: ${goal}` : '.');
+  // Provenance stops at the task code: the originating goal is usually an
+  // imperative, and as the prompt's last line it read as a second, unrelated ask.
+  const provenance = `Promoted from raised item ${item.id} on task ${ref}.`;
   return `${promptBody.trim()}\n\n---\n\n${provenance}`;
 }
 

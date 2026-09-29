@@ -15,6 +15,7 @@
 
 import { hostname } from 'os';
 import { writeMcpConfig, writeCursorMcpConfig, writeToolPermissions } from '../mcp/config';
+import { assertTestLaunchHasPrivateHome } from '../mcp/test-home-guard';
 import { MCP_EXPECTED_TASK_ID_ENV, MCP_EXPECTED_WORKTREE_ENV } from '../mcp/turn-identity';
 import { ensureCursorHttp1Config, cursorCliConfigPath } from '../agent/cursor-cli-config';
 import {
@@ -151,6 +152,9 @@ export async function prepareTurnMcp(
   process.env[MCP_EXPECTED_WORKTREE_ENV] = worktreePath;
 
   try {
+    // Before ANY write into HOME: a test-launched supervisor must never touch
+    // the account's real ~/.claude.json. See src/mcp/test-home-guard.ts.
+    assertTestLaunchHasPrivateHome();
     const mcpConfig = runner.mcpServerConfig(taskId, worktreePath, { toolset });
     await writeMcpConfig(mcpConfig);
     if (opts.harness === 'codex') {

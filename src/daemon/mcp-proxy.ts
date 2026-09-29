@@ -57,6 +57,7 @@ import {
   readHeartbeatEnvelope,
 } from './heartbeat';
 import { describeProgress } from './progress';
+import { resolveTargetAddresses, describeTargetResolution } from '../utils/target-resolution';
 
 export interface DaemonMcpConfig {
   /**
@@ -328,18 +329,25 @@ export function foreignDaemonDiagnosis(
  * response — the socket/port refused the connection). This is what a moved port
  * or a stopped daemon looks like from inside the container.
  */
-export function daemonUnreachableMessage(toolName: string, target: string, detail: string): string {
+export function daemonUnreachableMessage(
+  toolName: string,
+  target: string,
+  detail: string,
+  resolution = '',
+): string {
+  const resolved = resolution ? `; ${resolution}` : '';
   return (
-    `lazy MCP call '${toolName}' could not reach the daemon at ${target} (${detail}). ` +
+    `lazy MCP call '${toolName}' could not reach the daemon at ${target} (${detail}${resolved}). ` +
     `lazy retried until its reconnect window ran out — re-reading the mounted daemon ` +
     `config each round, so a daemon that came back on another port would have been ` +
     `picked up — then probed ${target}/daemon/status and got no answer either, so the ` +
-    `daemon really is unreachable from here. ` +
-    `The daemon appears to be down, or listening on a different address than when ` +
-    `this builder launched (a daemon restart can move the port). Ensure the daemon ` +
-    `is running ('lazy daemon status' / 'lazy daemon start'), then exit and relaunch ` +
-    `this builder — 'lazy builder --resume <session-id>' — so it picks up the ` +
-    `daemon's current address and credentials.`
+    `daemon did not answer at that address from here. ` +
+    `The daemon may be down, listening on a different address than when this builder ` +
+    `launched (a daemon restart can move the port), or not listening on the address ` +
+    `family that name resolved to. Check 'lazy daemon status' on the host before ` +
+    `restarting anything; if it is running, exit and relaunch this builder — ` +
+    `'lazy builder --resume <session-id>' — so it picks up the daemon's current ` +
+    `address and credentials.`
   );
 }
 
@@ -413,7 +421,8 @@ export async function classifyTransportFailure(
 
   const probe = await probeDaemonStatus(config.target);
   if (!probe.responded) {
-    return new Error(daemonUnreachableMessage(toolName, config.target, detail));
+    const resolution = describeTargetResolution(await resolveTargetAddresses(config.target));
+    return new Error(daemonUnreachableMessage(toolName, config.target, detail, resolution));
   }
 
   if (probe.projectRoot && probe.projectRoot !== config.projectRoot) {

@@ -17,6 +17,7 @@ import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 import { maybePostUpgradeNotice } from '../../src/daemon/upgrade-notice';
 import { getDaemonDir } from '../../src/daemon/paths';
 import { VERSION } from '../../src/version';
+import { runningBuildIdentity } from '../../src/utils/build-provenance';
 
 describe('daemon upgrade notice', () => {
   let testDir: string;
@@ -76,6 +77,22 @@ describe('daemon upgrade notice', () => {
     // A second start with the SAME version is quiet — one upgrade, one notice.
     await maybePostUpgradeNotice(testDir, async () => storage);
     expect(await storage.listSystemMessages()).toHaveLength(1);
+  });
+
+  // The notice says WHICH BUILD on both sides, not only which version: the
+  // previous start's build comes from the marker, the current one from the
+  // running process, and the marker records it for the next start.
+  test('the notice and the marker carry the build identity', async () => {
+    mkdirSync(getDaemonDir(testDir), { recursive: true });
+    writeFileSync(markerPath(), JSON.stringify({ version: '0.0.1-previous', build: 'main@0ld0ld0, clean' }));
+
+    await maybePostUpgradeNotice(testDir, async () => storage);
+
+    const current = await runningBuildIdentity();
+    const [message] = await storage.listSystemMessages();
+    expect(message.title).toContain('0.0.1-previous (main@0ld0ld0, clean)');
+    if (current) expect(message.title).toContain(`${VERSION} (${current})`);
+    expect(JSON.parse(readFileSync(markerPath(), 'utf-8')).build).toBe(current);
   });
 
   test('a corrupt marker is treated as first start — re-record, no fabricated notice', async () => {

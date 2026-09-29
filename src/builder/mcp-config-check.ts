@@ -76,6 +76,12 @@ async function readJson(path: string): Promise<unknown> {
 export async function assertDaemonMcpConfigMounted(
   daemonConfigPath: string,
   claudeConfigPath: string,
+  /**
+   * The path the container sees the file at, when it is mounted somewhere
+   * other than its host path (a detached builder's fixed container dir). The
+   * Claude config must name THIS path; defaults to the host path.
+   */
+  containerPath: string = daemonConfigPath,
 ): Promise<void> {
   try {
     await readJson(daemonConfigPath);
@@ -100,13 +106,13 @@ export async function assertDaemonMcpConfigMounted(
     );
   }
 
-  if (recorded !== daemonConfigPath) {
+  if (recorded !== containerPath) {
     throw new Error(
       `The builder's Claude config names a different MCP credential than the one ` +
       `being mounted, so the builder would start with no lazy_* tools.\n` +
       `  config:  ${claudeConfigPath}\n` +
       `  names:   ${recorded ?? '(no lazy MCP entry)'}\n` +
-      `  mounted: ${daemonConfigPath}\n` +
+      `  mounted: ${daemonConfigPath}${containerPath === daemonConfigPath ? '' : ` at ${containerPath}`}\n` +
       `This means two builder launches wrote the same Claude config. Report it — ` +
       `the mounted copy is supposed to be per-launch.`,
     );

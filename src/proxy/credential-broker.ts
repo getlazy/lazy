@@ -71,6 +71,15 @@ export interface CredentialGrant {
    * carries the profile.
    */
   profile?: string;
+  /**
+   * The UUID of the task the launch belongs to — what the proxy matches a
+   * team-mode turn's principal by (its live session binding is keyed by it).
+   * `taskId` is whatever REFERENCE the launch had to hand (its code, a short
+   * id), and a code is mutable and reusable, so it never identifies a turn.
+   * Optional: grants minted before it existed carry none, and pay for nothing
+   * in team mode until their next launch adds it.
+   */
+  taskUuid?: string;
   createdAt: string;
 }
 
@@ -257,7 +266,9 @@ function identityKey(
  */
 export async function mintCredentialGrant(
   projectRoot: string,
-  opts: { role: GrantRole; taskId?: string | null; label: string; envKey: string; profile?: string },
+  opts: {
+    role: GrantRole; taskId?: string | null; label: string; envKey: string; profile?: string; taskUuid?: string;
+  },
 ): Promise<string> {
   const taskId = opts.taskId ?? null;
   return mutate(projectRoot, async registry => {
@@ -265,7 +276,15 @@ export async function mintCredentialGrant(
     const existing = registry.grants.find(
       g => identityKey(g.role, g.taskId, g.label, g.envKey, g.profile) === key,
     );
-    if (existing) return existing.token;
+    if (existing) {
+      // Same token — a running container keeps the value in its env — now
+      // carrying the task UUID a grant minted before that field lacks.
+      if (opts.taskUuid && existing.taskUuid !== opts.taskUuid) {
+        existing.taskUuid = opts.taskUuid;
+        await persist(projectRoot, registry);
+      }
+      return existing.token;
+    }
 
     const grant: CredentialGrant = {
       token: placeholderValueFor(opts.envKey),
@@ -274,6 +293,7 @@ export async function mintCredentialGrant(
       label: opts.label,
       envKey: opts.envKey,
       ...(opts.profile ? { profile: opts.profile } : {}),
+      ...(opts.taskUuid ? { taskUuid: opts.taskUuid } : {}),
       createdAt: new Date().toISOString(),
     };
     registry.grants.push(grant);

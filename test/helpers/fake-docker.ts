@@ -31,7 +31,7 @@
  * regresses.
  */
 
-import { chmod, mkdir, readFile, writeFile } from 'fs/promises';
+import { chmod, mkdir, readFile, rm, symlink, writeFile } from 'fs/promises';
 import { join } from 'path';
 
 const SCRIPT = `#!/usr/bin/env bash
@@ -81,10 +81,75 @@ case "\${1:-}" in
       *IPAddress*)
         if [ -f "\$STATE/container-ip" ]; then cat "\$STATE/container-ip"; else echo "172.30.0.2"; fi
         ;;
+      *ExitCode*)
+        # \`inspect <name> --format '{{.State.Running}} {{.State.ExitCode}} …'\`:
+        # running → \`true 0\`, crashed (see \`crash\`) → its code, unknown →
+        # docker's own "No such container". \`failInspect\` makes the runtime
+        # not answer at all.
+        name="\${2:-}"
+        if [ -f "\$STATE/fail-inspect" ]; then
+          echo "fake docker: Cannot connect to the Docker daemon" >&2
+          exit 1
+        fi
+        cstate=""
+        if [ -f "\$STATE/containers.tsv" ]; then
+          cstate="\$(awk -F'\\t' -v n="\$name" '\$1 == n { print \$2 }' "\$STATE/containers.tsv")"
+        fi
+        if [ -z "\$cstate" ]; then
+          echo "Error: No such container: \$name" >&2
+          exit 1
+        fi
+        if [ "\$cstate" = "running" ]; then
+          printf 'true 0 0001-01-01T00:00:00Z\\n'
+        else
+          code=0
+          [ -f "\$STATE/exit-\$name" ] && code="\$(cat "\$STATE/exit-\$name")"
+          printf 'false %s 2026-09-27T12:00:00Z\n' "\$code"
+        fi
+        ;;
+      *'json .State'*)
+        # \`inspect --format '{{json .State}}' <name>\`: the state record a dead
+        # builder's evidence starts from. Unknown → docker's "No such container".
+        name="\${@: -1}"
+        cstate=""
+        if [ -f "\$STATE/containers.tsv" ]; then
+          cstate="\$(awk -F'\t' -v n="\$name" '\$1 == n { print \$2 }' "\$STATE/containers.tsv")"
+        fi
+        if [ -z "\$cstate" ]; then
+          echo "Error: No such container: \$name" >&2
+          exit 1
+        fi
+        code=0
+        [ -f "\$STATE/exit-\$name" ] && code="\$(cat "\$STATE/exit-\$name")"
+        printf '{"Status":"%s","ExitCode":%s,"OOMKilled":false,"Error":"","StartedAt":"2026-09-27T12:00:00Z","FinishedAt":"2026-09-27T12:00:02Z"}\n' "\$cstate" "\$code"
+        ;;
     esac
     exit 0
     ;;
+  cp)
+    # \`cp <name>:<path> <dest>\`: one file a crashed builder left (see
+    # \`crash\`'s supervisorLog). Copied with -P, as docker cp does: a symlink
+    # arrives as a symlink. Nothing there → docker's own "Could not find".
+    src="\${2:-}"; dest="\${3:-}"; name="\${src%%:*}"; path="\${src#*:}"
+    file="\$STATE/tmp-\$name/\$(basename "\$path")"
+    if [ ! -e "\$file" ] && [ ! -L "\$file" ]; then
+      echo "Error response from daemon: Could not find the file \$path in container \$name" >&2
+      exit 1
+    fi
+    cp -P "\$file" "\$dest"
+    exit 0
+    ;;
+  logs)
+    # \`logs --tail N <name>\`: what a crashed container printed (see \`crash\`).
+    name="\${@: -1}"
+    [ -f "\$STATE/logs-\$name" ] && cat "\$STATE/logs-\$name"
+    exit 0
+    ;;
   ps)
+    if [ -f "\$STATE/fail-inspect" ]; then
+      echo "fake docker: Cannot connect to the Docker daemon" >&2
+      exit 1
+    fi
     # Two real shapes reach this: the project-wide
     # \`ps -a --filter name=^lazy- --format {{.Names}}<tab>{{.State}}<tab>{{.Label …}}\`
     # and \`containerExists\`'s single-name \`--filter name=^/<n>$ --format {{.ID}}\`.
@@ -162,6 +227,12 @@ case "\${1:-}" in
     if [ -f "\$STATE/fail-run" ]; then
       exit 1
     fi
+    # The projects-dir write probe (\`sh -c 'touch … && rm -f …'\`): a test flips
+    # fail-write-probe to get a container user that cannot write the per-builder
+    # overlay, so the launch falls back to the member home's projects dir.
+    if [ -f "\$STATE/fail-write-probe" ] && printf '%s' "\$*" | grep -q 'touch '; then
+      exit 1
+    fi
     # Machine one-shot containers carry lazy.oneshot=1, and a \`runClaude\`
     # prompt run (the pair summary) carries \`claude -p\` — both parse stdout as
     # an agent answer, so emit a minimal JSON result for either without a real
@@ -199,10 +270,20 @@ case "\${1:-}" in
     case "\$*" in
       *" -d "*)
         dname=""
+        resume_id=""
+        projects_mount=""
+        home_mount=""
         set -- \$*
         while [ \$# -gt 0 ]; do
           case "\$1" in
             --name) dname="\$2"; shift 2 ;;
+            --resume) resume_id="\$2"; shift 2 ;;
+            -v)
+              case "\$2" in
+                *:/home/user/.claude/projects) projects_mount="\${2%:/home/user/.claude/projects}" ;;
+                *:/home/user/.claude) home_mount="\${2%:/home/user/.claude}" ;;
+              esac
+              shift 2 ;;
             *) shift ;;
           esac
         done
@@ -211,7 +292,22 @@ case "\${1:-}" in
             awk -F'\\t' -v n="\$dname" '\$1 != n' "\$STATE/containers.tsv" > "\$STATE/containers.tsv.new"
             mv "\$STATE/containers.tsv.new" "\$STATE/containers.tsv"
           fi
-          printf '%s\\trunning\\t-\\tsha256:container-%s\\n' "\$dname" "\$dname" >> "\$STATE/containers.tsv"
+          # What \`claude --resume <id>\` does inside the container: it looks for
+          # <id>.jsonl in the projects dir it SEES (the per-builder overlay if
+          # mounted, else ~/.claude/projects under the mounted home) and, when
+          # the file is not there, prints "No conversation found" and exits 1
+          # at once — a container that is dead seconds after its launch.
+          cstate=running
+          if [ -n "\$resume_id" ]; then
+            seen="\$projects_mount"
+            [ -z "\$seen" ] && [ -n "\$home_mount" ] && seen="\$home_mount/projects"
+            if ! ls "\$seen"/*/"\$resume_id.jsonl" >/dev/null 2>&1; then
+              cstate=exited
+              printf '1' > "\$STATE/exit-\$dname"
+              printf 'No conversation found with session ID: %s\n' "\$resume_id" > "\$STATE/logs-\$dname"
+            fi
+          fi
+          printf '%s\\t%s\\t-\\tsha256:container-%s\\n' "\$dname" "\$cstate" "\$dname" >> "\$STATE/containers.tsv"
         fi
         ;;
     esac
@@ -367,6 +463,19 @@ export interface FakeDocker {
     project?: string;
     id?: string;
   }): Promise<void>;
+  /**
+   * A running container dies on its own: it moves to `exited` with this exit
+   * code, and `docker logs` prints `output` — what a builder that crashed
+   * right after launch looks like to the daemon. `supervisorLog`, when given,
+   * is the in-container supervisor's /tmp log file, readable with `docker cp`;
+   * `{ symlinkTo }` plants a symlink there instead (a container pointing the
+   * log at a host path).
+   */
+  crash(name: string, exitCode: number, output: string, supervisorLog?: string | { symlinkTo: string }): Promise<void>;
+  /** The projects-dir write probe fails, so a builder launch runs without its overlay. */
+  failWriteProbe(): Promise<void>;
+  /** `docker inspect` and `docker ps` fail — a runtime that does not answer. */
+  failInspect(on?: boolean): Promise<void>;
   /** Names of the containers the fake still has, in seeded order. */
   containers(): Promise<string[]>;
   /** Every `docker build` invocation so far, as the joined argv string. */
@@ -526,6 +635,30 @@ export async function installFakeDocker(
         join(stateDir, 'containers.tsv'),
         [...existing, `${name}\t${state}\t${project}\t${id}`].join('\n') + '\n',
       );
+    },
+    async failWriteProbe() {
+      await writeFile(join(stateDir, 'fail-write-probe'), '');
+    },
+    async failInspect(on = true) {
+      const flag = join(stateDir, 'fail-inspect');
+      if (on) await writeFile(flag, '');
+      else await rm(flag, { force: true });
+    },
+    async crash(name, exitCode, output, supervisorLog) {
+      const lines = (await readLines('containers.tsv')).map(line => {
+        const cols = line.split('\t');
+        if (cols[0] === name) cols[1] = 'exited';
+        return cols.join('\t');
+      });
+      await writeFile(join(stateDir, 'containers.tsv'), lines.join('\n') + '\n');
+      await writeFile(join(stateDir, `exit-${name}`), String(exitCode));
+      await writeFile(join(stateDir, `logs-${name}`), output);
+      if (supervisorLog !== undefined) {
+        await mkdir(join(stateDir, `tmp-${name}`), { recursive: true });
+        const logFile = join(stateDir, `tmp-${name}`, `${name}.log`);
+        if (typeof supervisorLog === 'string') await writeFile(logFile, supervisorLog);
+        else await symlink(supervisorLog.symlinkTo, logFile);
+      }
     },
     async containers() {
       return (await readLines('containers.tsv')).map(line => line.split('\t')[0] ?? '');

@@ -18,7 +18,7 @@ const mockConfig: ResolvedConfig = {
   session: { verbose: false, debug: false, auto_commit_instructions: false },
   data: { path: '/tmp/test/.lazy' },
   storage: { backend: 'external', external_path: '' },
-  git: { default_branch_prefix: 'lazy', lfs_check: 'refuse' },
+  git: { default_branch_prefix: 'lazy', lfs_check: 'refuse', coauthor_trailer: true },
   output: { shortid_length: 8 },
   agents: {},
   agent: { agent_id: 'test-agent', watchdog_output_timeout_ms: 0, wind_down_timeout_ms: 0, effort: 'medium' },
@@ -692,6 +692,34 @@ describe('GitLabDriver', () => {
         },
       };
     }
+
+    async function squashMessage(coauthorTrailer?: boolean): Promise<string> {
+      const glCalls: string[][] = [];
+      const deps = makeDeps((args) => {
+        glCalls.push([...args]);
+        if (args[0] === 'api' && typeof args[1] === 'string' && args[1].includes('pipelines')) return ok(JSON.stringify([]));
+        if (args[0] === 'mr' && args[1] === 'view' && args.includes('json')) {
+          const merged = glCalls.some(c => c[0] === 'mr' && c[1] === 'merge');
+          return ok(JSON.stringify({ web_url: 'https://gitlab.com/o/r/-/merge_requests/42', iid: 42, state: merged ? 'merged' : 'opened' }));
+        }
+        if (args[0] === 'mr' && args[1] === 'merge') return ok();
+        return fail('unexpected glab call');
+      });
+      const result = await new GitLabDriver(mockConfig, deps).merge({
+        sourceBranch: 'lazy/test1234', targetBranch: 'main', task: makeTask(), taskShortId: 'test1234', root: '/tmp/test',
+        ...(coauthorTrailer === undefined ? {} : { coauthorTrailer }),
+      });
+      expect(result.status).toBe('merged');
+      const call = glCalls.find(c => c[0] === 'mr' && c[1] === 'merge')!;
+      return call[call.indexOf('--squash-message') + 1];
+    }
+
+    // INVARIANT: the forge squash carries lazy's co-author trailer by default
+    // and none when the project opts out ([git] coauthor_trailer = false).
+    test('squash message carries the co-author trailer by default and not when opted out', async () => {
+      expect(await squashMessage()).toBe('Test goal\n\nCo-Authored-By: Lazy <noreply@getlazy.dev>');
+      expect(await squashMessage(false)).toBe('Test goal');
+    });
 
     test('merges MR when existing MR is open', async () => {
       const glCalls: string[][] = [];

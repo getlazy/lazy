@@ -23,6 +23,9 @@ import type { ProgressEmitter } from './progress';
 import { trackWait, BLOCKING_WAIT_TOOLS } from './wait-registry';
 import { taskTurnOwner } from './turn-owner';
 import type { Storage } from '../storage/interface';
+import { realignAfterDaemonWrite } from '../utils/worktree-ownership';
+import { INTERNAL_GIT_TOOL_NAME } from '../mcp/types';
+import { runWithGitAuthor } from '../identity/git-author';
 
 /**
  * HTTP status a daemon route should answer with for a handler error.
@@ -294,11 +297,33 @@ export async function handleMcpToolCall(
 
   logger.debug(`MCP tool call: ${toolName} (task=${taskId || 'builder'}, worktree=${worktreePath})`);
 
+  // A commit this call makes (lazy_commit, a self-sync's merges, an accept)
+  // is authored by the person who asked for the turn; a turn nobody asked for
+  // falls through to the configured system identity (src/identity/git-author.ts).
+  return runWithGitAuthor(ctx.actorPerson ?? null, () =>
+    dispatchMcpHandler(storage, taskId, toolName, worktreePath, handler, args));
+}
+
+async function dispatchMcpHandler(
+  storage: Awaited<ReturnType<typeof getOrCreateStorage>>,
+  taskId: string,
+  toolName: string,
+  worktreePath: string,
+  handler: (args: Record<string, unknown>) => Promise<unknown>,
+  args: Record<string, unknown>,
+): Promise<unknown> {
   // A task agent making a BLOCKING call is parked, not working. Record it for
   // the duration so read surfaces can say `working(waiting on <task>)` and so
   // the waited time is subtractable from the turn's wall-clock. Builder calls
   // (taskId === '') have no task to attribute anything to.
   if (!taskId || !BLOCKING_WAIT_TOOLS.has(toolName)) {
+    if (taskId && WORKTREE_WRITING_TOOLS.has(toolName)) {
+      try {
+        return await handler(args);
+      } finally {
+        await realignAfterDaemonWrite(worktreePath);
+      }
+    }
     return handler(args);
   }
 
@@ -343,3 +368,11 @@ async function resolveWaitTargets(
   }
   return out;
 }
+
+/**
+ * Tools whose daemon-side handler writes into the calling task's own worktree
+ * or git dirs. A root daemon hands what they created back to the container
+ * user afterwards (src/utils/worktree-ownership.ts), or the agent cannot edit
+ * a file a merge just rewrote, nor stage into an objects dir a commit created.
+ */
+const WORKTREE_WRITING_TOOLS = new Set<string>(['lazy_commit', 'lazy_sync', 'lazy_accept', INTERNAL_GIT_TOOL_NAME]);

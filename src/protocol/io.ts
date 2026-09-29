@@ -24,7 +24,7 @@ import { PROGRESS_FILE } from './progress';
 import { FINAL_MARKER_FILE } from './final-marker';
 import { PRESENTATION_MARKER_FILE } from './presentation-marker';
 import type { ResolvedConfig, MaintainEntry, ReactEntry } from '../config/types';
-import { buildAgentSandboxArgs } from '../runner/host-sandbox';
+import { buildAgentSandboxArgs, hostSandboxStorePath } from '../runner/host-sandbox';
 import { harnessForAgentName } from '../config/agent-profiles';
 import { logger } from '../utils/logger';
 
@@ -119,7 +119,7 @@ export function commonCommandFields(
  *
  * Returns `{}` (no field) in every other case so the command stays unchanged.
  */
-function computeAgentExtraArgs(config: ResolvedConfig): { agent_extra_args?: string[] } {
+export function computeAgentExtraArgs(config: ResolvedConfig): { agent_extra_args?: string[] } {
   // Optional chaining: callers (and tests) may pass partial configs. Anything
   // other than a host-process Claude agent in sandbox mode gets no extra args.
   //
@@ -138,6 +138,7 @@ function computeAgentExtraArgs(config: ResolvedConfig): { agent_extra_args?: str
     allowWeakerNested: config.runner.sandbox_allow_weaker_nested,
     denyRead: config.runner.sandbox_deny_read,
     denyWrite: config.runner.sandbox_deny_write,
+    storePath: hostSandboxStorePath(config),
   });
   return extra.length > 0 ? { agent_extra_args: extra } : {};
 }

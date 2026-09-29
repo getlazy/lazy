@@ -91,6 +91,8 @@ import { turnText } from '../utils/turn-content';
 import { reviewFindingsSectionHtml, reviewFindingTurnsOf } from './review-findings';
 import { reviewsTabHtml, reviewsTabCount } from './reviews-tab';
 import { taskCommentsTabHtml, taskJournalTabHtml, queuedComments } from './task-notes';
+import { artifactsTabHtml } from './artifacts-tab';
+import type { TaskArtifact } from '../types';
 import {
   buildLiveStatusKeys,
   taskLiveStatusScript,
@@ -99,6 +101,9 @@ import {
 import { liveKeysToken } from './task-live-regions';
 import { domMorphScript } from './dom-morph';
 import { timestampHtml } from './timestamps';
+import { taskUsagePauseHtml } from './usage-pause-banner';
+import type { TaskUsagePauseView } from './task-actions';
+import { revertedProtectedFiles } from '../protection/reverted-files';
 
 export interface TaskProgressLine {
   message: string;
@@ -122,7 +127,12 @@ export interface TaskPageReviewExtras {
     rows: import('../regions').RegionSummary[];
     active: string | null;
     notes: string[];
+    source?: 'presentation' | 'children';
+    staleWalkthrough?: boolean;
+    fileRegions?: Record<string, string>;
   };
+  /** Set when the diff is loaded file by file (src/server/review-progressive.ts). */
+  progressive?: import('./review-progressive').ChangesLoadPlan;
   /**
    * Per-line unit attribution for the files the Changes tab is rendering — the
    * subtask-blame gutter. Absent on every other tab, and on a task with no
@@ -208,6 +218,11 @@ export interface TaskPageInput {
   launchIdentity?: TaskLaunchIdentityView | null;
   reparentTargets?: TaskReparentTargets | null;
   submitPreflight?: TaskSubmitPreflight | null;
+  /**
+   * The daemon's usage-pause answer for this task (header line, and the
+   * launch dialogs' "let this turn through" box). Absent/null draws nothing.
+   */
+  usagePause?: TaskUsagePauseView | null;
   /** Shared linkify tables (task codes; symbols merge in on Changes). */
   markdown?: RenderMarkdownOptions;
   /** Direct `/raised/:id` load — render the Raised tab with this dialog open. */
@@ -220,12 +235,23 @@ export interface TaskPageInput {
    * the CLI. Stats tab only; absent renders the tab's own empty state.
    */
   stats?: TaskStatsResult;
+  /** Artifact metadata — the Artifacts tab and its strip badge. Absent = no badge. */
+  artifacts?: TaskArtifact[];
+  /** Decoded text of non-binary artifacts, for previews. Artifacts tab only. */
+  artifactTexts?: ReadonlyMap<string, string>;
+  /** Result line of the last artifact upload. */
+  artifactNotice?: { text: string; error?: boolean } | null;
   /**
    * Codes shared by more than one task, from `Storage.listTaskCodes()`. Task
    * URLs on this page fall back to the id for those, so a link cannot land on
    * a sibling task with the same code; absent, links just use code-or-id.
    */
   duplicatedCodes?: ReadonlySet<string>;
+}
+
+/** The daemon says this task's next turn would be paused (no allowance pending). */
+function usagePausedFor(input: TaskPageInput): boolean {
+  return !!input.usagePause?.reason && input.usagePause.liftable && !input.usagePause.allowed;
 }
 
 function emptyTab(message: string): string {
@@ -473,6 +499,7 @@ function landingHeaderHtml(input: TaskPageInput): string {
   return `
     <div class="lz-landing-header">
       ${flash}
+      ${taskUsagePauseHtml(task.id, input.usagePause)}
       <h1>Task ${escapeHtml(taskDisplayId)}</h1>
       <div class="task-signal">
         <p class="task-goal">${escapeHtml(task.goal)}</p>
@@ -490,7 +517,7 @@ function landingHeaderHtml(input: TaskPageInput): string {
       <div class="action-links">
         ${goReview}
         ${landingExtraActionsHtml(input)}
-        ${taskActionRowHtml(task, hasOpenSession, input.duplicatedCodes)}
+        ${taskActionRowHtml(task, hasOpenSession, input.duplicatedCodes, usagePausedFor(input))}
         ${isTerminalStatus(task.status) ? '' : `<a href="${taskPath(task, input.duplicatedCodes)}/edit" class="btn">Edit task</a>`}
         ${isTerminalStatus(task.status) ? '' : `<a href="/tasks/new?parent=${seg}" class="btn">New subtask</a>`}
         ${isTerminalStatus(task.status) ? '' : watchPanelHtml(seg, true)}
@@ -685,6 +712,7 @@ function tabBodyHtml(input: TaskPageInput): string {
     hubChildren: review.hubChildren,
     regions: review.regions,
     lineAttribution: review.lineAttribution,
+    ...(review.progressive ? { progressive: review.progressive } : {}),
     timings: input.timings,
     markdown: input.markdown,
   };
@@ -764,6 +792,14 @@ function tabBodyHtml(input: TaskPageInput): string {
       });
     case 'journal':
       return taskJournalTabHtml(input.journal, input.markdown);
+    case 'artifacts':
+      return artifactsTabHtml({
+        taskId: seg,
+        artifacts: input.artifacts ?? [],
+        texts: input.artifactTexts,
+        markdown: input.markdown,
+        notice: input.artifactNotice,
+      });
     case 'stats': {
       const stats = input.stats;
       // The route loads these only for a real Stats render; absent means this
@@ -815,7 +851,9 @@ function tabBodyHtml(input: TaskPageInput): string {
         hasCommits: input.commits.length > 0,
         verifyProgress: currentVerifyProgress(input),
         turns: acceptGateTurns(input.turns),
+        restoredProtectedFiles: revertedProtectedFiles(input.turns),
         duplicatedCodes: input.duplicatedCodes,
+        usagePaused: usagePausedFor(input),
         // The ANSWER, from the one resolver — never the turns for this page to
         // re-derive finality from.
         final: buildShowFinal(input.turns),
@@ -854,6 +892,7 @@ function tabBadges(input: TaskPageInput): Partial<Record<TaskTabId, TaskTabBadge
       : { text: String(input.comments.length) };
   }
   if (input.journal.length) badges.journal = { text: String(input.journal.length) };
+  if (input.artifacts?.length) badges.artifacts = { text: String(input.artifacts.length) };
   // Stats badges the number the tab exists for — total recorded tokens — not a
   // row count. It is summed from the turns the strip already has, so every tab
   // can show it without the Stats tab's own loads.

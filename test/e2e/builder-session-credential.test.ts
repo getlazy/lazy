@@ -9,82 +9,95 @@
  * when the container is already gone (or never existed) — exactly the shape
  * `lazy upgrade`'s SIGKILL recovery already relies on
  * (test/e2e/builder-kill-resume.test.ts). So this suite talks to the daemon
- * directly over its TCP port, the same template as builder-cap-daemon-side.test.ts,
- * and never launches Docker.
+ * directly over its TCP port and never launches a container.
+ *
+ * "Already gone" is an ANSWER, though, not an absence of one: the daemon asks
+ * the runtime with `docker inspect`, and a runtime that cannot be asked is
+ * `unknown`, which it deliberately refuses to act on. So the runtime here is
+ * the fake `docker` binary (test/helpers/fake-docker.ts) with no containers
+ * seeded — every `inspect` answers "No such container" on any machine, with or
+ * without a real docker — and `failRuns()` makes a container launch fail, the
+ * "Docker cannot start it" state the launch tests need.
+ *
+ * The daemon is OUT of process and unmocked (`setupTestLazy({ fakeClaude:
+ * true })`, restarted with the fake on its PATH): the module mock replaces the
+ * inspect probe wholesale, and an in-process daemon cannot be pointed at a
+ * fake binary at all — `Bun.spawn` resolves executables from the environment
+ * the process STARTED with, never a later `process.env.PATH` edit.
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { startDaemonServer, type RunningDaemon } from '../../src/daemon/server';
+import { mkdtemp, readFile, writeFile, rm } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { pinConfig } from '../helpers/pin-config';
-import { makeDaemonBaseDir, pinDaemonBaseDir, removeDaemonBaseDir } from '../helpers/daemon-base-dir';
-import { isolateInProcessDaemonEnv } from '../helpers/in-process-daemon';
-import { resetConcurrencyStateForTest } from '../../src/daemon/concurrency';
+import { installFakeDocker, type FakeDocker } from '../helpers/fake-docker';
+import { getDaemonTcpTarget, readToken } from '../../src/daemon/lifecycle';
+import { DaemonClient, RpcApplicationError } from '../../src/daemon/client';
 import { NO_OWNER_CREDENTIAL_MARKER } from '../../src/daemon/turn-credentials';
 import { RemoteStorage } from '../../src/storage/remote-storage';
 import type { BuilderResumeIntent } from '../../src/storage/types';
 
-const TOKEN = 'test-token-builder-session';
 // setupTestLazy() configures this as the project's git identity — see
 // test/helpers/setup.ts. Outside managed mode this is who a control-token
 // call is attributed to, and therefore the member a builder session it starts
 // is registered under.
 const GIT_EMAIL = 'test@lazy.test';
 
-isolateInProcessDaemonEnv();
-
 describe('daemon-owned builder session: credential binding and registry', () => {
   let ctx: TestContext;
-  let daemon: RunningDaemon | undefined;
-  let restoreConfig: (() => void) | undefined;
-  let daemonBaseDir: string;
-  let restoreDaemonBaseDir: (() => void) | undefined;
+  let fakeDir: string;
+  let docker: FakeDocker;
+  let target: string;
+  let token: string;
 
   beforeEach(async () => {
-    process.env.LAZY_TEST = '1';
-    ctx = await setupTestLazy();
-    restoreConfig = pinConfig(ctx.root);
-    daemonBaseDir = await makeDaemonBaseDir();
-    restoreDaemonBaseDir = pinDaemonBaseDir(daemonBaseDir);
-    resetConcurrencyStateForTest();
-    daemon = await startDaemonServer({ token: TOKEN, projectRoot: ctx.root });
+    fakeDir = await mkdtemp(join(tmpdir(), 'lazy-builder-cred-'));
+    docker = await installFakeDocker(fakeDir);
+    // No container this suite names may ever start: the launch tests assert
+    // on a launch that fails at the container step.
+    await docker.failRuns();
+
+    ctx = await setupTestLazy({ fakeClaude: true });
+    // fakeClaude switches the project to the host-process runner; a builder
+    // session's container is the docker runner's, so put that back.
+    const configPath = join(ctx.root, 'lazy.toml');
+    const before = await readFile(configPath, 'utf-8');
+    const patched = before.replace(
+      'type = "dangerously-host-process-without-any-isolation"',
+      'type = "docker"',
+    );
+    if (patched === before) throw new Error('could not restore [runner] type = "docker" in the generated lazy.toml');
+    await writeFile(configPath, patched);
+    await ctx.restartDaemon({
+      LAZY_BUILDER_HOMES_BASE_DIR: join(fakeDir, 'builder-homes'),
+      PATH: `${docker.binDir}:${process.env.PATH ?? ''}`,
+    });
+
+    const resolvedTarget = getDaemonTcpTarget(ctx.root);
+    const resolvedToken = readToken(ctx.root);
+    if (!resolvedTarget || !resolvedToken) throw new Error('test daemon did not record a TCP target and token');
+    target = resolvedTarget;
+    token = resolvedToken;
   });
 
   afterEach(async () => {
-    if (daemon) await daemon.stop();
-    daemon = undefined;
-    resetConcurrencyStateForTest();
-    restoreConfig?.();
-    restoreConfig = undefined;
     await ctx.cleanup();
-    restoreDaemonBaseDir?.();
-    restoreDaemonBaseDir = undefined;
-    await removeDaemonBaseDir(daemonBaseDir);
+    await rm(fakeDir, { recursive: true, force: true });
   });
 
   async function rpc(command: string, params: Record<string, unknown> = {}): Promise<{ status: number; body: any }> {
-    const resp = await fetch(`http://127.0.0.1:${daemon!.webPort}/rpc/${command}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${TOKEN}`,
-        'X-Lazy-Project': ctx.root,
-      },
-      body: JSON.stringify(params),
-    });
-    return { status: resp.status, body: await resp.json() };
+    try {
+      const body = await DaemonClient.fromTarget(target, token).rpc(command, ctx.root, params);
+      return { status: 200, body };
+    } catch (err) {
+      if (!(err instanceof RpcApplicationError)) throw err;
+      return { status: err.status, body: { error: err.message } };
+    }
   }
 
-  /** A minimal DaemonClient-shaped object over this test's own fetch helper. */
   function daemonStorage(): RemoteStorage {
-    const client = {
-      rpc: async (command: string, _projectRoot: string, params: Record<string, unknown>) => {
-        const { status, body } = await rpc(command, params);
-        if (status >= 400) throw new Error(body?.error ?? `RPC ${command} failed (${status})`);
-        return body;
-      },
-    } as unknown as import('../../src/daemon/client').DaemonClient;
-    return new RemoteStorage(client, ctx.root, '');
+    return new RemoteStorage(DaemonClient.fromTarget(target, token), ctx.root, '');
   }
 
   // INVARIANT: a member with no stored credential is refused with the wire
@@ -109,13 +122,13 @@ describe('daemon-owned builder session: credential binding and registry', () => 
 
   // Outside team mode, `startBuilderSession` must not require a credential at
   // all — the non-managed `lazy builder` path stays exactly as it works today.
-  // The launch itself still fails here (no Docker in this test environment),
+  // The launch itself still fails here (the fake runtime refuses every run),
   // but it must fail at the CONTAINER step, never at the credential check.
   test('outside team mode, no credential is required before the container step', async () => {
     const { status, body } = await rpc('startBuilderSession', {});
     // Never the credential refusal.
     expect(body.error ?? '').not.toContain(NO_OWNER_CREDENTIAL_MARKER);
-    // Docker is unavailable in this environment, so the launch fails past the
+    // The runtime refuses the container, so the launch fails past the
     // credential gate — proving the gate was cleared rather than skipped.
     expect(status).toBeGreaterThanOrEqual(400);
   });
@@ -153,6 +166,8 @@ describe('daemon-owned builder session: credential binding and registry', () => 
     expect(body.state).toBe('ended');
     expect(body.agentSessionId).toBe('claude-sess-abc');
     expect(body.endedAt).toBeTruthy();
+    // "Gone" was the runtime's answer, not a failure to ask it.
+    expect((await docker.invocations()).some(l => l.startsWith('inspect lazy-builder-d0e5a075'))).toBe(true);
 
     // Ending is terminal: the intent was consumed (not left for a resume that
     // will never come — an ended session is never resumed, §5.7).
@@ -218,16 +233,18 @@ describe('daemon-owned builder session: credential binding and registry', () => 
     } satisfies BuilderResumeIntent);
 
     // The container named on the row was never actually started in this test
-    // (no Docker here), so `runner.isRunning` reports it dead — exactly the
-    // state a real daemon restart leaves behind, minus the daemon actually
-    // having restarted. startBuilderSession must not trust the stale 'running'
-    // row: it falls through to the (Docker-less, and therefore failing) resume
-    // launch — but only AFTER capturing the resume intent onto the row.
+    // (the fake runtime has no such container), so `docker inspect` reports it
+    // gone — exactly the state a real daemon restart leaves behind, minus the
+    // daemon actually having restarted. startBuilderSession must not trust the
+    // stale 'running' row: it falls through to the (refused, and therefore
+    // failing) resume launch — but only AFTER capturing the resume intent onto
+    // the row.
     await rpc('startBuilderSession', {});
 
     const after = await storage.getBuilderSession('sess-stale-1');
     expect(after?.agentSessionId).toBe('claude-sess-after-restart');
     expect(after?.state).not.toBe('running');
+    expect((await docker.invocations()).some(l => l.startsWith('inspect lazy-builder-7ea9ed00'))).toBe(true);
     // The intent is consumed once captured — a second stale detection must not
     // find a phantom session id from a previous restart.
     expect(await storage.listBuilderResumeIntents(ctx.root)).toEqual([]);

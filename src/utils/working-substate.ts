@@ -154,6 +154,10 @@ export interface LivenessContext {
 export const ACTIVE_HARNESS_PHASES: ReadonlySet<string> = new Set([
   'sync_with_remote',
   'merge_and_fix',
+  // The restore of rejected protected files is in progress. (Once it lands,
+  // stranded recovery also skips the restore commit itself by author —
+  // recoverStrandedCompletion.)
+  'restore_rejected',
   'pre_turn_hook',
   'permission_pushback',
   // Maintained-files and reactive-automation follow-ups resume the agent for up

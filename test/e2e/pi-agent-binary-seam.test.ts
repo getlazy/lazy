@@ -88,6 +88,8 @@ describe('pi turns through the fake-binary seam', () => {
       sequence: [
         piSuccessScenario({
           result: 'First turn done.',
+          inputTokens: 321,
+          outputTokens: 45,
           commit: { message: 'pi turn 1', files: [{ path: 'pi-1.txt', content: 'one\n' }] },
         }),
         piSuccessScenario({ result: 'Second turn done.' }),
@@ -101,6 +103,18 @@ describe('pi turns through the fake-binary seam', () => {
     expectSuccess(await ctx.lazy(['start', taskId, '--yes', '--effort', 'medium']));
     expectSuccess(await ctx.lazy(['wait', taskId]));
     expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
+
+    // The harness-reported measurement is durable Storage state on the turn,
+    // not something reconstructed later from the bounded proxy audit log.
+    const storedTurns = await agentTurns(ctx.root, taskId);
+    expect(storedTurns.some(turn => {
+      const usage = turn.usage as Record<string, unknown> | null;
+      return usage?.inputTokens === 321 && usage.outputTokens === 45;
+    })).toBe(true);
+    const session = await readSessionRecord(ctx.root, taskId);
+    const total = session.total_usage as Record<string, unknown> | null;
+    expect(Number(total?.inputTokens)).toBeGreaterThanOrEqual(321);
+    expect(Number(total?.outputTokens)).toBeGreaterThanOrEqual(45);
 
     const turns = await turnInvocations();
     expect(turns.length, 'the fake pi was never launched for a turn').toBeGreaterThan(0);
@@ -582,5 +596,35 @@ describe('pi turns through the fake-binary seam', () => {
     expect(resumed).toContain('--session-id');
     expect(resumed[resumed.indexOf('--session-id') + 1]).toBe(PI_SESSION_ID);
     expect(resumed[resumed.length - 1]).toContain('Credential fixed');
+  }, 180_000);
+
+  // INVARIANT: a provider's monthly-quota 429 is not transient. Seen live
+  // 2026-09-18: Ollama Cloud's "reached your monthly usage limit" was retried
+  // every 60s, uncapped, behind a "retrying" substate. It must block after ONE
+  // launch, with the provider's remedy URL on the recorded turn.
+  test('a monthly-quota 429 blocks after one launch with the provider remedy visible', async () => {
+    const taskId = await createTask(ctx, 'pi quota wall', 'Do the work');
+    await ctx.setPiScenario({
+      sequence: [
+        piErrorScenario({
+          errorMessage:
+            '429 {"type":"error","error":{"type":"rate_limit_error","message":"you (someone) have reached ' +
+            'your monthly usage limit, upgrade for higher limits: https://ollama.com/upgrade or add usage ' +
+            'credits: https://ollama.com/settings (ref: x)"}}',
+          sessionId: PI_SESSION_ID,
+        }),
+      ],
+    });
+
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+    expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
+
+    const piTurns = (await ctx.piInvocations()).filter(i => i.argv.includes('-p'));
+    expect(piTurns.length).toBe(1);
+    const turns = await agentTurns(ctx.root, taskId);
+    const content = String(turns[turns.length - 1]!.content);
+    expect(content).toContain('fatal_auth');
+    expect(content).toMatch(/Reason: model provider quota exhausted[^\n]*ollama\.com\/upgrade/);
   }, 180_000);
 });

@@ -50,18 +50,18 @@ function fileRowHtml(f: ScratchFileEntry): string {
   </tr>`;
 }
 
-function sessionHeading(sessionId: string | null): string {
-  if (!sessionId) return 'Session not recorded';
-  return `Builder session <a href="/conversations/${escapeHtml(encodeURIComponent(sessionId))}"><code>${escapeHtml(sessionId.substring(0, 8))}</code></a>`;
+function sessionHeading(builderId: string | null): string {
+  if (!builderId) return 'Builder not recorded';
+  return `Builder <a href="/builders/${escapeHtml(encodeURIComponent(builderId))}"><code>${escapeHtml(builderId.substring(0, 8))}</code></a>`;
 }
 
 export function scratchIndexHtml(groups: ScratchSessionGroup[]): string {
   const total = groups.reduce((n, g) => n + g.files.length, 0);
   const body = total === 0
     ? `<div class="empty-state" id="scratch-empty">No captured builder scratch files yet. Builders write into <code>$LAZY_SCRATCH_DIR</code>; capture them now with <code>lazy scratch sync</code>.</div>`
-    : `<p class="text-muted" id="scratch-summary">${total} file${total === 1 ? '' : 's'} in ${groups.length} session group${groups.length === 1 ? '' : 's'}.</p>
+    : `<p class="text-muted" id="scratch-summary">${total} file${total === 1 ? '' : 's'} from ${groups.length} Builder${groups.length === 1 ? '' : 's'}.</p>
        ${groups.map((g) => `<section class="detail-section scratch-group">
-         <h2>${sessionHeading(g.session_id)}</h2>
+         <h2>${sessionHeading(g.builder_id)}</h2>
          <table class="table scratch-table">
            <thead><tr><th>Path</th><th>Size</th><th>Captured</th><th>State</th></tr></thead>
            <tbody>${g.files.map(fileRowHtml).join('\n')}</tbody>
@@ -103,9 +103,9 @@ export function scratchFileHtml(file: ScratchFileEntry & { content: string | nul
     escapeHtml(formatBytes(file.size)),
     `captured ${escapeHtml(formatDate(file.updated_at))}`,
     `by ${escapeHtml(file.updated_by)}`,
-    file.session_id
-      ? `session <a href="/conversations/${escapeHtml(encodeURIComponent(file.session_id))}"><code>${escapeHtml(file.session_id.substring(0, 8))}</code></a>`
-      : 'session not recorded',
+    (file.builder_id ?? file.session_id)
+      ? `Builder <a href="/builders/${escapeHtml(encodeURIComponent(file.builder_id ?? file.session_id!))}"><code>${escapeHtml((file.builder_id ?? file.session_id!).substring(0, 8))}</code></a>`
+      : 'Builder not recorded',
   ].join(' · ');
 
   let body: string;

@@ -152,7 +152,10 @@ describe('raised-item promote helpers', () => {
       };
       const prompt = buildPromotedTaskPrompt(item, task);
       expect(prompt).toContain('Fix the flaky retry path');
-      expect(prompt).toContain('Promoted from raised item ri-uuid on task fix-retry: Fix retry bugs');
+      // INVARIANT: provenance ends at the task code. The originating goal is an imperative
+      // and, as the prompt's last line, read to the agent as a second unrelated ask.
+      expect(prompt.endsWith('Promoted from raised item ri-uuid on task fix-retry.')).toBe(true);
+      expect(prompt).not.toContain('Fix retry bugs');
     }
   });
 

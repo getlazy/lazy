@@ -166,7 +166,17 @@ export function heartbeatRequestHeaders(): Record<string, string> {
  */
 export function heartbeatEnvelopeResponse(
   produce: EnvelopeProducer,
-  options?: { intervalMs?: number; signal?: AbortSignal },
+  options?: {
+    intervalMs?: number;
+    signal?: AbortSignal;
+    /**
+     * Called once when the caller was gone before the result could be written
+     * (the request aborted, or the final write failed). The work itself ran to
+     * the end regardless; this is how the daemon LOG, not only tracing, records
+     * that somebody's connection was cut mid-operation.
+     */
+    onCallerGone?: (info: { elapsedMs: number; heartbeats: number; resultStatus: number | null }) => void;
+  },
 ): Response {
   const intervalMs = options?.intervalMs ?? HEARTBEAT_INTERVAL_MS;
   const encoder = new TextEncoder();
@@ -223,7 +233,13 @@ export function heartbeatEnvelopeResponse(
         }
       }, intervalMs);
 
-      const onAbort = () => writerSpan.reaped(heartbeats);
+      let callerGoneReported = false;
+      const reportCallerGone = (resultStatus: number | null) => {
+        if (callerGoneReported) return;
+        callerGoneReported = true;
+        options?.onCallerGone?.({ elapsedMs: Date.now() - started, heartbeats, resultStatus });
+      };
+      const onAbort = () => { writerSpan.reaped(heartbeats); reportCallerGone(null); };
       options?.signal?.addEventListener('abort', onAbort, { once: true });
 
       let result: EnvelopeResult;
@@ -246,6 +262,7 @@ export function heartbeatEnvelopeResponse(
         // Client already gone — the response is undeliverable, and there is no
         // one left to report that to. The work completed regardless.
         writerSpan.undeliverable(result.status, heartbeats);
+        reportCallerGone(result.status);
       }
     },
   });

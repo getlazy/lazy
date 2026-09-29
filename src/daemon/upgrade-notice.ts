@@ -21,11 +21,19 @@ import { readFile, writeFile, mkdir } from 'fs/promises';
 import { getDaemonDir } from './paths';
 import { logger } from '../utils/logger';
 import type { Storage } from '../storage';
+import { runningBuildIdentity } from '../utils/build-provenance';
 
 const MARKER_FILE = 'daemon-last-version.json';
 
 interface VersionMarker {
   version: string;
+  /** `branch@sha, clean|dirty` of that start, when it could be determined. */
+  build?: string | null;
+}
+
+/** `0.90.4100 (main@abc1234, clean)`, or the bare version when no build is known. */
+function label(version: string, build: string | null | undefined): string {
+  return build ? `${version} (${build})` : version;
 }
 
 /**
@@ -49,16 +57,28 @@ export async function maybePostUpgradeNotice(
     return;
   }
 
+  // Which commit, not only which version: two builds of one version are
+  // different code, and "is this daemon up to date" is asked of the SHA.
+  // Display only — a notice still fires on a VERSION change, as before.
+  let build: string | null = null;
+  try {
+    build = await runningBuildIdentity();
+  } catch (err) {
+    logger.warn(`Could not determine the daemon's build identity: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
   const markerDir = getDaemonDir(projectRoot);
   const markerPath = join(markerDir, MARKER_FILE);
 
   try {
     let previous: string | null = null;
+    let previousBuild: string | null = null;
     try {
       const raw = await readFile(markerPath, 'utf-8');
       const parsed = JSON.parse(raw) as VersionMarker;
       if (typeof parsed.version === 'string' && parsed.version.length > 0) {
         previous = parsed.version;
+        previousBuild = typeof parsed.build === 'string' ? parsed.build : null;
       }
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
@@ -73,9 +93,9 @@ export async function maybePostUpgradeNotice(
       await storage.createSystemMessage({
         source: 'daemon',
         kind: 'notice',
-        title: `Daemon version changed: ${previous} → ${version}`,
+        title: `Daemon version changed: ${label(previous, previousBuild)} → ${label(version, build)}`,
         body:
-          `The daemon for this project started as version **${version}**; the previous start was **${previous}**.\n\n` +
+          `The daemon for this project started as version **${label(version, build)}**; the previous start was **${label(previous, previousBuild)}**.\n\n` +
           `Nothing to do — this is a heads-up that new daemon code is now serving the project. ` +
           `If running tasks behave unexpectedly after an upgrade, \`lazy daemon status\` shows what is running and \`CHANGELOG.md\` what changed.`,
       });
@@ -83,7 +103,7 @@ export async function maybePostUpgradeNotice(
     }
 
     await mkdir(markerDir, { recursive: true });
-    await writeFile(markerPath, JSON.stringify({ version } satisfies VersionMarker, null, 2) + '\n', 'utf-8');
+    await writeFile(markerPath, JSON.stringify({ version, build } satisfies VersionMarker, null, 2) + '\n', 'utf-8');
   } catch (err) {
     logger.error(
       `Failed to record/report the daemon version change: ${err instanceof Error ? err.message : String(err)}. ` +

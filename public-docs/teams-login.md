@@ -34,7 +34,7 @@ What happens, step by step:
    and who you would be approving as. The second link has the code already in
    it; it is a convenience, and typing the code yourself is the safer habit,
    because it means you know which request you are approving.
-3. You approve. The install creates an API token named after the machine.
+3. You approve. The install creates a Git & CLI token named after the machine.
 4. Lazy collects the token, asks which project this clone is, and saves both.
 
 The code expires after 15 minutes. If nobody approves it in time, run
@@ -49,7 +49,7 @@ from one network at the same time do not crowd each other out.
 If a login ends after you approved it — you interrupt it, the install becomes
 unreachable, or the project you named is not one you are a member of — the token
 it created still exists. Lazy says so, and you can retire it at
-**Settings → API tokens**.
+**Account settings → Git & CLI tokens** (from your avatar menu).
 
 **Only you can approve your own logins.** An administrator viewing the site as
 you cannot approve one on your behalf, even with writes enabled — approving puts
@@ -92,7 +92,7 @@ command works without it.
 `lazy builder` in a bound clone does not start anything on your machine. Your
 builder runs on the Teams install, next to the project, and `lazy builder`
 opens a terminal on it. Running `lazy builder` again — from this clone, another
-machine, or the **Builder** page in your browser — reaches the same session, so
+machine, or the **Builders** page in your browser — reaches the same session, so
 you can start something on your laptop and pick it up from your phone. Its
 conversation is kept with the project, like any other builder conversation.
 
@@ -100,6 +100,16 @@ conversation is kept with the project, like any other builder conversation.
 - `lazy builder stop` stops it and keeps its conversation; the next
   `lazy builder` resumes it.
 - `lazy builder end` ends it for good.
+
+In the browser, a stopped builder stays on the **Builders** page, marked
+"Stopped — resumable". Its page has a **Resume** button, and the Builders page
+button reads **Resume your builder**. If a builder stopped on its own (it
+crashed, or the machine restarted), its page says so, with the exit code, and
+Resume starts it again. If a stopped builder's conversation cannot be picked
+up again, starting it opens a fresh conversation instead; the old one stays
+readable under **Builders**. If Teams could not check whether your builder is
+running, the terminal says so; nothing is stopped, and you can try again in a
+moment.
 
 A builder runs until you stop or end it — there is no idle timeout. It runs on
 your own Claude account, so connect one in Teams first. Options that choose how
@@ -155,7 +165,7 @@ This deletes the stored login, which is also how the clone is unbound. If a clon
 somehow ends up holding more than one login — a state every other command refuses
 to act on — `lazy logout` clears all of them and says how many it removed. It stops
 *this machine* using the token; it does not retire the token. To end access
-altogether, revoke it at **Settings → API tokens** on the install — that takes
+altogether, revoke it at **Account settings → Git & CLI tokens** (from your avatar menu) on the install — that takes
 effect on the next request, from anywhere.
 
 ## Where the login is kept
@@ -173,8 +183,8 @@ points without unlocking a keychain to do it.
 
 ## The tokens this creates
 
-A login creates an ordinary API token with **CLI and MCP** access, named after
-the machine. It appears at **Settings → API tokens** alongside any token you
+A login creates an ordinary Git & CLI token with **CLI and MCP** access, named after
+the machine. It appears at **Account settings → Git & CLI tokens** (from your avatar menu) alongside any token you
 created by hand, showing when it was last used, and it is revoked there like any
 other. Logging the same machine in twice gives the second token a distinguishing
 suffix rather than failing.
@@ -187,7 +197,7 @@ clone over HTTPS from the install, that needs a git-capable token — see
 ## Approving from the browser
 
 The approval page lives at `/device` on your install and is also reachable from
-**Settings → API tokens**. Open it and type the code in — it is case-insensitive
+**Account settings → Git & CLI tokens** (from your avatar menu). Open it and type the code in — it is case-insensitive
 and the dash is optional. The prefilled link lazy prints underneath works too,
 and is a convenience rather than the mechanism.
 

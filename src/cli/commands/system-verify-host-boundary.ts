@@ -19,6 +19,7 @@
 
 import { writeFile } from 'fs/promises';
 import { requireLazyRoot, parseFlags } from '../helpers';
+import { isTTY, promptYesNo } from '../editor';
 import { loadConfig } from '../../config/loader';
 import { theme } from '../../render/theme';
 import {
@@ -37,11 +38,25 @@ export async function commandSystemVerifyHostBoundary(args: string[]): Promise<v
     { name: 'refresh', takesValue: false },
     { name: 'check', takesValue: false },
     { name: 'json', takesValue: true },
+    { name: 'yes', aliases: ['y'], takesValue: false },
   ], 'system verify-host-boundary');
 
   const refresh = parsed.flags.get('refresh') === true;
   const checkOnly = parsed.flags.get('check') === true;
   const jsonPath = parsed.flags.get('json') as string | undefined;
+  const yes = parsed.flags.get('yes') === true;
+
+  // The probe spends real, billed sessions, so it is always asked for. --yes
+  // skips the question only for automation, which reads the verdict from the
+  // JSON file: a --yes without --json is a person skipping a question they
+  // should see, and is refused before anything else runs.
+  if (yes && !jsonPath) {
+    console.error(
+      'Error: --yes is only accepted together with --json <path>, for automation that reads the verdict file.\n' +
+      'At a terminal, run without --yes and answer the prompt.',
+    );
+    process.exit(2);
+  }
 
   const root = requireLazyRoot();
   const config = await loadConfig(root);
@@ -85,10 +100,26 @@ export async function commandSystemVerifyHostBoundary(args: string[]): Promise<v
     }
   }
 
+  const sessions = checkOnly ? '1 real headless Claude Code session' : '9 real headless Claude Code sessions (~4-6 min)';
+  if (!yes) {
+    if (!isTTY()) {
+      console.error(
+        `Error: this runs ${sessions}, billed to your Claude account, and needs confirmation.\n` +
+        'Run it at a terminal and answer the prompt, or pass --yes --json <path> for automation.',
+      );
+      process.exit(2);
+    }
+    console.log(`${theme.warning('This launches')} ${sessions}, billed to your Claude account.`);
+    if (!(await promptYesNo('Run them now?', false))) {
+      console.log('Not run — no verdict reached, the boundary is unverified.');
+      process.exit(2);
+    }
+  }
+
   console.log(
     checkOnly
       ? 'Checking whether this host can run the boundary guard (1 real headless session)…'
-      : 'Verifying the host file-tool deny boundary (3 real headless sessions, ~1-2 min)…',
+      : 'Verifying the host file-tool deny boundary (9 real headless sessions, ~4-6 min)…',
   );
   console.log(`Claude Code: ${claudeVersion ?? 'unknown'}`);
 
@@ -97,6 +128,12 @@ export async function commandSystemVerifyHostBoundary(args: string[]): Promise<v
     settingsJson: settings,
     claudeVersion,
   });
+
+  // What each check did — the verdict alone does not say which vectors ran
+  // (e.g. whether the project-root checks were run or SKIPPED).
+  for (const c of result.cases ?? []) {
+    console.log(`  ${c.case.padEnd(24)} ${c.outcome}`);
+  }
 
   if (jsonPath) {
     await writeFile(jsonPath, `${JSON.stringify(result, null, 2)}\n`, 'utf-8');
@@ -144,18 +181,22 @@ the only thing holding the file tools back, and they are upstream behavior lazy
 depends on but does not control. A Claude Code upgrade could regress them silently.
 
 Probes the exact --settings posture this project gives its host agents, using real
-headless sessions (~1-2 min, billed). Needs a logged-in \`claude\`, jq, and a working
+headless sessions (~4-6 min, billed), and asks before starting them. Needs a logged-in \`claude\`, jq, and a working
 OS sandbox.
 
 Options:
   --refresh        Re-probe even when a cached verdict exists for this version
   --check          Only ask whether this host CAN run the guard (1 session)
   --json <path>    Also write the verdict as JSON to <path>
+  -y, --yes        Skip the confirmation prompt. Only accepted with --json, for
+                   automation; without a terminal the command refuses unless both
+                   are given
 
 Exit codes:
   0  boundary intact (with --check: this host can run the guard)
   1  VIOLATION — a deny rule was violated; host agents are porous
-  2  INCONCLUSIVE — no verdict reached (no auth, missing deps, or a hang)
+  2  INCONCLUSIVE — no verdict reached (no auth, missing deps, a hang, or the
+     sessions were declined or not confirmed)
 
 Verdicts are cached per Claude Code version + platform + deny posture in
 ~/.lazy/host-boundary-guard.json. Inconclusive runs are never cached.
@@ -166,5 +207,6 @@ launches run this automatically and refuse to launch on a violation.
 Examples:
   lazy system verify-host-boundary                 # verdict for this project's posture
   lazy system verify-host-boundary --check          # can this host run the guard at all?
-  lazy system verify-host-boundary --refresh        # re-probe after a Claude Code upgrade`);
+  lazy system verify-host-boundary --refresh        # re-probe after a Claude Code upgrade
+  lazy system verify-host-boundary --refresh --yes --json verdict.json   # automation`);
 }

@@ -506,6 +506,9 @@ export async function resolveOutstandingViolations(
 
     const plan: TaskDirectDiffPlan = await resolveTaskDirectDiff({
       task, session, storage, projectRoot, worktreePath, config,
+      // The one caller that scopes to the task's own work: protection asks
+      // what THIS task wrote, never what a reader is shown.
+      directOnly: true,
     });
     // Child contributions, keyed the way the plan already grouped them. Filled
     // once per HEAD (cache-fill time) and cached with the scan — a warm read

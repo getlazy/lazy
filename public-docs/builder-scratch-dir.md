@@ -7,8 +7,13 @@ to hand to you — and nothing else.
 ~/.lazy/scratch/<project-slug>/
 ```
 
-The builder sees the path in `$LAZY_SCRATCH_DIR`. You see it at the **same
-absolute path** on the host.
+The builder sees the path in `$LAZY_SCRATCH_DIR`. For a builder you launch with
+`lazy builder`, you see it at the **same absolute path** on the host. A builder
+started by Lazy Teams sees it inside its container at `/lazy-builder/scratch`;
+read its files with `lazy scratch` or the Teams **Files** view.
+On Lazy Teams the directory, like each member's builder settings and
+conversations, lives on the project's persistent disk, so it survives the
+project's machine being replaced during an upgrade.
 
 ## Why it exists
 
@@ -52,7 +57,7 @@ Two properties enforce this, structurally rather than by convention:
 
 | | container runner (`docker` / `podman`) |
 |---|---|
-| Availability | bind-mounted read-write at the identical host path |
+| Availability | bind-mounted read-write — at the identical host path for `lazy builder`, at `/lazy-builder/scratch` for a Lazy Teams builder |
 | Path | `$LAZY_SCRATCH_DIR` |
 
 The path is derived from the project root alone — no config key, no lazy.toml
@@ -87,8 +92,9 @@ with `in:scratch`. **Task agents cannot** — both the tool and the search scope
 are rejected for an agent caller, server-side, from its task identity. The
 builder↔human boundary above is not weakened by making scratch searchable.
 
-The web dashboard (and Lazy Teams) show the same captured files under
-**Scratch**: grouped by the builder session that wrote them, with capture time,
+The web dashboard shows the same captured files under **Scratch** (in Lazy
+Teams, **Builders → Files**, and each builder's own files under **Files this
+builder left** on its page): grouped by the builder that last wrote them, with capture time,
 markdown rendered (with a raw view), and a search box. A file recorded by name
 only is labelled as such with its reason — over 1 MiB, binary, or over the
 sandbox budget — rather than shown empty. A system message that names a

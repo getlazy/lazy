@@ -70,10 +70,12 @@ import type { ProxyToolStatsRecorder } from './tool-stats';
 import { AuditQueue, type AuditSink } from './audit';
 import {
   captureUsageLimitHeaders,
+  codexRefusalHeaders,
   daemonUsageLimits,
   usageLimitCredentialKey,
   type UsageLimitTracker,
 } from './usage-limits';
+import { credentialValuesIn, upstreamErrorExcerpt } from './upstream-error';
 import {
   activityPath, closeEventFromRecord, proxyActivity,
   CREDENTIAL_REFUSED_PREFIX, PATH_REFUSED_PREFIX, type ProxyActivityBus,
@@ -124,7 +126,7 @@ import {
   missingCredentialMessage,
   type PresentedCredential,
 } from './inject';
-import type { TargetCredentials } from './target-credentials';
+import type { TargetCredentialOutcome, TargetCredentials } from './target-credentials';
 import type { CredentialGrant } from './credential-broker';
 import { looksLikeLazyPlaceholder } from './credential-broker';
 import { logger } from '../utils/logger';
@@ -143,6 +145,24 @@ export interface ProxyCredentialDeps {
   lookup(token: string): Promise<CredentialGrant | null>;
   /** Per-upstream real credentials, resolved live at request time. */
   targets: TargetCredentials;
+  /**
+   * TEAM MODE: the credential a verified TASK caller is paid with — its turn
+   * principal's own credential for the grant's profile — or null when the
+   * per-upstream map decides (no team mode, no task). When it answers, it is
+   * the whole answer for the caller's first target: nothing falls back to the
+   * map, and failover targets are dropped rather than paid by anybody else.
+   * See resolveMemberCredential in ./credential-deps.ts.
+   */
+  member?(grant: CredentialGrant): Promise<MemberCredentialResolution | null>;
+}
+
+/** What {@link ProxyCredentialDeps.member} answers. */
+export interface MemberCredentialResolution {
+  outcome: TargetCredentialOutcome;
+  /** Whose credential it is, for the audit record; null when nobody could be named. */
+  userId: string | null;
+  /** The profile the credential was connected for; null when it is their Claude credential. */
+  profile?: string | null;
 }
 
 /** A presented placeholder that verified, and the grant it proves. */
@@ -527,10 +547,15 @@ async function forwardCursor(
   let hasBody = req.method !== 'GET' && req.method !== 'HEAD' && req.body != null;
   let bodyOverride: Uint8Array | null = null;
   let cursorCredentialLabel: string | null = null;
+  let cursorUserId: string | null = null;
 
   // --- JIT credential exchange ---
   if (caller && credentials) {
-    const outcome = await credentials.targets.forTarget(cursorUpstream);
+    // Team mode: the turn principal's own Cursor credential for the profile —
+    // see ProxyCredentialDeps.member.
+    const member = credentials.member ? await credentials.member(caller.grant) : null;
+    if (member?.userId) cursorUserId = member.userId;
+    const outcome = member ? member.outcome : await credentials.targets.forTarget(cursorUpstream);
     const presented = collectPresentedCredentials(req.headers);
     if (outcome.kind === 'missing') {
       return refuse(ctx, req, {
@@ -567,6 +592,8 @@ async function forwardCursor(
     // minted by lazy for exactly one launch.
     role: caller?.grant.role ?? null,
     taskId: caller?.grant.taskId ?? null,
+    // Team mode: whose own Cursor credential paid for this request.
+    ...(cursorUserId ? { userId: cursorUserId } : {}),
     backend: 'cursor',
     upstream: cursorUpstream,
     method: req.method,
@@ -1004,6 +1031,8 @@ export function createProxyServer(
       // this whole block is a single prefix test and the headers go out
       // untouched — the single-user path, unchanged.
       let userId: string | null = null;
+      // Set when a member's credential FOR A PROFILE paid (see ProxyAuditRecord).
+      let credentialProfile: string | null = null;
       const scan = config.resolveSessionCredential
         ? scanForPlaceholder(fwdHeaders, isSessionPlaceholderToken)
         : ({ kind: 'none' } as const);
@@ -1080,8 +1109,18 @@ export function createProxyServer(
       // primary's credential down the chain is exactly the leak this closes.
       const chain: Array<{ target: ProxyFallbackTarget; headers: Headers; label: string | null }> = [];
       if (caller) {
+        // TEAM MODE: a task caller is paid by its turn principal's own
+        // credential for its profile, and by nothing else — so only the first
+        // target is ever tried; a failover target would need somebody else's.
+        const member = credentials!.member ? await credentials!.member(caller.grant) : null;
+        if (member?.userId) userId = member.userId;
+        if (member?.profile) credentialProfile = member.profile;
         for (const target of targets) {
-          const outcome = await credentials!.targets.forTarget(target.upstream);
+          const outcome: TargetCredentialOutcome = member
+            ? (target === targets[0]
+              ? member.outcome
+              : { kind: 'missing', reason: 'a failover target is not paid by the member who asked for this turn' })
+            : await credentials!.targets.forTarget(target.upstream);
           const headers = new Headers(fwdHeaders);
           if (outcome.kind === 'credential') {
             applyCredential(headers, presented, caller.token, outcome.placement);
@@ -1309,6 +1348,7 @@ export function createProxyServer(
           role,
           taskId,
           userId,
+          ...(credentialProfile ? { credentialProfile } : {}),
           backend: 'proxy',
           upstream: finalTarget.upstream,
           method: req.method,
@@ -1423,7 +1463,9 @@ export function createProxyServer(
 
         const durationMs = Date.now() - startMs;
         auditQueue.enqueue({
-          id, seq: currentSeq, ts: startMs, role, taskId, userId, backend: 'proxy', upstream: finalTarget.upstream,
+          id, seq: currentSeq, ts: startMs, role, taskId, userId,
+          ...(credentialProfile ? { credentialProfile } : {}),
+          backend: 'proxy', upstream: finalTarget.upstream,
           method: req.method, path, endpoint: extracted.endpoint, model: extracted.model,
           tier: extracted.tier, stream: extracted.stream, requestShape: extracted.requestShape,
           toolUses: extracted.toolUses, toolResults: extracted.toolResults,
@@ -1450,6 +1492,7 @@ export function createProxyServer(
         role,
         taskId,
         userId,
+        ...(credentialProfile ? { credentialProfile } : {}),
         backend: 'proxy',
         upstream: finalTarget.upstream,
         method: req.method,
@@ -1484,6 +1527,50 @@ export function createProxyServer(
       const canCaptureUsage = usageEndpoint && upstreamResp.ok && upstreamResp.body != null;
 
       if (!canCaptureUsage) {
+        // A Codex 429 states its reset in a small JSON body, not in a header
+        // (src/proxy/usage-limits.ts, `codexRefusalHeaders`). Read it here —
+        // the one error response whose body the usage pause needs — and hand
+        // the same bytes on to the client.
+        if (
+          status === 429 &&
+          usageLimitHeaders &&
+          Object.keys(usageLimitHeaders).some((h) => h.startsWith('x-codex-')) &&
+          upstreamResp.body != null &&
+          !(upstreamResp.headers.get('content-type') ?? '').includes('text/event-stream')
+        ) {
+          const body = await upstreamResp.text();
+          const refusal = codexRefusalHeaders(body, startMs);
+          const withError = { ...record, error: upstreamErrorExcerpt(body, credentialValuesIn(headersFor(finalTarget))) };
+          auditQueue.enqueue(refusal ? { ...withError, usageLimitHeaders: { ...usageLimitHeaders, ...refusal } } : withError);
+          return new Response(body, {
+            status: upstreamResp.status,
+            statusText: upstreamResp.statusText,
+            headers: respHeaders,
+          });
+        }
+        // An error response: record WHAT the upstream said, not just its status
+        // — a bare FAIL(400) is undiagnosable (upstream-error.ts). Error bodies
+        // are small JSON and the client needs the whole body anyway, so reading
+        // it here costs nothing; an SSE body is still streamed untouched.
+        if (
+          status >= 400 &&
+          upstreamResp.body != null &&
+          !(upstreamResp.headers.get('content-type') ?? '').includes('text/event-stream')
+        ) {
+          // Forward the upstream's BYTES, and decode only a copy for the
+          // excerpt: text() would replace invalid UTF-8 in what the client gets.
+          const body = await upstreamResp.arrayBuffer();
+          const excerpt = upstreamErrorExcerpt(
+            new TextDecoder().decode(body),
+            credentialValuesIn(headersFor(finalTarget)),
+          );
+          auditQueue.enqueue({ ...record, error: excerpt });
+          return new Response(body, {
+            status: upstreamResp.status,
+            statusText: upstreamResp.statusText,
+            headers: respHeaders,
+          });
+        }
         // Fire-and-forget — never awaited on the hot path.
         auditQueue.enqueue(record);
         return new Response(keepAliveIfSse(upstreamResp.body, respHeaders), {

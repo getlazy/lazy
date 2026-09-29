@@ -56,6 +56,9 @@ function ownerText(owner: string, setBy: OverlayActor | undefined): string {
 export interface RegionCoverPayload {
   regions: RegionSummary[];
   notes: string[];
+  source?: 'presentation' | 'children';
+  staleWalkthrough?: boolean;
+  fileRegions?: Record<string, string>;
 }
 
 /**
@@ -75,11 +78,17 @@ export function regionExtras(
   rows: RegionSummary[];
   active: string | null;
   notes: string[];
+  source?: 'presentation' | 'children';
+  staleWalkthrough: boolean;
+  fileRegions?: Record<string, string>;
 } {
   return {
     rows: cover.regions,
     active,
     notes: cover.notes,
+    ...(cover.source ? { source: cover.source } : {}),
+    staleWalkthrough: cover.staleWalkthrough === true,
+    ...(cover.fileRegions ? { fileRegions: cover.fileRegions } : {}),
   };
 }
 
@@ -89,6 +98,12 @@ const STRIP_VISIBLE = 12;
 export interface RegionsStripOptions {
   taskId: string;
   regions: RegionSummary[];
+  /**
+   * `children` when the rows are a hub's derived map — one per accepted
+   * child. The Changes card then LISTS them (each a link scoping the diff),
+   * because on such a task they are the whole review, not a filter over it.
+   */
+  source?: 'presentation' | 'children';
   /** The `?region=` value in force, or null for the unfiltered view. */
   active: string | null;
   /** Notes the read wants said out loud (no walkthrough yet, and the like). */
@@ -117,11 +132,13 @@ export function regionsStripOptions(
     rows?: RegionSummary[];
     active?: string | null;
     notes?: string[];
+    source?: 'presentation' | 'children';
   } | undefined,
 ): RegionsStripOptions {
   return {
     taskId,
     regions: extras?.rows ?? [],
+    ...(extras?.source ? { source: extras.source } : {}),
     active: extras?.active ?? null,
     notes: extras?.notes ?? [],
   };
@@ -426,6 +443,33 @@ export function regionsCardHtml(opts: RegionsStripOptions): string {
     );
   }
 
+  // BOTH VIEWS (engineer decision 2026-09-25): the diff below is everything —
+  // the task's whole branch — and a region is a scoped view of it. The card
+  // says which one the reader is in.
+  if (opts.source === 'children') {
+    // A hub's derived map: each top-level row is one accepted child, and
+    // together they ARE the review. A count with three names left the reviewer
+    // of a landing hub with "11 regions" and nothing to click, so here every
+    // child is listed and each link scopes this diff to it, the same as
+    // `lazy_diff region=…`. The count is the rows listed, so the heading and
+    // the list agree; a long list starts collapsed.
+    const rows = regions.filter((r) => r.depth === 0);
+    const items = rows.map((r) =>
+      `<li><a class="rv-region-link" href="${escapeHtml(changesHref(taskId, r.id))}">` +
+      `${escapeHtml(truncateLabel(r.label))}</a> ` +
+      `<span class="rv-region-id">(${r.files} file${r.files === 1 ? '' : 's'})</span></li>`,
+    ).join('');
+    return (
+      `<section class="rv-regions-card rv-regions-card-children">` +
+      `<strong>Viewing everything</strong> — the whole branch. ` +
+      `<details class="rv-region-views"${rows.length <= STRIP_VISIBLE ? ' open' : ''}>` +
+      `<summary>Or one at a time: ${rows.length} accepted subtask region${rows.length === 1 ? '' : 's'}</summary>` +
+      `<ul class="rv-region-list">${items}</ul></details>` +
+      ` <a href="${escapeHtml(tab)}">open Regions</a>` +
+      `</section>`
+    );
+  }
+
   // Already sorted most-impactful first by the daemon, so "the top three" is a
   // slice rather than a second opinion about what impact means.
   const top = regions.filter((r) => r.depth === 0).slice(0, 3);
@@ -435,6 +479,7 @@ export function regionsCardHtml(opts: RegionsStripOptions): string {
 
   return (
     `<section class="rv-regions-card">` +
+    `<strong>Viewing everything.</strong> ` +
     `<strong>${regions.length} review region${regions.length === 1 ? '' : 's'}</strong>` +
     (names ? ` — largest: ${names}` : '') +
     ` · <a href="${escapeHtml(tab)}">open Regions</a> to scope this diff to one` +

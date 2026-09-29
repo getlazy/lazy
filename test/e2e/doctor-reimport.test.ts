@@ -108,7 +108,7 @@ describe('lazy doctor --reimport-conversations', () => {
     // They are now in the store.
     const list = await ctx.lazy(['builder', 'list']);
     expectSuccess(list);
-    expectOutput(list, '2 captured conversation(s)');
+    expectOutput(list, '2 Builder(s)');
     expectOutput(list, '11111111');
     expectOutput(list, '66666666');
     expectOutput(list, 'How do we recover lost conversations?');
@@ -150,7 +150,7 @@ describe('lazy doctor --reimport-conversations', () => {
     // And it never reaches the conversation list either.
     const list = await ctx.lazy(['builder', 'list']);
     expectSuccess(list);
-    expectOutput(list, '1 captured conversation(s)');
+    expectOutput(list, '1 Builder(s)');
     expectOutputExcludes(list, 'aaaa1111');
   });
 });

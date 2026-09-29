@@ -64,6 +64,7 @@ import { join, resolve } from 'path';
 import { mkdir, readdir, readFile, rm, rmdir, chmod, lstat } from 'fs/promises';
 import { basename, dirname } from 'path';
 import { getDaemonBaseDir, projectSlug } from './paths';
+import { BUILDER_STATE_DIR_ENV, builderStateRoot } from '../builder/state-root';
 import { getHome } from '../utils/home';
 import { readRegularFileUnder, writeRegularFileUnder, FileTooLargeError } from './link-safe-files';
 import { extractClaudePreferenceSeed } from '../task/claude-home';
@@ -84,6 +85,8 @@ import { validateMemberGitLayout, memberGitPointerMounts, writeMemberGitPointerC
 import { ensureImage, ensureAgentBinary, isContainerRunning } from '../capture/claude';
 import { pinnedCustomImage } from '../docker/worktree-image';
 import { PROJECT_LABEL } from '../runner/docker-runner';
+import type { PhaseNotify } from './progress';
+import { MEMBER_SESSION_MARKER, MEMBER_SESSION_MARKER_TEXT } from '../agent/member-session-marker';
 import {
   planMemberContainerCredential,
   MEMBER_EXEC_CREDENTIAL_KEYS,
@@ -601,6 +604,9 @@ async function memberGitconfig(safeDirectories: string[]): Promise<string> {
  * its predecessor left and hands the conversation in it back.
  */
 export function memberHomesDir(projectRoot: string): string {
+  // Relocated with the rest of builder state when LAZY_BUILDER_STATE_DIR is set
+  // (a Teams guest, whose own disk dies with every machine replacement).
+  if (process.env[BUILDER_STATE_DIR_ENV]) return join(builderStateRoot(), 'member-homes', projectSlug(projectRoot));
   return join(dirname(getDaemonBaseDir()), 'member-homes', projectSlug(projectRoot));
 }
 
@@ -689,6 +695,8 @@ export async function prepareMemberHome(opts: {
     // Settings as lazy sets them: nothing — no hooks, no permissions granted,
     // no MCP servers, no apiKeyHelper.
     await writeRegularFileUnder(dir, join('.claude', 'settings.json'), '{}\n');
+    // What `lazy-agent doctor` reads to say this is a member session.
+    await writeRegularFileUnder(dir, MEMBER_SESSION_MARKER, MEMBER_SESSION_MARKER_TEXT);
     await mkdir(join(dir, '.claude', 'projects', encodeProjectPath(opts.worktreePath)), { recursive: true, mode: 0o700 });
     // The worktree is the root every sandbox path is checked under — so the
     // sandbox directory itself cannot be a link either.
@@ -781,6 +789,16 @@ export async function handBackMemberHome(
       const transcript = await readRegularFileUnder(dir, join(projectsRel, name), MAX_TRANSCRIPT_BYTES);
       if (!transcript) continue;
       if (isSessionFileId(meta.agentSessionId) && name === `${meta.agentSessionId}.jsonl`) {
+        // The member never touched it — nothing of theirs to hand back or save.
+        // Writing it anyway could race a turn appending to the agent's copy:
+        // a home can be handed back after the task is free again (a member
+        // who closed their terminal before its container was ready).
+        if (
+          !meta.agentTranscriptTooLarge && meta.agentTranscript !== undefined
+          && sameFingerprint(transcriptFingerprint(transcript), meta.agentTranscript)
+        ) {
+          continue;
+        }
         // Back over the agent's copy ONLY while the agent's copy is still the
         // one this home started from. It can have moved on: this home may be
         // one a previous daemon left, handed back at a later startup after
@@ -988,6 +1006,9 @@ export async function launchMemberContainer(opts: {
   session: Session;
   memberEmail: string;
   binary: string;
+  /** Narration while the container is made: image resolution is a build or a
+   * pull after an upgrade, which the member watches in their terminal. */
+  notify?: PhaseNotify;
   deps?: LaunchMemberContainerDeps;
 }): Promise<{ ok: true; container: MemberContainer } | { ok: false; status: number; message: string }> {
   const { projectRoot, storage, task, session, memberEmail, binary } = opts;
@@ -1074,6 +1095,7 @@ export async function launchMemberContainer(opts: {
       (deps.ensureImage ?? ensureImage)(binary, {
         agentId: profileNameForAgent(task.agent_id),
         pinnedImage: pinnedCustomImage(task),
+        notify: opts.notify,
       }),
       (deps.ensureAgentBinary ?? ensureAgentBinary)(),
     ]);
@@ -1091,6 +1113,7 @@ export async function launchMemberContainer(opts: {
       runArgs,
       credentialEnv: credential.env,
     });
+    opts.notify?.('starting your terminal container');
     const ran = await (deps.run ?? runDetached)(argv);
     if (ran.exitCode !== 0) {
       throw new Error(ran.stderr.trim() || `${binary} run exited ${ran.exitCode}`);

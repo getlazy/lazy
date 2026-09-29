@@ -27,7 +27,8 @@
  * the next key added to lazy.toml has to classify itself.
  *
  * UNMANAGED IS UNTOUCHED. Everything here is inert unless {@link isManagedMode}
- * is true. That is asserted, not assumed — the same test loads a hostile
+ * is true — except {@link managedConfigPath}, the control plane's own config
+ * file, which is named by the daemon's environment and honoured either way. That is asserted, not assumed — the same test loads a hostile
  * lazy.toml with managed mode off and requires it to be honoured verbatim.
  */
 
@@ -56,6 +57,46 @@ export { MANAGED_ENV, isManagedMode };
 export const MANAGED_STORAGE_ENV = 'LAZY_MANAGED_STORAGE_PATH';
 /** The fleet's container runner. Optional; defaults to `docker`. */
 export const MANAGED_RUNNER_ENV = 'LAZY_MANAGED_RUNNER';
+
+/**
+ * Where the CONTROL PLANE keeps this project's lazy.toml. Optional.
+ *
+ * Lazy Teams imports a project's lazy.toml once, keeps it in its database, and
+ * writes the effective file here — outside the clone, so a saved change never
+ * dirties the git tree and the repository's own lazy.toml stops mattering. See
+ * {@link managedConfigPath} and public-docs/managed-config.md.
+ */
+export const MANAGED_CONFIG_ENV = 'LAZY_MANAGED_CONFIG_PATH';
+
+/**
+ * The control plane's config path for this project, or null when there is none.
+ *
+ * Armed by environment for the same reason managed mode is: a lazy.toml key
+ * naming "the real config is over there" would be the repository choosing its
+ * own rules. Honoured whether or not managed mode is armed — whoever starts the
+ * daemon owns its environment either way, and a control plane running its
+ * daemons unmanaged (a demo install) still owns their configuration.
+ *
+ * FAILS CLOSED on a path that is relative or inside the project checkout. The
+ * whole point of the file is that nothing on a branch can reach it; a path in
+ * the clone would put it back within an agent's reach, and a relative one
+ * would resolve against whatever cwd a process happened to have.
+ */
+export function managedConfigPath(projectRoot: string, env: NodeJS.ProcessEnv = process.env): string | null {
+  const raw = (env[MANAGED_CONFIG_ENV] ?? '').trim();
+  if (!raw) return null;
+  if (!isAbsolute(raw)) {
+    throw new ManagedModeMisconfiguredError(`${MANAGED_CONFIG_ENV} must be an absolute path (got "${raw}").`);
+  }
+  const rel = relative(resolve(projectRoot), resolve(raw));
+  if (rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))) {
+    throw new ManagedModeMisconfiguredError(
+      `${MANAGED_CONFIG_ENV} = "${raw}" is inside the project checkout ${projectRoot}. ` +
+      `The control plane's config must live outside the clone, where no branch can reach it.`,
+    );
+  }
+  return raw;
+}
 
 /** Runners a managed host will run agents under. `host` is never one of them. */
 const MANAGED_RUNNERS = ['docker', 'podman'] as const;
@@ -177,6 +218,31 @@ export interface ManagedRule {
    * classification from a raw parsed file without resolving one.
    */
   effective?: (fleet: FleetValues) => unknown;
+  /**
+   * Why the CONTROL PLANE's own config (the file at {@link MANAGED_CONFIG_ENV},
+   * which a project owner edits in the control plane) may set this REFUSED key
+   * even though a repository may not. Absent: refused from every origin.
+   *
+   * The distinction is WHO chose the value. A refusal protects the fleet from
+   * a file that arrived from a git clone; a key whose danger the rest of lazy
+   * already neutralises once a person chose it deliberately is that person's
+   * to set.
+   */
+  controlPlaneMay?: string;
+}
+
+/**
+ * Where a config being judged came from: the repository's lazy.toml (untrusted,
+ * the default), or the control plane's own copy — the file at
+ * {@link MANAGED_CONFIG_ENV}, which the project's owner edits in the control
+ * plane and a branch cannot reach. See {@link ManagedRule.controlPlaneMay}.
+ */
+export type ManagedConfigOrigin = 'repository' | 'control-plane';
+
+/** Is `configPath` the control plane's own config file? */
+export function isControlPlaneConfigPath(configPath: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = (env[MANAGED_CONFIG_ENV] ?? '').trim();
+  return raw !== '' && isAbsolute(raw) && resolve(raw) === resolve(configPath);
 }
 
 /** Rejects a project-relative path that escapes the project. */
@@ -280,9 +346,18 @@ export const MANAGED_POLICY: Record<string, ManagedRule> = {
   // repository's business — they are the container's contents, not its shape.
   'agents.*.harness': { disposition: 'respected' },
   'agents.*.model': { disposition: 'respected' },
+  // Display text beside agent pickers: no routing, credential or container effect.
+  'agents.*.description': { disposition: 'respected' },
   'agents.*.endpoint': {
     disposition: 'refused',
     why: 'an arbitrary upstream URL from a repository receives the real model credential',
+    // A profile endpoint on a managed host is paid ONLY by the credential each
+    // member connects for that profile, bound to that endpoint — never by the
+    // fleet's (src/proxy/credential-deps.ts, src/daemon/member-credentials.ts).
+    // What the refusal protects cannot reach it, so the project's owner may
+    // point a profile anywhere; members see where before they connect.
+    controlPlaneMay:
+      "a profile's endpoint is paid only by the credential each member connects for that profile, never by the host's",
     guard: (v) => (typeof v === 'string' && v.trim() !== ''
       ? `endpoint = "${v}" would receive this project's model credential`
       : null),
@@ -296,6 +371,9 @@ export const MANAGED_POLICY: Record<string, ManagedRule> = {
   'agents.*.credential': {
     disposition: 'refused',
     why: 'a repository-invented credential name selects a secret the fleet did not assign to it',
+    // Same reasoning as the endpoint: a name the project's owner chose selects
+    // which of each MEMBER's own credentials pays, never a slot of the fleet's.
+    controlPlaneMay: "a profile's credential is each member's own, connected for that profile",
     guard: (v) => {
       if (typeof v !== 'string' || v.trim() === '') return null;
       const name = v.trim();
@@ -621,6 +699,7 @@ export const MANAGED_POLICY: Record<string, ManagedRule> = {
   'session.auto_commit_instructions': { disposition: 'respected' },
   'git.default_branch_prefix': { disposition: 'respected' },
   'git.lfs_check': { disposition: 'respected' },
+  'git.coauthor_trailer': { disposition: 'respected' },
   'output.shortid_length': { disposition: 'respected' },
   'agent.agent_id': { disposition: 'respected' },
   'agent.by_type': { disposition: 'respected' },
@@ -802,6 +881,7 @@ const SECTION_TERMINAL = new Set(['mounts', 'features', 'serve.services']);
 export function evaluateManagedConfig(
   raw: Record<string, unknown> | null,
   env: NodeJS.ProcessEnv = process.env,
+  origin: ManagedConfigOrigin = 'repository',
 ): ManagedEvaluation {
   const managed = isManagedMode(env);
   if (!managed || !raw) return { managed, refusals: [], overrides: [], unclassified: [] };
@@ -828,6 +908,7 @@ export function evaluateManagedConfig(
     }
 
     if (rule.disposition === 'refused') {
+      if (origin === 'control-plane' && rule.controlPlaneMay) continue;
       // A guard lets a refused key be stated harmlessly (a profile with no
       // endpoint) without failing an otherwise fine project.
       const reason = rule.guard ? rule.guard(asked) : (rule.why ?? 'not available on a managed host');
@@ -874,11 +955,12 @@ export function applyManagedPolicy(
   raw: Record<string, unknown> | null,
   configPath: string,
   env: NodeJS.ProcessEnv = process.env,
+  origin: ManagedConfigOrigin = isControlPlaneConfigPath(configPath, env) ? 'control-plane' : 'repository',
 ): ManagedEvaluation {
   if (!isManagedMode(env)) return { managed: false, refusals: [], overrides: [], unclassified: [] };
 
   const fleet = readFleetValues(env);
-  const evaluation = evaluateManagedConfig(raw, env);
+  const evaluation = evaluateManagedConfig(raw, env, origin);
 
   if (evaluation.refusals.length > 0) {
     throw new ManagedConfigRefusedError(evaluation.refusals, configPath);

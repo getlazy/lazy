@@ -77,10 +77,43 @@ describe('lazy stats limits', () => {
     expect(view.scope).toBe('project');
     expect(view.pause).toBeDefined();
     expect(view.pause.configured).toBeDefined();
+    // ...including the token budget, attached the same way.
+    expect(view.budget.scope).toBe('project');
+    expect(view.budget.credentials.map((c: { credential: string }) => c.credential)).toContain('credential:CLAUDE_CODE_OAUTH_TOKEN');
     const { readings } = view;
     expect(readings.map((r: { credential: string }) => r.credential)).toEqual([
       'credential:CLAUDE_CODE_OAUTH_TOKEN',
       'credential:ANTHROPIC_API_KEY',
     ]);
+  });
+
+  // INVARIANT: a window whose reset has passed is shown as reset, never as its
+  // old percentage — in text and --json alike. The engineer read "100% used"
+  // of a Codex window that had reset hours earlier and was back at 0%.
+  test('a window past its reset shows as reset, not its stored percentage', async () => {
+    const readAt = Date.now() - 8 * 3_600_000;
+    await seed([
+      line(1, readAt, 'credential:ChatGPT subscription', {
+        'x-codex-primary-used-percent': '100',
+        'x-codex-primary-reset-after-seconds': '7200',
+        'x-codex-secondary-used-percent': '74',
+        'x-codex-secondary-reset-after-seconds': String(32 * 3600),
+      }, 429),
+    ]);
+    const result = await ctx.lazy(['stats', 'limits']);
+    expectSuccess(result);
+    expect(result.stdout).toContain('reset at');
+    expect(result.stdout).toContain('was 100% used');
+    expect(result.stdout).not.toMatch(/100% used\s+·/);
+    expect(result.stdout).toContain('74% used');
+
+    const json = await ctx.lazy(['stats', 'limits', '--json']);
+    expectSuccess(json);
+    const [r] = JSON.parse(json.stdout).readings;
+    const byName = (ws: { name: string }[], n: string) => ws.find((w) => w.name === n) as Record<string, unknown>;
+    expect(byName(r.windows, 'codex-primary').usedPercent).toBeNull();
+    expect(typeof byName(r.windows, 'codex-primary').resetSince).toBe('number');
+    expect(byName(r.windows, 'codex-secondary')).toMatchObject({ usedPercent: 74, resetSince: null });
+    expect(byName(r.storedWindows, 'codex-primary').usedPercent).toBe(100);
   });
 });

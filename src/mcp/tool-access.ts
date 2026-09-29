@@ -42,6 +42,10 @@ export const TOOL_ACCESS: Readonly<Record<string, ToolAccess>> = {
   lazy_messages: 'read',
   // Pure read of the proxy's latest readings and the pause state.
   lazy_usage_limits: 'read',
+  lazy_token_stats: 'read',
+  // The task's recorded PR/MR, read through the daemon's forge credential.
+  lazy_review_comments: 'read',
+  lazy_review_status: 'read',
   lazy_raised_items: 'read',
   lazy_raised_promote: 'write',
   lazy_artifact_list: 'read',

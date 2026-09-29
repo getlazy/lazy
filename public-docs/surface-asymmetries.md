@@ -1239,54 +1239,67 @@ prints: the full project view, including the same fallback that reads the
 local record when the daemon is down, and it is refused wherever that
 command is refused. Such a server refuses a task agent's call outright. Neither surface ever returns a credential's secret.
 
-## 34. The usage-pause override is a person's
+### Token statistics: detail for your own work, model aggregates for everyone
+
+`lazy_token_stats` is the one read tool that narrows what a task agent sees,
+unlike the ungated reads in section 1. A builder gets the whole project, like
+`lazy stats tokens`. A task agent gets per-task detail (spend, outcome,
+feedback rounds, models) only for its own task, and for its descendants when
+it passes `subtree: true`; asking about any other task is refused. The
+per-model summaries (task count, accept and first-pass rates, tokens per
+accepted task) still cover the whole project, because choosing a model for new
+work is what the tool is for.
+
+The reason is that spend is closer to a person's usage than a task's content
+is: one task's token bill says how much its owner used, which the task's
+diff and turns do not. Model aggregates pool many tasks and say nothing about
+one of them. No view ever includes credential or member labels, or money.
+
+## 34. Getting past the usage pause: a person or the builder, one task at a time
 
 [`[usage_pause]`](lazy-toml.md#usage_pause) stops lazy starting turns on a
-credential that is close to paid overage. Its one-shot escape hatch,
-`lazy daemon config set usage_pause_threshold off`, is human-only in every
-direction:
+credential that is close to paid overage. There are two ways past it, and
+neither is ever available to a task agent.
 
-- **Setting it** needs an interactive terminal. The command refuses when stdin
-  is not a terminal, inside a container, and with any of lazy's test prompt
-  variables set; the daemon separately refuses a request that does not come
-  from the `human` channel. There is no MCP tool and no flag or piped form. On
-  a Lazy Teams host the setting is not available to members at all.
-- **Using it** is reserved for launches a person asks for on a person's
-  channel. Exactly three reach it:
-  - **The CLI, from a person's own terminal.** Every command that can launch
-    a turn — `lazy start`, `lazy unblock`, `lazy resume`, `lazy review`,
-    `lazy ask`, `lazy sync`, `lazy report`, `lazy pair` and `lazy chat` —
-    takes it only from an interactive terminal outside a container. Run from
-    a script, a pipe or the builder's shell, the same command is judged on the
-    configured threshold alone and leaves the override for the person who set
-    it.
-  - **The local dashboard.** Its Start, Unblock, Resume, Review, Ask, Sync,
-    Pair and Chat buttons: the person at the page is signed in to the
-    dashboard with its one-time login link, which an agent never has; the
-    dashboard does not exist on a Lazy Teams host.
-  - **On a Lazy Teams host, a member's own request from the web UI** (Start,
-    Resume, Restart, Unblock and Review). A clone bound to Lazy Teams follows
-    the CLI's rule above: its commands take the override only when run from a
-    person's own terminal, and Lazy Teams passes that along unchanged. Requests
-    from Slack do not take it.
+- **Let one task's next turn through.** This is the everyday one. It names a
+  TASK, and is used up by the first launch of that task it lets past the pause —
+  whichever launch that is, including one lazy starts by itself, such as an
+  auto-resume or a held subtask start. It never lets any other task through.
+  - **A person** takes it with `--past-usage-pause` on `lazy start`,
+    `unblock`, `resume`, `review` and `ask`, with
+    `lazy daemon config set usage_pause_threshold off --task <task>`, or with
+    the "Let its next turn through" button on the local dashboard and in Lazy
+    Teams (members included). No terminal is required.
+  - **The builder** may take it, on the person's behalf, through the
+    `past_usage_pause` argument of `lazy_start`, `lazy_unblock` and
+    `lazy_resume`. Its refusals say to do so only when asked.
+  - **A task agent never can.** The argument is not in its tool schemas, the
+    tools refuse it, and lazy refuses the request from an agent's channel. An
+    agent's refusal only says when the window resets.
+- **Let one launch beside any task through**: a `lazy report`, a `lazy ask` on
+  a stored conversation, a chat, a review conversation. This is
+  `lazy daemon config set usage_pause_threshold off`, and it stays a
+  person's only: the command needs an interactive terminal outside a container
+  with none of lazy's test prompt variables set, lazy refuses it from any
+  channel but a person's, and only a person's own launch — from their terminal,
+  or the local dashboard — takes it. It never lets a task's turn through.
 
-  A launch through the agent tools (the builder's or a task agent's), one
-  that names no channel, and every turn lazy starts by itself are judged on
-  the configured threshold alone and never spend a pending override.
-- **Being told about it** is human-only too: a refusal addressed to a person
-  names the override command; a refusal addressed to the builder or an agent
-  only says when the window resets. The CLI's own hints follow the same rule:
-  the check before `lazy unblock` and `lazy ask`, `lazy daemon config get`,
-  `lazy doctor` and the usage-pause line in `lazy show` name the command only
-  to a person at their own terminal, never when the builder or an agent runs
-  them. For a subtask start that is waiting on the pause, `lazy show` says it
-  starts by itself after the reset: the override does not release it.
+The CLI's hints (the check before `lazy unblock` and `lazy ask`,
+`lazy daemon config get`, `lazy doctor`, the usage-pause line in `lazy show`)
+name these commands only to a person at their own terminal.
+
+On Lazy Teams, letting a task through is offered on the task's page, beside
+each waiting task on the project page, and as a "let this turn through the
+usage pause" choice on the launch itself; it is recorded as the member's
+action on the task and can be taken back until a launch uses it. Nothing lets
+a launch past saved usage readings lazy cannot read.
 
 The reason is the whole point of the feature. An agent reads the refusal it
-gets and acts on it. If it could set the override, or even learned the
-command from the refusal, the pause would be a suggestion it could talk its
-way past on every launch — spending exactly the money the person configured
-the pause to protect.
+gets and acts on it. If it could lift the pause, or even learned how from the
+refusal, the pause would be a suggestion it could talk its way past on every
+launch — spending exactly the money the person configured the pause to
+protect. The builder may, because it acts for the person in front of it and
+the way past names exactly one task.
 
 One more difference follows from who is waiting. When an agent starts one of
 its own subtasks on a paused credential, the start is **held**, not refused:
@@ -1307,6 +1320,17 @@ parent task's branch as its base and tracks it like any submitted task.
 its refusal says a person can run `lazy submit`. A PR notifies everybody
 watching the repository, and an agent cannot tell a person's explicit request
 from its own initiative; the person typing the command can.
+
+## 36. Reading a PR/MR: agents read through lazy, with no forge token
+
+The CLI has no `lazy_review_comments` / `lazy_review_status` equivalent: a
+person has `gh` / `glab` and the forge's web page. Agents get these two
+read-only MCP tools instead of a token. lazy reads the forge with its own
+credential and answers only about the PR/MR recorded on a task — a task agent's
+own task, any task for the builder — cached for 60 seconds, so the tools cannot
+be used to reach anything else on the forge or to exhaust its rate limit. An
+agent that has to run `gh` or push itself still needs a token granted to it.
+See [MCP tools](mcp-tools.md#reading-a-tasks-pullmerge-request).
 
 ## When you find an asymmetry that is not listed here
 

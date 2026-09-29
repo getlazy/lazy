@@ -179,7 +179,7 @@ describe('MCP server that cannot reach storage', () => {
       expect(first.length).toBeGreaterThan(0);
       // Whatever precondition bit first, it must be said out loud rather than
       // exiting: both messages below are LazyPreconditionError text.
-      expect(first).toMatch(/not in a lazy project|Daemon is not running/);
+      expect(first).toMatch(/not in a lazy project|No daemon address is recorded|Daemon is not running/);
 
       // The channel is still there for the next tool call.
       expect(responses.find(r => r.id === 2)).toBeDefined();

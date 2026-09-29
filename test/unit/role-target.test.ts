@@ -179,6 +179,7 @@ describe('resolveRoleTarget', () => {
       endpointPinned: true,
       wire: 'anthropic',
       credential: NO_CREDENTIAL,
+      description: '',
     };
     const r = resolveRoleTarget('agent', config, { profile, preferredModel: 'claude-opus-4-8' });
     expect(r.profile).toBe('local-ollama-pi');

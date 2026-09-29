@@ -10,6 +10,7 @@
  */
 
 import { requireLaunchModel } from '../agent/launch-model';
+import { applyLaunchDirective } from '../builder/launch-directive';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdirSync } from 'fs';
 import { realpath } from 'fs/promises';
 import { join } from 'path';
@@ -29,7 +30,7 @@ import type { BuilderLaunchProjects } from '../builder/projects-isolation';
 import { ensureBuilderScratchDir, SCRATCH_ENV_VAR } from '../builder/scratch';
 import { getAuthEnvVars as getDefaultAuthEnvVars, getLaunchAuthEnvVars } from '../capture/claude';
 import { findLazyRoot } from '../project-paths';
-import { getTaskEnv } from '../daemon/task-env';
+import { getTaskEnv, recordTaskEnvLaunched, taskEnvKeysEnv } from '../daemon/task-env';
 import { sessionCredentialEnvFor } from '../daemon/turn-credentials';
 import { mintCredentialGrant } from '../proxy/credential-broker';
 import type { LaunchIdentity } from '../proxy/placeholder-env';
@@ -63,7 +64,8 @@ import { getLazyCommand } from '../utils/cli-path';
 import type { Agent } from '../agent/interface';
 import { safeArgvPrompt } from '../agent/argv-safety';
 import { snapshotSessionFiles, captureConversation } from '../import/capture-session';
-import { buildAgentSandboxArgs, type HostPermissionConfig } from './host-sandbox';
+import { buildAgentSandboxArgs, withGitPointerDenyArgs, type HostPermissionConfig } from './host-sandbox';
+import { hostGitPointerDenyPaths } from '../git/worktree-pointers';
 import type { OneshotRequest } from '../oneshot/types';
 import type { LaunchBuilderHeadlessParams, LaunchBuilderHeadlessResult } from './types';
 import { DEFAULT_ONESHOT_TIMEOUT_MS, ONESHOT_KILL_GRACE_MS } from '../oneshot/args';
@@ -609,7 +611,7 @@ export class HostProcessRunner implements Runner {
     // for why this is off by default and why an inconclusive run only warns.
     await ensureHostBoundaryVerified(this._hostPermission, this._verifyBoundary);
 
-    // Auth is NOT enforced here. The daemon credential gate
+    // Auth is NOT enforced here. The turn credential gate
     // (src/daemon/credential-gate.ts) is the single enforcement point.
     // Early, non-fatal reachability nudge for every upstream lazy probes
     // (fail-hard happens at launch via preflightRoleTarget). The same predicate
@@ -678,6 +680,8 @@ export class HostProcessRunner implements Runner {
       ? await sessionCredentialEnvFor(projectRoot, taskUuid)
       : null;
     const taskEnv = (taskUuid && projectRoot) ? await getTaskEnv(projectRoot, taskUuid) : {};
+    // Spawn env is fixed for the supervisor's life, exactly like a container's.
+    if (taskUuid && projectRoot) await recordTaskEnvLaunched(projectRoot, taskUuid, runName, taskEnv);
 
     // The daemon resolved this task's `[agents.<name>]` profile before setting
     // the agent; `_agent.id` is the HARNESS it runs. Both are needed below —
@@ -699,6 +703,8 @@ export class HostProcessRunner implements Runner {
       label: runName,
       // The task's agent IS its profile name — what the proxy routes by.
       profile: profileName,
+      // What a team-mode proxy finds the turn's principal by — never the code.
+      ...(taskUuid ? { taskUuid } : {}),
     };
     const authEnvVars = await this.getLaunchAuthEnvVars(
       supervisorIdentity, this.agentTarget(), { role: 'agent', taskId }, sessionCredential,
@@ -710,7 +716,12 @@ export class HostProcessRunner implements Runner {
     // a host process can also use the agent's own login session, and the CLI
     // fails with its own actionable auth error when neither exists.
     if (this._agent && this._agent.id !== 'claude-code' && agentSupportsApiKey(this._agent.id) && this.lazyRoot) {
-      const key = await resolveAgentApiKey(this.lazyRoot, this._agent.id);
+      // Team mode never reads the project's store: the proxy pays the turn with
+      // its principal's own credential for the profile (planTurnCredential
+      // required it), so only the placeholder is needed here.
+      const key = sessionCredential
+        ? { source: 'the turn principal\'s own credential for the profile' }
+        : await resolveAgentApiKey(this.lazyRoot, this._agent.id);
       if (key) {
         // JIT INJECTION: the launched process gets a PLACEHOLDER. The real key
         // is resolved here only to establish that one exists — the proxy
@@ -822,6 +833,8 @@ export class HostProcessRunner implements Runner {
         // refused at intake, and spreading it first means even a future gap in
         // that list cannot let a task redirect its own credentials or routing.
         ...taskEnv,
+        // Key names only, so the supervisor's own log scrubber covers them.
+        ...taskEnvKeysEnv(taskEnv),
         ...Object.fromEntries(authEnvVars.map(v => [v.key, v.value])),
         // Ensure HOME is set for Claude Code
         HOME: getHome(),
@@ -870,11 +883,18 @@ export class HostProcessRunner implements Runner {
     // Bypass interactive prompts (headless), then layer the OS sandbox on top in
     // "sandbox" mode so the agent is confined even though it never prompts. In
     // "bypass" mode this is just --dangerously-skip-permissions (no sandbox).
+    // The worktree's git pointers are denied per worktree, as the supervisor
+    // does for turns (docs/design/git-pointer-boundary.md); a tampered
+    // worktree throws before anything runs.
+    const pointerPaths = this._hostPermission.mode === 'sandbox'
+      ? await hostGitPointerDenyPaths(sandbox.worktreePath)
+      : null;
+    const sandboxArgs = buildAgentSandboxArgs(this._hostPermission);
     const claudeArgs = [
       'claude', '-p', safeArgvPrompt(prompt, 'prompt'),
       '--output-format', 'json',
       '--dangerously-skip-permissions',
-      ...buildAgentSandboxArgs(this._hostPermission),
+      ...(pointerPaths ? withGitPointerDenyArgs(sandboxArgs, pointerPaths)! : sandboxArgs),
       // Always: see requireLaunchModel (src/agent/launch-model.ts).
       '--model', requireLaunchModel('claude-code', effectiveModel),
     ];
@@ -1278,7 +1298,7 @@ export class HostProcessRunner implements Runner {
         }
       }
       // The file-tool half of the boundary. Read-only here: doctor reports the
-      // cached verdict and never spends three headless sessions of its own.
+      // cached verdict and never spends nine headless sessions of its own.
       results.push(await diagnoseBoundaryVerdict(this._hostPermission, this._verifyBoundary));
     }
 
@@ -1350,7 +1370,8 @@ export class HostProcessRunner implements Runner {
     const claudeArgs = [
       'claude',
       '--append-system-prompt', safeArgvPrompt(systemPrompt, 'builder system prompt'),
-      ...claudeExtraArgs,
+      // No supervisor here: strip the host→supervisor override markers claude must not see.
+      ...applyLaunchDirective(claudeExtraArgs, undefined),
     ];
 
     if (debug) {

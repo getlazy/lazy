@@ -91,7 +91,7 @@ describe('lazy ask <conversation-id>', () => {
     // the messages it was imported with, and no second conversation appeared.
     const list = await ctx.lazy(['builder', 'list']);
     expectSuccess(list);
-    expectOutput(list, '1 captured conversation(s)');
+    expectOutput(list, '1 Builder(s)');
   });
 
   test('accepts a unique session-id prefix', async () => {

@@ -1,3 +1,4 @@
+import { CODEX_LATEST_MODEL } from '../../src/config/default-models';
 import { describe, test, expect, beforeEach } from 'bun:test';
 import { mkdtemp, mkdir, writeFile, rm } from 'fs/promises';
 import { tmpdir } from 'os';
@@ -8,6 +9,10 @@ import { renderCodexConfig, CODEX_CONFIG_MARKER } from '../../src/agent/codex-co
 import { codexProxyEnvVars, codexLaunchEnvVars, codexBaseUrlPrefix, CODEX_ENDPOINT_ENV } from '../../src/proxy/codex-route';
 import { getAgent, getAgentPackaging, listAgents, agentDisplayName } from '../../src/agent/registry';
 import { codexProxiedCallScenario } from '../helpers/fake-codex';
+import { extractUsage } from '../../src/proxy/usage';
+import { aggregateUsage } from '../../src/proxy/aggregate';
+import { toTurnUsage } from '../../src/utils/usage-recording';
+import type { ProxyAuditRecord } from '../../src/storage/types';
 
 // Every fixture line below is REAL output captured from codex-cli 0.152.1
 // (aarch64 Linux, driven by a local fake OpenAI Responses server — see the
@@ -21,6 +26,16 @@ const TURN_FAILED = '{"type":"turn.failed","error":{"message":"unexpected status
 const RECONNECT_ERROR = '{"type":"error","message":"Reconnecting... 1/5 (unexpected status 401 Unauthorized: probe-401, url: http://127.0.0.1:18081/v1/responses)"}';
 
 const SUCCESS_STREAM = [THREAD_STARTED, TURN_STARTED, AGENT_MESSAGE, TURN_COMPLETED].join('\n');
+
+function auditRecord(usage: ProxyAuditRecord['usage']): ProxyAuditRecord {
+  return {
+    id: 'codex-1', seq: 1, ts: 1, role: 'agent', taskId: 'codex-task', backend: 'proxy',
+    upstream: 'https://api.openai.com', method: 'POST', path: '/v1/responses',
+    endpoint: 'responses', model: 'gpt-5.2', tier: 'openai', stream: false,
+    requestShape: null, toolUses: [], toolResults: [], status: 200, usage,
+    stopReason: null, error: null, durationMs: 1, reroute: null,
+  };
+}
 
 describe('CodexAgent', () => {
   let agent: CodexAgent;
@@ -152,6 +167,47 @@ describe('CodexAgent', () => {
       });
     });
 
+    test('leaves usage absent when turn.completed has no measurement', () => {
+      const stream = [THREAD_STARTED, AGENT_MESSAGE, '{"type":"turn.completed"}'].join('\n');
+      expect(agent.parseResponse(stream).usage).toBeUndefined();
+    });
+
+    test('leaves malformed turn.completed usage absent instead of fabricating zero', () => {
+      for (const usage of [
+        {},
+        { input_tokens: 10 },
+        { input_tokens: '10', output_tokens: 7 },
+        { input_tokens: 10, output_tokens: Number.NaN },
+        { input_tokens: 10, output_tokens: -1 },
+        { input_tokens: 10, output_tokens: 7, cached_input_tokens: '2' },
+      ]) {
+        const stream = [
+          THREAD_STARTED,
+          AGENT_MESSAGE,
+          JSON.stringify({ type: 'turn.completed', usage }),
+        ].join('\n');
+        expect(agent.parseResponse(stream).usage).toBeUndefined();
+      }
+    });
+
+    test('matches proxy-audit totals for the same OpenAI response', () => {
+      const response = agent.parseResponse(SUCCESS_STREAM);
+      const wireBody = JSON.stringify({
+        usage: {
+          input_tokens: 42,
+          output_tokens: 7,
+          input_tokens_details: { cached_tokens: 12 },
+        },
+      });
+      const proxy = aggregateUsage([auditRecord(extractUsage(false, wireBody, 'openai'))]).totals;
+      expect(toTurnUsage(response.usage)).toEqual({
+        inputTokens: proxy.inputTokens,
+        outputTokens: proxy.outputTokens,
+        cacheCreationTokens: proxy.cacheCreationInputTokens,
+        cacheReadTokens: proxy.cacheReadInputTokens,
+      });
+    });
+
     test('joins multiple agent messages in stream order', () => {
       const stream = [
         THREAD_STARTED,
@@ -203,7 +259,7 @@ describe('CodexAgent', () => {
       const response = agent.parseResponse(result!.raw!);
       expect(response.result).toBe('Hello from the fake server!');
       expect(response.session_id).toBe('01a0648a-81c3-7b40-8d72-e54a856da67f');
-      expect(response.usage.input_tokens).toBe(30);
+      expect(response.usage!.input_tokens).toBe(30);
     });
 
     test('command execution items map to tool_start / tool_end', () => {
@@ -321,8 +377,8 @@ describe('CodexAgent', () => {
     expect(agent.isSessionNotFoundError('some other error')).toBe(false);
   });
 
-  test('defaultModel is the omit-the-flag sentinel', () => {
-    expect(agent.defaultModel()).toBe(CODEX_DEFAULT_MODEL);
+  test('defaultModel is a concrete OpenAI model id, not lazy\'s Anthropic default', () => {
+    expect(agent.defaultModel()).toBe(CODEX_LATEST_MODEL);
   });
 
   test('declares an activity stream and progress-based watchdogging', () => {

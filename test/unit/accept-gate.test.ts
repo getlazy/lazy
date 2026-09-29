@@ -72,6 +72,21 @@ describe('accept gate rows', () => {
   });
 });
 
+  // A Reject is a decision, so the checklist says so and what follows — it
+  // must never call a rejected file "no decision" beside its lit Reject.
+  test('a rejected protected file is labelled rejected, not undecided', () => {
+    const rows = buildAcceptGate({
+      turns: [],
+      raisedItems: [],
+      fileViolations: [{ file: 'lazy.toml', base_sha: 'a', status: 'pending', rejected_at: 5 }],
+      taskMetadata: null,
+    }).rows;
+    expect(rows).toEqual([{
+      kind: 'file', file: 'lazy.toml', rejected: true,
+      label: 'lazy.toml was rejected — the next unblock restores it',
+    }]);
+  });
+
 describe('buildAcceptGate: queued comments', () => {
   test('queued comments are a row; none is no row', () => {
     const base = { turns: [], raisedItems: [], fileViolations: [], taskMetadata: null };

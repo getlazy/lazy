@@ -14,6 +14,8 @@ import type { Storage } from './storage';
 import { repoHasCommits } from './git/operations';
 import { DaemonClient, RpcApplicationError, boundCloneFailure } from './daemon/client';
 import { RemoteStorage } from './storage/remote-storage';
+import { getWebPortPath } from './daemon/paths';
+import { resolveTargetAddresses, describeTargetResolution } from './utils/target-resolution';
 
 /**
  * A precondition of running lazy is not met (no project, no commits, no daemon).
@@ -56,6 +58,19 @@ export function resolveLazyRoot(): string {
  * Returns null if the daemon is unavailable or in test/daemon mode.
  */
 export async function tryRemoteStorage(root: string): Promise<Storage | null> {
+  const opened = await openRemoteStorage(root);
+  return opened && 'storage' in opened ? opened.storage : null;
+}
+
+/** A recorded daemon address that did not answer at the transport layer. */
+interface DaemonUnreachable {
+  target: string;
+  detail: string;
+}
+
+async function openRemoteStorage(
+  root: string,
+): Promise<{ storage: Storage } | { unreachable: DaemonUnreachable } | null> {
   // Skip daemon in test mode or when we ARE the daemon
   if (process.env.LAZY_TEST === '1') return null;
   if (process.env.LAZY_IS_DAEMON === '1') return null;
@@ -70,7 +85,7 @@ export async function tryRemoteStorage(root: string): Promise<Storage | null> {
       args: {},
     }) as string;
 
-    return new RemoteStorage(client, root, info);
+    return { storage: new RemoteStorage(client, root, info) };
   } catch (err) {
     // A bound clone reaches Teams, not a local daemon: returning null here
     // would end in "Start it with: lazy daemon start", which refuses there.
@@ -82,11 +97,30 @@ export async function tryRemoteStorage(root: string): Promise<Storage | null> {
     // The daemon RESPONDED but the operation failed (e.g. storage-lock
     // contention, a 500). That is NOT "daemon not running" — surface it so the
     // real problem is visible instead of sending the user to restart a healthy
-    // daemon. Only a transport failure (daemon genuinely unreachable) should
-    // fall through to the null → "Daemon is not running" path.
+    // daemon. Only a transport failure (the recorded address did not answer)
+    // falls through, and it keeps the address so the message can name it.
     if (err instanceof RpcApplicationError) throw err;
-    return null;
+    return {
+      unreachable: { target: client.baseUrl, detail: err instanceof Error ? err.message : String(err) },
+    };
   }
+}
+
+/**
+ * The message for a recorded daemon address that did not answer. It is NOT
+ * "Daemon is not running": the address came from the daemon's own markers,
+ * and a stopped daemon, a moved port and an address this process cannot reach
+ * all look alike — telling the human to start it can send them to restart a
+ * healthy daemon.
+ */
+export async function daemonUnreachablePreconditionMessage(unreachable: DaemonUnreachable): Promise<string> {
+  const resolution = describeTargetResolution(await resolveTargetAddresses(unreachable.target));
+  return (
+    `The daemon at ${unreachable.target} did not answer (${unreachable.detail}` +
+    `${resolution ? `; ${resolution}` : ''}). ` +
+    `It may be stopped, or running but not reachable at that address from here. ` +
+    `Check with: lazy daemon status — and start it with 'lazy daemon start' only if it is not running.`
+  );
 }
 
 /**
@@ -98,8 +132,9 @@ export async function tryRemoteStorage(root: string): Promise<Storage | null> {
 export async function resolveStorage(): Promise<Storage> {
   const root = resolveLazyRoot();
 
-  const remote = await tryRemoteStorage(root);
-  if (remote) return remote;
+  const opened = await openRemoteStorage(root);
+  if (opened && 'storage' in opened) return opened.storage;
+  if (opened) throw new LazyPreconditionError(await daemonUnreachablePreconditionMessage(opened.unreachable));
 
   // Test-mode fallback: under LAZY_TEST no daemon runs (tryRemoteStorage returns
   // null by design, see above), so the CLI process opens storage directly. This
@@ -120,5 +155,16 @@ export async function resolveStorage(): Promise<Storage> {
     return getOrCreateStorage();
   }
 
-  throw new LazyPreconditionError('Daemon is not running. Start it with: lazy daemon start');
+  // No recorded daemon address (no port marker or token) for this project.
+  // On the host that means no daemon has started; inside a container it is
+  // expected — those files are never mounted there, and a container reaches the
+  // daemon only through the tool entry lazy writes with --daemon-config. A
+  // `lazy mcp` started by hand (or leaked by a test) in a container lands here,
+  // and "start the daemon" would send its reader to restart a healthy one.
+  throw new LazyPreconditionError(
+    `No daemon address is recorded for this project (looked for ${getWebPortPath(root)}). ` +
+    'On the host, start one with: lazy daemon start. Inside a container this is expected — ' +
+    'containers reach the daemon only through the lazy tool entry lazy writes with ' +
+    '--daemon-config; run `lazy-agent doctor` to check that entry.',
+  );
 }

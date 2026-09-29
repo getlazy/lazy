@@ -26,9 +26,12 @@ import {
   mermaidDiffRowHtml,
 } from './mermaid';
 import { shortHash } from './viewed-cards';
+import { unquoteGitPath } from '../git/quote-path';
+export { unquoteGitPath };
 import { escapeHtml, scriptJson } from './escape';
 import type { FileLineAttribution, LineAttributionRun } from '../regions';
 import { EXPAND_CHUNK_LINES, MAX_EXPAND_LINES } from '../review/file-lines';
+import type { ViolationDecision } from '../protection/rejected-files';
 
 export type DiffLineKind = 'context' | 'add' | 'del' | 'meta';
 export type DiffSide = 'old' | 'new';
@@ -363,7 +366,7 @@ export function parseUnifiedDiff(diffText: string): DiffFile[] {
 }
 
 function stripPrefix(p: string): string {
-  const trimmed = p.trim().split('\t')[0];
+  const trimmed = unquoteGitPath(p.trim().split('\t')[0]);
   if (trimmed.startsWith('a/') || trimmed.startsWith('b/')) return trimmed.slice(2);
   return trimmed;
 }
@@ -372,6 +375,9 @@ function pathFromGitHeader(header: string): string {
   // `diff --git a/x b/x` — take the b-side. Paths with spaces make this
   // ambiguous, which is why the +++ line overrides it when present.
   const rest = header.slice('diff --git '.length);
+  // Quoted form: `"a/x" "b/y"` — take the second quoted token.
+  const quoted = /"((?:[^"\\]|\\.)*)"$/.exec(rest);
+  if (quoted) return stripPrefix(`"${quoted[1]}"`);
   const bIdx = rest.lastIndexOf(' b/');
   if (bIdx >= 0) return rest.slice(bIdx + 3);
   return rest;
@@ -417,7 +423,7 @@ export interface RenderDiffOptions {
    * (`file_decisions`, scope `protected`); presenting the same file as several
    * snippets must not mint several controls.
    */
-  violations?: Map<string, 'pending' | 'approved' | 'rejected'>;
+  violations?: Map<string, ViolationDecision>;
   /** Task id, for the decision form's action. */
   taskId?: string;
   /**
@@ -890,6 +896,16 @@ function blameUnitCount(attribution: FileLineAttribution | undefined): number {
 }
 
 /**
+ * The state line beside each protected file's [Reject] [Approve], per
+ * decision. Shared with the page's script so a live update says the same.
+ */
+export const VIOLATION_DECISION_STATE: Record<ViolationDecision, string> = {
+  undecided: '⚠ protected — not decided yet; accept refuses',
+  approved: '✅ protected — change accepted',
+  rejected: '⛔ protected — rejected; the next unblock restores it, accept refuses',
+};
+
+/**
  * The reviewer's decision on one protected file — on the FILE header, never
  * on a hunk card. Presented and Raw may each show one copy (they are
  * independent views of the same stored record); consecutive snippets of the
@@ -901,28 +917,26 @@ function blameUnitCount(attribution: FileLineAttribution | undefined): number {
  * status, because "pending" tells the reviewer nothing about what is going to
  * happen to their code.
  *
- * Two explicit buttons rather than a checkbox, so the standing answer is
- * readable instead of implied by an empty box.
+ * Two explicit, exclusive buttons rather than a checkbox, so the standing
+ * answer is readable instead of implied by an empty box. An undecided file has
+ * neither pressed.
  */
 export function violationDecision(
   taskId: string,
   file: string,
-  status: 'pending' | 'approved' | 'rejected',
+  decision: ViolationDecision,
 ): string {
-  const approved = status === 'approved';
-  const state = approved
-    ? '✅ protected — change accepted'
-    : '⛔ protected — change will be reverted';
+  const approved = decision === 'approved';
   const button = (value: '0' | '1', label: string, on: boolean) =>
     `<button type="submit" name="approved" value="${value}"` +
     ` class="rv-decide-btn${on ? ' rv-decide-on' : ''}"` +
     ` aria-pressed="${on ? 'true' : 'false'}">${escapeHtml(label)}</button>`;
   return (
     `<form class="rv-decide" method="post" action="/tasks/${escapeHtml(taskId)}/review/violation"` +
-    ` data-rv-decide="${escapeHtml(file)}" data-approved="${approved ? '1' : '0'}">` +
+    ` data-rv-decide="${escapeHtml(file)}" data-approved="${approved ? '1' : '0'}" data-decision="${decision}">` +
     `<input type="hidden" name="file" value="${escapeHtml(file)}">` +
-    `<span class="rv-decide-state">${state}</span>` +
-    button('0', 'Reject', !approved) +
+    `<span class="rv-decide-state">${escapeHtml(VIOLATION_DECISION_STATE[decision])}</span>` +
+    button('0', 'Reject', decision === 'rejected') +
     button('1', 'Approve', approved) +
     `</form>`
   );
@@ -1592,6 +1606,18 @@ ${presentedViewScript()}
 
   for (var name in MODES) set(name, read(name), false);
   syncNarrow();
+
+  // Cards filled in after load (the progressive Changes loader) arrive in the
+  // server's unified layout with their expand rows hidden: bring them to the
+  // view the reader is already in.
+  root.addEventListener('rv:files-loaded', function () {
+    if (EXPAND_URL) {
+      var rows = root.querySelectorAll('tr.rv-expand');
+      for (var i = 0; i < rows.length; i++) rows[i].hidden = false;
+    }
+    if (current.presented) MODES.presented.apply(current.presented);
+    if (current.layout) applyLayout(current.layout === 'split' && !narrow.matches ? 'split' : 'unified');
+  });
 
   // This whole script re-runs every time its tab body is (re)fetched (see
   // activateScripts in task-tabs.ts). A MediaQueryList's change listener is

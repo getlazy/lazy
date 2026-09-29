@@ -12,6 +12,7 @@ import {
   writeNeutralCredentialStore,
   resolveBuilderSessionHomeDir,
   ensureBuilderSessionHomeDir,
+  writeBuilderSessionClaudeConfig,
 } from '../../src/builder/claude-home';
 
 describe('builder claude home', () => {
@@ -197,6 +198,39 @@ describe('builder claude home', () => {
       const home = await ensureBuilderSessionHomeDir('/home/user/projects/acme', 'ivan@example.com');
       const stat = await import('fs/promises').then(fs => fs.stat(join(home, '.claude')));
       expect(stat.isDirectory()).toBe(true);
+    });
+  });
+
+  describe('detached first launch seed', () => {
+    const write = async (persisted: string) => {
+      const sessionPath = join(dir, 'session.json');
+      await writeBuilderSessionClaudeConfig({
+        sessionPath, persistedPath: persisted, hostConfigPath: null, mcpArgs: ['mcp'],
+        firstRun: { trustPaths: ['/proj'], apiKey: 'placeholder-key-0123456789abcdef' },
+        onWarn: () => {},
+      });
+      return JSON.parse(await readFile(sessionPath, 'utf-8'));
+    };
+
+    test('a first launch carries first-run answers and no identity', async () => {
+      // INVARIANT: a member's first Teams builder skips Claude Code's first-run
+      // prompts, and is never seeded with anybody's account or identity.
+      const doc = await write(join(dir, 'missing.json'));
+      expect(doc.hasCompletedOnboarding).toBe(true);
+      expect(doc.theme).toBeDefined();
+      expect(doc.projects['/proj'].hasTrustDialogAccepted).toBe(true);
+      expect(doc.customApiKeyResponses.approved).toEqual(['placeholder-key-0123456789abcdef'.slice(-20)]);
+      expect(doc.mcpServers.lazy).toBeDefined();
+      expect(doc.oauthAccount).toBeUndefined();
+      expect(doc.userID).toBeUndefined();
+    });
+
+    test('a member\'s own persisted answers win', async () => {
+      const persisted = join(dir, 'persisted.json');
+      await writeFile(persisted, JSON.stringify({ theme: 'light', projects: { '/proj': { hasTrustDialogAccepted: false } } }));
+      const doc = await write(persisted);
+      expect(doc.theme).toBe('light');
+      expect(doc.projects['/proj'].hasTrustDialogAccepted).toBe(false);
     });
   });
 });

@@ -53,8 +53,14 @@ export const READ_ONLY_RPC_COMMANDS: ReadonlySet<string> = new Set([
   'active',
   'show',
   'search',
+  'resolveIds',
+  'commitPatch',
   // Builder scratch, read-only (src/builder/scratch-view.ts).
   'scratchList',
+  // A Builder and its joined transcript (src/builder/identity-transcript.ts).
+  'builderTranscript',
+  // Everything about one builder run (src/daemon/builder-run-report.ts). Control token only.
+  'builderRunReport',
   // The injected-context answer for a memory surface (src/memory/context-status.ts).
   'memoryStatus',
   'scratchShow',
@@ -78,18 +84,33 @@ export const READ_ONLY_RPC_COMMANDS: ReadonlySet<string> = new Set([
   'serve.getStartServicesCmd',
   'taskProgress',
   'taskStats',
+  'tokenStats',
   'submitTaskPreflight',
   'getTaskUpstreamStatus',
   'listReparentTargets',
   'taskEnv',
   'describeLinkedTask',
   'getProjectSettings',
+  // Which credential each agent profile takes from a member — the list a
+  // control plane's "connect your credentials" page renders. No secret, no row.
+  'agentCredentialProfiles',
+  // The control plane's copy of a managed project's lazy.toml
+  // (src/daemon/project-config.ts): the file in force, and a verdict on
+  // candidate text, and candidate text with settings-form edits applied.
+  // None of them writes anything.
+  'getProjectConfig',
+  'validateProjectConfig',
+  'editProjectConfig',
+  // ENVIRONMENT-ONLY write: replaces the control plane's config file outside
+  // the clone. No store row; the control plane keeps who-changed-what itself.
+  'applyProjectConfig',
   'listUserCredentials',
   'checkUserCredential',
   'getAuthEnv',
   'getCredentialState',
   'reviewQueue',
   'reviewDiff',
+  'reviewDiffFiles',
   'reviewPresentations',
   'reviewProseAnchors',
   'reviewVerify',
@@ -101,6 +122,8 @@ export const READ_ONLY_RPC_COMMANDS: ReadonlySet<string> = new Set([
   'identity',
   // Latest proxy usage-limit reading per credential — an in-memory read.
   'usageLimits',
+  // The token-budget view: those readings plus recorded usage — a read.
+  'tokenBudget',
   // Doctor is the surface that EXPLAINS an unconfigured identity (the
   // single-warning-surface rule), so it must run while unconfigured — remedies
   // included, since a remedy repairs the environment and writes no attributed
@@ -111,6 +134,9 @@ export const READ_ONLY_RPC_COMMANDS: ReadonlySet<string> = new Set([
   // runner and tasks and changes none of them — like doctor, it has to answer
   // precisely when something (identity included) is wrong.
   'daemonHealth',
+  // The CLI's pre-editor question "would this turn be refused for want of a
+  // model credential?" — a presence read, asked before identity may be fixed.
+  'turnCredentialCheck',
   'doctor.previewRemedy',
   'doctor.applyRemedy',
   // `lazy system repair-commits`: recomputes a task's recorded commit list and
@@ -328,6 +354,7 @@ export const CONTROL_PLANE_RPC_COMMANDS: ReadonlySet<string> = new Set([
   'mintDashboardTicket',
   // Operator configuration of a project, not an act on a task.
   'setProjectSettings',
+  'applyProjectConfig',
   'serve.setStartServicesCmd',
   'serve.clearStartServicesCmd',
   // A throwaway container the control plane runs; writes no task row.
@@ -435,6 +462,8 @@ export const READ_ONLY_STORAGE_METHODS: ReadonlySet<string> = new Set([
   'loadConversation',
   'listConversations',
   'listConversationSummaries',
+  'listBuilders',
+  'getBuilder',
   'isConversationImported',
   'getAgentSessionLog',
   'getProjectSettings',

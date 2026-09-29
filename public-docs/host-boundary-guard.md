@@ -45,6 +45,14 @@ do. Three modes:
 | `--guard` | must-deny checks only — the blocking regression gate |
 | (no flag) | the full evidence matrix, including expected SILENT-ALLOWs |
 
+In `--guard` mode lazy also builds a throwaway project with a real task worktree
+under your home directory (`~/.lazy-boundary-probe`, removed afterwards) and
+checks, with the exact rules it gives an agent, that the file tools cannot write
+your home directory outside the project, or the project root (its `lazy.toml`
+directly or through a symlink in the worktree, another task's worktree), while
+the worktree itself and `git add` from the shell still work. The command prints
+each check's outcome.
+
 Exit codes are the verdict, and there are three of them because "we couldn't
 tell" is a distinct outcome from "it's fine":
 
@@ -61,6 +69,15 @@ The anti-false-pass mechanism inside the probe is the **control vector**, which
 runs first in `--guard`/`--check` mode: it confirms a session can do legitimate
 work *inside* its own worktree. Without that check, a session that cannot write
 anywhere at all (no auth, broken sandbox) would "pass" every deny check trivially.
+
+`--guard` and the full run also check that a session working in a git worktree
+cannot rewrite the worktree's git pointer files (its `.git` file, and the
+`commondir` and `gitdir` files in the repository's per-worktree directory), the
+repository's `config`, or its hooks — from `Bash` or with its file tools. Any of
+those could make a later `git` command outside the sandbox run code the session
+planted, so a change to one is a `violation` like any other. The full run also
+shows that, without lazy's rules, a pointer IS writable — so a model that
+simply refuses cannot make the checks pass.
 
 Lazy's own CI runs the `--guard` check weekly on macOS and Linux against the latest Claude Code; the two checks below let you verify your own host.
 
@@ -85,8 +102,8 @@ switch `type = "docker"`, drop to `permission_mode = "bypass"` knowingly, or set
 
 ### Why `off` is the default
 
-Preflight on *every* launch is indefensible: the guard spends **three real headless
-Claude sessions** (~1–2 min, billed) per run. Even once-per-machine would stall the
+Preflight on *every* launch is indefensible: the guard spends **nine real headless
+Claude sessions** (~4–6 min, billed) per run. Even once-per-machine would stall the
 first launch on any host without an interactive `claude` login — including CI
 sandboxes and containers — over a check the operator never asked for. The weekly CI check is the
 standing signal; the runtime knob is for operators who want a machine that refuses
@@ -121,7 +138,7 @@ Both writers share one cache: the launch preflight and `lazy system
 verify-host-boundary` (in guard mode) write through the same helper with the same
 rules. That is what makes `--refresh` genuinely *replace* a stale entry, and lets an operator warm
 the cache **before** switching `verify_sandbox_boundary` to `"once-per-version"`
-— so the first real task launch does not stall on three headless sessions.
+— so the first real task launch does not stall on nine headless sessions.
 `--check` never writes: "this host can run the guard" is not a verdict about the
 boundary.
 
@@ -136,8 +153,14 @@ verdict itself is unaffected: a violation still refuses, cached or not.
 lazy system verify-host-boundary            # verdict for this project's posture
 lazy system verify-host-boundary --check    # can this host run the guard at all?
 lazy system verify-host-boundary --refresh  # re-probe after a Claude Code upgrade
-lazy system verify-host-boundary --json v.json
+lazy system verify-host-boundary --refresh --yes --json v.json   # automation
 ```
+
+Before it starts any session it says how many it will launch and asks
+`Run them now? [y/N]`; answering no starts nothing and exits `2` (no verdict).
+Without a terminal it refuses unless you pass both `--yes` and `--json <path>`,
+so a script always reads its verdict from the JSON file. `--yes` alone is
+refused. A cached verdict is printed without asking, since it launches nothing.
 
 It probes the **exact** `--settings` posture this project would give a host agent
 (built from your lazy.toml exactly as the runner builds it

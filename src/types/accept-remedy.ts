@@ -36,6 +36,8 @@ export type AcceptRefusalReason =
   | 'merge-conflict'
   | 'mid-merge'
   | 'dirty-worktree'
+  | 'tampered-git-dir'
+  | 'nested-git-repository'
   | 'no-session'
   | 'interrupted'
   | 'working'
@@ -72,7 +74,7 @@ const REASONS: ReadonlySet<string> = new Set<AcceptRefusalReason>([
   'approval-required', 'approval-invalid', 'pending-violations', 'open-raised-items',
   'review-issues-unaddressed', 'queued-comments-undelivered',
   'resurrection',
-  'lfs-raw-blob', 'check-failed', 'out-of-sync', 'merge-conflict', 'mid-merge', 'dirty-worktree',
+  'lfs-raw-blob', 'check-failed', 'out-of-sync', 'merge-conflict', 'mid-merge', 'dirty-worktree', 'tampered-git-dir', 'nested-git-repository',
   'no-session', 'interrupted', 'working', 'parent-active', 'no-commits',
   'already-accepted', 'forge-approval-required', 'mr-closed', 'review-base-mismatch',
 ]);

@@ -116,11 +116,7 @@ function modelItem(
   projectModel: string | null | undefined,
 ): LaunchIdentityItem {
   const stored = task.model?.trim() ?? '';
-  const resolved = resolveAgentModel(config, {
-    overrideModel: taskModelChoice(null, task.model),
-    projectModel,
-    agentId: task.agent_id,
-  });
+  const resolved = resolveViewModel(config, task.agent_id, task.model, projectModel);
   if (!stored) return { value: resolved, source: 'default' };
   if (resolved !== stored) {
     // Unreachable through the launch rule (taskModelChoice makes a stored
@@ -139,4 +135,33 @@ function effortItem(task: Task, config: ResolvedConfig): LaunchIdentityItem {
   const stored = task.metadata?.effort?.trim() ?? '';
   if (stored) return { value: stored, source: 'task' };
   return { value: config.agent.effort, source: 'default' };
+}
+
+/**
+ * The model a task on agent profile `agentId` would run when nothing is
+ * recorded on the task — the same `modelItem` ladder with an empty task
+ * record. A display read for pickers (the Teams New Task form's per-profile
+ * default); like the rest of this file it writes nothing and decides no turn.
+ * Throws whatever the launch resolution throws for a broken profile.
+ */
+export function profileDefaultModel(opts: {
+  agentId: string;
+  config: ResolvedConfig;
+  projectModel?: string | null;
+}): string {
+  return resolveViewModel(opts.config, opts.agentId, null, opts.projectModel);
+}
+
+/** The one resolution every read in this file shares, so no two can drift. */
+function resolveViewModel(
+  config: ResolvedConfig,
+  agentId: string | undefined,
+  taskModel: string | null | undefined,
+  projectModel: string | null | undefined,
+): string {
+  return resolveAgentModel(config, {
+    overrideModel: taskModelChoice(null, taskModel),
+    projectModel,
+    agentId,
+  });
 }

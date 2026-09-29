@@ -9,6 +9,27 @@ predate lazy, or that recovery left behind.
 Adopting lazy on a repo that already has Claude Code history should mean
 inheriting that history as builder memory — not starting from scratch.
 
+## Builders: one conversation, however many session files
+
+Claude Code rolls a long session into a fresh session file when it compacts
+the context and when a session is resumed, and `/clear` starts a fresh one too.
+Lazy lists and opens **Builders**, not session files: a Builder runs from a
+start or `/clear` to the next `/clear`, and compaction and resume continue
+it. Lazy joins the files by the links Claude Code writes into them, so
+`lazy conversations`, `lazy conversations show`, search, `lazy ask`,
+the dashboard's **Builders** page and the conversation MCP tools each
+show one entry per Builder, with every message across its files. A Builder's
+id is the session id of its first file; any of its session ids (or a unique
+prefix) opens it. A builder you started from the dashboard shows its state as a
+badge on its Builder once that builder has stopped at least once (the session
+it is in is recorded when it stops).
+
+Conversations imported before this existed are grouped the same way, with no
+re-import. A compaction captured before then may still show as two Builders;
+`lazy import-conversation --all --yes` re-reads the session files still on disk
+and joins them. Captured builder scratch files record the Builder that last wrote
+them.
+
 ## Live capture: two paths, both automatic
 
 Nothing needs importing for sessions that happen while lazy is running — they
@@ -340,24 +361,25 @@ lazy conversations search "design decision"       # search message content
 lazy conversations show 4f8c2a1b                  # read one in full
 ```
 
-`lazy builder list` shows the same table (first prompt column); `lazy show
-<session-id>` still works too. For structured search across the whole project,
+`lazy builder list` shows the same table; `lazy show <builder-id>` still
+works too. For structured search across the whole project,
 `lazy search --conversations` and `lazy search 'in:conversations <text>'` also
 reach conversation bodies.
 
 ### In the browser
 
-The daemon's web UI serves the same conversations under **Conversations** in the
-nav (the dashboard's address is printed by `lazy daemon status`):
+The daemon's web UI serves the same Builders under **Builders** in the nav
+(the dashboard's address is printed by `lazy daemon status`; old
+`/conversations` links redirect):
 
-- **`/conversations`** — every captured conversation, newest first: session id,
-  start and end, how many turns came from you and from the builder, and the
-  summary. The search box takes the same pattern `lazy conversations search`
+- **`/builders`** — every Builder, newest first: its id, start and end, how
+  many turns came from you and from the builder, and its title. The search box takes the same pattern `lazy conversations search`
   does and shows the matching passages inline, so you can tell from the results
-  which conversation you meant before opening it. A pattern the engine
+  which Builder you meant before opening it. A pattern the engine
   rejects — a typo, or one that takes too long to evaluate — is named on
   the page; the box keeps what you typed.
-- **`/conversations/<session-id>`** — one conversation, read as a dialogue.
+- **`/builders/<id>`** — one Builder, read as a dialogue across all its
+  session files.
   Long transcripts are paged 40 messages at a time with **Earlier** / **Later**
   links. A short id works here too, as long as it is unique; an ambiguous one is
   refused rather than resolved to a guess.
@@ -365,11 +387,18 @@ nav (the dashboard's address is printed by `lazy daemon status`):
 Conversations are captured, never authored here: nothing you do on these pages
 edits a transcript. The one thing they let you *create* is a task, from part of
 a transcript — see below. Everything works with JavaScript turned off. Lazy
-Teams shows the same two pages for a project, so the record reads the same
-either way.
+Teams shows the same for a project under **Builders**: the list, with your
+running builder first and each builder's run state as a badge, and a page per
+builder with its whole transcript, the files it left in scratch and — when it
+is yours and running — its terminal with **Stop** and **End**. A builder you
+have just started is listed as soon as its transcript is first captured (within
+about half a minute), but without its run badge until the run has stopped once;
+until then the run itself is offered on its own as **Running now**. Old **Transcripts**
+links redirect. There the badge rides the **Builders** nav entry, and the mark
+it counts against is kept per member on the server.
 
-The **Conversations** nav entry carries a badge counting what has been captured
-since you last opened the listing. That mark lives in your browser rather than
+The **Builders** nav entry carries a badge counting Builders that grew since
+you last opened the listing. That mark lives in your browser rather than
 in the store — conversations have no read state — so each browser counts for
 itself; see [the nav counts](web-review.md#the-nav-counts).
 

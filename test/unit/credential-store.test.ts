@@ -232,7 +232,7 @@ describe('providers', () => {
     // A profile on a local model server bills nothing, so there is no slot to
     // write — saying so beats storing a key nothing will ever present.
     test('a profile that bills no credential is refused', () => {
-      const cfg = config({ local: { harness: 'codex', endpoint: 'http://localhost:11434/v1', model: 'qwen3:latest' } });
+      const cfg = config({ local: { harness: 'codex', endpoint: 'http://localhost:11434', model: 'qwen3:latest' } });
       expect(() => resolveCredentialTarget(cfg, 'local')).toThrow(/bills no credential/);
     });
 
@@ -345,6 +345,8 @@ describe('backends', () => {
   function fakeSecurity(limit = 4096) {
     const items = new Map<string, string>();
     const argvSeen: string[] = [];
+    /** Every `add-generic-password` write: which account, and whether it carried `-A`. */
+    const writes: Array<{ account: string; anyApp: boolean }> = [];
     const key = (service: string, account: string): string => `${service} :: ${account}`;
 
     const splitLine = (line: string): string[] => {
@@ -422,6 +424,7 @@ describe('backends', () => {
             exitCode = 1;
             continue;
           }
+          writes.push({ account: flag(args, '-a') ?? '', anyApp: args.includes('-A') });
           items.set(key(flag(args, '-s') ?? '', flag(args, '-a') ?? ''), flag(args, '-w') ?? '');
           exitCode = 0;
         }
@@ -442,7 +445,7 @@ describe('backends', () => {
       throw new Error(`fakeSecurity: unexpected command ${cmd.join(' ')}`);
     };
 
-    return { run, items, argvSeen };
+    return { run, items, argvSeen, writes };
   }
 
   /** A ChatGPT-session-sized secret: compact JSON, single line, two JWT-ish blobs. */
@@ -515,6 +518,33 @@ describe('backends', () => {
       const before = sec.argvSeen.length;
       expect(await backend.get('/proj', 'anthropic')).toBe('sk-ant-ordinary-key');
       expect(sec.argvSeen.length - before).toBe(1);
+    });
+
+    // INVARIANT: rotating a multi-part ChatGPT session never re-applies access
+    // to a part that already exists — only a part that is newly CREATED gets
+    // `-A`. Re-applying access on an existing item asks the user to confirm, and
+    // this rotation is exactly the host-side token refresh that prompted.
+    test('rotating a multi-part session grants access only to newly created parts', async () => {
+      const sec = fakeSecurity();
+      const backend = new KeychainBackend(sec.run, 'darwin');
+      await backend.set('/proj', 'chatgpt', bigSecret(6000));
+      const firstParts = sec.writes.length;
+      expect(firstParts).toBeGreaterThan(1);
+      expect(sec.writes.every((w) => w.anyApp)).toBe(true);
+
+      sec.writes.length = 0;
+      const rotated = bigSecret(6000).replace('acct-unit', 'acct-rot');
+      await backend.set('/proj', 'chatgpt', rotated);
+      expect(sec.writes.length).toBe(firstParts);
+      expect(sec.writes.some((w) => w.anyApp)).toBe(false);
+      expect(await backend.get('/proj', 'chatgpt')).toBe(rotated);
+
+      // A longer session needs one more part: only that one is created with -A.
+      sec.writes.length = 0;
+      await backend.set('/proj', 'chatgpt', bigSecret(9000));
+      const created = sec.writes.filter((w) => w.anyApp);
+      expect(sec.writes.length).toBe(firstParts + 1);
+      expect(created.map((w) => w.account)).toEqual([sec.writes[sec.writes.length - 1]!.account]);
     });
 
     // Removing a credential removes ALL of it. A leftover part would be a live
@@ -623,10 +653,30 @@ describe('backends', () => {
     test('set passes the secret on stdin, never in argv', async () => {
       const { run, calls } = fakeRunner([{ exitCode: 0 }]);
       await new KeychainBackend(run, 'darwin').set('/proj', 'anthropic', 'sk-supersecret');
-      expect(calls[0]!.cmd).toEqual(['security', '-i']);
-      expect(calls[0]!.cmd.join(' ')).not.toContain('sk-supersecret');
-      expect(calls[0]!.stdin).toContain('sk-supersecret');
-      expect(calls[0]!.stdin).toContain('add-generic-password');
+      for (const call of calls) expect(call.cmd.join(' ')).not.toContain('sk-supersecret');
+      const write = calls.find((c) => c.cmd[1] === '-i');
+      expect(write!.cmd).toEqual(['security', '-i']);
+      expect(write!.stdin).toContain('sk-supersecret');
+      expect(write!.stdin).toContain('add-generic-password');
+    });
+
+    // INVARIANT: `-A` is passed only when the item is CREATED, never when an
+    // existing item is updated. With `-U` on an existing item an access flag
+    // re-applies the item's access, which always asks the user to confirm — so
+    // each ChatGPT token rotation prompted. The existence probe must not
+    // decrypt (`-w`), or it would prompt itself.
+    test('set grants any-application access on create and leaves the ACL alone on update', async () => {
+      const created = fakeRunner([{ exitCode: 44, stderr: 'could not be found' }, { exitCode: 0 }]);
+      await new KeychainBackend(created.run, 'darwin').set('/proj', 'chatgpt', 'v1');
+      expect(created.calls[0]!.cmd).not.toContain('-w');
+      expect(created.calls.find((c) => c.cmd[1] === '-i')!.stdin).toMatch(/^add-generic-password -U -A /);
+
+      const updated = fakeRunner([{ exitCode: 0 }]);
+      await new KeychainBackend(updated.run, 'darwin').set('/proj', 'chatgpt', 'v2');
+      expect(updated.calls[0]!.cmd).not.toContain('-w');
+      const line = updated.calls.find((c) => c.cmd[1] === '-i')!.stdin!;
+      expect(line).toMatch(/^add-generic-password -U -s /);
+      expect(line).not.toContain(' -A ');
     });
 
     test('is unavailable off macOS without running anything', async () => {

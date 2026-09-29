@@ -639,7 +639,7 @@ diff --git a/${OTHER} b/${OTHER}
 
   const files = parseUnifiedDiff(diff);
   const violations = new Map([
-    [FILE, 'pending' as const],
+    [FILE, 'undecided' as const],
     [OTHER, 'approved' as const],
   ]);
 
@@ -698,8 +698,12 @@ diff --git a/${OTHER} b/${OTHER}
     expect(html).toContain('bind-failure');
     expect(html).toContain('bind host');
     // Standing answer comes from the daemon, not from a per-hunk guess.
-    expect(html).toContain('protected — change will be reverted');
-    expect(html).toMatch(/value="0"[^>]*rv-decide-on/);
+    // An undecided file has neither switch pressed: Reject is a decision of
+    // its own (the next unblock restores the file), not the
+    // default.
+    expect(html).toContain('protected — not decided yet');
+    const control = (html.split('data-rv-decide="test/e2e/daemon.test.ts"')[1] ?? '').split('</form>')[0];
+    expect(control).not.toMatch(/rv-decide-on/);
   });
 
   test('an interleaved other file keeps a second card of the first file, still one decision', () => {

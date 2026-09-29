@@ -36,7 +36,7 @@ import { rpcAuthErrorMessage } from '../daemon/rpc-auth';
 import type { WebSocketUpgrader, UpgradeOutcome } from './ws';
 import { decodePathSegment } from './task-urls';
 import { createShellRelayHandler, clampDim, refusal, SHELL_CMD, type ShellSocketData } from './shell-ws';
-import { parseShellSessionMode, planPairOrChatExec } from './shell-pair';
+import { parseShellSessionMode, planPairOrChatExec, type PairExecPlan } from './shell-pair';
 import {
   resolveSessionAttachTarget,
   confirmAttachTargetRunning,
@@ -50,6 +50,7 @@ import {
   memberTerminalContainer,
   memberHeldMessage,
   MEMBER_VACATING_MESSAGE,
+  ABANDONED_LAUNCH,
   type HeldContainer,
 } from './member-terminals';
 import { enterTaskAsMember } from '../daemon/member-entry';
@@ -58,6 +59,29 @@ import { logger } from '../utils/logger';
 import { MEMBER_TERMINAL_IDLE_MS, MEMBER_TERMINAL_MAX_MS, type TerminalLimits } from './terminal-idle';
 
 import { DEFAULT_TERM_COLS, DEFAULT_TERM_ROWS, MAX_TERM_COLS, MAX_TERM_ROWS } from './shell-protocol';
+
+/** What a member's terminal reads when their environment could not be made. */
+export const MEMBER_LAUNCH_FAILED_MESSAGE =
+  'Your terminal environment for this task could not be started. Try again, and if it keeps failing ask your administrator.';
+
+/**
+ * How long a member's terminal may wait with NO progress from its container
+ * launch before it is answered with an error. Everything slow in image
+ * resolution narrates through `ensureImage`'s notify: each build line and the
+ * build's 20-second "still building … (elapsed)" heartbeat — for the project
+ * image and for a base image built first — and a 20-second heartbeat while it
+ * waits behind another caller's build of the same image. So only a launch that
+ * genuinely says nothing for this long ends here; a build that hangs keeps
+ * showing its elapsed time instead, because builds are unbounded by policy.
+ */
+export const MEMBER_PREPARE_STALL_MS = 10 * 60_000;
+
+export const MEMBER_PREPARE_STALLED_MESSAGE =
+  'Preparing your terminal environment stopped making progress. Try again, and if it keeps happening ask your administrator.';
+
+type MemberPrepared =
+  | { ok: true; container: string; plan: PairExecPlan | null }
+  | { ok: false; message: string; detail?: string };
 
 export const SESSION_ATTACH_WS_PATH_RE = /^\/rpc\/sessions\/([^/]+)\/attach\/ws$/;
 
@@ -82,12 +106,16 @@ export interface SessionAttachUpgraderDeps {
   launchMemberContainer?: (opts: Parameters<typeof launchMemberContainer>[0]) => Promise<
     { ok: true; container: HeldContainer } | { ok: false; status: number; message: string }
   >;
+  /** Pair/Chat planner seam for tests; defaults to `planPairOrChatExec`. */
+  planPairOrChat?: typeof planPairOrChatExec;
   /** Liveness of a reused member container; defaults to `docker ps`. */
   memberContainerRunning?: (container: HeldContainer) => Promise<boolean>;
   /** What runs when a member's last terminal has gone; defaults to removing their container. */
   onMemberVacate?: (container: HeldContainer | null) => Promise<void>;
   /** Grace seam for tests; defaults to MEMBER_VACATE_GRACE_MS. */
   memberGraceMs?: number;
+  /** Stall seam for tests; defaults to MEMBER_PREPARE_STALL_MS. */
+  memberPrepareStallMs?: number;
   /** Idle/max seam for tests; defaults to MEMBER_TERMINAL_IDLE_MS / _MAX_MS. */
   memberTerminalLimits?: TerminalLimits;
 }
@@ -159,6 +187,10 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
       let env = ['TERM=xterm-256color'];
       let onClose: (() => void) | null = null;
       let abort: (() => void) | null = null;
+      // A member's own container, made after the upgrade (see below).
+      let memberLaunch: ((status: (message: string) => void, abandoned: () => boolean) => Promise<MemberPrepared>) | null = null;
+      // Releases this terminal's claim on the task (members only; once).
+      let releaseClaim: (() => void) | null = null;
       if (target.kind === 'task') {
         const mode = parseShellSessionMode(requestedMode);
         // On a shared daemon the terminal runs AS the attaching member —
@@ -183,7 +215,7 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
         const vacate = deps.onMemberVacate ?? (async (container: HeldContainer | null) => {
           if (container) await container.remove();
         });
-        const fail = (status: number, message: string) => {
+        const undoAll = () => {
           for (const u of undo.reverse()) {
             try {
               u();
@@ -192,6 +224,10 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
               logger.warn(`terminal refusal cleanup failed: ${err instanceof Error ? err.message : String(err)}`);
             }
           }
+          undo.length = 0;
+        };
+        const fail = (status: number, message: string) => {
+          undoAll();
           return refusal(status, message);
         };
         try {
@@ -201,7 +237,17 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
             if (!claimed.ok) {
               return refusal(409, claimed.vacating ? MEMBER_VACATING_MESSAGE : memberHeldMessage(claimed.holder));
             }
-            undo.push(() => releaseMemberTerminal(target.task.id, member.email, vacate, deps.memberGraceMs));
+            // Released exactly once per terminal, whichever path gets there first:
+            // a refusal, a failed or stalled launch, the client closing while its
+            // container is still being made, or the socket's own close. Releasing
+            // twice would count down ANOTHER of this member's terminals.
+            let claimReleased = false;
+            releaseClaim = () => {
+              if (claimReleased) return;
+              claimReleased = true;
+              releaseMemberTerminal(target.task.id, member.email, vacate, deps.memberGraceMs);
+            };
+            undo.push(releaseClaim);
             // EVERY CHECK THAT CAN REFUSE runs before the entry, which keeps
             // turns off the task from the moment it succeeds: a Pair on an
             // agent that cannot pair, a Chat on a working task, or a member
@@ -227,39 +273,123 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
             });
             if (!entered.ok) return fail(entered.status, entered.message);
             // The member's own container: created for their first terminal,
-            // joined by every later one while the hold lasts.
+            // joined by every later one while the hold lasts. It is made
+            // AFTER the upgrade is answered (`prepare`, run by the relay
+            // handler on open): resolving its image is a build or a pull —
+            // minutes after an upgrade replaced the VM — and a relay in front
+            // of this daemon waits a bounded time for the 101. Until then the
+            // socket is told what is happening in `status` frames, and a
+            // launch that fails is its `error` frame. A dead session is still
+            // refused above, as an HTTP answer a CLI can read.
+            // Nothing is exec'd until then — least of all the TASK's container.
+            execTarget = '';
             const launch = deps.launchMemberContainer ?? launchMemberContainer;
-            let launchRefusal: { status: number; message: string } | null = null;
-            let container: HeldContainer;
-            try {
-              container = await memberTerminalContainer(
-                target.task.id,
-                member.email,
-                async () => {
-                  const launched = await launch({
-                    projectRoot: deps.root,
-                    storage,
-                    task: freshTask,
-                    session: target.session,
-                    memberEmail: member.email,
-                    binary: target.binary,
+            const stallMs = deps.memberPrepareStallMs ?? MEMBER_PREPARE_STALL_MS;
+            memberLaunch = async (report, closed) => {
+              // Bounded by SILENCE, not by total time: image builds are
+              // unbounded by lazy's policy and narrate every line plus a
+              // heartbeat, so a long build that is alive keeps this open,
+              // while one that has stopped saying anything ends in an error
+              // frame instead of "Preparing…" forever.
+              let stalled = false;
+              let stallTimer: ReturnType<typeof setTimeout> | null = null;
+              let onStall: (() => void) | null = null;
+              const stall = new Promise<MemberPrepared>((resolve) => {
+                onStall = () => {
+                  stalled = true;
+                  undoAll();
+                  logger.warn(`member terminal preparation for task ${target.task.id.substring(0, 8)} made no progress for ${Math.round(stallMs / 1000)}s`);
+                  resolve({
+                    ok: false,
+                    message: MEMBER_PREPARE_STALLED_MESSAGE,
+                    detail: `no progress from the container launch for ${Math.round(stallMs / 1000)}s`,
                   });
-                  if (!launched.ok) {
-                    launchRefusal = launched;
-                    throw new Error(launched.message);
+                };
+              });
+              const arm = () => {
+                if (stallTimer) clearTimeout(stallTimer);
+                stallTimer = setTimeout(() => onStall?.(), stallMs);
+              };
+              const status = (message: string) => {
+                if (stalled) return;
+                arm();
+                report(message);
+              };
+              // Nothing more is done for a terminal nobody is waiting on: a
+              // client that left, or a preparation already answered as stalled.
+              const abandoned = () => stalled || closed();
+              status('Preparing your terminal environment…');
+              try {
+                return await Promise.race([work(status, abandoned), stall]);
+              } finally {
+                if (stallTimer) clearTimeout(stallTimer);
+              }
+            };
+            const work = async (status: (message: string) => void, abandoned: () => boolean): Promise<MemberPrepared> => {
+              let launchRefusal: { status: number; message: string } | null = null;
+              try {
+                const container = await memberTerminalContainer(
+                  target.task.id,
+                  member.email,
+                  async () => {
+                    const launched = await launch({
+                      projectRoot: deps.root,
+                      storage,
+                      task: freshTask,
+                      session: target.session,
+                      memberEmail: member.email,
+                      binary: target.binary,
+                      notify: (detail) => status(`Preparing your terminal: ${detail}…`),
+                    });
+                    if (!launched.ok) {
+                      launchRefusal = launched;
+                      throw new Error(launched.message);
+                    }
+                    return launched.container;
+                  },
+                  deps.memberContainerRunning ?? ((c) => memberContainerRunning(c.binary, c.name)),
+                );
+                // Pair/Chat take their lock only once the container exists: a
+                // launch that fails must not flip the task to `pairing`, spend
+                // a usage-pause override, or record a pairing session that
+                // never started. The member preflight already applied the
+                // planner's rules, so a refusal here is a race. Nor is one taken
+                // for a terminal nobody is waiting on any more.
+                if (mode !== 'shell' && !abandoned()) {
+                  const planned = await (deps.planPairOrChat ?? planPairOrChatExec)({
+                    root: deps.root,
+                    storage,
+                    task: target.task,
+                    session: target.session,
+                    mode,
+                    member,
+                  });
+                  if (!planned.ok) {
+                    undoAll();
+                    return { ok: false, message: planned.message };
                   }
-                  return launched.container;
-                },
-                deps.memberContainerRunning ?? ((c) => memberContainerRunning(c.binary, c.name)),
-              );
-            } catch (err) {
-              const r = launchRefusal as { status: number; message: string } | null;
-              if (r) return fail(r.status, r.message);
-              throw err;
-            }
-            execTarget = container.name;
+                  return { ok: true, container: container.name, plan: planned.plan };
+                }
+                return { ok: true, container: container.name, plan: null };
+              } catch (err) {
+                undoAll();
+                const r = launchRefusal as { status: number; message: string } | null;
+                // A refusal the member can act on is theirs to read as it is;
+                // what failed underneath is for god mode (the relay withholds
+                // `detail` from everyone else).
+                if (r && r.status < 500) return { ok: false, message: r.message };
+                const detail = r ? r.message : (err instanceof Error ? err.message : String(err));
+                // The member left before their environment was ready: nothing failed.
+                if (!r && err instanceof Error && err.message === ABANDONED_LAUNCH) {
+                  logger.debug(`member terminal launch dropped: ${detail}`);
+                  return { ok: false, message: detail };
+                }
+                logger.warn(`member terminal launch failed: ${detail}`);
+                return { ok: false, message: MEMBER_LAUNCH_FAILED_MESSAGE, detail };
+              }
+            };
           }
-          if (mode !== 'shell') {
+          if (mode !== 'shell' && !member) {
             const planned = await planPairOrChatExec({
               root: deps.root,
               storage,
@@ -276,7 +406,7 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
           return fail(500, `Could not open a terminal in this task's environment: ${err instanceof Error ? err.message : String(err)}`);
         }
         if (member) {
-          const release = () => releaseMemberTerminal(target.task.id, member.email, vacate, deps.memberGraceMs);
+          const release = releaseClaim ?? (() => {});
           const [close0, abort0] = [onClose, abort];
           onClose = () => { release(); close0?.(); };
           abort = () => { release(); abort0?.(); };
@@ -298,6 +428,27 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
         // forgotten one is closed (./terminal-idle.ts).
         ...(target.kind === 'task' && multiMember ? { limits: deps.memberTerminalLimits ?? { idleMs: MEMBER_TERMINAL_IDLE_MS, maxMs: MEMBER_TERMINAL_MAX_MS } } : {}),
       };
+      if (memberLaunch) {
+        const launchIt = memberLaunch;
+        // The client leaving mid-preparation releases this terminal's claim AT
+        // ONCE (./shell-ws.ts calls this from close), rather than when a launch
+        // that may be a minutes-long image build settles. What the launch makes
+        // is still the hold's, and the hold's vacate removes it.
+        data.releaseNow = releaseClaim;
+        data.prepare = async (status) => {
+          const launched = await launchIt(status, () => data.closedWhilePreparing === true);
+          if (!launched.ok) return launched;
+          data.container = launched.container;
+          const plan = launched.plan;
+          if (plan) {
+            data.cmd = plan.cmd;
+            data.env = plan.env;
+            const release = data.onClose;
+            data.onClose = () => { release?.(); plan.onClose(); };
+          }
+          return { ok: true };
+        };
+      }
       if (!server.upgrade(req, { data })) {
         abort?.();
         return refusal(426, 'Expected a WebSocket upgrade request.');

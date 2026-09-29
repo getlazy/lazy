@@ -35,7 +35,8 @@ describe('the client half of shell-protocol', () => {
       .toEqual({ ok: true, message: { type: 'resize', cols: 100, rows: 30 } });
   });
 
-  test('reads ready, exit and error', () => {
+  test('reads status, ready, exit and error', () => {
+    expect(parseShellServerMessage('{"type":"status","message":"Preparing"}')).toEqual({ ok: true, message: { type: 'status', message: 'Preparing' } });
     expect(parseShellServerMessage('{"type":"ready","container":"c"}')).toEqual({ ok: true, message: { type: 'ready', container: 'c' } });
     expect(parseShellServerMessage('{"type":"exit","code":null}')).toEqual({ ok: true, message: { type: 'exit', code: null } });
     expect(parseShellServerMessage('{"type":"error","message":"m"}')).toEqual({ ok: true, message: { type: 'error', message: 'm' } });
@@ -44,7 +45,7 @@ describe('the client half of shell-protocol', () => {
   // INVARIANT: a malformed control frame is reported, never thrown — one bad
   // frame must not take a live terminal down.
   test('rejects malformed frames without throwing', () => {
-    for (const raw of ['nope', '[]', '{"type":"exit","code":1.5}', '{"type":"ready"}', '{"type":"other"}']) {
+    for (const raw of ['nope', '[]', '{"type":"exit","code":1.5}', '{"type":"ready"}', '{"type":"status"}', '{"type":"other"}']) {
       expect(parseShellServerMessage(raw).ok).toBe(false);
     }
   });

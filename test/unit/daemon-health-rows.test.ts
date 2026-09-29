@@ -9,6 +9,7 @@
 
 import { describe, test, expect } from 'bun:test';
 import {
+  buildVersionRow,
   buildAuditRow,
   buildBuildMatchRow,
   buildDashboardRow,
@@ -443,5 +444,16 @@ describe('the recorder', () => {
     rec.tickStarted('reconcile');
     rec.tickFinished('reconcile', old);
     expect(rec.snapshot().loops[0]!.currentTickStartedAt).toBe(400_000);
+  });
+});
+
+describe('buildVersionRow', () => {
+  // INVARIANT: the doctor's version row names the running build (branch@sha,
+  // clean|dirty) beside the version, so "is this daemon current" is readable.
+  test('names the build when the daemon knows it, and only the version otherwise', () => {
+    const facts = { pid: 1, startedAt: null, version: '0.90.4100', sourceId: null, sourceIdKind: null };
+    expect(buildVersionRow({ ...facts, build: 'main@abc1234, clean' }, 0).reason)
+      .toStartWith('lazy 0.90.4100 (main@abc1234, clean), pid 1');
+    expect(buildVersionRow(facts, 0).reason).toStartWith('lazy 0.90.4100, pid 1');
   });
 });

@@ -52,12 +52,15 @@ const ENTRY = join(import.meta.dir, '..', '..', 'src', 'index.ts');
  * - `binding`   — refused, naming the Teams binding and what to do instead.
  * - `role`      — refused because the tool belongs to a task agent, not a
  *                 builder; true on any laptop, bound or not.
+ * - `route`     — refused because the tool is served only on lazy's own
+ *                 daemon-side MCP route; true on any MCP server a person runs
+ *                 on their own machine, bound or not. Does not name the binding.
  * - `generic`   — the proxy's own "Unknown or unsupported command" 403/404.
  *                 Tracked separately on purpose: it is a refusal, but it
  *                 tells a person nothing about the binding.
  * - `obscure`   — anything else. Never acceptable.
  */
-type Outcome = 'answers' | 'domain' | 'binding' | 'role' | 'generic' | 'obscure';
+type Outcome = 'answers' | 'domain' | 'binding' | 'role' | 'route' | 'generic' | 'obscure';
 
 /** What each tool does in a bound clone, decided once and checked every run. */
 const EXPECTED: Record<string, Outcome> = {
@@ -109,8 +112,14 @@ const EXPECTED: Record<string, Outcome> = {
   lazy_reparent: 'binding',
   lazy_link: 'binding',
   lazy_raised_promote: 'binding',
-  // Every member's readings: Teams relays neither usage RPC to a clone.
+  // Every member's readings — usage limits and project token statistics:
+  // Teams relays none of those RPCs to a clone.
   lazy_usage_limits: 'binding',
+  lazy_token_stats: 'binding',
+  // The task's PR/MR, read with the daemon's forge credential: served only on
+  // the daemon's MCP route, so a laptop server refuses them bound or not.
+  lazy_review_comments: 'route',
+  lazy_review_status: 'route',
   // Runs a model one-shot, which Teams does not offer to a clone.
   lazy_conversation_ask: 'binding',
   // Several writes Teams would relay only in part: refused before the first.
@@ -171,6 +180,7 @@ function classify(r: { isError: boolean; text: string }): Outcome {
   if (!r.isError) return 'answers';
   if (/Unknown or unsupported command/.test(r.text)) return 'generic';
   if (/not available in builder mode/.test(r.text)) return 'role';
+  if (/served only through the daemon's MCP route/.test(r.text)) return 'route';
   return 'domain';
 }
 

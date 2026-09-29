@@ -123,12 +123,12 @@ an `output`, the builder's and the CLI's is an `input`.
 
 ## Surfaces
 
-| | CLI | MCP | Lazy Teams |
-| --- | --- | --- | --- |
-| attach | `lazy artifact add` | `lazy_artifact_add` | task page, **Artifacts** section |
-| list | `lazy artifact list` | `lazy_artifact_list` | task page, **Artifacts** section |
-| read | `lazy artifact get` | `lazy_artifact_get` | **Download** link |
-| remove | `lazy artifact rm` | *(none — deliberate)* | *(none — use the CLI)* |
+| | CLI | MCP | Dashboard | Lazy Teams |
+| --- | --- | --- | --- | --- |
+| attach | `lazy artifact add` | `lazy_artifact_add` | task page, **Artifacts** tab | task page, **Artifacts** tab; the New Task form |
+| list | `lazy artifact list` | `lazy_artifact_list` | task page, **Artifacts** tab | task page, **Artifacts** tab |
+| read | `lazy artifact get` | `lazy_artifact_get` | **Download** link, preview | **Download** link |
+| remove | `lazy artifact rm` | *(none — deliberate)* | *(none — use the CLI)* | *(none — use the CLI)* |
 
 Removal is CLI-only: an artifact is often the only copy of something a human
 handed the task, deleting is the one artifact operation that destroys something
@@ -140,10 +140,25 @@ tree-wide like every other read. See
 `lazy show` lists a task's artifacts (metadata only), and `lazy_show` returns the
 same as `artifacts`.
 
+### Dashboard
+
+The task page on the local dashboard (`lazy dashboard`) has an **Artifacts**
+tab, labelled with how many artifacts the task carries. Each artifact shows its
+name, size, type, origin (input or output), who added it and when, and a
+**Download** link. Raster images preview inline; text files preview as text and
+Markdown files render. HTML and SVG are shown as source, never rendered. Below
+the list, **Add an input file** attaches a file for the agent, optionally under a
+name of your choosing; it never starts a turn, and a file with an existing name
+replaces it. Downloads go through the same dashboard sign-in as every page, and
+anything that is not a raster image is delivered as a file attachment.
+
 ### Lazy Teams
 
-A task's **Record** tab has an **Artifacts** section listing its inputs and
-outputs, each with its size, type and a **Download** link. Any member who can
+A task page has an **Artifacts** tab, labelled with how many artifacts the task
+carries. It lists inputs and outputs separately, each with its size, type and a
+**Download** link; images also get a small preview you can click to open full
+size. The tab also shows how much of the task's budget is left (8 MB and 64
+files per task, 1 MB per file), so a refused attach is never a surprise. Any member who can
 leave a note on the task can attach a file there, optionally under a name of
 their choosing (for example `design/spec.md`). The file is stored as an input
 and nothing else happens: the agent finds it on its next turn, and attaching
@@ -151,10 +166,17 @@ does not start one. A file with the same name as an existing artifact replaces
 it, and the page says so. Oversized files and invalid names are refused with the same
 explanation the CLI gives.
 
+The **New Task** form can attach files too, under **Files for the agent** (you can
+choose several). They are checked against the same limits before the task is
+created, then attached as inputs before the task starts, so the agent can read them
+from its first turn. If a file cannot be attached after the task was created, the
+task stays unstarted and its Artifacts tab opens, naming the file, so you can attach
+it again and then start the task.
+
 Downloads are always delivered as file attachments, never displayed in the
 browser, so an HTML or SVG file a task published cannot run in your Teams
-session. Screenshots in an agent's report are the one exception: raster images (never
-SVG) render inline.
+session. Image previews and screenshots in an agent's report are the one exception: raster
+images (never SVG) render inline.
 
 ## Events
 

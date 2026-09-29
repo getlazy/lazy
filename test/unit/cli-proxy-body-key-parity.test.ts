@@ -68,6 +68,8 @@ const REFUSED_COMMANDS: Readonly<Record<string, string>> = {
   concurrency: 'control-plane.',
   usageLimits: 'control-plane — every member\'s usage-limit readings; the daemon refuses it to a user token, like listUserCredentials.',
   usagePause: 'control-plane: the one-shot usage-pause override, and every member\'s paused credential (the daemon refuses user tokens too).',
+  tokenBudget: 'control-plane — names every member\'s credential with its window spend; the daemon refuses it to a user token, like usageLimits.',
+  tokenStats: 'not yet classified for the proxy (a bound clone\'s `lazy stats tokens` is refused rather than relayed).',
   builderSlot: 'control-plane (builder admission).',
   ensureTaskContainer: 'container plumbing on the daemon host.',
   getDaemonMcpConfig: 'mints an MCP session token — control-plane.',

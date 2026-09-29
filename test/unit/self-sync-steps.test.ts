@@ -24,6 +24,9 @@ function gitIn(cwd: string, ...args: string[]): { stdout: string; stderr: string
 }
 
 /** Records the turns a self-sync writes, so the test can assert on them. */
+/** The task branch the fixture checks out (the HEAD guard is a no-op outside .lazy/worktrees). */
+const TASK_BRANCH = 'lazy/task';
+
 function stubStorage(): { storage: Storage; turns: Array<Record<string, unknown>> } {
   const turns: Array<Record<string, unknown>> = [];
   const storage = {
@@ -114,7 +117,7 @@ describe('runSelfSync in a real repository', () => {
       taskId: 'task-1234',
       sessionId: 'sess-1',
       displayId: 'my-task',
-      worktreePath: worktree,
+      worktreePath: worktree, branch: TASK_BRANCH,
       plan: parentPlan(),
     });
 
@@ -149,7 +152,7 @@ describe('runSelfSync in a real repository', () => {
       taskId: 'task-1234',
       sessionId: 'sess-1',
       displayId: 'my-task',
-      worktreePath: worktree,
+      worktreePath: worktree, branch: TASK_BRANCH,
       plan: parentPlan(),
     });
 
@@ -177,7 +180,7 @@ describe('runSelfSync in a real repository', () => {
       taskId: 'task-1234',
       sessionId: 'sess-1',
       displayId: 'my-task',
-      worktreePath: worktree,
+      worktreePath: worktree, branch: TASK_BRANCH,
       plan: parentPlan(),
       leaveConflictInProgress: false,
     });
@@ -210,12 +213,12 @@ describe('runSelfSync in a real repository', () => {
     const { storage } = stubStorage();
     await runSelfSync({
       storage, taskId: 'task-1234', sessionId: 'sess-1', displayId: 'my-task',
-      worktreePath: worktree, plan: parentPlan(),
+      worktreePath: worktree, branch: TASK_BRANCH, plan: parentPlan(),
     });
 
     const again = await runSelfSync({
       storage, taskId: 'task-1234', sessionId: 'sess-1', displayId: 'my-task',
-      worktreePath: worktree,
+      worktreePath: worktree, branch: TASK_BRANCH,
       plan: planSelfSyncSteps({
         parentRef: 'main',
         parentSha: gitIn(dir, 'rev-parse', 'main').stdout.trim(),

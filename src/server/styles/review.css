@@ -726,3 +726,18 @@ dialog.lz-shotbox .lz-shotbox-nav:hover { background: var(--color-accent); color
 .lz-findings-none { color: color-mix(in srgb, var(--color-text) 60%, transparent); }
 .lz-findings-raw { margin-top: var(--space-3); }
 .lz-findings-raw > summary { cursor: pointer; }
+
+/* Region list inside the Changes card: every top-level region, one link each. */
+.rv-region-views { display: inline; }
+.rv-region-views > summary { display: inline; cursor: pointer; }
+.rv-region-list { margin: 0.25rem 0 0; padding-left: 1.25rem; columns: 2 22rem; }
+
+/* The progressive file list: every file of a large diff, before any hunk. */
+.rv-file-list { margin: 0.5rem 0 1rem; }
+.rv-file-list > summary { cursor: pointer; }
+.rv-file-list-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.rv-file-list-table td, .rv-file-list-table th { padding: 0.1rem 0.5rem; text-align: left; }
+.rv-file-list-table td:first-child { font-family: var(--font-mono, monospace); word-break: break-all; }
+
+/* A file card whose hunks have not loaded yet. */
+.rv-file-pending .rv-binary { opacity: 0.8; }

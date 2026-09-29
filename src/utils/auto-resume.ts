@@ -17,6 +17,7 @@ import { resolveTurnLaunchIdentity } from '../daemon/launch-identity';
 import { createRunner } from '../runner';
 import { harnessForTask, setRunnerAgentForTask } from '../daemon/task-harness';
 import { stampSessionRunner, removeTaskRun, mustRecreateForContainerAgent } from '../runner/session-launch';
+import { mustRecreateForTaskEnv } from '../daemon/task-env';
 import { pinnedCustomImage } from '../docker/worktree-image';
 import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../protocol';
 import type { UnblockCommand } from '../protocol';
@@ -29,7 +30,7 @@ import { writeDaemonMcpConfig } from '../daemon/task-launcher';
 import { resolveUpstreamMergeRefForCommand } from '../daemon/upstream-command-ref';
 import { resolveWrapUpCommandFields } from '../daemon/wrap-up-plan';
 import { planTurnCredential, mustRecreateForCredentialPlan, systemTurnBlock } from '../daemon/turn-credentials';
-import { usagePauseHold } from '../daemon/usage-pause';
+import { takeTaskAllowanceAtLaunch, usagePauseHold } from '../daemon/usage-pause';
 import { hasDaemonContext } from '../daemon/context';
 import { findPendingFeedback, buildFeedbackRedeliveryPrompt } from './feedback-redelivery';
 import { isTurnInFlight } from '../daemon/in-flight-turn';
@@ -39,6 +40,7 @@ import { supervisorStillOwnsTurn } from '../daemon/supervisor-handback';
 import { buildAgentSwitchHandoffContext } from '../agent/switch-handoff';
 import { rediscoverSessionIdForHarness } from '../agent/session-discovery';
 import { typeConstraintsSection } from '../task/type-constraints';
+import { recordRecreationIfRunning, recreationReason, environmentReplacedPrefix, clearEnvironmentReplaced } from '../task/environment-replaced';
 import { buildTurnHistoryContext } from '../task/turn-context';
 import { systemActor } from '../identity/system-identity';
 
@@ -160,7 +162,7 @@ export async function autoResumeTask(
   // project's service credential — and refuses rather than billing an arbitrary
   // member if there isn't one. Warned, not debug-logged: a silently non-resuming
   // task looks like a bug in auto-resume.
-  const systemBlock = await systemTurnBlock(lazyRoot);
+  const systemBlock = await systemTurnBlock(lazyRoot, task);
   if (systemBlock) {
     logger.warn(`Auto-resume ${taskShortId}: skipped — ${systemBlock}`);
     return false;
@@ -182,6 +184,11 @@ export async function autoResumeTask(
     logger.debug(`Auto-resume ${taskShortId}: could not acquire worktree lock, skipping`);
     return false;
   }
+
+  // [usage_pause]: the launch commits here, after every gate that could still
+  // skip it — so a pending "let its next turn through" is used now, not burned
+  // by a pass that then skipped (src/daemon/usage-pause.ts).
+  await takeTaskAllowanceAtLaunch(lazyRoot, task, 'auto-resume');
 
   // Bridge/stamp the resolved runner onto the session before launch.
   await stampSessionRunner(storage, lazyRoot, session, worktreePath, runner.type);
@@ -362,6 +369,18 @@ export async function autoResumeTask(
       return recreate;
     });
     const mustRecreateForAgent = mustRecreateForContainerAgent(session, task.agent_id);
+    // `lazy env set` since this container was created: env is fixed at create.
+    const mustRecreateForEnv = await mustRecreateForTaskEnv(lazyRoot, task.id, containerName);
+    if (mustRecreateForEnv) logger.info('recreating container: task environment changed (lazy env) — launch env is fixed at create time');
+    // See src/task/environment-replaced.ts: a replaced container is told to the
+    // turn that runs in its successor.
+    await recordRecreationIfRunning(
+      storage,
+      task.id,
+      recreationReason(mustRecreateForCredential, mustRecreateForAgent, mustRecreateForEnv),
+      runner, containerName,
+    );
+    const envNotice = await environmentReplacedPrefix(storage, task.id);
     if (mustRecreateForAgent) {
       logger.info(
         `Auto-resume ${taskShortId}: recreating container — agent changed ` +
@@ -443,7 +462,7 @@ export async function autoResumeTask(
       // prompt with no contract, and does its children's work itself instead of
       // re-reading its tree. Same injection `unblock` makes; see
       // src/task/type-constraints.ts.
-      prompt: typeConstraintsSection(task) + crashContext + fullPrompt,
+      prompt: envNotice + typeConstraintsSection(task) + crashContext + fullPrompt,
       agent_id: task.agent_id,
       harness,
       model_id: modelId,
@@ -476,7 +495,7 @@ export async function autoResumeTask(
     }
 
     // Check if supervisor is already running
-    if (!mustRecreateForCredential && !mustRecreateForAgent && (await runner.isRunning(containerName))) {
+    if (!mustRecreateForCredential && !mustRecreateForAgent && !mustRecreateForEnv && (await runner.isRunning(containerName))) {
       logger.debug(`Auto-resume ${taskShortId}: supervisor already running, command written`);
     } else {
       await removeTaskRun(runner, storage, session, containerName);
@@ -489,6 +508,7 @@ export async function autoResumeTask(
         return false;
       }
     }
+    if (envNotice) await clearEnvironmentReplaced(storage, task.id);
 
     // Store container name and update interaction timestamp
     await storage.updateSessionContainerName(session.id, containerName, task.agent_id);

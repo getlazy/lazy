@@ -57,6 +57,7 @@ export function toStoredConversation(
         usage: m.usage,
       })),
     })),
+    ...(conversation.lineage ? { lineage: conversation.lineage } : {}),
   };
 }
 

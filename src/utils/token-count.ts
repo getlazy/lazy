@@ -28,6 +28,7 @@
  *              to produce a figure.
  */
 
+import { CLAUDE_DEFAULT_MODEL } from '../config/default-models';
 /** Which tokenizer produced a count. */
 // The proxy's module is a leaf (no imports of its own), so taking the flag from
 // there costs nothing and keeps one spelling.
@@ -45,7 +46,7 @@ export const DEFAULT_BPE_ENCODING: BpeEncoding = 'o200k_base';
 export const CHARS_PER_TOKEN_HEURISTIC = 4;
 
 /** Model used when the API tier is asked for a count without one. Counts are model-specific. */
-export const DEFAULT_COUNT_TOKENS_MODEL = 'claude-opus-5';
+export const DEFAULT_COUNT_TOKENS_MODEL = CLAUDE_DEFAULT_MODEL;
 
 export interface TokenCountResult {
   /** Token count. */
@@ -68,7 +69,7 @@ export interface CountTokensOptions {
   method?: TokenCountMethod;
   /** Vocabulary for the 'bpe' tier. Defaults to o200k_base. */
   encoding?: BpeEncoding;
-  /** Model for the 'api' tier. Defaults to claude-opus-5. */
+  /** Model for the 'api' tier. Defaults to the Claude default model. */
   model?: string;
   /** Base URL for the 'api' tier. Defaults to $ANTHROPIC_BASE_URL or the public API. */
   baseUrl?: string;

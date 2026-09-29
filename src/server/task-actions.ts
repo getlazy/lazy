@@ -71,6 +71,22 @@ export interface TaskLifecycleResult {
   warnings?: string[];
 }
 
+/** Per-launch options a lifecycle dialog can carry. */
+export interface TaskLaunchOptions {
+  /** "Let this turn through the usage pause": the per-task allowance, for this launch. */
+  pastUsagePause?: boolean;
+}
+
+/** The task page's usage-pause line, already worded by the daemon. */
+export interface TaskUsagePauseView {
+  /** Why the task's next turn would be paused (describeUsagePause), or null = it would start. */
+  reason: string | null;
+  /** False when the pause is unreadable saved readings, which no allowance lifts. */
+  liftable: boolean;
+  /** A pending "let its next turn through", or null. */
+  allowed: { setBy: string | null; setAt: number } | null;
+}
+
 export interface TaskActions {
   /**
    * Apply the edit through the daemon's one implementation, which enforces the
@@ -94,7 +110,7 @@ export interface TaskActions {
   // ./task-verbs.ts; the daemon still refuses anything illegal.
 
   /** Start a backlog task: worktree, branch, first agent turn. Returns once launched. */
-  startTask(taskId: string, onProgress?: ProgressEmitter): Promise<TaskLifecycleResult>;
+  startTask(taskId: string, onProgress?: ProgressEmitter, options?: TaskLaunchOptions): Promise<TaskLifecycleResult>;
   /** Halt a running task without auto-resume. Reason is required. */
   stopTask(taskId: string, reason: string, onProgress?: ProgressEmitter): Promise<TaskLifecycleResult>;
   /** Close (abandon) the task. Reason is required. */
@@ -102,7 +118,18 @@ export interface TaskActions {
   /** Reject the task's work and end its session. Reason is required. */
   rejectTask(taskId: string, reason: string, onProgress?: ProgressEmitter): Promise<TaskLifecycleResult>;
   /** Relaunch a blocked/interrupted task with no new feedback. Returns once launched. */
-  resumeTask(taskId: string, onProgress?: ProgressEmitter): Promise<TaskLifecycleResult>;
+  resumeTask(taskId: string, onProgress?: ProgressEmitter, options?: TaskLaunchOptions): Promise<TaskLifecycleResult>;
+
+  // The per-task usage-pause allowance ("let this task's next turn through"),
+  // set and cleared by the daemon's own rule (src/daemon/usage-pause.ts) as the
+  // human channel. The page never decides whether a task is paused.
+
+  /** Whether this task's next turn would be paused, and any pending allowance. */
+  usagePauseForTask(taskId: string): Promise<TaskUsagePauseView>;
+  /** Let this task's next turn through the usage pause (one launch). */
+  allowPastUsagePause(taskId: string): Promise<void>;
+  /** Drop a pending allowance for this task. */
+  clearUsagePauseAllowance(taskId: string): Promise<void>;
   /**
    * Reopen a terminal task to blocked (had a session) or backlog. A reason is
    * required for a `complete` task and recorded as a comment, exactly as

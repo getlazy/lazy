@@ -27,7 +27,8 @@
  * these prefixes is not counted either.
  */
 
-import type { Comment, Session, Turn } from '../storage';
+import type { Comment, Session, Storage, Turn } from '../storage';
+import { isPendingDelivery } from '../server/review-actions';
 import { actorRole } from '../actor-ref';
 import { buildNotesState } from './show-sections';
 
@@ -58,6 +59,35 @@ export function queuedHumanFeedbackCount(input: {
   pendingReviewComments: number;
 }): number {
   const queued = new Set(buildNotesState(input.session, input.turns, input.comments).queued_ids);
-  const notes = input.comments.filter((c) => queued.has(c.id) && isHumanFeedbackComment(c)).length;
-  return notes + input.pendingReviewComments;
+  return countQueuedHumanFeedback(input.comments.filter((c) => queued.has(c.id)), input.pendingReviewComments);
+}
+
+/**
+ * The counting step of the rule, for a caller that already resolved WHICH task
+ * comments are queued through `buildNotesState` (the task page does, to list
+ * them): the human-written ones, plus the queued web-review comments.
+ */
+export function countQueuedHumanFeedback(queuedTaskComments: readonly Comment[], pendingReviewComments: number): number {
+  return queuedTaskComments.filter(isHumanFeedbackComment).length + pendingReviewComments;
+}
+
+/**
+ * The count accept refuses on, read straight from the store — what the accept
+ * gate itself calls, and what every surface offering Accept (the task page's
+ * Current review, the review island's live poll) calls, so the "merge without
+ * delivering" box appears exactly when accept would refuse without it.
+ */
+export async function queuedHumanFeedbackForTask(storage: Storage, taskId: string): Promise<number> {
+  const session = await storage.getSessionByTaskId(taskId);
+  const [turns, comments, reviewComments] = await Promise.all([
+    session ? storage.getSessionTurns(session.id) : Promise.resolve([] as Turn[]),
+    storage.getTaskComments(taskId),
+    storage.getTaskReviewComments(taskId),
+  ]);
+  return queuedHumanFeedbackCount({
+    session,
+    turns,
+    comments,
+    pendingReviewComments: reviewComments.filter(isPendingDelivery).length,
+  });
 }

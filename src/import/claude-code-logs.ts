@@ -17,6 +17,7 @@ import { join, basename } from 'path';
 import { getHome } from '../utils/home';
 import { isLocalCommandScaffolding } from './local-command-messages';
 import type { TokenUsage } from '../types';
+import { LineageCollector, type SegmentLineage } from '../builder/identity';
 
 // --- Raw JSONL types ---
 
@@ -101,6 +102,8 @@ export interface ParsedConversation {
   messages: ConversationMessage[];
   subagents: SubagentConversation[];
   totalUsage: TokenUsage;
+  /** Builder-stitching evidence from the raw records (src/builder/identity.ts). */
+  lineage?: SegmentLineage;
 }
 
 // --- Discovery ---
@@ -359,6 +362,8 @@ export interface JsonlParseState {
     gitBranch?: string;
   };
   usage: TokenUsage;
+  /** Lineage evidence over EVERY record, not only the kept messages. */
+  lineage: LineageCollector;
 }
 
 /**
@@ -369,6 +374,7 @@ export function createParseState(): JsonlParseState {
     messages: [],
     metadata: {},
     usage: { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 },
+    lineage: new LineageCollector(),
   };
 }
 
@@ -385,6 +391,7 @@ export function parseJsonlLines(text: string, state: JsonlParseState): void {
   for (const line of lines) {
     try {
       const raw = JSON.parse(line) as RawLogEntry;
+      state.lineage.observe(raw);
 
       // Aggregate token usage from all assistant messages, even those we skip
       if (raw.type === 'assistant' && raw.message?.usage) {
@@ -445,7 +452,7 @@ export async function parseConversation(
 
   // Parse main conversation file
   const mainFile = join(projectDir, `${sessionId}.jsonl`);
-  const { messages: mainMessages, metadata, usage: mainUsage } = await parseJsonlFile(mainFile);
+  const { messages: mainMessages, metadata, usage: mainUsage, lineage } = await parseJsonlFile(mainFile);
 
   // Parse subagent conversations
   const subagents: SubagentConversation[] = [];
@@ -498,6 +505,7 @@ export async function parseConversation(
     messages: mainMessages,
     subagents,
     totalUsage,
+    lineage: lineage.finish(sessionId),
   };
 }
 

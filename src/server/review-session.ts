@@ -8,7 +8,7 @@
 
 import { layoutHtml } from './templates';
 import { escapeHtml } from './review-diff';
-import { renderMarkdown } from './markdown';
+import { renderMarkdown, type RenderMarkdownOptions } from './markdown';
 import { taskPath } from './task-urls';
 import { REVIEW_SESSION_FIRST_TURN_CLOSER } from './review-session-actions';
 import type { ReviewSession, ReviewSessionMessage, ReviewSessionStatus } from '../types';
@@ -62,31 +62,31 @@ function messageDeliveryHtml(_taskId: string, m: ReviewSessionMessage): string {
   return '';
 }
 
-function messageBodyHtml(m: ReviewSessionMessage): string {
+function messageBodyHtml(m: ReviewSessionMessage, markdown?: RenderMarkdownOptions): string {
   if (m.role === 'assistant' || m.role === 'system') {
-    return `<div class="rv-msg-body turn-content">${renderMarkdown(m.content)}</div>`;
+    return `<div class="rv-msg-body turn-content">${renderMarkdown(m.content, markdown)}</div>`;
   }
   // Human messages: plain pre-wrap (compose box text, not markdown authored by user).
   return `<div class="rv-msg-body">${escapeHtml(m.content)}</div>`;
 }
 
-function messageHtml(taskId: string, m: ReviewSessionMessage): string {
+function messageHtml(taskId: string, m: ReviewSessionMessage, markdown?: RenderMarkdownOptions): string {
   const roleClass = m.role === 'assistant' ? ' rv-msg-agent' : '';
   return (
     `<div class="rv-msg${roleClass}">` +
     `<div class="rv-msg-head">${escapeHtml(messageRoleLabel(m.role))}</div>` +
-    `${messageBodyHtml(m)}` +
+    `${messageBodyHtml(m, markdown)}` +
     `${messageDeliveryHtml(taskId, m)}` +
     `</div>`
   );
 }
 
-function transcriptHtml(taskId: string, messages: ReviewSessionMessage[]): string {
+function transcriptHtml(taskId: string, messages: ReviewSessionMessage[], markdown?: RenderMarkdownOptions): string {
   if (messages.length === 0) {
     return '<p class="rs-empty">No messages in this archived session.</p>';
   }
   const sorted = [...messages].sort((a, b) => a.created_at - b.created_at);
-  return `<div class="rs-transcript" id="rs-transcript">${sorted.map((m) => messageHtml(taskId, m)).join('')}</div>`;
+  return `<div class="rs-transcript" id="rs-transcript">${sorted.map((m) => messageHtml(taskId, m, markdown)).join('')}</div>`;
 }
 
 function statusLineHtml(status: ReviewSessionStatus): string {
@@ -101,6 +101,8 @@ function statusLineHtml(status: ReviewSessionStatus): string {
 export function reviewSessionPollJson(
   session: ReviewSession | null,
   messages: ReviewSessionMessage[],
+  /** Task-code and id links for the builder's prose. */
+  markdown?: RenderMarkdownOptions,
 ) {
   const sorted = [...messages].sort((a, b) => a.created_at - b.created_at);
   return {
@@ -111,7 +113,7 @@ export function reviewSessionPollJson(
       role: m.role,
       content: m.content,
       content_html: m.role === 'assistant' || m.role === 'system'
-        ? renderMarkdown(m.content)
+        ? renderMarkdown(m.content, markdown)
         : escapeHtml(m.content),
       created_at: m.created_at,
       delivery: m.delivery,
@@ -125,6 +127,7 @@ export function reviewSessionPageHtml(
   session: ReviewSession | null,
   messages: ReviewSessionMessage[],
   notice?: { text: string; error?: boolean },
+  markdown?: RenderMarkdownOptions,
 ): string {
   const label = task.code ?? task.id.substring(0, 8);
   const noticeHtml = notice
@@ -139,7 +142,7 @@ export function reviewSessionPageHtml(
     ${noticeHtml}
     <div id="rs-root">
       ${statusLineHtml(session?.status ?? 'idle')}
-      ${transcriptHtml(task.id, messages)}
+      ${transcriptHtml(task.id, messages, markdown)}
     </div>
   `;
 

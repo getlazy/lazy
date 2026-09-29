@@ -49,6 +49,8 @@ import type {
   AcceptGateWarning,
   MarkReadyOptions,
   OpenReview,
+  ReviewConversationItem,
+  ReviewStatus,
 } from './driver';
 import { truncateMRTitle } from './driver';
 import type { Task } from '../types';
@@ -84,6 +86,10 @@ async function runGh(args: string[], cwd?: string): Promise<GhResult> {
   const spawnOpts: Record<string, unknown> = {
     stdout: 'pipe',
     stderr: 'pipe',
+    // Explicit env: without it Bun resolves the binary on the PATH the process
+    // STARTED with, so this probe and the doctor's managed check (which passes
+    // env) could disagree about whether the CLI is installed.
+    env: process.env,
   };
   if (cwd) spawnOpts.cwd = cwd;
 
@@ -610,11 +616,12 @@ export class GitHubDriver implements RepositoryDriver {
     const mergeTarget = prNumber ?? sourceBranch;
 
     // Step 3: Squash merge via gh pr merge
-    // Fetch the PR body and append Lazy co-author trailer
-    const { LAZY_COAUTHOR_TRAILER } = await import('../constants');
+    // Fetch the PR body and append Lazy co-author trailer (unless opted out)
+    const { withLazyCoauthorTrailer } = await import('../constants');
+    const trailer = opts.coauthorTrailer ?? true;
 
     // Fetch current PR body to preserve it in the squash commit
-    let commitBody = LAZY_COAUTHOR_TRAILER;
+    let commitBody = withLazyCoauthorTrailer('', trailer);
     if (prNumber) {
       const viewResult = await this.gh(['pr', 'view', prNumber, '--json', 'body'], root);
       if (viewResult.exitCode === 0) {
@@ -622,7 +629,7 @@ export class GitHubDriver implements RepositoryDriver {
           const prData = JSON.parse(viewResult.stdout);
           const originalBody = prData.body || '';
           // Append co-author trailer to the existing PR body
-          commitBody = originalBody ? `${originalBody}\n\n${LAZY_COAUTHOR_TRAILER}` : LAZY_COAUTHOR_TRAILER;
+          commitBody = withLazyCoauthorTrailer(originalBody, trailer);
         } catch {
           // If parsing fails, fall back to just the trailer
           logger.debug('Failed to parse PR body, using co-author trailer only');
@@ -630,8 +637,10 @@ export class GitHubDriver implements RepositoryDriver {
       }
     }
 
+    // An empty body (opted out, nothing to preserve) leaves GitHub's default
+    // squash body alone instead of replacing it with nothing.
     const mergeResult = await this.gh(
-      ['pr', 'merge', String(mergeTarget), '--squash', '--body', commitBody],
+      ['pr', 'merge', String(mergeTarget), '--squash', ...(commitBody ? ['--body', commitBody] : [])],
       root,
     );
     if (mergeResult.exitCode !== 0) {
@@ -1112,6 +1121,137 @@ export class GitHubDriver implements RepositoryDriver {
       logger.debug(`getPRState: failed to parse response for PR #${prNumber}`);
       return null;
     }
+  }
+
+  async readReviewConversation(task: Task): Promise<ReviewConversationItem[]> {
+    const prNumber = this.requirePrNumber(task);
+    // Same prompt-injection gate as the import path: a public repo's comments
+    // are anyone's text, and this read lands them in an agent's context.
+    if (!(await this.readRepoPrivate())
+      && !this.config.remote.github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection) {
+      throw new Error(
+        'This repository is public, so its PR comments are not shown to agents ' +
+        '(prompt injection risk). A human can opt in with github_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection = true in [remote].',
+      );
+    }
+    const items: ReviewConversationItem[] = [];
+    const login = (o: Record<string, unknown>) => ((o.user as Record<string, unknown> | undefined)?.login as string) ?? 'unknown';
+    for (const c of await this.readApiList(`repos/{owner}/{repo}/issues/${prNumber}/comments`)) {
+      items.push({ kind: 'comment', id: String(c.id), author: login(c), createdAt: (c.created_at as string) ?? '', body: (c.body as string) ?? '' });
+    }
+    const resolved = await this.readThreadResolution(prNumber);
+    for (const c of await this.readApiList(`repos/{owner}/{repo}/pulls/${prNumber}/comments`)) {
+      items.push({
+        kind: 'inline', id: String(c.id), author: login(c), createdAt: (c.created_at as string) ?? '', body: (c.body as string) ?? '',
+        path: c.path as string | undefined,
+        line: (c.line as number | undefined) ?? (c.original_line as number | undefined),
+        resolved: resolved.get(String(c.id)),
+      });
+    }
+    for (const r of await this.readApiList(`repos/{owner}/{repo}/pulls/${prNumber}/reviews`)) {
+      // A PENDING review is the viewer's own unsubmitted draft.
+      if (r.state === 'PENDING') continue;
+      items.push({ kind: 'review', id: String(r.id), author: login(r), createdAt: (r.submitted_at as string) ?? '', body: (r.body as string) ?? '', state: r.state as string });
+    }
+    items.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    return items;
+  }
+
+  async readReviewStatus(task: Task): Promise<ReviewStatus> {
+    const prNumber = this.requirePrNumber(task);
+    const result = await this.gh(['pr', 'view', prNumber, '--json', 'state,reviewDecision,mergeStateStatus,reviews,statusCheckRollup']);
+    if (result.exitCode !== 0) throw new Error(`gh pr view #${prNumber} failed: ${result.stderr || `exit ${result.exitCode}`}`);
+    let data: Record<string, unknown>;
+    try {
+      data = JSON.parse(result.stdout);
+    } catch (err) {
+      throw new Error(`gh pr view #${prNumber} returned unparseable JSON: ${err instanceof Error ? err.message : err}`);
+    }
+    const state = data.state === 'OPEN' || data.state === 'MERGED' || data.state === 'CLOSED' ? data.state : null;
+    // Latest verdict per reviewer — GitHub lists every review ever submitted.
+    const latest = new Map<string, { author: string; state: string; submittedAt: string }>();
+    for (const r of (data.reviews as Array<Record<string, unknown>> | undefined) ?? []) {
+      const author = ((r.author as Record<string, unknown> | undefined)?.login as string) ?? 'unknown';
+      if (r.state === 'PENDING') continue;
+      latest.set(author, { author, state: String(r.state), submittedAt: (r.submittedAt as string) ?? '' });
+    }
+    const checks = ((data.statusCheckRollup as Array<Record<string, unknown>> | undefined) ?? []).map((c) =>
+      c.__typename === 'StatusContext'
+        ? (c.state === 'PENDING' || c.state === 'EXPECTED'
+          ? { name: String(c.context ?? ''), status: 'PENDING', conclusion: null, url: c.targetUrl as string | undefined }
+          : { name: String(c.context ?? ''), status: 'COMPLETED', conclusion: (c.state as string) ?? null, url: c.targetUrl as string | undefined })
+        : { name: String(c.name ?? ''), status: String(c.status ?? ''), conclusion: (c.conclusion as string) || null, url: c.detailsUrl as string | undefined });
+    return {
+      state,
+      decision: (data.reviewDecision as string) || null,
+      reviews: [...latest.values()],
+      mergeable: (data.mergeStateStatus as string) || null,
+      checks,
+    };
+  }
+
+  /**
+   * Visibility for the display reads. Unlike {@link isRepoPrivate} (which
+   * treats a failed lookup as public so the import quietly skips), a failure
+   * here THROWS with the forge's error: calling it "public" would point the
+   * agent at the prompt-injection opt-in when the real problem is auth or
+   * reachability.
+   */
+  private async readRepoPrivate(): Promise<boolean> {
+    const result = await this.gh(['repo', 'view', '--json', 'isPrivate']);
+    if (result.exitCode !== 0) throw new Error(`could not read repository visibility: ${result.stderr || `exit ${result.exitCode}`}`);
+    try {
+      return JSON.parse(result.stdout).isPrivate === true;
+    } catch (err) {
+      throw new Error(`could not read repository visibility: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  private requirePrNumber(task: Task): string {
+    const prNumber = this.prNumber(task);
+    if (!prNumber) throw new Error('This task has no pull request recorded.');
+    return prNumber;
+  }
+
+  /** A paginated REST list that THROWS on failure (the display reads never pass off a failure as "no comments"). */
+  private async readApiList(endpoint: string): Promise<Array<Record<string, unknown>>> {
+    const result = await this.ghApi([endpoint, '--paginate']);
+    if (result.exitCode !== 0) throw new Error(`gh api ${endpoint} failed: ${result.stderr || `exit ${result.exitCode}`}`);
+    if (!result.stdout.trim()) return [];
+    return parsePaginatedApiJson(result.stdout);
+  }
+
+  /**
+   * Inline comment id → whether its review thread is resolved. REST does not
+   * expose it; GraphQL does. Resolution is extra detail "where the forge
+   * exposes it", so a failure here leaves `resolved` unset (with a warning)
+   * rather than failing the whole comments read.
+   */
+  private async readThreadResolution(prNumber: string): Promise<Map<string, boolean>> {
+    const map = new Map<string, boolean>();
+    const ref = await this.getRemoteRef();
+    if (!ref) {
+      logger.warn(`readThreadResolution: remote ${this.remoteName} is not a GitHub owner/repo URL; resolution state omitted`);
+      return map;
+    }
+    const [owner, name] = ref.ownerRepo.split('/');
+    const query = 'query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){reviewThreads(first:100){nodes{isResolved comments(first:100){nodes{databaseId}}}}}}}';
+    const result = await this.ghApi(['graphql', '-f', `query=${query}`, '-f', `owner=${owner}`, '-f', `name=${name}`, '-F', `pr=${prNumber}`]);
+    if (result.exitCode !== 0) {
+      logger.warn(`readThreadResolution: gh api graphql failed for PR #${prNumber}; resolution state omitted: ${result.stderr || `exit ${result.exitCode}`}`);
+      return map;
+    }
+    let threads: Array<{ isResolved?: boolean; comments?: { nodes?: Array<{ databaseId?: number }> } }>;
+    try {
+      threads = JSON.parse(result.stdout)?.data?.repository?.pullRequest?.reviewThreads?.nodes ?? [];
+    } catch (err) {
+      logger.warn(`readThreadResolution: unparseable GraphQL answer for PR #${prNumber}; resolution state omitted: ${err instanceof Error ? err.message : err}`);
+      return map;
+    }
+    for (const t of threads) {
+      for (const c of t?.comments?.nodes ?? []) map.set(String(c.databaseId), t.isResolved === true);
+    }
+    return map;
   }
 
   async checkHealth(): Promise<HealthCheck[]> {

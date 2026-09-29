@@ -100,6 +100,14 @@ export interface PresentedRegions {
    * claim, so there is no per-region content to hash.
    */
   hashes: Map<string, string>;
+  /**
+   * True when an authored walkthrough is on record but the branch has moved
+   * past the head it was written at, so it is NOT what these rows present.
+   * Surfaces that render the report's own presentation (the web Changes tab)
+   * read this rather than parsing the notes, and never show that walkthrough
+   * as the page's headline.
+   */
+  staleWalkthrough?: boolean;
 }
 
 /** The region row one group becomes. Its `files` are the `kind: 'file'` claims. */
@@ -418,7 +426,7 @@ async function resolveTaskHeadSha(
   taskRefInput: string,
 ): Promise<string | null> {
   try {
-    const ctx = await resolveTaskDiffContext(storage, projectRoot, taskRefInput, { fullBranch: true });
+    const ctx = await resolveTaskDiffContext(storage, projectRoot, taskRefInput);
     return (await resolveSha(ctx.worktreePath, 'HEAD')) ?? null;
   } catch (err) {
     logger.debug(
@@ -560,11 +568,12 @@ export async function loadPresentedRegions(
     // never asked for a walkthrough at all, so a refusal recorded on one
     // explains nothing its reader needs.
     if (hub) {
-      return hubRegions(storage, projectRoot, taskRefInput, task.id, children, {
+      const derived = await hubRegions(storage, projectRoot, taskRefInput, task.id, children, {
         allowStale: opts.lenientHubCarve,
         allowMissing: opts.lenientHubCarve,
         ...(staleNote ? { leadNotes: [staleNote] } : {}),
       });
+      return staleNote ? { ...derived, staleWalkthrough: true } : derived;
     }
     return {
       cover: emptyCover(task.id, await latestCapRefusal(storage, task.id)),
@@ -573,14 +582,9 @@ export async function loadPresentedRegions(
     };
   }
 
-  // `fullBranch` for the same reason the diff's `--region` implies it (§6.3):
-  // a region is a navigational map of the WHOLE branch — on a release hub the
-  // default diff excludes accepted children's files, and every presented
-  // group is made of exactly files some child brought. Residual completeness
-  // is a partition invariant, not a per-surface preference.
-  const ctx = await resolveTaskDiffContext(storage, projectRoot, taskRefInput, {
-    fullBranch: true,
-  });
+  // A region is a navigational map of the WHOLE branch, which is what the
+  // task diff context always names.
+  const ctx = await resolveTaskDiffContext(storage, projectRoot, taskRefInput);
   const headSha = (await resolveSha(ctx.worktreePath, 'HEAD')) ?? '';
   // Resolved to a sha rather than passed through as typed: `listReviewPaths`
   // and `blobPairs` both interpolate the ref into a three-dot range, and a

@@ -61,10 +61,11 @@ export function wrongReviewBaseRefusal(task: Task, base: string, targetBranch: s
  * Normally the accept's own merge target. But a ROOT task with no named
  * target (an unresolved '' or a detached `HEAD`) had its PR opened against the
  * REMOTE'S DEFAULT branch — the drivers resolve it that way, and so does
- * remote-sync — while the accept's merge target falls back to the literal
- * `main`. Comparing against that literal refused, as a wrong base, every such
- * PR in a repo whose default is `master`. Resolved lazily (git/operations is
- * mocked wholesale by several suites), and only in that case.
+ * remote-sync, and accept's own merge target now resolves the same way. This
+ * re-resolves it anyway so a caller passing a stale literal can never refuse,
+ * as a wrong base, such a PR in a repo whose default is `master`. Resolved
+ * lazily (git/operations is mocked wholesale by several suites), and only in
+ * that case.
  */
 export async function reviewComparisonTarget(
   task: Task,

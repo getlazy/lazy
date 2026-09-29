@@ -85,10 +85,11 @@
  * can never name a per-launch path at all.
  */
 
+import { applyClaudeFirstRunDefaults, type ClaudeFirstRunOptions } from '../agent/claude-first-run';
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { createHash } from 'crypto';
-import { getHome } from '../utils/home';
+import { builderStateRoot } from './state-root';
 import { projectSlug } from '../daemon/paths';
 
 /**
@@ -102,7 +103,8 @@ import { projectSlug } from '../daemon/paths';
  */
 /**
  * Base directory for every project's per-member builder homes:
- * `~/.lazy/builder-homes/` on the machine running the daemon.
+ * `<builder state root>/builder-homes/` (`~/.lazy/builder-homes/` by default; on the
+ * host-mounted disk under Teams — src/builder/state-root.ts).
  *
  * `LAZY_BUILDER_HOMES_BASE_DIR` overrides it — the same test-isolation seam
  * `LAZY_SCRATCH_BASE_DIR` gives the builder scratch dir (src/builder/scratch.ts).
@@ -110,7 +112,7 @@ import { projectSlug } from '../daemon/paths';
 function getBuilderHomesBaseDir(): string {
   const override = process.env.LAZY_BUILDER_HOMES_BASE_DIR;
   if (override) return override;
-  return join(getHome(), '.lazy', 'builder-homes');
+  return join(builderStateRoot(), 'builder-homes');
 }
 
 /**
@@ -267,11 +269,18 @@ export async function writeBuilderSessionClaudeConfig(opts: {
   mcpArgs: string[];
   /** Command Claude Code uses to spawn the lazy MCP server (default lazy-agent). */
   mcpCommand?: string;
+  /**
+   * Fill Claude Code's missing first-run answers (src/agent/claude-first-run.ts)
+   * before merging. Set on the detached launch, whose first seed is `{}` and
+   * otherwise opens the theme picker. Never identity: only onboarding/trust keys.
+   */
+  firstRun?: ClaudeFirstRunOptions;
   onWarn: (message: string) => void;
 }): Promise<string> {
-  const base = await resolveBuilderClaudeConfigBase(
+  const resolved = await resolveBuilderClaudeConfigBase(
     opts.persistedPath, opts.hostConfigPath, opts.onWarn,
   );
+  const base = opts.firstRun ? applyClaudeFirstRunDefaults(resolved, opts.firstRun) : resolved;
   await writeFile(
     opts.sessionPath,
     JSON.stringify(
@@ -367,6 +376,15 @@ async function readJsonObject(
  * launch bind-mounts each file in it individually, so a container sees only
  * its own. Removed when the launch's resources are released (stop, end, a
  * failed launch).
+ *
+ * Modes are set explicitly, never left to the daemon's umask
+ * (setBuilderLaunchModes, src/runner/docker-runner.ts): the dir is 0700 (the
+ * container engine resolves bind sources, so nobody else needs to traverse
+ * it), its files 0644 and the MCP wrapper 0755 — readable by a container user
+ * whose uid is not the daemon's, writable by nobody else. The two files the
+ * container must WRITE (its `~/.claude.json`, its credential store) and the
+ * member's `.claude` tree are taken over inside the container by the detached
+ * builder's entry (`sudo chown`), never widened on the host.
  */
 export function builderSessionLaunchDir(homeDirAbs: string, builderId: string): string {
   return join(homeDirAbs, 'launches', builderId);

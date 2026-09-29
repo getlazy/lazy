@@ -105,6 +105,12 @@ export interface ProtectionContext {
   gateDefaultBranch: boolean;
   /** Repo default branch, or null when protection is off or it is unresolved. */
   defaultBranch: string | null;
+  /**
+   * The remote's default branch whenever protection is enabled (null when off
+   * or unresolved) — what a root task with no named target merges into, so the
+   * status line gates the same branch accept does.
+   */
+  remoteDefaultBranch: string | null;
   /** taskId → the identifier as written in [protection].protected_tasks. */
   protectedTaskIds: Map<string, string>;
 }
@@ -119,6 +125,7 @@ const INERT_CONTEXT: ProtectionContext = {
   protectedBranches: [],
   gateDefaultBranch: false,
   defaultBranch: null,
+  remoteDefaultBranch: null,
   protectedTaskIds: new Map(),
 };
 
@@ -143,8 +150,9 @@ export function contextIsInert(ctx: ProtectionContext): boolean {
 /**
  * Resolve the project-wide protection facts.
  *
- * The default-branch lookup runs ONLY when protection is enabled and gates the
- * default branch — a project that never turned protection on pays nothing, and
+ * The default-branch lookup runs ONLY when protection is enabled — it gates the default
+ * branch, and names where an untargeted root task merges. A project that never
+ * turned protection on pays nothing, and
  * never sees `getRemoteDefaultBranch`'s "could not resolve" warning because of
  * a read-only status line.
  *
@@ -172,10 +180,10 @@ export async function loadProtectionContext(
     if (match.task) protectedTaskIds.set(match.task.id, listedAs);
   }
 
-  let defaultBranch: string | null = null;
-  if (p.enabled && p.gate_default_branch) {
+  let remoteDefaultBranch: string | null = null;
+  if (p.enabled) {
     try {
-      defaultBranch = await getRemoteDefaultBranch(projectRoot, config.remote.git_remote);
+      remoteDefaultBranch = await getRemoteDefaultBranch(projectRoot, config.remote.git_remote);
     } catch (err) {
       // Observational surface: a repo we cannot ask about the default branch
       // must not fail a `show`/`list`. The explicit lists still apply.
@@ -190,7 +198,8 @@ export async function loadProtectionContext(
     enabled: p.enabled,
     protectedBranches: p.protected_branches,
     gateDefaultBranch: p.gate_default_branch,
-    defaultBranch,
+    defaultBranch: p.gate_default_branch ? remoteDefaultBranch : null,
+    remoteDefaultBranch,
     protectedTaskIds,
   };
 }
@@ -198,12 +207,15 @@ export async function loadProtectionContext(
 /**
  * Resolve the branch a task's work merges INTO, mirroring accept's resolution
  * (src/daemon/task-lifecycle.ts): a child merges into its parent's `lazy/…`
- * branch, a top-level task into its stored target branch, falling back to
- * `main` exactly as accept does.
+ * branch, a top-level task into its stored target branch. A root task with no
+ * named target ('' or a detached `HEAD`) merges into the remote's default
+ * branch exactly as accept does — `remoteDefaultBranch`, or null (unknown) when
+ * it was not resolved.
  */
 export async function resolveTaskTargetBranch(
   storage: Storage,
   task: Task,
+  remoteDefaultBranch: string | null = null,
 ): Promise<string | null> {
   const parentId = parentTaskIdOf(task);
   if (parentId) {
@@ -217,7 +229,9 @@ export async function resolveTaskTargetBranch(
       return null;
     }
   }
-  return targetBranchOf(task) ?? 'main';
+  const named = targetBranchOf(task);
+  if (named && named !== 'HEAD') return named;
+  return remoteDefaultBranch;
 }
 
 /**
@@ -241,7 +255,7 @@ export async function protectionStatusForTask(
   const targetBranch =
     opts.targetBranch !== undefined
       ? opts.targetBranch
-      : await resolveTaskTargetBranch(storage, task);
+      : await resolveTaskTargetBranch(storage, task, ctx.remoteDefaultBranch);
 
   let branchGate: TaskProtectionStatus['branchGate'] = null;
   if (targetBranch) {

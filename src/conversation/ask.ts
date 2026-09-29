@@ -36,6 +36,7 @@
 
 import { chunkParts, runAskEngine, TRANSCRIPT_CHARS_PER_CALL as ENGINE_BUDGET, type AskChunk } from '../oneshot/ask-engine';
 import type { StoredConversation, StoredMessage } from '../storage/types';
+import { resolveBuilderTranscript, type BuilderTranscriptStore } from '../builder/identity-transcript';
 import type { TokenUsage } from '../types';
 
 import singleTemplate from '../prompts/conversation-ask-single.md' with { type: 'text' };
@@ -159,32 +160,20 @@ export async function askConversation(
 }
 
 /**
- * Resolve a conversation by exact session ID or unique prefix.
+ * Resolve a Builder (docs/design/builder-identity.md) by its id, by any of its
+ * segment session ids, or by a unique prefix of either, to its JOINED
+ * transcript — so a compaction or resume never splits what the reader sees.
+ * The returned conversation's `sessionId` is the Builder id.
  *
- * Same rule as `lazy show` (src/cli/commands/show.ts): an exact match wins, a
- * unique prefix is accepted, and an ambiguous prefix is an ERROR rather than a
- * silent pick of the first hit. Shared so the CLI and the MCP tool cannot drift
- * into resolving the same string differently.
+ * An exact match wins, a unique prefix is accepted, and an ambiguous prefix is
+ * an ERROR rather than a silent pick. Shared so the CLI, the MCP tools and the
+ * promote path cannot drift into resolving the same string differently.
  */
 export async function resolveStoredConversation(
-  storage: { listConversations(): Promise<StoredConversation[]>; loadConversation(id: string): Promise<StoredConversation | null> },
+  storage: BuilderTranscriptStore,
   idOrPrefix: string,
-): Promise<{ conversation: StoredConversation } | { ambiguous: StoredConversation[] } | null> {
-  const conversations = await storage.listConversations();
-  const exact = conversations.find(c => c.sessionId === idOrPrefix);
-  const prefixMatches = conversations.filter(c => c.sessionId.startsWith(idOrPrefix));
-  const match = exact ?? (prefixMatches.length === 1 ? prefixMatches[0] : null);
-
-  if (!match) {
-    if (prefixMatches.length > 1) return { ambiguous: prefixMatches };
-    return null;
-  }
-
-  // listConversations may hand back a lighter shape than the store holds;
-  // load the authoritative copy so the transcript is never half-rendered.
-  const full = await storage.loadConversation(match.sessionId);
-  if (!full) {
-    throw new Error(`Conversation ${match.sessionId} is listed but could not be loaded from the store.`);
-  }
-  return { conversation: full };
+): Promise<{ conversation: StoredConversation } | { ambiguous: Array<{ sessionId: string; summary: string }> } | null> {
+  const resolved = await resolveBuilderTranscript(storage, idOrPrefix);
+  if (!resolved || 'ambiguous' in resolved) return resolved;
+  return { conversation: resolved.conversation };
 }

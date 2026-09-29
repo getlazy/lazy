@@ -26,6 +26,7 @@
 
 import { requireActorIdentity } from '../identity-preflight';
 import { usagePauseRefusalLines } from '../usage-pause-preflight';
+import { turnCredentialRefusal } from '../turn-credential-preflight';
 import { admitOneshotCommand, type OneshotCommand } from '../../oneshot';
 import { requireStorage, parseFlags, resolveTaskOrExit } from '../helpers';
 import { shortId, displayId } from '../../task/identity';
@@ -253,6 +254,7 @@ export async function commandAsk(args: string[]): Promise<void> {
     { name: 'message', aliases: ['m'], takesValue: true },
     { name: 'json', takesValue: false },
     { name: 'no-wait', takesValue: false },
+    { name: 'past-usage-pause', takesValue: false },
   ], 'ask');
 
   const jsonOutput = parsed.flags.get('json') === true;
@@ -305,8 +307,11 @@ export async function commandAsk(args: string[]): Promise<void> {
     // credential is refused by the daemon ([usage_pause]). The live route spends
     // the task's credential; the record route runs a one-shot on the builder
     // role's, so that is the one peeked at there.
-    const paused = await usagePauseRefusalLines(task.id, 'ask', undefined, { beside: route === 'record' });
+    const paused = await usagePauseRefusalLines(task.id, 'ask', undefined, { beside: route === 'record', pastUsagePause: parsed.flags.get('past-usage-pause') === true });
     if (paused) fail(jsonOutput, paused[0]!, paused.slice(1));
+    // Likewise a missing model credential for the profile the answer runs on.
+    const noCredential = await turnCredentialRefusal(task.id, { beside: route === 'record' });
+    if (noCredential) fail(jsonOutput, noCredential);
 
     // --- Question: --message > piped stdin > interactive prompt (TTY only) ---
     const prompted = await obtainQuestion({
@@ -358,7 +363,7 @@ export async function commandAsk(args: string[]): Promise<void> {
     // here", not "do not ask".
     if (noWait) {
       try {
-        const started = await queryAskTask({ taskId: task.id, message: question, ...(await usagePauseOverrideEligibility()), }, display);
+        const started = await queryAskTask({ taskId: task.id, message: question, ...(await usagePauseOverrideEligibility()), ...(parsed.flags.get('past-usage-pause') === true ? { usagePausePastOnce: true as const } : {}) }, display);
         display?.close();
         if (recoveryPath) removeRecoveryFile(recoveryPath);
         if (jsonOutput) {
@@ -398,7 +403,7 @@ export async function commandAsk(args: string[]): Promise<void> {
 
     let result;
     try {
-      result = await queryAskTaskAwaited({ taskId: task.id, message: question, ...(await usagePauseOverrideEligibility()), }, display);
+      result = await queryAskTaskAwaited({ taskId: task.id, message: question, ...(await usagePauseOverrideEligibility()), ...(parsed.flags.get('past-usage-pause') === true ? { usagePausePastOnce: true as const } : {}) }, display);
       display?.close();
     } catch (err) {
       const message = unwrapRpcMessage(err);
@@ -451,7 +456,7 @@ export async function commandAsk(args: string[]): Promise<void> {
 }
 
 export function askUsage(): void {
-  console.log(`Usage: lazy ask <id> [-m|--message "..."] [--no-wait] [--json]
+  console.log(`Usage: lazy ask <id> [-m|--message "..."] [--no-wait] [--json] [--past-usage-pause]
 
 Ask a question and print the answer. Read-only either way — an ask never writes.
 
@@ -494,6 +499,9 @@ Options:
                         Conversation: {type, conversationId, sessionId, answer,
                                        chunks, relevantChunks, usage, warnings}
                         Errors are printed as {"error": "..."} with exit 1.
+  --past-usage-pause    Let this task's ask start even though its credential is past the
+                        usage-pause threshold (used up by that one turn). Asking a
+                        finished task or a conversation is not a turn of the task.
 
 Input priority: --message flag > piped stdin > $EDITOR (TTY)
 

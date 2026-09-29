@@ -17,6 +17,9 @@ import {
   expectOutputExcludes,
 } from '../helpers/assertions';
 import { writeConversationFile } from '../helpers/storage';
+import { mkdir, copyFile } from 'fs/promises';
+import { join } from 'path';
+import { encodeProjectPath } from '../../src/import/claude-code-logs';
 
 function seedConversation(
   sessionId: string,
@@ -77,7 +80,7 @@ describe('lazy conversations', () => {
   test('empty store points at builder and import', async () => {
     const result = await ctx.lazy(['conversations']);
     expectSuccess(result);
-    expectOutput(result, 'No captured builder conversations yet');
+    expectOutput(result, 'No captured Builders yet');
     expectOutput(result, 'lazy builder');
     expectOutput(result, 'lazy import-conversation');
   });
@@ -104,7 +107,7 @@ describe('lazy conversations', () => {
 
     const list = await ctx.lazy(['conversations', 'list']);
     expectSuccess(list);
-    expectOutput(list, '2 captured conversation(s)');
+    expectOutput(list, '2 Builder(s)');
     // INVARIANT: list is sorted most-recent-first (storage contract).
     if (list.stdout.indexOf('abcdef01') >= list.stdout.indexOf('11111111')) {
       throw new Error(`Expected newer conversation before older in list output:\n${list.stdout}`);
@@ -143,7 +146,7 @@ describe('lazy conversations', () => {
   test('show of an unknown id fails with a pointer to list', async () => {
     const result = await ctx.lazy(['conversations', 'show', 'ffffffff']);
     expectFailure(result);
-    expectError(result, 'No conversation matches');
+    expectError(result, 'No Builder matches');
   });
 
   test('a non-hex session id is rejected at the boundary', async () => {
@@ -268,4 +271,48 @@ describe('lazy conversations', () => {
     expectError(result, 'Invalid search pattern');
     expectError(result, 'took too long');
   }, 15_000);
+});
+
+/**
+ * Builders across a compaction, through the REAL capture path: session JSONL on
+ * disk (test/fixtures/builder-segments, shaped like what Claude Code writes) →
+ * `lazy import-conversation` → the store → `lazy conversations`.
+ */
+describe('lazy conversations lists Builders, not session files', () => {
+  let ctx: TestContext;
+  const A = 'aaaaaaaa-0000-4000-8000-000000000001'; // start
+  const B = 'bbbbbbbb-0000-4000-8000-000000000002'; // compaction of A
+  const D = 'dddddddd-0000-4000-8000-000000000004'; // /clear
+
+  beforeEach(async () => {
+    ctx = await setupTestLazy({ withDaemon: true });
+    const dir = join(ctx.root, '.lazy', 'builder-projects', 'builderA', encodeProjectPath(ctx.root));
+    await mkdir(dir, { recursive: true });
+    const fixtures = join(import.meta.dir, '..', 'fixtures', 'builder-segments');
+    for (const id of [A, B, D]) await copyFile(join(fixtures, `${id}.jsonl`), join(dir, `${id}.jsonl`));
+    expectSuccess(await ctx.lazy(['import-conversation', '--yes']));
+  });
+
+  afterEach(async () => {
+    await ctx.cleanup();
+  });
+
+  // INVARIANT: a compaction continues the Builder — three captured session
+  // files, two of them one conversation, list as TWO Builders.
+  test('a compacted conversation lists once, a /clear lists separately', async () => {
+    const result = await ctx.lazy(['conversations']);
+    expectSuccess(result);
+    expectOutput(result, '2 Builder(s)');
+    expectOutput(result, 'aaaaaaaa');
+    expectOutput(result, 'dddddddd');
+    expectOutputExcludes(result, 'bbbbbbbb');
+  });
+
+  test('a segment id typed by hand opens its whole Builder', async () => {
+    const result = await ctx.lazy(['conversations', 'show', 'bbbbbbbb']);
+    expectSuccess(result);
+    expectOutput(result, `Builder aaaaaaaa`);
+    expectOutput(result, 'Plan the builder identity work');
+    expectOutput(result, 'Continuing with the stitching.');
+  });
 });

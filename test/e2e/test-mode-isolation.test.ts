@@ -80,7 +80,7 @@ describe('test-mode isolation for daemon-backed suites', () => {
 
     const created = await ctx.lazy(['create', '--goal', 'daemon-flag-task']);
     // Under the leak this exits 1 with the message below, from requireStorage().
-    expect(created.stderr).not.toContain('Daemon is not running');
+    expect(created.stderr).not.toContain('No daemon address is recorded');
     expectSuccess(created);
 
     const list = await ctx.lazy(['list']);

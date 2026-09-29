@@ -43,7 +43,7 @@ import { isTurnInFlight } from './in-flight-turn';
 import { isTaskBusyRefusal } from './rpc-error';
 import { supervisorStillOwnsTurn } from './supervisor-handback';
 import { systemTurnBlock } from './turn-credentials';
-import { usagePauseHold } from './usage-pause';
+import { takeTaskAllowanceAtLaunch, usagePauseHold } from './usage-pause';
 import {
   FINAL_REVIEW_CAP,
   getFinalReviewRound,
@@ -689,7 +689,7 @@ async function maybeAutoReview(
   // worktree reappears) or is a §8 design park with its own record — the gates
   // below can stand for hours, so a task skipped by one of them would otherwise
   // sit with a standing final, no review, and nothing holding accept.
-  const systemBlock = await systemTurnBlock(lazyRoot);
+  const systemBlock = await systemTurnBlock(lazyRoot, task);
   if (systemBlock) {
     logger.warn(
       `Auto-review ${shortId(task.id)}: skipped — ${systemBlock}`,
@@ -746,6 +746,10 @@ async function maybeAutoReview(
     return;
   }
 
+  // [usage_pause]: the launch commits here, after every gate that could still
+  // skip it — so a pending "let its next turn through" is used now, not burned
+  // by a pass that then skipped (src/daemon/usage-pause.ts).
+  await takeTaskAllowanceAtLaunch(lazyRoot, task, 'auto-review');
   try {
     await launchReviewTask(lazyRoot, {
       taskId: task.id,

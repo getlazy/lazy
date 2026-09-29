@@ -97,7 +97,7 @@ describe('lazy import-conversation (unified surface)', () => {
     // Now in the store.
     const list = await ctx.lazy(['builder', 'list']);
     expectSuccess(list);
-    expectOutput(list, '2 captured conversation(s)');
+    expectOutput(list, '2 Builder(s)');
     expectOutput(list, 'How do we unify import?');
 
     // Second run imports nothing new (idempotent).
@@ -144,7 +144,7 @@ describe('lazy import-conversation (unified surface)', () => {
     expectOutputExcludes(preview, 'Imported 99999999');
 
     const list = await ctx.lazy(['builder', 'list']);
-    expectOutput(list, 'No captured builder conversations yet');
+    expectOutput(list, 'No captured Builders yet');
   });
 
   test('reports nothing to import when no sessions on disk', async () => {

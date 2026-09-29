@@ -235,12 +235,12 @@ describe('usage pause hardening', () => {
     expect(config.stdout).not.toContain('usage_pause_threshold');
   }, 240_000);
 
-  // INVARIANT: the builder's shell cannot CONSUME a person's one-shot override.
-  // `lazy start` / `lazy unblock` carry the `human` channel for attribution
-  // from any process; without a terminal they are judged like the builder's —
-  // refused on a paused credential, the override left pending for the person
-  // who set it, and the command never named in the refusal.
-  test("a terminal-less start or unblock never spends a person's override", async () => {
+  // INVARIANT (changed 2026-09-26, when the engineer made the way past a pause
+  // PER TASK): no task launch — from a terminal or not — spends the daemon-wide
+  // one-shot override, which is left for launches beside any task; a task gets
+  // through only with its own allowance, which the CLI carries with
+  // `--past-usage-pause` and which the builder's shell may use too.
+  test("a task launch never spends the daemon-wide override; --past-usage-pause lets it through", async () => {
     const paused = await pauseWithOneTurn('0.97', Math.floor(Date.now() / 1000) + 3600, 'Paused A');
     const other = await createTask(ctx, 'Task B', 'More work');
     await setUsagePauseOverrideRpc(ctx, 'off');
@@ -256,11 +256,17 @@ describe('usage pause hardening', () => {
     expect(await readTaskStatus(ctx.root, other)).toBe('backlog');
     expect((await ctx.lazy(['daemon', 'config', 'get'])).stdout).toContain('One-shot override: off');
 
-    // …while the person it was set for can still use it, exactly once.
-    await ctx.setClaudeScenario(proxiedTurn('person-start'));
+    // …nor does a person's own launch: the override is not the task's way through.
     const person = await launchAsPerson(ctx, 'startTask', { taskId: findFullTaskId(ctx.root, other) });
-    expect(person.exitCode).toBe(0);
-    expect((await ctx.lazy(['daemon', 'config', 'get'])).stdout).not.toContain('One-shot override');
+    expect(person.exitCode).not.toBe(0);
+    expect(person.stderr).toContain('--past-usage-pause');
+    expect((await ctx.lazy(['daemon', 'config', 'get'])).stdout).toContain('One-shot override: off');
+
+    // The task's own allowance, carried by the launch, lets it through — from
+    // the builder's shell too — and the daemon-wide override is still pending.
+    await ctx.setClaudeScenario(proxiedTurn('person-start'));
+    expectSuccess(await ctx.lazy(['start', other, '--yes', '--past-usage-pause'], { env: { LAZY_ACTOR: 'builder' } }));
+    expect((await ctx.lazy(['daemon', 'config', 'get'])).stdout).toContain('One-shot override: off');
   }, 240_000);
 
   // INVARIANT: the latest reading lives in Storage. With the bounded audit log

@@ -944,6 +944,15 @@ async function seedProjectsDirFromHistory(opts: {
   await recordSeededSessions(targetHostDir, encodedCwd, seededIds);
 }
 
+/**
+ * Whether a container that sees `projectsDir` as its `~/.claude/projects` can
+ * `--resume` `sessionId`: Claude Code looks for `<encoded cwd>/<id>.jsonl`
+ * there and exits at once ("No conversation found") when it is missing.
+ */
+export async function projectsDirHoldsSession(projectsDir: string, lazyRoot: string, sessionId: string): Promise<boolean> {
+  return (await sessionFileStat(projectsDir, encodeProjectPath(lazyRoot), sessionId)) !== null;
+}
+
 const DEFAULT_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000; // 14 days
 
 /**

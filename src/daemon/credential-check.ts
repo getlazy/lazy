@@ -2,8 +2,8 @@
  * "Does this credential actually work?" — asked on purpose, right now.
  *
  * WHY THIS EXISTS, GIVEN credential-gate.ts SAYS NOT TO PROBE: the gate runs at
- * DAEMON STARTUP, on every start, for a credential nobody asked about. Probing
- * there would tie starting a daemon to network reachability and would still say
+ * every TURN LAUNCH, for a credential nobody asked about. Probing there would
+ * tie launching a turn to network reachability and would still say
  * nothing about an hour later, which is why it checks presence only. This is the
  * opposite situation in every respect: a human has just pressed a button that
  * says "Test credential" and is waiting for the answer. A probe is the only

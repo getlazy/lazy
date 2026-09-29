@@ -21,6 +21,18 @@ export async function setUsagePauseOverrideRpc(ctx: TestContext, value: string |
 }
 
 /**
+ * Let one task's next turn through the pause (the per-task allowance), as a
+ * surface does: the daemon's `usagePause` `allowTask` RPC, on the channel given.
+ * Rejects with the daemon's refusal (a task agent's channel is refused).
+ */
+export async function allowTaskRpc(ctx: TestContext, taskId: string, actor: 'human' | 'builder' | 'agent'): Promise<void> {
+  const target = getDaemonTcpTarget(ctx.root);
+  const token = readToken(ctx.root);
+  if (!target || !token) throw new Error('allowTaskRpc: the test daemon is not running');
+  await DaemonClient.fromTarget(target, token).rpc('usagePause', ctx.root, { action: 'allowTask', taskId, actor });
+}
+
+/**
  * Launch as a PERSON AT THEIR OWN TERMINAL would: the `human` channel plus the
  * override eligibility the CLI sends only from a real terminal
  * (src/cli/human-terminal.ts, `usagePauseOverrideEligibility`). A test's CLI has

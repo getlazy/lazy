@@ -295,14 +295,14 @@ The replacement keeps the old task's PARENT: redoing a task that sits under a
 release hub creates the replacement under that same hub, not on main. Only the
 base ref is fresh — the branch is cut from that parent's current HEAD when the
 task starts. To move the work elsewhere, use --no-start and re-parent the
-replacement (lazy reparent <new_task> main) before starting it.
+replacement (lazy reparent <new_task> --parent main) before starting it.
 
 Arguments:
   <task_id>          ID of the task to redo
 
 Options:
   --prompt <text>    Override the prompt for the new task (default: inherit old prompt)
-  --model <model>    Override model for the new task (e.g. opus, sonnet, claude-opus-5)
+  --model <model>    Override model for the new task (e.g. opus, sonnet, claude-opus-5-5)
   --no-start         Create the new task but don't start it (backlog)
   --yes              Skip confirmation prompt when starting
 

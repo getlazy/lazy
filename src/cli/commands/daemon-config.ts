@@ -9,8 +9,12 @@
  *   reset [key]      — clear the override, reverting to lazy.toml
  *
  * `usage_pause_threshold` is ONE-SHOT on top of ephemeral: it is used up by the
- * first start, unblock or resume a person asks for that it lets past a pause,
- * and then lazy.toml applies again (src/daemon/usage-pause.ts).
+ * first launch BESIDE any task (a one-shot, a chat, a review conversation) a
+ * person asks for that it lets past a pause, and then lazy.toml applies again.
+ * With `--task <task>` (value `off` only) it is that TASK's allowance instead —
+ * "let this task's next turn through" — which a person or the builder may set
+ * (src/daemon/usage-pause.ts, "The per-task allowance"); the launch commands'
+ * `--past-usage-pause` sets the same thing.
  *
  * The override is ephemeral: it lives only in the running daemon process and is
  * lost on restart (which reverts to lazy.toml). This command NEVER writes
@@ -117,7 +121,13 @@ function printUsagePause(state: UsagePauseState, offerOverride: boolean): void {
     console.log(
       `  ${theme.warning('One-shot override:')} ${percentOrOff(state.override)}` +
         `${state.overrideSetAt ? ` (set ${new Date(state.overrideSetAt).toISOString()})` : ''} — used up by the ` +
-        `first start, unblock or resume you ask for that it lets past a pause, then lazy.toml applies again.`,
+        `first launch beside any task (a one-shot, a chat) that it lets past a pause, then lazy.toml applies again.`,
+    );
+  }
+  for (const a of state.allowed ?? []) {
+    console.log(
+      `  ${theme.warning('Let through:')} ${a.task}'s next turn (set ${new Date(a.setAt).toISOString()}` +
+        `${a.setBy ? ` by ${a.setBy}` : ''}) — used up by the launch it lets past a pause.`,
     );
   }
   if (state.storeError) {
@@ -137,7 +147,9 @@ function printUsagePause(state: UsagePauseState, offerOverride: boolean): void {
     console.log(`  ${theme.label('Waiting:')} ${h.task} — ${h.hold.held}, on ${h.hold.credential}`);
   }
   if (offerOverride) {
-    console.log(`  Let one turn start past it: ${theme.command(`lazy daemon config set ${USAGE_PAUSE_OVERRIDE_KEY} off`)}`);
+    console.log(`  Let one task's next turn through: ${theme.command('lazy resume <task> --past-usage-pause')} ` +
+      `(also on start, unblock, review, ask), or ${theme.command(`lazy daemon config set ${USAGE_PAUSE_OVERRIDE_KEY} off --task <task>`)}`);
+    console.log(`  Let one launch beside any task through: ${theme.command(`lazy daemon config set ${USAGE_PAUSE_OVERRIDE_KEY} off`)}`);
   }
 }
 
@@ -166,9 +178,39 @@ async function configSetUsagePause(rawValue: string): Promise<void> {
   console.log(`  It is also dropped if the daemon restarts. Clear it now: ${theme.command(`lazy daemon config reset ${USAGE_PAUSE_OVERRIDE_KEY}`)}`);
 }
 
+/**
+ * `--task <task>`: let that task's next turn through the pause. Unlike the
+ * daemon-wide override this is not refused off a terminal: the builder may set
+ * it too, on the engineer's behalf. The daemon decides who may (a person or the
+ * builder, never a task agent) and refuses anyone else.
+ */
+async function configAllowTask(rawValue: string, task: string): Promise<void> {
+  if (rawValue.trim().toLowerCase() !== 'off') {
+    console.error(
+      `With --task, ${USAGE_PAUSE_OVERRIDE_KEY} takes only 'off': it lets that task's next turn start ` +
+        `regardless of usage. Got '${rawValue}'.`,
+    );
+    process.exit(1);
+  }
+  await queryUsagePause({ action: 'allowTask', taskId: task, actor: getActor() });
+  console.log(theme.success(`${task}'s next turn may start past the usage pause.`));
+  console.log('  Used up by the first launch of that task it lets past a pause — including one lazy starts by');
+  console.log('  itself (an auto-resume). Dropped if the daemon restarts.');
+  console.log(`  Clear it now: ${theme.command(`lazy daemon config reset ${USAGE_PAUSE_OVERRIDE_KEY} --task ${task}`)}`);
+}
+
 async function configSet(args: string[]): Promise<void> {
-  const parsed = parseFlags(args, [], 'daemon config set');
+  const parsed = parseFlags(args, [{ name: 'task', takesValue: true }], 'daemon config set');
   const [rawKey, rawValue] = parsed.positional;
+  const task = parsed.flags.get('task') as string | undefined;
+  if (task !== undefined) {
+    if (!rawKey || !isUsagePauseKey(rawKey) || rawValue === undefined) {
+      console.error(`--task applies only to: lazy daemon config set ${USAGE_PAUSE_OVERRIDE_KEY} off --task <task>`);
+      process.exit(1);
+    }
+    await configAllowTask(rawValue, task);
+    return;
+  }
 
   if (!rawKey || rawValue === undefined) {
     console.error('Usage: lazy daemon config set <key> <value>');
@@ -207,8 +249,18 @@ async function configSet(args: string[]): Promise<void> {
 }
 
 async function configReset(args: string[]): Promise<void> {
-  const parsed = parseFlags(args, [], 'daemon config reset');
+  const parsed = parseFlags(args, [{ name: 'task', takesValue: true }], 'daemon config reset');
   const rawKey = parsed.positional[0];
+  const task = parsed.flags.get('task') as string | undefined;
+  if (task !== undefined) {
+    if (!rawKey || !isUsagePauseKey(rawKey)) {
+      console.error(`--task applies only to: lazy daemon config reset ${USAGE_PAUSE_OVERRIDE_KEY} --task <task>`);
+      process.exit(1);
+    }
+    await queryUsagePause({ action: 'clearTask', taskId: task, actor: getActor() });
+    console.log(theme.success(`Cleared ${task}'s usage-pause allowance; [usage_pause] applies to its next turn.`));
+    return;
+  }
 
   if (rawKey && isUsagePauseKey(rawKey)) {
     await queryUsagePause({ action: 'reset' });
@@ -248,15 +300,21 @@ launches immediately.
 Overrides set here are EPHEMERAL — they live only in the running daemon and
 reset on restart (reverting to lazy.toml). This command never writes lazy.toml.
 The usage_pause_threshold override is also ONE-SHOT: it is used up by the first
-start, unblock or resume you ask for that it lets past a pause, and then
-lazy.toml applies again.
+launch BESIDE any task (a one-shot such as lazy report, a chat, a review
+conversation) that it lets past a pause, and then lazy.toml applies again.
+With --task <task> it is instead that task's allowance: its next turn starts past
+the pause, whichever launch that is (lazy start/unblock/resume/review/ask also
+take --past-usage-pause for the same thing).
 
 Subcommands:
   get                    Show the cap: configured value, ephemeral override,
                          effective limit, and current running count; and the
                          usage pause: thresholds, override, what is paused
   set <key> <value>      Set an ephemeral override for this daemon session
+                         (usage_pause_threshold off --task <task>: let that
+                         task's next turn through the pause)
   reset [key]            Clear the override, reverting to lazy.toml
+                         (usage_pause_threshold --task <task>: drop that task's)
 
 Keys:
   max_concurrent_builders  (alias: builders) max concurrent builder containers
@@ -264,11 +322,14 @@ Keys:
                            regardless of usage; a percent is a threshold for
                            that one turn (100 still pauses at a full or refused
                            window). Only from your own terminal: it is refused
-                           without one, inside a container, and from an agent
+                           without one, inside a container, and from an agent.
+                           With --task, a person or the builder may set it;
+                           a task agent never
 
 Examples:
   lazy daemon config get                            # Show current limit + usage
   lazy daemon config set builders 4                 # Lower the builder cap to 4
-  lazy daemon config set usage_pause_threshold off  # Let one paused turn start
+  lazy daemon config set usage_pause_threshold off  # Let one paused one-shot start
+  lazy daemon config set usage_pause_threshold off --task abc1  # Let abc1's next turn start
   lazy daemon config reset                          # Clear the overrides`);
 }

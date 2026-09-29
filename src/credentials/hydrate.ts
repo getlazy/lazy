@@ -12,9 +12,13 @@
  * repeatedly, and correctly: the credential was on the machine, just not in that
  * shell.
  *
- * Hydration runs ONCE, inside `startDaemonServer`, BEFORE the gate: the stored
- * secret is copied into the daemon process's own env, and from there the rest of
- * lazy works exactly as it did. Nothing downstream had to learn about the store.
+ * Hydration runs inside `startDaemonServer`: the stored secret is copied into
+ * the daemon process's own env, and from there the rest of lazy works exactly as
+ * it did. Nothing downstream had to learn about the store. It runs AGAIN, for
+ * one provider, when a turn is about to launch on a profile whose daemon-env
+ * credential is still missing (see the turn gate in
+ * ../daemon/credential-gate.ts): a daemon may start with no credential at all,
+ * and one stored afterwards has to reach it without a restart.
  *
  * ENV WINS. A variable that is already set is never overwritten — an operator
  * who exported a token for this one daemon gets that token, and the migration
@@ -73,22 +77,28 @@ export interface HydratedCredential {
  * Fill in the environment for every provider this project needs.
  *
  * Providers whose env var is already set (and non-blank) are left alone; ones
- * with no stored credential either are simply skipped — the gate that runs next
- * is what turns that into an actionable refusal. Hydration's job is to make a
+ * with no stored credential either are simply skipped — the turn gate
+ * (../daemon/credential-gate.ts) turns that into an actionable refusal when a
+ * turn actually needs one. Hydration's job is to make a
  * credential available, not to decide whether one is required.
  *
  * @param projectRoot - Project root (resolves role targets and the store)
  * @param env - Environment to fill (defaults to this process's environment)
+ * @param providers - Which providers to fill. Omitted at daemon startup, where
+ *   it is the role defaults; the turn gate (src/daemon/credential-gate.ts)
+ *   passes the one provider a turn's profile bills, so a credential stored
+ *   AFTER the daemon started reaches a daemon-env provider without a restart.
  * @returns What was hydrated, in provider order — for logging and diagnostics
  */
 export async function hydrateCredentialEnv(
   projectRoot: string,
   env: NodeJS.ProcessEnv = process.env,
+  providers?: readonly Provider[],
 ): Promise<HydratedCredential[]> {
-  const config = await loadConfig(projectRoot);
+  const wanted = providers ?? requiredProviders(await loadConfig(projectRoot));
   const hydrated: HydratedCredential[] = [];
 
-  for (const provider of requiredProviders(config)) {
+  for (const provider of wanted) {
     // A SELF-REFRESHING credential is never hydrated, and this is a correctness
     // rule rather than an optimisation. Renewal reads the current secret,
     // exchanges it upstream — retiring the old one there and then — and writes
@@ -151,23 +161,21 @@ export async function hydrateCredentialEnv(
 }
 
 /**
- * Refuse to continue when the index promised a credential that never reached
- * the environment.
+ * Throw when the index promised a credential that never reached the
+ * environment.
  *
- * WHY THIS EXISTS AS A SEPARATE CHECK. The gate answers "is a credential
- * available?" from the NON-SECRET INDEX (see ../daemon/credential-gate.ts) — it
- * must not open a backend, or a detached auto-start would block on a keychain
- * unlock nobody can answer. But that means the gate reads the very record whose
- * disagreement with the backend made hydration fail: index says stored, backend
- * has nothing, hydration throws, and the gate then cheerfully answers "stored"
- * and lets the daemon up with an empty environment. That daemon runs, answers
- * RPC, and 401s on every model request — the exact failure ../credentials/store.ts
- * describes itself as existing to prevent, and on a detached start the only
- * evidence is one line in a log file nobody is watching.
+ * WHY THIS EXISTS AS A SEPARATE CHECK. Presence is answered from the NON-SECRET
+ * INDEX (see ../daemon/credential-gate.ts) — a detached daemon must not open a
+ * backend and block on a keychain unlock nobody can answer. But that index is
+ * the very record whose disagreement with the backend made hydration fail:
+ * index says stored, backend has nothing, hydration throws, and every presence
+ * check still answers "stored". The daemon then 401s on every model request
+ * with nothing saying why.
  *
- * So: after hydration, anything the gate would accept on the strength of the
- * STORE must actually be in the environment. If it is not, the store's promise
- * was not kept, and that is fatal rather than logged.
+ * So after startup hydration the daemon asks this, and a throw is RECORDED for
+ * `lazy daemon health` (never fatal — a daemon needs no credential to run);
+ * the turn gate retries the load at the first turn on that credential and
+ * refuses the turn, with this reason, if it still cannot.
  *
  * This also covers the non-throwing miss: a stored credential whose kind has no
  * environment variable is skipped by hydration with a warning, yet still counts
@@ -189,14 +197,14 @@ export async function assertStoredCredentialsReachedEnv(
   for (const provider of requiredProviders(config)) {
     // A self-refreshing credential is deliberately NOT hydrated (see above), so
     // "stored but not in the environment" is its correct and expected state —
-    // not a broken promise. Checking it here would refuse to start a daemon
-    // whose credential is perfectly fine.
+    // not a broken promise. Reporting it here would flag a credential that is
+    // perfectly fine.
     if (credentialSelfRefreshing(provider)) continue;
     // Asked of the environment DIRECTLY, not through the precedence helpers:
     // hydration's copies deliberately do not outrank the store any more, so
     // `locateCredential` answers 'store' for a credential that hydrated
-    // perfectly, and reading that as a broken promise would refuse to start
-    // every daemon this check exists to protect. The question here has always
+    // perfectly, and reading that as a broken promise would flag every
+    // daemon this check exists to protect. The question here has always
     // been the literal one — index says stored, did the secret reach the
     // environment — and now it is asked that way.
     if (!credentialInEnv(provider, env) && (await credentialPresence(projectRoot, provider))) {
@@ -216,8 +224,7 @@ export async function assertStoredCredentialsReachedEnv(
   throw new Error(
     `The credential store says a ${names} credential is stored, but it could not be loaded:\n` +
     `\n${detail}\n\n` +
-    `Refusing to start. A daemon without a usable credential runs, answers RPC and launches ` +
-    `containers, but every model request fails with an authentication error and nothing says why.\n` +
+    `Turns that need it are refused until it loads; everything else keeps working.\n` +
     `  Re-store it:  lazy auth set ${unmet[0]}\n` +
     `  Or drop the stale record and use the environment instead:  lazy auth rm ${unmet[0]}`,
   );

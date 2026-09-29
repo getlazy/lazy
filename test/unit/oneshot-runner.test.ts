@@ -546,7 +546,7 @@ describe('one-shot credential posture', () => {
     }
 
     // The model is the request's or the builder target's, else a harness default
-    // or [models] default when the builder profile names none — never the task's.
+    // or the builder default when the builder profile names none — never the task's.
     expect(body).toContain('{ harness, model: target.model }, req.model');
 
     // ...and the deleted helper is gone from the tree, not merely unused here.

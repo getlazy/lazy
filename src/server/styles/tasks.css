@@ -95,6 +95,13 @@
 .edit-notice-err { border-left-color: var(--color-danger); }
 .edit-notice-locked { border-left-color: var(--color-warning); }
 
+/* "When to use each agent" beneath an agent picker: profile descriptions. */
+.agent-descriptions { margin: var(--space-2) 0 var(--space-4); }
+.agent-descriptions > summary { cursor: pointer; color: color-mix(in srgb, var(--color-text) 55%, transparent); }
+.agent-descriptions dl { margin: var(--space-2) 0 0; display: grid; grid-template-columns: max-content 1fr; gap: var(--space-1) var(--space-3); }
+.agent-descriptions dt { font-family: var(--font-mono); }
+.agent-descriptions dd { margin: 0; }
+
 .edit-form { max-width: 900px; }
 .edit-form .input { width: 100%; }
 .edit-label {
@@ -135,3 +142,6 @@
 }
 .edit-preview-wrap > summary { cursor: pointer; }
 .edit-preview { margin-top: var(--space-3); }
+
+/* Usage-pause "Let its next turn through" / Clear: a button inline with its line. */
+.usage-pause-allow { display: inline; margin-left: 0.4em; }

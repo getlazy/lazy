@@ -26,6 +26,9 @@ import {
 import { countImportableMemories, importHarnessMemory } from '../import/import-harness-memory';
 import { applyLocalCommandCleanup, elideSummary } from '../import/local-command-cleanup';
 import type { Storage } from '../storage/interface';
+import { manualHeadRemedy, repairTaskWorktreeHead, repairWorktreeGitPointers, scanTaskWorktreeHeads, scanWorktreeGitPointers, validateWorktreeGitPointers } from '../git/worktree-pointers';
+import { describeNestedGit, notUnderLiveTurn, QUARANTINE_INFIX, quarantineReport, scanProjectNestedGit } from '../git/nested-git';
+import { taskWorktreeBranches } from '../task/worktree-branches';
 import {
   describeWorktreeReclaim,
   findOrphanedContainers,
@@ -48,6 +51,7 @@ export const DOCTOR_REMEDY_FLAGS = [
   'reimport-conversations',
   'import-memory',
   'clean-local-command-conversations',
+  'repair-git-pointers',
 ] as const;
 
 export type DoctorRemedyFlag = (typeof DOCTOR_REMEDY_FLAGS)[number];
@@ -78,6 +82,7 @@ const REMEDY_TITLES: Record<DoctorRemedyFlag, string> = {
   'reimport-conversations': 'Re-import missing conversations',
   'import-memory': 'Import harness memory records',
   'clean-local-command-conversations': 'Clean local-command noise out of stored conversations',
+  'repair-git-pointers': "Repair task worktrees' git pointers and quarantine nested repositories",
 };
 
 export function isDoctorRemedyFlag(value: string): value is DoctorRemedyFlag {
@@ -204,6 +209,7 @@ export async function previewRemedy(flag: DoctorRemedyFlag, ctx: RemedyContext):
     case 'reimport-conversations': return previewReimportConversations(ctx);
     case 'import-memory': return previewImportMemory(ctx);
     case 'clean-local-command-conversations': return previewCleanLocalCommandConversations(ctx);
+    case 'repair-git-pointers': return previewRepairGitPointers(ctx);
   }
 }
 
@@ -217,6 +223,7 @@ export async function applyRemedy(flag: DoctorRemedyFlag, ctx: RemedyContext): P
     case 'reimport-conversations': return applyReimportConversations(ctx);
     case 'import-memory': return applyImportMemory(ctx);
     case 'clean-local-command-conversations': return applyCleanLocalCommandConversations(ctx);
+    case 'repair-git-pointers': return applyRepairGitPointers(ctx);
   }
 }
 
@@ -670,6 +677,96 @@ async function applyCleanLocalCommandConversations(ctx: RemedyContext): Promise<
     'conversation(s)',
     lines,
   );
+  emit(ctx, { label: result.message, state: 'done' });
+  return result;
+}
+
+/**
+ * Task worktrees whose git pointers differ from what lazy created
+ * (src/git/worktree-pointers.ts). Rewriting them back is not destructive: the
+ * text restored is exactly what `git worktree add` wrote, derived from paths.
+ */
+async function previewRepairGitPointers(ctx: RemedyContext): Promise<DoctorRemedyPreview> {
+  const tampered = (await scanWorktreeGitPointers(ctx.root)).filter(r => r.state === 'tampered');
+  const heads = await scanTaskWorktreeHeads(ctx.root, await taskWorktreeBranches(ctx.storage));
+  const nestedScan = await scanProjectNestedGit(ctx.root, ctx.storage);
+  const nested = nestedScan.filter(r => r.findings.length > 0 && notUnderLiveTurn(r.task));
+  const live = nestedScan.filter(r => r.findings.length > 0 && !notUnderLiveTurn(r.task));
+  const notes: string[] = [];
+  if (tampered.length + heads.length > 0) notes.push('Each worktree\'s .git, commondir and gitdir files are rewritten to what lazy created; a config.worktree is removed; a HEAD redirected without moving the index is pointed back at the task\'s own branch. No commit, branch or working file is touched. A worktree really checked out on another branch is left for you to switch back.');
+  if (nested.length > 0) notes.push(`Each nested repository is moved aside (renamed to .git${QUARANTINE_INFIX}<n>, or a bare repository's HEAD renamed the same way) — nothing is deleted.`);
+  for (const r of live) notes.push(`${r.name} holds ${describeNestedGit(r.findings)}, left alone while its turn runs.`);
+  return previewOf(
+    'repair-git-pointers',
+    [
+      ...tampered.map(r => `${r.name} — ${r.problem}`),
+      ...heads.map(r => r.manual
+        ? `${r.name} — HEAD ${r.problem}; checked out on another branch, NOT repaired: ${manualHeadRemedy(r.path, r.branch)}`
+        : `${r.name} — HEAD ${r.problem} (pointed back at ${r.branch})`),
+      ...nested.map(r => `${r.name} — nested: ${describeNestedGit(r.findings)}`),
+    ],
+    notes,
+    "Every task worktree's git pointers are what lazy created, and none holds a nested repository — nothing to repair.",
+  );
+}
+
+async function applyRepairGitPointers(ctx: RemedyContext): Promise<DoctorRemedyResult> {
+  const tampered = (await scanWorktreeGitPointers(ctx.root)).filter(r => r.state === 'tampered');
+  emit(ctx, { label: `Repairing ${tampered.length} worktree(s)`, state: 'start' });
+  const lines: string[] = [];
+  let done = 0;
+  for (const r of tampered) {
+    try {
+      await repairWorktreeGitPointers(ctx.root, r.path);
+      await validateWorktreeGitPointers(ctx.root, r.path);
+      const line = `Repaired ${r.name}`;
+      lines.push(line);
+      emit(ctx, { label: r.name, state: 'ok', detail: line });
+      done++;
+    } catch (err) {
+      const line = `Failed to repair ${r.name}: ${err instanceof Error ? err.message : String(err)}`;
+      lines.push(line);
+      emit(ctx, { label: r.name, state: 'error', detail: line });
+    }
+  }
+  // Redirected HEADs second: a HEAD is read through the pointers just repaired.
+  const heads = await scanTaskWorktreeHeads(ctx.root, await taskWorktreeBranches(ctx.storage));
+  for (const r of heads) {
+    if (r.manual) {
+      const line = `Not repaired ${r.name}: HEAD ${r.problem} and it is checked out on another branch — ${manualHeadRemedy(r.path, r.branch)}`;
+      lines.push(line);
+      emit(ctx, { label: r.name, state: 'error', detail: line });
+      continue;
+    }
+    try {
+      await repairTaskWorktreeHead(ctx.root, r.path, r.branch);
+      const line = `Pointed ${r.name}'s HEAD back at ${r.branch} (it ${r.problem})`;
+      lines.push(line);
+      emit(ctx, { label: r.name, state: 'ok', detail: line });
+      done++;
+    } catch (err) {
+      const line = `Failed to repair ${r.name}'s HEAD: ${err instanceof Error ? err.message : String(err)}`;
+      lines.push(line);
+      emit(ctx, { label: r.name, state: 'error', detail: line });
+    }
+  }
+  // Nested repositories last, never under a live turn (src/git/nested-git.ts).
+  const nested = (await scanProjectNestedGit(ctx.root, ctx.storage, notUnderLiveTurn)).filter(r => r.findings.length > 0);
+  for (const r of nested) {
+    try {
+      const q = await quarantineReport(ctx.root, r);
+      if (q.error) throw new Error(q.error);
+      const line = `Quarantined in ${r.name}: ${q.moved.map(m => m.rel).join(', ')}`;
+      lines.push(line);
+      emit(ctx, { label: r.name, state: 'ok', detail: line });
+      done++;
+    } catch (err) {
+      const line = `Failed to quarantine in ${r.name}: ${err instanceof Error ? err.message : String(err)}`;
+      lines.push(line);
+      emit(ctx, { label: r.name, state: 'error', detail: line });
+    }
+  }
+  const result = resultOf('repair-git-pointers', 'Repaired', done, tampered.length + heads.length + nested.length, 'worktree(s)', lines);
   emit(ctx, { label: result.message, state: 'done' });
   return result;
 }

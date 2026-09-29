@@ -447,6 +447,9 @@ subtree).
 - **`lazy reopen <task>`** — complete|abandoned → blocked|backlog
   - For complete tasks: requires `--reason`, resets the session, returns to blocked
   - For abandoned tasks: returns to blocked if the task had agent work, otherwise backlog
+  - A task that ran comes back on its OWN branch at its last head: the local branch if it still exists, otherwise the task branch on the remote — unless lazy recorded newer work the remote never received, which is restored instead (the output says the remote is behind; `lazy sync` merges it back) — otherwise the last commit lazy recorded for it. If none can be found, reopen refuses and changes nothing — it never starts a task empty (`lazy clone` / `lazy redo` do that)
+  - The restored branch keeps its own history; if the parent moved meanwhile, run `lazy sync` to bring it in. Nothing is pushed
+  - Reopening an accepted task supersedes that accept: lazy remembers which accept it was, never treats it as a crashed accept to recover, and `lazy show` prints "reopened after accept at <commit>" until the task is accepted again
 
 #### Agent Actions
 
@@ -719,15 +722,16 @@ own; a revoked credential never does. So lazy sorts each failure into a class
 and acts on the class.
 
 This is about credentials and conditions that go bad *while a task runs*. A
-daemon with no credential at all refuses to start in the first place.
+turn on a profile with no credential at all is refused before it launches, and
+the task keeps its status.
 
 ### The taxonomy
 
 | Class | Examples | Behaviour |
 |---|---|---|
-| `fatal_auth` | 401/403, invalid API key, missing credential, credit balance exhausted | Stop on the first failure |
+| `fatal_auth` | 401/403, invalid API key, missing credential, credit balance exhausted, a provider quota or spend cap (monthly usage limit, out of credits, `insufficient_quota`) | Stop on the first failure |
 | `fatal_config` | unknown flag, invalid model, agent binary missing (exit 127) | Stop on the first failure |
-| `transient_overload` | 429, 529, 503, "overloaded" | Retry indefinitely, 5s→60s |
+| `transient_overload` | 429, 529, 503, "overloaded" (a per-minute or short-window rate limit) | Retry indefinitely, 5s→60s |
 | `transient_network` | ECONNRESET, ETIMEDOUT, socket hang up, `fetch failed` | Retry indefinitely, 5s→60s |
 | `transient_unreachable` | ECONNREFUSED, ENOTFOUND | Retry 5s→60s, **bounded** at 12 attempts (~9 min), then stop |
 | `unknown` | anything unrecognized | Retry 15s→60s; the crash-loop detector still applies |
@@ -771,6 +775,12 @@ says the limit clears soon: a rate-limit marker or a short reset horizon
 ("resets in 20 minutes") stays `transient_overload`, while a reset stated as a
 *date* ("when your monthly cycle ends on 9/19/2026") does not. When in doubt,
 lazy retries.
+
+The same rule applies to every provider's quota. A 429 that says a monthly
+usage limit, spend cap or credit balance has been reached (Ollama, OpenAI,
+Anthropic) is `fatal_auth`: the task blocks with the provider's own message,
+including any upgrade or add-credits link it gave. A per-minute rate limit, or
+a cap whose message says it clears soon, is still retried.
 
 ### Seeing what is being retried
 

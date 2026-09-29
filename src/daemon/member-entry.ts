@@ -44,6 +44,7 @@ import { checkPairingLock } from '../utils/pairing-lock';
 import { readLock, lockHeldHere } from '../utils/lock';
 import { readProcessIdentity, looksLikeLazyProcess } from '../utils/process-identity';
 import { getWorktreePath } from '../task/identity';
+import { recordEnvironmentReplaced, REASON_MEMBER_ENTERED } from '../task/environment-replaced';
 
 /**
  * Tasks whose worktree something other than a turn is about to change — a
@@ -132,7 +133,8 @@ export async function taskTurnRunning(
 
 /**
  * Stop the task's own container (or host run), if it is running, and confirm
- * it has stopped. Throws when it could not be stopped.
+ * it has stopped. Throws when it could not be stopped. Returns whether a
+ * running CONTAINER was stopped (false for a host-process run).
  *
  * STOPPED, not removed. The next turn recovers exactly as it does after any
  * container that died between turns: every launch path sees the run is not
@@ -145,15 +147,18 @@ export async function taskTurnRunning(
  * container's logs, readable until that next launch, when a turn left
  * something behind that someone wants to look at.
  */
-export async function stopTaskContainerForMember(projectRoot: string, task: Task, session: Session): Promise<void> {
+export async function stopTaskContainerForMember(projectRoot: string, task: Task, session: Session): Promise<boolean> {
   const runner = await createRunner(projectRoot, session.runner_type ?? task.runner_type ?? undefined);
   const name = session.container_name ?? runner.runNameForTask(taskRef(task));
-  if (!(await runner.isRunning(name))) return;
+  if (!(await runner.isRunning(name))) return false;
   const stopped = await runner.stopRun(name);
   if (!stopped || (await runner.isRunning(name))) {
     throw new Error(`the task's own environment (${name}) could not be stopped`);
   }
   logger.info(`[${task.id.substring(0, 8)}] Stopped the task's environment (${name}) so a member can work in the task alone.`);
+  // A host-process run's environment is the host: nothing outside the
+  // worktree was lost, so there is nothing to tell the agent.
+  return runner.usesSandbox();
 }
 
 /** Is the task being paired on, and whose web Pair (if any) holds it? */
@@ -231,7 +236,7 @@ export interface EnterTaskDeps {
   /** Seam for tests; defaults to `supervisorStillOwnsTurn` (./supervisor-handback.ts). */
   supervisorOwnsTurn?: (task: Task, session: Session) => Promise<string | null>;
   /** Seam for tests; defaults to {@link stopTaskContainerForMember}. */
-  stopTaskContainer?: (task: Task, session: Session) => Promise<void>;
+  stopTaskContainer?: (task: Task, session: Session) => Promise<boolean | void>;
   /** Seam for tests; defaults to marking the in-memory hold. */
   markEntered?: (taskId: string, email: string) => void;
 }
@@ -259,7 +264,7 @@ export interface EnterTaskDeps {
  */
 export async function enterTaskAsMember(opts: {
   projectRoot: string;
-  storage: Pick<Storage, 'getTask' | 'getSessionByTaskId' | 'getSessionTurns'>;
+  storage: Pick<Storage, 'getTask' | 'getSessionByTaskId' | 'getSessionTurns' | 'getTaskMetadata' | 'updateTaskMetadata'>;
   taskId: string;
   email: string;
   deps?: EnterTaskDeps;
@@ -335,8 +340,9 @@ export async function enterTaskAsMember(opts: {
         message: 'The agent is still finishing its last turn. Open the terminal again in a moment.',
       };
     }
+    let stopped: boolean | void;
     try {
-      await (deps.stopTaskContainer ?? ((t, s) => stopTaskContainerForMember(projectRoot, t, s)))(task, session);
+      stopped = await (deps.stopTaskContainer ?? ((t, s) => stopTaskContainerForMember(projectRoot, t, s)))(task, session);
     } catch (err) {
       logger.warn(`[${taskId.substring(0, 8)}] Refused ${email}'s terminal: ${err instanceof Error ? err.message : String(err)}`);
       return {
@@ -344,6 +350,17 @@ export async function enterTaskAsMember(opts: {
         status: 503,
         message: `The agent's environment for this task could not be stopped, so a terminal of your own cannot be opened beside it. Try again in a moment.`,
       };
+    }
+    // The next work turn runs in a fresh container: its agent is told, once,
+    // that whatever it installed outside the worktree is gone
+    // (src/task/environment-replaced.ts). A failed write only costs the
+    // notice — the container is already stopped, so refusing gains nothing.
+    if (stopped === true) {
+      try {
+        await recordEnvironmentReplaced(storage, taskId, REASON_MEMBER_ENTERED);
+      } catch (err) {
+        logger.warn(`[${taskId.substring(0, 8)}] Could not record that the agent's environment was replaced: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
     (deps.markEntered ?? markMemberTerminalEntered)(taskId, email);
     return { ok: true };

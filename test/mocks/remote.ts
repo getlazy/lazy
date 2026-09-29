@@ -275,6 +275,21 @@ function buildMockDriver(mockResult: ImportResult | null): RepositoryDriver {
       return pr?.base ?? null;
     },
     syncComments: async () => [],
+    // The on-demand read tools. Every call is logged to
+    // mock-review-read-calls.jsonl so a suite can prove the daemon's cache
+    // spared the forge; answers come from mock-review-conversation.json /
+    // mock-review-status.json, and a task with no PR is refused like a real driver.
+    readReviewConversation: async (task: Task) => {
+      appendJsonLine('mock-review-read-calls.jsonl', { kind: 'conversation', taskId: task.id });
+      if (!forgeIdOf(task)) throw new Error('This task has no pull request recorded.');
+      return (readJsonFile('mock-review-conversation.json') ?? []) as never;
+    },
+    readReviewStatus: async (task: Task) => {
+      appendJsonLine('mock-review-read-calls.jsonl', { kind: 'status', taskId: task.id });
+      if (!forgeIdOf(task)) throw new Error('This task has no pull request recorded.');
+      return (readJsonFile('mock-review-status.json')
+        ?? { state: 'OPEN', decision: null, reviews: [], mergeable: null, checks: [] }) as never;
+    },
     // Like a real forge, a PR the task records has a state — OPEN until
     // something closes or merges it — and `null` only for a task with no PR.
     // (A real driver answers null otherwise only when it cannot ask the forge;

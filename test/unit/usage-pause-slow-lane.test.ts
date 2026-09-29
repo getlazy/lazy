@@ -14,9 +14,14 @@ import { processAutoResumeQueue, getSlowLaneState } from '../../src/daemon/auto-
 import { MAX_CONSECUTIVE_INTERRUPTIONS } from '../../src/utils/auto-resume';
 import {
   assertTurnStartAllowed,
+  allowTaskPastUsagePause,
+  clearTaskUsagePauseAllowance,
   getUsagePauseOverride,
   setUsagePauseOverride,
+  takeTaskAllowanceAtLaunch,
+  taskUsagePauseAllowance,
   turnSpendCredential,
+  usagePauseHold,
 } from '../../src/daemon/usage-pause';
 import { USAGE_PAUSE_HELD_KEY } from '../../src/usage-pause/hold';
 import { daemonUsageLimits } from '../../src/proxy/usage-limits';
@@ -119,12 +124,13 @@ describe('slow lane under a usage pause', () => {
     expect(notices.map((n) => n.title).join('\n')).toContain('paused');
   });
 
-  // INVARIANT: a launch the DAEMON starts never spends a person's one-shot
-  // override, even when it rides the explicit unblock path carrying that
-  // person as its actor (a review's auto-fix carries the reviewer's). The
-  // override is for the turn its setter is about to start; `daemonLaunch` makes
-  // the gate judge without it. A person's own launch still uses it.
-  test('the explicit gate never gives a daemon launch the override', async () => {
+  // INVARIANT (changed by the engineer's decision of 2026-09-26, which made
+  // the way past a pause PER TASK): a TASK's launch — a person's or the
+  // daemon's — never spends the daemon-wide one-shot override, which is left
+  // for launches beside any task; only that task's own allowance lets it
+  // through, and it lets any launch of that task through, the daemon's own
+  // included, because "let its next turn through" means whichever turn is next.
+  test('a task launch never takes the daemon-wide override; the task allowance lets any launch of it through', async () => {
     const now = Date.now();
     const config = await loadConfig(root);
     const task = { id: 'gated-task-0000-0000-000000000003', status: 'blocked', agent_id: 'claude-code' } as Task;
@@ -142,12 +148,61 @@ describe('slow lane under a usage pause', () => {
       await expect(
         assertTurnStartAllowed(root, { task, config, actor: 'human', verb: 'unblock', daemonLaunch: true }),
       ).rejects.toThrow(/paused/);
+      await expect(
+        assertTurnStartAllowed(root, { task, config, actor: 'human', verb: 'unblock' }),
+      ).rejects.toThrow(/--past-usage-pause/);
       expect(getUsagePauseOverride()).toBe(0);
 
-      await assertTurnStartAllowed(root, { task, config, actor: 'human', verb: 'unblock' });
-      expect(getUsagePauseOverride()).toBeNull();
+      allowTaskPastUsagePause(task.id, 'human');
+      await assertTurnStartAllowed(root, { task, config, actor: 'human', verb: 'unblock', daemonLaunch: true });
+      expect(taskUsagePauseAllowance(task.id)).toBeNull();
+      expect(getUsagePauseOverride()).toBe(0);
     } finally {
       setUsagePauseOverride(null);
+      clearTaskUsagePauseAllowance(task.id);
+    }
+  });
+
+  // INVARIANT: a daemon launch's hold CHECK counts a pending allowance and never
+  // takes it; the launch takes it at its commit point. Taken at the check,
+  // auto-resume (which checks twice: the reconciler, then autoResumeTask) used
+  // it on the first check and held the task on the second, and a review
+  // auto-fix used it at the hold and was then refused at its launch gate — a
+  // "let its next turn through" that let nothing through.
+  test('the hold check counts an allowance without taking it; the launch takes it', async () => {
+    const now = Date.now();
+    const config = await loadConfig(root);
+    const task = { id: 'gated-task-0000-0000-000000000004', status: 'interrupted', agent_id: 'claude-code', metadata: {} } as unknown as Task;
+    const spend = await turnSpendCredential(root, config, task);
+    daemonUsageLimits.observeReading({
+      credential: spend!.credential, ts: now, upstream: 'https://api.anthropic.com', backend: 'proxy',
+      status: 200, taskId: null, model: null,
+      headers: {
+        'anthropic-ratelimit-unified-5h-utilization': '0.97',
+        'anthropic-ratelimit-unified-5h-reset': String(Math.floor(now / 1000) + 3600),
+      },
+    });
+    const { storage } = createMockStorage([task], new Map());
+    try {
+      expect(await usagePauseHold(root, storage, task, 'auto-resume')).not.toBeNull();
+      allowTaskPastUsagePause(task.id, 'human');
+      // Checked twice, as auto-resume does: still pending both times.
+      expect(await usagePauseHold(root, storage, task, 'auto-resume')).toBeNull();
+      expect(await usagePauseHold(root, storage, task, 'auto-resume')).toBeNull();
+      expect(taskUsagePauseAllowance(task.id)).not.toBeNull();
+      // The launch commits: used up, and the next check holds again.
+      await takeTaskAllowanceAtLaunch(root, task, 'auto-resume');
+      expect(taskUsagePauseAllowance(task.id)).toBeNull();
+      expect(await usagePauseHold(root, storage, task, 'auto-resume')).not.toBeNull();
+
+      // A review auto-fix: its hold check counts it, and its launch gate
+      // (the explicit path, as a daemon launch) takes it rather than refusing.
+      allowTaskPastUsagePause(task.id, 'builder');
+      expect(await usagePauseHold(root, storage, task, 'review auto-fix')).toBeNull();
+      await assertTurnStartAllowed(root, { task, config, actor: 'human', verb: 'unblock', daemonLaunch: true });
+      expect(taskUsagePauseAllowance(task.id)).toBeNull();
+    } finally {
+      clearTaskUsagePauseAllowance(task.id);
     }
   });
 

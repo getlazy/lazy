@@ -182,6 +182,51 @@ describe('lazy_internal_git', () => {
     await expect(handler({ op: 'push' })).rejects.toThrow(/unknown op/);
   });
 
+  // INVARIANT (supervisor-restores-rejected-files): the host-side restore puts
+  // a file the daemon itself knows is rejected back to its base, in ONE commit
+  // authored by lazy (not the agent) that touches only that path.
+  test('restore_rejected restores a file this task owes a restore, as lazy\'s commit', async () => {
+    await writeFile(join(repo, 'lazy.toml'), '[permissions]\nprotected = ["base.txt"]\n');
+    const baseSha = git(worktree, 'rev-parse', 'HEAD');
+    await writeFile(join(worktree, 'base.txt'), 'agent edit\n');
+    await writeFile(join(worktree, 'other.txt'), 'agent work\n');
+    git(worktree, 'add', '.');
+    git(worktree, 'commit', '-m', 'agent');
+    const session = await storage.createSession(ctx.taskId!, 'claude-code', 'lazy/mine', baseSha);
+    await storage.createTurn({
+      sessionId: session.id, sequence: 1, role: 'agent', content: 'did it',
+      violations: [{ file: 'base.txt', base_sha: baseSha, status: 'pending', rejected_at: 1 }],
+    });
+    const { planRejectedRestores } = await import('../../src/protection/rejected-restore');
+    const { resolveOutstandingViolations } = await import('../../src/protection/outstanding-resolver');
+    const task = (await storage.getTask(ctx.taskId!))!;
+    const plan = planRejectedRestores((await resolveOutstandingViolations(
+      repo, task, session, await storage.getSessionTurns(session.id), storage,
+    )).outstanding);
+    expect(plan.map((p) => p.file)).toEqual(['base.txt']);
+
+    const handler = createInternalGitHandler(ctx);
+    const reply = await handler({ op: 'restore_rejected', files: plan }) as { exit_code: number; stdout: string; head: string };
+    expect(reply.exit_code).toBe(0);
+    expect(reply.stdout).toBe(reply.head);
+    expect(git(worktree, 'show', 'HEAD:base.txt')).toBe('base');
+    expect(git(worktree, 'show', '--name-only', '--format=', 'HEAD')).toBe('base.txt');
+    expect(git(worktree, 'log', '-1', '--format=%an')).toBe('Lazy Supervisor');
+  });
+
+  // INVARIANT (supervisor-restores-rejected-files): the restore plan comes
+  // through the container-writable protocol dir, so the host-side restore
+  // honours only entries that are rejected files the daemon itself would
+  // restore. Anything else is refused and nothing is committed.
+  test('restore_rejected refuses a file this task owes no restore', async () => {
+    const handler = createInternalGitHandler(ctx);
+    const head = git(worktree, 'rev-parse', 'HEAD');
+    await expect(handler({ op: 'restore_rejected', files: [{ file: 'README.md', base_sha: head }] }))
+      .rejects.toThrow(/Refusing to restore|no task record or session/);
+    await expect(handler({ op: 'restore_rejected', files: [] })).rejects.toThrow(/non-empty/);
+    expect(git(worktree, 'rev-parse', 'HEAD')).toBe(head);
+  });
+
   test('lazy_commit concludes a merge whose resolution matches HEAD', async () => {
     // Set up a conflicted merge, then resolve every conflict in favour of ours,
     // so the staged diff against HEAD is empty.

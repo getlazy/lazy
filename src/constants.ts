@@ -5,10 +5,32 @@
 import type { Actor } from './types';
 
 /**
- * Co-author trailer appended to commits made by agents.
- * This ensures proper attribution to the Lazy system.
+ * Co-author trailer lazy appends to the commits it writes for a task:
+ * lazy_commit commits, the local accept squash and forge squash merges.
+ * Opt out with `[git] coauthor_trailer = false` (root lazy.toml).
  */
 export const LAZY_COAUTHOR_TRAILER = 'Co-Authored-By: Lazy <noreply@getlazy.dev>';
+
+const TRAILER_LINE = /^[A-Za-z][A-Za-z0-9-]*: \S.*$/;
+
+/**
+ * Append {@link LAZY_COAUTHOR_TRAILER} to a commit message, unless disabled or
+ * already in its final trailer block. When the message already ends in a trailer block (e.g. the
+ * agent's own `Co-Authored-By: Claude …`), the trailer joins that block so git
+ * still parses every line as a trailer; otherwise it starts a new paragraph.
+ */
+export function withLazyCoauthorTrailer(message: string, enabled = true): string {
+  if (!enabled) return message;
+  const trimmed = message.replace(/\s+$/, '');
+  if (trimmed === '') return LAZY_COAUTHOR_TRAILER;
+  const paragraphs = trimmed.split(/\n\s*\n/);
+  const last = paragraphs[paragraphs.length - 1].split('\n');
+  const endsInTrailers = paragraphs.length > 1 && last.every(line => TRAILER_LINE.test(line));
+  // Already signed only when the line sits in the FINAL trailer block: a body
+  // that merely quotes it (a summary, a PR description) still gets the real one.
+  if (endsInTrailers && last.includes(LAZY_COAUTHOR_TRAILER)) return trimmed;
+  return `${trimmed}${endsInTrailers ? '\n' : '\n\n'}${LAZY_COAUTHOR_TRAILER}`;
+}
 
 /**
  * Detect the current actor from the LAZY_ACTOR environment variable.

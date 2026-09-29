@@ -2,9 +2,16 @@
 #
 # Pull-and-go operators use docker-compose.yml alone. When you are hacking on
 # lazy-teams or lazy itself, merge this file so compose builds the app image
-# from the repository checkout:
+# from the repository checkout. The app image takes its lazy checkout from the
+# lazy daemon image (lazy is built once, in that image), so build that first:
 #
+#   docker build $(../../scripts/source-stamp-build-args.sh) -f daemon-image/Dockerfile -t lazy-daemon:local ../..
 #   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# LAZY_DAEMON_BUILD_IMAGE names a different daemon image to build against. It
+# is deliberately NOT LAZY_DAEMON_IMAGE: that is the runtime guest-image setting
+# (often a published ref or a saved tar in .env), and reusing it here would
+# silently build the app from a lazy other than this checkout.
 #
 # See public-docs/self-hosting-lazy-teams.md § "Building from source".
 
@@ -13,4 +20,6 @@ services:
     build:
       context: ../..
       dockerfile: lazy-teams/deploy/Dockerfile
+      args:
+        LAZY_DAEMON_IMAGE: ${LAZY_DAEMON_BUILD_IMAGE:-lazy-daemon:local}
     image: ${LAZY_TEAMS_IMAGE:-lazy-teams:local}

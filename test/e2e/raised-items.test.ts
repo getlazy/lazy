@@ -272,6 +272,10 @@ describe('raised items accept gate', () => {
     expect(prompt).toContain('Handle the empty-input case too');
     expect(prompt).toContain('worth doing next');
     expect(prompt).toContain('Promoted from raised item');
+    // INVARIANT: provenance ends at the task code — a trailing originating goal
+    // (usually an imperative) read to the agent as a second, unrelated ask.
+    expect(prompt.trimEnd()).toMatch(/Promoted from raised item \S+ as a subtask of task \S+\.$/);
+    expect(prompt).not.toContain('Promote subtask at accept');
 
     // Comment is informational and names the created task — never an
     // instruction to the agent to create it.

@@ -5,7 +5,7 @@
  * stay aligned on columns and timestamp formatting.
  */
 
-import type { ConversationSummary } from '../storage/types';
+import type { BuilderSummary, ConversationSummary } from '../storage/types';
 import { theme } from '../render/theme';
 
 /** ISO timestamp → "YYYY-MM-DD HH:MM" for table columns. */
@@ -37,58 +37,47 @@ export function elideConversationSummary(summary: string, maxLen = 60): string {
   return line.substring(0, maxLen) + '...';
 }
 
-export interface PrintConversationListOptions {
-  offset?: number;
-  limit?: number;
-  /** When true, the SUMMARY column uses conv.summary; otherwise FIRST PROMPT. */
-  useSummaryColumn?: boolean;
-  summaryWidth?: number;
+/** The run badge a Builder row carries: the live run's state, nothing else. */
+export function builderRunBadge(builder: BuilderSummary): string {
+  return builder.run?.live ? `[${builder.run.state}]` : '';
 }
 
 /**
- * Print a conversation table to stdout. Returns counts so callers can print
- * paging hints without re-deriving slice math.
+ * Print a Builder table to stdout — `lazy conversations list` and `lazy builder
+ * list`. One row per Builder (a conversation from a start or `/clear` to the
+ * next `/clear`), however many session files compaction and resume rolled it
+ * through; the live run's state is a badge on the row it is in.
  */
-export function printConversationList(
-  conversations: Array<ConversationSummary & { messages?: Array<{ role: string; text: string }> }>,
-  options: PrintConversationListOptions = {},
+export function printBuilderList(
+  builders: BuilderSummary[],
+  options: { offset?: number; limit?: number; titleWidth?: number } = {},
 ): { shown: number; total: number; hasMore: boolean } {
   const offset = options.offset ?? 0;
-  const total = conversations.length;
+  const total = builders.length;
   const limit = options.limit;
-  const sliced = limit !== undefined
-    ? conversations.slice(offset, offset + limit)
-    : conversations.slice(offset);
+  const sliced = limit !== undefined ? builders.slice(offset, offset + limit) : builders.slice(offset);
   const hasMore = limit !== undefined && offset + sliced.length < total;
-  const summaryWidth = options.summaryWidth ?? 60;
-  const lastColumn = options.useSummaryColumn ? 'SUMMARY' : 'FIRST PROMPT';
+  const titleWidth = options.titleWidth ?? 60;
 
-  console.log(`${total} captured conversation(s):\n`);
+  console.log(`${total} Builder(s):\n`);
   console.log(
-    `${theme.header('SESSION'.padEnd(10))} ` +
+    `${theme.header('BUILDER'.padEnd(10))} ` +
     `${theme.header('STARTED'.padEnd(18))} ` +
     `${theme.header('ENDED'.padEnd(18))} ` +
     `${theme.header('TURNS'.padEnd(12))} ` +
-    theme.header(lastColumn),
+    theme.header('TITLE'),
   );
-
-  for (const conv of sliced) {
-    const shortId = conv.sessionId.substring(0, 8);
-    const started = formatConversationTimestamp(conv.startedAt);
-    const ended = formatConversationTimestamp(conv.endedAt);
-    const turns = `${conv.stats.userMessageCount}h/${conv.stats.assistantMessageCount}a`;
-    const summaryCell = options.useSummaryColumn
-      ? elideConversationSummary(conv.summary, summaryWidth)
-      : conversationFirstPrompt(conv, summaryWidth);
-
+  for (const b of sliced) {
+    const badge = builderRunBadge(b);
+    const turns = `${b.stats.userMessageCount}h/${b.stats.assistantMessageCount}a`;
     console.log(
-      `${theme.taskId(shortId).padEnd(19)} ` +
-      `${started.padEnd(18)} ` +
-      `${ended.padEnd(18)} ` +
+      `${theme.taskId(b.id.substring(0, 8)).padEnd(19)} ` +
+      `${formatConversationTimestamp(b.startedAt).padEnd(18)} ` +
+      `${formatConversationTimestamp(b.endedAt).padEnd(18)} ` +
       `${turns.padEnd(12)} ` +
-      summaryCell,
+      (badge ? `${theme.success(badge)} ` : '') +
+      elideConversationSummary(b.title, titleWidth),
     );
   }
-
   return { shown: sliced.length, total, hasMore };
 }

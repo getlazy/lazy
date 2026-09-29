@@ -52,6 +52,7 @@ function maybeFail(step: FollowThroughStep): void {
 await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => ({
   loadConfig: async () => ({
     remote: { driver: 'gitlab', git_remote: 'origin', auto_approve: false, offline: false },
+    git: { default_branch_prefix: 'lazy', lfs_check: 'refuse', coauthor_trailer: true },
     storage: { backend: 'external', external_path: '' },
     review: { mode: 'separate', auto_fix: false, draft_effort: 'low', review_effort: 'xhigh' },
     automation: { maintain: [], react: [], pre_accept: { enabled: false, commands: [], timeout: 600 }, accept_check: '', accept_check_timeout: 300 },

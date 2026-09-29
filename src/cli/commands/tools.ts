@@ -30,23 +30,15 @@
  * the descendants through `collectDescendantTasks` — the same walk the web tab
  * and the RPC use — and `mergeToolStats` what each of them contributes.
  */
-import { join } from 'path';
-import { requireLazyRoot, requireStorage, resolveTaskOrExit, parseFlags } from '../helpers';
-import { loadConfig } from '../../config/loader';
-import { readAuditRecords } from '../../proxy/audit-log';
+import { parseFlags } from '../helpers';
 import { theme, dim } from '../../render/theme';
 import {
-  buildToolStats,
-  toolStatsFromRecord,
-  mergeToolStats,
-  partitionAuditRecordsByTask,
   type TaskToolStats,
   type ToolRow,
 } from '../../task/stats';
-import { collectDescendantTasks, loadToolStatsRecords } from '../../task/stats-data';
-import { displayId } from '../../task/identity';
 import { writeStdout } from '../../utils/stdio';
 import { parseSince, parsePositiveInt } from './stats-flags';
+import { queryTokenStats } from '../../daemon/rpc-fallback';
 
 /** Scan cap: how many records are read from the trail before filtering. */
 const DEFAULT_SCAN = 50_000;
@@ -256,39 +248,13 @@ export async function commandTools(args: string[]): Promise<void> {
   // the answer comes from the task's durable record and covers its whole life.
   const windowed = sinceMs !== undefined || parsed.flags.get('limit') !== undefined;
 
-  const root = requireLazyRoot();
-  const storage = await requireStorage();
-  let label: string;
-  let stats: TaskToolStats | null;
-  let folded = 0;
-  try {
-    const task = await resolveTaskOrExit(storage, taskRef);
-    label = displayId(task);
-    // Same walk the web tab and the RPC use — a hub's own tool calls are not
-    // its tool calls. Done for both readings, so `--subtree` means one thing.
-    const ids = [task.id];
-    if (subtree) {
-      const descendants = await collectDescendantTasks(storage, task.id);
-      folded = descendants.length;
-      ids.push(...descendants.map((d) => d.id));
-    }
-
-    if (windowed) {
-      const config = await loadConfig(root);
-      const all = await readAuditRecords(join(root, config.data.path), { limit });
-      const records = sinceMs === undefined ? all : all.filter((r) => r.ts >= sinceMs);
-      const byTask = partitionAuditRecordsByTask(records, ids);
-      stats = mergeToolStats(ids.map((id) => buildToolStats(byTask.get(id) ?? [], id)));
-    } else {
-      // Only the tasks that HAVE a record are folded in; none at all is "never
-      // recorded", which is a different fact from "called no tools".
-      const byTask = await loadToolStatsRecords(storage, ids);
-      const present = ids.map((id) => byTask.get(id) ?? null).filter((r) => r !== null);
-      stats = present.length > 0 ? mergeToolStats(present.map((r) => toolStatsFromRecord(r!))) : null;
-    }
-  } finally {
-    await storage.close();
-  }
+  const result = await queryTokenStats({
+    mode: 'tools-cli', task: taskRef, subtree, sinceMs, limit,
+    windowedTools: windowed, top: Number.MAX_SAFE_INTEGER,
+  });
+  const label = result.taskCode ?? String(result.taskId).slice(0, 8);
+  const folded = Number(result.descendantCount ?? 0);
+  const stats = result.tools as TaskToolStats | null;
   const scopeLabel = subtree
     ? `${label} + ${folded} nested task(s)`
     : label;

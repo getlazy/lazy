@@ -13,6 +13,7 @@
  * watch is real and driven through the injected status reader.
  */
 
+import { BUILDER_DEFAULT_MODEL } from '../../src/config/default-models';
 import { describe, test, expect, afterAll } from 'bun:test';
 import { resolve } from 'path';
 import { mockModule, restoreMockedModules } from '../helpers/mock-module';
@@ -269,8 +270,8 @@ describe('runInteractiveSupervisor — chat', () => {
 
     // Order matters: extras sit after --resume, exactly as the pre-supervisor
     // chat command composed them. --model is always there (no harness launches
-    // without one); with no builder model configured it is [models] default.
-    expect(state.launches[0]!.argv).toEqual(['claude', '--resume', 'chat-sess', '--model', 'claude-opus-5', ...chatArgs]);
+    // without one); with no builder model configured it is the builder default (not the task default).
+    expect(state.launches[0]!.argv).toEqual(['claude', '--resume', 'chat-sess', '--model', BUILDER_DEFAULT_MODEL, ...chatArgs]);
   });
 
   // INVARIANT (turn-model stickiness): a session that belongs to a TASK (chat,

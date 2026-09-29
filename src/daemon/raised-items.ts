@@ -471,11 +471,10 @@ function buildPromotedTaskPrompt(
   response?: string | null,
 ): string {
   const ref = taskDisplayRef(originating);
-  const goal = originating.goal.trim();
   const relation = kind === 'subtask' ? 'as a subtask of' : 'as a peer of';
-  const provenance =
-    `Promoted from raised item ${item.id} ${relation} task ${ref}` +
-    (goal ? `: ${goal}` : '.');
+  // Provenance stops at the task code: the originating goal is usually an
+  // imperative, and as the prompt's last line it read as a second, unrelated ask.
+  const provenance = `Promoted from raised item ${item.id} ${relation} task ${ref}.`;
   const extra = response?.trim() ? `\n\nReviewer note:\n${response.trim()}` : '';
   // An agent-authored proposed_prompt is meant to be used verbatim; fall back
   // to the item's own body when it filed free text instead.

@@ -61,6 +61,7 @@ import { layoutHtml } from '../../src/server/templates';
 import { subtasksSectionHtml } from '../../src/server/subtasks';
 import { servicesCardHtml } from '../../src/server/services-card';
 import type { Task } from '../../src/types';
+import { progressiveLoaderScript } from '../../src/server/review-progressive';
 
 const SERVER_DIR = join(import.meta.dir, '../../src/server');
 
@@ -128,6 +129,7 @@ function task(): Task {
  */
 const ISLANDS: Record<string, () => string> = {
   taskTabSwitchScript: () => taskTabSwitchScript(),
+  progressiveLoaderScript: () => progressiveLoaderScript('/api/review/task-1/files'),
   reviewNavigationScript: () => reviewNavigationScript(),
   viewedStateScript: () => viewedStateScript('task-1'),
   reviewDraftScript: () => reviewDraftScript('task-1'),

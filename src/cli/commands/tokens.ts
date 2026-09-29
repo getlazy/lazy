@@ -10,14 +10,10 @@
  * is proxied, whatever its role's backend — so this trail covers all of them.
  * What it cannot cover is a process lazy did not launch.
  */
-import { join } from 'path';
-import { requireLazyRoot, requireStorage, resolveTaskOrExit, parseFlags } from '../helpers';
-import { displayId } from '../../task/identity';
-import { collectDescendantTasks } from '../../task/stats-data';
-import { loadConfig } from '../../config/loader';
-import { readAuditRecords } from '../../proxy/audit-log';
+import { parseFlags } from '../helpers';
 import { theme, dim } from '../../render/theme';
-import { aggregateUsage, type TokenGroup, type TokenReport } from '../../proxy/aggregate';
+import type { TokenGroup, TokenReport } from '../../proxy/aggregate';
+import { queryTokenStats } from '../../daemon/rpc-fallback';
 import { parseSince, parsePositiveInt } from './stats-flags';
 
 function num(n: number): string {
@@ -120,35 +116,15 @@ export async function commandTokens(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const root = requireLazyRoot();
-
-  // `--task` alone is a plain id-prefix filter over the trail and needs no
-  // store. `--subtree` does: which tasks are under this one is a fact only the
-  // store knows, and the same walk the Stats tab uses answers it.
-  let subtreeIds: string[] | undefined;
   let subtreeLabel = '';
-  if (subtree && taskId) {
-    const storage = await requireStorage();
-    try {
-      const task = await resolveTaskOrExit(storage, taskId);
-      const descendants = await collectDescendantTasks(storage, task.id);
-      subtreeIds = [task.id, ...descendants.map((d) => d.id)];
-      subtreeLabel = `${displayId(task)} + ${descendants.length} nested task(s)`;
-    } finally {
-      await storage.close();
-    }
-  }
-
-  const config = await loadConfig(root);
-  const records = await readAuditRecords(join(root, config.data.path), { limit });
-  const report = aggregateUsage(records, {
-    sinceMs,
-    role,
-    // With --subtree the id set IS the filter; keeping the raw prefix too would
-    // narrow it back down to the root task.
-    taskId: subtreeIds ? undefined : taskId,
-    taskIds: subtreeIds,
+  const result = await queryTokenStats({
+    mode: 'tokens-cli', sinceMs, limit, role, task: taskId, subtree,
   });
+  const report = result.report as TokenReport;
+  if (result.task) {
+    const label = result.task.code ?? String(result.task.id).slice(0, 8);
+    subtreeLabel = `${label} + ${result.task.descendants} nested task(s)`;
+  }
 
   if (json) {
     console.log(JSON.stringify(report, null, 2));

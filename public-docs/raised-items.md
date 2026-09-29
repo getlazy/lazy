@@ -364,9 +364,10 @@ structured report when present) **above** the diff, so the questions are the
 first thing you see — blocking ones first, in one card list with the non-blocking
 ones under them.
 
-**Lazy Teams** task and accept pages show the same items above the diff and let
-you resolve them inline; a decision made there can be undone until the next
-unblock or accept. Its project nav has a **Raised** page — the same cross-task
+**Lazy Teams** shows open blocking items on the task page's **Current review**
+and open items of both kinds on the accept page, and lets you resolve them
+inline; a decision can be undone from the item's own **Raised** page until the
+next unblock or accept. Its project nav has a **Raised** page — the same cross-task
 queue, blocking first, with a blocking/FYI filter, a toggle on every row for the
 flag itself, and a badge counting open blocking and open FYI separately. See
 [Reviewing tasks in Lazy Teams](lazy-teams-task-review.md).

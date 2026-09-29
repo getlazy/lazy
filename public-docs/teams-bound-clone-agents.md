@@ -7,7 +7,7 @@ project with Claude Code. They are not equals.
 
 ## The primary way: your builder on the server
 
-Run `lazy builder` in the bound clone, or open the **Builder** page in your
+Run `lazy builder` in the bound clone, or open the **Builders** page in your
 browser. Your builder runs on the Teams install, next to the project, and your
 terminal attaches to it. This is the full experience:
 
@@ -72,6 +72,9 @@ failing obscurely:
 - **In the browser, but not offered to a clone:** dismissing a system message,
   and redoing a task (several steps, not all of them relayed). Use the Teams
   web UI for these.
+- **Usage limits and token statistics.** These cover every member of the
+  project, so they are not offered to a clone. Use the Teams web UI where it
+  shows them, or a server-side builder.
 - **Asking a past conversation a question.** It runs a model on the server,
   which a clone cannot ask for. Use a server-side builder.
 - **Switching a task's agent** on edit. Leave `agent` out, or switch it from a
@@ -83,6 +86,11 @@ failing obscurely:
   a task finished, raising items for review, reporting, and progress updates.
   Your own Claude Code has no task of its own, so these are refused the same
   way they are for any builder.
+
+Reading a task's pull/merge request comments and status is refused on any
+MCP server you run on your own machine, bound or not: only lazy's server-side
+sessions hold the forge credential. Its error does not name your Teams install.
+Use a server-side builder.
 
 Nothing is left half done: a call that could not complete on Teams refuses
 before it writes anything.

@@ -103,8 +103,12 @@ export function outstandingFromDetection(
   const records = violationRecordsByFile(turns);
   const outstanding: FileViolation[] = [];
   for (const hit of detected) {
-    if (records.get(hit.file)?.status === 'approved') continue;
-    outstanding.push({ ...hit, status: 'pending' });
+    const record = records.get(hit.file);
+    if (record?.status === 'approved') continue;
+    // A reviewer's Reject rides along: still outstanding (pending), but the
+    // surfaces and the next unblock need to know it was refused.
+    const rejectedAt = record?.status === 'pending' ? record.rejected_at : undefined;
+    outstanding.push({ ...hit, status: 'pending', ...(rejectedAt ? { rejected_at: rejectedAt } : {}) });
   }
   return outstanding;
 }
@@ -119,8 +123,9 @@ export function outstandingFromDetection(
  * unapproved protected file.
  *
  * `rejected` does NOT count here, unlike in the detection path above. A rejected
- * record only exists on sessions from before move-file-approval-to-accept, and
- * it means the reviewer refused the change AND lazy reverted it — a decision
+ * record means the reviewer refused the change AND lazy restored it (the
+ * supervisor's restore, src/protection/rejected-restore.ts, or the old
+ * revert-at-unblock on older sessions) — a decision
  * that was made and carried out. (In the detection path the same record with the
  * file still in the diff means the opposite: the change came back and nobody has
  * approved THAT.)

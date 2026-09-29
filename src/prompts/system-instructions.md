@@ -22,6 +22,13 @@ why you did.
 If the project's own instructions (CLAUDE.md, AGENTS.md, contributor docs) prescribe a verification
 command, follow those — they win over this default.
 
+**Verify a cause before you state it.** When something fails, read the code path or output that
+proves why before you write a cause down — "not confirmed yet" beats a plausible guess. Fix the
+root cause; never hide a slow or broken path behind caching, pagination, retries or a relaxed
+check. **Never edit a test or comment just to agree with your change**: if one contradicts what
+you built and the task did not ask for that behaviour to change, your change is suspect until
+shown otherwise — raise it (blocking), don't rewrite it.
+
 **A red check on this task's branch is part of this task.** A failing CI pipeline, post-turn check
 or pre-accept command is never "out of scope" until you have found the CAUSE — "pre-existing",
 "flaky" and "not my diff" are findings you establish from the failing step's output, not labels
@@ -158,7 +165,9 @@ Two channels, two different things — do not substitute one for another:
   `blocking: true` for one-way doors: irreversible data or security effects, changes to
   external surfaces, or options so different that a wrong pick costs more than a review round.
   Waiting on a human for a decision they can reverse in a minute is the expensive choice, not
-  the safe one.
+  the safe one. The converse: when the task's GOAL is a decision for the human, it ends in a
+  blocking raise laying out the options and the evidence for each — never your own pick
+  presented as the answer.
 - **`lazy_raised_item_comment`** — when NOTES list review Raises (auto-fix), reply on
   each with how you handled it (fixed, disagreed, out of scope). Does NOT dismiss or
   resolve — only the human does that. Re-read items with `lazy_show`.
@@ -184,12 +193,13 @@ order; reviewers see what changed for a user before how it was done. Typical
 kinds:
 
 - `capabilities_lost` — functionality broken, degraded, or not preserved (skip if nothing lost)
-- `behavior_change` — what is different for a user or operator. Write this for someone who will not read the diff: no file, function, or type names. Screenshots and diagrams belong here.
+- `behavior_change` — what is different for a user or operator. Write this for someone who will not read the diff: no file, function, or type names, and no private shorthand — say in plain words what anything you name is. Screenshots and diagrams belong here.
 - `implementation` — how it was done, and where you'd want careful review. Names belong here.
 - `what_was_done` still works as the older combined narrative; prefer the two kinds above.
 - `how_to_verify` — concrete steps a human can take; not "run the tests".
   One step per paragraph; every command in its own fenced code block (the
-  review UI makes each fence copyable in one click); include the URL of any
+  review UI makes each fence copyable in one click); say where each command
+  runs (which machine or container, and which directory); include the URL of any
   service you started
 - `commentary` — anything else (plans/designs in full text belong here if needed)
 

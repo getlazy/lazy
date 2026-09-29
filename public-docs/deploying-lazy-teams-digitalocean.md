@@ -116,7 +116,7 @@ Optional mail: add `SMTP_PASSWORD` and the `SMTP_*` / `MAILER_FROM` values under
 
 ### Building from source (maintainers)
 
-By default the config **pulls** the pre-built image from `ghcr.io/getlazy/lazy-teams`. To build from your checkout instead, uncomment `builder.context` and `builder.dockerfile` in `deploy.yml`.
+By default the config **pulls** the pre-built image from `ghcr.io/getlazy/lazy-teams`; the identical image is also on Docker Hub as `docker.io/getlazy/lazy-teams`. To pull from Docker Hub instead, set `registry.server` to `docker.io` in `deploy.yml`, `registry.username` to your Docker Hub username, and `KAMAL_REGISTRY_PASSWORD` to a Docker Hub access token. To build from your checkout instead, uncomment `builder.context`, `builder.dockerfile` and `builder.args` in `deploy.yml`. The application image takes lazy from the lazy daemon image of the same version, so set `LAZY_DAEMON_IMAGE` under `args` to `ghcr.io/getlazy/lazy-daemon:<version tag of your checkout>` — Kamal's builder cannot see images on your laptop, so it must be a registry reference.
 
 On an **Apple Silicon Mac** targeting amd64 droplets, also uncomment `builder.remote` and point it at an amd64 machine with Docker (a second small droplet works):
 
@@ -125,6 +125,8 @@ builder:
   arch: amd64
   context: ..
   dockerfile: lazy-teams/deploy/Dockerfile
+  args:
+    LAZY_DAEMON_IMAGE: ghcr.io/getlazy/lazy-daemon:v0.23.1234   # your checkout's version tag
   remote: ssh://root@YOUR_AMD64_BUILDER_IP
 ```
 

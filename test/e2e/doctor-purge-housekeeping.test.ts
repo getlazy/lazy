@@ -122,7 +122,7 @@ describe('lazy doctor --purge-housekeeping-conversations', () => {
     // All three are still in the store.
     const list = await ctx.lazy(['builder', 'list']);
     expectSuccess(list);
-    expectOutput(list, '3 captured conversation(s)');
+    expectOutput(list, '3 Builder(s)');
   });
 
   test('deletes the housekeeping conversations with --yes and is idempotent', async () => {
@@ -134,7 +134,7 @@ describe('lazy doctor --purge-housekeeping-conversations', () => {
     // The real conversations survive; the housekeeping one is gone.
     const list = await ctx.lazy(['builder', 'list']);
     expectSuccess(list);
-    expectOutput(list, '2 captured conversation(s)');
+    expectOutput(list, '2 Builder(s)');
     expectOutput(list, 'bbbb2222');
     expectOutput(list, 'cccc3333');
     expectOutputExcludes(list, 'aaaa1111');

@@ -54,15 +54,15 @@ import {
   type AgentFailureInput,
 } from './failure-taxonomy';
 
+import { CODEX_LATEST_MODEL } from '../config/default-models';
+
 const LAUNCH_BINARY = new CodexPackaging().binaryName();
 
 /**
- * The model name meaning "let Codex choose". Codex has no `auto` model id in
- * its catalog — omitting `-m` is how "the CLI's own default" is spelled — but
- * lazy needs a concrete, human-readable name to record on the task/turn, and
- * `resolveAgentModel`'s precedence needs this agent to declare *something* (a
- * silent fall-through to `[models] default` would pass an Anthropic model name
- * to `-m`). Unlike Cursor, omission is safe here: lazy owns the whole
+ * The model name meaning "let Codex choose", opt-in: a task or profile names it
+ * explicitly (the declared default is CODEX_LATEST_MODEL). Codex has no `auto`
+ * model id in its catalog — omitting `-m` is how "the CLI's own default" is
+ * spelled — but lazy needs a readable name to record on the task/turn. Unlike Cursor, omission is safe here: lazy owns the whole
  * ~/.codex/config.toml in the sandbox (see src/agent/codex-config.ts) and
  * never writes a `model` key into it, so there is no persisted user default
  * that could hijack an omitted flag.
@@ -137,15 +137,22 @@ function eventItem(obj: Record<string, unknown>): Record<string, unknown> | null
  * both conventions, so codex turns aggregate correctly next to Claude turns
  * and are not double-counted against the proxy's own wire-side extraction.
  */
-function mapUsage(raw: Record<string, unknown>): AgentTokenUsage {
-  const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
-  const input = num(raw.input_tokens);
-  const cached = num(raw.cached_input_tokens);
+function mapUsage(raw: Record<string, unknown>): AgentTokenUsage | undefined {
+  const required = [raw.input_tokens, raw.output_tokens];
+  const optional = [raw.cached_input_tokens, raw.cache_write_input_tokens];
+  if (!required.every((value) => typeof value === 'number' && Number.isFinite(value) && value >= 0)) {
+    return undefined;
+  }
+  if (!optional.every((value) => value === undefined || (typeof value === 'number' && Number.isFinite(value) && value >= 0))) {
+    return undefined;
+  }
+  const input = raw.input_tokens as number;
+  const cached = (raw.cached_input_tokens as number | undefined) ?? 0;
   return {
     input_tokens: Math.max(0, input - cached),
-    output_tokens: num(raw.output_tokens),
+    output_tokens: raw.output_tokens as number,
     cache_read_input_tokens: cached,
-    cache_creation_input_tokens: num(raw.cache_write_input_tokens),
+    cache_creation_input_tokens: (raw.cache_write_input_tokens as number | undefined) ?? 0,
   };
 }
 
@@ -439,7 +446,7 @@ export class CodexAgent implements Agent {
     return {
       result: messages.join('\n\n'),
       session_id: sessionId,
-      usage: usage ?? { input_tokens: 0, output_tokens: 0 },
+      ...(usage ? { usage } : {}),
       // No model_id: codex's JSONL does not report which model actually ran.
     };
   }
@@ -556,11 +563,10 @@ export class CodexAgent implements Agent {
   }
 
   defaultModel(): string {
-    // Let codex pick: lazy's `[models] default` is an Anthropic model name
-    // chosen for Claude Code, and passing it to `-m` would fail every turn.
-    // See CODEX_DEFAULT_MODEL for why this is a named sentinel rather than
-    // null or an omitted flag.
-    return CODEX_DEFAULT_MODEL;
+    // A concrete OpenAI id, never lazy's `[models] default` (an Anthropic
+    // name that `-m` would fail on every turn). The CODEX_DEFAULT_MODEL
+    // sentinel still works when a task names it explicitly.
+    return CODEX_LATEST_MODEL;
   }
 
   activityStream(): CodexActivityStream {

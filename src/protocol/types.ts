@@ -141,6 +141,16 @@ export interface UnblockCommand {
    */
   permission_mode?: 'plan' | 'default';
 
+  /**
+   * Protected files a reviewer REJECTED that are still in the task's changes.
+   * The supervisor restores each to its `base_sha` and commits that as lazy's
+   * own commit BEFORE the agent runs, then tells the agent what it restored
+   * (src/protection/rejected-restore.ts). Never set on a plan-mode turn. An
+   * older supervisor ignores it: the file stays rejected and accept keeps
+   * refusing, so no PROTOCOL_VERSION bump is needed.
+   */
+  restore_rejected_files?: ProtectedRestore[];
+
   turn_started_at?: string;    // ISO timestamp — used for elapsed-time logging
   watchdog_output_timeout_ms?: number; // kill process if no output for this many ms (0 = disabled)
   wind_down_timeout_ms?: number;       // kill process this many ms after it emits its final result if it hasn't exited (0 = disabled)
@@ -299,6 +309,7 @@ export interface AskCommand {
  */
 export interface SyncCommand {
   type: 'sync';
+  agent_extra_args?: string[];         // host OS-sandbox `--settings` for the conflict-resolution agent; see commonCommandFields
   task_id: string;
   /** Echoed on the response so the host can correlate a single-slot answer. */
   command_id?: CommandId;
@@ -477,13 +488,33 @@ export type SupervisedKind =
   | 'low_high_revise'
   | 'review_reask';
 
+/** One rejected protected file to put back to its base — see UnblockCommand. */
+export interface ProtectedRestore {
+  file: string;
+  base_sha: string;
+}
+
+/** A restore the supervisor carried out before the agent's turn. */
+export interface ProtectedRestoreDone extends ProtectedRestore {
+  /** The commit that holds the restore (lazy's, not the agent's). */
+  commit_sha: string;
+}
+
 export interface CompletedResponse {
   status: 'completed';
+  /**
+   * Rejected protected files the supervisor restored before the WORK
+   * invocation ran. Work response only. The reconciler records each on the
+   * work turn as a `rejected` violation carrying `restored_*` — what accept
+   * reads to tell the reviewer the merged tree holds a lazy-made restore.
+   */
+  restored_protected_files?: ProtectedRestoreDone[];
   /** Echo of the command that produced this response; absent on pre-correlation supervisors. */
   command_id?: CommandId;
   result: string;
   session_id: string;
-  usage: AgentTokenUsage;
+  /** Token usage reported by the harness; absent means it was not recorded. */
+  usage?: AgentTokenUsage;
   /**
    * Launch settings THIS invocation ran under, echoed back so the reconciler can
    * stamp them on the turn it records. Per-response (not per-bundle) because a
@@ -723,6 +754,12 @@ export interface CompletedResponseBundle {
 
 export interface ErrorResponse {
   status: 'error';
+  /**
+   * Rejected protected files the supervisor restored before the work phase
+   * failed — see CompletedResponse. Recorded on the error turn so accept still
+   * names a restore whose turn crashed.
+   */
+  restored_protected_files?: ProtectedRestoreDone[];
   /** Echo of the command that produced this response; absent on pre-correlation supervisors. */
   command_id?: CommandId;
   error: string;
@@ -889,6 +926,8 @@ export type SupervisorPhase =
   | 'sync_with_remote_done'
   | 'merge_and_fix'
   | 'merge_and_fix_done'
+  | 'restore_rejected'
+  | 'restore_rejected_done'
   | 'pre_turn_hook'
   | 'pre_turn_hook_done'
   | 'work'
@@ -952,6 +991,12 @@ export interface SupervisorStatus {
   post_remote_sync_sha?: string;
   /** SHA of HEAD after pre-turn sync-with-upstream phase completed */
   post_merge_sha?: string;
+  /**
+   * SHA of HEAD after the supervisor committed the restore of rejected
+   * protected files (`restore_rejected_files`). The agent's work window starts
+   * here, so lazy's restore commit is never attributed to the agent.
+   */
+  post_restore_sha?: string;
   /** SHA of the upstream branch at the time it was merged (for accurate diff scope) */
   upstream_merge_sha?: string;
   /** SHA of HEAD after work phase completed (before post-turn sync) */

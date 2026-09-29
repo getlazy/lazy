@@ -104,6 +104,29 @@ describe('lazy env (per-task environment variables)', () => {
     expect((await stat(registry)).mode & 0o777).toBe(0o600);
   }, 120_000);
 
+  // INVARIANT: `lazy env set` takes effect at the task's next launch even when
+  // its supervisor is still alive. Env is fixed when a supervisor/container is
+  // created and launches reuse a live one, so without a recreate the unblock
+  // below ran with the OLD value — contradicting what `lazy env set` prints.
+  test('a value changed while the supervisor is alive reaches the next turn', async () => {
+    const taskId = await createTask(ctx, 'Env changed between turns', 'Do the work');
+    await ctx.recordClaudeEnvKeys(['DUMMY_TASK_TOKEN']);
+    expectSuccess(await ctx.lazy(['env', 'set', taskId, `DUMMY_TASK_TOKEN=${SECRET}`]));
+
+    await ctx.setClaudeScenario(successScenario({ result: 'done', sessionId: 'fake-sess-change' }));
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+
+    const UPDATED = 'sk-dummy-per-task-updated-4411';
+    expectSuccess(await ctx.lazy(['env', 'set', taskId, `DUMMY_TASK_TOKEN=${UPDATED}`]));
+    expectSuccess(await ctx.lazy(['unblock', taskId, '--message', 'again', '--yes']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+
+    const turns = (await ctx.claudeInvocations()).filter(i => i.argv.includes('-p'));
+    expect(turns.length).toBeGreaterThanOrEqual(2);
+    expect(turns[turns.length - 1].env?.DUMMY_TASK_TOKEN).toBe(UPDATED);
+  }, 180_000);
+
   test('another task does not get it', async () => {
     const withVar = await createTask(ctx, 'Has a token', 'Do the work');
     const without = await createTask(ctx, 'Has no token', 'Do the work');

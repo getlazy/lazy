@@ -155,6 +155,9 @@ import type {
   ReviewDraftPatch,
   ReviewDraftsFile,
 } from './types';
+import type { BuilderSummary } from './types';
+import { lineageFromMessages, type SegmentLineage } from '../builder/identity';
+import { summarizeBuilders, findBuilder } from '../builder/identity-view';
 import { isTerminalStatus, isBlockedStatus, raisedStatusForAction, LEGACY_CLUSTER_TASK_TYPE } from '../types';
 import { emptyReviewDraft, MAX_LINE_DRAFTS, MAX_VIEWED_FILES } from '../review-draft';
 import { normalizeTagOrThrow } from '../utils/tags';
@@ -183,7 +186,7 @@ const STORAGE_VERSION = 1;
  * cannot pick it up as a conversation. Bump `version` if the entry shape
  * changes — an unknown version is treated as missing and rebuilt.
  */
-const CONVERSATION_INDEX_VERSION = 1 as const;
+const CONVERSATION_INDEX_VERSION = 2 as const;
 const CONVERSATION_INDEX_FILENAME = 'conversations-index.json';
 
 /** Per-task durable tool statistics, one small file in the task's directory. */
@@ -199,6 +202,13 @@ interface ConversationTranscriptFile {
 interface ConversationIndexEntry extends ConversationSummary {
   mtimeMs: number;
   size: number;
+  /**
+   * Builder-stitching evidence (src/builder/identity.ts). Taken from the
+   * transcript's recorded lineage, or derived from its messages for a segment
+   * captured before lineage was recorded — which is how existing captures fold
+   * into Builders without a re-import (version 2 rebuilds the index once).
+   */
+  lineage: SegmentLineage;
 }
 
 interface ConversationIndexFile {
@@ -249,6 +259,7 @@ function toIndexEntry(
     ...conversationSummaryOf(conv),
     mtimeMs: file.mtimeMs,
     size: file.size,
+    lineage: conv.lineage ?? lineageFromMessages(conv.messages ?? []),
   };
 }
 
@@ -1270,7 +1281,10 @@ export class FileStorage implements Storage {
   }
 
   async close(): Promise<void> {
-    // No resources to release for file storage
+    // The daemon holds this instance's lock for its whole life (a bare
+    // acquire in getOrCreateStorage); closing is where it is given back.
+    // Short-lived instances hold nothing here, so this is a no-op for them.
+    this.lock.releaseAll();
   }
 
   // --- Tasks ---
@@ -3628,7 +3642,17 @@ export class FileStorage implements Storage {
     // Resolve and validate BEFORE the lock: a bad id or a range past the end of
     // the transcript is the caller's error, and other writers should not queue
     // behind it.
-    const resolved = await resolveStoredConversation(this, sessionId);
+    //
+    // Message numbers must mean what the CALLER displayed. A Builder id or a
+    // prefix opens the joined Builder transcript (CLI, dashboard); an exact id
+    // of a LATER segment is a caller still rendering that one segment (Lazy
+    // Teams, until it moves to Builders), so the range is applied to that
+    // segment alone and the promotion is recorded under it.
+    const exactSegment = await this.loadConversation(sessionId);
+    const segmentBuilder = exactSegment ? await this.getBuilder(sessionId) : null;
+    const resolved = exactSegment && segmentBuilder && segmentBuilder.id !== sessionId
+      ? { conversation: exactSegment }
+      : await resolveStoredConversation(this, sessionId);
     if (!resolved) {
       throw new Error(`No builder conversation matches '${sessionId}'.`);
     }
@@ -4944,10 +4968,29 @@ export class FileStorage implements Storage {
   }
 
   async listConversationSummaries(): Promise<ConversationSummary[]> {
+    return sortByStartedAtDesc((await this.listConversationIndexEntries()).map(indexEntryToSummary));
+  }
+
+  async listBuilders(): Promise<BuilderSummary[]> {
+    const entries = await this.listConversationIndexEntries();
+    // The run registry only decides the badge: failing to read it costs the
+    // badge, never the listing.
+    const runs = await this.listBuilderSessions().catch((err) => {
+      logger.warn(`Builders are listed without run state: could not read builder sessions: ${(err as Error).message}`);
+      return [];
+    });
+    return summarizeBuilders(entries, runs);
+  }
+
+  async getBuilder(idOrSegmentId: string): Promise<BuilderSummary | null> {
+    return findBuilder(await this.listBuilders(), idOrSegmentId);
+  }
+
+  private async listConversationIndexEntries(): Promise<ConversationIndexEntry[]> {
     const files = await this.listConversationTranscriptFiles();
     const index = await this.readConversationIndex();
     if (index && conversationIndexMatches(index, files)) {
-      return sortByStartedAtDesc(index.entries.map(indexEntryToSummary));
+      return index.entries;
     }
     if (files.length === 0) {
       // Nothing to index — don't create an empty sidecar in a store that has
@@ -5035,7 +5078,7 @@ export class FileStorage implements Storage {
 
   private async rebuildConversationIndex(
     files: ConversationTranscriptFile[],
-  ): Promise<ConversationSummary[]> {
+  ): Promise<ConversationIndexEntry[]> {
     const entries: ConversationIndexEntry[] = [];
     for (const file of files) {
       try {
@@ -5055,7 +5098,7 @@ export class FileStorage implements Storage {
         `Failed to write conversation index at ${this.conversationIndexPath}: ${(err as Error).message}`,
       );
     }
-    return sortByStartedAtDesc(entries.map(indexEntryToSummary));
+    return entries;
   }
 
   private async upsertConversationIndexEntry(
@@ -5300,6 +5343,18 @@ export class FileStorage implements Storage {
 
   async saveScratchFile(input: ScratchFileInput, actor: Actor): Promise<ScratchFile> {
     assertScratchFileWithinCap(input);
+    // Provenance is the BUILDER, not the segment: a compaction rolls the session
+    // id mid-conversation, and the file must not change hands under its reader.
+    // Resolved outside the lock (it reads the conversation index, not
+    // scratch.json). The supervisor captures the conversation before it syncs
+    // scratch, so the live segment is normally known; when it is not, the stamp
+    // is left off rather than guessed, and readers resolve `session_id`.
+    const builderId = input.session_id
+      ? (await this.getBuilder(input.session_id).catch((err) => {
+          logger.warn(`Could not resolve the Builder of session ${input.session_id} for scratch file ${input.path}: ${(err as Error).message}`);
+          return null;
+        }))?.id
+      : undefined;
     // Locked: read-modify-write of scratch.json. Two builders of the same
     // project capture concurrently, and an unlocked write loses one of them.
     return this.lock.withLock(async () => {
@@ -5316,6 +5371,7 @@ export class FileStorage implements Storage {
         updated_by: actor,
         ...(input.skipped ? { skipped: input.skipped } : {}),
         ...(input.session_id ? { session_id: input.session_id } : {}),
+        ...(builderId ? { builder_id: builderId } : {}),
       };
 
       const next = existing

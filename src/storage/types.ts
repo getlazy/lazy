@@ -570,6 +570,41 @@ export interface StoredConversation {
   messages: StoredMessage[];
   /** Subagent conversations */
   subagents: StoredSubagent[];
+  /**
+   * Lineage evidence of this segment (src/builder/identity.ts), recorded at
+   * capture. Absent on segments captured before Builders existed; those are
+   * stitched from their messages instead.
+   */
+  lineage?: import('../builder/identity').SegmentLineage;
+}
+
+/**
+ * A Builder: one conversation in the human sense — from a start or `/clear` to
+ * the next `/clear` — stitched from the Claude session files ("segments") a
+ * builder run rolls through on compaction and resume. DERIVED from the stored
+ * segments on every read, never stored. See docs/design/builder-identity.md.
+ */
+export interface BuilderSummary {
+  /** Session id of the Builder's first segment. Stable as the Builder grows. */
+  id: string;
+  /** First human message of the first segment. */
+  title: string;
+  startedAt: string | null;
+  endedAt: string | null;
+  /** Git branch recorded by the newest segment. */
+  gitBranch: string | null;
+  /** Segment session ids, oldest first. The last one is where a resume continues. */
+  segments: string[];
+  /** Stats summed over every segment. */
+  stats: ConversationStats;
+  /** Newest capture of any segment (unix ms) — "has this Builder grown since I looked". */
+  importedAt: number;
+  /**
+   * The daemon-registered builder run last known to be in this Builder, or null
+   * when none is known (a host `lazy builder` run is never registered). `live`
+   * is the badge: the run is starting or running.
+   */
+  run: { id: string; state: BuilderSession['state']; live: boolean } | null;
 }
 
 export interface StoredMessage {
@@ -781,6 +816,15 @@ export interface ProxyAuditRecord {
    * back cleanly.
    */
   userId?: string | null;
+  /**
+   * The agent profile whose credential `userId` connected paid for this request,
+   * when that was a credential connected FOR A PROFILE rather than their Claude
+   * credential (src/daemon/member-credentials.ts). A 401 here condemns that
+   * profile's credential, not their Claude one, so the per-member "re-authorize"
+   * verdict (src/proxy/auth-verdict.ts) leaves these records out. Absent on
+   * every other record.
+   */
+  credentialProfile?: string | null;
   /**
    * Resolved backend the request was forwarded to
    * (anthropic|ollama|proxy-upstream|cursor|unknown). `cursor` marks a record
@@ -1151,6 +1195,33 @@ export interface BuilderSession {
   updatedAt: string;
   /** When the session was explicitly ended, or null while live/resumable. */
   endedAt: string | null;
+  /**
+   * How the most recent container ended when nobody stopped it: its exit code
+   * and the tail of its output, recorded when the daemon found a `running` row
+   * whose container was gone. Cleared by the next launch.
+   */
+  lastExit?: string | null;
+  /**
+   * The most recent start's timeline: each step with its duration, where it
+   * stopped and why (src/daemon/builder-start-trace.ts). Replaced by every
+   * start; the same events are in the daemon log under the run id.
+   */
+  startTimeline?: BuilderStartEvent[] | null;
+}
+
+/** One entry of a builder start's timeline. */
+export interface BuilderStartEvent {
+  /** Wall-clock time the event was recorded. */
+  at: string;
+  /** Milliseconds since the start began. */
+  offsetMs: number;
+  /** `step` finished; `failed` stopped the start; `note` is a decision or observation; `done` is the outcome. */
+  kind: 'step' | 'failed' | 'note' | 'done';
+  step: string;
+  /** How long the step took (`step`, `failed`), or the whole start (`done`). */
+  ms?: number;
+  /** The recorded cause of a failure. */
+  detail?: string;
 }
 
 /** Patch accepted by {@link Storage.updateBuilderSession}. */
@@ -1160,4 +1231,6 @@ export interface BuilderSessionUpdate {
   builderId?: string;
   agentSessionId?: string | null;
   endedAt?: string | null;
+  lastExit?: string | null;
+  startTimeline?: BuilderStartEvent[] | null;
 }

@@ -47,7 +47,7 @@ describe('lazy-agent doctor', () => {
       mcpServers: {
         lazy: {
           command: 'lazy-agent',
-          args: ['mcp', '--daemon-config', configPath, '--task-id', 'task-uuid-1', '--worktree', '/repo'],
+          args: ['mcp', '--daemon-config', configPath, '--task-id', 'task-uuid-1', '--worktree', home],
         },
       },
     }));
@@ -117,7 +117,7 @@ describe('lazy-agent doctor', () => {
       mcpServers: {
         lazy: {
           command: 'lazy-agent',
-          args: ['mcp', '--daemon-config', configPath, '--task-id', 'some-other-task', '--worktree', '/repo'],
+          args: ['mcp', '--daemon-config', configPath, '--task-id', 'some-other-task', '--worktree', home],
         },
       },
     }));
@@ -127,12 +127,88 @@ describe('lazy-agent doctor', () => {
     expect(c.detail).toContain('stale');
   });
 
+  // INVARIANT: an entry another process wrote over this session's is named as
+  // such. Claude Code reads one ~/.claude.json per HOME; on 2026-09-28 a leaked
+  // test `lazy mcp` overwrote a builder's entry, and every lazy tool said
+  // "Daemon is not running" against a healthy daemon. The remedy must name the
+  // stray process and how the entry comes back.
+  describe('an entry another process wrote', () => {
+    let prevScratch: string | undefined;
+    beforeEach(() => {
+      prevScratch = process.env.LAZY_SCRATCH_DIR;
+    });
+    afterEach(() => {
+      if (prevScratch === undefined) delete process.env.LAZY_SCRATCH_DIR;
+      else process.env.LAZY_SCRATCH_DIR = prevScratch;
+    });
+
+    /** A builder container: scratch dir set, no LAZY_DAEMON_CONFIG. */
+    function becomeBuilder(): void {
+      delete process.env.LAZY_DAEMON_CONFIG;
+      process.env.LAZY_SCRATCH_DIR = home;
+    }
+
+    test('the incident: a task-scoped server on a builder is flagged even when its worktree exists', async () => {
+      becomeBuilder();
+      await writeFile(join(home, '.claude.json'), JSON.stringify({
+        mcpServers: { lazy: { command: 'bun', args: ['/tmp/x/src/index.ts', 'mcp', '--task-id', '605e9a6b', '--worktree', home] } },
+      }));
+      const result = await runAgentDoctor();
+      const c = check(result.checks, 'claude-json');
+      expect(c.ok).toBe(false);
+      expect(c.detail).toContain('on a builder session');
+      expect(c.detail).toContain('no --daemon-config');
+      expect(c.remedy).toContain('Another process overwrote this entry');
+      // The builder's own config arrives as argv, so its absence from env is not a failure.
+      expect(check(result.checks, 'daemon-config').ok).toBe(true);
+    });
+
+    test("a builder's own entry passes", async () => {
+      becomeBuilder();
+      await writeFile(join(home, '.claude.json'), JSON.stringify({
+        mcpServers: { lazy: { command: 'lazy-agent', args: ['mcp', '--daemon-config', configPath, '--worktree', home] } },
+      }));
+      expect(check((await runAgentDoctor()).checks, 'claude-json').ok).toBe(true);
+    });
+
+    test('a vanished --worktree is flagged, with the path in the remedy', async () => {
+      await writeFile(join(home, '.claude.json'), JSON.stringify({
+        mcpServers: { lazy: { command: 'lazy-agent', args: ['mcp', '--daemon-config', configPath, '--task-id', 'task-uuid-1', '--worktree', '/tmp/lazy-poc-gone/poc-demo'] } },
+      }));
+      const c = check((await runAgentDoctor()).checks, 'claude-json');
+      expect(c.ok).toBe(false);
+      expect(c.detail).toContain("--worktree '/tmp/lazy-poc-gone/poc-demo' does not exist");
+      expect(c.remedy).toContain('--worktree /tmp/lazy-poc-gone/poc-demo');
+    });
+
+    test("a --daemon-config other than this session's is flagged", async () => {
+      const other = join(home, 'other.json');
+      await writeFile(other, '{}');
+      await writeFile(join(home, '.claude.json'), JSON.stringify({
+        mcpServers: { lazy: { command: 'lazy-agent', args: ['mcp', '--daemon-config', other, '--task-id', 'task-uuid-1', '--worktree', home] } },
+      }));
+      const c = check((await runAgentDoctor()).checks, 'claude-json');
+      expect(c.ok).toBe(false);
+      expect(c.detail).toContain("is not this session's config");
+    });
+
+    // A host-process task's entry legitimately has no --daemon-config: it runs
+    // tools in-process. Flagging it would send a human after a process that
+    // does not exist.
+    test("a host-process task's own entry passes", async () => {
+      await writeFile(join(home, '.claude.json'), JSON.stringify({
+        mcpServers: { lazy: { command: 'lazy-agent', args: ['mcp', '--task-id', 'task-uuid-1', '--worktree', home] } },
+      }));
+      expect(check((await runAgentDoctor()).checks, 'claude-json').ok).toBe(true);
+    });
+  });
+
   test('a --daemon-config path that does not exist in this container fails', async () => {
     await writeFile(join(home, '.claude.json'), JSON.stringify({
       mcpServers: {
         lazy: {
           command: 'lazy-agent',
-          args: ['mcp', '--daemon-config', join(home, 'missing.json'), '--task-id', 'task-uuid-1', '--worktree', '/repo'],
+          args: ['mcp', '--daemon-config', join(home, 'missing.json'), '--task-id', 'task-uuid-1', '--worktree', home],
         },
       },
     }));
@@ -177,4 +253,33 @@ describe('lazy-agent doctor', () => {
     expect(text).toContain('lazy-agent doctor — container');
     expect(text).toContain('task: task-uuid-1');
   });
+
+  // INVARIANT: in a member's own terminal container — no lazy MCP server, no
+  // daemon config, no lazy tool permissions, all by design — doctor says it is
+  // a member session and shows those checks as not applicable, never as
+  // failures a member would read as a broken install.
+  test('a member terminal session is named, and its absent MCP is not a failure', async () => {
+    delete process.env.LAZY_DAEMON_CONFIG;
+    await rm(join(home, '.claude.json'));
+    await writeFile(join(home, '.claude', 'settings.json'), '{}\n');
+    await writeFile(join(home, '.claude', 'lazy-member-session'), 'member\n');
+    const result = await runAgentDoctor();
+    expect(result.ok).toBe(true);
+    expect(result.memberSession).toBe(true);
+    expect(result.checks.map((c) => c.id)).toEqual(['daemon-config', 'claude-json', 'tool-permissions']);
+    for (const c of result.checks) expect(c.data?.notApplicable).toBe(true);
+    const text = formatAgentDoctorReport(result);
+    expect(text).toContain('member terminal session: no MCP, no daemon config by design');
+    expect(text).not.toContain('✗');
+    expect(text).not.toContain('builder or project-wide mode');
+  });
+
+  // INVARIANT: the marker alone never turns doctor off — a task container's
+  // home is agent-writable, and it always has LAZY_DAEMON_CONFIG.
+  test('a marker in a container that has a daemon config runs the normal checks', async () => {
+    await writeFile(join(home, '.claude', 'lazy-member-session'), 'member\n');
+    const result = await runAgentDoctor();
+    expect(result.memberSession).toBeUndefined();
+    expect(check(result.checks, 'daemon-config').data?.notApplicable).toBeUndefined();
+  }, 60_000);
 });

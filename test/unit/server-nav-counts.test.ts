@@ -51,11 +51,11 @@ function stubStorage(options: StubOptions = {}): Storage {
             total_open_blocking: blocking,
             total_open_non_blocking: nonBlocking,
           },
-    listConversationSummaries: async () =>
+    listBuilders: async () =>
       fail.has('conversations')
         ? boom('conversations')
         : (options.conversations ?? []).map((importedAt, i) => ({
-            sessionId: `s${i}`, startedAt: null, endedAt: null, importedAt,
+            id: `s${i}`, startedAt: null, endedAt: null, importedAt,
             summary: null, gitBranch: null, stats: null,
           })),
     listTasksWithOptions: async () =>

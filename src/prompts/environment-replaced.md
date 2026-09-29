@@ -1,0 +1,1 @@
+Your environment was replaced before this turn ({{reason}}); anything you installed or changed outside the worktree is gone. The worktree itself is intact.

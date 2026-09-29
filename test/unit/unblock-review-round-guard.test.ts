@@ -86,6 +86,7 @@ function createMockStorage(): any {
     getTaskReviewComments: async () => [],
     getTaskComments: async () => [],
     getTaskJournal: async () => [],
+    getSessionTurns: async () => [],
     listTaskArtifacts: async () => [],
     getLatestWorktreeSnapshot: async () => null,
     getNextTurnSequence: async () => 4,

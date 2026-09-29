@@ -310,58 +310,6 @@ describe('lazy pair', () => {
     expectError(result, 'already being paired on');
   });
 
-  // INVARIANT: pair does NOT enforce auth itself — the daemon credential gate
-  // is the single enforcement point. `lazy pair` auto-starts the daemon, which
-  // refuses to start without a credential. So a missing credential surfaces as
-  // the daemon's actionable error (clients pass through, they don't re-enforce).
-  // This is the behavior that makes dropping the old client-side check safe.
-  //
-  // `LAZY_TEST: ''` is load-bearing: a daemonless suite runs the CLI with
-  // LAZY_TEST=1, under which ensureDaemon() returns early and no daemon is ever
-  // started — so the gate could never fire and the test would sail past into
-  // the launch step. Clearing it restores the real auto-start path (same
-  // technique as daemon.test.ts's credential-gate block). No daemon leaks: the
-  // gate is exactly what stops it from coming up.
-  test('missing credential surfaces the daemon gate error, not a client check', async () => {
-    const taskId = await createTask(ctx, 'No auth task', 'Some work');
-    createSessionManually(ctx, taskId);
-    setTaskStatus(ctx.root, taskId, 'blocked');
-
-    const result = await ctx.lazy(['pair', taskId], {
-      env: {
-        LAZY_TEST: '',
-        CLAUDE_CODE_OAUTH_TOKEN: '',
-        ANTHROPIC_API_KEY: '',
-      },
-    });
-
-    expectFailure(result);
-    // The daemon gate fired — not the old client-side "No API token found".
-    expectError(result, 'Daemon refuses to start');
-    expectError(result, 'ANTHROPIC_API_KEY');
-    expectOutputExcludes(result, 'No API token found');
-  });
-
-  // INVARIANT: the daemon gate is not bypassable by client flags. --no-summary
-  // used to skip pair's local auth check; now there is no client check, and the
-  // daemon still requires a credential regardless of the flag.
-  test('--no-summary does not bypass the daemon credential gate', async () => {
-    const taskId = await createTask(ctx, 'No auth task', 'Some work');
-    createSessionManually(ctx, taskId);
-    setTaskStatus(ctx.root, taskId, 'blocked');
-
-    const result = await ctx.lazy(['pair', taskId, '--no-summary'], {
-      env: {
-        LAZY_TEST: '',
-        CLAUDE_CODE_OAUTH_TOKEN: '',
-        ANTHROPIC_API_KEY: '',
-      },
-    });
-
-    expectFailure(result);
-    expectError(result, 'Daemon refuses to start');
-  });
-
   test('proceeds past the gate when a credential is available', async () => {
     const taskId = await createTask(ctx, 'Auth task', 'Some work');
     createSessionManually(ctx, taskId);

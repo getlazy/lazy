@@ -22,6 +22,8 @@ import {
 import { ANTHROPIC_DEFAULT_TARGET, LOCAL_BACKEND_CREDS } from '../../src/utils/role-target';
 import { NO_CREDENTIAL } from '../../src/config/agent-profiles';
 import { makeDaemonBaseDir, pinDaemonBaseDir } from '../helpers/daemon-base-dir';
+import { NO_PROFILE_CREDENTIAL_MARKER } from '../../src/daemon/credential-gate';
+import { RpcError } from '../../src/daemon/rpc-error';
 
 const ROOT = '/tmp/launch-auth-session-credential';
 const SESSION_TOKEN = `${SESSION_TOKEN_PREFIX}unit-test-owner-placeholder`;
@@ -175,5 +177,66 @@ describe('no launch path bypasses getLaunchAuthEnvVars with a plan credential', 
     const callers = (await sources()).filter(({ src }) => src.includes('credentialEnvForPlan('));
     expect(callers.map(({ file }) => file).sort()).toEqual(Object.keys(REVIEWED).sort());
     for (const { file, src } of callers) expect(REVIEWED[file]!.test(src)).toBe(true);
+  });
+});
+
+/**
+ * INVARIANT: every in-daemon launch paid by the daemon's OWN credential — a
+ * builder session, the review-conversation builder, a machine one-shot — goes
+ * through the turn credential gate inside getLaunchAuthEnvVars. The daemon may
+ * run with no credential at all, so such a launch is refused naming its profile
+ * (never the bare "Authentication required"), and one stored after the daemon
+ * started is loaded rather than needing a restart. A launch carrying a member's
+ * session placeholder is that member's to pay and never asks.
+ */
+describe('getLaunchAuthEnvVars runs the turn credential gate', () => {
+  let undo: () => void;
+  let baseDir: string;
+  const saved = {
+    oauth: process.env.CLAUDE_CODE_OAUTH_TOKEN,
+    apiKey: process.env.ANTHROPIC_API_KEY,
+  };
+  const identity = {
+    role: 'builder' as const, taskId: null, label: 'builder:unit', profile: 'claude-code',
+  };
+
+  beforeEach(async () => {
+    baseDir = await makeDaemonBaseDir();
+    undo = pinDaemonBaseDir(baseDir);
+    clearCredentialGrantCache();
+    setDaemonContext({ webPort: 26024, token: 'test', proxyPort: 40001 });
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    delete process.env.ANTHROPIC_API_KEY;
+  });
+
+  afterEach(async () => {
+    clearDaemonContext();
+    undo();
+    clearCredentialGrantCache();
+    for (const [k, v] of [['CLAUDE_CODE_OAUTH_TOKEN', saved.oauth], ['ANTHROPIC_API_KEY', saved.apiKey]] as const) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    await rm(baseDir, { recursive: true, force: true });
+  });
+
+  test('a launch on the daemon credential with none is refused by profile', async () => {
+    const err = await getLaunchAuthEnvVars(identity, ANTHROPIC_DEFAULT_TARGET, undefined, 'container')
+      .then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(RpcError);
+    expect((err as RpcError).status).toBe(400);
+    expect((err as Error).message).toStartWith(`${NO_PROFILE_CREDENTIAL_MARKER} "claude-code"`);
+    expect((err as Error).message).not.toContain('Authentication required');
+  });
+
+  test('a launch carrying a member session placeholder is not gated', async () => {
+    const injected = [{ key: 'CLAUDE_CODE_OAUTH_TOKEN', value: SESSION_TOKEN }];
+    const vars = await getLaunchAuthEnvVars(identity, ANTHROPIC_DEFAULT_TARGET, undefined, 'container', injected);
+    expect(vars.find((v) => v.key === 'CLAUDE_CODE_OAUTH_TOKEN')?.value).toBe(SESSION_TOKEN);
+  });
+
+  test('a profile on a server that takes no credential is not gated', async () => {
+    const target = { ...ANTHROPIC_DEFAULT_TARGET, credential: NO_CREDENTIAL, profile: 'local-model' };
+    await expect(getLaunchAuthEnvVars(identity, target, undefined, 'container')).resolves.toBeDefined();
   });
 });

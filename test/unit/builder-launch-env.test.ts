@@ -66,6 +66,10 @@ describe('handleGetBuilderLaunchEnv', () => {
       v => v.key === '_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL' && v.value === '1',
     )).toBe(true);
     expect(body.proxyBaseUrl).toMatch(/^http:\/\/(127\.0\.0\.1|host\.docker\.internal):\d+/);
+    // INVARIANT: the daemon serves the builder's CURRENT model/effort with the launch env, so an in-place relaunch never reuses first-start argv.
+    expect(body.directive.effort).toBeTruthy();
+    // INVARIANT: the directive always names a concrete model (the builder default when no profile pins one), never null/omitted.
+    expect(body.directive.model).toMatch(/^claude-/);
     expect(typeof body.lazyVersion).toBe('string');
     expect(body.lazyVersion.length).toBeGreaterThan(0);
   });

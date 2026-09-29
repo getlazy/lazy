@@ -432,6 +432,169 @@ describe('proxy smart routing (failover)', () => {
     primary.server.stop();
   });
 
+  // INVARIANT: an upstream error's MESSAGE reaches the audit record, and the
+  // client still gets the upstream's body byte-for-byte. A bare FAIL(400) in
+  // `lazy watch` is undiagnosable — Anthropic answers many different refusals
+  // with the same 400 — so the proxy records a bounded excerpt of what it said.
+  test('a 400 records the upstream error message and forwards the body unchanged', async () => {
+    const upstreamBody = JSON.stringify({
+      type: 'error',
+      error: { type: 'invalid_request_error', message: 'This model does not support the effort parameter.' },
+      request_id: 'req_1',
+    });
+    const primary = createControllableUpstream(
+      () => new Response(upstreamBody, { status: 400, headers: { 'content-type': 'application/json' } }),
+    );
+    const ms = createMockSink();
+    const proxy = createProxyServer({ port: 0, bind: '127.0.0.1', upstream: primary.url }, ms.sink, null);
+    await waitForFlush(20);
+    const pp = portOf(proxy);
+
+    const resp = await fetch(`http://127.0.0.1:${pp}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'claude-haiku-4-5', messages: [] }),
+    });
+    expect(resp.status).toBe(400);
+    expect(await resp.text()).toBe(upstreamBody);
+    await waitForFlush();
+    const record = ms.records[ms.records.length - 1];
+    expect(record.status).toBe(400);
+    expect(record.error).toBe(
+      'upstream: invalid_request_error: This model does not support the effort parameter.',
+    );
+
+    proxy.stop();
+    primary.server.stop();
+  });
+
+  // INVARIANT: the credential a request carried never reaches the audit record
+  // or the live Watch event through an upstream that echoes it in an error.
+  test('an upstream error echoing the credential is recorded redacted', async () => {
+    const secret = 'sk-ant-api03-ECHOEDSECRETVALUE';
+    const primary = createControllableUpstream(() =>
+      Response.json(
+        { type: 'error', error: { type: 'authentication_error', message: `invalid x-api-key ${secret}` } },
+        { status: 401 },
+      ),
+    );
+    const ms = createMockSink();
+    const published: Array<{ error: string | null }> = [];
+    const activity = { publish: (e: { error: string | null }) => published.push(e) };
+    const proxy = createProxyServer(
+      { port: 0, bind: '127.0.0.1', upstream: primary.url },
+      ms.sink,
+      null,
+      { activity: activity as never },
+    );
+    await waitForFlush(20);
+    const pp = portOf(proxy);
+
+    const resp = await fetch(`http://127.0.0.1:${pp}/v1/messages`, {
+      method: 'POST',
+      headers: { 'x-api-key': secret },
+      body: JSON.stringify({ model: 'claude-haiku-4-5', messages: [] }),
+    });
+    expect(resp.status).toBe(401);
+    await resp.text();
+    await waitForFlush();
+    const record = ms.records[ms.records.length - 1];
+    expect(record.error).toContain('invalid x-api-key');
+    expect(record.error).not.toContain(secret);
+    expect(published.length).toBeGreaterThan(0);
+    for (const e of published) expect(e.error ?? '').not.toContain(secret);
+
+    proxy.stop();
+    primary.server.stop();
+  });
+
+  test('an upstream error echoing a Cursor-keyed credential is recorded redacted', async () => {
+    const secret = 'cursor-key-ECHOEDSECRETVALUE';
+    const primary = createControllableUpstream(() =>
+      Response.json({ error: { type: 'invalid_request_error', message: `bad key ${secret}` } }, { status: 400 }),
+    );
+    const ms = createMockSink();
+    const proxy = createProxyServer({ port: 0, bind: '127.0.0.1', upstream: primary.url }, ms.sink, null);
+    await waitForFlush(20);
+    const resp = await fetch(`http://127.0.0.1:${portOf(proxy)}/v1/messages`, {
+      method: 'POST',
+      headers: { 'x-cursor-api-key': secret },
+      body: JSON.stringify({ model: 'claude-haiku-4-5', messages: [] }),
+    });
+    expect(resp.status).toBe(400);
+    await resp.text();
+    await waitForFlush();
+    const record = ms.records[ms.records.length - 1];
+    expect(record.error).toContain('bad key');
+    expect(record.error).not.toContain(secret);
+
+    proxy.stop();
+    primary.server.stop();
+  });
+
+  test('a Codex 429 records the refusal headers AND the error excerpt', async () => {
+    const primary = createControllableUpstream(() =>
+      new Response(
+        JSON.stringify({ error: { type: 'usage_limit_reached', message: 'limit hit', resets_in_seconds: 600 } }),
+        { status: 429, headers: { 'content-type': 'application/json', 'x-codex-primary-used-percent': '100' } },
+      ),
+    );
+    const ms = createMockSink();
+    const proxy = createProxyServer({ port: 0, bind: '127.0.0.1', upstream: primary.url }, ms.sink, null);
+    await waitForFlush(20);
+    const resp = await fetch(`http://127.0.0.1:${portOf(proxy)}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'gpt-5', messages: [] }),
+    });
+    expect(resp.status).toBe(429);
+    await resp.text();
+    await waitForFlush();
+    const record = ms.records[ms.records.length - 1];
+    expect(record.error).toBe('upstream: usage_limit_reached: limit hit');
+    expect(Object.keys(record.usageLimitHeaders ?? {}).some((k) => k.startsWith('x-codex-'))).toBe(true);
+    expect(Object.keys(record.usageLimitHeaders ?? {}).length).toBeGreaterThan(1);
+
+    proxy.stop();
+    primary.server.stop();
+  });
+
+  test('an SSE error response is streamed through untouched', async () => {
+    const sse = 'event: error\ndata: {"type":"error","error":{"type":"overloaded_error"}}\n\n';
+    const primary = createControllableUpstream(
+      () => new Response(sse, { status: 400, headers: { 'content-type': 'text/event-stream' } }),
+    );
+    const ms = createMockSink();
+    const proxy = createProxyServer({ port: 0, bind: '127.0.0.1', upstream: primary.url }, ms.sink, null);
+    await waitForFlush(20);
+    const resp = await fetch(`http://127.0.0.1:${portOf(proxy)}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'claude-haiku-4-5', messages: [] }),
+    });
+    expect(resp.status).toBe(400);
+    expect(await resp.text()).toBe(sse);
+    await waitForFlush();
+    const record = ms.records[ms.records.length - 1];
+    expect(record.status).toBe(400);
+
+    proxy.stop();
+    primary.server.stop();
+  });
+
+  test('a non-UTF-8 error body reaches the client byte for byte', async () => {
+    const bytes = new Uint8Array([0x7b, 0xff, 0xfe, 0x7d]);
+    const primary = createControllableUpstream(() => new Response(bytes, { status: 400 }));
+    const ms = createMockSink();
+    const proxy = createProxyServer({ port: 0, bind: '127.0.0.1', upstream: primary.url }, ms.sink, null);
+    await waitForFlush(20);
+    const resp = await fetch(`http://127.0.0.1:${portOf(proxy)}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'claude-haiku-4-5', messages: [] }),
+    });
+    expect(new Uint8Array(await resp.arrayBuffer())).toEqual(bytes);
+
+    proxy.stop();
+    primary.server.stop();
+  });
+
   test('unreachable primary with a fallback reroutes; audit trigger is "unreachable"', async () => {
     const deadPort = findFreePort(); // nothing listening
     const fallback = createControllableUpstream(() => Response.json({ ok: true }));

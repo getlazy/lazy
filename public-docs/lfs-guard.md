@@ -50,15 +50,18 @@ Run `lazy doctor` for details.
 deliberate: the point of occurrence gets one generic
 line, doctor is the single place remedies live.
 
-**Lazy never repairs the config for you.** Writing to a user's git config as a
-side effect of `lazy start` is a hidden side effect lazy avoids by design. Lazy detects and refuses; you fix it deliberately:
+**For repositories you manage yourself, lazy does not repair your git config.** Writing to your config as a side effect of `lazy start` is a hidden side effect lazy avoids by design. Lazy detects and refuses; fix it deliberately:
 
 ```bash
 git lfs install --local          # writes filter.lfs.process/clean/smudge + required
 git config filter.lfs.required true
 ```
 
-Configure the mode with `[git] lfs_check` in lazy.toml:
+If installation refuses because a pre-push hook exists, preserve and integrate the hook before deliberately retrying with `git lfs install --local --force`, which replaces it. Lazy Teams does not overwrite custom hooks automatically.
+
+In Lazy Teams, Lazy configures the LFS filter when a project is provisioned and whenever it starts, repairing an existing broken local filter as needed. Members do not need to run Git commands. If setup fails, restart the project; if the git-lfs binary is missing, the operator must update the installation images. Task worktrees share the repository filter configuration.
+
+For repositories you manage yourself, configure the mode with `[git] lfs_check` in lazy.toml:
 
 - `"refuse"` (default) — block the start
 - `"warn"` — start anyway, record a warning on the task

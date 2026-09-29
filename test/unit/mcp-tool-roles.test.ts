@@ -316,9 +316,25 @@ describe('MCP tool roles', () => {
  * lives in the builder system prompt, where the builder reads its contract.
  *
  * Raised to 58,910, ~37 bytes over the agent role (58,873).
+ *
+ * `lazy_token_stats` adds the model-planning read surface requested for both
+ * roles. ARGUED: its schema is the capability (scope, window, grouping and
+ * task filters), not explanatory prose; the description is one sentence and
+ * only the otherwise opaque duration field has help text.
+ * Raised by the serialized schema size, with less than 50 bytes of headroom.
+ *
+ * `lazy_review_comments` and `lazy_review_status` then arrived: two WHOLE NEW
+ * TOOLS — read-only PR/MR reads through the daemon's forge credential, asked
+ * for so agents see review feedback between syncs without holding a token.
+ * ARGUED: a capability that did not exist. TRIMMED: one shared optional
+ * `task` schema with no help text, one shared description tail, and the
+ * descriptions cut from ~190 to ~110 bytes each. The tail keeps one clause
+ * the request asked for: running `gh` or pushing still needs a granted token,
+ * so an agent does not read "no token" as "no token ever needed". Raised to
+ * 60,060, ~40 bytes over the agent role (60,020).
  */
 describe('MCP tool surface byte budget', () => {
-  const BUDGET_BYTES = 58_910;
+  const BUDGET_BYTES = 60_060;
 
   for (const role of ['builder', 'agent'] as const) {
     test(`the ${role} surface stays under budget`, () => {

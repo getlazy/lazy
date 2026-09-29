@@ -14,7 +14,7 @@ A missing `lazy.toml` is a normal condition — lazy uses its defaults. A `lazy.
 
 The most common cause is a **duplicate table**. `lazy init` already writes `[runner]`, `[server]`, `[storage]`, `[remote]`, `[docker]` and others, so appending a second copy of one is a TOML redefinition error. Edit the table that is already there instead of adding another one.
 
-**The daemon refuses to start on such a config**, whether it failed to parse or was rejected for an invalid value — it fails before the dashboard port is bound, with an error naming the file and the cause, and tears down what it had already opened — timers, storage, the lock — so a refused start leaves nothing listening and nothing to clean up by hand. It reads the dashboard port, the bind interface, and the runner from this file and hands the last of those to every task it launches, so starting on guessed values would serve a dashboard on a port you did not configure with a runner you may not have. This joins the daemon's other hard startup preconditions — the credential gate and the [proxy bind](#proxy).
+**The daemon refuses to start on such a config**, whether it failed to parse or was rejected for an invalid value — it fails before the dashboard port is bound, with an error naming the file and the cause, and tears down what it had already opened — timers, storage, the lock — so a refused start leaves nothing listening and nothing to clean up by hand. It reads the dashboard port, the bind interface, and the runner from this file and hands the last of those to every task it launches, so starting on guessed values would serve a dashboard on a port you did not configure with a runner you may not have. This joins the daemon's other hard startup precondition, the [proxy bind](#proxy). A missing model credential is *not* one: only turns need it.
 
 `lazy doctor` is the exception that keeps working: it reports the parse failure as a failed `lazy.toml parses` check and skips every config-dependent check rather than reporting defaults as if you had chosen them. It keeps working *without a daemon*, too — every other command auto-starts one and fails when that start fails, but doctor prints why the daemon isn't there and runs its remaining checks anyway. It is the command you reach for when nothing else runs, so it must not die of the thing it is meant to diagnose.
 
@@ -26,19 +26,20 @@ Controls which AI model agents use by default.
 
 | Key       | Type     | Default                         | Description |
 |-----------|----------|---------------------------------|-------------|
-| `default` | `string` | `"claude-opus-5"` | Default model for sessions. |
+| `default` | `string` | `"claude-sonnet-5-5"` | Default model for task sessions. The builder does not use it — see below. |
 
-Values are raw model IDs — examples: `"claude-opus-5"`, `"claude-sonnet-5"`, `"qwen3.5:35b-a3b-coding-nvfp4"`.
+Values are raw model IDs — examples: `"claude-opus-5-5"`, `"claude-sonnet-5-5"`, `"qwen3.5:35b-a3b-coding-nvfp4"`.
 
 ```toml
 [models]
-default = "claude-opus-5"
+default = "claude-sonnet-5-5"
 ```
+
+`claude-sonnet-5-5` and `claude-opus-5-5` need Claude Code 2.1.284 or newer in the task image; an older one does not know them and runs them with a 200k context window. Rebuild an older image with `lazy upgrade`.
 
 **`default` is an Anthropic model name, so it applies only to agents that speak
 Anthropic model names.** An agent may declare its own default instead: a Cursor
-task with no explicit model runs Cursor's `auto` (Cursor picks the model), and a
-Codex task runs `default` (the Codex CLI's own current default model), not
+task with no explicit model runs Cursor's `auto` (Cursor picks the model), and a Codex task runs `gpt-6-sol`, not
 `models.default` — lazy's default is chosen for Claude Code and means nothing to
 another vendor's registry.
 
@@ -47,8 +48,12 @@ agent CLI and refuses to start one without it, so a turn never silently runs
 whatever the tool itself would pick. Codex's `default` is the one exception in
 spelling only: it is passed by omitting the flag, which is how the Codex CLI
 names its built-in default. `lazy chat` and `lazy pair` run the task's own model.
-Lazy's own background calls (summaries, reports) run the builder profile's
-`model`, else that agent's own default, else `models.default`.
+The builder (`lazy builder`, review turns, one-shots, `lazy chat`, `lazy pair`, summaries and reports) runs the builder profile's
+`model`, else that agent's own default, else `claude-opus-5-5` — never `models.default`,
+which is the task default. Tasks default to the cheaper tier while the builder,
+which plans and reviews across tasks, defaults to the more capable one. To change
+it, point `[models.roles.builder]` at a profile that sets `model`, or pass `--model`
+to `lazy builder`.
 
 **Cursor resolves short names itself.** A task that asked for `opus` may
 actually run whatever snapshot cursor-agent currently maps that alias to
@@ -62,7 +67,8 @@ and so does a model pinned on the task's [agent profile](#agentsname--named-agen
 
 1. `--model` on the command
 2. The task's model, else the profile's model
-3. The agent's own default (Cursor: `auto`; Codex: `default`; Claude Code and Pi declare none)
+3. The agent's own default (Cursor: `auto`, Cursor picks; Codex: `gpt-6-sol`; Claude Code and Pi declare none)
+   — name `default` as a Codex model to let the Codex CLI pick
 4. A project default set outside the repository (where your deployment offers
    one), else `models.default`
 
@@ -145,6 +151,7 @@ A **profile** is the whole answer to "how does this task's agent run": which age
 | `harness`    | `string` | the profile's own name, when that name is a harness | The agent program that drives the turn: `"claude-code"`, `"codex"`, `"cursor"`, or `"pi"`. Unknown values are rejected at load. |
 | `model`      | `string` | the harness default (`qwen3.8:latest` for `pi`; otherwise the harness's own) | Model to ask for. **Required whenever `endpoint` is set** — model names belong to the endpoint, and lazy will not guess one. |
 | `endpoint`   | `string` | the harness default (`http://localhost:11434` for `pi`, `https://api.openai.com` for `codex`; the proxy's primary upstream otherwise) | The upstream **lazy's proxy forwards this profile to** — never an address the agent dials. Host-perspective; see below. |
+| `description` | `string` | built-in's own, else none | When to choose this profile, in plain text (at most 500 characters). Shown next to every agent picker — the web New-task and Edit forms, Lazy Teams' task form and project settings, `lazy system agent`, the builder, and the `agent_profiles` list `lazy_status` returns to agents — so a person or the builder can propose the right profile. It never selects a profile on its own. A block that overrides a built-in keeps the built-in's text unless it writes its own `description`, runs a different `harness`, or sets its own `endpoint`. |
 | `credential` | `string` | inferred from `endpoint` | Name of a stored credential (`lazy auth set <name>`) that pays for this upstream, or `"none"` for an upstream that authenticates nobody. |
 
 ```toml
@@ -155,11 +162,11 @@ endpoint = "http://localhost:11434"
 
 [agents.claude-code]          # overrides the built-in profile of the same name
 harness = "claude-code"
-model = "claude-opus-5"
+model = "claude-opus-5-5"
 
 [agents.work-codex]           # same provider as the built-in codex profile,
 harness = "codex"             # billed to a different key
-model = "gpt-5-codex"
+model = "gpt-6-sol"
 credential = "work-openai"    # any name you choose: `lazy auth set work-openai`
 ```
 
@@ -178,15 +185,17 @@ A private gateway that *does* want a key just names one: `credential = "anthropi
 
 **The wire format is derived, never configured.** Claude Code and Cursor speak the Anthropic Messages API; Codex speaks the OpenAI wire (Chat Completions / Responses); Pi speaks both, and its endpoint decides: `api.openai.com` and `openrouter.ai` put a Pi profile on the OpenAI wire, any other host on the Anthropic one. OpenRouter serves both APIs from one hostname, so each harness takes the one it speaks — Claude Code its Anthropic-compatible Messages endpoint, Codex and Pi its native OpenAI API. Lazy never translates between API shapes, so a profile whose endpoint speaks only the *other* wire (`api.openai.com` under `claude-code`, say) is rejected at load, naming the mismatch and the harnesses that do speak it. The wire also selects which paths the proxy will forward and which usage extractor reads the response, which is why it is not yours to set. For OpenAI-wire profiles the proxy forwards **only the OpenAI inference surface** (`/v1/chat/completions`, `/v1/responses`, model discovery) — never account, billing, or admin endpoints — and counts token usage from both endpoints, streaming or not, into `lazy stats tokens`.
 
+**A Codex endpoint is the API root, without `/v1`.** Lazy adds `/v1` to every Codex request itself, so OpenRouter is `endpoint = "https://openrouter.ai/api"` and OpenAI is `endpoint = "https://api.openai.com"`. An endpoint ending in `/v1` would request `/v1/v1/responses` and fail; lazy warns at load and names the corrected value.
+
 **The profile chooses the upstream, never whether the traffic is proxied.** Every launch goes through lazy's audit/policy proxy, including profiles pinned at a local endpoint. The agent is always handed the proxy's address; where the request goes next is the proxy's decision, made per launch from the profile named on that launch's credential grant — evidence, not a header the agent could set. See [`[proxy]`](#proxy).
 
 **Guardrails (fail hard, no silent fallback):**
 
 - An unknown `harness`, an unknown key, a pinned `endpoint` with no `model`, a harness/endpoint wire contradiction, or a task naming a profile that does not exist — all rejected with an actionable error.
 - Before every launch lazy **preflights** the profile's upstream for reachability. If it is unreachable, the launch fails with an actionable error — lazy **never** silently falls back to another upstream.
-- A pinned profile's `model` is **never silently substituted**; a task that sets its own model (`lazy edit --model`) runs that one instead — a logical alias like `"claude-opus-5"` does not exist in an Ollama registry. Unresolvable model names surface loudly (e.g. Ollama's `404 model not found`).
+- A pinned profile's `model` is **never silently substituted**; a task that sets its own model (`lazy edit --model`) runs that one instead — a logical alias like `"claude-opus-5-5"` does not exist in an Ollama registry. Unresolvable model names surface loudly (e.g. Ollama's `404 model not found`).
 
-**Omitting `endpoint` inherits the harness default, and that default can move.** Two harnesses have one of their own: `pi` runs a local Ollama and `codex` runs `https://api.openai.com`. So a profile of yours that names a model but no endpoint follows its harness — `[agents.my-pi] harness = "pi", model = "claude-opus-5"` runs against the local Ollama, not Anthropic, and `claude-opus-5` is not a model that server has. Lazy warns at startup for exactly that combination (a harness default upstream that is not Anthropic, plus a recognizably Anthropic model), naming the profile and the `endpoint = "https://api.anthropic.com"` line that pins it where you meant. It is a warning, not a refusal: only you can say which service you wanted.
+**Omitting `endpoint` inherits the harness default, and that default can move.** Two harnesses have one of their own: `pi` runs a local Ollama and `codex` runs `https://api.openai.com`. So a profile of yours that names a model but no endpoint follows its harness — `[agents.my-pi] harness = "pi", model = "claude-opus-5-5"` runs against the local Ollama, not Anthropic, and `claude-opus-5-5` is not a model that server has. Lazy warns at startup for exactly that combination (a harness default upstream that is not Anthropic, plus a recognizably Anthropic model), naming the profile and the `endpoint = "https://api.anthropic.com"` line that pins it where you meant. It is a warning, not a refusal: only you can say which service you wanted.
 
 **`endpoint` is host-perspective.** The proxy runs inside the daemon, which is a host process, so it makes the upstream call from the host. Write `endpoint` the way the host reaches the service: `http://localhost:11434`, a LAN IP, a real DNS name. A container-perspective `host.docker.internal` spelling is read as `localhost` (the same service, from the host) with a **warning** naming the value it read; update it to clear the warning. Other hostnames are used exactly as written. Container and host launches alike get the proxy's own address in `ANTHROPIC_BASE_URL`, and only *that* address differs between them.
 
@@ -197,11 +206,11 @@ Because the upstream rides the profile rather than the role, one project can run
 ```toml
 [agents.house-codex]          # the team's OpenAI account
 harness = "codex"
-model = "gpt-5-codex"
+model = "gpt-6-sol"
 
 [agents.work-codex]           # a second OpenAI key, for client work
 harness = "codex"
-model = "gpt-5-codex"
+model = "gpt-6-sol"
 credential = "work-openai"
 
 [agents.local-pi]             # a model server on this machine — no key at all
@@ -216,6 +225,46 @@ lazy create "Sweep the changelog"  --agent local-pi
 ```
 
 Each task's traffic reaches its own upstream with its own credential, and the others are untouched.
+
+### Spreading work across models by tier
+
+Not every task needs the most capable model. A useful split is four tiers, with one profile per tier for each harness you use. Each profile's `description` says when to pick it, and that text appears beside every agent picker, so you, your team and the builder can choose the right tier when a task is created.
+
+| Tier | When | Claude Code | Cursor | Codex |
+|------|------|-------------|--------|-------|
+| **Normal** (the default) | Everyday tasks: features, fixes, tests, docs | `claude-sonnet-5-5` | `composer-2.5` | `gpt-5.6-terra` |
+| **Complex** | Tasks that drive their own subtasks, and highly complex work: cross-cutting design, subtle concurrency, large refactors | `claude-opus-5-5` | `grok-4-7` | `gpt-6-sol` |
+| **Security** | Work touching authentication, credentials, permissions, sandboxing or untrusted input, and security reviews | `claude-opus-5-5` | `claude-opus-5-5` | `gpt-6-sol` |
+| **On demand** | Only when someone asks for it by name: the hardest problems, or a second opinion after another tier got stuck | `claude-fable-5-1` | — | `gpt-6-astra` |
+
+```toml
+[agents.claude-normal]
+harness = "claude-code"
+model = "claude-sonnet-5-5"
+description = "Normal tier (default): everyday features, fixes, tests and docs"
+
+[agents.claude-complex]
+harness = "claude-code"
+model = "claude-opus-5-5"
+description = "Complex tier: tasks that drive subtasks, cross-cutting design, subtle concurrency, large refactors"
+
+[agents.claude-security]
+harness = "claude-code"
+model = "claude-opus-5-5"
+description = "Security tier: authentication, credentials, permissions, sandboxing, untrusted input, security reviews"
+
+[agents.claude-on-demand]
+harness = "claude-code"
+model = "claude-fable-5-1"
+description = "On demand only: use when someone asks for it by name — the hardest problems or a second opinion"
+
+[agent]
+agent_id = "claude-normal"    # new tasks start on the normal tier
+```
+
+`lazy.toml.example` carries the full set for Claude Code, Cursor and Codex. Pick a tier per task with `--agent` (`lazy create "Rework the session store" --agent claude-complex`) or from the Agent profile picker. A tier is a starting point, not a lock: `--model` on a single task still wins.
+
+Model ids differ by harness, and each harness has to know the model. The Claude Code ids above need Claude Code 2.1.284 or newer; `cursor-agent models` and the Codex CLI's model list show what yours offers.
 
 ### Migrating from role backends
 
@@ -303,6 +352,7 @@ Git-related configuration.
 |-------------------------|----------|----------|-------------|
 | `default_branch_prefix` | `string` | `"lazy"` | Prefix for task branches (e.g., `lazy/fix-bug`). Set it to `"wip"` and new task branches are named `wip/fix-bug`. A trailing slash is optional — `"wip"` and `"wip/"` mean the same thing. |
 | `lfs_check`             | `string` | `"refuse"` | Start-time git LFS check on repos that use LFS: `"refuse"` blocks the start when the LFS filter would not run, `"warn"` starts anyway and records a warning, `"off"` disables it. Does not affect the accept-time guard, which always runs — see [LFS guard](lfs-guard.md). |
+| `coauthor_trailer`      | `boolean` | `true` | Adds `Co-Authored-By: Lazy <noreply@getlazy.dev>` to the commits lazy writes for a task: `lazy_commit` commits, the accept squash commit, and the squash-merge commit on GitHub/GitLab. Set `false` to leave it off everywhere. Commits an agent makes itself with plain `git` are not touched. |
 
 Changing `default_branch_prefix` renames nothing. Branches that already exist keep
 their names and their tasks keep working; the new prefix applies to branches created
@@ -945,11 +995,9 @@ agent_id = "local-ollama"     # make it the default for new tasks
 
 Requires Ollama v0.14+ running on the host with the Anthropic Messages API enabled. **Local** Ollama (`http://localhost:11434`, a LAN address) needs **no credential** — that is what the profile's inferred `credential = "none"` means, and the proxy strips the placeholder before forwarding. **Hosted** Ollama (`https://ollama.com`) is inferred as `credential = "ollama"` and needs a key: run `lazy auth set ollama` (never put a key in `lazy.toml`).
 
-**Interaction with the daemon credential gate.** The daemon refuses to start without the credentials its configuration actually requires, on every start path — explicit start, restart, upgrade, and the auto-start that fires on any `lazy` command — because it launches task containers whose traffic it must be able to pay for. The gate is **provider-aware**: it reads the profile each role defaults to and asks for exactly the credentials those profiles name, so a project whose builder *and* agent both run on a local profile (`credential = "none"`) needs no Anthropic credential and starts with none. A **mixed** setup still needs one: if either role's profile bills Anthropic, the daemon requires an Anthropic credential, and the refusal names each missing provider and the command that stores one. The check is presence-only and never calls the API (a blank value counts as absent).
+**When a credential is required.** Only a turn needs one. The daemon starts, clones and serves reads with no model credential; when a turn is about to launch, lazy checks the credential of the profile that turn runs on, and refuses the turn — before anything runs — naming the profile and the credential it lacks. A profile on a local server (`credential = "none"`) never needs one, so an all-local project needs no credential at all, and a mixed setup needs exactly the credentials of the profiles its tasks actually run on. Declaring `[agents.work-codex]` costs nothing until a task selects it. The check is presence-only and never calls the API (a blank value counts as absent); `lazy daemon health` and `lazy doctor` warn about a missing one before a turn is refused. See [Credentials](credentials.md).
 
-The gate reads the **role defaults**, not every profile you declare — adding `[agents.work-codex]` is not a statement that any task runs it, so it is not a reason to refuse a daemon. A task that *selects* such a profile resolves its credential at launch and fails there, naming the profile and the name to store.
-
-A credential satisfies the gate from either source: the **environment** (`CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`, or `LAZY_CREDENTIAL_<NAME>` for a credential you named yourself), or the **credential store** written by `lazy auth set <name>` — see [`[credentials]`](#credentials) and [Credentials](credentials.md). The store is what makes the daemon independent of the shell that starts it, which is why `lazy upgrade` no longer aborts when you run it from a terminal that never exported a token. Because it never calls the API, a credential that is present but *expired* passes the gate — the daemon starts and then every request 401s. `lazy doctor` covers that half: it reads the proxy's audit trail and reports a 401/403 that nothing has succeeded after, with the steps to re-mint. Both halves report on the **daemon's** environment, not the shell you happen to run `lazy doctor` in: the presence check asks the daemon over RPC (which returns presence and the variable *name*, never the credential itself) and labels the source it used — `daemon env: …`, or `shell env: …` plus a caveat when the daemon could not be asked.
+A credential satisfies the turn check from either source: the **environment** (`CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`, or `LAZY_CREDENTIAL_<NAME>` for a credential you named yourself), or the **credential store** written by `lazy auth set <name>` — see [`[credentials]`](#credentials) and [Credentials](credentials.md). The store is what makes the daemon independent of the shell that starts it. Because the check never calls the API, a credential that is present but *expired* passes it — the turn launches and then every request 401s. `lazy doctor` covers that half: it reads the proxy's audit trail and reports a 401/403 that nothing has succeeded after, with the steps to re-mint. Both halves report on the **daemon's** environment, not the shell you happen to run `lazy doctor` in: the presence check asks the daemon over RPC (which returns presence and the variable *name*, never the credential itself) and labels the source it used — `daemon env: …`, or `shell env: …` plus a caveat when the daemon could not be asked.
 
 ---
 
@@ -1000,6 +1048,8 @@ What to do:
 The reasoning is the same as for daemon startup: a transient daemon failure must not be able to drop you out of the audit plane — silently, on a single launch, with no trace afterward that the traffic went unaudited. This applies to every profile, local Ollama and explicitly-pinned endpoints included: they need the proxy's address too, because the proxy is what reaches their upstream.
 
 **A resolved address is only good for the daemon that gave it out.** With the port OS-assigned, a restarted daemon serves the proxy somewhere else, so any address held across a restart is dead. This matters for `lazy upgrade`, which restarts the daemon while your builder session keeps running: the in-container supervisor notices the restart, re-resolves the address against the daemon that came back, and relaunches Claude with `--resume` — rather than leaving you on a dead port. If that re-resolve fails, the session is **not** silently degraded — you get the error above and a `lazy builder --resume <id>` to run once the daemon is healthy, instead of a session that comes back alive but unable to reach the API.
+
+**A reconnect uses your current builder model and effort.** Each time the builder reconnects after a daemon restart, it launches Claude with the model and effort from the current `lazy.toml`, not the ones from when the session started. A `--model` or `--effort` you typed on `lazy builder` stays in force for that session. `lazy doctor` lists running builders whose model or image is behind your config; quit one and run `lazy builder --resume <id>` to refresh it.
 
 | Key        | Type     | Default                          | Description |
 |------------|----------|----------------------------------|-------------|
@@ -1058,6 +1108,23 @@ lazy stats tokens --json                 # machine-readable rollup
 
 `--subtree` needs a `--task` to descend from, and folds in every descendant at every depth — what a parent task (a release task, a cluster) really spent, rather than the handful of turns it ran itself. The *By task* breakdown then has one row per task in the subtree.
 
+Builders and task agents can read the same accounting through `lazy_token_stats`.
+The MCP tool can group recent traffic by task, model, or role and can return the
+per-tool context breakdown for a task. It also joins durable task history to the
+spend: harness, the model that actually served each task (the requested alias is
+listed separately), effort, outcome, feedback rounds, and turn wall-clock where
+recorded. Model summaries include task count, accept and
+first-pass rates, average feedback rounds, and tokens per accepted task. Samples
+below `min_tasks` (three by default) report `insufficient data` instead of a rate.
+
+A task agent gets detailed rows only for itself (and its descendants with
+`subtree: true`), plus
+project-wide model aggregates. A builder gets the project view. Neither view
+contains credential/member labels or currency estimates. Token windows come
+from the bounded proxy audit trail; outcomes and rounds come from durable task,
+session, and turn storage, so the response states which source answered each
+part.
+
 Two scope caveats, both printed in the readout:
 
 - **Every launch lazy makes is proxied**, whatever profile it runs, so all of it appears here. A process lazy did not launch does not.
@@ -1114,7 +1181,7 @@ lazy stats audit --reroutes --json        # failovers, machine-readable
 lazy stats audit 3f9a1c2b                 # full detail for one record
 ```
 
-The listing shows time, record id, role, task, model, tool_use/tool_result counts, total tokens and duration, plus a `NOTES` column that flags the rows worth opening: `DENY(n)`, `REROUTE`, and `FAIL(<status>)` (or `FAIL(no-response)` when the request never got one). Filters — `--task` (short-id prefix), `--role`, `--model` (substring), `--since`/`--last`, `--denied`, `--reroutes`, `--errors` — all combine.
+The listing shows time, record id, role, task, model, tool_use/tool_result counts, total tokens and duration, plus a `NOTES` column that flags the rows worth opening: `DENY(n)`, `REROUTE`, and `FAIL(<status>)` (or `FAIL(no-response)` when the request never got one). A failed request also carries a short excerpt of the error message the upstream answered with, so a `400` says why it was refused. Filters — `--task` (short-id prefix), `--role`, `--model` (substring), `--since`/`--last`, `--denied`, `--reroutes`, `--errors` — all combine.
 
 Passing a record id (the short form from the `ID` column is enough) opens the **detail view** for that request: routing and upstream, request shape and declared tools, token usage, the `tool_use` blocks the agent intended with their paths/commands, `tool_result` previews, the reroute's source and target, and each denial with the rule that fired and the reason given back to the agent. `--json` emits the row list, or — with a record id — the raw record.
 
@@ -1339,11 +1406,12 @@ you, ever, on any surface.
 
 While the task is still open to revision — at the wrap-up that closes a declared-final turn — a task whose range violates a pattern gets a push-back asking the agent to revert the file itself or record a short reason for keeping it. Those reasons are what you read when you decide. The exchange runs once, over the task's whole range. The range is branch-wide: at a parent task's final it includes the changes of its accepted subtasks, so a subtask's protected-file edit that nobody has asked about yet is asked here, where the whole work is being reviewed. The violation itself is detected no matter when it happens: every end-of-turn park scans the task's own changes, so a protected edit still parks the task in `conflict` mid-task, before the agent has had its say — that is exactly what the wrap-up's exchange is for.
 
-**Unblock asks nothing.** `lazy unblock` has no `--approve-file` /
+**Unblock asks nothing.** (It does pass on a Reject made on a review page —
+see below.) `lazy unblock` has no `--approve-file` /
 `--no-approve-files` flags and `lazy_unblock` has no `approved_files`
 parameter — a conflict task is unblocked exactly like a blocked one, as many
-times as the work needs, and the violated files keep the agent's content
-throughout. (Passing a retired flag or parameter is an error pointing at accept,
+times as the work needs, and lazy itself never changes the violated files.
+(Passing a retired flag or parameter is an error pointing at accept,
 not a silent no-op.)
 
 **Accept is the one gate:**
@@ -1354,18 +1422,24 @@ not a silent no-op.)
 | Required? | Yes, while any violation is pending | Yes, while any violation is pending |
 | A pending file left out | makes accept **refuse**; nothing is reverted | makes accept **refuse**; nothing is reverted |
 
-The web review page carries the same decision per file, next to the rendered
-diff: ✅ approves, ⛔ returns the record to *pending*. Accept reads those stored
-decisions, so a file you ticked there needs no flag at the terminal.
+The web review page (and Lazy Teams) carries the same decision per file, next
+to the rendered diff, as two switches: **Approve** and **Reject**. Accept reads
+those stored decisions, so a file approved there needs no flag at the terminal.
+**Reject** keeps the file pending — accept still refuses — and additionally
+makes the next unblock, from any surface, restore that file to its base version
+as lazy's own commit before the agent runs; the agent is then told to make the
+rest of the work fit. Once restored, the file is no longer part of the diff and
+drops off the list, and accept names the restore so the reviewer knows the
+merged tree contains it.
 
 **Approval is sticky.** A file already approved stays approved; only a turn that
 touches it again raises a fresh pending violation to decide. Approving in the
 feedback *text* has no effect anywhere — the flag, the parameter and the page
 are the only channels that are read.
 
-To reverse an approval, un-approve the file on the review page: that puts the
-record back to `pending` rather than to a settled refusal, so accept asks again.
-Or simply ask the agent, in unblock feedback, to revert the file itself. The
+To reverse an approval, press Reject on the review page: the record goes back to
+`pending` (so accept asks again) and the next unblock asks the agent to revert
+the file. Or simply ask the agent, in unblock feedback, to revert it. The
 absence of a CLI/MCP un-approve is deliberate; see
 [CLI and MCP surface asymmetries](./surface-asymmetries.md).
 
@@ -1633,7 +1707,7 @@ This is the **permanent** cap. To steer it at runtime without editing
 - `lazy daemon config get` — configured value, ephemeral override, effective limit, and current running count.
 - `lazy daemon config set max_concurrent_builders <value>` (alias `builders`) — set an **ephemeral** override for the current daemon session. This does **not** change `lazy.toml` and resets on daemon restart.
 - `lazy daemon config reset [key]` — clear the override, reverting to `lazy.toml`.
-- `lazy daemon config set usage_pause_threshold <percent|off>` — a **one-shot** override of [`[usage_pause]`](#usage_pause), used up by the first turn you start, unblock, resume, review or ask for that it lets past a pause.
+- `lazy daemon config set usage_pause_threshold <percent|off>` — a **one-shot** override of [`[usage_pause]`](#usage_pause) for a launch beside any task (a report, a chat); with `off --task <task>`, lets that task's next turn through instead.
 
 **Turn cap (`max_turns_without_human`).** The counter is per-task and increments on every builder- or agent-initiated `lazy unblock`/`lazy resume`/`lazy start`; a **human**-initiated one always resets it to 0. At the cap, the daemon refuses a builder/agent-initiated unblock/resume/start with a `409` naming the task, the count, and the config key — the task stays `blocked` awaiting a human. A human action is never blocked by this cap.
 
@@ -1691,7 +1765,9 @@ past its threshold, or a window the provider already reports as `rejected`.
 Which windows count depends on the agent:
 
 - **Claude Code:** the Claude subscription 5-hour and 7-day windows.
-- **Codex:** the ChatGPT subscription windows.
+- **Codex:** the ChatGPT subscription windows, including any per-model limit.
+  A Codex "usage limit" refusal also pauses the credential until the reset
+  time Codex states, whatever the last percentages said.
 - **Other agents:** never paused, because lazy has no usage signal for them.
 
 Per-minute API-key rate limits never cause a pause. They refill within a
@@ -1753,7 +1829,10 @@ cannot engage for it, and every turn on it starts. Lazy says so rather than
 staying quiet: `lazy doctor` warns "armed, NO READING" for that credential,
 and `lazy stats limits`, `lazy daemon config get` and the dashboard show it
 too. `lazy stats limits` also marks a window whose reset has passed since its
-reading as STALE instead of showing the old percentage.
+reading as reset ("reset at <time> (was N% used)") instead of showing the old
+percentage; in `--json` and `lazy_usage_limits` such a window has
+`usedPercent: null` and a `resetSince` time, with the stored reading kept
+under `storedWindows`.
 
 **Saved readings lazy cannot read.** Lazy keeps the latest reading per
 credential in its task store, so a pause survives a restart. If that file is
@@ -1764,34 +1843,63 @@ pause would judge, and `lazy doctor`, `lazy stats limits`,
 launches go ahead again at the next check. The one-shot override below does not
 lift this.
 
-**Letting one turn through.** To go past the threshold once, for example to
-finish a task, run this yourself, at your own terminal:
+**Letting one task's next turn through.** To go past the threshold once for a
+particular task — for example to finish it — let its next turn through:
+
+```sh
+lazy unblock <task> -m "..." --past-usage-pause   # also on start, resume, review, ask
+lazy daemon config set usage_pause_threshold off --task <task>
+```
+
+The first form lets that launch through. The second lets whichever launch of
+that task comes next through, including one lazy starts by itself (an
+auto-resume, or a subtask start its parent's agent asked for). The local
+dashboard and Lazy Teams show a **Let its next turn through** button beside
+every paused task, and their Start, Unblock and Resume dialogs offer the same
+choice. The builder can do it for you when you ask it to. A task's own agent
+never can.
+
+It is used up by the one launch it lets past the pause; a launch that was not
+paused anyway does not use it. It never lets another task through, never lifts
+unreadable saved readings, and is dropped if the daemon restarts.
+`lazy daemon config reset usage_pause_threshold --task <task>` clears it unused.
+
+**Letting one launch beside any task through.** `lazy report`, `lazy ask` on a
+stored conversation, a chat or a review conversation is not a turn of any task.
+To let one of those through once, run this yourself, at your own terminal:
 
 ```sh
 lazy daemon config set usage_pause_threshold off
 ```
 
 It is refused without an interactive terminal, from inside a container, and
-from anything that is not you, because the override is how a person decides
-to spend past the limit. The agent tools never set or use it. `lazy report`,
-`lazy ask` on a stored conversation, `lazy pair` and `lazy chat` use it only
-from your own terminal too; other commands you run on the host use it
-whenever they are the first paused launch. The dashboard's Pair and Chat
-buttons use it as well (you are signed in to the dashboard), and on a Lazy
-Teams host so does a member's own request, which Lazy Teams sends on that
-member's own token.
+from anything that is not you. It is used up by the first such launch you ask
+for that it lets past a pause, and never lets a task's turn through. `off` is
+the value to use; a number is a threshold for that one launch (even `100` still
+pauses at a full window). `lazy daemon config reset usage_pause_threshold`
+clears it unused.
 
-The override is used up by the **first** thing you ask for that it lets past
-a pause — a start, unblock, resume, review, ask or any of the others above. Then `lazy.toml` applies again. A launch that
-was not paused anyway (another credential, an agent lazy cannot measure,
-pausing off) does not use it, and neither does one it would not let through.
+**Letting one task's next turn through, from the dashboard.** The daemon's
+dashboard lets you do the same for a single task, without touching the
+threshold for anything else:
 
-`off` is the value to use: it lets the next paused turn start whatever the
-reading. A number is a threshold for that one turn, so it only helps when it
-is above the reading. Even `100` still pauses at a full window, or one the
-provider already refuses.
-Turns lazy starts by itself never use it. It is also dropped if the daemon
-restarts. `lazy daemon config reset usage_pause_threshold` clears it unused.
+- The home page's **Usage pause** section lists every task waiting for the
+  reset, and while a credential is paused every started task resting until
+  someone launches it whose next turn would wait, each with a **Let its next
+  turn through** button.
+- A task's own page says when its next turn would be paused, and why, with the
+  same button.
+- The task page's **Start**, **Resume** and **Unblock** dialogs show a
+  **Let this turn through the usage pause** box while the task is paused;
+  tick it to let that one launch through.
+
+This is good for exactly one turn of that task, and the next one pauses again.
+A task waiting for the reset because lazy would have started it by itself (an
+automatic resume, a delivered comment) goes ahead at the next check. Until it
+is used, both pages say who let it through and when, with a **Clear** button
+to take it back. Like the override, it does not lift a pause caused by saved
+readings lazy cannot read, so no button is offered then, and a task's own
+agent can never set it.
 
 **Where to look.** `lazy stats limits` marks paused credentials.
 `lazy daemon config get` shows the thresholds, a pending override (and when

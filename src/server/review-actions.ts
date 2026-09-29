@@ -436,7 +436,14 @@ export interface ReviewActions {
    * `?region=<id>` filter. Omitted, the diff is exactly what it was before
    * regions existed.
    */
-  getDiff(taskId: string, opts?: { region?: string }): Promise<string>;
+  getDiff(taskId: string, opts?: { region?: string; files?: string[] }): Promise<string>;
+
+  /**
+   * The files the task's diff touches, with +/− counts and no patch — what
+   * the Changes tab renders first, before loading any file's hunks. Same
+   * range and `region` scoping as `getDiff`.
+   */
+  listDiffFiles?(taskId: string, opts?: { region?: string }): Promise<import('../git/operations').DiffFileEntry[]>;
 
   /**
    * The task's region cover, as summary rows (no file lists).
@@ -448,6 +455,12 @@ export interface ReviewActions {
   listRegions(taskId: string): Promise<{
     regions: RegionSummary[];
     notes: string[];
+    /** Whether the rows are the authored walkthrough or a hub's derived children map. */
+    source?: 'presentation' | 'children';
+    /** An authored walkthrough exists but the branch moved past it; it is not what is shown. */
+    staleWalkthrough?: boolean;
+    /** Path → the top-level region that owns it. */
+    fileRegions?: Record<string, string>;
   }>;
   /**
    * Per-line unit attribution for the files a Changes view is rendering — the
@@ -512,8 +525,9 @@ export interface ReviewActions {
    * same work turn. Queued behind any in-flight asks, so the conversation
    * finishes before the work starts.
    *
-   * Carries no protected-file decision: unblock never reverts, whatever a
-   * violation's recorded status is.
+   * Carries no protected-file decision. The only file an unblock restores is
+   * one a reviewer already REJECTED — lazy's supervisor does that before the
+   * agent runs (src/protection/rejected-restore.ts).
    *
    * `raisedResolutions` optionally resolves named open raised items before the
    * turn launches (partial OK on unblock — unlike accept). Never inferred from
@@ -524,8 +538,11 @@ export interface ReviewActions {
     message: string,
     raisedResolutions?: RaisedItemResolution[],
     onProgress?: ProgressEmitter,
-    /** keepFeedbackDraft: the text came from an ask box, not the feedback box. */
-    options?: { keepFeedbackDraft?: boolean },
+    /**
+     * keepFeedbackDraft: the text came from an ask box, not the feedback box.
+     * pastUsagePause: the person ticked "Let this turn through the usage pause".
+     */
+    options?: { keepFeedbackDraft?: boolean; pastUsagePause?: boolean },
   ): Promise<UnblockResult>;
   /**
    * Accept the task's work and merge it into the parent.

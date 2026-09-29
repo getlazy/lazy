@@ -41,7 +41,7 @@ A `Comment` created through lazy — `lazy comment`, the web UI, `lazy_comment` 
 
 The delivery cutoff is `session.notes_delivered_through`, advanced by `Storage.markNotesDelivered()` through the newest comment a prompt actually carried (never to "now", so a comment racing prompt assembly rides the next turn). Every surface answering "what has the agent not seen" resolves it through `resolveNotesCutoff()` (`src/task/turn-context.ts`) — never "new since the last agent turn", which ask and sync turns silently skip past.
 
-FORGE (PR/MR) comments are the one exception, opt-in behind `[daemon] auto_react_comments`: nobody is sitting at a lazy CLI about to resume the task. `deliverPendingSignals` tells them apart by `details.source === 'remote'`; a `comment` signal without it is consumed WITHOUT delivery, so a stale queue cannot resurrect the auto-launch. Details in [docs/comment-delivery.md](docs/comment-delivery.md).
+FORGE (PR/MR) comments are the one exception, behind `[daemon] auto_react_comments` (on by default; set it to `false` to turn it off): nobody is sitting at a lazy CLI about to resume the task. `deliverPendingSignals` tells them apart by `details.source === 'remote'`; a `comment` signal without it is consumed WITHOUT delivery, so a stale queue cannot resurrect the auto-launch. Details in [docs/comment-delivery.md](docs/comment-delivery.md).
 
 ### A `cluster` task drives its children, and the driver — not the daemon — decides how many run at once
 
@@ -75,7 +75,7 @@ Neither direction may regress: a parent task's own agent commits can never be on
 
 ### One resolver decides a task's diff base
 
-Every surface rendering "what did this task change" — `handleDiff` (behind `lazy diff`, the web review surface, Teams' `reviewDiff`), `lazy_diff`, the TUI review, the review editor's turn diff, the `lazy show` summary — resolves its base ref through `resolveTaskDiffBase()` (`src/task-diff-base.ts`), which goes through `resolveUpstreamMergeRef()`. Never compute a base ref locally on a new surface, and never "fix" an implausible diff in the display layer: reading the raw local default branch instead attributed every upstream commit since clone time to one task, a 90k-file diff on a freshly seeded project. `resolveTaskDiffBase` never throws and never fetches — `refreshRemote: false` takes the ref NAME from `driver.upstreamRefName()` while leaving every routing decision in `resolveUpstreamMergeRef` exactly as accept sees it. The REVIEW REGIONS carving is on this list too: it takes its range from `resolveTaskDiffContext` (`src/daemon/task-diff-context.ts`, which calls `resolveTaskDiffBase`), so a region can never be carved out of a range `lazy diff` disagrees with. Details in [docs/task-diff-base-resolution.md](docs/task-diff-base-resolution.md).
+Every surface rendering "what did this task change" — `handleDiff` (behind `lazy diff`, the web review surface, Teams' `reviewDiff`), `lazy_diff`, the TUI review, the review editor's turn diff, the `lazy show` summary — resolves its base ref through `resolveTaskDiffBase()` (`src/task-diff-base.ts`), which goes through `resolveUpstreamMergeRef()`. Never compute a base ref locally on a new surface, and never "fix" an implausible diff in the display layer: reading the raw local default branch instead attributed every upstream commit since clone time to one task, a 90k-file diff on a freshly seeded project. `resolveTaskDiffBase` never throws and never fetches — `refreshRemote: false` takes the ref NAME from `driver.upstreamRefName()` while leaving every routing decision in `resolveUpstreamMergeRef` exactly as accept sees it. **What it resolves is always the WHOLE branch** (engineer decision 2026-09-25, reversing the 2026-09-07 hub exclusion that made a landing hub or finished cluster diff as "no changes"): accepted children's files are never hidden on any display surface. `resolveTaskDirectDiff`'s `directOnly` exists for the protected-file resolver alone, and `--full-branch` / `full_branch` are accepted no-ops. Size is handled by loading the web Changes tab file by file (`src/server/review-progressive.ts`), never by capping or hiding files. The REVIEW REGIONS carving is on this list too: it takes its range from `resolveTaskDiffContext` (`src/daemon/task-diff-context.ts`, which calls `resolveTaskDiffBase`), so a region can never be carved out of a range `lazy diff` disagrees with. Details in [docs/task-diff-base-resolution.md](docs/task-diff-base-resolution.md).
 
 ### One resolution decides which run speaks for a `working` task
 
@@ -363,6 +363,16 @@ Written for people outside this repo: a 30-second scan of what's new, changed, o
 - **Intro paragraph: 3 sentences max.** Keep the `Added` / `Changed` / `Fixed` structure; don't rewrite older sections to match.
 
 Example: ``- **`lazy daemon list` / `kill-stray`** — see and reap stray daemons host-wide``
+
+## UI changes ship with screenshots
+
+A UI diff is reviewed by looking, and the reviewer may not be able to run the app — so any task that changes what a person sees attaches screenshots, whoever created the task, whether or not its prompt asks for them. It applies inside `lazy-teams/` too, although that app otherwise opts out of this file. That covers `lazy-teams/app/views`, `lazy-teams/app/components`, `lazy-teams/app/assets`, the daemon dashboard's templates and styles under `src/server/`, and any CLI command's human-readable output.
+
+- **One PNG per changed screen at desktop width**, plus one at phone width for pages with a mobile layout; name each for the screen (`teams-builders-list.png`, `teams-builders-list-phone.png`). For CLI output, a capture of the terminal output.
+- **Attach them as task artifacts**: `lazy_artifact_add` from a task, `lazy artifact add <task> <file>` from a shell.
+- **Name them in the end-of-turn report** — `presentation.screenshots` in `lazy_report`, with a caption per screen.
+
+How to take them is already documented — do not reinvent it: the dashboard via the image's Chromium (`$CHROME_BIN`), [docs/testing-harness.md](docs/testing-harness.md) "Screenshot a page"; Teams via Capybara's `page.save_screenshot` in an opt-in `lazy-teams/test/system/*_screenshots_test.rb` (gated on `TEAMS_SCREENSHOTS=1`, writing under `tmp/`; e.g. `review_keep_your_place_screenshots_test.rb`), with `resize_to_desktop` / `resize_to_mobile` from `lazy-teams/test/application_system_test_case.rb` for the two widths.
 
 ## End-to-End Testing
 

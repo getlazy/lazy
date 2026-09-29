@@ -25,15 +25,16 @@ import { buildMountArgs } from './mounts';
 import { buildPublishArgs } from '../serve/ports';
 // Leaf module: task-env only reaches daemon/paths → utils/home, so this adds no
 // cycle between the capture and daemon layers.
-import { getTaskEnv, buildTaskEnvArgs } from '../daemon/task-env';
+import { getTaskEnv, planTaskEnvLaunchFile, recordTaskEnvLaunched } from '../daemon/task-env';
 import { sessionCredentialEnvFor } from '../daemon/turn-credentials';
 import { isSessionPlaceholderToken } from '../daemon/session-credentials';
 import { isBuildProgressLine, splitLines, formatDuration, buildTimeoutMessage } from './docker-build-output';
-import { buildGitMountArgsFor, buildGitMountArgs, resolveGitMountPaths } from './git-mounts';
+import { buildTaskGitMounts } from './git-mounts';
 import {
   targetEnvVars,
   ANTHROPIC_DEFAULT_TARGET,
   LOCAL_BACKEND_CREDS,
+  teamModeLaunchCreds,
   resolveProfileLaunchCreds,
   usesSyntheticCreds,
   type ProxyAuditHints,
@@ -46,6 +47,8 @@ import { codexLaunchEnvVars } from '../proxy/codex-route';
 import { placeholderizeAuthEnv, type LaunchIdentity } from '../proxy/placeholder-env';
 import { mintCredentialGrant } from '../proxy/credential-broker';
 import { hasDaemonContext, getDaemonContext } from '../daemon/context';
+import { targetCredentialRefusal } from '../daemon/credential-gate';
+import { RpcError } from '../daemon/rpc-error';
 // Cycle: auth-env imports getAuthEnvVars from this module. Safe — both sides
 // are hoisted function declarations, called at request time, never during
 // module evaluation.
@@ -138,7 +141,7 @@ import {
 } from '../agent/binary-install';
 import {
   captureBuildProvenance,
-  DEV_BUILD_INFO,
+  restingBuildInfoContent,
   formatBuildInfoContent,
   formatSourceProvenanceLine,
   type BuildInfoValues,
@@ -1214,6 +1217,7 @@ async function ensureLazyBaseImage(
   dockerfilePath: string,
   binary: string,
   timeoutMs: number,
+  notify?: PhaseNotify,
 ): Promise<void> {
   if (usage.buildable.length === 0) return;
 
@@ -1231,7 +1235,8 @@ async function ensureLazyBaseImage(
   try {
     // No --no-cache: the image is absent, so there is nothing stale to bust, and
     // a warm build cache is the difference between seconds and minutes here.
-    await buildLazyRunnerImage({ binary, timeoutMs });
+    notify?.(`building the base image ${IMAGE_NAME} first`);
+    await buildLazyRunnerImage({ binary, timeoutMs, notify });
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     throw new Error(
@@ -1306,7 +1311,7 @@ async function buildImageWithTags(
       IMAGE_NAME,
       buildTagsFor(IMAGE_NAME),
     );
-    await ensureLazyBaseImage(baseUsage, customPath, binary, timeoutMs);
+    await ensureLazyBaseImage(baseUsage, customPath, binary, timeoutMs, notify);
   } else {
     source = 'the embedded default Dockerfile';
     notify?.(`building ${tags[0]} from the default Dockerfile`);
@@ -1439,7 +1444,7 @@ export async function removeImageTag(ref: string, binary: string = 'docker'): Pr
  *
  * Returns every tag written: the version tag first, then the `:latest` alias.
  */
-export async function buildLazyRunnerImage(options: { binary?: string; noCache?: boolean; timeoutMs?: number } = {}): Promise<string[]> {
+export async function buildLazyRunnerImage(options: { binary?: string; noCache?: boolean; timeoutMs?: number; notify?: PhaseNotify } = {}): Promise<string[]> {
   const binary = options.binary ?? 'docker';
   const noCache = options.noCache ?? false;
 
@@ -1462,6 +1467,7 @@ export async function buildLazyRunnerImage(options: { binary?: string; noCache?:
     source: 'the embedded default Dockerfile',
     reason: `base image ${IMAGE_NAME} requested explicitly`,
     timeoutMs: options.timeoutMs ?? 0,
+    notify: options.notify,
   });
 
   return tags;
@@ -1543,9 +1549,31 @@ export async function ensureImage(
   // agent slot. Serialized, the first builds and the rest fall straight through
   // the hash check below. See `imageBuildMutex` for the residual cross-process
   // race, which is left open deliberately.
-  return imageBuildMutex.withLock(imageName, () =>
-    ensureImageLocked(lazyRoot, repository, imageName, binary, options?.noCache ?? false, options?.agentId, options?.timeoutMs ?? 0, notify)
-  );
+  // Waiting on another caller's build is as long as the build itself, and it
+  // must not look dead to whoever is watching this launch: say so, and keep a
+  // forced heartbeat until the lock is ours (after an upgrade the resumed
+  // turns usually start the build, and a member's terminal waits behind it).
+  let waitHeartbeat: ReturnType<typeof setInterval> | null = null;
+  if (notify && imageBuildMutex.isLocked(imageName)) {
+    const waitStarted = Date.now();
+    const noteWait = throttleNotes(notify);
+    notify(`waiting for ${imageName} to finish building`);
+    waitHeartbeat = setInterval(() => {
+      noteWait(`still waiting for ${imageName} to finish building... (${formatDuration(Date.now() - waitStarted)} elapsed)`, true);
+    }, BUILD_HEARTBEAT_INTERVAL_MS);
+  }
+  const stopWaiting = () => {
+    if (waitHeartbeat) clearInterval(waitHeartbeat);
+    waitHeartbeat = null;
+  };
+  try {
+    return await imageBuildMutex.withLock(imageName, () => {
+      stopWaiting();
+      return ensureImageLocked(lazyRoot, repository, imageName, binary, options?.noCache ?? false, options?.agentId, options?.timeoutMs ?? 0, notify);
+    });
+  } finally {
+    stopWaiting();
+  }
 }
 
 async function ensureImageLocked(
@@ -2068,7 +2096,10 @@ async function buildAgentBinaryFromSourceCheckout(
   } finally {
     // Restore dev defaults so a dev checkout's build-info.ts does not stay dirty
     // with compile-time values after the binary is already stamped.
-    writeFileSync(buildInfoPath, DEV_BUILD_INFO);
+    // Back to the checkout's RESTING content, not always the dev defaults: an
+    // image checkout (no .git) rests on its source stamp, and 'dev' there would
+    // make the daemon forget which commit it runs after its first agent compile.
+    writeFileSync(buildInfoPath, restingBuildInfoContent(sourceRoot));
   }
 }
 
@@ -2199,13 +2230,33 @@ export async function getLaunchAuthEnvVars(
   injectedCreds?: Array<{ key: string; value: string }>,
 ): Promise<Array<{ key: string; value: string }>> {
   const resolved = await withPrimaryUpstream(target ?? ANTHROPIC_DEFAULT_TARGET);
+  // THE TURN CREDENTIAL GATE, for every in-daemon launch paid by the daemon's
+  // own credential (nothing injected): a builder session, a review-conversation
+  // builder, a one-shot. The daemon may be running with no credential at all,
+  // so this is where such a launch loads one stored since startup — or is
+  // refused naming its profile. See src/daemon/credential-gate.ts.
+  if (!injectedCreds?.length && !usesSyntheticCreds(resolved) && hasDaemonContext()) {
+    const refusal = await targetCredentialRefusal(getLazyRoot(), resolved);
+    if (refusal) throw new RpcError(400, refusal);
+  }
   // injectedCreds: either team-mode session placeholders (`lazy-sess-…`, passed
   // through unchanged below) or real credential vars from the host runner's
   // agent — which still need JIT placeholderization. When absent, the profile's
   // own credential slot decides the source: the store for a named/provider slot,
   // the module-level default agent reader for Anthropic.
-  const real =
-    (await resolveProfileLaunchCreds(getLazyRoot(), resolved))
+  //
+  // TEAM MODE (session placeholders injected) never reads the project's store:
+  // every turn is paid by its principal's own credential for the profile. An
+  // Anthropic-wire profile the owner's Claude credential pays on the primary
+  // upstream keeps the session placeholder; any other claude-code or pi profile
+  // gets a stand-in that becomes a GRANT, so the proxy can route it to the
+  // profile's upstream and pay it with the member's credential for that
+  // profile. Another harness (codex, cursor) gets no Anthropic credential at
+  // all — nothing in its turn uses one (see teamModeLaunchCreds).
+  const teamMode = !!injectedCreds?.some((v) => isSessionPlaceholderToken(v.value));
+  const real = teamMode
+    ? teamModeLaunchCreds(resolved, injectedCreds!)
+    : (await resolveProfileLaunchCreds(getLazyRoot(), resolved))
       ?? injectedCreds
       ?? _agent.getAuthEnvVars();
   const proxyPort = hasDaemonContext() ? getDaemonContext().proxyPort : undefined;
@@ -2232,7 +2283,7 @@ export async function getLaunchAuthEnvVars(
  * mount set never exposes the daemon state dir — see the INVARIANT comment there.
  *
  * `gitMountArgs` carries the split `.git` mount (see src/capture/git-mounts.ts);
- * callers build it with `buildGitMountArgsFor(worktreePath)`.
+ * callers build it with `buildTaskGitMounts(root, worktreePath)`.
  */
 export function buildDockerArgs(
   sandbox: SandboxConfig,
@@ -2317,7 +2368,7 @@ export async function runClaude(
   const args = buildDockerArgs(
     sandbox, claudeArgs, agentBinaryPath, imageName, binary,
     getLazyRoot(), authEnvVars,
-    await buildGitMountArgsFor(sandbox.worktreePath),
+    (await buildTaskGitMounts(getLazyRoot(), sandbox.worktreePath)).args,
   );
 
   if (debug) {
@@ -2691,10 +2742,27 @@ export function supervisorWritablePaths(opts: {
   ];
 }
 
-export function buildSupervisorWrapperScript(protocolDir: string, worktreePath: string, writablePaths: string[] = []): string {
+export function buildSupervisorWrapperScript(
+  protocolDir: string,
+  worktreePath: string,
+  writablePaths: string[] = [],
+  /**
+   * Paths inside `writablePaths` that are read-only BY DESIGN — the git
+   * pointer copies (src/git/worktree-pointers.ts). Left out of the adopt probe
+   * and the chown, which would otherwise fire on every turn and fail on them.
+   */
+  readOnlyPaths: string[] = [],
+): string {
   // Use single quotes for the sh -c wrapper to avoid escaping issues.
   // The paths are injected directly — they come from our own code, not user input.
   const adoptArgs = writablePaths.map((p) => `"${p}"`).join(' ');
+  const excl = readOnlyPaths.map((p) => `! -path "${p}"`).join(' ');
+  const probe = excl
+    ? `    find "$p" ! -writable ${excl} -print -quit 2>/dev/null | grep -q . || continue`
+    : '    find "$p" ! -writable -print -quit 2>/dev/null | grep -q . || continue';
+  const chown = excl
+    ? `sudo -n find "$p" ${excl} -exec chown -h "$(id -u):$(id -g)" {} +`
+    : 'sudo -n chown -R "$(id -u):$(id -g)" "$p"';
   return [
     '#!/bin/sh',
     '# PID 1 wrapper — restarts supervisor between turns to release memory.',
@@ -2706,9 +2774,9 @@ export function buildSupervisorWrapperScript(protocolDir: string, worktreePath: 
     'adopt() {',
     '  for p in "$@"; do',
     '    [ -e "$p" ] || continue',
-    '    find "$p" ! -writable -print -quit 2>/dev/null | grep -q . || continue',
+    probe,
     '    if command -v sudo >/dev/null 2>&1; then',
-    '      sudo -n chown -R "$(id -u):$(id -g)" "$p" || echo "lazy: could not take ownership of $p (a root-run daemon on Linux needs this to be writable)" >&2',
+    `      ${chown} || echo "lazy: could not take ownership of $p (a root-run daemon on Linux needs this to be writable)" >&2`,
     '    else',
     '      echo "lazy: $p is not writable by $(id -un) and sudo is unavailable — writes there will fail" >&2',
     '    fi',
@@ -2750,7 +2818,7 @@ export interface SupervisorDockerArgsParams {
   /**
    * Already-built `-v ...` args for the split `.git` mount — common dir
    * read-only, only objects + this worktree's gitdir writable.
-   * Build with `buildGitMountArgsFor(worktreePath)`; see src/capture/git-mounts.ts.
+   * Build with `buildTaskGitMounts(root, worktreePath)`; see src/capture/git-mounts.ts.
    */
   gitMountArgs: string[];
   /**
@@ -3123,6 +3191,8 @@ export async function launchSupervisorAsync(
     taskId: taskId ?? null,
     label: containerName,
     profile: profileNameForAgent(agentId),
+    // What a team-mode proxy finds the turn's principal by — never the code.
+    ...(taskUuid ? { taskUuid } : {}),
   };
   // pi deliberately takes the claude-code path below: it has no credential of
   // its own — its turns RUN ON lazy's Anthropic/Ollama credentials via the
@@ -3145,7 +3215,14 @@ export async function launchSupervisorAsync(
       // the same harness can bill different keys, and the proxy resolves the
       // profile's slot per request — so a check keyed by harness could pass on
       // a key the request is never sent with.
-      const key = await resolveProfileCredential(getLazyRoot(), profile);
+      //
+      // TEAM MODE (a session binding exists) never reads the project's store:
+      // the proxy pays this turn with its principal's own credential for the
+      // profile, which planTurnCredential already required before this launch.
+      // The placeholder is still minted — its grant is what the proxy resolves.
+      const key = sessionCredential
+        ? { source: 'the turn principal\'s own credential for the profile' }
+        : await resolveProfileCredential(getLazyRoot(), profile);
       if (!key) {
         // Name the command after the PROFILE the user chose when that says more
         // than the credential does — `lazy auth` resolves an agent name to the
@@ -3189,10 +3266,13 @@ export async function launchSupervisorAsync(
       authEnvVars.push({ key: agentEnvKey, value: placeholder });
       logger.debug(`Resolved ${harness} API key from ${key.source}; container gets a placeholder`);
     }
-    // The Anthropic/proxy env is still forwarded when resolvable — the
-    // in-container merge phase shells out to `claude`
-    // (src/supervisor/merge.ts) — but its absence must not block a task that
-    // never authenticates against Anthropic.
+    // The proxy address (ANTHROPIC_BASE_URL and friends) is still assembled
+    // here. A credential rides along only on a single-user install, where it
+    // is the user's own; in TEAM MODE a codex or cursor turn carries none at
+    // all (teamModeLaunchCreds) — the merge phase runs the task's own harness
+    // (src/supervisor/merge.ts), so nothing in the turn needs the owner's
+    // Claude credential, and holding it would let the agent spend it. Its
+    // absence must not block a task that never authenticates against Anthropic.
     try {
       authEnvVars = [
         ...(await getLaunchAuthEnvVars(
@@ -3202,8 +3282,8 @@ export async function launchSupervisorAsync(
       ];
     } catch (err) {
       // Distinguish "there is no credential" from "resolving it BROKE". The
-      // first is ordinary \u2014 a cursor task need not have an Anthropic key, and
-      // only the in-container merge phase would miss it. The second means the
+      // first is ordinary \u2014 a cursor task need not have an Anthropic key. The
+      // second means the
       // grant registry or the proxy wiring is faulty, and letting that log at
       // debug as a missing credential is how a broken security path stays
       // invisible (CLAUDE.md: distinguish not-found from found-but-broken).
@@ -3212,14 +3292,13 @@ export async function launchSupervisorAsync(
       if (merelyAbsent) {
         logger.debug(
           `No Anthropic credential forwarded to ${harness} task container${profileNote} ` +
-          `(merge-conflict turns need one): ${message}`
+          `(its own harness does not use one): ${message}`
         );
       } else {
         logger.warn(
           `[proxy] could not build the placeholder auth env for the ${harness} task container${profileNote}: ` +
-          `${message}. The launch continues without Anthropic credentials, so an in-container ` +
-          `merge turn will fail on auth. This is not a missing key — it is a failure to mint or ` +
-          `resolve one.`
+          `${message}. The launch continues without an Anthropic placeholder. This is not a ` +
+          `missing key — it is a failure to mint or resolve one.`
         );
       }
     }
@@ -3284,11 +3363,19 @@ export async function launchSupervisorAsync(
   // container. See src/daemon/task-env.ts. Empty unless the user set one, so
   // the argv is byte-identical to before for every other task. Keyed by the
   // task UUID, not the ref — see RunnerInterface.launchSupervisor.
+  //
+  // Delivered through a 0600 --env-file deleted once `docker run` exits, so the
+  // values never sit in the host process table (`docker inspect` still shows
+  // them — see writeTaskEnvLaunchFile).
   const taskEnv = taskUuid ? await getTaskEnv(repoRoot, taskUuid) : {};
-  const taskEnvArgs = buildTaskEnvArgs(taskEnv);
+  // What this container is created with, so a later reuse can tell whether
+  // `lazy env set` has changed it since (mustRecreateForTaskEnv).
+  if (taskUuid) await recordTaskEnvLaunched(repoRoot, taskUuid, containerName, taskEnv);
+  const taskEnvLaunch = planTaskEnvLaunchFile(repoRoot, containerName, taskEnv);
+  const taskEnvArgs = taskEnvLaunch.args;
 
-  const gitMountPaths = await resolveGitMountPaths(sandbox.worktreePath);
-  const gitMountArgs = buildGitMountArgs(gitMountPaths);
+  // Split .git mount plus read-only pointer copies — see buildTaskGitMounts.
+  const { paths: gitMountPaths, args: gitMountArgs, pointerTargets } = await buildTaskGitMounts(repoRoot, sandbox.worktreePath);
 
   // [serve] ports. Resolved and validated at config load time; here we only
   // turn them into publish args. Empty for a project with no [serve] section.
@@ -3310,6 +3397,7 @@ export async function launchSupervisorAsync(
       objectsDir: gitMountPaths.objectsDir,
       worktreeGitDir: gitMountPaths.worktreeGitDir,
     }),
+    pointerTargets,
   );
 
   // Daemon MCP config is provided by the caller (daemon task launcher).
@@ -3348,7 +3436,18 @@ export async function launchSupervisorAsync(
   // timeout: 0) so a timeout produces an actionable error rather than an opaque
   // signal exit code: on deadline we kill the process, which closes its streams
   // and lets the reads below resolve.
-  const proc = spawn(args, { stdout: 'pipe', stderr: 'pipe', timeout: 0 });
+  //
+  // The task env file exists only for the life of `docker run`: written here,
+  // removed in the finally below (docker has read it by the time run exits).
+  await taskEnvLaunch.write();
+  const proc = await (async () => {
+    try {
+      return spawn(args, { stdout: 'pipe', stderr: 'pipe', timeout: 0 });
+    } catch (err) {
+      await taskEnvLaunch.cleanup();
+      throw err;
+    }
+  })();
 
   let timedOut = false;
   const timer = setTimeout(() => {
@@ -3371,6 +3470,7 @@ export async function launchSupervisorAsync(
     ]);
   } finally {
     clearTimeout(timer);
+    await taskEnvLaunch.cleanup();
   }
 
   if (timedOut) {

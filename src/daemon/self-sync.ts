@@ -37,6 +37,7 @@ import { RpcError } from './rpc-error';
 import { runGit } from '../utils/git';
 import { readWorktreeMergeState, hasUncommittedChanges } from '../git/operations';
 import { logger } from '../utils/logger';
+import { assertTaskWorktreeHead, TaskHeadBranchError } from '../git/worktree-pointers';
 import type { Storage } from '../storage';
 import { turnChannelActor } from './turn-owner';
 import mergeConflictResolutionTemplate from '../prompts/merge-conflict-resolution.md' with { type: 'text' };
@@ -164,6 +165,8 @@ export async function runSelfSync(args: {
   sessionId: string;
   displayId: string;
   worktreePath: string;
+  /** The task's own branch: HEAD must name it before every merge (src/git/worktree-pointers.ts). */
+  branch: string;
   plan: SelfSyncPlanStep[];
   /** Leave a conflicted merge for the calling agent; ordinary sync aborts it before dispatch. */
   leaveConflictInProgress?: boolean;
@@ -179,6 +182,15 @@ export async function runSelfSync(args: {
     const headBefore = await headOf(worktreePath);
     const incoming = await countIncoming(planned.target, worktreePath);
     const message = `Merge ${planned.ref}`;
+
+    // Re-read HEAD right before each merge: the check in syncTaskRun is
+    // followed by a network fetch, and the merge commits on whatever HEAD names.
+    try {
+      await assertTaskWorktreeHead(worktreePath, args.branch);
+    } catch (err) {
+      if (err instanceof TaskHeadBranchError) throw new RpcError(409, err.message);
+      throw err;
+    }
 
     const merge = await runGit(['merge', planned.target, '--no-ff', '-m', message], { cwd: worktreePath });
 

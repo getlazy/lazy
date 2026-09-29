@@ -28,6 +28,7 @@ lazy doctor --clean-orphaned-containers
 lazy doctor --unset-upstream-tracking
 lazy doctor --resume-interrupted-tasks
 lazy doctor --clean-local-command-conversations
+lazy doctor --repair-git-pointers
 ```
 
 Every one of them has the same shape:
@@ -66,6 +67,25 @@ What each one does:
   calls out the one case that is not — a branch whose tracking names a
   *different* branch, where a plain `git pull` on it would merge that other
   branch in.
+- **`--repair-git-pointers`** rewrites a task worktree's `.git`, `commondir`
+  and `gitdir` files back to what lazy created when something changed them.
+  Doctor reports such a worktree as an error — do not run git in it until it is
+  repaired, because the changed files could make git run a program the task
+  left behind. lazy itself refuses to run git there, and the daemon repairs it
+  on its own within seconds; this flag does it on demand. A directory with no
+  `.git` at all is listed but never touched. The same check covers the
+  worktree's submodule repositories: a submodule config setting anything
+  `git submodule` never writes is rewritten to the settings it does write (the
+  original is kept beside it as `config.lazy-quarantine-<id>`), and a hooks
+  folder holding a real hook is renamed `hooks.lazy-quarantine-<id>`.
+  `.git` at all is listed but never touched.
+  It also moves aside any repository a task created inside its worktree (a
+  `.git` in a subfolder that is not a submodule of your base branch), renaming
+  it rather than deleting it; a task whose turn is running is left alone.
+  It also points a task worktree's `HEAD` back at the task's own branch when
+  only the `HEAD` file was changed. A worktree that was really checked out on
+  another branch is listed but not touched; run `git checkout <task branch>` in
+  it (`git stash` first if it has uncommitted changes).
 - **`--resume-interrupted-tasks`** starts the next turn of interrupted tasks
   now. An interrupted task is resumable, not broken, and a running daemon offers
   to resume each one every few seconds — but it holds back a task you stopped
@@ -213,6 +233,18 @@ The common causes, in rough order of frequency:
   always on and has no off switch; the daemon fails loudly rather than silently
   sending traffic direct. Fix the `[proxy]` settings (`port`, `bind`,
   `upstream`) — `lazy daemon logs` says which one failed.
+- **A daemon for this project already runs from another daemon directory:**
+
+  ```
+  Error: A lazy daemon for /path/to/project is already running (PID 222) outside this shell's daemon directory (/root/.lazy/daemon); refusing to start a second one.
+  Point this shell at it:  export LAZY_DAEMON_BASE_DIR=/path/the/daemon/uses
+  ```
+
+  The project's daemon was started with a different `LAZY_DAEMON_BASE_DIR`
+  than your shell has, for example by a managed host. Lazy never starts a
+  second daemon for one project. When it can read the running daemon's
+  directory, it just uses that daemon. Otherwise run the `export` line it
+  prints, or use the shell that started the daemon.
 
 `lazy doctor` deliberately keeps working when the daemon does not — it is the
 one command that must never die of the problem it exists to diagnose.
@@ -729,6 +761,12 @@ Then the checks that read task state are named as skipped, and the remedy is
 `lazy daemon status` / `lazy daemon restart` — never deleting the lock file,
 which would admit a second writer while the daemon still lives.
 
+The same check runs when doctor is started from the dashboard's Doctor page
+(or a hosted Lazy Teams install). There the daemon checks itself by reading its
+own storage directly, so a healthy daemon reports the lock as held "as
+designed". If that check cannot be made at all, doctor says so as a warning
+rather than calling the daemon stuck.
+
 ### When the holder is alive but never lets go
 
 A lock whose holder verifies as the process that took it is *not* stale, so
@@ -956,7 +994,12 @@ docker exec -it <container> bash
 lazy-agent doctor
 ```
 
-It walks the whole chain and marks each link, exiting non-zero if any fails:
+In a terminal you opened yourself in Lazy Teams, doctor says `member terminal
+session: no MCP, no daemon config by design` and marks the lazy-tool checks as
+not applicable (`–`). That environment is yours, not the agent's, and it never
+has lazy's tools — nothing there is broken.
+
+Everywhere else it walks the whole chain and marks each link, exiting non-zero if any fails:
 
 1. **`LAZY_DAEMON_CONFIG`** — set, mounted, readable, parseable; reports the
    project root, task id and daemon target. The bearer token is never printed.
@@ -964,6 +1007,13 @@ It walks the whole chain and marks each link, exiting non-zero if any fails:
    resolve on `PATH`, does its `--daemon-config` path exist in this container,
    and does its `--task-id` match this container's task (a mismatch is a stale
    entry from a previous task).
+   It also fails when the entry was written by another process: its
+   `--worktree` no longer exists, it names a daemon config other than this
+   session's, or — in a builder session — it is scoped to a task. Claude Code
+   reads a single `~/.claude.json`, so a stray `lazy mcp` started in the same
+   container can take over the lazy tools, and every call then fails while the
+   daemon is running. Stop that process (`ps -eo pid,args | grep ' mcp '`) and
+   restart the session, which rewrites the entry.
 3. **`~/.claude/settings.json`** — how many `mcp__lazy__*` entries are allowed.
 4. **Read-only (ask) mode** — on or off, and how many tools that implies. Ask
    turns legitimately get a smaller set; this tells you which count is healthy.
@@ -1130,8 +1180,12 @@ lazy --version
 lazy-agent selfcheck
 ```
 
-Both append branch, commit, clean/dirty, and source path when the binary was built
-from a checkout (dev-mode `bun run ./src/index.ts` runs show `dev` instead).
+Both append branch, commit, clean/dirty, and source path, for example
+`0.90.4100 (main@1a2b3c4, clean, /opt/lazy)`. A run straight from a source
+checkout asks git for the current commit. Images built without git (the daemon
+and Lazy Teams images) carry the identity they were built from; a build that got
+neither git nor that identity prints `(source unknown: …)` rather than nothing.
+`lazy doctor` shows the running daemon's version and commit on its version row.
 `lazy daemon status` includes branch and path on its **Built:** line for compiled
 daemons.
 

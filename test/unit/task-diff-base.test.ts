@@ -300,6 +300,7 @@ describe('resolveTaskDirectDiff (real git)', () => {
       projectRoot: root,
       worktreePath: worktree,
       config: configWithDriver('local'),
+      directOnly: true,
     });
     expect(plan.scopedToDirect).toBe(true);
     expect(plan.paths).toContain('hub-own.txt');
@@ -321,6 +322,7 @@ describe('resolveTaskDirectDiff (real git)', () => {
       projectRoot: root,
       worktreePath: worktree,
       config: configWithDriver('local'),
+      directOnly: true,
     });
     expect(plan.scopedToDirect).toBe(true);
     expect(plan.childAttribution).toEqual([{ childId, paths: ['child-only.txt'], attributed: true }]);
@@ -344,7 +346,6 @@ describe('resolveTaskDirectDiff (real git)', () => {
       projectRoot: root,
       worktreePath: worktree,
       config: configWithDriver('local'),
-      fullBranch: true,
     });
     expect(full.childAttribution).toBeUndefined();
   });
@@ -358,6 +359,7 @@ describe('resolveTaskDirectDiff (real git)', () => {
       projectRoot: root,
       worktreePath: worktree,
       config: configWithDriver('local'),
+      directOnly: true,
     });
     expect(plan.scopedToDirect).toBe(true);
     expect(plan.paths).not.toContain('child-only.txt');
@@ -377,6 +379,7 @@ describe('resolveTaskDirectDiff (real git)', () => {
       projectRoot: root,
       worktreePath: worktree,
       config: configWithDriver('local'),
+      directOnly: true,
     });
     expect(plan.scopedToDirect).toBe(true);
     expect(plan.childAttribution).toEqual([{ childId, paths: [], attributed: false }]);
@@ -398,12 +401,18 @@ describe('resolveTaskDirectDiff (real git)', () => {
       projectRoot: root,
       worktreePath: worktree,
       config: configWithDriver('local'),
+      directOnly: true,
     });
     expect(plan.childAttribution).toEqual([{ childId, paths: [], attributed: false }]);
     expect(plan.paths).toContain('child-only.txt');
   });
 
-  test('fullBranch restores the whole-branch path set', async () => {
+  // INVARIANT: a task's diff is its WHOLE branch — accepted children's files
+  // included — on every display surface. Engineer decision 2026-09-25,
+  // reversing the 2026-09-07 hub exclusion that made a landing hub diff as
+  // "no changes". Only the protected-file resolver scopes to direct work, and
+  // it must ask for that with `directOnly`.
+  test('the default plan is the whole branch, accepted children included', async () => {
     const plan = await resolveTaskDirectDiff({
       task: hubTask(),
       session: { upstream_merge_sha: undefined } as unknown as Session,
@@ -411,8 +420,8 @@ describe('resolveTaskDirectDiff (real git)', () => {
       projectRoot: root,
       worktreePath: worktree,
       config: configWithDriver('local'),
-      fullBranch: true,
     });
+    expect(gitDiffPaths(plan)).toEqual({ paths: undefined, empty: false });
     expect(plan.scopedToDirect).toBe(false);
     expect(plan.paths).toBeUndefined();
     const files = await changedFiles('main', worktree);
@@ -428,6 +437,7 @@ describe('resolveTaskDirectDiff (real git)', () => {
       projectRoot: root,
       worktreePath: worktree,
       config: configWithDriver('local'),
+      directOnly: true,
     });
     expect(plan.scopedToDirect).toBe(true);
     expect(plan.paths).not.toContain('child-only.txt');
@@ -463,6 +473,7 @@ describe('resolveTaskDirectDiff (real git)', () => {
           projectRoot: root,
           worktreePath: worktree,
           config: configWithDriver('local'),
+          directOnly: true,
         });
       } finally {
         spy.mockRestore();

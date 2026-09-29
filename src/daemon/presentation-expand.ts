@@ -10,7 +10,7 @@
  * same way `lazy_regions` calls the regions RPC, and the answer it gets back
  * is the walkthrough as it will be stored.
  *
- * The range is the one `presentedRegions` partitions (`fullBranch: true`,
+ * The range is the one `presentedRegions` partitions (the whole branch,
  * §6.3): a group whose glob matched nothing but files an accepted child
  * brought would otherwise be refused on a release hub, where those files are
  * exactly what the walkthrough is about.
@@ -88,9 +88,7 @@ export async function handleExpandPresentation(
 
   let diffPaths: string[];
   try {
-    const ctx = await resolveTaskDiffContext(storage, projectRoot, params.taskId, {
-      fullBranch: true,
-    });
+    const ctx = await resolveTaskDiffContext(storage, projectRoot, params.taskId);
     const headSha = (await resolveSha(ctx.worktreePath, 'HEAD')) ?? '';
     const baseSha = (await resolveSha(ctx.worktreePath, ctx.fromRef)) ?? ctx.fromRef;
     diffPaths = headSha ? (await listReviewPaths(ctx.worktreePath, baseSha, headSha)).paths : [];

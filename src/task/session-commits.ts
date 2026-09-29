@@ -42,11 +42,14 @@ import type { Storage } from '../storage';
 import type { GitCommitInfo } from '../git/operations';
 import { getNewCommits, isAncestorCommit, getMergeBase } from '../git/operations';
 import { logger } from '../utils/logger';
+import { assertTaskWorktreeHead } from '../git/worktree-pointers';
 
 /** The subset of a session this module needs. */
 export interface CommitScanSession {
   id: string;
   git_start_sha: string;
+  /** The task's own branch; when given, a worktree whose HEAD names another is not recorded from. */
+  git_branch?: string;
 }
 
 export interface CommitScan {
@@ -137,6 +140,18 @@ export async function recordSessionCommits(
   cwd: string,
   label: string,
 ): Promise<CommitScan> {
+  // HEAD is what the scan walks: a worktree whose HEAD a task redirected to
+  // another branch would record THAT branch's commits as this task's work.
+  if (session.git_branch) {
+    try {
+      await assertTaskWorktreeHead(cwd, session.git_branch);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error(`Task ${label}: not recording commits — ${message}`);
+      return { base: null, commits: [], all: [], reason: message };
+    }
+  }
+
   let scan: CommitScan;
   try {
     scan = await scanSessionCommits(storage, session, cwd);

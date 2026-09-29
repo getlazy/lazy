@@ -13,7 +13,8 @@
 
 import type { Storage } from '../storage/interface';
 import type { ScratchFile, ScratchSkipReason } from '../types';
-import type { SearchResult } from '../storage/types';
+import type { BuilderSummary, SearchResult } from '../storage/types';
+import { findBuilder } from './identity-view';
 import { executeSearch } from '../search/run';
 import { MAX_SCRATCH_FILE_BYTES, MAX_SCRATCH_SANDBOX_BYTES, formatBytes } from './scratch-limits';
 
@@ -25,13 +26,20 @@ export interface ScratchFileEntry {
   /** Human sentence for `skipped`; absent for stored files. */
   skippedReason?: string;
   session_id?: string;
+  /** The Builder that last wrote the file (docs/design/builder-identity.md). */
+  builder_id?: string;
   created_at: number;
   updated_at: number;
   updated_by: string;
 }
 
-/** Files of one builder session, path-ordered. `session_id` null = not recorded. */
+/**
+ * Files last written by one Builder, path-ordered. `builder_id` null = not
+ * recorded. `session_id` carries the same id (a Builder id is its first
+ * segment's session id) for clients that read the pre-Builder field.
+ */
 export interface ScratchSessionGroup {
+  builder_id: string | null;
   session_id: string | null;
   /** Newest capture in the group — the order groups are listed in. */
   latest_at: number;
@@ -59,6 +67,7 @@ export function scratchEntry(file: ScratchFile): ScratchFileEntry {
     size: file.size,
     ...(file.skipped ? { skipped: file.skipped, skippedReason: describeScratchSkip(file.skipped) } : {}),
     ...(file.session_id ? { session_id: file.session_id } : {}),
+    ...(file.builder_id ? { builder_id: file.builder_id } : {}),
     created_at: file.created_at,
     updated_at: file.updated_at,
     updated_by: String(file.updated_by),
@@ -66,17 +75,31 @@ export function scratchEntry(file: ScratchFile): ScratchFileEntry {
 }
 
 /**
- * Group captured files by the builder session that last wrote them. Groups run
- * newest-first; files within a group sort by path. Files with no recorded
- * session form one trailing group.
+ * The Builder that last wrote `file`: its stamp, else its segment resolved
+ * against `builders` (a file captured before the stamp existed, or before its
+ * segment was), else the bare segment id.
  */
-export function groupScratchBySession(files: ScratchFile[]): ScratchSessionGroup[] {
+export function scratchBuilderId(file: ScratchFile, builders: BuilderSummary[]): string | null {
+  // A stamped id is re-resolved too: a Builder's id moves when an older segment
+  // of it is captured later, and its files must stay in one group.
+  if (file.builder_id) return findBuilder(builders, file.builder_id)?.id ?? file.builder_id;
+  if (!file.session_id) return null;
+  return findBuilder(builders, file.session_id)?.id ?? file.session_id;
+}
+
+/**
+ * Group captured files by the BUILDER that last wrote them — never by segment,
+ * so a compaction does not split one conversation's files in two. Groups run
+ * newest-first; files within a group sort by path. Files with no recorded
+ * writer form one trailing group.
+ */
+export function groupScratchBySession(files: ScratchFile[], builders: BuilderSummary[] = []): ScratchSessionGroup[] {
   const groups = new Map<string | null, ScratchSessionGroup>();
   for (const file of files) {
-    const key = file.session_id ?? null;
+    const key = scratchBuilderId(file, builders);
     let group = groups.get(key);
     if (!group) {
-      group = { session_id: key, latest_at: 0, files: [] };
+      group = { builder_id: key, session_id: key, latest_at: 0, files: [] };
       groups.set(key, group);
     }
     group.files.push(scratchEntry(file));

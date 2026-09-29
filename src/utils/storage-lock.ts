@@ -506,6 +506,19 @@ export class StorageLock {
   }
 
   /**
+   * Give the lock up entirely, whatever the re-entry depth — for an owner that
+   * took it with a bare `acquire()` and holds it for its life (the daemon's
+   * long-lived Storage), on close. Without this a cleanly stopped daemon left
+   * `.storage-lock` naming its pid for whoever came next to judge. A no-op
+   * for an instance that does not hold it.
+   */
+  releaseAll(): void {
+    if (this.depth <= 0) return;
+    this.depth = 1;
+    this.release();
+  }
+
+  /**
    * Run a function while holding the storage lock, with MUTUAL EXCLUSION both
    * across processes (the lock file) and within this one (a FIFO queue).
    * Guarantees the lock is released even if the function throws.

@@ -69,6 +69,19 @@ describe('web task page: Comments and Journal tabs', () => {
     expect(journal).toContain('Chose K=3 because.');
   });
 
+  // The engineer pastes ids, not URLs: a short task id in a comment must be
+  // one click from that task, and a hex string nothing resolves must not be.
+  test('a short task id in a comment links to that task; an unknown one does not', async () => {
+    const id = await blockedTask('Id links');
+    const other = await createTask(ctx, 'Referenced task', 'Do other work');
+    const short = other.slice(0, 8);
+    await ctx.lazy(['comment', id, '-m', `See ${short} and deadbee1, not \`${short}\`.`]);
+    const comments = await (await fetch(`${base}/tasks/${id}/comments`)).text();
+    expect(comments).toMatch(new RegExp(`<a href="/tasks/[^"]+" class="lz-task-link">${short}</a>`));
+    expect(comments).toContain(`<code>${short}</code>`);
+    expect(comments).not.toContain('>deadbee1</a>');
+  });
+
   function postEdit(id: string, commentId: string, content: string) {
     return fetch(`${base}/tasks/${id}/comments/${commentId}/edit`, {
       method: 'POST',

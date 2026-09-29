@@ -43,12 +43,18 @@ if [[ "${ENV_ONLY}" == "0" ]]; then
   [[ -S /var/run/docker.sock ]] || fail "/var/run/docker.sock is missing — is the Docker daemon running?"
 fi
 
+# Where the secrets go: `.env` beside this script by default, which is what
+# compose reads. bin/native-install passes BOOTSTRAP_ENV_FILE with --env-only,
+# because a native install keeps its .env with its data, outside any checkout.
+ENV_PATH="${BOOTSTRAP_ENV_FILE:-.env}"
+case "${ENV_PATH}" in /*) ENV_SHOWN="${ENV_PATH}" ;; *) ENV_SHOWN="${DEPLOY_DIR}/${ENV_PATH}" ;; esac
+
 rand_hex() { openssl rand -hex "${1}"; }
 
-if [[ -f .env ]]; then
-  echo "bootstrap: .env already exists — leaving it in place"
+if [[ -f "${ENV_PATH}" ]]; then
+  echo "bootstrap: ${ENV_SHOWN} already exists — leaving it in place"
 else
-  echo "bootstrap: writing .env (edit APP_HOST before enabling TLS)"
+  echo "bootstrap: writing ${ENV_SHOWN} (edit APP_HOST before enabling TLS)"
   APP_HOST="${APP_HOST:-localhost}"
   SECRET_KEY_BASE="$(rand_hex 64)"
   AR_PRIMARY="$(rand_hex 32)"
@@ -71,10 +77,10 @@ else
   # world-readable). This file holds SECRET_KEY_BASE and the three encryption
   # keys, and on a native install it is the operator's permanent key store on a
   # personal machine, not a throwaway inside a server's deploy directory.
-  : > .env
-  chmod 600 .env
+  : > "${ENV_PATH}"
+  chmod 600 "${ENV_PATH}"
 
-  cat > .env <<EOF
+  cat > "${ENV_PATH}" <<EOF
 APP_HOST=${APP_HOST}
 # The image already sets this, so it changes nothing for a compose install. It
 # is written here for the NATIVE one, where \`.env\` is the whole of what an
@@ -101,8 +107,8 @@ FORCE_SSL=${FORCE_SSL}
 EOF
 fi
 
-# shellcheck disable=SC1091
-set -a && source .env && set +a
+# shellcheck disable=SC1090,SC1091
+set -a && source "${ENV_PATH}" && set +a
 
 # A STRING, not a bash array. This script runs under `set -u`, and macOS ships
 # bash 3.2, where expanding an empty array is an unbound-variable error rather
@@ -123,13 +129,12 @@ done
 
 if [[ "${ENV_ONLY}" == "1" ]]; then
   echo ""
-  echo "Secrets written to ${DEPLOY_DIR}/.env."
+  echo "Secrets written to ${ENV_SHOWN}."
   echo ""
   echo "  1. Set APP_HOST to the hostname this install is reached at, and"
   echo "     FORCE_SSL=true once there is HTTPS in front of it."
   echo "  2. Load them and start the app natively:"
-  echo "       set -a && source ${DEPLOY_DIR}/.env && set +a"
-  echo "       cd ${DEPLOY_DIR}/.. && RAILS_ENV=production bin/native-start"
+  echo "       cd ${DEPLOY_DIR}/.. && bin/native-start --env-file ${ENV_SHOWN}"
   echo ""
   echo "  KEEP THIS FILE. The three AR_ENCRYPTION_* values decrypt every stored"
   echo "  credential; regenerating them makes the existing ones unreadable."
@@ -189,7 +194,8 @@ echo "       cd ${DEPLOY_DIR}"
 echo "       ${COMPOSE_CMD} pull"
 echo "       ${COMPOSE_CMD} up -d"
 echo ""
-echo "     Building from a source checkout instead (developers):"
+echo "     Building from a source checkout instead (developers) — the daemon image first:"
+echo "       docker build \$(../../scripts/source-stamp-build-args.sh) -f daemon-image/Dockerfile -t lazy-daemon:local ../.."
 echo "       ${COMPOSE_CMD} -f docker-compose.yml${BACKEND_FILES} -f docker-compose.build.yml up -d --build"
 echo ""
 echo "     For automatic HTTPS with Let's Encrypt (ports 80 and 443 on this host):"

@@ -98,7 +98,12 @@ import { theme } from '../../render/theme';
  */
 function effectAdvice(credential: CredentialName, session = false): string[] {
   if (credentialNeedsDaemonRestart(credential)) {
-    return ['The daemon loads it at startup — restart it to pick this up now: lazy daemon restart'];
+    // A daemon with none yet loads it at the next turn that needs it (the turn
+    // gate, src/daemon/credential-gate.ts); one already holding a copy keeps it.
+    return [
+      'A running daemon with no Anthropic credential loads this at the next turn. If it already had one, ' +
+      'restart it to switch: lazy daemon restart',
+    ];
   }
   return [
     session || credentialSelfRefreshing(credential)

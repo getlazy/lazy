@@ -22,7 +22,7 @@
  * actually launched.
  */
 
-import { getOrCreateStorage, handleDiff, handleFileLines, RpcError } from './rpc-handlers';
+import { getOrCreateStorage, handleDiff, handleFileLines, RpcError, withLaunchAllowance } from './rpc-handlers';
 import { launchAskTaskAwaited, launchUnblockTask, acceptTask, syncTask } from './task-lifecycle';
 import type { ProgressEmitter } from './progress';
 import { logger } from '../utils/logger';
@@ -187,15 +187,22 @@ export function createReviewActions(projectRoot: string): ReviewActions {
       return entries;
     },
 
-    async getDiff(taskId: string, opts?: { region?: string }): Promise<string> {
+    async getDiff(taskId: string, opts?: { region?: string; files?: string[] }): Promise<string> {
       // includeComments: false — the review page PARSES this as a unified
       // diff, and the synthetic `diff --lazy a/comments b/comments` section is
       // not a git patch. The page renders comments as threads anyway; sending
       // them as diff text once produced a phantom "comments" file.
       const result = (await handleDiff(projectRoot, {
         taskId, full: true, includeComments: false, region: opts?.region,
+        ...(opts?.files ? { files: opts.files } : {}),
       })) as { output: string };
       return result.output ?? '';
+    },
+
+    async listDiffFiles(taskId: string, opts?: { region?: string }) {
+      const { handleDiffFiles } = await import('./rpc-handlers');
+      const result = await handleDiffFiles(projectRoot, { taskId, region: opts?.region });
+      return result.files;
     },
 
     async listRegions(taskId: string) {
@@ -211,7 +218,7 @@ export function createReviewActions(projectRoot: string): ReviewActions {
         const { loadPresentedRegions } = await import('./regions-presentation');
         const { regionSummary } = await import('../regions');
         const storage = await getOrCreateStorage();
-        const { cover, hashes } = await loadPresentedRegions(storage, projectRoot, taskId, {
+        const { cover, hashes, source, staleWalkthrough } = await loadPresentedRegions(storage, projectRoot, taskId, {
           // Navigation on top of the diff: a hub's first carve must not hold
           // the Changes tab, and a stale map scopes exactly as correctly.
           lenientHubCarve: true,
@@ -222,6 +229,13 @@ export function createReviewActions(projectRoot: string): ReviewActions {
             // head: a sign-off survives a commit that touched another region.
             regionSummary(r, { headSha: hashes.get(r.id) ?? cover.head_sha })),
           notes: cover.notes,
+          source,
+          staleWalkthrough: staleWalkthrough === true,
+          // Which top-level region owns each file — the Changes tab's file
+          // list names it per row. A partition, so one owner per path.
+          fileRegions: Object.fromEntries(
+            cover.regions.filter((r) => r.depth === 0).flatMap((r) => r.files.map((f) => [f, r.id])),
+          ),
         };
       } catch (err) {
         logger.debug(
@@ -436,7 +450,7 @@ export function createReviewActions(projectRoot: string): ReviewActions {
       message: string,
       raisedResolutions?: RaisedItemResolution[],
       onProgress?: ProgressEmitter,
-      options?: { keepFeedbackDraft?: boolean },
+      options?: { keepFeedbackDraft?: boolean; pastUsagePause?: boolean },
     ) {
       const storage = await getOrCreateStorage();
       const resolved = await storage.resolveTask(taskId);
@@ -465,7 +479,11 @@ export function createReviewActions(projectRoot: string): ReviewActions {
           // (move-file-approval-to-accept): a pending violation stays pending,
           // the file keeps the agent's content, and the ✅/⛔ the reviewer sets
           // on this page is read at ACCEPT.
-          result = await launchUnblockTask(projectRoot, {
+          // "Let this turn through the usage pause" rides as the per-task
+          // allowance for THIS launch only, exactly as the RPC's usagePausePastOnce.
+          result = await withLaunchAllowance('unblockTask', {
+            taskId: fullId, actor: 'human', usagePausePastOnce: options?.pastUsagePause === true,
+          }, () => launchUnblockTask(projectRoot, {
             taskId: fullId,
             message,
             actor: 'human',
@@ -481,7 +499,7 @@ export function createReviewActions(projectRoot: string): ReviewActions {
               : {}),
             ...(options?.keepFeedbackDraft ? { keepFeedbackDraft: true } : {}),
             onProgress,
-          });
+          }));
         } catch (err) {
           // The turn never launched, so the comments stay pending_delivery and
           // will ride the next unblock. Nothing is marked delivered.
@@ -569,10 +587,12 @@ export function createReviewActions(projectRoot: string): ReviewActions {
       const merged = mergedViolationRecords(turns, state.detected, approved ? [file] : []);
       const updated: FileViolation[] = merged.map((v) =>
         v.file === file
-          // Back to 'pending', never 'rejected' — see setViolationDecision on
-          // the port for why writing 'rejected' here would let a later accept
-          // merge the refused change.
-          ? { ...v, status: approved ? ('approved' as const) : ('pending' as const) }
+          // Reject is 'pending' + rejected_at, never status 'rejected' — see
+          // setViolationDecision on the port for why writing 'rejected' here
+          // would let a later accept merge the refused change.
+          ? approved
+            ? { file: v.file, base_sha: v.base_sha, status: 'approved' as const }
+            : { file: v.file, base_sha: v.base_sha, status: 'pending' as const, rejected_at: Date.now() }
           : v,
       );
       await storage.updateTurnViolations(resolved.task.id, ledgerTurn.id, updated);

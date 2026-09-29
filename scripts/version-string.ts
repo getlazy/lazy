@@ -11,12 +11,15 @@
  *   - the patch component is `git rev-list --count HEAD`
  *   - `-alpha` is appended whenever the build is NOT from `main`
  *
- * If git is unavailable (e.g. `bun install` in a non-git context), falls back to
- * package.json's version verbatim.
+ * If git is unavailable, the count and branch come from the checkout's source
+ * stamp (src/utils/source-stamp.ts) — how an image built from a tree with no
+ * `.git` still reads `0.90.4100-alpha` rather than package.json's `0.90.0`.
+ * With neither, falls back to package.json's version verbatim.
  */
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { spawnSyncUnsupervised } from '../src/utils/spawn';
+import { readSourceStamp } from '../src/utils/source-stamp';
 
 /** Git probes during version computation should finish quickly or fall back. */
 const GIT_PROBE_TIMEOUT_MS = 5_000;
@@ -68,12 +71,17 @@ export function detectBranch(root: string): string | null {
 export function computeVersion(root: string): string {
   const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf-8'));
 
+  const [major, minor] = String(pkg.version).split('.');
+
   const commitCount = git(['rev-list', '--count', 'HEAD'], root);
   if (!commitCount || !/^\d+$/.test(commitCount)) {
-    return pkg.version;
+    // No git: an image build carries the count in its source stamp.
+    const stamp = readSourceStamp(root);
+    if (stamp?.commitCount == null) return pkg.version;
+    const stampSuffix = stamp.branch !== null && stamp.branch !== 'main' ? '-alpha' : '';
+    return `${major}.${minor}.${stamp.commitCount}${stampSuffix}`;
   }
 
-  const [major, minor] = String(pkg.version).split('.');
   const branch = detectBranch(root);
   const suffix = branch !== null && branch !== 'main' ? '-alpha' : '';
   return `${major}.${minor}.${commitCount}${suffix}`;

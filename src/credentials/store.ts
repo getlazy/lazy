@@ -13,9 +13,9 @@
  *                           Service, or a 0600 file (see ./backends.ts).
  *
  * WHY SPLIT. Reading a secret out of the macOS Keychain can block on a GUI
- * unlock prompt. The daemon credential gate runs on EVERY daemon start,
- * including detached auto-starts with no terminal and no session to answer one,
- * and all it needs to know is whether a credential exists — the same
+ * unlock prompt. Presence is asked on every turn launch and every health check,
+ * including from a detached daemon with no terminal and no session to answer
+ * one, and all it needs to know is whether a credential exists — the same
  * "presence, not validity" line ../daemon/credential-gate.ts already draws.
  * So presence is a plain JSON read that works offline and prompts for nothing,
  * and the secret is touched by the daemon at hydration — and after that only
@@ -171,6 +171,17 @@ export function credentialHint(secret: string): string {
 }
 
 /**
+ * The index exists but will not parse. Its own type so a caller that can act
+ * without the index (the local daemon client) can tell it from a read failure.
+ */
+export class CredentialIndexParseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CredentialIndexParseError';
+  }
+}
+
+/**
  * Read the non-secret index.
  *
  * A missing file is the normal state of every install that has never run
@@ -196,7 +207,7 @@ export async function readCredentialIndex(projectRoot: string): Promise<Credenti
   try {
     parsed = JSON.parse(raw);
   } catch (err) {
-    throw new Error(
+    throw new CredentialIndexParseError(
       `Failed to parse the credential index at ${path}: ` +
       `${err instanceof Error ? err.message : String(err)}. ` +
       `Fix or delete the file, then re-run \`lazy auth set <provider>\`.`,

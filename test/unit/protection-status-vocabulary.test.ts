@@ -17,6 +17,7 @@ import {
   protectionAdvice,
   protectionHeadline,
   protectionToJson,
+  protectionStatusForTask,
   type ProtectionContext,
   type TaskProtectionStatus,
 } from '../../src/protection/status';
@@ -42,6 +43,7 @@ function ctx(over: Partial<ProtectionContext> = {}): ProtectionContext {
     protectedBranches: [],
     gateDefaultBranch: false,
     defaultBranch: null,
+    remoteDefaultBranch: null,
     protectedTaskIds: new Map(),
     ...over,
   };
@@ -222,5 +224,36 @@ describe('review header', () => {
   test('says nothing when there is no gate', () => {
     expect(buildStatusLine(reviewData(null))).not.toContain('[P]');
     expect(buildStatusLine(reviewData(status()))).not.toContain('[P]');
+  });
+});
+
+describe('protectionStatusForTask target resolution', () => {
+  const untargeted = (branch: string) =>
+    ({ id: 't1', target: { kind: 'branch', branch } }) as unknown as Task;
+  const storage = {} as Parameters<typeof protectionStatusForTask>[0];
+
+  // INVARIANT: a root task with no named target ('' or 'HEAD') is judged
+  // against the remote's default branch, exactly as accept merges it — never a
+  // literal `main`, which in a master-default repo would report "not gated"
+  // for an accept that then asks for the passphrase.
+  test.each(['', 'HEAD'])('an unnamed target (%p) gates the remote default branch', async (branch) => {
+    const c = ctx({ enabled: true, gateDefaultBranch: true, defaultBranch: 'master', remoteDefaultBranch: 'master' });
+    const s = await protectionStatusForTask(storage, c, untargeted(branch));
+    expect(s.targetBranch).toBe('master');
+    expect(s.branchGate).toEqual({ branch: 'master', source: 'default-branch' });
+    expect(s.gated).toBe(true);
+  });
+
+  test('a listed master branch gates an untargeted task without the default gate', async () => {
+    const c = ctx({ enabled: true, protectedBranches: ['master'], remoteDefaultBranch: 'master' });
+    const s = await protectionStatusForTask(storage, c, untargeted(''));
+    expect(s.branchGate).toEqual({ branch: 'master', source: 'listed' });
+  });
+
+  test('a named target is used as-is', async () => {
+    const c = ctx({ enabled: true, protectedBranches: ['main'], remoteDefaultBranch: 'master' });
+    const s = await protectionStatusForTask(storage, c, untargeted('main'));
+    expect(s.targetBranch).toBe('main');
+    expect(s.branchGate?.branch).toBe('main');
   });
 });

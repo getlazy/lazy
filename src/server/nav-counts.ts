@@ -81,7 +81,8 @@ export async function computeNavCounts(
     // The exact option set /raised uses for its default "Needs attention"
     // view, so the badge and that page report the same numbers.
     storage.listRaisedItems({ state: 'open', collapseExactDuplicates: true }),
-    storage.listConversationSummaries(),
+    // Builders, not session files: a compaction must not count as a new one.
+    storage.listBuilders(),
     // No action port means no review surface either (those routes answer 503),
     // so the badge reports nothing rather than counting the queue a second way
     // here — a number pointing at a page that will not load is worse than none.

@@ -7,6 +7,7 @@
  */
 
 import { randomUUID } from 'crypto';
+import { isManagedMode } from '../config/managed-mode';
 import { join } from 'path';
 import { getOrCreateStorage } from './rpc-handlers';
 import { handleBuilderSlot, handleGetDaemonMcpConfig } from './rpc-handlers';
@@ -90,7 +91,12 @@ export async function buildReviewSessionBuilderSystemPrompt(
 ): Promise<string> {
   const runner = await createRunner(projectRoot);
   const storage = await getOrCreateStorage();
-  return assembleBuilderSystemPrompt({ lazyRoot: projectRoot, runner, storage });
+  // Headless, so scratch is mounted at the daemon host's path — which in
+  // managed mode (Lazy Teams) is a guest VM no member can open.
+  return assembleBuilderSystemPrompt({
+    lazyRoot: projectRoot, runner, storage,
+    scratchAccess: isManagedMode() ? 'store' : 'host',
+  });
 }
 
 /**

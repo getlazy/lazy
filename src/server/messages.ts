@@ -28,7 +28,7 @@ import {
 } from '../messages';
 import { layoutHtml } from './templates';
 import { escapeHtml } from './review-diff';
-import { renderMarkdown } from './markdown';
+import { renderMarkdown, type RenderMarkdownOptions } from './markdown';
 
 function formatDate(ts: number): string {
   const d = new Date(ts);
@@ -176,6 +176,7 @@ export function messageDetailHtml(
   message: SystemMessage,
   notice?: { text: string; error?: boolean },
   scratchPaths: string[] = [],
+  markdown?: RenderMarkdownOptions,
 ): string {
   const state = systemMessageState(message);
   const meta = [
@@ -193,7 +194,7 @@ export function messageDetailHtml(
     ${noticeHtml(notice)}
     <div class="action-links msg-detail-actions">${actionsHtml(message, false)}</div>
     <div class="detail-section">
-      <div class="turn-content">${renderMarkdown(message.body)}</div>
+      <div class="turn-content">${renderMarkdown(message.body, markdown)}</div>
     </div>
     ${scratchMentionsHtml(scratchPaths)}
   `);

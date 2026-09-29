@@ -596,6 +596,28 @@ describe('review service', () => {
       expect(stored.find((v) => v.file === 'src/protected.ts')?.status).toBe('approved');
     });
 
+    // INVARIANT: Reject is RECORDED (rejected_at) but stays 'pending', so every
+    // accept gate still refuses; Approve clears the rejection. Reject has to be
+    // distinguishable from undecided because it is the one that sends the agent
+    // to restore the file on the next unblock.
+    test('rejecting records rejected_at on a pending record; approving clears it', async () => {
+      const { storage, task, session } = await taskWithViolations();
+      const actions = createReviewActions(root);
+
+      const rejected = await actions.setViolationDecision(task.id, 'src/protected.ts', false);
+      const file = rejected.find((v) => v.file === 'src/protected.ts');
+      expect(file?.status).toBe('pending');
+      expect(typeof file?.rejected_at).toBe('number');
+      expect(rejected.find((v) => v.file === 'src/other.ts')?.rejected_at).toBeUndefined();
+      const stored = (await storage.getSessionTurns(session.id))[0].violations ?? [];
+      expect(stored.find((v) => v.file === 'src/protected.ts')?.rejected_at).toBe(file?.rejected_at);
+
+      const approved = await actions.setViolationDecision(task.id, 'src/protected.ts', true);
+      expect(approved.find((v) => v.file === 'src/protected.ts')).toEqual({
+        file: 'src/protected.ts', base_sha: 'base1', status: 'approved',
+      });
+    });
+
     test('a file the task never violated is refused rather than silently added', async () => {
       const { task } = await taskWithViolations();
       const actions = createReviewActions(root);

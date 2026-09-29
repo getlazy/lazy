@@ -2,7 +2,7 @@ import { describe, test, expect } from 'bun:test';
 import type { ResolvedConfig, RoleTarget } from '../../src/config/types';
 import { ANTHROPIC_DEFAULT_TARGET } from '../../src/config/default-target';
 import type { Task } from '../../src/types';
-import { pairSessionModel, taskLaunchIdentityView } from '../../src/task/launch-identity-view';
+import { pairSessionModel, profileDefaultModel, taskLaunchIdentityView } from '../../src/task/launch-identity-view';
 import { launchIdentityHtml, taskPageHtml } from '../../src/server/task-page';
 
 const anthropic = (model = ''): RoleTarget => ({ ...ANTHROPIC_DEFAULT_TARGET, model });
@@ -248,5 +248,24 @@ describe('task page header', () => {
     // What Metadata keeps.
     expect(html).toContain('<span class="detail-label">ID</span>');
     expect(html).toContain('<span class="detail-label">Created</span>');
+  });
+});
+
+describe('profileDefaultModel', () => {
+  // INVARIANT: a picker's per-profile default model is exactly what an unstarted
+  // task on that profile shows in its header. The Teams New Task hint and the
+  // task page must never disagree about what a task would run.
+  test('matches the header model of an unstarted task on the same profile', () => {
+    const config = configWith({
+      defaultModel: 'claude-opus-5',
+      agents: { pinned: { harness: 'claude-code', model: 'claude-sonnet-5' }, bare: { harness: 'claude-code' } },
+    });
+    for (const projectModel of [undefined, 'claude-haiku-4-5']) {
+      for (const agentId of ['pinned', 'bare', 'claude-code']) {
+        const header = taskLaunchIdentityView({ task: task({ agent_id: agentId, model: null }), config, projectModel });
+        expect(profileDefaultModel({ agentId, config, projectModel })).toBe(header.model.value);
+      }
+    }
+    expect(profileDefaultModel({ agentId: 'pinned', config })).toBe('claude-sonnet-5');
   });
 });

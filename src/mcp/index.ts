@@ -24,6 +24,7 @@ import {
   type McpToolset,
 } from './tool-access';
 import { isToolForRole, roleForTaskId, type McpRole } from './tool-roles';
+import { definitionForRole } from './tool-surface';
 import type { McpTool, McpToolHandler } from './types';
 import mcpServerInstructions from '../prompts/mcp-server-instructions.md' with { type: 'text' };
 
@@ -119,7 +120,7 @@ export function registerTools(
     }
     const handler = handlers.get(tool.name);
     if (handler) {
-      server.registerTool(tool, handler, { advertise: isToolForRole(tool.name, role) });
+      server.registerTool(definitionForRole(tool, role), handler, { advertise: isToolForRole(tool.name, role) });
     }
   }
 }

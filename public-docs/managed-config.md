@@ -94,8 +94,8 @@ Every key lazy resolves appears below. Non-respected keys carry the reason.
 
 | key | why |
 |---|---|
-| `agents.*.endpoint` | An [agent profile](lazy-toml.md#agentsname--named-agent-profiles)'s endpoint is the upstream the proxy forwards to, carrying the real model credential — a repository choosing it is credential redirection. A profile with no `endpoint` is fine. |
-| `agents.*.credential` | A credential name the fleet did not assign reaches for a secret slot nobody gave this repository. Naming one of lazy's own providers (`anthropic`, `openai`, `openrouter`, `ollama`, `cursor`) or `none` is fine. |
+| `agents.*.endpoint` | An [agent profile](lazy-toml.md#agentsname--named-agent-profiles)'s endpoint is the upstream the proxy forwards to, carrying the real model credential — a repository choosing it is credential redirection. A profile with no `endpoint` is fine. Allowed in the host's own config file (below). |
+| `agents.*.credential` | A credential name the fleet did not assign reaches for a secret slot nobody gave this repository. Naming one of lazy's own providers (`anthropic`, `openai`, `openrouter`, `ollama`, `cursor`) or `none` is fine. Allowed in the host's own config file (below). |
 | `models.roles.*.backend` | A non-Anthropic role backend sends the model credential somewhere the fleet did not choose; team-level backends are configured by the team, not by a repository. Stating `"anthropic"` explicitly is fine. (The key was since removed from lazy.toml altogether — a config that still has it does not load.) |
 | `models.roles.*.endpoint` | An arbitrary endpoint URL from a repository receives the real model credential. (Also removed from lazy.toml — see `agents.*.endpoint` above.) |
 | `proxy.upstream` | The daemon fetches this URL from the host carrying the real model credential — a repository choosing it is credential redirection. |
@@ -148,7 +148,7 @@ host files that are not this project's.
 Everything else. In full:
 
 `models.default` · `models.roles.*.model` · `models.roles.*.agent` ·
-`agents.*.harness` · `agents.*.model` ·
+`agents.*.harness` · `agents.*.model` · `agents.*.description` ·
 `proxy.retry_after_threshold` · `proxy.upstream_timeout` ·
 `proxy.policy.deny_path_globs` (it can only ever
 ADD denials) · `docker.build_inputs` · `remote.driver` · `remote.git_remote` ·
@@ -161,7 +161,7 @@ ADD denials) · `docker.build_inputs` · `remote.driver` · `remote.git_remote` 
 `automation.accept_check` · `automation.accept_check_timeout` · `checks.post_turn` ·
 `checks.post_turn_timeout` · `session.verbose` · `session.debug` ·
 `session.auto_commit_instructions` · `git.default_branch_prefix` ·
-`git.lfs_check` · `output.shortid_length` · `agent.agent_id` ·
+`git.lfs_check` · `git.coauthor_trailer` · `output.shortid_length` · `agent.agent_id` ·
 `agent.by_type` · `agent.watchdog_output_timeout_ms` · `agent.wind_down_timeout_ms` ·
 `agent.graceful_exit_timeout_ms` · `agent.effort` · `agent.low_high_loop` ·
 `agent.low_high_loop_draft_effort` · `agent.low_high_loop_review_effort` ·
@@ -213,3 +213,61 @@ needs to point somewhere that renders. So the table and the mechanism live in
 lazy itself; the fleet-side decisions (how the daemon is
 armed, how a refusal is surfaced in the UI) belong to the managed product
 itself.
+
+## When the host owns the config file
+
+A host can take ownership of a project's `lazy.toml` altogether. It sets
+`LAZY_MANAGED_CONFIG_PATH` in the daemon's environment to an absolute path
+**outside** the project checkout (a path inside it is refused). Until that file
+exists, lazy reads the repository's `lazy.toml` as usual. Once it exists, lazy
+reads only that file — changes to the repository's `lazy.toml` no longer have any
+effect, and nothing is ever written into the checkout.
+
+Lazy Teams uses this for its project **Settings → Configuration** page:
+
+- When a project is set up, its repository's `lazy.toml` is copied once.
+- The team's owner edits it on the page; every member can read it, and anyone who
+  can read it can download it as a `lazy.toml` to commit if they wish. Every save
+  is kept as a new version with who saved it and when, and the history shows
+  what each version changed as a diff against the one before it.
+- Settings are edited in a form, grouped by what they are for. Each shows what it
+  does, lazy's default, and when a change to it is picked up. Settings with list
+  or table values (protected files, maintained files, agent profiles) are edited
+  in the `lazy.toml` text, which stays available underneath the form; comments
+  in the file are kept when the form saves.
+- **Check** judges a change without saving it and lists what saving would change.
+  Each save is checked by lazy first too, with the same rules a load uses: an
+  error names the setting it is about, and a configuration with errors is not
+  saved. Settings the host decides (see the tables above) and settings lazy does
+  not recognise are reported as notes — they are kept in the file but have no
+  effect.
+- lazy re-reads the configuration every time it does something, so a saved change
+  needs no restart: it is picked up the next time lazy does what that setting
+  governs. After a save the page names each changed setting and when that is —
+  when the next turn starts (models, effort, usage pause), when the next turn
+  finishes (after-turn checks, protected files), at the next review or accept,
+  within a minute for background behaviour such as resuming interrupted work, or
+  immediately for settings like the forge driver.
+  The exception is what lazy's proxy is set up with when the project starts:
+  `[proxy] retry_after_threshold`, `upstream_timeout`,
+  `[proxy.policy] deny_path_globs`, and agent profiles (`[agents.<name>]`)
+  that send their traffic to their own endpoint. Changing any of those restarts
+  the project, which pauses work in progress and resumes it.
+- Agent profiles in this file may set `endpoint` and `credential` (including
+  ones copied from the repository at setup), although a repository's own
+  `lazy.toml` may not: on a managed host a profile's own endpoint is paid
+  **only** by the credential each member connects for that profile — never by
+  the host's own credentials — and members see the endpoint before they connect
+  one. A member's
+  credential is sent only to the endpoint the profile had when they connected
+  it; if the owner points the profile elsewhere, it is not used until they
+  connect it again.
+- It is one-way: a downloaded or committed copy is never read back.
+- If a saved configuration stops loading after an upgrade, the project cannot
+  start. The owner fixes it on the same page: the correction is checked by
+  lazy, saved, and — unless the project was stopped on purpose — the project is
+  started with it. When another project on the
+  installation already runs the current version of lazy, it checks the fix
+  before it is saved. Otherwise the project's own start is the check: if the
+  configuration still cannot be loaded, lazy's reason is shown on the page
+  next to the saved version, so it can be corrected and saved again.

@@ -114,6 +114,13 @@ describe('a member terminal on a shared daemon', () => {
     if (patched === before) throw new Error('could not set [runner] type = "docker" in the generated lazy.toml');
     await writeFile(configPath, patched);
 
+    // Seeded BEFORE the managed daemon starts: its launch warmup prepares the
+    // image and agent binary at once, and unseeded it would compile a real one.
+    await docker.seedImage(`lazy-runner:${IMAGE_TAG}`, {
+      dockerfileHash: await calculateImageInputsHash(ctx.root),
+      inputs: await calculateImageInputManifest(ctx.root),
+    });
+    await seedAgentBinaryStamp(ctx.agentHome!);
     await ctx.restartDaemon({
       LAZY_TEST_FORCE_MANAGED: '1',
       LAZY_MANAGED_STORAGE_PATH: storageDirFor(ctx.root),
@@ -124,11 +131,6 @@ describe('a member terminal on a shared daemon', () => {
     sharedToken = readToken(ctx.root)!;
     if (!target || !sharedToken) throw new Error('test daemon did not record a TCP target and token');
 
-    await docker.seedImage(`lazy-runner:${IMAGE_TAG}`, {
-      dockerfileHash: await calculateImageInputsHash(ctx.root),
-      inputs: await calculateImageInputManifest(ctx.root),
-    });
-    await seedAgentBinaryStamp(ctx.agentHome!);
     await rpc(sharedToken, 'putUserCredential', { userId: ALICE_EMAIL, kind: 'oauth', token: 'sk-ant-oat01-alice-member' });
     await rpc(sharedToken, 'putUserCredential', { userId: SERVICE_CREDENTIAL_USER_ID, kind: 'oauth', token: 'sk-ant-oat01-service-member' });
     // Between turns the task's own container stays up, with whatever a turn

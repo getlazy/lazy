@@ -153,6 +153,10 @@ describe('lazy_usage_limits over MCP', () => {
     expect(view.credential).toBe(`user:${alice}`);
     expect(view.readings.map((r: { credential: string }) => r.credential)).toEqual([`user:${alice}`]);
     expect(JSON.stringify(view)).not.toContain(bob);
+    // The budget is built over the same narrowed view: its own credential, its own task.
+    expect(view.budget.scope).toBe('task');
+    expect(view.budget.credentials.map((c: { credential: string }) => c.credential)).toEqual([`user:${alice}`]);
+    expect(view.budget.tasks.every((t: { taskId: string }) => t.taskId === taskId)).toBe(true);
   });
 
   // INVARIANT: with no live binding lazy cannot tell which credential the turn

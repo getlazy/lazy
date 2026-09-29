@@ -31,6 +31,8 @@ import { runGit, type GitResult } from '../utils/git';
 import { readDaemonMcpConfig, createDaemonProxyHandler } from '../daemon/mcp-proxy';
 import { INTERNAL_GIT_TOOL_NAME } from '../mcp/types';
 import { log, logWarn } from './log';
+import { applyProtectedRestores } from '../protection/rejected-restore';
+import type { ProtectedRestore } from '../protocol/types';
 
 interface InternalGitReply {
   exit_code: number;
@@ -178,4 +180,26 @@ export async function elevatedResetHardHead(cwd: string): Promise<GitResult> {
 /** Force-write a `turn/<taskid8>/<phase>/<sha>` tag, host-side. */
 export async function elevatedTag(cwd: string, name: string): Promise<GitResult> {
   return elevate(cwd, { op: 'tag', name }, () => runGit(['tag', '-f', name], { cwd }));
+}
+
+/**
+ * Restore rejected protected files to their base and commit that as lazy's own
+ * commit, host-side (src/protection/rejected-restore.ts). The daemon refuses
+ * any entry that is not a rejected file it itself would restore, so a tampered
+ * protocol dir cannot use this to rewrite arbitrary paths. `stdout` carries the
+ * restore commit's SHA, empty when nothing needed committing.
+ */
+export async function elevatedRestoreRejected(
+  cwd: string,
+  plan: ProtectedRestore[],
+): Promise<GitResult> {
+  log(`[git] Restoring ${plan.length} rejected protected file(s) to base`);
+  return elevate(cwd, { op: 'restore_rejected', files: plan }, async () => {
+    try {
+      const sha = await applyProtectedRestores(cwd, plan);
+      return { exitCode: 0, stdout: sha ?? '', stderr: '' };
+    } catch (err) {
+      return { exitCode: 1, stdout: '', stderr: err instanceof Error ? err.message : String(err) };
+    }
+  });
 }

@@ -77,9 +77,14 @@ export const NATIVE_1M_MODELS: readonly string[] = [
   'claude-fable-5-1',
   'claude-fable-5',
   'claude-mythos-5',
+  // Read from Claude Code 2.1.284's bundle (native_1m, window 1e6), not the
+  // 2.1.266 table; older harnesses cap it at 200k (2.1.283 does not know it).
+  'claude-opus-5-5',
   'claude-opus-5',
   'claude-opus-4-8',
   'claude-opus-4-7',
+  // Same source as claude-opus-5-5: needs Claude Code >= 2.1.284.
+  'claude-sonnet-5-5',
   'claude-sonnet-5',
 ];
 

@@ -12,7 +12,11 @@
 
 import { readFile } from 'fs/promises';
 
+import type { BuilderLaunchDirective } from './launch-directive';
+
 export interface BuilderLaunchEnv {
+  /** The builder role's CURRENT model/effort. Absent from a daemon that predates it. */
+  directive?: BuilderLaunchDirective;
   authEnvVars: Array<{ key: string; value: string }>;
   proxyBaseUrl?: string;
   lazyVersion?: string;

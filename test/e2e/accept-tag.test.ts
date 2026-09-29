@@ -123,4 +123,67 @@ describe('lazy accept creates the authoritative accept tag', () => {
     const tagType = ctx.git('cat-file', '-t', `refs/tags/lazy-accept-${fullTaskId}`);
     expect(tagType.stdout.trim()).toBe('tag');
   });
+
+  // INVARIANT: a reopen after an accept SPENDS that accept. The accept tag
+  // outlives the reopen, and the zombie sweep used to re-end the reopened
+  // session as `accepted` one tick later (complete → blocked → zombie →
+  // complete in six seconds). The store records which accept the reopen
+  // superseded, and the sweep never heals from it. The control half proves the
+  // ticks ran: with the record removed, the same sweep heals at once.
+  test('a task reopened after accept stays blocked across reconciler ticks', async () => {
+    const taskId = await createStartedTaskWithCommit(ctx, 'Reopen after accept');
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+    expectSuccess(await ctx.lazy(['accept', taskId, '--yes']));
+    const tagSha = ctx.git('rev-parse', `refs/tags/lazy-accept-${fullTaskId}^{commit}`).stdout.trim();
+
+    expectSuccess(await ctx.lazy(['reopen', taskId, '--reason', 'more work']));
+    expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
+    const head = ctx.git('rev-parse', `lazy/${taskId}`).stdout.trim();
+    const record = JSON.parse(readTaskJson(ctx.root, taskId).metadata.reopened_after_accept);
+    expect(record.accept_commit).toBe(tagSha);
+
+    await Bun.sleep(15_000);
+    expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
+    expect(readSessionJson(ctx.root, taskId)?.outcome ?? null).toBeNull();
+    expect(ctx.git('rev-parse', `lazy/${taskId}`).stdout.trim()).toBe(head);
+
+    const shown = await ctx.lazy(['show', taskId]);
+    expectSuccess(shown);
+    expect(shown.stdout).toContain(`reopened after accept at ${tagSha.slice(0, 8)}`);
+
+    // Control: without the store record the tag is trusted again.
+    setTaskMetadata(ctx.root, taskId, 'reopened_after_accept', '');
+    const deadline = Date.now() + 30_000;
+    while (readTaskStatus(ctx.root, taskId) !== 'complete' && Date.now() < deadline) {
+      await Bun.sleep(500);
+    }
+    expect(readTaskStatus(ctx.root, taskId)).toBe('complete');
+  }, 120_000);
+
+  // INVARIANT: the reopen record spends only the accept it superseded. A later
+  // accept of the reopened task moves the tag to a NEW commit, so the record no
+  // longer matches and that accept is current — the sweep keeps its purpose.
+  test('a reopened task accepted again gets a new accept identity', async () => {
+    const taskId = await createStartedTaskWithCommit(ctx, 'Reaccept after reopen');
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+    const tagRef = `refs/tags/lazy-accept-${fullTaskId}^{commit}`;
+    expectSuccess(await ctx.lazy(['accept', taskId, '--yes']));
+    const firstTag = ctx.git('rev-parse', tagRef).stdout.trim();
+
+    expectSuccess(await ctx.lazy(['reopen', taskId, '--reason', 'one more change']));
+    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
+    writeFileSync(join(worktreePath, 'second.txt'), 'second change\n');
+    expect(ctx.git('-C', worktreePath, 'add', 'second.txt').exitCode).toBe(0);
+    expect(ctx.git('-C', worktreePath, 'commit', '-m', 'Second change').exitCode).toBe(0);
+    await seedFinal(ctx, taskId);
+
+    expectSuccess(await ctx.lazy(['accept', taskId, '--yes', '--allow-queued-comments']));
+    expect(readTaskStatus(ctx.root, taskId)).toBe('complete');
+    expect(readSessionJson(ctx.root, taskId)?.outcome).toBe('accepted');
+    const secondTag = ctx.git('rev-parse', tagRef).stdout.trim();
+    expect(secondTag).not.toBe(firstTag);
+    const record = JSON.parse(readTaskJson(ctx.root, taskId).metadata.reopened_after_accept);
+    expect(record.accept_commit).toBe(firstTag);
+    expect(ctx.git('show', 'main:second.txt').exitCode).toBe(0);
+  }, 120_000);
 });

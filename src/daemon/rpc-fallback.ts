@@ -13,6 +13,7 @@
  * 3. Error translation (RpcError → return types the CLI expects)
  */
 
+import type { TokenBudgetView } from '../usage-pause/budget-view';
 import type { ReviewSettingsOverrides } from '../review/mode';
 import { tryRpc, RpcApplicationError } from './client';
 import {
@@ -46,7 +47,9 @@ import {
   handleEditComment,
   handleIdentity,
   handleUsageLimits,
+  handleTokenStats,
   RpcError,
+  withLaunchAllowance,
 } from './rpc-handlers';
 import { resolveLazyRoot, resolveStorage } from '../preconditions';
 import { admitInteractiveSession, describeUsagePauseState, type UsagePauseState } from './usage-pause';
@@ -78,6 +81,15 @@ import type { AttachSessionInfo } from './session-attach';
  * command passes the display itself.
  */
 export type ProgressSink = ProgressEmitter | RpcObservers;
+
+/** The `tokenStats` RPC body: an open bag the daemon validates field by field (handleTokenStats). */
+export interface TokenStatsRpcParams { [key: string]: unknown }
+
+export async function queryTokenStats(params: TokenStatsRpcParams): Promise<Record<string, any>> {
+  const rpc = await tryRpc<Record<string, any>>('tokenStats', params);
+  if (rpc) return rpc;
+  return await handleTokenStats(resolveLazyRoot(), params) as Record<string, any>;
+}
 
 /** Normalize either sink form to the observer pair `tryRpc` expects. */
 function observersOf(sink?: ProgressSink): RpcObservers {
@@ -250,16 +262,15 @@ export interface DiffResult {
   diffRange: string;
   /** The resolved task's canonical short id. */
   taskId: string;
-  /** True when accepted-child squash commits were excluded from the path set. */
-  scopedToDirect?: boolean;
-  /** How many accepted children were excluded. */
-  acceptedSubtaskCount?: number;
 }
 
 export async function queryDiff(params: {
   taskId: string;
   full?: boolean;
-  /** Whole-branch escape hatch: do not exclude accepted children's files. */
+  /**
+   * Accepted and ignored: every diff is the whole branch now. Kept so old
+   * callers (and old `--full-branch` scripts) do not break.
+   */
   fullBranch?: boolean;
   /** Restrict the diff to these pathspecs. */
   files?: string[];
@@ -523,6 +534,8 @@ export async function queryStartTask(params: {
   actor: ActorInput;
   /** A person at their own terminal asked — see src/cli/human-terminal.ts. */
   usagePauseOverrideEligible?: boolean;
+  /** Let THIS task's next turn through the usage pause (a person or the builder; src/daemon/usage-pause.ts). */
+  usagePausePastOnce?: boolean;
   /** W3C trace context propagated from the CLI so daemon spans stitch onto the CLI trace. */
   traceparent?: string;
 }, progress?: ProgressSink): Promise<StartTaskRpcResult> {
@@ -540,13 +553,14 @@ export async function queryStartTask(params: {
     runnerOverride: params.runnerOverride,
     actor: params.actor,
     usagePauseOverrideEligible: params.usagePauseOverrideEligible,
+    usagePausePastOnce: params.usagePausePastOnce || undefined,
     traceparent: params.traceparent,
   }, observers);
   if (rpc) return rpc;
 
   // Test/daemon-self mode: execute directly
   const root = resolveLazyRoot();
-  return await handleStartTask(root, params, observers.onProgress) as StartTaskRpcResult;
+  return await withLaunchAllowance('startTask', params, () => handleStartTask(root, params, observers.onProgress)) as StartTaskRpcResult;
 }
 
 // --- Concurrency limits ---
@@ -586,7 +600,7 @@ export async function queryConcurrency(params: {
 // --- Usage pause ([usage_pause], src/daemon/usage-pause.ts) ---
 
 export async function queryUsagePause(params: {
-  action?: 'get' | 'set' | 'reset' | 'admitInteractive';
+  action?: 'get' | 'set' | 'reset' | 'allowTask' | 'clearTask' | 'admitInteractive';
   value?: string | number;
   taskId?: string;
   agentId?: string;
@@ -596,7 +610,7 @@ export async function queryUsagePause(params: {
   surface?: 'pair' | 'chat';
   /** `admitInteractive`: decide without taking the override (a pre-flight). */
   peek?: boolean;
-  /** The channel asking — only a `human` one may set or use the override. */
+  /** The channel asking — only `human` may set the override; `human` or `builder` a task's allowance. */
   actor?: Actor;
   /** The pre-flight's own eligibility: `false` judges the task without the pending override. */
   usagePauseOverrideEligible?: boolean;
@@ -606,7 +620,7 @@ export async function queryUsagePause(params: {
   // No daemon: nothing is launching turns, and an override would be set in a
   // process that exits with this command — refuse rather than pretend. (A
   // reset has nothing to clear, so it simply reports the state.)
-  if (params.action === 'set') {
+  if (params.action === 'set' || params.action === 'allowTask') {
     throw new Error(
       'The daemon is not running, so there is no override to change: overrides live in the running ' +
       'daemon only. Start it with `lazy daemon start` and try again.',
@@ -783,6 +797,8 @@ export async function queryUnblockTask(params: {
   actor?: ActorInput;
   /** A person at their own terminal asked — see src/cli/human-terminal.ts. */
   usagePauseOverrideEligible?: boolean;
+  /** Let THIS task's next turn through the usage pause (a person or the builder; src/daemon/usage-pause.ts). */
+  usagePausePastOnce?: boolean;
 }, progress?: ProgressSink): Promise<UnblockTaskRpcResult> {
   const observers = observersOf(progress);
   const rpc = await tryRpc<UnblockTaskRpcResult>('unblockTask', {
@@ -797,12 +813,13 @@ export async function queryUnblockTask(params: {
     permissionMode: params.permissionMode,
     actor: params.actor,
     usagePauseOverrideEligible: params.usagePauseOverrideEligible,
+    usagePausePastOnce: params.usagePausePastOnce || undefined,
   }, observers);
   if (rpc) return rpc;
 
   // Test/daemon-self mode: execute directly
   const root = resolveLazyRoot();
-  return await handleUnblockTask(root, params, observers.onProgress) as UnblockTaskRpcResult;
+  return await withLaunchAllowance('unblockTask', params, () => handleUnblockTask(root, params, observers.onProgress)) as UnblockTaskRpcResult;
 }
 
 // --- Ask Task (read-only Q&A) ---
@@ -849,6 +866,8 @@ export async function queryAskTask(params: {
   actor?: ActorInput;
   /** A person at their own terminal asked — see src/cli/human-terminal.ts. */
   usagePauseOverrideEligible?: boolean;
+  /** Let THIS task's next turn through the usage pause (a person or the builder; src/daemon/usage-pause.ts). */
+  usagePausePastOnce?: boolean;
 }, progress?: ProgressSink): Promise<AskTaskRpcResult> {
   const observers = observersOf(progress);
   const rpc = await tryRpc<AskTaskRpcResult>('askTask', {
@@ -857,11 +876,12 @@ export async function queryAskTask(params: {
     effortOverride: params.effortOverride,
     actor: params.actor,
     usagePauseOverrideEligible: params.usagePauseOverrideEligible,
+    usagePausePastOnce: params.usagePausePastOnce || undefined,
   }, observers);
   if (rpc) return rpc;
 
   const root = resolveLazyRoot();
-  return await handleAskTask(root, params, observers.onProgress) as AskTaskRpcResult;
+  return await withLaunchAllowance('askTask', params, () => handleAskTask(root, params, observers.onProgress)) as AskTaskRpcResult;
 }
 
 // --- Review Task (read-only review in a new session) ---
@@ -890,6 +910,8 @@ export async function queryReviewTask(params: {
   actor?: ActorInput;
   /** A person at their own terminal asked — see src/cli/human-terminal.ts. */
   usagePauseOverrideEligible?: boolean;
+  /** Let THIS task's next turn through the usage pause (a person or the builder; src/daemon/usage-pause.ts). */
+  usagePausePastOnce?: boolean;
 }, progress?: ProgressSink): Promise<ReviewTaskRpcResult> {
   const observers = observersOf(progress);
   const rpc = await tryRpc<ReviewTaskRpcResult>('reviewTask', {
@@ -899,11 +921,12 @@ export async function queryReviewTask(params: {
     autoFix: params.autoFix,
     actor: params.actor,
     usagePauseOverrideEligible: params.usagePauseOverrideEligible,
+    usagePausePastOnce: params.usagePausePastOnce || undefined,
   }, observers);
   if (rpc) return rpc;
 
   const root = resolveLazyRoot();
-  return await handleReviewTask(root, params, observers.onProgress) as ReviewTaskRpcResult;
+  return await withLaunchAllowance('reviewTask', params, () => handleReviewTask(root, params, observers.onProgress)) as ReviewTaskRpcResult;
 }
 
 // --- Await a claimed turn (the blocking half of ask / review) ---
@@ -968,6 +991,8 @@ export async function queryAskTaskAwaited(params: {
   actor?: ActorInput;
   /** A person at their own terminal asked — see src/cli/human-terminal.ts. */
   usagePauseOverrideEligible?: boolean;
+  /** Let THIS task's next turn through the usage pause (a person or the builder; src/daemon/usage-pause.ts). */
+  usagePausePastOnce?: boolean;
 }, progress?: ProgressSink): Promise<AwaitedAskResult> {
   const started = await queryAskTask(params, progress);
   if (started.outcome === 'answered') {
@@ -1034,6 +1059,8 @@ export async function queryReviewTaskAwaited(params: {
   actor?: ActorInput;
   /** A person at their own terminal asked — see src/cli/human-terminal.ts. */
   usagePauseOverrideEligible?: boolean;
+  /** Let THIS task's next turn through the usage pause (a person or the builder; src/daemon/usage-pause.ts). */
+  usagePausePastOnce?: boolean;
 }, progress?: ProgressSink): Promise<AwaitedReviewResult> {
   const started = await queryReviewTask(params, progress);
   const settled = await queryAwaitClaimedTurn({
@@ -1272,6 +1299,7 @@ export interface ReopenTaskRpcResult {
   newStatus: 'blocked' | 'backlog';
   hadSession: boolean;
   gitBranch: string | null;
+  restore: { branch: string; source: string; sha: string; message: string; syncHint: string | null } | null;
   warnings: string[];
 }
 
@@ -1279,11 +1307,13 @@ export async function queryReopenTask(params: {
   taskId: string;
   reason?: string;
   actor?: ActorInput;
+  checkOnly?: boolean;
 }): Promise<ReopenTaskRpcResult> {
   const rpc = await tryRpc<ReopenTaskRpcResult>('reopenTask', {
     taskId: params.taskId,
     reason: params.reason,
     actor: params.actor,
+    checkOnly: params.checkOnly,
   });
   if (rpc) return rpc;
 
@@ -1378,6 +1408,8 @@ export async function queryResumeTask(params: {
   actor?: ActorInput;
   /** A person at their own terminal asked — see src/cli/human-terminal.ts. */
   usagePauseOverrideEligible?: boolean;
+  /** Let THIS task's next turn through the usage pause (a person or the builder; src/daemon/usage-pause.ts). */
+  usagePausePastOnce?: boolean;
 }, progress?: ProgressSink): Promise<ResumeTaskRpcResult> {
   const observers = observersOf(progress);
   const rpc = await tryRpc<ResumeTaskRpcResult>('resumeTask', {
@@ -1386,11 +1418,12 @@ export async function queryResumeTask(params: {
     effortOverride: params.effortOverride,
     actor: params.actor,
     usagePauseOverrideEligible: params.usagePauseOverrideEligible,
+    usagePausePastOnce: params.usagePausePastOnce || undefined,
   }, observers);
   if (rpc) return rpc;
 
   const root = resolveLazyRoot();
-  return await handleResumeTask(root, params, observers.onProgress) as ResumeTaskRpcResult;
+  return await withLaunchAllowance('resumeTask', params, () => handleResumeTask(root, params, observers.onProgress)) as ResumeTaskRpcResult;
 }
 
 // --- Sync Task ---
@@ -1705,6 +1738,13 @@ export async function querySyncTaskFromRemote(params: {
   const root = resolveLazyRoot();
   const { handleSyncTaskFromRemote } = await import('./rpc-handlers');
   return await handleSyncTaskFromRemote(root, params);
+}
+
+export async function queryTokenBudget(): Promise<TokenBudgetView> {
+  const rpc = await tryRpc<TokenBudgetView>('tokenBudget', {});
+  if (rpc) return rpc;
+  const { handleTokenBudget } = await import('./rpc-handlers');
+  return await handleTokenBudget(resolveLazyRoot());
 }
 
 // --- Proxy usage-limit readings (src/proxy/usage-limits.ts) ---

@@ -206,7 +206,7 @@ export function libsecretAttributes(projectRoot: string, provider: CredentialNam
  * place rather than accumulating duplicates that `find` would then resolve
  * arbitrarily.
  *
- * `-A` (any application may read this item without a prompt) is deliberate, and
+ * `-A` (any application may READ this item without a prompt) is deliberate, and
  * is the honest trade. The reader is the lazy DAEMON, frequently started
  * detached by an auto-start with no terminal and no GUI session to answer an
  * unlock prompt — an item that prompts would hang daemon startup rather than
@@ -214,6 +214,22 @@ export function libsecretAttributes(projectRoot: string, provider: CredentialNam
  * running as the same user, which is exactly what a 0600 file also lacks and is
  * not the threat here. What it keeps is encryption at rest and a secret that is
  * in no file lazy writes.
+ *
+ * `-A` is applied only when an item is CREATED, never on an update. lazy never
+ * calls the Security framework itself — every access is `/usr/bin/security`,
+ * a signed Apple binary that does not change when lazy is rebuilt. When
+ * `add-generic-password -U` finds an existing item AND is given an access flag,
+ * it re-applies the item's access, and changing an item's access always asks
+ * the user to confirm, whoever asks. So every write to an existing item — every
+ * ChatGPT token rotation, which rewrites the stored session on the host —
+ * prompted. Upgrades only coincided: a restarted daemon usually finds the
+ * access token stale and refreshes. (Read off how `-U` behaves, not yet
+ * verified on a Mac — see docs/codex-chatgpt-subscription.md.) An update carrying only new data
+ * needs nothing beyond what the `-A` entry already grants, so `set` first
+ * probes for the item WITHOUT `-w` (attributes only, no decrypt, never prompts)
+ * and drops the flag when it exists. The item is still updated IN PLACE —
+ * never delete-and-recreate, whose crash window would lose a just-rotated
+ * refresh token whose predecessor the provider has already invalidated.
  */
 export class KeychainBackend implements CredentialBackend {
   readonly id = 'keychain' as const;
@@ -223,10 +239,13 @@ export class KeychainBackend implements CredentialBackend {
     private readonly platform: string = process.platform,
   ) {}
 
-  /** The `add-generic-password` line for one part, secret included. */
-  private addLine(projectRoot: string, account: string, secret: string): string {
+  /**
+   * The `add-generic-password` line for one part, secret included. `create`
+   * adds `-A`; it defaults on so `budget` measures the longer line.
+   */
+  private addLine(projectRoot: string, account: string, secret: string, create = true): string {
     return (
-      'add-generic-password -U -A ' +
+      `add-generic-password -U ${create ? '-A ' : ''}` +
       `-s ${quoteForSecurity(keychainService(projectRoot))} ` +
       `-a ${quoteForSecurity(account)} ` +
       `-D ${quoteForSecurity('lazy credential')} ` +
@@ -288,6 +307,16 @@ export class KeychainBackend implements CredentialBackend {
     return value.length > 0 ? value : null;
   }
 
+  /** Whether the item exists — an attribute lookup that never decrypts, so never prompts. */
+  private async hasPart(projectRoot: string, account: string): Promise<boolean> {
+    const result = await this.run([
+      'security', 'find-generic-password',
+      '-s', keychainService(projectRoot),
+      '-a', account,
+    ]);
+    return result.exitCode === 0;
+  }
+
   private async removePart(projectRoot: string, account: string): Promise<boolean> {
     const result = await this.run([
       'security', 'delete-generic-password',
@@ -330,7 +359,10 @@ export class KeychainBackend implements CredentialBackend {
       // One `security -i` per part rather than one invocation carrying every
       // line: interactive mode returns only the LAST command's status, so a
       // batch would report success for a failure in any earlier line.
-      const result = await this.run(['security', '-i'], this.addLine(projectRoot, account, part));
+      // An existing item gets new data only — see the class comment:
+      // re-asserting `-A` on it is what prompted on every token rotation.
+      const exists = await this.hasPart(projectRoot, account);
+      const result = await this.run(['security', '-i'], this.addLine(projectRoot, account, part, !exists));
       if (result.exitCode !== 0) {
         throw new Error(
           `The macOS Keychain refused to store the ${provider} credential ` +

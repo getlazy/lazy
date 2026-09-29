@@ -12,6 +12,7 @@ import { ClaudeCodeAgent } from '../../src/agent/claude-code';
 import { CursorAgent } from '../../src/agent/cursor';
 import { CursorPackaging } from '../../src/agent/cursor-packaging';
 import { QaAgent } from '../../src/agent/qa-agent';
+import { PiAgent } from '../../src/agent/pi';
 import { listAgents, getAgent } from '../../src/agent/registry';
 import {
   classifyCommonFailureSignals,
@@ -351,5 +352,96 @@ describe('taxonomy coverage', () => {
       expect(typeof failure.class).toBe('string');
       expect(failure.reason.length).toBeGreaterThan(0);
     }
+  });
+});
+
+// INVARIANT: a provider's quota/billing 429 is fatal_auth and its reason quotes
+// the provider's remedy; a plain per-minute 429 stays transient. Seen live
+// 2026-09-18: Ollama Cloud's monthly-limit 429 was classified
+// transient_overload and retried every 60s, uncapped, while the human never
+// saw the real cause.
+describe('quota-wall 429s', () => {
+  const OLLAMA_BODY =
+    '429 {"type":"error","error":{"type":"rate_limit_error","message":"you (ierceg) have reached ' +
+    'your monthly usage limit, upgrade for higher limits: https://ollama.com/upgrade or add usage ' +
+    'credits: https://ollama.com/settings (ref: abc123)"}}';
+
+  test('Ollama monthly limit via pi "turn ended in error" is fatal_auth with the provider remedy', () => {
+    const failure = new PiAgent().classifyFailure({ message: `pi turn ended in error: ${OLLAMA_BODY}` });
+    expect(failure.class).toBe('fatal_auth');
+    expect(failure.reason).toContain('monthly usage limit');
+    expect(failure.reason).toContain('https://ollama.com/upgrade');
+    expect(failure.reason).toContain('https://ollama.com/settings');
+  });
+
+  test('the same body on the Claude Code stream error path is fatal_auth', () => {
+    const failure = new ClaudeCodeAgent().classifyFailure({
+      message: 'Agent exited with code 1',
+      exitCode: 1,
+      stdoutError: `API Error: ${OLLAMA_BODY}`,
+    });
+    expect(failure.class).toBe('fatal_auth');
+    expect(failure.reason).toContain('https://ollama.com/upgrade');
+  });
+
+  test('OpenAI insufficient_quota and Anthropic credit walls are fatal_auth', () => {
+    expect(classifyCommonFailureSignals({
+      message: '429 {"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}',
+    }, [])?.class).toBe('fatal_auth');
+    expect(classifyCommonFailureSignals({
+      message: 'API Error: 429 {"type":"error","error":{"type":"rate_limit_error",' +
+        '"message":"Monthly spend limit reached","details":{"error_code":"enforced_spend_limit_reached"}}}',
+    }, [])?.class).toBe('fatal_auth');
+  });
+
+  test('a per-minute rate limit, or a cap that resets shortly, stays transient', () => {
+    expect(classifyCommonFailureSignals({
+      message: 'API Error: 429 {"type":"error","error":{"type":"rate_limit_error",' +
+        '"message":"Number of request tokens has exceeded your per-minute rate limit"}}',
+    }, [])?.class).toBe('transient_overload');
+    expect(classifyCommonFailureSignals({
+      message: '429 daily usage limit hit, resets in 20 minutes',
+    }, [])?.class).toBe('transient_overload');
+  });
+});
+
+// INVARIANT: Anthropic's documented spend-cap 429 is a quota wall, and caps
+// that clear on their own (hourly/session windows, "try again in an hour")
+// stay transient even when they carry the "add usage credits" remedy — a
+// wrong fatal blocks a task that would have recovered.
+describe('quota-wall edge cases', () => {
+  // Shaped from Anthropic's rate-limit docs (error_code
+  // enforced_spend_limit_reached); not yet seen live.
+  const ANTHROPIC_SPEND_CAP =
+    '429 {"type":"error","error":{"type":"rate_limit_error","message":"Monthly spend limit reached",' +
+    '"details":{"error_code":"enforced_spend_limit_reached"}}}';
+
+  test('Anthropic spend-cap 429 is fatal_auth on both Claude Code and pi', () => {
+    expect(new ClaudeCodeAgent().classifyFailure({
+      message: 'Agent exited with code 1', exitCode: 1, stdoutError: `API Error: ${ANTHROPIC_SPEND_CAP}`,
+    }).class).toBe('fatal_auth');
+    expect(new PiAgent().classifyFailure({ message: `pi turn ended in error: ${ANTHROPIC_SPEND_CAP}` }).class)
+      .toBe('fatal_auth');
+  });
+
+  test('an hourly cap carrying the credits remedy, or "try again in an hour", stays transient', () => {
+    expect(classifyCommonFailureSignals({
+      message: '429 {"error":{"type":"rate_limit_error","message":"you have reached your hourly usage ' +
+        'limit, upgrade for higher limits or add usage credits: https://ollama.com/settings"}}',
+    }, [])?.class).toBe('transient_overload');
+    expect(classifyCommonFailureSignals({
+      message: '429 insufficient_quota for this minute, try again in an hour',
+    }, [])?.class).toBe('transient_overload');
+  });
+
+  test('the reason quotes the quota message, not the first JSON message, decoded', () => {
+    const failure = classifyCommonFailureSignals({
+      message: 'turn failed',
+      stderr: '{"message":"retrying request"}\n' +
+        '429 {"error":{"message":"you\\u2019ve reached your monthly usage limit, add usage credits: https://x.example"}}',
+    }, []);
+    expect(failure?.class).toBe('fatal_auth');
+    expect(failure?.reason).not.toContain('retrying request');
+    expect(failure?.reason).toContain('you’ve reached your monthly usage limit');
   });
 });

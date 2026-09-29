@@ -14,6 +14,7 @@ import { commandTools, toolsUsage } from './tools';
 import { commandTimings, timingsUsage } from './timings';
 import { commandAudit, auditUsage } from './audit';
 import { commandLimits, limitsUsage } from './limits';
+import { commandBudget, budgetUsage } from './budget';
 
 export async function commandStats(args: string[]): Promise<void> {
   const subcommand = args[0];
@@ -41,6 +42,9 @@ export async function commandStats(args: string[]): Promise<void> {
     case 'limits':
       await commandLimits(sub);
       break;
+    case 'budget':
+      await commandBudget(sub);
+      break;
     default:
       console.error(`Unknown subcommand: stats ${subcommand}`);
       statsUsage();
@@ -61,6 +65,7 @@ export const statsSubcommandUsage: Record<string, () => void> = {
   'timings': timingsUsage,
   'audit': auditUsage,
   'limits': limitsUsage,
+  'budget': budgetUsage,
 };
 
 export function statsUsage(): void {
@@ -74,6 +79,7 @@ Subcommands:
   audit     Browse the proxy audit trail record by record (filters + detail view)
   timings   Recorded request traces, ranked by self time
   limits    Latest usage-limit reading per credential (subscription / rate-limit windows)
+  budget    Token budgets: per-window spend and what is left, per harness / task / day
 
 Examples:
   lazy stats tokens                 # totals plus by-role / by-task / by-model
@@ -84,6 +90,7 @@ Examples:
   lazy stats audit --denied         # only requests with a policy denial
   lazy stats timings                # newest traces, ranked by self time
   lazy stats limits                 # how close each credential is to its limits
+  lazy stats budget                 # tokens left per window, spend per harness
   lazy stats timings --limit 1 --tree  # newest request plus its span tree
   lazy stats tokens -h              # full options for a subcommand`);
 }

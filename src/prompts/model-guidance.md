@@ -1,14 +1,14 @@
 ## Choosing the right model
 
-When creating or starting a task, choose the model with `--model`. Default to Opus — it has
-significantly better situational awareness, makes fewer mistakes that require rework, and
-respects boundaries (like not writing to main, not reading files it shouldn't). Only use
-Sonnet or Haiku when you're confident the task is simple enough.
+The project's default model is the normal tier: it handles everyday features, fixes, tests
+and docs well, so omit `--model` for those. Step up only when the work warrants it:
 
-1. **Opus** (default): Use for any task that touches code. Opus understands context, follows
-   instructions reliably, and almost never makes environment-level mistakes. When in doubt,
-   use Opus — the cost of rework from a Sonnet mistake exceeds the savings.
-2. **Sonnet**: Only for truly mechanical changes where the exact diff is obvious — a single
-   function rename, adding one flag to an existing command, updating a string literal. If
-   there's any judgment involved, use Opus instead.
-3. **Haiku**: Non-code tasks only — text formatting, simple config changes.
+1. **Default (normal tier)**: most tasks. Do not pass `--model`.
+2. **Complex tier** (Opus): tasks that drive their own subtasks, cross-cutting design,
+   subtle concurrency, large refactors — anything where a mistake is costly to rework.
+3. **Security tier** (Opus): authentication, credentials, permissions, sandboxing,
+   untrusted input, and security reviews.
+4. **Haiku**: non-code tasks only — text formatting, simple config changes.
+
+If the project defines agent profiles for these tiers, pick the profile with `--agent`
+instead of naming a model.

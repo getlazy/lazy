@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { writeFileSync } from 'fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
@@ -68,6 +68,29 @@ describe('dirty worktree check — hard gate for accept/close', () => {
     expectError(acceptResult, 'None of it is on the branch');
   });
 
+
+  // INVARIANT (submodule-gitdir-config-guard): accept refuses by name while a
+  // submodule git dir inside the task's gitdir carries config git would run.
+  // Left to runGit alone, the dirty check above reads the refused git as
+  // "clean", so accept would proceed and could drop loose work.
+  test('accept refuses while a submodule git dir carries a planted fsmonitor', async () => {
+    const taskId = await createTask(ctx, 'Accept with planted submodule config', 'Add a file');
+    await startAndReconcile(ctx, taskId);
+    seedFinal(ctx, taskId);
+
+    const worktreePath = worktreePathFor(ctx.root, taskId);
+    const gitdir = readFileSync(join(worktreePath, '.git'), 'utf-8').replace(/^gitdir: /, '').trim();
+    const sub = join(gitdir, 'modules', 'lib');
+    mkdirSync(join(sub, 'objects'), { recursive: true });
+    mkdirSync(join(sub, 'refs'), { recursive: true });
+    writeFileSync(join(sub, 'HEAD'), 'ref: refs/heads/main\n');
+    writeFileSync(join(sub, 'config'), '[core]\n\tbare = false\n\tfsmonitor = /tmp/payload.sh\n');
+
+    const acceptResult = await ctx.lazy(['accept', taskId]);
+    expectFailure(acceptResult, 1);
+    expectError(acceptResult, 'core.fsmonitor');
+    expectError(acceptResult, 'lazy doctor --repair-git-pointers');
+  });
   test('accept succeeds when worktree is clean', async () => {
     // 1. Create and start a task
     const taskId = await createTask(ctx, 'Accept test with clean worktree', 'Add a file');
@@ -83,6 +106,27 @@ describe('dirty worktree check — hard gate for accept/close', () => {
     const acceptResult = await ctx.lazy(['accept', taskId]);
     expectSuccess(acceptResult);
     expectOutput(acceptResult, 'accepted');
+  });
+
+  // INVARIANT (nested-git-dir-in-worktree): accept refuses while the worktree
+  // holds a nested repository its base branch does not have, NAMING it — even
+  // when the task hid it from `git status` so the dirty gate cannot see it.
+  // Its config would run for whoever opens that folder with git or an IDE.
+  test('accept refuses a worktree holding a planted nested repository, naming it', async () => {
+    const taskId = await createTask(ctx, 'Accept test with nested repo', 'Add a file');
+    await startAndReconcile(ctx, taskId);
+
+    const worktreePath = worktreePathFor(ctx.root, taskId);
+    mkdirSync(join(worktreePath, 'sub', '.git'), { recursive: true });
+    writeFileSync(join(worktreePath, 'sub', '.git', 'config'), '[core]\n\tfsmonitor = /tmp/payload.sh\n');
+    // Hidden from the dirty gate, as a task hiding it would.
+    appendFileSync(join(ctx.root, '.git', 'info', 'exclude'), '\nsub/\n');
+
+    const acceptResult = await ctx.lazy(['accept', taskId]);
+    expectFailure(acceptResult, 1);
+    expectError(acceptResult, 'nested git repositories');
+    expectError(acceptResult, 'sub/.git');
+    expectError(acceptResult, 'lazy doctor --repair-git-pointers');
   });
 
   // ========== CLOSE TESTS ==========

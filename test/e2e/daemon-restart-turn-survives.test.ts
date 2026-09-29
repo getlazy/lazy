@@ -29,6 +29,22 @@ import { expectSuccess } from '../helpers/assertions';
 import { goSilentScenario, successScenario } from '../helpers/fake-claude';
 import { readTaskStatus } from '../helpers/storage';
 import { sessionInterrupt } from '../helpers/agent-seam';
+import selfReviewPrompt from '../../src/prompts/low-high-loop-review.md' with { type: 'text' };
+import revisePrompt from '../../src/prompts/low-high-loop-revise.md' with { type: 'text' };
+import wrapUpPrompt from '../../src/prompts/present-regions.md' with { type: 'text' };
+
+/**
+ * The post-turn phases that run on the SAME session after a work turn ends —
+ * the low-high self-review and revise passes and the wrap-up presentation.
+ * Keyed on each prompt file's first line, so the filter follows the text.
+ */
+const POST_TURN_PHASE_OPENERS = [selfReviewPrompt, revisePrompt, wrapUpPrompt]
+  .map(p => p.trimStart().split('\n')[0]);
+
+function isWorkTurnLaunch(argv: string[]): boolean {
+  const prompt = argv[argv.indexOf('-p') + 1] ?? '';
+  return !POST_TURN_PHASE_OPENERS.some(opener => prompt.trimStart().startsWith(opener));
+}
 
 const settle = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
@@ -98,7 +114,10 @@ describe('a turn survives the daemon restarting under it', () => {
     expect(status).toBe('blocked');
 
     // And the agent really ran again, rather than the status being bookkeeping.
-    const invocations = await ctx.claudeInvocations();
+    // Work-turn launches only: with `[review] mode = low_high` one finished turn
+    // also runs self-review, revise and wrap-up invocations, none of which is a
+    // resume.
+    const invocations = (await ctx.claudeInvocations()).filter(i => isWorkTurnLaunch(i.argv));
     expect(invocations.length).toBeGreaterThan(0);
 
     // INVARIANT: resumed ONCE. The restart reaper stops the old supervisor and

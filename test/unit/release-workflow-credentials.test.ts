@@ -112,8 +112,8 @@ describe('release workflows: deploy key handling', () => {
         }
       }
     }
-    // release (1) + publish-docs "Checkout the released tag" (1) + both image jobs (2)
-    expect(checked).toBe(4);
+    // release (1) + publish-docs "Checkout the released tag" (1) + both images' build and merge jobs (4)
+    expect(checked).toBe(6);
   });
 
   // INVARIANT: before the deploy key exists, the release job proves HEAD is the

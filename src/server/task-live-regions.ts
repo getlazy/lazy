@@ -81,6 +81,8 @@ export const TASK_TAB_REGIONS: Readonly<Record<TaskTabId, readonly TaskLiveRegio
   raised: ['raised'],
   comments: ['comments'],
   journal: ['journal'],
+  // No live region: artifacts change rarely, and a reload shows them.
+  artifacts: [],
   // Derived from status history (the task's and its children's) plus turns
   // and commits.
   stats: ['header', 'subtasks', 'turns', 'commits'],
@@ -108,6 +110,7 @@ export const TASK_TAB_POLICY: Readonly<Record<TaskTabId, TaskTabUpdatePolicy>> =
   // a half-typed comment must survive a refresh.
   comments: 'append',
   journal: 'append',
+  artifacts: 'morph',
   // An insight surface read on purpose, and the most expensive body on the
   // page (status history per child, plus the audit trail). Pill, not morph —
   // re-deriving it in the background on a hub would be the whole cost of the

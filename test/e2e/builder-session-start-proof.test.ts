@@ -188,6 +188,13 @@ describe('daemon-owned builder session start proof', () => {
     // Restart so the daemon runs the real capture/claude.ts against the fake
     // docker, in managed mode, with per-member homes redirected into the
     // proof dir. Managed mode requires an explicit storage path.
+    // Seeded BEFORE the managed daemon starts: its launch warmup prepares the
+    // image and agent binary at once, and unseeded it would compile a real one.
+    await docker.seedImage(`lazy-runner:${IMAGE_TAG}`, {
+      dockerfileHash: await calculateImageInputsHash(ctx.root),
+      inputs: await calculateImageInputManifest(ctx.root),
+    });
+    await seedAgentBinaryStamp(ctx.agentHome!);
     await ctx.restartDaemon({
       LAZY_TEST_FORCE_MANAGED: '1',
       LAZY_MANAGED_STORAGE_PATH: storageDirFor(ctx.root),
@@ -362,4 +369,32 @@ describe('daemon-owned builder session start proof', () => {
     const all = await rpc(userToken, 'storage', { method: 'listBuilderSessions' }) as BuilderSession[];
     expect(all).toEqual([]);
   }, 60_000);
+
+  // INVARIANT: a launch that fails records its reason on the member's builder
+  // row. The start's caller may already be gone (its connection dropped while
+  // the launch ran), so the row is the only place the failure can be read. A
+  // fresh claim still ends ('ended' is terminal, nothing to resume); it now
+  // says why.
+  test('a failed launch records why on its row', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const userToken = await mintUserToken(ALICE_EMAIL, 'Alice');
+    const manifest = await calculateImageInputManifest(ctx.root);
+    const hash = await calculateImageInputsHash(ctx.root);
+    await docker.seedImage(`lazy-runner:${IMAGE_TAG}`, { dockerfileHash: hash, inputs: manifest });
+    const agentHome = ctx.agentHome;
+    if (!agentHome) throw new Error('fake-agent setup did not expose the daemon HOME');
+    await seedAgentBinaryStamp(agentHome);
+    await docker.failRuns();
+
+    const status = await rpcStatus(userToken, 'startBuilderSession', {});
+    expect(status.status).toBe(500);
+    expect(status.message).toContain('Failed to start detached builder session');
+
+    const all = await rpc(userToken, 'storage', { method: 'listBuilderSessions' }) as BuilderSession[];
+    expect(all).toHaveLength(1);
+    expect(all[0].state).toBe('ended');
+    expect(all[0].containerName).toBeNull();
+    expect(all[0].lastExit).toStartWith('Your builder could not be started: Failed to start detached builder session');
+  }, 120_000);
 });

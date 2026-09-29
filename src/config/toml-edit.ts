@@ -233,6 +233,15 @@ export function setSectionBoolean(
 }
 
 /**
+ * Set `key = <number>` inside `[section]`, creating the key (and the section)
+ * when missing. Used by the settings form (src/config/settings-catalog.ts).
+ */
+export function setSectionNumber(content: string, section: string, key: string, value: number): string {
+  if (!Number.isFinite(value)) throw new TomlEditError(`${key} must be a finite number, got ${value}`);
+  return setSectionValue(content, section, key, `${key} = ${value}`);
+}
+
+/**
  * Set `key = "value"` inside `[section]`, creating the key (and the section)
  * when missing. Used by `lazy system agent set <id>` to switch the project's
  * default agent while preserving every comment in lazy.toml.

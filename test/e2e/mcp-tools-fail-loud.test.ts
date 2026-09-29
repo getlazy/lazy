@@ -32,6 +32,7 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask } from '../helpers/fixtures';
 import { expectSuccess } from '../helpers/assertions';
 import { successScenario } from '../helpers/fake-claude';
+import { TEST_AGENT_HOME_ENV } from '../../src/mcp/test-home-guard';
 import { makeDaemonBaseDir, pinDaemonBaseDir, removeDaemonBaseDir } from '../helpers/daemon-base-dir';
 
 describe('a turn with no lazy MCP tools fails loud', () => {
@@ -52,7 +53,9 @@ describe('a turn with no lazy MCP tools fails loud', () => {
     // A DIRECTORY where writeMcpConfig expects to write a file.
     await mkdir(join(brokenHome, '.claude.json'), { recursive: true });
 
-    ctx = await setupTestLazy({ fakeClaude: true, daemonEnv: { HOME: brokenHome } });
+    // Declared as the context's private agent home, or the supervisor refuses it
+    // before reaching the write this test breaks (src/mcp/test-home-guard.ts).
+    ctx = await setupTestLazy({ fakeClaude: true, daemonEnv: { HOME: brokenHome, [TEST_AGENT_HOME_ENV]: brokenHome } });
   });
 
   afterEach(async () => {

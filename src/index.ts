@@ -150,6 +150,7 @@ Stats:
   stats audit            Browse the proxy audit trail record by record (denials, reroutes)
   stats timings          Recorded request traces, ranked by self time
   stats limits           Latest usage-limit reading per credential (5h / 7d windows)
+  stats budget           Token budgets: what is left per window, spend per harness
 
 Task Environment:
   env set <task_id>      Give one task an env var (API token) — host-only, never persisted
@@ -654,9 +655,8 @@ if (!isHelpOrVersion && (!command || !skipAutoInit.includes(command))) {
 //
 // And for the project-free `system` queries (`source-id`, `store-check`), for
 // the same reason preflight skips them: reading a source tree or a named store
-// directory needs no daemon, and starting one would run the credential gate —
-// so asking "which lazy is this?" on a machine with no Anthropic credential
-// would fail with a message about the model API. Lazy Teams asks exactly those
+// directory needs no daemon, and starting one for a question about a source
+// tree would be a side effect nobody asked for. Lazy Teams asks exactly those
 // questions, from a checkout, on every fleet tick and before every adoption.
 if (!isHelpOrVersion && !isProjectFreeSystemQuery) {
   const { ensureDaemon } = await import('./daemon/auto-start');

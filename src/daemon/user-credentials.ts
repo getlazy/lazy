@@ -23,9 +23,11 @@
  * draws, see ./credential-gate.ts).
  */
 
+import { createHash } from 'crypto';
 import { mkdir, readFile, writeFile } from 'fs/promises';
 import { dirname } from 'path';
 import { canonicalPersonEmail, isPersonEmail } from '../actor-ref';
+import { isValidName } from '../config/agent-profiles';
 import { getUserCredentialsPath } from './paths';
 
 /**
@@ -85,6 +87,49 @@ export interface UserCredentialRecord {
    */
   ownerEmail?: string;
   ownerName?: string;
+  /**
+   * The AGENT PROFILE (`[agents.<name>]`) this credential pays for, or absent
+   * for the principal's Claude (Anthropic) credential — the one every record
+   * was before profiles had credentials of their own, and still the one that
+   * pays an Anthropic-billed profile whose traffic goes to Anthropic itself
+   * (./member-credentials.ts owns that rule).
+   *
+   * Keyed per PROFILE rather than per credential name on purpose: a member's
+   * token then only ever reaches the upstream of the profile they connected it
+   * for. Keyed by name, an `[agents.x]` block pointing anywhere with the default
+   * `anthropic` credential would carry every member's Anthropic token there.
+   */
+  profile?: string;
+  /**
+   * The member's CONSENT: the endpoint (origin; '' for the project's default
+   * upstream) the control plane SHOWED them for this profile when they
+   * connected the credential, sent by the control plane with it and stored as
+   * given. Never derived from config — the control plane re-pushes every
+   * credential on each provisioning pass, and a stamp taken from config there
+   * would re-consent every member to wherever the profile points now. Null:
+   * no consent was stated, and the credential pays for nothing. A turn is
+   * refused while this differs from where the RUNNING proxy forwards the
+   * profile (./member-credentials.ts).
+   */
+  endpoint?: string | null;
+  /**
+   * sha256 of the secret exactly as the control plane pushed it. Set only on a
+   * credential lazy RENEWS itself (a ChatGPT subscription session): renewal
+   * rotates the stored secret, while the control plane re-pushes the ORIGINAL on
+   * every provisioning pass — whose refresh token the renewal already retired.
+   * A re-push matching this digest is the same credential, not a new one, and
+   * must not clobber the renewed secret.
+   */
+  pushedDigest?: string;
+  /**
+   * For the SERVICE key on a ChatGPT-session profile only: the address of the
+   * service holder whose OWN record pays, instead of a copy of their session.
+   * A session renews by rotating its refresh token, so two stored copies of one
+   * login each retire the other's; this record holds no secret (`token` is
+   * ''), and every use — the holder's turns and the automations — renews and
+   * writes back through the holder's one record (./member-credentials.ts).
+   */
+  sameAs?: string;
   updatedAt: string;
 }
 
@@ -95,6 +140,7 @@ export interface UserCredentialSummary {
   label: string;
   ownerEmail?: string;
   ownerName?: string;
+  profile?: string;
   updatedAt: string;
 }
 
@@ -309,9 +355,24 @@ export async function putUserCredential(
     label?: string;
     ownerEmail?: string;
     ownerName?: string;
+    /** The agent profile this credential pays for; omitted for the Claude credential. */
+    profile?: string;
+    /** The endpoint the member was SHOWN, as the control plane sent it — see the record field. Never config. */
+    endpoint?: string | null;
+    /** True for a credential lazy renews itself; see `pushedDigest`. */
+    renewable?: boolean;
+    /** Service key, session profile: the holder whose own record pays — see the record field. */
+    sameAs?: string;
   },
 ): Promise<UserCredentialSummary> {
   const userId = canonicalCredentialKey(input.userId);
+  const profile = input.profile?.trim() || undefined;
+  if (profile !== undefined && !isValidName(profile)) {
+    throw new Error(
+      `Invalid profile '${input.profile}'. A profile name is lowercase letters, digits, and . _ - ` +
+      `(starting with a letter or digit) — the name of an [agents.<name>] block.`,
+    );
+  }
   if (!isValidCredentialKey(userId)) {
     throw new Error(
       `Invalid userId '${input.userId}'. A credential is keyed by the person's email — ` +
@@ -325,13 +386,21 @@ export async function putUserCredential(
       `token, sent as Authorization: Bearer) or 'api-key' (an Anthropic API key, sent as x-api-key).`,
     );
   }
-  const token = input.token.trim();
-  if (!token) {
+  const sameAs = input.sameAs ? canonicalCredentialKey(input.sameAs) : undefined;
+  if (sameAs !== undefined && (userId !== SERVICE_CREDENTIAL_USER_ID || !isPersonEmail(sameAs) || !input.profile)) {
+    throw new Error(
+      `Refusing a credential for '${userId}' that refers to '${input.sameAs}': only the service key's ` +
+      `credential for an agent profile may refer to a member's own, by their address.`,
+    );
+  }
+  const token = sameAs !== undefined ? '' : input.token.trim();
+  if (!token && sameAs === undefined) {
     throw new Error(`Refusing to store an empty credential for user '${userId}'.`);
   }
 
   const owner = resolveOwner(userId, input);
 
+  const pushedDigest = input.renewable ? digestOf(token) : undefined;
   const record: UserCredentialRecord = {
     userId,
     kind: input.kind,
@@ -339,46 +408,107 @@ export async function putUserCredential(
     label: input.label?.trim() || userId,
     ...(owner.email ? { ownerEmail: owner.email } : {}),
     ...(owner.name ? { ownerName: owner.name } : {}),
+    ...(profile !== undefined ? { profile, endpoint: input.endpoint ?? null } : {}),
+    ...(pushedDigest ? { pushedDigest } : {}),
+    ...(sameAs !== undefined ? { sameAs } : {}),
     updatedAt: new Date().toISOString(),
   };
 
   return mutate(projectRoot, async (file) => {
+    const existing = file.credentials.find((c) => sameSlot(c, userId, profile));
+    // THE SAME RENEWABLE SECRET, PUSHED AGAIN: keep the renewed one. The
+    // original's refresh token is already retired upstream, so storing it
+    // again would log the member out on the next renewal.
+    const stored = existing && pushedDigest && existing.pushedDigest === pushedDigest && existing.kind === record.kind
+      ? { ...record, token: existing.token }
+      : record;
     // Both sides canonicalised, so re-putting under a corrected spelling
     // REPLACES a record an earlier daemon stored raw rather than leaving that
     // person with two credentials and no way to tell which one is spent.
-    const credentials = file.credentials.filter(
-      (c) => canonicalCredentialKey(c.userId) !== userId,
-    );
-    credentials.push(record);
+    const credentials = file.credentials.filter((c) => !sameSlot(c, userId, profile));
+    credentials.push(stored);
     await persist(projectRoot, { version: 1, credentials });
-    return summarize(record);
+    return summarize(stored);
   });
 }
 
-/** Remove a principal's credential. Returns false when there was none. */
-export async function revokeUserCredential(
+/**
+ * Write back a secret lazy RENEWED itself (a rotated ChatGPT session) into an
+ * existing record, keeping everything else — above all `pushedDigest`, which
+ * is what stops the control plane's next re-push of the original from undoing
+ * this.
+ *
+ * COMPARE-AND-SWAP on `renewedFrom`, the secret the renewal started from: a
+ * member may reconnect a NEW session while an old one renews, and writing the
+ * old account's renewal over it would keep the new record's digest — so every
+ * later re-push would match and the member would stay billed on the login they
+ * replaced. False, and nothing written, when the record is gone or no longer
+ * holds that secret.
+ */
+export async function storeRenewedUserCredential(
   projectRoot: string,
   userId: string,
+  profile: string | undefined,
+  token: string,
+  renewedFrom: string,
 ): Promise<boolean> {
   const key = canonicalCredentialKey(userId);
   return mutate(projectRoot, async (file) => {
-    const credentials = file.credentials.filter(
-      (c) => canonicalCredentialKey(c.userId) !== key,
-    );
+    const existing = file.credentials.find((c) => sameSlot(c, key, profile));
+    if (!existing || existing.token !== renewedFrom) return false;
+    const renewed: UserCredentialRecord = { ...existing, token, updatedAt: new Date().toISOString() };
+    const credentials = file.credentials.filter((c) => !sameSlot(c, key, profile));
+    credentials.push(renewed);
+    await persist(projectRoot, { version: 1, credentials });
+    return true;
+  });
+}
+
+/** One record per (principal, profile); an absent profile is the Claude credential. */
+function sameSlot(record: UserCredentialRecord, canonicalUserId: string, profile: string | undefined): boolean {
+  return canonicalCredentialKey(record.userId) === canonicalUserId && (record.profile || undefined) === profile;
+}
+
+function digestOf(secret: string): string {
+  return createHash('sha256').update(secret).digest('hex');
+}
+
+/**
+ * Remove a principal's credential — their Claude credential, or with `profile`
+ * the one they connected for that agent profile. Returns false when there was
+ * none. One slot at a time: taking back a Claude credential must not also take
+ * back a key the member connected for some other profile.
+ */
+export async function revokeUserCredential(
+  projectRoot: string,
+  userId: string,
+  profile?: string,
+): Promise<boolean> {
+  const key = canonicalCredentialKey(userId);
+  const slot = profile?.trim() || undefined;
+  return mutate(projectRoot, async (file) => {
+    const credentials = file.credentials.filter((c) => !sameSlot(c, key, slot));
     if (credentials.length === file.credentials.length) return false;
     await persist(projectRoot, { version: 1, credentials });
     return true;
   });
 }
 
-/** The real credential for a principal, or null. Daemon-internal use only. */
+/**
+ * The real credential for a principal, or null. Daemon-internal use only.
+ *
+ * Without `profile` this is their Claude credential; with it, the one they
+ * connected for that profile. Which of the two a TURN spends is not decided
+ * here — see ./member-credentials.ts.
+ */
 export async function getUserCredential(
   projectRoot: string,
   userId: string,
+  profile?: string,
 ): Promise<UserCredentialRecord | null> {
   const file = await load(projectRoot);
   const key = canonicalCredentialKey(userId);
-  return file.credentials.find((c) => canonicalCredentialKey(c.userId) === key) ?? null;
+  return file.credentials.find((c) => sameSlot(c, key, profile)) ?? null;
 }
 
 /** The project-level service credential for system-initiated turns, or null. */
@@ -420,6 +550,7 @@ function summarize(record: UserCredentialRecord): UserCredentialSummary {
     label: record.label,
     ...(record.ownerEmail ? { ownerEmail: record.ownerEmail } : {}),
     ...(record.ownerName ? { ownerName: record.ownerName } : {}),
+    ...(record.profile ? { profile: record.profile } : {}),
     updatedAt: record.updatedAt,
   };
 }

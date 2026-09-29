@@ -44,6 +44,7 @@ import {
   WEB_PORT_FILE,
   WEB_HOST_FILE,
 } from './paths';
+import { isBuilderStateDir } from '../builder/state-root';
 import { isProcessAlive } from './lifecycle';
 import { probeDaemonLock, readProcessCommands, commandVerdict } from './process-identity';
 
@@ -254,6 +255,10 @@ export async function enumerateDaemons(): Promise<DaemonRecord[]> {
     entries.map(async (slug): Promise<DaemonRecord | null> => {
       const dir = join(baseDir, slug);
       if (!(await dirExists(dir))) return null; // skip stray files in the base dir
+      // Under Teams the builder state root (members' homes, scratch) lives
+      // INSIDE the daemon base dir. It is not a daemon dir, and must never be
+      // listed as an orphan — `kill-stray --prune-dirs` would rm -rf it.
+      if (isBuilderStateDir(dir)) return null;
 
       const [pid, projectRoot] = await Promise.all([readPidInDir(dir), readRootInDir(dir)]);
       const pidAlive = pid !== null && isProcessAlive(pid);

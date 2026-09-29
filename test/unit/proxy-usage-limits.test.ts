@@ -156,6 +156,12 @@ describe('proxy capture (fake upstream)', () => {
             { status: 429, headers: { 'retry-after': '120', 'anthropic-ratelimit-unified-status': 'rejected', 'set-cookie': 'a=b' } },
           );
         }
+        if (body.model === 'codex-refused') {
+          return Response.json(
+            { error: { type: 'usage_limit_reached', message: 'limit', resets_at: 1_900_000_000 } },
+            { status: 429, headers: { 'x-codex-primary-used-percent': '18', 'x-codex-primary-reset-at': '1800000000' } },
+          );
+        }
         if (body.model === 'early') {
           // Headers now, body held open: the audit record (written when the
           // stream drains) cannot exist while this test looks.
@@ -233,6 +239,26 @@ describe('proxy capture (fake upstream)', () => {
     const latest = tracker.readings();
     expect(latest).toHaveLength(1);
     expect(latest[0].status).toBe(429);
+  });
+
+  // INVARIANT: a Codex usage-limit refusal states its reset only in the 429
+  // body; the proxy reads it onto the reading (so the pause lasts until that
+  // reset) and still hands the client the same body.
+  test('a Codex usage-limit 429 carries the stated reset from its body onto the reading', async () => {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'codex-refused', stream: true, max_tokens: 5, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    expect(res.status).toBe(429);
+    expect(((await res.json()) as { error: { type: string } }).error.type).toBe('usage_limit_reached');
+    await new Promise((r) => setTimeout(r, 30));
+    const r = records.at(-1)!;
+    expect(r.usageLimitHeaders?.['lazy-codex-refusal-resets-at']).toBe('1900000000');
+    const reading = tracker.readings().find((x) => x.model === 'codex-refused')!;
+    const w = reading.windows.find((x) => x.name === 'codex-refused')!;
+    expect(w.status).toBe('rejected');
+    expect(w.resetsAt).toBe(1_900_000_000_000);
   });
 });
 

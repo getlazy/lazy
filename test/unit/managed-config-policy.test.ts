@@ -55,6 +55,7 @@ const CONTAINER_EXPANSIONS: Record<string, string[]> = {
   // per profile name.
   'agents.harness': ['agents.*.harness'],
   'agents.model': ['agents.*.model'],
+  'agents.description': ['agents.*.description'],
   'agents.endpoint': ['agents.*.endpoint'],
   'agents.credential': ['agents.*.credential'],
   'proxy.fallback': ['proxy.fallback[].upstream', 'proxy.fallback[].model'],

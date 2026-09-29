@@ -9,7 +9,9 @@
  * See src/server/task-actions.ts for why the port is declared in src/server/.
  */
 
-import { getOrCreateStorage } from './rpc-handlers';
+import { getOrCreateStorage, handleUsagePause, withLaunchAllowance } from './rpc-handlers';
+import { describeUsagePause } from '../usage-pause/policy';
+import { describeTaskUsagePause } from './usage-pause';
 import { editTask } from './edit-task';
 import { createTask as daemonCreateTask } from './create-task';
 import { launchTask } from './task-launcher';
@@ -37,6 +39,8 @@ import type {
   TaskEditInput,
   TaskEditResult,
   TaskLifecycleResult,
+  TaskLaunchOptions,
+  TaskUsagePauseView,
   EnsureContainerResult,
   TaskUpstreamStatusView,
   TaskSyncResult,
@@ -77,9 +81,14 @@ export function createTaskEditActions(projectRoot: string): TaskActions {
     // this only narrows the result to what the page needs. `actor: 'human'` —
     // a person in the dashboard is the same channel as a person at the CLI.
 
-    async startTask(taskId: string, onProgress?: ProgressEmitter): Promise<TaskLifecycleResult> {
-      // A signed-in person: may use the one-shot usage-pause override.
-      const result = await launchTask(projectRoot, { taskId, actor: 'human', usagePauseOverrideEligible: true, onProgress });
+    async startTask(taskId: string, onProgress?: ProgressEmitter, options?: TaskLaunchOptions): Promise<TaskLifecycleResult> {
+      // A signed-in person: may use the one-shot usage-pause override, and may
+      // let this one launch through the pause (the per-task allowance).
+      const result = await withLaunchAllowance(
+        'startTask',
+        { taskId, actor: 'human', usagePausePastOnce: options?.pastUsagePause === true },
+        () => launchTask(projectRoot, { taskId, actor: 'human', usagePauseOverrideEligible: true, onProgress }),
+      );
       return { warnings: result.warnings };
     },
 
@@ -98,16 +107,41 @@ export function createTaskEditActions(projectRoot: string): TaskActions {
       return { warnings: result.warnings };
     },
 
-    async resumeTask(taskId: string, onProgress?: ProgressEmitter): Promise<TaskLifecycleResult> {
-      const result = await daemonResumeTask(projectRoot, { taskId, actor: 'human', usagePauseOverrideEligible: true, onProgress });
+    async resumeTask(taskId: string, onProgress?: ProgressEmitter, options?: TaskLaunchOptions): Promise<TaskLifecycleResult> {
+      const result = await withLaunchAllowance(
+        'resumeTask',
+        { taskId, actor: 'human', usagePausePastOnce: options?.pastUsagePause === true },
+        () => daemonResumeTask(projectRoot, { taskId, actor: 'human', usagePauseOverrideEligible: true, onProgress }),
+      );
       return { warnings: result.warnings };
+    },
+
+    // The usage-pause allowance goes through the same RPC handler the CLI and
+    // the builder reach, as the human channel — the rule stays the daemon's.
+    async usagePauseForTask(taskId: string): Promise<TaskUsagePauseView> {
+      // One task only: the task page must not pay for the project-wide state.
+      const { verdict, allowance } = await describeTaskUsagePause(projectRoot, await getOrCreateStorage(), taskId);
+      return {
+        reason: verdict ? describeUsagePause(verdict) : null,
+        // Unreadable saved readings are never lifted by an allowance.
+        liftable: !verdict?.storeError,
+        allowed: allowance ? { setBy: allowance.setBy, setAt: allowance.setAt } : null,
+      };
+    },
+
+    async allowPastUsagePause(taskId: string): Promise<void> {
+      await handleUsagePause(projectRoot, { action: 'allowTask', taskId, actor: 'human' });
+    },
+
+    async clearUsagePauseAllowance(taskId: string): Promise<void> {
+      await handleUsagePause(projectRoot, { action: 'clearTask', taskId, actor: 'human' });
     },
 
     async reopenTask(taskId: string, reason?: string, _onProgress?: ProgressEmitter): Promise<TaskLifecycleResult> {
       const result = await daemonReopenTask(projectRoot, { taskId, reason, actor: 'human' });
       return {
         warnings: result.hadSession
-          ? result.warnings
+          ? [result.restore?.message, result.restore?.syncHint, ...result.warnings].filter((w): w is string => Boolean(w))
           : [...result.warnings, 'Task reopened in backlog — start it to begin work.'],
       };
     },

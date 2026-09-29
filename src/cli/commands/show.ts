@@ -9,7 +9,8 @@ import { renderWorkingStatus } from '../../utils/working-substate';
 import { formatTurnLaunchLabels, formatTurnModelWarning, formatTurnTypeSuffix } from '../../utils/turn-labels';
 import { formatUnparsedReviewSuffix } from '../../review/parse-report';
 import { isBuiltinPromptCode, readBuiltinPrompt, listBuiltinPrompts } from './prompts';
-import { showConversationTranscript } from './import-conversation';
+import { printConversationTranscript } from './import-conversation';
+import { resolveBuilderTranscript } from '../../builder/identity-transcript';
 import { isTTY, promptChoice } from '../editor';
 import type { Task, Session, Turn } from '../../types';
 import { formatArtifactBytes } from '../../artifacts/limits';
@@ -17,6 +18,7 @@ import { parentTaskIdOf } from '../../task-target';
 import { isMidMerge, describeMergeState } from '../../git/operations';
 import { shortId, displayId } from '../../task/identity';
 import { clusterProgressOf, formatClusterProgress, clusterProgressPayload } from '../../task/cluster-progress';
+import { reopenedAfterAcceptLine, reopenedAfterAcceptOf } from '../../task/reopen-after-accept';
 import { displayUrlFor } from '../../serve/subdomain';
 import type { Storage } from '../../storage/interface';
 import { loadTaskShowData, type TaskShowData } from '../../task/show-data';
@@ -251,6 +253,7 @@ export function buildTaskShowLines(
       outputLines.push(...usagePauseHoldLines(usageHold, {
         heldStart: usagePausePendingStartOf(task) !== null,
         offerOverride: offerUsagePauseOverride,
+        taskRef: displayId(task),
       }));
     }
 
@@ -483,8 +486,15 @@ export function buildTaskShowLines(
       outputLines.push(...usagePauseHoldLines(heldStartHold, {
         heldStart: usagePausePendingStartOf(task) !== null,
         offerOverride: offerUsagePauseOverride,
+        taskRef: displayId(task),
       }));
     }
+  }
+
+  // A reopened task still carries its old accept tag; say it was superseded.
+  const reopenedLine = reopenedAfterAcceptLine(task);
+  if (reopenedLine) {
+    outputLines.push(`\n${theme.label('Reopened:')} ${reopenedLine}`);
   }
 
   // Cluster progress — derived from the children below, printed above them so
@@ -870,49 +880,45 @@ export async function commandShow(args: string[], invokedAs = 'show'): Promise<v
   // Not a task — try conversation session ID, then file path
   const storage = await requireStorage();
   try {
-    const conversations = await storage.listConversations();
-    // Prefer an exact session-ID match; otherwise accept a unique prefix, the
-    // same way tasks resolve short IDs. A prefix matching more than one
-    // conversation is ambiguous — error rather than silently picking the first.
-    const exact = conversations.find(c => c.sessionId === taskId);
-    const prefixMatches = conversations.filter(c => c.sessionId.startsWith(taskId));
-    const convMatch = exact ?? (prefixMatches.length === 1 ? prefixMatches[0] : null);
+    // A Builder id, any of its segments' session ids, or a unique prefix — the
+    // shared resolver (src/builder/identity-transcript.ts), so this and
+    // `lazy conversations show` can never answer the same id differently.
+    const resolved = /^[0-9a-fA-F-]+$/.test(taskId) ? await resolveBuilderTranscript(storage, taskId) : null;
 
-    if (!convMatch && prefixMatches.length > 1) {
-      console.error(`Multiple conversations match '${taskId}'. Use a longer prefix to disambiguate:`);
-      for (const c of prefixMatches) {
-        const firstUserMsg = c.messages.find(m => m.role === 'user');
-        const firstLine = firstUserMsg ? firstUserMsg.text.split('\n')[0].substring(0, 60) : '(no prompt)';
-        console.error(`  ${c.sessionId.substring(0, 8)}  ${firstLine}`);
+    if (resolved && 'ambiguous' in resolved) {
+      console.error(`Multiple Builders match '${taskId}'. Use a longer prefix to disambiguate:`);
+      for (const c of resolved.ambiguous) {
+        console.error(`  ${c.sessionId.substring(0, 8)}  ${c.summary.split('\n')[0].substring(0, 60)}`);
       }
       process.exit(1);
     }
 
-    if (convMatch) {
+    if (resolved) {
+      const { builder, conversation: conv } = resolved;
       if (jsonOutput) {
-        const conv = await storage.loadConversation(convMatch.sessionId);
-        if (conv) {
-          console.log(JSON.stringify({
-            type: 'conversation',
-            session_id: conv.sessionId,
-            summary: conv.summary,
-            git_branch: conv.gitBranch,
-            started_at: conv.startedAt,
-            ended_at: conv.endedAt,
-            stats: conv.stats,
-            total_usage: conv.totalUsage,
-            messages: conv.messages.map(m => ({
-              role: m.role,
-              text: m.text,
-              timestamp: m.timestamp,
-              model: m.model,
-              usage: m.usage,
-            })),
-          }));
-        }
+        console.log(JSON.stringify({
+          type: 'conversation',
+          session_id: conv.sessionId,
+          builder_id: builder.id,
+          segments: builder.segments,
+          run: builder.run,
+          summary: conv.summary,
+          git_branch: conv.gitBranch,
+          started_at: conv.startedAt,
+          ended_at: conv.endedAt,
+          stats: conv.stats,
+          total_usage: conv.totalUsage,
+          messages: conv.messages.map(m => ({
+            role: m.role,
+            text: m.text,
+            timestamp: m.timestamp,
+            model: m.model,
+            usage: m.usage,
+          })),
+        }));
         return;
       }
-      await showConversationTranscript(storage, convMatch.sessionId, lineRange);
+      printConversationTranscript(conv, lineRange, builder);
       return;
     }
   } finally {
@@ -1124,6 +1130,9 @@ function buildShowJson(data: TaskShowData): Record<string, unknown> {
   // Pencils down. Emitted even when null, unlike the optional blocks below: a
   // script must be able to tell "nobody declared this done" from "this build
   // does not report finals", and only an explicit null does that.
+  const reopened = task.status === 'complete' ? null : reopenedAfterAcceptOf(task);
+  if (reopened) jsonData.reopened_after_accept = reopened;
+
   jsonData.final = buildShowFinal(turns);
 
   if (retryStatus) {
@@ -1224,14 +1233,15 @@ Examples:
 /**
  * The `lazy show` lines for a launch the usage pause is holding.
  *
- * INVARIANT: the override command is named only to a person at their own
- * terminal (`offerOverride`), and never for a HELD SUBTASK START, which the
- * override does not release (the replay runs as the agent that asked): that
- * one starts by itself after the reset, and says so.
+ * INVARIANT: the way through — the task's own allowance, "let its next turn
+ * through" — is named only to a person at their own terminal
+ * (`offerOverride`). It releases a HELD SUBTASK START too (engineer decision
+ * 2026-09-26: the allowance is per task, whichever launch is next), so that one
+ * is offered it as well as told it starts by itself after the reset.
  */
 export function usagePauseHoldLines(
   hold: UsagePauseHold,
-  opts: { heldStart: boolean; offerOverride: boolean; now?: number },
+  opts: { heldStart: boolean; offerOverride: boolean; taskRef?: string; now?: number },
 ): string[] {
   const lifted = hold.resetsAt !== null && hold.resetsAt <= (opts.now ?? Date.now());
   const lines = [
@@ -1241,11 +1251,11 @@ export function usagePauseHoldLines(
         : `the ${hold.held} is waiting`),
   ];
   if (!lifted) lines.push(`    ${describeUsagePause(hold)}`);
-  const next = opts.heldStart
-    ? 'it starts by itself after the reset'
-    : opts.offerOverride
-      ? `let one turn start now: ${theme.command('lazy daemon config set usage_pause_threshold off')}`
-      : 'it goes ahead by itself after the reset';
+  const byItself = opts.heldStart ? 'it starts by itself after the reset' : 'it goes ahead by itself after the reset';
+  const next = opts.offerOverride
+    ? `${byItself}, or let it through now: ` +
+      theme.command(`lazy daemon config set usage_pause_threshold off --task ${opts.taskRef ?? '<task>'}`)
+    : byItself;
   lines.push(`    ${dim(`Details: ${theme.command('lazy doctor')} · ${next}`)}`);
   return lines;
 }

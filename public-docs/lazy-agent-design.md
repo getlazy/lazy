@@ -173,7 +173,7 @@ silently loses **every** `lazy_*` tool. The only visible symptom is an opaque
 Two mechanisms make that failure loud at **container launch**:
 
 1. **`lazy-agent selfcheck`** (and `--version` / `--revision`) prints a stable
-   sentinel, `lazy-agent ok <version>`, and exits 0. A bare Bun binary instead
+   sentinel, `lazy-agent ok <version> (<branch>@<commit>, clean|dirty, <source>)`, and exits 0 — the suffix says which build it is. A bare Bun binary instead
    prints Bun's own version or errors `Script not found "selfcheck"`, so both the
    sentinel and the exit code distinguish the real compiled agent from bare Bun.
 2. The **builder supervisor preflight** (`preflightAgentBinary`) execs

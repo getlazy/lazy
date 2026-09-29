@@ -1,5 +1,122 @@
 # Changelog
 
+## [0.91.1184] - 2026-09-29 - Lazy Teams
+
+Lazy Teams gets its own Configuration page, per-agent and per-team credentials, per-file protected-file decisions, a reworked task page and much more reliable upgrades on microVM installs. In lazy itself, `lazy stats budget` shows where a usage window's tokens went, every binary and image names its exact build, and task worktrees are hardened against several ways an agent could reach outside them. On Claude, which is still first among equals, tasks now default to `claude-sonnet-5-5` and the builder to `claude-opus-5-5`.
+
+### Added
+
+**lazy**
+- **`lazy stats budget`** — tokens spent and left per usage window, plus spend by harness, task and day; also on the dashboard and Lazy Teams
+- **Let a paused task's next turn through** — `--past-usage-pause` on start/unblock/resume/review/ask, a button on the dashboard and Lazy Teams, and the builder on request; one task, one turn
+- **Approve or Reject each protected file** — one persistent switch per file in the web review and Lazy Teams, next to the agent's reason and the diff; a rejected file is restored to its base, as its own commit, before the agent's next turn, and accept names the restore
+- **Artifacts tab on the dashboard task page** — list, preview (images, text, Markdown), download, and upload input files for the agent
+- **Id links** — task codes, short task ids, raised-item ids and commit shas written in prompts, turns, comments or reports link to their pages, on the dashboard and in Lazy Teams
+- **Build identity everywhere** — `lazy --version`, `lazy-agent --version`, daemon status and Lazy Teams (footer and `GET /version`) name the exact commit, branch and clean/dirty state, including inside images
+- **Agent profile `description`** — say when to use each `[agents.<name>]` profile; every agent picker, `lazy system agent` and the builder show it
+- **`lazy_review_comments` / `lazy_review_status`** — agents and builders read a task's PR/MR comments, verdicts and CI checks on demand, without holding a forge token
+- **`lazy_token_stats`** — builders and task agents can compare token use, outcomes, feedback rounds, and model history before choosing a model
+- **Lazy co-author trailer on task commits** — `lazy_commit` commits now carry `Co-Authored-By: Lazy` like accept commits do; turn it off with `[git] coauthor_trailer = false`
+
+**Lazy Teams**
+- **Project Configuration page** — a project's `lazy.toml` is imported once, then edited by the team owner in an explained settings form with lazy's own validation, Check before saving, versions with diffs, a notice saying when each change applies, and repair even when it stops loading; the repository copy is then ignored
+- **Credentials per agent** — members connect their own credential for each agent profile a project defines (Pi, Codex, Cursor, extra Claude endpoints) and every turn bills the starter's own; the Credentials page shows whether the project can use each one
+- **Credential levels** — set credentials per account or team (projects may override); copy one up a level without seeing it
+- **Artifacts tab** — a task's files get their own tab with a count, image previews and the space left; the New Task form attaches files at creation
+- **Commits show who and when, with their patch** — each commit names its author and time (ISO 8601, your local zone, UTC on hover); opening one shows its diff
+- **Reopened-after-accept notice** — a task reopened after an accept says so on its page, so its leftover accept tag no longer reads as accepted
+- **Actionable project doctor** — every member finds it under Settings → Doctor; Run doctor shows its progress, never runs twice at once, and gives a remedy, troubleshooting link and shell commands with real paths per failing check; admins can report a problem to support and see when it was read
+- **Pull and merge requests** — projects on their own machine (the default) include `gh` and `glab`, so `lazy submit` opens PRs/MRs and forge reviews are readable
+- **God-mode logs** — operators read each project's setup attempt, supervisor commands, app log (including the project daemon's own) and daemon log in the browser, filtered and followed, with credentials redacted
+- **God-mode machine shell** — site administrators open a browser shell inside a project's microVM, in its repository with its daemon's environment; each open is logged
+
+### Changed
+
+**lazy**
+- **Default models** — tasks default to `claude-sonnet-5-5`, the builder to `claude-opus-5-5` (Claude Code 2.1.284+); `lazy.toml.example` adds model-tier profiles
+- **The daemon starts without a model credential** — only running a turn needs one; a turn on a profile without its credential is refused naming that profile, and `lazy daemon health` warns first
+- **Builders** — `lazy conversations`, the dashboard's Builders page and the conversation tools show one Builder per conversation, across compactions and resumes; scratch files record their Builder
+- **`lazy system verify-host-boundary`** — asks before launching its billed headless sessions; scripts pass `--yes` together with `--json <path>`
+- **Changes tab, `lazy diff`, `lazy_diff`** — a parent task shows its whole branch, subtasks included, with per-region views; large branches load file by file
+- **Dashboard token usage** — appears below tasks and reviews, keeping the work you open the dashboard for first
+- **Agent and builder working rules** — agents verify a failure's cause before stating it, raise decision tasks instead of answering them, and say where every handed-over command runs
+- **Container images on both registries** — the Lazy Teams image joins the daemon image on Docker Hub; both publish to GHCR and Docker Hub with identical tags
+- **Faster image publishing** — both images reuse cached layers across releases and build arm64 on native runners; `-f arm_runner=emulated` falls back to QEMU
+
+**Lazy Teams**
+- **Codex, Cursor and Pi tasks need each member's own credential** — a project- or host-held key no longer runs them; each member connects theirs on the Credentials page
+- **Task page** — an Overview tab showing the prompt, a Current review tab holding protected files, raised items and the accept checklist (Accept is offered on submitted tasks too), How to verify only on Verify, and wrapping tabs
+- **Project page** — a task overview: token budget moves to its own Usage page, and Project health appears only when something is wrong
+- **Navigation** — Builders lists each builder (yours first, with its run state) and opens its whole transcript and files; Settings gathers Memory, settings, credentials and Doctor; old links redirect
+- **New Task form** — Tab from Goal goes straight into the prompt, the Model hint names the chosen agent's own default, and the agent picker groups profiles apart from built-in harnesses
+- **Builders start in the background** — god mode shows each start's timeline and a per-run report, also via `bin/builder-run-report`
+- **Native install settings live with its data** — `~/lazy-fleet/deploy.env`, so any checkout or worktree runs the same install; `--env-file` overrides, and an old `deploy/.env` moves automatically
+- **Image built from the daemon image** — it copies lazy from the daemon image of the same release, so building Teams from source now needs that daemon image first
+
+### Fixed
+
+**lazy**
+- **`lazy reopen`** — reopening an accepted task no longer snaps back to complete seconds later, and one whose local branch is gone comes back with its own work restored from the remote (or refuses when it cannot be found); `lazy show` notes which accept the reopen superseded
+- **Tasks with no named target** — `lazy accept` merges into, and `lazy submit` opens its PR against, the remote's real default branch (e.g. `master`) instead of assuming `main`
+- **Builder relaunch and reconnect** — a builder relaunched or reconnected after an upgrade or daemon restart uses the current lazy.toml model, effort and system prompt; `--model`/`--effort` typed on `lazy builder` stay pinned
+- **`lazy doctor` builder staleness** — reports running builders whose model or image is behind the current config, since upgrades leave builders running
+- **Builder losing its lazy tools to a task sharing its home** — a task turn now refuses to overwrite a builder's tool entry
+- **Honest "daemon unreachable" errors** — commands say which daemon address they tried, or that none is recorded, instead of "Daemon is not running"; `lazy-agent doctor` flags a lazy tool entry another process overwrote
+- **No second daemon from a shell with a different daemon directory** — lazy uses the project's running daemon, or refuses with the variable to export, instead of starting a conflicting one
+- **Doctor storage-lock check** — no longer reports a healthy daemon as "holds the storage lock but is not serving storage", including when run from the dashboard or Lazy Teams
+- **`lazy doctor`** — a corrupt credential index no longer cuts every command off from the daemon; doctor reports the one credential it cannot vouch for
+- **`lazy doctor` container image check** — a project whose image is not built yet (before its first task start) is a note, not a failure
+- **Task diffs and commits** — lazy's runtime files (the agent sandbox, `.lazy/`, `.lazy-lock`) are ignored in every task worktree even when the project never committed lazy's `.gitignore`
+- **`lazy env set`** — a change reaches the task's next turn even while its container is still running, and values are scrubbed from logs and recorded turns
+- **Dashboard Accept dialog** — offers "merge without delivering the queued comments" even when the comment was queued after the page opened, and on a refused accept
+- **Failed API calls in `lazy watch` and the proxy audit** — a refused request shows the upstream's own error message next to `FAIL(<status>)`, not just the status code
+- **Per-turn token usage** — Pi, Codex and Cursor measurements persist with each turn and stay available after proxy audit logs rotate
+- **Codex on OpenRouter** — the documented endpoint is now `https://openrouter.ai/api`; a Codex endpoint ending in `/v1` gets a load-time warning naming the fix
+- **`[usage_pause]` for Codex** — a Codex usage-limit refusal pauses the ChatGPT credential until the reset it states, even when readings were under the threshold; per-model limits count too
+- **`lazy stats limits`** — a usage window whose reset time has passed shows as reset, not its old percentage, in text, `--json` and `lazy_usage_limits`
+- **Provider quota walls** — a "monthly usage limit" / out-of-credits 429 (Ollama, OpenAI, Anthropic) blocks the task with the provider's message and remedy instead of retrying forever
+- **macOS Keychain prompts** — refreshing a ChatGPT/Codex subscription session no longer asks to change your keychain after each lazy upgrade or token rotation
+- **Promoted tasks** — a task promoted from a raised item or review discussion no longer ends its prompt with the originating task's goal, which agents read as a second instruction
+- **Replaced agent environments** — when lazy replaces a task's container between turns, the agent is told that anything it installed outside the worktree is gone
+
+**Security**
+- **Task containers** — a task can no longer redirect its worktree's git pointers, or plant config or hooks in its submodules' git dirs, to make git outside the container run its code; `lazy doctor --repair-git-pointers` repairs both
+- **Task worktrees** — a repository a task plants inside its worktree is reported by `lazy doctor`, moved aside between turns, never run by lazy's own git, and blocks `lazy accept`
+- **Task worktrees** — lazy refuses to commit, sync or accept in a task worktree whose HEAD names another branch; `lazy doctor` reports it and says how to switch back
+- **Host-process runner sandbox** — an agent's file tools can no longer write outside its own worktree in your home directory or the project root (including the root `lazy.toml`), nor read or write lazy's daemon directory or the project's external task store; its shell keeps working on macOS
+
+**Lazy Teams**
+- **Upgrades** — every project, microVM ones included, moves to the new version automatically, keeping its worktrees and uncommitted work, even when the upgrade changed its environment; the Installation page shows each failed restart's reason and next attempt, and god mode lists out-of-date projects
+- **Model credentials** — a project registers, clones and starts without one (it is needed only to run tasks, and a refusal names the agent profile that lacks it); setup, the dashboard, the team page and the project page say so up front with a Connect link, admins see which members have none, and a lost credential is re-sent automatically
+- **Private repositories clone with your forge connection** — on every backend and on automatic retries, and later fetches and pushes authenticate too; registering asks for a connection first, and SSH URLs are refused
+- **A repository that cannot be cloned** — the project page shows why and what to do next (connect a forge account, fix the URL), and Retry setup re-runs it
+- **Project setup** — a stalled or impossible setup is reported with its cause instead of "starting…" forever; unpullable project images are caught first
+- **Hosted repositories on microVMs** — projects clone, fetch and push them from inside their machine; `LAZY_GIT_LISTENER_PORT` sets the internal port
+- **Hosted-git sign-in throttle** — counted per token instead of per address, so one broken token no longer locks out any other machine; trips show on the project page and in god mode
+- **Git LFS repositories** — large-file filters are installed and configured automatically so tasks can start without committing raw files
+- **microVM tasks** — tasks that edit files can commit and finish again; the daemon no longer refuses worktrees its task containers own
+- **Commits** — commits, sync merges and accepts made by the daemon name the member who asked (or the service credential owner) instead of failing with "unable to auto-detect email address"
+- **Projects stuck on "Failed to acquire storage lock"** — a second daemon start no longer touches the store; Teams restarts a project whose daemon cannot open it, and members see a plain sentence
+- **Builder homes survive machine replacement** — members' builder settings, credentials, conversations and scratch live on the project's persistent disk instead of the machine; an upgrade moves existing ones across
+- **Builders** — a member's first session opens straight into the builder instead of Claude Code's first-run prompts, and builders no longer exit with "permission denied" on their own prompt file when the daemon runs as root (scratch now mounts at `/lazy-builder`; builders point members at `lazy scratch show`)
+- **Terminals** — after an upgrade the terminal shows "Preparing your terminal…" while your environment is built instead of failing after 30 seconds, and a builder, shell or watch terminal that cannot open says why on its own page
+- **`lazy-agent doctor` in a member terminal** — says it is a member session with no lazy tools by design, instead of reporting three failures
+- **Repository-host check** — no longer reports a project's repository as unreachable when git works; it tests git access with the project's forge connection
+- **Doctor notices** — per-problem wording and last-checked time; god mode lists waiting support reports and gets restart and support-bundle actions; restarts re-check at once
+- **Usage pause** — starting, unblocking or reviewing a task during a usage pause says when the window resets instead of naming a terminal command members do not have
+- **Unblock, Review, Sync and Reparent** — the page comes back as soon as the action is recorded instead of leaving the progress bar running while the agent launches
+- **Watch panel** — multi-line agent output renders line by line instead of as a staircase drifting right
+- **Notices** — a success notice after an action no longer vanishes when the page refreshes itself with live updates
+- **Reviews tab** — a review lazy judged clean says "clean", and a needs-work review that does not hold the merge is marked "not blocking"
+- **New Task prompt drafts** — a created task no longer leaves its prompt behind, drafts never cross projects or reinstalls, and a restored draft says so with a Discard button
+- **First-run setup** — "Skip for now" on the final step completes setup instead of showing a "page not found" error
+- **Project Settings** — saving a default model or agent no longer fails with "actor must be a string, got object"
+- **Members page** — the role dropdown now actually saves a member's new role instead of silently doing nothing
+
+### Removed
+
+- **Lazy Teams Docker Sandboxes backend** — never production-tested; projects run on the microVM backend (default) or `local`, and `LAZY_FLEET_BACKEND=sandbox` is now refused
+
 ## [0.90.1170] - 2026-09-25 - Lazy Teams, identity and per-user billing
 
 Every action and every agent turn is now attributed to the person who asked for it, and billed to their own credential. Lazy Teams, a self-hostable web app for sharing a lazy project with your team, is new: it runs each project's agent turns in its own microVM by default, `lazy login` binds a local clone to a Teams project (your own builder and Claude Code included), and its web UI brings most of the local dashboard. Agents now declare when they are done and their work is reviewed automatically (by default the writer reviews and revises its own work), and you can opt in to pausing work before a subscription window runs out.
@@ -164,12 +281,7 @@ Every action and every agent turn is now attributed to the person who asked for 
 - **`lazy accept` and `lazy ask` no longer hang for half an hour when the agent's run dies** — they notice within seconds, report the exit code and last output, and leave the task where it was
 - **`lazy accept` never merges on a pre-accept turn that validated nothing** — if another turn takes over the task mid-validation, the accept stops instead of treating the missing result as a pass
 - **`lazy ask`** — a second ask on a task that is already answering one is refused instead of racing it
-- **The web review page no longer shows a phantom "comments" file** — a task comment could rename the last changed file to `comments` and hide its diff; comments now render only as threads
 - **`lazy sync` no longer says "Already up to date" while `lazy accept` reports conflicts** — sync merges the ref accept actually merges into, and warns when the local and remote parent branch differ
-- **`[git] default_branch_prefix` is finally honoured** — set it to `wip` and task branches are named `wip/<task>`; a prefix git cannot use is rejected when the config loads
-- **`[remote] github_auto_push = false` now stops the automatic pushes** — task branches stay local; `lazy submit` and `lazy accept` still push when a merge needs it
-- **A consented worktree image is built against that worktree's own directory** — its `Dockerfile.lazy` `COPY`s resolve on its branch, not the project root, and the prompt names the context before you answer
-- **A broken `lazy.toml` no longer kills the daemon with a bare parse error** — startup refuses up front, naming the file, the offending line and the fix
 
 ## [0.22.1134] - 2026-08-24 - Hotfix for long running Docker builds
 

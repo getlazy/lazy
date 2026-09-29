@@ -79,7 +79,7 @@ export interface RunResult {
  * The environment every demo subprocess runs with.
  *
  * `ANTHROPIC_API_KEY` is a deliberately fake, obviously-labelled value and the
- * demo NEVER inherits the human's real credential. The daemon's credential gate
+ * demo NEVER inherits the human's real credential. The turn credential gate
  * only checks that one is present; the fake agent never dials out, so nothing
  * is ever spent. Inheriting the real one would put a live credential behind a
  * throwaway daemon for no benefit at all.
@@ -259,7 +259,7 @@ function shellQuote(value: string): string {
  * which is the shape secret scanners match — and this repo has already produced
  * GitGuardian alerts on exactly that, from proxy placeholder tokens. A literal
  * in the source that trips a scanner costs somebody a triage every time it is
- * seen, and buys nothing: the daemon's credential gate only checks that a
+ * seen, and buys nothing: the turn credential gate only checks that a
  * credential is present and non-blank (`credentialFromEnv` in
  * `src/daemon/credential-gate.ts`), so the prefix is not load-bearing for
  * anything.

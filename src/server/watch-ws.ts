@@ -29,8 +29,12 @@
  * (src/render/theme.ts) — otherwise the panel would show colorless text purely
  * because of which process built the string.
  *
- * Wire protocol: binary frames are output bytes to write verbatim; text frames
- * are JSON control messages ({@link WatchServerMessage}).
+ * Wire protocol: binary frames are rendered lines of output; text frames are
+ * JSON control messages ({@link WatchServerMessage}). A frame ends in "\r\n",
+ * but a rendered line may carry EMBEDDED bare "\n"s (multi-line agent text), so
+ * a terminal consumer must display with LF→CRLF conversion (xterm `convertEol`)
+ * — the dashboard's watch panel and Lazy Teams' Watch both do. This is a stream
+ * of lines, not a PTY.
  */
 
 import { open as openFile, stat } from 'fs/promises';

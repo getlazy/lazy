@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { ensureLazyExcludeBestEffort } from '../git/lazy-exclude';
 import { join, resolve } from 'path';
 import {
   LAZY_DIR,
@@ -498,6 +499,7 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
     // the blanket `.lazy/` rule can never converge onto it — the enumerated
     // entries were written by init, so init is the thing that must retire them.
     // Silent when nothing changes.
+    await ensureLazyExcludeBestEffort(targetDir);
     if (await updateGitignore(targetDir)) {
       console.log(`Updated .gitignore: lazy now ignores ${LAZY_DIR}/ wholesale`);
       await warnAboutTrackedLazyFiles(targetDir);
@@ -601,7 +603,9 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
     }
   }
 
-  // Update .gitignore
+  // Update .gitignore, and the repository-wide info/exclude that every task
+  // worktree sees even when that .gitignore is never committed.
+  await ensureLazyExcludeBestEffort(targetDir);
   await updateGitignore(targetDir);
   console.log('Adding lazy entries to .gitignore');
   await warnAboutTrackedLazyFiles(targetDir);

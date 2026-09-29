@@ -27,10 +27,13 @@ import { RpcError } from '../../src/daemon/rpc-error';
 import { pinDaemonBaseDir } from '../helpers/daemon-base-dir';
 
 function fakeStorage(task: Record<string, unknown>, opts: { turns?: number; session?: boolean } = {}) {
+  const metadata = new Map<string, string>();
   return {
     getTask: async () => task as never,
     getSessionByTaskId: async () => (opts.session === false ? null : ({ id: 'sess-1', task_id: task.id }) as never),
     getSessionTurns: async () => Array.from({ length: opts.turns ?? 1 }, (_, i) => ({ sequence: i + 1 })) as never,
+    getTaskMetadata: async (_id: string, key: string) => metadata.get(key) ?? null,
+    updateTaskMetadata: async (_id: string, key: string, value: string) => { metadata.set(key, value); },
   };
 }
 
@@ -239,7 +242,9 @@ describe("the task's own container on a member's entry", () => {
     const runnerModule = await import('../../src/runner');
     const calls: string[] = [];
     let running = true;
+    let sandboxed = true;
     const fakeRunner = {
+      usesSandbox: () => sandboxed,
       runNameForTask: (ref: string) => `lazy-${ref}`,
       isRunning: async (n: string) => { calls.push(`isRunning:${n}`); return running; },
       stopRun: async (n: string) => { calls.push(`stop:${n}`); running = false; return true; },
@@ -248,8 +253,14 @@ describe("the task's own container on a member's entry", () => {
     const spy = spyOn(runnerModule, 'createRunner').mockResolvedValue(fakeRunner as never);
     try {
       const task = { id: 'task-14', runner_type: null, metadata: { task_ref: 'ref' } } as never;
-      await stopTaskContainerForMember('/p', task, { container_name: 'lazy-c', runner_type: 'docker' } as never);
+      expect(await stopTaskContainerForMember('/p', task, { container_name: 'lazy-c', runner_type: 'docker' } as never)).toBe(true);
       expect(calls).toEqual(['isRunning:lazy-c', 'stop:lazy-c', 'isRunning:lazy-c']);
+      // INVARIANT: a stopped host-process run reports false — its environment
+      // is the host, so the agent must not be told it was replaced.
+      running = true;
+      sandboxed = false;
+      expect(await stopTaskContainerForMember('/p', task, { container_name: 'lazy-c', runner_type: 'host-process' } as never)).toBe(false);
+      sandboxed = true;
       // A runtime that says it stopped it while it is still up: refused.
       running = true;
       fakeRunner.stopRun = async (n: string) => { calls.push(`stop:${n}`); return true; };

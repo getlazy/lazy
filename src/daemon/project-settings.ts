@@ -27,6 +27,8 @@ import type { ProjectSettings } from '../storage/types';
 import type { ResolvedConfig } from '../config/types';
 import { agentProfilesFor, selectableAgentProfiles } from '../config/agent-profiles';
 import { logger } from '../utils/logger';
+import { CODEX_PICKS_MODEL_NAMES, CURSOR_PICKS_MODEL_NAMES } from '../config/default-models';
+import { profileDefaultModel } from '../task/launch-identity-view';
 
 /**
  * One setting, reported with enough provenance for a UI to be honest about it.
@@ -73,6 +75,11 @@ export interface AgentProfileChoice {
   model: string;
   /** True when no `[agents.<name>]` block declares it — one of lazy's built-ins. */
   builtin: boolean;
+  /**
+   * When to choose this profile, in plain words ('' when none). Shown beside the
+   * picker so a person can propose the right agent — never used to select one.
+   */
+  description: string;
 }
 
 /**
@@ -89,6 +96,16 @@ export interface EffectiveProjectSettings {
    * inventing names is not.
    */
   agentProfiles: AgentProfileChoice[];
+  /**
+   * Per offered profile name, the model a task on it runs when its Model field
+   * is left empty — the launch's own resolution, so a
+   * form's hint follows the chosen agent without re-deriving the ladder. A
+   * separate map rather than a field on each profile row, whose key set is
+   * deliberately closed. A name that could not be resolved is absent.
+   */
+  agentDefaultModels: Record<string, string>;
+  /** Profile names whose empty Model field lets the harness pick its own model. */
+  agentHarnessChoosesModel: string[];
   /** Display-only for now — the mechanism generalises, the forms do not exist. */
   runnerType: EffectiveSetting;
   agentEffort: EffectiveSetting;
@@ -118,7 +135,7 @@ function setting(
  * The model a task turn should run on, given the overlay and lazy.toml.
  *
  * Returns undefined when neither source has an opinion, which lets the caller
- * keep using `resolveAgentModel`'s own fallback rather than duplicating it —
+ * keep using the launch resolution's own fallback rather than duplicating it —
  * a local ollama/proxy backend is authoritative over BOTH of these and must
  * still win.
  */
@@ -151,6 +168,41 @@ export async function readProjectSettings(storage: Storage): Promise<ProjectSett
   return storage.getProjectSettings();
 }
 
+/** Codex's `default` / Cursor's `auto`: "let the CLI pick", not a model name. */
+function isHarnessChoiceSentinel(harness: string, model: string): boolean {
+  const m = model.toLowerCase();
+  if (harness === 'codex') return CODEX_PICKS_MODEL_NAMES.has(m);
+  if (harness === 'cursor') return CURSOR_PICKS_MODEL_NAMES.has(m);
+  return false;
+}
+
+/**
+ * Per profile, what a task on it runs when its Model field is left empty.
+ * `models` holds concrete names from the launch's own resolution; a profile
+ * that pins its harness's own-choice placeholder (codex `default`, cursor
+ * `auto`) is listed in `harnessChooses` instead, because those placeholders
+ * are not model names a person can read.
+ */
+function agentDefaultModels(
+  config: ResolvedConfig,
+  profiles: readonly AgentProfileChoice[],
+  projectModel: string | undefined,
+): { models: Record<string, string>; harnessChooses: string[] } {
+  const models: Record<string, string> = {};
+  const harnessChooses: string[] = [];
+  for (const { name, harness } of profiles) {
+    try {
+      const model = profileDefaultModel({ config, agentId: name, projectModel });
+      if (isHarnessChoiceSentinel(harness, model)) harnessChooses.push(name);
+      else if (model) models[name] = model;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.warn(`Project settings: could not resolve the default model of agent '${name}': ${message}`);
+    }
+  }
+  return { models, harnessChooses };
+}
+
 /**
  * The project's selectable agent profiles, ordered for a picker.
  *
@@ -168,6 +220,7 @@ function agentProfileChoices(config: ResolvedConfig): AgentProfileChoice[] {
       harness: profile.harness,
       model: profile.model,
       builtin: profile.builtin,
+      description: profile.description,
     }));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -184,10 +237,14 @@ export function effectiveProjectSettings(
   settings: ProjectSettings | null,
   config: ResolvedConfig,
 ): EffectiveProjectSettings {
+  const agentProfiles = agentProfileChoices(config);
+  const defaults = agentDefaultModels(config, agentProfiles, resolveProjectModel(settings, config));
   const result: EffectiveProjectSettings = {
     defaultAgent: setting(settings?.defaultAgent, config.agent.agent_id, true),
     defaultModel: setting(settings?.defaultModel, config.models.default, true),
-    agentProfiles: agentProfileChoices(config),
+    agentProfiles,
+    agentDefaultModels: defaults.models,
+    agentHarnessChoosesModel: defaults.harnessChooses,
     // Display-only: reported so the page can show the whole operational
     // picture, but the overlay does not carry them yet (design §11.4).
     runnerType: setting(undefined, config.runner.type, false),

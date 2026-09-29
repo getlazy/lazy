@@ -11,6 +11,7 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { extractTaskId } from '../helpers/assertions';
 import { writeFileSync } from 'fs';
+import { readFile, writeFile } from 'fs/promises';
 import { readSystemMessagesFile, readTaskJson } from '../helpers/storage';
 import { MCP_SERVER_ENV_PINS } from '../helpers/mcp-env';
 
@@ -170,13 +171,16 @@ describe('lazy-agent mcp', () => {
     // concurrency cap), and the pre-unification aliases lazy_add_followup /
     // lazy_followups / lazy_followup_promote — raised items are one entity now,
     // and lazy_raise / lazy_raised_items / lazy_raised_promote are the surface.
+    // 51 since lazy_token_stats, lazy_review_comments and lazy_review_status —
+    // all agent-facing READS by design (a task agent reads its own token
+    // traffic and its own PR/MR; see mcp-token-stats / mcp-forge-read e2e).
     // 48 since lazy_usage_limits; 47 since the final-turn slice 1 added `lazy_final`; 46 before that, when
     // the release-v022 merge added `lazy_regions`. Agent-advertised by design,
     // not by omission: reading a task's regions is open on both surfaces
     // (public-docs/surface-asymmetries.md §25) — an agent reviewing a large
     // branch a region at a time is what the tool exists for. Only the human
     // OVERLAY (naming, sign-off) is CLI-only, and that is a separate tool.
-    expect(result.tools.length).toBe(48);
+    expect(result.tools.length).toBe(51);
 
     const toolNames = result.tools.map(t => t.name).sort();
     expect(toolNames).not.toContain('lazy_propose');
@@ -220,6 +224,8 @@ describe('lazy-agent mcp', () => {
       'lazy_report',
       'lazy_resume',
       'lazy_review',
+      'lazy_review_comments',
+      'lazy_review_status',
       'lazy_search',
       'lazy_show',
       'lazy_start',
@@ -228,6 +234,7 @@ describe('lazy-agent mcp', () => {
       'lazy_submit',
       'lazy_sync',
       'lazy_tag',
+      'lazy_token_stats',
       'lazy_unblock',
       'lazy_untag',
       'lazy_update_progress',
@@ -418,6 +425,46 @@ describe('lazy-agent mcp', () => {
     expect(parsed.worktree).toBeDefined();
     expect(parsed.worktree.branch).toBe('main');
     expect(typeof parsed.worktree.changed_files).toBe('number');
+  });
+
+  // INVARIANT: lazy_status answers the project's offered agent profiles with
+  // their descriptions, so a task agent or cluster driver can choose a
+  // subtask's agent from them. Internal agents are never offered.
+  test('lazy_status lists agent profiles with their descriptions', async () => {
+    const taskId = '00000000-0000-0000-0000-000000000001';
+    const tomlPath = join(ctx.root, 'lazy.toml');
+    const toml = await readFile(tomlPath, 'utf-8');
+    await writeFile(tomlPath, toml + '\n[agents.security]\nharness = "claude-code"\ndescription = "Use whenever a security aspect comes up."\n');
+
+    const responses = await runMcpSession(ctx.root, taskId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_status', arguments: {} } },
+    ]);
+    const result = responses.find(r => r.id === 2)!.result as { content: Array<{ text: string }> };
+    const parsed = JSON.parse(result.content[0].text);
+    const byName = new Map((parsed.agent_profiles as Array<{ name: string; description: string }>).map(p => [p.name, p]));
+    expect(byName.get('security')?.description).toBe('Use whenever a security aspect comes up.');
+    expect(byName.get('claude-code')?.description).not.toBe('');
+    expect(byName.has('qa-agent')).toBe(false);
+  });
+
+  // INVARIANT: a profile table that cannot be resolved is REPORTED, never
+  // swallowed — an agent must be able to tell a broken [agents.<name>] block
+  // from a project with no profiles to offer.
+  test('lazy_status names the error when agent profiles cannot be read', async () => {
+    const taskId = '00000000-0000-0000-0000-000000000001';
+    const tomlPath = join(ctx.root, 'lazy.toml');
+    const toml = await readFile(tomlPath, 'utf-8');
+    await writeFile(tomlPath, toml + '\n[agents.broken]\nharness = "claude-code"\ndescription = 42\n');
+
+    const responses = await runMcpSession(ctx.root, taskId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_status', arguments: {} } },
+    ]);
+    const result = responses.find(r => r.id === 2)!.result as { content: Array<{ text: string }> };
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.agent_profiles).toBeNull();
+    expect(parsed.agent_profiles_error).toContain('[agents.broken] description must be a string');
   });
 
   test('lazy_commit commits changes', async () => {

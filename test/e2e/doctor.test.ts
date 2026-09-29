@@ -1,4 +1,5 @@
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
+import { CLAUDE_DEFAULT_MODEL } from '../../src/config/default-models';
 import { mkdirSync, writeFileSync, readFileSync, rmSync, copyFileSync, chmodSync, existsSync } from 'fs';
 import { join } from 'path';
 import { mkdtempSync } from 'fs';
@@ -210,7 +211,7 @@ describe('lazy doctor', () => {
     test('warns about an oversized CLAUDE.md and names what to do', async () => {
       const configPath = join(ctx.root, 'lazy.toml');
       const before = readFileSync(configPath, 'utf-8');
-      const after = before.replace('default = "claude-opus-5"', 'default = "claude-sonnet-4-6"');
+      const after = before.replace(`default = "${CLAUDE_DEFAULT_MODEL}"`, 'default = "claude-sonnet-4-6"');
       expect(after).not.toBe(before);
       writeFileSync(configPath, after);
 

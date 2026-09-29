@@ -94,12 +94,12 @@ import {
 } from '../artifacts/limits';
 import { normalizeArtifactName } from '../artifacts/name';
 import type { TaskArtifactOrigin } from '../types';
-import { MCP_ACTOR, AGENT_ACTOR } from '../constants';
+import { MCP_ACTOR, AGENT_ACTOR, withLazyCoauthorTrailer } from '../constants';
 import { spawn } from '../utils/spawn';
 import { runGit } from '../utils/git';
 import { logger } from '../utils/logger';
 import { pathExists } from '../utils/fs';
-import { readWorktreeMergeState, isMidMerge, describeMergeState, getCurrentSha } from '../git/operations';
+import { readWorktreeMergeState, isMidMerge, describeMergeState, getCurrentSha, resolveDetachedHead } from '../git/operations';
 import {
   normalizeTurnReportSections,
   TURN_REPORT_SECTION_KINDS,
@@ -151,6 +151,8 @@ function rejectIfReadOnly(toolName: string): void {
 // Re-use storage and helpers from existing CLI infrastructure
 import { resolveStorage, resolveLazyRoot } from '../preconditions';
 import { assertWorktreeUsable } from './turn-identity';
+import { describeNestedGit, scanTaskWorktreeNestedGit } from '../git/nested-git';
+import { assertTaskWorktreeHead, taskWorktreeOf } from '../git/worktree-pointers';
 import { looksLikeTaskBranch, taskRefFromBranch } from '../git/branch-prefix';
 import { INTERNAL_GIT_TOOL_NAME, createInternalGitHandler } from './internal-git';
 import type { Storage, SearchResult } from '../storage';
@@ -158,7 +160,7 @@ import { VALID_TASK_TYPES, invalidTaskTypeMessage, type Session, type Task, type
 import { resolveTaskDiffBase } from '../task-diff-base';
 import { type RunnerType, resolveRunnerType, RUNNER_ALIAS_HINT, VALID_EFFORT_LEVELS, type EffortLevel } from '../config/types';
 import { hostRunnerRemovedMessage, isRemovedHostRunnerInput } from '../runner/host-runner-gate';
-import { agentProfileOrThrow, agentProfilesFor } from '../config/agent-profiles';
+import { agentProfileOrThrow, agentProfilesFor, selectableAgentProfiles } from '../config/agent-profiles';
 import { resolveAgentForNewTaskFromConfig } from '../agent/task-agent';
 import { createRunner } from '../runner';
 import type { Runner } from '../runner';
@@ -1529,7 +1531,7 @@ export const createTool: McpTool = {
       },
       model: {
         type: 'string',
-        description: 'Model ID to use for this task (e.g., opus, sonnet, claude-opus-5)',
+        description: 'Model ID to use for this task (e.g., opus, sonnet, claude-opus-5-5)',
 
       },
       runner: {
@@ -2200,6 +2202,7 @@ export function createScratchHandler(ctx: McpToolContext): McpToolHandler {
             size: f.size,
             ...(f.skipped ? { skipped: f.skipped } : {}),
             sessionId: f.session_id ?? null,
+            builderId: f.builder_id ?? null,
             updated_at: new Date(f.updated_at).toISOString(),
             updated_by: f.updated_by,
           })),
@@ -2218,6 +2221,7 @@ export function createScratchHandler(ctx: McpToolContext): McpToolHandler {
         ...(file.skipped ? { skipped: file.skipped } : {}),
         content: file.content,
         sessionId: file.session_id ?? null,
+        builderId: file.builder_id ?? null,
         created_at: new Date(file.created_at).toISOString(),
         updated_at: new Date(file.updated_at).toISOString(),
         updated_by: file.updated_by,
@@ -2236,9 +2240,9 @@ export function createScratchHandler(ctx: McpToolContext): McpToolHandler {
 export const usageLimitsTool: McpTool = {
   name: 'lazy_usage_limits',
   description:
-    'Usage-limit readings, as `lazy stats limits --json`: per-credential windows ' +
-    '(usedPercent, resetsAt), overage, [usage_pause] state. Scoped to the caller: ' +
-    'no other Teams member\'s credential.',
+    'Usage readings, as `lazy stats limits --json`: per-credential windows ' +
+    '(usedPercent, resetsAt; reset: resetSince, raw: storedWindows), overage, [usage_pause], budget (tokens left). ' +
+    'Own credentials only.',
   inputSchema: { type: 'object', properties: {} },
 };
 
@@ -2249,13 +2253,15 @@ export function createUsageLimitsHandler(ctx: McpToolContext): McpToolHandler {
     // token label both come from the authenticated token, never an argument.
     if (ctx.projectRoot) {
       const { describeUsageLimitsView } = await import('../daemon/usage-pause');
-      return describeUsageLimitsView(
-        ctx.projectRoot,
-        await getStorage(ctx),
-        ctx.taskId
-          ? { kind: 'task', taskId: ctx.taskId }
-          : { kind: 'builder', label: ctx.builderTokenLabel ?? null },
-      );
+      const { describeTokenBudgetFor } = await import('../daemon/token-budget');
+      const storage = await getStorage(ctx);
+      const caller = ctx.taskId
+        ? { kind: 'task' as const, taskId: ctx.taskId }
+        : { kind: 'builder' as const, label: ctx.builderTokenLabel ?? null };
+      const view = await describeUsageLimitsView(ctx.projectRoot, storage, caller);
+      // The budget is built over the view ALREADY narrowed to this caller.
+      const { attachBudget } = await import('../usage-pause/budget-view');
+      return attachBudget(view, () => describeTokenBudgetFor(ctx.projectRoot!, storage, caller, view));
     }
     // Anywhere else this is not a daemon-owned session: it is the host-side /
     // local MCP server, i.e. the OPERATOR's view. A task agent is refused
@@ -2272,10 +2278,128 @@ export function createUsageLimitsHandler(ctx: McpToolContext): McpToolHandler {
         'to the daemon; ask the human to run `lazy stats limits`.',
       );
     }
-    const { queryUsageLimits, queryUsagePause } = await import('../daemon/rpc-fallback');
+    const { queryUsageLimits, queryUsagePause, queryTokenBudget } = await import('../daemon/rpc-fallback');
     const { projectUsageLimits } = await import('../usage-pause/limits-view');
     const { readings } = await queryUsageLimits();
-    return projectUsageLimits(readings, await queryUsagePause());
+    const { attachBudget } = await import('../usage-pause/budget-view');
+    return attachBudget(projectUsageLimits(readings, await queryUsagePause()), queryTokenBudget);
+  };
+}
+
+// ============================================================================
+// lazy_review_comments / lazy_review_status
+// ============================================================================
+
+const FORGE_READ_TAIL = ' Via lazy; no token (gh/push need a granted one). Agents: own task. Cached 60s.';
+const forgeReadSchema: McpTool['inputSchema'] = { type: 'object', properties: { task: { type: 'string' } } };
+
+export const reviewCommentsTool: McpTool = {
+  name: 'lazy_review_comments',
+  description: "PR/MR comments, inline (path/line/resolved) and reviews." + FORGE_READ_TAIL,
+  inputSchema: forgeReadSchema,
+};
+
+export const reviewStatusTool: McpTool = {
+  name: 'lazy_review_status',
+  description: "PR/MR state, verdicts, mergeability, CI checks." + FORGE_READ_TAIL,
+  inputSchema: forgeReadSchema,
+};
+
+function createForgeReadHandler(ctx: McpToolContext, kind: 'conversation' | 'status'): McpToolHandler {
+  return async (args) => {
+    // Only the daemon holds the forge credential; the caller's scope comes
+    // from its authenticated token (ctx.taskId), never an argument.
+    if (!ctx.projectRoot) {
+      throw new Error('PR/MR reads are served only through the daemon\'s MCP route, which this server is not connected to.');
+    }
+    const { readTaskForge } = await import('../daemon/forge-read');
+    const storage = await getStorage(ctx);
+    const caller = ctx.taskId ? { kind: 'task' as const, taskId: ctx.taskId } : { kind: 'builder' as const };
+    const ref = typeof args.task === 'string' && args.task ? args.task : undefined;
+    return await readTaskForge(ctx.projectRoot, storage, caller, kind, { taskRef: ref });
+  };
+}
+
+export function createReviewCommentsHandler(ctx: McpToolContext): McpToolHandler {
+  return createForgeReadHandler(ctx, 'conversation');
+}
+
+export function createReviewStatusHandler(ctx: McpToolContext): McpToolHandler {
+  return createForgeReadHandler(ctx, 'status');
+}
+
+// ============================================================================
+// lazy_token_stats
+// ============================================================================
+
+export const tokenStatsTool: McpTool = {
+  name: 'lazy_token_stats',
+  description: 'Token/tool totals and model planning evidence. Agents get own task (subtree:true adds descendants) plus project model aggregates; builders get the project. No credential labels or USD.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      scope: { type: 'string', enum: ['tokens', 'tools'] },
+      task: { type: 'string' },
+      subtree: { type: 'boolean' },
+      group_by: { type: 'string', enum: ['task', 'model', 'role'] },
+      since: { type: 'string', description: 'Window such as 30m, 2h, or 1d' },
+      top: { type: 'number' },
+      task_type: { type: 'string' },
+      min_tasks: { type: 'number' },
+    },
+  },
+};
+
+export function createTokenStatsHandler(ctx: McpToolContext): McpToolHandler {
+  return async (args) => {
+    const { describeTokenStats, parseTokenStatsSince, parseTokenStatsTaskType } =
+      await import('../daemon/token-stats');
+    const scope = args.scope === undefined ? undefined : String(args.scope);
+    if (scope !== undefined && scope !== 'tokens' && scope !== 'tools') throw new Error("scope must be 'tokens' or 'tools'");
+    const groupBy = args.group_by === undefined ? undefined : String(args.group_by);
+    if (groupBy !== undefined && !['task', 'model', 'role'].includes(groupBy)) throw new Error("group_by must be 'task', 'model', or 'role'");
+    const top = args.top === undefined ? undefined : Number(args.top);
+    const minTasks = args.min_tasks === undefined ? undefined : Number(args.min_tasks);
+    if (top !== undefined && (!Number.isInteger(top) || top < 1)) throw new Error('top must be a positive integer');
+    if (minTasks !== undefined && (!Number.isInteger(minTasks) || minTasks < 1)) throw new Error('min_tasks must be a positive integer');
+    const sinceMs = parseTokenStatsSince(args.since as string | undefined);
+    const taskType = parseTokenStatsTaskType(args.task_type);
+
+    // A task identity is meaningful only on the daemon-owned route. Refuse a
+    // stale/local server rather than sending a caller-asserted task id over RPC.
+    if (!ctx.projectRoot) {
+      if (ctx.taskId) {
+        throw new Error('lazy_token_stats for a task agent is served only through the daemon MCP route.');
+      }
+      const { queryTokenStats } = await import('../daemon/rpc-fallback');
+      return queryTokenStats({
+        scope, task: args.task, subtree: args.subtree === true, groupBy,
+        sinceMs, top, taskType, minTasks,
+      });
+    }
+
+    const storage = await getStorage(ctx);
+    const resolve = async (ref: unknown) => {
+      if (!ref) return undefined;
+      const result = await storage.resolveTask(String(ref));
+      if (!result.task) throw new Error(`Task not found or ambiguous: ${String(ref)}`);
+      return result.task;
+    };
+    const own = ctx.taskId ? await storage.getTask(ctx.taskId) : null;
+    if (ctx.taskId && !own) {
+      throw new Error('This task token no longer resolves to a task; refusing project token statistics.');
+    }
+    return describeTokenStats(ctx.projectRoot, storage, {
+      scope: scope as 'tokens' | 'tools' | undefined,
+      task: await resolve(args.task),
+      subtree: args.subtree === true,
+      groupBy: groupBy as 'task' | 'model' | 'role' | undefined,
+      sinceMs,
+      top,
+      taskType,
+      minTasks,
+      caller: own ? { kind: 'task', root: own } : { kind: 'builder' },
+    });
   };
 }
 
@@ -4038,6 +4162,42 @@ export const commitTool: McpTool = {
   },
 };
 
+/**
+ * Refuse lazy_commit when the worktree's HEAD names anything but the task's own
+ * branch (src/git/worktree-pointers.ts): a task that redirected HEAD would have
+ * this daemon-side commit move a sibling's, its parent's or main's branch.
+ */
+async function assertCommitHeadIsTaskBranch(ctx: McpToolContext, cwd: string): Promise<void> {
+  // Only lazy task worktrees are judged; anything else is not a task's branch.
+  if (!taskWorktreeOf(cwd)) return;
+  const storage = await getStorage(ctx);
+  let branch: string | undefined;
+  try {
+    branch = (await storage.getSessionByTaskId(ctx.taskId))?.git_branch;
+  } finally {
+    await storage.close();
+  }
+  if (!branch) throw new Error(`lazy_commit: task ${ctx.taskId} has no session branch to commit on.`);
+  await assertTaskWorktreeHead(cwd, branch);
+}
+
+async function assertCommitLandedOnTaskBranch(ctx: McpToolContext, cwd: string, sha: string): Promise<void> {
+  const storage = await getStorage(ctx);
+  let branch: string | undefined;
+  try {
+    branch = (await storage.getSessionByTaskId(ctx.taskId))?.git_branch;
+  } finally {
+    await storage.close();
+  }
+  const tip = await runGit(['rev-parse', '--verify', `refs/heads/${branch}`], { cwd });
+  if (!branch || tip.exitCode !== 0 || tip.stdout !== sha) {
+    throw new Error(
+      `lazy_commit: commit ${sha.substring(0, 12)} did not land on the task's branch ${branch ?? '(unknown)'} ` +
+      `(its tip is ${tip.stdout || 'unresolvable'}): HEAD changed during the commit. See \`lazy doctor\`.`,
+    );
+  }
+}
+
 export function createCommitHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
     rejectIfReadOnly('lazy_commit');
@@ -4051,6 +4211,34 @@ export function createCommitHandler(ctx: McpToolContext): McpToolHandler {
     const cwd = ctx.worktreePath;
     // Before git gets a chance to report a directory the agent never chose.
     await assertWorktreeUsable('lazy_commit', cwd, ctx.taskId);
+    // HEAD must be the task's own branch, or this commit moves another one.
+    await assertCommitHeadIsTaskBranch(ctx, cwd);
+
+    // A nested repository below the worktree: `git add` asks it whether it is
+    // dirty by running git INSIDE it, under its own config — so lazy stages
+    // nothing while one is present (src/git/nested-git.ts).
+    const wt = taskWorktreeOf(cwd);
+    if (wt) {
+      const storage = await getStorage(ctx);
+      let findings;
+      try {
+        findings = await scanTaskWorktreeNestedGit(wt.projectRoot, storage, await storage.getTask(ctx.taskId), wt.worktreePath);
+      } finally {
+        await storage.close();
+      }
+      if (findings.length > 0) {
+        throw new Error(
+          `lazy_commit refused: the worktree contains nested git repositories its base branch does not have: ` +
+          `${describeNestedGit(findings)}. lazy will not run git over them. Remove them (or keep their content ` +
+          `as plain files without a .git), then commit again. A submodule has to be added on the base branch first.`,
+        );
+      }
+    }
+
+    // lazy writes this commit, so it carries lazy's co-author trailer unless the
+    // PROJECT ROOT's lazy.toml opts out ([git] coauthor_trailer). Read before
+    // staging, so a config that cannot load fails with the index untouched.
+    const trailerConfig = await loadConfig(ctx.projectRoot ?? wt?.projectRoot ?? resolveLazyRoot());
 
     // Stage files
     if (files && files.length > 0) {
@@ -4082,8 +4270,9 @@ export function createCommitHandler(ctx: McpToolContext): McpToolHandler {
       }
     }
 
-    // Commit
-    const commitResult = await runGit(['commit', '-m', message], { cwd });
+    // Commit.
+    const commitMessage = withLazyCoauthorTrailer(message, trailerConfig.git.coauthor_trailer);
+    const commitResult = await runGit(['commit', '-m', commitMessage], { cwd });
     if (commitResult.exitCode !== 0) {
       throw new Error(`git commit failed: ${commitResult.stderr}`);
     }
@@ -4091,6 +4280,9 @@ export function createCommitHandler(ctx: McpToolContext): McpToolHandler {
     // Get the commit SHA
     const shaResult = await runGit(['rev-parse', 'HEAD'], { cwd });
     const sha = shaResult.stdout;
+    // HEAD was checked before staging; a process in the container could have
+    // flipped it since. Confirm the commit landed on the task's own branch.
+    if (taskWorktreeOf(cwd)) await assertCommitLandedOnTaskBranch(ctx, cwd, sha);
 
     // Count files changed from diffstat (last line is summary)
     const diffLines = diffStat.split('\n');
@@ -4124,7 +4316,8 @@ export const statusTool: McpTool = {
   description:
     'Check the current status of the task and worktree. Returns task metadata, ' +
     'git status (branch, uncommitted changes, recent commits), session info, and ' +
-    'dashboard_url (the web dashboard base URL, or null when the dashboard is off). ' +
+    'dashboard_url (the web dashboard base URL, or null when the dashboard is off), and ' +
+    'agent_profiles (the offered `agent` profiles, each with when to use it). ' +
     'Use this to understand the current state before making decisions.',
   inputSchema: {
     type: 'object',
@@ -4198,6 +4391,27 @@ export function createStatusHandler(ctx: McpToolContext): McpToolHandler {
         dashboard_url = null;
       }
 
+      // Best-effort like the dashboard address: the profiles a subtask's
+      // `agent` may name, with when to use each. null when config cannot be
+      // read — never a guessed list.
+      let agent_profiles: Array<{ name: string; harness: string; model: string; builtin: boolean; description: string }> | null = null;
+      let agent_profiles_error: string | undefined;
+      try {
+        const config = await loadConfig(resolveLazyRoot());
+        agent_profiles = selectableAgentProfiles(agentProfilesFor(config)).map((p) => ({
+          name: p.name,
+          harness: p.harness,
+          model: p.model,
+          builtin: p.builtin,
+          description: p.description,
+        }));
+      } catch (err) {
+        // Not swallowed: the reason rides beside the null, so an agent can tell
+        // a broken [agents.<name>] block from a project with nothing to offer.
+        agent_profiles = null;
+        agent_profiles_error = err instanceof Error ? err.message : String(err);
+      }
+
       return {
         task: task ? {
           id: shortId(task.id),
@@ -4227,6 +4441,8 @@ export function createStatusHandler(ctx: McpToolContext): McpToolHandler {
         // dashboard is off (managed mode) or the daemon could not be reached —
         // never a fabricated URL.
         dashboard_url,
+        agent_profiles,
+        ...(agent_profiles_error ? { agent_profiles_error } : {}),
       };
     } finally {
       await storage.close();
@@ -4241,8 +4457,8 @@ export function createStatusHandler(ctx: McpToolContext): McpToolHandler {
 export const conversationsTool: McpTool = {
   name: 'lazy_conversations',
   description:
-    'List past builder conversations with timestamps and summaries. ' +
-    'Use this to find previous builder sessions and their content.',
+    'List past builder conversations (one per start or /clear; compaction and resume ' +
+    'continue it) with timestamps and summaries.',
   inputSchema: {
     type: 'object',
     properties: {},
@@ -4253,18 +4469,20 @@ export function createConversationsHandler(ctx: McpToolContext): McpToolHandler 
   return async (_args) => {
     const storage = await getStorage(ctx);
     try {
-      const conversations = await storage.listConversationSummaries();
+      const builders = await storage.listBuilders();
 
       return {
-        count: conversations.length,
-        conversations: conversations.map(c => ({
-          session_id: c.sessionId,
-          started_at: c.startedAt,
-          ended_at: c.endedAt,
-          summary: c.summary.substring(0, 200),
-          user_messages: c.stats.userMessageCount,
-          assistant_messages: c.stats.assistantMessageCount,
-          total_tokens: c.stats.totalTokens,
+        count: builders.length,
+        conversations: builders.map(b => ({
+          session_id: b.id,
+          started_at: b.startedAt,
+          ended_at: b.endedAt,
+          summary: b.title.substring(0, 200),
+          user_messages: b.stats.userMessageCount,
+          assistant_messages: b.stats.assistantMessageCount,
+          total_tokens: b.stats.totalTokens,
+          segments: b.segments,
+          run: b.run,
         })),
       };
     } finally {
@@ -4302,7 +4520,8 @@ export function createConversationSearchHandler(ctx: McpToolContext): McpToolHan
 
     const storage = await getStorage(ctx);
     try {
-      const conversations = await storage.listConversations();
+      const { listBuilderTranscripts } = await import('../builder/identity-transcript');
+      const conversations = await listBuilderTranscripts(storage);
       const results = await searchConversations(conversations, query);
 
       return {
@@ -4328,8 +4547,8 @@ export function createConversationSearchHandler(ctx: McpToolContext): McpToolHan
 export const conversationReadTool: McpTool = {
   name: 'lazy_conversation_read',
   description:
-    'Read a full past builder conversation by session ID. Returns all ' +
-    'messages in the conversation. Use lazy_conversations to find session IDs.',
+    'Read a full past builder conversation by session ID (any session it spans, or a ' +
+    'unique prefix). Use lazy_conversations to find session IDs.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -4349,10 +4568,18 @@ export function createConversationReadHandler(ctx: McpToolContext): McpToolHandl
 
     const storage = await getStorage(ctx);
     try {
-      const conversation = await storage.loadConversation(sessionId);
-      if (!conversation) {
+      const { resolveStoredConversation } = await import('../conversation/ask');
+      const match = await resolveStoredConversation(storage, sessionId);
+      if (!match) {
         throw new Error(`Conversation not found: ${sessionId}`);
       }
+      if ('ambiguous' in match) {
+        throw new Error(
+          `Multiple conversations match '${sessionId}'. Use a longer prefix: ` +
+          match.ambiguous.map(c => c.sessionId.substring(0, 8)).join(', '),
+        );
+      }
+      const conversation = match.conversation;
 
       return {
         session_id: conversation.sessionId,
@@ -4578,6 +4805,33 @@ async function getDiffStat(
 
 // --- lazy_start ---
 
+/**
+ * `past_usage_pause` on lazy_start / unblock / resume / review / ask: let THIS
+ * task's next turn through the usage pause. The builder's, on the engineer's
+ * behalf; never a task agent's — refused here at the door, and again by the
+ * daemon, which owns the rule (src/daemon/usage-pause.ts, "The per-task
+ * allowance").
+ */
+const PAST_USAGE_PAUSE_ARG = {
+  past_usage_pause: {
+    type: 'boolean',
+    description: 'Only when the human asks: let this turn start past the usage pause.',
+  },
+} as const;
+
+export function parsePastUsagePauseArg(ctx: McpToolContext, args: Record<string, unknown>): { usagePausePastOnce?: true } {
+  const v = args.past_usage_pause;
+  if (v === undefined || v === false) return {};
+  if (v !== true) throw new Error(`Invalid past_usage_pause: expected true or false.`);
+  if (ctx.taskId) {
+    throw new Error(
+      'past_usage_pause refused: only a person or the builder may let a task past the usage pause, ' +
+        'never a task agent. Wait for the window to reset.',
+    );
+  }
+  return { usagePausePastOnce: true };
+}
+
 export const startTool: McpTool = {
   name: 'lazy_start',
   description:
@@ -4615,6 +4869,7 @@ export const startTool: McpTool = {
         description: 'Runner override, persisted on the task and effective this turn. Omit to use the task or global default.',
       },
       ...REVIEW_TOOL_ARGS,
+      ...PAST_USAGE_PAUSE_ARG,
       force_local: {
         type: 'boolean',
         description:
@@ -4677,7 +4932,8 @@ export function createStartHandler(ctx: McpToolContext): McpToolHandler {
       }
     }
 
-    const params: StartTaskParams = {
+    const params: StartTaskParams & { usagePausePastOnce?: true } = {
+      ...parsePastUsagePauseArg(ctx, args),
       taskId,
       modelOverride: model,
       agentId,
@@ -4776,6 +5032,7 @@ export const unblockTool: McpTool = {
           'and dismiss (seen, will not act) are the same act with different valence, and ' +
           'both work on any item.',
       },
+      ...PAST_USAGE_PAUSE_ARG,
     },
     required: ['task_id', 'feedback'],
   },
@@ -4818,7 +5075,8 @@ export function createUnblockHandler(ctx: McpToolContext): McpToolHandler {
       await storage.close();
     }
 
-    const params: UnblockTaskParams = {
+    const params: UnblockTaskParams & { usagePausePastOnce?: true } = {
+      ...parsePastUsagePauseArg(ctx, args),
       taskId,
       message: feedback,
       modelOverride: model,
@@ -4896,6 +5154,7 @@ export const askTool: McpTool = {
         enum: [...VALID_EFFORT_LEVELS],
         description: 'Reasoning effort override for this turn (low, medium, high, xhigh, max)',
       },
+      ...PAST_USAGE_PAUSE_ARG,
     },
     required: ['task_id', 'message'],
   },
@@ -4932,7 +5191,8 @@ export function createAskHandler(ctx: McpToolContext): McpToolHandler {
       await storage.close();
     }
 
-    const params: AskTaskParams = {
+    const params: AskTaskParams & { usagePausePastOnce?: true } = {
+      ...parsePastUsagePauseArg(ctx, args),
       taskId,
       message,
       effortOverride: effort,
@@ -5017,6 +5277,7 @@ export const reviewTool: McpTool = {
         enum: [...VALID_EFFORT_LEVELS],
         description: 'Reasoning effort override for this review only (low, medium, high, xhigh, max)',
       },
+      ...PAST_USAGE_PAUSE_ARG,
     },
     required: ['task_id'],
   },
@@ -5049,6 +5310,7 @@ export function createReviewHandler(ctx: McpToolContext): McpToolHandler {
     }
 
     const result = await queryReviewTask({
+      ...parsePastUsagePauseArg(ctx, args),
       taskId,
       modelOverride: model,
       effortOverride: effort,
@@ -5220,7 +5482,7 @@ export function createAcceptHandler(ctx: McpToolContext): McpToolHandler {
           const gatePid = parentTaskIdOf(task);
           const gateTargetBranch = gatePid
             ? (await storage.getSessionByTaskId(gatePid))?.git_branch ?? 'main'
-            : targetBranchOf(task) ?? 'main';
+            : await resolveDetachedHead(targetBranchOf(task) ?? 'HEAD', lazyRoot, config.remote.git_remote);
           const decision = await resolveEdgeGateDecision(
             { sourceBranch: gateSession.git_branch, targetBranch: gateTargetBranch },
             config,
@@ -5313,7 +5575,7 @@ export function createAcceptHandler(ctx: McpToolContext): McpToolHandler {
       const pid = parentTaskIdOf(task);
       const parentBranch = pid
         ? (await storage.getSessionByTaskId(pid))?.git_branch ?? 'main'
-        : 'main';
+        : await resolveDetachedHead(targetBranchOf(task) ?? 'HEAD', resolveLazyRoot(), (await loadConfig(resolveLazyRoot())).remote.git_remote);
 
       const code = generateCode('ac');
       storePending({ code, operation: 'accept', taskId: task.id, createdAt: Date.now() });
@@ -5747,6 +6009,7 @@ export const resumeTool: McpTool = {
         description: 'Model override for this run (optional)',
 
       },
+      ...PAST_USAGE_PAUSE_ARG,
     },
     required: ['task_id'],
   },
@@ -5767,7 +6030,8 @@ export function createResumeHandler(ctx: McpToolContext): McpToolHandler {
 
     // Resume is like unblock but for interrupted tasks, without a feedback message.
     // Use unblock with a standard resume message.
-    const params: UnblockTaskParams = {
+    const params: UnblockTaskParams & { usagePausePastOnce?: true } = {
+      ...parsePastUsagePauseArg(ctx, args),
       taskId,
       message: '[Resumed after interruption]',
       modelOverride: model,
@@ -6130,9 +6394,8 @@ export const diffTool: McpTool = {
   description:
     'Show what a task changed, against the same base ref `lazy diff` uses. Works on ' +
     'ANY task, not just your own. Stat summary by default; "full" for the diff, ' +
-    '"files" to filter paths, "offset"+"max_lines" to paginate. A task with accepted ' +
-    'children (a release hub) shows only its own direct changes unless you pass ' +
-    '"full_branch". Comments added since the last agent turn appear as a trailing ' +
+    '"files" to filter paths, "offset"+"max_lines" to paginate. Always the task\'s ' +
+    'whole branch, accepted children included; "region" scopes it to one child or group. Comments added since the last agent turn appear as a trailing ' +
     '"diff --lazy a/comments b/comments" section.',
   inputSchema: {
     type: 'object',
@@ -6149,8 +6412,8 @@ export const diffTool: McpTool = {
       full_branch: {
         type: 'boolean',
         description:
-          'Include accepted children\'s files (whole branch vs upstream). ' +
-          'Default is the hub\'s own direct changes only.',
+          'No-op, kept for old callers: every diff is already the whole branch, ' +
+          'accepted children included.',
       },
       files: {
         type: 'array',
@@ -6161,9 +6424,7 @@ export const diffTool: McpTool = {
         type: 'string',
         description:
           'Scope the diff to one review region\'s files — a region id or a task ' +
-          'code, from lazy_regions (the task\'s declared walkthrough groups). ' +
-          'Implies full_branch, since a hub\'s child regions are made of exactly ' +
-          'the files the default direct diff excludes.',
+          'code, from lazy_regions (the task\'s declared walkthrough groups). ',
       },
       offset: {
         type: 'number',
@@ -6968,7 +7229,8 @@ export const reopenTool: McpTool = {
   name: 'lazy_reopen',
   description:
     'Reopen a previously rejected, closed, or completed task. Restores ' +
-    'the task to blocked (if it had a session) or backlog status. ' +
+    'the task to blocked (had a session) or backlog, its branch at its last head — ' +
+    'or refuses, changing nothing, if that work is gone. ' +
     'Does NOT recreate worktrees — call lazy_start to set up the worktree.',
   inputSchema: {
     type: 'object',
@@ -7036,7 +7298,7 @@ export function createReopenHandler(ctx: McpToolContext): McpToolHandler {
           previous_status: result.previousStatus,
           new_status: result.newStatus,
           message: result.hadSession
-            ? 'Task reopened. Call lazy_start to set up the worktree and resume.'
+            ? [result.restore?.message, result.restore?.syncHint, 'Task reopened. Call lazy_start to set up the worktree and resume.'].filter(Boolean).join(' ')
             : 'Task reopened in backlog. Call lazy_start to begin work.',
         };
       }
@@ -7479,6 +7741,9 @@ export const allTools: McpTool[] = [
   messagePostTool,
   messagesTool,
   usageLimitsTool,
+  reviewCommentsTool,
+  reviewStatusTool,
+  tokenStatsTool,
   followupsTool,
   followupPromoteTool,
   messageDismissTool,
@@ -7607,6 +7872,9 @@ export function createAllHandlers(ctx: McpToolContext): Map<string, McpToolHandl
   handlers.set('lazy_message_post', createMessagePostHandler(ctx));
   handlers.set('lazy_messages', createMessagesHandler(ctx));
   handlers.set('lazy_usage_limits', createUsageLimitsHandler(ctx));
+  handlers.set('lazy_review_comments', createReviewCommentsHandler(ctx));
+  handlers.set('lazy_review_status', createReviewStatusHandler(ctx));
+  handlers.set('lazy_token_stats', createTokenStatsHandler(ctx));
   handlers.set('lazy_raised_items', createFollowupsHandler(ctx));
   handlers.set('lazy_raised_promote', createFollowupPromoteHandler(ctx));
   handlers.set('lazy_message_dismiss', createMessageDismissHandler(ctx));

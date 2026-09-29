@@ -35,7 +35,7 @@ export type AcceptGateRow =
       unblockable: boolean;
     }
   | { kind: 'raised'; raisedId: string; label: string }
-  | { kind: 'file'; file: string; label: string }
+  | { kind: 'file'; file: string; label: string; rejected?: boolean }
   /**
    * Comments a human wrote that no prompt has carried yet. Accept refuses on
    * these (without `--allow-queued-comments`): merging would end the task
@@ -126,7 +126,11 @@ export function buildAcceptGate(input: {
   }
   for (const v of input.fileViolations) {
     if (v.status === 'approved') continue;
-    rows.push({ kind: 'file', file: v.file, label: `${v.file} has no decision` });
+    // The same condition the unblock notice acts on (rejectedOutstanding).
+    const rejected = v.status === 'pending' && !!v.rejected_at;
+    rows.push(rejected
+      ? { kind: 'file', file: v.file, label: `${v.file} was rejected — the next unblock restores it`, rejected: true }
+      : { kind: 'file', file: v.file, label: `${v.file} has no decision` });
   }
   return { rows };
 }

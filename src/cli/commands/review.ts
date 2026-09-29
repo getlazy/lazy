@@ -27,6 +27,7 @@ function unwrapRpcMessage(err: unknown): string {
 export async function commandReview(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [
     { name: 'yes', takesValue: false },
+    { name: 'past-usage-pause', takesValue: false },
     { name: 'post', takesValue: false },
     { name: 'no-wait', takesValue: false },
     { name: 'model', takesValue: true },
@@ -98,6 +99,7 @@ export async function commandReview(args: string[]): Promise<void> {
         const started = await queryReviewTask({
           taskId: task.id, modelOverride, effortOverride,
           ...(await usagePauseOverrideEligibility()),
+        ...(parsed.flags.get('past-usage-pause') === true ? { usagePausePastOnce: true as const } : {}),
         }, display);
         display.close();
         await writeStdoutLine(
@@ -120,6 +122,7 @@ export async function commandReview(args: string[]): Promise<void> {
         modelOverride,
         effortOverride,
         ...(await usagePauseOverrideEligibility()),
+        ...(parsed.flags.get('past-usage-pause') === true ? { usagePausePastOnce: true as const } : {}),
       }, display);
       display.close();
     } catch (err) {
@@ -138,7 +141,7 @@ export async function commandReview(args: string[]): Promise<void> {
 }
 
 export function reviewUsage(): void {
-  console.log(`Usage: lazy review <task_id> [--yes] [--no-wait] [--model <model>] [--effort <level>]
+  console.log(`Usage: lazy review <task_id> [--yes] [--no-wait] [--model <model>] [--effort <level>] [--past-usage-pause]
 
 Run an agent review of a task's work. The reviewer starts a new session
 in the task's container (it does not resume the implementer's conversation),
@@ -164,6 +167,8 @@ Options:
   --no-wait          Start the review and return; read the report later with lazy show
   --model <model>    Model for this review only (not written back to the task)
   --effort <level>   Reasoning effort for this review only (low, medium, high, xhigh, max)
+  --past-usage-pause Let this review start even though the task's credential is past the
+                     usage-pause threshold (used up by that one turn)
 
 Examples:
   lazy review abc123

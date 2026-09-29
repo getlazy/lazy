@@ -20,7 +20,7 @@
  */
 
 import { join } from 'path';
-import { stat } from 'fs/promises';
+import { lstat, stat } from 'fs/promises';
 import { loadConfig } from '../config/loader';
 import type { EffortLevel, ResolvedConfig } from '../config/types';
 import { resolveTurnLaunchIdentity, resolveOneOffTurnIdentity } from './launch-identity';
@@ -29,6 +29,7 @@ import { pathExists } from '../utils/fs';
 import { createRunner } from '../runner';
 import type { Runner } from '../runner/types';
 import { stampSessionRunner, removeTaskRun, mustRecreateForContainerAgent } from '../runner/session-launch';
+import { mustRecreateForTaskEnv } from './task-env';
 import { pinnedCustomImage } from '../docker/worktree-image';
 import {
   createDriver,
@@ -38,6 +39,7 @@ import {
   resolveUpstreamMergeRef,
   type MergeResult,
 } from '../remote';
+import { restoreTaskBranchForReopen, type BranchRestore } from './reopen-restore';
 import { resolveUpstreamMergeRefForCommand } from './upstream-command-ref';
 import {
   PhaseReporter,
@@ -70,6 +72,7 @@ import { askTaskRecord } from '../task/record-ask';
 import { regenerateFidelity } from '../synthesis/fidelity';
 import { getSummarizer } from '../synthesis/summarizer';
 import { getOrCreateStorage, RpcError } from './rpc-handlers';
+import { assertTaskWorktreeHead, TaskHeadBranchError } from '../git/worktree-pointers';
 import { isUsagePauseRefusal } from './rpc-error';
 import { runSelfSync, planSelfSyncSteps, type SelfSyncStep } from './self-sync';
 import { memberInsideTask, memberInsideSyncMessage } from '../server/member-terminals';
@@ -102,15 +105,18 @@ import { resolveProjectModel } from './project-settings';
 import { setRunnerAgentForTask } from './task-harness';
 import { assertKnownAgentProfile } from './agent-profile-check';
 import { readWorktreeMergeState, isMidMerge, describeMergeState } from '../git/operations';
-import { hasUncommittedChanges, listUncommittedPaths, applyPatch, patchIsAlreadyApplied, snapshotFiles, patchPaths, hasUpstreamChanges, getRemoteDefaultBranch, recoverMissingWorktreeWithFetch, createAcceptTag, getNewCommits, getMergeBase } from '../git/operations';
+import { refuseTamperedWorktreeGit } from '../git/worktree-pointers';
+import { hasUncommittedChanges, listUncommittedPaths, applyPatch, patchIsAlreadyApplied, snapshotFiles, patchPaths, hasUpstreamChanges, getRemoteDefaultBranch, recoverMissingWorktreeWithFetch, createAcceptTag, getAcceptTagCommit, getNewCommits, getMergeBase } from '../git/operations';
+import { recordReopenAfterAccept } from '../task/reopen-after-accept';
 import { DEFAULT_PRE_ACCEPT_TIMEOUT_SECS } from '../supervisor/accept-gate';
 import type { DestinationRestoreConflict } from '../git/operations';
 import { checkLock, acquireLock, removeLock } from '../utils/lock';
 import { checkPairingLock } from '../utils/pairing-lock';
-import { protocolDir as getProtocolDir, reviewProtocolDir, acceptGateProtocolDir, writeCommand, writeResponse, consumeCommand, ensureProtocolDir, commonCommandFields, newCommandId, removeProtocolDir, consumeResponse, clearStatus, completedResponses, readResponse, inFlightResponseCorrelates } from '../protocol';
+import { protocolDir as getProtocolDir, reviewProtocolDir, acceptGateProtocolDir, writeCommand, writeResponse, consumeCommand, ensureProtocolDir, commonCommandFields, computeAgentExtraArgs, newCommandId, removeProtocolDir, consumeResponse, clearStatus, completedResponses, readResponse, inFlightResponseCorrelates } from '../protocol';
 import { shortId, displayId, displayIdFor, taskRef, getWorktreePath, getWorktreePathForRef, getBranchName, getBranchNameFromId } from '../task/identity';
 import { buildNotesContext, buildJournalNotice, buildArtifactNotice, buildSystemPrompt, buildPromptWithInstructions, buildTurnHistoryContext, resolveNotesCutoff, selectNotesForDelivery, getNewJournalSince } from '../task/turn-context';
 import { typeConstraintsSection } from '../task/type-constraints';
+import { recordRecreationIfRunning, recreationReason, environmentReplacedPrefix, clearEnvironmentReplaced } from '../task/environment-replaced';
 import { snapshotIsRestorable } from '../task/worktree-snapshot';
 import { runSyncWithRemote } from '../task/sync-remote';
 import { cleanupWorktree, cleanupWorktreeAndBranch, cleanupTaskContainer } from '../task/cleanup';
@@ -139,6 +145,7 @@ import {
 } from '../protection/accept-check';
 import { revertedProtectedFiles, revertedProtectedFilesNotice } from '../protection/reverted-files';
 import { acceptRefusal, AcceptRefusedError, acceptWithApprovedFilesCommand, shellQuote } from './accept-refusal';
+import { describeNestedGit, scanTaskWorktreeNestedGit } from '../git/nested-git';
 import {
   applyRaisedResolutions,
   buildRaisedResolvedNotice,
@@ -176,8 +183,8 @@ import {
 } from './submit-target';
 import { getActor } from '../constants';
 import { writeDaemonMcpConfig } from './task-launcher';
-import { prepareTurnLaunch, assertNoMemberInside, releaseTurnCredential } from './turn-credentials';
-import { assertBesideLaunchAllowed, assertTurnStartAllowed, usagePauseHold } from './usage-pause';
+import { prepareTurnLaunch, assertNoMemberInside, assertTurnCredentialAvailable, releaseTurnCredential, turnCredentialProblem } from './turn-credentials';
+import { assertBesideLaunchAllowed, assertTurnStartAllowed, takeTaskAllowanceAtLaunch, usagePauseHold } from './usage-pause';
 import { USAGE_PAUSE_PENDING_FIX_KEY } from '../usage-pause/hold';
 import { createAgentTurn, createRecoveredAgentTurn, pendingTurnOwnerPerson, turnOwnerOfClaim } from './turn-owner';
 import { revokeTaskMcpTokens } from './mcp-tokens';
@@ -192,6 +199,7 @@ import { validateBranchInSyncWithRemote } from '../utils/git';
 import { latestViolationTurn, launchSettingsFromResponse } from '../utils/turns';
 import { parkTaskPaused } from '../utils/paused-status';
 import { resolveOutstandingViolations } from '../protection/outstanding-resolver';
+import { planRejectedRestores } from '../protection/rejected-restore';
 import { approvedFilesFromRecords, mergedViolationRecords } from '../protection/outstanding';
 import { findPendingFeedback, buildFeedbackRedeliveryPrompt } from '../utils/feedback-redelivery';
 import { isOfflineMode } from '../utils/offline';
@@ -202,7 +210,7 @@ import { resolveWrapUpCommandFields } from './wrap-up-plan';
 import { checkClusterFixRoundBudget, incrementClusterFixRound, resetClusterFixRound } from './cluster-fix-rounds';
 import { docsSuffix } from '../docs/links';
 import { journalWorktreeRecovery } from '../utils/reconcile';
-import { PROTOCOL_VERSION } from '../protocol/types';
+import { PROTOCOL_VERSION, type ProtectedRestore } from '../protocol/types';
 import type { FileViolation, Task, TokenUsage, Session, TaskStatus, Actor, ActorInput, RaisedItem, RaisedItemResolution, ReviewComment, InFlightTurn, InFlightTurnOutcome, InFlightTurnOwner, TurnType, ReviewReport, AgentTokenUsage } from '../types';
 import { RETIRED_IN_FLIGHT_OWNERS } from '../types';
 import { currentPromptOf } from '../task-prompt';
@@ -239,7 +247,7 @@ import reviewTurnScopePrompt from '../prompts/review-turn-scope.md' with { type:
 import reviewTurnFeaturePrompt from '../prompts/review-turn-feature.md' with { type: 'text' };
 import { askAwaitsAgent, isHumanAsk, isPendingDelivery } from '../server/review-actions';
 import {
-  queuedHumanFeedbackCount,
+  queuedHumanFeedbackForTask,
   ACCEPTED_COMMENT_PREFIX,
   SUBMITTED_COMMENT_PREFIX,
   REPARENTED_COMMENT_PREFIX,
@@ -344,10 +352,43 @@ function checkPairingLockOrThrow(root: string, tRef: string, displayTaskId: stri
 }
 
 /**
+ * Refuse while a task worktree's git pointers or submodule git dirs are not
+ * what lazy and git created (src/git/worktree-pointers.ts). Explicit rather
+ * than left to runGit: the uncommitted-changes check reads a refused git as
+ * "clean", so without this a tampered worktree would also skip that guard and
+ * its loose work could be dropped. A data-safety check: it runs on resume too.
+ */
+async function checkWorktreeGitSafeOrThrow(worktreePath: string, displayTaskId: string, commandName: string): Promise<void> {
+  if (!await pathExists(worktreePath)) return;
+  const refusal = await refuseTamperedWorktreeGit(worktreePath);
+  if (!refusal) return;
+  throw acceptRefusal(409, `${refusal} ${commandName} refuses until it is repaired.`, {
+    reason: 'tampered-git-dir',
+    next: `Repair the task's worktree git files, then ${commandName} again.`,
+    command: 'lazy doctor --repair-git-pointers',
+  });
+}
+
+/**
  * Check for uncommitted changes in a task's worktree and throw if found.
  */
+/**
+ * Refuse (409) when a task worktree's HEAD names anything but the task's own
+ * branch: sync's merges and accept's checks would act on a branch the task
+ * does not own (src/git/worktree-pointers.ts). Repair is doctor's and the sweep's.
+ */
+async function refuseRedirectedHead(worktreePath: string, branch: string): Promise<void> {
+  try {
+    await assertTaskWorktreeHead(worktreePath, branch);
+  } catch (err) {
+    if (err instanceof TaskHeadBranchError) throw new RpcError(409, err.message);
+    throw err;
+  }
+}
+
 async function checkUncommittedChangesOrThrow(worktreePath: string, displayTaskId: string, commandName: string): Promise<void> {
   if (!await pathExists(worktreePath)) return;
+  await checkWorktreeGitSafeOrThrow(worktreePath, displayTaskId, commandName);
 
   // A half-merged worktree is NOT "uncommitted changes" and telling the human to
   // "commit or stash" is bad advice — stashing a conflicted merge fails, and
@@ -831,6 +872,14 @@ async function launchUnblockTaskRun(
     peek: true,
     daemonLaunch: params.daemonLaunch,
     overrideEligible: params.usagePauseOverrideEligible === true,
+  });
+  // The credential, for the same reason and at the same point: on the profile
+  // this unblock will RUN (the `--agent` switch included), before the first
+  // write. Checked again, with a load, right before the turn row is written.
+  await assertTurnCredentialAvailable(projectRoot, {
+    taskId: task.id,
+    storage,
+    ...(params.agentOverride ? { agentId: params.agentOverride } : {}),
   });
 
   // Merging → resting escape hatch. Parks as `conflict` if the task still owes a
@@ -1367,6 +1416,23 @@ async function launchUnblockTaskRun(
     if (raisedResolvedNotice) {
       message = `${raisedResolvedNotice}\n\n---\n\n${message}`;
     }
+    // A reviewer's Reject on a protected file is carried out by lazy's
+    // SUPERVISOR, never the agent: every unblock — whatever surface sent it —
+    // hands the supervisor the rejected files still in the task's changes, and
+    // it restores and commits them before the agent runs
+    // (src/protection/rejected-restore.ts). Read-only turns never restore.
+    let restoreRejectedFiles: ProtectedRestore[] = [];
+    if (params.permissionMode !== 'plan') {
+      const violationState = await resolveOutstandingViolations(
+        projectRoot, task, sess, await storage.getSessionTurns(sess.id), storage,
+      );
+      restoreRejectedFiles = planRejectedRestores(violationState.outstanding);
+      if (restoreRejectedFiles.length > 0) {
+        warnings.push(
+          `Restoring ${restoreRejectedFiles.length} rejected protected file(s) to base before the agent's turn.`,
+        );
+      }
+    }
     // A cluster's constraints hold on EVERY turn it takes, not just its first —
     // the daemon enforces the other half of that contract
     // (restart-on-added-child). See src/task/type-constraints.ts.
@@ -1411,6 +1477,9 @@ async function launchUnblockTaskRun(
       // A member working in the task keeps turns off it. Refused BEFORE the
       // feedback turn is recorded, so nothing is half-dispatched.
       assertNoMemberInside(task.id);
+      // Same reason: a turn with no credential for its profile is refused here,
+      // before its turn row exists — never after (assertTurnCredentialAvailable).
+      await assertTurnCredentialAvailable(projectRoot, { taskId: task.id, storage });
 
       const nextSeq = await storage.getNextTurnSequence(sess.id);
       await storage.createTurn({
@@ -1443,6 +1512,18 @@ async function launchUnblockTaskRun(
         storage,
       });
 
+      // A container this launch is about to replace takes whatever the agent
+      // installed with it; this turn is told so (src/task/environment-replaced.ts).
+      // `lazy env set` since this container was created: env is fixed at create.
+      const mustRecreateForEnv = await mustRecreateForTaskEnv(projectRoot, task.id, containerName);
+      await recordRecreationIfRunning(
+        storage,
+        task.id,
+        recreationReason(mustRecreateContainer, mustRecreateForContainerAgent(sess, task.agent_id), mustRecreateForEnv),
+        runner, containerName,
+      );
+      const envNotice = await environmentReplacedPrefix(storage, task.id);
+
       await storage.updateTaskStatus(task.id, 'working', actor);
 
       phases.end(`turn ${Math.floor(nextSeq / 2) + 1}`);
@@ -1459,7 +1540,7 @@ async function launchUnblockTaskRun(
         type: 'unblock',
         task_id: task.id,
         goal: task.goal,
-        prompt: fullMessage,
+        prompt: envNotice + fullMessage,
         agent_id: task.agent_id,
         harness,
         system_prompt: systemPrompt,
@@ -1472,6 +1553,7 @@ async function launchUnblockTaskRun(
         sync_after_work: autoSyncAfterTurn && !isLinkedTask(task),
         remote_branch: syncResult.remoteBranch,
         permission_mode: params.permissionMode,
+        ...(restoreRejectedFiles.length > 0 ? { restore_rejected_files: restoreRejectedFiles } : {}),
         ...(lowHighLoop ? { low_high_loop: { review_effort: lowHighLoop.reviewEffort } } : {}),
         // The wrap-up plan rides every work command: finality is declared DURING
         // the turn, after this write, so it cannot be sent later (§3.3).
@@ -1488,9 +1570,9 @@ async function launchUnblockTaskRun(
       };
       writeCommand(protoDir, unblockCommand);
 
-      return { nextSeq, mustRecreateContainer, protoDir };
+      return { nextSeq, mustRecreateContainer, mustRecreateForEnv, protoDir, envNotice };
     });
-    const { nextSeq, mustRecreateContainer, protoDir } = claim;
+    const { nextSeq, mustRecreateContainer, mustRecreateForEnv, protoDir, envNotice } = claim;
 
     // --- Generate daemon MCP config ---
     // The daemon knows its own webPort — no health check, no fallback.
@@ -1504,13 +1586,15 @@ async function launchUnblockTaskRun(
 
     // Launch or reuse supervisor
     const mustRecreateForAgent = mustRecreateForContainerAgent(sess, task.agent_id);
+    // `lazy env set` since this container was created: env is fixed at create.
+    if (mustRecreateForEnv) phases.note('recreating container: task environment changed (lazy env) — launch env is fixed at create time');
     if (mustRecreateForAgent) {
       phases.note(
         `recreating container: agent changed ` +
         `(${sess.container_agent_id} → ${task.agent_id}) — launch env is fixed at create time`,
       );
     }
-    if (!mustRecreateContainer && !mustRecreateForAgent && (await runner.isRunning(containerName))) {
+    if (!mustRecreateContainer && !mustRecreateForAgent && !mustRecreateForEnv && (await runner.isRunning(containerName))) {
       // Supervisor already running — it will pick up the new command. The
       // config written just above still reaches it (in-place write, pinned
       // inode); a container whose FIRST launch had none stays without one, but
@@ -1527,6 +1611,7 @@ async function launchUnblockTaskRun(
         throw new RpcError(500, `Failed to launch supervisor: ${err instanceof Error ? err.message : err}`);
       }
     }
+    if (envNotice) await clearEnvironmentReplaced(storage, task.id);
 
     // Store container name
     await storage.updateSessionContainerName(sess.id, containerName, task.agent_id);
@@ -2334,6 +2419,9 @@ async function launchAskTaskRun(
       assertAskableStatus(task, fresh.status);
       // Before the question's turn is recorded — see assertNoMemberInside.
       assertNoMemberInside(task.id);
+      // Same reason: a turn with no credential for its profile is refused here,
+      // before its turn row exists — never after (assertTurnCredentialAvailable).
+      await assertTurnCredentialAvailable(projectRoot, { taskId: task.id, storage });
       statusBeforeAsk = fresh.status;
 
       // --- Model + effort resolution ---
@@ -2449,6 +2537,12 @@ async function launchAskTaskRun(
       // reused, so it also does not count as an already-running supervisor for
       // the in-flight wait below. Same for an agent-switch env mismatch.
       const mustRecreateForAgent = mustRecreateForContainerAgent(sess, task.agent_id);
+    // `lazy env set` since this container was created: env is fixed at create.
+    const mustRecreateForEnv = await mustRecreateForTaskEnv(projectRoot, task.id, containerName);
+    if (mustRecreateForEnv) phases.note('recreating container: task environment changed (lazy env) — launch env is fixed at create time');
+      // Not a work turn: a replacement here is only RECORDED, and told to the
+      // next work turn (src/task/environment-replaced.ts).
+      await recordRecreationIfRunning(storage, task.id, recreationReason(mustRecreateContainer, mustRecreateForAgent, mustRecreateForEnv), runner, containerName);
       if (mustRecreateForAgent) {
         phases.note(
           `recreating container: agent changed ` +
@@ -2456,7 +2550,7 @@ async function launchAskTaskRun(
         );
       }
       const reusedExistingSupervisor =
-        !mustRecreateContainer && !mustRecreateForAgent && (await runner.isRunning(containerName));
+        !mustRecreateContainer && !mustRecreateForAgent && !mustRecreateForEnv && (await runner.isRunning(containerName));
       if (reusedExistingSupervisor) {
         // Supervisor already running — it will pick up the ask command
         phases.note(`reusing running container ${containerName}`);
@@ -3612,6 +3706,9 @@ async function launchReviewTaskRun(
       assertReviewableStatus(task, fresh.status);
       // Before the review's turn is recorded — see assertNoMemberInside.
       assertNoMemberInside(task.id);
+      // Same reason: a turn with no credential for its profile is refused here,
+      // before its turn row exists — never after (assertTurnCredentialAvailable).
+      await assertTurnCredentialAvailable(projectRoot, { taskId: task.id, storage });
       statusBeforeReview = fresh.status;
 
       const config = await loadConfig(projectRoot);
@@ -4750,6 +4847,12 @@ export interface ReopenTaskParams {
   reason?: string;
   /** Channel actor (MCP → 'builder'/'agent', CLI → 'human'); falls back to getActor(). See {@link MCP_ACTOR}. */
   actor?: ActorInput;
+  /**
+   * Answer "would this reopen find the task's work?" and write NOTHING — no
+   * branch, no comment, no status. The CLI asks it before opening $EDITOR, so a
+   * reopen that is going to refuse does so before the human types a reason.
+   */
+  checkOnly?: boolean;
 }
 
 export interface ReopenTaskResult {
@@ -4761,6 +4864,12 @@ export interface ReopenTaskResult {
   hadSession: boolean;
   /** The preserved branch a session-holding task will come back on, or null. */
   gitBranch: string | null;
+  /**
+   * How the task branch was restored, with a narration line — null for a task
+   * that never ran. The branch keeps its own history: if the parent moved
+   * meanwhile, bringing it in is a `lazy sync`, never part of reopen.
+   */
+  restore: BranchRestore | null;
   warnings: string[];
 }
 
@@ -4769,8 +4878,9 @@ export interface ReopenTaskResult {
  * when it never ran.
  *
  * THE one implementation of the reopen storage sequence — `lazy reopen`,
- * `lazy_reopen` (MCP) and the web task page all call this. It deliberately
- * does NOT recreate the worktree: that is host-side git work the CLI performs
+ * `lazy_reopen` (MCP) and the web task page all call this. It restores the
+ * task BRANCH at its last head (or refuses), but deliberately does NOT
+ * recreate the worktree: that is host-side git work the CLI performs
  * around this call, and every other caller defers to the next start/unblock,
  * which sets the worktree up itself.
  *
@@ -4799,24 +4909,67 @@ export async function reopenTask(
     throw new RpcError(409, `Task ${displayId(task)} is ${task.status} — only abandoned or complete tasks can be reopened.`);
   }
   const reason = params.reason?.trim();
-  if (task.status === 'complete' && !reason) {
+  if (task.status === 'complete' && !reason && !params.checkOnly) {
     throw new RpcError(400, 'A reason is required to reopen a completed task.');
+  }
+
+  // Give back what was closed — BEFORE any write, so a refusal changes nothing.
+  // A task that ran comes back on its own branch at its last head (local, then
+  // the remote, then a recorded commit) or not at all; a fresh start is clone's
+  // or redo's job (src/daemon/reopen-restore.ts). A task that never ran has no
+  // branch to restore.
+  const priorSession = await storage.getSessionByTaskId(task.id);
+  const restore = priorSession
+    ? await restoreTaskBranchForReopen({
+      projectRoot,
+      config: await loadConfig(projectRoot),
+      storage,
+      session: priorSession,
+      displayId: displayId(task),
+      checkOnly: params.checkOnly,
+    })
+    : null;
+
+  if (params.checkOnly) {
+    return {
+      taskId: task.id,
+      displayId: displayId(task),
+      previousStatus: task.status,
+      newStatus: priorSession ? 'blocked' : 'backlog',
+      hadSession: !!priorSession,
+      gitBranch: priorSession?.git_branch ?? null,
+      restore,
+      warnings: [],
+    };
   }
 
   if (reason) {
     await storage.createComment(task.id, `[Reopened] ${reason}`, actor);
   }
 
-  // storage.reopenTask itself lands the task on 'blocked' (has a session) or
-  // 'backlog' (never ran) and clears completed_at — no separate status write.
-  await storage.reopenTask(task.id, actor);
+  // An accepted task keeps its accept tag; record in the store that this
+  // reopen supersedes it, BEFORE the session is reset, so the zombie sweep
+  // never re-ends the reopened session from it (src/task/reopen-after-accept.ts).
+  if (task.status === 'complete') {
+    const acceptCommit = await getAcceptTagCommit(task.id, projectRoot);
+    if (acceptCommit) await recordReopenAfterAccept(storage, task.id, acceptCommit);
+  }
 
+  // Reset the session BEFORE the status leaves terminal. A non-terminal task
+  // with an ended `accepted` session is exactly what storage's list-time
+  // self-heal flips back to `complete`, so the other order let any concurrent
+  // read undo the reopen. A terminal task with a reset session is inert: every
+  // sweep skips terminal tasks.
   const session = await storage.getSessionByTaskId(task.id);
   if (session) {
     // Clear ended_at/outcome and the agent session id so the next turn starts
     // a fresh agent conversation rather than resuming the finished one.
     await storage.resetSession(session.id);
   }
+
+  // storage.reopenTask itself lands the task on 'blocked' (has a session) or
+  // 'backlog' (never ran) and clears completed_at — no separate status write.
+  await storage.reopenTask(task.id, actor);
 
   // A reopened child owes its cluster a fresh fix-round budget: the count is
   // "since it was last started or accepted", and reopening ends that episode.
@@ -4829,6 +4982,7 @@ export async function reopenTask(
     newStatus: session ? 'blocked' : 'backlog',
     hadSession: !!session,
     gitBranch: session?.git_branch ?? null,
+    restore,
     warnings: [],
   };
 }
@@ -4836,6 +4990,61 @@ export async function reopenTask(
 // =====================================================================
 // Accept Task — pre-flight validation only
 // =====================================================================
+
+/**
+ * Whether accept's nested-repository scan applies: the worktree exists and
+ * the project root has a `.git` (directory or gitdir file). Mirrors the scope
+ * of refuseTamperedWorktreeGit (src/git/worktree-pointers.ts).
+ */
+export async function nestedGitScanApplies(projectRoot: string, worktreePath: string): Promise<boolean> {
+  if (!await pathExists(worktreePath)) return false;
+  try {
+    await lstat(join(projectRoot, '.git'));
+    return true;
+  } catch (err) {
+    // Only a .git that is genuinely ABSENT skips the scan. Any other error
+    // (EACCES, EIO) runs it, so the scan's own failure refuses — fail closed.
+    const code = (err as NodeJS.ErrnoException).code;
+    return !(code === 'ENOENT' || code === 'ENOTDIR');
+  }
+}
+
+/**
+ * Accept's nested-repository gate: throws the 409 refusal when the task's
+ * worktree holds a nested repository its base branch does not have, or when
+ * the scan cannot answer (fail closed). Skipped where nestedGitScanApplies
+ * says lazy never lays out task worktrees.
+ */
+export async function refuseNestedGitOnAccept(projectRoot: string, storage: Storage, task: Task, worktreePath: string): Promise<void> {
+  if (await nestedGitScanApplies(projectRoot, worktreePath)) {
+    let findings;
+    try {
+      findings = await scanTaskWorktreeNestedGit(projectRoot, storage, task, worktreePath);
+    } catch (err) {
+      // Fail closed: a scan that could not answer is not a clean worktree.
+      throw acceptRefusal(
+        409,
+        `Task ${displayId(task)}'s worktree could not be checked for nested git repositories: ` +
+        `${err instanceof Error ? err.message : String(err)}. Run \`lazy doctor\` for the details, then accept again.`,
+        { reason: 'nested-git-repository', next: 'Fix what stopped the check (see lazy doctor), then accept again.', command: 'lazy doctor' },
+      );
+    }
+    if (findings.length > 0) {
+      throw acceptRefusal(
+        409,
+        `Task ${displayId(task)} has nested git repositories in its worktree that its base branch does not have: ` +
+        `${describeNestedGit(findings)}. Their config could run code for anyone who runs git or opens an IDE in those ` +
+        `folders. Do not open them; move them aside with \`lazy doctor --repair-git-pointers\` (nothing is deleted), then accept again.`,
+        {
+          reason: 'nested-git-repository',
+          next: 'Quarantine the nested repositories (they are moved aside, not deleted), then accept again.',
+          command: 'lazy doctor --repair-git-pointers',
+          files: findings.slice(0, 20).map(f => f.rel),
+        },
+      );
+    }
+  }
+}
 
 /**
  * Accept task pre-flight validation.
@@ -5036,7 +5245,10 @@ export async function acceptTaskPreflight(
   }
   if (!params.acceptDirtyWorktree) {
     await checkUncommittedChangesOrThrow(worktreePath, displayId(task), 'accept');
+  } else {
+    await checkWorktreeGitSafeOrThrow(worktreePath, displayId(task), 'accept');
   }
+  await refuseRedirectedHead(worktreePath, sess.git_branch);
 
   // --- Status validation ---
   if (task.status === 'pairing') {
@@ -5289,12 +5501,7 @@ export async function acceptTaskPreflight(
     // policy gate: a resumed accept already passed it and never re-checks.
     // The same count backs the "Before you can accept" row every surface shows.
     if (!params.allowQueuedComments) {
-      const queuedFeedback = queuedHumanFeedbackCount({
-        session: sess,
-        turns,
-        comments: await storage.getTaskComments(task.id),
-        pendingReviewComments: (await storage.getTaskReviewComments(task.id)).filter(isPendingDelivery).length,
-      });
+      const queuedFeedback = await queuedHumanFeedbackForTask(storage, task.id);
       if (queuedFeedback > 0) {
         const n = `${queuedFeedback} queued comment${queuedFeedback === 1 ? '' : 's'}`;
         throw acceptRefusal(
@@ -5313,6 +5520,18 @@ export async function acceptTaskPreflight(
 
   // --- Pairing lock check ---
   checkPairingLockOrThrow(projectRoot, taskRef(task), displayId(task));
+
+  // --- Nested repositories (src/git/nested-git.ts) ---
+  // A repository the task planted below its worktree is not something the
+  // merge carries, but it IS what a human's own git or IDE runs when they open
+  // the folder — so accept, the moment a human is most likely to look, refuses
+  // while one is present. A data-safety check: it runs on a resumed accept too.
+  // It runs AFTER the pre-existing refusals (status, dirty worktree, pairing
+  // lock) so the refusal a human sees first is unchanged for those cases, and
+  // it is scoped like refuseTamperedWorktreeGit: a project root with no .git
+  // is not a layout lazy creates task worktrees in, so there is nothing to
+  // scan. Inside a real task worktree a scan that throws still refuses.
+  await refuseNestedGitOnAccept(projectRoot, storage, task, worktreePath);
 
   // --- Check for zero commits ---
   const commits = await storage.getSessionCommits(sess.id);
@@ -5374,8 +5593,11 @@ export async function acceptTaskPreflight(
     parentDisplayId = displayId(parentTask);
     mergeTargetBranch = await getBranchNameFromId(childParentId, storage);
   } else {
+    // A root task with no named target (unresolved '' or a detached 'HEAD')
+    // integrates into the REMOTE'S DEFAULT branch — what sync, remote-sync and
+    // the drivers resolve it to — never a literal 'main', which need not exist.
     const { resolveDetachedHead } = await import('../git/operations');
-    mergeTargetBranch = await resolveDetachedHead(targetBranchOf(task) ?? 'main', projectRoot, config.remote.git_remote);
+    mergeTargetBranch = await resolveDetachedHead(targetBranchOf(task) ?? 'HEAD', projectRoot, config.remote.git_remote);
   }
 
   // --- Branch sync validation (root tasks with remote driver) ---
@@ -6942,6 +7164,7 @@ async function acceptTaskRun(
       task,
       taskShortId: taskRef(task),
       root: projectRoot,
+      coauthorTrailer: config.git.coauthor_trailer,
     });
 
     if (retryResult.metadata) {
@@ -7231,6 +7454,7 @@ async function acceptTaskRun(
       root: projectRoot,
       fidelityBody: fidelity.fidelityBody,
       resume: isResume,
+      coauthorTrailer: config.git.coauthor_trailer,
     });
     mergeLanded = result.status === 'merged';
 
@@ -7343,7 +7567,7 @@ async function acceptTaskRun(
     closeReview: closeReviewOwed(config, storage, projectRoot, task, !mergeDriver.needsSync),
     // Read-only and non-throwing: the tag must point at the merge itself, not
     // at whatever the parent holds when a retried follow-through gets to it.
-    ...(!mergeDriver.needsSync ? { mergeSha: await readTargetSha(followTarget, projectRoot) } : {}),
+    ...(!mergeDriver.needsSync ? { mergeSha: await readTargetSha(mergeTargetBranch, projectRoot) } : {}),
     done: [],
     attempts: 0,
   };
@@ -7633,6 +7857,12 @@ export interface SyncTaskResult {
    * reason to sync (an upstream signal) can let that go.
    */
   usagePauseHeld?: boolean;
+  /**
+   * Set with `pending_sync` when the merge conflicts and the agent that would
+   * resolve it has no model credential (src/daemon/credential-gate.ts). Held
+   * exactly like `usagePauseHeld`: the queued sync owns the retry.
+   */
+  credentialHeld?: boolean;
 }
 
 /**
@@ -7895,6 +8125,8 @@ async function syncTaskRun(
     }
   }
 
+  await refuseRedirectedHead(worktreePath, sess.git_branch);
+
   // Check for concurrent session lock
   const existingLock = await checkLock(worktreePath);
   if (existingLock) {
@@ -8071,6 +8303,7 @@ async function syncTaskRun(
         storage,
         taskId: task.id,
         sessionId: sess.id,
+        branch: sess.git_branch,
         displayId: displayId(task),
         worktreePath,
         plan: planSelfSyncSteps({
@@ -8131,6 +8364,7 @@ async function syncTaskRun(
         storage,
         taskId: task.id,
         sessionId: sess.id,
+        branch: sess.git_branch,
         displayId: displayId(task),
         worktreePath,
         plan: planSelfSyncSteps({
@@ -8253,6 +8487,39 @@ async function syncTaskRun(
       }
     }
 
+    // --- Model credential, the same place and the same two outcomes ---
+    // A CLEAN merge is git work and needs no credential; resolving a conflict
+    // runs the task's agent, which does. Refused here, before the agent is
+    // launched or the task claimed, on the profile the agent runs.
+    //
+    // INVARIANT: an automatic sync refused for a missing credential is HELD,
+    // never dropped — the counter reset above goes back, and the retry loop
+    // re-offers it with backoff until a credential is connected. A sync a
+    // person asked for is refused to them, and a sync the daemon had queued
+    // before it survives that refusal too.
+    const credentialProblem = await turnCredentialProblem(projectRoot, { taskId: task.id, storage });
+    if (credentialProblem) {
+      if (params.daemonLaunch) {
+        await storage.incrementTaskPendingSync(task.id);
+        phases.skip(SYNC_PHASES.launch, 'no model credential for the task\'s agent');
+        return {
+          taskId: task.id,
+          displayId: displayId(task),
+          status: 'pending_sync',
+          message:
+            `The merge into ${displayId(task)} conflicts, and resolving it runs the task's agent: held until a ` +
+            `credential is connected, then retried. ${credentialProblem}${mergedSoFar}`,
+          warnings,
+          credentialHeld: true,
+        };
+      }
+      if (task.pending_sync > 0) await storage.incrementTaskPendingSync(task.id);
+      throw new RpcError(400, `${credentialProblem} The merge conflicts, and resolving it runs the task's agent.${mergedSoFar}`);
+    }
+    // An automatic conflict sync that a task's allowance let past the pause
+    // (usagePauseHold only counted it) uses it now, as the agent is launched.
+    if (params.daemonLaunch) await takeTaskAllowanceAtLaunch(projectRoot, task, 'conflict sync');
+
     const runner = await createRunner(projectRoot, task.runner_type ?? undefined);
     // Set agent on runner so auth uses the correct agent (not hardcoded ClaudeCodeAgent)
     const harness = setRunnerAgentForTask(runner, config, task);
@@ -8371,6 +8638,9 @@ async function syncTaskRun(
         // Sent even when 0 so the supervisor sees the explicit opt-out rather
         // than falling back to a default.
         wind_down_timeout_ms: config.agent.wind_down_timeout_ms,
+        // Host runner: the OS sandbox for the conflict-resolution agent, which
+        // otherwise ran with none (the supervisor adds the git-pointer denies).
+        ...computeAgentExtraArgs(config),
       };
       // Record what this sync FOUND, against this sync's command id, so its
       // end-of-turn park can put the status back instead of parking the task
@@ -8422,13 +8692,19 @@ async function syncTaskRun(
 
     // Launch or reuse supervisor
     const mustRecreateForAgent = mustRecreateForContainerAgent(sess, task.agent_id);
+    // `lazy env set` since this container was created: env is fixed at create.
+    const mustRecreateForEnv = await mustRecreateForTaskEnv(projectRoot, task.id, containerName);
+    if (mustRecreateForEnv) phases.note('recreating container: task environment changed (lazy env) — launch env is fixed at create time');
+    // Not a work turn: a replacement here is only RECORDED, and told to the
+    // next work turn (src/task/environment-replaced.ts).
+    await recordRecreationIfRunning(storage, task.id, recreationReason(mustRecreateContainer, mustRecreateForAgent, mustRecreateForEnv), runner, containerName);
     if (mustRecreateForAgent) {
       phases.note(
         `recreating container: agent changed ` +
         `(${sess.container_agent_id} → ${task.agent_id}) — launch env is fixed at create time`,
       );
     }
-    if (!mustRecreateContainer && !mustRecreateForAgent && (await runner.isRunning(containerName))) {
+    if (!mustRecreateContainer && !mustRecreateForAgent && !mustRecreateForEnv && (await runner.isRunning(containerName))) {
       // Supervisor already running — it will pick up the new command. The
       // config written just above still reaches it (in-place write, pinned
       // inode); a container whose FIRST launch had none stays without one, but
@@ -9390,6 +9666,9 @@ async function resumeTaskRun(
     // runs on it, and never a notice turn for a resume that did not happen.
     const { mustRecreateContainer } = await withTaskLifecycleLock(task.id, async () => {
       assertNoMemberInside(task.id);
+      // Same reason: a turn with no credential for its profile is refused here,
+      // before its turn row exists — never after (assertTurnCredentialAvailable).
+      await assertTurnCredentialAvailable(projectRoot, { taskId: task.id, storage });
       const nextSeq = await storage.getNextTurnSequence(sess.id);
       await storage.createTurn({
         sessionId: sess.id,
@@ -9419,13 +9698,25 @@ async function resumeTaskRun(
     phases.end();
     phases.begin(RESUME_PHASES.launch);
 
+    // See src/task/environment-replaced.ts: a replaced container is told to the
+    // turn that runs in its successor.
+    // `lazy env set` since this container was created: env is fixed at create.
+    const mustRecreateForEnv = await mustRecreateForTaskEnv(projectRoot, task.id, containerName);
+    await recordRecreationIfRunning(
+      storage,
+      task.id,
+      recreationReason(mustRecreateContainer, mustRecreateForContainerAgent(sess, task.agent_id), mustRecreateForEnv),
+      runner, containerName,
+    );
+    const envNotice = await environmentReplacedPrefix(storage, task.id);
+
     const unblockCommand: UnblockCommand = {
       type: 'unblock',
       task_id: task.id,
       goal: task.goal,
       // A cluster's constraints hold on EVERY turn it takes — a resume is a turn.
       // Same injection unblockTask makes; see src/task/type-constraints.ts.
-      prompt: typeConstraintsSection(task) + fullPrompt,
+      prompt: envNotice + typeConstraintsSection(task) + fullPrompt,
       agent_id: task.agent_id,
       harness,
       system_prompt: systemPrompt,
@@ -9456,13 +9747,15 @@ async function resumeTaskRun(
 
     // Launch or reuse supervisor
     const mustRecreateForAgent = mustRecreateForContainerAgent(sess, task.agent_id);
+    // `lazy env set` since this container was created: env is fixed at create.
+    if (mustRecreateForEnv) phases.note('recreating container: task environment changed (lazy env) — launch env is fixed at create time');
     if (mustRecreateForAgent) {
       phases.note(
         `recreating container: agent changed ` +
         `(${sess.container_agent_id} → ${task.agent_id}) — launch env is fixed at create time`,
       );
     }
-    if (!mustRecreateContainer && !mustRecreateForAgent && (await runner.isRunning(containerName))) {
+    if (!mustRecreateContainer && !mustRecreateForAgent && !mustRecreateForEnv && (await runner.isRunning(containerName))) {
       // Supervisor already running — it will pick up the new command. The
       // config written just above still reaches it (in-place write, pinned
       // inode); a container whose FIRST launch had none stays without one, but
@@ -9479,6 +9772,7 @@ async function resumeTaskRun(
         throw new RpcError(500, `Failed to launch supervisor: ${err instanceof Error ? err.message : err}`);
       }
     }
+    if (envNotice) await clearEnvironmentReplaced(storage, task.id);
 
     phases.end(containerName);
 

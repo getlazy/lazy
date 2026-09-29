@@ -56,7 +56,10 @@ store — a task's API token must not travel with the project.
 to paste into a bug report. Debug output that shows the launch command redacts
 the task's own keys by name, whatever they are called — you set them because
 they were sensitive, so `STRIPE_SANDBOX` is treated exactly like
-`STRIPE_API_KEY`.
+`STRIPE_API_KEY`. The values themselves are also scrubbed (replaced with
+`<redacted>`) from lazy's log files and from recorded agent turns, so an agent
+that echoes its own token does not record it. Values shorter than 12 characters
+are not scrubbed from free text, to avoid mangling unrelated words.
 
 **Agents cannot reach this at all.** There is no MCP tool for `lazy env`, for
 reads or writes. The agent gets its variable by finding it in `process.env` and
@@ -78,8 +81,10 @@ lazy start my-task --env STRIPE_API_KEY   # same
 value typed that way lands in your shell history and, while the command runs, in
 the process table where any other user on the machine can read it with `ps`.
 
-Under the Docker runner the value is also visible in `docker inspect` for the
-container's lifetime to anyone in the `docker` group on the host — the same
+Lazy itself hands the value to `docker run` through a short-lived `0600` file in
+its state directory rather than on the command line, so it is not in the process
+table while the container starts. It is, however, still visible in
+`docker inspect` for the container's lifetime to anyone in the `docker` group on the host — the same
 posture as the Anthropic credentials lazy already passes to every task container,
 so this is not a new exposure, but it is worth knowing before you hand a
 production token to a task.
@@ -104,11 +109,13 @@ and close each clear it for you.
 
 ### A running agent keeps the environment it launched with
 
-Docker fixes a container's environment at creation time, and lazy reuses a live
-supervisor container across turns. So a change made while a task is `working`
-takes effect at the task's **next** launch — typically after the agent
-blocks and you unblock it. `lazy env set`/`unset`/`clear` say so when the task is
-working.
+A container's environment is fixed when it is created. Lazy normally keeps a
+task's container running between turns, but when the task's variables have
+changed since the container was created, the next launch (`unblock`, an
+automatic resume, `ask`, `sync`) replaces the container so the agent sees the
+new values. A turn that is already running keeps the values it started with, so
+a change made while a task is `working` takes effect at the task's **next**
+launch. `lazy env set`/`unset`/`clear` say so when the task is working.
 
 ## Reserved names
 
@@ -146,8 +153,9 @@ much more confusingly, as an unexplained 401 inside the container.
 
 Both runners are covered:
 
-- **Docker/Podman** — passed as `-e KEY=VALUE` on `docker run`, before the image
-  name.
+- **Docker/Podman** — passed to `docker run` through a `0600` `--env-file` that is
+  deleted once the container has started (a value containing a line break is
+  passed as `-e KEY=VALUE`, since the env-file format cannot hold one).
 - **Host process** (`dangerously-host-process-without-any-isolation`) — merged
   into the supervisor process's spawn environment.
 

@@ -69,6 +69,8 @@ export type PiInvocation = FakeAgentInvocation;
 export interface PiSuccessOptions {
   result?: string;
   sessionId?: string;
+  inputTokens?: number;
+  outputTokens?: number;
   /** Files to write + commit before responding (the "work"). */
   commit?: { message: string; files: Array<{ path: string; content: string }> };
 }
@@ -83,6 +85,8 @@ export function piSuccessScenario(opts: PiSuccessOptions = {}): PiScenario {
     kind: 'respond',
     result: opts.result ?? 'Fake pi agent completed the task.',
     ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+    ...(opts.inputTokens !== undefined ? { inputTokens: opts.inputTokens } : {}),
+    ...(opts.outputTokens !== undefined ? { outputTokens: opts.outputTokens } : {}),
   });
   return { steps };
 }

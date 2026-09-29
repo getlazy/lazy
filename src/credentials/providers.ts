@@ -349,16 +349,13 @@ export function providerForTarget(target: Pick<RoleTarget, 'credential'>): Provi
  * setup needs none and is let through; a mixed setup still needs its Anthropic
  * token.
  *
- * Deliberately the ROLE DEFAULTS, not every profile the project declares.
- * Declaring `[agents.work-codex]` is not a statement that any task runs it
- * today, and refusing to start the daemon over a profile nothing has selected
- * would make adding a profile a breaking change. A task that DOES select one
- * resolves its credential at launch and fails there, naming the profile — the
- * same treatment Cursor already gets.
+ * Deliberately the ROLE DEFAULTS, not every profile the project declares: this
+ * is what daemon startup HYDRATES into its environment. Nothing refuses over it
+ * — a turn is refused at launch, per profile (src/daemon/credential-gate.ts),
+ * and the diagnostic question is {@link requiredCredentials}'s.
  *
- * Cursor is NOT included for that reason: a Cursor key is resolved per launch
- * (src/agent/credentials.ts) and a missing one warns at launch; gating daemon
- * startup on it would refuse a daemon for every task that is not a Cursor task.
+ * Cursor is NOT included: a Cursor key is resolved per launch
+ * (src/agent/credentials.ts), never read from the daemon's environment.
  */
 export function requiredProviders(config: ResolvedConfig): Provider[] {
   const providers = new Set<Provider>();

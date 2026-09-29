@@ -1,8 +1,9 @@
 /**
- * The self-host image's checkout stage copies a MODULE GRAPH, and this is the
- * scan that keeps the two in agreement.
+ * The lazy checkout stage copies a MODULE GRAPH, and this is the scan that keeps
+ * the two in agreement.
  *
- * `lazy-teams/deploy/Dockerfile`'s `lazy-checkout` stage copies a deliberately
+ * The daemon image's `lazy-checkout` stage (which the self-host image copies)
+ * copies a deliberately
  * narrow set of paths and then, in the same stage, runs
  * `bun run src/index.ts system source-id --write`. Bun resolves the whole CLI
  * module graph to do that, so anything `src/` imports from OUTSIDE `src/` must
@@ -22,14 +23,16 @@ import { join, dirname, resolve, relative } from 'path';
 
 const repoRoot = resolve(import.meta.dir, '..', '..');
 const srcDir = join(repoRoot, 'src');
-// Both checkout stages copy the same module graph and must not drift apart: the
-// daemon image (the image a project daemon runs in inside its VM) shipped with
-// the same missing stylesheet a week after the self-host image was fixed, and
-// failed its first `lazy --version` on real hardware (run 20260920-081830).
+// There is ONE checkout stage. There used to be two — the self-host image built
+// its own — and they drifted: the daemon image shipped with the same missing
+// stylesheet a week after the self-host image was fixed, and failed its first
+// `lazy --version` on real hardware (run 20260920-081830). The self-host image
+// now copies the daemon image's checkout instead; the last describe below keeps
+// it from growing a second one again.
 const DOCKERFILES: { label: string; path: string }[] = [
-  { label: 'self-host image', path: join(repoRoot, 'lazy-teams', 'deploy', 'Dockerfile') },
   { label: 'daemon image', path: join(repoRoot, 'lazy-teams', 'deploy', 'daemon-image', 'Dockerfile') },
 ];
+const TEAMS_DOCKERFILE = join(repoRoot, 'lazy-teams', 'deploy', 'Dockerfile');
 
 /**
  * Paths the stage does NOT copy and does not need to, each with the reason it
@@ -147,6 +150,55 @@ describe.each(DOCKERFILES)('the $label copies what src imports', ({ path: docker
     const copies = await checkoutStageCopies(dockerfile);
     for (const { path } of PROVIDED_BY_THE_RUN_LINE) {
       expect(isCopied(path, copies)).toBe(false);
+    }
+  });
+});
+
+describe('the self-host image builds no lazy checkout of its own', () => {
+  // INVARIANT: lazy is built once per release. The self-host image copies its
+  // checkout (and bun) out of the daemon image named by LAZY_DAEMON_IMAGE, so
+  // the app and the daemons it launches cannot run different lazy bytes, and
+  // the module-graph COPY list above exists in exactly one place.
+  test('takes /lazy from the daemon image and never runs bun install', async () => {
+    const text = await Bun.file(TEAMS_DOCKERFILE).text();
+    expect(text).toMatch(/^ARG LAZY_DAEMON_IMAGE=$/m);
+    // A global ARG: it must come before the first FROM to be usable in one.
+    expect(text.indexOf('ARG LAZY_DAEMON_IMAGE=')).toBeLessThan(text.search(/^FROM /m));
+    expect(text).toMatch(/^FROM \$\{LAZY_DAEMON_IMAGE\} AS lazy-daemon$/m);
+    expect(text).toContain('COPY --from=lazy-daemon --chown=rails:rails /opt/lazy /lazy');
+    expect(text).toContain('COPY --from=lazy-daemon /usr/local/bin/bun /usr/local/bin/bun');
+    expect(text).not.toMatch(/^RUN .*bun install/m);
+    expect(text).not.toMatch(/^COPY src /m);
+    expect(text).not.toContain('bun.sh/install');
+    // And it proves the copied lazy runs here, as rails, from the baked id.
+    expect(text).toMatch(/^RUN gosu rails bun run \/lazy\/src\/index\.ts system source-id --json .*baked/m);
+  });
+
+  // INVARIANT: the fingerprint RollsFleet compares is written by lazy itself,
+  // never by a hand-rolled shell pipeline (src/utils/source-id.ts). The
+  // assertion is scoped to the fingerprint's subject — the lazy-checkout stage,
+  // plus any RUN that mentions the source id or fingerprint — because other
+  // stages legitimately use hash tools for something else entirely (verifying
+  // pinned checksums of downloaded release tarballs), and banning the tool
+  // image-wide made that unrelated verification trip this rule.
+  test('the daemon image bakes the fingerprint with lazy, not a pipeline', async () => {
+    const text = await Bun.file(DOCKERFILES[0]!.path).text();
+    const HASH_TOOL = /\b(sha\d*sum|md5sum|shasum|b2sum|openssl\s+dgst)\b/;
+
+    const start = text.search(/^FROM .* AS lazy-checkout$/m);
+    expect(start).toBeGreaterThanOrEqual(0);
+    const next = text.slice(start + 1).search(/^FROM /m);
+    const stage = next < 0 ? text.slice(start) : text.slice(start, start + 1 + next);
+    expect(stage).toContain('bun run src/index.ts system source-id --write');
+    expect(stage).not.toMatch(HASH_TOOL);
+
+    // Anywhere in the image, a RUN (continuations joined) that touches the
+    // source id or fingerprint must not reach for a hash tool.
+    const runs = text.replace(/\\\n/g, ' ').split('\n').filter((l) => l.startsWith('RUN '));
+    const fingerprintRuns = runs.filter((r) => /source-id|fingerprint/i.test(r));
+    expect(fingerprintRuns.length).toBeGreaterThan(0);
+    for (const run of fingerprintRuns) {
+      expect(run).not.toMatch(HASH_TOOL);
     }
   });
 });

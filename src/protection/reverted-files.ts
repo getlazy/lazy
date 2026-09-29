@@ -1,36 +1,33 @@
 /**
- * Protected files that were REVERTED during a task — surfaced at accept time.
+ * Protected files lazy RESTORED during a task — surfaced at accept time.
  *
  * ## Why accept has to say this out loud
  *
- * HISTORICAL RECORDS ONLY since move-file-approval-to-accept: lazy no longer
- * reverts a protected file on any path, so no new task produces a `rejected`
- * record. Tasks whose sessions still carry one from the old behaviour do, and
- * accept must still say so — which is why this module stays wired in.
+ * When a reviewer rejects a protected file, lazy's supervisor restores it to
+ * its base and commits that before the agent's next work turn
+ * (src/protection/rejected-restore.ts), and records the file as `rejected`
+ * with `restored_at`. (Sessions from before move-file-approval-to-accept carry
+ * `rejected` records from the old revert-at-unblock, which read the same.)
+ * From that moment the task's diff simply does not contain the file — which
+ * reads EXACTLY like "the task never touched it". The reviewer at accept has
+ * no way to tell the two apart, and the one thing they most need to know is
+ * that the tree they are merging holds a lazy-made restore: a restore can leave
+ * the branch incoherent (restored tests for code the task deleted, an import of
+ * a constant the task removed), and that is precisely how a task that did not
+ * compile was once merged. The agent now gets a turn after the restore to make
+ * the tree coherent, but the reviewer must still be told.
  *
- * When a reviewer rejected a protected file at `lazy unblock`, the daemon
- * restored it from its base SHA and committed the revert. From that moment the
- * task's diff simply does not contain the file — which reads EXACTLY like "the
- * task never touched it". The reviewer at accept has no way to tell the two
- * apart, and the one thing they most need to know is that the tree they are
- * merging is not the tree the agent built and verified: a revert can leave the
- * branch incoherent (restored tests for code the task deleted, an import of a
- * constant the task removed), and that is precisely how a task that did not
- * compile got merged.
- *
- * The revert itself is not weakened in any way. This module only READS the
- * decisions already recorded on the session's turns and names them where the
- * merge decision is actually made.
+ * This module only READS the records on the session's turns and names them
+ * where the merge decision is actually made.
  *
  * ## Latest decision wins
  *
- * A file could be rejected in one round and re-approved in a later one. A
- * re-approved file is back in
- * the diff and needs no notice, so only files whose LATEST recorded decision is
- * `rejected` are reported. Turns are scanned in order and each file's status is
- * overwritten as later turns record it.
+ * A restored file the agent edits again is re-detected as a fresh `pending`
+ * record on a later turn — back in the diff and owed a new decision, so it
+ * needs no notice. Only files whose LATEST record is `rejected` are reported.
+ * Turns are scanned in order and each file's status is overwritten as later
+ * turns record it.
  */
-
 import type { Turn } from '../types';
 
 /**
@@ -61,9 +58,9 @@ export function revertedProtectedFilesNotice(files: string[]): string {
   if (files.length === 0) return '';
   const plural = files.length === 1 ? 'file was' : 'files were';
   return (
-    `${files.length} protected ${plural} reverted during this task:\n` +
+    `${files.length} protected ${plural} reverted during this task — a reviewer rejected the change and lazy restored the base version:\n` +
     files.map(f => `  ${f}`).join('\n') +
-    `\n\nThose changes are NOT in the diff you are reviewing — the tree being merged is not the ` +
-    `tree the agent last built against.`
+    `\n\nThose changes are NOT in the diff you are reviewing: the tree being merged holds lazy's own ` +
+    `restore commit. The agent had a turn after the restore to make the tree coherent — check that it did.`
   );
 }

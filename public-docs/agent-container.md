@@ -120,3 +120,84 @@ says what to fix. The most common causes:
   then run `lazy upgrade`.
 
 See also [Troubleshooting](troubleshooting.md).
+
+## What the container can and cannot change in git
+
+An agent works in its task's own git worktree. Inside the container, the
+repository's shared git directory (branches, config, hooks) is read-only; the
+agent can stage, diff, check out files and create commit objects, and lazy
+records its commits for it.
+
+Three small files tell git where a worktree's repository is: the worktree's
+`.git` file, and `commondir` and `gitdir` in the worktree's own git directory.
+A task that could rewrite them could point git at a directory it controls, whose
+configuration runs a program — and the next `git` you or lazy ran in that
+worktree, outside the container, would run it. So:
+
+- **The container sees read-only copies of those three files.** It cannot
+  rewrite, move or delete them.
+- **lazy checks them before every git command it runs in a task worktree**,
+  without running git to do it, and refuses with a message naming the task if
+  they differ from what lazy created.
+- **The daemon puts them back** within one reconcile tick if they were changed
+  anyway (for example by an agent on the host-process runner, which has no
+  container), and `lazy doctor` reports any it finds as an error.
+  `lazy doctor --repair-git-pointers` repairs them on demand.
+
+The same applies to the repositories of the worktree's **submodules**, which
+git keeps inside the worktree's own git directory where the container can
+write. lazy checks them the same way and refuses while one has a setting
+`git submodule` never writes, a live hook, or a work-tree setting pointing
+outside the task's worktree. `lazy accept`, `reject` and `close` refuse too,
+naming the file. The daemon puts them back between turns, and
+`lazy doctor --repair-git-pointers` does it on demand. Nothing is deleted:
+the original config is kept beside it as `config.lazy-quarantine-<id>`. The
+repair also reverts a setting you made yourself inside a task worktree's
+submodule.
+A worktree's `HEAD` file has to stay writable inside the container — git rewrites
+it on every checkout — so a task could point it at another branch (a sibling
+task's, its parent's, `main`). Before lazy commits, syncs, accepts or records
+commits in a task worktree, it reads `HEAD` and refuses unless it names the
+task's own branch; a detached `HEAD` is refused too, and `lazy doctor` reports
+the worktree.
+
+How it is put right depends on what happened:
+
+- **Only the `HEAD` file was changed** (the worktree's staged content is still
+  the task's branch). When no turn or pairing session is running, the daemon
+  points `HEAD` back within one reconcile tick, and
+  `lazy doctor --repair-git-pointers` does it on demand. Only `HEAD` is
+  rewritten, so uncommitted edits are kept.
+- **The worktree was really checked out on another branch**, or is detached.
+  lazy leaves it alone: pointing `HEAD` back under another branch's files would
+  make the next commit undo the task's work. `lazy doctor` tells you what to
+  run: `git checkout <task branch>` in that worktree (`git stash` first if it
+  has uncommitted changes).
+
+lazy also refuses a task worktree while the repository has
+`extensions.worktreeConfig` turned on, because git would then read a
+per-worktree config file the task can write.
+
+A task can also create a whole repository INSIDE its worktree — a `.git`
+folder in some subfolder, or a folder shaped like a bare repository — whose
+configuration runs a program for anyone who runs `git` in that subfolder, or
+opens the worktree in an editor that scans for nested repositories. So:
+
+- **`lazy doctor` reports any nested repository** your base branch does not
+  have as an error, naming its path. Submodules listed in the base branch's
+  `.gitmodules` are normal and not reported.
+- **lazy's own git does not look inside it.** In a task worktree, lazy runs
+  git without asking submodules whether they have uncommitted changes, and the
+  agent's commit tool refuses to stage while a nested repository is present.
+- **The daemon moves it aside between turns** (never while a turn is running):
+  `sub/.git` becomes `sub/.git.lazy-quarantine-1`; a symbolic link to a
+  repository is moved out of the worktree into the project's `.lazy` folder.
+  Nothing is deleted.
+  `lazy doctor --repair-git-pointers` does the same on demand.
+- **`lazy accept` refuses** while one is present, and names it.
+
+Until it has been moved aside, do not run git in that subfolder or open the
+worktree in an IDE.
+
+This protection does not rely on git's own "dubious ownership" check, which some
+setups (including container images that trust every directory) turn off.

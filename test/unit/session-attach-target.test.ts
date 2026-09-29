@@ -65,6 +65,11 @@ function fakeStorage(): Pick<Storage, 'getBuilderSession' | 'getSession' | 'getT
   } as never;
 }
 
+/** Run what the relay handler runs on open (`prepare`), with no socket. */
+function prepareSocket(data: Record<string, unknown>, status: (m: string) => void = () => {}) {
+  return (data.prepare as (s: (m: string) => void) => Promise<{ ok: boolean; message?: string; detail?: string }>)(status);
+}
+
 const dockerRunner = async () => ({
   type: 'docker' as const,
   usesSandbox: () => true,
@@ -212,6 +217,18 @@ describe('resolveSessionAttachTarget (attach exec target)', () => {
 
     test('a working task with no binding (the daemon-env mode) is refused', async () => {
       expect(await as('alice@example.com', null, { status: 'working' })).toMatchObject({ ok: false, status: 409 });
+    });
+
+    // INVARIANT: the refusal says what the reader can do, never that a
+    // terminal "opens once the turn has ended" — nothing opens one by itself,
+    // so that promised something that never happened.
+    test('the refusal says why and what to do, and promises nothing', async () => {
+      const r = await as('alice@example.com', null, { status: 'working' });
+      expect(r.ok).toBe(false);
+      const message = (r as { message: string }).message;
+      expect(message).toContain('a terminal cannot open while it does');
+      expect(message).toContain('When the turn ends, open the terminal again');
+      expect(message).not.toMatch(/opens once the turn/);
     });
 
     test('between turns a member is let through to the entry step', async () => {
@@ -395,6 +412,10 @@ describe('session attach upgrader: the client cannot steer the exec', () => {
       { headers: { Authorization: 'Bearer t', 'X-Lazy-Project': ROOT, 'X-Lazy-Container': 'lazy-run-some-task' } },
     ), server);
     expect(outcome).toBe('upgraded');
+    // The container is made after the upgrade was answered.
+    expect(launched).toEqual([]);
+    expect(upgrades[0]!.container).toBe('');
+    expect(await prepareSocket(upgrades[0]!)).toEqual({ ok: true });
     expect(launched).toEqual(['alice@example.com']);
     expect(upgrades[0]!.container).toBe('lazymember-task-1-aaaa');
     expect(upgrades[0]!.container).not.toBe('lazy-run-some-task');
@@ -408,7 +429,7 @@ describe('session attach upgrader: the client cannot steer the exec', () => {
     resetMemberTerminalsForTests();
   });
 
-  test("a member whose container cannot be made is refused with the daemon's own sentence", async () => {
+  test("a member whose container cannot be made is told the daemon's own sentence", async () => {
     resetMemberTerminalsForTests();
     const up = createSessionAttachUpgrader({
       getStorage: async () => fakeStorage() as Storage,
@@ -426,9 +447,12 @@ describe('session attach upgrader: the client cannot steer the exec', () => {
     const outcome = await up.tryUpgrade(new Request(`http://daemon/rpc/sessions/${TASK_SESSION.id}/attach/ws`, {
       headers: { Authorization: 'Bearer t', 'X-Lazy-Project': ROOT },
     }), server);
-    expect((outcome as Response).status).toBe(400);
-    expect(await (outcome as Response).text()).toContain('No Anthropic credential');
-    expect(upgrades).toHaveLength(0);
+    // Answered first; the failed launch is the socket's error frame (the
+    // relay handler sends what `prepare` returns).
+    expect(outcome).toBe('upgraded');
+    const prepared = await prepareSocket(upgrades[0]!);
+    expect(prepared).toEqual({ ok: false, message: expect.stringContaining('No Anthropic credential') });
+    await new Promise((r) => setTimeout(r, 60));
     // Nothing came up, so nothing is held: the task is free at once.
     const { memberInsideTask } = await import('../../src/server/member-terminals');
     expect(memberInsideTask(TASK.id)).toBeNull();
@@ -487,7 +511,9 @@ describe('session attach upgrader: the client cannot steer the exec', () => {
       const launched: string[] = [];
       const alice = capturingServer();
       expect(await memberUpgrader('alice@example.com', { vacated, launched }).tryUpgrade(req(), alice.server)).toBe('upgraded');
+      await prepareSocket(alice.upgrades[0]!);
       expect(await memberUpgrader('alice@example.com', { vacated, launched }).tryUpgrade(req(), alice.server)).toBe('upgraded');
+      await prepareSocket(alice.upgrades[1]!);
       // Both of Alice's terminals are in the ONE container made for her.
       expect(launched).toEqual(['lazymember-alice-1']);
       expect(alice.upgrades.map((u) => u.container)).toEqual(['lazymember-alice-1', 'lazymember-alice-1']);
@@ -593,9 +619,10 @@ describe('session attach upgrader: the client cannot steer the exec', () => {
     // task until the daemon restarted.
     test('a container launch that throws after the claim releases it', async () => {
       resetMemberTerminalsForTests();
-      const { server } = capturingServer();
+      const { server, upgrades } = capturingServer();
       const outcome = await memberUpgrader('alice@example.com', { launchThrows: true }).tryUpgrade(req(), server);
-      expect((outcome as Response).status).toBe(500);
+      expect(outcome).toBe('upgraded');
+      expect((await prepareSocket(upgrades[0]!)).ok).toBe(false);
       const { memberTerminalHolder } = await import('../../src/server/member-terminals');
       // Released: after the grace the task is free for anyone.
       await new Promise((r) => setTimeout(r, 60));
@@ -702,5 +729,316 @@ describe('attachSession preflight refusals', () => {
     const r2 = await withWorktree(cursor, (root) => taskModeRefusals({ projectRoot: root, task: cursor, callerEmail: null, multiMember: false, binary: 'docker' }));
     expect(r2.refusals.pair).toBeUndefined();
     expect(r2.refusals.chat).toContain('chat only supports Claude Code');
+  });
+});
+
+// INVARIANT: the member's terminal upgrade is answered BEFORE their container
+// is launched. Image resolution after a fleet upgrade is a build or a pull —
+// minutes — and a relay in front of the daemon waits a bounded time for the
+// 101, so a launch inside the handshake turned the first terminal after every
+// upgrade into "the session did not answer within 30s". The launch runs after
+// the upgrade, narrated as `status` frames, and a failure is an `error` frame.
+describe('a member terminal is answered first and prepared after', () => {
+  function slowUpgrader(opts: {
+    launch: (o: { notify?: (m: string) => void }) => Promise<
+      { ok: true; container: { name: string; binary: string; remove: () => Promise<void> } } | { ok: false; status: number; message: string }
+    >;
+  }) {
+    return createSessionAttachUpgrader({
+      getStorage: async () => fakeStorage() as Storage,
+      root: ROOT,
+      authenticate: async () => ({ ok: true, actor: { kind: 'user', email: 'alice@example.com' } as never, legacyShared: false }),
+      multiMember: async () => true,
+      runnerFor: dockerRunner,
+      bindingFor: async () => null,
+      enterAsMember: async (o) => { markMemberTerminalEntered(o.taskId, o.email); return { ok: true }; },
+      memberPreflight: async () => ({ refusals: {}, credentialMissing: false }),
+      onMemberVacate: async () => {},
+      memberGraceMs: 20,
+      launchMemberContainer: (o) => opts.launch(o as never),
+      memberContainerRunning: async () => true,
+    });
+  }
+  const req = () => new Request(`http://daemon/rpc/sessions/${TASK_SESSION.id}/attach/ws`, {
+    headers: { Authorization: 'Bearer t', 'X-Lazy-Project': ROOT },
+  });
+  function capture() {
+    const upgrades: Array<Record<string, unknown>> = [];
+    const server = { upgrade: (_r: Request, o?: { data?: unknown }) => { upgrades.push(o?.data as Record<string, unknown>); return true; } } as unknown as Server<unknown>;
+    return { server, upgrades };
+  }
+  function fakeSocket(data: Record<string, unknown>) {
+    const sent: string[] = [];
+    const closes: number[] = [];
+    return { ws: { data, send: (m: string) => { sent.push(m); }, sendBinary: () => {}, close: (code: number) => { closes.push(code); } }, sent, closes };
+  }
+
+  test('a launch slower than any handshake does not hold the upgrade', async () => {
+    resetMemberTerminalsForTests();
+    let finishLaunch!: () => void;
+    const launchGate = new Promise<void>((r) => { finishLaunch = r; });
+    const up = slowUpgrader({
+      launch: async (o) => {
+        o.notify?.('building lazy-agent:1 from the default Dockerfile');
+        await launchGate;
+        return { ok: true, container: { name: 'lazymember-task-1-aaaa', binary: 'docker', remove: async () => {} } };
+      },
+    });
+    const { server, upgrades } = capture();
+    const outcome = await Promise.race([
+      up.tryUpgrade(req(), server),
+      new Promise((r) => setTimeout(() => r('still waiting'), 200)),
+    ]);
+    expect(outcome).toBe('upgraded');
+    const data = upgrades[0]!;
+    const statuses: string[] = [];
+    const prepared = (data.prepare as (s: (m: string) => void) => Promise<unknown>)((m) => statuses.push(m));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(statuses.some((s) => s.includes('building lazy-agent:1'))).toBe(true);
+    finishLaunch();
+    expect(await prepared).toEqual({ ok: true });
+    expect(data.container).toBe('lazymember-task-1-aaaa');
+    resetMemberTerminalsForTests();
+  });
+
+  test('a launch that fails is an error frame with the sentence, and frees the task', async () => {
+    resetMemberTerminalsForTests();
+    const up = slowUpgrader({
+      launch: async () => ({ ok: false, status: 500, message: 'Could not start your terminal environment for this task: no space left on device' }),
+    });
+    const { server, upgrades } = capture();
+    expect(await up.tryUpgrade(req(), server)).toBe('upgraded');
+    const { ws, sent, closes } = fakeSocket(upgrades[0]!);
+    await (up.handler as unknown as { open: (w: unknown) => Promise<void> }).open(ws);
+    const frames = sent.map((s) => JSON.parse(s));
+    expect(frames[0]).toEqual({ type: 'status', message: expect.stringContaining('Preparing your terminal') });
+    // A failure underneath is the product sentence; what failed rides `detail`,
+    // which the Teams relay shows to god mode only.
+    expect(frames.at(-1)).toEqual({ type: 'error', message: expect.stringContaining('could not be started'), detail: expect.stringContaining('no space left on device') });
+    expect(closes).toEqual([1011]);
+    await new Promise((r) => setTimeout(r, 60));
+    const { memberTerminalHolder } = await import('../../src/server/member-terminals');
+    expect(memberTerminalHolder(TASK.id)).toBeNull();
+    resetMemberTerminalsForTests();
+  });
+
+  test('a launch that throws is an error frame too, and frees the task', async () => {
+    resetMemberTerminalsForTests();
+    const up = slowUpgrader({ launch: async () => { throw new Error('the registry is unreadable'); } });
+    const { server, upgrades } = capture();
+    expect(await up.tryUpgrade(req(), server)).toBe('upgraded');
+    const { ws, sent, closes } = fakeSocket(upgrades[0]!);
+    await (up.handler as unknown as { open: (w: unknown) => Promise<void> }).open(ws);
+    expect(JSON.parse(sent.at(-1)!)).toEqual({ type: 'error', message: expect.stringContaining('could not be started'), detail: 'the registry is unreadable' });
+    expect(closes).toEqual([1011]);
+    await new Promise((r) => setTimeout(r, 60));
+    const { memberTerminalHolder } = await import('../../src/server/member-terminals');
+    expect(memberTerminalHolder(TASK.id)).toBeNull();
+    resetMemberTerminalsForTests();
+  });
+
+  // INVARIANT: a member who closes their terminal while its environment is
+  // still being made frees the task AT ONCE, not when the launch — possibly a
+  // minutes-long image build — settles; what the launch makes is removed as
+  // soon as it lands, so nothing of theirs outlives the terminal.
+  test('a socket that closes while its container is prepared frees the task at once and removes what lands', async () => {
+    resetMemberTerminalsForTests();
+    let finishLaunch!: () => void;
+    const launchGate = new Promise<void>((r) => { finishLaunch = r; });
+    const vacated: string[] = [];
+    const up = createSessionAttachUpgrader({
+      getStorage: async () => fakeStorage() as Storage,
+      root: ROOT,
+      authenticate: async () => ({ ok: true, actor: { kind: 'user', email: 'alice@example.com' } as never, legacyShared: false }),
+      multiMember: async () => true,
+      runnerFor: dockerRunner,
+      bindingFor: async () => null,
+      enterAsMember: async (o) => { markMemberTerminalEntered(o.taskId, o.email); return { ok: true }; },
+      memberPreflight: async () => ({ refusals: {}, credentialMissing: false }),
+      onMemberVacate: async (c) => { vacated.push(c?.name ?? 'none'); },
+      memberGraceMs: 20,
+      launchMemberContainer: async () => {
+        await launchGate;
+        return { ok: true, container: { name: 'lazymember-task-1-aaaa', binary: 'docker', remove: async () => {} } };
+      },
+      memberContainerRunning: async () => true,
+    });
+    const { server, upgrades } = capture();
+    expect(await up.tryUpgrade(req(), server)).toBe('upgraded');
+    const { ws, closes } = fakeSocket(upgrades[0]!);
+    const handler = up.handler as unknown as { open: (w: unknown) => Promise<void>; close: (w: unknown) => void };
+    const opened = handler.open(ws);
+    // Let the launch get under way (it waits on the gate: a build in progress).
+    await new Promise((r) => setTimeout(r, 10));
+    handler.close(ws);
+    const { memberTerminalHolder } = await import('../../src/server/member-terminals');
+    expect(memberTerminalHolder(TASK.id)).toBeNull();
+    expect(vacated).toEqual([]);
+    finishLaunch();
+    await opened;
+    expect(upgrades[0]!.exec).toBeNull();
+    await new Promise((r) => setTimeout(r, 30));
+    // The container made for nobody is removed once it lands.
+    expect(vacated).toEqual(['lazymember-task-1-aaaa']);
+    expect(closes).toEqual([]);
+    resetMemberTerminalsForTests();
+  });
+
+  function pairUpgrader(opts: { launchOk: boolean; planned: string[] }) {
+    return createSessionAttachUpgrader({
+      getStorage: async () => fakeStorage() as Storage,
+      root: ROOT,
+      authenticate: async () => ({ ok: true, actor: { kind: 'user', email: 'alice@example.com' } as never, legacyShared: false }),
+      multiMember: async () => true,
+      runnerFor: dockerRunner,
+      bindingFor: async () => null,
+      enterAsMember: async (o) => { markMemberTerminalEntered(o.taskId, o.email); return { ok: true }; },
+      memberPreflight: async () => ({ refusals: {}, credentialMissing: false }),
+      onMemberVacate: async () => {},
+      memberGraceMs: 20,
+      launchMemberContainer: async () => {
+        opts.planned.push('launch');
+        return opts.launchOk
+          ? { ok: true, container: { name: 'lazymember-task-1-aaaa', binary: 'docker', remove: async () => {} } }
+          : { ok: false, status: 500, message: 'could not build the image' };
+      },
+      planPairOrChat: async () => {
+        opts.planned.push('plan');
+        return { ok: true, plan: { cmd: ['lazy-agent', 'pair'], env: ['TERM=xterm-256color'], onClose: () => { opts.planned.push('plan-close'); }, abort: () => { opts.planned.push('plan-abort'); } } };
+      },
+      memberContainerRunning: async () => true,
+    });
+  }
+  const pairReq = () => new Request(`http://daemon/rpc/sessions/${TASK_SESSION.id}/attach/ws?mode=pair`, {
+    headers: { Authorization: 'Bearer t', 'X-Lazy-Project': ROOT },
+  });
+
+  // INVARIANT: Pair/Chat take their lock only once the member's container
+  // exists. Taking it first flipped the task to `pairing` (and could spend a
+  // usage-pause override) for a launch that then failed, and releasing it
+  // wrote a "pairing session ended" turn for a session that never started.
+  test('a Pair whose container cannot be made never reaches the planner', async () => {
+    resetMemberTerminalsForTests();
+    const planned: string[] = [];
+    const { server, upgrades } = capture();
+    expect(await pairUpgrader({ launchOk: false, planned }).tryUpgrade(pairReq(), server)).toBe('upgraded');
+    expect(planned).toEqual([]);
+    expect((await prepareSocket(upgrades[0]!)).ok).toBe(false);
+    expect(planned).toEqual(['launch']);
+    resetMemberTerminalsForTests();
+  });
+
+  test('a Pair is planned after its container, and runs the planned command', async () => {
+    resetMemberTerminalsForTests();
+    const planned: string[] = [];
+    const { server, upgrades } = capture();
+    expect(await pairUpgrader({ launchOk: true, planned }).tryUpgrade(pairReq(), server)).toBe('upgraded');
+    expect(await prepareSocket(upgrades[0]!)).toEqual({ ok: true });
+    expect(planned).toEqual(['launch', 'plan']);
+    expect(upgrades[0]!.cmd).toEqual(['lazy-agent', 'pair']);
+    (upgrades[0]!.onClose as () => void)();
+    expect(planned).toEqual(['launch', 'plan', 'plan-close']);
+    resetMemberTerminalsForTests();
+  });
+
+  test('a resize sent while the terminal is prepared sets the size the PTY opens at', async () => {
+    resetMemberTerminalsForTests();
+    const up = slowUpgrader({ launch: async () => ({ ok: false, status: 409, message: 'no' }) });
+    const { server, upgrades } = capture();
+    expect(await up.tryUpgrade(req(), server)).toBe('upgraded');
+    const { ws } = fakeSocket(upgrades[0]!);
+    (up.handler as unknown as { message: (w: unknown, m: string) => void }).message(ws, '{"type":"resize","cols":150,"rows":50}');
+    expect(upgrades[0]!.cols).toBe(150);
+    expect(upgrades[0]!.rows).toBe(50);
+    resetMemberTerminalsForTests();
+  });
+
+  test('a socket that closes before its launch has started starts no launch at all', async () => {
+    resetMemberTerminalsForTests();
+    let launches = 0;
+    const up = slowUpgrader({
+      launch: async () => {
+        launches += 1;
+        return { ok: true, container: { name: 'lazymember-task-1-aaaa', binary: 'docker', remove: async () => {} } };
+      },
+    });
+    const { server, upgrades } = capture();
+    expect(await up.tryUpgrade(req(), server)).toBe('upgraded');
+    const { ws } = fakeSocket(upgrades[0]!);
+    const handler = up.handler as unknown as { open: (w: unknown) => Promise<void>; close: (w: unknown) => void };
+    const opened = handler.open(ws);
+    handler.close(ws);
+    await opened;
+    expect(launches).toBe(0);
+    const { memberTerminalHolder } = await import('../../src/server/member-terminals');
+    expect(memberTerminalHolder(TASK.id)).toBeNull();
+    resetMemberTerminalsForTests();
+  });
+
+  // INVARIANT: "Preparing…" is bounded by silence. A launch that is alive
+  // (every build line and the build's own heartbeat) keeps the terminal
+  // waiting however long it takes; one that says nothing for the bound ends
+  // in an error frame and frees the task.
+  test('progress keeps a slow launch alive; silence past the bound is an error and frees the task', async () => {
+    resetMemberTerminalsForTests();
+    let finish!: () => void;
+    const gate = new Promise<void>((r) => { finish = r; });
+    const lines = ['building lazy-agent:1: Step 1/9', 'building lazy-agent:1: Step 2/9', 'still building lazy-agent:1... (40s elapsed)'];
+    const aliveUp = createSessionAttachUpgrader({
+      getStorage: async () => fakeStorage() as Storage,
+      root: ROOT,
+      authenticate: async () => ({ ok: true, actor: { kind: 'user', email: 'alice@example.com' } as never, legacyShared: false }),
+      multiMember: async () => true,
+      runnerFor: dockerRunner,
+      bindingFor: async () => null,
+      enterAsMember: async (o) => { markMemberTerminalEntered(o.taskId, o.email); return { ok: true }; },
+      memberPreflight: async () => ({ refusals: {}, credentialMissing: false }),
+      onMemberVacate: async () => {},
+      memberGraceMs: 20,
+      memberPrepareStallMs: 60,
+      launchMemberContainer: async (o) => {
+        // Longer than the bound in total, but never silent for it.
+        for (const l of lines) { await new Promise((r) => setTimeout(r, 40)); o.notify?.(l); }
+        await gate;
+        return { ok: true, container: { name: 'lazymember-task-1-aaaa', binary: 'docker', remove: async () => {} } };
+      },
+      memberContainerRunning: async () => true,
+    });
+    const alive = capture();
+    expect(await aliveUp.tryUpgrade(req(), alive.server)).toBe('upgraded');
+    const statuses: string[] = [];
+    const prepared = prepareSocket(alive.upgrades[0]!, (m) => statuses.push(m));
+    await new Promise((r) => setTimeout(r, 130));
+    finish();
+    expect(await prepared).toEqual({ ok: true });
+    // The build's own lines reach the terminal.
+    expect(statuses).toEqual([
+      'Preparing your terminal environment…',
+      ...lines.map((l) => `Preparing your terminal: ${l}…`),
+    ]);
+    resetMemberTerminalsForTests();
+
+    const silentUp = createSessionAttachUpgrader({
+      getStorage: async () => fakeStorage() as Storage,
+      root: ROOT,
+      authenticate: async () => ({ ok: true, actor: { kind: 'user', email: 'alice@example.com' } as never, legacyShared: false }),
+      multiMember: async () => true,
+      runnerFor: dockerRunner,
+      bindingFor: async () => null,
+      enterAsMember: async (o) => { markMemberTerminalEntered(o.taskId, o.email); return { ok: true }; },
+      memberPreflight: async () => ({ refusals: {}, credentialMissing: false }),
+      onMemberVacate: async () => {},
+      memberGraceMs: 20,
+      memberPrepareStallMs: 50,
+      launchMemberContainer: () => new Promise(() => {}),
+      memberContainerRunning: async () => true,
+    });
+    const silent = capture();
+    expect(await silentUp.tryUpgrade(req(), silent.server)).toBe('upgraded');
+    const outcome = await prepareSocket(silent.upgrades[0]!);
+    expect(outcome).toEqual({ ok: false, message: expect.stringContaining('stopped making progress'), detail: expect.stringContaining('no progress') });
+    const { memberTerminalHolder } = await import('../../src/server/member-terminals');
+    expect(memberTerminalHolder(TASK.id)).toBeNull();
+    resetMemberTerminalsForTests();
   });
 });

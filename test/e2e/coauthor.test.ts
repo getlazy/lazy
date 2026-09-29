@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { writeFileSync } from 'fs';
+import { readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput } from '../helpers/assertions';
@@ -86,5 +86,23 @@ describe('Lazy co-author trailer', () => {
     for (const commit of commits) {
       expect(commit).toContain('Co-Authored-By: Lazy <noreply@getlazy.dev>');
     }
+  });
+
+  test('[git] coauthor_trailer = false omits the trailer from the accept squash', async () => {
+    // INVARIANT: the trailer is opt-out, read from the PROJECT ROOT's lazy.toml.
+    // Off means no trailer on any commit lazy writes.
+    const tomlPath = join(ctx.root, 'lazy.toml');
+    const toml = readFileSync(tomlPath, 'utf8');
+    const edited = toml.replace('[git]\n', '[git]\ncoauthor_trailer = false\n');
+    expect(edited).not.toBe(toml);
+    writeFileSync(tomlPath, edited);
+
+    const taskId = await createStartedTaskWithCommit(ctx, 'Test co-author opt-out');
+    expectSuccess(await ctx.lazy(['accept', taskId, '--yes']));
+
+    const logResult = ctx.git('log', '--format=%B', '-n', '1', 'main');
+    expect(logResult.exitCode).toBe(0);
+    expect(logResult.stdout).toContain('Accept task');
+    expect(logResult.stdout).not.toContain('Co-Authored-By: Lazy');
   });
 });

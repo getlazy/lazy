@@ -38,6 +38,7 @@ import {
   probeDaemonLockSync,
   readDaemonLockPid,
   readPid,
+  readWebPort,
   acquireDaemonLock,
   releaseDaemonLock,
   tryFlockNonBlocking,
@@ -50,6 +51,11 @@ import { expectSuccess, expectOutput } from '../helpers/assertions';
 import { makeDaemonBaseDir, removeDaemonBaseDir } from '../helpers/daemon-base-dir';
 import { pinConfig } from '../helpers/pin-config';
 import { DEAD_PID } from '../helpers/dead-pid';
+import { storageDirFor } from '../helpers/storage';
+import { startForeignProcess, type ForeignProcess } from '../helpers/foreign-process';
+
+/** The CLI entry point, for tests that need a real daemon PROCESS. */
+const LAZY_ENTRY = join(import.meta.dir, '../../src/index.ts');
 
 /** How long to wait for the daemon's own state-file repair to run (interval is 5s). */
 const REPAIR_TIMEOUT_MS = 20_000;
@@ -325,4 +331,151 @@ describe('daemon state-file ownership', () => {
     expect(acquireDaemonLock(ctx.root)).toBeNull();
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(50);
   });
+
+  /**
+   * INVARIANT: a daemon that loses the singleton lock does NOTHING to the
+   * project's store first. The losing start used to initialize storage, take
+   * `.storage-lock`, sweep member-terminal containers and start its reconcile
+   * loop before it ever asked for the daemon lock — so a second start for a
+   * running project (a fleet roll racing the reconciler on a Teams machine)
+   * could sit on the store lock under a live pid while the real daemon's every
+   * storage RPC failed with "Failed to acquire storage lock".
+   *
+   * The incumbent here is this test process holding the lock on its own fd
+   * (flock conflicts across fds even within one process). The store's
+   * `version.json` is removed first: storage initialization re-creates it, so
+   * its reappearance is proof the loser opened the store.
+   */
+  test('a start that loses the daemon lock never opens the store', async () => {
+    const incumbent = acquireDaemonLock(ctx.root);
+    expect(incumbent).not.toBeNull();
+    const versionPath = join(storageDirFor(ctx.root), 'version.json');
+    try {
+      await rm(versionPath, { force: true });
+
+      await expect(startDaemonServer({ projectRoot: ctx.root, webPort: 0 }))
+        .rejects.toThrow('Another daemon is already running');
+
+      expect(existsSync(versionPath)).toBe(false);
+      expect(existsSync(join(storageDirFor(ctx.root), '.storage-lock'))).toBe(false);
+    } finally {
+      releaseDaemonLock(incumbent!);
+    }
+  });
+
+  /**
+   * INVARIANT: a start refused before its full teardown exists gives back what
+   * it took. The daemon lock and PID file are taken first now, so a broken
+   * lazy.toml refused afterwards must not leave the lock held (in-process) or a
+   * pid file naming a daemon that never ran.
+   */
+  test('a start refused for its config leaves the lock free and no pid file', async () => {
+    const tomlPath = join(ctx.root, 'lazy.toml');
+    const good = await Bun.file(tomlPath).text();
+    await writeFile(tomlPath, good + '\n[[[not toml\n');
+    try {
+      await expect(startDaemonServer({ projectRoot: ctx.root, webPort: 0 })).rejects.toThrow(/Daemon failed to load/);
+      expect(probeDaemonLockSync(ctx.root)).toBe('free');
+      expect(existsSync(getPidPath(ctx.root))).toBe(false);
+    } finally {
+      await writeFile(tomlPath, good);
+    }
+  });
+
+  /**
+   * INVARIANT: a clean stop releases the store lock. The daemon holds it for its
+   * whole life; a stop that left `.storage-lock` behind handed the next start
+   * a lock naming a dead (on a VM, soon recycled) pid.
+   */
+  test('a clean stop removes the store lock', async () => {
+    daemon = await startDaemonServer({ projectRoot: ctx.root, webPort: 0 });
+    const lockPath = join(storageDirFor(ctx.root), '.storage-lock');
+    expect(await waitFor(() => existsSync(lockPath), 20_000)).toBe(true);
+    await daemon.stop();
+    daemon = undefined;
+    expect(existsSync(lockPath)).toBe(false);
+  }, 40_000);
+});
+
+describe('a daemon that cannot open its store says so on /daemon/status', () => {
+  let ctx: TestContext;
+  let daemonBaseDir: string;
+  let restoreBaseDir: string | undefined;
+  let restoreConfig: (() => void) | undefined;
+  let subprocess: ReturnType<typeof Bun.spawn> | undefined;
+  let holder: ForeignProcess | undefined;
+
+  beforeEach(async () => {
+    ctx = await setupTestLazy();
+    daemonBaseDir = await makeDaemonBaseDir();
+    restoreBaseDir = process.env.LAZY_DAEMON_BASE_DIR;
+    process.env.LAZY_DAEMON_BASE_DIR = daemonBaseDir;
+    restoreConfig = pinConfig(ctx.root);
+  });
+
+  afterEach(async () => {
+    if (subprocess) {
+      subprocess.kill('SIGTERM');
+      await subprocess.exited;
+      subprocess = undefined;
+    }
+    holder?.kill();
+    holder = undefined;
+    restoreConfig?.();
+    if (restoreBaseDir === undefined) delete process.env.LAZY_DAEMON_BASE_DIR;
+    else process.env.LAZY_DAEMON_BASE_DIR = restoreBaseDir;
+    await removeDaemonBaseDir(daemonBaseDir);
+    await ctx.cleanup();
+  });
+
+  /**
+   * INVARIANT: a daemon whose store is held by another live process reports it
+   * on its health probe. The daemon holds its store for its whole life, so one
+   * that cannot get it answers every storage RPC with "Failed to acquire storage
+   * lock" for as long as the other holder lives — while `/daemon/status`, which
+   * never touches storage, looked perfectly healthy. That is how a Teams
+   * project sat wedged for hours with its fleet supervisor reporting it up;
+   * `storeUnavailable` is what lets the supervisor recognise it and restart the
+   * project instead.
+   */
+  test('reports storeUnavailable while another live process holds the store', async () => {
+    holder = await startForeignProcess(ctx.root, 'lazy-store-holder');
+    await writeFile(join(storageDirFor(ctx.root), '.storage-lock'), JSON.stringify({
+      pid: holder.pid,
+      acquired_at: new Date().toISOString(),
+      holder_started_at: holder.identity.started,
+      holder_start_source: holder.identity.startedSource,
+    }));
+
+    // A real daemon process, as production runs it: in-process, bun test
+    // counts the daemon's own logged storage failures as the test's.
+    const env: Record<string, string> = { ...(process.env as Record<string, string>), LAZY_DAEMON_BASE_DIR: daemonBaseDir };
+    delete env.LAZY_TEST;
+    subprocess = Bun.spawn(['bun', 'run', LAZY_ENTRY, 'daemon', 'start', '--foreground', '--project', ctx.root], {
+      env, cwd: ctx.root, stdout: 'ignore', stderr: 'ignore',
+    });
+    const statusBody = async (): Promise<{ storeUnavailable?: { since: string; error: string } } | null> => {
+      const port = readWebPort(ctx.root);
+      if (port === null) return null;
+      try {
+        return await (await fetch(`http://127.0.0.1:${port}/daemon/status`)).json() as { storeUnavailable?: { since: string; error: string } };
+      } catch {
+        return null; // not listening yet
+      }
+    };
+
+    const reported = await waitFor(async () => {
+      const body = await statusBody();
+      return !!body?.storeUnavailable && body.storeUnavailable.error.includes('Failed to acquire storage lock');
+    }, 90_000, 500);
+    expect(reported).toBe(true);
+
+    // And it clears once the holder is gone and the store opens.
+    holder.kill();
+    const cleared = await waitFor(async () => {
+      const body = await statusBody();
+      return body !== null && body.storeUnavailable === undefined;
+    }, 60_000, 500);
+    expect(cleared).toBe(true);
+  }, 150_000);
 });

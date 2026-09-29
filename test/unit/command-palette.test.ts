@@ -80,7 +80,7 @@ describe('searchResultHref', () => {
       entity_type: 'conversation',
       entity_id: 'sess-1',
       task_id: 'sess-1',
-    })).toBe('/conversations/sess-1');
+    })).toBe('/builders/sess-1');
 
     expect(searchResultHref({
       entity_type: 'memory',

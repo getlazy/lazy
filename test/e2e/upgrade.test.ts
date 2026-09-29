@@ -174,52 +174,21 @@ describe('lazy upgrade', () => {
     expectOutput(result, 'Wait for all working tasks to block before upgrading');
   });
 
-  // --- Credential preflight ---
+  // --- No credential preflight ---
   //
-  // REGRESSION (observed live on the first upgrade to v0.20): the upgrade ran to
-  // completion — stopping every container and rebuilding the image and binary —
-  // and only then did the daemon's credential gate refuse to start the daemon.
-  // The condition was knowable before anything was touched, so it must abort up
-  // front, leaving the running daemon and builders alone.
-  //
-  // LAZY_FORCE_CRED_PREFLIGHT is the test-only hatch that runs the real decision
-  // under LAZY_TEST (where no daemon is ever started, so the check is skipped).
-  const NO_CREDENTIALS = {
-    LAZY_FORCE_CRED_PREFLIGHT: '1',
-    ANTHROPIC_API_KEY: '',
-    CLAUDE_CODE_OAUTH_TOKEN: '',
-  };
-
-  test('aborts before stopping or rebuilding anything when no credential is set', async () => {
-    const result = await ctx.lazy(['upgrade', '--force'], { env: NO_CREDENTIALS });
-
-    expectFailure(result);
-    expectError(result, 'Upgrade aborted before any changes were made');
-    expectError(result, 'Nothing was stopped, rebuilt, or changed');
-    // The gate's own actionable remedy, surfaced BEFORE the damage.
-    expectError(result, 'CLAUDE_CODE_OAUTH_TOKEN');
-    // Nothing was stopped and nothing was built.
-    expectOutputExcludes(result, 'Rebuilding...');
-    expectOutputExcludes(result, 'Stopping');
-    expectOutputExcludes(result, 'Upgrade complete');
-  });
-
-  // A dry run changes nothing by design, so the failing preflight is a warning
-  // there — but it must still be surfaced, since it is what a real run aborts on.
-  test('--dry-run warns about the missing credential instead of failing', async () => {
-    // lazyMocked: the dry-run path probes runner availability, which needs the
-    // docker mock. The mock helper's fake ANTHROPIC_API_KEY is a default, so
-    // NO_CREDENTIALS still clears it.
+  // INVARIANT: an upgrade does not need a model credential. It used to abort up
+  // front without one, because the daemon it restarts refused to start without
+  // one; the daemon now starts with none and only a TURN requires a credential
+  // (src/daemon/credential-gate.ts), so there is nothing to preflight.
+  test('--dry-run with no credential in the environment does not predict an abort', async () => {
     const result = await ctx.lazyMocked(['upgrade', '--dry-run'], MOCK_CLAUDE_SUCCESS, {
-      env: NO_CREDENTIALS,
+      env: { ANTHROPIC_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '' },
     });
 
     expectSuccess(result);
     expectOutput(result, 'Upgrade dry run:');
-    expectOutput(result, 'A real upgrade would abort immediately');
-    // Same provider-aware remedy the abort path prints — not the pre-`lazy auth`
-    // "Set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY" line.
-    expectOutput(result, 'lazy auth set');
+    expectOutputExcludes(result, 'would abort');
+    expectOutputExcludes(result, 'Upgrade aborted');
   });
 
   // --- Non-disruptive image refresh (lazy upgrade --images) ---

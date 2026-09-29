@@ -35,6 +35,9 @@ import { cleanupWorktree } from '../../task/cleanup';
 import { createRunnerFromType } from '../../runner';
 import { removeLazyImage, resolveImageName, type LazyImageInfo } from '../../capture/claude';
 import { runGit } from '../../utils/git';
+import { manualHeadRemedy, repairTaskWorktreeHead, repairWorktreeGitPointers, scanTaskWorktreeHeads, scanWorktreeGitPointers, validateWorktreeGitPointers } from '../../git/worktree-pointers';
+import { taskWorktreeBranches } from '../../task/worktree-branches';
+import { describeNestedGit, notUnderLiveTurn, QUARANTINE_INFIX, quarantineReport, scanProjectNestedGit } from '../../git/nested-git';
 import { queryResumeTask } from '../../daemon/rpc-fallback';
 import {
   applyLocalCommandCleanup,
@@ -666,4 +669,109 @@ export async function commandDoctorCleanLocalCommandConversations(
     );
     if (deleted + alreadyGone < plan.emptied.length) process.exitCode = 1;
   });
+}
+
+/**
+ * `lazy doctor --repair-git-pointers`: rewrite tampered task-worktree git
+ * pointers to what lazy created (src/git/worktree-pointers.ts). The daemon's
+ * sweep does the same every tick; this is the explicit, visible form.
+ */
+export async function commandDoctorRepairGitPointers(root: string, opts: RemedyOptions): Promise<void> {
+  const tampered = (await scanWorktreeGitPointers(root)).filter(r => r.state === 'tampered');
+  const branches = await withDoctorStorage(root, taskWorktreeBranches);
+  const allHeads = await scanTaskWorktreeHeads(root, branches);
+  // A real checkout of another branch is the human's to undo — never counted
+  // as repairable, never touched; the listing says what to run instead.
+  const heads = allHeads.filter(r => !r.manual);
+  const manual = allHeads.filter(r => r.manual);
+  // Nested repositories (src/git/nested-git.ts): never moved under a live turn.
+  const nestedScan = await withDoctorStorage(root, storage => scanProjectNestedGit(root, storage));
+  const nested = nestedScan.filter(r => r.findings.length > 0 && notUnderLiveTurn(r.task));
+  const nestedLive = nestedScan.filter(r => r.findings.length > 0 && !notUnderLiveTurn(r.task));
+  if (tampered.length === 0 && allHeads.length === 0 && nested.length === 0) {
+    console.log("Every task worktree's git pointers are what lazy created, and none holds a nested repository — nothing to repair.");
+    for (const r of nestedLive) console.log(theme.warning(`  ${r.name} holds ${describeNestedGit(r.findings)}, left alone while its turn runs.`));
+    return;
+  }
+  if (tampered.length > 0) {
+    console.log(`${tampered.length} task worktree(s) have git pointers lazy did not write:\n`);
+    for (const r of tampered) console.log(`  ${r.name} — ${theme.warning(r.problem!)}`);
+    console.log('');
+  }
+  if (heads.length > 0) {
+    console.log(`${heads.length} task worktree(s) have HEAD off their task's own branch:\n`);
+    for (const r of heads) console.log(`  ${r.name} — ${theme.warning(`HEAD ${r.problem}`)} (task branch ${r.branch})`);
+    console.log('');
+  }
+  if (manual.length > 0) {
+    console.log(`${manual.length} task worktree(s) are checked out on another branch — lazy will not repair these:\n`);
+    for (const r of manual) console.log(`  ${r.name} — ${theme.warning(`HEAD ${r.problem}`)}; ${manualHeadRemedy(r.path, r.branch)}`);
+    console.log('');
+  }
+  if (nested.length > 0) {
+    console.log(`${nested.length} task worktree(s) hold nested git repositories their base branch does not have:\n`);
+    for (const r of nested) console.log(`  ${r.name} — ${theme.warning(describeNestedGit(r.findings))}`);
+    console.log('');
+  }
+  for (const r of nestedLive) console.log(theme.warning(`  ${r.name} holds ${describeNestedGit(r.findings)}, left alone while its turn runs.`));
+  const total = tampered.length + heads.length + nested.length;
+  if (total === 0) {
+    console.log('Nothing lazy can repair on its own — run the commands above in those worktrees.');
+    return;
+  }
+  if (tampered.length + heads.length > 0) {
+    console.log(theme.separator(
+      "  Each worktree's .git, commondir and gitdir files are rewritten to what lazy created; a config.worktree is removed;",
+    ));
+    console.log(theme.separator(
+      "  a HEAD redirected without moving the index is pointed back at the task's own branch. No commit, branch or working file is touched.",
+    ));
+  }
+  if (nested.length > 0) {
+    console.log(theme.separator(
+      `  Each nested repository is moved aside (renamed to .git${QUARANTINE_INFIX}<n>, or a bare repository's HEAD renamed the same way) — nothing is deleted.`,
+    ));
+  }
+  console.log('');
+  if (opts.dryRun) {
+    console.log(`Dry run — nothing repaired. Drop ${theme.command('--dry-run')} to apply.`);
+    return;
+  }
+  if (!(await confirmRemedy(`Repair ${total} worktree(s)?`, opts.yes))) {
+    console.log('Aborted — nothing was repaired.');
+    return;
+  }
+  let repaired = 0;
+  for (const r of tampered) {
+    try {
+      await repairWorktreeGitPointers(root, r.path);
+      await validateWorktreeGitPointers(root, r.path);
+      console.log(theme.success(`  Repaired ${r.name}`));
+      repaired++;
+    } catch (err) {
+      console.log(theme.error(`  Failed to repair ${r.name}: ${err instanceof Error ? err.message : String(err)}`));
+    }
+  }
+  // HEADs second: HEAD is read through the pointers just repaired. The repair
+  // re-checks the index itself and refuses if it moved since the scan.
+  for (const r of heads) {
+    try {
+      await repairTaskWorktreeHead(root, r.path, r.branch);
+      console.log(theme.success(`  Pointed ${r.name}'s HEAD back at ${r.branch}`));
+      repaired++;
+    } catch (err) {
+      console.log(theme.error(`  Failed to repair ${r.name}'s HEAD: ${err instanceof Error ? err.message : String(err)}`));
+    }
+  }
+  for (const r of nested) {
+    try {
+      const q = await quarantineReport(root, r);
+      if (q.error) throw new Error(q.error);
+      console.log(theme.success(`  Quarantined in ${r.name}: ${q.moved.map(m => m.rel).join(', ')}`));
+      repaired++;
+    } catch (err) {
+      console.log(theme.error(`  Failed to quarantine in ${r.name}: ${err instanceof Error ? err.message : String(err)}`));
+    }
+  }
+  reportRemedyOutcome('Repaired', repaired, total, 'worktree(s)');
 }

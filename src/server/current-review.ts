@@ -24,7 +24,7 @@ import {
 } from './review';
 import { askThreadIsCurrent, withdrawRefusalReason } from './review-actions';
 import { busyGateAttributes, busyUnblockAcceptReason } from './review';
-import { isHumanFeedbackComment } from '../task/queued-feedback';
+import { countQueuedHumanFeedback } from '../task/queued-feedback';
 import {
   reviewEndVerbUnavailableReason,
   taskVerbUnavailableReason,
@@ -40,6 +40,8 @@ import { attributionLabel } from '../actor-ref';
 
 export interface CurrentReviewInput {
   task: Task;
+  /** The daemon judged the task's next turn paused: Unblock offers "let this turn through". */
+  usagePaused?: boolean;
   comments: ReviewComment[];
   /**
    * Task comments the agent has not been shown yet, oldest first — resolved by
@@ -64,6 +66,12 @@ export interface CurrentReviewInput {
   verifyProgress?: { verified: number; total: number };
   /** Session turns — used to decide whether Accept should offer a formal review. */
   turns?: ReviewTurnLike[];
+  /**
+   * Protected files lazy RESTORED to their base after a reviewer rejected them
+   * (src/protection/reverted-files.ts). Absent from the diff, so the page says
+   * so beside the checklist: the tree being accepted holds lazy's own commit.
+   */
+  restoredProtectedFiles?: readonly string[];
   /** Codes shared by more than one task — this page's task links fall back to the id. */
   duplicatedCodes?: ReadonlySet<string>;
   /**
@@ -193,7 +201,7 @@ function acceptChecklistHtml(
           ` <a class="rv-hint" href="#lz-review-queued">→ Queued comments</a></li>`;
       case 'file':
         // Land on the file's Changes card, not the top of the tab.
-        return `<li class="lz-gate-item"><code>${escapeHtml(row.file)}</code> has no decision` +
+        return `<li class="lz-gate-item"><code>${escapeHtml(row.file)}</code> ${row.rejected ? 'was rejected — the next unblock restores it' : 'has no decision'}` +
           ` <a class="rv-hint" href="/tasks/${t}/changes#${escapeHtml(fileSectionId(row.file))}">→ Changes</a></li>`;
     }
   });
@@ -266,8 +274,7 @@ function rejectFormHtml(taskId: string, reason: string | null): string {
  * lists every queued comment; this is the subset that gates.
  */
 function queuedFeedbackCount(input: CurrentReviewInput): number {
-  return pendingDeliveryComments(input.comments).length +
-    (input.queuedNotes ?? []).filter(isHumanFeedbackComment).length;
+  return countQueuedHumanFeedback(input.queuedNotes ?? [], pendingDeliveryComments(input.comments).length);
 }
 
 function reviewEndActionsHtml(input: CurrentReviewInput): string {
@@ -298,6 +305,7 @@ function reviewEndActionsHtml(input: CurrentReviewInput): string {
       duplicatedCodes: input.duplicatedCodes,
       queuedCount: queued.length + (input.queuedNotes?.length ?? 0),
       queuedFeedback: queuedFeedbackCount(input),
+      usagePaused: input.usagePaused,
     })}
     <div class="lz-review-terminals">
       ${rejectFormHtml(seg, rejectReason)}
@@ -384,9 +392,22 @@ export function currentReviewHtml(input: CurrentReviewInput): string {
     ${input.remedy ? remedyPanelHtml(seg, input.remedy, input.draft) : ''}
     ${finalBannerHtml(input.final)}
     ${acceptChecklistHtml(seg, buildAcceptGate({ turns: input.turns ?? [], raisedItems: input.raisedItems, fileViolations: input.fileViolations, taskMetadata: task.metadata, queuedComments: queuedFeedbackCount(input) }))}
+    ${restoredProtectedFilesHtml(input.restoredProtectedFiles ?? [])}
     ${queuedBlock}
     ${askBlock}
     ${proseThreadsFallbackHtml(seg, groupThreads(comments))}
     ${reviewEndActionsHtml(input)}
   </section>`;
+}
+
+/**
+ * Non-blocking note beside the accept checklist: which protected files lazy
+ * restored to their base after a Reject. They are no longer in the diff, so
+ * without this the reviewer cannot tell "restored by lazy" from "never touched".
+ */
+export function restoredProtectedFilesHtml(files: readonly string[]): string {
+  if (files.length === 0) return '';
+  const list = files.map((f) => `<code>${escapeHtml(f)}</code>`).join(', ');
+  return `<p class="rv-hint" id="restored-protected-files">Lazy restored ${files.length === 1 ? 'a rejected protected file' : `${files.length} rejected protected files`} to ${files.length === 1 ? 'its' : 'their'} base version: ${list}. ` +
+    `${files.length === 1 ? 'It is' : 'They are'} not in the diff, and the work you accept contains lazy's own restore commit — check that the agent made the rest of the work fit.</p>`;
 }

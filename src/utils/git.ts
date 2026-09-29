@@ -6,6 +6,37 @@ import { existsSync } from 'node:fs';
 import { logger } from './logger';
 import { spawn } from './spawn';
 import { annotateDubiousOwnership } from './git-ownership';
+import { refuseTamperedWorktreeGit, taskWorktreeOf } from '../git/worktree-pointers';
+import { resolveGitAuthorForArgs } from '../identity/git-author';
+import { isManagedMode } from '../config/managed-mode';
+
+/**
+ * Config every git lazy runs in a task worktree carries, as `GIT_CONFIG_*`
+ * env — command-scope, so it outranks any repository config and a child git
+ * inherits it. A task can plant a nested repository and stage it as a gitlink;
+ * git then asks it whether it is dirty by running `git status` INSIDE it, under
+ * that repository's config (core.fsmonitor, filter drivers). `dirty` stops
+ * that question for status, diff and commit, and `core.fsmonitor=false` stops
+ * the hook even where git still asks (`git add` does — lazy_commit refuses to
+ * stage while a nested repository is present, see ../git/nested-git.ts).
+ */
+export const TASK_WORKTREE_GIT_CONFIG: ReadonlyArray<readonly [string, string]> = [
+  ['diff.ignoreSubmodules', 'dirty'],
+  ['core.fsmonitor', 'false'],
+];
+
+/** `GIT_CONFIG_*` env carrying {@link TASK_WORKTREE_GIT_CONFIG}, appended after any the caller already set. */
+export function taskWorktreeGitEnv(base: Record<string, string | undefined>): Record<string, string> {
+  const n = Number.parseInt(base.GIT_CONFIG_COUNT ?? '0', 10);
+  const start = Number.isFinite(n) && n > 0 ? n : 0;
+  const env: Record<string, string> = {};
+  TASK_WORKTREE_GIT_CONFIG.forEach(([k, v], i) => {
+    env[`GIT_CONFIG_KEY_${start + i}`] = k;
+    env[`GIT_CONFIG_VALUE_${start + i}`] = v;
+  });
+  env.GIT_CONFIG_COUNT = String(start + TASK_WORKTREE_GIT_CONFIG.length);
+  return env;
+}
 
 export interface GitResult {
   stdout: string;
@@ -70,6 +101,17 @@ export async function runGit(args: string[], opts?: RunGitOptions | string): Pro
     };
   }
 
+  // Second line of the git-pointer boundary (../git/worktree-pointers.ts): in
+  // a lazy task worktree, never run git until its three pointer files are
+  // what lazy created — a task that redirected them would have THIS git (the
+  // daemon's commit, sync, accept) execute its code. Three small reads.
+  if (options.cwd) {
+    const refusal = await refuseTamperedWorktreeGit(options.cwd);
+    if (refusal) {
+      logger.error(refusal);
+      return { stdout: '', stderr: refusal, exitCode: 128 };
+    }
+  }
   const spawnOpts: Record<string, unknown> = {
     stdout: stdoutMode,
     stderr: stderrMode,
@@ -77,7 +119,31 @@ export async function runGit(args: string[], opts?: RunGitOptions | string): Pro
   if (options.cwd) spawnOpts.cwd = options.cwd;
   if (options.stdin) spawnOpts.stdin = options.stdin;
   if (options.env) spawnOpts.env = { ...process.env, ...options.env };
+  if (options.cwd && taskWorktreeOf(options.cwd)) {
+    const base = (spawnOpts.env as Record<string, string | undefined> | undefined) ?? process.env;
+    spawnOpts.env = { ...base, ...taskWorktreeGitEnv(base) };
+  }
   if (options.timeout !== undefined) spawnOpts.timeout = options.timeout;
+
+  // A commit the daemon makes names its author explicitly — never git's
+  // auto-detect, which on a managed host has no config and refuses
+  // (../identity/git-author.ts). Only commit-creating calls resolve anything,
+  // and a caller that set the author env itself keeps it. On a laptop so does
+  // a daemon whose own environment exports one (a per-project identity); on a
+  // managed host a process-wide value would name one account for every
+  // member, so it is overridden there.
+  const ambientAuthor = !isManagedMode() && !!process.env.GIT_AUTHOR_EMAIL;
+  if (!options.env?.GIT_AUTHOR_EMAIL && !ambientAuthor) {
+    const authorship = await resolveGitAuthorForArgs(args);
+    if (authorship && 'refusal' in authorship) {
+      logger.error(authorship.refusal);
+      return { stdout: '', stderr: authorship.refusal, exitCode: 128 };
+    }
+    if (authorship) {
+      const base = (spawnOpts.env as Record<string, string | undefined> | undefined) ?? process.env;
+      spawnOpts.env = { ...base, ...authorship.env };
+    }
+  }
 
   try {
     const proc = spawn(['git', ...args], spawnOpts) as any;
@@ -133,22 +199,29 @@ export async function findWorktreeForBranch(
   // ...
   const lines = listResult.stdout.split('\n');
   let currentWorktreePath: string | null = null;
+  const found: string[] = [];
 
   for (const line of lines) {
     if (line.startsWith('worktree ')) {
       currentWorktreePath = line.substring('worktree '.length);
     } else if (line.startsWith('branch ')) {
       const branchRef = line.substring('branch '.length);
-      if (branchRef === `refs/heads/${branch}`) {
-        return currentWorktreePath;
-      }
+      if (branchRef === `refs/heads/${branch}` && currentWorktreePath) found.push(currentWorktreePath);
     } else if (line === '') {
       // Empty line marks end of worktree entry
       currentWorktreePath = null;
     }
   }
 
-  return null;
+  // Two worktrees on one branch is a redirected task HEAD, never git's doing
+  // (see assertSingleWorktreeForBranch in src/git/operations.ts).
+  if (found.length > 1) {
+    throw new Error(
+      `Refusing to act on ${branch}: ${found.length} worktrees have HEAD on it (${found.join(', ')}). ` +
+      `A task pointed its HEAD at a branch it does not own; see \`lazy doctor\`.`,
+    );
+  }
+  return found[0] ?? null;
 }
 
 /**

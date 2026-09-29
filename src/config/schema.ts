@@ -34,7 +34,7 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
   session: ['verbose', 'debug', 'auto_commit_instructions'],
   data: ['path'],
   storage: ['backend', 'external_path'],
-  git: ['default_branch_prefix', 'lfs_check'],
+  git: ['default_branch_prefix', 'lfs_check', 'coauthor_trailer'],
   output: ['shortid_length'],
   // `graceful_exit_timeout_ms` is the pre-rename spelling of
   // `wind_down_timeout_ms`. Kept known (not unknown) so an existing lazy.toml
@@ -61,7 +61,7 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
   // profile key nobody classified is a key a shared host would honour from an
   // untrusted repository, and `endpoint` is where the real model credential
   // goes.
-  agents: ['harness', 'model', 'endpoint', 'credential'],
+  agents: ['harness', 'model', 'endpoint', 'credential', 'description'],
   builder: ['effort'],
   chattiness: ['default', 'builder', 'agent'],
   server: ['port', 'sync_interval', 'bind', 'dashboard_url'],

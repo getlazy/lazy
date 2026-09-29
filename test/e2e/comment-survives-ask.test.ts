@@ -5,6 +5,21 @@ import { createTask } from '../helpers/fixtures';
 import { successScenario } from '../helpers/fake-claude';
 
 /**
+ * The one prompt that carried a given unblock message. Selected by content, not
+ * position: with `[review] mode = low_high` a work turn is followed by
+ * self-review, revise and wrap-up invocations on the same session, so the LAST
+ * prompt is not the one the unblock produced.
+ */
+async function promptCarrying(ctx: TestContext, feedback: string): Promise<string> {
+  const prompts = (await ctx.claudeInvocations())
+    .filter(i => i.argv.includes('-p'))
+    .map(i => i.argv.join('\n'))
+    .filter(p => p.includes(feedback));
+  expect(prompts).toHaveLength(1);
+  return prompts[0];
+}
+
+/**
  * A queued comment survives an intervening `lazy ask`.
  *
  * "Never lose human feedback" is lazy's first invariant, and the notes cutoff
@@ -71,8 +86,7 @@ describe('a queued comment survives an intervening ask', () => {
     expectSuccess(await ctx.lazy(['unblock', taskId, '--message', 'Fix the retry path']));
     expectSuccess(await ctx.lazy(['wait', taskId]));
 
-    const turnInvocations = (await ctx.claudeInvocations()).filter(i => i.argv.includes('-p'));
-    const unblockPrompt = turnInvocations[turnInvocations.length - 1].argv.join('\n');
+    const unblockPrompt = await promptCarrying(ctx, 'Fix the retry path');
     expect(unblockPrompt).toContain('NOTES ADDED SINCE YOUR LAST TURN');
     expect(unblockPrompt).toContain('REVIEW NOTE: the retry path swallows errors');
     expect(unblockPrompt).toContain('Fix the retry path');
@@ -104,11 +118,14 @@ describe('a queued comment survives an intervening ask', () => {
     expectSuccess(await ctx.lazy(['unblock', taskId, '--message', 'second feedback']));
     expectSuccess(await ctx.lazy(['wait', taskId]));
 
-    const turnInvocations = (await ctx.claudeInvocations()).filter(i => i.argv.includes('-p'));
-    const first = turnInvocations[turnInvocations.length - 2].argv.join('\n');
-    const second = turnInvocations[turnInvocations.length - 1].argv.join('\n');
+    const first = await promptCarrying(ctx, 'first feedback');
+    const second = await promptCarrying(ctx, 'second feedback');
     expect(first).toContain('REVIEW NOTE: only once please');
     expect(second).toContain('second feedback');
     expect(second).not.toContain('REVIEW NOTE: only once please');
+    // Across EVERY prompt, self-review/revise/wrap-up included: carried once.
+    const carriers = (await ctx.claudeInvocations())
+      .filter(i => i.argv.includes('-p') && i.argv.join('\n').includes('REVIEW NOTE: only once please'));
+    expect(carriers).toHaveLength(1);
   }, 180_000);
 });

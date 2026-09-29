@@ -1,7 +1,10 @@
 import { join, dirname } from 'path';
-import { LAZY_COAUTHOR_TRAILER } from '../constants';
+import { assertTaskWorktreeHead, removeTaskGitPointerCopies, taskWorktreeOf } from './worktree-pointers';
+import { withLazyCoauthorTrailer } from '../constants';
 import { logger } from '../utils/logger';
 import { runGit } from '../utils/git';
+import { ensureLazyExcludeBestEffort } from './lazy-exclude';
+import { unquoteGitPath } from './quote-path';
 import { withRemoteRetry } from '../utils/retry';
 import { pathExists, ensureDir, stat, copyFile, chmod } from '../utils/fs';
 import { TaskMutex } from '../utils/task-mutex';
@@ -135,23 +138,39 @@ export async function findWorktreeForBranch(branch: string, cwd?: string): Promi
   const lines = result.stdout.split('\n');
 
   let currentPath: string | null = null;
+  const found: string[] = [];
   for (const line of lines) {
     if (line.startsWith('worktree ')) {
       currentPath = line.slice('worktree '.length);
     } else if (line.startsWith('branch refs/heads/') && currentPath) {
       const branchName = line.slice('branch refs/heads/'.length);
-      if (branchName === branch) {
-        return currentPath;
-      }
+      if (branchName === branch) found.push(currentPath);
     } else if (line === '') {
       currentPath = null;
     }
   }
+  assertSingleWorktreeForBranch(branch, found);
+  return found[0] ?? null;
+}
 
-  return null;
+/**
+ * git never checks one branch out in two worktrees on its own; two claiming it
+ * means a task rewrote its HEAD to name another task's branch. Merging in the
+ * wrong one would leave the real owner's worktree behind its branch, and its
+ * next commit would revert the merge — so refuse, naming every claimant.
+ */
+export function assertSingleWorktreeForBranch(branch: string, worktrees: string[]): void {
+  if (worktrees.length > 1) {
+    throw new Error(
+      `Refusing to merge into ${branch}: ${worktrees.length} worktrees have HEAD on it (${worktrees.join(', ')}). ` +
+      `A task pointed its HEAD at a branch it does not own; see \`lazy doctor\` and ` +
+      `\`lazy doctor --repair-git-pointers\`.`,
+    );
+  }
 }
 
 export async function createWorktree(path: string, branch: string, cwd?: string): Promise<void> {
+  await ensureLazyExcludeBestEffort(cwd ?? process.cwd());
   // Try creating with new branch first
   const result = await runGit(['worktree', 'add', path, '-b', branch], { cwd });
   if (result.exitCode === 0) return;
@@ -168,6 +187,9 @@ export async function removeWorktree(path: string, cwd?: string): Promise<void> 
   if (result.exitCode !== 0) {
     throw new Error(`git worktree remove failed: ${result.stderr}`);
   }
+  // The worktree's read-only git pointer copies (./worktree-pointers.ts) go with it.
+  const wt = taskWorktreeOf(path);
+  if (wt) await removeTaskGitPointerCopies(wt.projectRoot, wt.worktreePath);
 }
 
 export interface NewCommitsOptions {
@@ -414,6 +436,9 @@ async function runSquashMergeCommitLocked(
   commitMessage: string,
   cwd: string
 ): Promise<void> {
+  // The merge commits on whatever HEAD names: in a task worktree that must be
+  // the target branch, never one the task redirected HEAD to.
+  await assertTaskWorktreeHead(cwd, targetBranch);
   // Stale index.lock from a crashed earlier git permanently wedges accept into
   // this worktree. Clear it only with evidence that no process has it open.
   await clearStaleIndexLock(cwd);
@@ -539,6 +564,9 @@ export async function squashMergeBranchIntoTarget(
   // in that worktree, where the branch is already checked out.
   const worktreePath = await findWorktreeForBranch(targetBranch, cwd);
   if (worktreePath) {
+    // Before the dirty-worktree stash/reset below: a refused merge must not
+    // stash and reset another task's worktree first.
+    await assertTaskWorktreeHead(worktreePath, targetBranch);
     // A squash merge stages changes into the worktree's index and updates its
     // working files. If the worktree has unrelated uncommitted work, running the
     // merge directly would entangle with it. We must NOT refuse the accept just
@@ -725,6 +753,81 @@ export async function getDiffFull(fromRef: string, toRef: string = 'HEAD', cwd?:
   return output;
 }
 
+/** One file of a diff, from `git diff --numstat` — no hunks, no patch text. */
+export interface DiffFileEntry {
+  /** Post-image path — the path the review page renders as `data-file`. */
+  path: string;
+  /** Pre-image path when the file was renamed; absent otherwise. */
+  oldPath?: string;
+  additions: number;
+  deletions: number;
+  /** Git reports no line counts for a binary file. */
+  binary: boolean;
+}
+
+/**
+ * The files a diff touches with their +/− counts, without materialising the
+ * patch — the review page's file list, which it renders before any hunk.
+ *
+ * Same range and the same uncommitted-changes rule as `getDiffFull`, so the
+ * list names exactly the files that function would render. A file changed both
+ * in the range and on disk appears once, with the counts summed (two sections
+ * of the rendered diff, one row in the list). `-z` keeps renames and odd paths
+ * unambiguous. A failing git is an empty list, the same answer `getDiffFull`
+ * gives.
+ */
+export async function getDiffNumstat(fromRef: string, toRef: string = 'HEAD', cwd?: string, twoDot: boolean = false, paths?: string[]): Promise<DiffFileEntry[]> {
+  const range = twoDot ? `${fromRef}..${toRef}` : `${fromRef}...${toRef}`;
+  const result = await runGit(withPathspecs(['diff', '--no-color', '--numstat', '-z', range], paths), { cwd });
+  if (result.exitCode !== 0) return [];
+  const entries = parseNumstatZ(result.stdout);
+  if (toRef === 'HEAD' && await hasUncommittedChanges(cwd)) {
+    const dirty = await runGit(withPathspecs(['diff', '--no-color', '--numstat', '-z', 'HEAD'], paths), { cwd });
+    if (dirty.exitCode === 0) {
+      const byPath = new Map(entries.map((e) => [e.path, e]));
+      for (const e of parseNumstatZ(dirty.stdout)) {
+        const prior = byPath.get(e.path);
+        if (prior) {
+          prior.additions += e.additions;
+          prior.deletions += e.deletions;
+          prior.binary = prior.binary || e.binary;
+        } else {
+          entries.push(e);
+          byPath.set(e.path, e);
+        }
+      }
+    }
+  }
+  return entries;
+}
+
+/**
+ * Parse `git diff --numstat -z`. A plain record is `add\tdel\tpath\0`; a rename
+ * is `add\tdel\t\0old\0new\0`. Binary files carry `-` for both counts.
+ */
+export function parseNumstatZ(out: string): DiffFileEntry[] {
+  const tokens = out.split('\0');
+  const entries: DiffFileEntry[] = [];
+  let i = 0;
+  while (i < tokens.length) {
+    const head = tokens[i++];
+    if (!head) continue;
+    const m = /^(-|\d+)\t(-|\d+)\t(.*)$/s.exec(head);
+    if (!m) continue;
+    const binary = m[1] === '-' || m[2] === '-';
+    const additions = binary ? 0 : parseInt(m[1], 10);
+    const deletions = binary ? 0 : parseInt(m[2], 10);
+    if (m[3] === '') {
+      const oldPath = tokens[i++] ?? '';
+      const path = tokens[i++] ?? '';
+      if (path) entries.push({ path, oldPath, additions, deletions, binary });
+    } else {
+      entries.push({ path: m[3], additions, deletions, binary });
+    }
+  }
+  return entries;
+}
+
 /** The pre- and post-image paths a diff touches. */
 export interface DiffPathSets {
   /** Post-image paths — what the diff renders as `data-file`. */
@@ -764,7 +867,8 @@ export async function getDiffPathSets(
   const absorb = (stdout: string) => {
     for (const raw of stdout.split('\n')) {
       if (!raw) continue;
-      const parts = raw.split('\t');
+      // Unquoted so the allow-list matches the raw paths the review page asks for.
+      const parts = raw.split('\t').map((p, i) => (i === 0 ? p : unquoteGitPath(p)));
       const status = parts[0] ?? '';
       if (status.startsWith('R') || status.startsWith('C')) {
         if (parts[1]) oldPaths.add(parts[1]);
@@ -1329,6 +1433,7 @@ export async function applyPatch(patch: string, cwd?: string): Promise<boolean> 
  * Used when creating child tasks that branch from parent's current state
  */
 export async function createWorktreeFromSha(path: string, branch: string, startSha: string, cwd?: string): Promise<void> {
+  await ensureLazyExcludeBestEffort(cwd ?? process.cwd());
   // Create worktree with new branch starting from specified SHA
   const result = await runGit(['worktree', 'add', path, '-b', branch, startSha], { cwd });
   if (result.exitCode !== 0) {
@@ -1406,6 +1511,7 @@ export async function recoverMissingWorktree(
     return { recovered: false, branchExists: false, dirty: false };
   }
 
+  await ensureLazyExcludeBestEffort(cwd ?? process.cwd());
   // Prune stale worktree entries so git doesn't reject the add
   await runGit(['worktree', 'prune'], { cwd });
 
@@ -1806,7 +1912,7 @@ export async function mergeConflictPreview(
  * unavailable, or non-fidelity callers), we fall back to the deterministic
  * goal + commit-subjects message.
  */
-async function buildSquashCommitMessage(taskShortId: string, goal: string, sourceBranch: string, targetBranch: string, root: string, fidelityBody?: string): Promise<string> {
+async function buildSquashCommitMessage(taskShortId: string, goal: string, sourceBranch: string, targetBranch: string, root: string, fidelityBody?: string, coauthorTrailer = true): Promise<string> {
   let message = `Accept task ${taskShortId}: ${goal}`;
   const body = fidelityBody?.trim();
   if (body) {
@@ -1818,9 +1924,7 @@ async function buildSquashCommitMessage(taskShortId: string, goal: string, sourc
         commitMsgs.map(m => `  ${m}`).join('\n');
     }
   }
-  // Add Lazy co-author trailer
-  message += `\n\n${LAZY_COAUTHOR_TRAILER}`;
-  return message;
+  return withLazyCoauthorTrailer(message, coauthorTrailer);
 }
 
 /**
@@ -1837,8 +1941,9 @@ export async function squashMergeTaskBranch(
   goal: string,
   root: string,
   fidelityBody?: string,
+  coauthorTrailer = true,
 ): Promise<DestinationRestoreConflict | null> {
-  const commitMessage = await buildSquashCommitMessage(taskShortId, goal, sourceBranch, targetBranch, root, fidelityBody);
+  const commitMessage = await buildSquashCommitMessage(taskShortId, goal, sourceBranch, targetBranch, root, fidelityBody, coauthorTrailer);
   return await squashMergeBranchIntoTarget(sourceBranch, targetBranch, commitMessage, root);
 }
 
@@ -1905,4 +2010,71 @@ export async function copyUntrackedFilesIntoWorktree(
       logger.info(`Copied ${relativePath} to worktree`);
     }
   }
+}
+
+/** Who made a commit and when, as git records it. Times are ISO 8601 (UTC offset as recorded). */
+export interface CommitIdentity {
+  author_name: string;
+  author_email: string;
+  authored_at: string;
+  committer_name: string;
+  committer_email: string;
+  committed_at: string;
+}
+
+const IDENTITY_FORMAT = '%H%x1f%an%x1f%ae%x1f%aI%x1f%cn%x1f%ce%x1f%cI';
+
+function parseIdentityLines(stdout: string, into: Map<string, CommitIdentity>): void {
+  for (const line of stdout.split('\n')) {
+    const f = line.split('\x1f');
+    if (f.length !== 7) continue;
+    into.set(f[0], {
+      author_name: f[1], author_email: f[2], authored_at: f[3],
+      committer_name: f[4], committer_email: f[5], committed_at: f[6],
+    });
+  }
+}
+
+/**
+ * Author/committer identity for each of `shas`, keyed by the full SHA git
+ * resolved, in one `git log`. A SHA this repository does not know is simply
+ * absent from the answer.
+ */
+export async function getCommitIdentities(shas: string[], cwd?: string): Promise<Map<string, CommitIdentity>> {
+  const out = new Map<string, CommitIdentity>();
+  const wanted = [...new Set(shas.filter((s) => /^[0-9a-f]{4,64}$/i.test(s)))];
+  if (wanted.length === 0) return out;
+  // --ignore-missing: an unknown SHA is skipped instead of failing the batch,
+  // so this is always ONE git process however many records are gone.
+  const res = await runGit(['log', '--no-walk=unsorted', '--ignore-missing', `--format=${IDENTITY_FORMAT}`, ...wanted], { cwd });
+  if (res.exitCode !== 0) {
+    logger.warn(`getCommitIdentities: git log failed in ${cwd ?? process.cwd()} (exit ${res.exitCode}); commits render without author/time: ${res.stderr.trim()}`);
+    return out;
+  }
+  parseIdentityLines(res.stdout, out);
+  return out;
+}
+
+/**
+ * One commit's patch against its FIRST parent. Unlike `getCommitDiff` (a
+ * combined diff, empty for a clean merge), a merge shows what it brought in.
+ * Returns `missing: true` ONLY on git's own "no such commit" answer
+ * (`rev-parse --verify --quiet` exiting 1 with nothing on stderr); any other
+ * git failure throws, so an error is never shown as "no changes" or "gone".
+ */
+export async function getCommitPatch(sha: string, cwd?: string): Promise<{ patch: string; missing: boolean }> {
+  if (!/^[0-9a-f]{4,64}$/i.test(sha)) {
+    throw new Error(`getCommitPatch: '${sha}' is not a hex commit SHA`);
+  }
+  const where = cwd ?? process.cwd();
+  const exists = await runGit(['rev-parse', '--verify', '--quiet', `${sha}^{commit}`], { cwd });
+  if (exists.exitCode === 1 && exists.stderr.trim() === '') return { patch: '', missing: true };
+  if (exists.exitCode !== 0) {
+    throw new Error(`getCommitPatch: could not look up ${sha} in ${where} (exit ${exists.exitCode}): ${exists.stderr.trim()}`);
+  }
+  const r = await runGit(['show', '--no-color', '--format=', '-m', '--first-parent', sha], { cwd });
+  if (r.exitCode !== 0) {
+    throw new Error(`getCommitPatch: git show ${sha} failed in ${where} (exit ${r.exitCode}): ${r.stderr.trim()}`);
+  }
+  return { patch: r.stdout, missing: false };
 }

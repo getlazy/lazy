@@ -17,7 +17,9 @@ import { mkdtemp, rm, writeFile, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
+  allowTaskPastUsagePause,
   assertBesideLaunchAllowed,
+  taskUsagePauseAllowance,
   besideSpendCredential,
   getUsagePauseOverride,
   mayUseUsagePauseOverride,
@@ -599,13 +601,15 @@ describe('the dashboard web Pair and Chat', () => {
     expect(writes.filter((w) => w.startsWith('update'))).toEqual([]);
   });
 
-  test('a web chat the page refuses on its own terms leaves the override pending', async () => {
+  // A task's web Pair/Chat is a launch of that task: its allowance, not the
+  // daemon-wide override, is what lets it through (see "The per-task allowance").
+  test('a web chat the page refuses on its own terms leaves the task allowance pending', async () => {
     const { plan } = await pausedTask('working');
-    setUsagePauseOverride(0);
+    allowTaskPastUsagePause('aaaaaaaa-0000-4000-8000-000000000001', 'human');
     const result = await plan('chat');
     expect(result.ok).toBe(false);
     expect((result as { status: number }).status).toBe(409);
-    expect(getUsagePauseOverride()).toBe(0);
+    expect(taskUsagePauseAllowance('aaaaaaaa-0000-4000-8000-000000000001')).not.toBeNull();
   });
 });
 
@@ -838,6 +842,12 @@ describe('the real Claude header set (captured 2026-09-24)', () => {
       `${credential}: overage is off (org_level_disabled_until) — the provider stops at the limit itself.`,
     );
     expect(usagePauseBannerHtml({ ...emptyState(), coverage })).toContain('overage off');
+    // INVARIANT: an overage line alone is information, not a pause — the
+    // section is headed "Usage" and says nothing is paused. Heading it "Usage
+    // pause" told a person something was held back when nothing was.
+    const html = usagePauseBannerHtml({ ...emptyState(), coverage });
+    expect(html).toContain('<h2>Usage</h2>');
+    expect(html).toContain('Nothing is paused.');
   });
 
   // INVARIANT: overage ALLOWED is said plainly and changes nothing about
@@ -1101,10 +1111,11 @@ describe('the CLI names the override only to a person who could use it', () => {
 });
 
 describe('doctor and show name the override only to a person who could use it', () => {
-  // INVARIANT: `lazy doctor` and `lazy show` never name the override command to
+  // INVARIANT: `lazy doctor` and `lazy show` never name the way past a pause to
   // a caller the daemon would not name it to. Doctor is where every refusal
-  // points (the builder's and an agent's included); and a held subtask START
-  // is never released by the override, so show says it starts after the reset.
+  // points (the builder's and an agent's included). Changed 2026-09-26 (the
+  // engineer made the way through PER TASK): a held subtask START is released
+  // by its task's allowance like any other launch, so show offers it there too.
   test('doctor advice names the command only when offered', async () => {
     const { usagePauseAdvice } = await import('../../src/doctor/sweep');
     expect(usagePauseAdvice(false).join('\n')).not.toContain('usage_pause_threshold off');
@@ -1112,18 +1123,20 @@ describe('doctor and show name the override only to a person who could use it', 
     expect(usagePauseAdvice(true).join('\n')).toContain('lazy daemon config set usage_pause_threshold off');
   });
 
-  test('a show hold line names it only when offered, and never for a held subtask start', async () => {
+  test('a show hold line names the task allowance only when offered', async () => {
     const { usagePauseHoldLines } = await import('../../src/cli/commands/show');
     const hold = {
       credential: 'credential:CLAUDE_CODE_OAUTH_TOKEN', window: 'unified-5h', usedPercent: 97, status: null,
       threshold: 95, resetsAt: Date.now() + 3_600_000, readingAt: Date.now(), held: 'auto-resume', since: Date.now(),
     };
-    const text = (o: { heldStart: boolean; offerOverride: boolean }) => usagePauseHoldLines(hold, o).join('\n');
+    const text = (o: { heldStart: boolean; offerOverride: boolean }) =>
+      usagePauseHoldLines(hold, { ...o, taskRef: 'fix-x' }).join('\n');
     expect(text({ heldStart: false, offerOverride: false })).not.toContain('usage_pause_threshold off');
-    expect(text({ heldStart: false, offerOverride: true })).toContain('usage_pause_threshold off');
+    expect(text({ heldStart: false, offerOverride: true })).toContain('usage_pause_threshold off --task fix-x');
     const start = text({ heldStart: true, offerOverride: true });
     expect(start).toContain('starts by itself after the reset');
-    expect(start).not.toContain('usage_pause_threshold off');
+    expect(start).toContain('usage_pause_threshold off --task fix-x');
+    expect(text({ heldStart: true, offerOverride: false })).not.toContain('usage_pause_threshold');
   });
 });
 

@@ -13,7 +13,8 @@
  * without even looking for a socket (src/preconditions.ts, src/daemon/client.ts).
  * Every CLI child of a later `withDaemon: true` suite therefore refuses to talk
  * to the daemon that suite just started, and dies with
- * "Error: Daemon is not running. Start it with: lazy daemon start" — while
+ * "No daemon address is recorded for this project" (formerly "Daemon is not
+ * running. Start it with: lazy daemon start") — while
  * `lazy daemon status`, which only reads the pidfile, cheerfully reports the
  * daemon running.
  *

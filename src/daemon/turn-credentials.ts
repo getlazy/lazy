@@ -9,10 +9,11 @@
  *   the proxy forwards its auth header verbatim. Nothing here runs.
  *
  *   TEAM MODE. The turn's owner is the human who initiated it; the container
- *   gets a placeholder bound to that owner, and the proxy swaps it. A turn the
- *   daemon starts by itself (auto-deliver, sync) has no human behind it and
- *   runs on the project's SERVICE credential — and if the project has not
- *   configured one, the automation is disabled with a stated reason instead of
+ *   gets a placeholder bound to that owner, and the proxy swaps in the owner's
+ *   own credential FOR THE TURN'S AGENT PROFILE (./member-credentials.ts). A
+ *   turn the daemon starts by itself (auto-deliver, sync) has no human behind it
+ *   and runs on the project's SERVICE holder's credential for the profile — and
+ *   if there is none, the automation is disabled with a stated reason instead of
  *   quietly billing whichever member happened to touch the task last (§3.2).
  */
 
@@ -21,7 +22,6 @@ import { logger } from '../utils/logger';
 import { memberInsideTask, memberInsideLaunchMessage } from '../server/member-terminals';
 import { RpcError } from './rpc-error';
 import {
-  getServiceCredential,
   getUserCredential,
   teamModeEnabled,
   SERVICE_CREDENTIAL_USER_ID,
@@ -35,6 +35,16 @@ import {
   SESSION_TOKEN_PREFIX,
 } from './session-credentials';
 import { getPendingTurnOwner, recordSessionTurnOwner } from './turn-owner';
+import { turnCredentialRefusal } from './credential-gate';
+import { loadConfig } from '../config/loader';
+import { type AgentProfile, profileForAgentNameOrNull } from '../config/agent-profiles';
+import { credentialLabel } from '../credentials/providers';
+import {
+  NO_OWNER_PROFILE_CREDENTIAL_MARKER,
+  type MemberCredentialAnswer,
+  memberCredentialFor,
+  profileLabel,
+} from './member-credentials';
 import type { SessionCredentialLookup, SessionRequestContext } from '../proxy/session-auth';
 import type { Storage } from '../storage/interface';
 import type { TurnOwner } from '../types';
@@ -144,45 +154,190 @@ export async function planTurnCredential(
   // knowing this exists. See ./turn-owner.ts.
   if (!input.spender) await recordSessionTurnOwner(input);
 
-  if (!(await teamModeEnabled(projectRoot))) return { mode: 'daemon-env' };
+  const teamMode = await teamModeEnabled(projectRoot);
 
-  const ownerUserId = input.spender?.email ?? getTurnOwner(input.taskId);
-  if (ownerUserId) {
-    const credential = await getUserCredential(projectRoot, ownerUserId);
-    if (!credential) {
-      throw new TurnCredentialUnavailableError(
-        `${NO_OWNER_CREDENTIAL_MARKER}: this turn was initiated by user '${ownerUserId}', who has ` +
-        `no Anthropic credential stored in this daemon. The control plane must call ` +
-        `putUserCredential for that user before their turns can run.`,
-      );
-    }
-    const bound = await bindTurnCredential(projectRoot, {
-      taskId: input.taskId,
-      sessionId: input.sessionId,
-      ownerUserId,
-      kind: credential.kind,
-    });
-    return { mode: 'session', token: bound.token, kind: credential.kind, ownerUserId, kindChanged: bound.kindChanged };
+  // THE CREDENTIAL IS REQUIRED HERE, AND ONLY HERE (./credential-gate.ts): a
+  // daemon starts, clones and serves reads with none, and a turn on a profile
+  // that has none is refused now — before the status flip, naming the profile
+  // and what it lacks. Only for the task's OWN turns: a spender's launch runs
+  // beside the task on the spender's credential, which the branches below
+  // decide. In team mode every slot is left to the principal check below.
+  if (!input.spender) {
+    const refusal = await taskTurnCredentialRefusal(projectRoot, input, teamMode);
+    if (refusal) throw new TurnCredentialUnavailableError(refusal);
   }
 
-  // System-initiated: no human asked for this turn.
-  const service = await getServiceCredential(projectRoot);
-  if (!service) {
-    throw new TurnCredentialUnavailableError(systemTurnBlockedReason());
-  }
+  if (!teamMode) return { mode: 'daemon-env' };
+
+  // WHO PAYS, and for WHICH PROFILE: the person who asked (or the spender), else
+  // the project's service holder for a turn nobody asked for — each paying with
+  // their OWN credential for the profile this turn runs on
+  // (./member-credentials.ts). Never the project's store, never a teammate's.
+  const principal = input.spender?.email ?? getTurnOwner(input.taskId) ?? SERVICE_CREDENTIAL_USER_ID;
+  const profile = await turnProfile(projectRoot, input);
+  const refusal = await principalCredentialProblem(projectRoot, principal, profile);
+  if (refusal) throw new TurnCredentialUnavailableError(refusal);
+
+  // The session binding names the principal for the whole turn: the proxy reads
+  // its owner to resolve that principal's credential for every request the
+  // turn's profile makes. Its KIND decides the Anthropic env var the container's
+  // session placeholder lives in — the Claude credential's kind when the
+  // principal has one (the one the placeholder resolves to), else an inert
+  // default: a profile the Claude credential does not pay for never presents
+  // that placeholder for its model traffic.
+  const claude = await getUserCredential(projectRoot, principal);
+  const kind: UserCredentialKind = claude?.kind ?? 'api-key';
   const bound = await bindTurnCredential(projectRoot, {
     taskId: input.taskId,
     sessionId: input.sessionId,
-    ownerUserId: SERVICE_CREDENTIAL_USER_ID,
-    kind: service.kind,
+    ownerUserId: principal,
+    kind,
   });
-  return {
-    mode: 'session',
-    token: bound.token,
-    kind: service.kind,
-    ownerUserId: SERVICE_CREDENTIAL_USER_ID,
-    kindChanged: bound.kindChanged,
-  };
+  return { mode: 'session', token: bound.token, kind, ownerUserId: principal, kindChanged: bound.kindChanged };
+}
+
+/**
+ * The profile a task's turn runs on, or null when the launch is held to the
+ * principal's CLAUDE credential instead: a spender's launch (a member's
+ * terminal, a builder session, a one-shot beside the task) always rides the
+ * session placeholder to the proxy's primary upstream whatever the project's
+ * profiles say — resolving one here once let a configured profile's credential
+ * rules decide what a member's own `claude` spends — and a key that names no
+ * task has no profile at all.
+ */
+async function turnProfile(
+  projectRoot: string,
+  input: { taskId: string; storage?: Storage; agentId?: string; spender?: TurnOwner },
+): Promise<AgentProfile | null> {
+  if (input.spender) return null;
+  const task = input.storage ? await input.storage.getTask(input.taskId) : null;
+  if (!task && input.agentId === undefined) return null;
+  return profileForAgentNameOrNull(await loadConfig(projectRoot), input.agentId ?? task?.agent_id);
+}
+
+/**
+ * Why `principal` cannot pay for a turn on `profile`, or null when they can.
+ * The one place the team-mode refusals are worded, for the launch
+ * ({@link planTurnCredential}), the pre-record check and the pre-flight
+ * ({@link turnCredentialProblem}) and the automations ({@link systemTurnBlock}).
+ */
+async function principalCredentialProblem(
+  projectRoot: string,
+  principal: string,
+  profile: AgentProfile | null,
+): Promise<string | null> {
+  if (!profile) {
+    if (await getUserCredential(projectRoot, principal)) return null;
+    return principal === SERVICE_CREDENTIAL_USER_ID
+      ? systemTurnBlockedReason()
+      : ownerCredentialMissingMessage(principal, '');
+  }
+  const answer = await memberCredentialFor(projectRoot, principal, profile);
+  return refusalFor(principal, profile, answer);
+}
+
+function refusalFor(principal: string, profile: AgentProfile, answer: MemberCredentialAnswer): string | null {
+  if (answer.kind !== 'missing') return null;
+  const onProfile = ` (the turn runs on agent profile ${profileLabel(profile)})`;
+  if (principal === SERVICE_CREDENTIAL_USER_ID) {
+    if (answer.want === 'claude') return systemTurnBlockedReason(onProfile);
+    return (
+      `${NO_SERVICE_CREDENTIAL_MARKER} on agent profile "${profile.name}": turns the daemon starts by itself ` +
+      `(auto-deliver, sync) are paid by the project's service credential holder, and ${answer.detail}. ` +
+      `Connect one — putUserCredential with userId '${SERVICE_CREDENTIAL_USER_ID}' and profile ` +
+      `"${profile.name}" — to enable them. Until then these turns are disabled rather than charged to an ` +
+      `arbitrary member.`
+    );
+  }
+  if (answer.want === 'claude') return ownerCredentialMissingMessage(principal, onProfile);
+  return (
+    `${NO_OWNER_PROFILE_CREDENTIAL_MARKER} "${profile.name}": this turn was initiated by user '${principal}', ` +
+    `and ${answer.detail}. A turn on ${profileLabel(profile)} needs ${withArticle(credentialLabel(profile.credential))} ` +
+    `credential, and in a team every turn is paid by the member who asks for it — never by a teammate's or ` +
+    `the project's. The control plane must call putUserCredential for that user with profile ` +
+    `"${profile.name}" before their turns on it can run.`
+  );
+}
+
+/** "an Anthropic", "a ChatGPT subscription". */
+function withArticle(label: string): string {
+  return /^[aeiou]/i.test(label) ? `an ${label}` : `a ${label}`;
+}
+
+/**
+ * Refuse, BEFORE anything is recorded, a turn `planTurnCredential` would refuse
+ * for want of a credential. Throws `RpcError(400)` with the same text.
+ *
+ * The launch paths that record the human's turn row before planning the
+ * credential (unblock, review, ask — the order `assertNoMemberInside`
+ * explains) call this first, right after their in-lock status re-read. A
+ * refusal after the row is written leaves a half-dispatched turn behind, which
+ * the redelivery path later hands the agent as feedback nobody delivered. The
+ * human's words are not lost: every surface keeps them until a delivery
+ * succeeds (the CLI's recovery file, the review draft, Teams' ask record), and
+ * the CLI asks the same question before its editor opens.
+ *
+ * Decides exactly what `planTurnCredential` decides, binds nothing, and loads
+ * a stored daemon-env credential the same way — so the plan that follows
+ * finds it in the environment.
+ */
+export async function assertTurnCredentialAvailable(
+  projectRoot: string,
+  input: { taskId: string; storage: Storage; agentId?: string },
+): Promise<void> {
+  const refusal = await turnCredentialProblem(projectRoot, input);
+  if (refusal) throw new RpcError(400, refusal);
+}
+
+/**
+ * Why a turn for this task would be refused for want of a credential, or null
+ * when it would launch — the non-throwing form of
+ * {@link assertTurnCredentialAvailable}, and the ONE place its rules live, so
+ * the CLI pre-flight (`turnCredentialCheck`), the pre-record check and the
+ * sync gate can never disagree with each other or with `planTurnCredential`:
+ *
+ *   1. the credential the turn's PROFILE bills (`agentId` when an `--agent`
+ *      switch will change it, else the task's own) — ./credential-gate.ts;
+ *   2. in team mode, the turn OWNER's own credential for that profile when a
+ *      person asked for the turn, else the project's service holder's
+ *      (./member-credentials.ts).
+ *
+ * `owner`: omitted, it is read from the request scope exactly as a launch
+ * reads it (`getTurnOwner`); a caller outside that scope (the pre-flight RPC,
+ * which is not a turn-launching command) passes the one it resolved, and
+ * `null` for nobody. `load: false` answers from presence only (see
+ * `profileCredentialRefusal`).
+ */
+export async function turnCredentialProblem(
+  projectRoot: string,
+  input: {
+    taskId: string;
+    storage: Storage;
+    agentId?: string;
+    owner?: string | null;
+    load?: boolean;
+  },
+): Promise<string | null> {
+  const teamMode = await teamModeEnabled(projectRoot);
+  const task = await input.storage.getTask(input.taskId);
+  if (!task) return null;
+  const agentId = input.agentId ?? task.agent_id;
+  const refusal = await turnCredentialRefusal(projectRoot, agentId, {
+    perUser: teamMode,
+    ...(input.load === false ? { load: false } : {}),
+  });
+  if (refusal) return refusal;
+  if (!teamMode) return null;
+  const principal = (input.owner === undefined ? getTurnOwner(input.taskId) : input.owner) ?? SERVICE_CREDENTIAL_USER_ID;
+  return principalCredentialProblem(projectRoot, principal, await turnProfile(projectRoot, { ...input, agentId }));
+}
+
+function ownerCredentialMissingMessage(ownerUserId: string, profileNoteText: string): string {
+  return (
+    `${NO_OWNER_CREDENTIAL_MARKER}: this turn was initiated by user '${ownerUserId}', who has ` +
+    `no Anthropic credential stored in this daemon${profileNoteText}. The control ` +
+    `plane must call putUserCredential for that user before their turns can run.`
+  );
 }
 
 /**
@@ -289,15 +444,41 @@ export function assertNoMemberInside(taskId: string): void {
  * it is not. Checked by the daemon's own turn-launching automations so they
  * skip with a stated reason instead of failing at the container.
  */
-export async function systemTurnBlock(projectRoot: string): Promise<string | null> {
-  if (!(await teamModeEnabled(projectRoot))) return null;
-  if (await getServiceCredential(projectRoot)) return null;
-  return systemTurnBlockedReason();
+export async function systemTurnBlock(
+  projectRoot: string,
+  task?: { agent_id?: string | null },
+): Promise<string | null> {
+  const teamMode = await teamModeEnabled(projectRoot);
+  // The task's profile first: with no credential for it, the turn would be
+  // refused at launch whoever paid for it — say that, every tick, instead.
+  if (task) {
+    // PRESENCE ONLY: this runs on every reconciler tick, which must never open
+    // a keychain item. The launch that follows loads for real.
+    const refusal = await turnCredentialRefusal(projectRoot, task.agent_id, { perUser: teamMode, load: false });
+    if (refusal) return refusal;
+  }
+  if (!teamMode) return null;
+  const profile = task ? profileForAgentNameOrNull(await loadConfig(projectRoot), task.agent_id) : null;
+  return principalCredentialProblem(projectRoot, SERVICE_CREDENTIAL_USER_ID, profile);
 }
 
-function systemTurnBlockedReason(): string {
+/**
+ * The turn gate for the task behind `input.taskId`, or null when it may launch
+ * (or when the key names no task — a one-shot's own binding key).
+ */
+async function taskTurnCredentialRefusal(
+  projectRoot: string,
+  input: { taskId: string; storage?: Storage },
+  teamMode: boolean,
+): Promise<string | null> {
+  const task = input.storage ? await input.storage.getTask(input.taskId) : null;
+  if (!task) return null;
+  return turnCredentialRefusal(projectRoot, task.agent_id, { perUser: teamMode });
+}
+
+function systemTurnBlockedReason(onProfile = ''): string {
   return (
-    `${NO_SERVICE_CREDENTIAL_MARKER}: this project runs per-user Anthropic credentials, and turns the daemon starts by itself ` +
+    `${NO_SERVICE_CREDENTIAL_MARKER}${onProfile}: this project runs per-user credentials, and turns the daemon starts by itself ` +
     `(auto-deliver, sync) have no user to bill. Configure a project service credential — ` +
     `putUserCredential with userId '${SERVICE_CREDENTIAL_USER_ID}' — to enable them. ` +
     `Until then these turns are disabled rather than charged to an arbitrary member.`

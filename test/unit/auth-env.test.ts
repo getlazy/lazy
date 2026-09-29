@@ -10,8 +10,9 @@ import {
   applyLiveProxyUrl,
   ProxyUnavailableError,
 } from '../../src/daemon/auth-env';
-import { assertDaemonCredentials, credentialFromEnv } from '../../src/daemon/credential-gate';
+import { NO_PROFILE_CREDENTIAL_MARKER, credentialFromEnv, turnCredentialRefusal } from '../../src/daemon/credential-gate';
 import type { RoleTarget } from '../../src/config/types';
+import { RpcError } from '../../src/daemon/rpc-error';
 import { ANTHROPIC_DEFAULT_TARGET } from '../../src/config/default-target';
 import { NO_CREDENTIAL } from '../../src/config/agent-profiles';
 import { setDaemonContext, clearDaemonContext } from '../../src/daemon/context';
@@ -100,11 +101,34 @@ describe('daemon auth env', () => {
       });
     });
 
-    // INVARIANT: even though the credential gate makes a credential-less running
-    // daemon practically unreachable, this RPC must still fail hard (never return
-    // an empty credential) if the daemon env somehow lacks one.
-    test('throws an actionable error when the daemon env has no credential', async () => {
+    // INVARIANT: this RPC never returns an empty credential. A daemon may now
+    // run with none (only turns need one), so this is a real path, not a
+    // defensive one.
+    test('throws when the daemon env has no credential', async () => {
       await expect(handleGetAuthEnv(projectRoot, { proxied: false })).rejects.toThrow('Authentication required');
+    });
+
+    // INVARIANT (replaces the pair/builder "daemon refuses to start" tests): an
+    // interactive launch — `lazy pair`, `lazy chat`, `lazy builder` — on a
+    // daemon with no credential for its profile is refused by THIS RPC, with a
+    // 400 naming the profile and what it lacks, not a bare "Authentication
+    // required" and not a session that falls through to a /login prompt.
+    test('an identified launch with no credential is refused naming the profile', async () => {
+      const err = await handleGetAuthEnv(projectRoot, {
+        proxied: false, role: 'builder', label: 'pair:unit', profile: 'claude-code',
+      }).then(() => null, (e: unknown) => e);
+      expect(err).toBeInstanceOf(RpcError);
+      expect((err as RpcError).status).toBe(400);
+      expect((err as Error).message).toStartWith(`${NO_PROFILE_CREDENTIAL_MARKER} "claude-code"`);
+      expect((err as Error).message).toContain('an Anthropic credential');
+    });
+
+    test('an identified launch with the credential present is answered', async () => {
+      process.env.ANTHROPIC_API_KEY = 'daemon-api-key';
+      const result = await handleGetAuthEnv(projectRoot, {
+        proxied: false, role: 'builder', label: 'pair:unit', profile: 'claude-code',
+      });
+      expect(result.authEnvVars).toEqual([{ key: 'ANTHROPIC_API_KEY', value: 'daemon-api-key' }]);
     });
   });
 
@@ -259,72 +283,55 @@ describe('daemon auth env', () => {
     });
   });
 
-  describe('assertDaemonCredentials (the single enforcement point)', () => {
+  // The credential is required at TURN launch, for the profile the turn runs
+  // on — never at daemon start (src/daemon/credential-gate.ts). These are the
+  // presence rules the old start gate pinned, asked of the turn gate now.
+  describe('turnCredentialRefusal (the turn gate)', () => {
+    const gate = (agentId: string) => turnCredentialRefusal(projectRoot, agentId, { perUser: false });
+
     test('passes when the daemon env holds an OAuth token', async () => {
       process.env.CLAUDE_CODE_OAUTH_TOKEN = 'daemon-oauth-token';
-      await expect(assertDaemonCredentials(projectRoot)).resolves.toBeUndefined();
+      expect(await gate('claude-code')).toBeNull();
     });
 
-    // INVARIANT: the gate is the single enforcement point — a daemon started
-    // without a credential must refuse with an actionable error, never silently.
-    test('throws an actionable refusal when the daemon env has no credential', async () => {
-      await expect(assertDaemonCredentials(projectRoot)).rejects.toThrow(
-        'Daemon refuses to start',
-      );
+    // INVARIANT: a turn on a profile with no credential is refused with an
+    // actionable message naming the profile and what it lacks, never launched
+    // into a 401.
+    test('refuses, naming the profile, when the daemon env has no credential', async () => {
+      const refusal = await gate('claude-code');
+      expect(refusal).toContain(NO_PROFILE_CREDENTIAL_MARKER);
+      expect(refusal).toContain('"claude-code"');
+      expect(refusal).toContain('Anthropic');
     });
 
     // INVARIANT: a set-but-blank credential counts as ABSENT. `export
     // CLAUDE_CODE_OAUTH_TOKEN=$(claude setup-token)` leaves exactly this behind
-    // when the inner command fails, and a presence-only check let it through —
-    // producing the failure this gate exists to prevent: a daemon that runs,
-    // answers RPC, and hands every container a credential the API rejects.
-    test('throws when the credential is set but blank', async () => {
+    // when the inner command fails.
+    test('refuses when the credential is set but blank', async () => {
       process.env.CLAUDE_CODE_OAUTH_TOKEN = '   ';
-      await expect(assertDaemonCredentials(projectRoot)).rejects.toThrow(
-        'Daemon refuses to start',
-      );
+      expect(await gate('claude-code')).toContain(NO_PROFILE_CREDENTIAL_MARKER);
     });
 
-    // A blank OAuth token must not mask a real API key — the gate looks for ANY
-    // usable credential, not just the first one that happens to be set.
+    // A blank OAuth token must not mask a real API key.
     test('passes when a blank OAuth token is accompanied by a real API key', async () => {
       process.env.CLAUDE_CODE_OAUTH_TOKEN = '';
       process.env.ANTHROPIC_API_KEY = 'sk-ant-real';
-      await expect(assertDaemonCredentials(projectRoot)).resolves.toBeUndefined();
+      expect(await gate('claude-code')).toBeNull();
     });
 
-    // INVARIANT: a local model server authenticates nobody, so a project whose
-    // ROLE-DEFAULT profiles are all local must start with no Anthropic token —
-    // mirroring runner.checkAvailability(). The old spelling of this was the
-    // role-wide `[ollama]` block; the profile form is what it became, and the
-    // skip must survive the move. (The `[ollama]` block itself is now REFUSED at
-    // load — test/e2e covers that migration message.)
-    test('is skipped when every role-default profile needs no credential', async () => {
+    // INVARIANT: a local model server authenticates nobody, so a turn on a
+    // profile pointed at one needs no Anthropic token.
+    test('a profile on a local model server needs no credential', async () => {
       await writeFile(
         join(projectRoot, 'lazy.toml'),
         '[agents.local-ollama]\n' +
         'harness = "claude-code"\n' +
         'model = "qwen3:8b"\n' +
-        'endpoint = "http://localhost:11434"\n\n' +
-        '[models.roles.builder]\nagent = "local-ollama"\n\n' +
-        '[models.roles.agent]\nagent = "local-ollama"\n',
+        'endpoint = "http://localhost:11434"\n',
       );
-      await expect(assertDaemonCredentials(projectRoot)).resolves.toBeUndefined();
-    });
-
-    // ...and the other half of that rule, which is the one a broad "any local
-    // endpoint anywhere" skip would break: a MIXED project still owes a token
-    // for the role that is not local.
-    test('still demands a credential when only one role is local', async () => {
-      await writeFile(
-        join(projectRoot, 'lazy.toml'),
-        '[agents.local-ollama]\n' +
-        'harness = "claude-code"\n' +
-        'model = "qwen3:8b"\n' +
-        'endpoint = "http://localhost:11434"\n\n' +
-        '[models.roles.agent]\nagent = "local-ollama"\n',
-      );
-      await expect(assertDaemonCredentials(projectRoot)).rejects.toThrow(/Anthropic/i);
+      expect(await gate('local-ollama')).toBeNull();
+      // ...while the Anthropic-billed profile in the same project still owes one.
+      expect(await gate('claude-code')).toContain('Anthropic');
     });
   });
 

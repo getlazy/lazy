@@ -30,7 +30,7 @@ import { getCredentialIndexPath } from '../../src/daemon/paths';
 /** A declared profile billing OpenRouter — the credential the daemon below never has. */
 const OPENROUTER_CODEX =
   '\n[agents.openrouter-codex]\nharness = "codex"\nmodel = "gpt-5-codex"\n' +
-  'endpoint = "https://openrouter.ai/api/v1"\n';
+  'endpoint = "https://openrouter.ai/api"\n';
 
 describe('lazy doctor — credential source', () => {
   let ctx: TestContext;
@@ -112,18 +112,19 @@ describe('lazy doctor — credential source', () => {
     expectOutputExcludes(result, 'shell env:');
   });
 
-  // INVARIANT: a credential the daemon cannot pay with FAILS the check by name,
-  // with the profile it strands and the command that stores it — and the
-  // credentials that ARE present are still reported. The daemon itself starts
-  // fine (its gate reads the role defaults only), which is exactly why doctor
-  // has to be the surface that says this.
-  test('fails by name when the daemon holds no credential a declared profile bills', async () => {
+  // INVARIANT: a credential the daemon cannot pay with is a WARNING by name,
+  // with the profile whose turns it strands and the command that stores it —
+  // and the credentials that ARE present are still reported. A WARNING, not a
+  // failure: the daemon runs without it and only turns on that profile are
+  // refused, which is exactly why doctor has to be the surface that says this.
+  test('warns by name when the daemon holds no credential a declared profile bills', async () => {
     await appendConfig(OPENROUTER_CODEX);
 
     const result = await ctx.lazy(['doctor'], { env: { OPENROUTER_API_KEY: '' } });
 
-    expectOutput(result, '✗ OpenRouter credential present (needed by openrouter-codex)');
+    expectOutput(result, '✓ OpenRouter credential missing (needed by openrouter-codex)');
     expectOutput(result, 'The daemon holds no OpenRouter credential');
+    expectOutput(result, 'will be refused until one is connected');
     expectOutput(result, 'openrouter-codex profile');
     expectOutput(result, 'lazy auth set openrouter');
     expectOutput(result, 'OPENROUTER_API_KEY');
@@ -141,7 +142,7 @@ describe('lazy doctor — credential source', () => {
     const result = await ctx.lazy(['doctor'], { env: { OPENROUTER_API_KEY: '' } });
 
     expectOutput(result, '✓ Anthropic credential present (daemon env: ANTHROPIC_API_KEY; needed by claude-code)');
-    expectOutput(result, '✗ OpenRouter credential present (needed by openrouter-codex)');
+    expectOutput(result, '✗ OpenRouter credential readable (needed by openrouter-codex)');
     expectOutput(result, 'could not tell whether a OpenRouter credential is available');
     expectOutput(result, 'Failed to parse the credential index');
   });

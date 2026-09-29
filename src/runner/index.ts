@@ -16,6 +16,7 @@ import type { RunnerType, ResolvedConfig, RoleTarget } from '../config/types';
 import { DockerRunner } from './docker-runner';
 import { PodmanRunner } from './podman-runner';
 import { HostProcessRunner } from './host-process-runner';
+import { hostSandboxStorePath } from './host-sandbox';
 import {
   assertHostRunnerConfigAllowed,
   HOST_RUNNER_TYPE,
@@ -152,6 +153,7 @@ export async function createRunner(lazyRoot: string, overrideType?: RunnerType):
         allowWeakerNested: config.runner.sandbox_allow_weaker_nested,
         denyRead: config.runner.sandbox_deny_read,
         denyWrite: config.runner.sandbox_deny_write,
+        storePath: hostSandboxStorePath(config),
       });
       runner.setBoundaryVerification(config.runner.verify_sandbox_boundary);
       return runner;

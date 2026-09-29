@@ -10,6 +10,7 @@
  * and the status bar to a live one.
  */
 
+import { usagePausePastCheckboxHtml } from './usage-pause-banner';
 import { layoutHtml } from './templates';
 import { scriptJson } from './escape';
 import { REVIEW_DRAFT_KEY_JS } from '../review/draft-key';
@@ -36,10 +37,18 @@ import {
   escapeHtml,
   fileSectionId,
   violationDecision,
+  VIOLATION_DECISION_STATE,
   diffViewOptionsHtml,
   diffViewScript,
   type RenderedThread,
+  type DiffFile,
 } from './review-diff';
+import {
+  fileListHtml,
+  pendingFileHtml,
+  progressiveLoaderScript,
+  type ChangesLoadPlan,
+} from './review-progressive';
 import { regionsCardHtml, regionsStripOptions } from './review-regions';
 import type { RegionSummary } from '../regions';
 import {
@@ -48,7 +57,7 @@ import {
   renderPresentedChanges,
   screenshotsCardHtml,
 } from './review-presentation';
-import { renderMarkdownFile, type MarkdownSources } from './review-markdown';
+import { renderMarkdownFile, isMarkdownPath, type MarkdownSources } from './review-markdown';
 import { PROSE_BLOCK_TAGS } from '../review/prose-blocks';
 import { discussionPromoteSeed as seedDiscussionPromotion, type DiscussionPromoteSeed } from '../review/promote-discussion';
 import {
@@ -81,6 +90,7 @@ import {
 import { reviewNavControlsHtml, reviewNavigationScript } from './review-navigation';
 import { screenshotLightboxScript } from './screenshot-lightbox';
 import { clusterProgressBarHtml } from './cluster-progress-html';
+import { reopenedAfterAcceptLine } from '../task/reopen-after-accept';
 import {
   asksBarLabel,
   queuedBarLabel,
@@ -112,6 +122,7 @@ import type {
 } from '../types';
 import { ACTIVE_RAISED_ACTIONS } from '../types';
 import type { Task } from '../storage';
+import { violationDecisionOf, type ViolationDecision } from '../protection/rejected-files';
 import {
   isTaskLevelReviewAnchor,
   TASK_LEVEL_REVIEW_ANCHOR,
@@ -1626,6 +1637,24 @@ ${STATUS_BAR_LABELS_JS}
     }
   }
 
+  // Accept's "merge without delivering" box follows the accept gate's own
+  // count (queuedFeedbackSlotHtml). Refilled in the <template> the dialog
+  // clones AND in an open dialog; a slot whose count is unchanged is left
+  // alone so a ticked box stays ticked, and a changed count resets it — the
+  // reviewer agreed to drop a different number of comments.
+  function renderQueuedFeedback(count, html) {
+    var slots = Array.prototype.slice.call(document.querySelectorAll('[data-rv-queued-feedback]'));
+    var tmpls = document.querySelectorAll('template[data-lz-action-template]');
+    for (var t = 0; t < tmpls.length; t++) {
+      slots = slots.concat(Array.prototype.slice.call(tmpls[t].content.querySelectorAll('[data-rv-queued-feedback]')));
+    }
+    for (var i = 0; i < slots.length; i++) {
+      if (slots[i].getAttribute('data-rv-queued-feedback') === String(count)) continue;
+      slots[i].setAttribute('data-rv-queued-feedback', String(count));
+      slots[i].innerHTML = html;
+    }
+  }
+
   function renderStatus(data) {
     var st = data.state;
     if (bar && st) {
@@ -1645,6 +1674,7 @@ ${STATUS_BAR_LABELS_JS}
     // Unblock / Accept live on [data-rv-actions], independent of the bar —
     // flip them whenever the poll carries a status, even if the bar is gone.
     if (st) renderActionBusy(st.status);
+    if (typeof data.queuedFeedback === 'number') renderQueuedFeedback(data.queuedFeedback, data.queuedFeedbackHtml || '');
     if (bar) {
       // Same wording AND the same hide-at-a-never-used-zero rule the server
       // rendered — a counter that reappeared with different words on the first
@@ -1928,26 +1958,31 @@ ${STATUS_BAR_LABELS_JS}
         });
     });
 
+    var DECISION_STATE = ${scriptJson(VIOLATION_DECISION_STATE)};
+    var ROW_STATE = ${scriptJson(VIOLATION_ROW_STATE)};
+    function decisionOf(v) {
+      if (v.status === 'approved') return 'approved';
+      if (v.status === 'rejected' || v.rejected_at) return 'rejected';
+      return 'undecided';
+    }
     function applyDecisions(violations) {
       var outstanding = [];
       for (var i = 0; i < violations.length; i++) {
         var v = violations[i];
-        var approved = v.status === 'approved';
+        var decision = decisionOf(v);
+        var approved = decision === 'approved';
         if (!approved) outstanding.push(v.file);
 
         var forms = document.querySelectorAll('[data-rv-decide]');
         for (var j = 0; j < forms.length; j++) {
           if (forms[j].getAttribute('data-rv-decide') !== v.file) continue;
           forms[j].setAttribute('data-approved', approved ? '1' : '0');
+          forms[j].setAttribute('data-decision', decision);
           var state = forms[j].querySelector('.rv-decide-state');
-          if (state) {
-            state.textContent = approved
-              ? '✅ protected — change accepted'
-              : '⛔ protected — change will be reverted';
-          }
+          if (state) state.textContent = DECISION_STATE[decision];
           var btns = forms[j].querySelectorAll('.rv-decide-btn');
           for (var k = 0; k < btns.length; k++) {
-            var on = (btns[k].value === '1') === approved;
+            var on = btns[k].value === '1' ? decision === 'approved' : decision === 'rejected';
             btns[k].classList.toggle('rv-decide-on', on);
             btns[k].setAttribute('aria-pressed', on ? 'true' : 'false');
           }
@@ -1958,7 +1993,7 @@ ${STATUS_BAR_LABELS_JS}
           if (rows[m].getAttribute('data-rv-summary') !== v.file) continue;
           rows[m].setAttribute('data-approved', approved ? '1' : '0');
           var rowState = rows[m].querySelector('.rv-violation-state');
-          if (rowState) rowState.textContent = approved ? 'accepted' : 'will be reverted';
+          if (rowState) rowState.textContent = ROW_STATE[decision];
         }
       }
 
@@ -1971,11 +2006,11 @@ ${STATUS_BAR_LABELS_JS}
       if (outstanding.length) {
         box.removeAttribute('data-resolved');
         if (head) head.textContent = outstanding.length + ' of ' + total + ' protected file' + plural + ' not yet accepted';
-        if (hint) hint.textContent = 'Open each file to decide. Unblock reverts every rejected file to its base commit; accept refuses while any is still rejected.';
+        if (hint) hint.textContent = ${scriptJson(VIOLATION_HINT_OUTSTANDING)};
       } else {
         box.setAttribute('data-resolved', '1');
         if (head) head.textContent = 'All ' + total + ' protected file' + plural + ' accepted';
-        if (hint) hint.textContent = 'Unblock keeps these changes; accept can merge them.';
+        if (hint) hint.textContent = ${scriptJson(VIOLATION_HINT_RESOLVED)};
       }
     }
   })();
@@ -2705,6 +2740,21 @@ export function agentReportHtml(
 }
 
 /**
+ * What Reject means, said the same way by the server render and the page
+ * script: the next unblock restores each rejected file to its
+ * base itself, before the agent runs, and accept refuses meanwhile.
+ */
+const VIOLATION_HINT_OUTSTANDING =
+  'Open each file and choose Approve or Reject. Accept refuses until every one is approved; ' +
+  'the next unblock restores each rejected file to its base version before the agent runs.';
+const VIOLATION_HINT_RESOLVED = 'All approved — accept can merge them.';
+const VIOLATION_ROW_STATE: Record<ViolationDecision, string> = {
+  undecided: 'not yet accepted',
+  approved: 'accepted',
+  rejected: 'rejected — the next unblock restores it',
+};
+
+/**
  * The protected-file summary above the actions.
  *
  * REPORTS state, never changes it. Approving a change you have not looked at is
@@ -2737,9 +2787,9 @@ function violationSummary(
       // it forever. It gets its control here, and it is still the only one.
       const body = filesInDiff.has(v.file)
         ? `<a href="#${escapeHtml(fileSectionId(v.file))}"><code>${escapeHtml(v.file)}</code></a>` +
-          `<span class="rv-violation-state">${approved ? 'accepted' : 'not yet accepted'}</span>`
+          `<span class="rv-violation-state">${escapeHtml(VIOLATION_ROW_STATE[violationDecisionOf(v)])}</span>`
         : `<code>${escapeHtml(v.file)}</code> <span class="rv-hint">(not in this diff)</span>` +
-          violationDecision(taskId, v.file, v.status);
+          violationDecision(taskId, v.file, violationDecisionOf(v));
       return `<li class="rv-violation-item" data-approved="${approved ? '1' : '0'}" data-rv-summary="${escapeHtml(v.file)}">
         <span class="rv-violation-mark" aria-hidden="true"></span>
         ${body}
@@ -2751,8 +2801,8 @@ function violationSummary(
     ? `${outstanding.length} of ${violations.length} protected file${violations.length === 1 ? '' : 's'} not yet accepted`
     : `All ${violations.length} protected file${violations.length === 1 ? '' : 's'} accepted`;
   const hint = outstanding.length
-    ? 'Open each file to decide. Accept refuses until every one is accepted; unblocking the agent again changes nothing about them.'
-    : 'All decided — accept can merge them.';
+    ? VIOLATION_HINT_OUTSTANDING
+    : VIOLATION_HINT_RESOLVED;
   return `<div class="rv-violations"${outstanding.length ? '' : ' data-resolved="1"'}>
       <strong>${escapeHtml(head)}</strong>
       <p class="rv-hint">${escapeHtml(hint)}</p>
@@ -3041,6 +3091,32 @@ export function askDialogActionsHtml(seg: string, live: ReviewLiveState): string
           </div>`;
 }
 
+/**
+ * Accept's explicit "merge without delivering the queued comments" box — the
+ * web twin of `--allow-queued-comments` — or nothing when accept would not
+ * refuse on queued feedback.
+ *
+ * Also served by the review island's poll (`/api/review/:id/threads`), so the
+ * words exist once.
+ */
+export function queuedFeedbackBoxHtml(count: number): string {
+  if (count <= 0) return '';
+  return `<label class="rv-hint"><input type="checkbox" name="allow_queued_comments" value="1">
+            Merge without delivering the ${count} queued comment${count === 1 ? '' : 's'} — the agent will never read ${count === 1 ? 'it' : 'them'}</label>`;
+}
+
+/**
+ * The slot Accept's box lives in, always mounted. The Accept dialog is cloned
+ * from a <template> at click time, so a box decided only at render could never
+ * appear on a page opened before the feedback was queued: the reviewer got a
+ * refusal and no way past it. The island's poll (renderQueuedFeedback) refills
+ * the slot — in the template and in an open dialog — when the count changes.
+ */
+function queuedFeedbackSlotHtml(count: number): string {
+  const n = Math.max(0, count);
+  return `<div data-rv-queued-feedback="${n}">${queuedFeedbackBoxHtml(n)}</div>`;
+}
+
 export function actionsHtml(
   task: Task,
   queued: ReviewComment[],
@@ -3062,11 +3138,18 @@ export function actionsHtml(
      */
     queuedCount?: number;
     /**
-     * Human feedback accept refuses on (src/task/queued-feedback.ts). Non-zero
-     * adds the explicit "merge without delivering them" box to Accept.
+     * Human feedback accept refuses on — `queuedHumanFeedbackForTask` /
+     * `queuedHumanFeedbackCount` (src/task/queued-feedback.ts), never a count
+     * of the caller's own. REQUIRED: a caller that forgot it used to render an
+     * Accept with no "merge without delivering them" box while the daemon
+     * refused. The slot it sits in always mounts, so the review island's live
+     * poll can fill it on a page rendered before the feedback was queued (see
+     * queuedFeedbackSlotHtml).
      */
-    queuedFeedback?: number;
-  } = {},
+    queuedFeedback: number;
+    /** The daemon judged the task's next turn paused: the Unblock dialog offers "let this turn through". */
+    usagePaused?: boolean;
+  },
 ): string {
   const extras = options.extras !== false;
   const where = extras ? ' below' : '';
@@ -3075,11 +3158,7 @@ export function actionsHtml(
   const unblockLabel = queuedCount
     ? `<strong>Unblock</strong> — resumes the agent, carrying the ${queuedCount} queued comment${queuedCount === 1 ? '' : 's'}${where}`
     : '<strong>Unblock</strong> — resumes the agent to change code';
-  const queuedFeedback = options.queuedFeedback ?? 0;
-  const allowQueuedBox = queuedFeedback > 0
-    ? `<label class="rv-hint"><input type="checkbox" name="allow_queued_comments" value="1">
-            Merge without delivering the ${queuedFeedback} queued comment${queuedFeedback === 1 ? '' : 's'} — the agent will never read ${queuedFeedback === 1 ? 'it' : 'them'}</label>`
-    : '';
+  const allowQueuedBox = queuedFeedbackSlotHtml(options.queuedFeedback);
 
   // INVARIANT: never offer Unblock / Accept while the task is working or
   // pairing — the daemon 409s ("still working"), and a stale Current-review
@@ -3121,6 +3200,7 @@ export function actionsHtml(
           <label><span class="rv-tab-lead">${unblockLabel}</span>
             <textarea name="message" rows="6" required data-rv-sync="feedback" data-rv-draft="feedback" placeholder="What should the agent do next?">${escapeHtml(draft.feedback ?? '')}</textarea>
           </label>
+          ${usagePausePastCheckboxHtml(options.usagePaused === true)}
           <div class="rv-form-actions">
             <button type="submit" data-lz-unblock-submit>Unblock</button>
             <span class="rv-draft-state" data-rv-draft-state aria-live="polite"></span>
@@ -3226,6 +3306,7 @@ export function statusBarHtml(
   // `children` omitted means the caller does not KNOW them — render no cluster
   // line rather than a 0/0 derived from a list that was never loaded.
   const cluster = options.children ? clusterProgressBarHtml(task, options.children) : '';
+  const reopened = reopenedAfterAcceptLine(task);
   return `<div class="rv-statusbar" id="rv-statusbar"
       data-rv-askable="${state.askable ? '1' : '0'}"
       data-rv-ask-reason="${escapeHtml(state.askUnavailable ?? '')}"
@@ -3237,6 +3318,7 @@ export function statusBarHtml(
       <span data-rv-sb="turns">${state.turns} turn${state.turns === 1 ? '' : 's'}</span>
       <span data-rv-sb="activity">active ${escapeHtml(relativeTime(state.lastActiveAt))}</span>
       ${cluster ? `<span class="rv-sb-sep">·</span>${cluster}` : ''}
+      ${reopened ? `<span class="rv-sb-sep">·</span><span data-rv-sb="reopened">${escapeHtml(reopened)}</span>` : ''}
       <span class="rv-sb-sep">·</span>
       <span class="rv-sb-sep">·</span>
       <span data-rv-sb="viewed"></span>
@@ -3350,6 +3432,12 @@ export function reviewTaskHtml(
       notes: string[];
       /** The first carve is still running, so `rows` is empty for that reason. */
       computing?: boolean;
+      /** Whether `rows` are the authored walkthrough or a hub's derived children map. */
+      source?: 'presentation' | 'children';
+      /** The authored walkthrough on record predates the branch head and is not what `rows` show. */
+      staleWalkthrough?: boolean;
+      /** Path → owning top-level region, for the progressive file list. */
+      fileRegions?: Record<string, string>;
     };
     /**
      * When set, return only that slice — no page chrome, no layout, no
@@ -3363,6 +3451,13 @@ export function reviewTaskHtml(
     lineAttribution?: Map<string, import('../regions').FileLineAttribution>;
     /** Codes shared by more than one task — this page's task links fall back to the id. */
     duplicatedCodes?: ReadonlySet<string>;
+    /**
+     * The diff was too large for one response: `diffText` carries only the
+     * plan's inline files, and every other file renders as a pending card the
+     * browser fills in (src/server/review-progressive.ts). Absent — every diff
+     * inside the inline budget — the Changes block is what it always was.
+     */
+    progressive?: ChangesLoadPlan;
   } = {},
 ): string {
   const timings = extras.timings ?? unmeasured();
@@ -3383,7 +3478,7 @@ export function reviewTaskHtml(
       ...(symbols.size > 0 ? [{ lookup: symbols, className: 'lz-sym-link' }] : []),
     ],
   };
-  const violationsByPath = new Map(fileViolations.map((v) => [v.file, v.status]));
+  const violationsByPath = new Map(fileViolations.map((v) => [v.file, violationDecisionOf(v)]));
   const fileDecisions = extras.fileDecisions ?? [];
   const threadsPhase = timings.begin('threads');
   const threads = groupThreads(comments);
@@ -3418,20 +3513,26 @@ export function reviewTaskHtml(
       }
     }
   }
+  // A thread on a file this response has not loaded yet is not orphaned: it
+  // renders when that file's card is filled in.
+  const notYetLoaded = extras.progressive
+    ? new Set([...extras.progressive.deferred, ...extras.progressive.large])
+    : null;
   const orphans = threads.filter(
     (t) =>
+      !(notYetLoaded?.has(t.file)) &&
       !isTaskLevelReviewAnchor(t.file, t.line) &&
       !isProseReviewAnchor(t.file) &&
       !anchored.has(`${t.file} ${t.side} ${t.line}`),
   );
-  const orphanHtml = orphans.length
-    ? `<h2>Comments whose lines are no longer in the diff</h2>` +
+  const orphanHtml = orphans.length || extras.progressive
+    ? `<div id="rv-orphans"${orphans.length ? '' : ' hidden'}><h2>Comments whose lines are no longer in the diff</h2>` +
       orphans
         .map(
           (t) =>
             `<div class="rv-notice"><div class="rv-msg-head">${escapeHtml(t.file)}:${t.line} (${escapeHtml(t.side)})</div>${threadHtml(seg, t, { markdown })}</div>`,
         )
-        .join('\n')
+        .join('\n') + `<div id="rv-orphans-late"></div></div>`
     : '';
   orphansPhase.end();
 
@@ -3456,16 +3557,18 @@ export function reviewTaskHtml(
     approvedFiles,
     fileViolations,
     duplicatedCodes: extras.duplicatedCodes,
+    // This actions block is never served in production (the task page embeds
+    // only 'changes'); the island's poll fills the slot with the real count.
+    queuedFeedback: 0,
   });
   const remedyHtml = extras.remedy ? remedyPanelHtml(seg, extras.remedy, draft) : '';
 
   // Screenshots the agent declared come FIRST — before raised items and the
   // report. A picture of the thing that was built is the fastest possible
   // answer to "what did this task do", so nothing outranks it.
-  const screenshotsHtml = screenshotsCardHtml(
-    seg,
-    extras.turnReport?.presentation?.screenshots,
-  );
+  const screenshotsHtml = extras.regions?.staleWalkthrough === true
+    ? ''
+    : screenshotsCardHtml(seg, extras.turnReport?.presentation?.screenshots);
 
   // Report-first order (structural-agent-questions): screenshots → open raised
   // → agent report → how to verify → untriaged follow-ups → violations →
@@ -3475,12 +3578,20 @@ export function reviewTaskHtml(
   const raisedHtml = raisedItemsSummary(seg, extras.raisedItems ?? [], {
     duplicatedCodes: extras.duplicatedCodes,
   });
-  const reportHtml = timings.measureSync('report', () => agentReportHtml(
-    seg,
-    extras.lastAgentTurn ?? null,
-    stripVerifySections(extras.turnReport ?? null),
-    { surface: extras.embed === 'changes' ? 'changes' : 'full', markdown },
-  ));
+  // A walkthrough the branch has moved past is never the headline. The regions
+  // service already decided it is not what the regions present (a hub whose
+  // children landed after its setup turn wrote "no changes yet"); the report
+  // it came with describes that same superseded head, so both give way to one
+  // line saying so, and the children regions below carry the review.
+  const staleWalkthrough = extras.regions?.staleWalkthrough === true;
+  const reportHtml = staleWalkthrough
+    ? staleWalkthroughHtml(seg)
+    : timings.measureSync('report', () => agentReportHtml(
+      seg,
+      extras.lastAgentTurn ?? null,
+      stripVerifySections(extras.turnReport ?? null),
+      { surface: extras.embed === 'changes' ? 'changes' : 'full', markdown },
+    ));
   // Run opens a shell into the container, which the Run itself starts if it is
   // down; the card only states the reason when no container can be entered at all.
   const verifyHtml = timings.measureSync('verify', () => verifyReportBlockHtml(
@@ -3519,6 +3630,10 @@ export function reviewTaskHtml(
   // this is expected to be the single biggest phase on the page, which is the
   // hypothesis this instrumentation exists to confirm or refute.
   const hasPresentation =
+    !staleWalkthrough &&
+    // A walkthrough cuts snippets out of the whole diff, which a progressive
+    // page does not hold; its groups are still the regions above.
+    !extras.progressive &&
     extras.turnReport?.presentation != null &&
     extras.turnReport.presentation.groups.length > 0;
   // Presented already stamps the canonical file id on the first card of
@@ -3526,8 +3641,13 @@ export function reviewTaskHtml(
   // getElementById land on the wrong one — the accept-checklist hash and
   // "Full file" links both use that id. Raw still carries data-file-section
   // so JS can find it after switching views.
-  const rawDiffHtml = timings.measureSync('changes', () =>
-    renderReviewDiff(files, byAnchor, {
+  const rawDiffHtml = timings.measureSync('changes', () => extras.progressive
+    ? progressiveDiffHtml(extras.progressive, files, byAnchor, {
+      ...diffOptions,
+      presentedPanes,
+      assignSectionId: true,
+    })
+    : renderReviewDiff(files, byAnchor, {
       ...diffOptions,
       presentedPanes,
       assignSectionId: !hasPresentation,
@@ -3550,10 +3670,30 @@ export function reviewTaskHtml(
       )
     : '';
 
+  // A progressive page's Markdown files may all arrive later, so the switch is
+  // offered whenever the plan lists one.
+  const hasMarkdownPanes = presentedPanes.size > 0 ||
+    (extras.progressive?.entries.some((e) => isMarkdownPath(e.path)) ?? false);
   const changesToolbar = hasPresentation ? changesViewOptionsHtml() : '';
-  const changesScripts = hasPresentation
+  // Said, not silently dropped: a current walkthrough exists but this page is
+  // too large to cut its snippets, so its groups are offered as regions.
+  const walkthroughNote = extras.progressive && !staleWalkthrough &&
+    (extras.turnReport?.presentation?.groups.length ?? 0) > 0
+    ? `<p class="rv-hint rv-walkthrough-progressive">This change is too large to lay out as the agent's walkthrough on one page — its groups are the regions above (<a href="/tasks/${escapeHtml(seg)}/regions">open Regions</a>).</p>`
+    : '';
+  const changesScripts = (hasPresentation
     ? `${changesViewScript()}\n${diffViewScript('#rv-changes', expandUrl)}`
-    : diffViewScript('#rv-root', expandUrl);
+    : diffViewScript('#rv-root', expandUrl)) +
+    (extras.progressive ? `\n${progressiveLoaderScript(`/api/review/${seg}/files`)}` : '');
+  const fileListBlock = extras.progressive
+    ? fileListHtml(extras.progressive, {
+      fileRegions: extras.regions?.fileRegions,
+      regionLabels: new Map((extras.regions?.rows ?? []).map((r) => [r.id, r.label])),
+    })
+    : '';
+  const violationPaths = extras.progressive
+    ? new Set(extras.progressive.entries.map((e) => e.path))
+    : new Set(files.map((f) => f.path));
 
   const activityCardHtml = extras.activity
     ? timings.measureSync('activity_card', () => reviewActivityCardHtml(extras.activity!, seg))
@@ -3562,14 +3702,14 @@ export function reviewTaskHtml(
   const changesBlock =
     `${orphanHtml}` +
     `${maintainHtml}` +
-    `${violationSummary(seg, fileViolations, new Set(files.map((f) => f.path)), fileDecisions)}` +
+    `${violationSummary(seg, fileViolations, violationPaths, fileDecisions)}` +
     // Unsent comment boxes whose line is not on screen are re-opened here,
     // above the diff, rather than kept invisible — see restoreDrafts().
     `<div id="rv-draft-orphans" class="rv-draft-orphans" hidden></div>` +
     `<h2>Changes</h2>` +
     `${regionsCardHtml(regionsStripOptions(seg, extras.regions))}` +
-    `${hubChildrenHtml(seg, extras.hubChildren)}${changesToolbar}` +
-    `${diffViewOptionsHtml({ presented: presentedPanes.size > 0 })}` +
+    `${hubChildrenHtml(seg, extras.hubChildren)}${walkthroughNote}${fileListBlock}${changesToolbar}` +
+    `${diffViewOptionsHtml({ presented: hasMarkdownPanes })}` +
     `<div id="rv-changes">` +
     `${hasPresentation ? `<div id="rv-presented" class="rv-changes-presented">${presentedHtml}</div>` : ''}` +
     `<div id="rv-root" class="rv-changes-raw">${rawDiffHtml}</div>` +
@@ -3609,14 +3749,14 @@ export function reviewTaskHtml(
     ${servicesCardHtml(task, extras.serve ?? null, extras.controls)}
     ${proseThreadsFallbackHtml(seg, threads)}
     ${maintainHtml}
-    ${violationSummary(seg, fileViolations, new Set(files.map((f) => f.path)), fileDecisions)}
+    ${violationSummary(seg, fileViolations, violationPaths, fileDecisions)}
     ${actions}
     ${orphanHtml}
     <div id="rv-draft-orphans" class="rv-draft-orphans" hidden></div>
     <h2>Changes</h2>
     ${regionsCardHtml(regionsStripOptions(seg, extras.regions))}
-    ${hubChildrenHtml(seg, extras.hubChildren)}${changesToolbar}
-    ${diffViewOptionsHtml({ presented: presentedPanes.size > 0 })}
+    ${hubChildrenHtml(seg, extras.hubChildren)}${walkthroughNote}${fileListBlock}${changesToolbar}
+    ${diffViewOptionsHtml({ presented: hasMarkdownPanes })}
     <div id="rv-changes">
       ${hasPresentation ? `<div id="rv-presented" class="rv-changes-presented">${presentedHtml}</div>` : ''}
       <div id="rv-root" class="rv-changes-raw">${rawDiffHtml}</div>
@@ -3708,3 +3848,121 @@ export function threadsJson(comments: ReviewComment[], state?: ReviewLiveState, 
 }
 
 export type { ReviewActions };
+
+/**
+ * What the Changes tab says in place of a walkthrough the branch has moved
+ * past. Deliberately short and without the old walkthrough's words: those
+ * describe a head that no longer exists, and quoting them is how "no changes
+ * yet" became the headline of a branch carrying 60 files.
+ */
+function staleWalkthroughHtml(taskId: string): string {
+  return (
+    `<section class="rv-stale-walkthrough">` +
+    `<p class="rv-hint">The walkthrough on record was written before this branch moved ` +
+    `and is not shown. The regions below are derived from the work on the branch now — ` +
+    `<a href="/tasks/${escapeHtml(taskId)}/regions">open Regions</a> for the full list.</p>` +
+    `</section>`
+  );
+}
+
+/**
+ * The files of a progressive page in list order: a rendered card for each file
+ * whose hunks are in this response, a pending card for every other one. A path
+ * the uncommitted-changes section repeats renders both of its sections, as the
+ * whole-diff render would.
+ */
+function progressiveDiffHtml(
+  plan: ChangesLoadPlan,
+  files: DiffFile[],
+  byAnchor: Map<string, RenderedThread[]>,
+  options: Parameters<typeof renderReviewDiff>[2],
+): string {
+  if (plan.entries.length === 0) return renderReviewDiff([], byAnchor, options);
+  const byPath = new Map<string, DiffFile[]>();
+  for (const f of files) {
+    const list = byPath.get(f.path) ?? [];
+    list.push(f);
+    byPath.set(f.path, list);
+  }
+  const out: string[] = [];
+  for (const entry of plan.entries) {
+    const rendered = plan.inline.has(entry.path) ? byPath.get(entry.path) : undefined;
+    out.push(rendered && rendered.length > 0
+      ? renderReviewDiff(rendered, byAnchor, options)
+      : pendingFileHtml(entry, plan.large.has(entry.path)));
+  }
+  return out.join('\n');
+}
+
+/**
+ * The cards for a batch of files the progressive loader asked for, by path —
+ * rendered with the same options, threads and gutters as the page's own, so a
+ * card filled in later is indistinguishable from one that came inline.
+ */
+export function reviewFileCardsHtml(
+  task: Task,
+  diffText: string,
+  comments: ReviewComment[],
+  fileViolations: FileViolation[],
+  wanted: string[],
+  extras: {
+    isMaintainedPath?: (path: string) => boolean;
+    markdownSources?: MarkdownSources;
+    lineAttribution?: Map<string, import('../regions').FileLineAttribution>;
+    duplicatedCodes?: ReadonlySet<string>;
+    markdown?: RenderMarkdownOptions;
+  } = {},
+): { files: Record<string, string>; orphans: string } {
+  const seg = taskPathSegment(task, extras.duplicatedCodes);
+  const files = parseUnifiedDiff(diffText);
+  const byAnchor = new Map<string, RenderedThread[]>();
+  const allThreads = groupThreads(comments);
+  for (const t of allThreads) {
+    const key = anchorKey({ file: t.file, side: t.side as 'old' | 'new', line: t.line });
+    const list = byAnchor.get(key) ?? [];
+    list.push({ threadId: t.threadId, html: threadHtml(seg, t, { markdown: extras.markdown ?? {} }) });
+    byAnchor.set(key, list);
+  }
+  const options = {
+    violations: new Map(fileViolations.map((v) => [v.file, violationDecisionOf(v)])),
+    taskId: seg,
+    isMaintainedPath: extras.isMaintainedPath,
+    allowExpand: true,
+    ...(extras.lineAttribution ? { lineAttribution: extras.lineAttribution } : {}),
+  };
+  const out: Record<string, string> = {};
+  for (const path of wanted) {
+    const mine = files.filter((f) => f.path === path);
+    if (mine.length === 0) continue;
+    const panes = new Map<string, string>();
+    const source = extras.markdownSources?.get(path);
+    if (source) {
+      const pane = renderMarkdownFile(mine[0], source, { threadCount: countThreadsInFile(byAnchor, path) });
+      if (pane) panes.set(path, pane);
+    }
+    out[path] = renderReviewDiff(mine, byAnchor, { ...options, presentedPanes: panes });
+  }
+  // The page leaves threads on files it has not loaded out of its "no longer
+  // in the diff" list; a thread whose line is gone from one of THESE files is
+  // returned here so the loader can add it there. It must never vanish.
+  const anchored = new Set<string>();
+  for (const f of files) {
+    if (!wanted.includes(f.path)) continue;
+    for (const h of f.hunks) {
+      for (const l of h.lines) {
+        if (l.newLine !== null) anchored.add(`${f.path} new ${l.newLine}`);
+        if (l.oldLine !== null) anchored.add(`${f.path} old ${l.oldLine}`);
+      }
+    }
+  }
+  const orphans = allThreads
+    .filter((t) =>
+      wanted.includes(t.file) &&
+      !isTaskLevelReviewAnchor(t.file, t.line) &&
+      !isProseReviewAnchor(t.file) &&
+      !anchored.has(`${t.file} ${t.side} ${t.line}`))
+    .map((t) =>
+      `<div class="rv-notice"><div class="rv-msg-head">${escapeHtml(t.file)}:${t.line} (${escapeHtml(t.side)})</div>${threadHtml(seg, t, { markdown: extras.markdown ?? {} })}</div>`)
+    .join('\n');
+  return { files: out, orphans };
+}

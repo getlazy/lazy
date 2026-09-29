@@ -473,6 +473,11 @@ async function runHttp(step) {
   const headers = { 'content-type': 'application/json' };
   if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
     headers.authorization = 'Bearer ' + process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  } else if (process.env.ANTHROPIC_AUTH_TOKEN) {
+    // What Claude Code does with ANTHROPIC_AUTH_TOKEN: a bearer. A profile paid
+    // through the proxy (a no-credential local profile, or a team member's own
+    // credential for a pinned profile) launches with its placeholder there.
+    headers.authorization = 'Bearer ' + process.env.ANTHROPIC_AUTH_TOKEN;
   } else if (process.env.ANTHROPIC_API_KEY) {
     headers['x-api-key'] = process.env.ANTHROPIC_API_KEY;
   } else {

@@ -192,7 +192,7 @@ export const VALID_HOST_PERMISSION_MODES: readonly HostPermissionMode[] = ['sand
  * lazy depends on but does not control.
  *   - 'off' (default): no runtime check. The standing signal is the CI guard
  *     workflow plus `lazy system verify-host-boundary` on demand. Default because
- *     the guard costs three real headless sessions and needs a logged-in
+ *     the guard costs nine real headless sessions and needs a logged-in
  *     `claude`, which a daemon host may not have.
  *   - 'once-per-version': verify on the first host launch for each Claude Code
  *     version + platform + deny posture, cache the verdict, and REFUSE to launch
@@ -346,6 +346,12 @@ export interface LazyConfig {
      * blob on an LFS path is refused at merge regardless.
      */
     lfs_check?: LfsCheckMode;
+    /**
+     * Append lazy's own `Co-Authored-By: Lazy <noreply@getlazy.dev>` trailer to
+     * the commits lazy writes for a task (lazy_commit, the accept squash, forge
+     * merge commits). Default true; false omits it everywhere.
+     */
+    coauthor_trailer?: boolean;
   };
   output?: {
     shortid_length?: number;
@@ -817,6 +823,7 @@ export interface ResolvedConfig {
   git: {
     default_branch_prefix: string;
     lfs_check: LfsCheckMode;
+    coauthor_trailer: boolean;
   };
   output: {
     shortid_length: number;

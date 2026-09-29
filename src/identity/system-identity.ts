@@ -34,6 +34,7 @@ import { getServiceCredential } from '../daemon/user-credentials';
 import { logger } from '../utils/logger';
 import type { ActorInput, TurnOwner } from '../types';
 import { resolveGitIdentity } from './git-identity';
+import { GIT_AUTHOR_REFUSAL, type GitAuthorAnswer } from './git-author';
 
 /**
  * The identity to record for work nobody asked for, or null when this install
@@ -96,4 +97,17 @@ async function serviceCredentialOwner(projectRoot: string): Promise<TurnOwner | 
     );
     return null;
   }
+}
+
+/**
+ * The answer for a daemon-side git write no request or tool call scoped
+ * (./git-author.ts): the configured system identity, or — on a managed host,
+ * where nobody's git config may answer — a refusal in lazy's own words before
+ * git runs. On a laptop with nothing configured, null leaves git to its own
+ * config exactly as before.
+ */
+export async function systemGitAuthor(projectRoot: string): Promise<GitAuthorAnswer> {
+  const identity = await resolveSystemIdentity(projectRoot);
+  if (identity) return { author: identity };
+  return isManagedMode() ? { refusal: GIT_AUTHOR_REFUSAL } : null;
 }

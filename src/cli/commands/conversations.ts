@@ -1,5 +1,11 @@
 /**
- * `lazy conversations` — browse captured builder conversations from the terminal.
+ * `lazy conversations` — browse Builders from the terminal.
+ *
+ * A Builder is one conversation in the human sense — from a start or `/clear`
+ * to the next `/clear` — however many Claude session files compaction and
+ * resume rolled it through (docs/design/builder-identity.md). Every subcommand
+ * lists and opens Builders; a segment's session id typed by hand resolves to
+ * the Builder it belongs to.
  *
  * Builder sessions are captured into lazy's store automatically (live capture
  * and import). MCP agents reach them via lazy_conversations /
@@ -24,8 +30,9 @@ import { theme } from '../../render/theme';
 import { docsFooter } from '../../docs/links';
 import { parsePositiveInt } from './stats-flags';
 import { searchConversations } from '../../conversation/search';
-import { printConversationList } from '../../conversation/list';
+import { printBuilderList } from '../../conversation/list';
 import { resolveStoredConversation } from '../../conversation/ask';
+import { listBuilderTranscripts, resolveBuilderTranscript } from '../../builder/identity-transcript';
 import {
   buildConversationTaskPrompt,
   conversationPromotions,
@@ -36,7 +43,7 @@ import {
   resolveMessageRange,
 } from '../../conversation/promote';
 import { isTTY, openEditor, promptLine, removeRecoveryFile } from '../editor';
-import { showConversationTranscript } from './import-conversation';
+import { printConversationTranscript } from './import-conversation';
 
 function requireSessionId(sub: string, id: string | undefined): string {
   if (!id || !/^[0-9a-fA-F-]+$/.test(id)) {
@@ -120,19 +127,15 @@ async function commandConversationsList(args: string[]): Promise<void> {
 
   const storage = await requireStorage();
   try {
-    const conversations = await storage.listConversationSummaries();
-    if (conversations.length === 0) {
-      console.log('No captured builder conversations yet.');
+    const builders = await storage.listBuilders();
+    if (builders.length === 0) {
+      console.log('No captured Builders yet.');
       console.log(`Start one with: ${theme.command('lazy builder')}`);
       console.log(`Or import Claude Code history: ${theme.command('lazy import-conversation')}`);
       return;
     }
 
-    const { shown, total, hasMore } = printConversationList(conversations, {
-      offset,
-      limit,
-      useSummaryColumn: true,
-    });
+    const { shown, total, hasMore } = printBuilderList(builders, { offset, limit });
 
     if (hasMore) {
       console.log(
@@ -140,7 +143,7 @@ async function commandConversationsList(args: string[]): Promise<void> {
         theme.command(`lazy conversations list --offset ${offset + shown}${limit !== undefined ? ` --limit ${limit}` : ''}`),
       );
     }
-    console.log(`\nRead one with: ${theme.command('lazy conversations show <session-id>')}`);
+    console.log(`\nRead one with: ${theme.command('lazy conversations show <builder-id>')}`);
     console.log(`Search with: ${theme.command('lazy conversations search <query>')}`);
   } finally {
     await storage.close();
@@ -163,9 +166,9 @@ async function runConversationSearch(
 
   const storage = await requireStorage();
   try {
-    const conversations = await storage.listConversations();
+    const conversations = await listBuilderTranscripts(storage);
     if (conversations.length === 0) {
-      console.log('No captured builder conversations yet.');
+      console.log('No captured Builders yet.');
       console.log(`Import history with: ${theme.command('lazy import-conversation')}`);
       return;
     }
@@ -179,11 +182,11 @@ async function runConversationSearch(
     }
 
     if (hits.length === 0) {
-      console.log(`No conversations match '${query}'.`);
+      console.log(`No Builders match '${query}'.`);
       return;
     }
 
-    console.log(`${hits.length} conversation(s) match '${query}':\n`);
+    console.log(`${hits.length} Builder(s) match '${query}':\n`);
     for (const hit of hits) {
       const shortId = hit.sessionId.substring(0, 8);
       const started = hit.startedAt
@@ -196,7 +199,7 @@ async function runConversationSearch(
       }
       console.log('');
     }
-    console.log(`Read one with: ${theme.command('lazy conversations show <session-id>')}`);
+    console.log(`Read one with: ${theme.command('lazy conversations show <builder-id>')}`);
   } finally {
     await storage.close();
   }
@@ -214,14 +217,14 @@ async function commandConversationsShow(args: string[]): Promise<void> {
 
   const storage = await requireStorage();
   try {
-    const match = await resolveStoredConversation(storage, sessionId);
+    const match = await resolveBuilderTranscript(storage, sessionId);
     if (!match) {
-      console.error(`No conversation matches '${sessionId}'.`);
+      console.error(`No Builder matches '${sessionId}'.`);
       console.error(`List them with: ${theme.command('lazy conversations')}`);
       process.exit(1);
     }
     if ('ambiguous' in match) {
-      console.error(`Multiple conversations match '${sessionId}'. Use a longer prefix:`);
+      console.error(`Multiple Builders match '${sessionId}'. Use a longer prefix:`);
       for (const c of match.ambiguous) {
         const firstLine = c.summary.split('\n')[0].substring(0, 60);
         console.error(`  ${c.sessionId.substring(0, 8)}  ${firstLine}`);
@@ -229,7 +232,7 @@ async function commandConversationsShow(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    await showConversationTranscript(storage, match.conversation.sessionId);
+    printConversationTranscript(match.conversation, null, match.builder);
   } finally {
     await storage.close();
   }
@@ -372,20 +375,23 @@ async function commandConversationsPromote(args: string[]): Promise<void> {
 export function conversationsUsage(): void {
   console.log(`Usage: lazy conversations <subcommand>
 
-Browse captured builder conversations — the reasoning and decisions from past
-builder sessions, stored automatically alongside task data.
+Browse Builders — the reasoning and decisions from past builder sessions,
+stored automatically alongside task data. A Builder is one conversation from a
+start or /clear to the next /clear: compaction and resume continue it, however
+many Claude session files they roll through. The live run's state is shown as
+a badge on the Builder it is in.
 
 Subcommands:
-  list                 List conversations (default; newest first)
+  list                 List Builders (default; newest first)
   search <query>       Search message content (regex, case-insensitive)
-  show <session-id>    Read one conversation in full
-  promote <session-id> Turn a range of its messages into a backlog task
+  show <builder-id>    Read one Builder in full
+  promote <builder-id> Turn a range of its messages into a backlog task
 
 Options:
   -s, --search <query> (list) Run a search without a separate subcommand
       --limit <n>      (list) Page size (default: show all)
-      --offset <n>     (list) Skip the first N conversations
-      --limit <n>      (search) Max conversations to return (default 10)
+      --offset <n>     (list) Skip the first N Builders
+      --limit <n>      (search) Max Builders to return (default 10)
       --from <n>       (promote) First message of the range (required)
       --to <n>         (promote) Last message of the range (default: --from)
       --goal <text>    (promote) Goal for the new task (default: seeded)
@@ -393,7 +399,8 @@ Options:
       --parent <task>  (promote) Parent task id or code (default: top level)
       --yes            (promote) Take the seeded goal and prompt unedited
 
-Session ids are UUIDs; any unique prefix works (the listing shows the first 8).
+Builder ids are UUIDs; any unique prefix works (the listing shows the first 8).
+A Claude session id of any of the Builder's segments works too.
 
 ${'`'}promote${'`'} seeds a BACKLOG task from the messages you name (${'`'}show${'`'} numbers them)
 and opens your editor on the seeded prompt first. Nothing is started, and the new

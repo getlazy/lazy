@@ -86,6 +86,10 @@ export function unresolvedAuthRejectionsByUser(
     if (r.status === null) continue; // never reached the upstream — says nothing about auth
     const userId = r.userId;
     if (!userId) continue; // daemon-env traffic: not attributable to a member
+    // Paid by a credential the member connected for one agent PROFILE: a 401
+    // there says nothing about their Claude credential, which is what this
+    // verdict asks them to re-authorize.
+    if (r.credentialProfile) continue;
 
     if (AUTH_REJECT_STATUSES.has(r.status)) {
       rejections.set(userId, { ts: r.ts, status: r.status, role: r.role, error: r.error });

@@ -100,9 +100,9 @@ export const PALETTE_COMMANDS: readonly PaletteCommand[] = [
   },
   {
     id: 'conversations',
-    label: 'Navigate to conversations',
-    keywords: 'builder chat',
-    href: '/conversations',
+    label: 'Navigate to Builders',
+    keywords: 'builder chat conversations',
+    href: '/builders',
   },
   {
     id: 'settings',
@@ -139,7 +139,7 @@ export function searchResultHref(
       }
       return taskPath(ref, duplicatedCodes);
     case 'conversation':
-      return `/conversations/${encodeURIComponent(r.entity_id)}`;
+      return `/builders/${encodeURIComponent(r.entity_id)}`;
     case 'memory':
       return `/memory/${encodeURIComponent(r.entity_id)}`;
     case 'raised':
@@ -244,7 +244,7 @@ export function commandPaletteScript(): string {
       return '/tasks/' + encodeURIComponent(seg) + '/turns/' + r.turn_sequence;
     }
     if (r.entity_type === 'conversation') {
-      return '/conversations/' + encodeURIComponent(r.entity_id);
+      return '/builders/' + encodeURIComponent(r.entity_id);
     }
     if (r.entity_type === 'memory') {
       return '/memory/' + encodeURIComponent(r.entity_id);

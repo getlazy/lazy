@@ -19,6 +19,7 @@ import {
   buildSandboxSettings,
   buildAgentSandboxArgs,
   buildBuilderPermissionArgs,
+  hostSandboxStorePath,
   type HostPermissionConfig,
 } from '../../src/runner/host-sandbox';
 import { ClaudeCodeAgent } from '../../src/agent/claude-code';
@@ -270,5 +271,68 @@ describe('commonCommandFields wires the posture into agent turns', () => {
       sandbox_allowed_domains: ['*.anthropic.com', 'github.com'],
     }));
     expect(settingsFrom(fields.agent_extra_args!).sandbox.network.allowedDomains).toEqual(['*.anthropic.com', 'github.com']);
+  });
+});
+
+describe('host agents are denied lazy\'s own state', () => {
+  // INVARIANT: a host-runner agent can neither read nor write the lazy daemon
+  // base dir or the project's external store. The daemon dir holds per-task env
+  // values, the credential index, file-backend model credentials and every
+  // task's MCP tool-access token; the store holds every task's record. Both
+  // boundaries must carry them: the OS sandbox (Bash) and permissions.deny
+  // (the Read/Write/Edit tools, which bypass the OS sandbox).
+  test('daemon base dir (honouring LAZY_DAEMON_BASE_DIR) and store are denied', () => {
+    const prev = process.env.LAZY_DAEMON_BASE_DIR;
+    process.env.LAZY_DAEMON_BASE_DIR = '/tmp/lazy-test-daemon-base';
+    try {
+      const s = settingsFrom(buildAgentSandboxArgs({ ...SANDBOX, storePath: '/tmp/lazy-test-store' }));
+      for (const p of ['/tmp/lazy-test-daemon-base', '/tmp/lazy-test-store']) {
+        expect(s.sandbox.filesystem.denyRead).toContain(p);
+        for (const tool of ['Read', 'Write', 'Edit']) {
+          expect(s.permissions.deny).toContain(`${tool}(/${p})`);
+          expect(s.permissions.deny).toContain(`${tool}(/${p}/**)`);
+        }
+      }
+    } finally {
+      if (prev === undefined) delete process.env.LAZY_DAEMON_BASE_DIR;
+      else process.env.LAZY_DAEMON_BASE_DIR = prev;
+    }
+  });
+
+  test('the builder keeps reaching the daemon dir — its Bash runs the lazy CLI', () => {
+    const prev = process.env.LAZY_DAEMON_BASE_DIR;
+    process.env.LAZY_DAEMON_BASE_DIR = '/tmp/lazy-test-daemon-base';
+    try {
+      const s = settingsFrom(buildBuilderPermissionArgs(SANDBOX, false));
+      expect(s.sandbox.filesystem.denyRead).not.toContain('/tmp/lazy-test-daemon-base');
+    } finally {
+      if (prev === undefined) delete process.env.LAZY_DAEMON_BASE_DIR;
+      else process.env.LAZY_DAEMON_BASE_DIR = prev;
+    }
+  });
+
+  test('the host-runner agent command carries the configured external store', () => {
+    const config = {
+      ...DEFAULT_CONFIG,
+      runner: { ...DEFAULT_CONFIG.runner, type: 'dangerously-host-process-without-any-isolation', permission_mode: 'sandbox' },
+      storage: { ...DEFAULT_CONFIG.storage, backend: 'external', external_path: '/tmp/lazy-test-store' },
+    } as unknown as ResolvedConfig;
+    const fields = commonCommandFields(config) as { agent_extra_args?: string[] };
+    const s = settingsFrom(fields.agent_extra_args ?? []);
+    expect(s.sandbox.filesystem.denyRead).toContain('/tmp/lazy-test-store');
+  });
+
+  test('store path: ~ expands, trailing slash strips, relative and empty are skipped', () => {
+    expect(hostSandboxStorePath({ storage: { external_path: '' } })).toBeUndefined();
+    expect(hostSandboxStorePath({ storage: { external_path: 'store' } })).toBeUndefined();
+    expect(hostSandboxStorePath({ storage: { external_path: '~/.lazy/x' } })!.endsWith('/.lazy/x')).toBe(true);
+    expect(hostSandboxStorePath({ storage: { external_path: '/tmp/x/' } })).toBe('/tmp/x');
+  });
+
+  test('a trailing slash never yields a //** file-tool rule', () => {
+    const s = settingsFrom(buildAgentSandboxArgs({ ...SANDBOX, storePath: hostSandboxStorePath({ storage: { external_path: '/tmp/x/' } }) }));
+    expect(s.permissions.deny).toContain('Read(//tmp/x)');
+    expect(s.permissions.deny).toContain('Read(//tmp/x/**)');
+    expect(s.permissions.deny.some((r: string) => r.includes('//**'))).toBe(false);
   });
 });

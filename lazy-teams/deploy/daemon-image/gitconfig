@@ -1,0 +1,22 @@
+# /etc/gitconfig for the lazy daemon image — the guest a project daemon runs in.
+#
+# The daemon runs as root here (it must: lazy-guest-init starts dockerd), while
+# task containers run as the runner image's `user` (uid 1000) on a real Linux
+# dockerd, which does not fake bind-mount ownership the way Docker Desktop does.
+# So every turn the container takes ownership of its worktree, its per-worktree
+# gitdir and the objects dir (the `adopt` step of the supervisor wrapper) — and
+# from then on git refuses those paths to ROOT with "detected dubious
+# ownership", which killed lazy_commit and lazy_final (both run git in the
+# daemon) for every task that wrote a file.
+#
+# `*` rather than a path list: git 2.39 (this image's Debian) matches
+# safe.directory exactly or by `*` only, and worktree paths are made per task.
+# What this trusts, honestly: the worktree, its `.git` pointer file and the
+# per-worktree gitdir are writable by the task container, so root git here now
+# follows pointers an agent could rewrite (e.g. to a config with core.fsmonitor).
+# That is the same exposure every other runner already has — on Docker Desktop
+# and the host-process runner the daemon owns agent-writable files outright, so
+# git never refused them — and the ownership check was never a designed boundary.
+# It must be SYSTEM (or global) config: git ignores safe.directory anywhere else.
+[safe]
+	directory = *

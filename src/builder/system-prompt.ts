@@ -18,10 +18,16 @@ import {
   type DashboardAvailability,
 } from '../daemon/dashboard-availability';
 import type { Storage } from '../storage';
+import type { ResolvedConfig } from '../config/types';
+import { resolveProjectAgent } from '../daemon/project-settings';
 import type { Runner } from '../runner';
 
 import lazySystemPrompt from '../prompts/builder-system-prompt.md' with { type: 'text' };
+import scratchHostSection from '../prompts/builder-scratch-host.md' with { type: 'text' };
+import scratchStoreSection from '../prompts/builder-scratch-store.md' with { type: 'text' };
 import modelGuidance from '../prompts/model-guidance.md' with { type: 'text' };
+import agentProfilesSection from '../prompts/agent-profiles-section.md' with { type: 'text' };
+import { agentProfilesFor, profileNameForAgent, renderAgentProfileList } from '../config/agent-profiles';
 
 export interface AssembleBuilderSystemPromptOpts {
   lazyRoot: string;
@@ -39,7 +45,18 @@ export interface AssembleBuilderSystemPromptOpts {
    * you are already running) and nothing else; the prompt is byte-identical.
    */
   announceMemorySize?: boolean;
+  /**
+   * Where the human reads the builder's scratch dir. `host` (default): the
+   * `lazy builder` launches, which mount scratch at its own host path, so a
+   * printed path opens in the operator's shell. `store`: a daemon-owned
+   * detached (Lazy Teams) builder, whose scratch is mounted at a container-only
+   * path (BUILDER_CONTAINER_PATHS.scratchDir) — members read it only through
+   * the captured copy, so the prompt must never promise the path works for them.
+   */
+  scratchAccess?: ScratchAccess;
 }
+
+export type ScratchAccess = 'host' | 'store';
 
 /**
  * Fill the builder template's placeholders. Pure: no I/O, so unit tests can
@@ -55,6 +72,7 @@ export function applyBuilderPromptPlaceholders(opts: {
   runnerInstructions: string;
   chattinessSnippet: string;
   dashboardSection: string;
+  scratchAccess?: ScratchAccess;
 }): string {
   const template = opts.template ?? lazySystemPrompt;
   let prompt = template.replace('{{RUNNER_INSTRUCTIONS}}', opts.runnerInstructions);
@@ -63,7 +81,23 @@ export function applyBuilderPromptPlaceholders(opts: {
     opts.chattinessSnippet ? opts.chattinessSnippet + '\n\n' : '',
   );
   prompt = prompt.replace('{{DASHBOARD}}', opts.dashboardSection + '\n\n');
+  const scratchSection = opts.scratchAccess === 'store' ? scratchStoreSection : scratchHostSection;
+  prompt = prompt.replace('{{SCRATCH_LOCATION}}', () => scratchSection.trimEnd());
   return prompt.trimEnd();
+}
+
+/**
+ * The builder's "Agent profiles" section: the project's offered profiles with
+ * their "use when" notes, and the default for new top-level tasks (the
+ * project-settings overlay included, as `lazy_create` resolves it). Function
+ * replacers, so `$` sequences in user-written descriptions stay literal.
+ */
+export function renderBuilderAgentProfilesSection(config: ResolvedConfig, defaultAgent: string): string {
+  const list = renderAgentProfileList(agentProfilesFor(config));
+  return agentProfilesSection
+    .replace('{{default}}', () => profileNameForAgent(defaultAgent))
+    .replace('{{profiles}}', () => list)
+    .trimEnd();
 }
 
 /** Full builder system prompt — same substitutions on every launch path. */
@@ -79,6 +113,7 @@ export async function assembleBuilderSystemPrompt(
     runnerInstructions: opts.runner.getBuilderInstructions().trimEnd(),
     chattinessSnippet,
     dashboardSection: renderDashboardPromptSection(availability),
+    scratchAccess: opts.scratchAccess,
   });
 
   const memorySection = await buildMemorySection(opts.storage, 'builder', {
@@ -89,6 +124,14 @@ export async function assembleBuilderSystemPrompt(
 
   const messagesSection = await buildSystemMessagesSection(opts.storage);
   if (messagesSection) prompt += '\n\n' + messagesSection;
+
+  // The project's agent profiles with their "use when" descriptions, so the
+  // builder can PROPOSE one for a task. The loader already resolved the table,
+  // so a bad block has failed before this point.
+  prompt += '\n\n' + renderBuilderAgentProfilesSection(
+    config,
+    resolveProjectAgent(await opts.storage.getProjectSettings(), config),
+  );
 
   if (await hasExplicitModelConfig(opts.lazyRoot)) {
     const defaultModel = config.models.default;

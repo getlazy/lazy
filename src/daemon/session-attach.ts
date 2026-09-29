@@ -36,8 +36,9 @@ import type { Session, Task, ActorInput } from '../types';
 import type { Runner, RunnerType } from '../runner';
 import { createRunner } from '../runner';
 import { execContainerName } from '../server/shell-ws';
-import { assertSessionRowActionable, multiMemberDaemon } from './builder-sessions';
+import { assertSessionRowActionable, multiMemberDaemon, probeBuilderRun, settleDeadBuilderSessions } from './builder-sessions';
 import { RpcError } from './rpc-error';
+import { logger } from '../utils/logger';
 import { actorEmail } from '../actor-ref';
 import { resolveGitIdentity } from '../identity/git-identity';
 import { getOrCreateStorage } from './rpc-handlers';
@@ -132,7 +133,9 @@ export async function resolveSessionAttachTarget(
         message:
           builder.state === 'ended'
             ? `Builder session ${sessionId} has ended and cannot be attached to.`
-            : `Builder session ${sessionId} is ${builder.state}, not running. Start it with startBuilderSession, then attach.`,
+            : builder.state === 'stopped'
+              ? `Your builder is stopped. ${BUILDER_RESUME_HINT}`
+              : `Your builder is still starting. Try again in a moment.`,
       };
     }
     try {
@@ -145,7 +148,7 @@ export async function resolveSessionAttachTarget(
       return {
         ok: false,
         status: 409,
-        message: `This project runs on the ${runner.type} runner, which has no container to attach to.`,
+        message: `Builders can't run on this project's setup.`,
       };
     }
     return {
@@ -194,7 +197,11 @@ export async function resolveSessionAttachTarget(
         message:
           `Task ${task.code ?? task.id} is running a turn` +
           (owner ? ` on ${owner === SERVICE_CREDENTIAL_USER_ID ? "the project's service" : `${owner}'s`} credential` : '') +
-          `. A terminal opens once the turn has ended.`,
+          // Never "a terminal opens once the turn has ended": nothing opens one
+          // by itself, so that promised something that never happened. Say
+          // why, and what the reader can do.
+          `, and a terminal cannot open while it does — the agent and a terminal share the task's ` +
+          `working copy. When the turn ends, open the terminal again (or stop the task to open it now).`,
       };
     }
     // The entry's other refusal, said early too: a task that has not run a
@@ -246,6 +253,9 @@ export async function resolveSessionAttachTarget(
  * A member's task terminal gets a container of its own, created when it
  * opens, so there is nothing to find running beforehand.
  */
+/** Where a stopped builder is resumed, for every refusal that names one. */
+export const BUILDER_RESUME_HINT = 'Resume it with Resume on its page under Builders, or with `lazy builder`.';
+
 export function attachNeedsRunningContainer(target: SessionAttachTarget, multiMember: boolean): boolean {
   return !(target.kind === 'task' && multiMember);
 }
@@ -263,13 +273,36 @@ export async function confirmAttachTargetRunning(
     ? target.session.runner_type ?? target.task.runner_type ?? undefined
     : undefined;
   const runner = await createRunner(projectRoot, runnerType);
+  if (target.kind === 'builder') {
+    // Three-way: a runtime that did not answer is not a dead builder, and the
+    // refusal must say which it was — the two used to read identically.
+    const probe = await probeBuilderRun(runner, target.container);
+    if (probe.state === 'running') return { ok: true };
+    if (probe.state === 'unknown') {
+      logger.warn(`Attach to builder session ${target.sessionId}: liveness unknown: ${probe.reason}`);
+      return {
+        ok: false,
+        status: 503,
+        message: 'Could not check whether your builder is running right now. Try again in a moment.',
+      };
+    }
+    // Record what the listings will say from now on (stopped, with how it
+    // ended), so the badge never keeps saying "Running" beside this refusal.
+    await settleDeadBuilderSessions(projectRoot);
+    const storage = await getOrCreateStorage();
+    const now = await storage.getBuilderSession(target.sessionId);
+    const how = now?.lastExit ? ` ${now.lastExit.split('\n')[0]}` : '';
+    return {
+      ok: false,
+      status: 409,
+      message: `Your builder is not running any more.${how} ${BUILDER_RESUME_HINT}`,
+    };
+  }
   if (await runner.isRunning(target.container)) return { ok: true };
   return {
     ok: false,
     status: 409,
-    message: target.kind === 'builder'
-      ? `Container for builder session ${target.sessionId} is not running.`
-      : `Container for this task is not running.`,
+    message: `Container for this task is not running.`,
   };
 }
 

@@ -24,6 +24,7 @@
  */
 
 import { runGit } from '../utils/git';
+import { taskGitPointerMounts } from '../git/worktree-pointers';
 
 export interface GitMountPaths {
   /** The shared git dir, `<repo>/.git` — mounted read-only. */
@@ -96,7 +97,32 @@ export function buildGitMountArgs(paths: GitMountPaths): string[] {
   ];
 }
 
-/** Convenience: resolve + build in one step. */
-export async function buildGitMountArgsFor(worktreePath: string): Promise<string[]> {
-  return buildGitMountArgs(await resolveGitMountPaths(worktreePath));
+
+/**
+ * The full git mount set for a TASK container: the split mount above, plus
+ * read-only copies of the worktree's three git pointer files bound over the
+ * originals (../git/worktree-pointers.ts).
+ *
+ * The paths come from reading and checking the pointer files, never from
+ * running git — git in a worktree whose pointers were redirected would follow
+ * the redirection. A tampered worktree throws GitPointerTamperError and no
+ * container is launched on it.
+ *
+ * INVARIANT: every task container mounts `<worktree>/.git`, `<gitdir>/commondir`
+ * and `<gitdir>/gitdir` read-only. They sit inside the writable worktree and
+ * the writable per-worktree gitdir, and rewriting any of them is enough to
+ * make the next git OUTSIDE the container — the daemon's, or the human's —
+ * run code the task planted.
+ */
+export async function buildTaskGitMounts(
+  projectRoot: string,
+  worktreePath: string,
+): Promise<{ paths: GitMountPaths; args: string[]; pointerTargets: string[] }> {
+  const { layout, mountArgs } = await taskGitPointerMounts(projectRoot, worktreePath);
+  const paths = { commonDir: layout.commonDir, objectsDir: layout.objectsDir, worktreeGitDir: layout.worktreeGitDir };
+  return {
+    paths,
+    args: [...buildGitMountArgs(paths), ...mountArgs],
+    pointerTargets: layout.pointerFiles.map((f) => f.target),
+  };
 }
