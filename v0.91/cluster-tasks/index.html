@@ -145,6 +145,8 @@ sets aside is tagged <code>deferred-by-&lt;cluster&gt;</code>, so you can find t
 what it needs from you. Blocking means accepting the cluster is refused until you
 have answered them, so a cluster can never quietly hand back a pile of work it
 never did.</p>
+<h2 id="which-agent-the-children-run-on"><a class="anchor" href="#which-agent-the-children-run-on" aria-hidden="true">#</a>Which agent the children run on</h2>
+<p>A child created without an agent runs on the driver&#39;s own agent profile, and so on that profile&#39;s model. <code>[agent.by_type]</code> in <code>lazy.toml</code> is not consulted for children, so a cluster on an expensive profile keeps every child there. To run a child on a cheaper profile, create it with an explicit agent (<code>--agent &lt;profile&gt;</code>, or the <code>agent</code> argument over MCP); the driver can do this itself, choosing from the profiles the project offers. Children also do not inherit the driver&#39;s task type: with no type given they are plain <code>task</code>s.</p>
 <h2 id="watching-it"><a class="anchor" href="#watching-it" aria-hidden="true">#</a>Watching it</h2>
 <p><code>lazy show &lt;cluster&gt;</code> prints the cluster&#39;s progress: how many children have been
 accepted out of how many are still expected to land, which are running, which

@@ -75,7 +75,13 @@ rather than quietly running an agent on your machine instead.</p>
 <pre><code>lazy pair &lt;task&gt;          # in the task&#39;s container (the normal case)
 lazy pair &lt;task&gt; --host   # claude-code only: on your machine instead of the container
 lazy pair --host          # branchless: no task, no worktree, no container
+lazy pair --host --no-task  # same, on ANY branch — even a lazy/* branch with no task in this store
 </code></pre>
+<p>If you are on a <code>lazy/*</code> branch whose task this store does not know (a branch
+from another machine, or a task since closed), <code>lazy pair</code> refuses. Add
+<code>--no-task</code> (with <code>--host</code>) to skip task detection and pair in the current
+directory on your machine. It cannot be combined with a task argument,
+<code>--unlock</code> or <code>--no-summary</code>; <code>--resume &lt;session&gt;</code> works as in branchless mode.</p>
 <h2 id="tools-the-paired-session-gets"><a class="anchor" href="#tools-the-paired-session-gets" aria-hidden="true">#</a>Tools the paired session gets</h2>
 <p>A paired session is wired with <strong>this task&#39;s</strong> <code>lazy_*</code> MCP tools — the same
 scoped toolset the task&#39;s own agent gets, not the broader builder toolset. That

@@ -475,6 +475,14 @@ a hunt:</p>
 </code></pre>
 <p>The daemon applies the same rule before it starts anything at all, so a broken
 <code>lazy.toml</code> never gets as far as a daemon running on guessed values.</p>
+<p>A daemon that is ALREADY running is different: if <code>lazy.toml</code> breaks while it
+runs, it keeps working on the last config it loaded from that same file rather
+than stopping. It says so once in a system message (<code>lazy messages</code>), and for
+as long as the file stays broken <code>lazy daemon status</code> and <code>lazy doctor</code> report
+that the last good config is in use. Fix the file and the daemon picks it up
+again by itself. Until then, do not run <code>lazy daemon restart</code> or <code>lazy upgrade</code>:
+a daemon cannot start on a file that does not load, so you would be left with
+no daemon at all.</p>
 <p>The same applies to a value that parses as TOML but isn&#39;t usable — an unknown
 effort level, a port outside 1–65535, a malformed <code>[docs] url</code>. Each is
 reported with the section, the key, and the accepted values.</p>
@@ -567,7 +575,9 @@ turns run — not as a host process against the worktree. <strong>Branchless pai
 (<code>lazy pair</code> on a non-task branch: no task, no worktree) has no container and
 requires an explicit <code>lazy pair --host</code>, which says what it is doing before it
 launches. There is no automatic fallback: if the container path fails, pairing
-fails loudly. See <a href="../pairing/">Pairing</a>.</p>
+fails loudly. If you are on a <code>lazy/*</code> branch whose task this store does not
+have (or cannot pair), <code>lazy pair --host --no-task</code> pairs in the current
+directory with no task context. See <a href="../pairing/">Pairing</a>.</p>
 <p>Cursor tasks now pair too — the refusal that used to apply to them was about
 host pairing needing to copy container-written chat history onto your host, and
 in-container pairing does not copy anything. Conversation capture and the

@@ -47,6 +47,27 @@ h2.group { margin-top:2.5rem; }</style>
 <p>The most common cause is a <strong>duplicate table</strong>. <code>lazy init</code> already writes <code>[runner]</code>, <code>[server]</code>, <code>[storage]</code>, <code>[remote]</code>, <code>[docker]</code> and others, so appending a second copy of one is a TOML redefinition error. Edit the table that is already there instead of adding another one.</p>
 <p><strong>The daemon refuses to start on such a config</strong>, whether it failed to parse or was rejected for an invalid value — it fails before the dashboard port is bound, with an error naming the file and the cause, and tears down what it had already opened — timers, storage, the lock — so a refused start leaves nothing listening and nothing to clean up by hand. It reads the dashboard port, the bind interface, and the runner from this file and hands the last of those to every task it launches, so starting on guessed values would serve a dashboard on a port you did not configure with a runner you may not have. This joins the daemon&#39;s other hard startup precondition, the <a href="#proxy">proxy bind</a>. A missing model credential is <em>not</em> one: only turns need it.</p>
 <p><code>lazy doctor</code> is the exception that keeps working: it reports the parse failure as a failed <code>lazy.toml parses</code> check and skips every config-dependent check rather than reporting defaults as if you had chosen them. It keeps working <em>without a daemon</em>, too — every other command auto-starts one and fails when that start fails, but doctor prints why the daemon isn&#39;t there and runs its remaining checks anyway. It is the command you reach for when nothing else runs, so it must not die of the thing it is meant to diagnose.</p>
+<p><strong>A running daemon never stops over a config that breaks.</strong> If <code>lazy.toml</code> stops parsing or validating while the daemon is running — say, you saved it mid-edit — the daemon keeps working on the last config it loaded from that same file, instead of failing every turn and request. It says so once, loudly: a system message (see <code>lazy messages</code>) naming the file and the error, and for as long as the file stays broken <code>lazy daemon status</code> and <code>lazy doctor</code> report that the last good config is in use. Nothing you changed after that point is in effect. Fix the file and the daemon picks it up again by itself. Until then, do not run <code>lazy daemon restart</code> or <code>lazy upgrade</code> — a daemon cannot start on a file that does not load, so you would be left with none. It only ever falls back to a copy of the same file, never to another one.</p>
+<h2 id="which-settings-need-a-reload-or-a-restart"><a class="anchor" href="#which-settings-need-a-reload-or-a-restart" aria-hidden="true">#</a>Which settings need a reload or a restart</h2>
+<p>Almost everything in <code>lazy.toml</code> is read each time it is used — the next turn, the next background check — so saving the file is enough. A few settings are read once, when the daemon starts:</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Apply a change with</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>[server] dashboard_url</code>, <code>[server] sync_interval</code></td>
+<td><code>lazy daemon reload</code> — no restart, nothing interrupted</td>
+</tr>
+<tr>
+<td><code>[server] port</code>, <code>[server] bind</code>, <code>[runner] type</code> (which interfaces the daemon listens on), <code>[storage]</code>, <code>[data] path</code> (the proxy&#39;s audit log), every <code>[proxy]</code> setting, and <code>[agents.&lt;name&gt;]</code> endpoints and credentials</td>
+<td><code>lazy daemon restart</code></td>
+</tr>
+</tbody></table>
+<p><code>lazy daemon status</code> shows which <code>lazy.toml</code> the daemon is using — its full path and why that file (the project root&#39;s, <code>LAZY_CONFIG</code>, or a control plane&#39;s managed copy) — and lists every setting above whose running value differs from the file, marked pending, with the command that applies it. <code>lazy daemon status --json</code> gives the same as JSON.</p>
+<p><code>lazy daemon reload</code> re-reads that file, applies what it can, and lists what still needs <code>lazy daemon restart</code> without changing it. A file that does not load is refused with its error, and the daemon keeps its running config.</p>
 <hr>
 <h2 id="models"><a class="anchor" href="#models" aria-hidden="true">#</a><code>[models]</code></h2>
 <p>Controls which AI model agents use by default.</p>
@@ -566,7 +587,7 @@ default <code>lazy</code>.</p>
 <td><code>by_type</code></td>
 <td><code>table</code></td>
 <td><em>(empty)</em></td>
-<td>Per-task-type agent overrides (<code>[agent.by_type]</code>). Keys are task type names (<code>fix</code>, <code>feature</code>, <code>spike</code>, …); values are agent profile names. Unmapped types use <code>agent_id</code>. An explicit <code>--agent</code> still wins; subtasks, clones, redo and rework inherit the source task&#39;s profile and ignore this table. Unknown type names or profile names are rejected at load time. See <code>lazy.toml.example</code> for the full list of task types and which dedicated commands (<code>lazy fix</code>, <code>lazy refactor</code>, …) exist.</td>
+<td>Per-task-type agent overrides (<code>[agent.by_type]</code>). Keys are task type names (<code>fix</code>, <code>feature</code>, <code>spike</code>, …); values are agent profile names. Unmapped types use <code>agent_id</code>. A new task&#39;s profile is chosen in this order: (1) an explicit <code>--agent</code> (or the MCP <code>agent</code> argument); (2) the task it comes from — a subtask&#39;s parent, or the source of a clone, redo or rework — whose profile it inherits, <strong>without consulting this table</strong>; (3) this table, for the task&#39;s type; (4) <code>agent_id</code>. So this table only routes tasks created from scratch: the children of a cluster on an expensive profile stay on it, whatever their own type maps to, unless each child is created with an explicit agent. A subtask does not inherit its parent&#39;s task type either — with no type given it is a plain <code>task</code>. A subtask does not copy its parent&#39;s model or effort (a clone or redo keeps its source&#39;s model unless you switch agent): unless set on the task, each turn uses the chosen profile&#39;s model (else the agent&#39;s default, else the project&#39;s default model) and <code>[agent] effort</code>. Unknown type names or profile names are rejected at load time. See <code>lazy.toml.example</code> for the full list of task types and which dedicated commands (<code>lazy fix</code>, <code>lazy refactor</code>, …) exist.</td>
 </tr>
 <tr>
 <td><code>watchdog_output_timeout_ms</code></td>
@@ -904,18 +925,18 @@ dashboard, not your project&#39;s dev servers.</p>
 <td><code>dashboard_url</code></td>
 <td><code>string</code></td>
 <td>unset</td>
-<td>Exact public origin used to reach the dashboard through a trusted reverse proxy, for example <code>&quot;https://lazy.example.com&quot;</code>. A trailing slash is ignored and a port is kept (<code>&quot;https://lazy.example.com:8443&quot;</code>). When set, dashboard links use this origin and dashboard authentication accepts only its host and origin — the local <code>http://lazy.localhost:&lt;port&gt;</code> address is refused. Paths, queries, fragments, and credentials are rejected. Restart the daemon after changing it.</td>
+<td>Exact public origin used to reach the dashboard through a trusted reverse proxy, for example <code>&quot;https://lazy.example.com&quot;</code>. A trailing slash is ignored and a port is kept (<code>&quot;https://lazy.example.com:8443&quot;</code>). When set, dashboard links use this origin and dashboard authentication accepts only its host and origin — the local <code>http://lazy.localhost:&lt;port&gt;</code> address is refused. Paths, queries, fragments, and credentials are rejected. Apply a change with <code>lazy daemon reload</code>.</td>
 </tr>
 <tr>
 <td><code>sync_interval</code></td>
 <td><code>number</code></td>
 <td><code>60</code></td>
-<td>Interval in seconds for the daemon&#39;s background sync. Set to <code>0</code> to disable.</td>
+<td>Interval in seconds for the daemon&#39;s background sync. Set to <code>0</code> to disable. Apply a change with <code>lazy daemon reload</code>.</td>
 </tr>
 </tbody></table>
 <p>To use a tunnel such as ngrok or Tailscale serve, point it at the daemon&#39;s
 local dashboard port, set <code>dashboard_url</code> to the tunnel&#39;s HTTPS origin, and
-restart the daemon. Treat the tunnel as a trusted proxy: this setting
+run <code>lazy daemon reload</code>. Treat the tunnel as a trusted proxy: this setting
 deliberately makes that public host the dashboard&#39;s sign-in and session
 boundary. The dashboard still requires a one-time login link from
 <code>lazy dashboard</code>.</p>
@@ -933,7 +954,7 @@ public origin, paste such links into the address bar instead of clicking them.</
 <li><strong>The daemon reads <code>dashboard_url</code> when it starts.</strong> If you change it while
 the daemon is running, <code>lazy dashboard</code> and <code>lazy daemon dashboard-url</code>
 keep printing the address being served and add one line naming both
-addresses: run <code>lazy daemon restart</code> to apply it. They say so too when
+addresses: run <code>lazy daemon reload</code> to apply it (no restart needed). They say so too when
 <code>dashboard_url</code> sits under a table other than <code>[server]</code>, where it is
 ignored.</li>
 <li><strong><code>lazy doctor</code> shows what is in effect</strong>: the origin that links and sign-in
