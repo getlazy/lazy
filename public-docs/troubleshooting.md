@@ -478,6 +478,15 @@ Failed to parse /path/to/lazy.toml: line 8: port = = 26024 — TOML Parse error:
 The daemon applies the same rule before it starts anything at all, so a broken
 `lazy.toml` never gets as far as a daemon running on guessed values.
 
+A daemon that is ALREADY running is different: if `lazy.toml` breaks while it
+runs, it keeps working on the last config it loaded from that same file rather
+than stopping. It says so once in a system message (`lazy messages`), and for
+as long as the file stays broken `lazy daemon status` and `lazy doctor` report
+that the last good config is in use. Fix the file and the daemon picks it up
+again by itself. Until then, do not run `lazy daemon restart` or `lazy upgrade`:
+a daemon cannot start on a file that does not load, so you would be left with
+no daemon at all.
+
 The same applies to a value that parses as TOML but isn't usable — an unknown
 effort level, a port outside 1–65535, a malformed `[docs] url`. Each is
 reported with the section, the key, and the accepted values.
@@ -608,7 +617,9 @@ turns run — not as a host process against the worktree. **Branchless pairing**
 (`lazy pair` on a non-task branch: no task, no worktree) has no container and
 requires an explicit `lazy pair --host`, which says what it is doing before it
 launches. There is no automatic fallback: if the container path fails, pairing
-fails loudly. See [Pairing](pairing.md).
+fails loudly. If you are on a `lazy/*` branch whose task this store does not
+have (or cannot pair), `lazy pair --host --no-task` pairs in the current
+directory with no task context. See [Pairing](pairing.md).
 
 Cursor tasks now pair too — the refusal that used to apply to them was about
 host pairing needing to copy container-written chat history onto your host, and

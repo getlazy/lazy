@@ -1,16 +1,20 @@
 # `lazy`
 
-`lazy` is:
+`lazy` is an asynchronous agentic orchestrator built, first and foremost, to optimize human productivity when working with coding agents. It takes over the low-level work (managing agents, their lifetimes and permissions, git, reviews) so you work with tasks, decisions and policies, not agent micromanagement and branch manipulation.
 
-* A secure, locally hosted agent [orchestrator](#the-orchestrator): `lazy` is both a software development lead (`builder` mode) and a fleet of autonomous agents working on your behalf, concurrently and asynchronously.
-* A [proxy](#the-proxy) for AI-human collaboration: `lazy` captures conversations, reviews, and decisions in a searchable data store, under your control and giving both you and your agents improved situational awareness.
-* A [software development lifecycle](#the-task-manager) tool integrating `git`: `lazy` treats the task -> work -> review -> acceptance/rejection cycle as a first-class development abstraction implemented through `git`. The same way the proxy wraps coding assistants and you don't invoke them directly, `lazy` removes the need to directly interact with `git`.
+- **One way to run every agent.** Claude Code, Codex, Cursor and Pi run the same way: in their own containers, with limited write access to the repo, sharing the same
+limitations, prompts, memories, tool access in order to achive normalized output.
+- **Deterministic code harnessing nondeterministic agents.** Lifecycle, merges and gates are ordinary code; agents do their work in isolation, strictly bounded on both semantic and system access levels, by the deterministic code.
+- **Tasks are units of work.** Each task goes through work → review → accept/reject cycle, and is reviewed and accepted by you or a parent agent, with agents adapting their behavior according to the audience. The tasks can be organized in human-to-agent and agent-to-agent hierarchies (with interactive builders or automated clusters of tasks) but none of that is required and you can just work with a flat list of tasks.
+- **Everything is captured.** Every human-to-agent and agent-to-agent interaction (be it prompt, review, question, response, etc) is captured and stored in a searchable store you control, which you and your agents can both read.
+- **Cost-aware.** `lazy` tracks token usage for agents that report it, and can pause work and schedule it to match.
 
 ## What are the main benefits
 
 * Prolonged autonomous horizon for agents (hours not tens of minutes)
 * Autonomous, concurrent, asynchronous (turn based) work across many tasks
 * Increased agent situational awareness (agents can search over all past tasks and prompts)
+* Mix and match hierarchies of different agents and different models working seamlessly.
 
 ## Quick Start
 

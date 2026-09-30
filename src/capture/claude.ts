@@ -960,6 +960,40 @@ interface DockerBuildRequest {
   notify?: PhaseNotify;
 }
 
+/** Lines of the failing step's own output shown on a build failure. */
+const BUILD_FAILURE_STEP_LINES = 40;
+
+/**
+ * The part of a failed build's output the human needs. BuildKit (plain
+ * progress, which it selects itself when stderr is not a TTY — as here, where
+ * it is piped) prefixes every line with its step number
+ * (`#50 12.3 error[E0308]: ...`) and ends with a Dockerfile excerpt and a
+ * "failed to solve" line, so a plain tail shows only that boilerplate. Find the
+ * step that ERRORed and return its last lines plus the ERROR line. Output with
+ * no such step (the classic builder, or anything unparseable) falls back to
+ * the plain last 10 lines.
+ */
+export function extractBuildFailureOutput(output: string): string {
+  const lines = output.split('\n');
+  const fallback = () => lines.slice(-10).join('\n');
+  let errorIdx = -1;
+  let step = '';
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = /^#(\d+) ERROR\b/.exec(lines[i]);
+    if (m) { errorIdx = i; step = m[1]; break; }
+  }
+  if (errorIdx < 0) return fallback();
+  const prefix = `#${step} `;
+  const stepLines = lines
+    .slice(0, errorIdx)
+    .filter(l => l.startsWith(prefix))
+    .map(l => l.slice(prefix.length))
+    // BuildKit's own status lines, not the step's output.
+    .filter(l => !/^(\d+(\.\d+)?\s+)?(DONE|CACHED)\b/.test(l));
+  if (stepLines.length === 0) return fallback();
+  return [...stepLines.slice(-BUILD_FAILURE_STEP_LINES), lines[errorIdx]].join('\n');
+}
+
 async function runDockerBuild(request: DockerBuildRequest): Promise<void> {
   const { buildCwd, dockerfilePath, tags, identity, binary, noCache, source, reason, signal, notify } = request;
   const timeoutMs = request.timeoutMs ?? 0;
@@ -1061,7 +1095,7 @@ async function runDockerBuild(request: DockerBuildRequest): Promise<void> {
     // fall back to stdout so the tail is never empty just because of which
     // builder the daemon happens to be using.
     const failureOutput = (stderr.trim() || stdout.trim());
-    const lastOutput = failureOutput.split('\n').slice(-10).join('\n');
+    const lastOutput = extractBuildFailureOutput(failureOutput);
     logger.error(`Container build failed with exit code ${exitCode}\n\nLast output:\n${lastOutput}`);
     throw new Error(`Container build failed with exit code ${exitCode}`);
   }

@@ -231,6 +231,7 @@ describe('lazy pair', () => {
 
     expectFailure(result);
     expectError(result, 'has no session');
+    expectError(result, '--host --no-task');
   });
 
   test('fails when task is working', async () => {
@@ -242,6 +243,7 @@ describe('lazy pair', () => {
 
     expectFailure(result);
     expectError(result, 'currently working');
+    expectError(result, '--host --no-task');
   });
 
   test('--unlock removes pairing lock', async () => {
@@ -392,6 +394,51 @@ describe('lazy pair', () => {
     expectFailure(result);
     expectError(result, '--resume is only valid in branchless mode');
     expectError(result, 'Task-based pairing resumes sessions automatically');
+  });
+
+  // INVARIANT: a lazy/* branch with no task in this store refuses by default and
+  // names --no-task; --no-task then pairs branchless on that same branch.
+  test('--no-task pairs branchless on a lazy/* branch with no task', async () => {
+    const co = ctx.git('checkout', '-b', 'lazy/nonexistent1');
+    expect(co.exitCode).toBe(0);
+
+    const refused = await ctx.lazy(['pair', '--host']);
+    expectFailure(refused);
+    expectError(refused, '--host --no-task');
+
+    const ok = await ctx.lazy(['pair', '--host', '--no-task']);
+    expectOutput(ok, 'Launching Claude Code');
+    expectOutput(ok, 'no task context');
+  });
+
+  test('an explicit unknown task refuses and names --no-task', async () => {
+    const result = await ctx.lazy(['pair', 'nosuchtask9']);
+    expectFailure(result);
+    expectError(result, '--host --no-task');
+  });
+
+  // INVARIANT: --no-task is branchless host pairing only; it never combines with
+  // anything task-scoped, so a user cannot believe they paired on a task.
+  test('--no-task refusal combinations', async () => {
+    const noHost = await ctx.lazy(['pair', '--no-task']);
+    expectFailure(noHost);
+    expectError(noHost, 'lazy pair --host --no-task');
+
+    const withTask = await ctx.lazy(['pair', 'abc123', '--host', '--no-task']);
+    expectFailure(withTask);
+    expectError(withTask, 'conflicts with a task argument');
+
+    const withUnlock = await ctx.lazy(['pair', '--host', '--no-task', '--unlock']);
+    expectFailure(withUnlock);
+    expectError(withUnlock, 'conflicts with --unlock');
+
+    const withNoSummary = await ctx.lazy(['pair', '--host', '--no-task', '--no-summary']);
+    expectFailure(withNoSummary);
+    expectError(withNoSummary, 'conflicts with --no-summary');
+
+    const withResume = await ctx.lazy(['pair', '--host', '--no-task', '--resume', 'abc123session']);
+    expectOutputExcludes(withResume, 'Usage: lazy pair');
+    expectOutput(withResume, 'no task context');
   });
 
   test('--resume fails when on task branch (detected task)', async () => {

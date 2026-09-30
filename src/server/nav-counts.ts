@@ -9,6 +9,7 @@
 import type { Storage } from '../storage';
 import { logger } from '../utils/logger';
 import { isClusterTask } from '../types';
+import { isBlockedStatus } from '../task-state-machine';
 import { activeClusterCount } from '../task/cluster-entries';
 import { unreadCount } from './messages';
 import type { ReviewActions } from './review-actions';
@@ -18,6 +19,10 @@ export interface NavCounts {
   unread: number | null;
   review: number | null;
   clusters: number | null;
+  /** Non-terminal tasks whose agent is running. */
+  active: number | null;
+  /** Non-terminal tasks waiting for a human: blocked, conflict or submitted. */
+  blocked: number | null;
   raisedBlocking: number | null;
   raisedNonBlocking: number | null;
   followups: number | null;
@@ -109,6 +114,10 @@ export async function computeNavCounts(
     clusters: liveTasks.status === 'fulfilled'
       ? activeClusterCount(liveTasks.value.filter((t) => isClusterTask(t)))
       : null,
+    // The Tasks badge from the same non-terminal read as `clusters`, so a client
+    // never pulls the task list just to count it.
+    active: liveTasks.status === 'fulfilled' ? liveTasks.value.filter((t) => t.status === 'working').length : null,
+    blocked: liveTasks.status === 'fulfilled' ? liveTasks.value.filter((t) => isBlockedStatus(t.status)).length : null,
     // Two numbers, one badge: blocking items hold up an accept and non-blocking
     // ones never do, so a single total would hide the only one that is urgent.
     raisedBlocking: raised.status === 'fulfilled' ? raised.value.total_open_blocking : null,

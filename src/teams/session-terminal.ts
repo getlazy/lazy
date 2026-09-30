@@ -44,6 +44,12 @@ export interface RemoteAttachUrlInput {
   teamsUrl: string;
   /** `<team>/<project>`, as the clone's binding records it. */
   project: string;
+  /**
+   * The project's id, as the binding records it: Teams reaches the bound
+   * project by it after a rename, and refuses rather than attach to a
+   * different project that took the old address.
+   */
+  projectId?: string;
   sessionId: string;
   cols: number;
   rows: number;
@@ -62,6 +68,7 @@ export function remoteAttachUrl(input: RemoteAttachUrlInput): string {
   );
   url.searchParams.set('cols', String(input.cols));
   url.searchParams.set('rows', String(input.rows));
+  if (input.projectId) url.searchParams.set('project_id', input.projectId);
   if (input.mode && input.mode !== 'attach') url.searchParams.set('mode', input.mode);
   return url.toString();
 }

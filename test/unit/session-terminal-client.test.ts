@@ -18,6 +18,14 @@ describe('remoteAttachUrl', () => {
       .toBe('ws://127.0.0.1:3000/api/projects/a/b/sessions/..%2Fx%3Fy/attach?cols=80&rows=24&mode=pair');
   });
 
+  // INVARIANT: a bound clone names the project it bound to by ID as well as by
+  // address. A project can be renamed and its old address taken by another;
+  // Teams reaches the bound project by this id, never the address's new holder.
+  test('carries the bound project id when the binding recorded one', () => {
+    expect(remoteAttachUrl({ teamsUrl: 'https://t', project: 'a/b', projectId: '42', sessionId: 's', cols: 80, rows: 24 }))
+      .toBe('wss://t/api/projects/a/b/sessions/s/attach?cols=80&rows=24&project_id=42');
+  });
+
   test('a builder attach sends no mode', () => {
     expect(remoteAttachUrl({ teamsUrl: 'http://h', project: 'a/b', sessionId: 's', cols: 80, rows: 24, mode: 'attach' }))
       .not.toContain('mode=');

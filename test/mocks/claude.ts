@@ -212,6 +212,8 @@ export async function buildProjectImageToTag(
   if (delayMs > 0) {
     await new Promise(resolve => setTimeout(resolve, delayMs));
   }
+  const failMessage = process.env.LAZY_MOCK_BUILD_FAIL;
+  if (failMessage) throw new Error(failMessage);
   return `lazy-runner:${tag}`;
 }
 

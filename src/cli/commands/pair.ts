@@ -332,6 +332,7 @@ export async function commandPair(args: string[]): Promise<void> {
     { name: 'autonomous', takesValue: false },
     { name: 'yes', takesValue: false },
     { name: 'host', takesValue: false },
+    { name: 'no-task', takesValue: false },
   ], 'pair');
 
   let taskId = parsed.positional[0];
@@ -341,6 +342,29 @@ export async function commandPair(args: string[]): Promise<void> {
   const autonomous = parsed.flags.get('autonomous') === true;
   const yes = parsed.flags.get('yes') === true;
   const hostRequested = parsed.flags.get('host') === true;
+  const noTask = parsed.flags.get('no-task') === true;
+
+  // --no-task is an explicit "pair here on the host, whatever the branch":
+  // validate the combination before anything else runs.
+  if (noTask) {
+    if (!hostRequested) {
+      console.error('Error: --no-task requires --host — with no task there is no container to pair in.');
+      console.error('Run: lazy pair --host --no-task');
+      process.exit(1);
+    }
+    if (taskId) {
+      console.error('Error: --no-task conflicts with a task argument. Drop one of them.');
+      process.exit(1);
+    }
+    if (unlock) {
+      console.error('Error: --no-task conflicts with --unlock — unlocking is task-scoped.');
+      process.exit(1);
+    }
+    if (noSummary) {
+      console.error('Error: --no-task conflicts with --no-summary — branchless pairing has no summary step.');
+      process.exit(1);
+    }
+  }
 
   const root = requireLazyRoot();
 
@@ -371,6 +395,13 @@ export async function commandPair(args: string[]): Promise<void> {
     }
 
     console.log('');
+  }
+
+  const noTaskHint = 'To pair here on the host with no task context, run: lazy pair --host --no-task';
+
+  if (noTask) {
+    await pairBranchless(root, resumeSessionId, autonomous);
+    return;
   }
 
   // If no task argument, try to detect from current branch
@@ -422,8 +453,9 @@ export async function commandPair(args: string[]): Promise<void> {
   const storage = await requireStorage();
 
   try {
-    // Resolve task
-    const task = await resolveTaskOrExit(storage, taskId);
+    // Resolve task. A lazy/* branch may name a task this store never had, or
+    // one that matches several, so those refusals carry the way out.
+    const task = await resolveTaskOrExit(storage, taskId, noTaskHint);
     const taskShortId = shortId(task.id);
     const worktreePath = getWorktreePath(root, task);
 
@@ -431,17 +463,20 @@ export async function commandPair(args: string[]): Promise<void> {
     const sess = await storage.getSessionByTaskId(task.id);
     if (!sess) {
       console.error(`Task ${displayId(task)} has no session. Start it first with: lazy start ${displayId(task)}`);
+      console.error(noTaskHint);
       process.exit(1);
     }
 
     if (sess.ended_at) {
       console.error(`Session has ended (${sess.outcome ?? 'ended'}). Cannot pair on a completed task.`);
+      console.error(noTaskHint);
       process.exit(1);
     }
 
     // Check worktree exists
     if (!existsSync(worktreePath)) {
       console.error(`Worktree not found at ${worktreePath}. Session may have been cleaned up.`);
+      console.error(noTaskHint);
       process.exit(1);
     }
 
@@ -486,6 +521,7 @@ export async function commandPair(args: string[]): Promise<void> {
       } else {
         console.error(`Task ${displayId(task)} is in state '${task.status}'. Can only pair with blocked, conflict, or interrupted tasks.`);
       }
+      console.error(noTaskHint);
       process.exit(1);
     }
 
@@ -495,6 +531,7 @@ export async function commandPair(args: string[]): Promise<void> {
       console.error(`Task ${displayId(task)} is already being paired on (PID ${existingPairingLock.pid}).`);
       console.error(`Started at: ${existingPairingLock.started_at}`);
       console.error(`\nIf this is stale, clear it with: lazy pair ${displayId(task)} --unlock`);
+      console.error(noTaskHint);
       process.exit(1);
     }
 
@@ -536,6 +573,7 @@ export async function commandPair(args: string[]): Promise<void> {
       console.error(`  lazy show ${displayId(task)}              # the task's turns, safe to read`);
       console.error(`  lazy unblock ${displayId(task)} -m "..."  # steer the agent with feedback`);
       console.error(`  lazy chat ${displayId(task)}              # read-only conversation about the work`);
+      console.error(noTaskHint);
       process.exit(1);
     }
 
@@ -551,6 +589,7 @@ export async function commandPair(args: string[]): Promise<void> {
       console.error('Give the task a container runner, then pair in it:');
       console.error(`  lazy edit ${displayId(task)} --runner docker`);
       console.error(`  lazy pair ${displayId(task)}`);
+      console.error(noTaskHint);
       process.exit(1);
     }
     const taskRunner = createRunnerFromType(taskRunnerType);
@@ -579,6 +618,7 @@ export async function commandPair(args: string[]): Promise<void> {
         console.error(`  lazy start ${displayId(task)} --runner docker  # give the task a container to pair in`);
       }
       console.error(`  lazy chat ${displayId(task)}                 # read-only conversation about the work`);
+      console.error(noTaskHint);
       process.exit(1);
     }
     if (useHost) {
@@ -1070,7 +1110,7 @@ Keep the summary concise and factual.`);
 }
 
 export function pairUsage(): void {
-  console.log(`Usage: lazy pair [task_id] [--unlock] [--no-summary] [--resume <session_id>] [--autonomous] [--yes] [--host]
+  console.log(`Usage: lazy pair [task_id] [--unlock] [--no-summary] [--resume <session_id>] [--autonomous] [--yes] [--host] [--no-task]
 
 Open an interactive agent session, context-aware.
 
@@ -1079,6 +1119,8 @@ Three modes:
   2. lazy pair                  On a lazy/* branch: detect the task, pair on it
   3. lazy pair --host           On main or a non-task branch: launch the agent
                                 in the current directory (no task context)
+  4. lazy pair --host --no-task Same, on ANY branch — even a lazy/* branch with no
+                                task in this store
 
 In task mode the session runs INSIDE the task's container, where the task's
 own turns run: it reads the same agent home directory the agent already
@@ -1095,8 +1137,9 @@ In task mode (1 & 2), the task is locked during pairing — other commands
 (start, unblock, accept, reject, resume) will refuse to operate until
 pairing ends.
 
-In branchless mode (3) there is no task and no container, so the agent runs
-on your machine: --host is required. The conversation is captured into
+In branchless mode (3, 4) there is no task and no container, so the agent runs
+on your machine: --host is required (and --no-task, on a lazy/* branch or to
+skip task detection). The conversation is captured into
 lazy's storage so it's searchable via lazy search.
 
 Arguments:
@@ -1113,6 +1156,9 @@ Options:
                          confirmed separately.
   --yes                  Auto-confirm prompts (required with --autonomous --host in
                          non-TTY mode)
+  --no-task              With --host: skip task detection and pair in the current
+                         directory with no task context, on any branch (including a
+                         lazy/* branch this store has no task for)
   --host                 Run the agent on your machine instead of in the task's container.
                          Required for branchless mode; on a task it is an explicit
                          claude-code-only opt-in. Never a silent fallback.
@@ -1122,6 +1168,7 @@ Examples:
   lazy pair abc123 --unlock          # Clear a stale pairing lock
   lazy pair                          # Detect task from branch and pair in its container
   lazy pair --no-summary             # Pair without AI summary
+  lazy pair --host --no-task         # Pair here on the host, ignoring any task for this branch
   lazy pair --host --resume abc123   # Resume a previous branchless session, on the host
   lazy pair abc123 --autonomous      # Run without permission prompts, in the container`);
 }

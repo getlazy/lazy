@@ -23,8 +23,10 @@
  * read on the gate's hot path, a rule for a lazy.toml that stops parsing
  * mid-edit (keep the last good boundary? drop to the default?), and a security
  * boundary that moves on a file write rather than on a restart someone chose.
- * Every other `[server]` key is start-time too. Not taken here; the warning
- * makes the one-command remedy impossible to miss instead.
+ * Every other `[server]` key is start-time too. Not taken; instead
+ * `lazy daemon reload` swaps the value in place when a person asks
+ * (./config-status.ts), and the daemon keeps its last good config while the
+ * file does not load — so the boundary still moves only on a deliberate act.
  */
 
 import { loadConfig, loadRawConfig } from '../config/loader';
@@ -142,7 +144,7 @@ export function dashboardAddressNote(problem: DashboardAddressProblem | { kind: 
         (problem.configured
           ? `Note: lazy.toml sets [server] dashboard_url = "${problem.configured}", `
           : 'Note: lazy.toml no longer sets [server] dashboard_url, ') +
-        `but the running daemon still serves ${problem.served} — run \`lazy daemon restart\` to apply it ` +
+        `but the running daemon still serves ${problem.served} — run \`lazy daemon reload\` to apply it ` +
         '(`lazy doctor` explains).'
       );
     case 'unreadable':

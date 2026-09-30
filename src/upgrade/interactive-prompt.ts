@@ -27,6 +27,11 @@ export const POST_BUILD_CHOICE_PROMPT =
 export async function waitForInterveningBuildOutput(
   imageBuild: BackgroundImageBuild | null | undefined,
 ): Promise<void> {
-  if (!imageBuild || imageBuild.status() !== 'building') return;
-  await imageBuild.awaitSettled();
+  if (!imageBuild) return;
+  if (imageBuild.status() === 'building') await imageBuild.awaitSettled();
+  // A FAILED build aborts the upgrade right here rather than prompting: a
+  // "continue" prompt invites the human into a step that must throw at
+  // finish() anyway, after they answered questions or stopped tasks. finish()
+  // throws with the failure detail; the build's own output is already printed.
+  if (imageBuild.status() === 'failed') await imageBuild.finish();
 }

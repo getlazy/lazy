@@ -50,6 +50,7 @@ import { commandAutoBudget, autoBudgetUsage } from './auto-budget';
 import { commandDaemonConfig, daemonConfigUsage } from './daemon-config';
 import { commandResumeQueue, resumeQueueUsage } from './resume-queue';
 import { commandDaemonHealth, daemonHealthUsage } from './daemon-health';
+import { commandDaemonReload, daemonReloadUsage, formatConfigStatusOrError, readConfigStatusForDisplay } from './daemon-reload';
 import { missingCredentialNotice } from '../../daemon/credential-gate';
 import { theme } from '../../render/theme';
 
@@ -94,7 +95,7 @@ export async function commandDaemon(args: string[]): Promise<void> {
   // clone does not do — Teams' own daemon is the one that runs (design doc
   // §4.4, §4.7). Fleet-wide introspection (`list`, `kill-stray`) and `logs`
   // are left alone: they are host-diagnostic, not "operate my daemon".
-  if (['start', 'stop', 'restart', 'status', 'health'].includes(subcommand ?? '')) {
+  if (['start', 'stop', 'restart', 'status', 'health', 'reload'].includes(subcommand ?? '')) {
     await refuseIfBoundClone(`daemon ${subcommand}`);
   }
 
@@ -113,6 +114,9 @@ export async function commandDaemon(args: string[]): Promise<void> {
       break;
     case 'health':
       await commandDaemonHealth(subArgs);
+      break;
+    case 'reload':
+      await commandDaemonReload(subArgs);
       break;
     case 'dashboard-url':
       await daemonDashboardUrl(subArgs);
@@ -481,8 +485,30 @@ async function daemonRestart(args: string[]): Promise<void> {
 async function daemonStatus(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [
     { name: 'project', takesValue: true },
+    { name: 'json', takesValue: false },
   ], 'daemon status');
   const projectRoot = resolveProjectRoot(parsed.flags);
+  const json = parsed.flags.get('json') === true;
+
+  if (json) {
+    // The daemon's own answers, unformatted: liveness and address from its
+    // status probe, the config section from `configStatus`.
+    if (!isDaemonRunning(projectRoot)) {
+      console.log(JSON.stringify({ running: false }, null, 2));
+      return;
+    }
+    const status = await checkDaemonHealth(projectRoot);
+    const configRead = status.running ? await readConfigStatusForDisplay(projectRoot) : { status: null, error: null };
+    console.log(JSON.stringify({
+      running: status.running,
+      pid: status.pid ?? null,
+      dashboardUrl: status.running ? dashboardUrlFromStatus(status) : null,
+      unresponsive: status.unresponsive === true,
+      config: configRead.status,
+      ...(configRead.error ? { configError: configRead.error } : {}),
+    }, null, 2));
+    return;
+  }
 
   // Primary check: same isDaemonRunning() used by start/stop/ensureDaemon.
   // If the process is dead but marker files remain (crash), clean up and
@@ -580,6 +606,10 @@ async function daemonStatus(args: string[]): Promise<void> {
         console.log(`  Code:    ${status.codeSha}${currentSha ? ' (up to date)' : ''}`);
       }
     }
+
+    // After the staleness block, so the `Source:` line is not read as part of
+    // the pending list below.
+    for (const line of formatConfigStatusOrError(await readConfigStatusForDisplay(projectRoot))) console.log(line);
 
     // Auto-react budget info
     if (status.autoReactBudget && status.autoReactBudget.length > 0) {
@@ -911,6 +941,7 @@ export const daemonSubcommandUsage: Record<string, () => void> = {
   'config': daemonConfigUsage,
   'resume-queue': resumeQueueUsage,
   'health': daemonHealthUsage,
+  'reload': daemonReloadUsage,
 };
 
 export function daemonUsage(): void {
@@ -924,7 +955,10 @@ Subcommands:
   start       Start the daemon (includes web dashboard)
   stop        Stop the daemon gracefully
   restart     Restart the daemon
-  status      Show daemon status and web dashboard URL (current project)
+  status      Show daemon status, web dashboard URL, the lazy.toml in force,
+              and startup-only settings still pending from it
+  reload      Apply the startup-only lazy.toml settings that need no restart
+              (dashboard_url, sync_interval); list the ones that do
   health      Check the daemon's moving parts: loops, sweeps, proxy, storage,
               runner, stuck tasks, dashboard (OK / WARN / FAIL per row)
   dashboard-url  Print the web dashboard URL, or exit non-zero if not running
@@ -939,6 +973,10 @@ Subcommands:
 Start options:
   --foreground    Run in foreground (don't detach)
   --background    Run in background (default, explicit flag for auto-start)
+  --project PATH  Explicit project root (default: auto-detect from cwd)
+
+status options:
+  --json          Print the status as JSON
   --project PATH  Explicit project root (default: auto-detect from cwd)
 
 stop / restart options:
@@ -962,6 +1000,7 @@ Examples:
   lazy daemon start             # Start in background
   lazy daemon start --foreground  # Start in foreground (for debugging)
   lazy daemon status            # Check if running, show web URL
+  lazy daemon reload            # Apply an edited [server] dashboard_url
   lazy daemon health            # Is everything inside it still working?
   lazy daemon dashboard-url     # Print the web dashboard URL (for scripting)
   lazy dashboard                # Sign in and open the dashboard in a browser

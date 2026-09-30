@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.91.1186] - 2026-09-30 - Hotfix
+
+### Added
+
+**lazy**
+- **`lazy daemon reload`** — applies `dashboard_url`/`sync_interval` without a restart; `lazy daemon status` names the lazy.toml in use; a broken lazy.toml leaves the daemon on its last good config
+- **`lazy pair --host --no-task`** — pair on the host with no task context on any branch, including a `lazy/*` branch this store has no task for; pair refusals about a missing or unusable task now name it
+
+**Lazy Teams**
+
+- **`bin/native-rails`** — run rails/rake commands, e.g. `lazy:adopt_store`, against your native install without sourcing its env file
+- **`lazy:reset_projects`** — deletes projects (all, a team's, or one) but keeps teams, members and credentials; stores are moved aside, never deleted; refuses a checkout's own database unless `ALLOW_DEV_DB=1`
+- **Rename a project or team** — change name and slug from settings; running projects are untouched, the old name is free at once, and bound clones follow the rename
+- **Project start steps** — a project page shows each step of a start live (machine, image, clone and whose forge connection, init, daemon), and names the failing step with its output
+
+### Fixed
+
+**lazy**
+- **Failed image builds** — the error shows the failing step's own output (e.g. the compiler error), and `lazy upgrade` aborts instead of asking to continue
+
+**Lazy Teams**
+- **Slow pages on large projects** — the top-nav counts no longer load every task, so pages stay quick on thousands of tasks; every page reports a `Server-Timing` breakdown
+- **`lazy:adopt_store`** — always copies the store into the fleet and only reads the original (`COPY=` is ignored), warning (not refusing) if a daemon or an in-place project may still be writing it
+- **`lazy:adopt_store`** — names the database it uses and accepts a team name as well as a slug
+- **`lazy:adopt_store AS=<member email>`** — adopts as a team member, so a private repository clones on the first try and on automatic retries
+- **`lazy:adopt_store` on native smolvm installs** — store adoption now runs there instead of failing at the preflight
+- **smolvm project images** — installs fetch published images to a local file; automatic restarts boot the new image first and stop, loudly in god mode, on failure
+- **`bin/native-install`** — when two env files claim one install, the refusal names which keys differ and whether the secrets match, never printing a value
+
 ## [0.91.1184] - 2026-09-29 - Lazy Teams
 
 Lazy Teams gets its own Configuration page, per-agent and per-team credentials, per-file protected-file decisions, a reworked task page and much more reliable upgrades on microVM installs. In lazy itself, `lazy stats budget` shows where a usage window's tokens went, every binary and image names its exact build, and task worktrees are hardened against several ways an agent could reach outside them. On Claude, which is still first among equals, tasks now default to `claude-sonnet-5-5` and the builder to `claude-opus-5-5`.

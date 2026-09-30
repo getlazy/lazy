@@ -19,6 +19,7 @@
  *     conversations-index.json  (derived listing metadata; rebuildable)
  */
 
+import { mapLimit, STORE_SCAN_CONCURRENCY } from '../utils/map-limit';
 import { createHash, randomUUID } from 'crypto';
 import { mkdir, readdir, readFile, writeFile, rename, rm, stat, unlink } from 'fs/promises';
 import type { Dirent } from 'fs';
@@ -1378,17 +1379,9 @@ export class FileStorage implements Storage {
 
   async listTasks(): Promise<Task[]> {
     try {
-      const dirs = await readdir(this.tasksPath);
-      const tasks: Task[] = [];
-
-      for (const dir of dirs) {
-        if (dir.includes('.tmp') || dir.includes('.backup')) continue;
-
-        const task = await this.readTask(join(this.tasksPath, dir, 'task.json'));
-        if (task) {
-          tasks.push(task);
-        }
-      }
+      const dirs = (await readdir(this.tasksPath)).filter((dir) => !dir.includes('.tmp') && !dir.includes('.backup'));
+      const read = await mapLimit(dirs, STORE_SCAN_CONCURRENCY, (dir) => this.readTask(join(this.tasksPath, dir, 'task.json')));
+      const tasks = read.filter((task): task is Task => task !== null);
 
       // Sort by created_at DESC
       return tasks.sort((a, b) => b.created_at - a.created_at);
@@ -1456,32 +1449,34 @@ export class FileStorage implements Storage {
     // This can happen if accept/reject updates the session but crashes before
     // updating the task status. We detect and repair this inconsistency.
     // Never auto-heal working tasks — the agent is actively running.
-    for (const task of tasks) {
-      if (!isTerminalStatus(task.status) && task.status !== 'working') {
-        const session = await this.getSessionByTaskId(task.id);
-        if (session?.ended_at && session.outcome) {
-          const newStatus = session.outcome === 'accepted' ? 'complete' : 'abandoned';
-          const now = Date.now();
-          task.status = newStatus;
-          task.completed_at = task.completed_at ?? session.ended_at;
-          // Persist the fix (best-effort, self-healing) — lock only for the
-          // write. Re-read task.json INSIDE the lock and apply just the two
-          // healed fields: `task` was loaded before this await-heavy sweep, and
-          // atomicWriteTask replaces the whole file, so writing the stale object
-          // would silently revert any field another operation changed meanwhile
-          // (e.g. an accepted `lazy edit --prompt`).
-          try {
-            await this.lock.withLock(async () => {
-              const current = await this.readTask(join(this.taskDir(task.id), 'task.json'));
-              if (!current) return;
-              current.status = newStatus;
-              current.completed_at = current.completed_at ?? session.ended_at;
-              const changelog = await this.readAndAppendStatusChange(task.id, newStatus, now);
-              await this.atomicWriteTask(task.id, { 'task.json': current, 'status-changelog.json': changelog });
-            });
-          } catch {
-            // In-memory fix still applies for this query
-          }
+    // The session reads are independent and latency-bound on a network or VM mount,
+    // so they run concurrently; the repairs themselves stay one at a time.
+    const candidates = tasks.filter((t) => !isTerminalStatus(t.status) && t.status !== 'working');
+    const candidateSessions = await mapLimit(candidates, STORE_SCAN_CONCURRENCY, (t) => this.getSessionByTaskId(t.id));
+    for (const [i, task] of candidates.entries()) {
+      const session = candidateSessions[i];
+      if (session?.ended_at && session.outcome) {
+        const newStatus = session.outcome === 'accepted' ? 'complete' : 'abandoned';
+        const now = Date.now();
+        task.status = newStatus;
+        task.completed_at = task.completed_at ?? session.ended_at;
+        // Persist the fix (best-effort, self-healing) — lock only for the
+        // write. Re-read task.json INSIDE the lock and apply just the two
+        // healed fields: `task` was loaded before this await-heavy sweep, and
+        // atomicWriteTask replaces the whole file, so writing the stale object
+        // would silently revert any field another operation changed meanwhile
+        // (e.g. an accepted `lazy edit --prompt`).
+        try {
+          await this.lock.withLock(async () => {
+            const current = await this.readTask(join(this.taskDir(task.id), 'task.json'));
+            if (!current) return;
+            current.status = newStatus;
+            current.completed_at = current.completed_at ?? session.ended_at;
+            const changelog = await this.readAndAppendStatusChange(task.id, newStatus, now);
+            await this.atomicWriteTask(task.id, { 'task.json': current, 'status-changelog.json': changelog });
+          });
+        } catch {
+          // In-memory fix still applies for this query
         }
       }
     }
@@ -4162,34 +4157,19 @@ export class FileStorage implements Storage {
     const { buildRaisedItemsListing } = await import('../raised');
     const rows: import('../raised').RawRaisedItemRow[] = [];
 
-    let dirs: string[];
-    try {
-      dirs = await readdir(this.tasksPath);
-    } catch (err) {
-      // ENOENT means the store has no tasks directory yet — genuinely empty.
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-        return buildRaisedItemsListing(rows, [], options);
-      }
-      throw new Error(
-        `Failed to list raised items: could not read tasks directory ${this.tasksPath}: ${(err as Error).message}`,
-      );
-    }
-
-    for (const dir of dirs) {
-      if (dir.includes('.tmp') || dir.includes('.backup')) continue;
-      const taskDir = join(this.tasksPath, dir);
-      const items = await this.readRaisedItems(taskDir);
-      if (!items.length) continue;
-
-      const task = await this.readTask(join(taskDir, 'task.json'));
-      if (!task) continue;
-
+    // ONE pass over the tasks (was: every task.json read up to three times — once
+    // per task with items, then all of them again for the listing), and the
+    // per-task reads run concurrently: this backs the nav badge on every page.
+    const allTasks = await this.listTasks();
+    const perTask = await mapLimit(allTasks, STORE_SCAN_CONCURRENCY, async (task) => ({
+      task,
+      items: await this.readRaisedItems(this.taskDir(task.id)),
+    }));
+    for (const { task, items } of perTask) {
       for (const item of repairRecordContents(items, 'raised-item', 'file-storage')) {
         rows.push({ item, task });
       }
     }
-
-    const allTasks = await this.listTasks();
     return buildRaisedItemsListing(rows, allTasks, options);
   }
 

@@ -46,6 +46,14 @@ export function setDaemonProxyPort(proxyPort: number): void {
 }
 
 /**
+ * Swap the public dashboard origin in place — `lazy daemon reload` applying a
+ * changed `[server] dashboard_url` (src/daemon/config-status.ts).
+ */
+export function setDaemonDashboardUrl(dashboardUrl: string): void {
+  if (context) context.dashboardUrl = dashboardUrl;
+}
+
+/**
  * Tear the context back down, so `hasDaemonContext()` reports false again.
  *
  * The lifecycle counterpart to {@link setDaemonContext}. The daemon process

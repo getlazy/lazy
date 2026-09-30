@@ -144,6 +144,19 @@ There is no command to switch a clone between projects: if you work on two
 projects, you have two clones — which you have anyway, because a clone is a
 checkout of one repository.
 
+### When the project or team is renamed
+
+A clone keeps working after its project or team is renamed. It remembers the
+project it was bound to by its identity as well as by its name, and keeps
+reaching that project under the new name — even after another project takes
+the old name. `lazy login` with no arguments still prints the name you bound
+by; log in again whenever you like to see the new one.
+
+A clone logged in with an older `lazy` only knows the name. It is told the new
+name and asked to log in again (`lazy login --project <team/new-name>`), and if
+another project has taken the old name since it logged in, it is refused rather
+than connected to that other project.
+
 ## Seeing where a clone points
 
 Run `lazy login` with no arguments. It prints the binding and starts nothing:

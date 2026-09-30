@@ -206,6 +206,13 @@ default = "claude-sonnet-5-5"
 # with `--agent`. The Claude Code models need Claude Code 2.1.284 or newer.
 # Keep only the harnesses you use.
 #
+# A cluster's CHILDREN do not follow [agent.by_type]: a child created without an
+# agent inherits its parent's profile (see "Which agent a new task gets" at
+# [agent.by_type] below). With the setup above, every child of a cluster stays
+# on the complex tier whatever its own type maps to. To put a child on a cheaper
+# tier, create it with an explicit agent (`--agent claude-normal`, or the `agent`
+# argument of the MCP tools).
+#
 # [agents.claude-normal]
 # harness = "claude-code"
 # model = "claude-sonnet-5-5"
@@ -369,6 +376,23 @@ agent_id = "claude-code"
 #               how many run at once, reviews each and accepts it (was `loop`; the
 #               old key is still honoured here and reported by `lazy doctor`)
 #
+# Which agent a new task gets — first match wins:
+#   1. an explicit choice: `--agent`, or the `agent` argument over MCP
+#   2. the task it is derived from: a subtask's PARENT, or the source of a
+#      clone / redo / rework. Its agent profile is inherited and
+#      [agent.by_type] is NOT consulted
+#   3. [agent.by_type] for the task's type (below)
+#   4. the project default: the default agent set in Lazy Teams' project
+#      settings when the project is managed there, else [agent] agent_id
+#      (which `lazy system agent set` edits)
+# So [agent.by_type] only routes tasks created from scratch (no parent, not a
+# clone). Subtasks do NOT inherit their parent's TYPE: with no type given, a
+# subtask is a plain `task`.
+# A subtask does not copy its parent's model or effort either. Unless you pass `model` /
+# `effort` on it, each turn uses the chosen profile's model (else the
+# agent's own default, else the project's default model) and [agent] effort. Once set on a
+# task, a model or effort override sticks for its later turns.
+#
 # [agent.by_type]
 # fix = "cursor"
 # refactor = "cursor"
@@ -488,6 +512,9 @@ port = 26024
 # dashboard_url = "https://lazy.example.com"
 # Interval in seconds for the daemon's background sync (0 to disable)
 # sync_interval = 60
+# dashboard_url and sync_interval are read when the daemon starts; after editing
+# them, `lazy daemon reload` applies them without a restart (`lazy daemon status`
+# lists settings still pending). `port` needs `lazy daemon restart`.
 
 # [serve]
 # Ports this project's dev servers listen on INSIDE a task's environment. Each

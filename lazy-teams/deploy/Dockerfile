@@ -44,7 +44,7 @@ ARG LAZY_DAEMON_IMAGE=
 #
 # Pinned to the same release `Dockerfile.lazy` pins, so the two images this
 # product ships agree on one OS. Moving to trixie is a real upgrade — a new
-# glibc, new libvips and sqlite3, and a different docker packaging story — and
+# glibc, new sqlite3, and a different docker packaging story — and
 # belongs in its own change with a build behind it, not as a side effect of a
 # floating tag.
 FROM docker.io/library/ruby:${RUBY_VERSION}-slim-bookworm AS base
@@ -57,7 +57,7 @@ WORKDIR /lazy/lazy-teams
 
 RUN apt-get update -qq && \
     apt-get install --no-install-recommends -y \
-      ca-certificates curl git git-lfs libjemalloc2 libvips sqlite3 && \
+      ca-certificates curl git git-lfs libjemalloc2 sqlite3 && \
     ln -s /usr/lib/$(uname -m)-linux-gnu/libjemalloc.so.2 /usr/local/lib/libjemalloc.so && \
     rm -rf /var/lib/apt/lists /var/cache/apt/archives
 
@@ -85,7 +85,7 @@ FROM base AS rails-build
 
 RUN apt-get update -qq && \
     apt-get install --no-install-recommends -y \
-      build-essential git libvips libyaml-dev pkg-config && \
+      build-essential git libyaml-dev pkg-config && \
     rm -rf /var/lib/apt/lists /var/cache/apt/archives
 
 COPY lazy-teams/Gemfile lazy-teams/Gemfile.lock ./

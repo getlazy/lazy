@@ -134,6 +134,10 @@ export const READ_ONLY_RPC_COMMANDS: ReadonlySet<string> = new Set([
   // runner and tasks and changes none of them — like doctor, it has to answer
   // precisely when something (identity included) is wrong.
   'daemonHealth',
+  // `lazy daemon status`'s config section: which lazy.toml is in force and
+  // which startup-only settings differ from it — a read, and most needed when
+  // something is misconfigured.
+  'configStatus',
   // The CLI's pre-editor question "would this turn be refused for want of a
   // model credential?" — a presence read, asked before identity may be fixed.
   'turnCredentialCheck',
@@ -151,6 +155,10 @@ export const READ_ONLY_RPC_COMMANDS: ReadonlySet<string> = new Set([
   // Refusing it on a fresh machine would mean somebody could not turn
   // concurrency down while fixing whatever made them want to.
   'concurrency',
+  // `lazy daemon reload`: swaps the daemon's in-memory copy of startup-only
+  // settings for what lazy.toml already says. No row; and it is how someone
+  // recovers from a config the daemon started on.
+  'configReload',
   // The one-shot [usage_pause] override and the pause state: daemon memory plus
   // a read of the proxy's readings, no task row. Same reasoning as concurrency.
   'usagePause',
@@ -363,6 +371,7 @@ export const CONTROL_PLANE_RPC_COMMANDS: ReadonlySet<string> = new Set([
   // because the identity gate must not refuse them. Named here too so the
   // partition is complete and a reader does not have to infer it. ---
   'concurrency',
+  'configReload',
   'usagePause',
   'mintActorToken',
   'revokeActorToken',

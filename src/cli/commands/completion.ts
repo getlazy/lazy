@@ -74,7 +74,7 @@ const ALL_TASK_ID_COMMANDS = withAliases([
 // positional argument (e.g. `lazy system prompts`). Completed from this map.
 const SUBCOMMANDS: Record<string, string[]> = expandAliasKeys({
   'system': ['prompts', 'build', 'status', 'source-id', 'agent', 'offline', 'online', 'passphrase', 'export-dockerfile', 'verify-host-boundary', 'repair-commits', 'store-check'],
-  'daemon': ['start', 'stop', 'restart', 'status', 'health', 'dashboard-url', 'list', 'kill-stray', 'logs', 'auto-budget', 'config', 'resume-queue'],
+  'daemon': ['start', 'stop', 'restart', 'status', 'health', 'reload', 'dashboard-url', 'list', 'kill-stray', 'logs', 'auto-budget', 'config', 'resume-queue'],
   'config': ['set', 'get'],
   'memory': ['list', 'show', 'save', 'rm', 'history', 'compact'],
   'artifact': ['list', 'add', 'get', 'rm'],
@@ -139,7 +139,7 @@ const COMMAND_FLAGS: Record<string, string[]> = expandAliasKeys({
   'ask':                 ['--message', '--json', '--no-wait', '--past-usage-pause'],
   'rework':              ['--goal', '--prompt', '--model', '--code', '--parent'],
   'redo':                ['--prompt', '--model', '--no-start', '--yes'],
-  'pair':                ['--host', '--unlock', '--no-summary', '--resume', '--autonomous', '--yes'],
+  'pair':                ['--host', '--no-task', '--unlock', '--no-summary', '--resume', '--autonomous', '--yes'],
   'unblock':             ['--message', '--model', '--effort', '--agent', '--follow', '--respond-raised', '--promote-raised-subtask', '--promote-raised-peer', '--dismiss-raised', '--acknowledge-raised', '--yes', '--past-usage-pause'],
   'loop':                ['--model', '--follow', '--pipeline', '--backlog', '--parent', '--tag'],
   'wait':                ['--follow', '--next', '--json'],

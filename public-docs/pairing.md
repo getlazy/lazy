@@ -44,7 +44,14 @@ rather than quietly running an agent on your machine instead.
 lazy pair <task>          # in the task's container (the normal case)
 lazy pair <task> --host   # claude-code only: on your machine instead of the container
 lazy pair --host          # branchless: no task, no worktree, no container
+lazy pair --host --no-task  # same, on ANY branch — even a lazy/* branch with no task in this store
 ```
+
+If you are on a `lazy/*` branch whose task this store does not know (a branch
+from another machine, or a task since closed), `lazy pair` refuses. Add
+`--no-task` (with `--host`) to skip task detection and pair in the current
+directory on your machine. It cannot be combined with a task argument,
+`--unlock` or `--no-summary`; `--resume <session>` works as in branchless mode.
 
 ## Tools the paired session gets
 

@@ -1,4 +1,4 @@
-import { describe, test, beforeEach, afterEach } from 'bun:test';
+import { describe, expect, test, beforeEach, afterEach } from 'bun:test';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { readFile, writeFile, unlink, mkdtemp, mkdir } from 'fs/promises';
@@ -160,6 +160,23 @@ describe('lazy upgrade', () => {
     }
 
     await unlink(buildLogPath);
+  });
+
+  // INVARIANT: a failed background build aborts the upgrade before any "Image build finished ... continue" prompt; that prompt would invite the human into a step that must fail.
+  test('a failed background build aborts without the Image build finished prompt', async () => {
+    const result = await ctx.lazyMocked(['upgrade'], MOCK_CLAUDE_SUCCESS, {
+      env: {
+        LAZY_MOCK_BUILD_FAIL: 'Container build failed with exit code 1',
+        LAZY_MOCK_BUILD_DELAY_MS: '50',
+        LAZY_FORCE_TTY: '1',
+        LAZY_PROMPT_DEFAULTS: '1',
+        LAZY_TEST_UPGRADE_BUILDER_COUNT: '1',
+      },
+    });
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout).not.toContain('Image build finished');
+    expect(result.stdout + result.stderr).toContain('Container build failed');
   });
 
   // Interactive prompt presents three options when working containers exist.

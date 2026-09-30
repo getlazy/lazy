@@ -199,7 +199,11 @@ export class DaemonClient {
         const fresh = await resolveTeamsLogin(projectRoot);
         return fresh ? { target, token: fresh.token } : null;
       });
-      client.teams = { url: bound.login.binding.teams_url, project: bound.login.binding.project };
+      client.teams = {
+        url: bound.login.binding.teams_url,
+        project: bound.login.binding.project,
+        projectId: bound.login.binding.project_id,
+      };
       return client;
     }
 
@@ -333,6 +337,7 @@ export class DaemonClient {
     // Applied here rather than inside the pure request builder: aborting is a
     // property of THIS call, not of the request's shape.
     if (signal) options.signal = signal;
+    Object.assign(options.headers as Record<string, string>, teamsProjectHeaders(this.teams));
     return await fetch(url, options as any);
   }
 }
@@ -340,7 +345,24 @@ export class DaemonClient {
 /** Which Teams install and project a bound clone's client reaches. */
 export interface TeamsTarget {
   url: string;
+  /** `team/project` as bound — the address in every request path. */
   project: string;
+  /**
+   * The project's id on that install. A project or team can be renamed and
+   * its old address taken by a DIFFERENT project, so the address alone cannot
+   * say which project this clone meant: Teams reaches the bound project by
+   * this id (under its new name too) and refuses rather than serve whoever
+   * holds the address now.
+   */
+  projectId?: string;
+}
+
+/** The header Teams resolves a bound clone's project by (CliProjectBinding). */
+export const TEAMS_PROJECT_ID_HEADER = 'X-Lazy-Teams-Project-Id';
+
+/** `{ X-Lazy-Teams-Project-Id }` for a bound clone that recorded its id, `{}` otherwise. */
+export function teamsProjectHeaders(teams: TeamsTarget | null): Record<string, string> {
+  return teams?.projectId ? { [TEAMS_PROJECT_ID_HEADER]: teams.projectId } : {};
 }
 
 /**

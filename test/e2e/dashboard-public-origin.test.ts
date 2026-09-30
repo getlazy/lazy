@@ -234,7 +234,7 @@ describe('dashboard at a configured public origin', () => {
     expect(doctor.stdout).toContain('✗ Dashboard address');
     expect(doctor.stdout).toContain('https://lazy.example.com');
     expect(doctor.stdout).toContain(proxy.origin);
-    expect(doctor.stdout).toContain('lazy daemon restart');
+    expect(doctor.stdout).toContain('lazy daemon reload');
   });
 });
 
@@ -244,7 +244,7 @@ describe('dashboard at a configured public origin', () => {
 // a config file. `lazy dashboard` then printed the old address with nothing to
 // say why. It must still print what the daemon serves (that is the address that
 // works), but never silently: one line naming both addresses, pointing at the
-// restart that applies it and at `lazy doctor`, which holds the diagnosis.
+// reload that applies it and at `lazy doctor`, which holds the diagnosis.
 describe('dashboard_url edited while the daemon is running', () => {
   let ctx: TestContext;
   const CONFIGURED = 'https://lazy.example.com';
@@ -283,7 +283,7 @@ describe('dashboard_url edited while the daemon is running', () => {
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain(CONFIGURED);
     expect(lines[0]).toContain(served);
-    expect(lines[0]).toContain('lazy daemon restart');
+    expect(lines[0]).toContain('lazy daemon reload');
     expect(lines[0]).toContain('lazy doctor');
   });
 

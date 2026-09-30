@@ -215,7 +215,9 @@ Every config read resolves to the PROJECT ROOT's `lazy.toml`. `loadConfig(lazyRo
 
 The config sits on an agent-writable branch, so loading a turn's config from the worktree let a turn choose the rules its NEXT turn ran under: blank `[permissions] protected` (which defaults to `[]`, so the edit is not itself flagged), blank `[checks] post_turn`, zeroed watchdog, dropped `[[maintain]]` groups, its own model and effort. It also wedged tasks — a branch carrying a config shape the daemon rejects made both `unblock` and `sync` fail, and sync was the only way to bring the fix in.
 
-`LAZY_CONFIG` still works: an absolute path is used directly, otherwise it names the file to read **in the project root**. If a per-task setting is ever wanted, it follows the container-image pattern below — explicit human TTY consent, pinned on the task record — never a file on the branch. Invariant tests: `test/e2e/worktree-config-authority.test.ts`, `test/unit/config-root-anchored.test.ts`.
+`LAZY_CONFIG` still works: an absolute path is used directly, otherwise it names the file to read **in the project root**.
+
+**The daemon's last-known-good config does not weaken this.** While lazy.toml does not load, a running daemon answers `loadConfig` with the last config it loaded (`src/config/last-good.ts`). That fallback is keyed ONLY by the resolved config path, is enabled only inside the daemon, and is bypassed by `loadConfig(root, { strict: true })` (reload, doctor's parse check). Never key it by anything else or enable it in a CLI process. If a per-task setting is ever wanted, it follows the container-image pattern below — explicit human TTY consent, pinned on the task record — never a file on the branch. Invariant tests: `test/e2e/worktree-config-authority.test.ts`, `test/unit/config-root-anchored.test.ts`.
 
 ### Task worktrees never auto-govern container images; human TTY consent only
 

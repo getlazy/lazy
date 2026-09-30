@@ -68,6 +68,7 @@ async function attachAndReport(
   const url = remoteAttachUrl({
     teamsUrl: bound.login.binding.teams_url,
     project: bound.login.binding.project,
+    projectId: bound.login.binding.project_id,
     sessionId,
     cols: size.cols,
     rows: size.rows,

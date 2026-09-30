@@ -47,6 +47,7 @@ import {
 } from '../runner/host-runner-gate';
 import { VALID_RUNNER_TYPES } from './types';
 import { setBranchPrefix, getBranchPrefix, branchPrefixError } from '../git/branch-prefix';
+import { lastKnownGoodFor, rememberGoodConfig } from './last-good';
 
 const CONFIG_FILENAME = process.env.LAZY_CONFIG || 'lazy.toml';
 
@@ -523,6 +524,23 @@ function refuseOllamaBlock(raw: unknown, harnessName: string): void {
  * Does NOT otherwise check whether the file exists.
  */
 export async function resolveConfigPath(lazyRoot: string): Promise<string> {
+  return (await resolveConfigSource(lazyRoot)).path;
+}
+
+/**
+ * Which rule chose the config file in force — what `lazy daemon status` names
+ * beside its path, so a person can tell WHY this file and not another.
+ */
+export type ConfigSourceRule = 'managed' | 'LAZY_CONFIG' | 'project-root';
+
+export interface ConfigSource {
+  /** Path of the file in force. It may not exist: lazy's defaults then apply. */
+  path: string;
+  rule: ConfigSourceRule;
+}
+
+/** {@link resolveConfigPath} plus the rule that picked the path — the one resolution. */
+export async function resolveConfigSource(lazyRoot: string): Promise<ConfigSource> {
   // AFTER A CONTROL PLANE'S IMPORT: it owns this project's config
   // and keeps it in a file OUTSIDE the clone (MANAGED_CONFIG_ENV in
   // ./managed). Once that file exists the repository's lazy.toml is never read
@@ -530,11 +548,14 @@ export async function resolveConfigPath(lazyRoot: string): Promise<string> {
   // plane has not imported yet — the root lazy.toml is the config, as it always
   // was, and the import reads it from there.
   const managedPath = managedConfigPath(lazyRoot);
-  if (managedPath && await pathExists(managedPath)) return managedPath;
+  if (managedPath && await pathExists(managedPath)) return { path: managedPath, rule: 'managed' };
   if (process.env.LAZY_CONFIG && isAbsolute(process.env.LAZY_CONFIG)) {
-    return process.env.LAZY_CONFIG;
+    return { path: process.env.LAZY_CONFIG, rule: 'LAZY_CONFIG' };
   }
-  return join(findConfigDir(lazyRoot), CONFIG_FILENAME);
+  return {
+    path: join(findConfigDir(lazyRoot), CONFIG_FILENAME),
+    rule: process.env.LAZY_CONFIG ? 'LAZY_CONFIG' : 'project-root',
+  };
 }
 
 /**
@@ -1035,8 +1056,35 @@ function validateAutomationEntries(
  * There is no starting-directory parameter, deliberately: the config is ALWAYS
  * the project root's, whatever the caller's cwd is. See findConfigDir.
  */
-export async function loadConfig(lazyRoot: string): Promise<ResolvedConfig> {
+export interface LoadConfigOptions {
+  /**
+   * Never answer with the last known good config: a file that does not load
+   * throws, even in a daemon that keeps one (./last-good.ts). For the surfaces
+   * whose question IS "does the file load" — `lazy daemon reload` and doctor's
+   * parse check.
+   */
+  strict?: boolean;
+}
+
+export async function loadConfig(lazyRoot: string, options: LoadConfigOptions = {}): Promise<ResolvedConfig> {
   const configPath = await resolveConfigPath(lazyRoot);
+  let config: ResolvedConfig;
+  try {
+    config = await loadConfigAt(lazyRoot, configPath);
+  } catch (err) {
+    // A running daemon keeps working on the last config it accepted FROM THIS
+    // SAME PATH — never one read from anywhere else, so the project-root
+    // anchoring above is untouched. Outside a daemon, or with nothing good
+    // remembered for this path, the failure is the answer.
+    const fallback = options.strict ? null : lastKnownGoodFor(configPath, err);
+    if (fallback) return fallback;
+    throw err;
+  }
+  rememberGoodConfig(configPath, config);
+  return config;
+}
+
+async function loadConfigAt(lazyRoot: string, configPath: string): Promise<ResolvedConfig> {
 
   // If LAZY_CONFIG is explicitly set but the file doesn't exist, fail hard
   if (process.env.LAZY_CONFIG && !(await pathExists(configPath))) {

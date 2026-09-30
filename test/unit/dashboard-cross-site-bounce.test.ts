@@ -211,12 +211,12 @@ describe('lazy doctor: Dashboard address', () => {
     expect(result.label).toContain('takes effect when the daemon starts');
   });
 
-  test('a daemon still serving another address fails with the restart remedy', () => {
+  test('a daemon still serving another address fails with the reload remedy', () => {
     const result = describeDashboardAddress(ORIGIN, { ...running, dashboardUrl: 'http://lazy.localhost:26024' })!;
     expect(result.ok).toBe(false);
     expect(result.label).toBe('Dashboard address');
     expect(result.detail).toContain('http://lazy.localhost:26024');
-    expect(result.detail).toContain('lazy daemon restart');
+    expect(result.detail).toContain('lazy daemon reload');
   });
 
   test('removing the setting without a restart is flagged too', () => {

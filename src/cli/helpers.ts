@@ -249,7 +249,7 @@ export function parseFlags(
  * Resolve a task identifier (hex ID, UUID, or code) to a Task.
  * Exits with an appropriate error message if not found or ambiguous.
  */
-export async function resolveTaskOrExit(storage: Storage, input: string): Promise<import('../types').Task> {
+export async function resolveTaskOrExit(storage: Storage, input: string, hint?: string): Promise<import('../types').Task> {
   const result = await storage.resolveTask(input);
 
   if (result.task) {
@@ -282,10 +282,12 @@ export async function resolveTaskOrExit(storage: Storage, input: string): Promis
     for (const option of options) {
       console.error(`  ${option}`);
     }
+    if (hint) console.error(hint);
     process.exit(1);
   }
 
   console.error(`No task found matching '${input}'`);
+  if (hint) console.error(hint);
   process.exit(1);
 }
 

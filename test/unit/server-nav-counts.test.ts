@@ -118,7 +118,7 @@ describe('/api/nav-counts degraded cases', () => {
   test('every read failing is empty badges, not a 500', async () => {
     const body = await counts(stubStorage({ fail: ['messages', 'raised', 'conversations', 'tasks'] }));
     expect(body).toEqual({
-      unread: null, review: null, clusters: null, raisedBlocking: null, raisedNonBlocking: null,
+      unread: null, review: null, clusters: null, active: null, blocked: null, raisedBlocking: null, raisedNonBlocking: null,
       followups: null, conversations: null, conversationsLatestAt: 0,
     });
   });
@@ -131,6 +131,16 @@ describe('/api/nav-counts degraded cases', () => {
       liveTasks: [['cluster', 'working'], ['task', 'working'], ['cluster', 'blocked'], ['fix', 'backlog']],
     }));
     expect(body.clusters).toBe(2);
+  });
+
+  // INVARIANT: the Tasks badge is answered here so Teams never pulls the whole task list to
+  // count it. `blocked` is the review queue's set (blocked, conflict, submitted); `active` is working.
+  test('active and blocked come from the live task read', async () => {
+    const body = await counts(stubStorage({
+      liveTasks: [['task', 'working'], ['task', 'working'], ['task', 'blocked'], ['task', 'conflict'], ['task', 'submitted'], ['task', 'backlog']],
+    }));
+    expect(body.active).toBe(2);
+    expect(body.blocked).toBe(3);
   });
 
   test('no loop tasks is 0, and a failed task read is null', async () => {

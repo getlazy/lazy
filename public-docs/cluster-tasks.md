@@ -135,6 +135,10 @@ what it needs from you. Blocking means accepting the cluster is refused until yo
 have answered them, so a cluster can never quietly hand back a pile of work it
 never did.
 
+## Which agent the children run on
+
+A child created without an agent runs on the driver's own agent profile, and so on that profile's model. `[agent.by_type]` in `lazy.toml` is not consulted for children, so a cluster on an expensive profile keeps every child there. To run a child on a cheaper profile, create it with an explicit agent (`--agent <profile>`, or the `agent` argument over MCP); the driver can do this itself, choosing from the profiles the project offers. Children also do not inherit the driver's task type: with no type given they are plain `task`s.
+
 ## Watching it
 
 `lazy show <cluster>` prints the cluster's progress: how many children have been

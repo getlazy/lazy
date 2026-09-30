@@ -228,7 +228,7 @@ docker compose exec app bin/rails lazy:adopt_store \
   TEAM=your-team NAME="My Project" \
   REPO_URL=https://github.com/you/my-project.git \
   STORE=/var/lib/lazy-fleet/incoming/my-project \
-  DRY_RUN=1
+  AS=you@example.com DRY_RUN=1
 ```
 
 `STORE` is the path **as the app container sees it**. With
@@ -238,24 +238,64 @@ docker compose exec app bin/rails lazy:adopt_store \
 store under the fleet root first — it does not have to be there permanently, but
 the container can only see paths that are mounted into it.
 
+`TEAM` is the team's slug or its name as shown on the page; a name shared by two teams is refused, so use the slug then.
+
+`AS` is the email of the team member the adoption acts for, exactly as if
+they had added the project themselves: the repository is cloned with **their**
+GitHub or GitLab connection, their Claude credential is the one the project
+starts with, and they are recorded as the project's registrant, so any later
+automatic restart clones as them too. A **private repository needs it**. The
+member must belong to `TEAM` and must have connected the repository's forge in
+their settings, or the adoption refuses before creating anything. Without
+`AS`, the clone runs with no member's forge credential, which a private
+repository refuses unless the team has a shared GitHub integration. If it fails,
+the message says so; a team admin who has connected the forge (or the member
+named in `AS`) can press **Retry setup** on the project's page, which clones with
+their own connection. To re-run the adoption instead, delete the failed project
+first.
+
 `DRY_RUN=1` runs every check and changes nothing. Drop it to do the adoption:
 
 ```
 docker compose exec app bin/rails lazy:adopt_store \
   TEAM=your-team NAME="My Project" \
   REPO_URL=https://github.com/you/my-project.git \
-  STORE=/var/lib/lazy-fleet/incoming/my-project
+  STORE=/var/lib/lazy-fleet/incoming/my-project \
+  AS=you@example.com
 ```
 
-The store is adopted **where it is** — nothing is copied and your directory is
-not rewritten. Add `COPY=1` to copy it into the fleet's own layout instead,
-leaving your original untouched. The output says which happened.
+The store is always **copied** into the fleet's own layout. Your original
+directory is only read, never written — not even to clear a stale lock. A
+`COPY=1` left over from an older script is ignored, with a note saying so.
+
+Because it is a copy, do the adoption with the local daemon stopped (step 1).
+A copy of a store that a daemon is still writing can catch a task mid-write, and
+tasks that were `working` in it may be resumed by the new project. The command
+prints a warning about this before it copies, and refuses if the store's lock
+shows something is serving it.
+
+A project adopted by an older version of this command may still be serving your
+original directory in place. It keeps working, and it does not stop you adopting
+the same store again as a copy: the command prints a warning naming that project,
+because its daemon still writes the directory being copied. Pick a different
+`NAME`, or remove the old project first with `bin/native-rails
+lazy:reset_projects` (your original is not deleted). Both commands name the
+environment and database they use before doing anything; run from a checkout's
+own database, `lazy:reset_projects` refuses to delete unless you add
+`ALLOW_DEV_DB=1`.
+
+The adoption then starts the project, and prints each step as it happens —
+creating the machine and pulling its image, restoring or cloning the repository
+(and whose forge connection it clones with), `lazy init`, starting the daemon —
+with how long each took. If a step fails, its own output is printed under it.
+The project page shows the same steps.
 
 ### What it refuses, and why
 
 | Refusal | What to do |
 |---|---|
-| The store's lock is still held | Something is serving that store right now. Stop the daemon on the machine that owns it (step 1). Adopting anyway would give one store two writers. |
+| `AS` is not a member of the team, or has no connection for the repository's forge | Name a member of `TEAM`, and have them connect GitHub or GitLab in their settings first. The clone runs as them. |
+| The store's lock is still held | Something is serving that store right now. Stop the daemon on the machine that owns it (step 1); a copy taken now would be a snapshot in the middle of a write. |
 | The store's format is newer than this install understands | Upgrade this install first. Older code reading a newer store drops what it does not understand, silently. |
 | The store still names people by old account numbers | It was written before Lazy named people by email. Back it up, run the attribution rewrite the error prints, then adopt again. |
 | The store names people this install cannot identify | Its rows were written by a different Lazy Teams install, whose account numbering is not this one's. Adopting would show one person's work under another person's name. Create the matching accounts first, or adopt into the install that wrote it. |
@@ -266,13 +306,16 @@ check without anything to do.
 ### 3. Verify in Teams
 
 Open the project in the web UI. The task list is your history: the same tasks,
-the same turns, the same reviews. If the project shows a start-up failure
-instead, the project page says what went wrong.
+the same turns, the same reviews. While it starts, the project page lists each
+step as it happens; if a start fails, it names the step that failed and what to
+do about it.
 
-### 4. Never run a local daemon against that store again
+### 4. Never run a local daemon against the original again
 
-This is the part with no undo. Two daemons writing one store corrupt it, and
-nothing warns you while it is happening. On the machine you moved it from:
+Your original store is untouched, but from now on Lazy Teams owns the project's
+history. A local daemon that keeps writing the original would fork it, and
+anything it did there never reaches the install. On the machine you copied it
+from:
 
 - **before running any other `lazy` command in that checkout**, move or rename
   the store directory the old `lazy.toml` points at. `lazy login` and
@@ -321,6 +364,40 @@ What does not change is the warning above: **never run a local daemon against
 the adopted store.** A bound clone never starts one. `lazy logout` returns a
 checkout to working locally — never do that in a checkout whose store you
 handed over.
+
+## Renaming a project or a team
+
+A team admin or owner can rename a project from its **Settings → Rename**, and a
+team from the **Rename** button on the team page. Site admins can do both in
+god mode. Both the name and the slug — the part of the address in URLs and in
+`lazy login --project team/project` — can change, under the same rules as when
+it was created. You confirm by typing the new slug.
+
+- **The running project is untouched.** Its data, machine, repository and
+  credentials stay where they are; nothing restarts.
+- **The old name is free at once.** A new project, or an [adoption](#adopting-an-existing-store),
+  can take it. It gets a fresh project with nothing carried over from the
+  renamed one. This is how you move a project aside and bring a new one in
+  under its name:
+
+  ```
+  # 1. Settings → Rename: lazy-dev → lazy-dev-old
+  # 2. adopt the new store under the old name
+  bin/rails lazy:adopt_store TEAM=acme NAME="lazy-dev" REPO_URL=… STORE=…
+  ```
+
+- **Old addresses stop working.** Pages at the old address answer "not found".
+  There is no redirect, because it would send people to whichever project takes
+  the name next. Clones bound with `lazy login` keep reaching the renamed project
+  (see [logging a machine in](teams-login.md#when-the-project-or-team-is-renamed)).
+- **A hosted repository keeps its clone URL.** The project's own copy of the
+  repository fetches and pushes that URL, so it stays the same after a rename
+  and keeps reaching the renamed project. A new project that takes the old name
+  gets a URL of its own (`…/git/acme/lazy-dev-2.git`), never the renamed
+  project's repository.
+- **A Slack room keeps its channel.** Rooms are tied to the project, not its
+  name, so the channel keeps its old name and keeps working. A new project that
+  takes the old name gets a room under the next free channel name.
 
 ## Hosting repositories on the install
 
@@ -583,6 +660,8 @@ microVM is left exactly as it was and keeps running the old version. The project
 is then retried and named on the Installation page, as below. If no project image
 is configured, or the configured image file is missing, no project is replaced:
 the Installation page says the version could not be read.
+
+Before it replaces any project, Lazy Teams first boots the new project image in a throwaway machine. If that fails, or if replacing one project fails, it stops there: the projects it had not reached keep running on their old version, the Installation page in god mode says why in red, and the automatic restart waits 30 minutes before trying again. Fix the cause, then use **Restart all project daemons** to go ahead at once.
 
 If your install predates the image-layout change, also refresh the deploy bundle from the release along with the image — see [Upgrading](#upgrading) below.
 

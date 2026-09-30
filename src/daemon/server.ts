@@ -115,6 +115,9 @@ import { systemGitAuthor } from '../identity/system-identity';
 import { guardDashboardRequest, serveDashboardRequest } from './dashboard-auth';
 import { getLogPath } from './paths';
 import { loadConfig, resolveConfigPath } from '../config/loader';
+import type { ResolvedConfig } from '../config/types';
+import { enableDaemonLastKnownGood, recordStartupSettings, registerReloadApplier, resetStartupSettings } from './config-status';
+import { resetLastKnownGood } from '../config/last-good';
 import type { RunnerType } from '../config/types';
 import { DEFAULT_WEB_PORT, DEFAULT_SERVER_BIND, MAX_PORT_ATTEMPTS } from '../config/constants';
 import { buildProxyCredentialDeps } from '../proxy/credential-deps';
@@ -137,7 +140,7 @@ import { teeTaskProgress } from './task-progress';
 import { createSessionCredentialResolver } from './turn-credentials';
 import { resolveDaemonBindHosts, resolveProxyBindHosts } from './bind-hosts';
 import { pushBranchAfterStateChange, retryFailedPushes } from './push';
-import { setDaemonContext, setDaemonProxyPort } from './context';
+import { setDaemonContext, setDaemonDashboardUrl, setDaemonProxyPort } from './context';
 import {
   autoUnblockTask,
   createReconcileEventState,
@@ -441,6 +444,9 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // outlives the start.
   const abandonEarlyStart = <T>(err: T): T => {
     cleanupOwnDaemonFiles(projectRoot);
+    // A start that never came up owns no config state either.
+    resetLastKnownGood();
+    resetStartupSettings();
     if (daemonLockFd !== null) {
       releaseDaemonLock(daemonLockFd);
       daemonLockFd = null;
@@ -454,7 +460,26 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // follow read config themselves and would otherwise surface the loader's raw
   // error in place of this one. Only the daemon lock and PID file exist yet, and a refusal here
   // gives both back (abandonEarlyStart).
+  // From here on a lazy.toml that stops loading leaves this daemon on the
+  // last config it accepted from the same file, reported loudly and once
+  // (src/config/last-good.ts). Enabled BEFORE the startup load so that load is
+  // the first one remembered; a file that is broken at start still refuses the
+  // start, since nothing good has been read yet.
+  enableDaemonLastKnownGood(() => getOrCreateStorage());
   const startupConfig = await loadDaemonConfigOrFail(projectRoot).catch((err) => { throw abandonEarlyStart(err); });
+  // What this daemon holds from its start, for `lazy daemon status` and
+  // `lazy daemon reload` (src/daemon/config-status.ts).
+  recordStartupSettings(startupConfig, 'startup');
+  // `[server] dashboard_url` is live-swappable: every link, the dashboard's
+  // host gate and `lazy dashboard` read this variable, never the startup copy.
+  let liveDashboardUrlSetting = startupConfig.server.dashboard_url;
+  registerReloadApplier('server.dashboard_url', (config) => {
+    liveDashboardUrlSetting = config.server.dashboard_url;
+    if (!boundWebPort) return;
+    const url = resolveDashboardUrl(boundBindHost, boundWebPort, liveDashboardUrlSetting);
+    setDaemonDashboardUrl(url);
+    daemonHealthRecorder(projectRoot).recordDashboardUrl(url);
+  });
 
   // An existing project picks up lazy's runtime-file excludes without re-init.
   await ensureLazyExcludeBestEffort(projectRoot);
@@ -911,19 +936,22 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         policyEnforce: boolean;
       } | undefined;
       try {
+        // The running proxy's own values when it was built; the file only
+        // when no proxy was built (a degraded daemon), since then nothing runs.
         const config = await loadConfig(projectRoot);
+        const view = runningProxyView ?? { bind: config.proxy.bind, upstream: config.proxy.upstream, fallbacks: config.proxy.fallbacks.length, policyEnforce: config.proxy.policy.enforce };
         // The proxy is always configured — `running` is the only question, and
         // `false` means a degraded daemon, not an operator's choice.
         const port = proxyServer?.port ?? null;
         proxy = {
           running: proxyServer !== undefined,
-          bind: config.proxy.bind,
-          binds: proxyServer?.binds ?? [config.proxy.bind],
+          bind: view.bind,
+          binds: proxyServer?.binds ?? [view.bind],
           port,
-          address: port !== null ? `http://${config.proxy.bind}:${port}` : null,
-          upstream: config.proxy.upstream,
-          fallbacks: config.proxy.fallbacks.length,
-          policyEnforce: config.proxy.policy.enforce,
+          address: port !== null ? `http://${view.bind}:${port}` : null,
+          upstream: view.upstream,
+          fallbacks: view.fallbacks,
+          policyEnforce: view.policyEnforce,
         };
       } catch { /* proxy status is optional; never block the health probe */ }
 
@@ -975,7 +1003,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         dashboardUrl: isManagedMode()
           ? null
           : (boundWebPort
-            ? resolveDashboardUrl(boundBindHost, boundWebPort, startupConfig.server.dashboard_url)
+            ? resolveDashboardUrl(boundBindHost, boundWebPort, liveDashboardUrlSetting)
             : null),
         ...(autoReactBudget ? { autoReactBudget } : {}),
         ...(proxy ? { proxy } : {}),
@@ -1363,6 +1391,9 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // Declared here (not in the start block below) so teardownPartialStart can stop
   // it if a LATER startup step fails.
   let proxyServer: ProxyServer | undefined;
+  // What the RUNNING proxy was built from — status reports this, never a fresh
+  // read of lazy.toml, which may hold edits still pending a restart.
+  let runningProxyView: { bind: string; upstream: string; fallbacks: number; policyEnforce: boolean } | undefined;
   // Stops the state-file self-repair watch (see below). Declared here so
   // teardownPartialStart can clear it whenever it was already armed.
   let stopStateFileWatch: (() => void) | undefined;
@@ -1436,8 +1467,13 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
    * call recordStartupFailure without a teardown: there is nothing to tear
    * down, and the teardown closes over bindings those steps precede.
    */
-  const failStartup = (errorMessage: string): Promise<Error> =>
-    recordStartupFailure(projectRoot, errorMessage, teardownPartialStart);
+  const failStartup = (errorMessage: string): Promise<Error> => {
+    // Same as stop(): a failed start must not leave its remembered config and
+    // appliers behind in this process.
+    resetLastKnownGood();
+    resetStartupSettings();
+    return recordStartupFailure(projectRoot, errorMessage, teardownPartialStart);
+  };
 
   // Build a minimal TCP handler that can accept the bind BEFORE we touch
   // storage. Storage initialization is expensive and async — if we kicked
@@ -1546,7 +1582,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     // here is only ever taken for a request that arrives in that window — and
     // it resolves to the same default.
     const dashboardUrl = boundWebPort
-      ? resolveDashboardUrl(boundBindHost, boundWebPort, startupConfig.server.dashboard_url)
+      ? resolveDashboardUrl(boundBindHost, boundWebPort, liveDashboardUrlSetting)
       : undefined;
     return serveDashboardRequest(
       projectRoot,
@@ -1609,7 +1645,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     // session cookie — on every upgrade (see src/daemon/dashboard-auth.ts).
     const wsGuard = (req: Request) => {
       const dashboardUrl = boundWebPort
-        ? resolveDashboardUrl(bindHost, boundWebPort, startupConfig.server.dashboard_url)
+        ? resolveDashboardUrl(bindHost, boundWebPort, liveDashboardUrlSetting)
         : undefined;
       return guardDashboardRequest(
         projectRoot,
@@ -1731,7 +1767,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     writeWebHost(projectRoot, bindHost);
     // Set daemon context so RPC handlers (e.g., task launcher) can access
     // the daemon's own webPort and token without health checks.
-    const dashboardUrl = resolveDashboardUrl(bindHost, actualPort, startupConfig.server.dashboard_url);
+    const dashboardUrl = resolveDashboardUrl(bindHost, actualPort, liveDashboardUrlSetting);
     setDaemonContext({ webPort: actualPort, token, bindHost, dashboardUrl });
     const bindHealth = daemonHealthRecorder(projectRoot);
     bindHealth.recordBind({ surface: 'dashboard', host: bindHost, port: actualPort, primary: true, ok: true });
@@ -1864,7 +1900,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
           // and sessions are enforced on every bind by design. That includes
           // `[server] dashboard_url`, exactly as the HTTP gate above reads it.
           const guard = (req: Request) => {
-            const configured = startupConfig.server.dashboard_url || undefined;
+            const configured = liveDashboardUrlSetting || undefined;
             return guardDashboardRequest(
               projectRoot,
               req,
@@ -1895,7 +1931,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     boundBindHost = DEFAULT_SERVER_BIND;
     const testBindHealth = daemonHealthRecorder(projectRoot);
     testBindHealth.recordBind({ surface: 'dashboard', host: DEFAULT_SERVER_BIND, port: webPort, primary: true, ok: true });
-    testBindHealth.recordDashboardUrl(resolveDashboardUrl(DEFAULT_SERVER_BIND, webPort, startupConfig.server.dashboard_url));
+    testBindHealth.recordDashboardUrl(resolveDashboardUrl(DEFAULT_SERVER_BIND, webPort, liveDashboardUrlSetting));
     // Persist the discovery markers even in test mode: with TCP as the only
     // transport they are how any OTHER process (a CLI subprocess in an e2e
     // test) finds this in-process daemon. The daemon base dir is redirected in
@@ -2129,6 +2165,8 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     // What this proxy was built from: a later config change touching any of it
     // needs a restart (src/daemon/proxy-fingerprint.ts).
     (await import('./proxy-fingerprint')).recordRunningProxy(projectRoot, cfg);
+    recordStartupSettings(cfg, 'proxy');
+    runningProxyView = { bind: cfg.proxy.bind, upstream: cfg.proxy.upstream, fallbacks: cfg.proxy.fallbacks.length, policyEnforce: cfg.proxy.policy.enforce };
     // What `lazy daemon health` probes: the addresses, the audit directory and
     // the audit queue's own record — never a credential.
     {
@@ -2201,7 +2239,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     extraWebServers,
     webPort: webPort!,
     bindHost: boundBindHost!,
-    dashboardUrl: resolveDashboardUrl(boundBindHost, webPort!, startupConfig.server.dashboard_url),
+    dashboardUrl: resolveDashboardUrl(boundBindHost, webPort!, liveDashboardUrlSetting),
     proxyServer,
     stop: async () => {},
   };
@@ -2213,6 +2251,10 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   async function stop() {
     if (stopped) return;
     stopped = true;
+    // Process-wide config state belongs to THIS daemon; an in-process test that
+    // starts another must not inherit its remembered config or its appliers.
+    resetLastKnownGood();
+    resetStartupSettings();
     if (stopTestParentWatch) stopTestParentWatch();
     logger.info('Daemon shutting down...');
 
@@ -3121,20 +3163,24 @@ function startDaemonSyncLoop(projectRoot: string): () => void {
   const initialTimeout = setTimeout(doSync, 5_000);
 
   // Subsequent syncs: use the configured sync_interval.
-  // Default is 60s — we check config once and use that for the interval.
-  // If the user changes the config, they restart the daemon anyway.
+  // Default is 60s — the PERIOD is read once here, and re-armed by
+  // `lazy daemon reload` (src/daemon/config-status.ts); each tick re-reads the
+  // rest of the config itself.
   let intervalId: ReturnType<typeof setInterval>;
-  loadConfig(projectRoot).then(config => {
+  const arm = (config: ResolvedConfig) => {
+    if (intervalId) clearInterval(intervalId);
     const syncIntervalMs = (config.server.sync_interval || 60) * 1_000;
     health.loopStarted(REMOTE_SYNC_LOOP, syncIntervalMs);
     intervalId = setInterval(doSync, syncIntervalMs);
     logger.debug(`Daemon sync loop enabled: every ${config.server.sync_interval || 60}s`);
-  }).catch(err => {
-    // Deliberately a fallback, not a startup failure — and the one place in the
-    // daemon where falling back to a default is right. startDaemonServer already
-    // refuses to start on an unloadable lazy.toml, so by the time this fires the
-    // config must have BECOME broken after the daemon came up (the user is
-    // mid-edit). Killing a healthy daemon's sync loop over an in-progress edit
+  };
+  registerReloadApplier('server.sync_interval', (config) => { if (!stopped) arm(config); });
+  loadConfig(projectRoot).then(arm).catch(err => {
+    // Deliberately a fallback, not a startup failure. With the last-known-good
+    // config (src/config/last-good.ts) a file that broke after startup no longer
+    // reaches here — loadConfig answers with the good copy — so this is only for
+    // a load that fails with nothing good remembered (e.g. an in-process daemon
+    // whose state was reset). Killing a healthy daemon's sync loop over an in-progress edit
     // would be worse than syncing at the documented default interval. It is not
     // silent, though: warn level, with the cause, so the log says why the
     // interval isn't the configured one.

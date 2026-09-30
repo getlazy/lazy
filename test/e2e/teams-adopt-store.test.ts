@@ -20,7 +20,8 @@
  */
 
 import { describe, test, expect, afterAll } from 'bun:test';
-import { cp, mkdtemp, rm } from 'fs/promises';
+import { cp, mkdtemp, readdir, readFile, rm, stat } from 'fs/promises';
+import { createHash } from 'crypto';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { slowSuiteSkipped } from '../helpers/slow-suite';
@@ -32,6 +33,22 @@ const ENTRY = join(CHECKOUT, 'src', 'index.ts');
 const APP_DIR = join(CHECKOUT, 'lazy-teams');
 
 const createdRoots = new Set<string>();
+
+/** Path, size, mtime and sha256 of every file under a directory: any write to it changes this. */
+async function fingerprint(dir: string): Promise<string[]> {
+  const out: string[] = [];
+  const walk = async (d: string): Promise<void> => {
+    for (const entry of (await readdir(d, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+      const path = join(d, entry.name);
+      if (entry.isDirectory()) { await walk(path); continue; }
+      const info = await stat(path);
+      const sum = createHash('sha256').update(await readFile(path)).digest('hex');
+      out.push(`${path} ${info.size} ${info.mtimeMs} ${sum}`);
+    }
+  };
+  await walk(dir);
+  return out;
+}
 
 afterAll(async () => {
   for (const root of createdRoots) {
@@ -122,13 +139,19 @@ describe.skipIf(slowSuiteSkipped('teams adopt-store'))('adopting an existing sto
     const incoming = join(root, 'incoming-store');
     await cp(liveStore, incoming, { recursive: true, filter: (src) => !src.endsWith('.storage-lock') });
 
+    const before = await fingerprint(incoming);
     const adopted = await teamsRun(root, [ 'bin/rails', 'lazy:adopt_store' ], {
       TEAM: 'acme', NAME: 'Adopted Project',
       REPO_URL: `file://${demoPaths(root).repo}`, STORE: incoming,
     });
     expect(adopted.out).toContain(`adopted ${taskCount} task(s)`);
-    expect(adopted.out).toContain('ADOPTED IN PLACE');
+    expect(adopted.out).toContain('COPIED to');
     expect(adopted.code).toBe(0);
+
+    // INVARIANT: adoption only ever READS the source store. Any write to it
+    // (a lock removal included) would give a store a daemon may still be
+    // serving a second writer.
+    expect(await fingerprint(incoming)).toEqual(before);
 
     // The proof: the project Teams provisioned on that directory answers with
     // the tasks that were already in it. Read through the app the way a page
@@ -144,7 +167,11 @@ describe.skipIf(slowSuiteSkipped('teams adopt-store'))('adopting an existing sto
       'puts "ADOPTED_STORE=#{project.store_path}"',
     ].join('; ') ]);
 
-    expect(listed.out).toContain(`ADOPTED_STORE=${incoming}`);
+    // Adoption always copies: the project serves a directory under the fleet
+    // root, never the operator's own.
+    const adoptedStore = listed.out.match(/ADOPTED_STORE=(.+)/)?.[1]?.trim() ?? '';
+    expect(adoptedStore).not.toBe(incoming);
+    expect(adoptedStore.startsWith(`${demoTeamsPaths(root).fleetRoot}/`)).toBe(true);
     const served = Number(listed.out.match(/ADOPTED_TASKS=(\d+)/)?.[1] ?? -1);
     expect(served).toBe(taskCount);
   }, 2_400_000);

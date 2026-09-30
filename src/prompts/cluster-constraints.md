@@ -131,7 +131,12 @@ estimate; a `tokens-only` harness has no limit lazy can see; a null `budget` (wi
    child. Each setting is inherited separately, so a child you escalate to
    `separate` still keeps your gate and auto-fix.
 
-   **Write the child's verdict in your journal before you accept it.**
+   **A child that names no `agent` inherits YOURS.** It runs on your agent
+  profile (and so that profile's model), and the project's `[agent.by_type]` routing is
+  not consulted for it. Pass `agent` on every child whose work does not need your
+  tier, choosing from the profiles `lazy_status` lists.
+
+  **Write the child's verdict in your journal before you accept it.**
    `lazy_journal` on your own task: how many rounds it took, what went right,
    what went wrong, and anything the next child should avoid. This is what the
    operator reads afterwards, and once the child is accepted its record is one

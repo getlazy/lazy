@@ -628,6 +628,8 @@ async function dispatchRpc(
     case 'linkTask': return handleLinkTask(projectRoot, params, progress);
     case 'describeLinkedTask': return handleDescribeLinkedTask(projectRoot, params, progress);
     case 'concurrency': return handleConcurrency(projectRoot, params);
+    case 'configStatus': return (await import('./config-status')).configStatus(projectRoot);
+    case 'configReload': return (await import('./config-status')).reloadConfig(projectRoot);
     case 'usagePause': return handleUsagePause(projectRoot, params, caller);
     case 'turnCredentialCheck': return handleTurnCredentialCheck(projectRoot, params, caller);
     case 'getProjectSettings': return handleGetProjectSettings(projectRoot);

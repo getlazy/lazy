@@ -41,6 +41,8 @@ import {
   LOOP_DEPRECATED_KEYS,
   CHECKS_DEPRECATED_KEYS,
 } from '../config/loader';
+import { lastKnownGoodState } from '../config/last-good';
+import { DaemonClient } from '../daemon/client';
 import { createRunner } from '../runner';
 import type { Runner } from '../runner';
 import {
@@ -117,7 +119,7 @@ import {
 } from '../daemon/auth-env';
 import { inspectDaemonStateFiles } from '../daemon/state-files';
 import { getDaemonDir, PID_FILE } from '../daemon/paths';
-import { readDaemonLockPid, readPid, checkDaemonHealth, isDaemonRunning, type DaemonStatus } from '../daemon/lifecycle';
+import { readDaemonLockPid, readPid, checkDaemonHealth, isDaemonRunning, DAEMON_HEALTH_TIMEOUT_MS, type DaemonStatus } from '../daemon/lifecycle';
 import { requestDaemonHealth, DaemonPredatesHealthError } from '../daemon/daemon-health-client';
 import { BUILD_MATCH_ROW_ID, summarizeRows, type DaemonHealthReport } from '../daemon/daemon-health-rows';
 import { getSourceIdentity } from '../utils/source-id';
@@ -1138,8 +1140,8 @@ export function describeDashboardAddress(
         `dashboard is still served at its default address. Move the line under [server]:\n` +
         `    [server]\n` +
         `    dashboard_url = "https://lazy.example.com"\n` +
-        `  then restart the daemon: ${theme.command('lazy daemon restart')}`,
-      remedy: 'Move dashboard_url under [server] in lazy.toml, then restart the daemon (lazy daemon restart).',
+        `  then apply it: ${theme.command('lazy daemon reload')}`,
+      remedy: 'Move dashboard_url under [server] in lazy.toml, then apply it (lazy daemon reload).',
     };
   }
 
@@ -1152,10 +1154,9 @@ export function describeDashboardAddress(
       label: 'Dashboard address',
       detail:
         `${asked}, but the running daemon still serves the dashboard at ${problem.served} — links, ` +
-        `\`lazy dashboard\` and sign-in all use that. The setting is read only when the daemon starts.\n` +
-        `  Restart it to apply lazy.toml: ${theme.command('lazy daemon restart')}\n` +
-        `  That interrupts running agent and pair sessions; each agent turn resumes against the new daemon.`,
-      remedy: 'Restart the daemon (lazy daemon restart) so it picks up [server] dashboard_url.',
+        `\`lazy dashboard\` and sign-in all use that. The setting is held from when the daemon started.\n` +
+        `  Apply lazy.toml without interrupting anything: ${theme.command('lazy daemon reload')}`,
+      remedy: 'Apply it with lazy daemon reload (no restart, running turns are not interrupted).',
     };
   }
 
@@ -3427,9 +3428,17 @@ export async function runDoctorReport(options: DoctorRunOptions): Promise<Doctor
   let configError: string | null = null;
   if (root) {
     try {
-      config = await loadConfig(root);
+      config = await loadConfig(root, { strict: true });
     } catch (err) {
       configError = err instanceof Error ? err.message : String(err);
+      // Run inside a daemon that is still working on its last good copy of
+      // this file (src/config/last-good.ts): say so, since that is what every
+      // turn is using right now.
+      const lastGood = await runningOnLastKnownGood(root);
+      if (lastGood) {
+        configError += `\n  The daemon is running on the last good config it loaded from this file (at ${lastGood.goodLoadedAt}); ` +
+          `nothing changed since is in effect until the file loads again.`;
+      }
     }
   }
   if (root) {
@@ -3814,5 +3823,28 @@ export async function runDoctorReport(options: DoctorRunOptions): Promise<Doctor
   } finally {
     sweepStorage = undefined;
     sweepRoot = null;
+  }
+}
+
+/**
+ * Is the daemon running on its last good copy of this project's lazy.toml?
+ * Asked of this process first (doctor run inside the daemon), then of the
+ * daemon over RPC (`lazy doctor` in a terminal runs its sweep locally).
+ */
+async function runningOnLastKnownGood(root: string): Promise<{ goodLoadedAt: string } | null> {
+  const local = lastKnownGoodState(await resolveConfigPath(root));
+  if (local) return local;
+  if (process.env.LAZY_IS_DAEMON === '1') return null;
+  try {
+    const client = await DaemonClient.create(root);
+    if (!client) return null;
+    // Bounded: a frozen daemon must not hang the command meant to diagnose it.
+    const status = await client.rpc('configStatus', root, {}, undefined, AbortSignal.timeout(DAEMON_HEALTH_TIMEOUT_MS)) as { lastKnownGood?: { goodLoadedAt: string } | null };
+    return status.lastKnownGood ?? null;
+  } catch (err) {
+    // No daemon, or one too old to answer: the parse failure itself is still
+    // reported in full; only the "running on the last good copy" line is lost.
+    void err;
+    return null;
   }
 }
