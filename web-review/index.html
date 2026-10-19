@@ -35,7 +35,7 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="web-review-surface"><a class="anchor" href="#web-review-surface" aria-hidden="true">#</a>Web review surface</h1>
 <p>This page is for anyone reviewing and driving lazy tasks from a browser rather
@@ -133,7 +133,7 @@ your dashboard session to that app, which could then use it against the
 dashboard.</p>
 <h3 id="task-apps-are-subdomains-and-stay-a-separate-jar"><a class="anchor" href="#task-apps-are-subdomains-and-stay-a-separate-jar" aria-hidden="true">#</a>Task apps are subdomains, and stay a separate jar</h3>
 <p>Each task&#39;s services are reachable through this same listener at
-<code>http://&lt;service&gt;.&lt;task&gt;.lazy.localhost:&lt;port&gt;</code> (see
+<code>http://&lt;task&gt;.&lt;service&gt;.lazy.localhost:&lt;port&gt;</code> (see
 <a href="../serve-ports/">serve ports</a>) — a hostname <em>under</em> the dashboard&#39;s. Three
 things keep that from undoing the separation above:</p>
 <ul>
@@ -166,6 +166,12 @@ one line to add to <code>/etc/hosts</code>:</p>
 the task subdomains: for those you need a browser that resolves <code>.localhost</code>
 itself, and for <code>curl</code> and scripts there is <code>lazy url &lt;task&gt; &lt;service&gt; --direct</code>.</p>
 <h2 id="the-task-page"><a class="anchor" href="#the-task-page" aria-hidden="true">#</a>The task page</h2>
+<p>Static text grows with the page instead of scrolling inside a fixed-height box.
+Use a section&#39;s header or collapse control to fold it to a single line, and open
+it again to read the full text. Editable boxes and interactive terminals retain
+their own scrolling.
+In Teams, live updates keep drawers open or closed as you left them, even while
+their contents change.</p>
 <p>Every task lives at <code>/tasks/:task</code> — the task&#39;s code when it has one, its id
 otherwise; both resolve, so old id-based links keep working. The tabs are always
 the same, in this order,
@@ -909,7 +915,10 @@ window or the panel changes size — drag the bottom edge to make it taller. It 
 read-only; you cannot type into it. When the task is not running the panel says
 so and stays open, so the next turn appears without reopening it. <strong>Close</strong>
 dismisses the panel. Watch needs scripting; with it off, reload the page to see
-the latest agent output.</p>
+the latest agent output. Opening Watch shows the latest five task turns
+with timestamps and brief descriptions. New turns appear as they finish.
+It replays only output from the latest turn; the full history remains in
+the task timeline.</p>
 <h2 id="large-changes"><a class="anchor" href="#large-changes" aria-hidden="true">#</a>Large changes</h2>
 <p>A branch can carry thousands of files — a release, or a parent task whose
 subtasks all landed. Changes never hides or truncates any of them; it loads
@@ -1125,7 +1134,7 @@ block there, <strong>inside the task&#39;s container</strong>: the same text Cop
 given you, in the place the agent worked. A step whose session is already live
 shows <strong>Open</strong> and <strong>Re-run</strong> instead of stacking a second terminal. The
 <a href="../web-shell/">Shell tab</a> lists that session and links to it; it does not draw
-a second copy. Maximise enlarges the same terminal in place.</p>
+a second copy. <strong>Fill window</strong> enlarges the same terminal to the whole window.</p>
 <p>Blocks tagged as data or source (<code>json</code>, <code>toml</code>, <code>ts</code>, …) are not runnable and
 show Copy only, and when no shell can be opened Run is disabled with the reason.
 A stopped container is not one of those reasons: Run starts the container and
@@ -1186,7 +1195,13 @@ previous turn&#39;s — which includes however long the turn sat waiting for you
 <p>The legend gives the four counters — input, output, cache read, cache write —
 with totals and shares. <strong>Per turn</strong> stacks those four for every agent turn,
 oldest on the left; <strong>Cumulative</strong> is the same turns as a running total, which
-is the one to look at when you want to know whether spend is accelerating.</p>
+is the one to look at when you want to know whether spend is accelerating.
+Its horizontal axis is time: the first and last turn times are labelled in
+ISO 8601 (UTC), with a middle time when there is room, and hovering a point shows
+its time, turn and chunk. A dashed line marks where each review chunk began, with
+its number; the numbers are also listed under the chart as links to that chunk&#39;s
+turns, and the per-turn table gains a <strong>Chunk</strong> column. With subtasks included
+there are no chunk marks, because every task numbers its own chunks.</p>
 <p>A turn that reported no token usage is <strong>absent from the chart</strong>, not drawn as
 a zero-height bar: usage is recorded when the agent reports it, and a missing
 report is not a free turn. The count of such turns is printed under the chart.
@@ -1243,7 +1258,7 @@ and closed, never a request to the app. Three states, and they look different on
 purpose:</p>
 <ul>
 <li><strong>Listening</strong> — a green dot and a clickable URL: the task&#39;s own name for that
-service, <code>http://&lt;service&gt;.&lt;task&gt;.lazy.localhost:&lt;port&gt;</code>. It is loopback-only,
+service, <code>http://&lt;task&gt;.&lt;service&gt;.lazy.localhost:&lt;port&gt;</code>. It is loopback-only,
 so it works from the machine the task runs on, which is the machine serving
 this page.</li>
 <li><strong>Published, nothing listening</strong> — a hollow red dot and the plain text
@@ -1281,20 +1296,20 @@ nothing to start).</p>
 <h3 id="start-services"><a class="anchor" href="#start-services" aria-hidden="true">#</a>Start services</h3>
 <p>Once your project has a Start services command, the card also offers a
 <strong>Start services</strong> button.</p>
-<p>The Services card lets you <strong>designate</strong> the command: type it (for example
-<code>bin/dev</code>) and save. It is one command for the whole project, not a per-task
-override, and it is saved in the project&#39;s store — lazy does not edit your
-<code>lazy.toml</code>. The command must be a single line. You can change it the same way
-later, from any task&#39;s Services card; Lazy Teams offers the same control on its
-Services card. After it is saved, <strong>Start services</strong> appears whenever the shell
-is available.</p>
-<p>To remove it, press <strong>Clear command</strong> on the Services card. The project then
+<p>You <strong>designate</strong> the command in <strong>Settings › Services</strong> — the Services card&#39;s
+<strong>Configure services</strong> button takes you there. Type it (for example <code>bin/dev</code>)
+and save. It is one command for the whole project, not a per-task override, and
+it is saved in the project&#39;s store — lazy does not edit your <code>lazy.toml</code>. The
+command must be a single line. A task&#39;s Services card never changes it. Lazy
+Teams keeps the same command on its project Configuration page. After it is
+saved, <strong>Start services</strong> appears whenever the shell is available.</p>
+<p>To remove it, press <strong>Clear command</strong> in Settings › Services. The project then
 has no Start services command until someone designates one again — a
 <code>start_services_cmd</code> still sitting in <code>lazy.toml</code> is not read back.</p>
 <p>If your <code>lazy.toml</code> already sets <code>start_services_cmd</code> in <code>[serve]</code>, the daemon
 imports that value into the store the next time it starts, so it keeps working.
-After the import, the store&#39;s value is the one used; edit it from the Services
-card rather than in <code>lazy.toml</code> (or clear it there).</p>
+After the import, the store&#39;s value is the one used; edit it in Settings ›
+Services rather than in <code>lazy.toml</code> (or clear it there).</p>
 <p>Pressing <strong>Start services</strong> opens the web shell on that task and runs the
 command there, in the container, so you watch the output in a real terminal
 instead of a spinner. The command never comes from a task&#39;s own files, which the
@@ -1302,6 +1317,22 @@ agent working in that task can edit.</p>
 <p>That is the whole point of the key: your agents do not have to leave a dev
 server running for you to look at their work. They end their turn; you press the
 button.</p>
+<h3 id="services-restart-after-every-turn"><a class="anchor" href="#services-restart-after-every-turn" aria-hidden="true">#</a>Services restart after every turn</h3>
+<p>When a project has a Start services command and its tasks run in containers,
+lazy restarts each task&#39;s services once after every agent work turn, before the
+task is handed back to you — so what you open is running the code the agent just
+wrote. It stops the services, then runs the Start services command again. This
+happens even if the services were not running before the turn. Questions
+(<code>lazy ask</code>), reviews and syncs do not restart anything.</p>
+<p>A failed stop is logged and the start still runs. A failed start does not change
+the task&#39;s state: the task waits for you as usual. In Lazy Teams the task&#39;s
+Services tab and Overview show a warning with the command&#39;s last output, and
+<code>lazy show --json</code> carries the same record as <code>services_restart</code>.</p>
+<p><strong>Stop services command (optional).</strong> Lazy Teams&#39; Configuration page has a Stop
+services command next to the Start one. When set, it runs in the task&#39;s
+environment before lazy ends the processes Start services launched — on
+<strong>Stop services</strong> and on the restart after a turn. Without one, stopping simply
+ends those processes.</p>
 <h2 id="navigating-a-long-review"><a class="anchor" href="#navigating-a-long-review" aria-hidden="true">#</a>Navigating a long review</h2>
 <p><strong>Changes</strong> can hold dozens of files, and Summary has the report cards.</p>
 <p>The first cut on a large branch is the <strong>Regions tab</strong>, which sits before
@@ -1870,8 +1901,9 @@ cannot run (for example there is no remote), the dialog says why instead of
 hiding the button. <code>--yes</code> skips the CLI prompt; MCP has no equivalent (it
 uses a <code>confirmation_code</code> instead). On success the page shows the PR URL.</p>
 <p>The Tasks list has a <strong>Submitted</strong> filter next to Working, Interrupted and
-Blocked, and the dashboard throughput graph plots submitted tasks as their
-own series.</p>
+Blocked. It shows submitted tasks and tasks linked to an external pull or merge
+request, even if their status has changed. The task page links directly to the
+request. The dashboard throughput graph plots submitted tasks as their own series.</p>
 <p>The header also shows whether the task is behind its parent (as of last
 fetch — no network). <strong>Sync</strong> on this tab and on Summary runs the same
 action.</p>
@@ -2096,6 +2128,12 @@ seconds — the same deadline Accept hit before action dialogs — so a
 minutes-long review never finishes in the browser. Scripting-on follows the
 run in a dialog instead; or run <code>lazy review</code> in a terminal.</li>
 </ul>
+<h2 id="copying-markdown"><a class="anchor" href="#copying-markdown" aria-hidden="true">#</a>Copying markdown</h2>
+<p>Turns, agent reports, comments, journal entries, raised items, prompts and messages are shown rendered, so selecting
+the text copies it without its headings, lists, code fences and links. Each such card has a <strong>Copy</strong> button
+that copies the original markdown source instead, exactly as it was written. It works in both the dashboard and
+Lazy Teams, shows &quot;Copied&quot; (or &quot;Copy failed&quot;) on the button, and falls back to the browser&#39;s older copy command
+where the page is not served over HTTPS or from localhost.</p>
 
 </main>
 </body>

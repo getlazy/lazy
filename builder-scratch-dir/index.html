@@ -35,7 +35,7 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="builder-scratch-dir"><a class="anchor" href="#builder-scratch-dir" aria-hidden="true">#</a>Builder scratch dir</h1>
 <p>A writable, host-accessible directory the builder can use for artifacts it wants
@@ -46,6 +46,8 @@ to hand to you — and nothing else.</p>
 <code>lazy builder</code>, you see it at the <strong>same absolute path</strong> on the host. A builder
 started by Lazy Teams sees it inside its container at <code>/lazy-builder/scratch</code>;
 read its files with <code>lazy scratch</code> or the Teams <strong>Files</strong> view.
+In Teams, <strong>Download</strong> saves any file whose content was captured into the store.
+See <a href="../lazy-teams-builders/">Builders in Lazy Teams</a> for the transcript and file controls.
 On Lazy Teams the directory, like each member&#39;s builder settings and
 conversations, lives on the project&#39;s persistent disk, so it survives the
 project&#39;s machine being replaced during an upgrade.</p>
@@ -119,6 +121,9 @@ lazy scratch rm &lt;path&gt;         # drop a captured file from the store
 lazy scratch path              # the live directory, its entry count and size
 lazy search &#39;in:scratch &lt;text&gt;&#39;   # search inside captured content
 </code></pre>
+<p>In a clone logged in to Lazy Teams, <code>lazy scratch sync</code> refuses: the Teams
+builder runs on the server and its files are captured there, so a member does not
+copy laptop files into the shared store. <code>list</code>, <code>show</code> and <code>path</code> still work.</p>
 <p>Builders read the same files through the <code>lazy_scratch</code> MCP tool and search them
 with <code>in:scratch</code>. <strong>Task agents cannot</strong> — both the tool and the search scope
 are rejected for an agent caller, server-side, from its task identity. The

@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Builders in Lazy Teams — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
+<main class="wrap">
+<h1 id="builders-in-lazy-teams"><a class="anchor" href="#builders-in-lazy-teams" aria-hidden="true">#</a>Builders in Lazy Teams</h1>
+<p>Open <strong>Builders</strong> in your project to start or return to your builder, read
+previous conversations, and find the files builders have left for you.</p>
+<h2 id="the-terminal"><a class="anchor" href="#the-terminal" aria-hidden="true">#</a>The terminal</h2>
+<p>Choose <strong>Fill window</strong> above the terminal to make it cover the whole window, and
+<strong>Exit full window</strong> (or <strong>Esc</strong>, when the terminal itself is not focused — inside it Esc goes to your program) to return to the page. You can also drag the terminal&#39;s bottom-right resize handle to
+change its height. <strong>Page Up</strong> and <strong>Page Down</strong> scroll the terminal&#39;s captured
+output, <strong>Ctrl/Cmd+C</strong> copies a selection and <strong>Ctrl/Cmd+V</strong> or <strong>Paste</strong> pastes;
+other key combinations keep their existing terminal behavior. Every terminal in
+Teams — builders, a task&#39;s Shell, Watch and Verify&#39;s Run in shell, and the
+admin machine shell — has the same controls.</p>
+<p>Teams builders run in isolated containers with permission bypass enabled.
+This does not change permission settings or warnings for builders you launch
+on your own machine.</p>
+<h2 id="create-a-task-from-messages"><a class="anchor" href="#create-a-task-from-messages" aria-hidden="true">#</a>Create a task from messages</h2>
+<p>In a previous builder&#39;s transcript, check <strong>Select message</strong> beside each
+message you want to use. Messages need not be consecutive. Selections remain
+as you move between transcript pages in the same browser tab.</p>
+<p>Choose <strong>Create task</strong> to open the normal new-task screen. Its prompt contains
+only the selected messages, in conversation order. Set the goal and edit the
+prompt before choosing <strong>Add to backlog</strong> or <strong>Create and start</strong>. Selecting
+messages alone never creates a task.</p>
+<p>Edits to this prompt are saved as a separate local draft. Returning to the same
+selection restores your edits without replacing an unrelated new-task draft.</p>
+<p>Messages render as markdown, with subtly different backgrounds for the human
+and builder.</p>
+<h2 id="files"><a class="anchor" href="#files" aria-hidden="true">#</a>Files</h2>
+<p>Open <strong>Files</strong> to read captured scratch files. <strong>Rendered</strong> displays markdown,
+<strong>Source</strong> displays its text within Teams, and <strong>Raw</strong> opens the plain text
+without the Teams interface. <strong>Download</strong> saves the stored file content.</p>
+<p>Files recorded by name only have no stored content to download. Their page
+shows why capture skipped them, rather than offering an empty file.</p>
+
+</main>
+</body>
+</html>

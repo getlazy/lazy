@@ -35,13 +35,20 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="proxy-request-plugins"><a class="anchor" href="#proxy-request-plugins" aria-hidden="true">#</a>Proxy request plugins</h1>
 <p>Lazy runs a local Anthropic-native passthrough proxy that every agent&#39;s model
 traffic flows through. A <strong>request plugin</strong> receives the parsed JSON body of each
 outbound request just before it is forwarded upstream, and may return a
 replacement body.</p>
+<blockquote>
+<p><strong>Repository plugins are currently not run.</strong> Lazy never runs code from the
+repository inside its own process on the host — on your own machine or on a
+shared Lazy Teams host. Files in <code>.lazy/plugins/</code> are ignored; the daemon log
+and <code>lazy doctor</code> name them. The rest of this page describes how plugins are
+written and how they would behave, for when a contained way to run them exists.</p>
+</blockquote>
 <p>Lazy ships the <strong>seam</strong>, not plugins. There is no built-in plugin and nothing to
 turn off: a project extends the proxy by dropping a module into
 <code>.lazy/plugins/</code>, and a project that does not is byte-for-byte identical to a
@@ -128,6 +135,11 @@ and keep it small enough to read in one sitting.</p>
 <p>Plugins are loaded from the <strong>main project checkout only</strong>, never from a task
 worktree. A worktree is agent output; a plugin appearing there would let one task
 agent rewrite every other agent&#39;s outbound requests.</p>
+<p>That is exactly why they are not run today: a plugin is code from the
+repository, which an agent can write and get accepted, and it would run with
+the daemon&#39;s full privileges on the host. See
+<a href="../managed-config/#code-from-the-repository">Managed mode</a> for how lazy treats
+every kind of code a repository ships.</p>
 <h2 id="measure-before-you-keep-one"><a class="anchor" href="#measure-before-you-keep-one" aria-hidden="true">#</a>Measure before you keep one</h2>
 <p>A transform that sounds like it should help, sitting on every agent&#39;s critical
 path, is a liability until it is measured. <code>lazy stats audit</code> and

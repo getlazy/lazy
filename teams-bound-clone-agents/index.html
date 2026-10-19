@@ -35,7 +35,7 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="claude-code-against-a-lazy-teams-project"><a class="anchor" href="#claude-code-against-a-lazy-teams-project" aria-hidden="true">#</a>Claude Code against a Lazy Teams project</h1>
 <p>This page is for Lazy Teams members who want to use Claude Code on a project.
@@ -85,19 +85,21 @@ task, memory, messages, raised items, artifacts, and listing, searching and
 reading past conversations.</p>
 <p>The task lifecycle: create, edit, clone, comment, tag, journal, attach
 artifacts, and start, unblock, resume, ask, review, stop, accept, reject,
-close, reopen and sync a task.</p>
+close, reopen and sync a task. Also: redoing a task, submitting a pull request,
+moving a task under another parent, linking an existing branch as a task,
+promoting a raised item into a task (goal and code only), and listing and
+showing the builder&#39;s captured scratch files — each as the browser offers it,
+for the same members.</p>
 <h3 id="what-refuses-and-says-so"><a class="anchor" href="#what-refuses-and-says-so" aria-hidden="true">#</a>What refuses, and says so</h3>
 <p>Each of these answers with an error naming the Teams install and project, and
 what to do instead — usually &quot;use your server-side builder&quot; — rather than
 failing obscurely:</p>
 <ul>
-<li><strong>Not in the browser either:</strong> saving shared memory, the builder&#39;s scratch
-files, posting system messages, submitting a pull request, reparenting a
-task, linking an existing branch as a task, and promoting a raised item into
-a task. Use a server-side builder for these.</li>
-<li><strong>In the browser, but not offered to a clone:</strong> dismissing a system message,
-and redoing a task (several steps, not all of them relayed). Use the Teams
-web UI for these.</li>
+<li><strong>Not in the browser either:</strong> saving shared memory, deleting scratch files or
+artifacts, posting system messages, per-task environment variables, and
+re-describing a linked task. Use a server-side builder for these.</li>
+<li><strong>In the browser, but not offered to a clone:</strong> dismissing a system message.
+Use the Teams web UI for this.</li>
 <li><strong>Usage limits and token statistics.</strong> These cover every member of the
 project, so they are not offered to a clone. Use the Teams web UI where it
 shows them, or a server-side builder.</li>

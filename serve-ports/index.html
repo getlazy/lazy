@@ -35,7 +35,7 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="reaching-a-tasks-dev-server"><a class="anchor" href="#reaching-a-tasks-dev-server" aria-hidden="true">#</a>Reaching a task&#39;s dev server</h1>
 <p>A task runs in its own environment. When the work is a web app, that environment
@@ -49,8 +49,8 @@ ports = [3000, 5173]
 </code></pre>
 <pre><code class="language-bash">lazy start my-task
 lazy url my-task
-# 3000  http://3000.my-task.lazy.localhost:26024  ● listening
-# 5173  http://5173.my-task.lazy.localhost:26024  ○ not listening
+# 3000  http://my-task.3000.lazy.localhost:26024  ● listening
+# 5173  http://my-task.5173.lazy.localhost:26024  ○ not listening
 
 open &quot;$(lazy url my-task 3000)&quot;
 </code></pre>
@@ -68,10 +68,10 @@ web = 3000
 api = 8080
 storybook = 6006
 </code></pre>
-<pre><code class="language-bash">lazy url my-task            # web  http://web.my-task.lazy.localhost:26024
-                            # api  http://api.my-task.lazy.localhost:26024
+<pre><code class="language-bash">lazy url my-task            # web  http://my-task.web.lazy.localhost:26024
+                            # api  http://my-task.api.lazy.localhost:26024
                             # ...
-lazy url my-task web        # http://web.my-task.lazy.localhost:26024
+lazy url my-task web        # http://my-task.web.lazy.localhost:26024
 </code></pre>
 <p>Both spellings can be used together — <code>ports</code> for the ones whose number <em>is</em> the
 name, <code>[serve.services]</code> for the ones worth naming. A bare port from <code>ports</code> is
@@ -84,7 +84,7 @@ URL as a link, a green/grey liveness dot from the same TCP check <code>lazy url<
 uses, and the <code>lazy url &lt;task&gt; &lt;service&gt;</code> command ready to copy. The task
 <em>list</em> does not show it: the live mapping means a runtime call per task, which
 is not a cost a list render should pay for information nobody asked for yet.</p>
-<h2 id="the-url-is-a-name-servicetasklazylocalhost"><a class="anchor" href="#the-url-is-a-name-servicetasklazylocalhost" aria-hidden="true">#</a>The URL is a name: <code>&lt;service&gt;.&lt;task&gt;.lazy.localhost</code></h2>
+<h2 id="the-url-is-a-name-taskservicelazylocalhost"><a class="anchor" href="#the-url-is-a-name-taskservicelazylocalhost" aria-hidden="true">#</a>The URL is a name: <code>&lt;task&gt;.&lt;service&gt;.lazy.localhost</code></h2>
 <p>That URL is served by the running lazy daemon, on the same port as the
 dashboard. The daemon reads the hostname, finds the task&#39;s container and the
 port it publishes, and forwards the request there — including WebSockets, so
@@ -100,12 +100,14 @@ container is created, so it changes on every recreate. The name does not: a
 browser tab, a bookmark, or a note in a PR keeps working across restarts.</li>
 </ul>
 <p>The task part is the task&#39;s <strong>code</strong> when it has one, and its short id
-otherwise (<code>http://web.a1b2c3d4.lazy.localhost:26024</code>). That is why task codes
+otherwise (<code>http://a1b2c3d4.web.lazy.localhost:26024</code>). That is why task codes
 are restricted to what a hostname allows — lowercase letters, digits and
 hyphens, up to 63 characters. Older tasks whose code does not fit keep it
 and keep working everywhere else; in a URL they are addressed by
 short id, which is what <code>lazy url</code> prints for them. The service part is the
-service name, or the container port for a bare <code>[serve] ports</code> entry.</p>
+service name, or the container port for a bare <code>[serve] ports</code> entry.
+The task always comes first, so every service of one task sits together:
+<code>my-task.web</code> and <code>my-task.3000</code> both address <code>my-task</code>.</p>
 <h3 id="--direct-for-curl-and-scripts"><a class="anchor" href="#--direct-for-curl-and-scripts" aria-hidden="true">#</a><code>--direct</code> for curl and scripts</h3>
 <p>Chromium and Firefox resolve <code>*.localhost</code> to loopback themselves, so nothing
 has to be installed for a browser to reach these names. <strong>The OS resolver
@@ -116,6 +118,42 @@ mapping:</p>
 </code></pre>
 <p><code>--direct</code> works in both shapes — with a service argument it prints the one
 bare loopback URL, and without one it lists them all.</p>
+<h2 id="under-lazy-teams"><a class="anchor" href="#under-lazy-teams" aria-hidden="true">#</a>Under Lazy Teams</h2>
+<p>When the project runs under Lazy Teams, each task&#39;s Services card has an
+<strong>Open</strong> link for every service. Teams proxies the request to the project and on
+to the task, so the service opens from any browser signed in to Teams as a
+member of the project — not only on the machine running it — with WebSockets
+and hot reload passing through. The service gets a host name of its own under
+the install&#39;s services host (<code>&lt;task&gt;--&lt;service&gt;--p&lt;project&gt;.&lt;services host&gt;</code>),
+so, as with <code>lazy url</code>, every task keeps its own cookie jar. What an install
+needs for that name to resolve is in
+<a href="../self-hosting-lazy-teams/#reaching-a-tasks-running-services">Self-hosting Lazy Teams</a>.</p>
+<p>The address printed beside <strong>Open</strong> is the one Teams serves the service on, and
+the <code>lazy url</code> command is not shown there: under Teams, <code>lazy.localhost</code> names
+belong to the project&#39;s own machine and answer nowhere else. An install with
+no services host shows no address and says what an operator must set up.</p>
+<p>Opening a service that nothing is serving — the task&#39;s environment is down, or
+nothing listens on the port — takes you to the task&#39;s <strong>Services</strong> tab, which
+says what is running and offers <strong>Run services</strong>, which starts the task&#39;s
+environment first if it is down and shows each step as it happens.</p>
+<p>A server started inside a task&#39;s container must listen on all interfaces
+(<code>0.0.0.0</code>), not only on the container&#39;s loopback, to be reachable through the
+published port — <code>BINDING=0.0.0.0 bin/rails server</code>, <code>vite --host</code>, and so on.</p>
+<h3 id="links-in-the-pull-request"><a class="anchor" href="#links-in-the-pull-request" aria-hidden="true">#</a>Links in the pull request</h3>
+<p>When the install has a public address, a submitted task&#39;s PR/MR description
+opens with one line: a link to the task in Teams and a link to its <strong>main
+service</strong>, so a reviewer can switch between the pull request and the running
+app. The main service is the port named by <code>main_service</code>, or the first
+declared port when it is not set:</p>
+<pre><code class="language-toml">[serve]
+ports = [3000, 5173]
+main_service = 5173     # must be one of the declared ports
+</code></pre>
+<p>A <code>main_service</code> that is not a declared port is a config error. The task&#39;s Services card marks which service that is. The service link appears only where the install can open task services (it has a services host); otherwise the line carries the task link alone. With no ports
+declared, the line carries the task link only. The line is kept current as the
+host or main service changes, and is never added on a solo install, where a
+localhost address would mean nothing to a reviewer. The links are plain; Teams&#39;
+own sign-in still guards them.</p>
 <h2 id="when-nothing-is-listening"><a class="anchor" href="#when-nothing-is-listening" aria-hidden="true">#</a>When nothing is listening</h2>
 <p>Opening a task service in a browser when the dev server is not up does not
 give you the browser&#39;s own &quot;connection refused&quot; page. The daemon knows why it
@@ -143,7 +181,7 @@ the task, not for the coffee-shop network the laptop is on.</p>
 podman can add a mapping to a running container. So editing <code>[serve]</code> does not
 change a task that is already up. <code>lazy show</code> says so plainly:</p>
 <pre><code>  Serving:
-    web → http://web.my-task.lazy.localhost:26024
+    web → http://my-task.web.lazy.localhost:26024
     api → (not published — restart to pick up [serve])
 </code></pre>
 <p>To pick the change up on a task that is already up:</p>

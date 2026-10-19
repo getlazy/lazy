@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Store backups before every upgrade — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
+<main class="wrap">
+<h1 id="store-backups-before-every-upgrade"><a class="anchor" href="#store-backups-before-every-upgrade" aria-hidden="true">#</a>Store backups before every upgrade</h1>
+<p>Your lazy store holds every task, session, turn, comment, conversation and
+memory. A new lazy version reads it and may rewrite it into a newer shape. So
+before a new version first opens an existing store, lazy saves the store as a
+compressed archive and checks it. If the backup cannot be made, the new version
+does not open the store.</p>
+<h2 id="when-a-backup-is-taken"><a class="anchor" href="#when-a-backup-is-taken" aria-hidden="true">#</a>When a backup is taken</h2>
+<ul>
+<li><strong><code>lazy upgrade</code></strong> takes one after it stops the old daemon and before it
+starts the new one.</li>
+<li><strong>A daemon starting on a different lazy version</strong> than the project&#39;s last
+start takes one before it opens the store. This covers upgrades made any other
+way, such as installing a new binary and running any <code>lazy</code> command.</li>
+<li><strong>Lazy Teams</strong> takes one on the host for every project, after the project&#39;s
+daemon stops and before the new lazy goes in. See
+<a href="../self-hosting-lazy-teams/#automatic-store-backup-before-every-roll">Self-hosting Lazy Teams</a>.</li>
+</ul>
+<p>An ordinary restart on the same version takes no backup. A fresh project with
+no store yet doesn&#39;t either. If a backup for the same upgrade already exists
+and the store has not changed since it was taken, lazy uses it instead of
+copying again.</p>
+<h2 id="where-and-how-many"><a class="anchor" href="#where-and-how-many" aria-hidden="true">#</a>Where, and how many</h2>
+<p>Backups go in a folder <strong>next to</strong> the store, never inside it:</p>
+<pre><code>&lt;store&gt;.backups/&lt;UTC time&gt;-&lt;from version&gt;-to-&lt;to version&gt;/
+    manifest.json   every file&#39;s path, size and sha256
+    store.tar.gz    the store, as one compressed archive
+</code></pre>
+<p>The store is the <code>[storage] external_path</code> in <code>lazy.toml</code>, or
+<code>~/.lazy/&lt;project-name&gt;</code> when that is empty. lazy keeps the newest five verified
+backups. Set <code>[storage] backup_keep</code> to keep a different number.</p>
+<p>Each backup is one gzip-compressed tar archive of the whole store. The store is
+mostly text, so a backup usually takes a small fraction of the store&#39;s size.
+lazy holds the store&#39;s lock while it writes the archive, so nothing writes to
+the store meanwhile. Then it reads the finished archive back from disk and
+compares it with the original: the number of files, the total size, and each
+file&#39;s sha256. A backup that passes gets its final name. One that fails is
+renamed <code>….failed</code>, with an <code>error.txt</code> saying why. Failed backups are kept
+for you to look at and never count towards the five.</p>
+<p>Before it starts, lazy checks there is room for the backup: about half the
+store&#39;s size plus 64 MiB free next to it. If the archive still runs out of
+room, the backup fails cleanly and leaves only its error record.</p>
+<p>Backups taken by earlier lazy versions are a plain copy (a <code>store/</code> folder
+instead of <code>store.tar.gz</code>). They are listed and restored exactly as before, and
+are never converted or deleted except by the usual keep-the-newest-five rule.</p>
+<p>A restore never creates a symlink that points outside the store. If the store
+had one, the restore leaves just that link out and names it.</p>
+<p><code>lazy doctor</code> shows the last backup: when it was taken, the store&#39;s size and the
+compressed size, and where it is.
+<code>lazy system store-backups</code> lists all of them.</p>
+<h2 id="when-a-backup-fails"><a class="anchor" href="#when-a-backup-fails" aria-hidden="true">#</a>When a backup fails</h2>
+<p>The upgrade stops and the store stays as it was:</p>
+<ul>
+<li><code>lazy upgrade</code> stops. The old daemon has already been stopped, and the new one
+is not started.</li>
+<li>A daemon on a new version refuses to start.</li>
+</ul>
+<p>Both say why and where the backups were going. The usual cause is a full disk,
+or a folder lazy can&#39;t write to next to the store. Fix it and try again. To go
+on <strong>without</strong> a backup, deliberately, run <code>lazy upgrade --skip-store-backup</code>,
+or start the daemon once with <code>LAZY_SKIP_STORE_BACKUP=1 lazy daemon start</code>.</p>
+<h2 id="taking-one-by-hand"><a class="anchor" href="#taking-one-by-hand" aria-hidden="true">#</a>Taking one by hand</h2>
+<pre><code class="language-bash">lazy daemon stop
+lazy system store-backup
+lazy daemon start
+</code></pre>
+<p>The copy needs the store&#39;s lock, so stop the daemon first.</p>
+<h2 id="restoring-a-backup"><a class="anchor" href="#restoring-a-backup" aria-hidden="true">#</a>Restoring a backup</h2>
+<ol>
+<li><p>Stop the daemon: <code>lazy daemon stop</code>.</p>
+</li>
+<li><p>Reinstall the lazy version the backup was taken <strong>from</strong> (the first version
+in its name). If you start a newer lazy on the restored store, it upgrades
+the store again.</p>
+</li>
+<li><p>Restore the backup:</p>
+<pre><code class="language-bash">lazy system store-backups                 # find the backup&#39;s name
+lazy system store-restore &lt;backup-name&gt;
+</code></pre>
+<p>lazy checks the backup again, copies it next to the store, and swaps it in.
+The store it replaces is <strong>moved</strong> to <code>&lt;store&gt;.before-restore-&lt;time&gt;</code>, never
+deleted. Delete that folder yourself once you are sure.</p>
+<p>The backup is unpacked next to the store before it is swapped in, so the
+restore needs free space for the full, uncompressed store there; it refuses
+up front, changing nothing, when there is not enough. If unpacking fails,
+the unpacked copy is removed again.</p>
+<p>The restore holds the store&#39;s lock from start to finish. If a <code>lazy</code>
+command tries to start the daemon while it runs, the daemon refuses. If the
+restore is interrupted while it swaps the backup in, the daemon keeps
+refusing and says where both halves are. Run the same restore again to
+finish it. If it is interrupted before the swap starts, the store was
+not touched: the daemon says so, and you either run the same restore again
+or remove the restore marker it names to keep the store as it is.</p>
+</li>
+<li><p>Start the daemon: <code>lazy daemon start</code>.</p>
+</li>
+</ol>
+<p>For a Lazy Teams project, add <code>--store &lt;path&gt;</code> with the project&#39;s store path on
+the host (shown as &quot;Store (external_path)&quot; on the project&#39;s page in god mode).
+Run the restore only while the project is stopped. If the project&#39;s daemon is
+still holding the store, the restore refuses and asks you to stop the project
+first; while the restore runs, the project&#39;s daemon refuses to start.</p>
+<p>If an earlier restore was interrupted and you run it again, lazy keeps track of
+where the interrupted one moved your original store, and names that folder when
+it finishes. The store as it was before any restore is the first folder named.</p>
+<p>While an interrupted restore is unfinished, no new backup is taken of the
+half-restored store: finish the restore first. From inside a container, a lock
+or restore held by a process in a neighbouring container is refused rather than
+treated as stale, because that container&#39;s processes cannot be seen from here;
+run the command where the lock was taken. (After a container is recreated, a
+leftover lock from its earlier life is refused the same way from inside another
+container; remove the lock file once the project is stopped.) On the host, a lock
+left by a process that is gone from a container that is still running is
+reclaimed automatically. A lock or restore taken on a Mac and seen from a Linux
+container sharing its store, or the reverse, is refused rather than treated as
+stale; once the other side is stopped, remove the lock file — the error prints
+the exact command.</p>
+<p>The restore moves the store&#39;s contents to folders next to it, so it refuses a
+store that is a mount point of its own. In that case, stop the daemon and unpack
+the backup into the store by hand (<code>tar -xzf &lt;backup&gt;/store.tar.gz -C &lt;store&gt;</code>),
+or, for an older backup, copy its <code>store/</code> folder in.</p>
+<h3 id="a-restore-refuses-a-link-in-the-backup"><a class="anchor" href="#a-restore-refuses-a-link-in-the-backup" aria-hidden="true">#</a>A restore refuses a link in the backup</h3>
+<p>A restore refuses a backup containing a symbolic link that could reach outside
+the store: one with an absolute target, one whose target leads out of the
+store, or one placed under or pointing through another link. The backup is
+still a plain archive. List it first with <code>tar -tzvf &lt;backup&gt;/store.tar.gz</code>,
+then extract it by hand into an empty directory with
+<code>tar -xzf &lt;backup&gt;/store.tar.gz -C &lt;empty-directory&gt;</code>, and copy what you need
+without following the links the restore refused.</p>
+
+</main>
+</body>
+</html>

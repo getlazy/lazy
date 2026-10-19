@@ -35,15 +35,16 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="self-hosting-lazy-teams"><a class="anchor" href="#self-hosting-lazy-teams" aria-hidden="true">#</a>Self-hosting Lazy Teams</h1>
+<p>Lazy Teams is in private alpha and is not yet generally released.</p>
 <p>Lazy Teams is a web application your team runs on a server you control. This guide takes you from a fresh Linux machine to a running install where every project, and every agent turn it runs, gets its own microVM.</p>
 <h2 id="what-you-need"><a class="anchor" href="#what-you-need" aria-hidden="true">#</a>What you need</h2>
 <ul>
 <li>A Linux server with <strong>Docker Engine</strong> and <strong>Docker Compose v2</strong> (v2.24 or later) installed</li>
 <li><strong>Hardware virtualization (KVM)</strong>: a <code>/dev/kvm</code> device on the server. Bare-metal servers have it; many cloud VMs do not, because they do not offer nested virtualization. Without it the install still runs everything except agent turns — see <a href="#task-turns">Task turns</a></li>
-<li>At least <strong>4 GB RAM</strong> and <strong>20 GB disk</strong> (more if many projects or large repositories)</li>
+<li>At least <strong>8 GB RAM</strong> and <strong>20 GB disk</strong> — each project&#39;s microVM defaults to 8 GiB (lower it with <code>LAZY_SMOLVM_MEMORY_MIB</code>), and more if you run several projects or large repositories</li>
 <li>For automatic HTTPS: a <strong>public DNS name</strong> pointing at the server, with ports <strong>80</strong> and <strong>443</strong> open</li>
 </ul>
 <p>You do <strong>not</strong> need Ruby, Bun, lazy, or a git checkout on the host — pull the published image and go.</p>
@@ -93,6 +94,145 @@ docker compose up -d
 <li>Leave <code>FORCE_SSL</code> at its default of <code>true</code></li>
 </ol>
 <p>Step 4 works whether or not your proxy sends an <code>X-Forwarded-Proto</code> header. Some terminators — Tailscale serve and Cloudflare Tunnel among them — do not, and an app that judged the scheme from that header alone would redirect such a request to HTTPS forever. This install treats traffic arriving on the direct port as already-encrypted, which is true when the only thing that can reach that port is your own proxy.</p>
+<h2 id="signing-in-through-your-proxys-login"><a class="anchor" href="#signing-in-through-your-proxys-login" aria-hidden="true">#</a>Signing in through your proxy&#39;s login</h2>
+<p>If your reverse proxy already signs people in — an ngrok Traffic Policy with Google OAuth, oauth2-proxy, Cloudflare Access — Lazy Teams can trust that identity instead of showing its own login screen. It is off unless you set <strong>both</strong> of these:</p>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>TRUSTED_IDENTITY_HEADER</code></td>
+<td>The request header your proxy puts the signed-in person&#39;s email in, e.g. <code>X-Lazy-Auth-Email</code></td>
+</tr>
+<tr>
+<td><code>TRUSTED_PROXY_SECRET</code></td>
+<td>A long random secret your proxy also sends, in the <code>X-Lazy-Proxy-Secret</code> header (<code>openssl rand -hex 32</code>)</td>
+</tr>
+</tbody></table>
+<p>How it behaves:</p>
+<ul>
+<li>A browser request with no Lazy Teams session, carrying the identity header <strong>and</strong> the matching secret, is signed in as the existing user with that email (matched case-insensitively). Lazy Teams never creates accounts this way — invite people first; someone new opening their invitation behind the proxy creates their account with the address the proxy names.</li>
+<li>An email with no account gets a page saying so. A request that carries the identity header with a wrong or missing secret signs nobody in and is refused, rather than shown the password form.</li>
+<li>Without the identity header, the ordinary password sign-in still works — for example over an SSH tunnel to the direct port.</li>
+<li>The account menu has no <strong>Sign out</strong> while you are signed in through the proxy, because the next request would sign you straight back in. Sign out at your proxy instead — for ngrok, see the logout section of its <a href="https://ngrok.com/docs/traffic-policy/actions/oauth" rel="noopener noreferrer">OAuth action documentation</a>. If someone else then signs in at the proxy in the same browser, their identity replaces the previous Lazy Teams session.</li>
+<li>The command line, hosted git, and the health check keep their own authentication; these headers have no effect on them.</li>
+</ul>
+<p><strong>Why a secret and not &quot;only from localhost&quot;:</strong> traffic from a project&#39;s machine or any process on the server can arrive from a local address, so the source address proves nothing. The secret is what proves a request came through your proxy. Your proxy must also <strong>remove both headers from incoming requests before adding its own</strong>, so a visitor cannot send their own.</p>
+<p>A browser-only example (no command-line access through the proxy) for ngrok:</p>
+<pre><code class="language-yaml">on_http_request:
+  # Drop whatever the client sent, then add the proxy&#39;s own values below.
+  - actions:
+      - type: remove-headers
+        config:
+          headers: [X-Lazy-Auth-Email, X-Lazy-Proxy-Secret]
+  - actions:
+      - type: oauth
+        config:
+          provider: google
+  - expressions:
+      - &quot;!(actions.ngrok.oauth.identity.email in [&#39;you@example.com&#39;])&quot;
+    actions:
+      - type: deny
+        config:
+          status_code: 403
+  - actions:
+      - type: add-headers
+        config:
+          headers:
+            X-Lazy-Auth-Email: &quot;${actions.ngrok.oauth.identity.email}&quot;
+            X-Lazy-Proxy-Secret: &quot;the value of TRUSTED_PROXY_SECRET&quot;
+</code></pre>
+<p>Then set <code>TRUSTED_IDENTITY_HEADER=X-Lazy-Auth-Email</code> and <code>TRUSTED_PROXY_SECRET=…</code> in <code>.env</code> and restart Lazy Teams. The command line (<code>lazy login</code>) cannot get through this policy; for that, use the ready-made policy under <a href="#behind-an-authenticating-proxy">Behind an authenticating proxy</a>.</p>
+<h2 id="behind-an-authenticating-proxy"><a class="anchor" href="#behind-an-authenticating-proxy" aria-hidden="true">#</a>Behind an authenticating proxy</h2>
+<p>If your install is reachable on a public address, put an authenticating proxy in front of it and let <strong>nothing</strong> reach Lazy Teams that the proxy has not verified. Lazy Teams still checks every request itself; the proxy is an extra outer layer, never a replacement. This section is for ngrok, which is the setup Lazy Teams generates a policy for.</p>
+<p>There are two kinds of caller, and the proxy verifies each one differently:</p>
+<table>
+<thead>
+<tr>
+<th>Caller</th>
+<th>What the proxy verifies</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>A browser</td>
+<td>Google sign-in and your email allowlist (the proxy&#39;s OAuth action). Lazy Teams then signs the person in from the proxy&#39;s identity, as described above.</td>
+</tr>
+<tr>
+<td><code>lazy</code> on a laptop (login, bound clones, <code>lazy builder</code>)</td>
+<td>A token Lazy Teams signed and the proxy checks itself (ngrok&#39;s JWT validation) before forwarding the request</td>
+</tr>
+</tbody></table>
+<p>Nothing is exempted from the proxy. Two small documents the command line needs <em>before</em> it has a token — Lazy Teams&#39; public signing key and a one-line description of which login to use — are answered by the policy itself and never reach Lazy Teams.</p>
+<h3 id="set-it-up"><a class="anchor" href="#set-it-up" aria-hidden="true">#</a>Set it up</h3>
+<p>The three <code>bin/rails</code> commands below run in the app&#39;s own environment (for a Compose install, <code>docker compose exec app bin/rails …</code>; for a native install, from the checkout&#39;s <code>lazy-teams/</code> directory). Rake does not read <code>.env</code>, so export the same <code>CLI_JWT_PRIVATE_KEY_FILE</code>, <code>APP_HOST</code>, <code>TRUSTED_IDENTITY_HEADER</code> there when you run them.</p>
+<ol>
+<li><p>Generate a signing key and give it to Lazy Teams. Setting it is what tells the install it is behind a proxy:</p>
+<pre><code class="language-bash">bin/rails teams:cli_jwt_key &gt; cli-jwt.pem &amp;&amp; chmod 600 cli-jwt.pem
+</code></pre>
+<p>Put <code>CLI_JWT_PRIVATE_KEY_FILE=/path/to/cli-jwt.pem</code> in <code>.env</code> (the file must be readable by the app; on a native install a relative path such as <code>cli-jwt.pem</code> is read from the directory of the env file, e.g. next to <code>deploy.env</code>), set <code>APP_HOST</code> to your public name, and restart. The public half is not secret; the private key never leaves the install.</p>
+</li>
+<li><p>Publish the public signing key from a <strong>separate</strong> ngrok endpoint. ngrok&#39;s JWT validation can only read keys from a URL, and it reads that URL while your install&#39;s endpoint is still starting — so the key cannot be served by the endpoint it protects. Create an always-on <a href="https://ngrok.com/docs/universal-gateway/cloud-endpoints/" rel="noopener noreferrer">Cloud Endpoint</a> on another hostname (for example <code>https://keys-teams.example.com</code>). The hostname must be a domain in your ngrok account: an ngrok-managed one (like <code>keys-yourname.ngrok.app</code>), or a subdomain of your own domain, added under <strong>Domains</strong> in the ngrok dashboard with the CNAME record it shows you. Print the endpoint&#39;s policy:</p>
+<pre><code class="language-bash">bin/rails teams:proxy_jwks_policy &gt; jwks-policy.yml
+</code></pre>
+<p>Then create the endpoint with that policy, either in the dashboard (<strong>Endpoints → New → Cloud Endpoint</strong>, then paste <code>jwks-policy.yml</code> as its Traffic Policy) or with the ngrok agent CLI and an ngrok API key:</p>
+<pre><code class="language-bash">ngrok api endpoints create --api-key &quot;$NGROK_API_KEY&quot; \
+  --type cloud --bindings public \
+  --url https://keys-teams.example.com \
+  --traffic-policy-file jwks-policy.yml
+</code></pre>
+<p>It answers <code>/.well-known/lazy-cli-jwks.json</code> with the public key set and <code>404</code> for everything else. It needs no agent and holds nothing secret. Whoever controls this endpoint decides which tokens ngrok accepts, so keep it in the same ngrok account as your install.</p>
+</li>
+<li><p>Print the Traffic Policy for your install, with your allowed emails and the key URL from step 2:</p>
+<pre><code class="language-bash">EMAILS=you@example.com,teammate@example.com \
+JWKS_URL=https://keys-teams.example.com/.well-known/lazy-cli-jwks.json \
+  bin/rails teams:proxy_policy &gt; policy.yml
+</code></pre>
+<p><code>JWKS_URL</code> must be <code>https://</code> and must not be on your install&#39;s own hostname; the command refuses otherwise. Replace <code>the value of TRUSTED_PROXY_SECRET</code> in it with your secret (see above) and apply it to your ngrok endpoint. The policy:</p>
+<ul>
+<li>removes the identity headers from every incoming request, so a client cannot send its own;</li>
+<li>answers <code>/.well-known/lazy-cli-jwks.json</code> (the signing key) and <code>/.well-known/lazy-teams</code> itself;</li>
+<li>requires every <code>/api/</code> and <code>/git/</code> request that carries a <code>Bearer</code> token to pass ngrok&#39;s JWT validation (issuer, audience, <code>RS256</code>, expiry, signature against the key read from <code>JWKS_URL</code>);</li>
+<li>sends <strong>everything else</strong> through Google sign-in and the allowlist, then adds the identity headers.</li>
+</ul>
+<p>A request with a <code>Bearer</code> token that fails validation is refused by ngrok and never reaches Lazy Teams.</p>
+<p><a id="removing-someone"></a><strong>Removing someone.</strong> Taking a person off the allowlist stops their browser, but not a command-line token they already hold: ngrok checks that token&#39;s signature, issuer, audience and expiry (up to 90 days), not who it belongs to. Lazy Teams itself refuses a revoked token at once. So to remove someone, take them off the allowlist <strong>and</strong> remove their team and project memberships in Lazy Teams: Lazy Teams checks membership on every request, so their tokens then reach no project. Tokens a person revokes at Settings → API tokens stop working at once.</p>
+</li>
+<li><p>Log in from your machine:</p>
+<pre><code class="language-bash">lazy login https://teams.example.com
+</code></pre>
+<p>Lazy opens your browser. You pass the proxy&#39;s Google sign-in, see which machine is asking, and approve it. The browser then posts a token to a short-lived listener on <code>127.0.0.1</code> in your terminal (in a form body, never in a URL), and <code>lazy</code> keeps it. The token is never printed. Pass <code>--device</code> to use the code-and-URL flow on a machine with no browser — it only works on installs without a proxy.</p>
+</li>
+</ol>
+<h3 id="what-the-token-is-and-what-happens-when-it-ends"><a class="anchor" href="#what-the-token-is-and-what-happens-when-it-ends" aria-hidden="true">#</a>What the token is, and what happens when it ends</h3>
+<p>The token is a signed JWT that wraps an ordinary Lazy Teams API token. It expires after 90 days (run <code>lazy login</code> again). Revoke it at <strong>Account settings → Git &amp; CLI tokens</strong>: Lazy Teams refuses it at once, even though the proxy keeps accepting its signature until it expires. Rotating the signing key invalidates every token at the proxy; run <code>lazy login</code> again on each machine.</p>
+<h3 id="git-to-hosted-repositories"><a class="anchor" href="#git-to-hosted-repositories" aria-hidden="true">#</a>Git to hosted repositories</h3>
+<p>A login behind a proxy also covers <code>git</code> to this install, machine-wide: after one <code>lazy login https://teams.example.com</code> — run anywhere, no clone needed — a plain <code>git clone https://teams.example.com/git/&lt;team&gt;/&lt;project&gt;.git</code> works, and so does <code>lazy clone https://teams.example.com/git/&lt;team&gt;/&lt;project&gt;.git</code>, which also binds the new clone to its project. <code>lazy login</code> adds one <code>include.path</code> entry to your user-level git config pointing at a small file in your lazy data directory (permissions <code>0600</code>) that sends the token as an <code>Authorization: Bearer</code> header to this install&#39;s exact address only, and never follows a redirect. The token is never written into your <code>.gitconfig</code> or any repository&#39;s <code>.git/config</code>, only the path to that file; <code>lazy logout https://teams.example.com</code> removes both. The proxy&#39;s token check then covers <code>/git/</code> too. Tokens from <code>lazy login</code> include git access; pasted Git &amp; CLI tokens (HTTP Basic) cannot pass the proxy. See <a href="../teams-login/#cloning-a-hosted-project">Logging a machine in</a>.</p>
+<h3 id="rotating-the-signing-key"><a class="anchor" href="#rotating-the-signing-key" aria-hidden="true">#</a>Rotating the signing key</h3>
+<p>There is no in-place rotation yet. To replace the key: generate a new one, set it, restart Lazy Teams, print and apply BOTH fresh policies (the key endpoint&#39;s from <code>teams:proxy_jwks_policy</code>, and your install&#39;s; both embed the new public key), wait about 15 minutes — ngrok caches the key set and re-reads it roughly that often, so until then it may refuse tokens signed with the new key — then run <code>lazy login</code> again on every machine (retry if it is refused) — tokens signed by the old key stop working at the proxy and at Lazy Teams.</p>
+<h3 id="limits"><a class="anchor" href="#limits" aria-hidden="true">#</a>Limits</h3>
+<ul>
+<li><code>/up</code> and <code>/version</code> also sit behind the sign-in, so an uptime monitor outside the proxy cannot call them.</li>
+</ul>
+<h3 id="check-it-from-your-machine"><a class="anchor" href="#check-it-from-your-machine" aria-hidden="true">#</a>Check it from your machine</h3>
+<p>Replace <code>teams.example.com</code> with your install&#39;s hostname and <code>keys-teams.example.com</code> with your key endpoint&#39;s. These need no Lazy Teams login.</p>
+<pre><code class="language-bash"># The policy answers these itself — JSON
+curl -si https://teams.example.com/.well-known/lazy-teams
+curl -si https://teams.example.com/.well-known/lazy-cli-jwks.json
+# The key endpoint ngrok verifies tokens against — must be identical to the line above
+curl -si https://keys-teams.example.com/.well-known/lazy-cli-jwks.json
+
+# Nothing else gets through without a verified token: a sign-in redirect/page, never Lazy Teams
+curl -si https://teams.example.com/api/cli/projects | head -5
+curl -si -H &#39;Authorization: Bearer not-a-real-token&#39; https://teams.example.com/api/cli/projects | head -5
+curl -si -X POST https://teams.example.com/api/cli/device/code | head -5
+curl -si https://teams.example.com/git/acme/app.git/info/refs | head -5
+</code></pre>
+<p>The last four must <strong>not</strong> return Lazy Teams&#39; own JSON (<code>{&quot;error&quot;: &quot;A CLI-scoped API token is required…</code>). After <code>lazy login</code>, <code>git ls-remote</code> against a hosted repository&#39;s URL should work from any directory, and <code>lazy list</code> should work in a bound clone.</p>
+<h3 id="other-proxies"><a class="anchor" href="#other-proxies" aria-hidden="true">#</a>Other proxies</h3>
+<p>The same shape works with any proxy that can (a) sign browsers in, (b) verify an <code>RS256</code> JWT in the <code>Authorization</code> header against a published key set, and (c) answer two static paths itself. Configure it to accept issuer <code>https://&lt;your APP_HOST&gt;</code>, audience <code>lazy-teams-cli</code>, and the key set printed by <code>bin/rails runner &#39;puts CliJwt.jwks.to_json&#39;</code>. Lazy Teams only generates a ready policy for ngrok.</p>
 <h2 id="serving-over-plain-http"><a class="anchor" href="#serving-over-plain-http" aria-hidden="true">#</a>Serving over plain HTTP</h2>
 <p>An install on a trusted internal network with no TLS anywhere needs <code>FORCE_SSL=false</code> in <code>.env</code>. Without it, cookies are marked <code>secure</code> and browsers will not send them back over plain HTTP, so sign-in appears to silently fail.</p>
 <p>This also switches emailed links to <code>http://</code>. It is the right setting for a loopback quick start and for a lab network; it is the wrong setting for anything reachable from the internet, where it puts the administrator&#39;s session cookie on the wire in the clear.</p>
@@ -107,7 +247,7 @@ docker compose up -d
 <p>Repeated failed sign-ins from one address are refused for a few minutes, and so are repeated password-reset requests. The same applies to the git endpoints when you host repositories on the install — but there the count is of <strong>failed</strong> authentications, not requests, so ordinary <code>git clone</code>, <code>fetch</code> and <code>push</code> traffic is never throttled no matter how much of it there is. Git failures are counted per token, so one broken token does not block any other token — not even another of the same member&#39;s; a pause is shown on that member&#39;s project page and on the administrator&#39;s project diagnostics page.</p>
 <p>Nothing is configurable here, and nothing needs to be turned on.</p>
 <h2 id="outgoing-email-optional"><a class="anchor" href="#outgoing-email-optional" aria-hidden="true">#</a>Outgoing email (optional)</h2>
-<p>The install <strong>boots without SMTP</strong>. Password resets and invitations are created, but nothing is sent until you configure mail.</p>
+<p>The install <strong>boots without SMTP</strong>. Invitations still work — the inviting admin is shown the link to hand over — but no email is sent, and password resets are unavailable, until you configure mail.</p>
 <p>Add to <code>.env</code> (see <code>.env.example</code> for the full list):</p>
 <pre><code>SMTP_ADDRESS=smtp.example.com
 SMTP_PORT=587
@@ -126,6 +266,7 @@ MAILER_FROM=no-reply@example.com
 </ul>
 <h2 id="if-a-repository-cannot-be-cloned"><a class="anchor" href="#if-a-repository-cannot-be-cloned" aria-hidden="true">#</a>If a repository cannot be cloned</h2>
 <p>When a project&#39;s repository cannot be cloned, its page says so: the project shows as <strong>failed</strong>, with the cause in plain words and the next step.</p>
+<p>A large repository is not failed for going quiet. The clone keeps going even when no output arrives, and the project page shows progress when available (for example &quot;Receiving objects: 40%&quot;). The overall limit is one hour. <strong>Retry setup</strong> removes an unfinished clone and starts again.</p>
 <ul>
 <li><strong>&quot;This repository needs a GitHub (or GitLab) connection with access to it&quot;</strong> — the repository is private, or the connected token cannot read it. Follow <strong>Connect GitHub →</strong>, connect an account whose token can read the repository, and press <strong>Retry setup</strong> — the Forge connections page offers it too.</li>
 <li><strong>&quot;The repository URL could not be reached&quot;</strong> — the URL is wrong or points at nothing. A team admin corrects it on the project&#39;s <strong>Settings → General</strong> page and presses <strong>Retry setup</strong> there.</li>
@@ -150,6 +291,75 @@ MAILER_FROM=no-reply@example.com
 </tr>
 </tbody></table>
 <p>Project task history lives in the fleet volume; team membership lives in the storage volume.</p>
+<h3 id="automatic-backup-before-every-upgrade"><a class="anchor" href="#automatic-backup-before-every-upgrade" aria-hidden="true">#</a>Automatic backup before every upgrade</h3>
+<p>Whenever a new version needs to change the application database, Lazy Teams
+copies the database first and only then changes it. A restart with nothing to
+change takes no copy, and neither does a fresh install.</p>
+<ul>
+<li><strong>Where:</strong> a <code>backups/</code> folder next to the database — inside the
+<code>lazy_teams_storage</code> volume (<code>/lazy/lazy-teams/storage/backups</code> in the
+container), or <code>&lt;LAZY_TEAMS_STORAGE_DIR&gt;/backups</code> on a native install. Set
+<code>LAZY_TEAMS_BACKUP_DIR</code> to an absolute path to put them somewhere else.</li>
+<li><strong>Names:</strong> <code>&lt;UTC time&gt;-&lt;from&gt;-to-&lt;to&gt;.sqlite3</code>, for example
+<code>20261010T120000Z-20260929020000-to-20261010010000.sqlite3</code>. The two numbers
+are the database&#39;s schema versions before and after the upgrade; a backup can
+be used with the version of Lazy Teams that ran before that upgrade.</li>
+<li><strong>How many:</strong> the newest five. Older ones are deleted when a new one is taken.</li>
+<li><strong>No backup, no upgrade:</strong> if the copy cannot be made (the folder is not
+writable, the disk is full), the upgrade stops before changing anything and
+the log says why. Fix the cause and start Lazy Teams again.</li>
+</ul>
+<p>The copy is made with SQLite&#39;s own online backup, so it is complete and
+consistent. The <strong>Installation</strong> page in god mode shows the last one: when it
+was taken, its size and its path.</p>
+<p>This covers the application database only. It is not a backup of the install:
+the project data and the encryption key in the table above still need your own
+backups.</p>
+<h4 id="restoring-a-backup"><a class="anchor" href="#restoring-a-backup" aria-hidden="true">#</a>Restoring a backup</h4>
+<ol>
+<li><p>Stop Lazy Teams (<code>docker compose down</code>, or stop <code>bin/native-start</code>).</p>
+</li>
+<li><p>Go back to the version of Lazy Teams you upgraded from. For the container
+install, set <code>LAZY_TEAMS_TAG</code> in <code>deploy/.env</code> to that version; natively,
+check out that version. A database restored under the newer version would
+simply be upgraded again.</p>
+</li>
+<li><p>Put the backup in place of the database, removing the files SQLite keeps
+beside it. For the container install (run from <code>lazy-teams/deploy</code>):</p>
+<pre><code class="language-bash">docker compose run --rm --no-deps --user rails --entrypoint sh app -c &#39;
+  cd /lazy/lazy-teams/storage &amp;&amp;
+  cp production.sqlite3 production.sqlite3.before-restore &amp;&amp;
+  rm -f production.sqlite3-wal production.sqlite3-shm &amp;&amp;
+  cp backups/&lt;backup file&gt; production.sqlite3&#39;
+</code></pre>
+<p>Natively, do the same in your <code>LAZY_TEAMS_STORAGE_DIR</code>.</p>
+</li>
+<li><p>Start Lazy Teams again.</p>
+</li>
+</ol>
+<h3 id="automatic-store-backup-before-every-roll"><a class="anchor" href="#automatic-store-backup-before-every-roll" aria-hidden="true">#</a>Automatic store backup before every roll</h3>
+<p>When Lazy Teams moves a project onto a new lazy version, it backs up that
+project&#39;s task store first, on the host. It stops the project&#39;s daemon, saves
+the store as one compressed archive, reads it back to check it, and only then
+puts the new lazy in.</p>
+<ul>
+<li><strong>Where:</strong> <code>&lt;store&gt;.backups/</code> next to the project&#39;s store in the fleet
+volume. By default that is <code>&lt;fleet&gt;/projects/&lt;project&gt;/store.backups/</code>. It
+is never inside the store, and never on the project&#39;s machine.</li>
+<li><strong>How many:</strong> the newest five verified backups per project. A failed copy is
+kept, labelled <code>.failed</code> with the reason, and doesn&#39;t count towards the five.</li>
+<li><strong>No backup, no roll:</strong> if the copy fails, the project&#39;s daemon starts again
+on the lazy it already had. The roll is recorded as failed, with the reason,
+on the project page. It is retried like any failed roll, and the sweep moves
+on to the other projects. On the local-docker backend there is only one lazy
+checkout to run, so the old daemon cannot be started again: the project is
+left stopped. Its daemon refuses to start on the new version until a store
+backup succeeds, so automatic restarts never run the new lazy on an unbacked
+store.</li>
+</ul>
+<p>A project&#39;s page in god mode (Admin → Projects) shows its last store backup:
+when it was taken, which upgrade, the store&#39;s size (and the compressed archive&#39;s size) and its path. To restore one, see
+<a href="../store-backups/#restoring-a-backup">Store backups</a>.</p>
 <h3 id="keeping-the-fleet-on-your-own-filesystem"><a class="anchor" href="#keeping-the-fleet-on-your-own-filesystem" aria-hidden="true">#</a>Keeping the fleet on your own filesystem</h3>
 <p>The fleet volume is a Docker named volume. On Docker Desktop that lives inside
 Docker&#39;s Linux VM: you cannot <code>ls</code> it, point a backup tool at it, or open a file
@@ -217,15 +427,14 @@ the container can only see paths that are mounted into it.</p>
 they had added the project themselves: the repository is cloned with <strong>their</strong>
 GitHub or GitLab connection, their Claude credential is the one the project
 starts with, and they are recorded as the project&#39;s registrant, so any later
-automatic restart clones as them too. A <strong>private repository needs it</strong>. The
+automatic restart clones as them too. <code>AS</code> is <strong>required</strong>: without a registrant, every later <strong>Retry setup</strong> clones with no forge credential too, and a private repository fails for good. The
 member must belong to <code>TEAM</code> and must have connected the repository&#39;s forge in
-their settings, or the adoption refuses before creating anything. Without
-<code>AS</code>, the clone runs with no member&#39;s forge credential, which a private
-repository refuses unless the team has a shared GitHub integration. If it fails,
-the message says so; a team admin who has connected the forge (or the member
-named in <code>AS</code>) can press <strong>Retry setup</strong> on the project&#39;s page, which clones with
+their settings, or the adoption refuses before creating anything — unless the repository is public: add <code>PUBLIC_REPOSITORY=1</code> and it is cloned with no credential (the same confirmation as &quot;It is public — register it&quot; on the new-project page). If the clone fails,
+the message says so; a team admin who has connected the forge (or, on a project adopted with <code>AS</code>, the member
+named in it) can press <strong>Retry setup</strong> on the project&#39;s page, which clones with
 their own connection. To re-run the adoption instead, delete the failed project
 first.</p>
+<p><code>CPUS</code>, <code>MEMORY_MIB</code> and <code>STORAGE_GIB</code> are optional and set the project&#39;s VM size, held to the same ranges as the project settings page. Give none and the project follows the installation default. Give some and the rest are filled from the installation default (then the fleet&#39;s own default size); the machine&#39;s first boot is at that size. <code>DRY_RUN=1</code> prints the size and where each value came from.</p>
 <p><code>DRY_RUN=1</code> runs every check and changes nothing. Drop it to do the adoption:</p>
 <pre><code>docker compose exec app bin/rails lazy:adopt_store \
   TEAM=your-team NAME=&quot;My Project&quot; \
@@ -290,6 +499,12 @@ check without anything to do.</p>
 the same turns, the same reviews. While it starts, the project page lists each
 step as it happens; if a start fails, it names the step that failed and what to
 do about it.</p>
+<p>Tasks come across exactly as they were, including the agent each one was set
+to. When the adoption finishes it lists every unfinished task whose agent this
+project cannot run — a profile the project&#39;s configuration does not define, or
+defines but cannot use here — with the reason. Each of those tasks also says so
+on its own page. Fix it on the project&#39;s <strong>Settings → Configuration</strong> page, or
+switch the task to another agent.</p>
 <h3 id="4-never-run-a-local-daemon-against-the-original-again"><a class="anchor" href="#4-never-run-a-local-daemon-against-the-original-again" aria-hidden="true">#</a>4. Never run a local daemon against the original again</h3>
 <p>Your original store is untouched, but from now on Lazy Teams owns the project&#39;s
 history. A local daemon that keeps writing the original would fork it, and
@@ -376,23 +591,76 @@ takes the old name gets a room under the next free channel name.</p>
 </ul>
 <h2 id="hosting-repositories-on-the-install"><a class="anchor" href="#hosting-repositories-on-the-install" aria-hidden="true">#</a>Hosting repositories on the install</h2>
 <p>When you add a project, choose <strong>Host on this install</strong> instead of pasting a GitHub or GitLab URL. The install keeps a bare repository for that project and serves <code>git clone</code>, <code>fetch</code>, and <code>push</code> over HTTPS (smart HTTP) at a URL under your <code>APP_HOST</code>.</p>
-<p>Git prompts for credentials over HTTP Basic. Use any username git accepts and an
-<strong>Git &amp; CLI token that includes git access</strong> as the password. Tokens are scoped: git
+<p>From your own machine, run <code>lazy login &lt;install&gt;</code> once: it sets git up for that
+install, so <code>git clone</code>, <code>fetch</code> and <code>push</code> need no password (see below). Where
+lazy is not installed — a script, another tool — git prompts for credentials over
+HTTP Basic: use any username git accepts and a <strong>Git &amp; CLI token that includes
+git access</strong> as the password. Tokens are scoped: git
 smart HTTP accepts only git-capable tokens, so a token minted for CLI or MCP
 access alone is refused even if it is otherwise valid.</p>
 <p>When you choose <strong>Host on this install</strong>, Lazy Teams provisions or reuses a
 git-scoped token for clone/push operations automatically. For manual
-<code>git clone</code>, <code>fetch</code>, or <code>push</code> from your own machine, create a token with git
+<code>git clone</code>, <code>fetch</code>, or <code>push</code> without <code>lazy login</code>, create a token with git
 access from <strong>Account settings → Git &amp; CLI tokens</strong> (from your avatar menu) in the web UI. Pick a label, enable
 <strong>Git</strong>, and copy the value when it is shown — it cannot be displayed again.
 Tokens created before scoping was introduced still include both git and CLI
 access until you rotate them.</p>
-<p>Every team member can clone and fetch; only team admins and owners can push.</p>
+<p>Every team member can clone and fetch. Who can push depends on the branch:</p>
+<ul>
+<li><strong>The default branch</strong> (<code>main</code> on a new hosted repository) — team admins
+and owners only, whatever the project&#39;s <code>[protection]</code> settings say. Members&#39;
+work reaches it through accept. A project admin can let members push it
+directly under the project&#39;s <strong>Settings → General → Default branch</strong> —
+unless the project names it in <code>protected_branches</code>, which still wins.</li>
+<li><strong>Task branches</strong> (<code>lazy/&lt;task&gt;</code>) — any team member, force-pushes included,
+unless the project names that branch in <code>protected_branches</code> in its
+<a href="../protected-branches/"><code>[protection]</code> settings</a>; then team admins and
+owners only.</li>
+<li><strong>Any other branch</strong> — any team member, unless the project protects it in
+its own <a href="../protected-branches/"><code>[protection]</code> settings</a>; a protected branch
+can be pushed only by team admins and owners. If the install cannot check
+the project&#39;s settings at that moment, members&#39; pushes to it are refused.</li>
+<li><strong>Tags, deleting a branch, and anything outside <code>refs/heads/</code></strong> — team
+admins and owners only.</li>
+</ul>
+<p>A push that touches several refs is all or nothing: if one ref is refused,
+nothing is pushed, and git lists each refused ref with the reason.</p>
+<p>While the install cannot check the project&#39;s protection settings (for
+example, the project is restarting), members can still push task branches
+(<code>lazy/&lt;task&gt;</code>), including task branches the project protects by name, so
+everyday work is not held up. Members&#39; pushes to every other branch are
+refused until the check works again. Team admins and owners are not affected.</p>
+<p>The project page shows the clone URL with the two commands that use it. One <code>lazy login &lt;install&gt;</code> per machine makes plain <code>git clone</code> work with no token to paste, behind a sign-in proxy or not — see <a href="../teams-login/#cloning-a-hosted-project">Logging a machine in</a>; <code>lazy clone &lt;clone-url&gt;</code> logs in if needed, clones, and binds the clone in one step.</p>
 <p>The URL shown on the project page is the public one under <code>APP_HOST</code>. Inside a project&#39;s microVM that address is usually unreachable (on a single machine it is <code>localhost</code>, which inside the VM is the VM itself), so the project&#39;s own copy of the repository uses the install&#39;s internal git address instead — see <a href="#smolvm-default-one-project-per-microvm"><code>smolvm</code></a>. You do not configure anything for this.</p>
-<p>To connect a machine&#39;s command line to the install instead, use
-<a href="../teams-login/"><code>lazy login</code></a> — it mints a CLI-scoped token for you through a
-browser approval, so nothing is pasted.</p>
+<p><a href="../teams-login/"><code>lazy login</code></a> mints that machine&#39;s token — with git and
+command-line access — through a browser approval, so nothing is pasted.</p>
 <p>This path is for teams that want Lazy Teams to be the only shared server — no external forge required. External remotes (GitHub, GitLab, and so on) still work the same way when you register a project with their URL instead.</p>
+<h3 id="recovering-commits-a-push-replaced"><a class="anchor" href="#recovering-commits-a-push-replaced" aria-hidden="true">#</a>Recovering commits a push replaced</h3>
+<p>Every hosted repository records each position each of its branches has had
+(git&#39;s reflog), for a year. So when a force-push replaces commits on any
+branch, task branches included, those commits are still on the install and
+can be restored. On the server, in the project&#39;s bare repository under the
+fleet volume (<code>repos/&lt;team&gt;/&lt;project&gt;.git</code>):</p>
+<pre><code class="language-bash"># Where the branch has been, newest first
+git --git-dir repos/&lt;team&gt;/&lt;project&gt;.git reflog show --date=iso refs/heads/&lt;branch&gt;
+
+# Put the branch back where it was (here: one update ago)
+git --git-dir repos/&lt;team&gt;/&lt;project&gt;.git update-ref refs/heads/&lt;branch&gt; &#39;refs/heads/&lt;branch&gt;@{1}&#39;
+</code></pre>
+<p>Or an admin whose own clone still has the old commit can push it back. Repositories created before this was in place start recording on their
+next push.</p>
+<h3 id="limits-on-git-requests"><a class="anchor" href="#limits-on-git-requests" aria-hidden="true">#</a>Limits on git requests</h3>
+<p>Git requests are bounded so that git cannot crowd out the rest of the install:</p>
+<ul>
+<li>At most <strong>2</strong> clones, fetches and pushes run at once
+(<code>LAZY_HOSTED_GIT_MAX_CONCURRENT</code>). Beyond that git gets <code>503</code> with a
+<code>Retry-After</code>, and the person can simply try again. Keep it below Puma&#39;s
+thread count (<code>RAILS_MAX_THREADS</code>, 3 by default) so pages always have a
+thread.</li>
+<li>One request may be at most <strong>2 GiB</strong> (<code>LAZY_HOSTED_GIT_MAX_REQUEST_BYTES</code>,
+in bytes); larger ones get <code>413</code>.</li>
+<li>Each git operation is stopped after 5 minutes.</li>
+</ul>
 <h2 id="task-turns"><a class="anchor" href="#task-turns" aria-hidden="true">#</a>Task turns</h2>
 <p><strong>With hardware virtualization, each project gets its own microVM,</strong> and its agent turns run inside it. What has been confirmed on real hardware so far: a project provisioned and ran an agent turn in a microVM on an Apple Silicon Mac, and the microVM runtime passed its hardware checks on a Linux server with KVM, both with Lazy Teams running directly on the machine. <strong>Running it from inside the published container, as the compose install does, has not yet been confirmed on real hardware</strong> — <a href="#confirming-it-on-your-server">Confirming it on your server</a> below is how to check yours before you rely on it.</p>
 <p>Each project gets its own microVM, and its agent turns run inside it. A project&#39;s repository is cloned inside its VM and never touches your server&#39;s filesystem. The server shares only that project&#39;s task store with it. The VM carries its own Docker engine, so a task&#39;s agent container runs next to the project process that launched it, and no Docker socket is shared with anything.</p>
@@ -421,7 +689,77 @@ browser approval, so nothing is pasted.</p>
 <p>On the <code>local</code> backend, every project&#39;s process runs <em>inside</em> the application container. An agent turn runs in its own container created by your host&#39;s Docker, and the project process that asks for it would be describing files and network addresses that exist only inside the application container. The project checkout, the task&#39;s working copy and the agent binary would all name paths the host does not have, and the agent would have no route back to the process that launched it. Rather than start a container that cannot work, the project refuses and says so.</p>
 <p>Giving the application your host&#39;s Docker would not change that — the problem is the paths, not permission — and the install does not ask for that access at all; see <a href="#your-docker-socket-stays-on-your-host">below</a>.</p>
 <h3 id="reaching-a-tasks-running-services"><a class="anchor" href="#reaching-a-tasks-running-services" aria-hidden="true">#</a>Reaching a task&#39;s running services</h3>
-<p>A task that declares services to run (a web server, say) is reached through its project&#39;s process, and in the compose install that process listens on the application container&#39;s own loopback interface. The addresses the project page shows for those services therefore do not answer from a browser on the server or elsewhere. Running agent turns does not depend on this.</p>
+<p>A task that declares services to run (see <a href="../serve-ports/">Reaching a task&#39;s dev server</a>) is opened from the <strong>Open</strong> link on its task page&#39;s Services card. Lazy Teams proxies the request to the task, so it works from any browser signed in to Teams as a member of the project — WebSockets included. Signing out, or leaving the team, ends access on the next request.</p>
+<p>Each service gets its own host name, one label under <code>SERVICES_HOST</code>:</p>
+<pre><code>https://&lt;task&gt;--&lt;service&gt;--p&lt;project&gt;.&lt;SERVICES_HOST&gt;
+</code></pre>
+<p>The link follows where you are browsing. On the Teams machine itself (<code>localhost</code>, <code>127.0.0.1</code>) it is <code>http://&lt;task&gt;--&lt;service&gt;--p&lt;project&gt;.localhost:&lt;port&gt;</code>, on the port you reached Teams on, which works with nothing configured — unless Teams is behind a sign-in proxy (<code>TRUSTED_IDENTITY_HEADER</code>), where every service request must come through that proxy, so the link is the <code>SERVICES_HOST</code> one there too. Anywhere else it is <code>https://</code> under <code>SERVICES_HOST</code> (<code>http://</code> for a <code>*.localhost</code> services name, or when the install sets <code>APP_PROTOCOL=http</code>).</p>
+<p>If a service is not answering yet, <strong>Open</strong> shows a page saying so: whether Run services is still bringing it up (and its current step), or the app is still starting by itself (including after a start command that launched it in the background and finished), and how long it has waited. It checks again every few seconds and opens the service as soon as its port answers. If nothing is starting it, it says so and offers Run services. On the Services card each such service reads <strong>starting — waiting for port N to answer</strong> with the time it has waited.</p>
+<ul>
+<li><strong>On a <code>localhost</code> install</strong> (<code>APP_HOST=localhost</code> or a name ending in <code>.localhost</code>) there is nothing to configure: browsers resolve every <code>*.localhost</code> name to your own machine.</li>
+<li><strong>Anywhere else</strong> set <code>SERVICES_HOST</code> to a name you control, point a <strong>wildcard</strong> DNS record (<code>*.teams-svc.example.net</code>) at the install, and give the front door a <strong>wildcard</strong> TLS certificate for it. One label per service is deliberate: a wildcard certificate covers exactly one label, so one certificate serves every task.</li>
+<li><strong>The bundled TLS profile (Caddy) serves only <code>APP_HOST</code>.</strong> For services, put your own reverse proxy in front with a wildcard certificate, which needs a DNS-01 challenge. Prefer a services domain outside Teams&#39; own (for example <code>teams-svc.example.net</code> rather than <code>svc.teams.example.com</code>), so an app running in a task cannot set cookies Teams can see.</li>
+<li><strong>Tailscale MagicDNS and free ngrok tunnels have no wildcard names</strong>, so behind them the Open link cannot work; the Services card then shows no address and says that <code>SERVICES_HOST</code> is needed. A paid ngrok plan supports wildcard domains (example below).</li>
+<li><strong>Behind a sign-in proxy</strong> (<code>TRUSTED_IDENTITY_HEADER</code> and <code>TRUSTED_PROXY_SECRET</code> set), every request to a service host must also carry your proxy&#39;s identity header and secret, naming the same person who opened the service. A request that did not come through the proxy is refused, even with a valid service cookie. Front the service hosts with the same login as Teams itself, as in the example below. Lazy Teams removes both headers before a request reaches the task&#39;s app, so the app never sees the secret.</li>
+</ul>
+<h4 id="example-task-services-behind-ngrok-with-google-oauth"><a class="anchor" href="#example-task-services-behind-ngrok-with-google-oauth" aria-hidden="true">#</a>Example: task services behind ngrok with Google OAuth</h4>
+<p>This extends <a href="#example-ngrok-with-google-oauth">the ngrok example above</a> to an install whose Teams answers at <code>teams.example.com</code>, with services under <code>svc.teams.example.com</code>. It uses a subdomain of Teams&#39; own name, against the advice above, because an ngrok custom domain usually lives under your one domain; the end of this example says what that costs. Lazy Teams keeps listening on <code>127.0.0.1</code> only. ngrok is the only way in to Teams and to every service, and nothing else needs to be exposed.</p>
+<ol>
+<li><p><strong>Reserve a wildcard domain.</strong> On a paid ngrok plan, add <code>*.svc.teams.example.com</code> under <strong>Domains</strong> in the ngrok dashboard (see <a href="https://ngrok.com/docs/gateway/domains" rel="noopener noreferrer">ngrok&#39;s domains documentation</a>). Create exactly the DNS records the dashboard lists for it: a <code>CNAME</code> for <code>*.svc.teams.example.com</code>, and the records ngrok needs to issue the wildcard certificate. ngrok obtains and renews that certificate itself, so there is nothing to install.</p>
+</li>
+<li><p><strong>Write a second Traffic Policy for the services</strong>, <code>services-policy.yml</code>. It is stricter than Teams&#39; own: <strong>every path</strong> goes through Google sign-in and the allowlist, with no exemptions, because on a service host every path belongs to the task&#39;s app.</p>
+<pre><code class="language-yaml">on_http_request:
+  - actions:
+      - type: oauth
+        config:
+          provider: google
+  - expressions:
+      - &quot;!(actions.ngrok.oauth.identity.email in [&#39;you@example.com&#39;])&quot;
+    actions:
+      - type: deny
+        config:
+          status_code: 403
+  # Drop whatever the client sent, then add the proxy&#39;s own values.
+  - actions:
+      - type: remove-headers
+        config:
+          headers: [X-Lazy-Auth-Email, X-Lazy-Proxy-Secret]
+  - actions:
+      - type: add-headers
+        config:
+          headers:
+            X-Lazy-Auth-Email: &quot;${actions.ngrok.oauth.identity.email}&quot;
+            X-Lazy-Proxy-Secret: &quot;the value of TRUSTED_PROXY_SECRET&quot;
+</code></pre>
+<p>Keep the allowlist identical to the one in Teams&#39; own policy. Anyone you add to Teams must be added to both. Do not set the OAuth action&#39;s cookie domain (<code>auth_cookie_domain</code>) to a parent domain in either policy: a service host&#39;s sign-in cookie reaches the task&#39;s app, and it must not be valid anywhere else.</p>
+</li>
+<li><p><strong>Start both endpoints</strong>, each forwarding to the same local Lazy Teams port:</p>
+<pre><code class="language-bash">ngrok http 127.0.0.1:3000 --url https://teams.example.com --traffic-policy-file teams-policy.yml
+ngrok http 127.0.0.1:3000 --url &#39;https://*.svc.teams.example.com&#39; --traffic-policy-file services-policy.yml
+</code></pre>
+<p>Do not rewrite the <code>Host</code> header (no <code>--host-header</code> option). Lazy Teams decides from the host name whether a request is for itself or for a task&#39;s service.</p>
+</li>
+<li><p><strong>Tell Lazy Teams the name.</strong> Add <code>SERVICES_HOST=svc.teams.example.com</code> to the install&#39;s settings next to <code>TRUSTED_IDENTITY_HEADER</code> and <code>TRUSTED_PROXY_SECRET</code>, then restart Lazy Teams.</p>
+</li>
+</ol>
+<p>Opening a service now takes the browser from the task page to its service host. The first visit to each service host passes through Google sign-in, because ngrok keeps a separate sign-in per host name. When you are already signed in to Google this is a quick redirect, and it does not interrupt opening the service. The service link is valid for one minute.</p>
+<p>Three checks guard each service request, in order:</p>
+<ul>
+<li><strong>ngrok&#39;s login and allowlist.</strong> A browser outside the list never reaches Lazy Teams or a service. The allowlist does not cover command-line tokens, though — see <a href="#removing-someone">Removing someone</a>.</li>
+<li><strong>Lazy Teams&#39; own check.</strong> Your Lazy Teams session must still be signed in and a member of the project.</li>
+<li><strong>The proxy&#39;s identity check.</strong> The person ngrok signed in must be the same person.</li>
+</ul>
+<p><code>teams.example.com</code> and <code>svc.teams.example.com</code> share a registrable domain, so an app running in a task is same-site with Teams, and its scripts can set cookies for <code>example.com</code> that Teams&#39; pages receive. Over HTTPS, Teams&#39; sign-in cookie is named <code>__Host-session_id</code>, a name browsers refuse to accept from any other host, and Teams ignores a request that carries its sign-in cookie twice. The setup checks show a warning for this arrangement. If you can, a services domain under a different registrable domain removes the question entirely.</p>
+<p>Until a services host name is available, the card shows each address as text and says what to configure. Running agent turns does not depend on any of this.</p>
+<h4 id="what-a-service-host-can-and-cannot-reach"><a class="anchor" href="#what-a-service-host-can-and-cannot-reach" aria-hidden="true">#</a>What a service host can and cannot reach</h4>
+<p>Every task&#39;s app runs code an agent wrote, so Lazy Teams keeps each service host to its own app:</p>
+<ul>
+<li><strong>Only its own pages, and links followed to it.</strong> A request another site&#39;s page makes — another project&#39;s or another task&#39;s service, or anything else on the web — is refused, unless it is a top-level navigation (following a link). Requests between two services of the <em>same</em> task are allowed, so a task&#39;s web service can call its own API service. WebSockets must come from the service&#39;s own pages.</li>
+<li><strong>Only WebSockets are relayed as open connections</strong>, and only once the task&#39;s app accepts the WebSocket.</li>
+<li><strong>Open connections end when access does.</strong> WebSockets and streamed responses are checked again every minute: signing out or leaving the team closes them. They also close after an hour (WebSockets after five minutes with no traffic); real WebSocket clients reconnect on their own.</li>
+<li><strong>Cookies stay on their own host.</strong> A <code>Domain</code> attribute on a cookie a service sets is removed, so it cannot reach sibling services.</li>
+<li><strong>Your sign-in proxy&#39;s credentials stay with the proxy.</strong> Before a request reaches the task&#39;s app, Lazy Teams removes these cookies (by name prefix, any case): <code>lazy_teams_service</code>, <code>ngrok</code>, <code>__ngrok</code>, <code>_oauth2_proxy</code>, <code>CF_Authorization</code>, <code>CF_AppSession</code>, <code>_pomerium</code>, <code>authelia_session</code>, <code>_forward_auth</code>, <code>tailscale</code>, <code>GCP_IAP_</code>, <code>AWSELBAuthSessionCookie</code>, <code>authentik_proxy</code>, <code>VouchCookie</code>; and these headers (by prefix): <code>Cf-Access-</code>, <code>Ngrok-</code>, <code>X-Auth-Request-</code>, <code>X-Forwarded-Email</code>, <code>X-Forwarded-User</code>, <code>X-Forwarded-Preferred-Username</code>, <code>X-Forwarded-Groups</code>, <code>X-Forwarded-Access-Token</code>, <code>X-Pomerium-</code>, <code>Remote-User</code>, <code>Remote-Email</code>, <code>Remote-Name</code>, <code>Remote-Groups</code>, <code>Tailscale-</code>, <code>X-Goog-IAP-JWT-Assertion</code>, <code>X-Goog-Authenticated-User-</code>, <code>X-Amzn-Oidc-</code>, <code>X-Authentik-</code>, <code>X-Vouch-</code>, plus the trusted identity and secret headers. A proxy that uses other names for its own cookie should be configured not to send it to the service hosts.</li>
+</ul>
 <h2 id="how-the-pieces-fit-together"><a class="anchor" href="#how-the-pieces-fit-together" aria-hidden="true">#</a>How the pieces fit together</h2>
 <p>The application container runs:</p>
 <ul>
@@ -565,6 +903,21 @@ workaround — it removes the boundary the rest of this page depends on.</p>
 <td>Extra hostnames the install answers to, comma-separated</td>
 </tr>
 <tr>
+<td><code>CLI_JWT_PRIVATE_KEY_FILE</code> (or <code>CLI_JWT_PRIVATE_KEY</code>), <code>CLI_JWT_ISSUER</code></td>
+<td>no</td>
+<td>Behind an authenticating proxy: the key Teams signs command-line tokens with, and the token issuer (defaults to <code>&lt;APP_PROTOCOL&gt;://&lt;APP_HOST&gt;</code>, without a port). <code>lazy login</code> refuses a token whose issuer is not exactly the address people type, port included, so set <code>CLI_JWT_ISSUER</code> when that differs; see &quot;Behind an authenticating proxy&quot;</td>
+</tr>
+<tr>
+<td><code>TRUSTED_IDENTITY_HEADER</code>, <code>TRUSTED_PROXY_SECRET</code></td>
+<td>no</td>
+<td>Sign people in from your reverse proxy&#39;s login; both must be set (see &quot;Signing in through your proxy&#39;s login&quot;)</td>
+</tr>
+<tr>
+<td><code>SERVICES_HOST</code></td>
+<td>no</td>
+<td>Host name task services open under (<code>&lt;task&gt;--&lt;service&gt;--p&lt;project&gt;.&lt;SERVICES_HOST&gt;</code>); needs a wildcard DNS name and certificate; not needed on a <code>localhost</code> install (see &quot;Reaching a task&#39;s running services&quot;)</td>
+</tr>
+<tr>
 <td><code>SMTP_*</code>, <code>MAILER_FROM</code></td>
 <td>no</td>
 <td>Outgoing email</td>
@@ -597,7 +950,7 @@ workaround — it removes the boundary the rest of this page depends on.</p>
 <tr>
 <td><code>LAZY_SMOLVM_CPUS</code>, <code>LAZY_SMOLVM_MEMORY_MIB</code>, <code>LAZY_SMOLVM_STORAGE_GIB</code></td>
 <td>no</td>
-<td>Per-project VM size (defaults: 2 CPUs, 4096 MiB, 32 GiB)</td>
+<td>Fallback size for a new microVM when god mode has not set one (defaults: 4 CPUs, 8192 MiB, 32 GiB). Install-wide, not per project</td>
 </tr>
 <tr>
 <td><code>LAZY_SMOLVM_CREATE_TIMEOUT</code></td>
@@ -624,7 +977,42 @@ workaround — it removes the boundary the rest of this page depends on.</p>
 <td>no</td>
 <td>Where the application&#39;s own database files go (default: <code>storage/</code> beside the application).</td>
 </tr>
+<tr>
+<td><code>LAZY_TEAMS_BACKUP_DIR</code></td>
+<td>no</td>
+<td>Where the automatic pre-upgrade database backups go (default: <code>backups/</code> next to the database); see &quot;Automatic backup before every upgrade&quot;</td>
+</tr>
 </tbody></table>
+<h2 id="changing-a-microvms-size"><a class="anchor" href="#changing-a-microvms-size" aria-hidden="true">#</a>Changing a microVM&#39;s size</h2>
+<p>A site admin, in god mode, sets how many CPUs, how much memory and how much disk one project&#39;s microVM gets. The project&#39;s page shows the size the machine was given and, when the machine is running and answers, how much memory it has in use.</p>
+<p>Saving a different size stops the machine and starts it again. The machine is not rebuilt, so the project&#39;s files stay. Disk can only be made larger. A turn that was running is interrupted and resumes.</p>
+<p>The Installation page in god mode sets the size for machines created from then on. A blank field there keeps the built-in size (4 CPUs, 8192 MiB, 32 GiB), or the <code>LAZY_SMOLVM_*</code> value when one is set. Projects that already have a machine keep their size until you change that project.</p>
+<h2 id="checking-the-host-is-not-overcommitted"><a class="anchor" href="#checking-the-host-is-not-overcommitted" aria-hidden="true">#</a>Checking the host is not overcommitted</h2>
+<p>The landing page of god mode has a <strong>Host capacity</strong> section for microVM installs. It adds up the CPUs and memory of the machines that are running, compares them with the host&#39;s RAM and CPU count, and shows the host&#39;s own view of memory: how much is available, how much is compressed or swapped, and the pressure level (macOS) or memory stall time (Linux). A machine that is stopped holds no host memory, so it is listed but not counted.</p>
+<p>The page warns when the running machines are promised more RAM than the host has, when they use more than three quarters of it, when the host reports memory pressure, or when it holds a lot of compressed memory. The sizes are what each machine was configured with, not live use. To fix an overcommit, lower a machine&#39;s memory on its project&#39;s page or stop a project. The section is read-only.</p>
+<h2 id="seeing-what-a-projects-machine-is-doing"><a class="anchor" href="#seeing-what-a-projects-machine-is-doing" aria-hidden="true">#</a>Seeing what a project&#39;s machine is doing</h2>
+<p>A project&#39;s admins can see what its machine is doing, even where they cannot change it. Plain members see the image&#39;s state and, when a build fails, the failing step&#39;s output (which they need to open a task that fixes it), but not the live build log or the machine page.</p>
+<p><strong>The project&#39;s image.</strong> The project page shows exactly one state for the project&#39;s runner image: building, failed, a <code>Dockerfile.lazy</code> from another branch or task being adopted, that adoption failed, adopted and in use, or ready. While a build runs, the page shows which step it is on out of how many. <strong>Watch the build log</strong> opens a page that follows the build live, showing:</p>
+<ul>
+<li>each step and how long it took;</li>
+<li>the failing step and its output, when a step fails;</li>
+<li>the end of the log.</li>
+</ul>
+<p><strong>Cancel</strong> stops a running build; steps that already finished stay cached. <strong>Rebuild</strong> builds the image again. Confirming <strong>Use Dockerfile.lazy from…</strong> takes you straight to that build&#39;s log, and the page never waits for the build to finish.</p>
+<p><strong>The machine.</strong> <strong>Machine</strong>, in the project page&#39;s header, shows the machine&#39;s four services: the container runtime, the forwarder, the project&#39;s daemon and the task proxy. For each, it gives the service&#39;s state and its recent log. It also shows CPU, memory and disk use against the machine&#39;s size. On a host shared by several projects (the local Docker backend), the host&#39;s name, CPU, memory and disk are not shown, because they would describe every project on that host; the page says so instead. Logs are shown with credentials and secrets removed before they leave the machine. The page is read-only for project admins.</p>
+<p>On a microVM, the container runtime also has a <strong>Restart history</strong>: each time it stopped, how it ended (its exit status, the end of its log, and whether the machine ran out of memory), and each time it was started again. When it stops, lazy restarts it on its own; if it stops again after three restarts within 15 minutes, lazy stops restarting it, and the page shows <strong>Keeps stopping</strong> for your installation&#39;s administrator. A restart from god mode is shown as requested and never counts toward that limit. If an image build loses its connection to the container runtime because the runtime stopped or was cut off, lazy runs the build once more after the runtime answers again. If that fails too, the failure says what the machine recorded (for example, that the runtime ran out of memory) and marks it as the installation administrator&#39;s to fix.</p>
+<p>On a microVM, the container runtime stores images and builds them in a way that keeps its memory use low, even while a large image is being built and saved, so big project images build without the runtime running out of memory. It also keeps its build cache to at most 40% of the machine&#39;s disk, removing the least recently used entries beyond that, so builds stay fast without the cache filling the disk.</p>
+<p><strong>Memory.</strong> The machine page charts the machine&#39;s memory in use and the container runtime&#39;s own over the last day (sampled every five minutes, the last 288 readings kept), and shows the machine&#39;s size, the container runtime&#39;s current memory, and how many times the kernel&#39;s out-of-memory killer has killed the container runtime. Project admins read all of it. The history appears once the machine has been sampled a couple of times, and a machine that did not answer leaves a gap rather than a made-up reading.</p>
+<p><strong>Data integrity.</strong> On a microVM, lazy checks by itself whether the machine damages data. Once an hour, and right after a task launch fails because an image layer could not be read, it writes a pattern to freshly allocated memory and reads it back (four threads for about 30 seconds, about 32 MiB, a few seconds of CPU; it waits while an image is building, a task is starting, or less than 512 MiB of memory is free). After every successful image build it re-hashes the image data that build stored, and again once the machine has been idle for 15 minutes: data wrong straight away was damaged as it was written, and data right at first and wrong later was damaged on disk. A clean result is one &quot;last checked&quot; line in the <strong>Data integrity</strong> section of the machine page. A damaging one is an alert message, shown in that section with its evidence and as a failing check in god mode&#39;s Doctor. Nothing needs running: lazy already rebuilds a damaged image when a launch hits one.</p>
+<p><strong>Who fixes what.</strong> Every failure says whether a project admin can fix it, and how — for example, fix the Dockerfile in a task, adopt a working one, or build again. Otherwise it says that the problem belongs to the installation&#39;s administrator, and why. For those, project admins get <strong>Report this to support</strong>, as on the project&#39;s health notices. Out-of-memory Docker failures are the exception: the project admin is shown the fix (give the machine more memory, or reset its Docker storage from the Machine page) rather than only the support button.</p>
+<p><strong>In god mode</strong>, a site administrator can also:</p>
+<ul>
+<li>restart the container runtime or the forwarder from the machine page. Restarting the container runtime stops every task and builder running on that machine. It also restarts a container runtime that lazy stopped restarting because it kept stopping.</li>
+<li>restart the project&#39;s daemon (and its task proxy with it) from the project&#39;s god-mode page, which the machine page links to;</li>
+<li>open the machine&#39;s <strong>Shell</strong> from the machine page;</li>
+<li>change the machine&#39;s size (CPUs, memory, disk) from the machine page, with the same form as on the project&#39;s god-mode page. Saving a different size stops the machine and starts it again; the machine is not replaced, so its files stay, and disk can only grow.</li>
+</ul>
+<p>Site operators see the same pages and restart nothing.</p>
 <h2 id="what-an-upgrade-does"><a class="anchor" href="#what-an-upgrade-does" aria-hidden="true">#</a>What an upgrade does</h2>
 <p>Pull the new image and bring the stack back up as usual. On the <code>local</code>
 backend, your projects are restarted on the new version automatically, within a
@@ -632,16 +1020,46 @@ minute or so of the app coming back — there is nothing to run and nothing to
 wait for. Work that was in progress resumes on its own, keeping its
 conversation and its uncommitted changes.</p>
 <p><strong>On the microVM backend, existing projects move to the new version too</strong>,
-automatically and within a few minutes. A project&#39;s version there is the project
-image its microVM was created from, so each project whose image differs from the
+automatically and within a few minutes. Each project whose lazy differs from the
 one the install is now configured with is listed as out of date on the
-Installation page in god mode. Lazy Teams then replaces its microVM with one
-built from the new image. Nothing is lost that belongs to you:</p>
+Installation page in god mode, and Lazy Teams upgrades it in place: it stops the
+project&#39;s daemon, copies the new lazy into the microVM, checks the copy, swaps
+it in, and starts the daemon again. The microVM itself is kept, so everything
+inside it stays: the project&#39;s clone and worktrees, tools agents installed, and
+the container images it has built. A turn that was running is interrupted and
+resumes by itself on the new version, as it does on the <code>local</code> backend. If the
+daemon does not come back on the new lazy, the previous lazy is put back, the
+project keeps running on it, and the Installation page says what failed.</p>
+<p>The same in-place upgrade also updates the microVM&#39;s own setup that comes with
+lazy, such as how the project&#39;s port is forwarded and the container runtime&#39;s
+settings. A changed forwarding setting takes effect straight away. New container
+runtime settings take effect the next time the runtime restarts, because an
+upgrade never stops it while builds or tasks may be using it; <strong>Restart the
+container runtime</strong> on the machine page applies them now. If the microVM does not
+run the new setup after the upgrade, the previous lazy is put back, as above.</p>
+<p><strong>When a release moves to a new version of the microVM runtime (smolvm), stop
+every project before you upgrade a native install</strong> — God mode&#39;s <strong>Stop all
+projects</strong>, or <code>bin/native-rails lazy:projects:stop_all</code>, run with the install you are
+upgrading FROM. A newer runtime may be unable to stop a microVM an older one
+started, and the installer replaces the runtime&#39;s files, so it refuses to
+proceed while any microVM still uses them and lists which ones. After the
+upgrade, start the projects again; each microVM keeps its disk and comes up on
+the new runtime. The release notes say when a release changes the runtime.</p>
+<p>Occasionally a release changes the microVM&#39;s own system (its operating system
+or Docker, for example). Then, and for microVMs created by a release before
+in-place upgrades existed, Lazy Teams replaces the microVM with one built from
+the new image instead. Nothing is lost that belongs to you:</p>
 <ul>
 <li>The project&#39;s task history lives outside the microVM and is not touched.</li>
 <li>The project&#39;s clone is carried across byte-for-byte. That includes every
 task&#39;s worktree, uncommitted changes, unpushed task branches and each agent&#39;s
-conversation.</li>
+conversation. Running work is stopped first — through Docker when it answers,
+and otherwise by stopping the task containers&#39; processes directly, so a
+microVM whose Docker has died is still brought to rest. Before the old microVM is
+removed, this machine checks that its copy matches what the microVM wrote,
+and the old microVM checks the copy holds every file of the project. The new
+microVM checks both again before it uses the copy. If any check fails, the old microVM, or the saved
+copy, is kept and the Installation page says what failed.</li>
 <li>A turn that was running is interrupted and resumes by itself on the new
 version, as it does on the <code>local</code> backend.</li>
 </ul>
@@ -653,11 +1071,12 @@ afterwards also rebuilds the task container image, which takes a few minutes.</p
 <p>Carrying the clone needs free disk on this machine roughly the size of the
 project&#39;s clone and worktrees, for the length of the replacement. If a microVM
 cannot be replaced, for example because the clone could not be saved, the old
-microVM is left exactly as it was and keeps running the old version. The project
-is then retried and named on the Installation page, as below. If no project image
+microVM is kept and its daemon is started again on the old version, so the
+project is never left stopped by a failed upgrade. The project is then retried
+and named on the Installation page, as below. If no project image
 is configured, or the configured image file is missing, no project is replaced:
 the Installation page says the version could not be read.</p>
-<p>Before it replaces any project, Lazy Teams first boots the new project image in a throwaway machine. If that fails, or if replacing one project fails, it stops there: the projects it had not reached keep running on their old version, the Installation page in god mode says why in red, and the automatic restart waits 30 minutes before trying again. Fix the cause, then use <strong>Restart all project daemons</strong> to go ahead at once.</p>
+<p>Before it upgrades or replaces any project, Lazy Teams first boots the new project image in a throwaway machine. A project whose own upgrade fails — its clone could not be saved, its containers would not stop — keeps running its old version and is retried later, and the upgrade carries on with the other projects. Lazy Teams stops the whole upgrade only when the new version itself cannot start: the throwaway machine does not boot, or the new version fails to start on two projects. Then the projects it had not reached keep running on their old version, the Installation page in god mode says why in red, and the automatic restart waits 30 minutes before trying again. Fix the cause, then use <strong>Restart all project daemons</strong> to go ahead at once.</p>
 <p>If your install predates the image-layout change, also refresh the deploy bundle from the release along with the image — see <a href="#upgrading">Upgrading</a> below.</p>
 <p>If a project cannot be brought back — its data folder is unreadable, say, or
 something is holding it open — Lazy Teams retries it a few times, waiting longer
@@ -667,6 +1086,9 @@ the last attempt said and when the next one is due. It also says if the
 automatic restart is not running at all. The Installation page names any project
 in the given-up state too, and the project&#39;s own page says what went wrong. Deal with the
 cause, then use <strong>Restart all project daemons</strong> to pick it up again.</p>
+<h2 id="stopping-every-project-at-once"><a class="anchor" href="#stopping-every-project-at-once" aria-hidden="true">#</a>Stopping every project at once</h2>
+<p>To take the whole installation down gently — before maintenance, say — run <code>bin/native-rails lazy:projects:stop_all</code> from the Teams directory of a native install (<code>docker compose exec app bin/rails lazy:projects:stop_all</code> in a Compose install), or press <strong>Stop all projects</strong> on the Installation page in god mode (it asks you to confirm). Each project&#39;s daemon is stopped in an orderly way first, so running turns are interrupted and resume later, and then its machine is stopped. Nothing is deleted: every project keeps its storage. The rake task prints one line per project; the page shows progress and a result for each (stopped, already stopped, or failed with the reason).</p>
+<p>Stopped projects stay stopped: the automatic restart and version rolls only touch projects that are meant to be running. Start each one again from its own page. With the local backend a project has no machine, so only its daemon is stopped.</p>
 <h2 id="building-from-source-development"><a class="anchor" href="#building-from-source-development" aria-hidden="true">#</a>Building from source (development)</h2>
 <p>When you are developing lazy or Lazy Teams itself, build the application image from the repository checkout instead of pulling:</p>
 <pre><code class="language-bash">cd lazy-teams/deploy
@@ -744,7 +1166,7 @@ The same answer is available without signing in:</p>
 docker compose up -d
 </code></pre>
 <p>If your install already has projects that were set up without microVMs, set <code>LAZY_FLEET_BACKEND=local</code> in <code>.env</code> before upgrading: an install never hands a project to a different backend than the one that set it up, and setup and the Installation page say so until the backend matches. A project set up before Lazy Teams recorded which backend made it, on a microVM backend, is refused too rather than guessed at; the refusal gives the one command that records its backend.</p>
-<p>Project data in the two volumes above is preserved. On the <code>local</code> backend your projects restart on the new version automatically, within a minute or so of the app coming up; on the microVM backend each project&#39;s microVM is replaced on the new image shortly after — see <a href="#what-an-upgrade-does">What an upgrade does</a>.</p>
+<p>Before it changes the application database, the upgrade copies it — see <a href="#automatic-backup-before-every-upgrade">Automatic backup before every upgrade</a>. Project data in the two volumes above is preserved. On the <code>local</code> backend your projects restart on the new version automatically, within a minute or so of the app coming up; on the microVM backend each project&#39;s microVM is upgraded in place shortly after — see <a href="#what-an-upgrade-does">What an upgrade does</a>.</p>
 <p>Your existing <code>.env</code> is never rewritten, so two of the defaults above change under an install that predates them:</p>
 <ul>
 <li>The direct port moves to the loopback interface. If you were reaching it across a network, set <code>APP_DIRECT_BIND=0.0.0.0</code> to keep that working — or better, put HTTPS in front and leave it local.</li>

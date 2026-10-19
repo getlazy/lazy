@@ -35,7 +35,7 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="lazy-agent-design"><a class="anchor" href="#lazy-agent-design" aria-hidden="true">#</a>lazy-agent Design</h1>
 <p>How lazy&#39;s in-container side works: the <code>lazy-agent</code> binary that supervises
@@ -89,6 +89,10 @@ same binary (<code>lazy-agent</code>) but run in different modes.</p>
 <p>The container&#39;s PID-1 wrapper restarts the one-shot supervisor between turns
 (releasing its post-turn RSS), and deliberately kills nothing else: processes
 the agent leaves running — dev servers, databases — survive turn boundaries.
+After a failed turn, the supervisor exits with a nonzero code and the wrapper
+stops instead of restarting it as though the turn completed successfully.
+The error response remains available for the daemon to record the failure and
+decide whether the task can resume.
 The <strong>container is the cleanup boundary</strong>: everything in it dies together when
 the task reaches a terminal state (accept/reject/close) or is stopped, which
 still <code>docker kill</code>s the container. The old between-turn process sweep
@@ -1243,6 +1247,10 @@ pointer — see
 <p>The container&#39;s entrypoint runs <code>lazy-agent --protocol-dir ... --worktree ...</code>
 which starts the supervisor loop.</p>
 <h3 id="git-containment-the-split-git-mount"><a class="anchor" href="#git-containment-the-split-git-mount" aria-hidden="true">#</a>Git containment: the split <code>.git</code> mount</h3>
+<p>Lazy&#39;s own data directory (<code>&lt;repo&gt;/.lazy</code>) is hidden behind an empty in-memory
+mount in every container that reads the repository, so an agent sees only its
+own worktree there, never other tasks&#39; worktrees, logs or the builder&#39;s
+configuration.</p>
 <p>The repository is mounted read-only and the task&#39;s worktree read-write on top of
 it — but the worktree is a <em>linked</em> git worktree, so all the state that matters
 (refs, config, hooks) lives in the main repo&#39;s <code>.git</code>. That directory used to be

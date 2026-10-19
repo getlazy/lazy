@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Environment variables, secrets and files — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
+<main class="wrap">
+<h1 id="environment-variables-secrets-and-files"><a class="anchor" href="#environment-variables-secrets-and-files" aria-hidden="true">#</a>Environment variables, secrets and files</h1>
+<p>Project admins define the environment a project&#39;s tasks can use under <strong>Settings → Environment</strong>.</p>
+<p>Each entry is either:</p>
+<ul>
+<li>a <strong>variable</strong> — a name such as <code>DATABASE_URL</code> and a value; or</li>
+<li>a <strong>file</strong> — a path relative to the task&#39;s worktree root (for example <code>.env.local</code> or <code>config/master.key</code>) and its contents.</li>
+</ul>
+<p>For each entry you choose:</p>
+<ul>
+<li><strong>Applies</strong> — <em>Always</em> (every task in the project) or <em>Optional</em> (only tasks it is picked for).</li>
+<li><strong>Secret</strong> — the value is write-only. After saving, the page shows only that it is set and when it last changed. To change it, enter a new value (leaving the field empty keeps the current one); to remove it, delete the entry. A secret cannot be turned into a plain entry or back: delete it and add a new one.</li>
+<li><strong>Members may select</strong> — for optional entries, whether any member may pick it for a task. Otherwise only admins can.</li>
+</ul>
+<p>Every value, secret or not, is stored encrypted. On this page a plain variable shows its value and a plain file shows only its size. An entry&#39;s kind (variable or file) is fixed once saved; its name or path, value, <strong>Applies</strong> and <strong>Members may select</strong> can be edited. Only project admins can add, change or delete entries; site operators in god mode can view the page but not change it.</p>
+<p>A secret is available to every task it applies to, and anyone who can work on such a task (giving its agent feedback, or using its shell) can read it — just like CI secrets on GitHub. <strong>Members may select</strong> only decides which tasks receive the secret, not who can read it there, so only define a secret that everyone who works on those tasks may see.</p>
+<p>Teams checks that a variable name uses only letters, digits and underscores and does not start with a digit, that a file path is relative, does not end in <code>/</code> and has no control characters, and that no two entries of the same kind share a name. Everything else is checked when the entry is delivered to a task, and a refusal is shown in full:</p>
+<ul>
+<li><strong>Reserved variable names:</strong> <code>PATH</code>, <code>HOME</code>, <code>USER</code>, <code>SHELL</code>, <code>PWD</code>, <code>TMPDIR</code>, <code>GIT_SSH_COMMAND</code>, <code>CLAUDECODE</code>, and any name starting with <code>LAZY_</code>, <code>ANTHROPIC_</code>, <code>CLAUDE_</code>, <code>CURSOR_</code> or <code>PI_</code>.</li>
+<li><strong>Variables:</strong> at most 64 per task and 128 KiB in total.</li>
+<li><strong>Files:</strong> at most 32 per task, 256 KiB each and 1 MiB in total. A path is at most 1024 bytes, uses <code>/</code> separators, has no <code>..</code>, <code>.</code> or empty segments, is not inside <code>.lazy</code>, <code>.lazy-task-sandbox</code> or <code>.lazy-lock</code> at the worktree root (nor one of those itself), and has no <code>.git</code> segment anywhere. A task can be given at most 256 different file paths over its lifetime.</li>
+</ul>
+<h2 id="what-a-task-gets"><a class="anchor" href="#what-a-task-gets" aria-hidden="true">#</a>What a task gets</h2>
+<p>A task&#39;s page shows an <strong>Environment</strong> section on its Services tab, where you go to troubleshoot its app: every always-applied entry, the optional entries picked for it, and any entries added for that task alone. Secrets, variables and files are listed by name or path only — values are never shown.</p>
+<ul>
+<li><strong>Pick optional entries.</strong> Tick an optional entry to give it to this task. Members can tick entries marked <em>members may select</em>; an admin can tick any.</li>
+<li><strong>Add something for one task.</strong> Any member who can edit the task can add a variable or file just for it, optionally as a secret (stored encrypted, never shown again). It overrides a project entry with the same name.</li>
+<li><strong>A secret can be read by anyone who can work on the task</strong> (feedback to its agent, or its shell), like CI secrets on GitHub. Pick secrets accordingly.</li>
+</ul>
+<p>Variables are delivered to the task&#39;s agent and to its services (Run services) before every launch the page starts, and again whenever the entries or the selection change; a task that is already running picks the change up at its next turn. Every task is given the project&#39;s always-applied entries from the moment it is created, however it was started — by a cluster task, a builder or the CLI as well as from the page. A task page says &quot;Not delivered by Teams yet&quot; while Teams has not delivered that task&#39;s environment itself. A refusal (for example a reserved variable name) is shown in full where you made the change, and the change stays saved. If an always-applied entry is refused, the Environment page says so in full. Until you fix or remove it, new tasks start without the always-applied entries and each task&#39;s delivery is refused too, while entries you removed are still taken off every task — so an entry you deleted never keeps reaching them. Terminal sessions you open on a task run in an environment of their own and do not get these variables. Files are written into the task&#39;s worktree and never committed or pushed: a commit that carries one is refused. A path the branch already tracks, or a file already in the worktree that was not written there for this task, is refused rather than overwritten, and the reason is shown.</p>
+<p>When a file stops applying to a task (you untick or delete its entry), it is no longer written, but it is not deleted: it stays in the task&#39;s worktree, still kept out of every commit. The task&#39;s Environment section lists such files so you can remove them yourself if you no longer want them there.</p>
+<p>A variable that stops applying is unset at the next delivery; variables set with <code>lazy env set</code> are left alone. A change made to a task that has already ended is saved but not delivered. An entry added for one task alone can be removed but not edited: remove it and add it again.</p>
+
+</main>
+</body>
+</html>

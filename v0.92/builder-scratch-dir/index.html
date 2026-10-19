@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Builder scratch dir — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
+<main class="wrap">
+<h1 id="builder-scratch-dir"><a class="anchor" href="#builder-scratch-dir" aria-hidden="true">#</a>Builder scratch dir</h1>
+<p>A writable, host-accessible directory the builder can use for artifacts it wants
+to hand to you — and nothing else.</p>
+<pre><code>~/.lazy/scratch/&lt;project-slug&gt;/
+</code></pre>
+<p>The builder sees the path in <code>$LAZY_SCRATCH_DIR</code>. For a builder you launch with
+<code>lazy builder</code>, you see it at the <strong>same absolute path</strong> on the host. A builder
+started by Lazy Teams sees it inside its container at <code>/lazy-builder/scratch</code>;
+read its files with <code>lazy scratch</code> or the Teams <strong>Files</strong> view.
+In Teams, <strong>Download</strong> saves any file whose content was captured into the store.
+See <a href="../lazy-teams-builders/">Builders in Lazy Teams</a> for the transcript and file controls.
+On Lazy Teams the directory, like each member&#39;s builder settings and
+conversations, lives on the project&#39;s persistent disk, so it survives the
+project&#39;s machine being replaced during an upgrade.</p>
+<h2 id="why-it-exists"><a class="anchor" href="#why-it-exists" aria-hidden="true">#</a>Why it exists</h2>
+<p>The repository is bind-mounted <strong>read-only</strong> into builder containers. That is
+deliberate: the builder&#39;s job is prompts and review, not implementation, so it
+must not be able to do work in the git tree.</p>
+<p>The side effect was that the builder had nowhere to put anything. Yet artifacts
+are genuinely useful:</p>
+<ul>
+<li>a long accept/review message you then pass through:
+<code>lazy accept &lt;task&gt; --message &quot;$(cat ~/.lazy/scratch/&lt;slug&gt;/accept-&lt;task&gt;.md)&quot;</code></li>
+<li>a throwaway analysis script</li>
+<li>a draft document</li>
+<li>a data dump for you to read</li>
+</ul>
+<p>The scratch dir is that place.</p>
+<h2 id="the-boundary-builder--human-never-builder--agent"><a class="anchor" href="#the-boundary-builder--human-never-builder--agent" aria-hidden="true">#</a>The boundary: builder ↔ human, never builder ↔ agent</h2>
+<p><strong>This directory is a scratchpad for the builder and for data exchange with
+you. It is not a channel to agents.</strong> If the builder had a writable place task
+agents could also see, the builder would start writing code there and telling
+agents to copy it in — dissolving the builder/agent separation the whole system
+depends on. An agent-visible scratch dir is worse than no scratch dir.</p>
+<p>There is no builder→agent handoff area, and none is planned.</p>
+<p>Two properties enforce this, structurally rather than by convention:</p>
+<ol>
+<li><strong>It can never be committed.</strong> It is not inside any git tree — not
+<code>.lazy/</code>, not the worktree, not the repo at all. There is no <code>.gitignore</code>
+entry to forget, edit, or override with <code>git add -f</code>.</li>
+<li><strong>No agent can read it.</strong> No agent launch path mounts it, and nothing is
+reachable in a container that is not mounted. A custom <code>[[mounts]]</code> entry
+in lazy.toml whose <code>source</code> is (or contains) the scratch base dir is
+refused with an error naming the entry — the same treatment lazy&#39;s daemon
+state directory gets, and for the same kind of reason.</li>
+</ol>
+<h2 id="container-builder-contract"><a class="anchor" href="#container-builder-contract" aria-hidden="true">#</a>Container builder contract</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>container runner (<code>docker</code> / <code>podman</code>)</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Availability</td>
+<td>bind-mounted read-write — at the identical host path for <code>lazy builder</code>, at <code>/lazy-builder/scratch</code> for a Lazy Teams builder</td>
+</tr>
+<tr>
+<td>Path</td>
+<td><code>$LAZY_SCRATCH_DIR</code></td>
+</tr>
+</tbody></table>
+<p>The path is derived from the project root alone — no config key, no lazy.toml
+setting — so every launch computes the same path.</p>
+<p>The directory is created mode <code>0777</code> before every builder launch. A builder
+<em>container</em> writes as the image&#39;s <code>user</code> account, whose uid need not match
+yours; the bind mount carries host ownership through, so a <code>0700</code> dir would be
+silently unwritable inside the container on any host where the uids differ.
+Repair only ever widens the bits — if you set the sticky bit (<code>chmod 1777</code>) by
+hand on a multi-user machine, lazy leaves it alone.</p>
+<h2 id="it-is-captured-into-the-project-store"><a class="anchor" href="#it-is-captured-into-the-project-store" aria-hidden="true">#</a>It is captured into the project store</h2>
+<p>The directory on disk is the <strong>working area</strong>; lazy&#39;s storage holds the durable
+copy. The builder supervisor captures the directory on its regular cadence and
+again when the session ends, so artifacts outlive the host, travel with the
+project, and are readable by later builders — not just by whoever was at that
+machine.</p>
+<pre><code>lazy scratch list              # captured files, newest first
+lazy scratch show &lt;path&gt;       # one file&#39;s content
+lazy scratch sync              # capture now instead of waiting for a builder
+lazy scratch rm &lt;path&gt;         # drop a captured file from the store
+lazy scratch path              # the live directory, its entry count and size
+lazy search &#39;in:scratch &lt;text&gt;&#39;   # search inside captured content
+</code></pre>
+<p>In a clone logged in to Lazy Teams, <code>lazy scratch sync</code> refuses: the Teams
+builder runs on the server and its files are captured there, so a member does not
+copy laptop files into the shared store. <code>list</code>, <code>show</code> and <code>path</code> still work.</p>
+<p>Builders read the same files through the <code>lazy_scratch</code> MCP tool and search them
+with <code>in:scratch</code>. <strong>Task agents cannot</strong> — both the tool and the search scope
+are rejected for an agent caller, server-side, from its task identity. The
+builder↔human boundary above is not weakened by making scratch searchable.</p>
+<p>The web dashboard shows the same captured files under <strong>Scratch</strong> (in Lazy
+Teams, <strong>Builders → Files</strong>, and each builder&#39;s own files under <strong>Files this
+builder left</strong> on its page): grouped by the builder that last wrote them, with capture time,
+markdown rendered (with a raw view), and a search box. A file recorded by name
+only is labelled as such with its reason — over 1 MiB, binary, or over the
+sandbox budget — rather than shown empty. A system message that names a
+captured scratch path links to it. The web pages are read-only; removal stays
+<code>lazy scratch rm</code>.</p>
+<h3 id="what-capture-does-and-does-not-do"><a class="anchor" href="#what-capture-does-and-does-not-do" aria-hidden="true">#</a>What capture does and does not do</h3>
+<ul>
+<li><strong>It never deletes.</strong> Removing a file from the live directory leaves the
+captured copy in place — you may be reading it hours after the builder that
+wrote it exited. <code>lazy scratch rm &lt;path&gt;</code> is the explicit removal.</li>
+<li><strong>Nothing is silently truncated.</strong> Content is stored whole or not at all.
+Three cases are recorded <strong>by name only</strong>, each with a warning naming the file
+and what to do about it: a file over <strong>1 MiB</strong>, a non-UTF-8 (binary) file, and
+anything past the <strong>32 MiB</strong> per-project sandbox budget. <code>lazy scratch list</code>
+shows those rows with the reason, and their bodies remain on disk.</li>
+<li><strong>The caps are not configurable.</strong> They exist to keep the store bounded by
+construction; a knob would only let it grow without limit again.</li>
+<li>Dot-prefixed entries and symlinks are not captured (a symlink would otherwise
+pull repository or <code>$HOME</code> content into the store).</li>
+</ul>
+<h2 id="finding-it"><a class="anchor" href="#finding-it" aria-hidden="true">#</a>Finding it</h2>
+<pre><code>lazy scratch path      # the live path, item count and size
+lazy system status     # names the path
+lazy doctor            # names the path, item count and total size
+</code></pre>
+<p>The builder also prints the path at launch, and its system prompt tells it to
+give you the full path whenever it leaves something there.</p>
+<h2 id="lifecycle"><a class="anchor" href="#lifecycle" aria-hidden="true">#</a>Lifecycle</h2>
+<p><strong>Persistent, never auto-wiped.</strong> You may read an artifact hours or days after
+the builder session that wrote it has ended, so nothing in lazy prunes this
+directory — not <code>lazy doctor</code>, not <code>lazy system status</code>, not a new builder
+session.</p>
+<p>Cleanup is yours, and it is two places — the live directory and the store:</p>
+<pre><code>rm -rf ~/.lazy/scratch/&lt;project-slug&gt;/*     # the live working area
+lazy scratch rm &lt;path&gt;                      # the captured copy
+</code></pre>
+<p>Clearing only the directory leaves the captured copies readable (deliberately —
+that is what &quot;outlives the host&quot; means). Clearing only the store means the next
+capture puts the file back.</p>
+<p><code>lazy doctor</code> reports the size on every run and adds that hint once the
+directory passes 100 MB.</p>
+<h2 id="overriding-the-location"><a class="anchor" href="#overriding-the-location" aria-hidden="true">#</a>Overriding the location</h2>
+<p><code>LAZY_SCRATCH_BASE_DIR</code> relocates the base directory for every project at once
+— the same seam, and for the same reason, as <code>LAZY_DAEMON_BASE_DIR</code> for daemon
+state. There is no lazy.toml key: as described under
+<a href="#container-builder-contract">Container builder contract</a>, the path stays a pure
+function of the project root, so every launch computes the same one.</p>
+
+</main>
+</body>
+</html>

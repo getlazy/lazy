@@ -35,7 +35,7 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="how-lazy-upgrade-rebuilds-the-container-image"><a class="anchor" href="#how-lazy-upgrade-rebuilds-the-container-image" aria-hidden="true">#</a>How <code>lazy upgrade</code> rebuilds the container image</h1>
 <p>This page explains how <code>lazy upgrade</code> rebuilds the container image your agents
@@ -198,6 +198,11 @@ image gets rebuilt&quot; below.</li>
 <h2 id="when-else-the-image-gets-rebuilt"><a class="anchor" href="#when-else-the-image-gets-rebuilt" aria-hidden="true">#</a>When else the image gets rebuilt</h2>
 <p>An upgrade is the main path, but not the only one. Three triggers rebuild a
 runner image, on three different axes:</p>
+<p>These triggers apply to an image lazy BUILT on your machine. The default image
+pulled from a release is never rebuilt for its age: it keeps the agent CLIs it
+was pulled with, and upgrading lazy pulls again. A default image lazy built
+itself is replaced by the published one, when one exists, as soon as a trigger
+fires.</p>
 <table>
 <thead>
 <tr>
@@ -229,30 +234,33 @@ code: <code>lazy-agent</code> is bind-mounted into the container at launch, so i
 current the moment lazy is.</p>
 <h2 id="the-base-image-a-custom-dockerfile-builds-from"><a class="anchor" href="#the-base-image-a-custom-dockerfile-builds-from" aria-hidden="true">#</a>The base image a custom Dockerfile builds FROM</h2>
 <p>If your project supplies its own Dockerfile and it starts with
-<code>FROM lazy-runner</code>, that base image is one lazy builds on your machine — it
-exists on no registry. On a machine where it has never been built, or where
-<code>docker system prune</code> removed it, Docker would treat the name as a Docker Hub
+<code>FROM lazy-runner</code>, that base has to be in your local image store. The bare name
+<code>lazy-runner</code> is not on a registry, so on a machine without it (never set up, or
+cleared by <code>docker system prune</code>) Docker would treat the name as a Docker Hub
 repository and fail with <code>pull access denied, repository does not exist</code>.</p>
 <p>Lazy avoids that: before building your custom image it checks for the base and,
-if it is missing, builds it first, saying so —</p>
+if it is missing, pulls your release&#39;s <code>ghcr.io/getlazy/lazy-runner</code> image and
+tags it <code>lazy-runner</code>. If there is nothing to pull (offline, or no release published
+the base your lazy version builds from) it builds the base instead, saying so —</p>
 <pre><code>Base image lazy-runner:latest not found — building it first, because
 /path/to/Dockerfile.lazy builds FROM it (this can take several minutes).
 </code></pre>
 <p>This happens <strong>only when the base is missing</strong>. It is not a fourth freshness
 trigger: an existing base image is left exactly as it is, and the three triggers
 in the table above are what keep it current.</p>
-<p>Two <code>FROM</code> spellings lazy will not build for you, because a base build would not
-produce the reference you asked for — a base build writes only the current
-<code>major.minor</code> tag and the <code>:latest</code> alias:</p>
+<p>Two <code>FROM</code> spellings lazy will not supply for you:</p>
 <ul>
-<li>a base pinned to another tag, e.g. <code>FROM lazy-runner:0.19</code></li>
-<li>an agent-suffixed image, e.g. <code>FROM lazy-runner-cursor</code>. These are lazy&#39;s own
-per-agent images (the default Dockerfile plus that agent&#39;s install line) and
-are not a supported <code>FROM</code> target — build on <code>lazy-runner</code> and add the agent&#39;s
-install line yourself.</li>
+<li>a base pinned to another tag, e.g. <code>FROM lazy-runner:0.19</code>. Lazy only ever
+writes the current <code>major.minor</code> tag and the <code>:latest</code> alias. Use
+<code>FROM lazy-runner</code>, or build the base yourself with
+<code>lazy system build lazy-runner</code>. To pin an exact release, name the published
+image instead: <code>FROM ghcr.io/getlazy/lazy-runner:v0.91.1402</code>.</li>
+<li>an agent-suffixed image, e.g. <code>FROM lazy-runner-cursor</code>. Per-agent images are
+no longer produced, because <code>lazy-runner</code> now carries every agent CLI. Change
+the line to <code>FROM lazy-runner</code>.</li>
 </ul>
-<p>In both cases lazy still names the remedy rather than leaving you with the
-registry error: run <code>lazy system build lazy-runner</code> and retry.</p>
+<p>In both cases lazy names the remedy rather than leaving you with the registry
+error.</p>
 
 </main>
 </body>

@@ -35,7 +35,7 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="running-tasks-with-the-pi-coding-agent"><a class="anchor" href="#running-tasks-with-the-pi-coding-agent" aria-hidden="true">#</a>Running tasks with the Pi coding agent</h1>
 <p>Lazy can run task agents on <a href="https://pi.dev" rel="noopener noreferrer">Pi</a> (<code>pi</code>, the Pi coding agent
@@ -73,6 +73,7 @@ built-in, with your address and model:</p>
 harness = &quot;pi&quot;
 model = &quot;qwen3:32b&quot;
 endpoint = &quot;http://ollama.lan:11434&quot;
+credential = &quot;none&quot;
 </code></pre>
 <p>Then <code>lazy create --agent remote-ollama-pi &quot;…&quot;</code>, or make it the project
 default with <code>lazy system agent set remote-ollama-pi</code>. Because the upstream
@@ -87,6 +88,7 @@ Anthropic:</p>
 harness = &quot;pi&quot;
 model = &quot;claude-opus-5-5&quot;
 endpoint = &quot;https://api.anthropic.com&quot;
+credential = &quot;anthropic&quot;
 </code></pre>
 </li>
 <li><p><strong>OpenAI</strong> — a profile pointed at <code>api.openai.com</code> runs Pi&#39;s OpenAI provider
@@ -95,6 +97,7 @@ instead, over the OpenAI wire:</p>
 harness = &quot;pi&quot;
 model = &quot;gpt-6-sol&quot;
 endpoint = &quot;https://api.openai.com&quot;
+credential = &quot;openai&quot;
 </code></pre>
 <p>The key comes from <code>lazy auth set openai</code> (or <code>OPENAI_API_KEY</code> in the
 daemon&#39;s environment), and the turn is proxied and audited exactly like an
@@ -108,6 +111,7 @@ and all:</p>
 harness = &quot;pi&quot;
 model = &quot;anthropic/claude-sonnet-4.5&quot;
 endpoint = &quot;https://openrouter.ai/api&quot;
+credential = &quot;openrouter&quot;
 </code></pre>
 </li>
 </ul>
@@ -164,9 +168,9 @@ the proxy does. Raising <code>[proxy] upstream_timeout</code> moves both togethe
 Lazy Teams is one — a repository is not allowed to choose an agent profile&#39;s
 <code>endpoint</code>, because that endpoint receives the installation&#39;s model credential.
 Every example on this page that sets <code>endpoint</code> is therefore something to keep
-out of a managed project&#39;s <code>lazy.toml</code>: committing one does not just fail to
-take effect, it stops the project loading at all, with <code>managed config refused</code>
-naming the key.</p>
+out of a managed project&#39;s <code>lazy.toml</code>: committing one does not take effect —
+the profile stays in the file but is not available, and <code>lazy doctor</code> (and
+on Lazy Teams the Configuration page) names it with the reason.</p>
 <p>That leaves the built-in <code>pi</code> profile and its local Ollama, so Pi runs there
 only if whoever operates the installation runs an Ollama the project&#39;s daemon
 can reach. If they do not, <strong>creating</strong> a Pi task is refused — not just starting
@@ -209,7 +213,7 @@ already manages:</p>
 <li>Anthropic — <code>lazy auth set anthropic</code> (or the environment the daemon runs in),</li>
 <li>hosted Ollama — <code>lazy auth set ollama</code>; local Ollama needs no credential,</li>
 <li>OpenAI — <code>lazy auth set openai</code>; OpenRouter — <code>lazy auth set openrouter</code>
-(inferred from the profile&#39;s endpoint, or named by its <code>credential</code> key).</li>
+(named by the profile&#39;s <code>credential</code> key, which every endpoint must carry).</li>
 </ul>
 <p><code>lazy system agent set-key pi</code> is refused by design — there is nothing
 pi-specific to store. As with every agent, the task container only ever holds
@@ -246,11 +250,10 @@ transcript, the same as for Claude Code. This holds for any profile whose
 harness is Pi, not only the built-in <code>pi</code> profile. See
 <a href="../pairing/#pi-pairing">Pairing</a> for the details.</p>
 <h2 id="container-image"><a class="anchor" href="#container-image" aria-hidden="true">#</a>Container image</h2>
-<p>The default lazy runner image family gets Pi installed automatically when a
-project&#39;s agent is <code>pi</code> (a <code>lazy-runner-pi</code> image is built from the default
-Dockerfile plus Pi&#39;s install). Projects with a custom <code>Dockerfile.lazy</code> add
-Pi&#39;s install line themselves — <code>lazy</code> prints it when the image is missing the
-binary. The install is pinned to a specific Pi version that lazy&#39;s
+<p>The default <code>lazy-runner</code> image has Pi installed, alongside every other agent
+lazy can run in a container. A custom <code>Dockerfile.lazy</code> that starts
+<code>FROM lazy-runner</code> has it too. One built on another base adds Pi&#39;s install
+line itself — <code>lazy</code> prints it when the image is missing the binary. The install is pinned to a specific Pi version that lazy&#39;s
 integration was verified against.</p>
 
 </main>

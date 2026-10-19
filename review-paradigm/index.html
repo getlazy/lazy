@@ -35,7 +35,7 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="the-review-paradigm--what-lazy-does-by-default-and-why"><a class="anchor" href="#the-review-paradigm--what-lazy-does-by-default-and-why" aria-hidden="true">#</a>The review paradigm — what lazy does by default, and why</h1>
 <p>Lazy reviews every task before you merge it, without being asked. What changed
@@ -249,6 +249,15 @@ be parsed, one that crashed, one that never started. &quot;Nobody knows what it
 concluded&quot; may not read as a pass. <code>lazy accept &lt;task&gt; --allow-review-issues</code> is
 your override, deliberately CLI-only: an agent may not overrule a review on your
 behalf.</p>
+<p><strong>A review that inspected nothing is a failed review.</strong> Reviews and asks are
+read-only, and lazy checks that itself: it records the task&#39;s working tree
+before the reviewer starts and compares it afterwards, and any change — an
+edited file, a new file, a commit — fails the review, naming the files. Nothing
+is reverted; you decide what to keep. A reviewer that reports it could not read
+the work (its tools or commands failed) is recorded as a failed review, never as
+a pass and never as findings. So is a review that passes the work without
+calling a single tool, including the self-review&#39;s bare approval in <code>low_high</code>
+mode.</p>
 <p><strong>What no longer gates: findings at medium or below.</strong> A finding is a reviewer&#39;s
 opinion about work you are about to read anyway. Holding the merge on every
 style nit cost a full agent turn or a person per finding, and left a cluster&#39;s

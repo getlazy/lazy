@@ -35,7 +35,7 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="protected-branches-and-human-approvals"><a class="anchor" href="#protected-branches-and-human-approvals" aria-hidden="true">#</a>Protected branches and human approvals</h1>
 <p>Branch protection flips the builder&#39;s default on sensitive merges from
@@ -45,7 +45,8 @@ cooperator, not an adversary. Treat it as a speed bump that makes an
 unreviewed merge require a deliberate act, not as a boundary that would hold
 against one.</p>
 <h2 id="turning-it-on-one-command-zero-branch-listing"><a class="anchor" href="#turning-it-on-one-command-zero-branch-listing" aria-hidden="true">#</a>Turning it on: one command, zero branch listing</h2>
-<p>Protection is <strong>opt-in — OFF by default</strong>. A project with no <code>[protection]</code>
+<p>Protection is <strong>opt-in — OFF by default</strong> (except in Lazy Teams, <a href="#in-lazy-teams-pressing-accept-is-the-approval">where it
+is on by default</a>). A project with no <code>[protection]</code>
 section (or with <code>enabled = false</code>) has no protection at all: accepts into
 <code>main</code> behave exactly as they always have. That is deliberate — a brand-new
 user&#39;s first <code>lazy accept</code> should merge, not refuse over a gate they have not
@@ -208,6 +209,37 @@ shut and the passphrase prompt is the offline path.</li>
 <li>A refusal on a forge project names both routes; on a <code>local</code> project it
 names only the terminal route, because there is no PR to approve.</li>
 </ul>
+<h2 id="in-lazy-teams-pressing-accept-is-the-approval"><a class="anchor" href="#in-lazy-teams-pressing-accept-is-the-approval" aria-hidden="true">#</a>In Lazy Teams: pressing Accept is the approval</h2>
+<p>Lazy Teams has no passphrase. Everyone there has already signed in, so a
+protected merge is approved by <strong>a signed-in member pressing Accept</strong> on the
+task&#39;s Accept page. The page says the merge is protected before you confirm,
+and the accepted task records who approved it (&quot;Protected merge approved by
+… (Accept in Lazy Teams)&quot;).</p>
+<p><strong>Protection is on by default in Lazy Teams.</strong> A Teams project&#39;s default
+branch is protected unless its configuration says otherwise. That includes
+projects created before this default existed, unless their configuration
+already sets <code>[protection] enabled</code>. Before, nobody could complete a protected
+accept in Teams, so protection there stayed off. Now the protected accept is
+one button press for a person, and what it stops is the builder and agents
+merging into the default branch on their own. Merges into a parent task&#39;s
+branch are not affected. With protection on, only team admins may push the
+default branch straight to a repository Lazy Teams hosts. To turn it off, a project owner sets <strong>Protection
+on</strong> to off on the project&#39;s Configuration page (<code>[protection] enabled = false</code>).</p>
+<p>What counts and what does not:</p>
+<ul>
+<li><strong>Counts:</strong> a member&#39;s own Accept in the browser.</li>
+<li><strong>Does not count:</strong> the builder, any task agent, or anything over MCP. They
+are refused exactly as on a laptop.</li>
+<li><strong>Does not count:</strong> <code>lazy accept</code> from a clone bound to Lazy Teams. It runs
+on your laptop with your member token, and any program you start there could
+run it too, including an agent or a builder. So a bound clone cannot claim
+to be your Accept. Use the Accept button instead.</li>
+<li><strong>Does not count:</strong> an administrator acting as another member. That is not
+the member&#39;s own approval, so accepting is not offered while acting as
+someone else.</li>
+</ul>
+<p>Approving the task&#39;s PR/MR on a forge still satisfies the gate in Teams, as
+everywhere else.</p>
 <h2 id="enrolling-the-passphrase-lazy-system-passphrase"><a class="anchor" href="#enrolling-the-passphrase-lazy-system-passphrase" aria-hidden="true">#</a>Enrolling the passphrase: <code>lazy system passphrase</code></h2>
 <pre><code>lazy system passphrase set      # enroll or rotate (asks twice; rotation asks for the current one)
 lazy system passphrase status   # is this machine enrolled? never prints or hints at the value

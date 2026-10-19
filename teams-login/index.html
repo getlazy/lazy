@@ -35,15 +35,50 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="logging-a-machine-in-to-lazy-teams"><a class="anchor" href="#logging-a-machine-in-to-lazy-teams" aria-hidden="true">#</a>Logging a machine in to Lazy Teams</h1>
-<p><code>lazy login</code> connects a machine to a Lazy Teams install and binds the clone you
-run it in to one project on that install. Nothing secret is typed, pasted or
-displayed: you approve a short code in a browser that is already signed in, and
-the credential travels from the install to the machine directly.</p>
+<p><code>lazy login</code> connects a machine to a Lazy Teams install. Run outside a
+repository, it logs the machine in — after which plain <code>git clone</code> of a
+repository the install hosts works, the way it does for GitHub after
+<code>gh auth login</code>. Run inside a clone, it also binds that clone to one project on
+the install. Nothing secret is typed, pasted or displayed: you approve the login
+in a browser that is already signed in, and the credential travels from the
+install to the machine directly.</p>
+<h2 id="cloning-a-hosted-project"><a class="anchor" href="#cloning-a-hosted-project" aria-hidden="true">#</a>Cloning a hosted project</h2>
+<p>If the install hosts the project&#39;s repository, its project page shows the clone
+URL and two ways to use it, each with a Copy button:</p>
+<pre><code>$ lazy login https://teams.example.com
+$ git clone https://teams.example.com/git/acme/api-server.git
+</code></pre>
+<p>or, in one step — log in if needed, clone, and bind the new clone to the project:</p>
+<pre><code>$ lazy clone https://teams.example.com/git/acme/api-server.git
+</code></pre>
+<p>Use the address your install is served on. lazy uses the scheme you type exactly, as <code>git</code> does: <code>https://</code> stays <code>https://</code>, and <code>http://</code> stays <code>http://</code>, so installs on a private network or tailnet work over plain http. Only a bare host (<code>lazy login teams.example.com</code>) gets <code>https://</code>, because nothing was typed. The login is scoped to that exact address and is never sent across a redirect; if the address redirects (say <code>http://</code> to <code>https://</code>, or to a sign-in page), lazy stops and tells you where it went so you can use that address. <code>lazy logout</code> needs no network.</p>
+<p>A login is only ever sent over the scheme it was made on. If this machine logged in at <code>https://teams.example.com</code>, <code>lazy clone http://teams.example.com/…</code> refuses rather than send that login unencrypted; use the <code>https://</code> address, or — if the install really is served over plain http — run <code>lazy login http://teams.example.com</code> first. lazy also refuses a login that the install you typed did not issue itself (an address relaying another install&#39;s approval), and a code-approval page on any address other than the one you typed. A login an older lazy sent to an <code>http://</code> address is cleaned up the next time you run <code>lazy login</code>, <code>lazy logout</code> or <code>lazy clone</code>, and lazy tells you to revoke that token.</p>
+<p><code>lazy clone &lt;clone-url&gt; [dir]</code> clones into <code>dir</code> (default: the
+project&#39;s name). It checks you are a member of the project before cloning, and
+reuses this machine&#39;s login for that exact address — same scheme — when it has one that still works. A project whose
+repository lives on GitHub or GitLab is cloned from there instead — <code>lazy clone</code>
+says so; clone it as usual and run <code>lazy login</code> inside the clone.</p>
+<h3 id="how-git-gets-the-login"><a class="anchor" href="#how-git-gets-the-login" aria-hidden="true">#</a>How git gets the login</h3>
+<p><code>lazy login</code> adds <strong>one</strong> <code>include.path</code> entry to your user-level git config —
+the file <code>git config --global</code> writes, which it names when it changes it —
+pointing at a small file of lazy&#39;s own (permissions <code>0600</code>). That file sets, for
+your install&#39;s exact address only:</p>
+<ul>
+<li>an <code>Authorization: Bearer</code> header carrying the login&#39;s token, and</li>
+<li><code>followRedirects = false</code>, so git never follows a redirect anywhere else.</li>
+</ul>
+<p>The token is never written into your <code>.gitconfig</code> itself or into any
+repository&#39;s <code>.git/config</code>, and no other host ever receives it. <code>lazy logout &lt;teams-url&gt;</code> removes the entry and the file.</p>
+<p>This works behind a sign-in proxy (which accepts the Bearer header and cannot
+read a password) and without one: every login&#39;s token carries git access,
+whether you approved it in the browser or with a code.</p>
+<p>A machine logged in with an older lazy, whose code-approved token had no git
+access, is left alone; run <code>lazy login &lt;teams-url&gt;</code> once more to set git up.</p>
 <h2 id="logging-in"><a class="anchor" href="#logging-in" aria-hidden="true">#</a>Logging in</h2>
-<p>Run it inside a clone of the repository:</p>
+<p>Inside a clone of the repository, <code>lazy login</code> also binds the clone to a project:</p>
 <pre><code>$ cd ~/src/api-server
 $ lazy login https://teams.example.com
 
@@ -68,7 +103,8 @@ and who you would be approving as. The second link has the code already in
 it; it is a convenience, and typing the code yourself is the safer habit,
 because it means you know which request you are approving.</li>
 <li>You approve. The install creates a Git &amp; CLI token named after the machine.</li>
-<li>Lazy collects the token, asks which project this clone is, and saves both.</li>
+<li>Lazy collects the token, asks which project this clone is, and saves both.
+Outside a clone there is no project to ask about: it saves the machine login.</li>
 </ol>
 <p>The code expires after 15 minutes. If nobody approves it in time, run
 <code>lazy login</code> again for a fresh one. Expiry is the whole window, not just the
@@ -103,14 +139,37 @@ to working locally.</p>
 <p>A bound clone can never do more than the browser can. A few task settings have
 no control in the browser, so the command-line options that set them are
 refused from a bound clone: <code>--runner</code> and the <code>--review</code> settings on
-<code>lazy create</code> / <code>lazy edit</code>, and <code>--parent</code> naming a git branch rather than a
-task. You can still set a task&#39;s parent task, or clear it, the same way the
-browser&#39;s edit page does.</p>
+<code>lazy create</code> / <code>lazy edit</code>, and <code>lazy edit --parent</code> naming a git branch rather
+than a task (use <code>lazy reparent</code>, like the browser&#39;s &quot;Move under another task&quot;).
+You can still set a task&#39;s parent task, or clear it, the same way the browser&#39;s
+edit page does.</p>
 <p>For the same reason, the options that let a command skip a check the browser
 enforces are refused too: <code>lazy accept --allow-broken</code> and
 <code>--allow-review-issues</code>, <code>lazy start --force-local</code>, <code>lazy unblock --agent</code>,
 and <code>lazy review --auto-fix</code> / <code>--model</code>. The refusal says what was refused, and the
 command works without it.</p>
+<p><code>lazy create --parent</code> may name a branch: a branch you pushed to the project&#39;s
+repository is fetched by the install, and the task starts from it. Name the
+branch exactly: a name that differs from an existing branch only in letter
+case, in whole or in any part (<code>Main</code> or <code>MAIN/x</code> when <code>main</code> exists,
+<code>Release/2.0</code> when <code>release/1.0</code> exists), is refused. Creating a
+task from a bound clone is all or nothing — when anything is refused, no task
+is created and the command says so.</p>
+<p><code>lazy stats limits</code> and <code>lazy stats budget</code> work from a bound clone and show
+you exactly what the install&#39;s Usage page shows you: your own credentials, the
+project&#39;s shared one, and any not tied to a member — never a colleague&#39;s.
+The usage-pause check that <code>lazy start</code> and <code>lazy unblock</code> run before they
+open an editor asks the install the same way.</p>
+<p><code>lazy chat</code>, <code>lazy report</code> and <code>lazy ask</code> on a stored conversation work from a
+bound clone and spend <strong>your own</strong> Claude credential, exactly as the browser
+does — never the project&#39;s or a colleague&#39;s. <code>lazy chat &lt;task&gt;</code> opens the
+task&#39;s Chat on the install, like <code>lazy pair</code> opens its Pair: it runs there, in
+an environment of your own, and <strong>ctrl-]</strong> leaves it. As in the browser, you
+can chat with a paused task whose agent is Claude Code; <code>--effort</code> and
+<code>--override-usage-pause</code> do not apply, because the install decides how the
+session runs. <code>lazy report</code> and <code>lazy ask &lt;conversation&gt;</code> run their model
+calls on the install and print the answer here. <code>lazy report</code> reads the project&#39;s tasks from the install but its main-branch commits from your checkout, so pull first for an up-to-date report. If you have not connected a
+Claude account to the install yet, each of them says so and runs nothing.</p>
 <h2 id="your-builder-from-a-bound-clone"><a class="anchor" href="#your-builder-from-a-bound-clone" aria-hidden="true">#</a>Your builder, from a bound clone</h2>
 <p><code>lazy builder</code> in a bound clone does not start anything on your machine. Your
 builder runs on the Teams install, next to the project, and <code>lazy builder</code>
@@ -140,10 +199,44 @@ are refused from a bound clone: the server decides how its sessions run.</p>
 <p>To use a Claude Code you run yourself against the project instead, see
 <a href="../teams-bound-clone-agents/">Claude Code against a Lazy Teams project</a> — it
 works, with fewer capabilities than the server-side builder.</p>
-<p><code>lazy pair</code> and <code>lazy shell</code> likewise go through Teams rather than opening
-anything locally. On a Teams install they are refused: a task&#39;s
+<p>Without <code>--local</code> (below), <code>lazy pair</code> and <code>lazy shell</code> likewise go through Teams
+rather than opening anything locally. On a Teams install they are refused: a task&#39;s
 container runs on the account of whoever started the task, so entering it in
 your name is not offered.</p>
+<h3 id="working-on-a-tasks-branch-on-your-own-machine"><a class="anchor" href="#working-on-a-tasks-branch-on-your-own-machine" aria-hidden="true">#</a>Working on a task&#39;s branch on your own machine</h3>
+<p>Some work has to be built and tested locally — a macOS app, say. Every task&#39;s
+branch (<code>lazy/&lt;task&gt;</code>) is on the project&#39;s repository (the install&#39;s own, or any
+other remote that is not GitHub or GitLab), kept current as the
+task&#39;s turns finish, so <code>git fetch</code> in your clone sees all of them. Accepted
+work is pushed to the target branch (usually <code>main</code>) there too. If someone
+pushed to <code>main</code> on the install directly, <code>lazy accept</code> brings those commits in
+first. Lazy never force-pushes: if <code>main</code> on the install and the project&#39;s own
+copy have diverged, the accept is refused before anything is merged.
+Likewise, if commits were pushed to the task&#39;s own branch (for example from
+<code>lazy shell &lt;task&gt; --local</code>) and the task does not have them yet, <code>lazy accept</code>
+is refused and points you at <code>lazy sync &lt;task&gt;</code>, so they are never left out. That
+answer comes first even when the target is protected, because it is one you
+can act on from the clone. Once the task has them, accept it with Accept on the
+task in the browser: the project&#39;s default branch is protected by default, and
+<code>lazy accept</code> from a clone is refused there and points you to Teams.</p>
+<p><code>lazy shell &lt;task&gt; --local</code> gives you a checkout of one:</p>
+<pre><code>lazy shell fix-login --local
+</code></pre>
+<p>It fetches the task&#39;s branch, creates a git worktree of your clone beside it
+(<code>&lt;clone&gt;-&lt;task&gt;</code>, so your editor and build tools can open it like any other
+directory), and opens your shell there. If the branch is already checked out
+in a worktree of this clone, that one is used.</p>
+<p>From then on it is plain git. The checkout tracks <code>origin/lazy/&lt;task&gt;</code>, so
+<code>git push</code> sends your commits to the task&#39;s branch on the install, and the
+agent picks them up the next time the task is synced (<code>lazy sync &lt;task&gt;</code>) or
+unblocked. Any team member may push a task branch; for other branches, see
+<a href="../self-hosting-lazy-teams/#hosting-repositories-on-the-install">who can push what</a>.
+Lazy never pushes for you — not when you commit, not when you leave the shell.</p>
+<p>Running it again is safe: a clean checkout that is behind is fast-forwarded,
+and one with commits you have not pushed or changes you have not committed is
+left exactly as it is, with a line saying why. <code>--host</code> does not apply in a
+bound clone — the task&#39;s own worktree is on the server — and says to use
+<code>--local</code> instead.</p>
 <h2 id="which-project-this-clone-is"><a class="anchor" href="#which-project-this-clone-is" aria-hidden="true">#</a>Which project this clone is</h2>
 <p><strong>Lazy never guesses from the git remote.</strong> Two clones of the same repository can
 belong to different projects, so the project is always chosen out loud: from the
@@ -167,25 +260,34 @@ by; log in again whenever you like to see the new one.</p>
 name and asked to log in again (<code>lazy login --project &lt;team/new-name&gt;</code>), and if
 another project has taken the old name since it logged in, it is refused rather
 than connected to that other project.</p>
-<h2 id="seeing-where-a-clone-points"><a class="anchor" href="#seeing-where-a-clone-points" aria-hidden="true">#</a>Seeing where a clone points</h2>
-<p>Run <code>lazy login</code> with no arguments. It prints the binding and starts nothing:</p>
+<h2 id="seeing-where-a-machine-and-a-clone-point"><a class="anchor" href="#seeing-where-a-machine-and-a-clone-point" aria-hidden="true">#</a>Seeing where a machine and a clone point</h2>
+<p>Run <code>lazy login</code> with no arguments. It prints which installs this machine is
+logged in to and, inside a clone, its binding — and starts nothing:</p>
 <pre><code>$ lazy login
-Bound to acme/api-server on https://teams.example.com
+This machine is logged in to: https://teams.example.com
+  git to those installs carries the login; lazy logout &lt;teams-url&gt; ends it
+This clone is bound to acme/api-server on https://teams.example.com
   bound 12/03/2026, 09:41:00
   lazy logout unbinds this clone
 </code></pre>
 <h2 id="logging-out"><a class="anchor" href="#logging-out" aria-hidden="true">#</a>Logging out</h2>
-<pre><code>lazy logout
+<pre><code>lazy logout https://teams.example.com   # this machine, from that install
+lazy logout                             # inside a clone: unbind the clone
 </code></pre>
-<p>This deletes the stored login, which is also how the clone is unbound. If a clone
+<p><code>lazy logout &lt;teams-url&gt;</code> deletes this machine&#39;s login to that install and
+removes the git config entry <code>lazy login</code> added (it names the file). A bare
+<code>lazy logout</code> inside a clone deletes the clone&#39;s stored login, which is also how
+the clone is unbound; outside any clone it logs the machine out of every install.
+If a clone
 somehow ends up holding more than one login — a state every other command refuses
 to act on — <code>lazy logout</code> clears all of them and says how many it removed. It stops
 <em>this machine</em> using the token; it does not retire the token. To end access
 altogether, revoke it at <strong>Account settings → Git &amp; CLI tokens</strong> (from your avatar menu) on the install — that takes
 effect on the next request, from anywhere.</p>
 <h2 id="where-the-login-is-kept"><a class="anchor" href="#where-the-login-is-kept" aria-hidden="true">#</a>Where the login is kept</h2>
-<p>In lazy&#39;s own <a href="../credentials/">credential store</a>, for this project, split the
-same way every credential there is:</p>
+<p>In lazy&#39;s own <a href="../credentials/">credential store</a> — a clone&#39;s login with that
+project, and the machine&#39;s login in a store of its own that belongs to no
+project — split the same way every credential there is:</p>
 <ul>
 <li>the <strong>token</strong> goes to the OS keychain (macOS Keychain, libsecret on Linux, or a
 mode-0600 file on a host with neither), and</li>
@@ -195,14 +297,15 @@ non-secret index.</li>
 <p>That split is why <code>lazy login</code> with no arguments can tell you where a clone
 points without unlocking a keychain to do it.</p>
 <h2 id="the-tokens-this-creates"><a class="anchor" href="#the-tokens-this-creates" aria-hidden="true">#</a>The tokens this creates</h2>
-<p>A login creates an ordinary Git &amp; CLI token with <strong>CLI and MCP</strong> access, named after
-the machine. It appears at <strong>Account settings → Git &amp; CLI tokens</strong> (from your avatar menu) alongside any token you
+<p>A login creates an ordinary Git &amp; CLI token named after the machine, with
+<strong>git, CLI and MCP</strong> access. It appears at <strong>Account settings → Git &amp; CLI tokens</strong> (from your avatar menu) alongside any token you
 created by hand, showing when it was last used, and it is revoked there like any
 other. Logging the same machine in twice gives the second token a distinguishing
 suffix rather than failing.</p>
-<p>A CLI token is not a git password: tokens carry separate access for git and for
-the command line, and one is refused where the other is expected. If you also
-clone over HTTPS from the install, that needs a git-capable token — see
+<p>Tokens carry separate access for git and for the command line, and one is
+refused where the other is expected. A login&#39;s token has both, and sets git up
+for you (see <a href="#how-git-gets-the-login">how git gets the login</a>); a token you
+create by hand for git is described under
 <a href="../self-hosting-lazy-teams/#hosting-repositories-on-the-install">hosting repositories</a>.</p>
 <h2 id="approving-from-the-browser"><a class="anchor" href="#approving-from-the-browser" aria-hidden="true">#</a>Approving from the browser</h2>
 <p>The approval page lives at <code>/device</code> on your install and is also reachable from
@@ -216,6 +319,30 @@ did act as you.</p>
 a decision a person makes at a keyboard, in a browser they are already signed in
 to; an agent must never do it. See
 <a href="../surface-asymmetries/">surface asymmetries</a>.</p>
+<h2 id="display-name"><a class="anchor" href="#display-name" aria-hidden="true">#</a>Display name</h2>
+<p>In <strong>Account settings → Profile</strong>, set the name you want shown beside your actions — sign-offs, turn bylines and
+comments. Leave it blank to be shown by your email address. The name applies to entries written after you save it;
+entries already written keep the name they were recorded with.</p>
+<p>Your email address is always shown next to your name, so nobody can pass for you. A name (or a rename) is refused if
+it looks like an email address, is a reserved word such as admin, god, lazy, system or support, or matches — ignoring
+case and spacing — another member&#39;s name or email in a team you share. If your name later matches a teammate&#39;s (for
+example, when someone with the same name joins), the Profile page warns you, and new entries show only your email
+until one of you changes it.</p>
+<h2 id="alternative-email-addresses"><a class="anchor" href="#alternative-email-addresses" aria-hidden="true">#</a>Alternative email addresses</h2>
+<p>In <strong>Account settings → Email addresses</strong>, add an alternative email and open the
+verification link sent to that inbox. Confirm while signed in to your existing
+member account. The link expires after one hour. Your installation must have
+outgoing email configured.</p>
+<p>Once verified, the address signs in to the same account with your existing
+password or through a trusted sign-in proxy, including one using a different
+OAuth account. Your primary email remains your notification address and account
+identity. An address cannot belong to two members. Remove alternatives from the
+same settings page when you no longer want to use them.</p>
+<p>If your installation cannot send email, a site administrator can add an
+alternative email to a member as already verified: in God mode, open the
+member&#39;s page, enter the address under <strong>Alternative emails</strong> and confirm. No
+email is sent, the address works for sign-in immediately, and the member&#39;s
+settings page shows it as verified by an admin.</p>
 
 </main>
 </body>

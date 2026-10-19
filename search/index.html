@@ -35,7 +35,7 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="searching-tasks"><a class="anchor" href="#searching-tasks" aria-hidden="true">#</a>Searching tasks</h1>
 <p><code>lazy search</code> looks across tasks, prompts, turns, commits, notes, raised items,
@@ -195,6 +195,8 @@ the rest of the query (a status, a date range, a text term), not the tag.</li>
 <li>With <code>--json</code>, the hint appears as a top-level <code>hint</code> field. The MCP
 <code>lazy_search</code> tool returns the same field.</li>
 </ul>
+<h2 id="searching-by-id"><a class="anchor" href="#searching-by-id" aria-hidden="true">#</a>Searching by id</h2>
+<p>Paste an id as the whole query — a prefix of at least 6 characters, or the full id — and search lists every entity that id names, ahead of any text matches: tasks, raised items, comments, journal entries, review comments, turns, commits (by SHA), artifacts, system messages and builder conversations. Each hit links to where the entity lives (a comment to its place on the Comments tab, a turn to the Turns tab, a message to its page). An ambiguous prefix lists every match. Id search is skipped with <code>--fuzzy</code>. Only id-shaped queries pay for the lookup; ordinary text searches run exactly as before.</p>
 <h2 id="result-order"><a class="anchor" href="#result-order" aria-hidden="true">#</a>Result order</h2>
 <p>Search results come back in a deliberate order, the same one on every surface
 that runs a search — the terminal, the MCP <code>lazy_search</code> tool, the dashboard&#39;s

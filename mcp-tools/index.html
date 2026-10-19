@@ -35,7 +35,7 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="mcp-tools-for-agents-and-builders"><a class="anchor" href="#mcp-tools-for-agents-and-builders" aria-hidden="true">#</a>MCP tools for agents and builders</h1>
 <p>Every task agent and every builder session talks to lazy through a set of MCP
@@ -73,11 +73,15 @@ differences from the <code>lazy</code> CLI are listed in
 </tr>
 <tr>
 <td><code>lazy_wait</code></td>
-<td>Block until another task finishes its turn</td>
+<td>Block until another task finishes its turn (returns early with <code>interrupted</code> if a subtask is added to the waiting task, or a human or builder comments on it — the comment is included and counts as delivered)</td>
 </tr>
 <tr>
 <td><code>lazy_memory_recall</code></td>
 <td>Shared project <a href="../memory/">memory</a></td>
+</tr>
+<tr>
+<td><code>lazy_recipe</code></td>
+<td>Built-in step-by-step recipes, loaded on demand — e.g. <code>task-image</code>, for adding a toolchain the <a href="../agent-container/">agent container</a> lacks</td>
 </tr>
 <tr>
 <td><code>lazy_conversations</code>, <code>lazy_conversation_search</code>, <code>lazy_conversation_read</code></td>
@@ -118,7 +122,7 @@ differences from the <code>lazy</code> CLI are listed in
 </thead>
 <tbody><tr>
 <td><code>lazy_create</code>, <code>lazy_start</code>, <code>lazy_edit</code></td>
-<td>Create, start and edit (sub)tasks</td>
+<td>Create, start and edit (sub)tasks (<a href="../renaming-tasks/">renaming a started task</a>)</td>
 </tr>
 <tr>
 <td><code>lazy_clone</code>, <code>lazy_redo</code></td>
@@ -143,6 +147,10 @@ differences from the <code>lazy</code> CLI are listed in
 <tr>
 <td><code>lazy_commit</code></td>
 <td>Commit the caller&#39;s worktree — <strong>agent only</strong></td>
+</tr>
+<tr>
+<td><code>lazy_image_build</code></td>
+<td>Test-build the caller&#39;s own <code>Dockerfile.lazy</code> against its committed files, in a separate builder that is removed afterwards, and return the output; no image is kept — <strong>agent only, and only on Lazy Teams projects that run in a virtual machine</strong> (<a href="../agent-container/#when-dockerfilelazy-does-not-build">agent container</a>)</td>
 </tr>
 <tr>
 <td><code>lazy_comment</code>, <code>lazy_journal</code>, <code>lazy_tag</code>, <code>lazy_untag</code></td>

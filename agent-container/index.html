@@ -35,7 +35,7 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="the-agent-container"><a class="anchor" href="#the-agent-container" aria-hidden="true">#</a>The agent container</h1>
 <p>Every task&#39;s agent runs in a Docker container of its own. This page is for anyone
@@ -43,8 +43,8 @@ whose agents need tools the default image does not have, or who is diagnosing an
 agent that cannot start: what the default image contains, how to give your
 project its own image, and when lazy rebuilds it.</p>
 <h2 id="the-default-image"><a class="anchor" href="#the-default-image" aria-hidden="true">#</a>The default image</h2>
-<p>A project with no <code>[docker] dockerfile</code> in its <code>lazy.toml</code> runs agents in lazy&#39;s
-default image, <code>lazy-runner</code>, which is deliberately minimal. It is Debian
+<p>A project with no <code>[docker] dockerfile</code> in its <code>lazy.toml</code> and no <code>Dockerfile.lazy</code>
+at its root runs agents in lazy&#39;s default image, <code>lazy-runner</code>, which is deliberately minimal. It is Debian
 (bookworm-slim) with:</p>
 <table>
 <thead>
@@ -62,35 +62,107 @@ default image, <code>lazy-runner</code>, which is deliberately minimal. It is De
 <td>Screenshots for visual checks of UI work</td>
 </tr>
 <tr>
-<td>Claude Code</td>
-<td>The agent binary</td>
+<td>Claude Code, Codex, Cursor CLI, Pi</td>
+<td>Every agent lazy can run in a container, so one image serves whichever agent a task uses</td>
 </tr>
 </tbody></table>
 <p>The agent runs as <code>user</code>, with passwordless <code>sudo</code>, so it can install what it
-needs for one task. Agents other than Claude Code get their own variant of this
-image with their binary added. Lazy itself is never baked into an image: it is
+needs for one task. Lazy itself is never baked into an image: it is
 mounted in when the container starts, so an image never pins you to an older
 lazy.</p>
 <p>To see exactly what the default image is built from:</p>
 <pre><code class="language-bash">lazy system export-dockerfile --stdout
 </code></pre>
+<p>Every lazy release publishes this image as <code>ghcr.io/getlazy/lazy-runner</code> (also
+on Docker Hub as <code>getlazy/lazy-runner</code>), tagged with the release version (for example
+<code>v0.91.1402</code>), <code>v0.91</code>, <code>latest</code>, and a content tag <code>sha-&lt;fingerprint&gt;</code> naming
+the exact Dockerfile it was built from. The first task on a machine <strong>pulls</strong>
+the content tag your lazy version builds from and tags it locally as
+<code>lazy-runner:&lt;major.minor&gt;</code> and <code>lazy-runner:latest</code>, so <code>FROM lazy-runner</code>
+keeps working. Lazy builds the image locally instead, and says why, when:</p>
+<ul>
+<li>it is offline;</li>
+<li>no release published the image your lazy version builds from, for example
+when you run lazy from a source checkout with a changed runner Dockerfile;
+lazy then also tags its own build with that content tag;</li>
+<li>the pull fails;</li>
+<li>the published image was built from a different Dockerfile than the one your
+lazy version uses.</li>
+</ul>
+<p>A pulled image keeps the agent CLIs it was pulled with; lazy never refreshes it
+behind your back. To get newer versions of Claude Code, Codex, Cursor or Pi,
+upgrade lazy, which pulls the newest published image for its runner.</p>
 <h2 id="giving-your-project-its-own-image"><a class="anchor" href="#giving-your-project-its-own-image" aria-hidden="true">#</a>Giving your project its own image</h2>
 <p>When agents keep installing the same toolchain (a language runtime, a database
 client, your project&#39;s dependencies), build it into an image instead. Write a
-Dockerfile, usually starting from the default image, and point <code>lazy.toml</code> at
-it:</p>
+<code>Dockerfile.lazy</code> at the root of your repository, usually starting from the
+default image:</p>
 <pre><code class="language-dockerfile">FROM lazy-runner
 RUN sudo apt-get update &amp;&amp; sudo apt-get install -y --no-install-recommends postgresql-client
 </code></pre>
+<p>No configuration is needed: when <code>[docker] dockerfile</code> is unset, lazy uses a
+<code>Dockerfile.lazy</code> at the project root, once it is committed on the checked-out
+branch. An uncommitted one, staged or not, is ignored (tasks use the default
+image and <code>lazy doctor</code> says so), because nobody has reviewed it yet. Lazy
+builds exactly the committed version: uncommitted edits to the file are not
+used, and it must be a regular file, not a symbolic link.</p>
+<p>On a Lazy Teams install that runs projects on the host&#39;s own Docker rather than
+in a virtual machine per project, a committed <code>Dockerfile.lazy</code> is not built
+automatically either: its build would run on a machine shared with other
+projects. Tasks there use the default image. The project gets a system message saying
+so, the agent is told the file will not change its container, and the task&#39;s
+launch progress says it too. The project owner can still choose the file explicitly with
+<code>[docker] dockerfile</code> in the project configuration.</p>
+<p>To use a file with another name or in
+another directory, name it instead (relative to the project root):</p>
 <pre><code class="language-toml">[docker]
-dockerfile = &quot;Dockerfile.lazy&quot;
+dockerfile = &quot;docker/agents.Dockerfile&quot;
 </code></pre>
-<p>The path is relative to the project root. If <code>FROM lazy-runner</code> names a base
-image that is not built yet, lazy builds it first. The build is done by the
-daemon on your machine, from the project root&#39;s copy of the file; an agent
-editing the Dockerfile on its task branch does not change the image your tasks
-run in. All <code>[docker]</code> settings, including <code>build_inputs</code> (rebuild when a
+<p>A file named there must exist — a missing one fails the launch rather than
+falling back to the default image, and so does a Dockerfile that fails to build
+(the error names the file and shows the end of the build output). If
+<code>FROM lazy-runner</code> names a base image that is not built yet, lazy builds it
+first. All <code>[docker]</code> settings, including <code>build_inputs</code> (rebuild when a
 lockfile changes), are in <a href="../lazy-toml/#docker">lazy.toml</a>.</p>
+<p>The build is done by the daemon, from the project root&#39;s copy of the file. An
+agent editing <code>Dockerfile.lazy</code> on its task branch does not change the image
+its own task runs in; the change takes effect for tasks started after that
+branch is accepted. Agents know this: when a task needs a toolchain the
+container lacks (asking for a Rust service in a project with no <code>cargo</code>, say),
+the agent adds it to <code>Dockerfile.lazy</code>, installs it in its own container for
+the task at hand, and tells you what it added.</p>
+<h3 id="when-dockerfilelazy-does-not-build"><a class="anchor" href="#when-dockerfilelazy-does-not-build" aria-hidden="true">#</a>When <code>Dockerfile.lazy</code> does not build</h3>
+<p>If the project&#39;s <code>Dockerfile.lazy</code> fails to build, nothing that needs an agent
+waits on it silently: builders start on the default image and say so, and a
+task&#39;s agent runs on the default image only if somebody confirms that on the
+task. On Lazy Teams the project page shows the failure and its build output,
+with two ways out:</p>
+<ul>
+<li><strong>Use <code>Dockerfile.lazy</code> from another branch or task</strong> (team admins). Pick a
+branch, or a task whose branch has a working file. Its committed file is shown
+next to the project branch&#39;s; on confirmation lazy builds it, with that
+branch&#39;s committed files as the build context, and only if it builds does the
+whole project — every builder and task — switch to it. The page says who
+adopted it and from where. Long lines wrap and long runs of spaces are drawn,
+so nothing hides past the edge; a file containing invisible or
+text-direction characters is marked where they are and cannot be adopted
+until they are removed. It stays in use when the project branch&#39;s own file
+changes later: the page says so and offers <strong>Switch back</strong>, and nothing
+switches until an admin chooses it. An adopted image also survives lazy
+upgrades, being rebuilt for the new version. On installs that run projects on
+the host&#39;s own Docker rather than in a virtual machine, this is not offered:
+the project owner names a Dockerfile in the project configuration instead.</li>
+<li><strong>Create a task to fix it.</strong> The new-task form arrives filled in with the
+build output. On projects that run in a virtual machine, the task&#39;s agent can
+check its fix with the <code>lazy_image_build</code> tool. It builds the task&#39;s own
+<code>Dockerfile.lazy</code> (including an uncommitted change to it) against the task&#39;s
+committed files, inside the project&#39;s virtual machine, and returns the
+output. The build runs in a separate builder of its own that is removed
+afterwards, so it shares no build cache with the project&#39;s real image and
+produces no image at all; it has no access to secrets, SSH keys or registry
+logins. Once it builds,
+an admin adopts the file from the task&#39;s branch as above.</li>
+</ul>
 <p>If your task containers need to be <em>created</em> with extra Docker flags (for
 example <code>--cap-add=SYS_PTRACE</code>), that is <code>[docker] run_args</code> — a container
 setting, not an image one, so no Dockerfile change can provide it.</p>
@@ -114,17 +186,96 @@ file to an image is one command:</p>
 </code></pre>
 <p>Chromium logs D-Bus and GPU warnings on every run in a container; they are noise,
 not failure. The exit code and a non-empty output file are the signals.</p>
+<h2 id="when-the-image-is-built"><a class="anchor" href="#when-the-image-is-built" aria-hidden="true">#</a>When the image is built</h2>
+<p>The daemon builds your project&#39;s image <strong>when it starts</strong>, in the background —
+not inside the first task or builder launch. Everything except running an agent
+keeps working while it builds: creating tasks, reviewing, commenting, browsing.
+Lazy Teams shows the build on the project page, the dashboard shows it at the
+top, and <code>lazy system runner-image</code> prints it.</p>
+<p>Until the image is ready:</p>
+<ul>
+<li><strong>A builder starts on lazy&#39;s default image</strong>, and says so in a banner.</li>
+<li><strong>An agent runs on the default image only if you confirm it.</strong> Start, resume
+and feedback ask first: in Lazy Teams and the dashboard with a &quot;run on the
+default image&quot; button or tick, at the terminal with a prompt (or
+<code>--default-image</code> / <code>--yes</code>), and over MCP with a confirmation code. If you
+would rather wait, do nothing; tasks waiting to be resumed automatically wait
+for the image too.</li>
+<li><strong>Questions and reviews never wait.</strong> Asking a task something and reviewing
+it are read-only, so they run on lazy&#39;s default image straight away, without
+a confirmation, and do not change which image the task&#39;s own work runs on.</li>
+<li><strong>Every turn shows the image it ran on</strong>, next to its agent and model.</li>
+<li><strong>A failed build stays visible</strong>, with its reason and the Dockerfile it came
+from, until you fix it and build again (the project page&#39;s &quot;Build it again&quot;,
+or <code>lazy system runner-image retry</code>). No launch quietly starts its own build.</li>
+</ul>
+<h3 id="watching-rebuilding-and-cancelling-the-build"><a class="anchor" href="#watching-rebuilding-and-cancelling-the-build" aria-hidden="true">#</a>Watching, rebuilding and cancelling the build</h3>
+<p>The build has a log you can follow while it runs: every line the container
+builder prints, each Dockerfile step with how long it took (or that it came
+from the cache), and where the build is — &quot;step 4 of 9&quot;. When a build fails,
+the step that failed is named with its own output, and the project&#39;s state
+says whether it is something you can fix (a step of your Dockerfile) or
+something for whoever runs the machine (the container runtime is down, the
+disk is full).</p>
+<pre><code class="language-sh">lazy system runner-image log --follow   # stream the build, step by step
+lazy system runner-image rebuild        # build again, even if it is up to date
+lazy system runner-image cancel         # stop the running build
+</code></pre>
+<p><strong>Rebuild</strong> builds the image again even when it is current (<code>--no-cache</code> also
+refetches everything the Dockerfile pulls). A rebuild of a ready image does not
+take it away: launches keep using it until the new one has built, and after a
+failed rebuild. <strong>Cancel</strong> stops the build at once. Adopting a Dockerfile from
+another branch in Lazy Teams is a build like any other: it returns straight
+away, and its log shows the branch being exported and checked before the build
+itself.</p>
+<p>Logs never show a credential: lazy removes every secret it holds — your
+credentials and the stand-ins it gives task containers — before a line reaches
+you. <code>lazy system machine</code> shows the rest of the machine the same way: the
+container runtime, the project daemon and its proxy, each one&#39;s recent log
+(<code>--logs</code>), and CPU, memory and disk use. On a Lazy Teams host shared by several
+projects, the host&#39;s name and its CPU, memory and disk figures are withheld,
+because they describe every project there.</p>
+<h2 id="resetting-a-machines-docker-storage"><a class="anchor" href="#resetting-a-machines-docker-storage" aria-hidden="true">#</a>Resetting a machine&#39;s Docker storage</h2>
+<p>On a Lazy Teams project&#39;s own machine, if Docker keeps running out of memory or
+its disk is full, its storage can be emptied and started clean. A project admin
+(or the installation&#39;s administrator in god mode) does it from the <strong>Machine</strong>
+page under <strong>Docker storage</strong>; an operator on the machine runs</p>
+<pre><code>lazy system machine reset-docker-storage    # asks first; --yes skips the question
+</code></pre>
+<p><strong>This deletes every image, container, volume and build cache on the machine</strong>
+and stops everything running in Docker, so it asks for confirmation. It then
+holds lazy&#39;s automatic Docker recovery off, stops Docker, unmounts everything
+under its storage, removes the storage without crossing a mount point, and
+starts Docker again, telling you each step as it happens (on the page, or in the
+terminal). A plain <code>rm -rf</code> of that directory is not a substitute: a Docker that
+was killed leaves its container mounts in place, and removal fails halfway.</p>
+<p><strong>Builds and task starts are cold afterwards</strong>: images are pulled again and
+layers rebuilt, so the first ones take longer. If a step fails, the page says
+which and Docker is started again anyway. Plain members do not see the button.</p>
+<p>Nothing switches back on its own once the image is ready. A task or builder
+that runs on the default image keeps a banner that turns into <strong>Restart with
+the project&#39;s image</strong>: for a task the switch applies from its next turn (a turn
+in progress is not interrupted; <code>lazy system runner-image use-project &lt;task&gt;</code>
+from a terminal), and for a builder it is a stop and a start that keeps the
+conversation.</p>
 <h2 id="rebuilding"><a class="anchor" href="#rebuilding" aria-hidden="true">#</a>Rebuilding</h2>
 <p>Lazy names a custom image after the content of its Dockerfile
-(<code>lazy-custom-&lt;hash&gt;</code>), so editing the Dockerfile in the project root rebuilds
-it on the next task launch — no manual step.</p>
+(<code>lazy-custom-&lt;hash&gt;</code>), so editing the Dockerfile in the project root makes
+the daemon build the new image the next time a launch asks for it — the launch
+itself waits or runs on the default image, as above.</p>
 <p>A Dockerfile&#39;s text says nothing about what it <em>pulls</em>: the same file builds a
-different image a month later. So lazy also rebuilds on two schedules:</p>
+different image a month later. So lazy also rebuilds an image it BUILT on two
+schedules:</p>
 <ul>
 <li><strong><code>lazy upgrade</code> always rebuilds</strong>, from scratch.</li>
-<li><strong>After 14 days</strong>, the next task launch rebuilds an older image once, without
-the build cache.</li>
+<li><strong>After 14 days</strong>, an older image is rebuilt once, without the build cache —
+when the daemon starts, or in the background while it runs. Launches keep
+using the current image until the new one is built.</li>
 </ul>
+<p>A default image that was pulled from a release is never rebuilt for its age.
+A default image lazy BUILT is replaced, when it reaches 14 days, by the
+published image if one exists, and rebuilt only if not. <code>lazy upgrade</code> pulls
+the newest published image instead of building one.</p>
 <p>The image <em>tag</em> is lazy&#39;s major.minor version (for example
 <code>lazy-custom-&lt;hash&gt;:0.22</code>); it is an identity, not a freshness signal.
 <code>lazy doctor</code> lists older images left behind. What happens during a rebuild, and
@@ -218,6 +369,25 @@ Nothing is deleted.
 worktree in an IDE.</p>
 <p>This protection does not rely on git&#39;s own &quot;dubious ownership&quot; check, which some
 setups (including container images that trust every directory) turn off.</p>
+<h3 id="git-hooks-do-not-run-on-lazys-own-git"><a class="anchor" href="#git-hooks-do-not-run-on-lazys-own-git" aria-hidden="true">#</a>Git hooks do not run on lazy&#39;s own git</h3>
+<p>lazy runs every git command of its own — the agent&#39;s commits, <code>lazy accept</code>&#39;s
+merge, syncs, worktree setup and pushes — with git hooks turned off
+(<code>core.hooksPath</code> pointed at nothing). A task branch can change files in your
+repository, including a hooks folder such as <code>.husky/</code> that your git config
+points at; if lazy ran those hooks, a task could run code on your machine
+outside its container just by being accepted.</p>
+<p>What that means for you:</p>
+<ul>
+<li><strong>Pre-commit checks (husky, lint-staged, <code>pre-commit</code>) do not run</strong> on
+commits lazy makes. Run them in the agent&#39;s own work instead — for example
+as a <code>[checks] post_turn</code> command, or with <code>[automation.pre_accept]</code>, which
+runs in a container before the merge.</li>
+<li><strong>Git LFS still uploads.</strong> git-lfs normally uploads files from its pre-push
+hook; when a branch lazy pushes tracks files with LFS, lazy runs
+<code>git lfs push</code> itself before the push.</li>
+<li><strong>Your own git is unchanged.</strong> Hooks still run when you commit or push
+yourself.</li>
+</ul>
 
 </main>
 </body>

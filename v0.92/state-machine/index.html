@@ -1,0 +1,1023 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Task State Machine and Crash Recovery — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
+<main class="wrap">
+<h1 id="task-state-machine-and-crash-recovery"><a class="anchor" href="#task-state-machine-and-crash-recovery" aria-hidden="true">#</a>Task State Machine and Crash Recovery</h1>
+<p>This page describes the statuses a lazy task moves through, which commands and
+events move it, and what lazy does when an agent crashes mid-turn.</p>
+<h2 id="how-a-turn-ends"><a class="anchor" href="#how-a-turn-ends" aria-hidden="true">#</a>How a turn ends</h2>
+<p>A task&#39;s status says where the task IS. It cannot say whether the agent thought
+it was finished: <code>blocked</code> reads exactly the same whether the agent delivered
+the whole task or simply ran out of budget halfway through. So an agent says
+which, and a turn ends in one of three ways.</p>
+<p>Nothing asks the agent which of the three it was — lazy reads the ending off
+what the turn did.</p>
+<ul>
+<li><strong>Declared done.</strong> The agent calls <code>lazy_final</code> — pencils down. The claim
+names the branch head at the moment it was made and is recorded on that turn,
+along with an optional one-line note. It is not a turn-end signal: the turn
+still ends when the agent stops, and an agent may keep working after declaring.
+Declaring is what starts an automatic review; it does not gate acceptance.</li>
+<li><strong>Needs input.</strong> The agent raised a blocking item (see
+<a href="../raised-items/">Raised items</a>). The task parks for a human decision.</li>
+<li><strong>Neither.</strong> The turn simply stopped — budget, watchdog, crash, or the agent
+said nothing. The task parks <code>blocked</code>.</li>
+</ul>
+<p>The last two look the same in the status: blocked is blocked whether or not
+anything was raised. What differs is the record — a blocking item, or none —
+and lazy labels the task from that.</p>
+<p><strong>You can accept from any of the three.</strong> A human-facing task gets its
+walkthrough whichever way the turn ended, precisely so the decision you are
+being asked to make has something to go on.</p>
+<p>The first two are exclusive. <code>lazy_final</code> refuses while a blocking item is open
+on the task, and names the item, because filing one is the agent having already
+chosen the other ending. The task&#39;s journal records which items parked it.</p>
+<h3 id="work-left-uncommitted-when-the-turn-ends"><a class="anchor" href="#work-left-uncommitted-when-the-turn-ends" aria-hidden="true">#</a>Work left uncommitted when the turn ends</h3>
+<p>A task is reviewed and merged from its <strong>commits</strong>. Anything an agent edits and
+never commits is in no diff, in no walkthrough, and in nothing <code>lazy accept</code>
+would carry — and it disappears with the worktree. The end of a turn is where
+this happens most: the checks that close a turn ask the agent to update docs or
+a changelog, and writing the file and forgetting the commit is an easy miss.</p>
+<p>Four things make that visible rather than silent.</p>
+<ul>
+<li><strong>The agent is asked, once, before the turn closes.</strong> When a turn is about to
+end with uncommitted paths, whether it declared itself done or parked for
+input, lazy names them and asks the agent once whether it has committed all
+its work — commit what belongs to the task, or say why it should stay
+uncommitted. A turn that declared itself done is additionally asked to commit
+or discard anything still loose, as its last check. These are questions, not
+a sweep: lazy never commits on an agent&#39;s behalf, because that would put
+content nobody reviewed — scratch output, a half-finished edit, a key someone
+pasted into the worktree — into the merge under the agent&#39;s name. Read-only
+turns are never asked.</li>
+<li><strong>Stopped background work is asked about first.</strong> If a turn ends while a
+background command the agent started is still running, Claude Code stops
+it. Lazy then asks the agent once, before the question about uncommitted
+work, whether it needed that command to finish, naming the command. If it
+did, it can run it again in the foreground; if not, it says so. Same rules:
+once per turn, never on read-only turns, recorded on the task as a
+&quot;Stopped Background Work Check&quot;.</li>
+<li><strong>Anything still loose is announced.</strong> If the agent does not commit or
+discard it (for example because it could not), the task gets an
+&quot;[Uncommitted work left behind]&quot; comment naming the paths, which the agent
+also receives on the next unblock, and a system message is filed so it is
+seen without opening the task.</li>
+<li><strong>The paths are on the turn record.</strong> <code>lazy show</code> puts the count on the turn
+and lists the paths in <code>--full</code>; the web review page shows the same count on
+the turn, with the paths in the tooltip.</li>
+<li><strong>Accept refuses, and says which files.</strong> A task whose worktree still holds
+uncommitted changes cannot be accepted, and the refusal names the paths and
+states that none of them is on the branch. Commit what belongs to the task,
+discard the rest, then accept.</li>
+</ul>
+<h3 id="a-declaration-is-about-a-sha-and-it-can-go-stale"><a class="anchor" href="#a-declaration-is-about-a-sha-and-it-can-go-stale" aria-hidden="true">#</a>A declaration is about a SHA, and it can go stale</h3>
+<p>Because a final names the head it was made at, the head can move afterwards — a
+sync merge, a commit made while pairing, a subtask accepted into a parent. None
+of those cancel the declaration; every surface that shows a final instead says
+so:</p>
+<pre><code>declared final at 9f3c1a2b; head has since moved (a sync)
+</code></pre>
+<p>What DOES cancel it is an agent going back to work: a later agent work turn that
+produces commits clears the declaration, and whoever did that work declares
+again when they are finished. A turn that committed nothing, a sync, a review, a
+question and the automated follow-ups all leave it standing.</p>
+<p><code>lazy show</code> prints the declaration (or <code>not declared</code>) next to the task&#39;s status,
+<code>lazy show --json</code> carries it as <code>final</code>, and the web review page leads with it.</p>
+<h2 id="task-status-state-machine"><a class="anchor" href="#task-status-state-machine" aria-hidden="true">#</a>Task Status State Machine</h2>
+<h3 id="status-definitions"><a class="anchor" href="#status-definitions" aria-hidden="true">#</a>Status Definitions</h3>
+<p>Lazy tasks can be in one of the following statuses:</p>
+<ul>
+<li><p><strong><code>backlog</code></strong> — Task created but not yet started. No session exists.</p>
+</li>
+<li><p><strong><code>working</code></strong> — Agent is actively working. Container/process is running.</p>
+</li>
+<li><p><strong><code>blocked</code></strong> — Agent completed a turn and is waiting for human review/feedback.</p>
+</li>
+<li><p><strong><code>conflict</code></strong> — Agent completed a turn but file permission violations were detected. Semantically &quot;blocked with a decision owed at merge time&quot;: the task is unblocked, resumed and paired exactly like a <code>blocked</code> one, and nothing reverts the violated files. Only <code>lazy accept</code> gates on them — every <em>pending</em> violated file must be approved there (all-or-nothing) or the accept is refused. A decision already made is sticky, and re-naming an approved file is always accepted. See <a href="../lazy-toml/#resolving-a-conflict-task">Resolving a conflict task</a>.</p>
+<p><strong><code>conflict</code> is derived, never set by hand.</strong> The set of pending violations decides it: a paused task is labelled <code>conflict</code> while that set is non-empty and <code>blocked</code> once it is empty. Every way a task comes to rest — a turn or sync finishing, a failed turn being parked, crash recovery, a pairing session ending, <code>lazy stop</code>, <code>lazy doctor &lt;task&gt;</code> — re-checks the set rather than simply writing <code>blocked</code>.</p>
+</li>
+<li><p><strong><code>submitted</code></strong> — The task&#39;s branch has an open pull/merge request waiting for review on the forge (<code>lazy submit</code>). It is a paused status like <code>blocked</code>: you can unblock it, review it, sync it, pair on it or accept it.</p>
+<p><strong>A sync or review puts <code>submitted</code> back when it ends.</strong> Merging upstream into the branch and running a review both move the task through <code>working</code> for the duration of the turn, because each needs an agent — but neither changes where the task stands with its reviewer, so each restores the status it found. That keeps the task in the submitted view and keeps PR-comment reactions (which only run on <code>submitted</code> tasks) switched on. A sync that fails in a way lazy will not retry — a dead credential, a bad model id, anything it parks for you rather than resuming — restores <code>submitted</code> too. A crash lazy <em>will</em> retry, or an agent killed outright without reporting, goes to <code>interrupted</code> instead and is resumed: the merge may be half applied, so the task is picked back up rather than called done. The other exception is a decision the reviewer still owes on a protected file: pending violations make the task <code>conflict</code> regardless, because that label is what <code>lazy accept</code> gates on.</p>
+<p><strong>A task finds its own PR/MR by its branch.</strong> If lazy does not have a PR/MR on record for a task — because lazy stopped right after the forge created it, or because someone opened it by hand — the daemon&#39;s background sync looks the PR/MR up by the task&#39;s branch and acts on what it finds. An open PR/MR is recorded on the task, so its comments, its merge and its link work as usual. A PR/MR that was merged into the task&#39;s target completes the task, but only when everything on the task&#39;s branch is already in the target; otherwise the task stays open and a comment explains why. If the PR/MR was merged into some other branch, the task is left alone and an alert says so. A closed PR/MR found this way changes nothing. Each outcome is recorded as a comment on the task. When lazy opens a PR/MR itself, it first checks whether the branch already has an open one and adopts it instead of opening a second.</p>
+</li>
+<li><p><strong><code>pairing</code></strong> — Human is working interactively with the task&#39;s agent, in the task&#39;s container (see <a href="../pairing/">Pairing</a>). <code>--host</code> is an explicit opt-in for tasks that have no container.</p>
+</li>
+<li><p><strong><code>interrupted</code></strong> — Agent crashed or was killed unexpectedly.</p>
+</li>
+<li><p><strong><code>merging</code></strong> — A merge is in flight: either an accept is merging the branch locally right now, or the task&#39;s PR/MR has been handed to the forge and is waiting for CI and merge (a later <code>lazy accept</code> asks the forge what happened). The task reads <code>merging</code> for the whole merge phase. If an accept dies partway (daemon restart, crash), the daemon resumes it rather than undoing it — you already said accept.</p>
+</li>
+<li><p><strong><code>zombie</code></strong> — System-only recovery state for tasks whose branch was merged but whose status was never updated (for example, <code>lazy accept</code> crashed after the merge). Lazy detects this and moves the task through <code>zombie</code> to <code>complete</code>.</p>
+</li>
+<li><p><strong><code>complete</code></strong> — Task accepted and merged successfully. When the accepted
+task had a parent <em>task</em> (a subtask, not a top-level task aimed at a bare
+branch), lazy also leaves a <code>[Subtask accepted]</code> comment on that parent with
+the merge commit SHA. The comment does not start a turn or unblock the
+parent; it shows up in the parent&#39;s next notes. <code>lazy wait</code> reports the same
+SHA as <code>head_sha</code> once the child is complete, so a parent that already waited
+can ignore a duplicate note. The same comment is written when a forge merge
+completes the task, and a missed comment is retried by the daemon.</p>
+</li>
+<li><p><strong><code>abandoned</code></strong> — Task rejected (<code>lazy reject</code>) or closed (<code>lazy close</code>, e.g. &quot;won&#39;t do&quot;, duplicate) by a human. Both commands resolve to this single terminal status; there is no distinct <code>closed</code> status. When the task had a parent <em>task</em>, that parent gets a <code>[Subtask removed]</code> comment naming the reason.</p>
+</li>
+</ul>
+<h3 id="a-parent-task-is-told-when-its-subtask-list-changes"><a class="anchor" href="#a-parent-task-is-told-when-its-subtask-list-changes" aria-hidden="true">#</a>A parent task is told when its subtask list changes</h3>
+<p>A task whose subtasks come and go gets a one-line comment each time, so its
+agent can see what happened on its next turn:</p>
+<ul>
+<li><code>[Subtask added] &lt;child&gt; — &quot;&lt;goal&gt;&quot;</code> when a subtask is created under it
+(<code>lazy create --parent</code>, the web New-task form, a clone or redo of a subtask,
+an agent creating one of its own subtasks), reparented into it, or reopened
+after having been closed.</li>
+<li><code>[Subtask removed] &lt;child&gt; — &quot;&lt;reason&gt;&quot;</code> when a subtask is closed, rejected or
+abandoned, and <code>[Subtask removed] &lt;child&gt; — reparented to &lt;parent&gt;</code> when it
+moves elsewhere.</li>
+<li><code>[Subtask accepted] &lt;child&gt; …</code> when a subtask is accepted and merged (see
+<code>complete</code> above). An accepted subtask is only ever reported this way — never
+also as removed.</li>
+</ul>
+<p>The quotes are deliberate: text somebody typed — the subtask&#39;s goal, the reason
+it was closed — is quoted so it reads as a quotation rather than as instructions
+to the parent&#39;s agent. Lazy&#39;s own wording, like <code>reparented to &lt;parent&gt;</code>, is
+not.</p>
+<p>Like every other lazy comment, these never start a turn and never unblock the
+parent: they show up in its next notes. A top-level task has no parent task, so
+nothing is written for it, and neither is anything written to a parent that is
+already <code>complete</code> or <code>abandoned</code>.</p>
+<h3 id="status-categories"><a class="anchor" href="#status-categories" aria-hidden="true">#</a>Status Categories</h3>
+<p><strong>Terminal statuses</strong> (task is finished, core fields frozen):</p>
+<ul>
+<li><code>complete</code>, <code>abandoned</code></li>
+</ul>
+<p><strong>Blocked statuses</strong> (waiting for human action):</p>
+<ul>
+<li><code>blocked</code>, <code>conflict</code>, <code>submitted</code></li>
+</ul>
+<p><strong>Active statuses</strong> (has active worktree that should not be merged into):</p>
+<ul>
+<li><code>working</code>, <code>interrupted</code>, <code>pairing</code>, <code>merging</code></li>
+</ul>
+<h3 id="valid-state-transitions"><a class="anchor" href="#valid-state-transitions" aria-hidden="true">#</a>Valid State Transitions</h3>
+<pre><code>backlog
+  → working       lazy start (creates session, launches agent)
+  → blocked       daemon (a backlog task whose branch already has commits)
+  → abandoned     lazy close (task canceled before starting)
+
+working
+  → blocked       daemon (agent turn completes)
+                  | daemon (the agent failed in a way retrying cannot fix —
+                    see &quot;Agent Failure Classification&quot; below; NOT auto-resumed)
+  → conflict      daemon (agent turn completes with file permission violations)
+                  | lazy accept (a failed acceptance gate restores the status the task had before)
+  → submitted     lazy accept (same restore, for a task that was submitted)
+                  | daemon (a sync or review turn ends on a task that was
+                    submitted — the turn restores the status it found; a sync
+                    that failed in a way lazy will not retry restores it too,
+                    while one it will retry goes to `interrupted` instead)
+  → interrupted   daemon (the agent&#39;s container or process died without finishing the turn)
+  → merging       daemon (the task&#39;s PR/MR was merged on the forge)
+  NOTE: working cannot transition to pairing or abandoned — the agent is running.
+  NOTE: accept flips the task to `working` while the acceptance gate runs and
+        restores the status it actually had if the gate fails.
+
+blocked
+  → working       lazy unblock (human gives feedback)
+  → conflict      any park that re-checks the label and finds pending
+                  violations (see &quot;conflict is derived&quot; above)
+  → pairing       lazy pair (human wants to work interactively)
+  → submitted     lazy submit (opens a PR/MR for review)
+  → merging       lazy accept (begins merge process)
+  → abandoned     lazy reject (rejects the work) | lazy close (canceled without accept/reject)
+  → backlog       daemon (a blocked task with no session is moved back to backlog)
+  NOTE: blocked cannot go directly to complete — must go through merging first.
+
+conflict
+  → working       lazy unblock (feedback, like any blocked task) | lazy resume
+                  | auto-resume / auto-delivery
+  → blocked       any park that re-checks the label after every violation was
+                  approved on the review page
+  → pairing       lazy pair (human wants to work interactively on violations)
+  → submitted     lazy submit
+  → merging       lazy accept (once every pending violation is approved)
+  → abandoned     lazy reject | lazy close
+
+submitted
+  → working       lazy unblock | lazy sync | lazy review
+                  (each of these runs a turn; sync and review restore
+                  `submitted` when the turn ends, an unblock does not — feedback
+                  means the task is being worked on again)
+  NOTE: `lazy resume` and `lazy ask` do NOT apply to a submitted task. Resume is
+        for picking a task back up where its turn stopped (interrupted, blocked
+        or conflict only); a review question runs only on a blocked or conflict
+        task. Send feedback with `lazy unblock`, or run `lazy review`.
+  → merging       lazy accept (merges the reviewed branch)
+  → pairing       lazy pair (human wants to work interactively)
+  → abandoned     lazy reject | lazy close
+  → blocked       lazy itself, in one case only: the task was re-parented (its
+                  parent was accepted or closed, or `lazy reparent`), and its
+                  pull/merge request could not be moved to the new target, so
+                  lazy closed it — the task no longer awaits a forge review
+  NOTE: otherwise submitted does not go directly to blocked or conflict. It
+        leaves through a turn (via `working`), an accept, a pairing session, or
+        rejection — a finished sync or review puts `submitted` back rather than
+        re-labelling the task, unless a protected-file decision is owed.
+
+interrupted
+  → working       auto-resume (daemon, circuit breaker allows) | lazy resume
+                  | daemon (the agent&#39;s answer arrived after the task was
+                    marked interrupted; it is recorded via working → blocked)
+  → pairing       lazy pair (human investigates interactively)
+  → merging       daemon (the task&#39;s PR/MR was merged on the forge)
+  → abandoned     lazy reject | lazy close
+  NOTE: interrupted cannot go to complete directly, and `lazy accept` does not
+        take an interrupted task — resume or unblock it first.
+
+pairing
+  → blocked       pairing ends (the session exits) | daemon (the pairing process is gone)
+  → conflict      same two paths, when the task still owes a decision on
+                  file-permission violations
+
+merging
+  → complete      lazy accept (checks pass, merge succeeds) | daemon (merge completed)
+  → blocked       lazy accept (checks fail) | daemon (PR/MR closed on the forge)
+  → conflict      lazy accept (merge phase aborts on a task that was in conflict)
+  → submitted     lazy accept (merge phase aborts on a task that was submitted)
+  NOTE: merging cannot go to abandoned — merge either succeeds or fails back to
+        the status the task held before the accept. A task in `conflict`
+        (unresolved violations) or `submitted` (open PR awaiting review) is not
+        `blocked`, so every abort restores the true prior status.
+  NOTE: the merge is the accept&#39;s commit point. The moment it lands the task
+        becomes `complete`; fast-forwarding the local branch, pushing the
+        parent, tagging, re-parenting children and cleanup happen AFTER, and a
+        failure there is reported as a failure (non-zero exit, the step named)
+        and retried by the daemon — it never moves the task out of `complete`.
+  NOTE: an accept that DIES (daemon restart, crash, kill) leaves the task in
+        `merging`. The daemon RESUMES it, whether it died before or after its
+        merge landed: a merge that already landed is recognised and not
+        repeated. While that resume is pending, `lazy reject`, `close`, `submit`
+        and `unblock` refuse (they would undo an accept that may already have
+        merged); `lazy accept` resumes it immediately. After three failed
+        automatic resumes the daemon stops, files a system message, and those
+        commands work again to recover the task to a resting status — except
+        when the work has already landed on the target: then they refuse and
+        point you at `lazy accept`, which finishes the accept instead of
+        undoing it. `lazy doctor` reports anything sitting in `merging`.
+
+zombie (system-only)
+  → complete      daemon (the task&#39;s branch is found merged)
+  NOTE: any non-terminal → zombie (system actor only). Terminal statuses cannot go to zombie.
+
+complete
+  → blocked       lazy reopen --reason &quot;...&quot; (reopen accepted task)
+  → backlog       lazy reopen (reopen accepted task with no session)
+
+abandoned
+  → backlog       lazy reopen (reopen rejected/closed task with no agent work)
+  → blocked       lazy reopen (reopen rejected/closed task with agent work)
+</code></pre>
+<h3 id="actors-turn--transition-provenance"><a class="anchor" href="#actors-turn--transition-provenance" aria-hidden="true">#</a>Actors (turn &amp; transition provenance)</h3>
+<p>Every turn and status transition records an <strong>actor</strong> — who caused it. This is
+provenance only: it never changes what a command does, it records who did it.</p>
+<p>There are five actors:</p>
+<ul>
+<li><strong><code>human</code></strong> — a person using the <code>lazy</code> CLI.</li>
+<li><strong><code>builder</code></strong> — an AI orchestrator driving lazy through its MCP tools
+(<code>lazy_start</code>, <code>lazy_unblock</code>, etc.).</li>
+<li><strong><code>agent</code></strong> — a task&#39;s own agent driving its OWN subtree through the same MCP
+tools (creating, starting, unblocking, and accepting its own subtasks). An
+agent accepting its subtask is therefore never recorded as a human&#39;s or the
+builder&#39;s decision.</li>
+<li><strong><code>system</code></strong> — the daemon acting on its own (status changes it detects,
+crash auto-resume).</li>
+<li><strong><code>supervisor</code></strong> — lazy&#39;s per-task supervisor, for the follow-up prompts it
+sends the agent itself (push-back and maintain checks).</li>
+</ul>
+<p><strong>The actor records the channel, not who wrote the words.</strong> A command that
+arrives over MCP is <code>builder</code>; the same command over the CLI is <code>human</code>. When a
+builder relays a human&#39;s feedback through <code>lazy_unblock</code>, the turn is still
+<code>builder</code> — the actor records who submitted it, not who authored it. The content
+is stored as written either way.</p>
+<p>Everything an operation writes carries its one actor: the turn, every status
+change it makes, and any comment it leaves — for commands that start a turn
+(start, unblock, ask, resume, stop, sync), for those that do not (reject, close,
+submit, reparent), for task creation and for journal entries. <code>lazy show</code>, the
+web dashboard and <code>lazy_show</code> label each human-side turn with its actor, so
+<code>builder</code> and <code>supervisor</code> turns are distinguishable from what a person typed.</p>
+<p><strong>An absent actor means the default.</strong> An agent&#39;s own reply never carries an
+actor (it is labelled by its role instead). On any other turn or status change,
+no actor means a CLI/human action. Commands that start a turn always record
+their actor explicitly, <code>human</code> included.</p>
+<h3 id="text-intake-is-sanitized-at-the-boundary"><a class="anchor" href="#text-intake-is-sanitized-at-the-boundary" aria-hidden="true">#</a>Text intake is sanitized at the boundary</h3>
+<p>Every prompt lazy sends an agent is passed on the agent&#39;s command line, where a
+raw NUL byte is illegal. So every place lazy takes in text — <code>lazy unblock</code>,
+<code>comment</code> and <code>create</code>, the <code>$EDITOR</code> and piped-stdin paths, every MCP tool
+argument, and auto-delivered PR comment and CI text — sanitizes it <strong>before
+saving it</strong>. Non-printable control characters (C0 except tab/LF/CR, DEL, and C1)
+are replaced with printable escapes: a NUL becomes the six characters <code>\u0000</code>.</p>
+<p>For free-text arguments that become prose in a prompt (<code>feedback</code>, <code>message</code>,
+<code>prompt</code>, <code>note</code>, <code>reason</code>, <code>question</code>, <code>goal_context</code>), a short note is appended
+saying a substitution was made, so it is visible rather than silent. Strings
+that are <em>not</em> prose are escaped <strong>without</strong> that note: short single-line fields
+like a task goal, and file-path lists such as <code>files</code> and <code>approved_files</code>,
+where an appended paragraph would corrupt the path.</p>
+<p>The policy is <strong>sanitize and deliver, never reject</strong>: rejecting would discard
+feedback at exactly the moment you finished typing it. Nothing is dropped — only
+re-encoded. Ordinary text passes through byte-for-byte.</p>
+<h3 id="transition-triggers"><a class="anchor" href="#transition-triggers" aria-hidden="true">#</a>Transition Triggers</h3>
+<p>The CLI commands below record the <code>human</code> actor; each has an MCP equivalent
+(<code>lazy_start</code>, <code>lazy_unblock</code>, …) that makes the same transition but records
+<code>builder</code> (or <code>agent</code>, when the caller is a task agent acting inside its own
+subtree).</p>
+<h4 id="human-actions-cli-commands"><a class="anchor" href="#human-actions-cli-commands" aria-hidden="true">#</a>Human Actions (CLI commands)</h4>
+<ul>
+<li><p><strong><code>lazy start &lt;task&gt;</code></strong> — backlog → working</p>
+<ul>
+<li>Creates the session, the worktree and the container, then launches the agent</li>
+<li>Narrates itself phase by phase — see <a href="#command-observability">Command observability</a></li>
+</ul>
+</li>
+<li><p><strong><code>lazy unblock &lt;task&gt;</code></strong> — blocked|conflict|interrupted|submitted → working</p>
+<ul>
+<li>Opens $EDITOR for your feedback (or reads from <code>--message</code>/stdin)</li>
+<li>Records your feedback as a turn, then launches the agent</li>
+<li>To merge upstream first, run <code>lazy sync &lt;task&gt;</code> separately — unblock does not</li>
+<li>Narrates itself phase by phase — see <a href="#command-observability">Command observability</a></li>
+</ul>
+</li>
+<li><p><strong><code>lazy resume &lt;task&gt;</code></strong> — interrupted|blocked|conflict → working</p>
+<ul>
+<li>Manual recovery, e.g. after the auto-resume circuit breaker fires</li>
+<li>Same as unblock but without feedback</li>
+<li>Pending protected-file violations do NOT refuse it: no turn reverts a file,
+so the decision stays owed at <code>lazy accept</code> and the work can continue.
+Auto-resume and auto-delivery treat such tasks the same way</li>
+<li>Narrates itself phase by phase — see <a href="#command-observability">Command observability</a></li>
+</ul>
+</li>
+<li><p><strong><code>lazy pair &lt;task&gt;</code></strong> — blocked|conflict|interrupted|submitted → pairing</p>
+<ul>
+<li>Launches the task&#39;s agent interactively inside the task&#39;s container,
+resuming its session if it has one (<code>--host</code> runs it on the host instead,
+and is refused unless asked for — see <a href="../pairing/">Pairing</a>)</li>
+<li>On exit, records a summary turn and returns the task to blocked (or
+<code>conflict</code>, if violations are still pending)</li>
+</ul>
+</li>
+<li><p><strong><code>lazy ask &lt;task&gt;</code></strong> — blocked|conflict → working → blocked|conflict (status-neutral)</p>
+<ul>
+<li>Read-only: resumes the agent session (plan mode plus hard tool denials) to
+answer one question</li>
+<li><strong>Only when the session can be resumed.</strong> For any other task — finished,
+session ended, worktree gone — the question is answered from the task&#39;s
+stored record by a throwaway read-only agent instead. That route touches no
+status at all (not even the transient <code>working</code> below), takes no worktree
+lock, and records no turn; the answer states where it came from. A task that
+has never run is the one case with nothing to answer from.</li>
+<li>Opens $EDITOR for the question (or reads from <code>--message</code>/stdin)</li>
+<li>Records the question as a turn before launching, and the answer as an agent turn</li>
+<li>Restores the status the task had before the ask when the turn ends — on
+success and on error — so an ask never changes task state. The brief
+<code>working</code> just marks the task busy while the agent answers</li>
+<li>The one exception is a timeout: the task stays <code>working</code> so an answer that
+still arrives can be recorded; it then parks as <code>blocked</code> or <code>conflict</code> as usual</li>
+<li>If the agent crashes mid-ask the task lands in <code>interrupted</code> like any other turn</li>
+<li>A second <code>lazy ask</code> on a task that is already answering one is refused</li>
+<li>Narrates itself phase by phase — see <a href="#command-observability">Command observability</a>.
+The narration goes to stderr, so the answer on stdout stays pipeable, and
+<code>--json</code> prints no narration at all</li>
+</ul>
+</li>
+<li><p><strong><code>lazy chat &lt;task&gt;</code></strong> — no transition at all (status-neutral)</p>
+<ul>
+<li>On a <code>blocked</code>/<code>conflict</code> task: resumes the agent session interactively in the
+worktree, read-only (same denials as ask). No status change, no turn, no
+commits — the only lasting effect is the session log saved on exit</li>
+<li>Holds the worktree lock for the chat&#39;s duration, so start/unblock/sync/resume
+refuse while a chat is open rather than starting a turn underneath it</li>
+<li>On a terminal task: resumes the saved session in the project root (no
+worktree exists)</li>
+</ul>
+</li>
+<li><p><strong><code>lazy accept &lt;task&gt;</code></strong> — blocked|conflict|submitted → merging → complete</p>
+<ul>
+<li>Refuses if uncommitted changes exist</li>
+<li>For remote tasks: creates/updates the PR/MR, waits for checks<ul>
+<li>If the merge succeeds immediately → merging → complete</li>
+<li>If checks are pending or approval is needed → stays merging</li>
+</ul>
+</li>
+<li>For local tasks: squash-merges into the parent branch → complete</li>
+<li>Ends the session and cleans up container/worktree/branch — after the task
+is already <code>complete</code>: a failure there exits non-zero and is retried by the
+daemon, but the accept stands</li>
+<li>Narrates itself phase by phase — see <a href="#command-observability">Command observability</a></li>
+<li>Status tracks the phase in flight: plain <code>working</code> while the opt-in
+acceptance gate runs, <code>merging</code> for the whole merge phase. Every abort
+restores the status the task actually had before the accept</li>
+<li>If the acceptance gate&#39;s run disappears without answering, the accept aborts
+within seconds — reporting the run&#39;s exit code and last output, restoring
+the task&#39;s prior status, and recording the reason on the task — instead of
+waiting out the gate&#39;s full budget. The merge only proceeds on a verdict
+that actually came from the gate</li>
+<li>Two accepts of the same task at once (say, a human and a builder) never
+both merge: the second waits, sees the task already accepted, and says so</li>
+<li>The parent must not be active (working/pairing/merging/interrupted) —
+merging into a live worktree would corrupt whatever is running in it. ONE
+exemption: a task&#39;s own agent accepting one of its direct subtasks over MCP
+while the parent is <code>working</code> (the agent asking is the one in that
+worktree), or a human pairing on the parent in its container accepting from
+that session while it is <code>pairing</code>. The caller&#39;s task identity comes from the token the daemon issued for its session, never
+from anything the caller sends, so a CLI caller or a different task can
+never claim it (see <a href="../lazy-agent-design/#identity-comes-from-the-token-not-the-url">Identity comes from the token, not the
+URL</a>).
+<code>merging</code> and <code>interrupted</code> still refuse for everyone. Host pairing
+(<code>lazy pair --host</code>) does not get the exemption</li>
+<li>Uncommitted work in the destination worktree does not block the merge and
+is never lost: the accept sets it aside, merges, and puts it back. If it
+cannot be put back cleanly, the merge still stands and lazy reports where the
+work was kept and how to recover it</li>
+<li>Over MCP, a task agent may accept a DIRECT SUBTASK ONLY, never its own task:
+accepting means &quot;merge upward and mark complete&quot;, so accepting yourself
+would skip the review the task exists for. Accepting a child merges into the
+agent&#39;s own branch, which a human still reviews when that task is accepted.
+Other agent tools allow the agent&#39;s own task or a direct child. The builder
+is unrestricted</li>
+</ul>
+</li>
+<li><p><strong><code>lazy reject &lt;task&gt;</code></strong> — blocked|conflict|interrupted|submitted → abandoned</p>
+<ul>
+<li>On a <code>working</code> task, stops the agent first (working → interrupted → abandoned)</li>
+<li>Opens $EDITOR for the rejection reason</li>
+<li>Ends the session, cleans up container/worktree/branch</li>
+<li>Narrates itself phase by phase — see <a href="#command-observability">Command observability</a></li>
+</ul>
+</li>
+<li><p><strong><code>lazy close &lt;task&gt;</code></strong> — backlog|blocked|conflict|interrupted|submitted → abandoned</p>
+<ul>
+<li>On a <code>working</code> task, stops the agent first (working → interrupted → abandoned)</li>
+<li>Opens $EDITOR for the close reason</li>
+<li>Ends the session, cleans up container/worktree/branch</li>
+<li>Resolves to the same <code>abandoned</code> status as <code>lazy reject</code>; the two differ only in intent/reason</li>
+<li>Narrates itself phase by phase — see <a href="#command-observability">Command observability</a></li>
+</ul>
+</li>
+<li><p><strong><code>lazy reopen &lt;task&gt;</code></strong> — complete|abandoned → blocked|backlog</p>
+<ul>
+<li>For complete tasks: requires <code>--reason</code>, resets the session, returns to blocked</li>
+<li>For abandoned tasks: returns to blocked if the task had agent work, otherwise backlog</li>
+<li>A task that ran comes back on its OWN branch at its last head: the local branch if it still exists, otherwise the task branch on the remote — unless lazy recorded newer work the remote never received, which is restored instead (the output says the remote is behind; <code>lazy sync</code> merges it back) — otherwise the last commit lazy recorded for it. If none can be found, reopen refuses and changes nothing — it never starts a task empty (<code>lazy clone</code> / <code>lazy redo</code> do that)</li>
+<li>The restored branch keeps its own history; if the parent moved meanwhile, run <code>lazy sync</code> to bring it in. Nothing is pushed</li>
+<li>Reopening an accepted task supersedes that accept: lazy remembers which accept it was, never treats it as a crashed accept to recover, and <code>lazy show</code> prints &quot;reopened after accept at <commit>&quot; until the task is accepted again</li>
+</ul>
+</li>
+</ul>
+<h4 id="agent-actions"><a class="anchor" href="#agent-actions" aria-hidden="true">#</a>Agent Actions</h4>
+<ul>
+<li><p><strong>Agent turn completes</strong> — working → blocked | conflict</p>
+<ul>
+<li>The agent&#39;s turn is recorded</li>
+<li>If the turn produced file permission violations, or earlier ones are still
+unresolved → conflict; otherwise → blocked</li>
+<li>A turn that runs no permission check (an ask, a sync) never clears
+violations that are still pending</li>
+</ul>
+</li>
+<li><p><strong>Agent crashes</strong> — working → interrupted</p>
+<ul>
+<li>The container or process exits without finishing the turn</li>
+<li>Auto-resume may kick in (see <a href="#crashresume-lifecycle">Crash/Resume Lifecycle</a> below)</li>
+</ul>
+</li>
+</ul>
+<h4 id="system-actions-daemon"><a class="anchor" href="#system-actions-daemon" aria-hidden="true">#</a>System Actions (daemon)</h4>
+<p>The daemon keeps checking task state in the background and fixes up anything
+that has changed underneath it:</p>
+<ul>
+<li><strong>Working tasks</strong> — a finished turn is recorded and the task parks <code>blocked</code>
+(or <code>conflict</code>). A task whose agent has died without finishing gets a crash
+turn recorded — so <code>lazy show</code> shows what happened — and moves to
+<code>interrupted</code>, where auto-resume may pick it up.</li>
+<li><strong>Late answers</strong> — if an agent&#39;s answer arrives after its task was already
+marked <code>interrupted</code>, it is still recorded and the task parks <code>blocked</code>.</li>
+<li><strong>Leftover containers</strong> — containers still around for <code>complete</code> or
+<code>abandoned</code> tasks are removed.</li>
+<li><strong>Branches merged elsewhere</strong> — a task whose branch is found merged into its
+target is completed (via <code>zombie</code>).</li>
+<li><strong>Dead pairing sessions</strong> — a task left in <code>pairing</code> after its session ended
+returns to <code>blocked</code>.</li>
+<li><strong>Blocked tasks with no session</strong> — moved back to <code>backlog</code>, which is where
+unstarted work belongs.</li>
+</ul>
+<h2 id="only-one-turn-runs-at-a-time"><a class="anchor" href="#only-one-turn-runs-at-a-time" aria-hidden="true">#</a>Only one turn runs at a time</h2>
+<p>A task never has two turns dispatched at once. If an unblock, an ask and an
+automatic sync arrive together, the first one to claim the task wins, and the
+others see the task is busy:</p>
+<ul>
+<li>an ask or unblock is refused (409) <strong>before</strong> anything is recorded, so no
+feedback is lost — send it again once the task is idle;</li>
+<li>a sync re-queues itself and is reported as <code>pending_sync</code>, naming the status
+it stood down for, and runs later.</li>
+</ul>
+<p>A turn is only dispatched from <code>blocked</code>, <code>conflict</code>, <code>submitted</code> or
+<code>interrupted</code>. A task in <code>pairing</code> or <code>merging</code> is never handed a new turn.</p>
+<h2 id="command-observability"><a class="anchor" href="#command-observability" aria-hidden="true">#</a>Command observability</h2>
+<p>Several CLI commands can run for seconds or minutes — starting a task (worktree
+creation, branch publish, container launch), unblocking with feedback, merging
+upstream into a task, asking its agent a question, accepting a merge, or
+closing/rejecting a task (stopping the agent, remote PR cleanup, worktree
+teardown). They narrate what they are doing, phase by phase.</p>
+<p><strong>How it looks on the terminal.</strong> Before work begins, the command prints a
+numbered plan of the phases it expects to run. As each phase starts and
+finishes, you get a line — on a TTY the open phase repaints with a live elapsed
+counter; in piped or CI output the lines are append-only. Optional phases that
+do not apply (for example publishing a branch for a linked task, or stopping an
+agent that is not running) are listed up front and then reported as skipped with
+a reason.</p>
+<p><strong>A long phase keeps saying so.</strong> Some phases do their work without anything to
+report as they go — fetching an upstream branch, creating a container. On a TTY
+the elapsed counter on the open line already shows that; in piped or CI output,
+where there is no line to repaint, the command adds a <code>still running (…)</code> line
+for the phase whenever roughly five seconds have passed with nothing printed. A
+phase that finishes quickly adds nothing. These lines follow the daemon&#39;s own
+liveness, so they stop when it stops — silence still means something is wrong.</p>
+<p><strong>Pre-flight is always a prelude.</strong> Every command runs validation first — task
+and session checks, runner availability, dirty-worktree guards — and narrates
+that as an unnumbered step. The numbered plan is announced only once pre-flight
+knows which path applies.</p>
+<p>The MCP tools for the same operations relay the same phases as progress
+notifications.</p>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Typical phases (after pre-flight)</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>lazy start</code></td>
+<td>Resolve integration base → create worktree → publish branch (when applicable) → launch agent</td>
+</tr>
+<tr>
+<td><code>lazy unblock</code></td>
+<td>Prepare worktree → record feedback turn → launch agent; plus resolve file-permission violations when the task has any</td>
+</tr>
+<tr>
+<td><code>lazy sync</code></td>
+<td>Check task branch on origin → fetch and resolve upstream → compare with upstream → prepare worktree → launch agent to merge</td>
+</tr>
+<tr>
+<td><code>lazy reparent</code></td>
+<td>Repoint task to new parent → then the whole sync plan above, as one continuous checklist</td>
+</tr>
+<tr>
+<td><code>lazy resume</code></td>
+<td>Prepare worktree → launch agent</td>
+</tr>
+<tr>
+<td><code>lazy ask</code></td>
+<td>Prepare worktree → launch agent → wait for the agent&#39;s answer</td>
+</tr>
+<tr>
+<td><code>lazy accept</code></td>
+<td>Branch-protection and merge gates → merge description → merge → finalize → clean up</td>
+</tr>
+<tr>
+<td><code>lazy close</code></td>
+<td>Update task status → clean up worktree (when the task had a session); stop running agent first when applicable</td>
+</tr>
+<tr>
+<td><code>lazy reject</code></td>
+<td>Same as close, plus close the remote PR/MR when one exists. The reason is recorded on the task; nothing is written to the PR</td>
+</tr>
+</tbody></table>
+<p><code>lazy submit</code> is not in this table: it pushes the branch and marks the PR/MR
+ready for review, and launches no turn. It asks first: a protected target
+is a yes/no prompt (default No); an unprotected or unknown target requires
+typing the branch name or the task code. <code>--yes</code> skips that. MCP
+<code>lazy_submit</code> uses a <code>confirmation_code</code> instead — there is no <code>--yes</code>.</p>
+<p><strong>Inside the launch phase.</strong> Launching an agent is where a command can go quiet
+for the longest, because it may have to build the container image first. That
+interior is narrated under the launch phase itself, as indented continuation
+lines: which image is being resolved, whether a task-pinned or adopted image is
+in use, why a build is needed (no image for this lazy version yet, the Dockerfile
+or its inputs changed, or the image is older than the maximum age), the build&#39;s
+own output throttled to a readable rate, a <code>still building (…)</code> heartbeat while
+Docker is quiet, and finally whether the container was created or an already
+running one was reused. On a TTY these update the phase&#39;s line in place; piped,
+they append. The phase does not settle until the agent is actually launched, so
+the elapsed counter keeps running honestly throughout.</p>
+<p>Narration is strictly observational — it never changes whether the command
+succeeds or fails, and a phase is only marked failed when the command itself
+fails. A sync that finds nothing to merge still settles its compare phase with
+&quot;already up to date&quot; and reports the remaining phases as skipped, rather than
+ending in silence; a sync whose fetch fails is not an error either — it queues
+the task for retry and says so on the upstream phase&#39;s own line.</p>
+<h3 id="lazy-sync-reconciles-two-things-in-order"><a class="anchor" href="#lazy-sync-reconciles-two-things-in-order" aria-hidden="true">#</a><code>lazy sync</code> reconciles two things, in order</h3>
+<p>A task can be behind in two different ways, and sync handles both on the task&#39;s
+own branch:</p>
+<ol>
+<li><strong>The task&#39;s own branch on origin.</strong> If a colleague has pushed commits to
+<code>origin/&lt;task-branch&gt;</code> — a review fix, a rebase of your work, a hand-written
+patch — those commits are merged into the worktree first. When the local
+branch is simply behind, this fast-forwards; when both sides have moved, it
+is a real merge, and any conflict is resolved by the task&#39;s own agent. The
+step is skipped, with a one-line reason on its own phase, when the remote
+driver is <code>local</code>, when lazy is offline, or when the branch is not on origin
+yet.</li>
+<li><strong>The parent branch.</strong> Fetched and merged into the task branch.</li>
+</ol>
+<p>Neither step ever touches, merges into, or pushes the parent branch — syncing a
+child does not reconcile its parent. Both merges are recorded on the task, so
+<code>lazy show</code> and the web review page name the ref and commit each one brought in
+(&quot;Merged origin/lazy/my-task @ 4f2ab19&quot;, then &quot;Merged main @ 9c1de07&quot;).</p>
+<p>Sync itself never pushes. The reconciled branch reaches origin through the push
+that follows a turn, and through <code>lazy accept</code>.</p>
+<h3 id="accept-specific-behavior"><a class="anchor" href="#accept-specific-behavior" aria-hidden="true">#</a>Accept-specific behavior</h3>
+<p><strong>Accept does not need a declaration.</strong> It works from any park where the turn
+ended normally — declared done, parked for a decision, or simply stopped — and
+requires only that every open blocking item is resolved in the same command.
+Deciding those items with the work in front of you IS the declaration.</p>
+<p>The one park accept refuses is <code>interrupted</code>: a turn that was killed (watchdog,
+container death, <code>lazy stop</code>, a closed pairing session) has an unknown ending,
+because the agent never got to stop. Resume or unblock it first, or close it.
+Like every other acceptance precondition — branch sync, protection preflight,
+the review-issues gate — this is checked before anything is written, so a
+refusal leaves the task exactly as it was.</p>
+<p>An accept can run for minutes — an opt-in acceptance gate, remote pushes, an
+LLM-written merge description, the merge itself. The announced plan is the plan
+that runs: the acceptance gate appears in it only when enabled, and a later
+<code>lazy accept</code> on a task already waiting on the forge shows a shorter plan (check
+remote state → finalize → clean up).</p>
+<p><strong>The merge description is an enhancement, never a gate.</strong> It is written by a
+one-shot agent run outside every git checkout, with write tools disabled and a
+ten-minute limit. If it fails or times out, the accept falls back to a plain
+list of the commits and proceeds. See
+<a href="../conversation-import/#where-a-one-shot-runs">conversation-import.md</a>.</p>
+<p><strong>Status during an accept.</strong> The narration tells the caller who is watching what
+the accept is doing; the task&#39;s status tells everyone else (<code>lazy list</code>,
+<code>lazy show</code>, MCP):</p>
+<table>
+<thead>
+<tr>
+<th>Accept phase</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Acceptance gate (opt-in)</td>
+<td><code>working</code></td>
+</tr>
+<tr>
+<td>Merge phase (description, merge, finalize)</td>
+<td><code>merging</code></td>
+</tr>
+<tr>
+<td>Aborted at any point</td>
+<td>the status held before the accept</td>
+</tr>
+</tbody></table>
+<p>No agent turn runs during the gate, so the task shows a bare <code>working</code> with no
+agent substate.</p>
+<h2 id="working-but-not-alive"><a class="anchor" href="#working-but-not-alive" aria-hidden="true">#</a>Working, but not alive</h2>
+<p><code>working</code> is where the task is in its lifecycle; the part in brackets is what
+lazy can see running for it right now. <code>working(not-alive)</code> means the task is
+still recorded as mid-turn but nothing is running for it and no answer is
+waiting — the turn&#39;s process has died. It is a short-lived state: once the
+turn is at least 30 seconds old, the daemon&#39;s next check (every few seconds)
+either recovers a turn that had finished its work to <code>blocked</code>, or records the
+crash, moves the task to <code>interrupted</code> and resumes it automatically.</p>
+<p>Two things that look similar are not that:</p>
+<ul>
+<li><strong><code>working(launching)</code></strong> — the daemon is still starting the turn&#39;s container
+or process. Building the container image on a fresh machine or after an
+upgrade can take minutes; the task is not dead, it has not started yet.</li>
+<li><strong>A running review</strong> — <code>lazy review</code> runs its reviewer separately from the
+task&#39;s own agent, and the task reads <code>working(agent:reviewing)</code> for as long as
+the reviewer is running. If the reviewer dies without answering, the review is
+recorded as failed and the task goes back to the status it had before. A
+review or <code>lazy ask</code> that was running when the daemon restarted cannot finish
+— the restart cuts it off from the model — so the new daemon stops it, records
+it as failed, and puts the task back the same way.</li>
+<li><strong>Plain <code>working</code>, no brackets</strong> — the run is starting up or its answer is
+being collected, or the container runtime did not answer when lazy asked
+about the run (a busy Docker, for example), so its liveness is unknown rather
+than dead. <code>lazy daemon health</code> names that last case as a warning with the
+reason.</li>
+</ul>
+<p>A task that reads <code>working(not-alive)</code> for more than a minute or so is a bug
+worth reporting. Include the <code>liveness</code> and <code>session</code> parts of
+<code>lazy show &lt;task&gt; --json</code> and the output of
+<code>lazy daemon logs &lt;short-id&gt; --no-follow -n 20000</code>, where <code>&lt;short-id&gt;</code> is the
+first 8 characters of the task&#39;s <code>id</code> in that JSON (daemon log lines name tasks
+that way).</p>
+<h2 id="waiting-on-subtasks"><a class="anchor" href="#waiting-on-subtasks" aria-hidden="true">#</a>Waiting on subtasks</h2>
+<p>An agent that splits its work into subtasks drives them with blocking lazy
+tools — <code>lazy_wait</code> (wait until a subtask finishes its turn) and <code>lazy_ask</code>
+(ask a subtask&#39;s agent a question and wait for the answer). While blocked in one
+of those calls the parent agent is doing nothing. A <code>lazy_wait</code> also returns early,
+with an <code>interrupted</code> reason, when someone adds a subtask to the waiting task from
+outside, so the parent can react instead of mistaking it for a timeout. Lazy shows the wait instead of
+a plain <code>working(agent)</code>:</p>
+<pre><code>working(waiting on fix-foo (2m10s))
+</code></pre>
+<p>This appears in <code>lazy list</code>, <code>lazy active</code>, <code>lazy status</code>, <code>lazy show</code>,
+<code>lazy watch</code>, and the MCP <code>substate</code> field. Two concurrent waits list both
+labels; a larger fan-out is summarized (<code>waiting on a, b +2</code>).</p>
+<p>Waiting outranks the turn-flavour substates (<code>agent:answering</code>,
+<code>agent:reviewing</code>) — those say what the turn <em>is</em>, <code>waiting</code> says what it is
+doing this second. A lazy-side phase (<code>harness:&lt;phase&gt;</code>) outranks waiting, and a
+dead run still reads <code>not-alive</code>. If the daemon is killed mid-wait, the marker
+is disregarded and the task falls back to <code>working(agent)</code>.</p>
+<p>Time spent waiting is recorded separately from the agent&#39;s own working time, so
+a turn that spent two hours blocked on a subtask does not bill those two hours
+to the agent in duration or cost reports. A failure to record a wait never
+affects the wait itself.</p>
+<h2 id="agent-reported-progress"><a class="anchor" href="#agent-reported-progress" aria-hidden="true">#</a>Agent-reported progress</h2>
+<p>The working substate answers <em>who is active</em> — agent, lazy, a wait, nothing.
+It cannot answer <em>doing what</em>. <code>lazy_update_progress</code> fills that gap: the agent
+posts a short line and every surface that shows the substate folds it in:</p>
+<pre><code>working(agent: running migration 3/7)
+</code></pre>
+<ul>
+<li><strong>Latest wins, no history.</strong> Each call replaces the previous line, and
+nothing is kept — a progress line is worthless five minutes later. What is
+worth keeping about a turn (rationale, decisions, deferrals) belongs in the
+journal.</li>
+<li><strong>Bounded.</strong> The line is whitespace-collapsed and capped at 120 characters.
+Longer messages are truncated, never rejected, and the agent is told.</li>
+<li><strong>Only while the agent is active.</strong> It decorates <code>agent</code>, <code>agent:answering</code>,
+<code>agent:reviewing</code> and <code>waiting on …</code>, never <code>harness:&lt;phase&gt;</code> or <code>not-alive</code>.</li>
+<li><strong>Cleared with the turn.</strong> Every new turn starts with no progress line, so a
+message from a finished turn never lingers.</li>
+</ul>
+<p>A progress post that cannot be recorded is simply lost; it never costs the agent
+its tool call.</p>
+<h2 id="agent-failure-classification"><a class="anchor" href="#agent-failure-classification" aria-hidden="true">#</a>Agent Failure Classification</h2>
+<p>Not every agent failure deserves the same response. A rate limit clears on its
+own; a revoked credential never does. So lazy sorts each failure into a class
+and acts on the class.</p>
+<p>This is about credentials and conditions that go bad <em>while a task runs</em>. A
+turn on a profile with no credential at all is refused before it launches, and
+the task keeps its status.</p>
+<h3 id="the-taxonomy"><a class="anchor" href="#the-taxonomy" aria-hidden="true">#</a>The taxonomy</h3>
+<table>
+<thead>
+<tr>
+<th>Class</th>
+<th>Examples</th>
+<th>Behaviour</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>fatal_auth</code></td>
+<td>401/403, invalid API key, missing credential, credit balance exhausted, a provider quota or spend cap (monthly usage limit, out of credits, <code>insufficient_quota</code>)</td>
+<td>Stop on the first failure</td>
+</tr>
+<tr>
+<td><code>fatal_config</code></td>
+<td>unknown flag, invalid model, agent binary missing (exit 127)</td>
+<td>Stop on the first failure</td>
+</tr>
+<tr>
+<td><code>transient_overload</code></td>
+<td>429, 529, 503, &quot;overloaded&quot; (a per-minute or short-window rate limit)</td>
+<td>Retry indefinitely, 5s→60s</td>
+</tr>
+<tr>
+<td><code>transient_network</code></td>
+<td>ECONNRESET, ETIMEDOUT, socket hang up, <code>fetch failed</code></td>
+<td>Retry indefinitely, 5s→60s</td>
+</tr>
+<tr>
+<td><code>transient_unreachable</code></td>
+<td>ECONNREFUSED, ENOTFOUND</td>
+<td>Retry 5s→60s, <strong>bounded</strong> at 12 attempts (~9 min), then stop</td>
+</tr>
+<tr>
+<td><code>unknown</code></td>
+<td>anything unrecognized</td>
+<td>Retry 15s→60s, <strong>bounded</strong> at 6 attempts (~4 min) per turn; the crash-loop detector still applies</td>
+</tr>
+</tbody></table>
+<p>A failure lazy does not recognize is classed <code>unknown</code> rather than guessed at —
+wrongly calling a failure fatal would block a task that would have recovered.</p>
+<p>Each agent&#39;s own wording is recognized too (Claude Code&#39;s &quot;Invalid API key ·
+Please run /login&quot;, Cursor&#39;s &quot;not logged in&quot;).</p>
+<h3 id="retry-pacing"><a class="anchor" href="#retry-pacing" aria-hidden="true">#</a>Retry pacing</h3>
+<p>Transient failures are retried at 5s → 10s → 20s → 40s → 60s (capped) —
+roughly 60 retries an hour.</p>
+<p>The crash-loop detector (3 failures in a row, each under 10s) does <strong>not</strong> apply
+to transient classes: a 429 comes back in milliseconds, so three in a row would
+abort a turn that was about to succeed. It still applies to <code>unknown</code>, which
+is also capped at 6 attempts per turn so a slow, repeating failure cannot
+retry forever.</p>
+<p><code>transient_unreachable</code> sits in between: a refused connection to a local proxy
+can heal if the proxy restarts, so it is retried generously, but not forever.</p>
+<h3 id="what-stop-means"><a class="anchor" href="#what-stop-means" aria-hidden="true">#</a>What &quot;stop&quot; means</h3>
+<p>When a failure is classed fatal (or <code>transient_unreachable</code> runs out of
+attempts), the turn ends and the task moves to <strong><code>blocked</code></strong> — not
+<code>interrupted</code> — with the class and reason recorded on it. Auto-resume only ever
+restarts <code>interrupted</code> tasks, so this is what keeps lazy from relaunching into a
+condition that will not clear, and puts the task in front of you with the reason
+attached.</p>
+<p>A crash loop, or an <code>unknown</code> failure that used up its 6 attempts, is
+different: its class is <code>unknown</code>, recorded for diagnosis only. The task goes
+to <code>interrupted</code> and is auto-resumed, because many such causes are transient.</p>
+<p>Conditions that never clear on their own are kept out of <code>unknown</code>. A Cursor
+plan quota spent or a spend limit reached is <code>fatal_auth</code>; Claude&#39;s <code>usage limit reached</code> is a 5-hour window that clears by itself and stays
+<code>transient_overload</code>. A Cursor quota message is only fatal when nothing in it
+says the limit clears soon: a rate-limit marker or a short reset horizon
+(&quot;resets in 20 minutes&quot;) stays <code>transient_overload</code>, while a reset stated as a
+<em>date</em> (&quot;when your monthly cycle ends on 9/19/2026&quot;) does not. When in doubt,
+lazy retries.</p>
+<p>The same rule applies to every provider&#39;s quota. A 429 that says a monthly
+usage limit, spend cap or credit balance has been reached (Ollama, OpenAI,
+Anthropic) is <code>fatal_auth</code>: the task blocks with the provider&#39;s own message,
+including any upgrade or add-credits link it gave. A per-minute rate limit, or
+a cap whose message says it clears soon, is still retried.</p>
+<h3 id="seeing-what-is-being-retried"><a class="anchor" href="#seeing-what-is-being-retried" aria-hidden="true">#</a>Seeing what is being retried</h3>
+<p>While a turn is retrying, lazy shows one line saying what and why — for example
+<code>attempt 7 (transient_overload): API Error: 529 overloaded</code>, with the error
+snippet truncated — in all of:</p>
+<ul>
+<li>the <code>lazy watch</code> / <code>lazy status</code> header</li>
+<li>the <code>lazy list</code> / <code>lazy active</code> substate</li>
+<li>the &quot;Retry State&quot; block in <code>lazy show</code></li>
+<li>the supervisor log (<code>Phase: retrying …</code>)</li>
+<li><code>retry_status</code> in MCP <code>lazy_show</code>, so a builder can tell a task stuck retrying
+from a healthy <code>working</code> one</li>
+</ul>
+<h3 id="watchdog-kills"><a class="anchor" href="#watchdog-kills" aria-hidden="true">#</a>Watchdog kills</h3>
+<p>A no-progress watchdog kill has no error to classify — lazy killed the agent
+itself, after <code>[agent] watchdog_output_timeout_ms</code> (default <strong>30 minutes</strong>; the
+timer resets on every completed step) passed with no forward progress. What
+happens next depends on one question:</p>
+<table>
+<thead>
+<tr>
+<th>Did the turn capture anything?</th>
+<th>Behaviour</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Yes</strong> — a final result, or new commits</td>
+<td>Not retried. The work is already on disk, so relaunching would repeat it or hang the same way; the turn ends and you read what was captured</td>
+</tr>
+<tr>
+<td><strong>No</strong> — no result, no new commits</td>
+<td>Relaunched within the turn (5s → 10s backoff), at most 3 attempts. Each attempt costs a full no-progress window, so the bound is tight</td>
+</tr>
+</tbody></table>
+<p>If lazy cannot read git to check for commits, it treats the kill as having
+captured nothing and retries.</p>
+<p>When a watchdog kill ends the turn, the task goes to <strong><code>interrupted</code></strong> with
+auto-resume, not <code>blocked</code>. The recorded turn and the interrupt reason say which
+guard fired, what its limit was, that keep-alive output does not count as
+progress, and whether lazy already relaunched.</p>
+<h2 id="crashresume-lifecycle"><a class="anchor" href="#crashresume-lifecycle" aria-hidden="true">#</a>Crash/Resume Lifecycle</h2>
+<p>When an agent crashes mid-turn, lazy detects it and tries to resume the task.</p>
+<h3 id="detection"><a class="anchor" href="#detection" aria-hidden="true">#</a>Detection</h3>
+<p>The daemon watches <code>working</code> tasks. A task whose agent container or process is
+gone without having finished its turn is marked <code>interrupted</code>. A task that
+became <code>working</code> within the last 30 seconds is left alone, so a container still
+starting up is not mistaken for a dead one.</p>
+<h3 id="what-is-recorded"><a class="anchor" href="#what-is-recorded" aria-hidden="true">#</a>What is recorded</h3>
+<p>The crash is recorded as a turn on the task (visible in <code>lazy show</code>), along with
+diagnostics: a reason (e.g. &quot;OOM killed or SIGKILL (exit code 137)&quot;), the exit
+code, the time, and the last lines of the container&#39;s logs. <code>lazy show &lt;task&gt;</code>
+displays them.</p>
+<p>Every turn that dies leaves a visible record, even when the same failure repeats
+turn after turn: two identical <code>fatal_auth</code> failures on consecutive unblocks are
+recorded as two turns.</p>
+<h3 id="circuit-breaker"><a class="anchor" href="#circuit-breaker" aria-hidden="true">#</a>Circuit breaker</h3>
+<p>Each crash counts toward a limit of <strong>3 consecutive interruptions</strong>. Once it is
+reached, lazy stops auto-resuming and the task stays <code>interrupted</code> until you run
+<code>lazy resume</code> or <code>lazy unblock</code>. An agent that crashes three times in a row
+without finishing a turn has something fundamentally wrong — out of memory,
+broken dependencies, an infinite loop — and needs a human to look.</p>
+<p>The counter resets whenever a turn completes, and when you resume or unblock the
+task yourself. So only sustained, back-to-back crashes trip the breaker.</p>
+<h3 id="auto-resume"><a class="anchor" href="#auto-resume" aria-hidden="true">#</a>Auto-resume</h3>
+<p>Auto-resume continues the agent&#39;s existing conversation, so it keeps its full
+history — but the files on disk reflect wherever the crash left them, and the
+agent is told to verify before continuing. What else happens depends on whether
+the worktree has uncommitted changes:</p>
+<ul>
+<li><strong>Clean worktree</strong> (the agent crashed before editing anything, or after
+committing everything): the parent branch is merged into the task branch
+first, so a resumed task does not drift behind, and the agent is told upstream
+was merged. A task pinned to a fixed base commit (<code>lazy clone --same-base</code>)
+is not merged.</li>
+<li><strong>Uncommitted changes</strong> (the agent crashed mid-edit): no merge — merging over
+half-finished edits would fail or tangle them. The agent is told there are
+uncommitted changes from the interrupted turn and asked to review them, keep
+or discard what it finds, commit, and continue.</li>
+</ul>
+<p>The resume is recorded as a <code>system</code> turn, &quot;Session interrupted and
+auto-resumed&quot;.</p>
+<p>If the crash happened while lazy was merging upstream into the task and the
+merge failed, the task is <strong>not</strong> auto-resumed: it cannot make progress without
+that merge, and a human needs to look at the conflict.</p>
+<h3 id="feedback-is-redelivered-after-a-crash"><a class="anchor" href="#feedback-is-redelivered-after-a-crash" aria-hidden="true">#</a>Feedback is redelivered after a crash</h3>
+<p>Your feedback is saved before the agent is launched. If the turn then crashes
+before the agent finishes responding to it, the resume — automatic or
+<code>lazy resume</code> — delivers that feedback again <strong>verbatim</strong>, in place of the
+generic &quot;you were interrupted&quot; prompt. If several pieces of feedback went
+unanswered, the newest is reproduced and the prompt says how many others there
+are. A crash during the resume redelivers the same feedback again. Once an agent
+turn completes normally, all feedback before it counts as delivered and is never
+redelivered.</p>
+<p>This applies to your initial task prompt, <code>lazy unblock</code> feedback, <code>lazy ask</code>
+questions, and PR comments and CI output delivered automatically. A comment made
+through lazy itself (<code>lazy comment</code>, the web UI, <code>lazy_comment</code>) is different:
+it never starts a turn, and reaches the agent with the next <code>lazy unblock</code> —
+or, when it is written while the agent is still doing the turn&#39;s main work,
+before that turn ends: once the agent finishes, it is resumed in the same
+conversation with the comment, exactly as an unblock would have shown it. A
+comment written after that point — while lazy runs its end-of-turn steps, such
+as the commit check or the walkthrough — waits for your next unblock.
+Comments imported from a pull request keep their own delivery. Each such hand-off counts toward
+<a href="../lazy-toml/#limits"><code>max_turns_without_human</code></a>; past it the comment waits for
+your unblock. Lazy&#39;s own notices (such as <code>[Subtask accepted]</code>) never keep a
+turn going on their own.
+<code>lazy ask</code> and <code>lazy sync</code> neither carry a comment nor use it up.</p>
+<h3 id="three-crash-scenarios"><a class="anchor" href="#three-crash-scenarios" aria-hidden="true">#</a>Three crash scenarios</h3>
+<table>
+<thead>
+<tr>
+<th>Crash</th>
+<th>State after</th>
+<th>On auto-resume</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Before any edits</strong> — agent read files, then crashed</td>
+<td>Worktree clean, no new commits</td>
+<td>Upstream merged; agent verifies and continues</td>
+</tr>
+<tr>
+<td><strong>Mid-edit</strong> — one file edited, another half-written</td>
+<td>Worktree has uncommitted changes</td>
+<td>No merge; agent reviews the changes, commits, fixes or discards them</td>
+</tr>
+<tr>
+<td><strong>After committing but before the turn finished</strong></td>
+<td>Worktree clean, commits on the branch</td>
+<td>Upstream merged; agent finds its commits on the branch and continues. The commits are recorded on the task when a later turn finishes</td>
+</tr>
+</tbody></table>
+<h3 id="a-turn-nobody-read"><a class="anchor" href="#a-turn-nobody-read" aria-hidden="true">#</a>A turn nobody read</h3>
+<p>If you unblock a task just as its agent finishes a turn, that finished turn is
+not lost: lazy still records it in the task&#39;s history, and remembers the agent
+session it ran in, so <code>lazy pair</code> resumes where the agent left off. A turn
+recovered this way is history only — it does not change the task&#39;s status or
+disturb the turn now running. If a turn&#39;s output genuinely cannot be recovered,
+the daemon log says so and names the task.</p>
+<h3 id="manual-recovery"><a class="anchor" href="#manual-recovery" aria-hidden="true">#</a>Manual recovery</h3>
+<p>If auto-resume fails or the circuit breaker fires:</p>
+<ul>
+<li><strong><code>lazy resume &lt;task&gt;</code></strong> — resume without feedback. Resets the crash counter.</li>
+<li><strong><code>lazy unblock &lt;task&gt; --message &quot;...&quot;</code></strong> — give feedback and resume. Resets the counter.</li>
+<li><strong><code>lazy pair &lt;task&gt;</code></strong> — work with the agent interactively to debug.</li>
+<li><strong><code>lazy show &lt;task&gt;</code></strong> — see the interrupt diagnostics: reason, exit code,
+time, recent log lines, the consecutive-interruption count, and whether the
+session was auto-resumed.</li>
+</ul>
+
+</main>
+</body>
+</html>

@@ -35,7 +35,7 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="task-state-machine-and-crash-recovery"><a class="anchor" href="#task-state-machine-and-crash-recovery" aria-hidden="true">#</a>Task State Machine and Crash Recovery</h1>
 <p>This page describes the statuses a lazy task moves through, which commands and
@@ -73,16 +73,30 @@ never commits is in no diff, in no walkthrough, and in nothing <code>lazy accept
 would carry — and it disappears with the worktree. The end of a turn is where
 this happens most: the checks that close a turn ask the agent to update docs or
 a changelog, and writing the file and forgetting the commit is an easy miss.</p>
-<p>Three things make that visible rather than silent.</p>
+<p>Four things make that visible rather than silent.</p>
 <ul>
-<li><strong>The agent is asked, once, before the turn closes.</strong> When a turn that
-declared itself done still has uncommitted paths, lazy puts them to the agent
-by name and asks it to commit them or discard them. It is a question, not a
-sweep: lazy never commits on an agent&#39;s behalf, because that would put content
-nobody reviewed — scratch output, a half-finished edit, a key someone pasted
-into the worktree — into the merge under the agent&#39;s name. A turn that parks
-for input is not asked: an unfinished edit is normal there, the worktree
-survives, and the next turn continues in it.</li>
+<li><strong>The agent is asked, once, before the turn closes.</strong> When a turn is about to
+end with uncommitted paths, whether it declared itself done or parked for
+input, lazy names them and asks the agent once whether it has committed all
+its work — commit what belongs to the task, or say why it should stay
+uncommitted. A turn that declared itself done is additionally asked to commit
+or discard anything still loose, as its last check. These are questions, not
+a sweep: lazy never commits on an agent&#39;s behalf, because that would put
+content nobody reviewed — scratch output, a half-finished edit, a key someone
+pasted into the worktree — into the merge under the agent&#39;s name. Read-only
+turns are never asked.</li>
+<li><strong>Stopped background work is asked about first.</strong> If a turn ends while a
+background command the agent started is still running, Claude Code stops
+it. Lazy then asks the agent once, before the question about uncommitted
+work, whether it needed that command to finish, naming the command. If it
+did, it can run it again in the foreground; if not, it says so. Same rules:
+once per turn, never on read-only turns, recorded on the task as a
+&quot;Stopped Background Work Check&quot;.</li>
+<li><strong>Anything still loose is announced.</strong> If the agent does not commit or
+discard it (for example because it could not), the task gets an
+&quot;[Uncommitted work left behind]&quot; comment naming the paths, which the agent
+also receives on the next unblock, and a system message is filed so it is
+seen without opening the task.</li>
 <li><strong>The paths are on the turn record.</strong> <code>lazy show</code> puts the count on the turn
 and lists the paths in <code>--full</code>; the web review page shows the same count on
 the turn, with the paths in the tooltip.</li>
@@ -119,6 +133,7 @@ question and the automated follow-ups all leave it standing.</p>
 </li>
 <li><p><strong><code>submitted</code></strong> — The task&#39;s branch has an open pull/merge request waiting for review on the forge (<code>lazy submit</code>). It is a paused status like <code>blocked</code>: you can unblock it, review it, sync it, pair on it or accept it.</p>
 <p><strong>A sync or review puts <code>submitted</code> back when it ends.</strong> Merging upstream into the branch and running a review both move the task through <code>working</code> for the duration of the turn, because each needs an agent — but neither changes where the task stands with its reviewer, so each restores the status it found. That keeps the task in the submitted view and keeps PR-comment reactions (which only run on <code>submitted</code> tasks) switched on. A sync that fails in a way lazy will not retry — a dead credential, a bad model id, anything it parks for you rather than resuming — restores <code>submitted</code> too. A crash lazy <em>will</em> retry, or an agent killed outright without reporting, goes to <code>interrupted</code> instead and is resumed: the merge may be half applied, so the task is picked back up rather than called done. The other exception is a decision the reviewer still owes on a protected file: pending violations make the task <code>conflict</code> regardless, because that label is what <code>lazy accept</code> gates on.</p>
+<p><strong>A task finds its own PR/MR by its branch.</strong> If lazy does not have a PR/MR on record for a task — because lazy stopped right after the forge created it, or because someone opened it by hand — the daemon&#39;s background sync looks the PR/MR up by the task&#39;s branch and acts on what it finds. An open PR/MR is recorded on the task, so its comments, its merge and its link work as usual. A PR/MR that was merged into the task&#39;s target completes the task, but only when everything on the task&#39;s branch is already in the target; otherwise the task stays open and a comment explains why. If the PR/MR was merged into some other branch, the task is left alone and an alert says so. A closed PR/MR found this way changes nothing. Each outcome is recorded as a comment on the task. When lazy opens a PR/MR itself, it first checks whether the branch already has an open one and adopts it instead of opening a second.</p>
 </li>
 <li><p><strong><code>pairing</code></strong> — Human is working interactively with the task&#39;s agent, in the task&#39;s container (see <a href="../pairing/">Pairing</a>). <code>--host</code> is an explicit opt-in for tasks that have no container.</p>
 </li>
@@ -733,7 +748,9 @@ that way).</p>
 <p>An agent that splits its work into subtasks drives them with blocking lazy
 tools — <code>lazy_wait</code> (wait until a subtask finishes its turn) and <code>lazy_ask</code>
 (ask a subtask&#39;s agent a question and wait for the answer). While blocked in one
-of those calls the parent agent is doing nothing, and lazy shows that instead of
+of those calls the parent agent is doing nothing. A <code>lazy_wait</code> also returns early,
+with an <code>interrupted</code> reason, when someone adds a subtask to the waiting task from
+outside, so the parent can react instead of mistaking it for a timeout. Lazy shows the wait instead of
 a plain <code>working(agent)</code>:</p>
 <pre><code>working(waiting on fix-foo (2m10s))
 </code></pre>
@@ -813,7 +830,7 @@ the task keeps its status.</p>
 <tr>
 <td><code>unknown</code></td>
 <td>anything unrecognized</td>
-<td>Retry 15s→60s; the crash-loop detector still applies</td>
+<td>Retry 15s→60s, <strong>bounded</strong> at 6 attempts (~4 min) per turn; the crash-loop detector still applies</td>
 </tr>
 </tbody></table>
 <p>A failure lazy does not recognize is classed <code>unknown</code> rather than guessed at —
@@ -825,7 +842,9 @@ Please run /login&quot;, Cursor&#39;s &quot;not logged in&quot;).</p>
 roughly 60 retries an hour.</p>
 <p>The crash-loop detector (3 failures in a row, each under 10s) does <strong>not</strong> apply
 to transient classes: a 429 comes back in milliseconds, so three in a row would
-abort a turn that was about to succeed. It remains the bound for <code>unknown</code>.</p>
+abort a turn that was about to succeed. It still applies to <code>unknown</code>, which
+is also capped at 6 attempts per turn so a slow, repeating failure cannot
+retry forever.</p>
 <p><code>transient_unreachable</code> sits in between: a refused connection to a local proxy
 can heal if the proxy restarts, so it is retried generously, but not forever.</p>
 <h3 id="what-stop-means"><a class="anchor" href="#what-stop-means" aria-hidden="true">#</a>What &quot;stop&quot; means</h3>
@@ -835,9 +854,9 @@ attempts), the turn ends and the task moves to <strong><code>blocked</code></str
 restarts <code>interrupted</code> tasks, so this is what keeps lazy from relaunching into a
 condition that will not clear, and puts the task in front of you with the reason
 attached.</p>
-<p>A crash loop is different: its class is always <code>unknown</code>, recorded for
-diagnosis only. The task goes to <code>interrupted</code> and is auto-resumed, because
-many crash-loop causes are transient.</p>
+<p>A crash loop, or an <code>unknown</code> failure that used up its 6 attempts, is
+different: its class is <code>unknown</code>, recorded for diagnosis only. The task goes
+to <code>interrupted</code> and is auto-resumed, because many such causes are transient.</p>
 <p>Conditions that never clear on their own are kept out of <code>unknown</code>. A Cursor
 plan quota spent or a spend limit reached is <code>fatal_auth</code>; Claude&#39;s <code>usage limit reached</code> is a 5-hour window that clears by itself and stays
 <code>transient_overload</code>. A Cursor quota message is only fatal when nothing in it
@@ -945,7 +964,16 @@ redelivered.</p>
 <p>This applies to your initial task prompt, <code>lazy unblock</code> feedback, <code>lazy ask</code>
 questions, and PR comments and CI output delivered automatically. A comment made
 through lazy itself (<code>lazy comment</code>, the web UI, <code>lazy_comment</code>) is different:
-it never starts a turn, and reaches the agent with the next <code>lazy unblock</code>.
+it never starts a turn, and reaches the agent with the next <code>lazy unblock</code> —
+or, when it is written while the agent is still doing the turn&#39;s main work,
+before that turn ends: once the agent finishes, it is resumed in the same
+conversation with the comment, exactly as an unblock would have shown it. A
+comment written after that point — while lazy runs its end-of-turn steps, such
+as the commit check or the walkthrough — waits for your next unblock.
+Comments imported from a pull request keep their own delivery. Each such hand-off counts toward
+<a href="../lazy-toml/#limits"><code>max_turns_without_human</code></a>; past it the comment waits for
+your unblock. Lazy&#39;s own notices (such as <code>[Subtask accepted]</code>) never keep a
+turn going on their own.
 <code>lazy ask</code> and <code>lazy sync</code> neither carry a comment nor use it up.</p>
 <h3 id="three-crash-scenarios"><a class="anchor" href="#three-crash-scenarios" aria-hidden="true">#</a>Three crash scenarios</h3>
 <table>

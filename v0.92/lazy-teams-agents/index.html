@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agents in Lazy Teams — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
+<main class="wrap">
+<h1 id="agents-in-lazy-teams"><a class="anchor" href="#agents-in-lazy-teams" aria-hidden="true">#</a>Agents in Lazy Teams</h1>
+<p>This page is for Lazy Teams members and admins choosing which coding agent runs
+a task and connecting the credentials those agents use. Lazy ships <strong>Claude
+Code</strong>, <strong>Codex</strong>, <strong>Cursor</strong> and <strong>Pi</strong>, and a project can define more of its
+own. Each agent bills turns to a different account, so the product keeps agent
+choice and credentials explicit.</p>
+<h2 id="choosing-an-agent-for-a-task"><a class="anchor" href="#choosing-an-agent-for-a-task" aria-hidden="true">#</a>Choosing an agent for a task</h2>
+<p>When you create a task, the <strong>Agent</strong> field lets you pick which agent runs it.
+The form preselects your project&#39;s default (see below). Pick another agent to
+override for that task only.</p>
+<p>When an agent&#39;s configuration says when to use it (its <code>description</code>), a
+<strong>When to use each agent</strong> list opens beneath the field — for example &quot;use this
+one whenever a security aspect comes up&quot;. It is guidance for your choice; the
+form never switches agent on its own. Project settings show the same list
+beside <strong>Default agent</strong>.</p>
+<h3 id="the-agents-your-project-offers"><a class="anchor" href="#the-agents-your-project-offers" aria-hidden="true">#</a>The agents your project offers</h3>
+<p>The list is your project&#39;s own. A project can name its own agents in its
+lazy.toml — a named combination of which agent software drives the work and
+which model it asks for — and those are offered first, above the ones lazy
+ships with. Each one says what it runs beside its name, so two agents built on
+the same software but pointed at different models are told apart without
+opening a config file.</p>
+<p>You choose an agent by name and nothing else: where its traffic goes and which
+key pays for it are set where the project is configured, and are never part of
+filling in a task form.</p>
+<p>If a project&#39;s agents cannot be read just now, the form falls back to the ones
+lazy ships with rather than guessing.</p>
+<p>The agent is fixed for a task once work has started. Change it only on tasks
+still in the backlog, before the first turn.</p>
+<h3 id="long-prompts"><a class="anchor" href="#long-prompts" aria-hidden="true">#</a>Long prompts</h3>
+<p>Every agent receives a turn&#39;s instructions on standard input, not as a
+command-line argument, so a task with a long history, many comments or long
+feedback is delivered whole — nothing is shortened or replaced with a pointer.
+You do not have to shorten feedback because a task has a long history.</p>
+<h2 id="project-default-agent"><a class="anchor" href="#project-default-agent" aria-hidden="true">#</a>Project default agent</h2>
+<p>Team <strong>admins</strong> set the default under <strong>Settings → General</strong> on a project page. The control
+shows what the repository&#39;s lazy.toml specifies and what this Lazy Teams install
+overrides, so you always see both values and which one wins.</p>
+<p>Clearing the override returns new tasks to the repository default. Changing the
+default affects tasks that have not started yet; a task already running keeps the
+agent it began with.</p>
+<h2 id="model-and-reasoning-effort"><a class="anchor" href="#model-and-reasoning-effort" aria-hidden="true">#</a>Model and reasoning effort</h2>
+<p>Beside the agent, the new-task form takes a <strong>Model</strong> and an <strong>Effort</strong> — how
+hard the agent thinks before it acts. Leave either blank and the project&#39;s own
+default decides.</p>
+<p>What you pick is kept on the task, not just on the run you are about to start.
+A task added to the backlog with <strong>Very high</strong> effort still runs at very high
+effort when somebody starts it days later from its own page.</p>
+<h2 id="agent-credentials"><a class="anchor" href="#agent-credentials" aria-hidden="true">#</a>Agent credentials</h2>
+<p>Every turn runs on the account of the person who starts it — never a teammate&#39;s,
+and never one key the project shares. Connect your credential <strong>once per
+endpoint</strong>; every agent profile using that endpoint uses the same connection.
+Separate named endpoints can use different accounts, even on the same provider.</p>
+<h3 id="where-endpoints-and-profiles-come-from"><a class="anchor" href="#where-endpoints-and-profiles-come-from" aria-hidden="true">#</a>Where endpoints and profiles come from</h3>
+<p>A project&#39;s owner defines its endpoints and agent profiles — under <strong>Settings →
+Configuration → Endpoints and agent profiles</strong>, a page every member can open
+that also lists what is waiting for a project admin to confirm, with a form for each endpoint (name,
+URL, credential name) and each profile (harness, model, description, an endpoint
+or a list of tiers). The form writes the project&#39;s <code>lazy.toml</code>; the same checks
+as the raw editor apply, and nothing is saved while lazy rejects it. Members
+then connect their own key for each endpoint on <strong>Your credentials</strong>.</p>
+<h3 id="your-claude-credential"><a class="anchor" href="#your-claude-credential" aria-hidden="true">#</a>Your Claude credential</h3>
+<p>Open <strong>Agent credentials</strong> from your account menu (top right) and connect your
+own Anthropic account — subscription token or API key. Lazy Teams stores it
+encrypted and never shows it again. This connects the built-in Anthropic endpoint
+(<code>builtin:anthropic</code>). An agent using a separately named Anthropic endpoint needs
+its own connection; it does not borrow the built-in account. Use <strong>Test credential</strong>
+for the built-in Anthropic connection to check each ready project&#39;s saved copy
+before running work. Results appear per project; an unreachable project means
+the test could not run, not that your credential is invalid. Named endpoints and
+other providers do not use this test. Projects still waiting for their normal
+upgrade cannot run credential tests; the page explains that no test was sent.
+If a project has not received your saved connection yet, the test sends it again
+and re-checks, and says why when it still cannot be delivered. Saved connections
+a project is missing are also re-sent automatically every few minutes, and the
+page tells you when a connection you saved for another team or project does not
+reach the one you are looking at.</p>
+<h3 id="account-team-and-project-credentials"><a class="anchor" href="#account-team-and-project-credentials" aria-hidden="true">#</a>Account, team and project credentials</h3>
+<p>Each endpoint credential can be set at three levels, and
+the most specific one you set wins:</p>
+<ol>
+<li><strong>Account</strong> (<strong>Agent credentials</strong> in your account menu) — used on every
+project of yours.</li>
+<li><strong>Team</strong> (the team page → <strong>Your credentials</strong>) — overrides your account
+credential on that team&#39;s projects.</li>
+<li><strong>Project</strong> (the project&#39;s <strong>Settings → Your credentials</strong>) — overrides both
+on that one project. You never need one; it is there if a project really
+needs a different key.</li>
+</ol>
+<p>Each page says which level currently applies (&quot;Using your team credential&quot;).
+<strong>Copy to team</strong> on a project credential and <strong>Copy to account</strong> on a team
+credential copy it up a level on the server — the value is never shown, and you
+are asked before an existing credential at that level is replaced. Only your
+own credentials are ever read or copied.</p>
+<p>A connection carries the origin shown when you set it: the URL&#39;s scheme, host
+and port. A project using the same endpoint name at a different origin cannot
+use it. A stale project or team override refuses work rather than silently
+spending a broader account; reconnect it or remove the override to inherit.</p>
+<h3 id="endpoints-a-project-uses"><a class="anchor" href="#endpoints-a-project-uses" aria-hidden="true">#</a>Endpoints a project uses</h3>
+<p>On the project&#39;s <strong>Settings → Your credentials</strong> tab: Pi, Codex (on an OpenAI API key, or on a ChatGPT subscription), Cursor, and
+any agent the project defines with an endpoint of its own — for example a
+second Claude agent pointed at a gateway. The tab lists each endpoint once,
+shows the agent profiles and tiers using it, and explains:</p>
+<ul>
+<li>what it needs — an API key, or for a ChatGPT subscription the contents of
+<code>~/.codex/auth.json</code> after <code>codex login</code> (use a login made for this: lazy
+keeps it renewed, which signs out any other copy);</li>
+<li><strong>where your credential is sent</strong> — the endpoint&#39;s origin;</li>
+<li>whether your connection is available, needs reconnecting, or no credential is
+needed (a model server that takes none).</li>
+</ul>
+<p>A credential is sent only to the origin you connected it for. Changing a base
+path on that origin does not require reconnecting; changing the scheme, host or
+port does. Anthropic credentials are never sent to a non-Anthropic destination.</p>
+<p>Profiles that name an endpoint share its connection. A profile with its own inline
+endpoint has the identity <code>profile:&lt;name&gt;</code>; renaming that profile creates a new
+identity and does not move the old connection. Use a named endpoint when sharing
+one connection across profiles is intentional. Built-in endpoints use
+<code>builtin:&lt;provider&gt;</code> identities.</p>
+<p>Starting a task or builder without a required connection is refused before
+anything runs, naming the missing endpoint. Leaving a team
+removes the credentials you set for that team and its projects; your account
+credentials stay yours.</p>
+<h3 id="tiered-agents-and-builders"><a class="anchor" href="#tiered-agents-and-builders" aria-hidden="true">#</a>Tiered agents and builders</h3>
+<p>A tiered profile can switch endpoints during a turn as its usage thresholds are
+reached. Connect <strong>every paid endpoint in the chain</strong> before starting it, including
+tiers you do not expect to use. Each request spends your connection for the tier
+actually selected; credential-free tiers send no authentication.</p>
+<p>Usage readings belong to your endpoint connection, so profiles sharing it see
+the same readings. Replacing a credential clears those readings; renewing the
+same session preserves them. Endpoints using the same upstream account still
+share the provider&#39;s real quota. Providers without usage readings cannot supply
+a measured percentage.</p>
+<h3 id="agents-the-project-adds"><a class="anchor" href="#agents-the-project-adds" aria-hidden="true">#</a>Agents the project adds</h3>
+<p>The team owner adds and changes a project&#39;s agents on its <strong>Settings → Configuration</strong>
+page (<code>[agents.&lt;name&gt;]</code> blocks in the project&#39;s lazy.toml). An agent added
+there appears on every member&#39;s Your credentials tab and in the task form&#39;s <strong>Agent</strong>
+list once the project has picked it up.</p>
+<h3 id="automations"><a class="anchor" href="#automations" aria-hidden="true">#</a>Automations</h3>
+<p>Each project can designate one member&#39;s credentials for <strong>automations</strong> (turns
+nobody started). Only an admin can set that, and only from their own connected
+account; automations run on that member&#39;s endpoint connections, including every
+paid tier. A missing connection disables the affected automation rather than
+spending another member&#39;s account. Any connected agent account will do: an admin who has
+connected only Codex can pay for a Codex-only project&#39;s automations.</p>
+<h2 id="cli-vs-teams"><a class="anchor" href="#cli-vs-teams" aria-hidden="true">#</a>CLI vs Teams</h2>
+<p>The lazy CLI chooses agents with <code>agent_id</code> in lazy.toml and <code>--agent</code> on
+<code>lazy create</code> / <code>lazy start</code>. A <strong>project default agent</strong> set in Lazy Teams
+(or via the daemon&#39;s project settings) applies when you omit <code>--agent</code> on
+<code>lazy create</code> and on MCP task creation too — the same overlay, not a separate
+Teams-only default.</p>
+
+</main>
+</body>
+</html>

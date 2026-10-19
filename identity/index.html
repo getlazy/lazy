@@ -35,7 +35,7 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="who-lazy-says-did-it"><a class="anchor" href="#who-lazy-says-did-it" aria-hidden="true">#</a>Who lazy says did it</h1>
 <p>Every row lazy stores carries the person who caused it — the task you created,
@@ -135,10 +135,21 @@ on the server is not consulted, and there is nothing to configure per machine.</
 from the request. So a task the team can see says <code>ada@example.com</code> accepted it,
 whether Ada pressed accept in a browser or from her terminal, and a client cannot
 sign somebody else&#39;s name to anything even if it asks to.</p>
+<p>A subtask that a task&#39;s agent starts during your turn is part of that turn: it
+runs, and is billed, as you — on your own connection for the subtask&#39;s agent.
+The same goes for a task your builder session starts or unblocks. Only work
+nobody asked for runs on the project&#39;s service holder.</p>
 <p>The address is what identifies somebody and is always there. A display name rides
 along where the client has one to offer — a terminal takes it from git config, so
-the same person&#39;s terminal actions read <code>Ada Lovelace &lt;ada@example.com&gt;</code> — and
+the same person&#39;s terminal actions read <code>Ada Lovelace &lt;ada@example.com&gt;</code>, and a Teams member&#39;s comes from <strong>Account settings → Profile</strong> — and
 rows simply show the address where it does not.</p>
+<p>In Lazy Teams a display name may be at most 80 characters, and it is refused
+when it looks like an email address, is a reserved word (<code>god</code>, <code>godmode</code>,
+<code>admin</code>, <code>administrator</code>, <code>lazy</code>, <code>system</code>, <code>support</code>, <code>root</code>, <code>operator</code>,
+<code>builder</code>, <code>agent</code>), or matches the display name or email address of anyone you
+share a team with — compared ignoring case, spaces and look-alike characters.
+Teams always shows it as &quot;Name (email)&quot;. If two people in one team end up with
+the same name later, both are shown by email alone until one of them renames.</p>
 <p>An address identifies one person however it is typed: lazy matches it ignoring
 surrounding spaces and upper/lower case, so <code>Ada@Example.com</code> and
 <code>ada@example.com</code> are the same member, with one history and one set of
@@ -163,8 +174,8 @@ outright rather than sitting unused.</p>
 <p>The same rule decides the author of every commit lazy makes on a team server —
 an agent&#39;s commit, a sync&#39;s merge, an accept. The commit names the person who
 asked for the work, as both author and committer. Work lazy starts by itself,
-such as resuming an interrupted task, names the owner of the project&#39;s service
-credential. No git configuration on the server is involved, and none is needed.
+such as resuming an interrupted task, names the member who holds the project&#39;s
+service credential — whichever model credentials they connected, Claude or not. No git configuration on the server is involved, and none is needed.
 If lazy cannot name anybody, it refuses with &quot;Please tell me who you are&quot; before
 git runs; setting the project&#39;s service credential fixes that for automated work.</p>
 

@@ -35,7 +35,7 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="cluster-tasks"><a class="anchor" href="#cluster-tasks" aria-hidden="true">#</a>Cluster tasks</h1>
 <p>A <strong>cluster task</strong> is a task whose agent drives <em>other</em> tasks instead of writing
@@ -58,6 +58,9 @@ subtasks up front and let it find them.</p>
 <p>Adding existing backlog tasks to a cluster is a reparent:</p>
 <pre><code class="language-bash">lazy reparent &lt;task&gt; --parent &lt;cluster&gt;
 </code></pre>
+<p>You can do this before the cluster starts. A started task reparented under a
+cluster that has not started yet has nothing to merge yet; lazy says so, and
+merges the cluster&#39;s branch into it as soon as the cluster starts.</p>
 <h2 id="what-the-driver-does"><a class="anchor" href="#what-the-driver-does" aria-hidden="true">#</a>What the driver does</h2>
 <p>Every turn a cluster takes, it runs under a contract lazy injects for you:</p>
 <ul>
@@ -121,6 +124,22 @@ remove the bound entirely.</p>
 <p>This key is one of the levers in
 <a href="../review-paradigm/#when-tokens-are-still-the-constraint">the review paradigm</a>,
 which explains what each one costs you when you turn it down.</p>
+<h3 id="protected-files-are-decided-once-at-the-cluster"><a class="anchor" href="#protected-files-are-decided-once-at-the-cluster" aria-hidden="true">#</a>Protected files are decided once, at the cluster</h3>
+<p>A child that changes files your project protects (<code>[permissions] protected</code> in
+<a href="../lazy-toml/"><code>lazy.toml</code></a>) — test suites, typically — is not held for your
+approval. Its accept goes through with no file decisions, and every protected
+change is carried up to the cluster: the cluster&#39;s own accept lists all of them,
+and you approve or reject them there, together with the rest of the work. The
+driver is told never to park a child, or ask you anything, on that account.</p>
+<p>This holds for every child of a cluster, including one you started or sent
+feedback to yourself.</p>
+<h3 id="children-run-your-end-of-work-rules"><a class="anchor" href="#children-run-your-end-of-work-rules" aria-hidden="true">#</a>Children run your end-of-work rules</h3>
+<p>Every child finishes the way any task does. Its final turn runs the rules you
+configured — maintained files (<code>[[automation.maintain]]</code>), reactive automations
+(<code>[[automation.react]]</code>), the check for uncommitted work, and the review
+walkthrough — exactly as it would for a task you started yourself. Only the
+protected-file <em>decision</em> moves: the child still records why it kept each
+protected change, and you decide on all of them once, at the cluster&#39;s accept.</p>
 <h3 id="it-keeps-its-own-branch-current"><a class="anchor" href="#it-keeps-its-own-branch-current" aria-hidden="true">#</a>It keeps its own branch current</h3>
 <p>A cluster can sync itself: it merges its own branch on origin, then its parent,
 into its branch. This matters on a long run. Work keeps landing on the parent

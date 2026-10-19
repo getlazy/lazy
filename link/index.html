@@ -35,7 +35,7 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="lazy-link--adopt-a-pull-request-or-branch-as-a-task"><a class="anchor" href="#lazy-link--adopt-a-pull-request-or-branch-as-a-task" aria-hidden="true">#</a><code>lazy link</code> — adopt a pull request or branch as a task</h1>
 <p><code>lazy link &lt;ref&gt;</code> turns someone else&#39;s pull request or git branch into a lazy
@@ -122,6 +122,10 @@ task&#39;s prompt.</p>
 <p>If you linked a branch that has no pull request yet, lazy keeps looking during
 its normal remote check. When someone opens a PR for that branch later, the
 task picks it up. Lazy does not open a PR for you.</p>
+<p>The task follows its PR&#39;s fate. When the PR is merged on the forge, the task
+becomes <strong>complete</strong>; when it is closed without being merged, the task is
+<strong>abandoned</strong>, with a comment saying why. Either way lazy only reads the PR — it
+never comments on, closes or retargets it.</p>
 <h2 id="what-linked-does-not-do"><a class="anchor" href="#what-linked-does-not-do" aria-hidden="true">#</a>What linked does <em>not</em> do</h2>
 <ul>
 <li>It does not start an agent.</li>

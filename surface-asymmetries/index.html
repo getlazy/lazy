@@ -35,7 +35,7 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="surface-asymmetries-cli-vs-mcp"><a class="anchor" href="#surface-asymmetries-cli-vs-mcp" aria-hidden="true">#</a>Surface asymmetries: CLI vs MCP</h1>
 <p>Lazy exposes two control surfaces over the same daemon: the <strong>CLI</strong>
@@ -60,6 +60,14 @@ usually the rule at work rather than drift.</p>
 <p>Task-mutating MCP tools check the caller. <code>ctx.taskId</code> non-empty means a <strong>task
 agent</strong>; empty means the <strong>builder</strong>. The builder is unrestricted; a task agent
 may only <em>change</em> its own task or a direct child.</p>
+<p><strong>A task&#39;s writes need a running turn.</strong> A task&#39;s MCP credential stays valid for
+the life of the task, but it only <em>acts</em> while one of that task&#39;s turns is
+running, and it acts for the person who asked for that turn. Outside a turn —
+for example a service or background process left running in the task&#39;s
+container — every tool that writes, starts work or spends a credential is
+refused; read-only tools still answer. During a read-only turn (an ask, a
+review, a reflective unblock, or an agent&#39;s self-review), only the tools that turn is offered are
+accepted, however the call reaches lazy.</p>
 <p><strong>Reads are not gated at all, on purpose.</strong> Every read-only tool — <code>lazy_search</code>, <code>lazy_show</code>, <code>lazy_diff</code>, <code>lazy_list</code>,
 <code>lazy_blocked</code>, <code>lazy_active</code>, <code>lazy_status</code>, <code>lazy_wait</code>, the conversation
 reads, <code>lazy_memory_recall</code> — works on ANY task in the project for an agent
@@ -257,6 +265,13 @@ single hallucinated call can produce. <code>lazy_accept</code> skips the two-ste
 diff is tiny — friction proportional to blast radius. <code>lazy submit</code> has <code>--yes</code>;
 <code>lazy_submit</code> does not — that is deliberate: opening a PR is the same class of
 irreversible remote action as accept/reject.</p>
+<p><code>lazy_start</code>, <code>lazy_unblock</code> and <code>lazy_resume</code> use the same protocol in one
+case only: while the project&#39;s own runner image is still building or failed, a
+launch on lazy&#39;s default image needs a <code>confirmation_code</code>. <code>lazy_sync</code> asks for
+one only when the merge conflicts, since resolving the conflict runs the task&#39;s
+agent. At the terminal the same decision is a prompt, answered without one by
+<code>--default-image</code> (or <code>--yes</code>); in Lazy Teams and the dashboard it is an explicit button or tick. A
+call that needs no confirmation ignores the argument.</p>
 <p>Do not add <code>--yes</code>-style bypass parameters to these tools.</p>
 <h2 id="3-mcp-never-auto-starts-work"><a class="anchor" href="#3-mcp-never-auto-starts-work" aria-hidden="true">#</a>3. MCP never auto-starts work</h2>
 <p><code>lazy redo</code> starts the replacement task by default (<code>--no-start</code> opts out).
@@ -302,6 +317,27 @@ without giving agents a chooser. <code>lazy clone</code> / <code>lazy redo</code
 warn when the source or previous attempt had a pin, so you can re-pin from a
 task worktree TTY if needed.</p>
 </li>
+<li><p><strong>Adopting a project&#39;s image from a branch or task (Lazy Teams only)</strong> —
+when a project&#39;s <code>Dockerfile.lazy</code> fails to build, a team admin can choose
+another branch&#39;s or task&#39;s committed <code>Dockerfile.lazy</code> for the whole project
+from the project page in Lazy Teams. It is a person&#39;s confirmed decision, so
+there is no MCP tool for it, no <code>lazy</code> CLI command, and a CLI clone bound to
+a Teams project cannot reach it either.</p>
+</li>
+<li><p><strong>Consenting to a project&#39;s imported endpoints and agent profiles (Lazy
+Teams only)</strong> — a team admin&#39;s import of the project is that consent, and
+where no admin is recorded for an import, a team admin confirms them on the
+project&#39;s Endpoints and agent profiles page; either way who is recorded. It decides where requests go and
+which key pays, so there is no MCP tool for it, no <code>lazy</code> CLI command, and a
+CLI clone bound to a Teams project cannot reach it either.</p>
+</li>
+<li><p><strong>Test-building a task&#39;s own <code>Dockerfile.lazy</code> (agents only, virtual-machine
+projects only)</strong> — <code>lazy_image_build</code> is an MCP tool a task&#39;s agent can use to
+check that its <code>Dockerfile.lazy</code> builds. It has no CLI equivalent and is not
+offered to the builder. It exists only on Lazy Teams projects that run in a
+virtual machine, its image is thrown away, and it never changes which image
+any task runs on — choosing that stays the admin&#39;s act above.</p>
+</li>
 <li><p><strong>Upgrade worktree adoption</strong> — when you run <code>lazy upgrade</code> from a terminal,
 every rebuild first announces any valid daemon adoption (TTY: keep it, default
 yes; non-interactive: keep and log). A <strong>new</strong> worktree <code>Dockerfile.lazy</code> is
@@ -332,6 +368,13 @@ never logged, and a wrong one is a retryable error that re-offers the form.
 What stays closed is the MCP surface: no tool has a parameter that can carry
 the token, so the builder still cannot satisfy its own gate. See
 <a href="../web-review/">web-review.md</a>.</p>
+<p><strong>In Lazy Teams the approval is the member&#39;s own Accept, not a passphrase.</strong>
+A signed-in member pressing Accept in the browser satisfies the gate, and the
+task records who approved it. Only that browser Accept counts. The builder,
+task agents, MCP callers and the Teams service&#39;s own token are refused, and
+so is <code>lazy accept</code> from a bound clone, even though it carries the same
+member&#39;s token: on that laptop, any program the member runs could drive it.
+See <a href="../protected-branches/#in-lazy-teams-pressing-accept-is-the-approval">protected-branches.md</a>.</p>
 </li>
 <li><p><strong><code>lazy system passphrase</code></strong> (<code>set</code>/<code>status</code>/<code>delete</code>) — enrolling, rotating,
 or removing the machine&#39;s approval passphrase. No MCP tool, and — unusually —
@@ -387,8 +430,8 @@ by no other route.</p>
 </li>
 <li><p><strong><code>lazy system agent</code></strong> — switching the project&#39;s default agent
 (<code>set &lt;id&gt;</code>, writes <code>[agent] agent_id</code> in lazy.toml) and storing an agent
-API key (<code>set-key &lt;id&gt;</code>, writes <code>~/.lazy/daemon/&lt;slug&gt;/agent-credentials.json</code>,
-mode 0600 and outside the repo every task container mounts) are human
+API key (<code>set-key &lt;id&gt;</code>, writes the unified credential store,
+using Keychain on macOS) are human
 decisions with no MCP counterpart.
 Credentials especially: <strong>agents must never write credentials</strong> — an agent
 that can install the key it then authenticates with has minted its own
@@ -493,11 +536,12 @@ branch with a running agent already on it. Wrong parenting was the single
 largest source of rework in the project, and agents in particular had a
 documented habit of starting a task first and trying to reparent it after. The
 create-then-start split makes creation cheap, reviewable and correctable:
-<code>lazy edit</code> can still fix a backlog task&#39;s goal, prompt, code, type and parent,
-and none of that is available once the agent is running.</p>
+<code>lazy edit</code> can still fix a backlog task&#39;s goal, prompt, code, type and parent.
+Of those, only the code can still change once the agent is running, as a rename: the
+branch, worktree and any PR/MR keep their old names (<a href="../renaming-tasks/">Renaming tasks</a>).</p>
 <p>So the fix for &quot;I want a task code on a task I started&quot; is
 <code>lazy create --code &lt;code&gt; ... &amp;&amp; lazy start &lt;code&gt;</code>, not a <code>--code</code> flag on
-<code>start</code>.</p>
+<code>start</code> — or rename it afterwards with <code>lazy edit &lt;task&gt; --code &lt;new-code&gt;</code>.</p>
 <h2 id="10-review-settings-are-on-both-surfaces"><a class="anchor" href="#10-review-settings-are-on-both-surfaces" aria-hidden="true">#</a>10. Review settings are on both surfaces</h2>
 <p>A task&#39;s <a href="../review-paradigm/">review settings</a> — mode, gate and auto-fix — are
 not an asymmetry: <code>lazy create</code> / <code>lazy start</code> / <code>lazy edit</code> take <code>--review</code>,
@@ -1152,22 +1196,24 @@ neither is ever available to a task agent.</p>
 TASK, and is used up by the first launch of that task it lets past the pause —
 whichever launch that is, including one lazy starts by itself, such as an
 auto-resume or a held subtask start. It never lets any other task through.<ul>
-<li><strong>A person</strong> takes it with <code>--past-usage-pause</code> on <code>lazy start</code>,
+<li><strong>A person</strong> takes it with <code>--override-usage-pause</code> on <code>lazy start</code>,
 <code>unblock</code>, <code>resume</code>, <code>review</code> and <code>ask</code>, with
 <code>lazy daemon config set usage_pause_threshold off --task &lt;task&gt;</code>, or with
 the &quot;Let its next turn through&quot; button on the local dashboard and in Lazy
 Teams (members included). No terminal is required.</li>
 <li><strong>The builder</strong> may take it, on the person&#39;s behalf, through the
-<code>past_usage_pause</code> argument of <code>lazy_start</code>, <code>lazy_unblock</code> and
-<code>lazy_resume</code>. Its refusals say to do so only when asked.</li>
+<code>override_usage_pause</code> argument of <code>lazy_start</code>, <code>lazy_unblock</code>,
+<code>lazy_resume</code>, <code>lazy_review</code> and <code>lazy_ask</code>. Its refusals say to do so only when asked.</li>
 <li><strong>A task agent never can.</strong> The argument is not in its tool schemas, the
 tools refuse it, and lazy refuses the request from an agent&#39;s channel. An
 agent&#39;s refusal only says when the window resets.</li>
 </ul>
 </li>
 <li><strong>Let one launch beside any task through</strong>: a <code>lazy report</code>, a <code>lazy ask</code> on
-a stored conversation, a chat, a review conversation. This is
-<code>lazy daemon config set usage_pause_threshold off</code>, and it stays a
+a stored conversation, a chat, a builder session or a review conversation.
+<code>--override-usage-pause</code> on <code>lazy pair</code>, <code>lazy chat</code>, <code>lazy builder</code> and
+<code>lazy ask</code> admits only that session; alternatively use
+<code>lazy daemon config set usage_pause_threshold off</code>. This stays a
 person&#39;s only: the command needs an interactive terminal outside a container
 with none of lazy&#39;s test prompt variables set, lazy refuses it from any
 channel but a person&#39;s, and only a person&#39;s own launch — from their terminal,
@@ -1212,6 +1258,18 @@ own task, any task for the builder — cached for 60 seconds, so the tools canno
 be used to reach anything else on the forge or to exhaust its rate limit. An
 agent that has to run <code>gh</code> or push itself still needs a token granted to it.
 See <a href="../mcp-tools/#reading-a-tasks-pullmerge-request">MCP tools</a>.</p>
+<h2 id="37-the-machine-and-its-image-build-watched-by-people-not-agents"><a class="anchor" href="#37-the-machine-and-its-image-build-watched-by-people-not-agents" aria-hidden="true">#</a>37. The machine and its image build: watched by people, not agents</h2>
+<p><code>lazy system runner-image log</code>, <code>rebuild</code> and <code>cancel</code>, and <code>lazy system machine</code>, have no MCP tools. They answer a person&#39;s questions about the machine
+a project runs on — where the image build is, what its services are doing —
+and their controls (rebuilding or cancelling the project&#39;s image) change what
+every task and builder runs on. An agent fixing a Dockerfile already has the
+tool it needs to check its work, which builds that task&#39;s own file and nothing
+else.</p>
+<p>In Lazy Teams the same answers are split by role: project admins see the build
+log and the machine&#39;s service logs and can rebuild or cancel the build;
+restarting a machine service is reserved to the installation&#39;s administrator.
+Members see neither. The daemon backs that up on its side: the log-bearing reads
+and the restart refuse a member&#39;s own credential outright.</p>
 <h2 id="when-you-find-an-asymmetry-that-is-not-listed-here"><a class="anchor" href="#when-you-find-an-asymmetry-that-is-not-listed-here" aria-hidden="true">#</a>When you find an asymmetry that is not listed here</h2>
 <p>It is probably accidental — this page is the complete list of the deliberate
 ones. Treat an unlisted difference as a gap and report it. Adding a deliberate

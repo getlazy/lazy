@@ -35,7 +35,7 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="just-in-time-credential-injection"><a class="anchor" href="#just-in-time-credential-injection" aria-hidden="true">#</a>Just-in-time credential injection</h1>
 <p>This page explains how lazy keeps your real model credentials out of every
@@ -217,6 +217,7 @@ unlike the OpenAI-wire upstreams above, whose model list is a public catalogue.<
 <p>The list is part of lazy&#39;s source, not a config knob, so growing lazy&#39;s
 forwarding surface is a reviewable code change rather than a setting someone
 can widen in passing.</p>
+<p>For failed Cursor requests, Watch and the proxy audit log show a credential-redacted upstream error message when the response is small enough to inspect. Large or streamed error bodies still reach Cursor unchanged; oversized bodies are identified without recording their contents.</p>
 <h2 id="usage-limit-readings"><a class="anchor" href="#usage-limit-readings" aria-hidden="true">#</a>Usage-limit readings</h2>
 <p>Model APIs report how close a credential is to its limits in response headers:
 a Claude subscription reports how much of its 5-hour and 7-day windows is used,
@@ -284,15 +285,30 @@ Only a value that <em>looks</em> like a lazy placeholder yet fails lookup earns 
 daemon auth token and the MCP token registry, and deliberately <strong>not</strong> under the
 project root, which every task container bind-mounts.</p>
 <ul>
-<li>Minting is <strong>per identity and reuses</strong>: the same (role, task, agent profile,
-env var) gets the same value back. A live container holds its placeholder in
+<li>Minting is <strong>per identity and reuses</strong>: the same (role, task, container,
+agent profile, env var) gets the same value back. A task&#39;s work container
+keeps one name across turns; its review and accept-check containers each get
+their own placeholder. A live container holds its placeholder in
 memory across turns, so re-minting per turn would either invalidate a running
 turn or pile up equally-valid placeholders. The profile is part of that
 identity because it decides which upstream the placeholder redeems against —
 switch a task to another profile and it gets a new placeholder.</li>
 <li><strong>Task grants are revoked</strong> when the task&#39;s session ends (accept, reject,
 close) — alongside its MCP tokens, in the same place, and independently, so a
-failure in one does not skip the other.</li>
+failure in one does not skip the other. Every grant naming the task goes,
+whichever task reference it was minted under.</li>
+<li><strong>Task grants are pinned to their container.</strong> On Linux with Docker, once a
+task&#39;s container is up its placeholders are bound to that container&#39;s network
+address, and the proxy refuses them from any other address (a <code>401</code> that is
+logged and audited). A placeholder that leaks out of one task&#39;s container
+cannot be spent from another&#39;s. Each turn&#39;s new container is pinned afresh.
+Grants are pinned only where the container&#39;s network gateway is an address
+of the host itself — native Docker. Docker Desktop (on any OS), rootless
+runtimes and a remote Docker host present every container from one other
+address, so there grants are not pinned.</li>
+<li><strong>Placeholders never reach the audit log.</strong> Every placeholder shape lazy mints
+is replaced by <code>&lt;lazy-placeholder&gt;</code> in recorded tool commands, tool results and
+errors, because the log lives in the project, which task containers can read.</li>
 <li><strong>Builder grants are revoked</strong> when the builder session&#39;s MCP token is revoked,
 keyed by the same session name.</li>
 <li>Interactive host launches (<code>lazy pair</code>, <code>lazy chat</code>) share one grant per
@@ -319,6 +335,15 @@ body — and forwards the rest verbatim. Body substitution is bounded to request
 declaring <code>content-length</code> ≤ 64 KiB, so the bidirectional agent stream is never
 buffered. The token in the path is never logged; a malformed route is reported by
 segment count only.</p>
+<p><code>cursor-agent</code> trades its API key for a session (an access token and a refresh
+token) before it starts work. That session is a real Cursor credential, so the
+proxy never hands it to the container: it replaces both tokens in the answer
+with placeholders bound to the launch&#39;s grant, and swaps them back on that
+launch&#39;s later requests. The access token keeps its readable expiry, so the CLI
+still renews on time. Session placeholders are revoked with the grant, one
+presented by any other launch is refused with <code>401</code>, and if the launch&#39;s grant
+is gone by the time the answer arrives the session is withheld (<code>502</code>) rather
+than forwarded.</p>
 <h2 id="codex"><a class="anchor" href="#codex" aria-hidden="true">#</a>Codex</h2>
 <p>The Codex CLI reads its key from <code>OPENAI_API_KEY</code> — where lazy puts the
 launch&#39;s placeholder — and sends it as <code>Authorization: Bearer …</code> on every

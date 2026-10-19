@@ -35,7 +35,7 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="reviewing-tasks-in-lazy-teams"><a class="anchor" href="#reviewing-tasks-in-lazy-teams" aria-hidden="true">#</a>Reviewing tasks in Lazy Teams</h1>
 <p>This page is for members of a Lazy Teams project who review agent work in the
@@ -49,6 +49,7 @@ items that must be resolved before accept.</p>
 waiting for you, tasks in the review queue, running clusters, open raised items
 (blocking and not), and unread messages. A number the project could not report
 is left off rather than shown as zero.</p>
+<p>The <strong>Tasks</strong> page opens on <strong>Active</strong>: every task that is working, blocked, submitted or otherwise in flight, shown as a tree with subtasks under the task that created them. <strong>Open</strong> is the flat, sortable list of everything not finished (backlog included); <strong>All</strong> and the status buttons narrow it further.</p>
 <p>Press <code>Ctrl+K</code> (<code>Cmd+K</code> on macOS) on any project page to search the project and
 jump straight to a hit; <code>Ctrl+Shift+K</code> (or typing <code>&gt;</code>) lists the project&#39;s pages
 and &quot;Create new task&quot;, which opens the new-task form over the page you are on. Arrow keys move, Enter opens, Escape closes. The
@@ -65,7 +66,11 @@ you act with.</p>
 </thead>
 <tbody><tr>
 <td><strong>Overview</strong></td>
-<td>What the task is, its prompt, what it has spent, and the agent&#39;s own report</td>
+<td>The goal, what the task serves (with Run services), and the agent&#39;s own report; feedback, Reject and Close sit below</td>
+</tr>
+<tr>
+<td><strong>More</strong></td>
+<td>The prompt, task details, the full environment, and the less common things to do with the task</td>
 </tr>
 <tr>
 <td><strong>Regions</strong></td>
@@ -145,10 +150,33 @@ task that cannot be accepted yet says so wherever you are reading.</p>
 that came from the project&#39;s own default is shown faded, so the line never
 presents a default as a choice somebody made. If the last turn actually ran on
 something different, the line says that too.</p>
-<p>The <strong>Overview</strong> section shows the task&#39;s current <strong>prompt</strong> — what the agent was
+<p>The <strong>More</strong> tab shows the task&#39;s current <strong>prompt</strong> — what the agent was
 asked to do, including any later edit — with <strong>Prompt history</strong> one link away.
 The rest of the task&#39;s identity — branch, turn and commit counts, timestamps — is
 behind <strong>Details</strong> on the same section.</p>
+<h2 id="lazys-own-instructions-are-folded-away"><a class="anchor" href="#lazys-own-instructions-are-folded-away" aria-hidden="true">#</a>lazy&#39;s own instructions are folded away</h2>
+<p>Every turn lazy starts carries text lazy wrote, not you: a cluster task&#39;s
+contract on every turn, the framing around delivered notes and re-delivered
+feedback, and the wrap-up checks it runs at the end of a turn (uncommitted
+changes, the presentation walkthrough, the self-review). The agent needs all of
+it; you rarely do.</p>
+<p>In Lazy Teams the <strong>Turns</strong> tab lists chunks newest first, one drawer per chunk:
+your turn and everything that followed it. A long history is split into pages
+with <strong>← Newer</strong> / <strong>Older →</strong> links and a <strong>Go to chunk</strong> box, so nothing is
+hidden behind a fixed turn limit.</p>
+<p>So in the <strong>Turns</strong> tab — on both Lazy Teams and the local dashboard — each turn
+shows its own words first: your feedback, or the agent&#39;s output. lazy&#39;s text
+sits underneath in one closed drawer, <strong>lazy&#39;s instructions (N lines)</strong>. Open it
+to read exactly what the agent was sent; <strong>Copy</strong> still copies the whole turn.</p>
+<p>Only text lazy marked as its own when it wrote the turn is folded. Your words
+are never hidden — if you type something that looks like lazy&#39;s marker, it is
+shown escaped (its <code>&lt;</code> becomes <code>&amp;lt;</code>) and nothing is folded.</p>
+<p>Turns recorded before this existed are folded only where lazy recognises its
+own template: the cluster contract, matched exactly in its current wording, and
+lazy&#39;s own wrap-up checks, recognised by their heading (only checks whose text
+is entirely lazy&#39;s — never one that carries a person&#39;s or reviewer&#39;s words).
+Older cluster turns written with an earlier wording of the contract, and
+anything else, are shown in full.</p>
 <h2 id="moving-through-a-review-with-the-keyboard"><a class="anchor" href="#moving-through-a-review-with-the-keyboard" aria-hidden="true">#</a>Moving through a review with the keyboard</h2>
 <p>A review is a list of cards — a file in the diff, a turn, a note, a section of
 the agent&#39;s report — and reading one means working down that list. You can do it
@@ -281,7 +309,7 @@ ticked.</p>
 the port is published and nothing is behind it. When the task is not running at
 all, the card says so once rather than listing every service as dead.</p>
 <p>Each running service has an address of the form
-<code>http://&lt;service&gt;.&lt;task&gt;.lazy.localhost:&lt;port&gt;</code> — the same name lazy&#39;s own
+<code>http://&lt;task&gt;.&lt;service&gt;.lazy.localhost:&lt;port&gt;</code> — the same name lazy&#39;s own
 <code>lazy url</code> prints, on the port your project&#39;s daemon is reached on from the
 machine running Teams. That name answers from a browser <strong>on that machine</strong>
 (Chrome and Firefox resolve <code>*.localhost</code> to it without any setup) whether the
@@ -294,10 +322,54 @@ saying so.</p>
 <p>Where a declared port is not being served at all, the card says exactly that and
 stops — it does not guess at a cause, because it was not told one.</p>
 <p>The card also shows the project&#39;s <strong>Start services</strong> command — the one command
-that brings the project&#39;s services up in a task&#39;s shell — and members can
-designate, change or clear it right there. It is one command for the whole project,
-saved by the project&#39;s daemon; lazy does not edit your <code>lazy.toml</code> for it.
-Like the rest of the card, this appears only when the project declares services.</p>
+that brings the project&#39;s services up in a task&#39;s environment. It is one command for the
+whole project, saved by the project&#39;s daemon; lazy does not edit your <code>lazy.toml</code> for it.
+A task&#39;s page does not change it: <strong>Configure services</strong> takes you to the project&#39;s
+<strong>Configuration</strong> page, where any member can designate, change or clear it under
+<strong>Services</strong>.
+The card appears on every task&#39;s Overview and Services tab, whatever the task&#39;s state;
+above a diff in review it appears only when the project declares services.</p>
+<p>The task&#39;s <strong>Services</strong> tab is where you run it: it offers <strong>Run services</strong> and
+<strong>Configure services</strong>. A project that boots its servers with a script and declares no
+services sees a line saying so, and can still run the command there. <strong>Run services</strong> runs
+the command in the task&#39;s own environment — the same place its turns run and its declared
+ports are published — so the card reports what it is really serving. If the task&#39;s
+environment is not running, Run services starts it first, restoring the task&#39;s files if
+they are missing. The tab shows each step live as it happens — restoring task files,
+starting the task&#39;s environment, starting services — and ends with either &quot;Services are
+running&quot; or a plain statement of the step that failed and why. A command that exits as
+soon as it starts (a typo, a missing program, a port already in use) is reported as a
+failure with its last output, not as started.
+Once running, it keeps running between turns. The tab shows whether it is running and its
+latest output, with <strong>Restart services</strong> and <strong>Stop services</strong>.
+Under <strong>Running in this environment</strong> the tab lists what the command actually started, read
+from the task&#39;s environment each time you open the tab: the command and when it started,
+whether it is starting (up, but not yet listening on any port), running, or ended by itself
+(with its exit code), and each of its processes — process id, command line, and the ports it
+listens on, named after the declared service each one serves and whether that service
+answers. The output shows its most recent part; <strong>Show more output</strong> loads a longer stretch.
+The services are <strong>shared</strong>: one set per task, which every member sees on the tab and
+reaches through its addresses, and which any member can start, restart or stop. They keep
+running while members have terminals open. When the project itself restarts (for example
+when Lazy Teams is upgraded) the task&#39;s environment stops and the services with it; the tab
+says the environment is not running until someone presses <strong>Run services</strong> again, or the
+task&#39;s next work turn brings them back.</p>
+<p><strong>After every agent work turn</strong> — when the project has a Start services command and the
+task&#39;s environment is running — lazy stops the task&#39;s services and starts them again once,
+before the task is handed back, so what you open runs the code the agent just wrote. This
+happens even if they were not running before the turn; questions, reviews and syncs restart
+nothing. A failed stop is noted and the start still runs. A failed start never changes the
+task&#39;s state: the Services tab and the Overview show a <strong>warning</strong> with when it ran and the
+command&#39;s last output, and a successful restart is noted there too.</p>
+<p>The project&#39;s <strong>Configuration</strong> page also has an optional <strong>Stop services</strong> command under
+<strong>Services</strong>. When set, it runs in the task&#39;s environment first whenever services are stopped
+— <strong>Stop services</strong> and the restart after a turn — and lazy then ends whatever Start services
+launched either way. Without one, stopping simply ends those processes.
+A service never holds a real credential: if it calls a model, the call is billed to whoever
+owns the task&#39;s current turn, and it gets a 401 between turns. See
+<a href="../credentials/#services-and-background-processes-in-a-task-container">Services and background processes in a task container</a>.
+Saving or clearing the command returns you to the tab.</p>
+<p>Each service row also carries its <code>lazy url &lt;task&gt; &lt;service&gt;</code> command with a Copy button. When the task&#39;s environment is not running, <strong>Start container</strong> brings it up without starting a turn. Ports that only the task&#39;s own branch declares are listed under <strong>Ports on this branch only</strong>, each with a copyable <code>lazy forward</code> command; they are advice, and the project&#39;s own configuration still decides what is published.</p>
 <h3 id="maintained-files"><a class="anchor" href="#maintained-files" aria-hidden="true">#</a>Maintained files</h3>
 <p>Your project can name file groups that are expected to be kept up to date as
 work happens — documentation, a changelog — with <code>[[automation.maintain]]</code> in
@@ -451,6 +523,21 @@ feedback. You can still take it back.</li>
 <li><strong>Delivered in turn N (how long ago).</strong> The agent read it in that turn. There
 is nothing to take back — say so in your next feedback instead.</li>
 </ul>
+<h3 id="feedback-that-did-not-get-through"><a class="anchor" href="#feedback-that-did-not-get-through" aria-hidden="true">#</a>Feedback that did not get through</h3>
+<p>Sometimes feedback can&#39;t reach the agent: the project was unreachable, the task
+was busy, or the request was still waiting after a few minutes. Your words are
+never dropped. They show in a panel at the top of the task page, on every tab,
+with the reason and three buttons:</p>
+<ul>
+<li><strong>Resend</strong> sends the same words again.</li>
+<li><strong>Copy</strong> puts them on your clipboard.</li>
+<li><strong>Set aside</strong> removes them from the panel. They stay in the task&#39;s Activity
+list on Overview.</li>
+</ul>
+<p><strong>Restart</strong> and <strong>Resume</strong> never launch past feedback the agent hasn&#39;t had. The
+turn they start carries that feedback, word for word and oldest first, together
+with any notes still waiting. To launch without it, use <strong>Restart without it</strong>
+(or <strong>Resume without it</strong>); the words then stay in the panel.</p>
 <p>Questions are different, because they are answered as you ask them. A question
 of yours stays in the list as <strong>open business</strong> until you submit a review — your
 unblock, or your accept — at which point it moves into <strong>Filed asks</strong>, collapsed
@@ -811,7 +898,7 @@ second press is told the task is already starting. And a start that somehow
 never gets anywhere does not strand the task: the page goes back to offering
 <strong>Start</strong> rather than saying &quot;starting&quot; forever.</p>
 <h2 id="deciding-accept-reject-or-close"><a class="anchor" href="#deciding-accept-reject-or-close" aria-hidden="true">#</a>Deciding: accept, reject or close</h2>
-<p>The three verdicts live together at the bottom of the page, under <strong>Decide</strong>:</p>
+<p>Accept lives under <strong>Decide</strong>; Reject and Close sit with <strong>Give feedback</strong>, folded, each asking for a reason and a confirmation:</p>
 <table>
 <thead>
 <tr>
@@ -832,7 +919,7 @@ never gets anywhere does not strand the task: the page goes back to offering
 <td>Withdraw the task because it is no longer wanted — needs a reason</td>
 </tr>
 </tbody></table>
-<p><strong>Accept</strong> is the button; <strong>Reject the work</strong> and <strong>Close the task</strong> are folded
+<p><strong>Accept</strong> is the button; <strong>Reject the work</strong> and <strong>Close the task</strong> (under Give feedback) are folded
 away and open when you choose one. Both still ask you to confirm — folding is
 about weight on the page, not about removing the safeguard. On a phone, Accept
 is also on the action bar at the bottom of the screen so you do not have to
@@ -847,12 +934,13 @@ preflight, open raised items (if any), and the same <strong>Changes</strong> vie
 page. Resolving raised items on that page applies your decisions as part of the
 accept — not as a separate step beforehand. Confirming starts the merge in the
 background; the task page updates when it finishes.</p>
-<p>Protected-branch passphrase approval is not available in Lazy Teams — the
-passphrase is entered only at a terminal, so those merges must be completed
-from the CLI when the gate applies.</p>
+<p>A protected merge (the project&#39;s default branch is protected by default in Lazy
+Teams) is approved by pressing <strong>Accept</strong> yourself: the page says the merge is
+protected, and the task records you as the person who approved it. There is no
+passphrase. See <a href="../protected-branches/#in-lazy-teams-pressing-accept-is-the-approval">Protected branches</a>.</p>
 <h2 id="more-to-do-with-this-task"><a class="anchor" href="#more-to-do-with-this-task" aria-hidden="true">#</a>More to do with this task</h2>
-<p>Below the verdict is everything else the page can do with a task. None of it is
-a verdict, which is why it is not up there next to <strong>Accept</strong>, and the two that
+<p>The <strong>More</strong> tab holds everything else the page can do with a task. None of it is
+a verdict, which is why it is not next to <strong>Accept</strong>, and the two that
 change what tasks exist are folded away so they cannot be pressed by accident.</p>
 <p><strong>Ask the agent to review its work</strong> sends the agent back over its own change
 before you read it. It reads what it wrote and files what it finds on this page,
@@ -884,13 +972,23 @@ connected, nothing to send — the page says why.</p>
 <p>The push and the pull request use the forge connection the project is connected
 through, never credentials from your own machine. Submitting runs no agent and spends
 nothing on your Claude account.</p>
+<h3 id="submit-on-a-repository-lazy-teams-hosts"><a class="anchor" href="#submit-on-a-repository-lazy-teams-hosts" aria-hidden="true">#</a>Submit on a repository Lazy Teams hosts</h3>
+<p>If the project&#39;s repository is not on GitHub or GitLab (Lazy Teams hosts it), there
+is no pull request to open, so <strong>Submit…</strong> — and <code>lazy submit</code>
+in a clone bound to Teams — explains that instead of opening anything. Review
+happens on the task in Teams. The task&#39;s branch is pushed to the hosted
+repository after each of its turns, and <strong>Accept</strong> merges the work into the
+target branch and pushes that branch there, so teammates see it with
+<code>git fetch</code>. To get pull requests, connect the project to GitHub or GitLab.</p>
 <h2 id="reparent-moving-a-task-under-a-different-parent"><a class="anchor" href="#reparent-moving-a-task-under-a-different-parent" aria-hidden="true">#</a>Reparent: moving a task under a different parent</h2>
 <p><strong>Reparent…</strong>, in the header of any task that is not running or finished, moves
 the task under another task or branch — the same as <code>lazy reparent</code>. Pick one
 from the suggestions or type it. The task&#39;s branch is then synced onto its new
 parent straight away, which runs a turn on <strong>your</strong> Claude account, like
 <strong>Sync</strong> below. A task that has not started yet simply branches from the new
-parent when it does.</p>
+parent when it does. If the new parent has not started yet, there is nothing to
+merge yet and the page says so; the task merges the parent&#39;s work as soon as
+the parent starts.</p>
 <h2 id="sync-bringing-the-parents-work-in"><a class="anchor" href="#sync-bringing-the-parents-work-in" aria-hidden="true">#</a>Sync: bringing the parent&#39;s work in</h2>
 <p><strong>Sync</strong> merges the task&#39;s parent branch into the task&#39;s branch. Use it when the
 parent has moved on since this task started — most often when an accept is
@@ -1034,6 +1132,9 @@ with a turn&#39;s usage, and the page shows nothing rather than guessing.</p>
 <h2 id="shell-working-inside-the-tasks-environment"><a class="anchor" href="#shell-working-inside-the-tasks-environment" aria-hidden="true">#</a>Shell: working inside the task&#39;s environment</h2>
 <p>The <strong>Shell</strong> tab, last in the strip, opens terminals on the task. Everything
 here runs on the server; your browser only shows the terminal.</p>
+<p>If the task&#39;s checkout is missing, lazy restores it from its saved branch
+automatically, fetching the branch if needed. Opening a terminal does not start
+an agent turn. The branch must still exist locally or on the project&#39;s remote.</p>
 <ul>
 <li><strong>Shell</strong> opens a new shell. Open as many as you like; each has its own
 <strong>Close</strong>.</li>
@@ -1076,9 +1177,10 @@ start beforehand and nothing to clean up afterwards. The first terminal can take
 a moment while the environment starts, and the terminal shows what it is doing
 meanwhile. Right after Lazy Teams has been upgraded, that first start can take a
 few minutes.</p>
-<p><strong>What your environment shares with other tasks.</strong> The agent of this task is
-stopped while you work, but other tasks&#39; agents keep running, and a few things
-are common to all of them and to you:</p>
+<p><strong>What your environment shares with other tasks.</strong> This task&#39;s own environment
+keeps running while you work — with its shared services and anything a turn
+left running in it — and so do other tasks&#39; agents. A few things are common to
+all of them and to you:</p>
 <ul>
 <li>the project&#39;s git object store, which you and they can write (new commits and
 objects are added there by everyone);</li>
@@ -1101,7 +1203,9 @@ needs to read it.</p>
 long as your session lasts. Your environment has a network of its own, so they
 are reachable from your own terminals only — not from the agent&#39;s turns, and not
 through the task&#39;s service links — and nothing the agent left listening is
-reachable from yours. For the same reason, the project&#39;s own container settings
+reachable from yours. To run services everyone on the task sees and reaches
+through its service links, use <strong>Run services</strong> on the Services tab instead:
+they run in the task&#39;s own environment. For the same reason, the project&#39;s own container settings
 for networks, published ports, host names and DNS (<code>--network</code>, <code>-p</code>,
 <code>--add-host</code>, <code>--dns</code> and the like in <code>[docker] run_args</code>) are not applied to
 your environment; its other settings, such as memory limits, are.</p>
@@ -1153,11 +1257,11 @@ not only Pair — the task is held: no turn starts (unblocking or resuming it is
 refused with your name), and it cannot be synced, accepted, rejected or closed.
 An automatic sync waits and runs afterwards. All of it works again once your
 session has ended, about 30 seconds after you close your last terminal.</li>
-<li>Opening your first terminal stops the agent&#39;s own environment, and it stays
-stopped until your session has ended. Anything a turn left running there — a
-dev server, a file watcher — stops with it, so nothing of the agent&#39;s runs
-beside you. Its next turn starts a fresh one, and the agent is told so:
-anything it installed or changed outside the task&#39;s files is gone.</li>
+<li>Your terminals run in an environment of your own, never in the task&#39;s. The
+task&#39;s own environment keeps running while you work, and so do the task&#39;s
+services (see <strong>Services</strong>), which everyone on the task shares. Anything a
+turn left running there keeps running too; your terminal&#39;s git reads only
+copies of the task&#39;s git pointers that lazy checked when you opened it.</li>
 <li>One person at a time can work in a task, with as many terminals as they like.
 The tab says who it is.</li>
 <li>A terminal left open doesn&#39;t hold the task forever. It closes after an hour

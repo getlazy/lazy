@@ -35,7 +35,7 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="per-task-environment-variables"><a class="anchor" href="#per-task-environment-variables" aria-hidden="true">#</a>Per-task environment variables</h1>
 <p>This page explains how to give <strong>one</strong> task an API token without exposing it to every other task.</p>
@@ -57,7 +57,8 @@ at a staging database.</p>
 shell environment or in the agent image, where it costs nothing per task. The
 whole point of this feature is the granularity: the other tasks don&#39;t get it.</p>
 <p>Do not use it for large values either. It is capped at 64 variables and 128 KiB
-per task; if you need to hand a task a file, mount it with <code>[[mounts]]</code>.</p>
+per task. To hand a task a file, use a file entry in Lazy Teams (<a href="../lazy-teams-environment/">Environment
+variables, secrets and files</a>) or mount it with <code>[[mounts]]</code>.</p>
 <h2 id="the-security-model"><a class="anchor" href="#the-security-model" aria-hidden="true">#</a>The security model</h2>
 <p><strong>Values live on this host only.</strong> They are written to the daemon&#39;s own state
 directory — <code>~/.lazy/daemon/&lt;project-slug&gt;/task-env.json</code>, mode <code>0600</code> — and
@@ -66,9 +67,10 @@ nowhere else.</p>
 token already relies on:</p>
 <ul>
 <li>A task&#39;s container bind-mounts the project root <strong>read-only</strong>
-(<code>-v &lt;repo&gt;:&lt;repo&gt;:ro</code>). Anything under <code>&lt;project&gt;/.lazy/</code> is therefore
-readable by <em>every</em> agent — which is exactly the separation this feature
-exists to provide. So the values cannot live there.</li>
+(<code>-v &lt;repo&gt;:&lt;repo&gt;:ro</code>), so the project tree is readable by <em>every</em> agent.
+Lazy hides <code>&lt;project&gt;/.lazy/</code> inside containers, but the project tree is
+still the wrong place for a value meant for one task. So the values do not
+live there.</li>
 <li>The daemon state directory is never mounted into anything: lazy refuses any
 mount source inside it.</li>
 </ul>

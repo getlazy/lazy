@@ -1,5 +1,5 @@
 {
-  "version": "v0.91",
+  "version": "v0.92",
   "pages": [
     {
       "path": "accept-check",
@@ -10,7 +10,7 @@
         "the-accept-check",
         "the-defect",
         "half-one-the-check",
-        "where-it-runs-and-what-an-agent-can-influence",
+        "where-it-runs-and-why",
         "what-a-refusal-looks-like",
         "the-override",
         "cost",
@@ -27,11 +27,16 @@
         "the-agent-container",
         "the-default-image",
         "giving-your-project-its-own-image",
+        "when-dockerfilelazy-does-not-build",
         "scripts-that-call-node",
         "the-headless-browser",
+        "when-the-image-is-built",
+        "watching-rebuilding-and-cancelling-the-build",
+        "resetting-a-machines-docker-storage",
         "rebuilding",
         "when-an-agent-cannot-start",
-        "what-the-container-can-and-cannot-change-in-git"
+        "what-the-container-can-and-cannot-change-in-git",
+        "git-hooks-do-not-run-on-lazys-own-git"
       ]
     },
     {
@@ -82,6 +87,8 @@
         "what-the-driver-does",
         "how-many-children-run-at-once",
         "how-many-rounds-one-child-may-have",
+        "protected-files-are-decided-once-at-the-cluster",
+        "children-run-your-end-of-work-rules",
         "it-keeps-its-own-branch-current",
         "children-it-cannot-finish",
         "which-agent-the-children-run-on",
@@ -112,6 +119,7 @@
       "anchors": [
         "importing-claude-code-conversations",
         "builders-one-conversation-however-many-session-files",
+        "who-had-the-conversation",
         "live-capture-two-paths-both-automatic",
         "capture-never-shortens-a-conversation",
         "what-is-deliberately-not-captured",
@@ -156,7 +164,9 @@
         "the-credential-store-says-a-credential-is-stored-but-it-could-not-be-loaded",
         "agent-api-keys",
         "running-codex-on-a-chatgpt-subscription",
-        "human-only-by-design"
+        "services-and-background-processes-in-a-task-container",
+        "human-only-by-design",
+        "obsolete-agent-key-files"
       ]
     },
     {
@@ -200,24 +210,6 @@
         "4-wait-for-it-and-look-at-the-work",
         "5-give-feedback-or-accept",
         "where-to-go-next"
-      ]
-    },
-    {
-      "path": "host-boundary-guard",
-      "source": "host-boundary-guard.md",
-      "file": "host-boundary-guard/index.html",
-      "title": "The host file-tool boundary guard",
-      "anchors": [
-        "the-host-file-tool-boundary-guard",
-        "the-probe-and-its-exit-code-contract",
-        "runtime-preflight--opt-in-off-by-default",
-        "why-off-is-the-default",
-        "inconclusive-does-not-refuse-the-launch",
-        "caching",
-        "on-demand--lazy-system-verify-host-boundary",
-        "one-definition-of-the-boundary",
-        "requirements",
-        "related"
       ]
     },
     {
@@ -317,15 +309,40 @@
         "agents-in-lazy-teams",
         "choosing-an-agent-for-a-task",
         "the-agents-your-project-offers",
+        "long-prompts",
         "project-default-agent",
         "model-and-reasoning-effort",
         "agent-credentials",
+        "where-endpoints-and-profiles-come-from",
         "your-claude-credential",
         "account-team-and-project-credentials",
-        "credentials-for-a-projects-other-agents",
+        "endpoints-a-project-uses",
+        "tiered-agents-and-builders",
         "agents-the-project-adds",
         "automations",
         "cli-vs-teams"
+      ]
+    },
+    {
+      "path": "lazy-teams-builders",
+      "source": "lazy-teams-builders.md",
+      "file": "lazy-teams-builders/index.html",
+      "title": "Builders in Lazy Teams",
+      "anchors": [
+        "builders-in-lazy-teams",
+        "the-terminal",
+        "create-a-task-from-messages",
+        "files"
+      ]
+    },
+    {
+      "path": "lazy-teams-environment",
+      "source": "lazy-teams-environment.md",
+      "file": "lazy-teams-environment/index.html",
+      "title": "Environment variables, secrets and files",
+      "anchors": [
+        "environment-variables-secrets-and-files",
+        "what-a-task-gets"
       ]
     },
     {
@@ -341,6 +358,7 @@
         "what-to-configure-on-the-host",
         "projects-run-the-version-of-lazy-the-app-does",
         "continuing-without-email",
+        "inviting-people",
         "passwords"
       ]
     },
@@ -352,6 +370,7 @@
       "anchors": [
         "reviewing-tasks-in-lazy-teams",
         "how-the-page-is-laid-out",
+        "lazys-own-instructions-are-folded-away",
         "moving-through-a-review-with-the-keyboard",
         "linking-somebody-to-a-paragraph",
         "agent-report",
@@ -369,6 +388,7 @@
         "commenting-on-a-line-and-asking-about-one",
         "replying-to-a-conversation-on-a-line",
         "whether-your-note-got-there",
+        "feedback-that-did-not-get-through",
         "turning-a-discussion-into-a-task",
         "asking-about-a-section-of-the-walkthrough",
         "asking-about-a-sentence-of-the-agents-report",
@@ -384,6 +404,7 @@
         "deciding-accept-reject-or-close",
         "more-to-do-with-this-task",
         "submit-opening-a-pull-request",
+        "submit-on-a-repository-lazy-teams-hosts",
         "reparent-moving-a-task-under-a-different-parent",
         "sync-bringing-the-parents-work-in",
         "turns",
@@ -416,7 +437,10 @@
         "agentsname--named-agent-profiles",
         "two-profiles-two-upstreams-one-project",
         "spreading-work-across-models-by-tier",
+        "tiered-profiles--use-a-tier-until-it-says-no",
+        "the-builder-on-a-tiered-profile",
         "migrating-from-role-backends",
+        "endpointsname--named-endpoints",
         "session",
         "data",
         "storage",
@@ -446,6 +470,7 @@
         "proxy",
         "there-is-no-off-switch",
         "token-accounting--lazy-stats-tokens",
+        "response-latency--lazy-stats-latency",
         "which-tool-filled-the-context--lazy-stats-tools",
         "reading-the-trail-record-by-record--lazy-stats-audit",
         "smart-routing--proxyfallback-failover-chain",
@@ -541,6 +566,7 @@
         "unclassified-keys-fail-closed",
         "finding-out-why-your-config-is-being-ignored",
         "how-a-host-becomes-managed",
+        "code-from-the-repository",
         "the-classification-in-full",
         "refused",
         "overridden",
@@ -575,7 +601,7 @@
         "why-llm-first-with-a-mechanical-fallback",
         "seeing-what-is-injected",
         "in-the-browser",
-        "memory-vs-journal-vs-claudemd",
+        "memory-vs-journal-vs-claudemd--agentsmd",
         "record-shape",
         "the-200-character-description-limit-is-an-authoring-rule",
         "who-can-write-agents-are-read-only",
@@ -644,6 +670,7 @@
         "the-builders-review-survives-the-refusal",
         "ci-and-scripting",
         "approving-the-prmr-counts",
+        "in-lazy-teams-pressing-accept-is-the-approval",
         "enrolling-the-passphrase-lazy-system-passphrase",
         "migrating-from-lazyapprove-passphrase",
         "what-this-does-not-close",
@@ -717,6 +744,17 @@
         "who-decided",
         "how-an-item-is-labelled-in-the-web-ui",
         "review-surfaces"
+      ]
+    },
+    {
+      "path": "renaming-tasks",
+      "source": "renaming-tasks.md",
+      "file": "renaming-tasks/index.html",
+      "title": "Renaming a task",
+      "anchors": [
+        "renaming-a-task",
+        "what-changes-and-what-does-not",
+        "rules"
       ]
     },
     {
@@ -808,6 +846,7 @@
         "name-is-the-spelling-lazy-prints",
         "quote-a-multi-word-tag",
         "empty-tag-results-explain-themselves",
+        "searching-by-id",
         "result-order",
         "from-a-hit-to-the-thing-it-hit",
         "examples",
@@ -828,6 +867,15 @@
         "the-direct-port-is-local-only",
         "automatic-https",
         "behind-your-own-reverse-proxy",
+        "signing-in-through-your-proxys-login",
+        "behind-an-authenticating-proxy",
+        "set-it-up",
+        "what-the-token-is-and-what-happens-when-it-ends",
+        "git-to-hosted-repositories",
+        "rotating-the-signing-key",
+        "limits",
+        "check-it-from-your-machine",
+        "other-proxies",
         "serving-over-plain-http",
         "which-hostnames-the-install-answers-to",
         "sign-in-and-git-rate-limits",
@@ -835,6 +883,9 @@
         "private-repositories-and-forge-connections",
         "if-a-repository-cannot-be-cloned",
         "where-data-lives",
+        "automatic-backup-before-every-upgrade",
+        "restoring-a-backup",
+        "automatic-store-backup-before-every-roll",
         "keeping-the-fleet-on-your-own-filesystem",
         "adopting-an-existing-store",
         "before-you-start",
@@ -846,11 +897,15 @@
         "working-on-the-project-afterwards",
         "renaming-a-project-or-a-team",
         "hosting-repositories-on-the-install",
+        "recovering-commits-a-push-replaced",
+        "limits-on-git-requests",
         "task-turns",
         "confirming-it-on-your-server",
         "a-server-without-kvm",
         "why-the-local-backend-cannot-run-turns-in-the-container",
         "reaching-a-tasks-running-services",
+        "example-task-services-behind-ngrok-with-google-oauth",
+        "what-a-service-host-can-and-cannot-reach",
         "how-the-pieces-fit-together",
         "smolvm-default-one-project-per-microvm",
         "run-it-as-an-unprivileged-user-in-the-kvm-group-never-as-root",
@@ -858,7 +913,11 @@
         "local-no-microvms",
         "your-docker-socket-stays-on-your-host",
         "environment-reference",
+        "changing-a-microvms-size",
+        "checking-the-host-is-not-overcommitted",
+        "seeing-what-a-projects-machine-is-doing",
         "what-an-upgrade-does",
+        "stopping-every-project-at-once",
         "building-from-source-development",
         "which-build-is-running",
         "verifying-the-install",
@@ -878,8 +937,10 @@
       "anchors": [
         "reaching-a-tasks-dev-server",
         "naming-services",
-        "the-url-is-a-name-servicetasklazylocalhost",
+        "the-url-is-a-name-taskservicelazylocalhost",
         "--direct-for-curl-and-scripts",
+        "under-lazy-teams",
+        "links-in-the-pull-request",
         "when-nothing-is-listening",
         "what-the-host-port-is-and-why-it-isnt-3000",
         "changing-serve-takes-effect-on-the-next-container",
@@ -951,6 +1012,21 @@
       ]
     },
     {
+      "path": "store-backups",
+      "source": "store-backups.md",
+      "file": "store-backups/index.html",
+      "title": "Store backups before every upgrade",
+      "anchors": [
+        "store-backups-before-every-upgrade",
+        "when-a-backup-is-taken",
+        "where-and-how-many",
+        "when-a-backup-fails",
+        "taking-one-by-hand",
+        "restoring-a-backup",
+        "a-restore-refuses-a-link-in-the-backup"
+      ]
+    },
+    {
       "path": "surface-asymmetries",
       "source": "surface-asymmetries.md",
       "file": "surface-asymmetries/index.html",
@@ -1004,6 +1080,7 @@
         "34-getting-past-the-usage-pause-a-person-or-the-builder-one-task-at-a-time",
         "35-a-pull-request-into-a-parent-tasks-branch-a-person-may-ask-an-agent-may-not",
         "36-reading-a-prmr-agents-read-through-lazy-with-no-forge-token",
+        "37-the-machine-and-its-image-build-watched-by-people-not-agents",
         "when-you-find-an-asymmetry-that-is-not-listed-here"
       ]
     },
@@ -1061,17 +1138,22 @@
       "title": "Logging a machine in to Lazy Teams",
       "anchors": [
         "logging-a-machine-in-to-lazy-teams",
+        "cloning-a-hosted-project",
+        "how-git-gets-the-login",
         "logging-in",
         "what-a-bound-clone-can-do",
         "your-builder-from-a-bound-clone",
+        "working-on-a-tasks-branch-on-your-own-machine",
         "which-project-this-clone-is",
         "when-the-project-or-team-is-renamed",
-        "seeing-where-a-clone-points",
+        "seeing-where-a-machine-and-a-clone-point",
         "logging-out",
         "where-the-login-is-kept",
         "the-tokens-this-creates",
         "approving-from-the-browser",
-        "human-only-deliberately"
+        "human-only-deliberately",
+        "display-name",
+        "alternative-email-addresses"
       ]
     },
     {
@@ -1096,6 +1178,7 @@
         "doctors-cleanup-flags",
         "sessions-start-with-a-lot-of-the-context-window-already-used",
         "the-daemon-wont-start",
+        "the-daemon-runs-but-stops-doing-work",
         "daemon-is-not-running-while-a-daemon-clearly-is",
         "the-daemon-is-alive-but-nothing-is-happening",
         "the-daemon-answers-but-work-has-stopped-lazy-daemon-health",
@@ -1106,6 +1189,8 @@
         "a-codex-task-answers-then-cant-touch-any-file",
         "cursor-review-says-mcp-calls-were-rejected",
         "one-cursor-task-fails-auth-while-others-work",
+        "cursor-keeps-reconnecting-without-doing-work",
+        "a-turn-fails-with-e2big-argument-list-too-long",
         "lazy-pair-refuses-to-run-on-my-machine",
         "lazy-pair-or-lazy-chat-asks-me-to-login",
         "gh-isnt-logged-into-my-github-enterprise-server-host",
@@ -1120,6 +1205,8 @@
         "run-lazy-doctor-task-id-from-the-host",
         "turns-now-catch-this-by-themselves",
         "redacted-in-logs-and-audit-records",
+        "a-builder-fails-while-its-container-image-is-building",
+        "the-environment-that-runs-this-projects-tasks-isnt-working",
         "script-not-found-builder-or-a-selfcheck-with-no-output",
         "lazy-sync--lazy-unblock-sits-silent-for-minutes-after-an-upgrade",
         "the-fix-isnt-working-after-lazy-upgrade",
@@ -1128,7 +1215,8 @@
         "a-colleague-pushed-to-my-tasks-branch",
         "a-task-lists-hundreds-of-commits-it-never-made",
         "the-daemon-cant-fetch-from-the-remote",
-        "documentation-links"
+        "documentation-links",
+        "missing-git-pointers-inside-a-task-container"
       ]
     },
     {
@@ -1199,6 +1287,7 @@
         "the-services-card",
         "start-container",
         "start-services",
+        "services-restart-after-every-turn",
         "navigating-a-long-review",
         "times",
         "when-an-accept-is-refused",
@@ -1227,7 +1316,8 @@
         "threads-survive-a-re-diff-even-when-their-line-moves",
         "security-posture",
         "managed-mode-no-dashboard-at-all",
-        "known-limits"
+        "known-limits",
+        "copying-markdown"
       ]
     },
     {
@@ -1249,5 +1339,18 @@
     }
   ],
   "assets": [],
-  "unresolvedLinks": []
+  "unresolvedLinks": [
+    {
+      "source": "lazy-toml.md",
+      "href": "accept-check.md#where-it-runs-and-what-an-agent-can-influence"
+    },
+    {
+      "source": "self-hosting-lazy-teams.md",
+      "href": "#example-ngrok-with-google-oauth"
+    },
+    {
+      "source": "self-hosting-lazy-teams.md",
+      "href": "#removing-someone"
+    }
+  ]
 }

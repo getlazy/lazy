@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Renaming a task — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
+<main class="wrap">
+<h1 id="renaming-a-task"><a class="anchor" href="#renaming-a-task" aria-hidden="true">#</a>Renaming a task</h1>
+<p>A task&#39;s code is how you address it: <code>lazy show &lt;code&gt;</code>, dashboard links,
+<code>[serve]</code> service hostnames (<code>&lt;code&gt;.&lt;service&gt;.lazy.localhost</code>) and every other
+lookup use it. You can change it at any time, including after the task has run:</p>
+<pre><code class="language-bash">lazy edit release-v091 --code release-next
+</code></pre>
+<p>The same edit works from the <code>lazy_edit</code> MCP tool and from the Lazy Teams task
+edit page.</p>
+<h2 id="what-changes-and-what-does-not"><a class="anchor" href="#what-changes-and-what-does-not" aria-hidden="true">#</a>What changes, and what does not</h2>
+<p>A task&#39;s branch name is chosen when the task is created, from its code
+(<code>lazy/&lt;code&gt;</code>), so subtasks and reparented tasks can name it before it starts.
+Renaming a task that has <strong>not started yet</strong> moves that branch name with the
+code: nothing has been created under the old name, so nothing is left behind.</p>
+<p>Renaming a task that has already started is <strong>cosmetic</strong>. Only the code
+changes. Everything lazy named when the task first started keeps its original
+name:</p>
+<ul>
+<li>the git branch (<code>lazy/release-v091</code> above) and its worktree directory,</li>
+<li>the task&#39;s container and agent session,</li>
+<li>any pull request or merge request already opened for it.</li>
+</ul>
+<p>Nothing is renamed in git or on your forge, so nothing is pushed or deleted.
+Subtasks keep syncing, diffing and accepting against the parent&#39;s existing
+branch without any change. <code>lazy edit</code> prints which names stayed the same.</p>
+<p>What follows the new code straight away is everything addressed by code:
+lookups, dashboard URLs and service hostnames. The old code stops resolving;
+lazy does not keep it as an alias.</p>
+<h2 id="rules"><a class="anchor" href="#rules" aria-hidden="true">#</a>Rules</h2>
+<ul>
+<li>The new code follows the same rules as <code>lazy create --code</code>: lowercase
+letters, digits and hyphens, and no other open task may already use it.</li>
+<li>On a started task, change the code <strong>on its own</strong>, not together with other
+fields, and give a new code rather than clearing it.</li>
+<li>A task created later with the old code gets a branch of its own; it is never
+placed on the renamed task&#39;s branch.</li>
+<li>A task listed <strong>by code</strong> in <code>[protection].protected_tasks</code> cannot be
+renamed: the entry would stop matching and protect nothing. Run
+<code>lazy protect &lt;old-code&gt; off</code>, rename, then <code>lazy protect &lt;new-code&gt; on</code>.
+An entry written as the task&#39;s short id keeps working across a rename.</li>
+</ul>
+
+</main>
+</body>
+</html>

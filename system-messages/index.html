@@ -35,7 +35,7 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="system-messages"><a class="anchor" href="#system-messages" aria-hidden="true">#</a>System messages</h1>
 <p>System messages are proactive reports the system writes <strong>for the human</strong>: a
@@ -81,6 +81,9 @@ builder&#39;s launch context, and <code>lazy messages</code> shows the inbox at 
 <td>Lifecycle state — see below</td>
 </tr>
 </tbody></table>
+<p>Secret values lazy knows about (a task&#39;s secret environment variables and
+files) are scrubbed from the title and body when a message is written, so a
+report that quotes an agent&#39;s error output never shows them in clear.</p>
 <h2 id="lifecycle-append-only-never-deleted"><a class="anchor" href="#lifecycle-append-only-never-deleted" aria-hidden="true">#</a>Lifecycle: append-only, never deleted</h2>
 <p>Creation is append-only. Messages are never edited or deleted — reading and
 dismissal are state changes on the message, so the record of what the system
@@ -94,6 +97,11 @@ injected but stay in <code>lazy messages list</code>.</li>
 <li><strong>dismissed</strong> — hidden from default surfaces. <code>lazy messages list --all</code>
 still shows it, forever.</li>
 </ul>
+<p><strong>Repeats.</strong> Some events recur — Docker restarting again and again in a
+project&#39;s machine, for example. Instead of filing a new message each time, lazy
+keeps one open message for the event and counts the repeats on it (&quot;happened 37
+times, last …&quot;). A different kind of event still gets its own message, and once
+you dismiss the message the next occurrence starts a fresh one.</p>
 <h2 id="surfaces"><a class="anchor" href="#surfaces" aria-hidden="true">#</a>Surfaces</h2>
 <p><strong>Builder launch.</strong> Unread messages are injected compactly into the builder&#39;s
 system prompt — the same shape as the memory index: title + attribution per
@@ -104,8 +112,14 @@ section; it never blocks the launch.</p>
 <pre><code class="language-bash">lazy messages                 # the inbox (dismissed hidden)
 lazy messages read 3f9a01b2   # full body; marks it read
 lazy messages dismiss 3f9a01b2
+lazy messages dismiss --source machine-docker   # every open message from one source
+lazy messages dismiss --title &quot;restarted&quot;       # every open message whose title contains it
+lazy messages dismiss --all                     # every open message
 lazy messages list --all      # everything, including dismissed
 </code></pre>
+<p>A bulk dismissal shows how many messages match and asks before acting; <code>--yes</code>
+skips the question (and is required when there is no terminal to ask on).
+<code>--source</code> and <code>--title</code> combine.</p>
 <p><strong>MCP tools.</strong></p>
 <ul>
 <li><code>lazy_message_post(title, body, kind)</code> — file a message. Open to the builder
@@ -131,7 +145,11 @@ says when it was dismissed and by whom, and that the record is kept.</li>
 Opening it marks it read: <code>read_at</code> records that you have <em>seen</em> the message,
 and the body being on your screen is the most direct evidence of that. This
 matches <code>lazy messages read &lt;id&gt;</code>.</li>
-<li><strong>Dismiss</strong> is a button on both the list and the message itself. <strong>Mark read</strong>
+<li><strong>Dismiss</strong> is a button on both the list and the message itself.
+<strong>Dismiss all like this</strong> files away every open message with the same source
+and title, and <strong>Dismiss all</strong> (on the inbox) every open message — both ask
+first, and nothing is deleted. Lazy Teams&#39; Messages page offers the same
+buttons. <strong>Mark read</strong>
 is offered too, on unread rows, for filing something you have decided about
 from the title alone.</li>
 <li>The nav carries an unread badge and the dashboard shows an unread panel, so a

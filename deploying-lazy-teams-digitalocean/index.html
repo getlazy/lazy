@@ -35,9 +35,10 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="deploying-lazy-teams-on-digitalocean-with-kamal"><a class="anchor" href="#deploying-lazy-teams-on-digitalocean-with-kamal" aria-hidden="true">#</a>Deploying Lazy Teams on DigitalOcean with Kamal</h1>
+<p>Lazy Teams is in private alpha and is not yet generally released.</p>
 <p>This guide puts Lazy Teams on a <strong>cloud VPS</strong> — a DigitalOcean droplet or any similar Linux server — with <a href="https://kamal-deploy.org/" rel="noopener noreferrer">Kamal</a>. Kamal pulls (or builds) a container image, SSHes into your server, and runs the app behind <strong>kamal-proxy</strong>.</p>
 <p>For a <strong>local or single-box install</strong> without SSH keys or a registry account, use the <a href="../self-hosting-lazy-teams/">docker compose bundle</a> instead. That path is pull-and-go; this path is for cloud deploy and Kamal-style upgrades.</p>
 <p>The default in this repository is a <strong>private install</strong>: the droplet is not exposed on the public internet, and you reach the UI over an SSH tunnel (or Tailscale). Public HTTPS with Let&#39;s Encrypt is an optional later step.</p>

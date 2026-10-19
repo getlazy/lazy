@@ -1,0 +1,2140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Web review surface — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
+<main class="wrap">
+<h1 id="web-review-surface"><a class="anchor" href="#web-review-surface" aria-hidden="true">#</a>Web review surface</h1>
+<p>This page is for anyone reviewing and driving lazy tasks from a browser rather
+than the terminal: it describes the dashboard the daemon serves, how to sign in,
+what each page and tab shows, and where its limits are. The daemon&#39;s embedded web server hosts <strong>one page per task</strong>, at <code>/tasks/:task</code>
+— the task&#39;s code when it has one, its id otherwise, and either works — with
+tabs for everything you used to hunt across a task page and a review page:
+Summary, Verify, Regions, Changes, Turns, Commits, Reviews, Subtasks, Raised,
+Comments, Journal, Artifacts, Stats, Shell, Services, and <strong>Current review</strong>. Review is a tab on that page — the place your
+queued comments, ticks, and Unblock / Ask / Accept live — not a second site.
+Old <code>/review/:id</code> links 308 there.</p>
+<p>The <strong>review loop</strong> is still the same work: the queue of tasks awaiting you →
+read what changed → comment, ask, or verify → unblock or accept. It just
+happens on one address.</p>
+<p>It is an early implementation: the loop works end to end, but it is <strong>not
+hardened</strong>, and it binds to loopback only for that reason. Read <a href="#known-limits">Known
+limits</a> before exposing it on anything else.</p>
+<p>It also requires a <strong>signed-in browser session</strong> — see <a href="#signing-in">Signing
+in</a>. Loopback is no longer the only thing standing between the
+dashboard and everything else that can reach the daemon&#39;s port.</p>
+<h2 id="signing-in"><a class="anchor" href="#signing-in" aria-hidden="true">#</a>Signing in</h2>
+<pre><code class="language-bash">lazy dashboard          # sign in and open the dashboard in your browser
+lazy dashboard --print  # print the one-time login link instead of opening it
+</code></pre>
+<p><code>lazy dashboard</code> asks the daemon for a <strong>one-time login link</strong> and opens your
+browser at it. The browser trades the link for a session cookie and is
+redirected to the plain dashboard URL, so the secret never stays in the address
+bar. The link works <strong>once</strong>: run the command again for a new one. The session
+lasts <strong>30 days of use</strong> and is refreshed every time you load a page, so
+ordinary daily use never asks you to sign in again. It survives
+<code>lazy daemon restart</code>.</p>
+<p>lazy <strong>prints the link instead of opening a browser</strong> when opening one would be
+pointless or would spend the link on nothing:</p>
+<ul>
+<li><code>--print</code> (or <code>--no-open</code>) was passed,</li>
+<li>there is no terminal (a script, a pipe),</li>
+<li>you are on an SSH session — the browser would open at the far end,</li>
+<li>Linux with no graphical session (no <code>DISPLAY</code>, no <code>WAYLAND_DISPLAY</code>, not WSL),</li>
+<li>the platform opener (<code>open</code>, <code>xdg-open</code>, <code>start</code>) failed.</li>
+</ul>
+<p>Visiting any dashboard route without a session gets <strong>one plain sign-in page</strong>
+that says to run <code>lazy dashboard</code> — no task list, no counts, no project path.
+JSON routes answer <code>401</code> with the same instruction.</p>
+<p><code>lazy daemon dashboard-url</code> is unchanged and still prints the dashboard&#39;s plain
+address with no secret in it, for scripts and for pasting into an already
+signed-in browser. It does not sign you in.</p>
+<p>There is no per-browser sign-out. Sessions live in the daemon&#39;s runtime state,
+next to its token, at <code>~/.lazy/daemon/&lt;project&gt;/dashboard-sessions.json</code>;
+deleting that file signs every browser out at once.</p>
+<h2 id="command-palette"><a class="anchor" href="#command-palette" aria-hidden="true">#</a>Command palette</h2>
+<p>From any dashboard page, open a VS Code–style palette without leaving where you
+are:</p>
+<table>
+<thead>
+<tr>
+<th>Shortcut</th>
+<th>Mode</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>Ctrl+K</code> (<code>Cmd+K</code> on macOS)</td>
+<td>Search tasks, turns, commits, comments, conversations, memories, and raised items</td>
+</tr>
+<tr>
+<td><code>Ctrl+Shift+K</code> (<code>Cmd+Shift+K</code>)</td>
+<td>Command mode — the query starts with <code>&gt;</code></td>
+</tr>
+</tbody></table>
+<p>In command mode you can filter the list (or type <code>&gt;</code> yourself in search mode).
+Commands include creating a new task (opens a dialog over the current page),
+and navigating to the dashboard, clusters, task lists, review queue, inbox, raised
+items, conversations, settings, and the full search page.</p>
+<p>In search mode the last result is always <strong>Search everything for &quot;…&quot;</strong>, which
+opens the full <code>/search</code> page for what you typed — the palette shows a short,
+flat list, and the page has the filters and the query-syntax reference.</p>
+<p>Arrow keys move the selection; Enter runs it; Escape closes. There is no Search
+link in the nav: the search box in the header is the no-scripting path, and it
+works with scripting off like any other form.</p>
+<h3 id="the-dashboard-has-its-own-hostname"><a class="anchor" href="#the-dashboard-has-its-own-hostname" aria-hidden="true">#</a>The dashboard has its own hostname</h3>
+<p>The dashboard is at <strong><code>http://lazy.localhost:&lt;port&gt;</code></strong>, not <code>http://127.0.0.1:&lt;port&gt;</code>,
+and it refuses any request addressed to another host: a session cookie is
+neither accepted nor handed out there. If you reach the port by its IP address
+you get a short page pointing you at the right URL.</p>
+<p>If you put the dashboard behind a trusted reverse proxy, set <code>[server] dashboard_url</code>
+in <code>lazy.toml</code> to its public origin (for example <code>https://lazy.example.com</code>).
+That origin then becomes the only host the dashboard accepts and the address its
+links use; the proxy must forward the original <code>Host</code> header, and <code>lazy doctor</code>
+shows which origin is in effect.</p>
+<p>That is a security boundary, not a preference. Browser cookies are scoped by
+<strong>hostname, not by port</strong> — one cookie for <code>127.0.0.1</code> is sent to <em>everything</em>
+on <code>127.0.0.1</code>, whatever port it is on. Apps your tasks start under <code>[serve]</code>
+are published on loopback ports, and that code was written by an agent. If the
+dashboard shared their hostname, opening a task&#39;s app to try it out would hand
+your dashboard session to that app, which could then use it against the
+dashboard.</p>
+<h3 id="task-apps-are-subdomains-and-stay-a-separate-jar"><a class="anchor" href="#task-apps-are-subdomains-and-stay-a-separate-jar" aria-hidden="true">#</a>Task apps are subdomains, and stay a separate jar</h3>
+<p>Each task&#39;s services are reachable through this same listener at
+<code>http://&lt;task&gt;.&lt;service&gt;.lazy.localhost:&lt;port&gt;</code> (see
+<a href="../serve-ports/">serve ports</a>) — a hostname <em>under</em> the dashboard&#39;s. Three
+things keep that from undoing the separation above:</p>
+<ul>
+<li><strong>The session cookie is host-only.</strong> It is set with no <code>Domain=</code> attribute,
+ever, so the browser sends it to <code>lazy.localhost</code> and to nothing else. A
+<code>Domain=lazy.localhost</code> cookie would be sent to every task app on the machine.</li>
+<li><strong>The proxy does not forward it.</strong> Any <code>Cookie</code> header on a request to a task
+subdomain is dropped before the request reaches the container, so a
+hand-crafted request cannot smuggle the dashboard session in either.</li>
+<li><strong>A task app cannot widen its own cookies.</strong> <code>Domain=</code> is stripped from every
+<code>Set-Cookie</code> a task app returns, so it cannot plant a cookie that the browser
+would then send to the dashboard.</li>
+</ul>
+<p>There is one thing a subdomain <em>does</em> change. <code>SameSite=Strict</code> is evaluated on
+the registrable domain, and <code>.localhost</code> is not a public suffix — so a task&#39;s
+own app counts as <strong>same-site</strong> with the dashboard, and <code>SameSite</code> alone would
+not stop a page served by a task from posting to a dashboard route with your
+cookie attached. That is why anything that can change state — every unsafe
+method, plus WebSocket upgrades — must additionally come from the dashboard&#39;s
+own <strong>origin</strong>; see <a href="#security-posture">Security posture</a> below. Plain <code>GET</code>
+navigation is deliberately exempt, so following a link from a task app back to
+the dashboard still works.</p>
+<p><code>lazy.localhost</code> is a loopback name — anything under <code>.localhost</code> resolves to
+your own machine, and Chrome and Firefox resolve it themselves without any
+setup. If your browser cannot reach it, <code>lazy dashboard</code> says so and prints the
+one line to add to <code>/etc/hosts</code>:</p>
+<pre><code>127.0.0.1 lazy.localhost
+</code></pre>
+<p>A hosts file cannot hold a wildcard, so that line covers the dashboard but not
+the task subdomains: for those you need a browser that resolves <code>.localhost</code>
+itself, and for <code>curl</code> and scripts there is <code>lazy url &lt;task&gt; &lt;service&gt; --direct</code>.</p>
+<h2 id="the-task-page"><a class="anchor" href="#the-task-page" aria-hidden="true">#</a>The task page</h2>
+<p>Static text grows with the page instead of scrolling inside a fixed-height box.
+Use a section&#39;s header or collapse control to fold it to a single line, and open
+it again to read the full text. Editable boxes and interactive terminals retain
+their own scrolling.
+In Teams, live updates keep drawers open or closed as you left them, even while
+their contents change.</p>
+<p>Every task lives at <code>/tasks/:task</code> — the task&#39;s code when it has one, its id
+otherwise; both resolve, so old id-based links keep working. The tabs are always
+the same, in this order,
+so muscle memory survives moving from one task to another. Only <strong>Shell</strong> hides,
+and only when the runner has no container to enter.</p>
+<table>
+<thead>
+<tr>
+<th>Tab</th>
+<th>What it is</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>Summary</strong></td>
+<td>Status-driven: what this task is, what just happened, the agent&#39;s report of what a user would notice.</td>
+</tr>
+<tr>
+<td><strong>Verify</strong></td>
+<td>How to check the work — the latest turn&#39;s steps, older ones collapsed as superseded.</td>
+</tr>
+<tr>
+<td><strong>Regions</strong></td>
+<td>The groups the agent&#39;s walkthrough declares — in the order it declared them, <code>Other changes</code> last, each with its tier and owner. Picking one scopes the Changes tab to it. See <a href="../review-regions/">Review regions</a>.</td>
+</tr>
+<tr>
+<td><strong>Changes</strong></td>
+<td>The diff, presented when the agent declared a walkthrough, raw files one click away. A small card above it says how many regions there are and which one is in force.</td>
+</tr>
+<tr>
+<td><strong>Turns</strong></td>
+<td>The record, reviewed a <strong>chunk</strong> at a time. A chunk is what happened since you last acted — your turn and every agent, nudge and auto-resume turn that followed, until you acted again — and it is one card: headed by the turn that opened it and the first line of what you asked for, with those turns, plus any comments and journal entries from the same window, inside it. Each agent turn lists the commits it made underneath, and each can be collapsed on its own. Ticking a chunk Viewed and the <code>j</code> / <code>k</code> keys both move a whole chunk. Newest first throughout.</td>
+</tr>
+<tr>
+<td><strong>Commits</strong></td>
+<td>Every commit on the task, newest first — the same rows as under each turn, in one list.</td>
+</tr>
+<tr>
+<td><strong>Reviews</strong></td>
+<td>Successful formal agent reviews — when, verdict, raise count, links to the turn and Raises (including reviews that filed issues). A turn that produced no usable Raises and no <strong>clean</strong> parseable security/data-integrity sweeps does not get a row here — check <strong>Turns</strong> for an unparsed banner or an incomplete recording.</td>
+</tr>
+<tr>
+<td><strong>Subtasks</strong></td>
+<td>Direct children, grouped by status, each group listing the most recently updated child first. Click a column header to re-sort a group; the jump bar above the groups opens and scrolls to any group in one click. The <strong>Nested</strong> column counts everything under that child — its own subtasks, theirs, and so on — and links into that child&#39;s Subtasks tab; a dash means nothing is nested under it.</td>
+</tr>
+<tr>
+<td><strong>Raised</strong></td>
+<td>Questions and proposals; a row opens the item in a dialog.</td>
+</tr>
+<tr>
+<td><strong>Comments</strong></td>
+<td>Every comment on the task, oldest first, split into the ones the agent has already been shown and the ones still queued for its next turn. Add one here in any status, finished tasks included — it is saved and nothing else, it reaches the agent in the prompt of the next Unblock, and it never starts a turn on its own. On a finished task a comment is an annotation for whoever reads the task later; if the task is reopened or redone, it rides that next turn. The tab&#39;s badge reads <code>queued/total</code> while any are waiting. If the store cannot be written, the page hands your text back so nothing you typed is lost.</td>
+</tr>
+<tr>
+<td><strong>Journal</strong></td>
+<td>The task&#39;s out-of-prompt record — rationale, deferrals, notes to whoever picks the task up next. Newest first. Journal entries are never injected into an agent&#39;s prompt; a later turn is only told how many new ones exist. Append with <code>lazy journal &lt;task&gt;</code>.</td>
+</tr>
+<tr>
+<td><strong>Artifacts</strong></td>
+<td>Files attached to the task — screenshots and reports its agent published, inputs handed to it. Previews images, text and Markdown; <strong>Add an input file</strong> attaches one for the agent&#39;s next turn without starting it. See <a href="../artifacts/">artifacts.md</a>.</td>
+</tr>
+<tr>
+<td><strong>Stats</strong></td>
+<td>Where this task&#39;s time and tokens went, and — for a task with subtasks — its whole subtree&#39;s. See <a href="#what-the-stats-tab-means">What the Stats tab means</a> below. The tab&#39;s badge is the total tokens recorded across its own turns.</td>
+</tr>
+<tr>
+<td><strong>Shell</strong></td>
+<td>Terminals in the task&#39;s container, plus Pair and Chat. See <a href="../web-shell/">Web shell</a>.</td>
+</tr>
+<tr>
+<td><strong>Services</strong></td>
+<td>Declared ports, liveness, Start container / Start services.</td>
+</tr>
+<tr>
+<td><strong>Current review</strong></td>
+<td>Your in-progress review — queued comments, ticks, and the buttons that end the turn.</td>
+</tr>
+</tbody></table>
+<p>Clicking a tab with JavaScript on swaps the body in place, so a terminal you
+opened under a verification step keeps running. A full navigation or reload
+still closes every shell. Without JavaScript each tab is a real page.</p>
+<p>Numbers 1–9 jump to Summary, Verify, Regions, Changes, Turns, Subtasks, Raised,
+Shell and Current review, in that order (Summary is 1, Current review is 9).
+Commits, Reviews, Comments, Journal, Artifacts, Stats and Services have no number — use <code>[</code> / <code>]</code>
+or click them.
+Current review comes last, picked out in the accent colour.</p>
+<p>The strip shows every tab: when they do not all fit across the window it wraps
+onto a second and third row rather than letting the last ones slide out of
+sight.</p>
+<h2 id="clusters"><a class="anchor" href="#clusters" aria-hidden="true">#</a>Clusters</h2>
+<p><strong>Clusters</strong> is the second entry in the top nav, right after Dashboard. It lists
+every <strong>cluster task</strong> — a task whose agent does not do the work itself but
+creates subtasks and drives them: deciding which of them can run at the same
+time, reviewing each one as it comes back, then accepting it.</p>
+<p>Each cluster shows:</p>
+<ul>
+<li><strong>k of n accepted</strong> — how many of its subtasks have landed, out of the ones
+still expected to. Subtasks the cluster closed are reported separately and do
+not inflate the denominator.</li>
+<li><strong>What is running</strong> — every subtask in flight; a cluster may have any number.</li>
+<li><strong>What was deferred</strong> — subtasks the cluster set aside for later.</li>
+<li><strong>Every subtask</strong>, with its status, so you can see where a cluster is without
+opening it.</li>
+</ul>
+<p>Those numbers are worked out from the subtasks themselves every time the page is
+drawn, so they cannot go stale when a subtask is closed, moved, or accepted by
+you rather than by the cluster.</p>
+<p><strong>New cluster</strong> at the top of the page opens the ordinary create form with the
+type already set to <code>cluster</code> — the same fields as <code>lazy create --type cluster</code>.</p>
+<h2 id="settings"><a class="anchor" href="#settings" aria-hidden="true">#</a>Settings</h2>
+<p><strong>Settings</strong> in the top nav is where project memory and installation health
+live:</p>
+<ul>
+<li><strong>Memories</strong> — the shared memory records (the same store as <code>lazy memory</code>).
+<code>/memory</code> still works; it redirects here.</li>
+<li><strong>Doctor</strong> — the last <code>lazy doctor</code> report this machine produced, a <strong>Run</strong>
+button that executes the same sweep, and a button per cleanup flag. Opening
+the page does not probe docker or git; Run does. Cleanup of worktrees,
+images or containers lists what it would remove and asks before acting.</li>
+</ul>
+<h2 id="routes"><a class="anchor" href="#routes" aria-hidden="true">#</a>Routes</h2>
+<p>All served in-process by the daemon (same process, same <code>storage</code> instance —
+never a second writer). The dashboard&#39;s base URL is printed by
+<code>lazy daemon status</code>, and every route below needs a session.</p>
+<table>
+<thead>
+<tr>
+<th>Route</th>
+<th>Method</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>/review</code></td>
+<td>GET</td>
+<td>Review queue — blocked tasks, with last activity, subtask count, and comment / pending-ask / queued-comment counts; <code>?sort=&lt;column&gt;</code> re-orders it (a leading <code>-</code> means descending)</td>
+</tr>
+<tr>
+<td><code>/review/:task</code></td>
+<td>GET</td>
+<td><strong>308</strong> → <code>/tasks/:task/review</code> (Current review tab). Bookmarks and old links keep working.</td>
+</tr>
+<tr>
+<td><code>/review/:task/&lt;action&gt;</code></td>
+<td>POST</td>
+<td><strong>308</strong> → <code>/tasks/:task/review/&lt;action&gt;</code> (method and body preserved)</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/review</code></td>
+<td>GET</td>
+<td>Current review tab — queued comments, accept checklist, Unblock / Ask / Accept (each a dialog), Reject / Sync / Submit. Review is a tab on the task page, not a separate page.</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/review/comment</code></td>
+<td>POST</td>
+<td>Post a line-anchored message (JSON), <code>intent: &#39;ask&#39; | &#39;comment&#39;</code></td>
+</tr>
+<tr>
+<td><code>/tasks/:task/review/ask</code></td>
+<td>POST</td>
+<td>Ask a task-level reflective question (form or JSON; 303 → <code>/tasks/:task/review</code> without JS)</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/review/thread/:thread/promote</code></td>
+<td>POST</td>
+<td>Promote an answered discussion into a new backlog task — goal, code, prompt and subtask-vs-sibling from the form (303 → <code>/tasks/:task/review?promoted=&lt;code&gt;</code>)</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/review/comment/:id/retry</code></td>
+<td>POST</td>
+<td>Re-send a saved question whose ask failed (form; 303 → <code>/tasks/:task/review</code>)</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/review/comment/:id/withdraw</code></td>
+<td>POST</td>
+<td>Retract one of your own messages before it reaches the agent (form; 303 → <code>/tasks/:task/review</code>)</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/review/raised</code></td>
+<td>POST</td>
+<td>Decide one open raised item (respond / acknowledge / dismiss / promote to subtask / promote to peer), blocking or not; the comment — and, for a promotion, the new task — lands on the next unblock or accept</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/review/raised/unresolve</code></td>
+<td>POST</td>
+<td>Undo a resolution whose comment has not been delivered yet</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/review/unblock</code></td>
+<td>POST</td>
+<td>Unblock with feedback, carrying every queued comment (form; 303 → <code>/tasks/:task/review</code>); may also carry raised-item resolutions</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/review/accept</code></td>
+<td>POST</td>
+<td>Accept the task (form; carries the approval passphrase when the gate asks for one, raised-item resolutions when deciding on the page, and <code>allow_queued_comments=1</code> when you choose to merge without delivering queued comments)</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/review/sync</code></td>
+<td>POST</td>
+<td>Merge the parent branch into the task branch — the in-UI remedy for an out-of-sync or conflicted accept (form)</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/review/draft</code></td>
+<td>POST</td>
+<td>Autosave the review in progress — unsent feedback, unsent accept reason, viewed/collapsed ticks (JSON <code>{ patch }</code>)</td>
+</tr>
+<tr>
+<td><code>/api/review/queue</code></td>
+<td>GET</td>
+<td>The queue as JSON, in the order <code>/review</code> would show it (<code>?sort=</code> accepted)</td>
+</tr>
+<tr>
+<td><code>/api/review/:task/file-lines</code></td>
+<td>GET</td>
+<td>A line range of one file at the task&#39;s diff revisions (<code>path</code>, <code>side</code>, <code>start</code>, <code>end</code>) — what the diff&#39;s expand controls read; refuses any path that is not part of the diff</td>
+</tr>
+<tr>
+<td><code>/api/review/:task/threads</code></td>
+<td>GET</td>
+<td><code>{ threads, taskThreads, pending, pendingDelivery, everQueued, everAsked, queued, state }</code> — what the island polls</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/review/session</code></td>
+<td>GET</td>
+<td><strong>410</strong> unless a stored builder-review transcript exists (read-only archive). Start/send are gone.</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/review/session/start</code></td>
+<td>POST</td>
+<td><strong>410</strong> — Review with builder cannot be started</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/review/session/send</code></td>
+<td>POST</td>
+<td><strong>410</strong> — Review with builder cannot be continued</td>
+</tr>
+<tr>
+<td><code>/api/review/:task/session</code></td>
+<td>GET</td>
+<td><strong>410</strong> unless a stored transcript exists (JSON archive)</td>
+</tr>
+<tr>
+<td><code>/tasks/:task</code></td>
+<td>GET</td>
+<td>Task page, Summary tab — goal, status, parent, PR/MR link, lifecycle actions, and a body that follows the task&#39;s status (including <code>behavior_change</code> / <code>capabilities_lost</code> from the agent&#39;s report)</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/changes</code></td>
+<td>GET</td>
+<td>Changes tab — the presented/raw diff, with the report&#39;s <code>implementation</code> section as preamble</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/verify</code></td>
+<td>GET</td>
+<td>Verify tab — latest how-to-verify steps, superseded history, per-step ticks</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/turns</code></td>
+<td>GET</td>
+<td>Turns tab — one card per turn chunk, with comments and journal folded in by time; each agent turn lists the commits it made underneath; newest-first throughout, with a line saying what a chunk is</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/turns/:n</code></td>
+<td>GET</td>
+<td>Redirects to <code>/tasks/:task/turns#turn-:n</code> — the Turns tab, scrolled to that turn inside its chunk. A sequence the task does not have is a 404</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/commits</code></td>
+<td>GET</td>
+<td>Commits tab — every commit on the task, newest first</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/reviews</code></td>
+<td>GET</td>
+<td>Reviews tab — successful formal agent reviews (failed/unparsed reviews omitted)</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/subtasks</code></td>
+<td>GET</td>
+<td>Subtasks tab — direct children grouped by status, with a filter and no cap</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/raised</code></td>
+<td>GET</td>
+<td>Raised tab — blocking and non-blocking items</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/comments</code></td>
+<td>GET</td>
+<td>Comments tab — every comment, oldest first, split into seen by the agent and queued for its next turn</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/comments/add</code></td>
+<td>POST</td>
+<td>Adds a comment and nothing else — no turn is started. Redirects back to the Comments tab</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/comments/:comment/edit</code></td>
+<td>POST</td>
+<td>Replaces the text of a comment the agent has not been shown yet. A comment it has already seen is refused, with the reason and your text handed back. Redirects back to the Comments tab</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/journal</code></td>
+<td>GET</td>
+<td>Journal tab — the task&#39;s out-of-prompt record, newest first</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/artifacts</code></td>
+<td>GET</td>
+<td>Artifacts tab — the task&#39;s files, with previews and an upload form (<a href="../artifacts/">artifacts.md</a>)</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/artifacts/file?name=…</code></td>
+<td>GET</td>
+<td>One artifact&#39;s bytes; add <code>&amp;download=1</code> to force a download</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/artifacts/upload</code></td>
+<td>POST</td>
+<td>Attach an input file (multipart form: <code>file</code>, optional <code>name</code>)</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/stats</code></td>
+<td>GET</td>
+<td>Stats tab — turn count, the time split, per-turn and cumulative token charts, and per-tool calls and result tokens when the proxy recorded any. <code>?scope=task</code> narrows it to the task alone; a task with descendants defaults to the whole subtree</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/shell</code></td>
+<td>GET</td>
+<td>Shell tab — index of this page&#39;s terminals, Pair, Chat; hidden when the runner has no container</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/services</code></td>
+<td>GET</td>
+<td>Services tab — declared ports, liveness, and ports this branch added that the project root does not publish</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/commits/:commit</code></td>
+<td>GET</td>
+<td>One commit on its own page, with its diff</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/prompts/:version</code></td>
+<td>GET</td>
+<td>One version of the task&#39;s prompt</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/edit</code></td>
+<td>GET</td>
+<td>Edit form for a task&#39;s goal and prompt (and the model, effort and agent its next turn will use)</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/edit</code></td>
+<td>POST</td>
+<td>Save those edits (form; 303 → <code>/tasks/:task</code>) — see <a href="#editing-a-task">Editing a task</a></td>
+</tr>
+<tr>
+<td><code>/tasks/new</code></td>
+<td>GET / POST</td>
+<td>Create a task — see <a href="#creating-a-task">Creating a task</a></td>
+</tr>
+<tr>
+<td><code>/tasks/link</code></td>
+<td>GET / POST</td>
+<td>Link a branch or PR as a blocked task — see <a href="#linking-a-branch-or-pr">Linking a branch or PR</a></td>
+</tr>
+<tr>
+<td><code>/tasks/:task/actions/:verb</code></td>
+<td>POST</td>
+<td>Lifecycle action from the task page — <code>start</code>, <code>stop</code>, <code>close</code>, <code>reject</code>, <code>resume</code>, <code>reopen</code>, <code>sync</code>, <code>submit</code>, or <code>review</code> (form; 303 → <code>/tasks/:task</code>) — see <a href="#acting-on-a-task">Acting on a task</a>. With scripting on, returns 202 and the page follows <code>/tasks/:task/action-runs/:runId</code>.</td>
+</tr>
+<tr>
+<td><code>/tasks/:task/live-status</code></td>
+<td>GET</td>
+<td>Cheap JSON freshness keys the open task page polls — one per section, so only the parts that moved react</td>
+</tr>
+<tr>
+<td><code>/raised</code></td>
+<td>GET</td>
+<td>Cross-task raised-item queue (open items by default; <code>/raised?all=1</code> for resolved); <code>?gate=blocking</code> / <code>?gate=non-blocking</code> filter by whether they gate accept, and <code>?sort=&lt;column&gt;</code> re-orders it (a leading <code>-</code> means descending), composing with the filters</td>
+</tr>
+<tr>
+<td><code>/raised/:id</code></td>
+<td>GET</td>
+<td>Opens the owning task&#39;s Raised tab with that item in a dialog (JS off: the same page, dialog in-flow). The address bar reads <code>/raised/:id</code>; Back and ESC close without acting.</td>
+</tr>
+<tr>
+<td><code>/raised/:id/decide</code></td>
+<td>POST</td>
+<td>Decide that item — respond, acknowledge, dismiss (with an optional note), or promote to a backlog task (form; 303 → the item, or the new task on promote)</td>
+</tr>
+<tr>
+<td><code>/raised/:id/blocking</code></td>
+<td>POST</td>
+<td>Change whether that item gates accept (form; 303 → the item)</td>
+</tr>
+<tr>
+<td><code>/followups</code>, <code>/followups/:id</code>, <code>/api/followups</code></td>
+<td>GET</td>
+<td>The pre-unification paths — 308-redirected to their <code>/raised</code> equivalents rather than 404ing, because they are in old task prompts and bookmarks</td>
+</tr>
+<tr>
+<td><code>/sessions</code></td>
+<td>GET</td>
+<td><strong>410</strong> — Review with builder was removed</td>
+</tr>
+<tr>
+<td><code>/builders</code></td>
+<td>GET</td>
+<td>Builders — one per builder conversation (start or <code>/clear</code> to the next <code>/clear</code>), newest first; <code>?q=</code> searches their message bodies (an invalid or too-slow pattern is refused, not a server error)</td>
+</tr>
+<tr>
+<td><code>/builders/:id</code></td>
+<td>GET</td>
+<td>One Builder&#39;s transcript across all its session files, paged 40 messages at a time (<code>?offset=</code>); any of its session ids works</td>
+</tr>
+<tr>
+<td><code>/api/builders</code></td>
+<td>GET</td>
+<td>The Builders listing as JSON — metadata, session ids and run state, never transcripts</td>
+</tr>
+<tr>
+<td><code>/conversations</code>, <code>/conversations/:session</code></td>
+<td>GET</td>
+<td>The old paths — 301-redirected to their <code>/builders</code> equivalents</td>
+</tr>
+<tr>
+<td><code>/api/conversations</code></td>
+<td>GET</td>
+<td>The per-session-file listing as JSON, kept for existing clients</td>
+</tr>
+<tr>
+<td><code>/scratch</code></td>
+<td>GET</td>
+<td>Captured builder scratch files, grouped by the Builder that last wrote them, with size and capture time; files recorded by name only are marked with the reason. <code>?q=</code> searches within them</td>
+</tr>
+<tr>
+<td><code>/scratch/file?path=</code></td>
+<td>GET</td>
+<td>One scratch file — markdown rendered, <code>&amp;raw=1</code> for the source; a name-only file says why it has no body</td>
+</tr>
+<tr>
+<td><code>/api/scratch</code></td>
+<td>GET</td>
+<td>The scratch listing as JSON — grouped by Builder, never file bodies</td>
+</tr>
+<tr>
+<td><code>/settings</code></td>
+<td>GET</td>
+<td>Settings — Memories tab (same listing as <code>/settings/memory</code>)</td>
+</tr>
+<tr>
+<td><code>/settings/memory</code></td>
+<td>GET</td>
+<td>Shared memory records — the Memories tab (live by default; <code>?all=1</code> includes removed ones)</td>
+</tr>
+<tr>
+<td><code>/settings/doctor</code></td>
+<td>GET</td>
+<td>Doctor — last health report this machine produced, or an empty state. Does not run checks.</td>
+</tr>
+<tr>
+<td><code>/settings/doctor/run</code></td>
+<td>POST</td>
+<td>Run doctor (the same sweep as <code>lazy doctor</code>); streams progress.</td>
+</tr>
+<tr>
+<td><code>/settings/doctor/remedy/:flag</code></td>
+<td>POST</td>
+<td>Preview or apply a <code>lazy doctor --&lt;flag&gt;</code> remedy. Cleanup of worktrees, images or containers lists what it would remove and waits for confirm.</td>
+</tr>
+<tr>
+<td><code>/memory</code></td>
+<td>GET</td>
+<td><strong>308</strong> → <code>/settings/memory</code> (query string kept)</td>
+</tr>
+<tr>
+<td><code>/memory/new</code></td>
+<td>GET</td>
+<td>Form to create a record (same write as <code>lazy memory save</code>)</td>
+</tr>
+<tr>
+<td><code>/memory</code></td>
+<td>POST</td>
+<td>Create a record; 303 to <code>/memory/:name</code></td>
+</tr>
+<tr>
+<td><code>/memory/:name</code></td>
+<td>GET / POST</td>
+<td>One record in full, with write history; POST saves an edit</td>
+</tr>
+<tr>
+<td><code>/memory/:name/remove</code></td>
+<td>GET / POST</td>
+<td>Confirm, then tombstone the record (history is kept)</td>
+</tr>
+<tr>
+<td><code>/memory/compact</code></td>
+<td>GET</td>
+<td>The current compact (what launches inject) plus size and staleness</td>
+</tr>
+<tr>
+<td><code>/memory/compact</code></td>
+<td>POST</td>
+<td>Run compact (auto / mechanical / llm); streams progress as it runs</td>
+</tr>
+<tr>
+<td><code>/memory/compact/clear</code></td>
+<td>POST</td>
+<td>Drop the compact; injection falls back to the full index</td>
+</tr>
+<tr>
+<td><code>/api/memory</code></td>
+<td>GET</td>
+<td>The record listing as JSON — index fields only, never bodies</td>
+</tr>
+<tr>
+<td><code>/clusters</code></td>
+<td>GET</td>
+<td>Every cluster task with its derived progress, and a form to create a new one — see <a href="#clusters">Clusters</a></td>
+</tr>
+<tr>
+<td><code>/api/nav-counts</code></td>
+<td>GET</td>
+<td>The nav badge counts in one payload — see <a href="#the-nav-counts">The nav counts</a></td>
+</tr>
+</tbody></table>
+<p><code>:task</code> accepts a short id, a full id, or a task code — the same resolution the
+CLI uses. Links the server renders use the task&#39;s code when it has one (the id
+when it does not, or when another task carries the same code); either resolves.
+Old id-based links and bookmarks keep working.</p>
+<p>Every task page, task list and review queue includes a
+<code>Server-Timing</code> response header with per-phase render times and size counts
+(diff bytes and files, HTML bytes, turns, children, threads). Open the browser
+Network panel&#39;s Timing view to read it, or grep the daemon log for
+<code>web-timing</code> — the same numbers, on one line per request, when debug logging is
+on.</p>
+<h3 id="linking-to-a-task-from-a-builder-or-agent"><a class="anchor" href="#linking-to-a-task-from-a-builder-or-agent" aria-hidden="true">#</a>Linking to a task from a builder or agent</h3>
+<p>The builder&#39;s system prompt includes the dashboard&#39;s base URL (the same address
+<code>lazy daemon dashboard-url</code> prints) and these path patterns, so a task the
+you will act on is written as a markdown link — <code>[fix-login](http://lazy.localhost:&lt;port&gt;/tasks/fix-login)</code>. Agents and tools that need the
+base URL without a new tool read <code>dashboard_url</code> on <code>lazy_status</code> (<code>null</code> when
+the dashboard is off — managed mode — so they must not invent a link).</p>
+<p>There is no dedicated &quot;give me the dashboard URL&quot; MCP tool. The CLI already
+has <code>lazy daemon dashboard-url</code>; MCP reuses <code>lazy_status</code>. See
+<a href="../surface-asymmetries/">surface-asymmetries</a>.</p>
+<h2 id="the-nav-counts"><a class="anchor" href="#the-nav-counts" aria-hidden="true">#</a>The nav counts</h2>
+<p>Five nav entries carry a small count badge, so something waiting for you is
+visible from whatever page you are already on:</p>
+<ul>
+<li><strong>Clusters</strong> — cluster tasks that have not finished yet.</li>
+<li><strong>Review</strong> — tasks awaiting review right now: the same queue <code>/review</code> lists.</li>
+<li><strong>Inbox</strong> — unread system messages.</li>
+<li><strong>Raised</strong> — open (un-decided) raised items: the same set <code>/raised</code> shows by
+default. This one badge carries two numbers, blocking first — <code>2/11</code> is two
+open blocking items and eleven open non-blocking ones — because they are one
+destination, not two. A zero blocking count is left out rather than shown as
+<code>0/11</code>.</li>
+<li><strong>Builders</strong> — Builders that grew since you last opened <code>/builders</code>.</li>
+</ul>
+<p>Each count is the count its own page shows — the badge runs the page&#39;s own
+query, so the two can&#39;t drift apart. A count of zero shows no badge at all,
+which means a bare nav is the honest answer for a quiet project, not a broken
+one.</p>
+<p>Every page makes <strong>one</strong> request, to <code>/api/nav-counts</code>, and fills every badge
+from it. That endpoint returns counts only — no titles, goals or
+bodies — and needs a session like every other route. With scripting off the
+badges are simply absent; nothing else about the nav changes, and every page
+they point at works as before.</p>
+<p>The counts are independent: if one of them can&#39;t be worked out, that badge is
+absent and the others still appear. An absent badge is never lazy claiming
+there is nothing there — it is either a count of zero or a count it couldn&#39;t
+take, and the page itself remains the authority either way.</p>
+<p><strong>The Builders count is per browser.</strong> Builders have no read state in
+the store — they are captured, never authored — so lazy does not invent one.
+Instead your browser remembers the newest capture it has been shown (in
+<code>localStorage</code>, under <code>lazy.conversationsSeenAt</code>), sends that back with the
+request, and the badge counts Builders that grew after it. Opening <code>/builders</code>
+clears the badge and sets the new mark. A second browser, a private window, or
+cleared site data therefore starts over and counts every Builder as new —
+which is right: &quot;since you last looked&quot; is a fact about a person at a screen,
+not about the project. A search (<code>/builders?q=</code>) shows a subset, so it
+never advances the mark.</p>
+<h2 id="creating-a-task"><a class="anchor" href="#creating-a-task" aria-hidden="true">#</a>Creating a task</h2>
+<p><strong>New task</strong> on the Tasks list opens <strong><code>/tasks/new</code></strong>. From a task page,
+<strong>New subtask</strong> opens the same form with that task already chosen as the
+parent. This is the browser&#39;s version of <code>lazy create</code>:</p>
+<ul>
+<li><strong>Goal</strong> is required. <strong>Prompt</strong> is markdown, with the same rendered preview
+the edit form uses.</li>
+<li><strong>Code</strong> is optional kebab-case. Leave it blank and lazy derives one from the
+goal when the goal itself makes a valid code; otherwise the task is addressed
+by its id.</li>
+<li><strong>Parent</strong> is a task (a subtask) or a branch name (a top-level task targeting
+that branch). Leave it blank for the repo default branch.</li>
+<li><strong>Review</strong> picks how the task gets read once it declares done — <code>low-high</code>
+(the default: the writer self-reviews in its own session), <code>separate</code> (a
+reviewer runs afterwards and gates accept, at three to four times the cost),
+or <code>off</code>. See <a href="../review-paradigm/">the review paradigm</a>.</li>
+<li><strong>Type</strong>, <strong>agent profile</strong>, <strong>model</strong> and <strong>effort</strong> are the same choices
+<code>lazy create</code> takes. The <strong>Agent profile</strong> dropdown lists the project&#39;s own
+<code>[agents.&lt;name&gt;]</code> profiles first, under <em>Configured profiles (lazy.toml)</em>,
+with the implicit per-harness <strong>built-in profiles</strong> beneath them; each option
+shows what it runs (harness, model, endpoint, credential). <strong>Model</strong> and
+<strong>effort</strong> on the same form override the chosen profile for this one task —
+that is how you run an ad-hoc combination without defining a profile for it.
+The task edit page offers the same picker; if that task names an agent the
+list does not otherwise offer — a profile you have since removed, say — it
+stays selectable in a <em>Pinned on this task</em> group, so saving the form never
+switches it behind your back. When lazy cannot read your <code>lazy.toml</code> at all,
+the picker says so and offers the built-in agents only.</li>
+<li><strong>Start now</strong> launches the first agent turn after creating. Leave it
+unchecked and the task lands in the backlog. Starting needs a prompt.</li>
+</ul>
+<p>A refused create — empty goal, a code that is already in use, an unknown
+parent — redisplays the form with <strong>what you typed still in it</strong> and the
+daemon&#39;s reason. Those checks run before the task is written. Prompt, model,
+effort and an explicit branch parent are saved just after; if one of those
+writes fails you still land on the new task with a notice, so submitting
+again cannot create a second one.</p>
+<p>With scripting off the form is a plain POST. With scripting on, <strong>Start now</strong>
+opens the same action dialog the Start button uses, so you see the launch
+phases. The task is created before those phases begin: if the browser never
+hears back, open the Tasks list rather than submitting again. A start that
+fails after create still takes you to the new task, with the reason.</p>
+<h2 id="linking-a-branch-or-pr"><a class="anchor" href="#linking-a-branch-or-pr" aria-hidden="true">#</a>Linking a branch or PR</h2>
+<p><strong>Link…</strong> on the Tasks list opens <strong><code>/tasks/link</code></strong>. This is the browser&#39;s
+version of <a href="../link/"><code>lazy link</code></a>: paste a pull-request URL or type a branch
+name, optionally a parent and a code. The new task uses that existing branch,
+starts blocked (not running), and is marked <strong>linked</strong> on the list and on its
+page — with the branch, and the PR once one is known.</p>
+<p>A refused link redisplays the form with what you typed and the reason. With
+scripting off the form is a plain POST. With scripting on, Link always opens
+the action dialog so you see the fetch and worktree steps. Two people (or two
+tabs) linking at once each get their own run — they do not share a queue slot.</p>
+<h2 id="agent-review-from-the-task-page"><a class="anchor" href="#agent-review-from-the-task-page" aria-hidden="true">#</a>Agent review from the task page</h2>
+<p><strong>Review</strong> on a paused task&#39;s action row is the browser&#39;s version of
+<a href="../review/"><code>lazy review</code></a>. It is a read-only agent pass — security and data
+integrity first — that files each issue as a <strong>Raise</strong> on the Raised tab (with
+<code>blocking</code> chosen per item). It is not the <strong>Go to Current review</strong> tab (that
+is where you accept or unblock). The task stays in its current status
+afterwards. The button is offered only while the task is paused (<code>blocked</code>,
+<code>conflict</code>, <code>submitted</code>, or <code>interrupted</code>) — the same statuses the daemon
+accepts.</p>
+<p>Optionally tick <strong>Automatically fix — start a work turn that injects any Raises
+the review files</strong>. When the review files at least one Raise, lazy starts a
+normal work turn whose notes include every finding (ids and text) and asks the
+agent to reply per item with <code>lazy_raised_item_comment</code>. A clean review or a
+turn that produced nothing usable does not start that turn. Agent comments do
+not dismiss Raises — only you do, on the Raised tab.</p>
+<p>The report stays on this page. Lazy does not post reviews to a pull or merge
+request — see <a href="../review/#reviews-stay-on-the-task">reviews stay on the task</a>.</p>
+<p>The <strong>Reviews</strong> tab lists every <em>successful</em> formal review: when it ran, the
+verdict, how many Raises it filed, and links to the review turn and those
+Raises. A review counts when it filed usable Raises or produced parseable
+<strong>clean</strong> security/data-integrity statements (<code>none found</code>). Unparsed leftover
+JSON with no Raises is treated as if the review never happened for the list
+and accept gates (the turn itself may still show a failed-parse banner on the
+Turns tab). A
+review that names issues in those sweeps but somehow records no Raises is
+also treated as failed — not as a clean pass. Accept refuses while a
+successful review that raised issues has not been followed by a work turn
+(dismissing Raises alone is not enough). A Raise you <strong>promote to its own
+task</strong> is the exception: the work is tracked in that task, so it stops
+counting towards the gate, and accept no longer asks you to unblock the agent
+for work nobody owes. Current review&#39;s <strong>Before you can accept</strong> list names
+that gate even when the Raises are non-blocking or already dismissed — the
+list would otherwise look clear while Accept still refuses — and it counts
+exactly the Raises that still hold accept back. When a task&#39;s work is
+declared done, lazy starts a review on it without anyone asking (see
+<a href="../review/">the review page</a>); by the time you open Accept that review has
+usually already run and its verdict is on the task. <strong>Review</strong> stays its own
+button for a second opinion or for work nobody declared final — which you can
+still accept, since the declaration gates nothing.</p>
+<h2 id="editing-a-task"><a class="anchor" href="#editing-a-task" aria-hidden="true">#</a>Editing a task</h2>
+<p><strong>Edit task</strong> on a task page (and <em>edit task</em> on Current review)
+opens <strong><code>/tasks/:task/edit</code></strong>. It is the browser&#39;s version of <code>lazy edit</code>, and it
+obeys exactly the same rules:</p>
+<ul>
+<li><strong>Before the first turn</strong> you can rewrite the <strong>goal</strong> and the <strong>prompt</strong>. The
+prompt is markdown, so the form shows it rendered above the textarea you are
+typing in — expand or collapse that preview as you like. The preview is
+rendered by the server, so it catches up whenever the page reloads.</li>
+<li><strong>Once a turn has run</strong>, the goal and prompt are locked: an agent has already
+read them and acted on them. The page says so in as many words, and drops
+those fields rather than letting you type into a box that would be refused.</li>
+<li><strong>Model, effort and agent</strong> stay editable for as long as the task is alive.
+They take effect on the task&#39;s <strong>next</strong> turn.</li>
+<li><strong>A finished task</strong> (complete or abandoned) cannot be edited at all, and the
+page says which of the two it is.</li>
+</ul>
+<p>Saving a prompt creates a <strong>new prompt version</strong> — nothing is overwritten. The
+old text stays readable under <strong>Prompt History</strong> on the task page, the same as
+after a <code>lazy edit --prompt</code>.</p>
+<p>If a save is refused — an effort level that does not exist, an empty goal — the
+form comes back with <strong>what you typed still in it</strong> and a plain sentence saying
+why. Nothing is half-saved: the daemon checks every field before it writes any
+of them, so a refusal means the task is exactly as it was.</p>
+<p>An empty model box means &quot;leave the model alone&quot;, so on a task that already has
+a model override, emptying it is refused with that explanation rather than
+silently doing nothing — type a different model, or change it in a terminal with
+<code>lazy edit &lt;task&gt; --model &lt;name&gt;</code>.</p>
+<h2 id="acting-on-a-task"><a class="anchor" href="#acting-on-a-task" aria-hidden="true">#</a>Acting on a task</h2>
+<p>The task page (<code>/tasks/:task</code>) carries a small action row, and it offers only
+the verbs that are legal for the task&#39;s current state — the same rules the CLI
+enforces, so a button you can see is a button that will work:</p>
+<ul>
+<li><strong>Backlog</strong> — <strong>Start</strong> launches the first agent turn (worktree, branch and
+all, exactly like <code>lazy start</code>), and <strong>Close</strong> ends the task without one.</li>
+<li><strong>Working</strong> — <strong>Stop</strong> halts the agent without auto-resume, like
+<code>lazy stop</code>. The reason you type is recorded on the task.</li>
+<li><strong>Blocked</strong> — <strong>Go to Current review</strong> leads the row (that tab is where a
+turn ends), with <strong>Resume</strong> (relaunch with no new feedback, like <code>lazy resume</code>)
+and <strong>Close</strong> beside it. <strong>Reject</strong> lives on Current review next to Accept.
+<strong>Submit</strong> and <strong>Sync</strong> are on both the Summary row and Current review.
+<strong>Reparent</strong>, <strong>Redo</strong> and <strong>Clone</strong> sit on Summary.</li>
+<li><strong>Finished</strong> (complete or abandoned) — <strong>Reopen</strong> brings the task back to
+blocked (if it had run) or backlog (if it never did). Reopening an accepted
+task asks for a reason, which is recorded as a comment. The task comes back
+with its own work — its branch is restored from the remote or from what lazy
+recorded if it is no longer local — and reopen refuses rather than start the
+task empty.</li>
+</ul>
+<p>Every one of those verbs opens a dialog. The dialog shows the same steps the
+CLI prints for that command (<code>lazy accept</code>, <code>lazy stop</code>, <code>lazy sync</code>, …) as
+they run. If everything succeeds, the dialog closes and the page refreshes to
+the new state. If a step fails, the dialog stays open with the failed step.
+A protected-branch accept that needs the approval passphrase asks for it
+<strong>in that same dialog</strong>, under the failed step: the passphrase field and
+<strong>Approve and accept</strong> are primary, and the exact CLI command (including
+<code>--approve-file</code> for every already-approved file, and <code>--reason</code> if you typed
+one) is the secondary alternative. Stop, close and reject still require a
+short reason — typed in the dialog, the same reasons the CLI asks for.
+Without scripting, the same forms post and redirect as they always did.</p>
+<p><strong>Watch</strong> opens a live output panel below the button — the same stream
+<code>lazy watch &lt;task&gt;</code> prints in a terminal, in the browser: the agent&#39;s thinking
+and tool calls, its API traffic through lazy&#39;s proxy, the supervisor&#39;s own
+output, and a status line every few seconds. Like the <a href="../web-shell/">web shell</a>
+it spans the full width of the page&#39;s content column and re-flows whenever the
+window or the panel changes size — drag the bottom edge to make it taller. It is
+read-only; you cannot type into it. When the task is not running the panel says
+so and stays open, so the next turn appears without reopening it. <strong>Close</strong>
+dismisses the panel. Watch needs scripting; with it off, reload the page to see
+the latest agent output. Opening Watch shows the latest five task turns
+with timestamps and brief descriptions. New turns appear as they finish.
+It replays only output from the latest turn; the full history remains in
+the task timeline.</p>
+<h2 id="large-changes"><a class="anchor" href="#large-changes" aria-hidden="true">#</a>Large changes</h2>
+<p>A branch can carry thousands of files — a release, or a parent task whose
+subtasks all landed. Changes never hides or truncates any of them; it loads
+them in stages instead:</p>
+<ul>
+<li><strong>The file list comes first.</strong> Every file, with its +/− counts and the region
+it belongs to, renders at once. Each row links to that file&#39;s diff.</li>
+<li><strong>Diffs load as you scroll.</strong> The first few dozen files arrive with the page;
+the rest fill in a few at a time as you approach them. <strong>Load all diffs</strong>
+fills in everything.</li>
+<li><strong>Very large single files</strong> (a lockfile, generated code) are listed like any
+other file but load only when you click <strong>Load diff</strong> on them.</li>
+</ul>
+<p>Comments, expand controls, the Viewed tick and the side-by-side view work the
+same on files that loaded later. A small change loads in one go, exactly as
+before.</p>
+<h2 id="staying-up-to-date-without-losing-your-place"><a class="anchor" href="#staying-up-to-date-without-losing-your-place" aria-hidden="true">#</a>Staying up to date without losing your place</h2>
+<p>The task page keeps itself current on its own (when scripting is on), and it
+does it per section rather than all at once. A short poll asks the server what
+has moved — the status and progress line, subtasks and their statuses, turns,
+comments, journal entries, raised items, commits, the branch&#39;s latest commit —
+and only the parts that actually moved react. A task that stays <em>working</em> while
+its subtasks come and go now updates its Subtasks tab; it used to sit there
+stale until you reloaded.</p>
+<p>What happens next depends on which tab you are reading:</p>
+<table>
+<thead>
+<tr>
+<th>Tab</th>
+<th>What an update does</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Header, tab strip, status bar</td>
+<td>Update in place immediately, always.</td>
+</tr>
+<tr>
+<td>Summary, Subtasks, Reviews, Raised</td>
+<td>Patched in place, silently. Your scroll position, text selection, open sections and anything you have typed are kept.</td>
+</tr>
+<tr>
+<td>Turns, Commits, Comments, Journal</td>
+<td>New entries appear in place. They land at the top, so the page holds your viewport where it was and offers <strong>New content above</strong> if you want to jump.</td>
+</tr>
+<tr>
+<td>Changes, Current review, Regions, Stats</td>
+<td>Never swapped under you. A small <strong>updated — reload</strong> button appears in the corner; you choose when.</td>
+</tr>
+<tr>
+<td>Shell, Verify</td>
+<td>Never touched, so a terminal you have open keeps running.</td>
+</tr>
+<tr>
+<td>Artifacts</td>
+<td>Not refreshed automatically — reload the page to see files attached meanwhile.</td>
+</tr>
+</tbody></table>
+<p>A tab you are <em>not</em> on is not refetched behind your back. It gets a dot in the
+tab strip, and its content is fetched fresh the moment you switch to it — so a
+stale Subtasks tab is visible from Changes without costing anything.</p>
+<p>Nothing is patched while you are working in it: if you are typing in a box,
+have text selected, or have just scrolled, the update waits and offers itself
+as a button instead. <strong>A draft you have typed is never cleared by a refresh.</strong></p>
+<p><strong>An update you decline is not forgotten.</strong> If you ignore the <strong>reload</strong> button,
+or the page holds an update back because you were busy, that tab is still behind
+— so it keeps its dot, and moving away and back to it fetches it fresh. The tab
+you are currently reading shows no dot, because the button in the corner is the
+offer; the dot appears the moment you leave it.</p>
+<p>An open Watch panel, Shell session or Verify terminal is left alone throughout.
+Without scripting, reload the page as before.</p>
+<h2 id="since-you-last-looked"><a class="anchor" href="#since-you-last-looked" aria-hidden="true">#</a>Since you last looked</h2>
+<p>Both the Current review tab and Summary lead with a <strong>Since you last looked</strong>
+card: everything that happened after your last action on the task — agent turns,
+commits, new comments, journal entries and raised items — one line
+each, linked to the page that shows it in full. Merge commits from syncing with
+the parent branch are left out, since they are not work the agent did.</p>
+<p>The window starts at your last intervention: the unblock, start or ask you last
+sent, not the last commit. If nothing has happened since, the card says so in
+one line. Tick <strong>Viewed</strong> to fold it away; it comes back the moment something
+new lands.</p>
+<h2 id="the-loop"><a class="anchor" href="#the-loop" aria-hidden="true">#</a>The loop</h2>
+<ol>
+<li><p><strong>Queue</strong> (<code>/review</code>) lists tasks in <code>blocked</code>, each showing its type and
+goal, when its agent was last active, how many subtasks sit under it (every
+descendant, not just direct children), whether a live agent session exists,
+and how many comments are still awaiting an answer. It is sorted by <strong>last
+activity, newest first</strong>, stated in a line under the heading, and every
+column header is a link that re-sorts the queue — clicking the column you
+are already sorted by flips the direction. Sorting by <strong>Subtasks</strong>
+descending brings the parent tasks — the ones with work stacked
+under them — to the top. Opening a row lands on that task&#39;s <strong>Summary</strong>
+tab.</p>
+</li>
+<li><p><strong>Summary, then Verify, then Changes.</strong> Summary leads with the agent&#39;s
+<strong>Screenshots</strong> when it declared any (see below), then the report of what a
+user would notice. <strong>Verify</strong> is the latest turn&#39;s how-to-verify steps.
+<strong>Raised</strong> holds open items — blocking ones gate accept. <strong>Services</strong> lists
+the task&#39;s declared <code>[serve]</code> ports. <strong>Changes</strong> is the diff: when the agent
+declared a presentation on <code>lazy_report</code>, a semantic walkthrough (groups,
+tiers, snippets) is shown first with a <strong>Presented / Raw files</strong> toggle;
+otherwise the per-file diff appears as before. Changes always shows the
+task&#39;s <strong>whole branch</strong> — including everything its accepted subtasks
+brought in — and the card above the diff offers the other view: one
+<strong>region</strong> at a time (for a parent task, one region per accepted subtask).
+<code>lazy diff</code> and <code>lazy_diff</code> show the same whole branch; <code>--full-branch</code> /
+<code>full_branch</code> are still accepted and change nothing. See
+<a href="#large-changes">Large changes</a> for how a very big branch loads.</p>
+</li>
+<li><p><strong>Diff</strong> renders the task branch vs. its parent, computed by the daemon — the same diff <code>lazy diff</code> shows. A diff only
+shows a few lines around each change, so every gap — above the first hunk,
+between two hunks, and after the last one — carries <strong>expand controls</strong>: ↑ and
+↓ reveal 20 more lines against the hunk they belong to, and ↔ reveals
+the whole gap (to the start or end of the file at the edges). Revealed lines
+that were unchanged in the diff are ordinary context rows (line numbers on
+both sides, commentable). When the Changes walkthrough shows only a
+<strong>snippet</strong> of a file, expanding can also reveal additions the snippet
+left out — those still paint as additions (green, <code>+</code>), never as old code,
+and the file header&#39;s <code>+N −M</code> updates; a partial snippet also shows
+<code>of +X −Y</code> for the whole file so a one-line card is not mistaken for a
+one-line change. The lines come from the daemon, read from
+the task&#39;s own worktree at the same revisions the diff was rendered from —
+only files that are part of the diff can be read this way. The controls need
+JavaScript; without it the diff renders as it always did.</p>
+</li>
+<li><p><strong>Files with a presented form are shown, not just diffed.</strong> Some files read
+better as themselves than as a column of <code>+</code>/<code>-</code> lines. Markdown is the first
+of them: a <code>.md</code>, <code>.markdown</code> or <code>.mdx</code> file in the diff is shown as the
+document it is — headings, lists, tables, links and Mermaid diagrams all
+render, exactly as they do elsewhere in the review surface.</p>
+<ul>
+<li>An <strong>added</strong> file renders whole. A <strong>removed</strong> file renders its old
+content, muted and labelled as deleted.</li>
+<li>A <strong>modified</strong> file renders the new version whole, with every untouched
+stretch folded into a &quot;N unchanged lines&quot; summary you can click open. The
+passages the change touched stay open at full strength, and inside them the
+green accent lands on what actually changed — the individual heading,
+paragraph, list item or table row — so one added bullet reads as one added
+bullet, not as a rewrite of the list it joined. Text that was removed is
+shown in place beneath it, struck through. A heading immediately above a
+change is never folded away: whatever labels the change stays visible.</li>
+<li><strong>You can ask about it where you are reading it.</strong> Every presented
+document carries a <strong>Comment</strong> button in its header: it opens the ordinary
+Ask / Add comment box against the document, without making you go and find
+a line first. Use it for the question that is about the passage rather than
+about one line.</li>
+<li><strong>The line diff is always one click away.</strong> The toolbar carries a
+<strong>Files: Presented / Source</strong> switch that applies to every presentable
+file on the page and is remembered between visits, and each presented file
+also has its own <strong>Source — comment line by line</strong> button, which says what
+it buys: a comment pinned to one specific line. Comment threads live on the
+source diff rows, so the &quot;+&quot; button on a presented block switches to the
+source view with that line in view, ready to comment, and the presented
+header says how many comments a file already has. Without JavaScript you
+get the ordinary diff, as before.</li>
+</ul>
+<p>The switch is not about markdown — markdown is simply the first file type
+with a presented form. As more arrive (diagrams, images, and other formats
+worth showing rather than listing), the same control governs them, and it
+stays a no-op for files that have no presented form.</p>
+</li>
+<li><p><strong>Comment</strong> — every diff row is commentable, and every message carries one of
+two reviewer <strong>intents</strong> (see below): <em>ask</em> a question, or leave a <em>comment</em>
+for the agent to act on later.</p>
+</li>
+<li><p><strong>Resolve</strong> — unblock with feedback (which also delivers every queued comment)
+or accept. If the accept is refused, the page says what to do about it — see
+<a href="#when-an-accept-is-refused">When an accept is refused</a>. Open raised items
+must be responded to, promoted, or dismissed before accept succeeds.</p>
+</li>
+</ol>
+<h2 id="the-screenshots-card"><a class="anchor" href="#the-screenshots-card" aria-hidden="true">#</a>The Screenshots card</h2>
+<p>When a task built something you can look at, its agent can show you rather than
+describe it: it attaches images to the task and names them in its report&#39;s
+presentation (see <a href="../turn-reports/">Structured turn reports</a>). Those images get
+a <strong>Screenshots</strong> card at the very top of Summary — above the raised
+items and the report — each with the agent&#39;s caption. Like every other card it
+collapses once you have marked it viewed.</p>
+<p><strong>Clicking one opens it in place.</strong> The picture fills the window over the page
+you were on, with its caption and its position in the set (&quot;2 of 3&quot;). The <code>←</code>
+and <code>→</code> keys — and the arrows either side of the image — walk through the rest,
+so a set of screenshots is one look rather than a tab per picture. <code>Esc</code>, the
+<strong>Close</strong> button or a click outside the image closes it and puts you back where
+you were. To zoom into a detail, <strong>Open full size</strong> in the overlay gives you the
+image on its own, in its own tab.</p>
+<p><strong>You can ask about a screenshot.</strong> Hover a caption and the same anchored &quot;+&quot;
+the agent&#39;s report paragraphs carry appears next to it: the question is filed
+against that caption, so the agent is told which picture you meant.</p>
+<p>The images come from the task&#39;s artifact store through the dashboard itself, so
+they are behind the same sign-in as everything else on the page and stay
+readable long after the task&#39;s worktree is gone. Only raster images (png, jpeg,
+gif, webp) are shown; a report naming anything else fails when the agent files
+it, so a screenshot card never renders a broken image.</p>
+<h2 id="the-verify-tab"><a class="anchor" href="#the-verify-tab" aria-hidden="true">#</a>The Verify tab</h2>
+<p>The latest agent turn&#39;s <code>how_to_verify</code> is <strong>the</strong> current set. Older turns&#39;
+steps sit under <strong>Earlier verification steps</strong>, each labelled with its turn
+number and marked superseded — they were written against a branch that may no
+longer exist in that shape, so treating them as a single accumulating &quot;how to
+check&quot; document would present falsehoods as truths.</p>
+<p>The section body stays plain markdown. Prose paragraphs render as text, and
+every fenced code block becomes a <strong>command panel</strong> with a language label and a
+one-click <strong>Copy</strong> button. A console-style block whose lines start with <code>$ </code>
+copies with the prompt markers stripped, and each line gets its own copy
+control. Without JavaScript (or without clipboard access) the buttons stay
+hidden and each command is still a selectable code block, plus one line naming
+<code>lazy shell &lt;task&gt;</code> as the terminal equivalent.</p>
+<p>Each step has a <strong>Verified</strong> tick, saved with the rest of the review draft, so
+it survives a reload and shows up on another device. The tick is keyed by turn,
+step index, and the step&#39;s text: edit the step and it comes back unticked. The
+tab badge and Current review both show &quot;N of M verified&quot;.</p>
+<p>Shell blocks also get <strong>Run in shell</strong>. A click opens a terminal <strong>directly
+under that step</strong> — no jump to a panel at the top of the page — and runs the
+block there, <strong>inside the task&#39;s container</strong>: the same text Copy would have
+given you, in the place the agent worked. A step whose session is already live
+shows <strong>Open</strong> and <strong>Re-run</strong> instead of stacking a second terminal. The
+<a href="../web-shell/">Shell tab</a> lists that session and links to it; it does not draw
+a second copy. <strong>Fill window</strong> enlarges the same terminal to the whole window.</p>
+<p>Blocks tagged as data or source (<code>json</code>, <code>toml</code>, <code>ts</code>, …) are not runnable and
+show Copy only, and when no shell can be opened Run is disabled with the reason.
+A stopped container is not one of those reasons: Run starts the container and
+narrates the start in the terminal it opens.</p>
+<p>When the agent gave no verification steps, the tab still renders and says so
+— an absent tab would hide the gap; the visible one is what gets it filled
+next turn.</p>
+<h2 id="what-the-stats-tab-means"><a class="anchor" href="#what-the-stats-tab-means" aria-hidden="true">#</a>What the Stats tab means</h2>
+<p>The <strong>Stats</strong> tab answers one question: where did this task&#39;s time and tokens
+actually go. It is an insight surface, so every number on it is either sourced
+from something lazy recorded or marked <em>not recorded</em>. Nothing is estimated,
+and nothing is filled in by a plausible guess.</p>
+<h3 id="this-task-or-the-whole-subtree"><a class="anchor" href="#this-task-or-the-whole-subtree" aria-hidden="true">#</a>This task, or the whole subtree</h3>
+<p>A task that drives subtasks — a parent task, a cluster — does almost none of its
+own work, so its own turns are not its spend. When a task has anything nested
+under it, the tab opens on the <strong>subtree</strong> view: this task plus every descendant,
+at every depth. A toggle at the top switches to <strong>This task only</strong>, and a line
+under it always says which of the two you are reading. A task with nothing
+nested under it has no toggle, because both views would be the same numbers.</p>
+<p>Turn counts, token totals and charts, commits and the per-tool table are all
+sums over the subtree, with the tool rows merged by tool name. <strong>Time is not
+summed</strong> — see below.</p>
+<p>The same rollup is on the CLI: <code>lazy stats tokens --task &lt;task&gt; --subtree</code> and
+<code>lazy stats tools &lt;task&gt; --subtree</code>.</p>
+<h3 id="the-four-tiles"><a class="anchor" href="#the-four-tiles" aria-hidden="true">#</a>The four tiles</h3>
+<p><strong>Turns</strong> is every turn on the task, split into agent turns and the human or
+builder turns that asked for them. <strong>Elapsed</strong> is wall clock from creation to
+completion, or to now if the task is still going. <strong>Tokens</strong> is the total the
+agent reported across its turns, with a note saying how many turns reported
+usage at all. <strong>Commits</strong> is the count on the task&#39;s branch.</p>
+<h3 id="where-the-time-went"><a class="anchor" href="#where-the-time-went" aria-hidden="true">#</a>Where the time went</h3>
+<p>The split — <em>Agent running</em>, <em>Awaiting a human</em>, <em>In backlog</em> — is derived
+from the task&#39;s recorded status history, and it is <strong>wall clock</strong>. A task left
+blocked overnight really did spend those hours blocked. That is not the same
+thing as an agent burning tokens for those hours, and the tab says so, because
+confusing the two is the easiest way to misread a spend.</p>
+<p><em>Agent running</em> covers the statuses where lazy is doing the work (working,
+pairing, merging). <em>Awaiting a human</em> covers everything that is stopped and
+waiting for you — blocked, a merge conflict, a submitted PR, an interrupted
+turn. <em>In backlog</em> is the time before the task was ever started.</p>
+<p>If the task has direct subtasks, one more line tells you how much of the
+running time overlapped a subtask that was itself running. A cluster task&#39;s agent
+sits in <em>working</em> while it waits for a child, so that time is a <strong>subset</strong> of
+the running time rather than a fourth slice of the clock.</p>
+<p><strong>In the subtree view, time is combined rather than added.</strong> A parent sits in
+<em>working</em> for exactly as long as its children run, so adding the wall clocks
+would bill the same minute two or three times. The bar is instead the time
+during which <strong>at least one</strong> task in the subtree was in that state — running
+takes precedence over awaiting, awaiting over backlog, so the three still divide
+one window. The added-up figure is a real number too, and is printed next to the
+bar along with how much of it is time two or more tasks ran at once. A stretch
+during which every task was finished and the next not yet created belongs to no
+state at all and is shown as <em>No task active</em> rather than folded into one.</p>
+<p>Per-turn agent runtime is <strong>not recorded anywhere</strong>, so it is not shown. The
+per-turn table&#39;s <em>Span</em> column is the gap between one turn&#39;s timestamp and the
+previous turn&#39;s — which includes however long the turn sat waiting for you.</p>
+<h3 id="tokens"><a class="anchor" href="#tokens" aria-hidden="true">#</a>Tokens</h3>
+<p>The legend gives the four counters — input, output, cache read, cache write —
+with totals and shares. <strong>Per turn</strong> stacks those four for every agent turn,
+oldest on the left; <strong>Cumulative</strong> is the same turns as a running total, which
+is the one to look at when you want to know whether spend is accelerating.
+Its horizontal axis is time: the first and last turn times are labelled in
+ISO 8601 (UTC), with a middle time when there is room, and hovering a point shows
+its time, turn and chunk. A dashed line marks where each review chunk began, with
+its number; the numbers are also listed under the chart as links to that chunk&#39;s
+turns, and the per-turn table gains a <strong>Chunk</strong> column. With subtasks included
+there are no chunk marks, because every task numbers its own chunks.</p>
+<p>A turn that reported no token usage is <strong>absent from the chart</strong>, not drawn as
+a zero-height bar: usage is recorded when the agent reports it, and a missing
+report is not a free turn. The count of such turns is printed under the chart.
+On a task with a great many turns the charts show the most recent ones and say
+how many earlier turns, worth how many tokens, are in the totals but off the
+chart — the totals are always complete.</p>
+<p><strong>Per-turn numbers</strong> under the charts is the same data as a table, including
+the model and effort each turn ran with. <code>unknown</code> there means the turn predates
+that field being recorded; lazy never back-fills it with today&#39;s default. In the
+subtree view the table gains a <strong>Task</strong> column and the merged series is ordered
+by time rather than by turn number — every task has a turn 1, so turn numbers
+alone would interleave unrelated conversations.</p>
+<h3 id="tools"><a class="anchor" href="#tools" aria-hidden="true">#</a>Tools</h3>
+<p>As lazy&#39;s proxy forwards each model request, it folds that request&#39;s tool calls
+into the task&#39;s own <strong>tool record</strong>. The table covers the task&#39;s whole life and
+nothing in it expires. A task with no record — one that ran before lazy started
+keeping them, or whose traffic did not go through the proxy — shows a line
+saying exactly that, which is not the same claim as &quot;this task called no tools&quot;.</p>
+<p>The table gives, per tool: how many times it was called, how many tokens its
+results added, that tool&#39;s share of those tokens, and the average per call.</p>
+<p><strong>What the Tokens column means matters.</strong> It is the size of what that tool&#39;s
+results put into the conversation — the output the tool handed back — measured
+once per call. It is <strong>not</strong> that tool&#39;s share of the model bill. Those are
+different numbers, and the second one is not knowable: a request is billed as a
+whole, and one model response routinely asks for several tools at once, so
+splitting a request&#39;s usage across them would be invented. lazy does not do it.</p>
+<p>The number you want for &quot;which tool should I reduce&quot; is usually <strong>Per call</strong>.
+Three cheap reads and one enormous fetch are not the same problem, and the call
+count alone cannot tell them apart.</p>
+<p>Expect the tokens the proxy observed for the same requests — printed above the
+table — to be far larger than the tool totals. That is not a contradiction:
+every request re-sends the whole conversation those results sit in, so a large
+result is paid for again, more cheaply, on every turn after it. That is exactly
+why a verbose tool is worth finding.</p>
+<p>Two lines may appear under the table, and both exist so the rows add up
+honestly. Results recorded before lazy measured their size are counted as <strong>not
+recorded</strong>, never as zero. Results answering a call lazy never saw — a
+conversation already under way when recording started — have no known tool, so
+their tokens are reported separately rather than filed under a guess.</p>
+<p>The same breakdown is on the CLI as <code>lazy stats tools &lt;task&gt;</code> — same numbers,
+same caveats, for when you are tuning spend from a terminal and do not want to
+open the dashboard. Add <code>--subtree</code> there to fold in every descendant, exactly
+as the tab&#39;s subtree view does. <code>--since</code> asks a different question: what a
+task&#39;s tools cost over a stretch of time, which only the proxy&#39;s bounded audit
+trail can answer, so that reading is a recent window and says so.</p>
+<h3 id="no-costs"><a class="anchor" href="#no-costs" aria-hidden="true">#</a>No costs</h3>
+<p>The tab shows no money. lazy has no price table, and a hardcoded one would go
+stale without anyone noticing — so it says nothing rather than something wrong.</p>
+<h2 id="the-services-card"><a class="anchor" href="#the-services-card" aria-hidden="true">#</a>The Services card</h2>
+<p>The Services card lists the <code>[serve]</code> services the task declares and says, for
+each one, whether anything is actually answering. Liveness is measured by the
+daemon, not by your browser: a bare TCP connect to the published port, opened
+and closed, never a request to the app. Three states, and they look different on
+purpose:</p>
+<ul>
+<li><strong>Listening</strong> — a green dot and a clickable URL: the task&#39;s own name for that
+service, <code>http://&lt;task&gt;.&lt;service&gt;.lazy.localhost:&lt;port&gt;</code>. It is loopback-only,
+so it works from the machine the task runs on, which is the machine serving
+this page.</li>
+<li><strong>Published, nothing listening</strong> — a hollow red dot and the plain text
+<em>nothing listening on port 3000</em>, deliberately <strong>not</strong> a link. The port is
+mapped, but no server is behind it, and the URL would only send you back to
+this same page with a banner on it — the card is already where that banner
+would point.</li>
+<li><strong>Container not running</strong> — one line for the whole card, not one row per
+service, because every service is down for the same reason.</li>
+</ul>
+<p>Each row also carries the <code>lazy url &lt;task&gt; &lt;service&gt;</code> command, with a Copy
+button when your browser allows clipboard access.</p>
+<p>If a task&#39;s own branch declares a <code>[serve]</code> port that the project root does
+not, the Services tab lists it separately and shows <code>lazy forward &lt;task&gt; &lt;port&gt;</code>
+as the way to reach it. A worktree <code>lazy.toml</code> never publishes the port itself —
+only the project root&#39;s config does. The banner you see after opening a dead
+service URL still lands on the task&#39;s first tab and links here.</p>
+<h3 id="start-container"><a class="anchor" href="#start-container" aria-hidden="true">#</a>Start container</h3>
+<p>When a task&#39;s container is not running, the Services card offers a <strong>Start
+container</strong> button. It brings the task&#39;s container up through the same path
+<code>lazy shell</code> uses — no turn is started, no agent runs, and nothing is committed.</p>
+<p>This is the one place the button lives, because the Services card is the one
+place with nothing to open: everywhere else — Watch, Shell, Pair, Chat, and Run
+on a verification step — asking for the thing starts the container as part of
+doing it, and shows the start&#39;s progress on that panel&#39;s own status line. A
+Start button appears next to a terminal only after a start has failed, with the
+failure text beside it.</p>
+<p>Opening a page never starts anything, and two panels opened together share one
+start rather than launching two containers. Starting usually takes seconds, but
+if the image has to be rebuilt it can take minutes, so whatever surface you
+asked from shows what the launch is doing until it finishes or fails. Nothing is
+started for a task that is closed or complete, or for a runner with no
+containers (the <code>host-process</code> runner shares your machine&#39;s network, so there is
+nothing to start).</p>
+<h3 id="start-services"><a class="anchor" href="#start-services" aria-hidden="true">#</a>Start services</h3>
+<p>Once your project has a Start services command, the card also offers a
+<strong>Start services</strong> button.</p>
+<p>You <strong>designate</strong> the command in <strong>Settings › Services</strong> — the Services card&#39;s
+<strong>Configure services</strong> button takes you there. Type it (for example <code>bin/dev</code>)
+and save. It is one command for the whole project, not a per-task override, and
+it is saved in the project&#39;s store — lazy does not edit your <code>lazy.toml</code>. The
+command must be a single line. A task&#39;s Services card never changes it. Lazy
+Teams keeps the same command on its project Configuration page. After it is
+saved, <strong>Start services</strong> appears whenever the shell is available.</p>
+<p>To remove it, press <strong>Clear command</strong> in Settings › Services. The project then
+has no Start services command until someone designates one again — a
+<code>start_services_cmd</code> still sitting in <code>lazy.toml</code> is not read back.</p>
+<p>If your <code>lazy.toml</code> already sets <code>start_services_cmd</code> in <code>[serve]</code>, the daemon
+imports that value into the store the next time it starts, so it keeps working.
+After the import, the store&#39;s value is the one used; edit it in Settings ›
+Services rather than in <code>lazy.toml</code> (or clear it there).</p>
+<p>Pressing <strong>Start services</strong> opens the web shell on that task and runs the
+command there, in the container, so you watch the output in a real terminal
+instead of a spinner. The command never comes from a task&#39;s own files, which the
+agent working in that task can edit.</p>
+<p>That is the whole point of the key: your agents do not have to leave a dev
+server running for you to look at their work. They end their turn; you press the
+button.</p>
+<h3 id="services-restart-after-every-turn"><a class="anchor" href="#services-restart-after-every-turn" aria-hidden="true">#</a>Services restart after every turn</h3>
+<p>When a project has a Start services command and its tasks run in containers,
+lazy restarts each task&#39;s services once after every agent work turn, before the
+task is handed back to you — so what you open is running the code the agent just
+wrote. It stops the services, then runs the Start services command again. This
+happens even if the services were not running before the turn. Questions
+(<code>lazy ask</code>), reviews and syncs do not restart anything.</p>
+<p>A failed stop is logged and the start still runs. A failed start does not change
+the task&#39;s state: the task waits for you as usual. In Lazy Teams the task&#39;s
+Services tab and Overview show a warning with the command&#39;s last output, and
+<code>lazy show --json</code> carries the same record as <code>services_restart</code>.</p>
+<p><strong>Stop services command (optional).</strong> Lazy Teams&#39; Configuration page has a Stop
+services command next to the Start one. When set, it runs in the task&#39;s
+environment before lazy ends the processes Start services launched — on
+<strong>Stop services</strong> and on the restart after a turn. Without one, stopping simply
+ends those processes.</p>
+<h2 id="navigating-a-long-review"><a class="anchor" href="#navigating-a-long-review" aria-hidden="true">#</a>Navigating a long review</h2>
+<p><strong>Changes</strong> can hold dozens of files, and Summary has the report cards.</p>
+<p>The first cut on a large branch is the <strong>Regions tab</strong>, which sits before
+Changes: it lists the groups the agent&#39;s walkthrough declares, in the order it
+declared them with <code>Other changes</code> last, each with its size, its tier, its owner
+and the line the walkthrough wrote about it — on <code>Other changes</code>, how many of the
+change&#39;s files the walkthrough never named. Picking one opens Changes
+with <code>?region=&lt;id&gt;</code> applied, so a scoped review is a link you can send to
+someone. Past the twelfth region the rest fold under <strong>Other regions</strong> rather
+than disappearing. See <a href="../review-regions/">Review regions</a>.</p>
+<p>Within whatever you are looking at, viewed ticks and keyboard navigation follow
+the section you are in:</p>
+<ul>
+<li><p><strong>The card header stays with you.</strong> Scrolling through a long file keeps that
+file&#39;s header — its path, its <code>+</code>/<code>−</code> counts, Approve / Reject, Viewed —
+parked directly under the tab strip, so you never have to scroll back up to
+find out what you are reading or how to accept it. Scroll out of one card and
+into the next and the header swaps with it. Markdown cards do the same. Moving
+with <code>j</code> / <code>k</code> (or following a link to a file) lands with the header visible
+rather than tucked behind the tabs.</p>
+</li>
+<li><p><strong>Viewed</strong> — every file and every markdown card carries a Viewed checkbox.
+Tick it and the section collapses to its header line; the tick is remembered
+per task on your machine and clears itself if the content changes before you
+come back. <strong>Approving a protected file also ticks its Viewed box</strong> — the
+decision means you are done with that file — while rejecting leaves it
+unticked, since you may want to look again. Approve/Reject is one control
+on the <strong>file</strong> header: a walkthrough that splits a file into several
+hunks still decides the file once, not each hunk. Opening a viewed card
+(the chevron) clears the tick: an open card is not viewed, and the
+checkbox always matches.</p>
+</li>
+<li><p><strong>A current section</strong> — one section at a time can be <em>current</em>, marked with
+an accent bar and outline. <code>j</code>/<code>k</code> (press <code>?</code> for the legend) move it in page
+order; clicking inside a section also makes it current. Scrolling alone never
+moves it, so the marker is a reliable &quot;where was I&quot;. When you start
+navigating with no current section, the first section visible at the top of
+the window becomes current. Navigating to a section you have already marked
+Viewed leaves it collapsed and scrolls to its header; re-opening it is the
+chevron, which clears the tick.</p>
+</li>
+</ul>
+<p>Keyboard shortcuts act on the current section (press <code>?</code> on the page for the
+same list):</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Action</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>j</code> / <code>n</code></td>
+<td>next section</td>
+</tr>
+<tr>
+<td><code>k</code> / <code>p</code></td>
+<td>previous section</td>
+</tr>
+<tr>
+<td><code>v</code></td>
+<td>mark Viewed and go to the next section</td>
+</tr>
+<tr>
+<td><code>v</code> (already viewed)</td>
+<td>un-view it and stay put</td>
+</tr>
+<tr>
+<td><code>a</code></td>
+<td>approve (protected file with a decision control)</td>
+</tr>
+<tr>
+<td><code>r</code></td>
+<td>reject (same)</td>
+</tr>
+<tr>
+<td><code>s</code></td>
+<td>toggle diff layout (Unified / Split)</td>
+</tr>
+<tr>
+<td><code>w</code></td>
+<td>toggle Wrap for long lines</td>
+</tr>
+<tr>
+<td><code>f</code></td>
+<td>toggle Files (Presented / Source), on a page that has something to present</td>
+</tr>
+<tr>
+<td>Hold <code>Shift</code></td>
+<td>show key hints beside the controls that have one</td>
+</tr>
+<tr>
+<td><code>?</code></td>
+<td>show / hide the shortcut legend</td>
+</tr>
+</tbody></table>
+<p><code>v</code> advances on purpose: ticking a section off is how you say &quot;done with this
+one, next&quot;. Un-ticking is a correction, so it leaves you where you are. Use
+<code>j</code> / <code>n</code> to move without deciding anything.</p>
+<p><code>s</code> / <code>w</code> / <code>f</code> click the same toolbar buttons your mouse would (below), so a
+disabled Split button below the 900px breakpoint stays disabled for the key
+too — there is no way around that layout limit from the keyboard. A page with
+nothing to present has no Files control, so <code>f</code> simply does nothing there.</p>
+<p>To discover shortcuts without leaving the page, hold <code>Shift</code> for about half a
+second: a small key hint appears next to every control that has one — the <code>?</code>
+help, the current section&#39;s Viewed checkbox,
+and its Approve / Reject buttons. Release <code>Shift</code> and they disappear. Opening
+the <code>?</code> legend shows them too.</p>
+<p>Shortcuts are ignored while you are typing in any input or while a dialog is
+open. The current section is a reading position, not review state — it is not
+persisted, and none of this touches the server except the approve/reject posts
+that already exist. Without JavaScript there are no navigation controls and
+every section is simply expanded.</p>
+<p>These page shortcuts never use <code>Ctrl</code> / <code>Cmd</code>. The global command palette
+(<code>Ctrl/Cmd+K</code> and <code>Ctrl/Cmd+Shift+K</code>) is separate — see <a href="#command-palette">Command
+palette</a>.</p>
+<p><strong>The same navigation works on a task&#39;s detail page</strong> (<code>/tasks/&lt;task&gt;</code>), which is
+built from the same cards — chunks, comments, journal entries and raised items.
+<code>j</code> / <code>k</code> / <code>v</code> and the Shift hints behave identically there; <code>a</code> and <code>r</code> do
+nothing, because a task page has no approve/reject control.</p>
+<p><strong>On the Turns tab a card is a chunk</strong>, so <code>j</code> / <code>k</code> / <code>n</code> / <code>p</code> move a whole
+chunk at a time and <code>v</code> ticks the chunk off. The turns inside are collapsible
+individually, but they are not separate stops — a nudge and the work it caused
+are one thing to read.</p>
+<p><strong>A link to a single turn</strong> (<code>/tasks/&lt;task&gt;/turns/&lt;n&gt;</code>) opens the Turns tab
+scrolled to that turn, inside its chunk. Old links and pasted URLs keep
+working; a turn the task does not have is still a 404. If you had already
+ticked that chunk off, a <strong>turn</strong> link re-opens it — you asked for that turn by
+name, so it is shown rather than hidden behind the collapsed header, and the
+Viewed tick clears to match (exactly as re-opening it by hand would).</p>
+<p>Only a turn link does that, and only when you follow one. Links to a comment or
+a journal entry — the rows on <em>Since you last looked</em>, for instance — scroll to
+the note without re-opening a chunk you have ticked off. Neither does reloading
+the page, going Back to it, or reopening a restored tab: the tick you set after
+following the link stays set. Following one never quietly undoes review progress
+you have recorded.</p>
+<h2 id="times"><a class="anchor" href="#times" aria-hidden="true">#</a>Times</h2>
+<p>Every turn, note, report and review card says when it happened, without a
+click. The visible form is relative — &quot;3m ago&quot;, &quot;5d ago&quot; — because that is what
+you read a page with; hover it for the exact UTC time.</p>
+<p>Those relative times <strong>keep up while the page is open</strong>. Task pages are the kind
+you park — the Turns tab is where you sit while a task runs — so a &quot;2m ago&quot;
+rendered when the page was served would otherwise go on saying &quot;2m ago&quot; an hour
+later. It is recomputed on a timer, including for content that arrived after the
+page loaded, so what you read is what is true now.</p>
+<p>A timestamp lazy cannot make sense of reads <code>unknown</code> rather than a guess.</p>
+<h2 id="when-an-accept-is-refused"><a class="anchor" href="#when-an-accept-is-refused" aria-hidden="true">#</a>When an accept is refused</h2>
+<p>An accept can be refused for many reasons: the protection gate wants an approval
+passphrase, files were touched that the task was not allowed to touch, the branch
+is behind its parent, a merge is half-finished, the task has no commits. A bare
+&quot;accept failed&quot; leaves the reviewer with nowhere to go, so every refusal renders a
+<strong>remedy panel</strong> above the diff — or, with scripting on, <strong>inside the Accept
+dialog</strong> as the failed step plus the in-page action, so the refusal is not
+shown twice:</p>
+<ul>
+<li><strong>what to do next</strong>, in a sentence;</li>
+<li>the <strong>files involved</strong>, when the refusal is about specific paths (the motivating
+case is a task with dozens of protected files — nobody is retyping those);</li>
+<li>an <strong>in-page action</strong> when one exists — the passphrase form for a gated accept
+(primary, right under the failed step), or a <em>Sync with parent</em> button for a
+branch that is behind or conflicted;</li>
+<li>the <strong>exact CLI command</strong>, complete and copy-pasteable, always. For a
+conflict task that already has approved files it includes <code>--approve-file</code>
+for each of them and <code>--reason</code> if you typed one. It is the fallback when
+there is no in-page action, and the secondary alternative when there is.</li>
+</ul>
+<h3 id="the-daemon-owns-the-remedy-the-page-only-renders-it"><a class="anchor" href="#the-daemon-owns-the-remedy-the-page-only-renders-it" aria-hidden="true">#</a>The daemon owns the remedy, the page only renders it</h3>
+<p>The refusal→remedy mapping lives in the daemon, next to the code that refuses:
+every refusal carries a structured remedy (the reason, the next step, and where
+they apply the command, in-page action and files) alongside its message. The web layer never pattern-matches
+the prose of an error message to decide what to offer, and it never re-derives a
+command from config. A refusal the daemon has not mapped simply has no remedy
+panel: the daemon&#39;s own message is still shown verbatim, so an unmapped case
+degrades to what the page did before, never to a dead end.</p>
+<h3 id="the-passphrase-is-a-human-surface-deliberately"><a class="anchor" href="#the-passphrase-is-a-human-surface-deliberately" aria-hidden="true">#</a>The passphrase is a human surface, deliberately</h3>
+<p><code>lazy approve</code> has no MCP equivalent on purpose — an agent must not be able to
+satisfy its own gate. That asymmetry is about <em>agents</em>, not about terminals: a
+person at Current review is exactly the human the gate was written for, so the
+page asks for the passphrase and the daemon completes the gated accept, the same
+way <code>lazy approve</code> + <code>lazy accept</code> do at a shell. The passphrase is posted to the
+daemon for verification, is never stored client-side and never logged or echoed
+back into the page, and a wrong one re-renders the form with a clear, retryable
+error. See <a href="../surface-asymmetries/">surface-asymmetries.md</a>.</p>
+<h3 id="a-refused-accept-never-eats-what-you-typed"><a class="anchor" href="#a-refused-accept-never-eats-what-you-typed" aria-hidden="true">#</a>A refused accept never eats what you typed</h3>
+<p>The reviewer may have a half-written accept reason and half-written unblock
+feedback on the page when the accept is refused. Both are carried through the
+refusal and echoed back into their boxes, and both ride along as hidden fields
+inside the passphrase and sync forms — so a second failure preserves them too.
+Approved protected files ride the same way (<code>approved_files</code> hidden fields), so
+a passphrase retry of a conflict-task accept cannot drop a file you already
+ticked ✅. The CLI treats what you typed in
+<code>$EDITOR</code> the same way: your input is never dropped.</p>
+<h3 id="a-review-in-progress-belongs-to-the-task-not-to-the-tab"><a class="anchor" href="#a-review-in-progress-belongs-to-the-task-not-to-the-tab" aria-hidden="true">#</a>A review in progress belongs to the task, not to the tab</h3>
+<p>Reviewing a change is not a single sitting. You read half the diff, type half a
+thought into the feedback box, go look at something else, and come back — maybe
+in another tab, maybe in another browser, maybe tomorrow. All of that comes
+back:</p>
+<ul>
+<li><p><strong>Unsent feedback</strong> and an <strong>unsent accept reason</strong> are saved as you type
+(debounced) and filled back into their boxes on the next load.</p>
+</li>
+<li><p><strong>A half-typed comment on a line, a report paragraph or a presented block</strong> is
+saved the same way, under the box you opened it in — and the box is re-opened
+with your words in it, with the cursor where you left it. That is what makes
+the page safe to move underneath you: expanding context to see what surrounds
+a change, switching between unified and side-by-side, the page refreshing
+itself while the agent works, or an accidental reload no longer costs you the
+question you were half way through writing. Sending it or pressing <strong>Cancel</strong>
+clears it; nothing else does. A box with words in it is never closed behind
+your back.</p>
+<p><strong>A box always comes back somewhere you can see it.</strong> If the line it was
+written on is not on the page — it is inside a collapsed file or an
+unexpanded stretch of context, it is in a view this tab is not showing
+(Presented / Source, or Changes: Presented / Raw files), or the agent has
+rewritten the file since — the box re-opens <strong>above the diff</strong> instead,
+labelled with the file and line it belongs to. You can read it, edit it and
+send it from there. Nothing is ever restored into a pane you are not looking
+at, and the page never switches views by itself to show you one.</p>
+<p>If a review somehow ends up holding the maximum number of unsent boxes at
+once, the box that cannot be kept is named — the rest of what you typed still
+saves, and the words stay in the box.</p>
+<p>Each box is saved on its own, so <strong>two tabs cannot erase each other&#39;s work</strong>:
+a tab only ever writes the box you are typing in, and everything else on the
+task is left as it stands. What a tab shows you is the state of the review
+when that tab loaded — a box opened in the other tab since then appears when
+you reload — but nothing you have typed in either can be deleted by the
+other. Two boxes that happen to sit on the same line of the same file (a
+comment on the diff row, and a question about the rendered document or the
+diagram that line produced) are two drafts, not one.</p>
+</li>
+<li><p><strong>Viewed / collapsed ticks</strong> on each file are saved the same way, keyed by the
+file&#39;s content hash — so a file that CHANGED under you comes back unviewed
+rather than falsely ticked.
+The draft lives on the task in lazy&#39;s own storage, so a second tab, a second
+browser, and the same page tomorrow all show the same review in progress.
+Nothing about it is kept in the browser. Two exceptions, deliberately: the
+<strong>view-mode toolbars</strong> (Unified/Split, Scroll/Wrap, Files Presented/Source, and
+the Changes block&#39;s own Presented/Raw files) stay in <code>localStorage</code>, because
+those are per-machine display preferences rather than review work.</p>
+</li>
+</ul>
+<p>A draft is cleared only when its words have actually been <strong>delivered</strong> — the
+unblock that carries the feedback, the accept that carries the reason. A refused
+accept or a failed unblock leaves it exactly where it was. It does not matter
+where you deliver them from: typing feedback on this page and then running
+<code>lazy unblock</code> in a terminal clears the draft too, because the clear happens
+where the unblock does. An <strong>Unblock</strong> pressed under a comment box or in the
+Ask dialog delivers the words in <em>that</em> box, not your draft, so the draft stays
+until the Unblock box&#39;s own Unblock (or a terminal unblock) sends it.</p>
+<p>Drafts are keyed per reviewer. On the daemon&#39;s own dashboard, which has no
+sign-in, there is one reviewer; in Lazy Teams the key is the signed-in member,
+and the daemon takes it from the authenticated caller rather than from the
+request — so nobody can read or overwrite someone else&#39;s unsent words. That is
+one key, not a multi-user review model.</p>
+<h2 id="two-intents-ask-vs-comment"><a class="anchor" href="#two-intents-ask-vs-comment" aria-hidden="true">#</a>Two intents: ask vs comment</h2>
+<p>Each inline message is one of:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th><strong>Ask agent</strong></th>
+<th><strong>Add comment</strong></th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Means</td>
+<td>a question</td>
+<td>a change request or note</td>
+</tr>
+<tr>
+<td>Dispatched</td>
+<td>immediately, as a read-only ask turn</td>
+<td>never on its own</td>
+</tr>
+<tr>
+<td>Reaches the agent</td>
+<td>now</td>
+<td>batched into your next unblock work turn</td>
+</tr>
+<tr>
+<td>Can change code</td>
+<td>no</td>
+<td>yes (it rides a normal work turn)</td>
+</tr>
+<tr>
+<td>State on the record</td>
+<td><code>ask_state: pending → answered/failed</code></td>
+<td><code>delivery_state: pending_delivery → delivered</code> (+ <code>delivered_turn</code>)</td>
+</tr>
+</tbody></table>
+<p>The familiar analogue is GitHub&#39;s single comment vs. start-a-review: an ask is a
+question you want answered right now; comments accumulate until you submit.</p>
+<h3 id="unblock-from-the-same-box"><a class="anchor" href="#unblock-from-the-same-box" aria-hidden="true">#</a>Unblock from the same box</h3>
+<p>Every box that offers <strong>Ask agent</strong> also offers <strong>Unblock</strong>: the row is always
+<strong>Ask agent · Add comment · Unblock · Cancel</strong>. Unblock saves what you typed as a
+comment on that line, report paragraph or document — exactly as <strong>Add comment</strong>
+would, anchor and quote included — and then unblocks the task, so the agent starts
+working on it straight away, along with any other comments you had queued. If the
+task cannot be unblocked right now (it is still working, say), the comment stays
+queued for your next unblock and the box says why nothing started.</p>
+<p>An action the task cannot take right now is shown disabled, with the reason when
+you hover over it, rather than hidden. The <strong>Ask</strong> dialog offers the same row: its
+<strong>Add comment</strong> saves a task comment (as <code>lazy comment</code> does, starting nothing) and
+its <strong>Unblock</strong> sends the text as unblock feedback. The steps on the <strong>Verify</strong> tab
+take the same <strong>+</strong> as the report, and each command block has a <strong>Comment</strong> button, so
+you can ask, comment or unblock about the exact step you are checking. The Ask dialog
+itself lives on the <strong>Current review</strong> tab.</p>
+<p>Worked example — the reviewer posts C1 (comment), A1 (ask), C2 (comment), A2
+(ask), then unblocks. The agent sees exactly <strong>three</strong> turns: A1&#39;s ask and reply,
+A2&#39;s ask and reply, then a single work turn carrying C1 + C2 with their anchors
+plus the reviewer&#39;s unblock message.</p>
+<p><strong>A comment never becomes a work turn on its own</strong> — a reviewer marking up ten lines should produce one
+turn, not ten. This mirrors how lazy already treats forge PR comments: collect,
+then react in batch.</p>
+<p>Both modes stand alone. Comment-only-then-unblock (accumulate, then answer) and
+ask-only (pure conversation, no code change) are equally legitimate, and an
+unblock with nothing queued behaves exactly as it did before: the message alone,
+unwrapped.</p>
+<h3 id="asks"><a class="anchor" href="#asks" aria-hidden="true">#</a>Asks</h3>
+<p>An ask persists the comment, then answers it. While the task is paused for
+review and its agent session can still be resumed, the answer comes from that
+agent in <strong>reflective mode</strong> (same machinery as <code>lazy_ask</code>). Once it cannot —
+the task is finished, its session has ended, its worktree is gone — the question
+is answered from what lazy STORED about the task instead: its turns, its raised
+items, its commits and its diff, read by a throwaway read-only agent. Either
+way the answer is persisted as a reply in the same thread, anchored to the same
+line; the human can reply again and the thread accumulates. Ask turns never
+change code.</p>
+<p>A record-derived answer <strong>says so</strong>, in the reply itself and above the ask box:
+it is not the original agent and it is not looking at a live worktree. Only a
+task that has never run has nothing to answer from.</p>
+<p><strong>Line-anchored asks</strong> are posted from the diff&#39;s gutter buttons; <strong>task-level
+asks</strong> are posted from the Ask dialog on Current review (or via
+<code>POST /tasks/:task/review/ask</code>). Task-level threads appear in <code>taskThreads</code> in the
+poll payload and render on Current review with their delivery state. Unblock,
+Ask and Accept are three buttons on that page; each opens a dialog that
+narrates the operation the way the CLI does, then closes on success or stays
+open on failure. Without JS the same forms still post. The sticky status
+bar carries <code>data-rv-askable</code> so a question asked while the agent is busy is
+saved and can be re-sent.</p>
+<p><strong>Asks are filed with the review they belong to.</strong> When you end a review —
+the unblock that delivers it, or the accept that finishes the task — every
+question that has been answered is marked filed and moves out of the <strong>Asks</strong>
+list into a collapsed <strong>Filed asks</strong> section on the same page. Nothing is
+deleted: the question, the agent&#39;s answer and their state stay exactly as they
+were, one click away. Questions the agent has <em>not</em> consumed are deliberately
+never filed — one still in flight, and one whose dispatch failed (whose only
+<strong>Re-send to agent</strong> button lives on that thread) — so they stay in the list
+until they are answered. Nor is a thread filed while it still carries a comment
+waiting to be delivered: replying to an answer with <em>Add comment</em> keeps that
+conversation in the open list until your next unblock takes it.</p>
+<p>The list is what is still open, so a conversation the agent has nothing left to
+take — every question answered and submitted, every comment delivered — sits
+under <strong>Filed asks</strong>, including one you only ever commented on.</p>
+<p>Filing happens when <em>you</em> submit a review — your Unblock, your Accept, or the
+auto-fix unblock you asked for when you started a formal review. Work the
+daemon starts on its own does not file anything.</p>
+<p><strong>Reply</strong> on a task-level thread offers the same two intents as a reply on a
+line thread: <em>Ask agent</em> (answered now, read-only) or <em>Add comment</em> (queued for
+your next unblock). Reading an answer and wanting to say &quot;alright, do that&quot;
+without hunting for a code line to attach it to is the common case, so it is a
+plain comment on the conversation you are already in.</p>
+<p>Which of the two routes a question takes — and the one case where neither is
+possible — is decided in exactly one place in the daemon, and drives every surface: the daemon&#39;s dispatch,
+the note shown above the comment box <em>before</em> the reviewer types, the sticky
+status bar, <code>lazy ask</code> and the <code>lazy_ask</code> MCP tool. A question that cannot be
+answered at all is still saved, marked <code>failed</code> with the reason, and the thread
+offers a <strong>Re-send to agent</strong> button
+(<code>POST /tasks/:task/review/comment/:id/retry</code>) so it never has to be typed twice.
+Retry re-checks availability: still unanswerable → the current reason is
+re-recorded and the question is untouched; otherwise it is dispatched as-is into
+its original thread, by whichever route now applies. Retrying an ask already in flight is a no-op, and retry refuses anything
+that is not one of the reviewer&#39;s own questions (a queued comment is delivered by
+unblock, not by an ask).</p>
+<h3 id="promoting-a-discussion-into-a-task"><a class="anchor" href="#promoting-a-discussion-into-a-task" aria-hidden="true">#</a>Promoting a discussion into a task</h3>
+<p>A discussion is where the work a task did <em>not</em> do usually gets named: you ask
+why something is the way it is, the answer explains, and the next task is
+sitting there in plain text. <strong>Promote to a task</strong> on any answered task-level
+thread writes it down.</p>
+<p>The form is seeded from the discussion and everything in it is editable before
+anything is created:</p>
+<ul>
+<li><strong>Goal</strong> — the first sentence of your own question.</li>
+<li><strong>Code</strong> — derived from that goal; a collision gets a <code>-2</code>, <code>-3</code> suffix.</li>
+<li><strong>Where it goes</strong> — a subtask of this task (the default) or a sibling of it.</li>
+<li><strong>Prompt</strong> — the whole exchange verbatim, your question and the agent&#39;s
+answer, plus a line saying which task it was promoted from. Withdrawn
+messages are left out.</li>
+</ul>
+<p>The created task is a <strong>backlog</strong> task. Nothing starts until you start it — the
+web UI never auto-starts work. It inherits the originating task&#39;s agent, model
+and effort, exactly as a promoted <a href="../raised-items/">raised item</a> does, and goes
+through the same task-seeding path.</p>
+<p>One promotion per discussion: the link is recorded on the thread, which then
+shows <strong>Promoted to <code>&lt;code&gt;</code></strong> instead of the form, and a second press is
+refused naming the task the first one made.</p>
+<p>It is a plain form (<code>POST /tasks/:task/review/thread/:thread/promote</code>), so it
+works with scripting off, and it is post-redirect-get, so a refresh cannot
+promote twice.</p>
+<h3 id="comments"><a class="anchor" href="#comments" aria-hidden="true">#</a>Comments</h3>
+<p>A comment is persisted with <code>delivery_state: &#39;pending_delivery&#39;</code> and nothing else
+happens — no dispatch, and deliberately <strong>no status gate</strong>: a reviewer may mark up
+the diff of a task that is busy or not yet askable, and the notes keep until an
+unblock can carry them. The task page previews everything queued and both the
+page and the queue show the count, so the reviewer never has to remember what
+they wrote.</p>
+<p>On unblock, every undelivered comment is rendered into one prompt with its anchor (file, line, side, the
+line&#39;s text) and any ask conversation that already happened on that thread —
+without it, &quot;do what we just agreed&quot; reads as a non-sequitur. The reviewer&#39;s
+overall message follows.</p>
+<p>Two kinds of comment have no diff line to name. A <strong>prose-anchored</strong> comment (on
+the agent&#39;s report or a raised item — see below) is delivered with
+the line it points at quoted, not with a file and line number. A <strong>reply on a
+task-level thread</strong> is delivered as a reply on that conversation, with the
+question and the agent&#39;s answer quoted under it. A <em>fresh</em> task-level comment —
+one that replies to nothing — is refused, because
+that is exactly what the Unblock tab&#39;s message box already is.</p>
+<p>&quot;The next unblock&quot; means <strong>whichever unblock comes next, from any surface</strong>: the
+review page&#39;s form, <code>lazy unblock</code> in the terminal, or <code>lazy_unblock</code> over MCP
+all run the same batching in the daemon. The CLI prints
+<code>Also delivering N queued review comment(s)</code> so you are never surprised by what
+the turn carries, and the MCP result reports the count.</p>
+<p>A comment is marked <code>delivered</code> <strong>only after the unblock turn actually launches</strong>,
+recording the turn number that carried it (and when). A failed launch leaves it
+pending for the next attempt — the persist-first invariant, extended to the
+batch path.</p>
+<h3 id="delivery-state-is-always-stated"><a class="anchor" href="#delivery-state-is-always-stated" aria-hidden="true">#</a>Delivery state is always stated</h3>
+<p>Every reviewer-authored item on the page shows one of two states, so you never
+have to unblock again just to ask the agent whether your note arrived:</p>
+<ul>
+<li><strong>Pending — rides the next unblock.</strong> The item is durably saved but has not
+reached the agent. Queued comments say it under the message; a decided raised
+item says it next to its <strong>Undo</strong> button (undo works exactly as long as the
+decision has not been delivered).</li>
+<li><strong>Delivered in turn N (time).</strong> The item reached the agent in that turn.
+Delivered items render as one compact line each — a delivered raised-item
+decision shows its outcome (&quot;Promoted to subtask → the task&quot;, &quot;Responded&quot;,
+&quot;Dismissed&quot;) with the delivering turn, and offers <strong>no undo</strong>: the agent has
+read it, so the only honest correction is saying so in your next unblock.
+Records delivered before lazy stored the turn number (or delivered at accept,
+where no turn runs) show the timestamp alone.</li>
+</ul>
+<p>Every decision is recorded the moment you apply it, blocking or not — a decided
+item collapses to one compact line (its decision, any note, and a link to the
+item) with no decide controls left behind. Deciding a blocking item is what
+lifts it off the accept gate; deciding a non-blocking one only records that you
+looked.</p>
+<h3 id="anchoring-to-the-agents-prose"><a class="anchor" href="#anchoring-to-the-agents-prose" aria-hidden="true">#</a>Anchoring to the agent&#39;s prose</h3>
+<p>Diff lines are not the only thing worth reacting to: the sentence you want to
+question is often in the agent&#39;s <strong>report</strong>. Hovering any line of the agent&#39;s
+prose — a report section paragraph, a list item, a heading, a raised
+item — shows the same small <strong>+</strong> the diff gutter has, and clicking it
+opens the same two-intent form. &quot;Why?&quot; is an <strong>Ask</strong>, answered now in a
+read-only turn; &quot;track this separately&quot; is a <strong>Comment</strong>, queued into your
+next unblock. Same two verbs, same machinery, no third concept.</p>
+<p>The anchor is a stable content hash of the block&#39;s text (plus its report
+section), not a position — so it survives reloads and re-renders, and moves
+only when the words themselves change. A thread whose anchor text is gone (the
+agent reported again) is never lost: it falls back to a <strong>Conversations on the
+report</strong> block with its quoted line, exactly as diff threads whose lines left
+the diff do.</p>
+<p>The agent never sees the anchor&#39;s internals. A prose-anchored message is
+delivered as <em>&quot;On your report, the line:&quot;</em> followed by the quoted text — in an
+ask turn immediately, or in the batched unblock prompt alongside the diff-line
+comments. The queued list shows these as <em>&quot;on the report: «quoted text»&quot;</em>
+instead of a file link, and they count toward the queued total like any other
+comment.</p>
+<h3 id="withdrawing-retracted-not-deleted"><a class="anchor" href="#withdrawing-retracted-not-deleted" aria-hidden="true">#</a>Withdrawing: retracted, not deleted</h3>
+<p>A reviewer can take back one of their own messages while it is still theirs to
+take back — a queued comment, or a question whose ask failed (which by
+definition never reached the agent, and whose <strong>Re-send to agent</strong> button the
+reviewer may simply not want). <code>POST /review/:task/comment/:id/withdraw</code>, a
+plain form with a redirect for the same reason retry is one.</p>
+<p>It is a <strong>state, not a delete</strong>: <code>withdrawn_at</code> is stamped on the record, which
+keeps its place in its thread (struck through, so the reviewer can see what they
+took back) while no longer counting as awaiting delivery — and therefore out of the
+queued list, the counts, the threads payload the island polls, and every future
+unblock prompt. A hard delete would destroy the only durable copy of something a
+human wrote, and a <code>withdrawn</code> value on <code>delivery_state</code> would give a withdrawn
+<em>ask</em> a delivery state it never had. This is a deliberately narrow, one-way
+widening of &quot;a review comment&#39;s words are immutable&quot;: there is no un-withdraw,
+and a reviewer who changes their mind posts again.</p>
+<p>Withdrawal is refused, in the daemon and stated in place of the button on the
+page, for anything the agent has already seen: a delivered comment, a question
+already in flight (the ask turn is running and the answer will land — saying
+&quot;withdrawn&quot; over a live conversation would be a lie the reviewer then acts on),
+an answered question, and anything the agent wrote. One rule in the daemon drives its
+refusal, the page&#39;s explanation, and the notice after a POST.</p>
+<h3 id="ordering-asks-first"><a class="anchor" href="#ordering-asks-first" aria-hidden="true">#</a>Ordering: asks first</h3>
+<p>Asks and the unblock work turn share one per-task queue in the daemon, so a
+reviewer who asks a question and then unblocks in the same breath gets the answer
+before the work starts. One failed ask does not strand the asks or the unblock
+behind it.</p>
+<h2 id="design-decisions-worth-knowing"><a class="anchor" href="#design-decisions-worth-knowing" aria-hidden="true">#</a>Design decisions worth knowing</h2>
+<h3 id="comments-are-their-own-storage-entity"><a class="anchor" href="#comments-are-their-own-storage-entity" aria-hidden="true">#</a>Comments are their own storage entity</h3>
+<p>Inline review comments are stored separately from ordinary task comments.</p>
+<ul>
+<li><strong>They are a batch, not a stream of notes.</strong> A task comment is
+delivered wholesale into the next turn&#39;s prompt; a review is a marked-up diff
+whose remarks are anchored to lines and threaded, and which the reviewer sends
+when it is complete. Reusing task comments would flatten every anchor and mix
+half-written review notes into the next turn.</li>
+<li>They carry an anchor (<code>file</code>, <code>line</code>, <code>side</code>) and a thread, which
+a task comment has no place for.</li>
+</ul>
+<h3 id="the-message-is-saved-before-anything-is-attempted"><a class="anchor" href="#the-message-is-saved-before-anything-is-attempted" aria-hidden="true">#</a>The message is saved before anything is attempted</h3>
+<p>lazy never loses what you typed. Posting writes the reviewer&#39;s words
+to the store <em>first</em>, then decides what to do with them — for an ask, that
+means the askability gate is evaluated only after the write.
+Every downstream failure — task not askable, worktree lock contention, runner
+unavailable, agent crash, 10-minute ask timeout — is recorded <strong>on</strong> the comment
+as <code>ask_state: &#39;failed&#39;</code> with an actionable <code>ask_error</code>. A comment is never
+deleted or rolled back because its ask failed. The same holds on the delivery
+side: a comment that could not be delivered stays <code>pending_delivery</code>.</p>
+<p>The reviewer&#39;s overall unblock message has no such durable home before the agent
+turn exists, so it is written to <code>.lazy/recovery/</code> before launch and removed only
+on success. The batched comments need no such backup — they are already durable.</p>
+<h3 id="the-post-returns-before-the-agent-answers"><a class="anchor" href="#the-post-returns-before-the-agent-answers" aria-hidden="true">#</a>The POST returns before the agent answers</h3>
+<p>An ask is synchronous inside the daemon with a 10-minute timeout — far too long
+to hold an HTTP request open. <code>POST /review/:task/comment</code> returns <code>201</code> as soon
+as the comment is durable, with <code>ask_state: &#39;pending&#39;</code>. The ask runs in the
+background; the browser island polls <code>/api/review/:task/threads</code> while
+<code>pending &gt; 0</code> and stops when it reaches zero. A queued comment never triggers
+polling — nothing is happening to it until unblock.</p>
+<p>Asks <em>and</em> the unblock are serialized per task in the daemon: an ask holds the
+task&#39;s worktree lock while it runs, and a second question or an unblock arriving
+meanwhile is refused (409) rather than racing it.</p>
+<h3 id="current-review-is-the-one-place-a-turn-ends"><a class="anchor" href="#current-review-is-the-one-place-a-turn-ends" aria-hidden="true">#</a>Current review is the one place a turn ends</h3>
+<p>The Current review tab holds the human&#39;s in-progress review: queued comments,
+ask threads with their delivery state, an autosaved feedback box, and the
+terminal actions. Unblock, Ask and Accept are dialogs, not an in-card tab
+control; Submit sits on that same row. Reject and Sync sit beside them and also open dialogs. The
+action block is rendered <strong>once</strong>. The diff lives on Changes, so there is no
+second copy at the bottom of a long page and no script keeping two forms in
+sync. While the task is working or pairing, Unblock and Accept are disabled
+with a visible reason under the buttons; the sticky-bar poll flips that gate
+live so a mid-review page never offers a click the daemon will refuse. Without
+JavaScript, the noscript Unblock/Accept forms are omitted on that same first
+paint (Ask still works) so a no-JS browser cannot POST into a 409 either.</p>
+<p>A <strong>Before you can accept</strong> checklist names each open blocking raised item
+and each protected file that still needs a decision, and links to the tab
+that resolves it. A protected-file row opens that file&#39;s card on Changes
+(not the top of the tab). It is disclosure only — the daemon still refuses
+accept if anything is open.</p>
+<p>Above it, <strong>Declared done</strong> / <strong>Not declared done</strong> says whether anybody has
+said this work is finished, with who, when and at which commit. It is
+information, not a gate: a task nobody declared is still yours to accept, and
+what the declaration decides is whether lazy ran a review of it.</p>
+<p>Each protected file has an <strong>Approve</strong> / <strong>Reject</strong> control on its header in
+Changes, saved as you press it. An undecided file has neither pressed. Unblock
+never blocks on one. It restores every file you <strong>rejected</strong> to the version it
+started from — as lazy&#39;s own commit, before the agent starts, which is then
+told to make the rest of the work fit; undecided and approved files keep the
+content the agent left. Accept tells you when the work contains such a restore. Accept refuses while any
+protected file is rejected or undecided.</p>
+<p>The empty state is usable if you want to accept immediately: the checklist,
+a progress line (queued comments, files viewed, verified steps), the
+actions, and one sentence saying comments come from a line in Changes or
+from the report on Summary.</p>
+<p><strong>Submit</strong> is on the task header (next to Sync) and on Current review next
+to Accept, so you do not have to open the review tab to find it. It asks
+before it opens a PR. A protected target is a checkbox (yes, create the PR).
+An unprotected or unknown target requires typing the target branch name or
+the task code — the same tiers as <code>lazy submit</code> and <code>lazy_submit</code>. If submit
+cannot run (for example there is no remote), the dialog says why instead of
+hiding the button. <code>--yes</code> skips the CLI prompt; MCP has no equivalent (it
+uses a <code>confirmation_code</code> instead). On success the page shows the PR URL.</p>
+<p>The Tasks list has a <strong>Submitted</strong> filter next to Working, Interrupted and
+Blocked. It shows submitted tasks and tasks linked to an external pull or merge
+request, even if their status has changed. The task page links directly to the
+request. The dashboard throughput graph plots submitted tasks as their own series.</p>
+<p>The header also shows whether the task is behind its parent (as of last
+fetch — no network). <strong>Sync</strong> on this tab and on Summary runs the same
+action.</p>
+<p>Queued comments are listed <strong>in full</strong>, never truncated: this list is the
+reviewer&#39;s only record of what they have already written before they commit to
+sending it. Each entry links to where its anchor lives — a Changes line, a
+Summary report line, or a raised item. Diff-line anchors still use
+<code>#l-&lt;encoded path&gt;-&lt;side&gt;-&lt;line&gt;</code>.</p>
+<p>When you have queued comments the agent has not read, Accept refuses unless you
+say you mean it: the Accept dialog offers <strong>Merge without delivering the queued
+comments</strong>. The box follows the page&#39;s live refresh, so it also appears for a
+comment added after you opened the page, and an accept refused for this reason
+offers the same choice inside the dialog.</p>
+<h3 id="the-sticky-status-bar"><a class="anchor" href="#the-sticky-status-bar" aria-hidden="true">#</a>The sticky status bar</h3>
+<p>A fixed footer always shows the task&#39;s status, turn count, last agent activity
+and whether the agent can answer right now — the <code>lazy ls</code> facts, without
+scrolling out of the diff.</p>
+<p>Two of its items are about <strong>your review</strong>, not about any queue of work:</p>
+<ul>
+<li><strong><code>N comments queued</code></strong> — review comments you have written and not sent. They
+all ride the next Unblock.</li>
+<li><strong><code>N asks awaiting an answer</code></strong> — questions you asked the agent that it has
+not answered yet. Back to zero when the answer lands.</li>
+</ul>
+<p>Each has a hover tooltip saying the same thing. Neither appears at all until
+something has been queued or asked on this review — and once something has,
+the counter stays visible even at zero, so you can watch it drain before you
+accept.</p>
+<p>On a <strong>cluster</strong> task the bar also carries the cluster&#39;s own progress: <code>Cluster: 3/8 accepted · running &lt;child&gt;</code>, with the running children linked. Those are the same
+numbers <code>lazy show</code> prints and the Subtasks tab rolls up, derived from the
+children themselves — accepted children out of the ones still expected to land,
+what is running now, what the cluster set aside, and what it closed.</p>
+<p>It is refreshed by the <strong>same poll</strong> that refreshes the threads and the
+Unblock / Accept busy gate, which therefore now runs always: every 3s while an
+ask is pending or the task is working/pairing, every 10s otherwise. That is a
+deliberate stopgap: polling is simple and adequate at this scale, and server
+push is the better answer once the surface justifies it.</p>
+<p>While the task is working or pairing (for example during an agent Review),
+Unblock and Accept stay disabled and the reason is visible under the buttons —
+not only a hover tooltip — so a page left open mid-review cannot offer a click
+the daemon will refuse.</p>
+<h3 id="one-diff-renderer-shared-by-both-pages"><a class="anchor" href="#one-diff-renderer-shared-by-both-pages" aria-hidden="true">#</a>One diff renderer, shared by both pages</h3>
+<p>There is one diff renderer. It is a purpose-built
+light-DOM unified-diff parser/renderer: every commentable line carries
+<code>data-file</code> / <code>data-side</code> / <code>data-line</code>, and every page that shows a diff — the
+review surface and commit detail — goes through it.</p>
+<p>One renderer means one look, one set of behaviours, and
+a feature built once shows up on both pages.</p>
+<p>Anchors track the old and new numbering spaces independently — a deleted line
+has only a pre-image number, an added line only a post-image number. Collapsing
+them would make anchors ambiguous.</p>
+<h3 id="the-view-toolbar-and-side-by-side"><a class="anchor" href="#the-view-toolbar-and-side-by-side" aria-hidden="true">#</a>The view toolbar, and side-by-side</h3>
+<p>Above every diff sits a toolbar of <strong>view modes</strong>, one group per mode, defined as
+a list. Today that is
+<strong>Layout</strong> (Unified / Split) and <strong>Long lines</strong> (Scroll / Wrap), plus <strong>Files</strong>
+(Presented / Source) on any page that has something to present. Each choice is
+one setting for the whole tool, not per file, persisted in <code>localStorage</code>
+(<code>lazy:difflayout</code>, <code>lazy:diffwrap</code>, <code>lazy:diffpresented</code>) in a try/catch — a
+private-mode browser loses the preference and nothing else. The controls ship
+<code>hidden</code> and JS unhides them, so a diff still renders fully without JS.</p>
+<p>The toolbar is <strong>sticky</strong>, so it never scrolls out of reach on a long review —
+switch layout or wrap at whatever file you are currently reading, with no trip
+back to the top. The same three toggles also have keyboard shortcuts (<code>s</code> / <code>w</code>
+/ <code>f</code>, above), for the same reason.</p>
+<p>What stays on screen while you scroll is a <strong>stack of three</strong>, each parked under
+the one above it: the tab strip at the top, then this toolbar, then the header
+of whichever file you are currently inside. All three are visible at once — the
+file header is never tucked underneath the toolbar — so at any point in a long
+review you can see where you are, what you are reading, and how to change the
+view, without scrolling anywhere.</p>
+<p>The list shape is the point. The review surface is heading towards <em>presenting</em> a
+change (rendered markdown, diagrams, images) rather than printing its lines, and
+every such mode needs an escape hatch back to the raw lines sitting right beside
+it. Each new mode joins the same view switch — not a second kind of control
+invented elsewhere on the page.</p>
+<p>The <strong>Files</strong> group is that idea already in place. It is deliberately not named
+after any file type: a presented pane and its source pane both ship in the page,
+marked <code>data-rv-show=&quot;presented&quot;</code> and <code>data-rv-show=&quot;source&quot;</code>, and the switch
+flips between them for every file that has both. A file with no presented form
+has only the source pane, and the switch leaves it alone. Markdown is the first
+type to grow one; nothing about the control assumes it is the last. The group is
+labelled <strong>Files</strong> rather than <strong>View</strong> because the Changes block just above has
+its own Presented / Raw files toggle for the agent&#39;s walkthrough — two different
+questions, which must not read as one.</p>
+<p><strong>Split is a DOM regrouping, not a stylesheet.</strong> Pairing a deletion with the
+addition that replaced it merges two <code>&lt;tr&gt;</code>s into one, and no CSS can change how
+many rows a table has. The server groups each hunk&#39;s lines into rows (a change block&#39;s deletions zipped index-wise
+against its additions, blank filler on whichever side runs out, context lines
+occupying both panes) and the browser only regroups rows it is told about, <strong>moving</strong> existing cells rather
+than re-rendering text — so nothing client-side can mis-escape a line of code.</p>
+<p>Two consequences worth knowing:</p>
+<ul>
+<li><strong>The anchor moves one level down the tree, and only that.</strong> A split row holds
+two lines, so it cannot carry one anchor: <code>data-file</code>/<code>data-side</code>/<code>data-line</code>
+and the anchor id land on the <strong>code cell of the side they belong
+to</strong>. Same values, same key, same fragment link — so a comment placed in split
+resolves identically in unified and survives a reload.</li>
+<li><strong>The unified <code>&lt;tbody&gt;</code> is detached, not hidden</strong>, while split is showing
+(stashed on the table element). Two copies in one document would mean two
+elements carrying each anchor&#39;s id, and the queued-comment list is built
+entirely out of fragment links.</li>
+</ul>
+<p>Wrap and split are <strong>independent and freely combined</strong>: a paired row is as tall
+as its taller pane, so wrapping cannot drift the two sides apart — split is if
+anything more robust under Wrap than unified was. Below <code>900px</code> the layout
+<strong>falls back to unified</strong> and the Split button is disabled rather than scrolling
+horizontally into uselessness; the stored preference is untouched, so widening
+the window restores it. Switching layout swaps the whole <code>&lt;tbody&gt;</code>, so the review
+island re-renders threads on an <code>rv:layout</code> event instead of waiting for the next
+poll.</p>
+<p>Commit detail gets all of this with no comment affordances — the toolbar and the
+split layout are renderer-level, the comment UI is passed in per page.</p>
+<h3 id="mermaid-diagrams-in-diffs-and-markdown"><a class="anchor" href="#mermaid-diagrams-in-diffs-and-markdown" aria-hidden="true">#</a>Mermaid diagrams in diffs (and markdown)</h3>
+<p>A complete fenced block tagged <code>mermaid</code> — in a markdown file, or embedded in
+any other text the diff shows — renders as a diagram instead of as raw source.
+Each block has a <strong>Diagram / Source</strong> toggle: the diagram is the default once
+it has rendered, and Source is the one-click escape hatch back to the exact
+fence characters (including the <code>+</code>/<code>-</code> markers when the fence itself changed).</p>
+<p>Only <strong>complete</strong> post-image fences are presented. A mid-edit fence with no
+closing <code>```</code> stays as source. A fence that fails to render (invalid
+syntax, timeout, library load failure) also stays as source, with a short error
+on the page — never a blank pane. The library is vendored and served from
+<code>/assets/mermaid.js</code> (no CDN); the page loads it only when a mermaid block is
+present.</p>
+<p>The fence lines keep their per-line comment anchors. The diagram is a
+presentation row layered after the closing fence, not a replacement for those
+rows — so commenting on a mermaid line still works the same way as on any other
+line.</p>
+<p>The toolbar also carries a <strong>Comment</strong> button, next to Diagram / Source: a
+question about a diagram is asked while looking at the diagram, not after
+switching back to the fence and hunting for the right line. It opens the same
+Ask / Add comment box, anchored to the line the fence opens on, with the
+diagram&#39;s source as the quote the agent receives.</p>
+<h3 id="threads-survive-a-re-diff-even-when-their-line-moves"><a class="anchor" href="#threads-survive-a-re-diff-even-when-their-line-moves" aria-hidden="true">#</a>Threads survive a re-diff, even when their line moves</h3>
+<p>Threads whose anchor no longer appears in the current diff (the agent edited the
+file, the hunk moved) are not dropped — they render in an <strong>orphan threads</strong>
+section below the diff, with their original anchor. There is no re-anchoring
+model yet; see <a href="#known-limits">Known limits</a>.</p>
+<h2 id="security-posture"><a class="anchor" href="#security-posture" aria-hidden="true">#</a>Security posture</h2>
+<p>Two things guard this surface: a <strong>browser session</strong> and a <strong>loopback bind</strong>.</p>
+<p><strong>The session.</strong> Every dashboard route — every page, every asset, every <code>/api</code>
+route — requires the cookie described in <a href="#signing-in">Signing in</a>. This
+matters because the dashboard shares one TCP port with the daemon&#39;s <code>/rpc</code> and
+<code>/mcp</code> endpoints, and task containers are given a route to that port so their
+agents can use MCP. Until the session gate existed, an agent inside any task
+container could read the whole task list and POST accept, unblock, close and
+edit on the dashboard, using no credential at all.</p>
+<p>The credentials an agent <em>does</em> hold do not open the dashboard: MCP tokens and
+the shared daemon bearer token are refused by the gate, and a login link can be
+minted only over <code>/rpc</code>, which refuses MCP tokens. The two credential systems
+are deliberately separate.</p>
+<p><code>SameSite=Strict</code> on the session cookie is half the CSRF story for the mutating
+routes: another <em>site</em> cannot make your browser use it. The cookie is
+<code>HttpOnly</code>, and deliberately not <code>Secure</code> — the dashboard is plain HTTP on
+loopback, where a <code>Secure</code> cookie would never be sent back at all.</p>
+<p>The other half is an <strong>origin check</strong>, and it is there because task apps are
+served on subdomains of the dashboard&#39;s own hostname. <code>SameSite</code> treats those as
+the same site, so it would let a page served by a task post to a dashboard
+route. Every request that can change state — any unsafe method, plus WebSocket
+upgrades, which is how the web shell into a container is opened — must therefore
+carry an <code>Origin</code> (or a <code>Sec-Fetch-Site</code>) that says it came from the dashboard
+itself; anything else is refused with a <code>403</code> before the login ticket or the
+cookie is even looked at. Safe <code>GET</code> navigations are exempt on purpose: they
+change nothing, every mutating route answers <code>405</code> to one, and a link from a
+task app back to the dashboard has to keep working. A request with neither
+header is a non-browser client (curl, a script) and is allowed — it is not
+carrying anyone&#39;s cookie by accident.</p>
+<p><strong>No framing.</strong> The origin check cannot see one last trick: a task&#39;s own app
+could put the dashboard in an invisible <code>&lt;iframe&gt;</code>, cover it, and let one of
+your clicks land on a real button behind it — a request that genuinely does come
+from the dashboard. So every dashboard response refuses to be framed at all
+(<code>Content-Security-Policy: frame-ancestors &#39;none&#39;</code> and <code>X-Frame-Options: DENY</code>).
+Your own apps are unaffected: pages served through a task&#39;s hostname are passed
+through untouched, including any framing rules they set for themselves.</p>
+<p><strong>The bind.</strong> The surface still <strong>binds to loopback only</strong>, and that is still
+load-bearing: the sign-in gate is authentication, not hardening. Do not expose
+it on another interface, a tunnel, or a reverse proxy. Treat that as a hard
+constraint of the current implementation, not a configuration choice.</p>
+<h3 id="managed-mode-no-dashboard-at-all"><a class="anchor" href="#managed-mode-no-dashboard-at-all" aria-hidden="true">#</a>Managed mode: no dashboard at all</h3>
+<p>On a managed daemon (a Lazy Teams fleet host — see
+<a href="../managed-config/">managed-config.md</a>) the dashboard does not exist. Every
+page, asset, <code>/api</code> route, the login endpoint and <code>lazy dashboard</code> itself answer
+with one line: <em>this daemon is managed; use Lazy Teams</em>. Pages and assets 404;
+<code>lazy dashboard</code> exits non-zero with the same message.</p>
+<p><code>/rpc</code> and <code>/mcp</code> are untouched, which is why a managed host loses nothing:
+Lazy Teams talks to daemons over <code>/rpc</code> with actor tokens, and never loads a
+page from this surface.</p>
+<p>Comment threads use exact <code>(file, line, side)</code> anchors. When a later turn moves
+the lines a thread was anchored to, the thread is not re-anchored: it is listed
+separately as an orphan thread, keeping its original anchor, rather than being
+silently attached to the wrong line.</p>
+<h2 id="known-limits"><a class="anchor" href="#known-limits" aria-hidden="true">#</a>Known limits</h2>
+<ul>
+<li>Single-operator sign-in: one session credential for the machine&#39;s owner, no
+users, no passwords, no OAuth, and no per-browser sign-out. A session is a
+bearer credential — anyone who can read the cookie or an unspent login link is
+signed in.</li>
+<li>No re-anchoring: a thread whose line moved falls into the orphan list.</li>
+<li>No live updates; the island polls — 3s while an ask is pending, 10s
+otherwise — to keep the threads and the status bar current.</li>
+<li>Single reviewer assumed — comments record <code>actor: &#39;human&#39;</code> with no identity.</li>
+<li>The queue lists <code>blocked</code> only; <code>conflict</code> tasks are askable but not listed.</li>
+<li>A queued comment cannot be <em>edited</em> before delivery — withdraw it and write it
+again. Withdrawal itself is one-way; there is no un-withdraw.</li>
+<li>No syntax highlighting, and no word-level intra-line diffing — the diff is
+plain text in both layouts. Complete <code>mermaid</code> fences are the exception:
+they render as diagrams with a Source toggle (incomplete or broken fences
+stay as source).</li>
+<li>The sync remedy starts a sync and reports it; the page does not follow the
+task through it — re-open the task page to see where it landed.</li>
+<li>Split shares one horizontal scroller across both panes, and an open comment
+form is dropped when the layout is toggled (a cloned <code>&lt;textarea&gt;</code> would lose
+what was typed).</li>
+<li>Mermaid rendering is post-image only: a changed fence shows the new diagram,
+not a before/after pair. Toggle to Source to inspect the character-level diff.</li>
+<li>Inside a blockquote the accent lands on the whole quote rather than the line
+within it, and a change that touches only blank lines opens its passage with
+no accent at all. Source has the exact lines in both cases.</li>
+<li>Without scripting, <strong>Review</strong> (and Accept, and the other long verbs) POST and
+wait on that one request. The dashboard cuts the page off after about 105
+seconds — the same deadline Accept hit before action dialogs — so a
+minutes-long review never finishes in the browser. Scripting-on follows the
+run in a dialog instead; or run <code>lazy review</code> in a terminal.</li>
+</ul>
+<h2 id="copying-markdown"><a class="anchor" href="#copying-markdown" aria-hidden="true">#</a>Copying markdown</h2>
+<p>Turns, agent reports, comments, journal entries, raised items, prompts and messages are shown rendered, so selecting
+the text copies it without its headings, lists, code fences and links. Each such card has a <strong>Copy</strong> button
+that copies the original markdown source instead, exactly as it was written. It works in both the dashboard and
+Lazy Teams, shows &quot;Copied&quot; (or &quot;Copy failed&quot;) on the button, and falls back to the browser&#39;s older copy command
+where the page is not served over HTTPS or from localhost.</p>
+
+</main>
+</body>
+</html>

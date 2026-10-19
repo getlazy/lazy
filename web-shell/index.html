@@ -35,7 +35,7 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="web-shell"><a class="anchor" href="#web-shell" aria-hidden="true">#</a>Web shell</h1>
 <p>This page is for anyone reviewing tasks in the local daemon dashboard. The
@@ -59,8 +59,14 @@ full-screen programs like <code>vi</code>, <code>less</code> and <code>htop</cod
 came from (a verification step, Services, opened here, Pair, Chat), and whether
 it is connected — with <strong>go to</strong> and close. A session renders in exactly one
 place; the list is an index, not a second terminal.</p>
-<p><strong>Maximise</strong> enlarges that same terminal as an overlay. The element never moves
-in the page, so focus and scrollback stay put.</p>
+<p><strong>Fill window</strong> makes that same terminal cover the whole browser window, width
+and height; <strong>Exit full window</strong> (or <strong>Esc</strong>, when the terminal itself is not focused — inside it Esc goes to your program) puts it back. The element never moves
+in the page, so focus and scrollback stay put. Every browser terminal in Lazy
+— the task Shell, Watch, a verification step&#39;s shell, and the terminals in Lazy
+Teams — has the same controls: <strong>Fill window</strong>, <strong>Paste</strong> (not on the read-only
+Watch), <strong>Page Up</strong> / <strong>Page Down</strong> to scroll back, <strong>Ctrl/Cmd+C</strong> to copy a
+selection (with none it stays the interrupt), <strong>Ctrl/Cmd+V</strong> or <strong>Shift+Insert</strong>
+to paste, and a draggable bottom edge to change the height.</p>
 <h2 id="pair-and-chat"><a class="anchor" href="#pair-and-chat" aria-hidden="true">#</a>Pair and Chat</h2>
 <p><strong>Pair</strong> takes over the agent&#39;s session in the same terminal, with the same
 lock as <code>lazy pair</code>: unblock and accept refuse until you stop, and a dropped

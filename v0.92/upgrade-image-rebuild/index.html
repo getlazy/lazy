@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How lazy upgrade rebuilds the container image — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }</style>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
+<main class="wrap">
+<h1 id="how-lazy-upgrade-rebuilds-the-container-image"><a class="anchor" href="#how-lazy-upgrade-rebuilds-the-container-image" aria-hidden="true">#</a>How <code>lazy upgrade</code> rebuilds the container image</h1>
+<p>This page explains how <code>lazy upgrade</code> rebuilds the container image your agents
+run in, and when else lazy rebuilds it. A rebuild can take several minutes, and
+none of the upgrade&#39;s other steps — asking what to do about working agents,
+waiting for them to block, stopping containers — is an input to it: the image is
+built from the Dockerfile, not from the state of your tasks. So the build starts
+first and runs in the background while the rest of the upgrade proceeds.</p>
+<h2 id="the-sequence"><a class="anchor" href="#the-sequence" aria-hidden="true">#</a>The sequence</h2>
+<ol>
+<li><p><strong>Preflight</strong> — container runtime availability, discovery of
+this project&#39;s running containers. Nothing has changed yet, and an abort here
+costs nothing.</p>
+</li>
+<li><p><strong>Start the rebuild, in the background, to a staging tag.</strong> The build writes
+<code>&lt;repository&gt;:&lt;tag&gt;-upgrade</code> (e.g. <code>lazy-runner:0.22-upgrade</code>), always
+with <code>--no-cache</code> — the Dockerfile text is unchanged when a new version of
+the configured agent&#39;s CLI ships, so only busting the cache actually
+re-fetches it.</p>
+<p>Upgrading lazy rebuilds the image. That is what makes the image tag safe to
+keep coarse (<code>major.minor</code>) — the tag is an identity, and this is the
+freshness mechanism.</p>
+<p>The one exception is <strong>repeating a build that just happened</strong> — and it is a
+question, not a rule. If an image built from exactly these inputs already
+exists (the usual cause being a <code>lazy upgrade --images</code> you ran minutes
+earlier), <code>lazy upgrade</code> tells you how old it is and asks whether to rebuild
+it anyway:</p>
+<pre><code>lazy-runner:0.22 was built 6 minutes ago from these exact inputs — its
+Dockerfile and build inputs are unchanged since.
+  Rebuilding re-resolves everything unpinned inside it (the agent CLI, apt
+  packages, anything else the Dockerfile fetches) and takes several minutes.
+  Rebuild the container image anyway? [Y/n]
+</code></pre>
+<p>The default is yes, because refreshing unpinned contents is what an upgrade
+rebuild is <em>for</em> — but whether that is worth several minutes right now
+depends on why you are upgrading, which only you know. There is no hidden
+time threshold deciding it for you. Without a TTY (scripts, CI) and with
+<code>--force</code>, the rebuild happens without asking; <code>lazy upgrade --images</code> never
+asks — it is the force-refresh path.</p>
+</li>
+<li><p><strong>Foreground flow continues</strong>: the stop/wait/cancel prompt, waiting for
+working agents to block, the builder pre-stop warning, stopping <strong>task</strong>
+containers. Builder sessions stay running — they reconnect in place once
+the daemon restarts (step 6).</p>
+</li>
+<li><p><strong>Collect and promote.</strong> The upgrade waits for the background build (usually
+already finished), then points the canonical tags — <code>lazy-runner:&lt;major.minor&gt;</code>
+and, for the base repository, <code>lazy-runner:latest</code> — at the staged image and
+drops the staging tag. The agent binary is rebuilt alongside this.</p>
+</li>
+<li><p><strong>Stop the daemon</strong>, then purge any pre-v0.20 MCP configs left in the repo and
+rotate the shared daemon token they leaked — the one window where no
+container and no daemon holds it.</p>
+</li>
+<li><p><strong>Restart the daemon</strong>, which reconciles and auto-resumes interrupted tasks.</p>
+</li>
+<li><p><strong>Print a completion summary</strong> as the last output — a bordered <strong>Upgrade
+complete</strong> block below any docker build progress (and any prompts that
+scrolled away during a long build). It states the version transition, what
+was rebuilt (container image tag, agent binary), daemon restart status, and
+what happens next (interrupted tasks auto-resuming, builders resuming in
+place, etc.). <code>lazy upgrade --images</code> ends with a similar <strong>Image refresh
+complete</strong> block instead.</p>
+</li>
+</ol>
+<h2 id="why-this-is-safe"><a class="anchor" href="#why-this-is-safe" aria-hidden="true">#</a>Why this is safe</h2>
+<p><strong>Nothing running is disturbed by the build.</strong> A container holds its image by ID
+from the moment it launches, and any container created while the build is in
+flight resolves the <em>canonical</em> tag — which still points at the current image.
+The staging tag is invisible to every launch path.</p>
+<p><strong>The canonical tag only moves after you commit.</strong> Promotion happens in step 4,
+past the point where you chose to proceed. Cancel the upgrade, ctrl-c out of a
+prompt, or hit any failure before that, and <code>lazy-runner:&lt;major.minor&gt;</code> still points
+exactly where it did. The abandoned build&#39;s layers stay in the container
+runtime&#39;s build cache, so the next upgrade starts warm instead of from scratch;
+the staging tag itself is removed.</p>
+<p><strong>A failed build fails the upgrade, loudly.</strong> There is no fallback to &quot;keep the
+old image and carry on&quot; — that would produce an upgrade that upgraded nothing.
+If the build has already failed by the time you answer the prompt, the upgrade
+aborts <em>before</em> stopping anything, so your builders and agents keep running on
+the intact image. If it fails while the upgrade is collecting it, the failure is
+reported with the staging tag that was not promoted.</p>
+<h2 id="running-builder-sessions"><a class="anchor" href="#running-builder-sessions" aria-hidden="true">#</a>Running builder sessions</h2>
+<p>On docker/podman, a live <code>lazy builder</code> in another terminal <strong>stays running</strong>
+through the upgrade. The upgrade rebuilds the agent binary and restarts the
+daemon, but it does <strong>not</strong> stop your builder container. The in-container
+supervisor watches for the daemon restart, refreshes the proxy address and
+credentials against the new daemon, and relaunches Claude Code in the <strong>same
+terminal</strong> with <code>--resume</code>. You should see at most a one-line notice:</p>
+<pre><code>Daemon upgraded 0.22.1140 → 0.22.1141; lazy tools reconnected and the session resumed.
+</code></pre>
+<p>You do not need to run <code>lazy builder --resume</code> yourself when the upgrade
+succeeds.</p>
+<p>Before the upgrade proceeds, it warns you to <strong>submit any message you have typed
+but not yet sent</strong> — that in-progress input cannot be preserved when Claude
+relaunches. While the background image build runs, docker step output can scroll
+that warning off screen; once the build finishes, lazy prints the press-Enter
+prompt again below the build output so you are not left staring at <code>#14 DONE</code>
+with no visible next step.</p>
+<p>If the in-container reconnect fails (for example the new daemon never comes
+healthy), lazy prints an actionable error and <code>lazy builder --resume &lt;id&gt;</code> so
+nothing is silently lost.</p>
+<p>The host-side <code>lazy builder</code> wrapper still has a relaunch loop for when the
+container exits for other reasons (a crash or manual stop). That loop waits for
+the upgrade to finish and re-execs <code>lazy builder --resume</code> into the same
+terminal — but a normal upgrade does not trigger it, because the container
+never exits.</p>
+<p><strong>Task agents</strong> running in containers follow a different path: the upgrade
+restarts the daemon (and its audit proxy, usually on a new OS-assigned port),
+but the task container keeps running. The in-container supervisor watches for
+that restart, stops the current agent launch, refreshes <code>ANTHROPIC_BASE_URL</code>
+from the new daemon, and retries the turn — so a mid-turn &quot;Connection refused&quot;
+from a stale proxy address should clear within a retry or two rather than
+looking like a firewall block. If a task was already stopped by the restart
+reaper, the next auto-resume launches a fresh container with fresh env.</p>
+<p>Host-process builders (no container) are not stopped by upgrade; their
+interactive supervisor reconnects the same way <code>lazy pair</code> and <code>lazy chat</code> do.</p>
+<h2 id="builds-have-no-time-limit"><a class="anchor" href="#builds-have-no-time-limit" aria-hidden="true">#</a>Builds have no time limit</h2>
+<p>An image build runs for as long as it needs to. <code>docker build</code> has no timeout of
+its own, and lazy does not add one: a build killed on a timer wasted every second
+it ran and produced nothing, which is strictly worse than one that runs long and
+succeeds. A slow build is usually a slow network, not a stuck build.</p>
+<p>So that an unbounded build never <em>looks</em> stuck, lazy streams the build&#39;s step
+headers as they happen and prints a &quot;still building…&quot; line with the elapsed time
+when a single step goes quiet for a while.</p>
+<p>If you genuinely want a bound — an unattended CI machine, say — every command
+that triggers a build takes an opt-in <code>--timeout &lt;seconds&gt;</code>:</p>
+<pre><code class="language-bash">lazy upgrade --timeout 1800
+lazy upgrade --images --timeout 1800
+lazy system build lazy-runner --timeout 1800
+</code></pre>
+<p><code>--timeout 0</code> spells out the default (no limit), so a script computing the value
+never has to special-case zero. If the bound does fire, the error says plainly
+that <em>lazy</em> killed the build, after how long, and that the limit is yours to
+raise or drop — it never surfaces as a bare Docker failure. Layers built before
+the kill stay in the build cache, so retrying resumes rather than starting over.</p>
+<p>Builds that lazy starts on its own — a task launching when the Dockerfile hash
+changed, or the 14-day age backstop below — are always unbounded. There is no
+config key for them: nobody is watching those builds, and a stale configured
+limit killing them is the exact failure this default exists to prevent.</p>
+<h2 id="related"><a class="anchor" href="#related" aria-hidden="true">#</a>Related</h2>
+<ul>
+<li><strong>Worktree Dockerfile adoption</strong> — when a task worktree&#39;s <code>Dockerfile.lazy</code>
+differs from the project root&#39;s, <code>lazy upgrade</code>
+(and <code>lazy upgrade --images</code>) can adopt it for the rebuild and the daemon.
+Your cwd may be anywhere inside that worktree — a subdirectory counts the
+same as the worktree root. Each rebuild first announces any existing adoption:
+on a TTY you choose whether to keep it (default yes); scripts and CI keep it
+and log. A new worktree Dockerfile is offered only when you are standing
+inside that worktree and its content differs (default no). Running upgrade
+from the project root alone never offers a new adoption.</li>
+<li><code>lazy upgrade --images</code> is the separate <strong>non-disruptive</strong> path: it rebuilds
+only the image, in the foreground, and stops nothing and restarts nothing.
+Only newly-created containers pick the new image up (<code>lazy upgrade --images --dry-run</code> prints the exact boundary).</li>
+<li>Image tags are versioned (lazy&#39;s <code>major.minor</code>), never bare <code>:latest</code> — see
+<a href="../agent-container/#rebuilding">Rebuilding</a> in the agent container page.</li>
+<li>An upgrade is not the only thing that refreshes the image — see &quot;When else the
+image gets rebuilt&quot; below.</li>
+</ul>
+<h2 id="when-else-the-image-gets-rebuilt"><a class="anchor" href="#when-else-the-image-gets-rebuilt" aria-hidden="true">#</a>When else the image gets rebuilt</h2>
+<p>An upgrade is the main path, but not the only one. Three triggers rebuild a
+runner image, on three different axes:</p>
+<p>These triggers apply to an image lazy BUILT on your machine. The default image
+pulled from a release is never rebuilt for its age: it keeps the agent CLIs it
+was pulled with, and upgrading lazy pulls again. A default image lazy built
+itself is replaced by the published one, when one exists, as soon as a trigger
+fires.</p>
+<table>
+<thead>
+<tr>
+<th>Trigger</th>
+<th>What it catches</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>lazy upgrade</code></td>
+<td>Everything. <code>--no-cache</code>, described above — asks first (default yes) when an identical image already exists</td>
+</tr>
+<tr>
+<td>The image is more than 14 days old</td>
+<td>Unpinned contents drifting on a host nobody upgrades</td>
+</tr>
+<tr>
+<td>The Dockerfile&#39;s content hash changed</td>
+<td>You edited the Dockerfile</td>
+</tr>
+</tbody></table>
+<p><code>lazy system build lazy-runner --no-cache</code> forces one at any time.</p>
+<p>The age backstop exists because a Dockerfile&#39;s <em>text</em> is not what goes stale.
+What it installs is unpinned — apt packages, the agent CLI&#39;s installer, the base
+image — so identical text yields a materially different image weeks later. Only
+wall-clock time sees that, which is why freshness is time-based and the tag
+(lazy&#39;s <code>major.minor</code>) is only an identity.</p>
+<p>None of this can leave you running an old <em>lazy</em>. The image contains no lazy
+code: <code>lazy-agent</code> is bind-mounted into the container at launch, so it is
+current the moment lazy is.</p>
+<h2 id="the-base-image-a-custom-dockerfile-builds-from"><a class="anchor" href="#the-base-image-a-custom-dockerfile-builds-from" aria-hidden="true">#</a>The base image a custom Dockerfile builds FROM</h2>
+<p>If your project supplies its own Dockerfile and it starts with
+<code>FROM lazy-runner</code>, that base has to be in your local image store. The bare name
+<code>lazy-runner</code> is not on a registry, so on a machine without it (never set up, or
+cleared by <code>docker system prune</code>) Docker would treat the name as a Docker Hub
+repository and fail with <code>pull access denied, repository does not exist</code>.</p>
+<p>Lazy avoids that: before building your custom image it checks for the base and,
+if it is missing, pulls your release&#39;s <code>ghcr.io/getlazy/lazy-runner</code> image and
+tags it <code>lazy-runner</code>. If there is nothing to pull (offline, or no release published
+the base your lazy version builds from) it builds the base instead, saying so —</p>
+<pre><code>Base image lazy-runner:latest not found — building it first, because
+/path/to/Dockerfile.lazy builds FROM it (this can take several minutes).
+</code></pre>
+<p>This happens <strong>only when the base is missing</strong>. It is not a fourth freshness
+trigger: an existing base image is left exactly as it is, and the three triggers
+in the table above are what keep it current.</p>
+<p>Two <code>FROM</code> spellings lazy will not supply for you:</p>
+<ul>
+<li>a base pinned to another tag, e.g. <code>FROM lazy-runner:0.19</code>. Lazy only ever
+writes the current <code>major.minor</code> tag and the <code>:latest</code> alias. Use
+<code>FROM lazy-runner</code>, or build the base yourself with
+<code>lazy system build lazy-runner</code>. To pin an exact release, name the published
+image instead: <code>FROM ghcr.io/getlazy/lazy-runner:v0.91.1402</code>.</li>
+<li>an agent-suffixed image, e.g. <code>FROM lazy-runner-cursor</code>. Per-agent images are
+no longer produced, because <code>lazy-runner</code> now carries every agent CLI. Change
+the line to <code>FROM lazy-runner</code>.</li>
+</ul>
+<p>In both cases lazy names the remedy rather than leaving you with the registry
+error.</p>
+
+</main>
+</body>
+</html>

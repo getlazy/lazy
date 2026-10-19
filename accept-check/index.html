@@ -35,7 +35,7 @@ ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }</style>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.91</span></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
 <main class="wrap">
 <h1 id="the-accept-check"><a class="anchor" href="#the-accept-check" aria-hidden="true">#</a>The accept check</h1>
 <p><code>lazy accept</code> refuses to merge a task whose own worktree does not build, and
@@ -61,8 +61,8 @@ titles, post-turn check output, an agent&#39;s own summary — all advisory.</li
 from the diff, which reads identically to &quot;the task never touched that file&quot;.</li>
 </ol>
 <h2 id="half-one-the-check"><a class="anchor" href="#half-one-the-check" aria-hidden="true">#</a>Half one: the check</h2>
-<p>When <code>[automation] accept_check</code> is set, accept runs that command <strong>in the task&#39;s
-own worktree</strong>, before the merge. A non-zero exit refuses the accept.</p>
+<p>When <code>[automation] accept_check</code> is set, accept runs that command <strong>against the
+task&#39;s own worktree, inside a short-lived container</strong>, before the merge. A non-zero exit refuses the accept.</p>
 <pre><code class="language-toml">[automation]
 # Run in the TASK worktree at accept time. Non-zero exit refuses the merge.
 accept_check = &quot;bun run typecheck&quot;
@@ -81,32 +81,23 @@ PATH they exit <strong>127 before the compiler reads a single file</strong>.</li
 whose interpreter is missing verified nothing. It still refuses — a gate that
 passes because nothing ran is the exact failure this exists to prevent.</li>
 <li><strong>A timeout is a refusal.</strong> A check that never answered is not a pass.</li>
-<li><strong>Host-side, in the worktree.</strong> No agent turn, no container, no network, and
-no daemon state beyond what accept already has. Read the trust boundary below
-before enabling it — that last property is a real tradeoff.</li>
+<li><strong>In a container, never on the host.</strong> The check runs in the same short-lived
+container <code>[automation.pre_accept]</code> uses, with no agent in it. See below.</li>
 </ul>
-<h3 id="where-it-runs-and-what-an-agent-can-influence"><a class="anchor" href="#where-it-runs-and-what-an-agent-can-influence" aria-hidden="true">#</a>Where it runs, and what an agent can influence</h3>
-<p>The check runs as a plain <code>sh -c</code> <strong>on the daemon host</strong>, as the user running the
-daemon, with its working directory set to the task worktree. That worktree is
-written by an agent.</p>
+<h3 id="where-it-runs-and-why"><a class="anchor" href="#where-it-runs-and-why" aria-hidden="true">#</a>Where it runs, and why</h3>
 <p>The <strong>command</strong> is yours: it comes from the project root&#39;s <code>lazy.toml</code>, never
 from the task branch&#39;s copy of it, so a task cannot edit or disable its own gate.
 But what the command <strong>resolves to</strong> is not: <code>bun run typecheck</code> reads the
 worktree&#39;s <code>package.json</code> scripts, <code>make check</code> reads its <code>Makefile</code>, <code>tsc</code> reads
 its <code>tsconfig.json</code> and anything that extends. An agent that can commit to its
 own branch can change what your check actually executes.</p>
-<p>This differs from <code>[automation] pre_accept</code>, which runs its commands in an
-ephemeral gate container under the same runner — under a container runner, the
-gate executes <em>inside</em> a container (with no agent in it). The accept check does
-not. It must not depend on the runner, the network, or daemon health beyond what
-accept already requires, so it
-executes outside every container guard — including on fully automated MCP accepts
-of subtasks, where no human is watching the accept at all.</p>
-<p><strong>If you run a container runner, treat <code>accept_check</code> like a CI hook running over
-untrusted input.</strong> Point it at a command whose behaviour you are willing to have
-resolved by the branch under review, keep the timeout tight, and do not enable it
-at all on a project whose agents you would not let run a shell command on the
-host. A project on the host runner already grants that, so nothing changes there.</p>
+<p>So lazy treats the check as code under the agent&#39;s control, and that code never
+runs on the machine hosting lazy — on your own machine or on a shared Lazy Teams
+host alike. Accept runs it in the same short-lived gate container
+<code>[automation.pre_accept]</code> uses, built from the task&#39;s image, with no agent in it,
+and removes the container afterwards. The check needs whatever tools it calls to
+be in that image — the same image your agents already work in — and the
+container runtime (Docker or Podman) must be available when you accept.</p>
 <h3 id="what-a-refusal-looks-like"><a class="anchor" href="#what-a-refusal-looks-like" aria-hidden="true">#</a>What a refusal looks like</h3>
 <pre><code>Task fix-parser does not build: its accept check failed (exit 2) in the task&#39;s
 own worktree, so merging it into `main` would break `main`.
@@ -136,10 +127,9 @@ does not build takes a human at a terminal&quot;</em> — the refusal states tha
 hatch exists and is out of reach, rather than naming a flag the caller cannot
 pass.</p>
 <h3 id="cost"><a class="anchor" href="#cost" aria-hidden="true">#</a>Cost</h3>
-<p>One process per accept, bounded by <code>accept_check_timeout</code>, and zero for a project
-that leaves <code>accept_check</code> unset. The gate adds nothing measurable on top of the command
-itself — one <code>sh -c</code> spawn and the same output handling accept already does for
-hooks; a full <code>tsc --noEmit</code> over ~900 files takes a few seconds. Paid
+<p>One short-lived container per accept, running the command once, bounded by
+<code>accept_check_timeout</code> — and nothing for a project that leaves <code>accept_check</code>
+unset. On top of the command itself you pay for starting that container. Paid
 once, at the moment a mistake would otherwise become the branch&#39;s problem.</p>
 <h2 id="half-two-reverted-protected-files-historical-records-only"><a class="anchor" href="#half-two-reverted-protected-files-historical-records-only" aria-hidden="true">#</a>Half two: reverted protected files (historical records only)</h2>
 <p>Independently of the check — and with no configuration at all — accept names
