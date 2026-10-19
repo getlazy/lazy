@@ -204,7 +204,7 @@ describe('resolveUpstreamRef', () => {
     //   2. On fetch failure the driver THROWS — callers must propagate, not
     //      swallow into a stale local ref. This guards the regression where
     //      launchTask had an empty `catch {}` that fell back to the local
-    //      branch name (a stale/local-ref merge); per CLAUDE.md "fail hard on
+    //      branch name (a stale/local-ref merge); per AGENTS.md "fail hard on
     //      remote failures — no silent fallbacks" that fallback is forbidden
     //      unless the caller explicitly opted into --force-local.
     test('GitLab: success resolves remote-tracking ref, not the local branch', async () => {

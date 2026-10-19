@@ -53,12 +53,25 @@
  * is inherent, and documented: a member who RUNS the task's own scripts in
  * Shell runs code a turn may have written.
  *
+ * THE TASK'S CONTAINER KEEPS RUNNING BESIDE IT (engineer, 2026-10-05). It is
+ * where the task's services run — ONE shared set per task that every member
+ * sees and controls (Start services, ./serve-run.ts), never per member and
+ * never in here — so a member's entry no longer stops it (./member-entry.ts).
+ * The threat model: everything in a task's container is suspect and
+ * contained. The worst a process left running there can do to a member is
+ * plant code in the shared worktree that this container then runs — code
+ * execution in here, next to one revocable placeholder — which running the
+ * task's own scripts already allows. The boundary that matters is container →
+ * daemon/host (read-only git config and hooks, pointer validation and the
+ * read-only pointer copies above), and that is unchanged.
+ *
  * Named `lazymember-…`, deliberately NOT `lazy-…`: every sweep that treats a
  * `^lazy-` container as a task supervisor (shutdown, restart reaping, upgrade)
  * must never mistake one for a turn's. Found by label instead
  * ({@link MEMBER_CONTAINER_LABEL} plus the project label).
  */
 
+import { customImageNotReady, DEFAULT_RUNNER_IMAGE_PIN } from '../capture/custom-image-gate';
 import { createHash, randomBytes } from 'crypto';
 import { join, resolve } from 'path';
 import { mkdir, readdir, readFile, rm, rmdir, chmod, lstat } from 'fs/promises';
@@ -76,14 +89,15 @@ import { logger } from '../utils/logger';
 import { loadConfig } from '../config/loader';
 import type { MountConfigEntry } from '../config/types';
 import { profileNameForAgent } from '../config/agent-profiles';
-import { getWorktreePath } from '../task/identity';
+import { ensureTaskWorktree } from './task-worktree';
 import { pathExists } from '../utils/fs';
 import { SANDBOX_DIR } from '../utils/sandbox';
 import { buildMemberMountArgs, turnWritableIndex, turnWritableMountStorage, type SharedStorage } from '../capture/mounts';
 import { buildGitMountArgs } from '../capture/git-mounts';
 import { validateMemberGitLayout, memberGitPointerMounts, writeMemberGitPointerCopies, GitLayoutRefusedError, type MemberGitLayout } from './member-git-layout';
 import { ensureImage, ensureAgentBinary, isContainerRunning } from '../capture/claude';
-import { pinnedCustomImage } from '../docker/worktree-image';
+import { dataDirOfWorktree, lazyDataDirMaskArgs } from '../capture/lazy-dir-mask';
+import { launchImagePin } from '../docker/worktree-image';
 import { PROJECT_LABEL } from '../runner/docker-runner';
 import type { PhaseNotify } from './progress';
 import { MEMBER_SESSION_MARKER, MEMBER_SESSION_MARKER_TEXT } from '../agent/member-session-marker';
@@ -214,6 +228,8 @@ export function memberContainerName(taskId: string): string {
 export interface MemberContainer {
   name: string;
   binary: string;
+  /** Give the container user any path under the task's worktree it cannot write — run on every terminal attach, since a root daemon keeps writing there. */
+  adopt?: () => Promise<void>;
   /** Remove the container (killing everything in it) and revoke its credential. */
   remove: () => Promise<void>;
 }
@@ -907,6 +923,10 @@ export interface MemberContainerArgsParams {
   agentBinaryPath: string;
   /** Built with `buildGitMountArgs` — the same split mount a turn gets. */
   gitMountArgs: string[];
+  /** Mounted paths the container user must be able to write: worktree and its git dirs. */
+  adoptPaths: string[];
+  /** Read-only-by-design paths inside {@link adoptPaths} (the git pointer copies). */
+  readOnlyPaths: string[];
   /** Built with `buildMemberMountArgs` from the project's `[[mounts]]`: only shared entries marked readonly. */
   customMountArgs: string[];
   /**
@@ -939,6 +959,8 @@ export function buildMemberContainerDockerArgs(p: MemberContainerArgsParams): st
     '--add-host=host.docker.internal:host-gateway',
     // The same file view a turn has: repo read-only, worktree read-write on top.
     '-v', `${p.repoRoot}:${p.repoRoot}:ro`,
+    // .lazy/ hidden exactly as in a turn's container — see src/capture/lazy-dir-mask.ts.
+    ...lazyDataDirMaskArgs(dataDirOfWorktree(p.repoRoot, p.worktreePath)),
     '-v', `${p.worktreePath}:${p.worktreePath}`,
     ...p.gitMountArgs,
     '-w', p.worktreePath,
@@ -971,14 +993,44 @@ export function buildMemberContainerDockerArgs(p: MemberContainerArgsParams): st
     // the member's terminals exec into it. First it takes ownership of its
     // home when the daemon's user is not the container's (a root daemon on
     // Linux), exactly as the supervisor's wrapper does for its mounts.
-    'sh', '-c', MEMBER_CONTAINER_COMMAND,
+    'sh', '-c', memberContainerCommand(p.adoptPaths, p.readOnlyPaths),
   ];
 }
 
-/** The member container's command: adopt the lazy-built home, then idle. */
-export const MEMBER_CONTAINER_COMMAND =
-  'for p in /home/user/.claude /home/user/.claude.json; do ' +
-  '[ -w "$p" ] || sudo -n chown -R "$(id -u):$(id -g)" "$p" 2>/dev/null || true; done; exec sleep infinity';
+/**
+ * The member container's command: adopt the lazy-built home AND the task's
+ * writable paths (worktree, per-worktree gitdir, objects dir), then idle.
+ *
+ * Under a root daemon (Linux self-host, the Teams guest) a fresh worktree is
+ * root-owned, and a task's own container only adopts it when a turn starts —
+ * so a terminal or services script opened before any turn could not create
+ * `log/` or `tmp/` files (Rails: "Unable to access log file"). The probe only
+ * fires when something under the path is not writable, so a daemon that is not
+ * root, or a worktree a turn already adopted, changes nothing. `readOnlyPaths`
+ * are the git pointer copies, read-only by design.
+ */
+export function memberContainerCommand(adoptPaths: string[], readOnlyPaths: string[]): string {
+  return `${memberAdoptScript(adoptPaths, readOnlyPaths)}; exec sleep infinity`;
+}
+
+/**
+ * The adopt loop alone — what {@link memberContainerCommand} runs at startup and
+ * what every later terminal attach execs in the already-running container, since
+ * the root guest daemon keeps writing into the worktree afterwards (a sync
+ * merge, a restore creating log/ or tmp/). Idempotent, and a single `find`
+ * probe per path when nothing needs fixing.
+ */
+export function memberAdoptScript(adoptPaths: string[], readOnlyPaths: string[]): string {
+  const excl = readOnlyPaths.map((p) => `! -path "${p}"`).join(' ');
+  const targets = ['/home/user/.claude', '/home/user/.claude.json', ...adoptPaths].map((p) => `"${p}"`).join(' ');
+  return (
+    `for p in ${targets}; do ` +
+    '[ -e "$p" ] || continue; ' +
+    `find "$p" ! -writable ${excl} -print -quit 2>/dev/null | grep -q . || continue; ` +
+    `sudo -n find "$p" ${excl} -exec chown -h "$(id -u):$(id -g)" {} + 2>/dev/null || true; ` +
+    'done'
+  );
+}
 
 export interface LaunchMemberContainerDeps {
   planCredential?: typeof planMemberContainerCredential;
@@ -1013,9 +1065,11 @@ export async function launchMemberContainer(opts: {
 }): Promise<{ ok: true; container: MemberContainer } | { ok: false; status: number; message: string }> {
   const { projectRoot, storage, task, session, memberEmail, binary } = opts;
   const deps = opts.deps ?? {};
-  const worktreePath = getWorktreePath(projectRoot, task);
-  if (!(await pathExists(worktreePath))) {
-    return { ok: false, status: 409, message: `This task has no worktree at ${worktreePath}. Start it, then open the terminal.` };
+  let worktreePath: string;
+  try {
+    worktreePath = await ensureTaskWorktree(projectRoot, task, session.git_branch, opts.notify);
+  } catch (error) {
+    return { ok: false, status: 409, message: error instanceof Error ? error.message : String(error) };
   }
   // The PROJECT ROOT's config, like every launch (loadConfig is root-anchored).
   const config = await loadConfig(projectRoot);
@@ -1073,6 +1127,8 @@ export async function launchMemberContainer(opts: {
 
   const remove = deps.remove ?? removeMemberContainer;
   let home: MemberHome | null = null;
+  let adoptPaths: string[] = [];
+  let readOnlyPaths: string[] = [];
   try {
     // Checked on the host by reading files, never by running git: a turn can
     // rewrite the worktree's git pointers, and host git would follow them
@@ -1091,14 +1147,21 @@ export async function launchMemberContainer(opts: {
     });
     const pointerCopies = await writeMemberGitPointerCopies(home.dir, gitPaths);
     const gitMountArgs = [...buildGitMountArgs(gitPaths), ...memberGitPointerMounts(pointerCopies)];
+    const onDefaultImage = !launchImagePin(task) && (await customImageNotReady());
     const [imageName, agentBinaryPath] = await Promise.all([
       (deps.ensureImage ?? ensureImage)(binary, {
         agentId: profileNameForAgent(task.agent_id),
-        pinnedImage: pinnedCustomImage(task),
+        // A person's own terminal is not an agent turn: while the project's
+        // image is not ready it opens on lazy's default image (its pre-launch
+        // note says so)
+        // rather than refusing the person who asked for it.
+        pinnedImage: onDefaultImage ? DEFAULT_RUNNER_IMAGE_PIN : launchImagePin(task),
         notify: opts.notify,
       }),
       (deps.ensureAgentBinary ?? ensureAgentBinary)(),
     ]);
+    adoptPaths = [worktreePath, gitPaths.worktreeGitDir, gitPaths.objectsDir];
+    readOnlyPaths = gitPaths.pointerFiles.map((f) => f.target);
     const argv = buildMemberContainerDockerArgs({
       binary,
       name,
@@ -1109,11 +1172,13 @@ export async function launchMemberContainer(opts: {
       homeDir: home.dir,
       agentBinaryPath,
       gitMountArgs,
+      adoptPaths,
+      readOnlyPaths,
       customMountArgs: memberMounts.args,
       runArgs,
       credentialEnv: credential.env,
     });
-    opts.notify?.('starting your terminal container');
+    opts.notify?.(onDefaultImage ? `starting your terminal container on lazy's default image (${imageName}) — the project's own image is not ready yet` : 'starting your terminal container');
     const ran = await (deps.run ?? runDetached)(argv);
     if (ran.exitCode !== 0) {
       throw new Error(ran.stderr.trim() || `${binary} run exited ${ran.exitCode}`);
@@ -1159,6 +1224,10 @@ export async function launchMemberContainer(opts: {
     container: {
       name,
       binary,
+      adopt: async () => {
+        const out = await (deps.run ?? runDetached)([binary, 'exec', name, 'sh', '-c', memberAdoptScript(adoptPaths, readOnlyPaths)]);
+        if (out.exitCode !== 0) throw new Error(out.stderr.trim() || `${binary} exec exited ${out.exitCode}`);
+      },
       remove: async () => {
         if (removed) return;
         try {

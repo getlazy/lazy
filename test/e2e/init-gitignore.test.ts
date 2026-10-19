@@ -199,7 +199,7 @@ describe('lazy init .gitignore', () => {
 
     // INVARIANT: init tells, it does not act. That state may be the only copy
     // of the human's task history — untracking it as a side effect of init
-    // would be exactly the hidden side effect CLAUDE.md forbids.
+    // would be exactly the hidden side effect AGENTS.md forbids.
     expect(git(tmpDir, 'ls-files', '--', '.lazy').stdout).toContain('.lazy/tasks/abc123.json');
   });
 

@@ -166,12 +166,13 @@ describe('the self-host image builds no lazy checkout of its own', () => {
     expect(text.indexOf('ARG LAZY_DAEMON_IMAGE=')).toBeLessThan(text.search(/^FROM /m));
     expect(text).toMatch(/^FROM \$\{LAZY_DAEMON_IMAGE\} AS lazy-daemon$/m);
     expect(text).toContain('COPY --from=lazy-daemon --chown=rails:rails /opt/lazy /lazy');
-    expect(text).toContain('COPY --from=lazy-daemon /usr/local/bin/bun /usr/local/bin/bun');
+    // The image ships the compiled binary and no bun.
+    expect(text).not.toContain('/usr/local/bin/bun');
     expect(text).not.toMatch(/^RUN .*bun install/m);
     expect(text).not.toMatch(/^COPY src /m);
     expect(text).not.toContain('bun.sh/install');
     // And it proves the copied lazy runs here, as rails, from the baked id.
-    expect(text).toMatch(/^RUN gosu rails bun run \/lazy\/src\/index\.ts system source-id --json .*baked/m);
+    expect(text).toMatch(/^RUN gosu rails \/lazy\/bin\/lazy system source-id --json .*embedded/m);
   });
 
   // INVARIANT: the fingerprint RollsFleet compares is written by lazy itself,

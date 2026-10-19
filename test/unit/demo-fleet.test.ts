@@ -158,7 +158,7 @@ describe('the machine memory budget', () => {
     ].join('\n');
     const v = parseGuestVitals(out);
     expect(v).toEqual({ uptimeSeconds: 843, memTotalMib: 3941, memUsedMib: 238, memAvailableMib: 3703 });
-    expect(formatGuestVitals(v, null)).toBe('up 14m 3s — memory 238 of 3941 MiB used, 3703 available (budget 4096 MiB)');
+    expect(formatGuestVitals(v, null)).toBe('up 14m 3s — memory 238 of 3941 MiB used, 3703 available (budget 8192 MiB)');
     expect(formatGuestVitals({ ...v, uptimeSeconds: 7322 }, 6144)).toBe('up 2h 2m — memory 238 of 3941 MiB used, 3703 available (budget 6144 MiB)');
     expect(() => parseGuestVitals('sh: free: not found')).toThrow(/not the output of/);
   });
@@ -242,10 +242,10 @@ describe('status prints every command with where it runs', () => {
   };
 
   test('the service address, its curl check on the host, and the guest commands via machine exec', () => {
-    const lines = fleetHowToBlock(manifest, [{ name: '8080', address: 'http://8080.demo-serve.lazy.localhost:27000' }]);
+    const lines = fleetHowToBlock(manifest, [{ name: '8080', address: 'http://demo-serve.8080.lazy.localhost:27000' }]);
     const text = lines.join('\n');
-    expect(text).toContain('http://8080.demo-serve.lazy.localhost:27000');
-    expect(text).toContain('curl -sS -H "Host: 8080.demo-serve.lazy.localhost" "http://127.0.0.1:27000/"   # on the host, any directory');
+    expect(text).toContain('http://demo-serve.8080.lazy.localhost:27000');
+    expect(text).toContain('curl -sS -H "Host: demo-serve.8080.lazy.localhost" "http://127.0.0.1:27000/"   # on the host, any directory');
     expect(text).toContain(`"${INPUTS.smolvmBinary}" machine exec --name lazy-lazy-demo-shop-1 -- lazy-guest-init --print-plan   # inside the guest, from the host`);
     for (const line of lines.filter(l => /curl|machine exec/.test(l))) expect(line).toMatch(/# (on the host|inside the guest)/);
     expect(text).toContain('Origin:     read-only to the guest');
@@ -257,7 +257,7 @@ describe('status prints every command with where it runs', () => {
   test('no instruction the demo prints names a Mac', () => {
     const teams = { url: 'http://127.0.0.1:3999', email: 'you@example.com', password: 'fixture-password' };
     const lines = [
-      ...fleetHowToBlock(manifest, [{ name: '8080', address: 'http://8080.demo-serve.lazy.localhost:27000' }], teams),
+      ...fleetHowToBlock(manifest, [{ name: '8080', address: 'http://demo-serve.8080.lazy.localhost:27000' }], teams),
       ...guestWatchLines(manifest),
       missingCredentialMessage(),
     ];

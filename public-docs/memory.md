@@ -181,11 +181,11 @@ of the member who pressed **Run compact**, and is refused if they have not
 connected one; **Mechanical** runs no model and needs no account. The page
 shows each step while the compact runs.
 
-## Memory vs journal vs CLAUDE.md
+## Memory vs journal vs CLAUDE.md / AGENTS.md
 
 | | scope | injected into prompts? | who writes |
 |---|---|---|---|
-| **CLAUDE.md** | how to work in this repo | read by Claude Code automatically | humans, in git |
+| **CLAUDE.md / AGENTS.md** | how to work in this repo | read by the agent harness automatically | humans, in git |
 | **Journal** (`lazy journal`) | one task | **entry text, never** — the agent's prompt gets a one-line count of new entries and reads them on demand | humans, builder, agents |
 | **Memory** (`lazy memory`) | the project, across tasks | yes — the index, on every launch | humans, builder |
 

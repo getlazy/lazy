@@ -15,7 +15,7 @@
  * INVARIANT: the fallback is keyed by the resolved path and nothing else. It can
  * never hand out a config read from a different file — a task worktree's
  * lazy.toml included — so "A task worktree's lazy.toml has no authority"
- * (CLAUDE.md, src/config/loader.ts findConfigDir) holds exactly as before: the
+ * (AGENTS.md, src/config/loader.ts findConfigDir) holds exactly as before: the
  * only config it returns is one the project-root resolution already accepted.
  *
  * Off by default: a CLI command runs once and must report a broken file as

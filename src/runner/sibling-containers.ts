@@ -46,7 +46,7 @@
  * Detecting it instead (`/.dockerenv`, a cgroup scan) would be guessing at the
  * question "is this container's Docker socket its own?", which no marker on the
  * filesystem answers: a container CAN legitimately run its own nested daemon.
- * CLAUDE.md's "straightforward over magical" applies — the deployment states
+ * AGENTS.md's "straightforward over magical" applies — the deployment states
  * its arrangement, lazy does not infer it.
  *
  * The full analysis, the mount inventory and the design for making the

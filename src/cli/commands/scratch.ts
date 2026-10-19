@@ -15,11 +15,12 @@
  *   path             — print the live scratch dir
  */
 
-import { requireStorage, requireLazyRoot, parseFlags } from '../helpers';
+import { requireStorage, requireLazyRoot, parseFlags, refuseIfBoundClone } from '../helpers';
 import { formatDate } from '../../utils/format';
 import { promptYesNo } from '../editor';
 import { theme } from '../../render/theme';
 import { getActor } from '../../constants';
+import { queryScratchList, queryScratchShow } from '../../daemon/rpc-fallback';
 import {
   resolveScratchDirForCapture,
   scratchDirSize,
@@ -77,9 +78,11 @@ export const scratchSubcommandUsage: Record<string, () => void> = {
 async function commandScratchList(args: string[]): Promise<void> {
   parseFlags(args, [], 'scratch');
 
-  const storage = await requireStorage();
-  try {
-    const files = await storage.listScratchFiles();
+  {
+    // The daemon's own read (`scratchList`), not a storage call: a clone bound
+    // to Lazy Teams is then authorized as the browser's Files tab is.
+    const files = (await queryScratchList()).groups.flatMap((g) => g.files)
+      .sort((a, b) => a.path.localeCompare(b.path));
     if (files.length === 0) {
       console.log('No captured builder scratch files yet.');
       console.log(
@@ -105,8 +108,6 @@ async function commandScratchList(args: string[]): Promise<void> {
     }
     console.log(`\nRead one with: ${theme.command('lazy scratch show <path>')}`);
     console.log(`Search inside them with: ${theme.command("lazy search 'in:scratch <text>'")}`);
-  } finally {
-    await storage.close();
   }
 }
 
@@ -120,12 +121,16 @@ async function commandScratchShow(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const storage = await requireStorage();
-  try {
-    const file = await storage.getScratchFile(path);
-    if (!file) {
-      console.error(`No captured scratch file at '${path}'. List them with: lazy scratch list`);
-      process.exit(1);
+  {
+    let file;
+    try {
+      file = (await queryScratchShow({ path })).file;
+    } catch (err) {
+      if ((err as { status?: number }).status === 404) {
+        console.error(`No captured scratch file at '${path}'. List them with: lazy scratch list`);
+        process.exit(1);
+      }
+      throw err;
     }
     if (file.skipped) {
       // Not an error — the record is the answer. Say why the body is missing
@@ -136,9 +141,8 @@ async function commandScratchShow(args: string[]): Promise<void> {
       );
       process.exit(1);
     }
-    process.stdout.write(file.content.endsWith('\n') ? file.content : `${file.content}\n`);
-  } finally {
-    await storage.close();
+    const content = file.content ?? '';
+    process.stdout.write(content.endsWith('\n') ? content : `${content}\n`);
   }
 }
 
@@ -146,6 +150,8 @@ async function commandScratchShow(args: string[]): Promise<void> {
 
 async function commandScratchSync(args: string[]): Promise<void> {
   parseFlags(args, [], 'scratch');
+  // Copies this laptop's scratch dir into the store; a bound clone's builder runs server-side.
+  await refuseIfBoundClone('scratch sync');
 
   const root = requireLazyRoot();
   const dir = resolveScratchDirForCapture(root);

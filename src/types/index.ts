@@ -480,6 +480,12 @@ export interface Session {
   interrupt_at: number | null;
   /** Last N lines of container logs from the interruption */
   interrupt_logs: string | null;
+  /**
+   * The failure notice of the session's latest WORK-type turn, when that turn
+   * was one — written by storage in the same write as the turn, cleared by the
+   * next work turn. Read only through src/task/turn-failure.ts. Absent otherwise.
+   */
+  last_turn_failure?: TurnFailure & { at: number; turn_sequence: number };
   /** Number of consecutive interruptions without a successful turn completion */
   consecutive_interruptions: number;
   /** Whether the current working session was auto-resumed by the reconciler */
@@ -600,6 +606,18 @@ export interface FileViolation {
   restore_sha?: string;
 }
 
+/** One tier of a tiered agent profile that served requests of a turn. */
+export interface TierServed {
+  /** 0-based position in the chain (rendered 1-based). */
+  index: number;
+  /** The `[endpoints.<name>]` it is. */
+  endpoint: string;
+  /** The model the proxy sent for it. */
+  model: string;
+  /** The upstream base URL it forwarded to. */
+  upstream: string;
+}
+
 export interface Turn {
   id: string;
   session_id: string;
@@ -638,6 +656,30 @@ export interface Turn {
    * convention as `effort` and `mcp_tools`.
    */
   agent?: string;
+  /**
+   * The runner image this turn ran on, as launched (`kind`: `custom` the
+   * project's image, `fallback` lazy's default image a person chose,
+   * `readonly` lazy's default image for an ask/review while the project's was
+   * not ready, `pinned` a consented per-task image, `standard` the default
+   * image of a project with no custom one). Set on agent turns; absent means
+   * unknown — turns written before it existed carry none.
+   */
+  runner_image?: { image: string; kind: string };
+  /**
+   * The tiers of a TIERED agent profile that actually served this turn's
+   * requests, in the order they first did. `model` above is tier 0's (what the
+   * harness was launched with); this is where the requests went. Agent turns
+   * only; absent on a profile that is not tiered and on turns recorded before
+   * the field existed.
+   */
+  tiers_served?: TierServed[];
+  /**
+   * How fast the model answered this turn — the compact summary of its stored
+   * latency rollup (src/task/turn-latency.ts): model calls, errors, retries,
+   * p50 TTFT / TTLT / tokens per second, and the share of the turn spent
+   * waiting on the model. Agent WORK turns with proxied traffic only.
+   */
+  latency?: import('../task/turn-latency').TurnLatencySummary;
   /**
    * The model this turn was LAUNCHED with — the resolved value passed as
    * `--model` (usually a tier alias like `opus`, or a concrete id for a local
@@ -731,7 +773,7 @@ export interface Turn {
   /**
    * Delivery state of the human/builder feedback this turn carries.
    *
-   * INVARIANT (CLAUDE.md — never lose human feedback): a turn whose feedback was
+   * INVARIANT (AGENTS.md — never lose human feedback): a turn whose feedback was
    * persisted but never acted on must be re-delivered verbatim when the task
    * resumes. This marker is the ONLY reliable record of that — "is there an
    * agent turn after it?" is not a valid proxy, because a crash records an agent
@@ -743,6 +785,20 @@ export interface Turn {
    * - consumed — an agent response completed after this feedback was delivered.
    */
   feedback_delivery?: FeedbackDelivery;
+  /**
+   * Feedback a member typed that was SAVED but whose launch was refused (no
+   * credential), so the agent has not seen it. The next successful unblock
+   * delivers it verbatim and clears this. Absent on every other turn.
+   */
+  feedback_withheld?: boolean;
+  /**
+   * The person's OWN words this feedback turn carries, oldest first, each with
+   * its author — distinct from `content`, the composed prompt (carried blocks,
+   * review comments, wrappers). A later carry reads these, never `content`, so
+   * carried feedback is never nested inside another carry's header. Absent on
+   * older turns, whose `content` is then the single item.
+   */
+  feedback_items?: FeedbackItem[];
   /**
    * True when the turn that recorded this error provably had no effect on the
    * branch: no new commits AND the worktree was clean when the turn ended.
@@ -776,6 +832,28 @@ export interface Turn {
    * THIS turn. Absent on every turn that declared nothing. See {@link FinalClaim}.
    */
   final?: FinalClaim;
+  /**
+   * Set on a turn LAZY wrote to say the turn FAILED — the agent never got to
+   * run, or was stopped on an unrecoverable failure. The row keeps
+   * `role: 'agent'` because it closes the attempt the human turn before it
+   * opened, which every attempt and chunk reader keys on — but it is lazy's
+   * NOTICE, not the agent's reply: surfaces render it as lazy's, and the task's
+   * "last turn failed" label is derived from it (src/task/turn-failure.ts).
+   * Absent on every other turn.
+   */
+  failure?: TurnFailure;
+}
+
+/** What lazy recorded about a failed turn. See {@link Turn.failure}. */
+export interface TurnFailure {
+  /** `fatal_auth`, `fatal_config`, `transient_unreachable`, or `launch_failed`. */
+  class: string;
+  /** What failed, verbatim from where it was detected. */
+  reason: string;
+  /** What a person does about it. */
+  remedy: string;
+  /** Agent profile the turn ran under, when known. */
+  agent?: string;
 }
 
 /**
@@ -810,6 +888,13 @@ export interface FinalClaim {
    * finality itself. Empty until a wrap-up has run (slice 3 stamps it).
    */
   wrap_up_steps: string[];
+}
+
+/** One person's verbatim feedback, as carried on a turn. See `Turn.feedback_items`. */
+export interface FeedbackItem {
+  text: string;
+  actor_email?: string;
+  actor_name?: string;
 }
 
 /**
@@ -1231,10 +1316,13 @@ export type SystemMessageKind = 'report' | 'notice' | 'alert';
  * into the builder's launch prompt while unread, listable by the CLI and any
  * UI at all times.
  *
- * INVARIANT: creation is append-only and messages are never deleted or edited.
- * Reading and dismissal are state changes on the message (`read_at`,
- * `dismissed_at`), so the record of what the system told the human is
- * permanent. Dismissal only removes a message from the default surfaces.
+ * INVARIANT: creation is append-only and messages are never deleted, and what
+ * the producer wrote (title, body, kind, source) is never edited. The only
+ * state changes are reading (`read_at`), dismissal (`dismissed_at`) and, for a
+ * producer that asked for collapsing, counting a repeat of the same open event
+ * (`repeat_count`, `last_seen_at`) — none of which rewrites the others, so
+ * the record of what the system told the human is permanent. Dismissal only
+ * removes a message from the default surfaces.
  */
 export interface SystemMessage {
   id: string;
@@ -1255,6 +1343,30 @@ export interface SystemMessage {
   /** Set on dismissal (human/builder decision). Never cleared. */
   dismissed_at?: number;
   dismissed_by?: Actor;
+  /**
+   * How many times the producer filed this same event (same source, kind and
+   * title) while the message was still open. Set only when the producer asked
+   * for repeats to be collapsed (`createSystemMessage(…, { collapseRepeats })`);
+   * absent means it happened once. A repeat moves this and `last_seen_at` and
+   * nothing else — title, body, read and dismissal state stay as they were.
+   */
+  repeat_count?: number;
+  /** When the latest collapsed repeat was filed. */
+  last_seen_at?: number;
+}
+
+/**
+ * Which OPEN messages a bulk dismissal applies to. Every field narrows; an
+ * empty filter matches every open message, so a surface must make "all" an
+ * explicit choice (`lazy messages dismiss --all`), never a default.
+ */
+export interface SystemMessageDismissFilter {
+  /** Exact source, e.g. `machine-docker`. */
+  source?: string;
+  /** Exact title — "dismiss all like this". */
+  title?: string;
+  /** Case-insensitive substring of the title. */
+  titleContains?: string;
 }
 
 /** The caller-supplied fields of a system message creation. */
@@ -1948,7 +2060,7 @@ export type ReviewCommentDeliveryState = 'pending_delivery' | 'delivered';
  * the daemon's comment auto-react loop (auto-deliver.ts), which would kick the
  * agent into an unsolicited work turn. A review comment is dispatched
  * explicitly and only as a read-only `ask`, so it must never enter that loop.
- * This mirrors why raised items are their own store — see CLAUDE.md.
+ * This mirrors why raised items are their own store — see AGENTS.md.
  *
  * INVARIANT: the anchor (file/line/side) and the thread are durable. The
  * comment is persisted BEFORE any ask dispatch that could fail, so human
@@ -2035,7 +2147,7 @@ export interface ReviewComment {
    *
    * INVARIANT: filing RECORDS, it never discards. The message, its answer and
    * its delivery state all stay exactly as they were and stay visible — a
-   * filed ask is moved, not deleted (CLAUDE.md, "Never Lose Human Feedback").
+   * filed ask is moved, not deleted (AGENTS.md, "Never Lose Human Feedback").
    * One-way, like `withdrawn_at`: set once, never cleared.
    */
   filed_at?: number;
@@ -2114,7 +2226,7 @@ export interface ReviewSessionMessage {
  * storage. Claude's `--resume` target lives in `resume_session_id`.
  *
  * INVARIANT: human messages are appended independently of launch success.
- * See CLAUDE.md "Never Lose Human Feedback".
+ * See AGENTS.md "Never Lose Human Feedback".
  */
 export interface ReviewSession {
   id: string;
@@ -2153,7 +2265,7 @@ export interface ReviewSessionMessageUpdate {
  * yet sent, held server-side per task so it survives navigating away, a second
  * tab, or a different browser on the same daemon.
  *
- * INVARIANT (CLAUDE.md "Never Lose Human Feedback"): the drafts here are human
+ * INVARIANT (AGENTS.md "Never Lose Human Feedback"): the drafts here are human
  * words that have not been delivered anywhere. They are written on input,
  * before any action that can fail, and cleared only once the action they belong
  * to has actually succeeded.

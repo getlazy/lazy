@@ -110,7 +110,7 @@ describe('legacy MCP config purge', () => {
 
   // INVARIANT: a project that never leaked gets no rotation. Churning a working
   // credential on every upgrade for no reason is exactly the kind of hidden side
-  // effect CLAUDE.md's "principle of least surprise" forbids.
+  // effect AGENTS.md's "principle of least surprise" forbids.
   test('a project with no legacy configs changes nothing and reports nothing', async () => {
     const before = generateToken(root);
 
@@ -136,7 +136,7 @@ describe('legacy MCP config purge', () => {
   });
 
   // A project that never ran a pre-v0.20 daemon has no tmp dir at all. Missing
-  // is a normal condition, not an error (CLAUDE.md: distinguish "not found" from
+  // is a normal condition, not an error (AGENTS.md: distinguish "not found" from
   // "found but broken").
   test('a project with no tmp directory is fine', async () => {
     expect(await findLegacyDaemonMcpConfigs(root)).toEqual([]);

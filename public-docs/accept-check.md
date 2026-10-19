@@ -28,8 +28,8 @@ Two separate gaps let that through:
 
 ## Half one: the check
 
-When `[automation] accept_check` is set, accept runs that command **in the task's
-own worktree**, before the merge. A non-zero exit refuses the accept.
+When `[automation] accept_check` is set, accept runs that command **against the
+task's own worktree, inside a short-lived container**, before the merge. A non-zero exit refuses the accept.
 
 ```toml
 [automation]
@@ -51,15 +51,10 @@ Notes on the shape, each deliberate:
   whose interpreter is missing verified nothing. It still refuses — a gate that
   passes because nothing ran is the exact failure this exists to prevent.
 - **A timeout is a refusal.** A check that never answered is not a pass.
-- **Host-side, in the worktree.** No agent turn, no container, no network, and
-  no daemon state beyond what accept already has. Read the trust boundary below
-  before enabling it — that last property is a real tradeoff.
+- **In a container, never on the host.** The check runs in the same short-lived
+  container `[automation.pre_accept]` uses, with no agent in it. See below.
 
-### Where it runs, and what an agent can influence
-
-The check runs as a plain `sh -c` **on the daemon host**, as the user running the
-daemon, with its working directory set to the task worktree. That worktree is
-written by an agent.
+### Where it runs, and why
 
 The **command** is yours: it comes from the project root's `lazy.toml`, never
 from the task branch's copy of it, so a task cannot edit or disable its own gate.
@@ -68,19 +63,13 @@ worktree's `package.json` scripts, `make check` reads its `Makefile`, `tsc` read
 its `tsconfig.json` and anything that extends. An agent that can commit to its
 own branch can change what your check actually executes.
 
-This differs from `[automation] pre_accept`, which runs its commands in an
-ephemeral gate container under the same runner — under a container runner, the
-gate executes *inside* a container (with no agent in it). The accept check does
-not. It must not depend on the runner, the network, or daemon health beyond what
-accept already requires, so it
-executes outside every container guard — including on fully automated MCP accepts
-of subtasks, where no human is watching the accept at all.
-
-**If you run a container runner, treat `accept_check` like a CI hook running over
-untrusted input.** Point it at a command whose behaviour you are willing to have
-resolved by the branch under review, keep the timeout tight, and do not enable it
-at all on a project whose agents you would not let run a shell command on the
-host. A project on the host runner already grants that, so nothing changes there.
+So lazy treats the check as code under the agent's control, and that code never
+runs on the machine hosting lazy — on your own machine or on a shared Lazy Teams
+host alike. Accept runs it in the same short-lived gate container
+`[automation.pre_accept]` uses, built from the task's image, with no agent in it,
+and removes the container afterwards. The check needs whatever tools it calls to
+be in that image — the same image your agents already work in — and the
+container runtime (Docker or Podman) must be available when you accept.
 
 ### What a refusal looks like
 
@@ -118,10 +107,9 @@ pass.
 
 ### Cost
 
-One process per accept, bounded by `accept_check_timeout`, and zero for a project
-that leaves `accept_check` unset. The gate adds nothing measurable on top of the command
-itself — one `sh -c` spawn and the same output handling accept already does for
-hooks; a full `tsc --noEmit` over ~900 files takes a few seconds. Paid
+One short-lived container per accept, running the command once, bounded by
+`accept_check_timeout` — and nothing for a project that leaves `accept_check`
+unset. On top of the command itself you pay for starting that container. Paid
 once, at the moment a mistake would otherwise become the branch's problem.
 
 ## Half two: reverted protected files (historical records only)

@@ -10,6 +10,8 @@
  * Called automatically by list/blocked commands before displaying results.
  */
 
+import { shouldLogImageHold, runnerImageHold } from '../daemon/runner-image-choice';
+import { announceUncommittedLeftBehind } from '../task/uncommitted-left-behind';
 import { RESTORE_COMMIT_EMAIL, restoredViolationRecords } from '../protection/rejected-restore';
 import { join } from 'path';
 import { existsSync, readdirSync, statSync, readFileSync } from 'fs';
@@ -32,6 +34,8 @@ import { recordSessionCommits, scanSessionCommits } from '../task/session-commit
 import { launchSettingsFromResponse } from './turns';
 import { parkTaskPaused } from './paused-status';
 import { consumeSyncRestoreStatus } from '../task/sync-restore-status';
+import { clearReadOnlyTurnFor, isReadOnlyWorkTurn } from '../task/read-only-turn';
+import { isWorkTurnCommand } from '../task/services-restart-record';
 import { checkLock, readLock, removeLock } from './lock';
 import { launchInFlight } from '../runner/launch-in-flight';
 import { resolveWorkRun } from './working-run';
@@ -51,9 +55,40 @@ import { isUserStopped } from '../task/user-stop';
 import { releaseTurnCredential } from '../daemon/turn-credentials';
 import { createAgentTurn, createRecoveredAgentTurn, sessionTurnOwner, turnChannelActor } from '../daemon/turn-owner';
 import { systemActor } from '../identity/system-identity';
+import { turnFailureRemedy } from '../task/turn-failure';
+import { fileTurnFailureAlert } from '../daemon/turn-failure-alert';
+import { noteDeliveredSecretsInSession } from '../daemon/task-files';
+import { deliveredFilesUpstreamExclude } from '../daemon/delivered-files-upstream';
+
+/**
+ * The record-time delivered-secret notice for a finished turn, excluding what
+ * is already on the parent branch so a sync merge's upstream history is never
+ * reported as this task carrying a secret. Never throws (as the notice).
+ */
+async function noteDeliveredSecretsForTurn(
+  storage: Storage,
+  lazyRoot: string,
+  taskId: string,
+  session: Pick<Session, 'git_start_sha'> & Partial<Pick<Session, 'upstream_merge_sha'>>,
+  worktreePath: string,
+): Promise<void> {
+  let exclude: string[] = [];
+  try {
+    const task = await storage.getTask(taskId);
+    if (task) {
+      exclude = await deliveredFilesUpstreamExclude({
+        task, session: { upstream_merge_sha: session.upstream_merge_sha ?? null }, storage, projectRoot: lazyRoot, worktreePath, config: await loadConfig(lazyRoot),
+      });
+    }
+  } catch (err) {
+    logger.debug(`Task ${taskId}: parent ref for the delivered-secret notice unavailable: ${(err as Error).message}`);
+  }
+  await noteDeliveredSecretsInSession(storage, lazyRoot, taskId, worktreePath, session.git_start_sha, exclude);
+}
 import type { AutoReactTrigger } from '../daemon/auto-react-budget';
 import { resetSlowLaneState, getLastProjectAutoResumeAt, recordProjectAutoResume } from '../daemon/auto-resume-queue';
 import { sweepStrandedMerging, sweepAcceptFollowThrough } from '../daemon/stranded-merge';
+import { maybePostRootDockerfileNotice } from '../daemon/root-dockerfile-notice';
 import { taskTurnInFlight, isInFlightLive, expiredSyncRestore, claimMadeByThisProcess } from '../daemon/in-flight-turn';
 import { reviewContainerNameForTask } from '../capture/claude';
 import { settleInFlightTurnFromProtocol, abandonDeadClaimedTurn } from '../daemon/task-lifecycle';
@@ -65,6 +100,7 @@ import { reparentChildren, formatReparentWarning } from '../task/orphan';
 import { readAgentReportFromSessionLog } from '../import/recover-agent-report';
 import { ACTIVE_HARNESS_PHASES } from './working-substate';
 import { runRecordedSweep, RECONCILE_LOOP } from '../daemon/health-registry';
+import { supervisedTurnContent } from '../task/wrapper-fold';
 import {
   isWatchdogKill,
   watchdogTurnLines,
@@ -327,6 +363,15 @@ export async function reconcileTasks(
     // until done, and never moves the task out of `complete`.
     await sweep('accept-follow-through', () => sweepAcceptFollowThrough(storage, lazyRoot), (err) => {
       logger.warn(`Post-accept follow-through sweep failed: ${describe(err)}`);
+    });
+
+    // Sweep 9c: a committed root Dockerfile.lazy this backend never builds
+    // (Lazy Teams local-docker) is announced as one system message — launch
+    // narration alone reaches nobody on a daemon-started or Teams-started turn.
+    // A no-op (no git, no storage) wherever the file IS built. Runs every tick
+    // so an accept that lands the file is announced without a restart.
+    await sweep('root-dockerfile-notice', () => maybePostRootDockerfileNotice(storage, lazyRoot), (err) => {
+      logger.warn(`Root Dockerfile.lazy notice failed: ${describe(err)}`);
     });
 
     // Sweep 10: repair task worktrees whose git pointers (.git, commondir,
@@ -729,6 +774,12 @@ async function reconcileTaskInner(storage: Storage, taskId: string, lazyRoot: st
     logger.debug(`Task ${taskShortId}: launch still in progress in this process, skipping reconciliation`);
     return;
   }
+  // The turn is over and its services are being restarted in the background
+  // (src/daemon/services-restart.ts). The pass after that finishes parks it.
+  if ((await import('../daemon/services-restart')).servicesRestartInFlight(taskId)) {
+    logger.debug(`Task ${taskShortId}: services restart in progress, parking after it`);
+    return;
+  }
 
   // Step 1: Check if supervisor has written a response
   const protoDir = getProtocolDir(taskId);
@@ -737,7 +788,7 @@ async function reconcileTaskInner(storage: Storage, taskId: string, lazyRoot: st
   // If there's a response file, process it immediately (no grace period applies).
   // The grace period only matters when there's NO response yet - we want to give
   // the container time to start before checking if it's running.
-  if (response) {
+  const routeResponse = async (response: NonNullable<ReturnType<typeof readResponse>>): Promise<void> => {
     if (response.status === 'completed') {
       logger.info(`Task ${taskShortId} finished turn, transitioning to blocked`);
       await handleCompletedResponses(storage, taskId, session, completedResponses(response), worktreePath, protoDir, lazyRoot, responseCommandId(response));
@@ -745,13 +796,15 @@ async function reconcileTaskInner(storage: Storage, taskId: string, lazyRoot: st
       // Note: push and PR operations moved out of reconciler.
       // Read commands (list, show, blocked, active) should be fast and local.
       // Push happens in: lazy start (publish), lazy sync (explicit), lazy accept (merge flow).
-      return;
     } else {
       // Error response — record as an agent error turn so crash details are visible
       logger.info(`Task ${taskShortId} crashed (phase: ${response.phase}): ${response.error}`);
       await handleErrorResponse(storage, taskId, session, response, protoDir, lazyRoot);
-      return;
     }
+  };
+  if (response) {
+    await routeResponse(response);
+    return;
   }
 
   // Step 2: No response yet — apply grace period before checking container status.
@@ -778,6 +831,17 @@ async function reconcileTaskInner(storage: Storage, taskId: string, lazyRoot: st
   if (await taskRunner.isRunning(containerName)) {
     logger.debug(`Task ${taskShortId}: run ${containerName} still running, no response yet`);
     return; // Still working
+  }
+
+  // INVARIANT: a run that has stopped gets ONE more read of its response before
+  // anything infers from its absence. A failed one-shot turn exits 1 right after
+  // writing response.json, so the response can land between the read above and
+  // the liveness probe; without this re-read a crashed turn with commits is
+  // "recovered" as finished and a fatal failure is auto-resumed as interrupted.
+  const lateResponse = readResponse(protoDir);
+  if (lateResponse) {
+    await routeResponse(lateResponse);
+    return;
   }
 
   // The run is not alive and there is no response. Before declaring the turn
@@ -911,6 +975,17 @@ export async function interruptForDaemonRestart(
     return false;
   }
 
+  // INVARIANT: a turn whose COMPLETED response is on disk is finished, not
+  // interrupted. A task waits in `working` with its response unconsumed while
+  // its services restart after the turn (src/daemon/services-restart.ts); a
+  // daemon stop or restart in that window must not relabel the finished turn
+  // `interrupted` — whose auto-resume would launch a work turn nobody asked for
+  // on top of it. The reconciler's response path finalizes it instead.
+  if (readResponse(getProtocolDir(taskId))?.status === 'completed') {
+    logger.info(`Task ${taskShortId}: its turn already finished — not interrupting; the reconciler parks it`);
+    return false;
+  }
+
   await storage.updateTaskStatus(taskId, 'interrupted', await systemActor(lazyRoot));
   await storage.recordInterrupt(session.id, {
     reason: trigger === 'stop'
@@ -1024,6 +1099,11 @@ async function maybeAutoResume(
   const usageHold = await usagePauseHold(lazyRoot, storage, task, 'auto-resume');
   if (usageHold) {
     logger.info(`Task ${taskShortId}: auto-resume held by usage pause — ${usageHold}`);
+    return;
+  }
+  const imageHold = await runnerImageHold(task);
+  if (imageHold) {
+    if (shouldLogImageHold('reconcile', task, imageHold)) logger.info(`Task ${taskShortId}: auto-resume held until the project's runner image is ready — ${imageHold}`);
     return;
   }
 
@@ -1444,6 +1524,12 @@ function supervisedHeading(kind: SupervisedKind): string {
       return '## Reactive Automation';
     case 'commit_leftovers':
       return '## Uncommitted Work';
+    case 'commit_nudge':
+      return '## Uncommitted Changes Check';
+    case 'background_nudge':
+      return '## Stopped Background Work Check';
+    case 'pending_notes':
+      return '## New Comments During the Turn';
     case 'present':
       return '## Presentation Walkthrough';
     case 'low_high_review':
@@ -1512,7 +1598,8 @@ export async function recordSupervisedTurns(
       sessionId,
       sequence: promptSeq,
       role: 'human',
-      content: `${supervisedHeading(kind)}\n\n${prompt}`,
+      // lazy's own wrapper is marked so review surfaces fold it (src/task/wrapper-fold.ts).
+      content: supervisedTurnContent(kind, supervisedHeading(kind), prompt),
       prompt,
       // The supervisor authored this autonomously — not the human, not the agent.
       actor: 'supervisor',
@@ -1742,7 +1829,12 @@ export async function journalWorktreeRecovery(
     lines.push(`Recovery patch: ${recovery.patch_path}`);
   }
   try {
-    await storage.appendJournalEntry(taskId, lines.join('\n'), 'supervisor');
+    // Idempotent by content: the end of a turn can take two passes over the same
+    // response (a services restart runs between them), and a re-run must not
+    // journal the same rollback twice.
+    const content = lines.join('\n');
+    if ((await storage.getTaskJournal(taskId)).some(e => e.content === content)) return;
+    await storage.appendJournalEntry(taskId, content, 'supervisor');
     logger.warn(`Task ${shortId(taskId)}: ${recovery.summary}`);
   } catch (err) {
     logger.warn(
@@ -2019,6 +2111,7 @@ async function recordSyncTurns(
     // commit itself (and any conflict resolution the agent committed on this
     // branch) belongs to this task.
     await recordSessionCommits(storage, session, worktreePath, taskShortId);
+    if (lazyRoot) await noteDeliveredSecretsForTurn(storage, lazyRoot, taskId, session, worktreePath);
   }
 
   // Sync completion returns the task to the status the sync FOUND — a merge
@@ -2036,6 +2129,7 @@ async function recordSyncTurns(
   //     review queue and off PR-comment auto-react. See
   //     src/task/sync-restore-status.ts.
   const restore = await consumeSyncRestoreStatus(storage, taskId, commandId);
+  await clearReadOnlyTurnFor(storage, taskId, commandId);
   await parkTaskPaused(storage, taskId, await systemActor(lazyRoot), {
     sessionId: session.id,
     ...(restore ? { restore } : {}),
@@ -2087,6 +2181,15 @@ export async function handleCompletedResponses(
 ): Promise<void> {
   const taskShortId = shortId(taskId);
   const work = responses[0];
+  // Read before the marker goes: a reflective (read-only) unblock changed
+  // nothing, so it must not restart the task's services below.
+  const endingTask = await storage.getTask(taskId);
+  const wasReadOnlyTurn = endingTask
+    ? await isReadOnlyWorkTurn(storage, endingTask, await storage.getSessionByTaskId(taskId))
+    : false;
+  // The turn is over: a reflective turn's read-only marker names it and goes
+  // (src/task/read-only-turn.ts). A mismatched id leaves it alone.
+  await clearReadOnlyTurnFor(storage, taskId, commandId);
   const supervised = responses.slice(1);
 
   // Sync (upstream-merge) responses are recorded by a dedicated path — the merge
@@ -2198,6 +2301,17 @@ export async function handleCompletedResponses(
       );
     }
 
+    // Work still loose after the wrap-up asked about it is announced, not just
+    // recorded on this turn: a comment on the task and a system notice. Inside
+    // this `else` so a reconciler re-run never announces twice.
+    if (work.uncommitted?.length) {
+      const previous = [...existingTurns].reverse()
+        .find(t => t.role === 'agent' && !t.turn_type)?.uncommitted ?? [];
+      const sameAsPreviousTurn = previous.length === work.uncommitted.length
+        && work.uncommitted.every(p => previous.includes(p));
+      await announceUncommittedLeftBehind(storage, taskId, work.uncommitted, { sameAsPreviousTurn });
+    }
+
     // Materialize each supervised follow-up as its own discrete turn pair.
     //
     // INVARIANT: supervised turns are recorded ONLY on the same pass that creates
@@ -2232,7 +2346,7 @@ export async function handleCompletedResponses(
     await rollUpBundleUsage(storage, session.id, responses, taskShortId);
   }
 
-  // INVARIANT (CLAUDE.md — never lose human feedback): the agent responded, so
+  // INVARIANT (AGENTS.md — never lose human feedback): the agent responded, so
   // everything queued before this turn has now been seen. Clearing the whole
   // pending backlog at once is what makes redelivery idempotent — a turn that
   // DID consume its feedback can never be re-delivered into. Deliberately
@@ -2249,10 +2363,44 @@ export async function handleCompletedResponses(
   // and is walked first-parent — see src/task/session-commits.ts for why a
   // "last known SHA" and a plain `A..HEAD` cannot be used here.
   await recordSessionCommits(storage, session, worktreePath, taskShortId);
+  if (lazyRoot) await noteDeliveredSecretsForTurn(storage, lazyRoot, taskId, session, worktreePath);
 
-  // Capture uncommitted changes
+  // Fresh services for whoever looks next: after a WORK turn (never an ask, a
+  // review or a sync — those carry other command types or returned above; every
+  // work-turn launch, daemon-started ones included, writes `start` or
+  // `unblock`), the supervisor having handed the turn back, and before the park
+  // hands the task to a person. The restart runs in the BACKGROUND
+  // (src/daemon/services-restart.ts): this task stays `working`, its response
+  // unconsumed, and a later pass parks it once the restart is done — while the
+  // reconciler moves on to every other task. Claimed per turn, so it runs once.
+  // The claim key must be the SAME on every pass over this response. Not
+  // `agentTurnSeq`: on a re-run that is the LAST agent-role turn, which after a
+  // bundle with supervised follow-ups (push-back, the low-high self-review) is a
+  // nudge reply or a review turn, not the work turn — and a changed key would
+  // claim and restart a second time. The ending command's id when the response
+  // carries one, else the work turn itself (agent role, no turn type).
+  const workTurnSeq = [...await storage.getSessionTurns(session.id)].reverse()
+    .find(t => t.role === 'agent' && !t.turn_type)?.sequence ?? agentTurnSeq;
+  const restartTurnKey = commandId ? `command:${commandId}` : `${session.id}:${workTurnSeq}`;
+  let resumingAfterRestart = false;
+  if (lazyRoot && !wasReadOnlyTurn && isWorkTurnCommand(status?.command_type)) {
+    const task = await storage.getTask(taskId);
+    // Loaded lazily: serve-run reaches the daemon's RPC module, which this
+    // module must not pull in at load time.
+    const { servicesRestartGate, servicesRestartClaimedFor } = await import('../daemon/services-restart');
+    if (task) {
+      resumingAfterRestart = servicesRestartClaimedFor(task, restartTurnKey);
+      if (await servicesRestartGate(storage, lazyRoot, task, await storage.getSessionByTaskId(taskId), restartTurnKey) === 'wait') {
+        logger.debug(`Task ${taskShortId}: restarting its services before it parks`);
+        return;
+      }
+    }
+  }
+
+  // Capture uncommitted changes — once, on the pass that recorded them before
+  // the services restart, not again on the pass that parks after it.
   try {
-    if (await hasUncommittedChanges(worktreePath)) {
+    if (!resumingAfterRestart && await hasUncommittedChanges(worktreePath)) {
       const uncommittedDiff = await getUncommittedDiff(worktreePath);
       const gitStatus = (await runGit(['status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd: worktreePath })).stdout;
       await storage.createWorktreeSnapshot(session.id, agentTurnSeq, uncommittedDiff, gitStatus);
@@ -2273,6 +2421,7 @@ export async function handleCompletedResponses(
   // pending set that is still owed a reviewer decision. parkTaskPaused unions
   // the fresh set with what the turns already hold. See src/utils/paused-status.ts.
   const finalViolations = [...responses].reverse().find(r => r.violations !== undefined)?.violations ?? [];
+
   await parkTaskPaused(storage, taskId, await systemActor(lazyRoot), { sessionId: session.id, detected: finalViolations, ...(lazyRoot ? { projectRoot: lazyRoot } : {}) });
 
   // pending_sync is managed by the daemon sync retry loop (src/daemon/sync-retry.ts).
@@ -2426,7 +2575,7 @@ function buildErrorTurnContent(
   watchdogKill: boolean,
 ): string {
   const heading = fatalClass
-    ? '[Agent stopped — unrecoverable failure]'
+    ? '[Lazy: the turn failed — unrecoverable failure]'
     : watchdogKill
       ? WATCHDOG_TURN_HEADING
       : '[Agent crashed]';
@@ -2475,6 +2624,25 @@ function buildErrorTurnContent(
 }
 
 /**
+ * Whose connection a failed turn spent, for keying its alert — only where
+ * members each pay with their own (team mode). The turn's recorded owner, or
+ * the project's service account for a turn nobody asked for. Undefined
+ * elsewhere, and on any read failure (the alert is then per profile).
+ */
+async function alertPayer(storage: Storage, taskId: string, lazyRoot?: string): Promise<string | undefined> {
+  if (!lazyRoot) return undefined;
+  try {
+    const { teamModeEnabled } = await import('../daemon/user-credentials');
+    if (!(await teamModeEnabled(lazyRoot))) return undefined;
+    const sess = await storage.getSessionByTaskId(taskId);
+    return sess?.turn_owner_email ?? "the project's service account";
+  } catch (err) {
+    logger.debug(`Task ${taskId.substring(0, 8)}: could not resolve who paid for the failed turn: ${err instanceof Error ? err.message : err}`);
+    return undefined;
+  }
+}
+
+/**
  * Handle an error response from the supervisor.
  * Records an agent error turn so crash details are visible in lazy show,
  * then transitions the task to 'interrupted'.
@@ -2501,9 +2669,9 @@ export async function handleErrorResponse(
   // credential or a bad model id just re-crashes on a timer.
   // `failure_class` is set when the supervisor ended the turn on purpose: a
   // `fatal_*` class, a `transient_unreachable` that outlived its bounded
-  // retries, or the fast-crash-loop backstop. The first two cannot heal and
-  // must block; the backstop only ever reports `unknown` — by construction, it
-  // runs for no other class — and an unclassifiable failure has never been a
+  // retries, the fast-crash-loop backstop, or an `unknown` failure that used up
+  // UNKNOWN_MAX_ATTEMPTS. The first two cannot heal and must block; the last two
+  // only ever report `unknown`, and an unclassifiable failure has never been a
   // reason to stop auto-resume. So `unknown` is carried for DIAGNOSIS only and
   // keeps the pre-existing interrupted + auto-resume behavior, exactly as an
   // absent class does.
@@ -2512,6 +2680,20 @@ export async function handleErrorResponse(
 
   const watchdogKill = isWatchdogKill(response);
   const turnContent = buildErrorTurnContent(response, fatalClass, classified, watchdogKill);
+  // An unrecoverable failure is LAZY's notice, not the agent's answer: the row
+  // says so structurally, which is what every surface renders it from and what
+  // the task's failed:<class> label is derived from (src/task/turn-failure.ts).
+  const failureReason = response.failure_reason
+    ? `${response.failure_reason}: ${response.error}`
+    : response.error;
+  const failure = fatalClass
+    ? {
+        class: fatalClass,
+        reason: failureReason,
+        remedy: turnFailureRemedy(fatalClass, failureReason, response.agent ?? undefined),
+        ...(response.agent ? { agent: response.agent } : {}),
+      }
+    : undefined;
   await journalWorktreeRecovery(storage, taskId, response.worktree_recovery);
   // A crashed or watchdog-killed turn is exactly when the agent's own account of
   // what it was doing matters most — persist it before recording the error turn.
@@ -2533,6 +2715,8 @@ export async function handleErrorResponse(
   // byte-identical content and recorded nothing (fix-empty-failed-turn). See
   // turnsSinceAttemptStart for why the last non-agent turn is the boundary.
   const existingTurns = await storage.getSessionTurns(session.id);
+  // Set only by the pass that records the turn, so a re-run never announces twice.
+  let announceLeftBehind = false;
   const alreadyRecorded = turnsSinceAttemptStart(existingTurns)
     .some(t => t.role === 'agent' && t.content === turnContent);
   if (!alreadyRecorded) {
@@ -2565,6 +2749,7 @@ export async function handleErrorResponse(
       ...(response.restored_protected_files?.length
         ? { violations: restoredViolationRecords(response.restored_protected_files, Date.now()) }
         : {}),
+      ...(failure ? { failure } : {}),
     }, lazyRoot);
     // Roll the same tokens into the session total, inside the same idempotency
     // guard as the turn write (see rollUpSessionUsage). A crashed turn's tokens
@@ -2574,6 +2759,7 @@ export async function handleErrorResponse(
       await rollUpSessionUsage(storage, session.id, errorUsage, `Task ${taskShortId}`);
     }
     logger.debug(`Task ${taskShortId}: recorded agent error turn`);
+    announceLeftBehind = !!fatalClass && !!response.uncommitted?.length;
   }
 
   // INVARIANT: a sweep acting on a response it read EARLIER must not touch a
@@ -2601,6 +2787,17 @@ export async function handleErrorResponse(
       `recording it as a turn but leaving the task's live state alone (a newer turn owns it).`,
     );
     return;
+  }
+
+  // A FATAL failure parks the task for a human, so loose work in its worktree
+  // is announced as on a completed park — after the guard above, so a
+  // superseded report never posts onto a task a newer turn owns. An ordinary
+  // crash goes to `interrupted` and auto-resumes in the same worktree, whose
+  // next turn's commit nudge asks about it. This wording never tells the agent to commit:
+  // a failed turn's loose files may be edits nobody authorised (a read-only
+  // self-review that wrote is exactly this failure) and stay for a person.
+  if (announceLeftBehind && response.uncommitted?.length) {
+    await announceUncommittedLeftBehind(storage, taskId, response.uncommitted, { failedTurn: true });
   }
 
   // Reconcile the agent's session id from the ERROR response — now that the
@@ -2644,6 +2841,7 @@ export async function handleErrorResponse(
   // non-matching read changes nothing and leaves the marker alone — it may
   // still be owed to the turn it names. See src/task/sync-restore-status.ts.
   const syncRestore = await consumeSyncRestoreStatus(storage, taskId, responseCommandId(response));
+  await clearReadOnlyTurnFor(storage, taskId, responseCommandId(response));
 
   if (fatalClass) {
     // Blocked, not interrupted: `maybeAutoResume` only acts on interrupted
@@ -2657,7 +2855,7 @@ export async function handleErrorResponse(
     // 'interrupted' — the exact auto-resume queue this branch exists to avoid.
     const current = await storage.getTask(taskId);
     if (current?.status === 'interrupted') {
-      await storage.updateTaskStatus(taskId, 'working', await systemActor(lazyRoot));
+      await storage.updateTaskStatus(taskId, 'working', await systemActor(lazyRoot), `${fatalClass}: re-parking a failed turn`);
     }
     // A crashed turn detected nothing, so it cannot clear an owed decision —
     // park on the violation set (violations-are-the-source-of-truth), restoring
@@ -2667,6 +2865,7 @@ export async function handleErrorResponse(
       sessionId: session.id,
       ...(syncRestore ? { restore: syncRestore } : {}),
       ...(lazyRoot ? { projectRoot: lazyRoot } : {}),
+      reason: `${fatalClass}: ${failureReason}`,
     });
     await storage.recordInterrupt(session.id, {
       reason: `${fatalClass}: ${response.failure_reason ?? response.error}`,
@@ -2677,6 +2876,12 @@ export async function handleErrorResponse(
       `Task ${taskShortId}: unrecoverable agent failure (${fatalClass}) — parked '${parked}' ` +
       `for human attention, not auto-resuming`,
     );
+    // Filed by lazy itself: when the credential is what broke, no agent runs to
+    // say so. One open alert per profile+class absorbs repeats.
+    const parkedTask = await storage.getTask(taskId);
+    if (parkedTask && failure) {
+      await fileTurnFailureAlert(storage, parkedTask, failure, await alertPayer(storage, taskId, lazyRoot));
+    }
     return;
   }
 
@@ -3082,7 +3287,7 @@ async function resumeStrandedInterruptedTasks(storage: Storage, lazyRoot: string
  *  - no commit detection, no worktree snapshot. Both read the worktree as it is
  *    at this instant, which is not what it looked like when this turn ended.
  *  - no `markFeedbackConsumed`. Feedback queued after this turn is still owed to
- *    the turn that is running now (CLAUDE.md: never lose human feedback).
+ *    the turn that is running now (AGENTS.md: never lose human feedback).
  *  - no violations, no `parkTaskPaused`, no status change. The task's status is
  *    the live turn's to own — clobbering it is precisely the bug this fix exists
  *    to stop.

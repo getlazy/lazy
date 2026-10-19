@@ -5,6 +5,7 @@
  * src/runner/docker-runner.ts (supervisorToolChecks, diagnose).
  */
 
+import type { HealthCheck } from '../remote/driver';
 import type { AgentPackaging } from './interface';
 import { spawnSyncUnsupervised } from '../utils/spawn';
 
@@ -59,7 +60,7 @@ WORKDIR /work
     ];
   }
 
-  diagnose(): { state: 'ok' | 'fail'; what: string; reason?: string }[] {
+  diagnose(): HealthCheck[] {
     try {
       const result = spawnSyncUnsupervised(['claude', '--version'], {
         stdout: 'pipe',
@@ -76,6 +77,7 @@ WORKDIR /work
     return [{
       state: 'fail',
       what: 'Claude Code CLI installed',
+      problem: 'Claude Code CLI isn\'t installed',
       reason: 'Claude Code CLI not found. Install: curl -fsSL https://claude.ai/install.sh | bash',
     }];
   }

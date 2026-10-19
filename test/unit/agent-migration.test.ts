@@ -37,6 +37,7 @@ describe('planAgentMigration', () => {
       harness: 'claude-code',
       model: 'qwen3:8b',
       endpoint: LEGACY_OLLAMA_ENDPOINT,
+      credential: 'none',
     });
     expect(parsed.models.roles.agent).toEqual({ agent: 'agent-ollama' });
   });
@@ -226,5 +227,18 @@ describe('planAgentMigration', () => {
     );
     expect(plan.blockers.length).toBe(1);
     expect(plan.blockers[0]).toContain('would still not load');
+  });
+});
+
+describe('migrating an endpoint that names no credential', () => {
+  // INVARIANT: the migration never guesses a credential for a host that is
+  // neither local nor a known provider's — it stops and asks the user to name
+  // one, rather than writing "none" (or the old wire default) silently.
+  test('an unrecognised remote host is a blocker, not a guessed credential', () => {
+    const plan = planAgentMigration(
+      '[models.roles.agent]\nbackend = "proxy"\nmodel = "m"\nendpoint = "https://gw.example.com"\n',
+    );
+    expect(plan.blockers.join('\n')).toContain('must now name the credential');
+    expect(plan.updated).not.toContain('credential =');
   });
 });

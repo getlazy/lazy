@@ -44,10 +44,13 @@ describe('uid1000.sh guest tools', () => {
     }
   });
 
-  test('the image still installs git and docker.io, which the script needs', () => {
+  // The docker engine moved from Debian's docker.io to Docker's own pinned apt
+  // packages (BuildKit in the guest); the script needs the docker CLI either way.
+  test('the image still installs git and the docker engine and CLI, which the script needs', () => {
     const install = dockerfile.slice(dockerfile.indexOf('apt-get install'));
     expect(install).toMatch(/^\s+git \\$/m);
-    expect(install).toMatch(/^\s+docker\.io \\$/m);
+    expect(install).toMatch(/^\s+"docker-ce=[^"]+" \\$/m);
+    expect(install).toMatch(/^\s+"docker-ce-cli=[^"]+" \\$/m);
     expect(dockerfile).toMatch(/debian:\$\{DEBIAN_TAG\}/);
     expect(dockerfile).toMatch(/DEBIAN_TAG=bookworm/);
   });

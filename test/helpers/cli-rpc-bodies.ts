@@ -233,6 +233,10 @@ export function cliRpcBodies(): Map<string, CliRpcBody> {
   const bodies = new Map<string, CliRpcBody>();
   scan('src/daemon/rpc-fallback.ts', /tryRpc(?:Void)?(?:<.*?>)?\(\s*'/g, bodies);
   scan('src/cli/review-actions-rpc.ts', /\bcall\(\s*'/g, bodies);
+  // `lazy report` / `lazy ask <conversation>`'s one-shots: the one tryRpc the
+  // one-shot client makes (its other tryRpc, `usagePause`, is served by
+  // Teams' usage-views route, not this table).
+  scan('src/oneshot/index.ts', /tryRpc<AgentResponse>\(\s*'/g, bodies);
   cached = bodies;
   return bodies;
 }

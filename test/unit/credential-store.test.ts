@@ -232,7 +232,7 @@ describe('providers', () => {
     // A profile on a local model server bills nothing, so there is no slot to
     // write — saying so beats storing a key nothing will ever present.
     test('a profile that bills no credential is refused', () => {
-      const cfg = config({ local: { harness: 'codex', endpoint: 'http://localhost:11434', model: 'qwen3:latest' } });
+      const cfg = config({ local: { harness: 'codex', endpoint: 'http://localhost:11434', credential: 'none', model: 'qwen3:latest' } });
       expect(() => resolveCredentialTarget(cfg, 'local')).toThrow(/bills no credential/);
     });
 

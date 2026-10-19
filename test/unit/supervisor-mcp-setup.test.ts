@@ -77,7 +77,7 @@ describe('prepareTurnMcp', () => {
     // process.env is shared by every test FILE in a bun test run. Leaking these
     // would make a later suite's `lazy-agent mcp` subprocess refuse to start
     // (it checks its own --task-id against them) — the same cross-file env leak
-    // class CLAUDE.md documents for LAZY_TEST / LAZY_IS_DAEMON.
+    // class AGENTS.md documents for LAZY_TEST / LAZY_IS_DAEMON.
     originalTurnEnv = [MCP_EXPECTED_TASK_ID_ENV, MCP_EXPECTED_WORKTREE_ENV].map(
       k => [k, process.env[k]] as [string, string | undefined],
     );
@@ -326,7 +326,7 @@ describe('prepareTurnMcp', () => {
       (e: unknown) => e as Error,
     );
 
-    // Actionable per CLAUDE.md: not just "MCP config failed".
+    // Actionable per AGENTS.md: not just "MCP config failed".
     expect(err.message).toContain('abcdef12');            // which task
     expect(err.message).toContain(hostname());            // which container/host
     expect(err.message).toContain('LAZY_DAEMON_CONFIG');  // what was missing

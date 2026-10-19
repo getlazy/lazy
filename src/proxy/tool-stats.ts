@@ -8,7 +8,7 @@
  * themselves are tiny and monotonic, so they are kept instead — a small
  * per-task record (`TaskToolStatsRecord`) the proxy folds each forwarded
  * request into as it goes. The audit log is untouched and stays exactly the
- * carve-out CLAUDE.md describes; nothing here moves that stream into Storage.
+ * carve-out AGENTS.md describes; nothing here moves that stream into Storage.
  *
  * THE HARD PART IS NOT DOUBLE COUNTING. Every request re-sends the entire
  * conversation, so one `tool_use` block appears in every later request — on a

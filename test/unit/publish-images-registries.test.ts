@@ -1,7 +1,7 @@
 /**
- * Both container images publish to both registries, symmetrically.
+ * Every container image publishes to both registries, symmetrically.
  *
- * lazy-daemon and lazy-teams each go to ghcr.io/getlazy AND docker.io/getlazy
+ * lazy-daemon, lazy-teams and lazy-runner each go to ghcr.io/getlazy AND docker.io/getlazy
  * from ONE buildx pass carrying the identical tag set, so either registry is a
  * complete source of either image. The Teams image once went to GHCR only; this
  * keeps that asymmetry from coming back silently — in the scripts (which decide
@@ -17,7 +17,7 @@ import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 
 const REPO = join(import.meta.dir, '..', '..');
 const REGISTRIES = ['docker.io/getlazy', 'ghcr.io/getlazy'];
-const IMAGES = ['lazy-daemon', 'lazy-teams'];
+const IMAGES = ['lazy-daemon', 'lazy-teams', 'lazy-runner'];
 
 type Step = { name?: string; uses?: string; with?: Record<string, unknown> };
 type Workflow = { jobs: Record<string, { steps?: Step[] }> };
@@ -310,6 +310,14 @@ exit 0
           cwd: REPO, stdout: 'pipe', stderr: 'pipe', timeout: 60_000,
           env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
         });
+        // INVARIANT: a PUBLISHING runner run refuses uncommitted edits to the files
+        // that compose its Dockerfile — a published tag must name committed text.
+        // So on a dirty tree the refusal is what this test checks instead.
+        if (image === 'lazy-runner' && runnerInputsDirty()) {
+          expect(r.exitCode).toBe(1);
+          expect(r.stderr.toString()).toContain('uncommitted changes');
+          return;
+        }
         expect(r.exitCode).toBe(0);
         expect(readFileSync(out, 'utf-8').trim()).toBe('sha256:abc123');
         expect(require('node:fs').existsSync(`${out}.metadata.json`)).toBe(false);
@@ -323,4 +331,33 @@ exit 0
       expect(plain).not.toContain('  ');
     }, 60_000);
   }
+});
+
+/** Uncommitted edits to what composes the runner Dockerfile (the publish script's own list). */
+function runnerInputsDirty(): boolean {
+  const r = spawnSyncUnsupervised(
+    ['git', 'status', '--porcelain', '--untracked-files=no', '--', 'src/docker', 'src/agent', 'src/capture/image-tag.ts', 'scripts/runner-image-dockerfile.ts'],
+    { cwd: REPO, stdout: 'pipe', stderr: 'pipe', timeout: 10_000 },
+  );
+  return r.stdout.toString().trim() !== '';
+}
+
+describe('lazy-runner anonymous-pull verification', () => {
+  // INVARIANT: every lazy launch pulls the runner WITHOUT credentials, so the
+  // release verifies exactly that: a job with no registry login, an isolated
+  // DOCKER_CONFIG (no inherited credentials), inspecting the new tag on both
+  // registries after the merge. A login added here would make the check pass
+  // for a private package and defeat it.
+  test('lazy-runner-verify runs logged out against both registries', () => {
+    const job = loadWorkflow().jobs['lazy-runner-verify'];
+    expect(job).toBeDefined();
+    expect([job.needs].flat()).toEqual(expect.arrayContaining(['lazy-runner-build', 'lazy-runner']));
+    const steps = job.steps ?? [];
+    expect(steps.some((s) => s.uses?.startsWith('docker/login-action'))).toBe(false);
+    const script = steps.map((s) => s.run ?? '').join('\n');
+    expect(script).toContain('DOCKER_CONFIG=');
+    expect(script).toContain('docker manifest inspect');
+    expect(script).toContain('ghcr.io/getlazy/lazy-runner:');
+    expect(script).toContain('docker.io/getlazy/lazy-runner:');
+  });
 });

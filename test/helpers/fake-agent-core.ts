@@ -45,6 +45,7 @@ export interface FakeAgentBinary {
 /** Record of one fake-agent invocation, as written to invocations.jsonl. */
 export interface FakeAgentInvocation {
   argv: string[];
+  stdin?: string;
   cwd: string;
   /** Epoch ms when the invocation started. */
   at: number;
@@ -235,7 +236,7 @@ try {
 
 fs.appendFileSync(
   invocationsPath,
-  JSON.stringify({ argv, cwd: process.cwd(), at: Date.now(), pid: process.pid, env: recordedEnv }) + '\n',
+  JSON.stringify({ argv, ...(typeof recordedStdin === 'string' ? { stdin: recordedStdin } : {}), cwd: process.cwd(), at: Date.now(), pid: process.pid, env: recordedEnv }) + '\n',
 );
 
 function loadScenario() {
@@ -276,6 +277,11 @@ function runCommit(step) {
   if (add.status !== 0) {
     throw new Error(FAKE_LABEL + ': git add failed: ' + (add.stderr || '').toString());
   }
+  // The scenario's files are already committed: a turn re-running work that an
+  // earlier launch of the same turn landed (a supervisor retry before a daemon
+  // restart reaped it, then the auto-resume) finds nothing to do, as a real
+  // agent would; git commit would exit 1 on the empty index and fake a crash.
+  if (spawnSync('git', ['diff', '--cached', '--quiet'], { cwd: process.cwd() }).status === 0) return;
   const commit = spawnSync('git', ['commit', '-m', step.message], { cwd: process.cwd() });
   if (commit.status !== 0) {
     throw new Error(FAKE_LABEL + ': git commit failed: ' + (commit.stderr || '').toString());
@@ -293,6 +299,15 @@ async function main() {
         break;
       case 'sleep':
         await sleep(step.ms);
+        break;
+      case 'hold-while-file':
+        // Keep the turn RUNNING until the test removes the file: the seam for
+        // "something happens while this task's turn is live" (an MCP call the
+        // daemon accepts only from a live turn). Bounded so a test that forgets
+        // to release cannot wedge a run forever.
+        for (const deadline = Date.now() + (step.maxMs || 120000); fs.existsSync(step.path) && Date.now() < deadline;) {
+          await sleep(100);
+        }
         break;
       case 'commit':
         runCommit(step);

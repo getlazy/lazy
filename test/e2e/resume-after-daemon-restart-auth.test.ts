@@ -65,9 +65,14 @@ describe('a turn resumed after a daemon restart keeps working auth', () => {
     baseDir = await makeDaemonBaseDir();
     unpin = pinDaemonBaseDir(baseDir);
     ctx = await setupTestLazy({ fakeClaude: true });
+    // This test resolves placeholders IN ITS OWN PROCESS (createSessionCredentialResolver
+    // loads the project config), and the fake-binary project runs the host-process
+    // runner, which only the harness's child processes are allowed by default.
+    process.env.LAZY_ALLOW_HOST_RUNNER = '1';
   });
 
   afterEach(async () => {
+    delete process.env.LAZY_ALLOW_HOST_RUNNER;
     await ctx.cleanup();
     // AFTER cleanup: the daemon pidfile is resolved from this variable.
     unpin();
@@ -78,11 +83,15 @@ describe('a turn resumed after a daemon restart keeps working auth', () => {
   test('the resumed agent holds a placeholder the new daemon still resolves', async () => {
     // Team mode: at least one real per-user credential, plus the service
     // credential every system-initiated turn (auto-resume, sync) runs on.
-    await putUserCredential(ctx.root, { userId: 'alice', kind: 'oauth', token: ALICE_TOKEN });
+    // The service record must NAME its holder (`ownerEmail`), whose own
+    // connection then pays for those turns — an anonymous service record
+    // leaves the daemon with no holder and every automated turn refused.
+    await putUserCredential(ctx.root, { userId: 'alice@example.com', kind: 'oauth', token: ALICE_TOKEN });
     await putUserCredential(ctx.root, {
       userId: SERVICE_CREDENTIAL_USER_ID,
       kind: 'oauth',
       token: SERVICE_TOKEN,
+      ownerEmail: 'alice@example.com',
     });
 
     await ctx.recordClaudeEnvKeys(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']);

@@ -11,6 +11,8 @@ import type { SystemMessage, TokenUsage } from '../types';
 import { isTerminalStatus } from '../types';
 import { shortMessageId, SYSTEM_MESSAGE_KIND_MEANING } from '../messages';
 import { renderMarkdown, type RenderMarkdownOptions } from './markdown';
+import { copyMarkdownButtonHtml, copyMarkdownScript, renderMarkdownWithCopy } from './copy-markdown';
+import { foldCaption, foldTurn } from '../task/wrapper-fold';
 import { raisedDisplayBody } from '../raised/content';
 import { raisedDecisionBadgeHtml, raisedGateBadgeHtml } from './raised-badges';
 import { attributionLabel } from '../actor-ref';
@@ -77,10 +79,12 @@ import { availableTaskVerbs, type TaskLifecycleVerb } from './task-verbs';
 import { stoppableClaimOf } from '../daemon/in-flight-turn';
 import { actionDialogButtonHtml, actionDialogTemplateHtml } from './action-dialog';
 import { resolveTaskForgeLink, taskForgeIconHtml } from '../task-forge-link';
+import { remotePrUrl } from '../task/remote-pr';
 import { isLinkedTask, formatLinkedMarker } from '../task/linked';
 import type { TaskLinkDraft } from './task-link-form';
 import { reviewReportHtml } from './review-findings';
 import { usagePausePastCheckboxHtml } from './usage-pause-banner';
+import { runnerImageConfirmCheckboxHtml } from './runner-image-banner';
 
 function linkedBadgeHtml(task: Task): string {
   const marker = formatLinkedMarker(task);
@@ -463,6 +467,7 @@ export function layoutCloseHtml(options?: { mermaid?: boolean }): string {
   ${modifierKeyScript()}
   ${commandPaletteScript()}
   ${relativeTimeScript()}
+  ${copyMarkdownScript()}
   ${options?.mermaid ? mermaidEnhanceScript() : ''}
 </body>
 </html>`;
@@ -726,6 +731,7 @@ export function taskActionRowHtml(
       <form method="post" action="${action('start')}" class="lz-action-form" data-lz-action-form>
         <p>Start this task? The agent will take a first turn.</p>
         ${usagePausePastCheckboxHtml(usagePaused)}
+        ${runnerImageConfirmCheckboxHtml(task)}
         <div class="rv-form-actions"><button type="submit" class="btn btn-primary">Start</button></div>
       </form>`));
   }
@@ -735,6 +741,7 @@ export function taskActionRowHtml(
       <form method="post" action="${action('resume')}" class="lz-action-form" data-lz-action-form>
         <p>Resume the agent with no new feedback.</p>
         ${usagePausePastCheckboxHtml(usagePaused)}
+        ${runnerImageConfirmCheckboxHtml(task)}
         <div class="rv-form-actions"><button type="submit" class="btn">Resume</button></div>
       </form>`));
   }
@@ -888,9 +895,12 @@ function turnHeadHtml(
   const usageInfo = turn.usage
     ? ` <span class="turn-tokens" title="${escapeHtml(turnUsageTitle(turn.usage))}">${escapeHtml(formatTokenCount(totalInputTokens(turn.usage)))} in, ${escapeHtml(formatTokenCount(turn.usage.outputTokens))} out</span>`
     : '';
-  const authorLabel = turn.role === 'human' && turn.actor && turn.actor !== 'human'
-    ? turn.actor
-    : turn.role;
+  // A failure notice (Turn.failure) is lazy's, never the agent's answer.
+  const authorLabel = turn.failure
+    ? 'lazy'
+    : turn.role === 'human' && turn.actor && turn.actor !== 'human'
+      ? turn.actor
+      : turn.role;
   const autoBadge = turn.auto_triggered ? ` <span class="turn-auto">auto</span>` : '';
   // On the HEAD, for the same reason the model warning is: a reviewer scanning
   // collapsed turns has to be able to see that one of them ended with work
@@ -960,6 +970,26 @@ function turnUsageTitle(usage: TokenUsage): string {
 }
 
 /**
+ * A turn's body with lazy's own wrapper folded into one closed drawer, the
+ * turn's own text on top (src/task/wrapper-fold.ts). A turn with nothing of
+ * lazy's in it renders exactly as before. Copy still copies the whole turn.
+ */
+export function foldedTurnBodyHtml(turn: Turn, markdown?: RenderMarkdownOptions): string {
+  const raw = turnText(turn);
+  const fold = foldTurn(turn);
+  if (!fold) return renderMarkdownWithCopy(raw, markdown);
+  const drawer = fold.segments
+    .filter((s) => s.kind === 'lazy')
+    .map((s) => `<div class="lz-lazy-fold-part" data-fold-label="${escapeHtml(s.label ?? '')}">${renderMarkdown(s.text, markdown)}</div>`)
+    .join('');
+  const primary = fold.primary.trim()
+    ? `<div class="lz-turn-primary">${renderMarkdown(fold.primary, markdown)}</div>`
+    : '';
+  return copyMarkdownButtonHtml(raw) + primary +
+    `<details class="lz-lazy-fold"><summary>${escapeHtml(foldCaption(fold))}</summary>${drawer}</details>`;
+}
+
+/**
  * One turn INSIDE its chunk.
  *
  * Deliberately not an `rv-viewable` card: the chunk is the unit of review now,
@@ -976,7 +1006,7 @@ function chunkTurnHtml(
   turnCommits?: Commit[],
   duplicatedCodes?: ReadonlySet<string>,
 ): string {
-  const preview = renderMarkdown(turnText(turn), markdown);
+  const preview = foldedTurnBodyHtml(turn, markdown);
   // `reviewReportHtml` composes `/tasks/${taskId}/...` itself, so it takes the
   // BARE segment — a full path here doubles into /tasks//tasks/...
   const body = turn.review
@@ -1049,7 +1079,7 @@ export function commentCardHtml(
     content: comment.content,
     id: `comment-${comment.id}`,
     headHtml: `<span class="note-date">${commentNoteHead(comment)}</span>${extraHeadHtml}`,
-    bodyHtml: renderMarkdown(comment.content, markdown),
+    bodyHtml: renderMarkdownWithCopy(comment.content, markdown),
     sectionClass: 'note',
     bodyClass: 'note-content turn-content',
   });
@@ -1097,7 +1127,7 @@ export function journalCardHtml(entry: JournalEntry, markdown?: RenderMarkdownOp
     content: entry.content,
     id: `journal-${entry.id}`,
     headHtml: `<span class="note-date">${journalNoteHead(entry)}</span>`,
-    bodyHtml: renderMarkdown(entry.content, markdown),
+    bodyHtml: renderMarkdownWithCopy(entry.content, markdown),
     sectionClass: 'note',
     bodyClass: 'note-content turn-content',
   });
@@ -1127,20 +1157,22 @@ function foldedItemHtml(
       return chunkNoteHtml(
         `comment-${item.comment.id}`,
         `<span class="note-date">${commentNoteHead(item.comment)}</span>`,
-        renderMarkdown(item.comment.content, markdown),
+        renderMarkdownWithCopy(item.comment.content, markdown),
       );
     case 'journal':
       return chunkNoteHtml(
         `journal-${item.journal.id}`,
         `<span class="note-date">${journalNoteHead(item.journal)}</span>`,
-        renderMarkdown(item.journal.content, markdown),
+        renderMarkdownWithCopy(item.journal.content, markdown),
       );
   }
 }
 
 /** First meaningful line of a turn, for the chunk heading's intent. */
 export function chunkIntentLine(turn: Turn, limit = 140): string {
-  const raw = turnText(turn);
+  // The turn's own words, never lazy's wrapper: a cluster turn's first line is
+  // its constraints heading, which says nothing about this chunk.
+  const raw = foldTurn(turn)?.primary ?? turnText(turn);
   const line = raw
     .split('\n')
     .map((l) => l.replace(/^[\s>#*\-`]+/, '').trim())
@@ -1369,7 +1401,7 @@ export function taskRaisedSectionHtml(
       (item.comments && item.comments.length > 0
         ? ` <span class="text-muted">${item.comments.length} agent comment${item.comments.length === 1 ? '' : 's'}</span>`
         : ''),
-    bodyHtml: renderMarkdown(raisedDisplayBody(item), markdown),
+    bodyHtml: renderMarkdownWithCopy(raisedDisplayBody(item), markdown),
     sectionClass: 'note',
     bodyClass: 'note-content turn-content',
   })).join('');
@@ -1545,6 +1577,7 @@ export function taskDetailHtml(
       <div class="task-signal-meta">
         ${statusBadge(status)}
         ${parentHtml}
+        ${remotePrUrl(task) ? `<a href="${escapeHtml(remotePrUrl(task)!)}" target="_blank" rel="noopener noreferrer">PR / MR ↗</a>` : ''}
       </div>
     </div>
     ${activity ? reviewActivityCardHtml(activity, taskPathSegment(task)) : ''}
@@ -1642,7 +1675,7 @@ export function promptVersionHtml(
         key: `prompt:${version ? `v${version.version}` : 'current'}`,
         content: promptContent,
         headHtml: `Prompt ${escapeHtml(title)}`,
-        bodyHtml: renderMarkdown(promptContent, markdown),
+        bodyHtml: renderMarkdownWithCopy(promptContent, markdown),
         bodyClass: 'turn-content',
       })}
     </div>
@@ -1653,7 +1686,7 @@ export function promptVersionHtml(
 /**
  * What the human typed, echoed straight back into the form.
  *
- * CLAUDE.md's "never lose human feedback" applies to a rewritten prompt as much
+ * AGENTS.md's "never lose human feedback" applies to a rewritten prompt as much
  * as to review feedback: when the save fails, the page re-renders from THIS,
  * not from storage, so a paragraph someone just wrote is never replaced by the
  * old text they were replacing.
@@ -2276,7 +2309,7 @@ export function searchResultsHtml(
   const resultItems = results.map(r => {
     const href = searchResultHref(r, duplicatedCodes);
     const rDisplayId = r.task_code
-      ?? (r.entity_type === 'conversation' || r.entity_type === 'memory'
+      ?? (r.entity_type === 'conversation' || r.entity_type === 'memory' || r.entity_type === 'message'
         ? shortId(r.entity_id)
         : shortId(r.task_id));
     // A turn hit knows its sequence, and the turn detail route is keyed by
@@ -2289,6 +2322,7 @@ export function searchResultsHtml(
     return `
     <div class="search-result">
       ${typeLabel}
+      ${r.matched_id ? `<code class="search-result-id">${escapeHtml(shortId(r.entity_id))}</code>` : ''}
       <a href="${escapeHtml(href)}">${escapeHtml(rDisplayId)}</a>
       &mdash; ${escapeHtml(r.task_goal)}
       <div class="search-result-context">${escapeHtml(r.match_context)}</div>
@@ -2363,6 +2397,8 @@ export interface DashboardStats {
    * Empty when there is nothing to say or the daemon did not supply it.
    */
   usagePauseHtml?: string;
+  /** Pre-rendered project runner-image line (src/server/runner-image-banner.ts). */
+  runnerImageHtml?: string;
   tokenBudgetHtml?: string;
 }
 
@@ -2878,6 +2914,7 @@ export function dashboardHtml(
     <h1>Dashboard</h1>
     ${statCards}
     ${stats.usagePauseHtml ?? ''}
+    ${stats.runnerImageHtml ?? ''}
     ${unreadMessagesSection(stats.unreadMessages)}
     ${activityHeatmapSectionHtml(stats.activityData)}
     ${usageSummary}

@@ -59,9 +59,15 @@ const TYPE_TIERS: Record<SearchResult['entity_type'], number> = {
   conversation: 6,
   memory: 7,
   scratch: 8,
+  // Id-addressed entities with no text tier of their own; they only appear as
+  // id hits, which rank above every tier anyway.
+  review_comment: 9,
+  artifact: 10,
+  message: 11,
+  journal: 12,
 };
 
-const UNKNOWN_TYPE_TIER = TYPE_TIERS.scratch + 1;
+const UNKNOWN_TYPE_TIER = TYPE_TIERS.journal + 1;
 
 const STRENGTH_EXACT = 0;
 const STRENGTH_PREFIX = 1;
@@ -171,7 +177,8 @@ export function rankSearchResults(results: SearchResult[], literalTerms: string[
       return {
         row,
         index,
-        tier: TYPE_TIERS[row.entity_type] ?? UNKNOWN_TYPE_TIER,
+        // An id hit is the entity the human named: above every text tier.
+        tier: row.matched_id ? -1 : (TYPE_TIERS[row.entity_type] ?? UNKNOWN_TYPE_TIER),
         strength,
         time: row.entity_time ?? 0,
       };

@@ -108,6 +108,8 @@ Pre-conditions:
   - Task must be in blocked or conflict status
   - Task must have at least one commit (non-empty diff)
   - A remote driver must be configured (e.g., [remote] driver = "github" in lazy.toml)
+    (a repository Lazy Teams hosts has no pull requests: review happens in
+    Teams, and accept pushes the target branch to origin)
 
 Notes:
   - A subtask integrates into its parent task's branch, and lazy never opens

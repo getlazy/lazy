@@ -128,7 +128,7 @@ describe('checkClusterFixRoundBudget', () => {
 
   // INVARIANT: a HUMAN unblock is never refused, at any count. It carries
   // feedback somebody has already typed, and refusing it discards that
-  // (CLAUDE.md, "Never Lose Human Feedback"). A human taking over also starts a
+  // (AGENTS.md, "Never Lose Human Feedback"). A human taking over also starts a
   // fresh budget — the same human-intervention rule every other counter uses.
   test('a human unblock is never refused and resets the budget', async () => {
     const storage = makeStorage(clusterParent);

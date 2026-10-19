@@ -14,6 +14,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import {
   admitOneshotCommand,
+  admitInteractiveSession,
   assertBesideLaunchAllowed,
   besideSpendCredential,
   oneshotAllowanceValid,
@@ -160,6 +161,39 @@ describe('usage pause beside a task: one-shot commands and the dashboard compact
     setUsagePauseOverride(0);
     await expect(admitOneshotCommand(root, 'agent')).rejects.toThrow(/paused/);
     expect(getUsagePauseOverride()).toBe(0);
+  });
+
+  test('an explicit one-shot override admits one command without altering daemon settings', async () => {
+    await pause();
+    const allowance = await admitOneshotCommand(root, 'human', Date.now(), true);
+    expect(oneshotAllowanceValid(allowance)).toBe(true);
+    expect(getUsagePauseOverride()).toBeNull();
+    await expect(admitOneshotCommand(root, 'human')).rejects.toThrow(/paused/);
+    await expect(admitOneshotCommand(root, 'agent', Date.now(), true)).rejects.toThrow(/Only a person/);
+  });
+
+  test('explicit chat, branchless pair and builder overrides admit only the requested session', async () => {
+    await pause();
+    const storage = {} as Storage;
+    for (const surface of ['chat', 'pair', 'builder'] as const) {
+      await expect(admitInteractiveSession(root, storage, { surface, actor: 'human' })).rejects.toThrow(/paused/);
+      await admitInteractiveSession(root, storage, { surface, actor: 'human', overrideUsagePause: true });
+      await expect(admitInteractiveSession(root, storage, { surface, actor: 'agent', overrideUsagePause: true })).rejects.toThrow(/Only a person/);
+    }
+    expect(getUsagePauseOverride()).toBeNull();
+  });
+
+  test('pairing on a task overrides that task credential without granting another turn', async () => {
+    await pause();
+    const task = { id: 'paired-task', code: 'paired-task', agent_id: 'claude-code' };
+    const storage = { resolveTask: async () => ({ task }) } as unknown as Storage;
+    await expect(admitInteractiveSession(root, storage, { surface: 'pair', taskId: task.id, actor: 'human' }))
+      .rejects.toThrow(/--override-usage-pause/);
+    await admitInteractiveSession(root, storage, {
+      surface: 'pair', taskId: task.id, actor: 'human', overrideUsagePause: true,
+    });
+    await expect(admitInteractiveSession(root, storage, { surface: 'pair', taskId: task.id, actor: 'human' }))
+      .rejects.toThrow(/paused/);
   });
 
   // INVARIANT: the dashboard's compact button reaches the SAME compact path as

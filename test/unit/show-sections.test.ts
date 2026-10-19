@@ -1,7 +1,7 @@
 /**
  * The derived answers `show` serves, so no client re-derives them.
  *
- * Three rules each live in exactly one function (CLAUDE.md): the notes cutoff,
+ * Three rules each live in exactly one function (AGENTS.md): the notes cutoff,
  * the review-chunk boundary, and which reviews count. These tests pin the
  * PROJECTIONS that carry those answers over the wire — the point of the module
  * is that a remote surface never has to hold a second copy of the rule, so each

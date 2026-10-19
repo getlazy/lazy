@@ -27,13 +27,15 @@
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { mkdtemp, rm, mkdir, writeFile, realpath, readdir } from 'fs/promises';
+import { mkdtemp, rm, mkdir, writeFile, readFile, realpath, readdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, resolve } from 'path';
 import { tmpdir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectOutputExcludes } from '../helpers/assertions';
 import { makeDaemonBaseDir, removeDaemonBaseDir } from '../helpers/daemon-base-dir';
+import { projectSlug } from '../../src/daemon/paths';
+import { setCredential } from '../../src/credentials/store';
 
 const FAKE_DAEMON = resolve(__dirname, '../helpers/fake-daemon-driver.ts');
 
@@ -176,7 +178,7 @@ describe('lazy daemon list / kill-stray', () => {
     await new Promise(r => setTimeout(r, 200));
 
     // INVARIANT: a daemon whose project root STILL exists is never killed
-    // (CLAUDE.md principle of least surprise — kill-stray reaps only strays).
+    // (AGENTS.md principle of least surprise — kill-stray reaps only strays).
     expect(isAlive(livePid)).toBe(true);
     expect(existsSync(liveDir)).toBe(true);
 
@@ -218,6 +220,49 @@ describe('lazy daemon list / kill-stray', () => {
 
     await rm(liveRoot, { recursive: true, force: true });
   });
+
+  // INVARIANT: credentials belong to the project, not its running daemon.
+  // Pruning runtime state must preserve the index, secrets, legacy keys and
+  // unknown persistent data, even when the project's root no longer exists.
+  for (const missingRoot of [false, true]) {
+    test(`kill-stray preserves stored credentials (${missingRoot ? 'stray' : 'stopped existing project'})`, async () => {
+      const root = missingRoot ? join(baseDir, 'missing-project') : ctx.root;
+      const previousBaseDir = process.env.LAZY_DAEMON_BASE_DIR;
+      process.env.LAZY_DAEMON_BASE_DIR = baseDir;
+      try {
+        await setCredential(root, { provider: 'cursor', kind: 'api-key', secret: 'test-prune-cursor-secret' }, 'file');
+      } finally {
+        if (previousBaseDir === undefined) delete process.env.LAZY_DAEMON_BASE_DIR;
+        else process.env.LAZY_DAEMON_BASE_DIR = previousBaseDir;
+      }
+      const slug = projectSlug(root);
+      const dir = missingRoot
+        ? (await fabricateLiveDaemon(baseDir, slug, root)).dir
+        : await fabricateDaemon(baseDir, slug, { pid: 2 ** 22, root });
+      await writeFile(join(dir, 'agent-credentials.json'), JSON.stringify({ cursor: { api_key: 'legacy-cursor-key' } }));
+      await writeFile(join(dir, 'user-credentials.json'), '{"member":"secret"}');
+      await mkdir(join(dir, 'future-persistent-data'));
+      await writeFile(join(dir, 'future-persistent-data', 'secret'), 'keep');
+      const persistentFiles = ['credential-index.json', 'credentials.json', 'agent-credentials.json', 'user-credentials.json', 'future-persistent-data/secret'];
+      const before = await Promise.all(persistentFiles.map(file => readFile(join(dir, file), 'utf-8')));
+      await writeFile(join(dir, 'daemon.log'), 'old runtime log');
+      await writeFile(join(dir, 'token'), 'old runtime token');
+
+      const result = await lazyDaemon(['kill-stray', '--yes', '--prune-dirs']);
+      expectSuccess(result);
+      expect(await Promise.all(persistentFiles.map(file => readFile(join(dir, file), 'utf-8')))).toEqual(before);
+      expect(existsSync(join(dir, 'lazy.pid'))).toBe(false);
+      expect(existsSync(join(dir, 'daemon.log'))).toBe(false);
+      expect(existsSync(join(dir, 'token'))).toBe(false);
+      if (!missingRoot) {
+        const listed = await ctx.lazy(['auth', 'list'], { env: { LAZY_DAEMON_BASE_DIR: baseDir } });
+        expectSuccess(listed);
+        expectOutput(listed, 'cursor');
+      }
+      expectSuccess(await lazyDaemon(['kill-stray', '--yes', '--prune-dirs']));
+      expect(await Promise.all(persistentFiles.map(file => readFile(join(dir, file), 'utf-8')))).toEqual(before);
+    });
+  }
 
   // INVARIANT: a pid alone never proves a daemon is running — the OS recycles
   // pids. A months-dead state dir whose recorded pid now belongs to an

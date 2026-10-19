@@ -19,6 +19,7 @@
  *                                  mutations go through /rpc//mcp handlers)
  */
 
+import { deleteLegacyAgentCredentials } from '../agent/credentials';
 import { daemonStatusBuild, runningBuildIdentity } from '../utils/build-provenance';
 import { ensureLazyExcludeBestEffort } from '../git/lazy-exclude';
 import { randomUUID } from 'crypto';
@@ -37,11 +38,19 @@ import { readProjectInstanceId } from './project-instance';
 import { recordStartupCredentialProblem, warnMissingTurnCredentials } from './credential-gate';
 import { assertStoredCredentialsReachedEnv, hydrateCredentialEnv } from '../credentials/hydrate';
 import { teamModeEnabled } from './user-credentials';
-import { handleRpc, handleBuilderStorageCall, handleGetBuilderLaunchEnv, handleGetAgentLaunchEnv, openProjectStorage, initDaemonStorage, getOrCreateStorage, closeAllStorage, storeAvailability } from './rpc-handlers';
+import { startGuestDockerdWatchdog, setGuestDockerdReporter, fileGuestDockerdEvent } from './guest-dockerd';
+import { setDamagedImageReporter } from '../docker/damaged-image';
+import { recordDamagedImageRepair } from './damaged-image-record';
+import { setMachineIntegrityReporter, fileIntegrityAlert, onImageBuildSucceeded } from './machine-integrity';
+import { onContainerBuildSucceeded } from '../capture/build-observer';
+import { handleRpc, handleBuilderStorageCall, handleGetBuilderLaunchEnv, handleGetAgentLaunchEnv, handleClaimAgentPendingNotes, openProjectStorage, initDaemonStorage, getOrCreateStorage, closeAllStorage, storeAvailability, storeOpeningStage, daemonStoreLockPath } from './rpc-handlers';
+import { boundedStep, STATUS_STEP_DEADLINE_MS, collectWedgeReport, describeLockHolderBounded, logWedgeIfStuck, loopWedgeViews, trackRequest } from './wedge-report';
 import { lookupMcpIdentity } from './mcp-tokens';
 import { primeTaskEnvRedaction } from './task-env';
+import { primeTaskFilesRedaction } from './task-files';
+import { primeTaskEnvSeedRedaction } from './task-env-seed';
 import { initTracing, shutdownTracing } from '../tracing';
-import { withRequestSpan } from './request-span';
+import { daemonRouteTemplate, withRequestSpan } from './request-span';
 import { authorizeMcpCall, handleMcpToolCall, httpStatusForError, parseMcpToolCallBody } from './mcp-routes';
 import { resolveRpcActor, rpcAuthErrorMessage, describeActor } from './rpc-auth';
 import type { ActorIdentity } from './actor-tokens';
@@ -84,6 +93,9 @@ import {
 } from './restart-reaper';
 import { createRunner } from '../runner';
 import { startLaunchWarmup } from './launch-warmup';
+import { startRunnerImageBoot } from './runner-image';
+import { recordTaskLaunchImage } from './runner-image-choice';
+import { registerLaunchImageRecorder } from '../capture/custom-image-gate';
 import { settleDeadBuilderSessions } from './builder-sessions';
 import { indexRunsByName, type OwnedRuns } from '../runner/run-ownership';
 import type { Storage } from '../storage/interface';
@@ -107,6 +119,7 @@ import { createMemoryActions } from './memory-service';
 import { createDoctorActions } from './doctor-service';
 import { createServeActions } from './serve-service';
 import { importStartServicesCmdFromConfig } from '../serve/start-cmd';
+import { pinUnstartedTaskRefs } from '../task/pin-unstarted-refs';
 import { createTaskEditActions } from './task-edit-service';
 import { dashboardHostFor, resolveDashboardUrl } from './dashboard-url';
 import { isManagedMode } from '../config/managed';
@@ -122,11 +135,18 @@ import type { RunnerType } from '../config/types';
 import { DEFAULT_WEB_PORT, DEFAULT_SERVER_BIND, MAX_PORT_ATTEMPTS } from '../config/constants';
 import { buildProxyCredentialDeps } from '../proxy/credential-deps';
 import { agentUpstreamMap } from '../proxy/agent-upstreams';
+import { createTierServedRecorder, recordTierSwitch, tieredHistoryCrossed } from './tier-switch-record';
+import { recordBuilderTierSwitch } from './builder-tier';
+import { prepareTierUsageReadings } from './usage-readings';
+import { createLiveProxyRouting } from './live-proxy-routing';
 import { ProxyToolStatsRecorder } from '../proxy/tool-stats';
+import { ProxyTurnLatencyRecorder, setActiveTurnLatencyRecorder, getActiveTurnLatencyRecorder } from '../proxy/turn-latency-recorder';
+import { REPOSITORY_PLUGINS_NOT_RUN, repositoryPluginsDisabled } from '../config/managed-repo-code';
 import {
   createProxyServer,
   type ProxyServer,
   loadProxyRequestPlugins,
+  listRepositoryPluginFiles,
   PLUGIN_DIR_RELATIVE,
   ProxyAuditLog,
   auditLogPath,
@@ -141,6 +161,7 @@ import { createSessionCredentialResolver } from './turn-credentials';
 import { resolveDaemonBindHosts, resolveProxyBindHosts } from './bind-hosts';
 import { pushBranchAfterStateChange, retryFailedPushes } from './push';
 import { setDaemonContext, setDaemonDashboardUrl, setDaemonProxyPort } from './context';
+import { markStartupComplete, resetStartupPhase, setStartupPhase, startupPhaseView, startupStep } from './startup-phase';
 import {
   autoUnblockTask,
   createReconcileEventState,
@@ -155,7 +176,7 @@ import { runAutoReviewCatchup } from './auto-review';
 import { processAutoResumeQueue } from './auto-resume-queue';
 import { describeUsagePauseState, processUsagePauseHolds } from './usage-pause';
 import { flushUsageReadingWrites, installUsageReadingStore } from './usage-readings';
-import { resumeHeldReviewFix } from './task-lifecycle';
+import { resumeHeldReviewFix, processRunnerImageHeldRestores } from './task-lifecycle';
 import { closeSignalDb, initSignalDb } from './signals';
 import { startSyncRetryLoop } from './sync-retry';
 import { sweepConversations, createSweepCursor } from '../import/capture-sweep';
@@ -352,6 +373,13 @@ async function loadDaemonConfigOrFail(projectRoot: string) {
  * serves daemon routes AND the web dashboard). Returns the running server
  * handle for lifecycle management.
  */
+/**
+ * How long `/daemon/status` waits for the source identity. Longer than the
+ * other steps' STATUS_STEP_DEADLINE_MS because it is never a wedge — local file
+ * reads, started at boot — and leaving it out is read by Lazy Teams as "stale".
+ */
+const SOURCE_ID_STEP_DEADLINE_MS = 10_000;
+
 export async function startDaemonServer(options: DaemonServerOptions): Promise<RunningDaemon> {
   // Mark this process as the daemon to prevent recursive RPC calls
   process.env.LAZY_IS_DAEMON = '1';
@@ -396,6 +424,17 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   }
 
   logger.info(`Daemon starting for project: ${projectRoot} (PID ${process.pid})`);
+
+  // The identity of the code this daemon runs, STARTED now rather than on the
+  // first `/daemon/status`. Cold, it reads every source file; under load that
+  // missed the status route's per-step deadline, the id was left out, and Lazy
+  // Teams reads a missing id as STALE — so a freshly started daemon could be
+  // rolled again for being itself. Not awaited (it would delay every start by
+  // the hash); the status route awaits the shared in-flight computation under
+  // its own, longer bound (SOURCE_ID_STEP_DEADLINE_MS).
+  void import('../utils/source-id').then((m) => m.getSourceIdentity()).catch((err) => {
+    logger.warn(`Could not start computing this daemon's source identity: ${err instanceof Error ? err.message : err}`);
+  });
 
   // Singleton enforcement via flock(2) — FIRST, before anything touches this
   // project's store, its containers or its credentials.
@@ -467,6 +506,30 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // start, since nothing good has been read yet.
   enableDaemonLastKnownGood(() => getOrCreateStorage());
   const startupConfig = await loadDaemonConfigOrFail(projectRoot).catch((err) => { throw abandonEarlyStart(err); });
+  // A store restore running (or one that died half-way through its swap) owns
+  // the store: refuse before anything below can open or write it
+  // (src/storage/store-backup.ts, assertNoRestoreInProgress).
+  {
+    const { assertNoRestoreInProgress } = await import('../storage/store-backup');
+    const { resolveStorePath } = await import('../storage');
+    await assertNoRestoreInProgress(await resolveStorePath(projectRoot)).catch((err) => {
+      const message = `Not starting the daemon: ${err instanceof Error ? err.message : String(err)}`;
+      logger.error(message);
+      throw abandonEarlyStart(new Error(message));
+    });
+  }
+  await deleteLegacyAgentCredentials(projectRoot).catch((err) => { throw abandonEarlyStart(err); });
+  // A start on a different lazy version backs the store up BEFORE anything
+  // opens it, and refuses if it cannot (src/daemon/upgrade-store-backup.ts).
+  // Here: after the config precondition, before credential hydration, storage
+  // initialization and the upgrade notice that rewrites the version marker.
+  {
+    const { backupStoreIfVersionChanged } = await import('./upgrade-store-backup');
+    await backupStoreIfVersionChanged(projectRoot).catch((err) => {
+      logger.error(err instanceof Error ? err.message : String(err));
+      throw abandonEarlyStart(err);
+    });
+  }
   // What this daemon holds from its start, for `lazy daemon status` and
   // `lazy daemon reload` (src/daemon/config-status.ts).
   recordStartupSettings(startupConfig, 'startup');
@@ -499,6 +562,16 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   } catch (err) {
     logger.error(`Per-task env values are NOT being scrubbed from logs: ${err instanceof Error ? err.message : String(err)}`);
   }
+  try {
+    await primeTaskEnvSeedRedaction(projectRoot);
+  } catch (err) {
+    logger.error(`The new-task environment's values are NOT being scrubbed from logs: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  try {
+    await primeTaskFilesRedaction(projectRoot);
+  } catch (err) {
+    logger.error(`Per-task secret file contents are NOT being scrubbed from logs: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   // Say which lazy this is, in the log, at the top, every time.
   //
@@ -506,8 +579,8 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // failure that produced this line was invisible precisely because nothing
   // anywhere stated the answer: a daemon built from one ref silently did not
   // render a feature that existed only on another, and it read as a lost
-  // feature rather than a version mismatch. Fire-and-forget so a slow
-  // filesystem cannot delay the listen; the fingerprint is ~90ms of reading.
+  // feature rather than a version mismatch. It shares the identity computation
+  // started at the top of startup, so it hashes nothing twice.
   void (async () => {
     try {
       const { getSourceIdentity } = await import('../utils/source-id');
@@ -572,6 +645,12 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // so a pause survives a restart after the audit log rotated its reading away.
   installUsageReadingStore(getOrCreateStorage);
 
+  // Every task launch records the image it resolved, so the default-image
+  // banner is derived from what ran (src/daemon/runner-image-choice.ts).
+  registerLaunchImageRecorder(async (taskId, imageName, kind, containerName) => {
+    await recordTaskLaunchImage(await getOrCreateStorage(), taskId, imageName, kind, containerName);
+  });
+
   // Initialize request tracing (always on). Finished spans are persisted
   // through the daemon's own Storage as JSONL — no collector.
   initTracing('daemon', async (spans) => {
@@ -617,6 +696,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   }
 
   const startedAt = Date.now();
+  resetStartupPhase(startedAt);
   // A fresh record for `lazy daemon health`: an in-process restart must not
   // inherit the previous daemon's ticks as its own.
   forgetDaemonHealth(projectRoot);
@@ -711,6 +791,38 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // Start remote sync loop (independent from reconcile to avoid blocking task detection)
   const stopSyncLoop = startDaemonSyncLoop(projectRoot);
 
+  // What the daemon is waiting on, on demand and unprompted (src/daemon/wedge-report.ts).
+  // Armed here, before startup's own storage awaits, so a daemon that wedges
+  // while starting can still say why. SIGUSR2 logs the report now; the timer
+  // logs it once per loop tick that runs past WEDGE_LOG_AFTER_MS.
+  const logWedgeReport = () => {
+    logger.warn(`Daemon wedge report (SIGUSR2): ${JSON.stringify(collectWedgeReport(projectRoot, storeOpeningStage()))}`);
+    // Second, and on its own line: the lock file is on the store's filesystem,
+    // so it is read asynchronously under a deadline and may answer "not readable".
+    const lockPath = daemonStoreLockPath();
+    if (!lockPath) {
+      logger.warn('Daemon wedge report (SIGUSR2): storage lock holder: store never created, lock path unknown');
+      return;
+    }
+    void describeLockHolderBounded(lockPath).then(
+      (holder) => logger.warn(`Daemon wedge report (SIGUSR2): storage lock holder: ${JSON.stringify(holder)}`),
+      (err) => logger.warn(`Daemon wedge report (SIGUSR2): storage lock holder unreadable: ${err instanceof Error ? err.message : String(err)}`),
+    );
+  };
+  process.on('SIGUSR2', logWedgeReport);
+  const wedgeWatch = setInterval(() => {
+    try {
+      logWedgeIfStuck(projectRoot, () => storeOpeningStage());
+    } catch (err) {
+      logger.warn(`Daemon wedge watch failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, 15_000);
+  wedgeWatch.unref?.();
+  const stopWedgeWatch = () => {
+    clearInterval(wedgeWatch);
+    process.removeListener('SIGUSR2', logWedgeReport);
+  };
+
   // Start the live conversation capture sweep (host-side Claude sessions —
   // fidelity summaries, `lazy report`, memory compaction, a human's own
   // `claude` in the repo — plus a backstop for the in-container builder).
@@ -719,6 +831,24 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // Reclaim worktrees left behind on tasks that finished (accepted/closed/
   // rejected) but whose cleanup step never ran — see startTerminalWorktreeCleanupLoop.
   const stopWorktreeCleanupLoop = startTerminalWorktreeCleanupLoop(projectRoot);
+
+  // A Teams microVM's dockerd has no init system behind it: restart it when it
+  // dies, and file what happened where every surface shows it.
+  setGuestDockerdReporter(async (event) => {
+    await fileGuestDockerdEvent(await getOrCreateStorage(), event);
+  });
+  // A launch that repaired a damaged runner image (or could not) is recorded
+  // on the task and next to the machine's Docker events.
+  setDamagedImageReporter(async (event) => {
+    await recordDamagedImageRepair(await getOrCreateStorage(), event);
+  });
+  // Does the machine damage data by itself? A failing memory canary or image data
+  // check is an alert (src/daemon/machine-integrity.ts); a build that succeeds is audited.
+  setMachineIntegrityReporter(async (input) => {
+    await fileIntegrityAlert(await getOrCreateStorage(), input);
+  });
+  const stopIntegrityBuildAudit = onContainerBuildSucceeded(onImageBuildSucceeded);
+  const stopGuestDockerdWatchdog = startGuestDockerdWatchdog();
 
   // Periodic `daemon.health` tick for SSE subscribers. The timer no-ops while
   // nobody is subscribed, so it costs nothing on a daemon with no listener.
@@ -785,6 +915,10 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   //                                           of magnitude under the timeout, and
   //                                           its CLIENT gives up first anyway
   //                                           (see fetchAgentLaunchEnv).
+  //   POST /agent/pending-notes    BOUNDED  — one token lookup, a task, session,
+  //                                           comment and turn read, loadConfig,
+  //                                           two small metadata/session writes.
+  //                                           Local file I/O only, no agent.
   //   GET  /rpc/events             STREAMED — see below.
   //   (no match) -> null -> 404    BOUNDED  — a constant JSON body, no I/O.
   //
@@ -848,13 +982,53 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     //     answers "still working on it" for two minutes is a probe that has
     //     already failed. If this route ever grows expensive work, the fix is to
     //     move that work behind a cache, not to frame it.
+    //
+    // (c) Every await below is a BOUNDED STEP (src/daemon/wedge-report.ts): it
+    //     gets STATUS_STEP_DEADLINE_MS (the source identity its own, longer bound), all run at once, and a step that
+    //     misses its deadline is left out of the answer and NAMED in `wedged`
+    //     instead of holding the response. A Teams daemon was found whose
+    //     timers fired while this route never answered; (a) is a claim about
+    //     what the steps do, and this is what holds when a dependency under
+    //     them stops answering anyway.
     if (url.pathname === '/daemon/status' && req.method === 'GET') {
       const uptime = Date.now() - startedAt;
-      let version = 'unknown';
-      try {
-        const mod = await import('../version');
-        version = mod.VERSION;
-      } catch { /* version file may not exist in tests */ }
+      const step = <T,>(label: string, fn: () => Promise<T>) => boundedStep(label, fn, STATUS_STEP_DEADLINE_MS, projectRoot);
+      const [versionStep, buildInfoStep, configStepResult, sourceIdStep, autoReactStep] = await Promise.all([
+        step('version', async () => (await import('../version')).VERSION),
+        step('build-info', () => import('../build-info')),
+        step('config', () => loadConfig(projectRoot)),
+        // Its own, longer bound: the hash is local file reads already in flight
+        // since startup, and a missing id makes Lazy Teams roll this daemon.
+        boundedStep('source-identity', async () => (await import('../utils/source-id')).getSourceIdentity(),
+          SOURCE_ID_STEP_DEADLINE_MS, projectRoot),
+        step('auto-react-budget', async (): Promise<AutoReactBudgetEntry[]> => {
+          const { readDailyBudget, effectiveDailyLimit, isGlobalAutoReactPaused } = await import('./auto-react-budget');
+          const { nextLocalMidnight } = await import('../utils/local-day');
+          const config = await loadConfig(projectRoot);
+          const dataDir = join(projectRoot, '.lazy');
+          const budget = await readDailyBudget(dataDir);
+          const limit = effectiveDailyLimit(budget, config.daemon.auto_react_daily_budget);
+          const pause = await isGlobalAutoReactPaused(dataDir);
+          return [{
+            project: projectRoot,
+            used: budget.used,
+            limit,
+            tasksAtLimit: cachedTasksAtLimit,
+            resetAt: nextLocalMidnight().getTime(),
+            paused: pause.paused,
+            pauseExpiresAt: pause.expiresAt,
+            capOverridden: budget.capOverride !== undefined,
+          }];
+        }),
+      ]);
+      const wedged: string[] = [];
+      for (const [label, step] of [
+        ['version', versionStep], ['build-info', buildInfoStep], ['config', configStepResult],
+        ['source-identity', sourceIdStep], ['auto-react-budget', autoReactStep],
+      ] as const) {
+        if (!step.ok && step.reason === 'timeout') wedged.push(label);
+      }
+      const version = versionStep.ok ? versionStep.value : 'unknown';
 
       // Build metadata embedded at compile time (UTC ISO string + git SHA +
       // dirty flag), or dev defaults when running from source (bun run
@@ -864,39 +1038,19 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       let buildDirty = false;
       let buildBranch = 'dev';
       let buildSourcePath = 'dev';
-      try {
-        const mod = await import('../build-info');
+      if (buildInfoStep.ok) {
+        const mod = buildInfoStep.value;
         buildTime = mod.BUILD_TIME;
         buildSha = mod.BUILD_SHA ?? 'dev';
         buildDirty = mod.BUILD_DIRTY ?? false;
         buildBranch = mod.BUILD_BRANCH ?? 'dev';
         buildSourcePath = mod.BUILD_SOURCE_PATH ?? 'dev';
-      } catch { /* build-info file may not exist in some contexts */ }
+      }
 
       // Auto-react budget: file-based read only (no storage, no lock).
       // tasksAtLimit is populated from a cache updated by the reconcile loop.
       let autoReactBudget: AutoReactBudgetEntry[] | undefined;
-      try {
-        const { readDailyBudget, effectiveDailyLimit, isGlobalAutoReactPaused } = await import('./auto-react-budget');
-        const { nextLocalMidnight } = await import('../utils/local-day');
-        const config = await loadConfig(projectRoot);
-        const dataDir = join(projectRoot, '.lazy');
-        const budget = await readDailyBudget(dataDir);
-        const limit = effectiveDailyLimit(budget, config.daemon.auto_react_daily_budget);
-        const pause = await isGlobalAutoReactPaused(dataDir);
-        autoReactBudget = [{
-          project: projectRoot,
-          used: budget.used,
-          limit,
-          tasksAtLimit: cachedTasksAtLimit,
-          resetAt: nextLocalMidnight().getTime(),
-          paused: pause.paused,
-          pauseExpiresAt: pause.expiresAt,
-          capOverridden: budget.capOverride !== undefined,
-        }];
-      } catch {
-        // Auto-react budget info is optional
-      }
+      if (autoReactStep.ok) autoReactBudget = autoReactStep.value;
 
       // Git SHA of the source the daemon is RUNNING (captured at startup, cached).
       // Lets `lazy daemon status` detect a stale daemon serving code older than
@@ -912,14 +1066,8 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       // release build with no `.git`. This is what Lazy Teams compares against
       // the tree it would launch the next daemon from, so a fleet can never
       // quietly serve old code — see src/utils/source-id.ts.
-      let sourceId: string | null = null;
-      let sourceIdKind: string | null = null;
-      try {
-        const { getSourceIdentity } = await import('../utils/source-id');
-        const identity = await getSourceIdentity();
-        sourceId = identity.id;
-        sourceIdKind = identity.kind;
-      } catch { /* identity is diagnostic; never block the health probe */ }
+      const sourceId: string | null = sourceIdStep.ok ? sourceIdStep.value.id : null;
+      const sourceIdKind: string | null = sourceIdStep.ok ? sourceIdStep.value.kind : null;
 
       // Proxy status — so `lazy daemon status` can show where audited traffic
       // flows (the primary way to find the address now that the port is
@@ -935,11 +1083,12 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         fallbacks: number;
         policyEnforce: boolean;
       } | undefined;
-      try {
-        // The running proxy's own values when it was built; the file only
-        // when no proxy was built (a degraded daemon), since then nothing runs.
-        const config = await loadConfig(projectRoot);
-        const view = runningProxyView ?? { bind: config.proxy.bind, upstream: config.proxy.upstream, fallbacks: config.proxy.fallbacks.length, policyEnforce: config.proxy.policy.enforce };
+      // The running proxy's own values when it was built; the file only
+      // when no proxy was built (a degraded daemon), since then nothing runs.
+      const view = runningProxyView ?? (configStepResult.ok
+        ? { bind: configStepResult.value.proxy.bind, upstream: configStepResult.value.proxy.upstream, fallbacks: configStepResult.value.proxy.fallbacks.length, policyEnforce: configStepResult.value.proxy.policy.enforce }
+        : undefined);
+      if (view) {
         // The proxy is always configured — `running` is the only question, and
         // `false` means a degraded daemon, not an operator's choice.
         const port = proxyServer?.port ?? null;
@@ -953,7 +1102,16 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
           fallbacks: view.fallbacks,
           policyEnforce: view.policyEnforce,
         };
-      } catch { /* proxy status is optional; never block the health probe */ }
+      }
+
+      const buildStep = await step('build', () =>
+        daemonStatusBuild(runningBuildIdentity, { buildSha, buildBranch, buildDirty }, codeSha));
+      if (!buildStep.ok && buildStep.reason === 'timeout') wedged.push('build');
+      // Loops whose tick has run past the wedge threshold, with the phase each
+      // is in — in-memory reads only. Present only when there is one.
+      const stuckLoops = loopWedgeViews(projectRoot).filter((l) => l.stalled);
+      const opening = storeOpeningStage();
+      const storeOpen = opening && opening.sinceMs > 10_000 ? opening : null;
 
       const storeDown = storeAvailability();
       return Response.json({
@@ -965,6 +1123,10 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         // learns "same daemon" vs "it restarted" without having to infer it
         // from pid (recycled) or uptime (only ever a heuristic).
         instanceId,
+        // What the daemon is doing while it starts (src/daemon/startup-phase.ts):
+        // a caller waiting on the task proxy shows this, and gives up only when
+        // it stops changing. In memory, so it can never wedge this answer.
+        startup: startupPhaseView(),
         // The project this daemon serves. Daemons for different projects share
         // one TCP port window, so a client that gets a 401 needs this to tell
         // "my token rotated" from "a foreign daemon took my port" — the latter
@@ -994,7 +1156,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         // notice read, so the three can never disagree.
         // Falls back to the build fields read above, so `build` can never be
         // null while buildSha/buildBranch say which build this is.
-        build: await daemonStatusBuild(runningBuildIdentity, { buildSha, buildBranch, buildDirty }, codeSha),
+        build: buildStep.ok ? buildStep.value : (buildSha !== 'dev' ? `${buildBranch}@${buildSha}, ${buildDirty ? 'dirty' : 'clean'}` : null),
         ...(sourceId ? { sourceId, sourceIdKind } : {}),
         webPort: boundWebPort,
         bindHost: boundBindHost,
@@ -1013,6 +1175,13 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         // storeAvailability. `unavailableForMs` is measured here, so a reader on
         // another clock (a VM guest's) need not compare timestamps across clocks.
         ...(storeDown ? { storeUnavailable: { since: new Date(storeDown.since).toISOString(), unavailableForMs: Date.now() - storeDown.since, error: storeDown.error } } : {}),
+        // Present only when something is stuck: the status steps that missed their
+        // deadline, loops that have completed no tick for longer than the wedge
+        // threshold plus two intervals (with the phase each is in; Teams restarts on it), and the store still opening. All in-memory; see (c) above
+        // and src/daemon/wedge-report.ts. SIGUSR2 logs the full report.
+        ...(wedged.length > 0 || stuckLoops.length > 0 || storeOpen
+          ? { wedged: { steps: wedged, loops: stuckLoops, ...(storeOpen ? { storeOpening: storeOpen } : {}) } }
+          : {}),
       });
     }
 
@@ -1075,6 +1244,9 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       }
 
       const mcpStart = Date.now();
+      // Effects a tool registered to follow a DELIVERED answer (lazy_wait's
+      // comment acknowledgement). Only the heartbeat path can observe delivery.
+      const afterDelivery: Array<() => Promise<void>> = [];
       // One source of truth for the outcome, used by both the plain and the
       // heartbeat-framed reply below. A tool call can run for minutes (accept,
       // sync, a wrap-up turn launch), which is exactly the case Bun.serve's
@@ -1096,7 +1268,10 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
           const builderTokenLabel = !authorizedTaskId && token
             ? await lookupDaemonTokenLabel(projectRoot, token)
             : null;
-          const result = await handleMcpToolCall(projectRoot, authorizedTaskId, toolName, args, emit, builderTokenLabel);
+          const result = await handleMcpToolCall(
+            projectRoot, authorizedTaskId, toolName, args, emit, builderTokenLabel,
+            clientAcceptsHeartbeat(req) ? (effect) => { afterDelivery.push(effect); } : undefined,
+          );
           const durationMs = Date.now() - mcpStart;
           logger.info(`MCP ${toolName} for task ${taskIdParam.substring(0, 8)} completed in ${durationMs}ms`);
           return { status: 200, body: { result } };
@@ -1116,7 +1291,21 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         }
       };
 
-      if (clientAcceptsHeartbeat(req)) return heartbeatEnvelopeResponse(produce, { signal: req.signal });
+      if (clientAcceptsHeartbeat(req)) return heartbeatEnvelopeResponse(produce, {
+        signal: req.signal,
+        onDelivered: async (status) => {
+          if (status !== 200) return;
+          for (const effect of afterDelivery) {
+            try {
+              await effect();
+            } catch (err) {
+              // The answer is delivered; an effect that fails leaves the comments
+              // claimed-but-unmarked, which the next claim re-issues (nothing lost).
+              logger.warn(`MCP ${toolName} for task ${taskIdParam.substring(0, 8)}: post-delivery effect failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          }
+        },
+      });
       const outcome = await produce();
       return Response.json(outcome.body, { status: outcome.status });
     }
@@ -1168,7 +1357,8 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       const produce = async (): Promise<EnvelopeResult> => {
         try {
           const params = await readJsonObjectBody(req, 'Builder storage params');
-          const result = await handleBuilderStorageCall(projectRoot, params);
+          const label = await lookupDaemonTokenLabel(projectRoot, bearerToken(req)!);
+          const result = await handleBuilderStorageCall(projectRoot, params, label);
           return { status: 200, body: result ?? null };
         } catch (err) {
           const status = httpStatusForError(err);
@@ -1237,6 +1427,44 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         const status = httpStatusForError(err);
         const message = err instanceof Error ? err.message : String(err);
         const line = `Agent launch-env failed (${status}): ${message}`;
+        if (status >= 500) logger.error(line); else logger.info(line);
+        return Response.json(errorBody(err, message), { status });
+      }
+    }
+
+    // POST /agent/pending-notes — comments that arrived while a TASK's work
+    // turn ran, handed to that turn before it ends (src/daemon/turn-comments.ts).
+    // Same project check and task-token authentication as /agent/launch-env.
+    if (url.pathname === '/agent/pending-notes' && req.method === 'POST') {
+      const reqProject = req.headers.get('x-lazy-project');
+      if (!reqProject) {
+        return Response.json({ error: 'Missing X-Lazy-Project header' }, { status: 400 });
+      }
+      if (reqProject !== projectRoot) {
+        return Response.json({ error: `Project mismatch: daemon serves ${projectRoot}, request is for ${reqProject}` }, { status: 400 });
+      }
+      const token = bearerToken(req);
+      if (!token) {
+        return Response.json({ error: 'Missing Authorization bearer token' }, { status: 401 });
+      }
+      try {
+        let body: { ack_through?: unknown; claim_id?: unknown; command_id?: unknown; notes_secret?: unknown } = {};
+        const text = await req.text();
+        if (text.trim()) {
+          try {
+            body = JSON.parse(text);
+          } catch (err) {
+            return Response.json({ error: `Invalid JSON body: ${err instanceof Error ? err.message : String(err)}` }, { status: 400 });
+          }
+          if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+            return Response.json({ error: 'Body must be a JSON object' }, { status: 400 });
+          }
+        }
+        return Response.json(await handleClaimAgentPendingNotes(projectRoot, token, body));
+      } catch (err) {
+        const status = httpStatusForError(err);
+        const message = err instanceof Error ? err.message : String(err);
+        const line = `Agent pending-notes failed (${status}): ${message}`;
         if (status >= 500) logger.error(line); else logger.info(line);
         return Response.json(errorBody(err, message), { status });
       }
@@ -1365,16 +1593,13 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // guard: opening storage reads lazy.toml, and a broken config must surface
   // as the actionable "Daemon failed to load" error from the bind block below,
   // not as a raw loadConfig throw from here.
-  // A Lazy Teams microVM roll replaced the machine this daemon runs in and left
-  // a marker saying so; every open task's next work turn is told. Best-effort:
-  // failing to tell an agent must never stop the daemon from starting.
-  await getOrCreateStorage()
-    .then(storage => consumeHostReplacedMarker(storage, getDaemonBaseDir()))
-    .then(told => { if (told !== null) logger.info(`Daemon start: machine was replaced; told ${told} open task(s)`); })
-    .catch(err => logger.warn(`Daemon start: could not record the machine replacement: ${err instanceof Error ? err.message : err}`));
 
+  // One store-open deadline before the bind, not one per step: when the member
+  // sweep above already waited the whole deadline out on a store that would
+  // not open, the snapshot does not wait it out a second time — it degrades to
+  // the empty snapshot below, as for any other failure to take one.
   previousGenerationSnapshot =
-    (await getOrCreateStorage()
+    (storeAvailability() ? null : await getOrCreateStorage()
       .then((storage) => snapshotPreviousGenerationChildren(projectRoot, storage))
       .catch(err => {
         logger.warn(`Daemon restart: previous-generation snapshot failed: ${err instanceof Error ? err.message : err}`);
@@ -1422,6 +1647,8 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     await safeStep('stopSyncLoop', () => stopSyncLoop());
     await safeStep('stopCaptureLoop', () => stopCaptureLoop());
     await safeStep('stopWorktreeCleanupLoop', () => stopWorktreeCleanupLoop());
+    await safeStep('stopWedgeWatch', () => stopWedgeWatch());
+    await safeStep('stopGuestDockerdWatchdog', () => stopGuestDockerdWatchdog());
     await safeStep('stopHealthEvents', () => { stopHealthEvents?.(); stopHealthEvents = null; });
     await safeStep('closeAllEventStreams', () => closeAllEventStreams());
     await safeStep('closeSignalDb', () => closeSignalDb());
@@ -1491,7 +1718,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // the daemon idle timeout, `server.requestIP()` for X-Forwarded-For.
   type ServeHandle = Parameters<Parameters<typeof tryBindTcpPort>[1]>[1];
 
-  // The task-service reverse proxy: `<service>.<task>.lazy.localhost:<port>`
+  // The task-service reverse proxy: `<task>.<service>.lazy.localhost:<port>`
   // forwarded to the container port `[serve]` published. It is a CLIENT of the
   // serve-state path the daemon already owns (getTaskServeState), never a second
   // resolver, and it lives in its own module so the sibling work on the
@@ -1507,7 +1734,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   };
   const handleServeProxy = createServeProxy(serveProxyDeps);
 
-  const tcpHandler = (req: Request, srv: ServeHandle): Promise<Response> => withRequestSpan(req, 'tcp', async () => {
+  const tcpHandlerInner = (req: Request, srv: ServeHandle): Promise<Response> => withRequestSpan(req, 'tcp', async () => {
     // A request for a task's service leaves here for the container and never
     // reaches a daemon route. It has to be FIRST: the dashboard gate below is an
     // exact host match, so it would answer every serve host with a 421.
@@ -1592,6 +1819,13 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       dashboardUrl,
     );
   });
+  // Every request is entered in the in-flight registry until its handler
+  // settles, so a request that never does is listed — route and age — in the
+  // wedge report (src/daemon/wedge-report.ts).
+  const tcpHandler = (req: Request, srv: ServeHandle): Promise<Response> => {
+    const done = trackRequest(req.method, daemonRouteTemplate(new URL(req.url).pathname));
+    return tcpHandlerInner(req, srv).finally(done);
+  };
 
   // The full production bind path resolves port/interface from config, persists
   // the bound port, and refreshes mounted MCP configs. Under LAZY_TEST those
@@ -1699,7 +1933,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       // Containers (builder, sandbox runners) call back via
       // host.docker.internal:<webPort>, so a daemon without a reachable web
       // port would leave container-based RPCs (e.g., getDaemonMcpConfig)
-      // throwing "Daemon context not initialized" — violating CLAUDE.md's
+      // throwing "Daemon context not initialized" — violating AGENTS.md's
       // "fail hard on remote failures" and "principle of least surprise".
       const lastPort = desiredPort + attempts - 1;
       // Two distinct failure modes need different remediation. Only the
@@ -1750,7 +1984,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     webPort = actualPort;
     boundWebPort = actualPort;
     boundBindHost = bindHost;
-    // Task service URLs (`web.my-task.lazy.localhost:26024`) ride the dashboard's
+    // Task service URLs (`my-task.web.lazy.localhost:26024`) ride the dashboard's
     // own host and port, so nothing can compose one until the bind has answered
     // with a port. Set it here, once, and every surface rendering inside this
     // process — the servePorts RPC, the Services card, the review page — gets
@@ -1789,11 +2023,11 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       // Dynamic import: task-launcher pulls in runners/drivers, and server.ts
       // deliberately keeps those off the static startup path.
       const { refreshDaemonMcpConfigs } = await import('./task-launcher');
-      await refreshDaemonMcpConfigs(
+      await startupStep('refreshing the MCP configs of running containers', () => refreshDaemonMcpConfigs(
         projectRoot,
         { webPort: actualPort },
         { info: (m) => logger.info(m), warn: (m) => logger.warn(m) },
-      );
+      ));
     } catch (err) {
       logger.warn(
         `Could not refresh daemon MCP configs for running containers: ` +
@@ -1940,20 +2174,249 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     writeWebHost(projectRoot, DEFAULT_SERVER_BIND);
   }
 
+  // The proxy comes up FIRST, before anything that walks the store. A start
+  // waiting on the proxy address used to sit behind the migrations below,
+  // which read every task file on every start — seconds on a large adopted
+  // store behind a VM mount — and a fixed deadline failed it (see
+  // src/daemon/startup-phase.ts). Nothing in the proxy needs a migration.
+  setStartupPhase('starting the task proxy');
+  const proxyStartT0 = Date.now();
+  // Start the Anthropic passthrough proxy. This is ALWAYS ON — there is no
+  // config option to turn it off — so the proxy is part of a normal daemon
+  // start, like the web server.
+  // The daemon owns the proxy: it announces its address at INFO next to the
+  // dashboard. Audit records do NOT go through Storage — they are disposable
+  // telemetry written to the project-local, size-capped
+  // `.lazy/logs/proxy-audit.jsonl`.
+  try {
+    // Search from projectRoot explicitly — loadConfig otherwise defaults its
+    // search to process.cwd(), which is the project root for a real daemon but
+    // NOT for an in-process test daemon.
+    const cfg = await loadConfig(projectRoot);
+    // Managed mode deliberately pins `[data] path` to `.lazy` (managed.ts), so
+    // no fleet override here: the audit log is PROJECT-LOCAL telemetry by
+    // design (see the module comment in src/proxy/audit-log.ts), and the store
+    // dir is a synced artifact that a growing stream once broke a push on.
+    const dataDir = join(projectRoot, cfg.data.path);
+
+    // Repository request plugins: NOT loaded in any mode — no repository code
+    // runs inside lazy's own process on the host (src/config/managed-repo-code.ts).
+    // The loader returns an empty chain without reading the directory.
+    const requestPlugins = await loadProxyRequestPlugins(projectRoot);
+    const proxyCredentials = buildProxyCredentialDeps(projectRoot, cfg, await teamModeEnabled(projectRoot));
+    const liveAgentRouting = await createLiveProxyRouting(projectRoot, cfg, proxyCredentials.targets);
+    proxyServer = createProxyServer(
+      {
+        // PROFILE UPSTREAMS: an `endpoint` on `[agents.<name>]` is where the
+        // PROXY forwards that profile's traffic; the launched agent always dials
+        // the proxy itself.
+        ...cfg.proxy,
+        // Where a task container can reach it: the bridge gateway on native
+        // Linux, under the daemon port's own conditions (see bind-hosts.ts).
+        // `[proxy] bind` keeps its meaning and its managed-mode pin.
+        extraBindHosts: resolveProxyBindHosts({
+          configBind: cfg.proxy.bind,
+          platform: process.platform,
+          runnerType: cfg.runner.type,
+        }).hosts.slice(1),
+        agentUpstreams: agentUpstreamMap(cfg),
+        liveAgentRouting,
+        plugins: requestPlugins,
+        // Per-user credentials: lets the proxy turn a container's session
+        // placeholder into its owner's real token. Inert until a control
+        // plane has stored a per-user credential in this daemon.
+        resolveSessionCredential: createSessionCredentialResolver(projectRoot),
+      },
+      // The audit log, with a live per-task tally teed off it. The tee
+      // forwards every record to the log unchanged and adds one in-memory
+      // addition, which is what makes a mid-turn token counter possible
+      // without a new stream, a new file, or anything at all on the
+      // daemon→supervisor channel.
+      teeTaskProgress(new ProxyAuditLog(dataDir, {
+        retentionDays: cfg.proxy.auditRetentionDays,
+        retentionMib: cfg.proxy.auditRetentionMib,
+      })),
+      // JIT credentials: from here on the daemon is the only process that holds
+      // a real one. Launched agents carry placeholders the proxy exchanges.
+      proxyCredentials,
+      {
+        // Durable per-task tool stats. The store is resolved per call rather
+        // than awaited here: `getOrCreateStorage` memoizes, and making proxy
+        // construction wait on storage init would hold up the bind for a
+        // number nobody is reading yet.
+        // Per-turn latency rollups, folded in memory and flushed into the
+        // store periodically and before each agent turn row is written.
+        turnLatency: (() => {
+          const recorder = new ProxyTurnLatencyRecorder({
+            mergeOpenTurnLatency: async (taskId, delta) => (await getOrCreateStorage()).mergeOpenTurnLatency(taskId, delta),
+          });
+          setActiveTurnLatencyRecorder(recorder);
+          return recorder;
+        })(),
+        toolStats: new ProxyToolStatsRecorder({
+          getToolStats: async (taskId) => (await getOrCreateStorage()).getToolStats(taskId),
+          saveToolStats: async (record) => (await getOrCreateStorage()).saveToolStats(record),
+        }),
+        // A tiered profile's tier switch, recorded on the task's journal.
+        // A BUILDER launch's switch (no task) is kept for the builder's surfaces.
+        onTierSwitch: (event) => {
+          if (!event.taskId) {
+            recordBuilderTierSwitch(event);
+            return;
+          }
+          void (async () => recordTierSwitch(await getOrCreateStorage(), event))().catch((err) => {
+            logger.warn(
+              `[tiers] could not record a tier switch for task ${event.taskId ?? '-'}: ` +
+              `${err instanceof Error ? err.message : String(err)}`,
+            );
+          });
+        },
+        // Which tiers served each turn, stamped on its agent row (src/task/tiers-served.ts).
+        onTierServed: (() => {
+          const record = createTierServedRecorder(() => getOrCreateStorage());
+          return (event: Parameters<typeof record>[0]) => { void record(event); };
+        })(),
+        historyCrossed: async (taskId) => tieredHistoryCrossed(await getOrCreateStorage(), taskId),
+        prepareTierChoice: () => prepareTierUsageReadings(projectRoot, cfg),
+      },
+    );
+    // Publish the ACTUAL bound port (OS-assigned when `[proxy] port` was
+    // omitted) so per-launch env injection and `lazy daemon status` resolve
+    // the real proxy address.
+    if (proxyServer.port) setDaemonProxyPort(proxyServer.port);
+    logger.info(`Startup: starting the task proxy took ${Date.now() - proxyStartT0}ms`);
+    // Housekeeping that needs the store runs only AFTER the proxy is up: opening
+    // a large adopted store must never hold the proxy address back from a
+    // start that is waiting on it (src/daemon/startup-phase.ts).
+    // Upgrade path: earlier versions appended the audit stream to the STORE
+    // root with no cap, where it reached 677 MiB and broke a store push. Drop
+    // it — telemetry, not durable state — and say so rather than letting data
+    // disappear silently.
+    //
+    // This is cleanup of a file a PREVIOUS version wrote, and runs on every
+    // start regardless of how the proxy is doing.
+    try {
+      const storePath = (await getOrCreateStorage()).getStoragePath();
+      const pruned = await pruneLegacyAuditLog(storePath);
+      if (pruned) {
+        logger.info(
+          `Removed the legacy proxy audit log at ${pruned.path} (${formatSize(pruned.bytes)}). ` +
+          `Audit records now live in ${auditLogPath(dataDir)}, capped at ` +
+          `${formatSize(AUDIT_SEGMENT_MAX_BYTES * (AUDIT_RETAINED_SEGMENTS + 1))} by default. ` +
+          `If that store is a git repo, the old blob is still in its history — ` +
+          `use git filter-repo to purge it.`,
+        );
+      }
+    } catch (err) {
+      // Cleanup is best-effort housekeeping: a failure here must not stop the
+      // daemon from starting. Say what happened so it is not silent.
+      logger.warn(
+        `Could not remove the legacy proxy audit log from the store root: ` +
+        `${err instanceof Error ? err.message : String(err)}. ` +
+        `It is safe to delete by hand.`,
+      );
+    }
+
+    // What this proxy was built from: a later config change touching any of it
+    // needs a restart (src/daemon/proxy-fingerprint.ts).
+    (await import('./proxy-fingerprint')).recordRunningProxy(projectRoot, cfg);
+    recordStartupSettings(cfg, 'proxy');
+    runningProxyView = { bind: cfg.proxy.bind, upstream: cfg.proxy.upstream, fallbacks: cfg.proxy.fallbacks.length, policyEnforce: cfg.proxy.policy.enforce };
+    // What `lazy daemon health` probes: the addresses, the audit directory and
+    // the audit queue's own record — never a credential.
+    {
+      const running = proxyServer;
+      daemonHealthRecorder(projectRoot).setProxy({
+        bind: cfg.proxy.bind,
+        binds: running.binds,
+        port: running.port ?? null,
+        auditDir: auditLogDir(dataDir),
+        auditHealth: () => running.auditHealth(),
+      });
+    }
+    // Announce the proxy at INFO alongside the web-dashboard line, on start
+    // and restart, so operators can see where audited traffic flows.
+    const fbCount = cfg.proxy.fallbacks.length;
+    const alsoBound = proxyServer.binds.slice(1);
+    logger.info(
+      `Proxy: http://${cfg.proxy.bind}:${proxyServer.port} → ${cfg.proxy.upstream} ` +
+      `(${fbCount} fallback${fbCount === 1 ? '' : 's'}, policy ${cfg.proxy.policy.enforce ? 'on' : 'off'}` +
+      `${alsoBound.length ? `, also on ${alsoBound.map((h: string) => `${h}:${proxyServer!.port}`).join(', ')} for containers` : ''})`,
+    );
+    // Repository plugins are not loaded in any mode (src/config/managed-repo-code.ts).
+    // If that is ever flipped back, loaded plugins are announced by name and in
+    // chain order, so a request rewriter is never silently active.
+    if (repositoryPluginsDisabled()) {
+      // Said whenever the project HAS plugin files, so nobody mistakes a
+      // committed plugin for a running one; silent otherwise.
+      // Informational only: nothing is loaded, so a .lazy/plugins that cannot be
+      // read (a committed FILE there, a permission problem) must never fail
+      // proxy startup — that would let repository content stop the daemon.
+      try {
+        const present = await listRepositoryPluginFiles(projectRoot);
+        if (present.length > 0) {
+          logger.info(`Proxy: ${REPOSITORY_PLUGINS_NOT_RUN} (ignored: ${present.join(', ')}).`);
+        }
+      } catch (listErr) {
+        logger.warn(
+          `Proxy: could not list ${PLUGIN_DIR_RELATIVE} (${listErr instanceof Error ? listErr.message : String(listErr)}); ` +
+          `${REPOSITORY_PLUGINS_NOT_RUN}.`,
+        );
+      }
+    } else if (requestPlugins.length > 0) {
+      logger.info(
+        `Proxy: ${requestPlugins.length} request plugin${requestPlugins.length === 1 ? '' : 's'} ` +
+        `loaded from ${PLUGIN_DIR_RELATIVE}, rewriting outbound requests in this order: ` +
+        requestPlugins.map((p) => p.name).join(' → '),
+      );
+    }
+  } catch (err) {
+    // A proxy startup failure is a CONTROLLED startup error — never an unhandled
+    // rejection that silently kills reconcile/sync/web (that was the ~6s-after-boot
+    // daemon death), and never a silent fall-through to direct connections.
+    //
+    // Falling back to direct would be the WORST outcome: agent traffic would flow
+    // straight to Anthropic while the audit trail recorded nothing, so the trail
+    // would lie by omission and the connector deny-rules would silently not apply.
+    // So we do NOT half-run: tear down the partial daemon and surface why + what
+    // to do (AGENTS.md: fail hard, cleanly and actionably — no silent fallback).
+    const detail = err instanceof Error ? err.message : String(err);
+    const errorMessage =
+      `Daemon failed to start the [proxy] server: ${detail}\n` +
+      `\n` +
+      `lazy routes all agent model traffic through its local audit/policy proxy, always, ` +
+      `and will not run half-configured: continuing without it would send agent traffic ` +
+      `direct while the audit trail recorded nothing. There is no way to turn the proxy ` +
+      `off — the fix is to get it running.\n` +
+      `\n` +
+      `To fix:\n` +
+      `  • Port already in use: the proxy picks a free port automatically, so this means a\n` +
+      `    pinned port is taken — drop or change it:\n` +
+      `      [proxy]\n` +
+      `      port = <number>   # or remove the line to auto-assign\n` +
+      `  • Storage lock contention (another project's daemon holds the lock): two projects\n` +
+      `    must not share one store — check [storage] external_path in lazy.toml, and run\n` +
+      `    'lazy daemon list' to see which project each daemon serves.\n` +
+      `  • Bind address unavailable: [proxy] bind must be an address this host owns\n` +
+      `    (the default, 127.0.0.1, always works).`;
+    throw await failStartup(errorMessage);
+  }
+
   // One-time migration: pre-unification follow-ups become non-blocking raised
   // items (docs/design/raised-items-unified.md). Idempotent — a store that has
   // already been migrated scans the task dirs, finds no legacy files, and
   // returns zeroes — so it is safe on every start, and a run interrupted
   // half-way converges on the next one.
   //
-  // Deliberately awaited BEFORE the web handler and the RPC surface start
-  // answering: a surface that read raised items mid-migration would show a
+  // Deliberately awaited BEFORE the web handler starts answering (RPC already
+  // answers, and the proxy is up — see above, and startup-phase.ts): a web
+  // surface that read raised items mid-migration would show a
   // human an incomplete triage queue. And deliberately LOUD — there is a large
   // stock of open follow-ups and losing one is the failure this exists to
   // prevent, so any record that could not be converted is named at WARN and its
   // source file is left in place for a retry.
   try {
-    const migration = await (await getOrCreateStorage()).migrateFollowUpsToRaisedItems();
+    const migration = await startupStep('migrating follow-ups to raised items', async () => (await getOrCreateStorage()).migrateFollowUpsToRaisedItems());
     if (migration.converted > 0 || migration.failures.length > 0) {
       logger.info(
         `Migrated ${migration.converted} follow-up(s) to raised items across ` +
@@ -1988,7 +2451,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // install cannot read as a person is dropped, so the count and the ids
   // themselves are reported rather than left for somebody to notice later.
   try {
-    const identity = await (await getOrCreateStorage()).migrateActorIdentity();
+    const identity = await startupStep('migrating stored attribution across the store', async () => (await getOrCreateStorage()).migrateActorIdentity());
     if (identity.carried > 0 || identity.files_rewritten > 0) {
       logger.info(
         `Migrated stored attribution to actor_email: ${identity.carried} carried forward across ` +
@@ -2020,12 +2483,25 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     );
   }
 
+  // Never-started tasks created before refs were fixed at create get theirs
+  // now (src/task/pin-unstarted-refs.ts), so a child under one never resolves
+  // a pre-start branch name. Idempotent; reported, not fatal.
+  try {
+    const pinned = await startupStep('fixing branch names of unstarted tasks', async () => pinUnstartedTaskRefs(await getOrCreateStorage()));
+    if (pinned > 0) logger.info(`Fixed the branch name of ${pinned} unstarted task(s)`);
+  } catch (err) {
+    logger.warn(
+      `Could not fix the branch names of unstarted tasks: ${err instanceof Error ? err.message : String(err)}. ` +
+      `Retried on the next daemon start; until then those tasks get their branch name when they start.`,
+    );
+  }
+
   // One-time import of lazy.toml's `[serve] start_services_cmd` into the store,
   // where the Start services command now lives. Idempotent: a no-op once the
   // store holds a command. Not fatal — until it succeeds, the command still
   // resolves from lazy.toml, so no user's setting disappears either way.
   try {
-    const imported = await importStartServicesCmdFromConfig(await getOrCreateStorage(), projectRoot);
+    const imported = await startupStep('importing the Start services command', async () => importStartServicesCmdFromConfig(await getOrCreateStorage(), projectRoot));
     if (imported) {
       logger.info(
         `Imported the Start services command "${imported}" from lazy.toml [serve] start_services_cmd ` +
@@ -2039,6 +2515,18 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       `the import is retried on the next daemon start.`,
     );
   }
+
+  // A Lazy Teams microVM roll replaced the machine this daemon runs in and left
+  // a marker saying so; every open task's next work turn is told. Best-effort:
+  // failing to tell an agent must never stop the daemon from starting. After
+  // the proxy (it awaits the store, which must not hold the proxy back) and
+  // before the loops, which are what launch the work turns it must precede.
+  await startupStep('recording a machine replacement', () => getOrCreateStorage()
+    .then(storage => consumeHostReplacedMarker(storage, getDaemonBaseDir()))
+    .then(told => { if (told !== null) logger.info(`Daemon start: machine was replaced; told ${told} open task(s)`); })
+    .catch(err => logger.warn(`Daemon start: could not record the machine replacement: ${err instanceof Error ? err.message : err}`)));
+
+  setStartupPhase('starting the background loops');
 
   // Bind succeeded — now wire up the real web request handler. Storage
   // initialization is kicked off eagerly so the first web request
@@ -2065,170 +2553,6 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     return handler(req);
   };
 
-  // Start the Anthropic passthrough proxy. This is ALWAYS ON — there is no
-  // config option to turn it off — so the proxy is part of a normal daemon
-  // start, like the web server.
-  // The daemon owns the proxy: it announces its address at INFO next to the
-  // dashboard. Audit records do NOT go through Storage — they are disposable
-  // telemetry written to the project-local, size-capped
-  // `.lazy/logs/proxy-audit.jsonl`.
-  try {
-    // Search from projectRoot explicitly — loadConfig otherwise defaults its
-    // search to process.cwd(), which is the project root for a real daemon but
-    // NOT for an in-process test daemon.
-    const cfg = await loadConfig(projectRoot);
-    // Managed mode deliberately pins `[data] path` to `.lazy` (managed.ts), so
-    // no fleet override here: the audit log is PROJECT-LOCAL telemetry by
-    // design (see the module comment in src/proxy/audit-log.ts), and the store
-    // dir is a synced artifact that a growing stream once broke a push on.
-    const dataDir = join(projectRoot, cfg.data.path);
-
-    // Upgrade path: earlier versions appended the audit stream to the STORE
-    // root with no cap, where it reached 677 MiB and broke a store push. Drop
-    // it — telemetry, not durable state — and say so rather than letting data
-    // disappear silently.
-    //
-    // This is cleanup of a file a PREVIOUS version wrote, and runs on every
-    // start regardless of how the proxy is doing.
-    try {
-      const storePath = (await getOrCreateStorage()).getStoragePath();
-      const pruned = await pruneLegacyAuditLog(storePath);
-      if (pruned) {
-        logger.info(
-          `Removed the legacy proxy audit log at ${pruned.path} (${formatSize(pruned.bytes)}). ` +
-          `Audit records now live in ${auditLogPath(dataDir)}, capped at ` +
-          `${formatSize(AUDIT_SEGMENT_MAX_BYTES * (AUDIT_RETAINED_SEGMENTS + 1))}. ` +
-          `If that store is a git repo, the old blob is still in its history — ` +
-          `use git filter-repo to purge it.`,
-        );
-      }
-    } catch (err) {
-      // Cleanup is best-effort housekeeping: a failure here must not stop the
-      // daemon from starting. Say what happened so it is not silent.
-      logger.warn(
-        `Could not remove the legacy proxy audit log from the store root: ` +
-        `${err instanceof Error ? err.message : String(err)}. ` +
-        `It is safe to delete by hand.`,
-      );
-    }
-
-    // User-authored request plugins, loaded by convention from the MAIN
-    // checkout's .lazy/plugins (never a task worktree — see the loader). A
-    // broken plugin throws here and is handled by the catch below, exactly
-    // like a bad proxy config: loud, never silently ignored.
-    const requestPlugins = await loadProxyRequestPlugins(projectRoot);
-    proxyServer = createProxyServer(
-      {
-        // PROFILE UPSTREAMS: an `endpoint` on `[agents.<name>]` is where the
-        // PROXY forwards that profile's traffic; the launched agent always dials
-        // the proxy itself.
-        ...cfg.proxy,
-        // Where a task container can reach it: the bridge gateway on native
-        // Linux, under the daemon port's own conditions (see bind-hosts.ts).
-        // `[proxy] bind` keeps its meaning and its managed-mode pin.
-        extraBindHosts: resolveProxyBindHosts({
-          configBind: cfg.proxy.bind,
-          platform: process.platform,
-          runnerType: cfg.runner.type,
-        }).hosts.slice(1),
-        agentUpstreams: agentUpstreamMap(cfg),
-        plugins: requestPlugins,
-        // Per-user credentials: lets the proxy turn a container's session
-        // placeholder into its owner's real token. Inert until a control
-        // plane has stored a per-user credential in this daemon.
-        resolveSessionCredential: createSessionCredentialResolver(projectRoot),
-      },
-      // The audit log, with a live per-task tally teed off it. The tee
-      // forwards every record to the log unchanged and adds one in-memory
-      // addition, which is what makes a mid-turn token counter possible
-      // without a new stream, a new file, or anything at all on the
-      // daemon→supervisor channel.
-      teeTaskProgress(new ProxyAuditLog(dataDir)),
-      // JIT credentials: from here on the daemon is the only process that holds
-      // a real one. Launched agents carry placeholders the proxy exchanges.
-      buildProxyCredentialDeps(projectRoot, cfg),
-      {
-        // Durable per-task tool stats. The store is resolved per call rather
-        // than awaited here: `getOrCreateStorage` memoizes, and making proxy
-        // construction wait on storage init would hold up the bind for a
-        // number nobody is reading yet.
-        toolStats: new ProxyToolStatsRecorder({
-          getToolStats: async (taskId) => (await getOrCreateStorage()).getToolStats(taskId),
-          saveToolStats: async (record) => (await getOrCreateStorage()).saveToolStats(record),
-        }),
-      },
-    );
-    // Publish the ACTUAL bound port (OS-assigned when `[proxy] port` was
-    // omitted) so per-launch env injection and `lazy daemon status` resolve
-    // the real proxy address.
-    if (proxyServer.port) setDaemonProxyPort(proxyServer.port);
-    // What this proxy was built from: a later config change touching any of it
-    // needs a restart (src/daemon/proxy-fingerprint.ts).
-    (await import('./proxy-fingerprint')).recordRunningProxy(projectRoot, cfg);
-    recordStartupSettings(cfg, 'proxy');
-    runningProxyView = { bind: cfg.proxy.bind, upstream: cfg.proxy.upstream, fallbacks: cfg.proxy.fallbacks.length, policyEnforce: cfg.proxy.policy.enforce };
-    // What `lazy daemon health` probes: the addresses, the audit directory and
-    // the audit queue's own record — never a credential.
-    {
-      const running = proxyServer;
-      daemonHealthRecorder(projectRoot).setProxy({
-        bind: cfg.proxy.bind,
-        binds: running.binds,
-        port: running.port ?? null,
-        auditDir: auditLogDir(dataDir),
-        auditHealth: () => running.auditHealth(),
-      });
-    }
-    // Announce the proxy at INFO alongside the web-dashboard line, on start
-    // and restart, so operators can see where audited traffic flows.
-    const fbCount = cfg.proxy.fallbacks.length;
-    const alsoBound = proxyServer.binds.slice(1);
-    logger.info(
-      `Proxy: http://${cfg.proxy.bind}:${proxyServer.port} → ${cfg.proxy.upstream} ` +
-      `(${fbCount} fallback${fbCount === 1 ? '' : 's'}, policy ${cfg.proxy.policy.enforce ? 'on' : 'off'}` +
-      `${alsoBound.length ? `, also on ${alsoBound.map((h: string) => `${h}:${proxyServer!.port}`).join(', ')} for containers` : ''})`,
-    );
-    // A plugin rewrites outbound request bodies, so it must never be silently
-    // active. Announced by name and in chain order whenever any are loaded —
-    // the default (no .lazy/plugins directory) stays quiet.
-    if (requestPlugins.length > 0) {
-      logger.info(
-        `Proxy: ${requestPlugins.length} request plugin${requestPlugins.length === 1 ? '' : 's'} ` +
-        `loaded from ${PLUGIN_DIR_RELATIVE}, rewriting outbound requests in this order: ` +
-        requestPlugins.map((p) => p.name).join(' → '),
-      );
-    }
-  } catch (err) {
-    // A proxy startup failure is a CONTROLLED startup error — never an unhandled
-    // rejection that silently kills reconcile/sync/web (that was the ~6s-after-boot
-    // daemon death), and never a silent fall-through to direct connections.
-    //
-    // Falling back to direct would be the WORST outcome: agent traffic would flow
-    // straight to Anthropic while the audit trail recorded nothing, so the trail
-    // would lie by omission and the connector deny-rules would silently not apply.
-    // So we do NOT half-run: tear down the partial daemon and surface why + what
-    // to do (CLAUDE.md: fail hard, cleanly and actionably — no silent fallback).
-    const detail = err instanceof Error ? err.message : String(err);
-    const errorMessage =
-      `Daemon failed to start the [proxy] server: ${detail}\n` +
-      `\n` +
-      `lazy routes all agent model traffic through its local audit/policy proxy, always, ` +
-      `and will not run half-configured: continuing without it would send agent traffic ` +
-      `direct while the audit trail recorded nothing. There is no way to turn the proxy ` +
-      `off — the fix is to get it running.\n` +
-      `\n` +
-      `To fix:\n` +
-      `  • Port already in use: the proxy picks a free port automatically, so this means a\n` +
-      `    pinned port is taken — drop or change it:\n` +
-      `      [proxy]\n` +
-      `      port = <number>   # or remove the line to auto-assign\n` +
-      `  • Storage lock contention (another project's daemon holds the lock): two projects\n` +
-      `    must not share one store — check [storage] external_path in lazy.toml, and run\n` +
-      `    'lazy daemon list' to see which project each daemon serves.\n` +
-      `  • Bind address unavailable: [proxy] bind must be an address this host owns\n` +
-      `    (the default, 127.0.0.1, always works).`;
-    throw await failStartup(errorMessage);
-  }
 
   const result: RunningDaemon = {
     token,
@@ -2401,10 +2725,15 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     stopSyncRetryLoop();
     stopSyncLoop();
     stopCaptureLoop();
+    stopGuestDockerdWatchdog();
+    setGuestDockerdReporter(null);
+    setMachineIntegrityReporter(null);
+    stopIntegrityBuildAudit();
     // The git-author fallback is bound to this daemon's project root; an
     // in-process daemon must not leave it answering for a root that is gone.
     setGitAuthorFallback(null);
     stopWorktreeCleanupLoop();
+    stopWedgeWatch();
     stopStateFileWatch?.();
     // Close SSE subscribers explicitly rather than leaving them to
     // webServer.stop(true) below: an ended stream lets the client see a clean
@@ -2427,6 +2756,14 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     // Flush any batched spans BEFORE storage closes — the span sink writes
     // through Storage, so it must still be open here.
     await shutdownTracing().catch(() => {});
+    // Buffered per-turn latency deltas go through Storage too; flush them while
+    // it is still open. Bounded so a wedged store cannot hold up shutdown.
+    const latencyRecorder = getActiveTurnLatencyRecorder();
+    if (latencyRecorder) {
+      latencyRecorder.stop();
+      await Promise.race([latencyRecorder.flush(), new Promise((r) => setTimeout(r, 5000))]);
+      setActiveTurnLatencyRecorder(null);
+    }
     // Close all long-lived Storage instances. Awaited: closing is what releases
     // .storage-lock, and a caller that awaits stop() (a new daemon starting, a
     // test tearing down) must be able to rely on the lock being free when stop()
@@ -2578,6 +2915,8 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   stopStateFileWatch = startDaemonStateFileWatch({ projectRoot });
 
   startLaunchWarmup(projectRoot);
+  void startRunnerImageBoot(projectRoot);
+  markStartupComplete();
 
   logger.info(`Daemon ready (PID ${process.pid}, ${boundBindHost}:${webPort})`);
 
@@ -2656,6 +2995,9 @@ function startDaemonReconcileLoop(
           `Daemon reconcile: previous tick exceeded ${RECONCILE_TICK_TIMEOUT_MS / 1000}s ` +
           `(${Math.round(elapsed / 1000)}s elapsed), force-resetting reconcile guard`
         );
+        health.tickAbandoned(RECONCILE_LOOP, new Error(
+          `tick abandoned after ${Math.round(elapsed / 1000)}s in phase '${health.currentPhase(RECONCILE_LOOP) ?? 'none'}'`,
+        ));
         reconciling = false;
       } else {
         logger.debug('Daemon reconcile: skipping tick, previous reconcile still running');
@@ -2683,7 +3025,9 @@ function startDaemonReconcileLoop(
 
     const reconcileStart = Date.now();
     try {
+      health.tickPhase(RECONCILE_LOOP, 'getOrCreateStorage');
       const storage = await getOrCreateStorage();
+      health.tickPhase(RECONCILE_LOOP, null);
 
       // FIRST TICK ONLY: stop the children the PREVIOUS daemon launched.
       //
@@ -2712,6 +3056,7 @@ function startDaemonReconcileLoop(
       // Cache task short IDs so stop() can filter supervisors synchronously
       // without needing async storage access.
       try {
+        health.tickPhase(RECONCILE_LOOP, 'listTasks');
         const allTasks = await storage.listTasks();
         knownTaskIds.clear();
         for (const t of allTasks) {
@@ -2726,7 +3071,9 @@ function startDaemonReconcileLoop(
       // expiry check itself is just a timestamp comparison on offline.json; the
       // small config read here is what lets a permanent-offline project gate
       // remote ops without writing to the offline file.
+      health.tickPhase(RECONCILE_LOOP, 'loadConfig');
       const reconcileConfig = await loadConfig(projectRoot);
+      health.tickPhase(RECONCILE_LOOP, 'isOfflineMode');
       const offline = await isOfflineMode(join(projectRoot, '.lazy'), reconcileConfig.remote.offline);
 
       // --- Critical path: detect finished tasks and transition states ---
@@ -2737,6 +3084,7 @@ function startDaemonReconcileLoop(
 
       // Snapshot working tasks before reconciliation so we can detect
       // which ones transition to blocked/conflict (turn completed).
+      health.tickPhase(RECONCILE_LOOP, 'snapshotWorkingTasks');
       const workingBefore = await storage.listTasksWithOptions({ workingOnly: true });
       const workingIds = new Set(workingBefore.map(t => t.id));
       const branchByTaskId = new Map<string, string>();
@@ -2750,6 +3098,7 @@ function startDaemonReconcileLoop(
         }
       }
 
+      health.tickPhase(RECONCILE_LOOP, null);
       await runPhase('reconcileTasks', async () => {
         await reconcileTasks(storage, projectRoot);
       });
@@ -2908,6 +3257,11 @@ function startDaemonReconcileLoop(
               return autoUnblockTask(storage, parent, session, projectRoot, message, 'child_added');
             },
           );
+        });
+        // Restore unblocks after another task's accept that waited for the
+        // project's runner image (src/daemon/task-lifecycle.ts).
+        await runPhase('processRunnerImageHeldRestores', async () => {
+          await processRunnerImageHeldRestores(projectRoot, storage);
         });
       }
     } catch (err) {
@@ -3113,22 +3467,36 @@ function startTerminalWorktreeCleanupLoop(projectRoot: string): () => void {
  */
 function startDaemonSyncLoop(projectRoot: string): () => void {
   let syncing = false;
+  let syncStartedAt = 0;
   let stopped = false;
   const health = daemonHealthRecorder(projectRoot);
+  // Same bound as the reconciler's: a tick hung on a dependency that never
+  // answers (a config read, a fetch) must not hold the loop for ever. The old
+  // tick keeps running; the generation check in `finally` keeps it from
+  // clearing the flag of the tick that replaced it.
+  const SYNC_TICK_TIMEOUT_MS = 300_000;
 
   const doSync = async () => {
     if (stopped) return;
     if (syncing) {
-      logger.debug('Daemon sync: skipping tick, previous sync still running');
-      health.tickSkipped(REMOTE_SYNC_LOOP);
-      return;
+      const elapsed = Date.now() - syncStartedAt;
+      if (elapsed <= SYNC_TICK_TIMEOUT_MS) {
+        logger.debug('Daemon sync: skipping tick, previous sync still running');
+        health.tickSkipped(REMOTE_SYNC_LOOP);
+        return;
+      }
+      const phase = health.currentPhase(REMOTE_SYNC_LOOP) ?? 'none';
+      logger.warn(`Daemon sync: previous tick exceeded ${SYNC_TICK_TIMEOUT_MS / 1000}s (${Math.round(elapsed / 1000)}s in phase '${phase}'), force-resetting sync guard`);
+      health.tickAbandoned(REMOTE_SYNC_LOOP, new Error(`tick abandoned after ${Math.round(elapsed / 1000)}s in phase '${phase}'`));
     }
 
     syncing = true;
     const syncStart = Date.now();
+    syncStartedAt = syncStart;
     health.tickStarted(REMOTE_SYNC_LOOP);
     let tickError: unknown;
     try {
+      health.tickPhase(REMOTE_SYNC_LOOP, 'loadConfig');
       const config = await loadConfig(projectRoot);
       const syncInterval = config.server.sync_interval;
 
@@ -3136,6 +3504,7 @@ function startDaemonSyncLoop(projectRoot: string): () => void {
       if (syncInterval <= 0) return;
 
       // Skip sync entirely when offline — no network noise.
+      health.tickPhase(REMOTE_SYNC_LOOP, 'isOfflineMode');
       if (await isOfflineMode(join(projectRoot, '.lazy'), config.remote.offline)) return;
 
       const driver = createDriver(config);
@@ -3143,7 +3512,9 @@ function startDaemonSyncLoop(projectRoot: string): () => void {
       // Skip if driver doesn't need remote sync (e.g., LocalDriver)
       if (!driver.needsSync) return;
 
+      health.tickPhase(REMOTE_SYNC_LOOP, 'getOrCreateStorage');
       const storage = await getOrCreateStorage();
+      health.tickPhase(REMOTE_SYNC_LOOP, 'runSync');
       await runSync(projectRoot, storage, debugSyncLogger);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -3155,7 +3526,7 @@ function startDaemonSyncLoop(projectRoot: string): () => void {
       health.tickFinished(REMOTE_SYNC_LOOP, syncStart, tickError);
       const durationMs = Date.now() - syncStart;
       logger.debug(`Daemon sync tick completed in ${durationMs}ms`);
-      syncing = false;
+      if (syncStartedAt === syncStart) syncing = false;
     }
   };
 

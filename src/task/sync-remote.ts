@@ -19,6 +19,7 @@
  * excludes nothing from any other process.
  */
 
+import { localDriverMirrorsOrigin } from '../remote/origin-mirror';
 import { shortId, displayId, taskRef, getWorktreePath } from './identity';
 import { reparentChildren, formatReparentWarning } from './orphan';
 import { buildRemoteCommentsContext } from './turn-context';
@@ -65,7 +66,7 @@ export async function syncTaskFromRemote(
   }
 
   try {
-    const driver = createDriver(config);
+    const driver = createDriver(config, { storage, lazyRoot: root });
 
     // If no remote ref exists yet, try to create one so comments can be synced.
     // This mirrors the exportTasks() flow in sync.ts: push branch, then
@@ -91,18 +92,16 @@ export async function syncTaskFromRemote(
         const commits = await storage.getSessionCommits(session.id);
         if (commits.length > 0) {
           try {
+            // Never publish a delivered per-task secret file (src/daemon/task-files.ts).
+            const { assertNoDeliveredSecretsToPush } = await import('../daemon/task-files');
+            await assertNoDeliveredSecretsToPush(root, session.git_branch, `Pushing ${session.git_branch}`);
             await driver.pushBranch(session.git_branch);
-            const prResult = await driver.markReadyForReview(task);
-            if (prResult.metadata) {
-              for (const [key, value] of Object.entries(prResult.metadata)) {
-                await storage.updateTaskMetadata(task.id, key, value);
-              }
-              // Update the in-memory task metadata so downstream code sees the new ref
-              if (!task.metadata) task.metadata = {};
-              Object.assign(task.metadata, prResult.metadata);
-              if (driver.hasRemoteRef(task)) {
-                logger.info(`Created remote ref for task ${shortId(task.id)} during pre-review sync`);
-              }
+            // Crash-safe, adopting an open PR the branch already has
+            // (src/daemon/review-self-heal.ts).
+            const { createOrAdoptReview } = await import('../daemon/review-self-heal');
+            await createOrAdoptReview(storage, driver, task, session.git_branch);
+            if (driver.hasRemoteRef(task)) {
+              logger.info(`Recorded remote ref for task ${shortId(task.id)} during pre-review sync`);
             }
           } catch (err) {
             console.log(theme.warning(`⚠ Warning: Could not push to origin — local and remote branches have diverged.`));
@@ -147,7 +146,10 @@ export async function syncTaskFromRemote(
         // Same rule as the daemon's remote-sync (src/daemon/review-base.ts): a
         // PR merged into a branch that is not the task's target never completes it.
         const { mergedIntoTaskTarget } = await import('../daemon/remote-sync');
-        if (sessionCommits.length > 0 && await mergedIntoTaskTarget(storage, driver, task, root)) {
+        // A linked task never records the PR author's commits as its own, so
+        // zero commits is not "spurious" for it (see detectExternalChanges).
+        const linked = isLinkedTask(task);
+        if ((sessionCommits.length > 0 || linked) && await mergedIntoTaskTarget(storage, driver, task, root)) {
           // Transition first, follow-through after (accept-merge-is-commit-point),
           // the same pair as every accept exit and the daemon's remote-sync.
           // Only the TRANSITION runs here, under the task's lifecycle lock on a
@@ -170,10 +172,10 @@ export async function syncTaskFromRemote(
             const marked = !!fresh.metadata?.[ACCEPT_IN_FLIGHT_KEY];
             const intent = marked ? readAcceptIntent(fresh) : null;
             await commitAcceptTransition(storage, fresh, {
-              reason: intent?.reason ?? 'Merged on the remote after the accepting process died (original reason was not recorded).',
+              reason: intent?.reason ?? (linked ? 'The linked PR/MR was merged on the forge.' : null) ?? 'Merged on the remote after the accepting process died (original reason was not recorded).',
               actor,
               commentActor: intent?.actor ?? 'system',
-              writeComment: marked,
+              writeComment: marked || linked,
               dedupeComment: true,
               followThrough: {
                 targetBranch: await acceptTargetBranchOf(fresh, storage),
@@ -197,6 +199,11 @@ export async function syncTaskFromRemote(
       } else if (prState === 'CLOSED') {
         console.log(`Remote ref was closed externally — marking task ${displayId(task)} abandoned`);
         await storage.abandonTask(task.id, 'Closed externally via remote', actor);
+        await storage.createComment(task.id,
+          isLinkedTask(task)
+            ? '[Abandoned] The linked PR/MR was closed on the forge without being merged.'
+            : '[Abandoned] The PR/MR was closed on the forge without being merged.',
+          actor);
 
         // Re-parent unfinished children (same as accept path)
         const closedReparented = await reparentChildren(task, storage);
@@ -251,7 +258,7 @@ export async function runSyncWithRemote(
   } catch {
     return {};
   }
-  if (config.remote.driver === 'local') {
+  if (config.remote.driver === 'local' && !localDriverMirrorsOrigin(config)) {
     return {};
   }
 

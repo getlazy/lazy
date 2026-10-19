@@ -88,10 +88,29 @@ describe('review protocol isolation', () => {
     expect(body).toContain('reviewProtocolDir(task.id)');
     expect(body).toMatch(/const protoDir = reviewProtocolDir\(task\.id\)/);
     expect(body).toContain('writeCommand(protoDir, reviewCommand)');
-    expect(body).toContain('launchSupervisor(sandbox, containerName, protoDir');
+    expect(body).toMatch(/launchReadOnlySupervisor\(runner,\s*\[sandbox,\s*containerName,\s*protoDir,\s*false,\s*daemonConfigPath \?\? undefined,\s*tRef,\s*task\.id\],\s*task,\s*phases\)/);
     // Must not fall back to the work mailbox for the review command.
     expect(body).not.toMatch(/writeCommand\(getProtocolDir/);
     expect(body).not.toMatch(/const protoDir = getProtocolDir\(task\.id\)/);
+  });
+
+  test('read-only supervisor forwards the same mailbox in normal and default-image launches', async () => {
+    const source = await readFile(LIFECYCLE, 'utf-8');
+    const start = source.indexOf('async function launchReadOnlySupervisor');
+    expect(start).toBeGreaterThan(-1);
+    const rest = source.slice(start);
+    const nextFn = rest.search(/\n(?:export )?(?:async )?function |\nexport async function /);
+    const body = nextFn > 0 ? rest.slice(0, nextFn) : rest;
+
+    expect(body).toMatch(/const \[sandbox, containerName, protoDir, debug, daemonConfigPath, tRef, taskId\] = args;/);
+    const launches = [...body.matchAll(/runner\.launchSupervisor\(([^;]+)\);/g)]
+      .map(match => match[1].replace(/\s+/g, ' ').trim());
+    expect(launches).toEqual([
+      'sandbox, containerName, protoDir, debug, daemonConfigPath, tRef, taskId, await readOnlyLaunchPin(task), phases.notify',
+      'sandbox, containerName, protoDir, debug, daemonConfigPath, tRef, taskId, READONLY_DEFAULT_RUNNER_IMAGE_PIN, phases.notify',
+    ]);
+    expect(body).toMatch(/try \{\s*await runner\.launchSupervisor\(sandbox, containerName, protoDir,/);
+    expect(body).toMatch(/catch \(err\) \{[\s\S]*await runner\.launchSupervisor\(sandbox, containerName, protoDir,[^;]*READONLY_DEFAULT_RUNNER_IMAGE_PIN/);
   });
 
   // INVARIANT: the unwind clears the review mailbox on whether THIS CALL WROTE

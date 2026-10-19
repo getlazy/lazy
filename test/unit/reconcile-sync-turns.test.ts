@@ -103,7 +103,7 @@ async function makeWorkingTask(env: Env, goal: string): Promise<{ ref: string; t
 
 /** Simulate a merge commit landing on the worktree; returns the new HEAD sha. */
 function commitMerge(worktreePath: string, file: string): string {
-  // Sync write: test setup, and git must see the file before `add` (CLAUDE.md
+  // Sync write: test setup, and git must see the file before `add` (AGENTS.md
   // permits sync fs calls in test setup/teardown).
   writeFileSync(join(worktreePath, file), 'merged upstream\n');
   git(worktreePath, 'add', '.');

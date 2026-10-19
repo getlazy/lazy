@@ -38,10 +38,6 @@ function createMockSink() {
   return { sink, records };
 }
 
-function findFreePort(): number {
-  return 40000 + Math.floor(Math.random() * 10000);
-}
-
 describe('cursor proxy endpoint building', () => {
   test('carries the launch placeholder as a single fixed segment', () => {
     expect(cursorProxyEndpoint('http://127.0.0.1:8766', 'key_lazy_abc'))
@@ -192,6 +188,11 @@ describe('cursor route forwarding', () => {
 
   const PLACEHOLDER = 'key_lazy_cursorgrant';
   const REAL_KEY = 'key_real_cursor_secret';
+  let refuseNext = false;
+  let largeRefuseNext = false;
+  let streamingRefuseNext = false;
+  let releaseStream: (() => void) | null = null;
+  const largeError = 'x'.repeat(16 * 1024 - 5) + REAL_KEY + 'x'.repeat(256 * 1024);
 
   const GRANT: CredentialGrant = {
     token: PLACEHOLDER,
@@ -203,9 +204,8 @@ describe('cursor route forwarding', () => {
   };
 
   beforeAll(async () => {
-    const upstreamPort = findFreePort();
     upstream = Bun.serve({
-      port: upstreamPort,
+      port: 0,
       hostname: '127.0.0.1',
       async fetch(req) {
         const url = new URL(req.url);
@@ -217,9 +217,31 @@ describe('cursor route forwarding', () => {
           headers,
           body: req.method === 'GET' ? '' : await req.text(),
         };
+        if (refuseNext) {
+          refuseNext = false;
+          return Response.json({ error: { message: `invalid key ${REAL_KEY}` } }, { status: 400 });
+        }
+        if (largeRefuseNext) {
+          largeRefuseNext = false;
+          return new Response(largeError, { status: 400, headers: { 'content-type': 'text/plain' } });
+        }
+        if (streamingRefuseNext) {
+          streamingRefuseNext = false;
+          const stream = new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('first part'));
+              releaseStream = () => {
+                controller.enqueue(new TextEncoder().encode(' second part'));
+                controller.close();
+              };
+            },
+          });
+          return new Response(stream, { status: 400, headers: { 'content-type': 'text/plain' } });
+        }
         return new Response('cursor-ok', { status: 200, headers: { 'content-type': 'application/json' } });
       },
     });
+    const upstreamPort = upstream.port!;
 
     const cursorUpstream = `http://127.0.0.1:${upstreamPort}`;
     const targets = new TargetCredentials();
@@ -233,11 +255,10 @@ describe('cursor route forwarding', () => {
       targets,
     };
 
-    proxyPort = findFreePort();
     sink = createMockSink();
     proxy = createProxyServer(
       {
-        port: proxyPort,
+        port: 0,
         bind: '127.0.0.1',
         upstream: 'http://127.0.0.1:1',   // deliberately dead: cursor must not use it
         cursorUpstream,
@@ -245,6 +266,7 @@ describe('cursor route forwarding', () => {
       sink.sink,
       credentials,
     );
+    proxyPort = proxy.port!;
     await new Promise((r) => setTimeout(r, 50));
   });
 
@@ -280,6 +302,56 @@ describe('cursor route forwarding', () => {
     expect(seen?.headers.authorization).toBe(`Bearer ${REAL_KEY}`);
     expect(seen?.body).toBe(JSON.stringify({ apiKey: REAL_KEY }));
     expect(JSON.stringify(seen)).not.toContain(PLACEHOLDER);
+  });
+
+  test('records the upstream reason without exposing the substituted credential', async () => {
+    refuseNext = true;
+    const response = await fetch(`http://127.0.0.1:${proxyPort}/_lazy/cursor/${PLACEHOLDER}/v1/ping`, {
+      method: 'POST', headers: { authorization: `Bearer ${PLACEHOLDER}` }, body: '{}',
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: { message: `invalid key ${REAL_KEY}` } });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const record = sink.records.find((entry) => entry.backend === 'cursor' && entry.status === 400);
+    expect(record?.error).toContain('invalid key');
+    expect(record?.error).not.toContain(REAL_KEY);
+    expect(record?.error).not.toContain(PLACEHOLDER);
+  });
+
+  test('large errors remain byte-exact while diagnostic capture is bounded', async () => {
+    sink.records.length = 0;
+    largeRefuseNext = true;
+    const response = await fetch(`http://127.0.0.1:${proxyPort}/_lazy/cursor/${PLACEHOLDER}/v1/ping`, {
+      method: 'POST', body: '{}',
+    });
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe(largeError);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const record = sink.records.find((entry) => entry.backend === 'cursor' && entry.status === 400);
+    expect(record?.error).toBe('upstream: error body exceeds diagnostic limit');
+  });
+
+  test('streams an upstream error without waiting for its trailing bytes', async () => {
+    sink.records.length = 0;
+    streamingRefuseNext = true;
+    const request = fetch(`http://127.0.0.1:${proxyPort}/_lazy/cursor/${PLACEHOLDER}/v1/ping`, {
+      method: 'POST', body: '{}',
+    });
+    let response: Response;
+    try {
+      response = await Promise.race([
+        request,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('response blocked on error body')), 1000)),
+      ]);
+    } finally {
+      releaseStream?.();
+      releaseStream = null;
+    }
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe('first part second part');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const record = sink.records.find((entry) => entry.backend === 'cursor' && entry.status === 400);
+    expect(record?.error).toBe('upstream: first part second part');
   });
 
   test('records coarse audit attributed from the GRANT, not from headers', async () => {

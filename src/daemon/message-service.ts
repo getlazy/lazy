@@ -25,7 +25,7 @@
 import { getOrCreateStorage } from './rpc-handlers';
 import type { MessageActions } from '../server/message-actions';
 import type { Storage } from '../storage';
-import type { SystemMessage } from '../types';
+import type { SystemMessage, SystemMessageDismissFilter } from '../types';
 
 /**
  * A `MessageActions` over any Storage.
@@ -42,6 +42,9 @@ export function createStorageMessageActions(getStorage: () => Promise<Storage>):
     },
     async dismiss(id: string): Promise<SystemMessage> {
       return (await getStorage()).dismissSystemMessage(id, 'human');
+    },
+    async dismissMatching(filter: SystemMessageDismissFilter): Promise<SystemMessage[]> {
+      return (await getStorage()).dismissSystemMessages(filter, 'human');
     },
   };
 }

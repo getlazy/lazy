@@ -11,6 +11,8 @@
  */
 
 import { spawn } from '../utils/spawn';
+import { assertArgvBounded } from '../agent/argv-safety';
+import type { AgentExecArgs } from '../agent/interface';
 import type { AgentResponse } from '../types';
 import { ONESHOT_KILL_GRACE_MS, oneshotTimeoutError } from './args';
 
@@ -38,12 +40,20 @@ export interface BoundedOneshotOptions {
 }
 
 export async function execBoundedOneshot(
-  argv: string[],
+  argv: AgentExecArgs,
   opts: BoundedOneshotOptions,
 ): Promise<AgentResponse> {
   const label = opts.label ?? 'Claude Code';
+  // The argv rule (src/agent/argv-safety.ts): a one-shot's prompt rides stdin.
+  // A one-shot never carries a system prompt, so a file placeholder here would
+  // reach the agent as a literal path — refuse it as loudly as an oversize arg.
+  if (argv.systemPromptInput !== undefined) {
+    throw new Error(`${label} one-shot was not launched: it carries a system prompt file, which one-shots do not materialize.`);
+  }
+  assertArgvBounded(argv, `${label} one-shot`);
 
   const proc = spawn(argv, {
+    stdin: argv.stdinInput === undefined ? 'ignore' : new Blob([argv.stdinInput]),
     stdout: 'pipe',
     stderr: 'pipe',
     cwd: opts.cwd,

@@ -103,6 +103,12 @@ export interface DaemonStatus {
   /** Anthropic passthrough proxy status. Absent only when the daemon could not
    *  read its own config while answering the health probe. */
   proxy?: DaemonProxyStatus;
+  /**
+   * Present only when something under the daemon is stuck: status steps that
+   * missed their deadline, loops that completed no tick past the wedge
+   * threshold, a store still opening (src/daemon/wedge-report.ts).
+   */
+  wedged?: { steps: string[]; loops: Array<{ name: string; phase: string | null; stalledMs: number }>; storeOpening?: { stage: string; sinceMs: number } };
 }
 
 /** Live proxy status surfaced in `lazy daemon status` / GET /daemon/status. */
@@ -612,7 +618,7 @@ export async function checkDaemonHealth(projectRoot: string): Promise<DaemonStat
       return { running: false, pid: pid ?? undefined };
     }
 
-    const data = await response.json() as { projectRoot?: string; uptime?: number; version?: string; instanceId?: string; buildTime?: string; buildSha?: string; buildDirty?: boolean; buildBranch?: string; buildSourcePath?: string; codeSha?: string; sourceId?: string; sourceIdKind?: string; webPort?: number; bindHost?: string; dashboardUrl?: string | null; autoReactBudget?: AutoReactBudgetEntry[]; proxy?: DaemonProxyStatus };
+    const data = await response.json() as { projectRoot?: string; uptime?: number; version?: string; instanceId?: string; buildTime?: string; buildSha?: string; buildDirty?: boolean; buildBranch?: string; buildSourcePath?: string; codeSha?: string; sourceId?: string; sourceIdKind?: string; webPort?: number; bindHost?: string; dashboardUrl?: string | null; autoReactBudget?: AutoReactBudgetEntry[]; proxy?: DaemonProxyStatus; wedged?: DaemonStatus['wedged'] };
     if (data.projectRoot !== projectRoot) {
       // A daemon answered, but for a different project — our port marker is
       // stale and another project's daemon now holds the port.
@@ -639,6 +645,7 @@ export async function checkDaemonHealth(projectRoot: string): Promise<DaemonStat
       ...('dashboardUrl' in data ? { dashboardUrl: data.dashboardUrl ?? null } : {}),
       autoReactBudget: data.autoReactBudget,
       proxy: data.proxy,
+      wedged: data.wedged,
     };
   } catch (err) {
     // Timed out with the pid still alive → state (c): the process is there but

@@ -59,6 +59,7 @@ import { modifierKeyScript } from '../../src/server/modifier-key';
 import { screenshotLightboxScript } from '../../src/server/screenshot-lightbox';
 import { layoutHtml } from '../../src/server/templates';
 import { subtasksSectionHtml } from '../../src/server/subtasks';
+import { copyMarkdownScript } from '../../src/server/copy-markdown';
 import { servicesCardHtml } from '../../src/server/services-card';
 import type { Task } from '../../src/types';
 import { progressiveLoaderScript } from '../../src/server/review-progressive';
@@ -128,6 +129,7 @@ function task(): Task {
  * test matches against.
  */
 const ISLANDS: Record<string, () => string> = {
+  copyMarkdownScript: () => copyMarkdownScript(),
   taskTabSwitchScript: () => taskTabSwitchScript(),
   progressiveLoaderScript: () => progressiveLoaderScript('/api/review/task-1/files'),
   reviewNavigationScript: () => reviewNavigationScript(),

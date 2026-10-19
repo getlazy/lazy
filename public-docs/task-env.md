@@ -26,7 +26,8 @@ shell environment or in the agent image, where it costs nothing per task. The
 whole point of this feature is the granularity: the other tasks don't get it.
 
 Do not use it for large values either. It is capped at 64 variables and 128 KiB
-per task; if you need to hand a task a file, mount it with `[[mounts]]`.
+per task. To hand a task a file, use a file entry in Lazy Teams ([Environment
+variables, secrets and files](lazy-teams-environment.md)) or mount it with `[[mounts]]`.
 
 ## The security model
 
@@ -38,9 +39,10 @@ That placement is the whole property, and it is the same one the per-task MCP
 token already relies on:
 
 - A task's container bind-mounts the project root **read-only**
-  (`-v <repo>:<repo>:ro`). Anything under `<project>/.lazy/` is therefore
-  readable by *every* agent — which is exactly the separation this feature
-  exists to provide. So the values cannot live there.
+  (`-v <repo>:<repo>:ro`), so the project tree is readable by *every* agent.
+  Lazy hides `<project>/.lazy/` inside containers, but the project tree is
+  still the wrong place for a value meant for one task. So the values do not
+  live there.
 - The daemon state directory is never mounted into anything: lazy refuses any
   mount source inside it.
 

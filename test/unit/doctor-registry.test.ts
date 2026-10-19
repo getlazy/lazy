@@ -19,7 +19,7 @@ describe('doctor registry', () => {
   test('statusOf maps ok / warning / error', () => {
     expect(statusOf({ ok: true, label: 'fine' })).toBe('ok');
     expect(statusOf({ ok: true, label: 'fine', warning: 'heads-up' })).toBe('warning');
-    expect(statusOf({ ok: false, label: 'broken', detail: 'nope' })).toBe('error');
+    expect(statusOf({ ok: false, label: 'broken', problem: 'Something broke', detail: 'nope' })).toBe('error');
   });
 
   test('checkIdFromLabel slugs a title', () => {
@@ -31,6 +31,7 @@ describe('doctor registry', () => {
     const result: CheckResult = {
       ok: false,
       label: 'Docker running',
+      problem: 'Docker isn\'t running',
       detail: '\u001b[36mdocker start\u001b[0m then retry',
       docs: 'troubleshooting-daemon',
       remedyFlag: 'clean-docker-images',
@@ -50,6 +51,7 @@ describe('doctor registry', () => {
       {
         id: 'one',
         title: 'First',
+        problem: 'First failed',
         run: async (ctx) => {
           seen.push(`one:${ctx.n}`);
           return { ok: true, label: 'First' };
@@ -58,11 +60,13 @@ describe('doctor registry', () => {
       {
         id: 'gated',
         title: 'Gated',
+        problem: 'Gated failed',
         run: async () => null,
       },
       {
         id: 'two',
         title: 'Second',
+        problem: 'Second failed',
         run: async () => ({ ok: true, label: 'Second', warning: 'soft' }),
       },
     ];
@@ -85,6 +89,7 @@ describe('doctor registry', () => {
       {
         id: 'boom',
         title: 'Explodes',
+        problem: 'Explodes failed',
         run: async () => {
           throw new Error('probe hung');
         },
@@ -92,6 +97,7 @@ describe('doctor registry', () => {
       {
         id: 'after',
         title: 'After',
+        problem: 'After failed',
         run: async () => ({ ok: true, label: 'After' }),
       },
     ];
@@ -100,7 +106,7 @@ describe('doctor registry', () => {
     expect(report.checks).toHaveLength(2);
     expect(report.checks[0]).toMatchObject({
       id: 'boom',
-      title: 'Explodes',
+      title: 'Explodes failed',
       status: 'error',
       detail: 'probe hung',
     });

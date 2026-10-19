@@ -63,7 +63,7 @@ describe('violations survive a status-label drift', () => {
    */
   async function driftedTask(): Promise<string> {
     // Edit the key init already wrote — appending a second [permissions] table
-    // is a TOML redefinition error (see CLAUDE.md, "Storage and config in tests").
+    // is a TOML redefinition error (see AGENTS.md, "Storage and config in tests").
     const configPath = join(ctx.root, 'lazy.toml');
     const before = readFileSync(configPath, 'utf-8');
     const after = before.replace(

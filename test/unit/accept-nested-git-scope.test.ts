@@ -86,3 +86,57 @@ describe('accept nested-git gate refusal', () => {
     expect((caught as Error).message).toContain('could not be checked for nested git repositories');
   });
 });
+
+describe("accept and codex's plugin-marketplace clone", () => {
+  const task = { id: 'codex-task', code: 'codex-task', goal: 'g', status: 'blocked', target: { kind: 'branch', branch: 'main' } } as unknown as Task;
+  const storage = {} as unknown as Storage;
+
+  async function project(): Promise<{ root: string; wt: string }> {
+    const root = await tmp();
+    const git = (...args: string[]) => Bun.spawnSync(['git', '-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd: root });
+    git('init', '-q', '-b', 'main');
+    await writeFile(join(root, 'README'), 'x\n');
+    git('add', '.');
+    git('commit', '-q', '-m', 'init');
+    const wt = join(root, '.lazy', 'worktrees', 't');
+    await mkdir(wt, { recursive: true });
+    return { root, wt };
+  }
+
+  async function plantRepo(dir: string): Promise<void> {
+    await mkdir(join(dir, '.git'), { recursive: true });
+    await writeFile(join(dir, '.git', 'HEAD'), 'ref: refs/heads/main\n');
+    await writeFile(join(dir, '.git', 'config'), '[core]\n\tbare = false\n');
+  }
+
+  async function refusal(root: string, wt: string): Promise<RpcError | null> {
+    try {
+      await refuseNestedGitOnAccept(root, storage, task, wt);
+      return null;
+    } catch (err) {
+      return err as RpcError;
+    }
+  }
+
+  // INVARIANT: lazy never deletes codex's leftover plugin clone on its own —
+  // it is refused like any other nested repository, and left in place.
+  test('a leftover codex plugin clone is refused and left in place', async () => {
+    const { root, wt } = await project();
+    const pluginsDir = join(wt, '.lazy-task-sandbox', '.codex', '.tmp', 'plugins');
+    await plantRepo(pluginsDir);
+    const err = await refusal(root, wt);
+    expect(err?.message ?? '').toContain('.lazy-task-sandbox/.codex/.tmp/plugins/.git');
+    expect(await Bun.file(join(pluginsDir, '.git', 'HEAD')).exists()).toBe(true);
+  });
+
+  // INVARIANT: a repository an agent plants anywhere — including elsewhere in
+  // the sandbox and the Codex home — is refused; the gate is a sandbox-escape guard.
+  test('a nested repo elsewhere in the sandbox or codex home is still refused', async () => {
+    for (const rel of ['.lazy-task-sandbox/.codex/.tmp/other', '.lazy-task-sandbox/.codex/plugins', '.lazy-task-sandbox/x', 'src/sub']) {
+      const { root, wt } = await project();
+      await plantRepo(join(wt, rel));
+      const err = await refusal(root, wt);
+      expect(err?.message ?? '').toContain(`${rel}/.git`);
+    }
+  });
+});

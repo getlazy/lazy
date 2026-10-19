@@ -14,7 +14,7 @@
  *
  * INVARIANT: the add-comment form POSTs to `/tasks/:id/comments/add`, which
  * persists a comment and NOTHING ELSE. A comment never starts a turn — it rides
- * the next unblock. See CLAUDE.md ("A lazy comment never starts a turn") and
+ * the next unblock. See AGENTS.md ("A lazy comment never starts a turn") and
  * `src/cli/commands/comment.ts`, which is deliberately just as inert.
  *
  * JOURNAL: newest first, matching the Turns tab convention. The journal is
@@ -157,7 +157,7 @@ export function taskCommentsTabHtml(input: TaskCommentsTabInput): string {
 /**
  * The refusal page for a comment that could NOT be written to the store.
  *
- * CLAUDE.md's first invariant is that human feedback is never silently
+ * AGENTS.md's first invariant is that human feedback is never silently
  * discarded. The browser has already thrown the textarea away by the time this
  * response renders, so the submitted text is echoed back verbatim in a
  * selectable block — the same "your reason was not lost" move `handleTaskAction`

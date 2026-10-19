@@ -74,11 +74,19 @@ export async function commandExportDockerfile(args: string[]): Promise<void> {
 
   console.log(theme.success(`Wrote default Dockerfile to ${targetName}`));
   console.log('');
-  console.log('  Customize it, then wire it up in lazy.toml:');
+  if (targetName === DEFAULT_OUTPUT) {
+    // With [docker].dockerfile unset, a root Dockerfile.lazy IS the image.
+    console.log(`  No lazy.toml change is needed: with [docker].dockerfile unset, lazy builds`);
+    console.log(`  ${DEFAULT_OUTPUT} at the project root for the next task. Customize it now.`);
+  } else {
+    console.log('  Customize it, then wire it up in lazy.toml:');
+    console.log('');
+    console.log('    [docker]');
+    console.log(`    dockerfile = "${targetName}"`);
+  }
   console.log('');
-  console.log('    [docker]');
-  console.log(`    dockerfile = "${targetName}"`);
-  console.log('');
+  console.log('  If your tasks run an agent other than Claude Code, add its install line');
+  console.log('  (after USER user) — the default image only carries Claude Code.');
   console.log(`  Lazy will rebuild the agent image from your Dockerfile on the next task run.`);
 }
 
@@ -88,8 +96,9 @@ export function exportDockerfileUsage(): void {
 Write the embedded default Dockerfile (used to build agent containers) to disk
 so you can customize it. Output defaults to ${DEFAULT_OUTPUT} in the project root.
 
-This does NOT modify lazy.toml — after editing, point [docker].dockerfile at the
-file yourself.
+This does NOT modify lazy.toml. A ${DEFAULT_OUTPUT} at the project root is used
+automatically when [docker].dockerfile is unset; for any other path, point
+[docker].dockerfile at the file yourself.
 
 Options:
   -o, --output <path>   Write to <path> instead of ${DEFAULT_OUTPUT}

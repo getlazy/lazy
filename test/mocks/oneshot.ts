@@ -268,3 +268,21 @@ export interface OneshotCommand {
 export async function admitOneshotCommand(_opts: { actor?: string } = {}): Promise<OneshotCommand> {
   return { run: (fn) => fn() };
 }
+
+/**
+ * The payer scope: a pass-through here. Who pays is planned inside the real
+ * runner path (`withOneshotPayment`), which this mock replaces wholesale; that
+ * planning is covered against the real module in
+ * test/unit/teams-no-system-credential.test.ts.
+ */
+export function runAsOneshotPayer<T>(_email: string | null | undefined, fn: () => Promise<T>): Promise<T> {
+  return fn();
+}
+
+export async function withOneshotPayment<T>(
+  _root: string,
+  req: OneshotRequest,
+  run: (req: OneshotRequest) => Promise<T>,
+): Promise<T> {
+  return run(req);
+}

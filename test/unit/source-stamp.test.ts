@@ -60,6 +60,22 @@ describe('source stamp', () => {
     expect(formatBuildIdentity(provenance)).toBe('main@abc1234, clean');
   });
 
+  // INVARIANT: no git BINARY at all (the daemon image's oven/bun build stage)
+  // reads the stamp exactly like a checkout with no .git. It used to throw on
+  // the missing binary, which failed the image build's compile step.
+  test('no git binary on PATH: the stamp still names the build, nothing throws', () => {
+    stamp({ LAZY_BUILD_SHA: 'abc1234', LAZY_BUILD_BRANCH: 'main', LAZY_BUILD_DIRTY: 'false', LAZY_BUILD_COMMIT_COUNT: '4100' });
+    const emptyBin = realpathSync(mkdtempSync(join(tmpdir(), 'lazy-no-git-')));
+    const savedPath = process.env.PATH;
+    process.env.PATH = emptyBin;
+    try {
+      expect(formatBuildIdentity(captureBuildProvenance(dir))).toBe('main@abc1234, clean');
+    } finally {
+      process.env.PATH = savedPath;
+      rmSync(emptyBin, { recursive: true, force: true });
+    }
+  });
+
   test('a non-main branch is alpha and a dirty tree says dirty, as with git', () => {
     stamp({ LAZY_BUILD_SHA: 'abc1234', LAZY_BUILD_BRANCH: 'lazy/x', LAZY_BUILD_DIRTY: 'true', LAZY_BUILD_COMMIT_COUNT: '12' });
 

@@ -5,7 +5,7 @@ import { getDataDir } from '../project-paths';
 /**
  * Async twin of src/cli/editor.ts's saveRecoveryFile, for use inside the daemon.
  *
- * CLAUDE.md: human feedback must be durably saved BEFORE anything that can fail
+ * AGENTS.md: human feedback must be durably saved BEFORE anything that can fail
  * (agent launch, container start, network) gets a chance to lose it. The CLI
  * version is sync because it runs once at CLI startup; the daemon must never
  * block its event loop, so this one is async and takes an explicit project root

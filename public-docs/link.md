@@ -90,6 +90,11 @@ If you linked a branch that has no pull request yet, lazy keeps looking during
 its normal remote check. When someone opens a PR for that branch later, the
 task picks it up. Lazy does not open a PR for you.
 
+The task follows its PR's fate. When the PR is merged on the forge, the task
+becomes **complete**; when it is closed without being merged, the task is
+**abandoned**, with a comment saying why. Either way lazy only reads the PR — it
+never comments on, closes or retargets it.
+
 ## What linked does *not* do
 
 - It does not start an agent.

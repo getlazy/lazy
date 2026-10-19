@@ -1024,7 +1024,7 @@ describe('GitLabDriver', () => {
     // before reporting 'merged'. If the verification API call fails (network,
     // throttle, auth), the driver MUST fail — silently returning 'merged' when
     // we cannot confirm causes the orchestrator to delete branches and report
-    // success for merges that never landed. See CLAUDE.md: "Fail hard on remote
+    // success for merges that never landed. See AGENTS.md: "Fail hard on remote
     // failures — no silent fallbacks."
     test('fails when glab mr merge succeeds but post-merge state verification (mr view) fails', async () => {
       const glCalls: string[][] = [];

@@ -32,7 +32,7 @@ enableInProcessTestMode();
 
 const VIOLATIONS: FileViolation[] = [
   { file: 'lazy.toml', base_sha: 'abc123', status: 'pending' },
-  { file: 'CLAUDE.md', base_sha: 'abc123', status: 'approved' },
+  { file: 'AGENTS.md', base_sha: 'abc123', status: 'approved' },
 ];
 
 describe('show RPC: file violations', () => {

@@ -32,6 +32,7 @@ describe("a member placeholder's origin pin", () => {
   let upstream: ReturnType<typeof Bun.serve>;
   let proxy: ReturnType<typeof Bun.serve>;
   let forwarded: string | null;
+  const realFetch = globalThis.fetch;
   const records: ProxyAuditRecord[] = [];
 
   beforeEach(async () => {
@@ -51,15 +52,24 @@ describe("a member placeholder's origin pin", () => {
         return Response.json({ type: 'message', model: 'test' });
       },
     });
+    // Stub the external provider transport, keeping the real Anthropic origin
+    // in the proxy so consent and provider checks are exercised unchanged.
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      const target = new URL(input instanceof Request ? input.url : String(input));
+      return target.origin === 'https://api.anthropic.com'
+        ? realFetch(`http://127.0.0.1:${upstream.port}${target.pathname}${target.search}`, init)
+        : realFetch(input, init);
+    }) as typeof fetch;
     const sink: AuditSink = { append: async (r: ProxyAuditRecord) => { records.push(r); } };
     proxy = createProxyServer(
-      { port: 0, bind: '127.0.0.1', upstream: `http://127.0.0.1:${upstream.port}`, resolveSessionCredential: createSessionCredentialResolver(root) },
+      { port: 0, bind: '127.0.0.1', upstream: 'https://api.anthropic.com', resolveSessionCredential: createSessionCredentialResolver(root) },
       sink,
       null,
     );
   });
 
   afterEach(async () => {
+    globalThis.fetch = realFetch;
     upstream.stop();
     proxy.stop();
     unpin();

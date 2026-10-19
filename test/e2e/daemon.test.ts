@@ -7,7 +7,7 @@
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { mkdtemp, rm, readFile, writeFile } from 'fs/promises';
+import { mkdtemp, rm, readFile, writeFile, mkdir, access } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -144,6 +144,21 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
       }
       await ctx.cleanup();
       await rm(tmpDir, { recursive: true, force: true });
+    });
+
+    // INVARIANT: daemon start deletes obsolete keys, without reading or migrating them.
+    test('startup deletes legacy agent keys at both locations and logs each path once', async () => {
+      const paths = [getDaemonDir(ctx.root), join(ctx.root, '.lazy')].map(directory => join(directory, 'agent-credentials.json'));
+      for (const path of paths) {
+        await mkdir(join(path, '..'), { recursive: true });
+        await writeFile(path, '{malformed secret');
+      }
+      daemon = await startDaemonServer({ token: 'test-cleanup-token', projectRoot: ctx.root });
+      for (const path of paths) await expect(access(path)).rejects.toThrow();
+      const log = await readFile(join(getDaemonDir(ctx.root), 'daemon.log'), 'utf8');
+      for (const path of paths) {
+        expect(log.split('\n').filter(line => line.includes(`Deleted obsolete plaintext agent credential file: ${path}`))).toHaveLength(1);
+      }
     });
 
     // INVARIANT: Daemon server binds its TCP port and responds to health checks.
@@ -1049,7 +1064,7 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
     // The daemon cannot service container-based workloads (builder, sandbox runners)
     // without a reachable web port — containers call back via host.docker.internal:<port>.
     // Silently degrading (as the old code did) made container RPCs throw the
-    // opaque "Daemon context not initialized" error. See CLAUDE.md invariants:
+    // opaque "Daemon context not initialized" error. See AGENTS.md invariants:
     // "fail hard on remote failures" and "principle of least surprise".
     test('daemon refuses to start with actionable error when web port is busy', async () => {
       // Squat an ephemeral port that the daemon will then try to bind.

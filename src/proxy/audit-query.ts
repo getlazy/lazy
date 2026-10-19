@@ -15,6 +15,7 @@
  */
 
 import type { ProxyAuditRecord, ProxyEnforcementAudit } from '../storage/types';
+import { endpointOf } from './latency';
 
 /** Filters applied to the trail. Every field is optional and ANDed. */
 export interface AuditFilters {
@@ -105,9 +106,16 @@ export interface AuditRow {
   role: string | null;
   taskId: string | null;
   model: string | null;
+  /** Wire endpoint kind (messages, …). */
   endpoint: string;
+  /** The upstream that served it: named endpoint, else the upstream origin. */
+  servedBy: string;
   status: number | null;
   durationMs: number | null;
+  /** Request start → first content token (ms); null when not measured. */
+  ttftMs: number | null;
+  /** Request start → last byte (ms); null when not measured. */
+  ttltMs: number | null;
   /** tool_use blocks carried on the request (intended actions). */
   toolUses: number;
   /** tool_result blocks carried on the request (results of prior actions). */
@@ -131,8 +139,11 @@ export function toAuditRow(record: ProxyAuditRecord): AuditRow {
     taskId: record.taskId,
     model: record.model,
     endpoint: record.endpoint,
+    servedBy: endpointOf(record),
     status: record.status,
     durationMs: record.durationMs,
+    ttftMs: record.ttftMs ?? null,
+    ttltMs: record.ttltMs ?? null,
     toolUses: record.toolUses?.length ?? 0,
     toolResults: record.toolResults?.length ?? 0,
     totalTokens: u

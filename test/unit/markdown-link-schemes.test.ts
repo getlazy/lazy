@@ -58,13 +58,13 @@ describe('safeLinkHref', () => {
 
   // A colon only asserts a SCHEME when what precedes it is scheme-shaped: a
   // letter, then letters/digits/+/-, with no dot. `file.ts:120` is the most
-  // common code reference agents write — CLAUDE.md tells them to, because it is
+  // common code reference agents write — AGENTS.md tells them to, because it is
   // clickable — and an earlier, broader check rendered every one of them as
   // grey inert text captioned "unsupported URL scheme".
   test('a dotted first segment is a relative path, not a scheme', () => {
     expect(safeLinkHref('markdown.ts:192')).toBe('markdown.ts:192');
     expect(safeLinkHref('src/server/markdown.ts:192')).toBe('src/server/markdown.ts:192');
-    expect(safeLinkHref('CLAUDE.md:1')).toBe('CLAUDE.md:1');
+    expect(safeLinkHref('AGENTS.md:1')).toBe('AGENTS.md:1');
     expect(safeLinkHref('test/unit/task-notes-tabs.test.ts:88')).toBe('test/unit/task-notes-tabs.test.ts:88');
 
     // The narrowing keys on the DOT, not on "looks like a path": an undotted
@@ -155,5 +155,21 @@ describe('renderMarkdown link rendering', () => {
       .toContain('href="/tasks/fix-docs"');
     expect(renderMarkdown('See fix-docs.', { linkify: [{ lookup, matchWords: true }] }))
       .toContain('href="/tasks/fix-docs"');
+  });
+});
+
+describe('fenced code block classes', () => {
+  // INVARIANT: a fence's info string yields at most ONE class, language-<word>.
+  // The rest is agent-written, and `md-copy` among it armed the dashboard's
+  // Copy handler, letting agent markdown overwrite the reader's clipboard.
+  test('extra words after the language never become classes', () => {
+    const html = renderMarkdown('```js md-copy" data-copy-md="x\nalert(1)\n```');
+    expect(html).toContain('<code class="language-js">');
+    expect(html).not.toContain('md-copy');
+  });
+
+  test('an info string that is not a language name yields no class', () => {
+    expect(renderMarkdown('``` md-copy\nx\n```')).toContain('<code class="language-md-copy">');
+    expect(renderMarkdown('```"><b>\nx\n```')).toContain('<pre><code>');
   });
 });

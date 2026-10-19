@@ -1,28 +1,24 @@
 /**
  * The wrap-up plan rules (final-turn design §3.2, §3.3) — which steps a turn
- * runs, resolved by the DAEMON from the task's audience and how the turn ended.
+ * runs, resolved by the DAEMON and carried on the command.
  *
- * INVARIANT (§13.3): the audience comes from `audienceOf` and nothing else —
- * `FinalClaim.wrap_up_steps` is an audit record and is never read back as the
- * plan. These tests pin the audience→steps mapping and the resolution inputs,
- * because a wrong plan here either bills an agent child for a presentation
- * nobody reads or skips the reader-facing work a person was promised.
+ * INVARIANT (engineer, 2026-10-04): every task runs every configured
+ * end-of-work step, whoever its audience is. An agent-audience plan used to
+ * run only the protected-file push-back, which silently suppressed the user's
+ * maintain/react rules and the leftovers commit for every cluster child and
+ * agent-created subtask. Audience never decides which rules run.
  *
  * INVARIANT (§13.5): the plan rides EVERY work command and the SUPERVISOR picks
  * a list from it by how the turn ended — that discipline is asserted in the
- * supervisor tests, not here. What is pinned here is that both lists are
- * present and that they never change shape between launches for the same
- * audience.
+ * supervisor tests, not here.
  */
 
 import { describe, test, expect } from 'bun:test';
 import type { Actor, Turn } from '../../src/types';
 import type { WrapUpStep } from '../../src/protocol/types';
-import { audienceOf } from '../../src/task/audience';
 import {
   resolvePresentedSha,
   resolveWrapUpPlan,
-  resolveWrapUpCommandFields,
   wrapUpPlanFor,
 } from '../../src/daemon/wrap-up-plan';
 
@@ -57,9 +53,9 @@ function planStorage(opts: {
 
 const FULL_PLAN: WrapUpStep[] = ['permission_pushback', 'maintain', 'react', 'commit_leftovers', 'present'];
 
-describe('wrapUpPlanFor — audience to steps', () => {
-  test('a human-audience task gets every step, in execution order', () => {
-    expect(wrapUpPlanFor('human').steps).toEqual(FULL_PLAN);
+describe('wrapUpPlanFor — one plan for every task', () => {
+  test('every task gets every step, in execution order', () => {
+    expect(wrapUpPlanFor().steps).toEqual(FULL_PLAN);
   });
 
   // INVARIANT: no step of the wrap-up asks the agent about the PROJECT. The
@@ -69,18 +65,11 @@ describe('wrapUpPlanFor — audience to steps', () => {
   // just as well. Nothing may re-add a step whose output is not about THIS
   // task's diff.
   test('no plan contains a systemic step', () => {
-    for (const audience of ['human', 'agent'] as const) {
-      const plan = wrapUpPlanFor(audience);
+    for (const hub of [false, true]) {
+      const plan = wrapUpPlanFor({ hub });
       expect(plan.steps).not.toContain('systemic' as never);
       expect(plan.park_steps).not.toContain('systemic' as never);
     }
-  });
-
-  test('an agent-audience task skips every reader-facing step', () => {
-    // Nobody opens the result, so present/react never run; pushback and
-    // Agent-audience tasks still record protected-file decisions even though
-    // they skip reader-facing maintenance and presentation work.
-    expect(wrapUpPlanFor('agent').steps).toEqual(['permission_pushback']);
   });
 
   // INVARIANT (this task): the walkthrough is owed on EVERY human-facing park,
@@ -89,14 +78,14 @@ describe('wrapUpPlanFor — audience to steps', () => {
   // deciding about a declared-done task. Gating it on the declaration meant the
   // human had to run a command to produce the thing that would tell them
   // whether to run the command.
-  test('the park plan records protected files and presents for a human audience', () => {
-    expect(wrapUpPlanFor('human').park_steps).toEqual(['permission_pushback', 'present']);
+  test('the park plan records protected files and presents', () => {
+    expect(wrapUpPlanFor().park_steps).toEqual(['permission_pushback', 'present']);
   });
 
   // INVARIANT: the rest of the chain is PENCILS-DOWN work.
   test('the park plan excludes final-only work', () => {
     for (const step of ['maintain', 'react', 'commit_leftovers'] as WrapUpStep[]) {
-      expect(wrapUpPlanFor('human').park_steps).not.toContain(step);
+      expect(wrapUpPlanFor().park_steps).not.toContain(step);
     }
   });
 
@@ -105,14 +94,10 @@ describe('wrapUpPlanFor — audience to steps', () => {
   // commit it is the case it exists for; before, because a commit it produces
   // must be in the file list the walkthrough is declared over.
   test('the leftovers check sits after the nudges and before the presentation', () => {
-    const steps = wrapUpPlanFor('human').steps;
+    const steps = wrapUpPlanFor().steps;
     expect(steps.indexOf('commit_leftovers')).toBeGreaterThan(steps.indexOf('maintain'));
     expect(steps.indexOf('commit_leftovers')).toBeGreaterThan(steps.indexOf('react'));
     expect(steps.indexOf('commit_leftovers')).toBeLessThan(steps.indexOf('present'));
-  });
-
-  test('an agent-audience task records permissions but does not present', () => {
-    expect(wrapUpPlanFor('agent').park_steps).toEqual(['permission_pushback']);
   });
 
   // INVARIANT (this task): a HUB presents by its CHILDREN, derived, with no
@@ -121,7 +106,7 @@ describe('wrapUpPlanFor — audience to steps', () => {
   // walkthrough of every feature in the release, which is what hit the
   // presentation item cap outright.
   test('a hub drops the presentation from both lists', () => {
-    const plan = wrapUpPlanFor('human', { hub: true });
+    const plan = wrapUpPlanFor({ hub: true });
     // Only the PRESENTATION is dropped: a hub's own worktree can hold loose
     // work like any other, so the leftovers check stays.
     expect(plan.steps).toEqual(['permission_pushback', 'maintain', 'react', 'commit_leftovers']);
@@ -129,55 +114,52 @@ describe('wrapUpPlanFor — audience to steps', () => {
   });
 
   // INVARIANT: the park plan is DERIVED from the final plan, never written out
-  // a second time — so "human audience, not a hub" cannot come to mean two
+  // a second time — so "not a hub" cannot come to mean two
   // different things on the two paths.
   test('every park step is also a final step', () => {
-    for (const audience of ['human', 'agent'] as const) {
-      for (const hub of [false, true]) {
-        const plan = wrapUpPlanFor(audience, { hub });
-        for (const step of plan.park_steps) expect(plan.steps).toContain(step);
-      }
+    for (const hub of [false, true]) {
+      const plan = wrapUpPlanFor({ hub });
+      for (const step of plan.park_steps) expect(plan.steps).toContain(step);
     }
   });
 });
 
-describe('resolveWrapUpPlan — audienceOf feeds the plan', () => {
+describe('resolveWrapUpPlan — audience never narrows the plan', () => {
   // Each of these awaits the call and asserts on the value, rather than using
   // `expect(promise).resolves`. Not a correctness fix: bun 1.4.2 does track an
   // un-awaited `.resolves` matcher and fails the test, so the un-awaited form
   // was never silently green (an earlier version of this comment claimed it
   // was — it was wrong). The reason for this shape is that it states the
   // timing itself instead of relying on the runner to notice.
-  test('an agent-launched recent turn yields the agent plan', async () => {
+  // INVARIANT (engineer, 2026-10-04): an agent-launched task — an
+  // agent-created subtask, a cluster child — gets the FULL plan: maintain,
+  // react and commit_leftovers run for it exactly as for a human's task.
+  test('an agent-launched task gets the full plan', async () => {
     const plan = await resolveWrapUpPlan(
       planStorage({ turns: [turn('human', 'agent'), turn('agent')], historyActor: 'agent' }),
       { id: 'task-1', type: 'task' } as never,
       'sess-1',
     );
-    expect(plan.steps).toEqual(['permission_pushback']);
-    expect(plan.park_steps).toEqual(['permission_pushback']);
+    expect(plan.steps).toEqual(FULL_PLAN);
+    expect(plan.park_steps).toEqual(['permission_pushback', 'present']);
   });
 
-
-  // INVARIANT: a start resolves its plan BEFORE recording turn 1 (so a failed
-  // setup step never leaves the task working), and the launching actor it
-  // passes decides the audience exactly as the recorded turn would — the
-  // task's CREATOR must not. An agent-created child a human starts is a
-  // human-audience task, and the reverse.
-  test('a pending launch actor wins over the creator', async () => {
-    const fields = (historyActor: 'agent' | 'human', pendingLaunchActor: 'agent' | 'human') =>
-      resolveWrapUpCommandFields({
-        storage: { ...(planStorage({ turns: [], historyActor }) as object), getTaskTurnReports: async () => [] } as never,
-        task: { id: 'task-1', type: 'task' } as never,
-        sessionId: 'sess-1',
-        session: { upstream_merge_sha: null } as never,
-        projectRoot: '/nonexistent',
-        worktreePath: '/nonexistent',
-        config: {} as never,
-        pendingLaunchActor,
-      });
-    expect((await fields('agent', 'human')).wrap_up?.steps).toEqual(FULL_PLAN);
-    expect((await fields('human', 'agent')).wrap_up?.steps).toEqual(['permission_pushback']);
+  // INVARIANT (engineer, 2026-10-04): a cluster's child is agent-audience
+  // (that is what defers its protected files to the cluster's accept), and it
+  // still runs the user's maintain rules and the leftovers commit.
+  test('a cluster child gets the full plan', async () => {
+    const storage = {
+      ...(planStorage({ turns: [turn('human', 'agent')], historyActor: 'agent' }) as object),
+      getTask: async () => ({ id: 'cluster-1', type: 'cluster', status: 'working' }),
+    } as never;
+    const plan = await resolveWrapUpPlan(
+      storage,
+      { id: 'task-1', type: 'task', parent_id: 'cluster-1' } as never,
+      'sess-1',
+    );
+    expect(plan.steps).toContain('maintain');
+    expect(plan.steps).toContain('commit_leftovers');
+    expect(plan.steps).toEqual(FULL_PLAN);
   });
 
   test('a human-launched recent turn yields the full plan', async () => {
@@ -190,7 +172,7 @@ describe('resolveWrapUpPlan — audienceOf feeds the plan', () => {
     expect(plan.park_steps).toEqual(['permission_pushback', 'present']);
   });
 
-  test('a failing status history still resolves — audience falls back to its safe default', async () => {
+  test('a failing status history still resolves to the full plan', async () => {
     const plan = await resolveWrapUpPlan(
       planStorage({ historyThrows: true }),
       { id: 'task-1', type: 'task' } as never,
@@ -251,24 +233,10 @@ describe('resolveWrapUpPlan — audienceOf feeds the plan', () => {
     expect(plan.park_steps).toEqual(['permission_pushback', 'present']);
   });
 
-  // INVARIANT: the plan depends on the AUDIENCE and nothing else. It used to
-  // take a launching actor too, because the systemic step re-armed on a new
-  // brief; with that step gone the parameter is gone, and re-adding one would
+  // INVARIANT: the plan takes no launching actor. Re-adding one would
   // re-introduce a plan that differs between launches of the same task.
-  //
-  // Asserted on the SIGNATURE rather than by calling twice: with no actor to
-  // vary, two identical calls cannot disagree, so that version of this test
-  // could never have failed.
   test('resolveWrapUpPlan takes no launching-actor argument', () => {
     expect(resolveWrapUpPlan.length).toBe(3); // storage, task, sessionId
-  });
-
-  test('the plan is re-derived from the CURRENT launching actor, never cached', () => {
-    // A task a loop started but a human later picked up: the latest turn
-    // decides, per §13.3, so the wrap-up must include the reader-facing work.
-    expect(audienceOf({
-      turns: [turn('human', 'agent'), turn('agent'), turn('human', 'builder')],
-    })).toBe('human');
   });
 });
 

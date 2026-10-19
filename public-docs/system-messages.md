@@ -24,6 +24,10 @@ Each message carries:
 | `kind` | `report` (a produced analysis), `notice` (a system event worth knowing), or `alert` (needs attention soon) |
 | `read_at` / `dismissed_at` | Lifecycle state — see below |
 
+Secret values lazy knows about (a task's secret environment variables and
+files) are scrubbed from the title and body when a message is written, so a
+report that quotes an agent's error output never shows them in clear.
+
 ## Lifecycle: append-only, never deleted
 
 Creation is append-only. Messages are never edited or deleted — reading and
@@ -37,6 +41,12 @@ told you is permanent:
   injected but stay in `lazy messages list`.
 - **dismissed** — hidden from default surfaces. `lazy messages list --all`
   still shows it, forever.
+
+**Repeats.** Some events recur — Docker restarting again and again in a
+project's machine, for example. Instead of filing a new message each time, lazy
+keeps one open message for the event and counts the repeats on it ("happened 37
+times, last …"). A different kind of event still gets its own message, and once
+you dismiss the message the next occurrence starts a fresh one.
 
 ## Surfaces
 
@@ -52,8 +62,15 @@ section; it never blocks the launch.
 lazy messages                 # the inbox (dismissed hidden)
 lazy messages read 3f9a01b2   # full body; marks it read
 lazy messages dismiss 3f9a01b2
+lazy messages dismiss --source machine-docker   # every open message from one source
+lazy messages dismiss --title "restarted"       # every open message whose title contains it
+lazy messages dismiss --all                     # every open message
 lazy messages list --all      # everything, including dismissed
 ```
+
+A bulk dismissal shows how many messages match and asks before acting; `--yes`
+skips the question (and is required when there is no terminal to ask on).
+`--source` and `--title` combine.
 
 **MCP tools.**
 
@@ -80,7 +97,11 @@ prints its address — serves the same inbox at `/messages`:
   Opening it marks it read: `read_at` records that you have *seen* the message,
   and the body being on your screen is the most direct evidence of that. This
   matches `lazy messages read <id>`.
-- **Dismiss** is a button on both the list and the message itself. **Mark read**
+- **Dismiss** is a button on both the list and the message itself.
+  **Dismiss all like this** files away every open message with the same source
+  and title, and **Dismiss all** (on the inbox) every open message — both ask
+  first, and nothing is deleted. Lazy Teams' Messages page offers the same
+  buttons. **Mark read**
   is offered too, on unread rows, for filing something you have decided about
   from the title alone.
 - The nav carries an unread badge and the dashboard shows an unread panel, so a

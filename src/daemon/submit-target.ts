@@ -4,7 +4,7 @@
  * asks before its confirmation prompt) and `submitTask` itself, so the two can
  * never disagree about a refusal.
  *
- * INVARIANT (CLAUDE.md "PRs only for protected branches", as amended
+ * INVARIANT (AGENTS.md "PRs only for protected branches", as amended
  * 2026-09-24): lazy never opens a PR/MR for an INTERMEDIATE branch — a task
  * stacked on another task, or a `lazy/...` target — on its own. Accept merges
  * those locally and no automatic path creates one. An explicit submit by a
@@ -23,6 +23,7 @@ import { actorRole } from '../actor-ref';
 import { parentTaskIdOf, targetBranchOf } from '../task-target';
 import { looksLikeTaskBranch } from '../git/branch-prefix';
 import { getBranchNameFromId, displayId } from '../task/identity';
+import { LocalDriver } from '../remote/local-driver';
 import { runGit } from '../utils/git';
 import { logger } from '../utils/logger';
 
@@ -57,6 +58,30 @@ export async function resolveSubmitTarget(task: Task, storage: Storage): Promise
 /** Only a person's explicit submit may open a PR/MR into an intermediate branch. */
 export function mayOpenIntermediateReview(actor: ActorInput | undefined): boolean {
   return actorRole(actor) === 'human';
+}
+
+/**
+ * What "submit" means when the mirroring local driver applies (a managed
+ * project whose repository is not on GitHub or GitLab — above all one Lazy
+ * Teams hosts): there is no forge, so no PR/MR exists to open. Review happens
+ * on the task in Teams; accept merges and pushes the target branch to origin.
+ * Shared by the preflight and submitTask so every client says it in the same words.
+ */
+export function hostedSubmitRefusal(task: Task): string {
+  return (
+    `Nothing to submit for ${displayId(task)}: this project's repository is not on GitHub or GitLab ` +
+    `(Lazy Teams hosts it), so there are no pull requests. Review the task in Lazy Teams; its branch is pushed ` +
+    `to the repository's origin after each turn. Accepting it merges the work into its target branch and ` +
+    `pushes that branch to origin, so teammates see it with \`git fetch\`. To get pull requests, connect the ` +
+    `project to GitHub or GitLab.`
+  );
+}
+
+/** Why a driver with no forge cannot submit: mirrors origin (Teams-hosted), or plain local. */
+export function noForgeSubmitRefusal(driver: RepositoryDriver, task: Task): string {
+  return driver instanceof LocalDriver && driver.originMirror !== null
+    ? hostedSubmitRefusal(task)
+    : 'Submit requires a remote driver (e.g., github). Local driver has no remote to create PRs on.';
 }
 
 /** The refusal an agent or the builder gets for an intermediate target. */

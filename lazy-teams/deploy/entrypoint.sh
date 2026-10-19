@@ -29,7 +29,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/configure-docker-socket.sh
 # As `rails`, like every other lazy invocation here: root would be able to leave
 # root-owned artefacts in a tree the app then runs as uid 1000.
 lazy_source_id() {
-  gosu rails bun run /lazy/src/index.ts system source-id
+  gosu rails /lazy/bin/lazy system source-id
 }
 
 configure_docker_socket_access
@@ -201,7 +201,7 @@ fi
 # to disagree.
 if ! LAZY_SOURCE_ID="$(lazy_source_id)" || [[ -z "${LAZY_SOURCE_ID}" ]]; then
   log "could not read the lazy source identity from /lazy — the image is incomplete"
-  log "(expected 'bun run /lazy/src/index.ts system source-id' to print an id)"
+  log "(expected '/lazy/bin/lazy system source-id' to print an id)"
   exit 1
 fi
 
@@ -242,7 +242,7 @@ build_lazy_runner() {
   # the whole invocation with "Unknown flag: --yes". Nothing in the repository
   # ran this line, so it shipped broken from the day it was written.
   if ! gosu rails env LAZY_MANAGED= LAZY_MANAGED_STORAGE_PATH= \
-      bun run /lazy/src/index.ts system build lazy-runner; then
+      /lazy/bin/lazy system build lazy-runner; then
     log "lazy-runner build failed — task containers will not start until this succeeds"
     exit 1
   fi

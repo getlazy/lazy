@@ -347,3 +347,79 @@ describe('reconciler: a crashed sync and the restore marker', () => {
     expect((await env.storage.getTask(taskId))?.status).toBe('blocked');
   });
 });
+
+describe('reconciler: a failed turn that left work uncommitted', () => {
+  let env: Env;
+
+  beforeEach(async () => { env = await setupEnv(); });
+  afterEach(async () => { await env.cleanup(); });
+
+  const left = (r: ErrorResponse): ErrorResponse => ({ ...r, uncommitted: ['src/a.ts', 'docs/b.md'] });
+  const announcements = async (taskId: string) => ({
+    comments: (await env.storage.getTaskComments(taskId))
+      .filter(c => c.content.startsWith('[Uncommitted work left behind]')),
+    notices: (await env.storage.listSystemMessages())
+      .filter(m => m.title.includes('uncommitted work left behind')),
+  });
+
+  // INVARIANT: a FATAL failure parks the task for a human, so loose work in its
+  // worktree is announced (comment + notice), never left as a turn badge alone.
+  test('a fatal failure announces the loose paths', async () => {
+    const { taskId, sessionId, protoDir } = await makeTask(env, 'working');
+    deliver(protoDir, left(fatalResponse));
+    await handleErrorResponse(env.storage, taskId, { id: sessionId }, left(fatalResponse), protoDir, env.lazyRoot);
+
+    const { comments, notices } = await announcements(taskId);
+    expect(comments.length).toBe(1);
+    expect(comments[0].content).toContain('docs/b.md');
+    expect(notices.length).toBe(1);
+  });
+
+  // INVARIANT: a failed turn's announcement never tells the agent to commit.
+  // A read-only self-review that wrote fails `fatal_config` with the reviewer's
+  // edits loose; the design keeps those uncommitted for a person, and a comment
+  // saying "commit with lazy_commit" would be delivered on the next unblock.
+  test('a read-only write-check failure is announced without a commit instruction', async () => {
+    const { taskId, sessionId, protoDir } = await makeTask(env, 'working');
+    const readOnly: ErrorResponse = {
+      status: 'error',
+      error: 'Work phase failed: the self-review is read-only but the worktree changed: reviewer-edit.txt',
+      phase: 'work',
+      failure_class: 'fatal_config',
+      failure_reason: 'read-only turn could not be trusted (see the error)',
+      failure_attempts: 1,
+      uncommitted: ['reviewer-edit.txt'],
+    };
+    deliver(protoDir, readOnly);
+    await handleErrorResponse(env.storage, taskId, { id: sessionId }, readOnly, protoDir, env.lazyRoot);
+
+    const { comments, notices } = await announcements(taskId);
+    expect(comments.length).toBe(1);
+    expect(comments[0].content).toContain('reviewer-edit.txt');
+    expect(comments[0].content).not.toContain('lazy_commit');
+    expect(notices.length).toBe(1);
+  });
+
+  // INVARIANT: a superseded crash report (response.json already moved aside by
+  // a newer command) never posts onto a task a newer turn owns.
+  test('a superseded fatal report announces nothing', async () => {
+    const { taskId, sessionId, protoDir } = await makeTask(env, 'working');
+    await handleErrorResponse(env.storage, taskId, { id: sessionId }, left(fatalResponse), protoDir, env.lazyRoot);
+
+    const { comments, notices } = await announcements(taskId);
+    expect(comments.length).toBe(0);
+    expect(notices.length).toBe(0);
+  });
+
+  // INVARIANT: an ordinary crash auto-resumes into the same worktree, whose
+  // next turn's wrap-up asks about the loose work — announcing it here is noise.
+  test('an ordinary crash (interrupted, auto-resumed) announces nothing', async () => {
+    const { taskId, sessionId, protoDir } = await makeTask(env, 'working');
+    deliver(protoDir, left(plainCrash));
+    await handleErrorResponse(env.storage, taskId, { id: sessionId }, left(plainCrash), protoDir, env.lazyRoot);
+
+    const { comments, notices } = await announcements(taskId);
+    expect(comments.length).toBe(0);
+    expect(notices.length).toBe(0);
+  });
+});

@@ -7,6 +7,8 @@
  * with an actionable error instead of falling back to direct execution.
  */
 
+import { authProxyMessage, gatherProxyEvidence, looksLikeAuthProxy, redirectMessage } from '../teams/auth-proxy';
+import { TeamsRequestError } from '../teams/device-auth';
 import { parseAcceptRemedy } from '../types';
 import type { AcceptRemedy } from '../types';
 import {
@@ -299,6 +301,10 @@ export class DaemonClient {
       return body;
     }
 
+    // A bound clone's request that a sign-in proxy answered with its own page:
+    // the address is right, and "RPC failed: 200 <html>" names nothing.
+    if (this.teams) await this.refuseIfAuthProxy(response);
+
     if (!response.ok) {
       const body = await response.text().catch(() => '');
       if (this.teams) {
@@ -325,6 +331,18 @@ export class DaemonClient {
     return response.json();
   }
 
+  /** Throws a message naming the proxy when Teams' own surface was answered by one. */
+  private async refuseIfAuthProxy(response: Response): Promise<void> {
+    const moved = redirectMessage(this.target, response);
+    if (moved) throw new TeamsRequestError(moved, response.status);
+    // Teams answers JSON, always: never buffer (or clone) a JSON reply just to ask.
+    if (/json/i.test(response.headers.get('content-type') ?? '')) return;
+    const evidence = await gatherProxyEvidence(response.clone());
+    if (looksLikeAuthProxy(evidence, response.url || this.target)) {
+      throw new TeamsRequestError(authProxyMessage(this.target, evidence), response.status);
+    }
+  }
+
   private async send(
     command: string,
     project: string,
@@ -338,6 +356,8 @@ export class DaemonClient {
     // property of THIS call, not of the request's shape.
     if (signal) options.signal = signal;
     Object.assign(options.headers as Record<string, string>, teamsProjectHeaders(this.teams));
+    // Never follow a redirect with a Teams token: refuseIfAuthProxy reports where it went.
+    if (this.teams) (options as { redirect?: string }).redirect = 'manual';
     return await fetch(url, options as any);
   }
 }
@@ -420,12 +440,23 @@ export function teamsCommandRefusal(
   const refused = command === 'storage' && typeof params.method === 'string'
     ? `storage.${params.method}`
     : command;
+  const why = TEAMS_REFUSAL_REASONS[refused];
   return new TeamsCommandRefusedError(
     `This clone is bound to Lazy Teams (${teams.project} on ${teams.url}), and Teams does not offer ` +
-    `'${refused}' to a bound clone. ${way}`,
+    `'${refused}' to a bound clone${why ? ` — ${why}` : ''}. ${way}`,
     refused,
   );
 }
+
+/**
+ * Why Teams withholds a few things a person reaches through a command that
+ * otherwise works, so the refusal says what the command was trying to do
+ * rather than only an RPC or storage name.
+ */
+const TEAMS_REFUSAL_REASONS: Readonly<Record<string, string>> = {
+  'storage.getAgentSessionLog':
+    "reading a task's raw agent transcript, which Teams does not hand to a clone (the web UI shows the turns instead)",
+};
 
 /**
  * The error a bound clone shows when a call to Teams fails in a way the
@@ -441,6 +472,8 @@ export function teamsCommandRefusal(
 export function boundCloneFailure(teams: TeamsTarget, err: unknown): unknown {
   // Teams was reached and answered: it already names the binding and the way forward.
   if (err instanceof TeamsCommandRefusedError) return err;
+  // Teams' own reach was answered by a sign-in proxy: the message already says so.
+  if (err instanceof TeamsRequestError) return err;
   const where = `${teams.project} on ${teams.url}`;
   const ways =
     'Run `lazy login` to sign in again, or `lazy logout` to work on this clone as a local project instead.';

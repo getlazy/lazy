@@ -4,6 +4,10 @@ import type { ResolvedConfig, ChattinessLevel } from '../../src/config/types';
 import { resolveBuilderChattiness, resolveAgentChattiness, renderChattinessSnippet } from '../../src/config/chattiness';
 import { buildSystemPrompt } from '../../src/task/turn-context';
 import builderSystemPrompt from '../../src/prompts/builder-system-prompt.md' with { type: 'text' };
+import recordAskSingle from '../../src/prompts/task-record-ask-single.md' with { type: 'text' };
+import recordAskReduce from '../../src/prompts/task-record-ask-reduce.md' with { type: 'text' };
+import conversationAskSingle from '../../src/prompts/conversation-ask-single.md' with { type: 'text' };
+import conversationAskReduce from '../../src/prompts/conversation-ask-reduce.md' with { type: 'text' };
 
 function makeConfig(chattiness: Partial<ResolvedConfig['chattiness']>): ResolvedConfig {
   return {
@@ -71,7 +75,7 @@ describe('agent system prompt assembly', () => {
   test('places the snippet at the top of the prompt when set', () => {
     const snippet = renderChattinessSnippet('terse');
     const prompt = buildSystemPrompt('RUNNER', snippet);
-    expect(prompt.startsWith(snippet)).toBe(true);
+    expect(prompt).toContain(snippet);
     expect(prompt.indexOf('Response verbosity')).toBeLessThan(prompt.indexOf('RUNNER'));
   });
 
@@ -93,5 +97,19 @@ describe('builder system prompt template', () => {
     const corePrincipleIdx = builderSystemPrompt.indexOf('## Core principle');
     expect(placeholderIdx).toBeGreaterThan(-1);
     expect(placeholderIdx).toBeLessThan(corePrincipleIdx);
+  });
+});
+
+describe('answer depth guidance', () => {
+  test('applies even when response verbosity is unset', () => {
+    expect(buildSystemPrompt('RUNNER')).toContain("Match the level of the human's question");
+    expect(builderSystemPrompt).toContain('Answer at the level asked');
+  });
+
+  test('stored-record and conversation answers do not dump unrequested evidence', () => {
+    for (const template of [recordAskSingle, recordAskReduce, conversationAskSingle, conversationAskReduce]) {
+      expect(template).toContain('Match the level of the question');
+      expect(template).toMatch(/unless requested|only when asked|only on request|when the question calls/);
+    }
   });
 });

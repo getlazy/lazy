@@ -36,6 +36,7 @@ import {
   preflightAgentBinaryInImage,
   listLazyImages,
   isImageTooOld,
+  classifyRunnerPullFailure,
   IMAGE_TAG,
   IMAGE_MAX_AGE_DAYS,
   IMAGE_MAX_AGE_MS,
@@ -43,7 +44,11 @@ import {
   resetUpgradeImageBuild,
   evaluateUpgradeRebuild,
 } from '../../src/capture/claude';
-import { imageTagFor } from '../../src/capture/image-tag';
+import { imageTagFor, runnerContentTag } from '../../src/capture/image-tag';
+import { PUBLISHED_RUNNER_REF, runnerIdentityHash } from '../../src/docker/runner-dockerfile';
+import { setOfflineMode } from '../../src/utils/offline';
+import { publishedRunnerImageLabels, runnerImageAgents, composeRunnerDockerfile } from '../../src/docker/runner-dockerfile';
+import { getAgentPackaging, listAgents } from '../../src/agent/registry';
 import { startBackgroundImageBuild } from '../../src/upgrade/background-image-build';
 import { checkStaleLazyImages } from '../../src/cli/commands/doctor';
 import { findStaleLazyImages } from '../../src/cli/commands/doctor-remedies';
@@ -384,13 +389,14 @@ describe('runner image identity and freshness', () => {
     expect(result.warning).toBeUndefined();
   });
 
-  // --- agent-aware images (cursor-first-class-agent) ----------------------
+  // --- one runner image for every agent (published-runner-image) --------
   //
-  // A container-capable non-claude agent (cursor) gets its OWN image: the
-  // default Dockerfile plus the agent's install command, under a repository
-  // that never collides with the base lazy-runner image.
+  // INVARIANT: the default image carries EVERY container-capable agent's CLI,
+  // so every agent resolves to the one lazy-runner image. Per-agent variants
+  // meant patching Dockerfiles, which hid what an image contained (engineer
+  // decision 2026-09-27, docs/design/published-runner-image.md).
 
-  test('a cursor-default project resolves an agent-suffixed repository with a distinct hash', async () => {
+  test('a cursor-default project runs the same lazy-runner image with the same identity', async () => {
     const baseHash = await calculateImageInputsHash(ctx.root);
 
     const configPath = join(ctx.root, 'lazy.toml');
@@ -399,20 +405,8 @@ describe('runner image identity and freshness', () => {
     expect(updated).not.toBe(toml);
     await writeFile(configPath, updated);
 
-    const ref = await resolveImageName(ctx.root);
-    expect(ref).toBe(`lazy-runner-cursor:${IMAGE_TAG}`);
-
-    const cursorHash = await calculateImageInputsHash(ctx.root);
-    expect(cursorHash).not.toBe(baseHash);
-  });
-
-  // Per-task --agent override: a claude-default project still builds the
-  // cursor image when the TASK's agent is cursor.
-  test('an explicit agentId override resolves the agent image on a claude-default project', async () => {
     expect(await resolveImageName(ctx.root)).toBe(IMAGE_REF);
-    expect(await resolveImageName(ctx.root, 'cursor')).toBe(`lazy-runner-cursor:${IMAGE_TAG}`);
-    // claude-code override is a no-op — the base image already contains it.
-    expect(await resolveImageName(ctx.root, 'claude-code')).toBe(IMAGE_REF);
+    expect(await calculateImageInputsHash(ctx.root)).toBe(baseHash);
   });
 
   // --- custom-Dockerfile agent-binary preflight (cursor-first-class-agent §2) --
@@ -460,26 +454,25 @@ describe('runner image identity and freshness', () => {
     const toml = await readFile(configPath, 'utf-8');
     await writeFile(configPath, toml.replace('dockerfile = "Dockerfile.custom"', 'dockerfile = ""'));
     await docker.failRuns(); // would fail if a probe ran
-    await preflightAgentBinaryInImage(`lazy-runner-cursor:${IMAGE_TAG}`, docker.binPath, 'cursor');
+    await preflightAgentBinaryInImage(IMAGE_REF, docker.binPath, 'cursor');
     const runs = (await docker.invocations()).filter(line => line.startsWith('run '));
     expect(runs.length).toBe(0);
   });
 
-  test('the built agent image Dockerfile contains the cursor install command', async () => {
-    const used = await ensureImage(docker.binPath, { agentId: 'cursor' });
-    expect(used).toBe(`lazy-runner-cursor:${IMAGE_TAG}`);
+  test('the built default image Dockerfile contains every agent CLI', async () => {
+    const used = await ensureImage(docker.binPath);
+    expect(used).toBe(IMAGE_REF);
 
     const builds = await docker.builds();
     expect(builds.length).toBe(1);
     // The build argv carries `-f <path>` to the temp Dockerfile lazy wrote —
-    // read it back to assert the agent install was appended.
+    // read it back to assert every agent's install line is in it.
     const match = builds[0].match(/-f (\S+)/);
     expect(match).not.toBeNull();
     const dockerfile = await readFile(match![1], 'utf-8');
     expect(dockerfile).toContain('cursor.com/install');
-    // The base image content is still there (claude stays available for
-    // in-container merge turns).
     expect(dockerfile).toContain('claude.ai/install.sh');
+    expect(dockerfile).toContain('openai/codex/releases');
   });
 
   // --- Dockerfile resolution: root-joined; worktree never auto-governs ---
@@ -577,6 +570,109 @@ describe('runner image identity and freshness', () => {
     } finally {
       process.chdir(ctx.root);
     }
+  });
+
+  // --- Root Dockerfile.lazy convention -------------------------------------
+  //
+  // INVARIANT: with `[docker].dockerfile` unset, a Dockerfile.lazy in the
+  // PROJECT ROOT is the image — so an accepted Dockerfile.lazy governs the next
+  // launch with no config edit. A worktree's Dockerfile.lazy still never does.
+
+  // The root file lands through an accept, i.e. a COMMIT on the root branch.
+  const commitRootDockerfile = () => {
+    expect(ctx.git('add', 'Dockerfile.lazy').exitCode).toBe(0);
+    expect(ctx.git('commit', '-q', '--no-verify', '-m', 'accept: task image').exitCode).toBe(0);
+  };
+
+  // INVARIANT: an UNTRACKED root Dockerfile.lazy is never the image — nobody
+  // reviewed or accepted it. The launch uses the default image and says why.
+  test('an untracked root Dockerfile.lazy is not the image, and the launch says why', async () => {
+    await writeFile(join(ctx.root, 'Dockerfile.lazy'), 'FROM lazy-runner\nRUN echo unreviewed\n');
+    const notes: string[] = [];
+    expect(await ensureImage(docker.binPath, { notify: (n) => notes.push(n) })).toBe(IMAGE_REF);
+    expect(notes.some(n => /not committed/.test(n))).toBe(true);
+  });
+
+  test('a root Dockerfile.lazy with no config key is the image on the next launch', async () => {
+    const content = 'FROM lazy-runner\nRUN sudo apt-get install -y cargo\n';
+    await writeFile(join(ctx.root, 'Dockerfile.lazy'), content);
+    commitRootDockerfile();
+
+    const used = await ensureImage(docker.binPath);
+
+    expect(used).toBe(`lazy-custom-${shortHashOf(content)}:${IMAGE_TAG}`);
+    const builds = await docker.builds();
+    expect(builds.some(b => b.includes(`-t lazy-custom-${shortHashOf(content)}`))).toBe(true);
+  });
+
+  // INVARIANT: the image identity AND the Dockerfile docker builds are the
+  // COMMITTED bytes — uncommitted edits in the root checkout reach neither.
+  test('uncommitted edits to the root Dockerfile.lazy reach neither the identity nor the build', async () => {
+    const committed = 'FROM lazy-runner\n# accepted\n';
+    await writeFile(join(ctx.root, 'Dockerfile.lazy'), committed);
+    commitRootDockerfile();
+    await writeFile(join(ctx.root, 'Dockerfile.lazy'), 'FROM lazy-runner\nRUN echo unreviewed\n');
+
+    const used = await ensureImage(docker.binPath);
+
+    expect(used).toBe(`lazy-custom-${shortHashOf(committed)}:${IMAGE_TAG}`);
+    const builds = await docker.builds();
+    const index = builds.findIndex(b => b.includes(`-t lazy-custom-${shortHashOf(committed)}`));
+    expect(index).toBeGreaterThanOrEqual(0);
+    expect(await docker.buildContextContent(index, 'dockerfile')).toBe(committed);
+  });
+
+  test('changing the root Dockerfile.lazy (an accept) rebuilds under a new identity', async () => {
+    const first = 'FROM lazy-runner\n# v1\n';
+    await writeFile(join(ctx.root, 'Dockerfile.lazy'), first);
+    commitRootDockerfile();
+    const before = await ensureImage(docker.binPath);
+
+    const second = 'FROM lazy-runner\nRUN sudo apt-get install -y nodejs\n';
+    await writeFile(join(ctx.root, 'Dockerfile.lazy'), second);
+    commitRootDockerfile();
+    const after = await ensureImage(docker.binPath);
+
+    expect(after).not.toBe(before);
+    expect(after).toBe(`lazy-custom-${shortHashOf(second)}:${IMAGE_TAG}`);
+  });
+
+  test("a worktree's Dockerfile.lazy is not the image when the root has none", async () => {
+    const wt = join(ctx.root, '.lazy', 'worktrees', 'toolchain-branch');
+    await mkdir(join(ctx.root, '.lazy', 'worktrees'), { recursive: true });
+    expect(ctx.git('worktree', 'add', '-q', '-b', 'lazy/toolchain-branch', wt).exitCode).toBe(0);
+    await writeFile(join(wt, 'Dockerfile.lazy'), 'FROM lazy-runner\nRUN echo agent-authored\n');
+    await commitAll(wt, 'agent adds Dockerfile.lazy');
+
+    process.chdir(wt);
+    try {
+      expect(await ensureImage(docker.binPath)).toBe(IMAGE_REF);
+    } finally {
+      process.chdir(ctx.root);
+    }
+  });
+
+  // INVARIANT: a root Dockerfile.lazy that fails to build fails the launch,
+  // naming the file — never a silent fall back to the default image.
+  test('a root Dockerfile.lazy that fails to build fails loudly, naming the file', async () => {
+    // A plain base, so the failure is THIS file's build, not a base-image build.
+    const rootDockerfile = join(ctx.root, 'Dockerfile.lazy');
+    await writeFile(rootDockerfile, 'FROM debian:bookworm-slim\nRUN false\n');
+    commitRootDockerfile();
+    await docker.failBuilds();
+
+    const err = await ensureImage(docker.binPath).then(() => null, (e: Error) => e);
+    expect(err).not.toBeNull();
+    // Names the COMMITTED file it built (never the working-tree copy) and where.
+    expect(err!.message).toMatch(/Dockerfile\.lazy as committed \([0-9a-f]{12}\)/);
+    expect(err!.message).toContain(await realpath(ctx.root));
+    expect(err!.message).toContain('Last output:');
+    expect(err!.message).not.toMatch(/Base image/i);
+    // Exactly the one failed build, of the project file — nothing retried
+    // from the default Dockerfile.
+    const builds = await docker.builds();
+    expect(builds).toHaveLength(1);
+    expect(builds[0]).toContain('lazy-custom-');
   });
 
   // INVARIANT: without the upgrade-build latch, ensureImage soft-pins an
@@ -714,5 +810,229 @@ describe('runner image identity and freshness', () => {
     const builds = await docker.builds();
     expect(builds.length).toBe(1);
     expect(builds[0]).toContain('lazy-custom-');
+  });
+  // --- the published runner image (published-runner-image) ----------------
+  //
+  // INVARIANT: launches PULL the release's runner image and re-tag it locally;
+  // a local build is the fallback, never removed. The release publishes the
+  // same composed Dockerfile this binary builds, and the identity label is what
+  // proves it (docs/design/published-runner-image.md §4).
+
+  // INVARIANT: lazy pulls the runner by its CONTENT tag, sha-<first 16 hex of the
+  // identity label>, from the one function the publish script also calls. A launch
+  // and the release computing it differently would mean every pull misses.
+  test('the pulled ref is the content tag of the composed runner', () => {
+    expect(runnerContentTag('0123456789abcdef0123')).toBe('sha-0123456789abcdef');
+    expect(PUBLISHED_RUNNER_REF).toBe(`ghcr.io/getlazy/lazy-runner:${runnerContentTag(runnerIdentityHash())}`);
+    const script = Bun.spawnSync(['bun', 'scripts/runner-image-dockerfile.ts', '--content-tag'], { cwd: join(import.meta.dir, '..', '..') });
+    expect(script.stdout.toString().trim()).toBe(PUBLISHED_RUNNER_REF.split(':').pop()!);
+  });
+
+  // INVARIANT: the labels the release stamps equal the identity a local build
+  // of the same text computes. If they drifted, every launch would reject the
+  // published image and silently go back to multi-minute local builds.
+  test('the release labels match the local identity for the default image', async () => {
+    const labels = publishedRunnerImageLabels();
+    expect(labels['lazy.dockerfile.hash']).toBe(await calculateImageInputsHash(ctx.root));
+    expect(labels['lazy.base.source']).toBe('published');
+  });
+
+  test('the runner Dockerfile installs every container-capable agent, once each', () => {
+    const expected = listAgents().filter(id => getAgentPackaging(id).supportsContainerRunner());
+    expect(runnerImageAgents()).toEqual(expected);
+    expect(expected).toEqual(expect.arrayContaining(['claude-code', 'codex', 'cursor', 'pi']));
+    const dockerfile = composeRunnerDockerfile();
+    for (const id of expected) {
+      const install = getAgentPackaging(id).dockerInstallCommand();
+      expect(dockerfile.split(install).length - 1).toBe(1);
+    }
+  });
+
+  test('a published image for this version is pulled and tagged — nothing is built', async () => {
+    await docker.publishImage(PUBLISHED_RUNNER_REF, { dockerfileHash: await calculateImageInputsHash(ctx.root) });
+
+    expect(await ensureImage(docker.binPath)).toBe(IMAGE_REF);
+
+    expect(await docker.pulls()).toEqual([`pull ${PUBLISHED_RUNNER_REF}`]);
+    expect(await docker.builds()).toEqual([]);
+    const tags = (await docker.invocations()).filter(line => line.startsWith('tag '));
+    expect(tags).toEqual([
+      `tag ${PUBLISHED_RUNNER_REF} ${IMAGE_REF}`,
+      `tag ${PUBLISHED_RUNNER_REF} lazy-runner:latest`,
+    ]);
+  });
+
+  test('an unpublished version builds locally, labelled local and tagged with the published ref', async () => {
+    expect(await ensureImage(docker.binPath)).toBe(IMAGE_REF);
+
+    expect((await docker.pulls()).length).toBe(1);
+    const builds = await docker.builds();
+    expect(builds.length).toBe(1);
+    expect(builds[0]).toContain('--label lazy.base.source=local');
+    expect(builds[0]).toContain(`-t ${PUBLISHED_RUNNER_REF}`);
+  });
+
+  // A published image whose identity label differs means the release built a
+  // different Dockerfile than this binary composes — never used.
+  test('a published image with a different identity is not used', async () => {
+    await docker.publishImage(PUBLISHED_RUNNER_REF, { dockerfileHash: 'some-other-dockerfile' });
+
+    await ensureImage(docker.binPath);
+
+    expect((await docker.pulls()).length).toBe(1);
+    expect((await docker.builds()).length).toBe(1);
+    expect((await docker.invocations()).some(line => line.startsWith(`tag ${PUBLISHED_RUNNER_REF}`))).toBe(false);
+  });
+
+  // INVARIANT: a PULLED image pins its agent CLIs to its release and is never
+  // age-rebuilt — newer CLIs come by upgrading lazy (engineer decision
+  // 2026-09-27). A LOCAL build keeps the age trigger (covered above).
+  test('a pulled image older than the age limit is not rebuilt', async () => {
+    const hash = await calculateImageInputsHash(ctx.root);
+    await docker.publishImage(PUBLISHED_RUNNER_REF, { dockerfileHash: hash, createdAt: ago(IMAGE_MAX_AGE_MS * 3) });
+    await ensureImage(docker.binPath);
+
+    expect(await ensureImage(docker.binPath)).toBe(IMAGE_REF);
+    expect(await docker.builds()).toEqual([]);
+    expect((await docker.pulls()).length).toBe(1);
+  });
+
+  // An upgrade to a release promotes THAT release's image. Its --no-cache is
+  // for re-fetching unpinned CLIs in a local build, and a published image pins
+  // them, so the pull wins and nothing is built.
+  test('lazy upgrade stages and promotes the published image instead of building', async () => {
+    await docker.publishImage(PUBLISHED_RUNNER_REF, { dockerfileHash: await calculateImageInputsHash(ctx.root) });
+
+    const build = startBackgroundImageBuild(ctx.root, docker.binPath);
+    await build.promote();
+
+    expect(await docker.builds()).toEqual([]);
+    const tags = (await docker.invocations()).filter(line => line.startsWith('tag '));
+    expect(tags[0]).toBe(`tag ${PUBLISHED_RUNNER_REF} lazy-runner:${IMAGE_TAG}-upgrade`);
+    expect(tags).toContain(`tag lazy-runner:${IMAGE_TAG}-upgrade ${IMAGE_REF}`);
+  });
+
+
+  // INVARIANT: an upgrade whose pull missed promotes its LOCAL build onto the
+  // published content ref too (task-image-design §2), labelled local — otherwise
+  // an older image keeps answering a FROM that names that ref.
+  test('lazy upgrade with no published image promotes the local build onto the content ref', async () => {
+    await docker.failPulls();
+
+    const build = startBackgroundImageBuild(ctx.root, docker.binPath);
+    await build.promote();
+
+    const builds = await docker.builds();
+    expect(builds.length).toBe(1);
+    expect(builds[0]).toContain('--label lazy.base.source=local');
+    const tags = (await docker.invocations()).filter(line => line.startsWith('tag '));
+    expect(tags).toContain(`tag lazy-runner:${IMAGE_TAG}-upgrade ${PUBLISHED_RUNNER_REF}`);
+  });
+
+  test('offline mode never pulls the base for a custom FROM lazy-runner', async () => {
+    await docker.publishImage(PUBLISHED_RUNNER_REF, { dockerfileHash: await calculateImageInputsHash(ctx.root) });
+    await useCustomDockerfile('FROM lazy-runner\n');
+    await setOfflineMode(join(ctx.root, '.lazy'), true);
+
+    await ensureImage(docker.binPath);
+
+    expect(await docker.pulls()).toEqual([]);
+  });
+
+
+  // INVARIANT: only the RUNNER repository is exempt from the age rebuild when
+  // published. Docker inherits labels from the base, so a custom image built FROM
+  // a pulled runner can carry `lazy.base.source=published`; its own layers still
+  // go stale and must keep the 14-day rebuild.
+  test('a custom image inheriting the published label is still age-rebuilt', async () => {
+    await useCustomDockerfile('FROM debian:bookworm-slim\n');
+    await ensureImage(docker.binPath);
+    const first = (await docker.builds())[0]!;
+    const ref = first.match(/-t (lazy-custom-[^ ]+)/)![1]!;
+
+    await docker.seedImage(ref, {
+      dockerfileHash: await calculateImageInputsHash(ctx.root),
+      createdAt: ago(IMAGE_MAX_AGE_MS * 3),
+      baseSource: 'published',
+    });
+    await ensureImage(docker.binPath);
+
+    const builds = await docker.builds();
+    expect(builds.length).toBe(2);
+    expect(builds[1]).toContain('--no-cache');
+  });
+
+
+  // Design note §5: a host whose LOCAL build ages out switches to the published
+  // image when one exists, instead of rebuilding locally every 14 days.
+  test('an aged local runner is replaced by the published image when there is one', async () => {
+    const hash = await calculateImageInputsHash(ctx.root);
+    await docker.seedImage(IMAGE_REF, { dockerfileHash: hash, createdAt: ago(IMAGE_MAX_AGE_MS * 2), baseSource: 'local' });
+    await docker.publishImage(PUBLISHED_RUNNER_REF, { dockerfileHash: hash });
+
+    expect(await ensureImage(docker.binPath)).toBe(IMAGE_REF);
+    expect(await docker.pulls()).toEqual([`pull ${PUBLISHED_RUNNER_REF}`]);
+    expect(await docker.builds()).toEqual([]);
+  });
+
+  // INVARIANT: "nothing was published" is the quiet, expected fallback; every
+  // other pull failure is a problem the human can fix, so it is warned with the
+  // remedy — a silent multi-minute local build every launch is the failure mode.
+  test('pull failures are classified: unpublished is quiet, the rest name a remedy', () => {
+    expect(classifyRunnerPullFailure('Error response from daemon: manifest for ghcr.io/getlazy/lazy-runner:sha-x not found: manifest unknown', 1).quiet).toBe(true);
+    expect(classifyRunnerPullFailure('Error response from daemon: pull access not found somewhere', 1).quiet).toBe(false);
+    const denied = classifyRunnerPullFailure('Error response from daemon: denied: denied', 1);
+    expect(denied.quiet).toBe(false);
+    expect(denied.why).toContain('docker logout ghcr.io');
+    expect(classifyRunnerPullFailure('x509: certificate signed by unknown authority', 1).why).toContain('CA');
+    expect(classifyRunnerPullFailure('dial tcp: lookup ghcr.io: no such host', 1).why).toContain('lazy system offline');
+    expect(classifyRunnerPullFailure('', null).why).toContain('could not be reached');
+  });
+
+  test('a failed fallback build names why the pull did not happen', async () => {
+    await docker.failPulls();
+    await docker.failBuilds();
+
+    await expect(ensureImage(docker.binPath)).rejects.toThrow(/Built locally because the pull of [\s\S]*no such host/);
+  });
+
+  test('a failed pull falls back to a local build', async () => {
+    await docker.publishImage(PUBLISHED_RUNNER_REF, { dockerfileHash: await calculateImageInputsHash(ctx.root) });
+    await docker.failPulls();
+
+    expect(await ensureImage(docker.binPath)).toBe(IMAGE_REF);
+    expect((await docker.builds()).length).toBe(1);
+  });
+
+  test('offline mode builds locally without trying to pull', async () => {
+    await docker.publishImage(PUBLISHED_RUNNER_REF, { dockerfileHash: await calculateImageInputsHash(ctx.root) });
+    await setOfflineMode(join(ctx.root, '.lazy'), true);
+
+    await ensureImage(docker.binPath);
+
+    expect(await docker.pulls()).toEqual([]);
+    expect((await docker.builds()).length).toBe(1);
+  });
+
+  // The structural fix for the missing-base failure class: a custom
+  // `FROM lazy-runner` on a host with no base pulls it instead of building.
+  test('a custom Dockerfile FROM lazy-runner pulls a missing base instead of building it', async () => {
+    const baseHash = await calculateImageInputsHash(ctx.root);
+    await docker.publishImage(PUBLISHED_RUNNER_REF, { dockerfileHash: baseHash });
+    await useCustomDockerfile('FROM lazy-runner\n');
+
+    await ensureImage(docker.binPath);
+
+    expect(await docker.pulls()).toEqual([`pull ${PUBLISHED_RUNNER_REF}`]);
+    const builds = await docker.builds();
+    expect(builds.length).toBe(1);
+    expect(builds[0]).toContain('lazy-custom-');
+  });
+
+  test('a custom Dockerfile FROM a retired per-agent image is told to use lazy-runner', async () => {
+    await useCustomDockerfile('FROM lazy-runner-cursor\n');
+    await docker.failBuilds();
+
+    await expect(ensureImage(docker.binPath)).rejects.toThrow(/per-agent runner images are no longer produced[\s\S]*FROM lazy-runner/);
   });
 });

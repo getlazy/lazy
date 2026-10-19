@@ -33,9 +33,10 @@ describe('createPhaseDisplay (non-TTY)', () => {
     });
     display.close();
 
-    expect(output()).toContain('accept ab12cd34 — 12 phases');
-    expect(output()).toContain(' 1. Branch-protection gate');
-    expect(output()).toContain('12. Clean up worktree and children');
+    expect(output()).toContain('accept ab12cd34 — 14 phases');
+    expect(output()).toContain(' 1. Check for commits pushed to the task branch');
+    expect(output()).toContain(' 2. Branch-protection gate');
+    expect(output()).toContain('14. Clean up worktree and children');
   });
 
   // Optional phases are announced too — a listed phase that is later explicitly

@@ -153,6 +153,11 @@ describe('working(not-alive) is always something the reconciler acts on', () => 
     // The work run goes away while the task is parked — what the restart
     // reaper does to every warm container on a daemon restart.
     for (const runName of runPids(ctx).keys()) killRun(ctx, runName);
+    // The work turn alone launches the agent more than once (its wrap-up steps
+    // run their own invocations), so "the reviewer launched" is a NEW
+    // invocation after this point — never a fixed count, which the wrap-up
+    // invocations already satisfy and which raced the reviewer's start.
+    const promptsBeforeReview = await agentPromptCount(ctx);
 
     await ctx.setClaudeScenario({ sequence: [goSilentScenario({ sessionId: 'fake-sess-review', silentMs: 600_000 })] });
     expectSuccess(await ctx.lazy(['review', taskId, '--yes', '--no-wait']));
@@ -161,7 +166,7 @@ describe('working(not-alive) is always something the reconciler acts on', () => 
       60_000,
       'the review run to be stamped on its claim',
     );
-    await waitFor(async () => (await agentPromptCount(ctx)) >= 2, 60_000, 'the reviewer to be launched');
+    await waitFor(async () => (await agentPromptCount(ctx)) > promptsBeforeReview, 60_000, 'the reviewer to be launched');
 
     const status = await ctx.lazy(['status', taskId]);
     expectSuccess(status);

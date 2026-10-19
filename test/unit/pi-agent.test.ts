@@ -67,12 +67,13 @@ afterEach(() => {
 
 describe('PiAgent', () => {
   describe('buildExecArgs', () => {
-    test('builds headless JSON-mode argv with prompt last', () => {
+    test('builds headless JSON-mode argv with prompt on stdin', () => {
       const args = agent.buildExecArgs({ prompt: 'do the thing', modelId: 'claude-opus-5', dangerouslySkipPermissions: true });
       expect(args[0]).toBe('pi');
       expect(args).toContain('-p');
       expect(args.slice(args.indexOf('--mode'))[1]).toBe('json');
-      expect(args[args.length - 1]).toBe('do the thing');
+      expect(args).not.toContain('do the thing');
+      expect(args.stdinInput).toBe('do the thing');
     });
 
     // INVARIANT (security): --no-approve pins project trust OFF so a
@@ -152,6 +153,14 @@ describe('PiAgent', () => {
       expect(args[args.indexOf('--model') + 1]).toBe('hf.co/unsloth/foo');
     });
 
+    test('moves an oversized system prompt to a file-backed native flag', () => {
+      const systemPrompt = 'guardrails 🐙'.repeat(12_000);
+      const args = agent.buildExecArgs({ prompt: 'x', modelId: 'claude-opus-5', systemPrompt, dangerouslySkipPermissions: true });
+      expect(args[args.indexOf('--append-system-prompt') + 1]).toBe('__LAZY_SYSTEM_PROMPT_FILE__');
+      expect(args.systemPromptInput).toBe(systemPrompt);
+      expect(args).not.toContain(systemPrompt);
+    });
+
     test('passes system prompt via native --append-system-prompt', () => {
       const args = agent.buildExecArgs({ prompt: 'x', modelId: 'claude-opus-5', systemPrompt: 'be terse', dangerouslySkipPermissions: true });
       const idx = args.indexOf('--append-system-prompt');
@@ -181,13 +190,19 @@ describe('PiAgent', () => {
       expect(args).not.toContain('--tools');
     });
 
-    test('appends extraArgs after flags, before the prompt', () => {
+    test('appends extraArgs after flags, with prompt on stdin', () => {
       const args = agent.buildExecArgs({ prompt: 'the prompt', modelId: 'claude-opus-5', extraArgs: ['--foo', 'bar'], dangerouslySkipPermissions: true });
       const fooIdx = args.indexOf('--foo');
       expect(fooIdx).toBeGreaterThan(-1);
       expect(args[fooIdx + 1]).toBe('bar');
-      expect(args[args.length - 1]).toBe('the prompt');
+      expect(args).not.toContain('the prompt');
+      expect(args.stdinInput).toBe('the prompt');
     });
+  });
+
+  test('a remaining argv or environment E2BIG stops rather than crash-looping', () => {
+    const failure = agent.classifyFailure({ message: "E2BIG: argument list too long, posix_spawn 'pi'" });
+    expect(failure.class).toBe('fatal_config');
   });
 
   describe('parseResponse (captured real output, pi 0.84.4)', () => {

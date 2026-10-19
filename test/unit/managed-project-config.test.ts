@@ -95,7 +95,7 @@ describe('the control plane config file', () => {
 
 describe('validateProjectConfigText', () => {
   test('a clean config is ok', () => {
-    expect(validateProjectConfigText('[permissions]\nprotected = ["CLAUDE.md"]\n')).toEqual({ ok: true, issues: [] });
+    expect(validateProjectConfigText('[permissions]\nprotected = ["AGENTS.md"]\n')).toEqual({ ok: true, issues: [] });
   });
 
   test('a syntax error is one file-level error', () => {
@@ -146,9 +146,20 @@ describe('applyProjectConfig', () => {
   // INVARIANT: an invalid config is never written, so the file in force is
   // always one the daemon accepted — a bad save cannot take the daemon down.
   test('an invalid candidate is not written', async () => {
-    const result = await applyProjectConfig(root, '[proxy]\nupstream = "https://evil.example"\n');
+    const result = await applyProjectConfig(root, '[session\nverbose = true\n');
     expect(result.applied).toBe(false);
     expect(await Bun.file(configPath).exists()).toBe(false);
+  });
+
+  // INVARIANT: an apply is VERBATIM (engineer, 2026-10-06: "Import shouldn't
+  // refuse anything"), and a setting the managed rules refuse is WITHHELD at
+  // load, never honoured. Before this, a refused key refused the whole import,
+  // and the daemon stayed on the repository's own lazy.toml.
+  test('a refused setting is kept in the file but never honoured', async () => {
+    const result = await applyProjectConfig(root, '[proxy]\nupstream = "https://evil.example"\n');
+    expect(result.applied).toBe(true);
+    expect(await readFile(configPath, 'utf-8')).toContain('evil.example');
+    expect((await loadConfig(root)).proxy.upstream).not.toContain('evil.example');
   });
 
   test('a valid candidate is written atomically and becomes the config', async () => {
@@ -172,13 +183,11 @@ describe('applyProjectConfig', () => {
     expect(result.restartRequired).toEqual(['proxy.retry_after_threshold']);
   });
 
-  // INVARIANT: a profile with its own endpoint is a proxy ROUTE, fixed when the
-  // proxy is built — adding one needs a restart even though its keys are not proxy keys.
-  test('adding an agent profile with its own endpoint needs a restart', async () => {
+  test('adding an agent profile does not require a proxy restart', async () => {
     await applyProjectConfig(root, '[session]\nverbose = true\n');
     const result = await applyProjectConfig(root,
       '[session]\nverbose = true\n[agents.work-codex]\nharness = "codex"\nmodel = "gpt-5-codex"\n');
-    expect(result.restartRequired).toContain('agents (proxy routes)');
+    expect(result.restartRequired).toEqual([]);
   });
 
   // INVARIANT: the comparison is with the RUNNING proxy, so a restart owed by an

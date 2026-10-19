@@ -62,7 +62,7 @@ function getPromptsDir(): string {
  *
  * We prefer the real files in dev so editing a prompt is instantly reflected by
  * `lazy system prompts` / `lazy show`, per the "prompts are discoverable and
- * editable" rule in CLAUDE.md. When src/prompts/ isn't on disk — i.e. a
+ * editable" rule in AGENTS.md. When src/prompts/ isn't on disk — i.e. a
  * `bun build --compile` binary — we fall back to the embedded bundle.
  *
  * INVARIANT: dev reads live files; compiled mode reads the embedded bundle.

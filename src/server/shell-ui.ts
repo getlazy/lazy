@@ -253,7 +253,12 @@ export function shellClientScript(): string {
     function pasteInto(s) {
       if (!(navigator.clipboard && navigator.clipboard.readText)) return;
       navigator.clipboard.readText().then(function (text) {
-        if (text) sendText(s, text);
+        if (!text) return;
+        // Through xterm, never straight to the socket: term.paste() wraps the
+        // text in bracketed-paste markers when the shell asked for them, so a
+        // clipboard holding newlines cannot run commands the reader never typed.
+        if (s.term) s.term.paste(text);
+        else sendText(s, text);
       }).catch(function () { /* clipboard read denied or dismissed: nothing pasted */ });
     }
 
@@ -261,6 +266,11 @@ export function shellClientScript(): string {
     function makeKeyHandler(s) {
       return function handleKey(ev) {
         if (ev.type !== 'keydown') return true;
+        if (!ev.ctrlKey && !ev.metaKey && !ev.altKey && !ev.shiftKey && (ev.key === 'PageUp' || ev.key === 'PageDown')) {
+          ev.preventDefault();
+          s.term.scrollPages(ev.key === 'PageUp' ? -1 : 1);
+          return false;
+        }
         if (ev.shiftKey && ev.key === 'Insert') { pasteInto(s); return false; }
         if (!ev.ctrlKey && !ev.metaKey) return true;
         const key = (ev.key || '').toLowerCase();
@@ -285,6 +295,13 @@ export function shellClientScript(): string {
       resizeTimer = setTimeout(() => { resizeTimer = null; sendResize(active); }, 100);
     }
     window.addEventListener('resize', onWindowResize);
+    // Esc leaves full window when focus is OUTSIDE the terminal (on a button);
+    // inside it, Esc belongs to the program, so it is never taken.
+    document.addEventListener('keydown', (ev) => {
+      if (ev.key !== 'Escape' || (ev.target && ev.target.closest && ev.target.closest('.xterm'))) return;
+      const filled = sessions.find((x) => x.el.classList.contains('is-maximised'));
+      if (filled) toggleMaximise(filled);
+    });
 
     function activate(s) {
       active = s;
@@ -441,7 +458,12 @@ export function shellClientScript(): string {
       for (let i = 0; i < sessions.length; i++) sessions[i].el.classList.remove('is-maximised');
       if (on) s.el.classList.add('is-maximised');
       document.body.classList.toggle('lz-shell-maximised', on);
+      if (s.maxBtn) {
+        s.maxBtn.textContent = on ? 'Exit full window' : 'Fill window';
+        s.maxBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+      }
       sendResize(s);
+      if (s.term) s.term.focus();
     }
 
     async function connect(s) {
@@ -555,6 +577,7 @@ export function shellClientScript(): string {
       const i = sessions.indexOf(s);
       if (i >= 0) sessions.splice(i, 1);
       if (s.tab) s.tab.remove();
+      if (s.el.classList.contains('is-maximised')) document.body.classList.remove('lz-shell-maximised');
       s.el.classList.remove('is-maximised');
       s.el.remove();
       if (s.mount) {
@@ -632,14 +655,23 @@ export function shellClientScript(): string {
       const maxBtn = document.createElement('button');
       maxBtn.type = 'button';
       maxBtn.className = 'btn btn-sm';
-      maxBtn.textContent = 'maximise';
-      maxBtn.title = 'Enlarge this terminal in place';
+      maxBtn.textContent = 'Fill window';
+      maxBtn.title = 'Make this terminal fill the whole window (Esc leaves it when the terminal is not focused)';
+      maxBtn.setAttribute('aria-pressed', 'false');
+      maxBtn.setAttribute('data-lz-term-fill', '');
+      const pasteBtn = document.createElement('button');
+      pasteBtn.type = 'button';
+      pasteBtn.className = 'btn btn-sm';
+      pasteBtn.textContent = 'Paste';
+      pasteBtn.title = 'Paste from the clipboard (Ctrl/Cmd+V, Shift+Insert)';
+      pasteBtn.setAttribute('data-lz-term-paste', '');
       const sessClose = document.createElement('button');
       sessClose.type = 'button';
       sessClose.className = 'btn btn-sm';
       sessClose.textContent = '×';
       sessClose.title = 'Close this shell';
       bar.appendChild(barLabel);
+      bar.appendChild(pasteBtn);
       bar.appendChild(maxBtn);
       bar.appendChild(sessClose);
       const termEl = document.createElement('div');
@@ -658,11 +690,12 @@ export function shellClientScript(): string {
         sessionsEl.appendChild(el);
       }
 
-      s.tab = tab; s.tabBtn = tabBtn; s.el = el; s.termEl = termEl;
+      s.tab = tab; s.tabBtn = tabBtn; s.el = el; s.termEl = termEl; s.maxBtn = maxBtn;
       sessions.push(s);
       tabBtn.addEventListener('click', () => activate(s));
       tabClose.addEventListener('click', () => closeSession(s));
       maxBtn.addEventListener('click', () => toggleMaximise(s));
+      pasteBtn.addEventListener('click', () => { pasteInto(s); if (s.term) s.term.focus(); });
       sessClose.addEventListener('click', () => closeSession(s));
       activate(s);
       void connect(s);

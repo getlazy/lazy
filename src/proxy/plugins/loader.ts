@@ -1,11 +1,14 @@
 /**
  * Convention-based loader for USER-authored proxy request plugins.
  *
- * WHERE: `<project>/.lazy/plugins/`. That location is deliberate — `.lazy` is
- * not gitignored, so a plugin a team writes can be committed and shared like
- * any other project file. Presence is the enable switch: no directory, or a
- * directory with no plugin modules in it, means an EMPTY chain, which the proxy
- * treats as "forward the original bytes verbatim". There is no lazy.toml key.
+ * NOT LOADED IN ANY MODE (engineer, 2026-10-10): no repository code runs inside
+ * lazy's own process on the host, so `loadProxyRequestPlugins` returns an empty
+ * chain without reading the directory unless a TEST opts into the mechanism.
+ * Everything below describes the mechanism kept for a future contained design.
+ *
+ * WHERE: `<project>/.lazy/plugins/`. No directory, or a directory with no
+ * plugin modules in it, means an EMPTY chain, which the proxy treats as
+ * "forward the original bytes verbatim". There is no lazy.toml key.
  *
  * WHAT A PLUGIN LOOKS LIKE — a Bun-importable `.ts`/`.js` module whose DEFAULT
  * export is either the plugin object itself:
@@ -33,9 +36,9 @@
  *
  * FAILURE POSTURE, in two halves — this split is the whole point:
  *
- *   - LOAD TIME fails LOUD. A file that will not import, or that does not
- *     export the expected shape, throws {@link ProxyPluginLoadError} and takes
- *     the daemon's proxy startup with it. The user wrote that file on purpose;
+ *   - LOAD TIME fails LOUD (when loading is enabled). A file that will not
+ *     import, or that does not export the expected shape, throws
+ *     {@link ProxyPluginLoadError}. The user wrote that file on purpose;
  *     silently ignoring it would leave them staring at a proxy that appears to
  *     work while their transform never runs. Same posture as a bad lazy.toml.
  *   - RUN TIME fails OPEN. Once loaded, a plugin that throws on a request is
@@ -43,7 +46,7 @@
  *     unmodified. The proxy is on every agent's critical path; a buggy
  *     transform must degrade to passthrough, never to a failed request.
  *
- * TRUST: plugin code runs INSIDE the daemon process, on the host, with the
+ * TRUST: were it loaded, plugin code would run INSIDE the daemon process, on the host, with the
  * daemon's full privileges. It is not sandboxed. Loading a plugin is exactly as
  * much of a trust decision as running any other code from the repository.
  *
@@ -57,6 +60,7 @@ import { readdir } from 'fs/promises';
 import { join } from 'path';
 import { pathToFileURL } from 'url';
 import type { ProxyRequestPlugin } from './types';
+import { repositoryPluginsDisabled } from '../../config/managed-repo-code';
 
 /** Directory, relative to the project root, that plugins are loaded from. */
 export const PLUGIN_DIR_RELATIVE = join('.lazy', 'plugins');
@@ -92,6 +96,23 @@ function isPluginFile(name: string): boolean {
   if (name.endsWith('.d.ts')) return false;
   if (/\.(test|spec)\.[cm]?[jt]s$/.test(name)) return false;
   return PLUGIN_EXTENSIONS.some((ext) => name.endsWith(ext));
+}
+
+/**
+ * The plugin files a project has under `.lazy/plugins/`, by name — read only,
+ * nothing imported. Lets the daemon and `lazy doctor` say that committed
+ * plugins are being ignored. Empty when the directory does not exist.
+ */
+export async function listRepositoryPluginFiles(projectRoot: string): Promise<string[]> {
+  try {
+    return (await readdir(proxyPluginDir(projectRoot))).filter(isPluginFile).sort();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw new Error(
+      `Failed to read the proxy plugin directory ${proxyPluginDir(projectRoot)}: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 }
 
 const SHAPE_HINT =
@@ -146,7 +167,13 @@ function coercePlugin(value: unknown, file: string): ProxyRequestPlugin {
  */
 export async function loadProxyRequestPlugins(
   projectRoot: string,
+  /** Tests of the loading mechanism only. No production caller passes this. */
+  opts: { enabled?: boolean } = {},
 ): Promise<ProxyRequestPlugin[]> {
+  // Never loaded — the directory is not even read. Repository code does not
+  // run inside lazy's own process on the host, in any mode. See
+  // src/config/managed-repo-code.ts.
+  if (!(opts.enabled ?? !repositoryPluginsDisabled())) return [];
   const dir = proxyPluginDir(projectRoot);
 
   let entries: string[];

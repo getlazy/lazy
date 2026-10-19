@@ -30,9 +30,11 @@ import {
   cursorProxiedCallScenario,
   cursorBusyScenario,
   cursorGoSilentScenario,
+  cursorCrashScenario,
 } from '../helpers/fake-cursor';
-import { setGuards, agentTurns, sessionInterrupt } from '../helpers/agent-seam';
-import { readTaskStatus } from '../helpers/storage';
+import { setGuards, agentTurns, sessionInterrupt, largePrompt, createTaskWithPipedPrompt } from '../helpers/agent-seam';
+import { findFullTaskId, readTaskStatus } from '../helpers/storage';
+import { PROTOCOL_VERSION, readResponse, writeCommand } from '../../src/protocol';
 import { looksLikeLazyPlaceholder } from '../../src/proxy/credential-broker';
 import { CURSOR_PROXY_PREFIX } from '../../src/proxy/cursor-route';
 import { auditLogPath } from '../../src/proxy/audit-log';
@@ -167,6 +169,101 @@ describe('cursor turns through the fake-binary seam', () => {
     else process.env.CURSOR_API_KEY = savedCursorKey;
   });
 
+  test('exhausted crash retries interrupt the task without running closing steps', async () => {
+    const taskId = await createTask(ctx, 'Cursor crash loop', 'Work that must not reach closing steps');
+    await ctx.setCursorScenario(cursorCrashScenario({ stderr: 'RetriableError: [internal] HTTP 400\n' }));
+
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    const wait = await ctx.lazy(['wait', taskId]);
+    expect(wait.exitCode).not.toBe(0);
+    expectOutput(wait, 'interrupted');
+
+    const recorded = await agentTurns(ctx.root, taskId);
+    expect(recorded.length).toBeGreaterThan(0);
+    expect(String(recorded[0]!.content)).toContain('[Agent crashed]');
+    expect(String(recorded[0]!.content)).toContain('Attempts before giving up: 3');
+
+    const invocations = await turnInvocations();
+    expect(invocations.length).toBeGreaterThanOrEqual(3);
+    for (const invocation of invocations) {
+      expect(String(invocation.stdin)).toContain('Work that must not reach closing steps');
+    }
+  }, 180_000);
+
+  test('a one-shot supervisor exits nonzero after Cursor exhausts crash retries', async () => {
+    const prompt = 'One-shot work that must not reach closing steps';
+    const taskId = await createTask(ctx, 'One-shot Cursor crash loop', prompt);
+    const fullTaskId = findFullTaskId(ctx.root, taskId);
+    const protocolDir = join(ctx.protocolBase, 'one-shot-crash');
+    const commandId = 'one-shot-cursor-crash';
+    const crashMessage = 'RetriableError: [internal] HTTP 400';
+    await ctx.setCursorScenario(cursorCrashScenario({ stderr: `${crashMessage}\n` }));
+    if (!ctx.fakeCursorBinDir) throw new Error('The one-shot regression requires the fake Cursor binary');
+    await writeFile(join(ctx.fakeCursorBinDir, 'claude'), '#!/bin/sh\nexit 99\n', { mode: 0o755 });
+
+    writeCommand(protocolDir, {
+      type: 'start',
+      task_id: fullTaskId,
+      command_id: commandId,
+      protocol_version: PROTOCOL_VERSION,
+      agent_id: 'cursor',
+      harness: 'cursor',
+      model_id: 'auto',
+      goal: 'One-shot Cursor crash loop',
+      prompt,
+      low_high_loop: { review_effort: 'high' },
+      wrap_up: { steps: ['present'], park_steps: ['present'] },
+      post_turn_check: 'touch one-shot-post-turn-check-ran.txt',
+    });
+
+    const result = await ctx.lazy([
+      'supervise', '--one-shot',
+      '--protocol-dir', protocolDir,
+      '--worktree', ctx.root,
+      '--runner', 'dangerously-host-process-without-any-isolation',
+    ], { env: { LAZY_DAEMON_CONFIG: '' } });
+
+    expect(result.exitCode).toBe(1);
+    const response = readResponse(protocolDir);
+    expect(response?.status).toBe('error');
+    if (!response || response.status !== 'error') throw new Error('The crashed one-shot did not write an error response');
+    expect(response.command_id).toBe(commandId);
+    expect(response.phase).toBe('work');
+    expect(response.failure_class, JSON.stringify(response)).toBe('unknown');
+    expect(response.failure_reason).toBe('unrecognized Cursor failure');
+    expect(response.failure_attempts).toBe(3);
+    expect(response.error).toContain(crashMessage);
+    expect(await Bun.file(join(ctx.root, 'one-shot-post-turn-check-ran.txt')).exists()).toBe(false);
+
+    const invocations = await turnInvocations();
+    expect(invocations).toHaveLength(3);
+    for (const invocation of invocations) {
+      expect(String(invocation.stdin)).toContain(prompt);
+    }
+  }, 120_000);
+
+  // INVARIANT: a prompt past the 128 KiB argv-element limit reaches cursor whole,
+  // on stdin, through the REAL supervisor spawn — never as an argv element,
+  // where it dies with E2BIG and crash-loops the task.
+  test('a >200 KiB prompt reaches the agent whole, on stdin', async () => {
+    const prompt = largePrompt('LARGE-PROMPT-TAIL-cursor');
+    const taskId = await createTaskWithPipedPrompt(ctx, 'Large prompt', prompt);
+    await ctx.setCursorScenario({ sequence: [
+      cursorSuccessScenario({ sessionId: 'fake-chat-large', result: 'Large turn done.', commit: { message: 'large', files: [{ path: 'large.txt', content: 'ok\n' }] } }),
+      cursorSuccessScenario({ sessionId: 'fake-chat-large', result: 'Follow-up done.' }),
+    ] });
+
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+    expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
+
+    const [turn] = await turnInvocations();
+    expect(turn, 'the fake cursor was never launched for a turn').toBeDefined();
+    expect(turn!.stdin).toContain(prompt);
+    expect(turn!.argv.every(a => Buffer.byteLength(a) < 128 * 1024)).toBe(true);
+    expect(turn!.argv.some(a => a.includes('LARGE-PROMPT-TAIL'))).toBe(false);
+  }, 90_000);
+
   test('a launched turn gets the argv and proxy env cursor expects', async () => {
     const taskId = await createTask(ctx, 'Cursor argv contract', 'Do the cursor thing');
 
@@ -212,8 +309,9 @@ describe('cursor turns through the fake-binary seam', () => {
     expect(argv[argv.indexOf('--model') + 1]).toBeTruthy();
     // First turn: no session to resume yet.
     expect(argv).not.toContain('--resume');
-    // Prompt is the last positional and carries the task's own prompt.
-    expect(argv[argv.length - 1]).toContain('Do the cursor thing');
+    // The prompt rides stdin, never argv, and carries the task's own prompt.
+    expect(argv.some(a => a.includes('Do the cursor thing'))).toBe(false);
+    expect(turns[0]!.stdin).toContain('Do the cursor thing');
 
     // The proxy env the launch built. CURSOR_API_KEY holds a MINTED PLACEHOLDER
     // — the real key stays in the daemon and is injected per request — and
@@ -241,7 +339,7 @@ describe('cursor turns through the fake-binary seam', () => {
     expect(afterUnblock.length).toBeGreaterThan(turns.length);
     // The unblock turn's WORK invocation — found by its prompt, not by being
     // last: the turn's own wrap-up invocations run after it.
-    const unblocked = afterUnblock.filter(i => String(i.argv[i.argv.length - 1]).includes('Keep going please'));
+    const unblocked = afterUnblock.filter(i => String(i.stdin).includes('Keep going please'));
     expect(unblocked.length, 'the unblock turn never launched cursor').toBe(1);
     const second = unblocked[0]!.argv;
     expect(second).toContain('--resume');
@@ -326,7 +424,7 @@ describe('cursor turns through the fake-binary seam', () => {
     // Counted by the task's own prompt — the supervisor's follow-up
     // invocations after a finished turn are not retries.
     const turns = await turnInvocations();
-    const workLaunches = turns.filter(i => String(i.argv[i.argv.length - 1]).includes('Work for a while'));
+    const workLaunches = turns.filter(i => String(i.stdin).includes('Work for a while'));
     expect(workLaunches.length).toBe(1);
     expect((await sessionInterrupt(ctx.root, taskId)).interrupt_reason ?? null).toBeNull();
 

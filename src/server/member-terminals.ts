@@ -42,6 +42,8 @@ export const MEMBER_VACATE_GRACE_MS = 30_000;
 export interface HeldContainer {
   name: string;
   binary: string;
+  /** Run on every attach, not only at creation (see MemberContainer.adopt). */
+  adopt?: () => Promise<void>;
   remove: () => Promise<void>;
 }
 
@@ -296,12 +298,6 @@ export function memberInsideLaunchMessage(holder: string): string {
 export function memberInsideSyncMessage(holder: string): string {
   return `${holder} has a terminal open on this task, and its files cannot be merged into or cleaned up while they are ` +
     `working in them. Try again once they have closed their terminals (their session ends within 30 seconds of the last one closing).`;
-}
-
-/** Why the agent's environment cannot be brought up without a turn right now. */
-export function memberInsideEnvironmentMessage(holder: string): string {
-  return `${holder} has a terminal open on this task, and the agent's environment stays stopped while they are working in it. ` +
-    `Try again once they have closed their terminals (their session ends within 30 seconds of the last one closing).`;
 }
 
 /** Test seam. */

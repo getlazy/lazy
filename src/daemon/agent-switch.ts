@@ -29,6 +29,7 @@ import type { Storage } from '../storage/interface';
 import type { EffortLevel, ResolvedConfig } from '../config/types';
 import { agentProfileOrThrow, agentProfilesFor, harnessForAgentName } from '../config/agent-profiles';
 import { resolveAgentModel } from '../agent/agent-model';
+import { assertNoModelOnTiered } from '../agent/tiered-model';
 import { resolveAndPersistEffort } from './effort';
 import { displayId } from '../task/identity';
 
@@ -160,11 +161,21 @@ export async function switchTaskAgent(
     throw new Error('Model name cannot be empty');
   }
 
-  const model = resolveAgentModel(config, {
-    ...(modelOverride ? { overrideModel: modelOverride } : { preferredModel: null }),
-    agentId: newAgentId,
-    projectModel: params.projectModel,
-  });
+  // Onto a TIERED profile: the model belongs to whichever tier serves a request,
+  // so a model pinned on the task is cleared and none may be named
+  // (src/agent/tiered-model.ts).
+  const newProfile = profiles.get(newAgentId)!;
+  let model: string;
+  if (newProfile.tiers) {
+    assertNoModelOnTiered(config, newAgentId, modelOverride);
+    model = '';
+  } else {
+    model = resolveAgentModel(config, {
+      ...(modelOverride ? { overrideModel: modelOverride } : { preferredModel: null }),
+      agentId: newAgentId,
+      projectModel: params.projectModel,
+    });
+  }
   await storage.updateTaskModel(task.id, model);
   task.model = model;
 

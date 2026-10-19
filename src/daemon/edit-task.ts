@@ -17,13 +17,15 @@ import { taskEditability } from '../task-edit-rules';
 import { resolveRunnerType, RUNNER_ALIAS_HINT, VALID_EFFORT_LEVELS } from '../config/types';
 import { hostRunnerRemovedMessage, isRemovedHostRunnerInput } from '../runner/host-runner-gate';
 import { assertKnownAgentProfile } from './agent-profile-check';
+import { assertNoModelOnTiered } from '../agent/tiered-model';
 import { loadConfig } from '../config/loader';
 import { resolveProjectModel } from './project-settings';
 import { switchTaskAgent, formatAgentSwitchAnnouncement } from './agent-switch';
 // validateModel() is deliberately NOT imported here — see the validation block
 // below: it exits the process on an empty value, which in the daemon would exit
 // the daemon.
-import { validateCode, displayId } from '../task/identity';
+import { validateCode, displayId, taskRef } from '../task/identity';
+import { taskBranchFor } from '../git/branch-prefix';
 import { logger } from '../utils/logger';
 import { RpcError } from './rpc-error';
 
@@ -154,11 +156,46 @@ export async function editTask(
     );
   }
 
+  // A code edit on a STARTED task is a cosmetic rename: `task.code` changes and
+  // nothing else. Every name a launch derived — branch, worktree, container and
+  // run names, the agent's session store — comes from the pinned
+  // `metadata.task_ref` (taskRef in src/task/identity.ts), and a child finds its
+  // parent's branch the same way, so none of them move and none break. What is
+  // keyed on the CURRENT code by design (`lazy show <code>`, dashboard URLs,
+  // `[serve]` hostnames) follows the new code. On its own only, and never a
+  // clear: a code is how a person addresses the task.
+  const isCosmeticRename = input.code !== undefined && !editability.canEditLockedFields;
+  if (isCosmeticRename) {
+    const others = Object.entries(input).filter(
+      ([k, v]) => v !== undefined && k !== 'code' && k !== 'taskId' && k !== 'actor',
+    );
+    if (others.length > 0) {
+      throw new RpcError(400, `Cannot combine a code change on started task ${displayId(task)} with other edits (${others.map(([k]) => k).join(', ')}) — change the code on its own.`);
+    }
+    if (input.code === null || input.code === '') {
+      throw new RpcError(400, `Cannot clear the code of started task ${displayId(task)} — give it a new code instead.`);
+    }
+    // [protection].protected_tasks names tasks by code and resolves them at
+    // accept time, so renaming a listed task would silently disarm its gate
+    // (and hand it to whichever task takes the old code next). A short-id
+    // entry survives a rename, so only a code entry refuses.
+    if (task.code && input.code !== task.code) {
+      const listed = (await loadConfig(projectRoot)).protection.protected_tasks;
+      if (listed.includes(task.code)) {
+        throw new RpcError(
+          409,
+          `Cannot rename ${task.code}: it is listed by code in [protection].protected_tasks, and renaming it would leave that entry protecting nothing. ` +
+          `Run \`lazy protect ${task.code} off\`, rename, then \`lazy protect ${input.code} on\`.`,
+        );
+      }
+    }
+  }
+
   const hasLockedFieldEdit =
     input.goal !== undefined ||
     input.prompt !== undefined ||
     input.type !== undefined ||
-    input.code !== undefined ||
+    (input.code !== undefined && !isCosmeticRename) ||
     input.parent !== undefined;
 
   const hasMidFlightEdit =
@@ -167,12 +204,12 @@ export async function editTask(
     input.runner !== undefined ||
     input.agent !== undefined;
 
-  const isMidFlightSafeEdit = hasMidFlightEdit && !hasLockedFieldEdit;
+  const isMidFlightSafeEdit = (hasMidFlightEdit || isCosmeticRename) && !hasLockedFieldEdit;
 
   if (!editability.canEditLockedFields && !isMidFlightSafeEdit && (hasLockedFieldEdit || hasMidFlightEdit)) {
     throw new RpcError(
       400,
-      `Cannot edit task ${displayId(task)}: task has already been started; only model, effort, runner and agent can be changed (not combined with goal/prompt/type/code/parent).`,
+      `Cannot edit task ${displayId(task)}: task has already been started; only model, effort, runner and agent can be changed (not combined with goal/prompt/type/parent), and the code can be changed on its own.`,
     );
   }
 
@@ -200,7 +237,7 @@ export async function editTask(
   // The empty-model check is what lets the writes below use input.model
   // directly instead of validateModel(): that is a CLI helper which prints and
   // calls process.exit(1) on an empty value, and in the daemon that exits the
-  // daemon (CLAUDE.md, "process.exit() belongs to CLI commands"). Every
+  // daemon (AGENTS.md, "process.exit() belongs to CLI commands"). Every
   // non-CLI surface — RPC, MCP, the web edit form — funnels through here.
   if (input.goal !== undefined && !input.goal.trim()) {
     throw new RpcError(400, 'goal cannot be empty');
@@ -216,8 +253,28 @@ export async function editTask(
     if (codeError) {
       throw new RpcError(400, `Invalid code: ${codeError}`);
     }
+    // The same collision rule as create: no two live tasks share a code.
+    const clash = input.code === task.code
+      ? undefined
+      : (await storage.listTasks()).find(t => t.id !== task.id && t.code === input.code && !isTerminalStatus(t.status));
+    if (clash) {
+      throw new RpcError(
+        409,
+        `A task with code '${input.code}' already exists (${clash.id.slice(0, 8)}, status: ${clash.status}). ` +
+        'Choose a different code or close/reject the existing task first.',
+      );
+    }
   }
   await assertKnownAgentProfile(projectRoot, input.agent);
+  if (input.model !== undefined && input.model !== null && input.model !== '') {
+    // Before any write: a model on a task whose (new) profile is tiered is
+    // refused (src/agent/tiered-model.ts).
+    try {
+      assertNoModelOnTiered(await loadConfig(projectRoot), input.agent ?? task.agent_id, input.model);
+    } catch (err) {
+      throw new RpcError(400, err instanceof Error ? err.message : String(err));
+    }
+  }
   if (input.runner !== undefined && input.runner !== null && input.runner !== '') {
     if (isRemovedHostRunnerInput(input.runner)) {
       throw new RpcError(400, hostRunnerRemovedMessage('per-task runner'));
@@ -300,6 +357,13 @@ export async function editTask(
   if (input.code !== undefined) {
     await storage.updateTaskCode(task.id, input.code === '' ? null : input.code);
     changes.push('code');
+    if (isCosmeticRename && input.code !== task.code) {
+      const branch = (await storage.getSessionByTaskId(task.id))?.git_branch || taskBranchFor(taskRef(task));
+      announcements.push(
+        `Renamed ${displayId(task)} → ${input.code}. Its branch (${branch}), worktree, container and any PR/MR keep their old names; ` +
+        'links, service hostnames and lookups now use the new code.',
+      );
+    }
   }
 
   if (input.parent !== undefined) {

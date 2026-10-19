@@ -17,8 +17,11 @@ import { isTerminalStatus } from '../types';
 import { parentTaskIdOf } from '../task-target';
 import { resolveTaskForgeLink, taskForgeLinkHtml } from '../task-forge-link';
 import { isLinkedTask, formatLinkedMarker, linkedBranchOf } from '../task/linked';
+import { countWithheldFeedbackTurns } from '../task/queued-feedback';
 import { escapeHtml } from './review-diff';
+import { taskTurnFailure, turnFailureLabel } from '../task/turn-failure';
 import { renderMarkdown, type RenderMarkdownOptions } from './markdown';
+import { copyMarkdownButtonHtml } from './copy-markdown';
 import { viewedCardHtml } from './viewed-cards';
 import { reviewDraftScript } from './review-draft-script';
 import { viewedStateScript } from './viewed-cards';
@@ -102,6 +105,7 @@ import { liveKeysToken } from './task-live-regions';
 import { domMorphScript } from './dom-morph';
 import { timestampHtml } from './timestamps';
 import { taskUsagePauseHtml } from './usage-pause-banner';
+import { taskRunnerImageHtml, runnerImageSyncCheckboxHtml } from './runner-image-banner';
 import type { TaskUsagePauseView } from './task-actions';
 import { revertedProtectedFiles } from '../protection/reverted-files';
 
@@ -330,6 +334,7 @@ function landingExtraActionsHtml(input: TaskPageInput): string {
     parts.push(actionDialogTemplateHtml('sync', `
       <form method="post" action="/tasks/${seg}/actions/sync" class="lz-action-form" data-lz-action-form>
         <p>Merge the parent branch into this task. The agent resolves conflicts.</p>
+        ${runnerImageSyncCheckboxHtml(task)}
         <div class="rv-form-actions"><button type="submit" class="btn">Sync</button></div>
       </form>`));
   }
@@ -413,25 +418,75 @@ function landingExtraActionsHtml(input: TaskPageInput): string {
  */
 export function launchIdentityHtml(view: TaskLaunchIdentityView | null | undefined): string {
   if (!view) return '';
+  const profile = view.profile;
+  const sep = '<span class="lz-launch-sep">·</span>';
+  const span = (cls: string, title: string, text: string): string =>
+    `<span class="${escapeHtml(cls)}" title="${escapeHtml(title)}">${escapeHtml(text)}</span>`;
+  // "recorded on this task", NOT "set on this task": the record does not
+  // distinguish a value a human pinned from one the first launch filled in
+  // from config, so claiming intent here would invite a conclusion the data
+  // does not support. See the source doc in src/task/launch-identity-view.ts.
+  const provenance = (label: string, item: LaunchIdentityItem, extra: string[] = []): string => {
+    const base = item.source === 'default'
+      ? `${label} — from lazy.toml default`
+      : `${label} — recorded on this task`;
+    return [item.note ? `${base} (${item.note})` : base, ...extra].join('\n');
+  };
+  const cls = (item: LaunchIdentityItem, extra = ''): string =>
+    `lz-launch-item${extra}${item.source === 'default' ? ' lz-launch-default' : ''}`;
+
+  const renderedHtml: string[] = [];
+  if (profile) {
+    // The profile's own facts ride the tooltip: nothing here is re-derived, the
+    // daemon resolved all of it with the launch's functions.
+    const facts = profile.found
+      ? [
+          `Agent profile "${profile.name}" (${profile.builtin ? 'built-in' : 'from lazy.toml'})`,
+          `Harness: ${profile.harness}`,
+          // A tiered profile has no single endpoint or credential: each tier names its own.
+          ...(profile.tiers
+            ? profile.tiers.map((t, i) => `Tier ${i + 1}: ${t.endpoint} — ${t.url} · Credential: ${t.credential ?? 'none'}`)
+            : [
+                `Endpoint: ${profile.endpoint_name ? `${profile.endpoint_name} — ` : ''}${profile.endpoint_url ?? 'the harness default'}`,
+                `Credential: ${profile.credential ?? 'none'}`,
+              ]),
+        ]
+      : [`Agent profile "${profile.name}" is not defined in lazy.toml`];
+    renderedHtml.push(span(
+      cls(view.agent, profile.found ? ' lz-launch-profile' : ' lz-launch-profile lz-launch-missing'),
+      provenance('Agent profile', view.agent, facts),
+      profile.found ? `profile ${profile.name}` : `profile ${profile.name} (missing)`,
+    ));
+    const modelTitle = {
+      task: 'recorded on this task',
+      profile: "the profile's own model",
+      project: 'from the project default',
+    }[profile.model_origin];
+    if (profile.tiers) {
+      const chain = profile.tiers
+        .map((t) => `${t.endpoint}/${t.model}${t.threshold === null ? '' : ` (<${t.threshold}%)`}`)
+        .join('\n');
+      renderedHtml.push(span(
+        'lz-launch-item lz-launch-tiered',
+        `Model — tiered profile: each request goes to the first tier with room, so the single model shown on the task is never sent.\n${chain}`,
+        `tiered: ${profile.tiers.map((t) => `${t.endpoint}/${t.model}`).join(' → ')}`,
+      ));
+    } else {
+      renderedHtml.push(span(cls(view.model), provenance('Model', view.model, [`Model: ${modelTitle}`]), view.model.value));
+    }
+    renderedHtml.push(span(cls(view.effort), provenance('Effort', view.effort), view.effort.value));
+    return `<span class="lz-launch-identity">${renderedHtml.join(sep)}</span>`;
+  }
+
   const items: Array<[string, LaunchIdentityItem]> = [
     ['Agent profile', view.agent],
     ['Model', view.model],
     ['Effort', view.effort],
   ];
-  const rendered = items.map(([label, item]) => {
-    // "recorded on this task", NOT "set on this task": the record does not
-    // distinguish a value a human pinned from one the first launch filled in
-    // from config, so claiming intent here would invite a conclusion the data
-    // does not support. See the source doc in src/task/launch-identity-view.ts.
-    const provenance = item.source === 'default'
-      ? `${label} — from lazy.toml default`
-      : `${label} — recorded on this task`;
-    const title = item.note ? `${provenance} (${item.note})` : provenance;
-    const cls = item.source === 'default' ? 'lz-launch-item lz-launch-default' : 'lz-launch-item';
-    return `<span class="${cls}" title="${escapeHtml(title)}">${escapeHtml(item.value)}</span>`;
-  });
-  const sep = '<span class="lz-launch-sep">·</span>';
-  return `<span class="lz-launch-identity">${rendered.join(sep)}</span>`;
+  for (const [label, item] of items) {
+    renderedHtml.push(span(cls(item), provenance(label, item), item.value));
+  }
+  return `<span class="lz-launch-identity">${renderedHtml.join(sep)}</span>`;
 }
 
 /**
@@ -500,6 +555,8 @@ function landingHeaderHtml(input: TaskPageInput): string {
     <div class="lz-landing-header">
       ${flash}
       ${taskUsagePauseHtml(task.id, input.usagePause)}
+      ${taskRunnerImageHtml(task, `/tasks/${encodeURIComponent(task.id)}`)}
+      ${turnFailureHtml(task, session)}
       <h1>Task ${escapeHtml(taskDisplayId)}</h1>
       <div class="task-signal">
         <p class="task-goal">${escapeHtml(task.goal)}</p>
@@ -659,7 +716,7 @@ function landingBodyHtml(input: TaskPageInput): string {
           content: turnText(latest),
           headHtml: `<a href="${taskPath(task, input.duplicatedCodes)}/turns/${latest.sequence}">Latest turn #${latest.sequence}</a>`
             + ` <span class="rv-hint">${timestampHtml(latest.timestamp)}</span>`,
-          bodyHtml: `<div class="turn-content">${renderMarkdown(turnText(latest).split('\n').slice(0, 15).join('\n'), input.markdown)}</div>
+          bodyHtml: `${copyMarkdownButtonHtml(turnText(latest))}<div class="turn-content">${renderMarkdown(turnText(latest).split('\n').slice(0, 15).join('\n'), input.markdown)}</div>
             <p class="rv-hint"><a href="${taskPath(task, input.duplicatedCodes)}/turns">Full turn → Turns</a></p>`,
           sectionClass: 'turn',
         })
@@ -811,6 +868,7 @@ function tabBodyHtml(input: TaskPageInput): string {
           descendantCount: stats.descendantCount,
           taskHref: statsScopeHref(seg, 'task'),
           subtreeHref: statsScopeHref(seg, 'subtree'),
+          turnsHref: `${taskPath(task, input.duplicatedCodes)}/turns`,
         }),
       );
     }
@@ -838,6 +896,7 @@ function tabBodyHtml(input: TaskPageInput): string {
         // Task comments (`lazy comment`, the Comments tab) the agent has not
         // been shown — resolved by the same function the Comments tab uses.
         queuedNotes: queuedComments(input.comments, session, input.turns),
+        withheldFeedback: countWithheldFeedbackTurns(input.turns),
         raisedItems: input.raisedItems,
         fileViolations: review.fileViolations ?? [],
         viewedFiles: input.viewedFiles ?? {},
@@ -1064,4 +1123,17 @@ export function taskPageHtml(input: TaskPageInput): string {
   return clock.measureSync('layout', () =>
     layoutHtml(`Task ${displayId(input.task)}`, inner + bar + scripts),
   );
+}
+
+/**
+ * The parked task's last turn FAILED (src/task/turn-failure.ts): say so above
+ * everything, with what failed and the fix, so it never reads as an ordinary
+ * review park. Empty when the last turn did not fail.
+ */
+function turnFailureHtml(task: Task, session: Session | null): string {
+  const failure = taskTurnFailure(task, session);
+  if (!failure) return '';
+  return `<div class="rv-notice rv-notice-err" id="task-turn-failure">` +
+    `<strong>The last turn failed (${escapeHtml(turnFailureLabel(failure))}).</strong> ` +
+    `${escapeHtml(failure.reason)}<br><strong>What to do:</strong> ${escapeHtml(failure.remedy)}</div>`;
 }

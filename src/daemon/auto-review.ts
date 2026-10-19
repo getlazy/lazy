@@ -9,7 +9,7 @@
  * that died between the final claim and the review launch).
  *
  * Daemon-dispatched only, never via a comment signal: a comment is delivered
- * into the target's next `lazy unblock` prompt (CLAUDE.md invariant), and a
+ * into the target's next `lazy unblock` prompt (AGENTS.md invariant), and a
  * review is not feedback — it is the daemon's own accounting turn, budgeted
  * and attributed like every other daemon-started turn.
  *
@@ -555,6 +555,8 @@ async function recordUndispatchedReviewTurn(
       // dispatch could not start. Nobody asked for this review, so it follows
       // the mode rule like the review it stands in for.
       reviewDispatch: 'auto',
+      // Nothing launched, so no container image ran it.
+      noRunnerImage: true,
       review: {
         verdict: verdictFor(cause),
         security: REVIEW_UNPARSED,

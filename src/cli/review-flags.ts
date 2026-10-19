@@ -30,7 +30,7 @@ import {
  * this used to be a `REVIEW_FLAG_NAMES` string array documented as "the entries
  * every command must register", which nothing imported and nothing asserted —
  * a contract in a comment, with three hand-written copies underneath it. The
- * shape here is the one CLAUDE.md sanctions for a shared table (see
+ * shape here is the one AGENTS.md sanctions for a shared table (see
  * `RAISED_RESOLUTION_FLAGS`): a plain exported array literal, imported directly
  * and spread, so the source scan in `cli-command-discoverability.test.ts` can
  * still follow the import and read each command's real flags.
@@ -47,7 +47,7 @@ export const REVIEW_FLAGS: FlagDefinition[] = [
  * Returns the overrides, or an error MESSAGE for the caller to print and exit
  * on. It does not exit itself: this lives outside `src/cli/commands/`, and a
  * helper that calls `process.exit` is a landmine for every long-lived process
- * that later reuses it (CLAUDE.md, "`process.exit()` belongs to CLI commands").
+ * that later reuses it (AGENTS.md, "`process.exit()` belongs to CLI commands").
  */
 export function parseReviewFlags(
   flags: Map<string, string | boolean | string[]>,

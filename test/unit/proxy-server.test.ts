@@ -15,6 +15,7 @@ import { createProxyServer, PROXY_HEALTH_PATH, type ProxyServer } from '../../sr
 import type { AuditSink } from '../../src/proxy/audit';
 import { ProxyToolStatsRecorder } from '../../src/proxy/tool-stats';
 import type { ProxyAuditRecord, TaskToolStatsRecord } from '../../src/storage/types';
+import { freePort } from '../helpers/free-port';
 
 // The proxy writes audit records to an AuditSink (the project-local bounded
 // log in production) — never to Storage.
@@ -27,11 +28,6 @@ function createMockSink() {
 }
 
 // ---- Helpers ----
-
-function findFreePort(): number {
-  // Use a random port in 40000–49999 range
-  return 40000 + Math.floor(Math.random() * 10000);
-}
 
 // ---- Tests ----
 
@@ -47,9 +43,8 @@ describe('proxy server', () => {
 
   beforeAll(async () => {
     // Start a mock upstream that echoes requests back as JSON
-    upstreamPort = findFreePort();
     mockUpstream = Bun.serve({
-      port: upstreamPort,
+      port: 0,
       hostname: '127.0.0.1',
       async fetch(req) {
         const body = req.method !== 'GET' ? await req.json().catch(() => null) : null;
@@ -59,15 +54,16 @@ describe('proxy server', () => {
         return Response.json({ type: 'message', model: body?.model ?? 'test', forwarded: true });
       },
     });
+    upstreamPort = mockUpstream.port!;
 
-    proxyPort = findFreePort();
     mockSink = createMockSink();
     proxyServer = createProxyServer(
-      { port: proxyPort, bind: '127.0.0.1', upstream: `http://127.0.0.1:${upstreamPort}` },
+      { port: 0, bind: '127.0.0.1', upstream: `http://127.0.0.1:${upstreamPort}` },
       mockSink.sink,
       // No credential broker: these tests exercise forwarding, not JIT injection.
       null,
     );
+    proxyPort = proxyServer.port!;
 
     // Give servers a moment to bind
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -149,7 +145,7 @@ describe('proxy server', () => {
     // What we verify here: when the upstream sends a WRONG content-length (stale/mismatched),
     // the proxy's stripping prevents forwarding it.
     const upstreamWithWrongLength = Bun.serve({
-      port: findFreePort(),
+      port: 0,
       hostname: '127.0.0.1',
       async fetch() {
         const body = JSON.stringify({ ok: true });
@@ -165,7 +161,7 @@ describe('proxy server', () => {
     const up = (upstreamWithWrongLength as unknown as { port: number }).port;
     const ms = createMockSink();
     const p = createProxyServer(
-      { port: findFreePort(), bind: '127.0.0.1', upstream: `http://127.0.0.1:${up}` },
+      { port: 0, bind: '127.0.0.1', upstream: `http://127.0.0.1:${up}` },
       ms.sink,
       // No credential broker: these tests exercise forwarding, not JIT injection.
       null,
@@ -252,10 +248,10 @@ describe('proxy server', () => {
   });
 
   test('returns 502 when upstream is unreachable', async () => {
-    const badPort = findFreePort(); // nothing listening here
+    const badPort = freePort(); // nothing listening here
     const ms = createMockSink();
     const badProxy = createProxyServer(
-      { port: findFreePort(), bind: '127.0.0.1', upstream: `http://127.0.0.1:${badPort}` },
+      { port: 0, bind: '127.0.0.1', upstream: `http://127.0.0.1:${badPort}` },
       ms.sink,
       // No credential broker: these tests exercise forwarding, not JIT injection.
       null,
@@ -397,7 +393,7 @@ describe('proxy smart routing (failover)', () => {
 
   // INVARIANT: No silent fallback. A 429 with NO fallback chain configured must
   // propagate the upstream error unchanged — the proxy never invents a failover
-  // target or waits. This is the fail-hard behavior CLAUDE.md mandates; changing
+  // target or waits. This is the fail-hard behavior AGENTS.md mandates; changing
   // it (e.g. auto-retrying or auto-routing) would violate the no-silent-fallback
   // rule and requires explicit human approval.
   test('429 WITHOUT a fallback propagates the error unchanged (no silent fallback)', async () => {
@@ -596,7 +592,7 @@ describe('proxy smart routing (failover)', () => {
   });
 
   test('unreachable primary with a fallback reroutes; audit trigger is "unreachable"', async () => {
-    const deadPort = findFreePort(); // nothing listening
+    const deadPort = freePort(); // nothing listening
     const fallback = createControllableUpstream(() => Response.json({ ok: true }));
     const ms = createMockSink();
     const proxy = createProxyServer(
@@ -629,8 +625,8 @@ describe('proxy smart routing (failover)', () => {
   });
 
   test('all targets unreachable still yields a 502 with an error audit record', async () => {
-    const deadA = findFreePort();
-    const deadB = findFreePort();
+    const deadA = freePort();
+    const deadB = freePort();
     const ms = createMockSink();
     const proxy = createProxyServer(
       {
@@ -1032,14 +1028,14 @@ describe('proxy server → durable tool stats', () => {
   let failSaves: boolean;
 
   beforeAll(async () => {
-    const upstreamPort = findFreePort();
     mockUpstream = Bun.serve({
-      port: upstreamPort,
+      port: 0,
       hostname: '127.0.0.1',
       async fetch() {
         return Response.json({ type: 'message', usage: { input_tokens: 10, output_tokens: 2 } });
       },
     });
+    const upstreamPort = mockUpstream.port!;
 
     saved = null;
     failSaves = false;
@@ -1051,13 +1047,13 @@ describe('proxy server → durable tool stats', () => {
       },
     });
 
-    proxyPort = findFreePort();
     proxyServer = createProxyServer(
-      { port: proxyPort, bind: '127.0.0.1', upstream: `http://127.0.0.1:${upstreamPort}` },
+      { port: 0, bind: '127.0.0.1', upstream: `http://127.0.0.1:${upstreamPort}` },
       createMockSink().sink,
       null,
       { toolStats: recorder },
     );
+    proxyPort = proxyServer.port!;
     await new Promise((resolve) => setTimeout(resolve, 50));
   });
 

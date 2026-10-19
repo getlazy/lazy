@@ -237,6 +237,7 @@ describe('preflightBuilderCapture', () => {
     const err = await preflightBuilderCapture(cfg).then(() => null, (e: unknown) => e as Error);
     expect(err).toBeInstanceOf(Error);
     expect(err!.message).toContain('http://127.0.0.1:1');
-    expect(err!.message).toContain('ConnectionRefused');
+    // The errno's spelling is Bun's: this asserted ConnectionRefused, and Bun 1.4.3 says ECONNREFUSED.
+    expect(err!.message).toMatch(/ConnectionRefused|ECONNREFUSED/);
   });
 });

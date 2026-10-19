@@ -17,6 +17,7 @@ import { formatDate } from '../utils/format';
 import { layoutHtml } from './templates';
 import { escapeHtml } from './review-diff';
 import { renderMarkdown } from './markdown';
+import { renderMarkdownWithCopy } from './copy-markdown';
 
 const INTRO =
   'Documents builders left in their scratch dir — accept messages, analyses, hand-off notes, reports — ' +
@@ -125,7 +126,7 @@ export function scratchFileHtml(file: ScratchFileEntry & { content: string | nul
         : `<a class="btn btn-sm" href="${escapeHtml(scratchFileHref(file.path, true))}" id="scratch-raw-link">Raw</a>`;
     const content = raw || !markdown
       ? `<pre class="scratch-raw" id="scratch-raw">${escapeHtml(file.content)}</pre>`
-      : `<div class="turn-content" id="scratch-rendered">${renderMarkdown(file.content)}</div>`;
+      : `<div class="turn-content" id="scratch-rendered">${renderMarkdownWithCopy(file.content)}</div>`;
     body = `${toggle ? `<div class="action-links">${toggle}</div>` : ''}
       <div class="detail-section" id="scratch-body">${content}</div>`;
   }

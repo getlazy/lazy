@@ -30,6 +30,10 @@ Adding existing backlog tasks to a cluster is a reparent:
 lazy reparent <task> --parent <cluster>
 ```
 
+You can do this before the cluster starts. A started task reparented under a
+cluster that has not started yet has nothing to merge yet; lazy says so, and
+merges the cluster's branch into it as soon as the cluster starts.
+
 ## What the driver does
 
 Every turn a cluster takes, it runs under a contract lazy injects for you:
@@ -101,6 +105,27 @@ remove the bound entirely.
 This key is one of the levers in
 [the review paradigm](review-paradigm.md#when-tokens-are-still-the-constraint),
 which explains what each one costs you when you turn it down.
+
+### Protected files are decided once, at the cluster
+
+A child that changes files your project protects (`[permissions] protected` in
+[`lazy.toml`](lazy-toml.md)) — test suites, typically — is not held for your
+approval. Its accept goes through with no file decisions, and every protected
+change is carried up to the cluster: the cluster's own accept lists all of them,
+and you approve or reject them there, together with the rest of the work. The
+driver is told never to park a child, or ask you anything, on that account.
+
+This holds for every child of a cluster, including one you started or sent
+feedback to yourself.
+
+### Children run your end-of-work rules
+
+Every child finishes the way any task does. Its final turn runs the rules you
+configured — maintained files (`[[automation.maintain]]`), reactive automations
+(`[[automation.react]]`), the check for uncommitted work, and the review
+walkthrough — exactly as it would for a task you started yourself. Only the
+protected-file *decision* moves: the child still records why it kept each
+protected change, and you decide on all of them once, at the cluster's accept.
 
 ### It keeps its own branch current
 

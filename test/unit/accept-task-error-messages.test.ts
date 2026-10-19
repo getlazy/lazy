@@ -85,6 +85,8 @@ await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
   detectRemote: () => null,
   createDriver: () => ({
     needsSync: true,
+    // Origin has nothing the task lacks (accept step 1e).
+    fetchBranch: async () => false,
     validateAccept: () => 'Task has no remote reference',
     hasRemoteRef: () => false,
     hasExternalApproval: async () => false,
@@ -93,6 +95,7 @@ await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
     isTargetBranchProtected: async () => true,
     pushBranch: (branch: string) => pushBranchImpl(branch),
     markReadyForReview: () => markReadyForReviewImpl(),
+    findOpenReviewForBranch: async () => null,
     getPRState: async () => null,
     getChecksStatus: async () => ({ status: 'passed' as const, failed: [] }),
     getTaskUrl: async () => null,

@@ -3,6 +3,7 @@
  */
 
 import { ClaudeCodeAgent } from '../agent/claude-code';
+import type { AgentExecArgs } from '../agent/interface';
 import type { ResolvedConfig, RoleTarget } from '../config/types';
 
 /**
@@ -18,21 +19,27 @@ export function builderHeadlessModel(config: ResolvedConfig, target: RoleTarget)
   return resolveBuilderModel(config, { harness: 'claude-code', model: target.model });
 }
 
-/** Compose `claude -p` argv for one builder review-session turn. */
+/**
+ * Compose `claude -p` argv for one builder review-session turn. The prompt is
+ * `stdinInput` and the system prompt is read from `systemPromptFile`, a path
+ * the caller wrote and Claude Code can see — neither rides argv (the argv rule
+ * in src/agent/argv-safety.ts).
+ */
 export function buildBuilderHeadlessClaudeArgs(
-  systemPrompt: string,
+  systemPromptFile: string,
   prompt: string,
   resumeSessionId: string | null | undefined,
   model: string,
-): string[] {
+): AgentExecArgs {
   const agent = new ClaudeCodeAgent();
-  return agent.buildExecArgs({
+  const args = agent.buildExecArgs({
     prompt,
-    systemPrompt,
     sessionId: resumeSessionId ?? undefined,
     modelId: model,
     dangerouslySkipPermissions: true,
   });
+  args.push('--append-system-prompt-file', systemPromptFile);
+  return args;
 }
 
 /** Parse stream-json or json stdout from a headless builder turn. */

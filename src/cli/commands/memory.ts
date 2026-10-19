@@ -217,7 +217,7 @@ async function commandMemorySave(args: string[]): Promise<void> {
   try {
     const existing = await storage.getMemory(name);
 
-    // PRE-FLIGHT before $EDITOR (CLAUDE.md — never lose human feedback): every
+    // PRE-FLIGHT before $EDITOR (AGENTS.md — never lose human feedback): every
     // validation that can fail happens here, so the human never types a record
     // body only to have it rejected afterwards.
     const descriptionInput = parsed.flags.get('description') as string | undefined;

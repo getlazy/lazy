@@ -23,6 +23,7 @@
  */
 
 import type { CredentialBinding } from '../credentials/store';
+import { jwtIssuerOrigin } from './token-origin';
 import {
   deleteCredential,
   getStoredCredential,
@@ -44,25 +45,43 @@ export interface TeamsLogin {
 }
 
 /**
- * The install a URL names, as a credential name: `teams:teams.example.com`, or
- * `teams:localhost:3000` when a port is part of the address.
+ * The install a URL names, as a credential name: its ORIGIN —
+ * `teams:https://teams.example.com`, `teams:http://localhost:3000`.
  *
- * The host and not the whole URL, because scheme and path are not identity — a
+ * The scheme IS identity: a token is only ever sent over the scheme it was
+ * issued on, so an https login is never offered for an http address (that would
+ * put a 90-day CLI and git token on the wire in plaintext). A path is not: a
  * person who typed `https://teams.example.com/` yesterday and
  * `https://teams.example.com` today has not logged in to two places.
  */
 export function teamsCredentialName(teamsUrl: string): string {
-  return `${TEAMS_CREDENTIAL_PREFIX}${new URL(teamsUrl).host}`;
+  return `${TEAMS_CREDENTIAL_PREFIX}${new URL(teamsUrl).origin}`;
 }
 
 /**
- * Normalize what a human typed into a base URL.
+ * The name logins had before they were keyed by origin: `teams:<host[:port]>`,
+ * with no scheme. Such a record is honoured for the scheme its own git
+ * include was used on (./machine-login.ts), and for https when there is no
+ * include to say — using it over https leaks nothing whichever it was.
+ */
+export function legacyTeamsCredentialName(teamsUrl: string): string {
+  return `${TEAMS_CREDENTIAL_PREFIX}${new URL(teamsUrl).host}`;
+}
+
+/** The origin a Teams credential name stands for; a legacy (host-only) name stands for https. */
+export function originOfTeamsCredentialName(name: string): string {
+  const rest = name.slice(TEAMS_CREDENTIAL_PREFIX.length);
+  return rest.includes('://') ? rest : `https://${rest}`;
+}
+
+/**
+ * Normalize what a human typed into a base URL, WITHOUT touching the network.
  *
  * A bare host gets `https://` — `lazy login teams.example.com` is what people
- * type, and refusing it teaches nothing. An explicit `http://` is kept: a
- * self-hosted install on a laptop or a private network is a real case, and
- * silently upgrading it to a scheme the server does not serve would fail with a
- * connection error that names nothing.
+ * type, and it is the only scheme lazy ever supplies, because nothing was typed.
+ * An explicit scheme is kept exactly as typed, as with `git clone`: the scheme is
+ * the person's choice (plain-http installs on a private network or tailnet are
+ * real), so use the address your install is served on.
  */
 export function normalizeTeamsUrl(input: string): string {
   const trimmed = input.trim().replace(/\/+$/, '');
@@ -151,6 +170,19 @@ export async function resolveTeamsLogin(
     throw new Error(
       `The login for ${login.binding.teams_url} disappeared while it was being read. ` +
       `Run \`lazy login ${login.binding.teams_url}\` again.`,
+    );
+  }
+  // A clone bound by an older lazy could hold a token issued over https while
+  // its binding names the http:// address (`lazy clone http://…` reused the
+  // machine's https login). Using it would keep sending it in plaintext, so it
+  // is refused here, before any request is made with it.
+  const iss = jwtIssuerOrigin(stored.value);
+  const bound = new URL(login.binding.teams_url).origin;
+  if (iss && iss !== bound) {
+    throw new Error(
+      `This clone's login was issued by ${iss} but the clone is bound to ${bound}, so it was not sent.\n` +
+      `  Run \`lazy login ${iss} -p ${login.binding.project}\` in this clone, and revoke the old token at ` +
+      `Account settings → Git & CLI tokens on the install.`,
     );
   }
   return { login, token: stored.value };

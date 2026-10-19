@@ -8,8 +8,7 @@
 
 import { join } from 'path';
 import type { AgentResponse } from '../types';
-import type { Agent } from './interface';
-import { safeArgvPrompt } from './argv-safety';
+import type { Agent, AgentExecArgs } from './interface';
 import { failureHaystack, type AgentFailure, type AgentFailureInput } from './failure-taxonomy';
 
 // Resolve the absolute path to the qa-agent script.
@@ -41,11 +40,12 @@ export class QaAgent implements Agent {
     effort?: string;
     /** Claude-Code-specific; not applicable to the QA agent (gated out upstream). */
     extraArgs?: string[];
-  }): string[] {
+  }): AgentExecArgs {
     // The scenario file path comes from the QA_SCENARIO_FILE env var (read by the binary).
     // The supervisor sets cwd to the worktree path, so we pass '.' as the worktree arg.
     // QA_AGENT_SCRIPT is an absolute path resolved at import time via import.meta.dir.
-    return ['bun', 'run', QA_AGENT_SCRIPT, '-p', safeArgvPrompt(opts.prompt, 'prompt'), '--worktree', '.'];
+    // The prompt goes on stdin (`-p` with no value), never argv.
+    return Object.assign(['bun', 'run', QA_AGENT_SCRIPT, '-p', '--worktree', '.'], { stdinInput: opts.prompt });
   }
 
   parseResponse(stdout: string, _opts?: { workingDir?: string }): AgentResponse {

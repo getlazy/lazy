@@ -138,6 +138,27 @@ describe('runSelfSync in a real repository', () => {
     expect(turns[0].endShaWork).toBeUndefined();
   });
 
+  test('a host-side sync records the head window its merge moved; an agent self-sync does not', async () => {
+    // INVARIANT: only a host sync (no open agent work turn) gives its sync turn
+    // a SHA window, so final-state can show the head moved; an agent's own
+    // lazy_sync stays windowless because its work turn already spans the merge.
+    const before = gitIn(worktree, 'rev-parse', 'HEAD').stdout.trim();
+    const { storage, turns } = stubStorage();
+    await runSelfSync({
+      storage,
+      taskId: 'task-1234',
+      sessionId: 'sess-1',
+      displayId: 'my-task',
+      worktreePath: worktree, branch: TASK_BRANCH,
+      plan: parentPlan(),
+      recordShaWindow: true,
+    });
+    const after = gitIn(worktree, 'rev-parse', 'HEAD').stdout.trim();
+    expect(turns[0].startSha).toBe(before);
+    expect(turns[0].endSha).toBe(after);
+    expect(before).not.toBe(after);
+  });
+
   test('a conflicted merge is LEFT IN PLACE for the calling agent, with instructions', async () => {
     // INVARIANT: the agent that called is the one that resolves. Aborting the
     // merge here would leave it with nothing to resolve — it cannot start a

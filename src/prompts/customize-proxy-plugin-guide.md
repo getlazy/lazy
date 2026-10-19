@@ -5,11 +5,10 @@ Develop the lazy proxy request plugin scaffolded at `{{pluginPath}}`.
 Lazy runs a local Anthropic-native passthrough proxy that every agent's model
 traffic flows through. A **request plugin** gets the parsed JSON body of each
 outbound request just before it is forwarded upstream, and may return a
-replacement body. Plugins are loaded by convention from `.lazy/plugins/` in the
-project — presence is the enable switch, there is no config key — in sorted
-filename order, and the chain is a fold: each plugin sees the previous one's
-output.
+replacement body. Plugins live in `.lazy/plugins/`, run in sorted filename
+order, and the chain is a fold: each plugin sees the previous one's output.
 
+{{notRunNotice}}
 The scaffold has two files:
 
 - `{{pluginPath}}` — the plugin. Its default export is `{ name, transformRequest }`.
@@ -30,9 +29,8 @@ The scaffold has two files:
    forwards the original body — so a bug degrades to passthrough, never to a
    failed request. Do not rely on that as control flow; do rely on it meaning a
    mistake here cannot take agents down.
-5. **Load-time errors are loud.** A file that will not import, or that does not
-   export the expected shape, fails the daemon's proxy startup. Keep the module
-   importable.
+5. **Keep the module importable.** A file that will not import, or that does
+   not export the expected shape, is a load error for the plugin loader.
 
 ## What is dangerous to touch, and why
 
@@ -57,17 +55,11 @@ The scaffold has two files:
 3. Extend `{{testPath}}` with a test per behaviour you promised, plus one that
    asserts the untouched fields are carried through identically.
 4. Run `{{testCommand}}` until green.
-5. Restart the lazy daemon (`lazy daemon restart`). The startup log will name
-   your plugin and its position in the chain — confirm it appears. Plugins are
-   loaded once per daemon process, so an edit needs a restart to take effect.
-6. Verify the real effect against real traffic with `lazy stats audit` and
-   `lazy stats tokens`, not against your expectations.
+5. Do not restart the daemon expecting the plugin to load — it will not, and
+   there is no real traffic to verify it against. The smoke test is the whole
+   verification today.
 
 ## Before you call it done
 
-Measure. A transform that sounds like it should help and is not measured to help
-is a liability sitting on every agent's critical path. Report what changed, by
-how much, and on what sample.
-
-Plugin code runs inside the lazy daemon process, on the host, with the daemon's
-privileges. It is not sandboxed. Keep it small enough to read in one sitting.
+Report what the plugin changes and what its tests prove. Keep it small enough
+to read in one sitting.

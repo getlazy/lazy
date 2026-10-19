@@ -31,6 +31,30 @@ describe("doctor's daemon-health summary line", () => {
     expect(result.label).toBe('Daemon health: all 1 checks OK');
   });
 
+  test('runner failure is not reported twice by doctor', async () => {
+    const fail: DaemonHealthRow = { ...OK, id: 'runner:available', group: 'runner', name: 'Runner', state: 'fail', reason: 'down' };
+    const result = await checkDaemonHealthSummary('/p', async () => report([OK, fail]));
+    expect(result.ok).toBe(true);
+    expect(result.label).toBe('Daemon health: all 1 checks OK');
+  });
+
+  test('proxy listener failure already reported as Runner available does not produce a second notice', async () => {
+    const listener = { ...OK, state: 'fail' as const, reason: 'proxy unavailable' };
+    const audit = { ...OK, id: 'proxy:audit-log', name: 'Proxy audit log writable' };
+    const result = await checkDaemonHealthSummary('/p', async () => report([listener, audit]), true);
+    expect(result.ok).toBe(true);
+    expect(result.label).toBe('Daemon health: all 1 checks OK');
+  });
+
+  test('independent proxy failures remain visible alongside a proxy-resolution failure', async () => {
+    const listener = { ...OK, state: 'fail' as const, reason: 'proxy unavailable' };
+    const audit = { ...OK, id: 'proxy:audit-log', name: 'Proxy audit log writable', state: 'fail' as const, reason: 'disk full' };
+    const result = await checkDaemonHealthSummary('/p', async () => report([listener, audit]), true);
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain('Proxy audit log writable');
+    expect(result.detail).not.toContain('Proxy answering');
+  });
+
   test('any other failing row fails the line and names it', async () => {
     const fail: DaemonHealthRow = { ...OK, state: 'fail', reason: 'down' };
     const result = await checkDaemonHealthSummary('/p', async () => report([fail, BUILD_MISMATCH]));

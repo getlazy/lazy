@@ -144,7 +144,7 @@ describe('protected branches: inline passphrase at lazy accept', () => {
     expect(log.stdout).not.toContain('wrong-pass');
   });
 
-  // INVARIANT: pre-flight before prompting (CLAUDE.md). With nothing enrolled,
+  // INVARIANT: pre-flight before prompting (AGENTS.md). With nothing enrolled,
   // NO passphrase can verify — so accept must say so and exit BEFORE it asks
   // the human to type a secret. Do NOT "simplify" this by letting the gate's
   // verify() produce the message after the prompt: that is the bug this pins.

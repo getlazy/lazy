@@ -19,6 +19,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import {
   validateWorktreeGitPointers,
+  writeGitPointerCopies,
   repairWorktreeGitPointers,
   repairTamperedWorktrees,
   scanWorktreeGitPointers,
@@ -30,6 +31,7 @@ import {
 import { buildSupervisorWrapperScript } from '../../src/capture/claude';
 import { buildTaskGitMounts } from '../../src/capture/git-mounts';
 import { runGit } from '../../src/utils/git';
+import { probeContainerGitPointers } from '../../src/git/container-pointers';
 
 let base: string;
 let repo: string;
@@ -240,13 +242,44 @@ describe('repair', () => {
 });
 
 describe('task container mounts', () => {
+  test('repeated and concurrent launches never replace an existing mounted copy', async () => {
+    const layout = await validateWorktreeGitPointers(repo, worktree);
+    const copyDir = join('.lazy', 'git-pointers', 'some-task');
+    const initial = await Promise.all(Array.from({ length: 8 }, () => writeGitPointerCopies(repo, copyDir, layout)));
+    const original = initial[0]!;
+    for (const copies of initial) expect(copies).toEqual(original);
+    const before = await Promise.all(original.map((copy) => stat(copy.source)));
+    const launches = await Promise.all(Array.from({ length: 8 }, () => writeGitPointerCopies(repo, copyDir, layout)));
+    for (const copies of launches) expect(copies).toEqual(original);
+    for (const [index, copy] of original.entries()) {
+      const after = await stat(copy.source);
+      expect(after.ino).toBe(before[index]!.ino);
+      expect(after.mtimeMs).toBe(before[index]!.mtimeMs);
+    }
+    const changed = { pointerFiles: layout.pointerFiles.map((pointer) => ({ ...pointer, content: `${pointer.content}\n` })) };
+    const revised = await writeGitPointerCopies(repo, copyDir, changed);
+    for (const [index, copy] of revised.entries()) {
+      expect(copy.source).not.toBe(original[index]!.source);
+      expect(await readFile(original[index]!.source, 'utf-8')).toBe(layout.pointerFiles[index]!.content);
+    }
+  });
+
+  test('an altered immutable copy is refused rather than overwritten', async () => {
+    const layout = await validateWorktreeGitPointers(repo, worktree);
+    const copies = await writeGitPointerCopies(repo, '.lazy/git-pointers/some-task', layout);
+    await chmod(copies[0]!.source, 0o644);
+    await writeFile(copies[0]!.source, 'wrong');
+    await expect(writeGitPointerCopies(repo, '.lazy/git-pointers/some-task', layout)).rejects.toThrow();
+  });
+
   test('bind read-only copies of the checked text over all three pointers, from a dir no container can write', async () => {
     const { args, pointerTargets } = await buildTaskGitMounts(repo, worktree);
     const mounts = args.filter((_, i) => args[i - 1] === '-v');
     const copyDir = join(repo, '.lazy', 'git-pointers', 'some-task');
     for (const [name, target] of [['dotgit', join(worktree, '.git')], ['commondir', join(gitdir, 'commondir')], ['gitdir', join(gitdir, 'gitdir')]] as const) {
-      expect(mounts).toContain(`${join(copyDir, name)}:${target}:ro`);
-      expect(await readFile(join(copyDir, name), 'utf-8')).toBe(await readFile(target, 'utf-8'));
+      const source = mounts.find((mount) => mount.endsWith(`:${target}:ro`))!.split(':')[0]!;
+      expect(source).toMatch(new RegExp(`${copyDir}/${name}-[a-f0-9]{64}$`));
+      expect(await readFile(source, 'utf-8')).toBe(await readFile(target, 'utf-8'));
       expect(pointerTargets).toContain(target);
     }
     // The copies sit under the project root (mounted :ro into every task
@@ -332,5 +365,51 @@ describe('taskWorktreeOf', () => {
     expect(taskWorktreeOf('/p/.workshop/worktrees/t/a')).toEqual({ projectRoot: '/p', worktreePath: '/p/.workshop/worktrees/t' });
     expect(taskWorktreeOf('/p')).toBeNull();
     expect(taskWorktreeOf('/p/.lazy/worktrees/')).toBeNull();
+  });
+});
+
+test('container pointer probe checks the mounted view independently of the host', async () => {
+  let replacement: string | undefined;
+  const runner = {
+    async execInRun(_name: string, argv: string[]) {
+      const command = [...argv];
+      if (replacement) command[4] = replacement;
+      return Bun.spawnSync(command, { stdout: 'pipe', stderr: 'pipe' }).exitCode;
+    },
+  };
+  expect(await probeContainerGitPointers(repo, worktree, runner, 'task')).toEqual({ kind: 'healthy' });
+  replacement = join(base, 'missing-mounted-pointer');
+  expect(await probeContainerGitPointers(repo, worktree, runner, 'task')).toEqual({ kind: 'broken' });
+  replacement = join(base, 'wrong-mounted-pointer');
+  await writeFile(replacement, 'gitdir: wrong');
+  expect(await probeContainerGitPointers(repo, worktree, runner, 'task')).toEqual({ kind: 'broken' });
+  replacement = join(base, 'linked-mounted-pointer');
+  await symlink(join(worktree, '.git'), replacement);
+  expect(await probeContainerGitPointers(repo, worktree, runner, 'task')).toEqual({ kind: 'broken' });
+  await validateWorktreeGitPointers(repo, worktree);
+});
+
+test('container pointer probe refuses host tampering before executing inside', async () => {
+  await writeFile(join(worktree, '.git'), `gitdir: ${evil}\n`);
+  let executed = false;
+  const runner = { async execInRun() { executed = true; return 0; } };
+  await expect(probeContainerGitPointers(repo, worktree, runner, 'task')).rejects.toThrow();
+  expect(executed).toBe(false);
+});
+
+test('a missing pointer reader is an unavailable diagnostic, not a broken pointer', async () => {
+  const runner = {
+    async execInRun(_name: string, argv: string[]) {
+      const command = ['/bin/sh', ...argv.slice(1)];
+      return Bun.spawnSync(command, {
+        env: { PATH: join(base, 'no-executables') },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      }).exitCode;
+    },
+  };
+  expect(await probeContainerGitPointers(repo, worktree, runner, 'task')).toEqual({
+    kind: 'unavailable',
+    reason: 'Pointer probe exited with code 43.',
   });
 });

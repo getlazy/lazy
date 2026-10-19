@@ -33,10 +33,16 @@ export function isUpstreamTimeout(err: unknown): boolean {
  *
  * `timeoutSeconds <= 0` means no ceiling at all: Bun's default is still
  * disabled, and only the client going away ends the request.
+ *
+ * REDIRECTS ARE NEVER FOLLOWED. The request carries the real credential the
+ * proxy attached for THIS target; a followed redirect would carry it to
+ * whatever host the Location names, past the per-target credential map and the
+ * provider-host backstop. The 3xx goes back to the client as-is, and the client
+ * holds only its placeholder.
  */
 export function upstreamFetchOptions(timeoutSeconds: number): Record<string, unknown> {
   // `timeout` is a Bun-only fetch extension and is not in the published types.
-  const options: Record<string, unknown> = { timeout: false };
+  const options: Record<string, unknown> = { timeout: false, redirect: 'manual' };
   if (timeoutSeconds > 0) {
     options.signal = AbortSignal.timeout(timeoutSeconds * 1000);
   }

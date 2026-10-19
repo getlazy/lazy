@@ -41,7 +41,9 @@ interface Invocation {
 }
 
 /**
- * Pull every `bun run <…>/src/index.ts …` invocation out of a shell script.
+ * Pull every lazy invocation out of a shell script: the compiled binary
+ * (`<…>/bin/lazy …`, what the image ships) or a source run
+ * (`bun run <…>/src/index.ts …`).
  *
  * Backslash continuations are joined first: the runner build is written across
  * two lines with the `gosu`/`env` prefix on the first, and a line-by-line scan
@@ -59,7 +61,7 @@ function lazyInvocations(script: string): Invocation[] {
     // rest of the sentence.
     if (/^(#|log\b|echo\b)/.test(trimmed)) continue;
 
-    const match = /bun\s+run\s+\S*src\/index\.ts\s+([^;|&]+)/.exec(line);
+    const match = /(?:bun\s+run\s+\S*src\/index\.ts|\S*\/bin\/lazy)\s+([^;|&]+)/.exec(line);
     if (!match) continue;
 
     const words = match[1]!.trim().split(/\s+/).filter(Boolean);

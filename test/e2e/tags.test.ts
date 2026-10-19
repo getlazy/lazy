@@ -6,7 +6,7 @@
  * attributed to actor='human'; via the MCP boundary (the builder) it is
  * actor='builder' (see mcp-tag.test.ts). History is append-only — untagging
  * appends an 'untag' event, it never erases the earlier 'tag' event. (See
- * CLAUDE.md, and the builder-actor task for the full actor taxonomy.)
+ * AGENTS.md, and the builder-actor task for the full actor taxonomy.)
  *
  * These assert on `lazy show`/`lazy list`/`lazy search` output rather than raw
  * storage files: the on-disk path is a configurable external location, and the

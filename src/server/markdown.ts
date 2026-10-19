@@ -49,7 +49,7 @@ const URL_IGNORED_CHARS = /[\u0000-\u0020\u007f-\u009f]/g;
  * letter, then letters, digits, `+` or `-`. No dot.
  *
  * The dot is what does the work here. `src/server/markdown.ts:192` is the most
- * common shape of code reference agents write — CLAUDE.md tells them to write
+ * common shape of code reference agents write — AGENTS.md tells them to write
  * `file_path:line_number` because it is clickable — and treating `markdown.ts`
  * as an asserted scheme made every one of those render as grey inert text
  * captioned "unsupported URL scheme". On a shared renderer that is lazy issuing
@@ -76,7 +76,7 @@ const URL_SCHEME_SHAPE = /^[a-z][a-z0-9+-]*$/;
  * A colon before the first `/`, `?` or `#` MAY be asserting a scheme. It only
  * counts as one when the text before it is scheme-shaped (see
  * {@link URL_SCHEME_SHAPE}); then it must be on the allowlist. A dotted prefix
- * — `markdown.ts:192`, `CLAUDE.md:1` — is the relative path it looks like. An
+ * — `markdown.ts:192`, `AGENTS.md:1` — is the relative path it looks like. An
  * UNDOTTED prefix is still read as a scheme and still refused, so the
  * narrowing keys on the dot rather than on "looks pathlike".
  *
@@ -525,7 +525,11 @@ export function renderMarkdown(markdown: string, options: RenderMarkdownOptions 
         output.push(mermaidMarkAttrs ? `<div${mermaidMarkAttrs}>${wrapped}</div>` : wrapped);
         continue;
       }
-      const langAttr = lang ? ` class="language-${escapeHtml(lang)}"` : '';
+      // ONE class, from the info string's first word and only if it looks like a
+      // language name: the rest is agent-written text, and a bare `md-copy` in
+      // it became a class that armed the page's Copy handler.
+      const langName = /^[A-Za-z0-9_+#.-]+/.exec(lang)?.[0] ?? '';
+      const langAttr = langName ? ` class="language-${escapeHtml(langName)}"` : '';
       output.push(
         `<pre${markAttrs(fenceStart, i - 1)}><code${langAttr}>${escapeHtml(codeLines.join('\n'))}</code></pre>`,
       );

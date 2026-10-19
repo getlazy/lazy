@@ -9,20 +9,21 @@ implementer turn under your project instructions.
 
 ```
 your-project/
-  CLAUDE.md            # read by Claude Code, in every session, including yours
+  CLAUDE.md or AGENTS.md  # your project instructions, read by the agent harness
   LAZY.md              # read by lazy, only for agents running lazy tasks
   services/api/
     LAZY.md            # applies to that part of the tree
 ```
 
-Nothing else reads it. Claude Code reads `CLAUDE.md`, Cursor and Codex read
-their own files; none of them know `LAZY.md` exists. Lazy injects it precisely
+Nothing else reads it. Claude Code reads `CLAUDE.md` (and falls back to `AGENTS.md` only when no
+`CLAUDE.md` exists), while Cursor and Codex read `AGENTS.md`; none
+of them know `LAZY.md` exists. Lazy injects it precisely
 because no harness does.
 
 ## What belongs in it
 
 **Anything that is true only when an agent is working through lazy** — and
-therefore does not belong in `CLAUDE.md`, which your own interactive sessions
+therefore does not belong in `CLAUDE.md` or `AGENTS.md`, which your own interactive sessions
 read too.
 
 The clearest case is your environment. An agent running a lazy task is inside
@@ -50,7 +51,7 @@ acceptance gate, house rules about what a task should and should not touch, wher
 put generated files so they do not end up in a diff.
 
 **What does not fit:** anything you want in effect when you work interactively
-too. That is `CLAUDE.md`'s job, and lazy does not duplicate it — the agent gets
+too. That is the job of `CLAUDE.md` and `AGENTS.md`, and lazy does not duplicate it — the agent gets
 both, from its own worktree.
 
 ## Which files get loaded
@@ -93,7 +94,7 @@ A project with no `LAZY.md` gets nothing injected and pays nothing.
 ## What it cannot do
 
 `LAZY.md` is **guidance, not authority**. It is read from the task's worktree —
-the same copy the agent's `CLAUDE.md` comes from — so an agent's instructions
+the same copy the agent's `CLAUDE.md` or `AGENTS.md` comes from — so an agent's instructions
 match the tree it is working in. Nothing in it can widen a permission, change a
 check, choose a model, or relax a rule in the agent's system instructions;
 lazy's own settings come from `lazy.toml` in your project root, which a task

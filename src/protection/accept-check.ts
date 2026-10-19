@@ -29,38 +29,25 @@
  *   Reporting that as a compile failure would send the reviewer hunting a type
  *   error that does not exist — and a gate that silently passes because nothing
  *   ran is the exact defect this module exists to prevent, so it still refuses.
- * - **Host-side, in the task worktree.** No agent turn, no container, no
- *   network, no extra daemon state: accept already has the worktree path.
- *   See the trust boundary below — this one is a real tradeoff, not a freebie.
+ * - **In a container, never on the host.** The check runs in the same
+ *   ephemeral gate container `[automation.pre_accept]` uses, against the task's
+ *   worktree. See the trust boundary below.
  * - **The override is explicit and named.** `lazy accept <task> --allow-broken`
  *   accepts knowingly; the refusal names the flag. There is no way to turn the
  *   gate into a silent pass. It is CLI-only, so a refusal delivered over MCP
  *   says the override needs a terminal rather than naming a flag that surface
  *   cannot pass (docs/surface-asymmetries.md §14).
  *
- * ## Trust boundary — read before enabling this
+ * ## Trust boundary
  *
- * The check runs as a plain `sh -c` on the DAEMON HOST, as the user running
- * the daemon, with cwd set to the task worktree. That worktree is agent-written.
- *
- * The COMMAND is human config: it comes from the project's `lazy.toml`, read
- * from the project root, never from the task branch's copy — a task cannot edit
- * its own gate. But what the command RESOLVES is agent-authored: `bun run
- * typecheck` reads the worktree's `package.json` scripts, a `make check` reads
- * its `Makefile`, `tsc` reads its `tsconfig.json` (and, via that, any config it
- * extends). An agent that can commit to its own branch can change what your
- * check actually executes.
- *
- * This is deliberate but not free. `[automation] pre_accept` — the mechanical
- * acceptance gate — runs in its own ephemeral container built from the task's
- * consented image, independent of the task's runner, and the accept_check gate
- * does not even share that: the task's constraint is
- * that it must not depend on the runner, the network, or daemon health beyond
- * what accept already needs, so it executes outside every container guard —
- * including on fully automated MCP accepts of subtasks, where no human sees the
- * accept at all. Enabling `accept_check` on a container-runner project means
- * accepting a host-side execution of something the agent can influence. Treat
- * it the way you would treat a CI hook running over untrusted input.
+ * The COMMAND is human config (the project root's lazy.toml, never the task
+ * branch's copy), but what it RESOLVES is agent-authored: `bun run typecheck`
+ * reads the worktree's `package.json`, `make check` its `Makefile`. So the
+ * check is agent-controlled code, and agent-controlled code never runs on the
+ * daemon's host — accept or not, solo or managed (engineer, 2026-10-10). It used
+ * to run as a host-side `sh -c`; it now runs through the caller-supplied
+ * {@link AcceptCheckRunner}, which the daemon backs with the acceptance-gate
+ * container. This module deliberately has no way to run a command itself.
  *
  * Cost: one process, bounded by `accept_check_timeout` (default 300s). Measured
  * on this repo (agent container, 2026-08): a full `tsc --noEmit` over ~900 files
@@ -70,7 +57,7 @@
  * project that leaves `accept_check` unset.
  */
 
-import { runTurnHookCommand, formatHookOutput, type TurnHookLogSink } from '../supervisor/post-turn-check';
+import type { TurnHookLogSink } from '../supervisor/post-turn-check';
 import { docsSuffix } from '../docs/links';
 
 /** Exit code of a command whose interpreter or binary was not found. */
@@ -115,8 +102,6 @@ export interface AcceptCheckOutcome {
 }
 
 export interface EnforceAcceptCheckParams {
-  /** The task's worktree — the tree that is about to be merged. */
-  worktreePath: string;
   /** Command from `[automation] accept_check`. Empty = no gate configured. */
   command: string;
   /** Timeout in seconds from `[automation] accept_check_timeout`. */
@@ -128,13 +113,29 @@ export interface EnforceAcceptCheckParams {
   allowBroken: boolean;
   /** See {@link acceptCheckOverrideAvailable}. Defaults to true (the CLI). */
   overrideAvailable?: boolean;
-  /** Where progress lines go. Defaults to the supervisor logger. */
+  /** Where progress lines go. */
   logSink?: TurnHookLogSink;
+  /** Runs the command in the task's worktree INSIDE a container. Required. */
+  run: AcceptCheckRunner;
+}
+
+/** What running the check produced. `output` is already formatted for a human. */
+export interface AcceptCheckRunResult {
+  exitCode: number;
+  timedOut: boolean;
+  output: string;
+  elapsedMs: number;
 }
 
 /**
+ * Runs the accept check somewhere that is NOT the daemon's host. Injected so
+ * this module cannot regress to a host-side spawn.
+ */
+export type AcceptCheckRunner = (command: string, timeoutSecs: number) => Promise<AcceptCheckRunResult>;
+
+/**
  * The refusal text: what happened, in MERGE terms, plus the output and the
- * named override. CLAUDE.md — an error says what was attempted, what happened,
+ * named override. AGENTS.md — an error says what was attempted, what happened,
  * and what to do about it.
  */
 export function acceptCheckRefusalMessage(params: {
@@ -227,7 +228,7 @@ export function acceptCheckOverriddenWarning(displayId: string, exitCode: number
 export async function enforceAcceptCheck(
   params: EnforceAcceptCheckParams,
 ): Promise<AcceptCheckOutcome> {
-  const { worktreePath, command, timeoutSecs, displayId, targetBranch, allowBroken, logSink } = params;
+  const { command, timeoutSecs, displayId, targetBranch, allowBroken, logSink } = params;
   const overrideAvailable = params.overrideAvailable !== false;
 
   // Coalesced: a config object that predates this key (or a caller that built
@@ -241,19 +242,15 @@ export async function enforceAcceptCheck(
     };
   }
 
-  const result = await runTurnHookCommand(
-    trimmed,
-    worktreePath,
-    Math.max(1, Math.round(timeoutSecs)) * 1000,
-    `Accept check for ${displayId}`,
-    logSink,
-  );
+  const secs = Math.max(1, Math.round(timeoutSecs));
+  logSink?.info(`Accept check for ${displayId}: running "${trimmed}" in the acceptance-gate container (timeout ${secs}s)`);
+  const result = await params.run(trimmed, secs);
 
   if (result.exitCode === 0) {
     return { ran: true, elapsedMs: result.elapsedMs };
   }
 
-  const output = formatHookOutput(result);
+  const output = result.output;
   if (allowBroken) {
     return { ran: true, elapsedMs: result.elapsedMs, overridden: true, exitCode: result.exitCode };
   }

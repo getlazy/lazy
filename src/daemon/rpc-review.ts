@@ -11,7 +11,7 @@
  * These handlers are the missing transport, and nothing more. Every one of them
  * is a thin adapter: validate the params, call the SAME `createReviewActions()`
  * implementation the daemon's own handler calls, return its result. The review
- * logic stays in review-service.ts, which is what keeps CLAUDE.md's "never lose
+ * logic stays in review-service.ts, which is what keeps AGENTS.md's "never lose
  * human feedback" ordering — persist the comment through Storage BEFORE any
  * dispatch is attempted — in one place with one copy.
  *
@@ -74,7 +74,16 @@ export async function handleReviewDiff(projectRoot: string, params: Record<strin
     ? params.region.trim()
     : undefined;
   const files = optionalPathList(params.files);
-  return { diff: await createReviewActions(projectRoot).getDiff(taskId, { region, ...(files ? { files } : {}) }) };
+  const actions = createReviewActions(projectRoot);
+  const diff = await actions.getDiff(taskId, { region, ...(files ? { files } : {}) });
+  // The Changes tab used to ask for the diff and then ask again, inside
+  // `reviewPresentations`, to render the same patch as documents and diagrams.
+  // `presentations: true` does both from the diff already in hand.
+  if (optionalBoolean(params, 'presentations') === true) {
+    const presented = await presentationsFromDiff(diff, (query) => actions.getFileLines(taskId, query));
+    return { diff, ...presented };
+  }
+  return { diff };
 }
 
 /** The Changes tab's file list: every file of the diff with +/−, no patch. */
@@ -158,9 +167,8 @@ export async function handleReviewFileLines(projectRoot: string, params: Record<
  * that cannot be rendered (unreadable, too long, a shape the renderer does not
  * model) is simply absent from `documents`: the client keeps its line diff.
  *
- * Cost: this computes the task diff a second time per Changes load (the first
- * is `reviewDiff`). Folding both into one reply behind an opt-in flag would
- * halve that and guarantee the two agree; not done yet.
+ * `reviewDiff` with `presentations: true` does this from the diff it already
+ * fetched. This command stays for a client that still asks separately.
  */
 export async function handleReviewPresentations(projectRoot: string, params: Record<string, unknown>) {
   const taskId = requireString(params, 'taskId');
@@ -172,8 +180,21 @@ export async function handleReviewPresentations(projectRoot: string, params: Rec
 export type PresentationReads = Pick<ReturnType<typeof createReviewActions>, 'getDiff' | 'getFileLines'>;
 
 export async function reviewPresentations(actions: PresentationReads, taskId: string, region?: string) {
-  const files = parseUnifiedDiff(await actions.getDiff(taskId, { region }));
-  const sources = await loadMarkdownSources(files, (query) => actions.getFileLines(taskId, query));
+  const diff = await actions.getDiff(taskId, { region });
+  return presentationsFromDiff(diff, (query) => actions.getFileLines(taskId, query));
+}
+
+/**
+ * Documents and diagrams for a diff that has already been fetched. Shared by
+ * `reviewDiff` (when the caller asked) and `reviewPresentations`, so the two
+ * cannot disagree about a patch one of them computed a moment later.
+ */
+export async function presentationsFromDiff(
+  diff: string,
+  readLines: Parameters<typeof loadMarkdownSources>[1],
+) {
+  const files = parseUnifiedDiff(diff);
+  const sources = await loadMarkdownSources(files, readLines);
   const documents = [];
   const diagrams = [];
   for (const file of files) {
@@ -388,7 +409,11 @@ export async function handleReviewSync(
   progress?: ProgressEmitter,
 ) {
   const taskId = requireString(params, 'taskId');
-  return await createReviewActions(projectRoot).sync(taskId, progress);
+  // A person's confirmation to resolve a conflict on lazy's default runner
+  // image while the project's is not ready (Lazy Teams' Sync).
+  return await createReviewActions(projectRoot).sync(taskId, progress, {
+    useDefaultImage: params.useDefaultImage === true,
+  });
 }
 
 export async function handleReviewViolationDecision(
@@ -582,11 +607,15 @@ export async function handleReviewPromoteRaised(
   const itemId = requireNonBlankString(params, 'itemId');
   const goal = optionalString(params, 'goal');
   const code = optionalString(params, 'code');
+  const prompt = optionalString(params, 'prompt');
+  const parent = optionalString(params, 'parent');
   const relation = params.relation === 'subtask' ? 'subtask' : 'peer';
   const actor = optionalActorInput(params);
   const result = await createReviewActions(projectRoot).promoteRaisedItem(taskId, itemId, {
     ...(goal != null ? { goal } : {}),
     ...(code != null ? { code } : {}),
+    ...(prompt != null ? { prompt } : {}),
+    ...(parent != null ? { parent } : {}),
     relation,
     ...(actor !== undefined ? { actor } : {}),
   });

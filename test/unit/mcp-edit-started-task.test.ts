@@ -2,7 +2,8 @@
  * Unit tests for the MCP `lazy_edit` guard on started tasks.
  *
  * The MCP surface must mirror the `lazy edit` CLI: once a task has turns,
- * goal/prompt/type/code/parent edits are rejected, but model and effort edits
+ * goal/prompt/type/parent edits are rejected (a code change on its own is a
+ * cosmetic rename, allowed), but model and effort edits
  * are allowed. That model-only exemption is the supported way to durably change a
  * running task's model — auto-resume/auto-deliver relaunch from task.model,
  * and a stale value there caused a real crash-loop incident (task relaunched

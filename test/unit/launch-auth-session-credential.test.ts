@@ -14,10 +14,14 @@ import { join } from 'path';
 import { Glob } from 'bun';
 import { getLaunchAuthEnvVars } from '../../src/capture/claude';
 import { setDaemonContext, clearDaemonContext } from '../../src/daemon/context';
-import { SESSION_TOKEN_PREFIX, isSessionPlaceholderToken } from '../../src/daemon/session-credentials';
+import { SESSION_TOKEN_PREFIX, isSessionPlaceholderToken, bindTurnCredential, clearSessionCredentialCache } from '../../src/daemon/session-credentials';
+import { putUserCredential, clearUserCredentialCache } from '../../src/daemon/user-credentials';
+import { resolveMemberCredential } from '../../src/proxy/credential-deps';
+import { findLazyRoot } from '../../src/project-paths';
 import {
   clearCredentialGrantCache,
   looksLikeLazyPlaceholder,
+  lookupCredentialGrant,
 } from '../../src/proxy/credential-broker';
 import { ANTHROPIC_DEFAULT_TARGET, LOCAL_BACKEND_CREDS } from '../../src/utils/role-target';
 import { NO_CREDENTIAL } from '../../src/config/agent-profiles';
@@ -165,11 +169,10 @@ describe('no launch path bypasses getLaunchAuthEnvVars with a plan credential', 
       'daemon/builder-sessions.ts': /getLaunchAuthEnvVars\([^;]*credEnv \?\? undefined/,
       // getLaunchAuthEnvVars(…, surface, credEnv ?? undefined)
       'daemon/review-session-builder-turn.ts': /getLaunchAuthEnvVars\([^;]*credEnv \?\? undefined/,
-      // → runOneshot ownerCredentialEnv → runner's getLaunchAuthEnvVars injectedCreds
-      'daemon/link-describe.ts': /ownerCredentialEnv/,
-      // memory compact: withCompactCredential → ownerCredentialEnv → compact's
-      // runOneshot → runner's getLaunchAuthEnvVars injectedCreds (spender = asker)
-      'daemon/rpc-memory.ts': /ownerCredentialEnv/,
+      // every team-mode one-shot (link describe, memory compact, the accept-time
+      // fidelity summary): fn(env) → runOneshot ownerCredentialEnv → runner's
+      // getLaunchAuthEnvVars injectedCreds (spender = asker, else service holder)
+      'daemon/oneshot-credential.ts': /fn\(credentialEnvForPlan\(plan\) \?\? undefined\)/,
       // a member's own terminal container: getLaunchAuthEnvVars(…, 'container', credEnv)
       // on the built-in Anthropic target, so no profile credential outranks it
       'server/member-exec-credential.ts': /getLaunchAuthEnvVars\([^;]*'container', credEnv\)/,
@@ -238,5 +241,57 @@ describe('getLaunchAuthEnvVars runs the turn credential gate', () => {
   test('a profile on a server that takes no credential is not gated', async () => {
     const target = { ...ANTHROPIC_DEFAULT_TARGET, credential: NO_CREDENTIAL, profile: 'local-model' };
     await expect(getLaunchAuthEnvVars(identity, target, undefined, 'container')).resolves.toBeDefined();
+  });
+});
+
+describe('getLaunchAuthEnvVars for a team-mode launch beside a task', () => {
+  let undo: () => void;
+  let baseDir: string;
+
+  beforeEach(async () => {
+    baseDir = await makeDaemonBaseDir();
+    undo = pinDaemonBaseDir(baseDir);
+    clearCredentialGrantCache();
+    clearUserCredentialCache();
+    clearSessionCredentialCache();
+    setDaemonContext({ webPort: 26024, token: 'test', proxyPort: 40001 });
+  });
+
+  afterEach(async () => {
+    clearDaemonContext();
+    undo();
+    clearCredentialGrantCache();
+    clearUserCredentialCache();
+    clearSessionCredentialCache();
+    await rm(baseDir, { recursive: true, force: true });
+  });
+
+  // INVARIANT: a side launch (a member's builder, a one-shot) on a key-capable
+  // harness gets its own key's placeholder, and that placeholder's grant
+  // resolves — through the session binding its injected placeholder belongs
+  // to — to the member who pays. Never to the project's own credentials.
+  test('a codex side launch gets a key placeholder billed to the binding owner', async () => {
+    const root = findLazyRoot()!;
+    const member = 'alice@example.com';
+    await putUserCredential(root, {
+      userId: member, profile: 'codex', kind: 'api-key', token: 'sk-openai-alice-side', endpoint: 'https://api.openai.com',
+    });
+    const bound = await bindTurnCredential(root, { taskId: 'oneshot:test:side', sessionId: 'oneshot:test:side', ownerUserId: member, kind: 'api-key' });
+    const target = {
+      ...ANTHROPIC_DEFAULT_TARGET, harness: 'codex', profile: 'codex', credential: 'openai',
+      endpoint: 'https://api.openai.com',
+    };
+    const vars = await getLaunchAuthEnvVars(
+      { role: 'builder', taskId: null, label: 'oneshot:test', profile: 'codex' },
+      target, { role: 'builder' }, 'container', [{ key: 'ANTHROPIC_API_KEY', value: bound.token }],
+    );
+    const key = vars.find((v) => v.key === 'OPENAI_API_KEY')?.value;
+    expect(key).toBeDefined();
+    expect(looksLikeLazyPlaceholder(key!)).toBe(true);
+    const grant = await lookupCredentialGrant(root, key!);
+    expect(grant?.bindingKey).toBe('oneshot:test:side');
+    const paid = await resolveMemberCredential(root, grant!);
+    expect(paid?.userId).toBe(member);
+    expect(paid?.outcome.kind).toBe('credential');
   });
 });

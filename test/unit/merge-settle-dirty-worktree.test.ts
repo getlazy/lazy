@@ -156,7 +156,7 @@ describe('settleConflictedWorktree with a dirty tracked file', () => {
     expect(patches.length).toBe(1);
     expect(patches[0]).toMatch(/^merge-settle-.*\.patch$/);
     // The path is in the message, because a patch the human cannot find is the
-    // same as no patch (CLAUDE.md: never silently discard).
+    // same as no patch (AGENTS.md: never silently discard).
     expect(result.detail).toContain(patches[0]!);
     // And the patch actually carries the discarded edit.
     const patch = await readFile(join(repo, '.lazy', 'recovery', patches[0]!), 'utf-8');

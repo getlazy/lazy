@@ -9,7 +9,7 @@
  */
 
 import type { McpTool } from './types';
-import { allTools } from './tools';
+import { allTools, capabilityTools } from './tools';
 import { internalGitTool } from './internal-git';
 import {
   parseToolCallEnvelope,
@@ -29,7 +29,7 @@ import {
  * surface unchecked.
  */
 export function allDispatchableTools(): McpTool[] {
-  return [...allTools, internalGitTool];
+  return [...allTools, ...capabilityTools, internalGitTool];
 }
 
 /** Find a tool definition by name, or undefined when the name is unknown. */

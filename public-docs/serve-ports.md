@@ -16,8 +16,8 @@ ports = [3000, 5173]
 ```bash
 lazy start my-task
 lazy url my-task
-# 3000  http://3000.my-task.lazy.localhost:26024  ● listening
-# 5173  http://5173.my-task.lazy.localhost:26024  ○ not listening
+# 3000  http://my-task.3000.lazy.localhost:26024  ● listening
+# 5173  http://my-task.5173.lazy.localhost:26024  ○ not listening
 
 open "$(lazy url my-task 3000)"
 ```
@@ -42,10 +42,10 @@ storybook = 6006
 ```
 
 ```bash
-lazy url my-task            # web  http://web.my-task.lazy.localhost:26024
-                            # api  http://api.my-task.lazy.localhost:26024
+lazy url my-task            # web  http://my-task.web.lazy.localhost:26024
+                            # api  http://my-task.api.lazy.localhost:26024
                             # ...
-lazy url my-task web        # http://web.my-task.lazy.localhost:26024
+lazy url my-task web        # http://my-task.web.lazy.localhost:26024
 ```
 
 Both spellings can be used together — `ports` for the ones whose number *is* the
@@ -61,7 +61,7 @@ uses, and the `lazy url <task> <service>` command ready to copy. The task
 *list* does not show it: the live mapping means a runtime call per task, which
 is not a cost a list render should pay for information nobody asked for yet.
 
-## The URL is a name: `<service>.<task>.lazy.localhost`
+## The URL is a name: `<task>.<service>.lazy.localhost`
 
 That URL is served by the running lazy daemon, on the same port as the
 dashboard. The daemon reads the hostname, finds the task's container and the
@@ -79,12 +79,14 @@ Two things that gets you, both of which a bare `127.0.0.1:49154` cannot:
   browser tab, a bookmark, or a note in a PR keeps working across restarts.
 
 The task part is the task's **code** when it has one, and its short id
-otherwise (`http://web.a1b2c3d4.lazy.localhost:26024`). That is why task codes
+otherwise (`http://a1b2c3d4.web.lazy.localhost:26024`). That is why task codes
 are restricted to what a hostname allows — lowercase letters, digits and
 hyphens, up to 63 characters. Older tasks whose code does not fit keep it
 and keep working everywhere else; in a URL they are addressed by
 short id, which is what `lazy url` prints for them. The service part is the
 service name, or the container port for a bare `[serve] ports` entry.
+The task always comes first, so every service of one task sits together:
+`my-task.web` and `my-task.3000` both address `my-task`.
 
 ### `--direct` for curl and scripts
 
@@ -100,6 +102,52 @@ curl "$(lazy url my-task web --direct)"   # http://127.0.0.1:49154
 
 `--direct` works in both shapes — with a service argument it prints the one
 bare loopback URL, and without one it lists them all.
+
+## Under Lazy Teams
+
+When the project runs under Lazy Teams, each task's Services card has an
+**Open** link for every service. Teams proxies the request to the project and on
+to the task, so the service opens from any browser signed in to Teams as a
+member of the project — not only on the machine running it — with WebSockets
+and hot reload passing through. The service gets a host name of its own under
+the install's services host (`<task>--<service>--p<project>.<services host>`),
+so, as with `lazy url`, every task keeps its own cookie jar. What an install
+needs for that name to resolve is in
+[Self-hosting Lazy Teams](self-hosting-lazy-teams.md#reaching-a-tasks-running-services).
+
+The address printed beside **Open** is the one Teams serves the service on, and
+the `lazy url` command is not shown there: under Teams, `lazy.localhost` names
+belong to the project's own machine and answer nowhere else. An install with
+no services host shows no address and says what an operator must set up.
+
+Opening a service that nothing is serving — the task's environment is down, or
+nothing listens on the port — takes you to the task's **Services** tab, which
+says what is running and offers **Run services**, which starts the task's
+environment first if it is down and shows each step as it happens.
+
+A server started inside a task's container must listen on all interfaces
+(`0.0.0.0`), not only on the container's loopback, to be reachable through the
+published port — `BINDING=0.0.0.0 bin/rails server`, `vite --host`, and so on.
+
+### Links in the pull request
+
+When the install has a public address, a submitted task's PR/MR description
+opens with one line: a link to the task in Teams and a link to its **main
+service**, so a reviewer can switch between the pull request and the running
+app. The main service is the port named by `main_service`, or the first
+declared port when it is not set:
+
+```toml
+[serve]
+ports = [3000, 5173]
+main_service = 5173     # must be one of the declared ports
+```
+
+A `main_service` that is not a declared port is a config error. The task's Services card marks which service that is. The service link appears only where the install can open task services (it has a services host); otherwise the line carries the task link alone. With no ports
+declared, the line carries the task link only. The line is kept current as the
+host or main service changes, and is never added on a solo install, where a
+localhost address would mean nothing to a reviewer. The links are plain; Teams'
+own sign-in still guards them.
 
 ## When nothing is listening
 
@@ -138,7 +186,7 @@ change a task that is already up. `lazy show` says so plainly:
 
 ```
   Serving:
-    web → http://web.my-task.lazy.localhost:26024
+    web → http://my-task.web.lazy.localhost:26024
     api → (not published — restart to pick up [serve])
 ```
 

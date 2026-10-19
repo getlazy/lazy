@@ -1,28 +1,12 @@
-import { join } from 'path';
-import { shortId, displayId, validateCode, taskRef, getWorktreePath, MAX_TASK_CODE_LENGTH } from '../../task/identity';
-import { existsSync } from 'fs';
-import { requireLazyRoot, requireStorage, parseFlags, validateModel, resolveTaskOrExit } from '../helpers';
-import { getDiffStat, hasUncommittedChanges } from '../../git/operations';
-import { cleanupTaskContainer, cleanupWorktreeAndBranch } from '../../task/cleanup';
+import { shortId, displayId, validateCode, MAX_TASK_CODE_LENGTH } from '../../task/identity';
+import { parseFlags, validateModel, resolveTaskOrExit, requireStorage } from '../helpers';
 import { commandStart } from './start';
-import { loadConfig } from '../../config/loader';
-import { createDriver } from '../../remote';
-import { logger } from '../../utils/logger';
-
+import { queryRedoTask } from '../../daemon/rpc-fallback';
 import { getActor } from '../../constants';
 import type { Storage } from '../../storage/interface';
-import { parentTaskIdOf } from '../../task-target';
 import { currentPromptOf } from '../../task-prompt';
-import { resolveAgentForNewTaskFromConfig } from '../../agent/task-agent';
-
-import { getDataDir } from '../../project-paths';
 import { theme } from '../../render/theme';
 import { escapeRegex } from '../../utils/regex';
-import { latestWorkAgentTurn } from '../../utils/turns';
-import { turnText } from '../../utils/turn-content';
-import {
-  droppedCustomImagePinWarning,
-} from '../../docker/worktree-image';
 
 /**
  * Generate a redo code from the old task's code, scanning existing tasks to avoid collisions.
@@ -101,7 +85,6 @@ export async function commandRedo(args: string[]): Promise<void> {
     modelOverride = validateModel(modelValue);
   }
 
-  const root = requireLazyRoot();
   const storage = await requireStorage();
 
   let newTaskShortId: string;
@@ -126,133 +109,59 @@ export async function commandRedo(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    // Check worktree for uncommitted changes
-    const worktreePath = getWorktreePath(root, oldTask);
-    if (existsSync(worktreePath) && (await hasUncommittedChanges(worktreePath))) {
-      console.error('Error: Task has uncommitted changes!');
-      console.error('Commit or stash your changes before redoing.');
-      console.error('Options:');
-      console.error(`  1. Unblock and ask agent to commit: lazy unblock ${displayId(oldTask)} --message "Please commit your changes"`);
-      console.error(`  2. Manually commit in shell: lazy shell ${displayId(oldTask)}`);
-      process.exit(1);
-    }
-
-    // Gather context from old task before closing
-    const sess = await storage.getSessionByTaskId(oldTask.id);
-    let redoContext = '';
-
-    if (sess) {
-      // Get last agent turn summary — the work turn, not a trailing nudge reply.
-      const turns = await storage.getSessionTurns(sess.id);
-      const lastAgentTurn = latestWorkAgentTurn(turns);
-      if (lastAgentTurn) {
-        // Truncate to a reasonable size for context injection
-        const lastAgentText = turnText(lastAgentTurn);
-        const summary = lastAgentText.length > 4000
-          ? lastAgentText.substring(0, 4000) + '\n... (truncated)'
-          : lastAgentText;
-        redoContext += `\n## Previous Attempt Context\n\nThis task is a redo of a previous attempt (${shortId(oldTask.id)}). The previous agent's last response:\n\n${summary}\n`;
-      }
-
-      // Get diff stat from old task
-      try {
-        const diffStat = await getDiffStat(sess.git_start_sha, 'HEAD', worktreePath);
-        if (diffStat.trim()) {
-          redoContext += `\nFiles changed in previous attempt:\n\`\`\`\n${diffStat}\`\`\`\n`;
-        }
-      } catch {
-        // Worktree may not exist or diff may fail — that's fine
-      }
-
-      if (redoContext) {
-        redoContext = '\n' + redoContext + '\nUse this context as a starting point, but work from the current state of the codebase in your worktree.\n';
-      }
-    }
-
-    // The stale task's CURRENT prompt, via the one resolver — a redo is a
-    // second attempt at the work as most recently specified, not as first
-    // drafted.
+    // The old task's CURRENT prompt, via the one resolver: the daemon seeds
+    // the replacement with it plus the previous attempt's context, and a
+    // `--prompt` override has to replace only the first part.
     const latestPrompt = currentPromptOf(oldTask) ?? '';
 
-    // Build new prompt: user override > old prompt + redo context
-    const newPrompt = promptOverride
-      ? promptOverride + redoContext
-      : latestPrompt + redoContext;
+    // The redo itself (create the replacement, close the old task,
+    // clean up its container and worktree) is the DAEMON's `redoTask` — the
+    // same act the browser's redo button performs — never storage calls from
+    // here. In a clone bound to Lazy Teams the member's authorization is then
+    // the browser's, and there is no local worktree or container to inspect.
+    const redone = await queryRedoTask({
+      taskId: oldTask.id,
+      reason: 'Started over with lazy redo',
+      actor: getActor(),
+    });
 
-    // Determine model: CLI override > old task model
-    const newModel = modelOverride ?? oldTask.model;
+    // Said only now that the daemon has accepted the redo.
+    console.log(`Closing task ${theme.taskId(displayId(oldTask))}... done`);
 
-    // --- Create new task first (so we have its ID for the close reason) ---
-    // Preserve parent relationship if the old task had one. The agent carries
-    // over too: a redo is a second attempt at the SAME work, so it must run on
-    // the agent the original was on, not on the project default.
-    const [config, projectSettings] = await Promise.all([
-      loadConfig(requireLazyRoot()),
-      storage.getProjectSettings(),
-    ]);
-    const newTask = await storage.createTask(
-      oldTask.goal,
-      parentTaskIdOf(oldTask) ?? undefined,
-      undefined,
-      undefined,
-      undefined,
-      resolveAgentForNewTaskFromConfig(
-        { inheritFrom: oldTask },
-        config.agent,
-        projectSettings,
-      ).agentId,
-    );
-
-    // Set prompt
-    await storage.updateTaskPrompt(newTask.id, newPrompt);
-
-    // Set model
-    if (newModel) {
-      await storage.updateTaskModel(newTask.id, newModel);
-    }
-
-    // Generate redo code from old task's code (convention: append -redo-N)
-    if (oldTask.code) {
-      const redoCode = await generateRedoCode(oldTask.code, storage);
-      if (redoCode) {
-        try {
-          await storage.updateTaskCode(newTask.id, redoCode);
-        } catch {
-          // Code conflict — not critical, skip silently
-          logger.debug(`Could not set code '${redoCode}' on new task`);
-        }
-      }
-    }
-
-    // Set redo_of metadata to link back to old task
-    await storage.updateTaskMetadata(newTask.id, 'redo_of', oldTask.id);
-
-    // INVARIANT: redo is a fresh start — do NOT inherit the old task's image pin.
-    const imagePinWarning = droppedCustomImagePinWarning(oldTask);
-
-    // --- Now close the old task (single call, with correct reason) ---
-    // "Closing" is the user-facing verb since `lazy abandon` was removed in
-    // favour of `lazy close`; the underlying terminal status is still
-    // 'abandoned'. Saying "Abandoning" here names a command that no longer
-    // exists.
-    console.log(`Closing task ${theme.taskId(displayId(oldTask))}...`);
-
-    await storage.abandonTask(oldTask.id, `Redone as ${displayId(newTask)}`, getActor());
-
-    // Clean up container and worktree
-    if (sess) {
-      await cleanupTaskContainer(storage, sess, taskRef(oldTask), root);
-
+    // Overrides land on the replacement, which is still in the backlog. The
+    // redo has ALREADY happened, so a failed follow-up write must not read as a
+    // failed redo: say which override did not land and how to apply it, and
+    // do not start the task on the wrong prompt or model.
+    const display = redone.displayId;
+    const failedOverrides: string[] = [];
+    let newTask = await storage.getTask(redone.taskId);
+    if (!newTask) throw new Error(`The replacement task ${redone.displayId} was created but cannot be read back.`);
+    if (promptOverride) {
       try {
-        const config = await loadConfig(root);
-        const driver = createDriver(config);
-        await driver.cleanup(sess.git_branch);
+        const seeded = currentPromptOf(newTask) ?? '';
+        // The daemon seeded `latestPrompt + context`; keep the context.
+        const context = seeded.startsWith(latestPrompt) ? seeded.slice(latestPrompt.length) : '';
+        await storage.updateTaskPrompt(newTask.id, promptOverride + context);
       } catch (err) {
-        logger.debug(`Remote cleanup failed (non-fatal): ${err instanceof Error ? err.message : err}`);
+        failedOverrides.push(`--prompt did not land (${err instanceof Error ? err.message : String(err)}). Apply it with: lazy edit ${redone.displayId} --prompt "<text>"`);
       }
-
-      await cleanupWorktreeAndBranch(worktreePath, sess.git_branch, root, storage, oldTask.id, sess.agent_session_id);
     }
+    if (modelOverride) {
+      try {
+        await storage.updateTaskModel(newTask.id, modelOverride);
+        newTask = (await storage.getTask(redone.taskId)) ?? newTask;
+      } catch (err) {
+        failedOverrides.push(`--model did not land (${err instanceof Error ? err.message : String(err)}). Apply it with: lazy edit ${redone.displayId} --model ${modelOverride}`);
+      }
+    }
+    if (failedOverrides.length > 0) {
+      console.error(`Redid ${displayId(oldTask)} as ${display}, but not every override was applied; ${display} is in the backlog and was not started:`);
+      for (const line of failedOverrides) console.error(`  ${line}`);
+      process.exitCode = 1;
+      return;
+    }
+    const newModel = newTask.model;
+    const imagePinWarning = redone.imagePinWarning;
 
     newTaskShortId = shortId(newTask.id);
 

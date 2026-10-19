@@ -2,7 +2,7 @@
  * Unit tests for the DERIVED memory compact: the watermark rules that decide
  * what injection says, and the generator's guarantees.
  *
- * The invariants under test (each asserted with the WHY, per CLAUDE.md):
+ * The invariants under test (each asserted with the WHY, per AGENTS.md):
  *   - records are never modified by compaction;
  *   - a record written after compaction is injected as its LIVE index line and
  *     supersedes the summary;

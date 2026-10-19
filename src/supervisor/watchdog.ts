@@ -10,9 +10,27 @@
  *     launch, from a commit, or from any other event.
  *
  *  2. **Wind-down guard** (runs only after the agent's final result is in
- *     hand). Once the summary has been captured, a CLI that will not exit is
- *     costing us a stuck task and nothing else, so a short bounded kill is
- *     safe. Killing here loses zero work.
+ *     hand AND the agent has nothing left running). Once the summary has been
+ *     captured, a CLI that will not exit is costing us a stuck task and
+ *     nothing else, so a short bounded kill is safe. Killing here loses zero
+ *     work.
+ *
+ * "Nothing left running" matters because a `result` is not always the end.
+ * Claude Code keeps a `-p` process alive while background work the agent
+ * started is still running (a background subagent, until it reports; a
+ * background shell, for a short grace) and, when that work reports, re-invokes
+ * the model, which emits a fresh `system/init`, more assistant events and a
+ * SECOND `result` (measured on 2.1.291, docs/claude-code-background-tasks.md).
+ * So the wind-down guard is armed only while the agent is IDLE after a result:
+ * no background task in its last `background_tasks_changed` list and no model
+ * invocation begun since. Anything else hands the process back to the
+ * no-progress guard, which still bounds a wedged background job; the next
+ * `result` re-arms the wind-down, and the LAST result is the turn's summary
+ * (its `usage` replaced by the sum over every result — see withSummedUsage).
+ *
+ * A no-progress kill AFTER a result (a background job that wedged) stays a
+ * no-progress kill: the turn fails with `capturedResult: true` and stops for a
+ * human, because the agent never got to act on the work it was waiting for.
  *
  * Guard 2 CANNOT be armed before the result is observed. That ordering is the
  * fix for the failure this module used to cause: turn-end was previously
@@ -32,11 +50,17 @@
  *    caught by its 5-minute agent default.
  */
 
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { log } from './log';
 import { spawn } from '../utils/spawn';
+import { assertArgvBounded } from '../agent/argv-safety';
 import { formatWatchdogMs } from '../utils/watchdog-turn';
-import type { AgentActivityEvent, AgentActivityStream } from '../agent/activity-stream';
+import type { AgentActivityEvent, AgentActivityStream, BackgroundTaskRef } from '../agent/activity-stream';
+import { SYSTEM_PROMPT_FILE_ARG, type AgentExecArgs } from '../agent/interface';
 import type { AgentTokenUsage } from '../types';
+import { addAgentUsage, usageFromRawOutput } from './usage';
 
 /** Grace period between SIGTERM and SIGKILL (ms). */
 const KILL_GRACE_MS = 5000;
@@ -234,6 +258,34 @@ export interface WatchdogResult {
    * state the caller declared unusable.
    */
   abortReason?: string;
+  /**
+   * Background work the agent left behind when its turn ended: tasks STOPPED
+   * after its last result (Claude Code stops a background shell 5s after it)
+   * plus any still reported running when the process exited. Labels name the
+   * command where the stream showed it. Empty when nothing was left behind.
+   * The supervisor asks the agent about these once (the background nudge).
+   */
+  backgroundLeftBehind?: string[];
+}
+
+/**
+ * The LAST result line, with its top-level `usage` replaced by the sum of
+ * every result's usage in the run — what the turn actually spent when
+ * background work re-invoked the model. Returned verbatim when there is no
+ * earlier usage to add or the line's own usage is not a valid usage object
+ * (nothing is invented).
+ */
+export function withSummedUsage(raw: string, prior: AgentTokenUsage | undefined): string {
+  if (!prior) return raw;
+  const own = usageFromRawOutput(raw);
+  if (!own) return raw;
+  try {
+    const obj = JSON.parse(raw) as Record<string, unknown>;
+    return JSON.stringify({ ...obj, usage: addAgentUsage(prior, own) });
+  } catch (err) {
+    log(`[watchdog] Could not sum usage across results: ${err instanceof Error ? err.message : String(err)}`);
+    return raw;
+  }
 }
 
 /**
@@ -254,7 +306,7 @@ export function resolveWatchdogTimeout(configValue: number, agentDefault: number
  * happens and the process is simply awaited.
  */
 export async function execWithWatchdog(
-  args: string[],
+  args: AgentExecArgs,
   opts: {
     cwd: string;
     env: Record<string, string>;
@@ -310,13 +362,51 @@ export async function execWithWatchdog(
     log(`[watchdog] Wind-down guard armed on result: timeout ${windDownTimeoutMs}ms`);
   }
 
-  const proc = spawn(args, {
+  const launchArgs = [...args];
+  let promptDir: string | undefined;
+  try {
+    if (args.systemPromptInput !== undefined) {
+      const placeholderIndex = launchArgs.indexOf(SYSTEM_PROMPT_FILE_ARG);
+      if (placeholderIndex < 0) throw new Error('Missing system prompt file argument');
+      promptDir = mkdtempSync(join(tmpdir(), 'lazy-system-prompt-'));
+      const promptPath = join(promptDir, 'system-prompt.txt');
+      writeFileSync(promptPath, args.systemPromptInput, { mode: 0o600 });
+      launchArgs[placeholderIndex] = promptPath;
+    }
+    // The one argv rule, for every harness: refuse an argv that carries
+    // unbounded text with a message naming it, instead of an E2BIG at spawn
+    // that crash-loops the task. See src/agent/argv-safety.ts.
+    assertArgvBounded(launchArgs, `Agent '${launchArgs[0]}'`);
+  } catch (error) {
+    if (promptDir) rmSync(promptDir, { recursive: true, force: true });
+    throw error;
+  }
+  const launch = () => spawn(launchArgs, {
     cwd,
+    stdin: args.stdinInput === undefined ? 'ignore' : new Blob([args.stdinInput]),
     stdout: 'pipe',
     stderr: 'pipe',
     env,
     timeout: 0, // Long-running: this function has its own progress-based guards
   });
+  let proc: ReturnType<typeof launch>;
+  try {
+    proc = launch();
+  } catch (error) {
+    if (promptDir) rmSync(promptDir, { recursive: true, force: true });
+    throw error;
+  }
+  if (promptDir) {
+    const directory = promptDir;
+    const cleanup = () => {
+      try {
+        rmSync(directory, { recursive: true, force: true });
+      } catch (error) {
+        log(`[watchdog] Could not remove temporary system prompt: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    };
+    void proc.exited.then(cleanup, cleanup);
+  }
 
   registerKill?.((signal = 'SIGTERM') => {
     try {
@@ -334,7 +424,24 @@ export async function execWithWatchdog(
   let graceTimer: ReturnType<typeof setTimeout> | null = null;
   let windDownTimer: ReturnType<typeof setTimeout> | null = null;
   let resultSeenAt: number | null = null;
+  /** When the wind-down timer was last armed — what a wind-down kill reports. */
+  let windDownArmedAt: number | null = null;
+  /** Background tasks in the agent's latest `background_tasks_changed` list. */
+  let backgroundTasks = 0;
+  /**
+   * True from a model invocation's start (`session_start`) to its `result`.
+   * Starts true: the first invocation is under way from launch.
+   */
+  let invoking = true;
+  /** Running background tasks, from the latest `background_tasks_changed`. */
+  let runningBackground = new Map<string, string>();
+  /** Background tasks stopped after the latest result. */
+  const stoppedAfterResult = new Map<string, string>();
   let resultLine: string | undefined;
+  /** Summed `usage` of every result before the latest one. */
+  let priorResultsUsage: AgentTokenUsage | undefined;
+  /** `system/init` seen — later ones are re-invocations, not the launch. */
+  let sessionStarted = false;
   let sessionId: string | undefined;
   let sessionStartEvent: AgentActivityEvent | undefined;
   let abortReason: string | undefined;
@@ -411,23 +518,62 @@ export async function execWithWatchdog(
     // If the no-progress guard already started killing, don't double-kill.
     if (killedByWatchdog || abortReason) return;
     killedDuringWindDown = true;
-    windDownElapsedMs = resultSeenAt !== null ? Date.now() - resultSeenAt : (windDownTimeoutMs ?? 0);
+    windDownElapsedMs = windDownArmedAt !== null ? Date.now() - windDownArmedAt : (windDownTimeoutMs ?? 0);
     log(
-      `[watchdog] Agent emitted its final result ${Math.round(windDownElapsedMs / 1000)}s ago but ` +
-      `has not exited. Summary is captured; sending SIGTERM.`,
+      `[watchdog] Agent emitted its final result and has had nothing running for ` +
+      `${Math.round(windDownElapsedMs / 1000)}s, but has not exited. Summary is captured; sending SIGTERM.`,
     );
     proc.kill('SIGTERM');
     scheduleSigkill('wind-down guard');
   }
 
+  /**
+   * The wind-down guard owns the process only while the agent is idle after a
+   * result: a result has landed, no model invocation has begun since, and no
+   * background task is running. See the module note.
+   */
+  function windDownOwns(): boolean {
+    return resultSeenAt !== null && !invoking && backgroundTasks === 0;
+  }
+
   function resetWatchdog() {
     if (!enabled) return;
     if (killedByWatchdog || killedDuringWindDown || abortReason) return; // Don't reset after we've started killing
-    // Once the result has landed, the wind-down guard owns the process. Leaving
-    // the no-progress timer running would just race it to the same kill.
-    if (resultSeenAt !== null) return;
+    // While the wind-down guard owns the process, leaving the no-progress
+    // timer running would just race it to the same kill.
+    if (windDownOwns()) return;
     if (watchdogTimer) clearTimeout(watchdogTimer);
     watchdogTimer = setTimeout(killForNoProgress, timeoutMs);
+  }
+
+  /**
+   * Hand the process to whichever guard owns it now. Called whenever the
+   * result / invocation / background-task state changes.
+   */
+  function updateOwnership() {
+    if (killedByWatchdog || killedDuringWindDown || abortReason) return;
+    if (windDownOwns()) {
+      if (watchdogTimer) {
+        clearTimeout(watchdogTimer);
+        watchdogTimer = null;
+      }
+      if (windDownEnabled && !windDownTimer) {
+        windDownArmedAt = Date.now();
+        windDownTimer = setTimeout(killForWindDown, windDownTimeoutMs!);
+      }
+      return;
+    }
+    if (windDownTimer) {
+      clearTimeout(windDownTimer);
+      windDownTimer = null;
+      windDownArmedAt = null;
+      log(
+        backgroundTasks > 0
+          ? `[watchdog] Agent has ${backgroundTasks} background task(s) running after its result; wind-down guard disarmed until they finish.`
+          : `[watchdog] Agent was re-invoked after its result; wind-down guard disarmed until its next result.`,
+      );
+    }
+    resetWatchdog();
   }
 
   /**
@@ -448,6 +594,16 @@ export async function execWithWatchdog(
         return; // liveness only — see the invariant above
       case 'session_start':
         if (event.sessionId) sessionId = event.sessionId;
+        // A `system/init` after a result is Claude Code re-invoking the model
+        // (a background task reported): the turn is running again.
+        invoking = true;
+        // A new invocation acts on whatever stopped before it.
+        stoppedAfterResult.clear();
+        // Only the FIRST init is the launch. A re-invocation's init must not
+        // re-run the launch-state check on a turn whose work is done, nor
+        // replace the launch-time record of what the agent loaded.
+        if (sessionStarted) break;
+        sessionStarted = true;
         sessionStartEvent = event;
         if (abortOnSessionStart) {
           const reason = abortOnSessionStart(event);
@@ -465,22 +621,39 @@ export async function execWithWatchdog(
         break;
       case 'result':
         if (event.sessionId) sessionId = event.sessionId;
-        if (event.raw) resultLine = event.raw;
-        if (resultSeenAt === null) {
-          resultSeenAt = Date.now();
-          // From here the summary is safe. Stop the no-progress timer and, if
-          // configured, start the bounded wind-down.
-          if (watchdogTimer) {
-            clearTimeout(watchdogTimer);
-            watchdogTimer = null;
-          }
-          if (windDownEnabled) {
-            windDownTimer = setTimeout(killForWindDown, windDownTimeoutMs!);
-          }
+        if (event.raw) {
+          // A re-invoked turn ends each invocation with its own result, and
+          // Claude Code's top-level `usage` covers only THAT invocation
+          // (measured on 2.1.291). Carry the earlier ones forward so the
+          // turn's tokens are the sum, not just the last invocation's.
+          if (resultLine) priorResultsUsage = addAgentUsage(priorResultsUsage, usageFromRawOutput(resultLine));
+          resultLine = withSummedUsage(event.raw, priorResultsUsage);
         }
+        // Every result replaces the last: when background work re-invokes the
+        // model, its LAST result is the turn's summary.
+        resultSeenAt = Date.now();
+        invoking = false;
+        // From here a summary is safe. Unless background work is still
+        // running, stop the no-progress timer and start the bounded wind-down.
+        updateOwnership();
         return;
       default:
         break;
+    }
+    if (event.backgroundTaskStopped && resultSeenAt !== null && !invoking) {
+      stoppedAfterResult.set(event.backgroundTaskStopped.id, event.backgroundTaskStopped.label);
+    }
+    if (event.backgroundTaskList) {
+      runningBackground = new Map(event.backgroundTaskList.map((t: BackgroundTaskRef) => [t.id, t.label]));
+    }
+    if (event.backgroundTasks !== undefined) {
+      backgroundTasks = event.backgroundTasks;
+      updateOwnership();
+      return;
+    }
+    if (event.kind === 'session_start') {
+      updateOwnership();
+      return;
     }
     resetWatchdog();
   }
@@ -605,5 +778,6 @@ export async function execWithWatchdog(
     sessionId,
     sessionStartEvent,
     abortReason,
+    backgroundLeftBehind: [...new Set([...stoppedAfterResult.values(), ...(resultSeenAt !== null ? runningBackground.values() : [])])],
   };
 }

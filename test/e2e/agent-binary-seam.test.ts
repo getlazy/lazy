@@ -22,11 +22,12 @@ import { expectSuccess, expectOutput } from '../helpers/assertions';
 import {
   successScenario,
   hangAfterResultScenario,
+  backgroundWorkScenario,
   goSilentScenario,
   heartbeatOnlyScenario,
   crashScenario,
 } from '../helpers/fake-claude';
-import { setGuards, agentTurns, sessionInterrupt } from '../helpers/agent-seam';
+import { setGuards, agentTurns, sessionInterrupt, largePrompt, createTaskWithPipedPrompt } from '../helpers/agent-seam';
 import { sandboxSuiteSkipped } from '../helpers/sandbox-deps';
 import { readCommand, readResponse, protocolDir as getProtocolDir } from '../../src/protocol';
 import type { StartCommand } from '../../src/protocol';
@@ -142,6 +143,29 @@ describe('agent binary seam (real supervisor, fake claude)', () => {
     expect(turn!.argv).toContain('--verbose');
   }, 90_000);
 
+  // INVARIANT: a prompt past the 128 KiB argv-element limit reaches the agent
+  // whole, on stdin, through the REAL supervisor spawn — never as an argv
+  // element, where it dies with E2BIG and crash-loops the task (in the wild,
+  // 2026-10-13: "E2BIG: argument list too long, posix_spawn 'claude'").
+  test('a >200 KiB prompt reaches the agent whole, on stdin', async () => {
+    const prompt = largePrompt('LARGE-PROMPT-TAIL-claude');
+    const taskId = await createTaskWithPipedPrompt(ctx, 'Large prompt', prompt);
+    await ctx.setClaudeScenario({ sequence: [
+      successScenario({ sessionId: 'fake-sess-large', commit: { message: 'large', files: [{ path: 'large.txt', content: 'ok\n' }] } }),
+      successScenario({ sessionId: 'fake-sess-large' }),
+    ] });
+
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+    expectOutput(await ctx.lazy(['show', taskId]), 'blocked');
+
+    const turn = (await ctx.claudeInvocations()).find(i => i.argv.includes('-p'));
+    expect(turn, 'the fake claude was never launched for a turn').toBeDefined();
+    expect(turn!.stdin).toContain(prompt);
+    expect(turn!.argv.every(a => Buffer.byteLength(a) < 128 * 1024)).toBe(true);
+    expect(turn!.argv.some(a => a.includes('LARGE-PROMPT-TAIL'))).toBe(false);
+  }, 90_000);
+
   // Per-turn launch labels, end to end through the REAL supervisor and
   // reconciler. Only this seam can assert the `model_id` half: the module mock
   // replaces `launchSupervisorAsync`, so it never runs an agent and therefore
@@ -238,6 +262,43 @@ describe('agent binary seam (real supervisor, fake claude)', () => {
     // The nudge ran afterwards and its answer is the last word — proof the
     // kill cost nothing but the exit, not the record.
     expect(String(turns[turns.length - 1].content)).toContain('Still done — the summary stands.');
+  }, 120_000);
+
+  // INVARIANT (src/supervisor/watchdog.ts): the wind-down guard never kills an
+  // agent whose background work is still running, the LAST result is the
+  // turn's summary, and the end-of-turn steps run only after that work is
+  // done. Claude Code keeps `-p` alive while background work runs and
+  // re-invokes the model when it reports (measured on 2.1.291); lazy used to
+  // kill it on the first result and lose the second answer.
+  test('background work running past the wind-down window: the turn waits, and the second result is the summary', async () => {
+    await setGuards(ctx, { windDownMs: 2_000 });
+
+    const taskId = await createTask(ctx, 'Background work', 'Do the work');
+    await ctx.setClaudeScenario({ sequence: [
+      backgroundWorkScenario({
+        sessionId: 'fake-sess-bg',
+        firstResult: 'Tests running in the background; I will commit once they pass.',
+        finalResult: 'Tests passed and the work is committed.',
+        backgroundMs: 6_000,
+        commitAfter: { message: 'Commit after the background tests', files: [{ path: 'bg-output.txt', content: 'done\n' }] },
+      }),
+      successScenario({ result: 'Nothing further.', sessionId: 'fake-sess-bg' }),
+    ] });
+
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+    expectOutput(await ctx.lazy(['show', taskId]), 'blocked');
+
+    const turns = await agentTurns(ctx.root, taskId);
+    const work = String(turns[0].content);
+    expect(work).toContain('Tests passed and the work is committed.');
+    expect(work).not.toContain('I will commit once they pass');
+
+    // The commit made after the background job is on the branch, and the
+    // worktree was clean when the end-of-turn steps ran: no commit nudge.
+    const log = ctx.git('log', '--all', '--format=%s');
+    expect(log.stdout).toContain('Commit after the background tests');
+    expect(turns.some(t => String(t.content).includes('Uncommitted Changes Check'))).toBe(false);
   }, 120_000);
 
   // INVARIANT: the no-progress guard kills an agent that has stopped advancing.
@@ -377,7 +438,7 @@ describe('agent binary seam (real supervisor, fake claude)', () => {
     expectSuccess(await ctx.lazy(['wait', taskId]));
 
     const turns = (await ctx.claudeInvocations()).filter(i => i.argv.includes('-p'));
-    const prompts = turns.map(t => String(t.argv[t.argv.indexOf('-p') + 1]));
+    const prompts = turns.map(t => String(t.stdin));
     const known = ['Do the sticky work', 'keep the model'];
     expect(prompts.some(p => p.includes('Do the sticky work')), 'the work turn never ran').toBe(true);
     expect(prompts.some(p => p.includes('keep the model')), 'the unblock turn never ran').toBe(true);

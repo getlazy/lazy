@@ -52,6 +52,21 @@ export interface OneshotCommand {
 const commandScope = new AsyncLocalStorage<{ allowance: string | null }>();
 
 /**
+ * Who pays for the one-shots run inside {@link runAsOneshotPayer} — the person
+ * who asked (an email), or null for nobody (the project's service holder).
+ * Read by {@link runOneshotWithRunner} for a request that carries no
+ * `ownerCredentialEnv` of its own. In team mode a one-shot is ALWAYS planned
+ * on a payer: one that names none is paid by the service holder or refused,
+ * never by the daemon's own credentials (on a Lazy Teams host those belong to
+ * whoever set the project up). Outside team mode the scope changes nothing.
+ */
+const payerScope = new AsyncLocalStorage<{ email: string | null }>();
+
+export function runAsOneshotPayer<T>(email: string | null | undefined, fn: () => Promise<T>): Promise<T> {
+  return payerScope.run({ email: email ?? null }, fn);
+}
+
+/**
  * Admit one command of many one-shot calls through the daemon's usage pause
  * ([usage_pause]) — `lazy report`, `lazy ask` on a stored conversation, the
  * `lazy_conversation_ask` tool.
@@ -76,7 +91,7 @@ const commandScope = new AsyncLocalStorage<{ allowance: string | null }>();
  * own gate in-process instead of skipping it. Only the in-process TEST harness
  * (`LAZY_TEST=1`, no daemon at all) skips it.
  */
-export async function admitOneshotCommand(opts: { actor?: Actor } = {}): Promise<OneshotCommand> {
+export async function admitOneshotCommand(opts: { actor?: Actor; overrideUsagePause?: boolean } = {}): Promise<OneshotCommand> {
   if (process.env.LAZY_IS_DAEMON === '1' && process.env.LAZY_TEST !== '1') {
     const { getDaemonProjectRoot } = await import('../daemon/rpc-handlers');
     const root = getDaemonProjectRoot() ?? findLazyRoot();
@@ -84,13 +99,14 @@ export async function admitOneshotCommand(opts: { actor?: Actor } = {}): Promise
     const { admitOneshotCommand: admitInDaemon } = await import('../daemon/usage-pause');
     // Judged and admitted here; the in-daemon calls that follow run the Runner
     // directly and never reach the per-call gate, so no allowance is carried.
-    await admitInDaemon(root, opts.actor);
+    await admitInDaemon(root, opts.actor, Date.now(), opts.overrideUsagePause);
     return { run: (fn) => fn() };
   }
   if (isDaemonRpcBypassed()) return { run: (fn) => fn() };
   const state = await tryRpc<{ oneshotAllowance?: string }>('usagePause', {
     action: 'admitOneshot',
     ...(opts.actor ? { actor: opts.actor } : {}),
+    ...(opts.overrideUsagePause ? { overrideUsagePause: true } : {}),
   });
   const allowance = state?.oneshotAllowance ?? null;
   return { run: (fn) => commandScope.run({ allowance }, fn) };
@@ -163,5 +179,23 @@ export async function runOneshotWithRunner(
   // stack, and the CLI-side callers of runOneshot never touch it.
   const { createOneshotRunner } = await import('./container-runner');
   const runner = await createOneshotRunner(root);
-  return runner.runOneshot(req);
+  return withOneshotPayment(root, req, (paid) => runner.runOneshot(paid));
+}
+
+/**
+ * Run `run` with a request that is PAID FOR: as handed in when it already
+ * carries `ownerCredentialEnv`, else planned on the payer in scope
+ * ({@link runAsOneshotPayer}) — the service holder when none is. Outside team
+ * mode no env is planned and the one-shot runs on the builder credential, as it
+ * always has. Exported for the guard test.
+ */
+export async function withOneshotPayment<T>(
+  root: string,
+  req: OneshotRequest,
+  run: (req: OneshotRequest) => Promise<T>,
+): Promise<T> {
+  if (req.ownerCredentialEnv) return run(req);
+  const { withOneshotCredential } = await import('../daemon/oneshot-credential');
+  return withOneshotCredential(root, 'oneshot', payerScope.getStore()?.email ?? null, (env) =>
+    run(env ? { ...req, ownerCredentialEnv: env } : req));
 }

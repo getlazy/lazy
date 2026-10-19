@@ -55,6 +55,7 @@ import {
   commandAuth, authUsage,
   commandLogin, loginUsage,
   commandLogout, logoutUsage,
+  commandInstallClone, isInstallCloneArgs,
   commandLoop, loopUsage,
   commandRevert, revertUsage,
   commandSubmit, submitUsage,
@@ -103,6 +104,8 @@ Task Management:
   tag <task_id> <tag>    Add a tag to a task (grouping label)
   untag <task_id> <tag>  Remove a tag from a task
   clone <task_id>        Duplicate task with optional reparenting
+  clone https://<install>/git/<team>/<project>.git [dir]
+                         Clone a project hosted on Lazy Teams and bind the clone
   list / tasks           List all non-terminal tasks
   active                 List active tasks (with sessions)
   blocked                List blocked tasks (waiting for user)
@@ -211,8 +214,8 @@ Setup:
   init                   Initialize lazy in a git repository
   doctor                 Check installation health
   auth                   Store model-provider credentials in OS secure storage
-  login                  Log this machine in to Lazy Teams and bind this clone
-  logout                 Unbind this clone and delete the stored login
+  login                  Log this machine in to Lazy Teams (git included); bind a clone
+  logout                 Unbind this clone, or log this machine out of an install
   upgrade                Rebuild image/binary and restart containers
   completion             Output shell completion script (--bash or --zsh)
 
@@ -400,7 +403,7 @@ const hiddenCommands: Record<string, (args: string[]) => Promise<void>> = {
       : undefined;
 
     const { runSupervisor } = await import('./supervisor/index');
-    await runSupervisor({ protocolDir, worktreePath, oneShot, runnerType });
+    process.exitCode = await runSupervisor({ protocolDir, worktreePath, oneShot, runnerType });
   },
 
   'mcp': async (cmdArgs: string[]) => {
@@ -461,9 +464,16 @@ const legacyCommands: Record<string, string> = {
 // Hidden internal commands: bypass auto-init, reconciliation, and help.
 if (command && hiddenCommands[command]) {
   await hiddenCommands[command](args.slice(1));
-  process.exit(0);
+  exitAfterDispatch();
 }
 
+// `lazy clone <teams-url> <team>/<project>` makes a NEW clone somewhere else, so
+// it bypasses auto-init and every project preflight exactly like a hidden
+// command; `lazy clone <task_id>` (the task form) falls through as before.
+if (command === 'clone' && isInstallCloneArgs(args.slice(1))) {
+  await commandInstallClone(args.slice(1));
+  exitAfterDispatch();
+}
 // Auto-init: if running in an uninitialized git repo, offer to initialize.
 // Skip for init itself, help, version, and completion.
 // `playground` (and its old spelling `demo`) is here for the same reason as `init`: it provisions a lazy project of
@@ -574,7 +584,7 @@ const rewritesStoragePath = command === 'init' && args.includes('--external-path
 // nothing. Probing the surrounding project's `.lazy` would refuse the fleet's
 // adoption preflight on exactly the machines it has to run on.
 const isProjectFreeSystemQuery =
-  command === 'system' && (args[1] === 'source-id' || args[1] === 'store-check');
+  command === 'system' && ['source-id', 'guest-init-script', 'store-check', 'store-backup', 'store-backups', 'store-restore'].includes(args[1] ?? '');
 
 // `lazy playground` (alias `demo`) is exempt for the same reason, and the failure is not
 // hypothetical either: the command exists to be run by an agent inside its own
@@ -631,7 +641,10 @@ if (!isHelpOrVersion && command !== 'completion' && !isProjectFreeSystemQuery &&
   }
 }
 
-if (!isHelpOrVersion && (!command || !skipAutoInit.includes(command))) {
+// Project-free system queries never offer to init: the guest's lazy-guest-init
+// shim captures `system guest-init-script`'s stdout, so a prompt there would be
+// invisible and hang.
+if (!isHelpOrVersion && !isProjectFreeSystemQuery && (!command || !skipAutoInit.includes(command))) {
   const lazyRoot = lazyRootOrNull();
   if (!lazyRoot) {
     const gitRoot = findGitRoot();
@@ -670,17 +683,9 @@ if (!isHelpOrVersion && !isProjectFreeSystemQuery) {
   // credential (turns run on Teams, not here) or silently leaves a real local
   // daemon running for a project that is supposed to have none.
   const binding = root ? await resolveCloneBinding(root) : null;
-  // Every remote-routed command names the install and project as its first
-  // line (design doc §4.7) — printed HERE, once, rather than in
-  // `requireStorage()`, because that only reaches commands going through the
-  // full `Storage` interface. Several read commands (`list`, `blocked`,
-  // `active`, …) call `src/daemon/rpc-fallback.ts`'s typed wrappers straight
-  // over `tryRpc` instead and never touched that banner at all. `'ambiguous'`
-  // prints nothing — there is no one login to name, and the command is about
-  // to get the daemon's own loud refusal instead.
-  if (binding && binding !== 'ambiguous') {
-    console.error(`${binding.binding.teams_url} — ${binding.binding.project}`);
-  }
+  // No per-command `<install> — <project>` line: which install a clone is
+  // bound to changes rarely, like a git remote, and git push does not announce
+  // its remote every time either. A bare `lazy login` reports the binding.
   if (root && !binding) {
     try {
       await ensureDaemon(command, root);

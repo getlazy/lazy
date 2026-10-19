@@ -1,7 +1,7 @@
 /**
  * What a human sees when they open a task service's URL and nothing answers.
  *
- * `http://web.my-task.lazy.localhost:26024` is a stable name, so people
+ * `http://my-task.web.lazy.localhost:26024` is a stable name, so people
  * bookmark it, leave it open in a tab and hit reload after lunch — by which
  * time the container may be down, the port unpublished, or the dev server
  * simply not started. "Connection refused" is the answer the raw loopback port
@@ -16,7 +16,7 @@
  *
  * INVARIANT: rendering this banner starts NOTHING. It is reached by a GET, and
  * a GET that starts a container would be a CSRF vector — any page anywhere
- * could embed `<img src="http://web.my-task.lazy.localhost:26024">` and spend
+ * could embed `<img src="http://my-task.web.lazy.localhost:26024">` and spend
  * the human's machine. Every start on this page is a POST behind a button.
  */
 

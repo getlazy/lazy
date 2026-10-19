@@ -24,6 +24,7 @@
  * arithmetic deterministically without real sleeps.
  */
 
+import { runnerImageHold } from './runner-image-choice';
 import { join } from 'path';
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import type { Storage } from '../storage';
@@ -235,6 +236,7 @@ export async function processAutoResumeQueue(
   for (const entry of queue) {
     if (entry.intervalEligibleAt > now) continue;
     if (await usagePauseHold(lazyRoot, storage, entry.task, 'auto-resume')) continue;
+    if (await runnerImageHold(entry.task)) continue;
     candidate = entry;
     break;
   }

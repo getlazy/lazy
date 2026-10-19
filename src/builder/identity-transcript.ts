@@ -11,6 +11,7 @@
 
 import type { BuilderSummary, StoredConversation, StoredMessage } from '../storage/types';
 import type { TokenUsage } from '../types';
+import { conversationForReading } from '../import/local-command-cleanup';
 
 function addUsage(a: TokenUsage, b: TokenUsage | undefined): TokenUsage {
   if (!b) return a;
@@ -27,10 +28,12 @@ export function joinBuilderTranscript(
   builder: BuilderSummary,
   segments: StoredConversation[],
 ): StoredConversation | null {
-  const byId = new Map(segments.map((s) => [s.sessionId, s]));
+  const byId = new Map(segments.map((segment) => [segment.sessionId, conversationForReading(segment)]));
   const ordered = builder.segments.map((id) => byId.get(id)).filter((s): s is StoredConversation => !!s);
   if (ordered.length === 0) return null;
-  if (ordered.length === 1 && ordered[0].sessionId === builder.id) return ordered[0];
+  if (ordered.length === 1 && ordered[0].sessionId === builder.id) {
+    return { ...ordered[0], memberEmail: builder.memberEmail ?? ordered[0].memberEmail ?? null };
+  }
 
   const seen = new Set<string>();
   const messages: StoredMessage[] = [];
@@ -48,6 +51,7 @@ export function joinBuilderTranscript(
   const newest = ordered[ordered.length - 1];
   const subagents = ordered.flatMap((s) => s.subagents ?? []);
   return {
+    memberEmail: builder.memberEmail ?? null,
     sessionId: builder.id,
     projectPath: newest.projectPath,
     cwd: newest.cwd,

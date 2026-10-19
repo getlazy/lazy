@@ -1,4 +1,4 @@
-import { requireLazyRoot, requireStorage, parseFlags, resolveTaskOrExit } from '../helpers';
+import { requireLazyRoot, requireStorage, parseFlags, resolveTaskOrExit, isBoundClone } from '../helpers';
 import { requireActorIdentity } from '../identity-preflight';
 import { shortId, displayId, validateCode } from '../../task/identity';
 import { targetBranchOf } from '../../task-target';
@@ -153,7 +153,7 @@ export async function commandAccept(args: string[]): Promise<void> {
   // The gate facts come from the daemon's pre-flight (enrollment probed
   // daemon-side — a CLI-side check from a task worktree resolves the wrong
   // root), so every failable check runs before the human types anything
-  // (CLAUDE.md). The prompt is TTY-only BY DESIGN: there is no flag, env var,
+  // (AGENTS.md). The prompt is TTY-only BY DESIGN: there is no flag, env var,
   // or stdin route for the passphrase — a non-interactive value would sit in
   // shell history and agent transcripts, which is the one property the
   // mechanism must keep (the token originates outside the builder's context).
@@ -214,7 +214,12 @@ export async function commandAccept(args: string[]): Promise<void> {
 
     if (gate.gated && !gate.satisfiedByForge) {
       console.log(theme.warning(`This merge is protected: ${gate.reason}`));
-
+    }
+    // Lazy Teams: no passphrase route exists, so nothing is prompted for. The
+    // accept still goes to the daemon, which refuses it — but a refusal that
+    // can be acted on from here (commits pushed to the task: run `lazy sync`)
+    // answers there before the "press Accept in Lazy Teams" one.
+    if (gate.gated && !gate.satisfiedByForge && !gate.teamsAcceptOnly) {
       if (gate.enrollment === 'not-enrolled') {
         console.error(`Error: ${gate.enrollmentMessage}`);
         process.exit(1);
@@ -540,6 +545,12 @@ async function handleContinuationTaskOffer(
       shouldCreateContinuation = true;
     }
 
+    // A clone bound to Lazy Teams cannot record the continuation's provenance
+    // keys (`continues_task_id`), so creating it would leave a half-made task.
+    if (shouldCreateContinuation && await isBoundClone()) {
+      console.log('\nNo continuation task was created: a clone logged in to Lazy Teams cannot record what it continues. Create it with `lazy create` if you need one.');
+      shouldCreateContinuation = false;
+    }
     if (shouldCreateContinuation) {
       let continuationCode = `${originalTaskCode}-v2`;
       let version = 2;
@@ -672,8 +683,9 @@ Behavior:
     accept is aborted (never a silent merge). This can take a while; the CLI
     waits for it.
   - Runs the accept check before merging, when [automation] accept_check is set:
-    the project's own command (e.g. "bun run typecheck") is run in the TASK's
-    worktree, and a non-zero exit REFUSES the accept — a task that does not
+    the project's own command (e.g. "bun run typecheck") is run against the
+    TASK's worktree inside a short-lived container, and a non-zero exit REFUSES
+    the accept — a task that does not
     build would break the branch it is merged into. Unset means no gate, and
     accept says the step was skipped rather than guessing a command. Override a
     refusal knowingly with --allow-broken.

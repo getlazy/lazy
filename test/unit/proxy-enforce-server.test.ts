@@ -27,10 +27,6 @@ function createMockSink() {
   return { sink, records };
 }
 
-function findFreePort(): number {
-  return 40000 + Math.floor(Math.random() * 10000);
-}
-
 /** A mock upstream that returns a streaming tool_use SSE response. */
 function toolUseSSE(name: string, input: Record<string, unknown>, id = 'toolu_1'): string {
   return [
@@ -53,14 +49,14 @@ describe('proxy enforcement (server integration)', () => {
   let nextResponse: () => Response;
 
   beforeAll(async () => {
-    upstreamPort = findFreePort();
     mockUpstream = Bun.serve({
-      port: upstreamPort,
+      port: 0,
       hostname: '127.0.0.1',
       async fetch() {
         return nextResponse();
       },
     });
+    upstreamPort = mockUpstream.port!;
     await new Promise((r) => setTimeout(r, 30));
   });
 
@@ -72,7 +68,7 @@ describe('proxy enforcement (server integration)', () => {
     const ms = createMockSink();
     const proxy = createProxyServer(
       {
-        port: findFreePort(),
+        port: 0,
         bind: '127.0.0.1',
         upstream: `http://127.0.0.1:${upstreamPort}`,
         policy: { ...defaultPolicyConfig(), ...policyOverrides },
@@ -81,7 +77,7 @@ describe('proxy enforcement (server integration)', () => {
       // No credential broker: these tests exercise forwarding, not JIT injection.
       null,
     );
-    return { proxy, ms, port: (proxy as unknown as { port: number }).port };
+    return { proxy, ms, port: proxy.port! };
   }
 
   // A request that DECLARES tools — the only shape whose response can carry a

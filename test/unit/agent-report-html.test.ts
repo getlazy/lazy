@@ -85,3 +85,20 @@ describe('agentReportHtml surfaces', () => {
     expect(html).toBe('');
   });
 });
+
+describe('a failure notice is lazy\'s, not the agent\'s', () => {
+  // INVARIANT: a turn carrying `failure` is lazy's record that the turn failed.
+  // Shown under "Agent report" it read as the agent's own answer; `lazy show`
+  // and Teams already label it as lazy's, and the dashboard must too.
+  test('the card is headed as lazy\'s, with the failure label', () => {
+    const turn = {
+      id: 't', session_id: 's', sequence: 4, role: 'agent', actor: 'system', timestamp: 0,
+      content: '[Lazy: the turn could not start]\n\nError: the task\'s container did not start: boom',
+      failure: { class: 'launch_failed', reason: 'boom', remedy: 'fix it' },
+    } as unknown as Parameters<typeof agentReportHtml>[1];
+    const html = agentReportHtml('task-1', turn, null);
+    expect(html).toContain('From lazy: the turn failed');
+    expect(html).toContain('failed:launch_failed');
+    expect(html).not.toContain('Agent report');
+  });
+});

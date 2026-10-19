@@ -6,6 +6,7 @@ import { queryTaskShow, type ShowResult } from '../../daemon/rpc-fallback';
 import { theme, dim } from '../../render/theme';
 import { renderStatusHeader } from '../../render/status-header';
 import { renderWorkingStatus } from '../../utils/working-substate';
+import { turnFailureLabel } from '../../task/turn-failure';
 import { formatTurnLaunchLabels, formatTurnModelWarning, formatTurnTypeSuffix } from '../../utils/turn-labels';
 import { formatUnparsedReviewSuffix } from '../../review/parse-report';
 import { isBuiltinPromptCode, readBuiltinPrompt, listBuiltinPrompts } from './prompts';
@@ -18,6 +19,7 @@ import { parentTaskIdOf } from '../../task-target';
 import { isMidMerge, describeMergeState } from '../../git/operations';
 import { shortId, displayId } from '../../task/identity';
 import { clusterProgressOf, formatClusterProgress, clusterProgressPayload } from '../../task/cluster-progress';
+import { servicesRestartOf } from '../../task/services-restart-record';
 import { reopenedAfterAcceptLine, reopenedAfterAcceptOf } from '../../task/reopen-after-accept';
 import { displayUrlFor } from '../../serve/subdomain';
 import type { Storage } from '../../storage/interface';
@@ -71,7 +73,7 @@ export function buildTaskShowLines(
   showChunks = false,
   offerUsagePauseOverride = false,
 ): string[] {
-  const { task, session: sess, turns, commits, comments, journal, raisedItems, turnReport, fileDecisions, artifacts, statusHistory, tagHistory, children, childSessions, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate, mergeState, serveState, protection, autoResumeQueue } = data;
+  const { task, session: sess, turns, commits, comments, journal, raisedItems, turnReport, fileDecisions, artifacts, statusHistory, tagHistory, children, childSessions, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate, turnFailure, mergeState, serveState, protection, autoResumeQueue } = data;
   const outputLines: string[] = [];
 
   // Status text decorated with the derived working substate for working tasks.
@@ -83,7 +85,9 @@ export function buildTaskShowLines(
     : workingSubstate;
   const taskStatusText = task.status === 'working' && substateForStatus
     ? renderWorkingStatus(substateForStatus)
-    : task.status;
+    : turnFailure
+      ? `${task.status}(${turnFailureLabel(turnFailure)})`
+      : task.status;
 
   // Supervisor status header (only for working tasks with a status file)
   if (task.status === 'working' && supervisorStatus) {
@@ -99,6 +103,12 @@ export function buildTaskShowLines(
   }
   outputLines.push(`  ${theme.label('Goal:')}    ${task.goal}`);
   outputLines.push(`  ${theme.label('Status:')}  ${theme.status(taskStatusText)}`);
+  // A failed last turn is said next to the status, because the status alone
+  // (`blocked`) reads as an ordinary review park.
+  if (turnFailure) {
+    outputLines.push(`  ${theme.label('Failed:')}  ${theme.warning(`the last turn failed (${turnFailure.class}): ${turnFailure.reason}`)}`);
+    outputLines.push(`           ${dim(`Fix: ${turnFailure.remedy}`)}`);
+  }
   // A mid-merge worktree is reported next to the status, because it CONTRADICTS
   // it: `blocked` reads as "settled, waiting for you", and this says otherwise.
   if (mergeState && isMidMerge(mergeState)) {
@@ -119,6 +129,16 @@ export function buildTaskShowLines(
     outputLines.push(`  ${theme.label('Protected:')} ${paint(protectionValue)}`);
     for (const line of protectionAdvice(protection, displayId(task))) {
       outputLines.push(`             ${dim(line)}`);
+    }
+  }
+  // Which runner image the task runs on — only when it is lazy's default image
+  // because the project's own was not ready. The daemon answers the banner
+  // (src/daemon/runner-image-choice.ts); nothing here re-derives it.
+  const runnerImageBanner = (data as { runnerImage?: { banner?: { text: string; action: string | null } | null } }).runnerImage?.banner;
+  if (runnerImageBanner) {
+    outputLines.push(`  ${theme.label('Image:')}   ${theme.warning(runnerImageBanner.text)}`);
+    if (runnerImageBanner.action === 'use_custom_image') {
+      outputLines.push(`           ${dim(`Switch back: lazy system runner-image use-project ${displayId(task)}`)}`);
     }
   }
   // Pencils down, next to the status because it answers the question the status
@@ -339,7 +359,9 @@ export function buildTaskShowLines(
       // turn from an automation turn.
       const renderTurn = (turn: typeof turns[number]) => {
         const turnBody = turnText(turn);
-        const isErrorTurn = turn.role === 'agent' && turnBody.startsWith('[Agent crashed]');
+        // A failure notice is lazy's, not the agent's answer (Turn.failure).
+        const isFailureNotice = turn.role === 'agent' && !!turn.failure;
+        const isErrorTurn = isFailureNotice || (turn.role === 'agent' && turnBody.startsWith('[Agent crashed]'));
         const usageSuffix = turn.usage
           ? ` | ${formatTokenCount(totalInputTokens(turn.usage))} in, ${formatTokenCount(turn.usage.outputTokens)} out`
           : '';
@@ -388,7 +410,9 @@ export function buildTaskShowLines(
         const authorLabel = turn.role === 'human' && turn.actor && turn.actor !== 'human'
           ? turn.actor
           : turn.role;
-        const roleDisplay = isErrorTurn ? theme.error('crash') : theme.turnRole(authorLabel);
+        const roleDisplay = isFailureNotice
+          ? theme.error(`lazy: ${turnFailureLabel(turn.failure!)}`)
+          : isErrorTurn ? theme.error('crash') : theme.turnRole(authorLabel);
         const unparsedSuffix = formatUnparsedReviewSuffix(turn);
         const reviewFailSuffix = unparsedSuffix ? theme.error(unparsedSuffix) : '';
         if (showFull) {
@@ -699,7 +723,10 @@ export function buildTaskShowLines(
         ? theme.status(change.status)
         : `${theme.status(prev)} → ${theme.status(change.status)}`;
       const actor = change.actor ? ` ${theme.label('by')} ${change.actor}${formatActorPerson(change.actor_email, change.actor_name)}` : '';
-      outputLines.push(`  [${theme.timestamp(formatDate(change.timestamp))}] ${transition}${actor}`);
+      // Lazy's own reason for a transition it caused (a launch that failed),
+      // so the history says why rather than only who.
+      const reason = change.reason ? ` ${theme.label('—')} ${change.reason}` : '';
+      outputLines.push(`  [${theme.timestamp(formatDate(change.timestamp))}] ${transition}${actor}${reason}`);
       prev = change.status;
     }
   }
@@ -1016,6 +1043,12 @@ function buildShowJson(data: TaskShowData): Record<string, unknown> {
       // from "we only ever knew the tier alias".
       model_id: t.model_id ?? null,
       effort: t.effort ?? null,
+      // The runner image the turn ran on; null means unknown (older turns).
+      runner_image: t.runner_image ?? null,
+      // The tiers of a tiered profile that served it; null when not tiered or older.
+      tiers_served: t.tiers_served ?? null,
+      // How fast the model answered the turn; null when nothing was recorded.
+      latency: t.latency ?? null,
       // Null means "never observed" (older turn, or an agent that reports no
       // tool list) — deliberately distinct from an observed `tools=0`.
       mcp_tools: t.mcp_tools ?? null,
@@ -1134,6 +1167,8 @@ function buildShowJson(data: TaskShowData): Record<string, unknown> {
   if (reopened) jsonData.reopened_after_accept = reopened;
 
   jsonData.final = buildShowFinal(turns);
+  // The last automatic services restart after a work turn, or null.
+  jsonData.services_restart = servicesRestartOf(task);
 
   if (retryStatus) {
     jsonData.retry_status = retryStatus;
@@ -1227,7 +1262,7 @@ Examples:
   lazy show lazy-prompt-system-instructions   # View a built-in system prompt
   lazy show README.md                         # View a file in scrollable TUI
   lazy show src/index.ts                      # View a TypeScript file
-  lazy show CLAUDE.md --lines 1..50           # Show first 50 lines of file`)
+  lazy show AGENTS.md --lines 1..50           # Show first 50 lines of file`)
 }
 
 /**

@@ -23,6 +23,7 @@
  */
 
 import type { Task, TaskType } from '../types';
+import { lazyFold } from './wrapper-fold';
 
 import clusterConstraints from '../prompts/cluster-constraints.md' with { type: 'text' };
 
@@ -42,5 +43,7 @@ export function typeConstraintsSection(task: Pick<Task, 'type'> | null | undefin
   if (!task?.type) return '';
   const text = CONSTRAINTS_BY_TYPE[task.type];
   if (!text) return '';
-  return `${text}\n\n---\n\n`;
+  // Marked as lazy's own text so review surfaces fold it (src/task/wrapper-fold.ts);
+  // the HTML comment changes nothing an agent reads.
+  return `${lazyFold(`${task.type}-constraints`, text)}\n\n---\n\n`;
 }

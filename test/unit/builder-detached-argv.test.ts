@@ -17,7 +17,7 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { buildBuilderDockerArgs, BUILDER_CONTAINER_PATHS } from '../../src/runner/docker-runner';
+import { buildBuilderDockerArgs, detachedBuilderClaudeArgs, BUILDER_CONTAINER_PATHS } from '../../src/runner/docker-runner';
 
 const PROJECT_ROOT = '/tmp/lazy-invariant-project';
 
@@ -43,6 +43,12 @@ function argsFor(opts: { detached?: boolean; resume?: string[] } = {}): string[]
 }
 
 describe('detached builder session argv', () => {
+  test('Teams builders start and resume with permission bypass and their chosen model', () => {
+    expect(detachedBuilderClaudeArgs('claude-test')).toEqual(['--dangerously-skip-permissions', '--model', 'claude-test']);
+    expect(detachedBuilderClaudeArgs('claude-test', 'session-1')).toEqual([
+      '--dangerously-skip-permissions', '--resume', 'session-1', '--model', 'claude-test',
+    ]);
+  });
   // INVARIANT: a detached session container must keep a pty and open stdin —
   // it runs the interactive supervisor, which needs both to keep Claude Code
   // alive, and `docker attach` (the route child 11 builds) needs `-i -t` on

@@ -7,7 +7,7 @@
  * src/supervisor/usage.ts → ErrorResponse.usage → the recorded turn — lives
  * entirely BELOW `launchSupervisorAsync`, which the `--preload` module mock
  * replaces wholesale. So it can only be exercised on the fake-binary seam
- * (`setupTestLazy({ fakeClaude: true })`, see CLAUDE.md on the two agent seams):
+ * (`setupTestLazy({ fakeClaude: true })`, see AGENTS.md on the two agent seams):
  * here a real `lazy supervise` subprocess really spawns an agent that really
  * reports tokens and really exits non-zero.
  */

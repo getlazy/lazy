@@ -16,6 +16,7 @@ import { protocolDir as getProtocolDir, readStatus } from '../protocol';
 import { createRunner } from '../runner';
 import { parentTaskIdOf } from '../task-target';
 import type { WorkingSubstate } from '../utils/working-substate';
+import { taskTurnFailure, type TaskTurnFailure } from './turn-failure';
 import { probeWorkingRun } from '../utils/working-run';
 import { loadConfig } from '../config/loader';
 import { logger } from '../utils/logger';
@@ -40,6 +41,8 @@ export interface TaskWithSession {
    * non-working tasks or when no substate can be derived.
    */
   workingSubstate?: WorkingSubstate;
+  /** The failure a parked task's last turn ended in (src/task/turn-failure.ts). */
+  turnFailure?: TaskTurnFailure;
   /**
    * Read-only protection status, present only when the project protects
    * anything. Undefined in a stock project so nothing is computed and nothing
@@ -161,9 +164,11 @@ export async function buildTaskTree(
       }
     }
 
+    const turnFailure = taskTurnFailure(task, session);
     taskMap.set(task.id, {
       task,
       session,
+      ...(turnFailure ? { turnFailure } : {}),
       turnCount: await storage.getTurnCountByTaskId(task.id),
       children: [],
       retryCount,

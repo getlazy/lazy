@@ -18,8 +18,9 @@ differences from the `lazy` CLI are listed in
 | `lazy_show`, `lazy_list`, `lazy_blocked`, `lazy_active` | A task in detail; lists of tasks by state |
 | `lazy_diff`, `lazy_regions` | What a task changed, whole or [region by region](review-regions.md) |
 | `lazy_status` | The caller's own task and worktree (caller only) |
-| `lazy_wait` | Block until another task finishes its turn |
+| `lazy_wait` | Block until another task finishes its turn (returns early with `interrupted` if a subtask is added to the waiting task, or a human or builder comments on it — the comment is included and counts as delivered) |
 | `lazy_memory_recall` | Shared project [memory](memory.md) |
+| `lazy_recipe` | Built-in step-by-step recipes, loaded on demand — e.g. `task-image`, for adding a toolchain the [agent container](agent-container.md) lacks |
 | `lazy_conversations`, `lazy_conversation_search`, `lazy_conversation_read` | Past builder conversations — one entry per Builder (start or `/clear` to the next `/clear`) |
 | `lazy_messages` | [System messages](system-messages.md) |
 | `lazy_raised_items` | [Raised items](raised-items.md) across tasks |
@@ -32,13 +33,14 @@ differences from the `lazy` CLI are listed in
 
 | Tool | What it does |
 |---|---|
-| `lazy_create`, `lazy_start`, `lazy_edit` | Create, start and edit (sub)tasks |
+| `lazy_create`, `lazy_start`, `lazy_edit` | Create, start and edit (sub)tasks ([renaming a started task](renaming-tasks.md)) |
 | `lazy_clone`, `lazy_redo` | Variant or fresh replacement of a task — **builder only** |
 | `lazy_unblock`, `lazy_resume`, `lazy_ask`, `lazy_review`, `lazy_stop` | Drive a task's turns |
 | `lazy_accept`, `lazy_reject`, `lazy_close`, `lazy_reopen`, `lazy_submit` | Finish a task |
 | `lazy_sync`, `lazy_link` | Branch plumbing |
 | `lazy_reparent` | Move a task under a new parent — **builder only** |
 | `lazy_commit` | Commit the caller's worktree — **agent only** |
+| `lazy_image_build` | Test-build the caller's own `Dockerfile.lazy` against its committed files, in a separate builder that is removed afterwards, and return the output; no image is kept — **agent only, and only on Lazy Teams projects that run in a virtual machine** ([agent container](agent-container.md#when-dockerfilelazy-does-not-build)) |
 | `lazy_comment`, `lazy_journal`, `lazy_tag`, `lazy_untag` | Annotate tasks |
 | `lazy_final`, `lazy_raise`, `lazy_raised_item_comment`, `lazy_report`, `lazy_update_progress` | Report on the caller's own task ([turn reports](turn-reports.md)) — **agent only** |
 | `lazy_justify_protected`, `lazy_justify_maintain` | Answer protected-file and maintained-file checks — **agent only** |

@@ -75,6 +75,43 @@ describe('mcpServers.lazy ownership', () => {
     expect(cfg.mcpServers.lazy.args).toContain('t2');
   });
 
+  // INVARIANT (no-overwrite-of-enclosing-turn): a supervisor started from
+  // inside a live turn's agent never replaces THAT turn's entry. On 2026-10-05
+  // an agent ran a host-process demo in its own container; the demo's
+  // supervisors rewrote the agent's entry, its next invocation had no lazy
+  // tools, and the turn parked with its work uncommitted.
+  test("a supervisor nested in another task's agent refuses to replace that task's entry", async () => {
+    const path = join(home, '.claude.json');
+    await writeMcpConfig(taskEntry('outer'));
+    const before = await readFile(path, 'utf-8');
+
+    const err = await writeMcpConfig(taskEntry('inner'), { enclosingTurnTaskId: 'outer' }).catch(e => e);
+    expect(err).toBeInstanceOf(ForeignMcpEntryError);
+    expect(err.message).toContain('outer');
+    expect(err.message).toContain('inner');
+    expect(await readFile(path, 'utf-8')).toBe(before);
+
+    // A private HOME (no entry of the enclosing task's) is fine, and so is the
+    // enclosing task re-writing its own entry.
+    await writeMcpConfig(taskEntry('outer'), { enclosingTurnTaskId: 'outer' });
+    await writeFile(path, JSON.stringify({ mcpServers: { lazy: taskEntry('someone-else') } }));
+    await writeMcpConfig(taskEntry('inner'), { enclosingTurnTaskId: 'outer' });
+  });
+
+  // INVARIANT (no-overwrite-of-enclosing-turn, wiring): prepareTurnMcp passes the
+  // enclosing turn to the write, so a nested supervisor fails its OWN turn
+  // instead of cutting the outer agent off from its tools.
+  test('prepareTurnMcp refuses, as a turn failure, to replace the enclosing turn\'s entry', async () => {
+    const path = join(home, '.claude.json');
+    await writeMcpConfig(taskEntry('outer'));
+    const before = await readFile(path, 'utf-8');
+    const err = await prepareTurnMcp(stubRunner, 'inner', '/wt/inner', { enclosingTurnTaskId: 'outer' }, quiet)
+      .catch(e => e);
+    expect(err).toBeInstanceOf(McpToolsUnavailableError);
+    expect(err.message).toContain('outer');
+    expect(await readFile(path, 'utf-8')).toBe(before);
+  });
+
   test('a builder-style write (no --task-id) is never refused by this rule', async () => {
     await writeFile(join(home, '.claude.json'), JSON.stringify({ mcpServers: { lazy: BUILDER_ENTRY } }));
     await writeMcpConfig(BUILDER_ENTRY);

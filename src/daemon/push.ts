@@ -14,10 +14,13 @@
  */
 
 import { loadConfig } from '../config/loader';
-import { createDriver, type RepositoryDriver } from '../remote';
+import { createDriver, LocalDriver, type RepositoryDriver } from '../remote';
 import { autoPushEnabled, autoPushConfigKey } from '../remote/auto-push';
 import { localBranchExists } from '../git/operations';
+import { runGit } from '../utils/git';
 import { logger } from '../utils/logger';
+import { deliveredFilesRefusal } from '../git/delivered-files';
+import { deliveredSecretsToPush } from './task-files';
 
 /** Branches that failed to push and should be retried. Keyed by project root. */
 const retryQueues = new Map<string, Set<string>>();
@@ -88,7 +91,19 @@ async function drainPushQueue(projectRoot: string): Promise<void> {
       return;
     }
 
-    if (!driver.needsSync) {
+    // A local driver pushes task branches only when it mirrors origin
+    // (managed mode — src/remote/origin-mirror.ts); the after-turn push is
+    // then the same mechanism a forge project uses.
+    const mirror = driver instanceof LocalDriver ? driver.originMirror : null;
+    const mirrorsOrigin = mirror !== null;
+    // A managed project with no such remote at all has nowhere to mirror to —
+    // "no remote", not a failed push, so nothing is queued for retry.
+    if (mirror && (await runGit(['remote', 'get-url', mirror.remoteName], projectRoot)).exitCode !== 0) {
+      logger.debug(`Push skipped: no remote ${mirror.remoteName} to mirror task branches to`);
+      retryQueues.delete(projectRoot);
+      return;
+    }
+    if (!driver.needsSync && !mirrorsOrigin) {
       logger.debug('Push skipped: driver does not need sync (local driver)');
       retryQueues.delete(projectRoot);
       return;
@@ -109,6 +124,17 @@ async function drainPushQueue(projectRoot: string): Promise<void> {
           continue;
         }
 
+        const secrets = await deliveredSecretsToPush(projectRoot, branch);
+        if (secrets.length > 0) {
+          // Not re-queued: retrying cannot help until the commit is gone, and
+          // the next turn's push re-checks. Loud, because the branch stays
+          // unpushed and accept refuses it for the same reason.
+          logger.error(
+            deliveredFilesRefusal(`Pushing ${branch}`, secrets) +
+            `A commit on the branch carries one; it was NOT pushed. Remove that commit from the branch, then the next push proceeds.`,
+          );
+          continue;
+        }
         await driver.pushBranch(branch);
         logger.debug(`Pushed branch ${branch} after state change`);
       } catch (err) {

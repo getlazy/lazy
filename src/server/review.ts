@@ -11,6 +11,7 @@
  */
 
 import { usagePausePastCheckboxHtml } from './usage-pause-banner';
+import { runnerImageConfirmCheckboxHtml } from './runner-image-banner';
 import { layoutHtml } from './templates';
 import { scriptJson } from './escape';
 import { REVIEW_DRAFT_KEY_JS } from '../review/draft-key';
@@ -27,6 +28,7 @@ import { shellPanelHtml, shellClientScript, type ShellAvailability } from './she
 import { reviewActivityCardHtml, type ReviewActivity } from './review-activity';
 import { unmeasured, type RenderTimings } from './render-timings';
 import { renderMarkdown, type RenderMarkdownOptions } from './markdown';
+import { copyMarkdownButtonHtml, renderMarkdownWithCopy } from './copy-markdown';
 import { turnText } from '../utils/turn-content';
 import { formatTurnLaunchLabels, formatTurnModelWarning } from '../utils/turn-labels';
 import {
@@ -91,6 +93,7 @@ import { reviewNavControlsHtml, reviewNavigationScript } from './review-navigati
 import { screenshotLightboxScript } from './screenshot-lightbox';
 import { clusterProgressBarHtml } from './cluster-progress-html';
 import { reopenedAfterAcceptLine } from '../task/reopen-after-accept';
+import { turnFailureLabel } from '../task/turn-failure';
 import {
   asksBarLabel,
   queuedBarLabel,
@@ -340,7 +343,7 @@ export function reviewScript(
   // page re-renders around it constantly: expanding context rebuilds the
   // side-by-side body, a layout switch swaps the whole <tbody>, a poll
   // re-renders threads. Every one of those used to take the typing with it —
-  // the "never lose human feedback" rule of CLAUDE.md, in miniature.
+  // the "never lose human feedback" rule of AGENTS.md, in miniature.
   //
   // So the text does not live in the DOM alone. Each box autosaves under its
   // ANCHOR through the same review-draft endpoint the feedback box uses, and
@@ -2402,7 +2405,7 @@ export function threadHtml(
     .map(
       (m) => `<div class="rv-msg rv-msg-${escapeHtml(m.role)}${isWithdrawn(m) ? ' rv-msg-withdrawn' : ''}">
         <div class="rv-msg-head">${messageAuthor(m)}</div>
-        <div class="rv-msg-body turn-content">${renderMarkdown(m.content, options.markdown)}</div>${messageStateHtml(taskId, m)}${withdrawControlHtml(taskId, m)}
+        <div class="rv-msg-body turn-content">${renderMarkdownWithCopy(m.content, options.markdown)}</div>${messageStateHtml(taskId, m)}${withdrawControlHtml(taskId, m)}
       </div>`,
     )
     .join('\n');
@@ -2468,7 +2471,7 @@ function queuedHtml(queued: ReviewComment[], markdown?: RenderMarkdownOptions): 
         : `<a class="rv-queued-where" href="#${escapeHtml(anchorDomId({ file: c.file, side: c.side, line: c.line }))}"><code>${escapeHtml(c.file)}</code>:${c.line} (${escapeHtml(c.side)})</a>`;
       return `<li class="rv-queued-item">
         ${where}
-        <div class="rv-msg-body turn-content">${renderMarkdown(c.content, markdown)}</div>
+        <div class="rv-msg-body turn-content">${renderMarkdownWithCopy(c.content, markdown)}</div>
       </li>`;
     })
     .join('\n');
@@ -2675,7 +2678,7 @@ export function agentReportHtml(
         const label = REPORT_SECTION_LABELS[s.kind] ?? s.kind;
         return `<section class="rv-report-section" data-kind="${escapeHtml(s.kind)}">
           <h3 class="rv-report-section-title">${escapeHtml(label)}</h3>
-          <div class="rv-agent-report-body turn-content" data-rv-prose="${escapeHtml(PROSE_REPORT_FILE)}" data-rv-prose-kind="${escapeHtml(s.kind)}">${renderMarkdown(s.body, markdown)}</div>
+          ${copyMarkdownButtonHtml(s.body)}<div class="rv-agent-report-body turn-content" data-rv-prose="${escapeHtml(PROSE_REPORT_FILE)}" data-rv-prose-kind="${escapeHtml(s.kind)}">${renderMarkdown(s.body, markdown)}</div>
         </section>`;
       })
       .join('');
@@ -2730,11 +2733,16 @@ export function agentReportHtml(
   if (!turn) return '';
   const raw = turnText(turn);
   if (!raw.trim()) return '';
+  // A failure notice (Turn.failure) is LAZY's record that the turn failed, not
+  // the agent's answer — label it as lazy's, as `lazy show` and Teams do.
+  const head = turn.failure
+    ? `<strong>From lazy: the turn failed</strong> <span class="rv-hint">${escapeHtml(turnFailureLabel(turn.failure))}</span>`
+    : '<strong>Agent report</strong>';
   return viewedCardHtml({
     key: 'agent-report',
     content: raw,
-    headHtml: `<strong>Agent report</strong> <span class="rv-hint">${seqLink(turn.sequence)} · ${timestampHtml(turn.timestamp)}</span>`,
-    bodyHtml: `<div class="rv-agent-report-body turn-content" data-rv-prose="${escapeHtml(PROSE_REPORT_FILE)}">${renderMarkdown(raw, markdown)}</div>`,
+    headHtml: `${head} <span class="rv-hint">${seqLink(turn.sequence)} · ${timestampHtml(turn.timestamp)}</span>`,
+    bodyHtml: `${copyMarkdownButtonHtml(raw)}<div class="rv-agent-report-body turn-content" data-rv-prose="${escapeHtml(PROSE_REPORT_FILE)}">${renderMarkdown(raw, markdown)}</div>`,
     sectionClass: 'rv-agent-report',
   });
 }
@@ -2869,7 +2877,7 @@ export function parseRaisedResolutionsFromForm(form: FormData): RaisedItemResolu
 /**
  * What the reviewer had typed when an action failed.
  *
- * CLAUDE.md's first invariant is that human feedback is never lost. A refused
+ * AGENTS.md's first invariant is that human feedback is never lost. A refused
  * accept re-renders the page, and without this the unblock feedback and the
  * accept reason the reviewer had already written would be blanked by that
  * re-render — punishing them for an accept the DAEMON refused.
@@ -3201,6 +3209,7 @@ export function actionsHtml(
             <textarea name="message" rows="6" required data-rv-sync="feedback" data-rv-draft="feedback" placeholder="What should the agent do next?">${escapeHtml(draft.feedback ?? '')}</textarea>
           </label>
           ${usagePausePastCheckboxHtml(options.usagePaused === true)}
+          ${runnerImageConfirmCheckboxHtml(task)}
           <div class="rv-form-actions">
             <button type="submit" data-lz-unblock-submit>Unblock</button>
             <span class="rv-draft-state" data-rv-draft-state aria-live="polite"></span>

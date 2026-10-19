@@ -71,12 +71,14 @@ async function readLastReport(projectRoot: string): Promise<StoredDoctorReport |
 export async function handleDoctorRun(
   projectRoot: string,
   params: Record<string, unknown> = {},
+  progress?: ProgressEmitter,
 ): Promise<DoctorReport> {
   if (params.alert !== undefined && typeof params.alert !== 'boolean') {
     throw new RpcError(400, `doctor.run 'alert' must be a boolean, got ${typeof params.alert}`);
   }
   const storage = await getOrCreateStorage();
   const { report } = await runDoctorReport({
+    onProgress: progress,
     root: projectRoot,
     storage,
     // In-process: the daemon must not RPC itself for its own health.

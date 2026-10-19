@@ -27,3 +27,19 @@ export const DEFAULT_CURSOR_UPSTREAM = 'https://api2.cursor.sh';
  * for why lazy sets this at all rather than leaving it to Bun.
  */
 export const DEFAULT_UPSTREAM_TIMEOUT_SECONDS = 1800;
+
+/**
+ * Default `[proxy] tier_retry_interval`, in seconds: how long a tier that
+ * refused for capacity without a retry time is skipped (src/proxy/tier-select.ts).
+ */
+export const DEFAULT_TIER_RETRY_INTERVAL_SECONDS = 300;
+
+/**
+ * Defaults of `[proxy] audit_retention_days` / `audit_retention_mib`: the proxy
+ * audit log keeps 7 days or 128 MiB, whichever comes first (engineer's
+ * decision, 2026-10-06; src/proxy/audit-log.ts).
+ */
+export const DEFAULT_AUDIT_RETENTION_DAYS = 7;
+export const DEFAULT_AUDIT_RETENTION_MIB = 128;
+/** The smallest size budget: the live segment plus one rotated 4 MiB segment. */
+export const MIN_AUDIT_RETENTION_MIB = 8;

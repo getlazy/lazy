@@ -18,7 +18,6 @@ import { resolveAgentProfiles } from '../../src/config/agent-profiles';
 
 describe('codex profile endpoint path through the proxy', () => {
   const TOKEN = 'sk-lazy-codex-placeholder';
-  const freePort = () => 41000 + Math.floor(Math.random() * 8000);
   let upstream: ReturnType<typeof Bun.serve>;
   let proxyPort: number;
   let upstreamUrl: string;
@@ -36,10 +35,9 @@ describe('codex profile endpoint path through the proxy', () => {
       targets: new TargetCredentials(),
     };
     const sink: AuditSink = { append: async () => {} };
-    proxyPort = freePort();
-    return createProxyServer(
+    const server = createProxyServer(
       {
-        port: proxyPort, bind: '127.0.0.1',
+        port: 0, bind: '127.0.0.1',
         upstream: 'http://127.0.0.1:1',
         fallbacks: [],
         retryAfterThreshold: 0,
@@ -56,20 +54,21 @@ describe('codex profile endpoint path through the proxy', () => {
       sink,
       credentials,
     );
+    proxyPort = server.port!;
+    return server;
   }
 
   beforeAll(() => {
     paths = [];
-    const port = freePort();
-    upstreamUrl = `http://127.0.0.1:${port}`;
     upstream = Bun.serve({
-      port, hostname: '127.0.0.1',
+      port: 0, hostname: '127.0.0.1',
       async fetch(req) {
         await req.text();
         paths.push(new URL(req.url).pathname);
         return Response.json({ id: 'r', object: 'response', output: [] });
       },
     });
+    upstreamUrl = `http://127.0.0.1:${upstream.port!}`;
   });
   afterAll(() => upstream.stop());
 
@@ -109,14 +108,14 @@ describe('codex profile endpoint path through the proxy', () => {
 describe('load-time warning for a codex endpoint ending in /v1', () => {
   function warningsFor(harness: string, endpoint: string): string[] {
     const out: string[] = [];
-    resolveAgentProfiles({ p: { harness, model: 'm', endpoint } }, (m) => out.push(m));
+    resolveAgentProfiles({ p: { harness, model: 'm', endpoint, credential: 'openrouter' } }, (m) => out.push(m));
     return out;
   }
 
   test('warns, naming the corrected endpoint, and does not rewrite it', () => {
     const out: string[] = [];
     const profiles = resolveAgentProfiles(
-      { p: { harness: 'codex', model: 'm', endpoint: 'https://openrouter.ai/api/v1/' } },
+      { p: { harness: 'codex', model: 'm', endpoint: 'https://openrouter.ai/api/v1/', credential: 'openrouter' } },
       (m) => out.push(m),
     );
     expect(out).toHaveLength(1);

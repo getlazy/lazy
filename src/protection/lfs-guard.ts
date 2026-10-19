@@ -54,7 +54,7 @@ function formatBytes(bytes: number): string {
 /**
  * The refusal text. Names every file with its size and the commit that put it
  * there, explains the mechanism in one paragraph, and gives the recovery route
- * — per CLAUDE.md, an error must say what happened, why, and what to do.
+ * — per AGENTS.md, an error must say what happened, why, and what to do.
  */
 export function lfsRefusalMessage(
   displayId: string,

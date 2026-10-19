@@ -28,6 +28,7 @@ import { getRemoteDefaultBranch } from '../git/operations';
 import { logger } from '../utils/logger';
 import { docsSuffix } from '../docs/links';
 import { createHumanTokenVerifier } from './verify-token';
+import { isManagedMode } from '../config/managed-mode';
 
 export interface MergeEdge {
   /** Branch being merged (the task's branch). */
@@ -262,6 +263,17 @@ export async function resolveEdgeGateDecision(
 // accept that uses it — so it cannot outlive or drift from the merge it
 // authorizes. Do not reintroduce a stored approval token.
 
+/** A signed-in Lazy Teams member whose own Accept approves a protected merge. */
+export interface MemberApproval {
+  email: string;
+  name?: string;
+}
+
+/** How a protected accept was let through (or that it was not protected). */
+export type EdgeGateSatisfaction =
+  | { satisfiedBy: 'not-gated' | 'forge' | 'passphrase' }
+  | { satisfiedBy: 'member'; approver: MemberApproval };
+
 export class EdgeGateRefusedError extends Error {
   /**
    * True when a token WAS supplied and simply did not match the enrolled
@@ -277,6 +289,19 @@ export class EdgeGateRefusedError extends Error {
   }
 }
 
+
+/**
+ * The one sentence every Lazy Teams surface uses for "how is this protected
+ * merge approved" — the refusal, the CLI's preflight, the MCP guidance.
+ */
+export function teamsAcceptOnlyMessage(displayId: string): string {
+  return (
+    `In Lazy Teams a protected merge is approved by a signed-in member pressing ` +
+    `Accept on task ${displayId} in the browser — not from the command line, a ` +
+    `builder or an agent, and there is no passphrase. Approving the task's PR/MR ` +
+    `on the forge, where there is one, satisfies the same gate.`
+  );
+}
 /**
  * Build the refusal message for a protected accept with no approval.
  *
@@ -296,6 +321,23 @@ export function edgeGateRefusalMessage(
   acceptCommand?: string,
 ): string {
   const cmd = acceptCommand ?? `lazy accept ${displayId}`;
+  // Lazy Teams has no passphrase surface: the approval IS a signed-in member's
+  // Accept in the browser, so that is the only route worth naming there.
+  if (isManagedMode()) {
+    return (
+      `Accepting task ${displayId} would merge \`${edge.sourceBranch}\` into \`${edge.targetBranch}\`, ` +
+      `which requires human approval (${reason}). ` +
+      `This cannot be satisfied from a builder or agent session, or from the command line — ` +
+      `no flag, confirmation code, or retry will complete it. A signed-in member must press ` +
+      `Accept on this task in Lazy Teams, which approves and merges in one step.\n\n` +
+      (forgeAvailable
+        ? `Approving this task's PR/MR on the forge satisfies the same gate — either act works.\n\n`
+        : '') +
+      `A project owner can switch protection off on the project's Configuration page ` +
+      `([protection] enabled = false).` +
+      docsSuffix('protected-branches', '\n\n')
+    );
+  }
   return (
     `Accepting task ${displayId} would merge \`${edge.sourceBranch}\` into \`${edge.targetBranch}\`, ` +
     `which requires human approval (${reason}). ` +
@@ -360,9 +402,15 @@ export async function enforceEdgeGate(opts: {
    * composes it (approved files, typed reason); this gate only prints it.
    */
   acceptCommand?: string;
-}): Promise<void> {
+  /**
+   * The signed-in Lazy Teams member whose own Accept this is (managed mode
+   * only). Built by the daemon's RPC layer from the AUTHENTICATED caller — see
+   * src/daemon/member-accept-approval.ts — never from a request field alone.
+   */
+  memberApproval?: MemberApproval;
+}): Promise<EdgeGateSatisfaction> {
   const decision = await resolveEdgeGateDecision(opts.edge, opts.config, opts.projectRoot, opts.storage);
-  if (!decision.gated) return;
+  if (!decision.gated) return { satisfiedBy: 'not-gated' };
 
   if (opts.forgeApproval) {
     let approvedOnForge = false;
@@ -382,11 +430,26 @@ export async function enforceEdgeGate(opts: {
         `Branch protection: satisfied by a PR/MR approval on task ${opts.displayId} — ` +
         `merging \`${opts.edge.sourceBranch}\` into \`${opts.edge.targetBranch}\`.`,
       );
-      return;
+      return { satisfiedBy: 'forge' };
     }
   }
 
-  if (opts.token !== undefined) {
+  // In Lazy Teams the authenticated member pressing Accept IS the deliberate
+  // human act: login already proves who they are, which a passphrase passed
+  // between people never could. The daemon builds a MemberApproval only for a
+  // managed host, a member token and the Teams app's own browser Accept.
+  if (opts.memberApproval) {
+    logger.info(
+      `Branch protection: satisfied by ${opts.memberApproval.email}'s Accept in Lazy Teams for task ${opts.displayId} — ` +
+      `merging \`${opts.edge.sourceBranch}\` into \`${opts.edge.targetBranch}\`.`,
+    );
+    return { satisfiedBy: 'member', approver: opts.memberApproval };
+  }
+
+  // Outside managed mode only: the passphrase is the SOLO mechanism. In Lazy
+  // Teams a passphrase on the daemon host would be one secret shared between
+  // people, which is exactly what a member's own Accept replaces.
+  if (opts.token !== undefined && !isManagedMode()) {
     const verifier = createHumanTokenVerifier(opts.projectRoot);
     const verification = await verifier.verify(opts.token);
     if (verification.ok) {
@@ -394,7 +457,7 @@ export async function enforceEdgeGate(opts: {
         `Branch protection: satisfied by inline human approval (${verifier.kind}) for task ${opts.displayId} — ` +
         `merging \`${opts.edge.sourceBranch}\` into \`${opts.edge.targetBranch}\`.`,
       );
-      return;
+      return { satisfiedBy: 'passphrase' };
     }
     throw new EdgeGateRefusedError(verification.message, verification.mismatch === true);
   }

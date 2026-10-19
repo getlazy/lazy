@@ -18,6 +18,7 @@ import {
   formatBuildInfoContent,
   formatSourceProvenanceLine,
 } from './build-info-content';
+import { computeSourceFingerprint } from '../src/utils/source-id';
 import {
   verifyAgentBinaryBytes,
   verifyAgentBinarySelfcheckExec,
@@ -29,6 +30,13 @@ const projectRoot = join(import.meta.dir, '..');
 // Capture provenance BEFORE writing build-info.ts — the write itself would
 // otherwise mark the tree dirty for the very build we are stamping.
 const buildProvenance = captureBuildProvenance(projectRoot);
+
+// A compiled binary has no source tree at runtime, so `lazy system source-id`
+// would have nothing to hash. Embed the fingerprint of the tree being compiled,
+// ALWAYS computed here (never a leftover `.source-fingerprint`, which could pin a
+// stale id for ever — see computeSourceIdentityOf), before build-info.ts is
+// rewritten below: the same moment `system source-id --write` hashes it.
+buildProvenance.buildSourceFingerprint = await computeSourceFingerprint(projectRoot);
 
 // Embed build metadata so `lazy daemon status` / `lazy --version` can identify
 // WHAT was built. generate-version.ts writes dev defaults for non-build contexts;

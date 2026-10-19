@@ -18,9 +18,10 @@
  * member's home ({@link writeMemberGitPointerCopies}) and bind-mounts those,
  * read-only, over the originals' paths. A rewrite of an original after the
  * check — by anything still running beside the worktree — changes nothing the
- * member's git reads. Nothing of a turn should still be running (the member's
- * entry stops the task's container, ./member-entry.ts); this is the second
- * line.
+ * member's git reads. Processes in the task's container (its shared services,
+ * anything a turn left running) DO keep running beside a member — the entry
+ * no longer stops it (./member-entry.ts, engineer 2026-10-05) — so this copy
+ * is what keeps a rewrite of the originals out of the member's git.
  */
 
 import {

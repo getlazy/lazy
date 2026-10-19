@@ -5,7 +5,7 @@
  * (add-pi-agent, 2026-09-02) — see that task's journal for the captured wire
  * and stream output. Key facts:
  *
- * - Headless mode is `pi -p --mode json "<prompt>"`: stdout is a JSONL event
+ * - Headless mode is `pi -p --mode json` with prompt on closed stdin: stdout is a JSONL event
  *   stream (session header, agent/turn/message lifecycle, tool_execution_*,
  *   agent_end). The final assistant message rides `agent_end` / the last
  *   assistant `message_end`.
@@ -42,17 +42,17 @@
  *   src/config/agent-profiles.ts), not Anthropic. pi is lazy's local-model
  *   agent, so `--agent pi` must not quietly spend an Anthropic credential;
  *   Anthropic remains available to anyone who declares a profile for it.
- * - `-p` HANGS when stdin is an open pipe (reproduced); the runner spawns
- *   agents with stdin ignored, which is what avoids it.
+ * - `-p` waits for EOF on piped stdin. The supervisor supplies a closed
+ *   prompt stream, avoiding both an open-pipe hang and the argv size limit.
  */
 
 import { join } from 'path';
 import { existsSync, readdirSync } from 'fs';
 import { getHome } from '../utils/home';
 import type { AgentResponse, AgentTokenUsage } from '../types';
-import type { Agent } from './interface';
+import type { Agent, AgentExecArgs } from './interface';
 import type { AgentActivityEvent, AgentActivityStream } from './activity-stream';
-import { safeArgvPrompt } from './argv-safety';
+import { systemPromptArgv } from './argv-safety';
 import { classifyNoModelRefusal, requireLaunchModel } from './launch-model';
 import { PI_INSTALL_HINT, PiPackaging } from './pi-packaging';
 import { piUpstreamExamples } from '../config/agent-profile-advice';
@@ -423,7 +423,7 @@ export class PiAgent implements Agent {
     effort?: string;
     permissionMode?: 'plan' | 'default';
     extraArgs?: string[];
-  }): string[] {
+  }): AgentExecArgs {
     // Provider comes from lazy's launch env, never from the task or the model
     // string. Throws (fatal_config) on anything the proxy cannot front.
     const provider = resolvePiProvider();
@@ -475,9 +475,10 @@ export class PiAgent implements Agent {
     // dangerouslySkipPermissions is meaningless to pi — it never prompts. The
     // container boundary is the isolation, exactly as for cursor --force.
 
-    if (opts.systemPrompt) {
-      args.push('--append-system-prompt', safeArgvPrompt(opts.systemPrompt, 'system prompt'));
-    }
+    // pi's --append-system-prompt takes text or a file path; a large one rides
+    // a file (see the argv rule in ./argv-safety).
+    const systemPrompt = systemPromptArgv(opts.systemPrompt, '--append-system-prompt', '--append-system-prompt');
+    args.push(...systemPrompt.args);
 
     if (opts.sessionId) {
       // Exact-id create-or-resume (verified): the same id resumes the same
@@ -496,11 +497,11 @@ export class PiAgent implements Agent {
       args.push(...opts.extraArgs);
     }
 
-    // Prompt is the last positional argument. A raw NUL anywhere in argv is
-    // fatal to the spawn, so escape rather than let the turn crash-loop.
-    args.push(safeArgvPrompt(opts.prompt, 'prompt'));
-
-    return args;
+    // pi combines piped stdin into the initial message before the turn.
+    return Object.assign(args, {
+      stdinInput: opts.prompt,
+      ...(systemPrompt.systemPromptInput !== undefined ? { systemPromptInput: systemPrompt.systemPromptInput } : {}),
+    });
   }
 
   /**
@@ -598,6 +599,7 @@ export class PiAgent implements Agent {
     // changes.
     const noModel = classifyNoModelRefusal(input);
     if (noModel) return noModel;
+
     if (text.includes('pi provider not supported by lazy')) {
       return { class: 'fatal_config', reason: 'this pi provider is not supported by lazy (anthropic, ollama, openai only)' };
     }

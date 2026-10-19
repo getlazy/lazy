@@ -25,10 +25,10 @@ import {
   placeholderValueFor,
   looksLikeLazyPlaceholder,
 } from '../../src/proxy/credential-broker';
-import { isOpenRouterEndpoint, DEFAULT_OPENAI_UPSTREAM } from '../../src/utils/openai-compat';
+import { isFireworksEndpoint, isOpenRouterEndpoint, DEFAULT_OPENAI_UPSTREAM } from '../../src/utils/openai-compat';
 import { isCredentialEnvKey } from '../../src/utils/redact';
 import { pinDaemonBaseDir, makeDaemonBaseDir } from '../helpers/daemon-base-dir';
-import { resolveAgentProfiles, cacheAgentProfiles } from '../../src/config/agent-profiles';
+import { knownEndpointWires, resolveAgentProfiles, cacheAgentProfiles } from '../../src/config/agent-profiles';
 import { roleTargetForProfile, ANTHROPIC_DEFAULT_TARGET } from '../../src/config/default-target';
 
 type ProfileInput = { harness: string; model?: string; endpoint?: string; credential?: string };
@@ -74,13 +74,50 @@ describe('isOpenRouterEndpoint', () => {
   });
 });
 
+describe('Fireworks (FireRouter)', () => {
+  // INVARIANT: only fireworks.ai and its subdomains are Fireworks — a lookalike
+  // host must never receive the user's Fireworks key.
+  test('isFireworksEndpoint matches fireworks.ai and subdomains only', () => {
+    expect(isFireworksEndpoint('https://api.fireworks.ai/inference')).toBe(true);
+    expect(isFireworksEndpoint('https://fireworks.ai')).toBe(true);
+    expect(isFireworksEndpoint('https://evilfireworks.ai')).toBe(false);
+    expect(isFireworksEndpoint('https://fireworks.ai.evil.example.com')).toBe(false);
+    expect(isFireworksEndpoint('')).toBe(false);
+    expect(isFireworksEndpoint('not a url')).toBe(false);
+  });
+
+  test('speaks both wires from one hostname', () => {
+    expect(knownEndpointWires('https://api.fireworks.ai/inference')).toEqual(['openai', 'anthropic']);
+  });
+
+  // INVARIANT (per-user-token billing): a profile at api.fireworks.ai bills the
+  // fireworks key on either wire — never the Anthropic or OpenAI one.
+  test('profiles at api.fireworks.ai bill fireworks on both wires', () => {
+    const claude = configWithAgentProfile('fw-claude', {
+      harness: 'claude-code', model: 'firerouter/opus', endpoint: 'https://api.fireworks.ai/inference', credential: 'fireworks',
+    });
+    const codex = configWithAgentProfile('fw-codex', {
+      harness: 'codex', model: 'firerouter/opus', endpoint: 'https://api.fireworks.ai/inference', credential: 'fireworks',
+    });
+    expect(providerForTarget(claude.models.roles.agent)).toBe('fireworks');
+    expect(providerForTarget(codex.models.roles.agent)).toBe('fireworks');
+  });
+
+  test('its env var is a credential key, and the placeholder mimics the fw_ shape', () => {
+    expect(isCredentialEnvKey('FIREWORKS_API_KEY')).toBe(true);
+    const placeholder = placeholderValueFor('FIREWORKS_API_KEY');
+    expect(placeholder.startsWith('fw_lazy_')).toBe(true);
+    expect(looksLikeLazyPlaceholder(placeholder)).toBe(true);
+  });
+});
+
 describe('providerForTarget / requiredProviders', () => {
   test('an openai-wire profile bills openai by default, openrouter at openrouter.ai', () => {
     const openai = configWithAgentProfile('work-codex', {
-      harness: 'codex', model: 'gpt-5-codex', endpoint: DEFAULT_OPENAI_UPSTREAM,
+      harness: 'codex', model: 'gpt-5-codex', endpoint: DEFAULT_OPENAI_UPSTREAM, credential: 'openai',
     });
     const router = configWithAgentProfile('router-codex', {
-      harness: 'codex', model: 'x', endpoint: 'https://openrouter.ai/api',
+      harness: 'codex', model: 'x', endpoint: 'https://openrouter.ai/api', credential: 'openrouter',
     });
     expect(providerForTarget(openai.models.roles.agent)).toBe('openai');
     expect(providerForTarget(router.models.roles.agent)).toBe('openrouter');
@@ -92,10 +129,10 @@ describe('providerForTarget / requiredProviders', () => {
   // another provider's server.
   test('an anthropic-wire profile at openrouter.ai bills openrouter, not anthropic', () => {
     const router = configWithAgentProfile('router-claude', {
-      harness: 'claude-code', model: 'anthropic/claude-opus-5', endpoint: 'https://openrouter.ai/api',
+      harness: 'claude-code', model: 'anthropic/claude-opus-5', endpoint: 'https://openrouter.ai/api', credential: 'openrouter',
     });
     const gateway = configWithAgentProfile('gateway-claude', {
-      harness: 'claude-code', model: 'claude-opus-5', endpoint: 'https://gateway.example.com',
+      harness: 'claude-code', model: 'claude-opus-5', endpoint: 'https://gateway.example.com', credential: 'anthropic',
     });
     expect(providerForTarget(router.models.roles.agent)).toBe('openrouter');
     expect(providerForTarget(gateway.models.roles.agent)).toBe('anthropic');
@@ -115,13 +152,13 @@ describe('providerForTarget / requiredProviders', () => {
 
   test('the daemon credential gate requires the right provider per role default', () => {
     expect(requiredProviders(configWithAgentProfile('work-codex', {
-      harness: 'codex', model: 'gpt-5.2', endpoint: DEFAULT_OPENAI_UPSTREAM,
+      harness: 'codex', model: 'gpt-5.2', endpoint: DEFAULT_OPENAI_UPSTREAM, credential: 'openai',
     }))).toEqual(['anthropic', 'openai']);
     expect(requiredProviders(configWithAgentProfile('router-codex', {
-      harness: 'codex', model: 'x', endpoint: 'https://openrouter.ai/api',
+      harness: 'codex', model: 'x', endpoint: 'https://openrouter.ai/api', credential: 'openrouter',
     }))).toEqual(['anthropic', 'openrouter']);
     expect(requiredProviders(configWithAgentProfile('router-claude', {
-      harness: 'claude-code', model: 'claude-opus-5', endpoint: 'https://openrouter.ai/api',
+      harness: 'claude-code', model: 'claude-opus-5', endpoint: 'https://openrouter.ai/api', credential: 'openrouter',
     }))).toEqual(['anthropic', 'openrouter']);
   });
 });
@@ -133,14 +170,14 @@ describe('profile upstream resolution', () => {
 
   test('an openai-wire profile carries the openai wire and its credential', () => {
     expect(entryFor(configWithAgentProfile('work-codex', {
-      harness: 'codex', model: 'gpt-5.2', endpoint: 'https://api.openai.com/',
+      harness: 'codex', model: 'gpt-5.2', endpoint: 'https://api.openai.com/', credential: 'openai',
     }), 'work-codex')).toEqual({
-      profile: 'work-codex', upstream: 'https://api.openai.com', credential: 'openai', wire: 'openai',
+      profile: 'work-codex', upstream: 'https://api.openai.com', credential: 'openai', wire: 'openai', credentialExplicit: true,
     });
     expect(entryFor(configWithAgentProfile('router-codex', {
-      harness: 'codex', model: 'x', endpoint: 'https://openrouter.ai/api',
+      harness: 'codex', model: 'x', endpoint: 'https://openrouter.ai/api', credential: 'openrouter',
     }), 'router-codex')).toEqual({
-      profile: 'router-codex', upstream: 'https://openrouter.ai/api', credential: 'openrouter', wire: 'openai',
+      profile: 'router-codex', upstream: 'https://openrouter.ai/api', credential: 'openrouter', wire: 'openai', credentialExplicit: true,
     });
   });
 
@@ -149,9 +186,9 @@ describe('profile upstream resolution', () => {
   // anthropic, so pointing it at openrouter.ai does not make its traffic openai.
   test('a claude-code profile at openrouter.ai keeps the anthropic wire with the openrouter credential', () => {
     expect(entryFor(configWithAgentProfile('router-claude', {
-      harness: 'claude-code', model: 'anthropic/claude-opus-5', endpoint: 'https://openrouter.ai/api',
+      harness: 'claude-code', model: 'anthropic/claude-opus-5', endpoint: 'https://openrouter.ai/api', credential: 'openrouter',
     }), 'router-claude')).toEqual({
-      profile: 'router-claude', upstream: 'https://openrouter.ai/api', credential: 'openrouter', wire: 'anthropic',
+      profile: 'router-claude', upstream: 'https://openrouter.ai/api', credential: 'openrouter', wire: 'anthropic', credentialExplicit: true,
     });
   });
 
@@ -160,7 +197,7 @@ describe('profile upstream resolution', () => {
   // its own, so it never appears here and keeps riding the primary upstream.
   test('a declared profile leaves every other profile on the primary upstream', () => {
     const config = configWithAgentProfile('router-codex', {
-      harness: 'codex', model: 'x', endpoint: 'https://openrouter.ai/api',
+      harness: 'codex', model: 'x', endpoint: 'https://openrouter.ai/api', credential: 'openrouter',
     });
     const names = resolveAgentUpstreams(config).map(u => u.profile);
     expect(names).toContain('router-codex');
@@ -191,7 +228,7 @@ describe('credential resolution for the proxy target map', () => {
 
   test('a missing key resolves to `missing` with an actionable remedy — never a silent none', async () => {
     const deps = buildProxyCredentialDeps(root, configWithAgentProfile('work-codex', {
-      harness: 'codex', model: 'gpt-5.2', endpoint: 'https://api.openai.com',
+      harness: 'codex', model: 'gpt-5.2', endpoint: 'https://api.openai.com', credential: 'openai',
     }));
     expect(deps.targets.has('https://api.openai.com')).toBe(true);
     const outcome = await deps.targets.forTarget('https://api.openai.com');
@@ -202,7 +239,7 @@ describe('credential resolution for the proxy target map', () => {
   test('a stored key is placed as Authorization: Bearer', async () => {
     await setCredential(root, { provider: 'openrouter', kind: 'api-key', secret: 'sk-or-v1-test-key-123456' });
     const deps = buildProxyCredentialDeps(root, configWithAgentProfile('router-codex', {
-      harness: 'codex', model: 'x', endpoint: 'https://openrouter.ai/api',
+      harness: 'codex', model: 'x', endpoint: 'https://openrouter.ai/api', credential: 'openrouter',
     }));
     const outcome = await deps.targets.forTarget('https://openrouter.ai/api');
     expect(outcome).toMatchObject({

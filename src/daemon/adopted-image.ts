@@ -49,8 +49,10 @@
  */
 
 import { createHash } from 'crypto';
-import { mkdir, readFile, unlink, writeFile } from 'fs/promises';
-import { dirname } from 'path';
+import { constants as fsConstants } from 'fs';
+import { mkdir, open, readFile, rename, unlink, writeFile } from 'fs/promises';
+import { dirname, join } from 'path';
+import { getDataDir } from '../project-paths';
 import { VERSION } from '../version';
 import { IMAGE_TAG, imageTagFor } from '../capture/image-tag';
 import { pathExists } from '../utils/fs';
@@ -84,6 +86,76 @@ export interface AdoptedImageState {
    * still parses, and nothing invalidates an adoption for lacking it.
    */
   contextCommit?: string;
+  /**
+   * Set when a project admin adopted the Dockerfile from a git REF (a branch
+   * or a task's branch) through the daemon's `adoptImageFromRef` RPC — Lazy
+   * Teams' way out of a failing Dockerfile.lazy (src/daemon/image-adoption.ts).
+   * Absent for a `lazy upgrade` worktree adoption. A ref adoption differs in
+   * two lifecycle rules, both because its inputs are lazy-owned copies of a
+   * committed tree rather than a live worktree:
+   *   - it does NOT expire on a minor-version bump: the daemon's boot build
+   *     rebuilds it under the new image tag (expiring it would silently drop a
+   *     Teams project back onto the broken file it was rescued from at the
+   *     next fleet roll);
+   *   - launches do not soft-pin `imageName`: it resolves as the project's
+   *     custom Dockerfile and goes through the boot build's gate.
+   */
+  source?: RefAdoptionSource;
+}
+
+/** Where a ref adoption came from and who confirmed it. */
+export interface RefAdoptionSource {
+  kind: 'ref';
+  /** What the admin picked: a branch name, or a task code/id. */
+  ref: string;
+  refKind: 'branch' | 'task';
+  /** The branch actually read (a task's branch for `refKind: 'task'`). */
+  branch: string;
+  /** The commit whose tree was snapshotted as the build context. */
+  commit: string;
+  /** The Dockerfile's blob sha in that commit. */
+  blob: string;
+  /** The Dockerfile path inside the tree (`Dockerfile.lazy` or `[docker].dockerfile`). */
+  dockerfile: string;
+  adoptedBy: { email: string | null; name: string | null };
+  /**
+   * The project branch's blob of the same file when the adoption was made, or
+   * null when it had none — so a later change on that branch can be shown as
+   * "switch back?" without ever switching on its own.
+   */
+  mainBlobAtAdoption: string | null;
+}
+
+/**
+ * Where a ref adoption's exported tree — its build CONTEXT — lives: inside the
+ * project's own checkout (`<root>/.lazy/adopted-image/`), NEVER the daemon
+ * dir. On Lazy Teams' microVM backend the daemon dir is mounted from the HOST,
+ * and the host must never hold repository contents ("the repo is inside the
+ * machine, never on this host"); only the small record lives there. The
+ * checkout is inside the machine, and task containers mount it read-only.
+ *
+ * Derived from the record, never stored in it, so a recreated machine — whose
+ * fresh clone has no such directory — re-exports it to the same place from the
+ * recorded commit (`ensureRefAdoptionContext`, src/daemon/image-adoption.ts).
+ * Per commit AND blob, so a new adoption never overwrites the one in force.
+ */
+export function refAdoptionContextsRoot(projectRoot: string): string {
+  return join(projectRoot, getDataDir(projectRoot), 'adopted-image');
+}
+
+export function refAdoptionContextDir(projectRoot: string, source: RefAdoptionSource): string {
+  return join(refAdoptionContextsRoot(projectRoot), `${source.commit.substring(0, 12)}-${source.blob.substring(0, 12)}`);
+}
+
+function isRefAdoptionSource(value: unknown): value is RefAdoptionSource {
+  if (!value || typeof value !== 'object') return false;
+  const v = value as Record<string, unknown>;
+  const by = v.adoptedBy as Record<string, unknown> | undefined;
+  const nullableString = (x: unknown) => x === null || typeof x === 'string';
+  return v.kind === 'ref' && typeof v.ref === 'string' && (v.refKind === 'branch' || v.refKind === 'task') &&
+    typeof v.branch === 'string' && typeof v.commit === 'string' && typeof v.blob === 'string' &&
+    typeof v.dockerfile === 'string' && !!by && typeof by === 'object' &&
+    nullableString(by.email) && nullableString(by.name) && nullableString(v.mainBlobAtAdoption);
 }
 
 function isAdoptedImageState(value: unknown): value is AdoptedImageState {
@@ -96,7 +168,8 @@ function isAdoptedImageState(value: unknown): value is AdoptedImageState {
     typeof v.imageName === 'string' &&
     typeof v.lazyVersion === 'string' &&
     typeof v.adoptedAt === 'string' &&
-    optionalString(v.contextCommit)
+    optionalString(v.contextCommit) &&
+    (v.source === undefined || isRefAdoptionSource(v.source))
   );
 }
 
@@ -158,7 +231,15 @@ export async function writeAdoptedImage(
     lazyVersion?: string;
     adoptedAt?: string;
   },
-  options: { content?: string } = {},
+  options: {
+    content?: string;
+    /**
+     * false: write the record ONLY (a ref adoption, whose Dockerfile already
+     * lives in its own lazy-owned context — the flat snapshot is the worktree
+     * adoption's). Default true.
+     */
+    snapshot?: boolean;
+  } = {},
 ): Promise<AdoptedImageState> {
   const full: AdoptedImageState = {
     dockerfilePath: state.dockerfilePath,
@@ -167,13 +248,14 @@ export async function writeAdoptedImage(
     lazyVersion: state.lazyVersion ?? VERSION,
     adoptedAt: state.adoptedAt ?? new Date().toISOString(),
     ...(state.contextCommit === undefined ? {} : { contextCommit: state.contextCommit }),
+    ...(state.source === undefined ? {} : { source: state.source }),
   };
 
   // Prefer the caller-supplied consented bytes; else snapshot from the
   // worktree path when readable. Missing path (test / expired fixture) still
   // writes JSON so inspect can report missing-dockerfile — no snapshot then.
-  let content = options.content;
-  if (content === undefined) {
+  let content = options.snapshot === false ? undefined : options.content;
+  if (content === undefined && options.snapshot !== false) {
     try {
       content = await readFile(state.dockerfilePath, 'utf-8');
     } catch {
@@ -195,7 +277,20 @@ export async function writeAdoptedImage(
     await writeFile(getAdoptedDockerfilePath(projectRoot), content, 'utf-8');
   }
 
-  await writeFile(path, `${JSON.stringify(full, null, 2)}\n`, 'utf-8');
+  // Published atomically: a reader sees the previous record or this one,
+  // never a torn file, and a failed write leaves the previous one in force.
+  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tmp, `${JSON.stringify(full, null, 2)}\n`, 'utf-8');
+  await rename(tmp, path);
+  // A ref adoption keeps its Dockerfile in its own context; a flat snapshot
+  // left by an earlier `lazy upgrade` adoption would describe another image.
+  if (options.snapshot === false) {
+    // Logged, never thrown: the record above is already published, and a
+    // throw here would make the caller treat a live adoption as failed.
+    await unlink(getAdoptedDockerfilePath(projectRoot)).catch((err: NodeJS.ErrnoException) => {
+      if (err.code !== 'ENOENT') logger.warn(`could not remove the stale adopted Dockerfile snapshot: ${err.message}`);
+    });
+  }
   return full;
 }
 
@@ -316,27 +411,69 @@ export async function inspectAdoptedImage(
   // not the full VERSION — see the header: the commit-count patch component
   // advances on every upgrade in a source checkout, and expiring on it made
   // every upgrade throw away the image it had just built.
-  if (imageTagFor(state.lazyVersion) !== IMAGE_TAG) {
+  if (state.source?.kind !== 'ref' && imageTagFor(state.lazyVersion) !== IMAGE_TAG) {
     return { status: 'expired', state };
   }
+
+  // A ref adoption's Dockerfile lives in a context that a recreated machine
+  // does not have yet: its presence and bytes are checked — and the context
+  // re-exported from the recorded commit when missing — where it is RESOLVED
+  // (resolveRefAdoptedDockerfileSnapshot), never by clearing the adoption here.
+  if (state.source?.kind === 'ref') return { status: 'valid', state };
 
   if (!(await pathExists(state.dockerfilePath))) {
     return { status: 'missing-dockerfile', state };
   }
 
   // Compare current worktree file bytes to the hash consented at adoption time.
-  let current: string;
-  try {
-    current = await readFile(state.dockerfilePath, 'utf-8');
-  } catch {
-    // Unreadable after exists check — treat like missing (clear, don't rebuild).
-    return { status: 'missing-dockerfile', state };
-  }
-  if (hashDockerfileContent(current) !== state.contentHash) {
+  // The worktree is agent-writable, so the read is bounded (see
+  // readConsentedDockerfile): anything it will not read cannot be the bytes a
+  // human consented to, and is drift.
+  const current = await readConsentedDockerfile(state.dockerfilePath);
+  if (current === 'missing') return { status: 'missing-dockerfile', state };
+  if (current === 'not-a-dockerfile' || hashDockerfileContent(current) !== state.contentHash) {
     return { status: 'content-drifted', state };
   }
 
   return { status: 'valid', state };
+}
+
+/** Larger than any Dockerfile; the same cap `lazy_image_build` reads under. */
+const MAX_CONSENTED_DOCKERFILE_BYTES = 1024 * 1024;
+
+/**
+ * Read an adopted worktree Dockerfile for the drift check without letting an
+ * agent hang or exhaust the daemon: O_NOFOLLOW (a symlink is not the file that
+ * was consented to), O_NONBLOCK (a FIFO cannot block the read), fstat on the
+ * open descriptor must say regular file, and the read is capped by bytes
+ * actually read — a file still growing cannot make the daemon buffer forever.
+ */
+export async function readConsentedDockerfile(path: string): Promise<string | 'missing' | 'not-a-dockerfile'> {
+  let handle;
+  try {
+    handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return 'missing';
+    if (code === 'ELOOP' || code === 'EMLINK') return 'not-a-dockerfile';
+    logger.warn(`adopted image: could not open ${path} for the drift check: ${(err as Error).message}`);
+    return 'missing';
+  }
+  try {
+    const st = await handle.stat();
+    if (!st.isFile() || st.size > MAX_CONSENTED_DOCKERFILE_BYTES) return 'not-a-dockerfile';
+    const buf = Buffer.alloc(MAX_CONSENTED_DOCKERFILE_BYTES + 1);
+    let filled = 0;
+    while (filled < buf.length) {
+      const { bytesRead } = await handle.read(buf, filled, buf.length - filled, filled);
+      if (bytesRead === 0) break;
+      filled += bytesRead;
+    }
+    if (filled > MAX_CONSENTED_DOCKERFILE_BYTES) return 'not-a-dockerfile';
+    return buf.subarray(0, filled).toString('utf-8');
+  } finally {
+    await handle.close();
+  }
 }
 
 /**
@@ -366,6 +503,33 @@ export async function resolveAdoptedDockerfileSnapshot(
 }
 
 /**
+ * The consented snapshot of a REF adoption, for every resolution of the
+ * project's custom Dockerfile (launches included — see the RefAdoptionSource
+ * comment). Null when there is no valid ref adoption. Registers a human label
+ * for the snapshot so build announcements and the status surfaces name the
+ * branch and commit rather than a daemon-dir path.
+ */
+export async function resolveRefAdoptedDockerfileSnapshot(projectRoot: string): Promise<string | null> {
+  // The Dockerfile inside the adoption's own lazy-owned context, its bytes
+  // checked against the consented hash — re-exported from the recorded commit
+  // first if the context is missing (a recreated machine). Throws
+  // RefAdoptionUnavailableError when that commit is gone: never a silent
+  // switch back to the project's own file.
+  const adopted = await loadValidAdoptedImage(projectRoot);
+  if (adopted?.source?.kind !== 'ref') return null;
+  const { ensureRefAdoptionContext } = await import('./image-adoption');
+  const path = await ensureRefAdoptionContext(projectRoot, adopted);
+  const { labelDockerfileSource } = await import('../capture/claude');
+  labelDockerfileSource(path, describeRefAdoption(adopted.source));
+  return path;
+}
+
+/** "Dockerfile.lazy from lazy/fix-image (abc123def456)" — one phrase for every surface. */
+export function describeRefAdoption(source: RefAdoptionSource): string {
+  return `${source.dockerfile} from ${source.branch} (${source.commit.substring(0, 12)}), adopted`;
+}
+
+/**
  * The directory an adopted image must be built with as its docker context, when
  * `dockerfilePath` is the adopted snapshot. Null for any other Dockerfile —
  * notably the root `[docker].dockerfile`, which keeps the project root.
@@ -380,11 +544,15 @@ export async function adoptedBuildContextRoot(
   projectRoot: string,
   dockerfilePath: string,
 ): Promise<string | null> {
-  if (dockerfilePath !== getAdoptedDockerfilePath(projectRoot)) return null;
-
   const adopted = await loadValidAdoptedImage(projectRoot);
   if (!adopted) return null;
-
+  // A ref adoption builds against the ROOT of its exported tree, wherever in
+  // it the Dockerfile sits.
+  if (adopted.source?.kind === 'ref') {
+    const ctx = refAdoptionContextDir(projectRoot, adopted.source);
+    return dockerfilePath === join(ctx, adopted.source.dockerfile) ? ctx : null;
+  }
+  if (dockerfilePath !== getAdoptedDockerfilePath(projectRoot)) return null;
   return dirname(adopted.dockerfilePath);
 }
 

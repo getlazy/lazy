@@ -20,7 +20,8 @@
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { join } from 'path';
-import { readFile, writeFile } from 'fs/promises';
+import { mkdtemp, rm, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask, withPresentedToken } from '../helpers/fixtures';
 import { expectSuccess } from '../helpers/assertions';
@@ -29,7 +30,7 @@ import { readTaskStatus, readTurns, storageDirFor } from '../helpers/storage';
 import { DaemonClient, RpcApplicationError } from '../../src/daemon/client';
 import { getDaemonTcpTarget, readToken } from '../../src/daemon/lifecycle';
 import { SERVICE_CREDENTIAL_USER_ID } from '../../src/daemon/user-credentials';
-import { NO_OWNER_CREDENTIAL_MARKER } from '../../src/daemon/turn-credentials';
+import { NO_OWNER_ENDPOINT_CREDENTIAL_MARKER } from '../../src/daemon/member-credentials';
 import { isSessionPlaceholderToken, SESSION_TOKEN_PREFIX } from '../../src/daemon/session-credentials';
 import { readAuditRecords } from '../../src/proxy/audit-log';
 
@@ -61,6 +62,7 @@ describe('credential swap through a live supervised turn', () => {
   let target: string;
   let upstream: ReturnType<typeof Bun.serve>;
   let forwarded: Forwarded = null;
+  let transportDir: string;
 
   async function rpc(token: string, command: string, params: Record<string, unknown> = {}) {
     return await DaemonClient.fromTarget(target, token).rpc(command, ctx.root, params);
@@ -86,19 +88,6 @@ describe('credential swap through a live supervised turn', () => {
     await rpc(sharedToken, 'putUserCredential', { userId, kind, token });
   }
 
-  /** Point the daemon proxy at the stub upstream and restart so it takes effect. */
-  async function pinUpstream(): Promise<void> {
-    const configPath = join(ctx.root, 'lazy.toml');
-    const before = await readFile(configPath, 'utf-8');
-    const upstreamLine = `http://127.0.0.1:${upstream.port}`;
-    if (!before.includes(upstreamLine)) {
-      await writeFile(
-        configPath,
-        `${before}\n[proxy]\nupstream = "${upstreamLine}"\n`,
-      );
-    }
-  }
-
   async function auditRecordFor(userId: string) {
     const records = await until(
       async () => readAuditRecords(join(ctx.root, '.lazy'), { limit: 20 }),
@@ -122,11 +111,28 @@ describe('credential swap through a live supervised turn', () => {
       },
     });
 
+    // INVARIANT: native Anthropic credentials only pay the consented Anthropic
+    // origin. Mock the external fetch transport, never the configured route or
+    // the consent/provider gate, while preserving native session placeholders.
+    transportDir = await mkdtemp(join(tmpdir(), 'swap-transport-'));
+    const transportPreload = join(transportDir, 'anthropic-fetch.ts');
+    await writeFile(transportPreload, `
+// Native session-kind proofs must not inherit the outer agent's bearer.
+delete process.env.ANTHROPIC_AUTH_TOKEN;
+delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+const realFetch = globalThis.fetch;
+globalThis.fetch = (async (input, init) => {
+  const url = new URL(input instanceof Request ? input.url : String(input));
+  if (url.origin !== 'https://api.anthropic.com') return realFetch(input, init);
+  const target = ${JSON.stringify(`http://127.0.0.1:${upstream.port}`)} + url.pathname + url.search;
+  return realFetch(input instanceof Request ? new Request(target, input) : target, init);
+});
+`);
     ctx = await setupTestLazy({
       fakeClaude: true,
+      daemonTransportPreload: transportPreload,
     });
 
-    await pinUpstream();
     // Arm managed mode for the proof of the per-user billing mandate.
     // We must provide a storage path, otherwise the daemon refuses to start in managed mode.
     const storagePath = storageDirFor(ctx.root);
@@ -146,6 +152,7 @@ describe('credential swap through a live supervised turn', () => {
   afterEach(async () => {
     upstream.stop(true);
     await ctx.cleanup();
+    await rm(transportDir, { recursive: true, force: true });
   });
 
   test('an OAuth owner: placeholder in the agent, real Bearer token at the upstream', async () => {
@@ -194,6 +201,7 @@ describe('credential swap through a live supervised turn', () => {
     expectSuccess(await ctx.lazy(['wait', taskId]));
 
     const invocations = await ctx.claudeInvocations();
+    expect(forwarded).not.toBeNull();
     const launched = invocations.filter(i => i.env?.ANTHROPIC_API_KEY !== undefined);
     expect(launched.length).toBeGreaterThan(0);
     expect(isSessionPlaceholderToken(launched[0]!.env!.ANTHROPIC_API_KEY!)).toBe(true);
@@ -221,7 +229,7 @@ describe('credential swap through a live supervised turn', () => {
     const refusedStart = await withPresentedToken(ctx, userToken, () => ctx.lazy(['start', taskId, '--yes']));
     expect(refusedStart.exitCode).toBe(1);
     const refusalText = `${refusedStart.stdout}\n${refusedStart.stderr}`;
-    expect(refusalText).toContain(NO_OWNER_CREDENTIAL_MARKER);
+    expect(refusalText).toContain(NO_OWNER_ENDPOINT_CREDENTIAL_MARKER);
     expect(refusalText).toContain(NEMO_EMAIL);
 
     // Nothing reached the stub and no agent ever ran: the refusal is the whole
@@ -255,7 +263,7 @@ describe('credential swap through a live supervised turn', () => {
     });
 
     expect(refused.status).toBe(400);
-    expect(refused.message).toContain(NO_OWNER_CREDENTIAL_MARKER);
+    expect(refused.message).toContain(NO_OWNER_ENDPOINT_CREDENTIAL_MARKER);
     expect(refused.message).toContain(NEMO_EMAIL);
     expect(readTaskStatus(ctx.root, unblockTaskId)).toBe('blocked');
     // Nothing reached the stub: the refusal is the whole outcome.

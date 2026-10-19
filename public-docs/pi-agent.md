@@ -48,6 +48,7 @@ Everything else is a profile you declare:
   harness = "pi"
   model = "qwen3:32b"
   endpoint = "http://ollama.lan:11434"
+  credential = "none"
   ```
 
   Then `lazy create --agent remote-ollama-pi "…"`, or make it the project
@@ -65,6 +66,7 @@ Everything else is a profile you declare:
   harness = "pi"
   model = "claude-opus-5-5"
   endpoint = "https://api.anthropic.com"
+  credential = "anthropic"
   ```
 
 - **OpenAI** — a profile pointed at `api.openai.com` runs Pi's OpenAI provider
@@ -75,6 +77,7 @@ Everything else is a profile you declare:
   harness = "pi"
   model = "gpt-6-sol"
   endpoint = "https://api.openai.com"
+  credential = "openai"
   ```
 
   The key comes from `lazy auth set openai` (or `OPENAI_API_KEY` in the
@@ -91,6 +94,7 @@ Everything else is a profile you declare:
   harness = "pi"
   model = "anthropic/claude-sonnet-4.5"
   endpoint = "https://openrouter.ai/api"
+  credential = "openrouter"
   ```
 
 Those two wires are all Pi speaks under lazy, and the endpoint's hostname
@@ -154,9 +158,9 @@ On an installation that [manages configuration for you](managed-config.md) —
 Lazy Teams is one — a repository is not allowed to choose an agent profile's
 `endpoint`, because that endpoint receives the installation's model credential.
 Every example on this page that sets `endpoint` is therefore something to keep
-out of a managed project's `lazy.toml`: committing one does not just fail to
-take effect, it stops the project loading at all, with `managed config refused`
-naming the key.
+out of a managed project's `lazy.toml`: committing one does not take effect —
+the profile stays in the file but is not available, and `lazy doctor` (and
+on Lazy Teams the Configuration page) names it with the reason.
 
 That leaves the built-in `pi` profile and its local Ollama, so Pi runs there
 only if whoever operates the installation runs an Ollama the project's daemon
@@ -208,7 +212,7 @@ already manages:
 - Anthropic — `lazy auth set anthropic` (or the environment the daemon runs in),
 - hosted Ollama — `lazy auth set ollama`; local Ollama needs no credential,
 - OpenAI — `lazy auth set openai`; OpenRouter — `lazy auth set openrouter`
-  (inferred from the profile's endpoint, or named by its `credential` key).
+  (named by the profile's `credential` key, which every endpoint must carry).
 
 `lazy system agent set-key pi` is refused by design — there is nothing
 pi-specific to store. As with every agent, the task container only ever holds
@@ -255,9 +259,8 @@ harness is Pi, not only the built-in `pi` profile. See
 
 ## Container image
 
-The default lazy runner image family gets Pi installed automatically when a
-project's agent is `pi` (a `lazy-runner-pi` image is built from the default
-Dockerfile plus Pi's install). Projects with a custom `Dockerfile.lazy` add
-Pi's install line themselves — `lazy` prints it when the image is missing the
-binary. The install is pinned to a specific Pi version that lazy's
+The default `lazy-runner` image has Pi installed, alongside every other agent
+lazy can run in a container. A custom `Dockerfile.lazy` that starts
+`FROM lazy-runner` has it too. One built on another base adds Pi's install
+line itself — `lazy` prints it when the image is missing the binary. The install is pinned to a specific Pi version that lazy's
 integration was verified against.

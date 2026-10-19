@@ -1009,7 +1009,7 @@ describe('remote driver', () => {
     // silent fallback to the local branch name. Two tests previously asserted
     // the opposite ("falls back to local branch name when fetch fails" and
     // "...on exception"); they were deleted because the fallback behaviour was
-    // intentionally removed per CLAUDE.md's "fail hard on remote failures" rule.
+    // intentionally removed per AGENTS.md's "fail hard on remote failures" rule.
     // See commit d7ef9af2 for the production change.
     test('throws when fetch fails', async () => {
       const deps: DriverDeps = {

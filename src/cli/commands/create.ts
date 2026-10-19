@@ -1,5 +1,7 @@
 import { requireActorIdentity } from '../identity-preflight';
-import { requireStorage, requireLazyRoot, parseFlags, validateModel, validateAgentProfileOrExit, resolveTaskOrExit } from '../helpers';
+import { requireStorage, requireLazyRoot, parseFlags, validateModel, validateAgentProfileOrExit, resolveTaskOrExit, agentToSend, isBoundClone } from '../helpers';
+import { createTaskFromBoundClone, resolveBoundCloneParent } from '../bound-clone-create';
+import type { Storage } from '../../storage/interface';
 import {
   describeReviewOverrides,
   hasReviewOverrides,
@@ -145,6 +147,16 @@ export async function commandCreate(args: string[]): Promise<void> {
   // written a prompt would throw the prompt away.
   await requireActorIdentity();
 
+  // Also before the editor: in a clone bound to Lazy Teams these settings are
+  // refused (no browser page sets them), and finding that out after the prompt
+  // was typed would cost the person their words.
+  const boundClone = await isBoundClone();
+  if (boundClone && (runnerType || hasReviewOverrides(reviewOverrides))) {
+    console.error('--runner and --review settings cannot be set from a clone logged in to Lazy Teams (the Teams web UI does not set them either).');
+    console.error('No task was created.');
+    process.exit(1);
+  }
+
   // Flag mode: both goal and optionally prompt provided
   const goalValue = parsed.flags.get('goal') as string | undefined;
   const promptValue = parsed.flags.get('prompt') as string | undefined;
@@ -189,14 +201,28 @@ export async function commandCreate(args: string[]): Promise<void> {
   }
 
   // INTAKE BOUNDARY: the goal and prompt are both rendered into the start
-  // prompt, which becomes argv[2] of `claude -p`. Escape non-printable control
-  // characters before persisting. The goal is a one-liner, so it is escaped
+  // prompt (delivered on stdin — src/agent/argv-safety.ts; sanitizing stays as
+  // defence in depth). Escape non-printable control characters before persisting. The goal is a one-liner, so it is escaped
   // without the explanatory note; the prompt gets the note so the substitution
   // is visible to both the human and the agent.
   goal = sanitizeUserText(goal, { annotate: false });
   if (prompt) prompt = sanitizeUserText(prompt);
 
   const storage = await requireStorage();
+  if (boundClone) {
+    try {
+      await createFromBoundClone(storage, {
+        goal, prompt, promptRecoveryPath, code, taskType, parentValue, agentValue, configAgentId,
+        model, effort, runnerType, tags,
+        review: parsed.flags.get('review') as string | undefined,
+        reviewGate: parsed.flags.get('review-gate') as string | undefined,
+        reviewAutoFix: parsed.flags.get('review-auto-fix') as string | undefined,
+      });
+    } finally {
+      await storage.close();
+    }
+    return;
+  }
   let explicitBranchTarget: string | undefined;
   try {
     // Resolve --parent: a task code/short-ID, or (fall-through) a raw git branch
@@ -243,7 +269,11 @@ export async function commandCreate(args: string[]): Promise<void> {
       configAgentId,
       projectSettings,
     );
-    agentId = agentResolution.agentId;
+    // In a clone bound to Teams the local lazy.toml is the REPOSITORY's copy,
+    // not the configuration the daemon runs on, so its default and
+    // [agent.by_type] must not pick the agent: only an explicit or inherited
+    // one is sent, and the daemon resolves the rest from its own configuration.
+    agentId = await agentToSend(agentResolution);
 
     const t = await storage.createTask(goal, parentTaskId, undefined, code, taskType ?? undefined, agentId);
 
@@ -270,7 +300,9 @@ export async function commandCreate(args: string[]): Promise<void> {
     if (t.type !== 'task') {
       console.log(`  Type:   ${t.type}`);
     }
-    const agentLine = formatAgentResolutionLine(agentResolution);
+    const agentLine = agentId === undefined
+      ? (t.agent_id ? `  Agent:  ${t.agent_id} (the project's default)` : null)
+      : formatAgentResolutionLine(agentResolution);
     if (agentLine) {
       console.log(agentLine);
     }
@@ -345,6 +377,60 @@ export async function commandCreate(args: string[]): Promise<void> {
   } finally {
     await storage.close();
   }
+}
+
+/**
+ * `lazy create` in a clone bound to Lazy Teams: one daemon create, whole or
+ * nothing (see `src/cli/bound-clone-create.ts`). Settings Teams does not let a
+ * member set are refused BEFORE anything is created, never after.
+ */
+async function createFromBoundClone(storage: Storage, input: {
+  goal: string;
+  prompt: string | null;
+  promptRecoveryPath: string | null;
+  code?: string;
+  taskType: TaskType | null;
+  parentValue?: string;
+  agentValue?: string;
+  configAgentId: Awaited<ReturnType<typeof loadConfig>>['agent'];
+  model: string | null;
+  effort?: EffortLevel;
+  runnerType?: RunnerType;
+  tags: string[];
+  review?: string;
+  reviewGate?: string;
+  reviewAutoFix?: string;
+}): Promise<void> {
+  if (input.runnerType) {
+    console.error('--runner cannot be set from a clone logged in to Lazy Teams: the project\'s runner is the one its daemon uses.');
+    console.error('No task was created.');
+    process.exit(1);
+  }
+  const { parentTask, parentBranch } = input.parentValue !== undefined
+    ? await resolveBoundCloneParent(storage, input.parentValue)
+    : { parentTask: null, parentBranch: undefined };
+  const agentResolution = resolveAgentForNewTaskFromConfig(
+    { explicit: input.agentValue, inheritFrom: parentTask, taskType: input.taskType ?? 'task' },
+    input.configAgentId,
+    await storage.getProjectSettings(),
+  );
+  const t = await createTaskFromBoundClone(storage, {
+    goal: input.goal,
+    prompt: input.prompt ?? undefined,
+    promptRecoveryPath: input.promptRecoveryPath,
+    code: input.code,
+    type: input.taskType ?? undefined,
+    parentTask,
+    parentBranch,
+    agent: await agentToSend(agentResolution),
+    model: input.model ?? undefined,
+    effort: input.effort,
+    review: input.review,
+    reviewGate: input.reviewGate,
+    reviewAutoFix: input.reviewAutoFix,
+    tags: input.tags,
+  });
+  console.log(`\nStart working on it with: lazy start ${displayId(t)}`);
 }
 
 export function createUsage(): void {

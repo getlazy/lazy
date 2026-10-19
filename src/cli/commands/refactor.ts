@@ -1,4 +1,5 @@
-import { requireStorage, requireLazyRoot, parseFlags, validateModel } from '../helpers';
+import { requireStorage, requireLazyRoot, parseFlags, validateModel, agentToSend, isBoundClone } from '../helpers';
+import { createShortcutTaskFromBoundClone } from '../bound-clone-create';
 import { requireActorIdentity } from '../identity-preflight';
 import { displayId, displayIdFor, validateCode, MAX_TASK_CODE_LENGTH } from '../../task/identity';
 import type { Task } from '../../types';
@@ -98,6 +99,16 @@ export async function commandRefactor(args: string[]): Promise<void> {
     : refactorConstraints;
 
   const storage = await requireStorage();
+  if (await isBoundClone()) {
+    try {
+      await createShortcutTaskFromBoundClone(storage, {
+        type: 'refactor', goal, fullPrompt, promptRecoveryPath, code, parentValue, model,
+      });
+    } finally {
+      await storage.close();
+    }
+    return;
+  }
   try {
     // Resolve and validate parent if provided
     let parent: Task | null = null;
@@ -121,13 +132,15 @@ export async function commandRefactor(args: string[]): Promise<void> {
       config.agent,
       projectSettings,
     );
-    const t = await storage.createTask(goal, parentTaskId, undefined, code, 'refactor', agentResolution.agentId);
+    const t = await storage.createTask(goal, parentTaskId, undefined, code, 'refactor', await agentToSend(agentResolution));
     console.log(`Created task ${displayId(t)}`);
     console.log(`  Goal:   ${t.goal}`);
     console.log(`  Status: ${t.status}`);
     console.log(`  ID:     ${t.id}`);
     console.log(`  Type:   refactor`);
-    const agentLine = formatAgentResolutionLine(agentResolution);
+    const agentLine = t.agent_id === agentResolution.agentId
+      ? formatAgentResolutionLine(agentResolution)
+      : `  Agent:  ${t.agent_id} (the project's default)`;
     if (agentLine) {
       console.log(agentLine);
     }

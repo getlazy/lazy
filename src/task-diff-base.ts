@@ -3,7 +3,7 @@
  *
  * A task diff is only meaningful if its base is the ref the task branch was CUT
  * from. The launcher cuts it through `resolveUpstreamMergeRef` (see
- * src/remote/upstream-ref.ts and the CLAUDE.md invariant it implements), so every
+ * src/remote/upstream-ref.ts and the AGENTS.md invariant it implements), so every
  * diff surface must resolve it through the same function — otherwise the diff
  * attributes somebody else's history to the task.
  *

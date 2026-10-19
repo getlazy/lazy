@@ -38,7 +38,10 @@ describe('feature flags', () => {
     test('shows feature flags with individual flag enabled', async () => {
       const tomlPath = join(ctx.root, 'lazy.toml');
       let toml = readFileSync(tomlPath, 'utf-8');
-      toml += '\n[features]\nsome_feature = true\n';
+      // lazy init already wrote a [features] table; redefining it is a TOML error, so add to it.
+      const withFlag = toml.replace('[features]\n', '[features]\nsome_feature = true\n');
+      expect(withFlag).not.toBe(toml);
+      toml = withFlag;
       writeFileSync(tomlPath, toml);
 
       const result = await ctx.lazy(['doctor']);
@@ -51,7 +54,10 @@ describe('feature flags', () => {
     test('shows feature flags with all = true', async () => {
       const tomlPath = join(ctx.root, 'lazy.toml');
       let toml = readFileSync(tomlPath, 'utf-8');
-      toml += '\n[features]\nall = true\n';
+      // lazy init already wrote a [features] table; redefining it is a TOML error, so add to it.
+      const withFlag = toml.replace('[features]\n', '[features]\nall = true\n');
+      expect(withFlag).not.toBe(toml);
+      toml = withFlag;
       writeFileSync(tomlPath, toml);
 
       const result = await ctx.lazy(['doctor']);
@@ -68,7 +74,10 @@ describe('feature flags', () => {
     test('warns about unknown flags without failing', async () => {
       const tomlPath = join(ctx.root, 'lazy.toml');
       let toml = readFileSync(tomlPath, 'utf-8');
-      toml += '\n[features]\nnonexistent_flag = true\n';
+      // lazy init already wrote a [features] table; redefining it is a TOML error, so add to it.
+      const withFlag = toml.replace('[features]\n', '[features]\nnonexistent_flag = true\n');
+      expect(withFlag).not.toBe(toml);
+      toml = withFlag;
       writeFileSync(tomlPath, toml);
 
       const result = await ctx.lazy(['doctor']);

@@ -35,9 +35,9 @@ export function actionDialogChromeHtml(): string {
     </form>
     <h2 class="lz-action-dialog-title" id="lz-action-dialog-title"></h2>
     <div class="lz-action-dialog-body" id="lz-action-dialog-body"></div>
-    <ol class="lz-action-steps" id="lz-action-steps" hidden></ol>
-    <p class="lz-action-error" id="lz-action-error" hidden></p>
-    <div class="lz-action-remedy" id="lz-action-remedy" hidden></div>
+    <details open class="lz-action-output"><summary>Progress</summary><ol class="lz-action-steps" id="lz-action-steps" hidden></ol></details>
+    <details open class="lz-action-output"><summary>Error</summary><p class="lz-action-error" id="lz-action-error" hidden></p></details>
+    <details open class="lz-action-output"><summary>Next steps</summary><div class="lz-action-remedy" id="lz-action-remedy" hidden></div></details>
   </dialog>`;
 }
 
@@ -426,6 +426,7 @@ export function actionDialogScript(): string {
     hideRemedy();
     lastFormData = null;
     lastFormAction = '';
+    dialog.querySelectorAll('.lz-action-output').forEach(function (drawer) { drawer.open = true; });
     if (dialog) dialog.classList.remove('lz-action-form-hidden');
     if (stepsEl) { stepsEl.hidden = true; stepsEl.innerHTML = ''; }
     if (titleEl) titleEl.textContent = title || verb;

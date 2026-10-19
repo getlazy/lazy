@@ -6,7 +6,7 @@
  * property is exactly what distinguishes raised items from comments: comments feed
  * the comment auto-react loop (daemon/auto-react.ts reads getTaskComments), which
  * would spuriously resume the agent — the "lost turn" failure this entity exists
- * to avoid. See CLAUDE.md and the RaisedItem type doc in src/types/index.ts.
+ * to avoid. See AGENTS.md and the RaisedItem type doc in src/types/index.ts.
  *
  * Both flags live in ONE store: `blocking: true` is what used to be a raised
  * item and gates accept; `blocking: false` is what used to be a follow-up and

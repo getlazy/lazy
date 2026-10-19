@@ -25,7 +25,6 @@ import {
   clearCredentialGrantCache,
   revokeTaskCredentialGrants,
 } from '../../src/proxy/credential-broker';
-import { findLazyRoot } from '../../src/project-paths';
 import type { RoleTarget } from '../../src/config/types';
 
 enableInProcessTestMode();
@@ -123,6 +122,23 @@ describe('one-shot container isolation argv', () => {
     expect(args).toContain('lazy.oneshot=1');
   });
 
+  test('pi one-shots pass large prompts to the container on stdin', async () => {
+    const { buildOneshotDockerArgs } = await import('../../src/runner/docker-runner');
+    const prompt = 'pi input '.repeat(20_000);
+    const args = buildOneshotDockerArgs({
+      ...common,
+      harness: 'pi',
+      agentStateHome: '/home-store/demo/.pi',
+      prompt,
+      repoAccess: 'none',
+    });
+    expect(args).toContain('-i');
+    expect(args).toContain('/home-store/demo/.pi:/home/user/.pi');
+    expect(args.stdinInput).toContain(prompt);
+    expect(args.every(arg => !arg.includes(prompt))).toBe(true);
+    expect(args.indexOf('-i')).toBeLessThan(args.indexOf('lazy-runner:test'));
+  });
+
   test('cursor agent mounts lazy-owned .cursor state instead of .claude', async () => {
     const { buildOneshotDockerArgs } = await import('../../src/runner/docker-runner');
     const args = buildOneshotDockerArgs({
@@ -175,10 +191,11 @@ describe('one-shot credential posture', () => {
     repoAccess: 'none' as const,
   };
 
-  // The launch seam mints against the root it discovers for ITSELF (cwd-walking,
-  // as every in-daemon launch does), so the grant lands under this repo's slug.
-  // `pinDaemonBaseDir` keeps the registry file in a temp dir all the same.
-  const mintRoot = findLazyRoot()!;
+  // The launch seam mints against the project the one-shot's identity names
+  // (`oneshotLaunchIdentity` carries its lazyRoot), never the process's own
+  // root, so the grant lands under that project's slug. `pinDaemonBaseDir`
+  // keeps the registry file in a temp dir all the same.
+  const mintRoot = common.lazyRoot;
   // A USER-DEFINED profile name, not `claude-code`: a hard-coded built-in would
   // be indistinguishable from a correctly resolved one in the assertions below.
   // This stands in for what `builderTarget()` resolves to — a one-shot composes
@@ -411,7 +428,7 @@ describe('one-shot credential posture', () => {
     // `revokeTaskCredentialGrants` filters on task id regardless of role, which
     // is what stops these outliving the task as live placeholders. Task 88's is
     // untouched — revocation is per task, not a sweep.
-    await revokeTaskCredentialGrants(mintRoot, 'task-77');
+    await revokeTaskCredentialGrants(mintRoot, { id: 'task-77' });
     clearCredentialGrantCache();
     expect(await lookupCredentialGrant(mintRoot, tokenOf(forTask77))).toBeNull();
     expect(await lookupCredentialGrant(mintRoot, tokenOf(taskOwnAgentLaunch))).toBeNull();
@@ -577,12 +594,14 @@ describe('one-shot target selection', () => {
     'harness = "claude-code"',
     'model = "task-model-x"',
     'endpoint = "https://task.example"',
+    'credential = "anthropic"',
   ];
   const BUILDER_PROFILE = [
     '[agents.deskbot]',
     'harness = "claude-code"',
     'model = "builder-model-y"',
     'endpoint = "https://builder.example"',
+    'credential = "anthropic"',
   ];
 
   async function writeRoles(agentProfile: string, builderProfile: string, extra: string[] = []) {
@@ -673,5 +692,15 @@ describe('one-shot target selection', () => {
     await writeRoles('qabot', 'deskbot', qa);
     const runner = seams(await createOneshotRunner(root));
     expect(runner.builderTarget().profile).toBe('deskbot');
+  });
+
+  // INVARIANT: a one-shot never leaves the proxy. Only Claude Code's route
+  // reaches a one-shot container, so a codex/cursor/pi builder harness is
+  // refused rather than launched to dial its vendor directly, unaudited.
+  test('a builder harness whose one-shots cannot be proxied is refused', async () => {
+    for (const harness of ['codex', 'cursor', 'pi']) {
+      await writeRoles('taskbot', 'otherbot', ['[agents.otherbot]', `harness = "${harness}"`, 'model = "m"']);
+      await expect(createOneshotRunner(root)).rejects.toThrow(/routed through lazy's proxy/);
+    }
   });
 });

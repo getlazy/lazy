@@ -98,6 +98,13 @@ describe('buildReviewAutoFixMessage', () => {
     }), 0)).toContain('[aaaaaaaa]');
   });
 
+  test('commits independent fixes separately without splitting a shared fix', () => {
+    const msg = buildReviewAutoFixMessage(FINDINGS);
+    expect(msg).toContain('commit its related file changes together with lazy_commit');
+    expect(msg).toContain('do not bundle independent fixes into one commit');
+    expect(msg).toContain('multiple findings need the same change, commit that change once');
+  });
+
   test('singular wording for one finding', () => {
     expect(buildReviewAutoFixMessage([FINDINGS[0]!])).toContain('found 1 issue.');
   });

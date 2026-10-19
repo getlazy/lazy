@@ -157,18 +157,20 @@ async function endOrStopBuilderSession(root: string, verb: 'end' | 'stop', expli
   }
 }
 
-// --- lazy pair / lazy shell -----------------------------------------------
+// --- lazy pair / lazy chat / lazy shell -----------------------------------
 
 /**
- * `lazy pair <task>` / `lazy shell <task>` in a bound clone: attach to the
- * task's CURRENT session on the server in that mode. The daemon decides
+ * `lazy pair <task>` / `lazy chat <task>` / `lazy shell <task>` in a bound
+ * clone: attach to the task's CURRENT session on the server in that mode —
+ * the browser's Pair, Chat and Shell tabs, spending the member's OWN
+ * credential exactly as those do. The daemon decides
  * whether the terminal may open — on a shared daemon it runs in a container
  * of the member's own, and is refused while a turn runs, before the task has
  * run one, or while another member is in — and a refusal is shown as it is.
  * Nothing is launched locally either way.
  */
 export async function commandTaskTerminalBound(
-  command: 'pair' | 'shell',
+  command: 'pair' | 'shell' | 'chat',
   root: string,
   args: string[],
 ): Promise<void> {
@@ -189,11 +191,18 @@ export async function commandTaskTerminalBound(
   const sessionId = shown.data.session?.id;
   if (!sessionId) fail(`task ${taskRef} has no session on the server yet — start it first.`);
 
+  let info;
   try {
-    await rpcAttachSession(sessionId);
+    info = await rpcAttachSession(sessionId);
   } catch (err) {
     fail(`cannot ${command} into task ${taskRef} through Lazy Teams: ${errorText(err)}`);
   }
+  // The daemon's per-mode answer for THIS member, said before any socket — the
+  // same sentence the browser shows (no Claude account connected, a turn
+  // running, an agent Pair/Chat cannot run). A refused upgrade reaches this
+  // terminal with no reason it can read.
+  const refusal = info.refusals?.[command];
+  if (refusal) fail(refusal);
   console.error(`Attached to task ${taskRef} on the server (${command}). ${DETACH_HINT} detaches.`);
   await attachAndReport(root, sessionId, command, (outcome) => {
     if (outcome.kind === 'closed') {

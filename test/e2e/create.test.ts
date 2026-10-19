@@ -4,6 +4,8 @@ import { expectSuccess, expectFailure, expectOutput, expectError, extractTaskId 
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { readTaskJson, writeTaskJson } from '../helpers/storage';
 import { REVIEW_MODE_METADATA_KEY } from '../../src/review/mode';
+import { rm } from 'fs/promises';
+import { join } from 'path';
 
 describe('lazy create', () => {
   let ctx: TestContext;
@@ -278,6 +280,24 @@ describe('lazy create --parent (started tasks)', () => {
   afterEach(async () => {
     await ctx.cleanup();
   });
+
+  test('starting a child restores an adopted parent checkout without restarting the parent', async () => {
+    const parentId = await createTask(ctx, 'Adopted parent', 'Do parent work');
+    expectSuccess(await ctx.lazyMocked(['start', parentId, '--yes'], MOCK_CLAUDE_SUCCESS));
+    expectSuccess(await ctx.lazy(['wait', parentId]));
+    const before = JSON.parse((await ctx.lazy(['show', parentId, '--json'])).stdout);
+    const childResult = await ctx.lazy(['create', '--goal', 'Child after adoption', '--parent', parentId, '--prompt', 'Do child work']);
+    expectSuccess(childResult);
+    const childId = extractTaskId(childResult.stdout);
+    const parentWorktree = join(ctx.root, '.lazy', 'worktrees', parentId);
+    await rm(parentWorktree, { recursive: true });
+    expectSuccess(await ctx.lazyMocked(['start', childId, '--yes'], MOCK_CLAUDE_SUCCESS));
+    expectSuccess(await ctx.lazy(['wait', childId]));
+    expect(ctx.git('-C', parentWorktree, 'rev-parse', 'HEAD').exitCode).toBe(0);
+    const after = JSON.parse((await ctx.lazy(['show', parentId, '--json'])).stdout);
+    expect(after.status).toBe(before.status);
+    expect(after.turns.length).toBe(before.turns.length);
+  }, 60_000);
 
   // INVARIANT: Child tasks created via `create --parent` must branch from the
   // parent's current HEAD at start time, not from main. This prevents child

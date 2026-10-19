@@ -17,6 +17,7 @@ import { getOrCreateStorage } from './rpc-handlers';
 import { syncTask } from './task-lifecycle';
 import { isLinkedTask } from '../task/linked';
 import { isSyncDispatchable } from '../task/sync-dispatch';
+import { unstartedParentOf } from '../task/unstarted-parent';
 import { memberInsideTask } from '../server/member-terminals';
 import { daemonHealthRecorder, SYNC_RETRY_LOOP } from './health-registry';
 
@@ -30,7 +31,7 @@ export interface BackoffEntry {
   /** Current attempt count (0 = first retry). */
   attempt: number;
   /** Why the last attempt did not sync — what `lazy daemon health` reports. */
-  reason?: 'fetch-failed' | 'usage-pause' | 'no-credential';
+  reason?: 'fetch-failed' | 'usage-pause' | 'no-credential' | 'runner-image' | 'waiting-for-parent' | 'branch-missing';
 }
 
 /**
@@ -64,6 +65,21 @@ const liveBackoffState = new Map<string, Map<string, BackoffEntry>>();
 /** A copy of the sync-retry loop's backoff state for a project (empty when the loop is not running). */
 export function syncRetryBackoffSnapshot(projectRoot: string): Map<string, BackoffEntry> {
   return new Map([...(liveBackoffState.get(projectRoot) ?? new Map<string, BackoffEntry>())].map(([k, v]) => [k, { ...v }]));
+}
+
+const liveNudges = new Map<string, (taskIds: string[]) => void>();
+
+/**
+ * Run a tick NOW instead of waiting for the interval, with `taskIds`' backoff
+ * cleared first — used when something they were waiting for just happened (a
+ * parent started). The tick runs in the loop's own context, outside the
+ * caller's request. Returns false when no loop runs for the project.
+ */
+export function nudgeSyncRetry(projectRoot: string, taskIds: string[] = []): boolean {
+  const nudge = liveNudges.get(projectRoot);
+  if (!nudge) return false;
+  nudge(taskIds);
+  return true;
 }
 
 /**
@@ -136,6 +152,16 @@ export async function runSyncRetryTick(
       continue;
     }
 
+    // A parent that has not started has no branch: nothing to try, and nothing
+    // to fetch. A local check (store + `git rev-parse`), no backoff, logged at
+    // debug only — the parent's start nudges this loop (./parent-started-sync.ts).
+    if (await unstartedParentOf(storage, task, projectRoot)) {
+      backoffState.set(task.id, { nextRetryAt: 0, attempt: 0, reason: 'waiting-for-parent' });
+      result.skipped.push(shortTaskId);
+      logger.debug(`Sync retry: ${shortTaskId} waiting for its parent to start`);
+      continue;
+    }
+
     result.attempted.push(shortTaskId);
 
     try {
@@ -143,7 +169,14 @@ export async function runSyncRetryTick(
       // The call answered, whatever it said: the run of throws is over.
       failureState.delete(task.id);
 
-      if (syncResult.status === 'held_by_member') {
+      if (syncResult.status === 'waiting_for_parent') {
+        // The parent has not started: nothing to fetch, nothing failed. No
+        // backoff — starting the parent syncs this task at once
+        // (./parent-started-sync.ts); this loop is only the backstop.
+        backoffState.delete(task.id);
+        result.skipped.push(shortTaskId);
+        logger.debug(`Sync retry: ${shortTaskId} waiting for its parent to start`);
+      } else if (syncResult.status === 'held_by_member') {
         // A member got in between the check above and the sync's lock.
         result.heldByMember.push(shortTaskId);
         logger.debug(`Sync retry: ${shortTaskId} held by a member's terminal, waiting`);
@@ -155,7 +188,11 @@ export async function runSyncRetryTick(
         backoffState.set(task.id, {
           nextRetryAt: now + delay,
           attempt,
-          reason: syncResult.usagePauseHeld ? 'usage-pause' : syncResult.credentialHeld ? 'no-credential' : 'fetch-failed',
+          reason: syncResult.usagePauseHeld ? 'usage-pause'
+            : syncResult.credentialHeld ? 'no-credential'
+            : syncResult.runnerImageHeld ? 'runner-image'
+            : syncResult.remoteBranchMissing ? 'branch-missing'
+            : 'fetch-failed',
         });
         result.backedOff.push(shortTaskId);
         // Said as what it is: a held sync is not a failed fetch, and a log that
@@ -164,7 +201,11 @@ export async function runSyncRetryTick(
           ? 'held by the usage pause (its conflict needs an agent; it runs after the window resets)'
           : syncResult.credentialHeld
             ? 'held: its conflict needs an agent, and there is no model credential for its profile'
-            : 'fetch failed';
+            : syncResult.runnerImageHeld
+              ? "held until the project's runner image is ready (its conflict needs an agent)"
+              : syncResult.remoteBranchMissing
+                ? 'its upstream branch does not exist on the remote yet'
+                : 'fetch failed';
         logger.info(`Sync retry: ${shortTaskId} ${why}, backoff ${Math.round(delay / 1000)}s (attempt ${attempt + 1})`);
       } else if (syncResult.status === 'up_to_date' || syncResult.status === 'sync_launched') {
         // Success — reset backoff
@@ -246,6 +287,23 @@ export function startSyncRetryLoop(
     }
   };
 
+  // The nudge worker: created HERE, at loop start, and awaiting a promise a
+  // nudge resolves. An awaiting continuation runs in its awaiter's async
+  // context, so a nudge sent from inside a member's request (a parent's start)
+  // runs this tick in the loop's own daemon context — never as that member.
+  let wake: (() => void) | null = null;
+  void (async () => {
+    while (!stopped) {
+      await new Promise<void>((resolve) => { wake = resolve; });
+      wake = null;
+      if (!stopped) await doTick();
+    }
+  })();
+  liveNudges.set(projectRoot, (taskIds) => {
+    for (const id of taskIds) backoffState.delete(id);
+    wake?.();
+  });
+
   // First tick after a short delay (let reconcile run first)
   const initialTimeout = setTimeout(doTick, 2_000);
 
@@ -256,6 +314,8 @@ export function startSyncRetryLoop(
 
   return () => {
     stopped = true;
+    wake?.();
+    liveNudges.delete(projectRoot);
     clearTimeout(initialTimeout);
     clearInterval(intervalId);
     if (liveBackoffState.get(projectRoot) === backoffState) liveBackoffState.delete(projectRoot);

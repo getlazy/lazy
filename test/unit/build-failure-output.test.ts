@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { extractBuildFailureOutput } from '../../src/capture/claude';
+import { buildFailureMessage, extractBuildFailureOutput } from '../../src/capture/claude';
 import { waitForInterveningBuildOutput } from '../../src/upgrade/interactive-prompt';
 import { BackgroundImageBuild } from '../../src/upgrade/background-image-build';
 
@@ -65,6 +65,19 @@ describe('extractBuildFailureOutput', () => {
   });
 });
 
+describe('buildFailureMessage', () => {
+  test('includes the failing BuildKit step in the error delivered to callers', () => {
+    const stderr = '#12 0.2 error: missing dependency\n#12 ERROR: process failed\n  12 | Dockerfile excerpt';
+    expect(buildFailureMessage(1, '', stderr)).toContain('error: missing dependency');
+    expect(buildFailureMessage(1, '', stderr)).not.toContain('Dockerfile excerpt');
+  });
+
+  test('uses classic builder stdout and explains a silent failure', () => {
+    expect(buildFailureMessage(2, 'step failed', '')).toContain('step failed');
+    expect(buildFailureMessage(1, '', '')).toContain('produced no output');
+  });
+});
+
 describe('waitForInterveningBuildOutput', () => {
   // INVARIANT: a failed background build aborts the upgrade before any "Image build finished" prompt.
   test('throws when the build failed', async () => {
@@ -77,5 +90,18 @@ describe('waitForInterveningBuildOutput', () => {
     });
     await build.awaitSettled();
     await expect(waitForInterveningBuildOutput(build)).rejects.toThrow('Container build failed');
+  });
+});
+
+describe('buildFailureMessage names the Dockerfile', () => {
+  // INVARIANT: a failed build names the Dockerfile it was building. The error reaches the Teams "builder could not be started" page, where "Unknown flag: network" alone does not say whose Dockerfile it was.
+  test('names an adopted worktree Dockerfile and its context exactly once', () => {
+    const msg = buildFailureMessage(1, '', 'dockerfile parse error line 494: Unknown flag: network', '/wt/Dockerfile.lazy (context /wt)');
+    expect(msg).toContain('Building: /wt/Dockerfile.lazy (context /wt)\n');
+    expect(msg.split('context').length - 1).toBe(1);
+    expect(msg).toContain('Unknown flag: network');
+  });
+  test('names the embedded default Dockerfile', () => {
+    expect(buildFailureMessage(1, '', 'boom', 'the embedded default Dockerfile')).toContain('Building: the embedded default Dockerfile\n');
   });
 });

@@ -70,6 +70,7 @@ You have five categories of lazy MCP tools:
 - Run build or test commands that produce output files in the repo
 - Manage branch protection: `lazy protect <branch|task> on|off` (opt-in gating of
   merges) is CLI-only and human-only by design, and a protected merge completes only
-  at the engineer's own `lazy accept` (it prompts for the approval passphrase). Tell
+  at the engineer's own `lazy accept` (it prompts for the approval passphrase) — or, in
+  Lazy Teams, when a signed-in member presses Accept on the task there. Tell
   the engineer about `lazy protect` when they ask about protecting `main` — then let
   them run it themselves.

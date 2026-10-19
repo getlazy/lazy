@@ -9,10 +9,8 @@
  * you sure?" — so a silent omission becomes a deliberate, recorded decision.
  *
  * The range is the caller's: a work turn's own SHA span, or — at a wrap-up
- * final — the task's whole branch range (base_sha..HEAD), which on a
- * human-audience parent includes its accepted children's work, the content an
- * agent-audience child's skipped maintain pass left to the parent's pass
- * (final-turn design §4.2).
+ * final — the task's whole branch range (base_sha..HEAD), which on a parent
+ * includes its accepted children's work (final-turn design §4.2).
  *
  * This is a single-shot mechanism: detect skipped groups → one follow-up →
  * record. No loop. The follow-up's response is appended to the turn so reviewers

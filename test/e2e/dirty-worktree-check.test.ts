@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
@@ -127,6 +127,26 @@ describe('dirty worktree check — hard gate for accept/close', () => {
     expectError(acceptResult, 'nested git repositories');
     expectError(acceptResult, 'sub/.git');
     expectError(acceptResult, 'lazy doctor --repair-git-pointers');
+  });
+
+  // INVARIANT: a git clone codex's plugin sync left in the task's Codex home
+  // is refused at accept like any other nested repository — lazy never deletes
+  // it on its own; the agent or `lazy doctor --repair-git-pointers` clears it.
+  test('accept refuses a leftover codex plugin clone like any nested repository', async () => {
+    const taskId = await createTask(ctx, 'Accept test with codex plugin clone', 'Add a file');
+    await startAndReconcile(ctx, taskId);
+
+    const pluginsDir = join(worktreePathFor(ctx.root, taskId), '.lazy-task-sandbox', '.codex', '.tmp', 'plugins');
+    mkdirSync(join(pluginsDir, '.git'), { recursive: true });
+    writeFileSync(join(pluginsDir, '.git', 'HEAD'), 'ref: refs/heads/main\n');
+    writeFileSync(join(pluginsDir, '.git', 'config'), '[core]\n\tbare = false\n');
+    seedFinal(ctx, taskId);
+
+    const acceptResult = await ctx.lazy(['accept', taskId]);
+    expectFailure(acceptResult);
+    expectError(acceptResult, '.lazy-task-sandbox/.codex/.tmp/plugins/.git');
+    expectError(acceptResult, 'lazy doctor --repair-git-pointers');
+    expect(existsSync(join(pluginsDir, '.git', 'HEAD'))).toBe(true);
   });
 
   // ========== CLOSE TESTS ==========

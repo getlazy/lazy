@@ -6,7 +6,7 @@ import { join } from 'path';
  * INVARIANT: `test/mocks/claude.ts` must export every symbol that any file in
  * `src/` imports from `src/capture/claude`.
  *
- * The mock REPLACES the whole module via bun `--preload` (see CLAUDE.md, "Two
+ * The mock REPLACES the whole module via bun `--preload` (see AGENTS.md, "Two
  * agent seams"). Bun resolves the aliased module's named exports eagerly, so a
  * source file importing a symbol the mock lacks does not degrade — every
  * module-mock e2e suite that touches that import chain dies at load with

@@ -1,3 +1,4 @@
+import { customImageNotReady } from '../capture/custom-image-gate';
 import { withLaunchInFlight } from './launch-in-flight';
 /**
  * DockerRunner — Runner implementation backed by Docker containers.
@@ -7,7 +8,9 @@ import { withLaunchInFlight } from './launch-in-flight';
  */
 
 import type { SandboxConfig } from '../capture/claude';
+import { lazyDataDirMaskArgs, resolveLazyDataDir } from '../capture/lazy-dir-mask';
 import type { AgentResponse } from '../types';
+import type { AgentExecArgs } from '../agent/interface';
 import type { Runner, RunInfo, FollowHandle, HealthCheck, RunStream, DiagnoseOptions, RunInfoProbe } from './types';
 import type { PhaseNotify } from '../daemon/progress';
 import { parsePortBindings, type PortBinding } from '../serve/ports';
@@ -26,6 +29,7 @@ import {
   probesUpstream,
   ANTHROPIC_DEFAULT_TARGET,
 } from '../utils/role-target';
+import { DamagedImageError, isDamagedLayerError, withDamagedImageRepair } from '../docker/damaged-image';
 
 import {
   checkDocker,
@@ -33,6 +37,7 @@ import {
   ensureAgentBinary,
   containerNameForTask,
   launchSupervisorAsync,
+  runnerImageRepairDeps,
   runClaude,
   getLaunchAuthEnvVars,
   isContainerRunning,
@@ -84,10 +89,13 @@ import {
 } from '../oneshot/args';
 import { execBoundedOneshot } from '../oneshot/exec';
 import { buildBuilderHeadlessClaudeArgs, builderHeadlessModel, parseBuilderHeadlessStdout } from './builder-headless';
+import { assertArgvBounded } from '../agent/argv-safety';
 import { detectBuilderLaunchSessionId } from '../builder/session-detect';
 import { ensureOneshotAgentHome } from '../oneshot/state-dir';
 import dockerBuilderInstructions from '../prompts/docker-builder-runner-instructions.md' with { type: 'text' };
 import dockerAgentInstructions from '../prompts/docker-agent-instructions.md' with { type: 'text' };
+import taskImageNotBuilt from '../prompts/task-image-not-built.md' with { type: 'text' };
+import { autoBuildsRootDockerfile } from '../config/managed-mode';
 import { writeToolPermissions } from '../mcp/config';
 import { READ_ONLY_TOOL_NAMES } from '../mcp/tool-access';
 import { isToolForRole } from '../mcp/tool-roles';
@@ -189,6 +197,7 @@ export function oneshotLaunchIdentity(
     taskId: taskId ?? null,
     label: taskId ? `oneshot:${lazyRoot}:${taskId}` : `oneshot:${lazyRoot}`,
     profile,
+    projectRoot: lazyRoot,
   };
 }
 
@@ -205,6 +214,11 @@ export function buildOneshotDockerArgs(opts: {
   containerName: string;
   lazyRoot: string;
   repoAccess: OneshotRepoAccess;
+  /**
+   * The project's lazy data dir, masked under a read-only repo mount
+   * (src/capture/lazy-dir-mask.ts). null/absent when there is none.
+   */
+  lazyDataDir?: string | null;
   agentStateHome: string;
   imageName: string;
   authEnvVars: { key: string; value: string }[];
@@ -214,10 +228,12 @@ export function buildOneshotDockerArgs(opts: {
   model?: string;
   /** Effort fixed by the one-shot's KIND. See OneshotRequest.effort. */
   effort?: string;
-}): string[] {
+}): AgentExecArgs {
   const agentConfigDir = getAgentPackaging(opts.harness).configDirName();
-  return [
+  const agentArgs = buildOneshotAgentArgv(opts.harness, opts.prompt, opts.model, opts.effort);
+  const args = [
     opts.binary, 'run', '--rm', '--init',
+    ...(agentArgs.stdinInput === undefined ? [] : ['-i']),
     '--name', opts.containerName,
     '--label', `${PROJECT_LABEL}=${opts.lazyRoot}`,
     // Marks this container as a one-shot rather than a task run, so anything
@@ -230,13 +246,56 @@ export function buildOneshotDockerArgs(opts: {
     // this is what makes the accept-time commit-on-main bug structurally
     // impossible rather than merely disallowed by argv.
     ...(opts.repoAccess === 'read-only'
-      ? ['-v', `${opts.lazyRoot}:${opts.lazyRoot}:ro`, '-w', opts.lazyRoot]
+      ? ['-v', `${opts.lazyRoot}:${opts.lazyRoot}:ro`, ...lazyDataDirMaskArgs(opts.lazyDataDir ?? null), '-w', opts.lazyRoot]
       : []),
     '-v', `${opts.agentStateHome}:/home/user/${agentConfigDir}`,
     ...opts.authEnvVars.flatMap(v => ['-e', `${v.key}=${v.value}`]),
     opts.imageName,
-    ...buildOneshotAgentArgv(opts.harness, opts.prompt, opts.model, opts.effort),
+    ...agentArgs,
   ];
+  return Object.assign(args, agentArgs.stdinInput === undefined ? {} : { stdinInput: agentArgs.stdinInput });
+}
+
+export interface DaemonProbeOptions {
+  /** Deadline for one `info`. */
+  timeoutMs?: number;
+  attempts?: number;
+  /** Waits between attempts, in ms. */
+  backoffMs?: number[];
+}
+
+/**
+ * Is the container daemon answering? One `<binary> info` per attempt, retried
+ * with backoff before giving up.
+ *
+ * INVARIANT: a slow-but-alive daemon is not a fault. A guest dockerd busy
+ * building an image on a slow microVM misses a single 10s deadline, and doctor
+ * then told a project its environment "isn't working" while it was building.
+ * Only failing every attempt reports a failure.
+ */
+export async function probeDaemonResponsive(
+  binary: string,
+  options: DaemonProbeOptions = {},
+): Promise<{ responsive: boolean; attempts: number; elapsedMs: number }> {
+  const timeout = options.timeoutMs ?? 10_000;
+  const attempts = options.attempts ?? 3;
+  const backoff = options.backoffMs ?? [2_000, 4_000];
+  const startedAt = Date.now();
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const proc = spawn([binary, 'info'], { stdout: 'ignore', stderr: 'ignore', timeout });
+      if ((await proc.exited) === 0) {
+        return { responsive: true, attempts: attempt, elapsedMs: Date.now() - startedAt };
+      }
+    } catch {
+      // A spawn that throws is the same answer as one that fails: this attempt
+      // got no reply. The final failure is reported with every attempt counted.
+    }
+    if (attempt < attempts) {
+      await new Promise(resolve => setTimeout(resolve, backoff[attempt - 1] ?? backoff[backoff.length - 1] ?? 0));
+    }
+  }
+  return { responsive: false, attempts, elapsedMs: Date.now() - startedAt };
 }
 
 export class DockerRunner implements Runner {
@@ -260,9 +319,14 @@ export class DockerRunner implements Runner {
    * ahead of the first launch. Both are idempotent and cached; this only moves
    * a cold build out of whichever launch would otherwise pay for it
    * (src/daemon/launch-warmup.ts).
+   *
+   * The image prepared here is lazy's DEFAULT runner image. A project's custom
+   * image is the daemon's boot build (src/daemon/runner-image.ts), which owns
+   * its state; the default one is what builders and confirmed agents fall back
+   * to while that build runs, so it is worth having first.
    */
   async prepareLaunchInputs(notify?: (detail: string) => void): Promise<void> {
-    await Promise.all([ensureImage(this.binary, notify ? { notify } : undefined), ensureAgentBinary()]);
+    await Promise.all([ensureImage(this.binary, { useDefaultImage: true, ...(notify ? { notify } : {}) }), ensureAgentBinary()]);
   }
 
   /** Set the per-role model targets (builder vs agent backends). */
@@ -359,8 +423,24 @@ export class DockerRunner implements Runner {
     }
   }
 
+  /**
+   * Builder-role launches run on lazy's DEFAULT image while the project's own
+   * image is not ready. In the daemon that is read from its boot build; the
+   * CLI's `lazy builder` sets it after asking the daemon, and prints a banner.
+   */
+  private builderOnDefaultImage = false;
+
+  /** `lazy builder`: the daemon says the project's image is not ready. */
+  useDefaultImageForBuilder(): void {
+    this.builderOnDefaultImage = true;
+  }
+
+  private async builderImageOptions(): Promise<{ useDefaultImage?: boolean }> {
+    return this.builderOnDefaultImage || (await customImageNotReady()) ? { useDefaultImage: true } : {};
+  }
+
   async ensureReady(): Promise<void> {
-    await ensureImage(this.binary);
+    await this.builderImageOptions().then((o) => ensureImage(this.binary, o));
     await ensureAgentBinary();
   }
 
@@ -386,7 +466,7 @@ export class DockerRunner implements Runner {
     // directories the host daemon invented. See src/runner/sibling-containers.ts.
     assertSiblingContainerLaunchSupported('start a task turn');
     // Fail hard before launch if the agent's backend is unreachable — never
-    // silently fall back to a different backend (CLAUDE.md: fail hard).
+    // silently fall back to a different backend (AGENTS.md: fail hard).
     await preflightRoleTarget('agent', this.agentTarget());
     // The PROFILE, not the harness: the launch mints its credential grant
     // against this name, and that grant is how the proxy knows which upstream
@@ -535,10 +615,10 @@ export class DockerRunner implements Runner {
       containerName,
       lazyRoot,
       repoAccess,
+      lazyDataDir: repoAccess === 'read-only' ? await resolveLazyDataDir(lazyRoot) : null,
       agentStateHome,
-      // ensureImage resolves the PROFILE to the harness it must bake in — the
-      // builder's, so the image actually carries the binary this argv invokes.
-      imageName: await ensureImage(this.binary, { agentId: target.profile }),
+      // The default image carries every agent CLI, so the builder's harness is in it.
+      imageName: await ensureImage(this.binary, await this.builderImageOptions()),
       authEnvVars,
       harness,
       prompt: req.prompt,
@@ -998,7 +1078,7 @@ export class DockerRunner implements Runner {
     const what = `${pkg.binaryName()} in the runner image`;
 
     try {
-      const image = await resolveImageName(lazyRoot, this._agentProfile);
+      const image = await resolveImageName(lazyRoot);
       if (!(await localImageExists(image, this.binary))) {
         return [{
           state: 'ok',
@@ -1007,16 +1087,19 @@ export class DockerRunner implements Runner {
       }
       const proc = spawn(
         [this.binary, 'run', '--rm', '--entrypoint', pkg.binaryName(), image, '--version'],
-        { stdout: 'pipe', stderr: 'ignore', timeout: 20_000 },
+        { stdout: 'pipe', stderr: 'pipe', timeout: 20_000 },
       );
-      const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
+      ]);
       if (exitCode !== 0) {
         return [{
           state: 'fail',
           what,
+          problem: `${pkg.binaryName()} in the runner image doesn't run`,
           reason:
             `\`${pkg.binaryName()} --version\` failed inside ${image}. The image is present but ` +
-            `its agent binary is not usable — rebuild it with \`lazy upgrade\`.`,
+            `its agent binary is not usable — rebuild it with \`lazy upgrade\`.` + (stderr.trim() ? `\n\nDocker said: ${stderr.trim().slice(-500)}` : ''),
         }];
       }
       return [{ state: 'ok', what: `${what}: ${stdout.trim()} (${image})` }];
@@ -1053,36 +1136,38 @@ export class DockerRunner implements Runner {
         const url = this.binary === 'podman'
           ? 'https://podman.io/docs/installation'
           : 'https://docs.docker.com/get-docker/';
-        results.push({ state: 'fail', what: `${name} installed`, reason: `${name} is not installed. Install it: ${url}` });
+        results.push({ state: 'fail', what: `${name} installed`, problem: `${name} isn't installed on this machine`, reason: `${name} is not installed. Install it: ${url}` });
         return results; // No point checking daemon if binary is missing
       }
     } catch {
       const name = this.binary === 'podman' ? 'Podman' : 'Docker';
-      results.push({ state: 'fail', what: `${name} installed`, reason: `${name} is not installed.` });
+      results.push({ state: 'fail', what: `${name} installed`, problem: `${name} isn't installed on this machine`, reason: `${name} is not installed.` });
       return results;
     }
 
-    // Check daemon running
+    // Check daemon running. A dockerd busy with an image build on a slow
+    // machine can miss one `info` deadline while being perfectly alive, so the
+    // probe retries briefly before it reports a failure (see probeDaemonResponsive).
     let daemonRunning = false;
-    try {
-      const proc = spawn([this.binary, 'info'], {
-        stdout: 'ignore', stderr: 'ignore', timeout,
+    const daemonName = this.binary === 'podman' ? 'Podman' : 'Docker';
+    const probe = await probeDaemonResponsive(
+      this.binary,
+      options.launchProbes === false ? { attempts: 1 } : {},
+    );
+    if (probe.responsive) {
+      results.push({ state: 'ok', what: `${daemonName} daemon running` });
+      daemonRunning = true;
+    } else {
+      const problem = `${daemonName} isn't responding`;
+      const tried = `Tried ${probe.attempts} time${probe.attempts === 1 ? '' : 's'} over ${Math.round(probe.elapsedMs / 1000)}s.`;
+      results.push({
+        state: 'fail',
+        what: `${daemonName} daemon running`,
+        problem,
+        reason: this.binary === 'podman'
+          ? `Podman is not responsive (${tried}) Start the Podman machine or run: podman machine start`
+          : `Docker daemon is not responsive (${tried}) Start Docker Desktop or run: sudo systemctl start docker`,
       });
-      const exitCode = await proc.exited;
-      if (exitCode === 0) {
-        const name = this.binary === 'podman' ? 'Podman' : 'Docker';
-        results.push({ state: 'ok', what: `${name} daemon running` });
-        daemonRunning = true;
-      } else {
-        if (this.binary === 'podman') {
-          results.push({ state: 'fail', what: 'Podman daemon running', reason: 'Podman is not responsive. Start the Podman machine or run: podman machine start' });
-        } else {
-          results.push({ state: 'fail', what: 'Docker daemon running', reason: 'Docker daemon is not responsive. Start Docker Desktop or run: sudo systemctl start docker' });
-        }
-      }
-    } catch {
-      const name = this.binary === 'podman' ? 'Podman' : 'Docker';
-      results.push({ state: 'fail', what: `${name} daemon running`, reason: `${name} is not responsive.` });
     }
 
     // The image-harness probe needs a working daemon (`docker run` / `inspect`).
@@ -1105,7 +1190,7 @@ export class DockerRunner implements Runner {
       if (check.reachable) {
         results.push({ state: 'ok', what: `[${role}] ${target.profile} reachable at ${check.endpoint}` });
       } else {
-        results.push({ state: 'fail', what: `[${role}] ${target.profile} reachable`, reason: check.reason });
+        results.push({ state: 'fail', what: `[${role}] ${target.profile} reachable`, problem: `[${role}] ${target.profile} is unreachable`, reason: check.reason });
       }
     }
 
@@ -1115,7 +1200,10 @@ export class DockerRunner implements Runner {
   // ----- Prompt support -----
 
   getAgentInstructions(): string {
-    return dockerAgentInstructions;
+    // On a backend that never auto-builds a project's Dockerfile.lazy (Lazy
+    // Teams' local-docker), the task-image recipe's "applies to the next task"
+    // is not true — the agent must say so rather than promise it.
+    return autoBuildsRootDockerfile() ? dockerAgentInstructions : dockerAgentInstructions + taskImageNotBuilt;
   }
 
   getBuilderInstructions(): string {
@@ -1167,7 +1255,7 @@ export class DockerRunner implements Runner {
     await preflightRoleTarget('builder', this.builderTarget());
 
     const [imageName, agentBinaryPath] = await Promise.all([
-      ensureImage(this.binary),
+      this.builderImageOptions().then((o) => ensureImage(this.binary, o)),
       ensureAgentBinary(),
     ]);
 
@@ -1405,7 +1493,7 @@ export class DockerRunner implements Runner {
     await preflightRoleTarget('builder', this.builderTarget());
 
     const [imageName, agentBinaryPath] = await Promise.all([
-      ensureImage(this.binary),
+      this.builderImageOptions().then((o) => ensureImage(this.binary, o)),
       ensureAgentBinary(),
     ]);
 
@@ -1452,7 +1540,12 @@ export class DockerRunner implements Runner {
     }
 
     const scratchDir = await ensureBuilderScratchDir(lazyRoot);
-    const claudeArgs = buildBuilderHeadlessClaudeArgs(systemPrompt, prompt, resumeSessionId, builderHeadlessModel(config, this.builderTarget()));
+    // Prompt on stdin, system prompt in a file: never argv (src/agent/argv-safety.ts).
+    // The file sits in tmpDir, inside the data dir the container mounts at
+    // the identical path, so the in-container path is the host path.
+    const promptFile = join(tmpDir, `builder-headless-${builderId}.txt`);
+    await writeFileAsync(promptFile, systemPrompt);
+    const claudeArgs = buildBuilderHeadlessClaudeArgs(promptFile, prompt, resumeSessionId, builderHeadlessModel(config, this.builderTarget()));
     const launchedAtMs = Date.now();
 
     const dockerArgs = buildBuilderDockerArgs({
@@ -1470,7 +1563,7 @@ export class DockerRunner implements Runner {
       mcpWrapperPath,
       authEnvVars,
       imageName,
-      promptFile: join(tmpDir, `builder-headless-${builderId}.txt`),
+      promptFile,
       daemonConfigPath: useDaemonProxy ? daemonConfigPath : undefined,
       claudeExtraArgs: [],
       debug: debug ?? false,
@@ -1485,7 +1578,8 @@ export class DockerRunner implements Runner {
       console.log('[DEBUG] Running headless builder:', redactSecrets(dockerArgs).join(' '));
     }
 
-    const proc = spawn(dockerArgs, { stdout: 'pipe', stderr: 'pipe', timeout: 0 });
+    assertArgvBounded(dockerArgs, 'Headless builder Claude Code');
+    const proc = spawn(dockerArgs, { stdin: new Blob([prompt]), stdout: 'pipe', stderr: 'pipe', timeout: 0 });
     const timeoutMs = DEFAULT_ONESHOT_TIMEOUT_MS;
     let timedOut = false;
     const timer = timeoutMs > 0
@@ -1531,7 +1625,7 @@ export class DockerRunner implements Runner {
 
     const tempFiles = [
       builderConfigPath, containerConfigFile, mergedConfigFile, neutralCredentialStore,
-      mcpWrapperPath,
+      mcpWrapperPath, promptFile,
     ];
     for (const tmpFile of tempFiles) {
       try { unlinkSync(tmpFile); } catch { /* best effort */ }
@@ -1553,7 +1647,20 @@ export class DockerRunner implements Runner {
    * src/daemon/builder-sessions.ts, and
    * docs/design/actor-identity-and-remote-clients.md §5.5).
    */
+  /**
+   * A builder whose image turns out to be damaged (its layers cannot be
+   * extracted) gets that image removed, rebuilt and its launch retried once —
+   * see src/docker/damaged-image.ts.
+   */
   async launchBuilderDetached(params: LaunchBuilderDetachedParams): Promise<LaunchBuilderDetachedResult> {
+    const trace = params.trace;
+    return withDamagedImageRepair(
+      { ...runnerImageRepairDeps(this.binary), subject: 'builder', ...(trace ? { notify: (d: string) => trace.note(d) } : {}) },
+      () => this.launchBuilderDetachedOnce(params),
+    );
+  }
+
+  private async launchBuilderDetachedOnce(params: LaunchBuilderDetachedParams): Promise<LaunchBuilderDetachedResult> {
     const { lazyRoot, systemPrompt, builderId, daemonConfigPath, projects, authEnvVars, homeDirAbs, debug } = params;
     let resumeSessionId = params.resumeSessionId;
     const trace = params.trace;
@@ -1566,10 +1673,11 @@ export class DockerRunner implements Runner {
     // its narration goes into the trail too, not only its duration.
     const [imageName, agentBinaryPath] = await Promise.all([
       phase('container image', () => ensureImage(this.binary, trace ? {
+        useDefaultImage: params.useDefaultImage,
         // Build output and heartbeats are already logged by the build itself;
         // only the decisions (up to date, rebuilding because…, waiting) go here.
         notify: (d) => { if (!/^(building \S+: |still building )/.test(d)) trace.note(`image: ${d}`); },
-      } : undefined)),
+      } : { useDefaultImage: params.useDefaultImage })),
       phase('agent binary', () => ensureAgentBinary()),
     ]);
 
@@ -1580,7 +1688,7 @@ export class DockerRunner implements Runner {
     // This method runs in the DAEMON's event loop, not a short-lived CLI
     // process (unlike launchBuilderInteractive below) — a sync fs call here
     // stalls the reconciler, every HTTP handler, and every other project's
-    // RPCs for as long as it takes (CLAUDE.md: sync fs is only for CLI
+    // RPCs for as long as it takes (AGENTS.md: sync fs is only for CLI
     // startup, exit handlers, and test setup). fs/promises throughout.
     // Per-launch files go in a directory under the MEMBER's home, never
     // <dataDir>/tmp: every builder container mounts the data dir read-write,
@@ -1697,10 +1805,7 @@ export class DockerRunner implements Runner {
     const { resolveBuilderModel } = await import('../agent/agent-model');
     const builderTarget = this.builderTarget();
     const builderModel = resolveBuilderModel(config, { harness: builderTarget.harness, model: builderTarget.model });
-    const claudeExtraArgs = [
-      ...(resumeSessionId ? ['--resume', resumeSessionId] : []),
-      '--model', builderModel,
-    ];
+    const claudeExtraArgs = detachedBuilderClaudeArgs(builderModel, resumeSessionId);
 
     const dockerArgs = buildBuilderDockerArgs({
       binary: this.binary,
@@ -1744,6 +1849,9 @@ export class DockerRunner implements Runner {
       ]);
       if (exitCode !== 0) {
         const detail = stderr.trim() || stdout.trim();
+        if (isDamagedLayerError(detail)) {
+          throw new DamagedImageError(imageName, `Failed to start detached builder session (exit ${exitCode}): ${detail.slice(0, 500)}`);
+        }
         throw new Error(
           detail
             ? `Failed to start detached builder session (exit ${exitCode}): ${detail.slice(0, 500)}`
@@ -1752,7 +1860,7 @@ export class DockerRunner implements Runner {
       }
     });
 
-    return { containerName: `lazy-builder-${builderId}`, resumed: resumeSessionId ?? null };
+    return { containerName: `lazy-builder-${builderId}`, resumed: resumeSessionId ?? null, imageName };
   }
 }
 
@@ -1818,6 +1926,10 @@ export interface BuilderDockerArgsParams {
  * (like Claude Code's trust prompt TUI) can hang in Podman after terminal mode
  * switches — see https://github.com/google-gemini/gemini-cli/issues/17275.
  */
+export function detachedBuilderClaudeArgs(model: string, resumeSessionId?: string | null): string[] {
+  return ['--dangerously-skip-permissions', ...(resumeSessionId ? ['--resume', resumeSessionId] : []), '--model', model];
+}
+
 export function buildBuilderDockerArgs(params: BuilderDockerArgsParams): string[] {
   const {
     binary, builderId, lazyRoot, dataDir, scratchDir, containerConfigFile, agentBinaryPath,
@@ -1850,7 +1962,8 @@ export function buildBuilderDockerArgs(params: BuilderDockerArgsParams): string[
     // `-i`/`-t` gives it neither, so the TUI hits EOF immediately and the
     // container exits within seconds. `-i -t` is also what a later `docker
     // attach` requires to have anything to attach to.
-    ...(detached ? ['-d', '-i', '-t'] : [...(interactive ? ['-it'] : []), '--rm']),
+    // A headless turn reads its prompt from stdin, so it needs `-i` (no tty).
+    ...(detached ? ['-d', '-i', '-t'] : [...(interactive ? ['-it'] : ['-i']), '--rm']),
     '--name', `lazy-builder-${builderId}`,
     // Scope this container to the project. Other projects' `lazy upgrade`,
     // discovery, and cleanup commands filter on this label to avoid

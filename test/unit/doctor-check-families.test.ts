@@ -9,7 +9,8 @@ const SWEEP = join(import.meta.dir, '../../src/doctor/sweep.ts');
 
 /** Every label the sweep spells as a literal: `label: '…'`, `label: \`…\``, `const label = '…'`. */
 async function sweepLabels(): Promise<string[]> {
-  const src = await readFile(SWEEP, 'utf-8');
+  // Progress-checklist phase headings (`{ id: 'git', label: '…' }`) are not checks.
+  const src = (await readFile(SWEEP, 'utf-8')).replace(/\{ id: '[a-z]+', label: '[^']+'/g, '');
   const labels = new Set<string>();
   const patterns = [/label: '([^']+)'/g, /label: `([^`$]+)/g, /const label = '([^']+)'/g];
   for (const re of patterns) {
@@ -57,10 +58,10 @@ describe('doctor check families', () => {
   });
 
   test('structured checks carry the classification', () => {
-    const s = toStructuredCheck({ ok: false, label: 'Disk space adequate', detail: 'low' });
+    const s = toStructuredCheck({ ok: false, label: 'Disk space adequate', problem: 'Disk space is low', detail: 'low' });
     expect(s).toMatchObject({ family: 'disk-space', remedyKind: 'host', impact: 'work', status: 'error' });
     const o = toStructuredCheck({
-      ok: false, label: 'Docker daemon running', detail: 'down',
+      ok: false, label: 'Docker daemon running', problem: 'Docker isn\'t responding', detail: 'down',
       classification: { family: 'runner-health', remedyKind: 'host', impact: 'work' },
     });
     expect(o.family).toBe('runner-health');

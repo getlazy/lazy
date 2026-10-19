@@ -15,7 +15,7 @@
  * A comment never becomes a turn on its own — that is the legacy `Comment`
  * behaviour this model exists to replace.
  *
- * The load-bearing rule here is CLAUDE.md's "never lose human feedback": a
+ * The load-bearing rule here is AGENTS.md's "never lose human feedback": a
  * review comment is persisted through Storage BEFORE any dispatch is attempted,
  * a failed ask downgrades to a visible error state rather than removing the
  * comment, and comments are marked delivered only once the unblock turn has
@@ -27,9 +27,10 @@ import { launchAskTaskAwaited, launchUnblockTask, acceptTask, syncTask } from '.
 import type { ProgressEmitter } from './progress';
 import { logger } from '../utils/logger';
 import { saveRecoveryFileAsync, removeRecoveryFileAsync } from '../utils/recovery';
-import type { ActorInput, FileViolation, ReviewComment, ReviewCommentSide, ReviewCommentIntent, RaisedItemResolution, RaisedItemResolveAction, ReviewDraftState, ReviewDraftPatch } from '../types';
+import type { ActorInput, FileViolation, ReviewComment, ReviewCommentSide, ReviewCommentIntent, RaisedItemResolution, RaisedItemResolveAction, ReviewDraftState, ReviewDraftPatch, Task } from '../types';
 import { isBlockedStatus } from '../types';
 import { descendantCounts } from '../task-target';
+import { mapLimit, STORE_SCAN_CONCURRENCY } from '../utils/map-limit';
 import { emptyReviewDraft } from '../review-draft';
 import { resolveOneRaisedItem } from './raised-items';
 import { latestViolationTurn } from '../utils/turns';
@@ -142,6 +143,44 @@ export { isPendingDelivery };
  */
 export { buildUnblockPrompt };
 
+/**
+ * One queue row per blocked task. The comment file and the session are read
+ * together, and several tasks at once: the review page's cost was this loop
+ * awaited one task at a time.
+ */
+export async function reviewQueueEntries(
+  tasks: readonly Task[],
+  descendants: ReadonlyMap<string, number>,
+  storage: {
+    getTaskReviewComments(taskId: string): Promise<ReviewComment[]>;
+    getSessionByTaskId(taskId: string): Promise<{ last_interaction_at: number | null } | null>;
+  },
+): Promise<ReviewQueueEntry[]> {
+  return mapLimit(tasks, STORE_SCAN_CONCURRENCY, async (task) => {
+    const [comments, session] = await Promise.all([
+      storage.getTaskReviewComments(task.id),
+      storage.getSessionByTaskId(task.id),
+    ]);
+    const unanswered = comments.filter(
+      (c) => c.role === 'human' && c.ask_state === 'pending',
+    ).length;
+    return {
+      id: task.id,
+      code: task.code ?? null,
+      goal: task.goal,
+      status: task.status,
+      type: task.type,
+      updatedAt: task.completed_at ?? task.created_at,
+      hasSession: !!session,
+      commentCount: comments.length,
+      pendingAsks: unanswered,
+      pendingComments: comments.filter(isPendingDelivery).length,
+      lastActiveAt: session?.last_interaction_at ?? null,
+      descendantCount: descendants.get(task.id) ?? 0,
+    };
+  });
+}
+
 export function createReviewActions(projectRoot: string): ReviewActions {
   return {
     async listQueue(): Promise<ReviewQueueEntry[]> {
@@ -160,31 +199,9 @@ export function createReviewActions(projectRoot: string): ReviewActions {
       const allTasks = await storage.listTasksWithOptions({});
       const descendants = descendantCounts(allTasks);
       const tasks = allTasks.filter((task) => isBlockedStatus(task.status));
-      const entries: ReviewQueueEntry[] = [];
-      for (const task of tasks) {
-        const [comments, session] = await Promise.all([
-          storage.getTaskReviewComments(task.id),
-          storage.getSessionByTaskId(task.id),
-        ]);
-        const unanswered = comments.filter(
-          (c) => c.role === 'human' && c.ask_state === 'pending',
-        ).length;
-        entries.push({
-          id: task.id,
-          code: task.code ?? null,
-          goal: task.goal,
-          status: task.status,
-          type: task.type,
-          updatedAt: task.completed_at ?? task.created_at,
-          hasSession: !!session,
-          commentCount: comments.length,
-          pendingAsks: unanswered,
-          pendingComments: comments.filter(isPendingDelivery).length,
-          lastActiveAt: session?.last_interaction_at ?? null,
-          descendantCount: descendants.get(task.id) ?? 0,
-        });
-      }
-      return entries;
+      // Comments and the session, per blocked task. Bounded concurrency: awaiting
+      // them one task at a time made the review page N times one file read.
+      return reviewQueueEntries(tasks, descendants, storage);
     },
 
     async getDiff(taskId: string, opts?: { region?: string; files?: string[] }): Promise<string> {
@@ -320,7 +337,7 @@ export function createReviewActions(projectRoot: string): ReviewActions {
       // ---- SAVE FIRST ----------------------------------------------------
       // Everything below this write may fail (status gate, worktree lock,
       // runner availability, agent crash, 10-minute ask timeout). The comment
-      // exists and is visible regardless. CLAUDE.md: never lose human feedback.
+      // exists and is visible regardless. AGENTS.md: never lose human feedback.
       const comment = await storage.createReviewComment(task.id, {
         threadId: input.threadId,
         file: input.file,
@@ -450,7 +467,7 @@ export function createReviewActions(projectRoot: string): ReviewActions {
       message: string,
       raisedResolutions?: RaisedItemResolution[],
       onProgress?: ProgressEmitter,
-      options?: { keepFeedbackDraft?: boolean; pastUsagePause?: boolean },
+      options?: { keepFeedbackDraft?: boolean; pastUsagePause?: boolean; useDefaultImage?: boolean },
     ) {
       const storage = await getOrCreateStorage();
       const resolved = await storage.resolveTask(taskId);
@@ -489,6 +506,7 @@ export function createReviewActions(projectRoot: string): ReviewActions {
             actor: 'human',
             // The dashboard's signed-in person: may use the one-shot usage-pause override.
             usagePauseOverrideEligible: true,
+            useDefaultImage: options?.useDefaultImage,
             // The reviewer pressed Unblock on their own review: it carries
             // their queued comments, so it files their asks too.
             filesReview: true,
@@ -504,7 +522,9 @@ export function createReviewActions(projectRoot: string): ReviewActions {
           // The turn never launched, so the comments stay pending_delivery and
           // will ride the next unblock. Nothing is marked delivered.
           const detail = recoveryPath ? ` Your feedback was saved to ${recoveryPath}.` : '';
-          throw new Error(`${err instanceof Error ? err.message : String(err)}${detail}`);
+          const text = `${err instanceof Error ? err.message : String(err)}${detail}`;
+          // Keep a refusal's status: a 400 for a missing credential must not become a 500.
+          throw err instanceof RpcError ? new RpcError(err.status, text, err.code) : new Error(text);
         }
 
         if (recoveryPath) await removeRecoveryFileAsync(recoveryPath);
@@ -548,8 +568,8 @@ export function createReviewActions(projectRoot: string): ReviewActions {
       });
     },
 
-    async sync(taskId: string, onProgress?: ProgressEmitter) {
-      return syncTask(projectRoot, { taskId, onProgress, liftPin: true });
+    async sync(taskId: string, onProgress?: ProgressEmitter, options?: { useDefaultImage?: boolean }) {
+      return syncTask(projectRoot, { taskId, onProgress, liftPin: true, useDefaultImage: options?.useDefaultImage });
     },
 
     async setViolationDecision(taskId: string, file: string, approved: boolean) {
@@ -638,7 +658,7 @@ export function createReviewActions(projectRoot: string): ReviewActions {
     async promoteRaisedItem(
       taskId: string,
       itemId: string,
-      options: { goal?: string; code?: string; relation?: 'peer' | 'subtask'; actor?: ActorInput },
+      options: { goal?: string; prompt?: string; code?: string; parent?: string; relation?: 'peer' | 'subtask'; actor?: ActorInput },
     ) {
       const storage = await getOrCreateStorage();
       const resolved = await storage.resolveTask(taskId);
@@ -654,7 +674,9 @@ export function createReviewActions(projectRoot: string): ReviewActions {
       }
       return storage.promoteRaisedItem(resolved.task.id, itemId, {
         goal: options.goal?.trim() || undefined,
+        prompt: options.prompt?.trim() || undefined,
         code,
+        parent: options.parent?.trim() || undefined,
         relation: options.relation ?? 'peer',
         actor: options.actor ?? HUMAN_DECIDER,
       });

@@ -8,6 +8,8 @@
 import { describe, test, expect } from 'bun:test';
 import { execWithWatchdog, resolveWatchdogTimeout, WatchdogTimeoutError } from '../../src/supervisor/watchdog';
 import { formatWatchdogMs } from '../../src/utils/watchdog-turn';
+import { existsSync } from 'node:fs';
+import { SYSTEM_PROMPT_FILE_ARG } from '../../src/agent/interface';
 
 describe('resolveWatchdogTimeout', () => {
   test('returns config value when non-zero', () => {
@@ -36,6 +38,43 @@ describe('execWithWatchdog', () => {
     expect(result.killedByWatchdog).toBe(false);
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toBe('hello');
+  });
+
+  test('delivers a prompt larger than Linux argv allows through closed stdin', async () => {
+    const prompt = 'A'.repeat(150_000) + ' 🐙';
+    const args = Object.assign(
+      [process.execPath, '-e', 'process.stdin.setEncoding("utf8"); let text = ""; process.stdin.on("data", chunk => text += chunk); process.stdin.on("end", () => console.log(JSON.stringify(text)))'],
+      { stdinInput: prompt },
+    );
+    const result = await execWithWatchdog(args, { cwd: '/tmp', env: {}, timeoutMs: 5000 });
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout.trim())).toBe(prompt);
+  });
+
+  // INVARIANT: agents run with exactly the caller's environment — lazy does
+  // NOT disable background tasks (CLAUDE_CODE_DISABLE_BACKGROUND_TASKS). The
+  // engineer's decision (2026-10-06): background jobs are allowed, and lazy's
+  // own guards wait for them instead (see wind-down-timeout.test.ts).
+  test('passes the caller env through without disabling background tasks', async () => {
+    const result = await execWithWatchdog(
+      [process.execPath, '-e', 'console.log(JSON.stringify([process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS ?? null, process.env.KEPT]))'],
+      { cwd: '/tmp', env: { KEPT: 'yes' }, timeoutMs: 0 },
+    );
+    expect(JSON.parse(result.stdout.trim())).toEqual([null, 'yes']);
+  });
+
+  test('loads an oversized system prompt from a restricted file and removes it', async () => {
+    const systemPrompt = 'system 🐙'.repeat(20_000);
+    const args = Object.assign(
+      [process.execPath, '-e', 'const fs = require("fs"); const file = process.argv.at(-1); console.log(JSON.stringify({ path: file, text: fs.readFileSync(file, "utf8"), mode: fs.statSync(file).mode & 0o777 }))', '--', SYSTEM_PROMPT_FILE_ARG],
+      { systemPromptInput: systemPrompt },
+    );
+    const result = await execWithWatchdog(args, { cwd: '/tmp', env: {}, timeoutMs: 5000 });
+    expect(result.exitCode).toBe(0);
+    const received = JSON.parse(result.stdout.trim());
+    expect(received.text).toBe(systemPrompt);
+    expect(received.mode).toBe(0o600);
+    expect(existsSync(received.path)).toBe(false);
   });
 
   test('process completes normally when output is produced before timeout', async () => {

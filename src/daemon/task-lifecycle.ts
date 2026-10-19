@@ -19,9 +19,16 @@
  * daemon code — it causes deadlocks and storage lock contention.
  */
 
-import { join } from 'path';
+import { isFatalFailureClass } from '../agent/failure-taxonomy';
+import { markAcceptGateRunning, clearAcceptGateRunning } from './accept-gate-marker';
+import { confirmRunnerImageForLaunch, mustRecreateForRunnerImage, readOnlyLaunchPin, runnerImageHold, RUNNER_IMAGE_NOT_READY_MARKER } from './runner-image-choice';
+import { RunnerImageNotReadyError, READONLY_DEFAULT_RUNNER_IMAGE_PIN } from '../capture/custom-image-gate';
+import type { SandboxConfig } from '../capture/claude';
+import { basename, join } from 'path';
 import { lstat, stat } from 'fs/promises';
 import { loadConfig } from '../config/loader';
+import { deliveredFilesUpstreamExclude } from './delivered-files-upstream';
+import { assertNoModelOnTiered } from '../agent/tiered-model';
 import type { EffortLevel, ResolvedConfig } from '../config/types';
 import { resolveTurnLaunchIdentity, resolveOneOffTurnIdentity } from './launch-identity';
 import { resolveAgentChattiness, renderChattinessSnippet } from '../config/chattiness';
@@ -30,7 +37,7 @@ import { createRunner } from '../runner';
 import type { Runner } from '../runner/types';
 import { stampSessionRunner, removeTaskRun, mustRecreateForContainerAgent } from '../runner/session-launch';
 import { mustRecreateForTaskEnv } from './task-env';
-import { pinnedCustomImage } from '../docker/worktree-image';
+import { launchImagePin } from '../docker/worktree-image';
 import {
   createDriver,
   LocalDriver,
@@ -40,6 +47,8 @@ import {
   type MergeResult,
 } from '../remote';
 import { restoreTaskBranchForReopen, type BranchRestore } from './reopen-restore';
+import { RemoteBranchMissingError } from '../remote/branch-missing';
+import { unstartedParentOf } from '../task/unstarted-parent';
 import { resolveUpstreamMergeRefForCommand } from './upstream-command-ref';
 import {
   PhaseReporter,
@@ -96,6 +105,7 @@ import {
   type FollowThroughStep,
 } from './accept-intent';
 import { markSyncRestoreStatus, clearSyncRestoreStatus } from '../task/sync-restore-status';
+import { markReadOnlyTurn } from '../task/read-only-turn';
 import { recordSessionCommits } from '../task/session-commits';
 import { pinnedBaseOf, BASE_PIN_KEY } from '../task/base-pin';
 import { isSyncDispatchable } from '../task/sync-dispatch';
@@ -114,8 +124,10 @@ import { checkLock, acquireLock, removeLock } from '../utils/lock';
 import { checkPairingLock } from '../utils/pairing-lock';
 import { protocolDir as getProtocolDir, reviewProtocolDir, acceptGateProtocolDir, writeCommand, writeResponse, consumeCommand, ensureProtocolDir, commonCommandFields, computeAgentExtraArgs, newCommandId, removeProtocolDir, consumeResponse, clearStatus, completedResponses, readResponse, inFlightResponseCorrelates } from '../protocol';
 import { shortId, displayId, displayIdFor, taskRef, getWorktreePath, getWorktreePathForRef, getBranchName, getBranchNameFromId } from '../task/identity';
+import { renderTaskTurnPrompt } from '../task/turn-prompt-render';
 import { buildNotesContext, buildJournalNotice, buildArtifactNotice, buildSystemPrompt, buildPromptWithInstructions, buildTurnHistoryContext, resolveNotesCutoff, selectNotesForDelivery, getNewJournalSince } from '../task/turn-context';
 import { typeConstraintsSection } from '../task/type-constraints';
+import { lazyFold, neutralizeLazyMarkers } from '../task/wrapper-fold';
 import { recordRecreationIfRunning, recreationReason, environmentReplacedPrefix, clearEnvironmentReplaced } from '../task/environment-replaced';
 import { snapshotIsRestorable } from '../task/worktree-snapshot';
 import { runSyncWithRemote } from '../task/sync-remote';
@@ -132,7 +144,8 @@ import {
   resetFinalReviewRound,
 } from './auto-react-budget';
 import { getNonHumanTurnCount, incrementNonHumanTurnCount, resetNonHumanTurnCount, checkTurnBudget } from './turn-budget';
-import { enforceEdgeGate, EdgeGateRefusedError, resolveEdgeGateDecision } from '../protection/edge-gate';
+import { enforceEdgeGate, EdgeGateRefusedError, resolveEdgeGateDecision, teamsAcceptOnlyMessage, type MemberApproval } from '../protection/edge-gate';
+import { isManagedMode } from '../config/managed-mode';
 import { peekPendingAcceptReview, clearPendingAcceptReview } from '../protection/pending-review';
 import { enforceResurrectionGuard, ResurrectionRefusedError, stackedChildAdvisory } from '../protection/resurrection-guard';
 import { enforceLfsGuard, LfsPointerRefusedError } from '../protection/lfs-guard';
@@ -160,9 +173,13 @@ import { isTerminalStatus, isActiveStatus, isBlockedStatus, raisedStatusForActio
 import { parentTaskIdOf, targetBranchOf, taskTarget, branchTarget } from '../task-target';
 import { isLinkedTask } from '../task/linked';
 import { logger } from '../utils/logger';
+import { recordLaunchFailure } from './launch-failure';
+import { systemActor } from '../identity/system-identity';
 import { reviewerKey } from '../review-draft';
 import { looksLikeTaskBranch } from '../git/branch-prefix';
+import { resolveBranchParent } from '../task/branch-parent';
 import type { OpenReview } from '../remote/driver';
+import { localDriverMirrorsOrigin, acceptPushesTargetToMirror, isNonFastForwardRejection, fastForwardTargetFromMirror, MirrorTargetDivergedError } from '../remote/origin-mirror';
 import { mismatchedReviewBase, wrongReviewBaseRefusal, reviewComparisonTarget } from './review-base';
 import { retargetReviewsAfterReparent } from './review-retarget';
 import { clearLazyClosedReview, dropLazyClosedRecord, LAZY_CLOSED_REVIEW_KEY, markedRecordState, unconfirmedCloseRefusal } from './lazy-closed-review';
@@ -180,38 +197,44 @@ import {
   linkedReviewBaseRefusal,
   mismatchedReviewRefusal,
   staleBaseWarning,
+  noForgeSubmitRefusal,
 } from './submit-target';
 import { getActor } from '../constants';
 import { writeDaemonMcpConfig } from './task-launcher';
 import { prepareTurnLaunch, assertNoMemberInside, assertTurnCredentialAvailable, releaseTurnCredential, turnCredentialProblem } from './turn-credentials';
-import { assertBesideLaunchAllowed, assertTurnStartAllowed, takeTaskAllowanceAtLaunch, usagePauseHold } from './usage-pause';
+import { assertBesideLaunchAllowed, assertBesideUsagePauseOverrideAllowed, assertTurnStartAllowed, takeTaskAllowanceAtLaunch, usagePauseHold } from './usage-pause';
 import { USAGE_PAUSE_PENDING_FIX_KEY } from '../usage-pause/hold';
 import { createAgentTurn, createRecoveredAgentTurn, pendingTurnOwnerPerson, turnOwnerOfClaim } from './turn-owner';
 import { revokeTaskMcpTokens } from './mcp-tokens';
 import { clearTaskEnv } from './task-env';
+import { assertNoDeliveredSecretsToPush, deliverTaskFilesForLaunch, deliveredGuardFor, forgetTaskFiles } from './task-files';
+import { deliveredFilesRefusal, findDeliveredFilesAtRef, findDeliveredFilesInRange } from '../git/delivered-files';
 import { revokeTaskCredentialGrants } from '../proxy/credential-broker';
 import { setupSandbox } from '../utils/sandbox';
 import { reviewContainerNameForTask, acceptGateContainerNameForTask } from '../capture/claude';
 import { hasDaemonContext } from './context';
 import { withSettleLock, isInFlightLive, IN_FLIGHT_ASYNC_BACKSTOP_MS, stoppableClaimOf, CLAIMING_PROCESS_ID } from './in-flight-turn';
 import { runGit } from '../utils/git';
+import { probeOriginBranch } from '../remote/origin-branch-probe';
 import { validateBranchInSyncWithRemote } from '../utils/git';
 import { latestViolationTurn, launchSettingsFromResponse } from '../utils/turns';
 import { parkTaskPaused } from '../utils/paused-status';
 import { resolveOutstandingViolations } from '../protection/outstanding-resolver';
+import { deferredProtectedFilesNotice } from '../protection/deferral';
 import { planRejectedRestores } from '../protection/rejected-restore';
 import { approvedFilesFromRecords, mergedViolationRecords } from '../protection/outstanding';
-import { findPendingFeedback, buildFeedbackRedeliveryPrompt } from '../utils/feedback-redelivery';
+import { findPendingFeedback, buildFeedbackRedeliveryPrompt, feedbackItemsOf } from '../utils/feedback-redelivery';
+import { turnText } from '../utils/turn-content';
 import { isOfflineMode } from '../utils/offline';
 import { waitForSupervisorAnswer, waitForSupervisorResponse, type SupervisorAnswerOutcome } from './supervisor-wait';
 
-import type { StartCommand, UnblockCommand, SyncCommand, AskCommand, AcceptGateCommand, ReviewCommand, CompletedResponse, ErrorResponse } from '../protocol';
+import type { StartCommand, UnblockCommand, SyncCommand, AskCommand, AcceptGateCommand, AcceptGateResult, ReviewCommand, CompletedResponse, ErrorResponse } from '../protocol';
 import { resolveWrapUpCommandFields } from './wrap-up-plan';
 import { checkClusterFixRoundBudget, incrementClusterFixRound, resetClusterFixRound } from './cluster-fix-rounds';
 import { docsSuffix } from '../docs/links';
 import { journalWorktreeRecovery } from '../utils/reconcile';
 import { PROTOCOL_VERSION, type ProtectedRestore } from '../protocol/types';
-import type { FileViolation, Task, TokenUsage, Session, TaskStatus, Actor, ActorInput, RaisedItem, RaisedItemResolution, ReviewComment, InFlightTurn, InFlightTurnOutcome, InFlightTurnOwner, TurnType, ReviewReport, AgentTokenUsage } from '../types';
+import type { FeedbackItem, FileViolation, Task, TokenUsage, Session, TaskStatus, Actor, ActorInput, RaisedItem, RaisedItemResolution, ReviewComment, InFlightTurn, InFlightTurnOutcome, InFlightTurnOwner, TurnType, ReviewReport, AgentTokenUsage } from '../types';
 import { RETIRED_IN_FLIGHT_OWNERS } from '../types';
 import { currentPromptOf } from '../task-prompt';
 import { parseReviewReport, parseReviewReply } from '../review/parse-report';
@@ -240,9 +263,8 @@ import {
 } from '../review/verdict';
 import { recoverAndAttachReviewFindings } from '../review/recover-findings';
 import { formatFindingForAutoFix, buildReviewAutoFixMessage } from '../review/auto-fix-message';
-import { audienceOf } from '../task/audience';
+import { audienceOf, createdByOf, parentIsClusterOf } from '../task/audience';
 import { isClusterTask } from '../types';
-import { createdByOf } from '../protection/outstanding-resolver';
 import reviewTurnScopePrompt from '../prompts/review-turn-scope.md' with { type: 'text' };
 import reviewTurnFeaturePrompt from '../prompts/review-turn-feature.md' with { type: 'text' };
 import { askAwaitsAgent, isHumanAsk, isPendingDelivery } from '../server/review-actions';
@@ -254,7 +276,7 @@ import {
   STALE_PARENT_COMMENT_PREFIX,
 } from '../task/queued-feedback';
 import { buildUnblockPrompt } from '../review/unblock-prompt';
-import { actorRole, withActorPerson } from '../actor-ref';
+import { actorEmail, actorName, actorRole, withActorPerson } from '../actor-ref';
 import { toTurnUsage, rollUpSessionUsage } from '../utils/usage-recording';
 import type { Storage } from '../storage';
 import { sanitizeUserText } from '../utils/sanitize-text';
@@ -286,7 +308,36 @@ import goalContextResumeText from '../prompts/goal-context-resume.md' with { typ
  * Best-effort by design: a token that outlives its session for a few seconds is
  * bad, but failing an accept that has already merged and pushed is worse.
  */
-async function revokeTaskTokens(projectRoot: string, taskId: string): Promise<void> {
+/**
+ * Accept never merges a per-task secret file lazy delivered
+ * (src/daemon/task-files.ts). Matched against the daemon registry alone (never the
+ * worktree manifest): any change at a path ever delivered to this task, or any
+ * delivered content, over every commit this session made — a data-safety
+ * check, so it runs on a resumed accept too. Throws a 409 naming the paths.
+ */
+async function refuseDeliveredSecretsOnBranch(
+  projectRoot: string,
+  task: Task,
+  worktreePath: string,
+  startSha: string | undefined | null,
+  upstreamExclude: () => Promise<string[]>,
+): Promise<void> {
+  const guard = await deliveredGuardFor(projectRoot, { taskId: task.id, ref: basename(worktreePath) });
+  if (guard.entries.length === 0 && guard.paths.length === 0) return;
+  // What is already on the parent branch (a sync merge brings it in) is not
+  // this task's work — see deliveredFilesUpstreamExclude.
+  const found = startSha
+    ? await findDeliveredFilesInRange(worktreePath, 'HEAD', [`^${startSha}`, ...await upstreamExclude()], guard.entries, guard.paths)
+    : await findDeliveredFilesAtRef(worktreePath, 'HEAD', guard.entries, guard.paths);
+  if (found.length === 0) return;
+  throw new RpcError(409,
+    deliveredFilesRefusal(`Accepting ${displayId(task)}`, [...new Set(found)]) +
+    `The task's branch carries one in a commit. Remove it from the branch's history ` +
+    `(e.g. ask the agent to drop or amend that commit), then accept again.`);
+}
+
+async function revokeTaskTokens(projectRoot: string, task: Task): Promise<void> {
+  const taskId = task.id;
   try {
     const revoked = await revokeTaskMcpTokens(projectRoot, taskId);
     if (revoked > 0) logger.debug(`Revoked ${revoked} MCP token(s) for task ${shortId(taskId)}`);
@@ -302,7 +353,12 @@ async function revokeTaskTokens(projectRoot: string, taskId: string): Promise<vo
   // Cursor credential through the proxy. Revoked separately from the MCP token
   // so one registry's failure cannot skip the other.
   try {
-    const revoked = await revokeTaskCredentialGrants(projectRoot, taskId);
+    // By UUID AND every ref a launch minted under: launches record the ref
+    // (code or short id) as the grant's taskId, so the UUID alone misses
+    // grants minted before they carried taskUuid.
+    const revoked = await revokeTaskCredentialGrants(projectRoot, {
+      id: taskId, refs: [taskRef(task), shortId(taskId)],
+    });
     if (revoked > 0) logger.debug(`Revoked ${revoked} proxy credential grant(s) for task ${shortId(taskId)}`);
   } catch (err) {
     logger.warn(
@@ -323,6 +379,17 @@ async function revokeTaskTokens(projectRoot: string, taskId: string): Promise<vo
   } catch (err) {
     logger.warn(
       `Failed to clear per-task env for task ${shortId(taskId)}: ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  // Its secret files (`taskFiles`) likewise — same lifetime, same posture.
+  try {
+    const cleared = await forgetTaskFiles(projectRoot, taskId);
+    if (cleared > 0) logger.debug(`Cleared ${cleared} per-task secret file(s) for task ${shortId(taskId)}`);
+  } catch (err) {
+    logger.warn(
+      `Failed to clear per-task secret files for task ${shortId(taskId)}: ` +
       `${err instanceof Error ? err.message : String(err)}`,
     );
   }
@@ -591,6 +658,12 @@ export async function resolveParentBranchWithFallback(
 // =====================================================================
 
 export interface UnblockTaskParams {
+  /**
+   * A person confirmed running this launch on lazy's DEFAULT runner image while
+   * the project's own image is not ready (src/daemon/runner-image-choice.ts).
+   * Without it such a launch is refused before anything is written.
+   */
+  useDefaultImage?: boolean;
   taskId: string;
   /**
    * The caller is a person who may use the one-shot usage-pause override
@@ -675,7 +748,7 @@ export interface UnblockTaskParams {
    * an Unblock pressed under an ask box (a line, report paragraph, verify step,
    * the Ask dialog). A delivered unblock then leaves the stored feedback draft
    * alone: the daemon clears only what it actually delivered, and those unsent
-   * words are someone's feedback (CLAUDE.md: never lose human feedback).
+   * words are someone's feedback (AGENTS.md: never lose human feedback).
    */
   keepFeedbackDraft?: boolean;
   /** Phase-narration sink (see ./progress.ts). Supplied by the transport — CLI only. */
@@ -762,7 +835,7 @@ async function clearDeliveredReviewDraft(
  * missing boundary, and it is the same moment the review draft is cleared: the
  * human has submitted their review.
  *
- * RECORDS, never discards (CLAUDE.md, "Never Lose Human Feedback"): the
+ * RECORDS, never discards (AGENTS.md, "Never Lose Human Feedback"): the
  * message, its answer and its delivery state are untouched, the thread stays
  * readable, and a filed ask is still listed — under "Filed asks" rather than as
  * open business. An ask the agent has not consumed (in flight, or one whose
@@ -787,6 +860,53 @@ async function fileReviewAsks(taskId: string, mode: 'unblock' | 'accept'): Promi
       `Could not file review asks for ${taskId} after ${mode}: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
+}
+
+/**
+ * The words every refusal that SAVED the feedback as a withheld turn carries.
+ * Lazy Teams matches on it (`LazyDaemon::Client::FEEDBACK_WITHHELD_MARKER`) to
+ * record such a refusal as saved — not owed — so it never offers the words
+ * again on top of the daemon's own delivery of them.
+ */
+export const FEEDBACK_WITHHELD_MARKER = 'Your feedback was saved on the task and will be delivered with the next unblock';
+
+/**
+ * Record a member's feedback as a pending human turn, then refuse the launch
+ * with `refusal` plus a plain statement that the words were saved. A retry with
+ * the same words while that turn is still the newest is not recorded twice.
+ */
+async function recordFeedbackThenRefuse(
+  storage: Storage,
+  input: {
+    taskId: string; sessionId: string; content: string; agent: string; actor: ActorInput; refusal: string;
+    refusePlainly?: boolean; callerReviewerKey?: string; keepFeedbackDraft?: boolean;
+  },
+): Promise<never> {
+  // A daemon-started launch carries system text, and a plan-mode unblock is a review
+  // QUESTION, not feedback: neither is saved as withheld work feedback.
+  if (input.refusePlainly) throw new RpcError(400, input.refusal);
+  const turns = await storage.getSessionTurns(input.sessionId);
+  const last = turns[turns.length - 1];
+  const alreadyKept = last?.role === 'human' && last.feedback_withheld === true && last.content === neutralizeLazyMarkers(input.content);
+  if (!alreadyKept) {
+    await storage.createTurn({
+      sessionId: input.sessionId,
+      sequence: await storage.getNextTurnSequence(input.sessionId),
+      role: 'human',
+      // A marker the person typed is made inert (src/task/wrapper-fold.ts).
+      content: neutralizeLazyMarkers(input.content),
+      agent: input.agent,
+      actor: input.actor,
+      feedbackWithheld: true,
+    });
+  }
+  // INVARIANT: the words are durable as a withheld turn now, so the caller's draft of
+  // them is spent — a kept draft resent after someone else delivered them would
+  // deliver them twice.
+  if (!input.keepFeedbackDraft) await clearDeliveredReviewDraft(input.taskId, input.callerReviewerKey, input.actor, 'unblock');
+  throw new RpcError(400,
+    `${input.refusal} ${FEEDBACK_WITHHELD_MARKER} by anyone who has a credential.`,
+  );
 }
 
 export async function launchUnblockTask(
@@ -859,6 +979,12 @@ async function launchUnblockTaskRun(
     throw new RpcError(409, `Task ${displayId(task)} is locked (pairing in progress). End the pairing session first.`);
   }
 
+  // The project's runner image: refused before anything is written unless the
+  // caller confirmed lazy's default image (src/daemon/runner-image-choice.ts).
+  // After the session and status checks, so an unblock refused for those never
+  // leaves a recorded default-image choice behind.
+  await confirmRunnerImageForLaunch(storage, task, params.useDefaultImage);
+
   // --- Usage pause, judged BEFORE the first write below ---
   // (the merging escape, the `--agent` switch, orphan retargeting). On the task
   // as this unblock will run it, and without spending the one-shot override, so
@@ -873,15 +999,28 @@ async function launchUnblockTaskRun(
     daemonLaunch: params.daemonLaunch,
     overrideEligible: params.usagePauseOverrideEligible === true,
   });
-  // The credential, for the same reason and at the same point: on the profile
-  // this unblock will RUN (the `--agent` switch included), before the first
-  // write. Checked again, with a load, right before the turn row is written.
-  await assertTurnCredentialAvailable(projectRoot, {
-    taskId: task.id,
-    storage,
-    ...(params.agentOverride ? { agentId: params.agentOverride } : {}),
-  });
-
+  // The credential, on the profile this unblock will RUN, also before the first write
+  // (agent switch, merging escape, sync): record the words, then refuse.
+  {
+    const earlyRefusal = await turnCredentialProblem(projectRoot, {
+      taskId: task.id,
+      storage,
+      ...(params.agentOverride ? { agentId: params.agentOverride } : {}),
+    });
+    if (earlyRefusal) {
+      await recordFeedbackThenRefuse(storage, {
+        taskId: task.id,
+        callerReviewerKey: params.callerReviewerKey,
+        keepFeedbackDraft: params.keepFeedbackDraft,
+        sessionId: sess.id,
+        content: sanitizeUserText(params.message).trim(),
+        agent: task.agent_id,
+        actor,
+        refusal: earlyRefusal,
+        refusePlainly: params.daemonLaunch === true || params.permissionMode === 'plan',
+      });
+    }
+  }
   // Merging → resting escape hatch. Parks as `conflict` if the task still owes a
   // decision on file-permission violations — see the violations-are-the-source-
   // of-truth invariant in src/utils/paused-status.ts.
@@ -909,6 +1048,15 @@ async function launchUnblockTaskRun(
   // One read for both the switch and the runner pre-flight below, which needs
   // it to resolve the task's agent PROFILE to a harness.
   const unblockConfig = await loadConfig(projectRoot);
+
+  // A model on a tiered task is refused BEFORE anything is written (agent
+  // switch, raised-item resolutions): src/agent/tiered-model.ts. The feedback
+  // itself is already saved by the caller.
+  try {
+    assertNoModelOnTiered(unblockConfig, params.agentOverride ?? task.agent_id, params.modelOverride);
+  } catch (err) {
+    throw new RpcError(400, err instanceof Error ? err.message : String(err));
+  }
 
   // --- Cluster fix-round budget ---
   // A CLUSTER unblocking the SAME child over and over is the unbounded-spend shape
@@ -1195,11 +1343,13 @@ async function launchUnblockTaskRun(
     phases.end();
 
     // INTAKE BOUNDARY: escape non-printable control characters before this text
-    // is persisted or built into a prompt. A raw NUL here becomes argv[2] of
-    // `claude -p` and kills the spawn instantly, crash-looping the turn and
-    // losing the feedback. Sanitize-and-deliver, never reject — see
+    // is persisted or built into a prompt. A raw NUL in argv once killed the
+    // spawn and lost the feedback; prompts now ride stdin
+    // (src/agent/argv-safety.ts) and this stays as defence in depth. Sanitize-and-deliver, never reject — see
     // src/utils/sanitize-text.ts.
-    let message = sanitizeUserText(params.message);
+    // A marker the person typed is made inert so it can never fold their own
+    // words away on a review surface (src/task/wrapper-fold.ts).
+    let message = neutralizeLazyMarkers(sanitizeUserText(params.message));
 
     // Protected-file approval is NOT an unblock concern (move-file-approval-to-accept):
     // unblock never reads an approval list and never reverts a file. The agents
@@ -1340,6 +1490,7 @@ async function launchUnblockTaskRun(
     // The mark advances only through the notes actually carried, so a comment
     // created while this prompt is being assembled rides the next turn.
     let notesCtx: string | undefined;
+    let notesDeliveredThrough: number | null = null;
     {
       const allNotes = await storage.getTaskComments(task.id);
       if (allNotes.length > 0) {
@@ -1353,8 +1504,10 @@ async function launchUnblockTaskRun(
           // editor and their feedback text carries them — delivered either way,
           // so the mark advances in both branches. Not advancing it here would
           // re-deliver the same notes on every subsequent editor unblock.
-          if (!params.notesInEditor) notesCtx = buildNotesContext(newNotes);
-          if (deliveredThrough !== null) await storage.markNotesDelivered(sess.id, deliveredThrough);
+          if (!params.notesInEditor) {
+            notesCtx = buildNotesContext(newNotes);
+          }
+          notesDeliveredThrough = deliveredThrough;
         }
       }
     }
@@ -1397,8 +1550,8 @@ async function launchUnblockTaskRun(
     // Skipped on plan-mode (read-only Q&A) turns: those cannot act on change
     // requests, and marking a comment delivered into one would be a lie.
     // Delivery is stamped only after the turn actually launches, further down.
-    // Sanitized like the feedback itself: comment content becomes part of the
-    // agent argv at the delivery seam, where a raw NUL is fatal.
+    // Sanitized like the feedback itself (defence in depth: the prompt rides
+    // stdin, never argv — src/agent/argv-safety.ts).
     let pendingReviewComments: ReviewComment[] = [];
     if (params.permissionMode !== 'plan') {
       const allReviewComments = await storage.getTaskReviewComments(task.id);
@@ -1412,6 +1565,44 @@ async function launchUnblockTaskRun(
         );
       }
     }
+
+    // INVARIANT (never lose human feedback; delivered exactly once): every
+    // feedback turn still owed — saved by an earlier REFUSED unblock (withheld)
+    // or never acted on by a turn that was INTERRUPTED (pending) — rides this
+    // unblock verbatim, oldest first, each attributed to its author. What is
+    // carried is each turn's own words (`feedback_items`), never its composed
+    // prompt, so an earlier carry is never nested inside this one; and every
+    // carried turn is marked consumed once this turn is recorded (below), so the
+    // new turn alone owes them and no later carry or resume repeats them.
+    const ownWords = neutralizeLazyMarkers(sanitizeUserText(params.message)).trim();
+    // What THIS turn delivers of its own — the words plus the review comments
+    // wrapped around them — before any carry is prepended.
+    const ownComposed = message.trim();
+    const owedTurns = params.permissionMode === 'plan' ? [] : (await storage.getSessionTurns(sess.id))
+      // A withheld turn is owed whatever its delivery state says: it was never
+      // delivered, so no completed turn can have consumed it.
+      .filter(t => t.role === 'human' && (t.feedback_delivery === 'pending' || t.feedback_withheld === true))
+      .sort((a, b) => a.sequence - b.sequence);
+    // An identical resend IS the saved words: they are already in `message`,
+    // so they are not carried a second time.
+    const carriedItems: FeedbackItem[] = owedTurns
+      .flatMap(feedbackItemsOf)
+      .filter(item => neutralizeLazyMarkers(item.text).trim() !== ownWords);
+    if (carriedItems.length > 0) {
+      const blocks = carriedItems.map(item =>
+        `From ${item.actor_name || item.actor_email || 'a member'}${item.actor_email && item.actor_name ? ` <${item.actor_email}>` : ''}:\n\n${neutralizeLazyMarkers(item.text)}`);
+      // lazy's framing is folded on review surfaces; the carried words are not.
+      const owed = `${lazyFold('carried-feedback', 'Feedback given earlier that you have not acted on yet — saved while a turn could not start, or sent to a turn that was interrupted (verbatim, oldest first):')}\n\n${blocks.join('\n\n---\n\n')}\n\n---\n\nNew feedback:\n\n`;
+      message = owed + message;
+      warnings.push(`Also delivering ${carriedItems.length} earlier feedback message(s) the agent has not acted on yet.`);
+    }
+    // Review comments and raised-item decisions ride the item too: both are
+    // marked delivered by this launch, so a later carry is their only route back.
+    const ownItem: FeedbackItem = {
+      text: raisedResolvedNotice ? `${raisedResolvedNotice}\n\n---\n\n${ownComposed}` : ownComposed,
+      ...(actorEmail(actor) ? { actor_email: actorEmail(actor) } : {}),
+      ...(actorName(actor) ? { actor_name: actorName(actor) } : {}),
+    };
 
     if (raisedResolvedNotice) {
       message = `${raisedResolvedNotice}\n\n---\n\n${message}`;
@@ -1436,11 +1627,17 @@ async function launchUnblockTaskRun(
     // A cluster's constraints hold on EVERY turn it takes, not just its first —
     // the daemon enforces the other half of that contract
     // (restart-on-added-child). See src/task/type-constraints.ts.
-    message = typeConstraintsSection(task) + message;
+    const typeConstraints = typeConstraintsSection(task);
+    message = typeConstraints + message;
 
     // Build prompts
     const systemPrompt = buildSystemPrompt(runner.getAgentInstructions(), renderChattinessSnippet(resolveAgentChattiness(config)), await buildMemorySection(storage, 'agent', { warnBytes: config.memory.warn_bytes }), await buildLazyMdSection(worktreePath));
-    const fullMessage = buildPromptWithInstructions(message.trim(), task.goal, projectRoot, turnHistory, notesCtx, remoteCommentsCtx, journalNotice, artifactNotice);
+    const deliveredMessage = message.trim();
+    const fullMessage = renderTaskTurnPrompt({
+      userPrompt: deliveredMessage, goal: task.goal, lazyRoot: projectRoot, turnHistory,
+      notesContext: notesCtx, remoteCommentsContext: remoteCommentsCtx,
+      journalNotice, artifactNotice,
+    });
 
     // --- Persist state and claim the task (serialized) ---
     // CONCURRENCY: the status checks at the top of this function are advisory —
@@ -1477,28 +1674,29 @@ async function launchUnblockTaskRun(
       // A member working in the task keeps turns off it. Refused BEFORE the
       // feedback turn is recorded, so nothing is half-dispatched.
       assertNoMemberInside(task.id);
-      // Same reason: a turn with no credential for its profile is refused here,
-      // before its turn row exists — never after (assertTurnCredentialAvailable).
-      await assertTurnCredentialAvailable(projectRoot, { taskId: task.id, storage });
+      // INVARIANT (AGENTS.md, never lose human feedback): a refusal for want of a
+      // credential happens AFTER the words are durably recorded, never before.
+      // On the profile this unblock will RUN (the `--agent` switch included).
+      const credentialRefusal = await turnCredentialProblem(projectRoot, {
+        taskId: task.id,
+        storage,
+        ...(params.agentOverride ? { agentId: params.agentOverride } : {}),
+      });
+      if (credentialRefusal) {
+        await recordFeedbackThenRefuse(storage, {
+          taskId: task.id,
+          callerReviewerKey: params.callerReviewerKey,
+          keepFeedbackDraft: params.keepFeedbackDraft,
+          sessionId: sess.id,
+          content: sanitizeUserText(params.message).trim(),
+          agent: task.agent_id,
+          actor,
+          refusal: credentialRefusal,
+          refusePlainly: params.daemonLaunch === true || params.permissionMode === 'plan',
+        });
+      }
 
       const nextSeq = await storage.getNextTurnSequence(sess.id);
-      await storage.createTurn({
-        sessionId: sess.id,
-        sequence: nextSeq,
-        role: 'human',
-        content: message.trim(),
-        agent: task.agent_id,
-        model: modelName,
-        effort: turnEffort,
-        prompt: fullMessage,
-        // Channel actor: MCP-relayed feedback is 'builder' even when it carries a
-        // human's words — the actor records who submitted (the channel), not who
-        // authored the content. Falls back to getActor() for CLI. See MCP_ACTOR.
-        actor,
-        // INVARIANT: this turn IS the human's feedback. If the work phase crashes
-        // before the agent consumes it, resume must re-deliver it verbatim.
-        carriesFeedback: true,
-      });
 
       // Transition to working. The transition itself is validated against the
       // canonical table in src/task-state-machine.ts inside updateTaskStatus.
@@ -1523,6 +1721,43 @@ async function launchUnblockTaskRun(
         runner, containerName,
       );
       const envNotice = await environmentReplacedPrefix(storage, task.id);
+
+      const turnCommandId = newCommandId();
+
+      await storage.createTurn({
+        sessionId: sess.id,
+        sequence: nextSeq,
+        role: 'human',
+        content: deliveredMessage,
+        agent: task.agent_id,
+        model: modelName,
+        effort: turnEffort,
+        prompt: fullMessage,
+        // Channel actor: MCP-relayed feedback is 'builder' even when it carries a
+        // human's words — the actor records who submitted (the channel), not who
+        // authored the content. Falls back to getActor() for CLI. See MCP_ACTOR.
+        actor,
+        // INVARIANT: this turn IS the human's feedback. If the work phase crashes
+        // before the agent consumes it, resume must re-deliver it verbatim.
+        carriesFeedback: true,
+        // The person's own words, after everything this turn carries — what a
+        // LATER carry reads, so nothing is nested or repeated.
+        ...(params.permissionMode === 'plan' ? {} : { feedbackItems: [...carriedItems, ownItem] }),
+      });
+      // Their words now ride the turn just recorded; only it stays owed.
+      if (owedTurns.length > 0) await storage.markFeedbackSubsumed(sess.id, owedTurns.map(t => t.id));
+
+      // A reflective turn is read-only at the daemon's MCP route too, not only
+      // in the toolset it is offered: the marker names this launch's command and
+      // the human turn just recorded, and goes inert once a later turn launches
+      // (src/task/read-only-turn.ts). Written AFTER that turn exists, so it can
+      // only ever name a used sequence, and BEFORE the status flip that makes the
+      // turn live; a failure refuses the launch.
+      if (params.permissionMode === 'plan') {
+        await markReadOnlyTurn(storage, task.id, {
+          command_id: turnCommandId, session_id: sess.id, human_turn_sequence: nextSeq,
+        });
+      }
 
       await storage.updateTaskStatus(task.id, 'working', actor);
 
@@ -1566,8 +1801,10 @@ async function launchUnblockTaskRun(
           worktreePath,
           config,
         })),
-        ...commonCommandFields(config),
+        ...commonCommandFields(config, { command_id: turnCommandId }),
       };
+      // Per-task secret files, repaired before every launch (src/daemon/task-files.ts).
+      await deliverTaskFilesForLaunch(projectRoot, task.id, worktreePath, phases.notify);
       writeCommand(protoDir, unblockCommand);
 
       return { nextSeq, mustRecreateContainer, mustRecreateForEnv, protoDir, envNotice };
@@ -1594,7 +1831,7 @@ async function launchUnblockTaskRun(
         `(${sess.container_agent_id} → ${task.agent_id}) — launch env is fixed at create time`,
       );
     }
-    if (!mustRecreateContainer && !mustRecreateForAgent && !mustRecreateForEnv && (await runner.isRunning(containerName))) {
+    if (!mustRecreateContainer && !mustRecreateForAgent && !mustRecreateForEnv && !mustRecreateForRunnerImage(task) && (await runner.isRunning(containerName))) {
       // Supervisor already running — it will pick up the new command. The
       // config written just above still reaches it (in-place write, pinned
       // inode); a container whose FIRST launch had none stays without one, but
@@ -1605,9 +1842,11 @@ async function launchUnblockTaskRun(
       await removeTaskRun(runner, storage, sess, containerName);
 
       try {
-        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef, task.id, pinnedCustomImage(task), phases.notify);
+        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef, task.id, launchImagePin(task), phases.notify);
       } catch (err) {
-        await storage.updateTaskStatus(task.id, 'interrupted', actor);
+        // Lazy's failure, not the caller's: system-attributed, with its reason
+        // and a failure notice turn (src/daemon/launch-failure.ts).
+        await recordLaunchFailure(storage, task, sess.id, err, projectRoot);
         throw new RpcError(500, `Failed to launch supervisor: ${err instanceof Error ? err.message : err}`);
       }
     }
@@ -1617,6 +1856,14 @@ async function launchUnblockTaskRun(
     await storage.updateSessionContainerName(sess.id, containerName, task.agent_id);
     sess.container_agent_id = task.agent_id;
     await storage.updateSessionInteraction(sess.id, 0);
+
+    if (notesDeliveredThrough !== null) {
+      try {
+        await storage.markNotesDelivered(sess.id, notesDeliveredThrough);
+      } catch (err) {
+        logger.error(`Could not mark task notes delivered after launch: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
 
     const turnNumber = Math.floor(nextSeq / 2) + 1;
 
@@ -1697,6 +1944,8 @@ export interface AskTaskParams {
    * judged on the configured threshold alone, and refused without naming it.
    */
   usagePauseOverrideEligible?: boolean;
+  /** Explicit override of this record ask's builder credential (not a task-turn allowance). */
+  overrideUsagePause?: boolean;
   message: string;
   effortOverride?: string;
   /** Channel actor (MCP → 'builder', CLI → 'human'); falls back to getActor(). See {@link MCP_ACTOR}. */
@@ -2058,10 +2307,16 @@ async function settleInFlightTurnLocked(
   if (response.status === 'error') {
     if (correlation !== 'match') return 'none';
     if (record.owner === 'ask') {
-      // recordAskErrorTurn deliberately parks the task `interrupted` so the
-      // crashed ask is auto-resumable; do not restore over that.
-      await recordAskErrorTurn(storage, task.id, session.id, response, protoDir, record.turn_sequence);
-      restoreStatus = false;
+      // recordAskErrorTurn parks a crashed ask `interrupted` so it is
+      // auto-resumable; do not restore over that. A FATAL ask failure is the
+      // exception: nothing heals it by retrying, and the one fatal an ask
+      // produces on purpose is a read-only violation (it wrote to the
+      // worktree) — auto-resume would launch a WORK turn on that dirtied
+      // worktree and commit the asker's edits as the implementer's. Restore
+      // the status the ask found instead; the error turn says what happened.
+      const fatal = response.failure_class !== undefined && isFatalFailureClass(response.failure_class);
+      await recordAskErrorTurn(storage, task.id, session.id, response, protoDir, record.turn_sequence, !fatal);
+      restoreStatus = fatal;
     } else if (record.owner === 'review') {
       // A failed review is not work: record the error turn and restore the
       // status the review found (submitted stays submitted). Parking
@@ -2254,6 +2509,31 @@ async function awaitInFlightOutcome(opts: {
  * The handler now returns at the end of that critical section, so the lock is
  * held only for the dispatch — never for the agent's whole thinking time.
  */
+/**
+ * Launch the container for a READ-ONLY turn (ask, review). Read-only turns
+ * never wait for the project's runner image and never ask: they launch on it
+ * when it is ready, and on lazy's default image otherwise — including when the
+ * gate refuses the project's image inside the launch (it vanished after the
+ * readiness check). The task's default-image CHOICE is never written, so this
+ * pins nothing for its later work turns.
+ */
+async function launchReadOnlySupervisor(
+  runner: Awaited<ReturnType<typeof createRunner>>,
+  args: [SandboxConfig, string, string, boolean, string | undefined, string, string],
+  task: Task,
+  phases: PhaseReporter,
+): Promise<void> {
+  const [sandbox, containerName, protoDir, debug, daemonConfigPath, tRef, taskId] = args;
+  try {
+    await runner.launchSupervisor(sandbox, containerName, protoDir, debug, daemonConfigPath, tRef, taskId, await readOnlyLaunchPin(task), phases.notify);
+  } catch (err) {
+    const imageRefused = err instanceof RunnerImageNotReadyError || (err as { code?: string } | null)?.code === 'runner_image_not_ready';
+    if (!imageRefused || launchImagePin(task)) throw err;
+    phases.note("the project's runner image is not ready; running this read-only turn on lazy's default image");
+    await runner.launchSupervisor(sandbox, containerName, protoDir, debug, daemonConfigPath, tRef, taskId, READONLY_DEFAULT_RUNNER_IMAGE_PIN, phases.notify);
+  }
+}
+
 export async function launchAskTask(
   projectRoot: string,
   params: AskTaskParams,
@@ -2311,16 +2591,28 @@ async function launchAskTaskRun(
     // INVARIANT: an ask is somebody's question, so a paused credential REFUSES
     // it before anything runs. The record route runs a machine one-shot on the
     // builder role's credential, so that is the one judged.
-    await assertBesideLaunchAllowed(projectRoot, {
-      config: await loadConfig(projectRoot), actor, what: `the ask of ${displayId(task)}`,
-      overrideEligible: params.usagePauseOverrideEligible === true,
-    });
+    const config = await loadConfig(projectRoot);
+    if (params.overrideUsagePause) {
+      if (params.usagePauseOverrideEligible !== true) {
+        throw new RpcError(403, 'Only a person at their own terminal may override the usage pause for this ask.');
+      }
+      await assertBesideUsagePauseOverrideAllowed(projectRoot, config, actor);
+    } else {
+      await assertBesideLaunchAllowed(projectRoot, {
+        config, actor, what: `the ask of ${displayId(task)}`,
+        overrideEligible: params.usagePauseOverrideEligible === true,
+        overrideCommand: `lazy ask ${displayId(task)} --override-usage-pause`,
+      });
+    }
     phases.end(displayId(task));
     phases.announce(askPhasePlan('record'), displayId(task));
     phases.begin(ASK_PHASES.read_record);
-    const record = await askTaskRecord(projectRoot, storage, task, sanitizeUserText(params.message).trim(), {
-      onProgress: (message) => phases.note(message),
-    });
+    // Paid by the person asking (team mode), else the service holder.
+    const { runAsOneshotPayer } = await import('../oneshot');
+    const record = await runAsOneshotPayer(actorEmail(actor) ?? null, () =>
+      askTaskRecord(projectRoot, storage, task, sanitizeUserText(params.message).trim(), {
+        onProgress: (message) => phases.note(message),
+      }));
     phases.end();
     return {
       outcome: 'answered',
@@ -2419,8 +2711,8 @@ async function launchAskTaskRun(
       assertAskableStatus(task, fresh.status);
       // Before the question's turn is recorded — see assertNoMemberInside.
       assertNoMemberInside(task.id);
-      // Same reason: a turn with no credential for its profile is refused here,
-      // before its turn row exists — never after (assertTurnCredentialAvailable).
+      // A turn with no credential for its profile is refused here: this launch carries
+      // no human feedback to save first (unlike unblock — recordFeedbackThenRefuse).
       await assertTurnCredentialAvailable(projectRoot, { taskId: task.id, storage });
       statusBeforeAsk = fresh.status;
 
@@ -2456,7 +2748,7 @@ async function launchAskTaskRun(
       const fullMessage = buildPromptWithInstructions(askMessage.trim(), task.goal, projectRoot);
 
       // --- Record the human turn BEFORE launching ---
-      // INVARIANT (CLAUDE.md): human feedback must be durably saved before any
+      // INVARIANT (AGENTS.md): human feedback must be durably saved before any
       // operation that might fail can discard it. For an ask, the question is
       // the feedback.
       //
@@ -2476,7 +2768,7 @@ async function launchAskTaskRun(
         sessionId: sess.id,
         sequence: askClaim.humanSeq,
         role: 'human',
-        content: askMessage.trim(),
+        content: neutralizeLazyMarkers(askMessage.trim()),
         agent: task.agent_id,
         model: modelName,
         effort: effortValue,
@@ -2550,16 +2842,28 @@ async function launchAskTaskRun(
         );
       }
       const reusedExistingSupervisor =
-        !mustRecreateContainer && !mustRecreateForAgent && !mustRecreateForEnv && (await runner.isRunning(containerName));
+        !mustRecreateContainer && !mustRecreateForAgent && !mustRecreateForEnv && !mustRecreateForRunnerImage(task) && (await runner.isRunning(containerName));
       if (reusedExistingSupervisor) {
         // Supervisor already running — it will pick up the ask command
         phases.note(`reusing running container ${containerName}`);
       } else {
         await removeTaskRun(runner, storage, sess, containerName);
         try {
-          await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef, task.id, pinnedCustomImage(task), phases.notify);
+          await launchReadOnlySupervisor(runner, [sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef, task.id], task, phases);
         } catch (err) {
-          await storage.updateTaskStatus(task.id, 'interrupted', actor);
+          // A read-only question must never leave the task `interrupted` over
+          // the image: auto-resume would turn that into a WORK turn nobody
+          // asked for. (It cannot normally get here — the launch falls back to
+          // lazy's default image — but if the default image itself is refused
+          // the same way, put back what it was.)
+          if (err instanceof RunnerImageNotReadyError || (err as { code?: string } | null)?.code === 'runner_image_not_ready') {
+            await storage.updateTaskStatus(task.id, statusBeforeAsk, actor);
+            movedToWorking = false;
+            throw new RpcError(409, `Not asked: ${RUNNER_IMAGE_NOT_READY_MARKER}. ${err instanceof Error ? err.message : String(err)}`, 'runner_image_not_ready');
+          }
+          // Lazy's failure, not the asker's: system-attributed, with its reason.
+          await storage.updateTaskStatus(task.id, 'interrupted', await systemActor(projectRoot),
+            `the task's container did not start: ${err instanceof Error ? err.message : String(err)}`);
           movedToWorking = false;
           throw new RpcError(500, `Failed to launch supervisor: ${err instanceof Error ? err.message : err}`);
         }
@@ -3052,7 +3356,7 @@ export function renderReviewTurnPrompt(task: Task, audience: 'human' | 'agent' =
   // §8: the review prompt is audience-specific — a reviewer reporting to the
   // human is walked region by region through the diff; one reporting to a
   // parent agent reports scope and correctness only. Selected here and
-  // nowhere else, exactly like the wrap-up plan's audience map.
+  // nowhere else.
   const body = audience === 'agent' ? reviewTurnScopePrompt : reviewTurnFeaturePrompt;
   return body
     .replaceAll('{{task_id}}', displayId(task))
@@ -3061,9 +3365,10 @@ export function renderReviewTurnPrompt(task: Task, audience: 'human' | 'agent' =
 }
 
 /**
- * Which audience the reviewer reports to (§8): derived from the same two
- * inputs every other audience derivation reads — the session's turns and the
- * task's creation actor — so the wrap-up, the outstanding-violations resolver
+ * Which audience the reviewer reports to (§8): derived from the same inputs
+ * every other audience derivation reads — the session's turns, the task's
+ * creation actor and whether its parent is a cluster — so the wrap-up, the
+ * outstanding-violations resolver
  * and the review prompt can never disagree about who this task is for.
  *
  * Best-effort like them: a task whose history cannot be read reviews for the
@@ -3076,7 +3381,11 @@ async function resolveReviewAudience(
 ): Promise<'human' | 'agent'> {
   try {
     const turns = await storage.getSessionTurns(sessionId);
-    return audienceOf({ turns, createdBy: await createdByOf(storage, task) });
+    return audienceOf({
+      turns,
+      createdBy: await createdByOf(storage, task),
+      parentIsCluster: await parentIsClusterOf(storage, task),
+    });
   } catch (err) {
     logger.debug(
       `Task ${task.id.substring(0, 8)}: turns unavailable for the review audience, ` +
@@ -3246,7 +3555,7 @@ async function settleAutoReviewRound(
     // on the child's own report and diff. Saying "failed to parse ... even
     // after the one re-ask" about a provider outage is both wrong and a guessed
     // cause inside a message whose only job is explaining the cause
-    // (CLAUDE.md, "never present a guessed cause as the explanation").
+    // (AGENTS.md, "never present a guessed cause as the explanation").
     //
     // `recordReviewErrorTurn` stamps `FAILED: the reviewer did not finish — …`
     // as the verdict of a crash, so the distinction is already in the record;
@@ -3542,9 +3851,16 @@ async function holdReviewFixForUsagePause(
   record: InFlightTurn,
 ): Promise<boolean> {
   const held = await usagePauseHold(projectRoot, storage, task, 'review auto-fix');
-  if (!held) return false;
+  // The fix is a daemon-started WRITE turn: while the project's runner image
+  // is not ready (and nobody chose the default image) it WAITS like the others.
+  // Held on the same record, which the reconciler's sweep re-offers every pass;
+  // the replay holds it again until the image is ready.
+  const imageHeld = held ? null : await runnerImageHold(task);
+  if (!held && !imageHeld) return false;
   await storage.updateTaskMetadata(task.id, USAGE_PAUSE_PENDING_FIX_KEY, JSON.stringify(record));
-  logger.info(`Review auto-fix for ${displayId(task)} held by usage pause — ${held}`);
+  logger.info(held
+    ? `Review auto-fix for ${displayId(task)} held by usage pause — ${held}`
+    : `Review auto-fix for ${displayId(task)} held until the project's runner image is ready — ${imageHeld}`);
   return true;
 }
 
@@ -3565,6 +3881,10 @@ async function holdReviewFixForUsagePause(
 export async function resumeHeldReviewFix(projectRoot: string, storage: Storage, task: Task): Promise<void> {
   const raw = await storage.getTaskMetadata(task.id, USAGE_PAUSE_PENDING_FIX_KEY);
   if (!raw) return;
+  // Still waiting on the project's runner image: leave the record where it is.
+  // Clearing and re-running the settle every pass would rewrite it and log a
+  // replay for the whole length of the build.
+  if (await runnerImageHold((await storage.getTask(task.id)) ?? task)) return;
   await storage.updateTaskMetadata(task.id, USAGE_PAUSE_PENDING_FIX_KEY, '');
   let record: InFlightTurn;
   try {
@@ -3588,7 +3908,7 @@ export async function resumeHeldReviewFix(projectRoot: string, storage: Storage,
   }
   const reviewTurn = await readRecordedReviewTurn(storage, record);
   if (!reviewTurn?.review) return;
-  logger.info(`Task ${displayId(task)}: usage pause lifted — running the review auto-fix it held`);
+  logger.info(`Task ${displayId(task)}: running the review auto-fix that was held (usage pause or runner image)`);
   if (record.review_follow_up?.auto_review) {
     await settleAutoReviewRound(projectRoot, storage, fresh, record, reviewTurn.review);
   } else {
@@ -3706,8 +4026,8 @@ async function launchReviewTaskRun(
       assertReviewableStatus(task, fresh.status);
       // Before the review's turn is recorded — see assertNoMemberInside.
       assertNoMemberInside(task.id);
-      // Same reason: a turn with no credential for its profile is refused here,
-      // before its turn row exists — never after (assertTurnCredentialAvailable).
+      // A turn with no credential for its profile is refused here: this launch carries
+      // no human feedback to save first (unlike unblock — recordFeedbackThenRefuse).
       await assertTurnCredentialAvailable(projectRoot, { taskId: task.id, storage });
       statusBeforeReview = fresh.status;
 
@@ -3817,7 +4137,7 @@ async function launchReviewTaskRun(
         await runner.removeRun(containerName);
       }
       try {
-        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef, task.id, pinnedCustomImage(task), phases.notify);
+        await launchReadOnlySupervisor(runner, [sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef, task.id], task, phases);
       } catch (err) {
         await storage.updateTaskStatus(task.id, statusBeforeReview, actor);
         movedToWorking = false;
@@ -3960,7 +4280,7 @@ async function recordAskCompletedTurn(
     await rollUpSessionUsage(storage, session.id, turnUsage);
   }
 
-  // INVARIANT (CLAUDE.md — never lose human feedback): the agent answered, so
+  // INVARIANT (AGENTS.md — never lose human feedback): the agent answered, so
   // the pending feedback backlog (this ask, plus anything queued before it) is
   // consumed and must not be re-delivered on a later resume. Outside the guard
   // above so a re-flush still converges. See src/utils/feedback-redelivery.ts.
@@ -3991,6 +4311,8 @@ async function recordAskErrorTurn(
   protoDir: string,
   /** Sequence reserved for this answer by claimSyncTurn. */
   reservedSeq: number,
+  /** Park the task `interrupted` (auto-resumable). False leaves the status to the caller. */
+  parkInterrupted = true,
 ): Promise<void> {
   const watchdogKill = isWatchdogKill(response);
   const lines: string[] = [watchdogKill ? WATCHDOG_TURN_HEADING : '[Agent crashed]', ''];
@@ -4033,7 +4355,7 @@ async function recordAskErrorTurn(
 
   consumeResponse(protoDir);
   clearStatus(protoDir);
-  await storage.updateTaskStatus(taskId, 'interrupted', 'system');
+  if (parkInterrupted) await storage.updateTaskStatus(taskId, 'interrupted', 'system');
 }
 
 /**
@@ -4283,6 +4605,43 @@ async function launchAcceptanceGate(
   // (runAcceptanceGate). Skip the container entirely.
   if (preAccept.commands.length === 0) return;
 
+  const gate = await runInAcceptGateContainer(projectRoot, task, worktreePath, config, priorStatus, {
+    label: 'Acceptance gate',
+    commands: preAccept.commands,
+    timeoutSecs: preAccept.timeout ?? DEFAULT_PRE_ACCEPT_TIMEOUT_SECS,
+  });
+
+  if (!gate.passed) {
+    const storage = await getOrCreateStorage();
+    const cmdLabel = gate.failed_command ? `\`${gate.failed_command}\`` : 'a configured check';
+    const exitLabel = gate.exit_code === -2 ? 'timed out' : `exited with ${gate.exit_code ?? 'a non-zero code'}`;
+    const outputTail = gate.output ? `\n\n\`\`\`\n${gate.output.slice(-1500)}\n\`\`\`` : '';
+    // Keep the accept-side copy byte-identical to the historical message —
+    // surfaces and suites match on it.
+    const message = `Pre-accept checks failed: ${cmdLabel} ${exitLabel}. Task returned to ${priorStatus}; accept aborted. Fix the issue, then re-accept.`;
+    await storage.createComment(task.id, `${message}${outputTail}`, 'system');
+    throw new RpcError(409, message);
+  }
+}
+
+/**
+ * Run `commands` in the task's worktree inside the ephemeral acceptance-gate
+ * container, and return the raw verdict. Shared by `[automation.pre_accept]`
+ * and `[automation] accept_check`: both execute code the task branch can
+ * influence, and such code never runs on the daemon's host.
+ *
+ * Infrastructure failures (no supervisor, timeout, crash, a foreign response)
+ * restore `priorStatus`, comment on the task and throw RpcError. On a verdict
+ * — pass or fail — the task is back in `priorStatus` when this returns.
+ */
+async function runInAcceptGateContainer(
+  projectRoot: string,
+  task: Task,
+  worktreePath: string,
+  config: ResolvedConfig,
+  priorStatus: TaskStatus,
+  spec: { label: string; commands: string[]; timeoutSecs: number },
+): Promise<AcceptGateResult> {
   const storage = await getOrCreateStorage();
 
   const tRef = taskRef(task);
@@ -4291,7 +4650,7 @@ async function launchAcceptanceGate(
   if (existingLock) {
     throw new RpcError(409, `Cannot run the acceptance gate for ${displayId(task)}: worktree is locked by another process (PID ${existingLock.pid}, ${existingLock.command}).`);
   }
-  const whatLabel = 'Acceptance gate';
+  const whatLabel = spec.label;
   await acquireLock(worktreePath, 'lazy accept (acceptance gate)');
 
   // Declared before the try so the finally can clean up a partially-set-up
@@ -4299,6 +4658,7 @@ async function launchAcceptanceGate(
   let runner: Runner | null = null;
   let containerName: string | null = null;
   let gateProtoDir: string | null = null;
+  let gateMarked = false;
 
   try {
     // The gate reuses `lazy review`'s run machinery: a runner for the task's
@@ -4319,6 +4679,10 @@ async function launchAcceptanceGate(
     // auto-deliver and auto-resume off the task while its worktree is locked
     // by the gate. The reconciler also never touches a `working` task whose
     // worktree is locked — the gate holds the lock for its whole duration.
+    // Marked BEFORE the flip: the gate's `working` is not a turn, and the
+    // task's MCP token must not read it as one (./accept-gate-marker.ts).
+    markAcceptGateRunning(task.id);
+    gateMarked = true;
     await storage.updateTaskStatus(task.id, 'working', 'system');
 
     gateProtoDir = acceptGateProtocolDir(task.id);
@@ -4338,8 +4702,8 @@ async function launchAcceptanceGate(
     const gateCommand: AcceptGateCommand = {
       type: 'accept_gate',
       task_id: task.id,
-      accept_gate_commands: preAccept.commands,
-      accept_gate_timeout: preAccept.timeout,
+      accept_gate_commands: spec.commands,
+      accept_gate_timeout: spec.timeoutSecs,
       // Inline version/id fields, NOT commonCommandFields(): the gate is a
       // mechanical command — no agent turn starts, so turn_started_at, the
       // watchdog/wind-down budgets, react and maintain fields are all
@@ -4358,7 +4722,7 @@ async function launchAcceptanceGate(
     try {
       // daemonConfigPath stays undefined: the gate container gets NO MCP
       // config — no agent runs, so there is nothing for MCP to configure.
-      await runner.launchSupervisor(sandbox, containerName, gateProtoDir, false, undefined, tRef, task.id, pinnedCustomImage(task));
+      await runner.launchSupervisor(sandbox, containerName, gateProtoDir, false, undefined, tRef, task.id, launchImagePin(task));
     } catch (err) {
       const message = `${whatLabel}: failed to launch supervisor: ${err instanceof Error ? err.message : err}. Task returned to ${priorStatus}; accept aborted.`;
       await storage.updateTaskStatus(task.id, priorStatus, 'system');
@@ -4371,7 +4735,7 @@ async function launchAcceptanceGate(
     // configured timeout, they run in order, plus a margin for supervisor
     // startup and shutdown. There is no agent here to watchdog — the agent
     // watchdog budget (watchdog_output_timeout_ms) does not apply.
-    const timeoutMs = preAccept.commands.length * (preAccept.timeout ?? DEFAULT_PRE_ACCEPT_TIMEOUT_SECS) * 1000 + SYNC_TURN_TIMEOUT_MARGIN_MS;
+    const timeoutMs = spec.commands.length * spec.timeoutSecs * 1000 + SYNC_TURN_TIMEOUT_MARGIN_MS;
     const outcome = await waitForSupervisorResponse({ protoDir: gateProtoDir, runner, runName: containerName, timeoutMs });
 
     if (outcome.kind === 'dead') {
@@ -4395,7 +4759,7 @@ async function launchAcceptanceGate(
       // configs that do not apply here (no agent watchdog is running).
       const message =
         `${whatLabel} hit the daemon's wait budget (${Math.floor(timeoutMs / 1000)}s — ` +
-        `${preAccept.commands.length} command(s) × ${preAccept.timeout ?? DEFAULT_PRE_ACCEPT_TIMEOUT_SECS}s + ${Math.floor(SYNC_TURN_TIMEOUT_MARGIN_MS / 1000)}s margin): ` +
+        `${spec.commands.length} command(s) × ${spec.timeoutSecs}s + ${Math.floor(SYNC_TURN_TIMEOUT_MARGIN_MS / 1000)}s margin): ` +
         `the gate never reported back. Task returned to ${priorStatus}; accept aborted. ` +
         `Re-accept when ready — a fresh gate will run.`;
       await storage.updateTaskStatus(task.id, priorStatus, 'system');
@@ -4439,23 +4803,13 @@ async function launchAcceptanceGate(
     // recovery the daemon hears about is recorded.
     await journalWorktreeRecovery(storage, task.id, completed.worktree_recovery);
 
-    if (!gate.passed) {
-      const cmdLabel = gate.failed_command ? `\`${gate.failed_command}\`` : 'a configured check';
-      const exitLabel = gate.exit_code === -2 ? 'timed out' : `exited with ${gate.exit_code ?? 'a non-zero code'}`;
-      const outputTail = gate.output ? `\n\n\`\`\`\n${gate.output.slice(-1500)}\n\`\`\`` : '';
-      // Keep the accept-side copy byte-identical to the historical message —
-      // surfaces and suites match on it.
-      const message = `Pre-accept checks failed: ${cmdLabel} ${exitLabel}. Task returned to ${priorStatus}; accept aborted. Fix the issue, then re-accept.`;
-      await storage.updateTaskStatus(task.id, priorStatus, 'system');
-      await storage.createComment(task.id, `${message}${outputTail}`, 'system');
-      throw new RpcError(409, message);
-    }
-
-    // Gate passed. Return the task to the status it had before the accept so
-    // the merge that follows transitions from a valid state, and a mid-merge
-    // failure leaves the task cleanly re-acceptable AS IT WAS.
+    // A verdict, pass or fail: back to the status the accept found. The caller
+    // decides what a failure means (pre_accept refuses; accept_check may be
+    // overridden with --allow-broken).
     await storage.updateTaskStatus(task.id, priorStatus, 'system');
+    return gate;
   } finally {
+    if (gateMarked) clearAcceptGateRunning(task.id);
     // The gate container is EPHEMERAL (§12.2): torn down however the gate ends
     // — pass, fail, crash, abort. Teardown failure must not mask the verdict
     // (the throw or return the caller is about to reach), but it is never
@@ -4625,7 +4979,7 @@ async function rejectTaskRun(
 
   // Clean up container
   await cleanupTaskContainer(storage, sess, taskRef(task), projectRoot);
-  await revokeTaskTokens(projectRoot, task.id);
+  await revokeTaskTokens(projectRoot, task);
 
   // Store rejection reason as comment
   await storage.createComment(task.id, `[Rejected] ${params.reason.trim()}`, actor);
@@ -4801,7 +5155,7 @@ async function closeTaskRun(
   // token left behind here would never be cleaned up by anything, since the
   // task is now terminal. Both revocations are idempotent, so a task that
   // genuinely had neither pays a no-op.
-  await revokeTaskTokens(projectRoot, task.id);
+  await revokeTaskTokens(projectRoot, task);
 
   phases.end();
 
@@ -5115,7 +5469,7 @@ export interface AcceptTaskPreflightParams {
  *
  * Computed DAEMON-SIDE on purpose: a CLI-side enrollment check run from a task
  * worktree resolves the wrong project root and falsely reports not-enrolled
- * (the fix-approve-enroll-ux incident). And per CLAUDE.md, every failable
+ * (the fix-approve-enroll-ux incident). And per AGENTS.md, every failable
  * check runs before the human is asked to type — enrollment and the forge
  * probe both live here so the passphrase prompt can never be a dead end.
  */
@@ -5130,6 +5484,12 @@ export interface AcceptGateInfo {
   enrollment: 'enrolled' | 'not-enrolled' | 'unknown';
   /** Actionable enrollment instructions when enrollment is 'not-enrolled'. */
   enrollmentMessage: string | null;
+  /**
+   * Lazy Teams (managed mode): the passphrase is not a route here. When set,
+   * the only approvals are a signed-in member's own browser Accept or a forge
+   * PR/MR approval, and this says so in words a CLI prints verbatim.
+   */
+  teamsAcceptOnly: string | null;
   /** Where the human gets the token, for the interactive prompt. */
   sourceLabel: string | null;
   /**
@@ -5249,6 +5609,8 @@ export async function acceptTaskPreflight(
     await checkWorktreeGitSafeOrThrow(worktreePath, displayId(task), 'accept');
   }
   await refuseRedirectedHead(worktreePath, sess.git_branch);
+  await refuseDeliveredSecretsOnBranch(projectRoot, task, worktreePath, sess.git_start_sha,
+    () => deliveredFilesUpstreamExclude({ task, session: sess, storage, projectRoot, worktreePath, config }));
 
   // --- Status validation ---
   if (task.status === 'pairing') {
@@ -5296,6 +5658,19 @@ export async function acceptTaskPreflight(
   const isResume = task.status === 'merging' && !!task.metadata?.[ACCEPT_IN_FLIGHT_KEY];
 
   const violationState = await resolveOutstandingViolations(projectRoot, task, sess, turns, storage);
+  // INVARIANT (deferred to the parent — src/protection/deferral.ts): an
+  // agent-audience subtask, every cluster child included, is NOT asked here.
+  // Its protected files go up undecided and its parent's accept asks them,
+  // where a person reviews the whole work; the resolver has already emptied
+  // `outstanding`, so the gate below cannot refuse it. Approving here would
+  // only ever record an agent's answer, which the parent ignores. Say so,
+  // naming the files, so the merge is never silent about what it carried.
+  if (!isResume && violationState.deferredTo && violationState.deferred.length > 0) {
+    warnings.push(deferredProtectedFilesNotice(
+      violationState.deferred.map(v => v.file),
+      violationState.deferredTo,
+    ));
+  }
   if (!isResume && violationState.outstanding.length > 0) {
     const pendingFiles = violationState.outstanding.map(v => v.file);
 
@@ -5496,7 +5871,7 @@ export async function acceptTaskPreflight(
 
     // --- Undelivered human feedback gate ---
     // Comments a human wrote that no prompt has carried yet. Accepting now ends
-    // the task with that feedback never read (CLAUDE.md, "Never Lose Human
+    // the task with that feedback never read (AGENTS.md, "Never Lose Human
     // Feedback"), so accept refuses unless the human says they mean it. A
     // policy gate: a resumed accept already passed it and never re-checks.
     // The same count backs the "Before you can accept" row every surface shows.
@@ -5620,7 +5995,7 @@ export async function acceptTaskPreflight(
 
   // --- Branch-protection pre-flight ---
   // Answers "will this accept need a passphrase?" BEFORE the CLI prompts, so
-  // the prompt is never a dead end (CLAUDE.md: failable checks run first).
+  // the prompt is never a dead end (AGENTS.md: failable checks run first).
   // 'merging' is exempt like the gate itself: re-entry completes an already
   // authorized merge.
   const gate: AcceptGateInfo = {
@@ -5629,6 +6004,7 @@ export async function acceptTaskPreflight(
     satisfiedByForge: false,
     enrollment: 'unknown',
     enrollmentMessage: null,
+    teamsAcceptOnly: null,
     sourceLabel: null,
     pendingReview: null,
   };
@@ -5659,11 +6035,17 @@ export async function acceptTaskPreflight(
         }
       }
 
-      const verifier = createHumanTokenVerifier(projectRoot);
-      const probe = await verifier.probeEnrollment();
-      gate.enrollment = probe.status;
-      gate.enrollmentMessage = probe.status === 'not-enrolled' ? probe.message : null;
-      gate.sourceLabel = verifier.sourceLabel;
+      if (isManagedMode()) {
+        // Lazy Teams has no passphrase: probing one here would send a bound
+        // clone's CLI off to enroll on a laptop the daemon never reads.
+        gate.teamsAcceptOnly = teamsAcceptOnlyMessage(displayId(task));
+      } else {
+        const verifier = createHumanTokenVerifier(projectRoot);
+        const probe = await verifier.probeEnrollment();
+        gate.enrollment = probe.status;
+        gate.enrollmentMessage = probe.status === 'not-enrolled' ? probe.message : null;
+        gate.sourceLabel = verifier.sourceLabel;
+      }
     }
   }
 
@@ -5783,6 +6165,13 @@ export interface AcceptTaskParams {
    * "--yes skips prompts, not the gate" structural rather than a convention.
    */
   token?: string;
+  /**
+   * The signed-in Lazy Teams member whose own Accept this is. Set ONLY by the
+   * RPC layer from the authenticated caller (`memberAcceptApprover`), never by
+   * MCP or the CLI; on a protected merge it is the approval, recorded in the
+   * accept reason.
+   */
+  memberApproval?: MemberApproval;
   approvedFiles?: string[];
   /**
    * Resolutions for every open raised item (all-or-nothing). See
@@ -6044,6 +6433,8 @@ export async function commitAcceptTransition(
     followThrough: AcceptFollowThrough;
   },
 ): Promise<void> {
+  const payerEmail = opts.followThrough.payerEmail ?? actorEmail(opts.actor);
+  if (payerEmail) opts.followThrough.payerEmail = payerEmail;
   await storage.updateTaskMetadata(task.id, ACCEPT_FOLLOWTHROUGH_KEY, JSON.stringify(opts.followThrough));
 
   // The human's reason lands BEFORE the session ends. An ended `accepted`
@@ -6118,7 +6509,7 @@ export interface FollowThroughOutcome {
  * INVARIANT: nothing here changes task status. A task that reached `complete`
  * stays there whatever fails below.
  *
- * INVARIANT (CLAUDE.md "Fail hard on remote failures", unchanged): a parent push
+ * INVARIANT (AGENTS.md "Fail hard on remote failures", unchanged): a parent push
  * that fails after its retries is a FAILURE — reported in the accept result, on
  * every retry, and in a system message when it persists. It is never softened
  * into success. It simply no longer un-accepts work that has already merged.
@@ -6203,13 +6594,27 @@ export async function runAcceptFollowThrough(
       // origin/<parent>. Plain branch push (withRemoteRetry, fails hard), never
       // a PR/MR. Uses the ORIGINAL driver: the merge driver for an unprotected
       // target is a LocalDriver whose push is a no-op.
+      // A local driver that mirrors origin (a Teams-hosted repository,
+      // src/remote/origin-mirror.ts) pushes the target here too, so members
+      // fetch accepted work. Offline, `driver` is a mirrorless LocalDriver.
       if (!record.pushParent) return;
-      if (offline || !driver.needsSync) {
+      const mirrors = driver instanceof LocalDriver && driver.originMirror !== null;
+      if (offline || (!driver.needsSync && !mirrors)) {
         throw new Error(`lazy is offline, so ${target} cannot be pushed to ${config.remote.git_remote} yet`);
       }
       try {
         await driver.pushBranch(target);
       } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        // Plain push, never force: a remote target that moved (someone pushed
+        // to it directly) is never overwritten. Loud, retried, task stays complete.
+        if (isNonFastForwardRejection(msg)) {
+          throw new Error(
+            `${config.remote.git_remote}/${target} has commits that local ${target} does not (someone pushed to it directly), ` +
+            `so the accepted work was not pushed — lazy never overwrites it. The work is merged into local ${target} and stays accepted; ` +
+            `retries keep failing, and accepts into ${target} are refused, until the two are reconciled — lazy cannot do that by itself yet. Git said: ${msg}`,
+          );
+        }
         throw new Error(
           `pushing ${target} to ${config.remote.git_remote} failed: ${err instanceof Error ? err.message : err}. ` +
           `Local ${target} is ahead of the remote until it is pushed (git push ${config.remote.git_remote} ${target}).`,
@@ -6217,7 +6622,7 @@ export async function runAcceptFollowThrough(
       }
     },
     'close-review': async () => {
-      // INVARIANT (CLAUDE.md "PRs only for protected branches"): a PR/MR a
+      // INVARIANT (AGENTS.md "PRs only for protected branches"): a PR/MR a
       // person submitted into a branch accept merges LOCALLY is closed once the
       // merge lands — never left open to claim the work has not landed, and
       // never merged through the forge instead (mergeLandsLocally stays the one
@@ -6251,15 +6656,28 @@ export async function runAcceptFollowThrough(
     'parent-fidelity': async () => {
       // Child→parent fidelity: the parent body is kept current as children land,
       // so by the time the parent merges it already reflects all child work.
-      await regenerateParentFidelity(storage, task, driver, config, projectRoot, warnings);
+      await regenerateParentFidelity(storage, task, driver, config, projectRoot, warnings, record.payerEmail ?? null);
     },
     cleanup: async () => {
       const sess = await storage.getSessionByTaskId(task.id);
       const worktreePath = getWorktreePath(projectRoot, task);
       if (sess) await cleanupTaskContainer(storage, sess, taskRef(task), projectRoot);
-      await revokeTaskTokens(projectRoot, task.id);
+      await revokeTaskTokens(projectRoot, task);
       await removeLock(worktreePath);
-      if (sess) {
+      if (sess && isLinkedTask(task)) {
+        // INVARIANT: a linked task's branch is adopted, and lazy never pushes
+        // it — so local commits on it may exist nowhere else. Delete it only
+        // when origin has every one of them; otherwise keep it and say so.
+        const unpushed = await linkedBranchUnpushedCount(sess.git_branch, projectRoot, config.remote.git_remote);
+        if (unpushed === 0) {
+          await cleanupWorktreeAndBranch(worktreePath, sess.git_branch, projectRoot, storage, task.id, sess.agent_session_id);
+        } else {
+          await cleanupWorktree(worktreePath, projectRoot, storage, task.id, sess.agent_session_id);
+          warnings.push(unpushed === null
+            ? `Kept local branch ${sess.git_branch}: ${config.remote.git_remote}/${sess.git_branch} is gone, so lazy cannot tell whether it holds unpushed work.`
+            : `Kept local branch ${sess.git_branch}: it has ${unpushed} commit(s) ${config.remote.git_remote}/${sess.git_branch} does not.`);
+        }
+      } else if (sess) {
         await cleanupWorktreeAndBranch(worktreePath, sess.git_branch, projectRoot, storage, task.id, sess.agent_session_id);
       }
       removeProtocolDir(getProtocolDir(task.id));
@@ -6329,6 +6747,18 @@ export async function runAcceptFollowThrough(
     logger.info(`Task ${displayId(task)}: post-accept follow-through completed after ${record.attempts} failed attempt(s).`);
   }
   return { pending: [] };
+}
+
+/**
+ * Commits on a linked task's local branch that `<remote>/<branch>` lacks.
+ * Null when the remote-tracking ref is missing or git cannot answer — the
+ * caller then keeps the branch rather than guess.
+ */
+export async function linkedBranchUnpushedCount(branch: string, root: string, remote: string): Promise<number | null> {
+  const result = await runGit(['rev-list', '--count', `refs/remotes/${remote}/${branch}..refs/heads/${branch}`], { cwd: root });
+  if (result.exitCode !== 0) return null;
+  const n = Number.parseInt(result.stdout.trim(), 10);
+  return Number.isNaN(n) ? null : n;
 }
 
 /**
@@ -6681,7 +7111,9 @@ async function acceptTaskRun(
       const landed = await acceptWorkLanded(storage, projectRoot, early, config);
       if (landed) {
         let pushParent = false;
-        if (landed.where === 'local' && driver.needsSync && !offline) {
+        if (landed.where === 'local' && !offline && !driver.needsSync) {
+          pushParent = await acceptPushesTargetToMirror(driver as LocalDriver, projectRoot);
+        } else if (landed.where === 'local' && driver.needsSync && !offline) {
           try {
             pushParent = isIntermediateBranch(landed.target) || !(await driver.isTargetBranchProtected(landed.target));
           } catch (err) {
@@ -6849,6 +7281,75 @@ async function acceptTaskRun(
     warnings.push(revertedProtectedFilesNotice(preflight.revertedProtectedFiles));
   }
 
+  // --- Step 1d: a Teams-hosted origin (mirroring local driver) ---
+  // INVARIANT (accept-merge-is-commit-point): decided HERE, in the pre-merge
+  // band, and carried to follow-through as a boolean — nothing new may run
+  // between the merge and the accept transition. Offline the driver is
+  // mirrorless, so nothing is owed.
+  const pushTargetToMirror = !driver.needsSync
+    && await acceptPushesTargetToMirror(driver as LocalDriver, projectRoot);
+  // --- Step 1e: commits pushed to the TASK branch on origin ---
+  // Runs BEFORE the branch-protection gate on purpose. When both apply (a
+  // member pushed from `lazy shell --local` and the target is protected), the
+  // useful answer is "run lazy sync", which can be acted on from where the
+  // accept was typed; in Lazy Teams the gate's answer is "press Accept in the
+  // browser", which would then be refused here anyway. This check only refuses
+  // or warns and never merges, so running it first lets nothing past the gate:
+  // when origin is not ahead, Step 1a still runs exactly as before.
+  // A member may have run `git push` from `lazy shell --local`; the squash
+  // below reads the LOCAL branch and would silently leave those commits out.
+  // Same detection as sync step 1 (`driver.fetchBranch`), refused rather than
+  // merged: accept never merges for the user. A branch that is not on origin
+  // yet (or an unreachable origin) has nothing to bring in. A resume re-checks
+  // no policy, and a forge-pending merge (`merging`, no marker) never reaches
+  // this check: Step 1b answers it, exactly as before the move.
+  if (preflight.taskStatus !== 'merging' && (driver.needsSync || pushTargetToMirror)) {
+    phases.begin(ACCEPT_PHASES.taskBranch, `${config.remote.git_remote}/${sess.git_branch}`);
+    let originAhead = false;
+    try {
+      originAhead = await driver.fetchBranch(sess.git_branch, worktreePath);
+    } catch (err) {
+      // `git fetch <remote> <branch>` fails the same way for "not pushed yet"
+      // and "origin unreachable". Only the first is safe to accept past: an
+      // unreachable origin may hold pushed commits the squash would drop. So
+      // ask `ls-remote --exit-code`, which tells them apart: exit 2 = the
+      // branch is absent (nothing to bring in, warn); anything else refuses.
+      const detail = err instanceof Error ? err.message : String(err);
+      logger.debug(`acceptTask: could not fetch ${sess.git_branch} from origin: ${detail}`);
+      const probe = await probeOriginBranch(config.remote.git_remote, sess.git_branch, worktreePath);
+      if (probe.kind !== 'absent') {
+        phases.end('origin unreachable');
+        const why = probe.kind === 'present'
+          ? `the branch exists there but could not be fetched (${detail})`
+          : `${config.remote.git_remote} could not be reached (${probe.detail})`;
+        throw acceptRefusal(503,
+          `Cannot check ${config.remote.git_remote}/${sess.git_branch} for commits pushed to the task: ${why}. ` +
+          `Accepting now could leave pushed commits out. Check the remote is reachable, then accept again.`,
+          {
+            reason: 'task-branch-origin-unreachable',
+            next: 'Make the remote reachable, then accept again.',
+            command: `lazy accept ${shellQuote(preflight.displayId)}`,
+          });
+      }
+      logger.debug(`acceptTask: ${config.remote.git_remote}/${sess.git_branch} does not exist; nothing was pushed to the task from elsewhere`);
+    }
+    phases.end(originAhead ? 'origin has commits the task lacks' : 'up to date');
+    if (originAhead) {
+      throw acceptRefusal(409,
+        `${config.remote.git_remote}/${sess.git_branch} has commits the task branch lacks (pushed to the task from elsewhere). ` +
+        `Run \`lazy sync ${preflight.displayId}\` to bring them in, then accept again; accepting now would leave them out.`,
+        {
+          reason: 'task-branch-behind-origin',
+          next: 'Bring the pushed commits into the task, then accept again.',
+          command: `lazy sync ${shellQuote(preflight.displayId)}`,
+        });
+    }
+  }
+
+  else if (!isRemoteMergeReentry) {
+    phases.skip(ACCEPT_PHASES.taskBranch, isResume ? 'resume' : 'no remote to ask');
+  }
+
   // --- Step 1a: Branch-protection (edge-gate) check ---
   // INVARIANT: this runs for ALL drivers, including local, and regardless of
   // who called accept (CLI --yes, MCP, automation). It is the single decision
@@ -6882,7 +7383,7 @@ async function acceptTaskRun(
       { reason: params.reason },
     );
     try {
-      await enforceEdgeGate({
+      const satisfaction = await enforceEdgeGate({
         storage,
         config,
         projectRoot,
@@ -6891,8 +7392,20 @@ async function acceptTaskRun(
         edge: { sourceBranch: sess.git_branch, targetBranch: mergeTargetBranch },
         forgeApproval,
         token: params.token,
+        memberApproval: params.memberApproval,
         acceptCommand,
       });
+      // A member's Accept approved a protected merge: say so on the record.
+      // The [Accepted] comment already names who accepted; this line says that
+      // their Accept was also the protection approval, and it rides into the
+      // persisted intent so a resumed accept keeps it.
+      if (satisfaction.satisfiedBy === 'member') {
+        const who = satisfaction.approver.name
+          ? `${satisfaction.approver.name} <${satisfaction.approver.email}>`
+          : satisfaction.approver.email;
+        reason = `${reason}\n\nProtected merge approved by ${who} (Accept in Lazy Teams).`;
+        intent.reason = reason;
+      }
     } catch (err) {
       if (err instanceof EdgeGateRefusedError) {
         // The one refusal a HUMAN surface can clear in place: supplying the
@@ -6905,6 +7418,15 @@ async function acceptTaskRun(
         //
         // The command enumerates every already-approved file and the typed
         // --reason: a bare `lazy accept <id>` is wrong for a conflict task.
+        // Lazy Teams: the approval is a member's own browser Accept, so the
+        // remedy names that and offers neither a command nor a passphrase form.
+        if (isManagedMode()) {
+          throw acceptRefusal(403, err.message, {
+            reason: 'approval-required',
+            next: 'This merge is protected — a signed-in member approves it by pressing Accept on this task in Lazy Teams.',
+            ...(commandFiles.length > 0 ? { files: commandFiles } : {}),
+          });
+        }
         throw acceptRefusal(403, err.message, {
           reason: err.tokenRejected ? 'approval-invalid' : 'approval-required',
           next: err.tokenRejected
@@ -7036,8 +7558,25 @@ async function acceptTaskRun(
     phases.begin(ACCEPT_PHASES.acceptCheck);
     try {
       const outcome = await enforceAcceptCheck({
-        worktreePath,
         command: config.automation.accept_check,
+        // INVARIANT: the accept check never runs on the daemon's host. What it
+        // runs (a package.json script, a Makefile) comes from the task branch,
+        // so it is agent-controlled code — it runs in the acceptance-gate
+        // container, solo and managed alike (engineer, 2026-10-10).
+        run: async (command, timeoutSecs) => {
+          const startedAt = Date.now();
+          const gate = await runInAcceptGateContainer(projectRoot, task, worktreePath, config, priorStatus, {
+            label: 'Accept check',
+            commands: [command],
+            timeoutSecs,
+          });
+          return {
+            exitCode: gate.passed ? 0 : (gate.exit_code ?? -1),
+            timedOut: !gate.passed && gate.exit_code === -2,
+            output: gate.output ?? '',
+            elapsedMs: Date.now() - startedAt,
+          };
+        },
         timeoutSecs: config.automation.accept_check_timeout,
         displayId: preflight.displayId,
         targetBranch: mergeTargetBranch,
@@ -7301,6 +7840,31 @@ async function acceptTaskRun(
     );
   }
 
+  // --- Step 1d: a Teams-hosted origin (mirroring local driver) ---
+  // (`pushTargetToMirror` is decided before Step 1e, ahead of Step 1a.)
+  // Bring local <target> up to the install's first, so the post-merge push is
+  // a fast-forward: someone may have pushed to it directly. Diverged = refuse
+  // before merging; never merge or overwrite. Task-branch targets are left to
+  // sync (step 1 of sync merges what a member pushed there), and a resume
+  // re-checks no policy, so it skips this too.
+  if (pushTargetToMirror && !isResume && !isIntermediateBranch(mergeTargetBranch)) {
+    const remoteName = (driver as LocalDriver).originMirror!.remoteName;
+    phases.begin(ACCEPT_PHASES.mirrorTarget, `${remoteName}/${mergeTargetBranch}`);
+    try {
+      const ff = await fastForwardTargetFromMirror(remoteName, mergeTargetBranch, projectRoot);
+      if (ff === 'fast-forwarded') {
+        warnings.push(`Brought local ${mergeTargetBranch} up to ${remoteName}/${mergeTargetBranch} (it had commits pushed there directly) before merging.`);
+      }
+      phases.end(ff === 'fast-forwarded' ? `fast-forwarded to ${remoteName}/${mergeTargetBranch}` : 'up to date');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new RpcError(err instanceof MirrorTargetDivergedError ? 409 : 502,
+        err instanceof MirrorTargetDivergedError ? msg : `Accept refused before merging: ${msg}`);
+    }
+  } else {
+    phases.skip(ACCEPT_PHASES.mirrorTarget, pushTargetToMirror ? 'resume or task-branch target' : 'no hosted origin');
+  }
+
   // --- Step 2: Auto-create remote ref if needed ---
   // Uses mergeDriver: for an unprotected target this is a LocalDriver whose
   // validateAccept always passes, so the whole remote-ref creation block is
@@ -7317,14 +7881,10 @@ async function acceptTaskRun(
     }
 
     try {
-      const prResult = await mergeDriver.markReadyForReview(task);
-      if (prResult.metadata) {
-        for (const [key, value] of Object.entries(prResult.metadata)) {
-          await storage.updateTaskMetadata(task.id, key, value);
-        }
-        if (!task.metadata) task.metadata = {};
-        Object.assign(task.metadata, prResult.metadata);
-      }
+      // Crash-safe, and adopts an open PR the branch already has rather than
+      // failing to open a second one (./review-self-heal.ts).
+      const { createOrAdoptReview } = await import('./review-self-heal');
+      await createOrAdoptReview(storage, mergeDriver, task, sess.git_branch);
       const retryError = mergeDriver.validateAccept(task);
       if (retryError) {
         // PR creation returned no error but also no metadata the acceptor can
@@ -7406,7 +7966,8 @@ async function acceptTaskRun(
   // oneshot-runs-on-builder, src/oneshot/types.ts). The task ref is still passed:
   // the run is ABOUT this task and its usage is attributed to it. Read-only —
   // an accept is not the human choosing a model, so nothing is written back.
-  const summarizer = getSummarizer(projectRoot, taskRef(task));
+  // Paid by the person accepting (team mode) — never the daemon's own account.
+  const summarizer = getSummarizer(projectRoot, taskRef(task), actorEmail(acceptActor) ?? null);
   let result: MergeResult;
   let mergeLanded = false;
   // (No member can be inside: refused at the top of the fresh accept, under
@@ -7557,7 +8118,11 @@ async function acceptTaskRun(
   const followThrough: AcceptFollowThrough = {
     targetBranch: followTarget,
     viaForge: mergeDriver.needsSync,
-    pushParent: useLocalMerge,
+    // A mirroring local driver (Teams-hosted repo) pushes every target too:
+    // `main`, a named branch, or a parent task's branch (which the after-turn
+    // mirror pushes anyway) — so members fetch accepted work. Offline the
+    // driver is mirrorless, so nothing is owed. Decided pre-merge (Step 1d).
+    pushParent: useLocalMerge || pushTargetToMirror,
     // A local merge of a task with an open PR/MR (a person submitted it into
     // an unprotected or intermediate branch): close it once merged. Never a
     // linked task's — that PR/MR belongs to someone else.
@@ -7701,6 +8266,47 @@ export async function planRestoreConflictReconciliation(
  * machinery the `unblock` RPC uses, or surfaces a loud, actionable fallback.
  * Never blocks or fails the (already-durable) child accept.
  */
+/**
+ * Task metadata key: the destination-restore unblock (see
+ * {@link handleDestinationRestoreConflict}) held because the project's runner
+ * image was not ready. JSON `{ message, at }`.
+ */
+export const RUNNER_IMAGE_HELD_RESTORE_KEY = 'runner_image_held_restore_unblock';
+
+/**
+ * Launch the destination-restore unblocks the runner image held, for the
+ * reconciler's pass. Each waits while its task would still need the image;
+ * then the record is cleared FIRST and the unblock launched as the daemon's
+ * own turn. A launch that fails is journaled on the task with the feedback it
+ * carried (which names the preserved stash), never dropped silently.
+ */
+export async function processRunnerImageHeldRestores(projectRoot: string, storage: Storage): Promise<void> {
+  const held = (await storage.listTasks()).filter((t) => t.metadata?.[RUNNER_IMAGE_HELD_RESTORE_KEY]);
+  for (const task of held) {
+    if (await runnerImageHold(task)) continue;
+    const raw = task.metadata![RUNNER_IMAGE_HELD_RESTORE_KEY]!;
+    await storage.updateTaskMetadata(task.id, RUNNER_IMAGE_HELD_RESTORE_KEY, '');
+    let message: string;
+    try {
+      message = (JSON.parse(raw) as { message: string }).message;
+    } catch (err) {
+      logger.warn(`Task ${displayId(task)}: the held restore unblock record does not parse — dropped: ${err instanceof Error ? err.message : String(err)}`);
+      continue;
+    }
+    try {
+      await launchUnblockTask(projectRoot, { taskId: task.id, message, daemonLaunch: true });
+      logger.info(`Task ${displayId(task)}: launched the restore unblock that waited for the project's runner image`);
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err);
+      logger.warn(`Task ${displayId(task)}: the restore unblock that waited for the runner image could not launch: ${why}`);
+      await storage.appendJournalEntry(task.id,
+        `The unblock queued to reconcile this worktree after another task's accept could not launch: ${why}\n\nWhat it would have said:\n\n${message}`,
+        'system',
+      ).catch((jErr: unknown) => logger.warn(`could not journal the failed restore unblock of ${displayId(task)}: ${String(jErr)}`));
+    }
+  }
+}
+
 async function handleDestinationRestoreConflict(
   projectRoot: string,
   storage: Storage,
@@ -7711,6 +8317,22 @@ async function handleDestinationRestoreConflict(
   const plan = await planRestoreConflictReconciliation(storage, rc, childDisplayId);
 
   if (plan.kind === 'unblock') {
+    // The daemon's own WRITE turn: while the project's runner image is not
+    // ready it WAITS like every daemon-started write turn — queued on the
+    // owning task and launched by the reconciler once the image is ready
+    // (processRunnerImageHeldRestores). The stash stays preserved meanwhile.
+    const owner = await storage.getTask(plan.taskId);
+    if (owner && (await runnerImageHold(owner))) {
+      await storage.updateTaskMetadata(plan.taskId, RUNNER_IMAGE_HELD_RESTORE_KEY, JSON.stringify({
+        message: plan.feedback, at: new Date().toISOString(),
+      }));
+      warnings.push(
+        `The destination worktree for ${rc.targetBranch} (task ${plan.taskDisplayId}) had uncommitted ` +
+        `changes that could not be auto-restored after the merge (${rc.mode}). Its agent will be unblocked to ` +
+        `reconcile the preserved stash ${rc.stashSha} once the project's runner image is ready. The accept itself succeeded.`
+      );
+      return;
+    }
     try {
       // No `filesReview`: this unblock is the daemon reconciling a worktree
       // after somebody ELSE's accept. The owning task's reviewer submitted
@@ -7763,12 +8385,14 @@ async function regenerateParentFidelity(
   config: ResolvedConfig,
   projectRoot: string,
   warnings: string[],
+  /** Who accepted the child (team mode pays with their credential); null for nobody. */
+  payerEmail: string | null,
 ): Promise<void> {
   const parentId = parentTaskIdOf(task);
   if (!parentId) return;
   const parent = await storage.getTask(parentId);
   if (!parent) return;
-  const summarizer = getSummarizer(projectRoot, taskRef(parent));
+  const summarizer = getSummarizer(projectRoot, taskRef(parent), payerEmail);
   const parentFidelity = await regenerateFidelity(storage, parent, driver, summarizer);
   if (parentFidelity.warning) warnings.push(parentFidelity.warning);
 }
@@ -7779,6 +8403,12 @@ async function regenerateParentFidelity(
 
 export interface SyncTaskParams {
   taskId: string;
+  /**
+   * A person confirmed running a conflict-resolving sync on lazy's DEFAULT
+   * runner image while the project's own image is not ready. Without it such a
+   * sync is refused (a daemon-queued one waits instead).
+   */
+  useDefaultImage?: boolean;
   /**
    * The caller is a person who may use the one-shot usage-pause override
    * (src/daemon/usage-pause.ts, `overrideEligible`). Required: absent means
@@ -7843,7 +8473,12 @@ export interface SyncTaskResult {
    * asked to queue rather than be refused (`queueIfMemberInside`). Nothing was
    * fetched or merged; the sync stays on the pending counter.
    */
-  status: 'up_to_date' | 'sync_launched' | 'pending_sync' | 'merged' | 'conflict' | 'pinned' | 'held_by_member';
+  /**
+   * `waiting_for_parent`: the parent task has not started, so it has no branch
+   * and there is nothing to merge yet. Not a failure: the sync stays queued and
+   * runs when the parent starts.
+   */
+  status: 'up_to_date' | 'sync_launched' | 'pending_sync' | 'merged' | 'conflict' | 'pinned' | 'held_by_member' | 'waiting_for_parent';
   message: string;
   warnings: string[];
   /** Self-sync only: what each of the two steps did. */
@@ -7858,11 +8493,22 @@ export interface SyncTaskResult {
    */
   usagePauseHeld?: boolean;
   /**
+   * Set with `pending_sync` when the upstream branch does not exist on the
+   * remote — an answer, not a connectivity problem, and reported as such.
+   */
+  remoteBranchMissing?: boolean;
+  /**
    * Set with `pending_sync` when the merge conflicts and the agent that would
    * resolve it has no model credential (src/daemon/credential-gate.ts). Held
    * exactly like `usagePauseHeld`: the queued sync owns the retry.
    */
   credentialHeld?: boolean;
+  /**
+   * Set with `pending_sync` when the merge conflicts and the project's runner
+   * image is not ready (src/daemon/runner-image-choice.ts): a daemon-queued
+   * conflict sync WAITS for it. Held exactly like `usagePauseHeld`.
+   */
+  runnerImageHeld?: boolean;
 }
 
 /**
@@ -7929,7 +8575,7 @@ async function resolveOriginTaskBranch(args: {
 }): Promise<string | undefined> {
   const { config, offline, branch, worktreePath, phases, warnings } = args;
 
-  if (config.remote.driver === 'local') {
+  if (config.remote.driver === 'local' && !localDriverMirrorsOrigin(config)) {
     phases.skip(SYNC_PHASES.origin, 'remote driver is "local" — the task branch has no origin');
     return undefined;
   }
@@ -8189,6 +8835,32 @@ async function syncTaskRun(
 
   phases.begin(SYNC_PHASES.upstream, parentBranch);
 
+  // --- A parent that has not started has no branch: nothing to merge YET ---
+  // Not a failure and not a fetch: the sync stays queued and runs the moment
+  // the parent starts (./parent-started-sync.ts). Only when the task's own
+  // origin branch has nothing either — otherwise step 1 still has work, and the
+  // fetch below reports the missing parent branch as missing, not as network.
+  const unstartedParent = remoteBranch
+    ? null
+    : await unstartedParentOf(storage, (await storage.getTask(task.id)) ?? task, projectRoot);
+  if (unstartedParent) {
+    if (!((await storage.getTask(task.id))?.pending_sync)) {
+      await storage.incrementTaskPendingSync(task.id);
+    }
+    const parentLabel = displayId(unstartedParent);
+    phases.skip(SYNC_PHASES.upstream, `${parentLabel} hasn't started — no branch yet`);
+    phases.skip(SYNC_PHASES.compare, 'nothing to merge yet');
+    phases.skip(SYNC_PHASES.prepare, 'nothing to merge yet');
+    phases.skip(SYNC_PHASES.launch, 'nothing to merge yet');
+    return {
+      taskId: task.id,
+      displayId: displayId(task),
+      status: 'waiting_for_parent',
+      message: `Parent ${parentLabel} hasn't started, so there is nothing to merge yet; this task will merge it when ${parentLabel} starts.`,
+      warnings,
+    };
+  }
+
   // --- Step 2: attempt to fetch upstream ref (unchanged) ---
   // Resolve to the ref `lazy accept` will actually merge into — NOT
   // unconditionally `origin/<parent>`. An unprotected parent (every `lazy/...`
@@ -8212,7 +8884,10 @@ async function syncTaskRun(
     // Settled as SKIPPED, not failed: sync exits 0 here and reports
     // `pending_sync` — the retry loop owns it from now on. A ✗ row above a
     // zero exit status tells the reader the command broke when it did not.
-    phases.skip(SYNC_PHASES.upstream, `fetch failed for ${parentBranch} — queued for retry`);
+    const missing = err instanceof RemoteBranchMissingError;
+    phases.skip(SYNC_PHASES.upstream, missing
+      ? `${parentBranch} does not exist on ${err.remote} — queued for retry`
+      : `fetch failed for ${parentBranch} — queued for retry`);
     phases.skip(SYNC_PHASES.compare, 'upstream unresolved');
     phases.skip(SYNC_PHASES.prepare, 'nothing to merge');
     phases.skip(SYNC_PHASES.launch, 'nothing to merge');
@@ -8220,8 +8895,11 @@ async function syncTaskRun(
       taskId: task.id,
       displayId: displayId(task),
       status: 'pending_sync',
-      message: `Fetch failed for upstream branch ${parentBranch}. Marked for retry.`,
-      warnings: [`Fetch failed: ${err instanceof Error ? err.message : err}`],
+      message: missing
+        ? `Branch ${parentBranch} does not exist on ${err.remote}. Marked for retry.`
+        : `Fetch failed for upstream branch ${parentBranch}. Marked for retry.`,
+      warnings: missing ? warnings : [...warnings, `Fetch failed: ${err instanceof Error ? err.message : err}`],
+      ...(missing ? { remoteBranchMissing: true } : {}),
     };
   }
 
@@ -8251,7 +8929,7 @@ async function syncTaskRun(
   // Use the SHA we just resolved — it's guaranteed to exist in the worktree's
   // object store (we fetched it and rev-parse succeeded), so we don't need
   // to re-resolve the ref. hasUpstreamChanges now throws on git failure per
-  // CLAUDE.md "errors are actionable"; a real rev-list failure here must
+  // AGENTS.md "errors are actionable"; a real rev-list failure here must
   // surface to the RPC caller instead of silently returning "up to date".
   let upstreamHasChanges: boolean;
   try {
@@ -8374,6 +9052,7 @@ async function syncTaskRun(
           parentHasChanges: upstreamHasChanges,
         }),
         leaveConflictInProgress: false,
+        recordShaWindow: true,
       });
       // INVARIANT: a host merge's commits are RECORDED before sync returns.
       // No turn runs around a host-side sync, so nothing else records them
@@ -8485,6 +9164,43 @@ async function syncTaskRun(
         if (task.pending_sync > 0) await storage.incrementTaskPendingSync(task.id);
         throw err;
       }
+    }
+
+    // --- The project's runner image (src/daemon/runner-image-choice.ts) ---
+    // Resolving a conflict runs the task's agent, a WRITE turn. A sync the
+    // daemon queued WAITS for the image like every daemon-started write turn
+    // (held as a pending sync, retried by the retry loop); one a person typed
+    // follows the human rule — it is refused until they confirm the default
+    // image on the task (start / unblock / resume with the confirmation) or
+    // the image is ready.
+    let imageHold = await runnerImageHold(task);
+    if (imageHold && !params.daemonLaunch && params.useDefaultImage) {
+      // The person confirmed the default image: recorded on the task like any
+      // confirmed launch (and on this snapshot, which the launch below reads).
+      await confirmRunnerImageForLaunch(storage, task, true);
+      imageHold = null;
+    }
+    if (imageHold) {
+      if (params.daemonLaunch || task.pending_sync > 0) await storage.incrementTaskPendingSync(task.id);
+      if (params.daemonLaunch) {
+        phases.skip(SYNC_PHASES.launch, "held until the project's runner image is ready");
+        return {
+          taskId: task.id,
+          displayId: displayId(task),
+          status: 'pending_sync',
+          message:
+            `The merge into ${displayId(task)} conflicts, and resolving it runs the task's agent: held until the ` +
+            `project's runner image is ready, then retried. ${imageHold}${mergedSoFar}`,
+          warnings,
+          runnerImageHeld: true,
+        };
+      }
+      throw new RpcError(
+        409,
+        `Not synced: ${RUNNER_IMAGE_NOT_READY_MARKER}. The merge conflicts, and resolving it runs the task's agent. ` +
+        `${imageHold} Sync again confirming lazy's default image (\`lazy sync --default-image\`, the sync button in Lazy Teams, or confirmation_code over MCP), or wait for the image.${mergedSoFar}`,
+        'runner_image_not_ready',
+      );
     }
 
     // --- Model credential, the same place and the same two outcomes ---
@@ -8642,6 +9358,10 @@ async function syncTaskRun(
         // otherwise ran with none (the supervisor adds the git-pointer denies).
         ...computeAgentExtraArgs(config),
       };
+      // Per-task secret files, repaired before every launch (src/daemon/task-files.ts).
+      // Ahead of the restore marker, which must stay immediately before the command.
+      await deliverTaskFilesForLaunch(projectRoot, task.id, worktreePath, phases.notify);
+
       // Record what this sync FOUND, against this sync's command id, so its
       // end-of-turn park can put the status back instead of parking the task
       // `blocked`. This is the only moment that knows it: the park happens in
@@ -8704,7 +9424,7 @@ async function syncTaskRun(
         `(${sess.container_agent_id} → ${task.agent_id}) — launch env is fixed at create time`,
       );
     }
-    if (!mustRecreateContainer && !mustRecreateForAgent && !mustRecreateForEnv && (await runner.isRunning(containerName))) {
+    if (!mustRecreateContainer && !mustRecreateForAgent && !mustRecreateForEnv && !mustRecreateForRunnerImage(task) && (await runner.isRunning(containerName))) {
       // Supervisor already running — it will pick up the new command. The
       // config written just above still reaches it (in-place write, pinned
       // inode); a container whose FIRST launch had none stays without one, but
@@ -8715,14 +9435,16 @@ async function syncTaskRun(
       await removeTaskRun(runner, storage, sess, containerName);
 
       try {
-        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef, task.id, pinnedCustomImage(task), phases.notify);
+        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef, task.id, launchImagePin(task), phases.notify);
       } catch (err) {
         // Supervisor failed to launch — revert the working transition so the
         // task doesn't get stuck waiting for a supervisor that never started.
         // Going back to the prior status is safer than 'interrupted' because
         // no work has happened yet; the user can simply retry sync.
         try {
-          await storage.updateTaskStatus(task.id, priorStatus, actor);
+          // Lazy's failure, not the caller's: system-attributed, with its reason.
+          await storage.updateTaskStatus(task.id, priorStatus, await systemActor(projectRoot),
+            `the sync's container did not start: ${err instanceof Error ? err.message : String(err)}`);
         } catch (revertErr) {
           logger.warn(`Failed to revert status for ${displayId(task)} after supervisor launch failure: ${revertErr instanceof Error ? revertErr.message : revertErr}`);
         }
@@ -8889,9 +9611,12 @@ async function reparentTaskRun(
   } else {
     // Not a task — treat it as a raw branch name. Verify it resolves locally
     // (boundary check); sync's resolveUpstreamRef handles the remote fetch.
+    // In managed mode a branch a member pushed to the team's repository is on
+    // origin only, and `resolveBranchParent` brings it in — the same rule
+    // `lazy create --parent <branch>` resolves through.
     const branch = params.parent;
     const verify = await runGit(['rev-parse', '--verify', '--quiet', branch], { cwd: projectRoot });
-    if (verify.exitCode !== 0) {
+    if (verify.exitCode !== 0 && !(await resolveBranchParent(projectRoot, branch)).ok) {
       throw new RpcError(404, `Could not resolve '${params.parent}' as a task or a git branch.`);
     }
     newParentTaskId = null;
@@ -8924,6 +9649,20 @@ async function reparentTaskRun(
       message: `Task ${displayId(task)} is already parented on ${newParentLabel}. Nothing to do.`,
       warnings,
     };
+  }
+
+  // The merge onto the new parent runs through the task's agent, and whether
+  // that merge is clean is unknown before the repoint: a conflict needs an
+  // agent to resolve it, which needs a turn credential. The repoint is written
+  // BEFORE the sync asks for one, so a person who cannot pay for a turn is
+  // refused here, up front (as the browser's reparent does), rather than left
+  // moved onto a parent the task was never synced with. A task with no live
+  // session runs no turn and is moved regardless.
+  {
+    const liveSession = await storage.getSessionByTaskId(task.id);
+    if (liveSession && !liveSession.ended_at && task.status !== 'backlog') {
+      await assertTurnCredentialAvailable(projectRoot, { taskId: task.id, storage });
+    }
   }
 
   phases.end(displayId(task));
@@ -9147,13 +9886,13 @@ export async function submitTask(
   // --- Remote driver check ---
   let driver;
   try {
-    driver = createDriver(config);
+    driver = createDriver(config, { storage, lazyRoot: projectRoot });
   } catch {
     throw new RpcError(400, 'No remote driver configured. Set [remote] driver in lazy.toml to use submit.');
   }
 
   if (!driver.needsSync) {
-    throw new RpcError(400, 'Submit requires a remote driver (e.g., github). Local driver has no remote to create PRs on.');
+    throw new RpcError(400, noForgeSubmitRefusal(driver, task));
   }
 
   // --- Intermediate-parent routing (INVARIANT: PRs only for protected branches) ---
@@ -9194,6 +9933,12 @@ export async function submitTask(
   // Before the forge lookups below: a push failure is the clearest thing to
   // report, and pushing the task's OWN branch is what the daemon does after
   // every turn anyway. The parent is never pushed here.
+  // Never publish a delivered per-task secret file (src/daemon/task-files.ts).
+  try {
+    await assertNoDeliveredSecretsToPush(projectRoot, sess.git_branch, `Submitting ${displayId(task)}`);
+  } catch (err) {
+    throw new RpcError(409, err instanceof Error ? err.message : String(err));
+  }
   try {
     await driver.pushBranch(sess.git_branch);
   } catch (err) {
@@ -9287,36 +10032,18 @@ export async function submitTask(
   }
 
   // --- Create/update PR ---
+  // Crash-safe (./review-self-heal.ts): the intent is saved before the forge
+  // is called, and a PR the forge created whose record never got written is
+  // found by its head branch on the next remote-sync pass.
   let prUrl: string | null = null;
   try {
-    const prResult = await driver.markReadyForReview(
-      task,
-      intermediate ? { baseBranch: submitTargetBranch } : undefined,
-    );
-    if (prResult.metadata) {
-      for (const [key, value] of Object.entries(prResult.metadata)) {
-        await storage.updateTaskMetadata(task.id, key, value);
-      }
-      // Update in-memory metadata for getTaskUrl
-      if (!task.metadata) task.metadata = {};
-      Object.assign(task.metadata, prResult.metadata);
-    }
-
-    // Safety net: ensure remote ref metadata was persisted. If markReadyForReview
-    // created a PR but failed to return its ID (e.g., glab output parsing failure),
-    // the task would be stuck in submitted with no way to detect merge completion.
+    const { createOrAdoptReview } = await import('./review-self-heal');
+    await createOrAdoptReview(storage, driver, task, sess.git_branch, {
+      ...(intermediate ? { baseBranch: submitTargetBranch } : {}),
+      alreadyLookedUp: true,
+    });
     if (!driver.hasRemoteRef(task)) {
-      const recovered = await driver.recoverRemoteRef(task);
-      if (recovered) {
-        for (const [key, value] of Object.entries(recovered)) {
-          await storage.updateTaskMetadata(task.id, key, value);
-        }
-        if (!task.metadata) task.metadata = {};
-        Object.assign(task.metadata, recovered);
-        logger.warn(`submitTask ${displayId(task)}: recovered missing remote ref metadata after markReadyForReview`);
-      } else {
-        logger.warn(`submitTask ${displayId(task)}: no remote ref metadata after markReadyForReview — merge detection will not work until next sync`);
-      }
+      logger.warn(`submitTask ${displayId(task)}: no remote ref metadata after markReadyForReview — the next remote-sync pass looks the PR/MR up by its branch`);
     }
 
     prUrl = await driver.getTaskUrl(task);
@@ -9327,6 +10054,15 @@ export async function submitTask(
   // --- Transition to submitted ---
   await storage.updateTaskStatus(task.id, 'submitted', actor);
   await storage.createComment(task.id, `${SUBMITTED_COMMENT_PREFIX}Task submitted for review${prUrl ? `: ${prUrl}` : ''}`, actor);
+
+  // A task submitted with work already done gets its real Summary now, not at
+  // the next sweep tick. Background: synthesis is a model one-shot and must not
+  // hold the submit. Description edit only — no comments (AGENTS.md). Runs even
+  // with `[server] sync_interval = 0`: that setting turns off the background
+  // sweep, while this is a one-off edit for a submit the person just asked for.
+  void import('./remote-sync')
+    .then(m => m.refreshFidelityForTask(storage, projectRoot, task.id))
+    .catch((err: unknown) => logger.warn(`submitTask ${displayId(task)}: post-submit description refresh failed: ${err instanceof Error ? err.message : err}`));
 
   return {
     taskId: task.id,
@@ -9341,6 +10077,12 @@ export async function submitTask(
 // =====================================================================
 
 export interface ResumeTaskParams {
+  /**
+   * A person confirmed running this launch on lazy's DEFAULT runner image while
+   * the project's own image is not ready (src/daemon/runner-image-choice.ts).
+   * Without it such a launch is refused before anything is written.
+   */
+  useDefaultImage?: boolean;
   taskId: string;
   /**
    * The caller is a person who may use the one-shot usage-pause override
@@ -9397,7 +10139,7 @@ export function buildSystemPromptForResume(runnerInstructions?: string, chattine
 /**
  * Build the dynamic user prompt for resuming after interruption.
  *
- * INVARIANT (CLAUDE.md — never lose human feedback): when `redeliveredFeedback`
+ * INVARIANT (AGENTS.md — never lose human feedback): when `redeliveredFeedback`
  * is present it REPLACES the generic "you were interrupted, carry on" context,
  * which would otherwise leave unconsumed feedback available only implicitly via
  * turn history. Mirrors buildResumePrompt in src/utils/auto-resume.ts.
@@ -9475,6 +10217,9 @@ async function resumeTaskRun(
       throw new RpcError(409, `Task ${displayId(task)} cannot be resumed (status: ${task.status}).`);
     }
   }
+
+  // The project's runner image — same rule as start and unblock.
+  await confirmRunnerImageForLaunch(storage, task, params.useDefaultImage);
 
   // --- Session check ---
   const sess = await storage.getSessionByTaskId(task.id);
@@ -9622,7 +10367,7 @@ async function resumeTaskRun(
 
     // --- Build prompts ---
     const systemPrompt = buildSystemPromptForResume(runner.getAgentInstructions(), renderChattinessSnippet(resolveAgentChattiness(config)), await buildMemorySection(storage, 'agent', { warnBytes: config.memory.warn_bytes }), await buildLazyMdSection(worktreePath));
-    // INVARIANT (CLAUDE.md — never lose human feedback): a manual resume has the
+    // INVARIANT (AGENTS.md — never lose human feedback): a manual resume has the
     // same gap as auto-resume — if the interrupted turn crashed before the agent
     // consumed its feedback, re-deliver that feedback verbatim.
     const pendingFeedback = findPendingFeedback(await storage.getSessionTurns(sess.id));
@@ -9666,8 +10411,8 @@ async function resumeTaskRun(
     // runs on it, and never a notice turn for a resume that did not happen.
     const { mustRecreateContainer } = await withTaskLifecycleLock(task.id, async () => {
       assertNoMemberInside(task.id);
-      // Same reason: a turn with no credential for its profile is refused here,
-      // before its turn row exists — never after (assertTurnCredentialAvailable).
+      // A turn with no credential for its profile is refused here: this launch carries
+      // no human feedback to save first (unlike unblock — recordFeedbackThenRefuse).
       await assertTurnCredentialAvailable(projectRoot, { taskId: task.id, storage });
       const nextSeq = await storage.getNextTurnSequence(sess.id);
       await storage.createTurn({
@@ -9737,6 +10482,8 @@ async function resumeTaskRun(
       })),
       ...commonCommandFields(config),
     };
+    // Per-task secret files, repaired before every launch (src/daemon/task-files.ts).
+    await deliverTaskFilesForLaunch(projectRoot, task.id, worktreePath, phases.notify);
     writeCommand(protoDir, unblockCommand);
 
     // Generate daemon MCP config
@@ -9755,7 +10502,7 @@ async function resumeTaskRun(
         `(${sess.container_agent_id} → ${task.agent_id}) — launch env is fixed at create time`,
       );
     }
-    if (!mustRecreateContainer && !mustRecreateForAgent && !mustRecreateForEnv && (await runner.isRunning(containerName))) {
+    if (!mustRecreateContainer && !mustRecreateForAgent && !mustRecreateForEnv && !mustRecreateForRunnerImage(task) && (await runner.isRunning(containerName))) {
       // Supervisor already running — it will pick up the new command. The
       // config written just above still reaches it (in-place write, pinned
       // inode); a container whose FIRST launch had none stays without one, but
@@ -9766,9 +10513,11 @@ async function resumeTaskRun(
       await removeTaskRun(runner, storage, sess, containerName);
 
       try {
-        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef, task.id, pinnedCustomImage(task), phases.notify);
+        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef, task.id, launchImagePin(task), phases.notify);
       } catch (err) {
-        await storage.updateTaskStatus(task.id, 'interrupted', actor);
+        // Lazy's failure, not the caller's: system-attributed, with its reason
+        // and a failure notice turn (src/daemon/launch-failure.ts).
+        await recordLaunchFailure(storage, task, sess.id, err, projectRoot);
         throw new RpcError(500, `Failed to launch supervisor: ${err instanceof Error ? err.message : err}`);
       }
     }
@@ -9942,7 +10691,7 @@ async function stopTaskRun(
     sessionId: sess.id,
     sequence: turnSeq,
     role: 'human',
-    content: `[built-in] Stopped by user: ${reason}`,
+    content: `[built-in] Stopped by user: ${neutralizeLazyMarkers(reason)}`,
     // Channel actor: MCP-originated stop is 'builder', CLI 'human'.
     actor,
   });
@@ -10053,7 +10802,7 @@ async function stopClaimedTurn(
   phases.announce(stopPhasePlan(), displayId(task));
   phases.end();
 
-  // SAVE FIRST (CLAUDE.md): the operator's reason is persisted before anything
+  // SAVE FIRST (AGENTS.md): the operator's reason is persisted before anything
   // that can fail. It lands at the RESERVED sequence — this IS the turn's
   // ending, not a note beside it.
   phases.begin(STOP_PHASES.record);

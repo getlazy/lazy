@@ -192,6 +192,19 @@ export class DaemonHealthRecorder {
     }
   }
 
+  /**
+   * A tick given up on by its loop's stuck-tick timeout: recorded as a
+   * failure so health shows it red, but NOT as a finished tick — nothing
+   * finished, and "how long since a tick completed" must keep growing.
+   */
+  tickAbandoned(loop: string, error: unknown): void {
+    const record = this.loops.get(loop);
+    if (!record) return;
+    record.lastTickFailed = true;
+    record.lastError = errorMessage(error);
+    record.lastErrorAt = this.now();
+  }
+
   sweepFinished(loop: string, name: string, startedAt: number, error?: unknown): void {
     const key = `${loop}:${name}`;
     let record = this.sweeps.get(key);

@@ -17,7 +17,7 @@ import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 import { maybePostUpgradeNotice } from '../../src/daemon/upgrade-notice';
 import { getDaemonDir } from '../../src/daemon/paths';
 import { VERSION } from '../../src/version';
-import { runningBuildIdentity } from '../../src/utils/build-provenance';
+import { runningBuildIdentity, resetRunningBuildProvenanceCache } from '../../src/utils/build-provenance';
 
 describe('daemon upgrade notice', () => {
   let testDir: string;
@@ -43,6 +43,7 @@ describe('daemon upgrade notice', () => {
   });
 
   afterEach(async () => {
+    resetRunningBuildProvenanceCache();
     if (savedBaseDir === undefined) delete process.env.LAZY_DAEMON_BASE_DIR;
     else process.env.LAZY_DAEMON_BASE_DIR = savedBaseDir;
     if (storage) await storage.close();

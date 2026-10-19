@@ -486,7 +486,7 @@ describe('lazy doctor --repair-git-pointers — redirected HEAD', () => {
 
     // The refusal says "see lazy doctor": the plain report must name it.
     const report = await ctx.lazy(['doctor']);
-    expectOutput(report, "HEAD is on the task's own branch");
+    expectOutput(report, 'Task worktrees have HEAD off their branch');
     expectOutput(report, 'points at branch main');
     expectOutput(report, 'lazy doctor --repair-git-pointers');
 

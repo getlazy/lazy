@@ -13,7 +13,7 @@ import {
 } from '../task/stats';
 import { collectDescendantTasks, loadToolStatsRecords } from '../task/stats-data';
 
-export type TokenStatsGroup = 'task' | 'model' | 'role';
+export type TokenStatsGroup = 'task' | 'model' | 'role' | 'endpoint';
 export type TokenStatsScope = 'tokens' | 'tools';
 export type TokenStatsCaller = { kind: 'builder' } | { kind: 'task'; root: Task };
 
@@ -307,7 +307,8 @@ export async function describeTokenStats(
   const byModel = summarizeModels(allRows, minTasks);
   const breakdown = options.groupBy === 'task' ? report.byTask
     : options.groupBy === 'model' ? report.byModel
-    : options.groupBy === 'role' ? report.byRole : undefined;
+    : options.groupBy === 'role' ? report.byRole
+    : options.groupBy === 'endpoint' ? report.byEndpoint : undefined;
   const detailIds = new Set(tasks.map(task => task.id));
   const detailRows = allRows
     .filter(row => detailIds.has(row.taskId))
@@ -327,6 +328,7 @@ export async function describeTokenStats(
           byRole: report.byRole.slice(0, top),
           byTask: report.byTask.slice(0, top),
           byModelTokens: report.byModel.slice(0, top),
+          byEndpoint: report.byEndpoint.slice(0, top),
         }),
     tasks: detailRows.slice(0, top),
     models: byModel.slice(0, top),

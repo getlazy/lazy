@@ -24,6 +24,7 @@ import type { Storage } from '../storage/interface';
 import type { SearchResult } from '../storage/types';
 import { isStructuredQuery, parseQuery } from './parser';
 import { structuredSearch, buildTagHint } from './structured';
+import { searchById } from './id-search';
 import { rankSearchResults, queryLiteralTerms } from './ranking';
 
 export interface SearchRequest {
@@ -84,6 +85,17 @@ export async function executeSearch(storage: Storage, request: SearchRequest): P
       results = await storage.search(query);
     } catch (err) {
       throw new SearchPatternError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  // An id-shaped query also finds the entity it names, whatever the text mode
+  // found. The id hit wins over a text hit on the same entity (a turn quoting
+  // its own id).
+  if (!fuzzy) {
+    const idHits = await searchById(storage, query);
+    if (idHits.length > 0) {
+      const seen = new Set(idHits.map(h => `${h.entity_type}:${h.entity_id}`));
+      results = [...idHits, ...results.filter(r => !seen.has(`${r.entity_type}:${r.entity_id}`))];
     }
   }
 

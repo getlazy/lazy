@@ -33,7 +33,7 @@ describe('LAZY.md project instructions', () => {
   }
 
   // INVARIANT: LAZY.md is injected by lazy because NO agent harness loads it.
-  // Claude Code reads CLAUDE.md, cursor and codex read their own files; the
+  // Claude Code reads AGENTS.md, cursor and codex read their own files; the
   // instructions that are true only under lazy have nowhere else to be read
   // from, so if this injection stops the file silently does nothing.
   test('the root LAZY.md reaches the agent system prompt', async () => {
@@ -51,7 +51,7 @@ describe('LAZY.md project instructions', () => {
   });
 
   // INVARIANT: nested LAZY.md files are injected UP FRONT, ordered after the
-  // ancestor chain. Claude Code defers subdirectory CLAUDE.md until the agent
+  // ancestor chain. Claude Code defers subdirectory AGENTS.md until the agent
   // reads a file there; lazy has no hook into an agent's file reads, so a
   // nested file is either loaded at launch or never seen.
   test('a nested LAZY.md is injected too, after the root one', async () => {

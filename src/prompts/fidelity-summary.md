@@ -24,7 +24,12 @@ corrections, scope changes, and review feedback that reshaped the work.
 
 Write a concise, factual Markdown summary of the work that was actually done.
 
-- Lead with a one-paragraph overview of what changed and why.
+- Lead with a one-paragraph overview of what the branch actually does and why.
+- If the result departs from the goal or the original ask (a pivot, a
+  narrowed scope, a different approach), say so plainly up front, and say why
+  if the events record why. Do not present the original plan as what was built.
+- Do NOT restate the prompt's mechanics or instructions; the reader sees only
+  the goal above your summary, never the prompt.
 - Use short bullet points for notable specifics: pivots away from the original
   plan, rounds of human feedback that changed direction, and contributions
   merged from child/subtask work.

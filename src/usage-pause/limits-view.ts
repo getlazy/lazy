@@ -9,7 +9,9 @@
  * credential — what a task agent is allowed to see — is `scopeUsageLimitsView`,
  * applied by the daemon before anything leaves it.
  */
+import type { CredentialFailure } from '../proxy/credential-health';
 import type { UsageLimitReading, UsageWindow } from '../proxy/usage-limits';
+import { isMemberEndpointUsageKey } from '../proxy/usage-limits';
 import {
   describeReadingsStoreError,
   overageStatusOf,
@@ -113,6 +115,12 @@ export interface UsageLimitsView {
   /** Latest reading per credential, most recent first. */
   readings: UsageLimitsReadingView[];
   pause: UsageLimitsPauseView;
+  /**
+   * Every credential whose latest request FAILED — refused upstream, or one
+   * lazy could not use at all (a refused refresh) — with or without a reading,
+   * scoped like `readings`. Empty when everything works.
+   */
+  credentialHealth: CredentialFailure[];
 }
 
 /**
@@ -140,6 +148,7 @@ export function projectUsageLimits(
   readings: UsageLimitReading[],
   pause: UsageLimitsPauseInput,
   now: number = Date.now(),
+  credentialHealth: readonly CredentialFailure[] = [],
 ): UsageLimitsView {
   if (pause.storeError) throw new UsageLimitsUnreadableError(pause.storeError);
   return {
@@ -158,6 +167,7 @@ export function projectUsageLimits(
       held: pause.held,
       coverage: (pause.coverage ?? []).map((c) => ({ ...c })),
     },
+    credentialHealth: credentialHealth.map((f) => ({ ...f })),
   };
 }
 
@@ -171,11 +181,12 @@ export function scopeUsageLimitsView(
   view: UsageLimitsView,
   credential: string | null,
   taskId: string,
+  endpointCredentials: readonly string[] = [],
 ): UsageLimitsView {
-  const own = (c: string) => credential !== null && c === credential;
+  const own = (c: string) => (credential !== null && c === credential) || endpointCredentials.includes(c);
   const credentials: Record<string, number> = {};
-  if (credential !== null && credential in view.pause.configured.credentials) {
-    credentials[credential] = view.pause.configured.credentials[credential];
+  for (const [key, value] of Object.entries(view.pause.configured.credentials)) {
+    if (own(key)) credentials[key] = value;
   }
   return {
     scope: 'task',
@@ -188,6 +199,7 @@ export function scopeUsageLimitsView(
       held: view.pause.held.filter((h) => h.taskId === taskId),
       coverage: view.pause.coverage.filter((c) => own(c.credential)),
     },
+    credentialHealth: view.credentialHealth.filter((f) => own(f.credential)),
   };
 }
 
@@ -204,8 +216,10 @@ export function memberUsageLimitsView(
   view: UsageLimitsView,
   credential: string | null,
   serviceCredential: string,
+  endpointCredentials: readonly string[] = [],
 ): UsageLimitsView {
-  const visible = (c: string) => !c.startsWith('user:') || c === serviceCredential || c === credential;
+  const visible = (c: string) => (!c.startsWith('user:') && !isMemberEndpointUsageKey(c)) ||
+    c === serviceCredential || c === credential || endpointCredentials.includes(c);
   const credentials: Record<string, number> = {};
   for (const [c, v] of Object.entries(view.pause.configured.credentials)) {
     if (visible(c)) credentials[c] = v;
@@ -221,5 +235,6 @@ export function memberUsageLimitsView(
       held: view.pause.held.filter((h) => visible(h.hold.credential)),
       coverage: view.pause.coverage.filter((c) => visible(c.credential)),
     },
+    credentialHealth: view.credentialHealth.filter((f) => visible(f.credential)),
   };
 }

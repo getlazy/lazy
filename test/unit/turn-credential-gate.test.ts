@@ -25,7 +25,6 @@ import {
   turnCredentialRefusal,
 } from '../../src/daemon/credential-gate';
 import {
-  NO_OWNER_CREDENTIAL_MARKER,
   NO_SERVICE_CREDENTIAL_MARKER,
   turnCredentialProblem,
   TurnCredentialUnavailableError,
@@ -34,7 +33,7 @@ import {
   systemTurnBlock,
 } from '../../src/daemon/turn-credentials';
 import { clearUserCredentialCache, putUserCredential } from '../../src/daemon/user-credentials';
-import { NO_OWNER_PROFILE_CREDENTIAL_MARKER } from '../../src/daemon/member-credentials';
+import { NO_OWNER_ENDPOINT_CREDENTIAL_MARKER } from '../../src/daemon/member-credentials';
 import { DEFAULT_OPENAI_UPSTREAM } from '../../src/utils/openai-compat';
 import { buildCredentialRows } from '../../src/daemon/daemon-health-rows';
 import { setCredential } from '../../src/credentials/store';
@@ -133,7 +132,7 @@ describe('the turn credential gate', () => {
   test('a profile on a server that takes no credential is never refused', async () => {
     await writeConfig(
       '[credentials]\nbackend = "file"\n\n' +
-      '[agents.local]\nharness = "claude-code"\nmodel = "qwen"\nendpoint = "http://localhost:11434"\n',
+      '[agents.local]\nharness = "claude-code"\nmodel = "qwen"\nendpoint = "http://localhost:11434"\ncredential = "none"\n',
     );
     expect(await turnCredentialRefusal(projectRoot, 'local', { perUser: false })).toBeNull();
   });
@@ -178,7 +177,7 @@ describe('the turn credential gate', () => {
         () => planTurnCredential(projectRoot, { taskId: 't-claude', sessionId: 's', storage }),
       ).then(() => null, (e: unknown) => e);
       expect(err).toBeInstanceOf(TurnCredentialUnavailableError);
-      expect((err as Error).message).toStartWith(NO_OWNER_CREDENTIAL_MARKER);
+      expect((err as Error).message).toStartWith(NO_OWNER_ENDPOINT_CREDENTIAL_MARKER);
       expect((err as Error).message).toContain('agent profile "claude-code"');
     });
   });
@@ -199,9 +198,9 @@ describe('the turn credential gate', () => {
     ).then(() => null, (e: unknown) => e);
     expect(err).toBeInstanceOf(TurnCredentialUnavailableError);
     const message = (err as Error).message;
-    expect(message).toStartWith(`${NO_OWNER_PROFILE_CREDENTIAL_MARKER} "codex"`);
+    expect(message).toStartWith(`${NO_OWNER_ENDPOINT_CREDENTIAL_MARKER} "builtin:openai"`);
     expect(message).toContain("user 'nobody@example.com'");
-    expect(message).toContain('OpenAI credential');
+    expect(message).toContain('OpenAI connection');
 
     // The pre-record check says the same thing, as a 400.
     const early = await runAsTurnOwnerRequest(
@@ -289,7 +288,7 @@ describe('the turn credential gate', () => {
       await putUserCredential(projectRoot, { userId: 'someone@example.com', kind: 'oauth', token: 'tok' });
       const storage = fakeStorage({ t: { agent_id: 'claude-code' } });
       expect(await turnCredentialProblem(projectRoot, { taskId: 't', storage, owner: 'nobody@example.com' }))
-        .toStartWith(NO_OWNER_CREDENTIAL_MARKER);
+        .toStartWith(NO_OWNER_ENDPOINT_CREDENTIAL_MARKER);
       expect(await turnCredentialProblem(projectRoot, { taskId: 't', storage, owner: 'someone@example.com' }))
         .toBeNull();
     });

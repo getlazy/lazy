@@ -86,23 +86,36 @@ describe('acceptCheckOverrideAvailable', () => {
 
 describe('enforceAcceptCheck', () => {
   const silent = { info: () => {}, warn: () => {} };
+  const ran: string[] = [];
+  /** Stands in for the acceptance-gate container: records, never spawns. */
+  const fakeRun = (exitCode: number, output = '') => async (command: string) => {
+    ran.push(command);
+    return { exitCode, timedOut: false, output, elapsedMs: 5 };
+  };
 
   // INVARIANT: lazy never invents a build command for a project that
   // configured none — the gate reports itself skipped, and accept continues.
   test('an unset command skips the gate and says why', async () => {
+    ran.length = 0;
     const outcome = await enforceAcceptCheck({
-      worktreePath: process.cwd(), command: '   ', timeoutSecs: 60,
+      command: '   ', timeoutSecs: 60, run: fakeRun(0),
       displayId: 'ab12cd34', targetBranch: 'main', allowBroken: false, logSink: silent,
     });
     expect(outcome.ran).toBe(false);
     expect(outcome.skippedReason).toContain('accept_check');
+    expect(ran).toEqual([]);
   });
 
-  test('a passing command returns ran with an elapsed cost', async () => {
+  // INVARIANT: the check runs ONLY through the injected runner (the gate
+  // container) — never a host-side spawn. Agent-controlled code never runs on
+  // the daemon's host (engineer, 2026-10-10).
+  test('a passing command runs through the injected runner and returns an elapsed cost', async () => {
+    ran.length = 0;
     const outcome = await enforceAcceptCheck({
-      worktreePath: process.cwd(), command: 'true', timeoutSecs: 60,
+      command: 'true', timeoutSecs: 60, run: fakeRun(0),
       displayId: 'ab12cd34', targetBranch: 'main', allowBroken: false, logSink: silent,
     });
+    expect(ran).toEqual(['true']);
     expect(outcome.ran).toBe(true);
     expect(outcome.overridden).toBeUndefined();
     expect(typeof outcome.elapsedMs).toBe('number');
@@ -110,7 +123,7 @@ describe('enforceAcceptCheck', () => {
 
   test('a failing command throws, and --allow-broken turns the throw into a reported override', async () => {
     const failing = {
-      worktreePath: process.cwd(), command: 'echo boom >&2; exit 3', timeoutSecs: 60,
+      command: 'make check', timeoutSecs: 60, run: fakeRun(3, 'boom'),
       displayId: 'ab12cd34', targetBranch: 'main', logSink: silent,
     };
     await expect(enforceAcceptCheck({ ...failing, allowBroken: false }))
@@ -120,5 +133,12 @@ describe('enforceAcceptCheck', () => {
     expect(overridden.ran).toBe(true);
     expect(overridden.overridden).toBe(true);
     expect(overridden.exitCode).toBe(3);
+  });
+
+  // INVARIANT: the module has no way to run a command itself, so it cannot
+  // regress to a host-side spawn.
+  test('the accept-check module imports no process runner', async () => {
+    const src = await Bun.file(new URL('../../src/protection/accept-check.ts', import.meta.url)).text();
+    expect(src).not.toMatch(/runTurnHookCommand|from '\.\.\/utils\/spawn'|Bun\.spawn/);
   });
 });

@@ -151,6 +151,26 @@ export const CREDENTIAL_REFUSED_PREFIX = 'credential refused';
 export const PATH_REFUSED_PREFIX = 'path refused';
 
 /**
+ * The prefix on the audit error of a request the proxy answered 429 because
+ * every tier of a tiered agent profile was full (src/proxy/tier-select.ts).
+ */
+export const TIERS_FULL_PREFIX = 'every tier full';
+
+/**
+ * The prefix on the audit error of a tiered request a tier REFUSED for
+ * capacity (a 429) and the proxy retried on the next tier.
+ */
+export const TIER_REFUSED_PREFIX = 'tier refused';
+
+/**
+ * The prefix on the audit error of a request the proxy answered 503 because it
+ * could not resolve the credential RIGHT NOW (a token refresh that timed out,
+ * a 5xx from the token endpoint). Deliberately not CREDENTIAL_REFUSED_PREFIX:
+ * nothing says the credential is broken, and readers of that prefix say so.
+ */
+export const CREDENTIAL_UNAVAILABLE_PREFIX = 'credential unavailable';
+
+/**
  * The path as a watcher should see it: query string removed.
  *
  * A query string is caller-controlled and carries no signal for "the agent is

@@ -17,7 +17,6 @@
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'fs/promises';
-import { createHash } from 'crypto';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
@@ -26,14 +25,12 @@ import {
   buildSandboxSettings,
   withGitPointerDenyArgs,
   withGitPointerDenies,
-  PROBE_GIT_POINTERS,
   type HostPermissionConfig,
 } from '../../src/runner/host-sandbox';
 import { hostGitPointerDenyPaths, GitPointerTamperError } from '../../src/git/worktree-pointers';
 import { addGitPointerDenies } from '../../src/supervisor/index';
 import { buildMergeAgentArgs } from '../../src/supervisor/merge';
 import { ClaudeCodeAgent } from '../../src/agent/claude-code';
-import { agentSettingsJson, boundaryFingerprint } from '../../src/runner/host-boundary-guard';
 import type { Command } from '../../src/protocol/types';
 
 const SANDBOX: HostPermissionConfig = {
@@ -83,22 +80,6 @@ describe('the git-pointer deny rules', () => {
     expect(withGitPointerDenyArgs(undefined, PATHS)).toBeUndefined();
     expect(withGitPointerDenyArgs([], PATHS)).toEqual([]);
     expect(withGitPointerDenyArgs(buildAgentSandboxArgs({ ...SANDBOX, mode: 'bypass' }), PATHS)).toEqual([]);
-  });
-
-  test('the guard probes the same rules on placeholder paths', () => {
-    const json = withGitPointerDenies(JSON.stringify(buildSandboxSettings(SANDBOX, false)), PROBE_GIT_POINTERS);
-    expect(json).toContain('/__lazy_probe_worktree__/.git');
-    expect(json).toContain('/__lazy_probe_gitdir__/gitdir');
-    expect(json).toContain('/__lazy_probe_common__/config');
-    expect(json).toContain('Write(//__lazy_probe_common__/**)');
-  });
-
-  // INVARIANT: a cached guard verdict covers only what was probed, so the
-  // probed pointer posture and the probe script key the cache too.
-  test('the guard fingerprint covers more than version, platform and project settings', () => {
-    const s = agentSettingsJson(SANDBOX)!;
-    const bare = createHash('sha256').update(`1.0.0\0linux\0${s}`).digest('hex').slice(0, 16);
-    expect(boundaryFingerprint('1.0.0', 'linux', s)).not.toBe(bare);
   });
 
   test('a merge-conflict agent carries the host sandbox args', () => {

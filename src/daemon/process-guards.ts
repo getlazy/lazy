@@ -38,7 +38,7 @@
  *
  * Nothing is swallowed. Every event is logged at ERROR level with its full
  * stack, so the daemon log names the failure exactly as a crash would have,
- * minus the outage. CLAUDE.md's "never swallow, always surface" is satisfied by
+ * minus the outage. AGENTS.md's "never swallow, always surface" is satisfied by
  * surfacing; the deviation is only that the process keeps serving.
  *
  * WHAT THIS DELIBERATELY DOES NOT COVER

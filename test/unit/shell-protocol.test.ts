@@ -10,7 +10,7 @@ import {
 // INVARIANT: the web-shell TEXT-frame parser is a system boundary — frames come
 // from a browser (possibly hostile). Every field is validated and a malformed
 // frame is REJECTED with a reason, never guessed at, and the parser never throws
-// (one bad frame must not tear down a live shell). See CLAUDE.md "external
+// (one bad frame must not tear down a live shell). See AGENTS.md "external
 // surfaces validate inputs".
 describe('parseShellClientMessage', () => {
   test('accepts a well-formed resize', () => {

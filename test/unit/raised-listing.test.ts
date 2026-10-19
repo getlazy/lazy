@@ -271,3 +271,18 @@ describe('buildRaisedItemsListing', () => {
     expect(result.items[0].promoted_to_task_ids).toEqual(['t-promoted']);
   });
 });
+
+// INVARIANT: the listing carries the turn that raised each item, so Teams can
+// link every queue row to its turn; an item with no recorded turn says null.
+describe('raising turn on the listing', () => {
+  test('turn_sequence rides each listed item', () => {
+    const task = stubTask('t-a', { code: 'aaa-task' });
+    const rows: RawRaisedItemRow[] = [
+      { item: { ...stubRaised('t-a', 'with a turn', 'a'), turn_sequence: 7 }, task },
+      { item: stubRaised('t-a', 'without a turn', 'b'), task },
+    ];
+    const items = buildRaisedItemsListing(rows, [task], { state: 'all' }).items;
+    expect(items.find((i) => i.id === 'a')?.turn_sequence).toBe(7);
+    expect(items.find((i) => i.id === 'b')?.turn_sequence).toBeNull();
+  });
+});

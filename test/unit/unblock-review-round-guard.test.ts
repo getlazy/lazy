@@ -428,7 +428,7 @@ describe('the loop fix-round budget on unblock (§9.1)', () => {
 
   // INVARIANT: a HUMAN unblock is never refused, at any count, and it starts a
   // fresh budget. It carries feedback somebody has already typed, and refusing
-  // it would discard that (CLAUDE.md, "Never Lose Human Feedback").
+  // it would discard that (AGENTS.md, "Never Lose Human Feedback").
   test('a human unblock at the budget is allowed and resets it', async () => {
     metadata.set('task-1:loop_fix_round', '99');
 

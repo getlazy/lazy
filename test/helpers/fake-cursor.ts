@@ -331,6 +331,7 @@ export async function clearCursorInvocations(fake: FakeCursor): Promise<void> {
  */
 const FAKE_CURSOR_PRELUDE = String.raw`
 const FAKE_LABEL = 'fake cursor-agent';
+const recordedStdin = argv.includes('--print') ? fs.readFileSync(0, 'utf8') : undefined;
 
 // Probe invocations, answered without touching the scenario so they never
 // consume a sequence entry:

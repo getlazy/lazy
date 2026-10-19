@@ -1,5 +1,7 @@
 import { describe, test, expect } from 'bun:test';
 import { findPendingFeedback, buildFeedbackRedeliveryPrompt } from '../../src/utils/feedback-redelivery';
+import { buildUnblockPrompt } from '../../src/review/unblock-prompt';
+import type { ReviewComment } from '../../src/types';
 import { buildResumePrompt } from '../../src/daemon/task-lifecycle';
 import type { Turn } from '../../src/types';
 
@@ -20,7 +22,7 @@ function turn(partial: Partial<Turn> & { sequence: number }): Turn {
 }
 
 describe('findPendingFeedback', () => {
-  // INVARIANT (CLAUDE.md — never lose human feedback): feedback that was
+  // INVARIANT (AGENTS.md — never lose human feedback): feedback that was
   // persisted but never consumed by an agent turn must be findable so resume
   // can re-deliver it. This is the whole point of the marker.
   test('finds a feedback turn that no agent response consumed', () => {
@@ -92,7 +94,7 @@ describe('findPendingFeedback', () => {
 });
 
 describe('buildFeedbackRedeliveryPrompt', () => {
-  // INVARIANT (CLAUDE.md): the human's words are re-delivered VERBATIM —
+  // INVARIANT (AGENTS.md): the human's words are re-delivered VERBATIM —
   // never summarized, truncated, or rewritten.
   test('reproduces the feedback verbatim', () => {
     const feedback = 'Rename `foo` to `bar`.\n\n- keep the tests green\n- do NOT touch main';
@@ -140,7 +142,7 @@ describe('buildFeedbackRedeliveryPrompt', () => {
 });
 
 describe('buildResumePrompt', () => {
-  // INVARIANT (CLAUDE.md — never lose human feedback): re-delivered feedback
+  // INVARIANT (AGENTS.md — never lose human feedback): re-delivered feedback
   // REPLACES the generic "you were interrupted, carry on" context. The generic
   // prompt leaves the feedback available only implicitly via turn history, and
   // in the live incident the agent never acted on it.

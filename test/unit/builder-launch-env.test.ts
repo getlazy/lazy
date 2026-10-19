@@ -6,7 +6,7 @@ import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { mkdtemp, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { overlayLaunchEnv } from '../../src/builder/launch-env';
+import { fetchBuilderLaunchEnv, launchEnvRefusalText, overlayLaunchEnv } from '../../src/builder/launch-env';
 import { handleGetBuilderLaunchEnv } from '../../src/daemon/rpc-handlers';
 import { mintMcpToken, clearMcpTokenCache } from '../../src/daemon/mcp-tokens';
 import { setDaemonContext, setDaemonProxyPort, clearDaemonContext } from '../../src/daemon/context';
@@ -22,6 +22,48 @@ describe('overlayLaunchEnv', () => {
     );
     expect(out.HOME).toBe('/home/user');
     expect(out.ANTHROPIC_BASE_URL).toBe('http://127.0.0.1:9999');
+  });
+});
+
+describe('fetchBuilderLaunchEnv', () => {
+  test('waits for proxy startup after the daemon begins serving', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'builder-launch-retry-'));
+    const configPath = join(directory, 'daemon.json');
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    try {
+      await writeFile(configPath, JSON.stringify({ token: 'token', projectRoot: '/project', target: 'http://daemon' }));
+      globalThis.fetch = Object.assign(async () => {
+        attempts++;
+        return attempts === 1
+          ? Response.json({ error: 'The daemon proxy is not running, so this builder cannot refresh its launch environment.' }, { status: 503 })
+          : Response.json({ authEnvVars: [{ key: 'ANTHROPIC_BASE_URL', value: 'http://proxy' }] });
+      }, { preconnect: originalFetch.preconnect });
+      expect((await fetchBuilderLaunchEnv(configPath)).authEnvVars[0]?.value).toBe('http://proxy');
+      expect(attempts).toBe(2);
+    } finally {
+      globalThis.fetch = originalFetch;
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('does not retry unauthorized responses', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'builder-launch-failure-'));
+    const configPath = join(directory, 'daemon.json');
+    const originalFetch = globalThis.fetch;
+    let attempts = 0;
+    try {
+      await writeFile(configPath, JSON.stringify({ token: 'token', projectRoot: '/project', target: 'http://daemon' }));
+      globalThis.fetch = Object.assign(async () => {
+        attempts++;
+        return Response.json({ error: 'Unauthorized' }, { status: 401 });
+      }, { preconnect: originalFetch.preconnect });
+      await expect(fetchBuilderLaunchEnv(configPath)).rejects.toThrow(/401/);
+      expect(attempts).toBe(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });
 
@@ -86,5 +128,20 @@ describe('parseResume stripping', () => {
     const args = ['--model', 'opus', '--resume', 'abc', '--verbose'];
     expect(parseResumeSessionId(args)).toBe('abc');
     expect(stripResumeFromClaudeArgs(args)).toEqual(['--model', 'opus', '--verbose']);
+  });
+});
+
+describe('launchEnvRefusalText', () => {
+  // INVARIANT: a refused launch environment is reported in the daemon's own
+  // words, not as a JSON envelope with CLI advice. A Teams member reads it off
+  // the builder page and has no terminal to run `lazy daemon status` in.
+  test('unwraps the daemon JSON error and adds no CLI advice', () => {
+    const text = launchEnvRefusalText(400, JSON.stringify({ error: 'No credential of yours for endpoint "x".' }));
+    expect(text).toBe('The daemon refused this builder\'s launch environment (400): No credential of yours for endpoint "x".');
+    expect(text).not.toContain('lazy daemon status');
+  });
+
+  test('keeps a non-JSON body as it is', () => {
+    expect(launchEnvRefusalText(502, 'Bad Gateway')).toBe('The daemon refused this builder\'s launch environment (502): Bad Gateway');
   });
 });

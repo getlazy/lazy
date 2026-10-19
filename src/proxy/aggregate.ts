@@ -5,8 +5,9 @@
  * so the same rollup can back the `lazy stats tokens` CLI readout today and an API or
  * MCP surface later without duplicating the arithmetic.
  *
- * Attribution comes from the `x-lazy-role` / `x-lazy-task-id` headers the proxy
- * records per request (see src/utils/role-target.ts). Records that carry neither
+ * Attribution comes from the per-launch credential grant the proxy resolves
+ * (src/proxy/credential-broker.ts); the `x-lazy-role` / `x-lazy-task-id`
+ * headers are only a fallback for traffic that presents no grant. Records that carry neither
  * are grouped under `(unattributed)` rather than dropped: traffic we cannot
  * attribute is a fact worth seeing, not one worth hiding.
  */
@@ -39,6 +40,12 @@ export interface TokenReport {
   byRole: TokenGroup[];
   byTask: TokenGroup[];
   byModel: TokenGroup[];
+  /**
+   * Per upstream ENDPOINT: the named endpoint a tiered profile's request was
+   * served by, else the upstream origin — so a tiered chain's spend is seen
+   * per endpoint, blended across its models.
+   */
+  byEndpoint: TokenGroup[];
   /** Timestamp (unix ms) of the oldest / newest record counted, or null if none. */
   firstTs: number | null;
   lastTs: number | null;
@@ -123,6 +130,7 @@ export function aggregateUsage(
   const byRole = new Map<string, TokenGroup>();
   const byTask = new Map<string, TokenGroup>();
   const byModel = new Map<string, TokenGroup>();
+  const byEndpoint = new Map<string, TokenGroup>();
   let firstTs: number | null = null;
   let lastTs: number | null = null;
 
@@ -139,6 +147,7 @@ export function aggregateUsage(
     bucket(byRole, record.role || UNATTRIBUTED, record);
     bucket(byTask, record.taskId || UNATTRIBUTED, record);
     bucket(byModel, record.model || UNATTRIBUTED, record);
+    bucket(byEndpoint, record.servedByEndpoint || endpointOrigin(record.upstream), record);
 
     if (firstTs === null || record.ts < firstTs) firstTs = record.ts;
     if (lastTs === null || record.ts > lastTs) lastTs = record.ts;
@@ -149,7 +158,18 @@ export function aggregateUsage(
     byRole: rank(byRole),
     byTask: rank(byTask),
     byModel: rank(byModel),
+    byEndpoint: rank(byEndpoint),
     firstTs,
     lastTs,
   };
+}
+
+function endpointOrigin(upstream: string | null | undefined): string {
+  if (!upstream) return UNATTRIBUTED;
+  try {
+    return new URL(upstream).origin;
+  } catch {
+    // Not a URL (a test double): the raw value still names the upstream.
+    return upstream;
+  }
 }

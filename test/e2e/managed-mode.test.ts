@@ -5,13 +5,14 @@
  * loader in-process. This suite covers the part a unit test cannot: that a real
  * `lazy` invocation, run under exactly the environment the fleet supervisor
  * sets (lazy-teams/app/clients/local_supervisor.rb `daemon_env`), honours the
- * fleet's store and refuses a hostile config — and that the refusal carries the
- * marker Lazy Teams matches on.
+ * fleet's store and keeps a hostile config's refused settings UNUSED without
+ * refusing to run — a repository's refused settings are kept unused and
+ * reported (`lazy init`, `lazy doctor`), never a start refusal (engineer,
+ * 2026-10-08).
  *
- * That marker is a CROSS-REPO CONTRACT. `ProvisioningDiagnosis` classifies a
- * provisioning failure as `:managed_config_refused` by matching the literal
- * string `managed config refused:` in the command's output. Nothing on the Ruby
- * side can notice if lazy rewords it; this suite is where that breaks.
+ * The `managed config refused:` marker that `ProvisioningDiagnosis` matches is
+ * now reachable only through the loader's backstop; these tests assert it does
+ * NOT appear for a hostile repository config.
  *
  * INVARIANT, and the reason for the last block: with managed mode OFF, every
  * one of these commands must behave exactly as it always has. Managed mode is a
@@ -133,23 +134,25 @@ describe('managed mode (fleet host)', () => {
     expect(await Bun.file(join(foreign, 'tasks')).exists()).toBe(false);
   });
 
-  // CROSS-REPO CONTRACT: lazy-teams/app/models/provisioning_diagnosis.rb keys on
-  // this exact string to render a refusal instead of a generic "a command
-  // failed, retry". Rewording it silently degrades that surface.
-  test('a hostile lazy.toml refuses provisioning with the marker Lazy Teams matches on', async () => {
+  // INVARIANT: a repository's refused settings are kept unused and reported,
+  // never a start refusal (engineer, 2026-10-08: "Importing must never refuse
+  // anything"). A project whose lazy.toml carries a mount still provisions —
+  // so the control plane's verbatim import can happen — and `lazy doctor`
+  // names the mount as kept but not used.
+  test('a hostile lazy.toml still provisions, and doctor names what is not used', async () => {
     await writeFile(join(repo, 'lazy.toml'), HOSTILE_CONFIG);
 
     const init = await fleetInit();
+    expect(init.exitCode).toBe(0);
+    expect(init.stdout + init.stderr).not.toContain('managed config refused:');
 
-    expect(init.exitCode).not.toBe(0);
-    const output = init.stdout + init.stderr;
-    expect(output).toContain('managed config refused:');
-    // Names the key, and says what to do about it.
-    expect(output).toContain('mounts');
-    expect(output).toContain("repository's lazy.toml");
+    const doctor = await runLazy(repo, ['doctor', '--no-resume'], fleetEnv(fleetStore));
+    const said = doctor.stdout + doctor.stderr;
+    expect(said).toContain("lazy.toml 'mounts'");
+    expect(said).toContain('kept in lazy.toml but not used');
   });
 
-  test('the refusal repeats on every later command, not just at init', async () => {
+  test('a refused setting pushed after provisioning never stops later commands', async () => {
     const init = await fleetInit();
     expect(init.exitCode).toBe(0);
 
@@ -157,8 +160,8 @@ describe('managed mode (fleet host)', () => {
     await writeFile(join(repo, 'lazy.toml'), HOSTILE_CONFIG);
 
     const list = await runLazy(repo, ['list'], fleetEnv(fleetStore));
-    expect(list.exitCode).not.toBe(0);
-    expect(list.stdout + list.stderr).toContain('managed config refused:');
+    expect(list.exitCode).toBe(0);
+    expect(list.stdout + list.stderr).not.toContain('managed config refused:');
   });
 
   // Fail closed: armed with no store, the daemon must stop rather than fall
@@ -172,7 +175,7 @@ describe('managed mode (fleet host)', () => {
     expect(init.exitCode).toBe(0);
     const controlPlaneConfig = join(root, 'fleet-config', 'lazy.toml');
     await mkdir(join(root, 'fleet-config'), { recursive: true });
-    await writeFile(controlPlaneConfig, '[permissions]\nprotected = ["CLAUDE.md"]\n');
+    await writeFile(controlPlaneConfig, '[permissions]\nprotected = ["AGENTS.md"]\n');
     const env = { ...fleetEnv(fleetStore), LAZY_MANAGED_CONFIG_PATH: controlPlaneConfig };
 
     await writeFile(join(repo, 'lazy.toml'), HOSTILE_CONFIG);
@@ -180,10 +183,10 @@ describe('managed mode (fleet host)', () => {
     expect(list.stderr).not.toContain('managed config refused:');
     expect(list.exitCode).toBe(0);
 
-    // Without the control plane's file the same repository is refused — the
-    // file above is what made the difference.
-    const refused = await runLazy(repo, ['list'], fleetEnv(fleetStore));
-    expect(`${refused.stdout}${refused.stderr}`).toContain('managed config refused:');
+    // Without the control plane's file the same repository still runs: its
+    // refused settings are withheld, never a refusal.
+    const withheld = await runLazy(repo, ['list'], fleetEnv(fleetStore));
+    expect(withheld.exitCode).toBe(0);
   });
 
   test('managed mode with no storage path refuses to run at all', async () => {
@@ -228,6 +231,39 @@ describe('managed mode (fleet host)', () => {
       const doctor = await runLazy(repo, ['doctor']);
       expect((doctor.stdout + doctor.stderr).toLowerCase()).not.toContain('managed mode');
     });
+
+    // INVARIANT: a single-user install is told its committed plugins are not
+    // run, by name — repository code never runs in lazy's own process on the
+    // host in any mode (engineer, 2026-10-10).
+    test('doctor names ignored repository plugins', async () => {
+      const ownStore = join(root, 'my-own-store');
+      await mkdir(ownStore, { recursive: true });
+      await runLazy(repo, [
+        'init', '--non-interactive', '--skip-auth-check', '--external-path', ownStore,
+      ]);
+      await mkdir(join(repo, '.lazy', 'plugins'), { recursive: true });
+      await writeFile(join(repo, '.lazy', 'plugins', 'redact.ts'), 'export default {};\n');
+
+      const doctor = await runLazy(repo, ['doctor']);
+      const output = doctor.stdout + doctor.stderr;
+      expect(output).toContain('Repository plugins (.lazy/plugins) are not run');
+      expect(output).toContain('redact.ts');
+    });
+
+    // INVARIANT: an unreadable .lazy/plugins (here a regular FILE) is reported,
+    // never allowed to break doctor — repository content cannot take it down.
+    test('a file at .lazy/plugins does not break doctor', async () => {
+      const ownStore = join(root, 'my-own-store');
+      await mkdir(ownStore, { recursive: true });
+      await runLazy(repo, [
+        'init', '--non-interactive', '--skip-auth-check', '--external-path', ownStore,
+      ]);
+      await mkdir(join(repo, '.lazy'), { recursive: true });
+      await writeFile(join(repo, '.lazy', 'plugins'), 'not a directory\n');
+
+      const doctor = await runLazy(repo, ['doctor']);
+      expect(doctor.stdout + doctor.stderr).toContain('Repository plugins: could not read');
+    });
   });
 
   // LOUD, NOT SILENT: the single surface that explains an ignored key.
@@ -238,6 +274,8 @@ describe('managed mode (fleet host)', () => {
     );
     await fleetInit();
 
+    await mkdir(join(repo, '.lazy', 'plugins'), { recursive: true });
+    await writeFile(join(repo, '.lazy', 'plugins', 'x.ts'), 'export default {};\n');
     const doctor = await runLazy(repo, ['doctor'], fleetEnv(fleetStore));
     const output = doctor.stdout + doctor.stderr;
 
@@ -246,5 +284,8 @@ describe('managed mode (fleet host)', () => {
     expect(output).toContain('runner.type');
     expect(output).toContain('server.port');
     expect(output).toContain('docker');
+    // INVARIANT: the owner learns here that repository plugins do not run on a
+    // managed host — the daemon never imports them (managed-repo-code.ts).
+    expect(output).toContain('Repository plugins (.lazy/plugins) are not run');
   });
 });

@@ -12,6 +12,7 @@ import { join } from 'path';
 import { protocolDir as getProtocolDir, readStatus } from '../protocol';
 import { createRunner } from '../runner';
 import type { WorkingSubstate } from '../utils/working-substate';
+import { taskTurnFailure, type TaskTurnFailure } from './turn-failure';
 import { computeTaskWorkingSubstate } from '../utils/working-run';
 import { checkOrphanedChild, type OrphanCheckResult } from './orphan';
 import type { Task, Session, Turn, Commit, Comment, JournalEntry, RaisedItem, TaskArtifact, TurnReport, FileDecision } from '../types';
@@ -28,6 +29,7 @@ import { primeDashboardAuthority } from '../serve/authority';
 import type { Storage } from '../storage/interface';
 import { getAutoReactSummary, type AutoReactTrigger } from '../daemon/auto-react-budget';
 import { logger } from '../utils/logger';
+import { mapLimit, STORE_SCAN_CONCURRENCY } from '../utils/map-limit';
 import { loadConfig } from '../config/loader';
 import type { ReviewSettingsView } from '../review/mode';
 import { getSlowLaneState, getLastProjectAutoResumeAt } from '../daemon/auto-resume-queue';
@@ -84,6 +86,13 @@ export interface TaskShowData {
    * can be derived. Shares the single derivation used by ls/blocked/active/watch.
    */
   workingSubstate: WorkingSubstate | null;
+  /**
+   * The failure a parked task's LAST turn ended in — a dead credential, a bad
+   * model, a container that never started — with its fix. Derived from the
+   * turns (src/task/turn-failure.ts), so the next turn clears it. Null when the
+   * last turn did not fail or the task is running.
+   */
+  turnFailure: TaskTurnFailure | null;
   /**
    * Merge state of the task's worktree, when one exists on disk.
    *
@@ -142,7 +151,12 @@ export interface TaskShowData {
 /**
  * Load all data needed for task show output.
  */
-export async function loadTaskShowData(storage: Storage, task: Task, root?: string): Promise<TaskShowData> {
+export async function loadTaskShowData(
+  storage: Storage,
+  task: Task,
+  root?: string,
+  opts: { loadChildSessions?: boolean } = {},
+): Promise<TaskShowData> {
   const sess = await storage.getSessionByTaskId(task.id);
   const children = await storage.getChildTasks(task.id);
 
@@ -221,9 +235,13 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
   const parentId = parentTaskIdOf(task);
   const parent = parentId ? await storage.getTask(parentId) : null;
 
+  // Default on: `lazy show` and search still want every child's session.
+  // A tab that did not ask for children passes false and skips the reads.
   const childSessions = new Map<string, Session | null>();
-  for (const child of children) {
-    childSessions.set(child.id, await storage.getSessionByTaskId(child.id));
+  if (opts.loadChildSessions !== false && children.length > 0) {
+    const sessions = await mapLimit(children, STORE_SCAN_CONCURRENCY, (child) =>
+      storage.getSessionByTaskId(child.id));
+    children.forEach((child, index) => childSessions.set(child.id, sessions[index] ?? null));
   }
 
   // Check orphan status for child tasks
@@ -288,5 +306,5 @@ export async function loadTaskShowData(storage: Storage, task: Task, root?: stri
     }
   }
 
-  return { task, session: sess, turns, commits, comments, journal, raisedItems, turnReport, fileDecisions, artifacts, statusHistory, tagHistory, children, childSessions, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate, mergeState, serveState, protection, autoResumeQueue, modelsDefault };
+  return { task, session: sess, turns, commits, comments, journal, raisedItems, turnReport, fileDecisions, artifacts, statusHistory, tagHistory, children, childSessions, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate, turnFailure: taskTurnFailure(task, sess), mergeState, serveState, protection, autoResumeQueue, modelsDefault };
 }

@@ -11,6 +11,7 @@ import type { ParsedConversation } from './claude-code-logs';
 import type { StoredConversation, ConversationStats } from '../storage/types';
 import type { Storage } from '../storage/interface';
 import { logger } from '../utils/logger';
+import { conversationForReading } from './local-command-cleanup';
 
 // Re-export types for backward compatibility
 export type { StoredConversation, StoredMessage, StoredSubagent, ConversationStats } from '../storage/types';
@@ -108,10 +109,13 @@ export async function saveConversationWithoutRegression(
   conversation: StoredConversation,
 ): Promise<ConversationSaveOutcome> {
   const existing = await storage.loadConversation(conversation.sessionId);
-  if (existing && isStrictPrefixConversation(conversation, existing)) {
+  conversation = { ...conversation, memberEmail: existing?.memberEmail ?? conversation.memberEmail ?? null };
+  const incomingTranscript = conversationForReading(conversation);
+  const storedTranscript = existing ? conversationForReading(existing) : null;
+  if (storedTranscript && isStrictPrefixConversation(incomingTranscript, storedTranscript)) {
     logger.warn(
       `Ignoring a capture of conversation ${conversation.sessionId} that would have shortened it ` +
-      `(${existing.messages.length} messages stored, ${conversation.messages.length} offered). ` +
+      `(${storedTranscript.messages.length} conversation messages stored, ${incomingTranscript.messages.length} offered). ` +
       `The incoming copy is an earlier snapshot of the same session.`,
     );
     return 'skipped-regression';

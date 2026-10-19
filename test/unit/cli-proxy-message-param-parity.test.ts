@@ -3,7 +3,7 @@
  * bodies lazy's own CLI actually sends.
  *
  * The route writes a `TaskAction` row BEFORE relaying to the daemon — root
- * CLAUDE.md's first invariant, so a refused `lazy unblock` or `lazy ask`
+ * AGENTS.md's first invariant, so a refused `lazy unblock` or `lazy ask`
  * still has the human's words on it. WHERE those words live in the body is a
  * wire contract: `CliRpcCommand::Mapping` names a `message_param` and Rails
  * reads exactly that key. Name a key the CLI does not send and the row is
@@ -109,7 +109,7 @@ describe('the Rails proxy table against the bodies the CLI sends', () => {
   // INVARIANT: every `message_param` the Rails route names is a key the CLI's
   // own request body carries. The route saves the human's words off that key
   // before the relay; a key the body never carries saves nothing, so a
-  // refused command loses what the person typed — root CLAUDE.md's first
+  // refused command loses what the person typed — root AGENTS.md's first
   // invariant, broken silently rather than loudly.
   test('every message param the Rails route reads is a key the CLI actually sends', () => {
     const broken: string[] = [];
@@ -203,7 +203,9 @@ describe('the Rails proxy table against the bodies the CLI sends', () => {
   });
 
   // Not a failure — a mapped command lazy never issues through this module is
-  // dormant by design (`editTask` says so in the table itself). Pinning the
+  // dormant by design. `editTask` was the one such command until `lazy edit
+  // --code` on a started task began sending it (`queryEditTask`); none is
+  // dormant now, and a new one must be added here by name. Pinning the
   // list keeps the two skips above honest: a reader can see WHICH commands
   // carrying a param the checks did not cover, instead of assuming they
   // covered everything. Reads are not here because they name no param at all.
@@ -212,6 +214,6 @@ describe('the Rails proxy table against the bodies the CLI sends', () => {
       .filter(([ c, p ]) => (p.taskIdParam || p.messageParam) && !bodies.has(c))
       .map(([ c ]) => c)
       .sort();
-    expect(dormant).toEqual([ 'editTask' ]);
+    expect(dormant).toEqual([]);
   });
 });

@@ -6,13 +6,13 @@
  * asserted without burning wall-clock.
  */
 
-import { describe, test, expect } from 'bun:test';
-import { runWork, CrashError, FatalAgentError, CrashLoopError, WatchdogTimeoutError, GracefulExitTimeoutError, turnErrorSessionId, type WorkResult, type RetryState } from '../../src/supervisor/work';
+import { describe, test, expect, spyOn } from 'bun:test';
+import { runWork, describeAgentExitError, CrashError, FatalAgentError, CrashLoopError, WatchdogTimeoutError, GracefulExitTimeoutError, turnErrorSessionId, type WorkResult, type RetryState } from '../../src/supervisor/work';
 import { describeTurnFailure } from '../../src/supervisor';
 import type { ErrorResponse } from '../../src/protocol';
 import { ClaudeCodeAgent } from '../../src/agent/claude-code';
 import { createRunnerFromType } from '../../src/runner';
-import { UNREACHABLE_MAX_ATTEMPTS } from '../../src/supervisor/retry-policy';
+import { UNKNOWN_MAX_ATTEMPTS, UNREACHABLE_MAX_ATTEMPTS } from '../../src/supervisor/retry-policy';
 
 const agent = new ClaudeCodeAgent();
 const runner = createRunnerFromType('dangerously-host-process-without-any-isolation');
@@ -190,6 +190,34 @@ describe('runWork — transient classifications retry on the tight ladder', () =
   });
 });
 
+describe('runWork — persistent unknown failures are bounded', () => {
+  // INVARIANT: an unclassified failure that is too slow for the fast-crash-loop
+  // detector still stops after UNKNOWN_MAX_ATTEMPTS — a Cursor turn that only
+  // reconnects and exits must never relaunch forever.
+  test('slow Cursor-style exits stop after the unknown attempt limit', async () => {
+    let calls = 0;
+    let clock = 1_000_000;
+    const nowSpy = spyOn(Date, 'now').mockImplementation(() => clock);
+    let outcome: Awaited<ReturnType<typeof run>>;
+    try {
+      outcome = await run({
+        execute: async () => {
+          calls++;
+          clock += 11_000; // each attempt runs past the 10s fast-fail window
+          throw new CrashError({ message: 'reconnecting', exitCode: 1, stderr: '', durationMs: 11_000 });
+        },
+      });
+    } finally {
+      nowSpy.mockRestore();
+    }
+    const { sleeps, error } = outcome;
+    expect(calls).toBe(UNKNOWN_MAX_ATTEMPTS);
+    expect(sleeps.length).toBe(UNKNOWN_MAX_ATTEMPTS - 1);
+    expect(error).toBeInstanceOf(FatalAgentError);
+    expect((error as FatalAgentError).failureClass).toBe('unknown');
+  });
+});
+
 describe('runWork — refused connections are bounded, never infinite', () => {
   // INVARIANT (the engineer's bar): never spin forever on something that
   // cannot recover. A refused connection is retried generously — it may be a
@@ -309,5 +337,32 @@ describe('session id survives the turn\'s own failure', () => {
     describeTurnFailure(response, err);
 
     expect(response.session_id).toBe('sess-set-by-executor');
+  });
+});
+
+describe('describeAgentExitError', () => {
+  // INVARIANT: Cursor reports failures on STDERR and ends stdout in
+  // retry/connection NDJSON (cursor-agent 2026.09.28 has no error event). The
+  // crash message must carry the stderr text, never the reconnect tail — the
+  // tail is what left "unknown: {\"type\":\"retry\"…" as the only clue.
+  test('prefers stderr over an unstructured NDJSON stdout tail', () => {
+    const tail = [
+      JSON.stringify({ type: 'connection', subtype: 'reconnecting', attempt: 3, endpoint_url: 'http://proxy/_lazy/cursor/tok_secret123/agent.v1.AgentService/RunSSE' }),
+      JSON.stringify({ type: 'retry', subtype: 'starting' }),
+    ].join('\n');
+    const out = describeAgentExitError(tail, tail, 'Connection lost. Failed to reconnect to http://proxy/_lazy/cursor/tok_secret123/x after 5 attempts.\n');
+    expect(out.message).toContain('Failed to reconnect');
+    expect(out.message).not.toContain('tok_secret123');
+    expect(out.stdoutError).not.toContain('tok_secret123');
+  });
+
+  test('a structured stdout error still wins over stderr', () => {
+    const line = JSON.stringify({ error: { message: 'Invalid API key' } });
+    expect(describeAgentExitError(line, line, 'noise').message).toBe('Invalid API key');
+  });
+
+  test('does not cut a long error before classification', () => {
+    const long = 'x'.repeat(900) + ' insufficient_quota';
+    expect(describeAgentExitError('', '', long).message).toContain('insufficient_quota');
   });
 });

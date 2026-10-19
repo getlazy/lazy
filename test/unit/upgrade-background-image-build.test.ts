@@ -134,7 +134,7 @@ describe('background image build for lazy upgrade', () => {
     expect(build.status()).toBe('succeeded');
   });
 
-  // INVARIANT: no silent fallback to the old image (CLAUDE.md). A failed
+  // INVARIANT: no silent fallback to the old image (AGENTS.md). A failed
   // background build fails the upgrade, with a message that says the current
   // image is intact and what to do next.
   test('a failed build reports failure and throws an actionable error', async () => {

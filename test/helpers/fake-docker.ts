@@ -16,7 +16,9 @@
  * The fake keeps its whole world in a state directory: one file per image ref
  * (line 1 = the `lazy.dockerfile.hash` label, line 2 = the image ID, line 3 =
  * the created timestamp that backs the age-based freshness check, line 4 = the
- * `lazy.image.inputs` manifest label, empty on pre-build_inputs images) plus an
+ * `lazy.image.inputs` manifest label, empty on pre-build_inputs images, line 5 =
+ * the `lazy.base.source` label; a `registry/` directory of the same files backs
+ * `pull`) plus an
  * `images.tsv` that backs `docker images --format`. Containers live the same way
  * in `containers.tsv` (name, state, `lazy.project` label, id), backing `ps -a`
  * and `rm -f`. A test seeds them directly, and a DETACHED `run -d` registers its
@@ -41,6 +43,18 @@ mkdir -p "\$STATE/images"
 printf '%s\\n' "\$*" >> "\$STATE/invocations.log"
 
 reffile() { printf '%s/images/%s' "\$STATE" "\$(printf '%s' "\$1" | tr ':/' '__')"; }
+# The fake "registry": one file per published ref, same format as images/.
+regfile() { printf '%s/registry/%s' "\$STATE" "\$(printf '%s' "\$1" | tr ':/' '__')"; }
+# List ref \$1 (image id \$2) in images.tsv, replacing any earlier row for it.
+index_ref() {
+  repo="\${1%:*}"
+  tag="\${1##*:}"
+  if [ -f "\$STATE/images.tsv" ]; then
+    awk -F'\\t' -v r="\$repo" -v g="\$tag" '!(\$1 == r && \$2 == g)' "\$STATE/images.tsv" > "\$STATE/images.tsv.new"
+    mv "\$STATE/images.tsv.new" "\$STATE/images.tsv"
+  fi
+  printf '%s\\t%s\\t%s\\t1.2GB\\n' "\$repo" "\$tag" "\$2" >> "\$STATE/images.tsv"
+}
 
 case "\${1:-}" in
   info)
@@ -60,16 +74,49 @@ case "\${1:-}" in
       [ -f "\$file" ] || exit 1
       case "\${5:-}" in
         *lazy.image.inputs*) sed -n 4p "\$file" ;;
+        *lazy.base.source*)  sed -n 5p "\$file" ;;
         *Labels*)  sed -n 1p "\$file" ;;
         *Created*) sed -n 3p "\$file" ;;
         *)         sed -n 2p "\$file" ;;
       esac
       exit 0
     fi
+    # image rm <ref>: drop that tag, as docker untags (and frees what nothing
+    # else references). Never --force here: lazy's repair must not pass it.
+    if [ "\${2:-}" = "rm" ]; then
+      file="\$(reffile "\${3:-}")"
+      [ -f "\$file" ] || { echo "Error response from daemon: No such image: \${3:-}" >&2; exit 1; }
+      rm -f "\$file"
+      repo="\${3%:*}"; tag="\${3##*:}"
+      awk -F'\\t' -v r="\$repo" -v g="\$tag" '!(\$1 == r && \$2 == g)' "\$STATE/images.tsv" > "\$STATE/images.tsv.new" 2>/dev/null
+      mv "\$STATE/images.tsv.new" "\$STATE/images.tsv"
+      exit 0
+    fi
     exit 1
     ;;
   images)
     cat "\$STATE/images.tsv" 2>/dev/null
+    exit 0
+    ;;
+  pull)
+    if [ -f "\$STATE/fail-pull" ]; then
+      echo "fake docker: dial tcp: lookup ghcr.io: no such host" >&2
+      exit 1
+    fi
+    src="\$(regfile "\${2:-}")"
+    if [ ! -f "\$src" ]; then
+      echo "Error response from daemon: manifest unknown" >&2
+      exit 1
+    fi
+    cp "\$src" "\$(reffile "\$2")"
+    index_ref "\$2" "\$(sed -n 2p "\$src")"
+    exit 0
+    ;;
+  tag)
+    src="\$(reffile "\${2:-}")"
+    [ -f "\$src" ] || { echo "fake docker: no such image \$2" >&2; exit 1; }
+    cp "\$src" "\$(reffile "\$3")"
+    index_ref "\$3" "\$(sed -n 2p "\$src")"
     exit 0
     ;;
   inspect)
@@ -221,6 +268,16 @@ case "\${1:-}" in
     exit 0
     ;;
   run)
+    # A damaged image store: the next N runs fail the way Docker does when it
+    # cannot extract a layer of the image (the 2026-10-15 field message).
+    if [ -f "\$STATE/damaged-runs" ]; then
+      left="\$(cat "\$STATE/damaged-runs")"
+      if [ "\$left" -gt 0 ] 2>/dev/null; then
+        echo \$((left - 1)) > "\$STATE/damaged-runs"
+        echo 'docker: Error response from daemon: apply layer error for "": failed to extract layer sha256:c315cf96: archive/tar: invalid tar header' >&2
+        exit 125
+      fi
+    fi
     # Throwaway probe containers (e.g. \`docker run --rm <image> which <bin>\`).
     # Succeed by default; a test flips the fail-run flag to simulate a probe
     # that finds the binary missing.
@@ -364,6 +421,7 @@ case "\${1:-}" in
     dockerfile=""
     hash=""
     inputs=""
+    source=""
     while [ \$# -gt 0 ]; do
       case "\$1" in
         -t) tags+=("\$2"); shift 2 ;;
@@ -371,6 +429,7 @@ case "\${1:-}" in
           case "\$2" in
             lazy.dockerfile.hash=*) hash="\${2#lazy.dockerfile.hash=}" ;;
             lazy.image.inputs=*)    inputs="\${2#lazy.image.inputs=}" ;;
+            lazy.base.source=*)     source="\${2#lazy.base.source=}" ;;
           esac
           shift 2
           ;;
@@ -395,6 +454,10 @@ case "\${1:-}" in
     # be absurd.
     mkdir -p "\$STATE/contexts/\$c.content"
     [ -n "\$dockerfile" ] && [ -f "\$dockerfile" ] && cp "\$dockerfile" "\$STATE/contexts/\$c.content/dockerfile" 2>/dev/null
+    # The build's own pid, so a test can prove Cancel killed it, and the
+    # progress a test scripted (BuildKit plain output, on stderr like the real one).
+    echo "\$\$" > "\$STATE/build-pid"
+    [ -f "\$STATE/build-output" ] && cat "\$STATE/build-output" >&2
     if [ -f "\$STATE/fail-build" ]; then
       echo "fake docker: build failed on purpose" >&2
       exit 1
@@ -408,16 +471,19 @@ case "\${1:-}" in
     created="\$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     # A real \`docker build\` is not instantaneous, and the per-image build lock is
     # only observable if a concurrent caller can actually overlap this window.
-    if [ -f "\$STATE/build-delay" ]; then sleep "\$(cat "\$STATE/build-delay")"; fi
+    # The sleep runs in the background and the shell WAITS on it, so a killed
+    # build takes its sleep with it: a foreground sleep outlived its killed
+    # shell and held the build's output pipes open for the whole delay, so a
+    # cancelled build kept looking alive (and its lock held) for that long.
+    if [ -f "\$STATE/build-delay" ]; then
+      sleep "\$(cat "\$STATE/build-delay")" &
+      trap 'kill \$! 2>/dev/null; exit 143' TERM INT HUP
+      wait \$!
+      trap - TERM INT HUP
+    fi
     for t in "\${tags[@]}"; do
-      printf '%s\\n%s\\n%s\\n%s\\n' "\$hash" "\$id" "\$created" "\$inputs" > "\$(reffile "\$t")"
-      repo="\${t%:*}"
-      tag="\${t##*:}"
-      if [ -f "\$STATE/images.tsv" ]; then
-        awk -F'\\t' -v r="\$repo" -v g="\$tag" '!(\$1 == r && \$2 == g)' "\$STATE/images.tsv" > "\$STATE/images.tsv.new"
-        mv "\$STATE/images.tsv.new" "\$STATE/images.tsv"
-      fi
-      printf '%s\\t%s\\t%s\\t1.2GB\\n' "\$repo" "\$tag" "\$id" >> "\$STATE/images.tsv"
+      printf '%s\\n%s\\n%s\\n%s\\n%s\\n' "\$hash" "\$id" "\$created" "\$inputs" "\$source" > "\$(reffile "\$t")"
+      index_ref "\$t" "\$id"
     done
     exit 0
     ;;
@@ -450,6 +516,8 @@ export interface FakeDocker {
     createdAt?: Date | string;
     /** `lazy.image.inputs` label. Omitted → absent, as on pre-build_inputs images. */
     inputs?: Record<string, string>;
+    /** `lazy.base.source` label. Omitted → absent. */
+    baseSource?: string;
   }): Promise<void>;
   /**
    * Pretend a container exists on this host, for `docker ps -a` and the
@@ -498,6 +566,21 @@ export interface FakeDocker {
   buildContextContent(index: number, which: 'dockerfile'): Promise<string | null>;
   /** Every invocation so far, as joined argv strings. */
   invocations(): Promise<string[]>;
+  /**
+   * Put an image in the fake REGISTRY, so `docker pull <ref>` succeeds and
+   * copies it into the local store. Unpublished refs answer "manifest unknown",
+   * as a real registry does for a tag that was never pushed.
+   */
+  publishImage(ref: string, opts: {
+    dockerfileHash: string;
+    createdAt?: Date | string;
+    /** `lazy.base.source` label. Defaults to `published`, what the release writes. */
+    baseSource?: string;
+  }): Promise<void>;
+  /** Make every `docker pull` fail as an offline host's would. */
+  failPulls(): Promise<void>;
+  /** Every `docker pull` invocation so far, as joined argv strings. */
+  pulls(): Promise<string[]>;
   /** Make the next build fail (offline-fallback tests). */
   failBuilds(): Promise<void>;
   /**
@@ -517,6 +600,10 @@ export interface FakeDocker {
    * accident: the first build finishes before the second caller even inspects.
    */
   slowBuilds(seconds: number): Promise<void>;
+  /** Print `text` on stderr during every build — scripted BuildKit plain progress. */
+  buildOutput(text: string): Promise<void>;
+  /** The pid of the most recent build's process, or null before any build. */
+  buildPid(): Promise<number | null>;
   /**
    * Hold DETACHED `docker run` launches for `seconds` (a detached builder
    * session stand-in). Probe runs (`--rm`) and one-shot/prompt runs are never
@@ -528,6 +615,11 @@ export interface FakeDocker {
   slowDetachedRuns(seconds: number): Promise<void>;
   /** Make `docker run` probes fail (missing-binary preflight tests). */
   failRuns(): Promise<void>;
+  /**
+   * The next `times` `docker run`s fail with Docker's "failed to extract layer …
+   * invalid tar header" (exit 125): an image whose stored layers are torn.
+   */
+  damageRuns(times: number): Promise<void>;
   /**
    * Make `docker stop` fail: a runtime that refuses, which is how a caller
    * reaches the "the stop did not happen" branch it must not report as success.
@@ -610,7 +702,7 @@ export async function installFakeDocker(
         ? opts.createdAt.toISOString()
         : (opts.createdAt ?? new Date().toISOString());
       const inputs = opts.inputs ? JSON.stringify(opts.inputs) : '';
-      await writeFile(join(stateDir, 'images', ref.replace(/[:/]/g, '_')), `${hash}\n${id}\n${createdAt}\n${inputs}\n`);
+      await writeFile(join(stateDir, 'images', ref.replace(/[:/]/g, '_')), `${hash}\n${id}\n${createdAt}\n${inputs}\n${opts.baseSource ?? ''}\n`);
       const colon = ref.lastIndexOf(':');
       const repository = ref.slice(0, colon);
       const tag = ref.slice(colon + 1);
@@ -683,6 +775,23 @@ export async function installFakeDocker(
     async invocations() {
       return readLines('invocations.log');
     },
+    async publishImage(ref, opts) {
+      const createdAt = opts.createdAt instanceof Date
+        ? opts.createdAt.toISOString()
+        : (opts.createdAt ?? new Date().toISOString());
+      await mkdir(join(stateDir, 'registry'), { recursive: true });
+      const id = `sha256:published-${ref.replace(/[^a-z0-9]/gi, '')}`;
+      await writeFile(
+        join(stateDir, 'registry', ref.replace(/[:/]/g, '_')),
+        `${opts.dockerfileHash}\n${id}\n${createdAt}\n\n${opts.baseSource ?? 'published'}\n`,
+      );
+    },
+    async failPulls() {
+      await writeFile(join(stateDir, 'fail-pull'), '1');
+    },
+    async pulls() {
+      return (await readLines('invocations.log')).filter(line => line.startsWith('pull '));
+    },
     async failBuilds() {
       await writeFile(join(stateDir, 'fail-build'), '1');
     },
@@ -695,11 +804,21 @@ export async function installFakeDocker(
     async slowBuilds(seconds) {
       await writeFile(join(stateDir, 'build-delay'), String(seconds));
     },
+    async buildOutput(text) {
+      await writeFile(join(stateDir, 'build-output'), text.endsWith('\n') ? text : `${text}\n`);
+    },
+    async buildPid() {
+      const [pid] = await readLines('build-pid');
+      return pid ? Number(pid) : null;
+    },
     async slowDetachedRuns(seconds) {
       await writeFile(join(stateDir, 'run-delay'), String(seconds));
     },
     async failRuns() {
       await writeFile(join(stateDir, 'fail-run'), '1');
+    },
+    async damageRuns(times: number) {
+      await writeFile(join(stateDir, 'damaged-runs'), String(times));
     },
     async failStops() {
       await writeFile(join(stateDir, 'fail-stop'), '1');

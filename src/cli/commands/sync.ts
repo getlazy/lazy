@@ -9,6 +9,8 @@
 
 import { theme } from '../../render/theme';
 import { usagePauseOverrideEligibility } from '../human-terminal';
+import { parseFlags } from '../helpers';
+import { isTTY, promptYesNo } from '../editor';
 
 export async function commandSync(args: string[]): Promise<void> {
   const firstArg = args[0];
@@ -30,11 +32,20 @@ export async function commandSync(args: string[]): Promise<void> {
  * sync from unblock.
  */
 export async function commandSyncTask(args: string[]): Promise<void> {
-  const taskId = args[0];
+  const parsed = parseFlags(args, [
+    { name: 'default-image', takesValue: false },
+    { name: 'yes', takesValue: false },
+  ], 'sync');
+  const taskId = parsed.positional[0];
   if (!taskId) {
-    console.error('Usage: lazy sync <task_id>');
+    console.error('Usage: lazy sync <task_id> [--default-image] [--yes]');
     process.exit(1);
   }
+  // A merge that conflicts runs the task's agent, a WRITE turn: while the
+  // project's runner image is not ready that needs the person's confirmation to
+  // run on lazy's default image. Given up front with the flag, or asked when
+  // the daemon says the merge needs it.
+  let useDefaultImage = parsed.flags.get('default-image') === true || parsed.flags.get('yes') === true;
 
   const { querySyncTask } = await import('../../daemon/rpc-fallback');
   const { createPhaseDisplay } = await import('../phase-display');
@@ -43,7 +54,21 @@ export async function commandSyncTask(args: string[]): Promise<void> {
   // start — minutes in which the command otherwise says nothing at all.
   const display = createPhaseDisplay();
   try {
-    const result = await querySyncTask({ taskId, ...(await usagePauseOverrideEligibility()), }, display);
+    let result;
+    try {
+      result = await querySyncTask({ taskId, ...(await usagePauseOverrideEligibility()), ...(useDefaultImage ? { useDefaultImage: true } : {}) }, display);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (useDefaultImage || !message.includes("the project's runner image is not ready")) throw err;
+      display.close();
+      console.error(theme.warning(message));
+      if (!isTTY() || !(await promptYesNo("Resolve the conflict now on lazy's default runner image instead? No waits for the project's image", false))) {
+        console.error('Not synced. Run `lazy sync --default-image` to resolve it on the default image, or try again once the project\'s runner image is ready.');
+        process.exit(1);
+      }
+      useDefaultImage = true;
+      result = await querySyncTask({ taskId, ...(await usagePauseOverrideEligibility()), useDefaultImage: true }, createPhaseDisplay());
+    }
     display.close();
 
     // Display warnings
@@ -57,6 +82,7 @@ export async function commandSyncTask(args: string[]): Promise<void> {
         console.log(theme.success(`${result.displayId}: Already up to date.`));
         break;
       case 'sync_launched':
+      case 'waiting_for_parent':
         console.log(theme.success(`${result.displayId}: ${result.message}`));
         break;
       case 'pending_sync':
@@ -81,7 +107,7 @@ export async function commandSyncTask(args: string[]): Promise<void> {
 }
 
 export function syncUsage(): void {
-  console.log(`Usage: lazy sync <task_id>
+  console.log(`Usage: lazy sync <task_id> [--default-image] [--yes]
 
 Reconcile a task's worktree, by task ID, with everything it is behind — in two
 steps, each narrated as it happens.
@@ -106,6 +132,11 @@ the daemon with: lazy daemon start
 Requirements:
   - Task must have a session and worktree
   - A remote driver must be configured for upstream fetch
+
+Options:
+  --default-image    If the merge conflicts while the project's runner image is still
+                     building (or failed), resolve it on lazy's default runner image
+                     instead of being asked (--yes does too)
 
 Examples:
   lazy sync abc12345   # Merge upstream into task abc12345`);

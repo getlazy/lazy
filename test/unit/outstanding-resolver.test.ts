@@ -516,4 +516,126 @@ describe('resolveOutstandingViolations (real git)', () => {
     expect(state.degraded).toBe(true);
     expect(state.outstanding).toEqual([]);
   });
+
+  // INVARIANT (engineer, 2026-10-04): a cluster's child is ALWAYS
+  // agent-audience, so its files are DEFERRED to the cluster's own accept even
+  // when a human launched it — and an approval on its records (made by the
+  // driver, an agent) never clears the cluster's question.
+  test('a cluster hub re-asks a human-launched child\'s approved file', async () => {
+    await commitChildSquash({});
+    const { storage } = buildStorage(childEnvironment('human', [PROTECTED_FILE]));
+    const state = await resolveOutstandingViolations(
+      root,
+      { ...hubTask(), type: 'cluster' } as Task,
+      { upstream_merge_sha: undefined } as unknown as Session,
+      [],
+      storage,
+    );
+    expect(state.degraded).toBe(false);
+    expect(filesOf(state.outstanding)).toEqual([PROTECTED_FILE]);
+    expect(state.approved).toEqual([]);
+  });
+
+  describe('a task whose questions are deferred to its parent', () => {
+    const PARENT_ID = 'cccccccc-dddd-4eee-8fff-000000000000';
+
+    /** The hub, re-cast as a child of a parent whose branch is `lazy/parent01`. */
+    function stackedSubject(): Task {
+      return { ...hubTask(), target: { kind: 'task', parentTaskId: PARENT_ID } } as unknown as Task;
+    }
+
+    function stackedStorage(parentType: string, parentStatus = 'working'): Storage {
+      return {
+        getChildTasks: async () => [],
+        getSessionByTaskId: async () => null,
+        getSessionTurns: async () => [],
+        getStatusHistory: async () => [{ actor: 'human' } as StatusChange],
+        getTask: async (id: string) => id === PARENT_ID
+          ? ({
+              id: PARENT_ID,
+              code: 'the-parent',
+              type: parentType,
+              status: parentStatus,
+              metadata: { task_ref: 'parent01' },
+              target: { kind: 'branch', branch: '' },
+            } as unknown as Task)
+          : null,
+      } as unknown as Storage;
+    }
+
+    beforeEach(async () => {
+      await git(['branch', 'lazy/parent01', 'main'], root);
+      // The subject's OWN protected edit — a direct change, not a child's.
+      await writeFile(join(worktree, PROTECTED_FILE), 'edited by the subtask\n');
+      await git(['add', PROTECTED_FILE], worktree);
+      await git(['commit', '-m', 'subtask edits a protected spec'], worktree);
+    });
+
+    // INVARIANT: an agent-audience subtask's accept asks nothing — the resolver
+    // moves its files to `deferred`, so accept, the conflict label and the
+    // review page all agree it owes nothing here. `detected` still says what
+    // the scan saw.
+    test('a cluster child owes nothing at its own accept; the file is deferred', async () => {
+      const state = await resolveOutstandingViolations(
+        root,
+        stackedSubject(),
+        { upstream_merge_sha: undefined } as unknown as Session,
+        [turn({ sequence: 1, role: 'human', actor: 'human' }), turn({ sequence: 2, role: 'agent', actor: 'agent' })],
+        stackedStorage('cluster'),
+      );
+      expect(state.degraded).toBe(false);
+      expect(state.outstanding).toEqual([]);
+      expect(filesOf(state.deferred)).toEqual([PROTECTED_FILE]);
+      expect(state.deferredTo).toEqual({ taskId: PARENT_ID, displayId: 'the-parent' });
+      expect(filesOf(state.detected)).toEqual([PROTECTED_FILE]);
+    });
+
+    // The agent's reply carries `actor: 'agent'`, as in production; only the
+    // launch turn decides who the subtask is for.
+    test('a human-launched subtask of an ordinary task is still asked', async () => {
+      const state = await resolveOutstandingViolations(
+        root,
+        stackedSubject(),
+        { upstream_merge_sha: undefined } as unknown as Session,
+        [turn({ sequence: 1, role: 'human', actor: 'human' }), turn({ sequence: 2, role: 'agent', actor: 'agent' })],
+        stackedStorage('task'),
+      );
+      expect(filesOf(state.outstanding)).toEqual([PROTECTED_FILE]);
+      expect(state.deferredTo).toBeNull();
+      expect(state.deferred).toEqual([]);
+    });
+
+    test('a finished parent does not take the question', async () => {
+      const state = await resolveOutstandingViolations(
+        root,
+        stackedSubject(),
+        { upstream_merge_sha: undefined } as unknown as Session,
+        [turn({ sequence: 1, role: 'human', actor: 'agent' })],
+        stackedStorage('cluster', 'complete'),
+      );
+      expect(filesOf(state.outstanding)).toEqual([PROTECTED_FILE]);
+      expect(state.deferredTo).toBeNull();
+    });
+
+    // The records-only answer defers by the same rule: without git the pending
+    // record is what would otherwise be owed.
+    test('the degraded answer defers too', async () => {
+      await rm(worktree, { recursive: true, force: true });
+      const state = await resolveOutstandingViolations(
+        root,
+        stackedSubject(),
+        { upstream_merge_sha: undefined } as unknown as Session,
+        [turn({
+          sequence: 1,
+          role: 'agent',
+          actor: 'agent',
+          violations: [{ file: PROTECTED_FILE, base_sha: '', status: 'pending' }],
+        })],
+        stackedStorage('cluster'),
+      );
+      expect(state.degraded).toBe(true);
+      expect(state.outstanding).toEqual([]);
+      expect(filesOf(state.deferred)).toEqual([PROTECTED_FILE]);
+    });
+  });
 });

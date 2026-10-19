@@ -12,7 +12,7 @@ import { sandboxSuiteSkipped } from '../helpers/sandbox-deps';
  * pin the permission mode alongside it.
  *
  * The mode defaults to 'bypass' for the same reason the fake-binary suites do
- * (see CLAUDE.md): none of these tests is ABOUT the OS sandbox — they assert on
+ * (see AGENTS.md): none of these tests is ABOUT the OS sandbox — they assert on
  * builder's CLI surface (disclosure, resume, --model, warning text). Leaving the
  * product default of 'sandbox' made every one of them depend on `bwrap` and
  * `socat` being installed, and lazy correctly refuses to run without them
@@ -110,7 +110,7 @@ function pointBuilderAtLocalProfile(config: string, model: string, endpoint: str
   }
   return (
     config +
-    `\n[agents.local-builder]\nharness = "claude-code"\nmodel = "${model}"\nendpoint = "${endpoint}"\n` +
+    `\n[agents.local-builder]\nharness = "claude-code"\nmodel = "${model}"\nendpoint = "${endpoint}"\ncredential = "none"\n` +
     `\n[models.roles.builder]\nagent = "local-builder"\n`
   );
 }
@@ -127,7 +127,18 @@ function pointBuilderAtLocalProfile(config: string, model: string, endpoint: str
 function installFakeClaude(root: string, logPath: string): string {
   const binDir = join(root, 'fakebin');
   mkdirSync(binDir, { recursive: true });
-  const script = `#!/bin/sh\nprintf '%s\\n' "$@" >> "${logPath}"\nexit 0\n`;
+  // A large system prompt arrives as `--append-system-prompt-file <path>`, and
+  // that temp file is gone once the builder exits — log its contents too.
+  const script = [
+    '#!/bin/sh',
+    `printf '%s\\n' "$@" >> "${logPath}"`,
+    'while [ $# -gt 0 ]; do',
+    `  if [ "$1" = "--append-system-prompt-file" ] && [ -f "$2" ]; then cat "$2" >> "${logPath}"; printf '\\n' >> "${logPath}"; fi`,
+    '  shift',
+    'done',
+    'exit 0',
+    '',
+  ].join('\n');
   const claudePath = join(binDir, 'claude');
   writeFileSync(claudePath, script);
   chmodSync(claudePath, 0o755);
@@ -485,7 +496,7 @@ describe('lazy builder', () => {
     // The fake claude logs one argv entry per LINE, so the multi-line prompt
     // spans many log lines — assert on the whole log, after the flag.
     const args = readClaudeArgs(logPath);
-    expect(args).toContain('--append-system-prompt');
+    expect(args.some((a) => a === '--append-system-prompt' || a === '--append-system-prompt-file')).toBe(true);
     const prompt = args.join('\n');
     expect(prompt).toContain('System messages (unread)');
     expect(prompt).toContain('Daemon version changed: 0.19.0 → 0.20.0');

@@ -87,6 +87,7 @@ const { getWorktreePathForRef, taskRef } = await import('../../src/task/identity
 const { loadConfig } = await import('../../src/config/loader');
 
 const ADA = { kind: 'user', email: 'ada@example.com', name: 'Ada' } as const;
+const SERVICE_HOLDER = 'service-holder@example.com';
 
 afterAll(() => {
   restoreMockedModules();
@@ -120,7 +121,9 @@ describe("a turn-launching request's owner does not outlive the request", () => 
     // TEAM MODE: Ada has her own credential, and the service credential is
     // what a turn nobody asked for spends.
     await putUserCredential(root, { userId: ADA.email, kind: 'api-key', token: 'sk-ant-api-ada' });
-    await putUserCredential(root, { userId: SERVICE_CREDENTIAL_USER_ID, kind: 'api-key', token: 'sk-ant-api-svc' });
+    // Approved endpoint design: service turns spend the named holder's own slot.
+    await putUserCredential(root, { userId: SERVICE_HOLDER, kind: 'api-key', token: 'sk-ant-api-svc' });
+    await putUserCredential(root, { userId: SERVICE_CREDENTIAL_USER_ID, ownerEmail: SERVICE_HOLDER, kind: 'api-key', token: 'sk-ant-api-svc' });
 
     // A task that has run once and is paused — i.e. one a live ask can reach.
     const storage = await getOrCreateStorage();
@@ -177,7 +180,7 @@ describe("a turn-launching request's owner does not outlive the request", () => 
     expect(settled.ask_error).toContain('runner unavailable');
 
     expect(getPendingTurnOwner(taskId)).toBeNull();
-    expect(await daemonStartedTurnBills()).toBe(SERVICE_CREDENTIAL_USER_ID);
+    expect(await daemonStartedTurnBills()).toBe(SERVICE_HOLDER);
   });
 
   // INVARIANT: a launch that runs after its request has returned — the
@@ -203,7 +206,7 @@ describe("a turn-launching request's owner does not outlive the request", () => 
 
     // Nothing of Ada's is left for the next turn the daemon starts.
     expect(getPendingTurnOwner(taskId)).toBeNull();
-    expect(await daemonStartedTurnBills()).toBe(SERVICE_CREDENTIAL_USER_ID);
+    expect(await daemonStartedTurnBills()).toBe(SERVICE_HOLDER);
   });
 
   // INVARIANT: an accept the forge has not finished (`status: 'pending'`) leaves
@@ -229,7 +232,7 @@ describe("a turn-launching request's owner does not outlive the request", () => 
     expect(getPendingTurnOwner(taskId)).toBeNull();
     // The forge's pipeline fails; remote-sync parks the task paused.
     await (await getOrCreateStorage()).updateTaskStatus(taskId, 'blocked', 'system');
-    expect(await daemonStartedTurnBills()).toBe(SERVICE_CREDENTIAL_USER_ID);
+    expect(await daemonStartedTurnBills()).toBe(SERVICE_HOLDER);
   });
 
   // INVARIANT: a turn the daemon starts by itself WHILE a member's
@@ -262,7 +265,7 @@ describe("a turn-launching request's owner does not outlive the request", () => 
     await inHandler;
 
     // The daemon starts a turn on the task now — outside any request.
-    expect(await daemonStartedTurnBills()).toBe(SERVICE_CREDENTIAL_USER_ID);
+    expect(await daemonStartedTurnBills()).toBe(SERVICE_HOLDER);
     const session = await (await getOrCreateStorage()).getSession(sessionId);
     expect(session?.turn_owner_email ?? null).toBeNull();
     expect(session?.turn_system_initiated).toBe(true);

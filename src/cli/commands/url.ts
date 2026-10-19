@@ -14,7 +14,7 @@ import { primeDashboardAuthority } from '../../serve/authority';
  * deciding which one to open. With one it prints exactly one bare URL and
  * nothing else, so `open "$(lazy url my-task web)"` works.
  *
- * The URL printed is the subdomain name (`http://web.my-task.lazy.localhost:26024`),
+ * The URL printed is the subdomain name (`http://my-task.web.lazy.localhost:26024`),
  * because the human's next move is to open it in a browser and the name is what
  * gives the app its own cookie jar and a URL that survives a container recreate.
  * `--direct` prints the raw `127.0.0.1` mapping instead, for curl and scripts:
@@ -180,7 +180,7 @@ container is created.
 
 The URL printed is a name served by the running daemon:
 
-  http://web.my-task.lazy.localhost:<dashboard port>
+  http://my-task.web.lazy.localhost:<dashboard port>
 
 It stays the same across container recreates (the 127.0.0.1 port does not), and
 each task gets its own cookie jar, so two tasks running the same app no longer

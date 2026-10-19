@@ -19,12 +19,17 @@
  *     conversations-index.json  (derived listing metadata; rebuildable)
  */
 
+import { turnRunImage } from '../task/turn-run-image';
+import { deriveTaskRef } from '../task/identity';
+import { pinnedBaseOf } from '../task/base-pin';
+import { conversationForReading } from '../import/local-command-cleanup';
 import { mapLimit, STORE_SCAN_CONCURRENCY } from '../utils/map-limit';
 import { createHash, randomUUID } from 'crypto';
 import { mkdir, readdir, readFile, writeFile, rename, rm, stat, unlink } from 'fs/promises';
 import type { Dirent } from 'fs';
-import { join } from 'path';
-import type { Storage, CreateTurnOptions } from './interface';
+import { dirname, join } from 'path';
+import { durableFsOps } from './durable-write';
+import type { Storage, CreateTurnOptions, NewTaskInitialState, TaskTurnLatency } from './interface';
 import {
   mergeUsageLimitReading,
   readStoredUsageLimitReading,
@@ -136,6 +141,7 @@ import type {
   MemoryCompactFile,
   SystemMessage,
   SystemMessageInput,
+  SystemMessageDismissFilter,
   SystemMessagesFile,
   CommentSource,
   CommentCreateOptions,
@@ -163,7 +169,11 @@ import { isTerminalStatus, isBlockedStatus, raisedStatusForAction, LEGACY_CLUSTE
 import { emptyReviewDraft, MAX_LINE_DRAFTS, MAX_VIEWED_FILES } from '../review-draft';
 import { normalizeTagOrThrow } from '../utils/tags';
 import { targetFromLegacy, parentTaskIdOf } from '../task-target';
+import { openRepeatOf, parseSystemMessageDismissFilter, systemMessageMatchesFilter } from '../messages/filter';
 import { logger } from '../utils/logger';
+import { redactSecretValues } from '../utils/redact';
+import { TIERS_SERVED_KEY, readTiersServed } from '../task/tiers-served';
+import { TURN_LATENCY_NO_TASK, closesLatencyRollup, emptyRollup, isEmptyRollup, mergeRollup, summarizeTurn, turnWallMs, type TurnLatencyRecord, type TurnLatencyRollup } from '../task/turn-latency';
 import type { TaskTarget, WaitInterval, WaitOutcome } from '../types';
 import type { OverlayActor, RegionCover, RegionOverlay } from '../regions';
 import type { RunnerType } from '../config/types';
@@ -176,7 +186,7 @@ import { BoundedTextMatcher } from '../search/text-matcher';
 import { entityTimeFromIso } from '../search/ranking';
 import { actorEmail, actorFields, actorName, actorRole, personFieldsAs } from '../actor-ref';
 import type { ActorInput } from '../types';
-import { StorageLock } from '../utils/storage-lock';
+import { RESTORE_MARKER_FILENAME, StorageLock, StoreRestoreInProgressError } from '../utils/storage-lock';
 import { TaskMutex } from '../utils/task-mutex';
 
 const STORAGE_VERSION = 1;
@@ -187,11 +197,15 @@ const STORAGE_VERSION = 1;
  * cannot pick it up as a conversation. Bump `version` if the entry shape
  * changes — an unknown version is treated as missing and rebuilt.
  */
-const CONVERSATION_INDEX_VERSION = 2 as const;
+const CONVERSATION_INDEX_VERSION = 3 as const;
 const CONVERSATION_INDEX_FILENAME = 'conversations-index.json';
 
 /** Per-task durable tool statistics, one small file in the task's directory. */
 const TOOL_STATS_FILENAME = 'tool-stats.json';
+
+/** Per-task latency rollups: the running turn's, and every closed turn's (src/task/turn-latency.ts). */
+const TURN_LATENCY_OPEN_FILENAME = 'turn-latency-open.json';
+const TURN_LATENCY_FILENAME = 'turn-latency.json';
 
 interface ConversationTranscriptFile {
   sessionId: string;
@@ -201,6 +215,7 @@ interface ConversationTranscriptFile {
 }
 
 interface ConversationIndexEntry extends ConversationSummary {
+  builderSummary: ConversationSummary;
   mtimeMs: number;
   size: number;
   /**
@@ -242,6 +257,7 @@ function isConversationTranscriptFilename(name: string): boolean {
 
 function conversationSummaryOf(conv: StoredConversation): ConversationSummary {
   return {
+    memberEmail: conv.memberEmail ?? null,
     sessionId: conv.sessionId,
     startedAt: conv.startedAt,
     endedAt: conv.endedAt,
@@ -258,6 +274,7 @@ function toIndexEntry(
 ): ConversationIndexEntry {
   return {
     ...conversationSummaryOf(conv),
+    builderSummary: conversationSummaryOf(conversationForReading(conv)),
     mtimeMs: file.mtimeMs,
     size: file.size,
     lineage: conv.lineage ?? lineageFromMessages(conv.messages ?? []),
@@ -266,6 +283,7 @@ function toIndexEntry(
 
 function indexEntryToSummary(entry: ConversationIndexEntry): ConversationSummary {
   return {
+    memberEmail: entry.memberEmail ?? null,
     sessionId: entry.sessionId,
     startedAt: entry.startedAt,
     endedAt: entry.endedAt,
@@ -289,7 +307,7 @@ function conversationIndexMatches(
   const byId = new Map(index.entries.map((e) => [e.sessionId, e]));
   for (const file of files) {
     const entry = byId.get(file.sessionId);
-    if (!entry) return false;
+    if (!entry || !entry.builderSummary) return false;
     if (entry.mtimeMs !== file.mtimeMs || entry.size !== file.size) return false;
   }
   return true;
@@ -337,6 +355,10 @@ interface TaskStoreIndex {
   codeOf: Map<string, string | null>;
   /** code → the task ids carrying it (more than one after a code is reused) */
   idsByCode: Map<string, Set<string>>;
+  /** task id → its pinned ref (`metadata.task_ref`), null when it has none */
+  refOf: Map<string, string | null>;
+  /** pinned ref → the task ids carrying it */
+  idsByRef: Map<string, Set<string>>;
   /** session id → owning task id */
   sessionToTask: Map<string, string>;
   /** task id → its current session id */
@@ -738,10 +760,16 @@ export class FileStorage implements Storage {
    * This ensures readers never see partial/corrupt content, which allows
    * read operations to proceed without holding the storage lock.
    */
-  private async writeJson(path: string, data: unknown): Promise<void> {
+  private async writeJson(path: string, data: unknown, opts: { syncDir?: boolean } = {}): Promise<void> {
+    await this.guardUnlockedWrite();
+    // Durable too: the temp file is fsynced before the rename and its
+    // directory after it, so a write the daemon has acknowledged survives a
+    // machine crash (see durable-write.ts).
+    const fsOps = durableFsOps();
     const tmpPath = `${path}.${process.pid}.${Date.now()}.tmp`;
-    await writeFile(tmpPath, JSON.stringify(data, null, 2), 'utf-8');
-    await rename(tmpPath, path);
+    await fsOps.writeAndSync(tmpPath, JSON.stringify(data, null, 2));
+    await fsOps.rename(tmpPath, path);
+    if (opts.syncDir !== false) await fsOps.syncDir(dirname(path));
   }
 
   /**
@@ -761,7 +789,7 @@ export class FileStorage implements Storage {
    *      operation started, so an interleaved write was not merely raced on
    *      one field — the loser's entire write was reverted. An acknowledged
    *      `lazy edit --prompt` was silently rolled back this way (see
-   *      CLAUDE.md, "Never Lose Human Feedback").
+   *      AGENTS.md, "Never Lose Human Feedback").
    *   2. Between the two renames the task directory did not exist, so a
    *      concurrent lock-free reader saw the task VANISH — observed as
    *      "404 Task not found" from a `start` racing an `edit`.
@@ -770,6 +798,7 @@ export class FileStorage implements Storage {
    * than O(directory size).
    */
   private async atomicWriteTask(taskId: string, files: Record<string, unknown>): Promise<void> {
+    await this.guardUnlockedWrite();
     // Serialize concurrent async operations on the same task directory, so two
     // writers cannot interleave their stage→rename sequences.
     return this.taskMutex.withLock(taskId, async () => {
@@ -777,18 +806,29 @@ export class FileStorage implements Storage {
       const tmpDir = `${taskDir}.tmp.${Date.now()}`;
 
       try {
-        await mkdir(taskDir, { recursive: true });
+        const createdTaskDir = await mkdir(taskDir, { recursive: true });
         await mkdir(tmpDir, { recursive: true });
 
         // Stage every file first, so a failure to serialize one of them leaves
         // the task directory completely untouched.
         for (const [filename, data] of Object.entries(files)) {
-          await this.writeJson(join(tmpDir, filename), data);
+          // Staged bytes are synced; the staging directory itself need not be.
+          await this.writeJson(join(tmpDir, filename), data, { syncDir: false });
         }
 
-        for (const filename of Object.keys(files)) {
-          await rename(join(tmpDir, filename), join(taskDir, filename));
+        // task.json goes LAST. A task directory without task.json is not a
+        // task to any reader, so a create that dies mid-way leaves no task
+        // behind — never a row whose prompt history or changelog is missing.
+        const names = Object.keys(files);
+        const ordered = [...names.filter((n) => n !== 'task.json'), ...names.filter((n) => n === 'task.json')];
+        for (const filename of ordered) {
+          await durableFsOps().rename(join(tmpDir, filename), join(taskDir, filename));
         }
+        // Make the renames durable before the write resolves.
+        await durableFsOps().syncDir(taskDir);
+        // A NEW task directory is itself an entry in the tasks directory; sync
+        // that too, or a crash can lose the whole task just created.
+        if (createdTaskDir !== undefined) await durableFsOps().syncDir(dirname(taskDir));
       } finally {
         // Always clear the staging directory — on success it is empty, on
         // failure it holds partial writes that must not linger.
@@ -878,6 +918,8 @@ export class FileStorage implements Storage {
       childrenOf: new Map(),
       codeOf: new Map(),
       idsByCode: new Map(),
+      refOf: new Map(),
+      idsByRef: new Map(),
       sessionToTask: new Map(),
       taskToSession: new Map(),
     };
@@ -932,6 +974,7 @@ export class FileStorage implements Storage {
     if (!task) return;
     this.indexSetParent(index, dir, parentTaskIdOf(task));
     this.indexSetCode(index, dir, task.code ?? null);
+    this.indexSetRef(index, dir, task.metadata?.task_ref ?? null);
 
     const session = await this.readSession(join(this.tasksPath, dir, 'session.json'));
     if (session) this.indexSetSession(index, dir, session.id);
@@ -971,6 +1014,24 @@ export class FileStorage implements Storage {
     }
   }
 
+  private indexSetRef(index: TaskStoreIndex, taskId: string, ref: string | null): void {
+    const previous = index.refOf.get(taskId);
+    if (previous) {
+      const holders = index.idsByRef.get(previous);
+      holders?.delete(taskId);
+      if (holders?.size === 0) index.idsByRef.delete(previous);
+    }
+    index.refOf.set(taskId, ref);
+    if (ref) {
+      let holders = index.idsByRef.get(ref);
+      if (!holders) {
+        holders = new Set();
+        index.idsByRef.set(ref, holders);
+      }
+      holders.add(taskId);
+    }
+  }
+
   private indexSetSession(index: TaskStoreIndex, taskId: string, sessionId: string): void {
     // A task holds one session.json at a time, so a new session makes the old
     // session id unreachable — drop it rather than leave it pointing here.
@@ -1000,6 +1061,14 @@ export class FileStorage implements Storage {
       if (holders?.size === 0) index.idsByCode.delete(code);
     }
     index.codeOf.delete(taskId);
+
+    const ref = index.refOf.get(taskId);
+    if (ref) {
+      const holders = index.idsByRef.get(ref);
+      holders?.delete(taskId);
+      if (holders?.size === 0) index.idsByRef.delete(ref);
+    }
+    index.refOf.delete(taskId);
 
     const sessionId = index.taskToSession.get(taskId);
     if (sessionId) index.sessionToTask.delete(sessionId);
@@ -1196,11 +1265,12 @@ export class FileStorage implements Storage {
     status: string,
     timestamp: number,
     actor?: ActorInput,
+    reason?: string,
   ): Promise<StatusChangelogFile> {
     const changelogPath = join(this.taskDir(taskId), 'status-changelog.json');
     const file = await this.readJson<StatusChangelogFile>(changelogPath);
     const changes = file?.changes ?? [];
-    changes.push({ status, timestamp, ...actorFields(actor) });
+    changes.push({ status, timestamp, ...actorFields(actor), ...(reason ? { reason: redactSecretValues(reason) } : {}) });
     return { changes };
   }
 
@@ -1290,11 +1360,16 @@ export class FileStorage implements Storage {
 
   // --- Tasks ---
 
-  async createTask(goal: string, parentTaskId?: string, branchedFromSha?: string, code?: string, type?: string, agentId?: string, actor?: ActorInput): Promise<Task> {
+  async createTask(goal: string, parentTaskId?: string, branchedFromSha?: string, code?: string, type?: string, agentId?: string, actor?: ActorInput, initial?: NewTaskInitialState): Promise<Task> {
+    if (initial?.targetBranch && parentTaskId) {
+      throw new Error('A new task has either a parent task or a branch target, not both.');
+    }
+    const initialTags = [...new Set((initial?.tags ?? []).map(normalizeTagOrThrow))];
     return this.lock.withLock(async () => {
       // Reject duplicate codes against non-terminal tasks
+      let existing: Task[] = [];
       if (code) {
-        const existing = await this.listTasks();
+        existing = await this.listTasks();
         const conflict = existing.find(t => t.code === code && !isTerminalStatus(t.status));
         if (conflict) {
           throw new Error(`A task with code '${code}' already exists (${conflict.id.slice(0, 8)}, status: ${conflict.status}). Choose a different code or close/reject the existing task first.`);
@@ -1303,33 +1378,49 @@ export class FileStorage implements Storage {
 
       const id = randomUUID();
       const now = Date.now();
+      const parent = parentTaskId ? await this.getTask(parentTaskId) : null;
+      const parentModel = parent?.agent_id === (agentId ?? 'claude-code')
+        ? parent.model : null;
 
       const task: Task = {
         id,
         code: code ?? null,
         goal,
-        prompt: '',
+        prompt: initial?.prompt ?? '',
         type: (type as Task['type']) ?? 'task',
         status: 'backlog',
         created_at: now,
         completed_at: null,
-        target: targetFromLegacy(parentTaskId ?? null, null),
+        target: targetFromLegacy(parentTaskId ?? null, initial?.targetBranch ?? null),
         branched_from_sha: branchedFromSha ?? null,
         close_reason: null,
-        model: null,
+        model: (initial?.model as Task['model'] | undefined) ?? parentModel ?? null,
         agent_id: agentId ?? 'claude-code',
         runner_type: null,
-        metadata: null,
-        tags: [],
+        metadata: initial?.metadata && Object.keys(initial.metadata).length > 0 ? { ...initial.metadata } : null,
+        tags: initialTags,
         pending_sync: 0,
         in_flight_turn: null,
       };
+
+      // The task's branch name is fixed HERE, at creation, never at start: a
+      // child reparented onto (or created under) a task that has not started
+      // yet resolves its parent's branch from this ref, and a ref first
+      // assigned at start answered `<prefix>/<shortId>` until then — a branch
+      // the task would never have. A caller-supplied ref (linked tasks) wins.
+      if (!task.metadata?.task_ref) {
+        task.metadata = { ...(task.metadata ?? {}), task_ref: deriveTaskRef(task, existing) };
+      }
 
       await this.atomicWriteTask(id, {
         'task.json': task,
         'turns.json': { turns: [] },
         'commits.json': { commits: [] },
-        'prompt-history.json': { versions: [] },
+        'prompt-history.json': {
+          versions: initial?.prompt
+            ? [{ id: randomUUID(), task_id: id, version: 1, content: initial.prompt, created_at: now, session_id: null }]
+            : [],
+        },
         'snapshots.json': { snapshots: [] },
         'reviews.json': { reviews: [] },
         'comments.json': { comments: [] },
@@ -1338,12 +1429,15 @@ export class FileStorage implements Storage {
         'file-decisions.json': { file_decisions: [] },
         'artifacts.json': { artifacts: [] },
         'status-changelog.json': { changes: [{ status: 'backlog', timestamp: now, ...actorFields(actor) }] },
-        'tag-history.json': { events: [] },
+        'tag-history.json': {
+          events: initialTags.map((tag) => ({ tag, action: 'tag' as const, timestamp: now, ...actorFields(actor) })),
+        },
       });
 
       await this.applyIndexUpdate((index) => {
         this.indexSetParent(index, id, parentTaskIdOf(task));
         this.indexSetCode(index, id, task.code);
+        this.indexSetRef(index, id, task.metadata?.task_ref ?? null);
       });
 
       return task;
@@ -1513,7 +1607,7 @@ export class FileStorage implements Storage {
     });
   }
 
-  async updateTaskStatus(taskId: string, status: TaskStatus, actor?: ActorInput): Promise<void> {
+  async updateTaskStatus(taskId: string, status: TaskStatus, actor?: ActorInput, reason?: string): Promise<void> {
     return this.lock.withLock(async () => {
       const fullId = await this.findTaskIdByPrefix(taskId);
       if (!fullId) return;
@@ -1535,7 +1629,7 @@ export class FileStorage implements Storage {
         task.completed_at = now;
       }
 
-      const changelog = await this.readAndAppendStatusChange(fullId, status, now, actor);
+      const changelog = await this.readAndAppendStatusChange(fullId, status, now, actor, reason);
       await this.atomicWriteTask(fullId, { 'task.json': task, 'status-changelog.json': changelog });
     });
   }
@@ -1566,11 +1660,27 @@ export class FileStorage implements Storage {
 
       task.code = code;
 
+      // Before a task has ever started, its ref follows its code: nothing has
+      // been cut from it yet (no branch, worktree or container), so the ref
+      // fixed at create is re-derived for the new code — the name the task
+      // will actually start under. Once started (a session exists) or pinned
+      // to a base (whose branch is cut at clone time), the ref is frozen and a
+      // code edit is cosmetic (src/daemon/edit-task.ts).
+      const refFollowsCode = task.status === 'backlog'
+        && !pinnedBaseOf(task)
+        && !(await this.getSessionByTaskId(fullId));
+      if (refFollowsCode) {
+        task.metadata = { ...(task.metadata ?? {}), task_ref: deriveTaskRef(task, await this.listTasks()) };
+      }
+
       await this.atomicWriteTask(fullId, { 'task.json': task });
 
       // The only write path that changes a task's code (lazy edit --code, and
       // the clone/redo suffixing that goes through it).
-      await this.applyIndexUpdate((index) => this.indexSetCode(index, fullId, code));
+      await this.applyIndexUpdate((index) => {
+        this.indexSetCode(index, fullId, code);
+        if (refFollowsCode) this.indexSetRef(index, fullId, task.metadata?.task_ref ?? null);
+      });
     });
   }
 
@@ -1769,6 +1879,7 @@ export class FileStorage implements Storage {
       task.metadata[key] = value;
 
       await this.atomicWriteTask(fullId, { 'task.json': task });
+      if (key === 'task_ref') await this.applyIndexUpdate((index) => this.indexSetRef(index, fullId, value));
     });
   }
 
@@ -2267,11 +2378,14 @@ export class FileStorage implements Storage {
         autoTriggered,
         turnType,
         carriesFeedback,
+        feedbackWithheld,
+        feedbackItems,
         agent_had_no_effect,
         review,
         reviewDispatch,
         reviewAddressed,
         final,
+        failure,
       } = options;
 
       const taskId = await this.findTaskIdBySessionPrefix(sessionId);
@@ -2336,17 +2450,21 @@ export class FileStorage implements Storage {
         ...(modelId ? { model_id: modelId } : {}),
         ...(effort ? { effort } : {}),
         ...(mcpTools ? { mcp_tools: mcpTools } : {}),
-        ...(prompt ? { prompt } : {}),
+        // The recorded prompt and check output are as durable as the content:
+        // scrubbed of every known secret value too (normalizeRecordContent).
+        ...(prompt ? { prompt: redactSecretValues(prompt) } : {}),
         ...actorFields(actor),
         ...(checkExitCode !== undefined ? { check_exit_code: checkExitCode } : {}),
-        ...(checkOutput !== undefined ? { check_output: checkOutput } : {}),
+        ...(checkOutput !== undefined ? { check_output: redactSecretValues(checkOutput) } : {}),
         ...(preTurnExitCode !== undefined ? { pre_turn_exit_code: preTurnExitCode } : {}),
-        ...(preTurnOutput !== undefined ? { pre_turn_output: preTurnOutput } : {}),
+        ...(preTurnOutput !== undefined ? { pre_turn_output: redactSecretValues(preTurnOutput) } : {}),
         ...(autoTriggered ? { auto_triggered: true } : {}),
         // Only persist non-default turn types — missing field implies 'work'.
         ...(turnType && turnType !== 'work' ? { turn_type: turnType } : {}),
         // Feedback starts life unconsumed; absent means "carries no feedback".
         ...(carriesFeedback ? { feedback_delivery: 'pending' as const } : {}),
+        ...(feedbackWithheld ? { feedback_delivery: 'pending' as const, feedback_withheld: true } : {}),
+        ...(feedbackItems && feedbackItems.length > 0 ? { feedback_items: feedbackItems } : {}),
         // Agent-had-no-effect flag for error turns — absent means unknown.
         ...(agent_had_no_effect !== undefined ? { agent_had_no_effect } : {}),
         // Structured review findings — only set on review-turn agent answers.
@@ -2355,7 +2473,32 @@ export class FileStorage implements Storage {
         ...(reviewAddressed ? { review_addressed: true } : {}),
         // Pencils down — only set on the turn that declared the work finished.
         ...(final ? { final } : {}),
+        // Lazy's failure notice — scrubbed like the content it sits beside.
+        ...(failure ? { failure: { ...failure, reason: redactSecretValues(failure.reason), remedy: redactSecretValues(failure.remedy) } } : {}),
       };
+
+      // The image this turn ACTUALLY ran on — the recorded launch of the
+      // container that runs its type (src/task/turn-run-image.ts). Stamped on
+      // every AGENT turn of every type (work, ask, review, sync, nudge, fix);
+      // a human turn ran nowhere. Absent when nothing was recorded, which
+      // renders as unknown rather than a guess.
+      if (role === 'agent' && !options.noRunnerImage) {
+        const owner = await this.readTask(join(this.taskDir(taskId), 'task.json'));
+        const ran = owner ? turnRunImage(owner, turnType, reviewDispatch) : null;
+        if (ran) turn.runner_image = { image: ran.image, kind: ran.kind };
+      }
+      // Which tiers of a tiered profile served the turn this WORK row closes
+      // (src/task/tiers-served.ts): stamped, then cleared in the same write.
+      let tiersOwner: Task | null = null;
+      if (role === 'agent' && (!turnType || turnType === 'work')) {
+        const owner = await this.readTask(join(this.taskDir(taskId), 'task.json'));
+        const served = readTiersServed(owner?.metadata?.[TIERS_SERVED_KEY]);
+        if (owner && served.length) {
+          turn.tiers_served = served;
+          delete owner.metadata![TIERS_SERVED_KEY];
+          tiersOwner = owner;
+        }
+      }
 
       turns.push(turn);
 
@@ -2363,6 +2506,7 @@ export class FileStorage implements Storage {
       // agent working time into total_duration_ms
       const session = await this.readSession(join(this.taskDir(taskId), 'session.json'));
       const writes: Record<string, unknown> = { 'turns.json': { turns } };
+      let agentWallMs: number | null = null;
 
       if (session) {
         // For agent turns, compute elapsed time since the last interaction
@@ -2372,6 +2516,7 @@ export class FileStorage implements Storage {
           const anchor = session.last_interaction_at ?? session.started_at;
           if (anchor) {
             const elapsed = now - anchor;
+            agentWallMs = elapsed > 0 ? elapsed : null;
             if (elapsed > 0) {
               session.total_duration_ms += elapsed;
             }
@@ -2379,7 +2524,50 @@ export class FileStorage implements Storage {
         }
 
         session.last_interaction_at = now;
+        // The "last turn failed" projection (src/task/turn-failure.ts), kept
+        // in the same write as the turn so it can never disagree with it: a
+        // WORK-type turn sets it when it is lazy's failure notice and clears it
+        // otherwise; ask, review and sync turns beside the work leave it alone.
+        // A WITHHELD feedback turn (its launch was refused, nothing ran) leaves
+        // it too: the last turn that RAN is still the one that failed.
+        if ((!turnType || turnType === 'work') && !feedbackWithheld) {
+          if (turn.failure) {
+            session.last_turn_failure = { ...turn.failure, at: now, turn_sequence: sequence };
+          } else {
+            delete session.last_turn_failure;
+          }
+        }
         writes['session.json'] = session;
+      }
+      if (tiersOwner) writes['task.json'] = tiersOwner;
+
+      // The running turn's latency rollup (src/task/turn-latency.ts) closes on
+      // the agent row that ends a turn (work, ask, review) — same write as the
+      // tiers served above. Statistics never cost the turn row: any failure
+      // here is logged and the row is written without them.
+      if (role === 'agent' && closesLatencyRollup(turnType)) {
+        try {
+          const dir = this.taskDir(taskId);
+          const open = await this.readJson<TurnLatencyRollup>(join(dir, TURN_LATENCY_OPEN_FILENAME));
+          if (open && !isEmptyRollup(open)) {
+            const closed = await this.readClosedTurnLatency(join(dir, TURN_LATENCY_FILENAME));
+            // The turn started at the row that launched it — the newest human
+            // row that is not a mid-turn one (sync, nudge) — else the elapsed time.
+            const launch = [...turns].reverse().find(
+              (t) => t !== turn && t.role === 'human' && t.turn_type !== 'sync' && t.turn_type !== 'nudge',
+            );
+            const wallMs = turnWallMs(launch ? launch.timestamp : null, agentWallMs, now);
+            closed.turns.push({ ...open, turn_sequence: turn.sequence, ended_at: now, wall_ms: wallMs });
+            writes[TURN_LATENCY_FILENAME] = closed;
+            writes[TURN_LATENCY_OPEN_FILENAME] = emptyRollup();
+            turn.latency = summarizeTurn(open, wallMs);
+          }
+        } catch (err) {
+          logger.warn(
+            `[turn-latency] turn ${turn.sequence} of task ${taskId.slice(0, 8)} recorded without its latency: ` +
+              `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
       }
 
       await this.atomicWriteTask(taskId, writes);
@@ -2588,7 +2776,8 @@ export class FileStorage implements Storage {
 
       let changed = false;
       for (const turn of turnsFile.turns) {
-        if (turn.session_id === sessionId && turn.feedback_delivery === 'pending') {
+        // A withheld turn was never delivered, so no completed turn consumed it.
+        if (turn.session_id === sessionId && turn.feedback_delivery === 'pending' && turn.feedback_withheld !== true) {
           turn.feedback_delivery = 'consumed';
           changed = true;
         }
@@ -2598,6 +2787,24 @@ export class FileStorage implements Storage {
       if (changed) {
         await this.atomicWriteTask(taskId, { 'turns.json': turnsFile });
       }
+    });
+  }
+
+  async markFeedbackSubsumed(sessionId: string, turnIds: string[]): Promise<void> {
+    return this.lock.withLock(async () => {
+      const taskId = await this.findTaskIdBySessionPrefix(sessionId);
+      if (!taskId) return;
+      const turnsFile = await this.readJson<TurnsFile>(join(this.taskDir(taskId), 'turns.json'));
+      if (!turnsFile?.turns) return;
+      let changed = false;
+      for (const turn of turnsFile.turns) {
+        if (turn.session_id === sessionId && turnIds.includes(turn.id) && (turn.feedback_delivery === 'pending' || turn.feedback_withheld)) {
+          turn.feedback_delivery = 'consumed';
+          delete turn.feedback_withheld;
+          changed = true;
+        }
+      }
+      if (changed) await this.atomicWriteTask(taskId, { 'turns.json': turnsFile });
     });
   }
 
@@ -4914,7 +5121,7 @@ export class FileStorage implements Storage {
   async saveConversation(conversation: StoredConversation): Promise<void> {
     await mkdir(this.conversationsPath, { recursive: true });
     const path = join(this.conversationsPath, `${conversation.sessionId}.json`);
-    await writeFile(path, JSON.stringify(conversation, null, 2), 'utf-8');
+    await this.writeJson(path, conversation);
     // Transcript is durable before the index is touched. A failed index update
     // is recovered on the next listConversationSummaries rebuild.
     await this.upsertConversationIndexEntry(conversation, path);
@@ -4959,7 +5166,8 @@ export class FileStorage implements Storage {
       logger.warn(`Builders are listed without run state: could not read builder sessions: ${(err as Error).message}`);
       return [];
     });
-    return summarizeBuilders(entries, runs);
+    return summarizeBuilders(entries.map((entry) => ({ ...entry, ...entry.builderSummary })), runs)
+      .filter((builder) => builder.stats.messageCount > 0);
   }
 
   async getBuilder(idOrSegmentId: string): Promise<BuilderSummary | null> {
@@ -4991,6 +5199,7 @@ export class FileStorage implements Storage {
   }
 
   async deleteConversation(sessionId: string): Promise<boolean> {
+    await this.guardUnlockedWrite();
     try {
       await unlink(join(this.conversationsPath, `${sessionId}.json`));
     } catch (err) {
@@ -5123,6 +5332,7 @@ export class FileStorage implements Storage {
   // --- Agent Session Logs (raw Claude Code JSONL) ---
 
   async saveAgentSessionLog(taskId: string, sessionId: string, content: string): Promise<void> {
+    await this.guardUnlockedWrite();
     const fullId = await this.findTaskIdByPrefix(taskId);
     if (!fullId) {
       throw new Error(`Task not found: ${taskId}`);
@@ -5563,6 +5773,7 @@ export class FileStorage implements Storage {
   }
 
   async clearMemoryCompact(): Promise<boolean> {
+    await this.guardUnlockedWrite();
     const existing = await this.readJson<MemoryCompactFile>(this.memoryCompactPath);
     if (!existing) return false;
     await rm(this.memoryCompactPath, { force: true });
@@ -5595,15 +5806,36 @@ export class FileStorage implements Storage {
     return matches[0] ?? null;
   }
 
-  async createSystemMessage(input: SystemMessageInput): Promise<SystemMessage> {
+  async createSystemMessage(input: SystemMessageInput, options?: { collapseRepeats?: boolean; refreshBody?: boolean }): Promise<SystemMessage> {
+    // Scrubbed at the write boundary like turns and comments: a producer may
+    // quote an agent's raw error text, which can echo a task secret. Before the
+    // repeat lookup, which compares against stored (scrubbed) titles.
+    const scrubbed = { ...input, title: redactSecretValues(input.title), body: redactSecretValues(input.body) };
     return this.lock.withLock(async () => {
       const messages = await this.readSystemMessages();
+      const repeatOf = options?.collapseRepeats ? openRepeatOf(messages, scrubbed) : undefined;
+      if (repeatOf) {
+        // A repeat is a state change on the open message, like read_at: the
+        // count and time move, nothing the producer wrote is rewritten —
+        // except the body, when the producer asked for its latest one.
+        const updated: SystemMessage = {
+          ...repeatOf,
+          ...(options?.refreshBody ? { body: scrubbed.body } : {}),
+          repeat_count: (repeatOf.repeat_count ?? 1) + 1,
+          last_seen_at: Date.now(),
+        };
+        await this.writeJson(
+          this.systemMessagesPath,
+          { system_messages: messages.map(m => (m.id === updated.id ? updated : m)) } satisfies SystemMessagesFile,
+        );
+        return updated;
+      }
       const message: SystemMessage = {
         id: randomUUID(),
         created_at: Date.now(),
         source: input.source,
-        title: input.title,
-        body: input.body,
+        title: scrubbed.title,
+        body: scrubbed.body,
         kind: input.kind,
       };
       // INVARIANT: append-only. Never rewrite or prune prior messages.
@@ -5663,6 +5895,35 @@ export class FileStorage implements Storage {
         } satisfies SystemMessagesFile,
       );
       return updated;
+    });
+  }
+
+  async dismissSystemMessages(
+    filter: SystemMessageDismissFilter,
+    actor: Actor,
+    options?: { preview?: boolean },
+  ): Promise<SystemMessage[]> {
+    // Validated here too, not only at the RPC boundary: every path into the
+    // store (the in-daemon dashboard, a direct CLI store) must refuse a blank
+    // field, which as a substring would match — and dismiss — everything.
+    filter = parseSystemMessageDismissFilter(filter);
+    if (options?.preview) {
+      return (await this.listSystemMessages()).filter(m => systemMessageMatchesFilter(m, filter));
+    }
+    return this.lock.withLock(async () => {
+      const messages = await this.readSystemMessages();
+      const now = Date.now();
+      const dismissed: SystemMessage[] = [];
+      const next = messages.map(m => {
+        if (!systemMessageMatchesFilter(m, filter)) return m;
+        const updated: SystemMessage = { ...m, dismissed_at: now, dismissed_by: actor };
+        dismissed.push(updated);
+        return updated;
+      });
+      if (dismissed.length > 0) {
+        await this.writeJson(this.systemMessagesPath, { system_messages: next } satisfies SystemMessagesFile);
+      }
+      return dismissed.sort((a, b) => b.created_at - a.created_at);
     });
   }
 
@@ -5820,6 +6081,96 @@ export class FileStorage implements Storage {
     await this.atomicWriteTask(fullId, { [TOOL_STATS_FILENAME]: { ...record, task_id: fullId } });
   }
 
+
+  // --- Per-turn latency rollups ---
+
+
+  /**
+   * The closed per-turn latency records. A missing file is an empty history; a
+   * file that exists but does not parse into `{ turns: [] }` THROWS, so the
+   * caller never overwrites history it could not read.
+   */
+  private async readClosedTurnLatency(path: string): Promise<{ turns: TurnLatencyRecord[] }> {
+    let raw: string;
+    try {
+      raw = await readFile(path, 'utf-8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { turns: [] };
+      throw new Error(`cannot read ${path}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      throw new Error(`${path} is not valid JSON (${err instanceof Error ? err.message : String(err)}); left untouched`);
+    }
+    if (!parsed || typeof parsed !== 'object' || !Array.isArray((parsed as { turns?: unknown }).turns)) {
+      throw new Error(`${path} is not a { turns: [] } latency file; left untouched`);
+    }
+    return parsed as { turns: TurnLatencyRecord[] };
+  }
+  async getTurnLatency(taskId: string): Promise<TaskTurnLatency | null> {
+    const fullId = await this.findTaskIdByPrefix(taskId);
+    if (!fullId) return null;
+    const dir = this.taskDir(fullId);
+    const open = await this.readJson<TurnLatencyRollup>(join(dir, TURN_LATENCY_OPEN_FILENAME));
+    const closed = await this.readJson<{ turns: TurnLatencyRecord[] }>(join(dir, TURN_LATENCY_FILENAME));
+    if (!open && !closed) return null;
+    return { open: open && !isEmptyRollup(open) ? open : null, turns: closed?.turns ?? [] };
+  }
+
+  /**
+   * The task a launch grant's task REFERENCE names, or null. A grant carries
+   * `taskRef(task)`: the pinned `metadata.task_ref` (a code, or
+   * `code-yy-mm-dd` once the code was reused), else the short id.
+   *
+   * Pinned refs are looked up in the index — narrowing only, the task file
+   * still decides — so an unknown or ambiguous ref costs a map lookup, never a
+   * read of every task in the store (this runs on every flush, under the
+   * global lock). Otherwise the ordinary id-prefix / code lookup answers, but
+   * only for a task the reference actually NAMES: its id, its short id or its
+   * code. A hex-looking code must not land on another task by prefixing its id.
+   * A task that does not exist must never get a directory made for it.
+   */
+  private async resolveGrantTaskRef(ref: string): Promise<string | null> {
+    const index = await this.ensureIndex();
+    const pinned: string[] = [];
+    for (const id of index.idsByRef.get(ref) ?? []) {
+      const task = await this.readTask(join(this.taskDir(id), 'task.json'));
+      if (task?.metadata?.task_ref === ref) pinned.push(id);
+    }
+    if (pinned.length === 1) return pinned[0];
+    if (pinned.length > 1) return null;
+
+    // Indexes only from here — never the full-store code scan the ordinary
+    // lookup falls back to: this runs under the global lock on every flush.
+    // An id (or the short id), from the index's set of task directories.
+    const byId = [...index.parentOf.keys()].filter((id) => id === ref || (ref.length === 8 && id.startsWith(ref)));
+    // A code, from the code index, confirmed against the task file.
+    const byCode: string[] = [];
+    for (const id of index.idsByCode.get(ref) ?? []) {
+      const task = await this.readTask(join(this.taskDir(id), 'task.json'));
+      if (task?.code === ref) byCode.push(id);
+    }
+    const candidates = [...new Set([...byId, ...byCode])];
+    if (candidates.length !== 1) return null;
+    // The task file decides: a task that does not exist gets no directory here.
+    return (await this.readTask(join(this.taskDir(candidates[0]), 'task.json'))) ? candidates[0] : null;
+  }
+
+  async mergeOpenTurnLatency(taskId: string, delta: TurnLatencyRollup): Promise<void> {
+    // Under the same storage lock `createTurn` closes the open rollup with, so
+    // a delta lands either wholly before the close (counted in that turn) or
+    // wholly after (counted in the next) — never both, never neither.
+    return this.lock.withLock(async () => {
+      const fullId = await this.resolveGrantTaskRef(taskId);
+      if (!fullId) throw new Error(`${TURN_LATENCY_NO_TASK}: "${taskId}"`);
+      const path = join(this.taskDir(fullId), TURN_LATENCY_OPEN_FILENAME);
+      const open = (await this.readJson<TurnLatencyRollup>(path)) ?? emptyRollup();
+      mergeRollup(open, delta);
+      await this.atomicWriteTask(fullId, { [TURN_LATENCY_OPEN_FILENAME]: open });
+    });
+  }
   // --- Usage-limit readings ([usage_pause]) ---
 
   private get usageLimitReadingsPath(): string {
@@ -5941,6 +6292,14 @@ export class FileStorage implements Storage {
       if (index >= 0) next[index] = merged;
       else next.push(merged);
       await this.writeJson(this.usageLimitReadingsPath, { readings: next });
+    });
+  }
+
+  async deleteUsageLimitReading(credential: string): Promise<void> {
+    await this.lock.withLock(async () => {
+      const { raw, records } = await this.readUsageLimitRecords();
+      const next = raw.filter((_, index) => records[index]!.record.credential !== credential);
+      if (next.length !== raw.length) await this.writeJson(this.usageLimitReadingsPath, { readings: next });
     });
   }
 
@@ -6201,7 +6560,35 @@ export class FileStorage implements Storage {
 
   // --- Tracing ---
 
+  /**
+   * The append-only streams below write WITHOUT the storage lock (appends are
+   * atomic per line). The lock is where a running restore refuses every other
+   * opener (StorageLock's restoreMarker), so these check its marker
+   * themselves: no write may land in a store a restore is swapping.
+   */
+  /**
+   * Some writes run without the storage lock (read-time self-heals, the
+   * conversation and settings files, the append streams). A write this
+   * instance makes while it holds the lock needs no check — no restore can
+   * have started under it (a restore takes the same lock) — so only a write
+   * made WITHOUT it pays one stat for the restore marker.
+   */
+  private async guardUnlockedWrite(): Promise<void> {
+    if (!this.lock.held) await this.assertNoRestoreMarker();
+  }
+
+  private async assertNoRestoreMarker(): Promise<void> {
+    const marker = join(this.basePath, RESTORE_MARKER_FILENAME);
+    if (await stat(marker).then(() => true, (err: NodeJS.ErrnoException) => {
+      if (err.code === 'ENOENT') return false;
+      throw new Error(`cannot check for a store restore marker at ${marker}: ${err.message}`);
+    })) {
+      throw new StoreRestoreInProgressError(marker);
+    }
+  }
+
   async appendTraceSpans(spans: SpanRecord[]): Promise<void> {
+    await this.guardUnlockedWrite();
     await appendSpansJsonl(this.basePath, spans);
   }
 
@@ -6212,10 +6599,12 @@ export class FileStorage implements Storage {
   // --- Wait intervals ---
 
   async recordWaitStart(start: WaitIntervalStart): Promise<void> {
+    await this.guardUnlockedWrite();
     await appendWaitStartJsonl(this.basePath, start);
   }
 
   async recordWaitEnd(id: string, endedAt: string, outcome: WaitOutcome): Promise<void> {
+    await this.guardUnlockedWrite();
     await appendWaitEndJsonl(this.basePath, id, endedAt, outcome);
   }
 

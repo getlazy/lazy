@@ -4,12 +4,12 @@
  *
  * WHY A SOURCE SCAN, in the shape of `cli-flag-alias-coverage` and
  * `cli-subcommand-usage-coverage`: this is the project's most important
- * invariant (CLAUDE.md, "Never Lose Human Feedback") and the failure is
+ * invariant (AGENTS.md, "Never Lose Human Feedback") and the failure is
  * invisible until it costs somebody their words. The daemon refuses a write it
  * cannot attribute; a command that collects a sign-off reason, a task prompt or
  * a journal entry BEFORE finding that out throws the text away. Six commands
  * had the check when the identity gate landed and eleven did not, while
- * CLAUDE.md already claimed all of them did — so the rule is now enforced
+ * AGENTS.md already claimed all of them did — so the rule is now enforced
  * rather than described.
  *
  * A new command that prompts for content is failed by this test until it is

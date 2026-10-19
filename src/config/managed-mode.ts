@@ -36,3 +36,26 @@ export function isManagedMode(env: NodeJS.ProcessEnv = process.env): boolean {
 
   return false;
 }
+
+/**
+ * Which Lazy Teams machine backend runs this daemon. Set by the fleet
+ * supervisor beside {@link MANAGED_ENV}: `microvm` (the project has its own
+ * guest dockerd) or `local-docker` (builds run on the Teams host's SHARED
+ * dockerd). Anything else — including unset — is treated as the shared case.
+ */
+export const MANAGED_BACKEND_ENV = 'LAZY_MANAGED_BACKEND';
+
+/**
+ * May an accepted root `Dockerfile.lazy` be built automatically?
+ *
+ * Unmanaged: yes (the machine is the person's own). Managed: only on the
+ * microVM backend, where the build runs on the project's own guest dockerd. On
+ * the local-docker backend the build would run on the Teams host's shared root
+ * dockerd, and the fleet red-team ruled "never auto-build on accept" there
+ * (docs/spikes/fleet-image-builds-adversarial.md). Fail closed: a managed
+ * daemon that was not told its backend does not auto-build.
+ */
+export function autoBuildsRootDockerfile(env: NodeJS.ProcessEnv = process.env): boolean {
+  if (!isManagedMode(env)) return true;
+  return env[MANAGED_BACKEND_ENV] === 'microvm';
+}

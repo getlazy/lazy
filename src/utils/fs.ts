@@ -5,6 +5,7 @@
  */
 
 import { stat, mkdir, readFile, writeFile, readdir, unlink, copyFile, chmod, rm, rename } from 'fs/promises';
+import { randomBytes } from 'crypto';
 
 /**
  * Check if a path exists (file or directory).
@@ -74,6 +75,23 @@ export async function unlinkSafe(path: string): Promise<void> {
 export async function writeFileAtomic(path: string, data: string, tmpPath: string): Promise<void> {
   await writeFile(tmpPath, data, 'utf-8');
   await rename(tmpPath, path);
+}
+
+/**
+ * Replace `path` with `data` atomically, readable by the owner only (0600): a
+ * fresh temp file created 0600 next to it, then renamed over it. For the
+ * daemon's secret-holding state files, where a write torn by a crash leaves an
+ * unparseable file every launch depends on. The temp name is unique per call.
+ */
+export async function writePrivateFileAtomic(path: string, data: string): Promise<void> {
+  const tmp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+  try {
+    await writeFile(tmp, data, { encoding: 'utf-8', mode: 0o600, flag: 'wx' });
+    await rename(tmp, path);
+  } catch (err) {
+    await rm(tmp, { force: true });
+    throw new Error(`failed to write ${path}: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 // Re-export commonly used fs/promises functions for convenience

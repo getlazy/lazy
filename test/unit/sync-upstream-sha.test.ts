@@ -13,7 +13,7 @@
  *   2. With upstreamSha provided and HEAD already containing it → merged is
  *      false and pre/post SHA are equal (honest "no-op", not a fake success).
  *   3. checkUpstreamChanges surfaces git errors instead of swallowing them —
- *      an invalid target throws with a clear message (CLAUDE.md "errors are
+ *      an invalid target throws with a clear message (AGENTS.md "errors are
  *      actionable").
  */
 

@@ -10,15 +10,17 @@
  *
  * The command also prints a guide prompt the user can hand to their own agent
  * to develop the plugin further. That prompt is a .md in src/prompts/ per
- * CLAUDE.md; the code templates live in ./customize-proxy-plugin-template.
+ * AGENTS.md; the code templates live in ./customize-proxy-plugin-template.
  */
 
 import { mkdir, writeFile, access } from 'fs/promises';
 import { join, relative } from 'path';
 import { parseFlags, requireLazyRoot } from '../helpers';
 import { PLUGIN_DIR_RELATIVE } from '../../proxy';
+import { repositoryPluginsDisabled, REPOSITORY_PLUGINS_NOT_RUN } from '../../config/managed-repo-code';
 import { PLUGIN_TEMPLATE, TEST_TEMPLATE } from './customize-proxy-plugin-template';
 import guidePrompt from '../../prompts/customize-proxy-plugin-guide.md' with { type: 'text' };
+import notRunNoticeTemplate from '../../prompts/customize-proxy-plugin-not-run.md' with { type: 'text' };
 
 /**
  * Plugin names become both a filename and a log identifier, so they are held to
@@ -93,17 +95,19 @@ export async function commandCustomizeProxyPlugin(args: string[]): Promise<void>
   // nothing at all.
   const testCommand = `bun test ./${relTest}`;
 
+  // Keyed off repositoryPluginsDisabled() so restoring loading removes every warning.
+  const notRun = repositoryPluginsDisabled();
+  if (notRun) {
+    console.log(`WARNING: ${REPOSITORY_PLUGINS_NOT_RUN}. The files below are scaffolded anyway, so the work is not lost if loading comes back.`);
+    console.log('');
+  }
   console.log(`Scaffolded proxy request plugin "${name}":`);
   console.log(`  ${relPlugin}   the plugin (a working no-op — edit transformRequest)`);
   console.log(`  ${relTest}   its smoke test (${testCommand})`);
   console.log('');
-  console.log(`The plugin is ALREADY INSTALLED: lazy's proxy loads every module in`);
-  console.log(`${PLUGIN_DIR_RELATIVE}/ — presence is the enable switch, there is no config key.`);
-  console.log('Run `lazy daemon restart` and the startup log will name it.');
-  console.log('');
-  console.log(`${PLUGIN_DIR_RELATIVE}/ is not gitignored, so commit these files to share the`);
-  console.log('plugin with your team. Plugin code runs inside the lazy daemon process,');
-  console.log('on the host, unsandboxed — review it like any other code you run.');
+  if (notRun) {
+    console.log(`lazy does not currently run repository plugins, so this plugin will NOT be loaded — the daemon log and \`lazy doctor\` will say so. You can still develop and test it with ${testCommand}.`);
+  }
 
   if (parsed.flags.get('no-prompt') !== true) {
     console.log('');
@@ -111,12 +115,17 @@ export async function commandCustomizeProxyPlugin(args: string[]): Promise<void>
     console.log('');
     console.log(
       guidePrompt
+        .replace(/\{\{notRunNotice\}\}/g, notRun ? guideNotRunNotice() : '')
         .replace(/\{\{name\}\}/g, name)
         .replace(/\{\{pluginPath\}\}/g, relPlugin)
         .replace(/\{\{testCommand\}\}/g, testCommand)
         .replace(/\{\{testPath\}\}/g, relTest),
     );
   }
+}
+
+function guideNotRunNotice(): string {
+  return notRunNoticeTemplate.replace('{{notRun}}', () => REPOSITORY_PLUGINS_NOT_RUN);
 }
 
 export function customizeProxyPluginUsage(): void {
@@ -126,18 +135,15 @@ Scaffold a proxy request plugin into ${PLUGIN_DIR_RELATIVE}/.
 
 Lazy's proxy sits on every agent's model traffic. A request plugin receives the
 parsed JSON body of each outbound request and may return a replacement body.
-Plugins are loaded by convention from ${PLUGIN_DIR_RELATIVE}/ in sorted-filename
-order — presence is the enable switch, there is no lazy.toml key. A project with
-no plugin directory forwards every request byte-for-byte, as it always has.
-
+${repositoryPluginsDisabled() ? `NOTE: ${REPOSITORY_PLUGINS_NOT_RUN}. A scaffolded plugin is NOT
+loaded; the daemon log and lazy doctor say so.
+` : ''}
 Two files are written: the plugin (a working no-op you edit) and a smoke test
 encoding the contract. A guide prompt is printed afterwards for handing to an
 agent. ${PLUGIN_DIR_RELATIVE}/ is not gitignored — commit them to share the
 plugin with your team.
 
-Plugin code runs INSIDE the lazy daemon process, on the host, unsandboxed, and
-is loaded from the main checkout only — never from a task worktree.
-
+${repositoryPluginsDisabled() ? 'Were plugins loaded, their code would run INSIDE the lazy daemon process, on the\nhost, unsandboxed — which is why they are not.\n' : ''}
 Arguments:
   <name>          Plugin name: lowercase letters, digits and dashes
 

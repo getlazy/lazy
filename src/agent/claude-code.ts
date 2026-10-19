@@ -9,9 +9,9 @@ import { join } from 'path';
 import { existsSync, readdirSync } from 'fs';
 import { getHome } from '../utils/home';
 import type { AgentResponse } from '../types';
-import type { Agent } from './interface';
+import type { Agent, AgentExecArgs } from './interface';
 import { ClaudeCodeActivityStream } from './activity-stream';
-import { safeArgvPrompt } from './argv-safety';
+import { systemPromptArgv } from './argv-safety';
 import { classifyNoModelRefusal, requireLaunchModel } from './launch-model';
 import { ClaudeCodePackaging } from './claude-code-packaging';
 import {
@@ -130,9 +130,12 @@ export class ClaudeCodeAgent implements Agent {
     effort?: string;
     permissionMode?: 'plan' | 'default';
     extraArgs?: string[];
-  }): string[] {
-    // argv[2] is the prompt. A raw NUL here is fatal to the spawn, so escape
-    // rather than let the turn crash-loop. See ./argv-safety.
+  }): AgentExecArgs {
+    // The prompt goes on STDIN, never argv: `claude -p` with no positional
+    // prompt reads it from stdin (verified on 2.1.296 — with neither it exits
+    // "Input must be provided either through stdin or as a prompt argument").
+    // A prompt in argv died with E2BIG past 128 KiB. See the argv rule in
+    // ./argv-safety.
     //
     // `stream-json` (not plain `json`) so the supervisor gets an incremental
     // activity signal instead of total silence until exit — see activityStream()
@@ -143,7 +146,6 @@ export class ClaudeCodeAgent implements Agent {
     const args = [
       'claude',
       '-p',
-      safeArgvPrompt(opts.prompt, 'prompt'),
       '--output-format',
       'stream-json',
       '--verbose',
@@ -161,9 +163,10 @@ export class ClaudeCodeAgent implements Agent {
       args.push('--dangerously-skip-permissions');
     }
 
-    if (opts.systemPrompt) {
-      args.push('--append-system-prompt', safeArgvPrompt(opts.systemPrompt, 'system prompt'));
-    }
+    // A large system prompt rides a file: `--append-system-prompt-file` is
+    // accepted by 2.1.296 (hidden from --help; named in its --bare text).
+    const systemPrompt = systemPromptArgv(opts.systemPrompt, '--append-system-prompt', '--append-system-prompt-file');
+    args.push(...systemPrompt.args);
 
     if (opts.sessionId) {
       args.push('--resume', opts.sessionId);
@@ -182,7 +185,10 @@ export class ClaudeCodeAgent implements Agent {
       args.push(...opts.extraArgs);
     }
 
-    return args;
+    return Object.assign(args, {
+      stdinInput: opts.prompt,
+      ...(systemPrompt.systemPromptInput !== undefined ? { systemPromptInput: systemPrompt.systemPromptInput } : {}),
+    });
   }
 
   /**

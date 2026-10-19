@@ -29,6 +29,15 @@ describe('lazy doctor', () => {
     expectOutput(result, 'Git installed');
   });
 
+  test('announces a checklist and reports progress before the final checks', async () => {
+    const result = await ctx.lazy(['doctor']);
+    expectOutput(result, 'doctor — 8 phases');
+    expectOutput(result, '[1/8] Git and actor identity');
+    expectOutput(result, '[3/8] Runner and container runtime');
+    expectOutput(result, '[8/8] Disk, remote driver and configuration checks');
+    expect(result.stdout.indexOf('doctor — 8 phases')).toBeLessThan(result.stdout.indexOf('✓ Git installed'));
+  });
+
   test('reports repository has commits', async () => {
     const result = await ctx.lazy(['doctor']);
     expectOutput(result, 'Repository has commits');
@@ -177,7 +186,7 @@ describe('lazy doctor', () => {
 
     // The number that motivated this section came off Claude Code's /context
     // screen, so a reader will compare the two. Doctor measures what LAZY
-    // injects plus the CLAUDE.md files it warns about — not the harness's own
+    // injects plus the AGENTS.md files it warns about — not the harness's own
     // prompt and built-in tools — and must say so rather than let a reader
     // conclude one of the two numbers is broken.
     test('states what it does and does not count', async () => {
@@ -208,28 +217,28 @@ describe('lazy doctor', () => {
     // The limit follows the window. A default Anthropic launch is 1M tokens,
     // which raises the limit to 200,000 chars — so this test pins a 200k-window
     // model to keep exercising the 40,000 floor the harness still uses there.
-    test('warns about an oversized CLAUDE.md and names what to do', async () => {
+    test('warns about an oversized AGENTS.md and names what to do', async () => {
       const configPath = join(ctx.root, 'lazy.toml');
       const before = readFileSync(configPath, 'utf-8');
       const after = before.replace(`default = "${CLAUDE_DEFAULT_MODEL}"`, 'default = "claude-sonnet-4-6"');
       expect(after).not.toBe(before);
       writeFileSync(configPath, after);
 
-      writeFileSync(join(ctx.root, 'CLAUDE.md'), `# Project\n\n${'Guidance line.\n'.repeat(3000)}`);
+      writeFileSync(join(ctx.root, 'AGENTS.md'), `# Project\n\n${'Guidance line.\n'.repeat(3000)}`);
 
       const result = await ctx.lazy(['doctor']);
-      expectOutput(result, 'CLAUDE.md (project)');
+      expectOutput(result, 'AGENTS.md (project)');
       expectOutput(result, 'over the 40,000-char per-file limit Claude Code 2.1.266 warns at');
       expectOutput(result, 'It is still injected in full — nothing is truncated');
       expectOutput(result, 'read on demand');
       expectOutput(result, 'Context window: 200k tokens');
     });
 
-    test('says nothing about a limit when CLAUDE.md is comfortably under it', async () => {
-      writeFileSync(join(ctx.root, 'CLAUDE.md'), '# Project\n\nBe careful.\n');
+    test('says nothing about a limit when AGENTS.md is comfortably under it', async () => {
+      writeFileSync(join(ctx.root, 'AGENTS.md'), '# Project\n\nBe careful.\n');
 
       const result = await ctx.lazy(['doctor']);
-      expectOutput(result, 'CLAUDE.md (project)');
+      expectOutput(result, 'AGENTS.md (project)');
       expectOutputExcludes(result, 'per-file limit');
     });
   });

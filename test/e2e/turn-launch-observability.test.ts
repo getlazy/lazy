@@ -78,7 +78,7 @@ describe('turn-launch observability', () => {
     expectInOrder(output, [
       'Pre-flight validation',
       // Step 1 of the two-step reconcile: origin/<task-branch> before the
-      // parent (see CLAUDE.md). Skipped here — the driver is `local` — but the
+      // parent (see AGENTS.md). Skipped here — the driver is `local` — but the
       // phase is still announced, which is the point of the narration.
       'Check task branch on origin',
       'Fetch and resolve upstream',

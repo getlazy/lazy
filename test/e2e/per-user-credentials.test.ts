@@ -61,6 +61,7 @@ describe('per-user credentials end to end', () => {
   let proxyUrl: string;
   let records: ProxyAuditRecord[];
   let forwarded: Forwarded = null;
+  const realFetch = globalThis.fetch;
   const savedEnv = {
     oauth: process.env.CLAUDE_CODE_OAUTH_TOKEN,
     apiKey: process.env.ANTHROPIC_API_KEY,
@@ -90,6 +91,13 @@ describe('per-user credentials end to end', () => {
         return Response.json({ type: 'message', model: 'test' });
       },
     });
+    // The external provider is fake; its consented origin and auth rules stay real.
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      const target = new URL(input instanceof Request ? input.url : String(input));
+      return target.origin === 'https://api.anthropic.com'
+        ? realFetch(`http://127.0.0.1:${upstream.port}${target.pathname}${target.search}`, init)
+        : realFetch(input, init);
+    }) as typeof fetch;
 
     records = [];
     const sink: AuditSink = { append: async (r) => { records.push(r); } };
@@ -97,7 +105,7 @@ describe('per-user credentials end to end', () => {
       {
         port: 0,
         bind: '127.0.0.1',
-        upstream: `http://127.0.0.1:${upstream.port}`,
+        upstream: 'https://api.anthropic.com',
         resolveSessionCredential: createSessionCredentialResolver(root),
       },
       sink,
@@ -110,6 +118,7 @@ describe('per-user credentials end to end', () => {
   });
 
   afterEach(async () => {
+    globalThis.fetch = realFetch;
     upstream.stop();
     proxy.stop();
     unpin();

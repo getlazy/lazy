@@ -39,6 +39,10 @@ import { getDaemonTcpTarget, readToken } from '../../src/daemon/lifecycle';
 import { SERVICE_CREDENTIAL_USER_ID } from '../../src/daemon/user-credentials';
 import { IMAGE_TAG, calculateImageInputManifest, calculateImageInputsHash } from '../../src/capture/claude';
 import type { AttachSessionInfo } from '../../src/daemon/session-attach';
+import { relayTeamsRpc } from '../helpers/teams-rpc-proxy-stub';
+import { pinDaemonBaseDir } from '../helpers/daemon-base-dir';
+import { writeTeamsLogin } from '../../src/teams/login';
+import { runGit } from '../../src/utils/git';
 import { seedAgentBinaryStamp, startFakeEngine, type FakeEngine } from '../helpers/fake-docker-engine';
 
 const ALICE_EMAIL = 'alice@example.com';
@@ -179,28 +183,25 @@ describe('a member terminal on a shared daemon', () => {
     expect(run).not.toContain(taskContainer);
     // Her git reads daemon-written copies of the pointer files, never the
     // worktree's own .git, which a process beside the worktree could rewrite.
-    expect(run).toMatch(new RegExp(`member-homes/\\S*/git-pointers/dotgit:\\S*/\\.git:ro`));
+    expect(run).toMatch(new RegExp(`member-homes/\\S*/git-pointers/dotgit-[a-f0-9]{64}:\\S*/\\.git:ro`));
     const pointerMounts = [...run.matchAll(/-v (\S+):(\S+\/(?:worktrees\/[^/\s]+\/\.git|commondir|gitdir)):ro/g)];
     expect(pointerMounts.map((m) => m[2]!.split('/').pop())).toEqual(['.git', 'commondir', 'gitdir']);
     for (const m of pointerMounts) expect(m[1]).toContain('/git-pointers/');
 
-    // INVARIANT: no process of a turn runs beside a member. Her entry stopped
-    // the task's own container — before hers was started — so nothing a turn
-    // left running (a watcher able to rewrite .git, say) is alive while she
-    // works; and it cannot be brought back up while she is inside.
+    // INVARIANT: a member's entry leaves the task's own container RUNNING
+    // (engineer's decision on raised item f1219a6f, 2026-10-05, replacing "the
+    // entry stops it"). It holds the task's SHARED services, which keep running
+    // while members work; everything in it is suspect and contained, and her
+    // git reads the checked, read-only pointer copies asserted above. Bringing
+    // it up without a turn is not refused on her account either.
     const invocations = await docker.invocations();
-    const stopAt = invocations.findIndex((l) => l === `kill ${taskContainer}`);
-    expect(stopAt).toBeGreaterThanOrEqual(0);
-    expect(stopAt).toBeLessThan(invocations.findIndex((l) => l.startsWith('run -d') && l.includes('lazymember-')));
+    expect(invocations.filter((l) => l.includes(taskContainer) && /^(kill|stop|rm)\b/.test(l))).toEqual([]);
     const running = await Bun.spawn([docker.binPath, 'ps', '--filter', `name=^/${taskContainer}$`, '--format', '{{.ID}}'], { stdout: 'pipe' });
-    expect((await new Response(running.stdout).text()).trim()).toBe('');
-    let broughtUp: unknown = null;
-    try {
-      await rpc(alice, 'ensureTaskContainer', { taskId: fullTaskId });
-    } catch (err) { broughtUp = err; }
-    expect(broughtUp).toBeInstanceOf(RpcApplicationError);
-    expect((broughtUp as RpcApplicationError).status).toBe(409);
-    expect((broughtUp as Error).message).toContain(ALICE_EMAIL);
+    expect((await new Response(running.stdout).text()).trim()).not.toBe('');
+    // Control-plane plumbing, so asked on the control token as Teams does.
+    const broughtUp = await rpc(sharedToken, 'ensureTaskContainer', { taskId: fullTaskId }) as { alreadyRunning: boolean; containerName: string };
+    expect(broughtUp.alreadyRunning).toBe(true);
+    expect(broughtUp.containerName).toBe(taskContainer);
 
     // The exec went into Alice's container, carrying no credential of its own.
     expect(engine.execCreates).toEqual([memberName]);
@@ -264,5 +265,71 @@ describe('a member terminal on a shared daemon', () => {
       await rpc(alice, 'unblockTask', { taskId: fullTaskId, message: 'carry on' });
     } catch (err) { after = err; }
     if (after) expect((after as Error).message).not.toContain(ALICE_EMAIL);
+  }, 180_000);
+
+  // INVARIANT: a member's Chat — the browser's Chat tab and `lazy chat` from a
+  // clone bound to Teams, which attaches here in `chat` mode — runs in her own
+  // container on HER credential, which the container holds only as a lazy
+  // placeholder. No other credential is spent and the secret never leaves the
+  // daemon.
+  test("a member's chat runs in her own container on her own credential", async () => {
+    const alice = (await rpc(sharedToken, 'mintActorToken', { kind: 'user', email: ALICE_EMAIL }) as { token: string }).token;
+    const info = await rpc(alice, 'attachSession', { id: sessionId }) as AttachSessionInfo;
+    expect(info.refusals?.chat).toBeUndefined();
+
+    const headers = { Authorization: `Bearer ${alice}`, 'X-Lazy-Project': ctx.root };
+    const term = openTerminal(`${target.replace(/^http/, 'ws')}${info.attachPath}?mode=chat`, headers);
+    await term.opened;
+
+    const runs = (await docker.invocations()).filter((l) => l.startsWith('run -d') && l.includes('lazymember-'));
+    expect(runs).toHaveLength(1);
+    const memberName = /--name (lazymember-\S+)/.exec(runs[0]!)![1]!;
+    expect(runs[0]).toMatch(/-e CLAUDE_CODE_OAUTH_TOKEN=lazy-sess-\S+/);
+    expect(runs[0]).not.toContain('sk-ant-oat01-alice-member');
+    expect(runs[0]).not.toContain('sk-ant-oat01-service-member');
+    expect(engine.execCreates).toEqual([memberName]);
+    expect(engine.execEnvs[0]!.filter((e) => /TOKEN|KEY/.test(e))).toEqual([]);
+    await term.closed();
+  }, 180_000);
+
+  // INVARIANT: `lazy chat` (and pair/shell) from a clone bound to Teams reads the
+  // daemon's per-mode refusal BEFORE opening a socket, so a member with no Claude
+  // account connected is told to connect one — the browser's sentence — instead
+  // of an unexplained failed attach. Nothing is created for them, and no other
+  // credential is spent in their place.
+  test('lazy chat from a bound clone, by a member with no credential, is refused by name', async () => {
+    const BOB = 'bob@example.com';
+    const bob = (await rpc(sharedToken, 'mintActorToken', { kind: 'user', email: BOB }) as { token: string }).token;
+    const laptop = join(workDir, 'laptop');
+    const clone = join(laptop, 'clone');
+    await runGit(['init', '-b', 'main', clone], { cwd: workDir });
+    const unpin = pinDaemonBaseDir(join(laptop, 'daemon'));
+    const teams = Bun.serve({
+      port: 0,
+      hostname: '127.0.0.1',
+      fetch: async (req) => (await relayTeamsRpc(req, {
+        project: 'acme/lazy-toy', cliToken: 'lz_cli_bob', projectRoot: ctx.root,
+        daemonTarget: () => target, memberToken: () => bob,
+      })) ?? Response.json({ error: 'not found' }, { status: 404 }),
+    });
+    try {
+      await writeTeamsLogin(clone, {
+        teamsUrl: `http://127.0.0.1:${teams.port}`, token: 'lz_cli_bob', project: 'acme/lazy-toy', projectId: '42',
+      });
+      const inherited = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('LAZY_')));
+      const proc = Bun.spawn(['bun', 'run', join(import.meta.dir, '..', '..', 'src', 'index.ts'), 'chat', fullTaskId], {
+        cwd: clone, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
+        env: { ...inherited, HOME: join(laptop, 'home'), LAZY_DAEMON_BASE_DIR: join(laptop, 'daemon'), NO_COLOR: '1' },
+      });
+      const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+      expect(code).toBe(1);
+      expect(stderr).toContain(`none is stored for ${BOB}`);
+      expect(stderr).toContain('Connect your Claude account');
+      expect((await docker.invocations()).filter((l) => l.startsWith('run -d') && l.includes('lazymember-'))).toEqual([]);
+      expect(engine.execCreates).toEqual([]);
+    } finally {
+      teams.stop(true);
+      unpin();
+    }
   }, 180_000);
 });

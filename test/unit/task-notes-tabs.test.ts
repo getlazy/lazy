@@ -115,7 +115,7 @@ describe('Comments tab', () => {
     expect(html).toContain('<li>one</li>');
   });
 
-  // INVARIANT (CLAUDE.md, "A lazy comment never starts a turn"): the composer
+  // INVARIANT (AGENTS.md, "A lazy comment never starts a turn"): the composer
   // posts to a route that only persists. It must not target a lifecycle verb.
   test('the composer posts to the inert add route and says so', () => {
     const html = renderComments({ comments: [] });
@@ -162,7 +162,7 @@ describe('Comments tab', () => {
 });
 
 describe('a comment that could not be saved', () => {
-  // INVARIANT (CLAUDE.md, "Never Lose Human Feedback"): a failed write must not
+  // INVARIANT (AGENTS.md, "Never Lose Human Feedback"): a failed write must not
   // swallow what someone typed. The browser has already discarded the textarea
   // by the time this page renders, so the text is echoed back verbatim.
   test('carries the submitted text back verbatim and names what failed', () => {

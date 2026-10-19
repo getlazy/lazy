@@ -154,7 +154,7 @@ export async function commandImportConversation(args: string[]): Promise<void> {
  * the store through the given Storage. The caller owns the Storage lifecycle.
  *
  * Never writes silently: without `--yes`, a TTY is prompted and a non-TTY is
- * told to re-run with `--yes` — matching CLAUDE.md's least-surprise rule.
+ * told to re-run with `--yes` — matching AGENTS.md's least-surprise rule.
  */
 export async function runReimportBulk(opts: {
   lazyRoot: string;

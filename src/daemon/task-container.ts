@@ -12,8 +12,12 @@
  * the agent inside no `lazy_*` tools on its next turn — or forge it.
  */
 
+import { deliverTaskFilesForLaunch } from './task-files';
+import { RunnerImageNotReadyError } from '../capture/custom-image-gate';
+import { describeRunnerImage } from './runner-image';
 import { setupSandbox } from '../utils/sandbox';
 import { createRunner } from '../runner';
+import { probeContainerGitPointers } from '../git/container-pointers';
 import { removeTaskRun } from '../runner/session-launch';
 import { getOrCreateStorage, RpcError } from './rpc-handlers';
 import { hasDaemonContext } from './context';
@@ -22,11 +26,12 @@ import { setRunnerAgentForTask } from './task-harness';
 import { loadConfig } from '../config/loader';
 import { protocolDir as getProtocolDir, ensureProtocolDir } from '../protocol';
 import { displayId, taskRef, getWorktreePathForRef } from '../task/identity';
+import { ensureTaskWorktree } from './task-worktree';
 import { pathExists } from '../utils/fs';
-import { pinnedCustomImage } from '../docker/worktree-image';
+import { launchImagePin } from '../docker/worktree-image';
 import type { PhaseNotify } from './progress';
 import { logger } from '../utils/logger';
-import { beginTaskContainerBringUp } from './member-entry';
+import { mustRecreateForTaskEnv } from './task-env';
 import type { Storage } from '../storage';
 import type { Task } from '../types';
 
@@ -45,6 +50,29 @@ export interface EnsureTaskContainerParams {
    * live task. Refused while the agent is mid-turn — that would kill its work.
    */
   restart?: boolean;
+  /**
+   * Narration sink for RESTORING TASK FILES only — handed to the worktree
+   * restore as its notify, so a caller can show the restore as a phase of its
+   * own and the restore can feed it its own progress lines. Called only when
+   * the files are actually being restored; its first call is the restore
+   * starting. Falls back to `notify` when unset.
+   */
+  restoreProgress?: PhaseNotify;
+  /** Called once, just before a container is launched — never when the running one is kept. */
+  onLaunching?: () => void;
+  /**
+   * Keep only a container that is already running as it is: never launch,
+   * recreate or restore anything, and refuse (409) when that is what it would
+   * take. For work done on behalf of a turn that already ended, where a new
+   * container would be one nobody asked for.
+   */
+  neverLaunch?: boolean;
+}
+
+export interface EnsureTaskContainerDeps {
+  getStorage?: typeof getOrCreateStorage;
+  createRunner?: typeof createRunner;
+  setupSandbox?: typeof setupSandbox;
 }
 
 export interface EnsureTaskContainerResult {
@@ -71,8 +99,9 @@ export interface EnsureTaskContainerResult {
 export async function ensureTaskContainer(
   projectRoot: string,
   params: EnsureTaskContainerParams,
+  deps: EnsureTaskContainerDeps = {},
 ): Promise<EnsureTaskContainerResult> {
-  const storage = await getOrCreateStorage();
+  const storage = await (deps.getStorage ?? getOrCreateStorage)();
 
   const resolved = await storage.resolveTask(params.taskId);
   if (!resolved.task) {
@@ -83,18 +112,12 @@ export async function ensureTaskContainer(
   }
   const task = resolved.task;
 
-  // A member's entry stops this container so nothing of a turn runs beside
-  // them (./member-entry.ts); bringing it back up while they are inside would
-  // undo exactly that. The member check and a claim that makes their entry
-  // refuse run under the lock the entry takes; the bring-up itself — which
-  // can spend minutes building an image — runs outside it, so turn launches,
-  // accepts and syncs on this task are not queued behind a docker build.
-  const release = await beginTaskContainerBringUp(task.id);
-  try {
-    return await ensureTaskContainerClaimed(projectRoot, params, storage, task);
-  } finally {
-    release();
-  }
+  // Allowed while a member is inside (engineer, 2026-10-05): the container
+  // holds the task's SHARED services, and a member's entry no longer stops it
+  // (./member-entry.ts). No lifecycle lock is held across the bring-up, which
+  // can spend minutes building an image, so turn launches, accepts and syncs
+  // on this task are not queued behind a docker build.
+  return ensureTaskContainerClaimed(projectRoot, params, storage, task, deps);
 }
 
 async function ensureTaskContainerClaimed(
@@ -102,9 +125,10 @@ async function ensureTaskContainerClaimed(
   params: EnsureTaskContainerParams,
   storage: Storage,
   task: Task,
+  deps: EnsureTaskContainerDeps,
 ): Promise<EnsureTaskContainerResult> {
   const sess = await storage.getSessionByTaskId(task.id);
-  const runner = await createRunner(projectRoot, sess?.runner_type ?? task.runner_type ?? undefined);
+  const runner = await (deps.createRunner ?? createRunner)(projectRoot, sess?.runner_type ?? task.runner_type ?? undefined);
 
   const tRef = taskRef(task);
   const containerName = sess?.container_name ?? runner.runNameForTask(tRef);
@@ -118,17 +142,43 @@ async function ensureTaskContainerClaimed(
     );
   }
 
-  if (!(await pathExists(worktreePath))) {
-    throw new RpcError(
-      404,
-      `Task ${displayId(task)} has no worktree at ${worktreePath}. ` +
-      `Run \`lazy start ${tRef}\` to create it.`,
-    );
+  const worktreeMissing = !await pathExists(worktreePath);
+  let containerRunning = await runner.isRunning(containerName);
+  if (params.neverLaunch && (!containerRunning || worktreeMissing)) {
+    throw new RpcError(409, `Task ${displayId(task)}'s container is not running any more, and bringing one up was not asked for. Run services starts it.`);
   }
 
-  if (await runner.isRunning(containerName)) {
-    if (!params.restart) {
+  if (worktreeMissing && containerRunning) {
+    if (task.status === 'working') {
+      throw new RpcError(409, `Task ${displayId(task)} is working — recreating its container would kill the turn. Wait for the turn to finish.`);
+    }
+    params.notify?.('Recreating container: its task checkout is missing.');
+    if (!await runner.stopRun(containerName) || await runner.isRunning(containerName)) {
+      throw new RpcError(503, `Cannot stop the outdated environment for ${displayId(task)}. Task files left untouched.`);
+    }
+    containerRunning = false;
+  }
+
+  await ensureTaskWorktree(projectRoot, task, sess?.git_branch, params.restoreProgress ?? params.notify);
+
+  if (containerRunning) {
+    const pointers = await probeContainerGitPointers(projectRoot, worktreePath, runner, containerName);
+    if (pointers.kind === 'unavailable') {
+      throw new RpcError(503, `Cannot check mounted git pointers for ${displayId(task)}: ${pointers.reason} Container left untouched.`);
+    }
+    // Env is fixed when a container is created, so a running container whose
+    // task env changed since (Lazy Teams pushes a task's selection, `lazy env
+    // set`) must be replaced for Run services / Start container to see it. A
+    // working task keeps its container: replacing it would kill the turn, and
+    // its own next launch recreates it.
+    const envStale = await mustRecreateForTaskEnv(projectRoot, task.id, containerName);
+    const recreateForEnv = envStale && task.status !== 'working';
+    if (!params.restart && pointers.kind === 'healthy' && !recreateForEnv) {
       return { containerName, worktreePath, runnerType: runner.type, alreadyRunning: true };
+    }
+    if (recreateForEnv && pointers.kind === 'healthy') params.notify?.("Recreating container: the task's environment variables changed since it was created.");
+    if (params.neverLaunch) {
+      throw new RpcError(409, `Task ${displayId(task)}'s container has to be replaced before it can run services, and replacing it was not asked for. Run services replaces it.`);
     }
     // Recreating a container kills whatever runs in it, including a supervisor
     // in the middle of a turn. Refuse rather than destroy an agent's work.
@@ -139,10 +189,15 @@ async function ensureTaskContainerClaimed(
         `Run \`lazy stop ${tRef}\` first, or wait for the turn to finish.`,
       );
     }
+    if (pointers.kind === 'broken') params.notify?.('Recreating container: mounted git pointers or checkout do not match the validated host environment.');
     await runner.stopRun(containerName);
   }
 
-  const sandbox = await setupSandbox(worktreePath, { storage, taskId: task.id });
+  params.onLaunching?.();
+  const sandbox = await (deps.setupSandbox ?? setupSandbox)(worktreePath, { storage, taskId: task.id });
+  // Per-task secret files (src/daemon/task-files.ts): services started here
+  // must see the task's current set, as every turn launch does.
+  await deliverTaskFilesForLaunch(projectRoot, task.id, worktreePath, params.notify);
   const protoDir = getProtocolDir(task.id);
   ensureProtocolDir(protoDir);
 
@@ -179,10 +234,16 @@ async function ensureTaskContainerClaimed(
       // A task the human pinned an image on must come up on THAT image here too:
       // every other launch path passes it, and falling back to the root image
       // would quietly give the container a different environment than its turns.
-      pinnedCustomImage(task),
+      launchImagePin(task),
       params.notify,
     );
   } catch (err) {
+    // The project's runner image is still building (or failed): this opens once
+    // it is ready. Not a crash, and not something a click here can change.
+    if (err instanceof RunnerImageNotReadyError) {
+      throw new RpcError(409,
+        `${displayId(task)}'s environment opens once the project's runner image is ready. ${describeRunnerImage()}`);
+    }
     throw new RpcError(
       500,
       `Failed to launch container for ${displayId(task)}: ${err instanceof Error ? err.message : err}`,

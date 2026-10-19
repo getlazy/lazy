@@ -542,7 +542,7 @@ export interface ReviewActions {
      * keepFeedbackDraft: the text came from an ask box, not the feedback box.
      * pastUsagePause: the person ticked "Let this turn through the usage pause".
      */
-    options?: { keepFeedbackDraft?: boolean; pastUsagePause?: boolean },
+    options?: { keepFeedbackDraft?: boolean; pastUsagePause?: boolean; useDefaultImage?: boolean },
   ): Promise<UnblockResult>;
   /**
    * Accept the task's work and merge it into the parent.
@@ -577,7 +577,7 @@ export interface ReviewActions {
    * refusals that say "sync first", performed in-page instead of sending the
    * reviewer to a terminal.
    */
-  sync(taskId: string, onProgress?: ProgressEmitter): Promise<SyncResult>;
+  sync(taskId: string, onProgress?: ProgressEmitter, options?: { useDefaultImage?: boolean }): Promise<SyncResult>;
   /**
    * Record the reviewer's ⛔/✅ decision on one protected file the agent changed
    * without permission, and return the task's violations as they now stand.
@@ -656,7 +656,7 @@ export interface ReviewActions {
   promoteRaisedItem(
     taskId: string,
     itemId: string,
-    options: { goal?: string; code?: string; relation?: 'peer' | 'subtask'; actor?: ActorInput },
+    options: { goal?: string; prompt?: string; code?: string; parent?: string; relation?: 'peer' | 'subtask'; actor?: ActorInput },
   ): Promise<PromoteRaisedItemResult>;
   /**
    * Promote a review DISCUSSION — a question and the answer it got — into a

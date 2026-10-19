@@ -3,7 +3,7 @@
  *
  * THE INVARIANT THIS SERVES is the most important one in lazy: the human must
  * never type feedback into `$EDITOR` only to have a pre-flight failure discard
- * it (CLAUDE.md, "Never Lose Human Feedback"). The daemon refuses a
+ * it (AGENTS.md, "Never Lose Human Feedback"). The daemon refuses a
  * store-writing RPC when it cannot name the acting person, so every command
  * that collects text from a human asks this question first, in the same
  * lightweight preflight block that already checks task status.

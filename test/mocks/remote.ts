@@ -260,6 +260,18 @@ function buildMockDriver(mockResult: ImportResult | null): RepositoryDriver {
       if (open.branch && open.branch !== branch) return null;
       return { url: open.url, baseBranch: open.baseBranch, metadata: open.metadata };
     },
+    // Any-state lookup: `mock-branch-review.json` ({ branch?, state, url,
+    // baseBranch, metadata }), else the open review above.
+    findReviewForBranch: async (branch: string) => {
+      const any = readJsonFile('mock-branch-review.json') as (OpenReview & { branch?: string; state: 'OPEN' | 'MERGED' | 'CLOSED' }) | null;
+      if (any) {
+        if (any.branch && any.branch !== branch) return null;
+        return { state: any.state, url: any.url, baseBranch: any.baseBranch, metadata: any.metadata };
+      }
+      const open = readJsonFile('mock-open-review.json') as (OpenReview & { branch?: string }) | null;
+      if (!open || (open.branch && open.branch !== branch)) return null;
+      return { state: 'OPEN' as const, url: open.url, baseBranch: open.baseBranch, metadata: open.metadata };
+    },
     // Retargeting succeeds unless `mock-retarget-fails.json` exists; every
     // attempt is logged to `mock-retargets.jsonl`.
     retargetReview: async (task: Task, base: string) => {

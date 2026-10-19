@@ -104,12 +104,15 @@ describe('decideRetry — transient_unreachable is bounded', () => {
 });
 
 describe('decideRetry — unknown', () => {
-  test('retries indefinitely on a slower ladder', () => {
+  test('retries on a slower ladder, then stops persistent unclassified failures', () => {
     const first = decideRetry(f('unknown'), 1);
     expect(first).toEqual({ action: 'retry', delayMs: 15_000, reason: 'unknown: unknown reason' });
-    const later = decideRetry(f('unknown'), 9);
-    if (later.action !== 'retry') throw new Error('expected retry');
+    const later = decideRetry(f('unknown'), 5);
+    if (later.action !== 'retry') throw new Error('expected retry before limit');
     expect(later.delayMs).toBe(60_000);
+    const exhausted = decideRetry(f('unknown'), 6);
+    expect(exhausted.action).toBe('stop');
+    if (exhausted.action === 'stop') expect(exhausted.reason).toContain('investigate');
   });
 });
 

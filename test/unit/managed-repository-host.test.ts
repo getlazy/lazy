@@ -66,7 +66,7 @@ describe('managed repository-host check', () => {
       argv[0] === 'gh' ? Promise.resolve({ exitCode: 0, stdout: 'gh 2', stderr: '' }) : defaultRunCommand(argv, cwd);
     const checks = await managedRepositoryHostChecks(cfg('github'), repo, withCli, { GH_TOKEN: 'x' }, async () => [
       { state: 'warn', what: 'Public repo: PR comment sync disabled', reason: 'r' },
-      { state: 'fail', what: 'GitHub authentication', reason: 'Run: gh auth login' },
+      { state: 'fail', what: 'GitHub authentication', problem: 'GitHub authentication failed', reason: 'Run: gh auth login' },
     ]);
     expect(checks.find(c => c.what.startsWith('GitHub API features'))?.state).toBe('ok');
     expect(checks.find(c => c.what === 'Public repo: PR comment sync disabled')?.state).toBe('warn');

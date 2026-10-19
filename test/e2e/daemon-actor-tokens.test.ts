@@ -4,10 +4,10 @@ import { readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
-import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { createTask, fullTaskId, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import {
   readTaskStatus, readTurns, taskFilePath, storageDirFor, setTaskStatus, readSessionJson, writeSessionJson,
-  findFullTaskId,
+  findFullTaskId, writeTurns,
 } from '../helpers/storage';
 import { consumeResponse, protocolDir as getProtocolDir } from '../../src/protocol';
 import { seedFinal } from '../helpers/final';
@@ -16,7 +16,9 @@ import { DaemonClient, RpcApplicationError } from '../../src/daemon/client';
 import { getDaemonTcpTarget, readToken } from '../../src/daemon/lifecycle';
 import { getSessionCredentialsPath } from '../../src/daemon/paths';
 import { SERVICE_CREDENTIAL_USER_ID } from '../../src/daemon/user-credentials';
-import { NO_OWNER_CREDENTIAL_MARKER } from '../../src/daemon/turn-credentials';
+import { NO_OWNER_ENDPOINT_CREDENTIAL_MARKER } from '../../src/daemon/member-credentials';
+
+const SERVICE_HOLDER = 'holder@example.com';
 
 /**
  * Actor identity on the daemon's `/rpc/*` surface.
@@ -343,8 +345,10 @@ describe('daemon actor tokens', () => {
     expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
 
     // The same call on the acting member's token lands, and the row it writes
-    // names her — which is the whole point of refusing the other one.
-    await rpc(userToken, 'acceptTask', { taskId });
+    // names her — which is the whole point of refusing the other one. It is
+    // sent as Teams' Accept button sends it (`memberAccept`): `main` is
+    // protected by default on a managed project.
+    await rpc(userToken, 'acceptTask', { taskId, memberAccept: true });
     expect(readTaskStatus(ctx.root, taskId)).toBe('complete');
 
     const accepted = readStatusChangelog(taskId).filter(c => c.status === 'complete');
@@ -858,6 +862,9 @@ describe('daemon actor tokens', () => {
     }
 
     const userToken = await mintUserToken('ada@example.com', 'Ada');
+    // Ada pays for the turn she asks for: a managed daemon bills every turn to
+    // its asker, and refuses one she has nothing to pay with.
+    await rpc(sharedToken, 'putUserCredential', { userId: 'ada@example.com', kind: 'api-key', token: 'sk-ant-api-ada' });
     await rpc(userToken, 'unblockTask', { taskId, message: 'Please also handle the empty case' });
 
     const waitedAgain = await ctx.lazy(['wait', taskId]);
@@ -886,7 +893,7 @@ describe('daemon actor tokens', () => {
     }
 
     // The in-daemon agent uses the daemon's own mock response, so the commit
-    // this task's regions are carved from is made here (see CLAUDE.md).
+    // this task's regions are carved from is made here (see AGENTS.md).
     const worktree = join(ctx.root, '.lazy', 'worktrees', taskId);
     const git = (...args: string[]) => {
       const r = Bun.spawnSync(['git', ...args], { cwd: worktree });
@@ -1066,8 +1073,10 @@ describe('daemon actor tokens', () => {
 
   /** Store a user's Anthropic credential, as the control plane does. */
   async function putCredential(userId: string): Promise<void> {
+    if (userId === SERVICE_CREDENTIAL_USER_ID) await putCredential(SERVICE_HOLDER);
     await rpc(sharedToken, 'putUserCredential', {
       userId, kind: 'oauth', token: `oat-for-${userId}`,
+      ...(userId === SERVICE_CREDENTIAL_USER_ID ? { ownerEmail: SERVICE_HOLDER } : {}),
     });
   }
 
@@ -1098,7 +1107,7 @@ describe('daemon actor tokens', () => {
     const bindings = await readBindings();
     expect(bindings).toHaveLength(1);
     expect(bindings[0].ownerUserId).toBe('ada@example.com');
-    expect(bindings[0].ownerUserId).not.toBe(SERVICE_CREDENTIAL_USER_ID);
+    expect(bindings[0].ownerUserId).not.toBe(SERVICE_HOLDER);
     // Live for the duration of the turn: this is the placeholder the container
     // was launched with, and the proxy swaps it for Ada's real token.
     expect(bindings[0].revokedAt).toBeNull();
@@ -1117,14 +1126,14 @@ describe('daemon actor tokens', () => {
 
     const bindings = await readBindings();
     expect(bindings).toHaveLength(1);
-    expect(bindings[0].ownerUserId).toBe(SERVICE_CREDENTIAL_USER_ID);
+    expect(bindings[0].ownerUserId).toBe(SERVICE_HOLDER);
   });
 
   // INVARIANT: NO SILENT FALLBACK. A member with no credential of their own is
   // REFUSED — never quietly billed to the service account or to anyone else —
   // and the refusal carries the marker the control plane matches on to turn it
   // into "connect your Claude account" rather than a stack trace. That string
-  // is a wire contract with lazy-teams (see NO_OWNER_CREDENTIAL_MARKER).
+  // is a wire contract with lazy-teams (see NO_OWNER_ENDPOINT_CREDENTIAL_MARKER).
   test('a user with no stored credential is refused, and their words are kept', async () => {
     const taskId = await createTask(ctx, 'Uncredentialed member task', 'Some work');
     await runOneTurn(taskId);
@@ -1138,18 +1147,164 @@ describe('daemon actor tokens', () => {
 
     const refused = await rpcStatus(userToken, 'unblockTask', { taskId, message: 'Carry on please' });
     expect(refused.status).toBe(400);
-    expect(refused.message).toContain(NO_OWNER_CREDENTIAL_MARKER);
+    expect(refused.message).toContain(NO_OWNER_ENDPOINT_CREDENTIAL_MARKER);
     expect(refused.message).toContain('nemo@example.com');
 
     // Nothing was bound: the refusal is the whole outcome.
     expect(await readBindings()).toHaveLength(0);
     expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
 
-    // INVARIANT (root CLAUDE.md's first): a refusal never costs the human what
+    // INVARIANT (root AGENTS.md's first): a refusal never costs the human what
     // they typed. The feedback turn is written before the credential decision.
     const kept = readTurns(ctx.root, taskId)
       .find(t => t.role === 'human' && String(t.content).includes('Carry on please'));
     expect(kept).toBeDefined();
+  });
+
+  // INVARIANT: saved feedback is DELIVERED, not just stored. Feedback a member
+  // typed while their turn was refused for a missing credential rides the next
+  // successful unblock verbatim (attributed to its author), and is only then
+  // cleared — otherwise the next turn's completion marks it consumed unseen.
+  test('feedback saved by a refused member is delivered with the next unblock by someone with a credential', async () => {
+    const taskId = await createTask(ctx, 'Saved feedback delivery task', 'Some work');
+    await runOneTurn(taskId);
+    await putCredential('ada@example.com');
+    const nemoToken = await mintUserToken('nemo@example.com', 'Nemo');
+    const adaToken = await mintUserToken('ada@example.com', 'Ada');
+
+    const refused = await rpcStatus(nemoToken, 'unblockTask', { taskId, message: 'Nemo says rename the helper' });
+    expect(refused.status).toBe(400);
+    expect(refused.message).toContain('will be delivered with the next unblock');
+    expect(refused.message).not.toContain('send it again');
+
+    await rpc(adaToken, 'unblockTask', { taskId, message: 'Ada says add a test' });
+
+    const delivered = readTurns(ctx.root, taskId)
+      .filter(t => t.role === 'human' && String(t.prompt ?? t.content).includes('Ada says add a test'))
+      .pop();
+    expect(delivered).toBeDefined();
+    const text = String(delivered!.content);
+    expect(text).toContain('Nemo says rename the helper');
+    expect(text).toContain('nemo@example.com');
+    expect(text.indexOf('Nemo says')).toBeLessThan(text.indexOf('Ada says'));
+    // Delivered once: nothing is left marked as withheld.
+    expect(readTurns(ctx.root, taskId).some(t => (t as { feedback_withheld?: boolean }).feedback_withheld)).toBe(false);
+  });
+
+  // INVARIANT: several refused members' words ride the next unblock IN ORDER,
+  // each attributed, in the PROMPT the agent receives (not just stored turns);
+  // and a plan-mode (review question) unblock is never saved as feedback.
+  test('several saved messages are delivered oldest-first with their authors, and plan-mode is not saved', async () => {
+    const taskId = await createTask(ctx, 'Many saved task', 'Some work');
+    await runOneTurn(taskId);
+    await putCredential('ada@example.com');
+    const nemoToken = await mintUserToken('nemo@example.com', 'Nemo');
+    const otherToken = await mintUserToken('otto@example.com', 'Otto');
+    const adaToken = await mintUserToken('ada@example.com', 'Ada');
+
+    expect((await rpcStatus(nemoToken, 'unblockTask', { taskId, message: 'First from Nemo' })).status).toBe(400);
+    expect((await rpcStatus(otherToken, 'unblockTask', { taskId, message: 'Second from Otto' })).status).toBe(400);
+    expect((await rpcStatus(nemoToken, 'unblockTask', { taskId, message: 'A question only', permissionMode: 'plan' })).status).toBe(400);
+    expect(readTurns(ctx.root, taskId).some(t => String(t.content).includes('A question only'))).toBe(false);
+
+    await rpc(adaToken, 'unblockTask', { taskId, message: 'Ada closes it out' });
+    const delivered = readTurns(ctx.root, taskId)
+      .filter(t => t.role === 'human' && String(t.content).includes('Ada closes it out')).pop()!;
+    const prompt = String(delivered.prompt);
+    const [a, b, c] = ['First from Nemo', 'Second from Otto', 'Ada closes it out'].map(s => prompt.indexOf(s));
+    expect(a).toBeGreaterThan(-1);
+    expect(a).toBeLessThan(b);
+    expect(b).toBeLessThan(c);
+    expect(prompt).toContain('otto@example.com');
+  });
+
+  // INVARIANT (never lose human feedback): feedback a crashed turn never
+  // consumed rides the next UNBLOCK too, not only a resume — Lazy Teams turns a
+  // Restart into an unblock when it has words of its own to carry, and that
+  // turn's end marks every pending feedback turn consumed.
+  test('an unblock carries feedback an interrupted turn never consumed', async () => {
+    const taskId = await createTask(ctx, 'Crashed feedback task', 'Some work');
+    await runOneTurn(taskId);
+    await putCredential('ada@example.com');
+    const adaToken = await mintUserToken('ada@example.com', 'Ada');
+
+    const turns = readTurns(ctx.root, taskId);
+    const human = turns.filter(t => t.role === 'human').pop()!;
+    (human as Record<string, unknown>).content = 'Words the crash swallowed';
+    (human as Record<string, unknown>).feedback_delivery = 'pending';
+    writeTurns(ctx.root, taskId, turns);
+
+    await rpc(adaToken, 'unblockTask', { taskId, message: 'Ada adds more' });
+    const delivered = readTurns(ctx.root, taskId)
+      .filter(t => t.role === 'human' && String(t.content).includes('Ada adds more')).pop()!;
+    const prompt = String(delivered.prompt);
+    expect(prompt).toContain('Words the crash swallowed');
+    expect(prompt.indexOf('Words the crash swallowed')).toBeLessThan(prompt.indexOf('Ada adds more'));
+  });
+
+  // INVARIANT: an identical resend is the saved turn, not a second message —
+  // refused twice records ONE turn, and sending the same words once a
+  // credential exists carries no duplicate block.
+  test('an identical resend records no second turn and is not delivered twice', async () => {
+    const taskId = await createTask(ctx, 'Identical resend task', 'Some work');
+    await runOneTurn(taskId);
+    await putCredential('ada@example.com');
+    const nemoToken = await mintUserToken('nemo@example.com', 'Nemo');
+    const adaToken = await mintUserToken('ada@example.com', 'Ada');
+
+    for (let i = 0; i < 2; i++) {
+      expect((await rpcStatus(nemoToken, 'unblockTask', { taskId, message: 'Same words twice' })).status).toBe(400);
+    }
+    expect(readTurns(ctx.root, taskId).filter(t => t.role === 'human' && t.content === 'Same words twice')).toHaveLength(1);
+
+    await rpc(adaToken, 'unblockTask', { taskId, message: 'Same words twice' });
+    const last = readTurns(ctx.root, taskId).filter(t => t.role === 'human').pop();
+    expect(String(last!.content)).not.toContain('Feedback saved earlier');
+  });
+
+  // INVARIANT: an agent's `lazy_unblock` of its own subtask keeps the feedback
+  // when the turn is refused for a missing credential — record first, refuse
+  // after, on the MCP door too.
+  test('lazy_unblock over MCP keeps the feedback when the credential is missing', async () => {
+    const parentId = await createTask(ctx, 'MCP unblock parent', 'Some work');
+    await runOneTurn(parentId);
+    const childRes = await ctx.lazy(['create', '--goal', 'MCP unblock child', '--prompt', 'do', '--parent', parentId]);
+    expectSuccess(childRes);
+    const childId = (childRes.stdout.match(/[0-9a-f]{8}/) ?? [])[0]!;
+    expect(childId).toBeDefined();
+    await runOneTurn(childId);
+    await putCredential('ada@example.com');
+
+    const parentFull = await fullTaskId(ctx, parentId);
+    const responses = await runMcpSession(ctx.root, parentFull, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_unblock', arguments: { task_id: childId, feedback: 'MCP typed words' } } },
+    ]);
+    const result = responses.find(r => r.id === 2)!.result as { content: Array<{ text: string }>; isError?: boolean };
+    expect(JSON.stringify(result)).toContain('saved');
+    expect(readTurns(ctx.root, childId).some(t => t.role === 'human' && String(t.content).includes('MCP typed words'))).toBe(true);
+  });
+
+  // INVARIANT: record first, refuse after — on EVERY feedback surface. The
+  // review page's unblock and a repeat of the same words both keep the words,
+  // exactly once, and the refusal says they were saved.
+  test('review-surface feedback survives a missing credential and is not double-recorded on retry', async () => {
+    const taskId = await createTask(ctx, 'Review feedback kept task', 'Some work');
+    await runOneTurn(taskId);
+    await putCredential('ada@example.com');
+    const userToken = await mintUserToken('nemo@example.com', 'Nemo');
+
+    for (let i = 0; i < 2; i++) {
+      const refused = await rpcStatus(userToken, 'reviewUnblock', { taskId, message: 'Please redo the parser' });
+      expect(refused.status).toBe(400);
+      expect(refused.message).toContain(NO_OWNER_ENDPOINT_CREDENTIAL_MARKER);
+      expect(refused.message).toContain('feedback was saved');
+    }
+    const kept = readTurns(ctx.root, taskId)
+      .filter(t => t.role === 'human' && String(t.content).includes('Please redo the parser'));
+    expect(kept).toHaveLength(1);
+    expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
+    expect(await readBindings()).toHaveLength(0);
   });
 
   // INVARIANT: the review surface bills the same way every other turn-launching
@@ -1172,7 +1327,7 @@ describe('daemon actor tokens', () => {
     const bindings = await readBindings();
     expect(bindings).toHaveLength(1);
     expect(bindings[0].ownerUserId).toBe('ada@example.com');
-    expect(bindings[0].ownerUserId).not.toBe(SERVICE_CREDENTIAL_USER_ID);
+    expect(bindings[0].ownerUserId).not.toBe(SERVICE_HOLDER);
   });
 
   // INVARIANT: the acceptance gate bills NOBODY. Its predecessor, the
@@ -1207,7 +1362,8 @@ describe('daemon actor tokens', () => {
     await putCredential('ada@example.com');
     const userToken = await mintUserToken('ada@example.com', 'Ada');
 
-    await rpc(userToken, 'acceptTask', { taskId });
+    // As Teams' Accept sends it — `main` is protected by default here.
+    await rpc(userToken, 'acceptTask', { taskId, memberAccept: true });
 
     // The gate ran (the accept merged), and no credential was bound for it: no
     // agent turn launched, so there is nothing to attribute to u-ada — and
@@ -1264,7 +1420,7 @@ describe('daemon actor tokens', () => {
     // Ada's refused call left nothing behind: the turn nobody asked for is paid
     // for by the service credential, not by the last person who knocked.
     expect(bindings).toHaveLength(1);
-    expect(bindings[0].ownerUserId).toBe(SERVICE_CREDENTIAL_USER_ID);
+    expect(bindings[0].ownerUserId).toBe(SERVICE_HOLDER);
     expect(bindings[0].ownerUserId).not.toBe('ada@example.com');
   }, 45000);
 
@@ -1322,7 +1478,7 @@ describe('daemon actor tokens', () => {
 
     const bindings = await waitForBindings(1);
     expect(bindings).toHaveLength(1);
-    expect(bindings[0].ownerUserId).toBe(SERVICE_CREDENTIAL_USER_ID);
+    expect(bindings[0].ownerUserId).toBe(SERVICE_HOLDER);
     expect(bindings[0].ownerUserId).not.toBe('ada@example.com');
   }, 45000);
 

@@ -61,6 +61,7 @@ import type {
   ScratchFileInput,
   SystemMessage,
   SystemMessageInput,
+  SystemMessageDismissFilter,
   CommentSource,
   CommentCreateOptions,
   CommentUpdate,
@@ -83,8 +84,27 @@ import type {
   StoredUsageLimitReading,
 } from './types';
 import type { SpanRecord } from '../tracing/types';
+import type { TurnLatencyRecord, TurnLatencyRollup } from '../task/turn-latency';
+
+/** A task's stored latency rollups — see {@link Storage.getTurnLatency}. */
+export interface TaskTurnLatency {
+  open: TurnLatencyRollup | null;
+  turns: TurnLatencyRecord[];
+}
 import type { RunnerType } from '../config/types';
-import type { FinalClaim, ReviewReport, WaitInterval, WaitOutcome } from '../types';
+import type { FeedbackItem, FinalClaim, ReviewReport, TurnFailure, WaitInterval, WaitOutcome } from '../types';
+
+/** What {@link Storage.createTask} writes in the same write as a new task's row. */
+export interface NewTaskInitialState {
+  /** A BRANCH target for a top-level task (a parent task goes in `parentTaskId`). */
+  targetBranch?: string;
+  /** Recorded as prompt version 1. */
+  prompt?: string;
+  model?: string;
+  metadata?: Record<string, string>;
+  /** Already normalized; each gets a tag-history event under the creating actor. */
+  tags?: string[];
+}
 import type { WaitIntervalStart, WaitIntervalFilter } from './wait-intervals';
 
 /**
@@ -220,6 +240,12 @@ export interface CreateTurnOptions {
    */
   reviewDispatch?: 'auto' | 'self' | 'manual';
   /**
+   * The turn ran in NO container (a review that never launched, recorded only
+   * so the dispatch failure is visible): storage must not stamp it with any
+   * container's image (`Turn.runner_image`).
+   */
+  noRunnerImage?: boolean;
+  /**
    * This review's findings were ALREADY ACTED ON by the same exchange that
    * produced it — the `low_high` revise pass, which runs straight after the
    * self-review and applies its instructions.
@@ -231,6 +257,8 @@ export interface CreateTurnOptions {
    * not land a task whose self-review worked.
    */
   reviewAddressed?: boolean;
+  /** Lazy's notice that this turn FAILED — see `Turn.failure`. */
+  failure?: TurnFailure;
   /**
    * Pencils down: the declaration that this turn's agent (or a human) made that
    * the task's work is finished. See {@link FinalClaim}.
@@ -244,13 +272,17 @@ export interface CreateTurnOptions {
    * Mark this turn as carrying human/builder feedback that the agent has not
    * consumed yet (persisted as `feedback_delivery: 'pending'`).
    *
-   * INVARIANT (CLAUDE.md — never lose human feedback): set this on every turn
+   * INVARIANT (AGENTS.md — never lose human feedback): set this on every turn
    * whose content is real feedback destined for the agent (unblock, ask,
    * initial task prompt, auto-delivered comments/CI). Do NOT set it on
    * synthetic system notices, supervisor sync/nudge turns, or stop reasons —
    * those must never trigger redelivery. See `findPendingFeedback()`.
    */
   carriesFeedback?: boolean;
+  /** Saved but undelivered feedback (launch refused); see `Turn.feedback_withheld`. Implies carriesFeedback. */
+  feedbackWithheld?: boolean;
+  /** The person's own words this turn carries, oldest first; see `Turn.feedback_items`. */
+  feedbackItems?: FeedbackItem[];
   /**
    * True when the error turn provably had no effect on the branch (no commits,
    * clean worktree). See `Turn.agent_had_no_effect` for semantics.
@@ -296,8 +328,15 @@ export interface Storage {
    * `actor` records the CHANNEL the creation came through (MCP → 'builder' or
    * 'agent', CLI → omitted, which reads as human). It is stamped on the initial
    * 'backlog' status-changelog entry so "who created this task" is auditable.
+   *
+   * `initial` is state written IN THE SAME WRITE as the row, so a create that
+   * carries a prompt, a branch target or settings lands whole or not at all —
+   * never a promptless backlog task left behind by a follow-up write that
+   * failed. The daemon's create (`src/daemon/create-task.ts`) is its caller. It
+   * is deliberately NOT carried over `RemoteStorage`: Lazy Teams authorizes a
+   * storage call per method and argument, and `initial` would bypass that.
    */
-  createTask(goal: string, parentTaskId?: string, branchedFromSha?: string, code?: string, type?: string, agentId?: string, actor?: ActorInput): Promise<Task>;
+  createTask(goal: string, parentTaskId?: string, branchedFromSha?: string, code?: string, type?: string, agentId?: string, actor?: ActorInput, initial?: NewTaskInitialState): Promise<Task>;
 
   /**
    * Get a task by ID (supports prefix matching and code lookup)
@@ -349,7 +388,7 @@ export interface Storage {
   /**
    * Update task status
    */
-  updateTaskStatus(taskId: string, status: TaskStatus, actor?: ActorInput): Promise<void>;
+  updateTaskStatus(taskId: string, status: TaskStatus, actor?: ActorInput, reason?: string): Promise<void>;
 
   /**
    * Update task goal
@@ -724,6 +763,13 @@ export interface Storage {
    * nothing, and that is precisely the case redelivery exists for.
    */
   markFeedbackConsumed(sessionId: string): Promise<void>;
+
+  /**
+   * Mark the named pending feedback turns consumed (and no longer withheld):
+   * their words now ride a newer feedback turn, which alone stays pending, so a
+   * later carry or resume delivers them once — never nested, never twice.
+   */
+  markFeedbackSubsumed(sessionId: string, turnIds: string[]): Promise<void>;
 
   // --- Commits ---
 
@@ -1111,7 +1157,7 @@ export interface Storage {
   // INVARIANT: bounded by construction. Implementations MUST enforce
   // `assertArtifactWithinLimits` (src/artifacts/limits.ts) before persisting.
   // Unbounded per-task growth inside the store is the failure mode that broke a
-  // real store once (see the proxy audit log carve-out in CLAUDE.md); artifacts
+  // real store once (see the proxy audit log carve-out in AGENTS.md); artifacts
   // must not become the second instance.
 
   /**
@@ -1225,7 +1271,7 @@ export interface Storage {
    *
    * INVARIANT: Human feedback is saved FIRST, before any failable dispatch
    * (ask launch, agent resume, network). A comment that never reaches the agent
-   * MUST still exist and be visible. See CLAUDE.md "Never Lose Human Feedback".
+   * MUST still exist and be visible. See AGENTS.md "Never Lose Human Feedback".
    *
    * INVARIANT: This is a PASSIVE write, like follow-ups — it MUST NOT feed the
    * comment auto-react loop. Review comments reach the agent only through an
@@ -1310,7 +1356,7 @@ export interface Storage {
   /**
    * Write part of a review draft, creating the record on first write.
    *
-   * INVARIANT (CLAUDE.md "Never Lose Human Feedback"): this is a PATCH, not a
+   * INVARIANT (AGENTS.md "Never Lose Human Feedback"): this is a PATCH, not a
    * replace. An omitted key is left as it was, so the feedback box autosaving
    * mid-sentence can never blank the accept reason a reviewer typed in another
    * tab. Clearing is explicit: write `''`.
@@ -1698,8 +1744,22 @@ export interface Storage {
   // memory, a system message is never injected into agent prompts as guidance —
   // it is attributed data shown to the human — so agent creation is safe.
 
-  /** Create a system message. Append-only; returns the stored message. */
-  createSystemMessage(input: SystemMessageInput): Promise<SystemMessage>;
+  /**
+   * Create a system message. Append-only; returns the stored message.
+   *
+   * With `collapseRepeats`, an OPEN (undismissed) message with the same source,
+   * kind and title absorbs the event instead: its `repeat_count` and
+   * `last_seen_at` move and that message is returned. For producers that file
+   * the same machine event over and over (a crash loop), so a stream of
+   * identical notices cannot bury the rest of the inbox. A different title is a
+   * different event and always gets its own message.
+   *
+   * With `refreshBody` as well, the absorbing message's body is replaced by the
+   * new one: for a producer whose title names the PROBLEM while the body names
+   * its latest cause (a failing agent profile), so the open message never shows
+   * a cause that has since changed.
+   */
+  createSystemMessage(input: SystemMessageInput, options?: { collapseRepeats?: boolean; refreshBody?: boolean }): Promise<SystemMessage>;
 
   /**
    * List system messages, newest first. Dismissed messages are excluded unless
@@ -1728,6 +1788,19 @@ export interface Storage {
    */
   dismissSystemMessage(id: string, actor: Actor): Promise<SystemMessage>;
 
+  /**
+   * Dismiss every OPEN message matching `filter` in one write (an empty filter
+   * matches all of them). Returns what it dismissed. Same contract as the
+   * single dismissal: nothing is deleted, already-dismissed messages are left
+   * exactly as they were. With `preview` it writes nothing and returns what it
+   * WOULD dismiss — what a surface shows before asking for confirmation.
+   */
+  dismissSystemMessages(
+    filter: SystemMessageDismissFilter,
+    actor: Actor,
+    options?: { preview?: boolean },
+  ): Promise<SystemMessage[]>;
+
   // --- Status History ---
 
   /**
@@ -1754,6 +1827,28 @@ export interface Storage {
    */
   saveToolStats(record: TaskToolStatsRecord): Promise<void>;
 
+  // --- Per-turn latency rollups (src/task/turn-latency.ts) ---
+
+  /**
+   * A task's latency rollups: `turns` are closed (one per agent WORK turn that
+   * had model traffic, oldest first), `open` is the running turn's so far.
+   * Null when the task never recorded any.
+   */
+  getTurnLatency(taskId: string): Promise<TaskTurnLatency | null>;
+
+  /**
+   * Merge a delta into the task's RUNNING turn's rollup. Written only by the
+   * proxy's recorder (src/proxy/turn-latency-recorder.ts). A merge, never an
+   * overwrite: the turn row that closes the open rollup may land between two
+   * flushes, and a delta flushed after it belongs to the next turn — never
+   * re-added to the closed one.
+   *
+   * When the agent WORK turn row is written (`createTurn`), the open rollup
+   * is closed into `turns` and summarised onto the row (`Turn.latency`) in
+   * the same write.
+   */
+  mergeOpenTurnLatency(taskId: string, delta: TurnLatencyRollup): Promise<void>;
+
   // --- Usage-limit readings ([usage_pause]) ---
   //
   // DAEMON-LOCAL: the storage RPC does not carry these and RemoteStorage refuses
@@ -1776,6 +1871,9 @@ export interface Storage {
    * Written only by the daemon's reading recorder (src/daemon/usage-readings.ts).
    */
   saveUsageLimitReading(reading: StoredUsageLimitReading): Promise<void>;
+
+  /** Forget an endpoint reading after replacement or revocation. */
+  deleteUsageLimitReading(credential: string): Promise<void>;
 
   // --- Search ---
 

@@ -6,6 +6,7 @@
  * For host-process, it just runs locally via bun.
  */
 
+import type { HealthCheck } from '../remote/driver';
 import type { AgentPackaging } from './interface';
 
 export class QaAgentPackaging implements AgentPackaging {
@@ -32,7 +33,7 @@ export class QaAgentPackaging implements AgentPackaging {
 
   dockerInstallCommand(): string {
     // qa-agent is a bun script shipped with lazy — no install needed.
-    // Bun is already in the base Docker image.
+    // (The base image does not ship bun; qa-agent is a test-only agent.)
     return '# qa-agent: no install needed (runs via bun from lazy source tree)';
   }
 
@@ -56,7 +57,7 @@ WORKDIR /work
     ];
   }
 
-  diagnose(): { state: 'ok' | 'fail'; what: string; reason?: string }[] {
+  diagnose(): HealthCheck[] {
     return [{ state: 'ok', what: 'qa-agent available (built-in bun script)' }];
   }
 }

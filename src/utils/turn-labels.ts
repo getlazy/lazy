@@ -25,6 +25,9 @@
  * we failed to record, i.e. one written before these fields existed.
  */
 
+import { formatTurnLatency, type TurnLatencySummary } from '../task/turn-latency';
+import type { TierServed } from '../types';
+import { formatTierServed } from '../task/tiers-served';
 import { HARNESS_PICKS_MODEL_NAMES } from '../config/default-models';
 
 /**
@@ -40,6 +43,12 @@ export interface TurnLaunchFields {
   model_id?: string;
   effort?: string;
   actor?: string;
+  /** The runner image the turn ran on (Turn.runner_image), when recorded. */
+  runner_image?: { image: string; kind: string };
+  /** The tiers of a tiered profile that served it (Turn.tiers_served), when recorded. */
+  tiers_served?: TierServed[];
+  /** How fast the model answered (Turn.latency), when recorded. */
+  latency?: TurnLatencySummary;
 }
 
 /** Rendered for a launch field of a turn that ran, but did not record it. */
@@ -240,17 +249,32 @@ export function turnModelMismatchWarning(
  * `['agent: claude-code', 'model: opus → claude-opus-4-5-20251101', 'effort: high']`
  *
  * Always those three labels, in that order, whatever the turn carries — except
- * for a turn no agent ran, which gets NONE. The concrete `model_id` the agent
+ * for a turn no agent ran, which gets NONE — plus `image: …` when the turn
+ * recorded the runner image it ran on. The concrete `model_id` the agent
  * self-reported is folded into the model label via {@link formatTurnModelLabel}.
  */
 export function turnLaunchLabels(turn: TurnLaunchFields): string[] {
   if (turnRanNoAgent(turn)) return [];
 
-  return [
+  const labels = [
     `agent: ${turn.agent ?? UNKNOWN_LAUNCH_LABEL}`,
     `model: ${formatTurnModelLabel(turn.model, turn.model_id)}`,
     `effort: ${turn.effort ?? UNKNOWN_LAUNCH_LABEL}`,
   ];
+  // The image it ran on, when recorded: a fourth label, so a turn that ran on
+  // lazy's default image (the project's own was not ready) says so wherever
+  // the launch labels are shown. Older turns record none and show none.
+  if (turn.runner_image) {
+    const onDefault = turn.runner_image.kind === 'fallback' || turn.runner_image.kind === 'readonly';
+    labels.push(`image: ${turn.runner_image.image}${onDefault ? ' (default image — project image not ready)' : ''}`);
+  }
+  // A tiered profile: `model` is tier 0's, the one the harness launched with;
+  // this says where the requests actually went ("ran on tier 2: lunaroute/glm-5.3").
+  if (turn.tiers_served?.length) {
+    labels.push(`ran on ${turn.tiers_served.map(formatTierServed).join(', ')}`);
+  }
+  if (turn.latency && turn.latency.requests > 0) labels.push(formatTurnLatency(turn.latency));
+  return labels;
 }
 
 /**

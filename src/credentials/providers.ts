@@ -7,8 +7,8 @@
  *  - A PROVIDER ({@link Provider}) is one of the services lazy knows by name:
  *    it has a label, the credential kinds it issues, the env vars those kinds
  *    are carried in, and instructions for obtaining one. Providers are what the
- *    daemon credential gate reasons about, and what a profile's credential
- *    DEFAULTS to (from its endpoint's hostname).
+ *    daemon credential gate reasons about, and what a BUILT-IN profile's
+ *    credential is (a user endpoint must name its own).
  *  - A NAMED credential is any other name a user picks — `credential =
  *    "work-openai"`, stored with `lazy auth set work-openai`. lazy knows nothing
  *    about it beyond "here is a secret, send it to this profile's upstream", so
@@ -46,9 +46,9 @@ import {
 import { isChatGptEndpoint } from '../utils/openai-compat';
 
 /** Every provider lazy knows by name. */
-export type Provider = 'anthropic' | 'chatgpt' | 'cursor' | 'ollama' | 'openai' | 'openrouter';
+export type Provider = 'anthropic' | 'chatgpt' | 'cursor' | 'fireworks' | 'ollama' | 'openai' | 'openrouter';
 
-export const PROVIDERS: readonly Provider[] = ['anthropic', 'chatgpt', 'cursor', 'ollama', 'openai', 'openrouter'] as const;
+export const PROVIDERS: readonly Provider[] = ['anthropic', 'chatgpt', 'cursor', 'fireworks', 'ollama', 'openai', 'openrouter'] as const;
 
 export function isProvider(value: string): value is Provider {
   return (PROVIDERS as readonly string[]).includes(value);
@@ -147,8 +147,8 @@ const SPECS: Record<Provider, ProviderSpec> = {
    * api.openai.com, a subscription pays chatgpt.com/backend-api/codex. A profile
    * has exactly one `endpoint`, so folding both into one slot would mean
    * inferring the host from whichever credential happened to be stored — and
-   * `defaultCredentialFor` already picks the slot from the endpoint's hostname,
-   * which gets this right for free. Keeping them apart also lets a project hold
+   * a profile with an endpoint names its credential explicitly (the built-in
+   * codex-subscription profile carries `chatgpt`), which gets this right for free. Keeping them apart also lets a project hold
    * both at once and choose per task.
    *
    * `oauth` is its only kind: the subscription issues no API key. The secret is
@@ -195,6 +195,15 @@ const SPECS: Record<Provider, ProviderSpec> = {
       'api-key': 'OPENAI_API_KEY',
     },
     howToGet: 'create an API key at https://platform.openai.com/api-keys and run `lazy auth set openai`',
+  },
+  fireworks: {
+    label: 'Fireworks',
+    kinds: ['api-key'],
+    envVar: {
+      oauth: null,
+      'api-key': 'FIREWORKS_API_KEY',
+    },
+    howToGet: 'create an API key at https://app.fireworks.ai/settings/users/api-keys and run `lazy auth set fireworks`',
   },
   openrouter: {
     label: 'OpenRouter',
@@ -324,8 +333,8 @@ export function envVarsFor(name: CredentialName): string[] {
  * needs none.
  *
  * The answer is READ, not derived: a profile resolves its own credential slot
- * at config load (`defaultCredentialFor` in src/config/agent-profiles.ts), from
- * an explicit `credential = "..."` or from the endpoint's hostname, and a role
+ * at config load (src/config/agent-profiles.ts): the explicit `credential = "..."`
+ * every endpoint must carry, or a built-in profile's fixed one, and a role
  * target is a flattened profile. Re-deriving it here from the endpoint would be
  * a second rule that can disagree with the one the proxy actually bills by.
  *

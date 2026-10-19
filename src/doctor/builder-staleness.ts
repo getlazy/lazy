@@ -112,6 +112,7 @@ export async function checkBuildersCurrent(opts: {
   return {
     ok: false,
     label,
+    problem: 'Running builders predate the current config or image',
     detail: `${stale.length} running builder(s) predate the current config or image — ${stale.join(' | ')}. ` +
       'Quit each (it keeps its session) and start it again with `lazy builder --resume <id>` to pick up the current model, prompt and image. ' +
       'A builder whose supervisor predates daemon-served model/effort needs this manual restart once; after that, in-place reconnects follow the config.',

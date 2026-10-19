@@ -1,4 +1,4 @@
-import { requireStorage, requireLazyRoot, parseFlags, validateModel, validateAgentProfileOrExit, resolveTaskOrExit } from '../helpers';
+import { requireStorage, requireLazyRoot, parseFlags, validateModel, validateAgentProfileOrExit, resolveTaskOrExit, isBoundClone } from '../helpers';
 import { requireActorIdentity } from '../identity-preflight';
 import {
   describeReviewOverrides,
@@ -20,6 +20,7 @@ import { loadConfig } from '../../config/loader';
 import { resolveProjectModel } from '../../daemon/project-settings';
 import { switchTaskAgent, formatAgentSwitchAnnouncement } from '../../daemon/agent-switch';
 import { maybeOfferWorktreeImageForTask } from '../../docker/worktree-image';
+import { queryEditTask } from '../../daemon/rpc-fallback';
 
 /**
  * Check if setting parentId as the parent of taskId would create a cycle.
@@ -100,13 +101,32 @@ export async function commandEdit(args: string[]): Promise<void> {
     // applies nothing — a combined edit must not leave the agent or runner
     // changed while the goal edit that accompanied it was refused.
     const turnCount = await storage.getTurnCountByTaskId(t.id);
+
+    // A code change on its own on a started task is a cosmetic rename, and the
+    // daemon owns its rules (src/daemon/edit-task.ts): collision check, the
+    // "on its own / never cleared" refusals, and what to tell the human.
+    const onlyCode = codeValue !== undefined && goalValue === undefined && promptValue === undefined
+      && modelValue === undefined && typeValue === undefined && parentValue === undefined
+      && effortValue === undefined && runnerValue === undefined && agentValue === undefined
+      && !hasReviewOverrides(reviewOverrides);
+    if (turnCount > 0 && onlyCode) {
+      try {
+        const result = await queryEditTask({ taskId: t.id, code: codeValue });
+        if (result.changes.length === 0) console.log('No changes made');
+        for (const line of result.announcements ?? []) console.log(line);
+      } catch (err) {
+        console.error(err instanceof Error ? err.message : String(err));
+        process.exit(1);
+      }
+      return;
+    }
     const isMidFlightSafeEdit = (modelValue !== undefined || effortValue !== undefined
         || runnerValue !== undefined || agentValue !== undefined
         || hasReviewOverrides(reviewOverrides))
       && goalValue === undefined && promptValue === undefined
       && typeValue === undefined && codeValue === undefined && parentValue === undefined;
     if (turnCount > 0 && !isMidFlightSafeEdit) {
-      console.error(`Cannot edit task ${displayId(t)}: task has already been started; only --model and --effort can be changed.`);
+      console.error(`Cannot edit task ${displayId(t)}: task has already been started; only --model and --effort can be changed, and --code on its own.`);
       console.error(`(--runner and --agent are changeable on a started task too, but only on their own — not combined with a goal/prompt/type/code/parent edit.)`);
       console.error(`Use 'lazy comment ${displayId(t)} --message "..."' to add annotations instead.`);
       process.exit(1);
@@ -175,7 +195,24 @@ export async function commandEdit(args: string[]): Promise<void> {
       }
       const coModel = modelValue !== undefined ? validateModel(modelValue) : undefined;
 
-      if (agentValue !== t.agent_id) {
+      if (agentValue !== t.agent_id && await isBoundClone()) {
+        // A bound clone's lazy.toml is the REPOSITORY's copy: the daemon checks
+        // the name and re-resolves model and effort from its own configuration.
+        try {
+          const result = await queryEditTask({
+            taskId: t.id,
+            agent: agentValue,
+            ...(coModel !== undefined ? { model: coModel } : {}),
+            ...(effortValue !== undefined ? { effort: effortValue } : {}),
+          });
+          for (const line of result.announcements ?? result.changes.map((c) => '  ' + c)) console.log(line);
+        } catch (err) {
+          console.error(err instanceof Error ? err.message : String(err));
+          process.exit(1);
+        }
+        if (coModel !== undefined) modelHandledByAgentSwitch = true;
+        if (effortValue !== undefined) effortHandledByAgentSwitch = true;
+      } else if (agentValue !== t.agent_id) {
         const root = requireLazyRoot();
         const config = await loadConfig(root);
         const projectSettings = await storage.getProjectSettings();
@@ -432,7 +469,9 @@ export function editUsage(): void {
 
 Edit a task's goal, prompt, model, type, code, parent, runner, effort, agent, or review mode. Interactive if no flags provided.
 Once an agent has worked on the task, only --model, --effort, --runner, --agent and the
---review* flags can still be changed; goal/prompt/type/code/parent edits are rejected. The --runner, --agent and
+--review* flags can still be changed; goal/prompt/type/parent edits are rejected. --code can still be
+changed on its own: the rename is cosmetic — the task's branch, worktree, container and any PR/MR keep
+their old names, while lookups, dashboard links and service hostnames use the new code. The --runner, --agent and
 --review overrides take effect on the next turn.
 Linked tasks that haven't been agent-started are still fully editable.
 Use 'lazy comment' to add annotations to started tasks.

@@ -24,9 +24,9 @@
 import { existsSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { getHome } from '../../utils/home';
-import { requireLazyRoot, requireStorage, parseFlags } from '../helpers';
+import { requireLazyRoot, requireStorage, parseFlags, refuseIfBoundClone } from '../helpers';
 import {
-  ensureImage, ensureAgentBinary, resolveImageName, resolveCustomDockerfile,
+  ensureImage, ensureAgentBinary, resolveImageName, resolveCustomDockerfile, describeDockerfileSource,
   enableUpgradeImageBuild, isAdoptedDockerfile, getLastSourceBuildProvenance,
   evaluateUpgradeRebuild,
 } from '../../capture/claude';
@@ -68,6 +68,9 @@ import {
   waitForInterveningBuildOutput,
 } from '../../upgrade/interactive-prompt';
 import { VERSION } from '../../version';
+import { backupStoreForUpgrade, SKIP_STORE_BACKUP_ENV } from '../../daemon/upgrade-store-backup';
+import { backupSizeText } from '../../storage/store-backup';
+import { backupProgressPrinter } from '../../daemon/upgrade-store-backup';
 import { missingCredentialNotice } from '../../daemon/credential-gate';
 
 const DOCKER_TIMEOUT_MS = 10_000;
@@ -188,7 +191,7 @@ async function printImageSource(root: string): Promise<void> {
   const adopted = await isAdoptedDockerfile(root, dockerfilePath);
   const sourceNote = adopted ? ' (daemon-adopted from worktree)' : '';
   console.log(`  Config:     ${configPath}`);
-  console.log(`  Dockerfile: ${dockerfilePath ? `${dockerfilePath}${sourceNote}` : 'embedded default ([docker].dockerfile is not set)'}`);
+  console.log(`  Dockerfile: ${dockerfilePath ? `${describeDockerfileSource(dockerfilePath)}${sourceNote}` : 'embedded default (no [docker].dockerfile and no Dockerfile.lazy at the project root)'}`);
   if (adopted) {
     // An adopted Dockerfile builds against its own worktree, not the project
     // root — say which, so "built from what?" is answerable before the build
@@ -317,7 +320,7 @@ function getLazyDevSourceRoot(): string | null {
  * docs/spikes/builder-upgrade-resume.md §1.4/§2-S3). The conversation itself is
  * durable and resumes automatically; only the unsent buffer is at risk.
  *
- * This honors CLAUDE.md's "never lose human feedback" invariant for the common
+ * This honors AGENTS.md's "never lose human feedback" invariant for the common
  * case: warn the human and block until they confirm they've submitted any
  * in-progress message. It is the v0.17 mitigation; the event-plane
  * `upgrade.imminent` warning into the live builder pane is a deferred follow-up.
@@ -507,13 +510,16 @@ async function promoteBackgroundImage(build: BackgroundImageBuild): Promise<stri
 }
 
 export async function commandUpgrade(args: string[]): Promise<void> {
+  await refuseIfBoundClone('upgrade');
   const parsed = parseFlags(args, [
     { name: 'force', takesValue: false },
     { name: 'wait', takesValue: false },
     { name: 'dry-run', takesValue: false },
     { name: 'images', takesValue: false },
+    { name: 'skip-store-backup', takesValue: false },
     BUILD_TIMEOUT_FLAG,
   ], 'upgrade');
+  const skipStoreBackup = parsed.flags.get('skip-store-backup') === true;
 
   const force = parsed.flags.get('force') === true;
   const wait = parsed.flags.get('wait') === true;
@@ -791,7 +797,7 @@ export async function commandUpgrade(args: string[]): Promise<void> {
 
     // Pre-stop prompt: give the human a chance to submit any in-progress
     // message in a live builder before its container is killed. Honors
-    // "never lose human feedback" (CLAUDE.md). Skipped under --force / non-TTY.
+    // "never lose human feedback" (AGENTS.md). Skipped under --force / non-TTY.
     await promptBuilderPreStop(builderContainers.length, force, interactiveSessions, imageBuild);
 
     // Step 1: Stop task containers/processes for this project. Builders ride
@@ -898,6 +904,35 @@ export async function commandUpgrade(args: string[]): Promise<void> {
     // src/upgrade/legacy-mcp-purge.ts for the full blast-radius argument.
     await purgeLegacyDaemonMcpConfigsReporting(root);
 
+    // Step 3b: back up the store while no daemon holds it, before the new
+    // daemon opens it (src/daemon/upgrade-store-backup.ts). No backup, no new
+    // daemon: the old one is already stopped, so a failure leaves the project
+    // down with the store untouched and says how to go on.
+    if (skipStoreBackup) {
+      console.log(theme.warning('\n--skip-store-backup: the store is NOT being backed up before the new daemon opens it.'));
+      process.env[SKIP_STORE_BACKUP_ENV] = '1';
+    } else if (previousVersion && previousVersion !== VERSION) {
+      console.log('\nBacking up the store before the new daemon opens it...');
+      try {
+        const config = await loadConfig(root);
+        const outcome = await backupStoreForUpgrade({
+          projectRoot: root,
+          fromVersion: previousVersion,
+          toVersion: VERSION,
+          keep: config.storage.backup_keep ?? 5,
+          reason: `lazy upgrade ${previousVersion} → ${VERSION}`,
+          onProgress: backupProgressPrinter((line) => console.log(`  ${line}`)),
+        });
+        if (outcome.kind === 'skipped') console.log(`  No backup needed: ${outcome.reason}`);
+        else console.log(`  ${theme.success(`${outcome.kind === 'taken' ? 'Backed up' : 'Already backed up'}: ${outcome.backup.path}`)} (${outcome.backup.file_count} files, ${backupSizeText(outcome.backup)})`);
+      } catch (err) {
+        console.error(`\nError: ${err instanceof Error ? err.message : String(err)}`);
+        console.error('The old daemon was stopped and has NOT been restarted. Fix the cause and run `lazy upgrade` again,');
+        console.error('or run `lazy upgrade --skip-store-backup` to upgrade without a backup, deliberately.');
+        process.exit(1);
+      }
+    }
+
     await ensureDaemon('upgrade', root);
 
     // Final block — always last so it sits below build output and any prompts
@@ -932,7 +967,7 @@ export async function commandUpgrade(args: string[]): Promise<void> {
 }
 
 export function upgradeUsage(): void {
-  console.log(`Usage: lazy upgrade [--force] [--wait] [--dry-run] [--timeout <seconds>]
+  console.log(`Usage: lazy upgrade [--force] [--wait] [--dry-run] [--skip-store-backup] [--timeout <seconds>]
        lazy upgrade --images [--dry-run] [--timeout <seconds>]
 
 Rebuild the Docker image and agent binary, then restart the daemon.
@@ -997,6 +1032,10 @@ Options:
               future sessions; stop nothing, don't restart the daemon. Always
               rebuilds and never asks — this is the force-refresh path
   --dry-run   Show what would be rebuilt and stopped, without doing anything
+  --skip-store-backup
+              Do not back up the store before the new daemon opens it. Without
+              this, a backup that fails stops the upgrade (see
+              \`lazy system store-backups\`)
   --timeout <seconds>
               Kill the image build after N seconds (default: no timeout).
               Builds are unbounded by default: one killed on a timer wastes the

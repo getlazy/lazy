@@ -12,7 +12,8 @@
 
 import { RpcApplicationError, type DaemonClient } from '../daemon/client';
 import { CommentAlreadySeenError } from '../task/comment-edit';
-import type { Storage, CreateTurnOptions } from './interface';
+import type { Storage, CreateTurnOptions, NewTaskInitialState, TaskTurnLatency } from './interface';
+import type { TurnLatencyRollup } from '../task/turn-latency';
 import { normalizeTurnContent, normalizeRecordContent } from '../utils/turn-content';
 import type { SpanRecord } from '../tracing/types';
 import type { WaitIntervalStart, WaitIntervalFilter } from './wait-intervals';
@@ -70,6 +71,7 @@ import type {
   ScratchFileInput,
   SystemMessage,
   SystemMessageInput,
+  SystemMessageDismissFilter,
 } from './types';
 import type { Actor, ActorInput, CommentSource, CommentCreateOptions, CommentUpdate, FileViolation, HunkApproval, HunkApprovalLineage, ReviewComment, ReviewCommentInput, ReviewCommentUpdate, ReviewDraftPatch, ReviewDraftState, ReviewSession, ReviewSessionMessage, ReviewSessionMessageInput, ReviewSessionMessageUpdate, ReviewSessionUpdate, TaskTarget } from '../types';
 import type { RunnerType } from '../config/types';
@@ -118,7 +120,13 @@ export class RemoteStorage implements Storage {
 
   // --- Tasks ---
 
-  async createTask(goal: string, parentTaskId?: string, branchedFromSha?: string, code?: string, type?: string, agentId?: string, actor?: ActorInput): Promise<Task> {
+  async createTask(goal: string, parentTaskId?: string, branchedFromSha?: string, code?: string, type?: string, agentId?: string, actor?: ActorInput, initial?: NewTaskInitialState): Promise<Task> {
+    // Not carried: a Lazy Teams relay authorizes each storage write by method and
+    // argument, and initial state would ride past that. A create with initial
+    // state is the daemon's `createTask` RPC, which writes it in one operation.
+    if (initial) {
+      throw new Error('RemoteStorage.createTask cannot carry initial task state; use the daemon\'s createTask RPC.');
+    }
     return this.call<Task>('createTask', { goal, parentTaskId, branchedFromSha, code, type, agentId, actor });
   }
 
@@ -146,8 +154,8 @@ export class RemoteStorage implements Storage {
     return this.call<Record<string, number>>('countDescendants', { taskIds });
   }
 
-  async updateTaskStatus(taskId: string, status: TaskStatus, actor?: ActorInput): Promise<void> {
-    await this.call('updateTaskStatus', { taskId, status, actor });
+  async updateTaskStatus(taskId: string, status: TaskStatus, actor?: ActorInput, reason?: string): Promise<void> {
+    await this.call('updateTaskStatus', { taskId, status, actor, ...(reason ? { reason } : {}) });
   }
 
   async updateTaskGoal(taskId: string, goal: string): Promise<void> {
@@ -386,6 +394,10 @@ export class RemoteStorage implements Storage {
 
   async markFeedbackConsumed(sessionId: string): Promise<void> {
     await this.call('markFeedbackConsumed', { sessionId });
+  }
+
+  async markFeedbackSubsumed(sessionId: string, turnIds: string[]): Promise<void> {
+    await this.call('markFeedbackSubsumed', { sessionId, turnIds });
   }
 
   // --- Commits ---
@@ -973,8 +985,8 @@ export class RemoteStorage implements Storage {
 
   // --- System messages (proactive system-to-human reports) ---
 
-  async createSystemMessage(input: SystemMessageInput): Promise<SystemMessage> {
-    return this.call<SystemMessage>('createSystemMessage', { input });
+  async createSystemMessage(input: SystemMessageInput, options?: { collapseRepeats?: boolean; refreshBody?: boolean }): Promise<SystemMessage> {
+    return this.call<SystemMessage>('createSystemMessage', { input, options });
   }
 
   async listSystemMessages(options?: { includeDismissed?: boolean }): Promise<SystemMessage[]> {
@@ -993,6 +1005,14 @@ export class RemoteStorage implements Storage {
     return this.call<SystemMessage>('dismissSystemMessage', { id, actor });
   }
 
+  async dismissSystemMessages(
+    filter: SystemMessageDismissFilter,
+    actor: Actor,
+    options?: { preview?: boolean },
+  ): Promise<SystemMessage[]> {
+    return this.call<SystemMessage[]>('dismissSystemMessages', { filter, actor, options });
+  }
+
   // --- Status History ---
 
   async getStatusHistory(taskId: string): Promise<StatusChange[]> {
@@ -1009,6 +1029,14 @@ export class RemoteStorage implements Storage {
     await this.call<void>('saveToolStats', { record });
   }
 
+  async getTurnLatency(taskId: string): Promise<TaskTurnLatency | null> {
+    return this.call<TaskTurnLatency | null>('getTurnLatency', { taskId });
+  }
+
+  async mergeOpenTurnLatency(taskId: string, delta: TurnLatencyRollup): Promise<void> {
+    await this.call<void>('mergeOpenTurnLatency', { taskId, delta });
+  }
+
   // --- Usage-limit readings ---
   //
   // Daemon-local by design: only the daemon's own recorder reads and writes
@@ -1021,6 +1049,10 @@ export class RemoteStorage implements Storage {
 
   async saveUsageLimitReading(_reading: StoredUsageLimitReading): Promise<void> {
     throw new Error(daemonLocalReadings('saveUsageLimitReading'));
+  }
+
+  async deleteUsageLimitReading(_credential: string): Promise<void> {
+    throw new Error(daemonLocalReadings('deleteUsageLimitReading'));
   }
 
   // --- Search ---

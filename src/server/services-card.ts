@@ -43,9 +43,10 @@ export interface ServicesCardControls extends ContainerControls {
   shellAvailable: boolean;
   /**
    * True when the dashboard can persist a designation (ServeActions port is
-   * wired). Without it the form is hidden — a button that 503s is noise.
+   * wired), so Configure services (Settings › Services) is offered. Without
+   * it the link is hidden — a form that 503s is noise.
    */
-  canDesignate: boolean;
+  canConfigure: boolean;
 }
 
 /** A serve state whose services have been through the liveness probe. */
@@ -95,10 +96,10 @@ export function servicesBodyHtml(
   serve: ProbedServeState,
   controls?: ServicesCardControls,
 ): string {
-  // Start services + designate ride every card state: starting the command
+  // Start services + Configure ride every card state: starting the command
   // only needs a shell (which brings the container up itself), and designating
-  // the project-wide command does not depend on ports being published.
-  const actions = `${startServicesHtml(controls)}${designateStartCmdHtml(controls)}`;
+  // the project-wide command (in Settings) does not depend on ports being published.
+  const actions = `${startServicesHtml(controls)}${configureServicesHtml(controls)}`;
 
   if (serve.declared.length === 0) {
     return `<p class="rv-hint">This task declares no services. Declare the ports it serves in ` +
@@ -192,45 +193,18 @@ function startServicesHtml(controls?: ServicesCardControls): string {
 }
 
 /**
- * Designate or change the project-wide Start services command.
- *
- * Empty state: the human types the command and saves it to the project's
- * store — never a per-task override, and never lazy.toml. Set state: the same
- * form pre-filled so they can change it. POST-only; the handler lives on
- * `/tasks/:id/services/start-cmd`. Hidden when the ServeActions port is absent
- * (a Storage-only dashboard cannot save it).
+ * Configure services — a link to Settings › Services, where the project-wide
+ * Start services command is designated. The task page never edits it: what
+ * every task runs is not a control on one task. Hidden when the ServeActions
+ * port is absent (a Storage-only dashboard cannot save it).
  */
-function designateStartCmdHtml(controls?: ServicesCardControls): string {
-  if (!controls?.canDesignate) return '';
-  const cmd = controls.startServicesCmd;
-  const hasCmd = cmd.length > 0;
-  const heading = hasCmd
-    ? 'Change the project-wide Start services command'
-    : 'Designate the project-wide command that Start services will run';
-  const hint = hasCmd
-    ? 'Saved for the whole project — not a per-task override.'
-    : 'This is the project-wide command Start services will run. It is saved for the ' +
-      'whole project, not a per-task override.';
-  const submit = hasCmd ? 'Save' : 'Save command';
-  return `<div class="svc-designate">` +
-    `<p class="svc-designate-head">${heading}</p>` +
-    `<p class="rv-hint">${hint}</p>` +
-    `<form method="POST" action="/tasks/${escapeHtml(controls.taskId)}/services/start-cmd" ` +
-    `class="svc-designate-form">` +
-    `<label class="svc-designate-label" for="svc-start-cmd-${escapeHtml(controls.taskId)}">Command</label>` +
-    `<input type="text" class="input" name="command" id="svc-start-cmd-${escapeHtml(controls.taskId)}" ` +
-    `value="${escapeHtml(cmd)}" placeholder="bin/dev" required autocomplete="off" spellcheck="false">` +
-    `<button type="submit" class="btn btn-sm">${submit}</button>` +
-    `</form>` +
-    // Clear is its own POST form (never a GET, never nested in the designate
-    // form), offered only when there is a command to clear.
-    (hasCmd
-      ? `<form method="POST" action="/tasks/${escapeHtml(controls.taskId)}/services/start-cmd/clear" ` +
-        `class="svc-designate-clear">` +
-        `<button type="submit" class="btn btn-sm">Clear command</button>` +
-        `</form>`
-      : '') +
-    `</div>`;
+function configureServicesHtml(controls?: ServicesCardControls): string {
+  if (!controls?.canConfigure) return '';
+  const hint = controls.startServicesCmd
+    ? ''
+    : `<p class="rv-hint">No Start services command is designated for this project yet.</p>`;
+  return `<div class="svc-configure">${hint}` +
+    `<a class="btn btn-sm" href="/settings/services" id="svc-configure">Configure services</a></div>`;
 }
 
 /**

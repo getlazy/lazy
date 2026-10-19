@@ -43,13 +43,9 @@ export function requireLazyRoot(): string {
  *
  * CLI-only wrapper around `resolveStorage()` — see `requireLazyRoot()`.
  *
- * The bound-clone announcement (design doc §4.7) is NOT here: it used to be,
- * but this is not where every remote-routed command actually goes — several
- * read commands (`list`, `blocked`, `active`, …) call
- * `src/daemon/rpc-fallback.ts`'s typed wrappers straight over `tryRpc`
- * instead and never touched it. It is printed once, centrally, in the
- * dispatcher (`src/index.ts`'s `resolveCloneBinding` call site), which every
- * command passes through regardless of which path it takes to the daemon.
+ * A bound clone prints no per-command `<install> — <project>` line (removed
+ * 2026-10-08: slowly-changing context, like a git remote); `lazy login` with
+ * no arguments reports the binding.
  */
 export async function requireStorage(): Promise<Storage> {
   try {
@@ -317,6 +313,10 @@ export function validateModel(value: string): string {
  * project's real list — not after a round trip.
  */
 export async function validateAgentProfileOrExit(root: string, value: string): Promise<void> {
+  // A bound clone's lazy.toml is the REPOSITORY's copy, not the configuration
+  // the Teams daemon runs on: judging the name here both refuses names Teams
+  // has and passes names it does not. The daemon judges every name it is sent.
+  if (await isBoundClone(root)) return;
   try {
     // agentProfileOrThrow, not profileForAgentName: `--agent ""` must be
     // rejected. Resolving the empty name to the default profile belongs to the
@@ -326,6 +326,37 @@ export async function validateAgentProfileOrExit(root: string, value: string): P
     console.error(err instanceof Error ? err.message : String(err));
     process.exit(1);
   }
+}
+
+/**
+ * Is this clone bound to a Lazy Teams install? Its lazy.toml is then the
+ * repository's copy — Teams imports it once and keeps its own configuration —
+ * so it must not decide agent names or defaults. Two logins count as bound;
+ * any other read failure does not (`refuseIfBoundClone`'s reasoning).
+ */
+export async function isBoundClone(cwd: string = process.cwd()): Promise<boolean> {
+  const root = findGitRoot(cwd);
+  if (!root) return false;
+  try {
+    return (await readTeamsLogin(root)) !== null;
+  } catch (err) {
+    return err instanceof MultipleTeamsLoginsError;
+  }
+}
+
+/**
+ * The agent a new task should be created with, as SENT to the daemon. In a
+ * bound clone the local lazy.toml is the repository's copy, so a choice it
+ * made (the default, [agent.by_type]) is not sent: undefined lets the daemon
+ * resolve it from its own configuration. Explicit and inherited choices are
+ * sent everywhere.
+ */
+export async function agentToSend(
+  resolution: { agentId: string; source: 'explicit' | 'inherit' | 'by_type' | 'default' },
+  cwd: string = process.cwd(),
+): Promise<string | undefined> {
+  if (resolution.source !== 'default' && resolution.source !== 'by_type') return resolution.agentId;
+  return (await isBoundClone(cwd)) ? undefined : resolution.agentId;
 }
 
 /**

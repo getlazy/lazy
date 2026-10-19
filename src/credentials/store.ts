@@ -56,8 +56,8 @@
  * the first time, and every report says `stale` for as long as it lasts.
  */
 
-import { mkdir, readFile, writeFile, chmod, unlink } from 'fs/promises';
-import { dirname } from 'path';
+import { readFile, unlink } from 'fs/promises';
+import { replaceCredentialFile, withCredentialFileLock } from './file-updates';
 import { logger } from '../utils/logger';
 import { getCredentialIndexPath } from '../daemon/paths';
 import { loadConfig } from '../config/loader';
@@ -242,12 +242,10 @@ export async function credentialPresence(
 
 async function writeIndex(projectRoot: string, entries: CredentialIndexEntry[]): Promise<void> {
   const path = getCredentialIndexPath(projectRoot);
-  await mkdir(dirname(path), { recursive: true });
   const file: CredentialIndexFile = { version: 1, credentials: entries };
   // No secret in here, but it still describes the shape of a user's setup —
   // same 0600 posture as everything else in the daemon dir.
-  await writeFile(path, JSON.stringify(file, null, 2) + '\n', { mode: 0o600 });
-  await chmod(path, 0o600);
+  await replaceCredentialFile(path, JSON.stringify(file, null, 2) + '\n');
 }
 
 /** Serialize a read-modify-write against the index. */
@@ -255,7 +253,10 @@ async function mutateIndex<T>(
   projectRoot: string,
   fn: (entries: CredentialIndexEntry[]) => Promise<T> | T,
 ): Promise<T> {
-  const run = writeChain.then(async () => fn(await readCredentialIndex(projectRoot)));
+  const run = writeChain.then(() => withCredentialFileLock(
+    getCredentialIndexPath(projectRoot),
+    async () => fn(await readCredentialIndex(projectRoot)),
+  ));
   writeChain = run.catch(() => {});
   return run;
 }
@@ -317,32 +318,32 @@ export async function setCredential(
   }
 
   const backend = await backendFor(projectRoot, selection);
-  await backend.set(projectRoot, input.provider, secret);
-
-  const readBack = await backend.get(projectRoot, input.provider);
-  if (readBack !== secret) {
-    // DO NOT LEAVE THE BAD VALUE BEHIND. Write-then-verify keeps the INDEX
-    // honest, but whatever the backend did accept is still sitting there — and
-    // a partial write is not inert: one truncated ChatGPT session outlived the
-    // command that wrote it and later 401'd every turn with "Unterminated
-    // string", because an index entry from an earlier, good write still pointed
-    // at it. Removing it turns that into the store's own loud "index says
-    // stored, backend has nothing" error, which names the remedy.
-    //
-    // Best-effort by design: the failure may be a locked keychain that accepted
-    // nothing, where this removes nothing and the throw below is the whole
-    // answer. A cleanup that cannot run must not replace the real error.
-    await backend.remove(projectRoot, input.provider).catch(() => {});
-    throw new Error(
-      `Stored the ${credentialLabel(input.provider)} credential in the ${backend.id} backend, but ` +
-      `reading it straight back ${readBack === null ? 'found nothing' : 'returned a different value'}. ` +
-      `The credential has NOT been recorded, because a daemon started against it would fail to ` +
-      `authenticate with no explanation. Try \`[credentials] backend = "file"\` in lazy.toml, or ` +
-      `keep using the ${envVarFor(input.provider, input.kind)} environment variable.`,
-    );
-  }
-
   return mutateIndex(projectRoot, async (entries) => {
+    await backend.set(projectRoot, input.provider, secret);
+
+    const readBack = await backend.get(projectRoot, input.provider);
+    if (readBack !== secret) {
+      // DO NOT LEAVE THE BAD VALUE BEHIND. Write-then-verify keeps the INDEX
+      // honest, but whatever the backend did accept is still sitting there — and
+      // a partial write is not inert: one truncated ChatGPT session outlived the
+      // command that wrote it and later 401'd every turn with "Unterminated
+      // string", because an index entry from an earlier, good write still pointed
+      // at it. Removing it turns that into the store's own loud "index says
+      // stored, backend has nothing" error, which names the remedy.
+      //
+      // Best-effort by design: the failure may be a locked keychain that accepted
+      // nothing, where this removes nothing and the throw below is the whole
+      // answer. A cleanup that cannot run must not replace the real error.
+      await backend.remove(projectRoot, input.provider).catch(() => {});
+      throw new Error(
+        `Stored the ${credentialLabel(input.provider)} credential in the ${backend.id} backend, but ` +
+        `reading it straight back ${readBack === null ? 'found nothing' : 'returned a different value'}. ` +
+        `The credential has NOT been recorded, because a daemon started against it would fail to ` +
+        `authenticate with no explanation. Try \`[credentials] backend = "file"\` in lazy.toml, or ` +
+        `keep using the ${envVarFor(input.provider, input.kind)} environment variable.`,
+      );
+    }
+
     const previous = entries.find((e) => e.provider === input.provider);
     const entry: CredentialIndexEntry = {
       provider: input.provider,
@@ -427,29 +428,31 @@ export async function purgeOrphanCredential(
   projectRoot: string,
   name: CredentialName,
 ): Promise<boolean> {
-  if (await credentialPresence(projectRoot, name)) return false;
-  try {
-    const backend = await backendFor(projectRoot);
-    return await backend.remove(projectRoot, name);
-  } catch {
-    // The backend is unavailable or the config will not load. Nothing is lost:
-    // an orphan costs a stale item, and the caller's real work has succeeded.
-    return false;
-  }
+  return mutateIndex(projectRoot, async (entries) => {
+    if (entries.some((entry) => entry.provider === name)) return false;
+    try {
+      const backend = await backendFor(projectRoot);
+      return await backend.remove(projectRoot, name);
+    } catch {
+      // The backend is unavailable or the config will not load. Nothing is lost:
+      // an orphan costs a stale item, and the caller's real work has succeeded.
+      return false;
+    }
+  });
 }
 
 /** Remove a provider's credential from both the backend and the index. */
 export async function deleteCredential(projectRoot: string, provider: CredentialName): Promise<boolean> {
-  const entry = await credentialPresence(projectRoot, provider);
-  if (!entry) return false;
-
-  // Remove the secret first. If the index write failed after the backend
-  // removal we would be left with a stale index entry, which reads as a loud
-  // error; the reverse order would leave an orphaned live secret nothing
-  // mentions, which is worse.
-  await backendById(entry.backend).remove(projectRoot, provider);
-
   return mutateIndex(projectRoot, async (entries) => {
+    const entry = entries.find((candidate) => candidate.provider === provider);
+    if (!entry) return false;
+
+    // Remove the secret first. If the index write failed after the backend
+    // removal we would be left with a stale index entry, which reads as a loud
+    // error; the reverse order would leave an orphaned live secret nothing
+    // mentions, which is worse.
+    await backendById(entry.backend).remove(projectRoot, provider);
+
     const remaining = entries.filter((e) => e.provider !== provider);
     if (remaining.length === 0) {
       // Leave no empty index behind — `lazy auth list` should describe a fresh

@@ -28,7 +28,7 @@ import { theme } from '../../render/theme';
  * now cannot reach a turn already running; the NEXT launch recreates the
  * container when the env changed (mustRecreateForTaskEnv), so it lands then. Saying so is the
  * difference between "lazy is broken" and "one more step" — see the
- * principle-of-least-surprise rule in CLAUDE.md.
+ * principle-of-least-surprise rule in AGENTS.md.
  */
 const LIVE_STATUSES = new Set(['working', 'queued']);
 

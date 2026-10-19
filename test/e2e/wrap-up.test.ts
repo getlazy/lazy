@@ -17,7 +17,7 @@ import { runMcpSession, type JsonRpcResponse } from '../helpers/mcp-session';
 import { seedFinal, markAgentLaunched } from '../helpers/final';
 
 /**
- * The wrap-up phase, with audience (docs/design/final-turn.md).
+ * The wrap-up phase, the same for every audience (docs/design/final-turn.md).
  *
  * Covered here:
  * - The PENCILS-DOWN chain runs once, on the turn that declared final, and not
@@ -30,15 +30,15 @@ import { seedFinal, markAgentLaunched } from '../helpers/final';
  *   supervisor comparison and is pinned at the executor seam
  *   (test/unit/wrap-up-executor-present.test.ts) and the plan that feeds it
  *   (test/unit/wrap-up-plan.test.ts).
- * - "An agent-audience task's wrap-up skips presentation and react (assert the
- *   supervised turns that did NOT happen)" — agent audience is reached the way
- *   production reaches it: an MCP session acting as a task's agent runs
- *   `lazy_create` + `lazy_start`, the only channel that records the launching
- *   actor 'agent' that `audienceOf` resolves.
+ * - An agent-created subtask runs the SAME wrap-up as any task — the user's
+ *   maintain rules and the leftovers check included (engineer, 2026-10-04).
+ *   Reached the way production reaches it: an MCP session acting as a task's
+ *   agent runs `lazy_create` + `lazy_start`, the channel that records the
+ *   launching actor 'agent'.
  * - "At a hub's final the steps run over the whole branch range, so an accepted
  *   child's content is covered there" (§4.2) — the maintained-file nudge fires
- *   at the HUB's final about work an accepted child wrote, after the child's
- *   own (agent-audience) final ran none of the steps.
+ *   at the HUB's final about work an accepted child wrote after its own
+ *   final had run.
  *
  * Deliberately NOT covered here:
  * - "The acceptance commands still gate the merge with no agent turn in
@@ -208,7 +208,7 @@ describe('the wrap-up chain runs once, on a final turn (mock seam)', () => {
   });
 });
 
-describe('the agent-audience wrap-up', () => {
+describe('an agent-created subtask\'s wrap-up', () => {
   let ctx: TestContext;
   let finalFlag: string;
 
@@ -219,7 +219,24 @@ describe('the agent-audience wrap-up', () => {
     // Existence of the file means "the running turn declared final", so the
     // suite controls the declaration by creating the file, not by re-enving a
     // long-lived daemon.
-    ctx = await setupTestLazy({ withDaemon: true, daemonEnv: { LAZY_MOCK_FINAL: finalFlag } });
+    // The agent commits work and leaves one file loose, so both the maintain
+    // rule and the leftovers check have something to act on.
+    ctx = await setupTestLazy({
+      withDaemon: true,
+      daemonEnv: {
+        LAZY_MOCK_FINAL: finalFlag,
+        LAZY_MOCK_SHOULD_COMMIT: '1',
+        LAZY_MOCK_LEAVE_UNCOMMITTED: 'notes.md',
+        LAZY_MOCK_LEFTOVERS_COMMIT: '1',
+      },
+    });
+    // A configured maintain rule the child's work never touches, so the rule
+    // has something to say if — and only if — the child's wrap-up runs it.
+    const configPath = join(ctx.root, 'lazy.toml');
+    writeFileSync(configPath, readFileSync(configPath, 'utf-8') +
+      '\n[[automation.maintain]]\ntitle = "changelog"\npattern = "CHANGELOG.md"\ninstructions = "Add a changelog line."\n');
+    ctx.git('add', 'lazy.toml');
+    ctx.git('commit', '-m', 'Enable maintained files');
   });
 
   afterEach(async () => {
@@ -227,15 +244,13 @@ describe('the agent-audience wrap-up', () => {
     await ctx.cleanup();
   });
 
-  // INVARIANT (final-turn design §13.3): audience is derived from the runner,
-  // by `audienceOf` and nothing else. A subtask an agent created and started
-  // (via the MCP channel, the only writer of the launching actor 'agent') is
-  // agent-audience: its wrap-up SKIPS presentation, react and maintain — and
-  // with the systemic check removed that leaves nothing, so the final costs
-  // the child no supervised invocation at all. Asserted through the supervised
-  // turns that did NOT happen, which is the spec's phrasing because an absent
-  // step writes no record of its own.
-  test('an agent-audience task runs no wrap-up steps', async () => {
+  // INVARIANT (engineer, 2026-10-04): every configured end-of-work rule runs
+  // for every task, whoever its audience is. A subtask an agent created and
+  // started is agent-audience, and its final still runs the user's maintain
+  // rules and the leftovers commit — the agent-only plan used to suppress
+  // both without telling anyone, and leftovers exists so nothing is left
+  // uncommitted.
+  test('an agent-created subtask runs the full wrap-up', async () => {
     // Parent: created and started by the CLI — a human action — so its launch
     // turn carries actor 'human'. It starts BEFORE the flag file exists, so
     // its own turn declares nothing.
@@ -248,15 +263,13 @@ describe('the agent-audience wrap-up', () => {
 
     const parentTurns = readTurns(ctx.root, parentShortId);
     expect(parentTurns.some(t => 'final' in t)).toBe(false);
-    // The parent is HUMAN-audience and parked, so it presented — the contrast
-    // the child draws below is that an agent-audience task presents on NEITHER
-    // ending, because nobody opens its walkthrough.
+    // The parent parked, so it presented.
     expect(parentTurns.some(t => (t.content as string).includes(PRESENT_MARKER))).toBe(true);
 
     // The production path to an agent-audience task: an MCP session acting as
     // the parent's agent creates a child and starts it. The creation changelog
     // entry and the child's launch turn both carry the channel actor 'agent',
-    // which is exactly what `audienceOf` resolves the plan from.
+    // which makes the child agent-audience — and it still gets the full plan.
     writeFileSync(finalFlag, '');
     const responses = await runMcpSession(ctx.root, parentFullId, parentWorktree, [
       { method: 'initialize', id: 1, params: {} },
@@ -293,27 +306,48 @@ describe('the agent-audience wrap-up', () => {
     expect(launchTurn).toBeDefined();
     expect(launchTurn!.actor).toBe('agent');
 
-    // The claim: declared, and audited as having run nothing.
+    // The claim: declared, and audited as having run the full chain.
     const claimed = claimedTurns(childTurns);
     expect(claimed.length).toBe(1);
     expect(claimed[0]!.final.actor).toBe('agent');
-    expect(claimed[0]!.final.wrap_up_steps).toEqual([]);
+    expect(claimed[0]!.final.wrap_up_steps).toContain('maintain');
+    expect(claimed[0]!.final.wrap_up_steps).toContain('commit_leftovers');
+    expect(claimed[0]!.final.wrap_up_steps).toContain('present');
 
-    // The turns that did NOT happen — no presentation, no react, no maintain:
-    // neither the supervisor-actored prompt turns nor the agent replies.
+    // The configured maintain rule actually reached the child's agent.
     const all = JSON.stringify(childTurns.map(t => t.content));
-    expect(all).not.toContain(PRESENT_HEADING);
-    expect(all).not.toContain(PRESENT_MARKER);
-    expect(all).not.toContain(REACT_HEADING);
-    expect(all).not.toContain('Mock react nudge');
-    expect(all).not.toContain(MAINTAIN_HEADING);
-    expect(all).not.toContain('Mock maintain nudge');
-
-    // No supervised turn of ANY kind: the agent plan is empty.
-    expect(childTurns.some(t => t.actor === 'supervisor')).toBe(false);
+    expect(all).toContain(MAINTAIN_HEADING);
 
     // The turn settled normally.
     expect(readTaskStatus(ctx.root, created.id)).toBe('blocked');
+  }, 120000);
+
+  // INVARIANT (engineer, 2026-10-04): a cluster's child is agent-audience —
+  // that is what defers its protected files to the cluster's accept — and its
+  // final still runs the user's maintain rules and the leftovers commit.
+  // Deferral is about WHO decides protected files, never about which
+  // configured rules run.
+  test('a cluster child runs the full wrap-up', async () => {
+    const createOut = async (args: string[]) => {
+      const r = await ctx.lazy(['create', ...args]);
+      expectSuccess(r);
+      return r.stdout.match(/Created task ([a-f0-9]{8})/)![1]!;
+    };
+    const clusterId = await createOut(['--goal', 'Cluster', '--prompt', 'Run the children', '--type', 'cluster']);
+    const childId = await createOut(['--goal', 'Cluster child', '--prompt', 'Child work', '--parent', clusterId]);
+    expectSuccess(await ctx.lazyMocked(['start', clusterId, '--yes'], MOCK_CLAUDE_SUCCESS));
+    expect((await ctx.lazy(['wait', clusterId])).exitCode).toBe(0);
+
+    writeFileSync(finalFlag, '');
+    expectSuccess(await ctx.lazyMocked(['start', childId, '--yes'], MOCK_CLAUDE_SUCCESS));
+    expect((await ctx.lazy(['wait', childId])).exitCode).toBe(0);
+
+    const childTurns = readTurns(ctx.root, childId);
+    const claimed = claimedTurns(childTurns);
+    expect(claimed.length).toBe(1);
+    expect(claimed[0]!.final.wrap_up_steps).toContain('maintain');
+    expect(claimed[0]!.final.wrap_up_steps).toContain('commit_leftovers');
+    expect(JSON.stringify(childTurns.map(t => t.content))).toContain(MAINTAIN_HEADING);
   }, 120000);
 });
 
@@ -371,21 +405,17 @@ describe('the hub\'s wrap-up covers accepted children\'s work', () => {
 
   // INVARIANT (final-turn design §4.2): the wrap-up steps at a hub's final run
   // over the hub's whole branch range (base_sha..HEAD), which contains every
-  // accepted child's squash — so a child's content is covered even though the
-  // child's own final ran none of the steps (agent-audience, §3.2). The
-  // negative half is what makes this the deferral rather than a copy: the
-  // child was never nudged, and the hub's nudge fired about work the child
-  // wrote.
+  // accepted child's squash — so a child's content is covered even when it
+  // landed after the child's own final ran its steps. The negative half: the
+  // child was never nudged about it, and the hub's nudge fired about work the
+  // child wrote.
   test('the maintained-file nudge at the hub\'s final fires about an accepted child\'s content', async () => {
     const parentShortId = await createTask(ctx, 'Hub', 'Parent work');
     expectSuccess(await ctx.lazyMocked(['start', parentShortId, '--yes'], MOCK_CLAUDE_SUCCESS));
     expect((await ctx.lazy(['wait', parentShortId])).exitCode).toBe(0);
 
-    // The production route to an agent-audience child: an MCP session acting
-    // as the hub's agent creates and starts it, which is the only channel that
-    // records the launching actor 'agent' that `audienceOf` reads. A CLI
-    // `lazy unblock` here would be a HUMAN launch and would flip the audience,
-    // which is the whole thing this test is about.
+    // The production route to an agent-created child: an MCP session acting
+    // as the hub's agent creates and starts it.
     const parentFullId = findFullTaskId(ctx.root, parentShortId);
     const parentWorktree = join(ctx.root, '.lazy', 'worktrees', parentShortId);
     writeFileSync(finalFlag, '');
@@ -414,10 +444,10 @@ describe('the hub\'s wrap-up covers accepted children\'s work', () => {
     expect(ctx.git('-C', childWorktree, 'add', 'src/feature.ts').exitCode).toBe(0);
     expect(ctx.git('-C', childWorktree, 'commit', '-m', 'Child adds the feature').exitCode).toBe(0);
 
-    // The child is agent-audience: its final runs no wrap-up steps at all.
+    // The child's own final ran before this commit existed, so its maintain
+    // pass had nothing to say about it — the content is only covered by the
+    // hub's pass over the whole branch.
     const childTurns = readTurns(ctx.root, childId);
-    const childClaim = declaredClaim(childTurns);
-    expect(childClaim.wrap_up_steps).toEqual([]);
     expect(JSON.stringify(childTurns.map(t => t.content))).not.toContain(MAINTAIN_HEADING);
 
     // Accepted into the hub — its squash is now on the hub's branch. The

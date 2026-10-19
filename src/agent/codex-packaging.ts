@@ -3,20 +3,29 @@
  *
  * The `codex` binary is a native (Rust, musl-static) executable. npm
  * `@openai/codex` exists but its bin stub is a node script (our images carry
- * bun, not node), so the container install pulls the pinned GitHub release
- * tarball directly — one static binary, no runtime dependency. Verified inside
- * lazy's container image context (Debian bookworm, aarch64) on 2026-09-03:
- * download, `--version`, `exec --json`, `login status` and `doctor` all work.
+ * bun, not node), so the container install pulls the latest GitHub release
+ * tarball directly — one static binary, no runtime dependency. Checked inside
+ * lazy's container image context (Debian bookworm, aarch64) on 2026-09-03
+ * with codex-cli 0.152.1: download, `--version`, `exec --json`, `login status`
+ * and `doctor` all worked. Codex is NOT pinned: installs take the latest
+ * release, like Claude Code and Cursor — but every asset is verified against
+ * the sha256 digest the same release publishes, and a missing digest fails.
  */
 
+import type { HealthCheck } from '../remote/driver';
 import type { AgentPackaging } from './interface';
 import { spawnSyncUnsupervised } from '../utils/spawn';
 
 /**
- * Pinned release. Bump deliberately, re-running the argv/event probes in the
- * add-codex-agent journal — the JSONL event contract is what lazy parses.
+ * Shell that sets `$tag` to the latest Codex release tag, resolved ONCE so
+ * both assets are downloaded from that one release (resolving per download via
+ * `releases/latest/download` could straddle a newly published release and
+ * install a mismatched pair). The redirect of `releases/latest` names the tag.
+ * No version constant is kept and there is no fallback: a failed lookup fails
+ * the install loudly.
  */
-export const CODEX_PINNED_VERSION = '0.152.1';
+const RESOLVE_LATEST_TAG =
+  `tag="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/openai/codex/releases/latest | sed 's|.*/||')"`;
 
 /**
  * Both binaries, because `codex` alone is not a working install — see
@@ -24,10 +33,17 @@ export const CODEX_PINNED_VERSION = '0.152.1';
  * code-mode host and why it cannot come from a different release.
  */
 export const CODEX_INSTALL_HINT =
-  `Install with: triple="$(uname -m | sed 's/^arm64$/aarch64/')-unknown-linux-musl"; ` +
-  `for bin in codex codex-code-mode-host; do ` +
-  `curl -fsSL "https://github.com/openai/codex/releases/download/rust-v${CODEX_PINNED_VERSION}/$bin-$triple.tar.gz" | tar -xz ` +
-  `&& mv "$bin-$triple" "$HOME/.local/bin/$bin"; done`;
+  `Install with (needs curl, jq, sha256sum; each asset is verified against the sha256 digest the release publishes): triple="$(uname -m | sed 's/^arm64$/aarch64/')-unknown-linux-musl"; ` +
+  `${RESOLVE_LATEST_TAG}; case "$tag" in rust-v*) ;; *) echo "could not resolve the latest codex release tag (got: '$tag')" >&2; false ;; esac && ` +
+  `json="$(curl -fsSL "https://api.github.com/repos/openai/codex/releases/tags/$tag")" && ` +
+  // A subshell, so a failed download or checksum EXITS non-zero: `|| break`
+  // left the loop with status 0 and the one-liner reported success.
+  `(for bin in codex codex-code-mode-host; do ` +
+  `asset="$bin-$triple.tar.gz"; ` +
+  `want="$(printf '%s' "$json" | jq -er --arg a "$asset" '.assets[] | select(.name == $a) | .digest | select(startswith("sha256:")) | ltrimstr("sha256:")')" && ` +
+  `curl -fsSL -o "/tmp/$asset" "https://github.com/openai/codex/releases/download/$tag/$asset" ` +
+  `&& echo "$want  /tmp/$asset" | sha256sum -c - && tar -xzf "/tmp/$asset" -C /tmp && rm "/tmp/$asset" ` +
+  `&& mv "/tmp/$bin-$triple" "$HOME/.local/bin/$bin" || exit 1; done)`;
 
 export class CodexPackaging implements AgentPackaging {
   readonly agentId = 'codex';
@@ -51,9 +67,9 @@ export class CodexPackaging implements AgentPackaging {
   }
 
   dockerInstallCommand(): string {
-    // Pinned, arch-resolved static binaries into the same non-root ~/.local/bin
+    // Latest-release, arch-resolved static binaries into the same non-root ~/.local/bin
     // layout the base image uses for Claude Code and Cursor. Each tarball
-    // contains a single file named <name>-<triple> (verified for 0.152.1).
+    // contains a single file named <name>-<triple> (checked on 0.152.1, 2026-09).
     //
     // TWO BINARIES, NOT ONE. `codex-code-mode-host` is a SEPARATE release asset
     // and is not optional: when the model the turn runs on declares `tool_mode
@@ -72,18 +88,27 @@ export class CodexPackaging implements AgentPackaging {
          *) echo "unsupported architecture for codex: $arch" >&2; exit 1 ;; \\
        esac \\
     && mkdir -p /home/user/.local/bin \\
+    && ${RESOLVE_LATEST_TAG} \\
+    && case "$tag" in rust-v*) ;; *) echo "could not resolve the latest codex release tag (got: '$tag')" >&2; exit 1 ;; esac \\
+    && json="$(curl -fsSL "https://api.github.com/repos/openai/codex/releases/tags/$tag")" \\
     && for bin in codex codex-code-mode-host; do \\
-         curl -fsSL "https://github.com/openai/codex/releases/download/rust-v${CODEX_PINNED_VERSION}/\${bin}-\${triple}.tar.gz" | tar -xz -C /home/user/.local/bin \\
+         asset="\${bin}-\${triple}.tar.gz"; \\
+         want="$(printf '%s' "$json" | jq -er --arg a "$asset" '.assets[] | select(.name == $a) | .digest | select(startswith("sha256:")) | ltrimstr("sha256:")')" || { echo "codex release $tag publishes no sha256 digest for $asset" >&2; exit 1; }; \\
+         curl -fsSL -o "/tmp/$asset" "https://github.com/openai/codex/releases/download/$tag/$asset" \\
+         && echo "$want  /tmp/$asset" | sha256sum -c - \\
+         && tar -xzf "/tmp/$asset" -C /home/user/.local/bin \\
+         && rm "/tmp/$asset" \\
          && mv "/home/user/.local/bin/\${bin}-\${triple}" "/home/user/.local/bin/\${bin}" \\
          || exit 1; \\
-       done`;
+       done \\
+    && mkdir -p /home/user/.local/share/lazy && echo "$tag" > /home/user/.local/share/lazy/codex-release-tag`;
   }
 
   generateDockerfile(): string {
     return `FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \\
-    git curl ca-certificates sudo \\
+    git curl jq ca-certificates sudo \\
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user with sudo — allows in-container tool installs
@@ -93,7 +118,7 @@ RUN useradd --create-home --shell /bin/bash user \\
 USER user
 ENV PATH="/home/user/.local/bin:\${PATH}"
 
-# Install the Codex CLI (pinned native binary) as \`user\`.
+# Install the Codex CLI (latest native binary) as \`user\`.
 ${this.dockerInstallCommand()}
 
 WORKDIR /work
@@ -117,8 +142,8 @@ WORKDIR /work
     ];
   }
 
-  diagnose(): { state: 'ok' | 'fail'; what: string; reason?: string }[] {
-    const results: { state: 'ok' | 'fail'; what: string; reason?: string }[] = [];
+  diagnose(): HealthCheck[] {
+    const results: HealthCheck[] = [];
     try {
       const version = spawnSyncUnsupervised(['codex', '--version'], {
         stdout: 'pipe',
@@ -131,6 +156,7 @@ WORKDIR /work
         return [{
           state: 'fail',
           what: 'Codex CLI installed',
+          problem: 'Codex CLI isn\'t installed',
           reason: `Codex CLI (codex) not found. ${CODEX_INSTALL_HINT}`,
         }];
       }
@@ -138,6 +164,7 @@ WORKDIR /work
       return [{
         state: 'fail',
         what: 'Codex CLI installed',
+        problem: 'Codex CLI isn\'t installed',
         reason: `Codex CLI (codex) not found. ${CODEX_INSTALL_HINT}`,
       }];
     }
@@ -161,6 +188,7 @@ WORKDIR /work
         results.push({
           state: 'fail',
           what: 'Codex code-mode host installed',
+          problem: 'Codex code-mode host is missing',
           reason:
             'codex-code-mode-host is not installed next to the codex binary. Models that run ' +
             'tools in code mode (the ChatGPT subscription default does) will reach the model ' +
@@ -171,12 +199,13 @@ WORKDIR /work
       results.push({
         state: 'fail',
         what: 'Codex code-mode host installed',
+        problem: 'Codex code-mode host is missing',
         reason: 'Could not check for codex-code-mode-host next to the codex binary.',
       });
     }
 
     // Auth state: `codex login status` prints "Logged in using …" (exit 0) or
-    // "Not logged in" (exit 1) — verified against 0.152.1. Informational —
+    // "Not logged in" (exit 1) — checked on 0.152.1. Informational —
     // OPENAI_API_KEY (or a stored `lazy system agent set-key codex` key) is
     // resolved at launch, so an un-logged-in CLI is a warning-shaped fail.
     try {
@@ -193,6 +222,7 @@ WORKDIR /work
         results.push({
           state: 'fail',
           what: 'Codex CLI authenticated',
+          problem: 'Codex CLI isn\'t logged in',
           reason: 'Not logged in. Run `lazy system agent set-key codex` (or `codex login` for host runs).',
         });
       }
@@ -200,6 +230,7 @@ WORKDIR /work
       results.push({
         state: 'fail',
         what: 'Codex CLI authenticated',
+        problem: 'Codex CLI isn\'t logged in',
         reason: 'Could not run `codex login status`. Run `lazy system agent set-key codex` or `codex login`.',
       });
     }

@@ -8,7 +8,7 @@
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { join } from 'path';
-import { chmod, mkdir, readFile, writeFile } from 'fs/promises';
+import { chmod, mkdir, readFile, rm, writeFile } from 'fs/promises';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
@@ -153,6 +153,10 @@ describe('lazy shell --container', () => {
   // not a real `docker run`.)
   test('--restart relaunches a container that is already running, loudly', async () => {
     const taskId = await startedTask('Restart');
+    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
+    const dirtyFile = join(worktreePath, 'uncommitted-recovery.txt');
+    await writeFile(dirtyFile, 'keep my changes\n');
+    const originalPointer = await readFile(join(worktreePath, '.git'), 'utf8');
     await writeFile(join(stateDir, 'running'), '');
 
     const plain = await shell([taskId, '--', 'echo', 'hi']);
@@ -162,6 +166,24 @@ describe('lazy shell --container', () => {
     const restarted = await shell([taskId, '--restart', '--', 'echo', 'hi']);
     expectSuccess(restarted);
     expectOutput(restarted, 'Recreating container');
+    expect(await readFile(dirtyFile, 'utf8')).toBe('keep my changes\n');
+    expect(await readFile(join(worktreePath, '.git'), 'utf8')).toBe(originalPointer);
+  });
+
+  test('a missing checkout recreates a running shell environment rather than only restoring host files', async () => {
+    const taskId = await startedTask('Deleted shell checkout');
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
+    await rm(worktreePath, { recursive: true });
+    await writeFile(join(stateDir, 'running'), '');
+    const result = await shell([taskId, '--', 'echo', 'restored']);
+    expectSuccess(result);
+    expectOutput(result, 'Recreating container');
+    expectOutput(result, 'Started');
+    expect(await readFile(join(worktreePath, '.git'), 'utf8')).toContain('gitdir:');
+    const execs = (await invocations()).filter(invocation => invocation.startsWith('exec '));
+    expect(execs).toHaveLength(1);
+    expect(execs[0]).toContain('echo restored');
   });
 
   test('--restart with --host is refused', async () => {

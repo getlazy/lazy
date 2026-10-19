@@ -70,6 +70,8 @@ export async function runReviewVerdictReask(
   effort?: string,
   /** Host OS-sandbox `--settings` (and any other argv) — same path the review itself uses. */
   extraArgs?: string[],
+  /** The runner isolates the agent (a task container) — see Agent.buildExecArgs. */
+  externallySandboxed?: boolean,
 ): Promise<ReviewReaskResult> {
   const prompt = reaskTemplate;
 
@@ -97,6 +99,7 @@ export async function runReviewVerdictReask(
     // rather than rarely. Asserted on the argv in
     // test/unit/review-reask-argv.test.ts so a future edit cannot drop it.
     permissionMode: 'plan',
+    externallySandboxed,
   });
 
   let stdout: string;

@@ -2,19 +2,18 @@
 
 `lazy` is an asynchronous agentic orchestrator built, first and foremost, to optimize human productivity when working with coding agents. It takes over the low-level work (managing agents, their lifetimes and permissions, git, reviews) so you work with tasks, decisions and policies, not agent micromanagement and branch manipulation.
 
-- **One way to run every agent.** Claude Code, Codex, Cursor and Pi run the same way: in their own containers, with limited write access to the repo, sharing the same
-limitations, prompts, memories, tool access in order to achive normalized output.
+- **One way to run every agent.** Claude Code, Codex, Cursor and Pi run the same way: in their own containers, with limited write access to the repo, sharing the same limitations, prompts, memories, tool access in order to achieve normalized output.
 - **Deterministic code harnessing nondeterministic agents.** Lifecycle, merges and gates are ordinary code; agents do their work in isolation, strictly bounded on both semantic and system access levels, by the deterministic code.
 - **Tasks are units of work.** Each task goes through work → review → accept/reject cycle, and is reviewed and accepted by you or a parent agent, with agents adapting their behavior according to the audience. The tasks can be organized in human-to-agent and agent-to-agent hierarchies (with interactive builders or automated clusters of tasks) but none of that is required and you can just work with a flat list of tasks.
 - **Everything is captured.** Every human-to-agent and agent-to-agent interaction (be it prompt, review, question, response, etc) is captured and stored in a searchable store you control, which you and your agents can both read.
-- **Cost-aware.** `lazy` tracks token usage for agents that report it, and can pause work and schedule it to match.
+- **Cost-aware.** `lazy` tracks token usage for agents that report it, and can pause work and schedule it to match. It also tracks endpoint latencies and performance which can help you answer questions about different providers.
 
 ## What are the main benefits
 
-* Prolonged autonomous horizon for agents (hours not tens of minutes)
-* Autonomous, concurrent, asynchronous (turn based) work across many tasks
-* Increased agent situational awareness (agents can search over all past tasks and prompts)
-* Mix and match hierarchies of different agents and different models working seamlessly.
+* Prolonged autonomous horizon for agents.
+* Autonomous, concurrent, asynchronous (turn based) work across many tasks.
+* Increased agent situational awareness as agents can search over all past tasks and prompts.
+* Mix and match hierarchies of different agents and different models working seamlessly together.
 
 ## Quick Start
 
@@ -33,6 +32,11 @@ lazy init
 # Launch the agent in interactive mode with an additional lazy's system prompt
 # and tell it what tasks to create and start.
 lazy builder # Ask it "what can you do?"
+
+# Open lazy's dashboard where you can interact with task agents, unblocking them,
+# asking them questions and replying to their raised issues, reviewing the work
+# done, testing the services directly through lazy and so on.
+lazy dashboard # This will open your browser
 
 # To review all the prompts that `lazy` uses run `lazy system prompts`
 # To view the content of individual prompts use `lazy show <prompt-code>`
@@ -159,13 +163,13 @@ See above. Plus building `lazy` is fun, building with `lazy` is fun and building
 
 ### What is `lazy` particularly good at compared to native coding agents?
 
-From the point of view of the quality of one-shot code or similar - nothing whatsoever. `lazy` runs the very same agents (Claude Code, Codex, Cursor, Pi and in the future others) so it can't write better code than they do *but* what it can do and does is provide these agents with better situational awarness of prior art, tasks that have tried the same and been rejected, tasks that are in backlog and may have to be planned for and so on. Once you see this flywheel operating, you cannot unsee it - agents just habitually refer to prior or pending or even concurrent work. I believe this makes for a faster, more autonomous development with agents (but to prove would require experiments that I have not yet undertaken). There is a hypothesis that training data scaling is currently accounting for more improvements to model performance than model architecture improvements. Lazy is providing more data in the context and on-demand to the agents doing the work and my (biased) feeling is that it shows.
+From the point of view of the quality of one-shot code or similar - nothing whatsoever. `lazy` runs the very same agents (Claude Code, Codex, Cursor, Pi and in the future others) so it can't write better code than they do *but* what it can do and does is provide these agents with better situational awareness of prior art, tasks that have tried the same and been rejected, tasks that are in backlog and may have to be planned for and so on. Once you see this flywheel operating, you cannot unsee it - agents just habitually refer to prior or pending or even concurrent work. I believe this makes for a faster, more autonomous development with agents (but to prove would require experiments that I have not yet undertaken). There is a hypothesis that training data scaling is currently accounting for more improvements to model performance than model architecture improvements. Lazy is providing more data in the context and on-demand to the agents doing the work and my (biased) feeling is that it shows.
 
 From the point of view of experience of software development, where e.g. Claude Code aptly leverages subagents to launch work in the background, `lazy` uses its task -> subtask system to do the same. `lazy` plans the work and fires off tasks and then gives *you* the control to do something else while the task or tasks are running. No more reams of code flying by, no more frantic ESC ESC ESC because "the agent took the wrong turn" - maybe it did, maybe it didn't, and you will find that out when the turn finishes. The difference, to me, is similar to the difference between real-time strategy games, where your reflexes dominate the outcome, to turn-based strategy games, where you asynchronously plan and make your moves and then let the opponent take its turn. To me, it is liberating to review after the agent's turn, instead of micromanaging it through every spot.
 
 On top of that, `lazy` does a lot of little "quality of life" things that are otherwise annoying with agents and that help keep them on track:
 
-* Before agent's turn `lazy` inject goals of the task into the prompt, in order to avoid goal drift and stabilize the agent's output.
+* Before agent's turn `lazy` injects goals of the task into the prompt, in order to avoid goal drift and stabilize the agent's output.
 * `lazy sync` merges the task's origin branch and the parent task's branch (e.g. main) into the task so that the differences are never too large, and the daemon syncs a task on its own when work lands upstream. Conflicts are resolved by the agentic turns with a specially crafted prompt.
 * After agent's turn `lazy` checks agent's work for file permission violations in order to make potential reward hacking (e.g. deleting tests it doesn't "like") obvious and rejectable by default.
 * `lazy` automatically gives agents turns to react when something has changed (e.g. create screenshots when touching UI) or when something *hasn't* been changed (e.g. agent didn't update CHANGELOG.md)
@@ -395,13 +399,13 @@ In `builder` mode, the assistant is prevented from doing anything directly on th
 * There is no `lazy` CLI in the container and even if it were to install one, all operations still have to go through the same external daemon.
 * All requests to model provider go through `lazy` proxy.
 
-Thus builder is lock down so that it can *only* launch tasks, direct them, etc. and finally also accept but limited to non-protected tasks and branches (see [task/branch protection](#protected-branches-and-tasks)). Such hard-lockdown posture is also why `builder` we consider safe to run builders in **autonomous mode by default** — no per-tool permission prompts. Each autonomous launch prints that posture and asks you to type `yes`; `--yes` skips the confirmation, and `lazy builder --no-autonomous` opts back into Claude Code's normal permission prompts.
+Thus builder is locked down so that it can *only* launch tasks, direct them, etc. and finally also accept but limited to non-protected tasks and branches (see [task/branch protection](#protected-branches-and-tasks)). Such hard-lockdown posture is also why `builder` we consider safe to run builders in **autonomous mode by default** — no per-tool permission prompts. Each autonomous launch prints that posture and asks you to type `yes`; `--yes` skips the confirmation, and `lazy builder --no-autonomous` opts back into Claude Code's normal permission prompts.
 
 Builder does get one writable place — `~/.lazy/scratch/<project>/`, outside the repo entirely — for artifacts meant for *you*: a long accept message, a draft doc, a data dump. It can never be committed and no agent can read it. See [public-docs/builder-scratch-dir.md](public-docs/builder-scratch-dir.md).
 
 The user <-> `builder` <-> agent relationship follows a clear division of labor:
 
-- The **user** sets direction and make decisions, plan larger work ("release so and so will have features this and that")
+- The **user** sets direction and makes decisions, plans larger work ("release so and so will have features this and that")
 - The **`builder`** helps scope work and manage tasks with goals and prompts, and preliminary or full feedback to the agents
 - The **agents** write code
 
@@ -470,7 +474,7 @@ blocked    ──→ working ──→ blocked ──→ ... ──→ complete
 (feedback)     (agent)     (review)            (merged)
 ```
 
-And of course - you can do [review](#review) or you can work with [`builder`](#builder) on it.
+And of course - you can do [review](#review) or you can work with [`builder`](#lazy-builder) on it.
 
 #### Per-task environment variables
 
@@ -496,8 +500,8 @@ api = 8080
 
 ```bash
 lazy shell my-task              # a shell where the agent works; start the server
-lazy url my-task                 # web  http://web.my-task.lazy.localhost:<port>
-                                 # api  http://api.my-task.lazy.localhost:<port>
+lazy url my-task                 # web  http://my-task.web.lazy.localhost:<port>
+                                 # api  http://my-task.api.lazy.localhost:<port>
 open "$(lazy url my-task web)"
 ```
 
@@ -655,7 +659,7 @@ An example of the output can be found [here](public-docs/lazy-report-example-202
 
 ### Protected branches and tasks
 
-Sometimes it happens that [builder](#builder) will go against the intended, but maybe not clearly stated, limits and accept tasks into their parent tasks or other branches when it should not do so. `lazy protect` exists to prevent this by forcing humans to approve tasks. To enable branch protection you have to:
+Sometimes it happens that [builder](#lazy-builder) will go against the intended, but maybe not clearly stated, limits and accept tasks into their parent tasks or other branches when it should not do so. `lazy protect` exists to prevent this by forcing humans to approve tasks. To enable branch protection you have to:
 
 ```bash
 # Updates lazy.toml to capture the protection repository wide.
@@ -681,7 +685,7 @@ lazy system passphrase set
 # Glob patterns for files agents are NOT allowed to delete or modify.
 # They are allowed to *add* into existing files *and* matching globs.
 # Violations are detected after each agent turn and flagged for review.
-# Example: protected = ["*.test.ts", "*.spec.ts", "src/core/**", "CLAUDE.md"]
+# Example: protected = ["*.test.ts", "*.spec.ts", "src/core/**", "AGENTS.md"]
 protected = ["README.md", "test/**/*.ts"]
 ```
 
@@ -689,7 +693,7 @@ When agents do happen to insist that the files have to be changed due to the nat
 
 ### Maintained Files
 
-The counterpart to protected files are maintained files - files that we *want* task agents to always updated if there is a need. Examples are changelogs, documentation, maybe some kind of maintained registry of modules and so on. To use this feature, you have to update your `lazy.toml` in the following manner (example from `lazy`'s config):
+The counterpart to protected files are maintained files - files that we *want* task agents to always update if there is a need. Examples are changelogs, documentation, maybe some kind of maintained registry of modules and so on. To use this feature, you have to update your `lazy.toml` in the following manner (example from `lazy`'s config):
 
 ```
 [automation]
@@ -712,7 +716,7 @@ This feature is more mature than protected files and it allows you to specify th
 
 ### Mounts
 
-Sometimes there is a tug of war between the host OS and container OS and compiled files need to be constantly refreshed because they cannot be cleanly separated (looking at you `node_modules` - Rust on the other hand is easy). In those cases, an easy fix is to create a separate mounts on the host so that container can keep its files separately from the host's files. For example, the fix to shadow `node_modules` would be something like this:
+Sometimes there is a tug of war between the host OS and container OS and compiled files need to be constantly refreshed because they cannot be cleanly separated (looking at you `node_modules` - Rust on the other hand is easy). In those cases, an easy fix is to create separate mounts on the host so that container can keep its files separately from the host's files. For example, the fix to shadow `node_modules` would be something like this:
 
 ```
 [[mounts]]
@@ -797,7 +801,7 @@ Supervisor: phase=work (12s)
 
 ### Correcting the Course
 
-Other times I will want to correct the course of a that was maybe started by chance or that is not going where it should go:
+Other times I will want to correct the course of a task that was maybe started by chance or that is not going where it should go:
 
 ```bash
 lazy stop <task-id>
@@ -838,7 +842,7 @@ A broader point to be made here is that humans and agents require different UI b
 
 There are four levels of "tell me twice":
 
-* `none`: `lazy` does not requires confirmation
+* `none`: `lazy` does not require confirmation
 * `light`: `builder` is reminded of the effect of the changes but nothing else
 * `standard`: `builder` is told what it needs to do before accepting the diff
 * `stern`: `builder` is told, in sterner terms, to perform the review and "reflect" before accepting the diff
@@ -865,7 +869,7 @@ The daemon also syncs tasks on its own when work is accepted into their parent; 
 
 After every agent's turn, `lazy` will check if the agent has tried to change or delete files from the areas that are prohibited for it to touch. For me, there are two areas that I don't want agents just screwing around: this `README.md` and the tests. I got tired of agents, not only `lazy` agents but in general, "fixing" the issues by deleting or unnecessarily modifying tests. So now `lazy` is enforcing the rules, not through begging and cajoling in prompts but with a deterministic process.
 
-That said, many times changes to say tests are really are needed, so `lazy` doesn't outright prohibit the changes but rather detects the violations and exposes them to you and `lazy builder` agent. Then it is up to the reviewer, whatever it may be, to *explicitly* approve changes to files at `lazy accept`. If they are not wanted, reject them in the web review and `lazy` will put them back, or send the task back with feedback.
+That said, many times changes to say tests really are needed, so `lazy` doesn't outright prohibit the changes but rather detects the violations and exposes them to you and `lazy builder` agent. Then it is up to the reviewer, whatever it may be, to *explicitly* approve changes to files at `lazy accept`. If they are not wanted, reject them in the web review and `lazy` will put them back, or send the task back with feedback.
 
 ### Head of Line Blocking
 
@@ -940,13 +944,13 @@ If you have an interactive `lazy builder` session open (docker/podman), `lazy up
 
 #### Non-disruptive image refresh
 
-When a new Claude Code or Cursor version ships and you only want **future** sessions to pick it up — without interrupting anything currently running — use:
+When a new Claude Code, Cursor or Codex version ships and you only want **future** sessions to pick it up — without interrupting anything currently running — use:
 
 ```bash
 lazy upgrade --images
 ```
 
-This rebuilds only the project's container image, with `--no-cache` so the newly-released Claude Code and Cursor CLI (installed inside the image) are actually re-fetched. Codex and Pi are pinned to the versions `lazy` was tested with and move only with `lazy` itself. It stops nothing, does not rebuild the agent binary, and does not restart the daemon, so running builders and agents keep working uninterrupted. Because a Docker container holds its image by ID once launched, only **newly-created** containers use the refreshed image:
+This rebuilds only the project's container image, with `--no-cache` so the newly-released Claude Code, Cursor and Codex CLIs (installed inside the image) are actually re-fetched. Pi is pinned to the version `lazy` was tested with and moves only with `lazy` itself. It stops nothing, does not rebuild the agent binary, and does not restart the daemon, so running builders and agents keep working uninterrupted. Because a Docker container holds its image by ID once launched, only **newly-created** containers use the refreshed image:
 
 - **New tasks**, and **interrupted tasks** that then auto-resume — immediately (their container is created fresh).
 - **Running builders** — on their next relaunch (a live builder keeps its image).
@@ -1047,9 +1051,9 @@ missing, Docker assumes the name is a Docker Hub repository and reports
 `pull access denied, repository does not exist`.
 
 Normally you never see this: when your `Dockerfile.lazy` starts with
-`FROM lazy-runner` and the base image is absent, lazy builds the base first and
-says so ("Base image lazy-runner:latest not found — building it first..."). You
-can still prebuild it yourself:
+`FROM lazy-runner` and the base image is absent, lazy pulls the base that your
+release published (`ghcr.io/getlazy/lazy-runner`), or builds it when there is
+nothing to pull, and says so. You can still build it yourself:
 
 ```bash
 lazy system build lazy-runner
@@ -1058,21 +1062,22 @@ lazy system build lazy-runner
 This bypasses the current project's `lazy.toml` and builds the base image
 directly. Add `--no-cache` to force a clean rebuild.
 
-Two `FROM` spellings lazy cannot build for you, because building would not
-produce the image you asked for — for these, run the command above yourself:
+Two `FROM` spellings lazy cannot supply for you:
 
-- a base pinned to an older tag, e.g. `FROM lazy-runner:0.19` (a base build only
-  ever writes the current `major.minor` tag and the `:latest` alias)
-- an agent-suffixed image, e.g. `FROM lazy-runner-cursor` — these are lazy's own
-  per-agent images and are not meant as a `FROM` target; use `FROM lazy-runner`
-  and add the agent's install line yourself
+- a base pinned to an older tag, e.g. `FROM lazy-runner:0.19` (lazy only ever
+  writes the current `major.minor` tag and the `:latest` alias)
+- an agent-suffixed image, e.g. `FROM lazy-runner-cursor`. Per-agent images are
+  no longer produced, because `lazy-runner` carries every agent CLI. Use
+  `FROM lazy-runner`.
 
 ### Runner images are tagged with the lazy release version
 
 Every image lazy builds is tagged with `lazy`'s <major>.<minor> release version,
-e.g. `lazy-runner:0.91`, not `lazy-runner:latest`. You can always rebuild the image
+e.g. `lazy-runner:0.92`, not `lazy-runner:latest`. You can always rebuild the image
 with `lazy upgrade` but even if you don't, `lazy` will automatically rebuild it every 14
-days or when it notices a change in `Dockerfile.lazy`.
+days or when it notices a change in `Dockerfile.lazy`. The default image is the exception:
+it is pulled from the release (`ghcr.io/getlazy/lazy-runner`), keeps the agent CLIs it was
+pulled with, and is refreshed by upgrading lazy.
 
 Older images stay on disk as build cache and for older `lazy` versions on the same host.
 `lazy doctor` lists them with their sizes and the `docker image rm` command to reclaim

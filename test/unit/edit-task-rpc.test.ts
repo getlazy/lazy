@@ -1,6 +1,7 @@
 /**
  * INVARIANT: `editTask` RPC enforces the same edit rules as `lazy edit` —
- * locked fields (goal/prompt/type/code/parent) refuse once a task has turns;
+ * locked fields (goal/prompt/type/parent) refuse once a task has turns; a code
+ * change on its own is a cosmetic rename and is allowed;
  * model/effort/agent may change on a started task.
  */
 

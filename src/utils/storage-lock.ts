@@ -24,7 +24,7 @@
  * how an acknowledged `lazy edit --prompt` was reported as saved (both
  * task.json and prompt-history.json were written) and then silently rolled
  * back by a concurrent `lazy start` whose own writes were built from a
- * pre-edit snapshot of the directory. See CLAUDE.md, "Never Lose Human
+ * pre-edit snapshot of the directory. See AGENTS.md, "Never Lose Human
  * Feedback": an acknowledged edit must be durable.
  *
  * The raw `acquire()`/`release()` pair keeps the older process-wide depth
@@ -37,9 +37,13 @@ import { existsSync, readFileSync, writeFileSync, unlinkSync, renameSync, openSy
 import { join, dirname } from 'path';
 import { getDataDir } from '../project-paths';
 import { logger } from './logger';
+import { shellQuote } from './shell-quote';
 import {
   checkHolder,
+  isVmGuest,
+  judgeHolderNamespace,
   isZombieState,
+  processNamespaceId,
   looksLikeLazyProcess,
   readProcessIdentity,
   selfIdentity,
@@ -52,6 +56,31 @@ const LOCK_FILENAME = '.storage-lock';
 /** Name of the lock file inside a store directory, for callers that only
  *  want to LOOK at it (doctor) rather than take it. */
 export const STORAGE_LOCK_FILENAME = LOCK_FILENAME;
+
+/**
+ * A store restore's marker, in the store's root beside the lock
+ * (src/storage/store-backup.ts writes it). While it exists the store is being
+ * swapped, or was left half swapped, and nothing but the restore itself may
+ * take the lock — see StorageLockOptions.restoreMarker.
+ */
+export const RESTORE_MARKER_FILENAME = '.restore-in-progress';
+
+/**
+ * The store's lock was asked for while a restore's marker is in the store.
+ * Thrown, never retried, and thrown BEFORE the lock file is touched — a lock
+ * held by the restore (possibly from another pid namespace, where it would
+ * otherwise look stale) is left exactly as it is.
+ */
+export class StoreRestoreInProgressError extends Error {
+  constructor(readonly markerPath: string) {
+    super(
+      `a store restore owns this store (${markerPath} exists), so lazy will not open it: the restore is running, ` +
+        `or it was interrupted and the store may be half swapped. Wait for it to finish, or run the restore again ` +
+        `to finish it; \`lazy daemon start\` names where the old store and the restored copy are.`,
+    );
+    this.name = 'StoreRestoreInProgressError';
+  }
+}
 
 /** Maximum number of attempts to acquire the lock */
 const MAX_ATTEMPTS = 50;
@@ -74,6 +103,34 @@ interface StorageLockFile {
   holder_started_at?: string;
   holder_start_source?: StartTimeSource;
   holder_command?: string;
+  /**
+   * The holder's pid namespace (processNamespaceId): its pid is only
+   * meaningful there. Optional for the same reason as the fields above.
+   */
+  holder_namespace?: string;
+  /** The holder was a Lazy Teams project's machine (isVmGuest) — the one holder another kernel may see alive. */
+  holder_guest?: boolean;
+}
+
+/**
+ * The lock is held by a process in ANOTHER pid namespace — a Lazy Teams
+ * project's machine seen from the host, a container seen from outside, or a
+ * process on another OS kernel (a macOS host daemon seen from a Linux container
+ * sharing its store, or the reverse) — so
+ * whether it is still running cannot be told from here. Thrown, never
+ * retried, by a lock opened with `foreignHolder: 'refuse'`.
+ */
+export class UnjudgeableStorageLockError extends Error {
+  constructor(readonly lockPath: string, readonly holderPid: number, readonly holderNamespace: string) {
+    super(
+      `the storage lock ${lockPath} was taken by pid ${holderPid} in another machine or pid namespace ` +
+        `(${holderNamespace}), so lazy here cannot tell whether that process is still running. ` +
+        `Stop the project first — on Lazy Teams stop it from its page, so its machine's daemon exits; ` +
+        `otherwise \`lazy daemon stop\` where it runs. If it is stopped and the lock is still there, its ` +
+        `holder died without releasing it — remove the lock and try again:\n\n  rm ${shellQuote(lockPath)}\n`,
+    );
+    this.name = 'UnjudgeableStorageLockError';
+  }
 }
 
 // Re-exported so existing callers and tests keep their import site. The zombie
@@ -358,6 +415,24 @@ export interface StorageLockOptions {
    * ordinary contention into spurious failures.
    */
   acquireTimeoutMs?: number;
+  /**
+   * What to do with a lock whose holder lives in another pid namespace
+   * (`holder_namespace` differs from ours). Default `judge`: judge its pid
+   * here as always (a daemon in a project's machine must not wedge on a lock
+   * the host left). `refuse`: throw UnjudgeableStorageLockError at once —
+   * for tools that are about to move the whole store (restore, backup), where
+   * reclaiming a live guest daemon's lock would pull the store out from under it.
+   */
+  foreignHolder?: 'judge' | 'refuse';
+  /**
+   * `refuse` (default): while a restore's marker is in the store, refuse to
+   * take the lock (StoreRestoreInProgressError) — checked before the lock file
+   * is created or reclaimed, and again once it is held, so neither a restore
+   * that started first nor one that started in between is raced. Every
+   * opener of a store goes through here, which is what makes it the one
+   * check that cannot be bypassed. `ignore`: the restore's own lock.
+   */
+  restoreMarker?: 'refuse' | 'ignore';
 }
 
 /**
@@ -368,7 +443,19 @@ export interface StorageLockOptions {
  */
 export class StorageLock {
   private readonly lockPath: string;
+
+  /** Where the lock file lives — for diagnostics that name its holder. */
+  get path(): string {
+    return this.lockPath;
+  }
+
+  /** Does this instance hold the lock right now (at any depth)? */
+  get held(): boolean {
+    return this.depth > 0;
+  }
   private readonly acquireTimeoutMs: number | undefined;
+  private readonly foreignHolder: 'judge' | 'refuse';
+  private readonly restoreMarker: 'refuse' | 'ignore';
   private depth: number = 0;
 
   /**
@@ -411,6 +498,8 @@ export class StorageLock {
       ? join(lockDir, LOCK_FILENAME)
       : join(lazyRoot, getDataDir(lazyRoot), LOCK_FILENAME);
     this.acquireTimeoutMs = options?.acquireTimeoutMs;
+    this.foreignHolder = options?.foreignHolder ?? 'judge';
+    this.restoreMarker = options?.restoreMarker ?? 'refuse';
   }
 
   /**
@@ -441,6 +530,12 @@ export class StorageLock {
           StorageLock.inProcessHolders.set(this.lockPath, holders);
         }
         holders.add(this);
+        // A restore whose marker appeared between the check in tryAcquire and
+        // the create: give back what we just took (ours alone) and refuse.
+        if (this.restoreMarkerPresent()) {
+          this.release();
+          throw new StoreRestoreInProgressError(join(dirname(this.lockPath), RESTORE_MARKER_FILENAME));
+        }
         return;
       }
       const exhausted = deadline === null ? attempts >= MAX_ATTEMPTS : Date.now() >= deadline;
@@ -570,6 +665,11 @@ export class StorageLock {
    * Uses O_EXCL for atomic create-or-fail to prevent TOCTOU races where
    * two processes both see "no lock file" and both write their own.
    */
+  /** Is a restore's marker in this lock's store? Sync like the rest of this file's lock-file I/O: one stat. */
+  private restoreMarkerPresent(): boolean {
+    return this.restoreMarker === 'refuse' && existsSync(join(dirname(this.lockPath), RESTORE_MARKER_FILENAME));
+  }
+
   private async tryAcquire(): Promise<boolean> {
     // Precondition: lock directory must exist
     const lockDir = dirname(this.lockPath);
@@ -579,9 +679,17 @@ export class StorageLock {
       );
     }
 
+    // Before anything creates, reclaims or even judges the lock file: a lock a
+    // restore holds may name a pid from another namespace, which the default
+    // `judge` would take for stale.
+    if (this.restoreMarkerPresent()) {
+      throw new StoreRestoreInProgressError(join(lockDir, RESTORE_MARKER_FILENAME));
+    }
+
     // Record WHO we are, not just our pid, so a future reader can tell this
     // lock apart from one whose pid the OS has since recycled.
     const self = await ownIdentity();
+    const namespace = await processNamespaceId();
     const lockData: StorageLockFile = {
       pid: process.pid,
       acquired_at: new Date().toISOString(),
@@ -589,6 +697,8 @@ export class StorageLock {
         ? { holder_started_at: self.started, holder_start_source: self.startedSource }
         : {}),
       ...(self?.command ? { holder_command: self.command } : {}),
+      ...(namespace ? { holder_namespace: namespace } : {}),
+      ...(isVmGuest() ? { holder_guest: true } : {}),
     };
     const lockContent = JSON.stringify(lockData, null, 2) + '\n';
 
@@ -614,6 +724,27 @@ export class StorageLock {
       const content = readFileSync(this.lockPath, 'utf-8');
       const lock: StorageLockFile = JSON.parse(content);
 
+      // A pid from another namespace is not ours even when the number matches,
+      // and "no such process here" says nothing about it either.
+      // Where the holder's pid lives decides whether it can be judged here at
+      // all. A holder from an earlier boot of this machine (or a container gone
+      // since) is dead whatever its pid now names here — reclaimed below
+      // without judging the pid, which a recycled pid could make look alive.
+      // Only a holder that may really be running out of sight (a project's
+      // guest seen from the host, a holder on another OS kernel such as a macOS
+      // host daemon seen from a Linux container) is refused, and only where asked.
+      const recordedHolder = { pid: lock.pid, started: lock.holder_started_at ?? null, startedSource: lock.holder_start_source ?? null, acquiredAt: lock.acquired_at ?? null };
+      const nsVerdict = await judgeHolderNamespace({ namespace: lock.holder_namespace, guest: lock.holder_guest, holder: recordedHolder });
+      const judgeable = nsVerdict === 'judgeable';
+      // A project machine's (microVM guest's) lock seen from outside that guest
+      // is refused in EVERY mode: its daemon holds the lock for its whole life,
+      // and its pid means nothing here, so judging it would reclaim a live
+      // writer. Nothing outside the guest legitimately needs to take it over —
+      // the guest reclaims its own earlier boots itself.
+      if (nsVerdict === 'foreign' && (this.foreignHolder === 'refuse' || (lock.holder_guest === true && !isVmGuest()))) {
+        throw new UnjudgeableStorageLockError(this.lockPath, lock.pid, lock.holder_namespace!);
+      }
+
       // The file already carries OUR pid. Two very different situations, and
       // the timestamp must not lie about either:
       //
@@ -628,7 +759,7 @@ export class StorageLock {
       //    inheriting an age that has nothing to do with us. The rename is
       //    atomic, so a concurrent reader sees the old file or the new one,
       //    never a half-written mix.
-      if (lock.pid === process.pid) {
+      if (lock.pid === process.pid && judgeable) {
         if (!StorageLock.heldInProcess(this.lockPath)) {
           const tmpPath = `${this.lockPath}.${process.pid}.tmp`;
           try {
@@ -649,7 +780,7 @@ export class StorageLock {
       // Is the RECORDED HOLDER still there? Not merely "is something alive at
       // that pid" — a recycled pid answers that forever, which is exactly how
       // this lock used to wedge permanently (see process-identity).
-      const verdict = await checkHolder({
+      const verdict = nsVerdict === 'dead' ? { alive: false } : await checkHolder({
         pid: lock.pid,
         started: lock.holder_started_at ?? null,
         startedSource: lock.holder_start_source ?? null,
@@ -663,7 +794,13 @@ export class StorageLock {
       // Remove and retry atomically.
       // Another process might also be trying to claim this stale lock,
       // so we remove-then-create with O_EXCL to race safely.
+      //
+      // The judgement above awaited, so the file judged may no longer be the
+      // file on disk: a racing process may have reclaimed the same stale lock
+      // and written its own LIVE one. Unlinking that would let both run as
+      // writers, so only the exact content that was judged is removed.
       try {
+        if (readFileSync(this.lockPath, 'utf-8') !== content) return false;
         unlinkSync(this.lockPath);
       } catch {
         // Someone else already removed it — that's fine, we'll retry next attempt
@@ -682,7 +819,8 @@ export class StorageLock {
       } catch {
         return false; // Another process got it first — retry on next attempt
       }
-    } catch {
+    } catch (err) {
+      if (err instanceof UnjudgeableStorageLockError) throw err;
       return false;
     }
   }

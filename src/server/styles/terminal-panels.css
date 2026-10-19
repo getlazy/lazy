@@ -141,3 +141,44 @@
 
 .lz-shell .btn-sm,
 .lz-watch .btn-sm { margin: 0; }
+
+/* Fill window for the Watch panel: it covers the whole viewport like a shell
+ * session's `.is-maximised` (tabs.css), with the bar on top and the terminal
+ * taking the rest. Same class, same behaviour, same Esc to leave. */
+.lz-watch-panel.is-maximised {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  flex-direction: column;
+  max-width: none;
+  width: auto;
+  height: auto !important;
+  margin: 0;
+  border-radius: 0;
+  resize: none;
+}
+.lz-watch-panel.is-maximised .lz-watch-term { flex: 1 1 auto; min-height: 0; height: auto; }
+
+/* The panels are black, but `.btn` is drawn for a light page: its dark text
+ * and transparent fill all but vanish on black, which hid the Fill window
+ * control (and Paste, Close, Reconnect) in the one place it matters. Buttons
+ * on a black surface get a light face. A verification step's own mount sits on
+ * the page, not in a panel, so it keeps the page's buttons until it fills the
+ * window, which is black again. */
+.lz-shell-panel .btn,
+.lz-watch-panel .btn,
+.lz-shell-session.is-maximised .btn {
+  background: #2a2d31;
+  color: #e3e5e8;
+  border-color: #6b7078;
+}
+.lz-shell-panel .btn:hover,
+.lz-watch-panel .btn:hover,
+.lz-shell-session.is-maximised .btn:hover { border-color: #e3e5e8; }
+.lz-shell-session.is-maximised .lz-shell-session-bar { color: inherit; }
+.lz-shell-panel .lz-shell-session-bar { color: #e3e5e8; }
+.lz-shell-panel .lz-shell-tab-btn,
+.lz-shell-panel .lz-shell-tab-close { color: #c4c8ce; }
+.lz-shell-panel .lz-shell-tab.is-active .lz-shell-tab-btn { color: #fff; }
+.lz-shell-panel .lz-shell-tab { background: #1c1e22; }

@@ -100,6 +100,14 @@ export async function commandClone(args: string[]): Promise<void> {
 export function cloneUsage(): void {
   console.log(`Usage: lazy clone <task_id> [--parent <task_id> | --default-parent] [--code <code>] [--model <model>]
                   [--agent <profile>] [--same-base | --base <sha>]
+       lazy clone https://<install>/git/<team>/<project>.git [dir]
+
+The second form clones a project hosted on a Lazy Teams install and binds the
+clone to it in one step, logging this machine in first if it is not already
+(see lazy login --help; --device and --device-name work as they do there).
+It is chosen by shape: the first argument is a full clone URL, the address on a
+Teams project page. Use the address your install is served on: lazy uses the
+scheme you type (http:// or https://) exactly, as git does, and never switches it.
 
 Duplicate a task with the same goal, prompt, model, and type. Creates a fresh task
 in the backlog with no session history. By default, inherits the source task's parent.

@@ -1,5 +1,5 @@
 /**
- * The mechanical half of "one entry point runs a search" (CLAUDE.md).
+ * The mechanical half of "one entry point runs a search" (AGENTS.md).
  *
  * Four surfaces search: the daemon's `search` RPC, the `lazy_search` MCP
  * handler, the dashboard's `/search` page and the command palette's

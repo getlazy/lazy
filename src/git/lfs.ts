@@ -366,7 +366,7 @@ async function configValue(cwd: string, key: string): Promise<string> {
  * decides whether a pointer or 335 MB of raw bytes lands.
  *
  * Never repairs anything. Rewriting a user's git config behind their back is
- * exactly the hidden side effect CLAUDE.md forbids; lazy detects and refuses,
+ * exactly the hidden side effect AGENTS.md forbids; lazy detects and refuses,
  * the human fixes it deliberately.
  */
 export async function inspectLfsEnvironment(

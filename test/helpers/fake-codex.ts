@@ -20,7 +20,7 @@
  *   {"type":"turn.completed","usage":{"input_tokens":…,"cached_input_tokens":…,
  *     "cache_write_input_tokens":…,"output_tokens":…,"reasoning_output_tokens":…}}
  *
- * If the pinned codex release ever changes these shapes, re-capture and update
+ * Codex is not pinned; if a newer release changes these shapes, re-capture and update
  * BOTH this fake and `src/agent/codex.ts` together.
  */
 
@@ -203,6 +203,7 @@ export async function clearCodexInvocations(fake: FakeCodex): Promise<void> {
  * `composeFakeAgentSource` sandwiches it.
  */
 const FAKE_CODEX_PRELUDE = String.raw`
+const recordedStdin = process.argv.includes('exec') ? require('fs').readFileSync(0, 'utf8') : undefined;
 const FAKE_LABEL = 'fake codex';
 
 // Probe invocations, answered without touching the scenario so they never
@@ -211,7 +212,7 @@ const FAKE_LABEL = 'fake codex';
 //                  .diagnose() both run it before any turn exists.
 //   login status   CodexPackaging.diagnose() and the system-agent view read it
 //                  for auth state. "Not logged in" + exit 1 is the real CLI's
-//                  un-authenticated answer (verified, 0.152.1) — informational
+//                  un-authenticated answer (checked on 0.152.1, 2026-09) — informational
 //                  there, since a launch supplies OPENAI_API_KEY.
 function agentProbe(argv) {
   if (argv.includes('--version')) {

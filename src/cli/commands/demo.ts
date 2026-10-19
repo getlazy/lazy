@@ -186,13 +186,13 @@ function printFleetUpBlock(
     const port = new URL(fleet.daemonUrl).port;
     console.log(`  Daemon port on this host:         ${port}   (127.0.0.1:${port} → 26024 inside the machine; Teams talks to it, you need not)`);
     if (fleet.servePort !== null && fleet.task) {
-      console.log(`  Service, once the turn is done:   http://${fleet.servePort}.${fleet.task.code}.lazy.localhost:${port}/   (through the daemon's own proxy on that port)`);
+      console.log(`  Service, once the turn is done:   http://${fleet.task.code}.${fleet.servePort}.lazy.localhost:${port}/   (through the daemon's own proxy on that port)`);
     }
   }
   console.log(`  When the task has finished: ${theme.command('lazy playground status')}   # on the host, any directory — the service address, the curl check, the guest commands`);
 }
 
-/** `4096 MiB memory (the default; --memory raises it)` or `6144 MiB memory (--memory)`. */
+/** `8192 MiB memory (the default; --memory raises it)` or `6144 MiB memory (--memory)`. */
 function machineBudget(memoryMib: number | null): string {
   return memoryMib === null
     ? `${DEFAULT_MACHINE_MEMORY_MIB} MiB memory (the default; lazy playground up --memory <MiB> raises it)`
@@ -442,7 +442,7 @@ Options:
                 With --fleet: the public git URL the guest clones — checked from
                 this machine first with no credentials, because the guest has none
                 and reaches only public IP space.
-  --memory MIB  With --fleet: the machine's memory budget in MiB (default 4096,
+  --memory MIB  With --fleet: the machine's memory budget in MiB (default 8192,
                 or LAZY_SMOLVM_MEMORY_MIB from the shell). The daemon, dockerd,
                 the agent-image build and the agent container all share it;
                 "lazy playground status" prints what the guest is using, so raise it

@@ -23,12 +23,11 @@ import type { TokenUsage } from '../types';
 /**
  * How many characters of rendered body may go into ONE prompt.
  *
- * The binding limit is not the context window — it is argv. A one-shot
- * passes the prompt as a single `claude -p <prompt>` argument, and Linux caps
- * one argv element at MAX_ARG_STRLEN (128 KiB); exceeding it fails the spawn
- * with E2BIG rather than degrading. 96 KiB of body leaves ~30 KiB of head room
- * for the template, the question and the metadata block, which is far more than
- * either needs.
+ * This size was first chosen to keep a one-shot's prompt under the 128 KiB
+ * argv limit. Prompts now reach every agent on stdin (the argv rule in
+ * src/agent/argv-safety.ts), so it is no longer a spawn limit: it is the
+ * excerpt size each map pass reads, which keeps every call well inside a
+ * context window and lets the passes run in parallel.
  */
 export const TRANSCRIPT_CHARS_PER_CALL = 96_000;
 
@@ -270,7 +269,7 @@ export async function runAskEngine(input: AskEngineInput): Promise<AskEngineResu
 
   // --- Reduce: one answer from the per-excerpt findings ---
   //
-  // The findings themselves are bounded by the same argv budget as the body: on
+  // The findings themselves are bounded by the same per-call budget as the body: on
   // a very large subject, dozens of excerpts each returning a page of bullets
   // can add up past it. Keep whole findings in order until the budget is spent
   // and SAY which ones were dropped — a reduce that silently lost its tail

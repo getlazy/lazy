@@ -18,6 +18,11 @@ import {
   clearCredentialGrantCache,
   looksLikeLazyPlaceholder,
   MAX_BUILDER_GRANTS,
+  pinGrantsToAddresses,
+  grantAcceptsPeer,
+  derivedPlaceholderFor,
+  bindDerivedCredentials,
+  scrubLazyPlaceholders,
 } from '../../src/proxy/credential-broker';
 import { placeholderizeAuthEnv } from '../../src/proxy/placeholder-env';
 import { TargetCredentials, anthropicPlacement } from '../../src/proxy/target-credentials';
@@ -76,10 +81,13 @@ describe('credential broker', () => {
 
   // INVARIANT: minting is per-identity and REUSES. A live container holds its
   // placeholder in memory across turns; a fresh value per turn would either
-  // invalidate a running turn or pile up equally-valid placeholders.
+  // invalidate a running turn or pile up equally-valid placeholders. The
+  // identity includes the container (label): a task's work container keeps a
+  // stable name across turns, and its review / accept-gate containers must not
+  // share a placeholder pinned to another container's address.
   test('the same identity gets the same placeholder back', async () => {
     const a = await mintCredentialGrant(ROOT, { role: 'agent', taskId: 't1', label: 'x', envKey: 'ANTHROPIC_API_KEY' });
-    const b = await mintCredentialGrant(ROOT, { role: 'agent', taskId: 't1', label: 'different-label', envKey: 'ANTHROPIC_API_KEY' });
+    const b = await mintCredentialGrant(ROOT, { role: 'agent', taskId: 't1', label: 'x', envKey: 'ANTHROPIC_API_KEY' });
     expect(b).toBe(a);
   });
 
@@ -92,17 +100,83 @@ describe('credential broker', () => {
   // INVARIANT: the task's placeholder dies with its session. After accept /
   // reject / close the container must not be able to spend the human's
   // credential, even if it is still running.
+  //
+  // Minted the way launches really mint: `taskId` is the task's REF (its code
+  // or short id) and `taskUuid` the UUID, while accept/reject/close revoke by
+  // the UUID. This test once minted and revoked with one string, so it passed
+  // while no real placeholder was ever revoked.
   test('revoking a task kills its placeholders and only its own', async () => {
-    const mine = await mintCredentialGrant(ROOT, { role: 'agent', taskId: 'gone', label: 'l', envKey: 'ANTHROPIC_API_KEY' });
-    const alsoMine = await mintCredentialGrant(ROOT, { role: 'agent', taskId: 'gone', label: 'l', envKey: 'CURSOR_API_KEY' });
-    const other = await mintCredentialGrant(ROOT, { role: 'agent', taskId: 'stays', label: 'l', envKey: 'ANTHROPIC_API_KEY' });
+    const UUID = '0d6c1f8e-6a5b-4c3d-9e2f-1a2b3c4d5e6f';
+    const mine = await mintCredentialGrant(ROOT, { role: 'agent', taskId: 'gone-code', taskUuid: UUID, label: 'l', envKey: 'ANTHROPIC_API_KEY' });
+    const alsoMine = await mintCredentialGrant(ROOT, { role: 'agent', taskId: 'gone-code', taskUuid: UUID, label: 'l', envKey: 'CURSOR_API_KEY' });
+    // A grant minted before grants carried the UUID: found by the task's ref.
+    const legacyMine = await mintCredentialGrant(ROOT, { role: 'builder', taskId: '0d6c1f8e', label: 'oneshot', envKey: 'ANTHROPIC_API_KEY' });
+    const other = await mintCredentialGrant(ROOT, { role: 'agent', taskId: 'stays', taskUuid: 'ffffffff-0000-0000-0000-000000000000', label: 'l', envKey: 'ANTHROPIC_API_KEY' });
+    // Same CODE, another task's UUID: a reused code must not revoke it.
+    const reusedCode = await mintCredentialGrant(ROOT, { role: 'agent', taskId: 'gone-code', taskUuid: 'eeeeeeee-0000-0000-0000-000000000000', label: 'l2', envKey: 'OPENAI_API_KEY' });
 
-    expect(await revokeTaskCredentialGrants(ROOT, 'gone')).toBe(2);
+    const task = { id: UUID, refs: ['gone-code', '0d6c1f8e'] };
+    expect(await revokeTaskCredentialGrants(ROOT, task)).toBe(3);
     expect(await lookupCredentialGrant(ROOT, mine)).toBeNull();
     expect(await lookupCredentialGrant(ROOT, alsoMine)).toBeNull();
+    expect(await lookupCredentialGrant(ROOT, legacyMine)).toBeNull();
     expect(await lookupCredentialGrant(ROOT, other)).not.toBeNull();
+    expect(await lookupCredentialGrant(ROOT, reusedCode)).not.toBeNull();
     // Idempotent: a second accept-path call must not throw.
-    expect(await revokeTaskCredentialGrants(ROOT, 'gone')).toBe(0);
+    expect(await revokeTaskCredentialGrants(ROOT, task)).toBe(0);
+  });
+
+  // INVARIANT: a grant pinned to its container's addresses is spendable only
+  // from them. A placeholder that leaks to a sibling container's view must not
+  // spend from there during the owner's live turn.
+  test('a pinned grant is accepted only from its own container', async () => {
+    const token = await mintCredentialGrant(ROOT, { role: 'agent', taskId: 't', label: 'lazy-t', envKey: 'ANTHROPIC_API_KEY' });
+    const unpinned = (await lookupCredentialGrant(ROOT, token))!;
+    expect(grantAcceptsPeer(unpinned, '172.17.0.9')).toBe(true);
+
+    expect(await pinGrantsToAddresses(ROOT, 'lazy-t', ['172.17.0.5'])).toBe(1);
+    const pinned = (await lookupCredentialGrant(ROOT, token))!;
+    expect(grantAcceptsPeer(pinned, '172.17.0.5')).toBe(true);
+    expect(grantAcceptsPeer(pinned, '172.17.0.9')).toBe(false);
+    expect(grantAcceptsPeer(pinned, null)).toBe(false);
+
+    // A new turn's container gets a new address: unpin, then pin again.
+    expect(await pinGrantsToAddresses(ROOT, 'lazy-t', null)).toBe(1);
+    expect(grantAcceptsPeer((await lookupCredentialGrant(ROOT, token))!, '172.17.0.9')).toBe(true);
+  });
+
+  // INVARIANT: each container of a task holds its OWN placeholder. A grant is
+  // pinned to one container's address, so a review or accept-gate container
+  // reusing the work container's grant would be refused from its own address.
+  test('a task\'s work and review containers get separate grants, pinned separately', async () => {
+    const work = await mintCredentialGrant(ROOT, { role: 'agent', taskId: 'r', label: 'lazy-r', envKey: 'ANTHROPIC_API_KEY' });
+    const review = await mintCredentialGrant(ROOT, { role: 'agent', taskId: 'r', label: 'lazy-r-review', envKey: 'ANTHROPIC_API_KEY' });
+    expect(review).not.toBe(work);
+    expect(await mintCredentialGrant(ROOT, { role: 'agent', taskId: 'r', label: 'lazy-r', envKey: 'ANTHROPIC_API_KEY' })).toBe(work);
+    await pinGrantsToAddresses(ROOT, 'lazy-r', ['172.17.0.5']);
+    expect(grantAcceptsPeer((await lookupCredentialGrant(ROOT, review))!, '172.17.0.6')).toBe(true);
+  });
+
+  // INVARIANT: an upstream-minted credential held for a grant dies with it.
+  test('derived credentials live on the grant and are revoked with it', async () => {
+    const token = await mintCredentialGrant(ROOT, { role: 'agent', taskId: 'd', taskUuid: 'dddddddd-0000-0000-0000-000000000000', label: 'l', envKey: 'CURSOR_API_KEY' });
+    const placeholder = derivedPlaceholderFor('aaa.bbb.REALSIG');
+    expect(placeholder.startsWith('aaa.bbb.')).toBe(true);
+    expect(placeholder).not.toContain('REALSIG');
+    expect(await bindDerivedCredentials(ROOT, token, [{ placeholder, real: 'aaa.bbb.REALSIG' }])).toBe(true);
+    expect((await lookupCredentialGrant(ROOT, token))!.derived?.[0]?.real).toBe('aaa.bbb.REALSIG');
+
+    await revokeTaskCredentialGrants(ROOT, { id: 'dddddddd-0000-0000-0000-000000000000' });
+    expect(await lookupCredentialGrant(ROOT, token)).toBeNull();
+    expect(await bindDerivedCredentials(ROOT, token, [{ placeholder, real: 'x' }])).toBe(false);
+  });
+
+  test('placeholders are scrubbed from text by shape', async () => {
+    const grant = await mintCredentialGrant(ROOT, { role: 'agent', taskId: 's', label: 'l', envKey: 'CURSOR_API_KEY' });
+    const derived = derivedPlaceholderFor('h.p.s');
+    const session = `lazy-sess-${'ab'.repeat(32)}`;
+    const out = scrubLazyPlaceholders(`env: ${grant} ${derived} ${session} plain`);
+    expect(out).toBe('env: <lazy-placeholder> <lazy-placeholder> <lazy-placeholder> plain');
   });
 
   test('revoking a builder session kills the grants under its label', async () => {

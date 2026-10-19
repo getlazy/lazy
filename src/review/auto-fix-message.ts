@@ -68,7 +68,11 @@ export function buildReviewAutoFixMessage(
   // does not exist.
   const header = n > 0
     ? `The automatic review of your work found ${n} issue${n === 1 ? '' : 's'}. ` +
-      `Fix each one below, then declare the work done again with lazy_final — ` +
+      `Fix each one below. After each self-contained fix, commit its related ` +
+      `file changes together with lazy_commit before moving to the next finding; ` +
+      `do not bundle independent fixes into one commit. If multiple findings ` +
+      `need the same change, commit that change once. Then declare the work ` +
+      `done again with lazy_final — ` +
       `a fresh review runs on what you land. ` +
       `If you believe a finding is wrong or out of scope, say so plainly in your ` +
       `response with your reasoning and move on; the next review either agrees ` +

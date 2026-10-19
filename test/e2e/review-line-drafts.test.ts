@@ -2,7 +2,7 @@
  * E2E for the half-typed comment boxes — a line comment, a question about a
  * presented document, a reply being written on a thread.
  *
- * These are the reviewer's unsent words (CLAUDE.md: never lose human feedback),
+ * These are the reviewer's unsent words (AGENTS.md: never lose human feedback),
  * and the whole point of storing them is a ROUND TRIP: what one request writes,
  * the next render of the page has to hand back to the island, and what is
  * deleted has to be gone. That is the half of this feature a test can actually

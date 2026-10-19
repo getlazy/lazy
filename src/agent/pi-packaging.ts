@@ -15,6 +15,7 @@
  * container rebuild.
  */
 
+import type { HealthCheck } from '../remote/driver';
 import type { AgentPackaging } from './interface';
 import { spawnSyncUnsupervised } from '../utils/spawn';
 
@@ -96,8 +97,8 @@ WORKDIR /work
     ];
   }
 
-  diagnose(): { state: 'ok' | 'fail'; what: string; reason?: string }[] {
-    const results: { state: 'ok' | 'fail'; what: string; reason?: string }[] = [];
+  diagnose(): HealthCheck[] {
+    const results: HealthCheck[] = [];
     try {
       const version = spawnSyncUnsupervised(['pi', '--version'], {
         stdout: 'pipe',
@@ -110,6 +111,7 @@ WORKDIR /work
         return [{
           state: 'fail',
           what: 'pi CLI installed',
+          problem: 'pi CLI isn\'t installed',
           reason: `pi CLI not found. ${PI_INSTALL_HINT}`,
         }];
       }
@@ -117,6 +119,7 @@ WORKDIR /work
       return [{
         state: 'fail',
         what: 'pi CLI installed',
+        problem: 'pi CLI isn\'t installed',
         reason: `pi CLI not found. ${PI_INSTALL_HINT}`,
       }];
     }

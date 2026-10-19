@@ -33,7 +33,7 @@
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtemp, rm, writeFile } from 'fs/promises';
-// Sync write in a test fixture: allowed by CLAUDE.md ("test setup/teardown"),
+// Sync write in a test fixture: allowed by AGENTS.md ("test setup/teardown"),
 // and this helper is called from synchronous git-fixture code.
 import { writeFileSync } from 'fs';
 import { join } from 'path';

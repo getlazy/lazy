@@ -1,17 +1,23 @@
 /**
  * Create a task — ONE implementation behind the web New-task form.
  *
- * CLI `lazy create` and MCP `lazy_create` still open storage themselves this
- * slice (same posture as clone-redo). The web never does: it calls this
- * through TaskActions. Validation, parent resolution, agent resolution and
- * code derivation all live here so the form cannot grow a second copy.
+ * The web calls this through TaskActions, and so does Lazy Teams' New-task
+ * form. A clone bound to Teams calls it for `lazy create` and the `lazy fix` /
+ * `document` / `refactor` shortcuts (`src/cli/bound-clone-create.ts`), and a
+ * bound clone's MCP `lazy_create` does too. A local CLI and local MCP
+ * `lazy_create` still open storage themselves.
+ *
+ * ONE storage write creates the task with everything it starts with (see
+ * `NewTaskInitialState`): it lands whole or leaves nothing behind.
+ * Validation, parent resolution, agent resolution and code derivation all
+ * live here so the form cannot grow a second copy.
  *
  * A blank code is not "no code": the form promises a suggestion from the
- * goal, so this applies {@link deriveCode} when the caller omitted one.
- * CLI create is unchanged — it only sends a code when `--code` was passed.
+ * goal, so this applies {@link deriveCode} when the caller omitted one. The
+ * CLI sends `deriveCode: false` — it only has a code when `--code` was passed.
  */
 
-import { pinChosenEffort } from './effort';
+import { chosenEffortMetadata } from './effort';
 import {
   REVIEW_GATE_INPUTS,
   REVIEW_MODE_INPUTS,
@@ -28,16 +34,19 @@ import type { Storage } from '../storage/interface';
 import type { ActorInput } from '../types';
 import type { EffortLevel } from '../config/types';
 import { VALID_EFFORT_LEVELS } from '../config/types';
-import { branchTarget } from '../task-target';
-import { looksLikeTaskBranch } from '../git/branch-prefix';
+import { resolveBranchParent } from '../task/branch-parent';
+import { normalizeTag } from '../utils/tags';
 import { loadConfig } from '../config/loader';
 import { resolveAgentForNewTaskFromConfig } from '../agent/task-agent';
 import { assertAgentProfileRunnable, assertKnownAgentProfile } from './agent-profile-check';
-import { inheritCustomImageMetadata } from '../docker/worktree-image';
+import { assertNoModelOnTiered } from '../agent/tiered-model';
+import { inheritedCustomImageMetadata } from '../docker/worktree-image';
 import { deriveCode, displayId, shortId, validateCode } from '../task/identity';
 import { sanitizeUserText } from '../utils/sanitize-text';
-import { runGit } from '../utils/git';
 import { RpcError } from './rpc-error';
+
+/** A full task id, any case — the shape Lazy Teams reads as a task parent. */
+const TASK_ID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export interface CreateTaskInput {
   goal: string;
@@ -54,6 +63,13 @@ export interface CreateTaskInput {
   /** Whether a separate review auto-fixes (on | off). Pinned on the task. */
   reviewAutoFix?: string;
   agent?: string;
+  /** Tags for the new task, written with it (normalized here). */
+  tags?: string[];
+  /**
+   * Fill a blank code in from the goal (the web form's promise). `false` keeps
+   * a blank code blank — what `lazy create` without `--code` has always done.
+   */
+  deriveCode?: boolean;
   actor?: ActorInput;
 }
 
@@ -63,9 +79,8 @@ export interface CreateTaskResult {
   /** True when a code was filled in from the goal rather than typed. */
   derivedCode: boolean;
   /**
-   * Follow-up writes (prompt, model, effort, branch target, image pin)
-   * that failed after the task row existed. The task is real; these are
-   * what did not stick. Empty when every write landed.
+   * Always empty now: every field is written with the row, so a create lands
+   * whole or not at all. Kept on the wire because clients read it.
    */
   warnings: string[];
 }
@@ -152,7 +167,7 @@ export async function createTask(
       throw new RpcError(400, `Invalid code '${typedCode}': ${codeError}`);
     }
     code = typedCode;
-  } else {
+  } else if (input.deriveCode !== false) {
     // Suggestion the form advertised: a kebab-case slug from the goal, when
     // the goal itself is a valid code. Too-short or reserved goals stay
     // uncoded (the short id is the address) rather than inventing padding.
@@ -169,8 +184,8 @@ export async function createTask(
   let explicitBranchTarget: string | undefined;
   if (parentValue) {
     // A value beginning with `-` is a git option, not a ref. Reject before
-    // resolveTask (a code/id never starts with `-`) and before rev-parse,
-    // and pass `--` anyway so a later edit cannot reintroduce the hole.
+    // resolveTask (a code/id never starts with `-`) and before any git call;
+    // `resolveBranchParent` also checks the name with `check-ref-format`.
     if (parentValue.startsWith('-')) {
       throw new RpcError(
         400,
@@ -192,22 +207,30 @@ export async function createTask(
         400,
         `Ambiguous parent '${parentValue}'. Matches: ${resolved.ambiguousMatches.map((t) => `${shortId(t.id)} (${t.goal})`).join(', ')}`,
       );
+    } else if (TASK_ID_SHAPE.test(parentValue)) {
+      // A full task id that names no task is a missing task, never a branch.
+      // Lazy Teams picks the bar a create must pass from this same shape
+      // (`CliRpcCommand.branch_parent?`): an id-shaped parent gets the New-task
+      // form's, a branch parent "Move under another task"'s as well. Falling
+      // through to the branch lookup here would let a branch pushed under an
+      // id-shaped name be targeted past the bar Teams meant for it.
+      throw new RpcError(404, `Parent task not found: ${parentValue}`);
     } else {
       // Same fall-through as `lazy create --parent` / `lazy reparent`: not a
-      // task, so it must be a local integration branch, not a typo and not a
-      // lazy/ task branch.
-      const verify = await runGit(
-        ['rev-parse', '--verify', '--quiet', '--', parentValue],
-        { cwd: projectRoot },
-      );
-      if (verify.exitCode !== 0) {
-        throw new RpcError(400, `Parent '${parentValue}' is neither a known task nor a local git branch.`);
-      }
-      if (looksLikeTaskBranch(parentValue)) {
-        throw new RpcError(400, `Parent must be an integration branch, not a lazy task branch ('${parentValue}').`);
-      }
+      // task, so it must be an integration branch — resolved below, once every
+      // other field has been checked, because in managed mode resolving it may
+      // fetch it from origin.
       explicitBranchTarget = parentValue;
     }
+  }
+
+  const tags: string[] = [];
+  for (const raw of input.tags ?? []) {
+    const normalized = normalizeTag(raw);
+    if (!normalized) {
+      throw new RpcError(400, `Invalid tag '${raw}': a tag must contain at least one letter or digit.`);
+    }
+    if (!tags.includes(normalized)) tags.push(normalized);
   }
 
   const [config, projectSettings] = await Promise.all([
@@ -227,6 +250,35 @@ export async function createTask(
   // `[agent.by_type]`, not the one that was typed — because a task inheriting
   // an unrunnable agent from its parent is just as dead as one that named it.
   await assertAgentProfileRunnable(projectRoot, agentResolution.agentId);
+  if (modelValue) {
+    // Before the row exists: a tiered profile picks the model per request.
+    try {
+      assertNoModelOnTiered(config, agentResolution.agentId, modelValue);
+    } catch (err) {
+      throw new RpcError(400, err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  if (explicitBranchTarget) {
+    const branch = await resolveBranchParent(projectRoot, explicitBranchTarget);
+    if (!branch.ok) {
+      throw new RpcError(400, branch.reason === 'task-branch'
+        ? `Parent must be an integration branch, not a lazy task branch ('${explicitBranchTarget}').`
+        : branch.reason === 'case-collision'
+          ? `Parent '${explicitBranchTarget}' differs only in letter case from an existing branch; name that branch exactly.`
+          : `Parent '${explicitBranchTarget}' is neither a known task nor a git branch of this project.`);
+    }
+  }
+
+  // Everything the task starts with is written WITH its row: a create either
+  // lands whole or leaves nothing behind. It used to be a row followed by
+  // separate writes, and when one of those failed (or, from a clone bound to
+  // Lazy Teams, was refused) the task was left in the backlog with no prompt.
+  const metadata: Record<string, string> = {
+    ...(parentTask ? inheritedCustomImageMetadata(parentTask) : {}),
+    ...(effortValue ? chosenEffortMetadata(effortValue) : {}),
+    ...reviewOverrideMetadata(reviewOverrides),
+  };
 
   let created: Task;
   try {
@@ -238,6 +290,13 @@ export async function createTask(
       taskType,
       agentResolution.agentId,
       input.actor,
+      {
+        targetBranch: explicitBranchTarget,
+        prompt: prompt.trim() ? prompt : undefined,
+        model: modelValue || undefined,
+        metadata,
+        tags,
+      },
     );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -249,53 +308,11 @@ export async function createTask(
     throw new Error(`failed to create task: ${message}`, { cause: err instanceof Error ? err : undefined });
   }
 
-  // The row exists. Prompt / model / effort / branch target / image pin are
-  // separate writes; a failure here must not look like "create never happened"
-  // (a form re-display would duplicate the row on retry). Collect and return.
-  const warnings: string[] = [];
-  const followUp = async (label: string, work: () => Promise<unknown>): Promise<void> => {
-    try {
-      await work();
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      warnings.push(`${label}: ${message}`);
-    }
-  };
-  if (explicitBranchTarget) {
-    await followUp('Could not set the branch parent', () =>
-      storage.updateTaskTarget(created.id, branchTarget(explicitBranchTarget)));
-  }
-  if (prompt.trim()) {
-    await followUp('Could not save the prompt', () =>
-      storage.updateTaskPrompt(created.id, prompt));
-  }
-  if (modelValue) {
-    await followUp('Could not save the model', () =>
-      storage.updateTaskModel(created.id, modelValue));
-  }
-  if (effortValue) {
-    await followUp('Could not save the effort', () =>
-      pinChosenEffort(storage, created.id, effortValue));
-  }
-  for (const [key, value] of Object.entries(reviewOverrideMetadata(reviewOverrides))) {
-    await followUp('Could not save the review settings', () =>
-      storage.updateTaskMetadata(created.id, key, value));
-  }
-  // Subtasks inherit a parent's consented image pin. The web never offers
-  // the TTY pin prompt — that stays CLI-only.
-  if (parentTask) {
-    await followUp('Could not inherit the parent image pin', () =>
-      inheritCustomImageMetadata(storage, created.id, parentTask));
-  }
-
-  // Re-read so displayId sees a code we derived and any target write.
-  const fresh = await storage.getTask(created.id);
-  const task = fresh ?? created;
   return {
-    taskId: task.id,
-    displayId: displayId(task),
+    taskId: created.id,
+    displayId: displayId(created),
     derivedCode,
-    warnings,
+    warnings: [],
   };
 }
 

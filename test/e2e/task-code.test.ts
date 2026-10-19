@@ -104,7 +104,7 @@ describe('task codes', () => {
   });
 
   // INVARIANT: a task code is a DNS label. Its services are served at
-  // <service>.<code>.lazy.localhost, and 63 octets is the label limit every
+  // <code>.<service>.lazy.localhost, and 63 octets is the label limit every
   // resolver enforces — so the code limit is that limit, not a lazy choice.
   test('accepts maximum length code (63 chars)', async () => {
     const code63 = 'a'.repeat(63);
@@ -266,7 +266,7 @@ describe('task codes', () => {
   });
 
   // INVARIANT: a new code may not contain a dot. It becomes one label of
-  // <service>.<code>.lazy.localhost, and a dotted code would silently split
+  // <code>.<service>.lazy.localhost, and a dotted code would silently split
   // into two labels there — addressing a task that does not exist. Codes
   // created before this rule keep working; they are simply addressed by their
   // short id in a hostname.

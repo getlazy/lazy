@@ -87,7 +87,7 @@ describe('a dashboard route that overruns its deadline', () => {
 
     const body = await response.text();
     expect(body).toContain('Request Timed Out');
-    // Actionable, per CLAUDE.md: says what happened and what to do next.
+    // Actionable, per AGENTS.md: says what happened and what to do next.
     expect(body).toContain('lazy doctor');
   });
 

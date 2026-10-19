@@ -40,7 +40,7 @@ export type SessionSnapshot = Map<string, { mtimeMs: number; size: number }>;
 /**
  * Snapshot all JSONL session files for a project.
  *
- * Async (per CLAUDE.md: no sync fs). Returns a map of sessionId →
+ * Async (per AGENTS.md: no sync fs). Returns a map of sessionId →
  * {mtimeMs, size}.
  */
 export async function snapshotSessionFiles(lazyRoot: string): Promise<SessionSnapshot> {

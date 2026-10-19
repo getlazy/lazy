@@ -33,7 +33,7 @@ const serve: ProbedServeState = {
 const controls: ServicesCardControls = {
   taskId: TASK_ID,
   canStart: true,
-  canDesignate: false,
+  canConfigure: false,
   start: null,
   startServicesCmd: 'bin/dev',
   shellAvailable: true,

@@ -12,6 +12,7 @@
  *   q  quit (prompts to submit feedback as unblock if any comments were made)
  */
 
+import { askDefaultRunnerImage } from '../runner-image-confirm';
 import * as readline from 'readline';
 import { existsSync } from 'fs';
 import type { Storage } from '../../storage/interface';
@@ -1571,10 +1572,17 @@ export async function runInteractiveReview(
         raw.close();
         const message = `Please address the review comments I added since ${reviewStartedAt.toISOString()}.`;
         try {
+          // The comments are already saved, so declining here loses nothing.
+          const useDefaultImage = await askDefaultRunnerImage(task.id, { defaultImage: false, yes: false });
+          if (useDefaultImage === null) {
+            console.log(`Your ${commentsMade} comment${commentsMade === 1 ? ' is' : 's are'} saved; unblock again once the project's runner image is ready.`);
+            return;
+          }
           const result = await queryUnblockTask({
             taskId: task.id,
             message,
             ...(await usagePauseOverrideEligibility()),
+            ...(useDefaultImage ? { useDefaultImage: true } : {}),
           });
           for (const w of result.warnings) console.log(w);
           console.log(`${ansi.fg.green}Task unblocked (turn ${result.turnNumber}).${ansi.reset}`);

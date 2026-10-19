@@ -271,6 +271,12 @@ export interface SetupOptions {
    */
   daemonEnv?: Record<string, string>;
   /**
+   * Daemon-only preload for mocking external transport (for example provider
+   * fetch), while keeping the fake-binary seam's real lazy modules intact.
+   * Applied on startup and restart; never propagated to supervisors or agents.
+   */
+  daemonTransportPreload?: string;
+  /**
    * Install a scriptable fake `claude` binary on PATH instead of mocking
    * lazy's own `capture/claude` module, and switch the project to the
    * host-process runner so the REAL supervisor runs.
@@ -328,7 +334,7 @@ export interface SetupOptions {
    *
    * `'sandbox'` is the PRODUCTION default: the agent is launched inside Claude
    * Code's bubblewrap sandbox, which needs `bwrap` and `socat` on PATH (see
-   * CLAUDE.md's Linux prerequisites). Suites asserting on watchdog behavior use
+   * AGENTS.md's Linux prerequisites). Suites asserting on watchdog behavior use
    * `'bypass'` so a missing sandbox dependency cannot masquerade as a watchdog
    * failure; a suite whose subject IS the sandbox asks for `'sandbox'`.
    *
@@ -503,7 +509,7 @@ async function startTestDaemon(
    * launch path under test). `baseEnv` carries the PATH that puts the fake
    * binary ahead of any real `claude`.
    */
-  options: { noPreload?: boolean; baseEnv?: Record<string, string> } = {},
+  options: { noPreload?: boolean; baseEnv?: Record<string, string>; transportPreload?: string } = {},
 ): Promise<void> {
   const { mkdir, open } = await import('fs/promises');
   const { join: pathJoin } = await import('path');
@@ -517,9 +523,10 @@ async function startTestDaemon(
   const logHandle = await open(startupLogPath, 'a');
 
   try {
-    const daemonArgv = options.noPreload
-      ? ['bun', 'run', ENTRY_PATH, 'daemon', 'start', '--foreground', '--project', projectRoot]
-      : ['bun', 'run', '--preload', PRELOAD_PATH, ENTRY_PATH, 'daemon', 'start', '--foreground', '--project', projectRoot];
+    const daemonArgv = ['bun', 'run'];
+    if (!options.noPreload) daemonArgv.push('--preload', PRELOAD_PATH);
+    if (options.transportPreload) daemonArgv.push('--preload', options.transportPreload);
+    daemonArgv.push(ENTRY_PATH, 'daemon', 'start', '--foreground', '--project', projectRoot);
 
     const proc = Bun.spawn(
       daemonArgv,
@@ -910,7 +917,7 @@ export async function setupTestLazy(options: SetupOptions = {}): Promise<TestCon
 
     if (useFakeCursor || useFakePi || useFakeCodex) {
       // Point the project at the fake's agent by REWRITING the key `lazy init`
-      // already wrote, per CLAUDE.md — appending a second `[agent]` table is a
+      // already wrote, per AGENTS.md — appending a second `[agent]` table is a
       // TOML redefinition error, and overwriting the file would discard
       // `external_path`. The replace is checked: a silent no-op here would run
       // every turn as claude-code and the suite would fail nowhere near the
@@ -974,6 +981,7 @@ export async function setupTestLazy(options: SetupOptions = {}): Promise<TestCon
     await startTestDaemon(root, protocolBase, composeDaemonEnv(), {
       noPreload: useFakeAgent,
       baseEnv,
+      transportPreload: options.daemonTransportPreload,
     });
   }
 
@@ -1074,6 +1082,7 @@ export async function setupTestLazy(options: SetupOptions = {}): Promise<TestCon
       await startTestDaemon(root, protocolBase, composeDaemonEnv(extraEnv), {
         noPreload: useFakeAgent,
         baseEnv,
+        transportPreload: options.daemonTransportPreload,
       });
     },
     cleanup: async () => {
@@ -1115,8 +1124,13 @@ export async function setupTestLazy(options: SetupOptions = {}): Promise<TestCon
       // Test roots come from mkdtemp('lazy-e2e-'), so the derived project name
       // always carries that prefix — a real project's ~/.lazy/<name> can never
       // match, no matter how cleanup is called.
+      // Its pre-upgrade backups (`<store>.backups`, src/storage/store-backup.ts)
+      // sit beside it, under the same guard.
       const removableStorage = basename(externalStorageDir).startsWith('lazy-e2e-')
-        ? [rm(externalStorageDir, { recursive: true, force: true })]
+        ? [
+            rm(externalStorageDir, { recursive: true, force: true }),
+            rm(`${externalStorageDir.replace(/\/+$/, '')}.backups`, { recursive: true, force: true }),
+          ]
         : [];
 
       await Promise.all([

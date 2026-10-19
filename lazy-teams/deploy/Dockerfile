@@ -11,7 +11,7 @@
 #   # or: scripts/publish-lazy-teams-image.sh --daemon-image lazy-daemon:local
 #
 # LAZY IS BUILT ONCE PER RELEASE. This image does not build the lazy checkout:
-# it copies /opt/lazy (and the bun that resolved its lockfile) out of the lazy
+# it copies /opt/lazy (the compiled lazy binary and its sidecars) out of the lazy
 # daemon image named by LAZY_DAEMON_IMAGE — the guest image every project
 # daemon boots. The app and the daemons it launches therefore run
 # byte-identical lazy by construction. The publish script pins that image to
@@ -122,11 +122,11 @@ RUN case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
 # ── lazy CLI: the daemon image's checkout ────────────────────────────────────
 #
 # The daemon image (lazy-teams/deploy/daemon-image/Dockerfile) owns building
-# the checkout — the COPY list that is a module graph, `bun install`,
+# the compiled binary — the COPY list that is a module graph, `bun install`,
 # generate:version, the lazy-agent placeholder and `.source-fingerprint` (written
 # by `lazy system source-id --write`).
 # Its runtime is debian bookworm, the same release as this image's ruby base,
-# so its glibc-linked bun runs here unchanged.
+# so its glibc-linked binary runs here unchanged.
 
 FROM ${LAZY_DAEMON_IMAGE} AS lazy-daemon
 
@@ -142,10 +142,6 @@ RUN apt-get update -qq && \
     apt-get install --no-install-recommends -y \
       docker.io gosu iproute2 unzip && \
     rm -rf /var/lib/apt/lists /var/cache/apt/archives
-
-# Bun for `bun run /lazy/src/index.ts` (LocalSupervisor's default command):
-# the exact bun that resolved the checkout's bun.lock, from the daemon image.
-COPY --from=lazy-daemon /usr/local/bin/bun /usr/local/bin/bun
 
 # The `docker` group is created by docker.io above with an arbitrary gid.
 # entrypoint.sh aligns it to the mounted socket at container start so one
@@ -209,10 +205,11 @@ RUN mkdir -p /var/lib/lazy-fleet /lazy/lazy-teams/storage && \
     chown -R rails:rails /var/lib/lazy-fleet /lazy/lazy-teams/storage /lazy
 
 # PROVE THE COPIED LAZY RUNS HERE, AS RAILS, WHERE FAILING IS CHEAP. The
-# checkout and bun came from another image; this is the first time either runs
+# binary came from another image; this is the first time it runs
 # on this image's glibc, at /lazy, owned by uid 1000. It must answer from the
 # baked fingerprint the daemon image wrote, never by re-hashing.
-RUN gosu rails bun run /lazy/src/index.ts system source-id --json | tee /dev/stderr | grep -q '"kind": *"baked"'
+RUN gosu rails /lazy/bin/lazy system source-id --json | tee /dev/stderr | grep -q '"kind": *"embedded"' && \
+    [ "$(gosu rails /lazy/bin/lazy system source-id)" = "$(cat /lazy/.source-fingerprint)" ]
 
 # PROVE THE VENDORED TREE, AS THE USER THAT RUNS IT, WHERE FAILING IS CHEAP.
 # (1) the launch-time verification passes for rails — every file in the tree

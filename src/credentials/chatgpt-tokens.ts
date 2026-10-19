@@ -29,7 +29,7 @@
 
 import { join } from 'path';
 
-/** Endpoint `codex login` refreshes against (verified in codex-cli 0.152.1). */
+/** Endpoint `codex login` refreshes against (checked in codex-cli 0.152.1, 2026-09). */
 export const CHATGPT_TOKEN_URL = 'https://auth.openai.com/oauth/token';
 
 /**
@@ -58,6 +58,15 @@ const REFRESH_SKEW_MS = 5 * 60 * 1000;
  * wall-clock on every run. Production never passes one.
  */
 export const REFRESH_TIMEOUT_MS = 20_000;
+
+/**
+ * A refresh that failed for a reason that says nothing about the session: the
+ * token endpoint timed out, could not be reached, or answered 5xx/429. A retry
+ * may well succeed, so callers must not report the credential as broken.
+ */
+export class ChatGptRefreshTransientError extends Error {
+  override name = 'ChatGptRefreshTransientError';
+}
 
 /** The ChatGPT OAuth session, as lazy stores and presents it. */
 export interface ChatGptTokens {
@@ -131,9 +140,10 @@ export function parseChatGptTokens(raw: string, source: string): ChatGptTokens {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
-  } catch (err) {
+  } catch {
+    // Parser diagnostics can include secret bytes from a malformed token.
     throw new Error(
-      `${source} is not valid JSON: ${err instanceof Error ? err.message : String(err)}. ` +
+      `${source} is not valid JSON. ` +
       `A ChatGPT credential is the JSON that \`codex login\` writes to ~/.codex/auth.json.`,
     );
   }
@@ -250,7 +260,7 @@ export async function refreshChatGptTokens(
     // "fetch failed" sends someone looking at their own network when the answer
     // is that the endpoint did not respond in time.
     const timedOut = err instanceof Error && err.name === 'TimeoutError';
-    throw new Error(
+    throw new ChatGptRefreshTransientError(
       timedOut
         ? `${CHATGPT_TOKEN_URL} did not respond within ` +
           `${timeoutMs >= 1000 ? `${Math.round(timeoutMs / 1000)}s` : `${timeoutMs}ms`} while refreshing ` +
@@ -261,6 +271,12 @@ export async function refreshChatGptTokens(
   }
 
   const text = await resp.text();
+  if (resp.status >= 500 || resp.status === 429) {
+    throw new ChatGptRefreshTransientError(
+      `${CHATGPT_TOKEN_URL} could not refresh the ChatGPT credential right now (HTTP ${resp.status}): ` +
+      `${text.slice(0, 400)}. Nothing was changed; the stored session is untouched. Retry the turn.`,
+    );
+  }
   if (!resp.ok) {
     throw new Error(
       `${CHATGPT_TOKEN_URL} refused to refresh the ChatGPT credential (HTTP ${resp.status}): ` +

@@ -172,7 +172,7 @@ describe('decideProxyPath — matching details', () => {
 });
 
 describe('refusal surfacing', () => {
-  // CLAUDE.md: errors are for humans — say what happened, with the actual values.
+  // AGENTS.md: errors are for humans — say what happened, with the actual values.
   test('the message names the refused method, path, and the rule', () => {
     const msg = pathRefusalMessage('POST', '/api/pull', 'role', 'unlisted-path');
     expect(msg).toContain('POST /api/pull');

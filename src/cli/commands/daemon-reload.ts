@@ -63,6 +63,15 @@ function pendingLine(p: PendingSetting, fileBroken: boolean): string {
 export function formatConfigStatus(status: ConfigStatus | null): string[] {
   if (!status) return ['  Config:  unknown — this daemon predates `lazy daemon reload`; restart it'];
   const lines = [`  Config:  ${status.path} (${RULE_WORDS[status.rule]})`];
+  if (status.sha256 !== undefined) {
+    if (status.sha256 === null) lines.push('           not present — lazy\'s defaults apply');
+    else lines.push(`           sha256 ${status.sha256}`);
+    if (status.rule === 'managed') {
+      lines.push(status.appliedVersion != null
+        ? `           configuration version ${status.appliedVersion} (applied ${status.appliedAt ?? 'at an unrecorded time'})`
+        : '           no configuration version is recorded for these bytes');
+    }
+  }
   if (status.lastKnownGood) {
     lines.push('');
     lines.push(`  ⚠ ${status.lastKnownGood.path} does NOT load, so the daemon is running on the last`);

@@ -196,7 +196,7 @@ model = "qwen3.5:35b"
     await writeFile(
       join(dir, 'lazy.toml'),
       `[agents.gateway]\nharness = "claude-code"\nmodel = "claude-sonnet-4-6"\n` +
-      `endpoint = "http://127.0.0.1:9999"\n\n[models.roles.agent]\nagent = "gateway"\n`,
+      `endpoint = "http://127.0.0.1:9999"\ncredential = "none"\n\n[models.roles.agent]\nagent = "gateway"\n`,
     );
     const config = await loadConfig(dir);
     expect(config.models.roles.agent.endpoint).toBe('http://127.0.0.1:9999');

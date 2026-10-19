@@ -521,3 +521,12 @@ export async function peekDaemonToken(
   return registry.tokens.find(t => recordKey(t) === key)?.token ?? null;
 }
 
+
+/**
+ * Every daemon bearer token in the registry (task, builder, control and user
+ * tokens alike) — for scrubbing them out of text an admin reads
+ * (src/daemon/observability-redaction.ts). Values only.
+ */
+export async function knownDaemonTokenValues(projectRoot: string): Promise<string[]> {
+  return (await getRegistry(projectRoot)).tokens.map((r) => r.token);
+}

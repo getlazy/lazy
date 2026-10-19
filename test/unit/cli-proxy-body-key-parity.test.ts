@@ -31,6 +31,7 @@ import { cliRpcBodies } from '../helpers/cli-rpc-bodies';
  * for `callerTaskId` — a key only lazy's own MCP boundary ever sets.
  */
 const REFUSED_BY_DESIGN: Readonly<Record<string, string>> = {
+  'wait.interruptOnNewChildOf': 'MCP-only task-bound wait interruption; only the running agent supplies its own task context.',
   'syncTask.callerTaskId': 'MCP-only proof that the caller is the task\'s own agent; lets a WORKING task self-sync.',
   'acceptTask.callerTaskId': 'MCP-only; lets a child merge into a parent whose agent is still working.',
   'acceptTask.allowBroken': '--allow-broken skips the accept check; the browser\'s accept never sends it.',
@@ -41,6 +42,9 @@ const REFUSED_BY_DESIGN: Readonly<Record<string, string>> = {
   'startTask.forceLocal': 'offline-mode start; the browser has no such control.',
   'startTask.retargetOrphan': 'retargets an orphaned child — a reparent by another door.',
   'startTask.reviewOverrides': 'per-task review settings; no browser page sets them.',
+  'createTask.review': 'per-task review settings on create (--review); no browser page sets them.',
+  'createTask.reviewGate': 'per-task review settings on create (--review-gate); no browser page sets them.',
+  'createTask.reviewAutoFix': 'per-task review settings on create (--review-auto-fix); no browser page sets them.',
   'unblockTask.agentOverride': 'switches the task\'s agent on unblock; the browser\'s feedback form cannot.',
   'unblockTask.permissionMode': 'runs the turn in a different permission mode; the browser never sends it.',
   'unblockTask.retargetOrphan': 'retargets an orphaned child — a reparent by another door.',
@@ -48,6 +52,11 @@ const REFUSED_BY_DESIGN: Readonly<Record<string, string>> = {
   'reviewTask.modelOverride': 'the browser\'s review button sends only the effort.',
   'cloneTask.base': 'pins a clone to an arbitrary commit; the browser\'s copy form offers only the source\'s own start commit (sameBase).',
   'cloneTask.defaultParent': 'makes the clone top-level; the browser\'s copy always lands beside the source.',
+  'runOneshot.model': 'no bound-clone command names a model; the daemon runs its builder-role model, as for the browser.',
+  'runOneshot.timeoutMs': '0 means unbounded; no bound-clone command sets it, and a member may not run an unbounded container.',
+  'runOneshot.taskId': 'no bound-clone command sends it; a one-shot from a clone acts on no task.',
+  'reviewPromoteRaised.prompt': '--prompt on lazy raised promote; the browser\'s promote card has a goal and a code only.',
+  'reviewPromoteRaised.parent': '--parent on lazy raised promote; the browser promotes beside or under the item\'s own task only.',
 };
 
 /**
@@ -60,18 +69,16 @@ const REFUSED_BY_DESIGN: Readonly<Record<string, string>> = {
 const REFUSED_COMMANDS: Readonly<Record<string, string>> = {
   describeLinkedTask: 'looks like a read, but runs a model one-shot (spends tokens) and rewrites the task\'s prompt and goal — with force, over a hand edit. The browser has no describe action.',
   taskEnv: 'its action can set/unset/clear a task\'s agent environment (secrets included); the browser has no such surface.',
-  submitTask: 'no browser equivalent.',
-  submitTaskPreflight: 'looks like a read, but unwedges a task stuck in merging (status, metadata, a comment); submitTask is refused, so it precedes nothing.',
-  reparentTask: 'no browser equivalent.',
-  linkTask: 'no browser equivalent.',
   repairCommits: 'store repair — a local operator act, not a member one.',
+  resetMachineDockerStorage: 'destroys every image, container and build cache on the project machine — a project-admin/god act served by the Machine page, never relayed from a bound clone.',
   concurrency: 'control-plane.',
-  usageLimits: 'control-plane — every member\'s usage-limit readings; the daemon refuses it to a user token, like listUserCredentials.',
-  usagePause: 'control-plane: the one-shot usage-pause override, and every member\'s paused credential (the daemon refuses user tokens too).',
-  tokenBudget: 'control-plane — names every member\'s credential with its window spend; the daemon refuses it to a user token, like usageLimits.',
-  tokenStats: 'not yet classified for the proxy (a bound clone\'s `lazy stats tokens` is refused rather than relayed).',
+  ackWaitComments: 'turn plumbing (register update): an agent\'s receipt for comments its lazy_wait handed over, sent by the MCP layer inside the task container, never by a bound clone or the browser.',
+  usageLimits: 'KEPT UNMAPPED in CliRpcCommand (a register update, not an invariant change): the daemon refuses it to a user token, so Teams serves it from its own narrowed usage-views route (Api::Cli::UsageViewsController), never as a verbatim relay of the control-plane answer.',
+  usagePause: 'KEPT UNMAPPED in CliRpcCommand (register update): served by the narrowed usage-views route, which allows only get/admitInteractive/admitOneshot; the one-shot override set and allowTask stay refused.',
+  tokenBudget: 'KEPT UNMAPPED in CliRpcCommand (register update): served by the narrowed usage-views route, credential windows filtered to the member.',
   builderSlot: 'control-plane (builder admission).',
   ensureTaskContainer: 'container plumbing on the daemon host.',
+  ensureTaskWorktree: 'session plumbing on the daemon host: it restores the worktree on the DAEMON\'s disk, a path a bound clone cannot use for `lazy shell --host`. Teams\' own recovery runs inside the daemon, never through this proxy.',
   getDaemonMcpConfig: 'mints an MCP session token — control-plane.',
   revokeDaemonMcpToken: 'control-plane.',
   setProjectSettings: 'the settings page is its own admin surface; not relayed for the CLI.',
@@ -86,11 +93,14 @@ const REFUSED_COMMANDS: Readonly<Record<string, string>> = {
   reviewFlagRaised: 'review-surface write; not yet classified for the proxy.',
   reviewResolveRaised: 'review-surface write; not yet classified for the proxy.',
   reviewUnresolveRaised: 'review-surface write; not yet classified for the proxy.',
-  reviewPromoteRaised: 'review-surface write; not yet classified for the proxy.',
   reviewPromoteDiscussion: 'review-surface write; not yet classified for the proxy.',
   reviewRetryAsk: 'review-surface write (launches an ask); not yet classified for the proxy.',
   reviewWithdrawComment: 'review-surface write; not yet classified for the proxy.',
   reviewViolationDecision: 'review-surface write; not yet classified for the proxy.',
+  imageBuildLog: 'quotes the machine\'s build log — the control plane\'s read; the daemon refuses it to a user token, and Rails decides which admin sees it.',
+  machineState: 'quotes the machine\'s service logs — the control plane\'s read; the daemon refuses it to a user token, and Rails decides which admin sees it.',
+  rebuildRunnerImage: 'a project admin\'s image control, offered on the Teams project page under its admin policy; not yet classified for the proxy.',
+  cancelImageBuild: 'a project admin\'s image control, offered on the Teams project page under its admin policy; not yet classified for the proxy.',
 };
 
 /**
@@ -98,7 +108,7 @@ const REFUSED_COMMANDS: Readonly<Record<string, string>> = {
  * and why their lists are what they are.
  */
 const NOT_SENT_BY_THE_CLI: Readonly<Record<string, string>> = {
-  editTask: 'dormant — lazy edit writes through storage; the list is the browser\'s TaskEdit fields.',
+  tokenStats: 'sent by `lazy stats latency` through queryTokenStats (a wrapper the scan does not follow); the proxy admits only modes "latency-cli" and "latency-history" (CliRpcCommand.body_refusal).',
   storage: 'sent by RemoteStorage as { method, args }; its args are StorageMethodPolicy\'s question.',
 };
 
@@ -148,8 +158,9 @@ describe('the proxy\'s body-key allowlist against the bodies the CLI sends', () 
     const unsent: string[] = [];
     for (const [ command, allowed ] of tables.bodyKeys) {
       const body = bodies.get(command);
+      if (Object.hasOwn(NOT_SENT_BY_THE_CLI, command)) continue;
       if (!body) {
-        if (!Object.hasOwn(NOT_SENT_BY_THE_CLI, command)) unsent.push(`${command} (no CLI call site at all)`);
+        unsent.push(`${command} (no CLI call site at all)`);
         continue;
       }
       for (const key of allowed) if (!body.keys.has(key)) unsent.push(`${command}.${key}`);

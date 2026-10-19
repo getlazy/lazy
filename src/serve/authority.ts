@@ -1,6 +1,6 @@
 /**
  * Teach a client process where the dashboard answers, so it can print the NAME
- * form of a task service URL (`http://web.my-task.lazy.localhost:26024`).
+ * form of a task service URL (`http://my-task.web.lazy.localhost:26024`).
  *
  * That URL is only composable by something that knows the dashboard's host and
  * port, because the proxy serving it rides the dashboard's listener. Inside the

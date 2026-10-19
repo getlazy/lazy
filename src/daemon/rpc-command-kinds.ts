@@ -67,6 +67,8 @@ export const READ_ONLY_RPC_COMMANDS: ReadonlySet<string> = new Set([
   'scratchSearch',
   'scratchMentions',
   'navCounts',
+  // Is each named branch protected (src/daemon/branch-protection.ts). Pure read.
+  'branchProtection',
   'diff',
   'fileLines',
   'regions',
@@ -89,24 +91,43 @@ export const READ_ONLY_RPC_COMMANDS: ReadonlySet<string> = new Set([
   'getTaskUpstreamStatus',
   'listReparentTargets',
   'taskEnv',
+  'taskFiles',
+  'taskEnvSeed',
   'describeLinkedTask',
   'getProjectSettings',
   // Which credential each agent profile takes from a member — the list a
   // control plane's "connect your credentials" page renders. No secret, no row.
   'agentCredentialProfiles',
+  'endpointCredentials',
+  'listEndpointCredentials',
   // The control plane's copy of a managed project's lazy.toml
   // (src/daemon/project-config.ts): the file in force, and a verdict on
   // candidate text, and candidate text with settings-form edits applied.
   // None of them writes anything.
   'getProjectConfig',
+  // Which endpoints and profiles wait for an admin to confirm them.
+  'getProjectConnections',
+  // Which live tasks name an agent this installation cannot run, and why.
+  'taskAgentProblems',
   'validateProjectConfig',
   'editProjectConfig',
   // ENVIRONMENT-ONLY write: replaces the control plane's config file outside
   // the clone. No store row; the control plane keeps who-changed-what itself.
   'applyProjectConfig',
+  // ENVIRONMENT-ONLY write: Teams' link templates for PR/MR descriptions live in
+  // the project settings record and name nobody, so the identity gate must not
+  // refuse them on an unmanaged daemon with no git identity.
+  'setTeamsLinks',
   'listUserCredentials',
   'checkUserCredential',
   'getAuthEnv',
+  // TURN PLUMBING, not a read: a running work turn's host-process supervisor
+  // takes the comments queued during the turn (src/daemon/turn-comments.ts),
+  // advancing the delivery mark and the turns-without-a-human count. Neither
+  // names a person, and the turn already passed the identity gate at launch.
+  'claimTurnNotes',
+  // The waiting agent's receipt for comments a wait handed it (same plumbing).
+  'ackWaitComments',
   'getCredentialState',
   'reviewQueue',
   'reviewDiff',
@@ -122,6 +143,8 @@ export const READ_ONLY_RPC_COMMANDS: ReadonlySet<string> = new Set([
   'identity',
   // Latest proxy usage-limit reading per credential — an in-memory read.
   'usageLimits',
+  // Which tier a tiered builder is answering on — in-memory plus config.
+  'builderTier',
   // The token-budget view: those readings plus recorded usage — a read.
   'tokenBudget',
   // Doctor is the surface that EXPLAINS an unconfigured identity (the
@@ -134,6 +157,26 @@ export const READ_ONLY_RPC_COMMANDS: ReadonlySet<string> = new Set([
   // runner and tasks and changes none of them — like doctor, it has to answer
   // precisely when something (identity included) is wrong.
   'daemonHealth',
+  // The project's boot-built runner image and one task's banner — a read.
+  'runnerImage',
+  // Re-runs the daemon's own image build: changes the ENVIRONMENT (a docker
+  // image), writes no row, and is how someone recovers from a failed build.
+  'retryRunnerImage',
+  // The same, as a project admin's explicit Rebuild (also of a ready image),
+  // its Cancel, and putting a failed adoption away: each changes only the
+  // ENVIRONMENT (a docker build, in-memory build state) and writes no row.
+  // Rails gates them on its admin policy (docs/design/project-observability.md).
+  'rebuildRunnerImage',
+  'cancelImageBuild',
+  'dismissImageAdoptionFailure',
+  // The image build's log and the machine's services, logs and resources —
+  // reads. Both quote logs, so the handlers refuse member tokens: the control
+  // plane reads them and Rails decides which person may see them.
+  'imageBuildLog',
+  'machineState',
+  // A branch's or task's committed Dockerfile next to the project branch's,
+  // for the "use Dockerfile.lazy from…" confirmation — a read.
+  'imageAdoptionPreview',
   // `lazy daemon status`'s config section: which lazy.toml is in force and
   // which startup-only settings differ from it — a read, and most needed when
   // something is misconfigured.
@@ -170,6 +213,9 @@ export const READ_ONLY_RPC_COMMANDS: ReadonlySet<string> = new Set([
   'mintActorToken',
   'revokeActorToken',
   'putUserCredential',
+  'putEndpointCredential',
+  'revokeEndpointCredential',
+  'setCredentialBillingMode',
   'revokeUserCredential',
 ]);
 
@@ -191,7 +237,23 @@ export const READ_ONLY_RPC_COMMANDS: ReadonlySet<string> = new Set([
  */
 export const STORE_WRITING_RPC_COMMANDS: ReadonlySet<string> = new Set([
   'regionOverlay',
+  // Restarting a guest service (dockerd, the forwarder) on the project's
+  // machine. No row, but it stops every running container: a WRITE, classified
+  // as one so the identity gate applies outside managed mode, and control-only
+  // below — god mode's verb, never a project admin's or member's.
+  'restartMachineService',
+  // Resetting the machine's Docker storage: deletes every image, container,
+  // volume and build cache. No row; a WRITE for the identity gate, control-only
+  // below (Rails decides which admins may ask).
+  'resetMachineDockerStorage',
+  // Adopting a ref's Dockerfile for the whole project, and switching back: no
+  // store row, but the adoption record NAMES who confirmed it, so like a row
+  // it needs a person (src/daemon/image-adoption.ts).
+  'adoptImageFromRef',
+  'clearImageAdoption',
   'startTask',
+  // Clears a task's default-image choice (task metadata) — a person's decision.
+  'useCustomRunnerImage',
   'editTask',
   'unblockTask',
   'askTask',
@@ -205,8 +267,15 @@ export const STORE_WRITING_RPC_COMMANDS: ReadonlySet<string> = new Set([
   // Rewrites a comment the agent has not seen, and stamps its editor.
   'editComment',
   'ensureTaskContainer',
+  'ensureTaskWorktree',
   'serve.setStartServicesCmd',
   'serve.clearStartServicesCmd',
+  'serve.setStopServicesCmd',
+  'serve.clearStopServicesCmd',
+  // Start services in the task's container (src/daemon/serve-run.ts): no row,
+  // but it brings the task's environment up and runs work in it.
+  'serve.run',
+  'serve.stop',
   'submitTask',
   'createTask',
   'cloneTask',
@@ -283,6 +352,12 @@ export const STORE_WRITING_RPC_COMMANDS: ReadonlySet<string> = new Set([
  * neither — so the next verb added has to say which it is.
  */
 export const HUMAN_INITIATED_RPC_COMMANDS: ReadonlySet<string> = new Set([
+  // Choosing the project's image is a project admin's confirmed decision —
+  // never a control-plane or agent act.
+  'adoptImageFromRef',
+  'clearImageAdoption',
+  // Switching a task back to the project's runner image is a person's call.
+  'useCustomRunnerImage',
   'startTask',
   'editTask',
   'unblockTask',
@@ -356,17 +431,39 @@ export const CONTROL_PLANE_RPC_COMMANDS: ReadonlySet<string> = new Set([
   // turn belongs to is the turn owner, recorded from the token that asked for
   // the turn (src/daemon/turn-credentials.ts), not from these.
   'ensureTaskContainer',
+  'ensureTaskWorktree',
   'getDaemonMcpConfig',
   'builderSlot',
+  // Turn plumbing: a running turn's host-process supervisor taking the comments
+  // queued during the turn (src/daemon/turn-comments.ts).
+  'claimTurnNotes',
+  // The waiting agent's receipt for comments a wait handed it (same plumbing).
+  'ackWaitComments',
   'revokeDaemonMcpToken',
   'mintDashboardTicket',
   // Operator configuration of a project, not an act on a task.
   'setProjectSettings',
   'applyProjectConfig',
+  // Teams telling the daemon how a PR/MR description links back to it.
+  'setTeamsLinks',
   'serve.setStartServicesCmd',
   'serve.clearStartServicesCmd',
-  // A throwaway container the control plane runs; writes no task row.
+  'serve.setStopServicesCmd',
+  'serve.clearStopServicesCmd',
+  // Start services in a task's container: container plumbing exactly like
+  // ensureTaskContainer — it spends no credential and writes no task row.
+  'serve.run',
+  'serve.stop',
+  // A throwaway container; writes no task row. A member's token reaches it too
+  // (Teams relays `lazy report` / `lazy ask <conversation>` from a bound clone),
+  // and is billed to that member through `runAsOneshotPayer`, never the control plane.
   'runOneshot',
+  // A fleet lifecycle verb on the project's machine — god mode's, through the
+  // control token; the handler refuses every member token.
+  'restartMachineService',
+  // Likewise the Docker storage reset: Rails gates who may ask; the daemon
+  // refuses every member token.
+  'resetMachineDockerStorage',
   // --- The environment-only writes, which are also in READ_ONLY_RPC_COMMANDS
   // because the identity gate must not refuse them. Named here too so the
   // partition is complete and a reader does not have to infer it. ---
@@ -376,8 +473,44 @@ export const CONTROL_PLANE_RPC_COMMANDS: ReadonlySet<string> = new Set([
   'mintActorToken',
   'revokeActorToken',
   'putUserCredential',
+  'putEndpointCredential',
+  'revokeEndpointCredential',
+  'setCredentialBillingMode',
   'revokeUserCredential',
+  // Reads AND rewrites the environment injected into a task's agent container
+  // (secrets included): operator configuration with no browser equivalent.
+  'taskEnv',
+  // Same for the secret FILES written into a task's worktree.
+  'taskFiles',
+  // And for the environment every new task of the project starts with.
+  'taskEnvSeed',
+  // A project admin's Rebuild / Cancel / put-away-a-failed-adoption. Teams
+  // gates them on its admin policy and sends them on the CONTROL token, so the
+  // daemon refuses a member token rather than trusting that gate alone.
+  'rebuildRunnerImage',
+  'cancelImageBuild',
+  'dismissImageAdoptionFailure',
 ]);
+
+/**
+ * The control-plane commands a member's (user-kind) token may still present.
+ *
+ * Every other command in {@link CONTROL_PLANE_RPC_COMMANDS} is refused to a
+ * user token by the daemon ITSELF (`handleRpc`), whatever the control plane in
+ * front of it allows — no surface may rely on not being THE surface. Teams'
+ * CLI proxy allowlist (`CliRpcCommand::COMMANDS`) is checked against this set
+ * by test/unit/control-plane-member-gate.test.ts.
+ */
+export const MEMBER_ALLOWED_CONTROL_PLANE_RPC_COMMANDS: ReadonlySet<string> = new Set([
+  // A member's `lazy report` / `lazy ask <conversation>` from a bound clone,
+  // billed to that member through `runAsOneshotPayer`.
+  'runOneshot',
+]);
+
+/** Must the daemon refuse a user-kind token for this command? */
+export function isControlOnlyRpc(command: string): boolean {
+  return CONTROL_PLANE_RPC_COMMANDS.has(command) && !MEMBER_ALLOWED_CONTROL_PLANE_RPC_COMMANDS.has(command);
+}
 
 /**
  * Is this call one a human initiates — so that in managed mode it may not ride
@@ -491,6 +624,7 @@ export const READ_ONLY_STORAGE_METHODS: ReadonlySet<string> = new Set([
   'getSystemMessage',
   'getStatusHistory',
   'getToolStats',
+  'getTurnLatency',
   'search',
   'readTraceSpans',
   'readWaitIntervals',
@@ -526,6 +660,8 @@ export const TELEMETRY_STORAGE_METHODS: ReadonlySet<string> = new Set([
   // Per-task tool stats: the proxy writes them as requests flow through it,
   // daemon-side, for the task-stats surfaces. Analytics, not domain state.
   'saveToolStats',
+  // Per-turn latency rollups: the proxy folds them the same way.
+  'mergeOpenTurnLatency',
 ]);
 
 /**

@@ -52,13 +52,11 @@ describe("a worktree's git layout", () => {
     const home = join(base, 'member-home');
     await mkdir(home);
     const copies = await writeMemberGitPointerCopies(home, layout);
-    expect(memberGitPointerMounts(copies)).toEqual([
-      '-v', `${join(home, 'git-pointers', 'dotgit')}:${join(worktree, '.git')}:ro`,
-      '-v', `${join(home, 'git-pointers', 'commondir')}:${join(gitdir, 'commondir')}:ro`,
-      '-v', `${join(home, 'git-pointers', 'gitdir')}:${join(gitdir, 'gitdir')}:ro`,
-    ]);
-    for (const [copy, original] of [['dotgit', join(worktree, '.git')], ['commondir', join(gitdir, 'commondir')], ['gitdir', join(gitdir, 'gitdir')]] as const) {
-      expect(await readFile(join(home, 'git-pointers', copy), 'utf-8')).toBe(await readFile(original, 'utf-8'));
+    expect(memberGitPointerMounts(copies)).toEqual(copies.flatMap((copy) => ['-v', `${copy.source}:${copy.target}:ro`]));
+    for (const [name, original] of [['dotgit', join(worktree, '.git')], ['commondir', join(gitdir, 'commondir')], ['gitdir', join(gitdir, 'gitdir')]] as const) {
+      const copy = copies.find((entry) => entry.target === original)!;
+      expect(copy.source).toMatch(new RegExp(`${home}/git-pointers/${name}-[a-f0-9]{64}$`));
+      expect(await readFile(copy.source, 'utf-8')).toBe(await readFile(original, 'utf-8'));
     }
   });
 

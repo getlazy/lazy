@@ -1,3 +1,5 @@
+import { parseSystemMessageDismissFilter } from '../messages/filter';
+import { handleEndpointCredentials, handleListEndpointCredentials, handlePutEndpointCredential, handleRevokeEndpointCredential, handleSetCredentialBillingMode } from './endpoint-credentials';
 /**
  * Daemon RPC handlers — execute command logic and return structured data.
  *
@@ -18,17 +20,23 @@
  * daemon code — it causes deadlocks and storage lock contention.
  */
 
+import { runnerImageStatus, describeRunnerImage, customImageReady, retryRunnerImageBuild, syncRunnerImageTarget } from './runner-image';
+import { taskRunnerImageView, useCustomRunnerImage, builderRunnerImageBanner } from './runner-image-choice';
 import { revertedProtectedFiles } from '../protection/reverted-files';
 import { resolveBuilderLaunchDirective, type BuilderLaunchDirective } from '../builder/launch-directive';
 import { createTask as createTaskFromInput } from './create-task';
 import { reviewSettingsViewOf } from '../review/mode';
 import { existsSync } from 'fs';
+import { branchServeAdviceFor } from '../serve/branch-advice';
 import { getWorktreePath, getBranchNameFromId, displayId, shortId, taskRef } from '../task/identity';
 import { parseStatsScope } from '../task/stats';
-import { collectDescendantTasks, loadTaskStats } from '../task/stats-data';
+import { latencyReport } from '../proxy/latency';
+import { collectDescendantTasks, loadTaskStats, loadTurnLatencyRollups } from '../task/stats-data';
+import { latencyHistory, rollupShapeProblem, type TurnLatencyRollup } from '../task/turn-latency';
 import {
   describeTokenStats,
   loadTokenReport,
+  loadAudit,
   parseTokenStatsTaskType,
   type TokenStatsGroup,
   type TokenStatsScope,
@@ -76,8 +84,11 @@ import {
   requireActorInput,
   requireRaisedCreateInput,
 } from './rpc-params';
-import { handleClearStartServicesCmd, handleGetStartServicesCmd, handleSetStartServicesCmd } from './serve-service';
+import { handleClearStartServicesCmd, handleClearStopServicesCmd, handleGetStartServicesCmd, handleSetStartServicesCmd, handleSetStopServicesCmd } from './serve-service';
+import { handleSetTeamsLinks } from './teams-links';
+import { mainServiceOf } from '../serve/ports';
 import { resolveProjectStartServicesCmd } from '../serve/start-cmd';
+import { servicesRestartOf } from '../task/services-restart-record';
 import {
   handleReviewQueue,
   handleNavCounts,
@@ -122,14 +133,20 @@ import { agentProfilesFor, agentProfileOrThrow, profileForAgentName, type AgentP
 import type { ResolvedConfig } from '../config/types';
 import { getAuthEnvVars } from '../capture/claude';
 import { credentialFromEnv, profileCredentialRefusal } from './credential-gate';
-import { sessionCredentialEnvFor, turnCredentialProblem } from './turn-credentials';
+import { sessionCredentialEnvFor, turnCredentialProblem, TurnCredentialUnavailableError } from './turn-credentials';
 import { credentialLabel, requiredCredentials, requiredProviders } from '../credentials/providers';
 import { locateProfileCredential } from '../agent/credentials';
 import type { DaemonCredentialEntry } from './auth-env';
-import { createStorage, type Storage, type StorageBackend } from '../storage';
+import { createStorage, resolveStorePath, type Storage, type StorageBackend } from '../storage';
+import { StoreRestoreInProgressError } from '../utils/storage-lock';
+import { assertNoRestoreInProgress } from '../storage/store-backup';
 import { setTaskEnv, unsetTaskEnv, clearTaskEnv, listTaskEnvKeys } from './task-env';
+import { setTaskFiles, listTaskFilePaths, clearTaskFiles, deliverTaskFiles, retiredTaskFilePaths } from './task-files';
+import { realignAfterDaemonWrite } from '../utils/worktree-ownership';
+import { isTerminalStatus } from '../task-state-machine';
 import { tapStorageEvents } from './event-tap';
 import { tapParentChildChanges } from './parent-child-tap';
+import { tapTaskEnvSeed, setTaskEnvSeed, listTaskEnvSeed } from './task-env-seed';
 import type { Task, SearchResult } from '../storage';
 import { toFollowUpView } from '../raised/legacy-view';
 import type { SpanRecord } from '../tracing/types';
@@ -140,6 +157,7 @@ import { VALID_EFFORT_LEVELS } from '../config/types';
 import { DEFAULT_ONESHOT_EFFORT } from '../oneshot/types';
 import { parentTaskIdOf, targetBranchOf, collectSubtreeIds, pruneTasksToDepth } from '../task-target';
 import { buildTaskTree, collectActiveTasks } from '../task/tree';
+import { buildOverview, buildTasksPage, parsePageListParams } from './page-views';
 import { loadTaskShowData } from '../task/show-data';
 import { isDeferredBy, clusterProgressOf, clusterProgressPayload } from '../task/cluster-progress';
 import { reopenedAfterAcceptOf } from '../task/reopen-after-accept';
@@ -150,6 +168,7 @@ import {
   wantsSection,
   buildNotesState,
   buildShowChunks,
+  buildShowTurns,
   buildShowFinal,
   buildShowReviews,
   type ShowSection,
@@ -183,7 +202,7 @@ import { describeIdentity, resolveGitIdentity } from '../identity';
 import { actorEmail, actorName, actorRole, canonicalPersonEmail, isPersonEmail } from '../actor-ref';
 import { reviewerKey } from '../review-draft';
 import { getActor } from '../constants';
-import { isHumanInitiatedRpc, isStoreWritingRpc, PERSON_ATTRIBUTED_STORAGE_ACTORS } from './rpc-command-kinds';
+import { isControlOnlyRpc, isHumanInitiatedRpc, isStoreWritingRpc, PERSON_ATTRIBUTED_STORAGE_ACTORS } from './rpc-command-kinds';
 import {
   mintDaemonToken,
   revokeDaemonTokens,
@@ -192,6 +211,7 @@ import {
   type ActorIdentity,
 } from './actor-tokens';
 import { runWithGitAuthor } from '../identity/git-author';
+import { memberAcceptApprover } from './member-accept-approval';
 import {
   putUserCredential,
   revokeUserCredential,
@@ -199,17 +219,21 @@ import {
   canonicalCredentialKey,
   teamModeEnabled,
 } from './user-credentials';
-import { checkUserCredential, clearUserAuthRejection } from './credential-check';
+import { auditRetentionOf, checkUserCredential, clearUserAuthRejection } from './credential-check';
 import {
   runAsTurnOwnerRequest,
   type PendingTurnOwner,
   type TurnOwnerRequest,
 } from './turn-owner';
 import { resolveAgentIdForStorageCreateTask } from '../agent/task-agent';
-import { effectiveProjectSettings, updateProjectSettings } from './project-settings';
+import { effectiveProjectSettings, readProjectSettings, resolveProjectModel, updateProjectSettings } from './project-settings';
+import { taskLaunchIdentityView } from '../task/launch-identity-view';
 import { assertAgentProfileRunnable, assertKnownAgentProfile } from './agent-profile-check';
 import type { ProjectSettings } from '../storage/types';
 import { readAuditRecords } from '../proxy/audit-log';
+import { unresolvedCredentialFailures, type CredentialFailure } from '../proxy/credential-health';
+import { credentialUsageKey, currentCredentialFailures, failurePredatesCredential } from './current-credential-failures';
+import { memberEndpointUsageKey } from '../proxy/usage-limits';
 import { daemonUsageLimits, type UsageLimitReading } from '../proxy/usage-limits';
 import { seedUsageReadings } from './usage-readings';
 import {
@@ -231,11 +255,15 @@ import { cloneTask, redoTask, listReparentTargets } from './clone-redo';
 import { linkTask, type LinkTaskParams } from './link-task';
 import { submitTaskPreflight } from './submit-preflight';
 import { ensureTaskContainer } from './task-container';
+import { runStartServices, stopStartServices, readServicesRunState, linkProcessesToServices, containerBinaryFor, type ServicesRunState } from './serve-run';
+import { ensureTaskWorktree } from './task-worktree';
 import { getTaskServeState } from '../serve/discovery';
 import { probeServices } from '../serve/probe';
 import { taskProgress } from './task-progress';
 import type { Comment } from '../types';
 import { logger } from '../utils/logger';
+import { redactSecretValuesDeep } from '../utils/redact';
+import { acknowledgePendingNotes, claimPendingNotesForRunningTurn, requireSupervisorCredential, type PendingNotesAnswer } from './turn-comments';
 import { VERSION } from '../version';
 import { groupScratchBySession, scratchEntry, searchScratch, scratchPathsMentionedIn } from '../builder/scratch-view';
 import { createRunner } from '../runner';
@@ -338,17 +366,36 @@ export async function getOrCreateStorage(): Promise<Storage> {
   // let two racing callers both pass `!daemonStorage` and each create their own.
   if (!daemonStorageInit) {
     const root = daemonProjectRoot;
+    const stage = (name: string) => {
+      storeOpening = { stage: name, startedAt: storeOpening?.startedAt ?? Date.now() };
+    };
     daemonStorageInit = (async () => {
       logger.debug('Initializing daemon storage...');
+      stage('loading the config');
       const config = await loadConfig(root);
-      const storage = await createStorage(root, {
-        backend: config.storage.backend as StorageBackend,
-        externalPath: config.storage.external_path || undefined,
-      });
-      // Acquire storage lock once and hold forever. The daemon is the sole writer
-      // (CLI uses RemoteStorage, agents run in containers with their own data dir).
-      // All FileStorage.withLock() calls become re-entrant within this process.
-      await (storage as any).lock?.acquire?.();
+      stage('opening the store');
+      let storage: Storage;
+      try {
+        storage = await createStorage(root, {
+          backend: config.storage.backend as StorageBackend,
+          externalPath: config.storage.external_path || undefined,
+        });
+        // Acquire storage lock once and hold forever. The daemon is the sole writer
+        // (CLI uses RemoteStorage, agents run in containers with their own data dir).
+        // All FileStorage.withLock() calls become re-entrant within this process.
+        storeLockPath = (storage as unknown as { lock?: { path?: string } }).lock?.path ?? null;
+        stage('acquiring the storage lock');
+        await (storage as any).lock?.acquire?.();
+      } catch (err) {
+        // A restore owns the store — its marker appeared after startDaemon's own
+        // check. The lock refused BEFORE touching the lock file (whose holder may
+        // be a host pid this side would judge stale); say what the restore left
+        // where, in full, which is what the operator needs.
+        if (err instanceof StoreRestoreInProgressError) {
+          await assertNoRestoreInProgress(await resolveStorePath(root));
+        }
+        throw err;
+      }
       // Wrap AFTER the lock acquire (which reaches past the Storage interface
       // for `.lock`) so the tap never sits between a caller and lock state.
       // This is the single chokepoint for the event feed: the daemon holds the
@@ -357,9 +404,12 @@ export async function getOrCreateStorage(): Promise<Storage> {
       // Parent-child notify sits OUTSIDE the event tap so the `[Subtask
       // added]` / `[Subtask removed]` comments it writes are themselves
       // published to the feed. See src/daemon/parent-child-tap.ts.
-      const tapped = tapParentChildChanges(tapStorageEvents(storage));
+      // The new-task environment seed sits outermost too: a task gets it
+      // before createTask returns, so before any surface can launch it.
+      const tapped = tapTaskEnvSeed(tapParentChildChanges(tapStorageEvents(storage)), root);
       daemonStorage = tapped;
       storeUnavailable = null;
+      storeOpening = null;
       // debug, not info: this is internal storage-lifecycle chatter. In the daemon
       // it's captured in the debug-level file log. Under the LAZY_TEST in-process
       // fallback (see requireStorage) this runs INSIDE the CLI process, where an
@@ -375,6 +425,7 @@ export async function getOrCreateStorage(): Promise<Storage> {
       // Clear the memo so a later caller (e.g. the next reconcile tick, once a
       // contending lock holder releases) can retry — but surface THIS failure.
       daemonStorageInit = null;
+      storeOpening = null;
       // The FIRST failure's time is kept across retries: "unavailable since" is
       // the question a supervisor asks, and each retry failing again is not news.
       storeUnavailable = {
@@ -384,7 +435,68 @@ export async function getOrCreateStorage(): Promise<Storage> {
       throw err;
     });
   }
-  return daemonStorageInit;
+  return awaitStoreOpen(daemonStorageInit);
+}
+
+/** How long a storage caller waits for the store to open before failing. */
+export const STORE_OPEN_DEADLINE_MS = 60_000;
+let storeOpenDeadlineMs = STORE_OPEN_DEADLINE_MS;
+
+/** Test seam: shorten (or, with no argument, restore) the store-open deadline. */
+export function setStoreOpenDeadlineForTests(ms: number = STORE_OPEN_DEADLINE_MS): void {
+  storeOpenDeadlineMs = ms;
+}
+
+/** The storage lock file this daemon opens its store with, once known. */
+let storeLockPath: string | null = null;
+
+/** The daemon's storage lock file, for the wedge report: null before the store was ever created. */
+export function daemonStoreLockPath(): string | null {
+  return storeLockPath;
+}
+
+/** The stage the store's opening is in, while it is opening. */
+let storeOpening: { stage: string; startedAt: number } | null = null;
+
+/** Where the store's opening is, for the wedge report: null once open (or never tried). */
+export function storeOpeningStage(now: number = Date.now()): { stage: string; sinceMs: number } | null {
+  return storeOpening ? { stage: storeOpening.stage, sinceMs: now - storeOpening.startedAt } : null;
+}
+
+/**
+ * Wait for the store to open, but never for ever.
+ *
+ * Every storage caller shares ONE opening (above), so an opening that never
+ * settles — a config or store read on a filesystem that stopped answering —
+ * used to hang every one of them silently: each reconcile and sync tick, every
+ * RPC. Past {@link STORE_OPEN_DEADLINE_MS} the caller gets an error naming the
+ * stage the opening is stuck in, and `storeUnavailable` says so on
+ * /daemon/status. The opening itself is left to finish rather than restarted
+ * (a second one would contend for the lock the first may be about to take); the
+ * first caller after it does gets the store, and the success clears the flag.
+ */
+async function awaitStoreOpen(init: Promise<Storage>): Promise<Storage> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const opening = storeOpening;
+      // Settled meanwhile: the race below has its answer, so say nothing.
+      if (!opening) return;
+      const error =
+        `The store did not open within ${Math.round(storeOpenDeadlineMs / 1000)}s ` +
+        `(stuck ${Math.round((Date.now() - opening.startedAt) / 1000)}s ${opening.stage}). ` +
+        `Something the daemon reads to open its store is not answering — send the daemon ` +
+        `SIGUSR2 to log what it is waiting on, then restart it.`;
+      storeUnavailable = { since: storeUnavailable?.since ?? opening.startedAt, error };
+      reject(new Error(error));
+    }, storeOpenDeadlineMs);
+    (timer as { unref?: () => void }).unref?.();
+  });
+  try {
+    return await Promise.race([init, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -407,6 +519,7 @@ export async function closeAllStorage(): Promise<void> {
   // closed instance.
   daemonStorageInit = null;
   storeUnavailable = null;
+  storeOpening = null;
 }
 
 /**
@@ -454,6 +567,15 @@ export async function handleRpc(
   // what the command does — and because a refusal must land before a store
   // write or a turn launch, not after.
   assertHumanActionCarriesAPerson(command, params, caller);
+  // The converse: control-plane plumbing never rides a member's token, and the
+  // daemon refuses it itself rather than trusting the control plane to filter.
+  if (caller.kind === 'user' && isControlOnlyRpc(command)) {
+    throw new RpcError(
+      403,
+      `Forbidden: ${command} is a control-plane operation, available to the project control token only. ` +
+      `This token identifies user ${caller.email}.`,
+    );
+  }
   // A run report quotes the daemon's own log: the control plane's read, never a member's.
   if (command === 'builderRunReport' && caller.kind === 'user') {
     throw new RpcError(403, 'builderRunReport is available to the project control token only');
@@ -591,14 +713,33 @@ async function dispatchRpc(
     case 'expandPresentation':
       return (await import('./presentation-expand')).handleExpandPresentation(projectRoot, params);
     case 'wait': return handleWait(projectRoot, params);
+    case 'ackWaitComments': return handleAckWaitComments(params);
     case 'startTask': return handleStartTask(projectRoot, params, progress);
+    // The project's boot-built runner image (src/daemon/runner-image.ts).
+    case 'runnerImage': return handleRunnerImage(params, projectRoot);
+    case 'retryRunnerImage': return handleRetryRunnerImage(projectRoot);
+    // What the project's machine is doing (docs/design/project-observability.md):
+    // the image build's log, Rebuild/Cancel, and the machine's services.
+    case 'rebuildRunnerImage': return handleRebuildRunnerImage(projectRoot, params);
+    case 'cancelImageBuild': return handleCancelImageBuild(projectRoot, params);
+    case 'dismissImageAdoptionFailure': return handleDismissImageAdoptionFailure(projectRoot);
+    case 'imageBuildLog': return handleImageBuildLog(projectRoot, params, caller);
+    case 'machineState': return handleMachineState(projectRoot, params, caller);
+    case 'restartMachineService': return handleRestartMachineService(projectRoot, params, caller);
+    case 'resetMachineDockerStorage': return handleResetMachineDockerStorage(projectRoot, params, caller);
+    // Teams' way out of a failing Dockerfile.lazy: adopt a branch's or task's
+    // committed Dockerfile for the whole project (src/daemon/image-adoption.ts).
+    case 'imageAdoptionPreview': return handleImageAdoptionPreview(projectRoot, params);
+    case 'adoptImageFromRef': return handleAdoptImageFromRef(projectRoot, params, caller);
+    case 'clearImageAdoption': return handleClearImageAdoption(projectRoot);
+    case 'useCustomRunnerImage': return handleUseCustomRunnerImage(params);
     case 'editTask': return handleEditTask(projectRoot, params);
     case 'unblockTask': return handleUnblockTask(projectRoot, params, progress);
     case 'askTask': return handleAskTask(projectRoot, params, progress);
     case 'reviewTask': return handleReviewTask(projectRoot, params, progress);
     case 'awaitClaimedTurn': return handleAwaitClaimedTurn(projectRoot, params, progress);
     case 'acceptTaskPreflight': return handleAcceptTaskPreflight(projectRoot, params);
-    case 'acceptTask': return handleAcceptTask(projectRoot, params, progress);
+    case 'acceptTask': return handleAcceptTask(projectRoot, params, progress, caller);
     case 'watchProxyActivity': return handleWatchProxyActivity(await resolveActivityFilterParams(params), progress);
     case 'rejectTask': return handleRejectTask(projectRoot, params, progress);
     case 'closeTask': return handleCloseTask(projectRoot, params, progress);
@@ -606,10 +747,16 @@ async function dispatchRpc(
     case 'reopenTask': return handleReopenTask(projectRoot, params);
     case 'editComment': return handleEditComment(projectRoot, params);
     case 'ensureTaskContainer': return handleEnsureTaskContainer(projectRoot, params);
+    case 'ensureTaskWorktree': return handleEnsureTaskWorktree(projectRoot, params);
     case 'servePorts': return handleServePorts(projectRoot, params);
     case 'serve.getStartServicesCmd': return handleGetStartServicesCmd(projectRoot);
+    case 'setTeamsLinks': return handleSetTeamsLinks(params);
     case 'serve.setStartServicesCmd': return handleSetStartServicesCmd(params);
     case 'serve.clearStartServicesCmd': return handleClearStartServicesCmd();
+    case 'serve.setStopServicesCmd': return handleSetStopServicesCmd(params);
+    case 'serve.clearStopServicesCmd': return handleClearStopServicesCmd();
+    case 'serve.run': return runStartServices(projectRoot, { taskId: requireString(params, 'taskId') }, { progress });
+    case 'serve.stop': return stopStartServices(projectRoot, { taskId: requireString(params, 'taskId') });
     case 'taskProgress': return handleTaskProgress(projectRoot, params);
     case 'taskStats': return handleTaskStats(projectRoot, params);
     case 'tokenStats': return handleTokenStats(projectRoot, params);
@@ -621,6 +768,8 @@ async function dispatchRpc(
     case 'redoTask': return handleRedoTask(projectRoot, params);
     case 'listReparentTargets': return handleListReparentTargets(projectRoot, params);
     case 'taskEnv': return handleTaskEnv(projectRoot, params);
+    case 'taskFiles': return handleTaskFiles(projectRoot, params);
+    case 'taskEnvSeed': return handleTaskEnvSeed(projectRoot, params);
     case 'resumeTask': return handleResumeTask(projectRoot, params, progress);
     case 'syncTask': return handleSyncTask(projectRoot, params, progress);
     case 'syncTaskFromRemote': return handleSyncTaskFromRemote(projectRoot, params);
@@ -633,18 +782,35 @@ async function dispatchRpc(
     case 'usagePause': return handleUsagePause(projectRoot, params, caller);
     case 'turnCredentialCheck': return handleTurnCredentialCheck(projectRoot, params, caller);
     case 'getProjectSettings': return handleGetProjectSettings(projectRoot);
+    case 'endpointCredentials': return handleEndpointCredentials(projectRoot, params, caller);
+    case 'listEndpointCredentials': return handleListEndpointCredentials(projectRoot, params, caller);
+    case 'putEndpointCredential': return handlePutEndpointCredential(projectRoot, params, caller);
+    case 'revokeEndpointCredential': return handleRevokeEndpointCredential(projectRoot, params, caller);
+    case 'setCredentialBillingMode': return handleSetCredentialBillingMode(projectRoot, params, caller);
     case 'agentCredentialProfiles': return handleAgentCredentialProfiles(projectRoot, params, caller);
     case 'getProjectConfig':
       return (await import('./project-config')).readProjectConfig(projectRoot);
+    case 'taskAgentProblems': {
+      // Tasks naming an agent this installation cannot run, with the reason —
+      // an adopted store brings its tasks verbatim (./agent-usability).
+      const ids = params.taskIds;
+      if (ids !== undefined && (!Array.isArray(ids) || ids.some((i) => typeof i !== 'string'))) {
+        throw new RpcError(400, 'taskIds must be an array of task ids');
+      }
+      const storage = await getOrCreateStorage();
+      return { problems: await (await import('./agent-usability')).taskAgentProblems(storage, projectRoot, ids as string[] | undefined) };
+    }
+    case 'getProjectConnections':
+      return (await import('./project-config')).readProjectConnections(projectRoot, params.toml, params.origin);
     case 'validateProjectConfig':
-      return (await import('./project-config')).validateProjectConfig(params.toml, params.before);
+      return (await import('./project-config')).validateProjectConfig(params.toml, params.before, params.origin, params.beforeOrigin);
     case 'editProjectConfig':
       return (await import('./project-config')).editProjectConfig(params.toml, params.set, params.unset);
     case 'applyProjectConfig':
       // The control plane's own configuration of the project: never a member's
       // token, exactly like pushing a credential.
       requireControlActor(caller, 'applyProjectConfig');
-      return (await import('./project-config')).applyProjectConfig(projectRoot, params.toml);
+      return (await import('./project-config')).applyProjectConfig(projectRoot, params.toml, params.version, params.origin);
     case 'setProjectSettings': return handleSetProjectSettings(projectRoot, params);
     case 'builderSlot': return handleBuilderSlot(projectRoot, params);
     case 'getDaemonMcpConfig': return handleGetDaemonMcpConfig(projectRoot, params);
@@ -668,9 +834,30 @@ async function dispatchRpc(
     // what every CLI command asks BEFORE opening an editor, so that a refusal
     // can never discard feedback a human already typed.
     case 'identity': return handleIdentity(projectRoot);
+    // Read-only: is each named branch protected? Lazy Teams' hosted git asks
+    // before letting a member push a non-task branch (src/daemon/branch-protection.ts).
+    case 'branchProtection':
+      return (await import('./branch-protection')).handleBranchProtection(projectRoot, params);
     case 'usageLimits': return handleUsageLimits(projectRoot, caller);
+    case 'builderTier': {
+      const { builderTierViewForCaller, builderTierLine } = await import('./builder-tier');
+      const view = await builderTierViewForCaller(projectRoot, await loadConfig(projectRoot), await getOrCreateStorage(), caller ?? { kind: 'control' }, optionalString(params, 'builderSessionId'));
+      return { ...view, line: builderTierLine(view) };
+    }
     case 'tokenBudget': return handleTokenBudget(projectRoot, caller);
     case 'getAuthEnv': return handleGetAuthEnv(projectRoot, params);
+    // A host-process supervisor's way to /agent/pending-notes: it holds no task
+    // token, only the daemon's own, so the task is named here. Control-only.
+    case 'claimTurnNotes': {
+      const storage = await getOrCreateStorage();
+      const taskId = requireString(params, 'taskId');
+      const task = await storage.getTask(taskId);
+      if (!task) throw new RpcError(404, `Task ${shortId(taskId)} not found.`);
+      requireSupervisorCredential(task, params);
+      return params.ack_through !== undefined
+        ? acknowledgePendingNotes(storage, task, params.ack_through, params.claim_id)
+        : claimPendingNotesForRunningTurn(storage, projectRoot, task);
+    }
     case 'getCredentialState': return handleGetCredentialState(projectRoot, params);
     // The review surface. In-process this port is injected straight into the
     // daemon's own web handler; these commands are the same port over the wire,
@@ -710,7 +897,7 @@ async function dispatchRpc(
     case 'compactMemory': return handleCompactMemory(projectRoot, params, progress);
     case 'clearMemoryCompact': return handleClearMemoryCompact(projectRoot, params);
     case 'memoryStatus': return handleMemoryStatus(projectRoot);
-    case 'doctor.run': return handleDoctorRun(projectRoot, params);
+    case 'doctor.run': return handleDoctorRun(projectRoot, params, progress);
     case 'doctor.report': return handleDoctorReport(projectRoot);
     case 'daemonHealth': return handleDaemonHealth(projectRoot, params, progress);
     case 'doctor.previewRemedy': return handleDoctorPreviewRemedy(projectRoot, params);
@@ -844,6 +1031,23 @@ async function buildTreeWithDepth(
 
 export async function handleList(projectRoot: string, params: Record<string, unknown>) {
   const storage = await getOrCreateStorage();
+
+  // Teams' project page and Tasks page. No `shape` keeps the full tree below
+  // for the CLI and every older client. `all` may ride along with `shape`:
+  // an older daemon ignores `shape` and still needs `all: true` to include
+  // finished tasks, and this daemon decides the set from the view instead.
+  const shape = optionalEnum(params, 'shape', ['overview', 'page'] as const);
+  if (shape) {
+    if (params.levels !== undefined && params.levels !== null) {
+      throw new RpcError(400, "shape cannot be combined with levels");
+    }
+    if (typeof params.taskFilter === 'string' && params.taskFilter) {
+      throw new RpcError(400, "shape cannot be combined with taskFilter");
+    }
+    if (shape === 'overview') return buildOverview(storage);
+    return buildTasksPage(storage, projectRoot, parsePageListParams(params));
+  }
+
   const all = params.all === true;
   const levels = optionalLevels(params);
   let tasks = all
@@ -1047,6 +1251,8 @@ export async function handleSetProjectSettings(projectRoot: string, params: Reco
   await updateProjectSettings(storage, (previous) => {
     if (previous?.startServicesCmd) next.startServicesCmd = previous.startServicesCmd;
     if (previous?.startServicesCmdCleared) next.startServicesCmdCleared = true;
+    if (previous?.stopServicesCmd) next.stopServicesCmd = previous.stopServicesCmd;
+    if (previous?.teamsLinks) next.teamsLinks = previous.teamsLinks;
     return next;
   });
   return effectiveProjectSettings(next, config);
@@ -1171,7 +1377,17 @@ async function outstandingFileViolations(
  * and the `delivered` flag on every comment, `chunks`, and `reviews`. See
  * src/task/show-sections.ts.
  */
+/**
+ * `show`'s answer, with every known secret value scrubbed from every string
+ * in it. Records are already scrubbed when they are WRITTEN (normalizeRecordContent);
+ * this covers what predates a value's registration and the fields a person
+ * typed (goal, prompt), so no `show` surface — CLI, dashboard, Teams — prints one.
+ */
 export async function handleShow(projectRoot: string, params: Record<string, unknown>) {
+  return redactSecretValuesDeep(await handleShowUnredacted(projectRoot, params));
+}
+
+async function handleShowUnredacted(projectRoot: string, params: Record<string, unknown>) {
   if (typeof params.taskId !== 'string' || !params.taskId) {
     throw new RpcError(400, 'taskId is required');
   }
@@ -1217,7 +1433,11 @@ export async function handleShow(projectRoot: string, params: Record<string, unk
     wantsSection(sections, section) ? items.slice(offset, offset + limit) : []
   );
 
-  const data = await loadTaskShowData(storage, result.task, projectRoot);
+  // Child sessions are only read when the children section is served (or the
+  // caller asked for the whole record). The subtasks tab is the one surface
+  // that shows them; every other tab was waiting on one session file per child.
+  const loadChildSessions = sections === null || wantsSection(sections, 'children');
+  const data = await loadTaskShowData(storage, result.task, projectRoot, { loadChildSessions });
   const config = await loadConfig(projectRoot);
 
   // The derived answers, resolved HERE so no client re-derives them. Each is a
@@ -1244,12 +1464,13 @@ export async function handleShow(projectRoot: string, params: Record<string, unk
   return {
     task: data.task,
     session: data.session,
-    turns: page('turns', data.turns),
+    // Each turn carries `fold`: its own text apart from lazy's wrapper.
+    turns: buildShowTurns(page('turns', data.turns)),
     // Each recorded commit carries who made it and when, read from git — the
     // store records only the SHA, and a client must not run git itself.
     commits: await withCommitIdentities(page('commits', data.commits), projectRoot),
     // Every comment carries whether the agent has SEEN it, so a client never
-    // compares its own timestamps against the cutoff (CLAUDE.md: "A lazy
+    // compares its own timestamps against the cutoff (AGENTS.md: "A lazy
     // comment never starts a turn" — the cutoff is the last delivery).
     comments: page('comments', data.comments).map((c) => ({
       ...c,
@@ -1287,6 +1508,17 @@ export async function handleShow(projectRoot: string, params: Record<string, unk
      * `max` 0 means unlimited. Never section-gated, same rule as `final`.
      */
     turnBudget,
+
+    /**
+     * Which runner image this task runs on and the banner to show for it —
+     * set when it runs on lazy's default image because the project's own
+     * image was not ready (src/daemon/runner-image-choice.ts). Never
+     * section-gated, same rule as `final`.
+     */
+    runnerImage: await (await import('./observability-redaction')).redactAnswer(
+      projectRoot,
+      taskRunnerImageView(data.task, data.task.status === 'working'),
+    ),
 
     /**
      * What this response actually served, and how big each section is whole.
@@ -1327,6 +1559,15 @@ export async function handleShow(projectRoot: string, params: Record<string, unk
     })(),
 
     /**
+     * What the task's next turn runs on — the resolved profile (built-in or
+     * lazy.toml, harness, endpoint, credential NAME, tiers) and where the model
+     * and effort come from (src/task/launch-identity-view.ts). The ANSWER, from
+     * the launch's own resolution, so a client never reads lazy.toml to explain
+     * a header. Never section-gated; null only when it cannot be resolved.
+     */
+    launchIdentity: await launchIdentityOf(storage, result.task, config),
+
+    /**
      * Which accept a reopen superseded (`{ accept_commit, reopened_at }`), or
      * null — including once the task is accepted again. The ANSWER, so no
      * client parses task metadata or re-applies the "not while complete" rule
@@ -1334,6 +1575,14 @@ export async function handleShow(projectRoot: string, params: Record<string, unk
      * `clusterProgress`.
      */
     reopenedAfterAccept: result.task.status === 'complete' ? null : reopenedAfterAcceptOf(result.task),
+
+    /**
+     * The last automatic restart of the task's services after a work turn —
+     * when it ran, whether stop and start worked, and the warning when start
+     * failed (src/daemon/services-restart.ts). null when none has run. Never
+     * section-gated, same rule as `clusterProgress`.
+     */
+    servicesRestart: servicesRestartOf(result.task),
 
     // Explicit list (same rule as mergeState): omitting raisedItems / turnReport /
     // fileDecisions would silently drop those sections over RPC even when
@@ -1354,6 +1603,7 @@ export async function handleShow(projectRoot: string, params: Record<string, unk
     autoReactStatus: data.autoReactStatus,
     supervisorStatus: data.supervisorStatus,
     workingSubstate: data.workingSubstate,
+    turnFailure: data.turnFailure,
     // A mid-merge worktree only reaches the CLI if it is serialized here — this
     // list is explicit, so an omission silently restores the old lie that a
     // stranded task is just `blocked` (fix-sync-silent-conflict).
@@ -1911,6 +2161,26 @@ export async function handleFileLines(projectRoot: string, params: Record<string
 // --- Wait ---
 
 /**
+ * The waiting agent's receipt for comments a `wait` handed it: marks them
+ * delivered through the claim's mark, once, exactly as the turn-end hand-off does.
+ */
+export async function handleAckWaitComments(params: Record<string, unknown>) {
+  const storage = await getOrCreateStorage();
+  const taskId = requireString(params, 'taskId');
+  const task = await storage.getTask(taskId);
+  if (!task) throw new RpcError(404, `Task ${shortId(taskId)} not found.`);
+  return acknowledgePendingNotes(storage, task, params.through, params.claim_id);
+}
+
+/** Resolve the waiting task to its full id; a wrong reference must fail, not silently watch nothing. */
+async function resolveWaitWatchParent(storage: Awaited<ReturnType<typeof getOrCreateStorage>>, ref: string | undefined): Promise<string | undefined> {
+  if (ref === undefined) return undefined;
+  const { task } = await storage.resolveTask(ref);
+  if (!task) throw new RpcError(404, `Task not found: ${ref} (interruptOnNewChildOf)`);
+  return task.id;
+}
+
+/**
  * Long-poll until the FIRST of one or more tasks finishes its turn — its turn
  * count increases with an agent turn, or its status changes from 'working'.
  *
@@ -1920,8 +2190,40 @@ export async function handleFileLines(projectRoot: string, params: Record<string
 export async function handleWait(projectRoot: string, params: Record<string, unknown>) {
   const inputs = normalizeWaitInputs(params);
   const storage = await getOrCreateStorage();
+  const watchParent = await resolveWaitWatchParent(storage, optionalString(params, 'interruptOnNewChildOf'));
+  // Comments on the waiting task are handed over by the same claim a turn-end
+  // hand-off uses, so budget, filtering and the delivery mark are shared.
+  // Budget spent: the notes stay queued, noted once per batch rather than per poll.
+  let exhaustedFor = -1;
+  // The full claim (turn authority, every comment, the session's turns) runs
+  // only when the comment set changed since a settled none/exhausted answer —
+  // a wait polls every 1.5s for up to 600s.
+  let settledSignature: string | null = null;
+  const claimComments = watchParent
+    ? async () => {
+        const waiter = await storage.getTask(watchParent);
+        if (!waiter) return null;
+        const comments = await storage.getTaskComments(waiter.id);
+        const signature = `${comments.length}:${Math.max(0, ...comments.map(c => c.created_at))}`;
+        if (signature === settledSignature) return null;
+        const answer = await claimPendingNotesForRunningTurn(storage, projectRoot, waiter);
+        settledSignature = answer.kind === 'none' || answer.kind === 'budget_exhausted' ? signature : null;
+        if (answer.kind === 'budget_exhausted') {
+          if (exhaustedFor !== answer.count) {
+            exhaustedFor = answer.count;
+            logger.info(`wait: comments on ${displayId(waiter)} stay queued — ${answer.reason}`);
+          }
+          return null;
+        }
+        return answer.kind === 'notes'
+          ? { notes: answer.notes, count: answer.count, through: answer.through, claim_id: answer.claim_id }
+          : null;
+      }
+    : undefined;
   const result = await raceWait(storage, inputs, {
     timeoutSecs: optionalNumber(params, 'timeout'),
+    interruptOnNewChildOf: watchParent,
+    claimComments,
   });
 
   // Report a half-merged worktree on the winner. Computed here rather than in
@@ -1932,7 +2234,8 @@ export async function handleWait(projectRoot: string, params: Record<string, unk
   // Also resolve head_sha here: for a complete task it is the accept-tag commit
   // (same SHA the parent `[Subtask accepted]` comment carries); otherwise the
   // task branch tip. Observational — never fails the wait.
-  if (!result.timed_out) {
+  // An interruption that settled nothing has no winner worth a tip SHA.
+  if (!result.timed_out && !(result.interrupted && result.status === 'working')) {
     try {
       const task = await storage.getTask(result.task_id);
       if (task) {
@@ -2498,6 +2801,283 @@ function requireControlActor(caller: ActorIdentity, command: string): void {
   );
 }
 
+
+/**
+ * The project image state, plus one task's banner when `taskId` is given.
+ * `imageState` is THE answer every surface renders (src/daemon/image-state.ts);
+ * `project`, `adoption` and `adoptionBuild` are the raw trackers it is derived
+ * from, kept for older clients. The whole answer is redacted on the way out:
+ * a failed build's output is in it.
+ */
+export async function handleRunnerImage(params: Record<string, unknown>, projectRoot: string) {
+  await syncRunnerImageTarget();
+  const project = runnerImageStatus();
+  const { projectImageState } = await import('./image-state');
+  // The ref adoption in force (with its "the project branch's file changed"
+  // notice) and the state of an adoption build, for the recovery surfaces.
+  const { refAdoptionView, adoptionBuildStatus } = await import('./image-adoption');
+  const adoptionView = await refAdoptionView(projectRoot).catch((err) => {
+    logger.warn(`runnerImage: could not read the image adoption: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  });
+  const result: Record<string, unknown> = {
+    project, description: describeRunnerImage(project), ready: customImageReady(),
+    imageState: await projectImageState(projectRoot, { adoptionView }),
+    adoption: adoptionView,
+    adoptionBuild: adoptionBuildStatus(),
+  };
+  const taskId = optionalString(params, 'taskId');
+  if (taskId) {
+    const storage = await getOrCreateStorage();
+    const { task } = await storage.resolveTask(taskId);
+    if (!task) throw new RpcError(404, `Task not found: ${taskId}`);
+    result.task = taskRunnerImageView(task, task.status === 'working');
+  }
+  const builderSessionId = optionalString(params, 'builderSessionId');
+  if (builderSessionId) {
+    const storage = await getOrCreateStorage();
+    const session = await storage.getBuilderSession(builderSessionId);
+    if (!session) throw new RpcError(404, `Builder session not found: ${builderSessionId}`);
+    result.builder = { runnerImage: session.runnerImage ?? null, banner: builderRunnerImageBanner(session) };
+  }
+  return (await import('./observability-redaction')).redactAnswer(projectRoot, result);
+}
+
+async function imageAdoptionCall<T>(fn: () => Promise<T>): Promise<T> {
+  const { ImageAdoptionError } = await import('./image-adoption');
+  try {
+    return await fn();
+  } catch (err) {
+    if (err instanceof ImageAdoptionError) throw new RpcError(err.status, err.message);
+    throw err;
+  }
+}
+
+export async function handleImageAdoptionPreview(projectRoot: string, params: Record<string, unknown>) {
+  const ref = requireString(params, 'ref');
+  const { previewImageAdoption } = await import('./image-adoption');
+  return imageAdoptionCall(async () => previewImageAdoption(projectRoot, await getOrCreateStorage(), ref));
+}
+
+export async function handleAdoptImageFromRef(projectRoot: string, params: Record<string, unknown>, caller: ActorIdentity) {
+  const ref = requireString(params, 'ref');
+  const commit = requireString(params, 'commit');
+  const contentHash = requireString(params, 'contentHash');
+  // WHO CONFIRMED IT, from the caller's token (a member) or, on a laptop, the
+  // daemon's git identity — never a request field (applyCallerActor has
+  // already refused a caller with neither).
+  let adoptedBy: { email: string | null; name: string | null };
+  if (caller.kind === 'user') {
+    adoptedBy = { email: caller.email, name: caller.name ?? null };
+  } else {
+    const resolution = await resolveGitIdentity(projectRoot);
+    adoptedBy = resolution.configured
+      ? { email: resolution.identity.email, name: resolution.identity.name ?? null }
+      : { email: null, name: null };
+  }
+  const { containerRunnerBinary } = await import('./runner-image');
+  const { startImageAdoption } = await import('./image-adoption');
+  const build = await imageAdoptionCall(async () => startImageAdoption(
+    projectRoot,
+    await getOrCreateStorage(),
+    { ref, commit, contentHash, adoptedBy },
+    {
+      resolveBinary: async () => (await containerRunnerBinary(projectRoot))?.binary ?? null,
+      onAdopted: () => syncRunnerImageTarget(),
+    },
+  ));
+  const { projectImageState } = await import('./image-state');
+  const { redactAnswer } = await import('./observability-redaction');
+  return redactAnswer(projectRoot, { adoptionBuild: build, imageState: await projectImageState(projectRoot) });
+}
+
+export async function handleClearImageAdoption(projectRoot: string) {
+  const { clearRefImageAdoption } = await import('./image-adoption');
+  return imageAdoptionCall(() => clearRefImageAdoption(projectRoot, { onCleared: () => syncRunnerImageTarget() }));
+}
+
+export async function handleRetryRunnerImage(projectRoot: string) {
+  const r = await retryRunnerImageBuild();
+  if (!r.ok) throw new RpcError(409, r.message);
+  return imageStateAnswer(projectRoot, { project: r.status, description: describeRunnerImage(r.status) });
+}
+
+/**
+ * `extra` plus `{ imageState }`, the WHOLE answer redacted — what every image
+ * control answers with (a project status can carry a failed build's output).
+ */
+async function imageStateAnswer<T extends Record<string, unknown>>(projectRoot: string, extra: T = {} as T): Promise<T & { imageState: unknown }> {
+  const { projectImageState } = await import('./image-state');
+  const { redactAnswer } = await import('./observability-redaction');
+  return redactAnswer(projectRoot, { ...extra, imageState: await projectImageState(projectRoot) });
+}
+
+/**
+ * A project admin's Rebuild of the project image. Non-blocking: returns as soon
+ * as the build has started, with its `buildId` in `imageState.build`. Refused
+ * (409) while a build or an adoption runs — Cancel it first, so the panel
+ * never shows two builds. A stale failed adoption is put away once the
+ * rebuild has started: the admin moved on.
+ */
+export async function handleRebuildRunnerImage(projectRoot: string, params: Record<string, unknown>) {
+  const noCache = optionalBoolean(params, 'noCache') === true;
+  const { adoptionBuildStatus, dismissImageAdoptionFailure } = await import('./image-adoption');
+  const adoption = adoptionBuildStatus();
+  if (adoption.state === 'building') {
+    throw new RpcError(409, `An adoption of ${adoption.branch} is building; cancel it before rebuilding the project's image.`);
+  }
+  const { rebuildRunnerImage } = await import('./runner-image');
+  const r = await rebuildRunnerImage({ noCache });
+  if (!r.ok) throw new RpcError(409, r.message);
+  dismissImageAdoptionFailure();
+  if (r.defaultBuild) {
+    // A project on lazy's default image: the Rebuild is of that image, and its
+    // build id rides beside imageState (which describes the project's own image).
+    return imageStateAnswer(projectRoot, {
+      project: r.status,
+      defaultBuild: r.defaultBuild,
+      description: `Rebuilding lazy's default runner image ${r.defaultBuild.imageName}.`,
+    });
+  }
+  return imageStateAnswer(projectRoot, { project: r.status, description: describeRunnerImage(r.status) });
+}
+
+/**
+ * Cancel the running image build: the adoption's when one is running (it is
+ * the build the panel shows), else the project image's. `buildId`, when given,
+ * must name the running build, so a stale page cannot cancel a newer one.
+ * Non-blocking: the docker client is killed and the state settles at once.
+ */
+export async function handleCancelImageBuild(projectRoot: string, params: Record<string, unknown>) {
+  const buildId = optionalString(params, 'buildId');
+  const { adoptionBuildStatus, cancelImageAdoption } = await import('./image-adoption');
+  const { runnerImageStatus: projectStatus, cancelRunnerImageBuild } = await import('./runner-image');
+  const adoption = adoptionBuildStatus();
+  const project = projectStatus();
+  const projectBuildId = project.state === 'building' || project.state === 'checking' ? project.buildId ?? null : null;
+  let cancelled: string | null = null;
+  if (adoption.state === 'building' && (!buildId || buildId === adoption.buildId)) {
+    cancelled = adoption.buildId;
+    await imageAdoptionCall(async () => cancelImageAdoption());
+  } else if (projectBuildId !== null && (!buildId || buildId === projectBuildId)) {
+    cancelled = projectBuildId;
+    cancelRunnerImageBuild();
+  } else if ((cancelled = (await import('./runner-image')).cancelDefaultImageRebuild(buildId)) !== null) {
+    // A Rebuild of lazy's default image, on a project that has no custom one.
+  } else {
+    throw new RpcError(409, buildId
+      ? `Build ${buildId} is not running, so there is nothing to cancel.`
+      : 'No image build is running, so there is nothing to cancel.');
+  }
+  return imageStateAnswer(projectRoot, { cancelled });
+}
+
+/** Put a failed adoption away; the project keeps the image it has. */
+export async function handleDismissImageAdoptionFailure(projectRoot: string) {
+  const { dismissImageAdoptionFailure } = await import('./image-adoption');
+  return imageStateAnswer(projectRoot, { dismissed: dismissImageAdoptionFailure() });
+}
+
+/** A machine read quotes logs: the control plane's, never a member token's (Rails decides who sees it). */
+function requireControlForMachineRead(caller: ActorIdentity, command: string): void {
+  if (caller.kind === 'user') {
+    throw new RpcError(403, `${command} quotes the machine's logs and is available to the project control token only.`);
+  }
+}
+
+/**
+ * The image build's log, streamed by cursor: lines after `after` (a seq,
+ * default 0), at most `limit` (default 500, max 2000). `waitMs` (max 25000)
+ * holds the answer until a new line arrives or the build ends — a long poll.
+ * `buildId` picks a build; without it, the build `imageState` is about.
+ */
+export async function handleImageBuildLog(projectRoot: string, params: Record<string, unknown>, caller: ActorIdentity) {
+  requireControlForMachineRead(caller, 'imageBuildLog');
+  const buildId = optionalString(params, 'buildId');
+  const after = Math.max(0, Math.floor(optionalNumber(params, 'after') ?? 0));
+  const limit = Math.min(2000, Math.max(1, Math.floor(optionalNumber(params, 'limit') ?? 500)));
+  const waitMs = Math.min(25_000, Math.max(0, Math.floor(optionalNumber(params, 'waitMs') ?? 0)));
+  const { findImageBuildJob } = await import('./image-build-job');
+  let job = buildId ? findImageBuildJob(buildId) : null;
+  if (buildId && !job) throw new RpcError(404, `No image build ${buildId} (builds are kept in memory; a daemon restart starts a fresh log).`);
+  if (!job) {
+    const { projectImageState } = await import('./image-state');
+    const state = await projectImageState(projectRoot);
+    const id = 'build' in state ? state.build?.id : undefined;
+    job = (id ? findImageBuildJob(id) : null) ?? findImageBuildJob();
+  }
+  const { redactAnswer } = await import('./observability-redaction');
+  if (!job) return redactAnswer(projectRoot, { build: null, lines: [], firstSeq: 0, lastSeq: 0, next: after, truncatedBefore: false });
+  await job.waitForLines(after, waitMs);
+  const page = job.read(after, limit);
+  const next = page.lines.length > 0 ? page.lines[page.lines.length - 1].seq : Math.max(after, page.firstSeq - 1);
+  return redactAnswer(projectRoot, { build: job.view(), ...page, next });
+}
+
+/** The machine's services, their recent logs and its resource use — read-only. */
+export async function handleMachineState(projectRoot: string, params: Record<string, unknown>, caller: ActorIdentity) {
+  requireControlForMachineRead(caller, 'machineState');
+  const lines = optionalNumber(params, 'lines');
+  const { observeMachine } = await import('./machine-observation');
+  const { redactAnswer } = await import('./observability-redaction');
+  const view = await observeMachine(projectRoot, lines !== undefined ? { lines } : {});
+  if (view.integrity) {
+    // A damaging result is a persisted alert; the in-memory view forgets it at every daemon restart.
+    const { withOpenIntegrityAlerts } = await import('./machine-integrity');
+    view.integrity = withOpenIntegrityAlerts(view.integrity, await (await getOrCreateStorage()).listSystemMessages());
+  }
+  return redactAnswer(projectRoot, view);
+}
+
+/**
+ * Restart one guest service — GOD MODE ONLY. Read-only project admins never
+ * get fleet lifecycle verbs: Rails gates the button on its god-admin policy and
+ * calls on the control token, and the daemon refuses any member's token
+ * outright, whoever that member is. Non-blocking; `machineState.restart`
+ * reports the outcome.
+ */
+export async function handleRestartMachineService(projectRoot: string, params: Record<string, unknown>, caller: ActorIdentity) {
+  if (caller.kind === 'user') {
+    throw new RpcError(403, 'Forbidden: restarting a machine service is a god-mode operation; a member token cannot do it.');
+  }
+  const service = requireString(params, 'service');
+  const { restartMachineService, MachineRestartError } = await import('./machine-observation');
+  try {
+    return { restart: restartMachineService(service, {}, projectRoot) };
+  } catch (err) {
+    if (err instanceof MachineRestartError) throw new RpcError(err.status, err.message);
+    throw err;
+  }
+}
+
+/**
+ * Reset the machine's Docker storage — destructive (every image, container,
+ * volume and build cache), narrated through `machineState.storageReset`.
+ * Control-only like the restart: the daemon cannot tell a project admin from a
+ * member, so Rails gates who may ask and the daemon refuses every member token.
+ * Needs `confirm: true`.
+ */
+export async function handleResetMachineDockerStorage(projectRoot: string, params: Record<string, unknown>, caller: ActorIdentity) {
+  if (caller.kind === 'user') {
+    throw new RpcError(403, 'Forbidden: resetting a machine\'s Docker storage goes through the control plane; a member token cannot do it.');
+  }
+  const { resetMachineDockerStorage, MachineRestartError } = await import('./machine-observation');
+  try {
+    return { storageReset: resetMachineDockerStorage(params.confirm, {}, projectRoot) };
+  } catch (err) {
+    if (err instanceof MachineRestartError) throw new RpcError(err.status, err.message);
+    throw err;
+  }
+}
+
+export async function handleUseCustomRunnerImage(params: Record<string, unknown>) {
+  const storage = await getOrCreateStorage();
+  const taskId = requireString(params, 'taskId');
+  const { task } = await storage.resolveTask(taskId);
+  if (!task) throw new RpcError(404, `Task not found: ${taskId}`);
+  return useCustomRunnerImage(storage, task);
+}
+
 export async function handleStartTask(projectRoot: string, params: Record<string, unknown>, progress?: ProgressEmitter) {
   const startParams: StartTaskParams = {
     taskId: requireString(params, 'taskId'),
@@ -2520,6 +3100,7 @@ export async function handleStartTask(projectRoot: string, params: Record<string
     // does not know who it is. See StartTaskParams.actor.
     actor: requireActorInput(params),
     usagePauseOverrideEligible: params.usagePauseOverrideEligible === true,
+    useDefaultImage: optionalBoolean(params, 'useDefaultImage'),
     onProgress: progress,
   };
 
@@ -2605,6 +3186,7 @@ export async function handleUnblockTask(projectRoot: string, params: Record<stri
     // page — so it submits whatever review they were holding.
     filesReview: true,
     keepFeedbackDraft: optionalBoolean(params, 'keepFeedbackDraft'),
+    useDefaultImage: optionalBoolean(params, 'useDefaultImage'),
     onProgress: progress,
   };
 
@@ -2621,6 +3203,7 @@ export async function handleAskTask(projectRoot: string, params: Record<string, 
     effortOverride: optionalString(params, 'effortOverride'),
     actor: optionalActorInput(params),
     usagePauseOverrideEligible: params.usagePauseOverrideEligible === true,
+    overrideUsagePause: optionalBoolean(params, 'overrideUsagePause'),
     onProgress: progress,
   };
 
@@ -2690,10 +3273,15 @@ export async function handleAcceptTask(
   projectRoot: string,
   params: Record<string, unknown>,
   progress?: ProgressEmitter,
+  caller: ActorIdentity = { kind: 'control' },
 ) {
   const acceptParams: AcceptTaskParams = {
     taskId: requireString(params, 'taskId'),
     reason: optionalString(params, 'reason'),
+    // A signed-in Teams member's own browser Accept, which satisfies branch
+    // protection on a managed host. Decided from the AUTHENTICATED caller,
+    // never from the body alone (src/daemon/member-accept-approval.ts).
+    memberApproval: memberAcceptApprover(params, caller),
     // The approval passphrase for a protected merge, from the CLI's own TTY
     // prompt. The MCP boundary never sets it (see createAcceptHandler) — a
     // gated accept over MCP is refused before this RPC is ever made.
@@ -2804,6 +3392,16 @@ export async function handleEnsureTaskContainer(projectRoot: string, params: Rec
   });
 }
 
+export async function handleEnsureTaskWorktree(projectRoot: string, params: Record<string, unknown>) {
+  const storage = await getOrCreateStorage();
+  const taskId = requireString(params, 'taskId');
+  const resolved = await storage.resolveTask(taskId);
+  if (!resolved.task) throw new RpcError(resolved.ambiguousMatches?.length ? 409 : 404, `Task not found or ambiguous: ${taskId}`);
+  const session = await storage.getSessionByTaskId(resolved.task.id);
+  if (!session) throw new RpcError(409, 'This task has no session yet.');
+  return { worktreePath: await ensureTaskWorktree(projectRoot, resolved.task, session.git_branch) };
+}
+
 // --- Published ports ---
 
 /**
@@ -2841,17 +3439,51 @@ export async function handleServePorts(projectRoot: string, params: Record<strin
   const task = resolved.task;
   const session = await storage.getSessionByTaskId(task.id);
   const [state, startServicesCmd] = await Promise.all([
-    getTaskServeState(projectRoot, task, session),
+    getTaskServeState(projectRoot, task, session, { alwaysProbe: true }),
     resolveProjectStartServicesCmd(storage, projectRoot),
   ]);
   const services = await probeServices(state.services);
+  // The service a PR/MR description links to (`[serve] main_service`, else the first).
+  const serveConfig = (await loadConfig(projectRoot)).serve;
+  const mainService = mainServiceOf(serveConfig.services, serveConfig.main_service)?.port ?? null;
+  // Whether Start services is running in the task's container, and its output
+  // — read from the container itself, only while it is up. null when nothing
+  // is running or the container could not be asked ("not known"). It costs an
+  // exec into the container, so only a caller that renders it asks
+  // (`includeServicesRun`: the Services tab).
+  //
+  // It carries the INVENTORY too: what the command launched (each process in
+  // its group, its state, the ports it listens on, named after the declared
+  // services they serve with their probe), how it ended, and how much output
+  // there is. `servicesLogBytes` asks for a longer tail than the default (the
+  // "more output" view), capped by MAX_LOG_TAIL_BYTES.
+  const logBytes = optionalNumber(params, 'servicesLogBytes');
+  let servicesRun: ServicesRunState | null = null;
+  if (state.containerRunning && optionalBoolean(params, 'includeServicesRun') === true) {
+    servicesRun = await readServicesRunState(containerBinaryFor(state.runnerType), state.containerName, undefined,
+      logBytes !== undefined ? { logBytes } : {})
+      .then((run) => run && linkProcessesToServices(run, services))
+      .catch((err) => {
+        logger.debug(`servePorts: could not read Start services in ${state.containerName}: ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+      });
+  }
+  // Ports the task BRANCH declares that the project root does not: advice only,
+  // read from the worktree's lazy.toml as untrusted data (src/serve/branch-advice.ts).
+  // The dashboard's Services tab shows the same list as "Ports on this branch only";
+  // it costs a worktree read, so only a caller that renders it asks (`includeBranchAdvice`).
+  const branchAdvice = optionalBoolean(params, 'includeBranchAdvice') === true
+    ? await branchServeAdviceFor(getWorktreePath(projectRoot, task), state.declared, taskRef(task))
+    : [];
 
   // Task identity travels with the state so a client holding several of these
   // does not have to remember which ref it asked with. `startServicesCmd` is
   // the project's designated Start services command ('' when none) — the same
   // resolution the dashboard's Services card renders, so Lazy Teams shows and
   // designates the one value (`serve.setStartServicesCmd`).
-  return { taskId: task.id, displayId: displayId(task), status: task.status, ...state, services, startServicesCmd };
+  // `servicesRestart`: the last automatic restart after a work turn
+  // (src/daemon/services-restart.ts), null when none has run.
+  return { taskId: task.id, displayId: displayId(task), status: task.status, ...state, services, startServicesCmd, mainService, branchAdvice, servicesRun, servicesRestart: servicesRestartOf(task) };
 }
 
 // --- Live progress on a running task ---
@@ -3034,7 +3666,30 @@ export async function handleTokenStats(projectRoot: string, params: Record<strin
     throw new RpcError(400, 'limit must be a positive integer');
   }
 
-  if (mode === 'tokens-cli') {
+  // HISTORY from the store's per-turn latency rollups (src/task/turn-latency.ts):
+  // any period, past the audit trail's retention. `latency-cli` above stays the
+  // recent, per-request view read off the audit trail.
+  if (mode === 'latency-history') {
+    let tasks: Task[];
+    if (taskRef) {
+      const resolved = await storage.resolveTask(taskRef);
+      if (!resolved.task) throw new RpcError(404, `Task not found or ambiguous: ${taskRef}`);
+      tasks = subtree ? [resolved.task, ...(await collectDescendantTasks(storage, resolved.task.id))] : [resolved.task];
+    } else {
+      if (subtree) throw new RpcError(400, '--subtree needs a task');
+      // A task finished before the window cannot have a turn inside it.
+      tasks = (await storage.listTasks()).filter(
+        (t) => sinceMs === undefined || t.completed_at === null || t.completed_at >= sinceMs,
+      );
+    }
+    const rollups = await loadTurnLatencyRollups(storage, tasks.map((t) => t.id));
+    return {
+      history: latencyHistory(rollups, { sinceMs }),
+      task: taskRef && tasks[0] ? { id: tasks[0].id, code: tasks[0].code, descendants: tasks.length - 1 } : null,
+    };
+  }
+
+  if (mode === 'tokens-cli' || mode === 'latency-cli') {
     let ids: string[] | undefined;
     let taskId = taskRef;
     let task: Task | undefined;
@@ -3047,14 +3702,22 @@ export async function handleTokenStats(projectRoot: string, params: Record<strin
       ids = [task.id, ...descendants.map(child => child.id)];
       taskId = undefined;
     }
+    const role = params.role === undefined ? undefined : String(params.role);
+    const taskInfo = task ? { id: task.id, code: task.code, descendants: (ids?.length ?? 1) - 1 } : null;
+    if (mode === 'latency-cli') {
+      return {
+        latency: latencyReport(await loadAudit(projectRoot, limit), { sinceMs, taskIds: ids, role, taskId }),
+        task: taskInfo,
+      };
+    }
     return {
       report: await loadTokenReport(projectRoot, ids, {
         sinceMs,
         limit,
-        role: params.role === undefined ? undefined : String(params.role),
+        role,
         taskId,
       }),
-      task: task ? { id: task.id, code: task.code, descendants: (ids?.length ?? 1) - 1 } : null,
+      task: taskInfo,
     };
   }
 
@@ -3072,8 +3735,8 @@ export async function handleTokenStats(projectRoot: string, params: Record<strin
     throw new RpcError(400, "scope must be 'tokens' or 'tools'");
   }
   const groupBy = params.groupBy === undefined ? undefined : String(params.groupBy);
-  if (groupBy !== undefined && !['task', 'model', 'role'].includes(groupBy)) {
-    throw new RpcError(400, "group_by must be 'task', 'model', or 'role'");
+  if (groupBy !== undefined && !['task', 'model', 'role', 'endpoint'].includes(groupBy)) {
+    throw new RpcError(400, "group_by must be 'task', 'model', 'role', or 'endpoint'");
   }
   const top = params.top === undefined ? undefined : Number(params.top);
   const minTasks = params.minTasks === undefined ? undefined : Number(params.minTasks);
@@ -3136,6 +3799,12 @@ export async function handleTaskEnv(projectRoot: string, params: Record<string, 
       case 'list':
         return { taskId: task.id, displayId: displayId(task), status: task.status, keys: await listTaskEnvKeys(projectRoot, task.id) };
       case 'set': {
+        // A finished task's env was cleared with its credentials
+        // (revokeTaskTokens); storing values now — a push racing the
+        // completion — would leave secrets that nothing ever clears.
+        if (isTerminalStatus(task.status)) {
+          throw new RpcError(409, `Task ${displayId(task)} is ${task.status}; it takes no environment variables.`);
+        }
         const vars = params.vars;
         if (!vars || typeof vars !== 'object' || Array.isArray(vars)) {
           throw new RpcError(400, `'vars' must be an object of KEY=VALUE pairs.`);
@@ -3174,6 +3843,130 @@ export async function handleTaskEnv(projectRoot: string, params: Record<string, 
   }
 }
 
+// --- The environment every new task starts with ---
+
+/**
+ * The project's new-task environment (src/daemon/task-env-seed.ts), pushed by a
+ * control plane. Control-only, like `taskEnv`. `set` REPLACES it with `vars`
+ * ({ KEY: VALUE }) and `files` (the `taskFiles` shape); `list` returns names
+ * and paths. No action returns a value. Existing tasks are untouched — their
+ * own sets are pushed through `taskEnv` / `taskFiles`.
+ */
+export async function handleTaskEnvSeed(projectRoot: string, params: Record<string, unknown>) {
+  const action = requireString(params, 'action');
+  try {
+    switch (action) {
+      case 'list':
+        return await listTaskEnvSeed(projectRoot);
+      case 'set': {
+        const raw = params.vars ?? {};
+        if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+          throw new RpcError(400, `'vars' must be an object of KEY=VALUE pairs.`);
+        }
+        const vars: Record<string, string> = {};
+        for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+          if (typeof value !== 'string') throw new RpcError(400, `Value for '${key}' must be a string.`);
+          vars[key] = value;
+        }
+        return await setTaskEnvSeed(projectRoot, vars, params.files ?? []);
+      }
+      default:
+        throw new RpcError(400, `Unknown taskEnvSeed action: ${action}`);
+    }
+  } catch (err) {
+    if (err instanceof RpcError) throw err;
+    throw new RpcError(400, err instanceof Error ? err.message : String(err));
+  }
+}
+
+// --- Per-task secret files ---
+
+/**
+ * A task's secret FILES (src/daemon/task-files.ts), pushed by a control plane
+ * (Lazy Teams). Control-only, like `taskEnv`.
+ *
+ * Actions: `set` REPLACES the task's whole set with `files` ([{ path,
+ * contents | contentsBase64 }], empty clears it); `list` returns paths;
+ * `clear` stops delivering them (never deletes a file). NO action returns contents. `set` on a task whose
+ * worktree exists delivers at once and returns `delivery` ({ written,
+ * refused: [{ path, reason }] }) so a refusal (a path the branch tracks) is
+ * visible to the caller now, not only at the next launch.
+ */
+export async function handleTaskFiles(projectRoot: string, params: Record<string, unknown>) {
+  const action = requireString(params, 'action');
+  const storage = await getOrCreateStorage();
+  const ref = requireString(params, 'taskId');
+  const resolved = await storage.resolveTask(ref);
+  if (!resolved.task) {
+    if (resolved.ambiguousMatches?.length) {
+      throw new RpcError(409, `Ambiguous task ID '${ref}'. Matches: ${resolved.ambiguousMatches.map(t => `${shortId(t.id)} (${t.goal})`).join(', ')}`);
+    }
+    throw new RpcError(404, `Task not found: ${ref}`);
+  }
+  const task = resolved.task;
+  const base = { taskId: task.id, displayId: displayId(task), status: task.status };
+
+  try {
+    switch (action) {
+      case 'list': {
+        // `retired`: delivered earlier, no longer selected, still in the
+        // worktree. lazy never removes them; the task page shows them so a
+        // person can.
+        const worktree = getWorktreePath(projectRoot, task);
+        const retired = await pathExists(worktree) ? await retiredTaskFilePaths(projectRoot, task.id, worktree) : [];
+        return { ...base, paths: await listTaskFilePaths(projectRoot, task.id), retired };
+      }
+      case 'set': {
+        // A finished task's files were cleared with its credentials
+        // (revokeTaskTokens); storing new ones now would leave secrets that
+        // nothing ever clears.
+        if (isTerminalStatus(task.status)) {
+          throw new RpcError(409, `Task ${displayId(task)} is ${task.status}; it takes no secret files.`);
+        }
+        const paths = await setTaskFiles(projectRoot, task.id, params.files);
+        // Stored. From here a failure is a DELIVERY failure, reported beside
+        // the stored paths — never a 400 claiming the set did not happen.
+        const worktree = getWorktreePath(projectRoot, task);
+        let delivery: Awaited<ReturnType<typeof deliverTaskFiles>> | null = null;
+        let deliveryError: string | undefined;
+        if (await pathExists(worktree)) {
+          try {
+            delivery = await deliverTaskFiles(projectRoot, task.id, worktree);
+            // A root daemon (Teams microVM): hand the new files to the
+            // container user, or a running agent cannot read them.
+            await realignAfterDaemonWrite(worktree);
+          } catch (err) {
+            deliveryError = `stored, but not delivered yet (the next launch retries): ${err instanceof Error ? err.message : String(err)}`;
+          }
+        }
+        return { ...base, paths, delivery, ...(deliveryError ? { deliveryError } : {}) };
+      }
+      case 'clear': {
+        const removed = await clearTaskFiles(projectRoot, task.id);
+        const worktree = getWorktreePath(projectRoot, task);
+        // lazy never deletes them: the files stay in the worktree, still
+        // excluded from git and guarded, and `delivery.retired` names them.
+        let delivery: Awaited<ReturnType<typeof deliverTaskFiles>> | null = null;
+        let deliveryError: string | undefined;
+        if (await pathExists(worktree)) {
+          try {
+            delivery = await deliverTaskFiles(projectRoot, task.id, worktree);
+          } catch (err) {
+            deliveryError = `cleared, but the worktree could not be checked: ${err instanceof Error ? err.message : String(err)}`;
+          }
+        }
+        return { ...base, removed, paths: [], delivery, ...(deliveryError ? { deliveryError } : {}) };
+      }
+      default:
+        throw new RpcError(400, `Unknown taskFiles action: ${action}`);
+    }
+  } catch (err) {
+    if (err instanceof RpcError) throw err;
+    // Validation failures (bad path, caps, duplicates) are the caller's to fix.
+    throw new RpcError(400, err instanceof Error ? err.message : String(err));
+  }
+}
+
 // --- Submit Task ---
 
 export async function handleSubmitTask(projectRoot: string, params: Record<string, unknown>) {
@@ -3198,7 +3991,9 @@ export async function handleGetTaskUpstreamStatus(projectRoot: string, params: R
  * New-task form uses (`src/daemon/create-task.ts`): validation, parent
  * resolution (a finished parent is refused), agent inheritance from the parent
  * and `[agent.by_type]`, the parent's image pin, code derivation, and the
- * prompt / model / effort writes. Lazy Teams used to reassemble a create from
+ * prompt / model / effort / branch-target / tag writes — all in ONE storage
+ * write, so a create lands whole or leaves nothing (a clone bound to Lazy
+ * Teams creates through this too). Lazy Teams used to reassemble a create from
  * raw storage writes, which skipped every one of those rules for a subtask.
  * What a new child means for its parent (a cluster's wake) stays in the
  * storage tap, which this goes through like every other create.
@@ -3214,6 +4009,11 @@ export async function handleCreateTask(projectRoot: string, params: Record<strin
     model: optionalString(params, 'model'),
     effort: optionalString(params, 'effort'),
     agent: optionalString(params, 'agent'),
+    review: optionalString(params, 'review'),
+    reviewGate: optionalString(params, 'reviewGate'),
+    reviewAutoFix: optionalString(params, 'reviewAutoFix'),
+    tags: optionalStringArray(params, 'tags'),
+    deriveCode: optionalBoolean(params, 'deriveCode'),
     actor: optionalActorInput(params),
   });
 }
@@ -3259,7 +4059,7 @@ export async function handleRedoTask(projectRoot: string, params: Record<string,
  * closed are `clusterProgressOf` (src/task/cluster-progress.ts), answered here,
  * so a remote client renders the same numbers `lazy show` and the dashboard
  * print. A client that reassembled them from a task tree would be holding a
- * second copy of a rule CLAUDE.md says has exactly one home — and would get the
+ * second copy of a rule AGENTS.md says has exactly one home — and would get the
  * denominator wrong the first time a child was closed.
  *
  * Ordering is part of the answer too (running clusters first, newest first), so
@@ -3303,6 +4103,7 @@ export async function handleResumeTask(projectRoot: string, params: Record<strin
     effortOverride: optionalString(params, 'effortOverride'),
     actor: optionalActorInput(params),
     usagePauseOverrideEligible: params.usagePauseOverrideEligible === true,
+    useDefaultImage: optionalBoolean(params, 'useDefaultImage'),
     onProgress: progress,
   };
 
@@ -3320,6 +4121,7 @@ export async function handleSyncTask(projectRoot: string, params: Record<string,
     // Only the MCP boundary sets this, from the authenticated per-task context —
     // it is what lets a task's own running agent sync itself (see self-sync.ts).
     callerTaskId: optionalString(params, 'callerTaskId'),
+    useDefaultImage: optionalBoolean(params, 'useDefaultImage'),
     onProgress: progress,
   };
   // An explicit sync lifts a pinned base — unless an agent is asking (see liftPin).
@@ -3488,19 +4290,39 @@ export async function handleMintDashboardTicket(projectRoot: string) {
 export async function handleUsageLimits(
   projectRoot: string,
   caller?: ActorIdentity,
-): Promise<{ readings: UsageLimitReading[] }> {
+): Promise<{ readings: UsageLimitReading[]; credentialHealth: CredentialFailure[] }> {
   // Every member's readings (user ids, tasks, utilization) — control-plane
   // only, like listUserCredentials. The in-process fallback passes no caller.
   if (caller) requireControlActor(caller, 'usageLimits');
   const config = await loadConfig(projectRoot);
   await seedUsageReadings(projectRoot, config);
-  return { readings: daemonUsageLimits.readings() };
+  // Every credential that is FAILING, whether or not it ever produced a reading
+  // — a dead credential never does (src/proxy/credential-health.ts).
+  const records = await readAuditRecords(join(projectRoot, config.data.path), { limit: USER_AUTH_VERDICT_RECORDS });
+  // Same staleness rule as listUserCredentials (./current-credential-failures).
+  const credentialHealth = await currentCredentialFailures(projectRoot, records);
+  return { readings: daemonUsageLimits.readings(), credentialHealth };
+}
+
+
+/** `{ ok: true }`, or the failure that postdates the stored credential. */
+function credentialHealthFor(failure: CredentialFailure | undefined, updatedAt: string | undefined) {
+  if (!failure) return { ok: true as const };
+  if (failurePredatesCredential(failure, updatedAt)) return { ok: true as const };
+  return {
+    ok: false as const,
+    failedAt: new Date(failure.failedAt).toISOString(),
+    error: failure.error,
+    status: failure.status,
+    // lazy itself could not produce a usable credential (e.g. a refused refresh)
+    unusable: failure.unusable,
+  };
 }
 
 /**
  * "Would this task's next turn be refused for want of a model credential?" —
  * the PRE-FLIGHT a CLI verb asks before it opens `$EDITOR`, so a refusal never
- * costs the human what they typed (CLAUDE.md: never lose human feedback).
+ * costs the human what they typed (AGENTS.md: never lose human feedback).
  *
  * Answered by the same gate the launch runs (`turnCredentialRefusal`,
  * ./credential-gate.ts), for the profile the turn will ACTUALLY run on: the
@@ -3616,17 +4438,18 @@ export async function handleUsagePause(
     setUsagePauseOverride(parseUsagePauseOverride(params.value));
   }
   const oneshotAllowance = action === 'admitOneshot'
-    ? await admitOneshotCommand(projectRoot, actor)
+    ? await admitOneshotCommand(projectRoot, actor, Date.now(), optionalBoolean(params, 'overrideUsagePause') === true)
     : undefined;
   const taskId = optionalString(params, 'taskId');
   const agentId = optionalString(params, 'agentId');
   const storage = await getOrCreateStorage();
   if (action === 'admitInteractive') {
     await admitInteractiveSession(projectRoot, storage, {
-      surface: requireEnum(params, 'surface', ['pair', 'chat'] as const),
+      surface: requireEnum(params, 'surface', ['pair', 'chat', 'builder'] as const),
       taskId,
       actor,
       peek: optionalBoolean(params, 'peek'),
+      overrideUsagePause: optionalBoolean(params, 'overrideUsagePause'),
     });
   }
   // The CLI pre-flight judges as its launch will: a caller that may not take
@@ -3872,7 +4695,7 @@ export async function handlePutUserCredential(
   // Clear the dead-token verdict immediately — do not wait for a turn or a
   // timestamp edge case to self-clear it.
   const config = await loadConfig(projectRoot);
-  await clearUserAuthRejection(join(projectRoot, config.data.path), userId);
+  await clearUserAuthRejection(join(projectRoot, config.data.path), auditRetentionOf(config), userId);
 
   // Never log the secret, and never log enough to identify it.
   logger.info(`Stored ${summary.kind} credential for user ${summary.userId} (${summary.label})`);
@@ -3933,10 +4756,19 @@ export async function handleListUserCredentials(projectRoot: string, caller: Act
     limit: USER_AUTH_VERDICT_RECORDS,
   });
   const rejections = unresolvedAuthRejectionsByUser(records);
+  const failures = new Map(unresolvedCredentialFailures(records).map((f) => [f.credential, f]));
 
   return {
     credentials: credentials.map((credential) => ({
       ...credential,
+      // Whether lazy could USE this credential lately — for every endpoint, not
+      // only Anthropic's (a ChatGPT session whose refresh was refused shows up
+      // here). Same staleness rule as `rejection`: a failure from before the
+      // credential was last replaced is about a secret that no longer exists.
+      health: credentialHealthFor(
+        failures.get(credentialUsageKey(credential)),
+        credential.updatedAt,
+      ),
       // Only a rejection that postdates the STORED credential is about the
       // credential this listing describes — see rejectionAgainstCurrentCredential.
       rejection: rejectionAgainstCurrentCredential(
@@ -4111,7 +4943,7 @@ async function turnOwnerRequest(
  * channel (loopback by default) and is never logged.
  */
 export async function handleGetAuthEnv(projectRoot: string, params: Record<string, unknown>) {
-  // SCHEMA-VALIDATE AT THE BOUNDARY (CLAUDE.md: every external surface parses
+  // SCHEMA-VALIDATE AT THE BOUNDARY (AGENTS.md: every external surface parses
   // and confirms its inputs). `proxied` decides whether this call hands back a
   // PLACEHOLDER or the user's real credential, so it is required rather than
   // defaulted: a caller that forgets it is a caller that would silently have
@@ -4169,6 +5001,18 @@ export async function handleGetAuthEnv(projectRoot: string, params: Record<strin
   // handleGetCredentialState: nothing that merely describes auth moves it.
   if (params.credentials === false) {
     return { authEnvVars: [] as AuthEnvVar[], ...(proxyBaseUrl ? { proxyBaseUrl } : {}) };
+  }
+
+  // TEAM MODE: a credential is only ever a turn owner's connected one, resolved
+  // by the launch and the proxy. Nothing is handed out of the daemon's own
+  // environment or the project store — not to a member token, not to the
+  // control token, under any name.
+  if (await teamModeEnabled(projectRoot)) {
+    throw new RpcError(
+      403,
+      'getAuthEnv: this project bills each turn to its owner\'s connected credentials, so the daemon ' +
+      'hands out no credential of its own. Connect yours for the endpoint and start the turn through lazy.',
+    );
   }
 
   // Parsed BEFORE the credential is resolved, because the identity's profile is
@@ -4250,6 +5094,31 @@ export async function handleGetAuthEnv(projectRoot: string, params: Record<strin
 }
 
 /**
+ * POST /agent/pending-notes — the running work turn's supervisor asks whether
+ * comments arrived while the agent worked, and takes them if so
+ * (src/daemon/turn-comments.ts), or — with `ack_through` — acknowledges the
+ * agent received them. Authenticated like /agent/launch-env: the
+ * per-task MCP token NAMES the task; nothing in the request does.
+ */
+export async function handleClaimAgentPendingNotes(
+  projectRoot: string,
+  presentedToken: string,
+  body: { ack_through?: unknown; claim_id?: unknown; command_id?: unknown; notes_secret?: unknown },
+): Promise<PendingNotesAnswer | Awaited<ReturnType<typeof acknowledgePendingNotes>>> {
+  const identity = await lookupDaemonIdentity(projectRoot, presentedToken);
+  if (!identity || identity.kind !== 'task') {
+    throw new RpcError(401, 'Unauthorized: /agent/pending-notes requires a task MCP token.');
+  }
+  const storage = await getOrCreateStorage();
+  const task = await storage.getTask(identity.taskId);
+  if (!task) throw new RpcError(404, `Task ${shortId(identity.taskId)} no longer exists.`);
+  requireSupervisorCredential(task, body);
+  return body.ack_through !== undefined
+    ? acknowledgePendingNotes(storage, task, body.ack_through, body.claim_id)
+    : claimPendingNotesForRunningTurn(storage, projectRoot, task);
+}
+
+/**
  * Fresh model/proxy launch environment for a TASK container relaunching its
  * agent in place — the retry path in src/supervisor/work.ts.
  *
@@ -4314,6 +5183,13 @@ export async function handleGetAgentLaunchEnv(
   // daemon's own credential or the project's store, neither of which holds the
   // member's key, and refuse a relaunch the launch itself allowed.
   const sessionCreds = await sessionCredentialEnvFor(projectRoot, task.id);
+  if (!sessionCreds && await teamModeEnabled(projectRoot)) {
+    throw new RpcError(
+      409,
+      `Task ${displayId(task)} has no active member credential binding, so its agent cannot be ` +
+      'relaunched in place. Resume the task so its owner\'s credential is bound again.',
+    );
+  }
   const authResult = sessionCreds
     ? await teamModeRefreshCreds(projectRoot, sessionCreds, target, {
       role: 'agent', taskId: task.id, label, profile: profile.name, taskUuid: task.id,
@@ -4409,6 +5285,32 @@ export async function handleGetBuilderLaunchEnv(
   const config = await loadConfig(projectRoot);
   const target = resolveRoleTarget('builder', config);
 
+  // TEAM MODE: the session's member pays, exactly as at launch — the env comes
+  // from the session binding the launch planned, never from getAuthEnv, which
+  // refuses in team mode by design (no daemon-held credential, ever). This
+  // runs before EVERY Claude Code launch in the container, the first included.
+  if (await teamModeEnabled(projectRoot)) {
+    // Same 503 as below while the proxy is still binding, so the container's
+    // startup retry (src/builder/launch-env.ts) waits instead of failing.
+    const proxyPort = hasDaemonContext() ? getDaemonContext().proxyPort : undefined;
+    if (!proxyPort) {
+      throw new RpcError(
+        503,
+        'The daemon proxy is not running, so this builder cannot refresh its launch environment. ' +
+        'Check `lazy daemon status` and retry.',
+      );
+    }
+    const { builderSessionRefreshAuthEnv } = await import('./builder-sessions');
+    const authEnvVars = await builderSessionRefreshAuthEnv(projectRoot, label, config);
+    const proxyBaseUrl = proxyBaseUrlForRunner(config.runner.type, proxyPort, config.proxy.bind);
+    return {
+      authEnvVars,
+      proxyBaseUrl,
+      lazyVersion: VERSION,
+      directive: resolveBuilderLaunchDirective(config),
+    };
+  }
+
   // The builder has no task and therefore no task-level agent: the profile its
   // relaunch is routed by is the one the builder ROLE defaults to — the same
   // one `docker run` used at initial launch, so the refreshed environment lands
@@ -4455,7 +5357,7 @@ interface AuthEnvVar { key: string; value: string }
 /**
  * Parse the launch identity a proxied caller must send, or null if absent.
  *
- * Validated at the boundary (CLAUDE.md): the identity is what the minted grant
+ * Validated at the boundary (AGENTS.md): the identity is what the minted grant
  * binds attribution AND ROUTING to, so a malformed one would produce audit
  * records naming a task that does not exist, or send a turn's traffic to an
  * upstream nobody chose. Rejected loudly rather than coerced.
@@ -4554,8 +5456,15 @@ export async function handleRunOneshot(projectRoot: string, params: Record<strin
     });
   }
 
-  const { runOneshotWithRunner } = await import('../oneshot');
-  return runOneshotWithRunner({ prompt, model, effort, repoAccess, timeoutMs, taskId }, projectRoot);
+  // Paid by the person whose token asked (team mode), else the service holder.
+  const { runOneshotWithRunner, runAsOneshotPayer } = await import('../oneshot');
+  try {
+    return await runAsOneshotPayer(actorEmail(optionalActorInput(params)) ?? null, () =>
+      runOneshotWithRunner({ prompt, model, effort, repoAccess, timeoutMs, taskId }, projectRoot));
+  } catch (err) {
+    if (err instanceof TurnCredentialUnavailableError) throw new RpcError(400, err.message);
+    throw err;
+  }
 }
 
 // --- Get Credential State ---
@@ -4579,8 +5488,7 @@ export async function handleRunOneshot(projectRoot: string, params: Record<strin
  * prints says who is affected.
  *
  * ONE BAD READ DEGRADES ONE ENTRY. Presence comes from the store's non-secret
- * index and (for harness-keyed credentials) the agent key file; either can
- * exist and be unreadable. That failure lands on THAT credential's entry as
+ * index, which can exist and be unreadable. That failure lands on THAT credential's entry as
  * `error`, verbatim, and every other entry is still answered — an RPC that
  * threw would turn "one corrupt file" into "doctor cannot say anything about
  * credentials", which is exactly when it is being asked.
@@ -4606,8 +5514,6 @@ export async function handleGetCredentialState(projectRoot: string, _params: Rec
       label: credentialLabel(required.name),
       requiredBy: required.requiredBy,
     };
-    // Which harnesses bill it decides whether the agent key file is consulted;
-    // every name in requiredBy resolved at config load, so this cannot miss.
     const harnesses = required.requiredBy.map((name) => agentProfileOrThrow(profiles, name).harness);
     try {
       providers.push({ ...entry, ...(await locateProfileCredential(projectRoot, required.name, harnesses)) });
@@ -4632,6 +5538,7 @@ export async function handleGetCredentialState(projectRoot: string, _params: Rec
     // older than `providers`.
     anthropicRequired: requiredProviders(config).includes('anthropic'),
     providers,
+    perMember: await teamModeEnabled(projectRoot),
   };
 }
 
@@ -4726,7 +5633,7 @@ export const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<str
   listTasksWithOptions: (s, a) => s.listTasksWithOptions(a.options as any),
   listTaskCodes: (s) => s.listTaskCodes(),
   countDescendants: (s, a) => s.countDescendants(a.taskIds as string[]),
-  updateTaskStatus: (s, a) => s.updateTaskStatus(a.taskId as string, a.status as any, a.actor as any),
+  updateTaskStatus: (s, a) => s.updateTaskStatus(a.taskId as string, a.status as any, a.actor as any, typeof a.reason === 'string' ? a.reason : undefined),
   updateTaskGoal: (s, a) => s.updateTaskGoal(a.taskId as string, a.goal as string),
   updateTaskCode: (s, a) => s.updateTaskCode(a.taskId as string, a.code as string | null),
   updateTaskTarget: (s, a) => s.updateTaskTarget(a.taskId as string, a.target as TaskTarget),
@@ -4791,6 +5698,7 @@ export const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<str
   updateTurnWrapUpSteps: (s, a) => s.updateTurnWrapUpSteps(a.taskId as string, a.turnId as string, a.wrapUpSteps as string[]),
   updateTurnReview: (s, a) => s.updateTurnReview(a.taskId as string, a.turnId as string, a.review as any),
   markFeedbackConsumed: (s, a) => s.markFeedbackConsumed(a.sessionId as string),
+  markFeedbackSubsumed: (s, a) => s.markFeedbackSubsumed(a.sessionId as string, a.turnIds as string[]),
 
   // Commits
   createCommit: (s, a) => s.createCommit(a.sessionId as string, a.sha as string, a.message as string),
@@ -5045,11 +5953,12 @@ export const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<str
   clearMemoryCompact: (s) => s.clearMemoryCompact(),
 
   // System messages (proactive system-to-human reports; append-only)
-  createSystemMessage: (s, a) => s.createSystemMessage(a.input as any),
+  createSystemMessage: (s, a) => s.createSystemMessage(a.input as any, a.options as any),
   listSystemMessages: (s, a) => s.listSystemMessages(a.options as any),
   getSystemMessage: (s, a) => s.getSystemMessage(a.id as string),
   markSystemMessageRead: (s, a) => s.markSystemMessageRead(a.id as string),
   dismissSystemMessage: (s, a) => s.dismissSystemMessage(a.id as string, a.actor as any),
+  dismissSystemMessages: (s, a) => s.dismissSystemMessages(parseSystemMessageDismissFilter(a.filter), a.actor as any, { preview: (a.options as { preview?: unknown } | undefined)?.preview === true }),
 
   // Status History
   getStatusHistory: (s, a) => s.getStatusHistory(a.taskId as string),
@@ -5057,6 +5966,12 @@ export const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<str
   // Per-task tool stats (durable; the proxy writes, every surface reads)
   getToolStats: (s, a) => s.getToolStats(a.taskId as string),
   saveToolStats: (s, a) => s.saveToolStats(a.record as any),
+  getTurnLatency: (s, a) => s.getTurnLatency(a.taskId as string),
+  mergeOpenTurnLatency: (s, a) => {
+    const problem = rollupShapeProblem(a.delta);
+    if (problem) throw new RpcError(400, `mergeOpenTurnLatency: ${problem}`);
+    return s.mergeOpenTurnLatency(a.taskId as string, a.delta as TurnLatencyRollup);
+  },
 
   // Usage-limit readings ([usage_pause]) are DELIBERATELY absent: only the
   // daemon's own recorder writes them, in process (src/daemon/usage-readings.ts).
@@ -5145,10 +6060,29 @@ export async function handleStorageCall(
     (await import('./builder-sessions')).refuseMemberSessionStorageWrite(method, caller);
   }
 
+  // INVARIANT: an agent name a client SENDS is judged against THIS daemon's
+  // profiles, never trusted. Clients validate against their own lazy.toml, and
+  // a clone bound to Teams has the repository's copy, not Teams' configuration:
+  // a Mac clone whose lazy.toml defined [agents.claude-complex] wrote it onto a
+  // Teams task whose daemon had never had it, and the task only failed — as
+  // "Unknown agent profile" — when it launched.
+  if (method === 'updateTaskAgent') {
+    await assertKnownAgentProfile(projectRoot, typeof args.agentId === 'string' ? args.agentId : String(args.agentId));
+  }
+  if (method === 'createTask' && typeof args.agentId === 'string' && args.agentId.trim() !== '') {
+    await assertKnownAgentProfile(projectRoot, args.agentId.trim());
+  }
   const storage = await getOrCreateStorage();
 
   // INVARIANT: storage.createTask must not silently pin claude-code when the
   // caller omitted agentId — the project overlay (and lazy.toml) decide.
+  if (method === 'saveConversation' && caller?.kind === 'user') {
+    const conversation = args.conversation;
+    if (!conversation || typeof conversation !== 'object' || Array.isArray(conversation)) {
+      throw new RpcError(400, 'Capture requires a conversation object');
+    }
+    args.conversation = { ...conversation, memberEmail: null };
+  }
   if (method === 'createTask') {
     const [config, projectSettings] = await Promise.all([
       loadConfig(projectRoot),
@@ -5160,6 +6094,9 @@ export async function handleStorageCall(
       config,
       projectSettings,
     );
+    // The RESOLVED name too: one inherited from a parent that carries an
+    // unknown agent must not be copied onto a new task unchecked.
+    await assertKnownAgentProfile(projectRoot, args.agentId as string);
     // INVARIANT: an agent this INSTALLATION cannot run is refused here, not at
     // launch. This route — not `./create-task` — is where `lazy create` and
     // Lazy Teams both land (the CLI reaches it through RemoteStorage, Teams
@@ -5251,6 +6188,7 @@ export const BUILDER_STORAGE_METHODS: ReadonlySet<string> = new Set([
 export async function handleBuilderStorageCall(
   projectRoot: string,
   params: Record<string, unknown>,
+  tokenLabel?: string | null,
 ) {
   const method = params.method;
   if (!method || typeof method !== 'string') {
@@ -5265,5 +6203,31 @@ export async function handleBuilderStorageCall(
       `which is deliberately not given to containers.`,
     );
   }
+  if (method === 'saveConversation') {
+    const rawArgs = params.args;
+    if (!rawArgs || typeof rawArgs !== 'object' || Array.isArray(rawArgs)) {
+      throw new RpcError(400, 'Builder capture requires object args');
+    }
+    const args = rawArgs as Record<string, unknown>;
+    const conversation = args.conversation;
+    if (!conversation || typeof conversation !== 'object' || Array.isArray(conversation)) {
+      throw new RpcError(400, 'Builder capture requires a conversation object');
+    }
+    const storage = await getOrCreateStorage();
+    const runs = await storage.listBuilderSessions(projectRoot);
+    const run = tokenLabel ? runs.find((row) => `builder-${row.builderId}` === tokenLabel) : null;
+    params = { ...params, args: { ...args, conversation: { ...conversation, memberEmail: run?.memberEmail ?? null } } };
+  }
   return handleStorageCall(projectRoot, params);
+}
+
+/** `show`'s `launchIdentity`: null (logged) when the config cannot resolve it. */
+async function launchIdentityOf(storage: Storage, task: Task, config: ResolvedConfig) {
+  try {
+    const settings = await readProjectSettings(storage);
+    return taskLaunchIdentityView({ task, config, projectModel: resolveProjectModel(settings, config) });
+  } catch (err) {
+    logger.warn(`show: could not resolve launch identity for ${task.code}: ${err instanceof Error ? err.message : err}`);
+    return null;
+  }
 }

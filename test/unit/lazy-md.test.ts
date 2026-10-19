@@ -50,7 +50,7 @@ afterEach(async () => {
 
 describe('ancestorChain', () => {
   // INVARIANT: the chain is ordered ROOT-FIRST, so the file closest to where the
-  // agent starts is read LAST. Claude Code concatenates CLAUDE.md that way, and
+  // agent starts is read LAST. Claude Code concatenates AGENTS.md that way, and
   // last-read-wins is what makes a deeper file able to refine a shallower one.
   test('orders the chain root-first', () => {
     expect(ancestorChain(root, join(root, 'services', 'api'))).toEqual([
@@ -84,7 +84,7 @@ describe('collectLazyMdFiles', () => {
   });
 
   // INVARIANT: nested LAZY.md files are loaded UP FRONT, not on demand. Claude
-  // Code defers subdirectory CLAUDE.md until the agent reads a file there; lazy
+  // Code defers subdirectory AGENTS.md until the agent reads a file there; lazy
   // has no hook into an agent's file reads, so a nested file is either injected
   // at launch or never seen at all.
   test('sweeps nested files shallowest-first after the ancestor chain', async () => {

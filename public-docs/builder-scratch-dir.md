@@ -11,6 +11,8 @@ The builder sees the path in `$LAZY_SCRATCH_DIR`. For a builder you launch with
 `lazy builder`, you see it at the **same absolute path** on the host. A builder
 started by Lazy Teams sees it inside its container at `/lazy-builder/scratch`;
 read its files with `lazy scratch` or the Teams **Files** view.
+In Teams, **Download** saves any file whose content was captured into the store.
+See [Builders in Lazy Teams](lazy-teams-builders.md) for the transcript and file controls.
 On Lazy Teams the directory, like each member's builder settings and
 conversations, lives on the project's persistent disk, so it survives the
 project's machine being replaced during an upgrade.
@@ -86,6 +88,10 @@ lazy scratch rm <path>         # drop a captured file from the store
 lazy scratch path              # the live directory, its entry count and size
 lazy search 'in:scratch <text>'   # search inside captured content
 ```
+
+In a clone logged in to Lazy Teams, `lazy scratch sync` refuses: the Teams
+builder runs on the server and its files are captured there, so a member does not
+copy laptop files into the shared store. `list`, `show` and `path` still work.
 
 Builders read the same files through the `lazy_scratch` MCP tool and search them
 with `in:scratch`. **Task agents cannot** — both the tool and the search scope

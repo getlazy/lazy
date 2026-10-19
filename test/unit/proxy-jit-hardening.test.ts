@@ -38,10 +38,6 @@ const CURSOR_GRANT: CredentialGrant = {
   createdAt: new Date().toISOString(),
 };
 
-function freePort(): number {
-  return 49000 + Math.floor(Math.random() * 6000);
-}
-
 describe('JIT credentials — attribution and refusal auditing', () => {
   let anthropicUp: ReturnType<typeof Bun.serve>;
   let proxy: ReturnType<typeof Bun.serve>;
@@ -53,14 +49,14 @@ describe('JIT credentials — attribution and refusal auditing', () => {
 
   beforeAll(async () => {
     records = [];
-    const upPort = freePort();
     anthropicUp = Bun.serve({
-      port: upPort, hostname: '127.0.0.1',
+      port: 0, hostname: '127.0.0.1',
       async fetch() {
         reached++;
         return Response.json({ type: 'message', model: 'm' });
       },
     });
+    const upPort = anthropicUp.port!;
 
     const targets = new TargetCredentials();
     targets.set(`http://127.0.0.1:${upPort}`, async () =>
@@ -75,12 +71,12 @@ describe('JIT credentials — attribution and refusal auditing', () => {
     };
 
     const sink: AuditSink = { append: async (r) => { records.push(r); } };
-    proxyPort = freePort();
     proxy = createProxyServer(
-      { port: proxyPort, bind: '127.0.0.1', upstream: `http://127.0.0.1:${upPort}`, retryAfterThreshold: 0 },
+      { port: 0, bind: '127.0.0.1', upstream: `http://127.0.0.1:${upPort}`, retryAfterThreshold: 0 },
       sink,
       credentials,
     );
+    proxyPort = proxy.port!;
     await new Promise(r => setTimeout(r, 50));
   });
 
@@ -181,15 +177,15 @@ describe('JIT credentials — cursor body substitution is byte-exact', () => {
   let seenLength: string | null = null;
 
   beforeAll(async () => {
-    const upPort = freePort();
     cursorUp = Bun.serve({
-      port: upPort, hostname: '127.0.0.1',
+      port: 0, hostname: '127.0.0.1',
       async fetch(req) {
         seenBody = new Uint8Array(await req.arrayBuffer());
         seenLength = req.headers.get('content-length');
         return Response.json({ ok: true });
       },
     });
+    const upPort = cursorUp.port!;
 
     const targets = new TargetCredentials();
     targets.set(`http://127.0.0.1:${upPort}`, async () => ({
@@ -201,10 +197,9 @@ describe('JIT credentials — cursor body substitution is byte-exact', () => {
       targets,
     };
     const sink: AuditSink = { append: async () => {} };
-    proxyPort = freePort();
     proxy = createProxyServer(
       {
-        port: proxyPort, bind: '127.0.0.1',
+        port: 0, bind: '127.0.0.1',
         upstream: 'http://127.0.0.1:1',
         cursorUpstream: `http://127.0.0.1:${upPort}`,
         retryAfterThreshold: 0,
@@ -212,6 +207,7 @@ describe('JIT credentials — cursor body substitution is byte-exact', () => {
       sink,
       credentials,
     );
+    proxyPort = proxy.port!;
     await new Promise(r => setTimeout(r, 50));
   });
 

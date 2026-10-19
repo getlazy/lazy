@@ -21,6 +21,7 @@ import { getHome } from '../utils/home';
 import type { Command, Response, SupervisorStatus } from './types';
 import { PROTOCOL_VERSION, normalizeResponse, normalizeSupervisorStatus, type CommandId } from './types';
 import { PROGRESS_FILE } from './progress';
+import { mintNotesSecret } from './notes-secret';
 import { FINAL_MARKER_FILE } from './final-marker';
 import { PRESENTATION_MARKER_FILE } from './presentation-marker';
 import type { ResolvedConfig, MaintainEntry, ReactEntry } from '../config/types';
@@ -296,7 +297,12 @@ export function writeCommand(dir: string, command: Command): void {
   if (existsSync(fPath)) {
     try { unlinkSync(fPath); } catch { /* best effort */ }
   }
-  atomicWrite(commandPath(dir), JSON.stringify(command, null, 2));
+  // The supervisor's own credential for comment hand-offs — see ./notes-secret.
+  const { command_id: cid } = command as { command_id?: string };
+  const withSecret = (cid && command.task_id)
+    ? { ...command, notes_secret: mintNotesSecret(command.task_id, cid) }
+    : command;
+  atomicWrite(commandPath(dir), JSON.stringify(withSecret, null, 2));
 }
 
 /**

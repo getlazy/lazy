@@ -39,7 +39,7 @@ export async function resolveTaskDiffContext(
   const worktreePath = getWorktreePath(projectRoot, task);
   // Async stat, not existsSync: this runs inside the daemon on every diff,
   // file-lines and region request, and a sync filesystem call there blocks the
-  // whole event loop (CLAUDE.md, "Never use sync filesystem calls"). It was
+  // whole event loop (AGENTS.md, "Never use sync filesystem calls"). It was
   // sync where this code came from; moving it is the moment to fix it.
   if (!(await pathExists(worktreePath))) {
     // Worktree is gone — try to recover from local or remote branch

@@ -41,11 +41,14 @@
  */
 
 import { randomUUID } from 'crypto';
+import { join } from 'path';
+import { readAuditRecords } from '../proxy/audit-log';
+import { currentCredentialFailures } from './current-credential-failures';
 import type { ResolvedConfig } from '../config/types';
 import type { Storage } from '../storage/interface';
 import type { ActorInput, Task } from '../types';
 import { loadConfig } from '../config/loader';
-import { agentProfilesFor, profileForAgentNameOrNull } from '../config/agent-profiles';
+import { agentProfilesFor, profileForAgentNameOrNull, type AgentProfile } from '../config/agent-profiles';
 import { actorEmail, actorRole } from '../actor-ref';
 import { displayId } from '../task/identity';
 import { parentTaskIdOf } from '../task-target';
@@ -53,10 +56,16 @@ import { isUserStopped } from '../task/user-stop';
 import { isClusterTask, isTerminalStatus } from '../types';
 import { logger } from '../utils/logger';
 import { buildTargetCredentials } from '../proxy/credential-deps';
+import { agentUpstreamMap, type TierRoute } from '../proxy/agent-upstreams';
+import { endpointRequirementsForProfile } from '../credentials/endpoint-requirements';
+import { memberCredentialFor, spendingMember } from './member-credentials';
+import { chooseTier, daemonTierRefusals } from '../proxy/tier-select';
 import {
   daemonUsageLimits,
   upstreamOrigin,
   usageLimitCredentialKey,
+  memberEndpointUsageKey,
+  isMemberEndpointUsageKey,
   type UsageLimitReading,
 } from '../proxy/usage-limits';
 import {
@@ -96,7 +105,9 @@ import {
   type UsageLimitsView,
 } from '../usage-pause/limits-view';
 import { getTurnOwner } from './turn-credentials';
-import { SERVICE_CREDENTIAL_USER_ID, teamModeEnabled } from './user-credentials';
+import { getPendingTurnOwner, runAsTurnOwnerRequest } from './turn-owner';
+import { runnerImageHold } from './runner-image-choice';
+import { SERVICE_CREDENTIAL_USER_ID, teamModeEnabled, getServiceHolder } from './user-credentials';
 
 export { describeNoReading, type UsagePauseCoverage } from '../usage-pause/policy';
 
@@ -330,7 +341,7 @@ function profileUpstream(config: ResolvedConfig, profile: { endpoint: string; ha
  *
  * Answered from the same sources the launch and the proxy use, so it cannot
  * name a different credential than the one actually billed:
- *   - per-user credentials (Teams): `user:<owner>`, else the project's service
+ *   - member credentials (Teams): member + endpoint, else the project's service
  *     credential — `planTurnCredential`'s answer, keyed exactly as the proxy
  *     keys it;
  *   - otherwise the proxy's own upstream → credential map, for the upstream the
@@ -347,10 +358,9 @@ async function spendCredentialFor(
   if (!profile) return null;
   const harness = profile.harness;
   if (await teamModeEnabled(projectRoot)) {
-    return {
-      credential: usageLimitCredentialKey({ userId: owner ?? SERVICE_CREDENTIAL_USER_ID, upstream: '' }),
-      harness,
-    };
+    const answer = await memberCredentialFor(projectRoot, owner ?? SERVICE_CREDENTIAL_USER_ID, profile, config);
+    if (answer.kind !== 'credential') return null;
+    return { credential: memberEndpointUsageKey(answer.member, answer.requirement.endpointId), harness };
   }
   const upstream = profileUpstream(config, profile);
   try {
@@ -396,6 +406,38 @@ export async function besideSpendCredential(
   return spendCredentialFor(
     projectRoot, config, config.models.roles.builder.profile, spenderEmail ?? null, 'the builder role',
   );
+}
+
+/**
+ * The BUILDER role's tiered profile. Both member and service launches are
+ * judged on the actual payer's endpoint readings for every tier.
+ */
+async function tieredBesideProfile(projectRoot: string, config: ResolvedConfig): Promise<AgentProfile | null> {
+  const profile = profileForAgentNameOrNull(config, config.models.roles.builder.profile);
+  if (!profile?.tiers) return null;
+  return profile;
+}
+
+/**
+ * Is a model run BESIDE any task (the builder role's profile) paused right now?
+ *
+ * INVARIANT: on a TIERED builder profile the verdict follows the tiers, never
+ * tier 0's credential alone — paused only when EVERY tier is full, by the same
+ * per-tier rule the proxy serves its requests by (`tieredUsagePause`). Judged
+ * on tier 0 alone, a builder whose subscription tier filled would be refused
+ * while the proxy would happily have served it from the next tier.
+ */
+export async function usagePauseBeside(
+  projectRoot: string,
+  config: ResolvedConfig,
+  spenderEmail: string | null,
+  threshold?: number,
+  now: number = Date.now(),
+): Promise<TaskUsagePause | null> {
+  const tiered = await tieredBesideProfile(projectRoot, config);
+  if (tiered) return tieredUsagePause(projectRoot, config, tiered.name, tiered.harness, threshold, now, spenderEmail);
+  if (threshold === undefined && !usagePauseConfigured(config)) return null;
+  return usagePauseForSpend(projectRoot, config, await besideSpendCredential(projectRoot, config, spenderEmail), threshold, now);
 }
 
 /** The latest reading for a credential, seeding from the audit log once per process. */
@@ -477,9 +519,115 @@ export async function usagePauseForTask(
   threshold?: number,
   now: number = Date.now(),
 ): Promise<TaskUsagePause | null> {
+  const profile = profileForAgentNameOrNull(config, task.agent_id);
+  if (profile?.tiers) return tieredUsagePause(projectRoot, config, profile.name, profile.harness, threshold, now, getTurnOwner(task.id));
   if (threshold === undefined && !usagePauseConfigured(config)) return null;
   const spend = await turnSpendCredential(projectRoot, config, task);
   return usagePauseForSpend(projectRoot, config, spend, threshold, now);
+}
+
+/**
+ * The launch-time pause for a TIERED profile: paused only when EVERY tier is
+ * over its threshold — the same per-tier rule the proxy picks a tier by
+ * (src/proxy/tier-select.ts), so the launch and the requests cannot disagree. A
+ * chain with an unconditional tier (one lazy reads no usage window for) is
+ * therefore never paused. The verdict is the LAST tier's, so the refusal names
+ * the window that has to reset for work to resume on the chain's floor.
+ *
+ * `threshold` (the override) of 0 or less lifts the pause, as for any profile.
+ */
+async function tieredUsagePause(
+  projectRoot: string,
+  config: ResolvedConfig,
+  profileName: string,
+  harness: string,
+  threshold: number | undefined,
+  now: number,
+  principal: string | null = null,
+): Promise<TaskUsagePause | null> {
+  if (threshold !== undefined && threshold <= 0) return null;
+  const configuredTiers = agentUpstreamMap(config)[profileName]?.tiers;
+  if (!configuredTiers?.length) return null;
+  // A positive one-shot override replaces every conditional tier's threshold,
+  // exactly as it replaces the configured one for an ordinary profile.
+  const tiers = threshold === undefined
+    ? configuredTiers
+    : configuredTiers.map((t) => (t.usage === null ? t : { ...t, threshold }));
+  await seedUsageReadings(projectRoot, config);
+  // INVARIANT (same as usagePauseForSpend): unreadable saved readings fail
+  // CLOSED for any chain whose availability depends on a reading.
+  const storeError = usageReadingsStoreError();
+  const conditional = tiers.find((t) => t.usage !== null);
+  if (storeError && conditional) {
+    return { harness, verdict: storeErrorVerdict(`tiered:${profileName}`, conditional.threshold ?? 0, storeError, now) };
+  }
+  const perUser = await teamModeEnabled(projectRoot);
+  const member = perUser ? await spendingMember(projectRoot, principal ?? SERVICE_CREDENTIAL_USER_ID) : null;
+  if (perUser && !member) return null;
+  let targets: ReturnType<typeof buildTargetCredentials>['targets'] | null = null;
+  try {
+    if (!perUser) targets = buildTargetCredentials(projectRoot, config).targets;
+  } catch (err) {
+    // The proxy refuses to start on the same misconfiguration; the launch
+    // reports that itself.
+    logger.debug(`usage pause: cannot resolve credentials for tiered profile ${profileName}: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+  const choice = await chooseTier(tiers, tierLookupsFor(targets, perUser, member, null), now);
+  if (!choice.allFull) return null;
+  const last = choice.skipped[choice.skipped.length - 1];
+  return last ? { harness, verdict: last.verdict } : null;
+}
+
+/** The proxy's own tier lookups, over the daemon-wide usage tracker. */
+function tierLookupsFor(targets: ReturnType<typeof buildTargetCredentials>['targets'] | null, perUser: boolean, member: string | null, profileName: string | null) {
+  return {
+    keyFor: async (t: TierRoute) => {
+      if (perUser) return member ? memberEndpointUsageKey(member, t.endpoint) : null;
+      const outcome = await targets!.forTarget(t.upstream);
+      return usageLimitCredentialKey({
+        credentialLabel: outcome.kind === 'credential' ? outcome.label : null,
+        upstream: t.upstream,
+      });
+    },
+    readingFor: (key: string) => daemonUsageLimits.reading(key),
+    // The tiers the proxy saw refuse, for a "tier in use" view (null = the
+    // usage pause, which judges readings only: refusals are short-lived, and
+    // the proxy already answers an all-refused request with 429 itself).
+    ...(profileName === null ? {} : { refusalFor: daemonTierRefusals.lookupFor(profileName) }),
+  };
+}
+
+/**
+ * The tier a TIERED profile's next request would be served by right now, and
+ * the usage-reading key of its credential — by the proxy's own rule
+ * (`chooseTier`), so what a surface shows is what the proxy will do. Null
+ * when the profile is not tiered or its credentials cannot be resolved.
+ */
+export async function tierInUseNow(
+  projectRoot: string,
+  config: ResolvedConfig,
+  profileName: string,
+  now: number = Date.now(),
+  principal: string | null = null,
+): Promise<{ tier: TierRoute; credential: string | null; allFull: boolean; reason: string } | null> {
+  const tiers = agentUpstreamMap(config)[profileName]?.tiers;
+  if (!tiers?.length) return null;
+  await seedUsageReadings(projectRoot, config);
+  const perUser = await teamModeEnabled(projectRoot);
+  const member = perUser ? await spendingMember(projectRoot, principal ?? SERVICE_CREDENTIAL_USER_ID) : null;
+  if (perUser && !member) return null;
+  let targets: ReturnType<typeof buildTargetCredentials>['targets'] | null = null;
+  try {
+    if (!perUser) targets = buildTargetCredentials(projectRoot, config).targets;
+  } catch (err) {
+    logger.debug(`tier in use: cannot resolve credentials for tiered profile ${profileName}: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+  if (usageReadingsStoreError() && tiers.some(t => t.usage !== null)) return null;
+  const lookups = tierLookupsFor(targets, perUser, member, profileName);
+  const choice = await chooseTier(tiers, lookups, now);
+  return { tier: choice.tier, credential: await lookups.keyFor(choice.tier), allFull: choice.allFull, reason: choice.reason };
 }
 
 // --- Is the pause able to act at all? ---
@@ -528,7 +676,7 @@ export async function usagePauseCoverage(
   const armed = new Set<string>();
   if (await teamModeEnabled(projectRoot)) {
     for (const credential of spent.keys()) {
-      if (credential.startsWith('user:') && spentOnSourced(credential)) armed.add(credential);
+      if (isMemberEndpointUsageKey(credential) && spentOnSourced(credential)) armed.add(credential);
     }
   } else {
     for (const profile of supported) {
@@ -570,8 +718,8 @@ const NOT_DONE: Record<UsagePauseVerb, string> = {
 };
 
 /** Launch verbs whose CLI command and builder MCP tool carry the per-task allowance themselves. */
-const ALLOWANCE_FLAG_VERBS: ReadonlySet<UsagePauseVerb> = new Set(['start', 'unblock', 'resume', 'review', 'ask']);
-/** Launch verbs whose builder MCP tool takes `past_usage_pause` (src/mcp/tools.ts). */
+const ALLOWANCE_FLAG_VERBS: ReadonlySet<UsagePauseVerb> = new Set(['start', 'unblock', 'resume', 'review', 'ask', 'pair']);
+/** Launch verbs whose builder MCP tool takes `override_usage_pause` (src/mcp/tools.ts). */
 const ALLOWANCE_MCP_VERBS: ReadonlySet<UsagePauseVerb> = new Set(['start', 'unblock', 'resume', 'review', 'ask']);
 
 /**
@@ -583,11 +731,11 @@ const ALLOWANCE_MCP_VERBS: ReadonlySet<UsagePauseVerb> = new Set(['start', 'unbl
 export function usagePauseRetryCommand(verb: UsagePauseVerb, task: string, actor: ActorInput | undefined): string {
   if (actorRole(actor) === 'builder') {
     return ALLOWANCE_MCP_VERBS.has(verb)
-      ? `call lazy_${verb} on ${task} again with past_usage_pause: true`
+      ? `call lazy_${verb} on ${task} again with override_usage_pause: true`
       : `run \`lazy daemon config set ${USAGE_PAUSE_OVERRIDE_KEY} off --task ${task}\` and retry`;
   }
   return ALLOWANCE_FLAG_VERBS.has(verb)
-    ? `lazy ${verb} ${task} --past-usage-pause`
+    ? `lazy ${verb} ${task} --override-usage-pause`
     : `lazy daemon config set ${USAGE_PAUSE_OVERRIDE_KEY} off --task ${task}`;
 }
 
@@ -655,16 +803,20 @@ export async function assertBesideLaunchAllowed(
     peek?: boolean;
     /** See {@link assertSpendAllowed}'s `overrideEligible`. */
     overrideEligible?: boolean;
+    /** CLI command for an explicitly requested session-scoped override. */
+    overrideCommand?: string;
   },
 ): Promise<void> {
-  // Nothing can pause with pausing off, and the credential lookup is not free.
-  if (!usagePauseConfigured(input.config)) return;
-  const spend = await besideSpendCredential(projectRoot, input.config, actorEmail(input.actor) ?? null);
+  // Nothing can pause with pausing off, and the credential lookup is not free —
+  // except a tiered builder, which pauses on its tiers' own thresholds.
+  if (!usagePauseConfigured(input.config) && !(await tieredBesideProfile(projectRoot, input.config))) return;
+  const spender = actorEmail(input.actor) ?? null;
   await assertSpendAllowed({
     actor: input.actor,
     peek: input.peek,
     overrideEligible: input.overrideEligible,
-    judge: (threshold) => usagePauseForSpend(projectRoot, input.config, spend, threshold),
+    overrideCommand: input.overrideCommand,
+    judge: (threshold) => usagePauseBeside(projectRoot, input.config, spender, threshold),
     what: input.what,
     refused: `${input.what.charAt(0).toUpperCase()}${input.what.slice(1)} was not started`,
     note: input.note,
@@ -697,16 +849,41 @@ export async function admitOneshotCommand(
   projectRoot: string,
   actor: ActorInput | undefined,
   now: number = Date.now(),
+  overrideUsagePause = false,
 ): Promise<string> {
-  await assertBesideLaunchAllowed(projectRoot, {
-    config: await loadConfig(projectRoot), actor, what: 'a one-shot model run',
-  });
+  const config = await loadConfig(projectRoot);
+  // Team mode: the command is paid by the person who asked (else the service
+  // holder) — the same payer `runOneshot` plans. Refused HERE, before any work
+  // or any question is typed, rather than once per model call afterwards.
+  const { oneshotCredentialProblem } = await import('./oneshot-credential');
+  const noCredential = await oneshotCredentialProblem(projectRoot, actorEmail(actor) ?? null);
+  if (noCredential) throw new RpcError(400, noCredential);
+  if (overrideUsagePause) {
+    await assertBesideUsagePauseOverrideAllowed(projectRoot, config, actor);
+  } else {
+    await assertBesideLaunchAllowed(projectRoot, { config, actor, what: 'a one-shot model run' });
+  }
   for (const [id, expires] of oneshotAllowances) {
     if (expires <= now) oneshotAllowances.delete(id);
   }
   const id = randomUUID();
   oneshotAllowances.set(id, now + ONESHOT_ALLOWANCE_TTL_MS);
   return id;
+}
+
+/** An explicit person's override applies to this launch only, without changing the pending daemon override. */
+export async function assertBesideUsagePauseOverrideAllowed(
+  projectRoot: string,
+  config: ResolvedConfig,
+  actor: ActorInput | undefined,
+): Promise<void> {
+  if (!mayUseUsagePauseOverride(actor)) {
+    throw new RpcError(403, 'Only a person may override the usage pause for this session.');
+  }
+  const verdict = await usagePauseBeside(projectRoot, config, actorEmail(actor) ?? null);
+  if (verdict?.verdict.storeError) {
+    throw usagePauseRefusal(verdict.verdict, { refused: 'Session was not started', human: true });
+  }
 }
 
 /**
@@ -725,12 +902,26 @@ export async function admitOneshotCommand(
 export async function admitInteractiveSession(
   projectRoot: string,
   storage: Storage,
-  input: { surface: 'pair' | 'chat'; taskId?: string; actor: ActorInput | undefined; peek?: boolean },
+  input: { surface: 'pair' | 'chat' | 'builder'; taskId?: string; actor: ActorInput | undefined; peek?: boolean; overrideUsagePause?: boolean },
 ): Promise<void> {
+  if (input.overrideUsagePause && !mayUseUsagePauseOverride(input.actor)) {
+    throw new RpcError(403, 'Only a person may override the usage pause for an interactive session.');
+  }
   const config = await loadConfig(projectRoot);
-  if (!usagePauseConfigured(config)) return;
+  if (!usagePauseConfigured(config) && !(await tieredBesideProfile(projectRoot, config))) return;
   const task = input.taskId ? (await storage.resolveTask(input.taskId)).task : null;
   if (input.taskId && !task) throw new RpcError(404, `Task not found: ${input.taskId}`);
+  if (input.overrideUsagePause) {
+    if (task && input.surface === 'pair') {
+      const verdict = await usagePauseForTask(projectRoot, config, task);
+      if (verdict?.verdict.storeError) {
+        throw usagePauseRefusal(verdict.verdict, { refused: 'Pairing session was not started', human: true });
+      }
+    } else {
+      await assertBesideUsagePauseOverrideAllowed(projectRoot, config, input.actor);
+    }
+    return;
+  }
   if (task && input.surface === 'pair') {
     await assertTurnStartAllowed(projectRoot, { task, config, actor: input.actor, verb: 'pair', peek: input.peek });
     return;
@@ -741,7 +932,12 @@ export async function admitInteractiveSession(
     peek: input.peek,
     what: input.surface === 'chat'
       ? `the chat with ${task ? displayId(task) : 'the task'}`
-      : 'the pairing session',
+      : input.surface === 'builder' ? 'the builder session' : 'the pairing session',
+    overrideCommand: input.surface === 'chat'
+      ? `lazy chat ${task ? displayId(task) : '<task>'} --override-usage-pause`
+      : input.surface === 'builder'
+        ? 'lazy builder --override-usage-pause'
+        : 'lazy pair --host --no-task --override-usage-pause',
   });
 }
 
@@ -774,6 +970,7 @@ async function assertSpendAllowed(input: {
    * person asked (one-shots, pair, chat, the dashboard's web terminals).
    */
   overrideEligible?: boolean;
+  overrideCommand?: string;
   /** The verdict at the configured threshold (no argument) or at `threshold`. */
   judge: (threshold?: number) => Promise<TaskUsagePause | null>;
   what: string;
@@ -812,7 +1009,7 @@ async function assertSpendAllowed(input: {
   // Unreadable saved readings: refused, and the override is not consulted —
   // a person fixes the file (see usagePauseForSpend).
   if (pause.verdict.storeError) {
-    throw usagePauseRefusal(pause.verdict, { refused: input.refused, note: input.note, human });
+    throw usagePauseRefusal(pause.verdict, { refused: input.refused, note: input.note, human, overrideCommand: input.overrideCommand });
   }
   const pending = human ? override : null;
   if (pending !== null) {
@@ -830,7 +1027,7 @@ async function assertSpendAllowed(input: {
       return;
     }
   }
-  throw usagePauseRefusal(pause.verdict, { refused: input.refused, note: input.note, human });
+  throw usagePauseRefusal(pause.verdict, { refused: input.refused, note: input.note, human, overrideCommand: input.overrideCommand });
 }
 
 /**
@@ -851,6 +1048,7 @@ export function usagePauseRefusal(
     taskRetry?: string;
     /** Addressed to the builder: the allowance is the engineer's call, not its own. */
     builder?: boolean;
+    overrideCommand?: string;
   },
 ): RpcError {
   if (input.taskRetry && !verdict.storeError) {
@@ -888,7 +1086,7 @@ export function usagePauseRefusal(
     : '';
   const escape = input.human
     ? `  To let ONE turn start anyway (the override is used up by the turn it lets through):\n` +
-      `    lazy daemon config set ${USAGE_PAUSE_OVERRIDE_KEY} off\n` +
+      `    ${input.overrideCommand ?? `lazy daemon config set ${USAGE_PAUSE_OVERRIDE_KEY} off`}\n` +
       `  Readings: lazy stats limits · Explanation: lazy doctor`
     : `  New turns on this credential can start again once the window resets. ` +
       `This limit is the human's to lift, not yours — do not retry before the reset.`;
@@ -993,8 +1191,8 @@ async function announceEpisode(storage: Storage, v: UsagePauseVerdict, task: Tas
         `**${displayId(task)}**) wait and go ahead on their own when the window resets. ` +
         `Starts, unblocks, resumes, reviews, asks and the other model runs you ask for are refused ` +
         `until then.\n\n` +
-        `To let one task's next turn start anyway, launch it with \`--past-usage-pause\` (e.g. ` +
-        `\`lazy resume <task> --past-usage-pause\`) or use the task's "Let its next turn through" button ` +
+        `To let one task's next turn start anyway, launch it with \`--override-usage-pause\` (e.g. ` +
+        `\`lazy resume <task> --override-usage-pause\`) or use the task's "Let its next turn through" button ` +
         `on the dashboard. \`lazy doctor\` lists everything the pause is holding.`,
     });
   } catch (err) {
@@ -1098,7 +1296,10 @@ export async function holdAgentStart(
   verdictTask: Task,
   params: Record<string, unknown>,
 ): Promise<string> {
-  const pending: UsagePausePendingStart = { requestedAt: Date.now(), params };
+  // The owner the start was asked under rides with it: the replay runs outside
+  // every request and would otherwise bill nobody, i.e. the service holder.
+  const owner = getPendingTurnOwner(task.id);
+  const pending: UsagePausePendingStart = { requestedAt: Date.now(), params, ...(owner ? { owner } : {}) };
   await storage.updateTaskMetadata(task.id, USAGE_PAUSE_PENDING_START_KEY, JSON.stringify(pending));
   const why = await usagePauseHold(projectRoot, storage, verdictTask, HELD_START_LABEL);
   logger.info(`usage pause: holding the start of ${displayId(task)} its parent's agent asked for${why ? ` — ${why}` : ''}`);
@@ -1143,7 +1344,7 @@ async function processHeldStart(
   // start was the cluster's own request — so it stays HELD (never launched,
   // never dropped) until the stop lifts, exactly as the cluster restart and
   // auto-resume honour the gate (src/task/user-stop.ts). One of the paths
-  // CLAUDE.md counts as consulting it.
+  // AGENTS.md counts as consulting it.
   if (parent) {
     const parentSession = await storage.getSessionByTaskId(parent.id);
     if (parentSession && isUserStopped(parentSession)) {
@@ -1153,11 +1354,18 @@ async function processHeldStart(
   }
   const agentId = typeof pending.params.agentId === 'string' ? pending.params.agentId : undefined;
   const verdictTask = agentId ? { ...task, agent_id: agentId } : task;
-  if (await pausedDespiteAllowance(projectRoot, config, verdictTask)) return;
+  // The verdict is judged as the launch will be: under the owner the start was
+  // held with, so it reads THEIR window, not the service holder's.
+  const asOwner = <T>(fn: () => Promise<T>): Promise<T> =>
+    pending.owner ? runAsTurnOwnerRequest({ taskId: task.id, owner: pending.owner }, fn) : fn();
+  if (await asOwner(() => pausedDespiteAllowance(projectRoot, config, verdictTask))) return;
   if (!resumeHeldStart) return;
+  // The project's runner image is not ready and nobody chose the default
+  // image: stays HELD (not dropped as a failed launch) until it is.
+  if (await runnerImageHold(task)) return;
   let outcome: 'started' | 'held';
   try {
-    outcome = await resumeHeldStart(task, pending.params);
+    outcome = await asOwner(() => resumeHeldStart(task, pending.params));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     logger.warn(`usage pause: the held start of ${displayId(task)} failed after the reset: ${message}`);
@@ -1366,7 +1574,9 @@ export async function describeUsagePauseState(
   const config = await loadConfig(projectRoot);
   await seedUsageReadings(projectRoot, config);
   const paused: UsagePauseVerdict[] = [];
+  const perUser = await teamModeEnabled(projectRoot);
   for (const reading of daemonUsageLimits.readings()) {
+    if (perUser && reading.credential.startsWith('user:')) continue;
     const v = evaluateUsagePause(
       reading,
       anySourcePauseWindows,
@@ -1438,6 +1648,21 @@ async function judgeTaskUsagePause(
   // The launch gate judges the task AFTER an `--agent` switch, so the
   // pre-flight must judge the agent the turn will actually run on.
   const task = agentId ? { ...resolvedTask, agent_id: agentId } : resolvedTask;
+  // A TIERED profile is judged the way its launch is: paused only when every
+  // tier is full (tieredUsagePause), never on tier 0's credential alone.
+  const tieredProfile = profileForAgentNameOrNull(config, task.agent_id);
+  if (tieredProfile?.tiers) {
+    const tieredPause = await tieredUsagePause(projectRoot, config, tieredProfile.name, tieredProfile.harness, undefined, now, ownerEmail ?? getTurnOwner(task.id));
+    const tieredAllowed = taskAllowances.has(task.id);
+    const shown = tieredPause && tieredAllowed && !tieredPause.verdict.storeError ? null : tieredPause;
+    return {
+      credential: tieredPause?.verdict.credential ?? null,
+      harness: tieredProfile.harness,
+      supported: true,
+      verdict: shown?.verdict ?? null,
+      allowed: tieredAllowed,
+    };
+  }
   const spend = ownerEmail && await teamModeEnabled(projectRoot)
     ? await spendCredentialFor(projectRoot, config, task.agent_id, ownerEmail, displayId(task))
     : await turnSpendCredential(projectRoot, config, task);
@@ -1472,7 +1697,8 @@ export async function describeTaskUsagePause(
   if (!task) throw new RpcError(404, `Task not found: ${taskId}`);
   const allowance = taskAllowances.get(task.id) ?? null;
   const config = await loadConfig(projectRoot);
-  if (!usagePauseConfigured(config)) return { verdict: null, allowance };
+  // A tiered task pauses on its tiers' own thresholds even with [usage_pause] off.
+  if (!usagePauseConfigured(config) && !profileForAgentNameOrNull(config, task.agent_id)?.tiers) return { verdict: null, allowance };
   await seedUsageReadings(projectRoot, config);
   const judged = await judgeTaskUsagePause(projectRoot, config, task, undefined, now);
   return { verdict: judged.verdict, allowance };
@@ -1506,6 +1732,21 @@ export async function describeBesideLaunch(
   opts: { overrideEligible?: boolean } = {},
 ): Promise<NonNullable<UsagePauseState['beside']>> {
   const config = await loadConfig(projectRoot);
+  const tiered = await tieredBesideProfile(projectRoot, config);
+  if (tiered) {
+    // The reading that matters is the tier the proxy would serve from now.
+    const inUse = await tierInUseNow(projectRoot, config, tiered.name, now, spenderEmail);
+    const configured = await usagePauseBeside(projectRoot, config, spenderEmail, undefined, now);
+    const pause = configured && override !== null && opts.overrideEligible !== false
+      ? await usagePauseBeside(projectRoot, config, spenderEmail, override, now)
+      : configured;
+    return {
+      credential: inUse?.credential ?? null,
+      harness: tiered.harness,
+      supported: usageSourceFor(tiered.harness) !== null,
+      verdict: pause?.verdict ?? null,
+    };
+  }
   const spend = await besideSpendCredential(projectRoot, config, spenderEmail);
   const configured = usagePauseConfigured(config)
     ? await usagePauseForSpend(projectRoot, config, spend, undefined, now)
@@ -1530,8 +1771,7 @@ export async function describeBesideLaunch(
  */
 export async function daemonBesideLaunchPaused(projectRoot: string): Promise<TaskUsagePause | null> {
   const config = await loadConfig(projectRoot);
-  if (!usagePauseConfigured(config)) return null;
-  return usagePauseForSpend(projectRoot, config, await besideSpendCredential(projectRoot, config, null));
+  return usagePauseBeside(projectRoot, config, null);
 }
 
 /**
@@ -1595,7 +1835,10 @@ export async function taskViewCredential(
   if (await teamModeEnabled(projectRoot)) {
     const binding = await getTaskSessionBinding(projectRoot, task.id);
     if (!binding || binding.revokedAt !== null) return null;
-    return usageLimitCredentialKey({ userId: binding.ownerUserId, upstream: '' });
+    const profile = profileForAgentNameOrNull(config, task.agent_id);
+    if (!profile) return null;
+    if (profile.tiers) return (await tierInUseNow(projectRoot, config, profile.name, Date.now(), binding.ownerUserId))?.credential ?? null;
+    return (await spendCredentialFor(projectRoot, config, profile.name, binding.ownerUserId, displayId(task)))?.credential ?? null;
   }
   return (await turnSpendCredential(projectRoot, config, task))?.credential ?? null;
 }
@@ -1628,12 +1871,14 @@ export async function seedUsageLimitsView(projectRoot: string): Promise<void> {
  * `builder-<id>`. Null for any other builder (a host `lazy builder`, a session
  * whose binding is gone).
  */
-async function builderViewCredential(projectRoot: string, label: string | null): Promise<string | null> {
+async function builderViewCredential(projectRoot: string, config: ResolvedConfig, label: string | null): Promise<string | null> {
   const id = label?.startsWith('builder-') ? label.slice('builder-'.length) : null;
   if (!id) return null;
   const binding = await getTaskSessionBinding(projectRoot, id);
   if (!binding || binding.revokedAt !== null) return null;
-  return usageLimitCredentialKey({ userId: binding.ownerUserId, upstream: '' });
+  const profile = profileForAgentNameOrNull(config, config.models.roles.builder.profile);
+  if (profile?.tiers) return (await tierInUseNow(projectRoot, config, profile.name, Date.now(), binding.ownerUserId))?.credential ?? null;
+  return (await besideSpendCredential(projectRoot, config, binding.ownerUserId))?.credential ?? null;
 }
 
 /**
@@ -1653,17 +1898,42 @@ export async function describeUsageLimitsView(
 ): Promise<UsageLimitsView> {
   await seed(projectRoot);
   const state = await describeUsagePauseState(projectRoot, storage);
-  const view = projectUsageLimits(daemonUsageLimits.readings(), state);
+  const config = await loadConfig(projectRoot);
+  // Failing credentials, scoped below exactly like the readings.
+  const records = await readAuditRecords(join(projectRoot, config.data.path), { limit: 200 });
+  const view = projectUsageLimits(daemonUsageLimits.readings(), state, Date.now(), await currentCredentialFailures(projectRoot, records));
   if (caller.kind === 'builder') {
     if (!(await teamModeEnabled(projectRoot))) return view;
     return memberUsageLimitsView(
       view,
-      await builderViewCredential(projectRoot, caller.label),
-      usageLimitCredentialKey({ userId: SERVICE_CREDENTIAL_USER_ID, upstream: '' }),
+      await builderViewCredential(projectRoot, config, caller.label),
+      '',
+      await builderEndpointKeys(projectRoot, config, caller.label),
     );
   }
   const task = await storage.getTask(caller.taskId);
   if (!task) throw new RpcError(404, `Task not found: ${caller.taskId}`);
-  const config = await loadConfig(projectRoot);
-  return scopeUsageLimitsView(view, await taskViewCredential(projectRoot, config, task), task.id);
+  const binding = await getTaskSessionBinding(projectRoot, task.id);
+  const profile = profileForAgentNameOrNull(config, task.agent_id);
+  const keys = await teamModeEnabled(projectRoot) && binding?.revokedAt === null && profile
+    ? await profileEndpointKeys(projectRoot, config, profile, binding.ownerUserId) : [];
+  return scopeUsageLimitsView(view, await taskViewCredential(projectRoot, config, task), task.id, keys);
+}
+
+
+async function profileEndpointKeys(projectRoot: string, config: ResolvedConfig, profile: AgentProfile, principal: string): Promise<string[]> {
+  const member = await spendingMember(projectRoot, principal);
+  return member ? endpointRequirementsForProfile(profile, config).filter(r => r.credential !== 'none').map(r => memberEndpointUsageKey(member, r.endpointId)) : [];
+}
+
+async function builderEndpointKeys(projectRoot: string, config: ResolvedConfig, label: string | null): Promise<string[]> {
+  const id = label?.startsWith('builder-') ? label.slice('builder-'.length) : null;
+  const binding = id ? await getTaskSessionBinding(projectRoot, id) : null;
+  const profile = profileForAgentNameOrNull(config, config.models.roles.builder.profile);
+  if (!profile) return [];
+  const holder = await getServiceHolder(projectRoot);
+  return [...new Set([
+    ...(binding?.revokedAt === null ? await profileEndpointKeys(projectRoot, config, profile, binding.ownerUserId) : []),
+    ...(holder ? await profileEndpointKeys(projectRoot, config, profile, holder.email) : []),
+  ])];
 }

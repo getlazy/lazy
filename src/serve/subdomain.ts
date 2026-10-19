@@ -1,6 +1,6 @@
 /**
  * Where a task's `[serve]` services live in the browser's eyes:
- * `http://<service>.<task>.lazy.localhost:<dashboard-port>`.
+ * `http://<task>.<service>.lazy.localhost:<dashboard-port>`.
  *
  * The published loopback URL (`http://127.0.0.1:49154`) is still the truth about
  * the container — this module is about the NAME humans and browsers use to get
@@ -11,7 +11,7 @@
  *    the dashboard already moved to `lazy.localhost`
  *    (src/daemon/dashboard-url.ts) — the same trick, one level down.
  *  - **The URL stops moving.** A host port is OS-assigned at container creation,
- *    so it changes on every recreate; `web.my-task.lazy.localhost:26024` does
+ *    so it changes on every recreate; `my-task.web.lazy.localhost:26024` does
  *    not, and a browser tab or a bookmark survives a restart.
  *
  * `*.localhost` is loopback by RFC 6761 and Chromium and Firefox resolve it
@@ -32,7 +32,7 @@ export const MAX_HOST_LABEL_LENGTH = 63;
 /**
  * A valid DNS label, lowercase: letters, digits and inner hyphens.
  *
- * A LEADING DIGIT is deliberately allowed — `3000.my-task.lazy.localhost` has
+ * A LEADING DIGIT is deliberately allowed — `my-task.3000.lazy.localhost` has
  * to work, since a bare `[serve] ports = [3000]` entry is named by its port.
  * RFC 1123 permits it and browsers accept it.
  */
@@ -73,7 +73,7 @@ export function serviceHostLabel(service: { name: string; port: number }): strin
   return isHostLabel(name) ? name : String(service.port);
 }
 
-/** A Host header parsed as `<service>.<task>.<suffix>`. */
+/** A Host header parsed as `<task>.<service>.<suffix>`. */
 export interface ServeHostRef {
   /** Service label as written: a `[serve.services]` name or a container port. */
   service: string;
@@ -105,7 +105,7 @@ export function parseServeHost(
   const labels = prefix.split('.');
   if (labels.length !== 2) return null;
 
-  const [service, task] = labels as [string, string];
+  const [task, service] = labels as [string, string];
   if (!isHostLabel(service) || !isHostLabel(task)) return null;
   return { service, task };
 }
@@ -128,14 +128,14 @@ function stripPort(hostHeader: string): string {
 }
 
 /**
- * `http://<service>.<task>.<authority>` — the URL a human opens.
+ * `http://<task>.<service>.<authority>` — the URL a human opens.
  *
  * `authority` is the dashboard's own `host[:port]`, so the service rides the
  * port the dashboard already answers on. No trailing slash: this is composed
  * into `lazy url` output and hrefs.
  */
 export function serviceSubdomainUrl(service: string, task: string, authority: string): string {
-  return `http://${service}.${task}.${authority}`;
+  return `http://${task}.${service}.${authority}`;
 }
 
 /**

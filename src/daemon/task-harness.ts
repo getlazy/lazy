@@ -28,7 +28,7 @@ import { displayId } from '../task/identity';
  * the error says which one to fix rather than just which name was missing. A
  * task whose profile was deleted from config cannot be launched, and guessing a
  * harness for it would run the turn on a binary, model and upstream nobody
- * chose (CLAUDE.md: no silent fallbacks).
+ * chose (AGENTS.md: no silent fallbacks).
  */
 export function harnessForTask(config: ResolvedConfig, task: Task): string {
   return profileForAgentName(config, task.agent_id, `task ${displayId(task)}`).harness;

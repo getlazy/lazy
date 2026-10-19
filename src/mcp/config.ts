@@ -20,7 +20,7 @@ import { pathExists, readFileSafe, writeFile, ensureDir } from '../utils/fs';
  * server and every permission the user had configured — a destructive edit
  * they would only discover much later, with no copy to restore from.
  *
- * Per CLAUDE.md's "found but broken" rule: missing falls through to defaults,
+ * Per AGENTS.md's "found but broken" rule: missing falls through to defaults,
  * but present-and-unparseable is an error the human must see. `prepareTurnMcp`
  * fails the turn on a config-write error, so throwing here surfaces properly.
  */
@@ -106,7 +106,10 @@ export class ForeignMcpEntryError extends Error {
  *
  * @param mcpServerConfig - The command and args for the MCP server, provided by the Runner.
  */
-export async function writeMcpConfig(mcpServerConfig: { command: string; args: string[] }): Promise<void> {
+export async function writeMcpConfig(
+  mcpServerConfig: { command: string; args: string[] },
+  opts: { enclosingTurnTaskId?: string } = {},
+): Promise<void> {
   const claudeConfigPath = join(getHome(), '.claude.json');
 
   let config: ClaudeConfig = {};
@@ -132,6 +135,24 @@ export async function writeMcpConfig(mcpServerConfig: { command: string; args: s
       `sharing this HOME with the task's supervisor; replacing it would cut that session off from lazy. ` +
       `Run the task's supervisor with its own HOME (a test harness must give every launch a private HOME), ` +
       `or remove the entry by hand if it is genuinely stale.`,
+    );
+  }
+
+  // The one task-to-task replacement that is NOT the host runner's ordinary
+  // shape: this supervisor was started from inside a live turn's agent
+  // (`enclosingTurnTaskId`, src/supervisor/mcp-setup.ts) and the entry here is
+  // THAT turn's. Replacing it cuts the enclosing agent off from its lazy tools
+  // for every later invocation of its turn.
+  const enclosing = opts.enclosingTurnTaskId;
+  const existingOwner = existing ? lazyMcpEntryOwner(existing) : undefined;
+  if (
+    enclosing && writer.kind === 'task' && writer.taskId !== enclosing
+    && existingOwner?.kind === 'task' && existingOwner.taskId === enclosing
+  ) {
+    throw new ForeignMcpEntryError(
+      `${claudeConfigPath} holds the lazy MCP entry of task ${enclosing}, whose agent started this ` +
+      `supervisor (task ${writer.taskId}) and is still running in this HOME. Replacing the entry would ` +
+      `cut that agent off from its lazy tools mid-turn. Run the inner lazy with its own HOME.`,
     );
   }
 

@@ -1,5 +1,212 @@
 # Changelog
 
+## [Unreleased]
+
+## [0.92.1201] - 2026-10-18 - Failure visibility, backups and Lazy Teams private alpha
+
+Lazy Teams, in private alpha, now owns each project's environment: admins define variables, secrets and secret files once, and every task gets its effective set without anything being committed. Failed turns say why wherever you look, task services restart after every turn, in Teams pull requests link back to the task and its running app, microVM installs move to smolvm 1.29, and every upgrade backs up the task store first (Teams also its database). Clones bound to a Teams project gain `lazy shell --local` and most task verbs, and tiered agent profiles fall through endpoints as usage windows fill.
+
+### Added
+- **Teams: secrets warning** — the Environment page and docs state that a secret can be read by anyone who can work on a task it applies to, like CI secrets on GitHub
+- **Teams: machine data integrity checks** — project machines check their own memory hourly and re-check stored image data after each build, alerting only when something was damaged
+- **`lazy:adopt_store` VM size** — optional `CPUS=`, `MEMORY_MIB=` and `STORAGE_GIB=` size the adopted project's machine; omitted ones follow the installation default
+- **Teams: PR/MR links to the task and its app** — a pull request description links to the task in Teams and to its main service, chosen by `[serve] main_service` (default: the first port)
+- **Services restart after every turn** — a task's services are stopped and restarted after each work turn, with a warning if the start fails; Teams adds a Stop services command
+- **Teams: task Overview leads with the goal and services** — feedback, Reject and Close follow, and a new More tab holds the prompt and details.
+- **Per-task secret files** — a control plane can give one task files such as a `.env`: written into its worktree before every launch, never committed or pushed, never deleted, and never overwriting a file already there
+- **Teams: project environment entries** — project admins define variables, secrets and files (secret values encrypted and write-only) under Settings → Environment, always-applied or optional per task
+- **Teams: task environment** — a task page shows its variables, secrets and files, lets members pick optional entries and add task-only ones, and delivers them before each launch, shown on the task's Services tab with a banner on every tab while its services are starting or not running; every new task, however started, gets the always-applied entries
+- **Bulk-dismiss messages** — `lazy messages dismiss --all`, `--source` or `--title`, and "Dismiss all" / "Dismiss all like this" in Teams and the dashboard; repeated machine alerts now count up on one message
+- **Teams: what is running in a task's environment** — the Services tab lists the processes Run services started, their state, listening ports, exit code and output, with Show more output
+- **Teams: imported endpoints and agent profiles work** — a project an admin imports can use the endpoints and profiles its `lazy.toml` defines straight away, and an owner's Save applies them; history shows what came in
+- **Teams: confirm a project's endpoints and profiles** — when an import has no admin on record, an admin confirms them on Endpoints and agent profiles; refused tasks link there
+- **Teams: reset a machine's Docker storage** — project admins empty a stuck machine's Docker storage from the Machine page or the health banner when the store is damaged (or `lazy system machine reset-docker-storage`), confirmed first, each step narrated; builds are cold afterwards
+- **Teams: memory on the Machine page** — a chart of the machine's and the container runtime's memory over the last day, the container runtime's memory, out-of-memory kills and machine size, and a resize form in god mode
+- **Teams: machine stop history in god mode** — every machine stop Teams makes is kept with its cause, and a machine found down without one is marked as such
+- **Teams: host capacity in God mode** — compares running machines' total CPU and memory with the host's RAM and memory pressure, warning when overcommitted
+- **Teams: display name** — set an editable display name under Account settings → Profile; it is shown with your email beside it, and names matching a teammate, shaped like an email, or reserved are refused
+- **Store backups before every upgrade** — upgrades and Teams rolls save a compressed, verified archive of the task store first, refusing to proceed without one, while a restore is unfinished, or while the store lock is held from the other OS (Mac vs container); see `lazy system store-backups`
+- **`lazy system store-restore`** — restores the store from a pre-upgrade backup; `lazy upgrade --skip-store-backup` skips the backup deliberately, and `[storage] backup_keep` sets how many are kept (default 5)
+- **Per-turn model latency** — each turn records its model calls' TTFT, TTLT and tokens/s; the task Stats tab and the Teams Usage page show latency history
+- **Teams: Turns pages by chunk** — the Turns tab shows the newest chunks first with Older/Newer links and a jump-to-chunk box, one drawer per chunk, and no fixed turn limit hiding history
+- **`lazy stats latency`** — TTFT, TTLT, tokens/s (output tokens over whole request time) and errors per endpoint and model, kept per turn so any period compares providers; every cell shows its sample count; `--recent` reads the audit trail
+- **`lazy stats audit --summary`** — one row per endpoint × model with requests, errors, latency percentiles and tokens/s; the audit list and detail now name the endpoint (also on the Teams Usage page)
+- **Teams: act on a raised item in place** — every raised item shows its ISO 8601 time and linked turn, offers Ask / Comment / Unblock right on the item, and a Decision can "Unblock agent" in one step
+- **Comments reach a working agent before its turn ends** — a comment written while the agent works is handed to it before its closing steps, bounded by `max_turns_without_human`; only the turn's own supervisor can mark them delivered
+- **Teams: database backup before every upgrade** — the application database is copied before an upgrade changes it (last five kept, shown in god mode); a failed copy stops the upgrade
+- **Supply-chain hardening** — image publisher actions are SHA-pinned, Codex downloads are checksum-verified, and the Docker apt keyring holds only the asserted key
+- **Single-tier agent profiles** — a tiered profile may list just one tier, to watch its `threshold_percent` fire before adding a second
+- **Relative `*_FILE` paths in the Teams env file** — `CLI_JWT_PRIVATE_KEY_FILE=cli-jwt.pem` now resolves next to `deploy.env`, not the server's working directory
+- **`lazy stats limits` / `lazy stats budget` in a Teams-bound clone** — show the same usage view the browser gives you
+- **`lazy chat`, `lazy report` and `lazy ask <conversation>` in a Teams-bound clone** — run on the install and spend your own Claude credential, exactly as the browser does
+- **Bound clones can redo, submit, reparent, link and promote** — `lazy redo`, `submit`, `reparent`, `link`, `raised promote` and `scratch list|show` work from a clone logged in to Lazy Teams, with the browser's permissions. `lazy scratch sync` refuses by name there, since it copies laptop files into the store.
+- **`lazy shell <task> --local`** — in a clone bound to Lazy Teams, opens a shell in a local checkout of the task's branch; `git push` sends your commits to the task.
+- **`git clone` from Lazy Teams just works** — after one `lazy login <install>`, run anywhere, plain `git clone` of hosted repositories works machine-wide, behind a sign-in proxy or not.
+- **`lazy clone <clone-url>`** — a second form of `lazy clone` (which otherwise duplicates a task): given a Lazy Teams project's clone URL, it logs in if needed, clones the repository and binds the clone at its real path, even inside a symlinked folder such as macOS's `/tmp`; use the address your install is served on — the scheme you type is used exactly, and a redirect is reported with where it went.
+- **Teams endpoint and profile editor** — project owners add, edit and remove endpoints and agent profiles (including tiers) with a form instead of lazy.toml text; the connections pages say where endpoints come from.
+- **Teams endpoint credentials** — connect once per endpoint, share connections across profiles, and run tiered tasks and builders on your own accounts.
+- **Copy markdown from any card** — turns, reports, comments, journal entries, raised items and prompts get a Copy button that copies the original markdown source
+- **Tiered builder** — `[models.roles.builder]` may name a tiered profile; the builder switches tiers like tasks, and `lazy builder` and the Builders pages show the tier answering
+- **Task header names the agent profile** — the dashboard and Teams show `profile <name>`, with harness, endpoint and credential name on hover, and a tiered profile's tier chain instead of a model that is never sent
+- **Teams stays usable when a project's daemon or machine is down** — God mode pages open at once, daemon reads give up after seconds and say "not answering — last heard from…", and the machine shell, service logs and dockerd/forwarder restarts work regardless
+- **Teams: stop all projects** — `bin/native-rails lazy:projects:stop_all` (native installs) and God mode's "Stop all projects" button stop every project's daemon and machine, deleting nothing, with a result per project
+- **Teams: God mode verifies alternative emails** — a site admin can add a member's alternative email as already verified, with no verification email sent
+- **Teams daemon image ships lazy as a compiled binary** — project machines run the compiled release build instead of a source tree with node_modules
+- **Teams: Services tab** — every task shows its services; Start services runs the project's command in the task's environment and shows its output; a service still starting shows how long it has waited, and Open waits for its port to answer
+- **Search by id** — paste a task, raised item, comment, turn, commit, artifact, message or conversation id (6+ characters, or the full id) into search on any surface and land on it
+- **Open task services from Lazy Teams** — each declared `[serve]` service opens through Teams from any member's browser, WebSockets included; set `SERVICES_HOST` with a wildcard domain (paid ngrok works). The Services card shows the address Teams serves each service on — https on a public install, `*.localhost` on the machine itself.
+- **Codex is no longer pinned** — images and the host install hint take the latest Codex release (both binaries from the same release), unknown Codex events are ignored, and Codex no longer clones its plugin marketplace into the task worktree
+- **Teams alternative emails** — verify additional email addresses to sign in to one member account through password or OAuth proxy sign-in.
+- **Lazy Teams trusted-proxy sign-in** — behind a proxy that already logs people in (e.g. ngrok Google OAuth), Teams signs existing users in from its identity header plus a shared secret
+- **Agents add missing toolchains to the task image** — they write it into `Dockerfile.lazy`; a committed root `Dockerfile.lazy` is used with no `lazy.toml` setting
+- **Teams: recover from a failing `Dockerfile.lazy`** — admins adopt it from another branch or task for the whole project after reviewing a diff against the project branch's Dockerfile, or open a fix task that test-builds it (`lazy_image_build`)
+- **`lazy system runner-image log` / `rebuild` / `cancel`, `lazy system machine`** — watch the project image build step by step, rebuild or cancel it, and see the machine's services, redacted logs and resource use
+- **Teams: see the project's machine** — admins get one image state, a live build log with Rebuild/Cancel, services, redacted logs (withheld entirely when lazy cannot load its secrets), why Docker restarted, resources and who fixes each failure; god mode restarts services
+- **`lazy login` behind an authenticating proxy** — logs in through your browser, the proxy verifies every CLI and git request; ready-made ngrok policy included
+- **Folded turn wrappers** — the Turns tab in Lazy Teams and the dashboard shows your feedback and the agent's output first, with lazy's repeated instructions in a closed drawer
+- **Stats cumulative-token graph** — time on the X axis (ISO 8601 labels, timestamps on hover), chunk starts marked and linked to Turns, in Teams and the dashboard.
+- **Published runner image** — each release publishes `lazy-runner` with Claude Code, Codex, Cursor and Pi baked in; the first task pulls it instead of building, building locally only as a fallback
+- **Lazy Teams machine size** — a site admin in god mode can set a project's microVM CPUs, memory and disk, and a default size for new machines.
+- **Tiered agent profiles and `[endpoints.<name>]`** — one profile falls from tier to tier (e.g. Claude subscription → Fireworks → Ollama) as usage windows fill or a tier refuses with a 429, mid-turn (`threshold_percent` optional), and returns after `[proxy] tier_retry_interval`; when every tier is full, requests get a rate-limit error saying when the earliest window resets.
+- **Agent profile endpoints** — newly added or changed routes and their credentials take effect on the next proxy request without restarting the daemon.
+- **Lazy Teams Tasks page** — Active opens as a collapsible tree of in-flight tasks, with inactive parents kept so the nesting stays intact; other filters stay a flat list.
+- **Fireworks FireRouter** — agent profiles pointed at `api.fireworks.ai` use a new `fireworks` credential (`lazy auth set fireworks`), so Claude Code, Codex and pi can run through FireRouter.
+- **`lazy_wait` interruption** — a subtask added to the waiting task from outside now ends the wait with an `interrupted` reason instead of looking like a timeout.
+
+### Changed
+- **Teams on microVMs runs smolvm 1.29.0** — up from 1.9.3, with cleaner disk shutdown and a newer guest kernel; stop all projects (God mode, or `bin/native-rails lazy:projects:stop_all`) before upgrading a native install, which otherwise refuses
+- **PR/MR description** — now reads Goal then Summary; the Summary says what was actually built, including when it differs from the ask, and the verbatim prompt is gone (old descriptions drop it on refresh)
+- **Teams: machine setup upgrades in place** — forwarder and Docker settings now ship in ordinary upgrades (Docker's apply at its next restart); machines are replaced one last time
+- **Lazy Teams notices** — every success, error, warning and info notice carries a matching icon
+- **Host boundary guard removed** — `lazy system verify-host-boundary` and its CI check are gone; `[runner] verify_sandbox_boundary` is still accepted but has no effect
+- **Run services shows each step** — starts a stopped task environment and narrates every step; the command moves to project configuration (dashboard: Settings › Services)
+- **Machine one-shots on a Codex, Cursor or Pi builder profile** — refused with a clear error instead of reaching their vendor directly, outside the proxy and its audit
+- **Teams: project VM default size** — 4 CPUs and 8 GiB (was 2 and 4); running machines keep their size until an admin resizes them in god mode's VM resources
+- **Repository plugins are no longer loaded** — lazy ignores `.lazy/plugins` on every install, since it never runs repository code inside its own process on the host; `lazy doctor` and the daemon log name ignored files
+- **Lazy Teams sign-in cookie** — HTTPS installs sign every member out once after upgrading; on those installs a cookie planted by a task's app can no longer take over a session
+- **Teams invitations** — adding someone to a team sends an invitation they accept (a link to hand over, also emailed when email is set up); set-password links issued before this stop working
+- **Protected merges in Lazy Teams** — a signed-in member pressing Accept approves a protected merge (no passphrase), and a Teams project's default branch is now protected by default.
+- **Members can push to Lazy Teams' hosted git** — members may push task branches and unprotected branches, but not the default branch unless an admin opens it; force-pushed commits stay recoverable.
+- **Bound clones are quieter** — commands in a clone bound to Lazy Teams no longer print the install and project first; a bare `lazy login` still shows the binding.
+- **Proxy audit log keeps 7 days or 128 MiB** — was about 8 MiB (hours); `[proxy] audit_retention_days` / `audit_retention_mib` tune it and `lazy doctor` shows how far back it reaches
+- **Agents may use background tasks again** — lazy waits for reported background work, keeps the agent's last answer, and asks once if a turn's background command was stopped
+- **Codex-only Teams projects** — no longer flagged for a missing system credential; every turn bills its asker, and an admin with only Codex can pay for automations
+- **Teams terminals keep the task running** — opening Shell, Pair or Chat no longer stops the task's environment; its shared services keep running while members work
+- **Teams upgrades keep project machines** — an upgrade swaps the new lazy into each running machine, keeping its Docker images, installed tools and clone; a failed swap rolls back
+- **`lazy edit --code` on started tasks** — rename a task that has already run; its branch, worktree and any PR keep their old names
+- **Task service URLs** — now read task first, `<task>.<service>.lazy.localhost`; the old `<service>.<task>` spelling no longer resolves
+- **Collapsible sections** — static text in both web interfaces grows with the page instead of nested scroll boxes; live updates preserve collapsed drawers.
+- **End-of-work rules run for every task** — agent-created subtasks and cluster children now run your maintain/react rules and uncommitted-work check
+- **Codex agents read the whole `AGENTS.md`** — Codex's default 32 KiB cut-off on project instructions is raised to 256 KiB, so large `AGENTS.md` files are no longer truncated.
+- **Teams builders** — expandable terminals, keyboard scrolling, exact message selection, readable markdown, and scratch-file downloads with separate rendered, source and raw views.
+- **Same controls on every browser terminal** — Fill window and Exit full window buttons plus the same scroll, copy and paste keys, in Teams and the dashboard.
+- **Agent credentials** — obsolete plaintext key files are ignored and deleted at daemon startup; re-store legacy-only keys with `lazy system agent set-key`.
+- **Raised** — the default view (dashboard and Teams) now shows only items from blocked tasks; new "Blocked tasks" filter, and "All" shows every task.
+- **Project runner image** — built when the daemon starts; meanwhile builders, asks and reviews use lazy's default image, work turns only after you confirm; every turn shows its image.
+- **Agent answers** — the builder and agents answer at the level of the question, saving supporting detail for when it is requested.
+- **Cluster tasks and protected files** — a cluster no longer holds a finished subtask for protected-file approval; you approve every such change once, at the cluster's own accept.
+- **Managed Docker arguments** — projects can use custom task-container Docker flags; Lazy Teams warns on the project Configuration page when they are set, saying what the flags can actually reach on this install.
+- **Teams builds use BuildKit** — projects whose `Dockerfile.lazy` uses `RUN --network`/`--mount` now build in Teams, and a failed container build names the Dockerfile it was building.
+- **Agent commits** — agents commit each self-contained change separately, so review fixes and other independent changes are easier to inspect.
+- **Doctor progress** — shows a live checklist during health checks; Teams displays the current check, including slow container probes.
+- **Cursor proxy errors** — Watch shows the upstream reason for failed Cursor requests when it is safe to capture, rather than only an HTTP status.
+- **Usage-pause override** — `--override-usage-pause` replaces `--past-usage-pause`, and the builder's MCP tools take `override_usage_pause`.
+
+### Fixed
+- **Storage lock on Lazy Teams stores** — a lazy process outside a project's machine no longer takes over the lock that machine's live daemon holds
+- **Failed turns are visible** — a turn that fails on a broken credential or config shows `failed:<reason>` with the fix everywhere, files one alert, and broken credentials appear in `lazy stats limits`
+- **Storage lock** — two lazy processes reclaiming the same stale lock at once can no longer both end up writing to the store
+- **A credential that is briefly unreachable is not reported broken** — a ChatGPT session refresh that times out or hits a server error is retried by the agent instead of failing the turn
+- **Damaged runner images repair themselves** — a task or builder that cannot start because an image layer is unreadable rebuilds that image and retries once
+- **PR/MR description on submit** — a task submitted with work already done gets its real Summary right away, or a plain note when the summary cannot be written, never a "Pending" promise.
+- **Teams Verify tab** — the "Feedback sent" confirmation is no longer lost when the task's live update arrives while the form is still submitting
+- **`lazy env set`** — refused on a task that has already finished, so no secret is left behind that nothing clears
+- **`lazy_wait`** — returns at once when a human or builder comments on the waiting task, carrying the comment, instead of the comment waiting until the turn ends
+- **Cursor tasks** — turns no longer crash after six attempts with `HTTP 400` caused by streamed request bodies being terminated twice on the way to Cursor
+- **Per-task secret values stay out of task history** — values set with `lazy env set` are now scrubbed from turns, comments, journal entries, raised items and `lazy show` as well as logs, including their base64, URL-encoded and line-by-line forms
+- **Long prompts no longer crash agent launches** — every agent (Claude Code, Codex, Cursor, Pi) gets its prompt on stdin, so big turns never fail with `E2BIG`; Cursor prompts are no longer trimmed
+- **Tasks never lose their own PR/MR** — a PR/MR lazy failed to record, or one opened by hand, is found by the task's branch: open is adopted, merged completes the task
+- **Linked tasks follow their PR/MR** — a task adopted with `lazy link` completes when its PR/MR is merged on the forge and is abandoned when it is closed unmerged, instead of staying open
+- **Teams builder sessions** — on a team-mode project a builder's start and in-place relaunch always run on the member's own credential, never the project's
+- **Reparenting onto an unstarted task** — says there is nothing to merge yet and merges as soon as the parent starts, instead of reporting a failed fetch and blaming the network
+- **Start services** — restarting services no longer briefly reports them as stopped while the new command is starting
+- **`lazy-agent doctor`** — an MCP server that exits is reported as exited at once instead of after a 20-second wait
+- **Teams: no needless daemon restarts** — a freshly started project daemon no longer looks out of date (and gets restarted again) when the machine is busy
+- **Teams: turn history fits a phone** — a turn's header and a chunk's timing wrap at phone width instead of pushing the page sideways
+- **Accept with a stale git lock** — clearing a crashed git's `index.lock` no longer refuses just because some unrelated process on the machine was exiting
+- **Teams: no false "not responding" after a restart** — once a project's daemon is back, pages stop saying it is not answering straight away instead of for another 15 seconds
+- **Teams: out-of-memory Docker stops are named** — alerts, build errors and the Machine page say how much memory dockerd used of the machine's and to give it more, and a project admin sees the fix (reset Docker storage) instead of only "report to support".
+- **Teams: big project images build without losing Docker** — large builds and their cache no longer run the machine out of memory, and the build cache is capped at 40% of disk; machines are replaced once on upgrade
+- **Failed image builds back off** — a failing rebuild of the project or default image is retried with growing delays (1 min up to 1 h), remembered across daemon restarts for the project image, and shows its next attempt time
+- **`lazy stats audit` / `lazy stats tokens`** — no longer claim local-Ollama or Anthropic agents bypass the proxy (every launch is audited), and help now names what token totals can undercount
+- **Starting tasks and restoring task files** — no longer fail after a minute on repositories with large Git LFS files; restores report checkout progress and failures are explained in plain words
+- **Syncs and accepts on Git LFS repositories** — merges, checkouts and fast-forwards are no longer cut off after a minute, which could leave a checkout half-updated
+- **Teams upgrades recover from failure** — a failed microVM upgrade (even on a full host disk) restarts the project on its old version, cleans up its half-written clone archive and retries later; on local-docker a failed store backup leaves the project stopped rather than run new code unbacked; one project's failure no longer stops the rest of the fleet
+- **Teams: your feedback is always visible** — unblocks and comments show their words and ISO 8601 times on Overview, Turns and Current review, however long the task
+- **Repository git hooks never run on lazy's own merges and commits** — a hooks directory inside the repository (husky and the like) no longer runs on any git command lazy runs — `lazy accept`, agents' commits and pushes included
+- **Teams: new accounts from an invitation confirm their email** when email is configured; after a password reset, people can leave teams they never confirmed joining
+- **Settings form** — saving one setting no longer also reports an untouched empty key (such as the container image file) as a second change.
+- **Task store durability** — comments, unblocks and every other acknowledged write are flushed to disk first, so a machine crash can no longer lose them.
+- **Lazy Teams undelivered feedback** — feedback or notes that never reached the agent stay on the task page with Resend, Copy and Set aside, and Resume/Restart carry them into the turn
+- **Teams image builds that lose their connection to Docker** — retried once after Docker in the machine is confirmed healthy; a final failure says what happened (Docker restarted, out of memory) instead of only BuildKit's EOF
+- **`[automation] accept_check` runs in a container** — the accept check now runs in the same short-lived container as `[automation.pre_accept]`, never on the host
+- **Task containers can never hold or reuse a real credential** — Cursor sessions stay behind placeholders, placeholders die with their task and are pinned to their container
+- **Teams endpoint consent covers the URL path** — a key consented for one gateway path is never sent to another; such connections reconnect once
+- **Agent tools act only during a running turn** — leftover or service processes can't start work billed to the last member, and read-only turns can't call write tools
+- **Teams project machines can no longer redirect host writes** — files Teams writes into a project's daemon directory or store never follow a link planted there
+- **Teams upgrades no longer lose Slack's default project or project rename history** — repaired where it can be derived; Slack settings and god mode flag a missing default project
+- **Teams credential syncing** — a silent project daemon no longer stalls other background work, and a removed member's or deleted connection's credentials are withdrawn even from projects that were stopped at the time.
+- **Hosted git requests are bounded** — clones stream instead of buffering in memory, requests are size-capped, and concurrent git operations are limited so pages stay responsive
+- **Security hardening** — task agents can no longer read `.lazy/` (builder config, audit log, other tasks); project daemons refuse operator-only commands on member tokens and get no Teams secrets
+- **Lazy Teams login tokens stay on the install and scheme that issued them** — an https login is never sent to an `http://` address, a browser login relayed by a look-alike install is refused, and project machines get git-only tokens
+- **Task screenshots in Teams** — an artifact is shown inline only when it is a PNG, JPEG, GIF or WebP image, however its type is spelled; SVGs never render
+- **`lazy accept` after a `git push` to the task** — refuses and points at `lazy sync` instead of leaving pushed commits out, and refuses when the remote cannot be checked
+- **`lazy create` from a clone logged in to Lazy Teams** — creates the whole task or nothing, and `--parent` may name a branch you pushed to the project's repository
+- **`lazy submit` / Submit on a Teams-hosted repository** — now explains that hosted repositories have no pull requests and where accepted work goes, instead of a forge-only error
+- **Clean reviews no longer show a critical security finding** — a sweep statement like "No exploitable issue found" is recognised as clean instead of recorded as a finding.
+- **`lazy reparent` checks your credential first** — a task is no longer moved onto a new parent and then left unsynced when you cannot run a turn; the move is refused up front.
+- **Lazy Teams configuration** — never refused: unsupported settings are kept unused and listed with reasons, as are adopted tasks whose agent cannot run; unknown agents are refused
+- **Task branches on Teams-hosted repositories** — every task's branch is pushed to the install's repository after each turn, so a clone sees more than `main`.
+- **Accepted work reaches `main` on Teams-hosted repositories** — `lazy accept` pushes it to the install, first bringing in direct pushes; a diverged `main` refuses the accept.
+- **`lazy loop` in a clone bound to Lazy Teams** — drives tasks through the Teams daemon instead of failing on a local runner check; `--follow` streams the task through Teams.
+- **Dotted profile/endpoint names** — an unquoted `[agents.claude-glm-5.3]` now gets a clear "quote it" error instead of being misread.
+- **Teams project start and restart** — one start, stop or restart per project at a time; a machine going down mid-start is restarted once or the error names who stopped it
+- **Lazy Teams** — the daemon no longer hands out a credential from its own environment or store; turns use only members' connected credentials.
+- **Teams subtask and builder billing** — work a task's agent or your builder starts now runs on your connections, not the service holder's; refusals name the real cause
+- **Security: no credential reaches a host by guesswork** — every endpoint must name its `credential` (`"none"` for local servers); an upstream redirect never carries a credential
+- **Teams: a momentary smolvm hiccup no longer fails a project start or upgrade** — a guest command smolvm failed to start is retried; giving up names the step and smolvm's words
+- **Teams project start: store write check** — a store write check that smolvm failed to run is retried instead of failing the start; a real refusal names the uid, the error and whether a daemon still holds the store
+- **Feedback without a connected credential** — feedback typed while your turn is refused for a missing credential is saved and delivered to the agent with the next unblock, never lost or duplicated.
+- **Teams project start** — a project machine smolvm lists as running but which does not answer is restarted once automatically, and one that won't come up is reported as such
+- **Uncommitted work at turn end** — a turn ending with uncommitted changes asks the agent once whether it committed all its work; anything still loose is announced on the task
+- **`/daemon/status` always answers** — a daemon waiting on something that never responds now reports what is stuck instead of hanging, and `SIGUSR2` logs what it is waiting on
+- **`lazy:adopt_store`** — `PUBLIC_REPOSITORY=1` adopts a public repository for a member with no forge connection, like "It is public — register it" in the UI
+- **Codex usage limits** — a usage-limit refusal following a model warning is retried until its reset instead of stopping the task as a rejected model
+- **Teams terminals and services can write the task worktree** — a project script run in a Teams terminal before any agent turn should no longer fail to open `log/development.log`
+- **Teams parent links** — task overviews lead with the parent relationship and show its task code instead of an opaque ID.
+- **Codex reviews and asks** — read-only Codex turns in task containers can now actually read the work; a review that inspected nothing is recorded as failed, and one that changed files stops the turn for you, committing nothing
+- **Protected-file approvals** — a file you approved when accepting your own subtask is no longer asked about again at the parent task's accept.
+- **Builder conversations** — omit effort-command noise and background-agent notifications, and show the captured owner's identity in Teams instead of “You”.
+- **Task environments** — missing worktrees restore automatically from the task branch when opening terminals or services, without starting an agent turn.
+- **Doctor** — failed checks name the problem, a busy Docker daemon is retried, and Teams re-checks a failed project within minutes.
+- **Lazy Teams machine Docker** — when Docker stops inside a project's machine, lazy restarts it, records why it stopped and posts a message, rather than every later build failing with "Install Docker"
+- **Teams task titles** — long task titles use compact, readable typography instead of oversized headings.
+- **Credential storage** — concurrent CLI and background updates no longer drop unrelated accounts, and interrupted file writes leave complete credential data.
+- **Daemon cleanup** — pruning stopped or stray daemon state preserves credential-store records, file-backed secrets and persistent project data.
+- **Cursor agent turns** — long histories no longer crash launches; an unexplained failure ends the turn after six attempts instead of retrying forever, and Cursor's error text is kept.
+- **Agent restart credentials** — launches and retries share environment-and-store credential resolution while keeping named accounts isolated.
+- **Builder starts** — failed container builds show their failing output on the start page and in the saved builder session reason.
+- **Teams project health notices** — dismiss a reported problem without hiding it from support.
+- **Pull request links** — Teams and the daemon dashboard link to task PRs and show externally linked tasks in Submitted, regardless of status.
+- **Watch** — shows recent turns and their progress without replaying old agent output as live activity.
+- **Subtask models** — new subtasks on the same agent inherit their parent's current model instead of reverting to the agent's default.
+- **Agent crashes** — failed supervisor turns return a failure exit code instead of reporting success and restarting the supervisor wrapper.
+- **Task containers** — launches preserve mounted git pointers; starting a paused task container detects broken pointer mounts and recreates the container without losing worktree edits.
+- **Builder reconnect after daemon restart** — waits for the audit proxy to become ready before resuming a builder conversation.
+- **Lazy Teams repository clone** — large repository clones no longer stop after 60 seconds; they show progress, with a one-hour overall limit and retries for unfinished clones.
+- **`lazy daemon stop` / `lazy daemon restart`** — the pre-stop warning no longer tells you to exit and relaunch live builders; on restart they reconnect in place when the new daemon is up, and on stop they do the same once a daemon runs again.
+- **Lazy Teams pages** — the project, Tasks, task, and review pages load the rows on screen instead of every task and a chain of daemon calls.
+
 ## [0.91.1186] - 2026-09-30 - Hotfix
 
 ### Added
@@ -18,13 +225,14 @@
 ### Fixed
 
 **lazy**
+- **Usage pause** — a full or refused paid-overage window no longer pauses work; only the 5-hour and 7-day subscription windows do
 - **Failed image builds** — the error shows the failing step's own output (e.g. the compiler error), and `lazy upgrade` aborts instead of asking to continue
 
 **Lazy Teams**
 - **Slow pages on large projects** — the top-nav counts no longer load every task, so pages stay quick on thousands of tasks; every page reports a `Server-Timing` breakdown
 - **`lazy:adopt_store`** — always copies the store into the fleet and only reads the original (`COPY=` is ignored), warning (not refusing) if a daemon or an in-place project may still be writing it
 - **`lazy:adopt_store`** — names the database it uses and accepts a team name as well as a slug
-- **`lazy:adopt_store AS=<member email>`** — adopts as a team member, so a private repository clones on the first try and on automatic retries
+- **`lazy:adopt_store AS=<member email>`** — is now required — adopts as a team member, so a private repository clones on the first try and on automatic retries
 - **`lazy:adopt_store` on native smolvm installs** — store adoption now runs there instead of failing at the preflight
 - **smolvm project images** — installs fetch published images to a local file; automatic restarts boot the new image first and stop, loudly in god mode, on failure
 - **`bin/native-install`** — when two env files claim one install, the refusal names which keys differ and whether the secrets match, never printing a value
@@ -37,7 +245,7 @@ Lazy Teams gets its own Configuration page, per-agent and per-team credentials, 
 
 **lazy**
 - **`lazy stats budget`** — tokens spent and left per usage window, plus spend by harness, task and day; also on the dashboard and Lazy Teams
-- **Let a paused task's next turn through** — `--past-usage-pause` on start/unblock/resume/review/ask, a button on the dashboard and Lazy Teams, and the builder on request; one task, one turn
+- **Let a paused task's next turn through** — `--override-usage-pause` on start/unblock/resume/review/ask, a button on the dashboard and Lazy Teams, and the builder on request; one task, one turn
 - **Approve or Reject each protected file** — one persistent switch per file in the web review and Lazy Teams, next to the agent's reason and the diff; a rejected file is restored to its base, as its own commit, before the agent's next turn, and accept names the restore
 - **Artifacts tab on the dashboard task page** — list, preview (images, text, Markdown), download, and upload input files for the agent
 - **Id links** — task codes, short task ids, raised-item ids and commit shas written in prompts, turns, comments or reports link to their pages, on the dashboard and in Lazy Teams

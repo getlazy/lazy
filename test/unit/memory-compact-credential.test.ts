@@ -64,10 +64,11 @@ describe('memory compact credential', () => {
   // naming the marker Lazy Teams turns into "connect your Claude account",
   // rather than billed to somebody else or quietly downgraded to mechanical.
   test('team mode: a member with no credential is refused', async () => {
+    // Approved endpoint design: docs/design/teams-endpoint-credentials.md.
     await putUserCredential(root, { userId: 'bob@example.com', kind: 'api-key', token: 'sk-ant-api-bob' });
     let ran = false;
     await expect(withCompactCredential(root, ALICE, 'auto', async () => { ran = true; }))
-      .rejects.toMatchObject({ status: 400, message: expect.stringContaining('No Anthropic credential for this user') });
+      .rejects.toMatchObject({ status: 400, message: expect.stringContaining('No credential of yours for endpoint "builtin:anthropic"') });
     expect(ran).toBe(false);
   });
 

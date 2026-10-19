@@ -7,9 +7,7 @@
  * restart, so the human always sees what happened and what to expect next.
  */
 
-import { join } from 'path';
-import { readFile } from 'fs/promises';
-import { getDaemonDir } from '../daemon/paths';
+import { readLastDaemonVersion } from '../daemon/upgrade-notice';
 import { theme } from '../render/theme';
 import {
   formatAgentBinaryRebuildSuccessLine,
@@ -18,28 +16,10 @@ import {
   type BuildInfoValues,
 } from '../utils/build-provenance';
 
-const MARKER_FILE = 'daemon-last-version.json';
-
-interface VersionMarker {
-  version: string;
-}
-
 /** Read the daemon version recorded at the previous startup, if any. */
 export async function readPreviousDaemonVersion(projectRoot: string): Promise<string | null> {
-  const markerPath = join(getDaemonDir(projectRoot), MARKER_FILE);
-  try {
-    const raw = await readFile(markerPath, 'utf-8');
-    const parsed = JSON.parse(raw) as VersionMarker;
-    if (typeof parsed.version === 'string' && parsed.version.length > 0) {
-      return parsed.version;
-    }
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      // Unreadable marker — treat as unknown previous version rather than
-      // fabricating a transition the upgrade notice would also skip.
-    }
-  }
-  return null;
+  // One reader of the marker, shared with the daemon's pre-upgrade backup.
+  return readLastDaemonVersion(projectRoot);
 }
 
 export interface FullUpgradeCompletionContext {

@@ -44,7 +44,8 @@ import type { Task } from '../types';
 import type { FollowHandle, Runner } from '../runner/types';
 import { createRunner } from '../runner';
 import { taskRef, getWorktreePath, displayId } from '../task/identity';
-import { findLatestSessionFile } from '../agent/session-discovery';
+import { findLatestSessionFile, watchSessionReplayStart, watchEntryBelongsToTurn } from '../agent/session-discovery';
+import { WatchTurnTracker } from '../agent/watch-turns';
 import { renderEntryLines, type RawLogEntry } from '../render/watch-renderer';
 import { renderProxyActivity, credentialRefusalHint, PROXY_LINE_PREFIX } from '../render/proxy-activity-renderer';
 import { proxyActivity, matchesFilter, type ProxyActivityEvent } from '../proxy/activity';
@@ -213,8 +214,13 @@ export function startTaskWatchStream(opts: {
     paint(event);
   });
 
-  // ── Supervisor stdout and the agent JSONL, both behind the runner.
+  // ── The durable task timeline remains readable when the runner is down.
   void (async () => {
+    const turns = new WatchTurnTracker(storage, task.id, (line) => emit(renderWithColors(() => dim(line))));
+    try { await turns.refresh(); } catch { emit(renderWithColors(() => dim('(recent turns unavailable)'))); }
+    if (!running) return;
+
+
     let runner: Runner;
     try {
       runner = await createRunner(root);
@@ -245,6 +251,7 @@ export function startTaskWatchStream(opts: {
       storage,
       task,
       substate,
+      turns,
       sink,
       emit,
       isRunning: () => running,
@@ -293,6 +300,7 @@ async function tailAgentSession(
     task: Task;
     /** The task's live working substate, probed the reconciler's way. */
     substate: () => Promise<WorkingSubstate | null>;
+    turns: WatchTurnTracker;
     sink: WatchSink;
     emit: (line: string) => void;
     isRunning: () => boolean;
@@ -307,11 +315,17 @@ async function tailAgentSession(
   let announcedIdle = false;
 
   while (ctx.isRunning()) {
-    const newest = (await findLatestSessionFile(projectDir))?.path ?? null;
-    if (newest && newest !== currentFile) {
+    const newest = (await findLatestSessionFile(projectDir, ctx.turns.turnStart))?.path ?? null;
+    if (newest !== currentFile) {
       currentFile = newest;
       lastFileSize = 0;
       partialLine = '';
+      if (newest) {
+        try {
+          const info = await stat(newest);
+          lastFileSize = await watchSessionReplayStart(newest, info.size);
+        } catch { /* file removed during discovery */ }
+      }
     }
 
     if (currentFile) {
@@ -336,6 +350,7 @@ async function tailAgentSession(
             } catch {
               continue; // Malformed JSON — agent may be mid-write.
             }
+            if (!watchEntryBelongsToTurn(entry.timestamp, ctx.turns.turnStart)) continue;
             for (const rendered of renderWithColors(() => renderEntryLines(entry))) {
               ctx.emit(rendered);
             }
@@ -352,6 +367,7 @@ async function tailAgentSession(
 
     if (now - lastStatusCheck >= STATUS_CHECK_INTERVAL_MS) {
       lastStatusCheck = now;
+      try { await ctx.turns.refresh(); } catch { /* retry on next status check */ }
       try {
         const current = await ctx.storage.getTask(ctx.task.id);
         const status = current?.status ?? 'unknown';

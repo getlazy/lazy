@@ -52,6 +52,8 @@ import type { Task } from '../types';
 import type { Storage } from '../storage';
 import type { EffortLevel, ResolvedConfig } from '../config/types';
 import { resolveAgentModel, taskModelChoice } from '../agent/agent-model';
+import { assertNoModelOnTiered } from '../agent/tiered-model';
+import { profileForAgentNameOrNull } from '../config/agent-profiles';
 import { resolveProjectModel } from './project-settings';
 import { resolveAndPersistEffort, resolveEffort } from './effort';
 
@@ -106,6 +108,16 @@ export async function resolveOneOffTurnIdentity(
   const { storage, task, config, modelOverride, effortOverride } = opts;
 
   const projectSettings = await storage.getProjectSettings();
+
+  // TIERED profile: the model is the serving tier's, chosen per request by the
+  // proxy; the harness is launched on tier 0's. task.model is neither read nor
+  // written here (src/agent/tiered-model.ts), and an explicit model is refused.
+  const tiered = profileForAgentNameOrNull(config, task.agent_id);
+  if (tiered?.tiers) {
+    assertNoModelOnTiered(config, task.agent_id, modelOverride);
+    return { agentId: task.agent_id, model: tiered.model, effort: resolveEffort(task, effortOverride, config.agent.effort) };
+  }
+
   const model = resolveAgentModel(config, {
     overrideModel: taskModelChoice(modelOverride, task.model),
     projectModel: resolveProjectModel(projectSettings, config),
@@ -150,6 +162,15 @@ export async function resolveTurnLaunchIdentity(
   opts: ResolveTurnLaunchIdentityOptions,
 ): Promise<TurnLaunchIdentity> {
   const { storage, task, config, modelOverride, effortOverride } = opts;
+
+  // TIERED profile carve-out from the stickiness rule above: see
+  // src/agent/tiered-model.ts. Nothing is written to task.model.
+  const tiered = profileForAgentNameOrNull(config, task.agent_id);
+  if (tiered?.tiers) {
+    assertNoModelOnTiered(config, task.agent_id, modelOverride);
+    const effort = await resolveAndPersistEffort(task, effortOverride, config.agent.effort, storage);
+    return { agentId: task.agent_id, model: tiered.model, effort };
+  }
 
   const projectSettings = await storage.getProjectSettings();
   const model = resolveAgentModel(config, {

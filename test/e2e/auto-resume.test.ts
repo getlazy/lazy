@@ -510,7 +510,7 @@ describe('project-wide gap on the fast lane', () => {
 // ============================================================
 // Section 4: Crash-safe feedback redelivery
 //
-// INVARIANT (CLAUDE.md — never lose human feedback): when a work phase crashes
+// INVARIANT (AGENTS.md — never lose human feedback): when a work phase crashes
 // AFTER feedback was persisted but BEFORE the agent consumed it, resuming with
 // the generic "you were interrupted, carry on" prompt effectively throws the
 // feedback away — it survives only implicitly via turn-history injection, and
@@ -591,10 +591,13 @@ describe('feedback redelivery on auto-resume', () => {
     expect(command.prompt).toContain('Re-delivered feedback');
   });
 
-  // INVARIANT: ordering is never lost when feedback queues up. The newest
-  // unconsumed feedback is re-delivered verbatim and the older ones are
-  // reported, never silently dropped.
-  test('queued feedback re-delivers the newest and reports the older ones', async () => {
+  // INVARIANT: ordering is never lost when feedback queues up. EVERY unanswered
+  // piece of feedback is carried verbatim into the resumed prompt, oldest first,
+  // and none appears twice — a summary like "N older pieces went unanswered"
+  // would make the agent act on words it never read. (History: this replaced
+  // the retired "older pieces reported" notice; rewrite engineer-approved,
+  // raise 2dfa8683 option A, after feedback-delivered-exactly-once.)
+  test('queued feedback is carried verbatim, oldest first, exactly once', async () => {
     const taskId = await createTask(ctx, 'Queued feedback', 'Do work');
     await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
     await runReconcileSubprocess(ctx.root, ctx.protocolBase);
@@ -609,8 +612,13 @@ describe('feedback redelivery on auto-resume', () => {
 
     const command = await crashAndAutoResume(fullTaskId);
 
-    expect(command.prompt).toContain('SECOND piece of feedback');
-    expect(command.prompt).toContain('older piece');
+    const first = command.prompt.indexOf('FIRST piece of feedback');
+    const second = command.prompt.indexOf('SECOND piece of feedback');
+    expect(first).toBeGreaterThanOrEqual(0);
+    expect(second).toBeGreaterThan(first);
+    expect(command.prompt.split('FIRST piece of feedback').length - 1).toBe(1);
+    expect(command.prompt.split('SECOND piece of feedback').length - 1).toBe(1);
+    expect(command.prompt).not.toContain('older piece');
   });
 });
 

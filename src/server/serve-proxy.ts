@@ -1,6 +1,6 @@
 /**
  * The reverse proxy that puts a task's `[serve]` services on a NAME:
- * `http://<service>.<task>.lazy.localhost:<dashboard-port>`.
+ * `http://<task>.<service>.lazy.localhost:<dashboard-port>`.
  *
  * It rides the daemon's existing dashboard listener — same Bun.serve, same port
  * — and routes purely on the Host header, so nothing new is bound and nothing
@@ -15,7 +15,7 @@
  * INVARIANT: NOTHING on this path starts a container or runs
  * `start_services_cmd`. Not on a GET, not on any method, not "just once to be
  * helpful". A page anywhere on the internet can embed
- * `<img src="http://web.my-task.lazy.localhost:26024/x">`, and a proxy that
+ * `<img src="http://my-task.web.lazy.localhost:26024/x">`, and a proxy that
  * started containers would hand that page the ability to spend this machine's
  * CPU and disk. When a service is down the proxy REPORTS it; every start is a
  * POST behind a button the human pressed (src/server/container-start.ts).
@@ -42,6 +42,7 @@ import { taskPathSegment, duplicateTaskCodes } from './task-urls';
 import { DASHBOARD_COOKIE_NAME } from '../daemon/dashboard-auth';
 import type { UpgradeOutcome, WebSocketUpgrader } from './ws';
 import { logger } from '../utils/logger';
+import { forwardableBody } from '../utils/forward-body';
 
 /**
  * How long a resolved target is reused.
@@ -117,13 +118,13 @@ type ProxyTarget =
 const targetCache = new Map<string, { at: number; target: Promise<ProxyTarget> }>();
 
 /**
- * `<service>.<task>` — the hostname prefix these two labels came from.
+ * `<task>.<service>` — the hostname prefix these two labels came from.
  *
  * Unambiguous because both are host labels by the time they get here, and a
  * host label cannot contain a dot: no pair of labels can collide with another.
  */
 function cacheKey(task: string, service: string): string {
-  return `${service}.${task}`;
+  return `${task}.${service}`;
 }
 
 /** Drop a cached target — called when its port stops answering. */
@@ -132,7 +133,7 @@ function forgetTarget(task: string, service: string): void {
 }
 
 /**
- * Resolve `<service>.<task>` to a host port, through the daemon's ONE serve
+ * Resolve `<task>.<service>` to a host port, through the daemon's ONE serve
  * resolution path (`getTaskServeState` + `findService`) — never a second
  * lookup of its own.
  *
@@ -166,7 +167,7 @@ async function resolveTarget(deps: ServeProxyDeps, task: string, service: string
  * enough — the oldest live ones.
  *
  * Dropping only EXPIRED entries would make the cap advisory rather than real.
- * Every `<anything>.<task>.lazy.localhost` is its own key, so a burst of
+ * Every `<task>.<anything>.lazy.localhost` is its own key, so a burst of
  * distinct labels inside one TTL window (a scan, or just a page whose assets
  * are spread over several service names) grows the Map with nothing to trim.
  * Evicting a live entry costs exactly one re-resolution — the same cost its
@@ -430,7 +431,7 @@ function downResponse(
 /**
  * The dashboard's own origin, derived from the Host the browser used.
  *
- * `web.my-task.lazy.localhost:26024` → `http://lazy.localhost:26024`. Taken by
+ * `my-task.web.lazy.localhost:26024` → `http://lazy.localhost:26024`. Taken by
  * dropping the two labels {@link parseServeHost} already validated, so the
  * redirect lands on the same port the browser is already talking to — and no
  * part of it is free-form client input.
@@ -468,7 +469,7 @@ export function createServeProxy(deps: ServeProxyDeps) {
     try {
       target = await resolveTarget(deps, ref.task, ref.service);
     } catch (err) {
-      logger.warn(`serve proxy: resolving ${ref.service}.${ref.task} failed: ${errText(err)}`);
+      logger.warn(`serve proxy: resolving ${ref.task}.${ref.service} failed: ${errText(err)}`);
       return new Response(`lazy: could not resolve '${ref.service}' on task '${ref.task}'.\n`, {
         status: 502,
         headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' },
@@ -495,8 +496,9 @@ export function createServeProxy(deps: ServeProxyDeps) {
         headers: upstreamRequestHeaders(req, clientIp),
         // Streamed, never buffered: an upload of any size passes through
         // without the daemon holding it in memory. `duplex: 'half'` is required
-        // by the Streams spec for a streaming request body.
-        body: req.body,
+        // by the Streams spec for a streaming request body. Re-piped: see
+        // forwardableBody for the Bun bug that forwarding req.body hits.
+        body: forwardableBody(req.body),
         ...(req.body ? { duplex: 'half' } : {}),
         // A 3xx belongs to the browser, which must see the app's own Location
         // and decide. Following it here would resolve it against the container
@@ -520,7 +522,7 @@ export function createServeProxy(deps: ServeProxyDeps) {
         // client will read.
         return new Response(null, { status: 499 });
       }
-      logger.debug(`serve proxy: ${ref.service}.${ref.task} -> ${upstreamUrl} failed: ${errText(err)}`);
+      logger.debug(`serve proxy: ${ref.task}.${ref.service} -> ${upstreamUrl} failed: ${errText(err)}`);
       return downResponse(req, dashboardOrigin, ref.service, ref.task, {
         ok: false,
         taskId: target.taskId,
@@ -618,7 +620,7 @@ export function createServeProxyUpgrader(deps: ServeProxyDeps): WebSocketUpgrade
       try {
         target = await resolveTarget(deps, ref.task, ref.service);
       } catch (err) {
-        logger.warn(`serve proxy ws: resolving ${ref.service}.${ref.task} failed: ${errText(err)}`);
+        logger.warn(`serve proxy ws: resolving ${ref.task}.${ref.service} failed: ${errText(err)}`);
         return refusal(502, `lazy: could not resolve '${ref.service}' on task '${ref.task}'.`);
       }
       if (!target.ok) {
@@ -753,6 +755,28 @@ function frameOf(value: unknown): string | Uint8Array | null {
 }
 
 /**
+ * The handshake headers the upstream WebSocket CLIENT writes itself, and which
+ * therefore must never also be passed to it from the browser's request.
+ *
+ * Bun's client does not replace a caller-supplied copy on every version: 1.2.x
+ * (the daemon image's Bun) writes its own `Sec-WebSocket-Key`/`-Version`/
+ * `-Protocol` and then APPENDS the caller's, so the app received each twice.
+ * Rack servers join duplicates with ", ", so websocket-driver (ActionCable) saw
+ * `Sec-WebSocket-Version: 13, 13` and refused with "Unsupported WebSocket
+ * version: 13". The key and version are per-hop by nature (the accept hash
+ * answers OUR key), extensions describe the client's own deflate support, and
+ * subprotocols ride the `protocols` option, so none of them is the browser's
+ * to state upstream.
+ */
+const CLIENT_GENERATED_HANDSHAKE_HEADERS = new Set([
+  'sec-websocket-key',
+  'sec-websocket-version',
+  'sec-websocket-extensions',
+  'sec-websocket-protocol',
+  'sec-websocket-accept',
+]);
+
+/**
  * Open the upstream socket, resolving once its handshake completes so the
  * negotiated subprotocol is readable, and rejecting on failure or timeout.
  *
@@ -764,7 +788,10 @@ function frameOf(value: unknown): string | Uint8Array | null {
 function openUpstream(url: string, headers: Headers, protocols: string[]): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
     const headerObject: Record<string, string> = {};
-    for (const [name, value] of headers) headerObject[name] = value;
+    for (const [name, value] of headers) {
+      if (CLIENT_GENERATED_HANDSHAKE_HEADERS.has(name.toLowerCase())) continue;
+      headerObject[name] = value;
+    }
 
     // Bun's WebSocket client takes an options object (headers, protocols); the
     // ambient DOM type in scope here only declares the `protocols` overload, so

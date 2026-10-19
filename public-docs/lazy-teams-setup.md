@@ -27,14 +27,14 @@ On first visit, any page redirects into a four-step wizard:
      on the backend the install now runs (see `LAZY_FLEET_BACKEND` in
      [Self-hosting Lazy Teams](self-hosting-lazy-teams.md#environment-reference)).
    - **Email** — outgoing mail is configured, or you choose to continue without
-     it and share set-password links yourself.
+     it and share invitation links yourself.
    - On the default microVM backend, three more: **MicroVM host**, **MicroVM
      runtime** and **Project image** — see
      [Task turns](self-hosting-lazy-teams.md#task-turns).
 
-4. **Your team** — Create your first team and optionally invite someone. With
-   email on, they receive an invitation. With email off, you copy a set-password
-   link from the finish screen.
+4. **Your team** — Create your first team and optionally invite someone. The
+   finish screen shows the invitation link; with email on, it is also emailed to
+   them. They join when they accept.
 
 When you complete step 4, setup is finished and the wizard stops redirecting
 every request.
@@ -102,18 +102,41 @@ never confused for one another.
 ## Continuing without email
 
 If you have not configured SMTP yet, choose **Continue without email** on the
-readiness step. You can still create accounts and add people to teams; when you
-invite someone, Lazy Teams shows you a set-password link to copy and send
-yourself (by chat, ticket, or any channel you already use). The link is valid
-for three days, and team administrators can mint a fresh one from the team's
-members page while email remains off.
+readiness step. You can still invite people to teams: Lazy Teams shows you the
+invitation link to copy and send yourself (by chat, ticket, or any channel you
+already use).
 
 Configure email later from **God mode → Email** when you are ready for automatic
 invitations and password resets.
 
+## Inviting people
+
+Adding someone to a team — on the team's **Members** page — sends them an
+invitation; it does not add them straight away. Nothing of theirs (membership,
+credentials) reaches the team until they accept.
+
+- You get an invitation link to hand over. When email is configured it is also
+  emailed to them. The link is shown once; from **Members** you can make a new
+  one (the old one stops working) or withdraw it.
+- Only someone signed in with the invited address — their main address or a
+  verified alternative — can accept or decline. Anyone else who opens the link
+  is refused.
+- Someone who already has an account signs in and accepts. Someone new creates
+  their account through the link, choosing their own password. When email is
+  configured they first confirm the address is theirs: Lazy Teams emails it a
+  link, and only that link lets them choose a password. Without email, the
+  link you handed over is enough.
+- An account created without that confirmation is asked about its teams after
+  its first password reset: the address's owner sees every team it joined
+  before and can leave any of them.
+- An invitation works once and expires after seven days.
+
+No link ever sets the password of an existing account except a password reset,
+which is only emailed to that account's own address.
+
 ## Passwords
 
-Every account password — the first administrator, invitations, and password
-resets — must be at least **12 characters**. Lazy Teams checks length only; it
+Every account password — the first administrator, accounts created from an
+invitation, and password resets — must be at least **12 characters**. Lazy Teams checks length only; it
 does not require symbols, numbers, or mixed case. Existing sessions stay signed
 in when a password is changed elsewhere.

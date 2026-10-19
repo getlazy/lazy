@@ -85,10 +85,17 @@ describe('the supervisor restores a rejected protected file', () => {
     const worktree = worktreePathFor(ctx.root, shortId);
     const baseSha = gitIn(ctx.root, 'rev-parse', 'main');
     await ctx.clearClaudeInvocations();
-    await ctx.setClaudeScenario(successScenario({
-      result: 'Made the tree coherent.',
-      commit: { message: 'Keep a feature', files: [{ path: 'feature.txt', content: 'kept\n' }] },
-    }));
+    // The work turn is followed by its wrap-up turns (self-review, revision,
+    // presentation); they answer differently so only the work turn matches.
+    await ctx.setClaudeScenario({
+      sequence: [
+        successScenario({
+          result: 'Made the tree coherent.',
+          commit: { message: 'Keep a feature', files: [{ path: 'feature.txt', content: 'kept\n' }] },
+        }),
+        successScenario({ result: 'Nothing to add.' }),
+      ],
+    });
     const unblocked = await ctx.lazy(['unblock', shortId, '--message', 'Carry on', '--yes']);
     expectSuccess(unblocked);
     expect(unblocked.stdout + unblocked.stderr).toContain('Restoring 1 rejected protected file');
@@ -113,7 +120,7 @@ describe('the supervisor restores a rejected protected file', () => {
 
     // The agent was told what lazy restored, and not asked to do it itself.
     const [first] = await ctx.claudeInvocations();
-    const prompt = first.argv[first.argv.indexOf('-p') + 1];
+    const prompt = first.stdin ?? '';
     expect(prompt).toContain('REJECTED PROTECTED FILES RESTORED');
     expect(prompt).toContain(`- ${GUARD} (base: `);
     expect(prompt).toContain(restoreSha.substring(0, 8));

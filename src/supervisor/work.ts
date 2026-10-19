@@ -20,6 +20,7 @@ import type { Runner } from '../runner/types';
 import { execWithWatchdog, WatchdogTimeoutError, GracefulExitTimeoutError } from './watchdog';
 import { findLatestSessionFile } from '../agent/session-discovery';
 import { runGit } from '../utils/git';
+import { countingActivityStream, runnerIsExternallySandboxed } from './read-only-guard';
 import type { AgentTokenUsage } from '../types';
 import { addAgentUsage, attachUsage, readUsage, usageFromRawOutput } from './usage';
 import { hostname } from 'os';
@@ -60,6 +61,18 @@ export interface WorkResult {
    * Undefined when the agent reported nothing to judge.
    */
   mcp_tools?: string;
+  /**
+   * Background work the agent left behind when this invocation ended (see
+   * WatchdogResult.backgroundLeftBehind). Drives the once-per-turn background
+   * nudge; never written to the response.
+   */
+  background_left_behind?: string[];
+  /**
+   * How many tool calls the agent started in the attempt that produced this
+   * result, as seen on its activity stream. Read-only turns use it as evidence
+   * of inspection: a review that called no tool read nothing.
+   */
+  tool_calls?: number;
 }
 
 /** Structured error from a Claude Code crash (exit code != 0) */
@@ -242,7 +255,7 @@ function classifyFailure(agent: Agent, err: unknown, errorMessage: string): Agen
  * dropping that is how sessions ended up with totals no turn accounts for. This
  * never throws and never blocks the failure path: when nothing is salvageable it
  * says so in the log and returns undefined, so the loss is visible rather than
- * silent (CLAUDE.md: never swallow).
+ * silent (AGENTS.md: never swallow).
  */
 function salvageUsage(raw: string | undefined, context: string): AgentTokenUsage | undefined {
   return usageFromRawOutput(raw, (reason) => {
@@ -304,6 +317,58 @@ async function expectedLatestModel(): Promise<string | undefined> {
  * Execute the agent once and return the result or throw on error.
  * When watchdogTimeoutMs > 0, monitors output and kills hung processes.
  */
+/**
+ * The human-readable reason a non-zero agent exit carries, derived from its
+ * stdout (`errorSource` is the isolated result line when there is one, else the
+ * bounded output tail) and its stderr. An empty `message` means neither said
+ * anything; the caller substitutes the exit code.
+ */
+export function describeAgentExitError(
+  errorSource: string,
+  output: string,
+  stderr: string,
+): { message: string; stdoutError?: string; stderrTail: string } {
+  // Try to extract error from stdout JSON (Claude Code puts errors in stdout sometimes)
+  let stdoutError: string | undefined;
+  let stdoutIsStructured = false;
+  // Prefer the isolated result line: with a streaming agent, `output` is a
+  // bounded tail of NDJSON and won't parse as a single object.
+  if (errorSource.trim()) {
+    try {
+      const parsed = JSON.parse(errorSource);
+      // Claude Code may return { error: { message: "..." } } or { error: "..." }
+      if (parsed.error) {
+        stdoutIsStructured = true;
+        stdoutError = typeof parsed.error === 'string'
+          ? parsed.error
+          : parsed.error.message ?? JSON.stringify(parsed.error);
+      } else if (parsed.result) {
+        stdoutError = typeof parsed.result === 'string' ? parsed.result : undefined;
+        stdoutIsStructured = stdoutError !== undefined;
+      }
+    } catch {
+      // stdout isn't JSON — capture last few lines as-is
+      const trimmed = output.trim();
+      if (trimmed.length > 0) {
+        stdoutError = trimmed.split('\n').slice(-5).join('\n').substring(0, 500);
+      }
+    }
+  }
+
+  // Cursor's stream-json never carries a failure event (verified against
+  // cursor-agent 2026.09.28): its error text goes to STDERR, while stdout ends
+  // in retry/connection NDJSON. So when stdout gave no structured error, the
+  // stderr text is the real message and the NDJSON tail only a fallback.
+  // Neither message is cut to a display length here: failure classification
+  // reads them, and a classifying phrase can sit deep in a long error.
+  const redactCursorEndpoint = (value: string) =>
+    value.replace(/\/_lazy\/cursor\/[A-Za-z0-9._-]+/g, '/_lazy/cursor/<redacted>');
+  const stderrTail = stderr ? redactCursorEndpoint(stderr.trim().split('\n').slice(-10).join('\n').slice(-4000)) : '';
+  stdoutError = stdoutError ? redactCursorEndpoint(stdoutError) : undefined;
+  const message = (stdoutIsStructured ? stdoutError : undefined) || stderrTail || stdoutError || '';
+  return { message, stdoutError, stderrTail };
+}
+
 async function executeAgent(
   agent: Agent,
   runner: Runner,
@@ -328,13 +393,17 @@ async function executeAgent(
     dangerouslySkipPermissions: true,
     effort,
     permissionMode,
+    externallySandboxed: runnerIsExternallySandboxed(runner.type),
     extraArgs,
   });
 
   const launchTime = Date.now();
   const effectiveTimeout = watchdogTimeoutMs ?? 0;
   const effectiveWindDownMs = windDownTimeoutMs ?? 0;
-  const activityStream = agent.activityStream();
+  const rawActivityStream = agent.activityStream();
+  // Counted so a read-only turn can tell "inspected" from "called no tool".
+  // No stream (an agent that emits none) leaves the count unknown, never zero.
+  const activityStream = rawActivityStream ? countingActivityStream(rawActivityStream) : null;
 
   // What the agent reported about its own lazy tools at session start, kept so
   // it can ride out on the successful turn as well as on the failure.
@@ -351,6 +420,7 @@ async function executeAgent(
     sessionId: streamSessionId,
     sessionStartEvent,
     abortReason,
+    backgroundLeftBehind,
   } = await execWithWatchdog(claudeArgs, {
     cwd: worktreePath,
     env: process.env as Record<string, string>,
@@ -443,7 +513,7 @@ async function executeAgent(
           `during wind-down. Summary was captured — treating the turn as successful.`,
         );
         const withModel = await attachReportedModel(parsed, sessionStartEvent?.model, modelId);
-        return { ...withModel, ...(mcpObservation ? { mcp_tools: mcpObservation } : {}) };
+        return { ...withModel, ...(mcpObservation ? { mcp_tools: mcpObservation } : {}), ...(activityStream ? { tool_calls: activityStream.toolCalls() } : {}), ...(backgroundLeftBehind?.length ? { background_left_behind: backgroundLeftBehind } : {}) };
       } catch (parseErr) {
         resultParseError = parseErr instanceof Error ? parseErr.message : String(parseErr);
         log(`[work] Wind-down kill: captured result could not be parsed (${resultParseError}).`);
@@ -468,36 +538,18 @@ async function executeAgent(
   }
 
   if (exitCode !== 0) {
-    // Try to extract error from stdout JSON (Claude Code puts errors in stdout sometimes)
-    let stdoutError: string | undefined;
-    // Prefer the isolated result line: with a streaming agent, `output` is a
-    // bounded tail of NDJSON and won't parse as a single object.
     const errorSource = resultLine ?? output;
-    if (errorSource.trim()) {
-      try {
-        const parsed = JSON.parse(errorSource);
-        // Claude Code may return { error: { message: "..." } } or { error: "..." }
-        if (parsed.error) {
-          stdoutError = typeof parsed.error === 'string'
-            ? parsed.error
-            : parsed.error.message ?? JSON.stringify(parsed.error);
-        } else if (parsed.result) {
-          stdoutError = typeof parsed.result === 'string' ? parsed.result : undefined;
-        }
-      } catch {
-        // stdout isn't JSON — capture last few lines as-is
-        const trimmed = output.trim();
-        if (trimmed.length > 0) {
-          stdoutError = trimmed.split('\n').slice(-5).join('\n').substring(0, 500);
-        }
-      }
-    }
-
-    const stderrTail = stderr ? stderr.trim().split('\n').slice(-10).join('\n').substring(0, 500) : '';
-    const errorMsg = stdoutError ?? stderrTail ?? `exit code ${exitCode}`;
+    const described = describeAgentExitError(errorSource, output, stderr);
+    // The agent's own terminal-error extraction wins over the generic excerpt:
+    // Codex prints warning events first, and a 500-char head of the last five
+    // lines cut its real usage-limit error off mid-word.
+    const agentError = agent.extractStdoutError?.(output);
+    const stdoutError = agentError ?? described.stdoutError;
+    const errorMsg = agentError ?? described.message;
+    const stderrTail = described.stderrTail;
 
     throw new CrashError({
-      message: errorMsg,
+      message: errorMsg || `exit code ${exitCode}`,
       exitCode,
       stderr: stderrTail,
       stdoutError,
@@ -520,7 +572,7 @@ async function executeAgent(
   try {
     const parsed = agent.parseResponse(resultLine ?? output, { workingDir: worktreePath }) as WorkResult;
     const withModel = await attachReportedModel(parsed, sessionStartEvent?.model, modelId);
-    return { ...withModel, ...(mcpObservation ? { mcp_tools: mcpObservation } : {}) };
+    return { ...withModel, ...(mcpObservation ? { mcp_tools: mcpObservation } : {}), ...(activityStream ? { tool_calls: activityStream.toolCalls() } : {}), ...(backgroundLeftBehind?.length ? { background_left_behind: backgroundLeftBehind } : {}) };
   } catch (parseErr) {
     throw new CrashError({
       message: parseErr instanceof Error ? parseErr.message : String(parseErr),

@@ -21,6 +21,7 @@
  */
 
 import type { UserCredentialKind } from '../daemon/user-credentials';
+import type { ResolvedConfig } from '../config/types';
 
 /** The two shapes a Claude Code request can carry a credential in. */
 export type InboundCredentialForm = 'bearer' | 'x-api-key';
@@ -48,7 +49,7 @@ export type SessionAuthDenial = 'unknown_session_token' | 'auth_kind_mismatch' |
 
 /** What the daemon tells the proxy about a presented placeholder. */
 export type SessionCredentialResolution =
-  | { ok: true; userId: string; kind: UserCredentialKind; secret: string }
+  | { ok: true; userId: string; kind: UserCredentialKind; secret: string; endpoint?: string }
   /**
    * `wrong_origin`: the placeholder is live but pinned to a different network
    * address than the one this request came from — it leaked out of the
@@ -60,6 +61,8 @@ export type SessionCredentialResolution =
 export interface SessionRequestContext {
   /** The peer's IP address (IPv4-mapped IPv6 unwrapped), or null when unknown. */
   peerAddress: string | null;
+  upstream?: string;
+  config?: ResolvedConfig;
 }
 
 /** Resolve a placeholder to its owner's real credential. Injected by the daemon. */

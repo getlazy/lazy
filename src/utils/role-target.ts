@@ -18,7 +18,7 @@
  *     same as `endpoint !== ''`: built-in `codex` carries a default OpenAI
  *     upstream nobody chose.
  *
- * Two guardrails are baked in here (see CLAUDE.md: fail hard, least surprise):
+ * Two guardrails are baked in here (see AGENTS.md: fail hard, least surprise):
  *  - No silent name substitution: a role on a pinned-endpoint profile with no
  *    configured model throws rather than guessing.
  *  - That model is authoritative — alias names like "claude-opus-5" don't exist
@@ -32,6 +32,7 @@
 
 import type { ResolvedConfig, RoleName, RoleTarget, RunnerType } from '../config/types';
 import { resolveCredential } from '../credentials/store';
+import { agentSupportsApiKey, agentCredentialProvider, resolveProfileCredential } from '../agent/credentials';
 import { isHostedOllamaEndpoint } from './ollama';
 import { endpointForHost, isLocalEndpoint } from './endpoint';
 import { roleTargetForProfile, ANTHROPIC_DEFAULT_TARGET } from '../config/default-target';
@@ -382,9 +383,9 @@ export function usesSyntheticCreds(target: Pick<RoleTarget, 'credential'>): bool
  *
  * Null rather than a value for the Anthropic case because its SOURCE differs by
  * launch path — the daemon reads its own process env, a client fetches it over
- * the `getAuthEnv` RPC — and that choice belongs to the call site. Every other
- * slot has exactly one source (the credential store) and is resolved here so the
- * rule cannot drift between paths.
+ * the `getAuthEnv` RPC — and that choice belongs to the call site. Other slots
+ * resolve here; key-capable harnesses use the initial launch's resolver,
+ * including its matching legacy per-agent credential file.
  *
  * `none` gets {@link LOCAL_BACKEND_CREDS}: a local server ignores auth, and
  * Claude Code still insists on a non-empty credential. Any other slot is a real
@@ -399,17 +400,26 @@ export function usesSyntheticCreds(target: Pick<RoleTarget, 'credential'>): bool
  */
 export async function resolveProfileLaunchCreds(
   projectRoot: string,
-  target: Pick<RoleTarget, 'credential' | 'endpoint' | 'profile'>,
+  target: Pick<RoleTarget, 'credential' | 'endpoint' | 'profile' | 'harness'>,
 ): Promise<AuthEnvVar[] | null> {
   if (target.credential === NO_CREDENTIAL) return LOCAL_BACKEND_CREDS;
   if (target.credential === 'anthropic') return null;
 
-  const cred = await resolveCredential(projectRoot, target.credential);
+  const cred = agentSupportsApiKey(target.harness)
+    ? await resolveProfileCredential(projectRoot, {
+      name: target.profile,
+      harness: target.harness,
+      credential: target.credential,
+    })
+    : await resolveCredential(projectRoot, target.credential);
   if (!cred) {
     const where = target.endpoint ? ` at ${target.endpoint}` : '';
+    const setKey = agentSupportsApiKey(target.harness) && target.credential === agentCredentialProvider(target.harness)
+      ? `\`lazy system agent set-key ${target.profile}\` or `
+      : '';
     throw new Error(
       `Agent profile "${target.profile}"${where} bills the "${target.credential}" credential, ` +
-      `but none is stored. Run \`lazy auth set ${target.credential}\`, or export its API key in ` +
+      `but none is stored. Run ${setKey}\`lazy auth set ${target.credential}\`, or export its API key in ` +
       'the environment the daemon starts from.',
     );
   }
@@ -756,7 +766,7 @@ function unreachableHint(endpoint: string): string {
 /**
  * Fail-hard preflight for a role's resolved target. Throws an actionable error
  * if the profile's pinned upstream is unreachable — NEVER silently falls back to
- * a different one (CLAUDE.md: fail hard on remote failures).
+ * a different one (AGENTS.md: fail hard on remote failures).
  *
  * An unpinned profile is a no-op here: it rides the proxy's primary upstream,
  * which has no local component to probe, and Anthropic reachability is the

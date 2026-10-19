@@ -37,10 +37,6 @@ const GRANT: CredentialGrant = {
   createdAt: new Date().toISOString(),
 };
 
-function freePort(): number {
-  return 41000 + Math.floor(Math.random() * 8000);
-}
-
 describe('a proxy request failure is isolated to that request', () => {
   let upstream: ReturnType<typeof Bun.serve>;
   let proxy: ReturnType<typeof Bun.serve>;
@@ -51,12 +47,12 @@ describe('a proxy request failure is isolated to that request', () => {
 
   beforeAll(async () => {
     records = [];
-    const upstreamPort = freePort();
     upstream = Bun.serve({
-      port: upstreamPort,
+      port: 0,
       hostname: '127.0.0.1',
       fetch: () => Response.json({ type: 'message', model: 'm' }),
     });
+    const upstreamPort = upstream.port!;
 
     // The misbehaving dependency is the credential broker, not the upstream:
     // an upstream that merely fails is ALREADY handled inline (502 + audit
@@ -79,16 +75,16 @@ describe('a proxy request failure is isolated to that request', () => {
     };
 
     const sink: AuditSink = { append: async (r) => { records.push(r); } };
-    proxyPort = freePort();
     proxy = createProxyServer(
       {
-        port: proxyPort,
+        port: 0,
         bind: '127.0.0.1',
         upstream: `http://127.0.0.1:${upstreamPort}`,
       },
       sink,
       credentials,
     );
+    proxyPort = proxy.port!;
     await new Promise((r) => setTimeout(r, 50));
   });
 

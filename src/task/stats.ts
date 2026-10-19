@@ -43,11 +43,13 @@
  * over. See {@link SubtreeRollup}.
  */
 
+import type { LatencyHistoryReport } from './turn-latency';
 import type { Task, Session, Turn, Commit, TokenUsage, TaskStatus } from '../types';
 import type { StatusChange, ProxyAuditRecord, TaskToolStatsRecord } from '../storage/types';
 import { isTerminalStatus } from '../types';
 import { displayId } from './identity';
 import { parentTaskIdOf } from '../task-target';
+import { groupTurnsIntoChunks } from '../utils/turn-chunks';
 
 /** Whether a readout covers one task, or that task plus every descendant. */
 export type StatsScope = 'task' | 'subtree';
@@ -317,6 +319,12 @@ export interface TurnTokenPoint {
    * view, where every point is the same task and the column would be noise.
    */
   taskLabel: string | null;
+  /**
+   * The review chunk this turn belongs to, 1-based — the number the Turns tab
+   * displays. null in a subtree view, where each task has its own chunk list
+   * and a bare number would be ambiguous.
+   */
+  chunk: number | null;
 }
 
 export interface TaskTokenStats {
@@ -329,6 +337,12 @@ export interface TaskTokenStats {
   series: TurnTokenPoint[];
   /** Turns omitted from the head of `series` because of the bound. */
   omittedTurns: number;
+  /**
+   * Where each review chunk opened — its 1-based number and the timestamp of
+   * its first turn (the boundary turn) and that turn's sequence. Single-task view only; empty in a
+   * subtree view, where each task numbers its own chunks.
+   */
+  chunks: Array<{ number: number; startTimestamp: number; startSequence: number }>;
   /** Tokens in those omitted turns, so the chart's caption can account for them. */
   omittedTotal: number;
   /** The session's own running total, when recorded — an independent check. */
@@ -390,6 +404,7 @@ export interface TurnGroup {
 export function buildTokenStatsAcross(groups: TurnGroup[], turnLimit: number): TaskTokenStats {
   const points: TurnTokenPoint[] = [];
   let agentTurnCount = 0;
+  const chunkStarts: TaskTokenStats['chunks'] = [];
 
   for (const group of groups) {
     const agentTurns = group.turns
@@ -397,6 +412,16 @@ export function buildTokenStatsAcross(groups: TurnGroup[], turnLimit: number): T
       .sort((a, b) => a.sequence - b.sequence);
     const byTimestamp = [...group.turns].sort((a, b) => a.timestamp - b.timestamp);
     agentTurnCount += agentTurns.length;
+
+    const chunkOf = new Map<number, number>();
+    if (groups.length === 1) {
+      const ordered = [...group.turns].sort((a, b) => a.sequence - b.sequence);
+      for (const chunk of groupTurnsIntoChunks(ordered)) {
+        const opener = chunk.turns[0]!;
+        chunkStarts.push({ number: chunk.index + 1, startTimestamp: opener.timestamp, startSequence: opener.sequence });
+        for (const t of chunk.turns) chunkOf.set(t.sequence, chunk.index + 1);
+      }
+    }
 
     let cursor = 0;
     let previous: Turn | undefined;
@@ -421,6 +446,7 @@ export function buildTokenStatsAcross(groups: TurnGroup[], turnLimit: number): T
         agent: turn.agent ?? null,
         spanMs: previous ? turn.timestamp - previous.timestamp : null,
         taskLabel: group.label,
+        chunk: chunkOf.get(turn.sequence) ?? null,
       });
     }
   }
@@ -465,6 +491,7 @@ export function buildTokenStatsAcross(groups: TurnGroup[], turnLimit: number): T
     totals,
     series,
     omittedTurns: omitted,
+    chunks: chunkStarts,
     omittedTotal,
     sessionTotal: sawSessionTotal ? sessionTotal : null,
     byModel: [...byModel.entries()]
@@ -550,7 +577,7 @@ export interface TaskToolStats {
  * The log is bounded by construction and disposable (see src/proxy/audit-log.ts):
  * a task older than the retained window has none, which is a recent-window view
  * and must be labelled as one. Nothing here moves the stream into Storage, which
- * CLAUDE.md forbids.
+ * AGENTS.md forbids.
  *
  * EVERY REQUEST REPLAYS THE WHOLE CONVERSATION, SO EVERYTHING IS DEDUPED BY
  * `tool_use` ID. The audited body is the full messages array, so a tool called
@@ -934,6 +961,12 @@ export interface TaskStats {
   descendants: number;
   /** Present only in `subtree` scope: what was folded in, and how time was combined. */
   subtree: SubtreeRollup | null;
+  /**
+   * How fast the model answered, per endpoint × model × tier, from the stored
+   * per-turn latency rollups (src/task/turn-latency.ts). Set by the loader
+   * (src/task/stats-data.ts); null when no turn recorded any.
+   */
+  latency?: LatencyHistoryReport | null;
 }
 
 export function buildTaskStats(input: TaskStatsInput): TaskStats {

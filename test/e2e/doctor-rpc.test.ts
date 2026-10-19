@@ -48,6 +48,28 @@ describe('doctor RPC', () => {
     await removeDaemonBaseDir(daemonBaseDir);
   });
 
+  test('doctor.run streams the checklist through the heartbeat envelope', async () => {
+    const response = await fetch(`http://127.0.0.1:${daemon!.webPort}/rpc/doctor.run`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${TOKEN}`,
+        'X-Lazy-Project': ctx.root,
+        'X-Lazy-Heartbeat': '1',
+      },
+      body: JSON.stringify({ alert: false }),
+    });
+    expect(response.headers.get('content-type')).toContain('application/x-ndjson');
+    const frames = (await response.text()).trim().split('\n').map(line => JSON.parse(line));
+    const events = frames.filter(frame => frame.progress).map(frame => frame.progress);
+    expect(events[0].kind).toBe('plan');
+    expect(events[0].operation).toBe('doctor');
+    expect(events[0].phases).toHaveLength(8);
+    expect(events.some(event => event.kind === 'phase' && event.id === 'runner' && event.state === 'start')).toBe(true);
+    expect(frames.at(-1).status).toBe(200);
+    expect(frames.at(-1).body.checks.length).toBeGreaterThan(0);
+  });
+
   async function rpc(command: string, params: Record<string, unknown> = {}): Promise<{ status: number; body: any }> {
     const resp = await fetch(`http://127.0.0.1:${daemon!.webPort}/rpc/${command}`, {
       method: 'POST',
@@ -159,7 +181,7 @@ describe('doctor RPC', () => {
       const binDir = await githubProjectWithGitOnlyPath(scratch);
       const report = await doctorRunWithEnv({ PATH: binDir });
       const family = report.checks.filter((c: any) => c.family === 'remote-driver');
-      expect(family.find((c: any) => c.title === 'gh CLI installed')?.status).toBe('error');
+      expect(family.find((c: any) => c.title === "gh CLI isn't installed")?.status).toBe('error');
       expect(family.find((c: any) => String(c.title).startsWith('Git can reach'))).toBeUndefined();
     } finally {
       await rm(scratch, { recursive: true, force: true });

@@ -27,8 +27,6 @@ const grants: Record<string, CredentialGrant> = {
   },
 };
 
-const freePort = () => 41000 + Math.floor(Math.random() * 8000);
-
 describe('proxy forwarding-surface allowlist', () => {
   let primary: ReturnType<typeof Bun.serve>;
   let profileTarget: ReturnType<typeof Bun.serve>;
@@ -38,9 +36,9 @@ describe('proxy forwarding-surface allowlist', () => {
   /** Every path each upstream was actually asked for. */
   let hits: Record<string, string[]> = { primary: [], profile: [] };
 
-  function upstreamServer(name: string, port: number) {
+  function upstreamServer(name: string) {
     return Bun.serve({
-      port, hostname: '127.0.0.1',
+      port: 0, hostname: '127.0.0.1',
       async fetch(req) {
         await req.text();
         hits[name]!.push(`${req.method} ${new URL(req.url).pathname}`);
@@ -50,10 +48,10 @@ describe('proxy forwarding-surface allowlist', () => {
   }
 
   beforeAll(async () => {
-    const primaryPort = freePort();
-    const profilePort = freePort();
-    primary = upstreamServer('primary', primaryPort);
-    profileTarget = upstreamServer('profile', profilePort);
+    primary = upstreamServer('primary');
+    profileTarget = upstreamServer('profile');
+    const primaryPort = primary.port!;
+    const profilePort = profileTarget.port!;
 
     const credentials: ProxyCredentialDeps = {
       lookup: async (token: string) => grants[token] ?? null,
@@ -62,16 +60,16 @@ describe('proxy forwarding-surface allowlist', () => {
       targets: new TargetCredentials(),
     };
     const sink: AuditSink = { append: async (r) => { records.push(r); } };
-    proxyPort = freePort();
     proxy = createProxyServer(
       {
-        port: proxyPort, bind: '127.0.0.1',
+        port: 0, bind: '127.0.0.1',
         upstream: `http://127.0.0.1:${primaryPort}`,
         agentUpstreams: { [LOCAL_PROFILE]: { upstream: `http://127.0.0.1:${profilePort}`, wire: 'anthropic' } },
       },
       sink,
       credentials,
     );
+    proxyPort = proxy.port!;
     await new Promise((r) => setTimeout(r, 50));
   });
 

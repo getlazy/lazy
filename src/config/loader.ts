@@ -8,12 +8,20 @@ import { pathExists, readFile } from '../utils/fs';
 import { expandTilde } from '../utils/home';
 import { validateMounts } from '../capture/mounts';
 import { DEFAULT_OPENAI_UPSTREAM } from '../utils/openai-compat';
-import { resolveServicePorts, resolveStartServicesCmd, type ServeConfigInput } from '../serve/ports';
-import { DEFAULT_CURSOR_UPSTREAM, DEFAULT_UPSTREAM_TIMEOUT_SECONDS } from '../proxy/upstream-defaults';
+import { resolveMainService, resolveServicePorts, resolveStartServicesCmd, type ServeConfigInput } from '../serve/ports';
+import {
+  DEFAULT_AUDIT_RETENTION_DAYS,
+  DEFAULT_AUDIT_RETENTION_MIB,
+  DEFAULT_CURSOR_UPSTREAM,
+  DEFAULT_TIER_RETRY_INTERVAL_SECONDS,
+  DEFAULT_UPSTREAM_TIMEOUT_SECONDS,
+  MIN_AUDIT_RETENTION_MIB,
+} from '../proxy/upstream-defaults';
 import { defaultPolicyConfig, type ProxyPolicyConfig } from '../proxy/policy';
 import { DEFAULT_DOCS_URL, normalizeDocsUrl, setDocsBaseUrl } from '../docs/links';
 import { ANTHROPIC_DEFAULT_TARGET, roleTargetForProfile } from './default-target';
-import { applyManagedPolicy, isManagedMode, managedConfigPath, type ManagedConfigOrigin } from './managed';
+import { applyManagedPolicy, isControlPlaneConfigPath, isManagedMode, managedConfigPath, type ManagedConfigOrigin } from './managed';
+import { withholdRefused } from './managed-withhold';
 import { generatedConfigProfileExamples, replaceWithProfileAdvice } from './agent-profile-advice';
 import { CLAUDE_DEFAULT_MODEL } from './default-models';
 import { findRemovedConfigKeys, DEPRECATED_KEY_HINTS } from './schema';
@@ -48,6 +56,8 @@ import {
 import { VALID_RUNNER_TYPES } from './types';
 import { setBranchPrefix, getBranchPrefix, branchPrefixError } from '../git/branch-prefix';
 import { lastKnownGoodFor, rememberGoodConfig } from './last-good';
+import { profilesAwaitingConfirmation } from './connection-consent';
+import { controlPlaneTextOrigin, describeConfigText, noteConfigLoaded, repositoryAgentNames } from './config-provenance';
 
 const CONFIG_FILENAME = process.env.LAZY_CONFIG || 'lazy.toml';
 
@@ -70,7 +80,7 @@ const CONFIG_FILENAME = process.env.LAZY_CONFIG || 'lazy.toml';
  * carve-outs. If a per-task setting is ever wanted it follows the container
  * image pattern — explicit human TTY consent, pinned on the task — never a file
  * on the branch (see "Task worktrees never auto-govern container images" and
- * "A task worktree's lazy.toml has no authority" in CLAUDE.md).
+ * "A task worktree's lazy.toml has no authority" in AGENTS.md).
  *
  * Nothing is lost for humans: `findLazyRoot()` already maps a worktree back to
  * the main repository, and a `lazy` run from any ordinary subdirectory found
@@ -104,6 +114,7 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   storage: {
     backend: 'external',
     external_path: '',
+    backup_keep: 5,
   },
   git: {
     default_branch_prefix: 'lazy',
@@ -116,6 +127,7 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   // No `[agents.<name>]` blocks by default: the built-in profiles (one per
   // harness, defined in ./agent-profiles.ts) are what a project without this
   // section gets, and they reproduce each harness's existing defaults exactly.
+  endpoints: {},
   agents: {},
   agent: {
     agent_id: 'claude-code',
@@ -184,9 +196,7 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
     sandbox_deny_read: [],
     sandbox_deny_write: [],
     sandbox_allow_weaker_nested: false,
-    // Off by default: the guard costs nine real headless sessions and needs an
-    // interactively logged-in `claude`, which a daemon host may not have. CI
-    // (.github/workflows/host-sandbox-guard.yml) is the standing signal.
+    // Retired: accepted and validated so old configs load; no effect.
     verify_sandbox_boundary: 'off',
   },
   documents: {
@@ -258,7 +268,10 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
     cursorUpstream: DEFAULT_CURSOR_UPSTREAM,
     fallbacks: [],
     retryAfterThreshold: 5,
+    tierRetryIntervalSeconds: DEFAULT_TIER_RETRY_INTERVAL_SECONDS,
     upstreamTimeoutSeconds: DEFAULT_UPSTREAM_TIMEOUT_SECONDS,
+    auditRetentionDays: DEFAULT_AUDIT_RETENTION_DAYS,
+    auditRetentionMib: DEFAULT_AUDIT_RETENTION_MIB,
     policy: defaultPolicyConfig(),
   },
   memory: {
@@ -377,6 +390,10 @@ function resolveRole(
   const named = explicit?.agent?.trim();
   const where = named ? `lazy.toml [models.roles.${role}] agent` : undefined;
   const profile = agentProfileOrThrow(profiles, named || defaultProfileName, where);
+  // A TIERED builder is allowed (engineer, 2026-10-05): the role target mirrors
+  // tier 0, which is what the harness launches on; the launch gate checks every
+  // tier's credential (src/daemon/credential-gate.ts) and the proxy picks the
+  // tier per request exactly as for a task. Team mode refuses it at launch.
   return roleTargetForProfile(profile);
 }
 
@@ -576,7 +593,7 @@ const TOML_LOCATE_MAX_LINES = 2000;
  * ("Expected ]"), which does not match, so the scan simply keeps going until it
  * reaches the line that really is at fault. If nothing matches — a reason that
  * only the complete document can produce — the caller reports the reason alone
- * rather than naming a line it cannot stand behind (CLAUDE.md: never present a
+ * rather than naming a line it cannot stand behind (AGENTS.md: never present a
  * guess as the explanation).
  */
 function locateTomlFailure(source: string, reason: string): { line: number; text: string } | null {
@@ -621,13 +638,24 @@ function describeTomlError(error: unknown, source?: string): string {
   const position = (error as { position?: { line?: number; lineText?: string } } | null)?.position;
   if (position?.line) {
     const text = position.lineText ? `: ${position.lineText.trim()}` : '';
-    return `line ${position.line}${text} — ${reason}`;
+    return `line ${position.line}${text} — ${reason}${dottedNameHint(position.lineText ?? '')}`;
   }
 
   const located = source === undefined ? null : locateTomlFailure(source, reason);
   if (!located) return reason;
   const text = located.text.trim() ? `: ${located.text.trim()}` : '';
-  return `line ${located.line}${text} — ${reason}`;
+  return `line ${located.line}${text} — ${reason}${dottedNameHint(located.text)}`;
+}
+
+/**
+ * When the failing line is a table header with a dotted `agents.`/`endpoints.`
+ * name (`[agents.claude-glm-5.3]`), say that the dot splits the name and show
+ * the quoted form.
+ */
+export function dottedNameHint(line: string): string {
+  const m = /^\s*\[\s*(agents|endpoints)\s*\.\s*([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+)\s*\]\s*(?:#.*)?$/.exec(line);
+  if (!m) return '';
+  return ` (a dot in a table header splits the name — to name it "${m[2]}", quote it: [${m[1]}."${m[2]}"])`;
 }
 
 /** The `[checks]` keys that were folded into `[automation]`, old name → new name. */
@@ -1067,10 +1095,12 @@ export interface LoadConfigOptions {
 }
 
 export async function loadConfig(lazyRoot: string, options: LoadConfigOptions = {}): Promise<ResolvedConfig> {
-  const configPath = await resolveConfigPath(lazyRoot);
+  const source = await resolveConfigSource(lazyRoot);
+  const configPath = source.path;
+  let readText: string | null = null;
   let config: ResolvedConfig;
   try {
-    config = await loadConfigAt(lazyRoot, configPath);
+    config = await loadConfigAt(lazyRoot, configPath, (text) => { readText = text; });
   } catch (err) {
     // A running daemon keeps working on the last config it accepted FROM THIS
     // SAME PATH — never one read from anywhere else, so the project-root
@@ -1081,10 +1111,49 @@ export async function loadConfig(lazyRoot: string, options: LoadConfigOptions = 
     throw err;
   }
   rememberGoodConfig(configPath, config);
+  // Which bytes (and which control-plane version) this config came from, so an
+  // error raised later from inside a lookup can name them (./config-provenance).
+  // Described from the text this load READ, never a second read of the file:
+  // that read could disagree with the first, and on a file that does not
+  // answer (a FIFO in tests) it would block the load forever.
+  // Best-effort: provenance only feeds diagnostics, so nothing here may fail
+  // or hold up a load that already succeeded.
+  try {
+    const loaded = await describeConfigText(configPath, source.rule, readText);
+    if (source.rule === 'managed') {
+      const names = await repositoryAgentNames(join(findConfigDir(lazyRoot), CONFIG_FILENAME));
+      if (names) loaded.repositoryAgentNames = names;
+    }
+    if (isManagedMode() && readText !== null) {
+      // What this load withheld, so `lazy doctor`, the Configuration page and
+      // "Unknown agent profile" can name it — never silently ignored.
+      const parsed = Bun.TOML.parse(readText as string) as Record<string, unknown>;
+      const origin = source.rule === 'managed' ? await controlPlaneTextOrigin(configPath, readText as string) : 'repository';
+      const withheld = withholdRefused(parsed, process.env, origin).withheld;
+      loaded.withheld = withheld;
+      const profiles = withheld.filter((w) => w.kind === 'profile');
+      if (profiles.length > 0) loaded.withheldProfiles = Object.fromEntries(profiles.map((w) => [w.name, w.reason]));
+      // Only the control plane's file can be confirmed: a repository lazy.toml
+      // in force has no admin page to confirm it on.
+      if (source.rule === 'managed' && origin === 'repository' && profiles.length > 0) {
+        loaded.awaitingConfirmation = profilesAwaitingConfirmation(parsed);
+      }
+    }
+    noteConfigLoaded(loaded);
+  } catch {
+    // Safe to drop: the error message then names no file, which is what it
+    // said before provenance existed; the load itself already succeeded.
+    noteConfigLoaded(null);
+  }
   return config;
 }
 
-async function loadConfigAt(lazyRoot: string, configPath: string): Promise<ResolvedConfig> {
+async function loadConfigAt(
+  lazyRoot: string,
+  configPath: string,
+  /** Told the text that was read (null: no file), so the caller never reads it twice. */
+  onText?: (text: string | null) => void,
+): Promise<ResolvedConfig> {
 
   // If LAZY_CONFIG is explicitly set but the file doesn't exist, fail hard
   if (process.env.LAZY_CONFIG && !(await pathExists(configPath))) {
@@ -1125,7 +1194,13 @@ async function loadConfigAt(lazyRoot: string, configPath: string): Promise<Resol
       `Failed to read ${configPath}: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
-  return resolveConfigText(configContent, configPath);
+  onText?.(configContent);
+  // The control plane's file is judged by the control plane's rules only when
+  // its owner wrote these exact bytes; an import is still the repository's text.
+  const origin: ManagedConfigOrigin | undefined = isManagedMode() && isControlPlaneConfigPath(configPath)
+    ? await controlPlaneTextOrigin(configPath, configContent)
+    : undefined;
+  return resolveConfigText(configContent, configPath, origin ? { origin } : {});
 }
 
 /** Options for {@link resolveConfigText}. */
@@ -1191,6 +1266,19 @@ export function resolveConfigText(
       `  • Restore a known-good file: \`git diff ${CONFIG_FILENAME}\` (if it is tracked), or see\n` +
       `    lazy.toml.example for the full reference.`,
     );
+  }
+
+  // On a managed host every setting the managed rules refuse is WITHHELD here
+  // (./managed-withhold), before anything below can resolve or honour it, and
+  // reported by name (the Configuration page, `lazy doctor`) instead of
+  // failing the load. Both files: the control plane's copy is stored verbatim,
+  // and a repository's own lazy.toml must still let the project START so the
+  // verbatim import can happen (engineer, 2026-10-08: "Importing must never
+  // refuse anything"). Each is judged by its own origin's rules, so a
+  // repository still cannot point a profile at an endpoint.
+  const origin = options.origin ?? (isControlPlaneConfigPath(configPath) ? 'control-plane' : 'repository');
+  if (isManagedMode()) {
+    parsed = withholdRefused(parsed as Record<string, unknown>, process.env, origin).raw as LazyConfig;
   }
 
   // Reject legacy [remote_github] section — use [remote] with prefixed keys instead
@@ -1354,7 +1442,7 @@ export function resolveConfigText(
   // and `[agent.by_type]` name PROFILES, so a project that defines
   // `[agents.local-ollama-pi]` and defaults to it must not be rejected for
   // naming something that is not a registered agent.
-  const profiles = resolveAgentProfiles(config.agents);
+  const profiles = resolveAgentProfiles(config.agents, undefined, config.endpoints);
   cacheAgentProfiles(config.agents, profiles);
 
   // Validate the default agent — a profile name, not a harness.
@@ -1527,6 +1615,13 @@ export function resolveConfigText(
     );
   }
 
+  if (config.storage.backup_keep !== undefined && (!Number.isInteger(config.storage.backup_keep) || config.storage.backup_keep < 1)) {
+    throw new Error(
+      `Invalid backup_keep value "${String(config.storage.backup_keep)}" in lazy.toml [storage] section. ` +
+      'Expected a whole number of at least 1 (the pre-upgrade store backups to keep).'
+    );
+  }
+
   if (typeof config.git.coauthor_trailer !== 'boolean') {
     throw new Error(
       `Invalid coauthor_trailer value "${String(config.git.coauthor_trailer)}" in lazy.toml [git] section. ` +
@@ -1622,10 +1717,13 @@ export function resolveConfigText(
   // a malformed [serve] otherwise means a task that quietly starts with nothing
   // published and no explanation for why `lazy url` is empty.
   const rawServe = (parsed as { serve?: ServeConfigInput }).serve;
+  const serveServices = resolveServicePorts(rawServe);
   config.serve = {
-    services: resolveServicePorts(rawServe),
+    services: serveServices,
     start_services_cmd: resolveStartServicesCmd(rawServe),
   };
+  const mainService = resolveMainService(rawServe, serveServices);
+  if (mainService !== undefined) config.serve.main_service = mainService;
 
   // Resolve each role's DEFAULT profile. A role names a profile and nothing
   // else; the pre-profile spellings are refused first, with the replacement
@@ -1769,6 +1867,19 @@ export function resolveConfigText(
       );
     }
 
+    // Tier retry interval (seconds). Default 300; at least 1 — a tier that
+    // refused must stay skipped for at least the request it refused.
+    const tierRetryInterval = parsedProxy.tier_retry_interval;
+    if (
+      tierRetryInterval !== undefined &&
+      (typeof tierRetryInterval !== 'number' || !Number.isFinite(tierRetryInterval) || tierRetryInterval < 1)
+    ) {
+      throw new Error(
+        'lazy.toml [proxy] tier_retry_interval must be a number of seconds, at least 1. ' +
+        `E.g., tier_retry_interval = ${DEFAULT_TIER_RETRY_INTERVAL_SECONDS}.`,
+      );
+    }
+
     // Upstream ceiling (seconds). Default 1800; 0 means no ceiling. Rejected
     // rather than clamped when negative: a negative ceiling is a typo, and
     // silently reading it as "no ceiling" is the opposite of what was meant.
@@ -1783,6 +1894,23 @@ export function resolveConfigText(
       );
     }
 
+    // Audit log retention: whichever limit is reached first. Both bounded by
+    // construction — an unbounded log is the defect the module exists to fix.
+    const retentionDays = parsedProxy.audit_retention_days;
+    if (retentionDays !== undefined && (typeof retentionDays !== 'number' || !Number.isFinite(retentionDays) || retentionDays <= 0)) {
+      throw new Error(
+        'lazy.toml [proxy] audit_retention_days must be a positive number of days. ' +
+        `E.g., audit_retention_days = ${DEFAULT_AUDIT_RETENTION_DAYS}.`,
+      );
+    }
+    const retentionMib = parsedProxy.audit_retention_mib;
+    if (retentionMib !== undefined && (typeof retentionMib !== 'number' || !Number.isFinite(retentionMib) || retentionMib < MIN_AUDIT_RETENTION_MIB)) {
+      throw new Error(
+        `lazy.toml [proxy] audit_retention_mib must be a number of MiB, at least ${MIN_AUDIT_RETENTION_MIB}. ` +
+        `E.g., audit_retention_mib = ${DEFAULT_AUDIT_RETENTION_MIB}.`,
+      );
+    }
+
     config.proxy = {
       port,
       bind: parsedProxy.bind ?? DEFAULT_PROXY_BIND,
@@ -1790,7 +1918,10 @@ export function resolveConfigText(
       cursorUpstream: (parsedProxy.cursor_upstream ?? DEFAULT_CURSOR_UPSTREAM).replace(/\/$/, ''),
       fallbacks,
       retryAfterThreshold: threshold ?? 5,
+      tierRetryIntervalSeconds: tierRetryInterval ?? DEFAULT_TIER_RETRY_INTERVAL_SECONDS,
       upstreamTimeoutSeconds: upstreamTimeout ?? DEFAULT_UPSTREAM_TIMEOUT_SECONDS,
+      auditRetentionDays: retentionDays ?? DEFAULT_AUDIT_RETENTION_DAYS,
+      auditRetentionMib: retentionMib ?? DEFAULT_AUDIT_RETENTION_MIB,
       policy: resolveProxyPolicy(parsedProxy.policy),
     };
   }
@@ -1977,8 +2108,9 @@ agent_id = "claude-code"
 # 0 = use the agent's own default. (default: 1800000 — 30 minutes)
 # watchdog_output_timeout_ms = 1800000
 # Max time (ms) to wait for the agent process to exit AFTER it has emitted its
-# final result. The summary is already captured by then, so this kill loses
-# nothing but the CLI's own teardown. 0 disables.
+# final result and has no background work left running. The summary is already
+# captured by then, so this kill loses nothing but the CLI's own teardown.
+# 0 disables.
 # wind_down_timeout_ms = 60000
 
 [review]
@@ -2083,15 +2215,8 @@ type = "docker"
 # container already provides the boundary. No effect on macOS (Seatbelt). Default: false.
 # sandbox_allow_weaker_nested = false
 
-# Verify the FILE-TOOL deny boundary before launching host agents under
-# permission_mode = "sandbox". Those deny rules are a Claude Code behavior lazy
-# depends on but does not control, so an upgrade could silently regress it.
-#   "off" (default)    — no runtime check. CI + "lazy system verify-host-boundary" cover it.
-#   "once-per-version" — on the first host launch for each Claude Code version, run the
-#                        real boundary probe (9 headless sessions, ~4-6 min, needs a
-#                        logged-in claude), cache the verdict, and REFUSE to launch if a
-#                        deny rule was violated. An inconclusive run warns loudly and is
-#                        never cached — it is not a pass.
+# Retired: the host file-tool boundary self-check was removed. Still accepted
+# ("off" | "once-per-version") so existing configs load, but it has no effect.
 # verify_sandbox_boundary = "off"
 
 
@@ -2122,8 +2247,9 @@ ${remoteName !== 'origin' ? `git_remote = "${remoteName}"` : '# git_remote = "or
 
 [docker]
 # Path to custom Dockerfile (relative to the project root)
-# If empty, uses the base image (Ubuntu with Claude Code + passwordless sudo).
-# Agents install what they need via apt-get.
+# If empty, uses a committed Dockerfile.lazy at the project root, otherwise
+# the base image (Debian with Claude Code + passwordless sudo). Agents install
+# what they need via apt-get.
 dockerfile = ""
 
 # Files whose CONTENTS are part of this image's identity, relative to the
@@ -2303,12 +2429,24 @@ dockerfile = ""
 # retries the primary once before failing over (default 5).
 # retry_after_threshold = 5
 #
+# A tier of a tiered agent profile is used until it refuses for its rate limit
+# (a 429); the request then goes to the next tier. A refused tier is tried again
+# at the retry time it reported, or after this many seconds when it reported
+# none — and a windowed tier (Anthropic, ChatGPT) no later than this, since its
+# window can reset early (default 300).
+# tier_retry_interval = 300
+#
 # How long the proxy waits for an upstream to answer ONE request, in seconds
 # (default 1800; 0 = wait forever). A local model that is loading, queued behind
 # other requests, or prefilling a very large prompt can take minutes to produce
 # its first byte — raise this if yours legitimately does. The proxy says which
 # upstream and which ceiling in the error when it gives up.
 # upstream_timeout = 1800
+#
+# The proxy audit log (one line per model request: which upstream, model,
+# status) keeps 7 days or 128 MiB, whichever comes first.
+# audit_retention_days = 7
+# audit_retention_mib = 128
 #
 # [[proxy.fallback]]
 # upstream = "http://host.docker.internal:11434"   # e.g. local Ollama

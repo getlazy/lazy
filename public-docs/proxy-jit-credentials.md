@@ -163,6 +163,8 @@ The list is part of lazy's source, not a config knob, so growing lazy's
 forwarding surface is a reviewable code change rather than a setting someone
 can widen in passing.
 
+For failed Cursor requests, Watch and the proxy audit log show a credential-redacted upstream error message when the response is small enough to inspect. Large or streamed error bodies still reach Cursor unchanged; oversized bodies are identified without recording their contents.
+
 ## Usage-limit readings
 
 Model APIs report how close a credential is to its limits in response headers:
@@ -239,15 +241,30 @@ Grants live in `proxy-tokens.json` in the daemon's per-project state directory
 daemon auth token and the MCP token registry, and deliberately **not** under the
 project root, which every task container bind-mounts.
 
-- Minting is **per identity and reuses**: the same (role, task, agent profile,
-  env var) gets the same value back. A live container holds its placeholder in
+- Minting is **per identity and reuses**: the same (role, task, container,
+  agent profile, env var) gets the same value back. A task's work container
+  keeps one name across turns; its review and accept-check containers each get
+  their own placeholder. A live container holds its placeholder in
   memory across turns, so re-minting per turn would either invalidate a running
   turn or pile up equally-valid placeholders. The profile is part of that
   identity because it decides which upstream the placeholder redeems against —
   switch a task to another profile and it gets a new placeholder.
 - **Task grants are revoked** when the task's session ends (accept, reject,
   close) — alongside its MCP tokens, in the same place, and independently, so a
-  failure in one does not skip the other.
+  failure in one does not skip the other. Every grant naming the task goes,
+  whichever task reference it was minted under.
+- **Task grants are pinned to their container.** On Linux with Docker, once a
+  task's container is up its placeholders are bound to that container's network
+  address, and the proxy refuses them from any other address (a `401` that is
+  logged and audited). A placeholder that leaks out of one task's container
+  cannot be spent from another's. Each turn's new container is pinned afresh.
+  Grants are pinned only where the container's network gateway is an address
+  of the host itself — native Docker. Docker Desktop (on any OS), rootless
+  runtimes and a remote Docker host present every container from one other
+  address, so there grants are not pinned.
+- **Placeholders never reach the audit log.** Every placeholder shape lazy mints
+  is replaced by `<lazy-placeholder>` in recorded tool commands, tool results and
+  errors, because the log lives in the project, which task containers can read.
 - **Builder grants are revoked** when the builder session's MCP token is revoked,
   keyed by the same session name.
 - Interactive host launches (`lazy pair`, `lazy chat`) share one grant per
@@ -275,6 +292,16 @@ body — and forwards the rest verbatim. Body substitution is bounded to request
 declaring `content-length` ≤ 64 KiB, so the bidirectional agent stream is never
 buffered. The token in the path is never logged; a malformed route is reported by
 segment count only.
+
+`cursor-agent` trades its API key for a session (an access token and a refresh
+token) before it starts work. That session is a real Cursor credential, so the
+proxy never hands it to the container: it replaces both tokens in the answer
+with placeholders bound to the launch's grant, and swaps them back on that
+launch's later requests. The access token keeps its readable expiry, so the CLI
+still renews on time. Session placeholders are revoked with the grant, one
+presented by any other launch is refused with `401`, and if the launch's grant
+is gone by the time the answer arrives the session is withheld (`502`) rather
+than forwarded.
 
 ## Codex
 

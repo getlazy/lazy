@@ -38,10 +38,10 @@ function resolveToolset(opts?: ToolSurfaceOpts): McpToolset {
  * Arguments only the builder may pass, withheld from a task agent's schema so
  * it is neither offered them nor pays for them in context. The handlers refuse
  * them from an agent regardless — this is advertisement, not enforcement.
- * `past_usage_pause`: letting a task past the usage pause is a person's or the
+ * `override_usage_pause` (and its deprecated alias `past_usage_pause`): letting a task past the usage pause is a person's or the
  * builder's call, never a task agent's (src/daemon/usage-pause.ts).
  */
-const BUILDER_ONLY_ARGS: readonly string[] = ['past_usage_pause'];
+const BUILDER_ONLY_ARGS: readonly string[] = ['override_usage_pause', 'past_usage_pause'];
 
 /** `tool`'s definition as `role` is served it (the MCP server registers this one). */
 export function definitionForRole(tool: McpTool, role: McpRole): McpTool {

@@ -136,7 +136,7 @@ describe('auto-resume after a real agent crash (real supervisor, fake claude)', 
    * `autoResumeTask` builds its own and skipped it. Invisible while the loop
    * was opt-in, load-bearing once `low_high` became the default: a task whose
    * FINAL turn is an auto-resume ran single-phase, produced no self-review, and
-   * parked with nothing recorded and nothing gating. CLAUDE.md names the class
+   * parked with nothing recorded and nothing gating. AGENTS.md names the class
    * — "the recovery paths are exactly the ones that forgot" — which is why this
    * is asserted on the real seam rather than at the resolver.
    */
@@ -208,7 +208,7 @@ describe('auto-resume after a real agent crash (real supervisor, fake claude)', 
     expect(resumedPrompt).toContain('You are being resumed after a crash');
   }, 180_000);
 
-  // INVARIANT (CLAUDE.md — never lose human feedback): feedback stays `pending`
+  // INVARIANT (AGENTS.md — never lose human feedback): feedback stays `pending`
   // until an agent turn actually COMPLETES, so a turn that crashes after
   // receiving it must have it re-delivered verbatim, not silently dropped and
   // replaced by the generic "you were interrupted" prompt.

@@ -108,7 +108,7 @@ const ALPINE_TOOLS = new Set([
 const DEBIAN_BASE = new Set([
   'cat', 'ls', 'stat', 'id', 'sleep', 'grep', 'awk', 'tail', 'head', 'tr', 'cut', 'sh', 'rm',
   'mkdir', 'echo', 'printf', 'sort', 'uniq', 'wc', 'sed', 'df', 'free', 'ps', 'pkill', 'setsid',
-  'sync', 'kill', 'tee', 'env', 'true', 'bun', 'lazy', 'lazy-guest-init', 'date',
+  'sync', 'kill', 'tee', 'env', 'true', 'lazy', '/opt/lazy/bin/lazy', 'lazy-guest-init', 'date',
 ]);
 const APT_TO_TOOLS: Record<string, string[]> = {
   curl: ['curl'],
@@ -116,6 +116,9 @@ const APT_TO_TOOLS: Record<string, string[]> = {
   iproute2: ['ip', 'ss'],
   git: ['git'],
   'docker.io': ['docker', 'dockerd'],
+  // Docker's own apt repo (pinned): the engine and the CLI are separate packages.
+  'docker-ce': ['dockerd'],
+  'docker-ce-cli': ['docker'],
   procps: ['ps', 'pkill', 'free'],
   jq: ['jq'],
   'e2fsprogs': ['mkfs.ext4', 'e2fsck'],
@@ -127,10 +130,15 @@ const APT_TO_TOOLS: Record<string, string[]> = {
 
 function daemonImageTools(): Set<string> {
   const tools = new Set(DEBIAN_BASE);
-  const apt = daemonDockerfile.match(/apt-get install[^&]*?\\\n([\s\S]*?)&&/);
-  expect(apt).not.toBeNull();
-  for (const pkg of apt![1]!.split(/\s+/).map((p) => p.replace(/\\$/, '')).filter(Boolean)) {
-    for (const tool of APT_TO_TOOLS[pkg] ?? []) tools.add(tool);
+  // Every install block, not just the first: the Docker engine comes from its
+  // own pinned block (Docker's apt repo), written as quoted `name=version`.
+  const blocks = [...daemonDockerfile.matchAll(/apt-get install[^&;]*?\\\n([\s\S]*?)(?:&&|;)/g)];
+  expect(blocks.length).toBeGreaterThan(0);
+  for (const apt of blocks) {
+    for (const raw of apt[1]!.split(/\s+/).map((p) => p.replace(/\\$/, '')).filter(Boolean)) {
+      const pkg = raw.replace(/^"|"$/g, '').replace(/=.*$/, '');
+      for (const tool of APT_TO_TOOLS[pkg] ?? []) tools.add(tool);
+    }
   }
   return tools;
 }
@@ -230,17 +238,17 @@ describe('the hardware probe defines every helper before any stage', () => {
 // wait loop ran (reproduced locally, exit 143). One Mac round trip each.
 describe("the probe's kill commands hit what they name and nothing else", () => {
   const guestInit = readFileSync(
-    join(repoRoot, 'lazy-teams', 'deploy', 'daemon-image', 'lazy-guest-init'),
+    join(repoRoot, 'src', 'guest', 'lazy-guest-init'),
     'utf8',
   );
   // The forwarder's argv as a guest sees it, with the values lazy-guest-init
   // substitutes (26024, the guest's link address).
-  const FORWARDER_ARGV = 'socat -d TCP4-LISTEN:26024,bind=100.96.0.2,reuseaddr,fork TCP4:127.0.0.1:26024';
+  const FORWARDER_ARGV = 'socat -d TCP4-LISTEN:26024,bind=100.96.0.2,reuseaddr,fork,backlog=1024 TCP4:127.0.0.1:26024';
 
   test('the forwarder argv this test assumes is what lazy-guest-init runs', () => {
-    expect(guestInit).toContain(
-      'socat -d "TCP4-LISTEN:${DAEMON_PORT},bind=${link},reuseaddr,fork" "TCP4:127.0.0.1:${DAEMON_PORT}"',
-    );
+    expect(guestInit).toContain('FWD_LISTEN="TCP4-LISTEN:${DAEMON_PORT},bind=${1},reuseaddr,fork,backlog=1024"');
+    expect(guestInit).toContain('FWD_TARGET="TCP4:127.0.0.1:${DAEMON_PORT}"');
+    expect(guestInit).toContain('setsid socat -d "$FWD_LISTEN" "$FWD_TARGET"');
   });
 
   function killPatterns(text: string): { pattern: string; cmd: string }[] {

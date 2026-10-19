@@ -85,9 +85,7 @@
  * The OS sandbox (Bash) and `permissions.deny` (file tools) — not a prompt — are
  * the hard boundaries. See test/e2e/host-sandbox-posture.test.ts and the unit
  * contract in test/unit/host-sandbox-posture.test.ts. The deny-rule enforcement
- * under bypass is a Claude Code behavior we depend on but do not control; the
- * committed `scripts/host-sandbox-probe.sh --guard` re-verifies it on a real host
- * and trips loudly if a CC upgrade ever makes a file tool escape the rules.
+ * under bypass is a Claude Code behavior we depend on but do not control.
  *
  * Unexplored alternatives (need a real host to evaluate — see follow-ups):
  *   - `--permission-mode dontAsk` (CC v2.1.170+): if it means "never prompt; deny
@@ -209,7 +207,7 @@ export function buildSandboxSettings(
     autoAllowBashIfSandboxed: true,
     // Fail hard if the OS sandbox can't initialize (bubblewrap/socat missing,
     // unsupported platform) instead of silently running unsandboxed. Matches
-    // CLAUDE.md's "no silent fallbacks" rule.
+    // AGENTS.md's "no silent fallbacks" rule.
     failIfUnavailable: true,
     // Headless agents must never escape the sandbox; an interactive builder may
     // approve an escape via the dangerouslyDisableSandbox retry prompt.
@@ -587,22 +585,6 @@ export function withProjectRootWriteDenyArgs(
 }
 
 /**
- * Placeholder scope the boundary guard probes with. The probe script swaps
- * {@link PROBE_PROJECT_ROOT} for a real project root it builds, with a real
- * worktree named `worktreeName`, so the rules it tests are exactly the ones
- * {@link projectRootWriteDenyRules} emits, not a copy.
- */
-export const PROBE_PROJECT_ROOT = '/__lazy_probe_home__/.lazy-boundary-probe';
-/** Swapped by the probe for its `$HOME`; the probe root lives under it, as a real project root usually does. */
-export const PROBE_HOME = '/__lazy_probe_home__';
-export const PROBE_PROJECT_ROOT_SCOPE: ProjectRootWriteScope = {
-  homeDirs: [PROBE_HOME],
-  projectRoots: [PROBE_PROJECT_ROOT],
-  dataDir: '.lazy',
-  worktreeName: 'probe-wt',
-};
-
-/**
  * What a host agent must not write to keep the git-pointer boundary
  * (docs/design/git-pointer-boundary.md). A task container gets read-only
  * copies mounted over the pointers; the host runner has no mount namespace of
@@ -644,9 +626,6 @@ export interface GitPointerDenyPaths {
  *     drops them.
  *   - Edit denies on the same paths, and a Write deny on the whole common dir,
  *     confine the file tools, which bypass the OS sandbox.
- *
- * `scripts/host-sandbox-probe.sh --guard` re-verifies against real sessions
- * ({@link PROBE_GIT_POINTERS}).
  */
 export function applyGitPointerDenies(
   settings: { sandbox: Record<string, unknown>; permissions: { deny: string[] } },
@@ -694,19 +673,3 @@ export function withGitPointerDenyArgs(
   out[i + 1] = withGitPointerDenies(extraArgs[i + 1]!, paths);
   return out;
 }
-
-/**
- * Placeholder paths the boundary guard probes with. The probe script rewrites
- * these prefixes to a real worktree it creates, so the rules it tests are the
- * ones {@link applyGitPointerDenies} emits, not a copy.
- */
-export const PROBE_GIT_POINTERS: GitPointerDenyPaths = {
-  protectedPaths: [
-    '/__lazy_probe_worktree__/.git',
-    '/__lazy_probe_gitdir__/commondir',
-    '/__lazy_probe_gitdir__/gitdir',
-    '/__lazy_probe_common__/config',
-    '/__lazy_probe_common__/hooks',
-  ],
-  commonDirs: ['/__lazy_probe_common__'],
-};

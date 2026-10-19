@@ -8,6 +8,7 @@ import type { DriverDetection, DetectRemoteFn } from './driver';
 import { LocalDriver } from './local-driver';
 import { GitHubDriver, detectGitHub } from './github-driver';
 import { GitLabDriver, detectGitLab } from './gitlab-driver';
+import { localDriverMirrorsOrigin } from './origin-mirror';
 
 export interface CreateDriverOptions {
   /** When true, return LocalDriver regardless of config — for offline mode. */
@@ -32,7 +33,7 @@ export function createDriver(config: ResolvedConfig, context?: DriverContext, op
 
   switch (config.remote.driver) {
     case 'local':
-      return new LocalDriver(context);
+      return new LocalDriver(context, localDriverMirrorsOrigin(config) ? { remoteName: config.remote.git_remote } : undefined);
     case 'github':
       return new GitHubDriver(config, undefined, context);
     case 'gitlab':

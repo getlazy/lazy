@@ -4,7 +4,7 @@
  *
  * `show` used to send raw records and leave the rules over them to whoever
  * rendered them, so every client that grew a task-record surface re-derived
- * three rules that CLAUDE.md says must live in exactly one place: which
+ * three rules that AGENTS.md says must live in exactly one place: which
  * comments the agent has not seen (`resolveNotesCutoff`), how turns group into
  * review chunks (`groupTurnsIntoChunks`), and what a review CONCLUDED
  * (`resolveReviewVerdict` — the closed set the accept gate reads). A Lazy Teams
@@ -30,8 +30,10 @@
  * sequence is the stable key every surface already links by.
  */
 
+import { formatTurnLatency } from './turn-latency';
 import type { Comment, Session, Turn } from '../types';
 import { resolveNotesCutoff } from './turn-context';
+import { foldTurn, type TurnFold } from './wrapper-fold';
 import { resolveFinalState, finalHeadMovedLabel, type FinalState } from './final-state';
 import { groupTurnsIntoChunks } from '../utils/turn-chunks';
 import {
@@ -119,6 +121,12 @@ export interface ShowNotesState {
   queued_ids: string[];
   delivered_count: number;
   queued_count: number;
+  /**
+   * Feedback turns a refused unblock SAVED (`feedback_withheld`) and no turn
+   * has delivered yet. They ride the next UNBLOCK, never a resume — so a
+   * surface about to resume turns it into an unblock while this is above 0.
+   */
+  withheld_count: number;
 }
 
 /**
@@ -150,6 +158,7 @@ export function buildNotesState(
     queued_ids: queued.map((c) => c.id),
     delivered_count: comments.length - queued.length,
     queued_count: queued.length,
+    withheld_count: turns.filter((t) => t.role === 'human' && t.feedback_withheld === true).length,
   };
 }
 
@@ -292,5 +301,20 @@ export async function withPromotedTaskCodes<T extends { promoted_task_id?: strin
     if (!item.promoted_task_id || item.promoted_task_code) return item;
     const code = (await getTask(item.promoted_task_id))?.code;
     return code ? { ...item, promoted_task_code: code } : item;
+  }));
+}
+
+/**
+ * Turns as `show` serves them: each carries `fold`, the split of the turn into
+ * its own text and lazy's wrapper (src/task/wrapper-fold.ts), or null when nothing
+ * in it is lazy's. The ANSWER, so no client parses markers itself.
+ */
+export function buildShowTurns<T extends Turn>(turns: T[]): Array<T & { fold: TurnFold | null; latency_line?: string }> {
+  // `latency_line`: the turn's model-latency summary, worded once here
+  // (src/task/turn-latency.ts) so a client renders it rather than re-wording it.
+  return turns.map((turn) => ({
+    ...turn,
+    fold: foldTurn(turn),
+    ...(turn.latency && turn.latency.requests > 0 ? { latency_line: formatTurnLatency(turn.latency) } : {}),
   }));
 }

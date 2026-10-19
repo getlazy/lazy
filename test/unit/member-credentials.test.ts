@@ -24,6 +24,7 @@ import {
   clearUserCredentialCache,
   getUserCredential,
   putUserCredential,
+  putEndpointCredential,
   storeRenewedUserCredential,
   SERVICE_CREDENTIAL_USER_ID,
 } from '../../src/daemon/user-credentials';
@@ -32,7 +33,6 @@ import { resolveMemberCredential } from '../../src/proxy/credential-deps';
 import { agentProfilesFor, type AgentProfile } from '../../src/config/agent-profiles';
 import { loadConfig } from '../../src/config/loader';
 import type { CredentialGrant } from '../../src/proxy/credential-broker';
-import { recordRunningProxyRoutes, resetRunningProxyRoutes } from '../../src/daemon/running-proxy-routes';
 
 const ALICE = 'alice@example.com';
 
@@ -50,16 +50,19 @@ const CONFIG = [
   'harness = "pi"',
   'model = "qwen3"',
   'endpoint = "https://ollama.com"',
+  'credential = "ollama"',
   '',
   '[agents.claude-direct]',
   'harness = "claude-code"',
   'model = "claude-sonnet-4-6"',
   'endpoint = "https://api.anthropic.com"',
+  'credential = "anthropic"',
   '',
   '[agents.local]',
   'harness = "claude-code"',
   'model = "qwen"',
   'endpoint = "http://localhost:11434"',
+  'credential = "none"',
   '',
 ].join('\n');
 
@@ -119,7 +122,6 @@ describe('member credentials per agent profile', () => {
     else process.env.LAZY_CONFIG = savedConfig;
     clearUserCredentialCache();
     clearSessionCredentialCache();
-    resetRunningProxyRoutes();
     await rm(projectRoot, { recursive: true, force: true });
     await rm(baseDir, { recursive: true, force: true });
   });
@@ -140,20 +142,23 @@ describe('member credentials per agent profile', () => {
     expect(await memberCredentialFor(projectRoot, ALICE, await profile('local'))).toEqual({ kind: 'none-needed' });
 
     expect(await memberCredentialFor(projectRoot, ALICE, await profile('claude-code')))
-      .toMatchObject({ kind: 'missing', want: 'claude' });
+      .toMatchObject({ kind: 'missing', want: 'endpoint' });
     expect(await memberCredentialFor(projectRoot, ALICE, await profile('claude-gw')))
-      .toMatchObject({ kind: 'missing', want: 'profile' });
+      .toMatchObject({ kind: 'missing', want: 'endpoint' });
 
     await putUserCredential(projectRoot, { userId: ALICE, kind: 'oauth', token: 'claude-secret' });
     expect(await memberCredentialFor(projectRoot, ALICE, await profile('claude-direct')))
-      .toMatchObject({ kind: 'credential', via: 'claude' });
+      .toMatchObject({ kind: 'missing', want: 'endpoint' });
+    await putEndpointCredential(projectRoot, { userId: ALICE, endpointId: 'profile:claude-direct', origin: 'https://api.anthropic.com', provider: 'anthropic', kind: 'oauth', token: 'direct-secret' });
+    expect(await memberCredentialFor(projectRoot, ALICE, await profile('claude-direct')))
+      .toMatchObject({ kind: 'credential', via: 'endpoint', record: { token: 'direct-secret' } });
     // The Claude credential never pays for a profile pinned elsewhere.
     expect(await memberCredentialFor(projectRoot, ALICE, await profile('claude-gw')))
-      .toMatchObject({ kind: 'missing', want: 'profile' });
+      .toMatchObject({ kind: 'missing', want: 'endpoint' });
 
     await putShown(projectRoot, { userId: ALICE, kind: 'api-key', token: 'gw-secret', profile: 'claude-gw' });
     const gw = await memberCredentialFor(projectRoot, ALICE, await profile('claude-gw'));
-    expect(gw).toMatchObject({ kind: 'credential', via: 'profile' });
+    expect(gw).toMatchObject({ kind: 'credential', via: 'endpoint' });
     expect(gw.kind === 'credential' && gw.record.token).toBe('gw-secret');
   });
 
@@ -164,7 +169,7 @@ describe('member credentials per agent profile', () => {
     await putShown(projectRoot, { userId: ALICE, kind: 'api-key', token: 'gw-secret', profile: 'claude-gw' });
     await writeFile(process.env.LAZY_CONFIG!, CONFIG.replace('https://gw.example.com', 'https://elsewhere.example.com'));
     const answer = await memberCredentialFor(projectRoot, ALICE, await profile('claude-gw'));
-    expect(answer).toMatchObject({ kind: 'missing', want: 'profile' });
+    expect(answer).toMatchObject({ kind: 'missing', want: 'endpoint' });
     expect(answer.kind === 'missing' && answer.detail).toContain('https://elsewhere.example.com');
   });
 
@@ -180,35 +185,58 @@ describe('member credentials per agent profile', () => {
       userId: ALICE, kind: 'api-key', token: 'gw-secret', profile: 'claude-gw', endpoint: 'https://gw.example.com',
     });
     expect(await memberCredentialFor(projectRoot, ALICE, await profile('claude-gw')))
-      .toMatchObject({ kind: 'missing', want: 'profile' });
+      .toMatchObject({ kind: 'missing', want: 'endpoint' });
     // Reconnecting — consenting to the new endpoint — is what makes it usable.
     await putShown(projectRoot, { userId: ALICE, kind: 'api-key', token: 'gw-secret', profile: 'claude-gw' });
     expect(await memberCredentialFor(projectRoot, ALICE, await profile('claude-gw')))
-      .toMatchObject({ kind: 'credential', via: 'profile' });
+      .toMatchObject({ kind: 'credential', via: 'endpoint' });
   });
 
   // A credential pushed with no stated consent pays for nothing.
   test('a credential stored without a consented endpoint is refused', async () => {
     await putProfileCredential(projectRoot, { userId: ALICE, kind: 'api-key', token: 'gw-secret', profile: 'claude-gw' });
     expect(await memberCredentialFor(projectRoot, ALICE, await profile('claude-gw')))
-      .toMatchObject({ kind: 'missing', want: 'profile' });
+      .toMatchObject({ kind: 'missing', want: 'endpoint' });
   });
 
-  // INVARIANT: the stamp is checked against where the RUNNING proxy forwards
-  // the profile — built at daemon start — not a fresh read of the config, which
-  // a save changes before the restart that re-routes the proxy.
-  test('the stamp is checked against the running proxy\'s route, not the saved config', async () => {
-    recordRunningProxyRoutes(projectRoot, await loadConfig(projectRoot));
+  test('the stamp tracks a changed route without a daemon restart', async () => {
     await writeFile(process.env.LAZY_CONFIG!, CONFIG.replace('https://gw.example.com', 'https://elsewhere.example.com'));
-    // Consent to the NEW endpoint: the proxy still forwards to the old one.
+    // Consent to the new endpoint is immediately valid.
     await putShown(projectRoot, { userId: ALICE, kind: 'api-key', token: 'gw-secret', profile: 'claude-gw' });
     const early = await memberCredentialFor(projectRoot, ALICE, await profile('claude-gw'));
-    expect(early).toMatchObject({ kind: 'missing', want: 'profile' });
-    expect(early.kind === 'missing' && early.detail).toContain('https://gw.example.com');
-    // Once the proxy runs on the new config (a restart), the same consent works.
-    recordRunningProxyRoutes(projectRoot, await loadConfig(projectRoot));
+    expect(early).toMatchObject({ kind: 'credential', via: 'endpoint' });
+
     expect(await memberCredentialFor(projectRoot, ALICE, await profile('claude-gw')))
       .toMatchObject({ kind: 'credential' });
+  });
+
+  // INVARIANT: new-endpoint consent never authorizes the previous route. An in-flight request may retain the old route while its owner reconnects.
+  test('a newly consented credential is never sent to the previous endpoint mid-request', async () => {
+    await putShown(projectRoot, { userId: ALICE, kind: 'api-key', token: 'old-secret', profile: 'claude-gw' });
+    await bindTurnCredential(projectRoot, { taskId: 'task-1', sessionId: 's', ownerUserId: ALICE, kind: 'api-key' });
+    await writeFile(process.env.LAZY_CONFIG!, CONFIG.replace('https://gw.example.com', 'https://elsewhere.example.com'));
+    await putShown(projectRoot, { userId: ALICE, kind: 'api-key', token: 'new-secret', profile: 'claude-gw' });
+    const staleRoute = await resolveMemberCredential(projectRoot, grant('claude-gw'), 'https://gw.example.com');
+    expect(staleRoute?.outcome).toMatchObject({ kind: 'missing' });
+    expect((staleRoute?.outcome as { reason?: string })?.reason).toContain('effective configuration');
+    expect((await resolveMemberCredential(projectRoot, grant('claude-gw'), 'https://elsewhere.example.com'))?.outcome)
+      .toMatchObject({ kind: 'credential', placement: { header: 'x-api-key', value: 'new-secret' } });
+  });
+
+  // INVARIANT: a Claude token never reaches a non-Anthropic route. An in-flight request cannot reuse its old gateway after a config change.
+  test('a Claude credential is not sent to the old gateway during a re-point to Anthropic', async () => {
+    await putUserCredential(projectRoot, { userId: ALICE, kind: 'oauth', token: 'claude-secret' });
+    await bindTurnCredential(projectRoot, { taskId: 'task-1', sessionId: 's', ownerUserId: ALICE, kind: 'oauth' });
+    await writeFile(process.env.LAZY_CONFIG!, CONFIG.replace(
+      'endpoint = "https://gw.example.com"\ncredential = "gw-claude"\n',
+      'endpoint = "https://api.anthropic.com"\ncredential = "anthropic"\n',
+    ));
+    const staleRoute = await resolveMemberCredential(projectRoot, grant('claude-gw'), 'https://gw.example.com');
+    expect(staleRoute?.outcome).toMatchObject({ kind: 'missing' });
+    // A re-point changes origin, never account ownership: builtin Claude is
+    // not consent for this implicit endpoint.
+    expect((await resolveMemberCredential(projectRoot, grant('claude-gw'), 'https://api.anthropic.com'))?.outcome)
+      .toMatchObject({ kind: 'missing' });
   });
 
   test('the store refuses what a profile does not take', async () => {
@@ -268,36 +296,28 @@ describe('member credentials per agent profile', () => {
     expect((await getUserCredential(projectRoot, ALICE, 'codex-subscription'))?.token).toContain('r2');
   });
 
-  // INVARIANT: the Claude credential is paid only where the RUNNING proxy
-  // sends the profile to Anthropic. A saved config that re-points a gateway
-  // profile at Anthropic (or drops its endpoint) changes nothing about where
-  // the proxy forwards until it is rebuilt, so the member's Anthropic token
-  // must not ride a request that still goes to the gateway.
-  test('the Claude credential never pays while the running proxy still forwards the profile elsewhere', async () => {
+  test('explicit Anthropic routes need their own connection; removing the pin uses the builtin default', async () => {
     await putUserCredential(projectRoot, { userId: ALICE, kind: 'oauth', token: 'claude-secret' });
-    recordRunningProxyRoutes(projectRoot, await loadConfig(projectRoot));
     const gwBlock = 'endpoint = "https://gw.example.com"\ncredential = "gw-claude"\n';
     for (const repointed of [
-      CONFIG.replace(gwBlock, 'endpoint = "https://api.anthropic.com"\n'),
+      CONFIG.replace(gwBlock, 'endpoint = "https://api.anthropic.com"\ncredential = "anthropic"\n'),
       CONFIG.replace(gwBlock, ''),
     ]) {
       expect(repointed).not.toBe(CONFIG);
       await writeFile(process.env.LAZY_CONFIG!, repointed);
-      const answer = await memberCredentialFor(projectRoot, ALICE, await profile('claude-gw'));
-      expect(answer.kind).toBe('missing');
-      expect(answer.kind === 'missing' && answer.detail).toContain('https://gw.example.com');
+      const selected = await profile('claude-gw');
+      const answer = await memberCredentialFor(projectRoot, ALICE, selected);
+      expect(answer).toMatchObject(selected.endpointPinned ? { kind: 'missing', want: 'endpoint' } : { kind: 'credential', via: 'endpoint' });
     }
-    // Once the proxy is rebuilt on the saved config, the Claude credential pays.
-    recordRunningProxyRoutes(projectRoot, await loadConfig(projectRoot));
     expect(await memberCredentialFor(projectRoot, ALICE, await profile('claude-gw')))
-      .toMatchObject({ kind: 'credential', via: 'claude' });
+      .toMatchObject({ kind: 'credential', via: 'endpoint' });
   });
 
   describe('what the proxy sends for a team-mode task caller', () => {
-    test('nothing to decide outside team mode, or for a caller with no task', async () => {
+    test('solo mode uses the project map, but member-mode unbound builders refuse', async () => {
       expect(await resolveMemberCredential(projectRoot, grant('claude-gw'))).toBeNull();
       await putUserCredential(projectRoot, { userId: ALICE, kind: 'oauth', token: 'claude-secret' });
-      expect(await resolveMemberCredential(projectRoot, grant('claude-code', null, 'builder'))).toBeNull();
+      expect((await resolveMemberCredential(projectRoot, grant('claude-code', null, 'builder')))?.outcome.kind).toBe('missing');
     });
 
     // INVARIANT: no member, no credential. A task with no live turn has nobody
@@ -327,8 +347,9 @@ describe('member credentials per agent profile', () => {
         .toMatchObject({ kind: 'credential', placement: { header: 'authorization', value: 'Bearer ollama-secret' } });
       expect((await resolveMemberCredential(projectRoot, grant('codex')))?.outcome)
         .toMatchObject({ kind: 'credential', placement: { header: 'authorization', value: 'Bearer openai-secret' } });
+      await putEndpointCredential(projectRoot, { userId: ALICE, endpointId: 'profile:claude-direct', origin: 'https://api.anthropic.com', provider: 'anthropic', kind: 'oauth', token: 'direct-secret' });
       expect((await resolveMemberCredential(projectRoot, grant('claude-direct')))?.outcome)
-        .toMatchObject({ kind: 'credential', placement: { header: 'authorization', value: 'Bearer claude-secret' } });
+        .toMatchObject({ kind: 'credential', placement: { header: 'authorization', value: 'Bearer direct-secret' } });
       expect((await resolveMemberCredential(projectRoot, grant('local')))?.outcome.kind).toBe('none');
     });
 
@@ -398,6 +419,42 @@ describe('member credentials per agent profile', () => {
       expect(n).toBe(4);
     });
 
+
+    // INVARIANT: only a REAL refusal of the refresh marks the credential
+    // missing-for-good. A token endpoint that timed out, could not be reached,
+    // or answered 5xx/429 says nothing about the session; reading it as a dead
+    // credential parked turns `fatal_auth`, filed an alert and marked the
+    // connection broken on a DNS blip. Transient → retryable, no refusal.
+    test('a transient refresh failure is transient; a refused refresh is not', async () => {
+      const session = JSON.stringify({
+        auth_mode: 'chatgpt',
+        tokens: { access_token: chatGptAccess(30, 0), refresh_token: 'rt-0', account_id: 'acct-alice' },
+      });
+      await putUserCredential(projectRoot, { userId: ALICE, kind: 'oauth', token: 'claude-secret' });
+      await putShown(projectRoot, { userId: ALICE, kind: 'oauth', token: session, profile: 'codex-subscription' });
+      await bindTurnCredential(projectRoot, { taskId: 'task-1', sessionId: 's', ownerUserId: ALICE, kind: 'oauth' });
+
+      const realFetch = globalThis.fetch;
+      const answers: Array<() => Response> = [
+        () => { throw Object.assign(new Error('timed out'), { name: 'TimeoutError' }); },
+        () => { throw new TypeError('getaddrinfo ENOTFOUND auth.openai.com'); },
+        () => new Response('upstream down', { status: 502 }),
+        () => new Response('slow down', { status: 429 }),
+      ];
+      try {
+        for (const answer of answers) {
+          globalThis.fetch = (async () => answer()) as unknown as typeof fetch;
+          const outcome = (await resolveMemberCredential(projectRoot, grant('codex-subscription')))?.outcome;
+          expect(outcome).toMatchObject({ kind: 'missing', transient: true });
+        }
+        globalThis.fetch = (async () => new Response('{"error":"refresh_token_reused"}', { status: 400 })) as unknown as typeof fetch;
+        const refused = (await resolveMemberCredential(projectRoot, grant('codex-subscription')))?.outcome;
+        expect(refused?.kind).toBe('missing');
+        expect(refused && 'transient' in refused ? refused.transient : undefined).toBeUndefined();
+      } finally {
+        globalThis.fetch = realFetch;
+      }
+    });
     // A ChatGPT subscription connected by a member is presented the way the
     // codex CLI presents one: its access token as a bearer, and the ACCOUNT
     // header from the stored session — never whatever the container sent.
@@ -423,9 +480,8 @@ describe('member credentials per agent profile', () => {
       await putUserCredential(projectRoot, { userId: ALICE, kind: 'oauth', token: 'claude-secret' });
       await bindTurnCredential(projectRoot, { taskId: 'task-1', sessionId: 's', ownerUserId: SERVICE_CREDENTIAL_USER_ID, kind: 'api-key' });
       expect((await resolveMemberCredential(projectRoot, grant('claude-gw')))?.outcome.kind).toBe('missing');
-      await putShown(projectRoot, {
-        userId: SERVICE_CREDENTIAL_USER_ID, kind: 'api-key', token: 'svc-gw', profile: 'claude-gw',
-      });
+      await putUserCredential(projectRoot, { userId: SERVICE_CREDENTIAL_USER_ID, ownerEmail: ALICE, kind: 'api-key', token: 'svc-marker' });
+      await putShown(projectRoot, { userId: ALICE, kind: 'api-key', token: 'svc-gw', profile: 'claude-gw' });
       expect((await resolveMemberCredential(projectRoot, grant('claude-gw')))?.outcome)
         .toMatchObject({ kind: 'credential', placement: { value: 'svc-gw' } });
     });

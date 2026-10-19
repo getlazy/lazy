@@ -8,12 +8,22 @@
  * capabilities — they pass what they have and the agent does the right thing.
  */
 
+import type { HealthCheck } from '../remote/driver';
 import type { AgentResponse } from '../types';
 import type { AgentFailure, AgentFailureInput } from './failure-taxonomy';
 import type { AgentActivityStream } from './activity-stream';
 
 export type { AgentResponse };
 export type { AgentActivityStream, AgentActivityEvent, AgentActivityKind } from './activity-stream';
+
+/**
+ * A headless agent launch. Unbounded text never rides argv (see the argv rule in
+ * ./argv-safety): the prompt is `stdinInput`, which the spawn seam pipes to the
+ * agent, and a large system prompt is `systemPromptInput`, which the seam
+ * writes to a private file and substitutes for {@link SYSTEM_PROMPT_FILE_ARG}.
+ */
+export type AgentExecArgs = string[] & { stdinInput?: string; systemPromptInput?: string };
+export const SYSTEM_PROMPT_FILE_ARG = '__LAZY_SYSTEM_PROMPT_FILE__';
 export type { AgentFailure, AgentFailureInput, AgentFailureClass } from './failure-taxonomy';
 
 /**
@@ -42,6 +52,12 @@ export interface Agent {
    * Build the CLI command to run the agent in headless mode.
    * Returns the full argv array.
    *
+   * The prompt MUST be returned as `stdinInput`, never in argv, and a system
+   * prompt either inline under the argv bound or via `systemPromptInput`
+   * (`systemPromptArgv` in ./argv-safety does this). Linux refuses an argv
+   * element over 128 KiB with E2BIG; `test/unit/agent-argv-bound.test.ts`
+   * builds every registered harness with a 1 MiB prompt to hold this.
+   *
    * Each agent handles its own quirks internally:
    * - Cursor: prepends system prompt to user prompt (no --append-system-prompt)
    * - Codex: uses `codex exec` subcommand with --config developer_instructions
@@ -67,12 +83,21 @@ export interface Agent {
      */
     permissionMode?: 'plan' | 'default';
     /**
+     * True when the process already runs inside an external isolation
+     * boundary (a task container). A harness whose own read-only sandbox
+     * cannot work there (Codex: bubblewrap cannot create a namespace) skips
+     * it for plan turns; lazy then enforces read-only itself (toolset, prompt
+     * and the supervisor's write check). Undefined/false keeps the harness's
+     * native sandbox — the host-process runner.
+     */
+    externallySandboxed?: boolean;
+    /**
      * Extra CLI args appended after all other flags. Used to thread the host
      * runner's OS-sandbox settings (`--settings <json>`) into the launch.
      * See src/runner/host-sandbox.ts.
      */
     extraArgs?: string[];
-  }): string[];
+  }): AgentExecArgs;
 
   /**
    * Parse the agent's stdout output into an AgentResponse.
@@ -106,6 +131,15 @@ export interface Agent {
    * expensive mistake.
    */
   classifyFailure(input: AgentFailureInput): AgentFailure;
+
+  /**
+   * Optional: pull the TERMINAL error out of a crashed launch's stdout, for
+   * agents whose stream carries non-fatal error-shaped events (warnings) that
+   * would otherwise crowd the real error out of the supervisor's bounded
+   * generic excerpt. Undefined = no terminal error found; the generic excerpt
+   * applies.
+   */
+  extractStdoutError?(output: string): string | undefined;
 
   /**
    * Default watchdog output timeout in ms. 0 = disabled.
@@ -279,5 +313,5 @@ export interface AgentPackaging {
   supervisorToolChecks(): { cmd: string; name: string; hint: string }[];
 
   /** Health checks for `lazy doctor`. */
-  diagnose(): { state: 'ok' | 'fail'; what: string; reason?: string }[];
+  diagnose(): HealthCheck[];
 }

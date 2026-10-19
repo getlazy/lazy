@@ -21,6 +21,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { initDaemonStorage } from '../../src/daemon/rpc-handlers';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'fs';
 import { mkdir, writeFile, rm, symlink } from 'fs/promises';
 import { join } from 'path';
@@ -222,20 +223,33 @@ describe('builder scratch capture', () => {
   const agentCtx = (): McpToolContext => ({ taskId: task.id, worktreePath: testDir, storage });
   const builderCtx = (): McpToolContext => ({ taskId: '', worktreePath: testDir, storage });
 
+  // The handler answers through the daemon's `scratchList` RPC, so this test runs
+  // it the way every unit test runs an RPC: in-process (LAZY_TEST=1) against
+  // THIS test's project. Without that it asked whatever daemon the cwd's lazy
+  // root has — failing where none runs, and reading a real project's scratch
+  // where one does.
   test('lazy_scratch lists and reads for the builder', async () => {
     await writeFile(join(scratchDir, 'accept-foo.md'), 'the message\n');
     await sync();
+    const savedTest = process.env.LAZY_TEST;
+    process.env.LAZY_TEST = '1';
+    initDaemonStorage(testDir);
+    try {
 
-    const scratch = createAllHandlers(builderCtx()).get('lazy_scratch')!;
+      const scratch = createAllHandlers(builderCtx()).get('lazy_scratch')!;
 
-    const list = (await scratch({})) as any;
-    expect(list.total).toBe(1);
-    expect(list.files[0].path).toBe('accept-foo.md');
+      const list = (await scratch({})) as any;
+      expect(list.total).toBe(1);
+      expect(list.files[0].path).toBe('accept-foo.md');
 
-    const one = (await scratch({ path: 'accept-foo.md' })) as any;
-    expect(one.content).toBe('the message\n');
+      const one = (await scratch({ path: 'accept-foo.md' })) as any;
+      expect(one.content).toBe('the message\n');
 
-    await expect(scratch({ path: 'nope.md' })).rejects.toThrow(/No captured scratch file/);
+      await expect(scratch({ path: 'nope.md' })).rejects.toThrow(/No captured scratch file/);
+    } finally {
+      if (savedTest === undefined) delete process.env.LAZY_TEST;
+      else process.env.LAZY_TEST = savedTest;
+    }
   });
 
   // INVARIANT (builder↔human boundary): scratch is not a channel to agents.

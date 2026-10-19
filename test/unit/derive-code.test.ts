@@ -27,7 +27,7 @@ describe('deriveCode', () => {
   });
 
   // A derived code has to be a DNS label: a task's [serve] services live at
-  // <service>.<code>.lazy.localhost, where a dot would split the code into two
+  // <code>.<service>.lazy.localhost, where a dot would split the code into two
   // labels and address a task that does not exist.
   test('turns dots into hyphens', () => {
     expect(deriveCode('foo...bar')).toBe('foo-bar');
@@ -92,7 +92,7 @@ describe('deriveCode', () => {
 
 /**
  * A task code is now a DNS label, because it becomes one: a task's [serve]
- * services live at `<service>.<code>.lazy.localhost`.
+ * services live at `<code>.<service>.lazy.localhost`.
  *
  * This governs NEW codes only. Existing dotted codes are never renamed or
  * migrated — they keep resolving everywhere, and in a hostname such a task is

@@ -54,3 +54,8 @@ export function beginLaunch(runName: string, taskId?: string): void {
 export function endLaunch(runName: string, taskId?: string): void {
   for (const k of keysFor(runName, taskId)) inFlight.delete(k);
 }
+
+/** Is ANY launch in progress in this process? (The machine-integrity canary stays out of a launch's way.) */
+export function anyLaunchInFlight(): boolean {
+  return inFlight.size > 0;
+}

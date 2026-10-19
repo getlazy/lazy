@@ -151,3 +151,12 @@
 }
 @keyframes lz-container-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .lz-container-spinner { animation: none; } }
+
+/* Copy-markdown control: floats at the top-right of a card's rendered body. */
+.md-copy {
+  float: right; margin: 0 0 4px 8px; font-family: var(--font-body); font-size: 11px; padding: 1px 7px;
+  cursor: pointer; border: 1px solid var(--color-divider); background: none; border-radius: 3px;
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
+}
+.md-copy:hover, .md-copy:focus-visible { border-color: color-mix(in srgb, var(--color-text) 40%, transparent); }
+.md-copy-bad { color: var(--color-danger); border-color: var(--color-danger); }

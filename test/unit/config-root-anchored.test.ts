@@ -16,7 +16,7 @@ import { loadConfig, resolveConfigPath } from '../../src/config/loader';
  * `[permissions] protected` so no violation is ever recorded, blank
  * `[checks] post_turn`, zero the watchdog, drop `[[maintain]]` groups, or pick
  * its own model and effort. Same governance rule as the container image ("Task
- * worktrees never auto-govern container images" in CLAUDE.md), generalised from
+ * worktrees never auto-govern container images" in AGENTS.md), generalised from
  * `[docker] run_args` to the whole file.
  *
  * This file guards the mechanism. The end-to-end proof that the SUPERVISOR

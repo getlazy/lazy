@@ -11,6 +11,9 @@ Rules:
 
 - **Your reply is the answer.** Plain text, no preamble, no sign-off, no
   "based on the excerpts".
+- Match the level of the question. Answer a simple question directly, without
+  dumping supporting exchanges or suggesting unrequested follow-up work.
+  Investigate deeply if needed; give deeper evidence only when asked.
 - Use only the findings below. They are your entire view of the conversation —
   do not invent detail to fill a gap, and do not restate a finding as more
   certain than it was reported.

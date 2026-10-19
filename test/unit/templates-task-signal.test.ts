@@ -104,6 +104,14 @@ describe('taskDetailHtml signal hierarchy', () => {
     expect(html).not.toContain('<h2>Session');
   });
 
+  test('shows a safe external PR link in the task header', () => {
+    const task = makeTask();
+    task.metadata = { github_remote_ref_url: 'https://github.com/org/repo/pull/12' };
+    expect(taskDetailHtml(task, makeSession(), [], [], [], [], [], [], [])).toContain('href="https://github.com/org/repo/pull/12"');
+    task.metadata = { github_remote_ref_url: 'javascript:alert(1)' };
+    expect(taskDetailHtml(task, makeSession(), [], [], [], [], [], [], [])).not.toContain('href="javascript:');
+  });
+
   test('demotes agent, model, tokens, branch, and ids into collapsed Metadata', () => {
     const html = taskDetailHtml(
       makeTask(),

@@ -19,8 +19,9 @@ import { createTask } from '../helpers/fixtures';
 import { expectSuccess } from '../helpers/assertions';
 import { piSuccessScenario, piHangAfterResultScenario, piErrorScenario, type PiScenario } from '../helpers/fake-pi';
 import { readTaskStatus } from '../helpers/storage';
-import { setGuards, agentTurns, waitForStatus, readSessionRecord } from '../helpers/agent-seam';
+import { setGuards, agentTurns, waitForStatus, readSessionRecord, largePrompt, createTaskWithPipedPrompt } from '../helpers/agent-seam';
 import { looksLikeLazyPlaceholder } from '../../src/proxy/credential-broker';
+import { auditLogPath } from '../../src/proxy/audit-log';
 
 describe('pi turns through the fake-binary seam', () => {
   let ctx: TestContext;
@@ -30,10 +31,13 @@ describe('pi turns through the fake-binary seam', () => {
    * The default endpoint is now a LOCAL server (src/config/agent-profiles.ts),
    * and a local endpoint is preflighted whether or not a human pinned it — so
    * without something answering on a port, every launch here would fail the
-   * probe rather than exercise the argv contract this suite is about. It only
-   * has to answer: the pi binary is fake, so no model request is ever made.
+   * probe rather than exercise the argv contract this suite is about. It also
+   * answers the one model request a test makes on purpose (the Ollama audit
+   * test's `http` step), and records it in `ollamaSeen`.
    */
   let ollamaStub: { port: number; stop: () => void };
+  /** Model requests the Ollama stand-in received, in arrival order. */
+  let ollamaSeen: Array<{ path: string; apiKey: string | null; body: string }>;
 
   /** The invocations that are real TURNS (probes are never recorded). */
   async function turnInvocations() {
@@ -61,14 +65,29 @@ describe('pi turns through the fake-binary seam', () => {
     // HOME is where the supervisor writes the per-turn pi files; the offline
     // flags and provider are lazy's own launch env. AUTH keys are recorded by
     // the fake unconditionally.
-    const server = Bun.serve({ port: 0, fetch: () => new Response('Ollama is running') });
+    ollamaSeen = [];
+    const server = Bun.serve({
+      port: 0,
+      fetch: async (req) => {
+        const path = new URL(req.url).pathname;
+        if (req.method === 'POST' && path === '/v1/messages') {
+          ollamaSeen.push({ path, apiKey: req.headers.get('x-api-key'), body: await req.text() });
+          return Response.json({
+            id: 'msg-ollama-seam', type: 'message', role: 'assistant', model: 'qwen3.8:latest',
+            content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn',
+            usage: { input_tokens: 7, output_tokens: 3 },
+          });
+        }
+        return new Response('Ollama is running');
+      },
+    });
     ollamaStub = { port: server.port!, stop: () => server.stop(true) };
     const configPath = join(ctx.root, 'lazy.toml');
     const baseConfig = await readFile(configPath, 'utf-8');
     await writeFile(
       configPath,
       `${baseConfig}\n[agents.pi]\nharness = "pi"\nmodel = "qwen3.8:latest"\n` +
-      `endpoint = "http://127.0.0.1:${ollamaStub.port}"\n`,
+      `endpoint = "http://127.0.0.1:${ollamaStub.port}"\ncredential = "none"\n`,
     );
     await ctx.recordPiEnvKeys([
       'HOME', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'LAZY_PI_PROVIDER', 'LAZY_PI_OLLAMA_MODEL',
@@ -80,6 +99,28 @@ describe('pi turns through the fake-binary seam', () => {
     await ctx.cleanup();
     ollamaStub?.stop();
   });
+
+  // INVARIANT: a prompt past the 128 KiB argv-element limit reaches pi whole,
+  // on stdin, through the REAL supervisor spawn — never as an argv element,
+  // where it dies with E2BIG and crash-loops the task.
+  test('a >200 KiB prompt reaches the agent whole, on stdin', async () => {
+    const prompt = largePrompt('LARGE-PROMPT-TAIL-pi');
+    const taskId = await createTaskWithPipedPrompt(ctx, 'Large prompt', prompt);
+    await ctx.setPiScenario({ sequence: [
+      piSuccessScenario({ result: 'Large turn done.', commit: { message: 'large', files: [{ path: 'large.txt', content: 'ok\n' }] } }),
+      piSuccessScenario({ result: 'Follow-up done.' }),
+    ] });
+
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+    expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
+
+    const [turn] = await turnInvocations();
+    expect(turn, 'the fake pi was never launched for a turn').toBeDefined();
+    expect(turn!.stdin).toContain(prompt);
+    expect(turn!.argv.every(a => Buffer.byteLength(a) < 128 * 1024)).toBe(true);
+    expect(turn!.argv.some(a => a.includes('LARGE-PROMPT-TAIL'))).toBe(false);
+  }, 90_000);
 
   test('a launched turn gets the argv, proxied env, and per-turn HOME files pi expects', async () => {
     const taskId = await createTask(ctx, 'pi argv contract', 'Do the pi thing');
@@ -131,8 +172,9 @@ describe('pi turns through the fake-binary seam', () => {
     expect(argv).toContain('--append-system-prompt');
     // A work turn keeps the full toolset.
     expect(argv).not.toContain('--exclude-tools');
-    // Prompt is the last positional and carries the task's own prompt.
-    expect(argv[argv.length - 1]).toContain('Do the pi thing');
+    // The full prompt travels on stdin, not as an argv element.
+    expect(turns[0]!.stdin).toContain('Do the pi thing');
+    expect(argv.every(arg => !arg.includes('Do the pi thing'))).toBe(true);
 
     // The env the launch built: a minted PLACEHOLDER (the real credential
     // stays daemon-side, swapped per request at the proxy), the proxied base
@@ -200,11 +242,57 @@ describe('pi turns through the fake-binary seam', () => {
     expect(afterUnblock.length).toBeGreaterThan(turns.length);
     // The unblock turn's WORK invocation — found by its prompt, not by being
     // last: the turn's own wrap-up invocations run after it.
-    const unblocked = afterUnblock.filter(i => String(i.argv[i.argv.length - 1]).includes('Keep going please'));
+    const unblocked = afterUnblock.filter(i => String(i.stdin).includes('Keep going please'));
     expect(unblocked.length, 'the unblock turn never launched pi').toBe(1);
     const second = unblocked[0]!.argv;
     expect(second).toContain('--session-id');
     expect(second[second.indexOf('--session-id') + 1]).toBe('fake-pi-session-0001');
+  }, 180_000);
+
+  // INVARIANT: a pi turn on a LOCAL Ollama endpoint reaches the model through
+  // lazy's proxy and lands in the audit trail, attributed to its task. A local
+  // endpoint used to be dialled directly, invisible to `lazy stats audit` and
+  // `lazy stats tokens`; this drives a real launch and lets the fake make the
+  // request exactly as pi would (provider baseUrl and key read from the
+  // per-turn models.json), so a launch that stopped pinning pi to the proxy
+  // would show up here as a request the audit never saw.
+  test('a local-Ollama pi turn\'s model traffic goes through the proxy and is audited', async () => {
+    const taskId = await createTask(ctx, 'pi ollama audit', 'Talk to the local model');
+    await ctx.setPiScenario({
+      steps: [
+        { kind: 'http', expectStatus: 200 },
+        ...piSuccessScenario({ result: 'Talked to ollama.' }).steps,
+      ],
+    });
+
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+    expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
+
+    const turns = await turnInvocations();
+    expect(turns.length, 'the fake pi was never launched for a turn').toBeGreaterThan(0);
+    const baseUrl = requireEnv(turns[0]!.env, 'ANTHROPIC_BASE_URL');
+    // The agent was handed the proxy, never the Ollama address.
+    expect(baseUrl).not.toContain(String(ollamaStub.port));
+
+    // The stand-in saw the request, with no credential: a placeholder never goes
+    // upstream, and a local endpoint gets none added.
+    expect(ollamaSeen.length, 'the pi turn never reached the Ollama stand-in').toBeGreaterThan(0);
+    expect(ollamaSeen[0]!.apiKey).toBeNull();
+    expect(JSON.parse(ollamaSeen[0]!.body).model).toBe('qwen3.8:latest');
+
+    const logPath = auditLogPath(join(ctx.root, '.lazy'));
+    let record: any;
+    for (let i = 0; i < 50 && !record; i++) {
+      const raw = await readFile(logPath, 'utf-8').catch(() => '');
+      record = raw.trim().split('\n').filter(Boolean).map(l => JSON.parse(l))
+        .find(r => String(r.upstream).includes(String(ollamaStub.port)) && r.status === 200);
+      if (!record) await Bun.sleep(100);
+    }
+    expect(record, 'the Ollama request has no audit record').toBeTruthy();
+    expect(record.role).toBe('agent');
+    expect(taskId.startsWith(String(record.taskId)) || String(record.taskId).startsWith(taskId)).toBe(true);
+    expect(record.usage).toMatchObject({ inputTokens: 7, outputTokens: 3 });
   }, 180_000);
 
   // The OpenAI-wire pi launch. An `[agents.*]` profile pointed at
@@ -289,7 +377,7 @@ describe('pi turns through the fake-binary seam', () => {
     await writeFile(
       configPath,
       `${before}\n[agents.openrouter-pi]\nharness = "pi"\nmodel = "openai/gpt-4o"\n` +
-      `endpoint = "https://openrouter.ai/api"\n`,
+      `endpoint = "https://openrouter.ai/api"\ncredential = "openrouter"\n`,
     );
 
     const taskId = await createTask(ctx, 'pi openrouter contract', 'Do the openrouter thing');
@@ -343,7 +431,7 @@ describe('pi turns through the fake-binary seam', () => {
     await writeFile(
       configPath,
       `${before}\n[agents.anthropic-pi]\nharness = "pi"\nmodel = "claude-opus-5"\n` +
-      `endpoint = "https://api.anthropic.com"\n`,
+      `endpoint = "https://api.anthropic.com"\ncredential = "anthropic"\n`,
     );
 
     const taskId = await createTask(ctx, 'pi provider refusal', 'Try google');
@@ -399,7 +487,7 @@ describe('pi turns through the fake-binary seam', () => {
     // follow-up invocation (wrap-up: review/presentation) — the "nudge" leg of
     // the rule, which rides the same command and must carry the same model.
     const known = ['Work on the sticky model', 'Keep going', 'Which model?'];
-    const followUps = turns.filter(t => !known.some(k => String(t.argv[t.argv.length - 1]).includes(k)));
+    const followUps = turns.filter(t => !known.some(k => String(t.stdin).includes(k)));
     expect(followUps.length, 'no wrap-up/nudge invocation ran, so stickiness across one is unproven')
       .toBeGreaterThan(0);
     for (const turn of turns) {
@@ -591,11 +679,11 @@ describe('pi turns through the fake-binary seam', () => {
     // retried — so the unblock turn is the SECOND invocation. Later ones are
     // that turn's own supervisor follow-ups (self-review, wrap-up).
     expect(piTurns.length).toBeGreaterThanOrEqual(2);
-    expect(piTurns.filter(i => String(i.argv[i.argv.length - 1]).includes('Credential fixed')).length).toBe(1);
+    expect(piTurns.filter(i => String(i.stdin).includes('Credential fixed')).length).toBe(1);
     const resumed = piTurns[1]!.argv;
     expect(resumed).toContain('--session-id');
     expect(resumed[resumed.indexOf('--session-id') + 1]).toBe(PI_SESSION_ID);
-    expect(resumed[resumed.length - 1]).toContain('Credential fixed');
+    expect(piTurns[1]!.stdin).toContain('Credential fixed');
   }, 180_000);
 
   // INVARIANT: a provider's monthly-quota 429 is not transient. Seen live

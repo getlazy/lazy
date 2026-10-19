@@ -49,28 +49,49 @@ export async function readDaemonMcpConfigMinimal(path: string): Promise<DaemonMc
  */
 /** See the task-side copy in src/supervisor/launch-env.ts for the rationale. */
 const LAUNCH_ENV_TIMEOUT_MS = 30_000;
+const PROXY_STARTUP_RETRY_MS = 250;
 
 export async function fetchBuilderLaunchEnv(configPath: string): Promise<BuilderLaunchEnv> {
   const cfg = await readDaemonMcpConfigMinimal(configPath);
   const url = `${cfg.target.replace(/\/$/, '')}/builder/launch-env`;
-  const resp = await fetch(url, {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${cfg.token}`,
-      'X-Lazy-Project': cfg.projectRoot,
-    },
-    // Same deadline, same reason as the task-side refresh: a stalled daemon must
-    // not park a relaunch forever. See LAUNCH_ENV_TIMEOUT_MS there.
-    signal: AbortSignal.timeout(LAUNCH_ENV_TIMEOUT_MS),
-  });
-  if (!resp.ok) {
+  const deadline = Date.now() + LAUNCH_ENV_TIMEOUT_MS;
+  while (true) {
+    const resp = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${cfg.token}`,
+        'X-Lazy-Project': cfg.projectRoot,
+      },
+      signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+    });
+    if (resp.ok) return await resp.json() as BuilderLaunchEnv;
     const body = await resp.text().catch(() => '');
-    throw new Error(
-      `Could not refresh the builder's launch environment from the daemon (${resp.status}): ` +
-      `${body || resp.statusText}. Check lazy daemon status and retry.`,
-    );
+    if (resp.status === 503 && body.includes('daemon proxy is not running') && Date.now() < deadline) {
+      await Bun.sleep(Math.min(PROXY_STARTUP_RETRY_MS, deadline - Date.now()));
+      continue;
+    }
+    throw new Error(launchEnvRefusalText(resp.status, body || resp.statusText));
   }
-  return await resp.json() as BuilderLaunchEnv;
+}
+
+/**
+ * The daemon's refusal in its own words: the `error` field of a JSON body when
+ * there is one (the daemon's routes answer `{ error }`), else the raw text.
+ * No CLI advice — a Teams member reading this from the builder page has no
+ * terminal to run it in.
+ */
+export function launchEnvRefusalText(status: number, body: string): string {
+  let reason = body;
+  try {
+    const parsed = JSON.parse(body) as unknown;
+    if (parsed && typeof parsed === 'object' && typeof (parsed as { error?: unknown }).error === 'string') {
+      reason = (parsed as { error: string }).error;
+    }
+  } catch (err) {
+    // Not JSON (a proxy's HTML error page, plain text): the raw body is the reason.
+    if (!(err instanceof SyntaxError)) throw err;
+  }
+  return `The daemon refused this builder's launch environment (${status}): ${reason}`;
 }
 
 /** Overlay launch env keys onto a base env record for spawn(). */

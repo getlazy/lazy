@@ -22,7 +22,7 @@ import { enableInProcessTestMode } from '../helpers/in-process-test-mode';
 // runs production code — and it is daemonless by design. Without LAZY_TEST=1 the
 // on-by-default audit proxy makes createRunner fail loud (ProxyUnavailableError)
 // because there is no daemon to report a proxy address, aborting every pass
-// before it does any work. See CLAUDE.md, "A daemonless suite that calls src/
+// before it does any work. See AGENTS.md, "A daemonless suite that calls src/
 // in-process must declare test mode".
 enableInProcessTestMode();
 

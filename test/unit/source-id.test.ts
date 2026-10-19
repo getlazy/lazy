@@ -19,6 +19,7 @@ import {
   computeSourceFingerprint,
   computeSourceIdentityOf,
   readBakedFingerprint,
+  readEmbeddedSourceFingerprint,
   sourceIdentityOf,
   FINGERPRINT_FILE,
 } from '../../src/utils/source-id';
@@ -104,6 +105,18 @@ describe('source fingerprint', () => {
     expect(await computeSourceFingerprint(root)).toBe(before);
   });
 
+  // INVARIANT: the build stamp is not identity. Compiling the agent binary from a
+  // checkout rewrites src/build-info.ts for the length of the compile; a daemon
+  // starting in that window must report the same id as the tree at rest, or the
+  // fleet rolls a daemon that is already current.
+  test('rewriting the build stamp does not change the id', async () => {
+    await writeFile(join(root, 'src', 'build-info.ts'), "export const BUILD_SHA = 'dev';\n");
+    const before = await computeSourceFingerprint(root);
+    await writeFile(join(root, 'src', 'build-info.ts'), "export const BUILD_SHA = 'abc1234';\n");
+
+    expect(await computeSourceFingerprint(root)).toBe(before);
+  });
+
   // A checkout that does not ship one of the covered paths still gets an id: a
   // fingerprint that refuses to exist is worse than one covering slightly less,
   // because every caller reads "no id" as "stale".
@@ -167,5 +180,25 @@ describe('the baked fingerprint', () => {
     expect(computed.id).not.toBe(stale);
     expect(computed.kind).toBe('computed');
     expect(computed.id).toBe(await computeSourceFingerprint(root));
+  });
+});
+
+// INVARIANT: a compiled binary answers `system source-id` with the fingerprint
+// embedded at build time, and nothing malformed is ever compared against real ids.
+describe('the fingerprint embedded in a compiled binary', () => {
+  test('a valid embedded id is reported', async () => {
+    const id = 'd'.repeat(16);
+    expect(await readEmbeddedSourceFingerprint(async () => ({ BUILD_SOURCE_FINGERPRINT: id }))).toBe(id);
+  });
+  test('a malformed or absent id is treated as none', async () => {
+    expect(await readEmbeddedSourceFingerprint(async () => ({ BUILD_SOURCE_FINGERPRINT: 'zz' }))).toBeNull();
+    expect(await readEmbeddedSourceFingerprint(async () => ({}))).toBeNull();
+    expect(await readEmbeddedSourceFingerprint(async () => { throw new Error('no module'); })).toBeNull();
+  });
+  test('scripts/build.ts computes the fingerprint before writing build-info', async () => {
+    const text = await Bun.file(join(import.meta.dir, '..', '..', 'scripts', 'build.ts')).text();
+    const at = text.indexOf('buildProvenance.buildSourceFingerprint = await computeSourceFingerprint(');
+    expect(at).toBeGreaterThan(-1);
+    expect(at).toBeLessThan(text.indexOf('formatBuildInfoContent(buildProvenance)'));
   });
 });

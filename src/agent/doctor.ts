@@ -37,19 +37,40 @@ import { isToolForRole } from '../mcp/tool-roles';
 import { MEMBER_SESSION_MARKER } from './member-session-marker';
 import { SCRATCH_ENV_VAR } from '../builder/scratch';
 
-/** One diagnosed link in the chain. */
-export interface DoctorCheck {
+/**
+ * Resolve a bare command against the CURRENT `process.env.PATH`. Bun's
+ * `which()` and `Bun.spawn` both default to the PATH the process STARTED with,
+ * so a PATH changed at runtime would be ignored and doctor would run a
+ * different binary than the environment it was given names.
+ */
+function resolveCommand(command: string): string | null {
+  return isAbsolute(command) ? command : which(command, { PATH: process.env.PATH ?? '' });
+}
+
+/**
+ * One diagnosed link in the chain.
+ *
+ * INVARIANT: a failing link REQUIRES `problem` — what is wrong, never the
+ * label's passing condition — and the report prints it next to the ✗. The
+ * `label` stays the stable subject (and the id's partner) for passes.
+ */
+export type DoctorCheck = (PassingLink | FailingLink) & DoctorLinkBase;
+
+interface PassingLink { ok: true; problem?: undefined }
+interface FailingLink { ok: false; problem: string }
+
+interface DoctorLinkBase {
   /** Stable machine-readable id (used by --json). */
   id: string;
   /** Human label printed next to the ✓/✗. */
   label: string;
   /**
-   * `false` means this link is provably broken and the command exits non-zero.
-   * A check that cannot determine anything reports ok with a `warning` instead
-   * — the same "absence of evidence is not evidence of absence" rule the
-   * session-start verification uses (src/supervisor/mcp-verify.ts).
+   * `ok: false` means this link is provably broken and the command exits
+   * non-zero. A check that cannot determine anything reports ok with a
+   * `warning` instead — the same "absence of evidence is not evidence of
+   * absence" rule the session-start verification uses
+   * (src/supervisor/mcp-verify.ts).
    */
-  ok: boolean;
   /** What was observed. */
   detail: string;
   /** What the human should do about it. Present on failures and on warnings. */
@@ -166,6 +187,7 @@ async function checkDaemonConfig(): Promise<{ check: DoctorCheck; facts: DaemonC
         id: 'daemon-config',
         label: 'LAZY_DAEMON_CONFIG',
         ok: false,
+        problem: 'LAZY_DAEMON_CONFIG is not set',
         detail: 'not set in this environment',
         remedy:
           'The container was launched without a daemon MCP config. Agent turns cannot reach ' +
@@ -185,6 +207,7 @@ async function checkDaemonConfig(): Promise<{ check: DoctorCheck; facts: DaemonC
         id: 'daemon-config',
         label: 'LAZY_DAEMON_CONFIG',
         ok: false,
+        problem: 'The daemon config cannot be read',
         detail: `${path} — could not read or parse: ${errText(err)}`,
         remedy:
           'The config is mounted from the host. If the file is missing, the mount is wrong or ' +
@@ -214,6 +237,7 @@ async function checkDaemonConfig(): Promise<{ check: DoctorCheck; facts: DaemonC
         id: 'daemon-config',
         label: 'LAZY_DAEMON_CONFIG',
         ok: false,
+        problem: 'The daemon config is missing required fields',
         detail: `${path} parses but is missing: ${missing.join(', ')}`,
         remedy: 'Restart the task so the host rewrites the config.',
         data: { path, projectRoot: raw.projectRoot, taskId: raw.taskId, target: raw.target },
@@ -260,6 +284,7 @@ async function checkClaudeJson(
         id: 'claude-json',
         label: '~/.claude.json mcpServers.lazy',
         ok: false,
+        problem: '~/.claude.json cannot be read',
         detail: `${path} — could not read or parse: ${errText(err)}`,
         remedy:
           'Lazy writes this file before every turn. If it is missing, no turn has started in ' +
@@ -277,6 +302,7 @@ async function checkClaudeJson(
         id: 'claude-json',
         label: '~/.claude.json mcpServers.lazy',
         ok: false,
+        problem: '~/.claude.json has no usable lazy MCP entry',
         detail:
           `no usable "lazy" server entry. Servers present: ${names.length ? names.join(', ') : '(none)'}`,
         remedy:
@@ -288,7 +314,7 @@ async function checkClaudeJson(
   }
 
   const problems: string[] = [];
-  const resolved = isAbsolute(entry.command) ? entry.command : which(entry.command);
+  const resolved = resolveCommand(entry.command);
   if (!resolved || !(await exists(resolved))) {
     problems.push(`command '${entry.command}' does not resolve on PATH`);
   }
@@ -342,6 +368,7 @@ async function checkClaudeJson(
         id: 'claude-json',
         label: '~/.claude.json mcpServers.lazy',
         ok: false,
+        problem: `The lazy MCP entry in ~/.claude.json is wrong: ${problems[0]}${problems.length > 1 ? ` (+${problems.length - 1} more)` : ''}`,
         detail: `${argvLine}\n    ${problems.join('\n    ')}`,
         remedy: foreign.length > 0
           ? 'Another process overwrote this entry. Find it with ' +
@@ -381,6 +408,7 @@ async function checkToolPermissions(): Promise<DoctorCheck> {
       id: 'tool-permissions',
       label: '~/.claude/settings.json permissions',
       ok: false,
+      problem: '~/.claude/settings.json cannot be read',
       detail: `${path} — could not read or parse: ${errText(err)}`,
       remedy:
         'Lazy writes the mcp__lazy__* allow entries before every turn. Start a fresh turn to ' +
@@ -399,6 +427,7 @@ async function checkToolPermissions(): Promise<DoctorCheck> {
       id: 'tool-permissions',
       label: '~/.claude/settings.json permissions',
       ok: false,
+      problem: 'No lazy tools are allowed in settings.json',
       detail: `no ${LAZY_TOOL_PREFIX}* entries in permissions.allow (${allow.length} entries total)`,
       remedy:
         'Without these the agent is prompted for, or denied, every lazy tool call. Start a ' +
@@ -481,10 +510,13 @@ async function checkLiveMcp(entry: ClaudeJsonLazyEntry | undefined): Promise<Doc
     ];
   }
 
-  const argv = [entry.command, ...entry.args];
   let proc: Bun.Subprocess<'pipe', 'pipe', 'pipe'>;
   try {
-    proc = spawn(argv, {
+    // Never fall back to the bare name: Bun would resolve it against the
+    // STARTUP PATH and run a binary the current environment does not name.
+    const command = resolveCommand(entry.command);
+    if (!command) throw new Error(`command '${entry.command}' does not resolve on PATH`);
+    proc = spawn([command, ...entry.args], {
       stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'pipe',
@@ -495,6 +527,7 @@ async function checkLiveMcp(entry: ClaudeJsonLazyEntry | undefined): Promise<Doc
       id,
       label,
       ok: false,
+      problem: `${label} could not run`,
       detail: `could not spawn the MCP server: ${errText(err)}`,
       remedy: 'The lazy-agent binary in this image cannot start. Rebuild the agent image.',
     });
@@ -544,9 +577,21 @@ async function checkLiveMcp(entry: ClaudeJsonLazyEntry | undefined): Promise<Doc
     }
   })();
 
+  // A server that EXITS will never answer: stop waiting at once and say so,
+  // rather than sitting out the full timeout on a dead process.
+  let exitCode: number | null = null;
+  void proc.exited.then((code) => { exitCode = code; }, () => { exitCode = -1; });
+
   const write = (msg: unknown) => {
-    proc.stdin.write(JSON.stringify(msg) + '\n');
-    proc.stdin.flush();
+    if (exitCode !== null) return;
+    try {
+      proc.stdin.write(JSON.stringify(msg) + '\n');
+      proc.stdin.flush();
+    } catch (err) {
+      // The pipe closed under us — the server is exiting. The wait below sees
+      // the exit and reports it; the write error itself adds nothing.
+      stderrChunks.push(`(writing to the server failed: ${errText(err)})\n`);
+    }
   };
 
   async function request(id: number, method: string, params: unknown): Promise<RpcReply | null> {
@@ -555,10 +600,20 @@ async function checkLiveMcp(entry: ClaudeJsonLazyEntry | undefined): Promise<Doc
     while (Date.now() < deadline) {
       const reply = replies.get(id);
       if (reply) return reply;
+      if (exitCode !== null) {
+        // Let the stdout reader drain a reply written just before the exit —
+        // bounded by the deadline: a grandchild still holding the pipe open
+        // must not turn "exited" into a hang.
+        await Promise.race([readStdout, new Promise(r => setTimeout(r, Math.max(0, deadline - Date.now())))]);
+        return replies.get(id) ?? null;
+      }
       await new Promise(r => setTimeout(r, 25));
     }
     return null;
   }
+  const noReply = () => exitCode !== null
+    ? `the server exited (code ${exitCode}) without replying`
+    : 'no reply within the timeout';
 
   const checks: DoctorCheck[] = [];
   try {
@@ -569,11 +624,12 @@ async function checkLiveMcp(entry: ClaudeJsonLazyEntry | undefined): Promise<Doc
     });
 
     if (!initReply || initReply.error) {
-      const why = initReply?.error?.message ?? 'no reply within the timeout';
+      const why = initReply?.error?.message ?? noReply();
       checks.push({
         id: 'mcp-selftest',
         label: 'Live MCP self-test (tools/list)',
         ok: false,
+        problem: 'The MCP server did not initialize',
         detail: `initialize failed: ${why}${stderrTail(stderrChunks)}`,
         remedy:
           'The MCP server process starts but cannot complete a handshake. The stderr tail above ' +
@@ -593,8 +649,9 @@ async function checkLiveMcp(entry: ClaudeJsonLazyEntry | undefined): Promise<Doc
         id: 'mcp-selftest',
         label: 'Live MCP self-test (tools/list)',
         ok: false,
+        problem: 'The MCP server did not list its tools',
         detail:
-          `tools/list failed: ${listReply?.error?.message ?? 'no usable reply'}` +
+          `tools/list failed: ${listReply?.error?.message ?? (listReply ? 'no usable reply' : noReply())}` +
           stderrTail(stderrChunks),
         remedy: 'The server answers `initialize` but cannot list tools — this is the exact state ' +
           '`claude mcp list` reports as "✔ Connected". Report the stderr tail above.',
@@ -610,6 +667,7 @@ async function checkLiveMcp(entry: ClaudeJsonLazyEntry | undefined): Promise<Doc
         id: 'mcp-selftest',
         label: 'Live MCP self-test (tools/list)',
         ok: false,
+        problem: 'The MCP server registered no tools',
         detail: `the server registered ZERO tools${stderrTail(stderrChunks)}`,
         remedy:
           'This is the failure `claude mcp list` cannot see: the server connects and advertises ' +
@@ -641,7 +699,8 @@ async function checkLiveMcp(entry: ClaudeJsonLazyEntry | undefined): Promise<Doc
         id: 'daemon-roundtrip',
         label: 'Daemon round-trip (lazy_status)',
         ok: false,
-        detail: `no reply within ${MCP_SELFTEST_TIMEOUT_MS}ms${stderrTail(stderrChunks)}`,
+        problem: 'The daemon did not answer lazy_status',
+        detail: `${exitCode !== null ? noReply() : `no reply within ${MCP_SELFTEST_TIMEOUT_MS}ms`}${stderrTail(stderrChunks)}`,
         remedy:
           'The server accepted the call but never answered — the daemon is unreachable from this ' +
           'container. Check `lazy daemon status` on the host and that the target in check 1 is ' +
@@ -654,6 +713,7 @@ async function checkLiveMcp(entry: ClaudeJsonLazyEntry | undefined): Promise<Doc
         id: 'daemon-roundtrip',
         label: 'Daemon round-trip (lazy_status)',
         ok: false,
+        problem: 'lazy_status failed',
         detail: `lazy_status failed: ${callReply.error.message ?? 'unknown error'}`,
         remedy:
           'The tool exists but the daemon refused or could not be reached. A 401/403 means a ' +
@@ -670,6 +730,7 @@ async function checkLiveMcp(entry: ClaudeJsonLazyEntry | undefined): Promise<Doc
         id: 'daemon-roundtrip',
         label: 'Daemon round-trip (lazy_status)',
         ok: false,
+        problem: 'The daemon answered lazy_status with an error',
         detail: `lazy_status answered with an error: ${firstText(result.content) ?? '(no text)'}`,
         remedy:
           'The transport works — the daemon answered — but the call itself was rejected. The ' +
@@ -750,12 +811,13 @@ function stderrTail(chunks: string[]): string {
  * agent process (and can bill a request).
  */
 async function checkProbeAgent(): Promise<DoctorCheck> {
-  const claudeBin = which('claude');
+  const claudeBin = resolveCommand('claude');
   if (!claudeBin) {
     return {
       id: 'probe-agent',
       label: 'Agent probe (claude init line)',
       ok: false,
+      problem: 'claude is not on PATH',
       detail: '`claude` not found on PATH',
       remedy: 'The agent binary is missing from this image. Rebuild the agent image.',
     };
@@ -774,6 +836,7 @@ async function checkProbeAgent(): Promise<DoctorCheck> {
       id: 'probe-agent',
       label: 'Agent probe (claude init line)',
       ok: false,
+      problem: 'claude could not be started',
       detail: `could not start claude: ${errText(err)}`,
       remedy: 'Fix the agent binary in this image, then re-run with --probe-agent.',
     };
@@ -786,6 +849,7 @@ async function checkProbeAgent(): Promise<DoctorCheck> {
         id: 'probe-agent',
         label: 'Agent probe (claude init line)',
         ok: false,
+        problem: 'claude produced no init line',
         detail: `claude produced no stream-json line within ${PROBE_AGENT_TIMEOUT_MS}ms`,
         remedy:
           'The agent could not start a session at all — usually credentials or network. Check ' +
@@ -801,6 +865,7 @@ async function checkProbeAgent(): Promise<DoctorCheck> {
         id: 'probe-agent',
         label: 'Agent probe (claude init line)',
         ok: false,
+        problem: 'claude\'s first stream line is not JSON',
         detail: `first stream-json line is not JSON (${errText(err)}): ${line.slice(0, 200)}`,
         remedy: 'This is an agent-version change, not a lazy misconfiguration. Report the line above.',
       };
@@ -839,6 +904,7 @@ async function checkProbeAgent(): Promise<DoctorCheck> {
         id: 'probe-agent',
         label: 'Agent probe (claude init line)',
         ok: false,
+        problem: 'claude started with no lazy tools',
         detail,
         remedy:
           'Claude Code itself loaded no lazy tools. This is the incident state exactly. If the ' +
@@ -853,6 +919,7 @@ async function checkProbeAgent(): Promise<DoctorCheck> {
         id: 'probe-agent',
         label: 'Agent probe (claude init line)',
         ok: false,
+        problem: 'claude started without the lazy MCP server connected',
         detail,
         remedy: 'Claude Code reports the lazy MCP server as not connected. See the self-test above.',
         data: { serverStatus },
@@ -967,7 +1034,7 @@ export function formatAgentDoctorReport(result: AgentDoctorResult): string {
 
   for (const check of result.checks) {
     const mark = check.data?.notApplicable ? '–' : check.ok ? (check.warning ? '!' : '✓') : '✗';
-    lines.push(`${mark} ${check.label}`);
+    lines.push(`${mark} ${check.ok ? check.label : check.problem}`);
     for (const line of check.detail.split('\n')) lines.push(`    ${line}`);
     if (check.remedy && (!check.ok || check.warning)) lines.push(`    → ${check.remedy}`);
     lines.push('');
@@ -976,7 +1043,7 @@ export function formatAgentDoctorReport(result: AgentDoctorResult): string {
   if (result.ok) {
     lines.push(result.memberSession ? 'Nothing to check: lazy\'s tools are not part of a member terminal.' : 'All checks passed.');
   } else {
-    const failed = result.checks.filter(c => !c.ok).map(c => c.label);
+    const failed = result.checks.flatMap(c => (c.ok ? [] : [c.problem]));
     lines.push(`FAILED: ${failed.join(', ')}`);
   }
   return lines.join('\n');

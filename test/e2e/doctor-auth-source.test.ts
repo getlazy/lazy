@@ -30,7 +30,7 @@ import { getCredentialIndexPath } from '../../src/daemon/paths';
 /** A declared profile billing OpenRouter — the credential the daemon below never has. */
 const OPENROUTER_CODEX =
   '\n[agents.openrouter-codex]\nharness = "codex"\nmodel = "gpt-5-codex"\n' +
-  'endpoint = "https://openrouter.ai/api"\n';
+  'endpoint = "https://openrouter.ai/api"\ncredential = "openrouter"\n';
 
 describe('lazy doctor — credential source', () => {
   let ctx: TestContext;
@@ -90,12 +90,12 @@ describe('lazy doctor — credential source', () => {
   });
 
   // INVARIANT: one line per credential the configured profiles bill — a provider
-  // inferred from a profile's endpoint, and a credential a profile names
+  // a profile's endpoint names (every endpoint names one), and a custom one it names
   // outright — each from the DAEMON's environment and each naming the profile
   // that needs it. Declaring a profile is enough; no role has to default to it.
   test('reports every credential the configured profiles bill, one line each', async () => {
     await appendConfig(
-      '\n[agents.openai-pi]\nharness = "pi"\nmodel = "gpt-5.2"\nendpoint = "https://api.openai.com"\n' +
+      '\n[agents.openai-pi]\nharness = "pi"\nmodel = "gpt-5.2"\nendpoint = "https://api.openai.com"\ncredential = "openai"\n' +
       '\n[agents.work-codex]\nharness = "codex"\nmodel = "gpt-5-codex"\ncredential = "work-openai"\n',
     );
 
@@ -142,8 +142,8 @@ describe('lazy doctor — credential source', () => {
     const result = await ctx.lazy(['doctor'], { env: { OPENROUTER_API_KEY: '' } });
 
     expectOutput(result, '✓ Anthropic credential present (daemon env: ANTHROPIC_API_KEY; needed by claude-code)');
-    expectOutput(result, '✗ OpenRouter credential readable (needed by openrouter-codex)');
-    expectOutput(result, 'could not tell whether a OpenRouter credential is available');
+    expectOutput(result, "✗ Lazy can't tell whether an OpenRouter credential is available (needed by openrouter-codex)");
+    expectOutput(result, 'could not tell whether an OpenRouter credential is available');
     expectOutput(result, 'Failed to parse the credential index');
   });
 
@@ -155,7 +155,7 @@ describe('lazy doctor — credential source', () => {
     // local server, and nothing else is declared.
     await appendConfig(
       '\n[agents.claude-code]\nharness = "claude-code"\nmodel = "qwen3.8:latest"\n' +
-      'endpoint = "http://localhost:11434"\n',
+      'endpoint = "http://localhost:11434"\ncredential = "none"\n',
     );
 
     const result = await ctx.lazy(['doctor'], {

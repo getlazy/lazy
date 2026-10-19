@@ -36,10 +36,6 @@ function collectingSink(): { sink: AuditSink; records: ProxyAuditRecord[] } {
   return { sink: { append: async (r) => { records.push(r); } }, records };
 }
 
-function freePort(): number {
-  return 40000 + Math.floor(Math.random() * 10000);
-}
-
 describe('keep-alive framing for a silent SSE body', () => {
   // INVARIANT: a silent SSE response body is kept warm with comment frames.
   // Bun.serve reaps a connection whose response body has written no bytes for
@@ -182,9 +178,8 @@ describe('a slow upstream still gets its real response through the proxy', () =>
   // says nothing for longer than the client would otherwise tolerate, then
   // streams a normal SSE answer.
   test('the client receives the upstream body, and the audit record is clean', async () => {
-    const upstreamPort = freePort();
     const upstream = Bun.serve({
-      port: upstreamPort,
+      port: 0,
       hostname: '127.0.0.1',
       idleTimeout: 0,
       async fetch() {
@@ -204,12 +199,12 @@ describe('a slow upstream still gets its real response through the proxy', () =>
         return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
       },
     });
+    const upstreamPort = upstream.port!;
 
     const { sink, records } = collectingSink();
-    const proxyPort = freePort();
     const proxy = createProxyServer(
       {
-        port: proxyPort,
+        port: 0,
         bind: '127.0.0.1',
         upstream: `http://127.0.0.1:${upstreamPort}`,
         upstreamTimeoutSeconds: 60,
@@ -217,6 +212,7 @@ describe('a slow upstream still gets its real response through the proxy', () =>
       sink,
       null,
     );
+    const proxyPort = proxy.port!;
     await Bun.sleep(50);
 
     try {
@@ -247,19 +243,18 @@ describe('a slow upstream still gets its real response through the proxy', () =>
   }, 30000);
 
   test('an upstream past the ceiling is audited and reported as a timeout, not a mystery', async () => {
-    const upstreamPort = freePort();
     const upstream = Bun.serve({
-      port: upstreamPort,
+      port: 0,
       hostname: '127.0.0.1',
       idleTimeout: 0,
       async fetch() { await Bun.sleep(60000); return new Response('never'); },
     });
+    const upstreamPort = upstream.port!;
 
     const { sink, records } = collectingSink();
-    const proxyPort = freePort();
     const proxy = createProxyServer(
       {
-        port: proxyPort,
+        port: 0,
         bind: '127.0.0.1',
         upstream: `http://127.0.0.1:${upstreamPort}`,
         upstreamTimeoutSeconds: 1,
@@ -267,6 +262,7 @@ describe('a slow upstream still gets its real response through the proxy', () =>
       sink,
       null,
     );
+    const proxyPort = proxy.port!;
     await Bun.sleep(50);
 
     try {

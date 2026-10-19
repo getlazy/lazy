@@ -79,9 +79,9 @@ export function tapStorageEvents(storage: Storage): Storage {
   const target = storage;
 
   const overrides: Record<string, (...args: any[]) => any> = {
-    async updateTaskStatus(taskId: string, status: TaskStatus, actor?: ActorInput) {
+    async updateTaskStatus(taskId: string, status: TaskStatus, actor?: ActorInput, reason?: string) {
       const before = await statusBefore(target, taskId);
-      const result = await target.updateTaskStatus(taskId, status, actor);
+      const result = await target.updateTaskStatus(taskId, status, actor, reason);
       await emitStatusChange(target, taskId, before, actor).catch((err) =>
         logger.debug(`event tap: status emit failed: ${err instanceof Error ? err.message : err}`),
       );

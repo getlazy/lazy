@@ -2,7 +2,8 @@ import { existsSync, mkdirSync, readFileSync, appendFileSync } from 'fs';
 import { requireActorIdentity } from '../identity-preflight';
 import { displayId, displayIdFor, validateCode, MAX_TASK_CODE_LENGTH } from '../../task/identity';
 import { join } from 'path';
-import { requireLazyRoot, requireStorage, parseFlags, validateModel } from '../helpers';
+import { requireLazyRoot, requireStorage, parseFlags, validateModel, agentToSend, isBoundClone } from '../helpers';
+import { createShortcutTaskFromBoundClone } from '../bound-clone-create';
 import { openEditor, removeRecoveryFile, readStdinIfPiped } from '../editor';
 import { loadConfig } from '../../config/loader';
 
@@ -156,6 +157,16 @@ export async function commandDocument(args: string[]): Promise<void> {
     : constraints;
 
   const storage = await requireStorage();
+  if (await isBoundClone()) {
+    try {
+      await createShortcutTaskFromBoundClone(storage, {
+        type: 'document', goal, fullPrompt, promptRecoveryPath, code, parentValue, model,
+      });
+    } finally {
+      await storage.close();
+    }
+    return;
+  }
   try {
     // Resolve and validate parent if provided
     let parent: Task | null = null;
@@ -179,13 +190,15 @@ export async function commandDocument(args: string[]): Promise<void> {
       config.agent,
       projectSettings,
     );
-    const t = await storage.createTask(goal, parentTaskId, undefined, code, 'document', agentResolution.agentId);
+    const t = await storage.createTask(goal, parentTaskId, undefined, code, 'document', await agentToSend(agentResolution));
     console.log(`Created task ${displayId(t)}`);
     console.log(`  Goal:   ${t.goal}`);
     console.log(`  Status: ${t.status}`);
     console.log(`  ID:     ${t.id}`);
     console.log(`  Type:   document`);
-    const agentLine = formatAgentResolutionLine(agentResolution);
+    const agentLine = t.agent_id === agentResolution.agentId
+      ? formatAgentResolutionLine(agentResolution)
+      : `  Agent:  ${t.agent_id} (the project's default)`;
     if (agentLine) {
       console.log(agentLine);
     }

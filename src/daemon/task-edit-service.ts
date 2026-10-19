@@ -87,7 +87,7 @@ export function createTaskEditActions(projectRoot: string): TaskActions {
       const result = await withLaunchAllowance(
         'startTask',
         { taskId, actor: 'human', usagePausePastOnce: options?.pastUsagePause === true },
-        () => launchTask(projectRoot, { taskId, actor: 'human', usagePauseOverrideEligible: true, onProgress }),
+        () => launchTask(projectRoot, { taskId, actor: 'human', usagePauseOverrideEligible: true, useDefaultImage: options?.useDefaultImage, onProgress }),
       );
       return { warnings: result.warnings };
     },
@@ -111,7 +111,7 @@ export function createTaskEditActions(projectRoot: string): TaskActions {
       const result = await withLaunchAllowance(
         'resumeTask',
         { taskId, actor: 'human', usagePausePastOnce: options?.pastUsagePause === true },
-        () => daemonResumeTask(projectRoot, { taskId, actor: 'human', usagePauseOverrideEligible: true, onProgress }),
+        () => daemonResumeTask(projectRoot, { taskId, actor: 'human', usagePauseOverrideEligible: true, useDefaultImage: options?.useDefaultImage, onProgress }),
       );
       return { warnings: result.warnings };
     },
@@ -166,9 +166,10 @@ export function createTaskEditActions(projectRoot: string): TaskActions {
       };
     },
 
-    async syncTask(taskId: string, onProgress?: ProgressEmitter): Promise<TaskSyncResult> {
+    async syncTask(taskId: string, onProgress?: ProgressEmitter, options?: TaskLaunchOptions): Promise<TaskSyncResult> {
       const result = await daemonSyncTask(projectRoot, {
         taskId, actor: 'human', usagePauseOverrideEligible: true, onProgress, liftPin: true,
+        useDefaultImage: options?.useDefaultImage,
       });
       return { message: result.message, warnings: result.warnings };
     },

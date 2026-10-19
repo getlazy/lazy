@@ -51,11 +51,7 @@ function isWithin(parent: string, child: string): boolean {
  * whole per-task identity boundary rests on that directory being unreachable
  * from inside a container.
  *
- * It also holds `agent-credentials.json`, the project's stored agent API key
- * (e.g. Cursor's). That key lived under the project root until
- * `fix-cursor-security-musts` moved it here — and the project root IS mounted
- * into every task container read-only, so every agent of every task could read
- * it. Reaching this directory would hand an agent that key back.
+ * It also holds the credential-store index and any file-backend secrets.
  *
  * Lazy's own launch paths honor that (asserted by
  * test/unit/daemon-dir-never-mounted.test.ts). `[[mounts]]` is the one remaining
@@ -267,7 +263,7 @@ export function buildMountArgs(mounts: MountConfigEntry[], paths: MountPaths): s
  * `[docker] run_args` mount, or lazy's own read-write mounts (every task's
  * worktree, the object store, the worktrees' gitdirs) — compared by volume
  * name, and by host path with containment either way ({@link turnWritableIndex}). Turns of other tasks keep
- * running while a member works (only this task's container is stopped), and
+ * running while a member works (every task's, this task's own included), and
  * they mount every entry exactly as configured: an entry without `readonly`
  * is read-write in every one of them, so whatever a turn — prompt-injected or
  * not — writes there (an executable in a cache, toolchain or PATH directory)

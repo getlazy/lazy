@@ -3,12 +3,18 @@ import { commandSystemBuild, systemBuildUsage } from './system-build';
 import { commandOffline, commandOnline, offlineUsage, onlineUsage } from './offline';
 import { commandSystemStatus, systemStatusUsage } from './system-status';
 import { commandExportDockerfile, exportDockerfileUsage } from './export-dockerfile';
-import { commandSystemVerifyHostBoundary, systemVerifyHostBoundaryUsage } from './system-verify-host-boundary';
 import { commandSystemAgent, systemAgentUsage } from './system-agent';
 import { commandSystemPassphrase, systemPassphraseUsage } from './system-passphrase';
 import { commandSystemSourceId, systemSourceIdUsage } from './system-source-id';
+import { commandSystemGuestInitScript, systemGuestInitScriptUsage } from './system-guest-init-script';
 import { commandSystemRepairCommits, systemRepairCommitsUsage } from './system-repair-commits';
 import { commandSystemStoreCheck, systemStoreCheckUsage } from './system-store-check';
+import {
+  commandSystemStoreBackup, commandSystemStoreBackups, commandSystemStoreRestore,
+  systemStoreBackupUsage, systemStoreBackupsUsage, systemStoreRestoreUsage,
+} from './system-store-backup';
+import { commandSystemRunnerImage, systemRunnerImageUsage } from './system-runner-image';
+import { commandSystemMachine, systemMachineUsage } from './system-machine';
 
 export async function commandSystem(args: string[]): Promise<void> {
   const subcommand = args[0];
@@ -36,14 +42,14 @@ export async function commandSystem(args: string[]): Promise<void> {
     case 'status':
       await commandSystemStatus(sub);
       break;
-    case 'verify-host-boundary':
-      await commandSystemVerifyHostBoundary(sub);
-      break;
     case 'agent':
       await commandSystemAgent(sub);
       break;
     case 'passphrase':
       await commandSystemPassphrase(sub);
+      break;
+    case 'guest-init-script':
+      await commandSystemGuestInitScript(sub);
       break;
     case 'source-id':
       await commandSystemSourceId(sub);
@@ -53,6 +59,21 @@ export async function commandSystem(args: string[]): Promise<void> {
       break;
     case 'store-check':
       await commandSystemStoreCheck(sub);
+      break;
+    case 'store-backup':
+      await commandSystemStoreBackup(sub);
+      break;
+    case 'store-backups':
+      await commandSystemStoreBackups(sub);
+      break;
+    case 'store-restore':
+      await commandSystemStoreRestore(sub);
+      break;
+    case 'runner-image':
+      await commandSystemRunnerImage(sub);
+      break;
+    case 'machine':
+      await commandSystemMachine(sub);
       break;
     case 'export-dockerfile':
     // `eject-dockerfile` is the pre-v0.16.x name, kept as a hidden alias for
@@ -83,13 +104,18 @@ export const systemSubcommandUsage: Record<string, () => void> = {
   'agent': systemAgentUsage,
   'passphrase': systemPassphraseUsage,
   'source-id': systemSourceIdUsage,
+  'guest-init-script': systemGuestInitScriptUsage,
   'repair-commits': systemRepairCommitsUsage,
   'store-check': systemStoreCheckUsage,
+  'store-backup': systemStoreBackupUsage,
+  'store-backups': systemStoreBackupsUsage,
+  'store-restore': systemStoreRestoreUsage,
+  'runner-image': systemRunnerImageUsage,
+  'machine': systemMachineUsage,
   'offline': offlineUsage,
   'online': onlineUsage,
   'export-dockerfile': exportDockerfileUsage,
   'eject-dockerfile': exportDockerfileUsage,
-  'verify-host-boundary': systemVerifyHostBoundaryUsage,
 };
 
 export function systemUsage(): void {
@@ -100,8 +126,11 @@ Inspect and prebuild Lazy system internals, and toggle project-wide modes.
 Subcommands:
   prompts            List built-in system prompt templates
   build <name>       Prebuild a lazy system image (bypasses lazy.toml)
+  runner-image       The project's runner image the daemon builds at start: status, log, rebuild, cancel
+  machine            What the project's machine is doing: services, logs, CPU, memory, disk
   status             Show current system state (offline/online, driver, daemon, storage)
   source-id          Print the content identity of this lazy source tree
+  guest-init-script  Write out the daemon image's guest preparation script this lazy carries
   agent              Show agent readiness, switch the default agent, or set an agent API key
   passphrase         Enroll, inspect, or delete this machine's approval passphrase
   offline            Enable offline mode (skip all remote operations)
@@ -109,8 +138,9 @@ Subcommands:
   export-dockerfile  Write the embedded default Dockerfile to disk for customization
   repair-commits     Fix recorded commit lists that name commits a task never made
   store-check <path> Report what a store directory holds, without opening it
-  verify-host-boundary
-                     Verify permissions.deny still confines host agents' file tools
+  store-backup       Copy and verify the store into <store>.backups/ (taken before every upgrade)
+  store-backups      List the store's backups
+  store-restore <b>  Put a backup back (daemon stopped; the current store is moved aside)
 
 System prompts use the 'lazy-prompt-' prefix (e.g. lazy-prompt-system-instructions).
 View any with: lazy show <code>
@@ -124,11 +154,14 @@ Examples:
   lazy system passphrase set                      # Enroll the approval passphrase (masked prompt)
   lazy system passphrase                          # Is one enrolled on this machine?
   lazy system build lazy-runner                   # Prebuild the base runner image
+  lazy system runner-image                        # Is the project's runner image ready?
+  lazy system runner-image log --follow           # Watch its build, step by step
+  lazy system machine --logs                      # Services, their logs, resource use
   lazy system offline                             # Skip all remote operations
   lazy system online                              # Restore remote operations
   lazy system export-dockerfile                   # Write Dockerfile.lazy for customization
   lazy system repair-commits --all                # Which commit lists are wrong?
   lazy system store-check ~/.lazy/my-project      # Is this store safe to hand over?
-  lazy system verify-host-boundary                # Check the host file-tool deny boundary
+  lazy system store-backups                       # Which pre-upgrade backups exist?
   lazy show lazy-prompt-system-instructions       # View a specific system prompt`);
 }

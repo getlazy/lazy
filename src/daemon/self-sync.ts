@@ -14,7 +14,7 @@
  *   step 1 of 2 — `origin/<own branch>` (a colleague pushed to the task branch)
  *   step 2 of 2 — the parent, through `resolveUpstreamMergeRef()`
  *
- * The order is the same load-bearing order sync has always used (see CLAUDE.md,
+ * The order is the same load-bearing order sync has always used (see AGENTS.md,
  * "Upstream merge is sync's job"): the branch must be at its true tip before the
  * parent is merged on top.
  *
@@ -170,6 +170,12 @@ export async function runSelfSync(args: {
   plan: SelfSyncPlanStep[];
   /** Leave a conflicted merge for the calling agent; ordinary sync aborts it before dispatch. */
   leaveConflictInProgress?: boolean;
+  /**
+   * Give each merged step's turn the SHA window it moved the head across.
+   * True ONLY for a host-side sync, where no agent work turn is open to span
+   * the merge; a running agent's own `lazy_sync` leaves it false.
+   */
+  recordShaWindow?: boolean;
 }): Promise<SelfSyncOutcome> {
   const { storage, taskId, sessionId, displayId, worktreePath, plan } = args;
   const leaveConflictInProgress = args.leaveConflictInProgress ?? true;
@@ -206,7 +212,12 @@ export async function runSelfSync(args: {
         head_after: headAfter,
       };
       steps.push(step);
-      await recordSelfSyncTurn(storage, sessionId, describeStep(step));
+      await recordSelfSyncTurn(
+        storage,
+        sessionId,
+        describeStep(step),
+        args.recordShaWindow ? { start: headBefore, end: headAfter } : undefined,
+      );
       continue;
     }
 
@@ -311,7 +322,12 @@ function conflictInstructions(ref: string, files: string[]): string {
  * the calling agent's work turn is still open and its own window already spans
  * these commits, so attaching one here would attribute the same commits twice.
  */
-async function recordSelfSyncTurn(storage: Storage, sessionId: string, content: string): Promise<void> {
+async function recordSelfSyncTurn(
+  storage: Storage,
+  sessionId: string,
+  content: string,
+  shaWindow?: { start: string; end: string },
+): Promise<void> {
   const sequence = await storage.getNextTurnSequence(sessionId);
   await storage.createTurn({
     sessionId,
@@ -325,5 +341,9 @@ async function recordSelfSyncTurn(storage: Storage, sessionId: string, content: 
     actor: await turnChannelActor(storage, sessionId, 'supervisor'),
     autoTriggered: true,
     turnType: 'sync',
+    // Host sync only: with no open work turn, this turn alone owns the head
+    // move, which is what lets final-state see it. Commit RECORDS are still
+    // written once, by recordSessionCommits.
+    ...(shaWindow ? { startSha: shaWindow.start, endSha: shaWindow.end } : {}),
   });
 }

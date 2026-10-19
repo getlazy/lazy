@@ -76,7 +76,7 @@ describe('lazy web task edit', () => {
     expect(v1).toContain('Original prompt text');
   });
 
-  // INVARIANT (CLAUDE.md, "never lose human feedback"): a refused save
+  // INVARIANT (AGENTS.md, "never lose human feedback"): a refused save
   // re-renders from what was TYPED, never from storage. The human's rewritten
   // prompt must survive a validation error on an unrelated field.
   //

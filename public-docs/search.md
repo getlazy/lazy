@@ -190,6 +190,10 @@ Details worth knowing:
 - With `--json`, the hint appears as a top-level `hint` field. The MCP
   `lazy_search` tool returns the same field.
 
+## Searching by id
+
+Paste an id as the whole query — a prefix of at least 6 characters, or the full id — and search lists every entity that id names, ahead of any text matches: tasks, raised items, comments, journal entries, review comments, turns, commits (by SHA), artifacts, system messages and builder conversations. Each hit links to where the entity lives (a comment to its place on the Comments tab, a turn to the Turns tab, a message to its page). An ambiguous prefix lists every match. Id search is skipped with `--fuzzy`. Only id-shaped queries pay for the lookup; ordinary text searches run exactly as before.
+
 ## Result order
 
 Search results come back in a deliberate order, the same one on every surface

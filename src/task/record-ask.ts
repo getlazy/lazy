@@ -111,7 +111,7 @@ function renderCommits(commits: Commit[]): string {
 /**
  * The task's diff, when one can still be produced, or null with a reason.
  *
- * INVARIANT (CLAUDE.md — one resolver decides a task's diff base): the base ref
+ * INVARIANT (AGENTS.md — one resolver decides a task's diff base): the base ref
  * comes from `resolveTaskDiffBase` and nowhere else. When the worktree is gone
  * — the ordinary state of an accepted task — no base is invented here: the ask
  * falls back to the task's commit list, which is stored, plus the model's

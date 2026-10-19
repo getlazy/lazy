@@ -12,7 +12,7 @@
  * The numbers are sized for what artifacts are FOR: a handful of design files,
  * a spec, a screenshot, a report. The motivating incident was nine HTML/CSS/JSON
  * files totalling well under a megabyte. Anything that wants more than this is a
- * blob store, and lazy is not one — see the proxy audit log (CLAUDE.md), which
+ * blob store, and lazy is not one — see the proxy audit log (AGENTS.md), which
  * grew to 677 MiB inside the store and broke a real push.
  */
 
@@ -53,7 +53,7 @@ export class ArtifactLimitError extends Error {
  * one of them, its bytes are freed first — replacing a 900 KB file with another
  * 900 KB file must not fail on a total that is not actually growing.
  *
- * Errors name the actual numbers (CLAUDE.md: errors are for humans, and include
+ * Errors name the actual numbers (AGENTS.md: errors are for humans, and include
  * the values that caused the failure).
  */
 export function assertArtifactWithinLimits(

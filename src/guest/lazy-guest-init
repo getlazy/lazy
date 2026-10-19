@@ -1,0 +1,1230 @@
+#!/bin/sh
+#
+# lazy-guest-init — bring the VM this image boots in to the state lazy's daemon
+# needs. smolvm is the vehicle today; the reasoning below is about the VM, not
+# about smolvm.
+#
+# Two things must be true before a lazy daemon can run a task inside the
+# machine, and neither survives a VM stop/start:
+#
+#   1. Docker's data-root must live on a REAL filesystem. smolvm's guest rootfs
+#      is an overlay whose lower layer is ramfs, which has no file-handle
+#      support, so Docker refuses to stack overlay2 on it (docs/spikes/smolvm.md
+#      §4, gotcha 1). The machine's `--storage` volume is ext4 on /dev/vda and
+#      is mounted at /storage — that is where the data-root goes.
+#   2. dockerd must be running. There is no init system in the guest: libkrunfw
+#      boots an injected /init.krun and the supervisor drives everything through
+#      `machine exec`, so nothing starts a service on our behalf.
+#   3. The daemon's port must be reachable from the VM's published-port relay.
+#      Managed mode pins the daemon to 127.0.0.1, and smolvm's `-p` relay dials
+#      the guest's LINK address, not its loopback (MEASURED, hardware run
+#      20260920-081830: a 127.0.0.1 bind was reset through the mapping, a
+#      0.0.0.0 bind answered). So a forwarder listens on the link address only
+#      and hands each connection to 127.0.0.1:<daemon port>. Link address only
+#      — never 0.0.0.0 — so nothing new is exposed on the docker bridge the
+#      daemon already handles itself (src/daemon/bind-hosts.ts); the link
+#      address is reachable from nowhere but the relay.
+#
+# Mounts and processes do not persist across stop/start, so this script is
+# idempotent and re-runs after every boot. Its readiness marker lives in /run
+# (tmpfs, empty on every boot), which is what makes "has this boot been
+# prepared?" answerable without asking dockerd first — and the forwarder's pid
+# file lives beside it, so "is the forwarder alive?" is answerable from outside
+# (`--print-plan` reports it, and the fleet supervisor reads that when a health
+# check fails, to tell "daemon up, forwarder down" from "daemon down").
+#
+# Delivery: this script travels WITH THE LAZY BINARY, not with the image. It is
+# embedded in the compiled binary; the image's /usr/local/bin/lazy-guest-init is
+# a stable shim that asks `lazy system guest-init-script` to write this out
+# (into the run dir, named by its hash) and runs it. So an in-place lazy swap
+# upgrades it too, and a change here never needs a new guest ABI. A setting
+# that changed with it is applied by --ensure: a forwarder started with other
+# options is restarted (forwarder_spec), while dockerd's config is applied at
+# dockerd's NEXT start, never by killing it (dockerd_config_state).
+#
+# It is invoked automatically by the `lazy` wrapper — the supervisor's only
+# entry point into the guest — and can be run directly, or from a Smolfile
+# `init = ["lazy-guest-init"]` for operators who drive smolvm by hand.
+#
+# Usage:
+#   lazy-guest-init [--ensure] [--force] [--reset-storage] [--stop-docker] [--print-plan] [--timeout N]
+#
+#   --ensure      (default) do nothing if this boot is already prepared, the
+#                 forwarder is alive AND dockerd answers; otherwise prepare what
+#                 is missing — including restarting a dockerd that died
+#   --force       redo the work even if the marker says otherwise
+#   --reset-storage  destroy docker's data-root (every image, container, volume
+#                 and build cache) safely and start dockerd on an empty one,
+#                 narrating each step as `reset_step=…` lines (see below)
+#   --print-plan  print the data-root/driver decision, the overlay diff the
+#                 module's current parameters give dockerd (overlay_diff), and
+#                 the forwarder's bind and liveness, then exit; changes nothing
+#   --stop-docker stop dockerd and containerd GRACEFULLY (SIGTERM, bounded wait,
+#                 never SIGKILL) and flush the disk with `sync`, so a machine
+#                 stop that follows cannot tear a layer dockerd was writing.
+#                 Run by Teams before every `machine stop`; prints
+#                 `docker_stop=stopped|not-running|timed-out`
+#   --timeout N   seconds to wait for dockerd to answer (default 60)
+#
+# Environment overrides (all optional):
+#   LAZY_GUEST_STORAGE_ROOT          where the machine's real disk is mounted
+#                                    (default /storage)
+#   LAZY_GUEST_DOCKER_DATA_ROOT      exact data-root path, skips detection
+#   LAZY_GUEST_DOCKER_STORAGE_DRIVER exact storage driver, skips detection: a
+#                                    containerd snapshotter (overlayfs, native,
+#                                    btrfs) keeps the containerd image store; a
+#                                    legacy graph driver (overlay2, vfs) turns
+#                                    the image store off (the escape hatch)
+#   LAZY_GUEST_DOCKER_DAEMON_JSON    the hand-written dockerd config --print-plan
+#                                    reports as ignored (default
+#                                    /etc/docker/daemon.json; test seam)
+#   LAZY_GUEST_MOUNTS_FILE           mount table to read (default /proc/mounts;
+#                                    the seam the unit test drives)
+#   LAZY_GUEST_DAEMON_PORT           the daemon port the forwarder carries
+#                                    (default 26024, managed mode's pin)
+#   LAZY_GUEST_LINK_ADDRESS          the address the forwarder binds, skips
+#                                    detection (default: the first global IPv4
+#                                    address on a non-loopback interface)
+#   LAZY_GUEST_RUN_DIR               tmpfs dir for markers and pid files
+#                                    (default /run; the seam the unit test drives)
+#   LAZY_GUEST_LOG_DIR               where the guest logs go (default /var/log)
+#   LAZY_GUEST_DOCKERD_MAX_RESTARTS  restarts allowed in the window before this
+#                                    stops restarting dockerd (default 3)
+#   LAZY_GUEST_DOCKERD_RESTART_WINDOW that window in seconds (default 900)
+#   LAZY_GUEST_DOCKERD_HUNG_SECONDS  how long a RUNNING dockerd may fail to
+#                                    answer before it is killed and restarted
+#                                    (default 180 — a slow build is not a hang)
+#   LAZY_GUEST_BUILD_CACHE_MAX       BuildKit's build-cache cap (Docker size
+#                                    syntax; default 40% of the data-root disk)
+#   LAZY_GUEST_OVERLAY_PARAMS_DIR    the overlay module's parameters (default
+#                                    /sys/module/overlay/parameters; test seam)
+#
+# Image store: dockerd always runs on the containerd image store (the
+# "containerd-snapshotter" feature), with the overlayfs snapshotter on a real
+# disk (ext4/xfs/btrfs) and the native snapshotter (containerd's vfs: full
+# copies, no overlay) on the rootfs fallback, where overlay cannot stack. The
+# legacy overlay2 store exports layers through the naive diff too: on a 16 GiB
+# machine every rebuild of a Rust-sized image killed dockerd at "exporting
+# layers", however small the build cache, while the same build on the image
+# store completed (2026-10-12). With the image store on, dockerd refuses the
+# graph-driver names (overlay2, vfs): only snapshotter names are valid.
+#
+# Settings: every dockerd setting except --data-root and --host lives in ONE
+# config file lazy writes before every start (lazy-dockerd.json in the run
+# dir) and passes with --config-file — the image-store feature, the storage
+# driver and the BuildKit GC limits — so a watchdog restart gets exactly what
+# the first start got. Passing --config-file means dockerd never reads
+# /etc/docker/daemon.json: a hand-written one is ignored (never touched)
+# rather than colliding with a flag ("conflicting options"), and --print-plan
+# says so (docker_daemon_json=ignored).
+#
+# Build cache bound: the same config enables BuildKit's garbage collection
+# under a disk-relative cap (on the image store this bounds disk, not memory),
+# and dockerd starts after an ATTEMPT to turn the overlay module's
+# redirect_dir and metacopy defaults OFF. With either on (the guest kernel builds
+# CONFIG_OVERLAY_FS_REDIRECT_DIR in) Docker's
+# overlay2 falls back to the "naive" diff, which sizes every cache record by
+# diffing whole layer trees: BuildKit's disk-usage pass over a Rust-sized cache
+# ran dozens of those at once and drove dockerd from 86MB to 7GB in seconds,
+# OOM-killing it on every start. Native diff sizes a layer by walking its own
+# upper directory. Both are module defaults read when an overlay is mounted
+# (and when dockerd probes for native diff at startup), so setting them before
+# dockerd starts is enough. `overlay_diff=native|naive|unknown` reports the
+# outcome; the first native start prunes the old cache once (see
+# migrate_to_native_diff). They are only touched when the driver is
+# overlay-based (overlay_diff=none otherwise).
+#
+# The attempt FAILS on smolvm machines: the guest's /sys is mounted read-only
+# (measured on token-watch, 2026-10-15: "Read-only file system", redirect_dir
+# stayed Y), so they run with overlay_diff=naive. The warning names the write's
+# error and --print-plan reports overlay_diff, so it is never silent. What it
+# costs under the image store (what every lazy guest runs): the memory fix of
+# 2026-10-12/14 does not rest on these settings — moving off overlay2 is what
+# ended the OOMs at "exporting layers" (measured, see "Image store" above: the
+# build that killed dockerd on overlay2 completed on the image store, with
+# these settings in whatever state they were). What remains: BuildKit (v0.33.1, vendored by
+# Docker 29.8.2) exports a layer with its overlay differ, which refuses an
+# upper dir holding a redirect ("redirect_dir is used but it's not supported
+# in overlayfs differ"), and then falls back to containerd's walking differ,
+# which compares the whole trees — slower and heavier, and only for a RUN step
+# that renamed a directory. Correct either way; it is not data loss.
+#
+# dockerd supervision: there is no init system to restart dockerd, so `--ensure`
+# does. Every `lazy` invocation runs it, and the managed daemon also runs it on
+# a timer and before giving up on a build or launch. When the marker says this
+# boot already had a dockerd but it no longer answers, the death is RECORDED
+# first — dockerd's exit status (written by the shell that started it), the
+# tail of the dockerd log, and any kernel OOM lines — to
+# lazy-dockerd-restarts.log, then dockerd is started again after a backoff.
+# Past the restart budget it stops and says so (reason=dockerd-crash-loop)
+# rather than flapping.
+#
+# A restart a PERSON asked for is not a death. God mode's Restart (the project
+# daemon's restartMachineService) writes the epoch to
+# lazy-dockerd.restart-requested in the run dir BEFORE it stops dockerd; while
+# that request is fresh (5 minutes), whichever run finds dockerd gone logs
+# "restart requested from god mode" instead of a death record, adds no entry to
+# the restart budget, and lifts a crash-loop refusal — the maintainer asked.
+# An --ensure that finds the requested dockerd still stopping leaves it alone
+# (reason=dockerd-restart-requested): the daemon's own --force finishes it.
+#
+# --reset-storage is the safe form of `rm -rf <data-root>`. A dockerd that was
+# killed (an OOM kill, a crash loop) leaves its overlay `merged` mounts in
+# place, so a plain rm hits hundreds of "Read-only file system" errors and
+# leaves the store half deleted. In order: refuse any data-root that is not a
+# directory named `docker`; hold the init lock and write
+# lazy-dockerd.reset-in-progress (a live `--ensure` then answers
+# reason=docker-storage-reset-running instead of starting dockerd against a
+# store being removed); stop dockerd, then containerd and the shims (they hold
+# the mounts); unmount everything under the data-root, deepest first, `umount
+# -l` when a plain unmount fails; refuse to remove anything while a mount
+# remains; remove the CONTENTS with `rm -rf --one-file-system` (so even a mount
+# missed can never be crossed); and fall through to the normal dockerd start.
+# Every step is a `reset_step=<words>` line, in order, as it happens. It ends
+# with reset_result=done|failed (+ reset_reason) and reset_freed_kb; a failed
+# reset still starts dockerd again, so the machine is never left without it.
+# It lifts the crash-loop refusal and clears the restart budget: someone asked.
+#
+# Prints `key=value` lines and exits non-zero when the guest is NOT ready — the
+# caller decides how much that matters (`lazy --version` does not need docker;
+# `lazy daemon start` does).
+
+set -eu
+
+MODE=ensure
+TIMEOUT=60
+RUN_DIR="${LAZY_GUEST_RUN_DIR:-/run}"
+LOG_DIR="${LAZY_GUEST_LOG_DIR:-/var/log}"
+MARKER="$RUN_DIR/lazy-guest-ready"
+LOCK="$RUN_DIR/lazy-guest-init.lock"
+DOCKERD_LOG="$LOG_DIR/lazy-dockerd.log"
+DOCKERD_PID="$RUN_DIR/lazy-dockerd.pid"
+DOCKERD_EXIT="$RUN_DIR/lazy-dockerd.exit"
+DOCKERD_START="$RUN_DIR/lazy-dockerd.start"
+DOCKERD_OOM_MEM="$RUN_DIR/lazy-dockerd.oom-mem"
+# The cgroup v2 oom_kill counter at this instance's start (removed again if
+# dockerd's wrapper could not verify it joined the cgroup).
+DOCKERD_CG_BASE="$RUN_DIR/lazy-dockerd.oom-kill-base"
+CG_ROOT="${LAZY_GUEST_CGROUP_ROOT:-/sys/fs/cgroup}"
+DOCKERD_CG="$CG_ROOT/lazy-dockerd"
+DOCKERD_RESTARTS="$RUN_DIR/lazy-dockerd.restarts"
+DOCKERD_HISTORY="$LOG_DIR/lazy-dockerd-restarts.log"
+MAX_RESTARTS="${LAZY_GUEST_DOCKERD_MAX_RESTARTS:-3}"
+RESTART_WINDOW="${LAZY_GUEST_DOCKERD_RESTART_WINDOW:-900}"
+HUNG_SECONDS="${LAZY_GUEST_DOCKERD_HUNG_SECONDS:-180}"
+DOCKERD_GAVE_UP="$RUN_DIR/lazy-dockerd.gave-up"
+DOCKERD_UNRESPONSIVE="$RUN_DIR/lazy-dockerd.unresponsive-since"
+DOCKERD_RESTART_REQUESTED="$RUN_DIR/lazy-dockerd.restart-requested"
+RESTART_REQUEST_TTL=300
+RESET_IN_PROGRESS="$RUN_DIR/lazy-dockerd.reset-in-progress"
+# Written by --stop-docker: the machine is about to stop, so --ensure must not
+# start dockerd again (or record a death) for MACHINE_STOPPING_TTL seconds.
+MACHINE_STOPPING="$RUN_DIR/lazy-dockerd.machine-stopping"
+MACHINE_STOPPING_TTL=300
+# How long --stop-docker waits for the guest-init lock before stopping anyway.
+STOP_LOCK_WAIT="${LAZY_GUEST_STOP_LOCK_WAIT:-20}"
+FORWARDER_PID="$RUN_DIR/lazy-guest-forwarder.pid"
+FORWARDER_SPEC="$RUN_DIR/lazy-guest-forwarder.spec"
+FORWARDER_LOG="$LOG_DIR/lazy-forwarder.log"
+MOUNTS="${LAZY_GUEST_MOUNTS_FILE:-/proc/mounts}"
+STORAGE_ROOT="${LAZY_GUEST_STORAGE_ROOT:-/storage}"
+DAEMON_PORT="${LAZY_GUEST_DAEMON_PORT:-26024}"
+BUILD_CACHE_MAX_OVERRIDE="${LAZY_GUEST_BUILD_CACHE_MAX:-}"
+OVERLAY_PARAMS="${LAZY_GUEST_OVERLAY_PARAMS_DIR:-/sys/module/overlay/parameters}"
+DOCKERD_CONFIG="$RUN_DIR/lazy-dockerd.json"
+DOCKER_DAEMON_JSON="${LAZY_GUEST_DOCKER_DAEMON_JSON:-/etc/docker/daemon.json}"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --ensure) MODE=ensure; shift ;;
+    --force) MODE=force; shift ;;
+    --reset-storage) MODE=reset; shift ;;
+    --print-plan) MODE=plan; shift ;;
+    --stop-docker) MODE=stop-docker; shift ;;
+    --timeout)
+      TIMEOUT="${2:-}"
+      [ -n "$TIMEOUT" ] || { echo "lazy-guest-init: --timeout requires a value" >&2; exit 2; }
+      shift 2
+      ;;
+    -h|--help)
+      sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      echo "lazy-guest-init: unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+emit() { printf '%s=%s\n' "$1" "$2"; }
+
+# ── stopping docker before the machine stops ─────────────────────────────────
+#
+# A `machine stop` with dockerd still running loses whatever the guest had not
+# yet written to the disk: a layer containerd recorded as committed can come
+# back torn ("failed to extract layer … invalid tar header", 2026-10-14/15).
+# So Teams asks for this first. SIGTERM only: dockerd stops its containers and
+# containerd and flushes its metadata; a SIGKILL would be no better than the
+# power-off that follows. The machine-stopping marker keeps every --ensure
+# before the power-off (a build or launch, the daemon watchdog) from starting
+# dockerd again or recording a death; it lapses after MACHINE_STOPPING_TTL, so
+# a stop that never happened heals by itself.
+if [ "$MODE" = stop-docker ]; then
+  date +%s >"$MACHINE_STOPPING" 2>/dev/null || true
+  # Then the lock, so an --ensure already past its marker check (queued on the
+  # lock, or starting dockerd right now) finishes first and is stopped below,
+  # rather than winning the lock after this and starting dockerd under the
+  # power-off; an --ensure that wins the lock reads the marker again. The wait
+  # is bounded on its own (STOP_LOCK_WAIT, never --timeout), because the stop
+  # must still reach dockerd within the time Teams gives the whole exec: a
+  # holder that is slow or dead is waited out and the stop goes ahead.
+  waited=0
+  while ! mkdir "$LOCK" 2>/dev/null; do
+    waited=$((waited + 1))
+    [ "$waited" -gt "$STOP_LOCK_WAIT" ] && break
+    sleep 1
+  done
+  if [ "$waited" -le "$STOP_LOCK_WAIT" ]; then trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM; fi
+  result=not-running
+  pid="$(cat "$DOCKERD_PID" 2>/dev/null || true)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    n=0
+    while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 45 ]; do sleep 1; n=$((n + 1)); done
+    if kill -0 "$pid" 2>/dev/null; then result=timed-out; else result=stopped; fi
+  fi
+  # A containerd dockerd did not take with it (it outlives a killed dockerd).
+  pkill -TERM -x containerd 2>/dev/null || true
+  n=0
+  while pgrep -x containerd >/dev/null 2>&1 && [ "$n" -lt 15 ]; do sleep 1; n=$((n + 1)); done
+  # Only Docker's disk: a global sync would also block on a hung shared folder.
+  if [ -d "$STORAGE_ROOT" ]; then sync -f "$STORAGE_ROOT" 2>/dev/null || sync; else sync; fi
+  emit docker_stop "$result"
+  exit 0
+fi
+warn() { printf 'lazy-guest-init: %s\n' "$1" >&2; }
+
+# Filesystem type of the mount point covering $1, from the mount table. Longest
+# matching mount path wins, which is how a nested mount is attributed correctly.
+fs_type_of() {
+  target="$1"
+  [ -r "$MOUNTS" ] || { echo ""; return 0; }
+  awk -v target="$target" '
+    {
+      point = $2; type = $3
+      if (point == "/") { prefix = "/" } else { prefix = point "/" }
+      if (target == point || index(target, prefix) == 1) {
+        if (length(point) >= best_len) { best_len = length(point); best = type }
+      }
+    }
+    END { print best }
+  ' "$MOUNTS"
+}
+
+# overlay2 needs a lower layer with file-handle support. ext4/xfs/btrfs have it;
+# the guest rootfs overlay (ramfs lower) does not, and virtiofs is a host
+# passthrough that Docker does not support as a data-root either.
+# Under the containerd image store the "driver" is a containerd snapshotter:
+# overlayfs has the same lower-layer needs overlay2 had, and native (full
+# copies, containerd's vfs) works anywhere.
+driver_for_fs() {
+  case "$1" in
+    ext4|xfs|btrfs) echo overlayfs ;;
+    *) echo native ;;
+  esac
+}
+
+# containerd, or graphdriver when a legacy driver name was forced through
+# LAZY_GUEST_DOCKER_STORAGE_DRIVER — dockerd refuses a graph driver with the
+# image store on, so naming one turns the store off.
+image_store_for_driver() {
+  case "$1" in
+    overlay2|vfs|devicemapper|fuse-overlayfs|zfs|aufs) echo graphdriver ;;
+    *) echo containerd ;;
+  esac
+}
+
+# Is the storage driver overlay-based (so the overlay module's defaults matter)?
+driver_uses_overlay() {
+  case "$STORAGE_DRIVER" in overlayfs|overlay2) return 0 ;; *) return 1 ;; esac
+}
+
+# ignored | absent: a hand-written /etc/docker/daemon.json is never read —
+# --config-file replaces it — and never touched.
+daemon_json_state() {
+  if [ -e "$DOCKER_DAEMON_JSON" ]; then echo ignored; else echo absent; fi
+}
+
+# The first real block filesystem that is not the rootfs, so a machine whose
+# disk is mounted somewhere other than /storage still gets overlayfs.
+first_block_mount() {
+  [ -r "$MOUNTS" ] || { echo ""; return 0; }
+  awk '$2 != "/" && ($3 == "ext4" || $3 == "xfs" || $3 == "btrfs") { print $2; exit }' "$MOUNTS"
+}
+
+# Turn off the overlay features that force Docker's naive diff (see the header)
+# and say which diff dockerd will get: native, naive, or unknown when the
+# module's parameters are not visible at all (no evidence either way).
+# redirect_always_follow is turned ON so redirects already on disk, written
+# while redirect_dir was on, are still followed when read.
+# The diff the overlay module's CURRENT parameters give dockerd, changing
+# nothing: native, naive, or unknown when the parameters are not visible.
+current_overlay_diff() {
+  [ -d "$OVERLAY_PARAMS" ] || { echo unknown; return 0; }
+  for param in redirect_dir metacopy; do
+    case "$(cat "$OVERLAY_PARAMS/$param" 2>/dev/null)" in Y|y|1|on) echo naive; return 0 ;; esac
+  done
+  echo native
+}
+
+# Whether lazy can change the overlay module's parameters at all: writable,
+# read-only (a read-only /sys, as on smolvm), or absent. Changes nothing.
+overlay_params_state() {
+  [ -f "$OVERLAY_PARAMS/redirect_dir" ] || { echo absent; return 0; }
+  if [ -w "$OVERLAY_PARAMS/redirect_dir" ]; then echo writable; else echo read-only; fi
+}
+
+prefer_native_overlay_diff() {
+  if [ ! -d "$OVERLAY_PARAMS" ]; then
+    warn "overlay module parameters not found (${OVERLAY_PARAMS}); cannot tell whether docker will use the native or the naive diff"
+    echo unknown
+    return 0
+  fi
+  result=native
+  for param in redirect_dir metacopy; do
+    f="$OVERLAY_PARAMS/$param"
+    [ -f "$f" ] || continue
+    write_err=""
+    case "$(cat "$f" 2>/dev/null)" in
+      # The write's own error is kept for the warning: a field machine kept
+      # redirect_dir=Y with nothing saying why (2026-10-15).
+      Y|y|1|on) write_err="$( { printf N >"$f"; } 2>&1 )" || true ;;
+    esac
+    case "$(cat "$f" 2>/dev/null)" in
+      Y|y|1|on) warn "could not turn off overlay ${param} (${f}${write_err:+: ${write_err}}); docker will size layers with the naive diff, which a large build cache can drive out of memory"; result=naive ;;
+    esac
+  done
+  f="$OVERLAY_PARAMS/redirect_always_follow"
+  if [ -f "$f" ]; then
+    case "$(cat "$f" 2>/dev/null)" in
+      Y|y|1|on) ;;
+      *) printf 'Y' 2>/dev/null >"$f" || warn "could not turn on overlay redirect_always_follow (${f})" ;;
+    esac
+  fi
+  echo "$result"
+}
+
+is_size() {
+  printf '%s' "$1" | grep -Eq '^[0-9]+(\.[0-9]+)?[A-Za-z]{0,3}$'
+}
+
+# The build cache's limits, in Docker 29's terms (builder.gc.default*Space):
+# GC prunes the cache down once it exceeds BUILD_CACHE_MAX or the disk has
+# less than BUILD_CACHE_MIN_FREE free, and never below BUILD_CACHE_RESERVED.
+# (The older defaultKeepStorage is, since Docker 28, only the reserved FLOOR —
+# not a cap.) By default the cap is 40% of the data-root's disk and the free
+# floor 20%, so an 8–256 GiB machine disk keeps room for images and task
+# containers while builds stay warm up to the cap.
+compute_cache_limits() {
+  disk_gb=""
+  probe="$DATA_ROOT"
+  [ -d "$probe" ] || probe="$(dirname "$probe")"
+  disk_kb="$(df -Pk "$probe" 2>/dev/null | awk 'NR == 2 { print $2 }')"
+  case "$disk_kb" in ''|*[!0-9]*) ;; *) disk_gb=$((disk_kb / 1048576)) ;; esac
+  if [ -n "$disk_gb" ] && [ "$disk_gb" -gt 0 ]; then
+    max=$((disk_gb * 40 / 100)); [ "$max" -ge 2 ] || max=2
+    free=$((disk_gb * 20 / 100)); [ "$free" -ge 1 ] || free=1
+    BUILD_CACHE_MAX="${max}GB"
+    BUILD_CACHE_MIN_FREE="${free}GB"
+  else
+    BUILD_CACHE_MAX=10GB
+    BUILD_CACHE_MIN_FREE=4GB
+  fi
+  BUILD_CACHE_RESERVED=1GB
+  if [ -n "$BUILD_CACHE_MAX_OVERRIDE" ]; then
+    if is_size "$BUILD_CACHE_MAX_OVERRIDE"; then
+      BUILD_CACHE_MAX="$BUILD_CACHE_MAX_OVERRIDE"
+    else
+      warn "LAZY_GUEST_BUILD_CACHE_MAX='${BUILD_CACHE_MAX_OVERRIDE}' is not a size; using ${BUILD_CACHE_MAX}"
+    fi
+  fi
+}
+
+# The config dockerd starts with. Rewritten on every start, so a changed limit
+# applies from the next dockerd start.
+# builder.gc is dockerd's own BuildKit section, the same keys on either store.
+render_dockerd_config() {
+  if [ "$IMAGE_STORE" = containerd ]; then snapshotter=true; else snapshotter=false; fi
+  printf '{\n  "storage-driver": "%s",\n  "features": {\n    "containerd-snapshotter": %s\n  },\n  "builder": {\n    "gc": {\n      "enabled": true,\n      "defaultReservedSpace": "%s",\n      "defaultMaxUsedSpace": "%s",\n      "defaultMinFreeSpace": "%s"\n    }\n  }\n}\n' \
+    "$STORAGE_DRIVER" "$snapshotter" "$BUILD_CACHE_RESERVED" "$BUILD_CACHE_MAX" "$BUILD_CACHE_MIN_FREE"
+}
+write_dockerd_config() { render_dockerd_config >"$DOCKERD_CONFIG"; }
+
+# Whether the RUNNING dockerd has the settings this lazy would give it:
+# none (no dockerd started this boot) | current | pending-restart. A lazy
+# swapped in place may want other settings than the one that started dockerd;
+# they are NEVER applied by killing dockerd here — a build or a task may be
+# mid-flight, and stopping dockerd belongs to the quiesce rules and to a person
+# (god mode's Restart). They apply at dockerd's next start, whatever starts it:
+# the watchdog after a death, a requested restart, a machine boot.
+# Needs compute_cache_limits first.
+dockerd_config_state() {
+  [ -f "$DOCKERD_CONFIG" ] || { echo none; return 0; }
+  if [ "$(render_dockerd_config)" = "$(cat "$DOCKERD_CONFIG" 2>/dev/null)" ]; then echo current; else echo pending-restart; fi
+}
+
+# Which lazy-guest-init this is: the first 16 hex of its own sha256. The image
+# carries only a shim; this script is embedded in the lazy binary and written
+# out by `lazy system guest-init-script`, whose `--id` prints the same number —
+# which is how the fleet proves an in-place roll runs the new script.
+guest_init_id() {
+  # sha256sum in the guest (Debian); shasum or openssl where it is absent (macOS),
+  # so the tests that run this script on a Mac get a real id too.
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$0" | cut -c1-16
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$0" | cut -c1-16
+  elif command -v openssl >/dev/null 2>&1; then openssl dgst -sha256 -r "$0" | cut -c1-16
+  else echo unknown; fi
+}
+
+# One-time cache reset when this data-root first runs with the native diff.
+# Records BuildKit committed while redirect_dir was on can hold overlay
+# redirect directories, which the native diff cannot represent: exported into
+# an image, such a record would silently lose files. So the first native-diff
+# start of a data-root with BuildKit state prunes the whole build cache once,
+# in the background (sizing is cheap now, but the delete can take a while),
+# and records the switch in a marker on the disk. A failed prune leaves no
+# marker and is retried at the next dockerd start. Prints what it did.
+NATIVE_DIFF_MARKER_NAME=.lazy-native-diff
+migrate_to_native_diff() {
+  marker="$DATA_ROOT/$NATIVE_DIFF_MARKER_NAME"
+  [ "$OVERLAY_DIFF" = native ] || { echo skipped; return 0; }
+  [ -f "$marker" ] && { echo done; return 0; }
+  # A reset just emptied the store: nothing to prune, so record the switch as done.
+  if [ "${RESET_RESULT:-}" = done ]; then : >"$marker"; echo none; return 0; fi
+  if [ ! -d "$DATA_ROOT/buildkit" ]; then
+    : >"$marker"
+    echo none
+    return 0
+  fi
+  echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) lazy-guest-init: first start with the native overlay diff; pruning the build cache once" >>"$DOCKERD_LOG"
+  bound=""
+  command -v timeout >/dev/null 2>&1 && bound="timeout 3600"
+  setsid sh -c 'if $0 docker builder prune --all --force >>"$1" 2>&1; then : >"$2"; echo "=== build cache pruned for the native diff" >>"$1"; else echo "=== build cache prune failed; retried at the next dockerd start" >>"$1"; fi' \
+    "$bound" "$DOCKERD_LOG" "$marker" </dev/null >/dev/null 2>&1 &
+  echo pruning
+}
+
+# ── the forwarder: link address → 127.0.0.1:<daemon port> ────────────────────
+
+# The address the VM's relay dials: the first global-scope IPv4 address on a
+# non-loopback interface (100.96.0.2 on smolvm's /30 link; 172.17.x when this
+# image runs as a plain container). Discovered, never hardcoded — the vehicle
+# owns the number.
+link_address() {
+  if [ -n "${LAZY_GUEST_LINK_ADDRESS:-}" ]; then
+    echo "$LAZY_GUEST_LINK_ADDRESS"
+    return 0
+  fi
+  if command -v ip >/dev/null 2>&1; then
+    ip -4 -o addr show scope global 2>/dev/null | awk '$2 != "lo" { split($4, a, "/"); print a[1]; exit }'
+  elif command -v hostname >/dev/null 2>&1; then
+    # A guest without iproute2 (not this image, which installs it) still has
+    # the libc answer.
+    hostname -I 2>/dev/null | awk '{ print $1 }'
+  else
+    echo ""
+  fi
+}
+
+# alive | dead | not-started, from the pid file alone (so it works from
+# --print-plan, which must change nothing, and from the fleet supervisor's
+# diagnosis over `machine exec`).
+forwarder_state() {
+  [ -f "$FORWARDER_PID" ] || { echo not-started; return 0; }
+  pid="$(cat "$FORWARDER_PID" 2>/dev/null)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo alive; else echo dead; fi
+}
+
+# The forwarder's whole command line for a link address, in FWD_LISTEN /
+# FWD_TARGET, and as one string (FWD_SPEC) recorded beside its pid at start.
+# A forwarder alive under any OTHER spec was started by an earlier lazy (this
+# script travels with the binary and is upgraded in place), so --ensure
+# restarts it: that is how a changed socat option reaches a machine without
+# replacing it.
+forwarder_spec_for() {
+  FWD_LISTEN="TCP4-LISTEN:${DAEMON_PORT},bind=${1},reuseaddr,fork,backlog=1024"
+  FWD_TARGET="TCP4:127.0.0.1:${DAEMON_PORT}"
+  FWD_SPEC="socat -d ${FWD_LISTEN} ${FWD_TARGET}"
+}
+
+# current | stale | none — stale when the live forwarder's recorded spec (or
+# no record: an older script started it) differs from this script's.
+forwarder_spec_state() {
+  [ "$(forwarder_state)" = alive ] || { echo none; return 0; }
+  spec_link="$(link_address)"
+  [ -n "$spec_link" ] || { echo none; return 0; }
+  forwarder_spec_for "$spec_link"
+  if [ "$(cat "$FORWARDER_SPEC" 2>/dev/null || true)" = "$FWD_SPEC" ]; then echo current; else echo stale; fi
+}
+
+forwarder_listening() {
+  command -v ss >/dev/null 2>&1 || return 0
+  ss -Hltn 2>/dev/null | grep -q "[[:space:]]$1:$2[[:space:]]"
+}
+
+# socat: in Debian's main archive, ~400 KB, and the same tool `lazy forward`
+# already relies on inside task containers (src/serve/forward.ts). `fork` gives
+# one child per connection; `reuseaddr` lets a fast restart rebind. Bound with
+# `bind=<link>` and nothing else — the whole point is NOT to widen the daemon's
+# exposure beyond the one address only the relay can reach.
+#
+# `backlog=1024`: socat's own listen backlog defaults to 5, and connections
+# arriving faster than socat forks were RESET. A dev server's page load (one
+# request per module, hundreds at once, each a fresh connection through Teams'
+# service proxy) lost about half of them that way, and Teams answered each with
+# a 502. The kernel still caps the value at net.core.somaxconn.
+ensure_forwarder() {
+  link="$(link_address)"
+  if [ -z "$link" ]; then
+    emit forwarder skipped
+    emit forwarder_reason no-link-address
+    return 0
+  fi
+  emit forwarder_bind "$link:$DAEMON_PORT"
+  forwarder_spec_for "$link"
+  if [ "$(forwarder_state)" = alive ]; then
+    if [ "$(cat "$FORWARDER_SPEC" 2>/dev/null || true)" = "$FWD_SPEC" ]; then
+      emit forwarder alive
+      emit forwarder_pid "$(cat "$FORWARDER_PID")"
+      return 0
+    fi
+    # Started by an earlier lazy with other options. Only the LISTENER is
+    # stopped: the per-connection children it forked keep their connections
+    # to the end, and reuseaddr lets the new listener bind at once.
+    old_pid="$(cat "$FORWARDER_PID")"
+    kill "$old_pid" 2>/dev/null || true
+    n=0
+    while kill -0 "$old_pid" 2>/dev/null && [ "$n" -lt 10 ]; do sleep 0.5; n=$((n + 1)); done
+    kill -9 "$old_pid" 2>/dev/null || true
+    mkdir -p "$(dirname "$FORWARDER_LOG")"
+    echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) lazy-guest-init: restarting the forwarder (pid ${old_pid}): its options changed; now ${FWD_SPEC}" >>"$FORWARDER_LOG"
+    emit forwarder_restarted options-changed
+  fi
+  if ! command -v socat >/dev/null 2>&1; then
+    warn "socat is not installed in this guest image — the daemon's port cannot be reached through the VM's relay"
+    emit forwarder no
+    emit forwarder_reason no-socat
+    return 1
+  fi
+  rm -f "$FORWARDER_PID" "$FORWARDER_SPEC"
+  mkdir -p "$(dirname "$FORWARDER_LOG")"
+  setsid socat -d "$FWD_LISTEN" "$FWD_TARGET" >>"$FORWARDER_LOG" 2>&1 &
+  echo $! >"$FORWARDER_PID"
+  printf '%s\n' "$FWD_SPEC" >"$FORWARDER_SPEC"
+  waited=0
+  while [ "$waited" -lt 10 ]; do
+    if forwarder_listening "$link" "$DAEMON_PORT" && [ "$(forwarder_state)" = alive ]; then
+      emit forwarder started
+      emit forwarder_pid "$(cat "$FORWARDER_PID")"
+      return 0
+    fi
+    [ "$(forwarder_state)" = alive ] || break
+    waited=$((waited + 1))
+    sleep 0.5
+  done
+  warn "the forwarder did not come up on ${link}:${DAEMON_PORT}; last lines of ${FORWARDER_LOG}:"
+  tail -n 5 "$FORWARDER_LOG" >&2 2>/dev/null || true
+  emit forwarder no
+  emit forwarder_reason forwarder-failed
+  return 1
+}
+
+# ── dockerd liveness and death records ────────────────────────────────────────
+
+# Does dockerd answer? Bounded: a hung dockerd must not hang every `lazy` call.
+docker_answers() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 15 docker info >/dev/null 2>&1
+  else
+    docker info >/dev/null 2>&1
+  fi
+}
+
+# Restarts within the window, from the per-boot record (one epoch per line).
+recent_restarts() {
+  [ -f "$DOCKERD_RESTARTS" ] || { echo 0; return 0; }
+  awk -v now="$(date +%s)" -v win="$RESTART_WINDOW" 'now - $1 <= win { n++ } END { print n + 0 }' "$DOCKERD_RESTARTS"
+}
+
+# Write down why dockerd is gone BEFORE anything restarts it, so the evidence is
+# not overwritten. Appends one block to the history log (which the daemon and
+# Lazy Teams read) and echoes a one-word cause for the key=value report.
+record_dockerd_death() {
+  exit_status=unknown
+  [ -f "$DOCKERD_EXIT" ] && exit_status="$(cat "$DOCKERD_EXIT" 2>/dev/null || echo unknown)"
+  pid="$(cat "$DOCKERD_PID" 2>/dev/null || true)"
+  # Kernel OOM lines are EVIDENCE, not a diagnosis: the ring buffer keeps old
+  # kills and kills of other processes. Only a kill attributable to THIS dockerd
+  # instance (the matching rule below) attributes the death to the OOM killer; anything
+  # else is copied into the record as uncorrelated context and the cause stays
+  # what the exit status says.
+  # One OOM event prints several matching lines, so the match searches the
+  # WHOLE buffer (a later kill must not push dockerd's line out), and needs the
+  # process name too, since a pid can be reused within a boot.
+  kernel="$(dmesg 2>/dev/null || true)"
+  oom="$(printf '%s\n' "$kernel" | grep -iE 'out of memory|oom-kill|oom_reaper|killed process' | tail -n 5 || true)"
+  oom_match=""
+  # A pid is reused within a boot, so name AND pid are not enough: the kill's
+  # kernel timestamp (seconds since boot, dmesg's default clock) must not
+  # predate this instance's start (/proc starttime on the same clock, recorded
+  # at launch). Without a start time or a kernel timestamp the kill stays
+  # unconfirmed context.
+  started="$(cat "$DOCKERD_START" 2>/dev/null || true)"
+  # How a kill is attributed to THIS instance, strongest first. The pid in
+  # /run/lazy-dockerd.pid is the one this guest's /proc shows, while the kernel
+  # logs pids in its own namespace; `machine exec` runs in a nested pid
+  # namespace whose offset is not constant, so exact pid equality cannot work
+  # (seen: the kill named a dockerd ~1600 higher than the pid file).
+  #   1. cgroup v2: dockerd runs in its own cgroup and memory.events oom_kill
+  #      rose across the instance's lifetime - names an OOM of THIS instance, no pid.
+  #      Used only when dockerd verifiably joined the cgroup, and only for a
+  #      SIGKILL-like end (exit 137 or no exit status): a child OOM-killed long
+  #      before an unrelated exit must not be blamed for it.
+  #   2. a kill naming the recorded pid.
+  #   3. fallback, only when no cgroup counter exists: an instance that exited
+  #      137 (SIGKILL) with exactly ONE distinct dockerd pid killed in its
+  #      lifetime (two are ambiguous, e.g. a nested dockerd).
+  # Kills before the instance's start never count; the rest is context.
+  cg_known=0; cg_oom=0
+  if [ -r "$DOCKERD_CG_BASE" ] && [ -r "$DOCKERD_CG/memory.events" ]; then
+    cg_base="$(cat "$DOCKERD_CG_BASE" 2>/dev/null || true)"
+    cg_now="$(awk '$1 == "oom_kill" { print $2; exit }' "$DOCKERD_CG/memory.events" 2>/dev/null || true)"
+    case "$cg_base$cg_now" in
+      ''|*[!0-9]*) ;;
+      *)
+        cg_known=1
+        if [ "$cg_now" -gt "$cg_base" ] && { [ "$exit_status" = 137 ] || [ "$exit_status" = unknown ]; }; then cg_oom=1; fi ;;
+    esac
+  fi
+  if [ -n "$started" ]; then
+    fallback=0; [ "$exit_status" = 137 ] && [ "$cg_known" = 0 ] && fallback=1
+    oom_match="$(printf '%s\n' "$kernel" | grep -E "[Kk]illed process [0-9]+ \(dockerd\)" | awk -v start="$started" -v pid="${pid:-0}" -v fallback="$fallback" -v cgoom="$cg_oom" '
+      match($0, /^\[ *[0-9]+\.[0-9]+\]/) {
+        ts = substr($0, RSTART + 1, RLENGTH - 2) + 0
+        if (ts < start + 0) next
+        kpid = $0; sub(/.*illed process /, "", kpid); sub(/ .*/, "", kpid)
+        if (!(kpid in seen)) { seen[kpid] = 1; distinct++ }
+        last = $0
+        if (kpid == pid) exact = $0
+      }
+      END {
+        if (exact != "") print exact
+        else if (cgoom == 1 && last != "") print last
+        else if (fallback == 1 && distinct == 1) print last
+      }' || true)"
+  fi
+  oom_matched=0
+  if [ "$cg_oom" = 1 ] || [ -n "$oom_match" ]; then oom_matched=1; fi
+  cause="exited-${exit_status}"
+  if [ "$exit_status" = unknown ]; then
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then cause=not-answering; else cause=gone; fi
+  fi
+  [ "$oom_matched" = 1 ] && cause="${cause}+oom-killer"
+  oom_used_kb=""; oom_machine_kb=""
+  rm -f "$DOCKERD_OOM_MEM"
+  if [ -n "$oom_match" ]; then
+    oom_used_kb="$(printf '%s\n' "$oom_match" | sed -n 's/.*anon-rss:\([0-9]*\)kB.*/\1/p' | tail -n 1)"
+    oom_machine_kb="$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo 2>/dev/null || true)"
+    [ -n "$oom_used_kb" ] && [ -n "$oom_machine_kb" ] && echo "$oom_used_kb $oom_machine_kb" >"$DOCKERD_OOM_MEM"
+  fi
+  mkdir -p "$LOG_DIR"
+  {
+    echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) dockerd (pid ${pid:-unknown}) stopped answering (cause=${cause}, exit_status=${exit_status})"
+    if [ "$oom_matched" = 1 ]; then
+      if [ "$cg_oom" = 1 ]; then echo "--- the machine's cgroup counted an OOM kill inside this dockerd instance (memory.events oom_kill ${cg_base} -> ${cg_now})"; fi
+      if [ -n "$oom_match" ]; then echo "--- kernel OOM kill of this dockerd:"; printf '%s\n' "$oom_match"; fi
+      if [ -n "$oom_used_kb" ] && [ -n "$oom_machine_kb" ]; then echo "--- dockerd memory at the kill: used ${oom_used_kb} kB of the machine's ${oom_machine_kb} kB"; fi
+    elif [ -n "$oom" ]; then
+      echo "--- recent kernel OOM lines (NOT matched to this dockerd instance; not the diagnosed cause):"; printf '%s\n' "$oom"
+    fi
+    echo "--- last lines of ${DOCKERD_LOG}:"
+    tail -n 20 "$DOCKERD_LOG" 2>/dev/null || echo "(no log)"
+  } >>"$DOCKERD_HISTORY"
+  echo "$cause"
+}
+
+# Did god mode ask for this restart, recently? The request holds the epoch it
+# was made at; an old one (a daemon that died mid-restart) is not honoured, so
+# a real crash later is never passed off as requested.
+restart_requested() {
+  [ -f "$DOCKERD_RESTART_REQUESTED" ] || return 1
+  at="$(cat "$DOCKERD_RESTART_REQUESTED" 2>/dev/null || true)"
+  case "$at" in ''|*[!0-9]*) return 1 ;; esac
+  [ $(($(date +%s) - at)) -le "$RESTART_REQUEST_TTL" ]
+}
+
+# Stop a dockerd that is alive but not answering, so the new one can take the
+# socket. Best effort: a process that is already gone is the common case.
+stop_stale_dockerd() {
+  pid="$(cat "$DOCKERD_PID" 2>/dev/null || true)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    n=0
+    while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 10 ]; do sleep 1; n=$((n + 1)); done
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$DOCKERD_PID" "$DOCKERD_EXIT" "$DOCKERD_START"
+}
+
+# ── resetting docker's storage ───────────────────────────────────────────────
+
+step() { emit reset_step "$1"; }
+
+# Stop every process holding the data-root open: dockerd, then containerd and
+# its shims (the shims hold the container overlay mounts, and containerd is not
+# always dockerd's child once dockerd was killed).
+stop_docker_processes() {
+  # Containers first, while dockerd can still name them: killing a shim does not
+  # stop the container's own processes, which would keep their memory and their
+  # mounts after the reset. Bounded: a hung dockerd must not hang the reset.
+  ids="$(timeout 20 docker ps -q 2>/dev/null || true)"
+  # shellcheck disable=SC2086
+  if [ -n "$ids" ]; then timeout 30 docker kill $ids >/dev/null 2>&1 || true; fi
+  # Containers of an already-dead dockerd are the shims' children.
+  for shim in $(pgrep -x containerd-shim-runc-v2 2>/dev/null || true) $(pgrep -x containerd-shim 2>/dev/null || true); do
+    pkill -9 -P "$shim" 2>/dev/null || true
+  done
+  stop_stale_dockerd
+  for name in dockerd containerd-shim-runc-v2 containerd-shim containerd; do
+    pkill -x "$name" 2>/dev/null || true
+  done
+  n=0
+  while [ "$n" -lt 10 ]; do
+    pgrep -x dockerd >/dev/null 2>&1 || pgrep -x containerd >/dev/null 2>&1 || break
+    sleep 1; n=$((n + 1))
+  done
+  for name in dockerd containerd-shim-runc-v2 containerd-shim containerd; do
+    pkill -9 -x "$name" 2>/dev/null || true
+  done
+}
+
+# Mount points under the data-root (never the data-root itself), deepest first.
+# /proc/mounts writes a space as \040; undo that so the path is the real one.
+mounts_under_data_root() {
+  awk -v root="$DATA_ROOT/" 'index($2, root) == 1 { print length($2) "\t" $2 }' "$MOUNTS" 2>/dev/null \
+    | sort -rn | cut -f2- | sed 's/\\040/ /g'
+}
+
+free_kb() { df -Pk "$DATA_ROOT" 2>/dev/null | awk 'NR == 2 { print $4 }'; }
+
+reset_docker_storage() {
+  case "$DATA_ROOT" in
+    /*/docker) ;;
+    *) warn "refusing to reset docker storage: data-root ${DATA_ROOT} is not a directory named docker"
+       emit ready no; emit reason reset-refused-data-root; exit 1 ;;
+  esac
+  printf '%s %s\n' "$$" "$(date +%s)" >"$RESET_IN_PROGRESS"
+  RESET_RESULT=done
+  RESET_REASON=""
+  before="$(free_kb)"
+  echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) resetting docker storage ${DATA_ROOT}: requested (not counted toward the restart budget)" >>"$DOCKERD_HISTORY"
+  rm -f "$DOCKERD_RESTART_REQUESTED" "$DOCKERD_GAVE_UP" "$DOCKERD_UNRESPONSIVE" "$DOCKERD_RESTARTS" "$MARKER"
+  step "Stopping dockerd and containerd"
+  stop_docker_processes
+  if pgrep -x dockerd >/dev/null 2>&1; then
+    RESET_RESULT=failed; RESET_REASON=reset-stop-failed
+    step "dockerd would not stop; the storage was not touched"
+    return 0
+  fi
+  list="$(mounts_under_data_root)"
+  count="$(printf '%s' "$list" | grep -c . || true)"
+  step "Unmounting ${count} mount(s) under ${DATA_ROOT}, deepest first"
+  lazy_list="$RUN_DIR/lazy-reset-lazy-unmounts"
+  rm -f "$lazy_list"
+  printf '%s\n' "$list" | while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    # A mount that will not go is caught by the check below, not by this loop.
+    umount "$m" 2>/dev/null || { umount -l "$m" 2>/dev/null && echo "$m" >>"$lazy_list"; } || true
+  done
+  if [ -f "$lazy_list" ]; then
+    step "$(grep -c . "$lazy_list" || true) mount(s) were busy and were detached lazily"
+    rm -f "$lazy_list"
+  fi
+  if [ -n "$(mounts_under_data_root)" ]; then
+    RESET_RESULT=failed; RESET_REASON=reset-unmount-failed
+    step "Mounts remain under ${DATA_ROOT}; nothing was removed"
+    return 0
+  fi
+  step "Removing the contents of ${DATA_ROOT} without crossing mount points"
+  if ! find "$DATA_ROOT" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system {} + 2>"$RUN_DIR/lazy-reset-rm.err"; then
+    RESET_RESULT=failed; RESET_REASON=reset-remove-failed
+    step "Some files could not be removed"
+    head -n 5 "$RUN_DIR/lazy-reset-rm.err" >&2 || true
+  fi
+  rm -f "$RUN_DIR/lazy-reset-rm.err"
+  after="$(free_kb)"
+  if [ -n "$before" ] && [ -n "$after" ] && [ "$after" -ge "$before" ]; then emit reset_freed_kb "$((after - before))"; fi
+}
+
+# ── decide where docker's data-root goes ─────────────────────────────────────
+
+BACKING_FS=""
+DATA_ROOT="${LAZY_GUEST_DOCKER_DATA_ROOT:-}"
+
+if [ -z "$DATA_ROOT" ]; then
+  storage_fs="$(fs_type_of "$STORAGE_ROOT")"
+  case "$storage_fs" in
+    ext4|xfs|btrfs)
+      DATA_ROOT="${STORAGE_ROOT}/docker"
+      BACKING_FS="$storage_fs"
+      ;;
+    *)
+      fallback="$(first_block_mount)"
+      if [ -n "$fallback" ]; then
+        DATA_ROOT="${fallback}/docker"
+        BACKING_FS="$(fs_type_of "$fallback")"
+      else
+        # No real disk: the machine was created without --storage, or the volume
+        # failed to attach. Docker still runs on the rootfs overlay under the native snapshotter —
+        # slow and RAM-backed, but a task can execute and the operator gets a
+        # named reason rather than an opaque dockerd failure.
+        DATA_ROOT=/var/lib/docker
+        BACKING_FS="$(fs_type_of /var/lib/docker)"
+        warn "no real disk found under ${STORAGE_ROOT} (mount table: ${MOUNTS}); \
+docker will run on the rootfs overlay with the native snapshotter (full copies). Create the machine \
+with --storage so images and containers land on /dev/vda."
+      fi
+      ;;
+  esac
+else
+  BACKING_FS="$(fs_type_of "$DATA_ROOT")"
+fi
+
+STORAGE_DRIVER="${LAZY_GUEST_DOCKER_STORAGE_DRIVER:-$(driver_for_fs "$BACKING_FS")}"
+IMAGE_STORE="$(image_store_for_driver "$STORAGE_DRIVER")"
+
+if [ "$MODE" = plan ]; then
+  emit data_root "$DATA_ROOT"
+  emit backing_fs "${BACKING_FS:-unknown}"
+  emit image_store "$IMAGE_STORE"
+  emit storage_driver "$STORAGE_DRIVER"
+  emit dockerd_config "$DOCKERD_CONFIG"
+  emit docker_daemon_json "$(daemon_json_state)"
+  # What the overlay module says NOW (read-only): naive means the write in
+  # prefer_native_overlay_diff did not stick, and overlay_params says whether it
+  # CAN: read-only on smolvm, whose guest /sys is mounted read-only (see the
+  # header). access(2) answers that without writing anything.
+  if driver_uses_overlay; then
+    emit overlay_diff "$(current_overlay_diff)"
+    emit overlay_params "$(overlay_params_state)"
+  else
+    emit overlay_diff none
+  fi
+  emit docker_daemon_json "$(daemon_json_state)"
+  compute_cache_limits
+  emit build_cache_max "$BUILD_CACHE_MAX"
+  emit build_cache_min_free "$BUILD_CACHE_MIN_FREE"
+  plan_link="$(link_address)"
+  emit forwarder_bind "${plan_link:-none}:$DAEMON_PORT"
+  emit forwarder_state "$(forwarder_state)"
+  emit forwarder_spec "$(forwarder_spec_state)"
+  emit dockerd_config_state "$(dockerd_config_state)"
+  emit guest_init_id "$(guest_init_id)"
+  emit docker_ready "$([ -f "$MARKER" ] && echo yes || echo no)"
+  emit dockerd_restarts "$(recent_restarts)"
+  exit 0
+fi
+
+# ── prepare this boot ────────────────────────────────────────────────────────
+
+# The marker says dockerd was brought up this boot; the forwarder is a process
+# that can die on its own, so "already prepared" also means "forwarder alive" —
+# and dockerd can die too (it did, mid-build, on a small machine), so it also
+# means "dockerd answers". Never trust the marker alone.
+if [ "$MODE" = ensure ] && [ -f "$MARKER" ] && [ "$(forwarder_state)" != dead ] \
+  && [ "$(forwarder_spec_state)" != stale ] && docker_answers; then
+  rm -f "$DOCKERD_UNRESPONSIVE" "$DOCKERD_GAVE_UP" 2>/dev/null || true
+  emit ready yes
+  emit source marker
+  emit forwarder "$(forwarder_state)"
+  emit guest_init_id "$(guest_init_id)"
+  compute_cache_limits
+  emit dockerd_config_state "$(dockerd_config_state)"
+  exit 0
+fi
+
+if [ "$(id -u)" != "0" ]; then
+  warn "must run as root to start dockerd (running as uid $(id -u))"
+  emit ready no
+  emit reason not-root
+  exit 1
+fi
+
+# The machine is stopping (--stop-docker ran): no dockerd may start under it.
+# --force and --reset-storage are a person asking, and clear it; a stale one
+# (a stop that never happened) is dropped. Asked again once the lock is won,
+# because a stop can begin while this run waits on the lock.
+check_machine_stopping() {
+  [ -f "$MACHINE_STOPPING" ] || return 0
+  at="$(cat "$MACHINE_STOPPING" 2>/dev/null || true)"
+  case "$at" in ''|*[!0-9]*) at=0 ;; esac
+  if [ "$MODE" = ensure ] && [ $(($(date +%s) - at)) -le "$MACHINE_STOPPING_TTL" ]; then
+    emit ready no
+    emit reason machine-stopping
+    exit 1
+  fi
+  rm -f "$MACHINE_STOPPING"
+}
+check_machine_stopping
+# A storage reset is removing the data-root: starting dockerd against it now
+# would put a daemon on a half-deleted store. The marker names the resetting
+# process, so one whose process died (a daemon killed mid-reset) is ignored.
+if [ "$MODE" != reset ] && [ -f "$RESET_IN_PROGRESS" ]; then
+  read -r reset_pid _ <"$RESET_IN_PROGRESS" || true
+  if [ -n "${reset_pid:-}" ] && kill -0 "$reset_pid" 2>/dev/null; then
+    emit ready no
+    emit reason docker-storage-reset-running
+    exit 1
+  fi
+  rm -f "$RESET_IN_PROGRESS"
+fi
+
+# Two `lazy` invocations can land in the same boot at once (the supervisor runs
+# a mount probe and a daemon start back to back). mkdir is the portable atomic
+# test-and-set; the loser waits for the winner rather than starting a second
+# dockerd against the same data-root.
+waited=0
+while ! mkdir "$LOCK" 2>/dev/null; do
+  if [ -f "$MARKER" ] && [ "$MODE" = ensure ] && docker_answers; then
+    emit ready yes
+    emit source marker
+    exit 0
+  fi
+  waited=$((waited + 1))
+  if [ "$waited" -gt "$TIMEOUT" ]; then
+    warn "timed out waiting for another lazy-guest-init to finish (${LOCK})"
+    emit ready no
+    emit reason lock-timeout
+    exit 1
+  fi
+  sleep 1
+done
+trap 'rmdir "$LOCK" 2>/dev/null || true; if [ "$(cut -d" " -f1 "$RESET_IN_PROGRESS" 2>/dev/null)" = "$$" ]; then rm -f "$RESET_IN_PROGRESS"; fi' EXIT INT TERM
+check_machine_stopping
+
+RESET_RESULT=""
+RESET_REASON=""
+if [ "$MODE" = reset ]; then
+  reset_docker_storage
+  if [ "$RESET_RESULT" = done ]; then step "Starting dockerd on an empty store"; else step "Starting dockerd again regardless, so the machine is not left without Docker"; fi
+  MODE=force
+fi
+
+# The forwarder first: it is cheap, it does not depend on dockerd, and a daemon
+# that starts before it is a daemon the host cannot reach for as long as the
+# race lasts.
+if ! ensure_forwarder; then
+  emit ready no
+  emit reason forwarder
+  exit 1
+fi
+
+mkdir -p "$DATA_ROOT"
+
+if docker_answers; then
+  : >"$MARKER"
+  emit ready yes
+  emit source running-dockerd
+  emit data_root "$DATA_ROOT"
+  emit storage_driver "$(docker info --format '{{.Driver}}' 2>/dev/null || echo unknown)"
+  emit guest_init_id "$(guest_init_id)"
+  compute_cache_limits
+  emit dockerd_config_state "$(dockerd_config_state)"
+  # A reset whose stop failed leaves dockerd answering on the untouched store:
+  # that is not a success.
+  if [ "$RESET_RESULT" = failed ]; then emit reset_result failed; emit reset_reason "$RESET_REASON"; exit 1; fi
+  exit 0
+fi
+
+if ! docker buildx version >/dev/null 2>&1; then
+  warn "docker buildx is missing from this guest image — docker build would use the legacy builder and reject BuildKit syntax (RUN --network, RUN --mount); rebuild the image"
+  emit ready no
+  emit reason no-buildx
+  exit 1
+fi
+
+if ! command -v dockerd >/dev/null 2>&1; then
+  warn "dockerd is not installed in this guest image — task containers cannot run"
+  emit ready no
+  emit reason no-dockerd
+  exit 1
+fi
+
+# The marker means THIS boot already had a dockerd that answered, so it died:
+# record why, then restart it within the budget.
+RESTARTED=""
+REQUESTED=""
+# God mode stopped dockerd and is waiting for it to exit (it allows 60s for a
+# graceful stop, then runs --force itself): an --ensure from elsewhere must not
+# kill it early or start a second one, and must leave the request for that run.
+requested_pid="$(cat "$DOCKERD_PID" 2>/dev/null || true)"
+if [ "$MODE" = ensure ] && [ -f "$MARKER" ] && restart_requested && [ ! -f "$DOCKERD_EXIT" ] \
+  && [ -n "$requested_pid" ] && kill -0 "$requested_pid" 2>/dev/null; then
+  emit ready no
+  emit reason dockerd-restart-requested
+  exit 1
+fi
+if [ -f "$MARKER" ] && restart_requested; then
+  # Asked for, not crashed: no death record and no budget entry, and a
+  # crash-loop refusal is lifted. The entries already in the window still
+  # count if it then dies on its own.
+  rm -f "$DOCKERD_RESTART_REQUESTED" "$DOCKERD_GAVE_UP" "$DOCKERD_UNRESPONSIVE"
+  echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) restarting dockerd: restart requested from god mode (not counted toward the restart budget)" >>"$DOCKERD_HISTORY"
+  stop_stale_dockerd
+  REQUESTED=yes
+elif [ -f "$MARKER" ]; then
+  # Already gave up this window: say so again without appending another
+  # death record on every call.
+  if [ -f "$DOCKERD_GAVE_UP" ] && [ "$(recent_restarts)" -ge "$MAX_RESTARTS" ]; then
+    emit ready no
+    emit reason dockerd-crash-loop
+    emit dockerd_restarts "$(recent_restarts)"
+    emit dockerd_history "$DOCKERD_HISTORY"
+    exit 1
+  fi
+  rm -f "$DOCKERD_GAVE_UP"
+  # Alive but not answering is often just slow (a big build on a small
+  # machine): killing it would kill that build. Only a dockerd unresponsive
+  # for HUNG_SECONDS is treated as hung.
+  live_pid="$(cat "$DOCKERD_PID" 2>/dev/null || true)"
+  if [ ! -f "$DOCKERD_EXIT" ] && [ -n "$live_pid" ] && kill -0 "$live_pid" 2>/dev/null; then
+    now="$(date +%s)"
+    [ -f "$DOCKERD_UNRESPONSIVE" ] || echo "$now" >"$DOCKERD_UNRESPONSIVE"
+    since="$(cat "$DOCKERD_UNRESPONSIVE" 2>/dev/null || echo "$now")"
+    if [ $((now - since)) -lt "$HUNG_SECONDS" ]; then
+      warn "dockerd (pid ${live_pid}) is running but not answering for $((now - since))s; leaving it alone until ${HUNG_SECONDS}s"
+      emit ready no
+      emit reason dockerd-not-answering
+      exit 1
+    fi
+  fi
+  rm -f "$DOCKERD_UNRESPONSIVE"
+  cause="$(record_dockerd_death)"
+  emit dockerd_died "$cause"
+  if [ -r "$DOCKERD_OOM_MEM" ]; then
+    read -r oom_used oom_machine <"$DOCKERD_OOM_MEM" || true
+    emit dockerd_oom_used_kb "$oom_used"
+    emit dockerd_oom_machine_kb "$oom_machine"
+  fi
+  restarts="$(recent_restarts)"
+  if [ "$restarts" -ge "$MAX_RESTARTS" ]; then
+    warn "dockerd died again (${cause}) after ${restarts} restarts in ${RESTART_WINDOW}s — not restarting it; see ${DOCKERD_HISTORY}"
+    echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) NOT restarting dockerd: ${restarts} restarts in ${RESTART_WINDOW}s (crash loop)" >>"$DOCKERD_HISTORY"
+    : >"$DOCKERD_GAVE_UP"
+    emit ready no
+    emit reason dockerd-crash-loop
+    emit dockerd_restarts "$restarts"
+    emit dockerd_history "$DOCKERD_HISTORY"
+    exit 1
+  fi
+  stop_stale_dockerd
+  # Backoff 0s, 2s, 4s, … so a dockerd that dies at once is not hammered.
+  backoff=$((restarts * 2))
+  if [ "$backoff" -gt 0 ]; then sleep "$backoff"; fi
+  date +%s >>"$DOCKERD_RESTARTS"
+  RESTARTED="$((restarts + 1))"
+  echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) restarting dockerd (restart ${RESTARTED} of ${MAX_RESTARTS} allowed in ${RESTART_WINDOW}s)" >>"$DOCKERD_HISTORY"
+fi
+
+# setsid so dockerd outlives the `machine exec` session that started it. The
+# smolvm docker-in-vm example relies on exactly this (spike §3), and the
+# supervisor's own `lazy daemon start --background` depends on the same
+# property.
+#
+# dockerd runs under a small sh that writes its exit status when it ends: that
+# is the only way to know afterwards whether it exited and how (137 = SIGKILL,
+# usually the OOM killer), since nothing else in the guest waits on it.
+mkdir -p "$(dirname "$DOCKERD_LOG")" "$RUN_DIR"
+rm -f "$DOCKERD_EXIT" "$DOCKERD_RESTART_REQUESTED"
+echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) lazy-guest-init starting dockerd" >>"$DOCKERD_LOG"
+# It also records this instance's start (seconds since boot, the clock dmesg
+# stamps kills with) so a later death is never matched to an old kill that
+# merely shares the reused pid.
+rm -f "$DOCKERD_START" "$DOCKERD_CG_BASE"
+if driver_uses_overlay; then OVERLAY_DIFF="$(prefer_native_overlay_diff)"; else OVERLAY_DIFF=none; fi
+compute_cache_limits
+write_dockerd_config
+# Run dockerd in its own cgroup (v2) so its memory.events counts OOM kills of
+# THIS instance. Best effort: without cgroup v2 or the memory controller the
+# join is skipped and attribution falls back to the kernel log.
+cg_procs=""
+if [ -e "$CG_ROOT/cgroup.controllers" ]; then
+  [ -d "$DOCKERD_CG" ] || mkdir "$DOCKERD_CG" 2>/dev/null || true
+  if [ -e "$CG_ROOT/cgroup.subtree_control" ]; then { echo +memory >"$CG_ROOT/cgroup.subtree_control"; } 2>/dev/null || true; fi
+  if [ -w "$DOCKERD_CG/cgroup.procs" ] && [ -r "$DOCKERD_CG/memory.events" ]; then
+    awk '$1 == "oom_kill" { print $2; exit }' "$DOCKERD_CG/memory.events" >"$DOCKERD_CG_BASE" 2>/dev/null || rm -f "$DOCKERD_CG_BASE"
+    cg_procs="$DOCKERD_CG/cgroup.procs"
+  fi
+fi
+setsid sh -c 'exit_file="$1"; start_file="$2"; cg_procs="$3"; cg_base_file="$4"; shift 4
+  if [ -n "$cg_procs" ]; then
+    echo $$ >"$cg_procs" 2>/dev/null
+    grep -qx "$$" "$cg_procs" 2>/dev/null || rm -f "$cg_base_file"
+  fi
+  dockerd "$@" & p=$!; echo $p >"$0"
+  hz="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+  sed "s/.*) //" "/proc/$p/stat" 2>/dev/null | awk -v hz="$hz" "NF >= 20 { printf \"%.2f\\n\", \$20 / hz }" >"$start_file" 2>/dev/null
+  wait $p; echo $? >"$exit_file"' \
+  "$DOCKERD_PID" "$DOCKERD_EXIT" "$DOCKERD_START" "$cg_procs" "$DOCKERD_CG_BASE" \
+  --data-root "$DATA_ROOT" \
+  --config-file "$DOCKERD_CONFIG" \
+  --host unix:///var/run/docker.sock \
+  >>"$DOCKERD_LOG" 2>&1 &
+
+waited=0
+while [ "$waited" -lt "$TIMEOUT" ]; do
+  if docker_answers; then
+    : >"$MARKER"
+    emit ready yes
+    if [ -n "$RESET_RESULT" ]; then
+      emit source reset-storage
+      emit reset_result "$RESET_RESULT"
+      [ -z "$RESET_REASON" ] || emit reset_reason "$RESET_REASON"
+    elif [ -n "$REQUESTED" ]; then
+      emit source requested-restart
+    elif [ -n "$RESTARTED" ]; then
+      emit source restarted-dockerd
+      emit dockerd_restarts "$RESTARTED"
+      emit dockerd_history "$DOCKERD_HISTORY"
+    else
+      emit source started-dockerd
+    fi
+    emit data_root "$DATA_ROOT"
+    emit backing_fs "${BACKING_FS:-unknown}"
+    emit image_store "$IMAGE_STORE"
+    emit storage_driver "$(docker info --format '{{.Driver}}' 2>/dev/null || echo "$STORAGE_DRIVER")"
+    emit overlay_diff "$OVERLAY_DIFF"
+    emit build_cache_max "$BUILD_CACHE_MAX"
+    emit build_cache_min_free "$BUILD_CACHE_MIN_FREE"
+    emit cache_migration "$(migrate_to_native_diff)"
+    emit waited_seconds "$waited"
+    # dockerd is back, but a reset that did not finish is a failure to report.
+    [ "$RESET_RESULT" != failed ] || exit 1
+    exit 0
+  fi
+  # dockerd already exited: waiting out the timeout cannot help.
+  [ -f "$DOCKERD_EXIT" ] && break
+  waited=$((waited + 1))
+  sleep 1
+done
+
+warn "dockerd did not become ready within ${TIMEOUT}s (data-root ${DATA_ROOT}, \
+driver ${STORAGE_DRIVER}); last lines of ${DOCKERD_LOG}:"
+tail -n 10 "$DOCKERD_LOG" >&2 2>/dev/null || true
+emit ready no
+emit reason dockerd-timeout
+[ -z "$RESET_RESULT" ] || emit reset_result "$RESET_RESULT"
+emit data_root "$DATA_ROOT"
+emit storage_driver "$STORAGE_DRIVER"
+exit 1

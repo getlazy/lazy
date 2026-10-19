@@ -290,6 +290,105 @@ describe('wind-down guard', () => {
   }, 20000);
 });
 
+/**
+ * Background work after a result. Event shapes read off Claude Code 2.1.291
+ * (`-p --output-format stream-json`, docs/claude-code-background-tasks.md): a
+ * `background_tasks_changed` line carrying the whole running list, the first
+ * `result`, the list emptying when the job reports, then a re-invocation —
+ * `system/init`, assistant output, a second `result`.
+ */
+describe('wind-down guard with background work', () => {
+  const BG_RUNNING = line({
+    type: 'system',
+    subtype: 'background_tasks_changed',
+    tasks: [{ task_id: 'bm60yrnvl', task_type: 'local_bash', description: 'run the tests' }],
+  });
+  const BG_EMPTY = line({ type: 'system', subtype: 'background_tasks_changed', tasks: [] });
+  const REINVOKE = line({ type: 'system', subtype: 'init', session_id: 'sess-abc-123', tools: [], mcp_servers: [] });
+  const SECOND_RESULT = line({
+    type: 'result',
+    subtype: 'success',
+    result: 'tests passed; committed',
+    session_id: 'sess-abc-123',
+    is_error: false,
+  });
+
+  // INVARIANT: the wind-down guard never kills a process whose agent still has
+  // background work running, and the LAST result is the turn's summary. Claude
+  // Code keeps `-p` alive while background work runs and re-invokes the model
+  // when it reports; killing on the first result threw that second answer away
+  // (engineer's decision 2026-10-06: fix lazy, do not disable background tasks).
+  test('does not kill while a background task runs past the wind-down window, and keeps the last result', async () => {
+    const script = emitScript([
+      { delayMs: 10, text: BG_RUNNING },
+      { delayMs: 10, text: RESULT },
+      // Background job runs ~4x the wind-down window.
+      { delayMs: 1200, text: BG_EMPTY },
+      { delayMs: 10, text: REINVOKE },
+      // The re-invoked model works for longer than the window too.
+      { delayMs: 400, text: TEXT },
+      { delayMs: 400, text: SECOND_RESULT },
+    ], EXIT_OK);
+
+    const result = await execWithWatchdog(['bun', '-e', script], {
+      cwd: '/tmp',
+      env: BASE_ENV,
+      timeoutMs: 5000,
+      activityStream: new ClaudeCodeActivityStream(),
+      windDownTimeoutMs: 300,
+    });
+
+    expect(result.killedDuringWindDown).toBe(false);
+    expect(result.killedByWatchdog).toBe(false);
+    expect(result.exitCode).toBe(0);
+    expect(result.resultLine).toBe(SECOND_RESULT);
+  }, 20000);
+
+  // INVARIANT: the guard's purpose stands — once the background work is done
+  // and the last result is in, a CLI that will not exit is still killed.
+  test('still kills a process that hangs after its last result once background work is done', async () => {
+    const script = emitScript([
+      { delayMs: 10, text: BG_RUNNING },
+      { delayMs: 10, text: RESULT },
+      { delayMs: 600, text: BG_EMPTY },
+      { delayMs: 10, text: REINVOKE },
+      { delayMs: 10, text: SECOND_RESULT },
+    ], HANG_FOREVER);
+
+    const result = await execWithWatchdog(['bun', '-e', script], {
+      cwd: '/tmp',
+      env: BASE_ENV,
+      timeoutMs: 0,
+      activityStream: new ClaudeCodeActivityStream(),
+      windDownTimeoutMs: 300,
+    });
+
+    expect(result.killedDuringWindDown).toBe(true);
+    expect(result.resultLine).toBe(SECOND_RESULT);
+  }, 20000);
+
+  // INVARIANT: background work does not escape every guard — a background job
+  // that wedges after the result is bounded by the no-progress guard.
+  test('a background job that wedges after the result is killed by the no-progress guard', async () => {
+    const script = emitScript([
+      { delayMs: 10, text: BG_RUNNING },
+      { delayMs: 10, text: RESULT },
+    ], HANG_FOREVER);
+
+    const result = await execWithWatchdog(['bun', '-e', script], {
+      cwd: '/tmp',
+      env: BASE_ENV,
+      timeoutMs: 800,
+      activityStream: new ClaudeCodeActivityStream(),
+      windDownTimeoutMs: 300,
+    });
+
+    expect(result.killedByWatchdog).toBe(true);
+    expect(result.killedDuringWindDown).toBe(false);
+    expect(result.resultLine).toBe(RESULT);
+  }, 20000);
+});
+
 // INVARIANT 5: Cursor and the qa agent emit a single blob at exit, so their
 // watchdog stays byte-level. This must not regress.
 describe('no-stream agents keep byte-level liveness', () => {
@@ -462,4 +561,81 @@ describe('GracefulExitTimeoutError', () => {
     });
     expect(err.sessionId).toBe('abc-def-123');
   });
+});
+
+describe('results after background work: usage and re-invocation inits', () => {
+  const result = (text: string, usage: Record<string, number>) => line({
+    type: 'result', subtype: 'success', result: text, session_id: 'sess-abc-123', is_error: false, usage,
+  });
+  const INIT = line({ type: 'system', subtype: 'init', session_id: 'sess-abc-123', tools: [], mcp_servers: [] });
+
+  // INVARIANT: a turn's tokens are the sum over every result. Claude Code's
+  // top-level `usage` covers one model invocation only (2.1.291: cache reads
+  // 35,330 then 44,342 in one run), so keeping just the last undercounts.
+  test('the last result carries usage summed over every result', async () => {
+    const script = emitScript([
+      { delayMs: 10, text: INIT },
+      { delayMs: 10, text: result('first', { input_tokens: 18, output_tokens: 233, cache_read_input_tokens: 35330, cache_creation_input_tokens: 8355 }) },
+      { delayMs: 10, text: INIT },
+      { delayMs: 10, text: result('second', { input_tokens: 18, output_tokens: 268, cache_read_input_tokens: 44342, cache_creation_input_tokens: 609 }) },
+    ], EXIT_OK);
+    const out = await execWithWatchdog(['bun', '-e', script], {
+      cwd: '/tmp', env: BASE_ENV, timeoutMs: 0, activityStream: new ClaudeCodeActivityStream(), windDownTimeoutMs: 5000,
+    });
+    const parsed = JSON.parse(out.resultLine!);
+    expect(parsed.result).toBe('second');
+    expect(parsed.usage).toEqual({ input_tokens: 36, output_tokens: 501, cache_read_input_tokens: 79672, cache_creation_input_tokens: 8964 });
+  }, 20000);
+
+  // INVARIANT: only the FIRST init is the launch. A re-invocation's init must
+  // not re-run the launch-state check on a turn whose work is done.
+  test('a re-invocation init does not re-run abortOnSessionStart', async () => {
+    let calls = 0;
+    const script = emitScript([
+      { delayMs: 10, text: INIT },
+      { delayMs: 10, text: RESULT },
+      { delayMs: 10, text: INIT },
+      { delayMs: 10, text: RESULT },
+    ], EXIT_OK);
+    const out = await execWithWatchdog(['bun', '-e', script], {
+      cwd: '/tmp', env: BASE_ENV, timeoutMs: 0, activityStream: new ClaudeCodeActivityStream(),
+      abortOnSessionStart: () => (++calls > 1 ? 'would kill a finished turn' : null),
+    });
+    expect(calls).toBe(1);
+    expect(out.abortReason).toBeUndefined();
+    expect(out.exitCode).toBe(0);
+  }, 20000);
+});
+
+describe('background work left behind at turn end', () => {
+  const BG_RUNNING = line({ type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'bm1', task_type: 'local_bash', description: 'run the suite' }] });
+  const BG_EMPTY = line({ type: 'system', subtype: 'background_tasks_changed', tasks: [] });
+  const KILLED = line({ type: 'system', subtype: 'task_updated', task_id: 'bm1', patch: { status: 'killed' } });
+  const COMPLETED = line({ type: 'system', subtype: 'task_updated', task_id: 'bm1', patch: { status: 'completed' } });
+  const run = (steps: Array<{ delayMs: number; text: string }>) => execWithWatchdog(['bun', '-e', emitScript(steps, EXIT_OK)], {
+    cwd: '/tmp', env: BASE_ENV, timeoutMs: 0, activityStream: new ClaudeCodeActivityStream(), windDownTimeoutMs: 5000,
+  });
+
+  // INVARIANT: a background task Claude Code stopped after the turn's result is
+  // reported, so the supervisor can ask the agent whether it needed it.
+  test('a task killed after the result is reported', async () => {
+    const out = await run([{ delayMs: 5, text: BG_RUNNING }, { delayMs: 5, text: RESULT }, { delayMs: 5, text: BG_EMPTY }, { delayMs: 5, text: KILLED }]);
+    expect(out.backgroundLeftBehind).toEqual(['run the suite']);
+  }, 20000);
+
+  test('a task that finished is not reported', async () => {
+    const out = await run([{ delayMs: 5, text: BG_RUNNING }, { delayMs: 5, text: RESULT }, { delayMs: 5, text: BG_EMPTY }, { delayMs: 5, text: COMPLETED }]);
+    expect(out.backgroundLeftBehind).toEqual([]);
+  }, 20000);
+
+  test('a task still reported running when the process exits is reported', async () => {
+    const out = await run([{ delayMs: 5, text: BG_RUNNING }, { delayMs: 5, text: RESULT }]);
+    expect(out.backgroundLeftBehind).toEqual(['run the suite']);
+  }, 20000);
+
+  // The agent stopping its own task mid-invocation is its own decision.
+  test('a task killed BEFORE the result is not reported', async () => {
+    const out = await run([{ delayMs: 5, text: BG_RUNNING }, { delayMs: 5, text: BG_EMPTY }, { delayMs: 5, text: KILLED }, { delayMs: 5, text: RESULT }]);
+    expect(out.backgroundLeftBehind).toEqual([]);
+  }, 20000);
 });

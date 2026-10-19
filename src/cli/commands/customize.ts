@@ -54,7 +54,7 @@ Generated files land in your project and are yours to edit — and, since .lazy 
 not gitignored, to commit and share with your team.
 
 Subcommands:
-  proxy-plugin <name>   A request plugin for the model-API proxy, in .lazy/plugins/
+  proxy-plugin <name>   A request plugin for the model-API proxy, in .lazy/plugins/ (not currently loaded)
 
 Examples:
   lazy customize proxy-plugin strip-trailing-space

@@ -2,7 +2,7 @@
  * The `clusters` RPC, and the cluster progress the `show` RPC carries.
  *
  * WHY THESE EXIST AS RPCs AT ALL. A cluster's k-of-n, its running child and its
- * deferred ones are DERIVED from the children (`clusterProgressOf`), and CLAUDE.md
+ * deferred ones are DERIVED from the children (`clusterProgressOf`), and AGENTS.md
  * says that derivation has exactly one home because a stored or re-derived
  * counter drifts the first time a child is closed, reparented away, or accepted
  * by a human. A remote client (Lazy Teams) showing cluster progress therefore

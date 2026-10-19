@@ -1,5 +1,7 @@
 # Deploying Lazy Teams on DigitalOcean with Kamal
 
+Lazy Teams is in private alpha and is not yet generally released.
+
 This guide puts Lazy Teams on a **cloud VPS** — a DigitalOcean droplet or any similar Linux server — with [Kamal](https://kamal-deploy.org/). Kamal pulls (or builds) a container image, SSHes into your server, and runs the app behind **kamal-proxy**.
 
 For a **local or single-box install** without SSH keys or a registry account, use the [docker compose bundle](./self-hosting-lazy-teams.md) instead. That path is pull-and-go; this path is for cloud deploy and Kamal-style upgrades.

@@ -254,9 +254,10 @@ export const BUILD_MATCH_ROW_ID = 'daemon:build-match';
 /**
  * Whether the asking client runs the daemon's build. Two identities compare
  * only when they are the same KIND of answer: a checkout fingerprint (baked or
- * computed) against another, or a compiled build against another — a compiled
- * binary's identity says nothing about a checkout's, and a verdict derived from
- * two incomparable values would be worse than none.
+ * computed) against another, or a compiled build against the same kind of
+ * compiled build (embedded or provenance id) — a compiled binary's identity says
+ * nothing about a checkout's, and a verdict derived from two incomparable values
+ * would be worse than none.
  */
 export function buildBuildMatchRow(
   daemon: Pick<DaemonIdentityFacts, 'version' | 'sourceId' | 'sourceIdKind'>,
@@ -270,7 +271,8 @@ export function buildBuildMatchRow(
   const comparable =
     client.sourceId && daemon.sourceId &&
     ((checkout(client.sourceIdKind) && checkout(daemon.sourceIdKind)) ||
-      (client.sourceIdKind === 'build' && daemon.sourceIdKind === 'build'));
+      (client.sourceIdKind === 'build' && daemon.sourceIdKind === 'build') ||
+      (client.sourceIdKind === 'embedded' && daemon.sourceIdKind === 'embedded'));
 
   if (client.version && client.version !== daemon.version) {
     return {
@@ -586,7 +588,8 @@ export function buildRunnerRows(runnerType: string, checks: HealthCheck[]): Daem
   return checks.map((check) => ({
     id: uniqueId(`runner:${runnerCheckKey(check.what)}`, used),
     group: 'runner' as const,
-    name: check.what,
+    // The row's name is what a reader skims: on a failure it names the problem, never the passing condition.
+    name: check.state === 'fail' ? check.problem : check.what,
     state: check.state,
     reason: check.state === 'ok' ? 'ok' : firstLine(check.reason ?? 'no reason given'),
     ...(check.state === 'fail'

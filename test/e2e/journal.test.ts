@@ -145,7 +145,7 @@ describe('lazy journal — prompt contract', () => {
   // This test pins that guarantee end to end: on the next run, a comment's text IS
   // present in the assembled prompt while a journal entry's text is NOT — only the
   // count notice is.
-  // Do not weaken or delete this without explicit human approval (see CLAUDE.md).
+  // Do not weaken or delete this without explicit human approval (see AGENTS.md).
   test('journal entry BODY does NOT appear in the agent prompt on the next run', async () => {
     const taskId = await createTask(ctx, 'Prompt-contract task', 'Do the work');
 

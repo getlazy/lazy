@@ -96,7 +96,7 @@ describe('the per-task usage-pause allowance', () => {
   test('a paused start is refused, the daemon-wide override is left unused, and the refusal names the task\'s way through', async () => {
     const err = await start({});
     expect(isPauseRefusal(err)).toBe(true);
-    expect((err as RpcError).message).toContain('--past-usage-pause');
+    expect((err as RpcError).message).toContain('--override-usage-pause');
     expect(getUsagePauseOverride()).toBe(0);
   });
 
@@ -148,7 +148,7 @@ describe('the per-task usage-pause allowance', () => {
   });
 
   // INVARIANT: the BUILDER's launch (what lazy_start / lazy_unblock /
-  // lazy_resume send with past_usage_pause) gets past the pause; the same
+  // lazy_resume send with override_usage_pause) gets past the pause; the same
   // launch on a task agent's channel is refused before anything is set.
   test('a builder-channel launch carrying it passes the pause; an agent-channel one is refused', async () => {
     const builder = await rpc('startTask', { taskId, actor: 'builder', usagePausePastOnce: true });

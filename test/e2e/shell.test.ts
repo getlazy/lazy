@@ -1,6 +1,7 @@
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { join } from 'path';
 import { existsSync } from 'fs';
+import { rm } from 'fs/promises';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectError } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
@@ -35,6 +36,27 @@ describe('lazy shell', () => {
 
     expectSuccess(result);
     expect(existsSync(join(worktreePath, 'RAN_HERE.txt'))).toBe(true);
+  });
+
+  test('restores a missing worktree before opening a shell without starting another turn', async () => {
+    const taskId = await startedTask('Shell recovery test');
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+    const beforeResult = await ctx.lazy(['show', taskId, '--json']);
+    expectSuccess(beforeResult);
+    const before = JSON.parse(beforeResult.stdout);
+    const worktreePath = join(ctx.root, '.lazy', 'worktrees', taskId);
+    await rm(worktreePath, { recursive: true });
+    const result = await ctx.lazy(['shell', taskId, '--host', '--', 'touch', 'RESTORED_SHELL.txt']);
+    expectSuccess(result);
+    expect(result.stderr).toContain('Restoring task files');
+    expect(result.stdout).toBe('');
+    expect(existsSync(join(worktreePath, 'RESTORED_SHELL.txt'))).toBe(true);
+    const afterResult = await ctx.lazy(['show', taskId, '--json']);
+    expectSuccess(afterResult);
+    const after = JSON.parse(afterResult.stdout);
+    expect(after.status).toBe(before.status);
+    expect(after.session.id).toBe(before.session.id);
+    expect(after.turns.length).toBe(before.turns.length);
   });
 
   test('sets LAZY_TASK and runs with cwd at the worktree', async () => {

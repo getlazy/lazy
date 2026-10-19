@@ -7,7 +7,7 @@
  * bounded, disposable telemetry (src/proxy/audit-log.ts). A paused credential
  * sends no traffic, so during a long (7-day) pause its last reading is exactly
  * what rotates out; the next `lazy upgrade` then found "no reading" and let
- * turns start at 97%. Losing it costs the user money, so per CLAUDE.md it
+ * turns start at 97%. Losing it costs the user money, so per AGENTS.md it
  * belongs in Storage: this module writes every reading through, and seeds the
  * tracker from Storage FIRST, then the audit log (the newer reading per
  * credential wins either way).
@@ -26,13 +26,16 @@ import type { ResolvedConfig } from '../config/types';
 import type { StoredUsageLimitReading } from '../storage/types';
 import { UsageLimitReadingsUnreadableError } from '../storage/usage-limit-readings';
 import { readAuditRecords } from '../proxy/audit-log';
-import { daemonUsageLimits, usageWindows, type UsageLimitReading } from '../proxy/usage-limits';
+import { daemonUsageLimits, isMemberEndpointUsageKey, memberEndpointUsageKey, usageWindows, type UsageLimitReading } from '../proxy/usage-limits';
+import { loadConfig } from '../config/loader';
 import { logger } from '../utils/logger';
 
 /** The two Storage methods this module needs. */
 export interface UsageReadingStore {
   getUsageLimitReadings(): Promise<StoredUsageLimitReading[]>;
   saveUsageLimitReading(reading: StoredUsageLimitReading): Promise<void>;
+  /** Required when this store records member endpoint credentials; older test stores may omit it. */
+  deleteUsageLimitReading?(credential: string): Promise<void>;
 }
 
 /** At most one write per credential this often; the latest reading always lands. */
@@ -211,11 +214,16 @@ export function installUsageReadingStore(resolve: () => Promise<UsageReadingStor
  * retried on the next call until it succeeds; a failure is logged and never
  * fatal, since the live view still has whatever the proxy fed it since start.
  */
+/** Most recent audit records the one-time usage seed reads (about the old 8 MiB log's depth). */
+export const USAGE_SEED_RECORD_LIMIT = 20_000;
+
 export async function seedUsageReadings(projectRoot: string, config: ResolvedConfig): Promise<void> {
   await seedFromStore();
   if (!auditSeeded) {
     auditSeeded = (async () => {
-      const records = await readAuditRecords(join(projectRoot, config.data.path));
+      // Bounded: the log now keeps up to 128 MiB (a week), and only the latest
+      // reading per credential matters here — the newest records hold it.
+      const records = await readAuditRecords(join(projectRoot, config.data.path), { limit: USAGE_SEED_RECORD_LIMIT });
       // Folded quietly — a log of thousands of requests would otherwise queue a
       // write for every reading that moved — and then the RESULT is written
       // once per credential, which carries a reading that exists only in the
@@ -223,7 +231,13 @@ export async function seedUsageReadings(projectRoot: string, config: ResolvedCon
       const before = new Map(daemonUsageLimits.readings().map((r) => [r.credential, r.ts]));
       const spentBefore = daemonUsageLimits.spentCredentials();
       daemonUsageLimits.quietly(() => {
-        for (const r of records) daemonUsageLimits.observe(r);
+        for (const r of records) {
+          // Member+endpoint keys were introduced with durable readings. A deleted
+          // reading means the connection changed, not that an audit copy should
+          // restore the previous account's quota. Legacy keys keep their fold.
+          if (r.credential && isMemberEndpointUsageKey(r.credential)) continue;
+          daemonUsageLimits.observe(r);
+        }
       });
       if (store) {
         // Only what the log CHANGED: a reading it made newer, or a spend it added.
@@ -250,6 +264,12 @@ export async function seedUsageReadings(projectRoot: string, config: ResolvedCon
   await auditSeeded;
 }
 
+/** A conditional tier must distinguish unknown usage from unreadable saved usage. */
+export async function prepareTierUsageReadings(projectRoot: string, config: ResolvedConfig): Promise<void> {
+  await seedUsageReadings(projectRoot, config);
+  if (storeSeedError) throw new Error(`Saved usage readings are unavailable: ${storeSeedError.message}`);
+}
+
 /** Wait for every queued write (tests, and a clean shutdown). */
 export async function flushUsageReadingWrites(): Promise<void> {
   await Promise.all([...deferredMarks]);
@@ -261,6 +281,44 @@ export async function flushUsageReadingWrites(): Promise<void> {
     }
   }
   await Promise.all([...slots.values()].map((s) => s.inFlight));
+}
+
+/** Forget a replaced/revoked connection before its next usage decision. Renewal never calls this. */
+export async function clearMemberEndpointUsage(projectRoot: string, member: string, endpoint: string): Promise<void> {
+  const credential = memberEndpointUsageKey(member, endpoint);
+  const resolve = store;
+  // Outside a daemon there is no recorder or durable usage state to mutate.
+  if (!resolve) {
+    daemonUsageLimits.clear(credential);
+    return;
+  }
+  await seedUsageReadings(projectRoot, await loadConfig(projectRoot));
+  if (storeSeedError) throw new Error(`Cannot clear usage for endpoint "${endpoint}": ${storeSeedError.message}`);
+  await Promise.all([...deferredMarks]);
+  const recorder = await resolve();
+  if (!recorder.deleteUsageLimitReading) throw new Error(`Cannot clear usage for endpoint "${endpoint}": the usage store cannot delete readings`);
+  let slot = slots.get(credential);
+  if (!slot) {
+    slot = { lastWrite: 0, lastKey: null, pending: null, timer: null, inFlight: Promise.resolve() };
+    slots.set(credential, slot);
+  }
+  if (slot.timer) clearTimeout(slot.timer);
+  slot.timer = null;
+  slot.pending = null;
+  slot.lastWrite = 0;
+  slot.lastKey = null;
+  // Drain old writes, then delete. New responses queue behind the deletion;
+  // an already in-flight response repopulating a reading is accepted for alpha.
+  const deletion = slot.inFlight.then(() => recorder.deleteUsageLimitReading!(credential));
+  // The caller receives deletion's rejection below. Settle only the queue tail
+  // so a failed deletion cannot poison future saves or the next explicit retry.
+  slot.inFlight = deletion.then(() => undefined, () => undefined);
+  try {
+    await deletion;
+    daemonUsageLimits.clear(credential);
+  } catch (error) {
+    throw new Error(`Could not clear usage for ${member} at endpoint "${endpoint}": ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 /** Test-only: a daemon restart — forget the readings, the store, the seeding and the queued writes. */

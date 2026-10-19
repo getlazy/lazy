@@ -66,6 +66,23 @@ describe('applyFidelitySection', () => {
     const twice = applyFidelitySection(once, 'X');
     expect(twice).toBe(once);
   });
+
+  // INVARIANT: a PR description is Goal then Summary and never quotes the prompt.
+  // The agent's Summary is the place to say the work differed from the ask.
+  test('initial body is Goal then Summary, with no Prompt section', () => {
+    const body = composeInitialBody({ goal: 'g', footer: 'f' });
+    expect(body).not.toContain('## Prompt');
+    expect(body.indexOf('## Goal')).toBeLessThan(body.indexOf('## Summary'));
+  });
+
+  // INVARIANT: a refresh drops the old lazy-written Prompt section, leaving
+  // human text outside the markers alone.
+  test('refresh removes the legacy Prompt section', () => {
+    const legacy = `## Goal\n\ng\n\n## Prompt\n\nsome\n\n## Summary\n\n${wrapFidelitySection('old')}\n\nf`;
+    const out = applyFidelitySection(legacy, 'new');
+    expect(out).not.toContain('## Prompt');
+    expect(out).toBe(`## Goal\n\ng\n\n## Summary\n\n${wrapFidelitySection('new')}\n\nf`);
+  });
 });
 
 // ---------------------------------------------------------------------------

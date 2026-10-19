@@ -30,6 +30,8 @@ import { pinConfig } from '../helpers/pin-config';
 import { makeDaemonBaseDir, pinDaemonBaseDir, removeDaemonBaseDir } from '../helpers/daemon-base-dir';
 import { mintMcpToken, clearMcpTokenCache } from '../../src/daemon/mcp-tokens';
 import { isolateInProcessDaemonEnv } from '../helpers/in-process-daemon';
+import type { StoredConversation, BuilderSession } from '../../src/storage/types';
+import { mintDaemonToken } from '../../src/daemon/actor-tokens';
 
 const SHARED_TOKEN = 'shared-daemon-token-builder-storage-test';
 const BUILDER_NAME = 'builder-1700000000000';
@@ -85,6 +87,52 @@ describe('POST /builder/storage — the builder capture surface', () => {
       body: JSON.stringify(body),
     });
   }
+
+  test('capture attributes every segment to the token-bound run, never a supplied person', async () => {
+    const now = new Date().toISOString();
+    const run: BuilderSession = {
+      id: 'registered-run', projectRoot: ctx.root, memberEmail: 'alice@example.com',
+      kind: 'interactive', state: 'stopped', containerName: null,
+      builderId: BUILDER_NAME.slice('builder-'.length), agentSessionId: null,
+      createdAt: now, updatedAt: now, endedAt: null,
+    };
+    const registered = await post('/rpc/storage', SHARED_TOKEN, { method: 'createBuilderSession', args: { session: run } });
+    expect(registered.status).toBe(200);
+    for (const sessionId of ['segment-first', 'segment-after-clear']) {
+      const conversation: StoredConversation = {
+        sessionId, projectPath: '-repo', cwd: ctx.root, version: null, gitBranch: null,
+        startedAt: now, endedAt: now, importedAt: Date.now(), summary: 'A real question',
+        memberEmail: 'forged@example.com',
+        stats: { messageCount: 1, userMessageCount: 1, assistantMessageCount: 0, subagentCount: 0, totalTokens: 0 },
+        totalUsage: { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 },
+        messages: [{ uuid: `${sessionId}-human`, parentUuid: null, timestamp: now, role: 'user', text: 'A real question', model: null, usage: null }],
+        subagents: [],
+      };
+      const captured = await post('/builder/storage', builderToken, { method: 'saveConversation', args: { conversation } });
+      expect(captured.status).toBe(200);
+      const loaded = await post('/rpc/storage', SHARED_TOKEN, { method: 'loadConversation', args: { sessionId } });
+      expect((await loaded.json() as StoredConversation).memberEmail).toBe('alice@example.com');
+    }
+    const listing = await post('/rpc/storage', SHARED_TOKEN, { method: 'listBuilders', args: {} });
+    expect((await listing.json() as Array<{ memberEmail: string }>).map((builder) => builder.memberEmail)).toEqual(['alice@example.com', 'alice@example.com']);
+    const first = await post('/rpc/storage', SHARED_TOKEN, { method: 'loadConversation', args: { sessionId: 'segment-first' } });
+    const imported = await first.json() as StoredConversation;
+    imported.sessionId = 'imported-history';
+    imported.memberEmail = 'forged@example.com';
+    imported.messages = imported.messages.map((message) => ({ ...message, uuid: 'imported-human' }));
+    const importerToken = await mintDaemonToken(ctx.root, { kind: 'user', email: 'importer@example.com' }, 'importer');
+    const priorManaged = process.env.LAZY_MANAGED;
+    process.env.LAZY_MANAGED = '1';
+    try {
+      const saved = await post('/rpc/storage', importerToken, { method: 'saveConversation', args: { conversation: imported } });
+      expect(saved.status).toBe(200);
+    } finally {
+      if (priorManaged === undefined) delete process.env.LAZY_MANAGED;
+      else process.env.LAZY_MANAGED = priorManaged;
+    }
+    const loaded = await post('/rpc/storage', SHARED_TOKEN, { method: 'loadConversation', args: { sessionId: imported.sessionId } });
+    expect((await loaded.json() as StoredConversation).memberEmail).toBeNull();
+  });
 
   // The bug, inverted: these are the exact calls the capture monitor makes.
   test('a builder token can call the allowlisted capture methods', async () => {

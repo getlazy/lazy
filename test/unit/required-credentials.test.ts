@@ -64,10 +64,10 @@ function configWith(
 }
 
 const LOCAL_CLAUDE: AgentProfileConfig = {
-  harness: 'claude-code', model: 'qwen3.8:latest', endpoint: 'http://localhost:11434',
+  harness: 'claude-code', model: 'qwen3.8:latest', endpoint: 'http://localhost:11434', credential: 'none',
 };
 const OPENROUTER_CODEX: AgentProfileConfig = {
-  harness: 'codex', model: 'gpt-5-codex', endpoint: 'https://openrouter.ai/api',
+  harness: 'codex', model: 'gpt-5-codex', endpoint: 'https://openrouter.ai/api', credential: 'openrouter',
 };
 
 describe('requiredCredentials', () => {

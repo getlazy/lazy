@@ -14,6 +14,7 @@ import {
   getTaskSessionBinding,
   lookupSessionBinding,
 } from '../../src/daemon/session-credentials';
+import { NO_OWNER_ENDPOINT_CREDENTIAL_MARKER } from '../../src/daemon/member-credentials';
 import { NO_OWNER_CREDENTIAL_MARKER, sessionCredentialEnvFor } from '../../src/daemon/turn-credentials';
 import {
   planMemberContainerCredential,
@@ -140,7 +141,7 @@ describe('member terminal credential', () => {
       root, taskId: TASK, sessionId: 's1', memberEmail: 'bob@example.com', container: 'lazymember-t-1',
     });
     expect(planned).toMatchObject({ ok: false, status: 400 });
-    if (!planned.ok) expect(planned.message).toContain(NO_OWNER_CREDENTIAL_MARKER);
+    if (!planned.ok) expect(planned.message).toContain(NO_OWNER_ENDPOINT_CREDENTIAL_MARKER);
   });
 });
 

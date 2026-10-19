@@ -52,9 +52,9 @@ export interface DaemonCredentialEntry {
   /** Profiles whose `credential` slot bills it, sorted. */
   requiredBy: string[];
   present: boolean;
-  /** Where the daemon found it — its environment, the store's index, the agent key file — or null. */
-  source: 'env' | 'store' | 'file' | null;
-  /** The env var NAME, the store backend id, or the key file's path. Null when absent. */
+  /** Where the daemon found it — its environment or the store's index — or null. */
+  source: 'env' | 'store' | null;
+  /** The env var NAME or the store backend id. Null when absent. */
   via: string | null;
   /**
    * Which FORM is in effect — `oauth` (a subscription) or `api-key` (a metered
@@ -111,6 +111,13 @@ export interface DaemonCredentialState {
    * Anthropic-only answer as the whole picture.
    */
   providers?: DaemonCredentialEntry[];
+  /**
+   * True when this daemon bills every turn to the member who asked for it
+   * (team mode — always so on a Lazy Teams host). What the daemon itself holds
+   * then pays for nothing, so `providers` says nothing about whether a turn
+   * can run, and a client must not report an absent entry as a problem.
+   */
+  perMember?: boolean;
 }
 
 /**

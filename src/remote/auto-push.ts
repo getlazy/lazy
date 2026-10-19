@@ -12,7 +12,7 @@
  * It is deliberately NOT a global "never push". Pushes a merge depends on for
  * correctness stay unconditional: `lazy accept` must push the parent branch
  * before (and after) a merge or origin drifts permanently behind local — see
- * the "Fail hard on remote failures" invariant in CLAUDE.md — and `lazy submit`
+ * the "Fail hard on remote failures" invariant in AGENTS.md — and `lazy submit`
  * cannot open a PR for a branch the forge cannot see. Those are the user asking
  * for a remote operation by name, which is the opposite of "behind my back".
  *

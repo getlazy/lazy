@@ -17,7 +17,7 @@ import { calculateBackoffMs, runSyncRetryTick } from '../../src/daemon/sync-retr
 
 // This suite awaits runSyncRetryTick() IN-PROCESS in a daemonless project, so
 // the `bun test` process itself runs production code and must declare test
-// mode. See CLAUDE.md, "A daemonless suite that calls src/ in-process must
+// mode. See AGENTS.md, "A daemonless suite that calls src/ in-process must
 // declare test mode".
 enableInProcessTestMode();
 

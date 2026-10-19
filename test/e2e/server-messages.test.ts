@@ -42,7 +42,7 @@ function seedMessage(overrides: Partial<StoredSystemMessage> = {}): StoredSystem
 }
 
 /** Form POST exactly as the browser would send it, without following redirects. */
-async function postAction(fetch: DashboardFetch, base: string, id: string, action: 'read' | 'dismiss', all = false) {
+async function postAction(fetch: DashboardFetch, base: string, id: string, action: 'read' | 'dismiss' | 'dismiss-like', all = false) {
   const body = new URLSearchParams();
   if (all) body.set('all', '1');
   return fetch(`${base}/messages/${encodeURIComponent(id)}/${action}`, {
@@ -166,6 +166,30 @@ describe('web system-messages inbox', () => {
     expect(await (await fetch(`${base}/messages?all=1`)).text()).toContain('Dismiss me');
   });
 
+  test('"Dismiss all like this" and "Dismiss all" file messages away in bulk', async () => {
+    const restarted = (n: number) => seedMessage({ source: 'machine-docker', title: 'Docker restarted', kind: 'notice', created_at: Date.now() - n });
+    const docker = [restarted(1), restarted(2), { ...restarted(3), repeat_count: 5, last_seen_at: Date.now() }];
+    const keep = seedMessage({ title: 'Keep me' });
+    writeSystemMessagesFile(ctx.root, [...docker, keep]);
+
+    const inbox = await (await fetch(`${base}/messages`)).text();
+    expect(inbox).toContain('Dismiss all like this');
+    expect(inbox).toContain('/messages/dismiss-all');
+    expect(inbox).toContain('happened 5 times');
+
+    const like = await postAction(fetch, base, docker[0].id, 'dismiss-like');
+    expect(like.status).toBe(303);
+    let stored = readSystemMessagesFile(ctx.root);
+    expect(stored.filter((m) => m.source === 'machine-docker').every((m) => m.dismissed_by === 'human')).toBe(true);
+    expect(stored.find((m) => m.id === keep.id)!.dismissed_at).toBeUndefined();
+
+    const all = await fetch(`${base}/messages/dismiss-all`, { method: 'POST', body: new URLSearchParams(), redirect: 'manual' });
+    expect(all.status).toBe(303);
+    stored = readSystemMessagesFile(ctx.root);
+    expect(stored).toHaveLength(4);
+    expect(stored.every((m) => (m.dismissed_at ?? 0) > 0)).toBe(true);
+  });
+
   test('the JSON index carries the unread count and no bodies', async () => {
     const unread = seedMessage({ title: 'Unread one' });
     const read = seedMessage({ title: 'Read one', read_at: Date.now(), created_at: Date.now() - 1000 });
@@ -218,6 +242,9 @@ describe('web system-messages inbox', () => {
  * over a stub Storage in test/unit/server-nav-counts.test.ts instead.
  */
 interface NavCounts {
+  /** Working tasks and tasks waiting for a human — the Tasks and Review nav badges. */
+  active: number | null;
+  blocked: number | null;
   unread: number;
   review: number;
   /** Live loop TASKS — the Loops page's badge. */
@@ -295,6 +322,8 @@ describe('web nav count badges', () => {
 
   test('a fresh project reports zero everywhere and offers no conversation mark', async () => {
     expect(await counts()).toEqual({
+      active: 0,
+      blocked: 0,
       unread: 0,
       review: 0,
       clusters: 0,
@@ -408,6 +437,8 @@ describe('web nav count badges', () => {
     const res = await fetch(`${base}/api/nav-counts`);
     const body = await res.text();
     expect(Object.keys(JSON.parse(body) as NavCounts).sort()).toEqual([
+      'active',
+      'blocked',
       'clusters',
       'conversations',
       'conversationsLatestAt',

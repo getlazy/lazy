@@ -27,7 +27,7 @@ import type { TestContext } from './setup';
  * there shows up as noise in both.
  *
  * The keys are rewritten IN the `[agent]` table `lazy init` already writes, per
- * CLAUDE.md ("change a test's lazy.toml by EDITING the key, never by
+ * AGENTS.md ("change a test's lazy.toml by EDITING the key, never by
  * overwriting the file"). Appending a second `[agent]` section is a TOML
  * redefinition error — which is exactly what this helper used to do, killing
  * every suite that called it the moment `[agent]` entered the init template.
@@ -69,7 +69,9 @@ export async function taskDir(root: string, shortId: string): Promise<string> {
   const toml = await readFile(join(root, 'lazy.toml'), 'utf-8');
   const m = toml.match(/^external_path\s*=\s*"(.+)"/m);
   const tasksDir = m && m[1] ? join(m[1], 'tasks') : join(root, '.lazy', 'tasks');
-  const dirs = await readdir(tasksDir);
+  // Skip FileStorage's staging (`<id>.tmp.<ms>`) and backup dirs: a daemon
+  // writing this task has a staging dir sharing the id prefix.
+  const dirs = (await readdir(tasksDir)).filter(d => !d.includes('.tmp') && !d.includes('.backup'));
   const dir = dirs.find(d => d.startsWith(shortId));
   if (!dir) throw new Error(`No task directory for ${shortId} in ${tasksDir}`);
   return join(tasksDir, dir);
@@ -143,12 +145,12 @@ export async function waitForStatus(
   );
 }
 
-/** The prompt argv the fake agent received on each real turn, oldest first. */
+/** The prompt (on stdin — never argv) the fake agent received on each real turn, oldest first. */
 export async function turnPrompts(ctx: TestContext): Promise<string[]> {
   const invocations = await ctx.claudeInvocations();
   return invocations
     .filter(i => i.argv.includes('-p'))
-    .map(i => i.argv[i.argv.indexOf('-p') + 1] ?? '');
+    .map(i => i.stdin ?? '');
 }
 
 /** Poll until the fake agent receives a prompt matching a semantic work-turn condition. */
@@ -166,4 +168,28 @@ export async function waitForTurnPrompt(
     await new Promise(resolve => setTimeout(resolve, 100));
   }
   throw new Error(`No matching agent prompt within ${timeoutMs}ms (${prompts.length} prompts observed)`);
+}
+
+/**
+ * A task prompt over 200 KiB — past Linux's 128 KiB limit on ONE argv element
+ * (MAX_ARG_STRLEN), so a harness that put it in argv dies with E2BIG at spawn.
+ * Ends with `tail` so a test can prove the agent received ALL of it.
+ */
+export function largePrompt(tail: string): string {
+  const line = 'This line pads the prompt past the argv element limit; the agent must still receive all of it.\n';
+  return line.repeat(Math.ceil((210 * 1024) / line.length)) + tail;
+}
+
+/**
+ * Create a task whose prompt arrives on the CLI's stdin. A large prompt cannot
+ * be handed to `lazy create --prompt` in a test either: that is an argv element
+ * of the test's own spawn, and fails with E2BIG for the same reason.
+ */
+export async function createTaskWithPipedPrompt(ctx: TestContext, goal: string, prompt: string): Promise<string> {
+  const { extractTaskId } = await import('./assertions');
+  const result = await ctx.lazy(['create', '--goal', goal], { input: prompt });
+  if (result.exitCode !== 0) {
+    throw new Error(`Failed to create task: ${result.stderr}\n${result.stdout}`);
+  }
+  return extractTaskId(result.stdout);
 }

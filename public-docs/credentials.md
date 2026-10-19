@@ -122,8 +122,8 @@ credential never outranks the store it came from.
 ### Named credentials
 
 A credential name does not have to be a provider. `anthropic`, `openai`,
-`openrouter`, `ollama`, `cursor` and `chatgpt` are just the names lazy knows how
-to infer; `lazy auth set <name>` stores **any** name (lowercase letters, digits, `.`, `_`
+`openrouter`, `fireworks`, `ollama`, `cursor` and `chatgpt` are just the provider names lazy
+knows; `lazy auth set <name>` stores **any** name (lowercase letters, digits, `.`, `_`
 and `-`, up to 64 characters), and an
 [agent profile](lazy-toml.md#agentsname--named-agent-profiles) picks one up with
 `credential = "<name>"`:
@@ -135,15 +135,21 @@ model = "gpt-6-sol"
 credential = "work-openai"    # lazy auth set work-openai
 ```
 
-That is how two profiles on the same provider bill different accounts. Profiles
-that do **not** name a credential share the one inferred from their endpoint, so
-the common case stays a single key per provider.
+That is how two profiles on the same provider bill different accounts. Every
+profile with an `endpoint` must name its credential (`"none"` for a local
+server); profiles naming the same one share a single key, so the common case
+stays one key per provider.
 
 A named credential has an environment form like every other:
 `LAZY_CREDENTIAL_WORK_OPENAI` for an API key, `LAZY_CREDENTIAL_WORK_OPENAI_OAUTH`
 for an OAuth token — the name uppercased with everything else turned into `_`.
 The environment still wins over the store, so a CI job can export one without
 lazy having to know the name in advance.
+
+In Lazy Teams none of this applies: every turn is paid by the credential the
+member who asked for it connected for that endpoint. The daemon never reads a
+credential from its environment or its store, under any name, and a turn whose
+member has not connected one is refused.
 
 ## Where credentials are stored
 
@@ -166,6 +172,16 @@ location outside the repository are the real protections. `lazy auth list` and
 `lazy doctor` always name the backend in use, so you can tell which one you got.
 If you asked for a specific backend and it is unavailable, `lazy auth set` fails
 rather than quietly writing a plaintext file instead.
+
+Credential updates are serialized across CLI processes and background writes,
+so changing one account does not overwrite another account's record. The index
+and file backend publish complete replacement files; an interrupted write does
+not leave truncated JSON. Persistent `.lock` files live in a private local
+runtime directory, outside the credential data directory, and contain no
+credentials. Do not delete them while lazy is running; a writer's lock is
+released automatically if its process exits. Credential data files must not
+be symbolic links: updates refuse both existing-target and dangling file links.
+Symbolic links to their parent directories remain supported.
 
 A long secret — a ChatGPT subscription session is a few kilobytes — is stored in
 the macOS Keychain as more than one item: `chatgpt`, then `chatgpt#2`, and so on.
@@ -243,6 +259,10 @@ the profile it runs on:
   when the endpoint is `openrouter.ai`. The same hostname rule applies to a
   profile pinned at OpenRouter's Anthropic-compatible endpoint: it bills your
   OpenRouter key, never your Anthropic one.
+- A profile on `api.fireworks.ai` (Fireworks, including its FireRouter models)
+  → the `fireworks` credential (`FIREWORKS_API_KEY`, or `lazy auth set fireworks`),
+  on either wire. Routing to Opus through FireRouter also needs your Anthropic
+  key connected in your Fireworks account; lazy does not send one itself.
 - A profile on the ChatGPT subscription backend
   (`https://chatgpt.com/backend-api/codex`) → the `chatgpt` credential. See
   [Running Codex on a ChatGPT subscription](#running-codex-on-a-chatgpt-subscription).
@@ -258,7 +278,7 @@ nothing until a task selects it. See
 `lazy doctor` is the diagnosis surface. It prints one line per credential your
 agent profiles bill — the role defaults plus every `[agents.<name>]` block —
 naming where the daemon found each one (its environment, the store and its
-backend, or the agent key file) and which profiles need it. A missing one is a
+backend) and which profiles need it. A missing one is a
 warning naming the profiles whose turns will be refused, with the `lazy auth set`
 command that stores it. `lazy daemon health` shows the same thing under
 **Model credentials**. And — because the turn check is presence-only and never
@@ -407,7 +427,28 @@ time would just swap which copy goes stale first.
 it for you from the refresh token and stores the renewed session, so you should
 not have to re-import. If the session is revoked, or sits unused long enough
 to lapse, turns fail with a message saying so — run `codex login` and
-`lazy auth import chatgpt` again.
+`lazy auth import chatgpt` again. A renewal that only fails for a moment — the
+sign-in server times out, cannot be reached, or answers with a server error — is
+not treated as a broken credential: the request is answered as temporarily
+unavailable and the agent retries it. Only a renewal the server actually refuses
+marks the credential as not working.
+
+**Do not keep using the imported session in another client.** Importing copies
+your codex CLI's own signed-in session, so lazy and that CLI then hold the same
+refresh token — and every refresh spends it and issues a new one. Whichever of
+the two refreshes first leaves the other with a spent token, and its next
+refresh fails with `refresh_token_reused` ("Your refresh token has already been
+used…"). After importing, run `codex login` again in your own CLI so it has a
+session of its own; if lazy's copy is the one that broke, log in and import
+again.
+
+When a credential stops working, lazy says so in three places: the task shows
+`failed:fatal_auth` beside its status (`lazy list`, `lazy show`) with the error
+and what to do, lazy files an alert in `lazy messages` naming the agent profile
+and the fix (one alert per problem, counting repeats), and `lazy stats limits`
+lists the credential as not usable. Feedback you sent to a task whose turn
+failed is kept and delivered with the next turn, so there is no need to send it
+again.
 
 Your session never enters a task container. The container is handed a
 placeholder, exactly as for an API key, and lazy's proxy swaps in the real token
@@ -420,8 +461,31 @@ is also refused for a profile whose endpoint authenticates nobody
 (`credential = "none"`, the default for a local model server): there is no key
 to store.
 
+## Services and background processes in a task container
+
+Processes inside a task container never hold a real credential, only a
+placeholder for the task. Lazy resolves that placeholder to the credential of
+whoever owns the task's **current turn**. This means:
+
+- A service started during one member's turn, or a process an earlier turn left
+  running in the background, is billed to whichever member's turn is running
+  when it makes a model or API call — not to the member who started it.
+- Between turns the placeholder is revoked, so calls from such a process fail
+  with a 401 until the next turn starts.
+
+This is how Lazy works today.
+
 ## Human-only, by design
 
 There is no MCP counterpart to `lazy auth`. Writing credentials is a human
 decision; agents must never store, read, or rotate one. See
 [surface asymmetries](surface-asymmetries.md).
+
+### Obsolete agent key files
+
+Lazy no longer reads `agent-credentials.json`. At daemon startup it deletes both
+`~/.lazy/daemon/<project-slug>/agent-credentials.json` and
+`<project>/.lazy/agent-credentials.json`, logging each deleted path. No keys are
+migrated. If your only key was in one of these files, store it again with
+`lazy system agent set-key <profile>`, or export `CURSOR_API_KEY` / `OPENAI_API_KEY`
+in the environment the daemon starts from.

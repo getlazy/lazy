@@ -23,7 +23,7 @@
  * BOUNDED BY CONSTRUCTION: the cache holds at most MAX_CACHED_RESULTS entries
  * and evicts oldest-first. It is process-local and disposable — losing it costs
  * a re-count, nothing else — so it is not storage state under any reading of
- * CLAUDE.md's carve-out.
+ * AGENTS.md's carve-out.
  *
  * THE COUNT IS AN APPROXIMATION AND SAYS SO. It comes from the project's BPE
  * tier (src/utils/token-count.ts), which undercounts Claude by roughly 15-20%.

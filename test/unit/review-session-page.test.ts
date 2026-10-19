@@ -169,3 +169,16 @@ describe('reviewSessionPollJson', () => {
     expect(payload.messages[1].is_preamble).toBe(false);
   });
 });
+
+describe('copy-markdown on review-session messages', () => {
+  // INVARIANT: every message (builder, system and human) carries a Copy button with its exact source.
+  test('the archived transcript page carries the source', () => {
+    const msgs = [
+      message({ id: 'a', role: 'assistant', content: '# Plan\n\n- one' }),
+      message({ id: 'h', role: 'human', content: 'why "this"?' }),
+    ];
+    const html = reviewSessionPageHtml(task(), session(), msgs);
+    expect(html.match(/class="md-copy"/g)?.length).toBe(2);
+    expect(html).toContain(JSON.stringify('# Plan\n\n- one').replace(/"/g, '&quot;'));
+  });
+});

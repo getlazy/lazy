@@ -302,8 +302,8 @@ describe('lazy edit on started tasks', () => {
   });
 
   // INVARIANT: Non-model fields stay frozen once an agent has worked on the
-  // task — changing goal/prompt/type/code/parent mid-flight is unsafe. Only
-  // --model is exempt.
+  // task — changing goal/prompt/type/parent mid-flight is unsafe. Only
+  // --model is exempt (a code change on its own is a cosmetic rename, allowed).
   test('goal edit is still rejected on a started task', async () => {
     const taskId = await startedTask();
 

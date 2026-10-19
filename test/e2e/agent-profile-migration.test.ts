@@ -154,6 +154,7 @@ describe('agent profile migration', () => {
         harness: 'claude-code',
         model: 'qwen3:8b',
         endpoint: 'http://localhost:11434',
+        credential: 'none',
       });
       expect(parsed.agent.agent_id).toBe('local-ollama');
 

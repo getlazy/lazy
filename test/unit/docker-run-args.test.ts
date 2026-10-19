@@ -129,7 +129,7 @@ describe('[docker] run_args root anchoring', () => {
   // worktree's copy. Task branches are agent-writable — a worktree lazy.toml
   // that could add `--privileged` or a host bind mount would let an agent
   // escalate its own next container. Same reasoning as image resolution
-  // (see "Task worktrees never auto-govern container images" in CLAUDE.md).
+  // (see "Task worktrees never auto-govern container images" in AGENTS.md).
   test('a worktree lazy.toml with run_args is ignored', async () => {
     await writeFile(join(root, 'lazy.toml'), '[docker]\nrun_args = ["--cap-add=SYS_PTRACE"]\n', 'utf-8');
     await writeFile(join(worktree, 'lazy.toml'), '[docker]\nrun_args = ["--privileged"]\n', 'utf-8');

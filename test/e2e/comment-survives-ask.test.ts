@@ -13,7 +13,7 @@ import { successScenario } from '../helpers/fake-claude';
 async function promptCarrying(ctx: TestContext, feedback: string): Promise<string> {
   const prompts = (await ctx.claudeInvocations())
     .filter(i => i.argv.includes('-p'))
-    .map(i => i.argv.join('\n'))
+    .map(i => i.stdin ?? '')
     .filter(p => p.includes(feedback));
   expect(prompts).toHaveLength(1);
   return prompts[0];
@@ -125,7 +125,7 @@ describe('a queued comment survives an intervening ask', () => {
     expect(second).not.toContain('REVIEW NOTE: only once please');
     // Across EVERY prompt, self-review/revise/wrap-up included: carried once.
     const carriers = (await ctx.claudeInvocations())
-      .filter(i => i.argv.includes('-p') && i.argv.join('\n').includes('REVIEW NOTE: only once please'));
+      .filter(i => i.argv.includes('-p') && (i.stdin ?? '').includes('REVIEW NOTE: only once please'));
     expect(carriers).toHaveLength(1);
   }, 180_000);
 });

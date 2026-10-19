@@ -195,3 +195,15 @@ export async function createStorage(lazyRoot: string, options?: CreateStorageOpt
   await storage.initialize();
   return storage;
 }
+
+/**
+ * The directory a project's file store lives in, as createStorage resolves it
+ * — the configured `[storage] external_path`, else `~/.lazy/<project-name>` —
+ * WITHOUT creating or opening anything. For callers that must look at the
+ * store before anything opens it (the pre-upgrade backup).
+ */
+export async function resolveStorePath(lazyRoot: string): Promise<string> {
+  const config = await loadConfig(lazyRoot);
+  if (config.storage.external_path) return config.storage.external_path;
+  return join(getHome(), '.lazy', await getProjectName(lazyRoot, config.remote.git_remote));
+}

@@ -127,6 +127,37 @@ describe('lazy env (per-task environment variables)', () => {
     expect(turns[turns.length - 1].env?.DUMMY_TASK_TOKEN).toBe(UPDATED);
   }, 180_000);
 
+
+  // INVARIANT: once a value is registered with `lazy env set`, it is absent
+  // from every `show` answer and from the taskEnv responses — including text
+  // written BEFORE it was registered (here: the goal and prompt) — and a
+  // comment carrying it is scrubbed as it is written to the store.
+  test('show and env output never carry a registered value', async () => {
+    const taskId = await createTask(ctx, `Goal mentioning ${SECRET}`, `Prompt using ${SECRET}`);
+    const set = await ctx.lazy(['env', 'set', taskId, `DUMMY_TASK_TOKEN=${SECRET}`]);
+    expectSuccess(set);
+    expectOutputExcludes(set, SECRET);
+    expectSuccess(await ctx.lazy(['comment', taskId, '-m', `the token is ${SECRET}`]));
+
+    const shown = await ctx.lazy(['show', taskId, '--json']);
+    expectSuccess(shown);
+    expect(shown.stdout).not.toContain(SECRET);
+    expect(shown.stdout).toContain('<redacted>');
+    const human = await ctx.lazy(['show', taskId]);
+    expectSuccess(human);
+    expectOutputExcludes(human, SECRET);
+
+    for (const argv of [['env', 'list', taskId], ['env', 'unset', taskId, 'DUMMY_TASK_TOKEN']]) {
+      const r = await ctx.lazy(argv);
+      expectSuccess(r);
+      expectOutputExcludes(r, SECRET);
+    }
+
+    // The comment reached the store scrubbed (the goal/prompt were written
+    // before registration and are scrubbed on the way OUT, above).
+    const comments = await filesContaining(storageDirFor(ctx.root), `the token is ${SECRET}`);
+    expect(comments).toEqual([]);
+  }, 120_000);
   test('another task does not get it', async () => {
     const withVar = await createTask(ctx, 'Has a token', 'Do the work');
     const without = await createTask(ctx, 'Has no token', 'Do the work');
@@ -228,6 +259,21 @@ describe('lazy env (per-task environment variables)', () => {
 
     expect((await readFile(registry, 'utf-8')).includes(SECRET)).toBe(false);
     expectOutput(await ctx.lazy(['env', 'list', taskId]), 'No environment variables');
+  }, 60_000);
+
+  // INVARIANT: a task that has ended takes no new variables. Its env was
+  // cleared at the terminal transition, so a set landing afterwards (a push
+  // racing the completion) would leave a secret on the host nothing clears.
+  test('setting variables on a task that has ended is refused and stores nothing', async () => {
+    const taskId = await createTask(ctx, 'Ended before the push', 'Do the work');
+    expectSuccess(await ctx.lazy(['close', taskId, '--reason', 'done with it', '--yes']));
+
+    const result = await ctx.lazy(['env', 'set', taskId, `DUMMY_TASK_TOKEN=${SECRET}`]);
+    expectFailure(result);
+    expectError(result, 'takes no environment variables');
+    expectOutputExcludes(result, SECRET);
+    const registry = await readFile(getTaskEnvPath(ctx.root), 'utf-8').catch(() => '');
+    expect(registry.includes(SECRET)).toBe(false);
   }, 60_000);
 
   test('an unknown task is refused rather than silently stored', async () => {

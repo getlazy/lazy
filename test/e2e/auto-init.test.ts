@@ -97,7 +97,7 @@ describe('auto-init', () => {
     // LAZY_TEST=1: this test is about lazy-root discovery from a nested cwd,
     // not about the daemon. Without it, `lazy list` auto-starts a REAL daemon
     // bound to a temp dir this suite then deletes — a leaked daemon holding a
-    // port from the bounded window (see CLAUDE.md), and a hard failure on any
+    // port from the bounded window (see AGENTS.md), and a hard failure on any
     // machine without a model credential, since the daemon's credential gate
     // refuses to start.
     const result = await runLazy(subDir, ['list'], { LAZY_TEST: '1' });

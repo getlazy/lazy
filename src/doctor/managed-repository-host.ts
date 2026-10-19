@@ -75,7 +75,7 @@ export async function managedRepositoryHostChecks(
 
   const url = await run(['git', 'remote', 'get-url', remote], root);
   if (url.exitCode !== 0) {
-    checks.push({ state: 'fail', what: `Git remote ${remote}`, reason: `The clone has no remote '${remote}' configured.` });
+    checks.push({ state: 'fail', what: `Git remote ${remote}`, problem: `Git remote ${remote} is not configured`, reason: `The clone has no remote '${remote}' configured.` });
     return checks;
   }
 
@@ -87,6 +87,7 @@ export async function managedRepositoryHostChecks(
     checks.push({
       state: 'fail',
       what: `Git can reach and authenticate to remote ${remote}`,
+      problem: `Git can't reach or authenticate to remote ${remote}`,
       reason: `git ls-remote ${remote} (${url.stdout.trim()}) failed through the clone's credential helper: ${why}. ` +
         `Check the project's forge connection token and that the repository still exists.`,
     });
@@ -100,6 +101,7 @@ export async function managedRepositoryHostChecks(
     checks.push({
       state: 'fail',
       what: 'Git push credential',
+      problem: 'Git has no usable push credential',
       reason: `No ${forge.label} token (${forge.tokenVar}) in the daemon's environment, so the credential helper has ` +
         `nothing to push with: the repository can be read, but pushes and accepts cannot authenticate. ` +
         `Connect a forge account for this project.`,

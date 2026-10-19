@@ -18,12 +18,13 @@
  */
 
 import { join } from 'path';
-import { requireLazyRoot } from '../helpers';
+import { requireLazyRoot, refuseIfBoundClone } from '../helpers';
 import { loadConfig } from '../../config/loader';
 import { setOfflineMode, resolveOfflineStatus, formatOfflineExpiry } from '../../utils/offline';
 import { theme } from '../../render/theme';
 
 export async function commandOffline(_args: string[]): Promise<void> {
+  await refuseIfBoundClone('system offline');
   const root = requireLazyRoot();
   const dataDir = join(root, '.lazy');
 
@@ -72,6 +73,7 @@ export async function commandOffline(_args: string[]): Promise<void> {
 }
 
 export async function commandOnline(_args: string[]): Promise<void> {
+  await refuseIfBoundClone('system online');
   const root = requireLazyRoot();
   const dataDir = join(root, '.lazy');
 

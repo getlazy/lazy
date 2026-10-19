@@ -5,7 +5,7 @@
  * - Signal is a **comment** on the parent, nothing else.
  * - Never auto-unblocks and never emits `child_completed` — that is what
  *   "auto-react off" means, and local comments must never start a turn
- *   (fix-comment-auto-launch / CLAUDE.md).
+ *   (fix-comment-auto-launch / AGENTS.md).
  * - The accept-tag SHA is included so a parent that already saw the same SHA
  *   from `lazy_wait` (when the child is already `complete`) can treat the note
  *   as idempotent.

@@ -7,6 +7,12 @@
  *
  * HOME is redirected per test so the checks read fixture files rather than the
  * developer's real ~/.claude.json — getHome() reads $HOME.
+ *
+ * PATH is prefixed with a stub `lazy-agent` that exits at once, for the same
+ * reason: the fixtures name `lazy-agent` as the MCP command, so without the
+ * stub the live checks spawned whatever `lazy-agent` the machine running the
+ * suite has. Inside a lazy agent container that is a real server dialling
+ * host.docker.internal, and every test waited out the 20 s self-test timeout.
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
@@ -28,14 +34,26 @@ describe('lazy-agent doctor', () => {
   let configPath: string;
   let prevHome: string | undefined;
   let prevDaemonConfig: string | undefined;
+  let prevPath: string | undefined;
+  let prevScratch: string | undefined;
+  let prevReadOnly: string | undefined;
 
   beforeEach(async () => {
+    // The doctor reads these ambiently; a builder container sets SCRATCH, a task container doesn't.
+    prevScratch = process.env.LAZY_SCRATCH_DIR;
+    prevReadOnly = process.env.LAZY_MCP_READ_ONLY;
+    delete process.env.LAZY_SCRATCH_DIR;
+    delete process.env.LAZY_MCP_READ_ONLY;
     home = await mkdtemp(join(tmpdir(), 'lazy-doctor-home-'));
     configPath = join(home, 'daemon-mcp.json');
     prevHome = process.env.HOME;
     prevDaemonConfig = process.env.LAZY_DAEMON_CONFIG;
     process.env.HOME = home;
     process.env.LAZY_DAEMON_CONFIG = configPath;
+    prevPath = process.env.PATH;
+    await mkdir(join(home, 'bin'));
+    await writeFile(join(home, 'bin', 'lazy-agent'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    process.env.PATH = `${join(home, 'bin')}:${prevPath ?? ''}`;
 
     await writeFile(configPath, JSON.stringify({
       token: TOKEN,
@@ -58,10 +76,16 @@ describe('lazy-agent doctor', () => {
   });
 
   afterEach(async () => {
+    if (prevScratch === undefined) delete process.env.LAZY_SCRATCH_DIR;
+    else process.env.LAZY_SCRATCH_DIR = prevScratch;
+    if (prevReadOnly === undefined) delete process.env.LAZY_MCP_READ_ONLY;
+    else process.env.LAZY_MCP_READ_ONLY = prevReadOnly;
     if (prevHome === undefined) delete process.env.HOME;
     else process.env.HOME = prevHome;
     if (prevDaemonConfig === undefined) delete process.env.LAZY_DAEMON_CONFIG;
     else process.env.LAZY_DAEMON_CONFIG = prevDaemonConfig;
+    if (prevPath === undefined) delete process.env.PATH;
+    else process.env.PATH = prevPath;
     await rm(home, { recursive: true, force: true });
   });
 
@@ -86,6 +110,18 @@ describe('lazy-agent doctor', () => {
     expect(result.taskId).toBe('task-uuid-1');
   });
 
+  // INVARIANT: a server that exits is reported as exited, at once. Doctor used
+  // to keep polling a dead process for the whole 20 s self-test timeout and
+  // then blame "no reply within the timeout" — slow, and the wrong diagnosis.
+  test('an MCP server that exits is reported as exited, without waiting out the timeout', async () => {
+    const started = Date.now();
+    const result = await runAgentDoctor();
+    const c = check(result.checks, 'mcp-selftest');
+    expect(c.ok).toBe(false);
+    expect(c.detail).toContain('exited (code 1) without replying');
+    expect(Date.now() - started).toBeLessThan(10_000);
+  });
+
   test('a missing LAZY_DAEMON_CONFIG fails with an actionable remedy', async () => {
     delete process.env.LAZY_DAEMON_CONFIG;
     const result = await runAgentDoctor();
@@ -93,6 +129,15 @@ describe('lazy-agent doctor', () => {
     expect(c.ok).toBe(false);
     expect(c.remedy).toBeDefined();
     expect(result.ok).toBe(false);
+  });
+
+  test('a builder session (scratch dir set, no LAZY_DAEMON_CONFIG) reports daemon-config as not applicable', async () => {
+    delete process.env.LAZY_DAEMON_CONFIG;
+    process.env.LAZY_SCRATCH_DIR = home;
+    const result = await runAgentDoctor();
+    const c = check(result.checks, 'daemon-config');
+    expect(c.ok).toBe(true);
+    expect(c.data?.notApplicable).toBe(true);
   });
 
   test('an unreadable daemon config fails rather than being skipped', async () => {

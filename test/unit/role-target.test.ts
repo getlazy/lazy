@@ -633,8 +633,8 @@ describe('connectivity preflight', () => {
     // INVARIANT: the preflight NEVER tells a reader on a managed host to put an
     // endpoint in the repository's lazy.toml. `agents.*.endpoint` is `refused`
     // by the managed policy, so following that advice does not fix the launch —
-    // it makes the whole project stop loading with `managed config refused`,
-    // which is strictly worse than the failure being explained.
+    // the profile is kept in the file but never used, so the failure being
+    // explained is merely replaced by a profile that is never available.
     test('does not send the reader to a repository key the host refuses', async () => {
       const message = await preflightMessage(true);
       expect(message).toMatch(/Preflight failed for the "agent" role/);

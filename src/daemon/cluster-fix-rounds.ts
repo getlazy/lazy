@@ -26,7 +26,7 @@
  *   - Only when the task's PARENT is a `cluster`.
  *   - Only when the unblock's actor is `agent` — the driver's own `lazy_unblock`
  *     over MCP. A HUMAN unblock is never refused: it carries feedback somebody
- *     has already typed (CLAUDE.md, "Never Lose Human Feedback"), and refusing
+ *     has already typed (AGENTS.md, "Never Lose Human Feedback"), and refusing
  *     it would discard that. The daemon's own recovery and auto-fix turns
  *     (actor `system`) are not refused either — a bound on the driver's
  *     judgement must not strand a turn the daemon started.

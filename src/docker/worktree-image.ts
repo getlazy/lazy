@@ -34,6 +34,7 @@ import { getRemoteDefaultBranch } from '../git/operations';
 import type { Storage } from '../storage/interface';
 import type { Task } from '../types';
 import { pathExists } from '../utils/fs';
+import { DEFAULT_RUNNER_IMAGE_PIN } from '../capture/custom-image-gate';
 import { runGit } from '../utils/git';
 
 /** Dockerfile filename compared and offered from a task worktree. */
@@ -242,6 +243,26 @@ export function pinnedCustomImageContext(task: Task | null | undefined): string 
 }
 
 /**
+ * The custom_image / custom_image_hash (and provenance) metadata a new child of
+ * `parent` inherits — empty when the parent has no pin. For a create that
+ * writes the child's metadata with its row.
+ */
+export function inheritedCustomImageMetadata(parent: Task | null | undefined): Record<string, string> {
+  const image = pinnedCustomImage(parent);
+  const hash = pinnedCustomImageHash(parent);
+  if (!image || !hash) return {};
+  const metadata: Record<string, string> = {
+    [CUSTOM_IMAGE_META_KEY]: image,
+    [CUSTOM_IMAGE_HASH_META_KEY]: hash,
+  };
+  // Provenance travels with the pin: without it the child records an image
+  // nothing can say which tree built.
+  const context = pinnedCustomImageContext(parent);
+  if (context) metadata[CUSTOM_IMAGE_CONTEXT_META_KEY] = context;
+  return metadata;
+}
+
+/**
  * Copy parent custom_image / custom_image_hash onto a newly created child.
  * No-op when the parent has no pin. Used by CLI and MCP create alike.
  */
@@ -250,21 +271,18 @@ export async function inheritCustomImageMetadata(
   childTaskId: string,
   parent: Task | null | undefined,
 ): Promise<boolean> {
-  const image = pinnedCustomImage(parent);
-  const hash = pinnedCustomImageHash(parent);
+  const metadata = inheritedCustomImageMetadata(parent);
+  const image = metadata[CUSTOM_IMAGE_META_KEY];
+  const hash = metadata[CUSTOM_IMAGE_HASH_META_KEY];
   if (!image || !hash) return false;
-
   await storage.updateTaskMetadata(childTaskId, CUSTOM_IMAGE_META_KEY, image);
   await storage.updateTaskMetadata(childTaskId, CUSTOM_IMAGE_HASH_META_KEY, hash);
-  // Provenance travels with the pin: without it the child records an image
-  // nothing can say which tree built.
-  const context = pinnedCustomImageContext(parent);
+  const context = metadata[CUSTOM_IMAGE_CONTEXT_META_KEY];
   if (context) {
     await storage.updateTaskMetadata(childTaskId, CUSTOM_IMAGE_CONTEXT_META_KEY, context);
   }
   return true;
 }
-
 /**
  * Warning for clone/redo when the source task had a per-task image pin.
  * Clone and redo are fresh starts — they use the root-resolved image, not an
@@ -380,4 +398,19 @@ export function missingPinnedImageMessage(
     `\`lazy edit <task>\` or \`lazy start <task>\` on a TTY and accept the Dockerfile prompt ` +
     `(the missing pin is treated as rebuildable).`
   );
+}
+
+/**
+ * Task metadata key recording a person's explicit choice to run the task on
+ * lazy's DEFAULT runner image while the project's custom image was not ready.
+ * `default` or absent/empty. Only the confirmation surfaces write it, and only
+ * the "restart with the custom image" action clears it — never a launch.
+ */
+export const RUNNER_IMAGE_CHOICE_META_KEY = 'runner_image_choice';
+
+/** The `pinnedImage` a task's launch passes: its consented pin, else its default-image choice. */
+export function launchImagePin(task: Task | null | undefined): string | undefined {
+  const pinned = pinnedCustomImage(task);
+  if (pinned) return pinned;
+  return task?.metadata?.[RUNNER_IMAGE_CHOICE_META_KEY] === 'default' ? DEFAULT_RUNNER_IMAGE_PIN : undefined;
 }

@@ -55,6 +55,15 @@ export const SKIP_AUTO_START = new Set([
  *
  * @param projectRoot - Project root directory
  */
+/**
+ * How much longer a background start waits for a child that is alive and has
+ * reported no failure: the daemon's store-open deadline plus a margin, since
+ * the store is opened before the daemon binds.
+ */
+/** Mirrors `STORE_OPEN_DEADLINE_MS` in ./rpc-handlers (not imported: that module is the daemon's whole RPC surface, far too heavy for every CLI start). A unit test keeps the two equal. */
+export const DAEMON_STORE_OPEN_DEADLINE_MS = 60_000;
+export const SLOW_START_BUDGET_MS = DAEMON_STORE_OPEN_DEADLINE_MS + 15_000;
+
 export async function startDaemonBackground(
   projectRoot: string,
   scanned?: { foreign: ForeignDaemon | null },
@@ -103,7 +112,7 @@ export async function startDaemonBackground(
   // output and logger output interleave in chronological order.
   //
   // Sync openSync is acceptable here: this is one-shot cold-start code that
-  // runs before the event loop matters, per CLAUDE.md's allowance for sync
+  // runs before the event loop matters, per AGENTS.md's allowance for sync
   // calls in "CLI startup/init code that runs once".
   const logFd = openSync(logPath, 'a');
 
@@ -141,9 +150,38 @@ export async function startDaemonBackground(
   // not coming up. Without this race, a hard failure like "web port
   // busy" stalls the user's CLI for the full readiness budget before we
   // even start producing an error message.
-  const readyPromise = waitForDaemon(projectRoot, 5000).then(ready => (ready ? 'ready' : 'timeout'));
   const exitPromise = proc.exited.then(() => 'exited' as const);
-  const outcome = await Promise.race([readyPromise, exitPromise]);
+  let outcome = await Promise.race([
+    waitForDaemon(projectRoot, 5000).then(ready => (ready ? 'ready' as const : 'timeout' as const)),
+    exitPromise,
+  ]);
+
+  // A child that is still alive and has written no startup-error marker is
+  // still STARTING — opening a large store can take up to the daemon's own
+  // store-open deadline before it binds. Keep waiting for it, out loud, rather
+  // than declaring a healthy start failed on a fixed 5s.
+  if (outcome === 'timeout' && !(await readStartupErrorMarker(startupErrorPath))) {
+    console.error(`Daemon is still starting (PID ${proc.pid}); waiting up to ${Math.round(SLOW_START_BUDGET_MS / 1000)}s more...`);
+    outcome = await Promise.race([
+      waitForDaemon(projectRoot, SLOW_START_BUDGET_MS).then(ready => (ready ? 'ready' as const : 'timeout' as const)),
+      exitPromise,
+    ]);
+  }
+
+  // A daemon starting on a new lazy version backs the store up BEFORE it
+  // listens (src/daemon/upgrade-store-backup.ts), and a big store takes longer
+  // than any fixed budget. While the child is alive and its backup is making
+  // progress, say what it is doing and keep waiting — declaring that start
+  // failed would send the next command racing a daemon that is still coming up.
+  while (outcome === 'timeout' && !(await readStartupErrorMarker(startupErrorPath))) {
+    const progress = await readBackupProgress(projectRoot, proc.pid);
+    if (!progress) break;
+    console.error(`Daemon (PID ${proc.pid}) is backing up the store before lazy ${progress.to_version} opens it: ${progress.line}`);
+    outcome = await Promise.race([
+      waitForDaemon(projectRoot, 10_000).then(ready => (ready ? 'ready' as const : 'timeout' as const)),
+      exitPromise,
+    ]);
+  }
 
   if (outcome === 'ready') return;
 
@@ -175,9 +213,28 @@ export async function startDaemonBackground(
   // back to the generic timeout with a pointer to the log file so the
   // user can at least inspect what the daemon was doing.
   throw new Error(
-    `Daemon did not start within 5 seconds.\n` +
+    `Daemon did not start within ${Math.round((5000 + SLOW_START_BUDGET_MS) / 1000)} seconds.\n` +
     `Check logs: ${logPath}`,
   );
+}
+
+/**
+ * The pre-upgrade backup's progress marker, when the child named `pid` wrote
+ * it in the last two minutes; null otherwise (no backup running, or a stale
+ * marker from a process that is gone).
+ */
+async function readBackupProgress(projectRoot: string, pid: number): Promise<{ to_version: string; line: string } | null> {
+  const { storeBackupProgressPath, describeBackupProgress } = await import('./upgrade-store-backup');
+  try {
+    const marker = JSON.parse(await readFile(storeBackupProgressPath(projectRoot), 'utf-8'));
+    if (marker.pid !== pid) return null;
+    if (Date.now() - Date.parse(marker.updated_at) > 120_000) return null;
+    return { to_version: String(marker.to_version), line: describeBackupProgress(marker) };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    console.error(`Warning: could not read the store backup progress: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
 }
 
 /**

@@ -42,6 +42,7 @@ import {
   CHATGPT_CODEX_UPSTREAM,
   DEFAULT_OPENAI_UPSTREAM,
   isChatGptEndpoint,
+  isFireworksEndpoint,
   isOpenRouterEndpoint,
 } from '../utils/openai-compat';
 import {
@@ -52,7 +53,8 @@ import {
 import { isLocalEndpoint, endpointForHost } from '../utils/endpoint';
 import { isKnownAnthropicModel } from '../utils/anthropic-models';
 import { isInternalAgent } from '../agent/registry';
-import { defineProfileAdvice, keepProfileOnEndpointAdvice } from './agent-profile-advice';
+import { defineProfileAdvice, endpointCredentialAdvice, keepProfileOnEndpointAdvice } from './agent-profile-advice';
+import { isManagedMode } from './managed-mode';
 
 /**
  * Protocol spoken to the upstream. Not a config key — see the file header.
@@ -67,6 +69,75 @@ export interface AgentProfileConfig {
   credential?: string;
   /** When to choose this profile, in plain words — shown wherever an agent is picked. */
   description?: string;
+  /**
+   * Name of an `[endpoints.<name>]` block this profile runs against — its URL
+   * and credential — instead of an inline `endpoint`. A separate key on purpose:
+   * `endpoint` is always a URL and never means "a URL or a name".
+   */
+  named_endpoint?: string;
+  /** Ordered usage tiers — makes this a TIERED profile. See {@link ResolvedTier}. */
+  tiers?: AgentTierConfig[];
+}
+
+/** One `tiers = [{ … }]` entry exactly as written. */
+export interface AgentTierConfig {
+  /** `[endpoints.<name>]` this tier runs against. */
+  endpoint?: string;
+  model?: string;
+  threshold_percent?: number;
+}
+
+/** A `[endpoints.<name>]` block exactly as written. */
+export interface NamedEndpointConfig {
+  url?: string;
+  credential?: string;
+  description?: string;
+}
+
+/** A named endpoint after validation. */
+export interface NamedEndpoint {
+  name: string;
+  /** Absolute http(s) URL as written, trailing slash removed. */
+  url: string;
+  /**
+   * Stored credential name as written. '' only on a managed host, where the
+   * block is kept but every profile selecting it is not honoured
+   * ({@link MissingEndpointCredentialError}).
+   */
+  credential: string;
+  description: string;
+}
+
+/**
+ * Which usage window decides whether a tier is available.
+ *
+ * `claude`: the Anthropic subscription's `unified-*` windows; `codex`: the
+ * ChatGPT subscription's `codex-*` windows. `null` = UNCONDITIONAL — lazy reads
+ * no usage window for this endpoint, so the tier is always available.
+ */
+export type TierUsageSource = 'claude' | 'codex' | null;
+
+/** One resolved tier of a tiered profile. */
+export interface ResolvedTier {
+  /** 0-based position in the chain. */
+  index: number;
+  /** `[endpoints.<name>]` it runs against. */
+  endpoint: string;
+  /** Host-perspective upstream URL. */
+  upstream: string;
+  /** Stored credential that pays for it, or {@link NO_CREDENTIAL}. */
+  credential: string;
+  /** True when lazy.toml NAMED the credential, false when lazy inferred it. See {@link AgentProfile.credentialExplicit}. */
+  credentialExplicit?: boolean;
+  model: string;
+  wire: AgentWire;
+  usage: TierUsageSource;
+  /**
+   * Percent of the usage window at which this tier switches EARLY, before it
+   * refuses. Optional: null = used until it refuses (a 429). A LAST
+   * conditional tier with none is judged by `[usage_pause]`.
+   */
+  threshold: number | null;
 }
 
 /** A profile after defaults, inference and validation. */
@@ -95,12 +166,25 @@ export interface AgentProfile {
    * talking to something other than the harness's native API.
    */
   endpointPinned: boolean;
+  /** `[endpoints.<name>]` the profile named via `named_endpoint`, when it did. Unset on a tiered profile (see `tiers`). */
+  endpointName?: string;
   /**
    * Stored credential that pays for this upstream — a provider name, a
    * user-chosen name (`lazy auth set work-openai`), or {@link NO_CREDENTIAL}
    * when the upstream takes none. {@link profileCredentialName} drops the last.
    */
   credential: string;
+  /**
+   * True when lazy.toml NAMED `credential` (on the profile or its named
+   * endpoint), false when {@link defaultCredentialFor} inferred it.
+   *
+   * The proxy reads it: a provider's credential is attached to a host that is
+   * not that provider's only when the config said so explicitly
+   * ({@link providerCredentialHostMismatch}). An Anthropic-compatible gateway
+   * that really wants the Anthropic key is a deliberate choice; an inferred
+   * one never is. Absent reads as inferred — the safe direction.
+   */
+  credentialExplicit?: boolean;
   /** Derived from harness + endpoint. */
   wire: AgentWire;
   /** True when no `[agents.<name>]` block declares it — a built-in. */
@@ -111,6 +195,13 @@ export interface AgentProfile {
    * '' when none is written and no built-in supplies one.
    */
   description: string;
+  /**
+   * Set only on a TIERED profile: the ordered chain the proxy picks from per
+   * request. On such a profile `endpoint`/`model`/`credential`/`wire` mirror
+   * TIER 0 — what the harness is launched against — so every launch-time reader
+   * sees an ordinary concrete profile.
+   */
+  tiers?: ResolvedTier[];
 }
 
 /** Credential name meaning "this upstream authenticates nobody". */
@@ -296,7 +387,20 @@ export const BUILTIN_PROFILE_NAMES: readonly string[] = Object.keys(BUILTIN_PROF
 const NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
 const NAME_MAX = 64;
 
-const PROFILE_KEYS = ['harness', 'model', 'endpoint', 'credential', 'description'] as const;
+const PROFILE_KEYS = ['harness', 'model', 'endpoint', 'credential', 'description', 'named_endpoint', 'tiers'] as const;
+
+/** Keys a TIERED profile may carry — everything else comes from its tiers. */
+const TIERED_PROFILE_KEYS = ['harness', 'description', 'tiers'] as const;
+
+const ENDPOINT_KEYS = ['url', 'credential', 'description'] as const;
+const TIER_KEYS = ['endpoint', 'model', 'threshold_percent'] as const;
+
+/**
+ * Harnesses a tiered profile may run. claude-code only for now: it is the one
+ * harness whose cross-provider history handling (thinking blocks) the proxy
+ * makes safe on a switch, and the one the switch is tested with.
+ */
+export const TIERED_HARNESSES: readonly string[] = ['claude-code'];
 
 /**
  * Longest `description` a profile may carry. It is rendered beside every agent
@@ -315,6 +419,25 @@ const UNKNOWN_KEY_HINTS: Record<string, string> = {
   api_key: 'credentials are never written to lazy.toml — store one with `lazy auth set <name>` and reference it as `credential`',
   base_url: 'use `endpoint`',
 };
+
+/**
+ * A dot in a TOML table header splits the name, so an unquoted
+ * `[agents.claude-glm-5.3]` parses (silently) as table `3` under profile
+ * `claude-glm-5`. Detect that shape — a block whose values are tables — and
+ * name the quoted form the author almost certainly meant. `tiers` is an array
+ * of tables, never a plain table, so it is not affected.
+ */
+function assertNoNestedNameTables(section: 'agents' | 'endpoints', name: string, block: object): void {
+  for (const [key, value] of Object.entries(block)) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) continue;
+    const intended = `${name}.${key}`;
+    throw new Error(
+      `lazy.toml [${section}.${name}] contains a nested table [${section}.${name}.${key}] — ` +
+      `a dot in a table header splits the name. If "${intended}" was meant as one name, ` +
+      `quote it: [${section}."${intended}"] (otherwise "${key}" is not a valid option here).`,
+    );
+  }
+}
 
 function nameError(what: string, name: string, where: string): Error {
   return new Error(
@@ -364,7 +487,7 @@ export function knownEndpointWires(endpoint: string): readonly AgentWire[] {
   if (host === null) return [];
   if (host === 'api.openai.com') return ['openai'];
   if (host === 'api.anthropic.com') return ['anthropic'];
-  if (isOpenRouterEndpoint(endpoint)) return ['openai', 'anthropic'];
+  if (isOpenRouterEndpoint(endpoint) || isFireworksEndpoint(endpoint)) return ['openai', 'anthropic'];
   return [];
 }
 
@@ -382,7 +505,13 @@ export function isAnthropicApiEndpoint(endpoint: string): boolean {
 }
 
 /**
- * Credential a profile uses when it names none.
+ * Credential a BUILT-IN profile uses — the ones lazy defines itself, whose
+ * endpoints are fixed and known.
+ *
+ * A profile the user writes with an `endpoint`, a named endpoint and every
+ * tier must NAME its credential ({@link MissingEndpointCredentialError}); this
+ * is never consulted for them. It still covers a user block that keeps a
+ * built-in's own endpoint (`[agents.codex] model = "…"`).
  *
  * This is the hostname rule that used to live in `credentialFor`
  * (the retired src/proxy/role-upstreams.ts), with one deliberate change: an endpoint on
@@ -405,8 +534,77 @@ export function defaultCredentialFor(harness: string, wire: AgentWire, endpoint:
   // unused). See src/credentials/providers.ts on why this is its own provider.
   if (isChatGptEndpoint(endpoint)) return 'chatgpt';
   if (isOpenRouterEndpoint(endpoint)) return 'openrouter';
+  if (isFireworksEndpoint(endpoint)) return 'fireworks';
   if (isLocalEndpoint(endpoint)) return NO_CREDENTIAL;
-  return wireCredential;
+  // A provider's credential only ever for that provider's own host; anything
+  // else gets NONE rather than the wire default. Unreachable for user endpoints
+  // (they must name a credential) — kept so no future caller can turn an
+  // unknown host into a destination for the user's Anthropic or OpenAI key.
+  const host = hostnameOf(endpoint);
+  if (host === 'api.anthropic.com') return 'anthropic';
+  if (host === 'api.openai.com') return 'openai';
+  return NO_CREDENTIAL;
+}
+
+/**
+ * Provider credential names, and the hosts each one belongs to.
+ *
+ * `cursor` is absent on purpose: only the cursor harness ever names it, and its
+ * placement is the client's own (src/proxy/credential-deps.ts).
+ */
+const PROVIDER_CREDENTIAL_HOSTS: Record<string, (endpoint: string) => boolean> = {
+  anthropic: isAnthropicApiEndpoint,
+  openai: (e) => hostnameOf(e) === 'api.openai.com',
+  chatgpt: isChatGptEndpoint,
+  openrouter: isOpenRouterEndpoint,
+  fireworks: isFireworksEndpoint,
+  ollama: isHostedOllamaEndpoint,
+};
+
+/**
+ * The provider whose credential would be sent to a host that is not its own,
+ * or null when nothing is wrong: the credential is not a provider's (`none`, or
+ * a user-chosen store name), or the host is that provider's.
+ *
+ * The rule the proxy's backstop enforces: a provider credential goes to another
+ * host only when lazy.toml named it for that endpoint.
+ */
+export function providerCredentialHostMismatch(credential: string, endpoint: string): string | null {
+  const owns = PROVIDER_CREDENTIAL_HOSTS[credential];
+  if (!owns || !endpoint.trim()) return null;
+  return owns(endpoint) ? null : credential;
+}
+
+/**
+ * An endpoint — `[endpoints.<name>]`, an inline profile `endpoint`, or a tier's
+ * endpoint — that does not name its credential.
+ *
+ * Every endpoint MUST say which credential pays it (engineer's rule,
+ * 2026-10-06: "anything without it is invalid"). Inferring one from the
+ * hostname decided, silently, which of the user's secrets a host received;
+ * naming it puts that decision in the file, where the user can read it. A
+ * server that takes no credential says `credential = "none"`.
+ *
+ * Its own class so managed mode can report the block as not honoured instead
+ * of failing the whole load (see {@link resolveAgentProfiles}).
+ */
+export class MissingEndpointCredentialError extends Error {
+  constructor(readonly block: string, readonly url: string, suggested: string) {
+    super(
+      `lazy.toml ${block} has no credential. Every endpoint must name the credential that pays for it ` +
+      `— lazy does not guess which of your secrets to send to ${hostnameOf(url) ?? url}.\n\n` +
+      endpointCredentialAdvice(block, suggested, isLocalEndpoint(url)),
+    );
+    this.name = 'MissingEndpointCredentialError';
+  }
+}
+
+/** The credential name the missing-credential error suggests: the provider for its own host, else the block's name. */
+function suggestedCredentialName(url: string, fallback: string): string {
+  for (const [provider, owns] of Object.entries(PROVIDER_CREDENTIAL_HOSTS)) {
+    if (owns(url)) return provider;
+  }
+  return isValidName(fallback) ? fallback : 'my-endpoint';
 }
 
 /**
@@ -492,6 +690,7 @@ function resolveProfile(
   name: string,
   raw: AgentProfileConfig | undefined,
   warn: (message: string) => void,
+  endpoints: Map<string, NamedEndpoint> = new Map(),
 ): AgentProfile {
   const where = `[agents.${name}]`;
 
@@ -504,6 +703,7 @@ function resolveProfile(
         `  [agents.${name}]\n  harness = "claude-code"\n  model = "claude-opus-5-5"`,
       );
     }
+    assertNoNestedNameTables('agents', name, raw);
     for (const key of Object.keys(raw)) {
       if ((PROFILE_KEYS as readonly string[]).includes(key)) continue;
       const hint = UNKNOWN_KEY_HINTS[key];
@@ -555,7 +755,28 @@ function resolveProfile(
     );
   }
 
-  const endpointSet = typeof raw?.endpoint === 'string' && raw.endpoint.trim().length > 0;
+  if (raw?.tiers !== undefined) {
+    return resolveTieredProfile(name, where, raw, harness, description, endpoints, warn);
+  }
+
+  // `named_endpoint` stands in for an inline `endpoint` (and, unless the
+  // profile names its own, its `credential`): the profile is then exactly as if
+  // it had written the endpoint's URL and credential itself.
+  let named: NamedEndpoint | null = null;
+  if (raw?.named_endpoint !== undefined) {
+    if (typeof raw.named_endpoint !== 'string' || !raw.named_endpoint.trim()) {
+      throw new Error(`lazy.toml ${where} named_endpoint must be the name of an [endpoints.<name>] block.`);
+    }
+    if (raw.endpoint !== undefined) {
+      throw new Error(
+        `lazy.toml ${where} sets both endpoint and named_endpoint. Use one: endpoint is a URL, ` +
+        `named_endpoint names an [endpoints.<name>] block.`,
+      );
+    }
+    named = namedEndpointOrThrow(endpoints, raw.named_endpoint.trim(), `${where} named_endpoint`);
+  }
+
+  const endpointSet = named !== null || (typeof raw?.endpoint === 'string' && raw.endpoint.trim().length > 0);
   // The built-in's own endpoint wins over the harness default, but ONLY while the
   // block still runs that harness: `[agents.codex-subscription] harness = "pi"`
   // has repurposed the name, and forcing the ChatGPT backend on it would be lazy
@@ -564,47 +785,8 @@ function resolveProfile(
     (builtin?.harness === harness ? builtin.endpoint : undefined) ??
     HARNESS_DEFAULT_ENDPOINT[harness] ??
     '';
-  let endpoint = endpointSet ? raw!.endpoint!.trim() : defaultEndpoint;
-  if (endpoint) {
-    let parsed: URL;
-    try {
-      parsed = new URL(endpoint);
-    } catch {
-      throw new Error(
-        `Invalid endpoint "${endpoint}" in lazy.toml ${where}. ` +
-        `Expected an absolute URL, e.g. endpoint = "http://localhost:11434".`,
-      );
-    }
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      throw new Error(
-        `Invalid endpoint "${endpoint}" in lazy.toml ${where}: expected an http:// or https:// URL.`,
-      );
-    }
-    endpoint = endpoint.replace(/\/$/, '');
-    // Same rewrite role targets get: an endpoint is the upstream the PROXY
-    // forwards to, and the proxy runs on the host, so a container-perspective
-    // alias names the wrong thing.
-    const hostSide = endpointForHost(endpoint);
-    if (hostSide !== endpoint) {
-      warn(
-        `lazy.toml ${where} endpoint = "${endpoint}" — this is the upstream lazy's proxy forwards ` +
-        `to, and the proxy runs on the host, not in the agent's container. Reading it as ` +
-        `"${hostSide}". Update lazy.toml to the host-side address to silence this warning.`,
-      );
-      endpoint = hostSide;
-    }
-    // codex's base_url already ends in `/v1` for every non-ChatGPT upstream and
-    // the proxy forwards endpoint + path verbatim, so an endpoint ending in
-    // `/v1` requests `/v1/v1/responses`. Warn rather than rewrite: routing
-    // stays exactly as configured.
-    if (harness === 'codex' && !isChatGptEndpoint(endpoint) && /\/v1$/.test(new URL(endpoint).pathname)) {
-      warn(
-        `lazy.toml ${where} endpoint = "${endpoint}" ends in /v1, but lazy adds /v1 to codex ` +
-        `requests itself, so they would go to ${endpoint}/v1/responses and fail. ` +
-        `Use endpoint = "${endpoint.replace(/\/v1$/, '')}" instead.`,
-      );
-    }
-  }
+  let endpoint = named ? named.url : endpointSet ? raw!.endpoint!.trim() : defaultEndpoint;
+  if (endpoint) endpoint = normalizeEndpointUrl(endpoint, where, harness, warn);
 
   const wireResult = wireForProfile(harness, endpoint);
   if ('error' in wireResult) {
@@ -665,7 +847,15 @@ function resolveProfile(
     );
   }
 
-  const credential = (raw?.credential ?? '').trim() || defaultCredentialFor(harness, wire, endpoint);
+  const ownCredential = (raw?.credential ?? '').trim();
+  // An endpoint the user wrote must name what pays it — no hostname inference.
+  // Only a built-in's own fixed endpoint falls back to defaultCredentialFor.
+  if (endpointSet && !ownCredential && !named?.credential) {
+    const block = named ? `[endpoints.${named.name}]` : where;
+    throw new MissingEndpointCredentialError(block, endpoint, suggestedCredentialName(endpoint, named?.name ?? name));
+  }
+  const credentialExplicit = !!ownCredential || !!named?.credential;
+  const credential = ownCredential || named?.credential || defaultCredentialFor(harness, wire, endpoint);
   if (!isValidName(credential)) throw nameError('credential name', credential, where);
   // A credential name is a STORE KEY, and the store takes any name — a provider
   // (`anthropic`) or one the user picked (`work-openai`), which is how two
@@ -696,7 +886,9 @@ function resolveProfile(
     model,
     endpoint,
     endpointPinned: endpointSet,
+    ...(named ? { endpointName: named.name } : {}),
     credential,
+    credentialExplicit,
     wire,
     builtin: raw === undefined,
     // A block overriding a built-in keeps the built-in's description unless it
@@ -704,6 +896,266 @@ function resolveProfile(
     // built-in's upstream: a repointed endpoint makes that text false.
     description: description || (builtin?.harness === harness && !endpointSet ? builtin.description : ''),
   };
+}
+
+/**
+ * Validate an endpoint URL and turn it into the host-perspective upstream the
+ * proxy dials. Shared by inline `endpoint`, `[endpoints.<name>] url` uses and
+ * tiers, so every spelling of an upstream is checked and rewritten one way.
+ */
+function normalizeEndpointUrl(
+  endpointIn: string,
+  where: string,
+  harness: string,
+  warn: (message: string) => void,
+): string {
+  let endpoint = endpointIn;
+  let parsed: URL;
+  try {
+    parsed = new URL(endpoint);
+  } catch {
+    throw new Error(
+      `Invalid endpoint "${endpoint}" in lazy.toml ${where}. ` +
+      `Expected an absolute URL, e.g. endpoint = "http://localhost:11434".`,
+    );
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(
+      `Invalid endpoint "${endpoint}" in lazy.toml ${where}: expected an http:// or https:// URL.`,
+    );
+  }
+  endpoint = endpoint.replace(/\/$/, '');
+  // Same rewrite role targets get: an endpoint is the upstream the PROXY
+  // forwards to, and the proxy runs on the host, so a container-perspective
+  // alias names the wrong thing.
+  const hostSide = endpointForHost(endpoint);
+  if (hostSide !== endpoint) {
+    warn(
+      `lazy.toml ${where} endpoint = "${endpoint}" — this is the upstream lazy's proxy forwards ` +
+      `to, and the proxy runs on the host, not in the agent's container. Reading it as ` +
+      `"${hostSide}". Update lazy.toml to the host-side address to silence this warning.`,
+    );
+    endpoint = hostSide;
+  }
+  // codex's base_url already ends in `/v1` for every non-ChatGPT upstream and
+  // the proxy forwards endpoint + path verbatim, so an endpoint ending in
+  // `/v1` requests `/v1/v1/responses`. Warn rather than rewrite: routing
+  // stays exactly as configured.
+  if (harness === 'codex' && !isChatGptEndpoint(endpoint) && /\/v1$/.test(new URL(endpoint).pathname)) {
+    warn(
+      `lazy.toml ${where} endpoint = "${endpoint}" ends in /v1, but lazy adds /v1 to codex ` +
+      `requests itself, so they would go to ${endpoint}/v1/responses and fail. ` +
+      `Use endpoint = "${endpoint.replace(/\/v1$/, '')}" instead.`,
+    );
+  }
+  return endpoint;
+}
+
+function namedEndpointOrThrow(endpoints: Map<string, NamedEndpoint>, name: string, where: string): NamedEndpoint {
+  const found = endpoints.get(name);
+  if (found) return found;
+  const known = [...endpoints.keys()].sort();
+  throw new Error(
+    `lazy.toml ${where} names endpoint "${name}", but there is no [endpoints.${name}] block. ` +
+    (known.length ? `Defined endpoints: ${known.join(', ')}.` : 'Define it, e.g.\n\n' +
+      `  [endpoints.${name}]\n  url = "https://api.anthropic.com"`),
+  );
+}
+
+/**
+ * The usage window lazy reads for a tier, or null when it reads none.
+ *
+ * Only two exist today, and both are verified captures through the proxy
+ * (src/usage-pause/policy.ts): Anthropic's subscription `unified-*` windows and
+ * the ChatGPT subscription's `codex-*` windows. A tier is CONDITIONAL when it
+ * runs on Anthropic's API or spends the `anthropic` credential (a gateway in
+ * front of Anthropic passes the same headers through), or on the ChatGPT
+ * backend or its `chatgpt` credential. Everything else — Fireworks, OpenRouter,
+ * a local Ollama — reports no window, so a tier on it is UNCONDITIONAL: always
+ * available.
+ */
+export function tierUsageSourceFor(upstream: string, credential: string): TierUsageSource {
+  if (isAnthropicApiEndpoint(upstream) || credential === 'anthropic') return 'claude';
+  if (isChatGptEndpoint(upstream) || credential === 'chatgpt') return 'codex';
+  return null;
+}
+
+/** Validate every `[endpoints.<name>]` block. */
+export function resolveNamedEndpoints(
+  raw: Record<string, NamedEndpointConfig> | undefined,
+  lenient = false,
+): Map<string, NamedEndpoint> {
+  const out = new Map<string, NamedEndpoint>();
+  for (const [name, block] of Object.entries(raw ?? {})) {
+    const where = `[endpoints.${name}]`;
+    if (!isValidName(name)) throw nameError('endpoint name', name, where);
+    if (typeof block !== 'object' || block === null || Array.isArray(block)) {
+      throw new Error(`lazy.toml ${where} must be a table, e.g.\n\n  ${where}\n  url = "https://api.fireworks.ai/inference"`);
+    }
+    assertNoNestedNameTables('endpoints', name, block);
+    for (const key of Object.keys(block)) {
+      if (!(ENDPOINT_KEYS as readonly string[]).includes(key)) {
+        throw new Error(`Unknown option "${key}" in lazy.toml ${where}. Valid options: ${ENDPOINT_KEYS.join(', ')}.`);
+      }
+    }
+    if (typeof block.url !== 'string' || !block.url.trim()) {
+      throw new Error(`lazy.toml ${where} has no url. Set url = "<the upstream base URL>".`);
+    }
+    // Validated as a URL here; host rewriting and harness checks happen per use.
+    normalizeEndpointUrl(block.url.trim(), where, '', () => {});
+    const credential = typeof block.credential === 'string' ? block.credential.trim() : '';
+    if (block.credential !== undefined && (typeof block.credential !== 'string' || !isValidName(credential))) {
+      throw nameError('credential name', String(block.credential), where);
+    }
+    // Refused here, at the block, even when no profile uses it yet. Under
+    // managed mode the block is kept (the import is verbatim) and every
+    // profile that selects it is reported as not honoured instead.
+    if (!credential && !lenient) {
+      const url = block.url.trim();
+      throw new MissingEndpointCredentialError(where, url, suggestedCredentialName(url, name));
+    }
+    if (block.description !== undefined && typeof block.description !== 'string') {
+      throw new Error(`lazy.toml ${where} description must be a string.`);
+    }
+    out.set(name, {
+      name,
+      url: block.url.trim().replace(/\/$/, ''),
+      credential,
+      description: (block.description ?? '').trim(),
+    });
+  }
+  return out;
+}
+
+/**
+ * Resolve a TIERED `[agents.<name>]` block.
+ *
+ * Every tier is (named endpoint, model). All tiers share the profile's one
+ * harness, and so its one wire. Everything is checked here so a malformed chain
+ * fails at config load, loudly, naming the tier.
+ */
+function resolveTieredProfile(
+  name: string,
+  where: string,
+  raw: AgentProfileConfig,
+  harness: string,
+  description: string,
+  endpoints: Map<string, NamedEndpoint>,
+  warn: (message: string) => void,
+): AgentProfile {
+  for (const key of Object.keys(raw)) {
+    if (!(TIERED_PROFILE_KEYS as readonly string[]).includes(key)) {
+      throw new Error(
+        `lazy.toml ${where} has tiers, so "${key}" cannot be set on it — each tier names its own ` +
+        `endpoint and model. Valid options on a tiered profile: ${TIERED_PROFILE_KEYS.join(', ')}.`,
+      );
+    }
+  }
+  if (!TIERED_HARNESSES.includes(harness)) {
+    throw new Error(
+      `lazy.toml ${where} is a tiered profile on the "${harness}" harness; tiered profiles support ` +
+      `${TIERED_HARNESSES.join(', ')} only for now.`,
+    );
+  }
+  if (!Array.isArray(raw.tiers) || raw.tiers.length < 1) {
+    throw new Error(
+      `lazy.toml ${where} tiers must list at least one tier (usually two or more), e.g.\n\n` +
+      `  tiers = [\n    { endpoint = "anthropic-sub", model = "claude-sonnet-5-5", threshold_percent = 95 },\n` +
+      `    { endpoint = "ollama-local", model = "qwen3-coder" },\n  ]`,
+    );
+  }
+  const tiers: ResolvedTier[] = [];
+  const seen = new Set<string>();
+  raw.tiers.forEach((t, index) => {
+    const at = `${where} tiers[${index}]`;
+    if (typeof t !== 'object' || t === null || Array.isArray(t)) {
+      throw new Error(`lazy.toml ${at} must be a table like { endpoint = "<name>", model = "<model>" }.`);
+    }
+    for (const key of Object.keys(t)) {
+      if (!(TIER_KEYS as readonly string[]).includes(key)) {
+        throw new Error(`Unknown option "${key}" in lazy.toml ${at}. Valid options: ${TIER_KEYS.join(', ')}.`);
+      }
+    }
+    if (typeof t.endpoint !== 'string' || !t.endpoint.trim()) {
+      throw new Error(`lazy.toml ${at} has no endpoint. Name an [endpoints.<name>] block.`);
+    }
+    const ep = namedEndpointOrThrow(endpoints, t.endpoint.trim(), at);
+    if (typeof t.model !== 'string' || !t.model.trim()) {
+      throw new Error(`lazy.toml ${at} has no model. Model names are specific to the endpoint, so lazy will not guess one.`);
+    }
+    const model = t.model.trim();
+    const key = `${ep.name}\u0000${model}`;
+    if (seen.has(key)) throw new Error(`lazy.toml ${at} repeats endpoint "${ep.name}" with model "${model}".`);
+    seen.add(key);
+    const upstream = normalizeEndpointUrl(ep.url, `${at} (endpoint "${ep.name}")`, harness, warn);
+    const wireResult = wireForProfile(harness, upstream);
+    if ('error' in wireResult) throw new Error(`lazy.toml ${at} (endpoint "${ep.name}"): ${wireResult.error}`);
+    if (!ep.credential) {
+      throw new MissingEndpointCredentialError(`[endpoints.${ep.name}]`, upstream, suggestedCredentialName(upstream, ep.name));
+    }
+    const credentialExplicit = true;
+    const credential = ep.credential;
+    const usage = tierUsageSourceFor(upstream, credential);
+    let threshold: number | null = null;
+    if (t.threshold_percent !== undefined) {
+      if (usage === null) {
+        throw new Error(
+          `lazy.toml ${at} sets threshold_percent, but endpoint "${ep.name}" (${upstream}) reports no ` +
+          `usage window lazy can read, so a threshold would never apply — the tier is used until it ` +
+          `refuses. Remove threshold_percent from this tier.`,
+        );
+      }
+      if (typeof t.threshold_percent !== 'number' || !Number.isInteger(t.threshold_percent)
+        || t.threshold_percent < 1 || t.threshold_percent > 100) {
+        throw new Error(`lazy.toml ${at} threshold_percent must be a whole number from 1 to 100.`);
+      }
+      threshold = t.threshold_percent;
+    }
+    // No threshold is fine on any tier: every tier hands over by REFUSING (a
+    // 429), and a threshold is only an optional early switch
+    // (src/proxy/tier-select.ts; engineer, 2026-10-06).
+    tiers.push({
+      index,
+      endpoint: ep.name,
+      upstream,
+      credential,
+      credentialExplicit,
+      model,
+      wire: wireResult.wire,
+      usage,
+      threshold,
+    });
+  });
+  const wire = tiers[0]!.wire;
+  const mixed = tiers.find((t) => t.wire !== wire);
+  if (mixed) {
+    throw new Error(
+      `lazy.toml ${where} tiers[${mixed.index}] speaks the ${mixed.wire} API but tiers[0] speaks ${wire}; ` +
+      `every tier of one profile must speak the same API.`,
+    );
+  }
+  for (const t of tiers) {
+    if (!isValidName(t.credential)) throw nameError('credential name', t.credential, `${where} tiers[${t.index}]`);
+  }
+  const first = tiers[0]!;
+  return {
+    name,
+    harness,
+    model: first.model,
+    endpoint: first.upstream,
+    endpointPinned: true,
+    credential: first.credential,
+    credentialExplicit: first.credentialExplicit,
+    wire,
+    builtin: false,
+    description,
+    tiers,
+  };
+}
+
+/** True when the profile is a tiered one. */
+export function isTieredProfile(profile: Pick<AgentProfile, 'tiers'> | null | undefined): boolean {
+  return !!profile?.tiers && profile.tiers.length > 0;
 }
 
 /**
@@ -717,15 +1169,45 @@ function resolveProfile(
 export function resolveAgentProfiles(
   raw: Record<string, AgentProfileConfig> | undefined,
   warn: (message: string) => void = (m) => console.warn(`Warning: ${m}`),
+  rawEndpoints?: Record<string, NamedEndpointConfig>,
 ): Map<string, AgentProfile> {
+  // MANAGED: the control plane imports a project's lazy.toml verbatim
+  // (importers never reject), so an endpoint with no credential must not take
+  // the whole project down. The profile is left out — never run with a guessed
+  // credential — and said so, naming the line to add. Everywhere else it is a
+  // load error.
+  const lenient = isManagedMode();
+  const endpoints = resolveNamedEndpoints(rawEndpoints, lenient);
   const profiles = new Map<string, AgentProfile>();
   for (const name of BUILTIN_PROFILE_NAMES) {
-    profiles.set(name, resolveProfile(name, undefined, warn));
+    profiles.set(name, resolveProfile(name, undefined, warn, endpoints));
   }
+  const notHonoured: Array<{ profile: string; reason: string }> = [];
   for (const [name, block] of Object.entries(raw ?? {})) {
-    profiles.set(name, resolveProfile(name, block ?? {}, warn));
+    try {
+      profiles.set(name, resolveProfile(name, block ?? {}, warn, endpoints));
+    } catch (err) {
+      if (!lenient || !(err instanceof MissingEndpointCredentialError)) throw err;
+      // A built-in of this name stays as it was rather than vanishing.
+      notHonoured.push({ profile: name, reason: err.message });
+      // One generic line at the point of occurrence; `lazy doctor` carries the
+      // full reason (single warning surface).
+      warn(`agent profile "${name}" is not honoured — run lazy doctor for why.`);
+    }
   }
+  if (notHonoured.length) NOT_HONOURED.set(profiles, notHonoured);
   return profiles;
+}
+
+const NOT_HONOURED = new WeakMap<Map<string, AgentProfile>, Array<{ profile: string; reason: string }>>();
+
+/**
+ * The `[agents.<name>]` blocks a managed host left out because an endpoint they
+ * use names no credential, each with the reason. Empty everywhere else — there
+ * the same block fails the load. Read by `lazy doctor`.
+ */
+export function notHonouredProfiles(profiles: Map<string, AgentProfile>): Array<{ profile: string; reason: string }> {
+  return NOT_HONOURED.get(profiles) ?? [];
 }
 
 /**
@@ -739,12 +1221,12 @@ export function resolveAgentProfiles(
 const RESOLVED_CACHE = new WeakMap<object, Map<string, AgentProfile>>();
 
 /** Profiles for a loaded config. Cached; never warns twice for one config. */
-export function agentProfilesFor(config: { agents?: Record<string, AgentProfileConfig> }): Map<string, AgentProfile> {
+export function agentProfilesFor(config: ProfileSource): Map<string, AgentProfile> {
   const raw = config.agents;
   if (!raw) return resolveAgentProfiles(undefined, () => {});
   const cached = RESOLVED_CACHE.get(raw);
   if (cached) return cached;
-  const resolved = resolveAgentProfiles(raw);
+  const resolved = resolveAgentProfiles(raw, undefined, config.endpoints);
   RESOLVED_CACHE.set(raw, resolved);
   return resolved;
 }
@@ -850,7 +1332,10 @@ export function agentProfileOrThrow(
 }
 
 /** Config shape these lookups need — anything carrying an `[agents]` table. */
-type ProfileSource = { agents?: Record<string, AgentProfileConfig> };
+type ProfileSource = {
+  agents?: Record<string, AgentProfileConfig>;
+  endpoints?: Record<string, NamedEndpointConfig>;
+};
 
 /**
  * The profile a task's `agent_id` names, or throw naming the alternatives.

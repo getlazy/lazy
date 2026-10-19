@@ -1,12 +1,12 @@
 /**
  * Measure the context lazy injects into a session before its first message.
  *
- * Every launch pays for the same four things — the CLAUDE.md files the agent
+ * Every launch pays for the same four things — the AGENTS.md files the agent
  * harness loads, lazy's own system prompt (which carries the project's LAZY.md
  * instructions), the shared-memory index, and the MCP tool schemas — and none
  * of them had a number attached anywhere in lazy. The
  * only place they showed up was Claude Code's own `/context` screen, which
- * nobody opens until a session is already behaving oddly, and its "CLAUDE.md is
+ * nobody opens until a session is already behaving oddly, and its "AGENTS.md is
  * over the 40.0k-char limit" line scrolls past at startup.
  *
  * This module produces the numbers; `lazy doctor` renders them, one line per
@@ -17,7 +17,7 @@
  *     system messages and model guidance, vs the agent's tool instructions +
  *     system instructions);
  *   - different memory templates (the two surfaces of `assembleMemorySection`);
- *   - different CLAUDE.md sets — the builder container mounts the human's
+ *   - different AGENTS.md sets — the builder container mounts the human's
  *     `~/.claude`, so their user-level CLAUDE.md is loaded too, while a task
  *     container is handed a fresh `.claude` and never sees it.
  * The MCP tool list also differs: each role is advertised only the tools it can
@@ -31,7 +31,7 @@
  * arguments the daemon passes, `assembleMemorySection` for the memory index, and
  * `serializedToolSurface(role)` — the MCP server's own advertised-list builder —
  * for the tool surface, which is the shape `tools/list` puts on the wire. The
- * CLAUDE.md files are read from disk. Nothing here re-implements a prompt.
+ * AGENTS.md files are read from disk. Nothing here re-implements a prompt.
  *
  * Where a launch can still differ, and why:
  *   - RESUME turns use a different prompt (`buildSystemPromptForResume`), so an
@@ -56,7 +56,7 @@
  *     artifacts listing, the maintained-files nudge and the protected-file
  *     push-back. Every one is conditional or grows with the task; averaging them
  *     into a "before the first message" total would make the total unfalsifiable.
- *   - Nested CLAUDE.md files in subdirectories: Claude Code loads those on
+ *   - Nested AGENTS.md files in subdirectories: Claude Code loads those on
  *     demand, when the agent reads a file in that directory, not at startup.
  *     Nested LAZY.md files ARE counted, because lazy has no on-demand hook and
  *     injects them up front — the asymmetry is real, not an oversight.
@@ -64,7 +64,7 @@
  *     `<system-reminder>` machinery. Those are Claude Code's, not lazy's, and no
  *     project setting changes them. This is why the total here is much smaller
  *     than the one on `/context`: doctor reports what LAZY costs a session, plus
- *     the CLAUDE.md files it is lazy's business to warn about.
+ *     the AGENTS.md files it is lazy's business to warn about.
  *
  * This lives outside `src/cli/` deliberately: it is domain logic (what does a
  * launch cost), not presentation, so the daemon can serve it later without
@@ -315,11 +315,11 @@ export async function measureText(text: string): Promise<TextMeasurement> {
   }
 }
 
-/** A CLAUDE.md-style memory file the agent harness loads at startup. */
+/** An AGENTS.md-style memory file the agent harness loads at startup. */
 export interface ClaudeMemoryFile {
   /** Absolute path on disk. */
   path: string;
-  /** How doctor names it, e.g. "CLAUDE.md (project)". */
+  /** How doctor names it, e.g. "AGENTS.md (project)". */
   label: string;
   content: string;
   /** The limit this file was compared against, derived from the window. */
@@ -329,12 +329,14 @@ export interface ClaudeMemoryFile {
 }
 
 /**
- * The CLAUDE.md files a role's harness loads from disk at startup.
+ * The AGENTS.md files a role's harness loads from disk at startup.
  *
- * Paths verified against Claude Code 2.1.266: project memory is `CLAUDE.md` in
- * the working directory (`.claude/CLAUDE.md` is treated the same way), local
+ * Claude Code 2.1.277 uses AGENTS.md as a fallback when no project
+ * CLAUDE.md, .claude/CLAUDE.md or CLAUDE.local.md is present.
+ * Project memory is `AGENTS.md` in
+ * the working directory (`.claude/AGENTS.md` is treated the same way), local
  * memory is `CLAUDE.local.md` beside it, and user memory is
- * `~/.claude/CLAUDE.md`. Nested CLAUDE.md files deeper in the tree load ON
+ * `~/.claude/CLAUDE.md`. Nested AGENTS.md files deeper in the tree load ON
  * DEMAND, when the agent reads a file in that directory, so they are not part
  * of the starting budget and are deliberately not counted.
  *
@@ -349,7 +351,9 @@ export async function findClaudeMemoryFiles(
 ): Promise<ClaudeMemoryFile[]> {
   const limit = claudeMdCharLimit(opts.windowTokens ?? CONTEXT_WINDOW_TOKENS);
   const candidates: Array<{ path: string; label: string }> = [
+    { path: join(opts.lazyRoot, 'AGENTS.md'), label: 'AGENTS.md (project)' },
     { path: join(opts.lazyRoot, 'CLAUDE.md'), label: 'CLAUDE.md (project)' },
+    { path: join(opts.lazyRoot, '.claude', 'AGENTS.md'), label: 'AGENTS.md (project, .claude/)' },
     { path: join(opts.lazyRoot, '.claude', 'CLAUDE.md'), label: 'CLAUDE.md (project, .claude/)' },
     { path: join(opts.lazyRoot, 'CLAUDE.local.md'), label: 'CLAUDE.local.md (project)' },
   ];
@@ -370,7 +374,7 @@ export async function findClaudeMemoryFiles(
     try {
       content = await readFile(candidate.path, 'utf-8');
     } catch {
-      // Absent is the normal case for three of these four paths, and an
+      // Absent is the normal case for most of these paths, and an
       // unreadable one is not a project health problem — a memory file doctor
       // cannot read is one the agent cannot read either, and the files it does
       // read still give an accurate picture. Left out of the report.
@@ -383,6 +387,18 @@ export async function findClaudeMemoryFiles(
       limit,
       overLimit: content.length > limit,
     });
+  }
+  const projectClaudePaths = [
+    join(opts.lazyRoot, 'CLAUDE.md'),
+    join(opts.lazyRoot, '.claude', 'CLAUDE.md'),
+    join(opts.lazyRoot, 'CLAUDE.local.md'),
+  ];
+  if (found.some(file => projectClaudePaths.includes(file.path))) {
+    const projectAgentsPaths = [
+      join(opts.lazyRoot, 'AGENTS.md'),
+      join(opts.lazyRoot, '.claude', 'AGENTS.md'),
+    ];
+    return found.filter(file => !projectAgentsPaths.includes(file.path));
   }
   return found;
 }
@@ -471,7 +487,7 @@ export function windowForRole(role: ContextRole, config: ResolvedConfig): Effect
   }
 }
 
-/** The remedy for a CLAUDE.md over Claude Code's per-file limit. */
+/** The remedy for an AGENTS.md over Claude Code's per-file limit. */
 export function claudeMdRemedy(path: string): string {
   return (
     `It is still injected in full — nothing is truncated — but the harness warns at every ` +
@@ -528,7 +544,7 @@ export async function measureContextBudget(
 
       // LAZY.md is injected into the AGENT system prompt only (src/task/lazy-md
       // — the builder is not handed it), and is read here from the project root
-      // for the same reason the CLAUDE.md files are: a task reads its own
+      // for the same reason the AGENTS.md files are: a task reads its own
       // worktree's copy, but the two are the same file until a task edits one,
       // and the root's copy is the honest answer to "what does a new task start
       // with".
@@ -654,12 +670,12 @@ export async function measureContextBudget(
  *
  * "Can shrink" is the point: the MCP tool schemas and lazy's system prompt are
  * lazy's own surface and no project setting trims them, so naming them would be
- * advice nobody can take. Only the CLAUDE.md files, the project's LAZY.md
+ * advice nobody can take. Only the AGENTS.md files, the project's LAZY.md
  * instructions and the shared-memory index belong to the human.
  */
 export function largestTrimmable(role: RoleContextBudget): ContextContributor | null {
   const trimmable = role.contributors.filter(
-    c => c.label.startsWith('CLAUDE') || c.label.includes('LAZY.md') || c.label.includes('shared memory'),
+    c => c.label.startsWith('AGENTS.md') || c.label.startsWith('CLAUDE') || c.label.includes('LAZY.md') || c.label.includes('shared memory'),
   );
   if (trimmable.length === 0) return null;
   return trimmable.reduce((biggest, c) => (c.chars > biggest.chars ? c : biggest));

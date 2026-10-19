@@ -55,7 +55,29 @@ export interface TurnMcpLog {
 
 const defaultLog: TurnMcpLog = { info: supervisorLog, warn: supervisorLogWarn };
 
+/**
+ * The lazy turn this supervisor process was started INSIDE, if any — read once,
+ * at module load, before `prepareTurnMcp` sets the variable for its own turn.
+ *
+ * `prepareTurnMcp` exports `LAZY_MCP_EXPECTED_TASK_ID` into its own environment,
+ * and an agent's shell inherits it. So a supervisor that STARTS with it already
+ * naming a task was launched from inside that task's agent: an agent running a
+ * host-process lazy (a demo, a playground, a suite). When such a supervisor
+ * shares the outer agent's HOME, its `~/.claude.json` write would repoint the
+ * outer agent's live lazy tool channel at this inner task: every later
+ * invocation of the outer turn starts with no lazy tools, cannot commit, and
+ * parks with its work uncommitted (2026-10-05, a native-cycle demo run from a
+ * task container). `writeMcpConfig` refuses exactly that overwrite.
+ */
+const INHERITED_TURN_TASK_ID = process.env[MCP_EXPECTED_TASK_ID_ENV] || undefined;
+
 export interface TurnMcpOptions {
+  /**
+   * The task whose agent started this supervisor, if any. Defaults to the value
+   * inherited at process start (see INHERITED_TURN_TASK_ID); injectable so the
+   * refusal it drives is testable.
+   */
+  enclosingTurnTaskId?: string;
   /**
    * Turn toolset. Prefer this over the legacy `readOnly` boolean.
    * - `full` — work turns
@@ -126,7 +148,7 @@ function toolsetScopeLabel(toolset: McpToolset): string {
  * history, record follow-ups, commit through lazy, or reach any lazy state at
  * all — it just does the work with the wrong picture and no way to say so. The
  * only trace was one warn line inside the container's supervisor log, which is
- * exactly where nobody looks. Per CLAUDE.md ("never swallow, always surface";
+ * exactly where nobody looks. Per AGENTS.md ("never swallow, always surface";
  * "errors are for humans, not for code") this must reach the human as a turn
  * failure they can see and act on.
  */
@@ -156,7 +178,9 @@ export async function prepareTurnMcp(
     // the account's real ~/.claude.json. See src/mcp/test-home-guard.ts.
     assertTestLaunchHasPrivateHome();
     const mcpConfig = runner.mcpServerConfig(taskId, worktreePath, { toolset });
-    await writeMcpConfig(mcpConfig);
+    await writeMcpConfig(mcpConfig, {
+      enclosingTurnTaskId: 'enclosingTurnTaskId' in opts ? opts.enclosingTurnTaskId : INHERITED_TURN_TASK_ID,
+    });
     if (opts.harness === 'codex') {
       // Codex reads BOTH its lazy_* MCP entry and its model-provider routing
       // from ~/.codex/config.toml, so one managed write covers them. The proxy
@@ -198,7 +222,7 @@ export async function prepareTurnMcp(
     );
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
-    // Name every fact the human needs to act on, per CLAUDE.md's "errors are
+    // Name every fact the human needs to act on, per AGENTS.md's "errors are
     // actionable": WHICH task lost its tools, WHERE it was running (in a
     // container the hostname is the container id), and the underlying cause —
     // typically LAZY_DAEMON_CONFIG unset, or a config path that is unreadable

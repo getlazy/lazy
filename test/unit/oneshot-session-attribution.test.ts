@@ -19,6 +19,7 @@
  * too, and pin the execution path a one-shot takes.
  */
 
+import type { AgentExecArgs } from '../../src/agent/interface';
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtemp, rm, mkdir, writeFile, utimes, chmod, readFile } from 'fs/promises';
 import { join } from 'path';
@@ -334,7 +335,8 @@ describe('one-shot execution path', () => {
   // "conversation" again — and every filter above goes blind at once.
   test('marks its prompt at the head', () => {
     const args = buildOneshotArgs('summarize the task', 'opus');
-    const prompt = args[args.indexOf('-p') + 1];
+    // The prompt rides stdin (the argv rule, src/agent/argv-safety.ts).
+    const prompt = (args as AgentExecArgs).stdinInput!;
     expect(prompt.startsWith(ONESHOT_MARKER)).toBe(true);
   });
 

@@ -3,7 +3,7 @@
  * clobbering anything else in it.
  *
  * On a host-process run this is the USER's real cursor CLI config, so a
- * replace-instead-of-merge here would silently delete their settings (CLAUDE.md:
+ * replace-instead-of-merge here would silently delete their settings (AGENTS.md:
  * no hidden destructive side effects; "found but broken" must surface).
  */
 

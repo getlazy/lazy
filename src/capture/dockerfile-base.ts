@@ -17,14 +17,12 @@
  * build path build the base first, and lets the failure name
  * `lazy system build lazy-runner` as the remedy.
  *
- * SCOPE — the exact `lazy-runner` repository is what lazy will build for you.
- * The agent-suffixed repositories (`lazy-runner-cursor`, …) are recognised but
- * NOT auto-built: they are lazy's own per-agent default images, produced by
- * `ensureImage` from the default Dockerfile plus that agent's install line, and
- * nothing documents them as a FROM target. Building one here would mean
- * re-deriving agent-aware Dockerfile content inside a path that is already
- * building the project's custom Dockerfile. They still get the actionable error
- * message rather than the raw registry one.
+ * SCOPE — the exact `lazy-runner` repository is what lazy will supply for you
+ * (pulled from the release, or built locally). The agent-suffixed repositories
+ * (`lazy-runner-cursor`, …) are recognised but NOT supplied: they were the old
+ * per-agent default images, retired when `lazy-runner` started carrying every
+ * agent CLI (docs/design/published-runner-image.md). A Dockerfile still naming
+ * one gets an error telling it to switch to `FROM lazy-runner`.
  *
  * Likewise a base reference pinned to a tag lazy does not write (`FROM
  * lazy-runner:0.19`) is recognised but not built — a base build writes only the

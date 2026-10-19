@@ -56,7 +56,7 @@ export interface ResolvedService extends ServicePort {
   /** `http://127.0.0.1:<hostPort>`, or null when unpublished. */
   url: string | null;
   /**
-   * `http://<service>.<task>.lazy.localhost:<dashboard-port>` — the name the
+   * `http://<task>.<service>.lazy.localhost:<dashboard-port>` — the name the
    * daemon's reverse proxy answers on, or null when there is no proxy to route
    * through (nothing published, or a process that does not know where the
    * dashboard is; see src/serve/subdomain.ts).
@@ -158,6 +158,37 @@ export interface ServeConfigInput {
   ports?: unknown;
   services?: unknown;
   start_services_cmd?: unknown;
+  main_service?: unknown;
+}
+
+/**
+ * Validate `[serve] main_service` — the ONE declared port a reviewer is sent to
+ * (the PR/MR description links to it). Undefined when unset; the caller falls
+ * back to the first declared service (see {@link mainServiceOf}).
+ *
+ * It must be one of the declared ports: a main service nothing publishes would
+ * produce a link to nowhere, so the typo is a config error naming the port and
+ * the list.
+ */
+export function resolveMainService(serve: ServeConfigInput | undefined, services: ServicePort[]): number | undefined {
+  const raw = serve?.main_service;
+  if (raw === undefined || raw === null) return undefined;
+  const port = assertValidPort(raw, 'lazy.toml [serve] main_service');
+  if (!services.some(s => s.port === port)) {
+    const declared = services.map(s => s.port).join(', ');
+    throw new Error(
+      `lazy.toml [serve] main_service: port ${port} is not one of the declared ports` +
+      (declared ? ` (${declared}).` : ` — no ports are declared.`) +
+      ` Set main_service to a port listed in [serve] ports or [serve.services], or remove the key.`,
+    );
+  }
+  return port;
+}
+
+/** The service a reviewer is sent to: `main_service`, else the first declared; null with no services. */
+export function mainServiceOf(services: ServicePort[], mainService: number | undefined): ServicePort | null {
+  if (mainService !== undefined) return services.find(s => s.port === mainService) ?? null;
+  return services[0] ?? null;
 }
 
 /**

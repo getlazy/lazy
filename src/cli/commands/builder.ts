@@ -2,7 +2,7 @@
  * lazy builder — Launch Claude Code with the Lazy builder system prompt.
  *
  * This command starts an interactive Claude Code session with the Lazy builder
- * instructions injected via --append-system-prompt. The user's CLAUDE.md is untouched.
+ * instructions injected via --append-system-prompt. The user's CLAUDE.md and AGENTS.md are untouched.
  *
  * Sessions share the host's ~/.claude/ directory, so Claude Code settings, credentials,
  * and conversation history are available inside the container. The builder supervisor
@@ -24,6 +24,7 @@ import { requireLazyRoot, requireStorage, parseFlags, type FlagDefinition } from
 import { loadConfig } from '../../config/loader';
 import { resolveRoleTarget, isKnownAnthropicModel, KNOWN_ANTHROPIC_SHORT_NAMES } from '../../utils/role-target';
 import { resolveBuilderModel } from '../../agent/agent-model';
+import { assertNoModelOnTiered } from '../../agent/tiered-model';
 import { builderProfileAdvice } from '../../config/agent-profile-advice';
 import { isTTY, promptLine } from '../editor';
 import { getProjectName } from '../../storage';
@@ -31,7 +32,8 @@ import { theme } from '../../render/theme';
 import { createRunner, refreshRunnerProxyTargets, type Runner } from '../../runner';
 import { buildBuilderPermissionArgs } from '../../runner/host-sandbox';
 import { generateBuilderConfig } from '../../builder/server';
-import { queryDaemonMcpConfig, queryConcurrency, admitBuilder, releaseBuilder } from '../../daemon/rpc-fallback';
+import { queryDaemonMcpConfig, queryConcurrency, admitBuilder, releaseBuilder, queryRunnerImage, queryBuilderTierLine } from '../../daemon/rpc-fallback';
+import { DockerRunner } from '../../runner/docker-runner';
 import { checkDaemonHealth } from '../../daemon/lifecycle';
 import { runBuilderRelaunchLoop, type BuilderLaunchResult } from '../../builder/relaunch';
 import { revokeBuilderMcpToken } from '../../builder/mcp-session';
@@ -51,6 +53,7 @@ import { assembleBuilderSystemPrompt } from '../../builder/system-prompt';
 import { MODEL_OVERRIDE_FLAG, EFFORT_OVERRIDE_FLAG } from '../../builder/launch-directive';
 import { resolveBuilderLaunchInputs } from '../../builder/launch-inputs';
 import { boundCloneLogin, commandBuilderBound } from './bound-session';
+import { admitInteractiveOrExit } from '../usage-pause-preflight';
 
 async function buildSystemPrompt(lazyRoot: string, runner: Runner, relaunch = false): Promise<string> {
   // Storage is opened just for the memory/messages reads inside assembly and
@@ -157,8 +160,10 @@ export async function commandBuilder(args: string[]): Promise<void> {
     { name: 'import', takesValue: false },
     { name: 'effort', takesValue: true },
     { name: 'model', takesValue: true },
+    { name: 'override-usage-pause', takesValue: false },
   ];
   const parsed = parseFlags(args, BUILDER_FLAGS, 'builder');
+  const overrideUsagePause = parsed.flags.get('override-usage-pause') === true;
   // Autonomous is the DEFAULT for the builder. The builder is an orchestrator,
   // not a task agent, and it runs with LESS access than the agents it directs
   // (containerised, repository mounted read-only, every task operation brokered
@@ -211,6 +216,15 @@ export async function commandBuilder(args: string[]): Promise<void> {
   // Create the runner — determines Docker vs host-process mode
   const runner = await createRunner(root);
   const config = await loadConfig(root);
+
+  // A TIERED builder takes its model from the tier serving each request, so a
+  // --model would be silently ignored: refused, exactly as for a tiered task.
+  try {
+    assertNoModelOnTiered(config, config.models.roles.builder.profile, modelOverride);
+  } catch (err) {
+    console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
 
   // Autonomous mode warnings and confirmation.
   // Shown BEFORE pre-flight checks so users see them even if infrastructure fails.
@@ -303,6 +317,18 @@ export async function commandBuilder(args: string[]): Promise<void> {
     // Non-fatal: never block an interactive builder on a limits-query failure.
     if (config.session.debug) {
       console.error(`[DEBUG] builder concurrency pre-check skipped: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  // A TIERED builder says which tier it is answering on; the proxy may switch
+  // tiers per request mid-conversation, which the dashboard's Builders page
+  // and the builder's own lazy_status then show. Best-effort, like the above.
+  try {
+    const tierLine = await queryBuilderTierLine();
+    if (tierLine) console.log(tierLine);
+  } catch (err) {
+    if (config.session.debug) {
+      console.error(`[DEBUG] builder tier query skipped: ${err instanceof Error ? err.message : err}`);
     }
   }
 
@@ -410,8 +436,22 @@ export async function commandBuilder(args: string[]): Promise<void> {
   console.log(`Scratch dir (writable, outside the repo, readable by you at this path):`);
   console.log(`  ${scratchDir}`);
 
+  // The project's own runner image is built by the daemon at boot. While it
+  // is not ready the builder starts on lazy's default image — said here, never
+  // silently — rather than building it again in this process.
+  if (runner instanceof DockerRunner) {
+    const image = await queryRunnerImage();
+    if (image && !image.ready) {
+      runner.useDefaultImageForBuilder();
+      console.log('');
+      console.log(theme.warning(`This builder runs on lazy's default runner image. ${image.description}`));
+      console.log(theme.separator('Once it is ready, quit and start `lazy builder --resume` again to switch to it.'));
+    }
+  }
+
   // Ensure runner infrastructure is ready (builds Docker image if needed)
   await runner.ensureReady();
+  await admitInteractiveOrExit('builder', undefined, { overrideUsagePause });
 
   // Resolve builder effort: --effort flag > config.builder.effort (default "high").
 
@@ -736,12 +776,14 @@ export async function commandBuilder(args: string[]): Promise<void> {
 }
 
 export function builderUsage(): void {
-  console.log(`Usage: lazy builder [list | --resume <id>]
+  console.log(`Usage: lazy builder [list | --resume <id>] [--override-usage-pause]
 
 Launch an interactive Claude Code session with Lazy builder instructions.
 
+--override-usage-pause starts this builder session even when its credential is paused.
+
 This starts Claude Code with the Lazy system prompt injected via --append-system-prompt.
-Your CLAUDE.md is untouched — Lazy's orchestration instructions are appended to the system
+Your CLAUDE.md and AGENTS.md are untouched — Lazy's orchestration instructions are appended to the system
 prompt, not written to any file.
 
 The host's ~/.claude/ directory is shared with the container, so Claude Code settings,

@@ -337,7 +337,8 @@ td.lz-forge-col {
   background: var(--color-accent);
 }
 
-/* Maximise-in-place: the element never moves in the DOM. */
+/* Fill window ("maximise"): the whole viewport, width and height; the element
+   never moves in the DOM. The Watch panel uses the same class (terminal-panels.css). */
 .lz-shell-session-bar {
   display: flex;
   align-items: center;
@@ -348,11 +349,12 @@ td.lz-forge-col {
 }
 .lz-shell-session.is-maximised {
   position: fixed;
-  inset: 1.5rem;
+  inset: 0;
   z-index: 80;
   display: flex;
   flex-direction: column;
-  background: var(--color-bg);
+  background: #000;
+  color: #e3e5e8;
   border: 1px solid var(--color-divider);
   padding: var(--space-3);
   height: auto !important;
@@ -698,7 +700,32 @@ body.lz-shell-maximised { overflow: hidden; }
 .lz-artifact-head .btn { margin-left: auto; }
 .lz-artifact-preview { margin-top: var(--space-2); }
 .lz-artifact-image { display: block; max-width: 100%; height: auto; margin-top: var(--space-2); border: 1px solid var(--border); }
-pre.lz-artifact-text { max-height: 32rem; overflow: auto; white-space: pre-wrap; word-break: break-word; }
-div.lz-artifact-text { max-height: 32rem; overflow: auto; }
+pre.lz-artifact-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+div.lz-artifact-text { overflow-wrap: anywhere; }
 .lz-artifact-upload { display: flex; flex-direction: column; gap: var(--space-2); border-top: 1px solid var(--border); padding-top: var(--space-3); }
 .lz-artifact-upload label { display: flex; flex-direction: column; gap: var(--space-1); max-width: 32rem; }
+
+/* A verification step's mounted shell has no panel around it to give it a
+   height. Left to size itself from its content it could grow when filled but
+   never shrink back (xterm's own rows held it open), so it gets a definite
+   height like the panel's 420px. */
+.lz-shell-mount .lz-shell-session:not(.is-maximised) {
+  display: flex;
+  flex-direction: column;
+  height: 420px;
+}
+.lz-shell-mount .lz-shell-session:not(.is-maximised) .lz-shell-term {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: auto;
+}
+
+/* A profile that lazy.toml no longer defines is stated, never styled as normal. */
+.lz-launch-missing {
+  color: var(--color-danger, #c0392b);
+  opacity: 1;
+  font-style: normal;
+}
+.lz-launch-tiered {
+  font-style: normal;
+}

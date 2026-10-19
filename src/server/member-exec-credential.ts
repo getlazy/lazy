@@ -156,6 +156,7 @@ export async function planMemberContainerCredential(opts: {
       taskId: opts.taskId,
       label,
       profile: ANTHROPIC_DEFAULT_TARGET.profile,
+      projectRoot: opts.root,
     };
     const vars = await getLaunchAuthEnvVars(identity, target, { role: 'builder' }, 'container', credEnv);
     const set = new Set(vars.map((v) => v.key));

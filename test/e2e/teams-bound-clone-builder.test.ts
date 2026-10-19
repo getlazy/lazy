@@ -278,13 +278,13 @@ describe('lazy builder in a clone bound to Lazy Teams', () => {
     expect(proxied).toContain('storage:getActiveBuilderSessionForMember');
   }, 240_000);
 
-  // INVARIANT: `lazy pair` and `lazy shell` in a bound clone launch nothing
+  // INVARIANT: `lazy pair`, `lazy chat` and `lazy shell` in a bound clone launch nothing
   // on the laptop either. They go through Teams to the task's session on the
   // server, and the daemon's refusal — here, a task that has not run a turn,
   // so it has no environment to open yet — is what the person reads, in its
   // own words, before any socket. Options that choose a LOCAL launch are
   // refused by name before anything is asked.
-  test('lazy pair and lazy shell go through Teams and show the server\'s refusal', async () => {
+  test('lazy pair, lazy chat and lazy shell go through Teams and show the server\'s refusal', async () => {
     const task = await rpc(alice, 'storage', { method: 'createTask', args: { goal: 'Pair on this' } }) as { id: string; code: string | null };
     await rpc(alice, 'storage', {
       method: 'createSession', args: { taskId: task.id, agentId: 'claude-code', gitBranch: `lazy/${task.id}`, gitStartSha: 'HEAD' },
@@ -302,7 +302,7 @@ describe('lazy builder in a clone bound to Lazy Teams', () => {
     };
     const launchesBefore = (await docker.invocations()).length;
 
-    for (const command of ['pair', 'shell']) {
+    for (const command of ['pair', 'chat', 'shell']) {
       proxied.length = 0;
       const result = await run([command, task.id]);
       expect(result.code).toBe(1);

@@ -9,7 +9,7 @@
  *
  *   TEAMS — the owner of the project's service credential, the member whose
  *   Anthropic account those turns already spend
- *   (`Project#service_claude_credential`), pushed to the daemon beside the
+ *   (`Project#service_user`), pushed to the daemon beside the
  *   secret itself (src/daemon/user-credentials.ts).
  *
  *   A LAPTOP — the git identity (§3.4), because in single-person mode all three
@@ -30,7 +30,7 @@
  */
 
 import { isManagedMode } from '../config/managed';
-import { getServiceCredential } from '../daemon/user-credentials';
+import { getServiceHolder } from '../daemon/user-credentials';
 import { logger } from '../utils/logger';
 import type { ActorInput, TurnOwner } from '../types';
 import { resolveGitIdentity } from './git-identity';
@@ -87,9 +87,7 @@ export async function systemActor(
  */
 async function serviceCredentialOwner(projectRoot: string): Promise<TurnOwner | null> {
   try {
-    const record = await getServiceCredential(projectRoot);
-    if (!record?.ownerEmail) return null;
-    return { email: record.ownerEmail, ...(record.ownerName ? { name: record.ownerName } : {}) };
+    return await getServiceHolder(projectRoot);
   } catch (err) {
     logger.debug(
       `Could not resolve the system identity from the service credential: ` +

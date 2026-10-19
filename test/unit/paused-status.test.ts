@@ -197,3 +197,60 @@ describe('re-deriving the paused label is always a legal transition', () => {
     expect(canTransition('pairing', 'conflict')).toBe(true);
   });
 });
+
+// INVARIANT (engineer, 2026-10-04): a task whose protected-file questions are
+// deferred to its parent's accept — an agent-audience subtask, every cluster
+// child — is never parked `conflict`. Nothing is owed at its own merge, and the
+// label must say what its accept gate says, or a cluster driver reads
+// `conflict` as "waiting for the engineer" and holds a finished child.
+describe('parkTaskPaused — deferred to the parent', () => {
+  let testDir: string;
+  let storage: Storage;
+
+  beforeEach(async () => {
+    testDir = mkdtempSync(join(tmpdir(), 'lazy-paused-deferred-'));
+    mkdirSync(join(testDir, '.lazy'), { recursive: true });
+    storage = await createStorage(testDir, { backend: 'external' });
+  });
+
+  afterEach(async () => {
+    if (storage) await storage.close();
+    if (testDir) rmSync(testDir, { recursive: true, force: true });
+  });
+
+  /** A working child of a `parentType` parent, its one turn launched by `launcher`. */
+  async function workingChild(parentType: string, launcher: 'human' | 'agent'): Promise<string> {
+    const parent = await storage.createTask('The parent', undefined, undefined, undefined, parentType);
+    await storage.updateTaskStatus(parent.id, 'working');
+    const child = await storage.createTask('A child', parent.id);
+    const session = await storage.createSession(child.id, 'claude', 'lazy/child', 'HEAD');
+    await storage.createTurn({ sessionId: session.id, sequence: 1, role: 'human', content: 'go', actor: launcher });
+    // `actor: 'agent'` is what an attributed reply turn carries in production;
+    // it must never be read as the launcher.
+    await storage.createTurn({ sessionId: session.id, sequence: 2, role: 'agent', content: 'work turn', actor: 'agent', violations: PENDING });
+    await storage.updateTaskStatus(child.id, 'working');
+    return child.id;
+  }
+
+  test('a cluster child with a pending set parks blocked', async () => {
+    const childId = await workingChild('cluster', 'human');
+    expect(await parkTaskPaused(storage, childId, 'system')).toBe('blocked');
+  });
+
+  // The turn's own fresh detection is what the reconciler passes at turn end.
+  test('so does one whose just-finished turn detected the file', async () => {
+    const childId = await workingChild('cluster', 'agent');
+    expect(await parkTaskPaused(storage, childId, 'system', { detected: PENDING })).toBe('blocked');
+  });
+
+  test('an agent-launched subtask of an ordinary task parks blocked', async () => {
+    const childId = await workingChild('task', 'agent');
+    expect(await parkTaskPaused(storage, childId, 'system')).toBe('blocked');
+  });
+
+  // A person reads it, so the question is asked at its own accept.
+  test('a human-launched subtask of an ordinary task still parks conflict', async () => {
+    const childId = await workingChild('task', 'human');
+    expect(await parkTaskPaused(storage, childId, 'system')).toBe('conflict');
+  });
+});

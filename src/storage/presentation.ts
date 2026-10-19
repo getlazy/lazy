@@ -323,6 +323,8 @@ const IMAGE_MIME_PREFIX = 'image/';
  * both ends rather than a report that validates and then renders broken.
  */
 const REFUSED_IMAGE_MIME = 'image/svg+xml';
+/** The raster types every serving route shows inline — the allowlist, compared to the normalized type. */
+const SCREENSHOT_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 
 export interface ScreenshotArtifactRef {
   name: string;
@@ -355,7 +357,9 @@ export function assertScreenshotsResolvable(
           ' Attach the image with lazy_artifact_add first.',
       );
     }
-    const mime = artifact.mime_type.toLowerCase();
+    // Normalized (no parameters, lowercase): the stored type is agent-supplied,
+    // and `image/svg+xml; charset=utf-8` is still SVG.
+    const mime = artifact.mime_type.split(';')[0]!.trim().toLowerCase();
     if (!mime.startsWith(IMAGE_MIME_PREFIX)) {
       throw new Error(
         `presentation screenshot artifact '${shot.artifact}' is ${artifact.mime_type}, not an image. ` +
@@ -366,6 +370,12 @@ export function assertScreenshotsResolvable(
       throw new Error(
         `presentation screenshot artifact '${shot.artifact}' is SVG, which the review page does not render ` +
           '(an SVG is a scriptable document, not a screenshot). Attach a raster capture (png, jpeg, gif, webp) instead.',
+      );
+    }
+    if (!SCREENSHOT_MIMES.has(mime)) {
+      throw new Error(
+        `presentation screenshot artifact '${shot.artifact}' is ${artifact.mime_type}, which the review page does not render. ` +
+          'Screenshots must be png, jpeg, gif or webp.',
       );
     }
   }

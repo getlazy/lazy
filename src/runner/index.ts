@@ -155,7 +155,6 @@ export async function createRunner(lazyRoot: string, overrideType?: RunnerType):
         denyWrite: config.runner.sandbox_deny_write,
         storePath: hostSandboxStorePath(config),
       });
-      runner.setBoundaryVerification(config.runner.verify_sandbox_boundary);
       return runner;
     }
     default:

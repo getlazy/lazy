@@ -30,11 +30,15 @@ import { getOrCreateStorage, handleBuilderSlot, handleGetDaemonMcpConfig, handle
 import {
   planTurnCredential,
   credentialEnvForPlan,
+  envVarForCredentialKind,
+  getTaskSessionBinding,
   releaseTurnCredential,
+  sideLaunchCredentialProblem,
   TurnCredentialUnavailableError,
   type TurnCredentialPlan,
 } from './turn-credentials';
 import { actorEmail } from '../actor-ref';
+import type { ResolvedConfig } from '../config/types';
 import type { ActorInput } from '../types';
 import { teamModeEnabled } from './user-credentials';
 import { isManagedMode } from '../config/managed';
@@ -51,7 +55,8 @@ export async function multiMemberDaemon(projectRoot: string): Promise<boolean> {
   return isManagedMode() || (await teamModeEnabled(projectRoot));
 }
 import type { ActorIdentity } from './actor-tokens';
-import type { BuilderSession, BuilderSessionUpdate } from '../storage/types';
+import type { BuilderSession, BuilderSessionUpdate, BuilderRunnerImage } from '../storage/types';
+import { customImageReady, describeRunnerImage, runnerImageStatus, syncRunnerImageTarget } from './runner-image';
 import { loadConfig } from '../config/loader';
 import { createRunner } from '../runner';
 import { resolveRoleTarget } from '../utils/role-target';
@@ -99,13 +104,19 @@ function newBuilderId(): string {
 async function planSessionCredential(
   projectRoot: string,
   sessionRegistryId: string,
-  memberEmail: string,
+  memberEmail: string | null,
+  builderProfile: string,
+  config: ResolvedConfig,
 ) {
   try {
     return await planTurnCredential(projectRoot, {
       taskId: sessionRegistryId,
       sessionId: sessionRegistryId,
-      spender: { email: memberEmail },
+      ...(memberEmail ? { spender: { email: memberEmail } } : {}),
+      config,
+      // The member pays with their own credential for the profile the builder
+      // RUNS ON, and the refusal names it.
+      spenderProfile: builderProfile,
     });
   } catch (err) {
     if (err instanceof TurnCredentialUnavailableError) throw new RpcError(400, err.message);
@@ -136,7 +147,9 @@ async function planSessionLaunchCredential(
 ): Promise<SessionLaunchPlan> {
   const config = await loadConfig(projectRoot);
   const builderTarget = await withLiveProxyTarget(resolveRoleTarget('builder', config), config);
-  const credentialPlan = memberEmail ? await planSessionCredential(projectRoot, builderId, memberEmail) : null;
+  const credentialPlan = await teamModeEnabled(projectRoot)
+    ? await planSessionCredential(projectRoot, builderId, memberEmail, builderTarget.profile, config)
+    : null;
   return { builderTarget, credentialPlan };
 }
 
@@ -157,6 +170,66 @@ async function planSessionLaunchCredential(
  */
 export function sessionLaunchGrantLabel(memberEmail: string | null, builderId: string): string {
   return memberEmail ? `member-builder:${memberEmail}:${builderId}` : `builder-session:${builderId}`;
+}
+
+/**
+ * The credential env a TEAM-MODE builder container re-reads when Claude Code
+ * (re)launches inside it — the refresh half of the launch above.
+ *
+ * The builder supervisor asks for its launch environment before EVERY Claude
+ * Code launch, the first one included, so this runs on every Teams builder
+ * start. It must pay exactly the way the launch did: through the session
+ * binding the launch planned under the builder id (the member's own
+ * credential), routed through the same `getLaunchAuthEnvVars` call with the
+ * same grant label, so a grant it mints is the launch's own grant (identical
+ * labels resolve to the existing grant). It never asks `getAuthEnv`, which in
+ * team mode refuses by design: the daemon holds no credential to hand out.
+ *
+ * Two refusals, never a daemon-held fallback:
+ *   - no LIVE binding (none was planned, or it was released when the session
+ *     stopped): a 409 — the session must be started again so the launch binds
+ *     the member's credential afresh. Not a credential refusal: the member may
+ *     well have one, and telling them to reconnect it would be wrong.
+ *   - a binding whose member can no longer pay for the builder's profile: the
+ *     same refusal the launch's own credential plan gives, which carries the
+ *     marker Teams turns into "connect a credential".
+ */
+export async function builderSessionRefreshAuthEnv(
+  projectRoot: string,
+  tokenLabel: string,
+  config: ResolvedConfig,
+): Promise<Array<{ key: string; value: string }>> {
+  const builderId = tokenLabel.startsWith('builder-') ? tokenLabel.slice('builder-'.length) : null;
+  if (!builderId) {
+    throw new RpcError(401, 'Unauthorized: this builder MCP token names no builder session. Relaunch the builder.');
+  }
+  const binding = await getTaskSessionBinding(projectRoot, builderId);
+  if (!binding || binding.revokedAt !== null) {
+    throw new RpcError(
+      409,
+      'This builder session no longer holds a credential binding — it was stopped or its start did not ' +
+      'complete — so it cannot be relaunched in place. Start the builder again.',
+    );
+  }
+  const roleTarget = resolveRoleTarget('builder', config);
+  const refusal = await sideLaunchCredentialProblem(projectRoot, binding.ownerUserId, roleTarget.profile, config);
+  if (refusal) throw new RpcError(400, refusal);
+  const storage = await getOrCreateStorage();
+  const session = (await storage.listBuilderSessions(projectRoot)).find((s) => s.builderId === builderId) ?? null;
+  const builderTarget = await withLiveProxyTarget(roleTarget, config);
+  return getLaunchAuthEnvVars(
+    {
+      role: 'builder', taskId: null,
+      label: sessionLaunchGrantLabel(session?.memberEmail ?? null, builderId),
+      profile: builderTarget.profile,
+      bindingKey: builderId,
+      projectRoot,
+    },
+    builderTarget,
+    { role: 'builder' },
+    'container',
+    [{ key: envVarForCredentialKind(binding.kind), value: binding.token }],
+  );
 }
 
 /**
@@ -310,7 +383,7 @@ async function launchDetachedContainer(opts: {
   resumeSessionId: string | null;
   launchPlan: SessionLaunchPlan;
   trace: BuilderStartTrace;
-}): Promise<{ containerName: string; resumed: string | null }> {
+}): Promise<{ containerName: string; resumed: string | null; runnerImage: BuilderRunnerImage | null }> {
   const { projectRoot, memberEmail, builderId, resumeSessionId, launchPlan, trace } = opts;
   const config = await loadConfig(projectRoot);
   const runner = await createRunner(projectRoot);
@@ -342,8 +415,13 @@ async function launchDetachedContainer(opts: {
   const identity = {
     role: 'builder' as const, taskId: null,
     label: sessionLaunchGrantLabel(memberEmail, builderId), profile: builderTarget.profile,
+    // A member's session is paid through the binding planned under its id, so a
+    // grant this launch mints (a profile off the Claude session path) bills
+    // THAT member — never the project's own credentials.
+    ...(plan?.mode === 'session' ? { bindingKey: builderId } : {}),
+    projectRoot,
   };
-  const credEnv = memberEmail ? credentialEnvForPlan(plan!) : null;
+  const credEnv = plan ? credentialEnvForPlan(plan) : null;
   // Route the plan's credential through getLaunchAuthEnvVars rather than
   // bypassing it: a session placeholder handed to the container on its own left
   // it with no ANTHROPIC_BASE_URL — that env comes from targetEnvVars, which
@@ -391,8 +469,17 @@ async function launchDetachedContainer(opts: {
 
   const systemPrompt = await trace.phase('system prompt', () => buildSystemPrompt(projectRoot, runner));
 
+  // While the project's own image is missing, building or failed, the builder
+  // starts on lazy's default image instead of waiting on (or starting) a
+  // build — and says so: the run records it and the builder page shows a
+  // banner, never a silent swap (src/daemon/runner-image.ts).
+  await syncRunnerImageTarget();
+  const useDefaultImage = !customImageReady();
+  if (useDefaultImage) trace.note(`runner image: starting on lazy's default image — ${describeRunnerImage()}`);
+
   try {
-    const { containerName, resumed } = await runner.launchBuilderDetached({
+    const { containerName, resumed, imageName } = await runner.launchBuilderDetached({
+      useDefaultImage,
       lazyRoot: projectRoot,
       systemPrompt,
       builderId,
@@ -403,15 +490,17 @@ async function launchDetachedContainer(opts: {
       resumeSessionId,
       trace,
     });
-    return { containerName, resumed };
+    const project = runnerImageStatus();
+    const runnerImage: BuilderRunnerImage | null = imageName
+      ? { image: imageName, kind: useDefaultImage ? 'fallback' : project.state === 'none' ? 'standard' : 'custom' }
+      : null;
+    return { containerName, resumed, runnerImage };
   } catch (err) {
     // The launch failed — this MCP token and slot were minted for a container
     // that will never exist. Release both rather than leaking them; a live
     // session's own slot/token are released by endBuilderSession instead.
     await handleRevokeDaemonMcpToken(projectRoot, { name: daemonMcpName }).catch(() => {});
-    if (memberEmail) {
-      await releaseTurnCredential(projectRoot, builderId).catch(() => {});
-    }
+    await releaseTurnCredential(projectRoot, builderId);
     // The launch wrote its per-launch files before `docker run` failed.
     await rm(builderSessionLaunchDir(homeDirAbs, builderId), { recursive: true, force: true })
       .catch((rmErr: unknown) => logger.warn(
@@ -479,10 +568,9 @@ async function releaseOutgoingSessionResources(
   // and the revoke is a no-op.
   await revokeBuilderCredentialGrant(projectRoot, sessionLaunchGrantLabel(session.memberEmail, outgoing))
     .catch((err: unknown) => warn('credential grant', err));
-  if (session.memberEmail) {
-    await releaseTurnCredential(projectRoot, outgoing)
-      .catch((err: unknown) => warn('credential binding', err));
-  }
+  // Service-backed launches also hold bindings, despite having no member on
+  // the session row. Release the launch's binding regardless of who paid.
+  await releaseTurnCredential(projectRoot, outgoing);
   await removeSessionLaunchFiles(projectRoot, session);
 }
 
@@ -1043,8 +1131,6 @@ async function startBuilderSessionLocked(
       `Wait for another builder session to finish, then retry.`,
     );
   }
-  const launchPlan = await trace.phase('credential plan', () => planSessionLaunchCredential(projectRoot, builderId, memberEmail));
-
   // Register the claim BEFORE the launch. This row is what keeps the
   // container from ever outrunning its record: a crash (write failure, daemon
   // death) after the launch leaves a 'starting' row naming the container, so
@@ -1056,6 +1142,7 @@ async function startBuilderSessionLocked(
   let claimed: BuilderSession | null = null;
   let launchedContainer: string | null = null;
   try {
+    const launchPlan = await trace.phase('credential plan', () => planSessionLaunchCredential(projectRoot, builderId, memberEmail));
     if (existing && existing.state === 'stopped') {
       // Reached either straight from the stale branch above — where these
       // calls are idempotent no-ops — or on a row left stopped by an earlier
@@ -1104,7 +1191,9 @@ async function startBuilderSessionLocked(
       // A conversation that could not be resumed is forgotten, or the next
       // start would try it again.
       return await reconcileClaimedSession(projectRoot, claimed, launched.containerName,
-        launched.resumed === resumeSessionId ? {} : { agentSessionId: null });
+        launched.resumed === resumeSessionId
+          ? { runnerImage: launched.runnerImage }
+          : { agentSessionId: null, runnerImage: launched.runnerImage });
     }
 
     const now = new Date().toISOString();
@@ -1132,14 +1221,16 @@ async function startBuilderSessionLocked(
       // return the winner as-is. Its state is what it really is — 'running'
       // means adopt it; 'stopped' means the rival's launch failed and this
       // call's retry path (resume) applies. Nothing was claimed or launched
-      // here, so nothing needs unwinding; the admitted slot is released by
-      // the outer catch below.
+      // here; release this attempt's planned binding and admitted slot before
+      // adopting the winner.
       const winner = await storage.getActiveBuilderSessionForMember(projectRoot, memberEmail);
       if (!winner) throw err;
+      await releaseTurnCredential(projectRoot, builderId);
+      await handleBuilderSlot(projectRoot, { action: 'release', builderId });
       return winner;
     }
     trace.setRunId(claimed.id);
-    const { containerName } = await launchDetachedContainer({
+    const { containerName, runnerImage } = await launchDetachedContainer({
       projectRoot,
       memberEmail,
       builderId,
@@ -1148,9 +1239,12 @@ async function startBuilderSessionLocked(
       trace,
     });
     launchedContainer = containerName;
-    return await reconcileClaimedSession(projectRoot, claimed, containerName);
+    return await reconcileClaimedSession(projectRoot, claimed, containerName, { runnerImage });
   } catch (err) {
     await handleBuilderSlot(projectRoot, { action: 'release', builderId }).catch(() => {});
+    // Planning can bind before a claim or launch fails, including failures
+    // before launchDetachedContainer reaches its own runner cleanup.
+    if (!launchedContainer) await releaseTurnCredential(projectRoot, builderId);
     // Demote only a launch that never produced a container. Once the container
     // is up, the row's job is to NAME it — the slot count derives from live
     // containers, so releasing the reservation below is self-correcting, and a
@@ -1207,7 +1301,7 @@ async function endBuilderSessionHeld(
 
   if (session.state === 'ended') return session;
 
-  // FAIL HARD ON A FAILED STOP (CLAUDE.md: no silent fallbacks). The daemon
+  // FAIL HARD ON A FAILED STOP (AGENTS.md: no silent fallbacks). The daemon
   // now owns this container's lifetime — endBuilderSession is the only stop
   // path a member has — so `success: true` on a stop that did not actually
   // happen would leave the container running, the registry saying the

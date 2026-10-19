@@ -33,7 +33,7 @@
  * DEGRADES GRACEFULLY: the hosted site may not exist yet, and a user may point
  * `[docs] url` at nothing. Pointers are always a SUPPLEMENT — every message
  * that carries one is still fully actionable with the pointer removed
- * (CLAUDE.md: "errors are actionable"). When docs are disabled (`url = ""`)
+ * (AGENTS.md: "errors are actionable"). When docs are disabled (`url = ""`)
  * every helper here returns an empty string and the message reads normally.
  */
 
@@ -90,6 +90,7 @@ export const DOCS_PAGES = {
   'accept-check': { path: 'accept-check', source: 'accept-check.md' },
   'lazy-toml': { path: 'lazy-toml', source: 'lazy-toml.md' },
   'managed-config': { path: 'managed-config', source: 'managed-config.md' },
+  'proxy-plugins': { path: 'proxy-plugins', source: 'proxy-plugins.md' },
   'search': { path: 'search', source: 'search.md' },
   'identity': { path: 'identity', source: 'identity.md' },
   'memory': { path: 'memory', source: 'memory.md' },

@@ -32,7 +32,11 @@ import { logger } from '../utils/logger';
 import { REDACTED } from '../utils/redact';
 import { ProxyAuditLog } from '../proxy/audit-log';
 import type { ProxyAuditRecord } from '../storage/types';
-import { getUserCredential, type UserCredentialKind } from './user-credentials';
+import { getEndpointCredential, type UserCredentialKind } from './user-credentials';
+import { memberEndpointCredentialFor } from './member-credentials';
+import { endpointRequirementsForProfile } from '../credentials/endpoint-requirements';
+import { resolveAgentProfiles } from '../config/agent-profiles';
+import { RpcError } from './rpc-error';
 
 /**
  * Primary probe for API keys: list models.
@@ -193,8 +197,17 @@ function upstreamErrorText(body: string, token: string): string | null {
  * and the replacement share a millisecond, or when the member has not yet run a
  * turn to produce a newer success.
  */
+/** The configured `[proxy]` audit retention a writer must honour. */
+export function auditRetentionOf(config: { proxy: { auditRetentionDays: number; auditRetentionMib: number } }): AuditRetention {
+  return { retentionDays: config.proxy.auditRetentionDays, retentionMib: config.proxy.auditRetentionMib };
+}
+
+
+export interface AuditRetention { retentionDays: number; retentionMib: number }
+
 export async function appendCredentialVerdictRecord(
   dataDir: string,
+  retention: AuditRetention,
   input: {
     userId: string;
     role: 'credential-check' | 'credential-replaced';
@@ -235,7 +248,9 @@ export async function appendCredentialVerdictRecord(
   };
 
   try {
-    await new ProxyAuditLog(dataDir).append(record);
+    // The CONFIGURED retention: a default-built writer would age-prune and
+    // rotate at 7 days / 128 MiB whatever the project set.
+    await new ProxyAuditLog(dataDir, retention).append(record);
   } catch (err) {
     logger.warn(
       `Credential verdict record for user ${input.userId} could not be written to the proxy audit log: ` +
@@ -245,8 +260,8 @@ export async function appendCredentialVerdictRecord(
 }
 
 /** Clear a standing dead-token verdict when a new credential replaces the old one. */
-export async function clearUserAuthRejection(dataDir: string, userId: string): Promise<void> {
-  await appendCredentialVerdictRecord(dataDir, {
+export async function clearUserAuthRejection(dataDir: string, retention: AuditRetention, userId: string): Promise<void> {
+  await appendCredentialVerdictRecord(dataDir, retention, {
     userId,
     role: 'credential-replaced',
     upstream: 'lazy://credential-store',
@@ -265,7 +280,8 @@ export async function clearUserAuthRejection(dataDir: string, userId: string): P
  * happened, in terms a person can act on.
  *
  * Never throws for a credential problem — a rejection is an ANSWER, not an
- * error. It throws only if the daemon cannot read its own configuration.
+ * error. It throws if configuration cannot be read or its destination cannot
+ * safely receive the stored credential.
  */
 export async function checkUserCredential(
   projectRoot: string,
@@ -273,19 +289,15 @@ export async function checkUserCredential(
   options: { fetchImpl?: typeof fetch } = {},
 ): Promise<CredentialCheckResult> {
   const config = await loadConfig(projectRoot);
-  // The upstream the proxy forwards to, so the probe lands where a turn would.
-  // With the proxy off there is no such setting and turns go straight out, so
-  // the probe follows them to the same default.
-  const upstream = (
-    config.proxy?.upstream ??
-    process.env.ANTHROPIC_BASE_URL ??
-    'https://api.anthropic.com'
-  ).replace(/\/+$/, '');
+  // Use one effective-config snapshot, with the same destination consent check
+  // as other credential senders. A client-side preflight cannot authorize it.
+  const upstream = config.proxy.upstream.replace(/\/+$/, '');
   const dataDir = join(projectRoot, config.data.path);
+  const retention = auditRetentionOf(config);
   const doFetch = options.fetchImpl ?? fetch;
 
-  const credential = await getUserCredential(projectRoot, userId);
-  if (!credential) {
+  const stored = await getEndpointCredential(projectRoot, userId, 'builtin:anthropic');
+  if (!stored) {
     return {
       userId,
       outcome: 'no-credential',
@@ -301,6 +313,13 @@ export async function checkUserCredential(
       checkedAt: Date.now(),
     };
   }
+  const profile = resolveAgentProfiles(undefined).get('claude-code')!;
+  const requirement = endpointRequirementsForProfile(profile, config)[0]!;
+  const answer = await memberEndpointCredentialFor(projectRoot, userId, requirement, upstream);
+  if (answer.kind !== 'credential') {
+    throw new RpcError(400, `Credential test refused: ${answer.kind === 'missing' ? answer.detail : 'this endpoint takes no credential'}. No request was sent.`);
+  }
+  const credential = answer.record;
 
   const base = {
     userId,
@@ -319,6 +338,7 @@ export async function checkUserCredential(
       method: spec.method,
       headers: probeHeaders(credential.kind, credential.token, spec.method),
       body: spec.body,
+      redirect: 'error',
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
     });
   } catch (err) {
@@ -326,7 +346,7 @@ export async function checkUserCredential(
     // their token is bad because our network is down is the failure this whole
     // area exists to stop making.
     const message = err instanceof Error ? err.message : String(err);
-    await appendCredentialVerdictRecord(dataDir, {
+    await appendCredentialVerdictRecord(dataDir, retention, {
       userId,
       role: 'credential-check',
       upstream,
@@ -354,7 +374,7 @@ export async function checkUserCredential(
   const status = response.status;
   const body = await response.text().catch(() => '');
   const upstreamError = status >= 400 ? upstreamErrorText(body, credential.token) : null;
-  await appendCredentialVerdictRecord(dataDir, {
+  await appendCredentialVerdictRecord(dataDir, retention, {
     userId,
     role: 'credential-check',
     upstream,

@@ -12,7 +12,7 @@
  *
  * `resolveNotesCutoff` is the one function every surface must agree on: it
  * decides which comments count as unseen, and getting it wrong loses human
- * feedback. See CLAUDE.md, "A lazy comment never starts a turn".
+ * feedback. See AGENTS.md, "A lazy comment never starts a turn".
  */
 
 import type { Session, Turn, Comment, JournalEntry } from '../types';
@@ -20,6 +20,7 @@ import type { RemoteComment } from '../remote';
 import { ARTIFACTS_SUBDIR } from '../utils/sandbox';
 import { formatArtifactBytes } from '../artifacts/limits';
 import { turnText } from '../utils/turn-content';
+import { lazyFold, neutralizeLazyMarkers } from './wrapper-fold';
 
 import lazyToolInstructions from '../prompts/tool-instructions.md' with { type: 'text' };
 import systemInstructionsText from '../prompts/system-instructions.md' with { type: 'text' };
@@ -147,19 +148,19 @@ export function selectNotesForDelivery(
 export function buildNotesContext(comments: Comment[]): string {
   if (comments.length === 0) return '';
 
-  const header = `NOTES ADDED SINCE YOUR LAST TURN:
+  // lazy's framing is marked so review surfaces fold it; the notes themselves
+  // are people's words and are neutralized, never folded (src/task/wrapper-fold.ts).
+  const header = lazyFold('notes-header', `NOTES ADDED SINCE YOUR LAST TURN:
 The following notes were added to this task while you were idle. They may contain
 guidance, corrections, context, or decisions from the builder, other agents,
-or human reviewers. Read them carefully and incorporate the guidance into your work.
-
-`;
+or human reviewers. Read them carefully and incorporate the guidance into your work.`) + '\n\n';
 
   const noteTexts = comments.map(n => {
     const dateStr = new Date(n.created_at).toISOString().replace('T', ' ').substring(0, 19);
-    return `[${dateStr}] ${n.content}`;
+    return `[${dateStr}] ${neutralizeLazyMarkers(n.content)}`;
   });
 
-  return header + noteTexts.join('\n\n') + '\n\n--- END OF NOTES ---\n\n';
+  return header + noteTexts.join('\n\n') + '\n\n' + lazyFold('notes-footer', '--- END OF NOTES ---') + '\n\n';
 }
 
 /**
@@ -349,7 +350,7 @@ export function buildSystemPrompt(runnerInstructions?: string, chattinessSnippet
   if (chattinessSnippet) {
     prompt = chattinessSnippet + '\n\n' + prompt;
   }
-  return prompt;
+  return `Match the level of the human's question. Answer the decision or fact they asked for first, in plain language. Investigate as deeply as needed to be accurate, but do not recount implementation details, tests, caveats, or possible follow-up work unless they are necessary to answer that question or the human asks for them. A request for more detail invites the next level of explanation, not every level at once. This governs relevance and depth, independently of the configured response verbosity.\n\n${prompt}`;
 }
 
 /**
@@ -357,7 +358,7 @@ export function buildSystemPrompt(runnerInstructions?: string, chattinessSnippet
  * history, notes, remote comments, and user feedback.
  * Does NOT include tool/system instructions (those go in the system prompt).
  *
- * Note: CLAUDE.md is NOT injected here — Claude Code reads it automatically.
+ * Note: AGENTS.md is NOT injected here — Claude Code reads it automatically.
  * LAZY.md is the opposite case (no harness knows it exists, so lazy injects it)
  * and rides the SYSTEM prompt, not this one: it is stable across turns and
  * benefits from prompt caching. See `buildSystemPrompt`.

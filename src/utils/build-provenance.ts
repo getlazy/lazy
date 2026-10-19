@@ -24,6 +24,13 @@ export interface BuildInfoValues {
   buildBranch: string;
   /** Absolute source checkout path at build time, 'dev' in source runs. */
   buildSourcePath: string;
+  /**
+   * The content fingerprint of the SOURCE TREE this build was compiled from
+   * (src/utils/source-id.ts), so a compiled binary can answer
+   * `lazy system source-id` with the id its tree has. Absent for every build
+   * that has a tree to hash at runtime.
+   */
+  buildSourceFingerprint?: string;
 }
 
 /** Values used for `bun run ./src/index.ts`, tests, and `generate:version`. */
@@ -46,7 +53,7 @@ export const BUILD_SHA = '${escapeBuildInfoString(values.buildSha)}';
 export const BUILD_DIRTY = ${values.buildDirty};
 export const BUILD_BRANCH = '${escapeBuildInfoString(values.buildBranch)}';
 export const BUILD_SOURCE_PATH = '${escapeBuildInfoString(values.buildSourcePath)}';
-`;
+${values.buildSourceFingerprint ? `export const BUILD_SOURCE_FINGERPRINT = '${escapeBuildInfoString(values.buildSourceFingerprint)}';\n` : ''}`;
 }
 
 /** Full file contents for the dev/test default build-info module. */
@@ -59,6 +66,13 @@ export const DEV_BUILD_INFO = formatBuildInfoContent(DEV_BUILD_INFO_VALUES);
 export function captureGitBuildMetadata(projectRoot: string): Pick<BuildInfoValues, 'buildSha' | 'buildDirty'> {
   let buildSha = 'unknown';
   let buildDirty = false;
+
+  // No git binary at all is an expected build context, not an error: the daemon
+  // image compiles lazy in the oven/bun stage, which ships no git (and has no
+  // .git either). The caller then takes the identity from the source stamp. A
+  // spawn of a missing binary throws rather than returning a non-zero exit, so
+  // it is asked for up front instead of being caught.
+  if (!Bun.which('git')) return { buildSha, buildDirty };
 
   const shaProc = spawnSyncUnsupervised(['git', 'rev-parse', '--short', 'HEAD'], {
     cwd: projectRoot,

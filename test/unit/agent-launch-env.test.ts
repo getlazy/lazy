@@ -14,12 +14,23 @@
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
+import { mkdir, writeFile } from 'fs/promises';
+import { join } from 'path';
+import { getDaemonDir } from '../../src/daemon/paths';
 import { handleGetAgentLaunchEnv, initDaemonStorage, getOrCreateStorage, closeAllStorage } from '../../src/daemon/rpc-handlers';
 import { mintMcpToken, clearMcpTokenCache } from '../../src/daemon/mcp-tokens';
 import { setDaemonContext, setDaemonProxyPort, clearDaemonContext } from '../../src/daemon/context';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { pinConfig } from '../helpers/pin-config';
 import { makeDaemonBaseDir, pinDaemonBaseDir, removeDaemonBaseDir } from '../helpers/daemon-base-dir';
+import { resolveProfileCredential } from '../../src/agent/credentials';
+import { setCredential } from '../../src/credentials/store';
+import { resolveProfileLaunchCreds } from '../../src/utils/role-target';
+
+async function writeLegacyKey(root: string, harness: string, secret: string): Promise<void> {
+  await mkdir(getDaemonDir(root), { recursive: true });
+  await writeFile(join(getDaemonDir(root), 'agent-credentials.json'), JSON.stringify({ [harness]: { api_key: secret } }));
+}
 
 describe('handleGetAgentLaunchEnv', () => {
   let ctx: TestContext;
@@ -78,6 +89,50 @@ describe('handleGetAgentLaunchEnv', () => {
   test('rejects a builder MCP token', async () => {
     const builderToken = await mintMcpToken(ctx.root, { kind: 'builder' }, 'builder-x');
     await expect(handleGetAgentLaunchEnv(ctx.root, builderToken)).rejects.toThrow(/task MCP token/i);
+  });
+
+  // INVARIANT: engineer-approved October 3 reversal of the restart fix's legacy fallback.
+  // Initial launch and refresh still share one resolver, but neither accepts a legacy-only key.
+  test.each([
+    ['cursor', 'cursor', 'CURSOR_API_KEY'],
+    ['codex', 'openai', 'OPENAI_API_KEY'],
+  ])('launch and restart refuse a legacy-only %s key and name set-key', async (harness, provider, envVar) => {
+    delete process.env[envVar];
+    const storage = await getOrCreateStorage();
+    await storage.updateTaskAgent(taskId, harness);
+    await writeLegacyKey(ctx.root, harness, 'fake-legacy-key');
+    expect(await resolveProfileCredential(ctx.root, { name: harness, harness, credential: provider })).toBeNull();
+    await expect(resolveProfileLaunchCreds(ctx.root, {
+      profile: harness, harness, credential: provider, endpoint: '',
+    })).rejects.toThrow(`lazy system agent set-key ${harness}`);
+    await expect(handleGetAgentLaunchEnv(ctx.root, taskToken)).rejects.toThrow(`lazy system agent set-key ${harness}`);
+    await setCredential(ctx.root, { provider, kind: 'api-key', secret: 'fake-current-key' }, 'file');
+    const body = await handleGetAgentLaunchEnv(ctx.root, taskToken);
+    expect(body.authEnvVars.find(variable => variable.key === 'ANTHROPIC_AUTH_TOKEN')?.value).toBeTruthy();
+    expect(body.authEnvVars.find(variable => variable.key === 'ANTHROPIC_AUTH_TOKEN')?.value).not.toBe('fake-current-key');
+    expect(await resolveProfileCredential(ctx.root, { name: harness, harness, credential: provider }))
+      .toEqual({ value: 'fake-current-key', source: 'store' });
+    expect(body.proxyBaseUrl).toMatch(/:45771/);
+  });
+
+  test('refresh credential resolution does not borrow a legacy key for a named account', async () => {
+    delete process.env.CURSOR_API_KEY;
+    delete process.env.LAZY_CREDENTIAL_WORK_CURSOR;
+    await writeLegacyKey(ctx.root, 'cursor', 'fake-legacy-cursor-key');
+    await expect(resolveProfileLaunchCreds(ctx.root, {
+      profile: 'work-cursor', harness: 'cursor', credential: 'work-cursor', endpoint: '',
+    })).rejects.toThrow(/lazy auth set work-cursor/);
+  });
+
+  test('refresh credential resolution prefers the unified store over a legacy key', async () => {
+    delete process.env.CURSOR_API_KEY;
+    await writeLegacyKey(ctx.root, 'cursor', 'fake-legacy-cursor-key');
+    await setCredential(ctx.root, {
+      provider: 'cursor', kind: 'api-key', secret: 'fake-current-cursor-key',
+    }, 'file');
+    expect(await resolveProfileLaunchCreds(ctx.root, {
+      profile: 'cursor', harness: 'cursor', credential: 'cursor', endpoint: '',
+    })).toEqual([{ key: 'ANTHROPIC_AUTH_TOKEN', value: 'fake-current-cursor-key' }]);
   });
 
   test('rejects an unknown token', async () => {

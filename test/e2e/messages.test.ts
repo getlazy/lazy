@@ -91,6 +91,70 @@ describe('lazy messages', () => {
     expect(stored[0].body).toBe(message.body);
   });
 
+  // INVARIANT: bulk dismissal shows the count and asks first (--yes skips it,
+  // non-interactive without --yes refuses), touches only matching open
+  // messages, and deletes nothing. A crash loop filled an inbox with 150+
+  // identical notices that could only be dismissed one at a time.
+  test('dismiss --source / --title / --all, with count and confirmation', async () => {
+    const docker = Array.from({ length: 3 }, (_, i) => seedMessage({
+      source: 'machine-docker',
+      title: "Docker stopped in this project's machine and was restarted",
+      created_at: Date.now() - i * 1000,
+    }));
+    const other = seedMessage({ title: 'Weekly report', source: 'weekly-report', kind: 'report' });
+    const upgrade = seedMessage();
+    writeSystemMessagesFile(ctx.root, [...docker, other, upgrade]);
+
+    const refused = await ctx.lazy(['messages', 'dismiss', '--source', 'machine-docker']);
+    expectFailure(refused);
+    expectOutput(refused, '3 open message(s) from machine-docker');
+    expectError(refused, '--yes');
+    expect(readSystemMessagesFile(ctx.root).filter(m => m.dismissed_at)).toHaveLength(0);
+
+    const declined = await ctx.lazy(['messages', 'dismiss', '--source', 'machine-docker'], {
+      env: { LAZY_FORCE_TTY: '1', LAZY_PROMPT_DEFAULTS: 'decline' },
+    });
+    expectSuccess(declined);
+    expectOutput(declined, 'Nothing dismissed');
+    expect(readSystemMessagesFile(ctx.root).filter(m => m.dismissed_at)).toHaveLength(0);
+
+    const confirmed = await ctx.lazy(['messages', 'dismiss', '--source', 'machine-docker'], {
+      env: { LAZY_FORCE_TTY: '1', LAZY_PROMPT_DEFAULTS: 'accept' },
+    });
+    expectSuccess(confirmed);
+    expectOutput(confirmed, 'Dismissed 3 message(s)');
+
+    const byTitle = await ctx.lazy(['messages', 'dismiss', '--title', 'weekly', '--yes']);
+    expectSuccess(byTitle);
+    expectOutput(byTitle, 'Dismissed 1 message(s)');
+
+    const rest = await ctx.lazy(['messages', 'dismiss', '--all', '-y']);
+    expectSuccess(rest);
+    expectOutput(rest, 'Dismissed 1 message(s)');
+
+    const none = await ctx.lazy(['messages', 'dismiss', '--all', '--yes']);
+    expectSuccess(none);
+    expectOutput(none, 'No open message(s)');
+
+    const stored = readSystemMessagesFile(ctx.root);
+    expect(stored).toHaveLength(5);
+    expect(stored.every(m => (m.dismissed_at ?? 0) > 0 && m.dismissed_by === 'human')).toBe(true);
+  });
+
+  test('a blank --title is refused, never treated as "match everything"', async () => {
+    writeSystemMessagesFile(ctx.root, [seedMessage()]);
+    const result = await ctx.lazy(['messages', 'dismiss', '--title', '', '--yes']);
+    expectFailure(result);
+    expect(readSystemMessagesFile(ctx.root).filter(m => m.dismissed_at)).toHaveLength(0);
+  });
+
+  test('a collapsed repeat shows its count in list and read', async () => {
+    const message = seedMessage({ source: 'machine-docker', title: 'Docker restarted', repeat_count: 37, last_seen_at: Date.now() });
+    writeSystemMessagesFile(ctx.root, [message]);
+    expectOutput(await ctx.lazy(['messages', 'list']), '×37');
+    expectOutput(await ctx.lazy(['messages', 'read', message.id.slice(0, 8)]), 'Happened 37 times');
+  });
+
   test('read of an unknown id fails with a pointer to list', async () => {
     const result = await ctx.lazy(['messages', 'read', 'ffffffff']);
     expectFailure(result);

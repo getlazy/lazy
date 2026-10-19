@@ -102,11 +102,40 @@ export interface AgentActivityEvent {
   /** Human-readable tool name, for diagnostics ("MCP tool `x` in flight"). */
   toolName?: string;
   /**
+   * Present when the agent reports its full set of running BACKGROUND tasks
+   * (background shells, background subagents, monitors). It is the whole
+   * list's size, not a delta: `0` means nothing is running in the background
+   * any more. `undefined` means this event says nothing about them.
+   *
+   * The watchdog reads it to keep the wind-down guard off a process that is
+   * still doing work the agent started — see src/supervisor/watchdog.ts.
+   */
+  backgroundTasks?: number;
+  /**
+   * Present when that list changes: each running background task's id and the
+   * best human label lazy has for it — the command the agent backgrounded
+   * when the stream showed it, else the agent's own description.
+   */
+  backgroundTaskList?: BackgroundTaskRef[];
+  /**
+   * Present when a background task was STOPPED rather than finishing — Claude
+   * Code's `task_updated` with `status: "killed"` or `task_notification` with
+   * `status: "stopped"`. In `-p` mode Claude Code does this to a background
+   * shell 5s after the turn's result (measured on 2.1.291).
+   */
+  backgroundTaskStopped?: BackgroundTaskRef;
+  /**
    * Present on `result`: the raw line, retained verbatim so the supervisor can
    * hand it to `Agent.parseResponse()` even if the surrounding stream was
    * dropped to bound memory.
    */
   raw?: string;
+}
+
+/** One background task as lazy can name it to a person or an agent. */
+export interface BackgroundTaskRef {
+  id: string;
+  label: string;
 }
 
 /**
@@ -133,12 +162,32 @@ export interface AgentActivityStream {
  *                                         "tool_use_id":"toolu_…"}]}}
  *   {"type":"tool_progress","heartbeat":true,…}                    → heartbeat
  *   {"type":"result","result":"…","session_id":"…","usage":{…}}    → result
+ *   {"type":"system","subtype":"background_tasks_changed",          → progress +
+ *    "tasks":[{"task_id":"…","task_type":"local_bash",…}]}            backgroundTasks
+ *
+ * `background_tasks_changed` was read off Claude Code 2.1.291 running
+ * `-p --output-format stream-json` (2026-10-06, docs/claude-code-background-tasks.md):
+ * it carries the WHOLE list of running background tasks each time it changes,
+ * and an empty `tasks` array once the last one ends. A turn with background
+ * work can therefore emit a `result`, keep running, and later re-invoke the
+ * model — a second `system/init`, more assistant events, a second `result`.
  *
  * Unknown `type` values are treated as progress rather than ignored: a new
  * event kind from a future Claude Code release is still evidence the turn is
  * advancing, and mistaking real progress for silence is the expensive error.
  */
 export class ClaudeCodeActivityStream implements AgentActivityStream {
+  /** tool_use id → the command the agent backgrounded with it. */
+  private readonly backgroundCommands = new Map<string, string>();
+  /** background task id → its label, learned from the events that start it. */
+  private readonly taskLabels = new Map<string, string>();
+
+  private labelFor(taskId: string, description: unknown): string {
+    const known = this.taskLabels.get(taskId);
+    if (known) return known;
+    return typeof description === 'string' && description.trim() ? description.trim() : taskId;
+  }
+
   parseLine(line: string): AgentActivityEvent | null {
     const trimmed = line.trim();
     if (!trimmed || trimmed[0] !== '{') return null;
@@ -192,6 +241,33 @@ export class ClaudeCodeActivityStream implements AgentActivityStream {
             : {}),
         };
       }
+      if (msg.subtype === 'background_tasks_changed' && Array.isArray(msg.tasks)) {
+        const list: BackgroundTaskRef[] = [];
+        for (const t of msg.tasks as unknown[]) {
+          if (!t || typeof t !== 'object') continue;
+          const task = t as Record<string, unknown>;
+          if (typeof task.task_id !== 'string') continue;
+          const label = this.labelFor(task.task_id, task.description);
+          this.taskLabels.set(task.task_id, label);
+          list.push({ id: task.task_id, label });
+        }
+        return { kind: 'progress', backgroundTasks: msg.tasks.length, backgroundTaskList: list };
+      }
+      if (msg.subtype === 'task_started' && typeof msg.task_id === 'string') {
+        const command = typeof msg.tool_use_id === 'string' ? this.backgroundCommands.get(msg.tool_use_id) : undefined;
+        if (command) this.taskLabels.set(msg.task_id, command);
+        else if (typeof msg.description === 'string' && msg.description.trim()) this.taskLabels.set(msg.task_id, msg.description.trim());
+        return { kind: 'progress' };
+      }
+      const stopped =
+        (msg.subtype === 'task_updated' && (msg.patch as Record<string, unknown> | undefined)?.status === 'killed') ||
+        (msg.subtype === 'task_notification' && msg.status === 'stopped');
+      if (stopped && typeof msg.task_id === 'string') {
+        return {
+          kind: 'progress',
+          backgroundTaskStopped: { id: msg.task_id, label: this.labelFor(msg.task_id, msg.summary) },
+        };
+      }
       return { kind: 'progress' };
     }
 
@@ -199,6 +275,12 @@ export class ClaudeCodeActivityStream implements AgentActivityStream {
       const blocks = contentBlocks(msg.message);
       for (const block of blocks) {
         if (block.type === 'tool_use' && typeof block.id === 'string') {
+          const input = block.input as Record<string, unknown> | undefined;
+          if (input && input.run_in_background === true) {
+            const label = typeof input.command === 'string' ? input.command
+              : typeof input.description === 'string' ? input.description : undefined;
+            if (label?.trim()) this.backgroundCommands.set(block.id, label.trim());
+          }
           return { kind: 'tool_start', toolUseId: block.id, toolName: typeof block.name === 'string' ? block.name : undefined };
         }
         if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {

@@ -75,6 +75,8 @@ export interface TaskLifecycleResult {
 export interface TaskLaunchOptions {
   /** "Let this turn through the usage pause": the per-task allowance, for this launch. */
   pastUsagePause?: boolean;
+  /** The person ticked "run on lazy's default runner image" (the project's image is not ready). */
+  useDefaultImage?: boolean;
 }
 
 /** The task page's usage-pause line, already worded by the daemon. */
@@ -152,7 +154,7 @@ export interface TaskActions {
   /** No-network behind/ahead + merge-tree preview. */
   getUpstreamStatus(taskId: string): Promise<TaskUpstreamStatusView>;
   /** Merge upstream into the task — same syncTask the CLI runs. */
-  syncTask(taskId: string, onProgress?: ProgressEmitter): Promise<TaskSyncResult>;
+  syncTask(taskId: string, onProgress?: ProgressEmitter, options?: TaskLaunchOptions): Promise<TaskSyncResult>;
   reparentTask(taskId: string, parent: string, onProgress?: ProgressEmitter): Promise<TaskReparentResult>;
   /**
    * Adopt a PR URL or git branch as a blocked linked task — the same

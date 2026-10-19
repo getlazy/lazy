@@ -130,4 +130,11 @@ describe('editConfigText', () => {
     expect(() => editConfigText('', { 'runner.type': 'host-process' }, [])).toThrow(SettingEditError);
     expect(() => editConfigText('', { 'permissions.protected': 'x' }, [])).toThrow(SettingEditError);
   });
+  // INVARIANT: unsetting a key whose value already equals lazy's default is not a
+  // change. The settings form writes every field, so an untouched empty string
+  // key would otherwise be reported as a second change on every save.
+  test('does not report a key dropped at its default value as changed', () => {
+    const changes = describeConfigChange('[docker]\ndockerfile = ""\n', '[docker]\n');
+    expect(changes).toEqual([]);
+  });
 });

@@ -5,7 +5,7 @@
  * MCP servers from this one TOML file, and both are load-bearing for lazy:
  *
  *  1. The provider block is the ONLY way to route codex through lazy's proxy —
- *     OPENAI_BASE_URL is ignored by the CLI (verified, 0.152.1). Without it a
+ *     OPENAI_BASE_URL is ignored by the CLI (checked on 0.152.1, 2026-09). Without it a
  *     turn dials api.openai.com directly with no audit record.
  *  2. The `mcp_servers.lazy` entry is how the agent gets its lazy_* tools —
  *     the codex counterpart of ~/.claude.json / ~/.cursor/mcp.json.
@@ -45,6 +45,19 @@ import { readFileSafe, writeFile, ensureDir } from '../utils/fs';
 /** First line of every lazy-managed config.toml — the rewrite consent marker. */
 export const CODEX_CONFIG_MARKER = '# Managed by lazy — rewritten before every codex turn. Do not edit.';
 
+/**
+ * Codex truncates the project doc (AGENTS.md) it injects at `project_doc_max_bytes`.
+ * Checked against codex-cli 0.152.1 (2026-09; codex is not pinned): the key exists in the
+ * binary's config schema, and `codex debug prompt-input` on a repo with a 100 KB
+ * AGENTS.md carried exactly the first 32768 bytes by default (32 KiB) and the whole
+ * file with `-c project_doc_max_bytes=200000`. A silent head-only read dropped most
+ * of a large repo's instructions, so lazy raises the cap to 256 KiB for every
+ * project: well above any sane instruction file, still a bound on prompt size.
+ * Details: docs/codex-project-doc-cap.md. Set in the managed config rather than argv so exec, resume and the pairing TUI
+ * all get it.
+ */
+export const CODEX_PROJECT_DOC_MAX_BYTES = 262144;
+
 /** Path of the codex config lazy manages. */
 export function codexConfigPath(): string {
   return join(getHome(), '.codex', 'config.toml');
@@ -72,12 +85,34 @@ export interface CodexTurnConfig {
   mcpServer: { command: string; args: string[] };
 }
 
-/** Render the full managed config.toml content. */
+/**
+ * Render the full managed config.toml content.
+ *
+ * `default_tools_approval_mode = "approve"` pre-approves every tool the lazy
+ * MCP server advertises, so no turn ever stops on an approval prompt nobody
+ * can answer (`codex exec` runs with approval policy `never`, under which an
+ * unapproved MCP call is denied). It is a per-server key of codex's
+ * `McpServerConfig`, values `auto | prompt | approve` (read off the
+ * codex-cli 0.152.1 binary's config schema, and verified: the binary loads
+ * "approve" and refuses an unknown value with "failed to load bootstrap
+ * configuration"). Safe because the set of tools is lazy's choice per turn —
+ * a read-only or review turn's server never advertises the write tools.
+ *
+ * `[features] plugins = false` turns off codex's curated plugin marketplace.
+ * With it on, codex-cli (checked on 0.161.0, 2026-10) git-clones OpenAI's plugin
+ * marketplace into `$CODEX_HOME/.tmp/plugins` at startup — and a task's
+ * CODEX_HOME is `<worktree>/.lazy-task-sandbox/.codex`, so every turn planted a
+ * nested repository that accept's nested-git gate (rightly) refused. Verified:
+ * `codex exec -c features.plugins=true` creates `.tmp/plugins/.git` within
+ * seconds, `=false` creates nothing under `.tmp`. Lazy's agents get their tools
+ * from the lazy MCP server, never from codex plugins.
+ */
 export function renderCodexConfig(config: CodexTurnConfig): string {
   const base = config.proxyBaseUrl.replace(/\/$/, '');
   return `${CODEX_CONFIG_MARKER}
 
 model_provider = "lazy"
+project_doc_max_bytes = ${CODEX_PROJECT_DOC_MAX_BYTES}
 
 [model_providers.lazy]
 name = "lazy audit proxy (OpenAI-compatible)"
@@ -88,6 +123,10 @@ wire_api = "responses"
 [mcp_servers.lazy]
 command = ${tomlString(config.mcpServer.command)}
 args = [${config.mcpServer.args.map(tomlString).join(', ')}]
+default_tools_approval_mode = "approve"
+
+[features]
+plugins = false
 `;
 }
 

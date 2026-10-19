@@ -42,7 +42,7 @@ let demoRoot: string | null = null;
  * minutes.
  *
  * Per-test `try/finally` is necessary and was not sufficient: an `up` outside
- * the `try`, or an assertion between `spawn` and `kill`, skips it. CLAUDE.md is
+ * the `try`, or an assertion between `spawn` and `kill`, skips it. AGENTS.md is
  * explicit that leaked daemons exhaust the port window and fail LATER suites
  * with spurious bind errors — a failure that looks like someone else's bug.
  * The registry is the backstop that holds however a test dies.

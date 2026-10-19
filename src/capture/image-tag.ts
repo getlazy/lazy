@@ -11,10 +11,10 @@
  * There is no COPY/ADD from the repo; `lazy-agent` is bind-mounted read-only at
  * container launch. So a stale image never means "running old lazy".
  *
- * What it does contain varies by project — the only thing lazy's own default
- * (src/docker/base.Dockerfile) guarantees is Claude Code plus a handful of
- * Debian packages, and a project supplying its own Dockerfile can put anything
- * in it. What every such image has in common is that none of it is pinned:
+ * What it does contain varies by project — lazy's own default (the composed
+ * runner, src/docker/runner-dockerfile.ts) guarantees every container-capable
+ * agent CLI plus a handful of Debian packages, and a project supplying its own
+ * Dockerfile can put anything in it. What every such image has in common is that none of it is pinned:
  * `apt-get install` and the Claude Code installer both resolve to whatever is
  * current at build time (pinning was considered and rejected — the maintenance
  * burden is not wanted). So the contents drift with WALL-CLOCK TIME, not with
@@ -40,6 +40,14 @@
  *                            handled by the `lazy.dockerfile.hash` label.
  *
  * The tag itself is therefore only an identity, not a freshness signal.
+ *
+ * EXCEPTION — the PULLED default runner (engineer decision 2026-09-27,
+ * docs/design/published-runner-image.md §5): an image the release built and
+ * lazy pulled (`lazy.base.source=published`) keeps its CLIs until lazy is
+ * upgraded. Trigger 2 never applies to it, trigger 1 re-pulls rather than
+ * rebuilds, and the pinning rejection above is reversed for it: "current" is
+ * resolved once, by the release build. Everything above still holds for images
+ * lazy builds locally, including the fallback build of the default runner.
  */
 
 import { createHash } from 'crypto';
@@ -146,4 +154,58 @@ export function consentedBuildIdentity(contentHash: string, contextDir: string):
   return createHash('sha256')
     .update(`dockerfile:${contentHash}\ncontext:${contextDir}\n`)
     .digest('hex');
+}
+
+/**
+ * Where the release publishes the runner image, and where launches pull it
+ * from (docs/design/published-runner-image.md). GHCR is the pull source: its
+ * public pulls are unmetered, while Docker Hub's anonymous pulls are rate-limited
+ * per IP. The release pushes the identical tag set to `docker.io/getlazy/lazy-runner`
+ * too (scripts/publish-lazy-runner-image.sh).
+ */
+export const PUBLISHED_RUNNER_REPOSITORY = 'ghcr.io/getlazy/lazy-runner';
+
+/**
+ * The published CONTENT tag for a runner identity: `sha-` + the first 16 hex of
+ * its {@link DOCKERFILE_HASH_LABEL} value — the `sha-<fingerprint>` shape of the
+ * daemon image's content tag (scripts/publish-lazy-daemon-image.sh).
+ *
+ * This is the ONE function both sides use: the release tags the image with it
+ * (scripts/runner-image-dockerfile.ts hands it to the publish script) and a
+ * launch pulls it. It changes only when the composed Dockerfile does, so a
+ * release binary and a source checkout ask for the same tag whenever their
+ * runner is the same. A source checkout whose runner was never published names
+ * a tag that does not exist; the pull misses and the local build wears this
+ * same ref (docs/design/task-image.md §2).
+ */
+export function runnerContentTag(identityHash: string): string {
+  return `sha-${identityHash.substring(0, 16)}`;
+}
+
+/**
+ * Label saying where a default runner image came from: `published` (built by
+ * the release and pulled) or `local` (built on this host, the fallback).
+ *
+ * It decides freshness. A published image pins its agent CLIs to its release,
+ * and newer CLIs come by upgrading lazy (engineer decision 2026-09-27), so the
+ * age rebuild never applies to it. A local build resolved its CLIs at build
+ * time and keeps the age trigger.
+ */
+export const BASE_SOURCE_LABEL = 'lazy.base.source';
+
+/**
+ * A path → content-hash map of everything the image's identity is derived from.
+ * Key order is the map's insertion order and is stable (Dockerfile first, then
+ * `build_inputs` sorted), so the combined hash is deterministic.
+ */
+export type ImageInputManifest = Record<string, string>;
+
+export function shortHash(content: string | Buffer): string {
+  return createHash('sha256').update(content).digest('hex').substring(0, 16);
+}
+
+/** The {@link DOCKERFILE_HASH_LABEL} value for a manifest. */
+export function hashManifest(manifest: ImageInputManifest): string {
+  const canonical = Object.entries(manifest).map(([path, hash]) => `${path}=${hash}`).join('\n');
+  return createHash('sha256').update(canonical).digest('hex');
 }

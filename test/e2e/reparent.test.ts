@@ -30,7 +30,7 @@ describe('lazy reparent', () => {
   });
 
   // Task state lives in EXTERNAL storage; test/helpers/storage.ts is the one
-  // place that knows the layout (CLAUDE.md). The hand-rolled
+  // place that knows the layout (AGENTS.md). The hand-rolled
   // `~/.lazy/<basename>/tasks` paths this file used to carry duplicated that
   // knowledge and would break silently if the layout moved.
   const fullIdFor = (shortId: string) => findFullTaskId(ctx.root, shortId);

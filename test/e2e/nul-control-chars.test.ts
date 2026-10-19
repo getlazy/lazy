@@ -98,7 +98,7 @@ describe('control-character sanitization at CLI intake', () => {
     await ctx.cleanup();
   });
 
-  // INVARIANT (CLAUDE.md "never lose human feedback"): NUL-bearing feedback is
+  // INVARIANT (AGENTS.md "never lose human feedback"): NUL-bearing feedback is
   // SANITIZED AND DELIVERED, never rejected and never persisted raw. Rejecting
   // would discard feedback the human already typed; persisting raw would
   // crash-loop the turn and drop it silently on the stale auto-resume.

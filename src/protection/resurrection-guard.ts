@@ -220,7 +220,7 @@ export class ResurrectionRefusedError extends Error {
 /**
  * The refusal text. Names every file, who deleted it and when, explains the
  * mechanism in one paragraph, and gives the two commands that resolve it —
- * per CLAUDE.md, an error must say what happened, why, and what to do.
+ * per AGENTS.md, an error must say what happened, why, and what to do.
  */
 export function resurrectionRefusalMessage(
   displayId: string,
@@ -316,7 +316,7 @@ export async function enforceResurrectionGuard(
  * rather than repairing it: reparenting moves a pointer, but repairing the merge
  * base means merging into somebody else's worktree during an accept the human
  * asked for on a different task. That is exactly the hidden side effect
- * CLAUDE.md forbids, and a conflict raised there would strand a task nobody was
+ * AGENTS.md forbids, and a conflict raised there would strand a task nobody was
  * looking at. `lazy sync` is the operation that owns upstream merges, so the
  * advisory names it; {@link enforceResurrectionGuard} is the hard backstop if it
  * is ignored.

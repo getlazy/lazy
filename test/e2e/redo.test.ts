@@ -149,7 +149,8 @@ describe('lazy redo', () => {
     const newTaskId = extractNewTaskId(result.stdout);
     const oldShow = await ctx.lazy(['show', taskId]);
     expectSuccess(oldShow);
-    expectOutput(oldShow, `Redone as ${newTaskId}`);
+    // The daemon's redo closes with "<reason> (redone as <new>)".
+    expectOutput(oldShow, `redone as ${newTaskId}`);
   });
 
   test('redo generates -redo-N code from old task code', async () => {

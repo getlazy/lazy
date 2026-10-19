@@ -363,7 +363,7 @@ function pacingMs() {
 // the accept-time description one-shot, resume without it; pacing those too
 // would multiply every turn (and every accept) by several waits nobody watches.
 async function pace() {
-  if (!argv.includes('--append-system-prompt')) return;
+  if (!argv.some(a => a === '--append-system-prompt' || a === '--append-system-prompt-file')) return;
   const ms = pacingMs();
   if (ms <= 0) return;
   const id = 'toolu_demo_pace';
@@ -379,9 +379,65 @@ async function pace() {
   emit({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id }] } });
 }
 
+// A READ-ONLY invocation — an ask, a review, or the low-high self-review inside
+// a work turn — is launched with "--disallowedTools" (lazy's claude-code argv
+// for read-only turns). It must leave the worktree exactly as it found it:
+// lazy compares HEAD and every dirty file before and after, and fails the whole
+// turn when they differ. This agent used to commit on every invocation, so the
+// self-review committed the scripted change a second time and every scripted
+// task ended "blocked" with its work unrecorded. It also must not advance the
+// turn counter, which numbers WORK turns. It reads (one Read call, so the
+// review is not taken for one that inspected nothing) and approves when asked
+// for the self-review verdict.
+const readOnly = argv.includes('--disallowedTools');
+
+// A WRAP-UP step inside a work turn — the presentation walkthrough, the commit
+// nudge, a maintain follow-up — resumes the session WITHOUT a system prompt;
+// only the invocation that opens a work turn carries one (the same signal
+// "pace" below uses). Replaying the scripted turn there committed it a second
+// time and advanced the counter, so the NEXT unblock skipped a scripted turn.
+// It does no work and counts no turn.
+const opensWorkTurn = argv.some(a => a === '--append-system-prompt' || a === '--append-system-prompt-file');
+
+// A markdown code fence, spelled without a backtick: this script lives inside a
+// template literal. The JSON report in it is what records the self-review.
+const FENCE = String.fromCharCode(96).repeat(3);
+
+function readOnlyTurn(sessionId) {
+  const approvalToken = 'LOW_HIGH_LOOP_APPROVED';
+  // lazy hands the prompt over on STDIN, never argv. Read it only here: a
+  // read-only launch always has stdin closed or piped, and a terminal run by
+  // hand must not hang waiting for input.
+  let prompt = '';
+  if (!process.stdin.isTTY) {
+    try {
+      prompt = fs.readFileSync(0, 'utf-8');
+    } catch (err) {
+      process.stderr.write('demo agent: could not read the prompt from stdin: ' + err.message + '\n');
+    }
+  }
+  const askedForVerdict = prompt.includes(approvalToken);
+  emit({ type: 'system', subtype: 'init', session_id: sessionId });
+  emit({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_demo_read', name: 'Read' }] } });
+  emit({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_demo_read' }] } });
+  const text = 'Demo agent: read the work and changed nothing. No real agent ran and no model was called.';
+  emit({
+    type: 'result', subtype: 'success',
+    result: askedForVerdict
+      ? approvalToken + '\n' + text + '\n\n' + FENCE + 'json\n' +
+        '{"verdict":"clean","security":"none found","data_integrity":"none found","findings":[]}\n' +
+        FENCE
+      : text,
+    session_id: sessionId,
+    usage: { input_tokens: 600, output_tokens: 120 },
+  });
+  process.exit(0);
+}
+
 async function main() {
   const turns = loadTurns();
   const sessionId = 'demo-sess-' + taskCode;
+  if (readOnly || !opensWorkTurn) return readOnlyTurn(sessionId);
 
   // A task with no script still has to produce a WELL-FORMED turn WITH WORK IN
   // IT. Two reasons, and the second is the one that matters: an agent that

@@ -16,7 +16,7 @@ every config key into three buckets:
 |---|---|---|
 | **Respected** | honoured exactly as written | — |
 | **Overridden** | the fleet's value is used; your ask is recorded | `lazy doctor` |
-| **Refused** | the project does not start until the key is removed | the start/provisioning error, and `lazy doctor` |
+| **Refused** | kept in the file but **not used**; the project still starts | `lazy doctor`, the provisioning log, and the Lazy Teams Configuration page |
 
 ## Why override some keys and refuse others
 
@@ -27,10 +27,12 @@ Both are equally safe — neither honours the repository. The choice is about
   still does what you meant. You asked for a specific `[server] port`; you get
   a different one; everything works. Silently substituting is fine because
   nothing about your project's behaviour changed.
-- **Refuse** when the fleet does not offer the capability at all. Silently
-  dropping `[[mounts]]` would leave your project running as something
-  materially different from what you configured, with no failure to trace. A
-  refusal is loud, once, at the moment you'd otherwise start debugging.
+- **Refuse** when the fleet does not offer the capability at all. A refused
+  setting is never used, but it never stops the project either: it stays in
+  the file and is named, with the reason, wherever you would look — `lazy
+  doctor`, the provisioning log, and on Lazy Teams the Configuration page. A
+  refused agent profile, or one that uses a refused endpoint, is not
+  available, and a task on it says why.
 
 ## Unclassified keys fail closed
 
@@ -64,20 +66,20 @@ provisioning error — carries one generic pointer here rather than repeating th
 diagnosis, because an override warning printed on every config load would land
 in the middle of every agent turn.
 
-A **refusal** is different: it is not a warning to go looking for, it is the
-error you already got. It fires at the earliest possible moment — `lazy init`
-checks the repository's committed config before it writes anything — and then
-on every command afterwards, naming each refused key and what to do about it.
+A **refused** setting is reported the same way: `lazy init` lists every one it
+finds in the repository's committed config, and `lazy doctor` names each one
+with the reason. The project starts without them.
 
 ## How a host becomes managed
 
-Three environment variables, read at daemon start:
+Four environment variables, read at daemon start:
 
 | variable | required | meaning |
 |---|---|---|
 | `LAZY_MANAGED` | — | `1` or `true` arms managed mode. Anything else, including unset, leaves lazy completely unchanged. |
 | `LAZY_MANAGED_STORAGE_PATH` | yes | Absolute path to the store the fleet assigned this project. |
 | `LAZY_MANAGED_RUNNER` | no | `docker` (default) or `podman`. Nothing else is accepted — including `host`. |
+| `LAZY_MANAGED_BACKEND` | no | Where this project's container builds run. `microvm`: the project has its own virtual machine, so a committed `Dockerfile.lazy` at the project root is built automatically. `local-docker`, anything else, or unset: builds would run on a machine shared with other projects, so a root `Dockerfile.lazy` is never built automatically (tasks use the default image and a system message says so). An explicit `[docker] dockerfile` in the project configuration is honoured either way. |
 
 Deliberately **not** a `lazy.toml` key: `lazy.toml` is the untrusted input this
 whole mechanism exists to bound. A managed host armed without a storage path
@@ -85,6 +87,18 @@ refuses to run rather than falling back to the repository's `external_path`.
 
 A fleet host sets these in the environment of each project's daemon when it
 starts it; Lazy Teams does this for every project it runs.
+
+## Code from the repository
+
+The same reasoning covers code a repository ships, not just settings:
+
+| what the repository ships | on a managed host |
+|---|---|
+| `.lazy/plugins/` (proxy request plugins) | **Not run — here or on your own machine.** They would run inside the daemon process itself, unsandboxed, on the host. The daemon log and `lazy doctor` name any that are ignored. |
+| `Dockerfile.lazy` / `[docker] dockerfile` | Built by docker, never run by the daemon; a root `Dockerfile.lazy` is built automatically only where the project has its own virtual machine (see `LAZY_MANAGED_BACKEND` above). |
+| `[automation] pre_turn` / `post_turn`, `[checks] post_turn`, `[serve] start_services_cmd` | Run inside the task's container. |
+| `[automation.pre_accept]` commands | Run in their own short-lived container. |
+| `[automation] accept_check` | Runs in the same short-lived container as `[automation.pre_accept]` — the scripts it calls come from the task's branch, so it never runs on the host. |
 
 ## The classification, in full
 
@@ -94,8 +108,10 @@ Every key lazy resolves appears below. Non-respected keys carry the reason.
 
 | key | why |
 |---|---|
-| `agents.*.endpoint` | An [agent profile](lazy-toml.md#agentsname--named-agent-profiles)'s endpoint is the upstream the proxy forwards to, carrying the real model credential — a repository choosing it is credential redirection. A profile with no `endpoint` is fine. Allowed in the host's own config file (below). |
-| `agents.*.credential` | A credential name the fleet did not assign reaches for a secret slot nobody gave this repository. Naming one of lazy's own providers (`anthropic`, `openai`, `openrouter`, `ollama`, `cursor`) or `none` is fine. Allowed in the host's own config file (below). |
+| `agents.*.endpoint` | An [agent profile](lazy-toml.md#agentsname--named-agent-profiles)'s endpoint is the upstream the proxy forwards to, carrying the real model credential — a repository choosing it is credential redirection. A profile with no `endpoint` is fine. Allowed in the host's own config file, including a copy a team admin imported (below). |
+| `agents.*.credential` | A credential name the fleet did not assign reaches for a secret slot nobody gave this repository. Naming one of lazy's own providers (`anthropic`, `openai`, `openrouter`, `ollama`, `cursor`) or `none` is fine. Allowed in the host's own config file, including a copy a team admin imported (below). |
+| `endpoints.*.url` | A [named endpoint](lazy-toml.md#endpointsname--named-endpoints)'s URL is an upstream the proxy forwards to with the real model credential, exactly like `agents.*.endpoint`, and allowed in the same places. |
+| `endpoints.*.credential` | A named endpoint's credential name selects a secret slot, exactly like `agents.*.credential`, and allowed in the same places. |
 | `models.roles.*.backend` | A non-Anthropic role backend sends the model credential somewhere the fleet did not choose; team-level backends are configured by the team, not by a repository. Stating `"anthropic"` explicitly is fine. (The key was since removed from lazy.toml altogether — a config that still has it does not load.) |
 | `models.roles.*.endpoint` | An arbitrary endpoint URL from a repository receives the real model credential. (Also removed from lazy.toml — see `agents.*.endpoint` above.) |
 | `proxy.upstream` | The daemon fetches this URL from the host carrying the real model credential — a repository choosing it is credential redirection. |
@@ -103,7 +119,6 @@ Every key lazy resolves appears below. Non-respected keys carry the reason.
 | `proxy.fallback[].upstream` | A failover target receives the same credential as the primary upstream. |
 | `proxy.fallback[].model` | A failover entry cannot exist without the upstream it belongs to, which is refused. |
 | `[[mounts]]` (whole section, every field) | A repository cannot mount host paths into its agent container on a shared machine. This is the worst case in the whole file: mounts are read-write by default, and the mount validator is a denylist, not an allowlist. |
-| `docker.run_args` | Extra `docker run` arguments shape the container itself: `--privileged` or a `-v /:/host` from a cloned lazy.toml would be a host handover — the same class of ask as `[[mounts]]`. Stating an empty array is fine. |
 | `remote.github_dangerously_sync_comments_in_public_repos_…` | Feeds public comment text to the agent as instructions; on a shared host a prompt-injected agent is a foothold. The key's own name is the argument. Stating `false` is fine. |
 | `remote.gitlab_dangerously_sync_comments_in_public_repos_…` | Same. |
 | *anything unclassified* | See "fail closed" above. |
@@ -117,7 +132,7 @@ Every key lazy resolves appears below. Non-respected keys carry the reason.
 | `runner.sandbox_allowed_domains` | The reachable-domain list is host policy; a repository widening it widens the host. |
 | `runner.sandbox_deny_read` / `runner.sandbox_deny_write` | Sandbox denials are the fleet's floor and are not negotiated per repository. |
 | `runner.sandbox_allow_weaker_nested` | Permitting a weaker nested sandbox is exactly the escalation a shared host must not accept from a repository. |
-| `runner.verify_sandbox_boundary` | The boundary self-check spends real agent sessions on the host, so the fleet decides when it runs. |
+| `runner.verify_sandbox_boundary` | Retired: the host boundary self-check was removed and the key has no effect. |
 | `proxy.port` | A fixed port collides across the projects sharing this host. |
 | `proxy.bind` | The bind address decides who else on the host can reach this project's proxy. |
 | `proxy.policy.enforce` | Enforcement is the fleet's posture; a repository turning it off would disable its own tool-call policy. |
@@ -127,6 +142,7 @@ Every key lazy resolves appears below. Non-respected keys carry the reason.
 | `credentials.backend` | Which secret store the daemon writes to is a property of the host it runs on: a fleet host has one secret service, or none, and a repository asking for the plaintext `file` fallback would write a credential onto a machine it does not own. |
 | `storage.backend` | The project's store is assigned by the fleet, not stated by the repository. |
 | `storage.external_path` | A repository naming a store path could point the daemon at another project's state. |
+| `storage.backup_keep` | The fleet keeps the count: the host backs the store up before every roll, and on the local-docker backend the daemon also takes one before it starts on a new version. |
 | `data.path` | The daemon's state directory is placed by the fleet, and a repository-chosen path writes wherever it points. |
 | `server.port` | A fixed port collides across the projects sharing this host. |
 | `server.bind` | The bind address decides who else on the host can reach this project. |
@@ -148,10 +164,11 @@ host files that are not this project's.
 Everything else. In full:
 
 `models.default` · `models.roles.*.model` · `models.roles.*.agent` ·
-`agents.*.harness` · `agents.*.model` · `agents.*.description` ·
-`proxy.retry_after_threshold` · `proxy.upstream_timeout` ·
+`agents.*.harness` · `agents.*.model` · `agents.*.description` · `agents.*.named_endpoint` · `agents.*.tiers[].endpoint` · `agents.*.tiers[].model` · `agents.*.tiers[].threshold_percent` · `endpoints.*.description` ·
+`proxy.retry_after_threshold` · `proxy.tier_retry_interval` · `proxy.upstream_timeout` ·
+`proxy.audit_retention_days` · `proxy.audit_retention_mib` ·
 `proxy.policy.deny_path_globs` (it can only ever
-ADD denials) · `docker.build_inputs` · `remote.driver` · `remote.git_remote` ·
+ADD denials) · `docker.build_inputs` · `docker.run_args` · `remote.driver` · `remote.git_remote` ·
 `remote.auto_approve` · `remote.offline` · `remote.github_auto_push` ·
 `remote.gitlab_auto_push` · `automation.maintain` · `automation.react` · `automation.pre_accept` ·
 `automation.pre_accept.enabled` · `automation.pre_accept.commands` ·
@@ -169,7 +186,7 @@ ADD denials) · `docker.build_inputs` · `remote.driver` · `remote.git_remote` 
 `chattiness.agent` · `permissions.protected` · `protection.enabled` ·
 `protection.protected_branches` · `protection.protected_tasks` ·
 `protection.gate_default_branch` ·
-`serve.ports` · `serve.services` · `serve.start_services_cmd` ·
+`serve.ports` · `serve.services` · `serve.start_services_cmd` · `serve.main_service` ·
 `memory.warn_bytes` · `docs.url` ·
 `daemon.auto_react_ci` · `daemon.auto_react_comments` ·
 `daemon.auto_react_max_retries` · `daemon.auto_react_backoff` ·
@@ -225,7 +242,48 @@ effect, and nothing is ever written into the checkout.
 
 Lazy Teams uses this for its project **Settings → Configuration** page:
 
-- When a project is set up, its repository's `lazy.toml` is copied once.
+Repositories may set `[docker] run_args` on a managed host. These arguments
+apply to every task container and can grant access to other containers or the
+host. Adopt projects only after reviewing their Docker arguments; the
+Configuration page displays a persistent warning when the saved configuration
+sets non-empty arguments.
+
+- When a project is set up, its repository's `lazy.toml` is copied once, exactly
+  as written — nothing in it is refused or dropped. Later changes to the
+  repository's file are not picked up, except that endpoints and agent profiles
+  it adds are offered on the Endpoints and agent profiles page (below); copy anything else in on
+  the page.
+- Settings this installation does not allow (for example an endpoint URL) are
+  kept in the file but not used. The page lists every agent profile the file
+  defines as usable, not used (with the reason), and notes
+  each setting that is kept but not used. An edit is refused only for such a
+  setting it adds.
+- **Importing is consenting to the project's endpoints.** An endpoint's URL and
+  credential, and a profile's own endpoint and credential, decide where requests
+  go and which key pays for them. When a team admin (or a site admin) creates
+  or adopts the project, the import of its `lazy.toml` is their choice, so its
+  endpoints and agent profiles can be used straight away. The configuration's
+  history records who imported it, when, and every endpoint (URL and credential
+  name) it brought in. Because the repository's file is read only that once, a
+  later push to the repository cannot change where requests go. Each member
+  still connects their own key for each endpoint under **Your credentials**, and
+  a key is only ever used for the endpoint address it was connected for.
+- Projects imported before imports recorded who did them are treated the same
+  way when the admin who created the project is known; the history says so in a
+  version of its own. Where nobody is recorded, the copy's endpoints are not
+  used until a team admin confirms them under **Settings → Configuration →
+  Endpoints and agent profiles**, which lists each one (URL, credential name, the
+  profiles using it) and records who confirmed. That page also offers blocks the
+  repository's `lazy.toml` added after the copy was made, brought in when
+  confirmed. There is no CLI or MCP way to confirm. A task on a profile still
+  waiting says so wherever it is refused, with a link to that page.
+- The page shows what the project is actually running on — the file, the saved
+  version it came from and a hash of its contents — and warns when that is not
+  the newest saved version, with the reason when a version was refused.
+  `lazy daemon status` shows the same file, hash and version.
+- A task can only be given an agent profile this configuration defines; any
+  other name is refused when the task is created or edited, and the message
+  names the configuration that was loaded.
 - The team's owner edits it on the page; every member can read it, and anyone who
   can read it can download it as a `lazy.toml` to commit if they wish. Every save
   is kept as a new version with who saved it and when, and the history shows
@@ -249,7 +307,8 @@ Lazy Teams uses this for its project **Settings → Configuration** page:
   within a minute for background behaviour such as resuming interrupted work, or
   immediately for settings like the forge driver.
   The exception is what lazy's proxy is set up with when the project starts:
-  `[proxy] retry_after_threshold`, `upstream_timeout`,
+  `[proxy] retry_after_threshold`, `tier_retry_interval`, `upstream_timeout`,
+  `audit_retention_days`, `audit_retention_mib`,
   `[proxy.policy] deny_path_globs`, and agent profiles (`[agents.<name>]`)
   that send their traffic to their own endpoint. Changing any of those restarts
   the project, which pauses work in progress and resumes it.

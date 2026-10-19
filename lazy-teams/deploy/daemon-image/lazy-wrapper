@@ -9,7 +9,7 @@
 # There is no init system, no login shell profile and no other hook, so this
 # wrapper is where per-boot guest preparation has to live. It runs
 # lazy-guest-init (docker data-root + dockerd, idempotent, marker in tmpfs) and
-# then execs the real CLI from the checkout.
+# then execs the compiled lazy binary.
 #
 # Preparation failure is fatal only for commands that need Docker. `lazy
 # --version` is the supervisor's readiness check and the first line of the
@@ -24,11 +24,11 @@
 #   LAZY_GUEST_SKIP_INIT=1      skip preparation entirely
 #   LAZY_GUEST_REQUIRE_DOCKER=1 make preparation failure fatal for every command
 #   LAZY_GUEST_REQUIRE_DOCKER=0 make it fatal for none
-#   LAZY_CHECKOUT=<path>        lazy sources to run (default /opt/lazy)
+#   LAZY_BIN=<path>             lazy binary to run (default /opt/lazy/bin/lazy)
 
 set -eu
 
-CHECKOUT="${LAZY_CHECKOUT:-/opt/lazy}"
+LAZY_BINARY="${LAZY_BIN:-/opt/lazy/bin/lazy}"
 
 needs_docker=0
 case "${1:-} ${2:-}" in
@@ -59,11 +59,12 @@ if [ "$skip_init" = "0" ]; then
     if [ "$needs_docker" = "1" ]; then
       echo "lazy: guest preparation failed and '${1:-} ${2:-}' needs it (the port forwarder and Docker). \
 Run 'lazy-guest-init --print-plan' in the machine for the forwarder's state and the intended \
-data-root, and read /var/log/lazy-forwarder.log and /var/log/lazy-dockerd.log." >&2
+data-root, and read /var/log/lazy-forwarder.log, /var/log/lazy-dockerd.log and \
+/var/log/lazy-dockerd-restarts.log (why dockerd stopped, and its restarts)." >&2
       exit 1
     fi
     echo "lazy: guest preparation failed; continuing because '${1:-}' does not need it." >&2
   fi
 fi
 
-exec bun run "${CHECKOUT}/src/index.ts" "$@"
+exec "$LAZY_BINARY" "$@"

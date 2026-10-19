@@ -71,6 +71,7 @@ export interface StartCommand {
   prompt: string;
   /** Echoed on the response so the host can correlate a single-slot answer. */
   command_id?: CommandId;
+  notes_secret?: string;               // stamped by writeCommand; see notes-secret.ts
   protocol_version?: number;   // wire protocol version — supervisor rejects on mismatch (see PROTOCOL_VERSION)
   agent_id?: string;           // which agent to use (e.g., 'claude-code', 'cursor') — defaults to 'claude-code'
   /** Harness (agent binary) the profile in `agent_id` runs. See the note above CommandType. */
@@ -117,6 +118,7 @@ export interface UnblockCommand {
   prompt: string;
   /** Echoed on the response so the host can correlate a single-slot answer. */
   command_id?: CommandId;
+  notes_secret?: string;
   protocol_version?: number;   // wire protocol version — supervisor rejects on mismatch (see PROTOCOL_VERSION)
   agent_id?: string;           // which agent to use (e.g., 'claude-code', 'cursor') — defaults to 'claude-code'
   /** Harness (agent binary) the profile in `agent_id` runs. See the note above CommandType. */
@@ -173,9 +175,9 @@ export interface UnblockCommand {
 
 /**
  * One step of the final-turn wrap-up phase, in the order the supervisor runs
- * them (final-turn design §3.3). Which of these a task actually gets is decided
- * by the DAEMON from the task's audience (`audienceOf`, src/task/audience.ts)
- * at command dispatch — the supervisor runs the steps it is handed and never
+ * them (final-turn design §3.3). Which of these a task gets is decided by the
+ * DAEMON at command dispatch (src/daemon/wrap-up-plan.ts — every task gets all
+ * of them; only the hub rule drops `present`) — the supervisor runs the steps it is handed and never
  * derives a plan itself.
  */
 export type WrapUpStep =
@@ -483,6 +485,9 @@ export type SupervisedKind =
   | 'maintain'
   | 'react'
   | 'commit_leftovers'
+  | 'commit_nudge'
+  | 'background_nudge'
+  | 'pending_notes'
   | 'present'
   | 'low_high_review'
   | 'low_high_revise'
@@ -944,6 +949,14 @@ export type SupervisorPhase =
   | 'react_done'
   | 'commit_leftovers'
   | 'commit_leftovers_done'
+  | 'commit_nudge'
+  | 'commit_nudge_done'
+  | 'background_nudge'
+  | 'background_nudge_done'
+  // Comments that arrived during the turn, delivered before it ends
+  // (src/supervisor/pending-notes.ts).
+  | 'pending_notes'
+  | 'pending_notes_done'
   | 'present'
   | 'present_done'
   // The ONE re-ask for a review whose verdict was not one of the three values

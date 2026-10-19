@@ -19,7 +19,7 @@
  * relaunch starts with nothing.
  *
  * The write is a MERGE, never a replace — on host-process runs this is the
- * user's real CLI config (CLAUDE.md: no hidden destructive side effects).
+ * user's real CLI config (AGENTS.md: no hidden destructive side effects).
  */
 
 import { join } from 'path';

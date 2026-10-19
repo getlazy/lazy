@@ -72,6 +72,7 @@ import { parkTaskPaused } from '../../utils/paused-status';
 import { boundCloneLogin, commandTaskTerminalBound } from './bound-session';
 import { findLazyRoot } from '../../project-paths';
 import { admitInteractiveOrExit } from '../usage-pause-preflight';
+import { neutralizeLazyMarkers } from '../../task/wrapper-fold';
 
 /** Max characters of conversation transcript to include in the summary prompt */
 const MAX_TRANSCRIPT_CHARS = 20_000;
@@ -278,10 +279,10 @@ async function detectTaskRefFromBranch(branchPrefix: string): Promise<string | n
  * Launch Claude Code in the current directory with no task context.
  * Captures the conversation into lazy's storage after exit.
  */
-async function pairBranchless(root: string, resumeSessionId?: string, autonomous?: boolean): Promise<void> {
+async function pairBranchless(root: string, resumeSessionId?: string, autonomous?: boolean, overrideUsagePause?: boolean): Promise<void> {
   // [usage_pause]: a branchless session runs on the builder role's credential;
   // a paused one refuses it before anything launches.
-  await admitInteractiveOrExit('pair');
+  await admitInteractiveOrExit('pair', undefined, { overrideUsagePause });
 
   console.log(`\nLaunching Claude Code in ${process.cwd()}...`);
   console.log(`(no task context — conversation will be captured for search)\n`);
@@ -333,6 +334,7 @@ export async function commandPair(args: string[]): Promise<void> {
     { name: 'yes', takesValue: false },
     { name: 'host', takesValue: false },
     { name: 'no-task', takesValue: false },
+    { name: 'override-usage-pause', takesValue: false },
   ], 'pair');
 
   let taskId = parsed.positional[0];
@@ -343,6 +345,7 @@ export async function commandPair(args: string[]): Promise<void> {
   const yes = parsed.flags.get('yes') === true;
   const hostRequested = parsed.flags.get('host') === true;
   const noTask = parsed.flags.get('no-task') === true;
+  const overrideUsagePause = parsed.flags.get('override-usage-pause') === true;
 
   // --no-task is an explicit "pair here on the host, whatever the branch":
   // validate the combination before anything else runs.
@@ -400,7 +403,7 @@ export async function commandPair(args: string[]): Promise<void> {
   const noTaskHint = 'To pair here on the host with no task context, run: lazy pair --host --no-task';
 
   if (noTask) {
-    await pairBranchless(root, resumeSessionId, autonomous);
+    await pairBranchless(root, resumeSessionId, autonomous, overrideUsagePause);
     return;
   }
 
@@ -438,7 +441,7 @@ export async function commandPair(args: string[]): Promise<void> {
         console.error('  lazy pair <task>                  # pair in that task\'s container');
         process.exit(1);
       }
-      await pairBranchless(root, resumeSessionId, autonomous);
+      await pairBranchless(root, resumeSessionId, autonomous, overrideUsagePause);
       return;
     }
   } else {
@@ -541,7 +544,7 @@ export async function commandPair(args: string[]): Promise<void> {
     // here, so the refusal comes early, and admitted (the one-shot override
     // taken, if that is what lets it through) only after pair's own refusals
     // below, so an override is never spent on a pair that is refused anyway.
-    await admitInteractiveOrExit('pair', task.id, { peek: true });
+    await admitInteractiveOrExit('pair', task.id, { peek: true, overrideUsagePause });
 
     // Pairing is opt-in per agent. Refuse here — before the status moves to
     // `pairing`, before a lock is taken, and before any process launches.
@@ -661,7 +664,7 @@ export async function commandPair(args: string[]): Promise<void> {
     }
 
     // [usage_pause]: every refusal of pair's own is behind us — admit the session.
-    await admitInteractiveOrExit('pair', task.id);
+    await admitInteractiveOrExit('pair', task.id, { overrideUsagePause });
 
     // Record HEAD before pairing starts
     const headBefore = await getCurrentSha(worktreePath);
@@ -911,6 +914,9 @@ export async function commandPair(args: string[]): Promise<void> {
         // it is one of the automatic pushes `<driver>_auto_push = false` covers.
         if (!offline && autoPushEnabled(config)) {
           const driver = createDriver(config);
+          // Never publish a delivered per-task secret file (src/daemon/task-files.ts).
+          const { assertNoDeliveredSecretsToPush } = await import('../../daemon/task-files');
+          await assertNoDeliveredSecretsToPush(root, sess.git_branch, `Pushing ${sess.git_branch}`);
           await driver.pushBranch(sess.git_branch);
         }
       } catch (err) {
@@ -1082,7 +1088,7 @@ Keep the summary concise and factual.`);
       sessionId: sess.id,
       sequence: nextSeq,
       role: 'human',
-      content: turnContent,
+      content: neutralizeLazyMarkers(turnContent),
       startSha: headBefore,
       endSha: headAfter,
       actor: getActor(),
@@ -1110,7 +1116,7 @@ Keep the summary concise and factual.`);
 }
 
 export function pairUsage(): void {
-  console.log(`Usage: lazy pair [task_id] [--unlock] [--no-summary] [--resume <session_id>] [--autonomous] [--yes] [--host] [--no-task]
+  console.log(`Usage: lazy pair [task_id] [--unlock] [--no-summary] [--resume <session_id>] [--autonomous] [--yes] [--host] [--no-task] [--override-usage-pause]
 
 Open an interactive agent session, context-aware.
 
@@ -1159,6 +1165,7 @@ Options:
   --no-task              With --host: skip task detection and pair in the current
                          directory with no task context, on any branch (including a
                          lazy/* branch this store has no task for)
+  --override-usage-pause Start this pairing session even when its credential is paused.
   --host                 Run the agent on your machine instead of in the task's container.
                          Required for branchless mode; on a task it is an explicit
                          claude-code-only opt-in. Never a silent fallback.

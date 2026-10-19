@@ -1,16 +1,20 @@
 import { requireLaunchModel } from '../agent/launch-model';
+import type { AgentExecArgs } from '../agent/interface';
 import { createHash, randomUUID } from 'crypto';
 import { throttleNotes, type PhaseNotify } from '../daemon/progress';
+import { currentBuildObserver, trackContainerBuild } from './build-observer';
 import { readFileSync, existsSync, mkdirSync, chmodSync, unlinkSync, writeFileSync, renameSync } from 'fs';
-import { access, mkdir, mkdtemp, writeFile, readFile } from 'fs/promises';
-import { join, isAbsolute, dirname, basename } from 'path';
-import { tmpdir } from 'os';
+import { access, mkdir, mkdtemp, writeFile, readFile, realpath, lstat } from 'fs/promises';
+import { join, isAbsolute, dirname, basename, relative } from 'path';
+import { networkInterfaces, tmpdir } from 'os';
+import { AsyncLocalStorage } from 'async_hooks';
 import type { AgentResponse, TokenUsage } from '../types';
 import { ClaudeCodeAgent } from '../agent/claude-code';
 import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
 import { getAgentPackaging, listAgents } from '../agent/registry';
 import { agentSupportsApiKey, resolveProfileCredential, alternativeCredentialHint, AGENT_KEY_ENV } from '../agent/credentials';
 import { findLazyRoot } from '../project-paths';
+import { dataDirOfWorktree, lazyDataDirMaskArgs } from './lazy-dir-mask';
 import { loadConfig } from '../config/loader';
 import {
   BUILDER_PROFILE_NAME,
@@ -27,7 +31,7 @@ import { buildPublishArgs } from '../serve/ports';
 // cycle between the capture and daemon layers.
 import { getTaskEnv, planTaskEnvLaunchFile, recordTaskEnvLaunched } from '../daemon/task-env';
 import { sessionCredentialEnvFor } from '../daemon/turn-credentials';
-import { isSessionPlaceholderToken } from '../daemon/session-credentials';
+import { isSessionPlaceholderToken, lookupSessionBinding, setSessionBindingOrigin } from '../daemon/session-credentials';
 import { isBuildProgressLine, splitLines, formatDuration, buildTimeoutMessage } from './docker-build-output';
 import { buildTaskGitMounts } from './git-mounts';
 import {
@@ -45,7 +49,7 @@ import { piLaunchEnvVars, piCredentialMirror } from '../agent/pi-turn-config';
 import { DEFAULT_UPSTREAM_TIMEOUT_SECONDS } from '../proxy/upstream-defaults';
 import { codexLaunchEnvVars } from '../proxy/codex-route';
 import { placeholderizeAuthEnv, type LaunchIdentity } from '../proxy/placeholder-env';
-import { mintCredentialGrant } from '../proxy/credential-broker';
+import { mintCredentialGrant, pinGrantsToAddresses } from '../proxy/credential-broker';
 import { hasDaemonContext, getDaemonContext } from '../daemon/context';
 import { targetCredentialRefusal } from '../daemon/credential-gate';
 import { RpcError } from '../daemon/rpc-error';
@@ -54,15 +58,19 @@ import { RpcError } from '../daemon/rpc-error';
 // module evaluation.
 import { resolveAuthEnvFromDaemon } from '../daemon/auth-env';
 import { logger } from '../utils/logger';
+import { isManagedMode } from '../config/managed-mode';
+import { guestDockerdSupervised, recoverGuestDockerd, managedDockerDownMessage } from '../daemon/guest-dockerd';
+import { diagnoseLostBuildConnection, isBuildConnectionLost, LOST_CONNECTION_HEADLINE } from '../daemon/build-connection-lost';
 import { redactSecrets } from '../utils/redact';
 import { isOfflineMode } from '../utils/offline';
 import { spawn } from '../utils/spawn';
-import { safeArgvPrompt } from '../agent/argv-safety';
-import DEFAULT_DOCKERFILE from '../docker/base.Dockerfile' with { type: 'text' };
+import { assertArgvBounded } from '../agent/argv-safety';
+import { composeRunnerDockerfile, PUBLISHED_RUNNER_REF } from '../docker/runner-dockerfile';
 
-// Re-export so other modules (e.g. `lazy system export-dockerfile`) can use the
-// exact same embedded text as the single source of truth — never copy it.
-export { DEFAULT_DOCKERFILE };
+// The default runner Dockerfile — base text plus every agent CLI. Exported so
+// other modules (e.g. `lazy system export-dockerfile`) use the exact same text
+// as the single source of truth — never copy it.
+export const DEFAULT_DOCKERFILE = composeRunnerDockerfile();
 import { getHome } from '../utils/home';
 import { toTurnUsage } from '../utils/usage-recording';
 import { VERSION } from '../version';
@@ -75,11 +83,17 @@ import {
   IMAGE_MAX_AGE_DAYS,
   IMAGE_MAX_AGE_MS,
   consentedBuildIdentity,
+  BASE_SOURCE_LABEL,
+  shortHash,
+  hashManifest,
+  type ImageInputManifest,
 } from './image-tag';
 import { pathExists } from '../utils/fs';
 import { TaskMutex } from '../utils/task-mutex';
 import { analyzeLazyBaseUsage, type LazyBaseUsage } from './dockerfile-base';
 import { adoptedBuildContextRoot } from '../daemon/adopted-image';
+import { customImageGate, RunnerImageNotReadyError, DEFAULT_RUNNER_IMAGE_PIN, READONLY_DEFAULT_RUNNER_IMAGE_PIN, recordLaunchImage } from './custom-image-gate';
+import { DamagedImageError, isDamagedLayerError, withDamagedImageRepair, type DamagedImageRepairDeps } from '../docker/damaged-image';
 
 /**
  * Serializes `ensureImage` per resolved image name, so a fan-out of task starts
@@ -200,9 +214,21 @@ const _packaging = new ClaudeCodePackaging();
 export async function checkDocker(binary: string = 'docker'): Promise<void> {
   logger.debug(`Checking ${binary}...`);
 
-  const proc = spawn([binary, 'info'], { stdout: 'ignore', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS });
-  const exitCode = await proc.exited;
-  if (exitCode !== 0) {
+  const answers = async () =>
+    (await spawn([binary, 'info'], { stdout: 'ignore', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS }).exited) === 0;
+  if (!(await answers())) {
+    // A Teams machine's dockerd is the project's own: it did not need
+    // installing, it stopped. Try once to bring it back, then name that.
+    if (binary === 'docker' && guestDockerdSupervised()) {
+      const report = await recoverGuestDockerd('a build or launch');
+      if (report.ready && (await answers())) {
+        logger.debug(`${binary} is running again ✓`);
+        return;
+      }
+      throw new Error(managedDockerDownMessage(report));
+    }
+    if (isManagedMode()) throw new Error(managedDockerDownMessage(null));
+
     const name = binary.charAt(0).toUpperCase() + binary.slice(1);
     const installUrl = binary === 'podman'
       ? 'https://podman.io/docs/installation'
@@ -269,6 +295,7 @@ export function isUpgradeImageBuild(): boolean {
  *    soft-pin `imageName` in `ensureImage` instead, so a post-consent agent
  *    edit of the worktree Dockerfile cannot become a host docker rebuild.
  * 2. `[docker].dockerfile` from config, joined to the PROJECT ROOT.
+ * 3. With that key unset: `Dockerfile.lazy` in the PROJECT ROOT, if present.
  *
  * INVARIANT: a task's worktree must never *automatically* govern the image.
  * Task branches are agent-writable, and deriving the image from one without
@@ -283,7 +310,248 @@ export function isUpgradeImageBuild(): boolean {
  *
  * Exported for `lazy upgrade`'s image-source announcement.
  */
+/** The root-level Dockerfile lazy builds when `[docker].dockerfile` is unset. */
+export const CONVENTIONAL_DOCKERFILE = 'Dockerfile.lazy';
+
+/**
+/**
+ * What the root `Dockerfile.lazy` convention decides, with `[docker].dockerfile`
+ * unset. `used` is the only state that builds it; the two skipped states are
+ * treated exactly as an absent file (the default image) and are reported by
+ * `lazy doctor`, the launch narration and (on a backend that never builds it) a
+ * system message — never silently.
+ */
+export type ConventionalDockerfileState =
+  | { kind: 'absent' }
+  /** On disk but not committed on the root's branch: nobody reviewed or accepted it. */
+  | { kind: 'untracked'; path: string }
+  /** Committed, but this Teams backend would build it on a shared host dockerd. */
+  | { kind: 'not-built-on-backend'; branch: string; blob: string }
+  /**
+   * Committed and built. `path` is a private SNAPSHOT of the committed blob —
+   * never the working-tree file — so the identity hash and the build read the
+   * exact bytes that were accepted.
+   */
+  | { kind: 'used'; branch: string; blob: string; path: string };
+
+/** The one line agents and Teams are shown when the backend skips the file. */
+export const ROOT_DOCKERFILE_SKIPPED_ON_BACKEND =
+  `this project's ${CONVENTIONAL_DOCKERFILE} is not built on this install's backend ` +
+  `(builds there would run on the shared host); tasks use the base image`;
+
+/**
+ * Decide the root `Dockerfile.lazy` convention for this project root.
+ *
+ * INVARIANT: the convention NEVER reads the working tree. The root checkout is
+ * a directory anything on the host can write to — an uncommitted edit, a
+ * symlink swapped in over a committed file (pointing into a task worktree
+ * inside `.lazy/worktrees`, which containment alone would pass), or a task
+ * branch the root has checked out for the length of an accept. So:
+ *   - ONE pinned ref: the branch the root has checked out, refused when that is
+ *     a task branch (an accept is mid-flight) or HEAD is detached;
+ *   - the tree entry must be a REGULAR file (mode 100644/100755), never a
+ *     symlink or submodule;
+ *   - the bytes are read with `git cat-file blob`, and exactly those bytes are
+ *     hashed for the image identity and handed to `docker build`.
+ * The file on disk is consulted for one thing only: telling an uncommitted
+ * file apart from no file, so `lazy doctor` can say "commit it".
+ *
+ * INVARIANT: on Lazy Teams' local-docker backend the convention does not apply
+ * (see `autoBuildsRootDockerfile`); an owner-configured `[docker].dockerfile`
+ * is unaffected, because an owner who set it has already chosen.
+ */
+export async function inspectConventionalDockerfile(lazyRoot: string): Promise<ConventionalDockerfileState> {
+  const onDisk = join(lazyRoot, CONVENTIONAL_DOCKERFILE);
+  // Nothing at that path (not even a dangling symlink): the default image, with
+  // no git call — the common case for every project without the file, on every
+  // launch. Safe in the direction it errs: it can only choose the DEFAULT image,
+  // never build bytes from disk (a committed file deleted from the root
+  // checkout means the default image until it is restored).
+  try {
+    await lstat(onDisk);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { kind: 'absent' };
+    throw new Error(`failed to check ${onDisk}: ${(err as Error).message}`, { cause: err });
+  }
+  const branch = await rootIntegrationBranch(lazyRoot);
+  const entry = branch ? await committedTreeEntry(lazyRoot, branch, CONVENTIONAL_DOCKERFILE) : null;
+  if (!branch || !entry) {
+    return { kind: 'untracked', path: onDisk };
+  }
+
+  const { autoBuildsRootDockerfile } = await import('../config/managed-mode');
+  if (!autoBuildsRootDockerfile()) return { kind: 'not-built-on-backend', branch, blob: entry.sha };
+
+  if (entry.type !== 'blob' || (entry.mode !== '100644' && entry.mode !== '100755')) {
+    throw new Error(
+      `Refusing to build from ${CONVENTIONAL_DOCKERFILE}: on ${branch} it is committed as ` +
+      `${entry.mode === '120000' ? 'a symlink' : `a ${entry.type} (mode ${entry.mode})`}, not a regular file. ` +
+      `Commit the Dockerfile itself at the repository root.`,
+    );
+  }
+  return { kind: 'used', branch, blob: entry.sha, path: await snapshotCommittedBlob(lazyRoot, entry.sha) };
+}
+
+/**
+ * One human line when a root Dockerfile.lazy exists but the convention skipped
+ * it, or null. Consulted only with `[docker].dockerfile` unset.
+ */
+export async function describeSkippedRootDockerfile(lazyRoot: string): Promise<string | null> {
+  const config = await loadConfig(lazyRoot);
+  if (config.docker.dockerfile) return null;
+  const state = await inspectConventionalDockerfile(lazyRoot);
+  if (state.kind === 'untracked') {
+    return `${CONVENTIONAL_DOCKERFILE} at the project root is not committed, so it is not used — ` +
+      `tasks use the base image. Commit it to make it the task image.`;
+  }
+  if (state.kind === 'not-built-on-backend') return ROOT_DOCKERFILE_SKIPPED_ON_BACKEND;
+  return null;
+}
+
+/** `timeoutMs`: 15s suits a ref/blob lookup; a whole-tree `git archive` passes its own. */
+export async function gitInRoot(
+  lazyRoot: string,
+  args: string[],
+  timeoutMs: number = 15_000,
+): Promise<{ exitCode: number | null; stdout: Buffer; stderr: string }> {
+  const proc = spawn(['git', ...args], { cwd: lazyRoot, stdout: 'pipe', stderr: 'pipe', timeout: timeoutMs });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    proc.exited, new Response(proc.stdout).arrayBuffer(), new Response(proc.stderr).text(),
+  ]);
+  return { exitCode, stdout: Buffer.from(stdout), stderr };
+}
+
+function gitFailure(lazyRoot: string, what: string, result: { exitCode: number | null; stderr: string }): Error {
+  return new Error(`git could not ${what} in ${lazyRoot} (exit ${result.exitCode}): ${result.stderr.trim()}`);
+}
+
+/**
+ * The branch the project root has checked out — the ONE ref the convention
+ * reads — or null when it has no commits yet. Decided from exit codes and
+ * output, never git's (localized) messages: `symbolic-ref -q` exits 1 for a
+ * detached HEAD, `rev-parse --verify -q` exits 1 for an unborn branch; any
+ * other failure is a broken repository and throws.
+ */
+export async function rootIntegrationBranch(lazyRoot: string): Promise<string | null> {
+  const head = await gitInRoot(lazyRoot, ['symbolic-ref', '-q', '--short', 'HEAD']);
+  if (head.exitCode === 1) {
+    throw new Error(
+      `Refusing to use ${CONVENTIONAL_DOCKERFILE}: the project root (${lazyRoot}) has a detached HEAD, ` +
+      `so there is no branch to read the accepted file from. Check out the project's branch there and relaunch.`,
+    );
+  }
+  if (head.exitCode !== 0) throw gitFailure(lazyRoot, 'read HEAD', head);
+  const branch = head.stdout.toString().trim();
+
+  const { looksLikeTaskBranch } = await import('../git/branch-prefix');
+  if (looksLikeTaskBranch(branch)) {
+    throw new Error(
+      `Refusing to use ${CONVENTIONAL_DOCKERFILE}: the project root has the task branch ${branch} checked out ` +
+      `(an accept is probably in progress), and a task branch never chooses the image. Relaunch once the root ` +
+      `is back on the project's branch.`,
+    );
+  }
+
+  const commit = await gitInRoot(lazyRoot, ['rev-parse', '--verify', '-q', `refs/heads/${branch}^{commit}`]);
+  if (commit.exitCode === 1) return null; // unborn: nothing is committed yet
+  if (commit.exitCode !== 0) throw gitFailure(lazyRoot, `resolve ${branch}`, commit);
+  return branch;
+}
+
+/** The tree entry for `relPath` on `branch`, or null when it is not committed there. */
+export async function committedTreeEntry(
+  lazyRoot: string,
+  branch: string,
+  relPath: string,
+): Promise<{ mode: string; type: string; sha: string } | null> {
+  const tree = await gitInRoot(lazyRoot, ['ls-tree', '-z', `refs/heads/${branch}`, '--', relPath]);
+  if (tree.exitCode !== 0) throw gitFailure(lazyRoot, `list ${relPath} on ${branch}`, tree);
+  const line = tree.stdout.toString().split('\0')[0];
+  if (!line) return null;
+  const match = /^(\d+) (\w+) ([0-9a-f]+)\t/.exec(line);
+  if (!match) throw new Error(`unexpected git ls-tree output for ${relPath} in ${lazyRoot}: ${line}`);
+  return { mode: match[1], type: match[2], sha: match[3] };
+}
+
+/**
+ * Write the committed blob to a snapshot only this process can write, and
+ * return its path. Content-addressed by blob sha inside a per-process mkdtemp
+ * directory (mode 0700): never a predictable shared path another local user
+ * could plant, and never the working-tree file.
+ */
+let committedSnapshotDir: Promise<string> | null = null;
+const committedSnapshotLabels = new Map<string, string>();
+
+async function snapshotCommittedBlob(lazyRoot: string, blob: string): Promise<string> {
+  // A failed mkdtemp is not cached, and a directory a tmp cleaner removed is
+  // recreated by a NEW mkdtemp (0700), never by a plain mkdir of the old path.
+  if (committedSnapshotDir) {
+    const existing = await committedSnapshotDir.catch(() => null);
+    if (!existing || !(await pathExists(existing))) committedSnapshotDir = null;
+  }
+  committedSnapshotDir ??= mkdtemp(join(tmpdir(), 'lazy-committed-dockerfile-'));
+  const base = await committedSnapshotDir.catch((err: Error) => {
+    committedSnapshotDir = null;
+    throw new Error(`could not create a private directory for the committed ${CONVENTIONAL_DOCKERFILE}: ${err.message}`, { cause: err });
+  });
+  const dir = join(base, blob);
+  const path = join(dir, CONVENTIONAL_DOCKERFILE);
+  if (!(await pathExists(path))) {
+    const bytes = await gitInRoot(lazyRoot, ['cat-file', 'blob', blob]);
+    if (bytes.exitCode !== 0) throw gitFailure(lazyRoot, `read ${CONVENTIONAL_DOCKERFILE} (${blob})`, bytes);
+    await mkdir(dir, { recursive: true });
+    const tmp = `${path}.${process.pid}.tmp`;
+    await writeFile(tmp, bytes.stdout);
+    const { rename } = await import('fs/promises');
+    await rename(tmp, path);
+  }
+  committedSnapshotLabels.set(path, `${CONVENTIONAL_DOCKERFILE} as committed (${blob.substring(0, 12)}) in ${lazyRoot}`);
+  return path;
+}
+
+/**
+ * Name a lazy-owned Dockerfile snapshot for build announcements and status
+ * surfaces. A ref adoption's snapshot path (src/daemon/image-adoption.ts)
+ * tells a person nothing about which branch it came from.
+ */
+export function labelDockerfileSource(path: string, label: string): void {
+  committedSnapshotLabels.set(path, label);
+}
+
+/** A human name for a snapshot path the convention returned, for build announcements. */
+export function describeDockerfileSource(path: string): string {
+  return committedSnapshotLabels.get(path) ?? path;
+}
+
+/**
+ * Within one `ensureImage` call, the FIRST resolution is reused by every later
+ * one (identity hash, build, preflight), so the image is tagged and built from
+ * the same bytes even if the root moves mid-launch. Keyed by project root.
+ */
+const dockerfilePin = new AsyncLocalStorage<{ resolved: { root: string; path: string | null } | null }>();
+
 export async function resolveCustomDockerfile(lazyRoot: string): Promise<string | null> {
+  const pin = dockerfilePin.getStore();
+  if (pin?.resolved && pin.resolved.root === lazyRoot) return pin.resolved.path;
+  const path = await resolveCustomDockerfileFresh(lazyRoot);
+  if (pin) pin.resolved = { root: lazyRoot, path };
+  return path;
+}
+
+async function resolveCustomDockerfileFresh(lazyRoot: string): Promise<string | null> {
+  // A Dockerfile ADOPTED FROM A GIT REF by a project admin (Teams' recovery
+  // from a failing Dockerfile.lazy) governs the whole project ahead of the
+  // root file, for launches and builds alike. Unlike a worktree adoption it is
+  // resolved here on every launch rather than soft-pinned: its snapshot and
+  // build context are lazy-owned copies of a COMMITTED tree under the daemon
+  // dir that no agent can write, so building from them builds exactly what the
+  // admin confirmed — and it lets the daemon's boot build own the image,
+  // rebuild it after a version bump or a VM replacement, and report a failure
+  // the way it reports the root file's.
+  const { resolveRefAdoptedDockerfileSnapshot } = await import('../daemon/adopted-image');
+  const refSnapshot = await resolveRefAdoptedDockerfileSnapshot(lazyRoot);
+  if (refSnapshot) return refSnapshot;
+
   // Adoption path is ONLY for the explicit upgrade build (latch on). Launches
   // soft-pin via ensureImage and must not re-hash the worktree file here.
   // Returns the consented SNAPSHOT (outside any worktree), never the live
@@ -296,7 +564,10 @@ export async function resolveCustomDockerfile(lazyRoot: string): Promise<string 
 
   const config = await loadConfig(lazyRoot);
   const configPath = config.docker.dockerfile;
-  if (!configPath) return null;
+  if (!configPath) {
+    const state = await inspectConventionalDockerfile(lazyRoot);
+    return state.kind === 'used' ? state.path : null;
+  }
 
   const absPath = join(lazyRoot, configPath);
   try {
@@ -314,7 +585,25 @@ export async function resolveCustomDockerfile(lazyRoot: string): Promise<string 
       { cause: err },
     );
   }
+  await assertInsideProject(lazyRoot, absPath, configPath);
   return absPath;
+}
+
+/**
+ * Refuse a Dockerfile whose real path leaves the project. `docker build` runs on
+ * the HOST and its error output reaches whoever sees launch failures, so a
+ * committed symlink (`Dockerfile.lazy -> /proc/self/environ`) must not turn
+ * the image build into a way of reading host files.
+ */
+async function assertInsideProject(lazyRoot: string, absPath: string, label: string): Promise<void> {
+  const [realRoot, realFile] = await Promise.all([realpath(lazyRoot), realpath(absPath)]);
+  const rel = relative(realRoot, realFile);
+  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
+    throw new Error(
+      `Refusing to build from ${label}: it resolves to ${realFile}, outside the project (${realRoot}). ` +
+      `Replace the symlink with a regular file inside the repository.`,
+    );
+  }
 }
 
 /**
@@ -378,73 +667,30 @@ async function adoptedImageRepository(lazyRoot: string): Promise<string | null> 
  * Get the Dockerfile content to use for building the lazy container.
  *
  * Resolution order:
- * 1. Custom Dockerfile from [docker].dockerfile in lazy.toml
+ * 1. The custom Dockerfile `resolveCustomDockerfile` returns: [docker].dockerfile,
+ *    or with that unset a Dockerfile.lazy in the project root
  * 2. Embedded default Dockerfile (base image)
  *
  * The project's own Dockerfile is NEVER used automatically — it's for the
  * project, not for agent containers. Use `lazy init` to create a Dockerfile.lazy
  * based on the project's Dockerfile if needed.
  */
-/**
- * Resolve which agent an image build should bake in.
- *
- * Explicit override (the task's agent, threaded from the launch path) wins;
- * otherwise the project's configured default agent applies. Returns null when
- * the effective agent needs no extra install: claude-code is already in the
- * base image, and host-only agents never reach a container build.
- *
- * `agentId` names a PROFILE; what gets installed is its HARNESS — the binary.
- * The lookup is lenient (see profileForAgentNameOrNull): a task naming a
- * profile lazy.toml no longer defines is a problem for the selection surface
- * to report, not a reason for an image build to throw from underneath.
- */
-/** Exported for unit tests — decides which agent CLI an image build should bake in. */
-export async function resolveImageAgent(lazyRoot: string, agentId?: string): Promise<string | null> {
-  const config = await loadConfig(lazyRoot);
-  const profileName = agentId ?? config.agent.agent_id;
-  const effective = harnessForAgentName(config, profileName) ?? profileName;
-  if (effective === 'claude-code') return null;
-  // Unknown ids fall back to the base image — but only after an explicit registry
-  // check. getAgentPackaging throws for unknown ids AND for genuine packaging
-  // failures; swallowing the catch hid the latter and built base images for
-  // registered agents whose packaging broke.
-  if (!listAgents().includes(effective)) return null;
-  return getAgentPackaging(effective).supportsContainerRunner() ? effective : null;
-}
-
-async function getDockerfileContent(lazyRoot: string, agentId?: string): Promise<{ content: string; isCustom: boolean }> {
-  const customPath = await resolveCustomDockerfile(lazyRoot);
+async function getDockerfileContent(lazyRoot: string, forceDefault: boolean = false): Promise<{ content: string; isCustom: boolean }> {
+  const customPath = forceDefault ? null : await resolveCustomDockerfile(lazyRoot);
   if (customPath) {
-    // Custom Dockerfiles are the user's own — never silently amended. If they
-    // run a non-claude agent they add its install line themselves (the install
-    // command is printed by `lazy system export-dockerfile` docs).
+    // Custom Dockerfiles are the user's own — never silently amended. Building
+    // `FROM lazy-runner` gives them every agent CLI; a Dockerfile on another
+    // base adds its agent's install line itself.
     return { content: await readFile(customPath, 'utf-8'), isCustom: true };
   }
 
-  // Agent-aware default image: bake the configured (or task-overridden) agent's
-  // CLI into the image on top of the base. The Dockerfile-hash label mechanism
-  // then handles rebuilds automatically, since the content differs.
-  const imageAgent = await resolveImageAgent(lazyRoot, agentId);
-  if (imageAgent) {
-    const install = getAgentPackaging(imageAgent).dockerInstallCommand();
-    const content =
-      `${DEFAULT_DOCKERFILE}\n# Agent CLI for the "${imageAgent}" agent (added by lazy)\n${install}\n`;
-    return { content, isCustom: false };
-  }
-
+  // The default image carries EVERY container-capable agent's CLI, so there is
+  // one default image whatever agent a project or task runs
+  // (docs/design/published-runner-image.md).
   return { content: DEFAULT_DOCKERFILE, isCustom: false };
 }
 
-/**
- * A path → content-hash map of everything the image's identity is derived from.
- * Key order is the map's insertion order and is stable (Dockerfile first, then
- * `build_inputs` sorted), so the combined hash below is deterministic.
- */
-export type ImageInputManifest = Record<string, string>;
-
-function shortHash(content: string | Buffer): string {
-  return createHash('sha256').update(content).digest('hex').substring(0, 16);
-}
+export type { ImageInputManifest };
 
 /**
  * Resolve `[docker] build_inputs` to absolute paths, in a stable sorted order.
@@ -490,8 +736,13 @@ async function resolveBuildInputs(lazyRoot: string): Promise<{ relative: string;
  * declared input — same bytes, different name — is a change: the Dockerfile
  * COPYs it by name, so the built image genuinely differs.
  */
-export async function calculateImageInputManifest(lazyRoot: string, agentId?: string): Promise<ImageInputManifest> {
-  const { content } = await getDockerfileContent(lazyRoot, agentId);
+export async function calculateImageInputManifest(lazyRoot: string, forceDefault: boolean = false): Promise<ImageInputManifest> {
+  const { content } = await getDockerfileContent(lazyRoot, forceDefault);
+  return manifestForDockerfileContent(lazyRoot, content);
+}
+
+/** The input manifest of an image built from `content` with this project's `build_inputs`. */
+async function manifestForDockerfileContent(lazyRoot: string, content: string): Promise<ImageInputManifest> {
   const manifest: ImageInputManifest = { [DOCKERFILE_INPUT_KEY]: shortHash(content) };
 
   for (const input of await resolveBuildInputs(lazyRoot)) {
@@ -515,14 +766,9 @@ export async function calculateImageInputManifest(lazyRoot: string, agentId?: st
  * NOT the bare sha256 of the Dockerfile text it used to be — so every existing
  * image looks stale exactly once, rebuilds, and is stable from then on. That
  * one-off is the cost of having a single identity mechanism instead of two.
- *
- * `agentId` selects which agent's CLI the Dockerfile bakes in, so a cursor image
- * and a claude-code image are different identities rather than two builds
- * fighting over one hash (cursor-first-class-agent). Omitted means the project's
- * configured agent.
  */
-export async function calculateImageInputsHash(lazyRoot: string, agentId?: string): Promise<string> {
-  return (await resolveImageIdentity(lazyRoot, agentId)).hash;
+export async function calculateImageInputsHash(lazyRoot: string, forceDefault: boolean = false): Promise<string> {
+  return (await resolveImageIdentity(lazyRoot, forceDefault)).hash;
 }
 
 /** The identity hash and the manifest it was derived from, always in step. */
@@ -535,15 +781,11 @@ export interface ImageIdentity {
  * Resolved once per build/check so the label pair written to an image can never
  * disagree with each other.
  */
-async function resolveImageIdentity(lazyRoot: string, agentId?: string): Promise<ImageIdentity> {
-  const manifest = await calculateImageInputManifest(lazyRoot, agentId);
+async function resolveImageIdentity(lazyRoot: string, forceDefault: boolean = false): Promise<ImageIdentity> {
+  const manifest = await calculateImageInputManifest(lazyRoot, forceDefault);
   return { hash: hashManifest(manifest), manifest };
 }
 
-function hashManifest(manifest: ImageInputManifest): string {
-  const canonical = Object.entries(manifest).map(([path, hash]) => `${path}=${hash}`).join('\n');
-  return createHash('sha256').update(canonical).digest('hex');
-}
 
 /**
  * Human-readable reason a rebuild is happening, by diffing the manifest an
@@ -573,11 +815,10 @@ export function describeInputChanges(
 /**
  * Determine the Docker image REPOSITORY (name without tag) to use.
  * Default behavior uses 'lazy-runner'. Custom Dockerfiles use 'lazy-custom-{hash}'.
- * Default-plus-agent images use 'lazy-runner-{agentId}' so they never collide
- * with the base runner image of other projects.
+ * There is no per-agent variant: the default image carries every agent CLI.
  */
-export async function resolveImageRepository(lazyRoot: string, agentId?: string): Promise<{ repository: string; isCustom: boolean }> {
-  const { isCustom, content } = await getDockerfileContent(lazyRoot, agentId);
+export async function resolveImageRepository(lazyRoot: string, forceDefault: boolean = false): Promise<{ repository: string; isCustom: boolean }> {
+  const { isCustom, content } = await getDockerfileContent(lazyRoot, forceDefault);
 
   if (isCustom) {
     // An adopted worktree Dockerfile was NAMED at the consent prompt, from its
@@ -592,11 +833,6 @@ export async function resolveImageRepository(lazyRoot: string, agentId?: string)
     return { repository: `lazy-custom-${hash}`, isCustom: true };
   }
 
-  const imageAgent = await resolveImageAgent(lazyRoot, agentId);
-  if (imageAgent) {
-    return { repository: `${IMAGE_NAME}-${imageAgent}`, isCustom: false };
-  }
-
   return { repository: IMAGE_NAME, isCustom: false };
 }
 
@@ -604,8 +840,8 @@ export async function resolveImageRepository(lazyRoot: string, agentId?: string)
  * Determine the full Docker image reference to run — always tagged with lazy's
  * major.minor version (see IMAGE_TAG), never `:latest`.
  */
-export async function resolveImageName(lazyRoot: string, agentId?: string): Promise<string> {
-  const { repository } = await resolveImageRepository(lazyRoot, agentId);
+export async function resolveImageName(lazyRoot: string): Promise<string> {
+  const { repository } = await resolveImageRepository(lazyRoot);
   return `${repository}:${IMAGE_TAG}`;
 }
 
@@ -618,6 +854,139 @@ export async function resolveImageName(lazyRoot: string, agentId?: string): Prom
 function buildTagsFor(repository: string): string[] {
   const versioned = `${repository}:${IMAGE_TAG}`;
   return repository === IMAGE_NAME ? [versioned, `${repository}:${LATEST_ALIAS_TAG}`] : [versioned];
+}
+
+/**
+ * Tags a LOCAL build of `repository` writes. A local build of the default
+ * runner is also tagged with the published ref this lazy would have pulled, so a
+ * FROM that names the published image resolves whether it was pulled or built
+ * (docs/design/published-runner-image.md §2).
+ */
+function localBuildTagsFor(repository: string): string[] {
+  const tags = buildTagsFor(repository);
+  return repository === IMAGE_NAME ? [...tags, PUBLISHED_RUNNER_REF] : tags;
+}
+
+/** Labels a LOCAL build of the default runner carries (see {@link BASE_SOURCE_LABEL}). */
+const LOCAL_BASE_LABELS: Record<string, string> = { [BASE_SOURCE_LABEL]: 'local' };
+
+/** The identity of the default runner image: the composed Dockerfile alone. */
+function defaultRunnerIdentity(): ImageIdentity {
+  const manifest: ImageInputManifest = { [DOCKERFILE_INPUT_KEY]: shortHash(DEFAULT_DOCKERFILE) };
+  return { hash: hashManifest(manifest), manifest };
+}
+
+/** One label off a local image, or null when the image or the label is absent. */
+async function getImageLabel(imageName: string, label: string, binary: string): Promise<string | null> {
+  const inspect = spawn(
+    [binary, 'image', 'inspect', imageName, '--format', `{{index .Config.Labels "${label}"}}`],
+    { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
+  );
+  const [stdout, exitCode] = await Promise.all([new Response(inspect.stdout).text(), inspect.exited]);
+  if (exitCode !== 0) return null;
+  const value = stdout.trim();
+  return value && value !== '<no value>' ? value : null;
+}
+
+/** Was this image pulled from the release rather than built on this host? */
+async function isPublishedImage(imageName: string, binary: string): Promise<boolean> {
+  return (await getImageLabel(imageName, BASE_SOURCE_LABEL, binary)) === 'published';
+}
+
+/** How long a pull of the runner may take — it is well over a gigabyte. */
+const RUNNER_PULL_TIMEOUT_MS = 30 * 60 * 1000;
+
+/**
+ * Why a pull of the published runner failed, and whether that is the ordinary
+ * "nothing was published for this runner" fallback (quiet) or a real problem the
+ * human can fix (warned, with the remedy). Exported for its unit test.
+ */
+export function classifyRunnerPullFailure(detail: string, exitCode: number | null): { quiet: boolean; why: string } {
+  const text = detail || `exit code ${exitCode}`;
+  if (/manifest unknown|manifest for \S+ not found/i.test(detail)) {
+    return { quiet: true, why: `no runner image ${PUBLISHED_RUNNER_REF} was published (lazy ${VERSION} composes a runner no release built)` };
+  }
+  let remedy: string;
+  if (/unauthorized|denied|authentication required|403 forbidden/i.test(detail)) {
+    remedy = 'if you are logged in to ghcr.io, stale credentials are the usual cause — run `docker logout ghcr.io` and retry; otherwise the image may not be published or public yet';
+  } else if (/x509|certificate|tls/i.test(detail)) {
+    remedy = 'a TLS-intercepting proxy or missing CA certificate is the usual cause — trust its CA in your container runtime';
+  } else if (/no such host|lookup |dial tcp|i\/o timeout|timeout|connection refused|network is unreachable|temporary failure/i.test(detail)
+    || exitCode === null) {
+    remedy = 'the registry could not be reached — check your network, or run `lazy system offline` to stop trying';
+  } else {
+    remedy = 'run the same `docker pull` by hand to see the full error';
+  }
+  return { quiet: false, why: `the pull of ${PUBLISHED_RUNNER_REF} failed: ${text} — ${remedy}` };
+}
+
+/** What {@link pullPublishedRunner} did: pulled, or why not (null = not attempted by design). */
+type RunnerPullOutcome = { pulled: true } | { pulled: false; why: string | null };
+
+/** A fallback build that failed also carries the reason the pull did not happen. */
+function withPullReason(err: unknown, outcome: RunnerPullOutcome): Error {
+  const error = err instanceof Error ? err : new Error(String(err));
+  if (outcome.pulled || !outcome.why) return error;
+  error.message = `${error.message}\n(Built locally because ${outcome.why}.)`;
+  return error;
+}
+
+/**
+ * Pull the release's runner image and tag it onto `targets`. Returns false
+ * (never throws) when the caller should build locally instead, after saying why
+ * once: offline, an identity no published image can have, a version that was
+ * never published, a failed pull, or a published image whose identity label does
+ * not match what this binary composes (a publishing bug, never used).
+ *
+ * See docs/design/published-runner-image.md §4.
+ */
+async function pullPublishedRunner(
+  lazyRoot: string | null,
+  identity: ImageIdentity,
+  targets: string[],
+  binary: string,
+  notify?: PhaseNotify,
+): Promise<RunnerPullOutcome> {
+  const expected = defaultRunnerIdentity();
+  if (identity.hash !== expected.hash) {
+    // Only [docker] build_inputs on the default Dockerfile get here: those
+    // files are part of the identity, so no published image can match it.
+    logger.debug(`Not pulling ${PUBLISHED_RUNNER_REF}: this project's image identity includes build inputs`);
+    return { pulled: false, why: null };
+  }
+  if (lazyRoot) {
+    const config = await loadConfig(lazyRoot);
+    if (await isOfflineMode(join(lazyRoot, '.lazy'), config.remote.offline)) {
+      logger.info(`Offline mode: building ${targets[0]} locally instead of pulling ${PUBLISHED_RUNNER_REF}.`);
+      return { pulled: false, why: 'offline mode is on' };
+    }
+  }
+
+  notify?.(`pulling ${PUBLISHED_RUNNER_REF}`);
+  logger.info(`Pulling ${PUBLISHED_RUNNER_REF} (the published runner image lazy ${VERSION} composes)...`);
+  const proc = spawn([binary, 'pull', PUBLISHED_RUNNER_REF], { stdout: 'ignore', stderr: 'pipe', timeout: RUNNER_PULL_TIMEOUT_MS });
+  const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+  if (exitCode !== 0) {
+    const { quiet, why } = classifyRunnerPullFailure(stderr.trim(), exitCode);
+    if (quiet) logger.info(`Building ${targets[0]} locally — ${why}.`);
+    else logger.warn(`Building ${targets[0]} locally — ${why}.`);
+    notify?.(`building locally — ${why}`);
+    return { pulled: false, why };
+  }
+
+  const pulledHash = await getImageDockerfileHash(PUBLISHED_RUNNER_REF, binary);
+  if (pulledHash !== expected.hash) {
+    logger.warn(
+      `${PUBLISHED_RUNNER_REF} carries identity ${pulledHash ?? '(none)'}, but lazy ${VERSION} composes ${expected.hash}. ` +
+      `The release published a different Dockerfile than this binary builds — not using it; building locally.`,
+    );
+    return { pulled: false, why: `the published ${PUBLISHED_RUNNER_REF} was built from a different Dockerfile than lazy ${VERSION} composes` };
+  }
+
+  await selfcheckImage(PUBLISHED_RUNNER_REF, binary);
+  await tagImage(PUBLISHED_RUNNER_REF, targets, binary);
+  notify?.(`using published image ${PUBLISHED_RUNNER_REF}`);
+  return { pulled: true };
 }
 
 /**
@@ -767,16 +1136,15 @@ export interface UpgradeRebuildEvaluation {
 export async function evaluateUpgradeRebuild(
   lazyRoot: string,
   binary: string = 'docker',
-  agentId?: string,
 ): Promise<UpgradeRebuildEvaluation> {
-  const imageName = await resolveImageName(lazyRoot, agentId);
+  const imageName = await resolveImageName(lazyRoot);
 
   const builtHash = await getImageDockerfileHash(imageName, binary);
   if (!builtHash) {
     return { verdict: 'rebuild', reason: `${imageName} is not built on this host`, imageName };
   }
 
-  const identity = await resolveImageIdentity(lazyRoot, agentId);
+  const identity = await resolveImageIdentity(lazyRoot);
   if (builtHash !== identity.hash) {
     const previous = await getImageInputManifest(imageName, binary);
     const changed = describeInputChanges(previous, identity.manifest) ?? 'image inputs have changed';
@@ -893,6 +1261,8 @@ async function pumpBuildStream(
   stream: ReadableStream<Uint8Array>,
   label: string,
   onProgress: (line: string) => void,
+  /** Every line, unfiltered — the daemon's per-build log (see ./build-observer.ts). */
+  onEveryLine?: (line: string) => void,
 ): Promise<string> {
   const decoder = new TextDecoder();
   let buffered = '';
@@ -906,12 +1276,14 @@ async function pumpBuildStream(
     buffered = remainder;
     for (const line of lines) {
       logger.stream(`[build ${label}] ${line}`);
+      onEveryLine?.(line);
       if (isBuildProgressLine(line)) onProgress(line.trim());
     }
   }
 
   if (buffered.length > 0) {
     logger.stream(`[build ${label}] ${buffered}`);
+    onEveryLine?.(buffered);
     if (isBuildProgressLine(buffered)) onProgress(buffered.trim());
   }
 
@@ -954,10 +1326,17 @@ interface DockerBuildRequest {
   source: string;
   /** Why this build is happening, when the caller knows. Named in the announcement. */
   reason?: string;
+  /**
+   * True when `source` is the PROJECT's Dockerfile (configured or the root
+   * Dockerfile.lazy): only then does a failure tell the user to fix it.
+   */
+  projectDockerfile?: boolean;
   signal?: AbortSignal;
   timeoutMs?: number;
   /** Mirrors build progress to whoever asked for this build (turn-launch display). */
   notify?: PhaseNotify;
+  /** Extra image labels, e.g. {@link BASE_SOURCE_LABEL} on a default-image build. */
+  labels?: Record<string, string>;
 }
 
 /** Lines of the failing step's own output shown on a build failure. */
@@ -994,10 +1373,89 @@ export function extractBuildFailureOutput(output: string): string {
   return [...stepLines.slice(-BUILD_FAILURE_STEP_LINES), lines[errorIdx]].join('\n');
 }
 
-async function runDockerBuild(request: DockerBuildRequest): Promise<void> {
-  const { buildCwd, dockerfilePath, tags, identity, binary, noCache, source, reason, signal, notify } = request;
+/**
+ * `source` is the human-meaningful Dockerfile description runDockerBuild
+ * already holds (never the temp snapshot); for an adopted or consented worktree
+ * Dockerfile it already carries the build context. The message reaches the
+ * Teams "could not be started" page verbatim.
+ */
+export function buildFailureMessage(exitCode: number, stdout: string, stderr: string, source?: string): string {
+  const output = stderr.trim() || stdout.trim();
+  const detail = output ? extractBuildFailureOutput(output).trim() : 'The container builder produced no output.';
+  const what = source ? `\nBuilding: ${source}` : '';
+  return `Container build failed with exit code ${exitCode}${what}\n\nLast output:\n${detail}`;
+}
+
+/**
+ * A build docker ran to a non-zero exit. `output` is what it printed; `message`
+ * carries the "fix that Dockerfile" pointer, `bare` does not (a lost connection
+ * is never the Dockerfile's fault).
+ */
+class ContainerBuildFailed extends Error {
+  constructor(message: string, readonly bare: string, readonly output: string) { super(message); }
+}
+
+/**
+ * Every container build in lazy. On a Teams microVM a build whose client lost
+ * its connection to BuildKit (`error reading from server: EOF`) is diagnosed —
+ * dockerd brought back if it died, what the machine recorded read — and retried
+ * ONCE when dockerd answers again; a final failure leads with the likely cause
+ * instead of only BuildKit's EOF (src/daemon/build-connection-lost.ts).
+ */
+async function runDockerBuild(request: DockerBuildRequest): Promise<{ output: string }> {
+  const lostConnection = (err: unknown): err is ContainerBuildFailed =>
+    err instanceof ContainerBuildFailed && isBuildConnectionLost(err.output);
+  const diagnose = async (err: ContainerBuildFailed, since: Date) => {
+    try {
+      return await diagnoseLostBuildConnection(since, undefined, request.signal ?? currentBuildObserver()?.signal);
+    } catch (diagErr) {
+      // The check failing must never replace the build's own error.
+      const why = diagErr instanceof Error ? diagErr.message : String(diagErr);
+      throw new Error(`${LOST_CONNECTION_HEADLINE}; lazy could not check what happened: ${why}\n\n${err.bare}`);
+    }
+  };
+  const startedAt = new Date();
+  try {
+    return await runDockerBuildOnce(request);
+  } catch (err) {
+    if (!lostConnection(err) || request.binary !== 'docker' || !guestDockerdSupervised()) throw err;
+    const first = await diagnose(err, startedAt);
+    if (!first.retryable) throw new Error(`${first.headline}\n\n${first.explanation}\n\n${err.bare}`);
+    const note = `${first.headline} ${first.explanation} Docker answers again; retrying the build once.`;
+    logger.warn(note);
+    // The image-build job's log reads narration through notify; a build with
+    // no notify still shows the retry in the job log through its observer.
+    if (request.notify) request.notify(note);
+    else currentBuildObserver()?.onLine(request.tags[0], note);
+    const retryStartedAt = new Date();
+    try {
+      return await runDockerBuildOnce(request);
+    } catch (again) {
+      if (!lostConnection(again)) throw again;
+      const second = await diagnose(again, retryStartedAt);
+      throw new Error(
+        `${second.headline} It happened twice in a row (lazy retried once).\n\n${second.explanation}\n\n${again.bare}`,
+      );
+    }
+  }
+}
+
+/** Every container build lazy runs passes here: counted while it runs, reported when it succeeds (src/capture/build-observer.ts). */
+function runDockerBuildOnce(request: DockerBuildRequest): Promise<{ output: string }> {
+  return trackContainerBuild(request.tags[0], () => runDockerBuildUntracked(request));
+}
+
+async function runDockerBuildUntracked(request: DockerBuildRequest): Promise<{ output: string }> {
+  const { buildCwd, dockerfilePath, tags, identity, binary, noCache, source, reason, notify } = request;
+  // A daemon image build (src/daemon/image-build-job.ts) watches every build in
+  // its async context: it gets every line, and its signal is how Cancel stops
+  // the docker client. An explicit request signal still wins.
+  const observer = currentBuildObserver();
+  const signal = request.signal ?? observer?.signal;
   const timeoutMs = request.timeoutMs ?? 0;
   if (signal?.aborted) throw new Error('Container build cancelled before it started');
+  observer?.onBuildStart?.(tags[0], source);
+  const observe = observer ? (line: string) => observer.onLine(tags[0], line) : undefined;
 
   const startedAt = Date.now();
 
@@ -1019,6 +1477,7 @@ async function runDockerBuild(request: DockerBuildRequest): Promise<void> {
       binary, 'build', ...(noCache ? ['--no-cache'] : []), ...tagArgs,
       '--label', `${DOCKERFILE_HASH_LABEL}=${identity.hash}`,
       '--label', `${IMAGE_INPUTS_LABEL}=${JSON.stringify(identity.manifest)}`,
+      ...Object.entries(request.labels ?? {}).flatMap(([key, value]) => ['--label', `${key}=${value}`]),
       '-f', dockerfilePath, '.',
     ],
     // timeout: 0 disables spawn()'s own kill timer. Any bound is armed below.
@@ -1072,8 +1531,8 @@ async function runDockerBuild(request: DockerBuildRequest): Promise<void> {
       // stderr, the classic builder to stdout), so both are labelled with the
       // image ref rather than 'out'/'err' — `[build err]` read as an error
       // stream and told nobody which image the lines belonged to.
-      pumpBuildStream(proc.stdout as ReadableStream<Uint8Array>, tags[0], echo),
-      pumpBuildStream(proc.stderr as ReadableStream<Uint8Array>, tags[0], echo),
+      pumpBuildStream(proc.stdout as ReadableStream<Uint8Array>, tags[0], echo, observe),
+      pumpBuildStream(proc.stderr as ReadableStream<Uint8Array>, tags[0], echo, observe),
       proc.exited,
     ]);
   } finally {
@@ -1082,7 +1541,13 @@ async function runDockerBuild(request: DockerBuildRequest): Promise<void> {
     clearInterval(heartbeat);
   }
 
-  if (signal?.aborted) throw new Error('Container build cancelled');
+  if (signal?.aborted) {
+    observer?.onBuildEnd?.(tags[0], 'cancelled');
+    throw new Error('Container build cancelled');
+  }
+  const ended = !timedOut && exitCode === 0 ? 'succeeded'
+    : !timedOut && isBuildConnectionLost(`${stdout}\n${stderr}`) ? 'connection-lost' : 'failed';
+  observer?.onBuildEnd?.(tags[0], ended);
 
   if (timedOut) {
     const message = buildTimeoutMessage(Date.now() - startedAt, timeoutMs);
@@ -1091,22 +1556,24 @@ async function runDockerBuild(request: DockerBuildRequest): Promise<void> {
   }
 
   if (exitCode !== 0) {
-    // BuildKit reports failures on stderr, the classic builder on stdout —
-    // fall back to stdout so the tail is never empty just because of which
-    // builder the daemon happens to be using.
-    const failureOutput = (stderr.trim() || stdout.trim());
-    const lastOutput = extractBuildFailureOutput(failureOutput);
-    logger.error(`Container build failed with exit code ${exitCode}\n\nLast output:\n${lastOutput}`);
-    throw new Error(`Container build failed with exit code ${exitCode}`);
+    const output = `${stdout}\n${stderr}`;
+    const bare = buildFailureMessage(exitCode, stdout, stderr, source);
+    // Only a PROJECT Dockerfile gets "fix it" — never lazy's own default, and
+    // never a build that lost its connection to Docker, which no Dockerfile edit fixes.
+    const pointer = request.projectDockerfile && !isBuildConnectionLost(output) ? '\n\nFix that Dockerfile and relaunch.' : '';
+    const message = bare + pointer;
+    logger.error(message);
+    throw new ContainerBuildFailed(message, bare, output);
   }
 
   logger.info(
     `Built container image ${tags[0]} from ${source} in ${formatDuration(Date.now() - startedAt)}.`,
   );
+  return { output: `${stdout}${stderr}` };
 }
 
-async function buildImage(lazyRoot: string, repository: string, identity: ImageIdentity, binary: string = 'docker', noCache: boolean = false, agentId?: string, timeoutMs: number = 0, reason?: string, notify?: PhaseNotify): Promise<void> {
-  await buildImageWithTags(lazyRoot, buildTagsFor(repository), identity, binary, noCache, undefined, agentId, timeoutMs, reason, notify);
+async function buildImage(lazyRoot: string, repository: string, identity: ImageIdentity, binary: string = 'docker', noCache: boolean = false, timeoutMs: number = 0, reason?: string, notify?: PhaseNotify, forceDefault: boolean = false): Promise<void> {
+  await buildImageWithTags(lazyRoot, localBuildTagsFor(repository), identity, binary, noCache, undefined, timeoutMs, reason, notify, forceDefault);
 }
 
 /** Does the container runtime have this image locally? */
@@ -1191,7 +1658,7 @@ export async function buildImageFromDockerfilePath(
 
   // Same FROM-lazy-runner preflight as the root custom-image path.
   const baseUsage = analyzeLazyBaseUsage(content, IMAGE_NAME, buildTagsFor(IMAGE_NAME));
-  await ensureLazyBaseImage(baseUsage, absPath, binary, options.timeoutMs ?? 0);
+  await ensureLazyBaseImage(lazyRoot, baseUsage, absPath, binary, options.timeoutMs ?? 0);
 
   // Build from a temp copy of the consented bytes, with the worktree as context.
   const snap = await writeDockerfileToTempDir(content);
@@ -1215,12 +1682,7 @@ export async function buildImageFromDockerfilePath(
   } catch (err) {
     if (baseUsage.unbuildable.length > 0) {
       const detail = err instanceof Error ? err.message : String(err);
-      throw new Error(
-        `${detail}\n` +
-        `${absPath} builds FROM ${baseUsage.unbuildable.join(', ')} — a lazy base image that exists only ` +
-        `locally, never on a registry. If the build failed to pull it, build the base first: ` +
-        `\`lazy system build lazy-runner\`.`,
-      );
+      throw new Error(`${detail}\n${unbuildableBaseRemedy(absPath, baseUsage.unbuildable)}`);
     }
     throw err;
   }
@@ -1229,11 +1691,31 @@ export async function buildImageFromDockerfilePath(
 }
 
 /**
+ * The remedy for a custom build that died on a lazy base ref lazy cannot supply.
+ * A per-agent `lazy-runner-<agent>` ref gets its own line: those images are no
+ * longer produced, because `lazy-runner` now carries every agent CLI.
+ */
+function unbuildableBaseRemedy(dockerfile: string, unbuildable: string[]): string {
+  const agentVariants = unbuildable.filter(ref => ref.startsWith(`${IMAGE_NAME}-`));
+  if (agentVariants.length > 0) {
+    return (
+      `${dockerfile} builds FROM ${agentVariants.join(', ')} — per-agent runner images are no longer produced: ` +
+      `${IMAGE_NAME} now carries every agent CLI. Change the FROM line to \`FROM ${IMAGE_NAME}\`.`
+    );
+  }
+  return (
+    `${dockerfile} builds FROM ${unbuildable.join(', ')} — a lazy base image tag that no lazy build writes. ` +
+    `Use \`FROM ${IMAGE_NAME}\`, or build the base first: \`lazy system build lazy-runner\`.`
+  );
+}
+
+/**
  * Build the base runner image first when a custom Dockerfile builds FROM it and
  * it is missing locally.
  *
- * `lazy-runner` exists on no registry — it is built here or not at all. Without
- * this, `docker build` on a `FROM lazy-runner` Dockerfile with no local base
+ * The bare name `lazy-runner` resolves on no registry, so it has to be put in
+ * the local store: pulled from the release (`ghcr.io/getlazy/lazy-runner`) and
+ * re-tagged, or built here when there is nothing to pull. Without this, `docker build` on a `FROM lazy-runner` Dockerfile with no local base
  * treats the name as a Docker Hub repository and dies with "pull access denied,
  * repository does not exist", which points at nothing. That is the exact failure
  * a fresh install hits: the version tag (src/capture/image-tag.ts) forces a
@@ -1247,6 +1729,7 @@ export async function buildImageFromDockerfilePath(
  * build something else.
  */
 async function ensureLazyBaseImage(
+  lazyRoot: string,
   usage: LazyBaseUsage,
   dockerfilePath: string,
   binary: string,
@@ -1254,12 +1737,31 @@ async function ensureLazyBaseImage(
   notify?: PhaseNotify,
 ): Promise<void> {
   if (usage.buildable.length === 0) return;
+  // Under the same per-image lock `ensureImage` takes for the default image, and
+  // re-checked inside it: the daemon's boot build prepares the default image
+  // and the custom one at once, and without the lock both would build
+  // lazy-runner side by side.
+  await imageBuildMutex.withLock(`${IMAGE_NAME}:${IMAGE_TAG}`, () =>
+    ensureLazyBaseImageLocked(lazyRoot, usage, dockerfilePath, binary, timeoutMs, notify));
+}
 
+async function ensureLazyBaseImageLocked(
+  lazyRoot: string,
+  usage: LazyBaseUsage,
+  dockerfilePath: string,
+  binary: string,
+  timeoutMs: number,
+  notify?: PhaseNotify,
+): Promise<void> {
   const missing: string[] = [];
   for (const ref of usage.buildable) {
     if (!(await imageExists(ref, binary))) missing.push(ref);
   }
   if (missing.length === 0) return;
+
+  // Pull the release's image first; building is the fallback.
+  const pull = await pullPublishedRunner(lazyRoot, defaultRunnerIdentity(), buildTagsFor(IMAGE_NAME), binary, notify);
+  if (pull.pulled) return;
 
   logger.info(
     `Base image ${missing.join(', ')} not found — building it first, because ${dockerfilePath} builds FROM it ` +
@@ -1275,7 +1777,8 @@ async function ensureLazyBaseImage(
     const detail = err instanceof Error ? err.message : String(err);
     throw new Error(
       `Failed to build the base image ${IMAGE_NAME}, which ${dockerfilePath} builds FROM: ${detail}\n` +
-      `Build it on its own to see the full output, then retry: \`lazy system build lazy-runner\``
+      `Build it on its own to see the full output, then retry: \`lazy system build lazy-runner\`` +
+      (pull.why ? `\n(Built locally because ${pull.why}.)` : '')
     );
   }
 }
@@ -1296,24 +1799,26 @@ async function buildImageWithTags(
   binary: string = 'docker',
   noCache: boolean = false,
   signal?: AbortSignal,
-  agentId?: string,
   timeoutMs: number = 0,
   reason?: string,
   notify?: PhaseNotify,
+  /** Build lazy's default runner image even though a custom one is configured. */
+  forceDefault: boolean = false,
 ): Promise<void> {
-  const customPath = await resolveCustomDockerfile(lazyRoot);
+  const customPath = forceDefault ? null : await resolveCustomDockerfile(lazyRoot);
 
   let buildCwd: string;
   let dockerfileName: string;
   let source: string;
   let baseUsage: LazyBaseUsage | null = null;
+  let labels: Record<string, string> | undefined;
 
   if (customPath) {
     // Name the Dockerfile in the announcement: from a worktree it is genuinely
     // ambiguous which copy governs, and a wrong one once cost a whole session.
     // The log line for this is emitted once, by runDockerBuild. The phase note
     // is not a log line — it goes to whoever is watching this turn launch.
-    notify?.(`building ${tags[0]} from ${customPath}`);
+    notify?.(`building ${tags[0]} from ${describeDockerfileSource(customPath)}`);
     // Read once and build from a temp copy so a concurrent write to customPath
     // cannot change what docker sees after we hashed (hash/build TOCTOU). For
     // adoption, customPath is already the daemon snapshot; the extra copy is
@@ -1331,7 +1836,7 @@ async function buildImageWithTags(
     // context rides along there rather than in a second log line of our own.
     source = adoptedContext
       ? `${customPath} (context ${adoptedContext})`
-      : customPath;
+      : describeDockerfileSource(customPath);
     // Temp dirs are unique (mkdtemp) under the OS temp dir — outside every
     // worktree — and left in place so the `-f` path stays inspectable.
     const snap = await writeDockerfileToTempDir(content);
@@ -1345,16 +1850,17 @@ async function buildImageWithTags(
       IMAGE_NAME,
       buildTagsFor(IMAGE_NAME),
     );
-    await ensureLazyBaseImage(baseUsage, customPath, binary, timeoutMs, notify);
+    await ensureLazyBaseImage(lazyRoot, baseUsage, describeDockerfileSource(customPath), binary, timeoutMs, notify);
   } else {
     source = 'the embedded default Dockerfile';
     notify?.(`building ${tags[0]} from the default Dockerfile`);
     // Write the resolved Dockerfile to a temp directory for the build.
     // Never use the project's own Dockerfile — it's for the project, not agents.
-    const { content } = await getDockerfileContent(lazyRoot, agentId);
+    const { content } = await getDockerfileContent(lazyRoot, forceDefault);
     const temp = await writeDockerfileToTempDir(content);
     buildCwd = temp.buildCwd;
     dockerfileName = temp.dockerfilePath;
+    labels = LOCAL_BASE_LABELS;
   }
 
   try {
@@ -1366,20 +1872,14 @@ async function buildImageWithTags(
       binary,
       noCache,
       source,
+      projectDockerfile: customPath !== null,
       reason,
       signal,
       timeoutMs,
       notify,
+      labels,
     });
-    // The image does not embed lazy-agent — it is bind-mounted at launch from a
-    // content-addressed install in ~/.lazy/bin. When that file is a bare Bun
-    // runtime, tagging a fresh image still strands every builder; prove the
-    // mount works before the tag moves (skipped when no verified agent binary
-    // exists yet). The pointer symlink resolves to the current install; a stale
-    // or missing pointer simply skips the probe.
-    const binDir = join(getHome(), '.lazy', 'bin');
-    const agentBinaryPath = (await resolveInstalledAgentBinary(binDir)) ?? agentBinaryPointerPath(binDir);
-    await assertAgentBinarySelfcheckForImage(tags[0], agentBinaryPath, binary);
+    await selfcheckImage(tags[0], binary);
   } catch (err) {
     // The base refs lazy could NOT supply itself (an agent-suffixed repository,
     // or a base pinned to a tag no base build writes — see
@@ -1388,20 +1888,29 @@ async function buildImageWithTags(
     // the real remedy rather than leaving that as the last word.
     if (baseUsage && baseUsage.unbuildable.length > 0) {
       const detail = err instanceof Error ? err.message : String(err);
-      throw new Error(
-        `${detail}\n` +
-        `${dockerfileName} builds FROM ${baseUsage.unbuildable.join(', ')} — a lazy base image that exists only ` +
-        `locally, never on a registry. If the build failed to pull it, build the base first: ` +
-        `\`lazy system build lazy-runner\`.`
-      );
+      throw new Error(`${detail}\n${unbuildableBaseRemedy(dockerfileName, baseUsage.unbuildable)}`);
     }
     throw err;
   }
 }
 
 /**
+ * The image does not embed lazy-agent — it is bind-mounted at launch from a
+ * content-addressed install in ~/.lazy/bin. When that file is a bare Bun
+ * runtime, tagging a fresh image still strands every builder; prove the mount
+ * works before a tag moves (skipped when no verified agent binary exists yet).
+ */
+async function selfcheckImage(ref: string, binary: string): Promise<void> {
+  const binDir = join(getHome(), '.lazy', 'bin');
+  const agentBinaryPath = (await resolveInstalledAgentBinary(binDir)) ?? agentBinaryPointerPath(binDir);
+  await assertAgentBinarySelfcheckForImage(ref, agentBinaryPath, binary);
+}
+
+/**
  * The canonical tags a build of THIS project's image writes — the version tag,
- * plus the `:latest` alias for the base runner repository.
+ * plus, for the base runner repository, the `:latest` alias and the published
+ * content ref (so an upgrade whose pull missed still leaves the local build
+ * wearing the ref a `FROM ghcr.io/getlazy/lazy-runner:sha-…` names).
  *
  * `lazy upgrade` needs these separately from the build itself: it builds to a
  * staging tag first and promotes onto exactly these refs afterwards, so a
@@ -1409,7 +1918,7 @@ async function buildImageWithTags(
  */
 export async function resolveImageBuildTags(lazyRoot: string): Promise<string[]> {
   const { repository } = await resolveImageRepository(lazyRoot);
-  return buildTagsFor(repository);
+  return localBuildTagsFor(repository);
 }
 
 /**
@@ -1430,18 +1939,109 @@ export async function buildProjectImageToTag(
   const { repository } = await resolveImageRepository(lazyRoot);
   const ref = `${repository}:${tag}`;
   const identity = await resolveImageIdentity(lazyRoot);
-  await buildImageWithTags(
+  // An upgrade to a release promotes that release's published image rather than
+  // building one (docs/design/published-runner-image.md §4). The upgrade always
+  // asks for --no-cache, but that exists to re-fetch unpinned CLIs in a LOCAL
+  // build. A published image pins them to its release (engineer decision
+  // 2026-09-27), so the pull comes first and --no-cache applies only to the
+  // local fallback.
+  const pull: RunnerPullOutcome = repository === IMAGE_NAME
+    ? await pullPublishedRunner(lazyRoot, identity, [ref], binary)
+    : { pulled: false, why: null };
+  if (pull.pulled) return ref;
+  try {
+    await buildImageWithTags(
     lazyRoot,
     [ref],
     identity,
     binary,
     options.noCache ?? false,
     options.signal,
-    undefined,
     options.timeoutMs ?? 0,
     options.reason ?? '`lazy upgrade` refreshing the image',
-  );
+    );
+  } catch (err) {
+    throw withPullReason(err, pull);
+  }
   return ref;
+}
+
+/**
+ * Build a Dockerfile that is NOT (yet) the project's — a candidate a person
+ * has asked about — from a lazy-owned snapshot with an explicit build context.
+ * One caller today:
+ *
+ * - a ref ADOPTION (src/daemon/image-adoption.ts) builds under the canonical
+ *   `lazy-custom-<hash>` tag the project will resolve once the adoption is
+ *   recorded, with the identity labels `ensureImage` checks, so the image is
+ *   current the moment it becomes the project's;
+ * - (the TRY-BUILD tool deliberately does NOT use this: it must never touch
+ *   the daemon's default builder or its cache — src/daemon/image-try-build.ts.)
+ *
+ * Returns the first tag and the build's combined output.
+ */
+export async function buildDockerfileCandidate(
+  lazyRoot: string,
+  options: {
+    dockerfilePath: string;
+    contextDir: string;
+    source: string;
+    binary?: string;
+    tags?: string[];
+    timeoutMs?: number;
+    notify?: PhaseNotify;
+    /** Prove the image can run lazy's agent before reporting success (adoption). */
+    selfcheck?: boolean;
+  },
+): Promise<{ imageName: string; output: string }> {
+  const binary = options.binary ?? 'docker';
+  await checkDocker(binary);
+  const content = await readFile(options.dockerfilePath, 'utf-8');
+  const repository = `lazy-custom-${createHash('sha256').update(content).digest('hex').substring(0, 12)}`;
+  const tags = options.tags ?? buildTagsFor(repository);
+  const manifest = await manifestForDockerfileContent(lazyRoot, content);
+  const identity: ImageIdentity = { hash: hashManifest(manifest), manifest };
+  const baseUsage = analyzeLazyBaseUsage(content, IMAGE_NAME, buildTagsFor(IMAGE_NAME));
+  await ensureLazyBaseImage(lazyRoot, baseUsage, options.source, binary, options.timeoutMs ?? 0, options.notify);
+  const snap = await writeDockerfileToTempDir(content);
+  return imageBuildMutex.withLock(tags[0], async () => {
+    const { output } = await runDockerBuild({
+      buildCwd: options.contextDir,
+      dockerfilePath: snap.dockerfilePath,
+      tags,
+      identity,
+      binary,
+      noCache: false,
+      source: options.source,
+      projectDockerfile: true,
+      timeoutMs: options.timeoutMs ?? 0,
+      notify: options.notify,
+    });
+    if (options.selfcheck) {
+      const binDir = join(getHome(), '.lazy', 'bin');
+      const agentBinaryPath = (await resolveInstalledAgentBinary(binDir)) ?? agentBinaryPointerPath(binDir);
+      await assertAgentBinarySelfcheckForImage(tags[0], agentBinaryPath, binary);
+    }
+    return { imageName: tags[0], output };
+  });
+}
+
+/**
+ * The lazy base images (`FROM lazy-runner…`) a Dockerfile builds from, made
+ * present in the local image store first — lazy's own images, built by lazy.
+ * Returns the refs, so an ISOLATED builder (the try-build's, which cannot see
+ * the local image store) can be handed them as named build contexts.
+ */
+export async function prepareLazyBaseRefs(
+  lazyRoot: string,
+  content: string,
+  source: string,
+  binary: string,
+  notify?: PhaseNotify,
+): Promise<{ buildable: string[]; unbuildable: string[] }> {
+  const usage = analyzeLazyBaseUsage(content, IMAGE_NAME, buildTagsFor(IMAGE_NAME));
+  await ensureLazyBaseImage(lazyRoot, usage, source, binary, 0, notify);
+  return { buildable: usage.buildable, unbuildable: usage.unbuildable };
 }
 
 /** Point additional refs at an existing image. Fails hard — no silent skip. */
@@ -1484,18 +2084,18 @@ export async function buildLazyRunnerImage(options: { binary?: string; noCache?:
 
   await checkDocker(binary);
 
-  const tags = buildTagsFor(IMAGE_NAME);
+  const tags = localBuildTagsFor(IMAGE_NAME);
 
   // The BASE image bypasses lazy.toml entirely (that is this function's whole
   // point), so its identity is the embedded Dockerfile alone — never the
   // project's `build_inputs`, which belong to the custom image layered on top.
-  const manifest: ImageInputManifest = { [DOCKERFILE_INPUT_KEY]: shortHash(DEFAULT_DOCKERFILE) };
   const { buildCwd, dockerfilePath } = await writeDockerfileToTempDir(DEFAULT_DOCKERFILE);
   await runDockerBuild({
     buildCwd,
     dockerfilePath,
     tags,
-    identity: { hash: hashManifest(manifest), manifest },
+    identity: defaultRunnerIdentity(),
+    labels: LOCAL_BASE_LABELS,
     binary,
     noCache,
     source: 'the embedded default Dockerfile',
@@ -1517,13 +2117,23 @@ export async function buildLazyRunnerImage(options: { binary?: string; noCache?:
  */
 export async function ensureImage(
   binary: string = 'docker',
-  options?: {
+  options?: EnsureImageOptions,
+): Promise<string> {
+  // ONE resolution per launch: the identity hash and the build below both ask
+  // resolveCustomDockerfile, and without the pin an accept landing between the
+  // two could tag one committed version's hash on an image built from another.
+  if (dockerfilePin.getStore()) return ensureImageResolved(binary, options);
+  return dockerfilePin.run({ resolved: null }, () => ensureImageResolved(binary, options));
+}
+
+type EnsureImageOptions = {
     noCache?: boolean;
-    agentId?: string;
     timeoutMs?: number;
     /**
      * Task-pinned image (metadata.custom_image). When set, use it if present
      * locally; if missing, FAIL LOUDLY — never fall back to root or adoption.
+     * `DEFAULT_RUNNER_IMAGE_PIN` (a person's recorded default-image choice)
+     * sits at this same level: lazy's default image, ahead of any adoption.
      * Resolution order: (1) this pin, (2) daemon-adopted imageName soft-pin
      * on launches, (3) root [docker].dockerfile (or adopted path during an
      * explicit upgrade build with the upgrade-build latch on).
@@ -1535,14 +2145,37 @@ export async function ensureImage(
      * went to the daemon log, where the human waiting on the CLI never saw it.
      */
     notify?: PhaseNotify;
-  },
-): Promise<string> {
+    /**
+     * Run on lazy's DEFAULT runner image even though the project configures a
+     * custom one. Only ever set from an explicit, recorded choice (a person
+     * confirmed it for a task, or a builder started while the custom image was
+     * not ready and says so in a banner) — never as a silent fallback.
+     */
+    useDefaultImage?: boolean;
+    /**
+     * The daemon's own boot build of the custom image. Every other caller in
+     * the daemon goes through the custom-image gate.
+     */
+    bypassGate?: boolean;
+    /**
+     * Build even when the image is up to date — a project admin's explicit
+     * Rebuild (src/daemon/runner-image.ts). Only ever with `bypassGate`, or with
+     * `useDefaultImage` for a Rebuild of lazy's default image.
+     */
+    rebuild?: boolean;
+};
+
+async function ensureImageResolved(binary: string, options?: EnsureImageOptions): Promise<string> {
   const notify = options?.notify;
   notify?.('resolving container image');
   await checkDocker(binary);
 
-  // Resolution order: task pin → daemon adoption soft-pin (launches) → root.
-  // A missing pin must not silently degrade mid-task.
+  // Resolution order: task pin (a consented custom_image, or the person's
+  // recorded default-image choice) → daemon adoption soft-pin (launches) →
+  // root. A missing pin must not silently degrade mid-task.
+  if (options?.pinnedImage === DEFAULT_RUNNER_IMAGE_PIN || options?.pinnedImage === READONLY_DEFAULT_RUNNER_IMAGE_PIN) {
+    return ensureImage(binary, { ...options, pinnedImage: undefined, useDefaultImage: true });
+  }
   if (options?.pinnedImage) {
     if (await imageExists(options.pinnedImage, binary)) {
       logger.debug(`Using task-pinned container image ${options.pinnedImage}`);
@@ -1561,10 +2194,15 @@ export async function ensureImage(
   // or a post-consent agent edit of the worktree Dockerfile would become host
   // docker build steps. Upgrade builds leave the latch ON and fall through
   // to resolveCustomDockerfile, which may return the adopted path.
-  if (!upgradeImageBuildEnabled) {
+  // A person's explicit choice of lazy's DEFAULT image (the default-image pin)
+  // is not overridden by an adoption either: it means the default image.
+  if (!upgradeImageBuildEnabled && !options?.useDefaultImage) {
     const { loadValidAdoptedImage, missingAdoptedImageMessage } = await import('../daemon/adopted-image');
     const adopted = await loadValidAdoptedImage(lazyRoot);
-    if (adopted) {
+    // A ref adoption is not soft-pinned: it resolves as the project's custom
+    // Dockerfile (resolveCustomDockerfile) and goes through the boot build's
+    // gate below exactly like the root file.
+    if (adopted && adopted.source?.kind !== 'ref') {
       if (await imageExists(adopted.imageName, binary)) {
         logger.debug(`Using daemon-adopted container image ${adopted.imageName}`);
         notify?.(`using adopted image ${adopted.imageName}`);
@@ -1574,8 +2212,59 @@ export async function ensureImage(
     }
   }
 
-  const { repository } = await resolveImageRepository(lazyRoot, options?.agentId);
+  const useDefault = options?.useDefaultImage ?? false;
+  let resolvedRepository: { repository: string; isCustom: boolean };
+  try {
+    resolvedRepository = await resolveImageRepository(lazyRoot, useDefault);
+  } catch (err) {
+    // An adoption whose context cannot be rebuilt (its commit is gone) is the
+    // project's image NOT BEING READY — inside the daemon that is the refusal
+    // the launching surfaces turn into "run on the default image, or wait?",
+    // exactly like a failed build, never a hard launch failure.
+    const { RefAdoptionUnavailableError } = await import('../daemon/image-adoption');
+    if (err instanceof RefAdoptionUnavailableError && !options?.bypassGate && customImageGate()) {
+      throw new RunnerImageNotReadyError(err.message);
+    }
+    throw err;
+  }
+  const { repository, isCustom } = resolvedRepository;
   const imageName = `${repository}:${IMAGE_TAG}`;
+  // A root Dockerfile.lazy the convention skipped is never silent: whoever is
+  // watching this launch (a Teams page, a terminal) is told why the base image
+  // is used instead. `lazy doctor` names the same states with their remedy.
+  if (!isCustom && !useDefault) {
+    const skipped = await describeSkippedRootDockerfile(lazyRoot);
+    if (skipped) {
+      logger.warn(skipped);
+      notify?.(skipped);
+    }
+  }
+
+  // Inside the daemon, the custom image belongs to the daemon's boot build
+  // (src/daemon/runner-image.ts): a launch never inspects-and-builds it itself,
+  // so it can never start a build behind the user's back while that one runs
+  // or after it failed. Ready means use it; anything else is a refusal the
+  // launching surface turns into "run on the default image, or wait?".
+  const gate = isCustom && !options?.bypassGate ? customImageGate() : null;
+  if (gate) {
+    const verdict = gate.check(imageName);
+    if (!verdict.ready) throw new RunnerImageNotReadyError(verdict.message);
+    if (await imageExists(imageName, binary)) {
+      // Same name, different inputs: a `build_inputs` file (a lockfile) changed.
+      // The daemon rebuilds it in the background; this launch keeps the
+      // current image, as it would during any in-place refresh.
+      const builtFrom = await getImageDockerfileHash(imageName, binary);
+      if (builtFrom !== null && builtFrom !== (await resolveImageIdentity(lazyRoot)).hash) {
+        gate.stale(imageName);
+        notify?.(`image ${imageName} is ready; its inputs changed, so the daemon is rebuilding it in the background`);
+      } else {
+        notify?.(`image ${imageName} is ready`);
+      }
+      return imageName;
+    }
+    gate.invalidate(imageName);
+    throw new RunnerImageNotReadyError(gate.check(imageName).message);
+  }
 
   // Everything from here on is inspect-then-build, which is a race: without the
   // lock, a fan-out of task starts after a lockfile bump has every one of them
@@ -1603,11 +2292,35 @@ export async function ensureImage(
   try {
     return await imageBuildMutex.withLock(imageName, () => {
       stopWaiting();
-      return ensureImageLocked(lazyRoot, repository, imageName, binary, options?.noCache ?? false, options?.agentId, options?.timeoutMs ?? 0, notify);
+      return ensureImageLocked(lazyRoot, repository, imageName, binary, options?.noCache ?? false, options?.timeoutMs ?? 0, notify, useDefault, options?.rebuild ?? false);
     });
   } finally {
     stopWaiting();
   }
+}
+
+/**
+ * Failure memory for builds a launch starts itself (the default image, or any
+ * image outside the daemon's custom-image gate). Without it every task start
+ * re-ran a build that had just failed — and a build that fails by exhausting
+ * the guest dockerd's memory takes the machine with it each time. Process-local
+ * on purpose: a restart is covered by the daemon's own attempt record for the
+ * project image. An explicit rebuild or --no-cache build ignores it.
+ */
+const buildFailures = new Map<string, { failures: number; retryAtMs: number; error: string }>();
+
+class BuildBackoffError extends Error {}
+
+export function buildFailureBackoffMs(failures: number): number {
+  return Math.min(60 * 60 * 1000, 60 * 1000 * 2 ** Math.max(0, failures - 1));
+}
+
+export function forgetBuildFailure(imageName: string): void {
+  for (const key of [...buildFailures.keys()]) if (key.endsWith(`\0${imageName}`)) buildFailures.delete(key);
+}
+
+export function resetBuildFailuresForTests(): void {
+  buildFailures.clear();
 }
 
 async function ensureImageLocked(
@@ -1616,25 +2329,38 @@ async function ensureImageLocked(
   imageName: string,
   binary: string,
   requestedNoCache: boolean,
-  agentId?: string,
   timeoutMs: number = 0,
   notify?: PhaseNotify,
+  forceDefault: boolean = false,
+  rebuild: boolean = false,
 ): Promise<string> {
-  // The agent decides which CLI the Dockerfile bakes in, so it is part of the
-  // image's identity — the same lock/hash/build path serves the base image and
-  // an agent-suffixed one (cursor-first-class-agent).
-  const identity = await resolveImageIdentity(lazyRoot, agentId);
+  const identity = await resolveImageIdentity(lazyRoot, forceDefault);
   const currentHash = identity.hash;
   const imageHash = await getImageDockerfileHash(imageName, binary);
   let noCache = requestedNoCache;
   // Handed to the build so its single announcement says WHY it is running.
   let reason: string;
 
-  if (imageHash === currentHash) {
+  if (imageHash === currentHash && rebuild) {
+    // Somebody asked for this build (a project admin's Rebuild): up to date or
+    // not, it runs. Docker moves the tag only when it succeeds, so the
+    // current image stays usable the whole time.
+    reason = requestedNoCache ? 'rebuild requested, without the build cache' : 'rebuild requested';
+    notify?.(`rebuilding ${imageName} — ${reason}`);
+  } else if (imageHash === currentHash) {
     // The Dockerfile text matches — but its text is not what goes stale. What
     // it PULLS is unpinned (apt packages, the Claude Code installer, the base
     // image, and whatever else a project's own Dockerfile fetches), and that
     // drifts with wall-clock time, so an old-enough image is rebuilt regardless.
+    //
+    // Except a PUBLISHED image: it pins its agent CLIs to its release, and newer
+    // ones come by upgrading lazy (engineer decision 2026-09-27,
+    // docs/design/published-runner-image.md §5). Age never rebuilds it.
+    if (repository === IMAGE_NAME && (await isPublishedImage(imageName, binary))) {
+      logger.debug('Container image is the published one for this release ✓');
+      notify?.(`image ${imageName} is up to date`);
+      return imageName;
+    }
     const { tooOld, ageDays } = await isImageTooOld(imageName, binary);
     if (!tooOld) {
       logger.debug('Container image is up to date ✓');
@@ -1677,17 +2403,47 @@ async function ensureImageLocked(
     notify?.(`rebuilding ${imageName} — ${reason}`);
   }
 
+  // Missing, mismatched or aged-out LOCAL default runner: pull the release's
+  // image first. The age path included: a host that first launched offline, or
+  // whose runner was published after it built, switches to the published image
+  // instead of rebuilding every 14 days. Only an explicit --no-cache from the
+  // caller skips the pull — that is an ask for a local rebuild.
+  let pull: RunnerPullOutcome = { pulled: false, why: null };
+  if (repository === IMAGE_NAME && !requestedNoCache) {
+    pull = await pullPublishedRunner(lazyRoot, identity, buildTagsFor(repository), binary, notify);
+    if (pull.pulled) return imageName;
+  }
+
+  const explicitBuild = rebuild || requestedNoCache;
+  const failureKey = `${binary}\0${imageName}`;
+  const remembered = buildFailures.get(failureKey);
+  const inBackoff = !explicitBuild && remembered && Date.now() < remembered.retryAtMs;
+
   try {
+    if (inBackoff) throw new BuildBackoffError(
+      `Not rebuilding ${imageName}: the last ${remembered.failures} attempt(s) failed, so no new attempt starts before ` +
+      `${new Date(remembered.retryAtMs).toISOString()}. Last error: ${remembered.error}`,
+    );
     // No timeout unless the caller passed one. The implicit path — a task
     // starting when the image hash has changed — always passes nothing, so a
     // build nobody is watching can never be killed on a timer.
-    await buildImage(lazyRoot, repository, identity, binary, noCache, agentId, timeoutMs, reason, notify);
+    await buildImage(lazyRoot, repository, identity, binary, noCache, timeoutMs, reason, notify, forceDefault);
+    buildFailures.delete(failureKey);
     return imageName;
   } catch (buildErr) {
+    // A refusal by the memory is not a new failure: it must not extend the backoff.
+    if (!(buildErr instanceof BuildBackoffError)) {
+    const failures = (buildFailures.get(failureKey)?.failures ?? 0) + 1;
+    buildFailures.set(failureKey, {
+      failures,
+      retryAtMs: Date.now() + buildFailureBackoffMs(failures),
+      error: buildErr instanceof Error ? buildErr.message : String(buildErr),
+    });
+    }
     // If not offline, just propagate the build error
     const buildConfig = await loadConfig(lazyRoot);
     if (!(await isOfflineMode(join(lazyRoot, '.lazy'), buildConfig.remote.offline))) {
-      throw buildErr;
+      throw withPullReason(buildErr, pull);
     }
 
     // Offline mode: try to fall back to an existing image
@@ -2268,8 +3024,10 @@ export async function getLaunchAuthEnvVars(
   // own credential (nothing injected): a builder session, a review-conversation
   // builder, a one-shot. The daemon may be running with no credential at all,
   // so this is where such a launch loads one stored since startup — or is
-  // refused naming its profile. See src/daemon/credential-gate.ts.
-  if (!injectedCreds?.length && !usesSyntheticCreds(resolved) && hasDaemonContext()) {
+  // refused naming its profile. See src/daemon/credential-gate.ts. Asked even
+  // when the target itself takes no credential: on a TIERED profile that is
+  // only tier 0, and the gate checks every tier (a `none` slot answers null).
+  if (!injectedCreds?.length && hasDaemonContext()) {
     const refusal = await targetCredentialRefusal(getLazyRoot(), resolved);
     if (refusal) throw new RpcError(400, refusal);
   }
@@ -2288,6 +3046,16 @@ export async function getLaunchAuthEnvVars(
   // profile. Another harness (codex, cursor) gets no Anthropic credential at
   // all — nothing in its turn uses one (see teamModeLaunchCreds).
   const teamMode = !!injectedCreds?.some((v) => isSessionPlaceholderToken(v.value));
+  // A team-mode launch BESIDE a task (a member's builder, a one-shot) is paid
+  // through the session binding its injected placeholder belongs to: every
+  // grant it mints names that binding, so the proxy bills its owner with their
+  // own credential for the grant's profile — never the project's credentials.
+  // A task's own turn (role `agent`) is found by its task UUID instead.
+  if (teamMode && identity.role !== 'agent' && !identity.bindingKey) {
+    const sessionToken = injectedCreds!.find((v) => isSessionPlaceholderToken(v.value))!.value;
+    const binding = await lookupSessionBinding(identity.projectRoot ?? getLazyRoot(), sessionToken);
+    if (binding) identity = { ...identity, bindingKey: binding.taskId };
+  }
   const real = teamMode
     ? teamModeLaunchCreds(resolved, injectedCreds!)
     : (await resolveProfileLaunchCreds(getLazyRoot(), resolved))
@@ -2306,7 +3074,19 @@ export async function getLaunchAuthEnvVars(
   const usesSessionPlaceholders = real.some((v) => isSessionPlaceholderToken(v.value));
   const creds = usesSessionPlaceholders
     ? real
-    : await placeholderizeAuthEnv(getLazyRoot(), real, identity);
+    : await placeholderizeAuthEnv(identity.projectRoot ?? getLazyRoot(), real, identity);
+  // A key-capable harness (codex, cursor) launched beside a task in team mode
+  // carries its OWN key's placeholder, bound like the rest to the member who
+  // pays — the Anthropic session placeholder means nothing to it.
+  const agentKeyEnv = AGENT_KEY_ENV[resolved.harness];
+  if (teamMode && identity.bindingKey && agentKeyEnv && agentSupportsApiKey(resolved.harness)
+      && resolved.credential !== NO_CREDENTIAL) {
+    const { projectRoot, ...grantIdentity } = identity;
+    creds.push({
+      key: agentKeyEnv,
+      value: await mintCredentialGrant(projectRoot ?? getLazyRoot(), { ...grantIdentity, envKey: agentKeyEnv }),
+    });
+  }
   return targetEnvVars(resolved, creds, surface, hints);
 }
 
@@ -2321,7 +3101,7 @@ export async function getLaunchAuthEnvVars(
  */
 export function buildDockerArgs(
   sandbox: SandboxConfig,
-  claudeArgs: string[],
+  claudeArgs: AgentExecArgs,
   agentBinaryPath: string,
   imageName: string,
   binary: string = 'docker',
@@ -2331,11 +3111,15 @@ export function buildDockerArgs(
 ): string[] {
   return [
     binary, 'run', '--rm', '--init',
+    // Keep stdin open when the agent reads its prompt from it.
+    ...(claudeArgs.stdinInput === undefined ? [] : ['-i']),
     // Allow container to reach host services (daemon MCP, Ollama, etc.)
     '--add-host=host.docker.internal:host-gateway',
     // Mount repo read-only so agent can read source but not modify the main tree.
     // The worktree is mounted read-write on top (more specific mount wins).
     '-v', `${repoRoot}:${repoRoot}:ro`,
+    // Hide .lazy/ (builder config, audit log, sibling worktrees) — see src/capture/lazy-dir-mask.ts.
+    ...lazyDataDirMaskArgs(dataDirOfWorktree(repoRoot, sandbox.worktreePath)),
     '-v', `${sandbox.worktreePath}:${sandbox.worktreePath}`,
     // Split .git mount: common dir read-only, only objects + this worktree's
     // gitdir writable. See src/capture/git-mounts.ts.
@@ -2372,13 +3156,14 @@ export async function runClaude(
   // model chain names Anthropic models it has never heard of.
   const effectiveModel = model || (target?.pinned ? target.model : '') || undefined;
 
-  const claudeArgs = [
-    'claude', '-p', safeArgvPrompt(prompt, 'prompt'),
+  // The prompt rides stdin, never argv (src/agent/argv-safety.ts).
+  const claudeArgs: AgentExecArgs = Object.assign([
+    'claude', '-p',
     '--output-format', 'json',
     '--dangerously-skip-permissions',
     // Always: see requireLaunchModel (src/agent/launch-model.ts).
     '--model', requireLaunchModel('claude-code', effectiveModel),
-  ];
+  ], { stdinInput: prompt });
 
   if (effort) {
     claudeArgs.push('--effort', effort);
@@ -2411,7 +3196,9 @@ export async function runClaude(
 
   logger.info('Running Claude Code...');
 
+  assertArgvBounded(args, 'Claude Code');
   const proc = spawn(args, {
+    stdin: new Blob([prompt]),
     stdout: 'pipe',
     stderr: verbose || debug ? 'inherit' : 'pipe',
   });
@@ -2899,6 +3686,8 @@ export function buildSupervisorDockerArgs(params: SupervisorDockerArgsParams): s
     '--add-host=host.docker.internal:host-gateway',
     // Mount repo read-only; worktree and protocol dir are mounted read-write on top.
     '-v', `${repoRoot}:${repoRoot}:ro`,
+    // Hide .lazy/ (builder config, audit log, sibling worktrees) — see src/capture/lazy-dir-mask.ts.
+    ...lazyDataDirMaskArgs(dataDirOfWorktree(repoRoot, sandbox.worktreePath)),
     '-v', `${sandbox.worktreePath}:${sandbox.worktreePath}`,
     // Split .git mount: the shared git dir (refs, packed-refs, config, hooks,
     // sibling worktree gitdirs) is read-only; only objects and this worktree's
@@ -3070,8 +3859,8 @@ function missingAgentBinaryMessage(ctx: AgentBinaryProbeContext): string {
 /**
  * Verify a non-claude agent's binary exists in the image that is about to run.
  *
- * Only applies when the project uses a CUSTOM Dockerfile: the default image is
- * agent-aware (getDockerfileContent appends the install command), but custom
+ * Only applies when the project uses a CUSTOM Dockerfile: the default image
+ * carries every agent CLI (src/docker/runner-dockerfile.ts), but custom
  * Dockerfiles are deliberately never amended, so the human must add the
  * install line themselves — and the failure mode without this check is a
  * supervisor whose work phase can never succeed. The probe is a throwaway
@@ -3088,13 +3877,13 @@ export async function preflightAgentBinaryInImage(
 ): Promise<void> {
   if (!agentId) return;
   const lazyRoot = getLazyRoot();
-  if (!(await resolveCustomDockerfile(lazyRoot))) return; // default image is agent-aware
+  if (!(await resolveCustomDockerfile(lazyRoot))) return; // the default image carries every agent CLI
 
   // `agentId` names a PROFILE; the binary that has to exist in the image is its
   // HARNESS. Resolved after the check above so the default-image path — every
   // project that has not written its own Dockerfile — still costs no config
-  // read. Lenient for the same reason resolveImageAgent is; an unregistered
-  // name still reaches getAgentPackaging and throws there, as before.
+  // read. Lenient (an unset profile falls back to the name itself) so an
+  // unregistered name still reaches getAgentPackaging and throws there.
   const config = await loadConfig(lazyRoot);
   const harness = harnessForAgentName(config, agentId) ?? agentId;
   if (harness === 'claude-code') return;
@@ -3105,7 +3894,7 @@ export async function preflightAgentBinaryInImage(
     imageName,
     agentId: harness,
     agentBinary,
-    dockerfileRelativePath: config.docker.dockerfile,
+    dockerfileRelativePath: config.docker.dockerfile || CONVENTIONAL_DOCKERFILE,
     installCommand: pkg.dockerInstallCommand(),
   };
 
@@ -3131,10 +3920,76 @@ export async function preflightAgentBinaryInImage(
   if (classification.kind === 'missing-binary') {
     throw new Error(missingAgentBinaryMessage(probeCtx));
   }
+  // The probe is the first container made from the image, so a torn layer
+  // surfaces here before the launch itself: typed, so the launch repairs it.
+  if (isDamagedLayerError(stderr)) throw new DamagedImageError(imageName, classification.message);
   throw new Error(classification.message);
 }
 
+/**
+ * Which `ensureImage` call rebuilds `imageName`, or null when lazy must not
+ * rebuild it by itself: lazy's DEFAULT image, or the project's OWN image (the
+ * root Dockerfile or a ref adoption — the daemon's boot build owns it, hence
+ * `bypassGate`, exactly as an admin's Rebuild runs it). A task-pinned image or
+ * a worktree adoption's soft-pinned image is a person's choice: never rebuilt
+ * from a launch (see AGENTS.md, "Task worktrees never auto-govern container
+ * images").
+ */
+async function runnerImageRebuildOptions(imageName: string): Promise<EnsureImageOptions | null> {
+  const lazyRoot = getLazyRoot();
+  const defaultRepo = await resolveImageRepository(lazyRoot, true);
+  if (imageName === `${defaultRepo.repository}:${IMAGE_TAG}`) return { useDefaultImage: true };
+  const { loadValidAdoptedImage } = await import('../daemon/adopted-image');
+  const adopted = await loadValidAdoptedImage(lazyRoot);
+  if (adopted && adopted.source?.kind !== 'ref' && adopted.imageName === imageName) return null;
+  const project = await resolveImageRepository(lazyRoot);
+  if (project.isCustom && imageName === `${project.repository}:${IMAGE_TAG}`) return { bypassGate: true };
+  return null;
+}
+
+/**
+ * The docker and build steps of a damaged-image repair (src/docker/damaged-image.ts):
+ * a forced rebuild without the cache — the same build an admin's Rebuild runs,
+ * so neither the build cache nor the published image can hand back the torn
+ * layer. Inside the daemon the image's own build does it (the gate's
+ * `repair`: visible on the build page, cancellable, tracked state kept true);
+ * only outside the daemon does the launch build inline.
+ */
+export function runnerImageRepairDeps(binary: string): DamagedImageRepairDeps {
+  return {
+    binary,
+    canRebuild: async (imageName) => (await runnerImageRebuildOptions(imageName)) !== null,
+    rebuild: async (imageName) => {
+      const options = await runnerImageRebuildOptions(imageName);
+      if (!options) throw new Error(`${imageName} is not an image lazy rebuilds by itself`);
+      const gate = customImageGate();
+      if (gate?.repair) return gate.repair(imageName);
+      return ensureImage(binary, { ...options, rebuild: true, noCache: true });
+    },
+    collectEvidence: async (imageName, dockerMessage) => {
+      const { collectDamagedImageEvidence } = await import('../docker/damaged-image-evidence');
+      return collectDamagedImageEvidence({ binary, imageName, dockerMessage });
+    },
+  };
+}
+
+/**
+ * Launch a task's supervisor container. A launch that fails because the
+ * runner image's layers cannot be extracted (a damaged image store) removes
+ * that image, rebuilds it and is retried once, narrated through `notify` —
+ * see src/docker/damaged-image.ts.
+ */
 export async function launchSupervisorAsync(
+  ...args: Parameters<typeof launchSupervisorOnce>
+): Promise<void> {
+  const binary = args[4] ?? 'docker';
+  return withDamagedImageRepair(
+    { ...runnerImageRepairDeps(binary), subject: 'task', ...(args[7] ? { taskId: args[7] } : {}), ...(args[11] ? { notify: args[11] } : {}) },
+    () => launchSupervisorOnce(...args),
+  );
+}
+
+async function launchSupervisorOnce(
   sandbox: SandboxConfig,
   containerName: string,
   protocolDir: string,
@@ -3165,7 +4020,7 @@ export async function launchSupervisorAsync(
   // a task branch that edits Dockerfile.lazy must never auto-govern the image.
   // Human-consented pins arrive as pinnedImage from task metadata only.
   const [imageName, agentBinaryPath] = await Promise.all([
-    ensureImage(binary, { agentId, pinnedImage, notify }),
+    ensureImage(binary, { pinnedImage, notify }),
     ensureAgentBinary(),
   ]);
   notify?.(`image ${imageName} ready — starting container ${containerName}`);
@@ -3320,7 +4175,7 @@ export async function launchSupervisorAsync(
       // second means the
       // grant registry or the proxy wiring is faulty, and letting that log at
       // debug as a missing credential is how a broken security path stays
-      // invisible (CLAUDE.md: distinguish not-found from found-but-broken).
+      // invisible (AGENTS.md: distinguish not-found from found-but-broken).
       const message = err instanceof Error ? err.message : String(err);
       const merelyAbsent = /no .*credential|not authenticated|setup-token|ANTHROPIC_API_KEY/i.test(message);
       if (merelyAbsent) {
@@ -3471,6 +4326,11 @@ export async function launchSupervisorAsync(
   // signal exit code: on deadline we kill the process, which closes its streams
   // and lets the reads below resolve.
   //
+  // This launch's grants are reused from earlier turns, pinned to an earlier
+  // container's address. Unpin them before the new container exists, or its
+  // first request would be refused; they are pinned to it once it is up.
+  await pinGrantsToAddresses(getLazyRoot(), containerName, null);
+
   // The task env file exists only for the life of `docker run`: written here,
   // removed in the finally below (docker has read it by the time run exits).
   await taskEnvLaunch.write();
@@ -3519,8 +4379,96 @@ export async function launchSupervisorAsync(
   if (exitCode !== 0) {
     const errText = stderr.trim();
     logger.error(`Failed to launch supervisor container: ${errText}`);
+    if (isDamagedLayerError(errText)) throw new DamagedImageError(imageName, `Failed to launch supervisor container: ${errText}`);
     throw new Error(`Failed to launch supervisor container: ${errText}`);
   }
 
   logger.debug(`Supervisor container ${containerName} launched`);
+
+  await pinLaunchGrantsToContainer(binary, containerName, sessionCredential && taskUuid ? taskUuid : undefined);
+
+  // Recorded once the container is actually up, so every surface DERIVES which
+  // image a task runs on (the default-image banner and its "restart with the
+  // project's image" action) rather than guessing. Best-effort: the turn is
+  // already running, and a lost record only costs the banner its accuracy.
+  await recordLaunchImage(
+    taskId, imageName,
+    pinnedImage === DEFAULT_RUNNER_IMAGE_PIN ? 'default'
+      : pinnedImage === READONLY_DEFAULT_RUNNER_IMAGE_PIN ? 'readonly-default'
+      : pinnedImage ? 'pinned' : 'project',
+    containerName,
+  ).catch((err: unknown) => {
+    logger.warn(`Could not record which image ${containerName} runs on (${imageName}): ${err instanceof Error ? err.message : String(err)}`);
+  });
+}
+
+/**
+ * Pin the launch's credential grants to the container's own addresses, so a
+ * placeholder that leaks out of it cannot be spent from a sibling container
+ * (src/proxy/credential-broker.ts, grantAcceptsPeer).
+ *
+ * Linux docker only, exactly like member terminals' pins
+ * (src/daemon/member-container.ts): there the proxy sees each container's own
+ * bridge address — decided by {@link containerGatewayIsLocal}, since Docker
+ * Desktop (any OS), rootless runtimes and a remote DOCKER_HOST present every
+ * container from one other address, where a pin would refuse the container's
+ * own traffic. Best-effort: the turn is already
+ * running, and an unpinned grant is what every launch had before — so a
+ * failed read is a warning, never a failed launch.
+ */
+async function containerGatewayIsLocal(binary: string, containerName: string): Promise<boolean> {
+  const proc = spawn(
+    [binary, 'inspect', '--format', '{{range .NetworkSettings.Networks}}{{.Gateway}} {{end}}', containerName],
+    { stdout: 'pipe', stderr: 'pipe', timeout: 30_000 },
+  );
+  const [stdout, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+  if (code !== 0) return false;
+  const gateways = stdout.split(/\s+/).filter(Boolean);
+  if (gateways.length === 0) return false;
+  const local = new Set(Object.values(networkInterfaces()).flatMap(list => (list ?? []).map(i => i.address)));
+  return gateways.every(g => local.has(g));
+}
+
+async function pinLaunchGrantsToContainer(
+  binary: string,
+  containerName: string,
+  /** Team mode: the task whose turn-session placeholder this container holds. */
+  sessionBindingTaskId?: string,
+): Promise<void> {
+  if (process.platform !== 'linux' || binary !== 'docker') return;
+  try {
+    // Only where the proxy really sees the container's own address: the
+    // container's network gateway must be an address of THIS host. That holds
+    // for native rootful dockerd and is false for Docker Desktop for Linux (a
+    // VM), rootless Docker (traffic leaves from the host's address) and a
+    // remote DOCKER_HOST — where a pin would refuse every request of the turn.
+    if (!(await containerGatewayIsLocal(binary, containerName))) {
+      logger.debug(`${containerName}: the container's gateway is not on this host; its proxy credential is not pinned.`);
+      return;
+    }
+    const proc = spawn(
+      [binary, 'inspect', '--format', '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}', containerName],
+      { stdout: 'pipe', stderr: 'pipe', timeout: 30_000 },
+    );
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
+    ]);
+    if (code !== 0) throw new Error(stderr.trim() || `${binary} inspect exited ${code}`);
+    const addresses = stdout.split(/\s+/).filter(Boolean);
+    if (addresses.length === 0) {
+      logger.warn(`${containerName} has no network address (host networking?); its proxy credential is not pinned to it.`);
+      return;
+    }
+    await pinGrantsToAddresses(getLazyRoot(), containerName, addresses);
+    // The team-mode turn placeholder pins the same way member terminals' do —
+    // to ONE address, which a container on a single network has.
+    if (sessionBindingTaskId && addresses.length === 1) {
+      await setSessionBindingOrigin(getLazyRoot(), sessionBindingTaskId, addresses[0]!);
+    }
+  } catch (err) {
+    logger.warn(
+      `Could not pin ${containerName}'s proxy credential to its address: ` +
+      `${err instanceof Error ? err.message : String(err)}. It is accepted from any address this turn.`,
+    );
+  }
 }

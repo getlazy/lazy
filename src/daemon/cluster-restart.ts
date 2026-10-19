@@ -2,7 +2,7 @@
  * Restart a quiescent `cluster` task when a child is added to it.
  *
  * THE EXCEPTION, STATED PLAINLY. "A lazy comment never starts a turn"
- * (CLAUDE.md) still holds — nothing here reads comments, and no comment
+ * (AGENTS.md) still holds — nothing here reads comments, and no comment
  * surface emits anything. What starts the turn is a change in the TREE: a task
  * whose parent is a blocked cluster appeared, and the cluster is the thing whose
  * only job is to run its children. A cluster that sat blocked until a human
@@ -95,6 +95,7 @@ import type { Storage } from '../storage';
 import type { Task, Turn } from '../types';
 import { isClusterTask, isTerminalStatus } from '../types';
 import { displayId, shortId } from '../task/identity';
+import { createdByOwnAgent } from '../task/created-by-own-agent';
 import { quotedOneLine } from '../task/notify-parent-children';
 import { isUserStopped } from '../task/user-stop';
 import { logger } from '../utils/logger';
@@ -153,6 +154,8 @@ async function markClusterChildrenSeen(
  * finished with a task it never ran.
  */
 function startsADriverTurn(turn: Turn): boolean {
+  // A refused unblock's saved words launched nothing, so they never start a turn.
+  if (turn.feedback_withheld === true) return false;
   return !turn.turn_type || turn.turn_type === 'work';
 }
 
@@ -188,36 +191,6 @@ async function turnStartFloor(storage: Storage, cluster: Task): Promise<number> 
       .reduce((max, t) => Math.max(max, t.timestamp), session.started_at);
   }
   return lastTurnAt === 0 ? cluster.created_at : lastTurnAt;
-}
-
-/**
- * Was this child created by the cluster's own agent?
- *
- * The creating actor is the actor on the task's first status-changelog entry.
- * An `agent` actor under a cluster parent can only be the driver itself:
- * `lazy_create` refuses to create anywhere but under the caller's own task.
- *
- * Read only for children that already passed the timestamp filter, so the usual
- * cost of this check per tick is zero reads.
- */
-async function createdByOwnAgent(storage: Storage, child: Task): Promise<boolean> {
-  try {
-    const history = await storage.getStatusHistory(child.id);
-    const first = history.reduce<{ timestamp: number; actor?: string } | null>(
-      (oldest, entry) => (!oldest || entry.timestamp < oldest.timestamp ? entry : oldest),
-      null,
-    );
-    return first?.actor === 'agent';
-  } catch (err) {
-    // Unreadable history is not proof of anything. Treat the child as
-    // externally added: a spurious extra turn is a far smaller failure than a
-    // cluster that never hears about a task the human gave it.
-    logger.debug(
-      `cluster-restart: could not read status history for ${shortId(child.id)}: ` +
-        `${err instanceof Error ? err.message : err}`,
-    );
-    return false;
-  }
 }
 
 /**

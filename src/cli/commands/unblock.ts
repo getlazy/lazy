@@ -18,7 +18,7 @@ import { isTerminalStatus } from '../../types';
 import { queryUnblockTask } from '../../daemon/rpc-fallback';
 import { requireActorIdentity } from '../identity-preflight';
 import { requireUsagePauseClear } from '../usage-pause-preflight';
-import { requireTurnCredential } from '../turn-credential-preflight';
+import { confirmDefaultRunnerImage } from '../runner-image-confirm';
 import { removeRecoveryFile } from '../editor';
 import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 import {
@@ -65,7 +65,8 @@ export async function commandUnblock(args: string[]): Promise<void> {
     { name: 'approve-file', takesValue: true, accumulate: true },
     { name: 'no-approve-files', takesValue: false },
     { name: 'yes', takesValue: false },
-    { name: 'past-usage-pause', takesValue: false },
+    { name: 'override-usage-pause', takesValue: false },
+    { name: 'default-image', takesValue: false },
     ...RAISED_RESOLUTION_FLAGS,
   ], 'unblock');
 
@@ -163,11 +164,18 @@ export async function commandUnblock(args: string[]): Promise<void> {
     // and that must be said before the editor opens, not after.
     // Judged on the agent this unblock will run, which `--agent` may change.
     await requireUsagePauseClear(task.id, 'unblock', agentOverride, {
-      pastUsagePause: parsed.flags.get('past-usage-pause') === true,
+      pastUsagePause: parsed.flags.get('override-usage-pause') === true,
     });
-    // And for the same reason again: a turn on a profile with no model
-    // credential is refused at launch, and the daemon may be running with none.
-    await requireTurnCredential(task.id, { agentId: agentOverride });
+    // Deliberately NO credential pre-flight here: a turn on a profile with no
+    // model credential is refused at launch, but the daemon records the typed
+    // feedback FIRST and says it was saved, so letting the words reach it loses
+    // nothing (AGENTS.md, never lose human feedback).
+    // And once more: while the project's runner image is not ready the launch
+    // needs a decision (default image or wait) — asked before the editor.
+    const useDefaultImage = await confirmDefaultRunnerImage(task.id, {
+      defaultImage: parsed.flags.get('default-image') === true,
+      yes: skipConfirmation,
+    });
 
     // INVARIANT (approval-happens-at-accept — move-file-approval-to-accept):
     // there is no protected-file guard here at all. Unblock is a feedback
@@ -382,8 +390,9 @@ export async function commandUnblock(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    // INTAKE BOUNDARY: feedback becomes argv[2] of `claude -p` at the delivery
-    // seam, where a raw NUL is fatal. Escape non-printable control characters
+    // INTAKE BOUNDARY: feedback becomes the agent's prompt. Prompts now ride
+    // stdin (src/agent/argv-safety.ts), but a raw NUL in argv was once fatal at
+    // the delivery seam, and sanitizing stays as defence in depth. Escape non-printable control characters
     // now — before persistence — so the feedback is delivered rather than
     // crash-looping the turn and being silently dropped by the stale auto-resume.
     // Sanitize-and-deliver, never reject: see src/utils/sanitize-text.ts.
@@ -405,7 +414,8 @@ export async function commandUnblock(args: string[]): Promise<void> {
         effortOverride,
         agentOverride,
         ...(await usagePauseOverrideEligibility()),
-        ...(parsed.flags.get('past-usage-pause') === true ? { usagePausePastOnce: true as const } : {}),
+        ...(parsed.flags.get('override-usage-pause') === true ? { usagePausePastOnce: true as const } : {}),
+        ...(useDefaultImage ? { useDefaultImage: true } : {}),
       }, display);
 
       // Clean up recovery file — feedback is now durably persisted in daemon
@@ -466,7 +476,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
 }
 
 export function unblockUsage(): void {
-  console.log(`Usage: lazy unblock <task_id> [-f <file> | -m|--message <text>] [--model <model>] [--effort <level>] [--agent <profile>] [--respond-raised <id>=<text>...] [--promote-raised-subtask <id>...] [--promote-raised-peer <id>...] [--dismiss-raised <id>=<reason>...] [--acknowledge-raised <id>...] [--past-usage-pause] [--yes] [--follow]
+  console.log(`Usage: lazy unblock <task_id> [-f <file> | -m|--message <text>] [--model <model>] [--effort <level>] [--agent <profile>] [--respond-raised <id>=<text>...] [--promote-raised-subtask <id>...] [--promote-raised-peer <id>...] [--dismiss-raised <id>=<reason>...] [--acknowledge-raised <id>...] [--override-usage-pause] [--default-image] [--yes] [--follow]
 
 Unblock a task by providing feedback, or interactively review and act on it.
 
@@ -492,8 +502,10 @@ Arguments:
 
 Options:
   -f <file>           Read feedback from a file
-  --past-usage-pause   Let this task's next turn start even though its credential is past the
+  --override-usage-pause   Let this task's next turn start even though its credential is past the
                         usage-pause threshold (used up by that one turn)
+  --default-image    While the project's runner image is still building (or failed), run on
+                     lazy's default runner image instead of being asked (--yes does too)
   -m, --message <text>  Provide inline feedback
   --model <model>     Override model for this turn (e.g. opus, sonnet, claude-opus-5-5)
   --effort <level>    Override Claude Code reasoning effort for this turn (low, medium, high, xhigh, max)

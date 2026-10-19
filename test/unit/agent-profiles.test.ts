@@ -198,7 +198,7 @@ describe('built-in profiles', () => {
     expect(resolve({ local: { harness: 'pi', model: 'qwen3.8:latest' } }).warnings).toHaveLength(0);
     // The profile pinned Anthropic itself, so nothing was substituted.
     expect(resolve({
-      'ok-pi': { harness: 'pi', model: 'claude-opus-5', endpoint: 'https://api.anthropic.com' },
+      'ok-pi': { harness: 'pi', model: 'claude-opus-5', endpoint: 'https://api.anthropic.com', credential: 'anthropic' },
     }).warnings).toHaveLength(0);
     // The built-ins never warn about themselves.
     expect(resolve(undefined).warnings).toHaveLength(0);
@@ -211,10 +211,10 @@ describe('built-in profiles', () => {
   // filling pi's Ollama default in there would send that model name to whatever
   // server the user chose, and would silently defeat the refusal below.
   test('a pi profile that pins an endpoint gets no default model, and is refused without one', () => {
-    expect(() => resolve({ 'remote-pi': { harness: 'pi', endpoint: 'http://ollama.lan:11434' } }))
+    expect(() => resolve({ 'remote-pi': { harness: 'pi', endpoint: 'http://ollama.lan:11434', credential: 'anthropic' } }))
       .toThrow(/sets endpoint but no model/);
     const { profiles } = resolve({
-      'anthropic-pi': { harness: 'pi', endpoint: 'https://api.anthropic.com', model: 'claude-opus-5' },
+      'anthropic-pi': { harness: 'pi', endpoint: 'https://api.anthropic.com', credential: 'anthropic', model: 'claude-opus-5' },
     });
     const pi = profiles.get('anthropic-pi')!;
     expect(pi.model).toBe('claude-opus-5');
@@ -309,7 +309,7 @@ describe('wire derivation', () => {
 
   test('a pi profile at OpenRouter resolves the openai wire and the openrouter credential', () => {
     const { profiles } = resolve({
-      'openrouter-pi': { harness: 'pi', model: 'anthropic/claude-sonnet-4.5', endpoint: 'https://openrouter.ai/api' },
+      'openrouter-pi': { harness: 'pi', model: 'anthropic/claude-sonnet-4.5', endpoint: 'https://openrouter.ai/api', credential: 'openrouter' },
     });
     const profile = profiles.get('openrouter-pi')!;
     // The wire the proxy routes by and the credential it bills come from the
@@ -321,7 +321,7 @@ describe('wire derivation', () => {
 
   test('a claude-code profile at OpenRouter keeps its Anthropic-compatible route', () => {
     const { profiles } = resolve({
-      'router-claude': { harness: 'claude-code', model: 'anthropic/claude-sonnet-4.5', endpoint: 'https://openrouter.ai/api' },
+      'router-claude': { harness: 'claude-code', model: 'anthropic/claude-sonnet-4.5', endpoint: 'https://openrouter.ai/api', credential: 'openrouter' },
     });
     expect(profiles.get('router-claude')!.wire).toBe('anthropic');
     expect(profiles.get('router-claude')!.credential).toBe('openrouter');
@@ -336,7 +336,7 @@ describe('wire derivation', () => {
   });
 
   test('a contradicting endpoint fails at config load, naming the profile', () => {
-    expect(() => resolve({ nope: { harness: 'codex', model: 'm', endpoint: 'https://api.anthropic.com' } })).toThrow(
+    expect(() => resolve({ nope: { harness: 'codex', model: 'm', endpoint: 'https://api.anthropic.com', credential: 'openai' } })).toThrow(
       /\[agents\.nope\].*speaks the anthropic API/s,
     );
   });
@@ -347,6 +347,9 @@ describe('credential inference', () => {
     expect(defaultCredentialFor('pi', 'anthropic', 'https://ollama.com')).toBe('ollama');
     expect(defaultCredentialFor('codex', 'openai', 'https://openrouter.ai/api')).toBe('openrouter');
     expect(defaultCredentialFor('claude-code', 'anthropic', 'https://openrouter.ai/api')).toBe('openrouter');
+    // INVARIANT: a Fireworks endpoint bills the fireworks key on either wire, never the Anthropic or OpenAI one.
+    expect(defaultCredentialFor('claude-code', 'anthropic', 'https://api.fireworks.ai/inference')).toBe('fireworks');
+    expect(defaultCredentialFor('codex', 'openai', 'https://api.fireworks.ai/inference')).toBe('fireworks');
     expect(defaultCredentialFor('claude-code', 'anthropic', '')).toBe('anthropic');
     expect(defaultCredentialFor('codex', 'openai', '')).toBe('openai');
   });
@@ -368,7 +371,7 @@ describe('credential inference', () => {
       expect(defaultCredentialFor('pi', 'anthropic', endpoint)).toBe(NO_CREDENTIAL);
     }
     const { profiles } = resolve({
-      'local-ollama-pi': { harness: 'pi', model: 'qwen3.8:latest', endpoint: 'http://localhost:11434' },
+      'local-ollama-pi': { harness: 'pi', model: 'qwen3.8:latest', endpoint: 'http://localhost:11434', credential: 'none' },
     });
     expect(profiles.get('local-ollama-pi')!.credential).toBe(NO_CREDENTIAL);
   });
@@ -439,7 +442,7 @@ describe('credential inference', () => {
 
 describe('endpoint and model validation', () => {
   test('an endpoint without a model is refused rather than guessed', () => {
-    expect(() => resolve({ mine: { harness: 'pi', endpoint: 'http://localhost:11434' } })).toThrow(
+    expect(() => resolve({ mine: { harness: 'pi', endpoint: 'http://localhost:11434', credential: 'none' } })).toThrow(
       /sets endpoint but no model/,
     );
   });
@@ -465,13 +468,13 @@ describe('endpoint and model validation', () => {
   });
 
   test('a non-http scheme is refused', () => {
-    expect(() => resolve({ mine: { harness: 'pi', model: 'm', endpoint: 'ftp://example.com' } })).toThrow(
+    expect(() => resolve({ mine: { harness: 'pi', model: 'm', endpoint: 'ftp://example.com', credential: 'anthropic' } })).toThrow(
       /http:\/\/ or https:\/\//,
     );
   });
 
   test('a trailing slash is stripped so upstreams compare equal', () => {
-    const { profiles } = resolve({ mine: { harness: 'codex', model: 'm', endpoint: 'https://openrouter.ai/api/' } });
+    const { profiles } = resolve({ mine: { harness: 'codex', model: 'm', endpoint: 'https://openrouter.ai/api/', credential: 'openrouter' } });
     expect(profiles.get('mine')!.endpoint).toBe('https://openrouter.ai/api');
   });
 
@@ -479,7 +482,7 @@ describe('endpoint and model validation', () => {
   // host — same rewrite (and same warning) role targets already get.
   test('a container-perspective endpoint is rewritten host-side, with a warning', () => {
     const { profiles, warnings } = resolve({
-      mine: { harness: 'pi', model: 'm', endpoint: 'http://host.docker.internal:11434' },
+      mine: { harness: 'pi', model: 'm', endpoint: 'http://host.docker.internal:11434', credential: 'none' },
     });
     expect(profiles.get('mine')!.endpoint).toBe('http://localhost:11434');
     expect(warnings.join('\n')).toContain('proxy runs on the host');
@@ -491,7 +494,7 @@ describe('endpoint and model validation', () => {
   // train users to ignore the warning that matters.
   test('a host-perspective endpoint is untouched and silent', () => {
     const { profiles, warnings } = resolve({
-      mine: { harness: 'pi', model: 'm', endpoint: 'http://localhost:11434' },
+      mine: { harness: 'pi', model: 'm', endpoint: 'http://localhost:11434', credential: 'none' },
     });
     expect(profiles.get('mine')!.endpoint).toBe('http://localhost:11434');
     expect(warnings.join('\n')).not.toContain('host.docker.internal');
@@ -568,7 +571,7 @@ describe('picker order and summary', () => {
 
   test('the summary says what the profile actually runs', () => {
     const { profiles } = resolve({
-      'local-ollama-pi': { harness: 'pi', model: 'qwen3.8:latest', endpoint: 'http://localhost:11434' },
+      'local-ollama-pi': { harness: 'pi', model: 'qwen3.8:latest', endpoint: 'http://localhost:11434', credential: 'none' },
     });
     const summary = agentProfileSummary(profiles.get('local-ollama-pi')!);
     expect(summary).toContain('pi');
@@ -603,7 +606,7 @@ describe('profile description', () => {
   });
 
   test('an override that repoints the endpoint does not inherit the built-in description', () => {
-    const p = resolveAgentProfiles({ 'claude-code': { endpoint: 'http://localhost:11434', model: 'qwen3.8:latest' } }, silent);
+    const p = resolveAgentProfiles({ 'claude-code': { endpoint: 'http://localhost:11434', credential: 'none', model: 'qwen3.8:latest' } }, silent);
     expect(p.get('claude-code')!.description).toBe('');
   });
 
@@ -642,4 +645,34 @@ describe('builder agent-profiles section', () => {
     expect(section).toContain('use when: Costs $$ and $& — literal.');
     expect(section).not.toContain('{{');
   });
+});
+
+describe('dotted profile and endpoint names', () => {
+  // INVARIANT: an unquoted dotted name ([agents.claude-glm-5.3]) is never silently misread
+  // as a nested table; it is refused with the quoted form. TOML splits a header at the dot,
+  // so Bun parses it as profile "claude-glm-5" holding a table "3" — a wrong profile, no error.
+  test('unquoted dotted profile name is refused with the quoted form', () => {
+    const raw = Bun.TOML.parse('[agents.claude-glm-5.3]\nharness = "claude-code"\nmodel = "glm"\n') as any;
+    expect(() => resolveAgentProfiles(raw.agents, () => {})).toThrow('[agents."claude-glm-5.3"]');
+  });
+
+  test('unquoted dotted endpoint name is refused with the quoted form', () => {
+    const raw = Bun.TOML.parse('[endpoints.my-gw.v2]\nurl = "https://x.example"\ncredential = "c"\n') as any;
+    expect(() => resolveAgentProfiles(undefined, () => {}, raw.endpoints)).toThrow('[endpoints."my-gw.v2"]');
+  });
+
+  test('quoted dotted names resolve', () => {
+    const raw = Bun.TOML.parse('[agents."claude-glm-5.3"]\nharness = "claude-code"\nmodel = "glm"\n') as any;
+    expect(resolveAgentProfiles(raw.agents, () => {}).get('claude-glm-5.3')?.model).toBe('glm');
+  });
+
+  test('a tiered profile (array of tables) is not mistaken for a nested name', () => {
+    const raw = Bun.TOML.parse('[endpoints.e]\nurl = "https://x.example"\ncredential = "anthropic"\n[agents.t]\nharness = "claude-code"\n[[agents.t.tiers]]\nendpoint = "e"\nmodel = "m"\n[[agents.t.tiers]]\nendpoint = "e"\nmodel = "m2"\n') as any;
+    expect(() => resolveAgentProfiles(raw.agents, () => {}, raw.endpoints)).not.toThrow();
+  });
+});
+
+test('a non-name sub-table like [agents.x.env] names the quoted form but also says it may be an invalid option', () => {
+  const raw = Bun.TOML.parse('[agents.x]\nharness = "claude-code"\n[agents.x.env]\nFOO = "1"\n') as any;
+  expect(() => resolveAgentProfiles(raw.agents, () => {})).toThrow('is not a valid option here');
 });

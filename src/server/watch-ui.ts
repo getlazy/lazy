@@ -45,6 +45,7 @@ export function watchPanelHtml(taskId: string, offered: boolean): string {
     `<div class="lz-watch-bar">` +
     `<span class="lz-watch-status" data-lz-watch-status>Disconnected</span>` +
     `<button type="button" class="btn btn-sm" data-lz-watch-reconnect hidden>Reconnect</button>` +
+    `<button type="button" class="btn btn-sm" data-lz-term-fill aria-pressed="false" data-lz-watch-fill title="Make this terminal fill the whole window (Esc leaves it when the terminal is not focused)">Fill window</button>` +
     `<button type="button" class="btn btn-sm" data-lz-watch-close>Close</button>` +
     `</div>` +
     `<div class="lz-watch-term" data-lz-watch-term></div>` +
@@ -102,6 +103,7 @@ export function watchClientScript(): string {
     const reconnectBtn = root.querySelector('[data-lz-watch-reconnect]');
     const openBtn = root.querySelector('[data-lz-watch-open]');
     const closeBtn = root.querySelector('[data-lz-watch-close]');
+    const fillBtn = root.querySelector('[data-lz-watch-fill]');
 
     let term = null, fit = null, ws = null, ro = null, closedByUser = false;
 
@@ -133,6 +135,17 @@ export function watchClientScript(): string {
       try { fit.fit(); } catch (e) { /* terminal not measurable yet */ }
     }
 
+    // Fill window: the panel itself covers the whole window (terminal-panels.css
+    // \`.is-maximised\`), the same control and class the shell's sessions use.
+    function setFilled(on) {
+      panel.classList.toggle('is-maximised', on);
+      document.body.classList.toggle('lz-shell-maximised', on);
+      fillBtn.textContent = on ? 'Exit full window' : 'Fill window';
+      fillBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+      refit();
+      if (term) term.focus();
+    }
+
     let resizeTimer = null;
     function onWindowResize() {
       if (resizeTimer) clearTimeout(resizeTimer);
@@ -154,6 +167,26 @@ export function watchClientScript(): string {
         fit = new window.FitAddon.FitAddon();
         term.loadAddon(fit);
         term.open(termEl);
+        // The same scrollback and exit keys the shell has; nothing is typed here.
+        term.attachCustomKeyEventHandler((ev) => {
+          if (ev.type !== 'keydown') return true;
+          if (!ev.ctrlKey && !ev.metaKey && !ev.altKey && !ev.shiftKey && (ev.key === 'PageUp' || ev.key === 'PageDown')) {
+            ev.preventDefault();
+            term.scrollPages(ev.key === 'PageUp' ? -1 : 1);
+            return false;
+          }
+          // Ctrl/Cmd+C copies a selection (nothing is typed here, so with none it is a no-op).
+          if ((ev.ctrlKey || ev.metaKey) && !ev.altKey && (ev.key || '').toLowerCase() === 'c') {
+            const selection = term.getSelection();
+            if (!selection) return true;
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(selection).catch(function () { /* copy refused */ });
+            }
+            term.clearSelection();
+            return false;
+          }
+          return true;
+        });
         ro = new ResizeObserver(() => refit());
         ro.observe(termEl);
         window.addEventListener('resize', onWindowResize);
@@ -223,7 +256,17 @@ export function watchClientScript(): string {
       setOpen(opening);
       if (opening) connect(); else disconnect();
     });
-    closeBtn.addEventListener('click', () => { setOpen(false); disconnect(); });
+    closeBtn.addEventListener('click', () => { if (panel.classList.contains('is-maximised')) setFilled(false); setOpen(false); disconnect(); });
+    fillBtn.addEventListener('click', () => setFilled(!panel.classList.contains('is-maximised')));
+    // Esc leaves full window only from outside the terminal (see shell-ui).
+    // A replaced Watch node (lzWireWatch) leaves its listener behind, so it
+    // unregisters itself once its panel is gone from the page.
+    function onEscape(ev) {
+      if (!panel.isConnected) { document.removeEventListener('keydown', onEscape); return; }
+      if (ev.key !== 'Escape' || (ev.target && ev.target.closest && ev.target.closest('.xterm'))) return;
+      if (panel.classList.contains('is-maximised')) setFilled(false);
+    }
+    document.addEventListener('keydown', onEscape);
     reconnectBtn.addEventListener('click', () => connect());
     window.addEventListener('beforeunload', () => disconnect());
   }

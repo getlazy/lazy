@@ -124,7 +124,7 @@ test("manual resume's member check and notice turn are inside the lifecycle lock
 // later hand the agent again.
 for (const [file, marker] of [
   ['src/utils/auto-resume.ts', "'[system] Session interrupted and auto-resumed'"],
-  ['src/daemon/auto-deliver.ts', 'content: `[system] ${safeMessage}`'],
+  ['src/daemon/auto-deliver.ts', 'content: `[system] ${neutralizeLazyMarkers(safeMessage)}`'],
 ] as const) {
   test(`${file}: the synthetic turn is written inside the lock, after the member check`, async () => {
     const src = await readFile(join(ROOT, file), 'utf-8');

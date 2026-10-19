@@ -1,5 +1,5 @@
-import { join, dirname } from 'path';
-import { assertTaskWorktreeHead, removeTaskGitPointerCopies, taskWorktreeOf } from './worktree-pointers';
+import { join, dirname, resolve } from 'path';
+import { assertTaskWorktreeHead, removeTaskGitPointerCopies, taskWorktreeOf, validateWorktreeGitPointers } from './worktree-pointers';
 import { withLazyCoauthorTrailer } from '../constants';
 import { logger } from '../utils/logger';
 import { runGit } from '../utils/git';
@@ -29,6 +29,7 @@ import {
  * distinguishes a live holder from a stale file.
  */
 const gitDirMergeMutex = new TaskMutex();
+const worktreeRecoveryMutex = new TaskMutex();
 
 export interface GitCommitInfo {
   sha: string;
@@ -72,20 +73,26 @@ export async function getCurrentBranch(cwd?: string): Promise<string> {
  * which returns the remote's default branch regardless of what's checked out locally.
  */
 export async function getRemoteDefaultBranch(cwd?: string, remoteName: string = 'origin'): Promise<string> {
-  // Try to resolve the remote's default branch via symbolic-ref
-  const result = await runGit(['symbolic-ref', `refs/remotes/${remoteName}/HEAD`], { cwd });
-  if (result.exitCode === 0) {
-    // Returns something like "refs/remotes/origin/main" — extract the branch name
-    const ref = result.stdout.trim();
-    const prefix = `refs/remotes/${remoteName}/`;
-    if (ref.startsWith(prefix)) {
-      return ref.slice(prefix.length);
-    }
-  }
+  const resolved = await resolveRemoteDefaultBranch(cwd, remoteName);
+  if (resolved !== null) return resolved;
 
   // Fallback to "main" if remote default cannot be determined
   logger.warn(`Could not resolve remote default branch for ${remoteName} — falling back to "main". Run "git remote set-head ${remoteName} --auto" to configure.`);
   return 'main';
+}
+
+/**
+ * The remote's default branch as `git symbolic-ref refs/remotes/<remote>/HEAD`
+ * names it, or null when it does not — never a guess. For callers that must
+ * tell "the default branch is main" from "we assumed main".
+ */
+export async function resolveRemoteDefaultBranch(cwd?: string, remoteName: string = 'origin'): Promise<string | null> {
+  const result = await runGit(['symbolic-ref', `refs/remotes/${remoteName}/HEAD`], { cwd });
+  if (result.exitCode !== 0) return null;
+  // Something like "refs/remotes/origin/main" — extract the branch name.
+  const ref = result.stdout.trim();
+  const prefix = `refs/remotes/${remoteName}/`;
+  return ref.startsWith(prefix) ? ref.slice(prefix.length) : null;
 }
 
 /**
@@ -169,17 +176,28 @@ export function assertSingleWorktreeForBranch(branch: string, worktrees: string[
   }
 }
 
+/**
+ * Kill-timer setting for every `git worktree add`: NONE. spawn()'s default 60s
+ * backstop killed checkouts still running LFS filters on large repositories,
+ * and a killed `git worktree add` DELETES the half-made worktree from its
+ * signal handler while its `git reset --hard` child keeps writing into the
+ * vanished directory ("unable to create file …: No such file or directory").
+ * A checkout is bounded by the repository's size and git-lfs's own transfer
+ * timeouts, not by a guess here.
+ */
+export const WORKTREE_ADD_TIMEOUT = 0;
+
 export async function createWorktree(path: string, branch: string, cwd?: string): Promise<void> {
   await ensureLazyExcludeBestEffort(cwd ?? process.cwd());
   // Try creating with new branch first
-  const result = await runGit(['worktree', 'add', path, '-b', branch], { cwd });
+  const result = await runGit(['worktree', 'add', path, '-b', branch], { cwd, timeout: WORKTREE_ADD_TIMEOUT });
   if (result.exitCode === 0) return;
 
   // Branch already exists — attach worktree to existing branch
-  const retry = await runGit(['worktree', 'add', path, branch], { cwd });
+  const retry = await runGit(['worktree', 'add', path, branch], { cwd, timeout: WORKTREE_ADD_TIMEOUT });
   if (retry.exitCode === 0) return;
 
-  throw new Error(`git worktree add failed: ${retry.stderr}`);
+  throw new Error(describeWorktreeAddFailure(retry.stderr, path, branch));
 }
 
 export async function removeWorktree(path: string, cwd?: string): Promise<void> {
@@ -1435,9 +1453,9 @@ export async function applyPatch(patch: string, cwd?: string): Promise<boolean> 
 export async function createWorktreeFromSha(path: string, branch: string, startSha: string, cwd?: string): Promise<void> {
   await ensureLazyExcludeBestEffort(cwd ?? process.cwd());
   // Create worktree with new branch starting from specified SHA
-  const result = await runGit(['worktree', 'add', path, '-b', branch, startSha], { cwd });
+  const result = await runGit(['worktree', 'add', path, '-b', branch, startSha], { cwd, timeout: WORKTREE_ADD_TIMEOUT });
   if (result.exitCode !== 0) {
-    throw new Error(`git worktree add from SHA failed: ${result.stderr}`);
+    throw new Error(describeWorktreeAddFailure(result.stderr, path, branch));
   }
 }
 
@@ -1495,6 +1513,68 @@ export interface WorktreeRecoveryResult {
   dirty: boolean;
 }
 
+export interface WorktreeRecoveryOptions {
+  /**
+   * Human-readable progress while the files are checked out ("Downloading
+   * large files: 12/28 (43%)"). A large repository — LFS content especially —
+   * can take minutes, and the caller's surface must not sit silent that long.
+   */
+  onProgress?: (detail: string) => void;
+}
+
+const CHECKOUT_PROGRESS_RE = /^(Filtering content|Updating files):\s*(\d+)% \((\d+)\/(\d+)\)(?:,\s*([^|,]+?)\s*(?:\|[^,]*)?)?(?:,\s*done\.)?$/;
+
+/**
+ * Turn git's checkout progress (stderr, `\r`-separated, e.g. "Filtering
+ * content:  42% (12/28), 30.1 MiB | 5.9 MiB/s" or "Updating files:  50% (…)")
+ * into one progress note per change of percentage.
+ */
+export function checkoutProgressParser(onProgress: (detail: string) => void): (chunk: string) => void {
+  let buffer = '';
+  let last = '';
+  return (chunk: string) => {
+    buffer += chunk;
+    const parts = buffer.split(/[\r\n]/);
+    buffer = parts.pop() ?? '';
+    for (const line of parts) {
+      const m = CHECKOUT_PROGRESS_RE.exec(line.trim());
+      if (!m) continue;
+      const key = `${m[1]}:${m[2]}`;
+      if (key === last) continue;
+      last = key;
+      const what = m[1] === 'Filtering content' ? 'Downloading large files' : 'Checking out files';
+      onProgress(`${what}: ${m[3]}/${m[4]} (${m[2]}%)${m[5] ? `, ${m[5]}` : ''}`);
+    }
+  };
+}
+
+/**
+ * The human message for a failed `git worktree add`: what failed, where, and
+ * what to do — never git's raw progress spew (that goes to the daemon log).
+ */
+export function describeWorktreeAddFailure(stderr: string, worktreePath: string, branch: string): string {
+  const lines = stderr.split(/[\r\n]+/).map((l) => l.trim()).filter(Boolean);
+  const uncreatable = lines
+    .map((l) => /^error: unable to create file (.+?): (.+)$/.exec(l))
+    .filter((m): m is RegExpExecArray => m !== null);
+  const problems = lines.filter((l) => /^(error|fatal):/.test(l) && !l.startsWith('error: unable to create file '));
+  const parts = [`Could not check out branch '${branch}' into ${worktreePath}.`];
+  if (uncreatable.length > 0) {
+    const files = uncreatable.slice(0, 3).map((m) => m[1]).join(', ');
+    const more = uncreatable.length > 3 ? ` and ${uncreatable.length - 3} more` : '';
+    parts.push(`${uncreatable.length} file(s) could not be written (${files}${more}): ${uncreatable[0][2]}.`);
+  }
+  const said = problems.length > 0 ? problems.slice(0, 3) : (uncreatable.length === 0 && lines.length > 0 ? [lines[lines.length - 1]] : []);
+  if (said.length > 0) parts.push(`git said: ${said.map((l) => l.replace(/^(error|fatal):\s*/, '').replace(/\.$/, '')).join('; ')}.`);
+  parts.push('The task branch itself is untouched. Try again; if it fails the same way, check free disk space and that the directory is writable — git\'s full output is in the daemon log.');
+  return parts.join(' ');
+}
+
+export async function worktreeExistsAfterRecovery(worktreePath: string, cwd?: string): Promise<boolean> {
+  return worktreeRecoveryMutex.withLock(resolve(cwd ?? process.cwd(), worktreePath),
+    () => pathExists(worktreePath));
+}
+
 /**
  * Attempt to recover a missing worktree by recreating it from an existing branch.
  * Returns recovery status including whether the worktree is dirty after recreation.
@@ -1506,7 +1586,46 @@ export async function recoverMissingWorktree(
   worktreePath: string,
   branch: string,
   cwd?: string,
+  opts: WorktreeRecoveryOptions = {},
 ): Promise<WorktreeRecoveryResult> {
+  return worktreeRecoveryMutex.withLock(resolve(cwd ?? process.cwd(), worktreePath),
+    () => recoverMissingWorktreeUnlocked(worktreePath, branch, cwd, opts));
+}
+
+async function validateRecoveredWorktree(
+  worktreePath: string,
+  branch: string,
+  cwd?: string,
+): Promise<WorktreeRecoveryResult | null> {
+  if (!await pathExists(worktreePath)) return null;
+  await validateWorktreeGitPointers(cwd ?? process.cwd(), worktreePath);
+  const expected = await runGit(['rev-parse', '--symbolic-full-name', branch], { cwd });
+  const actual = await runGit(['symbolic-ref', '--quiet', 'HEAD'], { cwd: worktreePath });
+  if (expected.exitCode !== 0) {
+    throw new Error(`Cannot verify recovered worktree against branch '${branch}'.`);
+  }
+  if (expected.stdout.startsWith('refs/heads/')) {
+    if (actual.exitCode !== 0 || actual.stdout !== expected.stdout) {
+      throw new Error(`Worktree at ${worktreePath} does not match branch '${branch}'.`);
+    }
+  } else {
+    const expectedCommit = await runGit(['rev-parse', '--verify', `${branch}^{commit}`], { cwd });
+    const actualCommit = await runGit(['rev-parse', '--verify', 'HEAD'], { cwd: worktreePath });
+    if (expectedCommit.exitCode !== 0 || actualCommit.exitCode !== 0 || actualCommit.stdout !== expectedCommit.stdout) {
+      throw new Error(`Worktree at ${worktreePath} does not match ref '${branch}'.`);
+    }
+  }
+  return { recovered: true, branchExists: true, dirty: await hasUncommittedChanges(worktreePath) };
+}
+
+async function recoverMissingWorktreeUnlocked(
+  worktreePath: string,
+  branch: string,
+  cwd?: string,
+  opts: WorktreeRecoveryOptions = {},
+): Promise<WorktreeRecoveryResult> {
+  const existing = await validateRecoveredWorktree(worktreePath, branch, cwd);
+  if (existing) return existing;
   if (!await branchExists(branch, cwd)) {
     return { recovered: false, branchExists: false, dirty: false };
   }
@@ -1515,9 +1634,17 @@ export async function recoverMissingWorktree(
   // Prune stale worktree entries so git doesn't reject the add
   await runGit(['worktree', 'prune'], { cwd });
 
-  const result = await runGit(['worktree', 'add', worktreePath, branch], { cwd });
+  // No kill timer: see WORKTREE_ADD_TIMEOUT.
+  const result = await runGit(['worktree', 'add', worktreePath, branch], {
+    cwd,
+    timeout: WORKTREE_ADD_TIMEOUT,
+    onStderr: opts.onProgress ? checkoutProgressParser(opts.onProgress) : undefined,
+  });
   if (result.exitCode !== 0) {
-    throw new Error(`Failed to recreate worktree: ${result.stderr}`);
+    const concurrent = await validateRecoveredWorktree(worktreePath, branch, cwd);
+    if (concurrent) return concurrent;
+    logger.error(`git worktree add ${worktreePath} ${branch} failed (exit ${result.exitCode}):\n${result.stderr}`);
+    throw new Error(describeWorktreeAddFailure(result.stderr, worktreePath, branch));
   }
 
   // Check if the recreated worktree has uncommitted changes
@@ -1598,21 +1725,35 @@ export async function recoverMissingWorktreeWithFetch(
   branch: string,
   remoteName: string = 'origin',
   cwd?: string,
+  opts: WorktreeRecoveryOptions = {},
 ): Promise<WorktreeRecoveryResult> {
-  // Try local recovery first (fast path)
-  if (await branchExists(branch, cwd)) {
-    return await recoverMissingWorktree(worktreePath, branch, cwd);
-  }
+  return worktreeRecoveryMutex.withLock(resolve(cwd ?? process.cwd(), worktreePath), async () => {
+    const existing = await validateRecoveredWorktree(worktreePath, branch, cwd);
+    if (existing) return existing;
+    // Try local recovery first (fast path)
+    if (await branchExists(branch, cwd)) {
+      return await recoverMissingWorktreeUnlocked(worktreePath, branch, cwd, opts);
+    }
 
-  // Branch not local — try fetching from remote
-  logger.info(`Branch '${branch}' not found locally. Fetching from ${remoteName}...`);
-  const fetched = await fetchRemoteBranch(branch, remoteName, cwd);
-  if (!fetched) {
-    return { recovered: false, branchExists: false, dirty: false };
-  }
+    // Branch not local — try fetching from remote
+    logger.info(`Branch '${branch}' not found locally. Fetching from ${remoteName}...`);
+    let fetched: boolean;
+    try {
+      fetched = await fetchRemoteBranch(branch, remoteName, cwd);
+    } catch (error) {
+      const concurrent = await validateRecoveredWorktree(worktreePath, branch, cwd);
+      if (concurrent) return concurrent;
+      throw error;
+    }
+    if (!fetched) {
+      const concurrent = await validateRecoveredWorktree(worktreePath, branch, cwd);
+      if (concurrent) return concurrent;
+      return { recovered: false, branchExists: false, dirty: false };
+    }
 
-  logger.info(`Fetched branch '${branch}' from ${remoteName}.`);
-  return await recoverMissingWorktree(worktreePath, branch, cwd);
+    logger.info(`Fetched branch '${branch}' from ${remoteName}.`);
+    return await recoverMissingWorktreeUnlocked(worktreePath, branch, cwd, opts);
+  });
 }
 
 /**
@@ -1693,7 +1834,7 @@ export async function findCommitByMessage(targetBranch: string, searchText: stri
  * INVARIANT (fix-sync-no-merge): errors throw with an actionable message —
  * they do NOT return false. The previous silent-false behavior was the
  * mechanism by which `lazy sync` reported fake "completed successfully"
- * responses while no merge ran. Per CLAUDE.md "errors are actionable",
+ * responses while no merge ran. Per AGENTS.md "errors are actionable",
  * a broken rev-list, a missing ref, or a malformed working tree must
  * surface to the caller rather than masquerading as "up to date".
  */
@@ -1782,7 +1923,7 @@ export async function getMergeBase(branch1: string, branch2: string, cwd?: strin
  * the fixed detector is deployed everywhere, the still-running pre-fix detector
  * on the merging daemon does not false-positive on this very file.)
  *
- * Per CLAUDE.md (fail hard, no silent fallbacks): an error exit throws rather
+ * Per AGENTS.md (fail hard, no silent fallbacks): an error exit throws rather
  * than being papered over as "no conflict" (which would let a broken check wave
  * through an unmergeable branch) or as "conflict" (which would block a mergeable
  * branch on a transient git error). Note that some git versions also return

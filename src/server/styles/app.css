@@ -198,6 +198,10 @@ nav.nav {
   padding: var(--space-2) 0;
 }
 .chunk-turn:last-child, .chunk-note:last-child { border-bottom: 0; }
+/* lazy's own wrapper text, folded into one closed drawer (src/task/wrapper-fold.ts). */
+.lz-lazy-fold { margin-top: var(--space-2); border: 1px dashed var(--color-divider); border-radius: 4px; padding: 0 var(--space-2); color: color-mix(in srgb, var(--color-text) 60%, transparent); }
+.lz-lazy-fold > summary { cursor: pointer; font-size: 0.85em; padding: var(--space-1) 0; }
+.lz-lazy-fold-part + .lz-lazy-fold-part { border-top: 1px dotted var(--color-divider); }
 .chunk-turn-head, .chunk-note-head {
   cursor: pointer;
   font-size: 12px;

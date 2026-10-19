@@ -1,200 +1,130 @@
-/**
- * Which of a member's OWN credentials pays for a turn on a given agent profile —
- * the one rule, in team mode, for every profile lazy can run.
- *
- * TEAM MODE BILLS THE ACTING MEMBER FOR EVERY PROFILE. With a control plane in
- * front of the daemon, each turn is paid by the person who asked for it (or, for
- * a turn nobody asked for, by the project's service holder) — the per-user
- * billing mandate: traceability, real per-person quotas, and never one account
- * shared among people. That used to be true only of Anthropic traffic; a codex,
- * cursor or pi turn spent whichever key the project's own credential store held,
- * shared by everybody. Now every profile is paid the same way, and the project
- * store is never consulted for a team-mode turn's model traffic — there is no
- * fallback to it, or to anybody else's credential.
- *
- * KEYED BY PROFILE. A member connects a credential per `[agents.<name>]` profile
- * (./user-credentials.ts, `profile`), so their secret only ever reaches the
- * upstream of the profile they connected it for. The record carries the
- * endpoint the member was SHOWN when they connected it — their consent, stated
- * by the control plane, never derived from config here — and a turn is refused
- * when the running proxy would forward the profile anywhere else, rather than
- * following the profile to a host they never agreed to send it to.
- *
- * THE CLAUDE CREDENTIAL still pays where it always did. A member's profile-less
- * record — the Claude credential they connected before profiles had credentials
- * of their own — pays EVERY profile that bills `anthropic` and whose traffic
- * goes to the proxy's primary upstream (no endpoint of its own) or to
- * Anthropic's own API, and only it does: exactly one credential answers for any
- * profile, so a member is never asked to connect the same Claude account twice
- * and no two copies can disagree about which one a turn spent.
- *
- * A profile that bills NOTHING (`credential = "none"`, a local model server)
- * needs nothing from anybody.
- */
-
+/** Member endpoint spending: consent, provider compatibility and the actual payer. */
 import { loadConfig } from '../config/loader';
-import {
-  type AgentProfile,
-  NO_CREDENTIAL,
-  isAnthropicApiEndpoint,
-  profileForAgentNameOrNull,
-} from '../config/agent-profiles';
+import type { ResolvedConfig } from '../config/types';
+import { type AgentProfile, NO_CREDENTIAL, isAnthropicApiEndpoint, profileForAgentNameOrNull } from '../config/agent-profiles';
 import { credentialLabel } from '../credentials/providers';
 import { isChatGptEndpoint } from '../utils/openai-compat';
-import { getUserCredential, SERVICE_CREDENTIAL_USER_ID, type UserCredentialRecord } from './user-credentials';
-import { forwardingOriginFor } from './running-proxy-routes';
+import { credentialCompatibleWithEndpoint, credentialConsentedToEndpoint, endpointRequirementsForProfile, normalizeEndpointOrigin, type EndpointRequirement } from '../credentials/endpoint-requirements';
+import { serviceTurnReason } from './launch-origin';
+import { getEndpointCredential, getServiceHolder, getServiceHolderState, SERVICE_CREDENTIAL_USER_ID, type EndpointCredentialRecord } from './user-credentials';
 
 /**
- * The stable prefix on a refusal a control plane can act on: the person who
- * asked for this turn has not connected a credential for the turn's profile.
- * The profile's name follows, in double quotes. A WIRE marker —
- * `lazy-teams/app/clients/lazy_daemon/client.rb` names it too.
- *
- * The Claude-credential case keeps its own, older marker
- * (`NO_OWNER_CREDENTIAL_MARKER`, ./turn-credentials.ts) so a control plane that
- * predates profile credentials still says "connect your Claude account" for it.
+ * Why the service holder resolved to nobody. The daemon learns the holder only
+ * from the service records Teams delivers, so it cannot tell "none designated"
+ * from "designated, but nothing was delivered" — it names both, and Teams,
+ * which can tell, says which (lazy-teams ServiceCredentialDiagnosis).
  */
+export const NO_SERVICE_HOLDER_DELIVERED_REASON =
+  "no service holder has been delivered to this project's daemon — either no admin has designated one in the project's Settings, or Teams could not deliver the holder's connections";
+export const SERVICE_HOLDER_CONFLICTED_REASON =
+  'the service connections delivered to this daemon name different holders; an admin designates one service holder again in Settings';
+
+/** Legacy markers stay exported for callers adapting older daemons. */
 export const NO_OWNER_PROFILE_CREDENTIAL_MARKER = 'No credential of yours for agent profile';
+export const NO_OWNER_ENDPOINT_CREDENTIAL_MARKER = 'No credential of yours for endpoint';
 
-/** What pays for one principal's turn on one profile. */
 export type MemberCredentialAnswer =
-  /** The profile authenticates nobody. */
   | { kind: 'none-needed' }
-  | {
-      kind: 'credential';
-      record: UserCredentialRecord;
-      /** `profile`: connected for this profile. `claude`: their Claude credential. */
-      via: 'profile' | 'claude';
-    }
-  | {
-      kind: 'missing';
-      /** `claude`: the Claude credential would pay and there is none. */
-      want: 'profile' | 'claude';
-      /** Why, in one clause — "has not connected one", "its endpoint changed". */
-      detail: string;
-    };
+  | { kind: 'credential'; record: EndpointCredentialRecord; via: 'endpoint'; member: string; requirement: EndpointRequirement }
+  | { kind: 'missing'; want: 'endpoint'; endpoint: string; detail: string };
 
-/**
- * Does the principal's Claude credential pay for this profile?
- *
- * Decided on the SAVED config; {@link memberCredentialFor} additionally
- * refuses while the RUNNING proxy still forwards the profile anywhere else.
- *
- * Only where it is sent to Anthropic: the proxy's primary upstream (a profile
- * with no endpoint of its own — on a managed host that is the fleet's, which a
- * repository cannot change) or Anthropic's own API host.
- */
+/** Compatibility for old profile descriptors; never used to resolve endpoint spending. */
 export function claudeCredentialPays(profile: Pick<AgentProfile, 'credential' | 'endpoint'>): boolean {
-  if (profile.credential !== 'anthropic') return false;
-  return profile.endpoint === '' || isAnthropicApiEndpoint(profile.endpoint);
+  return profile.credential === 'anthropic' && (profile.endpoint === '' || isAnthropicApiEndpoint(profile.endpoint));
 }
 
-/** Does this profile need a credential from anybody? */
 export function profileNeedsCredential(profile: Pick<AgentProfile, 'credential'>): boolean {
   return profile.credential !== NO_CREDENTIAL;
 }
 
-/**
- * Does a credential for this profile hold a ChatGPT subscription SESSION (the
- * JSON `codex login` writes) rather than a plain key? The endpoint overrules
- * the name, exactly as the proxy's own resolver does: that host takes nothing
- * else.
- */
 export function profileTakesChatGptSession(profile: Pick<AgentProfile, 'credential' | 'endpoint'>): boolean {
-  if (profile.credential === NO_CREDENTIAL) return false;
-  return profile.credential === 'chatgpt' || isChatGptEndpoint(profile.endpoint);
+  return profile.credential !== NO_CREDENTIAL && (profile.credential === 'chatgpt' || isChatGptEndpoint(profile.endpoint));
 }
 
-/**
- * Which of `principal`'s credentials pays for a turn on `profile`.
- *
- * @param principal a member's address, or {@link SERVICE_CREDENTIAL_USER_ID}
- */
-export async function memberCredentialFor(
+/** Service aliases name a holder; they are never a pool of keys for arbitrary endpoints. */
+export async function spendingMember(projectRoot: string, principal: string): Promise<string | null> {
+  if (principal !== SERVICE_CREDENTIAL_USER_ID) return principal.trim().toLowerCase();
+  return (await getServiceHolder(projectRoot))?.email.trim().toLowerCase() ?? null;
+}
+
+/** Check the selected endpoint against its actual host-derived upstream before exposing its secret. */
+export async function memberEndpointCredentialFor(
   projectRoot: string,
   principal: string,
-  profile: AgentProfile,
+  requirement: EndpointRequirement,
+  upstream: string = requirement.origin,
 ): Promise<MemberCredentialAnswer> {
-  if (!profileNeedsCredential(profile)) return { kind: 'none-needed' };
-
-  if (claudeCredentialPays(profile)) {
-    // Decided on the SAVED config, but the secret goes where the RUNNING proxy
-    // forwards the profile — built at daemon start, re-routed only by a
-    // restart. A profile re-pointed at Anthropic (or stripped of its endpoint)
-    // on the Configuration page is still forwarded to its old host until then,
-    // and the member's Anthropic token must not ride that request.
-    const forwardsTo = forwardingOriginFor(projectRoot, profile.name, await loadConfig(projectRoot));
-    if (forwardsTo !== '' && !isAnthropicApiEndpoint(forwardsTo)) {
-      return {
-        kind: 'missing',
-        want: 'profile',
-        detail:
-          `the project now sends it to Anthropic, but requests on this profile still go to ${forwardsTo} ` +
-          `until the project restarts, and a Claude credential is never sent anywhere but Anthropic`,
-      };
-    }
-    const claude = await getUserCredential(projectRoot, principal);
-    if (claude) return { kind: 'credential', record: claude, via: 'claude' };
-    return { kind: 'missing', want: 'claude', detail: 'no Claude (Anthropic) credential is connected' };
+  if (requirement.credential === NO_CREDENTIAL) return { kind: 'none-needed' };
+  const missing = (detail: string): MemberCredentialAnswer => ({ kind: 'missing', want: 'endpoint', endpoint: requirement.endpointId, detail });
+  const service = principal === SERVICE_CREDENTIAL_USER_ID;
+  let member: string;
+  if (service) {
+    const state = await getServiceHolderState(projectRoot);
+    if (state.conflicted) return missing(SERVICE_HOLDER_CONFLICTED_REASON);
+    if (!state.holder) return missing(NO_SERVICE_HOLDER_DELIVERED_REASON);
+    member = state.holder.email.trim().toLowerCase();
+  } else {
+    member = principal.trim().toLowerCase();
   }
-
-  const own = await getUserCredential(projectRoot, principal, profile.name);
-  // The service slot of a session profile refers to its holder's OWN record
-  // (./user-credentials.ts `sameAs`): answer with that record, and that
-  // record's consent — one login, one renewal chain.
-  if (own?.sameAs && principal === SERVICE_CREDENTIAL_USER_ID && own.sameAs !== SERVICE_CREDENTIAL_USER_ID) {
-    return memberCredentialFor(projectRoot, own.sameAs, profile);
+  const record = await getEndpointCredential(projectRoot, member, requirement.endpointId);
+  if (!record) {
+    return missing(service
+      ? `the service holder ${member} has no ${credentialLabel(requirement.credential)} connection for endpoint "${requirement.endpointId}" on this project's daemon — either they have none at any level (account, team or project), or Teams has not delivered it`
+      : `no usable ${credentialLabel(requirement.credential)} connection exists for endpoint "${requirement.endpointId}"`);
   }
-  if (own) {
-    // The stamp is the member's CONSENT — the endpoint the control plane showed
-    // them when they connected it (null: none was stated). It is checked
-    // against where the RUNNING proxy forwards this profile, which is where the
-    // secret would actually go; a saved config the proxy has not been rebuilt
-    // from yet is not.
-    const consented = own.endpoint ?? null;
-    const forwardsTo = forwardingOriginFor(projectRoot, profile.name, await loadConfig(projectRoot));
-    if (consented !== forwardsTo) {
-      const where = (origin: string) => origin || "the project's default upstream";
-      return {
-        kind: 'missing',
-        want: 'profile',
-        detail:
-          (consented === null
-            ? `the credential connected for it states no endpoint it was connected for`
-            : `the credential connected for it was connected for ${where(consented)}`) +
-          `, but requests on this profile go to ${where(forwardsTo)} — it is never sent anywhere its ` +
-          `owner did not connect it for, so it must be connected again`,
-      };
-    }
-    return { kind: 'credential', record: own, via: 'profile' };
+  let actualOrigin: string;
+  try {
+    actualOrigin = normalizeEndpointOrigin(upstream);
+  } catch (error) {
+    return missing(`the selected destination is invalid: ${error instanceof Error ? error.message : String(error)}`);
   }
-
-  return {
-    kind: 'missing',
-    want: 'profile',
-    detail: `no ${credentialLabel(profile.credential)} credential is connected for it`,
-  };
+  if (actualOrigin !== requirement.origin) return missing('the selected route does not match the endpoint in this request’s effective configuration');
+  if (!credentialConsentedToEndpoint(record, requirement)) return missing(`its connection consented to ${record.endpoint || 'no destination'}, but requests go to ${requirement.scope}; reconnect it before spending`);
+  // Consent alone cannot authorize a provider-bound secret at another provider.
+  if ((record.provider === 'anthropic' || requirement.provider === 'anthropic') && actualOrigin !== 'https://api.anthropic.com') {
+    return missing('an Anthropic credential is never sent to a non-Anthropic destination');
+  }
+  if (!credentialCompatibleWithEndpoint(record, requirement)) return missing('the connected credential’s provider, session or kind does not match this endpoint; reconnect it');
+  return { kind: 'credential', record, via: 'endpoint', member, requirement };
 }
 
-/** {@link memberCredentialFor} by profile NAME; null when the profile does not exist. */
-export async function memberCredentialForProfileName(
-  projectRoot: string,
-  principal: string,
-  profileName: string,
-): Promise<{ profile: AgentProfile; answer: MemberCredentialAnswer } | null> {
-  const profile = profileForAgentNameOrNull(await loadConfig(projectRoot), profileName);
-  if (!profile) return null;
-  return { profile, answer: await memberCredentialFor(projectRoot, principal, profile) };
+/** Ordinary profile or tier zero. Launches use every requirement, not this convenience. */
+export async function memberCredentialFor(projectRoot: string, principal: string, profile: AgentProfile, effectiveConfig?: ResolvedConfig): Promise<MemberCredentialAnswer> {
+  const requirements = endpointRequirementsForProfile(profile, effectiveConfig ?? await loadConfig(projectRoot));
+  const first = requirements[0];
+  return first ? memberEndpointCredentialFor(projectRoot, principal, first) : { kind: 'none-needed' };
 }
 
-/** `"claude-gw" (claude-code)` — the harness only when it adds information. */
+/** Every paid tier must be connected, even one unlikely to serve a request. */
+export async function memberProfileCredentialProblem(projectRoot: string, principal: string, profile: AgentProfile, config: ResolvedConfig): Promise<string | null> {
+  const requirements = endpointRequirementsForProfile(profile, config);
+  for (const requirement of requirements) {
+    const answer = await memberEndpointCredentialFor(projectRoot, principal, requirement);
+    if (answer.kind !== 'missing') continue;
+    const tiers = requirement.consumers.filter(c => c.profile === profile.name && c.tier !== null).map(c => `tier ${c.tier! + 1}`).join(', ');
+    const who = principalPhrase(principal);
+    const marker = principal === SERVICE_CREDENTIAL_USER_ID ? 'No service credential for automated turns' : NO_OWNER_ENDPOINT_CREDENTIAL_MARKER;
+    // A service refusal says WHY the turn is the service holder's at all: the
+    // member who sees it usually started the work, and is otherwise left to
+    // wonder why their own connection was not used.
+    const remedy = principal === SERVICE_CREDENTIAL_USER_ID
+      ? `${serviceTurnReason()}; no teammate's credential is used instead. A turn a person starts, or a subtask their task's agent starts, runs on that person's own connections.`
+      : 'Connect this endpoint for that member; no teammate or project credential is used.';
+    return `${marker} "${requirement.endpointId}": ${who} cannot run on agent profile ${profileLabel(profile)}${tiers ? ` (${tiers})` : ''}: ${answer.detail}. ${remedy}`;
+  }
+  return null;
+}
+
+export async function memberCredentialForProfileName(projectRoot: string, principal: string, profileName: string): Promise<{ profile: AgentProfile; answer: MemberCredentialAnswer } | null> {
+  const config = await loadConfig(projectRoot);
+  const profile = profileForAgentNameOrNull(config, profileName);
+  return profile ? { profile, answer: await memberCredentialFor(projectRoot, principal, profile, config) } : null;
+}
+
 export function profileLabel(profile: Pick<AgentProfile, 'name' | 'harness'>): string {
   return profile.name === profile.harness ? `"${profile.name}"` : `"${profile.name}" (${profile.harness})`;
 }
 
-/** Who a principal is, for a refusal. */
 export function principalPhrase(principal: string): string {
-  return principal === SERVICE_CREDENTIAL_USER_ID
-    ? `the project's service credential holder (turns nobody asked for run on their credentials)`
-    : `user '${principal}'`;
+  return principal === SERVICE_CREDENTIAL_USER_ID ? "the project's service credential holder" : `user '${principal}'`;
 }

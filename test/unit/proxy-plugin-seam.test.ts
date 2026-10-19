@@ -15,6 +15,12 @@ import { join } from 'path';
 import { applyRequestPlugins, type ProxyRequestContext, type ProxyRequestPlugin } from '../../src/proxy/plugins/types';
 import { loadProxyRequestPlugins, proxyPluginDir, ProxyPluginLoadError } from '../../src/proxy/plugins/loader';
 
+/**
+ * These tests exercise the loading MECHANISM. Lazy itself never loads
+ * repository plugins (src/config/managed-repo-code.ts), so they opt in here.
+ */
+const MECHANISM_ONLY = { enabled: true } as const;
+
 const MESSAGES_CTX: ProxyRequestContext = { method: 'POST', path: '/v1/messages', endpoint: 'messages' };
 
 const SYSTEM_PROMPT = [
@@ -92,12 +98,12 @@ describe('loadProxyRequestPlugins: .lazy/plugins convention', () => {
   // short-circuits on. Extending the proxy is opt-in by creating a file; there
   // is no config key to get wrong and no default plugin to turn off.
   test('a project with no .lazy/plugins directory loads nothing', async () => {
-    expect(await loadProxyRequestPlugins(root)).toEqual([]);
+    expect(await loadProxyRequestPlugins(root, MECHANISM_ONLY)).toEqual([]);
   });
 
   test('an empty .lazy/plugins directory loads nothing', async () => {
     await mkdir(proxyPluginDir(root), { recursive: true });
-    expect(await loadProxyRequestPlugins(root)).toEqual([]);
+    expect(await loadProxyRequestPlugins(root, MECHANISM_ONLY)).toEqual([]);
   });
 
   test('a plugin object default export is loaded', async () => {
@@ -108,7 +114,7 @@ describe('loadProxyRequestPlugins: .lazy/plugins convention', () => {
          transformRequest(body) { return { ...(body as object), tagged: true }; },
        };`,
     );
-    const plugins = await loadProxyRequestPlugins(root);
+    const plugins = await loadProxyRequestPlugins(root, MECHANISM_ONLY);
     expect(plugins.map((p) => p.name)).toEqual(['tag']);
     expect(plugins[0].transformRequest({ model: 'm' }, MESSAGES_CTX)).toEqual({ model: 'm', tagged: true });
   });
@@ -122,7 +128,7 @@ describe('loadProxyRequestPlugins: .lazy/plugins convention', () => {
          return { name: 'factory', transformRequest: () => ({ calls }) };
        };`,
     );
-    const plugins = await loadProxyRequestPlugins(root);
+    const plugins = await loadProxyRequestPlugins(root, MECHANISM_ONLY);
     expect(plugins.map((p) => p.name)).toEqual(['factory']);
     // Calling transform twice must not re-run the factory.
     plugins[0].transformRequest({}, MESSAGES_CTX);
@@ -136,7 +142,7 @@ describe('loadProxyRequestPlugins: .lazy/plugins convention', () => {
     await writePlugin('20-second.ts', `export default { name: 'second', transformRequest: () => null };`);
     await writePlugin('10-first.ts', `export default { name: 'first', transformRequest: () => null };`);
     await writePlugin('30-third.js', `export default { name: 'third', transformRequest: () => null };`);
-    const plugins = await loadProxyRequestPlugins(root);
+    const plugins = await loadProxyRequestPlugins(root, MECHANISM_ONLY);
     expect(plugins.map((p) => p.name)).toEqual(['first', 'second', 'third']);
   });
 
@@ -147,7 +153,7 @@ describe('loadProxyRequestPlugins: .lazy/plugins convention', () => {
     await writePlugin('real.test.ts', `throw new Error('a test file must never be imported as a plugin');`);
     await writePlugin('types.d.ts', `export type Nothing = never;`);
     await writePlugin('README.md', `not a module`);
-    const plugins = await loadProxyRequestPlugins(root);
+    const plugins = await loadProxyRequestPlugins(root, MECHANISM_ONLY);
     expect(plugins.map((p) => p.name)).toEqual(['real']);
   });
 
@@ -156,27 +162,27 @@ describe('loadProxyRequestPlugins: .lazy/plugins convention', () => {
   // the worst outcome. Same posture as a malformed lazy.toml.
   test('a plugin file that will not import fails loudly', async () => {
     await writePlugin('broken.ts', `export default { name: 'broken',,, };`);
-    await expect(loadProxyRequestPlugins(root)).rejects.toThrow(ProxyPluginLoadError);
+    await expect(loadProxyRequestPlugins(root, MECHANISM_ONLY)).rejects.toThrow(ProxyPluginLoadError);
   });
 
   test('a module with no default export fails loudly and shows the expected shape', async () => {
     await writePlugin('named.ts', `export const plugin = { name: 'named', transformRequest: () => null };`);
-    await expect(loadProxyRequestPlugins(root)).rejects.toThrow(/no default export/);
+    await expect(loadProxyRequestPlugins(root, MECHANISM_ONLY)).rejects.toThrow(/no default export/);
   });
 
   test('a default export missing transformRequest fails loudly', async () => {
     await writePlugin('shapeless.ts', `export default { name: 'shapeless' };`);
-    await expect(loadProxyRequestPlugins(root)).rejects.toThrow(/transformRequest/);
+    await expect(loadProxyRequestPlugins(root, MECHANISM_ONLY)).rejects.toThrow(/transformRequest/);
   });
 
   test('a default export missing a name fails loudly', async () => {
     await writePlugin('anon.ts', `export default { transformRequest: () => null };`);
-    await expect(loadProxyRequestPlugins(root)).rejects.toThrow(/name/);
+    await expect(loadProxyRequestPlugins(root, MECHANISM_ONLY)).rejects.toThrow(/name/);
   });
 
   test('a factory that throws at load time fails loudly', async () => {
     await writePlugin('boom.ts', `export default () => { throw new Error('bad table'); };`);
-    await expect(loadProxyRequestPlugins(root)).rejects.toThrow(/bad table/);
+    await expect(loadProxyRequestPlugins(root, MECHANISM_ONLY)).rejects.toThrow(/bad table/);
   });
 
   // Names identify a plugin in the startup line and in `appliedBy`; duplicates
@@ -184,6 +190,6 @@ describe('loadProxyRequestPlugins: .lazy/plugins convention', () => {
   test('two plugins sharing a name fail loudly', async () => {
     await writePlugin('a.ts', `export default { name: 'dup', transformRequest: () => null };`);
     await writePlugin('b.ts', `export default { name: 'dup', transformRequest: () => null };`);
-    await expect(loadProxyRequestPlugins(root)).rejects.toThrow(/both use the name "dup"/);
+    await expect(loadProxyRequestPlugins(root, MECHANISM_ONLY)).rejects.toThrow(/both use the name "dup"/);
   });
 });

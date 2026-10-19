@@ -52,7 +52,7 @@ export { commandWait, waitUsage } from './wait';
 export { commandBuilder, builderUsage } from './builder';
 export { commandDoctor, doctorUsage } from './doctor';
 export { commandAuth, authUsage } from './auth';
-export { commandLogin, loginUsage, commandLogout, logoutUsage } from './login';
+export { commandLogin, loginUsage, commandLogout, logoutUsage, commandInstallClone, isInstallCloneArgs } from './login';
 export { commandLoop, loopUsage } from './loop';
 export { commandRevert, revertUsage } from './revert';
 export { commandSubmit, submitUsage } from './submit';

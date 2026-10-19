@@ -57,6 +57,13 @@ export interface McpToolCallContext {
    * render progress. A no-op when the client did not ask for progress.
    */
   reportProgress: (message?: string) => void;
+  /**
+   * Aborted when the client sends `notifications/cancelled` for this call.
+   * Never a reason to stop work (see src/mcp/server.ts): it exists for a call
+   * whose DELIVERED answer has a side effect — `lazy_wait`, whose answer marks
+   * comments delivered — so an answer nobody will read is not delivered.
+   */
+  cancelled?: AbortSignal;
 }
 
 /**

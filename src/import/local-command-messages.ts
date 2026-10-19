@@ -30,9 +30,9 @@
  * rule is narrow and structural — a message is dropped only when it consists ENTIRELY of
  * these wrappers and therefore contains no human-authored payload:
  *
- *   - `<command-args>` with anything in it is KEPT. `/compact keep awareness on last
+ *   - Human-authored `<command-args>` are KEPT. `/compact keep awareness on last
  *     night's run` is text the human typed; the wrapper around it does not make it
- *     scaffolding.
+ *     scaffolding. A predefined `/effort` setting is still housekeeping.
  *   - a message that merely QUOTES a wrapper is KEPT — someone discussing this very
  *     behaviour writes the caveat into a real message, and that message is real.
  *
@@ -88,7 +88,7 @@ const SCAFFOLDING_ELEMENTS: RegExp[] = [
  */
 const HOUSEKEEPING_COMMANDS = new Set([
   'add-dir', 'agents', 'bug', 'clear', 'compact', 'config', 'context', 'cost',
-  'doctor', 'exit', 'export', 'feedback', 'help', 'hooks', 'ide', 'init',
+  'doctor', 'effort', 'exit', 'export', 'feedback', 'help', 'hooks', 'ide', 'init',
   'install-github-app', 'login', 'logout', 'mcp', 'memory', 'migrate-installer',
   'model', 'output-style', 'permissions', 'pr-comments', 'privacy-settings',
   'release-notes', 'resume', 'status', 'statusline', 'terminal-setup', 'todos',
@@ -132,6 +132,9 @@ export function isLocalCommandScaffolding(text: string): boolean {
   // bare caveat, a stdout block) falls through to the shape rules below.
   const named = commandNameIn(rest);
   if (named !== null && !HOUSEKEEPING_COMMANDS.has(named)) return false;
+  if (named === 'effort') {
+    rest = rest.replace(/<command-args>\s*(?:low|medium|high|max|auto)\s*<\/command-args>/, '<command-args></command-args>');
+  }
 
   let consumedAny = false;
   while (rest) {
@@ -145,4 +148,13 @@ export function isLocalCommandScaffolding(text: string): boolean {
   }
 
   return consumedAny;
+}
+
+export function isHarnessNotification(text: string): boolean {
+  const trimmed = text.trim();
+  return /^<task-notification>[\s\S]*?<\/task-notification>/.exec(trimmed)?.[0] === trimmed;
+}
+
+export function isConversationNoise(text: string): boolean {
+  return isLocalCommandScaffolding(text) || isHarnessNotification(text);
 }

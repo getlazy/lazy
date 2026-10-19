@@ -28,7 +28,7 @@
  * counts as a running daemon only when its identity is VERIFIED; see
  * src/daemon/process-identity.ts for the signals and why they rank as they do.
  *
- * All filesystem access is async (fs/promises) per CLAUDE.md — this code can be
+ * All filesystem access is async (fs/promises) per AGENTS.md — this code can be
  * invoked from the daemon's own event loop, and a sync scan of ~1000 dirs would
  * stall it.
  */

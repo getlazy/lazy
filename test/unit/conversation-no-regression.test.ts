@@ -68,6 +68,21 @@ describe('isStrictPrefixConversation', () => {
   });
 });
 
+test('recapture preserves the recorded human identity', async () => {
+  const stored = { ...conv('s', ['a']), memberEmail: 'alice@example.com' };
+  const storage = stubStorage(stored);
+  await saveConversationWithoutRegression(storage, { ...conv('s', ['a', 'b']), memberEmail: 'bob@example.com' });
+  expect(storage.stored?.memberEmail).toBe('alice@example.com');
+});
+
+test('filtering old noise does not let a stale copy overwrite later real messages', async () => {
+  const stored = conv('s', ['noise', 'a', 'b']);
+  stored.messages[0].text = '<command-name>/effort</command-name><command-args></command-args>';
+  const storage = stubStorage(stored);
+  expect(await saveConversationWithoutRegression(storage, conv('s', ['a']))).toBe('skipped-regression');
+  expect(storage.saveCalls).toHaveLength(0);
+});
+
 describe('saveConversationWithoutRegression', () => {
   test('refuses to shorten a stored conversation', async () => {
     const storage = stubStorage(conv('s', ['a', 'b', 'c']));

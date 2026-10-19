@@ -34,7 +34,7 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { installFakeDocker, type FakeDocker } from '../helpers/fake-docker';
 import { getDaemonTcpTarget, readToken } from '../../src/daemon/lifecycle';
 import { DaemonClient, RpcApplicationError } from '../../src/daemon/client';
-import { NO_OWNER_CREDENTIAL_MARKER } from '../../src/daemon/turn-credentials';
+import { NO_OWNER_ENDPOINT_CREDENTIAL_MARKER } from '../../src/daemon/member-credentials';
 import { RemoteStorage } from '../../src/storage/remote-storage';
 import type { BuilderResumeIntent } from '../../src/storage/types';
 
@@ -111,7 +111,7 @@ describe('daemon-owned builder session: credential binding and registry', () => 
 
     const { status, body } = await rpc('startBuilderSession', {});
     expect(status).toBe(400);
-    expect(body.error).toContain(NO_OWNER_CREDENTIAL_MARKER);
+    expect(body.error).toContain(NO_OWNER_ENDPOINT_CREDENTIAL_MARKER);
     expect(body.error).toContain(GIT_EMAIL);
 
     // Refused before any row was written — no orphaned 'starting' session left
@@ -127,7 +127,7 @@ describe('daemon-owned builder session: credential binding and registry', () => 
   test('outside team mode, no credential is required before the container step', async () => {
     const { status, body } = await rpc('startBuilderSession', {});
     // Never the credential refusal.
-    expect(body.error ?? '').not.toContain(NO_OWNER_CREDENTIAL_MARKER);
+    expect(body.error ?? '').not.toContain(NO_OWNER_ENDPOINT_CREDENTIAL_MARKER);
     // The runtime refuses the container, so the launch fails past the
     // credential gate — proving the gate was cleared rather than skipped.
     expect(status).toBeGreaterThanOrEqual(400);

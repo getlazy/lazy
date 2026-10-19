@@ -14,7 +14,7 @@
  * it has gone stale — a turn must not fail on a token that CAN be renewed — but
  * it cannot persist the result: the environment of an already-running daemon is
  * not lazy's to rewrite, and silently moving a credential from the variable the
- * user exported into the store would be exactly the hidden side effect CLAUDE.md
+ * user exported into the store would be exactly the hidden side effect AGENTS.md
  * forbids. The renewed session therefore lives in {@link renewed}, an in-memory
  * map, for this daemon's lifetime, which is why the store is the documented home.
  *

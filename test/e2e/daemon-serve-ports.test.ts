@@ -1,10 +1,10 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { readFile, writeFile } from 'fs/promises';
+import { mkdir, readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
-import { readProjectSettingsFile } from '../helpers/storage';
+import { readProjectSettingsFile, worktreePathFor } from '../helpers/storage';
 import { openSse, frameData } from '../helpers/sse';
 import { DaemonClient, RpcApplicationError } from '../../src/daemon/client';
 import { getDaemonTcpTarget, readToken } from '../../src/daemon/lifecycle';
@@ -103,8 +103,9 @@ describe('daemon servePorts RPC', () => {
     const state = await rpc('servePorts', { taskId }) as Record<string, unknown>;
     expect(state.declared).toEqual([]);
     expect(state.services).toEqual([]);
-    // Nothing declared is not an outage — there is simply nothing to publish.
-    expect(state.unavailable).toBeNull();
+    // Nothing declared, but the container's state is still reported: Start
+    // services needs no declaration, and the Services tab always shows it.
+    expect(state.unavailable).toBe('not-running');
     expect(typeof state.taskId).toBe('string');
     expect(state.status).toBe('backlog');
   });
@@ -131,6 +132,63 @@ describe('daemon servePorts RPC', () => {
     expect(state.runnerType).toBe('docker');
   });
 
+  // INVARIANT: ports only the task BRANCH declares come back as advice data
+  // (name, port, copyable command) and never govern the container. The Teams
+  // Services tab renders them as "Ports on this branch only".
+  test('servePorts carries branch-only ports as advice', async () => {
+    await declareServePorts();
+    const taskId = await createTask(ctx, 'Serve ports: branch advice');
+    const worktree = worktreePathFor(ctx.root, taskId);
+    await mkdir(worktree, { recursive: true });
+    await writeFile(join(worktree, 'lazy.toml'), '[serve]\nports = [3000, 4000]\n');
+
+    const without = await rpc('servePorts', { taskId }) as { branchAdvice: unknown[] };
+    expect(without.branchAdvice).toEqual([]);
+
+    const state = await rpc('servePorts', { taskId, includeBranchAdvice: true }) as {
+      branchAdvice: Array<{ name: string; port: number; command: string }>;
+      declared: Array<{ port: number }>;
+    };
+    // 3000 is on the root already; only 4000 is branch-only.
+    expect(state.branchAdvice.map((a) => a.port)).toEqual([4000]);
+    expect(state.branchAdvice[0]!.command).toContain('lazy forward');
+    expect(state.declared.map((s) => s.port)).toEqual([3000, 5173]);
+  });
+
+  // --- Start services in the task's container ---
+
+  // INVARIANT: Start services runs the PROJECT's designated command, never a
+  // caller-supplied one — the RPC takes a task and nothing else to run.
+  test('serve.run refuses without a designated command, and validates its task', async () => {
+    const taskId = await createTask(ctx, 'Serve run: no command');
+    const none = await rpcStatus('serve.run', { taskId });
+    expect(none.status).toBe(409);
+    expect(none.message).toMatch(/No Start services command is designated/);
+
+    expect((await rpcStatus('serve.run', {})).status).toBe(400);
+    expect((await rpcStatus('serve.run', { taskId: 'deadbeef' })).status).toBe(404);
+  });
+
+  test('serve.stop has nothing to stop while the task\'s container is down', async () => {
+    const taskId = await createTask(ctx, 'Serve stop: container down');
+    expect(await rpc('serve.stop', { taskId })).toEqual({ stopped: false });
+    expect((await rpcStatus('serve.stop', { taskId: 'deadbeef' })).status).toBe(404);
+  });
+
+  // INVARIANT: what Start services is doing is read from the task's container
+  // itself; with the container down the answer is null ("nothing to ask"),
+  // never a stale remembered state — and the container's state is reported
+  // even when no port is declared, since Start services needs no declaration.
+  test('servePorts reports Start services state only from a running container', async () => {
+    const taskId = await createTask(ctx, 'Serve ports: services run state');
+    const state = await rpc('servePorts', { taskId, includeServicesRun: true }) as { servicesRun: unknown; unavailable: string | null; runnerType: string };
+    expect(state.servicesRun).toBeNull();
+    expect(state.unavailable).toBe('not-running');
+    expect(state.runnerType).toBe('docker');
+    // A longer output tail is asked for by number; anything else is refused at the boundary.
+    await expect(rpc('servePorts', { taskId, includeServicesRun: true, servicesLogBytes: 'all' })).rejects.toThrow(/servicesLogBytes must be a number/);
+  });
+
   // --- Start services command ---
 
   // The command Lazy Teams shows and designates. It rides on servePorts so a
@@ -148,10 +206,23 @@ describe('daemon servePorts RPC', () => {
 
     state = await rpc('servePorts', { taskId }) as { startServicesCmd: string };
     expect(state.startServicesCmd).toBe('bin/dev');
-    expect(await rpc('serve.getStartServicesCmd')).toEqual({ command: 'bin/dev' });
+    expect(await rpc('serve.getStartServicesCmd')).toEqual({ command: 'bin/dev', stopCommand: '' });
     expect(readProjectSettingsFile(ctx.root)?.startServicesCmd).toBe('bin/dev');
     // INVARIANT: designation never edits lazy.toml.
     expect(await readFile(join(ctx.root, 'lazy.toml'), 'utf-8')).toBe(tomlBefore);
+  });
+
+  // INVARIANT: the Stop services command is designated, read back and cleared
+  // through the daemon's store, validated like Start, and survives a settings-form save.
+  test('Stop services command: set, read back, survive a settings save, clear', async () => {
+    expect(await rpc('serve.setStopServicesCmd', { command: '  bin/stop ', actor: 'human' })).toEqual({ command: 'bin/stop' });
+    expect(await rpc('serve.getStartServicesCmd')).toEqual({ command: '', stopCommand: 'bin/stop' });
+    expect((await rpcStatus('serve.setStopServicesCmd', { command: '  ' })).status).toBe(400);
+    expect((await rpcStatus('serve.setStopServicesCmd', { command: 'a\nb' })).status).toBe(400);
+    await rpc('setProjectSettings', { actor: 'human' });
+    expect(((await rpc('serve.getStartServicesCmd')) as { stopCommand: string }).stopCommand).toBe('bin/stop');
+    expect(await rpc('serve.clearStopServicesCmd')).toEqual({ command: '' });
+    expect(((await rpc('serve.getStartServicesCmd')) as { stopCommand: string }).stopCommand).toBe('');
   });
 
   test('serve.setStartServicesCmd refuses a multi-line or blank command with a 400', async () => {

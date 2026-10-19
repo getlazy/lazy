@@ -13,6 +13,7 @@ import { commandTokens, tokensUsage } from './tokens';
 import { commandTools, toolsUsage } from './tools';
 import { commandTimings, timingsUsage } from './timings';
 import { commandAudit, auditUsage } from './audit';
+import { commandLatency, latencyUsage } from './latency';
 import { commandLimits, limitsUsage } from './limits';
 import { commandBudget, budgetUsage } from './budget';
 
@@ -39,6 +40,9 @@ export async function commandStats(args: string[]): Promise<void> {
     case 'audit':
       await commandAudit(sub);
       break;
+    case 'latency':
+      await commandLatency(sub);
+      break;
     case 'limits':
       await commandLimits(sub);
       break;
@@ -64,6 +68,7 @@ export const statsSubcommandUsage: Record<string, () => void> = {
   'tools': toolsUsage,
   'timings': timingsUsage,
   'audit': auditUsage,
+  'latency': latencyUsage,
   'limits': limitsUsage,
   'budget': budgetUsage,
 };
@@ -77,6 +82,7 @@ Subcommands:
   tokens    Token accounting from the proxy audit trail (by role, task and model)
   tools     One task's per-tool breakdown — which tool filled its context
   audit     Browse the proxy audit trail record by record (filters + detail view)
+  latency   Time to first token / last token and tokens per second, by model, endpoint and tier
   timings   Recorded request traces, ranked by self time
   limits    Latest usage-limit reading per credential (subscription / rate-limit windows)
   budget    Token budgets: per-window spend and what is left, per harness / task / day

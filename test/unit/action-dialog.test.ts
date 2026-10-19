@@ -20,6 +20,10 @@ describe('action dialog protection-gate remedy', () => {
     expect(html).toContain('id="lz-action-remedy"');
     expect(html).toContain('id="lz-action-error"');
     expect(html).toContain('id="lz-action-steps"');
+    expect(html.match(/<details open class="lz-action-output">/g)).toHaveLength(3);
+    expect(html).toContain('<summary>Progress</summary>');
+    expect(html).toContain('<summary>Error</summary>');
+    expect(html).toContain('<summary>Next steps</summary>');
   });
 
   test('a passphrase refusal renders the field first and skips the duplicate error', () => {

@@ -242,7 +242,7 @@ export function pathRefusalReasonText(reason: PathRefusalReason): string {
 }
 
 /**
- * The body returned to the refused caller. Actionable per CLAUDE.md: it names
+ * The body returned to the refused caller. Actionable per AGENTS.md: it names
  * exactly what was refused, states the rule, and says what to do if the need is
  * legitimate — the allowlist is source, so the remedy is a code change, and
  * saying so beats letting someone hunt for a config key that does not exist.
@@ -256,7 +256,7 @@ export function pathRefusalMessage(
   const surface = tier === 'role'
     ? "a per-profile upstream (an agent profile's endpoint, such as a local ollama server)"
     : tier === 'openai'
-      ? 'an OpenAI-compatible upstream (api.openai.com, openrouter.ai)'
+      ? 'an OpenAI-compatible upstream (api.openai.com, openrouter.ai, api.fireworks.ai)'
       : 'the Anthropic upstream';
   const allowed = PROXY_ALLOWED_ROUTES
     .filter((r) => r.tiers.includes(tier))

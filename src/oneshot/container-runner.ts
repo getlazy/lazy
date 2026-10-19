@@ -55,8 +55,25 @@ export async function createOneshotRunner(lazyRoot: string): Promise<Runner> {
       `Machine one-shots require a container-capable agent, but the "${profileName}" profile runs ` +
       `${harness}, which does not support container runners. That profile is what ` +
       `[models.roles.builder] agent points at (falling back to [agent] agent_id when the role ` +
-      `names none) — point it at a profile whose harness is claude-code, codex, cursor, or pi, ` +
+      `names none) — point it at a profile whose harness is claude-code, ` +
       `and ensure Docker is running.`,
+    );
+  }
+
+  // INVARIANT: a one-shot never leaves the proxy. Only Claude Code's route is
+  // carried by the auth env a one-shot gets (ANTHROPIC_BASE_URL); codex, cursor
+  // and pi each need launch env or per-turn config files that only the
+  // supervised task-turn path writes (codexLaunchEnvVars + ~/.codex/config.toml,
+  // cursorLaunchEnvVars + --agent-endpoint, piLaunchEnvVars + models.json).
+  // Without them those agents dial their vendor's default upstream with a
+  // placeholder — unaudited, and failing anyway. Refuse loudly instead.
+  if (harness !== 'claude-code') {
+    throw new Error(
+      `Machine one-shots (lazy report, ask over a stored conversation, memory compaction, ` +
+      `accept-time summaries) run on Claude Code only for now: the "${profileName}" profile runs ` +
+      `${harness}, whose one-shots cannot yet be routed through lazy's proxy. Point ` +
+      `[models.roles.builder] agent at a claude-code profile (local Ollama or another Anthropic-wire ` +
+      `endpoint works) and retry.`,
     );
   }
 

@@ -47,6 +47,7 @@
  * still reported and never retried.
  */
 
+import { MCP_CAPABILITIES, type McpCapability } from '../mcp/tool-roles';
 import { readFileSync } from 'fs';
 import { readFile } from 'fs/promises';
 import type { McpToolCallContext, McpToolHandler } from '../mcp/types';
@@ -84,6 +85,8 @@ export interface DaemonMcpConfig {
    * source a 401 refresh re-reads. Absent for configs built in memory (tests).
    */
   sourcePath?: string;
+  /** Capabilities the daemon granted this identity (advertisement only — see tool-roles). */
+  capabilities?: McpCapability[];
 }
 
 /**
@@ -478,7 +481,16 @@ export function createDaemonProxyHandler(
   const reconnectWindowMs = options?.reconnectWindowMs ?? RECONNECT_WINDOW_MS;
   const reauthWindowMs = options?.reauthWindowMs ?? REAUTH_WINDOW_MS;
 
-  const sendOnce = async (args: Record<string, unknown>): Promise<Response> => {
+  // `lazy_wait`'s DELIVERED answer marks the caller's comments delivered
+  // (ctx.afterDelivery in src/mcp/tools.ts). When our client cancelled the
+  // call — its own tool timeout fired — it will never show that answer to its
+  // model, so the connection is dropped and the daemon never sees it delivered:
+  // the claim stays outstanding and the next wait or turn re-issues it. The
+  // daemon still runs the call to completion; only the receipt is withheld.
+  // Every other tool keeps its connection and its reply is read as before.
+  const abortOnCancel = toolName === 'lazy_wait';
+
+  const sendOnce = async (args: Record<string, unknown>, signal?: AbortSignal): Promise<Response> => {
     const encodedTool = encodeURIComponent(toolName);
     const encodedTask = encodeURIComponent(config.taskId || '_');
     const { url: base, init } = buildTargetRequest(
@@ -499,6 +511,7 @@ export function createDaemonProxyHandler(
         ...heartbeatRequestHeaders(),
       },
       body: JSON.stringify({ arguments: args }),
+      ...(signal ? { signal } : {}),
     };
 
     return await fetch(base, fetchOptions);
@@ -536,8 +549,9 @@ export function createDaemonProxyHandler(
 
     for (;;) {
       try {
-        return await sendOnce(args);
+        return await sendOnce(args, abortOnCancel ? ctx?.cancelled : undefined);
       } catch (err) {
+        if (abortOnCancel && ctx?.cancelled?.aborted) throw err; // reported by the wrapper below
         // fetch throws (rather than returning a non-2xx) when the connection
         // could not be established OR when an established connection died.
         // Those need opposite handling, so classify instead of blaming a down
@@ -610,7 +624,7 @@ export function createDaemonProxyHandler(
     return false;
   };
 
-  return async (args: Record<string, unknown>, ctx?: McpToolCallContext): Promise<unknown> => {
+  const call = async (args: Record<string, unknown>, ctx?: McpToolCallContext): Promise<unknown> => {
     let response = await send(args, ctx);
 
     // A 401 is recoverable when the daemon has rewritten the mounted config
@@ -687,6 +701,18 @@ export function createDaemonProxyHandler(
 
     return body.result;
   };
+
+  return async (args: Record<string, unknown>, ctx?: McpToolCallContext): Promise<unknown> => {
+    try {
+      return await call(args, ctx);
+    } catch (err) {
+      // Our own abort (connect or mid-read) is a cancellation, not a lost daemon.
+      if (abortOnCancel && ctx?.cancelled?.aborted) {
+        throw new Error(`${toolName} was cancelled by the client; nothing it handed over was marked delivered`);
+      }
+      throw err;
+    }
+  };
 }
 
 /**
@@ -734,6 +760,8 @@ export async function signalDaemonShutdown(config: DaemonMcpConfig): Promise<voi
  * launching the container).
  */
 export interface DaemonMcpConfigFile {
+  /** Capabilities granted to this identity; absent means none. */
+  capabilities?: unknown;
   /** Bearer token */
   token: string;
   /** Project root path */
@@ -763,7 +791,17 @@ export function readDaemonMcpConfig(configPath: string): DaemonMcpConfig {
     taskId: raw.taskId,
     target: raw.target,
     sourcePath: configPath,
+    capabilities: knownCapabilities(raw.capabilities),
   };
+}
+
+/**
+ * The capabilities a config file grants, keeping only names lazy knows:
+ * anything else in the file is dropped, never served. Shared by BOTH readers —
+ * the container MCP server uses the retrying one.
+ */
+export function knownCapabilities(raw: unknown): McpCapability[] {
+  return Array.isArray(raw) ? MCP_CAPABILITIES.filter((c) => (raw as unknown[]).includes(c)) : [];
 }
 
 /**
@@ -786,6 +824,7 @@ export async function readDaemonMcpConfigWithRetry(configPath: string): Promise<
         taskId: raw.taskId,
         target: raw.target,
         sourcePath: configPath,
+        capabilities: knownCapabilities(raw.capabilities),
       };
     } catch (err) {
       lastErr = err;

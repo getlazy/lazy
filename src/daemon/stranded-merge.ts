@@ -70,6 +70,7 @@ import type { ActorInput, Task, TaskStatus } from '../types';
 import { createDriver } from '../remote';
 import { loadConfig } from '../config/loader';
 import { pausedStatusFor } from '../utils/paused-status';
+import { resolveProtectedFileDeferral } from '../protection/deferral';
 import { displayId } from '../task/identity';
 import { logger } from '../utils/logger';
 import { isTaskLifecycleLocked, tryWithTaskLifecycleLock } from './task-lifecycle-lock';
@@ -135,14 +136,36 @@ export function mergeOwnerIsLive(taskId: string): boolean {
  * `submitted` before the accept goes back to `submitted` — it has an open PR
  * awaiting review, and rewriting that to `blocked` loses a real signal. Any
  * other recorded prior status rests at `blocked`.
+ *
+ * `protectedFilesDeferred` is the deferral answer (src/protection/deferral.ts):
+ * a task whose protected-file questions belong to its parent's accept owes
+ * nothing here, so its records never make it `conflict` — the same rule
+ * `parkTaskPaused` applies. {@link restingStatusOf} supplies it.
  */
 export function strandedMergeRestingStatus(
   turns: Parameters<typeof pausedStatusFor>[0],
   recordedPriorStatus: TaskStatus | null,
+  protectedFilesDeferred = false,
 ): TaskStatus {
   const paused = pausedStatusFor(turns);
-  if (paused === 'conflict') return 'conflict';
+  if (paused === 'conflict' && !protectedFilesDeferred) return 'conflict';
   return recordedPriorStatus === 'submitted' ? 'submitted' : 'blocked';
+}
+
+/**
+ * {@link strandedMergeRestingStatus} with the deferral read done: asked only
+ * when the records alone would say `conflict`, since that is the one answer
+ * deferral can change.
+ */
+async function restingStatusOf(
+  storage: Storage,
+  task: Task,
+  turns: Parameters<typeof pausedStatusFor>[0],
+): Promise<TaskStatus> {
+  const recorded = (task.metadata?.[ACCEPT_IN_FLIGHT_KEY] || null) as TaskStatus | null;
+  const deferred = pausedStatusFor(turns) === 'conflict'
+    && (await resolveProtectedFileDeferral(storage, task, turns)) !== null;
+  return strandedMergeRestingStatus(turns, recorded, deferred);
 }
 
 /**
@@ -178,7 +201,7 @@ export async function recoverStrandedMerge(
     );
   }
 
-  const status = strandedMergeRestingStatus(turns, recorded);
+  const status = await restingStatusOf(storage, task, turns);
   await storage.updateTaskStatus(task.id, status, actor);
   // Clear the marker only AFTER the status write lands: the marker is what a
   // later accept (or another recovery) reads to know a local merge died, so it
@@ -293,7 +316,7 @@ async function previewRestingStatus(storage: Storage, task: Task): Promise<TaskS
   try {
     const sess = await storage.getSessionByTaskId(task.id);
     const turns = sess ? await storage.getSessionTurns(sess.id) : [];
-    return strandedMergeRestingStatus(turns, (task.metadata?.[ACCEPT_IN_FLIGHT_KEY] || null) as TaskStatus | null);
+    return await restingStatusOf(storage, task, turns);
   } catch {
     // Only used to phrase a comment; the authoritative pick happens in
     // recoverStrandedMerge, which logs its own fallback.

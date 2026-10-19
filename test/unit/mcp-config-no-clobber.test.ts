@@ -5,7 +5,7 @@
  * silently deleting every other MCP server and every permission the user had —
  * a destructive edit with no copy to restore from.
  *
- * Per CLAUDE.md's "found but broken" rule: missing falls through to defaults,
+ * Per AGENTS.md's "found but broken" rule: missing falls through to defaults,
  * present-and-unparseable is an error the human must see. `prepareTurnMcp` fails
  * the turn on a config-write error, so throwing surfaces properly.
  *

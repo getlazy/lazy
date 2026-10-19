@@ -2,7 +2,7 @@
  * Source templates emitted by `lazy customize proxy-plugin`.
  *
  * These are CODE scaffolds, not prompts — the guide prompt that ships alongside
- * them lives in src/prompts/customize-proxy-plugin-guide.md per CLAUDE.md. They
+ * them lives in src/prompts/customize-proxy-plugin-guide.md per AGENTS.md. They
  * are kept here, apart from the command, so the command file stays about
  * argument handling and the templates stay readable as the files they become.
  *
@@ -15,9 +15,10 @@ export const PLUGIN_TEMPLATE = `/**
  * WHAT THIS CHANGES:  <describe exactly which request fields this rewrites>
  * WHAT IT NEVER TOUCHES:  <messages, input_schema, cache_control, ...>
  *
- * Loaded automatically by lazy's proxy from .lazy/plugins/ — presence is the
- * enable switch, there is no lazy.toml key. Plugins run in sorted-filename
- * order and the chain is a fold: each sees the previous one's output.
+ * NOT currently loaded: lazy never runs code from the repository inside its own
+ * process on the host, so lazy ignores .lazy/plugins/ (the daemon log and
+ * lazy doctor list it). Plugins are written to run in sorted-filename order,
+ * and the chain is a fold: each sees the previous one's output.
  *
  * THE CONTRACT (breaking any of these is a bug, not a style choice):
  *   - PURE, SYNCHRONOUS, DETERMINISTIC. Same body in, same body out. No I/O, no

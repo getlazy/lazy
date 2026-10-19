@@ -160,8 +160,8 @@ describe('accept does not re-ask about an accepted child\'s protected files', ()
   /**
    * Same shape as `parentWithAcceptedChild`, but the child's work was launched
    * by an AGENT (the record an MCP start writes), so the child is
-   * agent-audience (final-turn design §13.3). Its final runs no wrap-up steps
-   * at all — nobody ever asked about its protected file.
+   * agent-audience (final-turn design §13.3). Its final is SEEDED, so no
+   * wrap-up step ran — nobody ever asked about its protected file.
    */
   async function parentWithAcceptedAgentChild(): Promise<string> {
     const parentId = await createTask(ctx, 'Hub', 'Parent work');

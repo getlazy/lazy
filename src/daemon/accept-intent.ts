@@ -99,6 +99,13 @@ export interface AcceptFollowThrough {
    * written before this step existed, which is "nothing to close".
    */
   closeReview?: boolean;
+  /**
+   * The person who accepted, when one did: the follow-through's model run (the
+   * parent's fidelity summary) is part of their accept and is paid by them in
+   * team mode. Absent for an accept nobody made (a forge merge seen by sync),
+   * and on records written before this existed — the service holder pays.
+   */
+  payerEmail?: string;
   /** Target HEAD right after a LOCAL merge: what the accept tag points at. */
   mergeSha?: string;
   done: FollowThroughStep[];

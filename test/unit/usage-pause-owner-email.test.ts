@@ -17,7 +17,7 @@ import { initDaemonStorage, getOrCreateStorage, closeAllStorage, handleRpc } fro
 import { resetUsagePauseStateForTest } from '../../src/daemon/usage-pause';
 import { resetUsageReadingsForTest } from '../../src/daemon/usage-readings';
 import { clearUserCredentialCache, putUserCredential } from '../../src/daemon/user-credentials';
-import { daemonUsageLimits } from '../../src/proxy/usage-limits';
+import { daemonUsageLimits, memberEndpointUsageKey } from '../../src/proxy/usage-limits';
 import { enableInProcessTestMode } from '../helpers/in-process-test-mode';
 import { pinConfig } from '../helpers/pin-config';
 
@@ -47,7 +47,7 @@ describe('usagePause get with ownerEmail', () => {
     taskId = (await storage.createTask('Paused for Ada')).id;
     const now = Date.now();
     daemonUsageLimits.observeReading({
-      credential: `user:${MEMBER}`, ts: now, upstream: 'https://api.anthropic.com', backend: 'proxy',
+      credential: memberEndpointUsageKey(MEMBER, 'builtin:anthropic'), ts: now, upstream: 'https://api.anthropic.com', backend: 'proxy',
       status: 200, taskId: null, model: null,
       headers: {
         'anthropic-ratelimit-unified-5h-utilization': '0.97',
@@ -73,14 +73,14 @@ describe('usagePause get with ownerEmail', () => {
     const asService = await handleRpc('usagePause', root, { taskId }, undefined, control) as {
       task: { credential: string | null; verdict: unknown };
     };
-    expect(asService.task.credential).toBe('user:__service__');
+    expect(asService.task.credential).toBeNull();
     expect(asService.task.verdict).toBeNull();
 
     const asMember = await handleRpc('usagePause', root, { taskId, ownerEmail: MEMBER }, undefined, control) as {
       task: { credential: string | null; verdict: { credential: string; usedPercent: number } | null };
     };
-    expect(asMember.task.credential).toBe(`user:${MEMBER}`);
-    expect(asMember.task.verdict?.credential).toBe(`user:${MEMBER}`);
+    expect(asMember.task.credential).toBe(memberEndpointUsageKey(MEMBER, 'builtin:anthropic'));
+    expect(asMember.task.verdict?.credential).toBe(memberEndpointUsageKey(MEMBER, 'builtin:anthropic'));
     expect(asMember.task.verdict?.usedPercent).toBe(97);
   });
 });

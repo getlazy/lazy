@@ -21,7 +21,7 @@ import type { AgentResponse } from '../types';
 import type { Runner, RunInfo, FollowHandle, HealthCheck, RunStream } from './types';
 import type { PhaseNotify } from '../daemon/progress';
 import type { PortBinding } from '../serve/ports';
-import type { RoleTarget, SandboxBoundaryVerification } from '../config/types';
+import type { RoleTarget } from '../config/types';
 import {
   profileNameForAgent,
   profileForAgentNameOrNull,
@@ -32,7 +32,7 @@ import { getAuthEnvVars as getDefaultAuthEnvVars, getLaunchAuthEnvVars } from '.
 import { findLazyRoot } from '../project-paths';
 import { getTaskEnv, recordTaskEnvLaunched, taskEnvKeysEnv } from '../daemon/task-env';
 import { sessionCredentialEnvFor } from '../daemon/turn-credentials';
-import { mintCredentialGrant } from '../proxy/credential-broker';
+import { mintCredentialGrant, pinGrantsToAddresses } from '../proxy/credential-broker';
 import type { LaunchIdentity } from '../proxy/placeholder-env';
 import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
 import { getAgentPackaging } from '../agent/registry';
@@ -62,7 +62,9 @@ import { hasDaemonContext, getDaemonContext } from '../daemon/context';
 import { loadConfig } from '../config/loader';
 import { getLazyCommand } from '../utils/cli-path';
 import type { Agent } from '../agent/interface';
-import { safeArgvPrompt } from '../agent/argv-safety';
+import { assertArgvBounded, systemPromptArgv } from '../agent/argv-safety';
+import { SYSTEM_PROMPT_FILE_ARG } from '../agent/interface';
+import { withSystemPromptFile } from '../agent/system-prompt-file';
 import { snapshotSessionFiles, captureConversation } from '../import/capture-session';
 import { buildAgentSandboxArgs, withGitPointerDenyArgs, type HostPermissionConfig } from './host-sandbox';
 import { hostGitPointerDenyPaths } from '../git/worktree-pointers';
@@ -71,7 +73,6 @@ import type { LaunchBuilderHeadlessParams, LaunchBuilderHeadlessResult } from '.
 import { DEFAULT_ONESHOT_TIMEOUT_MS, ONESHOT_KILL_GRACE_MS } from '../oneshot/args';
 import { buildBuilderHeadlessClaudeArgs, builderHeadlessModel, parseBuilderHeadlessStdout } from './builder-headless';
 import { buildBuilderPermissionArgs } from './host-sandbox';
-import { ensureHostBoundaryVerified, diagnoseBoundaryVerdict } from './host-boundary-guard';
 
 import hostProcessBuilderInstructions from '../prompts/host-process-builder-runner-instructions.md' with { type: 'text' };
 
@@ -475,17 +476,6 @@ export class HostProcessRunner implements Runner {
     this._hostPermission = cfg;
   }
 
-  // Runtime file-tool boundary verification. Defaults to 'off' — the standing
-  // signal is CI, not every launch. Deliberately NOT part of
-  // HostPermissionConfig: that object defines the posture that becomes the
-  // agent's --settings, and a policy knob has no business inside it.
-  private _verifyBoundary: SandboxBoundaryVerification = 'off';
-
-  /** Set the runtime boundary-verification mode from lazy.toml. */
-  setBoundaryVerification(mode: SandboxBoundaryVerification): void {
-    this._verifyBoundary = mode;
-  }
-
   /** The resolved target for task/supervisor (agent) launches. */
   private agentTarget(): RoleTarget {
     return this._roleTargets?.agent ?? ANTHROPIC_DEFAULT_TARGET;
@@ -602,15 +592,6 @@ export class HostProcessRunner implements Runner {
       }
     }
 
-    // File-tool boundary verification (opt-in via [runner]
-    // verify_sandbox_boundary). The OS sandbox check above covers Bash; this
-    // covers the Read/Edit/Write tools, which bypass the OS sandbox and are held
-    // back only by the permissions.deny rules Claude Code honors for us. Throws
-    // HostBoundaryBrokenError — refusing the launch — when a deny rule was
-    // provably violated on this Claude Code version. See host-boundary-guard.ts
-    // for why this is off by default and why an inconclusive run only warns.
-    await ensureHostBoundaryVerified(this._hostPermission, this._verifyBoundary);
-
     // Auth is NOT enforced here. The turn credential gate
     // (src/daemon/credential-gate.ts) is the single enforcement point.
     // Early, non-fatal reachability nudge for every upstream lazy probes
@@ -711,7 +692,7 @@ export class HostProcessRunner implements Runner {
     );
 
     // Non-claude agents with a managed API key (cursor): resolve it at LAUNCH
-    // time (env override → per-project .lazy credentials file) so a key set
+    // time (env override → credential store) so a key set
     // while the daemon runs takes effect on the next launch. No gate here:
     // a host process can also use the agent's own login session, and the CLI
     // fails with its own actionable auth error when neither exists.
@@ -730,6 +711,8 @@ export class HostProcessRunner implements Runner {
         const placeholder = await mintCredentialGrant(this.lazyRoot, {
           ...supervisorIdentity, envKey: envVar,
         });
+        // A host process is not in a container: no address pin applies.
+        await pinGrantsToAddresses(this.lazyRoot, supervisorIdentity.label, null);
         authEnvVars.push({ key: envVar, value: placeholder });
         logger.debug(`Resolved ${this._agent.id} API key from ${key.source}; host launch gets a placeholder`);
       }
@@ -812,6 +795,12 @@ export class HostProcessRunner implements Runner {
     // call requireDaemonStorage() which skips the daemon connection when
     // LAZY_IS_DAEMON=1, breaking MCP tool execution.
     delete cleanEnv.LAZY_IS_DAEMON;
+    // LAZY_DAEMON_CONFIG: names a daemon and carries a task token. A supervisor
+    // may only ever hold the one ITS daemon issued (set below when it issues
+    // one); inheriting the daemon process's own — a daemon run from inside a
+    // task container, as lazy's own tests are — pointed the supervisor at a
+    // DIFFERENT daemon, acting with another task's token.
+    delete cleanEnv.LAZY_DAEMON_CONFIG;
 
     const proc = spawn(supervisorArgs, {
       cwd: sandbox.worktreePath,
@@ -890,8 +879,9 @@ export class HostProcessRunner implements Runner {
       ? await hostGitPointerDenyPaths(sandbox.worktreePath)
       : null;
     const sandboxArgs = buildAgentSandboxArgs(this._hostPermission);
+    // The prompt rides stdin, never argv (src/agent/argv-safety.ts).
     const claudeArgs = [
-      'claude', '-p', safeArgvPrompt(prompt, 'prompt'),
+      'claude', '-p',
       '--output-format', 'json',
       '--dangerously-skip-permissions',
       ...(pointerPaths ? withGitPointerDenyArgs(sandboxArgs, pointerPaths)! : sandboxArgs),
@@ -910,8 +900,10 @@ export class HostProcessRunner implements Runner {
     delete cleanEnv.CLAUDECODE;
     delete cleanEnv.LAZY_IS_DAEMON;
 
+    assertArgvBounded(claudeArgs, 'Claude Code');
     const proc = spawn(claudeArgs, {
       cwd: sandbox.worktreePath,
+      stdin: new Blob([prompt]),
       stdout: 'pipe',
       stderr: verbose || debug ? 'inherit' : 'pipe',
       timeout: 0, // Long-running: Claude Code sessions can take minutes or hours
@@ -1294,12 +1286,9 @@ export class HostProcessRunner implements Runner {
           }
           results.push(present
             ? { state: 'ok', what: `Sandbox dependency: ${tool}` }
-            : { state: 'fail', what: `Sandbox dependency: ${tool}`, reason: `${tool} not on PATH — install bubblewrap and socat, or set permission_mode = "bypass"` });
+            : { state: 'fail', what: `Sandbox dependency: ${tool}`, problem: `Sandbox dependency ${tool} is missing`, reason: `${tool} not on PATH — install bubblewrap and socat, or set permission_mode = "bypass"` });
         }
       }
-      // The file-tool half of the boundary. Read-only here: doctor reports the
-      // cached verdict and never spends nine headless sessions of its own.
-      results.push(await diagnoseBoundaryVerdict(this._hostPermission, this._verifyBoundary));
     }
 
     // Check connectivity for any role whose upstream lazy probes (see
@@ -1311,7 +1300,7 @@ export class HostProcessRunner implements Runner {
       if (check.reachable) {
         results.push({ state: 'ok', what: `[${role}] ${target.profile} reachable at ${check.endpoint}` });
       } else {
-        results.push({ state: 'fail', what: `[${role}] ${target.profile} reachable`, reason: check.reason });
+        results.push({ state: 'fail', what: `[${role}] ${target.profile} reachable`, problem: `[${role}] ${target.profile} is unreachable`, reason: check.reason });
       }
     }
 
@@ -1367,35 +1356,41 @@ export class HostProcessRunner implements Runner {
     // a workspace dir. See src/builder/scratch.ts.
     const scratchDir = await ensureBuilderScratchDir(lazyRoot);
 
-    const claudeArgs = [
-      'claude',
-      '--append-system-prompt', safeArgvPrompt(systemPrompt, 'builder system prompt'),
-      // No supervisor here: strip the host→supervisor override markers claude must not see.
-      ...applyLaunchDirective(claudeExtraArgs, undefined),
-    ];
-
-    if (debug) {
-      console.log('[DEBUG] Launching Claude Code directly:', redactSecrets(claudeArgs).join(' '));
-    }
-
-    logger.info('Launching Claude Code...');
-
     // Snapshot JSONL file times before launch for conversation capture
     const beforeSnapshot = await snapshotSessionFiles(lazyRoot);
 
-    const proc = spawn(claudeArgs, {
-      cwd: lazyRoot,
-      stdin: 'inherit',
-      stdout: 'inherit',
-      stderr: 'inherit',
-      env: {
-        ...process.env,
-        ...Object.fromEntries(builderEnvVars.map(v => [v.key, v.value])),
-        [SCRATCH_ENV_VAR]: scratchDir,
-      },
-    });
+    // A large system prompt rides a file, never argv (src/agent/argv-safety.ts);
+    // a small one stays inline, as every other launch keeps it.
+    const promptArgs = systemPromptArgv(systemPrompt, '--append-system-prompt', '--append-system-prompt-file');
+    const exitCode = await withSystemPromptFile(systemPrompt, async (systemPromptFile) => {
+      const claudeArgs = [
+        'claude',
+        ...promptArgs.args.map(a => a === SYSTEM_PROMPT_FILE_ARG ? systemPromptFile : a),
+        // No supervisor here: strip the host→supervisor override markers claude must not see.
+        ...applyLaunchDirective(claudeExtraArgs, undefined),
+      ];
 
-    const exitCode = await proc.exited;
+      if (debug) {
+        console.log('[DEBUG] Launching Claude Code directly:', redactSecrets(claudeArgs).join(' '));
+      }
+
+      logger.info('Launching Claude Code...');
+
+      assertArgvBounded(claudeArgs, 'Builder Claude Code');
+      const proc = spawn(claudeArgs, {
+        cwd: lazyRoot,
+        stdin: 'inherit',
+        stdout: 'inherit',
+        stderr: 'inherit',
+        env: {
+          ...process.env,
+          ...Object.fromEntries(builderEnvVars.map(v => [v.key, v.value])),
+          [SCRATCH_ENV_VAR]: scratchDir,
+        },
+      });
+
+      return proc.exited;
+    });
 
     // Capture conversation from JSONL files
     const detectedSessionId = await captureConversation(lazyRoot, beforeSnapshot, 'Builder');
@@ -1421,49 +1416,55 @@ export class HostProcessRunner implements Runner {
     );
 
     const scratchDir = await ensureBuilderScratchDir(lazyRoot);
-    const argv = [
-      ...buildBuilderHeadlessClaudeArgs(systemPrompt, prompt, resumeSessionId, builderHeadlessModel(config, this.builderTarget())),
-      ...permissionArgs,
-      '--add-dir', scratchDir,
-    ];
-
-    if (debug) {
-      console.log('[DEBUG] Headless builder:', redactSecrets(argv).join(' '));
-    }
-
     const beforeSnapshot = await snapshotSessionFiles(lazyRoot);
     const cleanEnv = { ...process.env } as Record<string, string>;
     delete cleanEnv.CLAUDECODE;
     delete cleanEnv.LAZY_IS_DAEMON;
-
-    const proc = spawn(argv, {
-      cwd: lazyRoot,
-      stdout: 'pipe',
-      stderr: 'pipe',
-      env: {
-        ...cleanEnv,
-        ...Object.fromEntries(authEnvVars.map(v => [v.key, v.value])),
-        [SCRATCH_ENV_VAR]: scratchDir,
-      },
-      timeout: 0,
-    });
-
     const timeoutMs = DEFAULT_ONESHOT_TIMEOUT_MS;
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      try { proc.kill('SIGTERM'); } catch { /* already exited */ }
-      setTimeout(() => {
-        try { proc.kill('SIGKILL'); } catch { /* already exited */ }
-      }, ONESHOT_KILL_GRACE_MS);
-    }, timeoutMs);
 
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
-    clearTimeout(timer);
+    // Prompt on stdin, system prompt in a file: never argv (src/agent/argv-safety.ts).
+    const { stdout, stderr, exitCode, timedOut } = await withSystemPromptFile(systemPrompt, async (systemPromptFile) => {
+      const argv = [
+        ...buildBuilderHeadlessClaudeArgs(systemPromptFile, prompt, resumeSessionId, builderHeadlessModel(config, this.builderTarget())),
+        ...permissionArgs,
+        '--add-dir', scratchDir,
+      ];
+
+      if (debug) {
+        console.log('[DEBUG] Headless builder:', redactSecrets(argv).join(' '));
+      }
+
+      assertArgvBounded(argv, 'Headless builder Claude Code');
+      const proc = spawn(argv, {
+        cwd: lazyRoot,
+        stdin: new Blob([prompt]),
+        stdout: 'pipe',
+        stderr: 'pipe',
+        env: {
+          ...cleanEnv,
+          ...Object.fromEntries(authEnvVars.map(v => [v.key, v.value])),
+          [SCRATCH_ENV_VAR]: scratchDir,
+        },
+        timeout: 0,
+      });
+
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        try { proc.kill('SIGTERM'); } catch { /* already exited */ }
+        setTimeout(() => {
+          try { proc.kill('SIGKILL'); } catch { /* already exited */ }
+        }, ONESHOT_KILL_GRACE_MS);
+      }, timeoutMs);
+
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+      clearTimeout(timer);
+      return { stdout, stderr, exitCode, timedOut };
+    });
 
     if (timedOut) {
       throw new Error(`Builder review-session turn timed out after ${timeoutMs}ms and was killed.`);

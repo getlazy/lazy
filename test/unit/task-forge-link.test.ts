@@ -76,3 +76,16 @@ describe('resolveTaskForgeLink', () => {
     expect(resolveTaskForgeLink(task({}))).toBeNull();
   });
 });
+
+describe('forge link schemes', () => {
+  // INVARIANT: only an http(s) URL in task metadata becomes a forge link. The
+  // link renders as an href on the dashboard origin; a javascript: value there
+  // is script with the session's authority, whoever wrote the metadata.
+  test('a non-http(s) URL is no link at all', () => {
+    expect(resolveTaskForgeLink(task({ github_pr_url: 'javascript:alert(1)//pull/1' }))).toBeNull();
+    expect(resolveTaskForgeLink(task({ gitlab_remote_ref_url: 'data:text/html,x' }))).toBeNull();
+    expect(resolveTaskForgeLink(task({ remote_ref_url: 'not a url' }))).toBeNull();
+    expect(resolveTaskForgeLink(task({ github_pr_url: 'https://github.com/o/r/pull/7' }))?.url)
+      .toBe('https://github.com/o/r/pull/7');
+  });
+});

@@ -35,7 +35,10 @@ export function tasksDirFor(root: string): string {
 /** Find the full task UUID directory name from a short (8-char) prefix. */
 export function findFullTaskId(root: string, shortId: string): string {
   const tasksDir = tasksDirFor(root);
-  const dirs = readdirSync(tasksDir);
+  // Skip FileStorage's staging (`<id>.tmp.<ms>`) and backup dirs, exactly as
+  // its own readers do: while a daemon writes the task, its staging dir shares
+  // the id prefix, and matching it reads a file that is about to vanish.
+  const dirs = readdirSync(tasksDir).filter(d => !d.includes('.tmp') && !d.includes('.backup'));
   const match = dirs.find(d => d.startsWith(shortId));
   if (!match) throw new Error(`Task directory not found for ${shortId} in ${tasksDir}`);
   return match;

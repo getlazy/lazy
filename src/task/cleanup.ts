@@ -51,7 +51,7 @@ export async function cleanupWorktree(
       // Worktree may be corrupted (e.g. .git is a dir instead of file).
       // Fall back to manual removal + prune.
       console.log('Worktree remove failed, cleaning up manually...');
-      // fs.rm (not a spawned `rm -rf`): fs beats spawning a process (CLAUDE.md),
+      // fs.rm (not a spawned `rm -rf`): fs beats spawning a process (AGENTS.md),
       // and it's async so teardown never blocks the event loop — cleanupWorktree
       // is reachable from async daemon/storage close paths.
       await rm(worktreePath, { recursive: true, force: true });
@@ -80,7 +80,7 @@ export async function cleanupWorktreeAndBranch(
   } catch (err) {
     // Non-fatal: a leftover local branch is recoverable and must never break
     // finalize (the merge has already landed by the time we get here). But we
-    // do NOT silently swallow it (CLAUDE.md) — surface it as a warning so a
+    // do NOT silently swallow it (AGENTS.md) — surface it as a warning so a
     // failed deletion is visible instead of accumulating invisibly. The most
     // common benign cause is the branch already being gone; rarer causes
     // (still checked out in another worktree, git error) are exactly what we

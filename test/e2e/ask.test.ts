@@ -323,7 +323,7 @@ describe('lazy ask (finished task, answered from the record)', () => {
     expect(result.stderr).toContain('not the original agent');
   }, 120_000);
 
-  // INVARIANT (CLAUDE.md — a read-only question must not disturb the task): the
+  // INVARIANT (AGENTS.md — a read-only question must not disturb the task): the
   // record ask takes no worktree lock, creates no turn, and must leave a
   // terminal task exactly as it found it.
   test('leaves the finished task untouched — same status, no new turns', async () => {

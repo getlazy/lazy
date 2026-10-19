@@ -28,6 +28,7 @@ import {
   recordedBaseUnreadableRefusal,
   linkedReviewBaseRefusal,
   mismatchedReviewRefusal,
+  noForgeSubmitRefusal,
 } from './submit-target';
 import { escapeMergingForOperation } from './stranded-merge';
 import { isLinkedTask } from '../task/linked';
@@ -117,7 +118,7 @@ export async function submitTaskPreflight(
     return empty('No remote driver configured. Set [remote] driver in lazy.toml to use submit.');
   }
   if (!driver.needsSync) {
-    return empty('Submit requires a remote driver (e.g., github). Local driver has no remote to create PRs on.');
+    return empty(noForgeSubmitRefusal(driver, task));
   }
 
   // INVARIANT (./submit-target.ts): an intermediate target is refused to

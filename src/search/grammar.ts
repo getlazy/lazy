@@ -94,6 +94,7 @@ export const GRAMMAR_NOTES: string[] = [
   'Boolean operators are case-sensitive: AND, not and. AND binds tighter than OR, and two adjacent terms with no operator are an implicit AND.',
   'task:, goal: and every in: scope are case-insensitive SUBSTRING matches — task:spike finds spike-vm-isolation and publish-runner-spike alike. status: and tag: are exact.',
   'A query with no operator, no field: term and no #tag is a case-insensitive REGEX over all content.',
+  'An id works as a bare query: paste a task id, raised item, comment, journal entry, turn, commit SHA, artifact, review comment, system message or conversation id — a prefix of at least 6 characters or the whole thing — and every entity it names is listed first. An ambiguous prefix lists every match. Not available with --fuzzy.',
   'Fuzzy matching (--fuzzy, or fuzzy=true over MCP) BYPASSES the query language: it looks for the literal text you typed, so tag:launch --fuzzy searches for "tag:launch".',
   'Tags are normalized identically on write and on query — lowercased, runs of non-alphanumerics collapsed to hyphens, a leading # stripped. Quote a multi-word tag: tag:"My Feature Work", or only its first word counts.',
   'In a shell, wrap the whole query in single quotes: # starts a comment, and an unquoted multi-word value is split into separate terms.',

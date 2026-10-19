@@ -39,8 +39,6 @@ import {
   agentSupportsApiKey,
   agentCredentialProvider,
   resolveProfileCredential,
-  clearAgentApiKey,
-  credentialsPath,
   AGENT_KEY_ENV,
 } from '../../agent/credentials';
 import { credentialPresence, setCredential, deleteCredential } from '../../credentials/store';
@@ -120,7 +118,7 @@ async function probeEndpoint(endpoint: string): Promise<string> {
 function describeHostLogin(harness: string, installed: boolean): string | null {
   // `cursor-agent status` and `codex login status` both print the account when
   // logged in and "Not logged in" otherwise (codex exits 1 on the latter,
-  // verified against 0.152.1).
+  // checked on 0.152.1 (2026-09)).
   const loginProbe: Record<string, string[]> = {
     cursor: ['cursor-agent', 'status'],
     codex: ['codex', 'login', 'status'],
@@ -178,8 +176,6 @@ async function describeCredential(root: string, profile: AgentProfile, installed
       parts.push(
         `${profile.credential} — credential store (${kind}${stored?.backend ?? 'stored'}) — see \`lazy auth list\``,
       );
-    } else {
-      parts.push(`${profile.credential} — project key (${credentialsPath(root)})`);
     }
   }
   const login = describeHostLogin(profile.harness, installed);
@@ -411,17 +407,10 @@ async function clearKey(root: string, agentId: string | undefined): Promise<void
   const removed = profile.credential === NO_CREDENTIAL
     ? false
     : await deleteCredential(root, profile.credential);
-  // Also drop any key the pre-store `set-key` left in the per-agent file:
-  // "removed" must mean the next launch finds nothing, and that file is still a
-  // resolution source (see resolveProfileCredential).
-  const legacy = await clearAgentApiKey(root, profile.harness);
 
-  console.log(removed || legacy
+  console.log(removed
     ? theme.success(`Removed the stored ${agentId} API key.`)
     : `No stored key for "${agentId}".`);
-  if (removed && legacy) {
-    console.log(theme.separator(`  Cleared both the "${profile.credential}" credential and the older per-agent key.`));
-  }
 }
 
 export async function commandSystemAgent(args: string[]): Promise<void> {

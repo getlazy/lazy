@@ -29,7 +29,7 @@
  */
 
 import { constants } from 'fs';
-import { lstat, mkdir, open, realpath, rename, unlink } from 'fs/promises';
+import { link, lstat, mkdir, open, realpath, rename, unlink } from 'fs/promises';
 import { dirname, isAbsolute, join, normalize, relative, sep } from 'path';
 import { randomBytes } from 'crypto';
 import { logger } from '../utils/logger';
@@ -84,7 +84,9 @@ async function walkDirs(rootReal: string, parts: string[], create: boolean): Pro
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
       if (!create) return null;
-      await mkdir(cur, { mode: 0o700 });
+      await mkdir(cur, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== 'EEXIST') throw error;
+      });
       st = await lstat(cur);
     }
     if (st.isSymbolicLink()) throw new LinkRefusedError(`refusing ${cur}: it is a symbolic link`);
@@ -131,7 +133,7 @@ export async function readRegularFileUnder(root: string, rel: string, maxBytes: 
  * file by rename (never writing through one). Throws LinkRefusedError on any
  * link on the way.
  */
-export async function writeRegularFileUnder(root: string, rel: string, data: string | Uint8Array, mode = 0o644): Promise<void> {
+export async function writeRegularFileUnder(root: string, rel: string, data: string | Uint8Array, mode = 0o644, immutable = false): Promise<void> {
   const parts = assertRelativeUnder(rel);
   const rootReal = await realRoot(root);
   const dir = (await walkDirs(rootReal, parts.slice(0, -1), true))!;
@@ -156,5 +158,19 @@ export async function writeRegularFileUnder(root: string, rel: string, data: str
     });
     throw new LinkRefusedError(`refusing ${target}: its directory moved outside ${rootReal}`);
   }
-  await rename(tmp, target);
+  if (immutable) {
+    try {
+      await link(tmp, target);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      const existing = await readRegularFileUnder(root, rel, Buffer.byteLength(data));
+      if (existing === null || !existing.equals(Buffer.from(data))) {
+        throw new LinkRefusedError(`refusing ${target}: its immutable content differs`);
+      }
+    } finally {
+      await unlink(tmp);
+    }
+  } else {
+    await rename(tmp, target);
+  }
 }

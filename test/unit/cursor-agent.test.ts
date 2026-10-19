@@ -1,4 +1,8 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { which } from 'bun';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { CursorAgent, CursorActivityStream } from '../../src/agent/cursor';
 import { CursorPackaging } from '../../src/agent/cursor-packaging';
 import { getAgent, getAgentPackaging, listAgents } from '../../src/agent/registry';
@@ -46,10 +50,11 @@ describe('CursorAgent', () => {
         expect(args).not.toContain('--agent-endpoint');
       });
 
-      test('the prompt stays the last positional argument', () => {
+      test('the prompt still rides stdin, not argv', () => {
         process.env.CURSOR_API_ENDPOINT = 'http://127.0.0.1:8766/_lazy/cursor/agent/ab12';
         const args = agent.buildExecArgs({ modelId: 'test-model', prompt: 'Hi', dangerouslySkipPermissions: false });
-        expect(args[args.length - 1]).toBe('Hi');
+        expect(args).not.toContain('Hi');
+        expect(args.stdinInput).toBe('Hi');
       });
     });
 
@@ -99,13 +104,16 @@ describe('CursorAgent', () => {
       }
     });
 
-    test('prompt is the last positional argument', () => {
+    // cursor-agent in print mode reads the prompt from stdin when no positional
+    // is given (2026.10.01 bundle, src/commands/build-prompt.ts).
+    test('the prompt rides stdin, never argv', () => {
       const args = agent.buildExecArgs({
         modelId: 'test-model',
         prompt: 'Hello',
         dangerouslySkipPermissions: false,
       });
-      expect(args[args.length - 1]).toBe('Hello');
+      expect(args).not.toContain('Hello');
+      expect(args.stdinInput).toBe('Hello');
     });
 
     test('prepends system prompt to user prompt', () => {
@@ -115,8 +123,7 @@ describe('CursorAgent', () => {
         systemPrompt: 'You are a helper',
         dangerouslySkipPermissions: false,
       });
-      // Prompt is the last argument
-      const prompt = args[args.length - 1];
+      const prompt = args.stdinInput!;
       expect(prompt).toContain('<system>');
       expect(prompt).toContain('You are a helper');
       expect(prompt).toContain('</system>');
@@ -280,7 +287,8 @@ describe('CursorAgent', () => {
         extraArgs: ['--extra-flag', 'value'],
       });
       expect(args).toContain('--extra-flag');
-      expect(args[args.length - 1]).toBe('Hello');
+      expect(args[args.length - 1]).toBe('value');
+      expect(args.stdinInput).toBe('Hello');
     });
 
     test('omits optional flags when not provided', () => {
@@ -596,6 +604,31 @@ describe('CursorAgent', () => {
       expect(agent.isPromptTooLongError('Some other error')).toBe(false);
     });
 
+    test('a prompt of any size is delivered whole, on stdin', () => {
+      const largePrompt = '🚀'.repeat(300_000);
+      const args = agent.buildExecArgs({ modelId: 'auto', prompt: largePrompt, dangerouslySkipPermissions: false });
+      expect(args.stdinInput).toBe(largePrompt);
+      expect(args).not.toContain(largePrompt);
+    });
+
+    test.skipIf(!which('cursor-agent'))('the real Cursor CLI accepts a >1 MiB prompt on stdin', async () => {
+      const home = mkdtempSync(join(tmpdir(), 'lazy-cursor-keyless-'));
+      try {
+        const args = agent.buildExecArgs({ modelId: 'auto', prompt: '🚀'.repeat(300_000), dangerouslySkipPermissions: false });
+        const proc = Bun.spawn(args, {
+          env: { PATH: process.env.PATH ?? '', HOME: home, XDG_CONFIG_HOME: home,
+            CURSOR_API_ENDPOINT: 'http://127.0.0.1:1' },
+          stdin: new Blob([args.stdinInput!]), stdout: 'pipe', stderr: 'pipe',
+        });
+        const stderr = await new Response(proc.stderr).text();
+        expect(await proc.exited).toBe(1);
+        expect(stderr.toLowerCase()).toContain('authentication required');
+        expect(stderr).not.toContain('E2BIG');
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+
     test('detects session not found errors', () => {
       expect(agent.isSessionNotFoundError('session not found')).toBe(true);
       expect(agent.isSessionNotFoundError('invalid session')).toBe(true);
@@ -606,6 +639,12 @@ describe('CursorAgent', () => {
   describe('classifyFailure', () => {
     // Messages verified against cursor-agent 2026.08.11 (see docstring in
     // src/agent/cursor.ts).
+    test('classifies OS E2BIG failures as non-retriable', () => {
+      const spawnFailure = agent.classifyFailure({ message: "E2BIG: argument list too long, posix_spawn 'cursor-agent'" });
+      expect(spawnFailure.class).toBe('fatal_config');
+      expect(spawnFailure.reason).toContain('argument/environment size limit');
+    });
+
     test('classifies the real no-credential message as fatal_auth', () => {
       const failure = agent.classifyFailure({
         message: '',

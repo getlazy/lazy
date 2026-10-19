@@ -90,7 +90,8 @@ describe('supervisor wrapper (between-turn behavior)', () => {
   });
 
   test('a non-zero, non-42 supervisor exit still ends the wrapper with that code', async () => {
-    const bin = await writeStubAgent('exit 7');
+    const invocationsPath = join(root, 'invocations');
+    const bin = await writeStubAgent(`echo invoked >> "${invocationsPath}"\nexit 7`);
     const script = buildSupervisorWrapperScript(join(root, 'proto'), root);
     const proc = spawn(['sh', '-c', script], {
       env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
@@ -99,6 +100,7 @@ describe('supervisor wrapper (between-turn behavior)', () => {
       timeout: 30_000,
     });
     expect(await proc.exited).toBe(7);
+    expect((await readFile(invocationsPath, 'utf-8')).trim().split('\n')).toHaveLength(1);
   });
 
   test('the wrapper script contains no between-turn kill sweep', () => {

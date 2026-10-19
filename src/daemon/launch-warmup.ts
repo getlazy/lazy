@@ -1,6 +1,9 @@
 /**
- * Build the runner image and the agent binary when a MANAGED daemon starts,
- * instead of inside the first launch that needs them.
+ * Build lazy's DEFAULT runner image and the agent binary when a MANAGED daemon
+ * starts, instead of inside the first launch that needs them. (A project's own
+ * custom image is the daemon's boot build in ./runner-image.ts, which every
+ * daemon runs; the default image prepared here is what builders and confirmed
+ * agents run on while that build is still going.)
  *
  * Why: in a Lazy Teams microVM both live on the machine's own disk — the
  * image in the guest dockerd's data-root on the machine's `--storage` volume,

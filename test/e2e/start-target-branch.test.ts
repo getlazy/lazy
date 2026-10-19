@@ -5,7 +5,7 @@
  * on a top-level task. `lazy start` used to ignore it entirely: it resolved the
  * repo default branch, branched the worktree from there, and then overwrote the
  * stored target with the default — no warning. The user's explicit instruction
- * was silently discarded, which is exactly the silent-wrongness CLAUDE.md's
+ * was silently discarded, which is exactly the silent-wrongness AGENTS.md's
  * "principle of least surprise" forbids.
  *
  * These run WITHOUT a daemon so `lazy start` executes launchTask() in-process

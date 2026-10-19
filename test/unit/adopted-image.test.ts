@@ -9,7 +9,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtemp, writeFile, rm, readFile } from 'fs/promises';
+import { mkdtemp, writeFile, rm, readFile, mkdir, symlink } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
@@ -68,7 +68,10 @@ describe('adopted-image persistence', () => {
     undoDaemonBase = pinDaemonBaseDir(daemonBase);
 
     root = await mkdtemp(join(tmpdir(), 'lazy-adopt-root-'));
-    dockerfile = join(root, 'Dockerfile.lazy');
+    // The adopted Dockerfile lives in a task WORKTREE, as in real use — at the
+    // root it would be the conventional root Dockerfile.lazy instead.
+    await mkdir(join(root, 'wt'), { recursive: true });
+    dockerfile = join(root, 'wt', 'Dockerfile.lazy');
     await writeFile(dockerfile, ADOPTED_CONTENT);
     // Empty dockerfile key — pin LAZY_CONFIG so loadConfig does not walk up
     // into lazy's own worktree (which sets dockerfile = "Dockerfile.lazy").
@@ -194,7 +197,7 @@ describe('adopted-image persistence', () => {
     // The build context is the directory holding the consented Dockerfile —
     // derived from the adoption's own path, so adoptions written before any
     // provenance field existed resolve identically.
-    expect(await adoptedBuildContextRoot(root, getAdoptedDockerfilePath(root))).toBe(root);
+    expect(await adoptedBuildContextRoot(root, getAdoptedDockerfilePath(root))).toBe(join(root, 'wt'));
 
     // The root [docker].dockerfile keeps the project root as its context — it
     // must never pick up the adopted worktree.
@@ -202,6 +205,27 @@ describe('adopted-image persistence', () => {
   });
 
   // INVARIANT: post-consent agent edits must not become host docker rebuilds.
+  // INVARIANT: the drift check never follows a symlink, blocks on a FIFO or
+  // reads an unbounded file. The adopted Dockerfile is agent-writable, and the
+  // daemon reads it on every launch.
+  test('a symlink, FIFO or oversized file in place of the adopted Dockerfile is drift, read without hanging', async () => {
+    const real = join(root, 'elsewhere');
+    await writeFile(real, ADOPTED_CONTENT);
+    const replacements: Array<() => Promise<unknown>> = [
+      () => symlink(real, dockerfile),
+      async () => expect(Bun.spawnSync(['mkfifo', dockerfile]).exitCode).toBe(0),
+      () => writeFile(dockerfile, 'x'.repeat(1024 * 1024 + 1)),
+    ];
+    for (const replace of replacements) {
+      await rm(dockerfile, { force: true });
+      await writeFile(dockerfile, ADOPTED_CONTENT);
+      await writeValidAdoption(root, dockerfile, `lazy-custom-ffffffffffff:${IMAGE_TAG}`);
+      await rm(dockerfile);
+      await replace();
+      expect(await inspectAdoptedImage(root)).toMatchObject({ status: 'content-drifted' });
+    }
+  });
+
   test('loadValidAdoptedImage clears when Dockerfile content drifts after consent', async () => {
     await writeValidAdoption(root, dockerfile, `lazy-custom-ffffffffffff:${IMAGE_TAG}`);
     await writeFile(dockerfile, 'FROM debian:bookworm-slim\n# AGENT EDITED AFTER CONSENT\n');
@@ -263,7 +287,10 @@ describe('ensureImage adoption soft-pin', () => {
     undoDaemonBase = pinDaemonBaseDir(daemonBase);
 
     root = await mkdtemp(join(tmpdir(), 'lazy-adopt-ens-root-'));
-    dockerfile = join(root, 'Dockerfile.lazy');
+    // In a worktree dir, not the root: a root Dockerfile.lazy is the project's
+    // own image by convention, which is not what these tests model.
+    await mkdir(join(root, 'wt'), { recursive: true });
+    dockerfile = join(root, 'wt', 'Dockerfile.lazy');
     await writeFile(dockerfile, ADOPTED_CONTENT);
     await writeFile(join(root, 'lazy.toml'), '[project]\nname = "t"\n[docker]\ndockerfile = ""\n');
     // getLazyRoot requires a git root with lazy.toml.
@@ -324,6 +351,9 @@ describe('ensureImage adoption soft-pin', () => {
     expect(await readAdoptedImage(root)).toBeNull();
     // Soft-pin of the old imageName must not apply after drift-clear.
     expect(used).not.toBe(imageName);
+    // ...and the drifted file was not built either: the launch fell through to
+    // the default image.
+    expect(used).toBe(`lazy-runner:${IMAGE_TAG}`);
   });
 
   // INVARIANT (fix-upgrade-image-rebuild-churn): the first launch after

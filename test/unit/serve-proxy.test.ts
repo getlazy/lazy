@@ -25,10 +25,10 @@ import { DASHBOARD_COOKIE_NAME } from '../../src/daemon/dashboard-auth';
  * carry in either direction.
  */
 
-const SERVE_HOST = 'web.my-task.lazy.localhost:26024';
+const SERVE_HOST = 'my-task.web.lazy.localhost:26024';
 
 function proxied(headers: Record<string, string>, init: RequestInit = {}): Request {
-  return new Request('http://web.my-task.lazy.localhost:26024/some/path', {
+  return new Request('http://my-task.web.lazy.localhost:26024/some/path', {
     ...init,
     headers: { host: SERVE_HOST, ...headers },
   });
@@ -330,7 +330,7 @@ describe('serveNoticeHtml', () => {
         runnerType: 'docker',
       },
       controls,
-      'http://web.my-task.lazy.localhost:26024',
+      'http://my-task.web.lazy.localhost:26024',
     );
     expect(html).toContain('<code>web</code>');
     expect(html).toContain('<code>my-task</code>');
@@ -338,7 +338,7 @@ describe('serveNoticeHtml', () => {
     expect(html).toContain('Start container');
     expect(html).toContain('Start services');
     expect(html).toContain('Try again');
-    expect(html).toContain('http://web.my-task.lazy.localhost:26024');
+    expect(html).toContain('http://my-task.web.lazy.localhost:26024');
     expect(html).toContain('href="/tasks/my-task/services"');
     // Same in-place shell-mount convention as the Services card: the button
     // and its terminal slot share one data-lz-shell-step wrap so the reader
@@ -380,7 +380,7 @@ describe('serveNoticeHtml', () => {
 /**
  * INVARIANT: nothing on the proxy path starts a container or runs
  * `start_services_cmd`. A page anywhere on the internet can embed
- * `<img src="http://web.my-task.lazy.localhost:26024/x">`; a proxy that started
+ * `<img src="http://my-task.web.lazy.localhost:26024/x">`; a proxy that started
  * things would hand that page this machine's CPU and disk.
  *
  * A source scan rather than a behavioural test because the failure mode is a

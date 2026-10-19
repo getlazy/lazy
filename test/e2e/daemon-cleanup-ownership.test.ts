@@ -18,7 +18,7 @@
  * and are asserted separately on purpose — a regression in any one of them is a
  * regression, even if the other two happen to mask it.
  *
- * Isolation notes (see CLAUDE.md): daemon state is redirected with
+ * Isolation notes (see AGENTS.md): daemon state is redirected with
  * `LAZY_DAEMON_BASE_DIR`, never `HOME`, and config resolution is pinned with
  * `pinConfig` so the in-process daemon cannot adopt lazy's OWN lazy.toml. The
  * `bun test` process deliberately does NOT have `LAZY_TEST=1`, which is what

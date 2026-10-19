@@ -823,7 +823,7 @@ export function reviewSettingsLine(s: ReviewSettings): string {
  *
  * Composed ONCE, in the daemon, and sent whole — `lazy show`, the task page and
  * `lazy_show` render it rather than each assembling their own. The rule about
- * sending the ANSWER rather than the rule (CLAUDE.md) applies to provenance
+ * sending the ANSWER rather than the rule (AGENTS.md) applies to provenance
  * exactly as it does to the line: a client re-deriving "where did this come
  * from" would be re-implementing the precedence chain in another language.
  */

@@ -176,6 +176,15 @@ export function heartbeatEnvelopeResponse(
      * that somebody's connection was cut mid-operation.
      */
     onCallerGone?: (info: { elapsedMs: number; heartbeats: number; resultStatus: number | null }) => void;
+    /**
+     * Called once, after the final result line was written and the stream
+     * closed with the caller still connected. Never called when the caller was
+     * gone or the write failed. For effects that must follow a delivered answer
+     * (marking comments delivered); a throw is the callback's to handle.
+     * "Written" means handed to the stream: a caller that drops while the last
+     * line is still buffered is not detected, a window of milliseconds.
+     */
+    onDelivered?: (resultStatus: number) => Promise<void> | void;
   },
 ): Response {
   const intervalMs = options?.intervalMs ?? HEARTBEAT_INTERVAL_MS;
@@ -243,6 +252,7 @@ export function heartbeatEnvelopeResponse(
       options?.signal?.addEventListener('abort', onAbort, { once: true });
 
       let result: EnvelopeResult;
+      let delivered = false;
       try {
         result = await produce(emit);
       } catch (err) {
@@ -258,12 +268,14 @@ export function heartbeatEnvelopeResponse(
         controller.enqueue(line(result));
         controller.close();
         writerSpan.delivered(result.status, heartbeats);
+        delivered = true;
       } catch {
         // Client already gone — the response is undeliverable, and there is no
         // one left to report that to. The work completed regardless.
         writerSpan.undeliverable(result.status, heartbeats);
         reportCallerGone(result.status);
       }
+      if (delivered && !callerGoneReported && options?.onDelivered) await options.onDelivered(result.status);
     },
   });
 

@@ -25,7 +25,7 @@ import { mkdir, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { encodeProjectPath, parseConversation, extractSummary } from '../../src/import/claude-code-logs';
-import { isLocalCommandScaffolding } from '../../src/import/local-command-messages';
+import { isLocalCommandScaffolding, isConversationNoise } from '../../src/import/local-command-messages';
 import { reimportConversations } from '../../src/import/reimport-conversations';
 import type { StoredConversation } from '../../src/storage/types';
 import type { Storage } from '../../src/storage/interface';
@@ -91,6 +91,19 @@ function makeStorageStub() {
 }
 
 describe('isLocalCommandScaffolding', () => {
+  test('effort settings are noise but human prose remains content', () => {
+    expect(isLocalCommandScaffolding(commandBlock('effort'))).toBe(true);
+    expect(isLocalCommandScaffolding(commandBlock('effort', 'high'))).toBe(true);
+    expect(isLocalCommandScaffolding(commandBlock('effort', 'explain this choice'))).toBe(false);
+  });
+
+  test('background completion envelopes are not human messages', () => {
+    const notification = '<task-notification><task-id>a1a653023bea05116</task-id><status>completed</status><summary>Agent finished</summary><result>All 22 calls succeeded.</result></task-notification>';
+    expect(isConversationNoise(notification)).toBe(true);
+    expect(isConversationNoise(`Why did I receive this?\n${notification}`)).toBe(false);
+    expect(isConversationNoise(`${notification}\nI have a real question.\n${notification}`)).toBe(false);
+    expect(isConversationNoise('All 22 calls succeeded.')).toBe(false);
+  });
   test('matches the caveat, a command block, and command output, alone or together', () => {
     expect(isLocalCommandScaffolding(CAVEAT)).toBe(true);
     expect(isLocalCommandScaffolding(commandBlock('clear'))).toBe(true);
@@ -174,7 +187,8 @@ describe('local-command sessions at ingest', () => {
 
     await writeFile(join(dir, `${REAL_WITH_HEADER}.jsonl`), [
       userLine(REAL_WITH_HEADER, lazyRoot, 0, CAVEAT),
-      userLine(REAL_WITH_HEADER, lazyRoot, 1, commandBlock('clear')),
+      userLine(REAL_WITH_HEADER, lazyRoot, 1, commandBlock('effort', 'high')),
+      userLine(REAL_WITH_HEADER, lazyRoot, 1, '<task-notification><task-id>agent-123</task-id><summary>Agent completed</summary><result>Background result</result></task-notification>'),
       userLine(REAL_WITH_HEADER, lazyRoot, 2, REAL_QUESTION),
       assistantLine(REAL_WITH_HEADER, 2, 'Here is how live systems do it.'),
       userLine(REAL_WITH_HEADER, lazyRoot, 3, commandBlock('model')),

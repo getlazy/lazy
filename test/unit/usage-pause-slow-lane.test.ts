@@ -150,7 +150,7 @@ describe('slow lane under a usage pause', () => {
       ).rejects.toThrow(/paused/);
       await expect(
         assertTurnStartAllowed(root, { task, config, actor: 'human', verb: 'unblock' }),
-      ).rejects.toThrow(/--past-usage-pause/);
+      ).rejects.toThrow(/--override-usage-pause/);
       expect(getUsagePauseOverride()).toBe(0);
 
       allowTaskPastUsagePause(task.id, 'human');

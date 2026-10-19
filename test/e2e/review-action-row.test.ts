@@ -81,7 +81,7 @@ describe('review action row: Ask agent / Add comment / Unblock', () => {
 
   // INVARIANT: a refused Unblock never loses the words. They are saved as a
   // queued comment BEFORE the turn is attempted, and the refusal comes back as
-  // an explanation, not as a failed save. CLAUDE.md: never lose human feedback.
+  // an explanation, not as a failed save. AGENTS.md: never lose human feedback.
   test('an inline Unblock the task cannot take keeps the words as a queued comment', async () => {
     const { taskId, fullId } = await startBlockedTask('Refused unblock');
     setTaskStatus(ctx.root, taskId, 'working');
@@ -173,7 +173,7 @@ describe('review action row: Ask agent / Add comment / Unblock', () => {
     expect(found).toBe(true);
   }, 120_000);
 
-  // INVARIANT (CLAUDE.md: never lose human feedback): an Unblock sent from an
+  // INVARIANT (AGENTS.md: never lose human feedback): an Unblock sent from an
   // ask box delivers THOSE words, so the daemon must leave the reviewer's
   // unsent feedback-box draft alone. It clears only what it delivered.
   test('an Ask-box Unblock leaves the unsent feedback draft in place', async () => {

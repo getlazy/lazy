@@ -28,8 +28,8 @@
 
 import type { ResolvedConfig } from '../config/types';
 import { loadConfig, resolveConfigSource, type ConfigSourceRule } from '../config/loader';
+import { describeConfigFile } from '../config/config-provenance';
 import { enableLastKnownGood, lastKnownGoodState, type LastKnownGoodEvent, type LastKnownGoodState } from '../config/last-good';
-import { proxyDifferences, proxyFingerprint, runningProxyFingerprint } from './proxy-fingerprint';
 import { logger } from '../utils/logger';
 import type { Storage } from '../storage/interface';
 
@@ -71,16 +71,13 @@ export const STARTUP_SETTINGS: readonly StartupSetting[] = [
   { key: 'proxy.cursor_upstream', apply: 'restart', recordedBy: 'proxy', read: (c) => c.proxy.cursorUpstream },
   { key: 'proxy.fallbacks', apply: 'restart', recordedBy: 'proxy', read: (c) => c.proxy.fallbacks },
   { key: 'proxy.retry_after_threshold', apply: 'restart', recordedBy: 'proxy', read: (c) => c.proxy.retryAfterThreshold },
+  { key: 'proxy.tier_retry_interval', apply: 'restart', recordedBy: 'proxy', read: (c) => c.proxy.tierRetryIntervalSeconds },
   { key: 'proxy.upstream_timeout', apply: 'restart', recordedBy: 'proxy', read: (c) => c.proxy.upstreamTimeoutSeconds },
+  { key: 'proxy.audit_retention_days', apply: 'restart', recordedBy: 'proxy', read: (c) => c.proxy.auditRetentionDays },
+  { key: 'proxy.audit_retention_mib', apply: 'restart', recordedBy: 'proxy', read: (c) => c.proxy.auditRetentionMib },
   { key: 'proxy.policy', apply: 'restart', recordedBy: 'proxy', read: (c) => c.proxy.policy },
 ];
 
-/**
- * The proxy fingerprint's parts that are not a single key above — agent
- * profile routes and the credential map — reported under these names. The
- * fingerprint stays the one authority on them (./proxy-fingerprint.ts).
- */
-const FINGERPRINT_ONLY_PARTS = ['agents (proxy routes)', 'proxy credential targets'];
 
 /** Running value per key, as canonical JSON. */
 const running = new Map<string, string>();
@@ -145,14 +142,6 @@ function pendingAgainst(projectRoot: string, config: ResolvedConfig): PendingSet
     const now = canonical(s.read(config));
     if (now !== was) pending.push({ key: s.key, running: display(was), configured: display(now), applyBy: s.apply });
   }
-  const runningProxy = runningProxyFingerprint();
-  if (runningProxy) {
-    const next = proxyFingerprint(projectRoot, config);
-    for (const part of proxyDifferences(runningProxy, next)) {
-      if (!FINGERPRINT_ONLY_PARTS.includes(part)) continue;
-      pending.push({ key: part, running: '(as started)', configured: '(changed)', applyBy: 'restart' });
-    }
-  }
   return pending;
 }
 
@@ -160,6 +149,14 @@ export interface ConfigStatus {
   /** The file in force (absolute), and the rule that chose it. */
   path: string;
   rule: ConfigSourceRule;
+  /**
+   * The file's bytes and, for a control plane's file, the configuration version
+   * they were applied from (null when none is recorded for these bytes).
+   * Optional on the wire: a daemon older than this reports neither.
+   */
+  sha256?: string | null;
+  appliedVersion?: number | null;
+  appliedAt?: string | null;
   /** Present while the file does not load and the daemon runs on its last good copy. */
   lastKnownGood: LastKnownGoodState | null;
   /**
@@ -185,9 +182,15 @@ export async function configStatus(projectRoot: string): Promise<ConfigStatus> {
   } catch (err) {
     loadError = err instanceof Error ? err.message : String(err);
   }
+  // Diagnostics only: an unreadable file must not take `lazy daemon status` down.
+  const onDisk = await describeConfigFile(source.path, source.rule)
+    .catch(() => ({ sha256: null, appliedVersion: null, appliedAt: null }));
   return {
     path: source.path,
     rule: source.rule,
+    sha256: onDisk.sha256,
+    appliedVersion: onDisk.appliedVersion,
+    appliedAt: onDisk.appliedAt,
     lastKnownGood: lastKnownGoodState(source.path),
     loadError,
     pending: config ? pendingAgainst(projectRoot, config) : [],

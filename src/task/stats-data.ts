@@ -19,6 +19,7 @@ import type { ProxyAuditRecord, TaskToolStatsRecord } from '../storage/types';
 import { loadConfig } from '../config/loader';
 import { readAuditRecords } from '../proxy/audit-log';
 import { logger } from '../utils/logger';
+import { latencyHistory, type LatencyHistoryReport, type TurnLatencyRollup } from './turn-latency';
 import { join } from 'path';
 import {
   buildSubtreeStats,
@@ -162,8 +163,9 @@ export async function loadTaskStats(
     const descendants = await collectDescendantTasks(storage, task.id);
     if (descendants.length > 0) {
       const parts = await Promise.all(descendants.map((d) => loadStatsPart(storage, d)));
+      const ids = [task.id, ...descendants.map((d) => d.id)];
       return {
-        stats: buildSubtreeStats({
+        stats: { ...buildSubtreeStats({
           root,
           descendants: parts,
           toolStatsRecords: await loadToolStatsRecords(storage, [
@@ -172,7 +174,7 @@ export async function loadTaskStats(
           ]),
           now: options.now,
           turnChartLimit: options.turnChartLimit,
-        }),
+        }), latency: await latencyFor(storage, ids) },
         scope: 'subtree',
         descendantCount: descendants.length,
       };
@@ -194,14 +196,31 @@ export async function loadTaskStats(
   );
   const counts = await storage.countDescendants([task.id]);
   return {
-    stats: buildTaskStats({
+    stats: { ...buildTaskStats({
       ...root,
       childHistories: childHistories.size > 0 ? childHistories : undefined,
       toolStatsRecord: (await loadToolStatsRecords(storage, [task.id])).get(task.id) ?? null,
       now: options.now,
       turnChartLimit: options.turnChartLimit,
-    }),
+    }), latency: await latencyFor(storage, [task.id]) },
     scope: 'task',
     descendantCount: counts[task.id] ?? 0,
   };
+}
+
+/**
+ * Every stored latency rollup of the given tasks — closed turns with their
+ * wall clock, plus each still-running turn's so far (no wall clock yet).
+ */
+export async function loadTurnLatencyRollups(
+  storage: Storage,
+  taskIds: string[],
+): Promise<Array<TurnLatencyRollup & { wall_ms?: number | null }>> {
+  const all = await Promise.all(taskIds.map((id) => storage.getTurnLatency(id)));
+  return all.flatMap((t) => (t ? [...t.turns, ...(t.open ? [t.open] : [])] : []));
+}
+
+async function latencyFor(storage: Storage, taskIds: string[]): Promise<LatencyHistoryReport | null> {
+  const report = latencyHistory(await loadTurnLatencyRollups(storage, taskIds));
+  return report.turns > 0 ? report : null;
 }

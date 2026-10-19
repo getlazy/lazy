@@ -41,8 +41,10 @@ import wrapUpPrompt from '../../src/prompts/present-regions.md' with { type: 'te
 const POST_TURN_PHASE_OPENERS = [selfReviewPrompt, revisePrompt, wrapUpPrompt]
   .map(p => p.trimStart().split('\n')[0]);
 
-function isWorkTurnLaunch(argv: string[]): boolean {
-  const prompt = argv[argv.indexOf('-p') + 1] ?? '';
+function isWorkTurnLaunch(invocation: { argv: string[]; stdin?: string }): boolean {
+  if (!invocation.argv.includes('-p')) return false;
+  // The prompt rides stdin, never argv (src/agent/argv-safety.ts).
+  const prompt = invocation.stdin ?? '';
   return !POST_TURN_PHASE_OPENERS.some(opener => prompt.trimStart().startsWith(opener));
 }
 
@@ -117,7 +119,7 @@ describe('a turn survives the daemon restarting under it', () => {
     // Work-turn launches only: with `[review] mode = low_high` one finished turn
     // also runs self-review, revise and wrap-up invocations, none of which is a
     // resume.
-    const invocations = (await ctx.claudeInvocations()).filter(i => isWorkTurnLaunch(i.argv));
+    const invocations = (await ctx.claudeInvocations()).filter(i => isWorkTurnLaunch(i));
     expect(invocations.length).toBeGreaterThan(0);
 
     // INVARIANT: resumed ONCE. The restart reaper stops the old supervisor and

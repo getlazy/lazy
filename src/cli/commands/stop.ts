@@ -29,7 +29,7 @@ export async function commandStop(args: string[]): Promise<void> {
   const reasonFromFlag = parsed.flags.get('reason') as string | undefined;
 
   // Pre-flight: verify the task exists and is running BEFORE asking for a reason.
-  // Per CLAUDE.md "Save first, act second" — we should never ask the user to
+  // Per AGENTS.md "Save first, act second" — we should never ask the user to
   // type feedback only to throw it away because the task wasn't stoppable.
   let taskDisplayId = taskId;
   let claimOwner: 'ask' | 'review' | null = null;

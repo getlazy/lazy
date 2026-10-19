@@ -5,7 +5,7 @@
  * {@link ./notify-parent-accepted}, and deliberately the same shape:
  * - The signal is a **comment** on the parent, nothing else. A lazy comment
  *   never starts a turn and never auto-unblocks (fix-comment-auto-launch /
- *   CLAUDE.md); the parent's agent reads it under `NOTES ADDED SINCE YOUR LAST
+ *   AGENTS.md); the parent's agent reads it under `NOTES ADDED SINCE YOUR LAST
  *   TURN` on its next unblock.
  * - No-op when there is no parent *task* (top-level into a named/default
  *   branch) and when the parent is already terminal — a complete or abandoned

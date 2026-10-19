@@ -125,7 +125,7 @@ describe('web task page: Comments and Journal tabs', () => {
     expect(html).not.toContain(`/comments/${commentId}`);
   });
 
-  // INVARIANT (CLAUDE.md, "A lazy comment never starts a turn"): posting from
+  // INVARIANT (AGENTS.md, "A lazy comment never starts a turn"): posting from
   // the web is exactly as inert as `lazy comment` — it persists and returns.
   test('posting a comment from the page saves it and does not start a turn', async () => {
     const id = await blockedTask('Post a comment');
@@ -151,7 +151,7 @@ describe('web task page: Comments and Journal tabs', () => {
     expect(readTaskStatus(ctx.root, id)).toBe('blocked');
   });
 
-  // INVARIANT (CLAUDE.md, "Never Lose Human Feedback"): a write that FAILS must
+  // INVARIANT (AGENTS.md, "Never Lose Human Feedback"): a write that FAILS must
   // hand the text back, not swallow it. The browser has already discarded the
   // textarea by the time the response renders, so if this page does not carry
   // the comment the human retyped it from memory or lost it.

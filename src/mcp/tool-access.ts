@@ -34,6 +34,7 @@ export const TOOL_ACCESS: Readonly<Record<string, ToolAccess>> = {
   lazy_conversation_search: 'read',
   lazy_conversation_read: 'read',
   lazy_memory_recall: 'read',
+  lazy_recipe: 'read',
   // Read-only by construction: builders write scratch by writing FILES into
   // $LAZY_SCRATCH_DIR, and capture persists them. There is no write tool.
   lazy_scratch: 'read',

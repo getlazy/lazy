@@ -29,7 +29,7 @@ describe('lazy upgrade', () => {
 
   // The pre-stop "submit your in-progress message" warning is the v0.17
   // mitigation for unsent-input loss when a builder container is killed
-  // (CLAUDE.md "never lose human feedback"). It must be documented in help so
+  // (AGENTS.md "never lose human feedback"). It must be documented in help so
   // users know to expect it and how --force / no TTY behaves.
   test('help documents the builder pre-stop warning and --force/no-TTY behavior', async () => {
     const result = await ctx.lazy(['upgrade', '--help']);

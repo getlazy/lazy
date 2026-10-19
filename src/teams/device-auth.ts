@@ -33,6 +33,8 @@ export interface TeamsProject {
   slug: string;
   name: string;
   team: string;
+  /** The install-hosted repository, or null when the project lives on a forge. Absent on older installs. */
+  hostedRepoUrl?: string | null;
 }
 
 /** A request to the Teams install failed in a way the user must see. */
@@ -42,6 +44,13 @@ export class TeamsRequestError extends Error {
     this.name = 'TeamsRequestError';
   }
 }
+
+import {
+  authProxyMessage,
+  gatherProxyEvidence,
+  looksLikeAuthProxy,
+  redirectMessage,
+} from './auth-proxy';
 
 type Fetcher = typeof fetch;
 
@@ -75,6 +84,7 @@ function readExpiresIn(value: unknown): number {
 }
 
 async function readJson(response: Response, url: string): Promise<Record<string, unknown>> {
+  const evidence = await gatherProxyEvidence(response.clone());
   const text = await response.text();
   try {
     const parsed = JSON.parse(text);
@@ -83,6 +93,11 @@ async function readJson(response: Response, url: string): Promise<Record<string,
     }
     return parsed as Record<string, unknown>;
   } catch {
+    // A sign-in proxy's page is the one non-JSON answer where the address is
+    // RIGHT; say so rather than sending the person to look for a typo.
+    if (looksLikeAuthProxy(evidence, url)) {
+      throw new TeamsRequestError(authProxyMessage(url, evidence), response.status);
+    }
     // The usual cause is an address that is a web server but not a Teams
     // install — a proxy's error page, a landing page, a 404 in HTML. Say what
     // was asked and what came back rather than "unexpected token < in JSON".
@@ -115,6 +130,7 @@ export async function requestDeviceCode(
   let response: Response;
   try {
     response = await fetcher(url, {
+      redirect: 'manual',
       method: 'POST',
       headers: { 'content-type': 'application/json', accept: 'application/json' },
       body: JSON.stringify({ device_name: deviceName }),
@@ -126,7 +142,14 @@ export async function requestDeviceCode(
     );
   }
 
+  const moved = redirectMessage(teamsUrl, response);
+  if (moved) throw new TeamsRequestError(moved, response.status);
+
   if (!response.ok) {
+    const evidence = await gatherProxyEvidence(response.clone());
+    if (looksLikeAuthProxy(evidence, url)) {
+      throw new TeamsRequestError(authProxyMessage(url, evidence), response.status);
+    }
     throw new TeamsRequestError(
       `${teamsUrl} refused to start a login (HTTP ${response.status}). ` +
       `Check the address, and that the install is running a version of Lazy Teams ` +
@@ -153,7 +176,7 @@ export async function requestDeviceCode(
 export type PollOutcome =
   | { status: 'pending' }
   | { status: 'slow_down'; interval: number }
-  | { status: 'approved'; token: string; email: string }
+  | { status: 'approved'; token: string; email: string; scopes?: string[] }
   | { status: 'refused'; reason: string };
 
 /** Step 2, once: has a human approved it yet? */
@@ -166,6 +189,7 @@ export async function pollDeviceToken(
   let response: Response;
   try {
     response = await fetcher(url, {
+      redirect: 'manual',
       method: 'POST',
       headers: { 'content-type': 'application/json', accept: 'application/json' },
       body: JSON.stringify({ device_code: deviceCode }),
@@ -175,6 +199,9 @@ export async function pollDeviceToken(
     // halfway through approving. Treated as "not yet" and retried by the loop.
     return { status: 'pending' };
   }
+
+  const moved = redirectMessage(teamsUrl, response);
+  if (moved) throw new TeamsRequestError(moved, response.status);
 
   // A 5xx is infrastructure, not an answer: a proxy or load balancer restarting
   // in front of the install returns one, usually with an HTML body. Treated as
@@ -202,7 +229,9 @@ export async function pollDeviceToken(
       user && typeof user === 'object' && typeof (user as { email?: unknown }).email === 'string'
         ? (user as { email: string }).email
         : 'your account';
-    return { status: 'approved', token, email };
+    // Older installs send no scopes; their device tokens are command-line only.
+    const scopes = Array.isArray(body.scopes) ? body.scopes.filter((s): s is string => typeof s === 'string') : undefined;
+    return { status: 'approved', token, email, ...(scopes ? { scopes } : {}) };
   }
 
   if (status === 'slow_down') {
@@ -229,6 +258,7 @@ export async function fetchProjects(
   let response: Response;
   try {
     response = await fetcher(url, {
+      redirect: 'manual',
       headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
     });
   } catch (err) {
@@ -238,7 +268,14 @@ export async function fetchProjects(
     );
   }
 
+  const moved = redirectMessage(teamsUrl, response);
+  if (moved) throw new TeamsRequestError(moved, response.status);
+
   if (!response.ok) {
+    const evidence = await gatherProxyEvidence(response.clone());
+    if (looksLikeAuthProxy(evidence, url)) {
+      throw new TeamsRequestError(authProxyMessage(url, evidence), response.status);
+    }
     const body = await readJson(response, url).catch(() => ({} as Record<string, unknown>));
     const detail = typeof body.error === 'string' ? body.error : `HTTP ${response.status}`;
     throw new TeamsRequestError(`${teamsUrl} refused to list your projects: ${detail}`, response.status);
@@ -262,6 +299,9 @@ export async function fetchProjects(
       slug,
       name: typeof project.name === 'string' ? project.name : slug,
       team: typeof project.team === 'string' ? project.team : '',
+      ...('hosted_repo_url' in project
+        ? { hostedRepoUrl: typeof project.hosted_repo_url === 'string' ? project.hosted_repo_url : null }
+        : {}),
     };
   });
 }

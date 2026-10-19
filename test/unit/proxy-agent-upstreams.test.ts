@@ -81,7 +81,7 @@ describe('resolveAgentUpstreams', () => {
 
   test('a profile that names an endpoint appears; one that does not rides the primary', () => {
     const config = configWith({
-      'local-ollama-pi': { harness: 'pi', model: 'qwen3.8:latest', endpoint: 'http://localhost:11434' },
+      'local-ollama-pi': { harness: 'pi', model: 'qwen3.8:latest', endpoint: 'http://localhost:11434', credential: 'none' },
       'claude-code': { harness: 'claude-code', model: 'claude-opus-5' },
     });
     const entries = resolveAgentUpstreams(config);
@@ -92,6 +92,7 @@ describe('resolveAgentUpstreams', () => {
       // A local model server ignores auth, so it is never handed a real key.
       credential: null,
       wire: 'anthropic',
+      credentialExplicit: true,
     });
   });
 
@@ -103,8 +104,8 @@ describe('resolveAgentUpstreams', () => {
   // alone cannot see.
   test('a local upstream gets no credential; a pinned remote one keeps its own', () => {
     const config = configWith({
-      'work-gateway': { harness: 'claude-code', model: 'm', endpoint: 'https://gateway.example.com' },
-      'local-pi': { harness: 'pi', model: 'qwen', endpoint: 'http://localhost:11434' },
+      'work-gateway': { harness: 'claude-code', model: 'm', endpoint: 'https://gateway.example.com', credential: 'anthropic' },
+      'local-pi': { harness: 'pi', model: 'qwen', endpoint: 'http://localhost:11434', credential: 'none' },
     });
     const credentials = Object.fromEntries(
       resolveAgentUpstreams(config)
@@ -120,7 +121,7 @@ describe('resolveAgentUpstreams', () => {
   // a second spelling of the same upstream.
   test('a trailing slash is normalized away', () => {
     const config = configWith({
-      'work-codex': { harness: 'codex', model: 'gpt-5-codex', endpoint: 'https://openrouter.ai/api/' },
+      'work-codex': { harness: 'codex', model: 'gpt-5-codex', endpoint: 'https://openrouter.ai/api/', credential: 'openrouter' },
     });
     expect(agentUpstreamMap(config)['work-codex'])
       .toEqual({ upstream: 'https://openrouter.ai/api', wire: 'openai' });
@@ -133,7 +134,7 @@ describe('resolveAgentUpstreams', () => {
   test('two profiles of one harness resolve to their own upstream and credential', () => {
     const config = configWith({
       codex: { harness: 'codex', model: 'gpt-5-codex' },
-      'router-codex': { harness: 'codex', model: 'x-ai/grok-4', endpoint: 'https://openrouter.ai/api' },
+      'router-codex': { harness: 'codex', model: 'x-ai/grok-4', endpoint: 'https://openrouter.ai/api', credential: 'openrouter' },
     });
     expect(agentUpstreamMap(config)).toEqual({
       codex: { upstream: 'https://api.openai.com', wire: 'openai' },
@@ -158,7 +159,7 @@ describe('resolveAgentUpstreams', () => {
 
 describe('routeForProfile', () => {
   const map = agentUpstreamMap(configWith({
-    'local-pi': { harness: 'pi', model: 'qwen3.8:latest', endpoint: 'http://localhost:11434' },
+    'local-pi': { harness: 'pi', model: 'qwen3.8:latest', endpoint: 'http://localhost:11434', credential: 'none' },
   }));
 
   test('a grant naming a profile with an upstream is routed there', () => {
@@ -197,8 +198,8 @@ describe('profile upstreams in the credential map', () => {
 
   test('each profile upstream is registered with its own credential', () => {
     const deps = buildProxyCredentialDeps('/tmp/x', configWith({
-      'router-codex': { harness: 'codex', model: 'x-ai/grok-4', endpoint: 'https://openrouter.ai/api' },
-      'local-pi': { harness: 'pi', model: 'qwen3.8:latest', endpoint: 'http://localhost:11434' },
+      'router-codex': { harness: 'codex', model: 'x-ai/grok-4', endpoint: 'https://openrouter.ai/api', credential: 'openrouter' },
+      'local-pi': { harness: 'pi', model: 'qwen3.8:latest', endpoint: 'http://localhost:11434', credential: 'none' },
     }));
     expect(deps.targets.has('https://openrouter.ai/api')).toBe(true);
     // The local one is deliberately unmapped, which TargetCredentials answers
@@ -246,7 +247,7 @@ describe('profile upstreams in the credential map', () => {
   test('two profiles sharing an origin and a credential are allowed', () => {
     const config = configWith({
       codex: { harness: 'codex', model: 'gpt-5-codex' },
-      'codex-mini': { harness: 'codex', model: 'gpt-5-mini', endpoint: 'https://api.openai.com' },
+      'codex-mini': { harness: 'codex', model: 'gpt-5-mini', endpoint: 'https://api.openai.com', credential: 'openai' },
     });
     expect(() => buildProxyCredentialDeps('/tmp/x', config)).not.toThrow();
   });
@@ -255,6 +256,8 @@ describe('profile upstreams in the credential map', () => {
 describe('the proxy routes by the caller grant profile', () => {
   const PI_TOKEN = 'sk-ant-api03-lazy-pi-placeholder';
   const CLAUDE_TOKEN = 'sk-ant-api03-lazy-claude-placeholder';
+  const FIREWORKS_TOKEN = 'sk-ant-api03-lazy-fireworks-placeholder';
+  const FIREWORKS_KEY = 'new-fireworks-secret';
   const LEGACY_TOKEN = 'sk-ant-api03-lazy-legacy-placeholder';
   const REAL = 'sk-ant-oat01-THE-REAL-USER-TOKEN';
 
@@ -266,6 +269,10 @@ describe('the proxy routes by the caller grant profile', () => {
     [CLAUDE_TOKEN]: {
       token: CLAUDE_TOKEN, role: 'agent', taskId: 'task-cc', label: 'lazy-task-cc',
       envKey: 'ANTHROPIC_API_KEY', profile: 'claude-code', createdAt: new Date().toISOString(),
+    },
+    [FIREWORKS_TOKEN]: {
+      token: FIREWORKS_TOKEN, role: 'agent', taskId: 'task-fw', label: 'lazy-task-fw',
+      envKey: 'ANTHROPIC_API_KEY', profile: 'fireworks', createdAt: new Date().toISOString(),
     },
     // Minted before profiles existed — still in the on-disk registry.
     [LEGACY_TOKEN]: {
@@ -285,12 +292,14 @@ describe('the proxy routes by the caller grant profile', () => {
   // Lets a test make an upstream fail. Restored from the role suite this
   // replaces: without it the no-failover invariant below cannot be expressed.
   let primaryStatus = 200;
+  let liveRoutes: Record<string, { upstream: string; wire: 'anthropic' | 'openai' }> | null = null;
+  let liveTargets: TargetCredentials | null = null;
+  let liveProfiles: ReadonlySet<string> | null = null;
+  let memberResolver: ProxyCredentialDeps['member'] | null = null;
 
-  const freePort = () => 41000 + Math.floor(Math.random() * 8000);
-
-  function upstreamServer(name: string, port: number, status: () => number) {
+  function upstreamServer(name: string, status: () => number) {
     return Bun.serve({
-      port, hostname: '127.0.0.1',
+      port: 0, hostname: '127.0.0.1',
       async fetch(req) {
         await req.text();
         const headers: Record<string, string> = {};
@@ -306,12 +315,10 @@ describe('the proxy routes by the caller grant profile', () => {
   beforeAll(async () => {
     seen = {};
     records = [];
-    const primaryPort = freePort();
-    const profilePort = freePort();
-    primaryUrl = `http://127.0.0.1:${primaryPort}`;
-    profileUrl = `http://127.0.0.1:${profilePort}`;
-    primary = upstreamServer('primary', primaryPort, () => primaryStatus);
-    profileTarget = upstreamServer('profile', profilePort, () => 200);
+    primary = upstreamServer('primary', () => primaryStatus);
+    profileTarget = upstreamServer('profile', () => 200);
+    primaryUrl = `http://127.0.0.1:${primary.port!}`;
+    profileUrl = `http://127.0.0.1:${profileTarget.port!}`;
 
     const targets = new TargetCredentials();
     targets.set(primaryUrl, async () => ({
@@ -324,12 +331,14 @@ describe('the proxy routes by the caller grant profile', () => {
     const credentials: ProxyCredentialDeps = {
       lookup: async (token: string) => grants[token] ?? null,
       targets,
+      member: async (grant, expectedOrigin) => memberResolver
+        ? memberResolver(grant, expectedOrigin)
+        : null,
     };
     const sink: AuditSink = { append: async (r) => { records.push(r); } };
-    proxyPort = freePort();
     proxy = createProxyServer(
       {
-        port: proxyPort, bind: '127.0.0.1',
+        port: 0, bind: '127.0.0.1',
         upstream: primaryUrl,
         fallbacks: [],
         retryAfterThreshold: 0,
@@ -338,14 +347,24 @@ describe('the proxy routes by the caller grant profile', () => {
         // what decides the upstream. Two profiles in the same role therefore
         // land on different upstreams, which is the whole point below.
         agentUpstreams: { 'local-pi': { upstream: profileUrl, wire: 'anthropic' } },
+        liveAgentRouting: async () => ({
+          routes: liveRoutes ?? { 'local-pi': { upstream: profileUrl, wire: 'anthropic' } },
+          targets: liveTargets ?? targets,
+          profiles: liveProfiles ?? new Set(['local-pi', 'claude-code']),
+        }),
       },
       sink,
       credentials,
     );
+    proxyPort = proxy.port!;
     await new Promise(r => setTimeout(r, 50));
   });
 
   afterAll(() => {
+    liveRoutes = null;
+    liveTargets = null;
+    liveProfiles = null;
+    memberResolver = null;
     primary.stop(); profileTarget.stop(); proxy.stop();
   });
 
@@ -356,6 +375,143 @@ describe('the proxy routes by the caller grant profile', () => {
       body: JSON.stringify({ model: 'claude-opus-5', messages: [] }),
     });
   }
+
+  test('new routes take effect without restarting and never leak the primary credential', async () => {
+    liveRoutes = { 'local-pi': { upstream: profileUrl, wire: 'anthropic' }, 'claude-code': { upstream: profileUrl, wire: 'anthropic' } };
+    seen.primary = null; seen.profile = null;
+    const response = await send({ 'x-api-key': CLAUDE_TOKEN });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ from: 'profile' });
+    expect(seen.primary).toBeNull();
+    expect((seen['profile'] as { headers: Record<string, string> } | null)?.headers['x-api-key']).not.toBe(REAL);
+    liveRoutes = null;
+  });
+
+  // INVARIANT: new-endpoint consent never authorizes the previous route. A request can wait for its credential while the profile endpoint changes.
+  test('an in-flight request never sends newly consented credentials on the old route', async () => {
+    await exerciseMemberRouteChange({
+      oldRoute: primaryUrl, newRoute: profileUrl,
+      secret: 'new-endpoint-secret', credentialKey: 'ANTHROPIC_API_KEY', destination: 'profile',
+    });
+  });
+
+  // INVARIANT: a Claude token never reaches a non-Anthropic route. A request routed to the old gateway must be refused if its profile switches to Anthropic before credential resolution.
+  test('an in-flight request never sends the Claude token to the old gateway', async () => {
+    await exerciseMemberRouteChange({
+      oldRoute: profileUrl, newRoute: 'https://api.anthropic.com',
+      secret: REAL, credentialKey: 'CLAUDE_CODE_OAUTH_TOKEN',
+    });
+  });
+
+  async function exerciseMemberRouteChange(input: {
+    oldRoute: string;
+    newRoute: string;
+    secret: string;
+    credentialKey: string;
+    destination?: 'primary' | 'profile';
+  }): Promise<void> {
+    const { oldRoute, newRoute, secret, credentialKey, destination } = input;
+    let consentedOrigin = new URL(oldRoute).origin;
+    let signalEntered!: () => void;
+    const entered = new Promise<void>(resolve => { signalEntered = resolve; });
+    let resume!: () => void;
+    const paused = new Promise<void>(resolve => { resume = resolve; });
+    const selectedOrigins: Array<string | undefined> = [];
+    memberResolver = async (_grant, expectedOrigin) => {
+      selectedOrigins.push(expectedOrigin);
+      signalEntered();
+      await paused;
+      if (expectedOrigin !== undefined && expectedOrigin !== consentedOrigin) {
+        return { userId: 'alice', outcome: { kind: 'missing', reason: 'routing changed during credential resolution' } };
+      }
+      return {
+        userId: 'alice',
+        outcome: { kind: 'credential', placement: anthropicPlacement(credentialKey, secret), label: 'connected' },
+      };
+    };
+    liveProfiles = new Set(['local-pi', 'claude-code', 'fireworks']);
+    liveRoutes = { fireworks: { upstream: oldRoute, wire: 'anthropic' } };
+    seen.primary = null; seen.profile = null;
+    try {
+      const pending = send({ 'x-api-key': FIREWORKS_TOKEN });
+      await entered;
+      liveRoutes = { fireworks: { upstream: newRoute, wire: 'anthropic' } };
+      consentedOrigin = new URL(newRoute).origin;
+      resume();
+      const denied = await pending;
+      expect(denied.status).toBe(401);
+      expect(selectedOrigins[0]).toBe(new URL(oldRoute).origin);
+      expect(seen.primary).toBeNull();
+      expect(seen.profile).toBeNull();
+
+      if (destination) {
+        const accepted = await send({ 'x-api-key': FIREWORKS_TOKEN });
+        expect(accepted.status).toBe(200);
+        expect(await accepted.json()).toMatchObject({ from: destination });
+        const headers = seen[destination]?.headers;
+        expect(headers?.[credentialKey === 'CLAUDE_CODE_OAUTH_TOKEN' ? 'authorization' : 'x-api-key'])
+          .toBe(credentialKey === 'CLAUDE_CODE_OAUTH_TOKEN' ? 'Bearer ' + secret : secret);
+      }
+    } finally {
+      resume();
+      memberResolver = null;
+      liveRoutes = null;
+      liveProfiles = null;
+    }
+  }
+
+  test('a removed profile cannot fall back to the primary upstream', async () => {
+    liveRoutes = { fireworks: { upstream: profileUrl, wire: 'anthropic' } };
+    liveProfiles = new Set(['local-pi', 'claude-code', 'fireworks']);
+    try {
+      const beforeRemoval = await send({ 'x-api-key': FIREWORKS_TOKEN });
+      expect(beforeRemoval.status).toBe(200);
+      expect(await beforeRemoval.json()).toMatchObject({ from: 'profile' });
+      liveProfiles = new Set(['local-pi', 'claude-code']);
+      liveRoutes = {};
+      seen.primary = null; seen.profile = null;
+      const response = await send({ 'x-api-key': FIREWORKS_TOKEN });
+      expect(response.status).toBe(410);
+      expect(await response.text()).toContain('no longer exists');
+      expect(seen.primary).toBeNull();
+      expect(seen.profile).toBeNull();
+      const cursorResponse = await fetch(`http://127.0.0.1:${proxyPort}/_lazy/cursor/${FIREWORKS_TOKEN}/auth/exchange_user_api_key`);
+      expect(cursorResponse.status).toBe(410);
+      expect(await cursorResponse.text()).toContain('no longer exists');
+      expect(seen.primary).toBeNull();
+      expect(seen.profile).toBeNull();
+    } finally {
+      liveRoutes = null;
+      liveProfiles = null;
+    }
+  });
+
+  test('a newly added profile uses its new route and credential target without a restart', async () => {
+    const updatedTargets = new TargetCredentials();
+    updatedTargets.set(primaryUrl, async () => ({
+      kind: 'credential', placement: anthropicPlacement('CLAUDE_CODE_OAUTH_TOKEN', REAL), label: 'primary',
+    }));
+    updatedTargets.set(profileUrl, async () => ({
+      kind: 'credential', placement: anthropicPlacement('ANTHROPIC_API_KEY', FIREWORKS_KEY), label: 'fireworks',
+    }));
+    liveRoutes = { fireworks: { upstream: profileUrl, wire: 'anthropic' } };
+    liveTargets = updatedTargets;
+    liveProfiles = new Set(['local-pi', 'claude-code', 'fireworks']);
+    try {
+      seen.primary = null; seen.profile = null;
+      const response = await send({ 'x-api-key': FIREWORKS_TOKEN });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ from: 'profile' });
+      expect(seen.primary).toBeNull();
+      const profileHeaders = (seen['profile'] as { headers: Record<string, string> } | null)?.headers;
+      expect(profileHeaders?.['x-api-key']).toBe(FIREWORKS_KEY);
+      expect(profileHeaders?.['authorization']).toBeUndefined();
+    } finally {
+      liveRoutes = null;
+      liveTargets = null;
+      liveProfiles = null;
+    }
+  });
 
   test('a caller whose profile names an upstream is forwarded there', async () => {
     seen.primary = null; seen.profile = null;
@@ -432,7 +588,7 @@ describe('the proxy routes by the caller grant profile', () => {
   // change when the routing key did): a profile upstream gets a SINGLE target
   // and no failover chain. `[[proxy.fallback]]` is the PRIMARY's failover;
   // failing a local-model profile over to api.anthropic.com would silently
-  // change the model and bill the user (CLAUDE.md: no silent fallbacks).
+  // change the model and bill the user (AGENTS.md: no silent fallbacks).
   // Nothing reroutes INTO a profile upstream either — a primary failure is the
   // primary's chain, which is empty here, so it fails hard.
   test('a profile upstream is never a failover destination for the primary', async () => {
@@ -478,11 +634,9 @@ describe('a configured fallback chain belongs to the primary alone', () => {
   let primaryStatus = 200;
   let profileStatus = 200;
 
-  const freePort = () => 41000 + Math.floor(Math.random() * 8000);
-
-  function upstreamServer(name: string, port: number, status: () => number) {
+  function upstreamServer(name: string, status: () => number) {
     return Bun.serve({
-      port, hostname: '127.0.0.1',
+      port: 0, hostname: '127.0.0.1',
       async fetch(req) {
         await req.text();
         seen[name] = true;
@@ -495,15 +649,12 @@ describe('a configured fallback chain belongs to the primary alone', () => {
 
   beforeAll(async () => {
     seen = {};
-    const primaryPort = freePort();
-    const fallbackPort = freePort();
-    const profilePort = freePort();
-    const primaryUrl = `http://127.0.0.1:${primaryPort}`;
-    const fallbackUrl = `http://127.0.0.1:${fallbackPort}`;
-    const profileUrl = `http://127.0.0.1:${profilePort}`;
-    primary = upstreamServer('primary', primaryPort, () => primaryStatus);
-    fallback = upstreamServer('fallback', fallbackPort, () => 200);
-    profileTarget = upstreamServer('profile', profilePort, () => profileStatus);
+    primary = upstreamServer('primary', () => primaryStatus);
+    fallback = upstreamServer('fallback', () => 200);
+    profileTarget = upstreamServer('profile', () => profileStatus);
+    const primaryUrl = `http://127.0.0.1:${primary.port!}`;
+    const fallbackUrl = `http://127.0.0.1:${fallback.port!}`;
+    const profileUrl = `http://127.0.0.1:${profileTarget.port!}`;
 
     const targets = new TargetCredentials();
     for (const url of [primaryUrl, fallbackUrl]) {
@@ -514,10 +665,9 @@ describe('a configured fallback chain belongs to the primary alone', () => {
       }));
     }
 
-    proxyPort = freePort();
     proxy = createProxyServer(
       {
-        port: proxyPort, bind: '127.0.0.1',
+        port: 0, bind: '127.0.0.1',
         upstream: primaryUrl,
         fallbacks: [{ upstream: fallbackUrl }],
         retryAfterThreshold: 0,
@@ -526,6 +676,7 @@ describe('a configured fallback chain belongs to the primary alone', () => {
       { append: async () => {} },
       { lookup: async (token: string) => grants[token] ?? null, targets },
     );
+    proxyPort = proxy.port!;
     await new Promise(r => setTimeout(r, 50));
   });
 

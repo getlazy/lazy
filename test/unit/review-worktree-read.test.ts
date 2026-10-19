@@ -16,7 +16,7 @@ describe('readWorktreeFileNoFollow', () => {
   beforeEach(async () => {
     // realpath the temp root: on macOS tmpdir() is /var/... -> /private/var/...,
     // and comparing an unresolved root against resolved paths reports every read
-    // as an escape (the same trap CLAUDE.md flags for git-printed paths).
+    // as an escape (the same trap AGENTS.md flags for git-printed paths).
     const base = await realpath(await mkdtemp(join(tmpdir(), 'lazy-wtread-')));
     root = join(base, 'worktree');
     outside = join(base, 'outside');

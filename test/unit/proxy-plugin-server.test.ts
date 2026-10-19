@@ -21,6 +21,12 @@ import type { ProxyRequestPlugin } from '../../src/proxy/plugins/types';
 import type { AuditSink } from '../../src/proxy/audit';
 import type { ProxyAuditRecord } from '../../src/storage/types';
 
+/**
+ * These tests exercise the loading MECHANISM. Lazy itself never loads
+ * repository plugins (src/config/managed-repo-code.ts), so they opt in here.
+ */
+const MECHANISM_ONLY = { enabled: true } as const;
+
 // The proxy writes audit records to an AuditSink (the project-local bounded
 // log in production) — never to Storage.
 function createMockSink(): AuditSink {
@@ -28,10 +34,6 @@ function createMockSink(): AuditSink {
   return {
     append: async (r: ProxyAuditRecord) => { records.push(r); },
   };
-}
-
-function findFreePort(): number {
-  return 40000 + Math.floor(Math.random() * 10000);
 }
 
 const SYSTEM_PROMPT = [
@@ -46,15 +48,15 @@ describe('proxy request plugins over real HTTP', () => {
   let projectRoot: string;
 
   beforeAll(async () => {
-    upstreamPort = findFreePort();
     upstream = Bun.serve({
-      port: upstreamPort,
+      port: 0,
       hostname: '127.0.0.1',
       async fetch(req) {
         rawForwardedBody = req.method === 'GET' ? null : await req.text();
         return Response.json({ type: 'message', ok: true });
       },
     });
+    upstreamPort = upstream.port!;
 
     // A real project checkout with a real user-authored plugin in .lazy/plugins.
     projectRoot = await mkdtemp(join(tmpdir(), 'lazy-plugin-proxy-'));
@@ -81,14 +83,13 @@ describe('proxy request plugins over real HTTP', () => {
   });
 
   function startProxy(plugins?: readonly ProxyRequestPlugin[]) {
-    const port = findFreePort();
     const server = createProxyServer(
-      { port, bind: '127.0.0.1', upstream: `http://127.0.0.1:${upstreamPort}`, plugins },
+      { port: 0, bind: '127.0.0.1', upstream: `http://127.0.0.1:${upstreamPort}`, plugins },
       createMockSink(),
       // No credential broker: these tests exercise request plugins, not JIT injection.
       null,
     );
-    return { port, server };
+    return { port: server.port!, server };
   }
 
   async function post(proxyPort: number, body: string): Promise<void> {
@@ -131,7 +132,7 @@ describe('proxy request plugins over real HTTP', () => {
   test('a project with no .lazy/plugins directory is byte-identical', async () => {
     const emptyRoot = await mkdtemp(join(tmpdir(), 'lazy-plugin-empty-'));
     try {
-      const loaded = await loadProxyRequestPlugins(emptyRoot);
+      const loaded = await loadProxyRequestPlugins(emptyRoot, MECHANISM_ONLY);
       expect(loaded).toEqual([]);
       const { port, server } = startProxy(loaded);
       try {
@@ -148,7 +149,7 @@ describe('proxy request plugins over real HTTP', () => {
   });
 
   test('a plugin loaded from .lazy/plugins rewrites the body on the wire', async () => {
-    const plugins = await loadProxyRequestPlugins(projectRoot);
+    const plugins = await loadProxyRequestPlugins(projectRoot, MECHANISM_ONLY);
     expect(plugins.map((p) => p.name)).toEqual(['uppercase-system']);
     const { port, server } = startProxy(plugins);
     try {
@@ -168,7 +169,7 @@ describe('proxy request plugins over real HTTP', () => {
   // A request the installed plugin declines (returns null for) must still go out
   // byte-for-byte — the seam only re-serialises when something actually changed.
   test('a request the plugin declines is still forwarded byte-identically', async () => {
-    const plugins = await loadProxyRequestPlugins(projectRoot);
+    const plugins = await loadProxyRequestPlugins(projectRoot, MECHANISM_ONLY);
     const { port, server } = startProxy(plugins);
     try {
       const sent = JSON.stringify({ model: 'm', max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] });

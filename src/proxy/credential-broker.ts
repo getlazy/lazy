@@ -80,6 +80,25 @@ export interface CredentialGrant {
    * in team mode until their next launch adds it.
    */
   taskUuid?: string;
+  /**
+   * The session-binding key a team-mode launch BESIDE a task (a member's
+   * builder, a one-shot) is paid through — the proxy bills that binding's owner
+   * with their own credential for the grant's profile, exactly as it bills a
+   * task turn's principal through `taskUuid`. Absent on every other grant.
+   */
+  bindingKey?: string;
+  /**
+   * Source addresses of the container this grant was launched into, when the
+   * runner could read them (see {@link pinGrantsToAddresses}). Absent = not
+   * pinned, accepted from anywhere.
+   */
+  boundAddresses?: string[];
+  /**
+   * Credentials an upstream minted FOR this grant's holder (Cursor's key
+   * exchange), each held behind its own placeholder — see
+   * {@link bindDerivedCredentials}. The container only ever sees `placeholder`.
+   */
+  derived?: Array<{ placeholder: string; real: string; createdAt: string }>;
   createdAt: string;
 }
 
@@ -118,6 +137,8 @@ const PLACEHOLDER_PREFIXES: Record<string, string> = {
   // OpenAI keys are `sk-...` / `sk-proj-...`; OpenRouter keys are `sk-or-v1-...`.
   OPENAI_API_KEY: 'sk-proj-lazy-',
   OPENROUTER_API_KEY: 'sk-or-v1-lazy-',
+  // Fireworks keys are `fw_...`.
+  FIREWORKS_API_KEY: 'fw_lazy_',
 };
 
 /** Fallback for an env var lazy has no shape knowledge of. */
@@ -177,13 +198,12 @@ async function loadRegistry(projectRoot: string): Promise<GrantFile> {
   let parsed: GrantFile;
   try {
     parsed = JSON.parse(raw) as GrantFile;
-  } catch (err) {
+  } catch {
     // Found-but-broken is an error the human must see. Starting from empty
     // would silently 401 every running container's next request, and the
     // message they'd chase would be "authentication", not "corrupt file".
     throw new Error(
-      `The proxy credential grant registry ${path} is not valid JSON ` +
-      `(${err instanceof Error ? err.message : String(err)}). ` +
+      `The proxy credential grant registry ${path} is not valid JSON. ` +
       `Delete the file and restart the daemon to re-mint placeholders — ` +
       `running agents will need their tasks resumed.`,
     );
@@ -245,9 +265,19 @@ function identityKey(
   label: string,
   envKey: string,
   profile: string | undefined,
+  bindingKey?: string,
 ): string {
-  const who = role === 'agent' ? `agent:${taskId ?? label}` : `builder:${label}`;
-  return `${who}|${envKey}|${profile ?? ''}`;
+  // The LABEL (the container / run name) is part of an agent grant's identity:
+  // a task's work, review and accept-gate containers each run under their own
+  // name and must each hold their OWN placeholder, because a grant is pinned to
+  // one container's address (pinGrantsToAddresses). The work container's name
+  // is stable per task, so work turns still reuse one placeholder.
+  const who = role === 'agent' ? `agent:${taskId ?? label}|${label}` : `builder:${label}`;
+  // The PAYER is part of a side launch's identity: one-shot labels are shared
+  // per project or task, and a grant reused across two launches paid by
+  // different people would bill whichever bound it last for both.
+  const paidBy = role !== 'agent' && bindingKey ? `|bind:${bindingKey}` : '';
+  return `${who}|${envKey}|${profile ?? ''}${paidBy}`;
 }
 
 /**
@@ -268,13 +298,14 @@ export async function mintCredentialGrant(
   projectRoot: string,
   opts: {
     role: GrantRole; taskId?: string | null; label: string; envKey: string; profile?: string; taskUuid?: string;
+    bindingKey?: string;
   },
 ): Promise<string> {
   const taskId = opts.taskId ?? null;
   return mutate(projectRoot, async registry => {
-    const key = identityKey(opts.role, taskId, opts.label, opts.envKey, opts.profile);
+    const key = identityKey(opts.role, taskId, opts.label, opts.envKey, opts.profile, opts.bindingKey);
     const existing = registry.grants.find(
-      g => identityKey(g.role, g.taskId, g.label, g.envKey, g.profile) === key,
+      g => identityKey(g.role, g.taskId, g.label, g.envKey, g.profile, g.bindingKey) === key,
     );
     if (existing) {
       // Same token — a running container keeps the value in its env — now
@@ -294,6 +325,7 @@ export async function mintCredentialGrant(
       envKey: opts.envKey,
       ...(opts.profile ? { profile: opts.profile } : {}),
       ...(opts.taskUuid ? { taskUuid: opts.taskUuid } : {}),
+      ...(opts.bindingKey ? { bindingKey: opts.bindingKey } : {}),
       createdAt: new Date().toISOString(),
     };
     registry.grants.push(grant);
@@ -357,18 +389,134 @@ export async function lookupCredentialGrant(
  * as this once did left those behind as live placeholders with nothing left to
  * revoke them.
  *
+ * WHICH IDENTIFIERS: `task.id` is the task's UUID and `task.refs` every
+ * reference a launch may have minted under (its code, its short id). Launches
+ * mint with `taskId` = the REF they had to hand and `taskUuid` = the UUID, so
+ * a revoke by UUID alone matched nothing and every placeholder outlived its
+ * task. A grant matches when its `taskUuid` is the UUID, or when its `taskId`
+ * is the UUID or one of the refs and it names no OTHER task's UUID — a code is
+ * reusable, and a grant carrying a different UUID belongs to that task.
+ *
  * Returns the number revoked. Idempotent.
  */
 export async function revokeTaskCredentialGrants(
   projectRoot: string,
-  taskId: string,
+  task: { id: string; refs?: readonly string[] },
 ): Promise<number> {
+  const refs = new Set([task.id, ...(task.refs ?? [])].filter(Boolean));
+  const belongs = (g: CredentialGrant): boolean =>
+    g.taskUuid === task.id ||
+    (g.taskId !== null && refs.has(g.taskId) && (!g.taskUuid || g.taskUuid === task.id));
   return mutate(projectRoot, async registry => {
     const before = registry.grants.length;
-    registry.grants = registry.grants.filter(g => g.taskId !== taskId);
+    registry.grants = registry.grants.filter(g => !belongs(g));
     const removed = before - registry.grants.length;
     if (removed > 0) await persist(projectRoot, registry);
     return removed;
+  });
+}
+
+/**
+ * Pin every grant minted for one launch (by its label — the container name) to
+ * the network addresses that container has, or clear the pin with `null`.
+ *
+ * A pinned grant is refused by the proxy from any other source address
+ * ({@link grantAcceptsPeer}), so a placeholder that leaks out of its container
+ * — into a transcript, a log another task can read — cannot be spent from a
+ * sibling container during the owner's live turn.
+ *
+ * Grants are reused across turns and every turn runs in a fresh container with
+ * a fresh address, so a launch CLEARS the pin before `docker run` (the old
+ * address is gone, and keeping it would refuse the new container's first
+ * request) and pins again once the container is up. Returns how many grants
+ * changed.
+ */
+export async function pinGrantsToAddresses(
+  projectRoot: string,
+  label: string,
+  addresses: readonly string[] | null,
+): Promise<number> {
+  const pin = addresses && addresses.length > 0 ? [...new Set(addresses)].sort() : null;
+  return mutate(projectRoot, async registry => {
+    let changed = 0;
+    for (const g of registry.grants) {
+      if (g.label !== label) continue;
+      if (pin) {
+        if (JSON.stringify(g.boundAddresses ?? null) === JSON.stringify(pin)) continue;
+        g.boundAddresses = pin;
+      } else {
+        if (!g.boundAddresses) continue;
+        delete g.boundAddresses;
+      }
+      changed++;
+    }
+    if (changed > 0) await persist(projectRoot, registry);
+    return changed;
+  });
+}
+
+/**
+ * May a request from `peerAddress` spend this grant?
+ *
+ * An unpinned grant answers yes (nothing to check against — Docker Desktop,
+ * the host-process runner, a launch whose address could not be read). A
+ * pinned one answers yes only from one of its addresses, and NO when the peer
+ * is unknown: a pin an unidentifiable caller could pass would pin nothing.
+ */
+export function grantAcceptsPeer(grant: CredentialGrant, peerAddress: string | null): boolean {
+  if (!grant.boundAddresses || grant.boundAddresses.length === 0) return true;
+  return peerAddress !== null && grant.boundAddresses.includes(peerAddress);
+}
+
+/**
+ * Most derived pairs one grant keeps. Each Cursor key exchange (once per
+ * launch, again whenever the access token nears expiry) adds one; the newest
+ * few cover every token a live container can still be holding.
+ */
+export const MAX_DERIVED_PER_GRANT = 8;
+
+/** Marker in a derived placeholder (the signature segment of a JWT-shaped one). */
+const DERIVED_MARKER = 'lazyd';
+
+/**
+ * A placeholder standing in for a credential an UPSTREAM minted for a grant's
+ * holder — today the access and refresh tokens Cursor's key exchange returns.
+ *
+ * A JWT keeps its header and payload and loses its signature: cursor-agent
+ * decodes the payload to read `exp` and re-exchanges whenever it cannot, and a
+ * JWT whose signature is lazy's random marker verifies nowhere. Anything else
+ * becomes an opaque marker value.
+ */
+export function derivedPlaceholderFor(real: string): string {
+  const random = randomBytes(24).toString('hex');
+  const parts = real.split('.');
+  if (parts.length === 3 && parts[0] && parts[1]) return `${parts[0]}.${parts[1]}.${DERIVED_MARKER}${random}`;
+  return `${DERIVED_MARKER}_${random}`;
+}
+
+/**
+ * Record upstream-minted credentials against the grant whose request minted
+ * them, so the proxy can substitute them back on that grant's later requests.
+ * Persisted ON the grant: it survives a daemon restart as the grant does, and
+ * it is revoked WITH the grant — a derived placeholder dies with its task.
+ * Returns false when the grant no longer exists (revoked mid-request); the
+ * caller must then hand out nothing.
+ */
+export async function bindDerivedCredentials(
+  projectRoot: string,
+  grantToken: string,
+  pairs: ReadonlyArray<{ placeholder: string; real: string }>,
+): Promise<boolean> {
+  return mutate(projectRoot, async registry => {
+    const grant = registry.grants.find(g => g.token === grantToken);
+    if (!grant) return false;
+    const now = new Date().toISOString();
+    grant.derived = [
+      ...(grant.derived ?? []),
+      ...pairs.map(p => ({ placeholder: p.placeholder, real: p.real, createdAt: now })),
+    ].slice(-MAX_DERIVED_PER_GRANT);
+    await persist(projectRoot, registry);
+    return true;
   });
 }
 
@@ -386,6 +534,20 @@ export async function revokeBuilderCredentialGrant(
   return mutate(projectRoot, async registry => {
     const before = registry.grants.length;
     registry.grants = registry.grants.filter(g => !(g.role === 'builder' && g.label === label));
+    const removed = before - registry.grants.length;
+    if (removed > 0) await persist(projectRoot, registry);
+    return removed;
+  });
+}
+
+/**
+ * Revoke every grant paid through the session binding `bindingKey` — a side
+ * launch's grants, when its binding is released. Returns how many. Idempotent.
+ */
+export async function revokeGrantsByBindingKey(projectRoot: string, bindingKey: string): Promise<number> {
+  return mutate(projectRoot, async registry => {
+    const before = registry.grants.length;
+    registry.grants = registry.grants.filter(g => g.bindingKey !== bindingKey);
     const removed = before - registry.grants.length;
     if (removed > 0) await persist(projectRoot, registry);
     return removed;
@@ -411,3 +573,56 @@ export async function revokeGrantsByLabelPrefix(projectRoot: string, prefix: str
 export function clearCredentialGrantCache(): void {
   cache.clear();
 }
+
+/**
+ * Every placeholder value this project's registry holds — for scrubbing them
+ * out of text an admin reads (src/daemon/observability-redaction.ts). Values
+ * only, never the grants they belong to. Includes each grant's derived pairs,
+ * placeholder AND real value: the real one is an upstream-minted session the
+ * daemon holds, and must no more appear in that text than the key it came from.
+ */
+export async function knownPlaceholderValues(projectRoot: string): Promise<string[]> {
+  return (await getRegistry(projectRoot)).grants.flatMap(g => [
+    g.token,
+    ...(g.derived ?? []).flatMap(d => [d.placeholder, d.real]),
+  ]);
+}
+
+/**
+ * The SHAPE of a placeholder lazy mints: one of the known prefixes followed
+ * by the 48 hex characters {@link placeholderValueFor} appends. Exact by
+ * construction — it is lazy's own format — so a placeholder already revoked
+ * (no longer in the registry) is still recognised in old log text.
+ */
+export const PLACEHOLDER_VALUE_PATTERN = new RegExp(
+  `(?:${[...new Set([...Object.values(PLACEHOLDER_PREFIXES), DEFAULT_PLACEHOLDER_PREFIX])]
+    .map(p => p.replace(/[.*+?^${}()|[\]\\-]/g, '\\$&')).join('|')})[0-9a-f]{48}`,
+  'g',
+);
+
+/**
+ * The shape of a placeholder standing in for an UPSTREAM-minted credential
+ * (see {@link derivedPlaceholderFor}): a JWT whose signature is lazy's marker,
+ * or the bare marker form.
+ */
+export const DERIVED_PLACEHOLDER_PATTERN = new RegExp(
+  `(?:[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.${DERIVED_MARKER}|${DERIVED_MARKER}_)[0-9a-f]{48}`,
+  'g',
+);
+
+/**
+ * Replace every lazy placeholder SHAPE in `text` — grant placeholders, team
+ * session placeholders, derived ones — with a fixed marker. For text a task
+ * container can read (the proxy audit log): a placeholder there could be
+ * spent by a sibling container while its owner's turn is live. Shape-based so
+ * it needs no registry read per record and still catches revoked values.
+ */
+export function scrubLazyPlaceholders(text: string): string {
+  return text
+    .replace(PLACEHOLDER_VALUE_PATTERN, '<lazy-placeholder>')
+    .replace(SESSION_PLACEHOLDER_PATTERN, '<lazy-placeholder>')
+    .replace(DERIVED_PLACEHOLDER_PATTERN, '<lazy-placeholder>');
+}
+
+/** Team-mode session placeholder shape (src/daemon/session-credentials.ts). */
+const SESSION_PLACEHOLDER_PATTERN = /lazy-sess-[0-9a-f]{64}/g;

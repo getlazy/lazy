@@ -70,6 +70,12 @@ describe('shellClientScript', () => {
     expect(script).toContain('navigator.clipboard.writeText(selection)');
   });
 
+  // INVARIANT: a clipboard paste goes through xterm's paste(), which honours
+  // bracketed paste. Sending it raw let a clipboard with newlines run commands.
+  test('pasted text goes through the terminal, not straight to the socket', () => {
+    expect(script).toContain('if (s.term) s.term.paste(text);');
+  });
+
   test('exposes lzShellRun, which queues text until the session is connected', () => {
     expect(script).toContain('window.lzShellRun = function (text, taskId, label, opts)');
     expect(script).toContain('root.__lzShellRun');

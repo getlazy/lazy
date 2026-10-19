@@ -30,6 +30,7 @@ import {
   type AuditFilters,
   type AuditRow,
 } from '../../proxy/audit-query';
+import { tokensPerSecond, endpointOf, formatErrors, summarizeByEndpointModel, tierLabel, type EndpointModelSummary, type Percentiles } from '../../proxy/latency';
 import type { ProxyAuditRecord } from '../../storage/types';
 
 /** How much of the record UUID identifies a record in the listing. */
@@ -42,7 +43,7 @@ const DEFAULT_SCAN = 50_000;
 const DEFAULT_LIMIT = 20;
 
 const SCOPE_NOTE =
-  'Only traffic through the lazy proxy is audited — agents on the anthropic/ollama backends never appear here.';
+  'Every agent lazy launches is proxied and audited here, whatever its harness or endpoint (a local Ollama included); a process lazy did not launch is not.';
 
 function fmtTime(ts: number): string {
   return new Date(ts).toLocaleString();
@@ -82,10 +83,13 @@ const COLUMNS: Column[] = [
   { header: 'ID', get: (r) => r.id.slice(0, ID_WIDTH) },
   { header: 'ROLE', get: (r) => r.role ?? '-' },
   { header: 'TASK', get: (r) => r.taskId ?? '-' },
+  { header: 'ENDPOINT', get: (r) => r.servedBy },
   { header: 'MODEL', get: (r) => r.model ?? '-' },
   { header: 'TOOLS', get: (r) => `${r.toolUses}/${r.toolResults}`, right: true },
   { header: 'TOKENS', get: (r) => (r.totalTokens === null ? '-' : num(r.totalTokens)), right: true },
-  { header: 'TOOK', get: (r) => fmtDur(r.durationMs), right: true },
+  { header: 'TTFB', get: (r) => fmtDur(r.durationMs), right: true },
+  { header: 'TTFT', get: (r) => fmtDur(r.ttftMs), right: true },
+  { header: 'TTLT', get: (r) => fmtDur(r.ttltMs), right: true },
 ];
 
 function renderTable(rows: AuditRow[]): void {
@@ -116,6 +120,7 @@ function field(label: string, value: string): void {
 
 function renderDetail(record: ProxyAuditRecord): void {
   const row = toAuditRow(record);
+  const tps = tokensPerSecond(record);
   console.log(
     `\n${theme.label(`Audit record ${record.id.slice(0, ID_WIDTH)}`)} ` +
       `${dim(record.id)}  ${dim(fmtTime(record.ts))}`,
@@ -127,6 +132,7 @@ function renderDetail(record: ProxyAuditRecord): void {
   field('role', record.role ?? dim('(unattributed)'));
   field('task', record.taskId ?? dim('(unattributed)'));
   field('model', record.model ?? '-');
+  field('endpoint', endpointOf(record));
   field('tier', record.tier ?? '-');
   field('backend', `${record.backend} ${dim(record.upstream)}`);
   field('request', `${record.method} ${record.path} ${dim(`(${record.endpoint})`)}`);
@@ -134,8 +140,14 @@ function renderDetail(record: ProxyAuditRecord): void {
     'response',
     `${record.status ?? dim('no response')}` +
       (record.stopReason ? ` ${dim(record.stopReason)}` : '') +
-      `  ${dim(fmtDur(record.durationMs))}` +
       (record.stream ? ` ${dim('streamed')}` : ''),
+  );
+  field(
+    'latency',
+    `first byte ${fmtDur(record.durationMs)} · first token ${fmtDur(record.ttftMs ?? null)} · ` +
+      `last token ${fmtDur(record.ttltMs ?? null)}` +
+      (tps !== null ? dim(`  (${tps.toFixed(1)} tokens/s)`) : '') +
+      dim('  from request start; includes connection setup'),
   );
 
   const u = record.usage;
@@ -208,6 +220,32 @@ function renderDetail(record: ProxyAuditRecord): void {
   console.log('');
 }
 
+function pc(p: Percentiles | null, fmt: (n: number) => string): string {
+  return p ? `${fmt(p.p50)}/${fmt(p.p90)} (n=${p.n})` : '-';
+}
+
+const SUMMARY_COLUMNS: Array<{ header: string; get: (r: EndpointModelSummary) => string; right?: boolean }> = [
+  { header: 'ENDPOINT', get: (r) => r.endpoint },
+  { header: 'MODEL', get: (r) => r.model },
+  { header: 'TIER', get: (r) => tierLabel(r.tierIndex, r.tierProfile) ?? '-' },
+  { header: 'REQS', get: (r) => num(r.requests), right: true },
+  { header: 'ERRORS', get: (r) => formatErrors(r.errors) },
+  { header: 'TTFB p50/p90', get: (r) => pc(r.ttfb, fmtDur), right: true },
+  { header: 'TTFT p50/p90', get: (r) => pc(r.ttft, fmtDur), right: true },
+  { header: 'TTLT p50/p90', get: (r) => pc(r.ttlt, fmtDur), right: true },
+  { header: 'TOK/S p50/p90', get: (r) => pc(r.tokensPerSecond, (n) => n.toFixed(1)), right: true },
+  { header: 'IN TOK', get: (r) => num(r.inputTokens), right: true },
+  { header: 'OUT TOK', get: (r) => num(r.outputTokens), right: true },
+];
+
+function renderSummary(rows: EndpointModelSummary[]): void {
+  const widths = SUMMARY_COLUMNS.map((c) => Math.max(c.header.length, ...rows.map((r) => c.get(r).length)));
+  const line = (get: (c: (typeof SUMMARY_COLUMNS)[number]) => string) =>
+    SUMMARY_COLUMNS.map((c, i) => (c.right ? get(c).padStart(widths[i]) : get(c).padEnd(widths[i]))).join('  ').trimEnd();
+  console.log(dim(line((c) => c.header)));
+  for (const r of rows) console.log(line((c) => c.get(r)));
+}
+
 export async function commandAudit(args: string[]): Promise<void> {
   const parsed = parseFlags(
     args,
@@ -224,6 +262,7 @@ export async function commandAudit(args: string[]): Promise<void> {
       { name: 'errors', takesValue: false },
       { name: 'limit', takesValue: true },
       { name: 'scan', takesValue: true },
+      { name: 'summary', takesValue: false },
       { name: 'json', takesValue: false },
     ],
     'stats audit',
@@ -241,6 +280,7 @@ export async function commandAudit(args: string[]): Promise<void> {
   const limit = parsePositiveInt(parsed.flags.get('limit') as string | undefined, 'limit', DEFAULT_LIMIT);
   const scan = parsePositiveInt(parsed.flags.get('scan') as string | undefined, 'scan', DEFAULT_SCAN);
   const json = parsed.flags.get('json') === true;
+  const summary = parsed.flags.get('summary') === true;
 
   const filters: AuditFilters = {
     sinceMs,
@@ -253,6 +293,10 @@ export async function commandAudit(args: string[]): Promise<void> {
   };
 
   const recordId = parsed.positional[0];
+  if (summary && recordId !== undefined) {
+    console.error('--summary rolls up many records; it cannot be combined with a record id.');
+    process.exit(1);
+  }
   if (parsed.positional.length > 1) {
     console.error(
       `Expected at most one record id, got ${parsed.positional.length}: ${parsed.positional.join(' ')}`,
@@ -289,6 +333,22 @@ export async function commandAudit(args: string[]): Promise<void> {
 
   // --- List view ---
   const matched = filterAuditRecords(all, filters);
+
+  if (summary) {
+    const summaryRows = summarizeByEndpointModel(matched);
+    if (json) {
+      console.log(JSON.stringify(summaryRows, null, 2));
+      return;
+    }
+    if (summaryRows.length === 0) {
+      console.log(`No timed requests match those filters ${dim(`(${num(all.length)} scanned)`)}.`);
+      return;
+    }
+    renderSummary(summaryRows);
+    console.log(dim(`\n${num(matched.length)} matching record(s) · ${num(all.length)} scanned`));
+    console.log(dim(SCOPE_NOTE));
+    return;
+  }
   // Newest last: the trail reads like a log, so the most recent request ends
   // up next to the prompt. `--limit` therefore keeps the TAIL, not the head.
   const shown = matched.slice(Math.max(0, matched.length - limit));
@@ -325,7 +385,7 @@ export async function commandAudit(args: string[]): Promise<void> {
 }
 
 export function auditUsage(): void {
-  console.log(`Usage: lazy stats audit [<record-id>] [filters] [--limit <n>] [--json]
+  console.log(`Usage: lazy stats audit [<record-id>] [filters] [--limit <n>] [--summary] [--json]
 
 Browse the proxy audit trail one record per proxied request — the record-level
 view of the same trail \`lazy stats tokens\` rolls up. Every request through the
@@ -338,8 +398,14 @@ the rows worth looking at (DENY, REROUTE, FAIL). Pass a record id — the short
 form from the ID column is enough — for the full detail view of one request,
 including denied tool calls with the rule that fired and the reason given.
 
-Every launch lazy makes routes through the proxy, whatever the role's backend, so
-all of it is audited here; a process lazy did not launch is not.
+Every launch lazy makes routes through the proxy, whatever its harness, profile
+or endpoint, so all of it is audited here; a process lazy did not launch is not.
+
+Limits of what the trail can know: a stream the client cancels or that breaks
+mid-way is still recorded, but its tokens are only what had arrived (usually
+input only, or none); an OpenAI-wire stream reports usage only when the client
+asked for it; a Cursor request is recorded without a model or usage; and a
+request that failed before any response has no usage.
 
 Filters (all combine):
   --task <id>          Only this task (short-id prefix match)
@@ -352,6 +418,10 @@ Filters (all combine):
   --errors             Only failed requests (proxy error, or non-2xx upstream)
 
 Options:
+  --summary            One row per endpoint × model (× profile and tier, for a tiered profile): requests, errors (429 / 5xx /
+                       timeout / cancelled), p50/p90 TTFB, TTFT, TTLT, output tokens/s and
+                       input/output tokens — to compare endpoints serving the same model.
+                       Covers every matching record (--limit does not apply; --scan does)
   --limit <n>          Max records to show, newest kept (default ${DEFAULT_LIMIT})
   --scan <n>           Max records to read from the trail (default ${num(DEFAULT_SCAN)})
   --json               Emit matching rows as JSON; with a record id, the raw record
@@ -361,6 +431,7 @@ Examples:
   lazy stats audit --denied                 # every policy denial recorded
   lazy stats audit --task add-audit --last 2h
   lazy stats audit --errors --limit 50      # recent failures, e.g. 401s
+  lazy stats audit --summary --since 24h    # compare endpoints per model
   lazy stats audit 3f9a1c2b                 # full detail for one record
   lazy stats audit --reroutes --json        # failovers, machine-readable`);
 }

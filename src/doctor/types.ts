@@ -15,9 +15,31 @@ import type { Storage } from '../storage/interface';
 import type { DoctorCheckFamily, DoctorImpact, DoctorRemedyKind } from './check-families';
 import type { DaemonHealthReport } from '../daemon/daemon-health-rows';
 
-/** One check's outcome as the CLI has always printed it. */
-export interface CheckResult {
-  ok: boolean;
+/**
+ * One check's outcome as the CLI has always printed it.
+ *
+ * INVARIANT: a check carries BOTH wordings. `label` is the PASS wording (a
+ * condition: "Docker is running") and also what the check's id and family are
+ * derived from; `problem` is the FAIL wording and names what is wrong ("Docker
+ * isn't running…"). A failing result without `problem` does not compile, so a
+ * check cannot ship that reports its own passing condition as the failure —
+ * "The check that failed: Docker daemon running" reads as a pass when skimmed.
+ */
+export type CheckResult = PassingCheck | FailingCheck;
+
+export interface FailingCheck extends CheckResultBase {
+  ok: false;
+  /** The FAIL wording: names the problem, never the passing condition. */
+  problem: string;
+}
+
+export interface PassingCheck extends CheckResultBase {
+  ok: true;
+  /** Never set on a pass; present so `result.problem` reads on the union. */
+  problem?: undefined;
+}
+
+interface CheckResultBase {
   label: string;
   /** Shown on failure. */
   detail?: string;
@@ -107,6 +129,12 @@ export interface DoctorReport {
 export interface DoctorCheck<C = DoctorContext> {
   id: string;
   title: string;
+  /**
+   * The FAIL wording: what is wrong when this check fails or throws. Required,
+   * like `CheckResult.problem`, so a registered check cannot ship with one
+   * wording (a thrown check yields no CheckResult to carry it).
+   */
+  problem: string;
   run: (ctx: C) => Promise<CheckResult | CheckResult[] | null>;
   remedyFlag?: string;
 }
@@ -139,6 +167,7 @@ export interface DoctorContext {
  * were gone — which is why the CLI has always asked BEFORE the other checks.
  */
 export interface DoctorRunOptions {
+  onProgress?: import('../daemon/progress').ProgressEmitter;
   root: string | null;
   cwd?: string;
   storage?: Storage;

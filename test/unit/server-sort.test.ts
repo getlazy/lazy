@@ -538,4 +538,32 @@ describe('the raised-items page header and filters', () => {
     expect(html).toContain('href="/raised?gate=blocking"');
     expect(html).not.toContain('Sorted by');
   });
+
+  // INVARIANT: /raised defaults to items from BLOCKED tasks while open, and to any
+  // task under All. A reader came here for the tasks waiting on a human; the
+  // lens is a default, so it is never spelled in a URL that matches it.
+  test('open view defaults to blocked tasks, all view to any task', () => {
+    const base = { blocking: 'all' as const, recurringOnly: false, sort: DEFAULT_RAISED_SORT };
+    expect(raisedListOptions({ ...base, state: 'open', status: 'blocked' }).taskStatus).toBe('blocked');
+    expect(raisedListOptions({ ...base, state: 'all', status: undefined }).taskStatus).toBeUndefined();
+    const open = raisedInboxHtml(rows, {});
+    expect(open).toContain('href="/raised?all=1"');
+    expect(open).toContain('href="/raised?status=complete-only"');
+    const all = raisedInboxHtml(rows, { state: 'all', status: undefined });
+    expect(all).toContain('href="/raised?all=1&amp;status=blocked"');
+    expect(all).not.toContain('href="/raised?all=1&amp;status=any"');
+  });
+
+  // INVARIANT: the Blocking / FYI buttons keep the task lens the reader is on,
+  // and All restores every task. Resetting the lens on a gate click was the
+  // original complaint about this page's filters.
+  test('gate filters keep the task lens, and All restores every task', () => {
+    const finished = raisedInboxHtml(rows, { status: 'complete-only' });
+    expect(finished).toContain('href="/raised?gate=blocking&amp;status=complete-only"');
+    expect(finished).toContain('href="/raised?gate=non-blocking&amp;status=complete-only"');
+    expect(finished).toContain('href="/raised?all=1"');
+    const allBlocked = raisedInboxHtml(rows, { state: 'all', status: 'blocked' });
+    expect(allBlocked).toContain('href="/raised?all=1&amp;gate=blocking&amp;status=blocked"');
+  });
+
 });

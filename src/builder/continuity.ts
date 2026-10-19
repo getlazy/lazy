@@ -131,8 +131,16 @@ export async function runBuilderWithContinuity(
       try {
         launchEnv = await fetchLaunchEnv(daemonConfigPath);
       } catch (err) {
-        if (restarts === 0) throw err;
         const msg = err instanceof Error ? err.message : String(err);
+        if (restarts === 0) {
+          // The first launch: say what the daemon answered, plainly, and exit —
+          // never an uncaught throw, whose stack trace is all a builder page
+          // would otherwise show for a refusal it can explain.
+          errorOut('');
+          errorOut('This builder could not start.');
+          errorOut(msg);
+          return { exitCode: 1, restarts };
+        }
         errorOut('');
         errorOut('The daemon restarted, but this builder could not refresh its launch environment.');
         errorOut(msg);

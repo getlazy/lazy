@@ -13,6 +13,20 @@ export async function commandShell(args: string[]): Promise<void> {
   // SERVER, through Teams — never one here (design doc §5.1).
   const boundRoot = findLazyRoot();
   if (boundRoot && await boundCloneLogin(boundRoot)) {
+    // `--local` is the one exception: a plain-git checkout of the task's
+    // branch on THIS machine, which the person pushes from themselves.
+    const sep = args.indexOf('--');
+    const own = sep === -1 ? args : args.slice(0, sep);
+    if (own.includes('--local')) {
+      const { commandShellLocal } = await import('./shell-local');
+      await commandShellLocal(boundRoot, args);
+      return;
+    }
+    if (own.includes('--host')) {
+      console.error('Error: --host does not apply in a clone bound to Lazy Teams: the task\'s worktree is on the server. ' +
+        'Use `lazy shell <task> --local` for a checkout of its branch on this machine.');
+      process.exit(1);
+    }
     await commandTaskTerminalBound('shell', boundRoot, args);
     return;
   }
@@ -32,7 +46,12 @@ export async function commandShell(args: string[]): Promise<void> {
     { name: 'container', aliases: ['c'], takesValue: false },
     { name: 'host', takesValue: false },
     { name: 'restart', takesValue: false },
+    { name: 'local', takesValue: false },
   ], 'shell');
+  if (parsed.flags.get('local') === true) {
+    console.error('--local is for a clone bound to Lazy Teams (after `lazy clone <url>`). Here the task\'s worktree is already on this machine — use --host.');
+    process.exit(1);
+  }
   const containerFlag = parsed.flags.get('container') === true;
   const useHost = parsed.flags.get('host') === true;
   const restart = parsed.flags.get('restart') === true;
@@ -66,15 +85,17 @@ export async function commandShell(args: string[]): Promise<void> {
     }
 
     const worktreePath = getWorktreePath(root, task);
-    if (!existsSync(worktreePath)) {
-      console.error(`Worktree not found at ${worktreePath}. Session may have been cleaned up.`);
-      process.exit(1);
+    const worktreeMissing = !existsSync(worktreePath);
+    if (worktreeMissing && useHost) {
+      console.error('Restoring task files…');
+      const { queryEnsureTaskWorktree } = await import('../../daemon/rpc-fallback');
+      await queryEnsureTaskWorktree(task.id);
     }
 
     // --- default: enter the task's actual environment, the container ---
     // (`--host` opts out into a shell in the worktree on this machine.)
     if (!useHost) {
-      const exitCode = await runInContainer(root, task, sess, command, sepIndex !== -1, restart);
+      const exitCode = await runInContainer(root, task, sess, command, sepIndex !== -1, restart || worktreeMissing);
       await storage.close();
       process.exit(exitCode);
     }
@@ -173,9 +194,9 @@ async function runInContainer(
   } else if (!running) {
     console.log(`Container for task ${displayId(task)} is not running — starting it...`);
   }
-  if (restart || !running) {
-    const ensured = await queryEnsureTaskContainer({ taskId: task.id, restart });
-    containerName = ensured.containerName;
+  const ensured = await queryEnsureTaskContainer({ taskId: task.id, restart });
+  containerName = ensured.containerName;
+  if (!ensured.alreadyRunning) {
     console.log(`Started ${containerName}.`);
   }
 
@@ -212,7 +233,7 @@ async function runInContainer(
 }
 
 export function shellUsage(): void {
-  console.log(`Usage: lazy shell <task_id> [--host | --restart] [-- <command> [args...]]
+  console.log(`Usage: lazy shell <task_id> [--host | --local | --restart] [-- <command> [args...]]
 
 Open an interactive shell in a task's CONTAINER — the same environment the
 agent works in, with its toolchain — or run a one-off command there. If the
@@ -228,6 +249,13 @@ Flags:
       --host          Open the shell (or run the command) in the task's
                       worktree on THIS machine instead of the container — the
                       right thing for git and host editors.
+      --local         Only in a clone bound to Lazy Teams: fetch the task's
+                      branch and open a shell in a LOCAL checkout of it (a git
+                      worktree beside this clone, tracking origin/lazy/<task>).
+                      Plain git: lazy never pushes from it — "git push" sends
+                      your commits to the task, and "lazy sync" merges them.
+                      Re-running fast-forwards a clean checkout and never
+                      discards unpushed or uncommitted work.
       --restart       Recreate the container even if it is running, then enter
                       it. Published ports are fixed when a container is created,
                       so this is how a [serve] change takes effect on a task

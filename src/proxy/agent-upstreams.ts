@@ -23,7 +23,9 @@ import type { ResolvedConfig } from '../config/types';
 import {
   type AgentProfile,
   type AgentWire,
+  type TierUsageSource,
   agentProfilesFor,
+  NO_CREDENTIAL,
   profileCredentialName,
 } from '../config/agent-profiles';
 
@@ -34,13 +36,43 @@ export interface AgentUpstream {
   upstream: string;
   /** Stored credential whose real secret this upstream gets, or null for none. */
   credential: string | null;
+  /**
+   * True when lazy.toml NAMED `credential` for this endpoint rather than lazy
+   * inferring it — the only case in which the proxy will attach a provider's
+   * credential to a host that is not that provider's.
+   */
+  credentialExplicit?: true;
+  /** `[endpoints.<name>]` this upstream came from, when it came from one. */
+  endpointName?: string;
   wire: AgentWire;
+  /**
+   * Position in a TIERED profile's chain, absent for an ordinary profile. Every
+   * tier is its own upstream → credential entry, so the credential map covers
+   * all of them and its origin-collision check sees all of them.
+   */
+  tier?: number;
+}
+
+/** One tier of a tiered profile, as the proxy picks between them per request. */
+export interface TierRoute {
+  index: number;
+  /** `[endpoints.<name>]` the tier runs against. */
+  endpoint: string;
+  upstream: string;
+  model: string;
+  usage: TierUsageSource;
+  /** Optional early-switch percent; null = used until it refuses (a last windowed tier may leave it to `[usage_pause]`). */
+  threshold: number | null;
+  /** `[usage_pause]` settings, carried only when `threshold` is left to them. */
+  pause?: { threshold_percent: number; credentials: Record<string, number> };
 }
 
 /** What the proxy needs per profile at request time: where to forward, which wire. */
 export interface AgentUpstreamRoute {
   upstream: string;
   wire: AgentWire;
+  /** Set on a TIERED profile: `upstream` is tier 0, and the proxy picks per request. */
+  tiers?: TierRoute[];
 }
 
 /** True when this profile needs its own route rather than the primary upstream. */
@@ -63,11 +95,29 @@ function hasOwnUpstream(profile: AgentProfile): boolean {
 export function resolveAgentUpstreams(config: ResolvedConfig): AgentUpstream[] {
   const out: AgentUpstream[] = [];
   for (const profile of agentProfilesFor(config).values()) {
+    if (profile.tiers) {
+      // One entry PER TIER: each tier's endpoint is a target with its own
+      // credential, and the proxy may forward to any of them mid-turn.
+      for (const tier of profile.tiers) {
+        out.push({
+          profile: profile.name,
+          upstream: tier.upstream.replace(/\/$/, ''),
+          credential: tier.credential === NO_CREDENTIAL ? null : tier.credential,
+          ...(tier.credentialExplicit ? { credentialExplicit: true as const } : {}),
+          endpointName: tier.endpoint,
+          wire: tier.wire,
+          tier: tier.index,
+        });
+      }
+      continue;
+    }
     if (!hasOwnUpstream(profile)) continue;
     out.push({
       profile: profile.name,
       upstream: profile.endpoint.replace(/\/$/, ''),
       credential: profileCredentialName(profile),
+      ...(profile.credentialExplicit ? { credentialExplicit: true as const } : {}),
+      ...(profile.endpointName ? { endpointName: profile.endpointName } : {}),
       wire: profile.wire,
     });
   }
@@ -78,7 +128,22 @@ export function resolveAgentUpstreams(config: ResolvedConfig): AgentUpstream[] {
 export function agentUpstreamMap(config: ResolvedConfig): Record<string, AgentUpstreamRoute> {
   const map: Record<string, AgentUpstreamRoute> = {};
   for (const entry of resolveAgentUpstreams(config)) {
+    if (entry.tier !== undefined && entry.tier > 0) continue;
     map[entry.profile] = { upstream: entry.upstream, wire: entry.wire };
+  }
+  for (const profile of agentProfilesFor(config).values()) {
+    if (!profile.tiers || !map[profile.name]) continue;
+    map[profile.name]!.tiers = profile.tiers.map((t) => ({
+      index: t.index,
+      endpoint: t.endpoint,
+      upstream: t.upstream.replace(/\/$/, ''),
+      model: t.model,
+      usage: t.usage,
+      threshold: t.threshold,
+      ...(t.threshold === null && t.usage !== null
+        ? { pause: { threshold_percent: config.usage_pause.threshold_percent, credentials: { ...config.usage_pause.credentials } } }
+        : {}),
+    }));
   }
   return map;
 }

@@ -8,7 +8,7 @@
  * same actionable error.
  *
  * Daemonless suite calling src/ in-process — needs enableInProcessTestMode()
- * (see CLAUDE.md, env-leakage rules).
+ * (see AGENTS.md, env-leakage rules).
  */
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { readFile, writeFile } from 'fs/promises';
@@ -37,7 +37,7 @@ describe('runner/agent capability gating', () => {
     // capability check gates.
     ctx = await setupTestLazy();
     // In-process createRunner loads config via the cwd walk — pin it to the
-    // fixture project or it silently adopts lazy's own lazy.toml (CLAUDE.md).
+    // fixture project or it silently adopts lazy's own lazy.toml (AGENTS.md).
     unpinConfig = pinConfig(ctx.root);
   });
 

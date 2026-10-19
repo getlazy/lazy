@@ -182,7 +182,7 @@ describe('lazy system passphrase', () => {
   });
 
   // INVARIANT: registered in systemSubcommandUsage, or `-h` silently prints
-  // the PARENT's help with no error anywhere (see CLAUDE.md).
+  // the PARENT's help with no error anywhere (see AGENTS.md).
   test('--help prints the passphrase help, not the system help', async () => {
     const result = await ctx.lazy(['system', 'passphrase', '--help']);
 

@@ -31,6 +31,8 @@ export interface TaskServeState {
   unavailable: ServeUnavailableReason | null;
   containerName: string;
   runnerType: string;
+  /** Whether the task's container was seen running (false when not asked). */
+  containerRunning?: boolean;
 }
 
 /**
@@ -52,14 +54,18 @@ export async function getTaskServeState(
   root: string,
   task: Task,
   session: Session | null,
+  opts: { alwaysProbe?: boolean } = {},
 ): Promise<TaskServeState> {
   const config = await loadConfig(root);
   const declared = config.serve.services;
 
   // Nothing declared means nothing to look up — and every caller that renders
   // this opportunistically (`lazy show`) then pays no runtime call at all.
-  if (declared.length === 0) {
-    return { declared, services: [], unavailable: null, containerName: '', runnerType: '' };
+  // `alwaysProbe` is for the Services surfaces, which show the container's
+  // state (and what Start services is doing in it) whether or not any port
+  // is declared: Start services needs no declaration.
+  if (declared.length === 0 && !opts.alwaysProbe) {
+    return { declared, services: [], unavailable: null, containerName: '', runnerType: '', containerRunning: false };
   }
 
   const runner = await createRunner(root, session?.runner_type ?? task.runner_type ?? undefined);
@@ -68,15 +74,18 @@ export async function getTaskServeState(
   const base = { declared, containerName, runnerType: runner.type };
 
   if (!runner.usesSandbox()) {
-    return { ...base, services: [], unavailable: 'no-container-runner' };
+    return { ...base, services: [], unavailable: 'no-container-runner', containerRunning: false };
   }
   if (!(await runner.isRunning(containerName))) {
-    return { ...base, services: [], unavailable: 'not-running' };
+    return { ...base, services: [], unavailable: 'not-running', containerRunning: false };
+  }
+  if (declared.length === 0) {
+    return { ...base, services: [], unavailable: null, containerRunning: true };
   }
 
   const bindings = (await runner.getRunPortBindings(containerName)) ?? [];
   const services = withPublicUrls(task, resolveServices(declared, bindings));
-  return { ...base, services, unavailable: null };
+  return { ...base, services, unavailable: null, containerRunning: true };
 }
 
 /**

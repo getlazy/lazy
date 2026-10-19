@@ -349,6 +349,20 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
                   },
                   deps.memberContainerRunning ?? ((c) => memberContainerRunning(c.binary, c.name)),
                 );
+                // A reused container too: the guest daemon keeps writing into
+                // the worktree as root (a sync merge, a restore creating log/),
+                // so ownership is re-aligned on EVERY attach, before the shell.
+                // A failure is the terminal's to survive: the shell still opens.
+                try {
+                  if (container.adopt && !abandoned()) {
+                    // Narrated: preparation is bounded by silence, and a chown
+                    // over a large worktree must not read as a stall.
+                    status('Preparing your terminal: checking file ownership…');
+                    await container.adopt();
+                  }
+                } catch (err) {
+                  logger.warn(`member terminal for task ${target.task.id.substring(0, 8)} could not take ownership of the worktree: ${err instanceof Error ? err.message : String(err)}`);
+                }
                 // Pair/Chat take their lock only once the container exists: a
                 // launch that fails must not flip the task to `pairing`, spend
                 // a usage-pause override, or record a pairing session that

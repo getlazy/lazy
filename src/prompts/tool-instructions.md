@@ -98,6 +98,8 @@ Available tools:
                      tags belong to the human. Idempotent; history is append-only.
   lazy_untag         Remove a tag, same scope as lazy_tag (params: tag, task_id?).
                      Idempotent, and it never erases the earlier tagging event.
+  lazy_recipe        Load a built-in recipe — step-by-step instructions for a recurring
+                     kind of work (params: name?). No name lists them; a name returns one.
   lazy_artifact_list List a task's artifacts — files attached to it and files it published
                      back. Metadata only (params: task_id?)
   lazy_artifact_get  Read one artifact's content by name (params: task_id?, name)

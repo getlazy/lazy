@@ -141,7 +141,7 @@ export async function purgeLegacyDaemonMcpConfigs(projectRoot: string): Promise<
 }
 
 /**
- * Run the purge and report it. "Transparent over terse" (CLAUDE.md): removing
+ * Run the purge and report it. "Transparent over terse" (AGENTS.md): removing
  * hundreds of files from someone's repo silently is not acceptable, and a
  * credential rotation must be stated outright.
  */

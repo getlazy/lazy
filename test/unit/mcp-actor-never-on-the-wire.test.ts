@@ -38,6 +38,9 @@ import { isActorRef } from '../../src/actor-ref';
 /** The ONE module allowed to put a person on an MCP tool context. */
 const PERSON_RESOLVING_MODULE = join('src', 'daemon', 'mcp-routes.ts');
 
+/** Where that route's person is looked up: the live turn's recorded owner. */
+const PERSON_LOOKUP_MODULE = join('src', 'daemon', 'mcp-turn-authority.ts');
+
 /** Where the field itself is declared and read — not a context construction. */
 const CONTEXT_DECLARING_MODULE = join('src', 'mcp', 'tools.ts');
 
@@ -98,12 +101,21 @@ describe('an MCP actor naming a person never reaches the wire', () => {
     expect(offenders).toEqual([]);
   });
 
-  // The scan must still SEE the one legitimate assignment: a source guard whose
-  // pattern stops matching passes by finding nothing.
+  // INVARIANT: the scan must still SEE the one legitimate resolution, followed to
+  // where it lives. The route assigns `actorPerson` from the live turn's
+  // authority, and the turn-authority module looks the person up (the claim's
+  // captured owner, else the session's turn owner). A source guard whose
+  // pattern stops matching passes by finding nothing, so both halves are
+  // asserted: if the lookup moves again, this fails instead of going blind.
   test('the scan still finds the daemon route that does resolve one', async () => {
-    const source = await readFile(PERSON_RESOLVING_MODULE, 'utf-8');
-    expect(source).toContain('actorPerson');
-    expect(source).toContain('taskTurnOwner');
+    const route = await readFile(PERSON_RESOLVING_MODULE, 'utf-8');
+    expect(route).toContain('actorPerson');
+    expect(route).toContain('resolveMcpTurnAuthority');
+
+    const lookup = await readFile(PERSON_LOOKUP_MODULE, 'utf-8');
+    expect(lookup).toContain('export async function resolveMcpTurnAuthority');
+    expect(lookup).toContain('taskTurnOwner');
+    expect(lookup).toContain('turnOwnerOfClaim');
   });
 
   // And the value itself: with no person resolved — which is every context

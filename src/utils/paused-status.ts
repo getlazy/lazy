@@ -31,6 +31,7 @@ import type { FileViolation, TaskStatus } from '../types';
 import type { ActorInput } from '../types';
 import type { SyncRestorableStatus } from '../task/sync-restore-status';
 import { outstandingFromRecords } from '../protection/outstanding';
+import { resolveProtectedFileDeferral } from '../protection/deferral';
 import { logger } from './logger';
 
 /** The paused status a task with this violation state belongs in. */
@@ -102,6 +103,8 @@ export async function parkTaskPaused(
     detected?: FileViolation[];
     projectRoot?: string;
     restore?: SyncRestorableStatus | null;
+    /** Recorded on the status change — set when lazy, not a person, caused the park. */
+    reason?: string;
   } = {},
 ): Promise<PausedStatus | SyncRestorableStatus> {
   let status: PausedStatus = 'blocked';
@@ -110,14 +113,28 @@ export async function parkTaskPaused(
     const sessionId = opts.sessionId ?? sess?.id;
     const turns = sessionId ? await storage.getSessionTurns(sessionId) : [];
     let outstanding: FileViolation[] | undefined;
+    let deferred = false;
     const task = opts.projectRoot ? await storage.getTask(taskId) : null;
     if (opts.projectRoot && task && sess) {
       // Lazy import: paused-status is reached from the CLI too, and the daemon
       // resolver pulls in config + git. The fallback inside it never throws.
       const { resolveOutstandingViolations } = await import('../protection/outstanding-resolver');
-      outstanding = (await resolveOutstandingViolations(opts.projectRoot, task, sess, turns, storage)).outstanding;
+      const state = await resolveOutstandingViolations(opts.projectRoot, task, sess, turns, storage);
+      outstanding = state.outstanding;
+      deferred = state.deferredTo !== null;
     }
     status = pausedStatusFor(turns, opts.detected, outstanding);
+    // INVARIANT: a task whose protected-file questions are deferred to its
+    // parent's accept (src/protection/deferral.ts — every cluster child) is
+    // never `conflict`. Nothing is owed at ITS merge, and the label must say
+    // what its accept gate says. Checked after the derivation rather than
+    // instead of it, because the turn's own fresh set (`detected`) and the
+    // records-only path both reach `conflict` without the resolver asking.
+    if (status === 'conflict' && !deferred) {
+      const subject = task ?? await storage.getTask(taskId);
+      if (subject) deferred = (await resolveProtectedFileDeferral(storage, subject, turns)) !== null;
+    }
+    if (deferred) status = 'blocked';
   } catch (err) {
     logger.warn(
       `Task ${taskId.substring(0, 8)}: could not read violations while parking the task — ` +
@@ -127,6 +144,6 @@ export async function parkTaskPaused(
   }
   const parked: PausedStatus | SyncRestorableStatus =
     status === 'blocked' && opts.restore ? opts.restore : status;
-  await storage.updateTaskStatus(taskId, parked, actor);
+  await storage.updateTaskStatus(taskId, parked, actor, opts.reason);
   return parked;
 }

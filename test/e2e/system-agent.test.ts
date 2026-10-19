@@ -8,12 +8,12 @@
  * operation. The daemon-backed suite at the bottom proves it end-to-end.
  */
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { readFile, writeFile, stat } from 'fs/promises';
+import { readFile, writeFile, stat, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
 import { makeDaemonBaseDir, pinDaemonBaseDir, removeDaemonBaseDir } from '../helpers/daemon-base-dir';
-import { getCredentialsPath } from '../../src/daemon/paths';
+import { getCredentialsPath, getDaemonDir } from '../../src/daemon/paths';
 
 /** The secret file the `file` credential backend writes. */
 async function readStore(root: string): Promise<Record<string, string>> {
@@ -45,6 +45,20 @@ describe('lazy system agent (daemonless)', () => {
     await removeDaemonBaseDir(daemonBase);
   });
 
+  // INVARIANT: engineer-approved removal of legacy key resolution applies to status too.
+  test('status does not report a legacy-only Cursor key as configured', async () => {
+    for (const directory of [getDaemonDir(ctx.root), join(ctx.root, '.lazy')]) {
+      await mkdir(directory, { recursive: true });
+      await writeFile(join(directory, 'agent-credentials.json'), JSON.stringify({ cursor: { api_key: 'fake-obsolete-key' } }));
+    }
+    const result = await ctx.lazy(['system', 'agent', 'status'], { env: { CURSOR_API_KEY: '' } });
+    expectSuccess(result);
+    expectOutput(result, 'cursor — NOT CONFIGURED');
+    expectOutput(result, 'lazy system agent set-key cursor');
+    expect(result.stdout).not.toContain('agent-credentials.json');
+    expect(result.stdout).not.toContain('fake-obsolete-key');
+  });
+
   test('status lists every built-in profile and marks the default', async () => {
     const result = await ctx.lazy(['system', 'agent']);
     expectSuccess(result);
@@ -72,6 +86,7 @@ describe('lazy system agent (daemonless)', () => {
 harness = "pi"
 model = "qwen3:8b"
 endpoint = "http://127.0.0.1:59431"
+credential = "none"
 `);
     const result = await ctx.lazy(['system', 'agent']);
     expectSuccess(result);

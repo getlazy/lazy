@@ -3,8 +3,10 @@
  *
  * WHY THIS EXISTS
  *
- * Every prompt lazy sends to an agent is passed as an *argv element*
- * (`claude -p <prompt>`). POSIX argv strings are NUL-terminated, so a raw NUL
+ * Every prompt lazy sent to an agent used to be an *argv element*
+ * (`claude -p <prompt>`); prompts now ride stdin (src/agent/argv-safety.ts),
+ * and this sanitizing stays as defence in depth for any text still in argv
+ * (a small inline system prompt). POSIX argv strings are NUL-terminated, so a raw NUL
  * byte anywhere in the prompt makes the spawn fail before the process even
  * starts:
  *

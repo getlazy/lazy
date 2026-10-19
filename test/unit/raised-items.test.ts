@@ -18,7 +18,7 @@ import {
 } from '../../src/daemon/raised-items';
 import { optionalRaisedResolutions } from '../../src/daemon/rpc-params';
 import type { RaisedItem, Task } from '../../src/types';
-import type { Storage } from '../../src/storage/interface';
+import type { Storage, NewTaskInitialState } from '../../src/storage/interface';
 import { AcceptRefusedError } from '../../src/daemon/accept-refusal';
 import { RpcError } from '../../src/daemon/rpc-error';
 
@@ -563,20 +563,17 @@ describe('raised-items helpers', () => {
         _code?: string,
         _type?: string,
         agentId?: string,
+        _actor?: unknown,
+        initial?: NewTaskInitialState,
       ) => {
+        // The prompt and inherited launch settings arrive IN the create (one
+        // write), not as follow-up updates — so they are read from `initial`.
         createdParent = parentTaskId;
         createdAgent = agentId;
+        createdPrompt = initial?.prompt;
+        createdModel = initial?.model;
+        for (const [key, value] of Object.entries(initial?.metadata ?? {})) metadataWrites.push({ key, value });
         return { id: 'sub-task-id-0001', code: 'sub-task', goal, agent_id: agentId };
-      },
-      updateTaskPrompt: async (_id: string, content: string) => {
-        createdPrompt = content;
-        return originating;
-      },
-      updateTaskModel: async (_id: string, model: string) => {
-        createdModel = model;
-      },
-      updateTaskMetadata: async (_id: string, key: string, value: unknown) => {
-        metadataWrites.push({ key, value });
       },
       createComment: async (_taskId: string, body: string) => {
         comments.push(body);

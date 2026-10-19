@@ -27,7 +27,9 @@ Almost everything in `lazy.toml` is read each time it is used — the next turn,
 | Setting | Apply a change with |
 |---|---|
 | `[server] dashboard_url`, `[server] sync_interval` | `lazy daemon reload` — no restart, nothing interrupted |
-| `[server] port`, `[server] bind`, `[runner] type` (which interfaces the daemon listens on), `[storage]`, `[data] path` (the proxy's audit log), every `[proxy]` setting, and `[agents.<name>]` endpoints and credentials | `lazy daemon restart` |
+| `[server] port`, `[server] bind`, `[runner] type` (which interfaces the daemon listens on), `[storage]`, `[data] path` (the proxy's audit log), every `[proxy]` setting | `lazy daemon restart` |
+
+Agent profile endpoints and credentials take effect on the next proxy request without a reload or restart. New tasks also pick up newly defined profiles at launch.
 
 `lazy daemon status` shows which `lazy.toml` the daemon is using — its full path and why that file (the project root's, `LAZY_CONFIG`, or a control plane's managed copy) — and lists every setting above whose running value differs from the file, marked pending, with the command that applies it. `lazy daemon status --json` gives the same as JSON.
 
@@ -167,13 +169,18 @@ A **profile** is the whole answer to "how does this task's agent run": which age
 | `model`      | `string` | the harness default (`qwen3.8:latest` for `pi`; otherwise the harness's own) | Model to ask for. **Required whenever `endpoint` is set** — model names belong to the endpoint, and lazy will not guess one. |
 | `endpoint`   | `string` | the harness default (`http://localhost:11434` for `pi`, `https://api.openai.com` for `codex`; the proxy's primary upstream otherwise) | The upstream **lazy's proxy forwards this profile to** — never an address the agent dials. Host-perspective; see below. |
 | `description` | `string` | built-in's own, else none | When to choose this profile, in plain text (at most 500 characters). Shown next to every agent picker — the web New-task and Edit forms, Lazy Teams' task form and project settings, `lazy system agent`, the builder, and the `agent_profiles` list `lazy_status` returns to agents — so a person or the builder can propose the right profile. It never selects a profile on its own. A block that overrides a built-in keeps the built-in's text unless it writes its own `description`, runs a different `harness`, or sets its own `endpoint`. |
-| `credential` | `string` | inferred from `endpoint` | Name of a stored credential (`lazy auth set <name>`) that pays for this upstream, or `"none"` for an upstream that authenticates nobody. |
+| `credential` | `string` | **required with `endpoint`**; the built-in's own otherwise | Name of a stored credential (`lazy auth set <name>`) that pays for this upstream, or `"none"` for an upstream that authenticates nobody. |
+| `named_endpoint` | `string` | none | Use an [`[endpoints.<name>]`](#endpointsname--named-endpoints) block's URL and credential instead of an inline `endpoint`. |
+| `tiers` | array | none | Makes this a [tiered profile](#tiered-profiles--use-a-tier-until-it-says-no): an ordered list of `{ endpoint, model, threshold_percent }` (`threshold_percent` optional). |
+
+A name containing a dot must be quoted in the header, because a bare dot splits the name: write `[agents."claude-glm-5.3"]`, not `[agents.claude-glm-5.3]` (the same goes for `[endpoints."…"]`). Lazy refuses the unquoted form and tells you the quoted spelling.
 
 ```toml
 [agents.local-ollama-pi]
 harness = "pi"
 model = "qwen3.8:latest"
 endpoint = "http://localhost:11434"
+credential = "none"           # a local server takes no key
 
 [agents.claude-code]          # overrides the built-in profile of the same name
 harness = "claude-code"
@@ -187,16 +194,21 @@ credential = "work-openai"    # any name you choose: `lazy auth set work-openai`
 
 **Built-in profiles.** Profiles named `claude-code`, `codex`, `cursor` and `pi` exist implicitly, each with `harness` equal to its name and that harness's defaults. Two of them carry an upstream of their own instead of the proxy's primary one: `codex` runs `https://api.openai.com` (it is OpenAI-wire), and `pi` runs a **local Ollama** — `http://localhost:11434`, model `qwen3.8:latest`, no credential — because Pi is the local-model agent and `--agent pi` must not quietly spend a hosted one. Pointing Pi at Anthropic or anywhere else is a profile you declare. A `[agents.<builtin>]` block *replaces* the built-in of that name — which is how you pin a model or an upstream for every task on that harness. A project with no `[agents]` section behaves exactly as it did before profiles existed.
 
-**Credentials are named objects.** `credential` names a key in lazy's credential store, not a provider type: `"anthropic"`, `"openai"`, `"openrouter"`, `"ollama"` and `"cursor"` are the provider-named defaults, and any other name works as soon as you run `lazy auth set <that name>`. Two profiles on the same provider share one credential unless one names its own. Omit the key and lazy infers it from the endpoint hostname:
+**Reading a task header.** A task header reads `profile <name> · <model> · <effort>`. The name is the task's agent profile — a missing profile (one removed from lazy.toml since the task was created) shows as `profile <name> (missing)` and never falls back to another. Hover it for the harness, endpoint and the credential's name (never the secret). For a tiered profile the header shows the tier chain (`tiered: <endpoint>/<model> → …`), because each request is sent to a tier's model, not a single one. Dimmed values come from a default rather than from the task.
 
-| Endpoint | Inferred credential |
-|----------|---------------------|
-| `ollama.com` | `ollama` |
-| `openrouter.ai` | `openrouter` |
-| An address on this machine or your LAN | `none` — a local model server takes no key, so lazy does not send it one |
-| Anything else | the credential for the harness's API (`anthropic`, or `openai` for Codex) |
+**Credentials are named objects.** `credential` names a key in lazy's credential store, not a provider type: `"anthropic"`, `"openai"`, `"openrouter"`, `"ollama"`, `"fireworks"`, `"chatgpt"` and `"cursor"` are the provider-named defaults, and any other name works as soon as you run `lazy auth set <that name>`. Two profiles on the same provider share one credential unless one names its own.
 
-A private gateway that *does* want a key just names one: `credential = "anthropic"`. Keys themselves never go in `lazy.toml` — see [Credentials](credentials.md).
+**Every endpoint names its credential.** A profile with an `endpoint`, every `[endpoints.<name>]` block, and so every tier, must say which credential pays it — lazy never guesses which of your secrets a host receives. A config missing one does not load; the error names the block and the line to add. A local model server says `credential = "none"`. Write the endpoint's final address: lazy's proxy does not follow redirects, because a followed redirect would carry the endpoint's credential to whatever host it pointed at — a redirect is handed back to the agent instead, which then fails. Only the built-in profiles, whose upstreams are their providers' own, bring a credential of their own (`codex` → `openai`, `pi` → `none`, …).
+
+```toml
+[endpoints.my-gateway]
+url = "https://gateway.example.com"
+credential = "my-gateway"     # then: lazy auth set my-gateway
+```
+
+**A provider's credential goes only to that provider's hosts, unless you say otherwise.** Naming `credential = "anthropic"` on a gateway that is not Anthropic's is allowed — some gateways are Anthropic-compatible and take your Anthropic key — but it has to be written; lazy's proxy refuses to attach a provider's credential (`anthropic`, `openai`, `chatgpt`, `openrouter`, `fireworks`, `ollama`) to another host on any other basis. Keys themselves never go in `lazy.toml` — see [Credentials](credentials.md).
+
+On a [managed installation](managed-config.md) the configuration is imported as written, so a block missing its credential does not stop the project: that profile is left out and reported as not honoured, with the reason, by the daemon and `lazy doctor`.
 
 **The wire format is derived, never configured.** Claude Code and Cursor speak the Anthropic Messages API; Codex speaks the OpenAI wire (Chat Completions / Responses); Pi speaks both, and its endpoint decides: `api.openai.com` and `openrouter.ai` put a Pi profile on the OpenAI wire, any other host on the Anthropic one. OpenRouter serves both APIs from one hostname, so each harness takes the one it speaks — Claude Code its Anthropic-compatible Messages endpoint, Codex and Pi its native OpenAI API. Lazy never translates between API shapes, so a profile whose endpoint speaks only the *other* wire (`api.openai.com` under `claude-code`, say) is rejected at load, naming the mismatch and the harnesses that do speak it. The wire also selects which paths the proxy will forward and which usage extractor reads the response, which is why it is not yours to set. For OpenAI-wire profiles the proxy forwards **only the OpenAI inference surface** (`/v1/chat/completions`, `/v1/responses`, model discovery) — never account, billing, or admin endpoints — and counts token usage from both endpoints, streaming or not, into `lazy stats tokens`.
 
@@ -232,6 +244,7 @@ credential = "work-openai"
 harness = "pi"
 model = "qwen3.8:latest"
 endpoint = "http://localhost:11434"
+credential = "none"
 ```
 
 ```bash
@@ -281,6 +294,74 @@ agent_id = "claude-normal"    # new tasks start on the normal tier
 
 Model ids differ by harness, and each harness has to know the model. The Claude Code ids above need Claude Code 2.1.284 or newer; `cursor-agent models` and the Codex CLI's model list show what yours offers.
 
+### Tiered profiles — use a tier until it says no
+
+A **tiered profile** runs one harness against an ordered list of *tiers*, each a [named endpoint](#endpointsname--named-endpoints) plus a model. For **every request** the proxy uses the first tier that is available. A tier stays in use until its provider **refuses** a request for its rate limit or quota (HTTP 429). The proxy then sends that same request to the next tier, so the turn carries on, in the middle of a turn. Later requests go back up to the refused tier once it may serve again.
+
+```toml
+[endpoints.anthropic-sub]
+url = "https://api.anthropic.com"       # your Claude subscription
+credential = "anthropic"                # `lazy auth set anthropic`
+
+[endpoints.fireworks]
+url = "https://api.fireworks.ai/inference"
+credential = "fireworks"                # `lazy auth set fireworks`
+
+[endpoints.ollama-local]
+url = "http://localhost:11434"
+credential = "none"                     # local: sends no credential
+
+[agents.tiered]
+harness = "claude-code"
+description = "Subscription until it says no, then Fireworks, then the local model"
+tiers = [
+  { endpoint = "anthropic-sub", model = "claude-sonnet-5-5" },
+  { endpoint = "fireworks", model = "firerouter/opus" },
+  { endpoint = "ollama-local", model = "qwen3-coder" },
+]
+```
+
+A profile may list a single tier, which is handy for watching a `threshold_percent` fire. When that only tier is over its threshold, lazy answers `429` itself, forwards nothing, and records `every tier full` in the proxy log and the task journal, exactly as when the last of several tiers is full.
+
+**When a tier refuses.** A 429 from a tier marks it unavailable for this profile and credential, and the refused request is retried at once on the next available tier. The agent never sees that 429. A short burst limit does not switch: a 429 whose `retry-after` is at or under [`[proxy] retry_after_threshold`](#proxy) (default 5 seconds) is waited out and sent to the same tier once more, and only a second refusal switches. A 529 ("overloaded") is the provider's own load, not your limit, so it does not switch tiers.
+
+**When a refused tier is tried again.** Lazy does not send test requests. The next real request after the tier's retry time goes to it, and if it refuses again, that request falls through to the next tier straight away. The retry time is:
+
+- the `retry-after` the provider sent, or the reset time it reported for the window that refused;
+- otherwise [`[proxy] tier_retry_interval`](#proxy) seconds after the refusal (default 300, five minutes);
+- for the Claude and ChatGPT subscriptions, never later than `tier_retry_interval`, even if the reported reset is hours away. A window can be reset early, or the plan upgraded, so lazy checks back regularly.
+
+Refusals are kept in the daemon's memory. After a daemon restart, a refused tier gets one more request, which falls through at once if it still refuses.
+
+**`threshold_percent` is optional: an early switch.** Lazy can read a usage window for two kinds of endpoint: the Claude subscription (its 5-hour and 7-day windows) and the ChatGPT subscription. On a tier for one of those you may set `threshold_percent` to stop using it *before* it refuses. The tier is skipped while a window is at or over that percentage, and used again when the window resets. Leave it out to use the tier until it refuses. Any other endpoint (Fireworks, OpenRouter, a local Ollama) reports no window lazy can read, so `threshold_percent` there is rejected at load. It could never apply.
+
+**What switches, and what doesn't.** The task stays on the tiered profile. Its agent session carries on across switches. The harness starts on the first tier's model. A request served by another tier asks for that tier's model, and is sent with **that tier's endpoint credential only**: your Claude credential never goes to Fireworks or Ollama, and a local tier is sent no credential at all. After a task's conversation has been served by more than one provider, lazy removes earlier *thinking* blocks from each request. While a tool-use step that crossed providers is still running, extended thinking is turned off for the rest of that step (Anthropic requires one thinking mode per step), and it comes back on with your next message. Adaptive thinking is never turned off. Anthropic checks that thinking blocks came from Claude, and lazy does not send one provider's blocks to another.
+
+**Every switch is recorded, with its reason.** The task's journal gets an entry for each switch, down and back up, showing the from and to tiers (endpoint and model), the turn, and why: a reading over the threshold, or a refusal such as `tier 1 (anthropic-sub): refused 429 at 01:07:39, retry after 01:12:39`. `lazy show` and the task page show these entries. The refused request itself appears in the proxy's traffic log, marked `tier refused`. `lazy stats tokens` breaks usage down **by endpoint**, so you can see what each tier served.
+
+**Which tier served a turn is recorded.** A turn's line in `lazy show`, the dashboard and Lazy Teams says where its requests went — `ran on tier 2: lunaroute/glm-5.3` — next to the model it was launched with, which is always the first tier's. Every request in the proxy audit log names its endpoint, tier, upstream, the model actually sent, and the name (never the value) of the credential attached.
+
+**Rules:**
+
+- Every tier must name an `[endpoints.<name>]` block and a `model`, and all tiers must use the profile's one harness and API. A tiered profile cannot set `model`, `endpoint`, `credential` or `named_endpoint` itself. Tiered profiles support the `claude-code` harness for now.
+- A running request continues if refreshing saved usage readings fails: tier selection uses the last known readings, and an unknown reading keeps a tier available. Credential and destination checks still apply to every request. Unreadable saved readings still refuse new launches governed by the usage pause.
+- `threshold_percent` is optional on every tier. If the last tier is a Claude or ChatGPT subscription and sets none, your [`[usage_pause]`](#usage_pause) threshold applies to it.
+- **Every tier's credential is checked before a turn starts.** If one is missing, the turn is refused and the message names that tier. Lazy never skips a tier because its credential is missing.
+- **In Lazy Teams**, each member connects every paid endpoint in the chain. Tasks and builders use that member's connection for the selected tier; unattended turns use the designated automation holder's connections. Usage thresholds read that member's endpoint readings, never another member's or a project key.
+- **When every tier is refusing or over its threshold**, no tier serves. Lazy answers the agent's request itself with HTTP 429 (a rate-limit error) and sends nothing more to any provider. The error names the profile, says every tier is full, and gives the earliest time a tier may serve again; its `retry-after` header is the seconds until then.
+  - **What happens to a running turn:** Claude Code ends the turn with `API Error: Request rejected (429)` and lazy's message. With a retry time more than a minute or so away it does not retry by itself. Lazy treats the failure as a rate limit that clears by itself: the task stays `working` and the turn is retried with a backoff that settles at once a minute (shown in `lazy watch`, `lazy list` and `lazy show`), and it carries on once a tier serves again. To stop it sooner, `lazy stop` the task.
+  - The first request refused this way, and the first one served afterwards, are recorded in the task's journal like a tier switch.
+  - A new turn is held by the [usage pause](#usage_pause) only when every tier is over its threshold, exactly as for any other profile; refusals alone do not pause new turns.
+- A task on a tiered profile has no model of its own: `--model` is refused. To pin one model, put the task on an ordinary profile.
+
+**Switching costs the prompt cache.** Providers cache a conversation's prompt per model, so every switch — down when a tier refuses or fills, **and back up when it is tried again** — sends the whole conversation uncached once. On a long task or a large builder conversation that is a real cost spike. A subscription that keeps refusing is tried again every `tier_retry_interval`, and each try that it serves is a switch back up. Lazy does not hold a tier to avoid it: the trade-off is yours. To switch less often, raise `tier_retry_interval`, or put the work on an ordinary profile.
+
+**Lazy does not check whether a request fits a tier.** If a conversation is larger than a tier's model accepts, that tier's provider answers with its own error, which reaches the agent as-is. Choose tiers whose models take the context your work needs.
+
+#### The builder on a tiered profile
+
+The builder can run on a tiered profile — set `[models.roles.builder] agent` to it. It switches tiers per request exactly as a task does, every tier's credential is checked before it starts, and the [usage pause](#usage_pause) holds it only when **every** tier is full. A lower tier is usually a weaker model, so lazy shows which tier is answering: `lazy builder` prints it at start, the builder's `lazy_status` reports it, and the Builders pages in the dashboard and Lazy Teams show it together with recent switches. Switches a builder made are kept in memory by the daemon and are not shown after it restarts.
+
 ### Migrating from role backends
 
 Three older spellings were removed. Lazy **refuses to load** a `lazy.toml` that still uses one, rather than reinterpreting it — the keys still parse, so a tolerant reader would keep launching against a different upstream than the file says. Each refusal prints the exact replacement block:
@@ -294,6 +375,44 @@ Three older spellings were removed. Lazy **refuses to load** a `lazy.toml` that 
 There is one carve-out, and it is narrow: a bare `[ollama]` header with **no keys under it** — every line commented out, say — configured nothing before profiles either, so there is nothing to reinterpret. Lazy reports it as removed and carries on rather than refusing; delete the dead header whenever it suits you. Anything else written under that name still refuses, including the array-of-tables spelling `[[ollama]]`, which carries real settings however unusual it looks. `lazy doctor` names the section and prints the replacement in both cases — including for a file that no longer loads, which is exactly when you need it.
 
 `lazy doctor` reports the same thing, and **`lazy doctor --fix agents` rewrites the file for you** — it shows the diff and asks before writing (`--yes` for scripts), preserves your comments and key order, and refuses to write anything it cannot re-validate. Where the rewrite would have to invent a model name it stops and tells you which key to add instead of guessing one.
+
+---
+
+## `[endpoints.<name>]` — named endpoints
+
+A named endpoint is an upstream URL plus the credential that pays for it, defined once. Any profile can use it in place of an inline `endpoint` with `named_endpoint = "<name>"`, and a [tiered profile](#tiered-profiles--use-a-tier-until-it-says-no) lists them as tiers.
+
+On Lazy Teams, the endpoint **name** identifies each member's connection, while
+the URL — its origin (scheme, host and port) **and its path** — is where they
+consent to send it. Profiles sharing a named endpoint share that member's
+connection. Different endpoint names can hold separate accounts on the same
+provider. Changing the origin or the path requires reconnecting, because a
+shared gateway can serve a different account under each path. The exception is
+a built-in provider's own API (`api.anthropic.com`, `api.openai.com`,
+`chatgpt.com`, Cursor's API), where one operator serves every path, so only the
+origin counts. A connection made before consent included the path covers only a
+URL with no path; reconnect it once for an endpoint whose URL has one. The
+`credential` setting describes the endpoint's authentication; it never selects
+another member's account or a shared project key.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `url` | `string` | required | The upstream lazy's proxy forwards to, from the host's point of view, written exactly like a profile's `endpoint`. |
+| `credential` | `string` | required | Name of a stored credential (`lazy auth set <name>`), or `"none"` for a server that takes no key. A key name you choose, unrelated to the endpoint's own name. See [every endpoint names its credential](#agentsname--named-agent-profiles). |
+| `description` | `string` | none | Plain-text note. |
+
+```toml
+[endpoints.work-fireworks]
+url = "https://api.fireworks.ai/inference"
+credential = "work-fireworks"
+
+[agents.firerouter]
+harness = "claude-code"
+model = "firerouter/opus"
+named_endpoint = "work-fireworks"   # instead of endpoint = "…"
+```
+
+`named_endpoint` and `endpoint` cannot both be set. A credential the profile names itself wins over the endpoint's. Profiles that write `endpoint` inline work exactly as before.
 
 ---
 
@@ -334,6 +453,7 @@ Controls where Lazy persists task state (tasks, sessions, turns, commits, commen
 |-----------------|----------|--------------|-------------|
 | `backend`       | `string` | `"external"` | Storage backend. Only `"external"` (file storage outside the repo) is supported. |
 | `external_path` | `string` | `""`         | Path for external storage. Defaults to `~/.lazy/<project-name>` if empty. Leading `~/` is expanded at load time. |
+| `backup_keep`   | `number` | `5`          | How many verified store backups to keep. lazy takes one before a new version first opens the store; see [Store backups](store-backups.md). |
 
 ```toml
 [storage]
@@ -407,10 +527,10 @@ Agent configuration for task execution.
 
 | Key                          | Type     | Default         | Description |
 |------------------------------|----------|-----------------|-------------|
-| `agent_id`                   | `string` | `"claude-code"` | Default [agent profile](#agentsname--named-agent-profiles) for task execution — a profile name, not a harness name. The built-in profiles `"claude-code"`, `"codex"` (OpenAI Codex CLI), `"cursor"` (Cursor CLI) and `"pi"` (Pi coding agent — see [pi-agent.md](pi-agent.md)) are always available; anything you declare in an `[agents.<name>]` block is equally valid here, so `agent_id = "local-ollama-pi"` is how you make a custom profile the default. Validated against the resolved profiles at load time; an unknown name is rejected and the available profiles are listed. Switch with `lazy system agent set <name>` (comment-preserving; takes effect on the next launch, no daemon restart); per-task override via `lazy create`/`start`/`edit`/`unblock --agent <name>`. This value is the default only for a task created from scratch: a subtask, clone, redo or rework inherits the profile of the task it came from, so a Cursor task's derivatives stay on Cursor. Switching profiles mid-task (via `edit` or `unblock`) starts a new session on the new profile; sessions are not migrated, and the task's model and effort are re-resolved unless you also pass `--model` / `--effort` on the same command. `lazy edit --agent` and `lazy start --agent` are refused while the task is `working` — wait for it to block, or run `lazy stop` first. The next prompt includes a distilled copy of the task's turn history plus a short branch orientation (commits and changed files). The task's profile also resolves merge conflicts when a sync pulls the parent branch in — a Cursor task's conflicts are resolved by Cursor, with the task's own model and session, under that harness's watchdog defaults. `lazy system agent set-key <profile>` stores the API key for a profile whose harness reads one out of its own config — Cursor and Codex (per-project, stored 0600 in `~/.lazy/daemon/<slug>/agent-credentials.json`, outside the repo, which every task container mounts read-only; read from a masked prompt or piped stdin, never an argument; `CURSOR_API_KEY` / `OPENAI_API_KEY` override, and a credential stored with `lazy auth set <name>` takes precedence over the file — see [Credentials](credentials.md)). Cursor also accepts `cursor-agent login` on the host, but containers need a key. Claude Code and Pi have no key of their own: `set-key` is refused for them and points you at `lazy auth set <credential>`, because lazy hands those harnesses the profile's credential through the proxy. Cursor, Codex and Pi tasks pair in-container ([Pairing](pairing.md)); conversation capture and the pairing summary are Claude Code and Pi only. |
-| `by_type`                    | `table`  | *(empty)*       | Per-task-type agent overrides (`[agent.by_type]`). Keys are task type names (`fix`, `feature`, `spike`, …); values are agent profile names. Unmapped types use `agent_id`. A new task's profile is chosen in this order: (1) an explicit `--agent` (or the MCP `agent` argument); (2) the task it comes from — a subtask's parent, or the source of a clone, redo or rework — whose profile it inherits, **without consulting this table**; (3) this table, for the task's type; (4) `agent_id`. So this table only routes tasks created from scratch: the children of a cluster on an expensive profile stay on it, whatever their own type maps to, unless each child is created with an explicit agent. A subtask does not inherit its parent's task type either — with no type given it is a plain `task`. A subtask does not copy its parent's model or effort (a clone or redo keeps its source's model unless you switch agent): unless set on the task, each turn uses the chosen profile's model (else the agent's default, else the project's default model) and `[agent] effort`. Unknown type names or profile names are rejected at load time. See `lazy.toml.example` for the full list of task types and which dedicated commands (`lazy fix`, `lazy refactor`, …) exist. |
+| `agent_id`                   | `string` | `"claude-code"` | Default [agent profile](#agentsname--named-agent-profiles) for task execution — a profile name, not a harness name. The built-in profiles `"claude-code"`, `"codex"` (OpenAI Codex CLI), `"cursor"` (Cursor CLI) and `"pi"` (Pi coding agent — see [pi-agent.md](pi-agent.md)) are always available; anything you declare in an `[agents.<name>]` block is equally valid here, so `agent_id = "local-ollama-pi"` is how you make a custom profile the default. Validated against the resolved profiles at load time; an unknown name is rejected and the available profiles are listed. Switch with `lazy system agent set <name>` (comment-preserving; takes effect on the next launch, no daemon restart); per-task override via `lazy create`/`start`/`edit`/`unblock --agent <name>`. This value is the default only for a task created from scratch: a subtask, clone, redo or rework inherits the profile of the task it came from, so a Cursor task's derivatives stay on Cursor. Switching profiles mid-task (via `edit` or `unblock`) starts a new session on the new profile; sessions are not migrated, and the task's model and effort are re-resolved unless you also pass `--model` / `--effort` on the same command. `lazy edit --agent` and `lazy start --agent` are refused while the task is `working` — wait for it to block, or run `lazy stop` first. The next prompt includes a distilled copy of the task's turn history plus a short branch orientation (commits and changed files). The task's profile also resolves merge conflicts when a sync pulls the parent branch in — a Cursor task's conflicts are resolved by Cursor, with the task's own model and session, under that harness's watchdog defaults. `lazy system agent set-key <profile>` stores the API key for a profile whose harness reads one out of its own config — Cursor and Codex (per-project, stored in the unified credential store (Keychain on macOS); read from a masked prompt or piped stdin, never an argument; `CURSOR_API_KEY` / `OPENAI_API_KEY` override the stored credential; `lazy auth set <name>` uses the same store — see [Credentials](credentials.md)). Cursor also accepts `cursor-agent login` on the host, but containers need a key. Claude Code and Pi have no key of their own: `set-key` is refused for them and points you at `lazy auth set <credential>`, because lazy hands those harnesses the profile's credential through the proxy. Cursor, Codex and Pi tasks pair in-container ([Pairing](pairing.md)); conversation capture and the pairing summary are Claude Code and Pi only. |
+| `by_type`                    | `table`  | *(empty)*       | Per-task-type agent overrides (`[agent.by_type]`). Keys are task type names (`fix`, `feature`, `spike`, …); values are agent profile names. Unmapped types use `agent_id`. A new task's profile is chosen in this order: (1) an explicit `--agent` (or the MCP `agent` argument); (2) the task it comes from — a subtask's parent, or the source of a clone, redo or rework — whose profile it inherits, **without consulting this table**; (3) this table, for the task's type; (4) `agent_id`. So this table only routes tasks created from scratch: the children of a cluster on an expensive profile stay on it, whatever their own type maps to, unless each child is created with an explicit agent. A subtask does not inherit its parent's task type either — with no type given it is a plain `task`. A subtask on the same agent copies its parent's recorded model at creation unless you specify one; switching agents leaves the model unset so the new agent uses its own default. A subtask does not copy its parent's effort (a clone or redo keeps its source's model unless you switch agent): unless set on the task, each turn uses the chosen profile's model (else the agent's default, else the project's default model) and `[agent] effort`. Unknown type names or profile names are rejected at load time. See `lazy.toml.example` for the full list of task types and which dedicated commands (`lazy fix`, `lazy refactor`, …) exist. |
 | `watchdog_output_timeout_ms` | `number` | `1800000`       | Hang backstop: kill the agent process after this many ms **without forward progress**. Resets on every completed step, so it bounds a single step, not the turn. A kill that captured nothing (no result, no new commits) is relaunched automatically with backoff; a kill after the agent had captured work stops for a human. `0` = use the agent's own default; the built-in agents all declare none (they stream their progress, so this value is the only guard), which means `0` switches the guard off. Default is 30 minutes. |
-| `wind_down_timeout_ms`       | `number` | `60000`         | How long to wait for the agent process to exit *after* it has emitted its final result, before killing it. `0` = wait indefinitely. Default is 60s. |
+| `wind_down_timeout_ms`       | `number` | `60000`         | How long to wait for the agent process to exit *after* it has emitted its final result and has no background work left running, before killing it. `0` = wait indefinitely. Default is 60s. |
 | `effort`                     | `string` | `"medium"`      | Reasoning effort level passed to Claude Code via `--effort` for task agents. Valid: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. Higher levels spend more tokens thinking before responding. |
 
 ```toml
@@ -454,6 +574,18 @@ is ever armed at a time:
   summary is in hand, so `wind_down_timeout_ms` gives the CLI a short window to
   exit and then kills it (SIGTERM, then SIGKILL after 5s). A kill here is
   recorded as a *successful* turn — the summary is preserved.
+- **A result is not always the end.** If the agent still has background work
+  running when it answers (a background subagent, or a background command
+  Claude Code has not stopped yet), the agent is not winding down: Claude Code
+  keeps going, and when the work reports it answers again. Until that
+  background work is done and the agent has answered, the turn counts as
+  *working*: the no-progress guard is armed and the wind-down window is not.
+  The turn's summary is the agent's **last** answer, its token usage covers
+  every answer, and the closing steps (the check for uncommitted work, the
+  self-review, the wrap-up) run only after it. If the background work stops
+  making progress for `watchdog_output_timeout_ms`, the agent is killed and
+  the turn stops for you rather than counting as finished: the agent never got
+  to act on what it was waiting for.
 
 Both guards cover merge-conflict resolution turns too: when a sync hits
 conflicts an agent resolves them, and that is an ordinary agent turn.
@@ -592,6 +724,8 @@ Baseline conversational verbosity for the builder and agents — how much they n
 
 When a role's effective level is unset (no `default` and no per-role value), **no verbosity guidance is injected** and behavior is unchanged from before this setting existed.
 
+Separately from this verbosity setting, Lazy asks the builder and agents to answer at the level of your question: a simple question gets a direct answer, while a request for details invites a deeper explanation. They can still investigate thoroughly before replying.
+
 The injected guidance is **elastic, not binary**: the configured level is the baseline, and when you ask for more detail the model steps up *one notch* from that baseline for that reply — not straight to maximum verbosity. At a `terse` baseline, "tell me more" yields a normal-length explanation, not an exhaustive essay. The guidance is placed near the top of the system prompt so it gets the model's attention.
 
 Invalid levels are rejected at config-load time, listing the valid levels.
@@ -616,7 +750,8 @@ to be confused with `[server]` below, which is lazy's own dashboard.
 |------------|------------|---------|-------------|
 | `ports`    | `number[]` | `[]`    | Container ports to publish. Each is addressed by its own number: `lazy url my-task 3000`. |
 | `services` | `table`    | `{}`    | Named ports (`web = 3000`), addressed by name or number: `lazy url my-task web`. Names must start with a letter, so a name is never mistaken for a port. |
-| `start_services_cmd` | `string` | *(unset)* | **Import only.** The **Start services** command is designated from a task's Services card and saved in the project's store, not here. If this key is set, the daemon imports it into the store once, the next time it starts, and does not read it again afterwards — change or clear the command from the Services card. Must be a non-empty single line. |
+| `main_service` | `number` | *(first declared port)* | Under Lazy Teams, the one declared port a pull request description links to alongside the task. Must be one of the declared ports, or the config is refused. |
+| `start_services_cmd` | `string` | *(unset)* | **Import only.** The **Start services** command is designated in the dashboard's Settings › Services (Lazy Teams: the project's Configuration page) and saved in the project's store, not here. If this key is set, the daemon imports it into the store once, the next time it starts, and does not read it again afterwards — change or clear the command there. Must be a non-empty single line. |
 
 ```toml
 [serve]
@@ -857,8 +992,8 @@ Docker image configuration for agent containers.
 
 | Key            | Type       | Default | Description |
 |----------------|------------|---------|-------------|
-| `dockerfile`   | `string`   | `""`    | Path to a custom Dockerfile, relative to the project root. If empty, lazy uses the base image (Ubuntu with Claude Code + passwordless sudo). Agents install what they need via `apt-get`. |
-| `build_inputs` | `string[]` | `[]`    | Files whose **contents** are part of the image's identity, relative to the project root. Changing one rebuilds the image on the next container start, exactly as editing the Dockerfile does. |
+| `dockerfile`   | `string`   | `""`    | Path to a custom Dockerfile, relative to the project root. If empty, lazy uses `Dockerfile.lazy` at the project root when it is committed (and, on Lazy Teams, when the install gives each project its own virtual machine), and otherwise the base image (Debian with Claude Code + passwordless sudo). A named file that is missing fails the launch. |
+| `build_inputs` | `string[]` | `[]`    | Files whose **contents** are part of the image's identity, relative to the project root. Changing one rebuilds the image: the next container start notices it and the daemon rebuilds in the background, while launches keep the current image until the new one is built. |
 | `run_args`     | `string[]` | `[]`    | Extra `docker run` arguments applied verbatim, in order, before the image name when a **task container** is created. They widen the container's privileges and apply to **every** task. |
 
 ```toml
@@ -906,7 +1041,9 @@ builds once, and a later `bundle update` changes neither the Dockerfile text nor
 lazy's idea of the image — so the image silently drifts from the lockfile until
 someone remembers to force a rebuild. Declaring the lockfile as a build input
 closes that gap: its content hash is folded into the image identity, so the next
-container start rebuilds and says why:
+container start notices the change and the daemon rebuilds the image in the
+background (launches keep the current image until the new one is built), saying
+why:
 
 ```
 Rebuilding image lazy-custom-974539f11375:0.21: Gemfile.lock changed (this can take several minutes).
@@ -1003,12 +1140,13 @@ There is no `[ollama]` section any more — a lazy.toml that still has one with 
 harness = "claude-code"
 model = "qwen3.5:35b-a3b-coding-nvfp4"
 endpoint = "http://localhost:11434"
+credential = "none"
 
 [agent]
 agent_id = "local-ollama"     # make it the default for new tasks
 ```
 
-Requires Ollama v0.14+ running on the host with the Anthropic Messages API enabled. **Local** Ollama (`http://localhost:11434`, a LAN address) needs **no credential** — that is what the profile's inferred `credential = "none"` means, and the proxy strips the placeholder before forwarding. **Hosted** Ollama (`https://ollama.com`) is inferred as `credential = "ollama"` and needs a key: run `lazy auth set ollama` (never put a key in `lazy.toml`).
+Requires Ollama v0.14+ running on the host with the Anthropic Messages API enabled. **Local** Ollama (`http://localhost:11434`, a LAN address) needs **no credential** — write `credential = "none"`, and the proxy strips the placeholder before forwarding. **Hosted** Ollama (`https://ollama.com`) takes `credential = "ollama"` and a key: run `lazy auth set ollama` (never put a key in `lazy.toml`).
 
 **When a credential is required.** Only a turn needs one. The daemon starts, clones and serves reads with no model credential; when a turn is about to launch, lazy checks the credential of the profile that turn runs on, and refuses the turn — before anything runs — naming the profile and the credential it lacks. A profile on a local server (`credential = "none"`) never needs one, so an all-local project needs no credential at all, and a mixed setup needs exactly the credentials of the profiles its tasks actually run on. Declaring `[agents.work-codex]` costs nothing until a task selects it. The check is presence-only and never calls the API (a blank value counts as absent); `lazy daemon health` and `lazy doctor` warn about a missing one before a turn is refused. See [Credentials](credentials.md).
 
@@ -1030,9 +1168,11 @@ Find the live address with `lazy daemon status` (it's also printed at daemon sta
 
 Cursor's agent stream is forced onto HTTP/1.1 for this: lazy sets `network.useHttp1ForAgent` in the container's `~/.cursor/cli-config.json` before each turn, and says so in the supervisor log. Two reasons — lazy's proxy speaks HTTP/1.1 only, and on cursor's HTTP/2 path the CLI takes its agent URL from a *server-supplied* redirect, which would route around the proxy silently. Your real `CURSOR_API_KEY` stays on the host: the container gets a placeholder and the proxy substitutes the real key — in the header or in the request body, wherever the CLI put it — on the way out. A host `cursor-agent` session logged in *without* an API key has no key to swap, so its traffic is forwarded exactly as it arrives and recorded unattributed.
 
-**Codex traffic rides the same proxy.** A `codex` task's OpenAI API calls go through the proxy's OpenAI-compatible route on the same port. The Codex CLI ignores `OPENAI_BASE_URL`, so lazy routes it the one way the CLI honors: before every turn it writes a managed `~/.codex/config.toml` in the task's sandbox whose provider block points `base_url` at the proxy and reads the credential from `OPENAI_API_KEY` — which holds the per-task **placeholder**, sent as the bearer token on every request and swapped for your real OpenAI key upstream. You configure nothing, your real key never enters the container, and a codex launch that cannot resolve the live proxy address **fails** rather than calling OpenAI's servers unaudited.
+**Codex traffic rides the same proxy.** A `codex` task's OpenAI API calls go through the proxy's OpenAI-compatible route on the same port. The Codex CLI ignores `OPENAI_BASE_URL`, so lazy routes it the one way the CLI honors: before every turn it writes a managed `~/.codex/config.toml` in the task's sandbox whose provider block points `base_url` at the proxy and reads the credential from `OPENAI_API_KEY` — which holds the per-task **placeholder**, sent as the bearer token on every request and swapped for your real OpenAI key upstream. You configure nothing, your real key never enters the container, and a codex launch that cannot resolve the live proxy address **fails** rather than calling OpenAI's servers unaudited. The same managed file also turns off the Codex CLI's plugin marketplace sync, which would otherwise download a git clone into the task's sandbox; lazy agents get their tools from lazy itself.
 
 **Everything is proxied — a profile's `endpoint` chooses where the proxy forwards.** There is no configuration that opts out. A profile with an explicit `endpoint` is routed by the proxy to that upstream, **per caller**: the per-launch credential the agent presents identifies which task and which [profile](#agentsname--named-agent-profiles) made the request, so the proxy resolves profile → upstream + credential + wire at request time from evidence, not from a header the agent could set. Two tasks on different profiles therefore reach different upstreams with different keys on the same proxy port, in the same project. Traffic with no such credential (a host login session) goes to the primary upstream as before, and the audit record names the upstream that was actually called.
+
+If a profile is removed, its existing launches receive HTTP 410 (route gone), not an authentication error. That name stays unavailable to the running proxy until a full daemon restart, even if it is added back; use another profile name in the meantime.
 
 ### There is no off switch
 
@@ -1062,7 +1202,7 @@ What to do:
 
 The reasoning is the same as for daemon startup: a transient daemon failure must not be able to drop you out of the audit plane — silently, on a single launch, with no trace afterward that the traffic went unaudited. This applies to every profile, local Ollama and explicitly-pinned endpoints included: they need the proxy's address too, because the proxy is what reaches their upstream.
 
-**A resolved address is only good for the daemon that gave it out.** With the port OS-assigned, a restarted daemon serves the proxy somewhere else, so any address held across a restart is dead. This matters for `lazy upgrade`, which restarts the daemon while your builder session keeps running: the in-container supervisor notices the restart, re-resolves the address against the daemon that came back, and relaunches Claude with `--resume` — rather than leaving you on a dead port. If that re-resolve fails, the session is **not** silently degraded — you get the error above and a `lazy builder --resume <id>` to run once the daemon is healthy, instead of a session that comes back alive but unable to reach the API.
+**A resolved address is only good for the daemon that gave it out.** With the port OS-assigned, a restarted daemon serves the proxy somewhere else, so any address held across a restart is dead. This matters for `lazy upgrade`, which restarts the daemon while your builder session keeps running: the in-container supervisor notices the restart, re-resolves the address against the daemon that came back, and relaunches Claude with `--resume` — rather than leaving you on a dead port. If the daemon answers before its proxy is ready, the builder waits briefly for it to bind. If re-resolution still fails, the session is **not** silently degraded — you get the error above and a `lazy builder --resume <id>` to run once the daemon is healthy, instead of a session that comes back alive but unable to reach the API.
 
 **A reconnect uses your current builder model and effort.** Each time the builder reconnects after a daemon restart, it launches Claude with the model and effort from the current `lazy.toml`, not the ones from when the session started. A `--model` or `--effort` you typed on `lazy builder` stays in force for that session. `lazy doctor` lists running builders whose model or image is behind your config; quit one and run `lazy builder --resume <id>` to refresh it.
 
@@ -1072,7 +1212,10 @@ The reasoning is the same as for daemon startup: a transient daemon failure must
 | `bind`     | `string` | `"127.0.0.1"`                    | Bind address. Keep the default (loopback only) unless you deliberately expose the proxy to other machines. |
 | `upstream` | `string` | `"https://api.anthropic.com"`    | Anthropic-compatible upstream the proxy forwards to (real Anthropic, Ollama, or another proxy). Anthropic-native targets only — the proxy never translates between API shapes. |
 | `cursor_upstream` | `string` | `"https://api2.cursor.sh"` | Cursor API base URL the cursor passthrough route forwards to. Change it only to point cursor traffic at a different Cursor deployment or a local stand-in. |
-| `retry_after_threshold` | `int` | `5` | On a **primary** 429 whose `Retry-After` is ≤ this many seconds, the proxy waits that long and retries the primary **once** before failing over. A larger `Retry-After` fails over immediately. Only applies when a fallback chain is configured. |
+| `retry_after_threshold` | `int` | `5` | On a **primary** 429 whose `Retry-After` is ≤ this many seconds, the proxy waits that long and retries the primary **once** before failing over. A larger `Retry-After` fails over immediately. Applies when a fallback chain is configured, and to tiered profiles, where a short 429 is waited out on the same tier before switching. |
+| `tier_retry_interval` | `int` | `300` | For a [tiered profile](#tiered-profiles--use-a-tier-until-it-says-no): seconds a tier that refused a request (HTTP 429) without saying when to come back is skipped before the next request tries it again. A Claude or ChatGPT subscription tier is tried again no later than this, even when its reported reset is later. At least `1`. |
+| `audit_retention_days` | `int` | `7` | Days of [proxy audit log](#proxy) kept. Whichever of this and `audit_retention_mib` is reached first wins. Must be positive. |
+| `audit_retention_mib` | `int` | `128` | Disk the proxy audit log may use in all, in MiB (at least `8`). |
 | `upstream_timeout` | `int` | `1800` | Seconds the proxy waits for an upstream to answer one request before giving up (`0` = wait indefinitely). Raise it for a local model that loads slowly, queues requests behind other sessions, or prefills very large prompts; when the proxy does give up it names the upstream and this ceiling, so a slow model never reads as a network fault. |
 
 `openai_upstream` **was removed.** It was one global OpenAI upstream shared by every caller holding an OpenAI key, so two Codex setups could never differ. An upstream is a property of a [profile](#agentsname--named-agent-profiles) now: give the `codex` profile (or a profile of your own) an `endpoint`. A lazy.toml that still carries the key is reported by `lazy doctor` with that remedy, and `lazy doctor --fix agents` applies it.
@@ -1093,7 +1236,7 @@ upstream = "https://api.anthropic.com"
 
 Audit records are written to `.lazy/logs/proxy-audit.jsonl` (append-only JSONL, one record per line) in the project-local data dir — **not** into your task store. The audit trail is disposable telemetry, not durable state: it is gitignored, safe to delete at any time, and never travels with the store. Writes are serialised — no interleaving even under concurrent requests — and happen asynchronously so the proxy hot path is never blocked by disk I/O.
 
-The file is **bounded**: it rotates to `proxy-audit.jsonl.1` at 4 MiB and only that one older segment is kept, so the audit trail can never exceed 8 MiB total. Retention is deliberately shallow — the only reader is the recent-history "is lazy's credential actually accepted?" verdict in `lazy doctor`. Anything wanting statistics should tap the stream as it flows rather than mine the file.
+The file is **bounded by size and by age**: it rotates into numbered segments (`proxy-audit.jsonl.1`, `.2`, …) of 4 MiB, and keeps **7 days or 128 MiB, whichever comes first** — set with `audit_retention_days` and `audit_retention_mib`. Age is checked per segment, so the oldest entries can outlive the window by up to one segment's worth. That is deep enough to answer "which upstream returned that error last night"; `lazy doctor` shows the oldest entry the log still reaches back to. Every reader in lazy reads newest-first with a limit, so the deeper history costs nothing until someone looks. Anything wanting statistics should tap the stream as it flows rather than mine the file.
 
 > **Upgrading from an earlier version:** the audit stream used to be appended, uncapped, into the task store itself (`<store>/proxy-audit.jsonl`), where it could grow large enough to break a store push. The daemon deletes that leftover file on startup and says so in its log — since it is cleanup of a file an older version wrote and has nothing to do with the proxy's current state. `lazy doctor` reports it if it is still there. If your store is a git repo, the oversized blob is also in its **history**, which lazy will not rewrite for you — use `git filter-repo` in the store repo to purge it.
 
@@ -1106,9 +1249,15 @@ Every audit record also carries the **token usage** the upstream reported for th
 Usage is captured on both response paths:
 
 - **Non-streaming / enforcement path** — the body is already buffered, so `usage` is read straight out of the JSON. On an enforced (denied) request the counts come from the *original* upstream body, not the rewritten one: a denial changes content, never the tokens the upstream billed.
-- **Streaming path** — the response body is passed through a tee that forwards each chunk to the client *before* inspecting it, watching the SSE stream for `message_start` (input/cache counts) and the final `message_delta` (cumulative `output_tokens`). Nothing is buffered and the client never waits on the scanner, so the streaming hot path keeps its zero-added-latency guarantee. The audit record is enqueued when the stream ends — including when the client cancels mid-stream, so a walked-away client never vanishes from the trail.
+- **Streaming path** — the response body is passed through a tee that forwards each chunk to the client *before* inspecting it, watching the SSE stream for `message_start` (input/cache counts) and the final `message_delta` (cumulative `output_tokens`) on the Anthropic wire, or for the `usage` an OpenAI-compatible stream sends on its last chunk. Nothing is buffered and the client never waits on the scanner, so the streaming hot path keeps its zero-added-latency guarantee. The audit record is enqueued when the stream ends — including when the client cancels mid-stream, so a walked-away client never vanishes from the trail.
 
 Requests that failed before any response (an unreachable upstream, a terminal error) legitimately have no usage and keep `usage: null`. They still appear in the trail, and `lazy stats tokens` counts them under "requests" but not under "with usage" — so a failure is visible rather than silently inflating or deflating the totals.
+
+What the trail cannot know, so totals can undercount:
+
+- **A stream that is cancelled or breaks mid-way** is recorded, but only with the tokens seen before it stopped — usually the input counts, sometimes nothing, since output tokens arrive at the end.
+- **An OpenAI-compatible stream** reports usage only when the client asked for it (`stream_options.include_usage`); without it the record has no usage.
+- **Cursor requests** are recorded and attributed, but without a model or token usage — Cursor's wire is not read for either.
 
 Read the trail with `lazy stats tokens`. It lives under `lazy stats`, the multiplexer for read-only analytics over what lazy recorded (alongside `lazy stats timings`, the request-trace readout) — top-level verbs are reserved for task-lifecycle operations:
 
@@ -1122,6 +1271,22 @@ lazy stats tokens --json                 # machine-readable rollup
 ```
 
 `--subtree` needs a `--task` to descend from, and folds in every descendant at every depth — what a parent task (a release task, a cluster) really spent, rather than the handful of turns it ran itself. The *By task* breakdown then has one row per task in the subtree.
+
+### Response latency — `lazy stats latency`
+
+Token totals cannot show a slow provider, so each audit record also carries three timings, all measured from the moment the proxy received the request:
+
+- **TTFB** — the upstream's response headers arrived (`durationMs`, as before).
+- **TTFT** — the first content token of a streamed reply. Keep-alive frames, `message_start` and the opening role-only chunk do not count. This works for Anthropic Messages and for OpenAI Chat Completions and Responses.
+- **TTLT** — the last token, when the stream ended.
+
+`lazy stats latency` reports, per endpoint and model (and tier, for a tiered profile): requests; errors split into 429, other 4xx, 5xx, network and cancelled; and p5 / p50 / p95 of TTFB, TTFT, TTLT and output tokens per second. Tokens per second is output tokens divided by the whole request time, so a non-streamed reply, whose first token is its last, is still measured. It also shows how much of the agents' turn time was spent waiting on the model, against tools and the agent itself.
+
+These numbers come from a small rollup lazy keeps **per turn, in the task store**, so they do not expire with the audit trail: `--since 90d` or `--since 365d` works, and `--task <id> [--subtree]` narrows to one task or a whole tree. The percentiles come from merged histograms and are within about ±16% of the exact value. Each agent turn also shows a one-line summary of its own latency (for example `14 model calls · p50 TTFT 2.1s · TTLT 9.8s · 52 tok/s · 63% waiting on the model`), and a task's Stats tab has the same table for that task. In a Teams project, the Usage page shows it as **Model latency history** with a choice of period. Tasks running on Cursor are not included: Cursor's traffic carries no model or token counts the proxy can read.
+
+For **recent, per-request** detail, read the audit trail instead: `lazy stats latency --recent` rolls the trail up by model, endpoint, endpoint × model and tier as p50 / p90, with output tokens per second (output tokens over the whole request, as above), over what the trail still holds; `lazy stats audit` shows the three timings per request, and the Teams Usage page shows the same recent tables for the last seven days. A provider optimised for time to first token but slow to finish shows a good TTFT next to a poor TTLT and tokens/s. Records written before timings existed show `-`, and are left out of the percentiles rather than counted as zero. Every timing cell ends in `(n=…)`, the number of requests it covers: REQS includes errors, and a stream that never produced a content event has a TTFB but no TTFT, so columns can differ.
+
+Connection setup is **not** reported separately: the proxy's HTTP client does not expose the TCP/TLS phase, so the timings include it. The proxy does keep upstream connections alive and reuses them per host, (verified over both plain HTTP and TLS), so setup is paid once per connection, not once per request — it shows up only in the first request after the connection was opened or dropped.
 
 Builders and task agents can read the same accounting through `lazy_token_stats`.
 The MCP tool can group recent traffic by task, model, or role and can return the
@@ -1194,9 +1359,12 @@ lazy stats audit --task add-audit --last 2h
 lazy stats audit --errors --limit 50      # recent failures — e.g. the 401s that mean an expired credential
 lazy stats audit --reroutes --json        # failovers, machine-readable
 lazy stats audit 3f9a1c2b                 # full detail for one record
+lazy stats audit --summary --since 24h    # per endpoint × model: compare endpoints serving the same model
 ```
 
-The listing shows time, record id, role, task, model, tool_use/tool_result counts, total tokens and duration, plus a `NOTES` column that flags the rows worth opening: `DENY(n)`, `REROUTE`, and `FAIL(<status>)` (or `FAIL(no-response)` when the request never got one). A failed request also carries a short excerpt of the error message the upstream answered with, so a `400` says why it was refused. Filters — `--task` (short-id prefix), `--role`, `--model` (substring), `--since`/`--last`, `--denied`, `--reroutes`, `--errors` — all combine.
+The listing shows time, record id, role, task, the endpoint that served it (its configured name, or the upstream address), model, tool_use/tool_result counts, total tokens and duration, plus a `NOTES` column that flags the rows worth opening: `DENY(n)`, `REROUTE`, and `FAIL(<status>)` (or `FAIL(no-response)` when the request never got one). A failed request also carries a short excerpt of the error message the upstream answered with, so a `400` says why it was refused. Filters — `--task` (short-id prefix), `--role`, `--model` (substring), `--since`/`--last`, `--denied`, `--reroutes`, `--errors` — all combine.
+
+`--summary` replaces the listing with one row per endpoint × model (and, for a tiered profile, the profile and tier that served it — `tiered tier 1` is profile `tiered`'s first): requests, errors (broken down into 429, 5xx, timeout and cancelled), p50 / p90 time to first byte, first token and last token, output tokens per second, and input / output tokens. It takes the same filters, covers every matching record (`--limit` does not apply) and supports `--json`. Timings and tokens come from successful requests only.
 
 Passing a record id (the short form from the `ID` column is enough) opens the **detail view** for that request: routing and upstream, request shape and declared tools, token usage, the `tool_use` blocks the agent intended with their paths/commands, `tool_result` previews, the reroute's source and target, and each denial with the rule that fired and the reason given back to the agent. `--json` emits the row list, or — with a record id — the raw record.
 
@@ -1279,9 +1447,9 @@ Denials are recorded on the request's audit record (`enforcement` field: which t
 
 ### Outbound request plugins are NOT configured here
 
-The proxy can run **request plugins**: transforms applied to the outbound request body before it is forwarded. They are loaded by convention from the project's `.lazy/plugins/` directory — presence is the enable switch, and there is no `lazy.toml` key for them. With no such directory the proxy forwards request bodies byte-identically, which is the default.
+The proxy can run **request plugins**: transforms applied to the outbound request body before it is forwarded. They are loaded by convention from the project's `.lazy/plugins/` directory — presence is the enable switch, and there is no `lazy.toml` key for them. With no such directory the proxy forwards request bodies byte-identically, which is the default. **Lazy does not currently run them**, on any install: they would run inside lazy's own process on the host — see [Proxy plugins](proxy-plugins.md).
 
-See [Proxy plugins](proxy-plugins.md), or scaffold one with `lazy customize proxy-plugin <name>`.
+See [Proxy plugins](proxy-plugins.md). `lazy customize proxy-plugin <name>` still scaffolds one, but warns that it will not be loaded.
 
 ---
 
@@ -1437,6 +1605,14 @@ not a silent no-op.)
 | Required? | Yes, while any violation is pending | Yes, while any violation is pending |
 | A pending file left out | makes accept **refuse**; nothing is reverted | makes accept **refuse**; nothing is reverted |
 
+**A subtask an agent runs is not asked at all.** That is every subtask of a
+[cluster task](./cluster-tasks.md), and any subtask another task's agent started.
+Nobody reads such a subtask but the agent that merges it, so nothing is pending
+on it: it parks `blocked`, never `conflict`, and its accept needs no approvals —
+it names the protected files it carried up instead. Every one of them is asked
+at the parent task's own accept, where you review the whole work (see "Which
+files count" below).
+
 The web review page (and Lazy Teams) carries the same decision per file, next
 to the rendered diff, as two switches: **Approve** and **Reject**. Accept reads
 those stored decisions, so a file approved there needs no flag at the terminal.
@@ -1527,11 +1703,11 @@ On GitHub and GitLab projects, **approving the task's PR/MR satisfies this same 
 
 ## `[automation]`
 
-The follow-up exchanges — protected-file push-back (under `[permissions]`), the maintained-files nudge and the reactive automations — run **once**, in the wrap-up that closes a declared-final turn: the turn where the agent said the task is done with `lazy_final`. Until that declaration none of them fire; the scans they would run are skipped. (The review walkthrough is the exception: it is produced on every park a person will open, because it is what you decide from.) Two things happen outside the wrap-up: protected-file edits are still detected at every end-of-turn park (the scan runs over the task's own change range, so the task still parks in `conflict` mid-task), and a plan-mode final gets the accept-time remedies instead of the exchange, since a plan-mode agent cannot revert anything.
+The follow-up exchanges — protected-file push-back (under `[permissions]`), the maintained-files nudge and the reactive automations — run **once**, in the wrap-up that closes a declared-final turn: the turn where the agent said the task is done with `lazy_final`. Until that declaration none of them fire; the scans they would run are skipped. (The review walkthrough is the exception: it is produced on every park, except on a task whose subtasks have landed, because it is what you decide from.) The wrap-up runs for **every** task, including subtasks an agent created and the children of a cluster: your configured rules are never skipped because no person started the task. Two things happen outside the wrap-up: protected-file edits are still detected at every end-of-turn park (the scan runs over the task's own change range, so the task still parks in `conflict` mid-task), and a plan-mode final gets the accept-time remedies instead of the exchange, since a plan-mode agent cannot revert anything.
 
 ### Maintained files (`[[automation.maintain]]`)
 
-Maintained files — the inverse of `[permissions].protected`. Patterns agents are *expected* to keep up to date as they work (docs, CHANGELOG, architecture diagrams). Agents *may* skip them, but when the task's whole change range touches none of an entry's files, the supervisor prompts the agent once, at the wrap-up, to either make the update or record why it skipped — turning a silent omission into a deliberate, reviewable decision. It is a nudge, not a gate: the task still blocks normally (it does not become a `conflict`). The range is branch-wide: at a parent task's final it covers its accepted subtasks' work too — a subtask whose own wrap-up skipped this check has its changes checked here instead, where the whole work is being reviewed.
+Maintained files — the inverse of `[permissions].protected`. Patterns agents are *expected* to keep up to date as they work (docs, CHANGELOG, architecture diagrams). Agents *may* skip them, but when the task's whole change range touches none of an entry's files, the supervisor prompts the agent once, at the wrap-up, to either make the update or record why it skipped — turning a silent omission into a deliberate, reviewable decision. It is a nudge, not a gate: the task still blocks normally (it does not become a `conflict`). The range is branch-wide: at a parent task's final it covers its accepted subtasks' work too — so a subtask's changes are checked again where the whole work is being reviewed.
 
 `maintain` is an array of tables (`[[automation.maintain]]`), each with:
 
@@ -1543,7 +1719,7 @@ Maintained files — the inverse of `[permissions].protected`. Patterns agents a
 
 Opt-in: empty by default. The check runs once, during the wrap-up, over the task's whole change range — the same range `lazy diff` and the reviewer are about to see — not just the final turn. It is skipped entirely when the task changed nothing at all (a no-op turn, or one that only drove subtasks, has nothing to maintain alongside).
 
-When the task's range also has protected-file violations, the maintain nudge runs **after** the push-back exchange and is **independent of its outcome** — it fires whether the agent resolved the violations or kept them. Ordering within the wrap-up is: work → push-back → agent reply → maintain nudge → agent reply (→ react nudge when configured → the uncommitted-work check → the presentation step on human-audience tasks). The uncommitted-work check is what stops an update made *here* from being written and never committed: it reads the working tree, and if anything is loose it asks the agent once to commit or discard it, before the walkthrough is written over the final file list. See [Work left uncommitted when the turn ends](state-machine.md#work-left-uncommitted-when-the-turn-ends). The push-back never re-runs because of the maintain or react steps (it is single-shot). The maintain response does not carry the violation set; when a react follow-up also runs, that response re-detects and carries the final set. Otherwise the push-back response does — so a still-violating task still becomes a `conflict` even though it also got nudged.
+When the task's range also has protected-file violations, the maintain nudge runs **after** the push-back exchange and is **independent of its outcome** — it fires whether the agent resolved the violations or kept them. Ordering within the wrap-up is: work → push-back → agent reply → maintain nudge → agent reply (→ react nudge when configured → the uncommitted-work check → the presentation step). The uncommitted-work check is what stops an update made *here* from being written and never committed: it reads the working tree, and if anything is loose it asks the agent once to commit or discard it, before the walkthrough is written over the final file list. See [Work left uncommitted when the turn ends](state-machine.md#work-left-uncommitted-when-the-turn-ends). The push-back never re-runs because of the maintain or react steps (it is single-shot). The maintain response does not carry the violation set; when a react follow-up also runs, that response re-detects and carries the final set. Otherwise the push-back response does — so a still-violating task still becomes a `conflict` even though it also got nudged.
 
 The follow-up is recorded as its own discrete turn pair — a `supervisor`-authored prompt turn (under a "Maintained Files Review" heading) followed by the agent's reply turn — so the turn history reads cleanly: work turn → supervisor nudge → agent reply. The nudge text is **not** appended to the work turn's response. The reply turn carries its own token usage (including cache tokens) and any commits the follow-up made are attributed to it, not the work turn. The protected-file push-back behaves the same way ("Permission Violation Review"). In `lazy show` and the dashboard these prompt turns are labelled `supervisor` (not `human`), so you can tell "the human said" from "the supervisor pushed back".
 
@@ -1632,7 +1808,7 @@ post_turn_timeout = 300
 
 ### The accept check — `accept_check`
 
-A command run in the **task's** worktree at accept time, before the merge. Unlike `post_turn`, which is advisory, a non-zero exit **refuses the accept**: a task that does not build would break the branch it is merged into. See [The accept check](accept-check.md) for why it exists and the full refusal text.
+A command run against the **task's** worktree at accept time, before the merge, inside the same short-lived container `[automation.pre_accept]` uses — never on the host, since the scripts it calls come from the task's branch. Unlike `post_turn`, which is advisory, a non-zero exit **refuses the accept**: a task that does not build would break the branch it is merged into. See [The accept check](accept-check.md) for why it exists and the full refusal text.
 
 | Key                     | Type     | Default | Description |
 |-------------------------|----------|---------|-------------|
@@ -1725,6 +1901,8 @@ This is the **permanent** cap. To steer it at runtime without editing
 - `lazy daemon config set usage_pause_threshold <percent|off>` — a **one-shot** override of [`[usage_pause]`](#usage_pause) for a launch beside any task (a report, a chat); with `off --task <task>`, lets that task's next turn through instead.
 
 **Turn cap (`max_turns_without_human`).** The counter is per-task and increments on every builder- or agent-initiated `lazy unblock`/`lazy resume`/`lazy start`; a **human**-initiated one always resets it to 0. At the cap, the daemon refuses a builder/agent-initiated unblock/resume/start with a `409` naming the task, the count, and the config key — the task stays `blocked` awaiting a human. A human action is never blocked by this cap.
+
+The same counter bounds **comments that arrive while a turn is running**: once the agent finishes its main work, it is handed any comment written since the turn started (in the same conversation, worded exactly as an unblock would show it), and every such hand-off counts one turn without a human. At the cap, the comments stay queued and the turn ends normally; your next unblock delivers them and resets the count.
 
 ## `[cluster]`
 
@@ -1862,7 +2040,7 @@ lift this.
 particular task — for example to finish it — let its next turn through:
 
 ```sh
-lazy unblock <task> -m "..." --past-usage-pause   # also on start, resume, review, ask
+lazy unblock <task> -m "..." --override-usage-pause   # also on start, resume, review, ask
 lazy daemon config set usage_pause_threshold off --task <task>
 ```
 
@@ -1881,7 +2059,10 @@ unreadable saved readings, and is dropped if the daemon restarts.
 
 **Letting one launch beside any task through.** `lazy report`, `lazy ask` on a
 stored conversation, a chat or a review conversation is not a turn of any task.
-To let one of those through once, run this yourself, at your own terminal:
+To start a pair, chat, builder or ask session despite the pause, pass
+`--override-usage-pause` to that command at your own terminal. This applies
+only to that session, not to later launches. Alternatively, to let one of
+these launches (including `lazy report`) through, run:
 
 ```sh
 lazy daemon config set usage_pause_threshold off
@@ -2020,7 +2201,8 @@ daemons across **all** projects on the host:
 - `lazy daemon kill-stray` — reap only stray daemons (those whose project root no longer
   exists). A daemon whose root still exists is **never** touched. Requires confirmation;
   pass `--yes` for non-interactive callers and `--prune-dirs` to also remove orphaned
-  state dirs.
+  runtime state. Stored credentials and other persistent project data are kept;
+  a state directory is removed only when empty.
 
 A state dir counts as *running* only if the process behind its recorded PID is verified
 to be that daemon — by answering `/daemon/status` on its recorded TCP port for the right

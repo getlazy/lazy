@@ -2,13 +2,14 @@
  * `lazy stats tokens` — token accounting from the proxy audit trail.
  *
  * The proxy records one audit record per forwarded request, attributed by the
- * `x-lazy-role` / `x-lazy-task-id` headers lazy injects, with the token usage
+ * per-launch credential grant it resolves, with the token usage
  * parsed out of the response. This command is the reader for that trail: overall
  * totals plus per-role, per-task and per-model breakdowns.
  *
  * Scope, stated in the readout rather than buried here: every launch lazy makes
- * is proxied, whatever its role's backend — so this trail covers all of them.
- * What it cannot cover is a process lazy did not launch.
+ * is proxied, whatever its harness, profile or endpoint — so this trail covers
+ * all of them. What it cannot cover is a process lazy did not launch, and Cursor
+ * requests are recorded without token usage.
  */
 import { parseFlags } from '../helpers';
 import { theme, dim } from '../../render/theme';
@@ -83,8 +84,9 @@ function renderReport(report: TokenReport, top: number): void {
   renderBreakdown('By role', report.byRole, top);
   renderBreakdown('By task', report.byTask, top);
   renderBreakdown('By model', report.byModel, top);
+  renderBreakdown('By endpoint', report.byEndpoint, top);
   console.log(
-    dim('\nOnly traffic through the lazy proxy is audited — agents on the anthropic/ollama backends are not counted.'),
+    dim('\nEvery agent lazy launches is proxied and counted here, whatever its harness or endpoint (a local Ollama included); a process lazy did not launch is not. Cursor requests carry no token counts.'),
   );
 }
 
@@ -150,7 +152,7 @@ export function tokensUsage(): void {
 
 Token accounting from the proxy audit trail. The lazy proxy records one audit
 record per forwarded request — attributed to a role (builder/agent) and a task
-by headers lazy injects — with the token usage parsed out of the response. This
+by the per-launch credential lazy issues — with the token usage parsed out of the response. This
 command rolls those records up:
 
   total          requests, and input / output / cache-write / cache-read tokens
@@ -158,10 +160,14 @@ command rolls those records up:
   By task        which task burned them
   By model       which wire model served them
 
-Every launch lazy makes routes through the proxy, whatever the role's backend, so
-all of it is audited here; a process lazy did not launch is not. Requests that
+Every launch lazy makes routes through the proxy, whatever its harness, profile
+or endpoint, so all of it is audited here; a process lazy did not launch is not. Requests that
 failed before a response carry no usage and are counted in "requests" but not in
-"with usage".
+"with usage". A stream the client cancelled or that broke mid-way counts only
+the tokens that had arrived (usually input only, or none), and an OpenAI-wire
+stream reports usage only when the client asked for it, so totals can undercount.
+Cursor requests are recorded without a model or token usage, so Cursor spend is
+not in these totals.
 
 Options:
   --since <duration>   Only records within this window (e.g. 30m, 2h, 1d)

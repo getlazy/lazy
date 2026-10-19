@@ -42,12 +42,29 @@ function numberFromUrl(url: string): string | null {
  * Reads metadata only. A missing URL is "no PR", not an error — local-driver
  * tasks never have one.
  */
+/**
+ * A metadata URL that may become an href: http(s) only. These keys are written
+ * by lazy's forge drivers today, but the link renders on the dashboard origin,
+ * so a `javascript:` value must never reach an href whoever writes it.
+ */
+function httpUrlMeta(md: Record<string, string> | null | undefined, key: string): string | undefined {
+  const value = stringMeta(md, key);
+  if (!value) return undefined;
+  try {
+    const { protocol } = new URL(value);
+    return protocol === 'http:' || protocol === 'https:' ? value : undefined;
+  } catch {
+    // Not a parseable URL: nothing a link can safely point at.
+    return undefined;
+  }
+}
+
 export function resolveTaskForgeLink(task: Task): TaskForgeLink | null {
   const md = task.metadata;
   const ghUrl =
-    stringMeta(md, 'github_remote_ref_url') ??
-    stringMeta(md, 'remote_ref_url') ??
-    stringMeta(md, 'github_pr_url');
+    httpUrlMeta(md, 'github_remote_ref_url') ??
+    httpUrlMeta(md, 'remote_ref_url') ??
+    httpUrlMeta(md, 'github_pr_url');
   if (ghUrl) {
     const id =
       stringMeta(md, 'github_remote_ref_id') ??
@@ -57,7 +74,7 @@ export function resolveTaskForgeLink(task: Task): TaskForgeLink | null {
     return { url: ghUrl, kind: 'pr', forge: 'github', id: id ?? null };
   }
 
-  const glUrl = stringMeta(md, 'gitlab_remote_ref_url');
+  const glUrl = httpUrlMeta(md, 'gitlab_remote_ref_url');
   if (glUrl) {
     const id = stringMeta(md, 'gitlab_remote_ref_id') ?? numberFromUrl(glUrl);
     return { url: glUrl, kind: 'mr', forge: 'gitlab', id: id ?? null };

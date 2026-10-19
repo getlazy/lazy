@@ -14,7 +14,7 @@
  * With `--task <task>` (value `off` only) it is that TASK's allowance instead —
  * "let this task's next turn through" — which a person or the builder may set
  * (src/daemon/usage-pause.ts, "The per-task allowance"); the launch commands'
- * `--past-usage-pause` sets the same thing.
+ * `--override-usage-pause` sets the same thing.
  *
  * The override is ephemeral: it lives only in the running daemon process and is
  * lost on restart (which reverts to lazy.toml). This command NEVER writes
@@ -147,7 +147,7 @@ function printUsagePause(state: UsagePauseState, offerOverride: boolean): void {
     console.log(`  ${theme.label('Waiting:')} ${h.task} — ${h.hold.held}, on ${h.hold.credential}`);
   }
   if (offerOverride) {
-    console.log(`  Let one task's next turn through: ${theme.command('lazy resume <task> --past-usage-pause')} ` +
+    console.log(`  Let one task's next turn through: ${theme.command('lazy resume <task> --override-usage-pause')} ` +
       `(also on start, unblock, review, ask), or ${theme.command(`lazy daemon config set ${USAGE_PAUSE_OVERRIDE_KEY} off --task <task>`)}`);
     console.log(`  Let one launch beside any task through: ${theme.command(`lazy daemon config set ${USAGE_PAUSE_OVERRIDE_KEY} off`)}`);
   }
@@ -304,7 +304,7 @@ launch BESIDE any task (a one-shot such as lazy report, a chat, a review
 conversation) that it lets past a pause, and then lazy.toml applies again.
 With --task <task> it is instead that task's allowance: its next turn starts past
 the pause, whichever launch that is (lazy start/unblock/resume/review/ask also
-take --past-usage-pause for the same thing).
+take --override-usage-pause for the same thing).
 
 Subcommands:
   get                    Show the cap: configured value, ephemeral override,

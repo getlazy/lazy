@@ -30,6 +30,8 @@ import {
   localBranchExists,
   branchExists,
   recoverMissingWorktree,
+  WORKTREE_ADD_TIMEOUT,
+  describeWorktreeAddFailure,
 } from '../../git/operations';
 import { runGit } from '../../utils/git';
 import { createRunner } from '../../runner';
@@ -395,10 +397,10 @@ async function checkOrphanedWorktree(
         await ensureLazyExcludeBestEffort(root);
         const result = await runGit(
           ['worktree', 'add', worktreePath, session.git_branch],
-          { cwd: root },
+          { cwd: root, timeout: WORKTREE_ADD_TIMEOUT },
         );
         if (result.exitCode !== 0) {
-          console.log(theme.error(`    Failed to re-register worktree: ${result.stderr.trim()}`));
+          console.log(theme.error(`    Failed to re-register worktree: ${describeWorktreeAddFailure(result.stderr, worktreePath, session.git_branch)}`));
           return;
         }
         console.log(theme.success('    Re-registered worktree'));

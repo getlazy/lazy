@@ -32,7 +32,7 @@ import { startDaemonServer, type RunningDaemon } from '../../src/daemon/server';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { pinConfig } from '../helpers/pin-config';
 import { makeDaemonBaseDir, pinDaemonBaseDir, removeDaemonBaseDir } from '../helpers/daemon-base-dir';
-import { findFullTaskId, taskFilePath } from '../helpers/storage';
+import { findFullTaskId, setTaskStatus, taskFilePath } from '../helpers/storage';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { expectSuccess } from '../helpers/assertions';
 import {
@@ -84,6 +84,11 @@ describe('per-task MCP token identity', () => {
     taskBShort = await createTask(ctx, 'Task B');
     taskAId = findFullTaskId(ctx.root, taskAShort);
     taskBId = findFullTaskId(ctx.root, taskBShort);
+    // Both tasks are mid-turn: a task's token acts only for the turn that is
+    // running (src/daemon/mcp-turn-authority.ts), and this suite is about WHICH
+    // task a token may act as, so the turn gate must not be what refuses.
+    setTaskStatus(ctx.root, taskAShort, 'working');
+    setTaskStatus(ctx.root, taskBShort, 'working');
 
     tokenA = await mintMcpToken(ctx.root, { kind: 'task', taskId: taskAId }, 'lazy-a');
     tokenB = await mintMcpToken(ctx.root, { kind: 'task', taskId: taskBId }, 'lazy-b');

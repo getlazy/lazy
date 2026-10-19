@@ -1,7 +1,7 @@
 /**
  * Invariant tests for accept's merge-routing decision.
  *
- * Background (CLAUDE.md invariants):
+ * Background (AGENTS.md invariants):
  *   - "PRs only for protected branches."
  *   - "Subtask→parent merges should be local git operations, not remote MRs."
  *
@@ -31,6 +31,9 @@ let mockParent: any = null;
 let mockSession: any = null;
 let mockCommits: any[] = [];
 let remoteProtected = false;
+/** Accept step 1e: whether fetching the task branch throws, and what ls-remote answers then. */
+let taskBranchFetchFails = false;
+let lsRemoteExit = 2;
 // When true, createDriver returns a LocalDriver (needsSync === false), simulating
 // lazy configured offline/local — there is no remote, so accept must push nothing.
 let localConfigDriver = false;
@@ -99,6 +102,12 @@ await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => {
     // and the recording remote driver otherwise — mirroring the real factory.
     createDriver: () => localConfigDriver ? new LocalDriver() : ({
       needsSync: true,
+      // Origin has nothing the task lacks (accept step 1e), unless a test says
+      // the fetch fails.
+      fetchBranch: async () => {
+        if (taskBranchFetchFails) throw new Error('fatal: could not read from remote repository');
+        return false;
+      },
       validateAccept: () => { remoteCalls.push('validateAccept'); return null; },
       hasRemoteRef: () => true,
       hasExternalApproval: async () => true,
@@ -146,7 +155,9 @@ await mockModule(resolve(import.meta.dir, '../../src/utils/pairing-lock.ts'), ()
 
 await mockModule(resolve(import.meta.dir, '../../src/utils/git.ts'), () => ({
   validateBranchInSyncWithRemote: async () => ({ inSync: true }),
-  runGit: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+  runGit: async (args: string[]) => args[0] === 'ls-remote'
+    ? { stdout: '', stderr: lsRemoteExit === 2 ? '' : 'fatal: unable to access origin', exitCode: lsRemoteExit }
+    : { stdout: '', stderr: '', exitCode: 0 },
 }));
 
 await mockModule(resolve(import.meta.dir, '../../src/utils/lock.ts'), () => ({
@@ -278,6 +289,32 @@ describe('acceptTask: merge routing (PRs only for protected branches)', () => {
     remoteProtected = false;
     localConfigDriver = false;
     mockParent = null;
+    taskBranchFetchFails = false;
+    lsRemoteExit = 2;
+  });
+
+  // INVARIANT: accept never squashes past an origin it could not ask about the
+  // task branch. The squash reads the LOCAL branch, so commits pushed to the
+  // task from elsewhere would be silently left out; only a branch the remote
+  // says is ABSENT (ls-remote exit 2) is safe to accept past.
+  test('a task-branch fetch failure with an unreachable remote refuses before any merge', async () => {
+    taskBranchFetchFails = true;
+    lsRemoteExit = 128;
+    remoteProtected = true;
+    mockTask = makeTask({ kind: 'branch', branch: 'main' });
+    const err = await acceptTask('/tmp/test', { taskId: 'child-task' }).then(() => null, (e: unknown) => e);
+    expect((err as { remedy?: { reason?: string } })?.remedy?.reason).toBe('task-branch-origin-unreachable');
+    expect(remoteCalls).not.toContain('merge');
+    expect(localMergeTargets).toEqual([]);
+  });
+
+  test('a task-branch fetch failure for a branch the remote does not have still accepts', async () => {
+    taskBranchFetchFails = true;
+    lsRemoteExit = 2;
+    remoteProtected = true;
+    mockTask = makeTask({ kind: 'branch', branch: 'main' });
+    const result = await acceptTask('/tmp/test', { taskId: 'child-task' });
+    expect(result.status).toBe('merged');
   });
 
   // INVARIANT: PRs only for protected branches / subtask→parent merges are local,

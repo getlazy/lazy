@@ -33,12 +33,16 @@ import {
 } from './toml-edit';
 import {
   BUILDER_PROFILE_NAME,
+  defaultCredentialFor,
+  NO_CREDENTIAL,
+  wireForProfile,
   DEFAULT_AGENT_PROFILE_NAME,
   HARNESS_WIRES,
   resolveAgentProfiles,
   type AgentProfileConfig,
 } from './agent-profiles';
 import { DEFAULT_OPENAI_UPSTREAM } from '../utils/openai-compat';
+import { isLocalEndpoint } from '../utils/endpoint';
 
 /**
  * The endpoint the removed `[ollama]` block and `backend = "ollama"` defaulted
@@ -107,7 +111,32 @@ function draftLines(draft: ProfileDraft): string[] {
     `harness = ${JSON.stringify(draft.harness)}`,
     ...(draft.model ? [`model = ${JSON.stringify(draft.model)}`] : []),
     ...(draft.endpoint ? [`endpoint = ${JSON.stringify(draft.endpoint)}`] : []),
+    ...(draft.endpoint ? [`credential = ${JSON.stringify(draftCredential(draft))}`] : []),
   ];
+}
+
+/**
+ * The credential a migrated profile with an endpoint must now name (every
+ * endpoint names its credential). Written out rather than invented: it is the
+ * provider of the endpoint's own host, or `none` for a local server. A host
+ * that is neither never reaches here — {@link credentialBlocker} stops the
+ * migration and asks the user to name it, since the legacy config would have
+ * spent the wire default there and lazy no longer guesses.
+ */
+function draftCredential(draft: ProfileDraft): string {
+  const wire = wireForProfile(draft.harness, draft.endpoint);
+  return defaultCredentialFor(draft.harness, 'error' in wire ? 'anthropic' : wire.wire, draft.endpoint);
+}
+
+/** A blocker when the draft's endpoint is neither local nor a provider's own host. */
+function credentialBlocker(draft: ProfileDraft, where: string): string | null {
+  if (!draft.endpoint || isLocalEndpoint(draft.endpoint) || draftCredential(draft) !== NO_CREDENTIAL) return null;
+  return (
+    `${where} points at ${draft.endpoint}, which is neither this machine nor a provider lazy knows, and ` +
+    `every endpoint must now name the credential that pays it — lazy will not guess. Write the ` +
+    `[agents.${draft.name}] block by hand with credential = "<name>" (then \`lazy auth set <name>\`, ` +
+    `or credential = "anthropic" if that host really takes your Anthropic key), and re-run.`
+  );
 }
 
 function applyDraft(content: string, draft: ProfileDraft): string {
@@ -115,6 +144,7 @@ function applyDraft(content: string, draft: ProfileDraft): string {
   let updated = setSectionString(content, section, 'harness', draft.harness);
   if (draft.model) updated = setSectionString(updated, section, 'model', draft.model);
   if (draft.endpoint) updated = setSectionString(updated, section, 'endpoint', draft.endpoint);
+  if (draft.endpoint) updated = setSectionString(updated, section, 'credential', draftCredential(draft));
   return updated;
 }
 
@@ -204,6 +234,11 @@ export function planAgentMigration(content: string): AgentMigrationPlan {
     }
 
     const draft: ProfileDraft = { name, harness, model, endpoint };
+    const roleBlocker = credentialBlocker(draft, `[models.roles.${role}]`);
+    if (roleBlocker) {
+      blockers.push(roleBlocker);
+      continue;
+    }
     steps.push({
       found: `[models.roles.${role}] ${found.map(k => `${k} = ${JSON.stringify(stringAt(table, k))}`).join(', ')}`,
       becomes: [...draftLines(draft), '', `[models.roles.${role}]`, `agent = ${JSON.stringify(name)}`],
@@ -253,11 +288,13 @@ export function planAgentMigration(content: string): AgentMigrationPlan {
       );
     } else {
       const draft: ProfileDraft = { name, harness, model, endpoint };
-      steps.push({
+      const ollamaBlocker = credentialBlocker(draft, '[ollama]');
+      if (ollamaBlocker) blockers.push(ollamaBlocker);
+      else steps.push({
         found: `[ollama] endpoint = ${JSON.stringify(endpoint)}`,
         becomes: [...draftLines(draft), '', '[agent]', `agent_id = ${JSON.stringify(name)}`],
       });
-      try {
+      if (!ollamaBlocker) try {
         updated = applyDraft(updated, draft);
         updated = setSectionString(updated, 'agent', 'agent_id', name);
         updated = removeSection(updated, 'ollama');
@@ -298,11 +335,13 @@ export function planAgentMigration(content: string): AgentMigrationPlan {
       );
     } else {
       const draft: ProfileDraft = { name: 'codex', harness: 'codex', model, endpoint: value };
-      steps.push({
+      const codexBlocker = credentialBlocker(draft, `[proxy] openai_upstream = ${JSON.stringify(value)}`);
+      if (codexBlocker) blockers.push(codexBlocker);
+      else steps.push({
         found: `[proxy] openai_upstream = ${JSON.stringify(value)}`,
         becomes: draftLines(draft),
       });
-      try {
+      if (!codexBlocker) try {
         updated = applyDraft(updated, draft);
         updated = removeSectionKey(updated, 'proxy', 'openai_upstream');
       } catch (err) {

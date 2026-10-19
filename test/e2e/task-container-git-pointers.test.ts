@@ -91,4 +91,69 @@ describe.skipIf(skip)('task container git pointers', () => {
     const after = await Promise.all([join(worktree, '.git'), join(gitdir, 'commondir'), join(gitdir, 'gitdir')].map((p) => readFile(p, 'utf-8')));
     expect(after).toEqual(before);
   }, 120_000);
+
+  test('pointer reads and git stay valid during concurrent launch preparation', async () => {
+    const { args } = await buildTaskGitMounts(repo, worktree);
+    const probe = await mkdtemp(join(worktree, '.pointer-probe-'));
+    const pointers = [join(worktree, '.git'), join(gitdir, 'commondir'), join(gitdir, 'gitdir')];
+    for (const [index, pointer] of pointers.entries()) {
+      await writeFile(join(probe, 'expected-' + index), await readFile(pointer, 'utf-8'));
+    }
+    const script = [
+      'exec 2> "' + probe + '/errors"',
+      "trap 'printf \"%s\\n\" \"$?\" > \"" + probe + "/exit-code\"' 0",
+      'while [ ! -f "' + probe + '/stop" ]; do',
+      ...pointers.flatMap((pointer, index) => [
+        '[ -f "' + pointer + '" ] && [ ! -L "' + pointer + '" ] || { echo "MISSING ' + pointer + '" >&2; exit 1; }',
+        'actual=$(cat "' + pointer + '") || exit 1',
+        'expected=$(cat "' + probe + '/expected-' + index + '") || exit 1',
+        '[ "$actual" = "$expected" ] || { echo "CHANGED ' + pointer + '" >&2; exit 1; }',
+      ]),
+      'git -c safe.directory="*" status --porcelain > /dev/null || exit 1',
+      'printf "." >> "' + probe + '/checks"',
+      'printf "ready" > "' + probe + '/ready"',
+      'done',
+    ].join('\n');
+    const started = Bun.spawnSync([
+      binary, 'run', '-d', '--rm', '--entrypoint', 'sh',
+      '-v', repo + ':' + repo + ':ro', '-v', worktree + ':' + worktree, ...args,
+      '-w', worktree, image, '-c', script,
+    ], { stdout: 'pipe', stderr: 'pipe' });
+    const container = started.stdout.toString().trim();
+    const waitFor = async (name: string): Promise<string> => {
+      const deadline = Date.now() + 20_000;
+      while (Date.now() < deadline) {
+        const content = await readFile(join(probe, name), 'utf-8').catch((error: NodeJS.ErrnoException) => {
+          if (error.code === 'ENOENT') return null;
+          throw error;
+        });
+        if (content !== null && content.length > 0) return content;
+        const errors = await readFile(join(probe, 'errors'), 'utf-8').catch(() => '');
+        if (errors) throw new Error('container pointer probe failed: ' + errors);
+        await Bun.sleep(20);
+      }
+      throw new Error('container pointer probe did not produce ' + name);
+    };
+    try {
+      expect(started.stderr.toString()).toBe('');
+      expect(started.exitCode).toBe(0);
+      await waitFor('ready');
+      const before = (await readFile(join(probe, 'checks'), 'utf-8')).length;
+      for (let launch = 0; launch < 100; launch++) {
+        await Promise.all(Array.from({ length: 4 }, () => buildTaskGitMounts(repo, worktree)));
+      }
+      const after = (await readFile(join(probe, 'checks'), 'utf-8')).length;
+      expect(after).toBeGreaterThan(before);
+      await writeFile(join(probe, 'stop'), 'stop');
+      expect((await waitFor('exit-code')).trim()).toBe('0');
+      expect(await readFile(join(probe, 'errors'), 'utf-8')).toBe('');
+      for (const [index, pointer] of pointers.entries()) {
+        expect(await readFile(pointer, 'utf-8')).toBe(await readFile(join(probe, 'expected-' + index), 'utf-8'));
+      }
+    } finally {
+      if (container) Bun.spawnSync([binary, 'stop', '-t', '0', container], { stdout: 'ignore', stderr: 'ignore' });
+      await rm(probe, { recursive: true, force: true });
+    }
+  }, 120_000);
+
 });

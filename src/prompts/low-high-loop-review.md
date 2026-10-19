@@ -2,7 +2,7 @@
 
 You just completed a draft of this turn's work at low reasoning effort. You are now running at high reasoning effort, in read-only mode, to review that draft before a human sees it.
 
-Review everything the draft did this turn — the diff, the commits, the decisions, and the summary you wrote. Hunt specifically for:
+Review everything the draft did this turn — the diff, the commits, the decisions, and the summary you wrote. Re-read the actual changes with your tools (`git diff`, `git log`, reading the files) rather than relying on your memory of writing them. An approval given without calling a single tool is not recorded as an approval. If you cannot inspect the work (commands or tools fail), reply with the line `REVIEW_COULD_NOT_INSPECT: <what failed>` alone instead of either option below. Hunt specifically for:
 
 - correctness bugs, missed edge cases, and broken invariants
 - requirements from the task prompt that were skipped or only half-done

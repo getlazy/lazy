@@ -77,6 +77,19 @@ function codexAuthJson(overrides: Record<string, unknown> = {}): string {
 }
 
 describe('chatgpt token parsing', () => {
+  // INVARIANT: credential syntax errors never echo access/refresh token bytes.
+  test('malformed token JSON keeps source guidance without parser secret context', () => {
+    const secret = 'synthetic_chatgpt_secret_never_echo';
+    let error: Error | undefined;
+    try { parseChatGptTokens(`{"tokens":{"refresh_token":${secret}}}`, 'fixture'); }
+    catch (err) { error = err as Error; }
+    expect(error).toBeInstanceOf(Error);
+    expect(error!.message).toContain('fixture is not valid JSON');
+    expect(error!.message).toContain('codex login');
+    expect(error!.message).not.toContain(secret);
+    expect(error!.stack).not.toContain(secret);
+  });
+
   test('reads a verbatim ~/.codex/auth.json', () => {
     const tokens = parseChatGptTokens(codexAuthJson(), 'fixture');
     expect(tokens.refreshToken).toBe('rt-original');
@@ -440,7 +453,7 @@ describe('resolveChatGptSession', () => {
     await writeFile(
       join(root, 'lazy.toml'),
       '[credentials]\nbackend = "file"\n\n[agents.codex-sub]\nharness = "codex"\n' +
-      'model = "gpt-5.6-sol"\nendpoint = "https://chatgpt.com/backend-api/codex"\n\n' +
+      'model = "gpt-5.6-sol"\nendpoint = "https://chatgpt.com/backend-api/codex"\ncredential = "chatgpt"\n\n' +
       '[agent]\nagent_id = "codex-sub"\n',
       'utf-8',
     );
@@ -470,7 +483,7 @@ describe('resolveChatGptSession', () => {
   // INVARIANT: the environment wins over the store, as for every credential —
   // and lazy refreshes it in memory but must NOT write it back. Silently moving
   // a credential out of the variable the user exported and into the store is
-  // exactly the hidden side effect CLAUDE.md forbids.
+  // exactly the hidden side effect AGENTS.md forbids.
   test('the env var overrides the store and is never written back', async () => {
     const stored = parseChatGptTokens(codexAuthJson(), 'fixture');
     await setCredential(

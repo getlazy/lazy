@@ -571,6 +571,20 @@ describe('presentation screenshots', () => {
     ).toThrow(/SVG/);
   });
 
+  // INVARIANT: the screenshot check compares the NORMALIZED type against an
+  // allowlist — the stored MIME is agent-supplied, and a parameter or a case
+  // change must not turn SVG into "not SVG".
+  test('assertScreenshotsResolvable rejects SVG spelled with parameters or in another case, and non-raster images', () => {
+    for (const mime of ['image/svg+xml; charset=utf-8', 'image/SVG+xml', 'image/x-icon']) {
+      expect(() =>
+        assertScreenshotsResolvable([{ artifact: 'a' }], [{ name: 'a', mime_type: mime }]),
+      ).toThrow();
+    }
+    expect(() =>
+      assertScreenshotsResolvable([{ artifact: 'a' }], [{ name: 'a', mime_type: 'IMAGE/PNG' }]),
+    ).not.toThrow();
+  });
+
   test('assertScreenshotsResolvable accepts an attached raster image', () => {
     expect(() =>
       assertScreenshotsResolvable(

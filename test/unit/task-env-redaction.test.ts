@@ -18,7 +18,7 @@ import {
   taskEnvKeysEnv,
 } from '../../src/daemon/task-env';
 import { getDaemonDir, getTaskEnvPath } from '../../src/daemon/paths';
-import { redactSecretValues, setRegisteredSecretValues, TASK_ENV_KEYS_VAR, REDACTED } from '../../src/utils/redact';
+import { redactSecretValues, registeredSecretSources, setRegisteredSecretValues, TASK_ENV_KEYS_VAR, REDACTED } from '../../src/utils/redact';
 import { writeFile } from 'fs/promises';
 
 const VALUE = 'stripe-sandbox-value-0123456789';
@@ -36,7 +36,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  setRegisteredSecretValues('task-env', []);
+  for (const s of registeredSecretSources()) setRegisteredSecretValues(s, []);
   if (prevBaseDir === undefined) delete process.env.LAZY_DAEMON_BASE_DIR;
   else process.env.LAZY_DAEMON_BASE_DIR = prevBaseDir;
   await rm(base, { recursive: true, force: true });

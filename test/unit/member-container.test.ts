@@ -27,6 +27,7 @@ afterEach(async () => {
   await rm(baseDir, { recursive: true, force: true });
 });
 import {
+  memberContainerCommand,
   buildMemberContainerDockerArgs,
   prepareMemberHome,
   memberHomesDir,
@@ -49,7 +50,7 @@ import {
   type MemberContainerArgsParams,
 } from '../../src/daemon/member-container';
 import { MEMBER_EXEC_CREDENTIAL_KEYS } from '../../src/server/member-exec-credential';
-import { mkdtemp, mkdir, rm, realpath, writeFile, readFile, readdir, symlink } from 'fs/promises';
+import { mkdtemp, mkdir, rm, realpath, writeFile, readFile, readdir, symlink, chmod } from 'fs/promises';
 import { encodeProjectPath } from '../../src/import/claude-code-logs';
 import { pathExists } from '../../src/utils/fs';
 import { tmpdir } from 'os';
@@ -70,6 +71,8 @@ const PARAMS: MemberContainerArgsParams = {
   homeDir: '/tmp/lazy-member-home-abc123',
   agentBinaryPath: '/home/me/.lazy/bin/lazy-agent',
   gitMountArgs: ['-v', '/projects/demo/.git:/projects/demo/.git:ro', '-v', '/projects/demo/.git/objects:/projects/demo/.git/objects', '-v', '/projects/demo/.git/worktrees/some-task:/projects/demo/.git/worktrees/some-task'],
+  adoptPaths: [WORKTREE, '/projects/demo/.git/worktrees/some-task', '/projects/demo/.git/objects'],
+  readOnlyPaths: [`${WORKTREE}/.git`],
   customMountArgs: [],
   runArgs: [],
   credentialEnv: [
@@ -153,6 +156,18 @@ describe('the member container argv', () => {
     expect(cmd.slice(0, 2)).toEqual(['sh', '-c']);
     expect(cmd[2]).toEndWith('exec sleep infinity');
     expect(cmd[2]).not.toContain('lazy-agent');
+  });
+
+  // INVARIANT: the member container takes ownership of the task worktree (and
+  // its git dirs) when it cannot write them, never widening modes. Under a
+  // root daemon a fresh worktree is root-owned, and a services script run
+  // before any turn could not create log/development.log.
+  test('adopts the worktree and git dirs, skipping the read-only pointer copies', () => {
+    const script = argv[argv.indexOf(PARAMS.imageName) + 3]!;
+    for (const p of PARAMS.adoptPaths) expect(script).toContain(`"${p}"`);
+    expect(script).toContain(`! -path "${WORKTREE}/.git"`);
+    expect(script).toContain('chown -h "$(id -u):$(id -g)"');
+    expect(script).not.toMatch(/chmod|o\+w|777/);
   });
 });
 
@@ -331,6 +346,38 @@ describe('launchMemberContainer', () => {
     containerAddress: async () => '172.30.0.7',
   });
 
+  test('opening a terminal restores an adopted task checkout without running a turn', async () => {
+    await withTask(async (root, task) => {
+      const git = (args: string[]) => {
+        const result = Bun.spawnSync(['git', ...args], {
+          cwd: root,
+          env: { ...process.env, GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.com', GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.com' },
+          stdout: 'pipe', stderr: 'pipe',
+        });
+        if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+      };
+      git(['init', '-q', '-b', 'main']);
+      await writeFile(join(root, 'tracked.txt'), 'task files\n');
+      git(['add', 'tracked.txt']);
+      git(['commit', '-qm', 'initial']);
+      git(['branch', 'imported/task-branch']);
+      await rm(getWorktreePath(root, task), { recursive: true });
+      task.status = 'blocked';
+      const messages: string[] = [];
+      const result = await launchMemberContainer({
+        projectRoot: root, storage: { listTaskArtifacts: async () => [] } as unknown as Storage,
+        task, session: { ...session, git_branch: 'imported/task-branch' },
+        memberEmail: 'alice@example.com', binary: 'docker', notify: message => messages.push(message),
+        deps: { ...baseDeps([]), run: async () => ({ exitCode: 0, stderr: '' }) },
+      });
+      if (!result.ok) throw new Error(result.message);
+      expect(await readFile(join(getWorktreePath(root, task), 'tracked.txt'), 'utf8')).toBe('task files\n');
+      expect(task.status).toBe('blocked');
+      expect(messages).toContain('Restoring task files…');
+      await result.container.remove();
+    });
+  });
+
   test("its docker run is on the members' network alone, whatever run_args name", async () => {
     await withTask(async (root, task) => {
       await writeFile(join(root, 'lazy.toml'), '[docker]\nrun_args = ["--network", "bridge", "-p", "3000:3000", "--add-host=api.anthropic.com:10.0.0.9", "--memory=4g"]\n');
@@ -346,6 +393,34 @@ describe('launchMemberContainer', () => {
       expect(argv).not.toContain('-p');
       expect(argv.some((a) => a.includes('api.anthropic.com'))).toBe(false);
       expect(argv).toContain('--memory=4g');
+    });
+  });
+
+  // INVARIANT: the container's adopt step (run on every terminal attach) execs
+  // the SAME ownership script the container starts with, over the real worktree
+  // and git dirs, and a failure is thrown with its stderr, never swallowed.
+  test('adopt() execs the ownership script in the running container and surfaces a failure', async () => {
+    await withTask(async (root, task) => {
+      const runs: string[][] = [];
+      let exitCode = 0;
+      const r = await launchMemberContainer({
+        projectRoot: root, storage: { listTaskArtifacts: async () => [] } as unknown as Storage, task, session, memberEmail: 'alice@example.com', binary: 'docker',
+        deps: { ...baseDeps([]), run: async (argv) => { runs.push(argv); return { exitCode, stderr: exitCode ? 'sudo: a password is required' : '' }; } },
+      });
+      if (!r.ok) throw new Error(r.message);
+      const run = runs[0]!;
+      const startup = run[run.indexOf('sh') + 2]!;
+      await r.container.adopt!();
+      const exec = runs[1]!;
+      expect(exec.slice(0, 3)).toEqual(['docker', 'exec', r.container.name]);
+      expect(exec.slice(3, 5)).toEqual(['sh', '-c']);
+      expect(exec[5]).toContain('sudo -n find');
+      expect(exec[5]).toContain(`"${join(root, '.lazy', 'worktrees', 'some-task')}"`);
+      expect(startup.startsWith(exec[5]!)).toBe(true);
+      exitCode = 1;
+      await expect(r.container.adopt!()).rejects.toThrow('a password is required');
+      exitCode = 0;
+      await r.container.remove();
     });
   });
 
@@ -1044,3 +1119,55 @@ test('the daemon hands back leftover member homes at startup, before the reconci
   expect(run).toBeLessThan(server.indexOf('startDaemonReconcileLoop(projectRoot'));
 });
 
+// INVARIANT: the member container's startup command EXECUTES correctly: it asks
+// sudo to chown a worktree it cannot write (skipping read-only pointer copies)
+// and leaves a writable one alone. access(2) always succeeds for root, so the
+// probe cannot be exercised there.
+describe('memberContainerCommand executed', () => {
+  const asRoot = process.getuid?.() === 0;
+
+  async function run(adopt: string[], ro: string[], dir: string): Promise<string> {
+    const bin = join(dir, 'bin');
+    await mkdir(bin, { recursive: true });
+    const log = join(dir, 'sudo.log');
+    await writeFile(join(bin, 'sudo'), `#!/bin/sh\necho "$@" >> "${log}"\n`, { mode: 0o755 });
+    // The script adopts the container user's home too (/home/user/.claude and
+    // .claude.json). Point it at an empty home under `dir`: on a machine whose
+    // own /home/user/.claude has a read-only entry (a mounted credential) the
+    // real one would answer for the test.
+    const script = memberContainerCommand(adopt, ro)
+      .replace('exec sleep infinity', 'true')
+      .replaceAll('"/home/user/', `"${join(dir, 'home')}/`);
+    expect(script).not.toContain('/home/user/');
+    const proc = Bun.spawn(['sh', '-c', script], { env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, stdout: 'ignore', stderr: 'pipe' });
+    expect(await proc.exited).toBe(0);
+    return (await pathExists(log)) ? await readFile(log, 'utf8') : '';
+  }
+
+  test.skipIf(asRoot)('chowns a worktree with unwritable entries, skipping read-only paths', async () => {
+    const dir = await realpath(await mkdtemp(join(tmpdir(), 'lzd-adopt-')));
+    try {
+      const wt = join(dir, 'wt');
+      await mkdir(join(wt, 'log'), { recursive: true });
+      await chmod(join(wt, 'log'), 0o555);
+      const out = await run([wt], [join(wt, '.git')], dir);
+      expect(out).toContain(`find ${wt}`);
+      expect(out).toContain(`! -path ${join(wt, '.git')}`);
+      expect(out).toContain('chown -h');
+    } finally {
+      await chmod(join(dir, 'wt', 'log'), 0o755).catch(() => {});
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('does nothing for a writable worktree', async () => {
+    const dir = await realpath(await mkdtemp(join(tmpdir(), 'lzd-adopt-')));
+    try {
+      const wt = join(dir, 'wt');
+      await mkdir(join(wt, 'log'), { recursive: true });
+      expect(await run([wt], [], dir)).toBe('');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});

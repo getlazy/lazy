@@ -51,7 +51,7 @@
  */
 
 import { extractSummary } from './claude-code-logs';
-import { isHousekeepingCommandName, isLocalCommandScaffolding } from './local-command-messages';
+import { isHousekeepingCommandName, isConversationNoise } from './local-command-messages';
 import type { Storage } from '../storage/interface';
 import type { StoredConversation } from '../storage/types';
 
@@ -97,7 +97,7 @@ export interface LocalCommandCleanupResult {
  */
 export function planConversationCleanup(stored: StoredConversation): LocalCommandCleanupItem | null {
   const kept = stored.messages.filter(
-    m => !(m.role === 'user' && isLocalCommandScaffolding(m.text)),
+    m => !(m.role === 'user' && isConversationNoise(m.text)),
   );
   const removed = stored.messages.length - kept.length;
   if (removed === 0) return null;
@@ -134,6 +134,18 @@ export function planConversationCleanup(stored: StoredConversation): LocalComman
   };
 
   return { ...base, cleaned };
+}
+
+export function conversationForReading(stored: StoredConversation): StoredConversation {
+  const cleanup = planConversationCleanup(stored);
+  if (!cleanup) return stored;
+  if (cleanup.cleaned) return cleanup.cleaned;
+  return {
+    ...stored,
+    messages: [],
+    summary: '',
+    stats: { ...stored.stats, messageCount: 0, userMessageCount: 0, assistantMessageCount: 0 },
+  };
 }
 
 /** Plan the cleanup across a whole store's worth of conversations, in input order. */

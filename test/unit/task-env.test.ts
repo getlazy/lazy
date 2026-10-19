@@ -137,6 +137,45 @@ describe('per-task env: store', () => {
     await rm(base, { recursive: true, force: true });
   });
 
+  // INVARIANT: the per-task env registry and the new-task seed are replaced by
+  // rename, never rewritten in place. A write torn by a crash left an
+  // unparseable task-env.json that failed every launch of the project and left
+  // values unscrubbed after a restart, and a torn seed failed the `list` Teams
+  // calls before every re-save, so nothing could rewrite it. A hard link to the
+  // old file keeps the OLD bytes only when the write went to a new inode.
+  test('the registry and the seed are written atomically, 0600', async () => {
+    const { link } = await import('fs/promises');
+    const { setTaskEnvSeed } = await import('../../src/daemon/task-env-seed');
+    const { getTaskEnvSeedPath } = await import('../../src/daemon/paths');
+    await setTaskEnv(root, 'task-1', { TOKEN: 'first' });
+    await setTaskEnvSeed(root, { SEEDED: 'first' }, []);
+    for (const path of [getTaskEnvPath(root), getTaskEnvSeedPath(root)]) {
+      await link(path, `${path}.old`);
+    }
+    await setTaskEnv(root, 'task-1', { TOKEN: 'second' });
+    await setTaskEnvSeed(root, { SEEDED: 'second' }, []);
+    for (const path of [getTaskEnvPath(root), getTaskEnvSeedPath(root)]) {
+      expect(await readFile(`${path}.old`, 'utf-8')).toContain('first');
+      expect(await readFile(path, 'utf-8')).toContain('second');
+      expect((await stat(path)).mode & 0o777).toBe(0o600);
+    }
+  });
+
+  // INVARIANT: a new-task environment the scrubber cannot hold is refused
+  // BEFORE it is written. Stored first, it made every later read throw: new
+  // tasks got no always entries and Teams, which lists the seed before every
+  // re-save, could never replace it.
+  test('a seed too large to scrub is refused and the previous seed stays', async () => {
+    const { setTaskEnvSeed, listTaskEnvSeed } = await import('../../src/daemon/task-env-seed');
+    const { getTaskEnvSeedPath } = await import('../../src/daemon/paths');
+    await setTaskEnvSeed(root, { KEPT: 'kept-value-123456' }, []);
+    const before = await readFile(getTaskEnvSeedPath(root), 'utf-8');
+    const lines = Array.from({ length: 4200 }, (_, i) => `line-${i}-abcdefghijkl`).join('\n');
+    await expect(setTaskEnvSeed(root, {}, [{ path: 'big.txt', contents: lines }])).rejects.toThrow(/too many distinct secret/);
+    expect(await readFile(getTaskEnvSeedPath(root), 'utf-8')).toBe(before);
+    expect((await listTaskEnvSeed(root)).keys).toEqual(['KEPT']);
+  });
+
   // INVARIANT: every task container bind-mounts the project root read-only, so
   // a secret written under <project>/.lazy would be readable by every OTHER
   // task's agent — the exact isolation this feature provides. The registry must

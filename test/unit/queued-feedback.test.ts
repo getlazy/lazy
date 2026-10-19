@@ -31,6 +31,18 @@ describe('queuedHumanFeedbackCount', () => {
     expect(n).toBe(4);
   });
 
+  // INVARIANT: feedback saved while a launch was refused (a withheld turn) is undelivered
+  // human feedback; accept must count it until an unblock delivers it and clears the flag.
+  test('counts withheld feedback turns until delivered', () => {
+    const base = { session: null, comments: [], pendingReviewComments: 0 };
+    const turns = [
+      { role: 'human', feedback_withheld: true },
+      { role: 'human' },
+      { role: 'agent' },
+    ] as never;
+    expect(queuedHumanFeedbackCount({ ...base, turns })).toBe(1);
+  });
+
   test('a person-attributed human actor counts', () => {
     expect(isHumanFeedbackComment(c({ actor: { role: 'human', email: 'a@b' } as never }))).toBe(true);
   });

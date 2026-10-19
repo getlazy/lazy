@@ -13,6 +13,7 @@ import { getOrCreateStorage } from './rpc-handlers';
 import { handleBuilderSlot, handleGetDaemonMcpConfig } from './rpc-handlers';
 import { assembleReviewPreamble } from './review-session-preamble';
 import { loadConfig } from '../config/loader';
+import type { ResolvedConfig } from '../config/types';
 import { createRunner } from '../runner';
 import { assembleBuilderSystemPrompt } from '../builder/system-prompt';
 import type { LaunchBuilderHeadlessParams } from '../runner/types';
@@ -30,8 +31,9 @@ import {
   planTurnCredential,
   releaseTurnCredential,
   TurnCredentialUnavailableError,
+  sideLaunchCredentialProblem,
 } from './turn-credentials';
-import { teamModeEnabled, getUserCredential } from './user-credentials';
+import { teamModeEnabled } from './user-credentials';
 import { actorEmail } from '../actor-ref';
 import type { ActorInput } from '../types';
 import { logger } from '../utils/logger';
@@ -66,9 +68,11 @@ export type ReviewSessionTurnLauncher = (
 export async function assertReviewSessionActorCredential(
   projectRoot: string,
   actor?: ActorInput,
+  effectiveConfig?: ResolvedConfig,
 ): Promise<void> {
   if (!(await teamModeEnabled(projectRoot))) return;
 
+  const config = effectiveConfig ?? await loadConfig(projectRoot);
   const ownerEmail = actorEmail(actor);
   if (!ownerEmail) {
     throw new TurnCredentialUnavailableError(
@@ -76,13 +80,8 @@ export async function assertReviewSessionActorCredential(
       `(actor token naming a person). Connect your Claude account and retry.`,
     );
   }
-  const credential = await getUserCredential(projectRoot, ownerEmail);
-  if (!credential) {
-    throw new TurnCredentialUnavailableError(
-      `${NO_OWNER_CREDENTIAL_MARKER}: this review-session turn was initiated by user '${ownerEmail}', ` +
-      `who has no Anthropic credential stored in this daemon. Connect your Claude account and retry.`,
-    );
-  }
+  const refusal = await sideLaunchCredentialProblem(projectRoot, ownerEmail, config.models.roles.builder.profile, config);
+  if (refusal) throw new TurnCredentialUnavailableError(refusal);
 }
 
 /** Full builder system prompt — same substitutions as `lazy builder`. */
@@ -116,13 +115,14 @@ export async function buildReviewSessionBuilderSystemPrompt(
  */
 export async function withReviewSessionCredential<T>(
   projectRoot: string,
-  input: { reviewSessionId: string; ownerEmail: string | null | undefined },
+  input: { reviewSessionId: string; ownerEmail: string | null | undefined; builderProfile?: string; config?: ResolvedConfig },
   fn: (credEnv: Array<{ key: string; value: string }> | null) => Promise<T>,
 ): Promise<T> {
   const key = `review-session:${input.reviewSessionId}:${randomUUID()}`;
   try {
     let credEnv: Array<{ key: string; value: string }> | null = null;
     if (input.ownerEmail) {
+      const config = input.config ?? await loadConfig(projectRoot);
       // The reviewer PAYS for their own conversation, and that is all this
       // launch says about them: it is a spender, not the task's turn owner,
       // which decides a NAME as well as a credential. A review session id is
@@ -133,6 +133,8 @@ export async function withReviewSessionCredential<T>(
         taskId: key,
         sessionId: input.reviewSessionId,
         spender: { email: input.ownerEmail },
+        spenderProfile: input.builderProfile ?? config.models.roles.builder.profile,
+        config,
       });
       credEnv = credentialEnvForPlan(plan);
     }
@@ -158,9 +160,8 @@ export async function launchReviewSessionBuilderTurn(
 ): Promise<ReviewSessionTurnLaunchResult> {
   const { projectRoot, reviewSessionId, prompt, resumeSessionId, actor } = input;
 
-  await assertReviewSessionActorCredential(projectRoot, actor);
-
   const config = await loadConfig(projectRoot);
+  await assertReviewSessionActorCredential(projectRoot, actor, config);
   const dataDirAbs = join(projectRoot, config.data.path);
   const builderId = randomUUID().split('-')[0]!;
   const daemonMcpName = `builder-${builderId}`;
@@ -188,7 +189,7 @@ export async function launchReviewSessionBuilderTurn(
     // the built-in name would send a pinned builder to the primary upstream.
     const identity = {
       role: 'builder' as const, taskId: null, label: `review-session:${builderId}`,
-      profile: builderTarget.profile,
+      profile: builderTarget.profile, projectRoot,
     };
     const runner = await createRunner(projectRoot);
     const systemPrompt = await buildReviewSessionBuilderSystemPrompt(projectRoot);
@@ -212,7 +213,7 @@ export async function launchReviewSessionBuilderTurn(
       }
     }
 
-    return await withReviewSessionCredential(projectRoot, { reviewSessionId, ownerEmail }, async (credEnv) => {
+    return await withReviewSessionCredential(projectRoot, { reviewSessionId, ownerEmail, builderProfile: builderTarget.profile, config }, async (credEnv) => {
       // The plan's credential goes THROUGH getLaunchAuthEnvVars as injectedCreds,
       // never around it: the proxy address, first-party flag and audit headers
       // come only from in there, and a builder handed a lazy-sess-… placeholder

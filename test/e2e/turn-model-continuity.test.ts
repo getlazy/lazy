@@ -130,7 +130,7 @@ async function readTaskRecord(ctx: TestContext, taskId: string): Promise<{ model
 }
 
 /** The turn invocations (probes excluded by the fake) the agent binary received. */
-async function turnInvocations(ctx: TestContext): Promise<Array<{ argv: string[] }>> {
+async function turnInvocations(ctx: TestContext): Promise<Array<{ argv: string[]; stdin?: string }>> {
   return (await ctx.claudeInvocations()).filter(i => {
     if (!i.argv.includes('-p')) return false;
     // The auto-review is a SEPARATE turn the daemon starts once a final
@@ -138,7 +138,7 @@ async function turnInvocations(ctx: TestContext): Promise<Array<{ argv: string[]
     // final turn's assertions run is a race (the shorter the wrap-up, the
     // likelier it has). This suite is about the WORK turn's invocations, so
     // the review's are filtered out rather than tolerated in the count.
-    const prompt = String(i.argv[1] ?? '');
+    const prompt = String(i.stdin ?? '');
     return !prompt.includes('Audience: a reviewer') && !prompt.includes('its verdict could not be read');
   });
 }
@@ -281,8 +281,8 @@ describe('turn model/effort continuity (real supervisor, fake claude)', () => {
     expect(thirdTurn.length).toBe(3);
     // Plan order, with the unconfigured steps absent: the maintain nudge, then
     // the presentation step.
-    expect(String(thirdTurn[1].argv[1])).toContain('did not touch');
-    expect(thirdTurn[2].argv[1]).toContain('presentation.groups');
+    expect(String(thirdTurn[1].stdin)).toContain('did not touch');
+    expect(thirdTurn[2].stdin).toContain('presentation.groups');
     for (const invocation of thirdTurn) {
       expect(flagValue(invocation.argv, '--model')).toBe(EDITED_MODEL);
       expect(flagValue(invocation.argv, '--effort')).toBe(EDITED_EFFORT);
@@ -385,8 +385,8 @@ describe('turn model/effort continuity (real supervisor, fake claude)', () => {
     const invocations = await turnInvocations(ctx);
     expect(invocations.length).toBe(4);
     const [work, review, revise] = invocations;
-    expect(String(review.argv[1])).toContain('## Self-Review (low-high loop)');
-    expect(String(revise.argv[1])).toContain('## Apply Self-Review Instructions (low-high loop)');
+    expect(String(review.stdin)).toContain('## Self-Review (low-high loop)');
+    expect(String(revise.stdin)).toContain('## Apply Self-Review Instructions (low-high loop)');
     for (const invocation of invocations) {
       expect(flagValue(invocation.argv, '--model')).toBe(EDITED_MODEL);
     }

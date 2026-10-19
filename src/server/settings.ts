@@ -25,13 +25,14 @@ import {
   type DoctorRemedyResult,
 } from '../doctor/remedies';
 
-export type SettingsSection = 'memory' | 'doctor';
+export type SettingsSection = 'memory' | 'services' | 'doctor';
 
 export function settingsTabsHtml(section: SettingsSection): string {
   const tab = (id: SettingsSection, href: string, label: string) =>
     `<a href="${escapeHtml(href)}" class="lz-tab${section === id ? ' lz-tab-current' : ''}"${section === id ? ' aria-current="page"' : ''}>${escapeHtml(label)}</a>`;
   return `<nav class="lz-tabs lz-settings-tabs" aria-label="Settings">
     ${tab('memory', '/settings/memory', 'Memories')}
+    ${tab('services', '/settings/services', 'Services')}
     ${tab('doctor', '/settings/doctor', 'Doctor')}
   </nav>`;
 }
@@ -44,7 +45,7 @@ export function settingsPageHtml(
 ): string {
   return layoutHtml(title, `
     <h1>Settings</h1>
-    <p class="text-muted lz-settings-intro">Project memory and installation health. Doctor runs the same checks as <code>lazy doctor</code>.</p>
+    <p class="text-muted lz-settings-intro">Project memory, services and installation health. Doctor runs the same checks as <code>lazy doctor</code>.</p>
     ${settingsTabsHtml(section)}
     ${bodyHtml}
     ${options?.extraHtml ?? ''}
@@ -359,4 +360,44 @@ export function doctorStreamCloseHtml(options: {
 
 export function doctorDialogEventLine(event: Record<string, unknown>): string {
   return JSON.stringify(event) + '\n';
+}
+
+/**
+ * Settings › Services: the project-wide Start services command — what a
+ * task's Start services runs. Designated here and never on a task's page
+ * (whose Services card links here as Configure services): what every task runs
+ * is not a control on one task. Saved to the project's store through the
+ * daemon, never lazy.toml. `command` is null when it could not be read, and
+ * `unavailable` when this dashboard has no way to save it.
+ */
+export function settingsServicesHtml(command: string | null, options?: { unavailable?: boolean; error?: string }): string {
+  let body: string;
+  if (options?.unavailable) {
+    body = `<p class="text-muted">The Start services command cannot be changed from this dashboard: it was started without a daemon serve-actions port.</p>`;
+  } else if (command === null) {
+    body = `<p class="text-muted" id="svc-settings-unreadable">The Start services command could not be read${options?.error ? `: ${escapeHtml(options.error)}` : '.'}</p>`;
+  } else {
+    const hasCmd = command.length > 0;
+    body = `<p id="svc-settings-current">${hasCmd
+      ? `Start services runs <code>${escapeHtml(command)}</code>.`
+      : 'No Start services command is designated yet, so no task offers Start services.'}</p>` +
+      `<form method="POST" action="/settings/services/start-cmd" class="svc-designate-form" id="svc-settings-form">` +
+      `<label class="svc-designate-label" for="svc-start-cmd">${hasCmd ? 'Change the command' : 'Command'}</label>` +
+      `<input type="text" class="input" name="command" id="svc-start-cmd" value="${escapeHtml(command)}"` +
+      ` placeholder="bin/dev" required autocomplete="off" spellcheck="false">` +
+      `<button type="submit" class="btn btn-sm">${hasCmd ? 'Save' : 'Save command'}</button>` +
+      `</form>` +
+      // Clear is its own POST form, offered only when there is a command to clear.
+      (hasCmd
+        ? `<form method="POST" action="/settings/services/start-cmd/clear" class="svc-designate-clear">` +
+          `<button type="submit" class="btn btn-sm">Clear command</button></form>`
+        : '');
+  }
+  return settingsPageHtml('Services — Settings', 'services', `
+    <section class="lz-settings-services" id="settings-services">
+      <h2>Services</h2>
+      <p class="rv-hint">Start services on a task runs this one command in that task's environment, where the
+        ports declared under <code>[serve]</code> are published. It is the same command for every task in this project.</p>
+      ${body}
+    </section>`);
 }

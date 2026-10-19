@@ -20,18 +20,12 @@
  * sees "waiting on the model" rather than a silent socket.
  */
 
-import { randomUUID } from 'crypto';
 import { createMemoryActions, getMemoryStorage } from './memory-service';
 import { actorEmail, actorRole } from '../actor-ref';
 import type { ActorInput } from '../types';
-import { teamModeEnabled, getUserCredential } from './user-credentials';
-import {
-  planTurnCredential,
-  credentialEnvForPlan,
-  releaseTurnCredential,
-  TurnCredentialUnavailableError,
-  NO_OWNER_CREDENTIAL_MARKER,
-} from './turn-credentials';
+import { teamModeEnabled } from './user-credentials';
+import { TurnCredentialUnavailableError } from './turn-credentials';
+import { oneshotCredentialProblem, withOneshotCredential } from './oneshot-credential';
 import { loadCompactContext } from '../memory/run-compact';
 import { memoryStatusPayload, compactRunSizeLine } from '../memory/context-status';
 import {
@@ -88,33 +82,22 @@ export async function withCompactCredential<T>(
   // Offline forces the mechanical generator: no model runs, nobody pays.
   if (offline) return fn(undefined);
 
-  const email = actorEmail(actor);
-  if (email && !(await getUserCredential(projectRoot, email))) {
+  const email = actorEmail(actor) ?? null;
+  // Checked up front, for the profile the compact RUNS ON: a refusal after the
+  // run began would waste it.
+  const problem = await oneshotCredentialProblem(projectRoot, email);
+  if (problem) {
     throw new RpcError(
       400,
-      `${NO_OWNER_CREDENTIAL_MARKER}: compacting memory with a model is billed to the person who ` +
-      `asked — user '${email}' has no Anthropic credential stored in this daemon. ` +
-      'Connect your Claude account and retry, or run a mechanical compact, which needs no model.',
+      `Compacting memory with a model is billed to the person who asked. ${problem} ` +
+      'Or run a mechanical compact, which needs no model.',
     );
   }
-  // A key of its own: a compact belongs to no task, and must never re-point a
-  // real task's binding.
-  const key = `oneshot:memory-compact:${randomUUID()}`;
   try {
-    let plan;
-    try {
-      plan = await planTurnCredential(projectRoot, {
-        taskId: key,
-        sessionId: key,
-        ...(email ? { spender: { email } } : {}),
-      });
-    } catch (err) {
-      if (err instanceof TurnCredentialUnavailableError) throw new RpcError(400, err.message);
-      throw err;
-    }
-    return await fn(credentialEnvForPlan(plan) ?? undefined);
-  } finally {
-    await releaseTurnCredential(projectRoot, key);
+    return await withOneshotCredential(projectRoot, 'memory-compact', email, fn);
+  } catch (err) {
+    if (err instanceof TurnCredentialUnavailableError) throw new RpcError(400, err.message);
+    throw err;
   }
 }
 

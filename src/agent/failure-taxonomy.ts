@@ -20,8 +20,8 @@
  *
  * `fatal_*`   — cannot heal without a human. Stop immediately.
  * `transient_*` — can heal on its own. Retry (see src/supervisor/retry-policy.ts).
- * `unknown`   — unclassifiable. Retried conservatively; the crash-loop
- *               detector remains the backstop for fast crash loops.
+ * `unknown`   — unclassifiable. Retried conservatively with a finite limit;
+ *               the crash-loop detector catches fast crash loops sooner.
  */
 export type AgentFailureClass =
   /** Missing/invalid/exhausted credential — 401, 403, invalid API key, billing. */
@@ -212,6 +212,17 @@ export function classifyCommonFailureSignals(
   agentBinaries: readonly string[],
 ): AgentFailure | null {
   const text = failureHaystack(input);
+
+  // The launch was too big to spawn — the kernel's E2BIG, or lazy's own argv
+  // bound refusing it first (src/agent/argv-safety.ts). Every retry builds the
+  // same argv and fails the same way, so retrying only crash-loops the task.
+  if (text.includes('e2big: argument list too long') || text.includes('-byte argv bound')) {
+    return {
+      class: 'fatal_config',
+      reason: 'the agent launch exceeds the operating system argument/environment size limit; ' +
+        'a prompt reached the command line or an environment value is oversized',
+    };
+  }
 
   // 127 = command not found. No amount of retrying installs the binary.
   if (input.exitCode === 127) {

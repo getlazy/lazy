@@ -28,7 +28,8 @@ function makeRecord(seq: number, overrides?: Partial<ProxyAuditRecord>): ProxyAu
   return {
     id: `id-${seq}`,
     seq,
-    ts: 1000000 + seq,
+    // Current: the log ages entries out by their timestamp, and these tests are about other things.
+    ts: Date.now() + seq,
     role: 'agent',
     taskId: null,
     backend: 'proxy',
@@ -281,5 +282,123 @@ describe('legacy store-root audit log migration', () => {
   test('formatSize renders large sizes readably', () => {
     expect(formatSize(512)).toBe('512 B');
     expect(formatSize(710 * 1024 * 1024)).toBe('710.0 MiB');
+  });
+});
+
+describe('audit log retention — 7 days or 128 MiB, whichever comes first', () => {
+  let dir: string;
+  beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'lazy-audit-retention-')); });
+  afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+
+  const { utimes } = require('fs/promises') as typeof import('fs/promises');
+  const day = 24 * 60 * 60 * 1000;
+
+  // INVARIANT: the default bound is 128 MiB in 4 MiB segments (31 rotated + the
+  // live one) and 7 days — the engineer's decision, 2026-10-06, replacing a
+  // single rotated segment (~8 MiB, a few hours of a busy day) that had already
+  // dropped the request a failure was investigated for.
+  test('the default bound is 128 MiB and 7 days', async () => {
+    const { AUDIT_RETAINED_SEGMENTS, AUDIT_SEGMENT_MAX_BYTES, DEFAULT_AUDIT_RETENTION_DAYS, DEFAULT_AUDIT_RETENTION_MIB, retainedSegmentsFor } =
+      await import('../../src/proxy/audit-log');
+    expect(DEFAULT_AUDIT_RETENTION_MIB).toBe(128);
+    expect(DEFAULT_AUDIT_RETENTION_DAYS).toBe(7);
+    expect((AUDIT_RETAINED_SEGMENTS + 1) * AUDIT_SEGMENT_MAX_BYTES).toBe(128 * 1024 * 1024);
+    expect(retainedSegmentsFor(8)).toBe(1);
+  });
+
+  // INVARIANT: the size budget bounds the log — rotation drops the oldest
+  // segment beyond what the budget allows, however young it is.
+  test('prunes by size: never more segments than the budget allows', async () => {
+    const lineBytes = JSON.stringify(makeRecord(1)).length + 1;
+    // Budget of 3 segments' worth -> 2 rotated + live.
+    const segment = lineBytes * 2;
+    const log = new ProxyAuditLog(dir, { maxBytes: segment, retentionMib: (segment * 3) / (1024 * 1024) });
+    for (let i = 1; i <= 12; i++) await log.append(makeRecord(i));
+    const files = (await readdir(auditLogDir(dir))).sort();
+    expect(files).toEqual([`${AUDIT_LOG_FILENAME}.1`, `${AUDIT_LOG_FILENAME}.2`]);
+    expect((await log.list()).map((r) => r.seq)).toEqual([9, 10, 11, 12]);
+  });
+
+  // INVARIANT: age bounds the log too — a rotated segment whose newest entry is
+  // past the window is deleted even when the size budget has room, on a quiet
+  // log that never rotates as well as on rotation.
+  test('prunes by age: an old rotated segment goes, a young one stays', async () => {
+    const lineBytes = JSON.stringify(makeRecord(1)).length + 1;
+    let now = Date.now();
+    const log = new ProxyAuditLog(dir, { maxBytes: lineBytes * 2, retentionDays: 7, now: () => now });
+    for (let i = 1; i <= 4; i++) await log.append(makeRecord(i)); // .2=[1,2] .1=[3,4]
+    const old = (Date.now() - 8 * day) / 1000;
+    await utimes(`${log.path}.2`, old, old);
+    now += 2 * 60 * 60 * 1000; // past the hourly check
+    await log.append(makeRecord(5)); // no rotation; the clock check prunes
+    const files = (await readdir(auditLogDir(dir))).sort();
+    expect(files).toEqual([AUDIT_LOG_FILENAME, `${AUDIT_LOG_FILENAME}.1`]);
+    expect((await log.list()).map((r) => r.seq)).toEqual([3, 4, 5]);
+  });
+
+  test('doctor reach: the oldest entry is the first line of the oldest segment', async () => {
+    const lineBytes = JSON.stringify(makeRecord(1)).length + 1;
+    const log = new ProxyAuditLog(dir, { maxBytes: lineBytes * 2 });
+    expect(await log.oldestEntryTs()).toBeNull();
+    for (let i = 1; i <= 5; i++) await log.append(makeRecord(i, { ts: 1000 * i }));
+    expect(await new ProxyAuditLog(dir).oldestEntryTs()).toBe(1000);
+  });
+
+  test('a reader with default options reads every segment a larger budget kept', async () => {
+    const lineBytes = JSON.stringify(makeRecord(1)).length + 1;
+    const log = new ProxyAuditLog(dir, { maxBytes: lineBytes, retainedSegments: 50 });
+    for (let i = 1; i <= 40; i++) await log.append(makeRecord(i));
+    expect((await readAuditRecords(dir)).length).toBe(40);
+    expect((await readAuditRecords(dir, { limit: 3 })).map((r) => r.seq)).toEqual([38, 39, 40]);
+  });
+});
+
+describe('audit log retention — edges', () => {
+  let dir: string;
+  beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'lazy-audit-edges-')); });
+  afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+  const day = 24 * 60 * 60 * 1000;
+
+  // INVARIANT: age bounds a QUIET log too — a live segment that never reaches
+  // the size cap still loses entries older than the window.
+  test('a quiet live segment past the window is rotated out of it and pruned', async () => {
+    const now = Date.now();
+    const log = new ProxyAuditLog(dir, { retentionDays: 7, now: () => now });
+    // A log left by a daemon eight days ago: one entry, written then.
+    await mkdir(auditLogDir(dir), { recursive: true });
+    await writeFile(log.path, JSON.stringify(makeRecord(1, { ts: now - 8 * day })) + '\n');
+    const { utimes } = await import('fs/promises');
+    const old = (now - 8 * day) / 1000;
+    await utimes(log.path, old, old);
+    await log.append(makeRecord(2, { ts: now }));
+    expect((await log.list()).map((r) => r.seq)).toEqual([2]);
+  });
+
+  // INVARIANT: lowering the size budget takes effect at the next rotation.
+  test('a lowered budget drops the extra segments on the next rotation', async () => {
+    const lineBytes = JSON.stringify(makeRecord(1)).length + 1;
+    const big = new ProxyAuditLog(dir, { maxBytes: lineBytes, retainedSegments: 6 });
+    for (let i = 1; i <= 7; i++) await big.append(makeRecord(i));
+    expect((await readdir(auditLogDir(dir))).length).toBe(6);
+    const small = new ProxyAuditLog(dir, { maxBytes: lineBytes, retainedSegments: 2 });
+    await small.append(makeRecord(8));
+    expect((await readdir(auditLogDir(dir))).sort()).toEqual([`${AUDIT_LOG_FILENAME}.1`, `${AUDIT_LOG_FILENAME}.2`]);
+  });
+
+  // INVARIANT: the credential-verdict writer honours the CONFIGURED retention —
+  // a default-built writer age-pruned at 7 days on every Teams credential check.
+  test('the credential-verdict writer keeps what a 30-day retention keeps', async () => {
+    const { utimes } = await import('fs/promises');
+    const { appendCredentialVerdictRecord } = await import('../../src/daemon/credential-check');
+    const lineBytes = JSON.stringify(makeRecord(1)).length + 1;
+    const log = new ProxyAuditLog(dir, { maxBytes: lineBytes * 2, retentionDays: 30 });
+    for (let i = 1; i <= 4; i++) await log.append(makeRecord(i));
+    const old = (Date.now() - 8 * day) / 1000;
+    await utimes(`${log.path}.2`, old, old);
+    await appendCredentialVerdictRecord(dir, { retentionDays: 30, retentionMib: 128 }, {
+      userId: 'u', role: 'credential-check', upstream: 'https://api.anthropic.com', method: 'POST',
+      path: '/v1/messages', endpoint: 'messages', model: null, status: 200, error: null, durationMs: 1,
+    });
+    expect(await readdir(auditLogDir(dir))).toContain(`${AUDIT_LOG_FILENAME}.2`);
   });
 });

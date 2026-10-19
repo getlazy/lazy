@@ -5,7 +5,7 @@ import { shortId, displayId, taskRef, getWorktreePath, getBranchNameFromId } fro
 import { promptChoice, promptYesNo, isTTY } from '../editor';
 import { commandStart } from './start';
 import { runInteractiveReview } from '../tui/per-hunk-review';
-import { queryWait } from '../../daemon/rpc-fallback';
+import { queryWait, queryCloseTask } from '../../daemon/rpc-fallback';
 import { normalizeTag } from '../../utils/tags';
 import type { Task, TaskStatus } from '../../types';
 import { commandAccept } from './accept';
@@ -14,7 +14,7 @@ import { commandUnblock } from './unblock';
 import { showTaskContext, runFeedbackFlow } from './shared';
 import { refreshTaskFromRemote } from './shared';
 import { commandSyncTask } from './sync';
-import { printTaskTree, printTaskListTreeHeader } from './list';
+import { printTaskTree, printTaskListTreeHeader, listColumnWidths } from './list';
 import { buildTaskTree } from '../../task/tree';
 
 import { isTerminalStatus } from '../../types';
@@ -23,8 +23,6 @@ import { theme, dim } from '../../render/theme';
 import { ActivityMonitor } from '../activity-monitor';
 
 
-import { cleanupWorktreeAndBranch, cleanupTaskContainer } from '../../task/cleanup';
-import { getActor } from '../../constants';
 import { parentTaskIdOf } from '../../task-target';
 
 /** Maximum number of recent activity lines to display in the polling view. */
@@ -51,11 +49,11 @@ const activeMonitors = new Map<string, ActivityMonitor>();
  */
 function syncActivityMonitors(
   workingTaskIds: Map<string, { worktreePath: string; turnStartedAt?: string }>,
-  runner: import('../../runner').Runner,
+  runner: import('../../runner').Runner | null,
 ): void {
   // Start monitors for new working tasks
   for (const [taskShortId, info] of workingTaskIds) {
-    if (!activeMonitors.has(taskShortId)) {
+    if (runner && !activeMonitors.has(taskShortId)) {
       const monitor = new ActivityMonitor(runner, info.worktreePath, taskShortId, info.turnStartedAt);
       monitor.start();
       activeMonitors.set(taskShortId, monitor);
@@ -148,7 +146,6 @@ async function handleInterruptedTasks(
     const { task, session: sess } = tasksWithSessions[i];
     const taskShortId = shortId(task.id);
     const taskDisplayId = displayId(task);
-    const worktreePath = getWorktreePath(root, task);
 
     console.log(`\n--- Interrupted Task ${i + 1} of ${tasksWithSessions.length}: ${taskDisplayId} ---`);
 
@@ -216,23 +213,9 @@ async function handleInterruptedTasks(
       // Abandon — mark as abandoned and clean up
       console.log('Abandoning task...');
       try {
-        // Mark as abandoned with reason
-        await storage.abandonTask(task.id, 'Abandoned due to interruption', getActor());
-
-        // Clean up worktree and branch
-        try {
-          await cleanupWorktreeAndBranch(worktreePath, sess.git_branch, root, storage, task.id, sess.agent_session_id);
-        } catch (err) {
-          // Log but don't fail — partial cleanup is acceptable
-          console.error(`Warning: could not fully clean up worktree: ${err instanceof Error ? err.message : err}`);
-        }
-
-        // Clean up container
-        try {
-          await cleanupTaskContainer(storage, sess, taskRef(task), root);
-        } catch (err) {
-          console.error(`Warning: could not clean up container: ${err instanceof Error ? err.message : err}`);
-        }
+        // The daemon abandons the task and cleans up its worktree, branch and
+        // container; a client holding storage or a runner is the wrong place.
+        await queryCloseTask({ taskId: task.id, reason: 'Abandoned due to interruption' });
 
         console.log(`Task ${taskDisplayId} abandoned.`);
       } catch (err) {
@@ -733,28 +716,33 @@ export async function commandLoop(args: string[]): Promise<void> {
 
   const root = requireLazyRoot();
 
-  // Resolve an explicit queue BEFORE the runner pre-flight. Resolution is pure
-  // validation with no side effects, and a typo'd reference is both the more
-  // likely mistake and the more confusing one to have masked by an environment
-  // complaint — same ordering rule as the wait race's reference resolution.
+  // Resolve an explicit queue FIRST. Resolution is pure validation with no side
+  // effects, so a typo'd reference fails before anything starts — same ordering
+  // rule as the wait race's reference resolution.
   const explicitQueue = parsed.positional.length > 0
     ? await resolveQueue(parsed.positional)
     : null;
 
-  // Pre-flight checks before entering the review loop
-  const { createRunner } = await import('../../runner');
-  const runner = await createRunner(root);
-  try {
-    await runner.checkAvailability();
-  } catch (err) {
-    console.error(`Error: ${err instanceof Error ? err.message : err}`);
-    process.exit(1);
-  }
+  // No local-runner pre-flight: starting a task is the daemon's business (its own
+  // start refuses an unavailable runner), and a clone bound to Lazy Teams has no
+  // local runner to ask. The runner is only needed for the live activity view of
+  // tasks whose worktree is on THIS machine, and is created on first use.
+  let localRunner: import('../../runner').Runner | null = null;
+  const getLocalRunner = async (): Promise<import('../../runner').Runner> => {
+    if (!localRunner) {
+      const { createRunner } = await import('../../runner');
+      try {
+        localRunner = await createRunner(root);
+      } catch (err) {
+        console.error(`Error: cannot show live activity: ${err instanceof Error ? err.message : err}`);
+        process.exit(1);
+      }
+    }
+    return localRunner;
+  };
 
   // --- Queue mode: an explicit, ordered list of tasks to drive.
   if (explicitQueue || hasFilters) {
-    // The filter picker prompts, so it runs after the runner check — nobody
-    // should confirm a queue only to be told the runner is unavailable.
     const queue = explicitQueue ?? await pickQueueFromFilters(backlogOnly, parentRef, tagFilter);
 
     if (!queue || queue.length === 0) return;
@@ -832,13 +820,19 @@ export async function commandLoop(args: string[]): Promise<void> {
                 });
               }
             }
-            syncActivityMonitors(workingTasks, runner);
+            // Only tasks whose worktree exists on this machine can be monitored.
+            const localWorking = new Map<string, { worktreePath: string; turnStartedAt?: string }>();
+            for (const [ref, info] of workingTasks) {
+              if (await Bun.file(`${info.worktreePath}/.git`).exists()) localWorking.set(ref, info);
+            }
+            syncActivityMonitors(localWorking, localWorking.size > 0 ? await getLocalRunner() : null);
             drainActivityMonitors();
 
             const tree = await buildTaskTree(storage, activeTasks, root);
-            printTaskListTreeHeader();
+            const widths = listColumnWidths(tree);
+            printTaskListTreeHeader(widths);
             for (const rootNode of tree) {
-              printTaskTree(rootNode);
+              printTaskTree(rootNode, '', true, 0, widths);
             }
 
             // Show recent activity feed below the task table

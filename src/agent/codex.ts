@@ -1,15 +1,15 @@
 /**
  * CodexAgent — Agent implementation for OpenAI's Codex CLI (`codex` binary).
  *
- * Verified against codex-cli 0.152.1 (see docs/spike-codex-cursor-revisit.md
+ * Checked against codex-cli 0.152.1 in 2026-09 (codex is not pinned; see docs/spike-codex-cursor-revisit.md
  * and the add-codex-agent task journal for the empirical probes — every flag
  * and event shape below was exercised against the real binary, driven by a
  * local fake OpenAI Responses server, so the *binary's* behavior is verified
  * even though no real OpenAI credentials were available).
  *
  * Key differences from Claude Code:
- * - Headless mode is a subcommand: `codex exec --json [PROMPT]`; resume is a
- *   nested subcommand: `codex exec resume <thread-id> --json [PROMPT]`.
+ * - Headless mode is a subcommand: `codex exec --json` with closed prompt stdin; resume is a
+ *   nested subcommand: `codex exec resume <thread-id> --json -` with closed prompt stdin.
  * - Output is a JSONL *event stream* (`--json`), not a single result object:
  *   `thread.started` (carries `thread_id` — the session id), `turn.started`,
  *   `item.started/updated/completed`, then `turn.completed` (usage) on success
@@ -40,9 +40,8 @@ import { existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import type { AgentResponse, AgentTokenUsage } from '../types';
 import { getHome } from '../utils/home';
-import type { Agent } from './interface';
+import type { Agent, AgentExecArgs } from './interface';
 import type { AgentActivityEvent, AgentActivityStream } from './activity-stream';
-import { safeArgvPrompt } from './argv-safety';
 import { classifyNoModelRefusal, requireLaunchModel } from './launch-model';
 import { AGENT_KEY_ENV } from './credentials';
 import { envVarFor } from '../credentials/providers';
@@ -305,9 +304,10 @@ export class CodexAgent implements Agent {
     dangerouslySkipPermissions: boolean;
     effort?: string;
     permissionMode?: 'plan' | 'default';
+    externallySandboxed?: boolean;
     extraArgs?: string[];
-  }): string[] {
-    // No system-prompt flag exists on `codex exec` (verified against 0.152.1
+  }): AgentExecArgs {
+    // No system-prompt flag exists on `codex exec` (checked on 0.152.1, 2026-09,
     // --help) — prepend the system prompt to the user prompt instead, the same
     // shape Cursor uses. (~/.codex/AGENTS.md would also inject globally, but
     // it rides a file outside this method's reach and mixes lazy's per-turn
@@ -331,9 +331,24 @@ export class CodexAgent implements Agent {
     //   a supervisor that already knows where it pointed the agent.
     args.push('--json', '--skip-git-repo-check');
 
-    if (opts.permissionMode === 'plan') {
+    if (opts.permissionMode === 'plan' && opts.externallySandboxed) {
+      // A read-only turn INSIDE a task container. Codex's read-only sandbox is
+      // bubblewrap on Linux, and bubblewrap cannot create a user namespace in
+      // our containers ("bwrap: No permissions to create new namespace") — so
+      // the native sandbox left the reviewer with no working shell AND its
+      // lazy MCP calls denied, and it "approved" work it never read. The
+      // container is the isolation boundary, exactly as for a work turn;
+      // read-only is enforced by lazy (read-only/review MCP toolset, prompt,
+      // and the supervisor's before/after write check — read-only-guard.ts).
+      // The flag is accepted by `exec resume` too (verified against
+      // codex-cli 0.152.1 `codex exec resume --help`), which the low-high
+      // self-review uses.
+      args.push('--dangerously-bypass-approvals-and-sandbox');
+    } else if (opts.permissionMode === 'plan') {
+      // Host-process runner: no container around the agent, so codex's own
+      // sandbox stays the only boundary.
       // `--sandbox` exists on `codex exec` but NOT on its nested `resume`
-      // subcommand (verified against codex-cli 0.152.1). Low-high review is a
+      // subcommand (checked against codex-cli 0.152.1, 2026-09). Low-high review is a
       // resumed turn, so passing that flag made clap reject the argv before
       // the agent ran. The config override is accepted by both commands and
       // selects the same native read-only sandbox.
@@ -349,7 +364,7 @@ export class CodexAgent implements Agent {
 
     pushCodexModel(args, opts.modelId);
     // CODEX_DEFAULT_MODEL omits -m on purpose: codex's built-in default (a
-    // real OpenAI model id, e.g. gpt-5.6-sol on 0.152.1) then applies. Safe
+    // real OpenAI model id, e.g. gpt-5.6-sol as seen on 0.152.1) then applies. Safe
     // because lazy owns ~/.codex/config.toml and never writes a `model` key —
     // there is no Cursor-style persisted user default to hijack the omission.
 
@@ -368,11 +383,10 @@ export class CodexAgent implements Agent {
       args.push(...opts.extraArgs);
     }
 
-    // Prompt must be the last positional argument. A raw NUL anywhere in argv
-    // is fatal to the spawn, so escape rather than let the turn crash-loop.
-    args.push(safeArgvPrompt(prompt, 'prompt'));
-
-    return args;
+    // Codex reads a missing prompt (fresh turn) or `-` (resume) from stdin.
+    // Never put the combined prompt in argv: Linux limits each argument to 128 KiB.
+    if (opts.sessionId) args.push('-');
+    return Object.assign(args, { stdinInput: prompt });
   }
 
   /**
@@ -451,6 +465,27 @@ export class CodexAgent implements Agent {
     };
   }
 
+  /**
+   * The terminal error of a failed `codex exec --json` run: `turn.failed`'s
+   * `error.message`, else the last top-level `{"type":"error"}` message.
+   * `item.completed` error items are warnings and are never returned.
+   */
+  extractStdoutError(output: string): string | undefined {
+    let failed: string | undefined;
+    let lastError: string | undefined;
+    for (const line of output.split('\n')) {
+      const obj = tryParseObject(line);
+      if (!obj) continue;
+      if (obj.type === 'turn.failed') {
+        const err = obj.error as Record<string, unknown> | undefined;
+        if (err && typeof err === 'object' && typeof err.message === 'string') failed = err.message;
+      } else if (obj.type === 'error' && typeof obj.message === 'string') {
+        lastError = obj.message;
+      }
+    }
+    return failed ?? lastError;
+  }
+
   isPromptTooLongError(errorMessage: string): boolean {
     // OpenAI wire spellings; none could be triggered live (needs a real
     // backend to enforce a context limit).
@@ -464,7 +499,7 @@ export class CodexAgent implements Agent {
   }
 
   isSessionNotFoundError(errorMessage: string): boolean {
-    // Verified live (bogus resume id, 0.152.1, stderr, exit 1):
+    // Checked live on 0.152.1, 2026-09 (bogus resume id, stderr, exit 1):
     // "Error: thread/resume: thread/resume failed: no rollout found for
     //  thread id 99999999-… (code -32600)"
     return (
@@ -477,7 +512,7 @@ export class CodexAgent implements Agent {
   /**
    * Codex-specific failure classification.
    *
-   * Messages verified against codex-cli 0.152.1:
+   * Messages checked against codex-cli 0.152.1 (2026-09):
    * - missing env key: `Missing environment variable: \`OPENAI_API_KEY\`.`
    *   (turn.failed on stdout, exit 1)
    * - bad key (real api.openai.com 401): "unexpected status 401 Unauthorized:
@@ -489,7 +524,8 @@ export class CodexAgent implements Agent {
    * could not be triggered without real credentials — see the task journal's
    * pairing checklist.
    */
-  classifyFailure(input: AgentFailureInput): AgentFailure {
+  classifyFailure(rawInput: AgentFailureInput): AgentFailure {
+    const input = withoutCodexWarningItems(rawInput);
     const text = failureHaystack(input);
 
     // lazy's own refusal to launch without a model (src/agent/launch-model.ts).
@@ -538,6 +574,15 @@ export class CodexAgent implements Agent {
       text.includes('codex login')
     ) {
       return { class: 'fatal_auth', reason: 'Codex CLI is not authenticated' };
+    }
+
+    // Codex's subscription-window refusal, seen live 2026-09-26 as the
+    // terminal `{"type":"error","message":"You've hit your usage limit. …
+    // try again at Sep 27th, 2026 12:29 AM."}`. It heals at the stated time
+    // (the usage pause holds the credential until then), so it is the same
+    // transient class Claude Code's 5-hour "usage limit reached" earns.
+    if (text.includes("you've hit your usage limit")) {
+      return { class: 'transient_overload', reason: codexUsageLimitReason(input) };
     }
 
     // "The model `x` does not exist or you do not have access to it." — the
@@ -604,7 +649,7 @@ export class CodexAgent implements Agent {
     configDir?: string;
   }): string[] {
     // Rollouts live at <configDir>/sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl
-    // (verified, 0.152.1). The filename embeds the thread id, so a sessionId
+    // (checked on 0.152.1, 2026-09). The filename embeds the thread id, so a sessionId
     // filter is a substring match on the basename.
     const configDir = opts.configDir ?? join(getHome(), '.codex');
     const sessionsDir = join(configDir, 'sessions');
@@ -636,4 +681,34 @@ export class CodexAgent implements Agent {
     walk(sessionsDir, 0);
     return results.sort();
   }
+}
+
+/**
+ * A Codex `item.completed` item of type `error` is a WARNING: the turn goes on
+ * (`turn.started` follows it). Two are seen live (2026-09-26): "Model metadata
+ * for `x` not found. Defaulting to fallback metadata…" and "This session was
+ * recorded with model `x` but is resuming with `y`…". The first names a model
+ * and says "not found", so left in the haystack it read as a rejected model id
+ * and stopped a task whose real failure was a usage limit. Only the terminal
+ * `{"type":"error"}` / `turn.failed` may decide the failure class.
+ */
+const CODEX_WARNING_ITEM_LINE = /^\s*\{"type":"item\.completed","item":\{"id":"[^"]*","type":"error"/;
+
+export function withoutCodexWarningItems(input: AgentFailureInput): AgentFailureInput {
+  const strip = (s: string | undefined): string | undefined =>
+    s === undefined ? s : s.split('\n').filter((line) => !CODEX_WARNING_ITEM_LINE.test(line)).join('\n');
+  return {
+    ...input,
+    message: strip(input.message) ?? '',
+    stderr: strip(input.stderr),
+    stdoutError: strip(input.stdoutError),
+  };
+}
+
+/** Quotes Codex's own stated reset ("try again at …") so the human sees when it heals. */
+function codexUsageLimitReason(input: AgentFailureInput): string {
+  const raw = [input.message, input.stderr, input.stdoutError].filter(Boolean).join('\n');
+  // Only a complete sentence: a truncated "try again at 4:43 " must not be quoted.
+  const at = /try again at ([^"\n]+?)(?:\.|")/.exec(raw)?.[1]?.trim();
+  return at ? `Codex usage limit reached — try again at ${at}` : 'Codex usage limit reached';
 }

@@ -1,7 +1,7 @@
 /**
  * Unit tests: the daemon-side review service.
  *
- * The load-bearing behaviour here is CLAUDE.md's "never lose human feedback".
+ * The load-bearing behaviour here is AGENTS.md's "never lose human feedback".
  * postComment() writes the reviewer's words through Storage BEFORE it evaluates
  * whether the agent can be asked at all, so no failure downstream of that write
  * can make the comment disappear.
@@ -48,7 +48,7 @@ describe('review service', () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  // INVARIANT (CLAUDE.md): the comment is persisted BEFORE the askability gate
+  // INVARIANT (AGENTS.md): the comment is persisted BEFORE the askability gate
   // is evaluated. A backlog task can never be asked, yet the reviewer's words
   // must survive and be visible, annotated with why they were not delivered.
   test('a comment on a non-askable task is still saved, marked failed with a reason', async () => {
@@ -424,7 +424,7 @@ describe('review service', () => {
     expect(isPendingDelivery({ ...base, withdrawn_at: 123 })).toBe(false);
   });
 
-  // INVARIANT (CLAUDE.md): "never lose human feedback" includes never making the
+  // INVARIANT (AGENTS.md): "never lose human feedback" includes never making the
   // human RE-TYPE it. An ask posted while the agent was busy is kept verbatim,
   // and retrying re-sends that same comment — it never asks for the words again.
   test('retrying a failed ask reuses the saved question, and re-records why when it still cannot go', async () => {

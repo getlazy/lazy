@@ -1,7 +1,7 @@
 /**
  * The agent's completed turn must survive a racing command.
  *
- * INVARIANT (CLAUDE.md's "never lose human feedback", mirrored for the agent):
+ * INVARIANT (AGENTS.md's "never lose human feedback", mirrored for the agent):
  * a turn the agent actually finished is evidence, and evidence is never
  * destroyed to make room for the next command. `writeCommand` used to `unlink`
  * an unconsumed `response.json` outright, so any command written between the

@@ -19,24 +19,35 @@
  * INSIDE the lock, so whichever of the two takes the lock second sees the
  * other.
  *
- * And no process of a turn runs beside a member, either. Between turns the
- * task's container stays up (a dev server, a watcher, anything a turn left
- * behind in it keeps running), and those processes can write the worktree —
- * including its git pointers, after the member's launch checked them. So the
- * entry STOPS the task's container, in the same lock, before the member's own
- * container is started ({@link stopTaskContainerForMember}); and nothing
- * brings it back while the member is inside: every turn launch refuses, and so
- * does the container-only bring-up (./task-container.ts).
+ * The task's OWN container is left running (engineer's decision, 2026-10-05).
+ * It used to be stopped on entry so that nothing a turn left behind ran beside
+ * a member; now it keeps running while members are inside, because it is where
+ * the task's SHARED services run (Start services, ./serve-run.ts) — one set per
+ * task, seen and controlled by every member, never inside anybody's terminal
+ * container. Starting, restarting or stopping them, and bringing the container
+ * up without a turn, all work while a member is inside.
+ *
+ * The threat model that makes this acceptable: everything in a task's
+ * container is suspect and contained. The worst a process a turn left running
+ * there can do to a member is plant code in the shared worktree that the
+ * member's terminal then runs — code execution INSIDE the member's container,
+ * whose one credential is a revocable placeholder — and running the task's
+ * own scripts or services already allows exactly that. The boundary that
+ * matters is container → daemon/host, and it is enforced elsewhere and
+ * unchanged by this: git config and hooks are mounted read-only, and the git
+ * pointers are validated before the member's launch and before the daemon's
+ * own git (./member-git-layout.ts, src/git/container-pointers.ts).
+ *
+ * What stays is the mutual exclusion with TURNS above: the agent and a member
+ * never work the worktree at the same time.
  */
 
 import type { Storage } from '../storage';
 import { withTaskLifecycleLock } from './task-lifecycle-lock';
 import { getTaskSessionBinding, type SessionCredentialBinding } from './session-credentials';
-import { markMemberTerminalEntered, memberInsideTask, memberInsideSyncMessage, memberInsideEnvironmentMessage } from '../server/member-terminals';
+import { markMemberTerminalEntered, memberInsideTask, memberInsideSyncMessage } from '../server/member-terminals';
 import { RpcError } from './rpc-error';
 import { isTerminalStatus } from '../task-state-machine';
-import { createRunner } from '../runner';
-import { taskRef } from '../task/identity';
 import type { Session, Task } from '../types';
 import { logger } from '../utils/logger';
 import { supervisorStillOwnsTurn } from './supervisor-handback';
@@ -44,7 +55,6 @@ import { checkPairingLock } from '../utils/pairing-lock';
 import { readLock, lockHeldHere } from '../utils/lock';
 import { readProcessIdentity, looksLikeLazyProcess } from '../utils/process-identity';
 import { getWorktreePath } from '../task/identity';
-import { recordEnvironmentReplaced, REASON_MEMBER_ENTERED } from '../task/environment-replaced';
 
 /**
  * Tasks whose worktree something other than a turn is about to change — a
@@ -85,36 +95,6 @@ export async function beginWorktreeTeardown(taskId: string): Promise<() => void>
 }
 
 /**
- * Tasks whose own container is being brought up without a turn right now
- * (`ensureTaskContainer`, ./task-container.ts), with how many bring-ups are
- * in flight. A member's entry refuses while a task has one: the entry stops
- * that container, and the bring-up would start it again beside the member.
- */
-const containerBringUps = new Map<string, number>();
-
-/**
- * Claim a task for a container bring-up: refuse (409) while a member is
- * inside, otherwise keep members out until `release` is called (once).
- * Only the check and the claim run under the task's lifecycle lock; the
- * bring-up itself, which can build an image for minutes, runs outside it.
- */
-export async function beginTaskContainerBringUp(taskId: string): Promise<() => void> {
-  return withTaskLifecycleLock(taskId, async () => {
-    const holder = memberInsideTask(taskId);
-    if (holder) throw new RpcError(409, memberInsideEnvironmentMessage(holder));
-    containerBringUps.set(taskId, (containerBringUps.get(taskId) ?? 0) + 1);
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      const left = (containerBringUps.get(taskId) ?? 1) - 1;
-      if (left > 0) containerBringUps.set(taskId, left);
-      else containerBringUps.delete(taskId);
-    };
-  });
-}
-
-/**
  * Is a turn running on this task — its status is `working`, or its credential
  * binding is live (a launch has bound it, whether or not the status has
  * flipped yet)?
@@ -129,36 +109,6 @@ export async function taskTurnRunning(
   if (task?.status === 'working') return true;
   const binding = await bindingFor(taskId);
   return !!binding && binding.revokedAt === null;
-}
-
-/**
- * Stop the task's own container (or host run), if it is running, and confirm
- * it has stopped. Throws when it could not be stopped. Returns whether a
- * running CONTAINER was stopped (false for a host-process run).
- *
- * STOPPED, not removed. The next turn recovers exactly as it does after any
- * container that died between turns: every launch path sees the run is not
- * running, removes it and records that (`removeTaskRun`), and creates a fresh
- * one. What a resume needs is not in the container — the agent's session id is
- * on the session record (written when the turn finalized, which it has: no
- * turn is running, checked just before) and its transcripts are in the task's
- * sandbox on the host, mounted in. The supervisor keeps nothing else there
- * between turns. Stopping leaves one thing removing would not: the dead
- * container's logs, readable until that next launch, when a turn left
- * something behind that someone wants to look at.
- */
-export async function stopTaskContainerForMember(projectRoot: string, task: Task, session: Session): Promise<boolean> {
-  const runner = await createRunner(projectRoot, session.runner_type ?? task.runner_type ?? undefined);
-  const name = session.container_name ?? runner.runNameForTask(taskRef(task));
-  if (!(await runner.isRunning(name))) return false;
-  const stopped = await runner.stopRun(name);
-  if (!stopped || (await runner.isRunning(name))) {
-    throw new Error(`the task's own environment (${name}) could not be stopped`);
-  }
-  logger.info(`[${task.id.substring(0, 8)}] Stopped the task's environment (${name}) so a member can work in the task alone.`);
-  // A host-process run's environment is the host: nothing outside the
-  // worktree was lost, so there is nothing to tell the agent.
-  return runner.usesSandbox();
 }
 
 /** Is the task being paired on, and whose web Pair (if any) holds it? */
@@ -235,8 +185,6 @@ export interface EnterTaskDeps {
   worktreeHolders?: (task: Task) => Promise<{ webChat: { held: boolean; email: string | null }; lock: { what: string } | null }>;
   /** Seam for tests; defaults to `supervisorStillOwnsTurn` (./supervisor-handback.ts). */
   supervisorOwnsTurn?: (task: Task, session: Session) => Promise<string | null>;
-  /** Seam for tests; defaults to {@link stopTaskContainerForMember}. */
-  stopTaskContainer?: (task: Task, session: Session) => Promise<boolean | void>;
   /** Seam for tests; defaults to marking the in-memory hold. */
   markEntered?: (taskId: string, email: string) => void;
 }
@@ -257,9 +205,7 @@ export interface EnterTaskDeps {
  *      `interrupted` task whose supervisor survived a restart, or a turn
  *      whose response is still in the mailbox, reads as parked — and the stop
  *      below would kill the supervisor's own work. Refused, retryably.
- *   4. The task's own container is stopped, so nothing a turn left running
- *      is beside the member (see the header). A stop that fails refuses.
- *   5. The hold is marked entered, still inside the lock — from here every
+ *   4. The hold is marked entered, still inside the lock — from here every
  *      launch refuses until the member's session ends.
  */
 export async function enterTaskAsMember(opts: {
@@ -284,17 +230,15 @@ export async function enterTaskAsMember(opts: {
     if (task.status === 'merging' || isTerminalStatus(task.status) || worktreeClaims.has(taskId)) {
       return { ok: false, status: 409, message: `This task is being merged or closed, so its files cannot be opened now.` };
     }
-    if (containerBringUps.has(taskId)) {
-      return { ok: false, status: 409, message: `The agent's environment for this task is being started. Open the terminal again in a moment.` };
-    }
     // A LINKED task sits `blocked` with a session before its first start.
     const session = await storage.getSessionByTaskId(taskId);
     if (!session || (await storage.getSessionTurns(session.id)).length === 0) {
       return { ok: false, status: 409, message: `This task has not run a turn yet. Start it, then open the terminal.` };
     }
     // A pairing session runs the agent in the TASK's container — `lazy pair`,
-    // or a Pair from the dashboard on a daemon that is not managed — and the
-    // stop below would end it mid-session. Only this member's OWN web Pair,
+    // or a Pair from the dashboard on a daemon that is not managed — so the
+    // agent is at work in the worktree, which a member's terminal must not
+    // share (the exclusion with turns, above). Only this member's OWN web Pair,
     // under the hold they already hold, is no obstacle: it runs in their own
     // container, and this is their next terminal joining it.
     const pairing = await (deps.pairing ?? ((t) => pairingState(projectRoot, t)))(task);
@@ -308,7 +252,7 @@ export async function enterTaskAsMember(opts: {
     // A Chat, or anything else holding the worktree lock, is at work in the
     // task too: an owner's dashboard Chat on a daemon that is not managed runs
     // in the TASK's container with the task still `blocked` and no pairing
-    // lock, and the stop below would end it mid-conversation. Only this
+    // lock: the agent is at work in the worktree, as in a turn. Only this
     // member's OWN web Chat, under the hold they already hold, is no obstacle —
     // it runs in their own container, and the worktree lock is its own.
     const holders = await (deps.worktreeHolders ?? ((t) => worktreeHolders(projectRoot, t)))(task);
@@ -328,7 +272,8 @@ export async function enterTaskAsMember(opts: {
       };
     }
     // ENGINEER RULE: the daemon never acts on a task before the supervisor has
-    // returned control — and stopping its container is acting on it.
+    // returned control — and letting a member into the worktree is acting on
+    // it: the supervisor's post-turn phases still write there.
     const owns = await (deps.supervisorOwnsTurn ?? ((t, sess) => supervisorStillOwnsTurn(projectRoot, t, sess)))(task, session);
     if (owns) {
       // The reason names lazy's internals (a supervisor phase, the command
@@ -339,28 +284,6 @@ export async function enterTaskAsMember(opts: {
         status: 409,
         message: 'The agent is still finishing its last turn. Open the terminal again in a moment.',
       };
-    }
-    let stopped: boolean | void;
-    try {
-      stopped = await (deps.stopTaskContainer ?? ((t, s) => stopTaskContainerForMember(projectRoot, t, s)))(task, session);
-    } catch (err) {
-      logger.warn(`[${taskId.substring(0, 8)}] Refused ${email}'s terminal: ${err instanceof Error ? err.message : String(err)}`);
-      return {
-        ok: false,
-        status: 503,
-        message: `The agent's environment for this task could not be stopped, so a terminal of your own cannot be opened beside it. Try again in a moment.`,
-      };
-    }
-    // The next work turn runs in a fresh container: its agent is told, once,
-    // that whatever it installed outside the worktree is gone
-    // (src/task/environment-replaced.ts). A failed write only costs the
-    // notice — the container is already stopped, so refusing gains nothing.
-    if (stopped === true) {
-      try {
-        await recordEnvironmentReplaced(storage, taskId, REASON_MEMBER_ENTERED);
-      } catch (err) {
-        logger.warn(`[${taskId.substring(0, 8)}] Could not record that the agent's environment was replaced: ${err instanceof Error ? err.message : String(err)}`);
-      }
     }
     (deps.markEntered ?? markMemberTerminalEntered)(taskId, email);
     return { ok: true };

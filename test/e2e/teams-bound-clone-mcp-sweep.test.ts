@@ -27,6 +27,7 @@ import { tmpdir } from 'os';
 
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { storageDirFor } from '../helpers/storage';
+import { turnProtectionOff } from '../helpers/managed-protection';
 import { pinDaemonBaseDir } from '../helpers/daemon-base-dir';
 import { relayTeamsRpc } from '../helpers/teams-rpc-proxy-stub';
 import { DaemonClient } from '../../src/daemon/client';
@@ -77,6 +78,7 @@ const EXPECTED: Record<string, Outcome> = {
   lazy_memory_recall: 'answers',
   lazy_messages: 'answers',
   lazy_raised_items: 'answers',
+  lazy_recipe: 'answers',
   lazy_artifact_list: 'answers',
   lazy_artifact_get: 'answers',
   lazy_conversations: 'answers',
@@ -103,27 +105,31 @@ const EXPECTED: Record<string, Outcome> = {
   lazy_close: 'answers',
   lazy_reopen: 'answers',
   lazy_sync: 'answers',
+  // Teams admits these at the browser's own verbs; the sweep's seed task has no
+  // remote or parent, so the daemon's own domain error answers.
+  lazy_submit: 'domain',
+  lazy_reparent: 'domain',
+  lazy_link: 'domain',
+  // Captured scratch is listed for every member (the Files tab); reads answer.
+  lazy_scratch: 'answers',
   // Refused by Teams — the browser cannot do them either — named by the client.
   lazy_memory_save: 'binding',
-  lazy_scratch: 'binding',
   lazy_message_post: 'binding',
   lazy_message_dismiss: 'binding',
-  lazy_submit: 'binding',
-  lazy_reparent: 'binding',
-  lazy_link: 'binding',
-  lazy_raised_promote: 'binding',
-  // Every member's readings — usage limits and project token statistics:
-  // Teams relays none of those RPCs to a clone.
-  lazy_usage_limits: 'binding',
+  // Both now run the daemon's own act (reviewPromoteRaised / redoTask) as the member.
+  lazy_raised_promote: 'answers',
+  // Usage limits: Teams answers them itself, narrowed to the member (its
+  // usage-views route, stood in for here as the one-shot admission needs it).
+  lazy_usage_limits: 'answers',
+  // Project token statistics: the proxy audit trail, which Teams relays to no clone.
   lazy_token_stats: 'binding',
   // The task's PR/MR, read with the daemon's forge credential: served only on
   // the daemon's MCP route, so a laptop server refuses them bound or not.
   lazy_review_comments: 'route',
   lazy_review_status: 'route',
-  // Runs a model one-shot, which Teams does not offer to a clone.
-  lazy_conversation_ask: 'binding',
-  // Several writes Teams would relay only in part: refused before the first.
-  lazy_redo: 'binding',
+  // Runs a model one-shot in the daemon, relayed by Teams and paid by the member.
+  lazy_conversation_ask: 'answers',
+  lazy_redo: 'answers',
   // A task agent's own tools. A laptop MCP server has no task of its own.
   lazy_final: 'role',
   lazy_raise: 'role',
@@ -204,6 +210,9 @@ describe('the lazy_* MCP surface in a clone bound to Lazy Teams', () => {
   beforeAll(async () => {
     workDir = await mkdtemp(join(tmpdir(), 'lzmcps-'));
     ctx = await setupTestLazy({ withDaemon: true });
+    // No control config here: the managed daemon reads the project's own lazy.toml.
+    // Protection is not what this suite tests; see test/helpers/managed-protection.ts.
+    await turnProtectionOff(join(ctx.root, 'lazy.toml'));
     await ctx.restartDaemon({
       LAZY_TEST_FORCE_MANAGED: '1',
       LAZY_MANAGED_STORAGE_PATH: storageDirFor(ctx.root),
@@ -229,6 +238,7 @@ describe('the lazy_* MCP surface in a clone bound to Lazy Teams', () => {
       hostname: '127.0.0.1',
       fetch: async (req) => (await relayTeamsRpc(req, {
         project: PROJECT, cliToken: CLI_TOKEN, projectRoot: ctx.root, proxied,
+        usageViews: { controlToken: () => shared, memberEmail: ALICE },
         daemonTarget: () => target, memberToken: () => alice,
       })) ?? Response.json({ error: 'not found' }, { status: 404 }),
     });
@@ -426,7 +436,8 @@ describe('the lazy_* MCP surface in a clone bound to Lazy Teams', () => {
     expect(observed.filter((o) => o.outcome === 'generic').map((o) => o.tool)).toEqual([]);
     // And it all went through Teams: the laptop has no daemon to reach.
     expect(proxied).toContain('startTask');
-    expect(proxied).toContain('storage:createTask');
+    expect(proxied).toContain('createTask');
+    expect(proxied).not.toContain('storage:createTask');
   }, 600_000);
 
   // INVARIANT: in a bound clone, a write made through the MCP surface is the
@@ -453,8 +464,6 @@ describe('the lazy_* MCP surface in a clone bound to Lazy Teams', () => {
     const original = await freshTask();
     const before = await taskCount();
 
-    const redo = await callThrough('lazy_redo', { task_id: original });
-    expect(classify(redo)).toBe('binding');
     const withRunner = await call('lazy_create', { goal: 'Pinned runner', runner: 'docker' });
     expect(classify(withRunner)).toBe('binding');
     const withReview = await call('lazy_create', { goal: 'Reviewed separately', review: 'separate' });

@@ -13,6 +13,7 @@ import type { TaskArtifact, TaskArtifactContent } from '../types';
 import { formatArtifactBytes, MAX_ARTIFACT_BYTES } from '../artifacts/limits';
 import { escapeHtml } from './escape';
 import { renderMarkdown, type RenderMarkdownOptions } from './markdown';
+import { renderMarkdownWithCopy } from './copy-markdown';
 import { timestampHtml } from './timestamps';
 
 /** Raster types a browser shows as a picture and never executes. */
@@ -67,7 +68,7 @@ function previewHtml(seg: string, a: TaskArtifact, text: string | undefined, mar
   }
   if (text === undefined) return '';
   if (isMarkdown(a)) {
-    return `<div class="lz-artifact-text markdown-body">${renderMarkdown(text, markdown)}</div>`;
+    return `<div class="lz-artifact-text markdown-body">${renderMarkdownWithCopy(text, markdown)}</div>`;
   }
   return `<pre class="lz-artifact-text">${escapeHtml(text)}</pre>`;
 }

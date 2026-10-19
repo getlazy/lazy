@@ -63,6 +63,10 @@ The supervisor is the container entrypoint. It:
 The container's PID-1 wrapper restarts the one-shot supervisor between turns
 (releasing its post-turn RSS), and deliberately kills nothing else: processes
 the agent leaves running — dev servers, databases — survive turn boundaries.
+After a failed turn, the supervisor exits with a nonzero code and the wrapper
+stops instead of restarting it as though the turn completed successfully.
+The error response remains available for the daemon to record the failure and
+decide whether the task can resume.
 The **container is the cleanup boundary**: everything in it dies together when
 the task reaches a terminal state (accept/reject/close) or is stopped, which
 still `docker kill`s the container. The old between-turn process sweep
@@ -1277,6 +1281,11 @@ The container's entrypoint runs `lazy-agent --protocol-dir ... --worktree ...`
 which starts the supervisor loop.
 
 ### Git containment: the split `.git` mount
+
+Lazy's own data directory (`<repo>/.lazy`) is hidden behind an empty in-memory
+mount in every container that reads the repository, so an agent sees only its
+own worktree there, never other tasks' worktrees, logs or the builder's
+configuration.
 
 The repository is mounted read-only and the task's worktree read-write on top of
 it — but the worktree is a *linked* git worktree, so all the state that matters

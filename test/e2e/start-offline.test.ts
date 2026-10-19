@@ -72,7 +72,7 @@ describe('lazy start (offline / force-local)', () => {
   });
 
   // INVARIANT: Online, a genuinely-missing remote parent ref must fail hard with
-  // an actionable error (per CLAUDE.md "fail hard on remote failures — no silent
+  // an actionable error (per AGENTS.md "fail hard on remote failures — no silent
   // fallbacks"), pointing the user at --force-local. Start must NOT silently
   // branch from a stale local ref just because the fetch failed.
   test('online: missing remote parent ref fails actionably without --force-local', async () => {

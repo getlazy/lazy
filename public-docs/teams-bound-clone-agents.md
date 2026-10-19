@@ -57,7 +57,11 @@ reading past conversations.
 
 The task lifecycle: create, edit, clone, comment, tag, journal, attach
 artifacts, and start, unblock, resume, ask, review, stop, accept, reject,
-close, reopen and sync a task.
+close, reopen and sync a task. Also: redoing a task, submitting a pull request,
+moving a task under another parent, linking an existing branch as a task,
+promoting a raised item into a task (goal and code only), and listing and
+showing the builder's captured scratch files — each as the browser offers it,
+for the same members.
 
 ### What refuses, and says so
 
@@ -65,13 +69,11 @@ Each of these answers with an error naming the Teams install and project, and
 what to do instead — usually "use your server-side builder" — rather than
 failing obscurely:
 
-- **Not in the browser either:** saving shared memory, the builder's scratch
-  files, posting system messages, submitting a pull request, reparenting a
-  task, linking an existing branch as a task, and promoting a raised item into
-  a task. Use a server-side builder for these.
-- **In the browser, but not offered to a clone:** dismissing a system message,
-  and redoing a task (several steps, not all of them relayed). Use the Teams
-  web UI for these.
+- **Not in the browser either:** saving shared memory, deleting scratch files or
+  artifacts, posting system messages, per-task environment variables, and
+  re-describing a linked task. Use a server-side builder for these.
+- **In the browser, but not offered to a clone:** dismissing a system message.
+  Use the Teams web UI for this.
 - **Usage limits and token statistics.** These cover every member of the
   project, so they are not offered to a clone. Use the Teams web UI where it
   shows them, or a server-side builder.

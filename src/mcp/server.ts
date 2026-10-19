@@ -62,6 +62,8 @@ export interface McpServerIo {
 }
 
 export class McpServer {
+  /** One controller per in-flight tool call, by request id; aborted on `notifications/cancelled`. */
+  private cancellations = new Map<string | number, AbortController>();
   private tools = new Map<string, { definition: McpTool; handler: McpToolHandler; advertise: boolean }>();
   private serverInfo: { name: string; version: string };
   private instructions?: string;
@@ -203,7 +205,16 @@ export class McpServer {
         //
         // Logged to stderr (never stdout — that is the protocol channel) so a
         // "why did that tool call vanish?" investigation has a trace.
+        //
+        // What it does do: abort the call's `cancelled` signal. The daemon still
+        // runs the work to completion; a handler uses the signal only so an
+        // answer nobody will read does not count as DELIVERED — `lazy_wait`'s
+        // delivered answer marks a human's comments delivered, and a harness
+        // that timed the call out never shows that answer to its model.
         const requestId = (message.params as { requestId?: unknown } | undefined)?.requestId;
+        if (typeof requestId === 'string' || typeof requestId === 'number') {
+          this.cancellations.get(requestId)?.abort();
+        }
         console.error(
           `[mcp] client cancelled request ${String(requestId ?? 'unknown')}; ` +
           'the operation continues on the daemon and is NOT aborted',
@@ -330,9 +341,12 @@ export class McpServer {
     }
 
     const progress = this.progressChannel(params?._meta?.progressToken, toolName);
+    const requestId = message.id!;
+    const cancel = new AbortController();
+    this.cancellations.set(requestId, cancel);
 
     try {
-      const result = await tool.handler(args, progress.ctx);
+      const result = await tool.handler(args, { ...progress.ctx, cancelled: cancel.signal });
       progress.settle();
       this.sendResponse({
         jsonrpc: JSONRPC_VERSION,
@@ -362,6 +376,8 @@ export class McpServer {
           isError: true,
         },
       });
+    } finally {
+      if (this.cancellations.get(requestId) === cancel) this.cancellations.delete(requestId);
     }
   }
 

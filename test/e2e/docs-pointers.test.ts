@@ -28,7 +28,7 @@ describe('documentation pointers', () => {
 
   /**
    * Edit the key in the lazy.toml `lazy init` wrote — never overwrite the file,
-   * which would throw away the external_path init put there (see CLAUDE.md).
+   * which would throw away the external_path init put there (see AGENTS.md).
    *
    * The key is INSERTED under the `[docs]` header rather than substituted into
    * the template's commented example line: that comment is prose, it has been

@@ -25,6 +25,8 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
+import { mkdtemp, rm } from 'fs/promises';
+import { tmpdir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectError, expectOutput } from '../helpers/assertions';
 import {
@@ -35,8 +37,9 @@ import {
   MOCK_CLAUDE_SUCCESS,
 } from '../helpers/fixtures';
 import { runReconcile } from '../helpers/reconcile';
-import { worktreePathFor, readTurns, writeTurns, readTaskStatus } from '../helpers/storage';
+import { worktreePathFor, readTurns, writeTurns, readTaskStatus, storageDirFor } from '../helpers/storage';
 import { seedFinal } from '../helpers/final';
+import { turnProtectionOff } from '../helpers/managed-protection';
 
 /**
  * Turn the gate on by rewriting the commented template key — never by
@@ -93,7 +96,7 @@ describe('lazy accept — the accept check', () => {
     const taskId = await taskReadyToAccept(ctx, 'Broken tree');
     setAcceptCheck(ctx.root, 'echo "src/x.ts(3,7): error TS2551: nope" >&2; exit 2');
 
-    const result = await ctx.lazy(['accept', taskId, '--yes']);
+    const result = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
     expectFailure(result);
     // The refusal is stated in MERGE terms, names the branch it would break,
     // carries the command's own output, and names the override.
@@ -113,7 +116,7 @@ describe('lazy accept — the accept check', () => {
     const taskId = await taskReadyToAccept(ctx, 'Broken but wanted');
     setAcceptCheck(ctx.root, 'echo "boom" >&2; exit 2');
 
-    const result = await ctx.lazy(['accept', taskId, '--yes', '--allow-broken']);
+    const result = await ctx.lazyMocked(['accept', taskId, '--yes', '--allow-broken'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(result);
     expectOutput(result, 'accepted');
     // The fact survives the override.
@@ -129,7 +132,7 @@ describe('lazy accept — the accept check', () => {
     expect(existsSync(join(ctx.root, 'feature.txt'))).toBe(false);
     setAcceptCheck(ctx.root, 'test -f feature.txt');
 
-    const result = await ctx.lazy(['accept', taskId, '--yes']);
+    const result = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(result);
     expectOutput(result, 'accepted');
   });
@@ -142,7 +145,7 @@ describe('lazy accept — the accept check', () => {
     const taskId = await taskReadyToAccept(ctx, 'Missing interpreter');
     setAcceptCheck(ctx.root, 'lazy-no-such-binary-anywhere --noEmit');
 
-    const result = await ctx.lazy(['accept', taskId, '--yes']);
+    const result = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
     expectFailure(result);
     expectError(result, 'COULD NOT RUN');
     expectError(result, 'exit 127');
@@ -155,7 +158,7 @@ describe('lazy accept — the accept check', () => {
     const taskId = await taskReadyToAccept(ctx, 'Hanging check');
     setAcceptCheck(ctx.root, 'sleep 30', 1);
 
-    const result = await ctx.lazy(['accept', taskId, '--yes']);
+    const result = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
     expectFailure(result);
     expectError(result, 'did not finish');
   });
@@ -165,7 +168,7 @@ describe('lazy accept — the accept check', () => {
   test('with no accept_check configured the phase is skipped, not guessed', async () => {
     const taskId = await taskReadyToAccept(ctx, 'No gate configured');
 
-    const result = await ctx.lazy(['accept', taskId, '--yes']);
+    const result = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(result);
     expectOutput(result, 'accepted');
     const combined = result.stdout + result.stderr;
@@ -193,7 +196,7 @@ describe('lazy accept — the accept check', () => {
 
     setAcceptCheck(ctx.root, `bun ${tscLib} --noEmit --strict broken.ts`);
 
-    const refused = await ctx.lazy(['accept', taskId, '--yes']);
+    const refused = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
     expectFailure(refused);
     // A genuine tsc diagnostic, not just a non-zero exit.
     expectError(refused, 'broken.ts');
@@ -204,10 +207,71 @@ describe('lazy accept — the accept check', () => {
     expect(ctx.git('-C', worktreePath, 'add', 'broken.ts').exitCode).toBe(0);
     expect(ctx.git('-C', worktreePath, 'commit', '-m', 'Fix the type error').exitCode).toBe(0);
 
-    const accepted = await ctx.lazy(['accept', taskId, '--yes']);
+    const accepted = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(accepted);
     expectOutput(accepted, 'accepted');
   }, 60000);
+});
+
+describe('lazy accept — the accept check never runs on the host', () => {
+  let ctx: TestContext;
+  let markerDir: string;
+
+  beforeEach(async () => {
+    ctx = await setupTestLazy();
+    disablePreAccept(ctx.root);
+    markerDir = await mkdtemp(join(tmpdir(), 'lazy-accept-check-marker-'));
+  });
+
+  afterEach(async () => {
+    await ctx.cleanup();
+    await rm(markerDir, { recursive: true, force: true });
+  });
+
+  /**
+   * A check whose script writes a marker OUTSIDE the worktree, naming where it
+   * ran: the mock gate container sets LAZY_MOCK_IN_GATE_CONTAINER, the daemon
+   * or CLI process on the host never does.
+   */
+  function markerCheck(): { host: string; container: string } {
+    const base = join(markerDir, 'ran');
+    const host = `${base}.host`;
+    const container = `${base}.container`;
+    setAcceptCheck(
+      ctx.root,
+      `if [ -n "$LAZY_MOCK_IN_GATE_CONTAINER" ]; then touch ${container}; else touch ${host}; fi`,
+    );
+    return { host, container };
+  }
+
+  // INVARIANT: what an accept check runs comes from the task branch, so it is
+  // agent-controlled code — it runs in the acceptance-gate container, never on
+  // the daemon's host, in solo mode (engineer, 2026-10-10).
+  test('solo: the check runs in the gate container, never on the host', async () => {
+    const taskId = await taskReadyToAccept(ctx, 'Solo marker');
+    const marker = markerCheck();
+
+    const result = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+    expectSuccess(result);
+    expect(existsSync(marker.host)).toBe(false);
+    expect(existsSync(marker.container)).toBe(true);
+  });
+
+  // INVARIANT: the same holds on a managed (Teams) host, whose daemon holds
+  // every member's credentials.
+  test('managed: the check runs in the gate container, never on the host', async () => {
+    const taskId = await taskReadyToAccept(ctx, 'Managed marker');
+    const marker = markerCheck();
+    // A managed host protects main; the owner's off switch, not the subject here.
+    await turnProtectionOff(join(ctx.root, 'lazy.toml'));
+
+    const result = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MANAGED: '1', LAZY_MANAGED_STORAGE_PATH: storageDirFor(ctx.root) },
+    });
+    expectSuccess(result);
+    expect(existsSync(marker.host)).toBe(false);
+    expect(existsSync(marker.container)).toBe(true);
+  });
 });
 
 describe('lazy accept — reverted protected files', () => {

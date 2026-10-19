@@ -1,4 +1,5 @@
 import { requireStorage, requireLazyRoot, parseFlags, validateModel, resolveTaskOrExit } from '../helpers';
+import { refuseCreateInBoundClone } from '../bound-clone-create';
 import { requireActorIdentity } from '../identity-preflight';
 import { shortId, displayId, displayIdFor, validateCode, MAX_TASK_CODE_LENGTH } from '../../task/identity';
 import { loadConfig } from '../../config/loader';
@@ -100,6 +101,7 @@ export async function commandRework(args: string[]): Promise<void> {
 
   // Before the rework prompt is typed: the daemon refuses a write it cannot
   // attribute, and a refusal must never cost the human what they wrote.
+  await refuseCreateInBoundClone('rework');
   await requireActorIdentity();
 
   const goalOverride = parsed.flags.get('goal') as string | undefined;

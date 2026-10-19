@@ -58,6 +58,12 @@ const CONTAINER_EXPANSIONS: Record<string, string[]> = {
   'agents.description': ['agents.*.description'],
   'agents.endpoint': ['agents.*.endpoint'],
   'agents.credential': ['agents.*.credential'],
+  'agents.named_endpoint': ['agents.*.named_endpoint'],
+  'agents.tiers': ['agents.*.tiers[].endpoint', 'agents.*.tiers[].model', 'agents.*.tiers[].threshold_percent'],
+  // [endpoints.<name>] is collapsed to `*` the same way.
+  'endpoints.url': ['endpoints.*.url'],
+  'endpoints.credential': ['endpoints.*.credential'],
+  'endpoints.description': ['endpoints.*.description'],
   'proxy.fallback': ['proxy.fallback[].upstream', 'proxy.fallback[].model'],
   'proxy.policy': [
     'proxy.policy.enforce',
@@ -163,7 +169,11 @@ describe('managed-mode classification coverage', () => {
       models: { default: 'x', roles: { agent: { agent: 'evil', backend: 'ollama', model: 'm', endpoint: 'http://x' } } },
       // Profile names are the repository's own words, so the flattening has to
       // collapse them the way it collapses role names.
-      agents: { evil: { harness: 'pi', model: 'm', endpoint: 'http://x', credential: 'stolen' } },
+      agents: {
+        evil: { harness: 'pi', model: 'm', endpoint: 'http://x', credential: 'stolen' },
+        chain: { harness: 'claude-code', named_endpoint: 'evil', tiers: [{ endpoint: 'evil', model: 'm', threshold_percent: 9 }] },
+      },
+      endpoints: { evil: { url: 'http://x', credential: 'stolen', description: 'd' } },
       // No `enabled` key: it was REMOVED, so a real lazy.toml can no longer
       // state it — the loader rejects `enabled = false` outright and warns on
       // `enabled = true`. See `the audit proxy cannot be turned off by the
@@ -258,6 +268,17 @@ describe('managed-mode evaluation', () => {
     expect(refusals.find((r) => r.key === 'agents.*.endpoint')?.why).toContain('evil.example');
   });
 
+  test("lazy-dev's own lazy.toml carries its [serve] services through a Teams import", async () => {
+    // INVARIANT: lazy-dev's lazy.toml declares the playground Teams it serves,
+    // and managed mode honours [serve] as written — so importing lazy-dev into
+    // Teams once brings the service along (docs/design/teams-task-service-proxy.md).
+    const raw = Bun.TOML.parse(await Bun.file(new URL('../../lazy.toml', import.meta.url)).text()) as Record<string, any>;
+    expect(raw.serve?.services?.teams).toBe(3000);
+    const { refusals, overrides } = evaluateManagedConfig(raw, env());
+    expect(refusals.filter((r) => r.key.startsWith('serve'))).toEqual([]);
+    expect(overrides.filter((o) => o.key.startsWith('serve'))).toEqual([]);
+  });
+
   test('a profile that only names a provider credential is not refused', () => {
     // The harmless statement of the same key: `credential = "openai"` says
     // which of the fleet's own credentials this profile bills, which is not a
@@ -345,6 +366,32 @@ describe('managed mode applied through loadConfig', () => {
     await rm(root, { recursive: true, force: true });
   });
 
+  // INVARIANT: a Lazy Teams project's default branch is protected unless its
+  // config says otherwise (engineer, 2026-10-10) — there a member's Accept is
+  // the approval, so there is no passphrase to share. An explicit value is the
+  // owner's switch and always wins; unmanaged lazy keeps protection opt-in.
+  test('protection defaults ON in managed mode, and an explicit value wins', async () => {
+    process.env[MANAGED_ENV] = '1';
+    process.env[MANAGED_STORAGE_ENV] = '/fleet/store/proj';
+    await writeFile(join(root, 'lazy.toml'), '[git]\n');
+    expect((await loadConfig(root)).protection.enabled).toBe(true);
+
+    await writeFile(join(root, 'lazy.toml'), '[protection]\nenabled = false\n');
+    expect((await loadConfig(root)).protection.enabled).toBe(false);
+
+    delete process.env[MANAGED_ENV];
+    await writeFile(join(root, 'lazy.toml'), '[git]\n');
+    expect((await loadConfig(root)).protection.enabled).toBe(false);
+  });
+
+  test('managed projects honour repository Docker run arguments', async () => {
+    await writeFile(join(root, 'lazy.toml'), '[docker]\nrun_args = ["--cap-add=SYS_PTRACE"]\n');
+    process.env[MANAGED_ENV] = '1';
+    process.env[MANAGED_STORAGE_ENV] = '/fleet/store/proj';
+
+    expect((await loadConfig(root)).docker.run_args).toEqual(['--cap-add=SYS_PTRACE']);
+  });
+
   /** A lazy.toml that asks for everything a shared host must not give it. */
   const HOSTILE = [
     '[runner]', 'type = "docker"', '',
@@ -369,14 +416,18 @@ describe('managed mode applied through loadConfig', () => {
     expect(config.mounts).toHaveLength(1);
   });
 
-  test('managed mode ON refuses the config that carries a mount', async () => {
+  // INVARIANT: a repository's refused settings are kept unused and reported,
+  // never a start refusal (engineer, 2026-10-08: "Importing must never refuse
+  // anything"). The mount is NOT honoured — the project loads without it — and
+  // `lazy doctor` / the Configuration page name it.
+  test('managed mode ON loads the config that carries a mount, without the mount', async () => {
     await writeFile(join(root, 'lazy.toml'), HOSTILE);
     process.env[MANAGED_ENV] = '1';
     process.env[MANAGED_STORAGE_ENV] = '/fleet/store/proj';
 
-    await expect(loadConfig(root)).rejects.toThrow(ManagedConfigRefusedError);
-    // The marker Lazy Teams classifies on must be in the message.
-    await expect(loadConfig(root)).rejects.toThrow(/managed config refused:/);
+    const config = await loadConfig(root);
+    expect(config.mounts ?? []).toHaveLength(0);
+    expect(config.storage.external_path).not.toBe('/somebody/elses/store');
   });
 
   test('managed mode ON overrides the rest and keeps the project running', async () => {

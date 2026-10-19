@@ -91,7 +91,7 @@ export function isCursorProxyPath(pathname: string): boolean {
  * Split a cursor-route request path into its attribution segments and the
  * upstream path.
  *
- * Strict on purpose (CLAUDE.md: validate at the boundary). The arity is fixed:
+ * Strict on purpose (AGENTS.md: validate at the boundary). The arity is fixed:
  * exactly one credential segment follows the prefix. A request that does not
  * match is rejected by the caller rather than guessed at — a malformed prefix
  * means the launch wiring is wrong, and silently forwarding it would produce

@@ -32,16 +32,18 @@ import {
 import type { ProxyRequestPlugin } from '../../src/proxy/plugins/types';
 import type { AuditSink } from '../../src/proxy/audit';
 
+/**
+ * These tests exercise the loading MECHANISM. Lazy itself never loads
+ * repository plugins (src/config/managed-repo-code.ts), so they opt in here.
+ */
+const MECHANISM_ONLY = { enabled: true } as const;
+
 enableInProcessTestMode();
 
 // Audit records go to an AuditSink (the project-local bounded log in
 // production), never to Storage — this test only needs it to swallow them.
 function createMockSink(): AuditSink {
   return { append: async () => {} };
-}
-
-function findFreePort(): number {
-  return 41000 + Math.floor(Math.random() * 8000);
 }
 
 const REQUEST_BODY = {
@@ -59,15 +61,15 @@ describe('proxy request plugins', () => {
 
   beforeEach(async () => {
     ctx = await setupTestLazy();
-    upstreamPort = findFreePort();
     upstream = Bun.serve({
-      port: upstreamPort,
+      port: 0,
       hostname: '127.0.0.1',
       async fetch(req) {
         rawForwardedBody = req.method === 'GET' ? null : await req.text();
         return Response.json({ type: 'message', ok: true });
       },
     });
+    upstreamPort = upstream.port!;
   });
 
   afterEach(async () => {
@@ -77,13 +79,13 @@ describe('proxy request plugins', () => {
 
   /** Run the real proxy in front of the recording upstream, with a real chain. */
   async function forward(plugins: readonly ProxyRequestPlugin[], bodyText: string): Promise<void> {
-    const port = findFreePort();
     const server = createProxyServer(
-      { port, bind: '127.0.0.1', upstream: `http://127.0.0.1:${upstreamPort}`, plugins },
+      { port: 0, bind: '127.0.0.1', upstream: `http://127.0.0.1:${upstreamPort}`, plugins },
       createMockSink(),
       // No credential broker: these tests exercise request plugins, not JIT injection.
       null,
     );
+    const port = server.port!;
     try {
       // Cast widens the assignment so TS does not narrow the flow type to the
       // literal `null` (the same tsc quirk noted in proxy-server.test.ts).
@@ -113,7 +115,7 @@ describe('proxy request plugins', () => {
   // parses back to the same object, because upstream prompt-cache keys are
   // computed over the bytes.
   test('a project with no .lazy/plugins directory forwards bytes untouched', async () => {
-    const plugins = await loadProxyRequestPlugins(ctx.root);
+    const plugins = await loadProxyRequestPlugins(ctx.root, MECHANISM_ONLY);
     expect(plugins).toEqual([]);
 
     const sent = JSON.stringify(REQUEST_BODY);
@@ -134,7 +136,7 @@ describe('proxy request plugins', () => {
        };`,
     );
 
-    const plugins = await loadProxyRequestPlugins(ctx.root);
+    const plugins = await loadProxyRequestPlugins(ctx.root, MECHANISM_ONLY);
     expect(plugins.map((p) => p.name)).toEqual(['tag-system']);
 
     await forward(plugins, JSON.stringify(REQUEST_BODY));
@@ -157,12 +159,12 @@ describe('proxy request plugins', () => {
     await writePlugin('good.ts', `export default { name: 'good', transformRequest: () => null };`);
     await writePlugin('broken.ts', `export default { name: 'broken',,, };`);
 
-    await expect(loadProxyRequestPlugins(ctx.root)).rejects.toThrow(ProxyPluginLoadError);
+    await expect(loadProxyRequestPlugins(ctx.root, MECHANISM_ONLY)).rejects.toThrow(ProxyPluginLoadError);
   });
 
   test('a module that loads but exports the wrong shape fails loud', async () => {
     await writePlugin('shapeless.ts', `export default { name: 'shapeless' };`);
-    await expect(loadProxyRequestPlugins(ctx.root)).rejects.toThrow(/transformRequest/);
+    await expect(loadProxyRequestPlugins(ctx.root, MECHANISM_ONLY)).rejects.toThrow(/transformRequest/);
   });
 });
 
@@ -185,8 +187,11 @@ describe('lazy customize proxy-plugin', () => {
     expectSuccess(result);
     expectOutput(result, '.lazy/plugins/my-plugin.ts');
     expectOutput(result, '.lazy/plugins/my-plugin.test.ts');
+    // INVARIANT: the scaffold never claims the plugin is installed — lazy does
+    // not run repository plugins (src/config/managed-repo-code.ts).
+    expectOutput(result, 'lazy does not currently run repository plugins');
 
-    const plugins = await loadProxyRequestPlugins(ctx.root);
+    const plugins = await loadProxyRequestPlugins(ctx.root, MECHANISM_ONLY);
     expect(plugins.map((p) => p.name)).toEqual(['my-plugin']);
 
     // The template is a deliberate no-op: it declines every request until edited.
@@ -199,7 +204,7 @@ describe('lazy customize proxy-plugin', () => {
 
   test('the scaffolded smoke test is skipped by the loader, not imported as a plugin', async () => {
     expectSuccess(await ctx.lazy(['customize', 'proxy-plugin', 'solo', '--no-prompt']));
-    const plugins = await loadProxyRequestPlugins(ctx.root);
+    const plugins = await loadProxyRequestPlugins(ctx.root, MECHANISM_ONLY);
     // Two files were written; exactly one of them is a plugin.
     expect(plugins.map((p) => p.name)).toEqual(['solo']);
   });
@@ -235,7 +240,7 @@ describe('lazy customize proxy-plugin', () => {
     expectFailure(result);
     expectError(result, 'not a valid plugin name');
     // Nothing was written anywhere.
-    await expect(loadProxyRequestPlugins(ctx.root)).resolves.toEqual([]);
+    await expect(loadProxyRequestPlugins(ctx.root, MECHANISM_ONLY)).resolves.toEqual([]);
   });
 
   test('an unknown customize subcommand fails with the family usage', async () => {

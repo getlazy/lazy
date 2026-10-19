@@ -468,7 +468,7 @@ describe('lazy list', () => {
  * rendered: `--levels 1` shows top-level rows only, `--levels 2` adds their
  * children. It is deliberately NOT the engineer's literal `--depth 0` spelling:
  * "0" reads as "nothing" as easily as "roots only", and a listing flag whose
- * most useful value is ambiguous is a trap (CLAUDE.md, principle of least
+ * most useful value is ambiguous is a trap (AGENTS.md, principle of least
  * surprise).
  *
  * INVARIANT — a depth-limited listing must never look complete. Every elided

@@ -15,7 +15,8 @@
  * never kill existing daemons — only stop/restart do that.
  */
 
-import { rm, readFile } from 'fs/promises';
+import { readFile } from 'fs/promises';
+import { pruneDaemonRuntime } from '../../daemon/prune';
 import { parseFlags, requireLazyRoot, refuseIfBoundClone } from '../helpers';
 import { formatDuration } from '../../utils/format';
 import { describeExpiry } from '../../utils/local-day';
@@ -61,7 +62,7 @@ import { getSourceIdentity } from '../../utils/source-id';
  * Compare a daemon's reported source id against this checkout's.
  *
  * Returns null when there is nothing to say — the daemon is too old to report an
- * id, or this process is a compiled binary whose `build:` identity is not
+ * id, or this process is a compiled binary whose identity is not
  * comparable to a checkout's fingerprint. Saying nothing is the right answer
  * there: a warning derived from two incomparable values is worse than silence.
  */
@@ -76,7 +77,7 @@ async function describeSourceStaleness(
   } catch {
     return null;
   }
-  if (identity.kind === 'build') return null;
+  if (identity.kind === 'build' || identity.kind === 'embedded') return null;
 
   const stale = identity.id !== reported;
   return {
@@ -93,9 +94,9 @@ export async function commandDaemon(args: string[]): Promise<void> {
 
   // Operating THIS machine's daemon by hand is exactly the thing a bound
   // clone does not do — Teams' own daemon is the one that runs (design doc
-  // §4.4, §4.7). Fleet-wide introspection (`list`, `kill-stray`) and `logs`
-  // are left alone: they are host-diagnostic, not "operate my daemon".
-  if (['start', 'stop', 'restart', 'status', 'health', 'reload'].includes(subcommand ?? '')) {
+  // §4.4, §4.7). Fleet-wide introspection (`list`, `kill-stray`)
+  // is left alone: it is host-diagnostic, not "operate my daemon".
+  if (['start', 'stop', 'restart', 'status', 'health', 'reload', 'logs'].includes(subcommand ?? '')) {
     await refuseIfBoundClone(`daemon ${subcommand}`);
   }
 
@@ -607,6 +608,16 @@ async function daemonStatus(args: string[]): Promise<void> {
       }
     }
 
+    // One line, not a diagnosis: `lazy doctor` is where a problem is explained.
+    if (status.wedged) {
+      const parts = [
+        ...status.wedged.steps.map((s) => `${s} not answering`),
+        ...status.wedged.loops.map((l) => `${l.name} stalled ${Math.round(l.stalledMs / 1000)}s in ${l.phase ?? 'no phase'}`),
+        ...(status.wedged.storeOpening ? [`store stuck ${status.wedged.storeOpening.stage}`] : []),
+      ];
+      console.log(`  ⚠ Stuck:  ${parts.join('; ')} — run: lazy doctor`);
+    }
+
     // After the staleness block, so the `Source:` line is not read as part of
     // the pending list below.
     for (const line of formatConfigStatusOrError(await readConfigStatusForDisplay(projectRoot))) console.log(line);
@@ -827,13 +838,13 @@ async function terminatePid(pid: number, timeoutMs = SIGNAL_SHUTDOWN_BUDGET_MS +
 
 /**
  * `lazy daemon kill-stray` — reap daemons whose project root no longer exists
- * on disk. Per CLAUDE.md "principle of least surprise": a daemon whose root
+ * on disk. Per AGENTS.md "principle of least surprise": a daemon whose root
  * STILL exists is never touched, and reaping requires confirmation interactively
  * (`--yes` skips it for non-interactive callers — NOT LAZY_PROMPT_DEFAULTS).
  *
- * `--prune-dirs` additionally removes orphaned state dirs — those whose pid is
+ * `--prune-dirs` additionally prunes runtime files in orphaned state dirs — those whose pid is
  * dead OR whose pid now belongs to an unrelated process (pid reuse) — so the
- * dir count under the daemon base dir doesn't grow unbounded after crashes.
+ * empty dirs can be removed after crashes. Persistent project data is kept.
  *
  * INVARIANT: only identity-verified daemons are ever signalled. The registry
  * classifies a dir alive only when the process is provably a lazy daemon, so a
@@ -872,7 +883,7 @@ async function daemonKillStray(args: string[]): Promise<void> {
     }
   }
   if (orphanDirs.length > 0) {
-    console.log(`Orphaned state dir${orphanDirs.length === 1 ? '' : 's'} to remove (no live process):`);
+    console.log(`Orphaned state dir${orphanDirs.length === 1 ? '' : 's'} to prune (no live process; persistent data preserved):`);
     for (const r of orphanDirs) {
       console.log(`  ${r.dir}`);
     }
@@ -890,12 +901,10 @@ async function daemonKillStray(args: string[]): Promise<void> {
     }
   }
 
-  // Reap strays: kill the process, then remove its now-useless state dir (its
-  // root is gone, so nothing will ever reattach to it).
   for (const r of strays) {
     if (r.pid !== null) await terminatePid(r.pid);
     try {
-      await rm(r.dir, { recursive: true, force: true });
+      await pruneDaemonRuntime(r.dir);
     } catch (err) {
       console.error(`Killed PID ${r.pid} (${r.projectRoot}) but could not remove its state dir ${r.dir}: ${err instanceof Error ? err.message : String(err)}`);
       continue;
@@ -906,8 +915,10 @@ async function daemonKillStray(args: string[]): Promise<void> {
   // Prune dead-pid dirs.
   for (const r of orphanDirs) {
     try {
-      await rm(r.dir, { recursive: true, force: true });
-      console.log(`Removed orphaned state dir ${r.dir}`);
+      const removed = await pruneDaemonRuntime(r.dir);
+      console.log(removed
+        ? `Removed orphaned state dir ${r.dir}`
+        : `Pruned orphaned runtime state ${r.dir} (persistent data preserved)`);
     } catch (err) {
       console.error(`Could not remove orphaned state dir ${r.dir}: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -918,7 +929,7 @@ async function daemonKillStray(args: string[]): Promise<void> {
   console.log('');
   console.log(
     `Done: reaped ${reaped} stray daemon${reaped === 1 ? '' : 's'}` +
-    (pruneDirs ? `, removed ${pruned} orphaned state dir${pruned === 1 ? '' : 's'}.` : '.'),
+    (pruneDirs ? `, pruned ${pruned} orphaned state dir${pruned === 1 ? '' : 's'} (persistent data preserved).` : '.'),
   );
 }
 
@@ -991,7 +1002,7 @@ non-TTY still prints the warning but never blocks.
 
 kill-stray options:
   --yes           Skip the confirmation prompt (for non-interactive callers)
-  --prune-dirs    Also remove orphaned state dirs whose process is dead
+  --prune-dirs    Prune orphaned runtime state; preserve stored credentials
 
 The daemon is required for all CLI commands (except init, daemon, and help).
 It auto-starts when you run any command. If auto-start fails, start manually.

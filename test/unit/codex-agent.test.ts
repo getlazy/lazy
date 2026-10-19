@@ -4,8 +4,8 @@ import { mkdtemp, mkdir, writeFile, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { CodexAgent, CodexActivityStream, CODEX_DEFAULT_MODEL } from '../../src/agent/codex';
-import { CodexPackaging, CODEX_PINNED_VERSION, CODEX_INSTALL_HINT } from '../../src/agent/codex-packaging';
-import { renderCodexConfig, CODEX_CONFIG_MARKER } from '../../src/agent/codex-config';
+import { CodexPackaging, CODEX_INSTALL_HINT } from '../../src/agent/codex-packaging';
+import { renderCodexConfig, CODEX_CONFIG_MARKER, CODEX_PROJECT_DOC_MAX_BYTES } from '../../src/agent/codex-config';
 import { codexProxyEnvVars, codexLaunchEnvVars, codexBaseUrlPrefix, CODEX_ENDPOINT_ENV } from '../../src/proxy/codex-route';
 import { getAgent, getAgentPackaging, listAgents, agentDisplayName } from '../../src/agent/registry';
 import { codexProxiedCallScenario } from '../helpers/fake-codex';
@@ -14,7 +14,7 @@ import { aggregateUsage } from '../../src/proxy/aggregate';
 import { toTurnUsage } from '../../src/utils/usage-recording';
 import type { ProxyAuditRecord } from '../../src/storage/types';
 
-// Every fixture line below is REAL output captured from codex-cli 0.152.1
+// Every fixture line below is REAL output captured from codex-cli 0.152.1 (a point-in-time capture, not a pin)
 // (aarch64 Linux, driven by a local fake OpenAI Responses server — see the
 // add-codex-agent task journal). Do not hand-edit shapes; re-capture instead.
 
@@ -49,13 +49,14 @@ describe('CodexAgent', () => {
   });
 
   describe('buildExecArgs', () => {
-    test('fresh turn: codex exec --json with the prompt as the last positional', () => {
+    test('fresh turn: codex exec --json with the prompt on stdin', () => {
       const args = agent.buildExecArgs({ modelId: 'default', prompt: 'Hello', dangerouslySkipPermissions: false });
       expect(args[0]).toBe('codex');
       expect(args[1]).toBe('exec');
       expect(args).toContain('--json');
       expect(args).toContain('--skip-git-repo-check');
-      expect(args[args.length - 1]).toBe('Hello');
+      expect(args).not.toContain('Hello');
+      expect(args.stdinInput).toBe('Hello');
     });
 
     test('resume is the nested subcommand with the thread id positional, before flags', () => {
@@ -67,7 +68,8 @@ describe('CodexAgent', () => {
         dangerouslySkipPermissions: true,
       });
       expect(args.slice(0, 4)).toEqual(['codex', 'exec', 'resume', '01a0648b-f428-70b0-8f46-4672842290ba']);
-      expect(args[args.length - 1]).toBe('continue');
+      expect(args[args.length - 1]).toBe('-');
+      expect(args.stdinInput).toBe('continue');
     });
 
     test('dangerouslySkipPermissions maps to --dangerously-bypass-approvals-and-sandbox', () => {
@@ -75,7 +77,10 @@ describe('CodexAgent', () => {
       expect(args).toContain('--dangerously-bypass-approvals-and-sandbox');
     });
 
-    test('plan mode uses the native read-only sandbox instead of the bypass flag', () => {
+    // INVARIANT: on the host-process runner (not externally sandboxed) a
+    // read-only Codex turn keeps codex's own read-only sandbox — there is no
+    // container around it, so that sandbox is the only boundary.
+    test('plan mode outside a container uses the native read-only sandbox, not the bypass flag', () => {
       const args = agent.buildExecArgs({
         modelId: 'default',
         prompt: 'Hi',
@@ -88,6 +93,28 @@ describe('CodexAgent', () => {
       expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
     });
 
+    // INVARIANT: inside a task container a read-only Codex turn (ask, review,
+    // low-high self-review) bypasses codex's sandbox exactly like a work turn.
+    // Codex's read-only sandbox is bubblewrap, which cannot create a namespace
+    // in our containers — with it, reviewers had no shell and their lazy MCP
+    // calls were denied, and they "approved" work they never read. Read-only
+    // is enforced by lazy instead (toolset, prompt, supervisor write check).
+    test('plan mode inside a container bypasses the sandbox — fresh and resumed', () => {
+      for (const sessionId of [undefined, '01a0648b-f428-70b0-8f46-4672842290ba']) {
+        const args = agent.buildExecArgs({
+          modelId: 'default',
+          prompt: 'Hi',
+          sessionId,
+          dangerouslySkipPermissions: true,
+          permissionMode: 'plan',
+          externallySandboxed: true,
+        });
+        expect(args).toContain('--dangerously-bypass-approvals-and-sandbox');
+        expect(args).not.toContain('sandbox_mode="read-only"');
+        expect(args).not.toContain('--sandbox');
+      }
+    });
+
     test('prepends system prompt to user prompt (no system-prompt flag exists)', () => {
       const args = agent.buildExecArgs({
         modelId: 'default',
@@ -95,10 +122,19 @@ describe('CodexAgent', () => {
         systemPrompt: 'You are a helper',
         dangerouslySkipPermissions: false,
       });
-      const prompt = args[args.length - 1]!;
+      const prompt = args.stdinInput!;
       expect(prompt).toContain('<system>');
       expect(prompt).toContain('You are a helper');
       expect(prompt.indexOf('<system>')).toBeLessThan(prompt.indexOf('Do something'));
+    });
+
+    test('sends an oversized combined prompt through stdin without losing content', () => {
+      const systemPrompt = 'system 🐙'.repeat(20_000);
+      const userPrompt = 'user 🐙'.repeat(20_000);
+      const args = agent.buildExecArgs({ modelId: 'default', prompt: userPrompt, systemPrompt, dangerouslySkipPermissions: false });
+      expect(args.stdinInput).toBe(`<system>\n${systemPrompt}\n</system>\n\n${userPrompt}`);
+      expect(args.join(' ')).not.toContain(systemPrompt);
+      expect(args.join(' ')).not.toContain(userPrompt);
     });
 
     test(`the "${CODEX_DEFAULT_MODEL}" sentinel omits -m so codex's own default applies`, () => {
@@ -133,7 +169,7 @@ describe('CodexAgent', () => {
       expect(args).not.toContain('-c');
     });
 
-    test('extraArgs are appended before the prompt', () => {
+    test('extraArgs remain in argv while the prompt uses stdin', () => {
       const args = agent.buildExecArgs({
         modelId: 'default',
         prompt: 'Hi',
@@ -141,7 +177,7 @@ describe('CodexAgent', () => {
         dangerouslySkipPermissions: false,
       });
       expect(args).toContain('--color');
-      expect(args[args.length - 1]).toBe('Hi');
+      expect(args.stdinInput).toBe('Hi');
     });
   });
 
@@ -234,6 +270,19 @@ describe('CodexAgent', () => {
     });
   });
 
+  // INVARIANT: codex is not pinned, so a newer release may emit event types and fields lazy has never seen. Unknown ones are ignored, never fatal.
+  test('ignores unknown event types and extra fields', () => {
+    const stream = [
+      THREAD_STARTED,
+      '{"type":"brand.new_event","payload":{"x":1}}',
+      '{"type":"item.completed","extra":"f","item":{"id":"item_0","type":"agent_message","text":"hi","new_field":[1,2]}}',
+      '{"type":"turn.completed","new_top_level":true,"usage":{"input_tokens":42,"cached_input_tokens":12,"output_tokens":7,"future_counter":3}}',
+    ].join('\n');
+    const response = agent.parseResponse(stream);
+    expect(response.result).toBe('hi');
+    expect(response.usage?.output_tokens).toBe(7);
+  });
+
   describe('CodexActivityStream', () => {
     test('thread.started → session_start with the thread id, from line 1', () => {
       const stream = new CodexActivityStream();
@@ -243,6 +292,17 @@ describe('CodexAgent', () => {
       // Codex's stream carries no MCP/tool report — "said nothing", never [].
       expect(event?.mcpServers).toBeUndefined();
       expect(event?.toolNames).toBeUndefined();
+    });
+
+    // INVARIANT: unknown event types and extra fields never throw; known events still map.
+    test('tolerates unknown events and extra fields', () => {
+      const stream = new CodexActivityStream();
+      expect(() => stream.parseLine('{"type":"brand.new_event","payload":{"x":1}}')).not.toThrow();
+      const started = stream.parseLine('{"type":"thread.started","thread_id":"t-1","new_field":true}');
+      expect(started?.kind).toBe('session_start');
+      expect(started?.sessionId).toBe('t-1');
+      const done = stream.parseLine('{"type":"turn.completed","extra":1,"usage":{"input_tokens":4,"output_tokens":2,"future":9}}');
+      expect(done?.kind).toBe('result');
     });
 
     test('turn.completed → result whose raw excerpt parses under parseResponse', () => {
@@ -318,6 +378,11 @@ describe('CodexAgent', () => {
   });
 
   describe('classifyFailure', () => {
+    test('remaining E2BIG from environment or flags stops without retry', () => {
+      const failure = agent.classifyFailure({ message: "E2BIG: argument list too long, posix_spawn 'codex'" });
+      expect(failure.class).toBe('fatal_config');
+    });
+
     test('missing binary is fatal_config with the install hint', () => {
       const failure = agent.classifyFailure({ message: "spawn failed: binary 'codex' not found" });
       expect(failure.class).toBe('fatal_config');
@@ -356,6 +421,89 @@ describe('CodexAgent', () => {
           'auth error: 401, auth error code: invalid_api_key',
       });
       expect(failure.class).toBe('fatal_auth');
+    });
+
+    // Wire lines verbatim from builder-on-codex turns 2, 9 and 13 (2026-09-26).
+    // The recorded turns truncate the terminal error; its full text is turn 9's.
+    const LIMIT =
+      '{"type":"error","message":"You\'ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), ' +
+      'visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 27th, 2026 12:29 AM."}';
+    const METADATA = (m: string) =>
+      `{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Model metadata for \`${m}\` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."}}`;
+    const RESUMED =
+      '{"type":"item.completed","item":{"id":"item_0","type":"error","message":"This session was recorded with model `gpt-6-astra` but is resuming with `gpt-6-sol`. Consider switching back to `gpt-6-astra` as it may affect Codex performance."}}';
+
+    // INVARIANT: a Codex item.completed error item is a warning that never
+    // decides the failure class; the terminal error does. The metadata warning
+    // read as "model rejected" and stopped a task that had hit a usage limit.
+    test('turn 2: metadata warning + usage limit is a usage limit, not fatal_config', () => {
+      const failure = agent.classifyFailure({
+        message: [
+          '{"type":"thread.started","thread_id":"01a0de3e-d504-7c11-a55c-2d3ccc8fefdb"}',
+          METADATA('gpt-6-astra'),
+          '{"type":"turn.started"}',
+          LIMIT,
+        ].join('\n'),
+      });
+      expect(failure.class).toBe('transient_overload');
+      expect(failure.reason).toBe('Codex usage limit reached — try again at Sep 27th, 2026 12:29 AM');
+    });
+
+    test('turn 9: a plain usage limit is a usage limit with its reset time', () => {
+      const failure = agent.classifyFailure({
+        message:
+          "Codex turn failed: You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit " +
+          'https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 27th, 2026 12:29 AM.',
+      });
+      expect(failure.class).toBe('transient_overload');
+      expect(failure.reason).toContain('Sep 27th, 2026 12:29 AM');
+    });
+
+    test('turn 13: resume-model and metadata warnings + usage limit is a usage limit', () => {
+      const failure = agent.classifyFailure({
+        message: [RESUMED, METADATA('gpt-6-sol').replace('item_0', 'item_1'), '{"type":"turn.started"}', LIMIT].join('\n'),
+      });
+      expect(failure.class).toBe('transient_overload');
+    });
+
+    // INVARIANT: the supervisor classifies what extractStdoutError returns for
+    // the WHOLE stream — the generic 500-char excerpt of the last five lines
+    // cut turn 13's limit off at "You've hit yo" behind the two warnings.
+    const TURN_FAILED =
+      '{"type":"turn.failed","error":{"message":"You\'ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 27th, 2026 12:29 AM."}}';
+    const STREAMS: Record<string, string[]> = {
+      'turn 2': [
+        '{"type":"thread.started","thread_id":"01a0de3e-d504-7c11-a55c-2d3ccc8fefdb"}',
+        METADATA('gpt-6-astra'),
+        '{"type":"turn.started"}',
+        LIMIT,
+      ],
+      'turn 13': [RESUMED, METADATA('gpt-6-sol').replace('item_0', 'item_1'), '{"type":"turn.started"}', LIMIT],
+    };
+    for (const [name, lines] of Object.entries(STREAMS)) {
+      for (const tail of [[], [TURN_FAILED]]) {
+        test(`${name} full stream${tail.length ? ' + turn.failed' : ''}: extracted then classified as a usage limit`, () => {
+          const extracted = agent.extractStdoutError([...lines, ...tail].join('\n'));
+          expect(extracted).toStartWith("You've hit your usage limit.");
+          const failure = agent.classifyFailure({ message: extracted!, stdoutError: extracted });
+          expect(failure.class).toBe('transient_overload');
+          expect(failure.reason).toBe('Codex usage limit reached — try again at Sep 27th, 2026 12:29 AM');
+        });
+      }
+    }
+
+    test('extraction never returns a warning item', () => {
+      expect(agent.extractStdoutError([RESUMED, METADATA('gpt-6-sol'), '{"type":"turn.started"}'].join('\n'))).toBeUndefined();
+    });
+
+    test('a truncated reset time is not quoted', () => {
+      const failure = agent.classifyFailure({ message: "You've hit your usage limit. … or try again at 4:43 " });
+      expect(failure.reason).toBe('Codex usage limit reached');
+    });
+
+    test('warnings alone never classify as a rejected model', () => {
+      const failure = agent.classifyFailure({ message: [RESUMED, METADATA('gpt-6-sol')].join('\n') });
+      expect(failure.class).not.toBe('fatal_config');
     });
 
     test('an unknown model id is fatal_config', () => {
@@ -425,9 +573,10 @@ describe('CodexPackaging', () => {
     expect(pkg.supportsContainerRunner()).toBe(true);
   });
 
-  test('docker install pins the verified release and resolves the arch', () => {
+  test('docker install resolves the latest release tag once and the arch', () => {
     const cmd = pkg.dockerInstallCommand();
-    expect(cmd).toContain(`rust-v${CODEX_PINNED_VERSION}`);
+    expect(cmd).toContain('releases/latest');
+    expect(cmd).not.toMatch(/rust-v[0-9]/);
     expect(cmd).toContain('x86_64-unknown-linux-musl');
     expect(cmd).toContain('aarch64-unknown-linux-musl');
     expect(pkg.generateDockerfile()).toContain(cmd);
@@ -448,10 +597,14 @@ describe('CodexPackaging', () => {
 
   // ...and from the SAME release as the CLI: the two handshake on a versioned
   // protocol, so a mixed pair is a runtime failure rather than a build one.
-  test('both binaries come from the one pinned release', () => {
-    const urls = [...pkg.dockerInstallCommand().matchAll(/rust-v([0-9][^/"\s]*)/g)].map(m => m[1]);
-    expect(urls.length).toBeGreaterThan(0);
-    for (const version of urls) expect(version).toBe(CODEX_PINNED_VERSION);
+  test('both binaries come from the one release tag, resolved once', () => {
+    for (const cmd of [pkg.dockerInstallCommand(), CODEX_INSTALL_HINT]) {
+      // One lookup of the latest tag; every download names that tag.
+      expect(cmd.match(/releases\/latest/g)?.length).toBe(1);
+      expect(cmd).not.toContain('releases/latest/download');
+      expect(cmd).toContain('releases/download/$tag/');
+      expect(cmd).not.toMatch(/rust-v[0-9]/);
+    }
   });
 
   test('supervisor tool checks name the codex binary', () => {
@@ -497,6 +650,35 @@ describe('codex-config', () => {
     expect(content).toContain('[mcp_servers.lazy]');
     expect(content).toContain('command = "/usr/local/bin/lazy-agent"');
     expect(content).toContain('args = ["mcp", "--task-id", "abc"]');
+  });
+
+  // INVARIANT: the lazy MCP server's tools are pre-approved. `codex exec`
+  // runs with approval policy `never`, under which an unapproved MCP call is
+  // denied — read-only turns reported "lazy_status and lazy_diff require
+  // approval". Which tools exist is lazy's per-turn choice (a read-only
+  // server never advertises the write tools), so approving them all is safe.
+  test('pre-approves the lazy MCP server tools', () => {
+    const content = renderCodexConfig({
+      proxyBaseUrl: 'http://x',
+      mcpServer: { command: 'lazy-agent', args: [] },
+    });
+    const section = content.slice(content.indexOf('[mcp_servers.lazy]'));
+    expect(section).toContain('default_tools_approval_mode = "approve"');
+  });
+
+  test("raises codex's 32 KiB project-doc cap so a large AGENTS.md is read whole", () => {
+    // INVARIANT: the managed config sets project_doc_max_bytes at top level (before any table). Codex 0.152.1 truncates the injected AGENTS.md at 32 KiB by default, silently dropping most of a large repo's instructions.
+    const content = renderCodexConfig({ proxyBaseUrl: 'http://x', mcpServer: { command: 'c', args: [] } });
+    expect(CODEX_PROJECT_DOC_MAX_BYTES).toBeGreaterThan(32768);
+    const line = `project_doc_max_bytes = ${CODEX_PROJECT_DOC_MAX_BYTES}`;
+    expect(content).toContain(line);
+    expect(content.indexOf(line)).toBeLessThan(content.indexOf('[model_providers.lazy]'));
+  });
+
+  test("turns off codex's plugin marketplace sync", () => {
+    // INVARIANT: the managed config disables codex's curated-plugin sync. With it on, codex (0.161.0) git-clones a marketplace into $CODEX_HOME/.tmp/plugins, which lives inside the task worktree, so every codex turn planted a nested repository that blocked accept.
+    const content = renderCodexConfig({ proxyBaseUrl: 'http://x', mcpServer: { command: 'c', args: [] } });
+    expect(content.slice(content.indexOf('[features]'))).toContain('plugins = false');
   });
 
   test('TOML-escapes strings via JSON escaping', () => {

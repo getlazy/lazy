@@ -69,6 +69,11 @@ export const EFFORT_EXPLICIT_METADATA_KEY = 'effort_explicit';
  * Mutates `task.metadata` in place when given a task, so a caller's local view
  * matches what was just written.
  */
+/** The metadata {@link pinChosenEffort} writes, for a create that writes it with the row. */
+export function chosenEffortMetadata(effort: EffortLevel | string): Record<string, string> {
+  return { effort, [EFFORT_EXPLICIT_METADATA_KEY]: 'true' };
+}
+
 export async function pinChosenEffort(
   storage: Storage,
   taskId: string,

@@ -251,7 +251,7 @@ describe('lazy web review surface', () => {
     expect(page).not.toContain('(structured)');
   });
 
-  // INVARIANT (CLAUDE.md, "never lose human feedback"): the comment is durably
+  // INVARIANT (AGENTS.md, "never lose human feedback"): the comment is durably
   // persisted BEFORE the ask is dispatched. Whatever the agent does — answer,
   // fail, or time out — the comment exists and is visible on reload.
   test('an inline comment is persisted and readable back through the threads API', async () => {
@@ -1128,7 +1128,7 @@ describe('lazy web review surface', () => {
     expect(workTurn!.prompt).toContain('C1: change this');
   }, 180_000);
 
-  // INVARIANT (CLAUDE.md, "never lose human feedback"): a question the agent
+  // INVARIANT (AGENTS.md, "never lose human feedback"): a question the agent
   // could not be asked is saved with the reason, and the reviewer can re-send it
   // without typing it again. The retry is a plain form POST + redirect so it
   // works with scripting off, exactly like unblock and accept.

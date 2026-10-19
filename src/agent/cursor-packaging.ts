@@ -8,6 +8,7 @@
  * all work unauthenticated.
  */
 
+import type { HealthCheck } from '../remote/driver';
 import type { AgentPackaging } from './interface';
 import { spawnSyncUnsupervised } from '../utils/spawn';
 
@@ -72,8 +73,8 @@ WORKDIR /work
     ];
   }
 
-  diagnose(): { state: 'ok' | 'fail'; what: string; reason?: string }[] {
-    const results: { state: 'ok' | 'fail'; what: string; reason?: string }[] = [];
+  diagnose(): HealthCheck[] {
+    const results: HealthCheck[] = [];
     try {
       const version = spawnSyncUnsupervised(['cursor-agent', '--version'], {
         stdout: 'pipe',
@@ -86,6 +87,7 @@ WORKDIR /work
         return [{
           state: 'fail',
           what: 'Cursor CLI installed',
+          problem: 'Cursor CLI isn\'t installed',
           reason: `Cursor CLI (cursor-agent) not found. ${INSTALL_HINT}`,
         }];
       }
@@ -93,6 +95,7 @@ WORKDIR /work
       return [{
         state: 'fail',
         what: 'Cursor CLI installed',
+        problem: 'Cursor CLI isn\'t installed',
         reason: `Cursor CLI (cursor-agent) not found. ${INSTALL_HINT}`,
       }];
     }
@@ -113,6 +116,7 @@ WORKDIR /work
         results.push({
           state: 'fail',
           what: 'Cursor CLI authenticated',
+          problem: 'Cursor CLI isn\'t logged in',
           reason: 'Not logged in. Run `cursor-agent login` or set CURSOR_API_KEY.',
         });
       }
@@ -120,6 +124,7 @@ WORKDIR /work
       results.push({
         state: 'fail',
         what: 'Cursor CLI authenticated',
+        problem: 'Cursor CLI isn\'t logged in',
         reason: 'Could not run `cursor-agent status`. Run `cursor-agent login` or set CURSOR_API_KEY.',
       });
     }

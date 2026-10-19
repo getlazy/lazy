@@ -165,7 +165,8 @@ describe('wrap-up executor: present (real executor, fake binary)', () => {
     // The present prompt is the REAL template with the §6.4 hint section
     // substituted — in this sandbox the carve resolves to nothing, so the
     // hint section collapses to its standing prose.
-    expect(invocations[0].argv[1]).toBe(presentRegionsTemplate.replace("{{provenance_hint}}", ""));
+    // The prompt rides stdin, never argv (src/agent/argv-safety.ts).
+    expect(invocations[0].stdin).toBe(presentRegionsTemplate.replace("{{provenance_hint}}", ""));
     expect(invocations[0].argv[invocations[0].argv.indexOf('--resume') + 1]).toBe('work-sess-1');
   });
 
@@ -501,7 +502,7 @@ describe('wrap-up executor: children-coverage lines in maintain and push-back pr
 
     const invocations = await readClaudeInvocations(fake);
     expect(invocations).toHaveLength(1);
-    const prompt = invocations[0].argv[1] as string;
+    const prompt = invocations[0].stdin as string;
     // Rendered, not raw: the placeholders were substituted.
     expect(prompt).not.toContain('{{');
     // Whitespace-normalized: the template's hand-wrapping must not be part of
@@ -536,7 +537,7 @@ describe('wrap-up executor: children-coverage lines in maintain and push-back pr
 
     const invocations = await readClaudeInvocations(fake);
     expect(invocations).toHaveLength(1);
-    const prompt = invocations[0].argv[1] as string;
+    const prompt = invocations[0].stdin as string;
     expect(prompt).not.toContain('{{');
     const flat = prompt.replace(/\s+/g, ' ');
     expect(flat).toContain('may have been changed by accepted children of this task');

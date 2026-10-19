@@ -37,6 +37,18 @@
  * it stamps. An agent never sends an identity and could not: the daemon looks
  * the owner up from the task it has already authenticated the agent as
  * (`authorizeMcpCall`).
+ *
+ * THE THIRD SOURCE: an agent's own launches. A turn a task's agent launches on
+ * its subtask (lazy_start, unblock, resume, ask, review) is part of that agent's
+ * turn, so it runs as a request whose owner is the owner of the CALLER task's
+ * LIVE turn (`agentLaunchOwnerRequest`, ./mcp-routes.ts; the live turn is
+ * resolved by ./mcp-turn-authority.ts, and outside one the launch is refused) —
+ * billed to them, `spendable`
+ * only in managed mode, and nobody when the parent's own turn had no owner. A
+ * start the usage pause held carries that owner on its record and is replayed
+ * under it (`holdAgentStart`, ./usage-pause.ts). A cluster restart is not a
+ * launch by the agent and stays a system turn. A Teams builder session's
+ * launches run as the member its session record names (`builderLaunchOwnerRequest`).
  */
 
 import { AsyncLocalStorage } from 'async_hooks';
@@ -47,6 +59,8 @@ import { AGENT_ACTOR, SYSTEM_ACTOR } from '../constants';
 import { shortId } from '../task/identity';
 import type { CreateTurnOptions, Storage } from '../storage/interface';
 import type { Actor, ActorInput, Turn, TurnAttribution, TurnOwner } from '../types';
+import { flushTurnLatency, getActiveTurnLatencyRecorder } from '../proxy/turn-latency-recorder';
+import { closesLatencyRollup } from '../task/turn-latency';
 
 /**
  * A pending turn owner: the person, plus whether their identity is one this
@@ -408,6 +422,7 @@ export async function createAgentTurn(
   projectRoot?: string,
 ): Promise<Turn> {
   options = scrubTurnContent(options);
+  await flushLatencyBeforeTurn(options);
   const person = await personForCurrentTurn(storage, options.sessionId, projectRoot);
   if (!person) return storage.createTurn(options);
   if (!person.system) return createRecoveredAgentTurn(storage, options, person);
@@ -548,6 +563,7 @@ export async function createRecoveredAgentTurn(
 ): Promise<Turn> {
   assertOneNamedPerson(options.actor, owner);
   options = scrubTurnContent(options);
+  await flushLatencyBeforeTurn(options);
   if (!owner) return storage.createTurn(options);
   const role = actorRole(options.actor) ?? AGENT_ACTOR;
   return storage.createTurn({
@@ -618,3 +634,19 @@ export function turnOwnerOfClaim(
   return { email, ...(name ? { name } : {}) };
 }
 
+
+/**
+ * Push the proxy's buffered latency for this session's task into the store
+ * before an agent row that closes a rollup (work, ask, review) is written, so it closes
+ * with every request it made (src/task/turn-latency.ts). A no-op without a
+ * proxy in this process or with nothing buffered; never throws.
+ */
+async function flushLatencyBeforeTurn(options: CreateTurnOptions): Promise<void> {
+  if (options.role !== 'agent' || !closesLatencyRollup(options.turnType)) return;
+  if (!getActiveTurnLatencyRecorder()?.pendingTaskIds().length) return;
+  try {
+    await flushTurnLatency();
+  } catch (err) {
+    logger.warn(`[turn-latency] flush before turn row failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}

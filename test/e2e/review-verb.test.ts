@@ -12,9 +12,10 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
-import { successScenario } from '../helpers/fake-claude';
+import { successScenario, sessionStartEvent, resultEvent } from '../helpers/fake-claude';
 import { readTurns, setTaskMetadata, setTaskStatus } from '../helpers/storage';
 import { IMPORT_SOURCE_URL_KEY } from '../../src/task/linked';
+import { launchAsPerson } from '../helpers/usage-pause';
 
 const REVIEW_JSON = JSON.stringify({
   verdict: 'clean',
@@ -65,9 +66,8 @@ describe('lazy review (real supervisor, fake claude)', () => {
     expect(reviewInv.argv[disallowIdx + 1]).toMatch(/Bash/);
     expect(reviewInv.argv[disallowIdx + 1]).toMatch(/Write/);
     expect(reviewInv.argv[disallowIdx + 1]).toMatch(/Edit/);
-    const promptIdx = reviewInv.argv.indexOf('-p');
-    expect(promptIdx).toBeGreaterThanOrEqual(0);
-    const prompt = reviewInv.argv[promptIdx + 1] ?? '';
+    // The prompt rides stdin, never argv (src/agent/argv-safety.ts).
+    const prompt = reviewInv.stdin ?? '';
     expect(prompt).toMatch(/SECURITY/i);
     expect(prompt).toMatch(/DATA INTEGRITY/i);
     expect(prompt).toMatch(/none found/);
@@ -247,5 +247,101 @@ describe('lazy review makes no forge write', () => {
     const result = await ctx.lazy(['review', taskId, '--yes']);
     expectSuccess(result);
     expect(forgeWrites().filter((w) => w.kind !== 'body')).toEqual([]);
+  }, 120_000);
+});
+
+/*
+ * A review is READ-ONLY, and inside a container a harness's own sandbox may be
+ * bypassed (Codex's cannot start there), so lazy enforces it itself, and a
+ * review that inspected nothing is not a review. These pin the SEPARATE review
+ * path end to end — the one `lazy review` takes — through the real supervisor.
+ */
+describe('lazy review read-only enforcement (real supervisor, fake claude)', () => {
+  let ctx: TestContext;
+  let taskId: string;
+
+  beforeEach(async () => {
+    ctx = await setupTestLazy({ fakeClaude: true });
+    taskId = await createTask(ctx, 'Review target', 'Do the work');
+    await ctx.setClaudeScenario(successScenario({ result: 'Work done.', sessionId: 'fake-sess-work' }));
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+  }, 120_000);
+
+  afterEach(async () => {
+    await ctx.cleanup();
+  });
+
+  function reviewVerdict(): string {
+    const review = readTurns(ctx.root, taskId).filter((t) => t.role === 'agent' && t.turn_type === 'review').pop();
+    expect(review).toBeDefined();
+    return String((review!.review as { verdict?: string } | undefined)?.verdict ?? '');
+  }
+
+  // INVARIANT: a review that writes to the worktree is a FAILED review naming
+  // what changed, and nothing is reverted.
+  test('a review that commits to the worktree is recorded as failed', async () => {
+    await ctx.setClaudeScenario(successScenario({
+      result: REVIEW_JSON,
+      sessionId: 'fake-sess-review',
+      commit: { message: 'Reviewer sneaks a fix', files: [{ path: 'sneaky.txt', content: 'x\n' }] },
+    }));
+    await ctx.lazy(['review', taskId, '--yes']);
+    const verdict = reviewVerdict();
+    expect(verdict).toStartWith('FAILED:');
+    expect(verdict).toContain('read-only');
+    expect(verdict).toContain('HEAD moved');
+  }, 120_000);
+
+  // INVARIANT: a `clean` verdict from a reviewer that called no tool is a
+  // FAILED review — a new review session has no diff in its prompt, so it read
+  // nothing. This is the bare pass Codex reviewers produced while blocked.
+  test('a clean verdict with no tool call is recorded as failed', async () => {
+    await ctx.setClaudeScenario({
+      steps: [
+        { kind: 'emit', event: sessionStartEvent('fake-sess-review') },
+        { kind: 'emit', event: resultEvent({ result: REVIEW_JSON, sessionId: 'fake-sess-review' }) },
+      ],
+    });
+    await ctx.lazy(['review', taskId, '--yes']);
+    const verdict = reviewVerdict();
+    expect(verdict).toStartWith('FAILED:');
+    expect(verdict).toContain('without calling a single tool');
+  }, 120_000);
+
+  // INVARIANT: a plan-mode (reflective) unblock is a READ-ONLY turn too, and
+  // gets the same write check. A violation fails the turn as FATAL, so it is
+  // never auto-resumed into a work turn on the dirtied worktree.
+  test('a plan-mode unblock that writes is failed, not auto-resumed', async () => {
+    await ctx.setClaudeScenario(successScenario({
+      result: 'Answered.',
+      sessionId: 'fake-sess-plan',
+      commit: { message: 'Plan turn sneaks a change', files: [{ path: 'plan-sneaky.txt', content: 'x\n' }] },
+    }));
+    const launched = await launchAsPerson(ctx, 'unblockTask', {
+      taskId, message: 'Why did you choose this approach?', permissionMode: 'plan',
+    });
+    expect(launched.exitCode).toBe(0);
+    await ctx.lazy(['wait', taskId]);
+    const last = readTurns(ctx.root, taskId).filter((t) => t.role === 'agent').pop();
+    expect(String(last?.content)).toContain('read-only');
+    expect(String(last?.content)).toContain('HEAD moved');
+    const shown = await ctx.lazy(['show', taskId]);
+    expect(shown.stdout).not.toContain('interrupted');
+  }, 120_000);
+
+  // INVARIANT: an ask that writes to the worktree fails, and the task goes back
+  // to the status the ask found — never `interrupted`, whose auto-resume would
+  // launch a WORK turn that commits the asker's edits as the implementer's.
+  test('an ask that writes is failed and the task is restored, not interrupted', async () => {
+    await ctx.setClaudeScenario(successScenario({
+      result: 'Answered.',
+      sessionId: 'fake-sess-ask',
+      commit: { message: 'Ask sneaks a change', files: [{ path: 'ask-sneaky.txt', content: 'x\n' }] },
+    }));
+    await ctx.lazy(['ask', taskId, '-m', 'why this approach?']);
+    const last = readTurns(ctx.root, taskId).filter((t) => t.role === 'agent').pop();
+    expect(String(last?.content)).toContain('read-only');
+    expectOutput(await ctx.lazy(['show', taskId]), 'blocked');
   }, 120_000);
 });

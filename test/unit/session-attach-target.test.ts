@@ -473,6 +473,8 @@ describe('session attach upgrader: the client cannot steer the exec', () => {
       preflight?: Awaited<ReturnType<typeof taskModeRefusals>>;
       launchThrows?: boolean;
       launched?: string[];
+      adopted?: string[];
+      adoptThrows?: boolean;
     } = {}) {
       return createSessionAttachUpgrader({
         getStorage: async () => fakeStorage() as Storage,
@@ -496,7 +498,18 @@ describe('session attach upgrader: the client cannot steer the exec', () => {
           if (opts.launchThrows) throw new Error('the registry is unreadable');
           const name = `lazymember-${email.split('@')[0]}-${(opts.launched?.length ?? 0) + 1}`;
           opts.launched?.push(name);
-          return { ok: true, container: { name, binary: 'docker', remove: async () => {} } };
+          return {
+            ok: true,
+            container: {
+              name,
+              binary: 'docker',
+              remove: async () => {},
+              adopt: async () => {
+                opts.adopted?.push(name);
+                if (opts.adoptThrows) throw new Error('sudo is unavailable');
+              },
+            },
+          };
         },
         memberContainerRunning: async () => true,
       });
@@ -530,6 +543,24 @@ describe('session attach upgrader: the client cannot steer the exec', () => {
       // Her container is what the vacate removed.
       expect(vacated).toEqual(['alice@example.com:lazymember-alice-1']);
       expect(await memberUpgrader('bob@example.com').tryUpgrade(req(), bob.server)).toBe('upgraded');
+      resetMemberTerminalsForTests();
+    });
+
+    // INVARIANT: a member terminal re-aligns worktree ownership on EVERY attach,
+    // including one that joins an already-running container: the root guest
+    // daemon keeps writing into the worktree after the container was created, so
+    // doing it only at creation left later root-owned files unwritable.
+    test('ownership is re-aligned on every attach, including a reused container, and a failure does not refuse the shell', async () => {
+      resetMemberTerminalsForTests();
+      const launched: string[] = [];
+      const adopted: string[] = [];
+      const { server, upgrades } = capturingServer();
+      expect(await memberUpgrader('alice@example.com', { launched, adopted }).tryUpgrade(req(), server)).toBe('upgraded');
+      expect(await prepareSocket(upgrades[0]!)).toEqual({ ok: true });
+      expect(await memberUpgrader('alice@example.com', { launched, adopted, adoptThrows: true }).tryUpgrade(req(), server)).toBe('upgraded');
+      expect(await prepareSocket(upgrades[1]!)).toEqual({ ok: true });
+      expect(launched).toEqual(['lazymember-alice-1']);
+      expect(adopted).toEqual(['lazymember-alice-1', 'lazymember-alice-1']);
       resetMemberTerminalsForTests();
     });
 

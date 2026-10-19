@@ -352,6 +352,12 @@ function formatPhase(phase: string): string | null {
     case 'wrap_up_done': return 'Wrap-up phase complete';
     case 'commit_leftovers': return 'Uncommitted work found — asking the agent to commit or discard it...';
     case 'commit_leftovers_done': return 'Uncommitted-work follow-up complete';
+    case 'commit_nudge': return 'Uncommitted changes found — asking the agent whether it committed all its work...';
+    case 'commit_nudge_done': return 'Uncommitted-changes check complete';
+    case 'background_nudge': return 'Background work was stopped at turn end — asking the agent whether it needed it...';
+    case 'background_nudge_done': return 'Stopped-background-work check complete';
+    case 'pending_notes': return 'New comments arrived during the turn — handing them to the agent...';
+    case 'pending_notes_done': return 'New comments handled';
     case 'present': return 'Presentation step: agent is authoring the walkthrough...';
     case 'present_done': return 'Presentation step complete';
     case 'post_turn_check': return 'Running post-turn check...';

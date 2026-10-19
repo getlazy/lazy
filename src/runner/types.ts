@@ -32,6 +32,11 @@ export interface DiagnoseOptions {
    * `--version` run). `lazy doctor` wants them; `lazy daemon health` runs on
    * demand and inside every doctor run, and must stay cheap and bounded, so it
    * passes false. Default: run them.
+   *
+   * The same `false` also makes the container-daemon probe a single attempt:
+   * the retry for a busy daemon (see `probeDaemonResponsive`) is for the
+   * thorough doctor run, and would push the bounded health path past its
+   * deadline.
    */
   launchProbes?: boolean;
 }
@@ -85,6 +90,11 @@ export interface LaunchBuilderDetachedParams {
    * (src/daemon/builder-start-trace.ts). Optional: without it nothing is timed.
    */
   trace?: LaunchPhaseTrace;
+  /**
+   * Launch on lazy's DEFAULT runner image: the daemon decided the project's
+   * own image is not ready, and the builder page says so in a banner.
+   */
+  useDefaultImage?: boolean;
 }
 
 /** A sink for one launch's timed phases and notes. */
@@ -102,6 +112,8 @@ export interface LaunchBuilderDetachedResult {
    * and the launch started a fresh conversation instead.
    */
   resumed: string | null;
+  /** The image the container was launched from. */
+  imageName?: string;
 }
 
 /** Information about a run (container or process). */

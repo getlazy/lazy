@@ -197,7 +197,16 @@ export async function profileCredentialRefusal(
 export async function targetCredentialRefusal(
   projectRoot: string,
   target: { profile: string; harness: string; credential: string },
+  opts: { config?: ResolvedConfig } = {},
 ): Promise<string | null> {
+  // A TIERED builder: the flattened target mirrors tier 0 only, but the proxy
+  // may move any request to any tier, so EVERY tier's credential is checked —
+  // and a daemon-env one loaded — here, the same gate a tiered task's turn
+  // passes. The proxy then pays each tier's request with that tier's own
+  // credential under the launch's own grant, never a task's.
+  const config = opts.config ?? (await loadConfig(projectRoot));
+  const configured = profileForAgentNameOrNull(config, target.profile);
+  if (configured?.tiers) return tieredCredentialRefusal(projectRoot, configured, { perUser: false });
   const profile = { name: target.profile, harness: target.harness, credential: target.credential } as AgentProfile;
   return profileCredentialRefusal(projectRoot, profile, { perUser: false });
 }
@@ -217,7 +226,35 @@ export async function turnCredentialRefusal(
   const config = opts.config ?? (await loadConfig(projectRoot));
   const profile = profileForAgentNameOrNull(config, agentId);
   if (!profile) return null;
+  if (profile.tiers) return tieredCredentialRefusal(projectRoot, profile, opts);
   return profileCredentialRefusal(projectRoot, profile, opts);
+}
+
+/**
+ * The gate for a TIERED profile: EVERY tier's credential, checked at launch.
+ *
+ * The proxy may move a turn to any tier mid-turn, so a tier whose credential is
+ * missing would otherwise surface as a 401 halfway through a turn — or tempt a
+ * "skip that tier" rule, which is exactly the silent fallback per-user billing
+ * forbids. So the launch is refused, naming the tier, until every tier can pay.
+ *
+ * Member mode checks every endpoint against the acting member in turn-credentials.
+ */
+async function tieredCredentialRefusal(
+  projectRoot: string,
+  profile: AgentProfile,
+  opts: { perUser: boolean; load?: boolean },
+): Promise<string | null> {
+  if (opts.perUser) return null; // The acting member’s endpoint requirements are checked by planTurnCredential.
+  for (const tier of profile.tiers ?? []) {
+    const refusal = await profileCredentialRefusal(
+      projectRoot,
+      { ...profile, name: `${profile.name}`, credential: tier.credential, tiers: undefined },
+      opts,
+    );
+    if (refusal) return `${refusal} (tier ${tier.index + 1}, endpoint "${tier.endpoint}")`;
+  }
+  return null;
 }
 
 /** One credential the configured profiles bill that turns on them would lack. */

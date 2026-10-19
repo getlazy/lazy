@@ -1,34 +1,20 @@
 /**
- * Real per-user Anthropic credentials, held by the daemon and by nothing else.
- *
- * WHY THIS EXISTS: with a control plane in front of the daemon (docs/design/
- * lazy-teams.md §3), each human's model spend must be billed to that human's
- * own Anthropic account. The daemon process env holds ONE credential, which is
- * exactly right for a single-user install and useless for a team. So the
- * control plane hands the daemon each member's credential once, over a
- * control-token RPC, and the daemon keeps it.
- *
- * THE INVARIANT THIS FILE PROTECTS: a real credential never leaves this
- * process. It is not written into any container's environment, not into a
- * worktree, and not into the repo. A container gets a session-bound PLACEHOLDER
- * (./session-credentials.ts); the proxy swaps the placeholder for the real
- * value on the way out (src/proxy/server.ts). That is why the file lives in
- * `~/.lazy/daemon/<slug>/`, mode 0600, and never under the project root: task
- * containers bind-mount the repo, so anything under `<project>/.lazy/` is
- * readable by every agent lazy runs.
- *
- * Scope of v1, per §3.2: long-lived credentials only — an OAuth setup-token or
- * an API key. There is no refresh machinery here, deliberately; lazy does not
- * replicate Claude Code's OAuth handshake (the same line the credential gate
- * draws, see ./credential-gate.ts).
+ * Daemon-private member + endpoint credential registry. Secrets and the protected
+ * migration backup live outside project worktrees. v1 adapters retain the old
+ * profile and origin fields while all stored accounts have stable v2 identities.
  */
 
 import { createHash } from 'crypto';
-import { mkdir, readFile, writeFile } from 'fs/promises';
+import { mkdir, readFile, open, rename, unlink } from 'fs/promises';
+import { randomUUID } from 'crypto';
+import { loadConfig } from '../config/loader';
+import { agentProfilesFor } from '../config/agent-profiles';
+import { endpointRequirementsForProfile, normalizeEndpointScope, consentScopeFor, credentialCompatibleWithEndpoint, credentialConsentedToEndpoint, legacyDefaultEndpointOrigin, type EndpointRequirement } from '../credentials/endpoint-requirements';
 import { dirname } from 'path';
 import { canonicalPersonEmail, isPersonEmail } from '../actor-ref';
 import { isValidName } from '../config/agent-profiles';
 import { getUserCredentialsPath } from './paths';
+import { isManagedMode } from '../config/managed-mode';
 
 /**
  * Which credential a user holds — and therefore which env var a placeholder for
@@ -87,18 +73,7 @@ export interface UserCredentialRecord {
    */
   ownerEmail?: string;
   ownerName?: string;
-  /**
-   * The AGENT PROFILE (`[agents.<name>]`) this credential pays for, or absent
-   * for the principal's Claude (Anthropic) credential — the one every record
-   * was before profiles had credentials of their own, and still the one that
-   * pays an Anthropic-billed profile whose traffic goes to Anthropic itself
-   * (./member-credentials.ts owns that rule).
-   *
-   * Keyed per PROFILE rather than per credential name on purpose: a member's
-   * token then only ever reaches the upstream of the profile they connected it
-   * for. Keyed by name, an `[agents.x]` block pointing anywhere with the default
-   * `anthropic` credential would carry every member's Anthropic token there.
-   */
+  /** Legacy adapter label; v2 account identity is endpointId. */
   profile?: string;
   /**
    * The member's CONSENT: the endpoint (origin; '' for the project's default
@@ -144,39 +119,26 @@ export interface UserCredentialSummary {
   updatedAt: string;
 }
 
-interface UserCredentialFile {
-  version: 1;
-  credentials: UserCredentialRecord[];
+export interface EndpointCredentialRecord extends UserCredentialRecord {
+  endpointId: string;
+  provider: string;
+  session: boolean;
 }
-
-/** Cached per project root — the launch path reads this on every turn start. */
+export interface EndpointCredentialSummary extends UserCredentialSummary {
+  endpointId: string;
+  origin: string | null;
+  provider: string;
+  session: boolean;
+  state?: 'conflicted';
+}
+interface UserCredentialFile {
+  version: 2;
+  billingMode: 'member' | 'solo';
+  credentials: EndpointCredentialRecord[];
+}
 const cache = new Map<string, UserCredentialFile>();
-/** Serializes read-modify-write cycles within this process. */
 let writeChain: Promise<unknown> = Promise.resolve();
 
-/**
- * The non-email spellings a credential may be keyed by. Kept beside the email
- * form rather than replaced by it: an install that already holds credentials
- * under a control plane's id must not have them become unreachable by an
- * upgrade, and the daemon's own reserved key is not an address.
- *
- * DELIBERATE AND TEMPORARY, and it now has NO PRODUCER LEFT — only records
- * written by an earlier release. The mint takes an `(email, name)` pair by name
- * as of `teams-identity-is-the-token`, and the control plane puts credentials
- * under addresses as of `teams-every-human-action-on-the-users-token`
- * (docs/design/actor-identity-and-remote-clients.md §3.6), so every live token
- * and every new credential identifies its holder by address and a turn is billed
- * to that address.
- *
- * What it survives FOR is the other half of that change: the control plane's
- * re-put also REVOKES the credentials still filed under `user-12`, which are
- * unreachable for anybody (the member is refused with the no-credential marker
- * while a live secret sits under a key nothing will ever ask for again) — and a
- * revoke has to be able to name the key it is removing. Delete this once the
- * re-put has run on the install (`bin/rails user_credentials:reput`, whose
- * ordered place in the upgrade is in lazy-teams/docs/self-host-deploy.md),
- * turning `isValidCredentialKey` into `isPersonEmail` plus the reserved key.
- */
 const USER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 /**
@@ -277,280 +239,348 @@ function resolveOwner(
   return { email: canonicalPersonEmail(email), ...(name ? { name } : {}) };
 }
 
-function emptyFile(): UserCredentialFile {
-  return { version: 1, credentials: [] };
+/** All reads, migrations and mutations share the same serialization. */
+function serialized<T>(fn: () => Promise<T>): Promise<T> {
+  const run = writeChain.then(fn);
+  // The caller observes rejection; the queue must remain usable afterwards.
+  writeChain = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+function validateRecord(value: unknown, version: 1 | 2): asserts value is EndpointCredentialRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Credential entry must be an object.');
+  const r = value as EndpointCredentialRecord;
+  if (typeof r.userId !== 'string' || !isValidCredentialKey(canonicalCredentialKey(r.userId)) ||
+      !USER_CREDENTIAL_KINDS.includes(r.kind) || typeof r.token !== 'string' ||
+      typeof r.label !== 'string' || typeof r.updatedAt !== 'string' || !Number.isFinite(Date.parse(r.updatedAt))) {
+    throw new Error('Credential entry has invalid identity, kind, secret, label or timestamp.');
+  }
+  if (r.profile !== undefined && (typeof r.profile !== 'string' || !isValidName(r.profile))) throw new Error('Invalid legacy profile.');
+  if (r.endpoint !== undefined && r.endpoint !== null && typeof r.endpoint !== 'string') throw new Error('Invalid origin consent.');
+  if (r.endpoint) normalizeEndpointScope(r.endpoint);
+  for (const field of ['ownerEmail', 'ownerName', 'sameAs', 'pushedDigest'] as const) {
+    if (r[field] !== undefined && typeof r[field] !== 'string') throw new Error(`Invalid ${field}.`);
+  }
+  resolveOwner(canonicalCredentialKey(r.userId), r);
+  if (r.sameAs !== undefined && (r.userId !== SERVICE_CREDENTIAL_USER_ID || !isPersonEmail(r.sameAs) || (version === 1 && !r.profile))) throw new Error('Invalid service holder reference.');
+  if (r.sameAs && r.ownerEmail && canonicalCredentialKey(r.sameAs) !== canonicalCredentialKey(r.ownerEmail)) throw new Error('Service holder reference contradicts ownerEmail.');
+  if (!r.token.trim() && !r.sameAs) throw new Error('Empty credential secret.');
+  if (r.pushedDigest !== undefined && !/^[a-f0-9]{64}$/.test(r.pushedDigest)) throw new Error('Invalid renewal push digest.');
+  if (version === 2 && (!isEndpointIdentity(r.endpointId) || typeof r.provider !== 'string' || !r.provider || typeof r.session !== 'boolean')) throw new Error('Invalid endpoint credential semantics.');
+}
+
+export function isEndpointIdentity(value: unknown): value is string {
+  return typeof value === 'string' && (isValidName(value) || /^(profile|builtin):[a-z0-9][a-z0-9._-]*$/.test(value));
+}
+
+async function legacyRequirement(projectRoot: string, profile?: string): Promise<{ endpointId: string; provider: string; session: boolean }> {
+  if (!profile) return { endpointId: 'builtin:anthropic', provider: 'anthropic', session: false };
+  const config = await loadConfig(projectRoot);
+  const resolved = agentProfilesFor(config).get(profile);
+  if (!resolved) return { endpointId: `profile:${profile}`, provider: `legacy:${profile}`, session: false };
+  const { endpointId, provider, session } = endpointRequirementsForProfile(resolved, config)[0]!;
+  return { endpointId, provider, session };
+}
+
+function storedOriginConsent(endpointId: string, origin: string | null): string | null {
+  // The PATH is kept: consent names origin + path (normalizeEndpointScope).
+  return origin === '' ? legacyDefaultEndpointOrigin(endpointId) ?? '' : origin ? consentScopeFor(origin) : origin;
+}
+
+/** Write a private temporary file, fsync it, then replace in one rename. */
+async function atomicPrivateWrite(path: string, contents: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  const temp = `${path}.${randomUUID()}.tmp`;
+  const handle = await open(temp, 'wx', 0o600);
+  try {
+    await handle.writeFile(contents);
+    await handle.sync();
+  } finally { await handle.close(); }
+  try { await rename(temp, path); }
+  catch (err) {
+    await unlink(temp);
+    throw new Error(`Failed to replace credential registry at ${path}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+async function persist(projectRoot: string, file: UserCredentialFile): Promise<void> {
+  for (const record of file.credentials) validateRecord(record, 2);
+  await atomicPrivateWrite(getUserCredentialsPath(projectRoot), JSON.stringify(file, null, 2));
+  cache.set(projectRoot, file);
 }
 
 async function load(projectRoot: string): Promise<UserCredentialFile> {
   const cached = cache.get(projectRoot);
   if (cached) return cached;
-
   const path = getUserCredentialsPath(projectRoot);
-  let parsed: UserCredentialFile;
-  try {
-    const raw = await readFile(path, 'utf-8');
-    const data = JSON.parse(raw) as Partial<UserCredentialFile>;
-    parsed = {
-      version: 1,
-      credentials: Array.isArray(data.credentials) ? data.credentials : [],
-    };
-  } catch (err) {
-    // A missing file is the normal state of every install that has never had a
-    // control plane in front of it. A file that EXISTS but will not parse is a
-    // different thing entirely — silently treating it as empty would bill every
-    // user's traffic to the daemon's own credential without a word.
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      parsed = emptyFile();
-    } else {
-      throw new Error(
-        `Failed to read the per-user credential store at ${path}: ` +
-        `${err instanceof Error ? err.message : String(err)}`,
-      );
+  let raw: string;
+  try { raw = await readFile(path, 'utf8'); }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error(`Failed to read credential registry at ${path}: ${err instanceof Error ? err.message : String(err)}`);
+    // Do not automatically restore the v1 backup: it may contain revoked secrets.
+    try {
+      await readFile(`${path}.v1-backup`, 'utf8');
+      throw new Error(`Credential registry at ${path} is missing but its migration backup exists. Reconcile explicitly; automatic recovery could resurrect revoked credentials.`);
+    } catch (backupError) {
+      if ((backupError as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error(`Cannot initialize credential registry: ${backupError instanceof Error ? backupError.message : String(backupError)}`);
     }
+    const empty: UserCredentialFile = { version: 2, billingMode: isManagedMode() ? 'member' : 'solo', credentials: [] };
+    if (isManagedMode()) await persist(projectRoot, empty);
+    return empty;
   }
-
-  cache.set(projectRoot, parsed);
-  return parsed;
+  try {
+    let data;
+    try { data = JSON.parse(raw); }
+    catch {
+      // Bun syntax errors can quote token bytes from the secret-bearing input.
+      throw new Error('Malformed registry JSON. Repair the credential registry before retrying.');
+    }
+    if (!data || ![1, 2].includes(data.version) || !Array.isArray(data.credentials)) throw new Error('Expected version 1 or 2 and a credentials array.');
+    for (const record of data.credentials) validateRecord(record, data.version);
+    let file: UserCredentialFile;
+    if (data.version === 1) {
+      const credentials: EndpointCredentialRecord[] = [];
+      for (const r of data.credentials as UserCredentialRecord[]) {
+        const requirement = await legacyRequirement(projectRoot, r.profile);
+        const migrated: EndpointCredentialRecord = {
+          ...r, userId: canonicalCredentialKey(r.userId), ...requirement,
+          // Only the profile-less historical Claude slot carried implicit Anthropic consent.
+          endpoint: storedOriginConsent(requirement.endpointId, r.endpoint === undefined ? r.profile ? null : 'https://api.anthropic.com' : r.endpoint),
+          ...(r.ownerEmail ? { ownerEmail: canonicalCredentialKey(r.ownerEmail) } : {}),
+          ...(r.sameAs ? { sameAs: canonicalCredentialKey(r.sameAs) } : {}),
+        };
+        // Coalesce only an identical account AND consent/auth/renewal metadata.
+        if (!credentials.some(c => equivalent(c, migrated))) credentials.push(migrated);
+      }
+      file = { version: 2, billingMode: isManagedMode() || credentials.some(c => c.userId !== SERVICE_CREDENTIAL_USER_ID) ? 'member' : 'solo', credentials };
+      for (const r of file.credentials) validateRecord(r, 2);
+      const backup = `${path}.v1-backup`;
+      try {
+        const handle = await open(backup, 'wx', 0o600);
+        try { await handle.writeFile(raw); await handle.sync(); } finally { await handle.close(); }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw new Error(`Could not protect migration backup: ${err instanceof Error ? err.message : String(err)}`);
+        throw new Error('A migration backup already exists beside a v1 registry. Reconcile explicitly; this may be an interrupted migration or restored credentials revoked since migration.');
+      }
+      await persist(projectRoot, file);
+    } else {
+      if (!['member', 'solo'].includes(data.billingMode)) throw new Error('Credential billing mode is missing or invalid; paid spending is refused.');
+      file = data;
+      if (isManagedMode() && file.billingMode !== 'member') { file = { ...file, billingMode: 'member' }; await persist(projectRoot, file); }
+    }
+    cache.set(projectRoot, file);
+    return file;
+  } catch (err) {
+    throw new Error(`Cannot use credential registry at ${path}: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
-async function persist(projectRoot: string, file: UserCredentialFile): Promise<void> {
-  const path = getUserCredentialsPath(projectRoot);
-  await mkdir(dirname(path), { recursive: true });
-  // 0600: real Anthropic credentials. Same posture as the token registry.
-  await writeFile(path, JSON.stringify(file, null, 2), { mode: 0o600 });
-  cache.set(projectRoot, file);
+function equivalent(a: EndpointCredentialRecord, b: EndpointCredentialRecord): boolean {
+  return ['userId', 'endpointId', 'token', 'endpoint', 'provider', 'session', 'kind', 'sameAs', 'pushedDigest', 'ownerEmail', 'ownerName', 'label'].every(k => a[k as keyof EndpointCredentialRecord] === b[k as keyof EndpointCredentialRecord]);
+}
+function sameSlot(record: EndpointCredentialRecord, member: string, endpointId: string): boolean {
+  return canonicalCredentialKey(record.userId) === member && record.endpointId === endpointId;
+}
+function digestOf(secret: string): string { return createHash('sha256').update(secret).digest('hex'); }
+export function clearUserCredentialCache(): void { cache.clear(); }
+
+export async function setCredentialBillingMode(projectRoot: string): Promise<void> {
+  return serialized(async () => { const file = await load(projectRoot); await persist(projectRoot, { ...file, billingMode: 'member' }); });
+}
+export async function teamModeEnabled(projectRoot: string): Promise<boolean> {
+  return serialized(async () => (await load(projectRoot)).billingMode === 'member');
 }
 
-/** Serialize a read-modify-write against the store. */
-async function mutate<T>(
-  projectRoot: string,
-  fn: (file: UserCredentialFile) => Promise<T> | T,
-): Promise<T> {
-  const run = writeChain.then(async () => {
-    const file = await load(projectRoot);
-    return fn(file);
-  });
-  writeChain = run.catch(() => {});
-  return run;
+export interface PutEndpointCredentialInput {
+  userId: string;
+  endpointId: string;
+  origin: string | null;
+  provider: string;
+  session?: boolean;
+  kind: UserCredentialKind;
+  token: string;
+  label?: string;
+  ownerEmail?: string;
+  ownerName?: string;
+  renewable?: boolean;
+  sameAs?: string;
+  /** Kept only for old callers' summaries. */
+  profile?: string;
 }
 
-/** Drop the in-memory cache. Tests, and any process that is not the daemon. */
-export function clearUserCredentialCache(): void {
-  cache.clear();
+/** External usage-store boundary; defaults to the daemon's durable invalidator. */
+export type EndpointUsageInvalidator = (projectRoot: string, member: string, endpointId: string) => Promise<void>;
+async function clearUsage(projectRoot: string, member: string, endpointId: string): Promise<void> {
+  const module = await import('./usage-readings');
+  await module.clearMemberEndpointUsage(projectRoot, member, endpointId);
 }
 
-/**
- * Store (or replace) one principal's real credential.
- *
- * Control-plane only — the RPC layer enforces that (see `requireControlActor`
- * in ./rpc-handlers.ts). Re-putting the same `userId` replaces the credential
- * in place rather than accumulating a second equally-valid secret.
- */
-export async function putUserCredential(
-  projectRoot: string,
-  input: {
-    userId: string;
-    kind: UserCredentialKind;
-    token: string;
-    label?: string;
-    ownerEmail?: string;
-    ownerName?: string;
-    /** The agent profile this credential pays for; omitted for the Claude credential. */
-    profile?: string;
-    /** The endpoint the member was SHOWN, as the control plane sent it — see the record field. Never config. */
-    endpoint?: string | null;
-    /** True for a credential lazy renews itself; see `pushedDigest`. */
-    renewable?: boolean;
-    /** Service key, session profile: the holder whose own record pays — see the record field. */
-    sameAs?: string;
-  },
-): Promise<UserCredentialSummary> {
+export async function putEndpointCredential(projectRoot: string, input: PutEndpointCredentialInput, invalidate: EndpointUsageInvalidator = clearUsage): Promise<EndpointCredentialSummary> {
+  return putCredential(projectRoot, input, invalidate, false);
+}
+
+async function putCredential(projectRoot: string, input: PutEndpointCredentialInput, invalidate: EndpointUsageInvalidator, optInMemberBilling: boolean): Promise<EndpointCredentialSummary> {
   const userId = canonicalCredentialKey(input.userId);
-  const profile = input.profile?.trim() || undefined;
-  if (profile !== undefined && !isValidName(profile)) {
-    throw new Error(
-      `Invalid profile '${input.profile}'. A profile name is lowercase letters, digits, and . _ - ` +
-      `(starting with a letter or digit) — the name of an [agents.<name>] block.`,
-    );
-  }
-  if (!isValidCredentialKey(userId)) {
-    throw new Error(
-      `Invalid userId '${input.userId}'. A credential is keyed by the person's email — ` +
-      `the same way the store names people — or by 1-128 characters of letters, digits, ` +
-      `'.', '_', ':' or '-' starting with a letter or digit.`,
-    );
-  }
-  if (!USER_CREDENTIAL_KINDS.includes(input.kind)) {
-    throw new Error(
-      `Invalid credential kind '${input.kind}'. Expected 'oauth' (a \`claude setup-token\` ` +
-      `token, sent as Authorization: Bearer) or 'api-key' (an Anthropic API key, sent as x-api-key).`,
-    );
-  }
-  const sameAs = input.sameAs ? canonicalCredentialKey(input.sameAs) : undefined;
-  if (sameAs !== undefined && (userId !== SERVICE_CREDENTIAL_USER_ID || !isPersonEmail(sameAs) || !input.profile)) {
-    throw new Error(
-      `Refusing a credential for '${userId}' that refers to '${input.sameAs}': only the service key's ` +
-      `credential for an agent profile may refer to a member's own, by their address.`,
-    );
-  }
-  const token = sameAs !== undefined ? '' : input.token.trim();
-  if (!token && sameAs === undefined) {
-    throw new Error(`Refusing to store an empty credential for user '${userId}'.`);
-  }
-
+  if (!isValidCredentialKey(userId)) throw new Error(`Invalid userId '${input.userId}'.`);
   const owner = resolveOwner(userId, input);
-
-  const pushedDigest = input.renewable ? digestOf(token) : undefined;
-  const record: UserCredentialRecord = {
-    userId,
-    kind: input.kind,
-    token,
-    label: input.label?.trim() || userId,
-    ...(owner.email ? { ownerEmail: owner.email } : {}),
-    ...(owner.name ? { ownerName: owner.name } : {}),
-    ...(profile !== undefined ? { profile, endpoint: input.endpoint ?? null } : {}),
-    ...(pushedDigest ? { pushedDigest } : {}),
-    ...(sameAs !== undefined ? { sameAs } : {}),
-    updatedAt: new Date().toISOString(),
+  const sameAs = input.sameAs ? canonicalCredentialKey(input.sameAs) : undefined;
+  const token = sameAs ? '' : input.token.trim();
+  const record: EndpointCredentialRecord = {
+    userId, endpointId: input.endpointId, provider: input.provider, session: input.session ?? false,
+    kind: input.kind, token, label: input.label?.trim() || userId,
+    endpoint: storedOriginConsent(input.endpointId, input.origin),
+    ...(input.profile ? { profile: input.profile } : {}),
+    ...(owner.email ? { ownerEmail: owner.email } : {}), ...(owner.name ? { ownerName: owner.name } : {}),
+    ...(sameAs ? { sameAs } : {}), ...(input.renewable ? { pushedDigest: digestOf(token) } : {}), updatedAt: new Date().toISOString(),
   };
-
-  return mutate(projectRoot, async (file) => {
-    const existing = file.credentials.find((c) => sameSlot(c, userId, profile));
-    // THE SAME RENEWABLE SECRET, PUSHED AGAIN: keep the renewed one. The
-    // original's refresh token is already retired upstream, so storing it
-    // again would log the member out on the next renewal.
-    const stored = existing && pushedDigest && existing.pushedDigest === pushedDigest && existing.kind === record.kind
-      ? { ...record, token: existing.token }
-      : record;
-    // Both sides canonicalised, so re-putting under a corrected spelling
-    // REPLACES a record an earlier daemon stored raw rather than leaving that
-    // person with two credentials and no way to tell which one is spent.
-    const credentials = file.credentials.filter((c) => !sameSlot(c, userId, profile));
-    credentials.push(stored);
-    await persist(projectRoot, { version: 1, credentials });
+  validateRecord(record, 2);
+  return serialized(async () => {
+    const file = await load(projectRoot);
+    const entries = file.credentials.filter(c => sameSlot(c, userId, record.endpointId));
+    const old = entries.length === 1 ? entries[0] : undefined;
+    const samePush = old && record.pushedDigest && old.pushedDigest === record.pushedDigest && old.kind === record.kind && old.provider === record.provider && old.session === record.session;
+    const stored = samePush ? { ...record, token: old.token } : record;
+    const remaining = file.credentials.filter(c => !sameSlot(c, userId, record.endpointId));
+    const changed = entries.length !== 1 || old!.token !== stored.token || old!.endpoint !== stored.endpoint || old!.kind !== stored.kind || old!.provider !== stored.provider || old!.session !== stored.session || old!.sameAs !== stored.sameAs || old!.ownerEmail !== stored.ownerEmail;
+    if (changed && userId !== SERVICE_CREDENTIAL_USER_ID) {
+      // Detach BEFORE erasing readings. A failed write preserves the old reading;
+      // a later failure leaves no spendable slot, including after a restart.
+      // Clear first connections too, so re-push recovers a previously failed clear.
+      await persist(projectRoot, { ...file, credentials: remaining });
+      try { await invalidate(projectRoot, userId, stored.endpointId); }
+      catch (err) {
+        throw new Error(`Endpoint '${stored.endpointId}' for '${userId}' was disconnected, but its usage reading could not be cleared. Reconnect to retry: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    // Service records designate a holder; they do not replace the holder's
+    // own endpoint account, so changing them must preserve that account's usage.
+    // Legacy member opt-in and its validated credential become visible together.
+    // Detach/clear failures preserve the old mode; endpoint provisioning never changes it.
+    await persist(projectRoot, { ...file, billingMode: optInMemberBilling && userId !== SERVICE_CREDENTIAL_USER_ID ? 'member' : file.billingMode, credentials: [...remaining, stored] });
     return summarize(stored);
   });
 }
 
-/**
- * Write back a secret lazy RENEWED itself (a rotated ChatGPT session) into an
- * existing record, keeping everything else — above all `pushedDigest`, which
- * is what stops the control plane's next re-push of the original from undoing
- * this.
- *
- * COMPARE-AND-SWAP on `renewedFrom`, the secret the renewal started from: a
- * member may reconnect a NEW session while an old one renews, and writing the
- * old account's renewal over it would keep the new record's digest — so every
- * later re-push would match and the member would stay billed on the login they
- * replaced. False, and nothing written, when the record is gone or no longer
- * holds that secret.
- */
-export async function storeRenewedUserCredential(
-  projectRoot: string,
-  userId: string,
-  profile: string | undefined,
-  token: string,
-  renewedFrom: string,
-): Promise<boolean> {
-  const key = canonicalCredentialKey(userId);
-  return mutate(projectRoot, async (file) => {
-    const existing = file.credentials.find((c) => sameSlot(c, key, profile));
-    if (!existing || existing.token !== renewedFrom) return false;
-    const renewed: UserCredentialRecord = { ...existing, token, updatedAt: new Date().toISOString() };
-    const credentials = file.credentials.filter((c) => !sameSlot(c, key, profile));
-    credentials.push(renewed);
-    await persist(projectRoot, { version: 1, credentials });
+export async function getEndpointCredential(projectRoot: string, userId: string, endpointId: string): Promise<EndpointCredentialRecord | null> {
+  return serialized(async () => {
+    const entries = (await load(projectRoot)).credentials.filter(c => sameSlot(c, canonicalCredentialKey(userId), endpointId));
+    return entries.length === 1 ? { ...entries[0]! } : null;
+  });
+}
+
+export type EndpointCredentialState = { state: 'connected' | 'missing' | 'stale' | 'conflicted' | 'none-needed'; detail?: string };
+export async function endpointCredentialState(projectRoot: string, userId: string, requirement: EndpointRequirement): Promise<EndpointCredentialState> {
+  if (!requirement.kinds.length) return { state: 'none-needed' };
+  return serialized(async () => {
+    const file = await load(projectRoot);
+    let member = canonicalCredentialKey(userId);
+    if (member === SERVICE_CREDENTIAL_USER_ID) {
+      const service = serviceHolderFromRecords(file.credentials);
+      if (service.conflicted) return { state: 'conflicted', detail: 'Service connections name different holders; choose one service holder.' };
+      if (!service.holder) return { state: 'missing', detail: 'No service holder is designated.' };
+      member = service.holder.email;
+    }
+    const records = file.credentials.filter(c => sameSlot(c, member, requirement.endpointId));
+    if (records.length > 1) return { state: 'conflicted', detail: 'Multiple retained connections require the owner to choose an account.' };
+    const record = records[0];
+    if (!record) return { state: 'missing' };
+    if (!credentialConsentedToEndpoint(record, requirement) || !credentialCompatibleWithEndpoint(record, requirement)) return { state: 'stale', detail: 'The connection does not match this endpoint origin or authentication.' };
+    return { state: 'connected' };
+  });
+}
+
+export async function revokeEndpointCredential(projectRoot: string, userId: string, endpointId: string, invalidate: EndpointUsageInvalidator = clearUsage): Promise<boolean> {
+  return serialized(async () => {
+    const file = await load(projectRoot);
+    const entries = file.credentials.filter(c => sameSlot(c, canonicalCredentialKey(userId), endpointId));
+    if (!entries.length) return false;
+    await persist(projectRoot, { ...file, credentials: file.credentials.filter(c => !entries.includes(c)) });
+    const member = canonicalCredentialKey(userId);
+    if (member !== SERVICE_CREDENTIAL_USER_ID) {
+      try { await invalidate(projectRoot, member, endpointId); }
+      catch (err) {
+        throw new Error(`Endpoint '${endpointId}' for '${member}' was revoked, but its usage reading could not be cleared. Reconnect to retry: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    return true;
+  });
+}
+export async function storeRenewedEndpointCredential(projectRoot: string, userId: string, endpointId: string, token: string, renewedFrom: string): Promise<boolean> {
+  return serialized(async () => {
+    const file = await load(projectRoot);
+    const entries = file.credentials.filter(c => sameSlot(c, canonicalCredentialKey(userId), endpointId));
+    if (entries.length !== 1 || entries[0]!.token !== renewedFrom) return false;
+    const old = entries[0]!;
+    await persist(projectRoot, { ...file, credentials: file.credentials.map(c => c === old ? { ...c, token, updatedAt: new Date().toISOString() } : c) });
     return true;
   });
 }
 
-/** One record per (principal, profile); an absent profile is the Claude credential. */
-function sameSlot(record: UserCredentialRecord, canonicalUserId: string, profile: string | undefined): boolean {
-  return canonicalCredentialKey(record.userId) === canonicalUserId && (record.profile || undefined) === profile;
+/** Compatibility adapters: a profile lookup never borrows another endpoint's account. */
+export async function putUserCredential(projectRoot: string, input: Omit<PutEndpointCredentialInput, 'endpointId' | 'origin' | 'provider'> & { endpoint?: string | null }): Promise<UserCredentialSummary> {
+  if (input.profile && !isValidName(input.profile)) throw new Error(`Invalid profile '${input.profile}'.`);
+  const requirement = await legacyRequirement(projectRoot, input.profile);
+  return putCredential(projectRoot, { ...input, ...requirement, origin: input.profile ? input.endpoint ?? null : 'https://api.anthropic.com' }, clearUsage, true);
 }
-
-function digestOf(secret: string): string {
-  return createHash('sha256').update(secret).digest('hex');
+export async function getUserCredential(projectRoot: string, userId: string, profile?: string): Promise<UserCredentialRecord | null> {
+  const requirement = await legacyRequirement(projectRoot, profile);
+  const record = await getEndpointCredential(projectRoot, userId, requirement.endpointId);
+  if (record && !profile && (record.endpoint !== 'https://api.anthropic.com' || record.provider !== 'anthropic' || record.session)) return null;
+  // New endpoint rows may be served to old profile callers only after checking
+  // their actual consent. Translate the old default-origin spelling afterwards.
+  if (record && profile && (!record.profile || requirement.endpointId === 'builtin:cursor')) {
+    const config = await loadConfig(projectRoot);
+    const resolved = agentProfilesFor(config).get(profile);
+    const expected = resolved ? endpointRequirementsForProfile(resolved, config)[0] : undefined;
+    if (!expected || !credentialConsentedToEndpoint(record, expected) || !credentialCompatibleWithEndpoint(record, expected)) return null;
+    return { ...record, profile, endpoint: resolved!.endpoint ? consentScopeFor(resolved!.endpoint) : '' };
+  }
+  return record;
 }
-
+export async function revokeUserCredential(projectRoot: string, userId: string, profile?: string): Promise<boolean> {
+  return revokeEndpointCredential(projectRoot, userId, (await legacyRequirement(projectRoot, profile)).endpointId);
+}
+export async function storeRenewedUserCredential(projectRoot: string, userId: string, profile: string | undefined, token: string, renewedFrom: string): Promise<boolean> {
+  return storeRenewedEndpointCredential(projectRoot, userId, (await legacyRequirement(projectRoot, profile)).endpointId, token, renewedFrom);
+}
+export async function getServiceCredential(projectRoot: string): Promise<UserCredentialRecord | null> { return getUserCredential(projectRoot, SERVICE_CREDENTIAL_USER_ID); }
+function serviceHolderFromRecords(credentials: EndpointCredentialRecord[]): {
+  holder: { email: string; name?: string } | null;
+  conflicted: boolean;
+} {
+  const records = credentials.filter(c => c.userId === SERVICE_CREDENTIAL_USER_ID && (c.ownerEmail || c.sameAs));
+  const holders = new Set(records.map(c => canonicalCredentialKey(c.ownerEmail ?? c.sameAs!)));
+  if (holders.size !== 1) return { holder: null, conflicted: holders.size > 1 };
+  const record = records[0]!;
+  return { holder: { email: canonicalCredentialKey(record.ownerEmail ?? record.sameAs!), ...(record.ownerName ? { name: record.ownerName } : {}) }, conflicted: false };
+}
+export async function getServiceHolder(projectRoot: string): Promise<{ email: string; name?: string } | null> {
+  return serialized(async () => serviceHolderFromRecords((await load(projectRoot)).credentials).holder);
+}
 /**
- * Remove a principal's credential — their Claude credential, or with `profile`
- * the one they connected for that agent profile. Returns false when there was
- * none. One slot at a time: taking back a Claude credential must not also take
- * back a key the member connected for some other profile.
+ * The service holder as this daemon knows it, and why there is none: the holder
+ * is named only by the service records Teams delivered, so "none" means either
+ * nothing was delivered or the delivered records name different holders.
  */
-export async function revokeUserCredential(
-  projectRoot: string,
-  userId: string,
-  profile?: string,
-): Promise<boolean> {
-  const key = canonicalCredentialKey(userId);
-  const slot = profile?.trim() || undefined;
-  return mutate(projectRoot, async (file) => {
-    const credentials = file.credentials.filter((c) => !sameSlot(c, key, slot));
-    if (credentials.length === file.credentials.length) return false;
-    await persist(projectRoot, { version: 1, credentials });
-    return true;
-  });
+export async function getServiceHolderState(projectRoot: string): Promise<{ holder: { email: string; name?: string } | null; conflicted: boolean }> {
+  return serialized(async () => serviceHolderFromRecords((await load(projectRoot)).credentials));
 }
-
-/**
- * The real credential for a principal, or null. Daemon-internal use only.
- *
- * Without `profile` this is their Claude credential; with it, the one they
- * connected for that profile. Which of the two a TURN spends is not decided
- * here — see ./member-credentials.ts.
- */
-export async function getUserCredential(
-  projectRoot: string,
-  userId: string,
-  profile?: string,
-): Promise<UserCredentialRecord | null> {
-  const file = await load(projectRoot);
-  const key = canonicalCredentialKey(userId);
-  return file.credentials.find((c) => sameSlot(c, key, profile)) ?? null;
-}
-
-/** The project-level service credential for system-initiated turns, or null. */
-export async function getServiceCredential(
-  projectRoot: string,
-): Promise<UserCredentialRecord | null> {
-  return getUserCredential(projectRoot, SERVICE_CREDENTIAL_USER_ID);
-}
-
-/** Every stored credential, without secrets. */
-export async function listUserCredentials(
-  projectRoot: string,
-): Promise<UserCredentialSummary[]> {
-  const file = await load(projectRoot);
-  return file.credentials.map(summarize);
-}
-
-/**
- * Is this project in TEAM MODE — i.e. has a control plane ever handed the
- * daemon a per-user credential?
- *
- * This one predicate is what keeps every single-user install on exactly the
- * path it was on before this feature existed. No `putUserCredential` call has
- * ever been made → false → the launch path reads the daemon's process env, the
- * proxy forwards auth headers verbatim, and nothing below is reachable.
- *
- * The service credential alone does not count: a project that configured only
- * a service credential has no per-user billing to do.
- */
-export async function teamModeEnabled(projectRoot: string): Promise<boolean> {
-  const file = await load(projectRoot);
-  return file.credentials.some((c) => c.userId !== SERVICE_CREDENTIAL_USER_ID);
-}
-
-function summarize(record: UserCredentialRecord): UserCredentialSummary {
+function summarize(record: EndpointCredentialRecord): EndpointCredentialSummary {
   return {
-    userId: record.userId,
-    kind: record.kind,
-    label: record.label,
+    userId: record.userId, endpointId: record.endpointId, origin: record.endpoint ?? null,
+    provider: record.provider, session: record.session, kind: record.kind, label: record.label,
     ...(record.ownerEmail ? { ownerEmail: record.ownerEmail } : {}),
     ...(record.ownerName ? { ownerName: record.ownerName } : {}),
-    ...(record.profile ? { profile: record.profile } : {}),
-    updatedAt: record.updatedAt,
+    ...(record.profile ? { profile: record.profile } : {}), updatedAt: record.updatedAt,
   };
+}
+export async function listEndpointCredentials(projectRoot: string, userId?: string): Promise<EndpointCredentialSummary[]> {
+  return serialized(async () => {
+    const records = (await load(projectRoot)).credentials;
+    return records.filter(c => userId === undefined || canonicalCredentialKey(userId) === c.userId).map(c => ({ ...summarize(c), ...(records.filter(other => sameSlot(other, c.userId, c.endpointId)).length > 1 ? { state: 'conflicted' as const } : {}) }));
+  });
+}
+export async function listUserCredentials(projectRoot: string): Promise<UserCredentialSummary[]> { return listEndpointCredentials(projectRoot); }
+export async function storedUserSecretValues(projectRoot: string): Promise<string[]> {
+  return serialized(async () => (await load(projectRoot)).credentials.map(c => c.token).filter(Boolean));
 }

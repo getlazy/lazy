@@ -24,6 +24,21 @@ function makeTask(overrides: Partial<Task> & { id: string; created_at: number })
 }
 
 describe('deriveTaskRef', () => {
+  // INVARIANT: a ref another task has PINNED counts as taken even when that
+  // task's code is now different. `lazy edit --code` on a started task is
+  // cosmetic, so the renamed task still owns the branch named after its old
+  // code, and a new task with that code must not be cut onto it.
+  test('a ref pinned by a renamed task is not reused', () => {
+    const renamed = makeTask({
+      id: 'bbbb2222-0000-0000-0000-000000000000', code: 'release-next', created_at: 1708732800000,
+      metadata: { task_ref: 'release-v091' },
+    });
+    const sameDay = makeTask({ id: 'aaaa1111-0000-0000-0000-000000000000', code: 'release-v091', created_at: 1708732800000 });
+    expect(deriveTaskRef(sameDay, [sameDay, renamed])).toBe('release-v091-24-02-24-aaaa1111');
+    const later = makeTask({ id: 'cccc3333-0000-0000-0000-000000000000', code: 'release-v091', created_at: 1709000000000 });
+    expect(deriveTaskRef(later, [later, renamed])).toBe('release-v091-24-02-27');
+  });
+
   // INVARIANT: Tasks with a unique code get the code as their ref.
   // This is the common case and produces the most readable branch names.
   test('unique code returns just the code', () => {

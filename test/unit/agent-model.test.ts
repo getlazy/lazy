@@ -103,7 +103,7 @@ describe('resolveAgentModel', () => {
     const config = configWith(
       { builder: anthropic(), agent: ollama('qwen3-coder') },
       'opus',
-      { 'local-ollama': { harness: 'claude-code', model: 'qwen3-coder', endpoint: 'http://localhost:11434' } },
+      { 'local-ollama': { harness: 'claude-code', model: 'qwen3-coder', endpoint: 'http://localhost:11434', credential: 'none' } },
     );
     // Named by the task…
     expect(resolveAgentModel(config, { agentId: 'local-ollama' })).toBe('qwen3-coder');
@@ -119,7 +119,7 @@ describe('resolveAgentModel', () => {
     const config = configWith(
       { builder: anthropic(), agent: proxy },
       'opus',
-      { gateway: { harness: 'claude-code', model: 'local-llm', endpoint: 'http://127.0.0.1:9000' } },
+      { gateway: { harness: 'claude-code', model: 'local-llm', endpoint: 'http://127.0.0.1:9000', credential: 'none' } },
     );
     expect(resolveAgentModel(config, { agentId: 'gateway' })).toBe('local-llm');
     expect(resolveAgentModel(config, {})).toBe('local-llm');
@@ -135,7 +135,7 @@ describe('resolveAgentModel', () => {
     const config = configWith(
       { builder: anthropic(), agent: ollama('qwen3-coder') },
       'opus',
-      { 'local-ollama': { harness: 'claude-code', model: 'qwen3-coder', endpoint: 'http://localhost:11434' } },
+      { 'local-ollama': { harness: 'claude-code', model: 'qwen3-coder', endpoint: 'http://localhost:11434', credential: 'none' } },
     );
     expect(resolveAgentModel(config, { agentId: 'claude-code' })).toBe('opus');
   });

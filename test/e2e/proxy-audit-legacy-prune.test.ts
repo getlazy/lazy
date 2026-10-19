@@ -70,7 +70,7 @@ describe('legacy proxy audit log cleanup on daemon start', () => {
     try {
       expect(await stat(legacyPath).catch(() => null)).toBeNull();
       // Removing data silently would violate the no-hidden-side-effects rule in
-      // CLAUDE.md — the daemon must name the file and the size it dropped.
+      // AGENTS.md — the daemon must name the file and the size it dropped.
       const daemonLog = await readFile(
         join(daemonBaseDir, projectSlug(ctx.root), LOG_FILE),
         'utf-8',

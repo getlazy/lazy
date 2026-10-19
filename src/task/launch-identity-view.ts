@@ -20,7 +20,13 @@
 import type { Task } from '../types';
 import type { ResolvedConfig } from '../config/types';
 import { resolveAgentModel, taskModelChoice } from '../agent/agent-model';
-import { agentProfilesFor, profileNameForAgent } from '../config/agent-profiles';
+import {
+  agentProfilesFor,
+  NO_CREDENTIAL,
+  profileCredentialName,
+  profileNameForAgent,
+  type AgentProfile,
+} from '../config/agent-profiles';
 
 /**
  * Where a displayed value came from — as far as the task record can say.
@@ -49,11 +55,58 @@ export interface LaunchIdentityItem {
   note?: string;
 }
 
+/** One tier of a tiered profile, as the header shows it. */
+export interface LaunchIdentityTier {
+  endpoint: string;
+  model: string;
+  /** Upstream URL of this tier. */
+  url: string;
+  /** Credential NAME this tier spends; null when it spends none. */
+  credential: string | null;
+  /** Usage percent at which the tier counts as full; null when unconditional. */
+  threshold: number | null;
+}
+
+/**
+ * The rung a model or effort came from. Finer than {@link LaunchIdentitySource}
+ * (which stays two-valued for the existing items): `profile` is the profile's
+ * own `model`, `project` is the harness default / `[models] default` / the
+ * project-settings overlay.
+ */
+export type LaunchIdentityOrigin = 'task' | 'profile' | 'project';
+
+/**
+ * The resolved profile behind `agent`: what the launch reads from lazy.toml at
+ * each turn. The ANSWER, so no client resolves a profile itself. Never carries a
+ * secret — only the credential's NAME.
+ */
+export interface LaunchIdentityProfile {
+  name: string;
+  /** False when the task names a profile lazy.toml no longer defines. */
+  found: boolean;
+  /** True for a built-in, false for an `[agents.<name>]` block; null when not found. */
+  builtin: boolean | null;
+  harness: string | null;
+  /** Named `[endpoints.<name>]` the profile runs against, when it names one. */
+  endpoint_name: string | null;
+  /** Upstream URL, or null for "the harness default". */
+  endpoint_url: string | null;
+  /** Credential NAME the profile spends; null when it spends none or is missing. */
+  credential: string | null;
+  /** Ordered tiers of a tiered profile, else null. The shown model is then never sent. */
+  tiers: LaunchIdentityTier[] | null;
+  model_origin: LaunchIdentityOrigin;
+  /** Effort is never a profile key, so this is `task` or `project`. */
+  effort_origin: LaunchIdentityOrigin;
+}
+
 export interface TaskLaunchIdentityView {
   /** The `[agents.<name>]` profile the task's turns run on. */
   agent: LaunchIdentityItem;
   model: LaunchIdentityItem;
   effort: LaunchIdentityItem;
+  /** Absent only on a view built without profile detail; renderers fall back to `agent`. */
+  profile?: LaunchIdentityProfile;
 }
 
 export interface TaskLaunchIdentityViewOptions {
@@ -75,10 +128,58 @@ export function taskLaunchIdentityView(
 ): TaskLaunchIdentityView {
   const { task, config, projectModel } = opts;
 
+  const model = modelItem(task, config, projectModel);
+  const effort = effortItem(task, config);
   return {
     agent: agentItem(task, config),
-    model: modelItem(task, config, projectModel),
-    effort: effortItem(task, config),
+    model,
+    effort,
+    profile: profileDetail(task, config, model, effort),
+  };
+}
+
+function profileDetail(
+  task: Task,
+  config: ResolvedConfig,
+  model: LaunchIdentityItem,
+  effort: LaunchIdentityItem,
+): LaunchIdentityProfile {
+  const name = profileNameForAgent(task.agent_id);
+  const profile: AgentProfile | undefined = agentProfilesFor(config).get(name);
+  const effortOrigin: LaunchIdentityOrigin = effort.source === 'task' ? 'task' : 'project';
+  if (!profile) {
+    return {
+      name, found: false, builtin: null, harness: null, endpoint_name: null,
+      endpoint_url: null, credential: null, tiers: null,
+      model_origin: model.source === 'task' ? 'task' : 'project',
+      effort_origin: effortOrigin,
+    };
+  }
+  const modelOrigin: LaunchIdentityOrigin = model.source === 'task'
+    ? 'task'
+    : profile.model.trim() && profile.model.trim() === model.value ? 'profile' : 'project';
+  // A tiered profile's endpoint and credential differ per tier (the profile's own
+  // fields only mirror tier 0), so they ride on the tiers and not on the profile.
+  const tiered = !!profile.tiers && profile.tiers.length > 0;
+  return {
+    name,
+    found: true,
+    builtin: profile.builtin,
+    harness: profile.harness,
+    endpoint_name: tiered ? null : profile.endpointName ?? null,
+    endpoint_url: tiered || !profile.endpoint ? null : sanitizeDisplayUrl(profile.endpoint),
+    credential: tiered ? null : profileCredentialName(profile),
+    tiers: tiered
+      ? profile.tiers!.map((t) => ({
+          endpoint: t.endpoint,
+          url: sanitizeDisplayUrl(t.upstream),
+          credential: t.credential === NO_CREDENTIAL ? null : t.credential,
+          model: t.model,
+          threshold: t.threshold,
+        }))
+      : null,
+    model_origin: modelOrigin,
+    effort_origin: effortOrigin,
   };
 }
 
@@ -164,4 +265,25 @@ function resolveViewModel(
     projectModel,
     agentId,
   });
+}
+
+/**
+ * A URL safe to put on a page: userinfo (`user:pass@`), query and fragment
+ * removed. lazy.toml URLs are written by the operator and may embed a secret;
+ * `launchIdentity` leaves the daemon on `show` and into every header tooltip.
+ * Config load guarantees an absolute http(s) URL, so a value that does not
+ * parse is not shown rather than echoed raw.
+ */
+export function sanitizeDisplayUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    u.username = '';
+    u.password = '';
+    u.search = '';
+    u.hash = '';
+    return u.toString().replace(/\/$/, url.endsWith('/') ? '/' : '');
+  } catch {
+    // Unparseable: never echo the raw text, which may carry a secret.
+    return '<invalid url>';
+  }
 }

@@ -26,7 +26,9 @@ import { enrollAtInit } from './commands/system-passphrase';
 import { runGit } from '../utils/git';
 import { spawnSyncUnsupervised } from '../utils/spawn';
 import { loadConfig } from '../config/loader';
-import { isManagedMode, evaluateManagedConfig, ManagedConfigRefusedError } from '../config/managed';
+import { isManagedMode } from '../config/managed';
+import { withholdRefused } from '../config/managed-withhold';
+import { withheldSettingKey } from '../config/agent-profile-advice';
 import { discoverCandidateSessions, reimportConversations } from '../import/reimport-conversations';
 import {
   countImportableMemories,
@@ -410,7 +412,7 @@ export async function updateGitignore(targetDir: string): Promise<boolean> {
  *
  * Tell the human and hand them the command — do NOT run it. That state may be
  * the only copy of their task history, and untracking it as an init side effect
- * would be exactly the kind of hidden side effect CLAUDE.md forbids.
+ * would be exactly the kind of hidden side effect AGENTS.md forbids.
  */
 export async function warnAboutTrackedLazyFiles(targetDir: string): Promise<void> {
   // Nothing can be tracked outside a git repo — no check to run, nothing to say.
@@ -441,24 +443,19 @@ export async function warnAboutTrackedLazyFiles(targetDir: string): Promise<void
 }
 
 /**
- * On a managed (fleet) host, refuse a repository whose committed lazy.toml asks
- * for something a shared installation does not allow — BEFORE init writes
- * anything or reports success.
+ * On a managed (fleet) host, SAY which settings of the repository's lazy.toml
+ * this installation will not use — never refuse the init over them.
  *
- * Every other command reaches the policy through `loadConfig`. `init` does not:
- * it WRITES a config rather than loading one, so without this gate a hostile
- * lazy.toml sails through provisioning and only fails at `daemon start`. That
- * failure is still loud and still carries the marker, but it names the wrong
- * phase and arrives after the clone, the store and the manifest already exist.
- * Failing here is the same diagnosis one step earlier and much cheaper.
+ * Engineer, 2026-10-08: "Importing must never refuse anything: start, keep
+ * refused settings unused, and report them." A refused setting is withheld at
+ * every load (src/config/managed-withhold.ts), so the project provisions, the
+ * control plane imports the file verbatim, and its Configuration page and
+ * `lazy doctor` keep naming what is not used. This only says so at init time
+ * too, so the provisioning log is not silent about it.
  *
- * A STRICT NO-OP when managed mode is off: `evaluateManagedConfig` returns no
- * refusals, and a normal single-user `lazy init` never reads this path's
- * verdict. Deliberately narrower than a full `loadConfig` — a malformed or
- * merely unusual config must still be init's to fix, not something this gate
- * starts rejecting.
+ * A STRICT NO-OP when managed mode is off.
  */
-async function refuseUnmanageableConfig(targetDir: string): Promise<void> {
+async function reportUnmanageableConfig(targetDir: string): Promise<void> {
   if (!isManagedMode()) return;
 
   const configPath = join(targetDir, CONFIG_FILENAME);
@@ -468,14 +465,16 @@ async function refuseUnmanageableConfig(targetDir: string): Promise<void> {
   try {
     raw = Bun.TOML.parse(readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
   } catch {
-    // A lazy.toml that does not parse is not this gate's problem — the next
-    // config load reports the parse error with the offending line, which is a
-    // far better message than anything this could say about it.
+    // A lazy.toml that does not parse is not this report's problem — the next
+    // config load reports the parse error with the offending line.
     return;
   }
 
-  const { refusals } = evaluateManagedConfig(raw);
-  if (refusals.length > 0) throw new ManagedConfigRefusedError(refusals, configPath);
+  const { withheld } = withholdRefused(raw, process.env, 'repository');
+  if (withheld.length === 0) return;
+  console.warn(`${configPath}: ${withheld.length} setting(s) are kept but not used on this managed host:`);
+  for (const item of withheld) console.warn(`  ${withheldSettingKey(item)} — ${item.reason}`);
+  console.warn('Run `lazy doctor` for details.');
 }
 
 export async function init(targetDir: string = process.cwd(), options: InitOptions = {}): Promise<void> {
@@ -490,7 +489,7 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
 
   // Managed hosts only, and before the "already initialized" short-circuits: a
   // repository that commits its own `.lazy` must not be able to skip the gate.
-  await refuseUnmanageableConfig(targetDir);
+  await reportUnmanageableConfig(targetDir);
 
   // Check for both new and legacy directories
   if (existsSync(lazyPath)) {

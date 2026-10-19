@@ -333,6 +333,8 @@ export const ACCEPT_PHASES = {
   remoteState: { id: 'remote-state', label: 'Check remote merge state' },
   preAccept: { id: 'pre-accept', label: 'Acceptance gate', optional: true },
   protection: { id: 'protection', label: 'Target-branch protection check', optional: true },
+  mirrorTarget: { id: 'mirror-target', label: 'Bring in direct pushes to the hosted target', optional: true },
+  taskBranch: { id: 'task-branch', label: 'Check for commits pushed to the task branch', optional: true },
   remoteRef: { id: 'remote-ref', label: 'Push branch and open PR/MR', optional: true },
   mergeGates: { id: 'merge-gates', label: 'Pre-merge gates (CI, reviews)' },
   pushParent: { id: 'push-parent', label: 'Push parent branch', optional: true },
@@ -359,12 +361,14 @@ export const ACCEPT_PHASES = {
 export function acceptPhasePlan(preAcceptEnabled: boolean): PlannedPhase[] {
   const p = ACCEPT_PHASES;
   return [
+    p.taskBranch,
     p.edgeGate,
     p.resurrection,
     p.lfs,
     p.acceptCheck,
     ...(preAcceptEnabled ? [p.preAccept] : []),
     p.protection,
+    p.mirrorTarget,
     p.remoteRef,
     p.mergeGates,
     p.pushParent,
@@ -636,4 +640,24 @@ export const LINK_PHASES = {
 export function linkPhasePlan(): PlannedPhase[] {
   const p = LINK_PHASES;
   return [p.resolve, p.fetch, p.worktree, p.create, p.describe];
+}
+
+// ---------------------------------------------------------------------------
+// Start services phase catalogue
+// ---------------------------------------------------------------------------
+
+/**
+ * Every phase `serve.run` can run, in execution order. Restoring task files
+ * comes BEFORE the environment because the container mounts them: a missing
+ * checkout is restored first, then the container comes up on it.
+ */
+export const SERVE_RUN_PHASES = {
+  restore: { id: 'restore-files', label: 'Restore task files', optional: true },
+  environment: { id: 'environment', label: "Start the task's environment", optional: true },
+  services: { id: 'services', label: 'Start services' },
+} as const satisfies Record<string, PlannedPhase>;
+
+export function serveRunPhasePlan(): PlannedPhase[] {
+  const p = SERVE_RUN_PHASES;
+  return [p.restore, p.environment, p.services];
 }

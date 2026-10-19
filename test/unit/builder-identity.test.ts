@@ -173,7 +173,7 @@ describe('Storage Builders', () => {
     await saveAll();
     const now = new Date().toISOString();
     const run: BuilderSession = {
-      id: 'run-1', projectRoot: root, memberEmail: null, kind: 'interactive', state: 'running',
+      id: 'run-1', projectRoot: root, memberEmail: 'engineer@example.com', kind: 'interactive', state: 'running',
       containerName: 'lazy-builder-x', builderId: 'x', agentSessionId: C,
       createdAt: now, updatedAt: now, endedAt: null,
     };
@@ -181,6 +181,33 @@ describe('Storage Builders', () => {
     const builders = await storage.listBuilders();
     expect(builders.find((b) => b.id === A)?.run).toEqual({ id: 'run-1', state: 'running', live: true });
     expect(builders.find((b) => b.id === D)?.run).toBeNull();
+    expect(builders.find((b) => b.id === A)?.memberEmail).toBe('engineer@example.com');
+    const transcript = await resolveBuilderTranscript(storage, A);
+    expect(transcript && 'conversation' in transcript && transcript.conversation.memberEmail).toBe('engineer@example.com');
+  });
+
+  test('stored attribution survives new runs and joined segments', async () => {
+    const first = await segment(A);
+    await storage.saveConversation({ ...first, memberEmail: 'alice@example.com' });
+    await storage.saveConversation(await segment(B));
+    expect((await storage.listConversationSummaries()).find((row) => row.sessionId === A)?.memberEmail).toBe('alice@example.com');
+    const transcript = await resolveBuilderTranscript(storage, B);
+    expect(transcript && 'conversation' in transcript && transcript.conversation.memberEmail).toBe('alice@example.com');
+  });
+
+  test('legacy noise is hidden in titles and transcripts without rewriting stored history', async () => {
+    const original = await segment(A);
+    const noise = { ...original.messages[0], uuid: 'noise', text: '<command-name>/effort</command-name><command-args>high</command-args>' };
+    const notification = { ...noise, uuid: 'notification', text: '<task-notification><summary>Agent finished</summary></task-notification>' };
+    await storage.saveConversation({ ...original, summary: noise.text, messages: [noise, ...original.messages, notification] });
+    const builders = await storage.listBuilders();
+    expect(builders[0].title).toBe(original.summary);
+    const transcript = await resolveBuilderTranscript(storage, A);
+    expect(transcript && 'conversation' in transcript && transcript.conversation.messages).toEqual(original.messages);
+    expect((await storage.loadConversation(A))?.messages).toHaveLength(original.messages.length + 2);
+    expect((await storage.listConversationSummaries())[0].summary).toBe(noise.text);
+    await storage.saveConversation({ ...original, sessionId: D, messages: [noise], summary: noise.text });
+    expect((await storage.listBuilders()).map((builder) => builder.id)).toEqual([A]);
   });
 
   // INVARIANT: promote numbers messages the way the caller showed them — a

@@ -176,7 +176,10 @@ describe('ClaudeCodeAgent.buildExecArgs', () => {
       prompt: 'do the thing',
       dangerouslySkipPermissions: true,
     });
-    expect(args.slice(0, 3)).toEqual(['claude', '-p', 'do the thing']);
+    // The prompt rides stdin, never argv (the argv rule, src/agent/argv-safety.ts).
+    expect(args.slice(0, 2)).toEqual(['claude', '-p']);
+    expect(args).not.toContain('do the thing');
+    expect(args.stdinInput).toBe('do the thing');
     expect(args).toContain('--output-format');
     expect(args[args.indexOf('--output-format') + 1]).toBe('stream-json');
     // Required by the CLI for stream-json in -p mode.
@@ -238,5 +241,47 @@ describe('ClaudeCodeAgent.parseResponse', () => {
 
   test('throws on empty output', () => {
     expect(() => agent.parseResponse('   ')).toThrow();
+  });
+});
+
+describe('ClaudeCodeActivityStream — background tasks', () => {
+  // Shapes read off Claude Code 2.1.291 (docs/claude-code-background-tasks.md).
+  test('background_tasks_changed reports the size of the running list', () => {
+    const running = stream.parseLine(JSON.stringify({
+      type: 'system',
+      subtype: 'background_tasks_changed',
+      tasks: [{ task_id: 'b1', task_type: 'local_bash', description: 'tests' }, { task_id: 'a1', task_type: 'local_agent', description: 'review' }],
+      session_id: 's',
+    }));
+    expect(running).toEqual({
+      kind: 'progress',
+      backgroundTasks: 2,
+      backgroundTaskList: [{ id: 'b1', label: 'tests' }, { id: 'a1', label: 'review' }],
+    });
+
+    const empty = stream.parseLine(JSON.stringify({ type: 'system', subtype: 'background_tasks_changed', tasks: [], session_id: 's' }));
+    expect(empty).toEqual({ kind: 'progress', backgroundTasks: 0, backgroundTaskList: [] });
+  });
+
+  test('other task events say nothing about the running list', () => {
+    const ev = stream.parseLine(JSON.stringify({ type: 'system', subtype: 'task_notification', task_id: 'b1', status: 'completed' }));
+    expect(ev).toEqual({ kind: 'progress' });
+  });
+
+  // The measured kill sequence after a result: task_updated killed, then
+  // task_notification stopped. Both name the task, labelled with the command
+  // the agent backgrounded (from its tool_use) rather than a bare id.
+  test('a stopped background task is reported, named by the command the agent ran', () => {
+    const s = new ClaudeCodeActivityStream();
+    s.parseLine(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_9', name: 'Bash', input: { command: 'bun test test/e2e/', run_in_background: true } }] } }));
+    s.parseLine(JSON.stringify({ type: 'system', subtype: 'task_started', task_id: 'bm60', tool_use_id: 'toolu_9', description: 'Run e2e', is_backgrounded: true, task_type: 'local_bash' }));
+    const changed = s.parseLine(JSON.stringify({ type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'bm60', task_type: 'local_bash', description: 'Run e2e' }] }));
+    expect(changed?.backgroundTaskList).toEqual([{ id: 'bm60', label: 'bun test test/e2e/' }]);
+    const killed = s.parseLine(JSON.stringify({ type: 'system', subtype: 'task_updated', task_id: 'bm60', patch: { status: 'killed', end_time: 1 } }));
+    expect(killed).toEqual({ kind: 'progress', backgroundTaskStopped: { id: 'bm60', label: 'bun test test/e2e/' } });
+    const stopped = s.parseLine(JSON.stringify({ type: 'system', subtype: 'task_notification', task_id: 'bm60', status: 'stopped', summary: 'Run e2e' }));
+    expect(stopped?.backgroundTaskStopped).toEqual({ id: 'bm60', label: 'bun test test/e2e/' });
+    const completed = s.parseLine(JSON.stringify({ type: 'system', subtype: 'task_updated', task_id: 'bm60', patch: { status: 'completed' } }));
+    expect(completed).toEqual({ kind: 'progress' });
   });
 });

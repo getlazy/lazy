@@ -4,6 +4,7 @@
  * what a task serves or whether anything is listening.
  */
 
+import { settingsServicesHtml } from '../../src/server/settings';
 import { describe, test, expect } from 'bun:test';
 import { servicesCardHtml, toProbedState, type ProbedServeState } from '../../src/server/services-card';
 
@@ -121,7 +122,7 @@ describe('servicesCardHtml container controls', () => {
     start: null,
     startServicesCmd: '',
     shellAvailable: true,
-    canDesignate: false,
+    canConfigure: false,
   };
 
   test('a stopped container offers Start container on the same line', () => {
@@ -172,50 +173,66 @@ describe('servicesCardHtml container controls', () => {
     const html = servicesCardHtml(
       task,
       { ...base, services: [], unavailable: 'not-running' },
-      { ...controls, startServicesCmd: 'bin/dev', canDesignate: true },
+      { ...controls, startServicesCmd: 'bin/dev', canConfigure: true },
     );
     expect(html).toContain('data-lz-shell-run="bin/dev"');
     expect(html).toContain('data-lz-shell-label="Services"');
-    expect(html).toContain('Change the project-wide Start services command');
+    expect(html).toContain('href="/settings/services"');
   });
 
-  test('when unset, the card offers to designate the project-wide command', () => {
-    const html = servicesCardHtml(task, base, { ...controls, canDesignate: true });
-    expect(html).toContain('project-wide command that Start services will run');
-    expect(html).toContain('not a per-task override');
-    expect(html).toContain(`action="/tasks/${task.id}/services/start-cmd"`);
-    expect(html).toContain('name="command"');
-    expect(html).toContain('method="POST"');
-    // No Start button until a command is saved.
+  // INVARIANT: the task page never edits the project-wide command — it offers
+  // Start services and Configure services (Settings › Services), nothing
+  // more. What every task runs is not a control on one task.
+  test('the card never carries a designate form, only Configure services', () => {
+    for (const startServicesCmd of ['', 'npm run dev']) {
+      const html = servicesCardHtml(task, base, { ...controls, startServicesCmd, canConfigure: true });
+      expect(html).not.toContain('name="command"');
+      expect(html).not.toContain('method="POST"');
+      expect(html).not.toContain('project-wide command');
+      expect(html).toContain('<a class="btn btn-sm" href="/settings/services" id="svc-configure">Configure services</a>');
+    }
+  });
+
+  test('when unset, the card says so and offers no Start button', () => {
+    const html = servicesCardHtml(task, base, { ...controls, canConfigure: true });
+    expect(html).toContain('No Start services command is designated for this project yet.');
     expect(html).not.toContain('data-lz-shell-run');
   });
 
-  test('when set, the card still offers Start services and a change form', () => {
-    const html = servicesCardHtml(task, base, {
-      ...controls,
-      startServicesCmd: 'npm run dev',
-      canDesignate: true,
-    });
-    expect(html).toContain('data-lz-shell-run="npm run dev"');
-    expect(html).toContain('Change the project-wide Start services command');
-    expect(html).toContain('value="npm run dev"');
-    expect(html).toContain(`action="/tasks/${task.id}/services/start-cmd"`);
-  });
-
-  test('designation form is hidden without a ServeActions port', () => {
+  test('Configure services is hidden without a ServeActions port', () => {
     const html = servicesCardHtml(task, base, controls);
-    expect(html).not.toContain('services/start-cmd');
-    expect(html).not.toContain('Designate the project-wide');
+    expect(html).not.toContain('/settings/services');
   });
 
-  test('designation form appears even when no services are declared', () => {
+  test('Configure services appears even when no services are declared', () => {
     const html = servicesCardHtml(
       task,
       { ...base, declared: [], services: [] },
-      { ...controls, canDesignate: true },
+      { ...controls, canConfigure: true },
     );
     expect(html).toContain('declares no services');
-    expect(html).toContain('project-wide command that Start services will run');
-    expect(html).toContain('services/start-cmd');
+    expect(html).toContain('/settings/services');
+  });
+});
+
+describe('Settings › Services', () => {
+  test('shows the command, a single-line form posting to Settings, and Clear only when set', () => {
+    const set = settingsServicesHtml('bin/dev "<x>"');
+    expect(set).toContain('Start services runs <code>bin/dev &quot;&lt;x&gt;&quot;</code>.');
+    expect(set).toContain('action="/settings/services/start-cmd"');
+    expect(set).toContain('type="text"');
+    expect(set).toContain('action="/settings/services/start-cmd/clear"');
+    expect(set).toContain('aria-current="page">Services</a>');
+
+    const unset = settingsServicesHtml('');
+    expect(unset).toContain('No Start services command is designated yet');
+    expect(unset).not.toContain('start-cmd/clear');
+  });
+
+  test('says why when it cannot be read or saved, and offers no form', () => {
+    expect(settingsServicesHtml(null, { error: 'daemon <down>' })).toContain('could not be read: daemon &lt;down&gt;');
+    const unavailable = settingsServicesHtml(null, { unavailable: true });
+    expect(unavailable).toContain('serve-actions port');
+    expect(unavailable).not.toContain('svc-settings-form');
   });
 });

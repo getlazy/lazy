@@ -13,6 +13,7 @@
  */
 
 import { markMachineOneshotPrompt } from '../import/machine-oneshot';
+import type { AgentExecArgs } from '../agent/interface';
 
 /**
  * How long any machine one-shot may run before it is killed.
@@ -72,7 +73,7 @@ export function buildOneshotAgentArgv(
    * this is handed over as-is and `buildExecArgs` decides how to spell it.
    */
   effort?: string,
-): string[] {
+): AgentExecArgs {
   // Deferred: importing the registry at module load time from docker-runner.ts
   // created a circular-init edge (docker-runner → args → registry → … →
   // runner/index → podman-runner → docker-runner). Call-time import is safe.

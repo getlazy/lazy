@@ -18,6 +18,7 @@ import {
   DEFAULT_CONFIG as REAL_DEFAULT_CONFIG,
   getDefaultConfigTemplate as REAL_getDefaultConfigTemplate,
 } from '../../src/config/loader';
+import { isAcceptGateRunning } from '../../src/daemon/accept-gate-marker';
 import {
   claimMemberTerminal,
   markMemberTerminalEntered,
@@ -29,6 +30,8 @@ let mockSession: any = null;
 /** Every effect-bearing step the accept reached, in order. */
 let reached: string[] = [];
 let preAcceptEnabled = true;
+/** When set, the gate's runner launches; what the MCP authority saw at launch lands here. */
+let gateProbe: { sawGate: boolean | null } | null = null;
 
 await mockModule(resolve(import.meta.dir, '../../src/config/loader.ts'), () => ({
   loadConfig: async () => ({
@@ -64,6 +67,7 @@ await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => {
     async isTargetBranchProtected() { return false; }
     async pushBranch() { reached.push('pushBranch'); }
     async markReadyForReview() { reached.push('markReadyForReview'); return {}; }
+    async findOpenReviewForBranch() { return null; }
     async checkAcceptGates() { reached.push('checkAcceptGates'); return []; }
     async merge() { reached.push('merge'); return { status: 'merged' as const }; }
     async fastForwardLocal() { return { success: true }; }
@@ -75,12 +79,15 @@ await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => {
     detectRemote: () => null,
     createDriver: () => ({
       needsSync: true,
+      // Origin has nothing the task lacks (accept step 1e).
+      fetchBranch: async () => false,
       validateAccept: () => 'no MR yet',
       hasRemoteRef: () => false,
       hasExternalApproval: async () => true,
       isTargetBranchProtected: async () => true,
       pushBranch: async () => { reached.push('pushBranch'); },
       markReadyForReview: async () => { reached.push('markReadyForReview'); return { metadata: { gitlab_remote_ref_id: '1' } }; },
+      findOpenReviewForBranch: async () => null,
       getPRState: async () => 'OPEN',
       getChecksStatus: async () => ({ status: 'passed' as const, failed: [] }),
       getTaskUrl: async () => 'https://gitlab/mr/1',
@@ -109,7 +116,25 @@ await mockModule(resolve(import.meta.dir, '../../src/git/operations.ts'), () => 
 
 // The gate's runner: stop the accept right there once the gate is reached.
 await mockModule(resolve(import.meta.dir, '../../src/runner/index.ts'), () => ({
-  createRunner: async () => { throw new Error('acceptance gate runner (test stops here)'); },
+  createRunner: async () => {
+    if (!gateProbe) throw new Error('acceptance gate runner (test stops here)');
+    const probe = gateProbe;
+    return {
+      type: 'docker',
+      checkAvailability: async () => {},
+      setAgent: () => {},
+      runExists: async () => false,
+      isRunning: async () => false,
+      launchSupervisor: async () => {
+        probe.sawGate = isAcceptGateRunning(mockTask.id);
+        throw new Error('gate launch (test stops here)');
+      },
+    };
+  },
+}));
+
+await mockModule(resolve(import.meta.dir, '../../src/utils/sandbox.ts'), () => ({
+  setupSandbox: async (worktreePath: string) => ({ worktreePath }),
 }));
 
 await mockModule(resolve(import.meta.dir, '../../src/utils/fs.ts'), () => ({
@@ -268,6 +293,27 @@ describe('accepting a task a member is working in', () => {
   test('with nobody inside, the accept reaches the acceptance gate', async () => {
     await acceptTask('/tmp/test', { taskId: 'held-task' }).catch(() => {});
     expect(reached).toContain('launchAcceptanceGate');
+  });
+
+  // INVARIANT: while the acceptance gate runs, the task's MCP token has no
+  // turn — the gate holds `working` with no agent — and the marker is gone
+  // once the gate ends, however it ends.
+  test('the gate marks itself for the MCP authority while it runs, and clears it', async () => {
+    const { mkdtemp, rm } = await import('fs/promises');
+    const { tmpdir } = await import('os');
+    const protoBase = await mkdtemp(`${tmpdir()}/lazy-gate-proto-`);
+    const savedBase = process.env.LAZY_PROTOCOL_BASE;
+    process.env.LAZY_PROTOCOL_BASE = protoBase;
+    gateProbe = { sawGate: null };
+    try {
+      await acceptTask('/tmp/test', { taskId: 'held-task' }).catch(() => {});
+      expect(gateProbe.sawGate).toBe(true);
+      expect(isAcceptGateRunning(mockTask.id)).toBe(false);
+    } finally {
+      gateProbe = null;
+      if (savedBase === undefined) delete process.env.LAZY_PROTOCOL_BASE; else process.env.LAZY_PROTOCOL_BASE = savedBase;
+      await rm(protoBase, { recursive: true, force: true });
+    }
   });
 
   test('with nobody inside and no gate configured, it pushes and opens the MR', async () => {

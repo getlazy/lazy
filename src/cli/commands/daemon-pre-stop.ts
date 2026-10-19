@@ -18,10 +18,10 @@
  * - Working agents ARE stopped by the daemon's own shutdown (server.ts stops
  *   every supervisor it owns), so the current turn is interrupted and resumes
  *   from its last checkpoint once a daemon is running again.
- * - Builders are NOT stopped — but the daemon hosts the proxy they reach the
- *   model through, and a restarted daemon binds a NEW OS-assigned proxy port
- *   that a live builder never picks up (its ANTHROPIC_BASE_URL is fixed at
- *   launch). They survive the command and then fail on their next request.
+ * - Builders are NOT stopped — the container keeps running. The in-container
+ *   supervisor watches daemon generation (src/builder/continuity.ts) and, once a
+ *   daemon is answering again, refreshes launch env (including the audit proxy)
+ *   and relaunches Claude Code with `--resume`. No manual exit/relaunch.
  * - Pair sessions are NOT stopped either and nothing resumes them; the task
  *   stays locked in `pairing` until the human exits the session.
  */
@@ -55,7 +55,7 @@ function errorMessage(err: unknown): string {
 /**
  * Run one inventory source under its own deadline, never throwing.
  *
- * Per CLAUDE.md's error-handling rules the CAUSE is carried, not flattened: a
+ * Per AGENTS.md's error-handling rules the CAUSE is carried, not flattened: a
  * failure reports what actually happened and a timeout says it timed out. A
  * human deciding whether to kill a daemon needs to know which of those it was.
  */
@@ -274,15 +274,16 @@ export function printDaemonStopInventory(inv: DaemonStopInventory, action: 'stop
     for (const name of inv.builders) {
       console.log(`    ${name}`);
     }
-    console.log('    They are NOT stopped and NOT resumed — they keep running as-is.');
+    console.log('    They are NOT stopped — the container keeps running.');
     if (inv.proxyLive) {
-      console.log('    But they reach the model through this daemon\'s proxy, which dies with it,');
-      console.log(
-        restarting
-          ? '    and the new daemon binds a NEW proxy port a live builder never picks up.'
-          : '    so their next request fails.',
-      );
-      console.log('    Exit and relaunch each builder afterwards to recover it.');
+      if (restarting) {
+        console.log('    Each reconnects in place once the new daemon is up: the supervisor');
+        console.log('    refreshes the audit-proxy address and relaunches Claude Code with --resume.');
+        console.log('    The conversation is preserved; any message typed but not yet submitted may be lost.');
+      } else {
+        console.log('    Model calls fail while no daemon is running; when you start one again,');
+        console.log('    each builder reconnects in place automatically.');
+      }
     }
   }
 

@@ -112,4 +112,36 @@ describe('project config RPCs (real daemon)', () => {
     expect(status).toBe(403);
     expect(await Bun.file(configPath).exists()).toBe(false);
   });
+
+  // INVARIANT: a repository's endpoints and profiles become usable only through
+  // the control plane recording them by its own rules (an admin's confirmation);
+  // until then the daemon reports them as waiting, including blocks only the
+  // repository has, and never honours them.
+  test('imported connections wait for confirmation, and a confirmed version makes them usable', async () => {
+    const extra = '\n[endpoints.lunaroute]\nurl = "http://lunaroute.internal:8080"\ncredential = "lunaroute"\n\n' +
+      '[agents.pi-lunaroute]\nharness = "pi"\nmodel = "glm-5.3"\nnamed_endpoint = "lunaroute"\n';
+    const imported = (await readFile(join(ctx.root, 'lazy.toml'), 'utf-8')) + extra;
+    await Bun.write(join(ctx.root, 'lazy.toml'), imported + '\n[agents.pi-later]\nharness = "pi"\nmodel = "glm-5.3"\n');
+    await ctx.restartDaemon({
+      LAZY_MANAGED: '1',
+      LAZY_MANAGED_STORAGE_PATH: storageDirFor(ctx.root),
+      LAZY_MANAGED_CONFIG_PATH: configPath,
+    });
+    target = getDaemonTcpTarget(ctx.root)!;
+    token = readToken(ctx.root)!;
+
+    expect((await rpc('applyProjectConfig', { toml: imported, version: 1, origin: 'repository' })).applied).toBe(true);
+    const waiting = await rpc('getProjectConnections', { toml: imported, origin: 'repository' });
+    expect(waiting.confirmable).toBe(true);
+    expect(waiting.endpoints).toContainEqual(expect.objectContaining({
+      name: 'lunaroute', url: 'http://lunaroute.internal:8080', usedBy: ['pi-lunaroute'], status: 'awaiting-confirmation',
+    }));
+    expect(waiting.fromRepository.profiles).toEqual(['pi-later']);
+
+    const confirmed = `${imported.trimEnd()}\n\n${waiting.fromRepository.toml}`;
+    expect((await rpc('applyProjectConfig', { toml: confirmed, version: 2, origin: 'control-plane' })).applied).toBe(true);
+    const after = await rpc('getProjectConnections', { toml: confirmed, origin: 'control-plane' });
+    expect(after.confirmable).toBe(false);
+    expect(after.profiles.filter((p: { status: string }) => p.status !== 'usable')).toEqual([]);
+  });
 });

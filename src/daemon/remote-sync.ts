@@ -14,6 +14,7 @@
  * remote is GitHub, GitLab, or any other forge.
  */
 
+import { assertNoDeliveredSecretsToPush } from './task-files';
 import { shortId, displayId, getWorktreePath, taskRef } from '../task/identity';
 import { loadConfig } from '../config/loader';
 import { createDriver, type RepositoryDriver } from '../remote';
@@ -138,7 +139,7 @@ export async function attachLinkedPullRequests(
  * Uses the driver's getPRState() to check remote state without
  * knowing the specifics of the remote system.
  */
-async function detectExternalChanges(storage: Storage, driver: RepositoryDriver, log: SyncLogger, root?: string): Promise<{ merged: number; closed: number; spurious: number; pipelineFailed: number; errors: string[] }> {
+export async function detectExternalChanges(storage: Storage, driver: RepositoryDriver, log: SyncLogger, root?: string): Promise<{ merged: number; closed: number; spurious: number; pipelineFailed: number; errors: string[] }> {
   const result = { merged: 0, closed: 0, spurious: 0, pipelineFailed: 0, errors: [] as string[] };
 
   const allTasks = await storage.listTasks();
@@ -188,76 +189,20 @@ async function detectExternalChanges(storage: Storage, driver: RepositoryDriver,
         const session = await storage.getSessionByTaskId(task.id);
         const sessionCommits = session ? await storage.getSessionCommits(session.id) : [];
 
-        if (sessionCommits.length === 0) {
+        // INVARIANT: a linked task's work is the PR author's and is never
+        // recorded as this task's session commits, so "zero commits" proves
+        // nothing about its merge. The linked exemptions cover WRITES to
+        // someone else's PR; reading its fate and applying it to the task is
+        // not one — a linked task whose PR merged completes, it never stays open.
+        const linked = isLinkedTask(task);
+        if (sessionCommits.length === 0 && !linked) {
           // Spurious merge: task has zero session commits, the "merge" is meaningless
           logger.debug(`Task ${shortId(task.id)}: remote ref merged spuriously (0 session commits), ignoring`);
           result.spurious++;
           continue;
         }
 
-        // INVARIANT (./review-base.ts): a PR merged into a branch that is not
-        // the task's target did not land the work where the task integrates —
-        // a subtask's PR still based on its old parent's branch after the
-        // parent was accepted. Never complete the task on it: say so, once.
-        if (!await mergedIntoTaskTarget(storage, driver, task, root)) continue;
-
-        // Transition first, follow-through after (accept-merge-is-commit-point),
-        // exactly as every accept exit does. Under the task's lifecycle lock and
-        // on a re-read: a live accept or a daemon resume of this task owns it
-        // otherwise, and racing it doubled the [Accepted] comment and ran
-        // follow-through twice at once. The lock not being free means "not now";
-        // the next sync pass looks again.
-        const { ACCEPT_IN_FLIGHT_KEY } = await import('./stranded-merge');
-        const { readAcceptIntent } = await import('./accept-intent');
-        const { commitAcceptTransition, runAcceptFollowThrough, acceptTargetBranchOf } = await import('./task-lifecycle');
-        const { tryWithTaskLifecycleLock } = await import('./task-lifecycle-lock');
-        const finished = await tryWithTaskLifecycleLock(task.id, async () => {
-          const fresh = await storage.getTask(task.id);
-          if (!fresh || isTerminalStatus(fresh.status)) return false;
-          // A MARKED task is an accept that died after handing the merge to the
-          // forge: the human's saved reason goes on the [Accepted] comment. An
-          // unmarked one was already commented when the forge took the merge, or
-          // was merged outside lazy entirely.
-          const marked = !!fresh.metadata?.[ACCEPT_IN_FLIGHT_KEY];
-          const intent = marked ? readAcceptIntent(fresh) : null;
-          if (fresh.status === 'merging') {
-            log.detail(`  Merge completed → task ${theme.taskId(displayId(fresh))} complete`);
-          } else {
-            log.detail(`  Remote ref merged externally → task ${theme.taskId(displayId(fresh))} complete`);
-          }
-          const followThrough = {
-            targetBranch: await acceptTargetBranchOf(fresh, storage),
-            viaForge: true,
-            pushParent: false,
-            done: [],
-            attempts: 0,
-          };
-          await commitAcceptTransition(storage, fresh, {
-            reason: intent?.reason ?? 'Merged on the remote after the accepting process died (original reason was not recorded).',
-            actor: getActor(),
-            commentActor: intent?.actor ?? 'system',
-            writeComment: marked,
-            dedupeComment: true,
-            followThrough,
-          });
-          if (!root) return true; // the daemon's follow-through sweep picks the record up
-          const followWarnings: string[] = [];
-          try {
-            const outcome = await runAcceptFollowThrough(root, fresh.id, { warnings: followWarnings, storage, record: { ...followThrough, done: [] } });
-            if (outcome.pending.length > 0) {
-              log.detail(`  Follow-through pending for ${displayId(fresh)}: ${outcome.error} — the daemon retries`);
-            }
-          } catch (err) {
-            logger.warn(`Task ${shortId(fresh.id)}: follow-through after the remote merge failed (the daemon retries): ${err instanceof Error ? err.message : err}`);
-          }
-          for (const w of followWarnings) log.detail(`  ${w}`);
-          return true;
-        });
-        if (!finished.ran) {
-          logger.debug(`Task ${shortId(task.id)}: remote merge seen, but an accept owns the task right now — leaving it to that accept`);
-          continue;
-        }
-        if (!finished.value) continue;
+        if (await completeMergedOnForge(storage, driver, task, log, root, linked ? 'The linked PR/MR was merged on the forge.' : null) !== 'merged') continue;
 
         result.merged++;
       } else if (prState === 'CLOSED' && lazyClosedReview(task)) {
@@ -280,6 +225,11 @@ async function detectExternalChanges(storage: Storage, driver: RepositoryDriver,
         } else {
           log.detail(`  Remote ref closed externally → task ${theme.taskId(displayId(task))} closed`);
           await storage.abandonTask(task.id, 'Closed externally via remote', getActor());
+          await storage.createComment(task.id,
+            isLinkedTask(task)
+              ? '[Abandoned] The linked PR/MR was closed on the forge without being merged.'
+              : '[Abandoned] The PR/MR was closed on the forge without being merged.',
+            getActor());
 
           // Re-parent unfinished children (same as accept path)
           const closedReparented = await reparentChildren(task, storage);
@@ -320,6 +270,90 @@ async function detectExternalChanges(storage: Storage, driver: RepositoryDriver,
   return result;
 }
 
+/**
+ * Complete a task whose PR/MR the forge reports MERGED: the review-base check,
+ * then the accept transition and its follow-through, under the task's
+ * lifecycle lock on a re-read. The one forge-merged completion path, shared by
+ * the recorded-PR sweep below and the unrecorded-PR heal
+ * (./review-self-heal.ts). `fallbackReason`, when set, is written as the
+ * `[Accepted]` reason for a merge nobody accepted through lazy.
+ */
+export async function completeMergedOnForge(
+  storage: Storage,
+  driver: RepositoryDriver,
+  task: Task,
+  log: SyncLogger,
+  root: string | undefined,
+  fallbackReason: string | null,
+): Promise<'merged' | 'skipped'> {
+  // INVARIANT (./review-base.ts): a PR merged into a branch that is not
+  // the task's target did not land the work where the task integrates —
+  // a subtask's PR still based on its old parent's branch after the
+  // parent was accepted. Never complete the task on it: say so, once.
+  if (!await mergedIntoTaskTarget(storage, driver, task, root)) return 'skipped';
+
+  // Transition first, follow-through after (accept-merge-is-commit-point),
+  // exactly as every accept exit does. Under the task's lifecycle lock and
+  // on a re-read: a live accept or a daemon resume of this task owns it
+  // otherwise, and racing it doubled the [Accepted] comment and ran
+  // follow-through twice at once. The lock not being free means "not now";
+  // the next sync pass looks again.
+  const { ACCEPT_IN_FLIGHT_KEY } = await import('./stranded-merge');
+  const { readAcceptIntent } = await import('./accept-intent');
+  const { commitAcceptTransition, runAcceptFollowThrough, acceptTargetBranchOf } = await import('./task-lifecycle');
+  const { tryWithTaskLifecycleLock } = await import('./task-lifecycle-lock');
+  const finished = await tryWithTaskLifecycleLock(task.id, async () => {
+    const fresh = await storage.getTask(task.id);
+    if (!fresh || isTerminalStatus(fresh.status)) return false;
+    // A MARKED task is an accept that died after handing the merge to the
+    // forge: the human's saved reason goes on the [Accepted] comment. An
+    // unmarked one was already commented when the forge took the merge, or
+    // was merged outside lazy entirely.
+    const marked = !!fresh.metadata?.[ACCEPT_IN_FLIGHT_KEY];
+    const intent = marked ? readAcceptIntent(fresh) : null;
+    // Nobody accepted this through lazy (a linked task, a PR lazy had not
+    // recorded), so say what happened.
+    const unacceptedReason = !intent ? fallbackReason : null;
+    if (fresh.status === 'merging') {
+      log.detail(`  Merge completed → task ${theme.taskId(displayId(fresh))} complete`);
+    } else {
+      log.detail(`  Remote ref merged externally → task ${theme.taskId(displayId(fresh))} complete`);
+    }
+    const followThrough = {
+      targetBranch: await acceptTargetBranchOf(fresh, storage),
+      viaForge: true,
+      pushParent: false,
+      done: [],
+      attempts: 0,
+    };
+    await commitAcceptTransition(storage, fresh, {
+      reason: intent?.reason ?? unacceptedReason ?? 'Merged on the remote after the accepting process died (original reason was not recorded).',
+      actor: getActor(),
+      commentActor: intent?.actor ?? 'system',
+      writeComment: marked || !!fallbackReason,
+      dedupeComment: true,
+      followThrough,
+    });
+    if (!root) return true; // the daemon's follow-through sweep picks the record up
+    const followWarnings: string[] = [];
+    try {
+      const outcome = await runAcceptFollowThrough(root, fresh.id, { warnings: followWarnings, storage, record: { ...followThrough, done: [] } });
+      if (outcome.pending.length > 0) {
+        log.detail(`  Follow-through pending for ${displayId(fresh)}: ${outcome.error} — the daemon retries`);
+      }
+    } catch (err) {
+      logger.warn(`Task ${shortId(fresh.id)}: follow-through after the remote merge failed (the daemon retries): ${err instanceof Error ? err.message : err}`);
+    }
+    for (const w of followWarnings) log.detail(`  ${w}`);
+    return true;
+  });
+  if (!finished.ran) {
+    logger.debug(`Task ${shortId(task.id)}: remote merge seen, but an accept owns the task right now — leaving it to that accept`);
+    return 'skipped';
+  }
+  return finished.value ? 'merged' : 'skipped';
+}
+
 /** Task metadata: the wrong base a merged PR was already reported for (reported once). */
 export const FORGE_MERGED_WRONG_BASE_KEY = 'forge_merged_wrong_base';
 
@@ -335,15 +369,9 @@ export async function mergedIntoTaskTarget(
   task: Task,
   root: string | undefined,
 ): Promise<boolean> {
-  const { acceptTargetBranchOf } = await import('./task-lifecycle');
   const { mismatchedReviewBase } = await import('./review-base');
-  let target = await acceptTargetBranchOf(task, storage);
-  if (target === 'HEAD') {
-    if (!root) return true;
-    const { resolveDetachedHead } = await import('../git/operations');
-    const config = await loadConfig(root);
-    target = await resolveDetachedHead(target, root, config.remote.git_remote);
-  }
+  const target = await resolveForgeTarget(storage, task, root);
+  if (target === null) return true;
   let base: string | null;
   try {
     base = await mismatchedReviewBase(driver, task, target);
@@ -352,22 +380,51 @@ export async function mergedIntoTaskTarget(
     return false;
   }
   if (base === null) return true;
-  logger.warn(`Task ${shortId(task.id)}: its PR/MR was merged into ${base}, not ${target} — not completing the task`);
-  if (task.metadata?.[FORGE_MERGED_WRONG_BASE_KEY] !== base) {
-    const url = await driver.getTaskUrl(task);
-    await storage.createSystemMessage({
-      source: 'daemon',
-      kind: 'alert',
-      title: `A pull request for ${displayId(task)} was merged into the wrong branch`,
-      body:
-        `The PR/MR${url ? ` ${url}` : ''} was merged on the forge into \`${base}\`, but **${displayId(task)}** ` +
-        `integrates into \`${target}\`, so its work is not in \`${target}\`. Lazy has not marked the task ` +
-        `complete, and will not on this merge. Get the work into \`${target}\` on the forge — for example a ` +
-        `new PR/MR from the task's branch into \`${target}\` — then close the task.`,
-    });
-    await storage.updateTaskMetadata(task.id, FORGE_MERGED_WRONG_BASE_KEY, base);
-  }
+  await reportWrongBaseMerge(storage, task, base, target, await driver.getTaskUrl(task));
   return false;
+}
+
+/**
+ * The branch a task's PR/MR must have merged into: the accept target, with a
+ * root task's detached `HEAD` resolved to the remote's default branch. Null
+ * when that needs a project root and there is none (not second-guessed).
+ */
+export async function resolveForgeTarget(storage: Storage, task: Task, root: string | undefined): Promise<string | null> {
+  const { acceptTargetBranchOf } = await import('./task-lifecycle');
+  const target = await acceptTargetBranchOf(task, storage);
+  if (target !== 'HEAD') return target;
+  if (!root) return null;
+  const { resolveDetachedHead } = await import('../git/operations');
+  const config = await loadConfig(root);
+  return await resolveDetachedHead(target, root, config.remote.git_remote);
+}
+
+/**
+ * A PR/MR of this task merged into `base`, not the task's `target`: never
+ * complete the task on it, and say so ONCE, as a system alert.
+ */
+export async function reportWrongBaseMerge(
+  storage: Storage,
+  task: Task,
+  base: string,
+  target: string,
+  url: string | null,
+): Promise<void> {
+  logger.warn(`Task ${shortId(task.id)}: its PR/MR was merged into ${base}, not ${target} — not completing the task`);
+  if (task.metadata?.[FORGE_MERGED_WRONG_BASE_KEY] === base) return;
+  await storage.createSystemMessage({
+    source: 'daemon',
+    kind: 'alert',
+    title: `A pull request for ${displayId(task)} was merged into the wrong branch`,
+    body:
+      `The PR/MR${url ? ` ${url}` : ''} was merged on the forge into \`${base}\`, but **${displayId(task)}** ` +
+      `integrates into \`${target}\`, so its work is not in \`${target}\`. Lazy has not marked the task ` +
+      `complete, and will not on this merge. Get the work into \`${target}\` on the forge — for example a ` +
+      `new PR/MR from the task's branch into \`${target}\` — then close the task.`,
+  });
+  await storage.updateTaskMetadata(task.id, FORGE_MERGED_WRONG_BASE_KEY, base);
+  if (!task.metadata) task.metadata = {};
+  task.metadata[FORGE_MERGED_WRONG_BASE_KEY] = base;
 }
 
 /**
@@ -403,6 +460,8 @@ async function exportTasks(storage: Storage, root: string, driver: RepositoryDri
 
       // Push branch
       try {
+        // Never publish a delivered per-task secret file (src/daemon/task-files.ts).
+        await assertNoDeliveredSecretsToPush(root, session.git_branch, `Pushing ${session.git_branch}`);
         await driver.pushBranch(session.git_branch);
         result.pushed++;
       } catch (err) {
@@ -766,6 +825,58 @@ function writeFailureSignature(warning: string): string {
 }
 
 /**
+ * Tasks whose description refresh is running right now. The sweep tick and the
+ * post-submit refresh both go through refreshFidelityForNewWork; without this
+ * they could synthesize and write for the same task at once.
+ */
+const fidelityInFlight = new Set<string>();
+
+/**
+ * Replace the "Pending — updated automatically" promise with an honest line
+ * when a task that already has work has never had a summary written and
+ * synthesis cannot run right now. Only before the first summary (watermark
+ * unset): it must never overwrite a real summary. Best-effort, never throws.
+ */
+async function noteSummaryUnavailable(
+  storage: Storage,
+  task: Task,
+  driver: RepositoryDriver,
+  lastFidelitySeqNum: number,
+  reason: string,
+): Promise<void> {
+  if (lastFidelitySeqNum >= 0) return;
+  // The watermark is not the only writer of a real summary: accepting a child
+  // regenerates its parent's description without advancing it. A task with
+  // landed children may already carry one, so never replace it with a note.
+  // If children cannot be read, we cannot tell: leave the description alone.
+  try {
+    const children = await storage.getChildTasks(task.id);
+    if (children.some(c => c.status === 'complete')) return;
+  } catch (err) {
+    logger.debug(`Summary note skipped for task ${displayId(task)}: could not read children: ${err instanceof Error ? err.message : err}`);
+    return;
+  }
+  await writeFidelityBody(task, driver, `_Summary not available yet — ${reason}._`, { logWarning: false });
+}
+
+/**
+ * Refresh one task's PR/MR description now (used right after submit so a task
+ * with finished work never sits on the placeholder until the next sweep).
+ * Never throws.
+ */
+export async function refreshFidelityForTask(storage: Storage, root: string, taskId: string): Promise<void> {
+  try {
+    const config = await loadConfig(root);
+    const driver = createDriver(config, { storage, lazyRoot: root });
+    if (!driver.needsSync) return;
+    const r = await refreshFidelityForNewWork(storage, driver, root, taskId);
+    for (const e of r.errors) logger.warn(e);
+  } catch (err) {
+    logger.warn(`Could not refresh the PR description right after submit: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+/**
  * Refresh the PR/MR body's lazy-owned fidelity section when new work has
  * landed since the last pass. Replaces the removed per-turn comment mirroring
  * (`postTurnSummaries`): forge comments are for people, and turn narration was
@@ -782,11 +893,15 @@ function writeFailureSignature(warning: string): string {
  *
  * The watermark is written AFTER the refresh, and only when the DESCRIPTION
  * actually changed — see the ordering INVARIANT in the loop.
+ *
+ * `onlyTaskId` narrows the pass to one task (the post-submit refresh); such a
+ * pass leaves every other task's carried retry state alone.
  */
 async function refreshFidelityForNewWork(
   storage: Storage,
   driver: RepositoryDriver,
   root: string,
+  onlyTaskId?: string,
 ): Promise<{ refreshed: number; errors: string[] }> {
   const result = { refreshed: 0, errors: [] as string[] };
   // Tasks whose refresh failed again on THIS pass, and whose carried state is
@@ -800,6 +915,7 @@ async function refreshFidelityForNewWork(
   const allTasks = await storage.listTasks();
 
   for (const task of allTasks) {
+    if (onlyTaskId !== undefined && task.id !== onlyTaskId) continue;
     if (!driver.hasRemoteRef(task)) continue;
     // INVARIANT: a linked task never writes another task's PR/MR. Its remote
     // ref points at a PR/MR adopted from someone else (`lazy link`), so a
@@ -809,6 +925,14 @@ async function refreshFidelityForNewWork(
     // for a linked task) and exportTasks (never push a linked branch).
     if (isLinkedTask(task)) continue;
     if (task.status !== 'blocked' && task.status !== 'conflict' && task.status !== 'submitted') continue;
+
+    // Another pass is already refreshing this task: leave it (and its carried
+    // state) to that pass.
+    if (fidelityInFlight.has(task.id)) {
+      carriedForward.add(task.id);
+      continue;
+    }
+    fidelityInFlight.add(task.id);
 
     try {
       const session = await storage.getSessionByTaskId(task.id);
@@ -844,7 +968,7 @@ async function refreshFidelityForNewWork(
       if (newestSeq > lastFidelitySeqNum) {
         // INVARIANT: the body refresh fires only when there are NEW turns, i.e.
         // on actual new work — never on upstream-merge sync (syncTask), which
-        // does not consider turns at all. See CLAUDE.md "Upstream merge is
+        // does not consider turns at all. See AGENTS.md "Upstream merge is
         // sync's job". Non-blocking: regenerateFidelity never throws.
         //
         // Still built PER TASK inside the loop, now for ATTRIBUTION only: every
@@ -925,6 +1049,7 @@ async function refreshFidelityForNewWork(
             // because the breaker — not the watermark — is what stops the
             // re-attempts.
             carriedForward.add(task.id);
+            await noteSummaryUnavailable(storage, task, driver, lastFidelitySeqNum, 'the summarizer has been failing and is retried periodically');
             // Count the skip, so the probe above comes due. Written through
             // `taskScoped` and with no `forSeq` — a body cached for an older
             // watermark is worthless here, since `carried` is undefined.
@@ -953,6 +1078,7 @@ async function refreshFidelityForNewWork(
             });
             if (builderPaused) {
               carriedForward.add(task.id);
+              await noteSummaryUnavailable(storage, task, driver, lastFidelitySeqNum, 'summaries are paused by the usage limit and are written once the pause lifts');
               logger.debug(
                 `Fidelity refresh for task ${displayId(task)} held by the usage pause: ` +
                   describeUsagePause(builderPaused.verdict),
@@ -985,6 +1111,10 @@ async function refreshFidelityForNewWork(
             outcome = fidelity.outcome;
             warning = fidelity.warning;
             body = fidelity.fidelityBody;
+          }
+
+          if (outcome === 'synthesis-fallback') {
+            await noteSummaryUnavailable(storage, task, driver, lastFidelitySeqNum, 'the summarizer could not run and is retried');
           }
 
           if (outcome === 'write-failed') {
@@ -1160,6 +1290,8 @@ async function refreshFidelityForNewWork(
       }
     } catch (err) {
       result.errors.push(`Failed to refresh PR description for task ${displayId(task)}: ${err instanceof Error ? err.message : err}`);
+    } finally {
+      fidelityInFlight.delete(task.id);
     }
   }
 
@@ -1177,7 +1309,11 @@ async function refreshFidelityForNewWork(
   // Dropping an entry only ever costs one re-synthesis on a later pass, so
   // erring towards dropping is the safe direction. A task skipped this pass
   // because storage threw loses its cached body for that reason and no other.
+  //
+  // A single-task pass sees only its own task, so it prunes only that entry;
+  // pruning the rest would wipe every other task's breaker and attempt budget.
   for (const id of pendingFidelity.keys()) {
+    if (onlyTaskId !== undefined && id !== onlyTaskId) continue;
     if (!carriedForward.has(id)) pendingFidelity.delete(id);
   }
 
@@ -1271,6 +1407,14 @@ export async function runSync(root: string, storage: Storage, log: SyncLogger): 
   } else {
     log.detail('  No new pull requests for linked branches');
   }
+
+  // Tasks whose own PR/MR lazy never recorded (a crash between the forge
+  // create and the store write, a PR opened by hand): find it by head branch.
+  log.phase('Reconciling unrecorded pull requests...');
+  const { healUnrecordedReviews } = await import('./review-self-heal');
+  const heal = await healUnrecordedReviews(storage, driver, log, root);
+  if (heal.adopted + heal.completed + heal.wrongBase === 0) log.detail('  None found');
+  for (const error of heal.errors) log.error(`  Error: ${error}`);
 
   // Detect external changes (merged/closed on remote)
   log.phase('Detecting external changes...');

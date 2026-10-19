@@ -80,7 +80,7 @@ describe('lazy accept observability', () => {
 
     // The plan header + the numbered list.
     expectOutput(result, 'phases');
-    expectOutput(result, '1. Branch-protection gate');
+    expectOutput(result, '2. Branch-protection gate');
     expectOutput(result, 'Clean up worktree and children');
 
     // Pre-flight runs BEFORE the plan is known and is narrated as a prelude.

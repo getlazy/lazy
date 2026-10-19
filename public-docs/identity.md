@@ -126,10 +126,23 @@ from the request. So a task the team can see says `ada@example.com` accepted it,
 whether Ada pressed accept in a browser or from her terminal, and a client cannot
 sign somebody else's name to anything even if it asks to.
 
+A subtask that a task's agent starts during your turn is part of that turn: it
+runs, and is billed, as you — on your own connection for the subtask's agent.
+The same goes for a task your builder session starts or unblocks. Only work
+nobody asked for runs on the project's service holder.
+
 The address is what identifies somebody and is always there. A display name rides
 along where the client has one to offer — a terminal takes it from git config, so
-the same person's terminal actions read `Ada Lovelace <ada@example.com>` — and
+the same person's terminal actions read `Ada Lovelace <ada@example.com>`, and a Teams member's comes from **Account settings → Profile** — and
 rows simply show the address where it does not.
+
+In Lazy Teams a display name may be at most 80 characters, and it is refused
+when it looks like an email address, is a reserved word (`god`, `godmode`,
+`admin`, `administrator`, `lazy`, `system`, `support`, `root`, `operator`,
+`builder`, `agent`), or matches the display name or email address of anyone you
+share a team with — compared ignoring case, spaces and look-alike characters.
+Teams always shows it as "Name (email)". If two people in one team end up with
+the same name later, both are shown by email alone until one of them renames.
 
 An address identifies one person however it is typed: lazy matches it ignoring
 surrounding spaces and upper/lower case, so `Ada@Example.com` and
@@ -160,7 +173,7 @@ outright rather than sitting unused.
 The same rule decides the author of every commit lazy makes on a team server —
 an agent's commit, a sync's merge, an accept. The commit names the person who
 asked for the work, as both author and committer. Work lazy starts by itself,
-such as resuming an interrupted task, names the owner of the project's service
-credential. No git configuration on the server is involved, and none is needed.
+such as resuming an interrupted task, names the member who holds the project's
+service credential — whichever model credentials they connected, Claude or not. No git configuration on the server is involved, and none is needed.
 If lazy cannot name anybody, it refuses with "Please tell me who you are" before
 git runs; setting the project's service credential fixes that for automated work.

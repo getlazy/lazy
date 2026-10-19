@@ -28,10 +28,6 @@ const GRANT: CredentialGrant = {
   createdAt: new Date().toISOString(),
 };
 
-function freePort(): number {
-  return 41000 + Math.floor(Math.random() * 8000);
-}
-
 type Seen = { headers: Record<string, string>; body: unknown };
 
 describe('proxy JIT credential injection (Anthropic path)', () => {
@@ -45,9 +41,9 @@ describe('proxy JIT credential injection (Anthropic path)', () => {
   /** Flipped per test to make the primary fail over. */
   let primaryStatus = 200;
 
-  function upstream(name: string, port: number, status: () => number) {
+  function upstream(name: string, status: () => number) {
     return Bun.serve({
-      port, hostname: '127.0.0.1',
+      port: 0, hostname: '127.0.0.1',
       async fetch(req) {
         const body = await req.json().catch(() => null);
         const headers: Record<string, string> = {};
@@ -63,12 +59,11 @@ describe('proxy JIT credential injection (Anthropic path)', () => {
   beforeAll(async () => {
     seen = {};
     records = [];
-    const primaryPort = freePort();
-    const fallbackPort = freePort();
-    const noCredPort = freePort();
-    primary = upstream('primary', primaryPort, () => primaryStatus);
-    fallback = upstream('fallback', fallbackPort, () => 200);
-    noCredTarget = upstream('nocred', noCredPort, () => 200);
+    primary = upstream('primary', () => primaryStatus);
+    fallback = upstream('fallback', () => 200);
+    noCredTarget = upstream('nocred', () => 200);
+    const primaryPort = primary.port!;
+    const fallbackPort = fallback.port!;
 
     const targets = new TargetCredentials();
     targets.set(`http://127.0.0.1:${primaryPort}`, async () => ({
@@ -92,10 +87,9 @@ describe('proxy JIT credential injection (Anthropic path)', () => {
     };
 
     const sink: AuditSink = { append: async (r) => { records.push(r); } };
-    proxyPort = freePort();
     proxy = createProxyServer(
       {
-        port: proxyPort, bind: '127.0.0.1',
+        port: 0, bind: '127.0.0.1',
         upstream: `http://127.0.0.1:${primaryPort}`,
         fallbacks: [{ upstream: `http://127.0.0.1:${fallbackPort}` }],
         retryAfterThreshold: 0,
@@ -103,6 +97,7 @@ describe('proxy JIT credential injection (Anthropic path)', () => {
       sink,
       credentials,
     );
+    proxyPort = proxy.port!;
     await new Promise(r => setTimeout(r, 50));
   });
 
@@ -203,10 +198,9 @@ describe('proxy JIT injection with an unmapped target', () => {
   // different server — forwarding the human's Anthropic credential to it by
   // default is exactly the leak per-target lookup exists to prevent.
   test('a target with no credential gets the placeholder stripped, not passed', async () => {
-    const port = freePort();
     let seen: Record<string, string> = {};
     const up = Bun.serve({
-      port, hostname: '127.0.0.1',
+      port: 0, hostname: '127.0.0.1',
       async fetch(req) {
         await req.text();
         seen = {};
@@ -214,15 +208,16 @@ describe('proxy JIT injection with an unmapped target', () => {
         return Response.json({ ok: true });
       },
     });
-    const proxyPort = freePort();
+    const port = up.port!;
     const proxy = createProxyServer(
-      { port: proxyPort, bind: '127.0.0.1', upstream: `http://127.0.0.1:${port}` },
+      { port: 0, bind: '127.0.0.1', upstream: `http://127.0.0.1:${port}` },
       { append: async () => {} },
       {
         lookup: async (t: string) => (t === PLACEHOLDER ? GRANT : null),
         targets: new TargetCredentials(),  // nothing registered
       },
     );
+    const proxyPort = proxy.port!;
     await new Promise(r => setTimeout(r, 50));
     try {
       const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
@@ -235,6 +230,43 @@ describe('proxy JIT injection with an unmapped target', () => {
       expect(JSON.stringify(seen)).not.toContain(PLACEHOLDER);
     } finally {
       up.stop(); proxy.stop();
+    }
+  });
+});
+
+describe('a credential that cannot be resolved RIGHT NOW', () => {
+  // INVARIANT: a transient failure to resolve a credential (token refresh timed
+  // out, DNS blip, 5xx) is a retryable 503 that records NO refusal against the
+  // credential. A 401 + refusal is reserved for a credential that is really
+  // refused: a 401 parks the turn as an auth failure, files an alert and marks
+  // the connection broken, which a network blip must never do.
+  test('transient → 503 with no refusal; refused → 401 with the refusal', async () => {
+    let outcome: { kind: 'missing'; reason: string; transient?: true } = { kind: 'missing', reason: 'timed out', transient: true };
+    const upstreamUrl = 'http://127.0.0.1:9';
+    const targets = new TargetCredentials();
+    targets.set(upstreamUrl, async () => outcome);
+    const records: ProxyAuditRecord[] = [];
+    const proxy = createProxyServer(
+      { port: 0, bind: '127.0.0.1', upstream: upstreamUrl, fallbacks: [], retryAfterThreshold: 0 },
+      { append: async (r) => { records.push(r); } },
+      { lookup: async (t: string) => (t === PLACEHOLDER ? GRANT : null), targets },
+    );
+    try {
+      const send = () => fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': PLACEHOLDER },
+        body: JSON.stringify({ model: 'claude-opus-5', messages: [] }),
+      });
+      const transient = await send();
+      expect(transient.status).toBe(503);
+      expect(await transient.text()).toContain('timed out');
+      outcome = { kind: 'missing', reason: 'refresh_token_reused' };
+      const refused = await send();
+      expect(refused.status).toBe(401);
+      await new Promise(r => setTimeout(r, 50));
+      expect(records.map(r => [r.status, Boolean(r.refusedCredential)])).toEqual([[503, false], [401, true]]);
+    } finally {
+      proxy.stop();
     }
   });
 });

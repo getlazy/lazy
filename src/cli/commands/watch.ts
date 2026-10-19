@@ -29,7 +29,8 @@ import { open, stat } from 'fs/promises';
 import { displayId, taskRef, getWorktreePath } from '../../task/identity';
 import { requireStorage, requireLazyRoot, parseFlags, resolveTaskOrExit } from '../helpers';
 import { theme, dim } from '../../render/theme';
-import { findLatestSessionFile } from '../../agent/session-discovery';
+import { findLatestSessionFile, watchSessionReplayStart, watchEntryBelongsToTurn } from '../../agent/session-discovery';
+import { WatchTurnTracker } from '../../agent/watch-turns';
 import { renderEntry, type RawLogEntry } from '../../render/watch-renderer';
 import { createRunner } from '../../runner';
 import type { FollowHandle } from '../../runner/types';
@@ -42,20 +43,6 @@ import { PROXY_LINE_PREFIX } from '../../render/proxy-activity-renderer';
 
 const POLL_INTERVAL_MS = 500;
 const STATUS_CHECK_INTERVAL_MS = 5000;
-
-// ── Session file discovery ──────────────────────────────────────────────
-
-/**
- * The newest AGENT session in the dir. Polled every tick, so watch follows a
- * new session when the agent restarts — but never lazy's own machine one-shots,
- * which land in the same dir and would otherwise win on mtime and splice a
- * housekeeping prompt into the task's timeline (`findLatestSessionFile` filters
- * them at the seam).
- */
-async function findSessionFile(projectDir: string): Promise<string | null> {
-  const info = await findLatestSessionFile(projectDir);
-  return info?.path ?? null;
-}
 
 // ── Main command ────────────────────────────────────────────────────────
 
@@ -201,6 +188,8 @@ async function doWatch(
   // Docker) and ask it for the project dir to tail.
   const runner = await createRunner(root);
   const projectDir = runner.agentSessionProjectDir(worktreePath);
+  const turns = new WatchTurnTracker(storage, task.id, (line) => process.stdout.write(dim(line) + '\n'));
+  try { await turns.refresh(); } catch { console.log(dim('(recent turns unavailable)')); }
 
   // Start tailing supervisor stdout via the runner. Keep the run name in scope
   // so the header can also probe run liveness for the substate.
@@ -253,12 +242,12 @@ async function doWatch(
 
   // Wait for the agent's JSONL session file to appear (best effort — task
   // may be in pre-turn phases where the agent has not started yet).
-  let sessionFile = await findSessionFile(projectDir);
+  let sessionFile: string | null = null;
 
   let lastFileSize = 0;
   let lastStatusCheck = Date.now();
   let lastHeaderPrint = Date.now();
-  let currentSessionFile = sessionFile;
+  let currentSessionFile: string | null = sessionFile;
   let partialLine = '';
 
   let running = true;
@@ -276,11 +265,17 @@ async function doWatch(
 
   try {
     while (running) {
-      const newSessionFile = await findSessionFile(projectDir);
-      if (newSessionFile && newSessionFile !== currentSessionFile) {
+      const newSessionFile = (await findLatestSessionFile(projectDir, turns.turnStart))?.path ?? null;
+      if (newSessionFile !== currentSessionFile) {
         currentSessionFile = newSessionFile;
         lastFileSize = 0;
         partialLine = '';
+        if (newSessionFile) {
+          try {
+            const info = await stat(newSessionFile);
+            lastFileSize = await watchSessionReplayStart(newSessionFile, info.size);
+          } catch { /* file removed during discovery */ }
+        }
       }
 
       if (currentSessionFile) {
@@ -306,7 +301,7 @@ async function doWatch(
               if (!line.trim()) continue;
               try {
                 const entry = JSON.parse(line) as RawLogEntry;
-                renderEntry(entry);
+                if (watchEntryBelongsToTurn(entry.timestamp, turns.turnStart)) renderEntry(entry);
               } catch {
                 // Malformed JSON — agent may be mid-write. Skip.
               }
@@ -325,6 +320,7 @@ async function doWatch(
 
       if (now - lastStatusCheck >= STATUS_CHECK_INTERVAL_MS) {
         lastStatusCheck = now;
+        try { await turns.refresh(); } catch { /* retry next status check */ }
         try {
           const current = await storage.getTask(task.id);
           if (!current || current.status !== 'working') {

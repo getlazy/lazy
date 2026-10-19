@@ -5,7 +5,7 @@ import { join, dirname, resolve, relative } from 'path';
 /**
  * INVARIANT: `src/daemon/` and `src/server/` import NOTHING from `src/cli/`.
  *
- * CLAUDE.md's rule is that the daemon owns business logic and the CLI is a
+ * AGENTS.md's rule is that the daemon owns business logic and the CLI is a
  * human-facing client — "violations to reject on sight". The trouble is that
  * this class of violation is invisible at review time. It never arrives as one
  * indefensible import; it arrives as 34 daemon->CLI edges accumulated across a

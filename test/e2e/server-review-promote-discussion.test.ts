@@ -96,7 +96,7 @@ describe('promote a review discussion', () => {
 
     const shown = JSON.parse((await ctx.lazy(['show', 'promoted-from-discussion', '--json'])).stdout);
     expect(shown.goal).toBe('Bound the retry path with a queue budget');
-    // INVARIANT (CLAUDE.md): the web UI never auto-starts work.
+    // INVARIANT (AGENTS.md): the web UI never auto-starts work.
     expect(shown.status).toBe('backlog');
     expect(shown.parent_task_id).toBe(findFullTaskId(ctx.root, taskId));
     expect(String(shown.prompt)).toContain('unbounded');

@@ -85,7 +85,7 @@ describe('a turn with no lazy MCP tools fails loud', () => {
     const show = await ctx.lazy(['show', taskId]);
     const text = show.stdout + show.stderr;
     expect(text).toContain('Could not register the lazy MCP tools');
-    // Actionable, per CLAUDE.md: which task, where it ran, and the real cause.
+    // Actionable, per AGENTS.md: which task, where it ran, and the real cause.
     expect(text).toContain(taskId);
     expect(text).toContain('Container/host:');
     expect(text).toContain('EISDIR');

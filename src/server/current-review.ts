@@ -6,6 +6,7 @@
  * draft; the accept checklist is disclosure (daemon still refuses).
  */
 
+import { runnerImageSyncCheckboxHtml } from './runner-image-banner';
 import type { Task, RaisedItem, Comment } from '../storage';
 import type { FileViolation, ReviewComment, AcceptRemedy } from '../types';
 import { isProseReviewAnchor, proseAnchorReviewerWhere } from '../review/prose-anchor';
@@ -51,6 +52,8 @@ export interface CurrentReviewInput {
    * Comments tab said otherwise.
    */
   queuedNotes?: Comment[];
+  /** Feedback saved by a refused unblock and not yet delivered; accept counts it. */
+  withheldFeedback?: number;
   raisedItems: RaisedItem[];
   fileViolations: FileViolation[];
   viewedFiles: Record<string, string>;
@@ -244,10 +247,11 @@ function terminalVerbHtml(
   }) + template;
 }
 
-function syncFormHtml(taskId: string, reason: string | null, busy: boolean): string {
+function syncFormHtml(taskId: string, reason: string | null, busy: boolean, imageOptionHtml: string = ''): string {
   return terminalVerbHtml('sync', 'Sync', reason, busy, actionDialogTemplateHtml('sync', `
     <form method="post" action="/tasks/${escapeHtml(taskId)}/actions/sync" class="lz-action-form" data-lz-action-form>
       <p>Merge the parent branch into this task. The agent resolves conflicts.</p>
+      ${imageOptionHtml}
       <div class="rv-form-actions"><button type="submit" class="btn">Sync</button></div>
     </form>`, { noscript: !busy }));
 }
@@ -274,7 +278,7 @@ function rejectFormHtml(taskId: string, reason: string | null): string {
  * lists every queued comment; this is the subset that gates.
  */
 function queuedFeedbackCount(input: CurrentReviewInput): number {
-  return countQueuedHumanFeedback(input.queuedNotes ?? [], pendingDeliveryComments(input.comments).length);
+  return countQueuedHumanFeedback(input.queuedNotes ?? [], pendingDeliveryComments(input.comments).length, input.withheldFeedback ?? 0);
 }
 
 function reviewEndActionsHtml(input: CurrentReviewInput): string {
@@ -309,7 +313,7 @@ function reviewEndActionsHtml(input: CurrentReviewInput): string {
     })}
     <div class="lz-review-terminals">
       ${rejectFormHtml(seg, rejectReason)}
-      ${syncFormHtml(seg, syncReason, busy)}
+      ${syncFormHtml(seg, syncReason, busy, runnerImageSyncCheckboxHtml(task))}
     </div>
     <p class="rv-hint">Comment on a line in Changes, or on the report from Summary.</p>
   </div>`;

@@ -1,13 +1,14 @@
+
 /**
  * "Would this turn be refused for want of a model credential?" — asked BEFORE
  * an editor or prompt opens.
  *
  * The daemon refuses a turn whose agent profile has no credential
  * (src/daemon/credential-gate.ts), and it may be running with none at all.
- * Finding that out after the editor closes would leave the human's words in a
- * recovery file, so every verb that collects text and then launches a turn asks
- * first, next to the identity and usage-pause pre-flights. The daemon is still
- * the authority: this only saves typing into a turn that cannot start.
+ * Verbs that collect text and then launch a turn WITHOUT saving it first
+ * (`lazy ask`) ask first, so nothing is typed into a turn that cannot start.
+ * `lazy unblock` deliberately does not: the daemon saves its feedback before
+ * refusing. The daemon is still the authority either way.
  */
 
 import { tryRpc } from '../daemon/client';
@@ -39,14 +40,3 @@ export async function turnCredentialRefusal(
   }
 }
 
-/** Exit 1 with the daemon's refusal when the task's next turn has no credential. */
-export async function requireTurnCredential(
-  taskId: string,
-  opts: { agentId?: string; beside?: boolean } = {},
-): Promise<void> {
-  const refusal = await turnCredentialRefusal(taskId, opts);
-  if (!refusal) return;
-  console.error(refusal);
-  console.error('Nothing was opened or saved; connect the credential and run this again.');
-  process.exit(1);
-}

@@ -37,6 +37,25 @@ function label(version: string, build: string | null | undefined): string {
 }
 
 /**
+ * The version recorded at this project's previous daemon start, or null when
+ * there is none (first start) or it cannot be read. Read-only — the marker is
+ * rewritten only by maybePostUpgradeNotice, after storage is open, so a start
+ * refused before that (a failed pre-upgrade store backup) is retried as an
+ * upgrade next time.
+ */
+export async function readLastDaemonVersion(projectRoot: string): Promise<string | null> {
+  const markerPath = join(getDaemonDir(projectRoot), MARKER_FILE);
+  try {
+    const parsed = JSON.parse(await readFile(markerPath, 'utf-8')) as VersionMarker;
+    return typeof parsed.version === 'string' && parsed.version.length > 0 ? parsed.version : null;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    logger.warn(`Could not read ${markerPath}: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
+/**
  * Compare the running version against the marker and file an upgrade notice
  * when they differ. Always rewrites the marker to the current version.
  *

@@ -22,7 +22,7 @@ import { expectSuccess, expectFailure, expectOutput, expectError, extractTaskId 
  * the init template started writing both tables itself. The loader then failed
  * on the duplicate table before ever reading the effort value, so all three
  * invariants stopped being exercised while two of them still went red for the
- * wrong reason. Per CLAUDE.md: rewrite the key that is already there, and fail
+ * wrong reason. Per AGENTS.md: rewrite the key that is already there, and fail
  * loudly if the template moves rather than silently editing nothing.
  *
  * Section-scoped because the template ships a commented `effort` line in BOTH

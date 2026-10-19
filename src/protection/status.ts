@@ -30,11 +30,12 @@
 import type { Storage } from '../storage';
 import type { ResolvedConfig } from '../config';
 import type { Task } from '../types';
-import { getRemoteDefaultBranch } from '../git/operations';
+import { getRemoteDefaultBranch, resolveRemoteDefaultBranch } from '../git/operations';
 import { getBranchNameFromId } from '../task/identity';
 import { parentTaskIdOf, targetBranchOf } from '../task-target';
 import { peekPendingAcceptReview } from './pending-review';
 import { logger } from '../utils/logger';
+import { isManagedMode } from '../config/managed-mode';
 
 // ---------------------------------------------------------------------------
 // Shared marker vocabulary
@@ -111,6 +112,13 @@ export interface ProtectionContext {
    * status line gates the same branch accept does.
    */
   remoteDefaultBranch: string | null;
+  /**
+   * False when protection is enabled but git could not NAME the remote's
+   * default branch, so `remoteDefaultBranch` is accept's `main` fallback (or
+   * null) rather than a fact. A surface that must not guess — hosted git —
+   * reads this to answer "unknown" instead of "not the default branch".
+   */
+  defaultBranchResolved: boolean;
   /** taskId → the identifier as written in [protection].protected_tasks. */
   protectedTaskIds: Map<string, string>;
 }
@@ -126,6 +134,7 @@ const INERT_CONTEXT: ProtectionContext = {
   gateDefaultBranch: false,
   defaultBranch: null,
   remoteDefaultBranch: null,
+  defaultBranchResolved: true,
   protectedTaskIds: new Map(),
 };
 
@@ -181,10 +190,17 @@ export async function loadProtectionContext(
   }
 
   let remoteDefaultBranch: string | null = null;
+  let defaultBranchResolved = true;
   if (p.enabled) {
     try {
-      remoteDefaultBranch = await getRemoteDefaultBranch(projectRoot, config.remote.git_remote);
+      const resolved = await resolveRemoteDefaultBranch(projectRoot, config.remote.git_remote);
+      defaultBranchResolved = resolved !== null;
+      // Unresolved: take accept's own fallback (and its warning), so the status
+      // line still gates the branch accept would. `defaultBranchResolved`
+      // records that it is a fallback.
+      remoteDefaultBranch = resolved ?? await getRemoteDefaultBranch(projectRoot, config.remote.git_remote);
     } catch (err) {
+      defaultBranchResolved = false;
       // Observational surface: a repo we cannot ask about the default branch
       // must not fail a `show`/`list`. The explicit lists still apply.
       logger.debug(
@@ -200,6 +216,7 @@ export async function loadProtectionContext(
     gateDefaultBranch: p.gate_default_branch,
     defaultBranch: p.gate_default_branch ? remoteDefaultBranch : null,
     remoteDefaultBranch,
+    defaultBranchResolved,
     protectedTaskIds,
   };
 }
@@ -235,6 +252,108 @@ export async function resolveTaskTargetBranch(
 }
 
 /**
+ * Why `branch` is a protected branch, or null when it is not — THE branch
+ * rule, shared by a task's status (the branch it merges into) and by
+ * {@link branchProtectionFor} (a branch somebody wants to push to).
+ *
+ * A listed branch is reported even while the master switch is off, so a task
+ * status can say "listed, but disabled"; whether it gates anything is
+ * `ctx.enabled`, which every caller applies.
+ */
+export function branchGateFor(
+  ctx: ProtectionContext,
+  branch: string,
+  opts: { foldCase?: boolean } = {},
+): { branch: string; source: BranchGateSource } | null {
+  // `branch` in the result is the PROTECTED name, which differs from the one
+  // asked about only under foldCase.
+  const same = opts.foldCase
+    ? (a: string, b: string) => a.toLowerCase() === b.toLowerCase()
+    : (a: string, b: string) => a === b;
+  const listed = ctx.protectedBranches.find((p) => same(p, branch));
+  if (listed !== undefined) return { branch: listed, source: 'listed' };
+  if (
+    ctx.enabled &&
+    ctx.gateDefaultBranch &&
+    ctx.defaultBranch !== null &&
+    same(ctx.defaultBranch, branch)
+  ) {
+    return { branch: ctx.defaultBranch, source: 'default-branch' };
+  }
+  return null;
+}
+
+/** Is a BRANCH protected — asked of a branch by name rather than of a task. */
+export interface BranchProtectionStatus {
+  branch: string;
+  /**
+   * True when [protection] is enabled and the branch is gated; null when that
+   * cannot be known (the default-branch gate is on but git could not name the
+   * default branch, and the branch is not otherwise gated). A caller must not
+   * read null as "not protected".
+   */
+  protected: boolean | null;
+  /** Why it is protected; null when it is not. */
+  source: BranchGateSource | null;
+  /** One sentence for a person, from {@link branchGateReason}; null when not protected. */
+  reason: string | null;
+}
+
+/**
+ * Protection status of a branch by name. Used where the question is about a
+ * branch rather than a task — today Lazy Teams' hosted git. Same rule as a
+ * task's branch gate ({@link branchGateFor}), and `source` says which half of
+ * it fired: `listed` (named in [protection].protected_branches) or
+ * `default-branch`. The caller decides what each means for it. Hosted git
+ * refuses a member's push of any protected branch, EXCEPT that for a task
+ * branch (`lazy/…`) only an explicit `listed` entry counts — a default-branch
+ * gate never applies there.
+ *
+ * `foldCase` matches without regard to letter case. ONLY hosted git asks for
+ * it: on a case-insensitive filesystem a pushed `Release` writes the same ref
+ * file as a protected `release`, existing or not. Accept and every status
+ * surface keep exact matching (the default) — a merge edge names a real branch.
+ *
+ * When the default-branch gate is on but the default branch could not be
+ * resolved, a branch nothing else gates answers `protected: null` (unknown):
+ * it might be the default branch, and only the caller can say how to fail.
+ */
+export function branchProtectionFor(
+  ctx: ProtectionContext,
+  branch: string,
+  opts: { foldCase?: boolean } = {},
+): BranchProtectionStatus {
+  const gate = ctx.enabled ? branchGateFor(ctx, branch, opts) : null;
+  if (gate) {
+    const base = branchGateReason(gate.branch, gate.source);
+    return {
+      branch,
+      protected: true,
+      source: gate.source,
+      reason: gate.branch === branch
+        ? base
+        : `\`${branch}\` differs only in letter case from \`${gate.branch}\`, and ${base}`,
+    };
+  }
+  if (ctx.enabled && ctx.gateDefaultBranch && !ctx.defaultBranchResolved) {
+    return {
+      branch,
+      protected: null,
+      source: null,
+      reason: 'the repo default branch could not be resolved, so whether this is the protected default branch is unknown',
+    };
+  }
+  return { branch, protected: false, source: null, reason: null };
+}
+
+/** Why a branch is protected, in the words every surface uses. */
+export function branchGateReason(branch: string, source: BranchGateSource): string {
+  return source === 'default-branch'
+    ? `\`${branch}\` is the repo default branch, protected while [protection] is enabled`
+    : `\`${branch}\` is listed in [protection].protected_branches`;
+}
+
+/**
  * Compute a task's protection status against an already-loaded context.
  *
  * `targetBranch` may be passed by a caller that already resolved it (the review
@@ -257,19 +376,9 @@ export async function protectionStatusForTask(
       ? opts.targetBranch
       : await resolveTaskTargetBranch(storage, task, ctx.remoteDefaultBranch);
 
-  let branchGate: TaskProtectionStatus['branchGate'] = null;
-  if (targetBranch) {
-    if (ctx.protectedBranches.includes(targetBranch)) {
-      branchGate = { branch: targetBranch, source: 'listed' };
-    } else if (
-      ctx.enabled &&
-      ctx.gateDefaultBranch &&
-      ctx.defaultBranch !== null &&
-      targetBranch === ctx.defaultBranch
-    ) {
-      branchGate = { branch: targetBranch, source: 'default-branch' };
-    }
-  }
+  const branchGate: TaskProtectionStatus['branchGate'] = targetBranch
+    ? branchGateFor(ctx, targetBranch)
+    : null;
 
   let armed = true;
   if (listedAs) {
@@ -385,8 +494,11 @@ export function protectionAdvice(
   if (!status.gated) return lines;
 
   lines.push(
-    `Accepting needs human approval — run \`lazy accept ${taskDisplayId}\` from a ` +
-    `terminal; it prompts for the approval passphrase and merges in one step.`,
+    isManagedMode()
+      ? `Accepting needs human approval — a signed-in member presses Accept on this task ` +
+        `in Lazy Teams, which approves and merges in one step.`
+      : `Accepting needs human approval — run \`lazy accept ${taskDisplayId}\` from a ` +
+        `terminal; it prompts for the approval passphrase and merges in one step.`,
   );
   if (status.pendingReview) {
     lines.push(
@@ -409,7 +521,9 @@ export function protectionHeadline(status: TaskProtectionStatus): string | null 
     : status.taskGate
       ? 'protected (task gate)'
       : `protected (merges into \`${status.branchGate!.branch}\`)`;
-  return `${PROTECTED_MARKER} ${what} — accept prompts for the passphrase`;
+  return isManagedMode()
+    ? `${PROTECTED_MARKER} ${what} — a member's Accept in Lazy Teams approves it`
+    : `${PROTECTED_MARKER} ${what} — accept prompts for the passphrase`;
 }
 
 /**

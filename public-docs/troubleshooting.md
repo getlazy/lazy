@@ -7,6 +7,8 @@ have a one-line fix, and `lazy doctor` diagnoses all of them in one pass:
 lazy doctor
 ```
 
+Doctor announces its checklist before checking and shows the active phase while it works, including slow container checks. In Teams, god-mode Doctor shows the current phase while the page refreshes.
+
 `lazy doctor` is the single diagnosis surface — every check prints what failed,
 why, and the command that fixes it. When a run finds errors, it also files
 one alert in the inbox (`lazy messages`, and Inbox on the dashboard) so
@@ -14,6 +16,11 @@ people who never run doctor still see the findings. Re-running doctor does
 not stack a second alert for the same failures. The same report and the same
 cleanup flags are on the dashboard under **Settings → Doctor**. The sections
 below expand on the failures users hit most often.
+
+In Lazy Teams, a project health notice can be dismissed from its project page.
+It stays hidden in that browser session while the same problem is reported,
+and returns if the check clears and later fails again. Dismissing a notice
+does not repair the underlying issue or withdraw a support report.
 
 ## Doctor's cleanup flags
 
@@ -48,6 +55,11 @@ whenever anything failed, so a script or `&&` chain sees it.
 
 Run one remedy at a time — doctor refuses two in one invocation, so you always
 know which listing you just approved.
+
+A task worktree normally has a `.git` **file**, containing `gitdir: ...`,
+not a directory. That alone does not mean it was overwritten. Containers see
+protected copies of these pointer files; doctor checks the originals on the
+machine running the daemon, not the containers’ mounted copies.
 
 What each one does:
 
@@ -110,11 +122,11 @@ nothing was inspected.
 ## Sessions start with a lot of the context window already used
 
 Every session — the builder and every task agent — begins with a fixed block of
-text already in its context: the `CLAUDE.md` files the agent harness loads,
+text already in its context: the `CLAUDE.md` and `AGENTS.md` files the agent harness loads,
 lazy's own system prompt, your shared memory index, and the schemas for lazy's
 tools. None of it is wasted, but on a mature project it adds up, and the first
 place most people notice is a startup line from the agent harness about
-`CLAUDE.md` being over its size limit.
+a `CLAUDE.md` or `AGENTS.md` being over its size limit.
 
 `lazy doctor` prints the whole breakdown, so you never have to go looking for
 it:
@@ -129,7 +141,7 @@ and a task agent session are not the same:
 ```
 Context budget (injected into every session, before the first message):
   Builder session
-    ≥10,412 tok  41,903 chars  CLAUDE.md (project)
+    ≥10,412 tok  41,903 chars  AGENTS.md (project)
       ! over the 40,000-char per-file limit Claude Code 2.1.266 warns at
         It is still injected in full — nothing is truncated — but the harness
         warns at every startup and re-reads the whole file every turn. …
@@ -153,7 +165,7 @@ Reading it:
 - **Indented lines break down the line above them** and are not added again to
   the total. The shared memory index is part of the system prompt, so it is
   shown inside it.
-- **Nothing here is ever truncated.** The per-file `CLAUDE.md` limit is a
+- **Nothing here is ever truncated.** The per-file `CLAUDE.md` / `AGENTS.md` limit is a
   warning from the agent harness, not a cut-off — an oversized file is still
   loaded in full, it just costs you that much of every session and gets re-read
   on every turn. The limit is per file, not a budget across all of them: two
@@ -176,15 +188,15 @@ Reading it:
   fixed 200k. A 1M-window Anthropic model through lazy's proxy gets 1M; a 200k
   model stays 200k. Doctor prints that number under each role, and names a
   remedy if the project's upstream is pointed somewhere that would cap a 1M
-  model. The CLAUDE.md per-file warning uses the same window, so a 1M session
+  model. The per-file warning uses the same window, so a 1M session
   is allowed a larger file before the harness complains.
 
 When a role's total goes past a fifth of the window, doctor adds one line naming
 the largest thing *you* can shrink. There are only two:
 
-- **A `CLAUDE.md` that has grown into a manual.** Move the parts only some tasks
+- **A `CLAUDE.md` or `AGENTS.md` that has grown into a manual.** Move the parts only some tasks
   need into a separate document they can read when it is relevant. Instructions
-  every task must follow belong in `CLAUDE.md`; reference material does not.
+  every task must follow belong in it; reference material does not.
 - **The shared memory index.** Shrink it with `lazy memory compact`, or curate
   the records directly with `lazy memory save` and `lazy memory rm`. See
   [memory.md](memory.md).
@@ -248,6 +260,29 @@ The common causes, in rough order of frequency:
 
 `lazy doctor` deliberately keeps working when the daemon does not — it is the
 one command that must never die of the problem it exists to diagnose.
+
+## The daemon runs but stops doing work
+
+Sometimes the daemon is running but makes no progress: tasks stop changing state,
+and `lazy daemon logs` repeats `skipping tick, previous reconcile still running`.
+That means something the daemon depends on (a file or a network call) has stopped
+answering. Because the daemon's status check bounds every wait, it still answers,
+and `lazy daemon status` prints a `Stuck:` line naming what it is waiting on.
+
+To see more, ask the daemon for a report of everything it is waiting on. It
+writes the report to its log:
+
+```bash
+kill -USR2 <daemon pid>      # the pid is in `lazy daemon status`
+lazy daemon logs              # look for "Daemon wedge report"
+```
+
+On Linux the report counts what each daemon thread is blocked on in the kernel.
+Threads waiting in `fuse_*` or `request_wait_answer` point at a mounted
+filesystem that has stopped answering. Restarting the daemon (`lazy daemon
+restart`) loses no work: tasks that were mid-turn are marked interrupted and
+resume on their own. If the cause is a mounted filesystem, fix or remount it
+first, or the daemon will get stuck the same way again.
 
 ## "Daemon is not running" while a daemon clearly is
 
@@ -533,8 +568,7 @@ profiles need it:
 
 A missing credential fails the check by name, with the profiles it strands, how
 to obtain one, and the `lazy auth set <name>` command that stores it. The source
-is the daemon's environment, the credential store (naming its backend), or the
-agent key file written by `lazy system agent set-key`. When the daemon cannot be
+is the daemon's environment or the credential store (naming its backend). When the daemon cannot be
 asked, doctor falls back to your shell's environment and the store and says so
 on every line — that answer may not be what lazy actually uses, so check the
 daemon and run it again.
@@ -609,6 +643,33 @@ Fix: recreate that task's container, then resume or unblock:
 lazy shell <task> --restart
 lazy resume <task>
 ```
+
+## Cursor keeps reconnecting without doing work
+
+Cursor can exit after reporting only reconnection events. Lazy retries an
+unrecognized failure up to six times in one turn, then ends the turn; the task
+becomes `interrupted` and automatic resume tries again later, with its usual
+limits. The task's last error carries Cursor's own error output. Also check
+the proxy audit (`lazy stats audit`) for a
+Cursor upstream HTTP status on the same task. Lazy records the short error
+message Cursor returned with it (credentials removed), which usually names
+why the request was rejected.
+
+## A turn fails with `E2BIG: argument list too long`
+
+Every agent lazy runs — Claude Code, Codex, Cursor and Pi — receives its task
+prompt on standard input, and a long system prompt through a private temporary
+file, so the operating system's limit on the size of one command-line argument
+(128 KiB on Linux) no longer applies to prompts however much feedback, history
+or notes they carry. Lazy also checks every agent launch before starting it and
+refuses one whose command line is oversized, naming the argument.
+
+If a turn still stops with `E2BIG` or "was not launched: argv element … over
+the … argv bound", look for oversized environment values (for example a very
+large variable set with `lazy env set`) or report it — it is a bug in how
+lazy launches the agent. Lazy does not retry such a launch, because every retry
+would fail the same way; once fixed, resume the task with `lazy resume <task>`.
+No feedback is lost: undelivered feedback is re-delivered on the next turn.
 
 ## `lazy pair` refuses to run on my machine
 
@@ -741,6 +802,12 @@ lazy doctor            # asks first
 lazy doctor --yes      # clears it without asking
 lazy doctor --dry-run  # only says what it would remove
 ```
+
+A lock taken inside a Lazy Teams project's machine is never reclaimed from
+outside that machine: lazy there cannot see whether the machine's daemon is
+still running, so it refuses with a message that names the lock file. Stop the
+project from its page first; if the lock is still there afterwards, remove it
+with the `rm` command the message prints.
 
 Removing the lock by hand (`rm …/.storage-lock`) is safe **only** when no lazy
 process is running. If one is, wait for it instead — the path in the message is
@@ -1010,7 +1077,7 @@ session: no MCP, no daemon config by design` and marks the lazy-tool checks as
 not applicable (`–`). That environment is yours, not the agent's, and it never
 has lazy's tools — nothing there is broken.
 
-Everywhere else it walks the whole chain and marks each link, exiting non-zero if any fails:
+Everywhere else it walks the whole chain and marks each link, exiting non-zero if any fails. A failed link is printed as what is wrong (for example `✗ LAZY_DAEMON_CONFIG is not set`), not as the name of the thing checked:
 
 1. **`LAZY_DAEMON_CONFIG`** — set, mounted, readable, parseable; reports the
    project root, task id and daemon target. The bearer token is never printed.
@@ -1093,6 +1160,43 @@ guessing which values look secret. Two consequences worth knowing:
 - Values shorter than 12 characters are left alone on purpose. Ollama sets
   `ANTHROPIC_API_KEY=ollama` and the QA agent uses `none`; substring-replacing
   words that short would corrupt unrelated log lines while protecting nothing.
+
+## A builder fails while its container image is building
+
+When starting a builder in Lazy Teams, the failed start page shows the container
+build's last relevant output beneath the exit code. The same diagnostic is saved
+with the builder session, so you can return to it after leaving the page. A
+project administrator can also read the failed start in the project's app logs.
+For a BuildKit failure, look for the failing step's error message above the
+final `ERROR` line; the exit code alone does not identify the cause.
+
+## "The environment that runs this project's tasks isn't working"
+
+In Lazy Teams, this health banner offers a project admin the fix that matches
+the failure. Docker's own error text is under **Docker's error** in the banner.
+
+- **The machine has a damaged image store** (Docker reports `failed to extract
+  layer` or `invalid tar header`): lazy repairs this by itself first. When a
+  task or builder fails to start this way, lazy removes only that image (never
+  volumes, containers or other images), rebuilds it without the build cache and
+  tries the start once more; the task's journal and the project's messages
+  record it, with what the damaged layer looked like before it was removed
+  (its real checksum against the expected one, where it stops decoding, and
+  what else Docker was doing), and the instance's Doctor shows the latest one.
+  The rebuild reuses the image's base image, so damage there is not
+  repaired this way. A repair that did not help is not tried again for the
+  same image and error until someone rebuilds that image, so a task that keeps
+  being restarted does not rebuild over and over. A full disk (`no space left
+  on device`) is not treated as damage, and nothing is removed for it: free
+  space on the machine instead. If the banner still shows, the damage is outside what the
+  rebuild replaces: use
+  **Reset Docker storage**, and once the check runs again, rebuild the image.
+- **The project's image is broken**, and the project builds its own image
+  (`[docker] dockerfile`, or a committed `Dockerfile.lazy`): use **Rebuild
+  image**. If that doesn't fix it, use **Rebuild without cache**.
+- **lazy's runner image is broken**, and the project has no image of its own:
+  use **Rebuild lazy's image**. This rebuilds lazy's default image from scratch.
+  From a terminal, `lazy system runner-image rebuild` does the same thing.
 
 ## `Script not found "builder"`, or a selfcheck with no output
 
@@ -1380,3 +1484,25 @@ url = "https://docs.example.com"   # "" disables documentation pointers
 
 Every message that carries a pointer is fully actionable without it — the link
 is always a supplement, never the instruction.
+
+## Missing git pointers inside a task container
+
+A linked worktree normally has a `.git` file, not a directory. If
+`lazy doctor --repair-git-pointers` finds no host-pointer problem but git
+inside a paused task's container still reports a missing `.git`, recreate the
+container rather than editing git files inside it. From a terminal connected
+to the project daemon, run:
+
+```sh
+lazy shell <task> --restart -- git status
+```
+
+This replaces the container and its mounts, not the worktree: uncommitted files
+remain, but container-only packages and running processes are lost. A working
+task must finish or be stopped first. In the web interface (including Teams),
+starting the task container checks its mounted pointers against the validated
+host originals and recreates a faulty paused container automatically. If the
+pointer check cannot run, the container is left untouched and the diagnostic
+error is reported. If the error persists after recreation, report it with the
+daemon logs; a successful host check alone does not identify the cause of a
+container failure.

@@ -44,7 +44,7 @@ import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 import { enableInProcessTestMode } from '../helpers/in-process-test-mode';
 import { pinConfig } from '../helpers/pin-config';
 
-// This suite calls production code (reconcileTasks) IN-PROCESS — see CLAUDE.md.
+// This suite calls production code (reconcileTasks) IN-PROCESS — see AGENTS.md.
 enableInProcessTestMode();
 
 function git(cwd: string, ...args: string[]): string {
@@ -61,7 +61,7 @@ interface Env {
 /**
  * Minimal project config. `reconcileTasks` builds a Runner from `loadConfig`,
  * which walks UP from cwd — lazy's OWN worktree under `bun test` — so without a
- * pin this suite silently adopts the developer's live lazy.toml (CLAUDE.md,
+ * pin this suite silently adopts the developer's live lazy.toml (AGENTS.md,
  * "In-process daemons → pin LAZY_CONFIG"). The docker runner never gets used:
  * every case here returns on the response branch, before any liveness probe.
  */

@@ -206,12 +206,28 @@ export interface ReviewStatus {
 }
 
 /** A single health-check result reported by a driver. */
-export interface HealthCheck {
-  state: 'ok' | 'warn' | 'fail';
-  /** Human-readable label, e.g. "gh CLI installed", "GitHub authentication" */
+export type HealthCheck = PassingHealthCheck | FailingHealthCheck;
+
+interface HealthCheckBase {
+  /** PASS wording, a condition: e.g. "gh CLI installed", "GitHub authentication" */
   what: string;
   /** Explanation for warn/fail states */
   reason?: string;
+}
+
+export interface PassingHealthCheck extends HealthCheckBase {
+  state: 'ok' | 'warn';
+  problem?: undefined;
+}
+
+/**
+ * INVARIANT: a failing check names the problem, not its passing condition
+ * ("Docker isn't running in this project's machine", never "Docker daemon
+ * running"). Required here so a new check cannot ship with one wording.
+ */
+export interface FailingHealthCheck extends HealthCheckBase {
+  state: 'fail';
+  problem: string;
 }
 
 /** A deprecated config option with a human-readable alternative. */
@@ -284,6 +300,16 @@ export interface OpenReview {
   baseBranch: string;
   /** Task metadata that records it — the keys markReadyForReview would write. */
   metadata: Record<string, string>;
+}
+
+/**
+ * A PR/MR found on the forge by its head branch, in whatever state it is —
+ * the natural key a task's PR is recovered by when lazy has no record of it.
+ */
+export interface BranchReview extends OpenReview {
+  state: PRState;
+  /** The PR/MR's head commit, when the forge reports it — proves it is THIS branch's history. */
+  headSha?: string;
 }
 
 /** Result returned by a driver's importUrl method. */
@@ -412,6 +438,17 @@ export interface RepositoryDriver {
    * LocalDriver: always null.
    */
   findOpenReviewForBranch(branch: string): Promise<OpenReview | null>;
+
+  /**
+   * The PR/MR whose head is `branch`, in ANY state: an open one when there is
+   * one, else the most recently created merged or closed one. Read-only. Used
+   * to reconcile a task whose PR lazy never recorded (a crash between the
+   * forge create and the store write, a PR opened by hand). Throws when the
+   * forge cannot be asked, so "none" is never confused with "could not tell".
+   *
+   * LocalDriver: always null.
+   */
+  findReviewForBranch(branch: string): Promise<BranchReview | null>;
 
   /**
    * The base branch of the PR/MR this task records, in whatever state it is

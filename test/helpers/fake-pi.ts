@@ -46,6 +46,22 @@ export type PiStep =
   | { kind: 'sleep'; ms: number }
   /** Write files in the cwd and `git commit` them — the agent "doing work". */
   | { kind: 'commit'; message: string; files: Array<{ path: string; content: string }> }
+  /**
+   * One model request, made the way pi makes it: the provider named by
+   * `--provider` is looked up in the per-turn `~/.pi/agent/models.json` the
+   * supervisor wrote, and the request goes to THAT provider's `baseUrl` with
+   * its `apiKey` (`$VAR` interpolated from the env, as pi does). Nothing in
+   * the step names an address, so the request lands wherever lazy pinned the
+   * provider — which is the property under test.
+   */
+  | {
+      kind: 'http';
+      /** Appended to the provider's baseUrl (default `/v1/messages`, the Anthropic wire). */
+      path?: string;
+      body?: unknown;
+      /** Fail the step unless the response status matches. */
+      expectStatus?: number;
+    }
   /** Exit immediately with this code. */
   | { kind: 'exit'; code: number };
 
@@ -164,6 +180,7 @@ export async function clearPiInvocations(fake: FakePi): Promise<void> {
  */
 const FAKE_PI_PRELUDE = String.raw`
 const FAKE_LABEL = 'fake pi';
+const recordedStdin = argv.includes('-p') ? fs.readFileSync(0, 'utf8') : undefined;
 
 // Probe invocations, answered without consuming a scenario entry:
 //   --version  HostProcessRunner.checkAvailability() and PiPackaging.diagnose().
@@ -231,10 +248,43 @@ function writeTurnStream(step) {
   for (const line of lines) process.stdout.write(JSON.stringify(line) + '\n');
 }
 
+async function runHttp(step) {
+  const providerFlag = argv.indexOf('--provider');
+  const provider = providerFlag !== -1 ? argv[providerFlag + 1] : undefined;
+  if (!provider) throw new Error(FAKE_LABEL + ': http step needs --provider on the argv');
+  const modelsPath = path.join(process.env.HOME || '', '.pi', 'agent', 'models.json');
+  const models = JSON.parse(fs.readFileSync(modelsPath, 'utf8'));
+  const entry = models.providers && models.providers[provider];
+  if (!entry || !entry.baseUrl) throw new Error(FAKE_LABEL + ': no baseUrl for provider ' + provider + ' in ' + modelsPath);
+  const rawKey = entry.apiKey || '';
+  const apiKey = rawKey.startsWith('$') ? (process.env[rawKey.slice(1)] || '') : rawKey;
+  const modelFlag = argv.indexOf('--model');
+  const model = modelFlag !== -1 ? argv[modelFlag + 1] : 'unknown';
+  const body = step.body !== undefined
+    ? JSON.stringify(step.body)
+    : JSON.stringify({ model, max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] });
+  const res = await fetch(entry.baseUrl.replace(/[/]$/, '') + (step.path || '/v1/messages'), {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'anthropic-version': '2023-06-01',
+      ...(apiKey ? { 'x-api-key': apiKey } : {}),
+    },
+    body,
+  });
+  await res.text().catch(() => '');
+  if (step.expectStatus !== undefined && res.status !== step.expectStatus) {
+    throw new Error(FAKE_LABEL + ': http expected status ' + step.expectStatus + ' got ' + res.status);
+  }
+}
+
 async function runAgentStep(step) {
   switch (step.kind) {
     case 'respond':
       writeTurnStream(step);
+      return true;
+    case 'http':
+      await runHttp(step);
       return true;
     default:
       return false;

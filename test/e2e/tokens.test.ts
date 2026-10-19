@@ -176,8 +176,9 @@ describe('lazy stats tokens', () => {
     // builder's requests cost real tokens and must appear somewhere.
     expect(taskSection).toContain('(unattributed)');
 
-    // The scope caveat is always printed: this counts proxied traffic only.
-    expectOutput(result, 'Only traffic through the lazy proxy is audited');
+    // The scope caveat is always printed: this counts what lazy launched, which
+    // is all proxied, and nothing it did not launch.
+    expectOutput(result, 'a process lazy did not launch is not');
   });
 
   test('--role and --task narrow the rollup', async () => {
@@ -258,7 +259,7 @@ describe('lazy stats tokens', () => {
     expectError(result, 'Unknown subcommand: stats replay');
   });
 
-  // The multiplexer invariant from CLAUDE.md: a subcommand with dedicated
+  // The multiplexer invariant from AGENTS.md: a subcommand with dedicated
   // usage text must be in the parent's usage map, or -h silently prints the
   // PARENT's help with no error anywhere.
   test('`lazy stats tokens -h` prints the subcommand help, not the parent help', async () => {
@@ -504,7 +505,7 @@ describe('lazy stats tools', () => {
     expectError(badTop, "Invalid --top '0'");
   });
 
-  // The multiplexer invariant from CLAUDE.md: a subcommand with its own usage
+  // The multiplexer invariant from AGENTS.md: a subcommand with its own usage
   // text must be in the parent's usage map, or -h silently prints the PARENT's
   // help with no error anywhere.
   test('`lazy stats tools -h` prints the subcommand help, not the parent help', async () => {

@@ -23,6 +23,7 @@
  */
 
 import { loadRailsPolicyTables } from './rails-policy-tables';
+import { USAGE_VIEW_COMMANDS, answerUsageView } from './teams-usage-views-stub';
 
 export interface TeamsRpcRelayOptions {
   /** `acme/lazy-toy` — the project path segment of the proxy route. */
@@ -37,6 +38,13 @@ export interface TeamsRpcRelayOptions {
   projectRoot: string;
   /** Records `command` or `storage:<method>` for every call relayed. */
   proxied?: string[];
+  /**
+   * Serve `usagePause` / `usageLimits` / `tokenBudget` the way Rails does: asked
+   * of the daemon as the control plane, answered narrowed to this member.
+   * Omitted, they are refused as unknown commands (a suite that does not
+   * exercise them need not hold a control token).
+   */
+  usageViews?: { controlToken: () => string; memberEmail: string };
 }
 
 /**
@@ -55,6 +63,11 @@ export async function relayTeamsRpc(req: Request, opts: TeamsRpcRelayOptions): P
   const command = url.pathname.slice(base.length);
   const body = await req.text();
   const params = body ? JSON.parse(body) : {};
+  // Narrowed to the member, not relayed (`Api::Cli::UsageViewsController`).
+  if (USAGE_VIEW_COMMANDS.has(command) && opts.usageViews) {
+    opts.proxied?.push(command);
+    return answerUsageView(command, params, { ...opts.usageViews, projectRoot: opts.projectRoot, daemonTarget: opts.daemonTarget });
+  }
   if (command !== 'storage' && !tables.cliCommands.has(command)) {
     return Response.json({ error: `Unknown or unsupported command '${command}'.` }, { status: 404 });
   }
@@ -65,6 +78,16 @@ export async function relayTeamsRpc(req: Request, opts: TeamsRpcRelayOptions): P
   if (extra.length > 0) {
     return Response.json(
       { error: `'${command}' cannot carry ${extra.map((k) => JSON.stringify(k)).join(', ')} from a clone logged in to Lazy Teams.` },
+      { status: 403 },
+    );
+  }
+  if (command === 'tokenStats' && params.mode !== 'latency-cli' && params.mode !== 'latency-history') {
+    return Response.json(
+      {
+        error:
+          "'tokenStats' can only carry mode \"latency-cli\" or \"latency-history\" from a clone logged in to Lazy Teams: " +
+          'token totals name credentials, and Teams does not offer them to a bound clone.',
+      },
       { status: 403 },
     );
   }

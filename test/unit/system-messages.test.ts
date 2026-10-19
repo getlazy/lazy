@@ -9,7 +9,8 @@
  * human's inbox. Do NOT weaken the dismissal-rejection test.
  *
  * The rest pin the storage contract: creation is append-only (no edit, no
- * delete), read/dismiss are idempotent first-wins state changes, and unread
+ * delete), read/dismiss are idempotent first-wins state changes, a collapsed
+ * repeat only moves its count and last-seen time, and unread
  * messages — and only unread ones — are injected into the builder prompt.
  */
 
@@ -19,6 +20,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { createAllHandlers, createMessagePostHandler, type McpToolContext } from '../../src/mcp/tools';
 import { createStorage, type Storage } from '../../src/storage';
+import { STORAGE_METHODS } from '../../src/daemon/rpc-handlers';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 import {
   buildSystemMessagesSection,
@@ -122,6 +124,101 @@ describe('system messages', () => {
     const all = await storage.listSystemMessages({ includeDismissed: true });
     expect(all).toHaveLength(1);
     expect(all[0].dismissed_by).toBe('human');
+  });
+
+  // INVARIANT: a bulk dismissal touches only OPEN messages matching the filter,
+  // deletes nothing, and keeps an earlier dismisser on record. The filter is
+  // applied by the store (one RPC), so every surface means the same thing.
+  test('dismissSystemMessages applies source/title filters to open messages only', async () => {
+    const a = await storage.createSystemMessage({ source: 'machine-docker', title: 'Docker restarted', body: 'b', kind: 'notice' });
+    const b = await storage.createSystemMessage({ source: 'machine-docker', title: 'Docker is not running', body: 'b', kind: 'alert' });
+    const c = await storage.createSystemMessage({ source: 'daemon', title: 'Docker restarted elsewhere', body: 'b', kind: 'notice' });
+    const early = await storage.createSystemMessage({ source: 'machine-docker', title: 'Docker restarted', body: 'b', kind: 'notice' });
+    await storage.dismissSystemMessage(early.id, 'builder');
+
+    const bySource = await storage.dismissSystemMessages({ source: 'machine-docker', title: 'Docker restarted' }, 'human');
+    expect(bySource.map(m => m.id)).toEqual([a.id]);
+
+    const bySubstring = await storage.dismissSystemMessages({ titleContains: 'DOCKER' }, 'human');
+    expect(bySubstring.map(m => m.id).sort()).toEqual([b.id, c.id].sort());
+
+    expect(await storage.listSystemMessages()).toHaveLength(0);
+    const all = await storage.listSystemMessages({ includeDismissed: true });
+    expect(all).toHaveLength(4);
+    expect(all.find(m => m.id === early.id)!.dismissed_by).toBe('builder');
+    expect(await storage.dismissSystemMessages({}, 'human')).toEqual([]);
+  });
+
+  // INVARIANT: with collapseRepeats an identical event (source+kind+title) that
+  // is still open bumps a count instead of filing a new message; a different
+  // title, or one arriving after dismissal, is its own message. A dockerd crash
+  // loop filed 150+ identical notices in a day and buried the inbox.
+  test('createSystemMessage collapses open repeats when asked', async () => {
+    const input = { source: 'machine-docker', title: 'Restarted', body: 'b', kind: 'notice' as const };
+    const first = await storage.createSystemMessage(input, { collapseRepeats: true });
+    const second = await storage.createSystemMessage({ ...input, body: 'other' }, { collapseRepeats: true });
+    expect(second.id).toBe(first.id);
+    expect(second.repeat_count).toBe(2);
+    expect(second.body).toBe('b');
+    expect((await storage.createSystemMessage(input, { collapseRepeats: true })).repeat_count).toBe(3);
+
+    const other = await storage.createSystemMessage({ ...input, title: 'Not running', kind: 'alert' }, { collapseRepeats: true });
+    expect(other.id).not.toBe(first.id);
+    // Without the option, producers keep the append-every-time contract.
+    expect((await storage.createSystemMessage(input)).id).not.toBe(first.id);
+
+    await storage.dismissSystemMessages({ source: 'machine-docker' }, 'human');
+    const fresh = await storage.createSystemMessage(input, { collapseRepeats: true });
+    expect(fresh.id).not.toBe(first.id);
+    expect(fresh.repeat_count).toBeUndefined();
+  });
+
+  // INVARIANT: the turn-failure alert is keyed by PROFILE and class, so a new
+  // cause under the same profile lands on the open alert — whose body must then
+  // name that latest cause, not the first one. Opt-in (`refreshBody`): every
+  // other collapsing producer keeps its first body.
+  test('a turn-failure alert shows the latest cause and the retry copy for its class', async () => {
+    const { fileTurnFailureAlert } = await import('../../src/daemon/turn-failure-alert');
+    const failure = { class: 'fatal_auth', reason: 'first cause', remedy: 'r', agent: 'codex-subscription' };
+    const first = await fileTurnFailureAlert(storage, task, failure);
+    const second = await fileTurnFailureAlert(storage, task, { ...failure, reason: 'second cause' });
+    expect(second!.id).toBe(first!.id);
+    expect(second!.repeat_count).toBe(2);
+    expect(second!.body).toContain('second cause');
+    expect(second!.body).not.toContain('first cause');
+    expect(second!.body).toContain('Nothing will retry it');
+
+    const launch = await fileTurnFailureAlert(storage, task, { class: 'launch_failed', reason: 'no container', remedy: 'r' });
+    expect(launch!.body).toContain('retries starting it a few times');
+    expect(launch!.body).not.toContain('Nothing will retry');
+  });
+
+  test('the builder line names a collapsed repeat count', () => {
+    const line = renderSystemMessageLine({ id: 'abcdef0123', created_at: 0, source: 'machine-docker', title: 'Restarted', body: 'b', kind: 'notice', repeat_count: 37, last_seen_at: 86_400_000 });
+    expect(line).toContain('Restarted (×37, last 1970-01-02)');
+  });
+
+  // INVARIANT: the storage RPC (the path every production CLI and Teams call
+  // takes) parses the filter, honours preview, and carries collapseRepeats.
+  test('the storage RPC entries carry the filter, preview and collapse options', async () => {
+    const call = async (method: string, args: Record<string, unknown>): Promise<any> => STORAGE_METHODS[method](storage, args);
+    const input = { source: 'machine-docker', title: 'Restarted', body: 'b', kind: 'notice' };
+    const first = await call('createSystemMessage', { input, options: { collapseRepeats: true } });
+    const again = await call('createSystemMessage', { input, options: { collapseRepeats: true } });
+    expect(again.id).toBe(first.id);
+    expect(again.repeat_count).toBe(2);
+
+    const preview = await call('dismissSystemMessages', { filter: { source: 'machine-docker' }, actor: 'human', options: { preview: true } });
+    expect(preview).toHaveLength(1);
+    expect(await storage.listSystemMessages()).toHaveLength(1);
+
+    await expect(call('dismissSystemMessages', { filter: { titleContains: ' ' }, actor: 'human' })).rejects.toThrow(/non-empty/);
+    await expect(call('dismissSystemMessages', { filter: { bogus: 'x' }, actor: 'human' })).rejects.toThrow(/Unknown/);
+    expect(await storage.listSystemMessages()).toHaveLength(1);
+
+    const dismissed = await call('dismissSystemMessages', { filter: { source: 'machine-docker' }, actor: 'human' });
+    expect(dismissed).toHaveLength(1);
+    expect(await storage.listSystemMessages()).toHaveLength(0);
   });
 
   test('messages survive a fresh storage instance', async () => {
@@ -281,5 +378,26 @@ describe('system messages', () => {
     expect(renderSystemMessageLine(m)).toContain('[alert] Title here — from daemon');
     const read = await storage.markSystemMessageRead(m.id);
     expect(isUnreadSystemMessage(read)).toBe(false);
+  });
+
+  // INVARIANT: a system message's title and body are scrubbed of registered
+  // secret values when written. A producer may quote an agent's raw error
+  // text (a turn-failure alert does), and the message is shown to humans in
+  // the CLI, the dashboard and Teams.
+  test('a registered secret never reaches a system message in clear', async () => {
+    const { setRegisteredSecretValues } = await import('../../src/utils/redact');
+    const SECRET = 'sk-sysmsg-0123456789abcdef-secret';
+    setRegisteredSecretValues('test:sysmsg', [SECRET]);
+    try {
+      const m = await storage.createSystemMessage({ source: 'daemon', title: `fail ${SECRET}`, body: `agent said: ${SECRET}`, kind: 'alert' });
+      const stored = (await storage.listSystemMessages({ includeDismissed: true })).find(x => x.id === m.id)!;
+      for (const text of [m.title, m.body, stored.title, stored.body]) expect(text).not.toContain(SECRET);
+      // A repeat of the same (secret-bearing) title collapses into the open message.
+      const again = await storage.createSystemMessage({ source: 'daemon', title: `fail ${SECRET}`, body: 'x', kind: 'alert' }, { collapseRepeats: true });
+      expect(again.id).toBe(m.id);
+      expect(again.repeat_count).toBe(2);
+    } finally {
+      setRegisteredSecretValues('test:sysmsg', []);
+    }
   });
 });

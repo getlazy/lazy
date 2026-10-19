@@ -19,7 +19,7 @@ import type { Task } from '../types';
  * Used for validation in CLI and MCP tool schemas.
  *
  * 63 because a task code becomes a DNS label: a task's services are served at
- * `<service>.<code>.lazy.localhost`, and 63 octets is the label limit every
+ * `<code>.<service>.lazy.localhost`, and 63 octets is the label limit every
  * resolver and browser enforces. See {@link validateCode}.
  */
 export const MAX_TASK_CODE_LENGTH = 63;
@@ -159,12 +159,17 @@ export function deriveTaskRef(task: Task, allTasks: Task[]): string {
     return shortId(task.id);
   }
 
-  // Check for other tasks with the same code (excluding this task)
-  const sameCode = allTasks.filter(t => t.id !== task.id && t.code === task.code);
+  // Check for other tasks with the same code (excluding this task). A task
+  // whose PINNED ref is this code counts too: a started task renamed away from
+  // it (`lazy edit --code` is cosmetic) still owns the branch and worktree named
+  // after it, and a new task must not be cut onto them.
+  const code = task.code;
+  const sameCode = allTasks.filter(t => t.id !== task.id && (t.code === code || t.metadata?.task_ref === code));
+  const refTaken = (ref: string) => allTasks.some(t => t.id !== task.id && t.metadata?.task_ref === ref);
 
   if (sameCode.length === 0) {
     // Unique code
-    return task.code;
+    return code;
   }
 
   // Need date disambiguation
@@ -173,9 +178,9 @@ export function deriveTaskRef(task: Task, allTasks: Task[]): string {
   // Check if any same-code tasks also share the same date
   const sameDateAndCode = sameCode.filter(t => formatDateForRef(t.created_at) === dateStr);
 
-  if (sameDateAndCode.length === 0) {
+  if (sameDateAndCode.length === 0 && !refTaken(`${code}-${dateStr}`)) {
     // Date disambiguates
-    return `${task.code}-${dateStr}`;
+    return `${code}-${dateStr}`;
   }
 
   // Full disambiguation with task ID
@@ -224,7 +229,7 @@ export function deriveCode(input: string): string | null {
  * Returns null if valid, or an error message string if invalid.
  *
  * That is exactly a DNS label, and deliberately so: a task's `[serve]` services
- * are reachable at `<service>.<code>.lazy.localhost`, so a code that is not a
+ * are reachable at `<code>.<service>.lazy.localhost`, so a code that is not a
  * label cannot be addressed there. Dots used to be allowed and are not any
  * more — a dotted code would silently become two labels in that hostname.
  *
@@ -238,7 +243,7 @@ export function validateCode(code: string): string | null {
   }
   if (code.length > MAX_TASK_CODE_LENGTH) {
     return `Task code must be ${MAX_TASK_CODE_LENGTH} characters or fewer (got ${code.length}). ` +
-      `A code becomes part of a hostname (<service>.<code>.lazy.localhost), and that limit is a ` +
+      `A code becomes part of a hostname (<code>.<service>.lazy.localhost), and that limit is a ` +
       `DNS one. Shorten it.`;
   }
   if (code.includes('.')) {
@@ -246,7 +251,7 @@ export function validateCode(code: string): string | null {
     // until recently, so the useful answer is why they stopped being valid and
     // what to write instead — not a restatement of the rule.
     return `Code must not contain dots — it becomes part of a hostname ` +
-      `(<service>.<code>.lazy.localhost), where a dot would split it into two labels. ` +
+      `(<code>.<service>.lazy.localhost), where a dot would split it into two labels. ` +
       `Use hyphens: '${code.replace(/\.+/g, '-')}'`;
   }
   if (!/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(code)) {

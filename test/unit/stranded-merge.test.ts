@@ -107,3 +107,14 @@ describe('task mutex: owner liveness', () => {
     expect(ran).toEqual({ ran: true, value: 'ok' });
   });
 });
+
+describe('stranded merge: a task whose protected files are deferred to its parent', () => {
+  // INVARIANT: an agent-audience subtask (every cluster child) owes nothing on
+  // protected files at its own merge — they are asked at its parent's accept
+  // (src/protection/deferral.ts) — so a dead accept never rests it in
+  // `conflict`, matching the label parkTaskPaused derives.
+  test('pending records do not make it conflict', () => {
+    expect(strandedMergeRestingStatus([turnWithViolation()], 'blocked', true)).toBe('blocked');
+    expect(strandedMergeRestingStatus([turnWithViolation()], 'submitted', true)).toBe('submitted');
+  });
+});

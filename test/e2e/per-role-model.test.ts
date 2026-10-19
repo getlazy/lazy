@@ -48,6 +48,7 @@ agent = "local-ollama"
 harness = "claude-code"
 model = "qwen3.5:35b-a3b-coding-nvfp4"
 endpoint = "http://localhost:11434"
+credential = "none"
 `);
     const taskId = await createTask(ctx, 'Per-role task');
     const result = await ctx.lazy(['show', taskId]);
@@ -81,6 +82,7 @@ agent = "local-ollama"
 [agents.local-ollama]
 harness = "claude-code"
 endpoint = "http://localhost:11434"
+credential = "none"
 `);
     const result = await ctx.lazy(['create', '--goal', 'test task']);
     expectFailure(result);

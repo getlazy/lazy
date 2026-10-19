@@ -16,10 +16,6 @@ import type { CredentialGrant } from '../../src/proxy/credential-broker';
 import type { AuditSink } from '../../src/proxy/audit';
 import type { ProxyAuditRecord } from '../../src/storage/types';
 
-function findFreePort(): number {
-  return 40000 + Math.floor(Math.random() * 10000);
-}
-
 describe('proxy → activity bus wiring', () => {
   let upstream: ReturnType<typeof Bun.serve>;
   let proxy: ReturnType<typeof Bun.serve>;
@@ -29,9 +25,8 @@ describe('proxy → activity bus wiring', () => {
   const records: ProxyAuditRecord[] = [];
 
   beforeAll(async () => {
-    const upstreamPort = findFreePort();
     upstream = Bun.serve({
-      port: upstreamPort,
+      port: 0,
       hostname: '127.0.0.1',
       async fetch(req) {
         const body = req.method !== 'GET' ? await req.json().catch(() => null) : null;
@@ -42,19 +37,20 @@ describe('proxy → activity bus wiring', () => {
         });
       },
     });
+    const upstreamPort = upstream.port!;
 
     bus = new ProxyActivityBus();
     events = [];
     bus.subscribe((e) => events.push(e));
 
     const sink: AuditSink = { append: async (r) => { records.push(r); } };
-    proxyPort = findFreePort();
     proxy = createProxyServer(
-      { port: proxyPort, bind: '127.0.0.1', upstream: `http://127.0.0.1:${upstreamPort}` },
+      { port: 0, bind: '127.0.0.1', upstream: `http://127.0.0.1:${upstreamPort}` },
       sink,
       null,
       { activity: bus },
     );
+    proxyPort = proxy.port!;
     await new Promise((resolve) => setTimeout(resolve, 50));
   });
 
@@ -161,9 +157,9 @@ describe('activity attribution composes with per-profile routing', () => {
   let events: ProxyActivityEvent[];
   let reachedProfileTarget: boolean;
 
-  function upstreamServer(port: number, onHit: () => void) {
+  function upstreamServer(onHit: () => void) {
     return Bun.serve({
-      port, hostname: '127.0.0.1',
+      port: 0, hostname: '127.0.0.1',
       async fetch(req) {
         await req.text();
         onHit();
@@ -173,11 +169,11 @@ describe('activity attribution composes with per-profile routing', () => {
   }
 
   beforeAll(async () => {
-    const primaryPort = findFreePort();
-    const profilePort = findFreePort();
     reachedProfileTarget = false;
-    primary = upstreamServer(primaryPort, () => {});
-    profileTarget = upstreamServer(profilePort, () => { reachedProfileTarget = true; });
+    primary = upstreamServer(() => {});
+    profileTarget = upstreamServer(() => { reachedProfileTarget = true; });
+    const primaryPort = primary.port!;
+    const profilePort = profileTarget.port!;
 
     bus = new ProxyActivityBus();
     events = [];
@@ -187,10 +183,9 @@ describe('activity attribution composes with per-profile routing', () => {
       lookup: async (token: string) => (token === AGENT_TOKEN ? grant : null),
       targets: new TargetCredentials(),
     };
-    proxyPort = findFreePort();
     proxy = createProxyServer(
       {
-        port: proxyPort, bind: '127.0.0.1',
+        port: 0, bind: '127.0.0.1',
         upstream: `http://127.0.0.1:${primaryPort}`,
         fallbacks: [],
         agentUpstreams: { [LOCAL_PROFILE]: { upstream: `http://127.0.0.1:${profilePort}`, wire: 'anthropic' } },
@@ -199,6 +194,7 @@ describe('activity attribution composes with per-profile routing', () => {
       credentials,
       { activity: bus },
     );
+    proxyPort = proxy.port!;
     await new Promise((resolve) => setTimeout(resolve, 50));
   });
 

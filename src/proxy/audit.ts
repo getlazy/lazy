@@ -9,7 +9,7 @@
  * not auditing them.
  *
  * Usage: call enqueue() from the hot path and return immediately; the write
- * completes asynchronously. This satisfies CLAUDE.md: no sync I/O on the
+ * completes asynchronously. This satisfies AGENTS.md: no sync I/O on the
  * daemon's event loop.
  */
 

@@ -11,6 +11,7 @@ import { readFile, unlink } from "fs/promises";
 import { join } from "path";
 import { findLazyRoot } from "../../project-paths";
 import { theme } from "../../render/theme";
+import { createPhaseDisplay } from '../phase-display';
 import { parseFlags, requireStorage, refuseIfBoundClone } from "../helpers";
 import { loadConfig, resolveConfigPath } from "../../config/loader";
 import { planAgentMigration } from "../../config/agent-migration";
@@ -411,11 +412,14 @@ export async function commandDoctor(args: string[]): Promise<void> {
   }
 
   const root = findLazyRoot();
+  const display = createPhaseDisplay();
   const { report, results, notes } = await runDoctorReport({
+    onProgress: display.onProgress,
     root,
     // Only a person at their own terminal is told the override command.
     offerUsagePauseOverride: await mayOfferUsagePauseOverride(),
     onStaleStorageLock: async (path, detail) => {
+      display.close();
       if (detail) console.log(`${theme.error("✗")} ${detail}\n`);
       if (dryRun) {
         console.log(`Would remove stale storage lock: ${path}\n`);
@@ -438,7 +442,7 @@ export async function commandDoctor(args: string[]): Promise<void> {
       console.log(`Left in place. Remove it yourself with: ${theme.command(`rm ${path}`)}\n`);
       return "left";
     },
-  });
+  }).finally(() => display.close());
 
   for (const note of notes) {
     console.log(`${note}\n`);
@@ -454,7 +458,7 @@ export async function commandDoctor(args: string[]): Promise<void> {
         console.log(theme.warning(`  ! ${r.warning}`));
       }
     } else {
-      console.log(theme.error(`✗ ${r.label}`));
+      console.log(theme.error(`✗ ${r.problem}`));
       if (r.detail) {
         console.log(`  ${r.detail}`);
       }
@@ -677,7 +681,7 @@ Project-level checks (no task ID):
   - Harness memory files on disk with no lazy shared-memory record
   - Injected memory context size vs [memory] warn_bytes (compact staleness + remedy)
   - Context budget: what every builder and task agent session starts with —
-    CLAUDE.md files (and Claude Code's per-file size warning), lazy's system
+    CLAUDE.md and AGENTS.md files (and Claude Code's per-file size warning), lazy's system
     prompt, the shared memory index, the MCP tool schemas — with a total per role
   - Stale [protection].protected_tasks entries that gate nothing
   - Default-branch protection resolves to a real branch (not the "main" fallback)
@@ -705,4 +709,3 @@ Task-level checks (with task ID):
 
 Exit code is 0 if all checks pass, 1 if any issues are found.${docsFooter('troubleshooting')}`);
 }
-

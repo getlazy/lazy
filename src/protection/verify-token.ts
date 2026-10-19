@@ -65,7 +65,7 @@ export interface HumanTokenVerifier {
   verify(token: string): Promise<HumanTokenVerification>;
   /**
    * Cheap pre-flight probe, run BEFORE the human is prompted. Never asks for
-   * or inspects a token. See CLAUDE.md: checks that can fail must run before
+   * or inspects a token. See AGENTS.md: checks that can fail must run before
    * we ask a human to type something the check would have rejected anyway.
    */
   probeEnrollment(): Promise<EnrollmentProbe>;

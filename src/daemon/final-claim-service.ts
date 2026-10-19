@@ -3,7 +3,7 @@
  *
  * Lives in the daemon, not at the MCP boundary, for the ordinary reason: the
  * ONE refusal and the shape of what gets written are business rules, and the
- * MCP layer is a client (CLAUDE.md — "The daemon owns business logic").
+ * MCP layer is a client (AGENTS.md — "The daemon owns business logic").
  *
  * What declaring does, and deliberately does not do:
  *   - It records a CLAIM ABOUT A SHA. It is NOT a turn-end signal: the turn
@@ -204,7 +204,7 @@ export async function declareFinal(params: DeclareFinalParams): Promise<DeclareF
  *
  * Read off the supervisor's own status checkpoint rather than passed in: the
  * MCP boundary cannot know which invocation it is serving, and a parameter it
- * had to set would be a rule living in a client (CLAUDE.md — "the daemon owns
+ * had to set would be a rule living in a client (AGENTS.md — "the daemon owns
  * business logic").
  *
  * Best-effort, and DELIBERATELY fails open. An unreadable status must never

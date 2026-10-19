@@ -84,8 +84,9 @@ export async function commandComment(args: string[]): Promise<void> {
     }
 
     // INTAKE BOUNDARY: comments are delivered to the agent as prompt text,
-    // which becomes argv of `claude -p`. Escape control characters here so a
-    // NUL from a file/editor/pipe can never reach the spawn seam.
+    // delivered on the agent's stdin (never argv — src/agent/argv-safety.ts).
+    // Escaping control characters here stays as defence in depth, so a NUL from
+    // a file/editor/pipe never reaches any launch path that still uses argv.
     content = sanitizeUserText(content);
 
     if (editId) {

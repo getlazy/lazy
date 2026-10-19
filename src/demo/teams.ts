@@ -398,7 +398,7 @@ async function registerDemoProject(
     // start is refused ("No service credential for automated turns"). The
     // seeded owner designates their own stand-in credential, as they would on
     // the project's settings page.
-    'project.update!(service_claude_credential: cred)',
+    'project.update!(service_user: user)',
     'puts "registered #{project.name} (#{project.repo_url})"',
   ].join('; ');
 

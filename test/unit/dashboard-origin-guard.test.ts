@@ -19,7 +19,7 @@ import {
  *
  * THE REASON IT EXISTS: `SameSite` is evaluated on the registrable domain, and
  * `localhost` is not in the public suffix list — so `lazy.localhost` is the
- * registrable domain of `web.my-task.lazy.localhost` too, and a page served
+ * registrable domain of `my-task.web.lazy.localhost` too, and a page served
  * from a task's container is SAME-SITE with the dashboard. `SameSite=Strict`
  * alone therefore stopped nothing once task apps got names under that suffix:
  * agent-written app code could auto-submit `POST .../container/start`, or open
@@ -30,7 +30,7 @@ import {
 
 const DASHBOARD_HOST = 'lazy.localhost';
 const DASHBOARD_AUTHORITY = 'lazy.localhost:26024';
-const TASK_APP_ORIGIN = 'http://web.my-task.lazy.localhost:26024';
+const TASK_APP_ORIGIN = 'http://my-task.web.lazy.localhost:26024';
 
 function req(
   path: string,

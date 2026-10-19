@@ -19,7 +19,7 @@ import {
   assertReviewSessionActorCredential,
   type ReviewSessionTurnLauncher,
 } from '../../src/daemon/review-session-builder-turn';
-import { NO_OWNER_CREDENTIAL_MARKER } from '../../src/daemon/turn-credentials';
+import { NO_OWNER_ENDPOINT_CREDENTIAL_MARKER } from '../../src/daemon/member-credentials';
 import { putUserCredential, teamModeEnabled } from '../../src/daemon/user-credentials';
 import { TurnCredentialUnavailableError } from '../../src/daemon/turn-credentials';
 
@@ -174,7 +174,7 @@ describe('review session service', () => {
 
     await expect(
       actions().start(task.id, { actor: { role: 'human', email: 'u-no-cred' } }),
-    ).rejects.toThrow(NO_OWNER_CREDENTIAL_MARKER);
+    ).rejects.toThrow(NO_OWNER_ENDPOINT_CREDENTIAL_MARKER);
 
     expect(launchCalls).toHaveLength(0);
 
@@ -224,7 +224,7 @@ describe('assertReviewSessionActorCredential', () => {
 
     await expect(
       assertReviewSessionActorCredential(root, { role: 'human', email: 'u-nemo' }),
-    ).rejects.toThrow(NO_OWNER_CREDENTIAL_MARKER);
+    ).rejects.toThrow(NO_OWNER_ENDPOINT_CREDENTIAL_MARKER);
   });
 
   test('passes when the acting user has a credential', async () => {

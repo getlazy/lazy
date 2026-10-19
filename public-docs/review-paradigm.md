@@ -199,6 +199,16 @@ concluded" may not read as a pass. `lazy accept <task> --allow-review-issues` is
 your override, deliberately CLI-only: an agent may not overrule a review on your
 behalf.
 
+**A review that inspected nothing is a failed review.** Reviews and asks are
+read-only, and lazy checks that itself: it records the task's working tree
+before the reviewer starts and compares it afterwards, and any change — an
+edited file, a new file, a commit — fails the review, naming the files. Nothing
+is reverted; you decide what to keep. A reviewer that reports it could not read
+the work (its tools or commands failed) is recorded as a failed review, never as
+a pass and never as findings. So is a review that passes the work without
+calling a single tool, including the self-review's bare approval in `low_high`
+mode.
+
 **What no longer gates: findings at medium or below.** A finding is a reviewer's
 opinion about work you are about to read anyway. Holding the merge on every
 style nit cost a full agent turn or a person per finding, and left a cluster's

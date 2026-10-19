@@ -34,6 +34,12 @@ describe('image resolution narrates every long phase', () => {
   // announced — after an upgrade the resumed turns start the build and a
   // member's terminal waits behind it for as long as it takes.
   test('a caller waiting on another build of the same image is told so', async () => {
+    // Resolve against THIS temp project, not whatever checkout the test runs
+    // from: a root Dockerfile.lazy there would otherwise become the image.
+    Bun.spawnSync(['git', 'init', '-q', root]);
+    const cwd = process.cwd();
+    process.chdir(root);
+    try {
     await writeFile(join(root, 'lazy.toml'), '[project]\nname = "t"\n[docker]\ndockerfile = ""\n');
     undoConfig = pinConfig(root);
     const docker = await installFakeDocker(root);
@@ -45,6 +51,9 @@ describe('image resolution narrates every long phase', () => {
     const second = ensureImage(docker.binPath, { notify: (n) => notes.push(n) });
     await Promise.all([first, second]);
     expect(notes.some((n) => /^waiting for .* to finish building$/.test(n))).toBe(true);
+    } finally {
+      process.chdir(cwd);
+    }
   }, 30_000);
 
   // INVARIANT: a base image built first for a Dockerfile FROM it is narrated.

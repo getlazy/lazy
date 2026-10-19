@@ -19,7 +19,7 @@ function latestPromptVersion(root: string, shortId: string): string {
 /**
  * INVARIANT: an acknowledged prompt edit is durable, and the agent is launched
  * with the LATEST accepted prompt — never a pre-edit snapshot. The prompt is
- * human input; CLAUDE.md's "Never Lose Human Feedback" rule covers it, so
+ * human input; AGENTS.md's "Never Lose Human Feedback" rule covers it, so
  * reporting the edit as saved and then handing the agent the old text is a
  * correctness bug, not a cosmetic one.
  *

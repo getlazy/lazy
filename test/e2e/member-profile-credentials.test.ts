@@ -31,11 +31,11 @@ import { readTaskStatus, readTurns, storageDirFor } from '../helpers/storage';
 import { DaemonClient } from '../../src/daemon/client';
 import { getDaemonTcpTarget, readToken } from '../../src/daemon/lifecycle';
 import { SERVICE_CREDENTIAL_USER_ID } from '../../src/daemon/user-credentials';
-import { NO_OWNER_PROFILE_CREDENTIAL_MARKER } from '../../src/daemon/member-credentials';
+import { NO_OWNER_ENDPOINT_CREDENTIAL_MARKER } from '../../src/daemon/member-credentials';
 import { readAuditRecords } from '../../src/proxy/audit-log';
 
 const ALICE_EMAIL = 'alice@example.com';
-const ALICE_CLAUDE = 'sk-ant-oat01-alice-claude-for-profile-proof';
+const ALICE_CLAUDE = 'primary-account-alice-for-profile-proof';
 const ALICE_GW_KEY = 'gw-key-alice-for-profile-proof';
 const SERVICE_CLAUDE = 'sk-ant-oat01-service-for-profile-proof';
 
@@ -89,13 +89,16 @@ describe('per-member credentials per agent profile, through live turns', () => {
     const config =
       `${await readFile(configPath, 'utf-8')}\n` +
       `[proxy]\nupstream = "http://127.0.0.1:${primary.port}"\n\n` +
+      // Both fake hosts use generic endpoint accounts. Anthropic-bound secrets
+      // must retain the real Anthropic origin, even in integration fixtures.
+      `[agents.claude-code]\nharness = "claude-code"\nmodel = "claude-sonnet-4-6"\n` +
+      `endpoint = "http://127.0.0.1:${primary.port}"\ncredential = "primary-account"\n` +
       `[agents.claude-gw]\nharness = "claude-code"\nmodel = "claude-sonnet-4-6"\n` +
       `endpoint = "http://127.0.0.1:${gateway.port}"\ncredential = "gw-claude"\n`;
     await writeFile(configPath, config);
     const controlPlaneDir = join(ctx.root, '..', `${ctx.root.split('/').pop()}-control-plane`);
     await mkdir(controlPlaneDir, { recursive: true });
     const controlPlaneConfig = join(controlPlaneDir, 'lazy.toml');
-    await writeFile(controlPlaneConfig, config);
 
     await ctx.restartDaemon({
       LAZY_TEST_FORCE_MANAGED: '1',
@@ -107,6 +110,11 @@ describe('per-member credentials per agent profile, through live turns', () => {
     if (!resolvedTarget || !resolvedToken) throw new Error('test daemon did not record a TCP target and token');
     target = resolvedTarget;
     sharedToken = resolvedToken;
+    // The owner's save: the applied record is what makes a managed load honour
+    // the control plane's [agents]/[endpoints] instead of withholding them.
+    // A refused apply returns applied:false rather than throwing, so check it.
+    expect(await rpc(sharedToken, 'applyProjectConfig', { toml: config, origin: 'control-plane' }))
+      .toMatchObject({ applied: true, changed: true });
   });
 
   afterEach(async () => {
@@ -116,7 +124,7 @@ describe('per-member credentials per agent profile, through live turns', () => {
   });
 
   test('each turn spends the member\'s own credential for its profile, at that profile\'s endpoint', async () => {
-    await rpc(sharedToken, 'putUserCredential', { userId: ALICE_EMAIL, kind: 'oauth', token: ALICE_CLAUDE });
+    await rpc(sharedToken, 'putEndpointCredential', { userId: ALICE_EMAIL, endpointId: 'profile:claude-code', origin: `http://127.0.0.1:${primary.port}`, kind: 'oauth', token: ALICE_CLAUDE });
     await rpc(sharedToken, 'putUserCredential', { userId: SERVICE_CREDENTIAL_USER_ID, kind: 'oauth', token: SERVICE_CLAUDE });
     const alice = (await rpc(sharedToken, 'mintActorToken', { kind: 'user', email: ALICE_EMAIL })) as { token: string };
 
@@ -127,7 +135,7 @@ describe('per-member credentials per agent profile, through live turns', () => {
     expect(listed.profiles.find((p) => p.name === 'claude-gw')).toMatchObject({
       paidBy: 'profile', endpoint: `http://127.0.0.1:${gateway.port}`,
     });
-    expect(listed.profiles.find((p) => p.name === 'claude-code')).toMatchObject({ paidBy: 'claude' });
+    expect(listed.profiles.find((p) => p.name === 'claude-code')).toMatchObject({ paidBy: 'profile' });
 
     // 1. The default profile: Alice's Claude credential, at the primary upstream.
     const onClaude = await createTask(ctx, 'Default profile turn', 'Exercise the proxy', { token: alice.token });
@@ -148,7 +156,7 @@ describe('per-member credentials per agent profile, through live turns', () => {
     const invocations = (await ctx.claudeInvocations()).length;
     const refused = await withPresentedToken(ctx, alice.token, () => ctx.lazy(['start', onGateway, '--yes']));
     expect(refused.exitCode).toBe(1);
-    expect(`${refused.stdout}\n${refused.stderr}`).toContain(`${NO_OWNER_PROFILE_CREDENTIAL_MARKER} "claude-gw"`);
+    expect(`${refused.stdout}\n${refused.stderr}`).toContain(`${NO_OWNER_ENDPOINT_CREDENTIAL_MARKER} "profile:claude-gw"`);
     expect(readTaskStatus(ctx.root, onGateway)).toBe(before);
     expect(readTurns(ctx.root, onGateway)).toHaveLength(0);
     expect((await ctx.claudeInvocations()).length).toBe(invocations);
@@ -157,9 +165,9 @@ describe('per-member credentials per agent profile, through live turns', () => {
     // 3. Alice connects her own key for the profile; the same start now runs,
     // and the gateway sees THAT key — nothing else of hers, nothing of anyone's.
     // Carrying the endpoint she was SHOWN — her consent to where it goes.
-    await rpc(sharedToken, 'putUserCredential', {
-      userId: ALICE_EMAIL, profile: 'claude-gw', kind: 'api-key', token: ALICE_GW_KEY,
-      endpoint: listed.profiles.find((p) => p.name === 'claude-gw')!.endpoint,
+    await rpc(sharedToken, 'putEndpointCredential', {
+      userId: ALICE_EMAIL, endpointId: 'profile:claude-gw', kind: 'api-key', token: ALICE_GW_KEY,
+      origin: listed.profiles.find((p) => p.name === 'claude-gw')!.endpoint,
     });
     await ctx.setClaudeScenario(credentialSwapScenario({ sessionId: 'profile-gw-1' }));
     expectSuccess(await withPresentedToken(ctx, alice.token, () => ctx.lazy(['start', onGateway, '--yes'])));

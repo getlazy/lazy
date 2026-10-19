@@ -28,6 +28,7 @@ import { formatMarkdown } from '../../utils/markdown';
 import { initTracing, shutdownTracing, withSpan, currentTraceparent } from '../../tracing';
 import { maybeOfferWorktreeImageForTask } from '../../docker/worktree-image';
 import { usagePauseOverrideEligibility } from '../human-terminal';
+import { confirmDefaultRunnerImage } from '../runner-image-confirm';
 import { CLAUDE_DEFAULT_MODEL, CODEX_LATEST_MODEL, CURSOR_DEFAULT_MODEL } from '../../config/default-models';
 
 
@@ -39,7 +40,8 @@ export async function commandStart(args: string[]): Promise<void> {
     { name: 'follow', takesValue: false },
     { name: 'yes', takesValue: false },
     { name: 'force-local', takesValue: false },
-    { name: 'past-usage-pause', takesValue: false },
+    { name: 'override-usage-pause', takesValue: false },
+    { name: 'default-image', takesValue: false },
     { name: 'effort', takesValue: true },
     { name: 'runner', takesValue: true },
     ...REVIEW_FLAGS,
@@ -194,9 +196,12 @@ export async function commandStart(args: string[]): Promise<void> {
 
             retargetOrphan = true;
           } else {
-            console.error(`Cannot start child task: parent task has no worktree.`);
-            console.error(`Start the parent first with: lazy start ${displayId(parentTask)}`);
-            process.exit(1);
+            const parentSession = await storage.getSessionByTaskId(parentTask.id);
+            if (!parentSession) {
+              console.error(`Cannot start child task: parent task has no worktree.`);
+              console.error(`Start the parent first with: lazy start ${displayId(parentTask)}`);
+              process.exit(1);
+            }
           }
         }
       }
@@ -301,6 +306,10 @@ export async function commandStart(args: string[]): Promise<void> {
   // Only a person at their own terminal may TAKE the one-shot usage-pause
   // override — the builder's shell is the CLI's human channel too.
   const overrideEligibility = await usagePauseOverrideEligibility();
+  const useDefaultImage = await confirmDefaultRunnerImage(taskId, {
+    defaultImage: parsed.flags.get('default-image') === true,
+    yes,
+  });
   try {
     const display = createPhaseDisplay();
     let result;
@@ -323,8 +332,9 @@ export async function commandStart(args: string[]): Promise<void> {
         // is pinned over this by the daemon, never taken from here.)
         actor: 'human',
         ...overrideEligibility,
-        ...(parsed.flags.get('past-usage-pause') === true ? { usagePausePastOnce: true as const } : {}),
+        ...(parsed.flags.get('override-usage-pause') === true ? { usagePausePastOnce: true as const } : {}),
         traceparent: currentTraceparent() ?? undefined,
+        ...(useDefaultImage ? { useDefaultImage: true } : {}),
       }, display));
     } finally {
       display.close();
@@ -376,7 +386,7 @@ export async function commandStart(args: string[]): Promise<void> {
 }
 
 export function startUsage(): void {
-  console.log(`Usage: lazy start <task_id> [--model <model>] [--agent <profile>] [--effort <level>] [--review <mode>] [--review-gate <g>] [--review-auto-fix <on|off>] [--runner <docker|container|podman>] [--env KEY=VALUE] [--env-file <path>] [--follow] [--yes] [--force-local] [--past-usage-pause]
+  console.log(`Usage: lazy start <task_id> [--model <model>] [--agent <profile>] [--effort <level>] [--review <mode>] [--review-gate <g>] [--review-auto-fix <on|off>] [--runner <docker|container|podman>] [--env KEY=VALUE] [--env-file <path>] [--follow] [--yes] [--force-local] [--override-usage-pause] [--default-image]
 
 Start an existing task. The daemon handles worktree creation, agent launch,
 and lifecycle management.
@@ -394,8 +404,10 @@ Arguments:
   <task_id>          ID of the task to start (short hex prefix or task code)
 
 Options:
-  --past-usage-pause  Let this task's next turn start even though its credential is past the
+  --override-usage-pause  Let this task's next turn start even though its credential is past the
                        usage-pause threshold (used up by that one turn)
+  --default-image    While the project's runner image is still building (or failed), run on
+                     lazy's default runner image instead of being asked (--yes does too)
   --model <model>    Override model for this session (e.g. opus, sonnet, claude-opus-5-5)
   --agent <profile>  Agent profile to run this task with — an [agents.<name>] block in
                      lazy.toml; harness names (claude-code, codex, cursor, pi) are the

@@ -74,6 +74,20 @@ describe('lazy auth', () => {
     expect(list.stdout).not.toContain('sk-ant-stored-secret-abcd');
   });
 
+  test('concurrent CLI credential writers preserve unrelated accounts', async () => {
+    const names = ['parallel-first', 'parallel-second', 'parallel-third', 'parallel-fourth'];
+    const results = await Promise.all(names.map((name) => ctx.lazy(['auth', 'set', name], {
+      env: emptyCredentialEnv(),
+      input: `stored-secret-${name}\n`,
+    })));
+    for (const result of results) {
+      expect({ exitCode: result.exitCode, stderr: result.stderr }).toEqual({ exitCode: 0, stderr: '' });
+    }
+    const list = await ctx.lazy(['auth', 'list'], { env: emptyCredentialEnv() });
+    expect(list.exitCode).toBe(0);
+    for (const name of names) expect(list.stdout).toContain(name);
+  });
+
   // SECURITY: a secret passed as an argument lands in shell history and is
   // visible in `ps` to every user on the machine. There is no way to make that
   // safe, so the form does not exist — and saying so has to include "rotate it",

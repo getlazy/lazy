@@ -138,6 +138,47 @@ describe('runBuilderWithContinuity', () => {
     expect(result).toEqual({ exitCode: 9, restarts: 0 });
     expect(launches).toHaveLength(1);
   });
+
+  // INVARIANT: a refused launch environment on the FIRST launch ends the
+  // builder with the daemon's own words and exit 1, never an uncaught throw.
+  // The container's output is what the builder page shows; a stack trace there
+  // hid a refusal that already said what to do.
+  test('a refused first launch environment exits 1 with the refusal, launching nothing', async () => {
+    const launches: string[][] = [];
+    await mockModule(SPAWN_PATH, () => ({
+      spawn: (args: string[]) => {
+        launches.push([...args]);
+        return { exited: Promise.resolve(0), kill: () => {} };
+      },
+      spawnSyncUnsupervised: () => ({ exitCode: 0, stdout: Buffer.from(''), stderr: Buffer.from('') }),
+      DEFAULT_SUBPROCESS_TIMEOUT_MS: 60_000,
+    }));
+    const realSupervisor = await import(SUPERVISOR_BUILDER_PATH);
+    await mockModule(SUPERVISOR_BUILDER_PATH, () => ({
+      ...realSupervisor,
+      preflightAgentBinaryWithRetry: async () => {},
+    }));
+    const { runBuilderWithContinuity } = await import(CONTINUITY_PATH);
+
+    const errors: string[] = [];
+    const result = await runBuilderWithContinuity({
+      daemonConfigPath: '/tmp/daemon-mcp.json',
+      projectRoot: '/proj',
+      worktreePath: '/proj',
+      baseEnv: {},
+      log: () => {},
+      errorOut: (m: string) => errors.push(m),
+      readStatus: async () => gen1(),
+      fetchLaunchEnv: async () => { throw new Error('refused: connect your credential'); },
+      pollMs: 50,
+      sleep: async () => {},
+      buildClaudeArgs: () => ['claude'],
+    });
+
+    expect(result).toEqual({ exitCode: 1, restarts: 0 });
+    expect(launches).toHaveLength(0);
+    expect(errors.join('\n')).toContain('refused: connect your credential');
+  });
 });
 
 describe('continuity relaunch takes the model from the daemon', () => {

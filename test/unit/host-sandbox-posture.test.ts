@@ -53,7 +53,7 @@ describe('buildSandboxSettings', () => {
   test('enables the OS sandbox and fails hard if it cannot start', () => {
     const { sandbox } = buildSandboxSettings(SANDBOX, /*interactive*/ false);
     expect(sandbox.enabled).toBe(true);
-    // INVARIANT: no silent fallback to an unsandboxed agent (CLAUDE.md "no silent
+    // INVARIANT: no silent fallback to an unsandboxed agent (AGENTS.md "no silent
     // fallbacks"). If bubblewrap/Seatbelt can't start, Claude must error out.
     expect(sandbox.failIfUnavailable).toBe(true);
     // Auto-approve sandboxed Bash so a headless agent is not stopped by per-command prompts.

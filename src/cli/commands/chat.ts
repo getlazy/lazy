@@ -15,6 +15,8 @@ import { pairSessionModel } from '../../task/launch-identity-view';
 import { readProjectSettings, resolveProjectModel } from '../../daemon/project-settings';
 import { checkLock, acquireLock, removeLock } from '../../utils/lock';
 import { bridgeSessionFiles } from './pair-bridge';
+import { boundCloneLogin, commandTaskTerminalBound } from './bound-session';
+import { findLazyRoot } from '../../project-paths';
 import { captureAgentSessionLog } from '../../import/capture-agent-session-log';
 import type { Storage } from '../../storage';
 import { isTerminalStatus, type Task, type Session } from '../../types';
@@ -59,10 +61,21 @@ const DEFAULT_CHAT_EFFORT: EffortLevel = 'medium';
  * list, so exiting the mode still cannot buy write access.
  */
 export async function commandChat(args: string[]): Promise<void> {
+  // A clone bound to Lazy Teams chats with the task's session ON THE SERVER,
+  // through Teams, exactly as the browser's Chat does: it runs in the member's
+  // own container on their own credential, and nothing launches here.
+  const boundRoot = findLazyRoot();
+  if (boundRoot && await boundCloneLogin(boundRoot)) {
+    await commandTaskTerminalBound('chat', boundRoot, args);
+    return;
+  }
+
   const parsed = parseFlags(args, [
     { name: 'effort', takesValue: true },
+    { name: 'override-usage-pause', takesValue: false },
   ], 'chat');
   const taskId = parsed.positional[0];
+  const overrideUsagePause = parsed.flags.get('override-usage-pause') === true;
 
   if (!taskId) {
     chatUsage();
@@ -93,7 +106,7 @@ export async function commandChat(args: string[]): Promise<void> {
     // taken, if that is what lets it through — only just before Claude Code
     // launches, after chat's own refusals, so a chat refused for its own reasons
     // never spends the override.
-    await admitInteractiveOrExit('chat', task.id, { peek: true });
+    await admitInteractiveOrExit('chat', task.id, { peek: true, overrideUsagePause });
 
     // Mode selection is derived from task state, never guessed: a task that is
     // not finished and still has an open session has a live agent and a live
@@ -102,9 +115,9 @@ export async function commandChat(args: string[]): Promise<void> {
     // retrospective chat against the archived JSONL.
     const sess = await storage.getSessionByTaskId(task.id);
     if (sess && !sess.ended_at && !isTerminalStatus(task.status)) {
-      await chatLive(root, storage, task, sess, effort);
+      await chatLive(root, storage, task, sess, effort, overrideUsagePause);
     } else {
-      await chatTerminal(root, storage, task, effort);
+      await chatTerminal(root, storage, task, effort, overrideUsagePause);
     }
   } finally {
     await storage.close();
@@ -133,6 +146,7 @@ async function chatLive(
   task: Task,
   sess: Session,
   effort: EffortLevel,
+  overrideUsagePause: boolean,
 ): Promise<void> {
   const taskShortId = shortId(task.id);
 
@@ -211,7 +225,7 @@ async function chatLive(
         }
         bridgeFailed = true;
         exitCode = 1;
-      } else if ((usageRefusal = await admitInteractive('chat', task.id)) !== null) {
+      } else if ((usageRefusal = await admitInteractive('chat', task.id, { overrideUsagePause })) !== null) {
         // [usage_pause]: every refusal of chat's own is behind us; this is the
         // admission that may take the override (see commandChat). Refused here
         // inside the lock, so it exits through the cleanup below.
@@ -283,6 +297,7 @@ async function chatTerminal(
   storage: Storage,
   task: Task,
   effort: EffortLevel,
+  overrideUsagePause: boolean,
 ): Promise<void> {
   const taskShortId = shortId(task.id);
 
@@ -298,7 +313,7 @@ async function chatTerminal(
   }
 
   // [usage_pause]: chat's own refusals are behind us — admit (see commandChat).
-  await admitInteractiveOrExit('chat', task.id);
+  await admitInteractiveOrExit('chat', task.id, { overrideUsagePause });
 
   const sessionId = log.sessionId;
 
@@ -420,7 +435,7 @@ async function launchChatClaude(opts: {
 }
 
 export function chatUsage(): void {
-  console.log(`Usage: lazy chat <task>
+  console.log(`Usage: lazy chat <task> [--override-usage-pause]
 
 Interactive, read-only chat with a task's agent — ask it what it did and why.
 
@@ -447,6 +462,7 @@ Arguments:
   <task>    ID or code of the task to chat with
 
 Options:
+  --override-usage-pause Start this chat even when its credential is paused.
   --effort <level>  Claude Code reasoning effort (low, medium, high, xhigh, max).
                     Defaults to "medium" — a reflective chat is lightweight.
                     Dial up for a deep dig, or down to low.

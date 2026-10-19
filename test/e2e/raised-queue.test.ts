@@ -16,16 +16,21 @@ import { randomUUID } from 'crypto';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput, extractTaskId } from '../helpers/assertions';
 import { createTask } from '../helpers/fixtures';
-import { readTaskJson, writeTaskJson, writeRaisedItemsFile } from '../helpers/storage';
+import { readTaskJson, writeTaskJson, writeRaisedItemsFile, setTaskStatus } from '../helpers/storage';
 import { checkDaemonHealth } from '../../src/daemon';
 import { signInToDashboard, type DashboardFetch } from '../helpers/dashboard-session';
 
-/** Seed raised items on a task. `blocking` defaults to false — a follow-up. */
+/**
+ * Seed raised items on a task. `blocking` defaults to false — a follow-up.
+ * The task is marked blocked: the page's default lens shows only items from
+ * blocked tasks, and these suites exercise the page's ordering and filters.
+ */
 function writeRaised(
   root: string,
   shortId: string,
   items: Array<{ id: string; content: string; created_at: number; blocking?: boolean }>,
 ): void {
+  setTaskStatus(root, shortId, 'blocked');
   writeRaisedItemsFile(root, shortId, items.map((i) => ({
     task_id: shortId,
     blocking: false,
@@ -222,6 +227,45 @@ describe('web raised-items inbox', () => {
     // the badges in the Gate column do.
     expect(html).toContain('Blocking');
     expect(html).toContain('FYI');
+  });
+
+  // INVARIANT: the open /raised page defaults to items from BLOCKED tasks; All
+  // and ?status=any show every task, and the JSON API stays unfiltered unless a
+  // lens is named. The page is where a person triages what waits on them.
+  test('the default lens hides items from tasks that are not blocked', async () => {
+    const blockedTask = await createTask(ctx, 'Blocked lens task');
+    const backlogTask = await createTask(ctx, 'Backlog lens task');
+    const now = Date.now();
+    writeRaised(ctx.root, blockedTask, [
+      { id: randomUUID(), content: 'Question on a blocked task', created_at: now },
+    ]);
+    writeRaised(ctx.root, backlogTask, [
+      { id: randomUUID(), content: 'Note on a backlog task', created_at: now },
+    ]);
+    setTaskStatus(ctx.root, backlogTask, 'backlog');
+
+    const standard = await (await fetch(`${base}/raised`)).text();
+    expect(standard).toContain('Question on a blocked task');
+    expect(standard).not.toContain('Note on a backlog task');
+
+    for (const q of ['?all=1', '?status=any']) {
+      const wide = await (await fetch(`${base}/raised${q}`)).text();
+      expect(wide).toContain('Question on a blocked task');
+      expect(wide).toContain('Note on a backlog task');
+    }
+
+    // An unknown value falls back to the default rather than erroring.
+    const bogus = await (await fetch(`${base}/raised?status=bogus`)).text();
+    expect(bogus).not.toContain('Note on a backlog task');
+
+    // The gate filters keep the lens; All restores every task.
+    const gated = await (await fetch(`${base}/raised?gate=blocking`)).text();
+    expect(gated).toContain('href="/raised?gate=non-blocking"');
+    const finished = await (await fetch(`${base}/raised?status=complete-only`)).text();
+    expect(finished).toContain('href="/raised?gate=blocking&amp;status=complete-only"');
+
+    const api = await (await fetch(`${base}/api/raised`)).json() as { items: unknown[] };
+    expect(api.items.length).toBe(2);
   });
 
   // The old URL is in prompts, bookmarks and older task text; it moves rather

@@ -40,7 +40,7 @@ import {
   isMidMerge,
 } from '../git/operations';
 import { getAgent, agentDisplayName } from '../agent/registry';
-import type { Agent } from '../agent/interface';
+import type { Agent, AgentExecArgs } from '../agent/interface';
 import { saveWorktreePatch } from './recovery-patch';
 import { execWithWatchdog } from './watchdog';
 import mergeConflictResolutionTemplate from '../prompts/merge-conflict-resolution.md' with { type: 'text' };
@@ -79,7 +79,7 @@ export function buildMergeAgentArgs(
   useResume: boolean = false,
   effort?: string,
   extraArgs?: string[],
-): string[] {
+): AgentExecArgs {
   return agent.buildExecArgs({
     prompt,
     // The host OS-sandbox `--settings` (with the git-pointer denies the
@@ -171,7 +171,7 @@ interface MergeAgentRun {
  */
 async function runMergeAgent(
   agent: Agent,
-  agentArgs: string[],
+  agentArgs: AgentExecArgs,
   worktreePath: string,
   logPrefix: string,
   guards?: MergeTurnOptions,
@@ -292,7 +292,7 @@ export async function runSyncWithUpstream(
   const resolvedTargetSha = resolvedTargetResult.stdout.trim();
 
   // Check if the target has commits not reachable from HEAD. The shared
-  // hasUpstreamChanges surfaces git errors (per CLAUDE.md "never swallow
+  // hasUpstreamChanges surfaces git errors (per AGENTS.md "never swallow
   // errors") instead of quietly returning false on rev-list failure.
   const hasChanges = await hasUpstreamChanges(resolvedTargetSha, worktreePath);
   if (!hasChanges) {
@@ -348,7 +348,7 @@ export async function runSyncWithUpstream(
     const standalonePrompt = mergeConflictResolutionTemplate.replace(/\{\{parentBranch\}\}/g, parentBranch);
     const resumePrompt = mergeConflictResolutionResumeTemplate.replace(/\{\{parentBranch\}\}/g, parentBranch);
 
-    function buildAgentArgs(shouldResume: boolean): string[] {
+    function buildAgentArgs(shouldResume: boolean): AgentExecArgs {
       const prompt = shouldResume ? resumePrompt : standalonePrompt;
       return buildMergeAgentArgs(agent, prompt, modelId, agentSessionId, shouldResume, opts?.effort, opts?.extraArgs);
     }
@@ -936,7 +936,7 @@ export async function abortMergeIfInProgress(cwd: string): Promise<boolean> {
  *
  * Rung 3 is the only one that discards anything, and it never discards
  * anything unrecoverable: the patch is written BEFORE the reset, is named in
- * the returned detail, and `.lazy/recovery/` is gitignored (CLAUDE.md's
+ * the returned detail, and `.lazy/recovery/` is gitignored (AGENTS.md's
  * recovery-file rule). It is the same trade the pre-turn rollback already
  * makes — a worktree nobody can settle is not a safer outcome than a patch
  * file, it is the outcome that stalls the task and needs a human with a
@@ -954,7 +954,7 @@ export async function abortMergeIfInProgress(cwd: string): Promise<boolean> {
  *
  * NOT `git stash`, at any rung: the stash stack is shared across every task's
  * worktree in this repo, so stashing here can drop foreign changes on another
- * task (CLAUDE.md).
+ * task (AGENTS.md).
  *
  * A ladder that runs out is still NOT swallowed: it comes back as
  * `settled: false` with an actionable message, because a worktree we could not

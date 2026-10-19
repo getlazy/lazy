@@ -63,7 +63,7 @@ describe('bridgeSessionFiles (Docker runner)', () => {
   });
 
   test('reports actionable diagnostics when session id is missing from sandbox', () => {
-    // INVARIANT: Per CLAUDE.md "Errors are actionable" — when bridging fails
+    // INVARIANT: Per AGENTS.md "Errors are actionable" — when bridging fails
     // because the stored session ID doesn't match any JSONL in the sandbox,
     // the result must list the paths checked AND the other sessions that ARE
     // in the sandbox, so the user can see what went wrong.

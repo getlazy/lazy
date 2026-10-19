@@ -45,6 +45,17 @@ describe('build-info-content', () => {
     expect(content).toContain("export const BUILD_BRANCH = 'lazy/release-v021'");
   });
 
+  // INVARIANT: the source fingerprint is embedded only when a build supplies one,
+  // so the resting build-info.ts (which lazy-agent's source hash and the baked
+  // fingerprint both read) is byte-identical to what it was before the field
+  // existed. A compiled lazy answers `system source-id` from it.
+  test('embeds the source fingerprint only when one is supplied', () => {
+    const base = { ...DEV_BUILD_INFO_VALUES };
+    expect(formatBuildInfoContent(base)).not.toContain('BUILD_SOURCE_FINGERPRINT');
+    expect(formatBuildInfoContent({ ...base, buildSourceFingerprint: '0123456789abcdef' }))
+      .toContain("export const BUILD_SOURCE_FINGERPRINT = '0123456789abcdef';");
+  });
+
   test('captureGitBuildMetadata returns a short SHA in this repo', () => {
     const { buildSha, buildDirty } = captureGitBuildMetadata(projectRoot);
     expect(buildSha).toMatch(/^[0-9a-f]+$/);

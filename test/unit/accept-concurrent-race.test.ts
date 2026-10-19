@@ -100,6 +100,8 @@ await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => {
     detectRemote: () => null,
     createDriver: () => ({
       needsSync: true,
+      // Origin has nothing the task lacks (accept step 1e).
+      fetchBranch: async () => false,
       validateAccept: () => null,
       hasRemoteRef: () => true,
       hasExternalApproval: async () => true,

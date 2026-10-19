@@ -13,6 +13,7 @@ import { closeTask } from './task-lifecycle';
 import { beginWorktreeTeardown } from './member-entry';
 import { RpcError } from './rpc-error';
 import { loadConfig } from '../config/loader';
+import { assertNoModelOnTiered, isTieredAgent } from '../agent/tiered-model';
 import { resolveAgentForNewTaskFromConfig } from '../agent/task-agent';
 import { currentPromptOf } from '../task-prompt';
 import { parentTaskIdOf } from '../task-target';
@@ -273,6 +274,14 @@ export async function cloneTask(
     config.agent,
     projectSettings,
   ).agentId;
+  // A tiered clone has no model of its own (src/agent/tiered-model.ts):
+  // an explicit one is refused BEFORE the clone exists, an inherited one dropped.
+  try {
+    assertNoModelOnTiered(config, agentId, params.model);
+  } catch (err) {
+    throw new RpcError(400, err instanceof Error ? err.message : String(err));
+  }
+  const clonedIsTiered = isTieredAgent(config, agentId);
   const cloned = await storage.createTask(
     goal,
     newParentTaskId,
@@ -296,7 +305,7 @@ export async function cloneTask(
   if (!model && !agentSwitched) {
     model = source.model ?? null;
   }
-  if (model) {
+  if (model && !clonedIsTiered) {
     await storage.updateTaskModel(cloned.id, model);
   }
   await storage.updateTaskMetadata(cloned.id, 'cloned_from', source.id);
@@ -375,7 +384,7 @@ async function redoClaimedTask(
   if (await pathExists(worktreePath) && (await hasUncommittedChanges(worktreePath))) {
     throw new RpcError(
       409,
-      `Task ${displayId(oldTask)} has uncommitted changes. Commit or stash them before redoing.`,
+      `Task ${displayId(oldTask)} has uncommitted changes. Commit them first (lazy unblock ${displayId(oldTask)} --message "Please commit your changes", or lazy shell ${displayId(oldTask)}), then redo.`,
     );
   }
 
@@ -424,7 +433,7 @@ async function redoClaimedTask(
   );
 
   await storage.updateTaskPrompt(newTask.id, latestPrompt + redoContext);
-  if (oldTask.model) {
+  if (oldTask.model && !isTieredAgent(config, newTask.agent_id)) {
     await storage.updateTaskModel(newTask.id, oldTask.model);
   }
   if (oldTask.code) {

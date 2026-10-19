@@ -120,7 +120,7 @@ describe('deferred PR creation (accept)', () => {
   // INVARIANT: with a remote driver configured but no reachable `origin`,
   // accept FAILS LOUD on the upstream fetch. It does not fall back to a
   // local-only merge — that would leave the remote parent without the merge
-  // (CLAUDE.md, "Fail hard on remote failures — no silent fallbacks").
+  // (AGENTS.md, "Fail hard on remote failures — no silent fallbacks").
   //
   // This test used to assert `No remote reference found` on stdout and
   // `lazy sync` on stderr. Both are stale, and accept's ordering is the correct

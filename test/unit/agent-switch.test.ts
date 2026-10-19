@@ -216,6 +216,7 @@ describe('switchTaskAgent', () => {
         harness: 'claude-code',
         model: 'claude-opus-5',
         endpoint: 'https://anthropic-gateway.internal',
+        credential: 'anthropic',
       },
     });
     const task = await env.storage.createTask('same harness', undefined, env.baseSha, undefined, undefined, 'claude-code');

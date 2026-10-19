@@ -71,7 +71,7 @@ async function readJson(path: string): Promise<unknown> {
  * names that exact file.
  *
  * Throws — never warns. A builder with no lazy tools is not a degraded builder,
- * it is a builder that cannot do its job, and per CLAUDE.md silence is the bug.
+ * it is a builder that cannot do its job, and per AGENTS.md silence is the bug.
  */
 export async function assertDaemonMcpConfigMounted(
   daemonConfigPath: string,

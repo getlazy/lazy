@@ -2,7 +2,7 @@
  * Which added children wake a blocked cluster task.
  *
  * INVARIANT: the restart is derived from the TREE, not from a comment and not
- * from a signal row. "A lazy comment never starts a turn" (CLAUDE.md) is
+ * from a signal row. "A lazy comment never starts a turn" (AGENTS.md) is
  * untouched by this: nothing here reads comments, and no comment surface emits
  * anything. What starts the turn is a child appearing under a blocked cluster.
  *
@@ -60,6 +60,7 @@ interface StubOptions {
    * itself. See the invariant it exists for below.
    */
   midTurnSyncAt?: number;
+  withheldAt?: number;
   sessionStartedAt?: number;
   /** `lazy stop` was used on this cluster. */
   userStopped?: boolean;
@@ -117,6 +118,7 @@ function stubStorage(opts: StubOptions): Storage {
         // The agent's answer is recorded when the turn ENDS. It must not
         // become the floor, or a child added mid-turn is silently swallowed.
         { role: 'agent', timestamp: opts.lastPromptAt + 10_000 },
+        ...(opts.withheldAt === undefined ? [] : [{ role: 'human', timestamp: opts.withheldAt, feedback_withheld: true }]),
         ...(opts.midTurnSyncAt === undefined
           ? []
           : [{
@@ -192,6 +194,18 @@ describe('freshClusterChildren', () => {
 
   // The same predicate covers every other turn written mid-flight — a review on
   // the driver, an ask, a supervisor nudge — none of which had been hit yet.
+  // INVARIANT: a refused unblock's saved words launched no turn, so they never raise the
+  // floor — a child added while launches were refused would otherwise be passed over.
+  test('a withheld-feedback turn does not raise the floor past a child', async () => {
+    const storage = stubStorage({
+      children: [task('arrived-before-the-refusal', 1_500)],
+      lastPromptAt: 1_000,
+      withheldAt: 3_000,
+    });
+    const fresh = await freshClusterChildren(storage, cluster);
+    expect(fresh.map(t => t.id)).toEqual(['arrived-before-the-refusal']);
+  });
+
   test('a child the cluster\'s own agent created never wakes it', async () => {
     const storage = stubStorage({
       children: [task('self-made', 5_000), task('handed-in', 5_000)],

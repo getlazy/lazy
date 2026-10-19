@@ -14,7 +14,7 @@
  * repository.
  *
  * INVARIANT: the diff base and the branch point resolve through the SAME
- * function (src/remote/upstream-ref.ts, per CLAUDE.md). A test here that goes
+ * function (src/remote/upstream-ref.ts, per AGENTS.md). A test here that goes
  * red means a diff surface has grown a second opinion again.
  */
 

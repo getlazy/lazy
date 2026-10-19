@@ -8,6 +8,7 @@ import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 
 import { theme } from '../../render/theme';
 import { usagePauseOverrideEligibility } from '../human-terminal';
+import { confirmDefaultRunnerImage } from '../runner-image-confirm';
 
 // Re-export for other modules that import from resume.ts
 export { buildSystemPromptForResume, buildResumePrompt } from '../../daemon/task-lifecycle';
@@ -18,8 +19,9 @@ export async function commandResume(args: string[]): Promise<void> {
     { name: 'follow', takesValue: false },
     { name: 'model', takesValue: true },
     { name: 'effort', takesValue: true },
-    { name: 'past-usage-pause', takesValue: false },
-
+    { name: 'override-usage-pause', takesValue: false },
+    { name: 'default-image', takesValue: false },
+    { name: 'yes', takesValue: false },
   ], 'resume');
 
   const taskId = parsed.positional[0];
@@ -54,6 +56,10 @@ export async function commandResume(args: string[]): Promise<void> {
   // Resuming launches a supervisor, which may resolve and build a container
   // image first — narrate those phases instead of sitting silent for minutes.
   const { createPhaseDisplay } = await import('../phase-display');
+  const useDefaultImage = await confirmDefaultRunnerImage(taskId, {
+    defaultImage: parsed.flags.get('default-image') === true,
+    yes: parsed.flags.get('yes') === true,
+  });
   const display = createPhaseDisplay();
   try {
     const result = await queryResumeTask({
@@ -61,7 +67,8 @@ export async function commandResume(args: string[]): Promise<void> {
       modelOverride,
       effortOverride,
       ...(await usagePauseOverrideEligibility()),
-      ...(parsed.flags.get('past-usage-pause') === true ? { usagePausePastOnce: true as const } : {}),
+      ...(parsed.flags.get('override-usage-pause') === true ? { usagePausePastOnce: true as const } : {}),
+      ...(useDefaultImage ? { useDefaultImage: true } : {}),
     }, display);
     display.close();
 
@@ -105,7 +112,7 @@ export async function commandResume(args: string[]): Promise<void> {
 }
 
 export function resumeUsage(): void {
-  console.log(`Usage: lazy resume <task_id> [--model <model>] [--effort <level>] [--past-usage-pause] [--follow]
+  console.log(`Usage: lazy resume <task_id> [--model <model>] [--effort <level>] [--override-usage-pause] [--default-image] [--yes] [--follow]
 
 Resume a task with NO new feedback — writes a command for the supervisor and
 launches a container if needed. To send guidance instead, use
@@ -128,8 +135,10 @@ Options:
   --model <model>    Override model for this session (e.g. opus, sonnet, claude-opus-5-5)
   --effort <level>   Override Claude Code reasoning effort (low, medium, high, xhigh, max)
   --follow           Wait for the agent to finish, streaming output in real time
-  --past-usage-pause  Let this task's next turn start even though its credential is past the
+  --override-usage-pause  Let this task's next turn start even though its credential is past the
                        usage-pause threshold (used up by that one turn)
+  --default-image    While the project's runner image is still building (or failed), run on
+                     lazy's default runner image instead of being asked (--yes does too)
 
 Examples:
   lazy resume abc12345

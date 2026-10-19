@@ -84,7 +84,7 @@ describe('review comments storage', () => {
     expect(all.map((c) => c.content)).toEqual(['one', 'two', 'three']);
   });
 
-  // INVARIANT (CLAUDE.md, "never lose human feedback"): a comment whose ask
+  // INVARIANT (AGENTS.md, "never lose human feedback"): a comment whose ask
   // never reached the agent must still exist and be visible. Failure is
   // recorded ON the comment — the comment is never deleted or rolled back.
   test('a failed ask marks the comment without destroying it', async () => {

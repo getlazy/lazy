@@ -108,6 +108,17 @@ const CLEAN_SWEEP_OPENERS = [
  */
 const CLEAN_SWEEP_EXACT = ['none', 'nothing', 'no issues', 'n/a', 'na'];
 
+/**
+ * "No <qualifiers> issue(s)/vulnerabilit(y|ies)/problem(s) found" — e.g. "No
+ * exploitable issue found. …". Up to three qualifier words, and the verb
+ * `found`/`identified`/`detected` is REQUIRED, so "no exploitable path is
+ * guarded, the write can corrupt" is not read as clean. The cap and the
+ * required verb are deliberate: phrasings outside them read as claims, the
+ * safe direction for this predicate to fail in.
+ */
+const CLEAN_SWEEP_NO_X_FOUND =
+  /^no (?:[a-z-]+ ){0,3}(?:issues?|vulnerabilit(?:y|ies)|problems?|findings?|concerns?) (?:was |were |is )?(?:found|identified|detected)(?=$|[\s.,;:!?—–-])/;
+
 /** Trim, lowercase, collapse whitespace, drop trailing punctuation. */
 function normalizeSweep(statement: string): string {
   return statement
@@ -165,6 +176,7 @@ export function reviewSweepClaimsIssue(statement: string | undefined | null): bo
   if (!normalized) return false;
   if (normalized === REVIEW_VERDICT_UNPARSED) return false;
   if (CLEAN_SWEEP_EXACT.includes(normalized)) return false;
+  if (CLEAN_SWEEP_NO_X_FOUND.test(normalized)) return false;
   return !CLEAN_SWEEP_OPENERS.some((opener) => opensWith(normalized, opener));
 }
 
@@ -326,7 +338,7 @@ export const REVIEW_CRASH_VERDICT_PREFIX = 'FAILED:';
  *
  * A third failure shape, and it needs its own word for two reasons. Saying "the
  * reviewer did not finish" about one that never began is a guessed cause in a
- * message whose only job is the cause (CLAUDE.md). And the catchup RETRIES a
+ * message whose only job is the cause (AGENTS.md). And the catchup RETRIES a
  * dispatch every tick, so this record must be distinguishable from a real
  * review turn — {@link reviewWasNeverDispatched} is what lets the retry go on
  * while the failure is already on the record and already gating.
@@ -396,7 +408,7 @@ export function reviewNotRunHeadline(report: ReviewReport | undefined | null): s
  * A driver reads this sentence and picks between those under step 5 of its
  * contract, so telling it the wrong one costs a wrong decision — and asserting
  * a parse failure survived "the one re-ask" when no re-ask ever ran is a
- * guessed cause inside a message whose only job is the cause (CLAUDE.md,
+ * guessed cause inside a message whose only job is the cause (AGENTS.md,
  * "never present a guessed cause as the explanation").
  *
  * Derived from the stored verdict rather than from a flag, because the record

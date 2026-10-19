@@ -16,6 +16,7 @@
  * another turn to address the signal.
  */
 
+import { shouldLogImageHold, runnerImageHold } from './runner-image-choice';
 import { join } from 'path';
 import type { Storage } from '../storage/interface';
 import type { Task } from '../types';
@@ -212,6 +213,11 @@ async function checkPRComments(
   const usageHold = await usagePauseHold(projectRoot, storage, task, 'auto-react (PR comment)');
   if (usageHold) {
     logger.info(`Auto-react: PR comment for task ${taskShortId} held by usage pause — ${usageHold}`);
+    return 'no_action';
+  }
+  const imageHold = await runnerImageHold(task);
+  if (imageHold) {
+    if (shouldLogImageHold('auto-react', task, imageHold)) logger.info(`Auto-react: PR comment for task ${taskShortId} held until the project's runner image is ready — ${imageHold}`);
     return 'no_action';
   }
 

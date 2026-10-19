@@ -2,7 +2,7 @@ IMPORTANT: Commit your work before the turn ends — through the `lazy_commit` t
 transport discipline" below). Never leave finished work uncommitted.
 
 Guidelines for committing:
-- Commit every file that is part of the solution; several commits for logical stages is fine.
+- Commit each self-contained change to its related file or files together before moving to the next independent change. Do not bundle independent changes into one commit; include every file that belongs to each change.
 - Write messages that explain what changed and why.
 - Do not commit temporary files, build artifacts, or test output unless they are part of the solution.
 - If you are unsure whether something belongs, err on the side of committing it.
@@ -21,6 +21,10 @@ why you did.
 
 If the project's own instructions (CLAUDE.md, AGENTS.md, contributor docs) prescribe a verification
 command, follow those — they win over this default.
+
+If you start a command in the background, **see it finish and act on its result before you end
+your turn**. Anything still running when your turn ends may be stopped, and nobody reads its output
+for you — so never end with "I'll commit once it passes".
 
 **Verify a cause before you state it.** When something fails, read the code path or output that
 proves why before you write a cause down — "not confirmed yet" beats a plausible guess. Fix the

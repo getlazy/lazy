@@ -12,6 +12,7 @@ import { describe, test, expect } from 'bun:test';
 import {
   buildTaskStats,
   buildTokenStats,
+  buildTokenStatsAcross,
   buildToolStats,
   statusIntervals,
   bucketIntervals,
@@ -213,6 +214,22 @@ describe('token aggregation', () => {
     expect(stats.totals.cacheCreationTokens).toBe(4);
     expect(stats.totals.total).toBe(376);
     expect(stats.series.map((p) => p.cumulative)).toEqual([128, 376]);
+  });
+
+  // INVARIANT: a series point names its review chunk with the 1-based number the
+  // Turns tab displays, so the growth chart can mark chunk starts that match.
+  test('each point carries its 1-based chunk number', () => {
+    const stats = buildTokenStats(
+      [
+        turn({ sequence: 1, role: 'human' }),
+        turn({ sequence: 2, usage: usage(1, 1) }),
+        turn({ sequence: 3, role: 'human' }),
+        turn({ sequence: 4, usage: usage(1, 1) }),
+      ],
+      null,
+      DEFAULT_TURN_CHART_LIMIT,
+    );
+    expect(stats.series.map((p) => p.chunk)).toEqual([1, 2]);
   });
 
   // INVARIANT: a turn that reported no usage stays null. Coercing it to zero
@@ -536,6 +553,74 @@ describe('the rendered tab', () => {
     }
     expect(html).toContain('3,000'); // input total, spelled out
     expect(html).toContain('Per-turn numbers (2)'); // the table view
+  });
+
+  // INVARIANT: the cumulative chart's X axis is time — ISO 8601 first/last
+  // labels — and chunk starts are marked with their number and linked to the
+  // Turns tab. Without them a plateau cannot be told from a day-long wait.
+  test('the cumulative chart labels its time axis and chunk starts', () => {
+    const html = statsTabHtml(
+      buildTaskStats({
+        task: task(),
+        session: null,
+        turns: [
+          turn({ sequence: 1, role: 'human', timestamp: T0 }),
+          turn({ sequence: 2, usage: usage(10, 1), timestamp: T0 + HOUR }),
+          turn({ sequence: 3, role: 'human', timestamp: T0 + 2 * HOUR }),
+          turn({ sequence: 4, usage: usage(10, 1), timestamp: T0 + 5 * HOUR }),
+        ],
+        commits: [],
+        statusHistory: [change('working', 0)],
+        now: T0 + 6 * HOUR,
+      }),
+      { scope: 'task', descendantCount: 0, taskHref: '/t', subtreeHref: '/t?s', turnsHref: '/tasks/demo/turns' },
+    );
+    expect(html).toContain('>2026-09-01T01:00Z</text>');
+    expect(html).toContain('>2026-09-01T05:00Z</text>');
+    expect(html).toContain('lz-viz-chunk-label');
+    // The chunk opened by the human turn (sequence 3) is linked from OUTSIDE the
+    // role="img" svg, to the turn that opened it, not to its first agent turn.
+    expect(html).toContain('<a href="/tasks/demo/turns/3">#2</a>');
+    expect(html).toContain('>#2</text>');
+    expect(html.slice(html.indexOf('<svg class="lz-viz-svg"'), html.indexOf('</svg>', html.indexOf('lz-viz-line')))).not.toContain('<a ');
+  });
+
+  // INVARIANT: chunks are placed at their real opening, the chunk already running
+  // at the left edge is pinned to it, labels never overlap and a subtree view
+  // (no chunk numbers) draws no marks. A mid-chunk point must never read as a
+  // chunk start just because the series was trimmed.
+  test('chunk marks sit at real chunk starts, never overlap, and vanish in a subtree', () => {
+    const turns = [
+      turn({ sequence: 1, role: 'human', timestamp: T0 }),
+      turn({ sequence: 2, role: 'human', timestamp: T0 + 1000 }),
+      turn({ sequence: 3, usage: usage(10, 1), timestamp: T0 + HOUR }),
+      turn({ sequence: 4, usage: usage(10, 1), timestamp: T0 + 2 * HOUR }),
+    ];
+    const stats = buildTokenStats(turns, null, DEFAULT_TURN_CHART_LIMIT);
+    // Chunk 2 opens before any agent turn; both starts precede the first point.
+    expect(stats.chunks.map((c) => c.number)).toEqual([1, 2]);
+    const view = { scope: 'task' as const, descendantCount: 0, taskHref: '/t', subtreeHref: '/t?s', turnsHref: '/x/turns' };
+    const html = statsTabHtml(
+      buildTaskStats({ task: task(), session: null, turns, commits: [], statusHistory: [change('working', 0)], now: T0 + 3 * HOUR }),
+      view,
+    );
+    // Only the chunk running at the left edge draws; its label is the only one.
+    expect(html.match(/lz-viz-chunk-rule/g)?.length).toBe(1);
+    expect(html.match(/<text class="lz-viz-chunk-label"/g)?.length).toBe(1);
+    expect(html).toContain('>#2</text>');
+    expect(html).toContain('<th>Chunk</th>');
+  });
+
+  test('no chunk numbers in a subtree series, and no chunk marks without timestamps', () => {
+    const sub = buildTokenStatsAcross(
+      [
+        { label: 'a', turns: [turn({ sequence: 1, usage: usage(1, 1), timestamp: T0 })], session: null },
+        { label: 'b', turns: [turn({ sequence: 1, usage: usage(1, 1), timestamp: T0 + HOUR })], session: null },
+      ],
+      DEFAULT_TURN_CHART_LIMIT,
+    );
+    expect(sub.chunks).toEqual([]);
+    expect(sub.series.map((p) => p.chunk)).toEqual([null, null]);
   });
 
   // INVARIANT: a task with no durable tool record says the numbers were never

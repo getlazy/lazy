@@ -193,7 +193,7 @@ describe('resolveTurnLaunchIdentity — model', () => {
   test("a pinned-endpoint profile runs the task's persisted model, not its own", async () => {
     const config = {
       ...configWith('fable'),
-      agents: { 'local-pi': { harness: 'pi', model: 'qwen3.8:latest', endpoint: 'http://localhost:11434' } },
+      agents: { 'local-pi': { harness: 'pi', model: 'qwen3.8:latest', endpoint: 'http://localhost:11434', credential: 'none' } },
     } as unknown as ResolvedConfig;
 
     const fresh = await env.makeTask('local-pi');

@@ -233,13 +233,15 @@ export function createRpcReviewActions(client: DaemonClient, projectRoot: string
     async promoteRaisedItem(
       taskId: string,
       itemId: string,
-      options: { goal?: string; code?: string; relation?: 'peer' | 'subtask'; actor?: ActorInput },
+      options: { goal?: string; prompt?: string; code?: string; parent?: string; relation?: 'peer' | 'subtask'; actor?: ActorInput },
     ): Promise<PromoteRaisedItemResult> {
       return (await call('reviewPromoteRaised', {
         taskId,
         itemId,
         ...(options.goal != null ? { goal: options.goal } : {}),
+        ...(options.prompt != null ? { prompt: options.prompt } : {}),
         ...(options.code != null ? { code: options.code } : {}),
+        ...(options.parent != null ? { parent: options.parent } : {}),
         relation: options.relation ?? 'peer',
         ...(options.actor !== undefined ? { actor: options.actor } : {}),
       })) as PromoteRaisedItemResult;

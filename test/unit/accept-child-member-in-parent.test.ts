@@ -53,7 +53,7 @@ async function aliceInsideParent(): Promise<void> {
     },
     taskId: PARENT,
     email: ALICE,
-    deps: { bindingFor: async () => null, stopTaskContainer: async () => {} },
+    deps: { bindingFor: async () => null },
   });
   expect(entered.ok).toBe(true);
 }
@@ -98,7 +98,7 @@ describe("accepting a child while a member works in its parent", () => {
                 updateTaskMetadata: async () => {},
               },
               taskId: PARENT, email: ALICE,
-              deps: { bindingFor: async () => null, stopTaskContainer: async () => {} },
+              deps: { bindingFor: async () => null },
             });
             releaseMemberTerminal(PARENT, ALICE);
             throw new Error('stop the accept here');

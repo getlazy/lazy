@@ -36,7 +36,7 @@
 
 import { lstat, readFile, readdir, realpath, rename, rm, unlink, writeFile } from 'fs/promises';
 import { basename, dirname, isAbsolute, join, sep } from 'path';
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import { writeRegularFileUnder } from '../daemon/link-safe-files';
 import { LAZY_DIR, LEGACY_DIR, getDataDir } from '../project-paths';
 import type { GitMountPaths } from '../capture/git-mounts';
@@ -272,8 +272,10 @@ export async function writeGitPointerCopies(
 ): Promise<Array<{ source: string; target: string }>> {
   const copies: Array<{ source: string; target: string }> = [];
   for (const f of layout.pointerFiles) {
-    await writeRegularFileUnder(root, join(relDir, f.name), f.content, 0o444);
-    copies.push({ source: join(root, relDir, f.name), target: f.target });
+    const digest = createHash('sha256').update(f.content).digest('hex');
+    const copyPath = join(relDir, `${f.name}-${digest}`);
+    await writeRegularFileUnder(root, copyPath, f.content, 0o444, true);
+    copies.push({ source: join(root, copyPath), target: f.target });
   }
   return copies;
 }

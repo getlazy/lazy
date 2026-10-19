@@ -139,7 +139,7 @@ describe('lazy sync <task> — live remote upstream', () => {
   }, 30_000);
 
   // INVARIANT: a fetch failure surfaces — sync must NOT silently fall back to a
-  // stale/local-ref merge and report success/"up to date". Per CLAUDE.md "fail
+  // stale/local-ref merge and report success/"up to date". Per AGENTS.md "fail
   // hard on remote failures — no silent fallbacks", syncTask marks the task for
   // retry (pending_sync) and exits non-zero when the upstream fetch fails.
   test('sync fails hard when the upstream fetch fails (no silent stale-ref merge)', async () => {

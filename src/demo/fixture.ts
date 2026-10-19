@@ -60,7 +60,7 @@ const HISTORY: FixtureCommit[] = [
         // lives: the daemon reads the PROJECT ROOT's lazy.toml, and under a fleet
         // backend the root is a clone made inside the machine — nothing the demo
         // writes after the fact can reach it. A bare port is addressed by its
-        // number, so the shop is `8080.<task>.lazy.localhost`. `lazy init` keeps
+        // number, so the shop is `<task>.8080.lazy.localhost`. `lazy init` keeps
         // a committed lazy.toml and only points its storage at the store.
         path: 'lazy.toml',
         content: [

@@ -18,6 +18,7 @@ import {
   protectionHeadline,
   protectionToJson,
   protectionStatusForTask,
+  branchProtectionFor,
   type ProtectionContext,
   type TaskProtectionStatus,
 } from '../../src/protection/status';
@@ -44,6 +45,7 @@ function ctx(over: Partial<ProtectionContext> = {}): ProtectionContext {
     gateDefaultBranch: false,
     defaultBranch: null,
     remoteDefaultBranch: null,
+    defaultBranchResolved: true,
     protectedTaskIds: new Map(),
     ...over,
   };
@@ -255,5 +257,76 @@ describe('protectionStatusForTask target resolution', () => {
     const s = await protectionStatusForTask(storage, c, untargeted('main'));
     expect(s.targetBranch).toBe('main');
     expect(s.branchGate?.branch).toBe('main');
+  });
+});
+
+describe('branchProtectionFor', () => {
+  // INVARIANT: a branch is protected for a push exactly when accept would gate a
+  // merge into it. Lazy Teams lets a member push a non-task branch only when this
+  // says it is not protected, so a looser answer here is a write the project's
+  // owner did not allow.
+  test('nothing is protected while [protection] is disabled, listed or not', () => {
+    const answer = branchProtectionFor(ctx({ protectedBranches: ['main'] }), 'main');
+    expect(answer).toEqual({ branch: 'main', protected: false, source: null, reason: null });
+  });
+
+  test('a listed branch is protected and says why', () => {
+    const answer = branchProtectionFor(ctx({ enabled: true, protectedBranches: ['release'] }), 'release');
+    expect(answer.protected).toBe(true);
+    expect(answer.source).toBe('listed');
+    expect(answer.reason).toBe('`release` is listed in [protection].protected_branches');
+  });
+
+  test('the default branch is protected only under gate_default_branch', () => {
+    const gated = ctx({ enabled: true, gateDefaultBranch: true, defaultBranch: 'main' });
+    expect(branchProtectionFor(gated, 'main').source).toBe('default-branch');
+    expect(branchProtectionFor(gated, 'main').reason).toContain('repo default branch');
+    expect(branchProtectionFor(ctx({ enabled: true, defaultBranch: 'main' }), 'main').protected).toBe(false);
+  });
+
+  // main is not special: an unlisted branch named main is unprotected when the
+  // default branch is something else.
+  test('main is not special', () => {
+    const c = ctx({ enabled: true, gateDefaultBranch: true, defaultBranch: 'trunk' });
+    expect(branchProtectionFor(c, 'main').protected).toBe(false);
+    expect(branchProtectionFor(c, 'trunk').protected).toBe(true);
+  });
+
+  // INVARIANT: hosted git asks with foldCase, because on a case-insensitive
+  // filesystem a pushed `Release` is the ref file of a protected `release` —
+  // whether or not that branch exists yet (this rule reads only config).
+  // Accept and the status line never fold.
+  test('foldCase matches a listed branch or the gated default branch in any letter case', () => {
+    const c = ctx({ enabled: true, protectedBranches: ['release'], gateDefaultBranch: true, defaultBranch: 'main' });
+    const listed = branchProtectionFor(c, 'Release', { foldCase: true });
+    expect(listed.protected).toBe(true);
+    expect(listed.source).toBe('listed');
+    expect(listed.reason).toBe(
+      '`Release` differs only in letter case from `release`, and `release` is listed in [protection].protected_branches',
+    );
+    expect(branchProtectionFor(c, 'MAIN', { foldCase: true }).source).toBe('default-branch');
+    expect(branchProtectionFor(c, 'Release').protected).toBe(false);
+    expect(branchProtectionFor(c, 'MAIN').protected).toBe(false);
+  });
+
+  // INVARIANT: an unresolvable default branch is UNKNOWN, never "not protected"
+  // — hosted git fails closed on unknown for non-task branches.
+  test('the gated default branch being unresolved answers null for what it cannot classify', () => {
+    const c = ctx({
+      enabled: true, protectedBranches: ['release'], gateDefaultBranch: true,
+      defaultBranch: 'main', defaultBranchResolved: false,
+    });
+    const unknown = branchProtectionFor(c, 'feature');
+    expect(unknown.protected).toBeNull();
+    expect(unknown.reason).toContain('could not be resolved');
+    expect(branchProtectionFor(c, 'release').protected).toBe(true);
+    // Without the default-branch gate nothing depends on the default branch.
+    expect(branchProtectionFor(ctx({ enabled: true, defaultBranchResolved: false }), 'feature').protected).toBe(false);
+  });
+
+  test('matching is exact — no prefix or case folding', () => {
+    const c = ctx({ enabled: true, protectedBranches: ['release'] });
+    expect(branchProtectionFor(c, 'release/1').protected).toBe(false);
+    expect(branchProtectionFor(c, 'Release').protected).toBe(false);
   });
 });

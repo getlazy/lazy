@@ -23,7 +23,7 @@
  * task's API token must do neither. Values also never enter task state, turns,
  * prompts, comments or the journal: those are durable and human-visible, and a
  * token leaked into a turn is unrecoverable. Same carve-out reasoning as the
- * proxy audit log in CLAUDE.md, with the two conditions that carve-out demands:
+ * proxy audit log in AGENTS.md, with the two conditions that carve-out demands:
  * bounded by construction (MAX_VARS_PER_TASK / MAX_TOTAL_BYTES) and disposable
  * (losing the file costs the user one `lazy env set`).
  *
@@ -46,8 +46,9 @@ import { createHash } from 'crypto';
 import { mkdir, readFile, rm, writeFile } from 'fs/promises';
 import { dirname, join } from 'path';
 import { getDaemonDir, getTaskEnvPath } from './paths';
-import { setRegisteredSecretValues, TASK_ENV_KEYS_VAR } from '../utils/redact';
+import { registeredSecretSources, setRegisteredSecretValues, TASK_ENV_KEYS_VAR } from '../utils/redact';
 import { logger } from '../utils/logger';
+import { writePrivateFileAtomic } from '../utils/fs';
 
 /**
  * Keep the free-text scrubber's view of per-task values equal to the file.
@@ -58,10 +59,18 @@ import { logger } from '../utils/logger';
  * task ends. The registry is bounded by the caps below, so the scrub set is too.
  */
 function registerForRedaction(registry: TaskEnvFile): void {
-  setRegisteredSecretValues(
-    'task-env',
-    Object.values(registry.tasks).flatMap(vars => Object.values(vars)),
-  );
+  // One source PER TASK: the redactor's cap is per source, and the per-task
+  // caps above are what bound each one. Sources for tasks no longer in the
+  // file are dropped, so an unset or cleared value stops being scrubbed.
+  const current = new Set<string>();
+  for (const [taskId, vars] of Object.entries(registry.tasks)) {
+    const source = `task-env:${taskId}`;
+    current.add(source);
+    setRegisteredSecretValues(source, Object.values(vars));
+  }
+  for (const source of registeredSecretSources()) {
+    if (source.startsWith('task-env:') && !current.has(source)) setRegisteredSecretValues(source, []);
+  }
 }
 
 /** On-disk shape. Keyed by full task UUID, mirroring the token registry. */
@@ -235,7 +244,9 @@ async function persist(projectRoot: string, registry: TaskEnvFile): Promise<void
   const path = getTaskEnvPath(projectRoot);
   await mkdir(dirname(path), { recursive: true });
   // 0600: these are user secrets. Same posture as the token files next to it.
-  await writeFile(path, JSON.stringify(registry, null, 2), { mode: 0o600 });
+  // Atomic: a torn registry fails every launch of the project and, after a
+  // daemon restart, leaves running containers' values unscrubbed.
+  await writePrivateFileAtomic(path, JSON.stringify(registry, null, 2));
   registerForRedaction(registry);
 }
 
@@ -261,7 +272,7 @@ async function mutate<T>(
 }
 
 /** Enforce the caps against the post-write state. Throws on violation. */
-function assertWithinCaps(vars: Record<string, string>, taskId: string): void {
+export function assertWithinCaps(vars: Record<string, string>, taskId: string): void {
   const keys = Object.keys(vars);
   if (keys.length > MAX_VARS_PER_TASK) {
     throw new Error(

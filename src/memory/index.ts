@@ -424,7 +424,7 @@ export function renderMemoryUnavailableSection(error: string): string {
  *     error, so the model cannot mistake "could not read memory" for "this
  *     project has no memory", and is told to retry via lazy_memory_recall /
  *     lazy_search on demand;
- *   - the underlying error is logged loudly (never swallowed — see CLAUDE.md).
+ *   - the underlying error is logged loudly (never swallowed — see AGENTS.md).
  *
  * The DERIVED compact is read separately and is allowed to fail on its own: it
  * is an optimization, so an unreadable compact degrades to the full index (with

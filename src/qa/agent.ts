@@ -71,9 +71,17 @@ function parseArgs(argv: string[]): { prompt: string; worktreePath: string } {
   let worktreePath = '';
 
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === '-p' && i + 1 < argv.length) {
-      prompt = argv[i + 1];
-      i++;
+    if (argv[i] === '-p') {
+      // `-p <prompt>` for a hand-run; `-p` alone reads the prompt from stdin,
+      // which is how lazy launches it (prompts never ride argv — see the argv
+      // rule in src/agent/argv-safety.ts).
+      const next = argv[i + 1];
+      if (next !== undefined && !next.startsWith('--')) {
+        prompt = next;
+        i++;
+      } else {
+        prompt = readFileSync(0, 'utf-8');
+      }
     } else if (argv[i] === '--worktree' && i + 1 < argv.length) {
       worktreePath = argv[i + 1];
       i++;

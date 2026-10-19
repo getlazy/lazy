@@ -1,22 +1,22 @@
 /**
  * LAZY.md — per-project instructions written for agents running lazy tasks.
  *
- * Claude Code reads CLAUDE.md by itself, and codex/cursor read their own
+ * Claude Code reads AGENTS.md by itself, and codex/cursor read their own
  * equivalents, so lazy never injected project instructions. That leaves nowhere
  * to write the things that are true ONLY when an agent is running under lazy —
  * "run the suite this way inside the lazy container", "this project's services
- * come up with X in a task worktree" — because a human editing CLAUDE.md is
+ * come up with X in a task worktree" — because a human editing AGENTS.md is
  * writing for every session, including their own interactive ones. LAZY.md is
  * that place, and lazy injects it because no harness knows the file exists.
  *
- * DISCOVERY follows Claude Code's CLAUDE.md rules as far as they can apply
+ * DISCOVERY follows Claude Code's AGENTS.md rules as far as they can apply
  * (verified against the Claude Code memory docs, 2026-09-10):
  *
- *   - Claude Code loads CLAUDE.md from the working directory and EVERY
+ *   - Claude Code loads AGENTS.md from the working directory and EVERY
  *     directory above it, concatenated filesystem-root-first so the file
  *     closest to the working directory is read last. {@link collectLazyMdFiles}
  *     walks the same chain, from `startDir` up to `root`.
- *   - Claude Code discovers CLAUDE.md files in SUBDIRECTORIES too, but loads
+ *   - Claude Code discovers AGENTS.md files in SUBDIRECTORIES too, but loads
  *     them ON DEMAND — when the agent reads a file in that directory. Lazy has
  *     no hook into an agent's file reads, so on-demand is not available to it:
  *     a nested LAZY.md is either loaded up front or never. It is loaded up
@@ -33,13 +33,13 @@
  * the directory it starts in, this needs no change.
  *
  * LAZY.md is GUIDANCE, never authority. It is read from the task's WORKTREE —
- * the same copy the agent's own CLAUDE.md comes from, so an agent's instructions
+ * the same copy the agent's own AGENTS.md comes from, so an agent's instructions
  * match the tree it is working in. That is deliberately unlike `lazy.toml`,
  * which is root-anchored precisely because it decides the rules a turn runs
- * under (CLAUDE.md, "A task worktree's lazy.toml has no authority"). Nothing in
+ * under (AGENTS.md, "A task worktree's lazy.toml has no authority"). Nothing in
  * LAZY.md can widen a permission, change a check, or pick a model; the worst a
  * branch can do by editing it is give its own next turn worse advice, exactly as
- * with CLAUDE.md.
+ * with AGENTS.md.
  */
 
 import { readdir } from 'fs/promises';
@@ -57,7 +57,7 @@ export const LAZY_MD_FILENAME = 'LAZY.md';
  *
  * Every launch pays this before the agent has read a line of code, so it is
  * capped rather than trusted. 40k characters is roughly the per-file limit
- * Claude Code itself warns a single CLAUDE.md past (see `claudeMdCharLimit` in
+ * Claude Code itself warns a single AGENTS.md past (see `claudeMdCharLimit` in
  * src/context-budget.ts) — a project whose lazy-specific instructions exceed
  * that is not being served by loading all of them anyway. Files past the budget
  * are NAMED in the injected text rather than silently dropped: an agent told
@@ -110,7 +110,7 @@ async function readWorktreeText(root: string, relativePath: string): Promise<str
 /**
  * The ancestor chain from `startDir` up to and including `root`, ordered
  * ROOT-FIRST — so the file closest to where the agent starts is read last, the
- * way Claude Code orders CLAUDE.md.
+ * way Claude Code orders AGENTS.md.
  *
  * A `startDir` outside `root` (or equal to it) yields just the root.
  */

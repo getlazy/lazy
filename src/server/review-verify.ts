@@ -45,6 +45,7 @@ import { PROSE_REPORT_FILE, proseAnchorLine } from '../review/prose-anchor';
  */
 const VERIFY_PROSE_KIND = 'how_to_verify';
 import { renderMarkdown } from './markdown';
+import { copyMarkdownButtonHtml, renderMarkdownWithCopy } from './copy-markdown';
 import { escapeHtml } from './review-diff';
 import { shortHash, viewedCardHtml } from './viewed-cards';
 import type { ShellAvailability } from './shell-ui';
@@ -392,7 +393,7 @@ export function verifyReportBlockHtml(
   let runNo = 0;
   const bodyHtml = steps
     .map((s) => {
-      if (s.kind !== 'code') return `<div class="rv-verify-prose turn-content">${renderMarkdown(s.markdown)}</div>`;
+      if (s.kind !== 'code') return `<div class="rv-verify-prose turn-content">${renderMarkdownWithCopy(s.markdown)}</div>`;
       runNo++;
       return codePanelHtml(s, shell, `Verify ${runNo}`);
     })
@@ -446,7 +447,7 @@ function verifyStepHtml(
         // and its [Ask agent] [Add comment] [Unblock] [Cancel] row, with the
         // step's own text as the quote the comment or unblock carries.
         // Superseded steps are not: they describe a branch that is gone.
-        `<div class="rv-verify-prose turn-content"${opts.current ? ` data-rv-prose="${escapeAttr(PROSE_REPORT_FILE)}" data-rv-prose-kind="${VERIFY_PROSE_KIND}"` : ''}>${renderMarkdown(step.markdown, opts.markdown)}</div>`
+        `${copyMarkdownButtonHtml(step.markdown)}<div class="rv-verify-prose turn-content"${opts.current ? ` data-rv-prose="${escapeAttr(PROSE_REPORT_FILE)}" data-rv-prose-kind="${VERIFY_PROSE_KIND}"` : ''}>${renderMarkdown(step.markdown, opts.markdown)}</div>`
       : codePanelHtml(step, opts.current ? shell : null, `Verify ${opts.runNo ?? index + 1}`, {
           mount: opts.current,
           ask: opts.current,

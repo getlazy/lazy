@@ -27,9 +27,12 @@
  *   transient_overload / _network  — never. These genuinely recover, and a task
  *                                    waiting on a rate limit must not need a
  *                                    human to un-stick it.
- *   unknown                        — never (unchanged from before this policy);
- *                                    the fast-crash-loop detector in work.ts is
- *                                    the backstop for tight crash loops.
+ *   unknown                        — after UNKNOWN_MAX_ATTEMPTS. Ends the TURN
+ *                                    only: the reconciler treats `unknown` as
+ *                                    non-fatal, so the task is `interrupted` and
+ *                                    auto-resume tries again later. The
+ *                                    fast-crash-loop detector in work.ts still
+ *                                    stops tight crash loops sooner.
  *
  * WATCHDOG KILLS ARE NOT IN THE TAXONOMY
  * A watchdog kill has no error string to classify — it is the supervisor's own
@@ -46,6 +49,13 @@ export const TRANSIENT_BACKOFF_CAP_MS = 60_000;
 /** Slower ladder for failures we could not classify. */
 export const UNKNOWN_BACKOFF_MS = [15_000, 30_000];
 export const UNKNOWN_BACKOFF_CAP_MS = 60_000;
+/**
+ * Persistent unknown failures must not relaunch forever inside one turn. Six
+ * attempts on the unknown ladder is ~4 minutes. Added after Cursor turns that
+ * only reconnected (each run >10s, so the fast-crash-loop detector never
+ * fired) retried indefinitely.
+ */
+export const UNKNOWN_MAX_ATTEMPTS = 6;
 
 /**
  * How many times we retry `transient_unreachable` before escalating to fatal.
@@ -103,6 +113,13 @@ export function decideRetry(failure: AgentFailure, attempt: number): RetryDecisi
       action: 'retry',
       delayMs: ladderDelay(attempt, TRANSIENT_BACKOFF_MS, TRANSIENT_BACKOFF_CAP_MS),
       reason: `${failure.class}: ${failure.reason}`,
+    };
+  }
+
+  if (attempt >= UNKNOWN_MAX_ATTEMPTS) {
+    return {
+      action: 'stop',
+      reason: `${failure.class}: ${failure.reason} — still failing after ${attempt} attempts; investigate the agent error and proxy audit`,
     };
   }
 
@@ -187,7 +204,7 @@ function totalLadderMs(attempts: number): number {
  * It must NOT apply to provider-side transients: a 429 or a refused connection
  * fails in well under a second, so three of them in a row would trip the
  * detector and abort a turn that was about to succeed. For `unknown` failures
- * the detector stays on — it is the only bound we have there.
+ * the detector stays on, catching tight loops sooner than UNKNOWN_MAX_ATTEMPTS.
  */
 export function appliesFastFailDetection(cls: AgentFailureClass): boolean {
   return cls === 'unknown';

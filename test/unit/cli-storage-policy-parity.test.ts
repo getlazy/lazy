@@ -138,18 +138,20 @@ const REFUSED_BY_DESIGN: Readonly<Record<string, string>> = {
   deleteMemory: 'lazy memory delete removes a curated record.',
   clearMemoryCompact: 'lazy memory clear-compact drops the compact summary.',
   saveMemoryCompact: 'lazy memory rebuild-compact writes the compact summary.',
-  // --- scratch files: project-local housekeeping, proxied but not admitted.
-  getScratchFile: 'lazy scratch read/get — housekeeping a bound clone does not serve.',
-  listScratchFiles: 'lazy scratch list — housekeeping a bound clone does not serve.',
-  deleteScratchFile: 'lazy scratch rm — housekeeping a bound clone does not serve.',
+  // --- scratch files: list/show go through the daemon's scratchList/scratchShow
+  //     RPCs (mapped at the read bar); the storage methods stay refused, and the
+  //     browser never deletes scratch.
+  getScratchFile: 'lazy scratch rm reads the file before deleting it; removal is not offered by the browser.',
+  listScratchFiles: 'lazy scratch list/show use the scratchList/scratchShow RPCs instead.',
+  deleteScratchFile: 'lazy scratch rm — the browser lists and shows scratch but never removes it.',
   // --- system messages: read state is server-side direction, pending.
   markSystemMessageRead: 'lazy messages marks a message read; server-side read state is the recorded direction.',
   dismissSystemMessage: 'lazy messages dismisses a message; server-side read state is the recorded direction.',
+  dismissSystemMessages: 'lazy messages dismiss --all/--source/--title dismisses in bulk; same direction as the single dismissal.',
   // --- task actions: real CLI verbs, unmapped until a human classifies them.
-  abandonTask: 'lazy redo abandons the superseded task; the loop interruption path uses it too.',
+  abandonTask: 'lazy loop abandons an interrupted task (lazy redo now closes through the daemon redoTask).',
   deleteTaskArtifact: 'lazy artifact rm deletes an artifact (create is admitted; delete is not yet classified).',
   createHunkApproval: 'the per-hunk review TUI writes an approval; no browser page writes hunk approvals.',
-  promoteRaisedItem: 'lazy raised promote turns a raised item into a task.',
 };
 
 describe('the CLI storage surface against the Rails policy table', () => {

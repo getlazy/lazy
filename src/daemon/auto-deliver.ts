@@ -14,6 +14,7 @@
  *   task.accepted    → blocked siblings: syncTask() (merge only)
  */
 
+import { shouldLogImageHold, runnerImageHold, mustRecreateForRunnerImage } from './runner-image-choice';
 import { join } from 'path';
 import { pathExists } from '../utils/fs';
 import { setupSandbox } from '../utils/sandbox';
@@ -28,7 +29,8 @@ import { createRunner } from '../runner';
 import { harnessForTask, setRunnerAgentForTask } from './task-harness';
 import { stampSessionRunner, removeTaskRun, mustRecreateForContainerAgent } from '../runner/session-launch';
 import { mustRecreateForTaskEnv } from './task-env';
-import { pinnedCustomImage } from '../docker/worktree-image';
+import { deliverTaskFilesForLaunch } from './task-files';
+import { launchImagePin } from '../docker/worktree-image';
 import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../protocol';
 import type { UnblockCommand } from '../protocol';
 import { acquireLock, removeLock, checkLock } from '../utils/lock';
@@ -37,6 +39,7 @@ import { memberInsideTask } from '../server/member-terminals';
 import { withTaskLifecycleLock } from './task-lifecycle-lock';
 import { supervisorStillOwnsTurn } from './supervisor-handback';
 import { logger } from '../utils/logger';
+import { launchFailureOf, recordLaunchFailureNotice } from './launch-failure';
 import { sanitizeUserText } from '../utils/sanitize-text';
 import { taskRef, getWorktreePathForRef } from '../task/identity';
 import { taskBranchFor } from '../git/branch-prefix';
@@ -66,6 +69,7 @@ import { pinnedBaseOf } from '../task/base-pin';
 import { systemActor } from '../identity/system-identity';
 import { resolveOutstandingViolations } from '../protection/outstanding-resolver';
 import { planRejectedRestores } from '../protection/rejected-restore';
+import { neutralizeLazyMarkers } from '../task/wrapper-fold';
 
 /**
  * Check whether a task's parent branch has commits that the task branch
@@ -232,6 +236,11 @@ export async function autoUnblockTask(
     logger.info(`Auto-unblock ${taskShortId}: held by usage pause — ${usageHold}`);
     return false;
   }
+  const imageHold = await runnerImageHold(task);
+  if (imageHold) {
+    if (shouldLogImageHold('auto-deliver', task, imageHold)) logger.info(`Auto-unblock ${taskShortId}: held until the project's runner image is ready — ${imageHold}`);
+    return false;
+  }
 
   const runner = await createRunner(lazyRoot, task.runner_type ?? undefined);
   try {
@@ -294,7 +303,7 @@ export async function autoUnblockTask(
     // skips this runs single-phase and produces no self-review at all — and if
     // it is the turn that declares final, the task parks with nothing recorded
     // and nothing gating. Invisible while the loop was opt-in; load-bearing
-    // now. CLAUDE.md names this exact class: "the recovery paths are exactly
+    // now. AGENTS.md names this exact class: "the recovery paths are exactly
     // the ones that forgot".
     const lowHighLoop = await resolveAndPersistLowHighLoop(
       task, undefined, config, storage, effortValue as EffortLevel,
@@ -306,7 +315,7 @@ export async function autoUnblockTask(
     // Build the full prompt with event context.
     // INTAKE BOUNDARY: the message is assembled from comment/CI text that may
     // predate sanitization (older stored comments, external CI output). Escape
-    // control characters here too — this prompt becomes argv[2] of `claude -p`.
+    // control characters here too, as defence in depth (prompts ride stdin).
     // A reviewer's Reject on a protected file rides EVERY unblock, the daemon's
     // own included: the supervisor restores it to base and commits that before
     // the agent runs (src/protection/rejected-restore.ts) — the same plan
@@ -349,7 +358,9 @@ export async function autoUnblockTask(
         sessionId: session.id,
         sequence: nextSeq,
         role: 'human',
-        content: `[system] ${safeMessage}`,
+        // PR comments / CI output are foreign text: a marker in them is made
+        // inert so it can never hide itself from the reviewer (src/task/wrapper-fold.ts).
+        content: `[system] ${neutralizeLazyMarkers(safeMessage)}`,
         // Labelled like every other request turn (unblock, ask, review): what
         // this turn was DISPATCHED to run on. Nobody typed this unblock, so the
         // per-turn record is the only place a reviewer can see which model the
@@ -423,6 +434,8 @@ export async function autoUnblockTask(
       })),
       ...commonCommandFields(config),
     };
+    // Per-task secret files, repaired before every launch (src/daemon/task-files.ts).
+    await deliverTaskFilesForLaunch(lazyRoot, task.id, worktreePath);
     writeCommand(protoDir, unblockCommand);
 
     // Generate daemon MCP config so the supervisor can provide MCP tools
@@ -432,16 +445,18 @@ export async function autoUnblockTask(
     }
 
     // Check if supervisor is already running
-    if (!mustRecreateForCredential && !mustRecreateForAgent && !mustRecreateForEnv && (await runner.isRunning(containerName))) {
+    if (!mustRecreateForCredential && !mustRecreateForAgent && !mustRecreateForEnv && !mustRecreateForRunnerImage(task) && (await runner.isRunning(containerName))) {
       logger.debug(`Auto-unblock ${taskShortId}: supervisor already running, command written`);
     } else {
       await removeTaskRun(runner, storage, session, containerName);
 
       try {
-        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath, tRef, task.id, pinnedCustomImage(task));
+        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath, tRef, task.id, launchImagePin(task));
       } catch (err) {
         logger.warn(`Auto-unblock ${taskShortId}: failed to launch supervisor: ${err instanceof Error ? err.message : err}`);
-        await parkTaskPaused(storage, task.id, deliveredBy, { projectRoot: lazyRoot });
+        const failure = launchFailureOf(task, err);
+        await parkTaskPaused(storage, task.id, deliveredBy, { projectRoot: lazyRoot, reason: failure.reason });
+        await recordLaunchFailureNotice(storage, task, session.id, failure, lazyRoot);
         return false;
       }
     }
@@ -553,7 +568,7 @@ export async function deliverUpstreamUpdated(
     } else if (result.status === 'up_to_date') {
       logger.debug(`Auto-sync ${taskShortId}: already up to date`);
       return false;
-    } else if (result.usagePauseHeld || result.credentialHeld) {
+    } else if (result.usagePauseHeld || result.credentialHeld || result.runnerImageHeld) {
       // INVARIANT ([usage_pause]): a conflict sync the pause holds is owned by
       // the queued sync (`pending_sync`), which the retry loop re-offers with
       // backoff and which runs by itself after the reset. The upstream signal
@@ -563,7 +578,9 @@ export async function deliverUpstreamUpdated(
       logger.info(
         result.credentialHeld
           ? `Auto-sync ${taskShortId}: held — its conflict needs an agent with no model credential; the queued sync retries`
-          : `Auto-sync ${taskShortId}: held by the usage pause; the queued sync retries after the reset`,
+          : result.runnerImageHeld
+            ? `Auto-sync ${taskShortId}: held — its conflict needs an agent and the project's runner image is not ready; the queued sync retries`
+            : `Auto-sync ${taskShortId}: held by the usage pause; the queued sync retries after the reset`,
       );
       return false;
     } else {

@@ -1,7 +1,7 @@
 /**
  * A turn the agent actually finished must never disappear.
  *
- * INVARIANT (CLAUDE.md's "never lose human feedback", mirrored for the agent):
+ * INVARIANT (AGENTS.md's "never lose human feedback", mirrored for the agent):
  * the agent's output is evidence, and evidence is never destroyed to make room
  * for the next command. Observed in the wild on an `interrupted` task: the
  * human ran `lazy unblock`, watched a full turn stream to completion, and
@@ -10,7 +10,7 @@
  * place that writes both the turn record and `agent_session_id`, and it never
  * ran, because `writeCommand` had `unlink`ed the response out from under it.
  *
- * This suite runs on the fake-binary seam deliberately (CLAUDE.md, "Two agent
+ * This suite runs on the fake-binary seam deliberately (AGENTS.md, "Two agent
  * seams"): the loss happens in the host↔supervisor protocol FILES — a real
  * `response.json` written by a real supervisor and removed by a real
  * `writeCommand`. The module mock replaces `launchSupervisorAsync`, so none of

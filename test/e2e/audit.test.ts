@@ -179,9 +179,10 @@ describe('lazy stats audit', () => {
     const result = await ctx.lazy(['stats', 'audit']);
     expectSuccess(result);
     expectOutput(result, 'No proxied requests recorded yet');
-    // The scope caveat matters most when the trail is empty: "nothing here" and
-    // "your agent is on a backend that bypasses the proxy" look identical.
-    expectOutput(result, 'Only traffic through the lazy proxy is audited');
+    // The scope caveat matters most when the trail is empty: every launch lazy
+    // makes is proxied, so "nothing here" means nothing lazy launched has made a
+    // request — a process lazy did not launch never shows up.
+    expectOutput(result, 'a process lazy did not launch is not');
   });
 
   test('lists records one per row with role, task, model and tool counts', async () => {
@@ -411,7 +412,7 @@ describe('lazy stats audit', () => {
     expectError(topLevel, 'Unknown command: audit');
   });
 
-  // The multiplexer invariant from CLAUDE.md: a subcommand with dedicated usage
+  // The multiplexer invariant from AGENTS.md: a subcommand with dedicated usage
   // text must be in the parent's usage map, or -h silently prints the PARENT's
   // help with no error anywhere.
   test('`lazy stats audit -h` prints the subcommand help, not the parent help', async () => {

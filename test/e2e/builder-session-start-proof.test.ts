@@ -43,7 +43,7 @@ import { storageDirFor } from '../helpers/storage';
 import { DaemonClient, RpcApplicationError } from '../../src/daemon/client';
 import { getDaemonTcpTarget, readToken } from '../../src/daemon/lifecycle';
 import { SERVICE_CREDENTIAL_USER_ID } from '../../src/daemon/user-credentials';
-import { NO_OWNER_CREDENTIAL_MARKER } from '../../src/daemon/turn-credentials';
+import { NO_OWNER_ENDPOINT_CREDENTIAL_MARKER } from '../../src/daemon/member-credentials';
 import { isSessionPlaceholderToken } from '../../src/daemon/session-credentials';
 import {
   IMAGE_TAG,
@@ -52,6 +52,8 @@ import {
 } from '../../src/capture/claude';
 import { resolveBuilderSessionHomeDir } from '../../src/builder/claude-home';
 import { builderRunName } from '../../src/builder/relaunch';
+import { fetchBuilderLaunchEnv } from '../../src/builder/launch-env';
+import { daemonMcpConfigDir, DAEMON_MCP_CONFIG_PREFIX } from '../../src/daemon/task-launcher';
 import { agentBinaryContentIdOfFile, versionedAgentBinaryName } from '../../src/agent/binary-install';
 import type { BuilderSession } from '../../src/storage/types';
 
@@ -348,6 +350,39 @@ describe('daemon-owned builder session start proof', () => {
     expect((await stat(agentMount![1])).size).toBeGreaterThanOrEqual(1024);
   }, 120_000);
 
+  // INVARIANT: in team mode the builder container's launch-environment refresh
+  // — which the in-container supervisor runs before EVERY Claude Code launch,
+  // the first one included — hands back the member's own session placeholder
+  // and never asks the daemon for a credential of its own. The daemon refuses
+  // that by design (per-user billing), and asking it made every Teams builder
+  // exit 1 the moment its container started.
+  test('a started member builder can refresh its launch environment in team mode', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const userToken = await mintUserToken(ALICE_EMAIL, 'Alice');
+
+    const row = await rpc(userToken, 'startBuilderSession', {}) as BuilderSession;
+    expect(row.state).toBe('running');
+    const launchLine = (await docker.invocations()).find(l => l.includes('--name lazy-builder-') && l.includes(' -d '))!;
+    const launchedPlaceholder = launchLine.match(/-e CLAUDE_CODE_OAUTH_TOKEN=(\S+)/)![1]!;
+
+    // The exact config file mounted into the container, with its
+    // host.docker.internal target re-pointed at loopback so this process can
+    // play the in-container supervisor.
+    const mounted = join(daemonMcpConfigDir(ctx.root), `${DAEMON_MCP_CONFIG_PREFIX}builder-${row.builderId}.json`);
+    const cfg = JSON.parse(await readFile(mounted, 'utf-8')) as { target: string };
+    const copy = join(proofDir, 'builder-mcp.json');
+    await writeFile(copy, JSON.stringify({ ...cfg, target: cfg.target.replace('host.docker.internal', '127.0.0.1') }));
+
+    const env = await fetchBuilderLaunchEnv(copy);
+    const byKey = new Map(env.authEnvVars.map(v => [v.key, v.value]));
+    expect(byKey.get('CLAUDE_CODE_OAUTH_TOKEN')).toBe(launchedPlaceholder);
+    expect(isSessionPlaceholderToken(byKey.get('CLAUDE_CODE_OAUTH_TOKEN')!)).toBe(true);
+    expect(byKey.get('ANTHROPIC_BASE_URL')).toMatch(/^http:\/\/host\.docker\.internal:\d+/);
+    expect(JSON.stringify(env)).not.toContain(ALICE_OAUTH);
+    expect(JSON.stringify(env)).not.toContain(SERVICE_OAUTH);
+  }, 120_000);
+
   test('a member with no stored credential is refused before any row exists', async () => {
     // Team mode ON via a DIFFERENT member's credential (the service credential
     // alone never flips it); ALICE herself has none. MONEY BEFORE
@@ -359,7 +394,7 @@ describe('daemon-owned builder session start proof', () => {
 
     const status = await rpcStatus(userToken, 'startBuilderSession', {});
     expect(status.status).toBe(400);
-    expect(status.message).toContain(NO_OWNER_CREDENTIAL_MARKER);
+    expect(status.message).toContain(NO_OWNER_ENDPOINT_CREDENTIAL_MARKER);
 
     // No row AT ALL — not merely no active one. The active-session read is
     // filtered to non-ended rows, but a failed launch's claim is demoted to

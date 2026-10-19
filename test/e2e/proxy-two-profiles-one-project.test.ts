@@ -169,7 +169,7 @@ describe('two profiles of one harness, two upstreams, one project', () => {
       // which authenticates nobody — so it names no credential and gets the
       // local default of none.
       `[agents.local-pi]\nharness = "pi"\nmodel = "qwen3:8b"\n` +
-      `endpoint = "http://127.0.0.1:${ollama.server.port}"\n`,
+      `endpoint = "http://127.0.0.1:${ollama.server.port}"\ncredential = "none"\n`,
     );
   }
 

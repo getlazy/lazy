@@ -44,9 +44,11 @@ import {
   type MessageRange,
 } from '../conversation/promote';
 import { layoutHtml } from './templates';
+import type { BuilderTierView } from '../daemon/builder-tier';
 import { escapeHtml } from './review-diff';
 import { taskPath } from './task-urls';
 import { renderMarkdown, type RenderMarkdownOptions } from './markdown';
+import { renderMarkdownWithCopy } from './copy-markdown';
 
 /**
  * Messages rendered per transcript page.
@@ -119,7 +121,36 @@ const INTRO =
  * counts, summary — because the two listings are the same listing, and a human
  * moving between the terminal and the browser should not have to re-learn it.
  */
-export function conversationsIndexHtml(builders: BuilderSummary[]): string {
+/**
+ * The tier a TIERED builder is answering on, and its recent switches — so a
+ * long conversation that fell to a weaker model is visible, not silent. Empty
+ * for an ordinary builder profile.
+ */
+export function builderTierPanelHtml(view: BuilderTierView | null | undefined): string {
+  if (!view?.tiered) return '';
+  const total = view.tiers.length;
+  const now = view.now;
+  const state = view.refused
+    ? escapeHtml(view.refused)
+    : !now
+    ? 'The tier in use cannot be read right now.'
+    : now.allFull
+      ? 'Every tier is full: builder requests are refused until a usage window resets.'
+      : `Answering on <strong>tier ${now.index + 1} of ${total}</strong> — ${escapeHtml(now.endpoint)}, model <code>${escapeHtml(now.model)}</code>` +
+        (now.index > 0 && view.tiers[0] ? ` (below tier 1, <code>${escapeHtml(view.tiers[0].model)}</code>)` : '') + '.';
+  const switches = view.switches.slice(0, 5).map((s) => {
+    const from = s.from ? `tier ${s.from.index + 1} (${s.from.model})` : 'unknown';
+    const to = s.to ? `tier ${s.to.index + 1} (${s.to.model})` : 'no tier (every tier full)';
+    return `<li><time>${escapeHtml(s.at)}</time> — ${escapeHtml(from)} → ${escapeHtml(to)}: ${escapeHtml(s.reason)}</li>`;
+  }).join('');
+  const cls = now && (now.allFull || now.index > 0) ? 'builder-tier builder-tier-below' : 'builder-tier';
+  return `<div class="${cls}" id="builder-tier">
+    <p>Builder profile <code>${escapeHtml(view.profile)}</code> is tiered. ${state}</p>
+    ${switches ? `<details${now && now.index > 0 ? ' open' : ''}><summary>Tier switches since the daemon started</summary><ul>${switches}</ul></details>` : ''}
+  </div>`;
+}
+
+export function conversationsIndexHtml(builders: BuilderSummary[], tier?: BuilderTierView | null): string {
   const body = builders.length === 0
     ? `<div class="empty-state">No Builders yet. Dialogues with the builder appear here once they are captured.</div>`
     : `<p class="text-muted">${builders.length} Builder${builders.length === 1 ? '' : 's'}.</p>
@@ -131,6 +162,7 @@ export function conversationsIndexHtml(builders: BuilderSummary[]): string {
   return layoutHtml('Builders', `
     <h1>Builders</h1>
     <p class="text-muted conv-intro">${INTRO}</p>
+    ${builderTierPanelHtml(tier)}
     ${searchFormHtml('')}
     ${body}
   `);
@@ -238,6 +270,7 @@ export function conversationDetailHtml(
   duplicatedCodes?: ReadonlySet<string>,
   markdown?: RenderMarkdownOptions,
   builder?: BuilderSummary,
+  tier?: BuilderTierView | null,
 ): string {
   const total = conv.messages.length;
   const title = conversationTitle(conv);
@@ -275,6 +308,7 @@ export function conversationDetailHtml(
     <div class="breadcrumb"><a href="/builders">Builders</a> &rsaquo; Builder</div>
     <h1>${escapeHtml(title)}${builder && builderRunBadgeHtml(builder) ? ' ' + builderRunBadgeHtml(builder) : ''}</h1>
     ${meta}
+    ${builderTierPanelHtml(tier)}
     ${promote ? promoteSectionHtml(conv, idHtml, offset, promote, duplicatedCodes) : ''}
     ${body}
   `);
@@ -404,7 +438,7 @@ function messageHtml(
   const stamp = msg.timestamp ? formatConversationTimestamp(msg.timestamp) : '';
   const model = msg.model ? `<span class="conv-model">${escapeHtml(msg.model)}</span>` : '';
   const content = msg.text.trim()
-    ? `<div class="turn-content">${renderMarkdown(msg.text, markdown)}</div>`
+    ? `<div class="turn-content">${renderMarkdownWithCopy(msg.text, markdown)}</div>`
     : `<div class="conv-empty-message">This message recorded no text.</div>`;
 
   const selected = selection && number >= selection.from && number <= selection.to;

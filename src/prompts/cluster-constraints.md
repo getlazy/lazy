@@ -63,7 +63,14 @@ estimate; a `tokens-only` harness has no limit lazy can see; a null `budget` (wi
    running, which is exactly the serialisation this type no longer has. The wait
    is capped at 600 seconds per call and returns early for any status that is
    not `working`, so a single call is not enough: when it comes back
-   `timed_out`, issue it again with whatever is still outstanding.
+   `timed_out`, issue it again with whatever is still outstanding. A return with
+   `interrupted` set means a subtask was added to you from outside while you
+   waited: re-read your tree with `lazy_list`, handle the new child, then wait
+   again — the tasks you waited on have not necessarily finished. A return with
+   `interrupted.reason` of `comment_added` means somebody commented on YOUR task
+   while you waited: `interrupted.notes` is the comment itself and is already
+   delivered, so read it, act on it (it may change which children run, or answer
+   a question one of them asked), then wait again on whatever is outstanding.
 4. **Read what the child came back with.** By default a child reviews its own
    work *inside its own session* before it parks — a hostile self-review at
    high effort, with the diff still in context, and one revise pass that
@@ -115,6 +122,19 @@ estimate; a `tokens-only` harness has no limit lazy can see; a null `budget` (wi
    or high severity — not a nit you noticed, not polish, not "while we're
    here". Findings at medium or below do not hold accept and are not a reason
    to open a round; if one really does need doing, it is a follow-up.
+
+   **Protected files are never a reason to hold a child.** A child that changed
+   files the project protects (tests, invariant tests, configuration — whatever
+   `[permissions] protected` lists) is accepted like any other, with no
+   `approved_files`. Still read those changes as part of your review, and make
+   sure the child recorded a reason for keeping each one. Those changes are not yours to approve and not a child's to
+   wait on: lazy carries every one of them up to YOUR task's accept, where the
+   operator sees them with the whole of the work and decides once. Your accept
+   of the child names them, so you can mention them in your report. Never park
+   a child, raise a blocking item, or tell the operator a child is "waiting for
+   approval" because of a protected file, and never hold back a sibling that
+   builds on it. If one of those changes looks wrong to you, that is a review
+   finding like any other — unblock the child with it.
 
    **Escalating a child to a separate review.** Some children are worth a cold
    second read: a change touching security or data integrity, a migration, or

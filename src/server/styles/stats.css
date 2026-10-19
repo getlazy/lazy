@@ -203,6 +203,23 @@
   stroke-linecap: round;
 }
 
+.lz-viz-chunk-rule {
+  stroke: color-mix(in srgb, var(--color-text) 35%, transparent);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+}
+
+.lz-viz-chunk-label {
+  fill: var(--text);
+  font-size: 10px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+}
+
+.lz-viz-hit {
+  fill: transparent;
+}
+
 .lz-viz-endlabel {
   fill: var(--text);
   font-size: 11px;
@@ -256,3 +273,30 @@
 
 .lz-stats-facts dt { color: var(--text-secondary); }
 .lz-stats-facts dd { margin: 0; font-family: var(--font-mono); }
+
+.lz-viz-hit:hover {
+  fill: color-mix(in srgb, var(--lz-viz-1) 25%, transparent);
+}
+
+.lz-chunk-links a {
+  margin-right: 6px;
+  font-family: var(--font-mono);
+}
+
+/* The charts scale with their viewBox, so on a phone 10px axis text lands near
+   5px. Raise it in viewBox units, and drop the middle time label, which no
+   longer has room beside the two end labels. */
+@media (max-width: 600px) {
+  .lz-viz-tick,
+  .lz-viz-endlabel {
+    font-size: 20px;
+  }
+
+  .lz-viz-chunk-label {
+    font-size: 18px;
+  }
+
+  .lz-viz-xtick-mid {
+    display: none;
+  }
+}

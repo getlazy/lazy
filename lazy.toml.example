@@ -105,12 +105,17 @@ default = "claude-sonnet-5-5"
 #              for an upstream that authenticates nobody, or ANY name you pick
 #              (`lazy auth set work-openai`, then credential = "work-openai") —
 #              that is how two profiles on the same provider get billed to
-#              different keys. Omit and lazy infers it from the hostname:
-#              ollama.com -> "ollama", openrouter.ai -> "openrouter", an address
-#              on this machine or your LAN -> "none" (a local model server takes
-#              no key, so lazy does not send it one), otherwise the credential
-#              for the harness's API. Two profiles on the same provider share
-#              one credential unless one names its own.
+#              different keys. REQUIRED whenever endpoint is set: lazy never
+#              guesses which of your secrets a host receives, so a profile
+#              (or [endpoints.<name>] block) with an endpoint and no credential
+#              does not load. A local model server says credential = "none".
+#              A provider's key on another host (credential = "anthropic" on
+#              an Anthropic-compatible gateway) is allowed when written; the
+#              proxy refuses that pairing on any other basis. Two profiles on
+#              the same provider share one credential unless one names its own.
+# Changes to a profile's endpoint or credential take effect for subsequent proxy
+# requests without restarting the daemon. Already-running requests keep their
+# original upstream and never send credentials to a different endpoint.
 #   description when to choose this profile, in plain text (up to 500
 #              characters). Shown beside every agent picker — the web forms,
 #              `lazy system agent`, the builder, and `lazy_status` for agents
@@ -151,21 +156,31 @@ default = "claude-sonnet-5-5"
 # harness = "pi"               # built-in pi profile already runs the local one)
 # model = "qwen3.8:latest"
 # endpoint = "http://ollama.lan:11434"
+# credential = "none"          # a model server that takes no key
 #
 # [agents.anthropic-pi]        # pi against Anthropic, which is NOT the default:
 # harness = "pi"               # it spends your Anthropic credential, so it is
 # model = "claude-opus-5-5"    # something you ask for by name
 # endpoint = "https://api.anthropic.com"
+# credential = "anthropic"
 #
 # [agents.openai-pi]            # pi speaks both wires: an api.openai.com or
 # harness = "pi"                # openrouter.ai endpoint runs pi's OpenAI
 # model = "gpt-6-sol"           # provider, any other endpoint its
 # endpoint = "https://api.openai.com"   # Anthropic-wire one
+# credential = "openai"
 #
 # [agents.openrouter-pi]        # OpenRouter model ids are used as-is; key from
-# harness = "pi"                # `lazy auth set openrouter` (inferred from the
-# model = "anthropic/claude-sonnet-4.5" # endpoint when credential is omitted)
+# harness = "pi"                # `lazy auth set openrouter`
+# model = "anthropic/claude-sonnet-4.5"
 # endpoint = "https://openrouter.ai/api"
+# credential = "openrouter"
+#
+# [agents.firerouter]           # Claude Code (Anthropic wire) through Fireworks' FireRouter; key from
+# harness = "claude-code"       # `lazy auth set fireworks`.
+# model = "firerouter/opus"     # Needs a standard `fw_...` key, not a Fire Pass one.
+# endpoint = "https://api.fireworks.ai/inference"   # no /v1: the client adds it
+# credential = "fireworks"
 #
 # [agents.claude-code]          # overrides the built-in profile of the same name
 # harness = "claude-code"
@@ -175,8 +190,7 @@ default = "claude-sonnet-5-5"
 # harness = "codex"
 # model = "gpt-6-sol"
 # endpoint = "https://openrouter.ai/api"   # no /v1: lazy adds it
-# credential = "openrouter"     # `lazy auth set openrouter`; inferred from the
-#                               # endpoint when omitted
+# credential = "openrouter"     # `lazy auth set openrouter`
 #
 # Running codex on a ChatGPT Plus/Pro SUBSCRIPTION needs no block at all:
 # "codex-subscription" is built in, alongside "codex-api" (the metered OpenAI
@@ -188,6 +202,54 @@ default = "claude-sonnet-5-5"
 # harness = "codex"             # billed to a different key
 # model = "gpt-6-sol"
 # credential = "work-openai"    # any name you choose: `lazy auth set work-openai`
+#
+# ---- Named endpoints and a tiered profile ----
+#
+# [endpoints.<name>] defines an upstream once: its url and the credential that
+# pays for it. Any profile can use one with `named_endpoint = "<name>"` instead
+# of an inline endpoint. `credential` is the name of a stored key
+# (`lazy auth set <that name>`), unrelated to the endpoint's own name, or
+# "none" for a server that takes no key. REQUIRED: an endpoint without one does
+# not load. Rule: public-docs/lazy-toml.md, "Every endpoint names its credential".
+#
+# A TIERED profile lists endpoints as tiers. Every request goes to the first
+# tier that is available, and a tier is used until it says no: when its
+# provider refuses a request for its rate limit (HTTP 429), that same request
+# goes to the next tier, mid-turn. The refused tier is tried again by a later
+# request at its retry-after or reported reset, else after
+# [proxy] tier_retry_interval (default 300 s) — and a Claude/ChatGPT
+# subscription no later than that, since its window can reset early.
+# threshold_percent is OPTIONAL: on a Claude/ChatGPT subscription tier it
+# switches early, before the provider refuses; other endpoints (Fireworks,
+# Ollama, ...) report no window and take none.
+# Every tier's credential must be present before a turn starts; claude-code only.
+# The builder may run on one too ([models.roles.builder] agent = "tiered").
+# Each switch, down or back up, loses the prompt cache: expect a cost spike
+# on a long conversation.
+# In Lazy Teams, each member connects every paid endpoint before launching a
+# task or builder, and pays each selected tier through that endpoint's connection.
+# Automated turns use the service holder's own endpoint connections.
+#
+# [endpoints.anthropic-sub]
+# url = "https://api.anthropic.com"       # your Claude subscription
+# credential = "anthropic"                # `lazy auth set anthropic`
+#
+# [endpoints.fireworks]
+# url = "https://api.fireworks.ai/inference"
+# credential = "fireworks"                # `lazy auth set fireworks`
+#
+# [endpoints.ollama-local]
+# url = "http://localhost:11434"
+# credential = "none"                     # local: sends no credential
+#
+# [agents.tiered]
+# harness = "claude-code"
+# description = "Subscription until it says no, then Fireworks, then local"
+# tiers = [
+#   { endpoint = "anthropic-sub", model = "claude-sonnet-5-5" },   # optional: threshold_percent = 95
+#   { endpoint = "fireworks", model = "firerouter/opus" },
+#   { endpoint = "ollama-local", model = "qwen3-coder" },
+# ]
 #
 # ---- Spreading work across models by tier ----
 #
@@ -292,6 +354,10 @@ backend = "external"
 # Path for external storage
 # Defaults to ~/.lazy/<project-name> if empty
 external_path = ""
+# Before a new lazy version first opens the store, it is copied to
+# <store>.backups/ beside it and the copy verified (see `lazy system store-backups`).
+# This many verified backups are kept; failed ones are kept too, labelled failed.
+# backup_keep = 5
 
 [git]
 # Default prefix for lazy task branches (e.g., "lazy/abc123"). Set "wip" and new
@@ -415,7 +481,8 @@ agent_id = "claude-code"
 # Wind-down window (milliseconds): how long to wait for the agent process to
 # exit AFTER it has emitted its final result. The summary is already captured
 # at that point, so killing a CLI that won't exit costs nothing. This timer is
-# never armed before the result lands.
+# never armed before the result lands, nor while the agent still has background
+# work running (it may answer again once that work reports).
 # Default: 60000 (60s). Set to 0 to wait indefinitely.
 # wind_down_timeout_ms = 60000
 
@@ -535,11 +602,18 @@ port = 26024
 # web = 3000
 # api = 8080
 #
+# Under Lazy Teams a task's PR/MR description links to the task and to ONE
+# service, so a reviewer can switch between the PR and the running app.
+# main_service picks that service; it must be one of the declared ports. Unset,
+# the first declared port is used.
+# main_service = 3000
+#
 # The "Start services" command (e.g. bin/dev) is NOT configured here: designate
-# or change it from any task's Services card (dashboard or Lazy Teams). It is
-# saved in the project's store. An existing start_services_cmd below is IMPORTED
+# or change it in the dashboard's Settings › Services (Lazy Teams: the project's
+# Configuration page). It is saved in the project's store. An existing
+# start_services_cmd below is IMPORTED
 # into the store once, the next time the daemon starts, and is not read again
-# after that — change or clear it from the Services card instead.
+# after that — change or clear it there instead.
 # start_services_cmd = "bin/dev"
 
 [runner]
@@ -551,7 +625,7 @@ type = "docker"
 # sandbox_allowed_domains = ["*.example.com"]
 # sandbox_deny_read = ["~/.ssh"]
 # sandbox_deny_write = ["/etc"]
-# verify_sandbox_boundary = "off"      # "off" | "once-per-version"
+# verify_sandbox_boundary = "off"      # retired: accepted, no effect
 
 [memory]
 # Advisory size budget (bytes) for the shared-memory context injected into every
@@ -670,11 +744,14 @@ driver = "local"
 # Authentication is handled by glab CLI (run: glab auth login)
 
 [docker]
-# Path to custom Dockerfile, relative to the project root. Empty = use the base
-# image (Ubuntu with Claude Code + passwordless sudo; agents apt-get what they
-# need). A task worktree's copy never auto-governs the image. Launch resolution:
+# Path to custom Dockerfile, relative to the project root. Empty = use
+# a committed `Dockerfile.lazy` at the project root, otherwise the base image
+# (Debian with Claude Code + passwordless sudo; agents apt-get what they need).
+# A task worktree's copy never auto-governs the image. Launch resolution:
 # (1) a task's already-pinned metadata.custom_image, (2) a daemon-adopted
-# worktree image from a consented `lazy upgrade`, (3) this key. From a terminal
+# worktree image from a consented `lazy upgrade`, (3) this key, (4) with the key
+# empty, a committed root Dockerfile.lazy (on Lazy Teams, only where each
+# project runs in its own VM). From a terminal
 # in a task worktree, `lazy create` / `start` / `edit` may ask once whether to
 # build that worktree's Dockerfile.lazy and pin it on the task (subtasks inherit
 # the pin; MCP never prompts). `lazy upgrade` from a worktree TTY may ask to
@@ -791,7 +868,7 @@ dockerfile = ""
 # Glob patterns for files agents are NOT allowed to delete or modify.
 # They are allowed to *add* into existing files *and* matching globs.
 # Violations are detected after each agent turn and flagged for review.
-# Example: protected = ["*.test.ts", "*.spec.ts", "src/core/**", "CLAUDE.md"]
+# Example: protected = ["*.test.ts", "*.spec.ts", "src/core/**", "AGENTS.md"]
 
 [protection]
 # Protected branches: accepting a task into a protected branch prompts for
@@ -799,6 +876,10 @@ dockerfile = ""
 # step, nothing stored. This is friction against an over-eager builder, not
 # security — see docs/protected-branches.md. Distinct from
 # [permissions].protected, which guards FILES.
+#
+# In Lazy Teams there is no passphrase: a signed-in member pressing Accept
+# approves the merge, and protection is ON by default there unless this file
+# sets `enabled` (the owner's switch on the Configuration page).
 #
 # OPT-IN: off by default, so nothing below has any effect until the master
 # switch is on. Turning it on protects the repo's DEFAULT branch (e.g. main)
@@ -917,8 +998,9 @@ dockerfile = ""
 # If the command exceeds this, it is killed and recorded as exit code -2.
 # post_turn_timeout = 300
 
-# accept_check — command run in the TASK WORKTREE when a task is accepted,
-# BEFORE the merge. A non-zero exit REFUSES the accept and names the failure in
+# accept_check — command run against the TASK WORKTREE when a task is accepted,
+# BEFORE the merge, inside the same short-lived container [automation.pre_accept]
+# uses — never on the host, since the scripts it calls come from the task branch. A non-zero exit REFUSES the accept and names the failure in
 # merge terms: this task does not compile, so merging it would break the target
 # branch. Unset (the default) means no gate — accept says the gate was skipped
 # rather than guessing a build command for your project.
@@ -1031,8 +1113,13 @@ dockerfile = ""
 # the audit trail so you can see afterward which turns ran on a fallback.
 # Anthropic-native targets only. On a 429 with Retry-After ≤ retry_after_threshold
 # seconds, the proxy waits and retries the primary once before failing over
-# (default 5).
+# (default 5). A tiered profile also waits out such a short 429 on the same
+# tier once before switching to the next tier.
 # retry_after_threshold = 5
+#
+# A tier of a tiered profile that refused (429) without a retry time is skipped
+# this many seconds before a request tries it again (default 300, at least 1).
+# tier_retry_interval = 300
 #
 # How long the proxy waits for an upstream to answer ONE request, in seconds
 # (default 1800; 0 = wait forever). A local model that is still loading, queued
@@ -1041,6 +1128,12 @@ dockerfile = ""
 # does. When the proxy does give up it names the upstream and this ceiling in
 # the error, so a slow model never looks like a network fault.
 # upstream_timeout = 1800
+#
+# The proxy audit log (one line per model request: which upstream, model and
+# status answered) keeps 7 days or 128 MiB, whichever comes first. Neither can
+# be turned off; the size is at least 8.
+# audit_retention_days = 7
+# audit_retention_mib = 128
 #
 # Each target gets its own credential, or none: the proxy presents the credential
 # configured for the target it actually calls, never whatever the client sent.

@@ -10,9 +10,8 @@ import { existsSync, readdirSync } from 'fs';
  *
  * Fixture setup for suites whose SUBJECT is AUDIENCE (final-turn design
  * §13.3): audience is derived from the last launching-actor turn, so a task
- * seeded this way resolves to agent-audience — whose final runs NO wrap-up
- * steps at all (§3.2: no protected-file push-back, no maintained-file nudge,
- * no presentation), and whose protected files defer to the hub's final (§4.2).
+ * seeded this way resolves to agent-audience, whose protected files defer to
+ * the parent's accept. It runs the same wrap-up steps as any other task.
  *
  * Same mechanics as seedFinal — append-only on a SETTLED task, never mid-turn.
  */

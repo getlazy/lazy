@@ -28,7 +28,7 @@ const ROOT = join(import.meta.dir, '..', '..');
  * far more rotten than it was.
  *
  * So the multi-file entry points must carry `--timeout` explicitly. A bare
- * `bun test test/e2e/` still does not (see CLAUDE.md); these tests pin the part
+ * `bun test test/e2e/` still does not (see AGENTS.md); these tests pin the part
  * that can be enforced mechanically.
  */
 describe('test timeout configuration', () => {

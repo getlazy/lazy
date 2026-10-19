@@ -27,7 +27,7 @@
  * PRODUCTION IS UNAFFECTED. Nothing in `src/` ever sets `LAZY_TEST_PARENT_PID`;
  * without it {@link startTestParentWatch} returns null and installs no timer. It
  * belongs to the same test-only env var family as `LAZY_FORCE_TTY` and
- * `LAZY_PROMPT_DEFAULTS` (see CLAUDE.md) — never read it from production code
+ * `LAZY_PROMPT_DEFAULTS` (see AGENTS.md) — never read it from production code
  * paths, and never set it from one.
  *
  * NOTE ON PID REUSE: a recycled parent pid would make the watch see a live

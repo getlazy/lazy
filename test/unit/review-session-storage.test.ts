@@ -60,7 +60,7 @@ describe('review session storage', () => {
     expect(loaded?.status).toBe('idle');
   });
 
-  // INVARIANT (CLAUDE.md, "never lose human feedback"): compose-box text is
+  // INVARIANT (AGENTS.md, "never lose human feedback"): compose-box text is
   // durable before launch — append persists with delivery pending even when the
   // builder turn has not started yet.
   test('appendReviewSessionMessage persists human text as pending before launch', async () => {

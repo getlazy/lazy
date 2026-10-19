@@ -26,6 +26,8 @@ function resultDisplayId(result: SearchResult): string {
   // Memory records are keyed by their name, not by an id — truncating it to 8
   // chars ("tasks-no") would hide which record matched.
   if (result.entity_type === 'memory') return result.entity_id;
+  // Task-less entities (a system message, a conversation) are named by their own id.
+  if (!result.task_id) return shortId(result.entity_id);
   return result.task_code ?? shortId(result.task_id);
 }
 
@@ -39,6 +41,10 @@ function resultDisplayId(result: SearchResult): string {
 function entityLabel(result: SearchResult): string {
   if (result.entity_type === 'turn' && result.turn_sequence !== undefined) {
     return `turn #${result.turn_sequence}`;
+  }
+  // An id hit names its entity, so an ambiguous prefix can be told apart.
+  if (result.matched_id && result.entity_type !== 'task') {
+    return `${result.entity_type} ${shortId(result.entity_id)}`;
   }
   return result.entity_type;
 }
@@ -59,9 +65,10 @@ function printResults(results: SearchResult[], groupByTask: boolean, hint?: stri
     // Group results by task
     const byTask = new Map<string, SearchResult[]>();
     for (const result of results) {
-      const existing = byTask.get(result.task_id) || [];
+      const key = result.task_id || `entity:${result.entity_id}`;
+      const existing = byTask.get(key) || [];
       existing.push(result);
-      byTask.set(result.task_id, existing);
+      byTask.set(key, existing);
     }
 
     byTask.forEach((taskResults) => {
@@ -175,7 +182,7 @@ async function printJsonResults(storage: Storage, results: SearchResult[], query
   // Collect unique task IDs (excluding conversations which use session IDs)
   const taskIds = new Set<string>();
   for (const r of results) {
-    if (r.entity_type !== 'conversation' && r.entity_type !== 'memory') {
+    if (r.entity_type !== 'conversation' && r.entity_type !== 'memory' && r.task_id) {
       taskIds.add(r.task_id);
     }
   }
@@ -204,6 +211,8 @@ async function printJsonResults(storage: Storage, results: SearchResult[], query
 
     return {
       task_id: r.task_id,
+      entity_id: r.entity_id,
+      ...(r.matched_id ? { matched_id: true } : {}),
       task_code: r.task_code,
       match_type: r.entity_type,
       line: lineNum,

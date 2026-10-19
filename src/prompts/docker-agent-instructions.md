@@ -5,6 +5,11 @@ You have passwordless sudo inside this container. If you need tools that aren't 
 `sudo apt-get update && sudo apt-get install -y <package>`. Making yourself effective at
 running code and tests is part of the job.
 
+A tool the PROJECT needs — a language, runtime or compiler its code is written in or built
+with (e.g. `node` for a Node service, `cargo` for a Rust one) — belongs in the project's task
+image too, or every later task starts without it. When your work needs one this container
+lacks, load the recipe with `lazy_recipe` (name `task-image`) and follow it.
+
 ### Git in this container
 
 This container is where the "Git and transport discipline" rules in your main instructions are

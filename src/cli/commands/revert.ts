@@ -1,4 +1,5 @@
 import { requireLazyRoot, requireStorage, parseFlags, resolveTaskOrExit } from '../helpers';
+import { refuseCreateInBoundClone } from '../bound-clone-create';
 import { requireActorIdentity } from '../identity-preflight';
 import { formatDate } from '../../utils/format';
 import { shortId, displayId, taskRef, getBranchNameFromId } from '../../task/identity';
@@ -43,6 +44,7 @@ export async function commandRevert(args: string[]): Promise<void> {
 
   // Before the revert reason is typed: the daemon refuses a write it cannot
   // attribute, and a refusal must never cost the human what they wrote.
+  await refuseCreateInBoundClone('revert');
   await requireActorIdentity();
 
   const reasonFlag = parsed.flags.get('reason') as string | undefined;

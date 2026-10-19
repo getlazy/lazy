@@ -20,6 +20,7 @@ import type {
   AcceptGateWarning,
   MarkReadyOptions,
   OpenReview,
+  BranchReview,
   ReviewConversationItem,
   ReviewStatus,
 } from './driver';
@@ -29,13 +30,23 @@ import type { Task } from '../types';
 import { checkMergeConflicts, checkMergeConflictsIntoTarget, squashMergeTaskBranch, branchChangesAlreadyIn } from '../git/operations';
 import type { DestinationRestoreConflict } from '../git/operations';
 import { runGit } from '../utils/git';
+import { withRemoteRetry } from '../utils/retry';
+import { logger } from '../utils/logger';
+
+/** Set when task branches are mirrored to origin — see `src/remote/origin-mirror.ts`. */
+export interface LocalDriverOriginMirror {
+  remoteName: string;
+}
 
 export class LocalDriver implements RepositoryDriver {
   needsSync = false;
+  /** Non-null when task branches are pushed to and fetched from origin. */
+  readonly originMirror: LocalDriverOriginMirror | null;
   private driverContext?: DriverContext;
 
-  constructor(context?: DriverContext) {
+  constructor(context?: DriverContext, originMirror?: LocalDriverOriginMirror) {
     this.driverContext = context;
+    this.originMirror = originMirror ?? null;
   }
 
   async merge(opts: MergeOptions): Promise<MergeResult> {
@@ -120,13 +131,38 @@ export class LocalDriver implements RepositoryDriver {
     return { passed: true };
   }
 
-  async pushBranch(_branch: string): Promise<void> {
-    // No-op for local driver
+  async pushBranch(branch: string): Promise<void> {
+    const mirror = this.originMirror;
+    if (!mirror) return;
+    await withRemoteRetry(
+      async () => {
+        // Same shape as the forge drivers: no -u, so a task worktree never
+        // tracks its remote branch and `git pull` there cannot merge it.
+        const result = await runGit(['push', mirror.remoteName, branch]);
+        if (result.exitCode !== 0) {
+          throw new Error(`Failed to push branch ${branch} to ${mirror.remoteName}: ${result.stderr.trim()}`);
+        }
+        logger.debug(`Pushed branch ${branch} to ${mirror.remoteName}`);
+      },
+      `push ${branch} to ${mirror.remoteName}`,
+    );
   }
 
-  async fetchBranch(_branch: string, _worktreePath: string): Promise<boolean> {
-    // No-op for local driver — no remote to fetch from
-    return false;
+  async fetchBranch(branch: string, worktreePath: string): Promise<boolean> {
+    const mirror = this.originMirror;
+    if (!mirror) return false;
+    await withRemoteRetry(
+      async () => {
+        const result = await runGit(['fetch', mirror.remoteName, branch], worktreePath);
+        if (result.exitCode !== 0) {
+          throw new Error(`Failed to fetch branch ${branch} from ${mirror.remoteName}: ${result.stderr.trim()}`);
+        }
+      },
+      `fetch ${branch} from ${mirror.remoteName}`,
+    );
+    const ahead = await runGit(['rev-list', '--count', `HEAD..${mirror.remoteName}/${branch}`], worktreePath);
+    if (ahead.exitCode !== 0) return false;
+    return parseInt(ahead.stdout.trim(), 10) > 0;
   }
 
   async fastForwardLocal(_targetBranch: string, _root: string): Promise<{ success: boolean; warning?: string }> {
@@ -159,6 +195,10 @@ export class LocalDriver implements RepositoryDriver {
   }
 
   async findOpenReviewForBranch(_branch: string): Promise<OpenReview | null> {
+    return null;
+  }
+
+  async findReviewForBranch(_branch: string): Promise<BranchReview | null> {
     return null;
   }
 

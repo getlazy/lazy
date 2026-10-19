@@ -44,7 +44,11 @@ const CLAUDE_SUBSCRIPTION: HarnessUsageSource = {
   // the overall `unified` status.
   // Seen in a real capture on 2026-09-24 (see the header).
   // The bare `unified` window is the overall status-only one (a `rejected` there pauses).
-  pauseWindows: (windows) => windows.filter((w) => w.name === 'unified' || w.name.startsWith('unified-')),
+  // `unified-overage` is NOT a subscription window: it is the paid-overage
+  // budget, which an admin controls (and may have capped), so it being full or
+  // `rejected` says nothing about the 5h/7d windows turns actually run on.
+  pauseWindows: (windows) =>
+    windows.filter((w) => w.name === 'unified' || (w.name.startsWith('unified-') && w.name !== 'unified-overage')),
 };
 
 const CODEX_SUBSCRIPTION: HarnessUsageSource = {

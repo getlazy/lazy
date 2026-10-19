@@ -206,7 +206,7 @@ describe('daemon restart resilience', () => {
     const beforeIno = (await stat(stalePath)).ino;
 
     // Pin LAZY_CONFIG so this in-process daemon cannot adopt lazy's own
-    // lazy.toml (see CLAUDE.md). The API proxy is irrelevant here but is always
+    // lazy.toml (see AGENTS.md). The API proxy is irrelevant here but is always
     // on, so keep it on loopback with an OS-assigned port — the one posture
     // that binds nothing a container would refuse.
     const cfgFile = join(tmpDir, 'pinned-lazy.toml');

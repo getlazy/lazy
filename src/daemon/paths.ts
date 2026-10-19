@@ -1,9 +1,11 @@
 /**
  * Daemon file paths.
  *
- * All daemon state lives under ~/.lazy/daemon/<project-slug>/ — PID file,
+ * Runtime and persistent project state share ~/.lazy/daemon/<project-slug>/ — PID file,
  * bearer token, TCP port/host markers, and log file. Each project gets its own
  * daemon directory derived from the project root path.
+ * Housekeeping must use pruneDaemonRuntime's runtime-file allowlist, never
+ * recursively delete this directory: credentials outlive daemon processes.
  *
  * Directory naming: <last-dir-component>-<sha256(projectRoot).slice(0,8)>
  * e.g., /home/user/prg/workshop → ~/.lazy/daemon/workshop-a1b2c3d4/
@@ -69,6 +71,11 @@ export const MCP_CONFIG_DIR = 'mcp';
  * under `<project>/.lazy/` would be readable by every other task's agent.
  */
 export const TASK_ENV_FILE = 'task-env.json';
+/**
+ * Per-task secret FILES (`taskFiles` RPC), written into the task worktree at
+ * launch. See src/daemon/task-files.ts. Same placement rule as TASK_ENV_FILE.
+ */
+export const TASK_FILES_FILE = 'task-files.json';
 /**
  * Real per-user Anthropic credentials, written by the control plane over the
  * `putUserCredential` RPC. See src/daemon/user-credentials.ts. Same placement
@@ -182,6 +189,11 @@ export function getTaskEnvPath(projectRoot: string): string {
   return join(getDaemonDir(projectRoot), TASK_ENV_FILE);
 }
 
+/** Per-task secret-file registry: ~/.lazy/daemon/<slug>/task-files.json */
+export function getTaskFilesPath(projectRoot: string): string {
+  return join(getDaemonDir(projectRoot), TASK_FILES_FILE);
+}
+
 /** Per-user real credential store: ~/.lazy/daemon/<slug>/user-credentials.json */
 export function getUserCredentialsPath(projectRoot: string): string {
   return join(getDaemonDir(projectRoot), USER_CREDENTIALS_FILE);
@@ -287,4 +299,16 @@ export function getAdoptedImagePath(projectRoot: string): string {
  */
 export function getAdoptedDockerfilePath(projectRoot: string): string {
   return join(getDaemonDir(projectRoot), ADOPTED_DOCKERFILE_FILE);
+}
+
+/**
+ * The environment every NEW task starts with (`taskEnvSeed` RPC), pushed by a
+ * control plane. See src/daemon/task-env-seed.ts. Same placement rule as
+ * TASK_ENV_FILE: it holds secrets, so never under the project root.
+ */
+export const TASK_ENV_SEED_FILE = 'task-env-seed.json';
+
+/** New-task env seed: ~/.lazy/daemon/<slug>/task-env-seed.json */
+export function getTaskEnvSeedPath(projectRoot: string): string {
+  return join(getDaemonDir(projectRoot), TASK_ENV_SEED_FILE);
 }

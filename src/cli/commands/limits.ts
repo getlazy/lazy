@@ -85,7 +85,7 @@ export async function commandLimits(args: string[]): Promise<void> {
     ],
     'stats limits',
   );
-  const { readings } = await queryUsageLimits();
+  const { readings, credentialHealth } = await queryUsageLimits();
   // Which of them [usage_pause] is holding, and which it is armed for but
   // cannot act on — the daemon's answer, so these lines and the launch gate
   // cannot disagree.
@@ -96,7 +96,7 @@ export async function commandLimits(args: string[]): Promise<void> {
     // refusal while the saved readings cannot be read.
     let view;
     try {
-      view = projectUsageLimits(readings, pause);
+      view = projectUsageLimits(readings, pause, Date.now(), credentialHealth);
     } catch (err) {
       if (!(err instanceof UsageLimitsUnreadableError)) throw err;
       console.error(`Error: ${err.message}`);
@@ -109,6 +109,13 @@ export async function commandLimits(args: string[]): Promise<void> {
   // Said first: while it stands the readings below may be missing the one that matters.
   if (storeError) console.log(`${theme.warning('SAVED READINGS UNREADABLE:')} ${describeReadingsStoreError(storeError)}\n`);
   const now = Date.now();
+  // A credential that is FAILING is said first and whether or not it has a
+  // reading: a credential lazy cannot use never produces one.
+  for (const f of credentialHealth) {
+    console.log(`${theme.label(f.credential)}  ${theme.warning(f.unusable ? 'NOT USABLE' : `REJECTED (HTTP ${f.status})`)}`);
+    console.log(`  since ${new Date(f.failedAt).toISOString()}${f.profile ? ` · agent profile ${f.profile}` : ''}`);
+    if (f.error) console.log(`  ${dim(f.error)}`);
+  }
   // Armed credentials with no reading at all have no reading to hang the
   // warning on, so they are listed on their own.
   const unread = (coverage ?? []).filter(
@@ -119,7 +126,7 @@ export async function commandLimits(args: string[]): Promise<void> {
     console.log(`  ${theme.warning('ARMED, NO READING:')} ${describeNoReading(c)}`);
   }
   if (readings.length === 0) {
-    if (unread.length === 0 && !storeError) {
+    if (unread.length === 0 && !storeError && credentialHealth.length === 0) {
       console.log('No usage-limit readings yet. The proxy records them from model API responses;');
       console.log('they appear after the next proxied request.');
     }

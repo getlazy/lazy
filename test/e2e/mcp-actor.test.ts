@@ -14,7 +14,7 @@
  * — the channel — NOT who authored the content. A `lazy_unblock` that relays a
  * human's words is still actor='builder' because the builder pressed the button.
  * The human-feedback content itself is preserved verbatim in the turn; the actor
- * tag never gates persistence. (See CLAUDE.md: never lose human feedback.)
+ * tag never gates persistence. (See AGENTS.md: never lose human feedback.)
  */
 
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';

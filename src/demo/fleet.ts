@@ -49,13 +49,12 @@ export const DAEMON_IMAGE_ENV = 'LAZY_DAEMON_IMAGE';
  * at create time; its own default (`DEFAULT_MEMORY_MIB` in
  * lazy-teams/app/clients/smolvm_supervisor.rb) is repeated here so the demo
  * can SAY what a machine got without asking Rails, and a unit test keeps the
- * two numbers equal. Whether 4 GiB is enough for the daemon, dockerd, the
- * runner-image build and one agent container is a MEASUREMENT `lazy playground
- * status` now takes (`free -m` inside the guest); the default is not raised
- * without one.
+ * two numbers equal. The default was raised to 8 GiB (with 4 CPUs) on the
+ * engineer's call, 2026-10-10; `lazy playground status` still shows from inside
+ * the guest (`free -m`) how much of it is used.
  */
 export const MEMORY_MIB_ENV = 'LAZY_SMOLVM_MEMORY_MIB';
-export const DEFAULT_MACHINE_MEMORY_MIB = 4096;
+export const DEFAULT_MACHINE_MEMORY_MIB = 8192;
 /** Below this a turn cannot run at all (the supervisor's own note: a 2 GiB machine is used up by one turn). */
 export const MIN_MACHINE_MEMORY_MIB = 2048;
 /** What `SmolvmSupervisor` sets on every smolvm invocation; repeated here so the operator's shell agrees. */
@@ -383,7 +382,7 @@ export function parseGuestVitals(stdout: string): GuestVitals {
   };
 }
 
-/** `up 14m 3s — memory 238 of 3941 MiB used, 3703 available (budget 4096 MiB)`. */
+/** `up 14m 3s — memory 238 of 3941 MiB used, 3703 available (budget 8192 MiB)`. */
 export function formatGuestVitals(v: GuestVitals, budgetMib: number | null): string {
   const s = v.uptimeSeconds;
   const up = s >= 3600 ? `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m` : `${Math.floor(s / 60)}m ${s % 60}s`;

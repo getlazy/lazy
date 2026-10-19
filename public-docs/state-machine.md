@@ -43,16 +43,30 @@ would carry — and it disappears with the worktree. The end of a turn is where
 this happens most: the checks that close a turn ask the agent to update docs or
 a changelog, and writing the file and forgetting the commit is an easy miss.
 
-Three things make that visible rather than silent.
+Four things make that visible rather than silent.
 
-- **The agent is asked, once, before the turn closes.** When a turn that
-  declared itself done still has uncommitted paths, lazy puts them to the agent
-  by name and asks it to commit them or discard them. It is a question, not a
-  sweep: lazy never commits on an agent's behalf, because that would put content
-  nobody reviewed — scratch output, a half-finished edit, a key someone pasted
-  into the worktree — into the merge under the agent's name. A turn that parks
-  for input is not asked: an unfinished edit is normal there, the worktree
-  survives, and the next turn continues in it.
+- **The agent is asked, once, before the turn closes.** When a turn is about to
+  end with uncommitted paths, whether it declared itself done or parked for
+  input, lazy names them and asks the agent once whether it has committed all
+  its work — commit what belongs to the task, or say why it should stay
+  uncommitted. A turn that declared itself done is additionally asked to commit
+  or discard anything still loose, as its last check. These are questions, not
+  a sweep: lazy never commits on an agent's behalf, because that would put
+  content nobody reviewed — scratch output, a half-finished edit, a key someone
+  pasted into the worktree — into the merge under the agent's name. Read-only
+  turns are never asked.
+- **Stopped background work is asked about first.** If a turn ends while a
+  background command the agent started is still running, Claude Code stops
+  it. Lazy then asks the agent once, before the question about uncommitted
+  work, whether it needed that command to finish, naming the command. If it
+  did, it can run it again in the foreground; if not, it says so. Same rules:
+  once per turn, never on read-only turns, recorded on the task as a
+  "Stopped Background Work Check".
+- **Anything still loose is announced.** If the agent does not commit or
+  discard it (for example because it could not), the task gets an
+  "[Uncommitted work left behind]" comment naming the paths, which the agent
+  also receives on the next unblock, and a system message is filed so it is
+  seen without opening the task.
 - **The paths are on the turn record.** `lazy show` puts the count on the turn
   and lists the paths in `--full`; the web review page shows the same count on
   the turn, with the paths in the tooltip.
@@ -95,6 +109,8 @@ Lazy tasks can be in one of the following statuses:
 - **`submitted`** — The task's branch has an open pull/merge request waiting for review on the forge (`lazy submit`). It is a paused status like `blocked`: you can unblock it, review it, sync it, pair on it or accept it.
 
   **A sync or review puts `submitted` back when it ends.** Merging upstream into the branch and running a review both move the task through `working` for the duration of the turn, because each needs an agent — but neither changes where the task stands with its reviewer, so each restores the status it found. That keeps the task in the submitted view and keeps PR-comment reactions (which only run on `submitted` tasks) switched on. A sync that fails in a way lazy will not retry — a dead credential, a bad model id, anything it parks for you rather than resuming — restores `submitted` too. A crash lazy *will* retry, or an agent killed outright without reporting, goes to `interrupted` instead and is resumed: the merge may be half applied, so the task is picked back up rather than called done. The other exception is a decision the reviewer still owes on a protected file: pending violations make the task `conflict` regardless, because that label is what `lazy accept` gates on.
+
+  **A task finds its own PR/MR by its branch.** If lazy does not have a PR/MR on record for a task — because lazy stopped right after the forge created it, or because someone opened it by hand — the daemon's background sync looks the PR/MR up by the task's branch and acts on what it finds. An open PR/MR is recorded on the task, so its comments, its merge and its link work as usual. A PR/MR that was merged into the task's target completes the task, but only when everything on the task's branch is already in the target; otherwise the task stays open and a comment explains why. If the PR/MR was merged into some other branch, the task is left alone and an alert says so. A closed PR/MR found this way changes nothing. Each outcome is recorded as a comment on the task. When lazy opens a PR/MR itself, it first checks whether the branch already has an open one and adopts it instead of opening a second.
 - **`pairing`** — Human is working interactively with the task's agent, in the task's container (see [Pairing](pairing.md)). `--host` is an explicit opt-in for tasks that have no container.
 - **`interrupted`** — Agent crashed or was killed unexpectedly.
 - **`merging`** — A merge is in flight: either an accept is merging the branch locally right now, or the task's PR/MR has been handed to the forge and is waiting for CI and merge (a later `lazy accept` asks the forge what happened). The task reads `merging` for the whole merge phase. If an accept dies partway (daemon restart, crash), the daemon resumes it rather than undoing it — you already said accept.
@@ -669,7 +685,9 @@ that way).
 An agent that splits its work into subtasks drives them with blocking lazy
 tools — `lazy_wait` (wait until a subtask finishes its turn) and `lazy_ask`
 (ask a subtask's agent a question and wait for the answer). While blocked in one
-of those calls the parent agent is doing nothing, and lazy shows that instead of
+of those calls the parent agent is doing nothing. A `lazy_wait` also returns early,
+with an `interrupted` reason, when someone adds a subtask to the waiting task from
+outside, so the parent can react instead of mistaking it for a timeout. Lazy shows the wait instead of
 a plain `working(agent)`:
 
 ```
@@ -734,7 +752,7 @@ the task keeps its status.
 | `transient_overload` | 429, 529, 503, "overloaded" (a per-minute or short-window rate limit) | Retry indefinitely, 5s→60s |
 | `transient_network` | ECONNRESET, ETIMEDOUT, socket hang up, `fetch failed` | Retry indefinitely, 5s→60s |
 | `transient_unreachable` | ECONNREFUSED, ENOTFOUND | Retry 5s→60s, **bounded** at 12 attempts (~9 min), then stop |
-| `unknown` | anything unrecognized | Retry 15s→60s; the crash-loop detector still applies |
+| `unknown` | anything unrecognized | Retry 15s→60s, **bounded** at 6 attempts (~4 min) per turn; the crash-loop detector still applies |
 
 A failure lazy does not recognize is classed `unknown` rather than guessed at —
 wrongly calling a failure fatal would block a task that would have recovered.
@@ -749,7 +767,9 @@ roughly 60 retries an hour.
 
 The crash-loop detector (3 failures in a row, each under 10s) does **not** apply
 to transient classes: a 429 comes back in milliseconds, so three in a row would
-abort a turn that was about to succeed. It remains the bound for `unknown`.
+abort a turn that was about to succeed. It still applies to `unknown`, which
+is also capped at 6 attempts per turn so a slow, repeating failure cannot
+retry forever.
 
 `transient_unreachable` sits in between: a refused connection to a local proxy
 can heal if the proxy restarts, so it is retried generously, but not forever.
@@ -763,9 +783,9 @@ restarts `interrupted` tasks, so this is what keeps lazy from relaunching into a
 condition that will not clear, and puts the task in front of you with the reason
 attached.
 
-A crash loop is different: its class is always `unknown`, recorded for
-diagnosis only. The task goes to `interrupted` and is auto-resumed, because
-many crash-loop causes are transient.
+A crash loop, or an `unknown` failure that used up its 6 attempts, is
+different: its class is `unknown`, recorded for diagnosis only. The task goes
+to `interrupted` and is auto-resumed, because many such causes are transient.
 
 Conditions that never clear on their own are kept out of `unknown`. A Cursor
 plan quota spent or a spend limit reached is `fatal_auth`; Claude's `usage limit
@@ -886,7 +906,16 @@ redelivered.
 This applies to your initial task prompt, `lazy unblock` feedback, `lazy ask`
 questions, and PR comments and CI output delivered automatically. A comment made
 through lazy itself (`lazy comment`, the web UI, `lazy_comment`) is different:
-it never starts a turn, and reaches the agent with the next `lazy unblock`.
+it never starts a turn, and reaches the agent with the next `lazy unblock` —
+or, when it is written while the agent is still doing the turn's main work,
+before that turn ends: once the agent finishes, it is resumed in the same
+conversation with the comment, exactly as an unblock would have shown it. A
+comment written after that point — while lazy runs its end-of-turn steps, such
+as the commit check or the walkthrough — waits for your next unblock.
+Comments imported from a pull request keep their own delivery. Each such hand-off counts toward
+[`max_turns_without_human`](lazy-toml.md#limits); past it the comment waits for
+your unblock. Lazy's own notices (such as `[Subtask accepted]`) never keep a
+turn going on their own.
 `lazy ask` and `lazy sync` neither carry a comment nor use it up.
 
 ### Three crash scenarios

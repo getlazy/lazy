@@ -28,7 +28,7 @@
  *   (src/daemon/usage-pause.ts). Read by the callers that must tell it from a
  *   failure: a reparent whose follow-up sync was refused has still reparented.
  */
-export type RpcErrorCode = 'task_busy' | 'usage_paused';
+export type RpcErrorCode = 'task_busy' | 'usage_paused' | 'runner_image_not_ready';
 
 export class RpcError extends Error {
   constructor(public status: number, message: string, public code?: RpcErrorCode) {

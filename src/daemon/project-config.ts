@@ -25,14 +25,18 @@
  * control plane can restart the daemon for the user.
  */
 
-import { mkdir, readFile, rename, writeFile, rm } from 'fs/promises';
+import { lstat, mkdir, readFile, rename, writeFile, rm } from 'fs/promises';
+import { readConnections, type ConnectionsRead } from '../config/connection-consent';
 import { dirname, join } from 'path';
 import { randomBytes } from 'crypto';
-import { loadConfig, resolveConfigPath, resolveConfigText } from '../config/loader';
+import { loadConfig, resolveConfigSource, resolveConfigText } from '../config/loader';
+import { describeConfigFile, sha256Text, writeAppliedRecord, type ConfigInForce } from '../config/config-provenance';
 import { managedConfigPath, isManagedMode } from '../config/managed';
 import {
   editableConfigKeys,
   validateProjectConfigText,
+  profileSupport,
+  type ProfileSupport,
   RESTART_REQUIRED_SUMMARY,
   type ProjectConfigVerdict,
 } from '../config/project-config';
@@ -73,6 +77,13 @@ export interface ProjectConfigRead {
    * this process built no proxy to compare against.
    */
   restartPending: string[];
+  /**
+   * The file in force as it is on disk: path, the rule that chose it, a hash
+   * of its bytes and the control-plane version those bytes were applied from
+   * (null when none is recorded for them). Reported so a control plane shows
+   * what the daemon is ACTUALLY on, never infers it from its own bookkeeping.
+   */
+  inForce: ConfigInForce;
 }
 
 /** What the config in force needs a restart for, compared with the running proxy. */
@@ -99,7 +110,8 @@ async function readIfPresent(path: string): Promise<string | null> {
 
 export async function readProjectConfig(projectRoot: string): Promise<ProjectConfigRead> {
   const managedPath = managedConfigPath(projectRoot);
-  const inForce = await resolveConfigPath(projectRoot);
+  const source = await resolveConfigSource(projectRoot);
+  const inForce = source.path;
   const imported = managedPath !== null && inForce === managedPath;
   return {
     managed: isManagedMode(),
@@ -112,6 +124,7 @@ export async function readProjectConfig(projectRoot: string): Promise<ProjectCon
     restartRequiredKeys: RESTART_REQUIRED_SUMMARY,
     settings: settingsCatalog(),
     restartPending: await pendingRestart(projectRoot),
+    inForce: await describeConfigFile(source.path, source.rule),
   };
 }
 
@@ -126,6 +139,8 @@ function requireToml(toml: unknown): string {
 export interface ProjectConfigCheck extends ProjectConfigVerdict {
   /** What the candidate sets, per key, as display text. */
   values: Record<string, string>;
+  /** Every profile the text defines, and whether this installation can use it. */
+  profiles: ProfileSupport[];
   /** Per-key changes from `before`, with when each takes effect — only when `before` was sent. */
   changes?: SettingChange[];
 }
@@ -134,9 +149,15 @@ export interface ProjectConfigCheck extends ProjectConfigVerdict {
  * The daemon's verdict on candidate text, plus what it sets and — given the
  * version it would replace — what changes and when each change is picked up.
  */
-export function validateProjectConfig(toml: unknown, before?: unknown): ProjectConfigCheck {
+export function validateProjectConfig(toml: unknown, before?: unknown, rawOrigin?: unknown, rawBeforeOrigin?: unknown): ProjectConfigCheck {
   const text = requireToml(toml);
-  const check: ProjectConfigCheck = { ...validateProjectConfigText(text), values: settingValues(text) };
+  const origin = rawOrigin === 'repository' ? 'repository' as const : 'control-plane' as const;
+  const keptOrigin = rawBeforeOrigin === 'repository' ? 'repository' as const : 'control-plane' as const;
+  // What the saved version already carries is kept, not refused again: an
+  // imported file is stored verbatim and its withheld settings are reported, not
+  // a reason to refuse an unrelated edit.
+  const kept = typeof before === 'string' ? before : null;
+  const check: ProjectConfigCheck = { ...validateProjectConfigText(text, { kept, origin, keptOrigin }), values: settingValues(text), profiles: profileSupport(text, origin) };
   if (before !== undefined && before !== null) {
     // Omitted when either text does not parse: nothing can be said about what it sets.
     const changes = describeConfigChange(requireToml(before), text);
@@ -176,10 +197,36 @@ export interface ProjectConfigApplied {
   /** Changed keys that take effect only after a daemon restart. */
   restartRequired: string[];
   path: string | null;
+  /** sha256 of the text now in the file; null when nothing was applied. */
+  sha256: string | null;
 }
 
-export async function applyProjectConfig(projectRoot: string, rawToml: unknown): Promise<ProjectConfigApplied> {
+/**
+ * `version` is the control plane's number for this text. It is recorded beside
+ * the file with the text's hash (../config/config-provenance), so
+ * `readProjectConfig` and `lazy daemon status` can say which version the daemon
+ * is on. Optional: a control plane that sends none gets a file reported with no
+ * version, which is the truth.
+ */
+export async function applyProjectConfig(
+  projectRoot: string,
+  rawToml: unknown,
+  rawVersion?: unknown,
+  rawOrigin?: unknown,
+): Promise<ProjectConfigApplied> {
   const toml = requireToml(rawToml);
+  // Whose text this is (src/config/config-provenance.ts `controlPlaneTextOrigin`):
+  // only an owner's own edit is `control-plane`. An import is the repository's,
+  // and so is anything a caller does not label.
+  if (rawOrigin !== undefined && rawOrigin !== null && rawOrigin !== 'repository' && rawOrigin !== 'control-plane') {
+    throw new RpcError(400, 'origin must be "repository" or "control-plane"');
+  }
+  const origin = rawOrigin === 'control-plane' ? 'control-plane' : 'repository';
+  if (rawVersion !== undefined && rawVersion !== null
+    && !(typeof rawVersion === 'number' && Number.isInteger(rawVersion) && rawVersion > 0)) {
+    throw new RpcError(400, 'version must be a positive integer');
+  }
+  const version = typeof rawVersion === 'number' ? rawVersion : null;
   const path = managedConfigPath(projectRoot);
   if (!path) {
     throw new RpcError(
@@ -189,8 +236,12 @@ export async function applyProjectConfig(projectRoot: string, rawToml: unknown):
     );
   }
 
-  const verdict = validateProjectConfigText(toml);
-  if (!verdict.ok) return { applied: false, changed: false, verdict, restartRequired: [], path };
+  // Applying is not authoring: the control plane already judged an edit, and an
+  // IMPORT is verbatim. A setting the managed rules refuse is withheld when the
+  // daemon loads the file (src/config/managed-withhold.ts), so the only thing
+  // that refuses an apply is text the daemon could not run on at all.
+  const verdict = validateProjectConfigText(toml, { kept: toml, origin });
+  if (!verdict.ok) return { applied: false, changed: false, verdict, restartRequired: [], path, sha256: null };
 
   // Compared with what the RUNNING proxy was built from, not with the previous
   // file: a restart owed by an earlier save and never performed stays owed.
@@ -200,8 +251,21 @@ export async function applyProjectConfig(projectRoot: string, rawToml: unknown):
   const restartRequired = proxyDifferences(base,
     proxyFingerprint(projectRoot, resolveConfigText(toml, path, { install: false })));
 
+  const sha256 = sha256Text(toml);
+  // Written AFTER the file, so a record never names bytes that are not there;
+  // a crash between the two leaves a file reported with no version, not a wrong one.
+  const record = async () => {
+    // Always written: the record is what tells the loader whose rules these
+    // bytes are judged by. With no version, the version is 0 (none recorded).
+    await writeAppliedRecord(path, { version: version ?? 0, sha256, appliedAt: new Date().toISOString(), origin });
+  };
   const current = await readIfPresent(path);
-  if (current === toml) return { applied: true, changed: false, verdict, restartRequired, path };
+  if (current === toml) {
+    // Same bytes, possibly under a new version number (a save that went back
+    // to an earlier text): the record follows the version.
+    await record();
+    return { applied: true, changed: false, verdict, restartRequired, path, sha256 };
+  }
 
   // Atomic: a sibling temp file renamed over the target, so a reader sees the
   // old file or the new one and never half of either.
@@ -215,5 +279,38 @@ export async function applyProjectConfig(projectRoot: string, rawToml: unknown):
     throw new Error(`failed to write the project config to ${path}: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  return { applied: true, changed: true, verdict, restartRequired, path };
+  await record();
+  return { applied: true, changed: true, verdict, restartRequired, path, sha256 };
+}
+
+/**
+ * The endpoints and agent profiles `toml` defines, judged by `origin`'s rules,
+ * with what a project admin's confirmation would make usable and the blocks
+ * only the repository's lazy.toml has (../config/connection-consent). Writes
+ * nothing: confirming is the control plane recording a version judged by its
+ * own rules, through `applyProjectConfig`, naming who confirmed.
+ */
+export async function readProjectConnections(projectRoot: string, rawToml: unknown, rawOrigin: unknown): Promise<ConnectionsRead & { blockedBy: ProjectConfigVerdict['issues'] }> {
+  const toml = requireToml(rawToml);
+  if (rawOrigin !== 'repository' && rawOrigin !== 'control-plane') {
+    throw new RpcError(400, 'origin must be "repository" or "control-plane"');
+  }
+  const read = readConnections(toml, rawOrigin, await readRegularFile(join(projectRoot, 'lazy.toml')));
+  // Judged exactly as the confirmation will be, so a Confirm that would be
+  // refused is never offered: its errors are listed instead.
+  const copied = read.fromRepository.toml;
+  const draft = copied ? `${toml.trimEnd()}\n\n${copied}` : toml;
+  const verdict = validateProjectConfigText(draft, { kept: toml, origin: 'control-plane', keptOrigin: rawOrigin });
+  return { ...read, blockedBy: verdict.issues.filter((i) => i.severity === 'error') };
+}
+
+/** A regular file's text, or null: the repository is untrusted, and a symlink to a FIFO would hang the read. */
+async function readRegularFile(path: string): Promise<string | null> {
+  try {
+    if (!(await lstat(path)).isFile()) return null;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
+  }
+  return readIfPresent(path);
 }

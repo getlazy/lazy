@@ -122,7 +122,7 @@ describe('merge-conflict detection', () => {
   });
 
   test('an error (bad ref) throws rather than being reported as a conflict', async () => {
-    // Per CLAUDE.md: fail hard on git errors — do not silently treat them as
+    // Per AGENTS.md: fail hard on git errors — do not silently treat them as
     // "conflict" (blocks a mergeable branch) or "no conflict" (waves through an
     // unmergeable one).
     await expect(checkMergeConflictsIntoTarget('does-not-exist', 'main', dir)).rejects.toThrow();

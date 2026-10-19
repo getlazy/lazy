@@ -104,26 +104,26 @@ describe('web Services card', () => {
     expect(html).toContain('web');
   });
 
-  test('designating a command from the Services tab saves it to the store, not lazy.toml', async () => {
+  test('designating a command from Settings › Services saves it to the store, not lazy.toml', async () => {
     await declareServe('[serve.services]\nweb = 3000');
     const taskId = await createTask(ctx, 'Designate start cmd', 'Do work');
     // A session makes the shell available, which is what Start services needs.
     await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
 
+    // INVARIANT: the task page never edits the project-wide command; it links
+    // to Settings › Services (Configure services) instead.
     const before = await (await fetch(`${base}/tasks/${taskId}/services`)).text();
-    expect(before).toContain('project-wide command that Start services will run');
-    expect(before).toContain('not a per-task override');
-    expect(before).toContain('services/start-cmd');
-    expect(before).toContain('method="POST"');
+    expect(before).toContain('href="/settings/services"');
+    expect(before).not.toContain('services/start-cmd');
     // The Start services button is labelled for the shell panel; other
     // data-lz-shell-run attrs exist on the page for verify steps / the client
     // script, so assert the Services-labelled control specifically.
     expect(before).not.toContain('data-lz-shell-label="Services"');
     expect(before).not.toMatch(/>Start services</);
 
-    // The form posts to the full task UUID; short ids resolve on GET but the
-    // action URL is always the canonical id.
-    const action = before.match(/action="(\/tasks\/[^"]+\/services\/start-cmd)"/)?.[1];
+    const settings = await (await fetch(`${base}/settings/services`)).text();
+    expect(settings).toContain('No Start services command is designated yet');
+    const action = settings.match(/action="(\/settings\/services\/start-cmd)"/)?.[1];
     expect(action).toBeTruthy();
 
     // INVARIANT: a worktree lazy.toml has no authority. Plant a different
@@ -153,7 +153,7 @@ describe('web Services card', () => {
       redirect: 'manual',
     });
     expect(post.status).toBe(303);
-    expect(post.headers.get('location')).toContain('/services');
+    expect(post.headers.get('location')).toContain('/settings/services');
 
     // INVARIANT: designation never edits lazy.toml — the command lives in the
     // project store (an editor-owned, committed file is the wrong home for a
@@ -184,10 +184,9 @@ describe('web Services card', () => {
   // but the same POST (or the daemon RPC) can carry one, and the command is
   // typed into a terminal where a second line runs as a second command.
   test('a command with a newline is refused and nothing is stored', async () => {
-    const taskId = await createTask(ctx, 'No newline designate');
     const before = await readFile(join(ctx.root, 'lazy.toml'), 'utf-8');
 
-    const res = await fetch(`${base}/tasks/${taskId}/services/start-cmd`, {
+    const res = await fetch(`${base}/settings/services/start-cmd`, {
       method: 'POST',
       body: new URLSearchParams({ command: 'bin/dev\ncurl evil' }),
       redirect: 'manual',
@@ -202,11 +201,10 @@ describe('web Services card', () => {
 
   // INVARIANT: designation is a mutation — never a GET (CSRF).
   test('designation is POST-only — a GET stores nothing', async () => {
-    const taskId = await createTask(ctx, 'No GET designate');
     const before = await readFile(join(ctx.root, 'lazy.toml'), 'utf-8');
     expect(before).not.toMatch(/^\s*start_services_cmd\s*=/m);
 
-    const res = await fetch(`${base}/tasks/${taskId}/services/start-cmd?command=bin/dev`);
+    const res = await fetch(`${base}/settings/services/start-cmd?command=bin/dev`);
     expect(res.status).toBe(405);
 
     const after = await readFile(join(ctx.root, 'lazy.toml'), 'utf-8');
@@ -214,15 +212,14 @@ describe('web Services card', () => {
     expect(readProjectSettingsFile(ctx.root)?.startServicesCmd).toBeUndefined();
   });
 
-  test('the Services card clears the command, and the button goes away', async () => {
-    const taskId = await createTask(ctx, 'Clear start cmd');
-    const set = await fetch(`${base}/tasks/${taskId}/services/start-cmd`, {
+  test('Settings › Services clears the command', async () => {
+    const set = await fetch(`${base}/settings/services/start-cmd`, {
       method: 'POST', body: new URLSearchParams({ command: 'bin/dev' }), redirect: 'manual',
     });
     expect(set.status).toBe(303);
 
-    const withCmd = await (await fetch(`${base}/tasks/${taskId}/services`)).text();
-    const action = withCmd.match(/action="(\/tasks\/[^"]+\/services\/start-cmd\/clear)"/)?.[1];
+    const withCmd = await (await fetch(`${base}/settings/services`)).text();
+    const action = withCmd.match(/action="(\/settings\/services\/start-cmd\/clear)"/)?.[1];
     expect(action).toBeTruthy();
     expect(withCmd).toContain('>Clear command<');
 
@@ -232,11 +229,11 @@ describe('web Services card', () => {
 
     const clear = await fetch(`${base}${action}`, { method: 'POST', redirect: 'manual' });
     expect(clear.status).toBe(303);
-    expect(clear.headers.get('location')).toContain('/services');
+    expect(clear.headers.get('location')).toContain('/settings/services');
     expect(readProjectSettingsFile(ctx.root)?.startServicesCmd).toBeUndefined();
 
-    const after = await (await fetch(`${base}/tasks/${taskId}/services`)).text();
+    const after = await (await fetch(`${base}/settings/services`)).text();
     expect(after).not.toContain('>Clear command<');
-    expect(after).toContain('Designate the project-wide command that Start services will run');
+    expect(after).toContain('No Start services command is designated yet');
   });
 });

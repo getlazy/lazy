@@ -9,6 +9,7 @@
  * - task comments (`lazy comment`, the web Comments tab) past the delivery
  *   cutoff (`buildNotesState`) whose actor is a human — or unrecorded, which
  *   is how comments were written before actors were;
+ * - withheld turns: feedback saved by a refused unblock, not yet delivered;
  * - web-review comments still `pending_delivery` (those are human by
  *   construction — `isPendingDelivery` requires it; the caller counts them).
  *
@@ -59,7 +60,16 @@ export function queuedHumanFeedbackCount(input: {
   pendingReviewComments: number;
 }): number {
   const queued = new Set(buildNotesState(input.session, input.turns, input.comments).queued_ids);
-  return countQueuedHumanFeedback(input.comments.filter((c) => queued.has(c.id)), input.pendingReviewComments);
+  return countQueuedHumanFeedback(input.comments.filter((c) => queued.has(c.id)), input.pendingReviewComments)
+    + countWithheldFeedbackTurns(input.turns);
+}
+
+/**
+ * Words saved while a launch was refused for a missing credential
+ * (`feedback_withheld`); the flag is cleared when an unblock delivers them.
+ */
+export function countWithheldFeedbackTurns(turns: readonly Turn[]): number {
+  return turns.filter((t) => t.role === 'human' && t.feedback_withheld === true).length;
 }
 
 /**
@@ -67,8 +77,8 @@ export function queuedHumanFeedbackCount(input: {
  * comments are queued through `buildNotesState` (the task page does, to list
  * them): the human-written ones, plus the queued web-review comments.
  */
-export function countQueuedHumanFeedback(queuedTaskComments: readonly Comment[], pendingReviewComments: number): number {
-  return queuedTaskComments.filter(isHumanFeedbackComment).length + pendingReviewComments;
+export function countQueuedHumanFeedback(queuedTaskComments: readonly Comment[], pendingReviewComments: number, withheldTurns = 0): number {
+  return queuedTaskComments.filter(isHumanFeedbackComment).length + pendingReviewComments + withheldTurns;
 }
 
 /**

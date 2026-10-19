@@ -49,6 +49,19 @@ describe('evaluateUsagePause', () => {
     expect(evaluateUsagePause(r, claude.pauseWindows, 0, NOW)).toBeNull();
   });
 
+  // INVARIANT: the paid-overage window never pauses. Admins own the overage
+  // budget; a full one says nothing about the 5h/7d windows turns run on.
+  test('a full or rejected overage window does not pause', () => {
+    const r = reading({
+      'anthropic-ratelimit-unified-5h-utilization': '0.10',
+      'anthropic-ratelimit-unified-5h-reset': inSeconds(600),
+      'anthropic-ratelimit-unified-overage-utilization': '9.81',
+      'anthropic-ratelimit-unified-overage-status': 'rejected',
+      'anthropic-ratelimit-unified-overage-reset': inSeconds(600),
+    });
+    expect(evaluateUsagePause(r, claude.pauseWindows, 95, NOW)).toBeNull();
+  });
+
   test('below the threshold: not paused', () => {
     const r = reading({ 'anthropic-ratelimit-unified-5h-utilization': '0.80', 'anthropic-ratelimit-unified-5h-reset': inSeconds(600) });
     expect(evaluateUsagePause(r, claude.pauseWindows, 95, NOW)).toBeNull();

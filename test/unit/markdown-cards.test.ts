@@ -197,7 +197,8 @@ describe('task page turns', () => {
     expect(html).toContain('<th>Check</th>');
     expect(html).toContain('<th style="text-align: center">Result</th>');
     expect(html).toContain('<td>typecheck</td>');
-    expect(html).not.toContain('| Check | Result |');
+    // The Copy button legitimately carries the SOURCE in its data attribute; the rendered body must not.
+    expect(html.replace(/data-copy-md="[^"]*"/g, '')).not.toContain('| Check | Result |');
   });
 });
 

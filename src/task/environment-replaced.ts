@@ -5,9 +5,6 @@
  * whatever it installed or upgraded outside the worktree last turn is still
  * there. Lazy sometimes takes that container away between turns:
  *
- *   - a member entered the task through a Teams terminal, which STOPS the
- *     task's container (src/daemon/member-entry.ts), so the next turn gets a
- *     fresh one;
  *   - a turn's credential is a different kind than the running container was
  *     launched with, the task's agent changed, or its per-task variables
  *     (`lazy env`) changed — all fix the launch env at create time, so the
@@ -34,8 +31,6 @@ import environmentReplacedTemplate from '../prompts/environment-replaced.md' wit
 /** Task metadata key holding the pending reasons (newline-free, "; "-joined). */
 export const ENVIRONMENT_REPLACED_KEY = 'environment_replaced';
 
-/** Reason: a member worked in the task through a terminal. */
-export const REASON_MEMBER_ENTERED = 'a member worked in this task through a terminal';
 /** Reason: the turn's credential needs a different launch environment. */
 export const REASON_CREDENTIAL_CHANGED = "the credential this task's turns run on changed";
 /** Reason: the task was switched to a different agent. */

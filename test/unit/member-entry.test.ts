@@ -42,7 +42,6 @@ const noBinding = async () => null;
 const liveBinding = async () => ({ revokedAt: null });
 // The task's own container is stopped by the entry; these tests are about the
 // exclusion, so there is none to stop (the stop has its own tests below).
-const noStop = async () => {};
 
 afterEach(() => resetMemberTerminalsForTests());
 
@@ -51,7 +50,7 @@ describe('a member entering a task', () => {
     expect(claimMemberTerminal('task-1', ALICE).ok).toBe(true);
     const entered = await enterTaskAsMember({
       projectRoot: '/p', storage: fakeStorage({ id: 'task-1', status: 'blocked' }), taskId: 'task-1', email: ALICE,
-      deps: { bindingFor: noBinding, stopTaskContainer: noStop },
+      deps: { bindingFor: noBinding },
     });
     expect(entered).toEqual({ ok: true });
     expect(memberInsideTask('task-1')).toBe(ALICE);
@@ -65,7 +64,7 @@ describe('a member entering a task', () => {
       expect(claimMemberTerminal('task-2', ALICE).ok).toBe(true);
       const refused = await enterTaskAsMember({
         projectRoot: '/p', storage: fakeStorage({ id: 'task-2', status }), taskId: 'task-2', email: ALICE,
-        deps: { bindingFor, stopTaskContainer: noStop },
+        deps: { bindingFor },
       });
       expect(refused).toMatchObject({ ok: false, status: 409 });
       expect(memberInsideTask('task-2')).toBeNull();
@@ -79,7 +78,7 @@ describe('a member entering a task', () => {
       [fakeStorage({ id: 'task-3', status: 'blocked' }, { session: false }), 'not run a turn'],
     ] as const) {
       expect(claimMemberTerminal('task-3', ALICE).ok).toBe(true);
-      const refused = await enterTaskAsMember({ projectRoot: '/p', storage, taskId: 'task-3', email: ALICE, deps: { bindingFor: noBinding, stopTaskContainer: noStop } });
+      const refused = await enterTaskAsMember({ projectRoot: '/p', storage, taskId: 'task-3', email: ALICE, deps: { bindingFor: noBinding } });
       expect(refused).toMatchObject({ ok: false, status: 409 });
       if (!refused.ok) expect(refused.message).toContain(why);
       expect(memberInsideTask('task-3')).toBeNull();
@@ -111,7 +110,7 @@ describe('a turn launching while a member is inside', () => {
     expect(claimMemberTerminal(taskId, ALICE).ok).toBe(true);
     const entered = await enterTaskAsMember({
       projectRoot: root, storage: fakeStorage({ id: taskId, status: 'blocked' }), taskId, email: ALICE,
-      deps: { bindingFor: noBinding, stopTaskContainer: noStop },
+      deps: { bindingFor: noBinding },
     });
     expect(entered.ok).toBe(true);
     await memberTerminalContainer(taskId, ALICE, async () => ({ name: 'lazymember-x', binary: 'docker', remove: async () => {} }), async () => true);
@@ -170,7 +169,7 @@ describe('other worktree writers while a member is inside', () => {
   test('a sync is refused for a person and queued for the automations', async () => {
     const { standDownForMember } = await import('../../src/daemon/task-lifecycle');
     expect(claimMemberTerminal('task-8', ALICE).ok).toBe(true);
-    await enterTaskAsMember({ projectRoot: '/p', storage: fakeStorage({ id: 'task-8', status: 'blocked' }), taskId: 'task-8', email: ALICE, deps: { bindingFor: noBinding, stopTaskContainer: noStop } });
+    await enterTaskAsMember({ projectRoot: '/p', storage: fakeStorage({ id: 'task-8', status: 'blocked' }), taskId: 'task-8', email: ALICE, deps: { bindingFor: noBinding } });
     const queued: string[] = [];
     const storage = { incrementTaskPendingSync: async (id: string) => { queued.push(id); } };
     await expect(standDownForMember(storage, { id: 'task-8' }, {})).rejects.toThrow(ALICE);
@@ -183,91 +182,63 @@ describe('other worktree writers while a member is inside', () => {
   test('a reject or close is refused while a member is in, and keeps members out while it runs', async () => {
     const { beginWorktreeTeardown } = await import('../../src/daemon/member-entry');
     expect(claimMemberTerminal('task-9', ALICE).ok).toBe(true);
-    await enterTaskAsMember({ projectRoot: '/p', storage: fakeStorage({ id: 'task-9', status: 'blocked' }), taskId: 'task-9', email: ALICE, deps: { bindingFor: noBinding, stopTaskContainer: noStop } });
+    await enterTaskAsMember({ projectRoot: '/p', storage: fakeStorage({ id: 'task-9', status: 'blocked' }), taskId: 'task-9', email: ALICE, deps: { bindingFor: noBinding } });
     await expect(beginWorktreeTeardown('task-9')).rejects.toThrow(ALICE);
 
     const release = await beginWorktreeTeardown('task-10');
     expect(claimMemberTerminal('task-10', ALICE).ok).toBe(true);
-    const during = await enterTaskAsMember({ projectRoot: '/p', storage: fakeStorage({ id: 'task-10', status: 'blocked' }), taskId: 'task-10', email: ALICE, deps: { bindingFor: noBinding, stopTaskContainer: noStop } });
+    const during = await enterTaskAsMember({ projectRoot: '/p', storage: fakeStorage({ id: 'task-10', status: 'blocked' }), taskId: 'task-10', email: ALICE, deps: { bindingFor: noBinding } });
     expect(during).toMatchObject({ ok: false, status: 409 });
     release();
-    const after = await enterTaskAsMember({ projectRoot: '/p', storage: fakeStorage({ id: 'task-10', status: 'blocked' }), taskId: 'task-10', email: ALICE, deps: { bindingFor: noBinding, stopTaskContainer: noStop } });
+    const after = await enterTaskAsMember({ projectRoot: '/p', storage: fakeStorage({ id: 'task-10', status: 'blocked' }), taskId: 'task-10', email: ALICE, deps: { bindingFor: noBinding } });
     expect(after.ok).toBe(true);
   });
 
   for (const status of ['merging', 'complete', 'abandoned']) {
     test(`a ${status} task cannot be entered`, async () => {
       expect(claimMemberTerminal('task-11', ALICE).ok).toBe(true);
-      const r = await enterTaskAsMember({ projectRoot: '/p', storage: fakeStorage({ id: 'task-11', status }), taskId: 'task-11', email: ALICE, deps: { bindingFor: noBinding, stopTaskContainer: noStop } });
+      const r = await enterTaskAsMember({ projectRoot: '/p', storage: fakeStorage({ id: 'task-11', status }), taskId: 'task-11', email: ALICE, deps: { bindingFor: noBinding } });
       expect(r).toMatchObject({ ok: false, status: 409 });
       expect(memberInsideTask('task-11')).toBeNull();
     });
   }
 });
 
-// INVARIANT: no process of a turn runs beside a member. The entry stops the
-// task's own container — inside the lifecycle lock, before the hold is marked
-// entered (so before the member's container is started) — and a stop that
-// fails refuses the entry. A process a turn left running there could otherwise
-// rewrite the worktree's git pointers after the member's launch checked them.
+// INVARIANT: a member's entry never stops the task's own container (engineer's
+// decision on raised item f1219a6f, 2026-10-05, replacing "the entry stops it").
+// That container holds the task's SHARED services, which every member sees and
+// controls and which must keep running while members work. Everything in it is
+// suspect and contained; the boundary that matters (container -> daemon/host)
+// is enforced by read-only git mounts and pointer validation, not by stopping it.
 describe("the task's own container on a member's entry", () => {
-  test('is stopped under the lock, before the member is inside', async () => {
-    const { isTaskLifecycleLocked } = await import('../../src/daemon/task-lifecycle-lock');
-    const seen: Array<{ locked: boolean; inside: string | null }> = [];
-    expect(claimMemberTerminal('task-12', ALICE).ok).toBe(true);
-    const entered = await enterTaskAsMember({
-      projectRoot: '/p', storage: fakeStorage({ id: 'task-12', status: 'blocked' }), taskId: 'task-12', email: ALICE,
-      deps: {
-        bindingFor: noBinding,
-        stopTaskContainer: async () => { seen.push({ locked: isTaskLifecycleLocked('task-12'), inside: memberInsideTask('task-12') }); },
-      },
-    });
-    expect(entered.ok).toBe(true);
-    expect(seen).toEqual([{ locked: true, inside: null }]);
-    expect(memberInsideTask('task-12')).toBe(ALICE);
-  });
-
-  test('a stop that fails refuses the entry, and keeps no turn out', async () => {
-    expect(claimMemberTerminal('task-13', ALICE).ok).toBe(true);
-    const refused = await enterTaskAsMember({
-      projectRoot: '/p', storage: fakeStorage({ id: 'task-13', status: 'blocked' }), taskId: 'task-13', email: ALICE,
-      deps: { bindingFor: noBinding, stopTaskContainer: async () => { throw new Error('docker kill failed'); } },
-    });
-    expect(refused).toMatchObject({ ok: false, status: 503 });
-    expect(memberInsideTask('task-13')).toBeNull();
-  });
-
-  test('stopTaskContainerForMember stops a running run and confirms it', async () => {
-    const { stopTaskContainerForMember } = await import('../../src/daemon/member-entry');
+  test('is left running: the entry never asks the runtime to stop anything', async () => {
     const runnerModule = await import('../../src/runner');
-    const calls: string[] = [];
-    let running = true;
-    let sandboxed = true;
-    const fakeRunner = {
-      usesSandbox: () => sandboxed,
-      runNameForTask: (ref: string) => `lazy-${ref}`,
-      isRunning: async (n: string) => { calls.push(`isRunning:${n}`); return running; },
-      stopRun: async (n: string) => { calls.push(`stop:${n}`); running = false; return true; },
-    };
     const { spyOn } = await import('bun:test');
-    const spy = spyOn(runnerModule, 'createRunner').mockResolvedValue(fakeRunner as never);
+    const calls: string[] = [];
+    const spy = spyOn(runnerModule, 'createRunner').mockResolvedValue({
+      usesSandbox: () => true,
+      runNameForTask: (ref: string) => `lazy-${ref}`,
+      isRunning: async () => true,
+      stopRun: async (n: string) => { calls.push(`stop:${n}`); return true; },
+      removeRun: async (n: string) => { calls.push(`remove:${n}`); },
+    } as never);
     try {
-      const task = { id: 'task-14', runner_type: null, metadata: { task_ref: 'ref' } } as never;
-      expect(await stopTaskContainerForMember('/p', task, { container_name: 'lazy-c', runner_type: 'docker' } as never)).toBe(true);
-      expect(calls).toEqual(['isRunning:lazy-c', 'stop:lazy-c', 'isRunning:lazy-c']);
-      // INVARIANT: a stopped host-process run reports false — its environment
-      // is the host, so the agent must not be told it was replaced.
-      running = true;
-      sandboxed = false;
-      expect(await stopTaskContainerForMember('/p', task, { container_name: 'lazy-c', runner_type: 'host-process' } as never)).toBe(false);
-      sandboxed = true;
-      // A runtime that says it stopped it while it is still up: refused.
-      running = true;
-      fakeRunner.stopRun = async (n: string) => { calls.push(`stop:${n}`); return true; };
-      await expect(stopTaskContainerForMember('/p', task, { container_name: 'lazy-c', runner_type: 'docker' } as never)).rejects.toThrow('could not be stopped');
+      expect(claimMemberTerminal('task-12', ALICE).ok).toBe(true);
+      const entered = await enterTaskAsMember({
+        projectRoot: '/p', storage: fakeStorage({ id: 'task-12', status: 'blocked' }), taskId: 'task-12', email: ALICE,
+        deps: { bindingFor: noBinding },
+      });
+      expect(entered.ok).toBe(true);
+      expect(memberInsideTask('task-12')).toBe(ALICE);
+      expect(calls).toEqual([]);
     } finally {
       spy.mockRestore();
     }
+  });
+
+  test('the entry module no longer carries a stop at all', async () => {
+    const mod = await import('../../src/daemon/member-entry');
+    expect('stopTaskContainerForMember' in mod).toBe(false);
   });
 });
 
@@ -278,7 +249,7 @@ test('overlapping worktree claims keep members out until the last is released', 
   const { beginWorktreeTeardown } = await import('../../src/daemon/member-entry');
   const enter = () => enterTaskAsMember({
     projectRoot: '/p', storage: fakeStorage({ id: 'task-15', status: 'blocked' }), taskId: 'task-15', email: ALICE,
-    deps: { bindingFor: noBinding, stopTaskContainer: noStop },
+    deps: { bindingFor: noBinding },
   });
   const first = await beginWorktreeTeardown('task-15');
   const second = await beginWorktreeTeardown('task-15');
@@ -293,11 +264,12 @@ test('overlapping worktree claims keep members out until the last is released', 
 });
 
 // INVARIANT (engineer rule): the daemon never acts on a task before the
-// supervisor has returned control, and stopping the task's container is
+// supervisor has returned control, and letting a member into the worktree is
 // acting on it. A parked status is not that handback: an `interrupted` task
 // whose supervisor survived a restart, or a turn whose response.json nobody has
 // settled yet, reads as parked. The entry asks supervisorStillOwnsTurn inside
-// the lock, and refuses — retryably — instead of killing the supervisor's work.
+// the lock, and refuses — retryably — rather than let a member into a worktree
+// the supervisor's post-turn phases are still writing.
 describe("a member's entry while the supervisor still owns the last turn", () => {
   let base: string;
   let unpin: () => void;
@@ -310,33 +282,31 @@ describe("a member's entry while the supervisor still owns the last turn", () =>
     await rm(base, { recursive: true, force: true });
   });
 
-  async function enter(taskId: string, status: string, stops: string[]) {
+  async function enter(taskId: string, status: string) {
     expect(claimMemberTerminal(taskId, ALICE).ok).toBe(true);
     return enterTaskAsMember({
       projectRoot: base, storage: fakeStorage({ id: taskId, status }), taskId, email: ALICE,
-      deps: { bindingFor: noBinding, stopTaskContainer: async () => { stops.push(taskId); } },
+      deps: { bindingFor: noBinding },
     });
   }
 
-  test('an unsettled response.json refuses the entry and stops nothing', async () => {
+  test('an unsettled response.json refuses the entry', async () => {
     const { protocolDir } = await import('../../src/protocol');
     const { mkdir, writeFile } = await import('fs/promises');
     const dir = protocolDir('task-16');
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, 'response.json'), '{}');
-    const stops: string[] = [];
-    const r = await enter('task-16', 'blocked', stops);
+    const r = await enter('task-16', 'blocked');
     expect(r).toMatchObject({ ok: false, status: 409 });
     if (!r.ok) {
       expect(r.message).toBe('The agent is still finishing its last turn. Open the terminal again in a moment.');
       // lazy's internals are for the log, never for the member.
       expect(r.message).not.toMatch(/supervisor|mailbox|response|settled/i);
     }
-    expect(stops).toEqual([]);
     expect(memberInsideTask('task-16')).toBeNull();
   });
 
-  test('a live supervisor still in a post-turn phase refuses the entry and stops nothing', async () => {
+  test('a live supervisor still in a post-turn phase refuses the entry', async () => {
     const { protocolDir } = await import('../../src/protocol');
     const { mkdir, writeFile } = await import('fs/promises');
     const runnerModule = await import('../../src/runner');
@@ -349,15 +319,13 @@ describe("a member's entry while the supervisor still owns the last turn", () =>
       isRunning: async () => true,
     } as never);
     try {
-      const stops: string[] = [];
       // `interrupted` after a daemon restart: the supervisor survived it.
-      const r = await enter('task-17', 'interrupted', stops);
+      const r = await enter('task-17', 'interrupted');
       expect(r).toMatchObject({ ok: false, status: 409 });
       if (!r.ok) {
         expect(r.message).toBe('The agent is still finishing its last turn. Open the terminal again in a moment.');
         expect(r.message).not.toMatch(/supervisor|maintain|mailbox/i);
       }
-      expect(stops).toEqual([]);
       expect(memberInsideTask('task-17')).toBeNull();
     } finally {
       spy.mockRestore();
@@ -365,55 +333,51 @@ describe("a member's entry while the supervisor still owns the last turn", () =>
   });
 });
 
-// INVARIANT: a member's entry never stops the task's container under a
-// pairing session. `lazy pair`, or a Pair from the dashboard on a daemon that
-// is not managed, runs the agent IN the task's container; stopping it ends
-// that session mid-way. The entry refuses (409, naming the web Pair's holder
+// INVARIANT: a member never enters beside a pairing session. `lazy pair`, or a
+// Pair from the dashboard on a daemon that is not managed, runs the agent IN
+// the task's container, at work in the worktree — the turn/member exclusion
+// applies (it used to be framed as "the stop would end it"; the entry no
+// longer stops anything, engineer 2026-10-05). The entry refuses (409, naming the web Pair's holder
 // where there is one) while the task is `pairing` or its pairing lock is held —
 // except for this member's OWN web Pair under the hold they already hold,
 // which runs in their own container.
 describe("a member's entry while the task is being paired on", () => {
-  test("an owner's pairing session (task `pairing`) refuses the entry and stops nothing", async () => {
-    const stops: string[] = [];
+  test("an owner's pairing session (task `pairing`) refuses the entry", async () => {
     expect(claimMemberTerminal('task-18', ALICE).ok).toBe(true);
     const r = await enterTaskAsMember({
       projectRoot: '/nonexistent-project', storage: fakeStorage({ id: 'task-18', status: 'pairing' }), taskId: 'task-18', email: ALICE,
-      deps: { bindingFor: noBinding, stopTaskContainer: async () => { stops.push('task-18'); } },
+      deps: { bindingFor: noBinding },
     });
     expect(r).toMatchObject({ ok: false, status: 409 });
     if (!r.ok) expect(r.message).toContain('pairing');
-    expect(stops).toEqual([]);
     expect(memberInsideTask('task-18')).toBeNull();
   });
 
   test("another member's web Pair refuses the entry, naming them", async () => {
-    const stops: string[] = [];
     expect(claimMemberTerminal('task-19', ALICE).ok).toBe(true);
     const r = await enterTaskAsMember({
       projectRoot: '/p', storage: fakeStorage({ id: 'task-19', status: 'blocked' }), taskId: 'task-19', email: ALICE,
       deps: {
         bindingFor: noBinding,
-        stopTaskContainer: async () => { stops.push('task-19'); },
         pairing: async () => ({ pairing: true, webPairEmail: 'bob@example.com' }),
       },
     });
     expect(r).toMatchObject({ ok: false, status: 409 });
     if (!r.ok) expect(r.message).toContain('bob@example.com');
-    expect(stops).toEqual([]);
   });
 
   test("the member's own web Pair, under their current hold, lets their next terminal in", async () => {
     expect(claimMemberTerminal('task-20', ALICE).ok).toBe(true);
     const first = await enterTaskAsMember({
       projectRoot: '/p', storage: fakeStorage({ id: 'task-20', status: 'blocked' }), taskId: 'task-20', email: ALICE,
-      deps: { bindingFor: noBinding, stopTaskContainer: noStop, pairing: async () => ({ pairing: false, webPairEmail: null }) },
+      deps: { bindingFor: noBinding, pairing: async () => ({ pairing: false, webPairEmail: null }) },
     });
     expect(first.ok).toBe(true);
     // Her Pair started; her next terminal (a Shell) enters beside it.
     expect(claimMemberTerminal('task-20', ALICE).ok).toBe(true);
     const next = await enterTaskAsMember({
       projectRoot: '/p', storage: fakeStorage({ id: 'task-20', status: 'pairing' }), taskId: 'task-20', email: ALICE,
-      deps: { bindingFor: noBinding, stopTaskContainer: noStop, pairing: async () => ({ pairing: true, webPairEmail: ALICE }) },
+      deps: { bindingFor: noBinding, pairing: async () => ({ pairing: true, webPairEmail: ALICE }) },
     });
     expect(next.ok).toBe(true);
   });
@@ -422,60 +386,29 @@ describe("a member's entry while the task is being paired on", () => {
     expect(claimMemberTerminal('task-21', ALICE).ok).toBe(true);
     const r = await enterTaskAsMember({
       projectRoot: '/p', storage: fakeStorage({ id: 'task-21', status: 'pairing' }), taskId: 'task-21', email: ALICE,
-      deps: { bindingFor: noBinding, stopTaskContainer: noStop, pairing: async () => ({ pairing: true, webPairEmail: ALICE }) },
+      deps: { bindingFor: noBinding, pairing: async () => ({ pairing: true, webPairEmail: ALICE }) },
     });
     expect(r).toMatchObject({ ok: false, status: 409 });
   });
 });
 
 // INVARIANT: bringing the task's own container up without a turn
-// (ensureTaskContainer) never runs beside a member, and never holds the task's
-// lifecycle lock for the length of the bring-up. The member check and a claim
-// run under the lock; while the claim is open a member's entry refuses (the
-// entry stops that container, the bring-up would start it again); the build
-// itself — minutes, when an image is built — runs with the lock free, so turn
-// launches, accepts and syncs are not queued behind it.
+// (ensureTaskContainer — Start container, Start services) works while a member
+// is inside (engineer, 2026-10-05: services are shared and keep running beside
+// members), and never holds the task's lifecycle lock across the bring-up, so
+// turn launches, accepts and syncs are not queued behind an image build.
 describe("a container bring-up and a member's entry", () => {
-  test('the entry refuses while a bring-up is in flight, and the lock is free meanwhile', async () => {
-    const { beginTaskContainerBringUp } = await import('../../src/daemon/member-entry');
-    const { isTaskLifecycleLocked } = await import('../../src/daemon/task-lifecycle-lock');
-    const release = await beginTaskContainerBringUp('task-22');
-    expect(isTaskLifecycleLocked('task-22')).toBe(false);
-    expect(claimMemberTerminal('task-22', ALICE).ok).toBe(true);
-    const during = await enterTaskAsMember({
-      projectRoot: '/p', storage: fakeStorage({ id: 'task-22', status: 'blocked' }), taskId: 'task-22', email: ALICE,
-      deps: { bindingFor: noBinding, stopTaskContainer: noStop },
-    });
-    expect(during).toMatchObject({ ok: false, status: 409 });
-    if (!during.ok) expect(during.message).toContain('being started');
-    release();
-    const after = await enterTaskAsMember({
-      projectRoot: '/p', storage: fakeStorage({ id: 'task-22', status: 'blocked' }), taskId: 'task-22', email: ALICE,
-      deps: { bindingFor: noBinding, stopTaskContainer: noStop },
-    });
-    expect(after.ok).toBe(true);
-  });
-
-  test('a bring-up while a member is inside is refused, naming them', async () => {
-    const { beginTaskContainerBringUp } = await import('../../src/daemon/member-entry');
-    expect(claimMemberTerminal('task-23', ALICE).ok).toBe(true);
-    await enterTaskAsMember({
-      projectRoot: '/p', storage: fakeStorage({ id: 'task-23', status: 'blocked' }), taskId: 'task-23', email: ALICE,
-      deps: { bindingFor: noBinding, stopTaskContainer: noStop },
-    });
-    await expect(beginTaskContainerBringUp('task-23')).rejects.toThrow(ALICE);
-  });
-
-  test('ensureTaskContainer claims the task for its bring-up rather than holding the lifecycle lock across it', async () => {
+  test('ensureTaskContainer neither consults the member hold nor holds the lifecycle lock', async () => {
     const { readFile } = await import('fs/promises');
     const src = await readFile(join(import.meta.dir, '../../src/daemon/task-container.ts'), 'utf-8');
-    expect(src).toContain('await beginTaskContainerBringUp(task.id)');
+    expect(src).not.toMatch(/memberInsideTask|beginTaskContainerBringUp/);
     expect(src).not.toMatch(/withTaskLifecycleLock\(/);
   });
 });
 
-// INVARIANT: a member's entry never stops the task's container under a Chat or
-// another operation holding the task's worktree. An owner's dashboard Chat on
+// INVARIANT: a member never enters while a Chat or another operation holds the
+// task's worktree (the turn/member exclusion; the entry stops nothing since
+// engineer 2026-10-05). An owner's dashboard Chat on
 // a daemon that is not managed runs the agent IN the task's container with the
 // task still `blocked` and no pairing lock — only its web-Chat hold and the
 // worktree lock show it. The entry refuses (409, naming the Chat's holder, or
@@ -483,20 +416,17 @@ describe("a container bring-up and a member's entry", () => {
 // web Chat under the hold they already hold, which runs in their own
 // container and whose worktree lock is its own.
 describe("a member's entry while a Chat or another operation holds the task", () => {
-  test("an owner's dashboard Chat refuses the entry and stops nothing", async () => {
-    const stops: string[] = [];
+  test("an owner's dashboard Chat refuses the entry", async () => {
     expect(claimMemberTerminal('task-24', ALICE).ok).toBe(true);
     const r = await enterTaskAsMember({
       projectRoot: '/p', storage: fakeStorage({ id: 'task-24', status: 'blocked' }), taskId: 'task-24', email: ALICE,
       deps: {
         bindingFor: noBinding,
-        stopTaskContainer: async () => { stops.push('task-24'); },
         worktreeHolders: async () => ({ webChat: { held: true, email: null }, lock: { what: 'a Chat with the agent' } }),
       },
     });
     expect(r).toMatchObject({ ok: false, status: 409 });
     if (!r.ok) expect(r.message).toContain('chatting');
-    expect(stops).toEqual([]);
     expect(memberInsideTask('task-24')).toBeNull();
   });
 
@@ -510,16 +440,14 @@ describe("a member's entry while a Chat or another operation holds the task", ()
     await mkdir(worktree, { recursive: true });
     await acquireLock(worktree, 'lazy accept (acceptance gate)');
     try {
-      const stops: string[] = [];
       expect(claimMemberTerminal('task-25', ALICE).ok).toBe(true);
       const r = await enterTaskAsMember({
         projectRoot: root, storage: fakeStorage(task), taskId: 'task-25', email: ALICE,
-        deps: { bindingFor: noBinding, stopTaskContainer: async () => { stops.push('task-25'); } },
+        deps: { bindingFor: noBinding },
       });
       expect(r).toMatchObject({ ok: false, status: 409 });
       // A lock this daemon holds is described in fixed words for its operation.
       if (!r.ok) expect(r.message).toContain("an accept's checks");
-      expect(stops).toEqual([]);
     } finally {
       await removeLock(worktree);
       await rm(root, { recursive: true, force: true });
@@ -530,14 +458,14 @@ describe("a member's entry while a Chat or another operation holds the task", ()
     expect(claimMemberTerminal('task-26', ALICE).ok).toBe(true);
     const first = await enterTaskAsMember({
       projectRoot: '/p', storage: fakeStorage({ id: 'task-26', status: 'blocked' }), taskId: 'task-26', email: ALICE,
-      deps: { bindingFor: noBinding, stopTaskContainer: noStop },
+      deps: { bindingFor: noBinding },
     });
     expect(first.ok).toBe(true);
     expect(claimMemberTerminal('task-26', ALICE).ok).toBe(true);
     const next = await enterTaskAsMember({
       projectRoot: '/p', storage: fakeStorage({ id: 'task-26', status: 'blocked' }), taskId: 'task-26', email: ALICE,
       deps: {
-        bindingFor: noBinding, stopTaskContainer: noStop,
+        bindingFor: noBinding,
         worktreeHolders: async () => ({ webChat: { held: true, email: ALICE }, lock: { what: 'a Chat with the agent' } }),
       },
     });
@@ -549,7 +477,7 @@ describe("a member's entry while a Chat or another operation holds the task", ()
     const r = await enterTaskAsMember({
       projectRoot: '/p', storage: fakeStorage({ id: 'task-27', status: 'blocked' }), taskId: 'task-27', email: ALICE,
       deps: {
-        bindingFor: noBinding, stopTaskContainer: noStop,
+        bindingFor: noBinding,
         worktreeHolders: async () => ({ webChat: { held: true, email: ALICE }, lock: { what: 'a Chat with the agent' } }),
       },
     });
@@ -584,7 +512,7 @@ describe("the worktree-lock refusal and a lock file the agent can write", () => 
 
   const enter = (root: string, taskId: string) => enterTaskAsMember({
     projectRoot: root, storage: fakeStorage({ id: taskId, status: 'blocked' }), taskId, email: ALICE,
-    deps: { bindingFor: noBinding, stopTaskContainer: noStop },
+    deps: { bindingFor: noBinding },
   });
 
   test("arbitrary text in a lock this daemon holds never appears in the refusal", async () => {

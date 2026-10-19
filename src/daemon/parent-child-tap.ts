@@ -107,9 +107,9 @@ export function tapParentChildChanges(storage: Storage): Storage {
       return result;
     },
 
-    async updateTaskStatus(taskId: string, status: TaskStatus, actor?: ActorInput) {
+    async updateTaskStatus(taskId: string, status: TaskStatus, actor?: ActorInput, reason?: string) {
       const before = status === 'abandoned' ? await taskOrNull(target, taskId) : null;
-      const result = await target.updateTaskStatus(taskId, status, actor);
+      const result = await target.updateTaskStatus(taskId, status, actor, reason);
       if (before && before.status !== 'abandoned') {
         const after = (await taskOrNull(target, taskId)) ?? before;
         // `lazy reject` notifies with its own reason just before this flip, so

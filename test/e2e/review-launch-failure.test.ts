@@ -283,6 +283,44 @@ describe('a review that fails (real supervisor, fake claude)', () => {
     expect(refused.stdout + refused.stderr).toContain('no readable security / data-integrity statement');
   }, 180_000);
 
+  // INVARIANT: a reviewer that says it could not inspect the work is a FAILED
+  // review — an infrastructure failure a person sees, gating accept — never a
+  // pass and never a `needs_work` verdict that would brief a fix turn on
+  // nothing. Codex reviewers in task containers said exactly this for a
+  // release ("sandbox initialization and MCP approval restrictions blocked both
+  // inspection routes") and it was recorded as an ordinary review.
+  //
+  // Same no-swap shape as the test above: the work turn and the review replay
+  // one scenario, so the review's reply is deterministic.
+  test('a reviewer that could not inspect the work is recorded as a failed review', async () => {
+    const taskId = await createTask(ctx, 'Reviewer is blind', 'Do the work');
+    const fullId = findFullTaskId(ctx.root, taskId);
+    const worktree = worktreePathFor(ctx.root, taskId);
+
+    await ctx.setClaudeScenario(
+      declaringWorkScenario(worktree, fullId, 'REVIEW_COULD_NOT_INSPECT: lazy_diff requires approval and bwrap cannot start'),
+    );
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+
+    const turns = await waitFor(
+      () => readTurns(ctx.root, taskId),
+      (t) => t.some((x) => x.role === 'agent' && x.turn_type === 'review'),
+      'the automatic review of a reviewer that could not inspect',
+      () => daemonLogTail(ctx),
+    );
+    const review = turns.find((t) => t.role === 'agent' && t.turn_type === 'review')!;
+    const report = reviewOf(review)!;
+    expect(report.verdict).toStartWith('FAILED:');
+    expect(report.verdict).toContain('could not inspect the work');
+    expect(report.findings).toEqual([]);
+    // Recorded as a failure, not re-asked into a verdict.
+    expect(String(review.content)).not.toContain('Re-asked for the verdict block');
+
+    const refused = await ctx.lazy(['accept', taskId, '--yes']);
+    expect(refused.exitCode).not.toBe(0);
+  }, 180_000);
+
   // INVARIANT (§8.2/§8.3): for a loop's child the loop is "the human", so a
   // failed review reaches it on the same journal channel as every other parked
   // cycle. Without it the loop's `lazy_wait` returns, it finds no review, and it
@@ -323,8 +361,14 @@ describe('a review that fails (real supervisor, fake claude)', () => {
       () => daemonLogTail(ctx),
     );
 
+    // A crash class the supervisor does NOT retry. The automatic review is
+    // dispatched on the same tick the final is seen, so it can launch before or
+    // after this swap: before, it replays the work scenario and fails to parse;
+    // after, it crashes here. Both are failed reviews. A transient 500 (what
+    // this used to be) is retried forever by design, so the crash path never
+    // finished and the test passed only when the review won the race.
     await ctx.setClaudeScenario(crashScenario({
-      stderr: 'API Error: 500 upstream model provider unavailable\n',
+      stderr: 'API Error: 401 authentication_error: credential rejected\n',
     }));
 
     const loopFullId = findFullTaskId(ctx.root, loopId);

@@ -120,6 +120,14 @@ describe('show RPC: sections and derived answers', () => {
     expect(payload.counts.comments).toBe(2);
   });
 
+  // INVARIANT: `show` sends the fold — the split of a turn into its own words
+  // and lazy's wrapper — so Teams and the dashboard never parse markers themselves.
+  test('every turn carries its fold, null where nothing is lazy\'s', async () => {
+    const payload = (await handleShow(root, { taskId, sections: ['turns'] })) as Record<string, any>;
+    expect(payload.turns.every((t: any) => 'fold' in t)).toBe(true);
+    expect(payload.turns[0].fold).toBeNull();
+  });
+
   test('naming sections narrows the payload and reports what was served', async () => {
     const payload = (await handleShow(root, {
       taskId,

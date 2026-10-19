@@ -52,6 +52,8 @@ export type ClaudeStep =
   | { kind: 'stderr'; text: string }
   /** Sleep. This is how "silent mid-turn" and "hangs after result" are expressed. */
   | { kind: 'sleep'; ms: number }
+  /** Keep running while `path` exists (bounded by `maxMs`, default 120s): holds the turn live until the test releases it. */
+  | { kind: 'hold-while-file'; path: string; maxMs?: number }
   /**
    * Write a file without committing it — the handoff channel a tools-down agent uses.
    * `path` may be absolute or relative to the cwd (the worktree); parent directories are created.
@@ -261,6 +263,95 @@ export function hangAfterResultScenario(opts: SuccessScenarioOptions & { hangMs?
 }
 
 /**
+ * `{"type":"system","subtype":"background_tasks_changed","tasks":[…]}` — the
+ * WHOLE list of running background tasks, as Claude Code 2.1.291 emits it each
+ * time the list changes (docs/claude-code-background-tasks.md).
+ */
+export function backgroundTasksChangedEvent(sessionId: string, taskIds: string[]): Record<string, unknown> {
+  return {
+    type: 'system',
+    subtype: 'background_tasks_changed',
+    tasks: taskIds.map(id => ({ task_id: id, task_type: 'local_bash', description: `background job ${id}` })),
+    session_id: sessionId,
+  };
+}
+
+/**
+ * The background-work case, in the event order measured on Claude Code
+ * 2.1.291: the agent starts a background job and ends its first invocation
+ * (first `result`); the process stays alive while the job runs; when it
+ * reports, the CLI re-invokes the model (`system/init` again), which does
+ * more work (optional commit) and emits a SECOND `result` before exiting.
+ */
+export function backgroundWorkScenario(opts: {
+  sessionId?: string;
+  firstResult?: string;
+  finalResult?: string;
+  backgroundMs: number;
+  commitAfter?: { message: string; files: Array<{ path: string; content: string }> };
+}): ClaudeScenario {
+  const sessionId = opts.sessionId ?? 'fake-sess-bg';
+  const steps: ClaudeStep[] = [
+    { kind: 'emit', event: sessionStartEvent(sessionId) },
+    { kind: 'emit', event: toolUseEvent('toolu_bg') },
+    { kind: 'emit', event: backgroundTasksChangedEvent(sessionId, ['bjob1']) },
+    { kind: 'emit', event: toolResultEvent('toolu_bg') },
+    { kind: 'emit', event: resultEvent({ result: opts.firstResult ?? 'Waiting for the background job.', sessionId }) },
+    { kind: 'sleep', ms: opts.backgroundMs },
+    { kind: 'emit', event: backgroundTasksChangedEvent(sessionId, []) },
+    { kind: 'emit', event: sessionStartEvent(sessionId) },
+  ];
+  if (opts.commitAfter) steps.push({ kind: 'commit', message: opts.commitAfter.message, files: opts.commitAfter.files });
+  steps.push({
+    kind: 'emit',
+    event: resultEvent({ result: opts.finalResult ?? 'The background job finished.', sessionId }),
+  });
+  return { steps };
+}
+
+/**
+ * A turn whose agent backgrounds a shell command and ends while it runs, in
+ * the event order measured on Claude Code 2.1.291 (docs/claude-code-background-tasks.md).
+ * `outcome: 'killed'` is what Claude Code does 5s after the result to a shell
+ * still running (`task_updated` killed, `task_notification` stopped);
+ * `'completed'` is a job that finished inside that grace and was re-invoked on.
+ */
+export function backgroundShellScenario(opts: {
+  sessionId?: string;
+  command: string;
+  outcome: 'killed' | 'completed';
+  result?: string;
+  /** Extra steps before the result (e.g. leaving a file uncommitted). */
+  beforeResult?: ClaudeStep[];
+}): ClaudeScenario {
+  const sessionId = opts.sessionId ?? 'fake-sess-bgshell';
+  const taskId = 'bgshell1';
+  const steps: ClaudeStep[] = [
+    { kind: 'emit', event: sessionStartEvent(sessionId) },
+    { kind: 'emit', event: { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_bgs', name: 'Bash', input: { command: opts.command, run_in_background: true } }] } } },
+    { kind: 'emit', event: backgroundTasksChangedEvent(sessionId, [taskId]) },
+    { kind: 'emit', event: { type: 'system', subtype: 'task_started', task_id: taskId, tool_use_id: 'toolu_bgs', description: 'background job', is_backgrounded: true, task_type: 'local_bash', session_id: sessionId } },
+    { kind: 'emit', event: toolResultEvent('toolu_bgs') },
+    ...(opts.beforeResult ?? []),
+    { kind: 'emit', event: resultEvent({ result: opts.result ?? 'Started it in the background.', sessionId }) },
+    { kind: 'emit', event: backgroundTasksChangedEvent(sessionId, []) },
+  ];
+  if (opts.outcome === 'killed') {
+    steps.push(
+      { kind: 'emit', event: { type: 'system', subtype: 'task_updated', task_id: taskId, patch: { status: 'killed' }, session_id: sessionId } },
+      { kind: 'emit', event: { type: 'system', subtype: 'task_notification', task_id: taskId, tool_use_id: 'toolu_bgs', status: 'stopped', summary: 'background job', session_id: sessionId } },
+    );
+  } else {
+    steps.push(
+      { kind: 'emit', event: { type: 'system', subtype: 'task_updated', task_id: taskId, patch: { status: 'completed' }, session_id: sessionId } },
+      { kind: 'emit', event: sessionStartEvent(sessionId) },
+      { kind: 'emit', event: resultEvent({ result: 'The background job passed.', sessionId }) },
+    );
+  }
+  return { steps };
+}
+
+/**
  * The no-progress case: the agent starts a tool call and then goes completely
  * silent. Only the no-progress guard can end this turn.
  */
@@ -435,6 +526,8 @@ export async function clearClaudeInvocations(fake: FakeClaude): Promise<void> {
  */
 const FAKE_CLAUDE_PRELUDE = String.raw`
 const FAKE_LABEL = 'fake claude';
+// Headless turns read the prompt from stdin (lazy never puts it in argv).
+const recordedStdin = argv.includes('-p') ? fs.readFileSync(0, 'utf8') : undefined;
 
 // --version is asked by runner.checkAvailability() and by which-style probes
 // long before any turn exists. Answering it here keeps it off the scenario, so

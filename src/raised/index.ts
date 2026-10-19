@@ -102,6 +102,8 @@ export interface ListedRaisedItem {
   unresolved_by_name: string | null;
   created_at: number;
   session_id?: string | null;
+  /** The turn that raised it, when the store knows. */
+  turn_sequence?: number | null;
   recurrence_id: string;
   recurrence_size: number;
   /** A later task's prompt says it was promoted from this originating task (heuristic). */
@@ -289,6 +291,7 @@ export function buildRaisedItemsListing(
       unresolved_by_name: item.unresolved_by_name ?? null,
       created_at: item.created_at,
       session_id: item.session_id,
+      turn_sequence: item.turn_sequence ?? null,
       recurrence_id,
       recurrence_size: recurrenceSizeFor.get(recurrence_id) ?? 1,
       possibly_promoted: !isPromoted && heuristicPromotedTo.length > 0,

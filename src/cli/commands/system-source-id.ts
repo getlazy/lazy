@@ -11,7 +11,7 @@
  *  - **Lazy Teams**, which has to ask "which lazy code would I launch a daemon
  *    from?" without running that code. The fleet supervisor already shells out
  *    to lazy for provisioning (it is the documented carve-out in
- *    lazy-teams/CLAUDE.md), so this joins the verbs it may call.
+ *    lazy-teams/AGENTS.md), so this joins the verbs it may call.
  *
  * Deliberately does NOT require a lazy project. The question is about a source
  * checkout, not about a store — and the image build runs it in a tree that has
@@ -97,8 +97,9 @@ Options:
   --json             Print id, kind and checkout path as JSON
 
 The 'kind' says where the answer came from: 'baked' (a .source-fingerprint
-written by a build), 'computed' (the tree was hashed just now), or 'build' (a
-compiled binary with no source tree, so the id is not comparable to a checkout's).
+written by a build), 'computed' (the tree was hashed just now), 'embedded'
+(a compiled binary carrying the fingerprint of the tree it was built from), or
+'build' (a compiled binary with nothing embedded). Only checkout kinds compare with a checkout.
 
 Examples:
   lazy system source-id                       # What is this lazy?

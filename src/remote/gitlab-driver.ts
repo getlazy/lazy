@@ -15,7 +15,7 @@
  *
  * - **External comments are untrusted input.** MR notes (from syncComments)
  *   are authored by external users and injected into agent prompts. They must
- *   never be treated as trusted instructions. The agent's CLAUDE.md and system
+ *   never be treated as trusted instructions. The agent's AGENTS.md and system
  *   prompt define the trust boundary, not comment authors.
  *
  * - **Token should have minimal privileges.** The GitLab token only needs
@@ -28,6 +28,7 @@
  *   token scope breadth, and remote URL correctness.
  */
 
+import { RemoteBranchMissingError, isRemoteRefMissing } from './branch-missing';
 import type {
   RepositoryDriver,
   DriverContext,
@@ -48,6 +49,7 @@ import type {
   AcceptGateWarning,
   MarkReadyOptions,
   OpenReview,
+  BranchReview,
   ReviewConversationItem,
   ReviewStatus,
 } from './driver';
@@ -63,7 +65,8 @@ import { runGit as defaultRunGit, fastForwardLocal as sharedFastForwardLocal, fi
 import { spawn, spawnSyncUnsupervised } from '../utils/spawn';
 import { truncateLog } from '../utils/log-truncate';
 import { withRemoteRetry, type RetryOptions } from '../utils/retry';
-import { applyFidelitySection, composeInitialBody } from '../synthesis/fidelity';
+import { applyFidelitySection, applyLinksSection, composeInitialBody } from '../synthesis/fidelity';
+import { descriptionLinksFor } from './description-links';
 import { remoteUrlHasHost, remoteUrlHostContains } from './remote-url';
 import { parsePaginatedApiJson } from './paginated-json';
 
@@ -232,16 +235,20 @@ export class GitLabDriver implements RepositoryDriver {
 
   async resolveUpstreamRef(parentBranch: string, worktreePath: string): Promise<string> {
     const remoteRef = this.upstreamRefName(parentBranch);
+    let missing = false;
     await withRemoteRetry(
       async () => {
         const fetchResult = await this.git(['fetch', this.remoteName, parentBranch], worktreePath);
         if (fetchResult.exitCode !== 0) {
+          // Not on the remote is an answer, not a network failure: no retry.
+          if (isRemoteRefMissing(fetchResult.stderr)) { missing = true; return; }
           throw new Error(`Failed to fetch ${remoteRef} from ${this.remoteName}: ${fetchResult.stderr}`);
         }
       },
       `fetch upstream ref ${parentBranch} from ${this.remoteName}`,
       this.retryOpts,
     );
+    if (missing) throw new RemoteBranchMissingError(parentBranch, this.remoteName);
     logger.debug(`resolveUpstreamRef: fetched ${remoteRef}`);
     return remoteRef;
   }
@@ -320,7 +327,7 @@ export class GitLabDriver implements RepositoryDriver {
     // (see RepositoryDriver.markReadyForReview); everything else derives it.
     const targetBranch = opts?.baseBranch ?? await this.targetBranch(task);
 
-    const body = this.buildMRBody(task);
+    const body = await this.buildMRBody(task);
 
     const createResult = await this.gl([
       'mr', 'create',
@@ -397,7 +404,7 @@ export class GitLabDriver implements RepositoryDriver {
       const reason = existing ? `stale (state: ${existing.state})` : 'not found';
       logger.info(`Existing MR is ${reason}, creating replacement MR...`);
 
-      const body = this.buildMRBody(task);
+      const body = await this.buildMRBody(task);
       const createResult = await this.gl([
         'mr', 'create',
         '--source-branch', sourceBranch,
@@ -514,7 +521,7 @@ export class GitLabDriver implements RepositoryDriver {
     // the request and queues "merge when pipeline succeeds". We MUST verify
     // the post-merge MR state via the API before reporting 'merged'.
     // INVARIANT: never silently return 'merged' without confirming the merge.
-    // See CLAUDE.md: "Fail hard on remote failures — no silent fallbacks".
+    // See AGENTS.md: "Fail hard on remote failures — no silent fallbacks".
     if (!mrIid) {
       // Reaching here without an MR IID means MR creation/lookup silently
       // produced no identifier. We cannot verify a merge we cannot identify.
@@ -1006,7 +1013,7 @@ export class GitLabDriver implements RepositoryDriver {
     // 1. Check glab CLI is installed
     const glabVersion = await this.gl(['--version']);
     if (glabVersion.exitCode !== 0) {
-      checks.push({ state: 'fail', what: 'glab CLI installed', reason: 'Install from https://gitlab.com/gitlab-org/cli' });
+      checks.push({ state: 'fail', what: 'glab CLI installed', problem: 'glab CLI isn\'t installed', reason: 'Install from https://gitlab.com/gitlab-org/cli' });
       return checks;
     }
     checks.push({ state: 'ok', what: 'glab CLI installed' });
@@ -1014,7 +1021,7 @@ export class GitLabDriver implements RepositoryDriver {
     // 2. Check glab auth status
     const authStatus = await this.gl(['auth', 'status']);
     if (authStatus.exitCode !== 0) {
-      checks.push({ state: 'fail', what: 'GitLab authentication', reason: 'Run: glab auth login' });
+      checks.push({ state: 'fail', what: 'GitLab authentication', problem: 'GitLab authentication failed', reason: 'Run: glab auth login' });
       return checks;
     }
     checks.push({ state: 'ok', what: 'GitLab authentication' });
@@ -1037,7 +1044,7 @@ export class GitLabDriver implements RepositoryDriver {
     // 4. Check that the configured git remote exists and points to GitLab
     const remoteUrl = await this.git(['remote', 'get-url', this.remoteName]);
     if (remoteUrl.exitCode !== 0) {
-      checks.push({ state: 'fail', what: `Git remote ${this.remoteName}`, reason: `No remote '${this.remoteName}' configured. Run: git remote add ${this.remoteName} <gitlab-url>` });
+      checks.push({ state: 'fail', what: `Git remote ${this.remoteName}`, problem: `Git remote ${this.remoteName} is not configured`, reason: `No remote '${this.remoteName}' configured. Run: git remote add ${this.remoteName} <gitlab-url>` });
       return checks;
     }
     const url = remoteUrl.stdout;
@@ -1207,6 +1214,40 @@ export class GitLabDriver implements RepositoryDriver {
       metadata: {
         gitlab_remote_ref_url: data.web_url,
         gitlab_remote_ref_id: String(data.iid),
+      },
+    };
+  }
+
+  async findReviewForBranch(branch: string): Promise<BranchReview | null> {
+    // The API, not `glab mr view <branch>`, so merged and closed MRs are seen
+    // too: newest first, and an open one wins over any older merged/closed one.
+    const query = `projects/:id/merge_requests?source_branch=${encodeURIComponent(branch)}&state=all&order_by=created_at&sort=desc&per_page=20`;
+    const result = await this.gl(['api', query]);
+    if (result.exitCode !== 0) {
+      throw new Error(`glab api merge_requests?source_branch=${branch} failed (exit ${result.exitCode}): ${result.stderr.trim()}`);
+    }
+    let list: Array<{ web_url?: string; iid?: number; state?: string; target_branch?: string; sha?: string }>;
+    try {
+      const parsed = JSON.parse(result.stdout || '[]');
+      list = Array.isArray(parsed) ? parsed : [];
+    } catch (err) {
+      throw new Error(`glab api merge_requests?source_branch=${branch} returned unparseable JSON: ${err instanceof Error ? err.message : err}`);
+    }
+    const stateOf = (s?: string): PRState | null => {
+      const v = (s ?? '').toLowerCase();
+      return v === 'opened' ? 'OPEN' : v === 'merged' ? 'MERGED' : v === 'closed' ? 'CLOSED' : null;
+    };
+    const usable = list.filter(m => m.web_url && m.iid !== undefined && stateOf(m.state));
+    const mr = usable.find(m => stateOf(m.state) === 'OPEN') ?? usable[0];
+    if (!mr) return null;
+    return {
+      state: stateOf(mr.state)!,
+      ...(mr.sha ? { headSha: mr.sha } : {}),
+      url: mr.web_url!,
+      baseBranch: mr.target_branch ?? '',
+      metadata: {
+        gitlab_remote_ref_url: mr.web_url!,
+        gitlab_remote_ref_id: String(mr.iid),
       },
     };
   }
@@ -1640,10 +1681,10 @@ export class GitLabDriver implements RepositoryDriver {
     return this.repoPrivate;
   }
 
-  private buildMRBody(task: Task): string {
+  private async buildMRBody(task: Task): Promise<string> {
     return composeInitialBody({
       goal: task.goal,
-      prompt: task.prompt ?? undefined,
+      links: await descriptionLinksFor(this.driverContext, this.config, task),
       footer: '---\n*Created by [lazy](https://getlazy.dev/)*',
     });
   }
@@ -1669,7 +1710,10 @@ export class GitLabDriver implements RepositoryDriver {
           throw new Error(`glab mr view returned unparseable JSON for MR !${mrIid}: ${err instanceof Error ? err.message : err}`);
         }
 
-        const newBody = applyFidelitySection(currentBody, summary);
+        const newBody = applyLinksSection(
+          applyFidelitySection(currentBody, summary),
+          await descriptionLinksFor(this.driverContext, this.config, task),
+        );
         if (newBody === currentBody) {
           logger.debug(`updateRemoteBody: MR !${mrIid} description unchanged — skipping edit`);
           return;

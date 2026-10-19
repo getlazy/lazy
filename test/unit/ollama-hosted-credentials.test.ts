@@ -44,9 +44,9 @@ describe('isHostedOllamaEndpoint', () => {
 });
 
 /** A project whose BOTH roles default to one claude-code profile at `endpoint`. */
-function configWithOllamaEndpoint(endpoint: string): ResolvedConfig {
+function configWithOllamaEndpoint(endpoint: string, credential: string): ResolvedConfig {
   const agents = {
-    'local-ollama': { harness: 'claude-code', model: 'gpt-oss:120b', endpoint },
+    'local-ollama': { harness: 'claude-code', model: 'gpt-oss:120b', endpoint, credential },
   } as never as Record<string, never>;
   const profiles = resolveAgentProfiles(agents);
   cacheAgentProfiles(agents, profiles);
@@ -90,7 +90,7 @@ describe('hosted vs local ollama credential routing', () => {
 
   test('a local ollama profile uses synthetic launch creds and no provider requirement', async () => {
     const endpoint = 'http://localhost:11434';
-    const config = configWithOllamaEndpoint(endpoint);
+    const config = configWithOllamaEndpoint(endpoint, 'none');
     const target = config.models.roles.agent;
     expect(target.credential).toBe('none');
 
@@ -99,6 +99,7 @@ describe('hosted vs local ollama credential routing', () => {
     expect(requiredProviders(config)).toEqual([]);
     expect(ollamaUpstream(config)).toEqual({
       profile: 'local-ollama', upstream: endpoint, credential: null, wire: 'anthropic',
+      credentialExplicit: true,
     });
     const deps = buildProxyCredentialDeps(root, config);
     expect(deps.targets.has(endpoint)).toBe(false);
@@ -106,7 +107,7 @@ describe('hosted vs local ollama credential routing', () => {
 
   test('a hosted ollama profile requires a stored key and maps a proxy credential', async () => {
     const endpoint = 'https://ollama.com';
-    const config = configWithOllamaEndpoint(endpoint);
+    const config = configWithOllamaEndpoint(endpoint, 'ollama');
     const target = config.models.roles.agent;
     expect(target.credential).toBe('ollama');
 
@@ -120,6 +121,7 @@ describe('hosted vs local ollama credential routing', () => {
     expect(requiredProviders(config)).toEqual(['ollama']);
     expect(ollamaUpstream(config)).toEqual({
       profile: 'local-ollama', upstream: endpoint, credential: 'ollama', wire: 'anthropic',
+      credentialExplicit: true,
     });
     const deps = buildProxyCredentialDeps(root, config);
     expect(deps.targets.has(endpoint)).toBe(true);

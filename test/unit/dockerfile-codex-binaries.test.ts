@@ -1,7 +1,7 @@
 import { describe, test, expect } from 'bun:test';
 import { readFile } from 'fs/promises';
 import { join } from 'path';
-import { CODEX_PINNED_VERSION } from '../../src/agent/codex-packaging';
+import { CODEX_INSTALL_HINT, CodexPackaging } from '../../src/agent/codex-packaging';
 
 const ROOT = join(import.meta.dir, '..', '..');
 const DOCKERFILE = join(ROOT, 'Dockerfile.lazy');
@@ -33,7 +33,7 @@ if (dockerfile === null) {
 }
 
 /**
- * INVARIANT: the image installs BOTH codex binaries, from the ONE pinned release.
+ * INVARIANT: the image installs BOTH codex binaries, from the ONE release.
  *
  * `codex-code-mode-host` is a separate release asset, and it is not optional.
  * When the model a turn runs on declares `tool_mode = "code_mode_only"` — which
@@ -76,16 +76,16 @@ describe.skipIf(dockerfile === null)('Dockerfile.lazy codex install', () => {
     ).toContain('codex-code-mode-host');
   });
 
-  test('every codex release URL names the pinned version', () => {
-    const versions = [...instructions.matchAll(/openai\/codex\/releases\/download\/rust-v([0-9][^/"\s]*)/g)]
-      .map(m => m[1]);
-    expect(versions.length).toBeGreaterThan(0);
-    for (const version of versions) {
+  test('the release tag is resolved once and every download names it', () => {
+    expect(instructions.match(/openai\/codex\/releases\/latest/g)?.length).toBe(1);
+    const urls = [...instructions.matchAll(/openai\/codex\/releases\/download\/([^/"\s]+)/g)].map(m => m[1]);
+    expect(urls.length).toBeGreaterThan(0);
+    for (const tag of urls) {
       expect(
-        { version, pinned: CODEX_PINNED_VERSION },
-        'Dockerfile.lazy downloads a codex release that CODEX_PINNED_VERSION does not name. ' +
+        tag,
+        'Dockerfile.lazy downloads a codex release other than the one resolved once as $tag. ' +
           'The CLI and its code-mode host must come from the same release.',
-      ).toEqual({ version: CODEX_PINNED_VERSION, pinned: CODEX_PINNED_VERSION });
+      ).toBe('$tag');
     }
   });
 
@@ -111,6 +111,58 @@ describe.skipIf(dockerfile === null)('Dockerfile.lazy codex install', () => {
       // inside `codex-code-mode-host` does not count for it.
       const named = new RegExp(`(?<![\\w-])${bin}(?![\\w-])`).test(instructions);
       expect({ bin, named }, `Dockerfile.lazy never names ${bin}`).toEqual({ bin, named: true });
+    }
+  });
+});
+
+// INVARIANT: every Codex download is checked against the sha256 digest the same release
+// publishes before it is extracted. Codex is deliberately unpinned ("latest"), so the
+// checksum is the only thing between a tampered asset and the runner image.
+describe('codex downloads are checksum-verified', () => {
+  const sources: Record<string, string> = {
+    'CODEX_INSTALL_HINT': CODEX_INSTALL_HINT,
+    'dockerInstallCommand()': new CodexPackaging().dockerInstallCommand(),
+    ...(dockerfile === null ? {} : { 'Dockerfile.lazy': instructions }),
+  };
+  for (const [name, text] of Object.entries(sources)) {
+    test(name, () => {
+      expect(text).toContain('sha256sum -c');
+      expect(text).toContain('startswith("sha256:")');
+      expect(text, 'curl must not pipe straight into tar').not.toMatch(/curl[^\n]*\|\s*tar/);
+    });
+  }
+});
+
+// INVARIANT: the install hint FAILS when a download does not match its
+// published digest. It used to `|| break` out of its loop, which exits 0, so
+// a human pasting it saw success with no codex installed.
+describe('the codex install hint fails on a checksum mismatch', () => {
+  const tools = ['jq', 'sha256sum', 'bash'].every(t => Bun.which(t));
+  test.skipIf(!tools)('exits non-zero', async () => {
+    const { mkdtemp, writeFile, chmod, rm, mkdir } = await import('fs/promises');
+    const { tmpdir } = await import('os');
+    const { join } = await import('path');
+    const dir = await mkdtemp(join(tmpdir(), 'lazy-codex-hint-'));
+    try {
+      const bin = join(dir, 'bin');
+      await mkdir(bin);
+      await mkdir(join(dir, '.local', 'bin'), { recursive: true });
+      // A fake curl: the latest tag, a release whose digests match nothing,
+      // and an asset download with arbitrary bytes.
+      await writeFile(join(bin, 'curl'), `#!/bin/bash
+case "$*" in
+  *-fsSLI*) printf 'https://github.com/openai/codex/releases/tag/rust-v9.9.9' ;;
+  *api.github.com*) printf '{"assets":[{"name":"codex-%s-unknown-linux-musl.tar.gz","digest":"sha256:%064d"},{"name":"codex-code-mode-host-%s-unknown-linux-musl.tar.gz","digest":"sha256:%064d"}]}' "$(uname -m | sed 's/^arm64$/aarch64/')" 0 "$(uname -m | sed 's/^arm64$/aarch64/')" 0 ;;
+  *) while [ "$1" != "-o" ]; do shift; done; echo tampered > "$2" ;;
+esac
+`);
+      await chmod(join(bin, 'curl'), 0o755);
+      const proc = Bun.spawn(['bash', '-c', CODEX_INSTALL_HINT.replace(/^[^:]*: /, '')], {
+        env: { PATH: `${bin}:${process.env.PATH}`, HOME: dir }, stdout: 'ignore', stderr: 'ignore',
+      });
+      expect(await proc.exited).not.toBe(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
     }
   });
 });

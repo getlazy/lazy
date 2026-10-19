@@ -332,9 +332,17 @@ describe('MCP tool roles', () => {
  * the request asked for: running `gh` or pushing still needs a granted token,
  * so an agent does not read "no token" as "no token ever needed". Raised to
  * 60,060, ~40 bytes over the agent role (60,020).
+ *
+ * `lazy_recipe` then arrived: a WHOLE NEW TOOL serving built-in, harness-
+ * independent recipes on demand (e.g. how to add a toolchain to the task
+ * image), asked for so agents load guidance only when their work needs it
+ * instead of carrying it in every prompt. ARGUED: loading on demand is the
+ * cheap alternative to prompt text. TRIMMED: a one-sentence description and no
+ * argument help. Raised to 60,250; after merging agent-profile descriptions from
+ * the hub the agent role measures 60,232 (under the ratchet by 18 bytes).
  */
 describe('MCP tool surface byte budget', () => {
-  const BUDGET_BYTES = 60_060;
+  const BUDGET_BYTES = 60_250;
 
   for (const role of ['builder', 'agent'] as const) {
     test(`the ${role} surface stays under budget`, () => {

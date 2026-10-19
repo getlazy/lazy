@@ -58,7 +58,7 @@
  *
  * A state-changing request must come from the dashboard's OWN origin. Same-site
  * is not enough, and that distinction is the whole point: task services are
- * served at `<service>.<task>.lazy.localhost` through the proxy in
+ * served at `<task>.<service>.lazy.localhost` through the proxy in
  * src/server/serve-proxy.ts, and `localhost` is not a public suffix, so the
  * registrable domain of both that name and `lazy.localhost` is
  * `lazy.localhost` — they are SAME-SITE. `SameSite=Strict` therefore does not

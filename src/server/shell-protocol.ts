@@ -13,7 +13,7 @@
  *
  * The parser is a system boundary: frames come from a browser, so every field
  * is validated and an unparseable message is rejected with a reason rather
- * than guessed at (see CLAUDE.md "external surfaces validate inputs").
+ * than guessed at (see AGENTS.md "external surfaces validate inputs").
  */
 
 /** Bounds for a resize request. Wider than any real terminal, small enough

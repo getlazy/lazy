@@ -1,6 +1,6 @@
 /**
  * The task-service reverse proxy end to end:
- * `http://<service>.<task>.lazy.localhost:<dashboard port>` → the container port
+ * `http://<task>.<service>.lazy.localhost:<dashboard port>` → the container port
  * `[serve]` published.
  *
  * Everything under test here is real — the daemon's listener, host parsing,
@@ -127,7 +127,7 @@ describe('serve proxy', () => {
     return Bun.serve({
       hostname: '127.0.0.1',
       port: 0,
-      fetch(req, server): Response | undefined {
+      fetch(req, server): Response | Promise<Response> | undefined {
         const url = new URL(req.url);
 
         if (url.pathname === '/ws') {
@@ -177,6 +177,14 @@ describe('serve proxy', () => {
           });
         }
 
+        // A module a dev server compiles on demand: a body of realistic size,
+        // answered a little late.
+        if (url.pathname.startsWith('/src/')) {
+          const body = 'export default 1;\n'.repeat(256);
+          const late = url.pathname.endsWith('0.jsx') ? 300 : 0;
+          return Bun.sleep(late).then(() => new Response(body, { headers: { 'Content-Type': 'text/javascript' } }));
+        }
+
         if (url.pathname === '/upload') {
           return new Response(req.body, { headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
         }
@@ -213,7 +221,7 @@ describe('serve proxy', () => {
   }
 
   function serveHost(task: string, service = 'web'): string {
-    return `${service}.${task}.lazy.localhost:${webPort}`;
+    return `${task}.${service}.lazy.localhost:${webPort}`;
   }
 
   /** A browser request to a task subdomain, sent to the address the daemon bound. */
@@ -235,6 +243,25 @@ describe('serve proxy', () => {
     expect(res.status).toBe(200);
     return (await res.json()) as { method: string; target: string; headers: Record<string, string> };
   }
+
+  // INVARIANT: a dev server's page load — hundreds of module requests at once,
+  // each on its own connection, as Lazy Teams' service proxy sends them — comes
+  // through whole: no 502, no reset, no short body. Teams answers any failure on
+  // this hop with a 502, which is what a Vite app through Teams looked like.
+  test('300 parallel module requests on separate connections all come through', async () => {
+    const taskId = await liveTask();
+    const expected = 'export default 1;\n'.repeat(256);
+
+    const outcomes = await Promise.all(
+      Array.from({ length: 300 }, (_, i) =>
+        proxyFetch(taskId, `/src/module-${i}.jsx`, { headers: { connection: 'close' } })
+          .then(async (res) => (res.status === 200 && (await res.text()) === expected ? 'ok' : `status ${res.status}`))
+          .catch((err: Error & { code?: string }) => err.code ?? err.message),
+      ),
+    );
+    const failed = outcomes.filter((o) => o !== 'ok');
+    expect({ failed: failed.length, sample: failed.slice(0, 3) }).toEqual({ failed: 0, sample: [] });
+  }, 60_000);
 
   /** Every `docker` invocation the daemon made, one per line. */
   async function dockerLog(): Promise<string[]> {
@@ -377,6 +404,87 @@ describe('serve proxy', () => {
     ws.close();
   }, 30_000);
 
+  // INVARIANT: the app receives exactly ONE of each handshake header and the
+  // browser's Host, so a strict server (websocket-driver, behind ActionCable)
+  // completes the handshake. Bun 1.2's client appended forwarded copies of
+  // Host/Sec-WebSocket-Key/-Version/-Protocol after its own; Rack joined them
+  // ("13, 13") and ActionCable answered "Unsupported WebSocket version: 13".
+  test('a strict WebSocket server sees one clean handshake through the proxy', async () => {
+    const seen: string[][] = [];
+    const strict = Bun.listen<{ buf: string }>({
+      hostname: '127.0.0.1',
+      port: 0,
+      socket: {
+        open(sock) { sock.data = { buf: '' }; },
+        data(sock, chunk) {
+          sock.data.buf += chunk.toString('latin1');
+          const end = sock.data.buf.indexOf('\r\n\r\n');
+          if (end < 0) return;
+          const lines = sock.data.buf.slice(0, end).split('\r\n').slice(1);
+          seen.push(lines);
+          const values = new Map<string, string[]>();
+          for (const line of lines) {
+            const i = line.indexOf(':');
+            const name = line.slice(0, i).trim().toLowerCase();
+            values.set(name, [...(values.get(name) ?? []), line.slice(i + 1).trim()]);
+          }
+          const one = (name: string) => (values.get(name)?.length === 1 ? values.get(name)![0] : null);
+          const key = one('sec-websocket-key');
+          const ok = one('sec-websocket-version') === '13' && key !== null &&
+            /^[A-Za-z0-9+/]{22}==$/.test(key) && one('host') !== null &&
+            (values.get('sec-websocket-protocol')?.length ?? 1) === 1;
+          if (!ok) {
+            sock.end('HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
+            return;
+          }
+          const accept = new Bun.CryptoHasher('sha1')
+            .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+          const welcome = Buffer.from(`welcome:${one('host')}`);
+          sock.write(
+            'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
+            `Sec-WebSocket-Accept: ${accept}\r\nSec-WebSocket-Protocol: actioncable-v1-json\r\n\r\n`,
+          );
+          sock.write(Buffer.concat([Buffer.from([0x81, welcome.length]), welcome]));
+        },
+      },
+    });
+    try {
+      await declareServe('[serve.services]\nweb = 3000');
+      const taskId = await createTask(ctx, 'Strict handshake');
+      await publish([`3000/tcp -> 127.0.0.1:${strict.port}`]);
+
+      // What a browser's ActionCable consumer sends, written as raw bytes so the
+      // test's own client cannot add or duplicate a header: one key, one
+      // version, and the two subprotocols.
+      let reply = '';
+      const browser = await Bun.connect({
+        hostname: '127.0.0.1',
+        port: webPort,
+        socket: { data(_s, chunk) { reply += chunk.toString('latin1'); } },
+      });
+      browser.write(
+        `GET /cable HTTP/1.1\r\nHost: ${serveHost(taskId)}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n` +
+        `Origin: http://${serveHost(taskId)}\r\nSec-WebSocket-Version: 13\r\n` +
+        'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n' +
+        'Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n' +
+        'Sec-WebSocket-Protocol: actioncable-v1-json, actioncable-unsupported\r\n\r\n',
+      );
+      const welcome = `welcome:${serveHost(taskId)}`;
+      await withTimeout(
+        (async () => { while (!reply.includes(welcome)) await Bun.sleep(20); })(),
+        10_000,
+        'the welcome frame',
+      ).catch((err: Error) => {
+        throw new Error(`${err.message}: browser got ${JSON.stringify(reply)}; app saw ${JSON.stringify(seen)}`);
+      });
+      expect(reply).toStartWith('HTTP/1.1 101');
+      expect(reply.toLowerCase()).toContain('sec-websocket-protocol: actioncable-v1-json');
+      browser.end();
+    } finally {
+      strict.stop(true);
+    }
+  }, 30_000);
+
   // --- Nothing there ------------------------------------------------------
 
   test('a navigation to a down container lands on the task page', async () => {
@@ -442,6 +550,20 @@ describe('serve proxy', () => {
     });
     expect(res.status).toBe(404);
     expect(await res.text()).toContain('no task matches');
+  });
+
+  // INVARIANT: a service URL has ONE spelling, task first. The retired
+  // `<service>.<task>` order is not an alias: read task-first it names a task
+  // called `web`, so it must reach no app and answer as an unknown task.
+  test('the old service-first order does not reach the app', async () => {
+    const taskId = await liveTask();
+    const res = await fetch(`http://127.0.0.1:${webPort}/hello`, {
+      headers: { host: `web.${taskId}.lazy.localhost:${webPort}` },
+    });
+    expect(res.status).toBe(404);
+    const body = await res.text();
+    expect(body).toContain('no task matches');
+    expect(body).not.toContain('upstream saw');
   });
 
   test('the dashboard itself still answers on its own host', async () => {
@@ -518,7 +640,7 @@ describe('serve proxy', () => {
     // The existing Start container control, unchanged — and a POST.
     expect(html).toContain(`<form method="POST" action="/tasks/${fullId}/container/start"`);
     // Back to where they came from, composed from the task's own labels.
-    expect(html).toContain(`http://web.${taskId}.lazy.localhost:${webPort}`);
+    expect(html).toContain(`http://${taskId}.web.lazy.localhost:${webPort}`);
     expect(html).toContain('Try again');
   }, 20_000);
 
@@ -535,7 +657,7 @@ describe('serve proxy', () => {
     expect(page.status).toBe(200);
     const html = await page.text();
     expect(html).toContain('<strong>Services</strong>');
-    expect(html).toContain(`http://web.${taskId}.lazy.localhost:${webPort}`);
+    expect(html).toContain(`http://${taskId}.web.lazy.localhost:${webPort}`);
   }, 20_000);
 
   // --- The invariant ------------------------------------------------------
@@ -543,7 +665,7 @@ describe('serve proxy', () => {
   /**
    * INVARIANT: nothing on the proxy path starts a container or runs
    * `start_services_cmd`. A GET that started a container would be a CSRF vector
-   * — any page anywhere could embed `<img src="http://web.my-task.lazy.localhost:26024">`
+   * — any page anywhere could embed `<img src="http://my-task.web.lazy.localhost:26024">`
    * and spend the human's machine — and it would make an idle tab on a reload
    * timer into a resource bomb. Every start is a POST behind a button.
    *

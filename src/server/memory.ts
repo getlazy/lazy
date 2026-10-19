@@ -42,6 +42,7 @@ import { layoutHtml, layoutOpenHtml, layoutCloseHtml } from './templates';
 import { settingsPageHtml } from './settings';
 import { escapeHtml } from './review-diff';
 import { renderMarkdown } from './markdown';
+import { renderMarkdownWithCopy } from './copy-markdown';
 
 const INTRO =
   'What Lazy remembers about how this team works. Agents see a one-line summary ' +
@@ -180,7 +181,7 @@ export function memoryShowHtml(
       <div><dt>Created</dt><dd>${escapeHtml(formatDate(record.created_at))} by ${escapeHtml(byline(record.created_by, record.created_by_name, record.created_by_email))}</dd></div>
     </dl>
     <h2>Body</h2>
-    <div class="panel mem-body" id="memory-body"><div class="mem-prose">${renderMarkdown(record.body)}</div></div>
+    <div class="panel mem-body" id="memory-body"><div class="mem-prose">${renderMarkdownWithCopy(record.body)}</div></div>
     <h2>Write history</h2>
     ${historyListHtml(events)}
     <h2>Edit</h2>
@@ -308,7 +309,7 @@ export function memoryCompactHtml(
   } else {
     artifact = `<p class="text-muted" id="memory-compact-meta">${escapeHtml(status.compactSummary)} by ${escapeHtml(byline(compact.generated_by, compact.generated_by_name, compact.generated_by_email))}${compact.model ? ` · ${escapeHtml(compact.model)}` : ''}.</p>
       <p class="text-muted">${escapeHtml(sizeLine)}${status.overThreshold ? ' <span class="tag tag-warning">over threshold</span>' : ''}</p>
-      <div class="panel mem-compact-body" id="memory-compact-body"><div class="mem-prose">${renderMarkdown(compact.content)}</div></div>
+      <div class="panel mem-compact-body" id="memory-compact-body"><div class="mem-prose">${renderMarkdownWithCopy(compact.content)}</div></div>
       ${coverageHtml(records, compact)}`;
   }
 
@@ -384,7 +385,7 @@ export function memoryCompactStreamResultHtml(
   const size = compactRunSizeLine(result);
   const notes = result.notes.map((n) => `<p class="hint">${escapeHtml(n)}</p>`).join('');
   const body = compact
-    ? `<div class="panel mem-compact-body"><div class="mem-prose">${renderMarkdown(compact.content)}</div></div>
+    ? `<div class="panel mem-compact-body"><div class="mem-prose">${renderMarkdownWithCopy(compact.content)}</div></div>
        ${coverageHtml(records, compact)}`
     : '';
   return `</div>

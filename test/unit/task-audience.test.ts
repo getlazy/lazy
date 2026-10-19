@@ -24,7 +24,7 @@
 
 import { describe, test, expect } from 'bun:test';
 import type { Actor, Turn } from '../../src/types';
-import { audienceOf } from '../../src/task/audience';
+import { audienceOf, parentIsClusterOf } from '../../src/task/audience';
 
 function turn(role: Turn['role'], actor?: Actor): Pick<Turn, 'role' | 'actor'> {
   return { role, ...(actor ? { actor } : {}) };
@@ -99,5 +99,83 @@ describe('audienceOf — the fallbacks', () => {
   test('with nothing known at all, human — the safe direction', () => {
     expect(audienceOf({ turns: [] })).toBe('human');
     expect(audienceOf({ turns: [turn('agent')], createdBy: null })).toBe('human');
+  });
+});
+
+// INVARIANT (engineer, 2026-10-04): a cluster's child is ALWAYS agent-audience.
+// The cluster's driver runs every child by construction, and the cluster is the
+// task a person reads. It has to hold whoever launched the child's latest turn:
+// audience also decides where the child's protected-file questions are asked
+// (src/protection/deferral.ts), and a human-audience child would be asked at
+// its own accept — made by the DRIVER, whose approval would then count at the
+// cluster as if a person had decided. Supersedes, for clusters only, the
+// "a human picking up a loop's child" example above.
+describe('audienceOf — a cluster\'s child is always agent-audience', () => {
+  test('a human-launched turn does not make a cluster child human-audience', () => {
+    expect(audienceOf({ turns: [turn('human', 'human')], parentIsCluster: true })).toBe('agent');
+  });
+
+  test('neither does a builder launch or a human creator', () => {
+    expect(audienceOf({
+      turns: [turn('human', 'agent'), turn('agent'), turn('human', 'builder')],
+      createdBy: 'human',
+      parentIsCluster: true,
+    })).toBe('agent');
+  });
+
+  test('a child of any other parent still follows its turns', () => {
+    expect(audienceOf({ turns: [turn('human', 'human')], parentIsCluster: false })).toBe('human');
+  });
+});
+
+describe('parentIsClusterOf', () => {
+  const storageWith = (parent: { type?: string } | null | Error) => ({
+    getTask: async () => {
+      if (parent instanceof Error) throw parent;
+      return parent as never;
+    },
+  });
+  const child = { id: 'child-1234', target: { kind: 'task' as const, parentTaskId: 'parent-5678' } };
+
+  test('true for a child of a cluster', async () => {
+    expect(await parentIsClusterOf(storageWith({ type: 'cluster' }), child)).toBe(true);
+  });
+
+  test('false for a child of any other task type', async () => {
+    expect(await parentIsClusterOf(storageWith({ type: 'task' }), child)).toBe(false);
+  });
+
+  test('false for a top-level task, without reading anything', async () => {
+    const storage = { getTask: async () => { throw new Error('must not be read'); } };
+    expect(await parentIsClusterOf(storage, { id: 'top-1234', target: { kind: 'branch', branch: 'main' } })).toBe(false);
+  });
+
+  // The safe direction: the turn-derived audience stands, and a protected-file
+  // question is asked at the task's own accept rather than deferred.
+  test('false when the parent is missing or unreadable', async () => {
+    expect(await parentIsClusterOf(storageWith(null), child)).toBe(false);
+    expect(await parentIsClusterOf(storageWith(new Error('store down')), child)).toBe(false);
+  });
+});
+
+// INVARIANT: only LAUNCH turns (`role: 'human'`) decide the audience. Since
+// turn-owner attribution an agent's own reply turn carries `actor: 'agent'` —
+// the channel it wrote through, not who launched it. Reading reply turns made
+// every task that had ever answered look agent-launched: a person's own
+// subtask then skipped its reader-facing wrap-up and, through protected-file
+// deferral, its own accept's question.
+describe('audienceOf — an agent reply never decides', () => {
+  test('a human launch followed by an attributed agent reply stays human-audience', () => {
+    expect(audienceOf({ turns: [turn('human', 'human'), turn('agent', 'agent')] })).toBe('human');
+  });
+
+  test('a builder launch followed by an attributed agent reply stays human-audience', () => {
+    expect(audienceOf({
+      turns: [turn('human', 'builder'), turn('agent', 'agent'), turn('agent', 'agent')],
+    })).toBe('human');
+  });
+
+  test('an agent launch is still agent-audience', () => {
+    expect(audienceOf({ turns: [turn('human', 'agent'), turn('agent', 'agent')] })).toBe('agent');
   });
 });

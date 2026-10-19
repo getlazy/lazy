@@ -29,8 +29,9 @@ import { createTask } from '../helpers/fixtures';
 import { expectSuccess } from '../helpers/assertions';
 import { successScenario, type ClaudeScenarioFile } from '../helpers/fake-claude';
 import { codexSuccessScenario } from '../helpers/fake-codex';
-import { writeAgentApiKey } from '../../src/agent/credentials';
+import { setCredential } from '../../src/credentials/store';
 import { agentTurns, taskDir } from '../helpers/agent-seam';
+import { readTaskStatus, worktreePathFor, readSystemMessagesFile } from '../helpers/storage';
 
 /**
  * Set the project's review mode, and COMMIT the change — the daemon resolves
@@ -38,7 +39,7 @@ import { agentTurns, taskDir } from '../helpers/agent-seam';
  * worktree's lazy.toml consistent too (same rationale as setGuards).
  *
  * Edits the key INTO the `[review]` section `lazy init` wrote (never overwrite
- * the file, never append a duplicate section — see CLAUDE.md), and asserts the
+ * the file, never append a duplicate section — see AGENTS.md), and asserts the
  * edit changed something: a silent no-op config change is how tests pass for
  * the wrong reason.
  */
@@ -247,6 +248,141 @@ describe('low-high loop (real supervisor, fake claude)', () => {
     expect(String(agents[2].content)).toContain('Applied instruction 1');
   }, 120_000);
 
+  // INVARIANT: a self-review that writes to the worktree ends the TURN, fatally.
+  // No revise, and no wrap-up step after it: on a final turn the wrap-up
+  // includes `commit_leftovers`, which would commit the reviewer's unauthorized
+  // edit as if it were the agent's work. The edit stays in the worktree,
+  // uncommitted and unreverted, and the task parks for a person.
+  test('low_high: a self-review that writes ends the turn — no revise, no wrap-up, nothing committed', async () => {
+    await setReviewMode(ctx, 'low_high');
+    const taskId = await createTask(ctx, 'Reviewer writes', 'Do the work');
+
+    // The draft declares final through the handoff file (the supervisor's
+    // tools-down fallback), so the FULL wrap-up chain — commit_leftovers
+    // included — is what would run after the loop.
+    const draft = successScenario({
+      result: 'Draft: did the work.',
+      sessionId: 'low-high-draft-final',
+      commit: { message: 'Draft work', files: [{ path: 'draft.txt', content: 'draft\n' }] },
+    });
+    draft.steps.splice(3, 0, {
+      kind: 'write-file',
+      path: '.lazy-task-sandbox/turn-handoff.jsonl',
+      content: '{"kind":"final","content":"done"}\n',
+    });
+    // The reviewer leaves an edit it had no business making.
+    const review = successScenario({ result: REVIEW_INSTRUCTIONS + REPORT_BLOCK, sessionId: 'low-high-review-writes' });
+    review.steps.splice(3, 0, { kind: 'write-file', path: 'reviewer-edit.txt', content: 'unauthorized\n' });
+    // Anything invoked after the review commits the leftovers — which is exactly
+    // what commit_leftovers would do with the reviewer's edit.
+    const leftovers = successScenario({
+      result: 'Committed the leftovers.',
+      sessionId: 'low-high-after-review',
+      commit: { message: 'Commit leftovers', files: [{ path: 'reviewer-edit.txt', content: 'unauthorized\n' }] },
+    });
+    await ctx.setClaudeScenario({ sequence: [draft, review, leftovers, leftovers, leftovers] });
+
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    await ctx.lazy(['wait', taskId]);
+
+    // Draft and review, and NOTHING after them: no revise, no wrap-up step.
+    const invocations = await turnInvocations(ctx);
+    expect(invocations.length).toBe(2);
+
+    // The reviewer's edit is still loose in the worktree: never committed,
+    // never reverted.
+    const worktree = worktreePathFor(ctx.root, taskId);
+    expect(await readFile(join(worktree, 'reviewer-edit.txt'), 'utf-8')).toBe('unauthorized\n');
+    const status = Bun.spawnSync(['git', 'status', '--porcelain', '--', 'reviewer-edit.txt'], { cwd: worktree });
+    expect(status.stdout.toString()).toContain('?? reviewer-edit.txt');
+    const log = Bun.spawnSync(['git', 'log', '--format=%s', '-3'], { cwd: worktree });
+    expect(log.stdout.toString()).not.toContain('Commit leftovers');
+
+    // Fatal: parked for a person, never auto-resumed into a work turn that
+    // would commit the edit as its own. The failure names what changed.
+    expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
+    const turns = await allTurns(ctx.root, taskId);
+    const failure = turns.find(t => String(t.content).includes('is read-only but the worktree changed'));
+    expect(failure).toBeDefined();
+    expect(String(failure!.content)).toContain('reviewer-edit.txt');
+    // The draft and the review both ran in full: their tokens land on this turn.
+    expect(failure!.usage).toBeDefined();
+    expect(String(failure!.content)).toContain('Nothing was reverted');
+    // The loose edit is announced for a PERSON, never as an instruction to commit.
+    const show = await ctx.lazy(['show', taskId, '--full']);
+    expect(show.stdout).toContain('[Uncommitted work left behind]');
+    expect(show.stdout).not.toContain('Commit what belongs to the task');
+    expect(turns.some(t => String(t.content).includes('## Low-High Loop Revision'))).toBe(false);
+  }, 120_000);
+
+  /*
+   * THE REVISE PASS THAT ENDS DIRTY — the 2026-10-05 failure, on the real
+   * supervisor. The revise applies its fixes, never commits them, and ends
+   * "the broad run is still going; I'll commit once it passes". The turn parks
+   * without a final, and before it does the supervisor asks ONCE whether the
+   * agent has committed all its work (the commit nudge, resuming the revise).
+   */
+  function dirtyReviseScenario(nudgeCommit: boolean): ClaudeScenarioFile {
+    const revise = successScenario({
+      result: 'The broad run is still going. Once it passes I will commit.',
+      sessionId: 'low-high-revise-dirty',
+    });
+    revise.steps.splice(3, 0, { kind: 'write-file', path: 'revised-fix.txt', content: 'fixed\n' });
+    const nudge = successScenario({
+      result: nudgeCommit ? 'Committed revised-fix.txt.' : 'I cannot commit: my lazy tools are unavailable.',
+      sessionId: 'low-high-nudge',
+      ...(nudgeCommit
+        ? { commit: { message: 'Commit the revision', files: [{ path: 'revised-fix.txt', content: 'fixed\n' }] } }
+        : {}),
+    });
+    const loop = loopScenario(REVIEW_INSTRUCTIONS + REPORT_BLOCK) as { sequence: ClaudeScenarioFile[] };
+    const [draft, review] = loop.sequence;
+    return { sequence: [draft, review, revise, nudge] } as ClaudeScenarioFile;
+  }
+
+  // INVARIANT: a revise pass that leaves its work uncommitted is nudged about
+  // it once before the turn parks, and what the agent commits reaches the branch.
+  test('low_high: a revise that ends dirty is asked to commit, and the work lands', async () => {
+    await setReviewMode(ctx, 'low_high');
+    const taskId = await createTask(ctx, 'Revise ends dirty', 'Do the work');
+    await ctx.setClaudeScenario(dirtyReviseScenario(true));
+
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+
+    const invocations = await turnInvocations(ctx);
+    // Draft, review, revise — then the commit nudge, resuming the revise.
+    expect(invocations.length).toBeGreaterThanOrEqual(4);
+    expect(argvFlag(invocations[3].argv, '--resume')).toBe('low-high-revise-dirty');
+
+    const turns = await allTurns(ctx.root, taskId);
+    expect(turns.filter(t => String(t.content).startsWith('## Uncommitted Changes Check')).length).toBe(1);
+    const worktree = worktreePathFor(ctx.root, taskId);
+    const status = Bun.spawnSync(['git', 'status', '--porcelain', '--', 'revised-fix.txt'], { cwd: worktree });
+    expect(status.stdout.toString()).toBe('');
+    const log = Bun.spawnSync(['git', 'log', '--format=%s', '-5'], { cwd: worktree });
+    expect(log.stdout.toString()).toContain('Commit the revision');
+  }, 120_000);
+
+  // INVARIANT: when the agent still does not commit (here: it cannot, its
+  // tools are gone), the task says so out loud — a comment and a notice.
+  test('low_high: a revise left dirty that the agent cannot commit is announced', async () => {
+    await setReviewMode(ctx, 'low_high');
+    const taskId = await createTask(ctx, 'Revise ends dirty, no tools', 'Do the work');
+    await ctx.setClaudeScenario(dirtyReviseScenario(false));
+
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+
+    const show = await ctx.lazy(['show', taskId, '--full']);
+    expectSuccess(show);
+    expect(show.stdout).toContain('[Uncommitted work left behind]');
+    expect(show.stdout).toContain('revised-fix.txt');
+    const notices = readSystemMessagesFile(ctx.root)
+      .filter(m => String(m.title).includes('uncommitted work left behind'));
+    expect(notices.length).toBe(1);
+  }, 120_000);
+
   test('low_high: a review that approves the draft skips the revise phase', async () => {
     await setReviewMode(ctx, 'low_high');
     const taskId = await createTask(ctx, 'Approved draft', 'Do the work');
@@ -375,7 +511,7 @@ describe('low-high loop (real supervisor, fake codex)', () => {
     savedOpenAIKey = process.env.OPENAI_API_KEY;
     process.env.OPENAI_API_KEY = 'sk-LOW_HIGH_CODEX_TEST_KEY';
     ctx = await setupTestLazy({ fakeCodex: true });
-    await writeAgentApiKey(ctx.root, 'codex', process.env.OPENAI_API_KEY);
+    await setCredential(ctx.root, { provider: 'openai', kind: 'api-key', secret: process.env.OPENAI_API_KEY }, 'file');
   });
 
   afterEach(async () => {
@@ -413,12 +549,95 @@ describe('low-high loop (real supervisor, fake codex)', () => {
     const [draft, review, revise] = invocations;
     expect(draft.argv).not.toContain('resume');
     expect(review.argv.slice(0, 3)).toEqual(['exec', 'resume', '01a00000-0000-7000-8000-00000000d001']);
+    // The fake-binary seam runs the HOST-PROCESS runner, so this is the branch
+    // that keeps codex's native read-only sandbox (no container around it).
+    // Inside a task container the review instead gets the bypass flag and
+    // lazy's own write check — asserted on the argv in
+    // test/unit/codex-agent.test.ts, and the check itself below.
     expect(review.argv).toContain('sandbox_mode="read-only"');
     expect(review.argv).not.toContain('--sandbox');
+    expect(review.argv).not.toContain('--dangerously-bypass-approvals-and-sandbox');
     expect(revise.argv.slice(0, 3)).toEqual(['exec', 'resume', '01a00000-0000-7000-8000-00000000d002']);
 
     const turns = await allTurns(ctx.root, taskId);
     expect(turns.some((turn) => turn.turn_type === 'review')).toBe(true);
     expect(turns.some((turn) => String(turn.content).includes('Applied the review instructions.'))).toBe(true);
   }, 120_000);
+
+  /** The recorded self-review turn's verdict (a FAILED review starts with `FAILED:`). */
+  async function selfReviewVerdict(taskId: string): Promise<string> {
+    const turns = await allTurns(ctx.root, taskId);
+    const review = turns.find((turn) => turn.turn_type === 'review');
+    expect(review).toBeDefined();
+    return String((review!.review as { verdict?: string } | undefined)?.verdict ?? '');
+  }
+
+  // INVARIANT: a read-only self-review that WRITES fails loudly — the turn ends
+  // FATALLY with the write check's message naming what changed, the task parks
+  // for a person — and nothing is reverted. Inside a container codex's own
+  // sandbox is bypassed, so lazy's before/after check is what keeps the review
+  // read-only. (Until 2026-10-04 this was a non-fatal FAILED review turn, and
+  // the turn went on into the wrap-up — see the fake-claude twin above.)
+  test('a self-review that modifies the worktree fails the turn fatally', async () => {
+    await setReviewMode(ctx, 'low_high');
+    const taskId = await createTask(ctx, 'Codex review writes', 'Do the work');
+    await ctx.setCodexScenario({
+      sequence: [
+        codexSuccessScenario({
+          result: 'Draft complete.',
+          sessionId: '01a00000-0000-7000-8000-00000000e001',
+          commit: { message: 'Codex draft', files: [{ path: 'draft.txt', content: 'draft\n' }] },
+        }),
+        codexSuccessScenario({
+          result: REVIEW_INSTRUCTIONS + REPORT_BLOCK,
+          sessionId: '01a00000-0000-7000-8000-00000000e002',
+          commit: { message: 'Reviewer sneaks a fix', files: [{ path: 'draft.txt', content: 'fixed by reviewer\n' }] },
+        }),
+      ],
+    });
+
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    await ctx.lazy(['wait', taskId]);
+
+    expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
+    const turns = await allTurns(ctx.root, taskId);
+    const failure = turns.find((t) => String(t.content).includes('is read-only but the worktree changed'));
+    expect(failure).toBeDefined();
+    expect(String(failure!.content)).toContain('HEAD moved');
+    expect(String(failure!.content)).toContain('Nothing was reverted');
+    // No revise phase ran on a review that broke its own rules.
+    expect(turns.some((t) => String(t.content).includes('## Low-High Loop Revision'))).toBe(false);
+  }, 120_000);
+
+  // INVARIANT: a review that could not inspect the work is a FAILED review —
+  // an infrastructure failure a person sees — never a pass and never a
+  // `needs_work` verdict. Both shapes are pinned: the reviewer saying so, and
+  // the bare approval with no tool call that Codex reviewers produced while
+  // bubblewrap blocked every command.
+  test('"I could not inspect" and a bare approval with no tool call are recorded as failed reviews', async () => {
+    await setReviewMode(ctx, 'low_high');
+    for (const [label, reply] of [
+      ['cannot-inspect', 'REVIEW_COULD_NOT_INSPECT: bwrap: No permissions to create new namespace'],
+      ['bare-approval', 'LOW_HIGH_LOOP_APPROVED'],
+    ] as const) {
+      const taskId = await createTask(ctx, `Codex ${label}`, 'Do the work');
+      await ctx.setCodexScenario({
+        sequence: [
+          codexSuccessScenario({
+            result: 'Draft complete.',
+            sessionId: '01a00000-0000-7000-8000-00000000f001',
+            commit: { message: 'Codex draft', files: [{ path: `${label}.txt`, content: 'draft\n' }] },
+          }),
+          codexSuccessScenario({ result: reply, sessionId: '01a00000-0000-7000-8000-00000000f002' }),
+        ],
+      });
+
+      expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+      expectSuccess(await ctx.lazy(['wait', taskId]));
+
+      const verdict = await selfReviewVerdict(taskId);
+      expect(verdict).toStartWith('FAILED:');
+      expect(verdict).toContain(label === 'cannot-inspect' ? 'could not inspect' : 'without calling a single tool');
+    }
+  }, 240_000);
 });

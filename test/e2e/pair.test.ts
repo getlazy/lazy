@@ -541,7 +541,7 @@ cp "${staged}" "${sessionsDir}/2026-09-05T12-00-00-000Z_${PI_FIXTURE_SESSION_ID}
     writeFileSync(
       tomlPath,
       `${before}\n[agents.local-pi]\nharness = "pi"\nmodel = "qwen3.8:latest"\n` +
-      `endpoint = "http://127.0.0.1:${ollamaStub.port}"\n`,
+      `endpoint = "http://127.0.0.1:${ollamaStub.port}"\ncredential = "none"\n`,
     );
 
     const taskId = await createTask(ctx, 'Pi capture task', 'Some work');

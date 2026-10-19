@@ -200,10 +200,10 @@ export async function linkTask(
     );
 
     const metadata = applyLinkIdentity(imported.metadata, params.ref.trim(), imported.branch);
-    // Pin task_ref to the short id used for the worktree path. Start otherwise
-    // re-derives a code-based ref, looks for a different directory, and fails
-    // because the adopted branch is already checked out here.
-    const linkedRef = taskRef(created);
+    // A linked task's ref is its short id (the worktree directory below), not
+    // the code-based ref createTask pinned: the adopted branch is not
+    // `lazy/<ref>`, so the ref names only the worktree and container.
+    const linkedRef = shortId(created.id);
     metadata.task_ref = linkedRef;
     for (const [key, value] of Object.entries(metadata)) {
       await storage.updateTaskMetadata(created.id, key, value);

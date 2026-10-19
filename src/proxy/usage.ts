@@ -171,6 +171,35 @@ function mergeOpenAISSEEvent(acc: UsageAccumulator, data: Record<string, unknown
   if (response && typeof response === 'object') acc.mergeOpenAI(response.usage);
 }
 
+/**
+ * Does this parsed SSE payload carry generated CONTENT — the event whose
+ * arrival defines time-to-first-token? Anthropic: `content_block_delta`.
+ * OpenAI chat: a chunk whose `delta` has non-empty text, reasoning or tool
+ * arguments (the opening role-only chunk does not count). Responses: a
+ * `response.*.delta` event with a non-empty payload.
+ */
+function isContentEvent(data: Record<string, unknown>, wire: UsageWire): boolean {
+  if (wire === 'anthropic') return data.type === 'content_block_delta';
+  const type = data.type;
+  if (typeof type === 'string') {
+    if (!type.startsWith('response.') || !type.endsWith('.delta')) return false;
+    const delta = data.delta;
+    return typeof delta === 'string' ? delta.length > 0 : delta !== null && delta !== undefined;
+  }
+  const choices = data.choices;
+  if (!Array.isArray(choices)) return false;
+  return choices.some((choice) => {
+    const delta = (choice as Record<string, unknown> | null)?.delta as Record<string, unknown> | undefined;
+    if (!delta || typeof delta !== 'object') return false;
+    for (const key of ['content', 'reasoning_content', 'reasoning', 'refusal']) {
+      const v = delta[key];
+      if (typeof v === 'string' && v.length > 0) return true;
+    }
+    const calls = delta.tool_calls;
+    return (Array.isArray(calls) && calls.length > 0) || delta.function_call != null;
+  });
+}
+
 /** Merge every usage-bearing `data:` line of a buffered SSE body. */
 function mergeSSEBody(acc: UsageAccumulator, bodyText: string, wire: UsageWire): void {
   for (const line of bodyText.split('\n')) {
@@ -178,20 +207,25 @@ function mergeSSEBody(acc: UsageAccumulator, bodyText: string, wire: UsageWire):
   }
 }
 
-/** Merge one raw SSE line (with or without a trailing `\r`). */
-function mergeSSELine(acc: UsageAccumulator, line: string, wire: UsageWire): void {
+/**
+ * Merge one raw SSE line (with or without a trailing `\r`). Returns whether the
+ * line was a content event (see {@link isContentEvent}).
+ */
+function mergeSSELine(acc: UsageAccumulator, line: string, wire: UsageWire): boolean {
   const trimmed = line.trimEnd();
-  if (!trimmed.startsWith('data:')) return;
+  if (!trimmed.startsWith('data:')) return false;
   const payload = trimmed.slice('data:'.length).trim();
-  if (!payload || payload === '[DONE]') return;
+  if (!payload || payload === '[DONE]') return false;
   try {
     const data = JSON.parse(payload) as Record<string, unknown>;
     if (wire === 'openai') mergeOpenAISSEEvent(acc, data);
     else mergeSSEEvent(acc, data);
+    return isContentEvent(data, wire);
   } catch {
     // A malformed data line means this event is unreadable — skip it and keep
     // scanning. Usage lives on its own event, so one bad line elsewhere in the
     // stream must not cost us the whole record.
+    return false;
   }
 }
 
@@ -244,13 +278,15 @@ class UsageScanner {
   private resyncing = false;
   /** Set once the JSON accumulator hits its cap: stop accumulating entirely. */
   private overflowed = false;
+  /** Wall-clock (ms) of the chunk that first carried a content event. */
+  firstContentAt: number | null = null;
 
   constructor(isStream: boolean, wire: UsageWire) {
     this.isStream = isStream;
     this.wire = wire;
   }
 
-  push(chunk: Uint8Array): void {
+  push(chunk: Uint8Array, now: number): void {
     if (this.overflowed) return;
     const text = this.decoder.decode(chunk, { stream: true });
     if (!text) return;
@@ -276,7 +312,7 @@ class UsageScanner {
         this.resyncing = false;
         continue;
       }
-      mergeSSELine(this.acc, line, this.wire);
+      if (mergeSSELine(this.acc, line, this.wire) && this.firstContentAt === null) this.firstContentAt = now;
     }
     if (this.buffer.length > MAX_SSE_LINE_BYTES) {
       this.buffer = '';
@@ -285,12 +321,14 @@ class UsageScanner {
   }
 
   /** Flush the decoder + any remaining unterminated line, then report. */
-  result(): ProxyTokenUsage | null {
+  result(now: number): ProxyTokenUsage | null {
     const tail = this.decoder.decode();
     if (tail) this.buffer += tail;
     if (this.overflowed) return this.acc.result();
     if (this.isStream) {
-      if (!this.resyncing && this.buffer) mergeSSELine(this.acc, this.buffer, this.wire);
+      if (!this.resyncing && this.buffer && mergeSSELine(this.acc, this.buffer, this.wire) && this.firstContentAt === null) {
+        this.firstContentAt = now;
+      }
     } else if (this.buffer) {
       try {
         const parsed = JSON.parse(this.buffer) as Record<string, unknown>;
@@ -302,6 +340,47 @@ class UsageScanner {
     this.buffer = '';
     return this.acc.result();
   }
+}
+
+/**
+ * When the stream's interesting moments happened (wall-clock ms, the same
+ * clock as the audit record's `ts`). `firstContentAt` is null for a response
+ * with no content event (non-streamed, or a stream that ended without one).
+ */
+export interface StreamTiming {
+  firstContentAt: number | null;
+  endedAt: number;
+  /** True only when the upstream stream ran to its end; false on client cancel or a read error. */
+  completed: boolean;
+}
+
+/**
+ * Read a whole response body — for a caller that must buffer it (the tool-use
+ * policy rewrites the complete body) — timing it exactly as the tee times a
+ * forwarded stream: chunk by chunk, so the first content event is stamped when
+ * its bytes ARRIVE rather than when the last byte does. `text` is what
+ * `Response.text()` would have produced (UTF-8, invalid bytes replaced).
+ */
+export async function readBodyTimed(
+  body: ReadableStream<Uint8Array>,
+  isStream: boolean,
+  wire: UsageWire = 'anthropic',
+  now: () => number = Date.now,
+): Promise<{ text: string; firstContentAt: number | null; endedAt: number }> {
+  const scanner = new UsageScanner(isStream, wire);
+  const decoder = new TextDecoder('utf-8');
+  const reader = body.getReader();
+  let text = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    text += decoder.decode(value, { stream: true });
+    scanner.push(value, now());
+  }
+  text += decoder.decode();
+  const endedAt = now();
+  scanner.result(endedAt);
+  return { text, firstContentAt: scanner.firstContentAt, endedAt };
 }
 
 /**
@@ -319,16 +398,18 @@ class UsageScanner {
 export function teeUsageStream(
   body: ReadableStream<Uint8Array>,
   isStream: boolean,
-  onDone: (usage: ProxyTokenUsage | null) => void,
+  onDone: (usage: ProxyTokenUsage | null, timing: StreamTiming) => void,
   wire: UsageWire = 'anthropic',
+  now: () => number = Date.now,
 ): ReadableStream<Uint8Array> {
   const scanner = new UsageScanner(isStream, wire);
   const reader = body.getReader();
   let finished = false;
-  const finish = () => {
+  const finish = (completed = false) => {
     if (finished) return;
     finished = true;
-    onDone(scanner.result());
+    const endedAt = now();
+    onDone(scanner.result(endedAt), { firstContentAt: scanner.firstContentAt, endedAt, completed });
   };
 
   return new ReadableStream<Uint8Array>({
@@ -337,12 +418,12 @@ export function teeUsageStream(
         const { done, value } = await reader.read();
         if (done) {
           controller.close();
-          finish();
+          finish(true);
           return;
         }
         // Forward before inspecting — the client never waits on the scanner.
         controller.enqueue(value);
-        scanner.push(value);
+        scanner.push(value, now());
       } catch (err) {
         // The upstream stream broke mid-flight. Propagate to the client (it must
         // see the failure, not a silently truncated body) and still close out the

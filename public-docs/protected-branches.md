@@ -9,7 +9,8 @@ against one.
 
 ## Turning it on: one command, zero branch listing
 
-Protection is **opt-in — OFF by default**. A project with no `[protection]`
+Protection is **opt-in — OFF by default** (except in Lazy Teams, [where it
+is on by default](#in-lazy-teams-pressing-accept-is-the-approval)). A project with no `[protection]`
 section (or with `enabled = false`) has no protection at all: accepts into
 `main` behave exactly as they always have. That is deliberate — a brand-new
 user's first `lazy accept` should merge, not refuse over a gate they have not
@@ -177,6 +178,42 @@ identical decision. Details that follow from that:
   shut and the passphrase prompt is the offline path.
 - A refusal on a forge project names both routes; on a `local` project it
   names only the terminal route, because there is no PR to approve.
+
+## In Lazy Teams: pressing Accept is the approval
+
+Lazy Teams has no passphrase. Everyone there has already signed in, so a
+protected merge is approved by **a signed-in member pressing Accept** on the
+task's Accept page. The page says the merge is protected before you confirm,
+and the accepted task records who approved it ("Protected merge approved by
+… (Accept in Lazy Teams)").
+
+**Protection is on by default in Lazy Teams.** A Teams project's default
+branch is protected unless its configuration says otherwise. That includes
+projects created before this default existed, unless their configuration
+already sets `[protection] enabled`. Before, nobody could complete a protected
+accept in Teams, so protection there stayed off. Now the protected accept is
+one button press for a person, and what it stops is the builder and agents
+merging into the default branch on their own. Merges into a parent task's
+branch are not affected. With protection on, only team admins may push the
+default branch straight to a repository Lazy Teams hosts. To turn it off, a project owner sets **Protection
+on** to off on the project's Configuration page (`[protection] enabled =
+false`).
+
+What counts and what does not:
+
+- **Counts:** a member's own Accept in the browser.
+- **Does not count:** the builder, any task agent, or anything over MCP. They
+  are refused exactly as on a laptop.
+- **Does not count:** `lazy accept` from a clone bound to Lazy Teams. It runs
+  on your laptop with your member token, and any program you start there could
+  run it too, including an agent or a builder. So a bound clone cannot claim
+  to be your Accept. Use the Accept button instead.
+- **Does not count:** an administrator acting as another member. That is not
+  the member's own approval, so accepting is not offered while acting as
+  someone else.
+
+Approving the task's PR/MR on a forge still satisfies the gate in Teams, as
+everywhere else.
 
 ## Enrolling the passphrase: `lazy system passphrase`
 

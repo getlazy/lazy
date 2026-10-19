@@ -1,3 +1,5 @@
+
+**Lazy Teams** adds a sixth option, **Unblock agent**, next to these five: it responds to the item with your note and resumes the agent in the same step (a note is required). Other open blocking items on the task stay open, and the form says how many.
 # Raised items
 
 A **raised item** is anything an agent surfaces to a human: a decision it needs
@@ -235,6 +237,11 @@ Filters and order compose: an order you picked survives a change of filter, and
 re-sorting keeps the filter you are looking through. The gate filters are
 labelled **Blocking** and **FYI**, the same two words the badges below use.
 
+The open view, in the dashboard and in Lazy Teams, shows only items from tasks that are
+**blocked** — the ones waiting on you. **All** shows every state and every task;
+**Blocked tasks** and **Finished tasks** narrow the task side, and `?status=any`,
+`?status=blocked` or `?status=complete-only` pick a task filter in the URL.
+
 Each item has a detail page whose main content is one **Decide** control —
 respond, acknowledge, dismiss with a note, or promote (goal and code you can
 edit) — alongside the body, where it came from, a blocking toggle, and its
@@ -366,7 +373,7 @@ ones under them.
 
 **Lazy Teams** shows open blocking items on the task page's **Current review**
 and open items of both kinds on the accept page, and lets you resolve them
-inline; a decision can be undone from the item's own **Raised** page until the
+inline; every item shows when it was raised (ISO 8601, UTC) and the turn it was raised in, linked to that turn, and an open item offers **Ask**, **Comment** and **Unblock** right on it, quoting the item to the agent; a decision can be undone from the item's own **Raised** page until the
 next unblock or accept. Its project nav has a **Raised** page — the same cross-task
 queue, blocking first, with a blocking/FYI filter, a toggle on every row for the
 flag itself, and a badge counting open blocking and open FYI separately. See

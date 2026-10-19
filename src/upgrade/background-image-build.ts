@@ -23,7 +23,7 @@
  *    drop the staging tag and the built layers remain in the runtime's build
  *    cache, so the next upgrade is warm rather than starting over.
  *
- * FAILURES ARE LOUD (CLAUDE.md: no silent fallbacks). A failed background build
+ * FAILURES ARE LOUD (AGENTS.md: no silent fallbacks). A failed background build
  * fails the upgrade — it never falls back to "keep the old image and carry on",
  * which would silently produce an upgrade that upgraded nothing.
  */

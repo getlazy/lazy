@@ -138,6 +138,18 @@ export function searchResultHref(
         return `${taskPath(ref, duplicatedCodes)}/turns/${r.turn_sequence}`;
       }
       return taskPath(ref, duplicatedCodes);
+    case 'comment':
+      return `${taskPath(ref, duplicatedCodes)}/comments#comment-${encodeURIComponent(r.entity_id)}`;
+    case 'commit':
+      return `${taskPath(ref, duplicatedCodes)}/commits/${encodeURIComponent(r.entity_id)}`;
+    case 'journal':
+      return `${taskPath(ref, duplicatedCodes)}/journal#journal-${encodeURIComponent(r.entity_id)}`;
+    case 'artifact':
+      return `${taskPath(ref, duplicatedCodes)}/artifacts`;
+    case 'review_comment':
+      return `${taskPath(ref, duplicatedCodes)}/changes`;
+    case 'message':
+      return `/messages/${encodeURIComponent(r.entity_id)}`;
     case 'conversation':
       return `/builders/${encodeURIComponent(r.entity_id)}`;
     case 'memory':
@@ -243,6 +255,24 @@ export function commandPaletteScript(): string {
     if (r.entity_type === 'turn' && r.turn_sequence !== undefined) {
       return '/tasks/' + encodeURIComponent(seg) + '/turns/' + r.turn_sequence;
     }
+    if (r.entity_type === 'comment') {
+      return '/tasks/' + encodeURIComponent(seg) + '/comments#comment-' + encodeURIComponent(r.entity_id);
+    }
+    if (r.entity_type === 'commit') {
+      return '/tasks/' + encodeURIComponent(seg) + '/commits/' + encodeURIComponent(r.entity_id);
+    }
+    if (r.entity_type === 'journal') {
+      return '/tasks/' + encodeURIComponent(seg) + '/journal#journal-' + encodeURIComponent(r.entity_id);
+    }
+    if (r.entity_type === 'artifact') {
+      return '/tasks/' + encodeURIComponent(seg) + '/artifacts';
+    }
+    if (r.entity_type === 'review_comment') {
+      return '/tasks/' + encodeURIComponent(seg) + '/changes';
+    }
+    if (r.entity_type === 'message') {
+      return '/messages/' + encodeURIComponent(r.entity_id);
+    }
     if (r.entity_type === 'conversation') {
       return '/builders/' + encodeURIComponent(r.entity_id);
     }
@@ -323,7 +353,7 @@ export function commandPaletteScript(): string {
   function renderSearchResults(results) {
     setHint(results.length ? (results.length + ' result' + (results.length === 1 ? '' : 's')) : 'No results');
     items = results.map(function (r) {
-      var id = r.task_code || (r.task_id ? String(r.task_id).slice(0, 8) : '');
+      var id = r.task_code || (r.task_id ? String(r.task_id).slice(0, 8) : String(r.entity_id || '').slice(0, 8));
       var type = r.entity_type || 'result';
       if (r.entity_type === 'turn' && r.turn_sequence !== undefined) {
         type = 'turn #' + r.turn_sequence;

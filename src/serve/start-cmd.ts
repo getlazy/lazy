@@ -135,3 +135,47 @@ export async function importStartServicesCmdFromConfig(
   });
   return imported;
 }
+
+/**
+ * The project's Stop services command — what stops a task's services, beside
+ * the Start one. Stored the same way (the project settings record), with no
+ * lazy.toml import: there has never been a lazy.toml key for it. With none set
+ * (or after a clear, which simply removes it), stopping is what it always was:
+ * lazy ends the Start services process group. A configured command runs FIRST,
+ * and the process group is ended after it either way, so nothing Start launched
+ * outlives a stop (src/daemon/serve-run.ts `stopServicesScript`).
+ */
+export function validateStopServicesCmd(raw: unknown): string {
+  try {
+    return validateStartServicesCmd(raw);
+  } catch (err) {
+    if (err instanceof StartServicesCmdError) {
+      throw new StartServicesCmdError(
+        err.message.replaceAll('Start services', 'Stop services').replace('starts your services', 'stops your services')
+          .replaceAll('bin/dev', 'bin/stop'),
+      );
+    }
+    throw err;
+  }
+}
+
+/** Persist `raw` as the project's Stop services command; returns what was saved. */
+export async function setStopServicesCmd(storage: Storage, raw: unknown): Promise<string> {
+  const command = validateStopServicesCmd(raw);
+  await updateProjectSettings(storage, (current) => ({ ...(current ?? {}), stopServicesCmd: command }));
+  return command;
+}
+
+/** Clear the project's Stop services command: stopping goes back to ending the process group. */
+export async function clearStopServicesCmd(storage: Storage): Promise<void> {
+  await updateProjectSettings(storage, (current) => {
+    const { stopServicesCmd: _cmd, ...rest } = current ?? {};
+    return rest;
+  });
+}
+
+/** The project's Stop services command, '' when none is set. */
+export async function resolveProjectStopServicesCmd(storage: Storage): Promise<string> {
+  const value = (await storage.getProjectSettings())?.stopServicesCmd;
+  return typeof value === 'string' ? value.trim() : '';
+}

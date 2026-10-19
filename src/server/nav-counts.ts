@@ -36,10 +36,13 @@ export interface NavCounts {
  * ONE ENDPOINT, NOT FOUR: the badge script runs on EVERY page, so a fetch per
  * badge would multiply the dashboard's request count by four to fill four
  * numbers in the chrome. Each count is produced by the SAME query its own page
- * runs — the review queue through {@link ReviewActions}, open raised items with
- * the option set behind "Needs attention", unread through the inbox's own
- * `unreadCount` — so a badge can never quietly disagree with the page it points
- * at. Bodies and rows are never shipped; this route answers with numbers.
+ * runs — the review badge is how many live tasks are `blocked`, `conflict` or
+ * `submitted` (the membership `listQueue` filters by, counted on the task read
+ * this route already did, not by building a queue entry per task), open raised
+ * items with the option set behind "Needs attention", unread through the
+ * inbox's own `unreadCount` — so a badge can never quietly disagree with the
+ * page it points at. Bodies and rows are never shipped; this route answers
+ * with numbers.
  *
  * CONVERSATIONS HAVE NO READ STATE. Nothing in the store records that a human
  * looked at a conversation, and inventing a server-side one would mean writing
@@ -81,24 +84,22 @@ export async function computeNavCounts(
   // otherwise become a 500 and the script would render no numbers at all —
   // Review, Inbox and Raised would go dark because a conversation file is
   // corrupt.
-  const [messages, raised, conversations, queue, liveTasks] = await Promise.allSettled([
+  const [messages, raised, conversations, liveTasks] = await Promise.allSettled([
     storage.listSystemMessages({ includeDismissed: false }),
     // The exact option set /raised uses for its default "Needs attention"
     // view, so the badge and that page report the same numbers.
     storage.listRaisedItems({ state: 'open', collapseExactDuplicates: true }),
     // Builders, not session files: a compaction must not count as a new one.
     storage.listBuilders(),
-    // No action port means no review surface either (those routes answer 503),
-    // so the badge reports nothing rather than counting the queue a second way
-    // here — a number pointing at a page that will not load is worse than none.
-    actions ? actions.listQueue() : Promise.resolve(null),
-    // Clusters badge: live cluster TASKS. Non-terminal only, because the badge
-    // asks "how many clusters are running", and a finished cluster is history the
-    // page still lists.
+    // Clusters badge, and the review badge: live TASKS. Non-terminal only,
+    // because a finished cluster is history and a finished task is not waiting
+    // for review. The review count is how many of these are blocked, conflict
+    // or submitted — the same set `listQueue` keeps. Building that queue (its
+    // comments and sessions) just to take `.length` ran on every page.
     storage.listTasksWithOptions({ nonTerminalOnly: true }),
   ]);
 
-  logRejected('nav counts', { messages, raised, conversations, queue, liveTasks });
+  logRejected('nav counts', { messages, raised, conversations, liveTasks });
 
   const summaries = conversations.status === 'fulfilled' ? conversations.value : null;
   const latestAt = summaries?.reduce((max, c) => Math.max(max, c.importedAt), 0) ?? 0;
@@ -110,7 +111,14 @@ export async function computeNavCounts(
 
   return {
     unread: messages.status === 'fulfilled' ? unreadCount(messages.value) : null,
-    review: queue.status === 'fulfilled' ? (queue.value?.length ?? null) : null,
+    // No action port means the review routes answer 503, so the badge reports
+    // nothing rather than a number pointing at a page that will not load.
+    // A failed task read is the same answer: null, not zero.
+    review: !actions
+      ? null
+      : liveTasks.status === 'fulfilled'
+        ? liveTasks.value.filter((task) => isBlockedStatus(task.status)).length
+        : null,
     clusters: liveTasks.status === 'fulfilled'
       ? activeClusterCount(liveTasks.value.filter((t) => isClusterTask(t)))
       : null,

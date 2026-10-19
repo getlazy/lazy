@@ -1,5 +1,8 @@
+import { findLatestSessionFile, watchEntryBelongsToTurn, watchSessionReplayStart } from '../../src/agent/session-discovery';
+import { WatchTurnTracker } from '../../src/agent/watch-turns';
+import type { Turn } from '../../src/types';
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtemp, rm } from 'fs/promises';
+import { mkdtemp, rm, writeFile, utimes, appendFile, readFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Server } from 'bun';
@@ -361,5 +364,61 @@ describe('rpc watch upgrader authorization', () => {
     }), server);
     expect((out as Response).status).toBe(404);
     expect(looked).toBe(true);
+  });
+});
+
+describe('watch session replay', () => {
+  test('shows recent turns, reports newly completed turns, and anchors session output to the latest request', async () => {
+    const emitted: string[] = [];
+    const start = Date.now() - 60_000;
+    const records = [
+      { sequence: 1, role: 'human', timestamp: start - 100_000, content: 'Old request', agent: 'claude-code' },
+      { sequence: 2, role: 'agent', timestamp: start - 90_000, content: 'Old result' },
+      { sequence: 3, role: 'human', timestamp: start, content: 'New request', agent: 'codex' },
+    ] as Turn[];
+    const storage = {
+      getTurnCountByTaskId: async () => records.length,
+      getSessionByTaskId: async () => ({ id: 'session' }),
+      getSessionTurns: async () => records,
+    } as unknown as Storage;
+    const tracker = new WatchTurnTracker(storage, 'task', (line) => emitted.push(line));
+    await tracker.refresh();
+    expect(tracker.turnStart).toBe(start);
+    expect(emitted.some((line) => line.includes('New request'))).toBe(true);
+    await tracker.refresh();
+    expect(emitted.filter((line) => line.includes('New request'))).toHaveLength(1);
+    records.push({ sequence: 4, role: 'agent', timestamp: start + 500, content: 'New result' } as Turn);
+    await tracker.refresh();
+    expect(emitted.at(-1)).toContain('New result');
+    expect(watchEntryBelongsToTurn(new Date(start - 90_000).toISOString(), tracker.turnStart)).toBe(false);
+    expect(watchEntryBelongsToTurn(new Date(start + 500).toISOString(), tracker.turnStart)).toBe(true);
+    expect(watchEntryBelongsToTurn(undefined, tracker.turnStart)).toBe(false);
+  });
+
+  test('ignores old sessions even when a newer turn used another harness', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'lazy-watch-turn-'));
+    try {
+      const path = join(directory, 'old.jsonl');
+      await writeFile(path, JSON.stringify({ type: 'assistant', timestamp: new Date(1_000_000).toISOString() }) + '\n');
+      await utimes(path, new Date(1_000_000), new Date(1_000_000));
+      expect(await findLatestSessionFile(directory, 2_000_000)).toBeNull();
+      await appendFile(path, JSON.stringify({ type: 'assistant', timestamp: new Date(2_000_001).toISOString() }) + '\n');
+      expect((await findLatestSessionFile(directory, 2_000_000))?.path).toBe(path);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('starts at a complete record even when the window cuts through UTF-8', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'lazy-watch-bytes-'));
+    try {
+      const path = join(directory, 'utf8.jsonl');
+      const data = Buffer.from('x'.repeat(32) + 'é'.repeat(256 * 1024 / 2) + '\n' + '{"timestamp":"recent!"}\n');
+      await writeFile(path, data);
+      const start = await watchSessionReplayStart(path, data.length);
+      expect((await readFile(path)).subarray(start).toString()).toBe('{"timestamp":"recent!"}\n');
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });

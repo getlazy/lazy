@@ -175,7 +175,7 @@ export function resolveBuilderModel(
  * An agent that returns a blank string DOES throw. That is not a user's stale
  * state but a broken agent implementation: the contract spells "no default"
  * `null`, so a blank is neither answer, and silently reading it as either would
- * hide the bug behind a model nobody chose (CLAUDE.md: no silent fallbacks).
+ * hide the bug behind a model nobody chose (AGENTS.md: no silent fallbacks).
  * Unreachable for the shipped agents — this is the guard rail for the next one.
  */
 export function agentDeclaredModel(harness: string | undefined): string | null {

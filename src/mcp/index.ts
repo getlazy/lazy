@@ -17,19 +17,25 @@ export { McpServer } from './server';
 export { allTools, createAllHandlers, type McpToolContext } from './tools';
 
 import { McpServer } from './server';
-import { allTools, createAllHandlers, type McpToolContext } from './tools';
+import { allTools, capabilityTools, createAllHandlers, type McpToolContext } from './tools';
 import {
   isToolAllowedOnToolset,
   mcpToolsetFromFlags,
   type McpToolset,
 } from './tool-access';
-import { isToolForRole, roleForTaskId, type McpRole } from './tool-roles';
+import { isToolCapabilityGranted, isToolForRole, roleForTaskId, type McpCapability, type McpRole } from './tool-roles';
 import { definitionForRole } from './tool-surface';
 import type { McpTool, McpToolHandler } from './types';
 import mcpServerInstructions from '../prompts/mcp-server-instructions.md' with { type: 'text' };
 
 /** Options shared by every MCP server entry point. */
 export interface McpServerOptions {
+  /**
+   * Capabilities the daemon granted this caller in its MCP config. A gated
+   * tool is registered either way (its handler refuses) but advertised only
+   * with its capability.
+   */
+  capabilities?: readonly McpCapability[];
   /**
    * Serve only the read-only toolset (`--read-only`).
    *
@@ -123,6 +129,22 @@ export function registerTools(
       server.registerTool(definitionForRole(tool, role), handler, { advertise: isToolForRole(tool.name, role) });
     }
   }
+  // Capability tools: registered whenever a handler exists (so a stale call
+  // gets the handler's own refusal), ADVERTISED only to a task agent on a work
+  // turn whose daemon granted the capability.
+  // On a read-only or review turn the tool is always registered with the
+  // restricted-turn refusal, whether or not a handler was minted for it — a
+  // stale call must never get "Unknown tool".
+  for (const tool of capabilityTools) {
+    if (toolset !== 'full') {
+      server.registerTool(tool, restrictedToolRefusal(tool.name, toolset), { advertise: false });
+      continue;
+    }
+    const handler = handlers.get(tool.name);
+    if (!handler) continue;
+    const advertise = role === 'agent' && isToolCapabilityGranted(tool.name, opts?.capabilities);
+    server.registerTool(tool, handler, { advertise });
+  }
 }
 
 /**
@@ -196,13 +218,17 @@ export async function startMcpServerDaemonProxy(
   // is hidden, not removed, and its refusal is produced by the handler running
   // inside the daemon — so it still needs a proxy handler to reach.
   const toolset = resolveServerToolset(opts);
-  const served = allTools.filter((t) => isToolAllowedOnToolset(t.name, toolset));
+  const served = [
+    ...allTools.filter((t) => isToolAllowedOnToolset(t.name, toolset)),
+    ...(toolset === 'full' ? capabilityTools : []),
+  ];
   const handlers = createAllDaemonProxyHandlers(config, served.map((t) => t.name));
 
   registerTools(server, handlers, allTools, {
     ...opts,
     toolset,
     role: opts?.role ?? roleForTaskId(config.taskId),
+    capabilities: config.capabilities ?? [],
   });
 
   // Run the server (blocks until stdin closes)

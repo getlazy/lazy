@@ -23,6 +23,7 @@ import { shortId, displayId, validateCode } from '../../task/identity';
 import { theme, bold } from '../../render/theme';
 import { docsFooter } from '../../docs/links';
 import { getActor } from '../../constants';
+import { queryReviewPromoteRaised } from '../../daemon/rpc-fallback';
 import { raisedGateVocabulary } from '../../raised/vocabulary';
 import { attributionLabel } from '../../actor-ref';
 import type {
@@ -402,7 +403,9 @@ async function commandRaisedPromote(args: string[]): Promise<void> {
         process.exit(1);
       }
     }
-    const result = await storage.promoteRaisedItem(task.id, itemId, {
+    const result = await queryReviewPromoteRaised({
+      taskId: task.id,
+      itemId,
       goal: parsed.flags.get('goal') as string | undefined,
       prompt: parsed.flags.get('prompt') as string | undefined,
       code,

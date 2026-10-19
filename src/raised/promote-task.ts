@@ -230,8 +230,8 @@ export async function createPromotedTask(
     code = allocatePromotedCode(code, taken);
   }
 
-  // createTask → updateTaskPrompt → inherit are sequential, not one atomic
-  // write: a crash mid-flight can leave an orphan backlog task. OK.
+  // ONE write: the prompt and the inherited launch settings land with the row,
+  // so a promotion never leaves a promptless backlog task behind.
   const created = await storage.createTask(
     goal,
     parentTaskId,
@@ -240,17 +240,28 @@ export async function createPromotedTask(
     undefined,
     originatingTask?.agent_id,
     actor,
+    { prompt: opts.prompt.trim() || undefined, ...originatingLaunchInitial(originatingTask) },
   );
-  await storage.updateTaskPrompt(created.id, opts.prompt.trim());
-  if (originatingTask) {
-    await inheritOriginatingLaunchSettings(storage, created.id, originatingTask);
-  }
 
   const task = await storage.getTask(created.id);
   if (!task) {
     throw new Error(`Promoted task ${created.id.slice(0, 8)} could not be read back after creation`);
   }
   return task;
+}
+
+/**
+ * The originating task's model and effort as a new task's initial state —
+ * what {@link inheritOriginatingLaunchSettings} writes, for a create that
+ * writes it with the row.
+ */
+export function originatingLaunchInitial(originating: Task | undefined): { model?: string; metadata?: Record<string, string> } {
+  if (!originating) return {};
+  const effort = originating.metadata?.effort;
+  return {
+    ...(originating.model ? { model: originating.model } : {}),
+    ...(effort ? { metadata: { effort } } : {}),
+  };
 }
 
 /**

@@ -1,4 +1,4 @@
-import type { AgentProfileConfig, AgentWire } from './agent-profiles';
+import type { AgentProfileConfig, AgentWire, NamedEndpointConfig } from './agent-profiles';
 import type { BackendSelection } from '../credentials/backends';
 import type { ProxyPolicyConfig } from '../proxy/policy';
 import type { ReviewGate, ReviewMode } from '../review/mode';
@@ -184,20 +184,11 @@ export type HostPermissionMode = 'sandbox' | 'bypass';
 export const VALID_HOST_PERMISSION_MODES: readonly HostPermissionMode[] = ['sandbox', 'bypass'] as const;
 
 /**
- * Whether lazy verifies the host FILE-TOOL boundary before launching host agents
- * under `permission_mode = "sandbox"`.
- *
- * The OS sandbox covers Bash; the Read/Edit/Write tools are held back only by
- * the `permissions.deny` rules lazy passes to Claude Code — an upstream behavior
- * lazy depends on but does not control.
- *   - 'off' (default): no runtime check. The standing signal is the CI guard
- *     workflow plus `lazy system verify-host-boundary` on demand. Default because
- *     the guard costs nine real headless sessions and needs a logged-in
- *     `claude`, which a daemon host may not have.
- *   - 'once-per-version': verify on the first host launch for each Claude Code
- *     version + platform + deny posture, cache the verdict, and REFUSE to launch
- *     if a deny rule was violated.
- * See src/runner/host-boundary-guard.ts and public-docs/host-boundary-guard.md.
+ * RETIRED. Selected the host file-tool boundary self-check, which was removed
+ * with the host runner's boundary guard (engineer decision, 2026-10-13: the
+ * host-process runner survives only as the fake-binary e2e seam). Still
+ * accepted and validated, like the other legacy host-process keys, so an
+ * existing lazy.toml keeps loading; it has no effect.
  */
 export type SandboxBoundaryVerification = 'off' | 'once-per-version';
 
@@ -335,6 +326,8 @@ export interface LazyConfig {
   storage?: {
     backend?: StorageBackendConfig;
     external_path?: string;
+    /** How many verified pre-upgrade store backups to keep (default 5). */
+    backup_keep?: number;
   };
   git?: {
     default_branch_prefix?: string;
@@ -363,6 +356,8 @@ export interface LazyConfig {
    * name overrides one. See ./agent-profiles.ts.
    */
   agents?: Record<string, AgentProfileConfig>;
+  /** Named upstreams — `[endpoints.<name>]`: a URL plus the credential that pays for it. */
+  endpoints?: Record<string, NamedEndpointConfig>;
   agent?: {
     agent_id?: string;
     /**
@@ -494,10 +489,7 @@ export interface LazyConfig {
      * unprivileged container (no user namespaces). Weakens isolation — opt-in.
      */
     sandbox_allow_weaker_nested?: boolean;
-    /**
-     * Verify the file-tool deny boundary before launching host agents under
-     * sandbox mode: "off" (default) or "once-per-version".
-     */
+    /** RETIRED: accepted and validated so old configs load; no effect. */
     verify_sandbox_boundary?: SandboxBoundaryVerification;
   };
   documents?: {
@@ -595,6 +587,12 @@ export interface LazyConfig {
      * container shell.
      */
     start_services_cmd?: string;
+    /**
+     * The one declared port a PR/MR description links to under Lazy Teams.
+     * Unset means the first declared service. Validated against the declared
+     * ports at load.
+     */
+    main_service?: number;
   };
   /**
    * DEPRECATED — migrated to `[automation]`. Still honored (never silently
@@ -620,10 +618,10 @@ export interface LazyConfig {
     backend?: string;
   };
   /**
-   * Built-in Anthropic-native passthrough proxy (Tier-1 audit plane).
-   * When set, the daemon starts the proxy server on `port` and forwards
-   * all traffic to `upstream`. Set `backend = "proxy"` on role targets
-   * to route that role's traffic through this proxy.
+   * Built-in passthrough proxy (Tier-1 audit plane). Always on: the daemon
+   * starts it and every launch's model traffic goes through it — to
+   * `upstream` by default, or to the endpoint of the agent profile the
+   * launch's credential grant names. This section only tunes it.
    */
   proxy?: {
     /*
@@ -668,9 +666,21 @@ export interface LazyConfig {
     }>;
     /**
      * On a primary 429 whose `Retry-After` is ≤ this many seconds, wait and
-     * retry the primary once before failing over (default 5).
+     * retry the primary once before failing over (default 5). Also applies to
+     * a tiered profile: a short 429 is waited out on the same tier first.
      */
     retry_after_threshold?: number;
+    /**
+     * Seconds a tier of a tiered agent profile that refused for capacity (a
+     * 429) without a retry time is skipped before the next request tries it
+     * again; also the longest a windowed tier (Anthropic, ChatGPT) waits for
+     * its reported reset (default 300).
+     */
+    tier_retry_interval?: number;
+    /** Days the proxy audit log keeps (default 7); whichever of this and audit_retention_mib comes first. */
+    audit_retention_days?: number;
+    /** MiB the proxy audit log may use in all (default 128, at least 8). */
+    audit_retention_mib?: number;
     /**
      * Seconds the proxy waits for an upstream to answer one request before
      * giving up (default 1800 — the supervisor's own no-progress watchdog).
@@ -744,7 +754,7 @@ export interface LazyConfig {
      *
      * Counted per child, reset when that child is started or accepted. Only an
      * AGENT-actored unblock counts: a human unblocking the child is never
-     * refused (CLAUDE.md, "Never Lose Human Feedback") and starts a fresh
+     * refused (AGENTS.md, "Never Lose Human Feedback") and starts a fresh
      * budget, and neither are the daemon's own recovery turns.
      *
      * 0 = unlimited.
@@ -819,6 +829,8 @@ export interface ResolvedConfig {
   storage: {
     backend: StorageBackendConfig;
     external_path: string;
+    /** Verified pre-upgrade store backups kept; the loader defaults it to 5. */
+    backup_keep?: number;
   };
   git: {
     default_branch_prefix: string;
@@ -835,6 +847,8 @@ export interface ResolvedConfig {
    * ResolvedConfig stays a plain, cloneable, serialisable object.
    */
   agents: Record<string, AgentProfileConfig>;
+  /** `[endpoints.<name>]` blocks as written, validated at load with `[agents]`. */
+  endpoints?: Record<string, NamedEndpointConfig>;
   agent: {
     agent_id: string;
     /** Per-task-type agent overrides. Empty when unset. */
@@ -944,7 +958,7 @@ export interface ResolvedConfig {
      * unprivileged container (no user namespaces). Weakens isolation — opt-in.
      */
     sandbox_allow_weaker_nested: boolean;
-    /** Runtime file-tool boundary verification (see LazyConfig.runner). */
+    /** RETIRED legacy key; no effect (see SandboxBoundaryVerification). */
     verify_sandbox_boundary: SandboxBoundaryVerification;
   };
   documents: {
@@ -1021,6 +1035,8 @@ export interface ResolvedConfig {
      * Empty string when unset.
      */
     start_services_cmd: string;
+    /** Validated `[serve] main_service` port; unset means the first service. */
+    main_service?: number;
   };
   /** Where `lazy auth` keeps model-provider credentials. */
   credentials: {
@@ -1059,6 +1075,12 @@ export interface ResolvedConfig {
     fallbacks: { upstream: string; model?: string; credential: ProxyFallbackCredential }[];
     /** Retry-After threshold (seconds) below which the primary is waited-out and retried before failover. */
     retryAfterThreshold: number;
+    /** `[proxy] tier_retry_interval`, seconds (default 300). */
+    tierRetryIntervalSeconds: number;
+    /** `[proxy] audit_retention_days` (default 7). */
+    auditRetentionDays: number;
+    /** `[proxy] audit_retention_mib` (default 128). */
+    auditRetentionMib: number;
     /**
      * Seconds the proxy waits for one upstream request (0 = no ceiling). Always
      * present: it REPLACES Bun's hidden default fetch timeout, which used to

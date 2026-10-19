@@ -3,6 +3,7 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes, extractTaskId } from '../helpers/assertions';
 import {
   createTask,
+  fullTaskId,
   disablePreAccept,
   MOCK_CLAUDE_SUCCESS,
   startAndAccept,
@@ -844,5 +845,34 @@ describe('lazy search', () => {
       expectOutput(result, 'No matches found.');
       expectOutputExcludes(result, 'No task is tagged');
     });
+  });
+
+  // INVARIANT: pasting an id (short prefix or full) into search lands on the
+  // entity it names — the CLI shares executeSearch with every other surface.
+  test('finds a task by its id prefix and by its full id', async () => {
+    const short = await createTask(ctx, 'Zanzibar goal text');
+    const full = await fullTaskId(ctx, short);
+    expect(full.length).toBe(36);
+
+    for (const q of [short, full]) {
+      const result = await ctx.lazy(['search', q]);
+      expectSuccess(result);
+      expectOutput(result, short);
+    }
+  });
+
+  test('finds a raised item by its id and names the entity in the output', async () => {
+    const taskId = await createTask(ctx, 'Raised id task');
+    writeRaisedItemsFile(ctx.root, taskId, [{
+      id: 'f7c33f91-0000-4000-8000-000000000001', task_id: taskId, content: 'which backoff',
+      created_at: Date.now(), blocking: false, status: 'open',
+    }]);
+
+    const result = await ctx.lazy(['search', 'f7c33f91']);
+    expectSuccess(result);
+    expectOutput(result, 'raised f7c33f91');
+
+    const json = JSON.parse((await ctx.lazy(['search', 'f7c33f91', '--json'])).stdout);
+    expect(json.matches[0].entity_id).toBe('f7c33f91-0000-4000-8000-000000000001');
   });
 });

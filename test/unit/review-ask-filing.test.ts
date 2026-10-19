@@ -152,7 +152,7 @@ describe('Current review — Asks block', () => {
   });
 
   // INVARIANT: filing MOVES an ask, it never discards it — the question, the
-  // answer and their delivery state stay on the page (CLAUDE.md, "Never Lose
+  // answer and their delivery state stay on the page (AGENTS.md, "Never Lose
   // Human Feedback"). The count above it is the reviewer's open business only.
   test('a filed ask leaves the count but stays readable below', () => {
     const html = render([

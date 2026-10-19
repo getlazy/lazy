@@ -6,6 +6,7 @@
  * launch supervisor container, update session state.
  */
 
+import { shouldLogImageHold, runnerImageHold, mustRecreateForRunnerImage } from '../daemon/runner-image-choice';
 import { pathExists } from './fs';
 import { setupSandbox } from './sandbox';
 import type { Storage } from '../storage';
@@ -18,11 +19,13 @@ import { createRunner } from '../runner';
 import { harnessForTask, setRunnerAgentForTask } from '../daemon/task-harness';
 import { stampSessionRunner, removeTaskRun, mustRecreateForContainerAgent } from '../runner/session-launch';
 import { mustRecreateForTaskEnv } from '../daemon/task-env';
-import { pinnedCustomImage } from '../docker/worktree-image';
+import { deliverTaskFilesForLaunch } from '../daemon/task-files';
+import { launchImagePin } from '../docker/worktree-image';
 import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields } from '../protocol';
 import type { UnblockCommand } from '../protocol';
 import { acquireLock, removeLock } from './lock';
 import { logger } from './logger';
+import { recordLaunchFailure } from '../daemon/launch-failure';
 import { taskRef, getWorktreePathForRef, getBranchNameFromId } from '../task/identity';
 import { getRemoteDefaultBranch, hasUncommittedChanges, getTaskTargetBranch } from '../git/operations';
 import { parentTaskIdOf } from '../task-target';
@@ -70,7 +73,7 @@ export function exitCodeToReason(exitCode: number | null): string {
 /**
  * Build the resume prompt.
  *
- * INVARIANT (CLAUDE.md — never lose human feedback): when `redeliveredFeedback`
+ * INVARIANT (AGENTS.md — never lose human feedback): when `redeliveredFeedback`
  * is present it REPLACES the generic "you were interrupted, carry on" context.
  * The generic prompt leaves unconsumed feedback available only implicitly via
  * turn history, and in practice the agent never acts on it.
@@ -176,6 +179,11 @@ export async function autoResumeTask(
     logger.info(`Auto-resume ${taskShortId}: held by usage pause — ${usageHold}`);
     return false;
   }
+  const imageHold = await runnerImageHold(task);
+  if (imageHold) {
+    if (shouldLogImageHold('auto-resume', task, imageHold)) logger.info(`Auto-resume ${taskShortId}: held until the project's runner image is ready — ${imageHold}`);
+    return false;
+  }
 
   // Acquire worktree lock
   try {
@@ -232,7 +240,7 @@ export async function autoResumeTask(
     // skips this runs single-phase and produces no self-review at all — and if
     // it is the turn that declares final, the task parks with nothing recorded
     // and nothing gating. Invisible while the loop was opt-in; load-bearing
-    // now. CLAUDE.md names this exact class: "the recovery paths are exactly
+    // now. AGENTS.md names this exact class: "the recovery paths are exactly
     // the ones that forgot".
     const lowHighLoop = await resolveAndPersistLowHighLoop(
       task, undefined, config, storage, effortValue as EffortLevel,
@@ -265,15 +273,13 @@ export async function autoResumeTask(
 
     // Build resume prompt.
     //
-    // INVARIANT (CLAUDE.md — never lose human feedback): if the interrupted turn
+    // INVARIANT (AGENTS.md — never lose human feedback): if the interrupted turn
     // crashed before the agent consumed its feedback, re-deliver that feedback
     // verbatim instead of the generic resume prompt. Applies to EVERY crash
     // cause, not just any particular one.
     const pendingFeedback = findPendingFeedback(await storage.getSessionTurns(session.id));
-    let fullPrompt = buildResumePrompt(
-      task.goal,
-      pendingFeedback ? buildFeedbackRedeliveryPrompt(pendingFeedback) : undefined,
-    );
+    const redelivery = pendingFeedback ? buildFeedbackRedeliveryPrompt(pendingFeedback) : undefined;
+    let fullPrompt = buildResumePrompt(task.goal, redelivery);
     if (pendingFeedback) {
       logger.info(`Auto-resume ${taskShortId}: re-delivering unconsumed feedback from turn ${pendingFeedback.turn.sequence}` +
         (pendingFeedback.olderPendingCount > 0 ? ` (${pendingFeedback.olderPendingCount} older also pending)` : ''));
@@ -297,6 +303,7 @@ export async function autoResumeTask(
         }
       }
     }
+
 
     // --- Persist state BEFORE launching container ---
 
@@ -486,6 +493,8 @@ export async function autoResumeTask(
       })),
       ...commonCommandFields(config),
     };
+    // Per-task secret files, repaired before every launch (src/daemon/task-files.ts).
+    await deliverTaskFilesForLaunch(lazyRoot, task.id, worktreePath);
     writeCommand(protoDir, unblockCommand);
 
     // Generate daemon MCP config so the supervisor can provide MCP tools
@@ -495,16 +504,19 @@ export async function autoResumeTask(
     }
 
     // Check if supervisor is already running
-    if (!mustRecreateForCredential && !mustRecreateForAgent && !mustRecreateForEnv && (await runner.isRunning(containerName))) {
+    if (!mustRecreateForCredential && !mustRecreateForAgent && !mustRecreateForEnv && !mustRecreateForRunnerImage(task) && (await runner.isRunning(containerName))) {
       logger.debug(`Auto-resume ${taskShortId}: supervisor already running, command written`);
     } else {
       await removeTaskRun(runner, storage, session, containerName);
 
       try {
-        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath, tRef, task.id, pinnedCustomImage(task));
+        await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath, tRef, task.id, launchImagePin(task));
       } catch (err) {
         logger.warn(`Auto-resume ${taskShortId}: failed to launch supervisor: ${err instanceof Error ? err.message : err}`);
-        await storage.updateTaskStatus(task.id, 'interrupted', resumedBy);
+        // Same record as a person's resume: the reason, a failure turn (the
+        // `[system]` resume notice just written must not leave the task looking
+        // healthy) and the alert (src/daemon/launch-failure.ts).
+        await recordLaunchFailure(storage, task, session.id, err, lazyRoot);
         return false;
       }
     }
@@ -521,7 +533,8 @@ export async function autoResumeTask(
     logger.warn(`Auto-resume ${taskShortId} failed: ${err instanceof Error ? err.message : err}`);
     // Ensure task stays interrupted if auto-resume fails
     try {
-      await storage.updateTaskStatus(task.id, 'interrupted', resumedBy);
+      await storage.updateTaskStatus(task.id, 'interrupted', resumedBy,
+        `auto-resume failed: ${err instanceof Error ? err.message : String(err)}`);
     } catch {
       // Best effort
     }

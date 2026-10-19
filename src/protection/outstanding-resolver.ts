@@ -17,7 +17,7 @@
  *
  * INVARIANT: the range comes from `resolveTaskDirectDiff` — the resolver
  * `lazy diff` and the review page already use — never from a locally computed
- * ref (CLAUDE.md's diff-base rule) and never from the unrestricted whole-branch
+ * ref (AGENTS.md's diff-base rule) and never from the unrestricted whole-branch
  * range.
  *
  * The whole-branch range is wrong here for a task with accepted children: a
@@ -137,7 +137,8 @@ import {
   type TaskDirectDiffPlan,
 } from '../task-diff-base';
 import { getWorktreePath } from '../task/identity';
-import { audienceOf, type TaskAudience } from '../task/audience';
+import { resolveProtectedFileDeferral, type ProtectedFileDeferral } from './deferral';
+import { audienceOf, createdByOf, type TaskAudience } from '../task/audience';
 import {
   approvedFilesFromRecords,
   outstandingFromDetection,
@@ -146,11 +147,25 @@ import {
   violationRecordsByFile,
 } from './outstanding';
 import type { Storage } from '../storage/interface';
-import type { Actor, FileViolation, Session, Task, Turn } from '../types';
+import { isClusterTask, type FileViolation, type Session, type Task, type Turn } from '../types';
 
 export interface OutstandingViolations {
-  /** Protected files still in the task's own changes with no approval recorded. */
+  /**
+   * Protected files still in the task's own changes with no approval recorded
+   * — what THIS task's accept asks. Always empty when `deferredTo` is set.
+   */
   outstanding: FileViolation[];
+  /**
+   * The parent whose accept asks this task's questions instead, when the task
+   * is agent-audience (src/protection/deferral.ts). Null when it is asked here.
+   */
+  deferredTo: ProtectedFileDeferral | null;
+  /**
+   * What would have been `outstanding` had the questions not been deferred —
+   * so a surface can name the files and where they will be asked. Empty when
+   * nothing is deferred.
+   */
+  deferred: FileViolation[];
   /**
    * Files a human has already approved, latest decision per file: this task's
    * own approvals plus those recorded at human-audience accepted children's
@@ -279,38 +294,11 @@ function effectivePatterns(configured: readonly string[], turns: Turn[]): string
 }
 
 /**
- * Who created the child — the actor on its first status-changelog entry.
- *
- * Mirrors `resolveWrapUpPlan` (src/daemon/wrap-up-plan.ts) exactly, so the
- * audience a child's wrap-up ran under and the audience read here can never
- * disagree: `system`-created tasks leave undefined and let `audienceOf` fall
- * through to its safe default.
- *
- * Exported because the review prompt's audience derivation (§8) reads the
- * same two inputs and must answer the same question the same way.
- */
-export async function createdByOf(
-  storage: Pick<Storage, 'getStatusHistory'>,
-  child: Task,
-): Promise<Actor | null | undefined> {
-  try {
-    const actor = (await storage.getStatusHistory(child.id))[0]?.actor;
-    return actor === 'human' || actor === 'builder' || actor === 'agent' ? actor : null;
-  } catch (err) {
-    // The changelog is a fallback input, not a gate.
-    logger.debug(
-      `Child ${child.id.substring(0, 8)}: status history unavailable: ` +
-      `${err instanceof Error ? err.message : err}; audience falls back to the turns.`,
-    );
-    return undefined;
-  }
-}
-
-/**
  * What this task's accepted children contribute to its protected-file answer.
  *
  * Per child: derive the audience exactly as the child's own wrap-up did —
- * `audienceOf` over its turns with the creation actor as fallback — then either
+ * `audienceOf` over its turns with the creation actor as fallback, and this
+ * task's type (a cluster's child is always agent-audience) — then either
  * join its approvals (human-audience: the decisions a human made at that
  * child's accept) or widen the deferred set with its attributed paths
  * (agent-audience: protected files that final never asked about). The paths
@@ -326,6 +314,7 @@ async function childContributionsFor(
   storage: Storage,
   acceptedChildren: readonly Task[],
   attribution: ReadonlyMap<string, ChildAttribution> | null,
+  parentIsCluster: boolean,
 ): Promise<ChildContributions> {
   const childApproved = new Set<string>();
   const deferredPaths = new Set<string>();
@@ -335,7 +324,7 @@ async function childContributionsFor(
     try {
       const session = await storage.getSessionByTaskId(child.id);
       const childTurns = session ? await storage.getSessionTurns(session.id) : [];
-      audience = audienceOf({ turns: childTurns, createdBy: await createdByOf(storage, child) });
+      audience = audienceOf({ turns: childTurns, createdBy: await createdByOf(storage, child), parentIsCluster });
       approved = approvedFilesFromRecords(childTurns);
     } catch (err) {
       audience = 'agent';
@@ -432,6 +421,25 @@ function outstandingWithChildApprovals(
   );
 }
 
+/** The answer before deferral is applied — what this task's own range owes. */
+type OwnOutstanding = Omit<OutstandingViolations, 'deferredTo' | 'deferred'>;
+
+/**
+ * Which protected files this task's accept must ask about.
+ *
+ * Two steps. First the task's OWN answer — the scan and the records, above.
+ * Then, when that answer owes something, whether the task asks it at all: an
+ * agent-audience task with a live parent defers every question to the parent's
+ * accept (src/protection/deferral.ts), so `outstanding` comes back empty and
+ * the files move to `deferred`. Everything that reads this — accept, the
+ * `conflict` label, `show`'s accept gate, the review page — therefore agrees
+ * that a cluster's child owes nothing at its own merge.
+ *
+ * The deferral read costs a parent lookup and a status-history read, so it
+ * runs only when there is something to defer and the task has a parent. It is
+ * not cached with the scan: audience moves with the turns and the parent's
+ * status, neither of which moves HEAD.
+ */
 export async function resolveOutstandingViolations(
   projectRoot: string,
   task: Task,
@@ -439,10 +447,25 @@ export async function resolveOutstandingViolations(
   turns: Turn[],
   storage: Storage,
 ): Promise<OutstandingViolations> {
+  const own = await resolveOwnOutstanding(projectRoot, task, session, turns, storage);
+  const deferredTo = own.outstanding.length > 0
+    ? await resolveProtectedFileDeferral(storage, task, turns)
+    : null;
+  if (!deferredTo) return { ...own, deferredTo: null, deferred: [] };
+  return { ...own, outstanding: [], deferredTo, deferred: own.outstanding };
+}
+
+async function resolveOwnOutstanding(
+  projectRoot: string,
+  task: Task,
+  session: Pick<Session, 'upstream_merge_sha' | 'git_branch'>,
+  turns: Turn[],
+  storage: Storage,
+): Promise<OwnOutstanding> {
   const answer = (
     detected: FileViolation[],
     childApproved: readonly string[],
-  ): OutstandingViolations => ({
+  ): OwnOutstanding => ({
     outstanding: outstandingWithChildApprovals(
       outstandingFromDetection(detected, turns),
       turns,
@@ -452,7 +475,7 @@ export async function resolveOutstandingViolations(
     detected,
     degraded: false,
   });
-  const degraded = async (reason: string): Promise<OutstandingViolations> => {
+  const degraded = async (reason: string): Promise<OwnOutstanding> => {
     logger.debug(
       `Task ${task.id.substring(0, 8)}: protected-file scan unavailable (${reason}); ` +
       `falling back to the recorded set.`,
@@ -463,7 +486,7 @@ export async function resolveOutstandingViolations(
       // pending records for child files (its final push-back writes those) must
       // not re-ask a decision a human-audience child already made.
       childApproved = (
-        await childContributionsFor(storage, await acceptedChildrenOf(storage, task), null)
+        await childContributionsFor(storage, await acceptedChildrenOf(storage, task), null, isClusterTask(task))
       ).childApproved;
     } catch (err) {
       logger.debug(
@@ -516,7 +539,9 @@ export async function resolveOutstandingViolations(
     const attribution = new Map<string, ChildAttribution>(
       (plan.childAttribution ?? []).map((a) => [a.childId, a]),
     );
-    const contributions = await childContributionsFor(storage, plan.acceptedChildren, attribution);
+    const contributions = await childContributionsFor(
+      storage, plan.acceptedChildren, attribution, isClusterTask(task),
+    );
     // Restricted to paths nothing else on this branch still owes a decision on
     // — a child's approval answers for that child's edit, never for this task's
     // own later one, nor for a sibling's deferred one. Computed here, above the

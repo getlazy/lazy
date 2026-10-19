@@ -77,7 +77,7 @@ describe('context budget — Claude Code memory file limit', () => {
   });
 });
 
-describe('context budget — CLAUDE.md discovery', () => {
+describe('context budget — AGENTS.md discovery', () => {
   let root: string;
   let home: string;
 
@@ -97,41 +97,82 @@ describe('context budget — CLAUDE.md discovery', () => {
     expect(await findClaudeMemoryFiles('agent', { lazyRoot: root, home })).toEqual([]);
   });
 
-  test('finds project, .claude/ and local memory files with exact sizes', async () => {
-    await writeFile(join(root, 'CLAUDE.md'), 'a'.repeat(120));
+  test('finds project and .claude/ AGENTS.md files with exact sizes', async () => {
+    await writeFile(join(root, 'AGENTS.md'), 'a'.repeat(120));
     await mkdir(join(root, '.claude'), { recursive: true });
-    await writeFile(join(root, '.claude', 'CLAUDE.md'), 'b'.repeat(30));
-    await writeFile(join(root, 'CLAUDE.local.md'), 'c'.repeat(7));
+    await writeFile(join(root, '.claude', 'AGENTS.md'), 'b'.repeat(30));
 
     const found = await findClaudeMemoryFiles('agent', { lazyRoot: root, home });
     expect(found.map(f => f.label)).toEqual([
-      'CLAUDE.md (project)',
-      'CLAUDE.md (project, .claude/)',
-      'CLAUDE.local.md (project)',
+      'AGENTS.md (project)',
+      'AGENTS.md (project, .claude/)',
     ]);
-    expect(found.map(f => f.content.length)).toEqual([120, 30, 7]);
+    expect(found.map(f => f.content.length)).toEqual([120, 30]);
     expect(found.every(f => !f.overLimit)).toBe(true);
   });
 
   // INVARIANT: the builder container mounts the human's ~/.claude, task
   // containers are handed a fresh one. Charging an agent for the user-level
   // CLAUDE.md would invent a cost it does not pay.
-  test('only the builder is charged for the user-level CLAUDE.md', async () => {
+  test('only the builder is charged for user-level CLAUDE.md, without suppressing AGENTS.md', async () => {
+    await writeFile(join(root, 'AGENTS.md'), 'project instructions');
     await writeFile(join(home, '.claude', 'CLAUDE.md'), 'user memory');
 
     const builder = await findClaudeMemoryFiles('builder', { lazyRoot: root, home });
     const agent = await findClaudeMemoryFiles('agent', { lazyRoot: root, home });
 
-    expect(builder.map(f => f.label)).toContain('CLAUDE.md (user, ~/.claude)');
-    expect(agent).toEqual([]);
+    expect(builder.map(file => file.label)).toEqual([
+      'AGENTS.md (project)',
+      'CLAUDE.md (user, ~/.claude)',
+    ]);
+    expect(agent.map(file => file.label)).toEqual(['AGENTS.md (project)']);
   });
 
+  test('does not treat ~/.claude/AGENTS.md as user memory', async () => {
+    await writeFile(join(home, '.claude', 'AGENTS.md'), 'not user memory');
+
+    for (const role of ['agent', 'builder'] as const) {
+      expect(await findClaudeMemoryFiles(role, { lazyRoot: root, home })).toEqual([]);
+    }
+  });
+
+  test('finds legacy project, .claude/ and local memory files with exact sizes', async () => {
+    await writeFile(join(root, 'CLAUDE.md'), 'a'.repeat(120));
+    await mkdir(join(root, '.claude'), { recursive: true });
+    await writeFile(join(root, '.claude', 'CLAUDE.md'), 'b'.repeat(30));
+    await writeFile(join(root, 'CLAUDE.local.md'), 'c'.repeat(7));
+
+    const found = await findClaudeMemoryFiles('agent', { lazyRoot: root, home });
+    expect(found.map(file => file.label)).toEqual([
+      'CLAUDE.md (project)',
+      'CLAUDE.md (project, .claude/)',
+      'CLAUDE.local.md (project)',
+    ]);
+    expect(found.map(file => file.content.length)).toEqual([120, 30, 7]);
+    expect(found.every(file => !file.overLimit)).toBe(true);
+  });
+
+  test.each(['CLAUDE.md', '.claude/CLAUDE.md', 'CLAUDE.local.md'])(
+    '%s suppresses both project AGENTS.md files, even when empty',
+    async relativePath => {
+      await mkdir(join(root, '.claude'), { recursive: true });
+      await writeFile(join(root, 'AGENTS.md'), 'shared instructions');
+      await writeFile(join(root, '.claude', 'AGENTS.md'), 'more shared instructions');
+      await writeFile(join(root, relativePath), '');
+
+      for (const role of ['agent', 'builder'] as const) {
+        const found = await findClaudeMemoryFiles(role, { lazyRoot: root, home });
+        expect(found.map(file => file.path)).toEqual([join(root, relativePath)]);
+      }
+    },
+  );
+
   test('flags a file over the limit, and one exactly at it is not over', async () => {
-    await writeFile(join(root, 'CLAUDE.md'), 'x'.repeat(CLAUDE_MD_CHAR_LIMIT));
+    await writeFile(join(root, 'AGENTS.md'), 'x'.repeat(CLAUDE_MD_CHAR_LIMIT));
     let [file] = await findClaudeMemoryFiles('agent', { lazyRoot: root, home });
     expect(file!.overLimit).toBe(false);
 
-    await writeFile(join(root, 'CLAUDE.md'), 'x'.repeat(CLAUDE_MD_CHAR_LIMIT + 1));
+    await writeFile(join(root, 'AGENTS.md'), 'x'.repeat(CLAUDE_MD_CHAR_LIMIT + 1));
     [file] = await findClaudeMemoryFiles('agent', { lazyRoot: root, home });
     expect(file!.overLimit).toBe(true);
   });
@@ -139,8 +180,9 @@ describe('context budget — CLAUDE.md discovery', () => {
   // INVARIANT: the limit is per FILE, not a sum. Two 30k files are both fine
   // even though they total 60k — Claude Code compares each file on its own.
   test('the limit applies per file, never to the sum', async () => {
-    await writeFile(join(root, 'CLAUDE.md'), 'x'.repeat(30_000));
-    await writeFile(join(root, 'CLAUDE.local.md'), 'y'.repeat(30_000));
+    await writeFile(join(root, 'AGENTS.md'), 'x'.repeat(30_000));
+    await mkdir(join(root, '.claude'), { recursive: true });
+    await writeFile(join(root, '.claude', 'AGENTS.md'), 'y'.repeat(30_000));
 
     const found = await findClaudeMemoryFiles('agent', { lazyRoot: root, home });
     expect(found).toHaveLength(2);
@@ -151,7 +193,7 @@ describe('context budget — CLAUDE.md discovery', () => {
   // limit follows the window. A caller rendering "over the N-char limit" must
   // read N off the file rather than off a constant that assumed 200k.
   test('the reported limit follows the window the caller asked about', async () => {
-    await writeFile(join(root, 'CLAUDE.md'), 'x'.repeat(120_000));
+    await writeFile(join(root, 'AGENTS.md'), 'x'.repeat(120_000));
 
     const [atDefault] = await findClaudeMemoryFiles('agent', { lazyRoot: root, home });
     expect(atDefault!.limit).toBe(40_000);
@@ -341,21 +383,21 @@ describe('context budget — remedies', () => {
     expect(contextBudgetRemedy(budget)).toContain('nothing to do here');
   });
 
-  test('names the biggest CLAUDE.md when that is the largest thing owned', () => {
+  test('names the biggest AGENTS.md when that is the largest thing owned', () => {
     const budget = role([
-      { label: 'CLAUDE.md (project)', chars: 42_000, tokens: 11_000 },
+      { label: 'AGENTS.md (project)', chars: 42_000, tokens: 11_000 },
       { label: 'CLAUDE.local.md (project)', chars: 900, tokens: 200 },
       { label: 'of which shared memory index', chars: 4_000, tokens: 1_000, nested: true },
       { label: 'MCP tool schemas (50 tools)', chars: 80_000, tokens: 20_000 },
     ]);
 
-    expect(largestTrimmable(budget)!.label).toBe('CLAUDE.md (project)');
-    expect(contextBudgetRemedy(budget)).toContain('CLAUDE.md (project)');
+    expect(largestTrimmable(budget)!.label).toBe('AGENTS.md (project)');
+    expect(contextBudgetRemedy(budget)).toContain('AGENTS.md (project)');
   });
 
   test('points at the memory commands when shared memory is the largest', () => {
     const budget = role([
-      { label: 'CLAUDE.md (project)', chars: 1_000, tokens: 250 },
+      { label: 'AGENTS.md (project)', chars: 1_000, tokens: 250 },
       { label: 'of which shared memory index', chars: 30_000, tokens: 7_500, nested: true },
     ]);
 
@@ -367,7 +409,7 @@ describe('context budget — remedies', () => {
   // because nobody can act on advice to shrink those.
   test('names LAZY.md when the project’s lazy instructions are the largest', () => {
     const budget = role([
-      { label: 'CLAUDE.md (project)', chars: 1_000, tokens: 250 },
+      { label: 'AGENTS.md (project)', chars: 1_000, tokens: 250 },
       { label: 'of which LAZY.md (project instructions)', chars: 30_000, tokens: 7_500, nested: true },
     ]);
 

@@ -42,6 +42,34 @@ export const AGENT_ONLY_TOOL_NAMES: readonly string[] = [
 ];
 
 /**
+ * A capability a daemon grants a caller on top of its role, written into that
+ * caller's MCP config by the daemon (`writeDaemonMcpConfig`).
+ *
+ * `image-build`: `lazy_image_build`, which exists ONLY on a managed daemon on
+ * the microVM backend (src/daemon/image-try-build.ts). Elsewhere it is not
+ * even advertised; its handler refuses it everywhere regardless.
+ *
+ * A capability tool is deliberately NOT in `allTools` (like
+ * `lazy_internal_git`): the role surface — what every agent and builder pays
+ * for in context, and what the role tests pin — never contains it. It is a
+ * TASK-AGENT tool on a full (work) turn only; `registerTools` adds it.
+ */
+export type McpCapability = 'image-build';
+
+export const MCP_CAPABILITIES: readonly McpCapability[] = ['image-build'];
+
+/** Tools advertised only to a caller holding their capability. */
+export const CAPABILITY_GATED_TOOLS: Readonly<Record<string, McpCapability>> = {
+  lazy_image_build: 'image-build',
+};
+
+/** Whether a capability-gated tool (or any ungated one) may be advertised. */
+export function isToolCapabilityGranted(name: string, capabilities: readonly McpCapability[] = []): boolean {
+  const needed = CAPABILITY_GATED_TOOLS[name];
+  return needed === undefined || capabilities.includes(needed);
+}
+
+/**
  * Tools only the BUILDER (acting for the human) can call.
  *
  * Two different reasons, both enforced in the handlers:

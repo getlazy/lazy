@@ -38,7 +38,7 @@ describe('accept refuses while human feedback is undelivered', () => {
 
   // INVARIANT: a comment a human queued that no prompt has carried REFUSES
   // accept — merging would end the task with that feedback never read
-  // (CLAUDE.md, "Never Lose Human Feedback"). The human's way past it is an
+  // (AGENTS.md, "Never Lose Human Feedback"). The human's way past it is an
   // explicit override, never a silent merge.
   test('a queued lazy comment refuses accept; --allow-queued-comments merges', async () => {
     const taskId = await createStartedTaskWithCommit(ctx, 'Queued comment gate');

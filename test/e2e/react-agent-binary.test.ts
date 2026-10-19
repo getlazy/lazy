@@ -30,10 +30,10 @@ import { PRESENTATION_MARKER_FILE } from '../../src/protocol/presentation-marker
  * wrap-up ran these steps and no more" depend on that timing, so it is filtered
  * out by its prompt rather than being tolerated in the count.
  */
-function workTurnInvocations(invocations: Array<{ argv: string[] }>): Array<{ argv: string[] }> {
+function workTurnInvocations(invocations: Array<{ argv: string[]; stdin?: string }>): Array<{ argv: string[]; stdin?: string }> {
   return invocations.filter(i => {
     if (!i.argv.includes('-p')) return false;
-    const prompt = String(i.argv[1] ?? '');
+    const prompt = String(i.stdin ?? '');
     return !prompt.includes('Audience: a reviewer') && !prompt.includes('its verdict could not be read');
   });
 }
@@ -44,7 +44,13 @@ async function enableReact(
   entry: { title: string; pattern: string; instructions: string },
 ): Promise<void> {
   const configPath = join(ctx.root, 'lazy.toml');
-  const existing = await readFile(configPath, 'utf-8');
+  // These counts describe the work turn's own invocations, with a SEPARATE
+  // auto-review (filtered by prompt above). Low-high is the default review mode
+  // and runs its self-review inside the work turn, adding invocations this file
+  // is not about — so the mode the test needs is stated, not inherited.
+  const raw = await readFile(configPath, 'utf-8');
+  const existing = raw.replace('# mode = "low_high"', 'mode = "separate"');
+  if (existing === raw) throw new Error('lazy.toml has no `# mode = "low_high"` line to switch to separate');
   await writeFile(
     configPath,
     `${existing}\n[[automation.react]]\ntitle = "${entry.title}"\npattern = "${entry.pattern}"\ninstructions = "${entry.instructions}"\n`,
@@ -149,11 +155,11 @@ describe('reactive automation (real supervisor, fake claude)', () => {
     const invocations = workTurnInvocations(await ctx.claudeInvocations());
     expect(invocations.length).toBe(3);
     // Plan order: react (nudge chain) before the presentation step.
-    expect(String(invocations[1].argv[1])).toContain('reactive automation group(s)');
-    expect(invocations[2].argv[1]).toContain('presentation.groups');
+    expect(String(invocations[1].stdin)).toContain('reactive automation group(s)');
+    expect(invocations[2].stdin).toContain('presentation.groups');
     // INVARIANT: nothing asks the agent about the PROJECT any more — the
     // systemic check was removed from the wrap-up.
-    expect(invocations.some(i => String(i.argv[1]).includes('Anything systemic?'))).toBe(false);
+    expect(invocations.some(i => String(i.stdin).includes('Anything systemic?'))).toBe(false);
   }, 180_000);
 
   // INVARIANT: untouched react patterns do not fire on the real supervisor path.

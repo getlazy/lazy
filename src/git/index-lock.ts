@@ -182,7 +182,7 @@ export async function findIndexLockHolders(
   const incomplete =
     deps.processTableMayBeIncomplete ?? processTableMayBeIncomplete;
 
-  const viaProc = await findHoldersViaProcfs(lockPath);
+  const viaProc = await processTableProbe.scanProcfs(lockPath);
   if (viaProc !== null) {
     if (viaProc.holders.length > 0) {
       return { scanned: true, holders: viaProc.holders };
@@ -237,7 +237,7 @@ function authorizeScanResult(
  * Scan /proc/<pid>/fd for openers of `lockPath`. Returns `null` when `/proc` is
  * missing or unreadable (macOS, restricted containers) — not an empty list.
  */
-interface ProcfsScanResult {
+export interface ProcfsScanResult {
   holders: IndexLockHolder[];
   /** True when one or more pid fd dirs were skipped due to EACCES/EPERM. */
   permissionGaps: boolean;
@@ -273,8 +273,11 @@ async function findHoldersViaProcfs(lockPath: string): Promise<ProcfsScanResult 
       fds = await readdir(join('/proc', entry, 'fd'));
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      if (code === 'EACCES' || code === 'EPERM') {
-        // Another user's process may hold the lock — an empty scan is not safe.
+      // Another user's process may hold the lock — an empty scan is not safe.
+      // Except a process that has already exited: a zombie answers EACCES
+      // too, even to its own user, and holds no files at all. Counting it made
+      // a stale lock unclearable whenever anything on the machine was mid-exit.
+      if ((code === 'EACCES' || code === 'EPERM') && !(await processHasExited(entry))) {
         permissionGaps = true;
       }
       // Process exited (ENOENT) or transient error — skip this pid only.
@@ -302,6 +305,23 @@ async function findHoldersViaProcfs(lockPath: string): Promise<ProcfsScanResult 
   }
 
   return { holders, permissionGaps };
+}
+
+/**
+ * True when /proc says the process is a zombie or dead (state Z or X) — or is
+ * already gone. `stat` stays readable for other users' processes, so this
+ * never turns a real gap into "no gap". The state follows the LAST ") " because
+ * the command name may itself contain one.
+ */
+export async function processHasExited(pid: string): Promise<boolean> {
+  let stat: string;
+  try {
+    stat = await readFile(join('/proc', pid, 'stat'), 'utf8');
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'ENOENT';
+  }
+  const state = stat.slice(stat.lastIndexOf(') ') + 2, stat.lastIndexOf(') ') + 3);
+  return state === 'Z' || state === 'X';
 }
 
 async function readCmdline(pid: number): Promise<string | null> {
@@ -437,3 +457,15 @@ export function formatIndexLockFailure(stderr: string, lockPath: string | null):
   );
 }
 
+
+/**
+ * The /proc scan, behind an object so a test can take the REST OF THE MACHINE
+ * out of the answer. Whether a scan has permission gaps depends on every other
+ * process running there — a Chromium renderer is non-dumpable, so its fd
+ * directory is unreadable even to its own user — and a unit test asserting the
+ * "no holder" path must not pass or fail on whether a browser happens to be up.
+ * Production never reassigns it.
+ */
+export const processTableProbe: { scanProcfs: (lockPath: string) => Promise<ProcfsScanResult | null> } = {
+  scanProcfs: findHoldersViaProcfs,
+};

@@ -2,7 +2,7 @@
  * `lazy submit` on a task that integrates into an INTERMEDIATE branch — a task
  * stacked on another task, whose merge target is the parent task's branch.
  *
- * The rule (engineer decision 2026-09-24, CLAUDE.md "PRs only for protected
+ * The rule (engineer decision 2026-09-24, AGENTS.md "PRs only for protected
  * branches"): by DEFAULT lazy never opens a PR/MR for an intermediate branch —
  * accept merges locally and no automatic path creates one. An explicit submit
  * by a PERSON is the request, and it is honoured: the PR/MR opens against the

@@ -12,6 +12,7 @@
  * `src/task/sync-remote.ts`.
  */
 
+import { confirmDefaultRunnerImage } from '../runner-image-confirm';
 import { getBranchNameFromId, displayId } from '../../task/identity';
 import { existsSync } from 'fs';
 import { getBranchCommitMessages, getCurrentSha, getNewCommits, getRemoteDefaultBranch, getDiffStat } from '../../git/operations';
@@ -35,6 +36,8 @@ import { theme, dim } from '../../render/theme';
 import { parentTaskIdOf } from '../../task-target';
 import { sanitizeUserText } from '../../utils/sanitize-text';
 import { ActivityMonitor, parseSupervisorLogLine } from '../activity-monitor';
+import { resolveTeamsLogin } from '../../teams/login';
+import { remoteWatchUrl, runRemoteWatch } from '../../teams/task-watch';
 import { queryUnblockTask } from '../../daemon/rpc-fallback';
 import { runGit } from '../../utils/git';
 import { latestWorkAgentTurn } from '../../utils/turns';
@@ -398,8 +401,9 @@ export async function showTaskContext(
  *
  * INTAKE BOUNDARY: every returned feedback message is passed through
  * sanitizeUserText(). Editors can (and do) write raw control bytes; a NUL that
- * survives to the delivery seam becomes argv[2] of `claude -p` and kills the
- * spawn, crash-looping the turn and silently losing the human's feedback.
+ * reached argv used to kill the spawn, crash-looping the turn and silently
+ * losing the human's feedback. Prompts now ride stdin (src/agent/argv-safety.ts);
+ * the sanitizing stays as defence in depth.
  */
 export async function getEditorFeedback(
   taskId: string,
@@ -580,6 +584,8 @@ export async function runFeedbackFlow(
   effortOverride?: string,
   agentOverride?: string,
 ): Promise<'continue' | 'done'> {
+  // Asked before the editor so declining costs no feedback.
+  const useDefaultImage = await confirmDefaultRunnerImage(task!.id, { defaultImage: false, yes: false });
   const result = await getEditorFeedback(task!.id, task!.goal, sess.id, taskShortId, storage, true, worktreePath, parentTaskIdOf(task!), root, displayId(task!));
 
   if (result.type === 'accept') {
@@ -610,6 +616,7 @@ export async function runFeedbackFlow(
         effortOverride,
         agentOverride,
         ...(await usagePauseOverrideEligibility()),
+        ...(useDefaultImage ? { useDefaultImage: true } : {}),
       });
 
       // Clean up recovery file — feedback is now durably persisted in daemon
@@ -632,7 +639,23 @@ export async function runFeedbackFlow(
         console.log(`Or check status with: ${theme.command('lazy status ' + displayId(task!))}`);
       }
 
-      if (follow) {
+      // A clone bound to Lazy Teams has no local container: the stream comes
+      // from the server's Watch relay, and the loop carries on once it ends.
+      const bound = follow ? await resolveTeamsLogin(root) : null;
+      if (follow && bound) {
+        const outcome = await runRemoteWatch({
+          url: remoteWatchUrl({
+            teamsUrl: bound.login.binding.teams_url,
+            project: bound.login.binding.project,
+            projectId: bound.login.binding.project_id,
+            taskId: task!.id,
+          }),
+          token: bound.token,
+        });
+        if (outcome.kind === 'failed') {
+          console.error(`\nCould not follow task ${taskShortId} through Lazy Teams: ${outcome.message}`);
+        }
+      } else if (follow) {
         const storage2 = await requireStorage();
         try {
           const runner = await createRunner(root);

@@ -4,12 +4,14 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtemp, readFile, rm } from 'fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { pinDaemonBaseDir } from '../helpers/daemon-base-dir';
-import { withReviewSessionCredential } from '../../src/daemon/review-session-builder-turn';
-import { putUserCredential, clearUserCredentialCache } from '../../src/daemon/user-credentials';
+import { assertReviewSessionActorCredential, withReviewSessionCredential } from '../../src/daemon/review-session-builder-turn';
+import { putUserCredential, clearUserCredentialCache, putEndpointCredential, setCredentialBillingMode } from '../../src/daemon/user-credentials';
+import { loadConfig } from '../../src/config/loader';
+import { pinConfig } from '../helpers/pin-config';
 import {
   clearSessionCredentialCache,
   getTaskSessionBinding,
@@ -24,21 +26,73 @@ describe('review conversation credential', () => {
   let root: string;
   let base: string;
   let unpin: () => void;
+  let unpinConfig: () => void;
 
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), 'lazy-review-cred-'));
     base = await mkdtemp(join(tmpdir(), 'lazy-review-cred-base-'));
     unpin = pinDaemonBaseDir(base);
+    await writeFile(join(root, 'lazy.toml'), '');
+    unpinConfig = pinConfig(root);
     clearUserCredentialCache();
     clearSessionCredentialCache();
   });
 
   afterEach(async () => {
     unpin();
+    unpinConfig();
     clearUserCredentialCache();
     clearSessionCredentialCache();
     await rm(root, { recursive: true, force: true });
     await rm(base, { recursive: true, force: true });
+  });
+
+  const tieredBuilderConfig = `
+[endpoints.personal]
+url = "https://api.anthropic.com"
+credential = "anthropic"
+[endpoints.work]
+url = "https://api.anthropic.com"
+credential = "anthropic"
+[agents.review-builder]
+harness = "claude-code"
+tiers = [{ endpoint = "personal", model = "claude-opus-5-5", threshold_percent = 90 }, { endpoint = "work", model = "claude-sonnet-5-5" }]
+[models.roles.builder]
+agent = "review-builder"
+`;
+
+  async function connectEndpoint(endpointId: string) {
+    await putEndpointCredential(root, { userId: 'alice@example.com', endpointId, origin: 'https://api.anthropic.com', provider: 'anthropic', kind: 'api-key', token: `test-${endpointId}` });
+  }
+
+  // INVARIANT: a review builder is paid through every endpoint of its configured profile, without requiring an unrelated builtin Claude account. Preflight and binding use the launch's same config snapshot.
+  test('named tier connections pass both preflight and binding without builtin Claude', async () => {
+    await writeFile(join(root, 'lazy.toml'), tieredBuilderConfig);
+    await setCredentialBillingMode(root);
+    await connectEndpoint('personal'); await connectEndpoint('work');
+    const config = await loadConfig(root);
+    await assertReviewSessionActorCredential(root, { role: 'human', email: 'alice@example.com' }, config);
+    // A concurrent config edit cannot change which profile this launch plans.
+    await writeFile(join(root, 'lazy.toml'), '');
+    let token: string | undefined;
+    await withReviewSessionCredential(root, { reviewSessionId: 'tiered-review', ownerEmail: 'alice@example.com', builderProfile: config.models.roles.builder.profile, config }, async (env) => {
+      token = env?.[0]?.value;
+      expect((await lookupSessionBinding(root, token!))?.ownerUserId).toBe('alice@example.com');
+    });
+    expect(token).toBeDefined();
+    expect(await lookupSessionBinding(root, token!)).toBeNull();
+  });
+
+  // INVARIANT: missing any paid review-builder tier refuses before the launch callback runs. A connected first tier or builtin Claude account cannot pay for a missing second endpoint.
+  test('a missing later tier refuses both preflight and launch planning', async () => {
+    await writeFile(join(root, 'lazy.toml'), tieredBuilderConfig);
+    await setCredentialBillingMode(root);
+    await connectEndpoint('personal');
+    await putUserCredential(root, { userId: 'alice@example.com', kind: 'api-key', token: 'unrelated-builtin-test-secret' });
+    await expect(assertReviewSessionActorCredential(root, { role: 'human', email: 'alice@example.com' })).rejects.toThrow('"work"');
+    let launched = false;
+    await expect(withReviewSessionCredential(root, { reviewSessionId: 'incomplete-review', ownerEmail: 'alice@example.com' }, async () => { launched = true; })).rejects.toThrow('"work"');
+    expect(launched).toBe(false);
   });
 
   // INVARIANT: a single-user install runs the conversation's builder on the

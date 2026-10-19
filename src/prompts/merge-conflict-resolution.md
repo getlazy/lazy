@@ -20,8 +20,12 @@ Steps:
 IMPORTANT: Your ONLY job is to resolve the conflicts. Do NOT make any other changes.
 Do NOT refactor, improve, or modify any code beyond what's needed for conflict resolution.
 
-When resolving conflicts, upstream ({{parentBranch}}) contains accepted work from other
-completed tasks that must be preserved. Never delete or revert upstream changes. However,
+When resolving conflicts, upstream ({{parentBranch}}) contains accepted work that must be
+preserved. Upstream only gains changes through reviewed merges: usually other completed work,
+but it can also be THIS task's own work, merged through this task's own pull/merge request.
+Never describe an upstream change as having landed "independently". If upstream already
+contains this task's own change, say exactly that — this task's work was already merged
+upstream — keep upstream's version, and do not leave a second copy of it. Never delete or revert upstream changes. However,
 don't blindly pick upstream's version of conflicted lines — merge intelligently so both
 sides' intent is preserved. Adapt your code to coexist with upstream changes, combining
 both sets of work so the result is correct and complete.

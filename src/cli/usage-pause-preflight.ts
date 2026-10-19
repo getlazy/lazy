@@ -8,7 +8,7 @@
  * still the authority: this only saves the human typing into a turn that
  * cannot start, and the task's pending allowance ("let its next turn
  * through") is counted exactly as the launch will count it — including the one
- * `--past-usage-pause` is about to set.
+ * `--override-usage-pause` is about to set.
  */
 
 import { queryUsagePause } from '../daemon/rpc-fallback';
@@ -66,11 +66,18 @@ export async function usagePauseRefusalLines(
     return null;
   }
   if (!verdict) return null;
-  // `--past-usage-pause` sets the task's allowance with the launch, which lets
-  // it through anything but unreadable readings. (A run BESIDE the task is not
-  // the task's turn, and no task allowance covers it.)
-  if (opts.pastUsagePause && !opts.beside && !verdict.storeError) return null;
-  return preflightRefusalLines(verdict, verb, eligible, opts.beside ? undefined : taskId);
+  // Task allowances can be carried from the builder's shell too. A record ask
+  // runs beside the task and requires the person's terminal eligibility.
+  if (overrideClearsUsagePausePreflight(opts, eligible, !!verdict.storeError)) return null;
+  return preflightRefusalLines(verdict, verb, eligible, opts.beside ? undefined : taskId, opts.beside ? taskId : undefined);
+}
+
+export function overrideClearsUsagePausePreflight(
+  opts: { beside?: boolean; pastUsagePause?: boolean },
+  eligible: boolean,
+  storeError: boolean,
+): boolean {
+  return opts.pastUsagePause === true && !storeError && (!opts.beside || eligible);
 }
 
 /**
@@ -78,7 +85,7 @@ export async function usagePauseRefusalLines(
  * through — only to a person at their own terminal
  * (`mayOfferUsagePauseOverride`); the builder has its own MCP parameter and an
  * agent none. With `taskRef` that is the task's own allowance, `lazy <verb>
- * <task> --past-usage-pause`; without (a run beside the task) the daemon-wide
+ * <task> --override-usage-pause`; without (a run beside the task) the daemon-wide
  * one-shot override.
  */
 export function preflightRefusalLines(
@@ -86,6 +93,7 @@ export function preflightRefusalLines(
   verb: PreflightVerb,
   offerOverride: boolean,
   taskRef?: string,
+  besideTaskRef?: string,
 ): string[] {
   if (verdict.storeError) {
     // No override lifts this one: a person fixes the file.
@@ -99,8 +107,10 @@ export function preflightRefusalLines(
     `The task cannot be ${NOT_DONE[verb]} right now: new turns on this credential are paused.`,
     `  ${describeUsagePause(verdict)}`,
     ...(offerOverride
-      ? [taskRef
-        ? `  To let this task's next turn start anyway: ${theme.command(`lazy ${verb} ${taskRef} --past-usage-pause`)}`
+      ? [besideTaskRef
+        ? `  To let this ask start anyway: ${theme.command(`lazy ask ${besideTaskRef} --override-usage-pause`)}`
+        : taskRef
+        ? `  To let this task's next turn start anyway: ${theme.command(`lazy ${verb} ${taskRef} --override-usage-pause`)}`
         : `  To let ONE turn start anyway: ${theme.command(`lazy daemon config set ${USAGE_PAUSE_OVERRIDE_KEY} off`)}`]
       : [`  New turns on this credential can start again once the window resets.`]),
     `Run ${theme.command('lazy doctor')} for the full diagnosis.`,
@@ -133,10 +143,10 @@ export async function requireUsagePauseClear(
  * same admission runs in-process (`queryUsagePause`'s fallback).
  */
 export async function admitInteractiveOrExit(
-  surface: 'pair' | 'chat',
+  surface: 'pair' | 'chat' | 'builder',
   taskId?: string,
   /** Decide only — never take the override. For a check before the command's own refusals. */
-  opts: { peek?: boolean } = {},
+  opts: { peek?: boolean; overrideUsagePause?: boolean } = {},
 ): Promise<void> {
   const refusal = await admitInteractive(surface, taskId, opts);
   if (refusal === null) return;
@@ -150,9 +160,9 @@ export async function admitInteractiveOrExit(
  * Null when admitted.
  */
 export async function admitInteractive(
-  surface: 'pair' | 'chat',
+  surface: 'pair' | 'chat' | 'builder',
   taskId?: string,
-  opts: { peek?: boolean } = {},
+  opts: { peek?: boolean; overrideUsagePause?: boolean } = {},
 ): Promise<string | null> {
   try {
     await queryUsagePause({
@@ -160,6 +170,7 @@ export async function admitInteractive(
       surface,
       ...(taskId ? { taskId } : {}),
       ...(opts.peek ? { peek: true } : {}),
+      ...(opts.overrideUsagePause ? { overrideUsagePause: true } : {}),
       // Only a person at a real terminal may TAKE the override (see
       // overrideEligibleActor); anything else is judged on the threshold alone.
       ...(await overrideEligibleActorOrUndefined()),

@@ -104,7 +104,7 @@ async function exec(cmd: string[], opts?: { cwd?: string; stdin?: string; timeou
       ...process.env,
       // Unset LAZY_FORCE_TTY so commands run non-interactively.
       // Do NOT set LAZY_NO_DAEMON — the daemon must be running for tests B/C/D.
-      // Do NOT set LAZY_PROMPT_DEFAULTS — use --yes flags per CLAUDE.md convention.
+      // Do NOT set LAZY_PROMPT_DEFAULTS — use --yes flags per AGENTS.md convention.
       LAZY_FORCE_TTY: undefined,
       // Unset LAZY_CONFIG so commands read the QA project's lazy.toml, not the
       // host project's config (which may have different agent, storage, etc.)

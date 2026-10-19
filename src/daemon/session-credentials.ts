@@ -130,7 +130,7 @@ async function load(projectRoot: string): Promise<SessionCredentialFile> {
       // would silently 401 every live container with no explanation anywhere.
       throw new Error(
         `Failed to read the session-credential registry at ${path}: ` +
-        `${err instanceof Error ? err.message : String(err)}`,
+        (err instanceof SyntaxError ? 'the registry is not valid JSON' : `${err instanceof Error ? err.message : String(err)}`),
       );
     }
   }
@@ -181,6 +181,13 @@ export interface BindTurnCredentialResult {
  * Reuses the existing token VALUE when the kind is unchanged, so a container
  * that is being reused keeps working with the env it was created with while the
  * authority behind that value moves to the new turn's owner.
+ *
+ * KNOWN, ACCEPTED BEHAVIOUR (engineer decision, 2026-10-10): a container
+ * process only ever holds the task's placeholder, which resolves to whoever
+ * owns the CURRENT turn. A service started in member A's turn, or a process an
+ * earlier turn backgrounded, is therefore billed to member B while B's turn
+ * runs, and gets a 401 between turns when the binding is revoked. Deliberate;
+ * documented in public-docs/credentials.md.
  */
 export async function bindTurnCredential(
   projectRoot: string,
@@ -313,4 +320,13 @@ function prune(bindings: SessionCredentialBinding[]): SessionCredentialBinding[]
 
 function mintToken(): string {
   return SESSION_TOKEN_PREFIX + randomBytes(32).toString('hex');
+}
+
+/**
+ * Every session placeholder value the registry remembers, revoked ones
+ * included — for scrubbing them out of text an admin reads
+ * (src/daemon/observability-redaction.ts).
+ */
+export async function knownSessionPlaceholderValues(projectRoot: string): Promise<string[]> {
+  return (await load(projectRoot)).bindings.map((b) => b.token);
 }

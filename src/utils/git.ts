@@ -9,6 +9,7 @@ import { annotateDubiousOwnership } from './git-ownership';
 import { refuseTamperedWorktreeGit, taskWorktreeOf } from '../git/worktree-pointers';
 import { resolveGitAuthorForArgs } from '../identity/git-author';
 import { isManagedMode } from '../config/managed-mode';
+import { deliveredExcludeFileFor, withDeliveredFilesGitConfig } from '../git/delivered-files-exclude';
 
 /**
  * Config every git lazy runs in a task worktree carries, as `GIT_CONFIG_*`
@@ -62,6 +63,12 @@ export interface RunGitOptions {
    */
   env?: Record<string, string>;
   /**
+   * Called with each stderr chunk AS IT ARRIVES (the full text is still
+   * returned in `stderr`). For long commands whose progress lines are the only
+   * sign of life — a checkout running LFS filters can take minutes.
+   */
+  onStderr?: (chunk: string) => void;
+  /**
    * Return stdout VERBATIM, with no `.trim()`. Default is to trim, because
    * almost every caller wants one value off a command that prints a trailing
    * newline.
@@ -78,6 +85,114 @@ export interface RunGitOptions {
    * end-of-string fixup can reach it.
    */
   trim?: boolean;
+}
+
+/**
+ * Lazy's own git never runs repository hooks — ANY hook, for ANY command.
+ * A root checkout whose `core.hooksPath` points into the tracked tree (husky's
+ * `.husky/`, a `githooks/` dir) would otherwise run hooks a TASK BRANCH wrote,
+ * on the host: pre-commit/post-merge on accept's squash, post-index-change on
+ * `git add`, reference-transaction on every ref update, post-checkout on
+ * `worktree add`, pre-push on accept's parent push. `-c core.hooksPath=/dev/null`
+ * names no directory, so git finds no hook at all, whatever the config or
+ * `.git/hooks` say. git-lfs uploads objects from its pre-push hook, so a push
+ * in a repository with LFS configured runs `git lfs push` explicitly first
+ * (see runGit). Exported for its test.
+ */
+export function withHooksDisabled(args: string[]): string[] {
+  return ['-c', 'core.hooksPath=/dev/null', ...args];
+}
+
+/** The subcommand of a git argv (skipping leading `-c k=v` / `-C dir` pairs and flags). */
+function gitSubcommand(args: string[]): { sub: string; index: number } | null {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '-c' || args[i] === '-C') { i++; continue; }
+    if (args[i]!.startsWith('-')) continue;
+    return { sub: args[i]!, index: i };
+  }
+  return null;
+}
+
+/**
+ * With hooks disabled, LFS's pre-push upload no longer runs: push the LFS
+ * objects for the same remote and refs explicitly — only when a pushed ref
+ * actually tracks files with LFS (a `filter=lfs` line in a `.gitattributes`
+ * at that ref; `git lfs install` commonly sets the filter config globally, so
+ * the config alone says nothing about this repository). The caller's leading
+ * `-C dir` / `-c k=v` pairs are carried to both probes, so they run in the
+ * repository the push runs in. Returns a failure to report, or null to go on.
+ */
+async function lfsPushBeforePush(args: string[], options: RunGitOptions): Promise<GitResult | null> {
+  const parsed = gitSubcommand(args);
+  if (!parsed || parsed.sub !== 'push') return null;
+  const prefix = args.slice(0, parsed.index);
+  const positional = args.slice(parsed.index + 1).filter(a => !a.startsWith('-'));
+  const [remote, ...refspecs] = positional;
+  if (!remote || refspecs.length === 0) return null;
+  // `git lfs push` takes source refs, not `src:dst` refspecs; a deletion
+  // (`:dst`) pushes no objects.
+  const refs = refspecs.map(r => r.replace(/^\+/, '').split(':')[0]!).filter(Boolean);
+  if (refs.length === 0) return null;
+  const probeOpts = { cwd: options.cwd, env: options.env, timeout: options.timeout };
+  let usesLfs = false;
+  for (const ref of refs) {
+    const grep = await runGit([...prefix, 'grep', '-l', '--fixed-strings', 'filter=lfs', ref, '--', '*.gitattributes'], probeOpts);
+    if (grep.exitCode === 0 && grep.stdout.trim()) { usesLfs = true; break; }
+  }
+  if (!usesLfs) return null;
+  const pushed = await runGit([...prefix, 'lfs', 'push', remote, ...refs], probeOpts);
+  return pushed.exitCode === 0 ? null : { ...pushed, stderr: `git lfs push failed before pushing: ${pushed.stderr}` };
+}
+
+/** Read a stderr stream to the end, handing each chunk to `onChunk` as it arrives. */
+async function streamStderr(stream: ReadableStream<Uint8Array>, onChunk: (chunk: string) => void): Promise<string> {
+  const decoder = new TextDecoder();
+  let text = '';
+  for await (const bytes of stream as unknown as AsyncIterable<Uint8Array>) {
+    const chunk = decoder.decode(bytes, { stream: true });
+    text += chunk;
+    try {
+      onChunk(chunk);
+    } catch (err) {
+      // A progress observer must never fail the git command it is watching.
+      logger.warn(`runGit: stderr observer threw: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return text + decoder.decode();
+}
+
+/**
+ * Kill-timer setting for git commands that write a working tree: NONE.
+ * spawn()'s default 60s backstop killed checkouts and merges still running
+ * Git LFS smudge filters on large repositories, leaving a task's checkout
+ * half-updated mid-sync or mid-accept. Such a command is bounded by the
+ * repository's size and git-lfs's own transfer timeouts, not by a guess here.
+ * A caller that passes an explicit `timeout` still gets it.
+ */
+export const CHECKOUT_TIMEOUT = 0;
+
+/** Subcommands that check files out into a working tree (and so can run LFS smudging). */
+const WORKTREE_WRITING_SUBCOMMANDS = new Set([
+  'checkout', 'switch', 'restore', 'merge', 'pull', 'reset', 'read-tree', 'stash',
+  'cherry-pick', 'revert', 'rebase', 'am', 'worktree',
+]);
+
+/** Global options before the subcommand that consume the following argument. */
+const GIT_GLOBAL_OPTS_WITH_VALUE = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path']);
+
+/**
+ * True when `args` runs a git subcommand that may write a working tree.
+ * `worktree` counts only for `add` (its other actions never check out).
+ */
+export function writesWorkingTree(args: string[]): boolean {
+  let i = 0;
+  while (i < args.length && args[i].startsWith('-')) {
+    i += GIT_GLOBAL_OPTS_WITH_VALUE.has(args[i]) ? 2 : 1;
+  }
+  const sub = args[i];
+  if (!sub || !WORKTREE_WRITING_SUBCOMMANDS.has(sub)) return false;
+  if (sub === 'worktree') return args[i + 1] === 'add';
+  return true;
 }
 
 /**
@@ -119,11 +234,24 @@ export async function runGit(args: string[], opts?: RunGitOptions | string): Pro
   if (options.cwd) spawnOpts.cwd = options.cwd;
   if (options.stdin) spawnOpts.stdin = options.stdin;
   if (options.env) spawnOpts.env = { ...process.env, ...options.env };
-  if (options.cwd && taskWorktreeOf(options.cwd)) {
+  const worktree = options.cwd ? taskWorktreeOf(options.cwd) : null;
+  if (worktree) {
     const base = (spawnOpts.env as Record<string, string | undefined> | undefined) ?? process.env;
-    spawnOpts.env = { ...base, ...taskWorktreeGitEnv(base) };
+    let env: Record<string, string | undefined> = { ...base, ...taskWorktreeGitEnv(base) };
+    // A task with delivered secret files (src/daemon/task-files.ts): point
+    // core.excludesFile at its own exclude list, so lazy's `git add -A` (and
+    // every status/dirty check) treats them as ignored. See
+    // src/git/delivered-files-exclude.ts for why this is env, not a file.
+    const excludeFile = await deliveredExcludeFileFor(worktree.worktreePath);
+    if (excludeFile) {
+      const { set, unset } = withDeliveredFilesGitConfig(env, excludeFile);
+      env = { ...env, ...set };
+      for (const key of unset) delete env[key];
+    }
+    spawnOpts.env = env;
   }
   if (options.timeout !== undefined) spawnOpts.timeout = options.timeout;
+  else if (writesWorkingTree(args)) spawnOpts.timeout = CHECKOUT_TIMEOUT;
 
   // A commit the daemon makes names its author explicitly — never git's
   // auto-detect, which on a managed host has no config and refuses
@@ -145,14 +273,23 @@ export async function runGit(args: string[], opts?: RunGitOptions | string): Pro
     }
   }
 
+  const lfsFailure = await lfsPushBeforePush(args, options);
+  if (lfsFailure) return lfsFailure;
+
   try {
-    const proc = spawn(['git', ...args], spawnOpts) as any;
+    const proc = spawn(['git', ...withHooksDisabled(args)], spawnOpts) as any;
+    const stderrText = stderrMode === 'pipe' && options.onStderr
+      ? streamStderr(proc.stderr, options.onStderr)
+      : null;
     const result = await proc.exited;
     const rawStdout = stdoutMode === 'pipe' ? await Bun.readableStreamToText(proc.stdout) : '';
     // Trimmed unless the caller says its output is content (see `trim` above).
     // stderr is always trimmed: it is a message, never a payload.
     const stdout = options.trim === false ? rawStdout : rawStdout.trim();
-    let stderr = stderrMode === 'pipe' ? (await Bun.readableStreamToText(proc.stderr)).trim() : '';
+    let stderr = '';
+    if (stderrMode === 'pipe') {
+      stderr = (stderrText ? await stderrText : await Bun.readableStreamToText(proc.stderr)).trim();
+    }
     const exitCode = proc.exitCode ?? result;
 
     // git's "dubious ownership" refusal tells the human to add a global

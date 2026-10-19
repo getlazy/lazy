@@ -32,6 +32,7 @@
  */
 
 import { logger } from './logger';
+import { redactSecretValues } from './redact';
 
 /** Placeholder shown where a turn's text is missing, for human-facing renders. */
 export const MISSING_TURN_CONTENT = '(no content recorded)';
@@ -94,7 +95,10 @@ export function normalizeRecordContent(
   writer: string,
   field: string,
 ): string {
-  if (typeof content === 'string') return content;
+  // Every record content written through here is durable and human-visible
+  // (turns, comments, journal, raised items), so no known secret value may
+  // reach the store: scrubbed on the way in (src/utils/redact.ts).
+  if (typeof content === 'string') return redactSecretValues(content);
 
   logger.warn(
     `[${context}] ${writer} called with non-string content (${content === null ? 'null' : typeof content}); ` +

@@ -44,6 +44,10 @@ import { mkdir, writeFile } from 'fs/promises';
 // Sync, because the symbol it serves (isContainerRunning) is sync. Test-harness
 // code, so the no-sync-fs rule for src/ does not reach it.
 import { existsSync } from 'fs';
+import { analyzeLazyBaseUsage } from '../../src/capture/dockerfile-base';
+import type { PhaseNotify } from '../../src/daemon/progress';
+import { looksLikeTaskBranch } from '../../src/git/branch-prefix';
+import { createHash } from 'crypto';
 
 export { IMAGE_TAG, IMAGE_MAX_AGE_DAYS, IMAGE_MAX_AGE_MS };
 const MOCK_IMAGE_REF = `${IMAGE_NAME}:${IMAGE_TAG}`;
@@ -72,6 +76,58 @@ export async function localImageExists(_ref: string, _binary?: string): Promise<
   // E2e mock: treat every ref as present so CLI "already pinned" skips do not
   // re-offer. Missing-image fail-loud is unit-tested against real ensureImage.
   return true;
+}
+
+export async function gitInRoot(
+  lazyRoot: string,
+  args: string[],
+  timeoutMs: number = 15_000,
+): Promise<{ exitCode: number | null; stdout: Buffer; stderr: string }> {
+  const proc = Bun.spawn(['git', ...args], { cwd: lazyRoot, stdout: 'pipe', stderr: 'pipe', timeout: timeoutMs });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    proc.exited, new Response(proc.stdout).arrayBuffer(), new Response(proc.stderr).text(),
+  ]);
+  return { exitCode, stdout: Buffer.from(stdout), stderr };
+}
+
+export async function rootIntegrationBranch(lazyRoot: string): Promise<string | null> {
+  const head = await gitInRoot(lazyRoot, ['symbolic-ref', '-q', '--short', 'HEAD']);
+  if (head.exitCode !== 0) throw new Error(`Cannot read project branch: ${head.stderr.trim() || 'detached HEAD'}`);
+  const branch = head.stdout.toString().trim();
+  if (looksLikeTaskBranch(branch)) throw new Error(`Task branch cannot choose the image: ${branch}`);
+  const commit = await gitInRoot(lazyRoot, ['rev-parse', '--verify', '-q', `refs/heads/${branch}^{commit}`]);
+  if (commit.exitCode === 1) return null;
+  if (commit.exitCode !== 0) throw new Error(`Cannot resolve project branch: ${commit.stderr.trim()}`);
+  return branch;
+}
+
+export async function prepareLazyBaseRefs(
+  _lazyRoot: string,
+  content: string,
+  _source: string,
+  _binary: string,
+  _notify?: PhaseNotify,
+): Promise<{ buildable: string[]; unbuildable: string[] }> {
+  const usage = analyzeLazyBaseUsage(content, IMAGE_NAME, [`${IMAGE_NAME}:${IMAGE_TAG}`, `${IMAGE_NAME}:latest`]);
+  return { buildable: usage.buildable, unbuildable: usage.unbuildable };
+}
+
+export async function buildDockerfileCandidate(
+  _lazyRoot: string,
+  options: {
+    dockerfilePath: string;
+    contextDir: string;
+    source: string;
+    binary?: string;
+    tags?: string[];
+    timeoutMs?: number;
+    notify?: PhaseNotify;
+    selfcheck?: boolean;
+  },
+): Promise<{ imageName: string; output: string }> {
+  const content = await Bun.file(options.dockerfilePath).text();
+  const contentHash = createHash('sha256').update(content).digest('hex').substring(0, 12);
+  return { imageName: options.tags?.[0] ?? `lazy-custom-${contentHash}:${IMAGE_TAG}`, output: '' };
 }
 
 export async function buildImageFromDockerfilePath(
@@ -159,8 +215,57 @@ export async function resolveCustomDockerfile(lazyRoot: string): Promise<string 
   }
   const { loadConfig } = await import('../../src/config/loader');
   const config = await loadConfig(lazyRoot);
-  if (!config.docker.dockerfile) return null;
+  if (!config.docker.dockerfile) {
+    const state = await inspectConventionalDockerfile(lazyRoot);
+    return state.kind === 'used' ? state.path : null;
+  }
   return join(lazyRoot, config.docker.dockerfile);
+}
+
+export type ConventionalDockerfileState =
+  | { kind: 'absent' }
+  | { kind: 'untracked'; path: string }
+  | { kind: 'not-built-on-backend'; branch: string; blob: string }
+  | { kind: 'used'; branch: string; blob: string; path: string };
+
+export const ROOT_DOCKERFILE_SKIPPED_ON_BACKEND =
+  `this project's Dockerfile.lazy is not built on this install's backend ` +
+  `(builds there would run on the shared host); tasks use the base image`;
+
+/**
+ * Mirrors the real convention's DECISION (committed on the root's branch, gated
+ * on the backend) for CLI flows under the module mock. The real snapshot/refusal
+ * mechanics are exercised against the real module in the unit and e2e suites;
+ * here a used file resolves to its root path, which nothing under the mock builds.
+ */
+export async function inspectConventionalDockerfile(lazyRoot: string): Promise<ConventionalDockerfileState> {
+  const path = join(lazyRoot, 'Dockerfile.lazy');
+  const { pathExists } = await import('../../src/utils/fs');
+  const tree = Bun.spawnSync(['git', 'ls-tree', 'HEAD', '--', 'Dockerfile.lazy'], {
+    cwd: lazyRoot, stdout: 'pipe', stderr: 'ignore',
+  });
+  const line = tree.exitCode === 0 ? tree.stdout.toString().trim() : '';
+  if (!line) return (await pathExists(path)) ? { kind: 'untracked', path } : { kind: 'absent' };
+  const blob = line.split(/\s+/)[2] ?? '';
+  const { autoBuildsRootDockerfile } = await import('../../src/config/managed-mode');
+  if (!autoBuildsRootDockerfile()) return { kind: 'not-built-on-backend', branch: 'HEAD', blob };
+  return { kind: 'used', branch: 'HEAD', blob, path };
+}
+
+/** Mirrors the real label helper: the mock resolves plain paths, so the path is the label. */
+export function describeDockerfileSource(path: string): string {
+  return path;
+}
+
+export async function describeSkippedRootDockerfile(lazyRoot: string): Promise<string | null> {
+  const { loadConfig } = await import('../../src/config/loader');
+  if ((await loadConfig(lazyRoot)).docker.dockerfile) return null;
+  const state = await inspectConventionalDockerfile(lazyRoot);
+  if (state.kind === 'untracked') {
+    return 'Dockerfile.lazy at the project root is not committed, so it is not used — ' +
+      'tasks use the base image. Commit it to make it the task image.';
+  }
+  return state.kind === 'not-built-on-backend' ? ROOT_DOCKERFILE_SKIPPED_ON_BACKEND : null;
 }
 
 export async function isAdoptedDockerfile(
@@ -377,7 +482,9 @@ async function maybeLeaveUncommitted(worktreePath: string): Promise<void> {
   for (const path of spec.split(',').map(p => p.trim()).filter(Boolean)) {
     const fullPath = join(worktreePath, path);
     mkdirSync(dirname(fullPath), { recursive: true });
-    writeFileSync(fullPath, `Left uncommitted by the mock agent (${path})\n`);
+    // Names the worktree, so a child cut from a branch where the parent's
+    // wrap-up committed the same path still leaves a REAL edit behind.
+    writeFileSync(fullPath, `Left uncommitted by the mock agent (${path}) in ${worktreePath}\n`);
   }
 }
 
@@ -827,6 +934,39 @@ async function simulateCommitLeftovers(ctx: WrapUpStepCtx, endSha: string): Prom
   ctx.state.lastSha = postLeftoversSha;
 }
 
+/**
+ * The once-per-turn commit nudge: before the wrap-up chain, on EITHER ending,
+ * a dirty worktree gets ONE "have you committed all your work?" follow-up,
+ * recorded as its own response. No-op on a clean worktree, like the real one.
+ *
+ * `LAZY_MOCK_NUDGE_COMMIT=1` makes the simulated agent commit everything;
+ * otherwise it answers (`LAZY_MOCK_NUDGE_RESPONSE`) and the paths stay loose.
+ */
+async function simulateCommitNudge(ctx: WrapUpStepCtx, endSha: string): Promise<void> {
+  const { listUncommittedPaths } = await import('../../src/git/operations');
+  const before = await listUncommittedPaths(ctx.sandbox.worktreePath);
+  if (before === null || before.length === 0) return;
+  if (process.env.LAZY_MOCK_NUDGE_COMMIT === '1') {
+    Bun.spawnSync(['git', 'add', '-A'], { cwd: ctx.sandbox.worktreePath });
+    Bun.spawnSync(['git', 'commit', '-m', 'Mock commit-nudge commit'], { cwd: ctx.sandbox.worktreePath });
+  }
+  const postNudgeSha = headShaOr(ctx.sandbox.worktreePath, endSha);
+  ctx.state.supervised.push({
+    status: 'completed',
+    result: process.env.LAZY_MOCK_NUDGE_RESPONSE ?? 'Mock agent: answered the commit nudge.',
+    session_id: 'mock-sess-commit-nudge',
+    usage: { ...SUPERVISED_USAGE },
+    start_sha_work: ctx.state.lastSha,
+    end_sha_work: postNudgeSha,
+    ...ctx.launchSettings,
+    supervised: {
+      kind: 'commit_nudge',
+      prompt: `Mock commit nudge: You have uncommitted changes (${before.length} path(s)). Have you committed all your work?`,
+    },
+  });
+  ctx.state.lastSha = postNudgeSha;
+}
+
 /** The enforcement error message — byte-identical on both real paths. */
 const PRESENT_ENFORCEMENT_ERROR =
   'Presentation step did not complete: no presentation was declared via lazy_report — send the report again with its presentation groups';
@@ -921,10 +1061,21 @@ async function handleMockAcceptGate(
   // Run each configured command in order in the worktree, stop at first failure.
   const commands = (cmd.accept_gate_commands as string[] | undefined) ?? [];
   let acceptGate: Record<string, unknown> = { passed: true };
+  const timeoutSecs = (cmd.accept_gate_timeout as number | undefined) ?? 600;
   for (const command of commands) {
     const r = Bun.spawnSync(['sh', '-c', command], {
       cwd: sandbox.worktreePath, stdout: 'pipe', stderr: 'pipe',
+      timeout: timeoutSecs * 1000,
+      // LAZY_MOCK_IN_GATE_CONTAINER: lets a suite tell "ran in the gate
+      // container" (this mock stands in for it) from "ran in the daemon or
+      // CLI process on the host", which never sets it.
+      env: { ...process.env, LAZY_MOCK_IN_GATE_CONTAINER: '1' },
     });
+    if (r.exitCode === null || r.signalCode) {
+      // Killed by the timeout: the real gate reports exit -2.
+      acceptGate = { passed: false, failed_command: command, exit_code: -2, output: `Command timed out after ${timeoutSecs}s` };
+      break;
+    }
     if (r.exitCode !== 0) {
       const out = (r.stderr?.toString() ?? '') + (r.stdout?.toString() ?? '');
       acceptGate = { passed: false, failed_command: command, exit_code: r.exitCode, output: truncateLog(out) };
@@ -1099,6 +1250,32 @@ async function handleMockSync(
   await writeMockResponse(protocolDir, { status: 'completed', responses }, cmd);
 }
 
+/**
+ * Hold the simulated turn open while the file named by
+ * `LAZY_MOCK_HOLD_TURN_FILE` exists — the module-mock seam for "a turn is
+ * RUNNING right now". Without it a mocked turn completes inside its own launch,
+ * so nothing can ever observe the task mid-turn: an agent's MCP call, which the
+ * daemon accepts only while the caller's turn is live, was unreachable from a
+ * module-mock suite. The launch stays in flight while held (the docker runner
+ * wraps this call in `withLaunchInFlight`), so the reconciler leaves the task
+ * alone exactly as it does for a real launch still starting. Async polling:
+ * this runs in the daemon's event loop.
+ */
+async function holdTurnWhileRequested(): Promise<void> {
+  const holdFile = process.env.LAZY_MOCK_HOLD_TURN_FILE;
+  if (!holdFile) return;
+  const { access } = await import('fs/promises');
+  const deadline = Date.now() + 120_000;
+  while (Date.now() < deadline) {
+    try {
+      await access(holdFile);
+    } catch {
+      return; // the file is gone: the test released the turn
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
 export async function launchSupervisorAsync(
   sandbox: SandboxConfig,
   containerName: string,
@@ -1119,6 +1296,8 @@ export async function launchSupervisorAsync(
   // Launch settings the host asked for — echoed onto every response this
   // invocation writes, exactly as the real supervisor does.
   const launchSettings = launchSettingsFromCommand(await readCommand(protocolDir));
+
+  await holdTurnWhileRequested();
 
   {
     const cmd = await readCommand(protocolDir);
@@ -1248,6 +1427,16 @@ export async function launchSupervisorAsync(
     declaredFinal,
     presentedSha: cmdPresentedSha,
   };
+
+  // The once-per-turn commit nudge, ahead of the wrap-up chain on either
+  // ending — never on a read-only (plan-mode) turn.
+  try {
+    if (cmdPermissionMode !== 'plan') {
+      await simulateCommitNudge(stepCtx, headShaOr(sandbox.worktreePath, postWorkSha ?? preTurnSha));
+    }
+  } catch {
+    // Non-fatal: skip the commit nudge if it fails in tests
+  }
 
   // Detect file permission violations, via the shared step simulation.
   // INVARIANT: status.post_work_sha stays pinned at the WORK end — NOT advanced
@@ -1525,6 +1714,7 @@ export function describeInputChanges(): string | null {
 // The mock replaces capture/claude entirely under LAZY_TEST, so every symbol the
 // source imports must be present here or module resolution fails CLI-wide.
 export const DEFAULT_DOCKERFILE = '# mock Dockerfile\n';
+export const CONVENTIONAL_DOCKERFILE = 'Dockerfile.lazy';
 
 // --- Token usage extraction ---
 
@@ -1534,5 +1724,19 @@ export function extractTokenUsage(response: AgentResponse): TokenUsage {
     outputTokens: response.usage?.output_tokens ?? 0,
     cacheCreationTokens: 0,
     cacheReadTokens: 0,
+  };
+}
+
+// Launch-level build-failure memory: the mock never builds, so there is nothing to remember.
+export function forgetBuildFailure(_imageName: string): void {}
+export function resetBuildFailuresForTests(): void {}
+
+// Same static-import mirror: docker-runner.ts imports the damaged-image repair
+// steps. Nothing under the mock launches docker, so the repair never runs.
+export function runnerImageRepairDeps(binary: string) {
+  return {
+    binary,
+    canRebuild: async () => false,
+    rebuild: async () => undefined,
   };
 }

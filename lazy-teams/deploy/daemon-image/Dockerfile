@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 #
 # The lazy daemon image — the image a project daemon runs in inside its VM:
-# bun + a lazy checkout + a Docker engine, in one OCI image. Nothing below is
+# lazy as a compiled binary + a Docker engine, in one OCI image. Nothing below is
 # smolvm-specific; smolvm is simply the vehicle in use today, and it boots this
 # image as a microVM with `smolvm machine create -I <image>`.
 #
@@ -23,24 +23,41 @@
 #   * a Docker engine — task containers run on the guest's own dockerd, and
 #     managed mode has no other runner. dockerd cannot use the rootfs overlay
 #     (ramfs lower layer), which is what lazy-guest-init exists to work around.
-#   * the lazy sources at /opt/lazy, including Dockerfile.lazy — the daemon
-#     builds the lazy-runner agent image from it on the guest's dockerd.
+#   * lazy itself as the compiled release binary at /opt/lazy/bin/lazy (built by
+#     scripts/build.ts, the same build a release ships) — no sources, no
+#     node_modules, no bun. The binary embeds its prompts, the lazy-runner
+#     Dockerfile it builds on the guest's dockerd and the agent binary; the
+#     project's own Dockerfile.lazy is read from the PROJECT checkout, never from
+#     lazy's.
 #
 # One Dockerfile, both architectures: nothing below is arch-conditional. bun
-# comes from the official multi-arch bun image rather than the install script,
-# so the runtime bun is byte-identical to the one that resolved bun.lock.
+# (build stage only) comes from the official multi-arch bun image rather than the
+# install script, so the compiler is byte-identical to the one that resolved
+# bun.lock.
 
-ARG BUN_VERSION=1.2.21
+# The repo's pinned bun (.bun-version) — the one every test runs on. The image
+# used to compile lazy with an older bun (1.2.21) whose WebSocket client
+# duplicated handshake headers, which broke ActionCable through task services;
+# test/unit/lazy-daemon-image.test.ts keeps the two equal.
+ARG BUN_VERSION=1.3.11
 ARG DEBIAN_TAG=bookworm-slim
 # Forge CLIs, exact release versions. Bumping one means updating its two rows
 # in the checksum table below; the build refuses a version it has no sha for.
 ARG GH_VERSION=2.101.0
 ARG GLAB_VERSION=1.119.0
+# Docker engine + buildx, exact versions from Docker's apt repo. Debian
+# bookworm's docker.io is 20.10, whose `docker build` is the LEGACY builder: it
+# rejects BuildKit-only syntax (`RUN --network`, `RUN --mount`, heredocs) that a
+# project's Dockerfile.lazy may use ("Unknown flag: network"). Docker 23+ builds
+# through buildx/BuildKit by default; a buildx binary alone would not help, as
+# the 20.10 CLI never delegates `docker build` to it.
+ARG DOCKER_VERSION=29.8.2
+ARG DOCKER_BUILDX_VERSION=0.37.1
 
-# ── lazy CLI (bun + source checkout) ─────────────────────────────────────────
-# The ONE build of lazy per release: lazy-teams/deploy/Dockerfile copies this
-# checkout (to /lazy) rather than building its own. lazy runs from TypeScript
-# sources, not a compiled bundle, so the tree ships as-is.
+# ── lazy CLI (build stage: sources → compiled binary) ────────────────────────
+# The ONE build of lazy per release: lazy-teams/deploy/Dockerfile copies the
+# compiled binary and its sidecars (to /lazy) rather than building its own. The
+# sources and node_modules stay in this stage and never reach the runtime image.
 
 FROM docker.io/oven/bun:${BUN_VERSION} AS lazy-checkout
 
@@ -70,7 +87,7 @@ COPY design/industry/styles.css ./design/industry/styles.css
 # The fingerprint is computed by lazy itself (`system source-id --write`), the
 # one implementation RollsFleet compares against — never a shell pipeline. It
 # also proves the CLI's module graph loads, here, where failing is cheap. The
-# Teams image copies this checkout, fingerprint included.
+# Teams image copies the compiled binary and this fingerprint.
 #
 # The checkout has no .git (.dockerignore; the publish script builds from a
 # `git archive`), so the source identity comes in as build args from the
@@ -89,6 +106,26 @@ RUN bun run scripts/write-source-stamp.ts && \
     bun run ensure:agent-placeholder && \
     bun run src/index.ts system source-id --write
 
+# COMPILE the release binary, exactly as a release does (scripts/build.ts: the
+# lazy-agent binary first, then lazy with it embedded, `--define
+# LAZY_RELEASE_BUILD=true --minify-syntax`). It embeds the `.source-fingerprint`
+# just written, so `lazy system source-id` in the guest answers the same id the
+# fleet roll compares against. Runs for THIS image's platform (one build per
+# arch under buildx), and the smoke line proves the binary starts here — and
+# that it carries lazy-guest-init byte for byte, since the image's shim runs
+# nothing else (docs/design/lazy-daemon-image.md, "What travels with the binary").
+RUN bun run scripts/build.ts && \
+    ./lazy --version && \
+    ./lazy system source-id --json | tee /dev/stderr | grep -q '"kind": *"embedded"' && \
+    [ "$(./lazy system source-id)" = "$(cat .source-fingerprint)" ]
+# lazy-guest-init, out of the compiled binary: byte-identical to the source, and
+# written under the id the binary reports (no hash tool here: the build stage
+# hashes nothing itself — see deploy-image-fingerprint tests).
+RUN gi="$(./lazy system guest-init-script --run-dir /tmp/guest-init-check)" && \
+    cmp "$gi" src/guest/lazy-guest-init && \
+    [ "$gi" = "/tmp/guest-init-check/lazy-guest-init.$(./lazy system guest-init-script --id)" ] && \
+    rm -rf /tmp/guest-init-check
+
 # ── Guest runtime ────────────────────────────────────────────────────────────
 
 FROM docker.io/library/debian:${DEBIAN_TAG} AS runtime
@@ -102,11 +139,25 @@ ARG LAZY_SOURCE_FINGERPRINT=unknown
 LABEL lazyVersion="${LAZY_VERSION}" \
       lazySourceFingerprint="${LAZY_SOURCE_FINGERPRINT}" \
       org.opencontainers.image.title="lazy-daemon" \
-      org.opencontainers.image.description="the image a lazy project daemon runs in inside its VM (bun + lazy + dockerd)" \
+      org.opencontainers.image.description="the image a lazy project daemon runs in inside its VM (lazy + dockerd)" \
       org.opencontainers.image.source="https://github.com/getlazy/lazy" \
       org.opencontainers.image.version="${LAZY_VERSION}"
 
-# docker.io brings dockerd, the docker CLI, containerd, runc and iptables.
+# THE GUEST ABI — raise it BY HAND whenever this stage changes what a machine's
+# root filesystem holds outside /opt/lazy/bin/lazy: Debian, the packages, Docker,
+# gh/glab, the lazy-guest-init SHIM, the wrapper, /etc/gitconfig, the ENV below.
+# A Teams upgrade copies only the lazy binary into a running machine (an
+# in-place swap that keeps its docker images and tools); a machine created under
+# another ABI is REPLACED instead, because only a new machine gets a new root
+# filesystem. lazy-guest-init's actual logic is NOT here: it is embedded in the
+# binary (src/guest/lazy-guest-init) and upgrades in place with it, so changing
+# it never needs a bump — that is what ABI 5 introduced the shim for.
+# test/unit/lazy-daemon-image.test.ts pins a digest of this stage and those
+# files to the number, so a change that forgets the bump fails there.
+LABEL org.getlazy.guest-abi="5"
+
+# The Docker engine comes from Docker's own apt repo (next block), not Debian's
+# docker.io. gnupg: verifies that repo's key. iptables: dockerd's bridge rules.
 # socat: the forwarder lazy-guest-init runs from the guest's link address to the
 # daemon's loopback, because the VM's published-port relay dials the link address
 # (measured on smolvm v1.9.3) and managed mode pins the daemon to 127.0.0.1.
@@ -118,9 +169,9 @@ RUN apt-get update -qq && \
     apt-get install --no-install-recommends -y \
       ca-certificates \
       curl \
-      docker.io \
       e2fsprogs \
       git \
+      gnupg \
       git-lfs \
       iproute2 \
       iptables \
@@ -130,6 +181,34 @@ RUN apt-get update -qq && \
       unzip \
       xz-utils && \
     rm -rf /var/lib/apt/lists /var/cache/apt/archives
+
+# Docker engine from Docker's apt repo, pinned. The repo key's fingerprint is
+# verified, so a swapped key fails the build. The last command fails the build
+# if the BuildKit builder is missing — the legacy builder must never silently
+# come back (lazy-guest-init re-checks at boot).
+ARG DOCKER_VERSION
+ARG DOCKER_BUILDX_VERSION
+RUN set -eu; \
+    install -m 0755 -d /etc/apt/keyrings; \
+    curl -fsSL https://download.docker.com/linux/debian/gpg -o /tmp/docker.asc; \
+    gpg --show-keys --with-colons /tmp/docker.asc | grep -q '^fpr:::::::::9DC858229FC7DD38854AE2D88D81803C0EBFCD88:' \
+      || { echo "Docker apt key fingerprint mismatch" >&2; exit 1; }; \
+    mkdir -p /tmp/dockergpg; chmod 700 /tmp/dockergpg; \
+    gpg --homedir /tmp/dockergpg --batch --import /tmp/docker.asc; \
+    gpg --homedir /tmp/dockergpg --batch --export 9DC858229FC7DD38854AE2D88D81803C0EBFCD88 > /etc/apt/keyrings/docker.gpg; \
+    [ "$(gpg --show-keys --with-colons /etc/apt/keyrings/docker.gpg | grep -c '^pub:')" = 1 ] \
+      || { echo "Docker apt keyring must hold exactly the asserted key" >&2; exit 1; }; \
+    rm -rf /tmp/docker.asc /tmp/dockergpg; \
+    echo "deb [signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list; \
+    apt-get update -qq; \
+    apt-get install --no-install-recommends -y \
+      "docker-ce=5:${DOCKER_VERSION}-1~debian.12~bookworm" \
+      "docker-ce-cli=5:${DOCKER_VERSION}-1~debian.12~bookworm" \
+      "docker-buildx-plugin=${DOCKER_BUILDX_VERSION}-1~debian.12~bookworm" \
+      containerd.io; \
+    rm -rf /var/lib/apt/lists /var/cache/apt/archives; \
+    docker --version; \
+    docker buildx version
 
 # gh and glab: the forge drivers' API features — opening PRs/MRs on
 # `lazy submit`, reading their reviews and comments. No login step: the fleet
@@ -161,12 +240,18 @@ RUN set -eu; cd /tmp; \
     rm -f "${gh}" "${glab}" forge-cli.sha256 want.sha256; \
     gh --version; glab --version
 
-# The exact bun that resolved bun.lock in the stage above.
-COPY --from=lazy-checkout /usr/local/bin/bun /usr/local/bin/bun
-RUN ln -sf /usr/local/bin/bun /usr/local/bin/bunx
+# lazy, as the compiled release binary and the three small files that name it.
+# No bun, no sources, no node_modules: the build stage had them, this image does
+# not. /opt/lazy/.source-fingerprint is what the fleet roll reads out of the image
+# (DaemonImageFetcher, the publish script's --save); source-stamp.json and
+# src/version.ts are the sidecars the Teams app image reads for its version.
+COPY --from=lazy-checkout /opt/lazy/lazy /opt/lazy/bin/lazy
+# source-stamp.json is absent when the build was handed no LAZY_BUILD_SHA, hence
+# the bracket glob (a no-match glob is tolerated beside a file that does match).
+COPY --from=lazy-checkout /opt/lazy/.source-fingerprint /opt/lazy/source-stamp.jso[n] /opt/lazy/
+COPY --from=lazy-checkout /opt/lazy/src/version.ts /opt/lazy/src/version.ts
 
-COPY --from=lazy-checkout /opt/lazy /opt/lazy
-
+# A stable shim: it runs the lazy-guest-init embedded in the CURRENT lazy binary.
 COPY lazy-teams/deploy/daemon-image/lazy-guest-init /usr/local/bin/lazy-guest-init
 # Named lazy-wrapper in the repository, `lazy` in the guest: the repo's
 # .gitignore ignores any path component called `lazy` (the compiled binary), and
@@ -178,10 +263,10 @@ COPY lazy-teams/deploy/daemon-image/lazy-wrapper /usr/local/bin/lazy
 COPY lazy-teams/deploy/daemon-image/gitconfig /etc/gitconfig
 RUN chmod 0755 /usr/local/bin/lazy-guest-init /usr/local/bin/lazy
 
-# LAZY_CHECKOUT is what the wrapper runs; LAZY_GUEST_STORAGE_ROOT is where
+# LAZY_BIN is what the wrapper runs; LAZY_GUEST_STORAGE_ROOT is where
 # lazy-guest-init looks for the machine's real disk (smolvm mounts the
 # `--storage` ext4 volume at /storage).
-ENV LAZY_CHECKOUT="/opt/lazy" \
+ENV LAZY_BIN="/opt/lazy/bin/lazy" \
     LAZY_GUEST_STORAGE_ROOT="/storage" \
     PATH="/usr/local/bin:${PATH}"
 

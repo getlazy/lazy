@@ -63,7 +63,7 @@ describe('a pinned profile endpoint is proxied, not dialed directly', () => {
     await writeFile(
       configPath,
       `${existing}\n[agents.local-ollama]\nharness = "claude-code"\nmodel = "qwen-test"\n` +
-      `endpoint = "${ollamaUrl}"\n`,
+      `endpoint = "${ollamaUrl}"\ncredential = "none"\n`,
     );
     ctx.git('add', 'lazy.toml');
     const commit = ctx.git('commit', '-m', 'Add a profile pinned to a stub Ollama');

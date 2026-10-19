@@ -1,7 +1,7 @@
 /**
  * Recovery patches — "we are about to destroy worktree state, save it first".
  *
- * CLAUDE.md's recovery-file rule: work that cannot be kept must at least be
+ * AGENTS.md's recovery-file rule: work that cannot be kept must at least be
  * retrievable. `.lazy/recovery/` is gitignored, so writing here never dirties
  * the worktree the caller is about to clean, and it survives whatever the
  * caller does next.

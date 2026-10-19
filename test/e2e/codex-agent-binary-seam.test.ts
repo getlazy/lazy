@@ -13,22 +13,23 @@
  * (JSONL event stream captured from codex-cli 0.152.1), so a green turn here
  * also exercises the real parse path end to end.
  *
- * The proxied-round-trip half (the turn's own HTTP hitting the proxy's
- * OpenAI-compatible route and the placeholder being swapped upstream) lands
- * with the route itself — see proxy-openai-upstreams, which this task's branch
- * is stacked on.
+ * The proxied-round-trip half — the turn's own HTTP hitting the proxy's
+ * OpenAI-compatible route, the placeholder swapped for the real key upstream,
+ * and the request landing in the audit trail — is the first test below.
  */
 
 import { CODEX_LATEST_MODEL } from '../../src/config/default-models';
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { readFile } from 'fs/promises';
+import { readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask } from '../helpers/fixtures';
+import { largePrompt, createTaskWithPipedPrompt } from '../helpers/agent-seam';
 import { expectSuccess } from '../helpers/assertions';
-import { codexSuccessScenario } from '../helpers/fake-codex';
+import { codexSuccessScenario, codexProxiedCallScenario } from '../helpers/fake-codex';
+import { auditLogPath } from '../../src/proxy/audit-log';
 import { readTaskStatus } from '../helpers/storage';
-import { writeAgentApiKey } from '../../src/agent/credentials';
+import { setCredential } from '../../src/credentials/store';
 import { looksLikeLazyPlaceholder } from '../../src/proxy/credential-broker';
 
 /**
@@ -76,7 +77,7 @@ describe('codex turns through the fake-binary seam', () => {
     ctx = await setupTestLazy({ fakeCodex: true });
     // The key the daemon holds, stored per-project so it survives restarts;
     // the launch resolves it only to prove one exists and mints a placeholder.
-    await writeAgentApiKey(ctx.root, 'codex', REAL_OPENAI_KEY);
+    await setCredential(ctx.root, { provider: 'openai', kind: 'api-key', secret: REAL_OPENAI_KEY }, 'file');
   });
 
   afterEach(async () => {
@@ -85,6 +86,98 @@ describe('codex turns through the fake-binary seam', () => {
     if (savedOpenAIKey === undefined) delete process.env.OPENAI_API_KEY;
     else process.env.OPENAI_API_KEY = savedOpenAIKey;
   });
+
+  // INVARIANT: a codex turn's own model request rides lazy's proxy and lands
+  // in the audit trail, attributed to its task, with the daemon's real key
+  // swapped in for the placeholder the agent held. proxy-codex-roundtrip proves
+  // the route answers when a test dials it; this proves the LAUNCH dials it —
+  // the fake reads only LAZY_CODEX_API_BASE, so a launch that stopped routing
+  // codex through the proxy shows up as a request the audit never saw.
+  test('the turn\'s own model traffic goes through the proxy and is audited', async () => {
+    const seen: Array<{ method: string; path: string; auth: string | null }> = [];
+    const upstream = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      async fetch(req) {
+        seen.push({ method: req.method, path: new URL(req.url).pathname, auth: req.headers.get('authorization') });
+        await req.text().catch(() => '');
+        return Response.json({ id: 'resp-seam', usage: { input_tokens: 11, output_tokens: 4, total_tokens: 15 } });
+      },
+    });
+    try {
+      const configPath = join(ctx.root, 'lazy.toml');
+      const before = await readFile(configPath, 'utf-8');
+      expect(before).not.toMatch(/^\s*\[agents\.codex\]/m);
+      await writeFile(
+        configPath,
+        `${before}\n[agents.codex]\nharness = "codex"\nmodel = "${CODEX_LATEST_MODEL}"\n` +
+        `endpoint = "http://127.0.0.1:${upstream.port}"\ncredential = "openai"\n`,
+      );
+      expectSuccess(await ctx.lazy(['daemon', 'restart']));
+
+      const taskId = await createTask(ctx, 'Codex proxy route', 'Call the API');
+      await ctx.setCodexScenario({
+        sequence: [
+          codexProxiedCallScenario({
+            sessionId: '01a00000-0000-7000-8000-00000000a0d1',
+            commit: { message: 'Codex proxied turn', files: [{ path: 'codex-proxy.txt', content: 'x\n' }] },
+          }),
+          codexSuccessScenario({ sessionId: '01a00000-0000-7000-8000-00000000a0d1' }),
+        ],
+      });
+
+      expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+      expectSuccess(await ctx.lazy(['wait', taskId]));
+      expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
+
+      const turns = await turnInvocations();
+      const placeholder = requireEnv(turns[0]!.env, 'OPENAI_API_KEY');
+      expect(requireEnv(turns[0]!.env, 'LAZY_CODEX_API_BASE')).not.toContain(String(upstream.port));
+
+      // The endpoint preflight may probe the stub too; the turn's request is
+      // the POST to the Responses API.
+      const call = seen.find(s => s.method === 'POST' && s.path.endsWith('/responses'));
+      expect(call, `the codex turn never reached the stub upstream (saw ${JSON.stringify(seen)})`).toBeTruthy();
+      expect(call!.auth).toBe(`Bearer ${REAL_OPENAI_KEY}`);
+      expect(call!.auth).not.toContain(placeholder);
+
+      const logPath = auditLogPath(join(ctx.root, '.lazy'));
+      let record: any;
+      for (let i = 0; i < 50 && !record; i++) {
+        const raw = await readFile(logPath, 'utf-8').catch(() => '');
+        record = raw.trim().split('\n').filter(Boolean).map(l => JSON.parse(l))
+          .find(r => String(r.upstream).includes(String(upstream.port)) && r.status === 200);
+        if (!record) await Bun.sleep(100);
+      }
+      expect(record, 'the codex request has no audit record').toBeTruthy();
+      expect(record.role).toBe('agent');
+      expect(taskId.startsWith(String(record.taskId)) || String(record.taskId).startsWith(taskId)).toBe(true);
+    } finally {
+      upstream.stop(true);
+    }
+  }, 180_000);
+
+  // INVARIANT: a prompt past the 128 KiB argv-element limit reaches codex whole,
+  // on stdin, through the REAL supervisor spawn — never as an argv element,
+  // where it dies with E2BIG and crash-loops the task.
+  test('a >200 KiB prompt reaches the agent whole, on stdin', async () => {
+    const prompt = largePrompt('LARGE-PROMPT-TAIL-codex');
+    const taskId = await createTaskWithPipedPrompt(ctx, 'Large prompt', prompt);
+    await ctx.setCodexScenario({ sequence: [
+      codexSuccessScenario({ sessionId: '01a00000-0000-7000-8000-00000000b16a', result: 'Large turn done.', commit: { message: 'large', files: [{ path: 'large.txt', content: 'ok\n' }] } }),
+      codexSuccessScenario({ sessionId: '01a00000-0000-7000-8000-00000000b16a', result: 'Follow-up done.' }),
+    ] });
+
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+    expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
+
+    const [turn] = await turnInvocations();
+    expect(turn, 'the fake codex was never launched for a turn').toBeDefined();
+    expect(turn!.stdin).toContain(prompt);
+    expect(turn!.argv.every(a => Buffer.byteLength(a) < 128 * 1024)).toBe(true);
+    expect(turn!.argv.some(a => a.includes('LARGE-PROMPT-TAIL'))).toBe(false);
+  }, 90_000);
 
   test('a launched turn gets the argv, placeholder key, proxy env and managed config codex expects', async () => {
     const taskId = await createTask(ctx, 'Codex argv contract', 'Do the codex thing');
@@ -125,8 +218,9 @@ describe('codex turns through the fake-binary seam', () => {
     expect(argv).toContain('--dangerously-bypass-approvals-and-sandbox');
     // A task with no model runs Codex's declared default, passed explicitly.
     expect(argv[argv.indexOf('-m') + 1]).toBe(CODEX_LATEST_MODEL);
-    // Prompt is the last positional and carries the task's own prompt.
-    expect(argv[argv.length - 1]).toContain('Do the codex thing');
+    // Fresh exec reads the full prompt from closed stdin.
+    expect(argv).not.toContain('Do the codex thing');
+    expect(turns[0]!.stdin).toContain('Do the codex thing');
 
     // OPENAI_API_KEY holds a MINTED PLACEHOLDER — the real key stays in the
     // daemon — and LAZY_CODEX_API_BASE points at the proxy's OpenAI route.
@@ -159,6 +253,9 @@ describe('codex turns through the fake-binary seam', () => {
     expect(configToml).toContain('env_key = "OPENAI_API_KEY"');
     expect(configToml).toContain('wire_api = "responses"');
     expect(configToml).toContain('[mcp_servers.lazy]');
+    // Codex's plugin-marketplace sync is off: it would git-clone into
+    // ~/.codex/.tmp/plugins, which is inside the task worktree.
+    expect(configToml.slice(configToml.indexOf('[features]'))).toContain('plugins = false');
 
     // Second turn: the thread codex reported is resumed via the nested
     // subcommand — `exec resume <thread-id>` — not started fresh.
@@ -169,11 +266,12 @@ describe('codex turns through the fake-binary seam', () => {
     expect(afterUnblock.length).toBeGreaterThan(turns.length);
     // The unblock turn's WORK invocation — found by its prompt, not by being
     // last: the turn's own wrap-up invocations run after it.
-    const unblocked = afterUnblock.filter(i => String(i.argv[i.argv.length - 1]).includes('Keep going please'));
+    const unblocked = afterUnblock.filter(i => i.stdin?.includes('Keep going please'));
     expect(unblocked.length, 'the unblock turn never launched codex').toBe(1);
     const second = unblocked[0]!.argv;
     expect(second.slice(0, 2)).toEqual(['exec', 'resume']);
     expect(second[2]).toBe('01a00000-0000-7000-8000-00000000t001');
+    expect(second[second.length - 1]).toBe('-');
   }, 180_000);
 
 });

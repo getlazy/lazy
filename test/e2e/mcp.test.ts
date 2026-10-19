@@ -171,6 +171,8 @@ describe('lazy-agent mcp', () => {
     // concurrency cap), and the pre-unification aliases lazy_add_followup /
     // lazy_followups / lazy_followup_promote — raised items are one entity now,
     // and lazy_raise / lazy_raised_items / lazy_raised_promote are the surface.
+    // 52 since lazy_recipe — an agent-facing READ by design: agents load
+    // step-by-step recipes (e.g. task-image) for recurring kinds of work.
     // 51 since lazy_token_stats, lazy_review_comments and lazy_review_status —
     // all agent-facing READS by design (a task agent reads its own token
     // traffic and its own PR/MR; see mcp-token-stats / mcp-forge-read e2e).
@@ -180,7 +182,7 @@ describe('lazy-agent mcp', () => {
     // (public-docs/surface-asymmetries.md §25) — an agent reviewing a large
     // branch a region at a time is what the tool exists for. Only the human
     // OVERLAY (naming, sign-off) is CLI-only, and that is a separate tool.
-    expect(result.tools.length).toBe(51);
+    expect(result.tools.length).toBe(52);
 
     const toolNames = result.tools.map(t => t.name).sort();
     expect(toolNames).not.toContain('lazy_propose');
@@ -218,6 +220,7 @@ describe('lazy-agent mcp', () => {
       'lazy_raise',
       'lazy_raised_item_comment',
       'lazy_raised_items',
+      'lazy_recipe',
       'lazy_regions',
       'lazy_reject',
       'lazy_reopen',
@@ -527,6 +530,20 @@ describe('lazy-agent mcp', () => {
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.count).toBeGreaterThanOrEqual(1);
     expect(parsed.results.length).toBeGreaterThanOrEqual(1);
+  });
+
+  test('lazy_search finds an entity by its id', async () => {
+    const short = await createTask(ctx, 'Id lookup over MCP');
+    const full = await fullTaskId(ctx, short);
+
+    const responses = await runMcpSession(ctx.root, '00000000-0000-0000-0000-000000000001', ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_search', arguments: { query: full.slice(0, 8) } } },
+    ]);
+    const result = responses.find(r => r.id === 2)!.result as { content: Array<{ text: string }> };
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.results[0].matchedId).toBe(true);
+    expect(parsed.results[0].id).toBe(full);
   });
 
   // When an agent (non-empty taskId) calls lazy_create, the new task is created

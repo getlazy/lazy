@@ -551,7 +551,7 @@ describe('CLI command discoverability', () => {
     expect([...s.realFlags.get('stats')!].sort()).toEqual(
       [
         'json', 'limit', 'role', 'since', 'task', 'top', 'tree', 'subtree',
-        'denied', 'errors', 'last', 'model', 'reroutes', 'scan',
+        'denied', 'errors', 'last', 'model', 'recent', 'reroutes', 'scan', 'summary',
       ].sort()
     );
   });

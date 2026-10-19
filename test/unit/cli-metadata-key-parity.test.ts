@@ -155,7 +155,7 @@ describe('the task metadata keys the CLI writes, against the Rails route\'s admi
 
   test('the scan itself is sound — it sees the known writers and keys', () => {
     // An empty or blind scan would make every assertion below vacuous.
-    for (const anchor of [ 'effort', 'effort_explicit', 'redo_of', 'pairing_pid', 'review_mode', 'custom_image' ]) {
+    for (const anchor of [ 'effort', 'effort_explicit', 'pairing_pid', 'review_mode', 'custom_image' ]) {
       expect(scan.keys.has(anchor)).toBe(true);
     }
     expect(scan.scannedHelpers.has('src/daemon/effort.ts')).toBe(true);

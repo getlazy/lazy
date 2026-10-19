@@ -326,6 +326,7 @@ describe('checkHealth authenticates against the remote host', () => {
     expect(checks[1]).toEqual({
       state: 'fail',
       what: 'GitHub authentication',
+      problem: 'GitHub authentication failed',
       reason: 'Run: gh auth login',
     });
   });

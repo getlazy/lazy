@@ -17,7 +17,9 @@ import { loadConfig } from '../../src/config/loader';
 import { MANAGED_CONFIG_ENV, evaluateManagedConfig } from '../../src/config/managed';
 import { validateProjectConfigText, editableConfigKeys } from '../../src/config/project-config';
 import { applyProjectConfig } from '../../src/daemon/project-config';
-import { buildTargetCredentials } from '../../src/proxy/credential-deps';
+import { buildTargetCredentials, resolveMemberCredential } from '../../src/proxy/credential-deps';
+import { bindTurnCredential } from '../../src/daemon/session-credentials';
+import { mintCredentialGrant, lookupCredentialGrant } from '../../src/proxy/credential-broker';
 import { resetRunningProxy } from '../../src/daemon/proxy-fingerprint';
 
 const ENV_KEYS = ['LAZY_MANAGED', 'LAZY_MANAGED_STORAGE_PATH', MANAGED_CONFIG_ENV, 'LAZY_CONFIG', 'LAZY_CREDENTIAL_GW_CLAUDE'];
@@ -69,12 +71,19 @@ describe('agent profiles in the control plane config of a managed project', () =
     expect(editableConfigKeys()).toEqual(expect.arrayContaining(['agents.*.endpoint', 'agents.*.credential']));
   });
 
+  // INVARIANT: a new agent profile's endpoint/credential routes take effect on
+  // the next proxy request, so saving one never asks for a daemon restart
+  // (proxy tunables still do). Routes are read live, so a restart prompt would
+  // be a false instruction.
   test('the Configuration page saves one, and the daemon runs on it', async () => {
     expect(validateProjectConfigText(PROFILES)).toEqual({ ok: true, issues: [] });
-    const applied = await applyProjectConfig(root, PROFILES);
+    const applied = await applyProjectConfig(root, PROFILES, undefined, 'control-plane');
     expect(applied.applied).toBe(true);
-    // A new profile with its own endpoint changes the proxy's routes.
-    expect(applied.restartRequired.length).toBeGreaterThan(0);
+    // A new profile with its own endpoint changes the proxy's routes — live.
+    expect(applied.restartRequired).toEqual([]);
+    // ...while a proxy tunable alongside it still reports a restart.
+    const tuned = await applyProjectConfig(root, `${PROFILES}\n[proxy]\nupstream_timeout = 99\n`, undefined, 'control-plane');
+    expect(tuned.restartRequired).toEqual(['proxy.upstream_timeout']);
     const config = await loadConfig(root);
     expect(config.agents?.['claude-gw']).toMatchObject({ endpoint: 'https://gw.example.com' });
   });
@@ -83,11 +92,17 @@ describe('agent profiles in the control plane config of a managed project', () =
   // host's own credential — not from its store, not from its environment. Only
   // a member's credential connected for the profile pays for it.
   test('a pinned endpoint gets nothing from the host', async () => {
-    await applyProjectConfig(root, PROFILES);
+    await applyProjectConfig(root, PROFILES, undefined, 'control-plane');
     process.env.LAZY_CREDENTIAL_GW_CLAUDE = 'host-secret';
     const { targets } = buildTargetCredentials(root, await loadConfig(root));
     const outcome = await targets.forTarget('https://gw.example.com');
-    expect(outcome.kind).toBe('missing');
+    // Approved endpoint design: global routing never supplies member secrets.
+    expect(outcome.kind).toBe('none');
     expect(JSON.stringify(outcome)).not.toContain('host-secret');
+    await bindTurnCredential(root, { taskId: 'managed-profile', sessionId: 'managed-profile', ownerUserId: 'member@example.com', kind: 'api-key' });
+    const token = await mintCredentialGrant(root, { role: 'agent', taskId: 'managed-profile', label: 'managed-profile', envKey: 'ANTHROPIC_API_KEY', profile: 'claude-gw' });
+    const member = await resolveMemberCredential(root, (await lookupCredentialGrant(root, token))!);
+    expect(member?.outcome.kind).toBe('missing');
+    expect(JSON.stringify(member)).not.toContain('host-secret');
   });
 });

@@ -24,8 +24,8 @@
  * exactly one developer's laptop.
  */
 
-import { mkdir, readFile, writeFile, chmod } from 'fs/promises';
-import { dirname } from 'path';
+import { readFile } from 'fs/promises';
+import { replaceCredentialFile, withCredentialFileLock } from './file-updates';
 import { getCredentialsPath, projectSlug } from '../daemon/paths';
 import { spawn } from '../utils/spawn';
 import type { CredentialName } from './providers';
@@ -480,17 +480,21 @@ export class FileBackend implements CredentialBackend {
   }
 
   async set(projectRoot: string, provider: CredentialName, secret: string): Promise<void> {
-    const file = await this.read(projectRoot);
-    file[provider] = secret;
-    await this.write(projectRoot, file);
+    await withCredentialFileLock(getCredentialsPath(projectRoot), async () => {
+      const file = await this.read(projectRoot);
+      file[provider] = secret;
+      await this.write(projectRoot, file);
+    });
   }
 
   async remove(projectRoot: string, provider: CredentialName): Promise<boolean> {
-    const file = await this.read(projectRoot);
-    if (!(provider in file)) return false;
-    delete file[provider];
-    await this.write(projectRoot, file);
-    return true;
+    return withCredentialFileLock(getCredentialsPath(projectRoot), async () => {
+      const file = await this.read(projectRoot);
+      if (!(provider in file)) return false;
+      delete file[provider];
+      await this.write(projectRoot, file);
+      return true;
+    });
   }
 
   private async read(projectRoot: string): Promise<Record<string, string>> {
@@ -524,10 +528,7 @@ export class FileBackend implements CredentialBackend {
 
   private async write(projectRoot: string, file: Record<string, string>): Promise<void> {
     const path = getCredentialsPath(projectRoot);
-    await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, JSON.stringify(file, null, 2) + '\n', { mode: 0o600 });
-    // writeFile's mode applies on CREATION only — tighten an existing file too.
-    await chmod(path, 0o600);
+    await replaceCredentialFile(path, JSON.stringify(file, null, 2) + '\n');
   }
 }
 

@@ -11,14 +11,20 @@
  * has always enumerated `.lazy/logs/` in the project .gitignore — ignored in
  * every project that has ever run init, old and new, with nothing to migrate.
  *
- * BOUNDED BY CONSTRUCTION: the live segment rotates at
- * AUDIT_SEGMENT_MAX_BYTES and exactly AUDIT_RETAINED_SEGMENTS older segments
- * are kept, so the whole log can never exceed
- * (AUDIT_RETAINED_SEGMENTS + 1) * AUDIT_SEGMENT_MAX_BYTES. Retention is
- * deliberately small: the readers are the recent-history auth verdict
- * (`lazy doctor`) and the one-time seed of the latest usage-limit reading
- * per credential (src/proxy/usage-limits.ts). This stream is not an analytics archive — anything that
- * wants statistics should tap the stream as it flows, not re-read the file.
+ * BOUNDED BY CONSTRUCTION, BY SIZE AND BY AGE: the live segment rotates at
+ * AUDIT_SEGMENT_MAX_BYTES, the number of rotated segments kept follows from the
+ * size budget (`[proxy] audit_retention_mib`, default 128 MiB), and a rotated
+ * segment whose NEWEST entry is older than `[proxy] audit_retention_days`
+ * (default 7) is deleted — whichever limit is reached first. Age is pruned per
+ * segment, so an entry can outlive the window by at most one segment's span.
+ *
+ * Why this deep (engineer's decision, 2026-10-06): the log is the only record
+ * of WHICH upstream answered a request with what status, and a failure is
+ * usually investigated the next morning. The old bound — one 4 MiB rotated
+ * segment, ~8 MiB in all — covered a few hours on a busy day, so a 01:07 tier
+ * switch 401 was already gone when it was looked for. It is still disposable
+ * telemetry, never storage state; every reader is limited and reads
+ * newest-first, so the deeper history costs nothing until someone asks.
  *
  * The writer is daemon-side only (`createProxyServer` is constructed solely by
  * the daemon), so a direct file writer is correct and the audit hot path makes
@@ -26,10 +32,12 @@
  * daemon's event loop.
  */
 
-import { appendFile, mkdir, readFile, rename, rm, stat } from 'fs/promises';
+import { scrubLazyPlaceholders } from './credential-broker';
+import { appendFile, mkdir, open, readFile, rename, rm, stat } from 'fs/promises';
 import { join } from 'path';
 import { hasScrubbableCredentials, redactSecretValues } from '../utils/redact';
 import type { ListAuditRecordsOptions, ProxyAuditRecord } from '../storage/types';
+import { DEFAULT_AUDIT_RETENTION_DAYS, DEFAULT_AUDIT_RETENTION_MIB } from './upstream-defaults';
 
 /** File name of the live audit segment. */
 export const AUDIT_LOG_FILENAME = 'proxy-audit.jsonl';
@@ -48,12 +56,29 @@ export const AUDIT_LOG_SUBDIR = 'logs';
 /** Rotate the live segment once it reaches this size. */
 export const AUDIT_SEGMENT_MAX_BYTES = 4 * 1024 * 1024;
 
+export { DEFAULT_AUDIT_RETENTION_DAYS, DEFAULT_AUDIT_RETENTION_MIB };
+
 /**
- * Rotated segments retained alongside the live one (`proxy-audit.jsonl.1`, …).
- * One is enough: rotation must not drop the recent window a doctor run needs,
- * and nothing reads deeper than that.
+ * Rotated segments a size budget allows next to the live one. At least one, so
+ * rotation never drops the recent window a doctor run needs.
  */
-export const AUDIT_RETAINED_SEGMENTS = 1;
+export function retainedSegmentsFor(retentionMib: number, segmentBytes = AUDIT_SEGMENT_MAX_BYTES): number {
+  return Math.max(1, Math.floor((retentionMib * 1024 * 1024) / segmentBytes) - 1);
+}
+
+/**
+ * Rotated segments retained by default (`proxy-audit.jsonl.1` … `.31`): the
+ * 128 MiB budget in 4 MiB segments. The engineer's decision, 2026-10-06 — "keep
+ * 7 days or 128 MiB, whichever comes first" — replacing a single segment that
+ * held only a few hours of a busy day.
+ */
+export const AUDIT_RETAINED_SEGMENTS = retainedSegmentsFor(DEFAULT_AUDIT_RETENTION_MIB);
+
+/** How often the append path checks rotated segments for age. */
+const AGE_PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+
+/** Hard ceiling on segments a reader will look for, whatever is on disk. */
+const MAX_SEGMENTS_READ = 4096;
 
 /** Directory the audit segments live in, for a project data dir. */
 export function auditLogDir(dataDir: string): string {
@@ -79,6 +104,42 @@ function parseRecords(raw: string): ProxyAuditRecord[] {
     }
   }
   return records;
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw new Error(`Failed to stat proxy audit segment at ${path}: ${(err as Error).message}`);
+  }
+}
+
+/** Timestamp of the first parseable entry of a segment, reading at most 64 KiB. */
+async function firstEntryTs(path: string): Promise<number | null> {
+  let handle;
+  try {
+    handle = await open(path, 'r');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw new Error(`Failed to open proxy audit segment at ${path}: ${(err as Error).message}`);
+  }
+  try {
+    const buf = Buffer.alloc(64 * 1024);
+    const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
+    for (const line of buf.subarray(0, bytesRead).toString('utf-8').split('\n')) {
+      try {
+        const ts = (JSON.parse(line) as ProxyAuditRecord).ts;
+        if (typeof ts === 'number') return ts;
+      } catch {
+        // A partial or corrupt line (the 64 KiB cut, or a crash mid-write): try the next.
+      }
+    }
+    return null;
+  } finally {
+    await handle.close();
+  }
 }
 
 async function readSegment(path: string): Promise<ProxyAuditRecord[]> {
@@ -126,14 +187,17 @@ async function readSegment(path: string): Promise<ProxyAuditRecord[]> {
  * scrubbed, which is every request on a setup with no long credential in env.
  */
 export function redactAuditRecordContent(record: ProxyAuditRecord): ProxyAuditRecord {
-  // Building the scrubbed copy walks every tool_use and tool_result. Skip that
-  // walk entirely when the environment holds nothing that could be replaced.
-  if (!hasScrubbableCredentials()) return record;
+  // Lazy's own PLACEHOLDERS are scrubbed always, not only when the environment
+  // holds a real credential: this log sits in the project, which every task
+  // container mounts, and a placeholder echoed into one task's tool output
+  // could otherwise be read and spent from a sibling container while its
+  // owner's turn is live.
+  const realSecrets = hasScrubbableCredentials();
 
   let changed = false;
   const scrub = <T extends string | null>(value: T): T => {
     if (value === null || value === '') return value;
-    const out = redactSecretValues(value) as T;
+    const out = scrubLazyPlaceholders(realSecrets ? redactSecretValues(value) : value) as T;
     if (out !== value) changed = true;
     return out;
   };
@@ -165,16 +229,36 @@ export class ProxyAuditLog {
   private readonly dataDir: string;
   private readonly maxBytes: number;
   private readonly retained: number;
+  /** Rotated segments whose newest entry is older than this (ms) are deleted; null = no age limit. */
+  private readonly retentionMs: number | null;
+  private readonly now: () => number;
   /** Size of the live segment; null until read back from disk on first append. */
   private liveBytes: number | null = null;
+  private lastAgePrune = 0;
 
+  /**
+   * `retentionMib` / `retentionDays` are the `[proxy]` keys; `retainedSegments`
+   * overrides the count derived from the size budget (tests). A WRITER should
+   * pass the configured values; a reader needs none — `list` reads whatever
+   * segments exist.
+   */
   constructor(
     dataDir: string,
-    options?: { maxBytes?: number; retainedSegments?: number },
+    options?: {
+      maxBytes?: number;
+      retainedSegments?: number;
+      retentionMib?: number;
+      retentionDays?: number;
+      now?: () => number;
+    },
   ) {
     this.dataDir = dataDir;
     this.maxBytes = options?.maxBytes ?? AUDIT_SEGMENT_MAX_BYTES;
-    this.retained = options?.retainedSegments ?? AUDIT_RETAINED_SEGMENTS;
+    this.retained = options?.retainedSegments
+      ?? retainedSegmentsFor(options?.retentionMib ?? DEFAULT_AUDIT_RETENTION_MIB, this.maxBytes);
+    const days = options?.retentionDays ?? DEFAULT_AUDIT_RETENTION_DAYS;
+    this.retentionMs = days > 0 ? days * 24 * 60 * 60 * 1000 : null;
+    this.now = options?.now ?? Date.now;
   }
 
   /** Path of the live segment. */
@@ -202,6 +286,10 @@ export class ProxyAuditLog {
     // whose data dir (or logs dir) does not exist yet.
     await mkdir(auditLogDir(this.dataDir), { recursive: true });
     if (this.liveBytes === null) this.liveBytes = await this.liveSize();
+    // A quiet log rotates rarely, so age is also checked on a clock — BEFORE
+    // this append, so a stale live segment is rotated out without the new
+    // entry riding along with it.
+    if (this.now() - this.lastAgePrune >= AGE_PRUNE_INTERVAL_MS) await this.pruneByAge();
 
     // Scrub on the way in, so no reader of this file — `lazy audit`, a doctor
     // run, or a human with `cat` — can surface a credential the agent echoed.
@@ -209,7 +297,55 @@ export class ProxyAuditLog {
     await appendFile(this.path, line, 'utf-8');
     this.liveBytes += Buffer.byteLength(line, 'utf-8');
 
-    if (this.liveBytes >= this.maxBytes) await this.rotate();
+    if (this.liveBytes >= this.maxBytes) {
+      await this.rotate();
+      await this.pruneByAge();
+    }
+  }
+
+  /**
+   * Delete rotated segments whose newest entry (the file's last write) is older
+   * than the retention window, walking the numbered segments up to the first
+   * gap. Deleting an old high-numbered segment leaves no gap below it, because
+   * a higher number is always older.
+   */
+  async pruneByAge(): Promise<void> {
+    this.lastAgePrune = this.now();
+    if (this.retentionMs === null) return;
+    const cutoff = this.now() - this.retentionMs;
+    // A quiet log's LIVE segment may never reach the size cap, so it would hold
+    // entries indefinitely: once its first entry is past the window, rotate it,
+    // and it ages out below like any other segment.
+    const liveFirst = await firstEntryTs(this.path);
+    if (liveFirst !== null && liveFirst < cutoff) {
+      if (this.liveBytes === null) this.liveBytes = await this.liveSize();
+      await this.rotate();
+    }
+    for (let n = 1; n <= MAX_SEGMENTS_READ; n++) {
+      const path = this.segmentPath(n);
+      let mtimeMs: number;
+      try {
+        mtimeMs = (await stat(path)).mtimeMs;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') break;
+        throw new Error(`Failed to stat proxy audit segment at ${path}: ${(err as Error).message}`);
+      }
+      if (mtimeMs < cutoff) await rm(path, { force: true });
+    }
+  }
+
+  /**
+   * The oldest entry the log still reaches back to (its timestamp, ms), or
+   * null for an empty log. Reads only the first line of the oldest segment.
+   */
+  async oldestEntryTs(): Promise<number | null> {
+    let highest = 0;
+    while (highest < MAX_SEGMENTS_READ && (await exists(this.segmentPath(highest + 1)))) highest++;
+    for (let n = highest; n >= 0; n--) {
+      const ts = await firstEntryTs(n === 0 ? this.path : this.segmentPath(n));
+      if (ts !== null) return ts;
+    }
+    return null;
   }
 
   /**
@@ -223,8 +359,13 @@ export class ProxyAuditLog {
       this.liveBytes = 0;
       return;
     }
-    // Drop what would fall off the end, then shift the rest down: .n -> .n+1.
-    await rm(this.segmentPath(this.retained), { force: true });
+    // Drop what would fall off the end — every segment numbered `retained` or
+    // higher, so a LOWERED size budget takes effect at the next rotation rather
+    // than when the extra segments age out — then shift the rest down.
+    for (let n = this.retained; n <= MAX_SEGMENTS_READ; n++) {
+      if (!(await exists(this.segmentPath(n)))) break;
+      await rm(this.segmentPath(n), { force: true });
+    }
     for (let n = this.retained - 1; n >= 1; n--) {
       try {
         await rename(this.segmentPath(n), this.segmentPath(n + 1));
@@ -251,8 +392,12 @@ export class ProxyAuditLog {
 
     const collected: ProxyAuditRecord[][] = [];
     let count = 0;
-    for (let n = 0; n <= this.retained; n++) {
-      const records = await readSegment(n === 0 ? this.path : this.segmentPath(n));
+    // Walk whatever segments exist (a reader need not know the configured
+    // retention), stopping at the first gap; MAX_SEGMENTS_READ is the backstop.
+    for (let n = 0; n <= MAX_SEGMENTS_READ; n++) {
+      const path = n === 0 ? this.path : this.segmentPath(n);
+      if (n > 0 && !(await exists(path))) break;
+      const records = await readSegment(path);
       if (records.length) {
         collected.unshift(records);
         count += records.length;

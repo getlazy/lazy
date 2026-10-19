@@ -31,6 +31,7 @@ import type { RepositoryDriver } from './driver';
 import { runGit, type GitResult } from '../utils/git';
 import { logger } from '../utils/logger';
 import { looksLikeTaskBranch } from '../git/branch-prefix';
+import { RemoteBranchMissingError } from './branch-missing';
 
 type GitFn = (args: string[], cwd?: string) => Promise<GitResult>;
 
@@ -101,7 +102,7 @@ function pushabilityNote(parentBranch: string, remoteName: string): string {
  * Resolve the ref a caller should merge from / branch off for `parentBranch`.
  *
  * Fetches through the driver exactly as before (so a fetch failure still fails
- * hard — CLAUDE.md "no silent fallbacks"), then reconciles local against remote:
+ * hard — AGENTS.md "no silent fallbacks"), then reconciles local against remote:
  *
  * - No remote (LocalDriver / offline): the local branch, as always.
  * - Remote contains local (local behind or equal): `origin/<branch>` — the
@@ -126,10 +127,30 @@ export async function resolveUpstreamMergeRef(
   const git = opts.git ?? defaultGit;
   const remoteName = opts.remoteName ?? 'origin';
 
-  const resolved = opts.refreshRemote === false
-    ? (driver.upstreamRefName?.(parentBranch)
-      ?? (driver.needsSync ? `${remoteName}/${parentBranch}` : parentBranch))
-    : await driver.resolveUpstreamRef(parentBranch, cwd);
+  let resolved: string;
+  if (opts.refreshRemote === false) {
+    resolved = driver.upstreamRefName?.(parentBranch)
+      ?? (driver.needsSync ? `${remoteName}/${parentBranch}` : parentBranch);
+  } else {
+    try {
+      resolved = await driver.resolveUpstreamRef(parentBranch, cwd);
+    } catch (err) {
+      // A lazy task branch not on origin yet is ordinary — accept merges into
+      // it LOCALLY anyway — so the local branch is the ref, if there is one.
+      // Anything else (a named branch missing, or no local copy) propagates,
+      // still saying "does not exist", never "check your network".
+      if (!(err instanceof RemoteBranchMissingError) || !isIntermediateBranch(parentBranch)) throw err;
+      const local = await git(['rev-parse', '--verify', '--quiet', `refs/heads/${parentBranch}`], cwd);
+      if (local.exitCode !== 0) throw err;
+      return {
+        ref: parentBranch,
+        remoteRef: null,
+        localOnly: 0,
+        remoteOnly: 0,
+        warnings: [`\`${parentBranch}\` does not exist on ${err.remote} yet; used the local branch.`],
+      };
+    }
+  }
   const base: UpstreamRefResolution = {
     ref: resolved,
     remoteRef: resolved === parentBranch ? null : resolved,

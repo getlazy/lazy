@@ -33,8 +33,9 @@
  */
 
 import { readFileSync } from 'fs';
-import { readFile, readdir, readlink } from 'fs/promises';
+import { readFile, readdir, readlink, stat } from 'fs/promises';
 import { spawn, spawnSyncUnsupervised } from './spawn';
+import { isManagedMode, MANAGED_BACKEND_ENV } from '../config/managed-mode';
 
 /**
  * Where a start time came from. The two sources use different units (procfs
@@ -516,4 +517,208 @@ export function processGroupIdSync(pid: number): number | null {
   const out = spawnSyncUnsupervised(['ps', '-o', 'pgid=', '-p', String(pid)], { timeout: PS_TIMEOUT_MS });
   if (out.exitCode !== 0) return null;
   return toPid(out.stdout.toString().trim());
+}
+
+// ---------------------------------------------------------------------------
+// Pid NAMESPACE identity
+//
+// A pid means something only inside the pid namespace (and kernel) that issued
+// it. The store is shared across that boundary on Lazy Teams: the host and a
+// project's microVM guest both reach it, and a container sees its own pids. A
+// lock or marker written on the other side names a pid this side cannot judge
+// at all — "no such process here" says nothing about whether it is running
+// there. Recording WHERE a pid lives is what lets a reader tell "dead" apart
+// from "not mine to judge".
+// ---------------------------------------------------------------------------
+
+let namespaceIdPromise: Promise<string | null> | null = null;
+
+/**
+ * This process's pid namespace, as a string that differs between any two
+ * places whose pids are not comparable: a different kernel boot (a VM guest
+ * vs its host, a reboot) or a different pid namespace on one kernel (a
+ * container). Null where it cannot be determined — callers treat null as
+ * "unknown", never as a match.
+ *
+ * Linux: the kernel's boot id plus the pid-namespace link (the initial
+ * namespace's inode is the same constant on every kernel, hence the boot id).
+ * macOS: the boot session UUID (no pid namespaces there).
+ */
+export function processNamespaceId(): Promise<string | null> {
+  if (!namespaceIdPromise) namespaceIdPromise = readNamespaceId();
+  return namespaceIdPromise;
+}
+
+async function readNamespaceId(): Promise<string | null> {
+  if (process.platform === 'linux') {
+    try {
+      const boot = (await readFile('/proc/sys/kernel/random/boot_id', 'utf-8')).trim();
+      const ns = await readlink('/proc/self/ns/pid');
+      return boot && ns ? `linux:${boot}:${ns}` : null;
+    } catch {
+      // No procfs answer (an unusual mount, a restricted sandbox): unknown.
+      // Callers treat null as "cannot compare", which is the safe reading.
+      return null;
+    }
+  }
+  if (process.platform === 'darwin') {
+    try {
+      const proc = spawn(['sysctl', '-n', 'kern.bootsessionuuid'], { stdout: 'pipe', stderr: 'ignore', timeout: 5000 });
+      const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+      const uuid = out.trim();
+      return code === 0 && uuid ? `darwin:${uuid}` : null;
+    } catch {
+      // sysctl unavailable: unknown, as above.
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Is THIS process a Lazy Teams project's machine (a microVM guest)? Its store
+ * is mounted from a host that also reaches it — the one place lazy has a
+ * holder in another kernel that may be alive. Recorded on locks and markers
+ * (`holder_guest`) so the host can tell a live guest from a dead past boot.
+ */
+export function isVmGuest(env: NodeJS.ProcessEnv = process.env): boolean {
+  return isManagedMode(env) && env[MANAGED_BACKEND_ENV] === 'microvm';
+}
+
+/**
+ * What a recorded holder's namespace says about judging its pid from here:
+ *
+ * - `judgeable`: the same namespace, or one side unknown (older lazy, no
+ *   answer) — judge the pid as always.
+ * - `dead`: another boot of a kernel that is not a guest's (this machine
+ *   before a crash or reboot, or a container from then), or — judged from the
+ *   kernel's INITIAL pid namespace only, the one that can see its siblings — a
+ *   pid namespace on THIS kernel in which the holder's pid is gone (a
+ *   recreated container, or a dead holder in a container still running) or
+ *   now belongs to a process with a different start identity (a recycled
+ *   pid). A recycled pid must never make a holder look alive (the pid-reuse
+ *   wedge).
+ * - `foreign`: a holder that may genuinely be running where this side cannot
+ *   see it — a holder on another OS kernel (a macOS host daemon seen from a
+ *   Linux container, or the reverse: only an earlier boot of the SAME kind of
+ *   kernel is dead); a guest (`holder_guest`) in another kernel; any sibling pid
+ *   namespace judged from inside a NESTED one (a neighbour container's live
+ *   namespace looks empty from here, so empty proves nothing); or, from the
+ *   initial namespace, a holder whose pid is still there with the recorded
+ *   identity, or whose namespace could not be fully inspected.
+ */
+export type HolderNamespaceVerdict = 'judgeable' | 'dead' | 'foreign';
+
+export async function judgeHolderNamespace(
+  recorded: {
+    namespace?: string | null;
+    guest?: boolean | null;
+    /** The holder's pid and start identity in ITS namespace: tells a live holder from a dead one in a still-populated namespace. */
+    holder?: RecordedHolder | null;
+  },
+  /** Test seam: where /proc is, this side's namespace, and how a process identity is read. */
+  seam: { procRoot?: string; ownNamespace?: string | null; readIdentity?: (pid: number) => Promise<ProcessIdentity | null> } = {},
+): Promise<HolderNamespaceVerdict> {
+  const theirs = recorded.namespace ?? null;
+  if (!theirs) return 'judgeable';
+  const own = seam.ownNamespace !== undefined ? seam.ownNamespace : await processNamespaceId();
+  if (own === null || own === theirs) return 'judgeable';
+  // A guest in another kernel is alive or not by a fact this side cannot read —
+  // unless this side IS that project's guest, on a later boot of its own.
+  if (recorded.guest && !isVmGuest()) return 'foreign';
+  const mine = parseNamespace(own);
+  const other = parseNamespace(theirs);
+  // Another OS kernel altogether — a macOS host daemon seen from a Linux
+  // container sharing its store, or the reverse — runs BESIDE this one, not
+  // before it: no boot comparison can prove it gone, so it is never reclaimed.
+  // An id that does not parse is treated the same way: nothing says it is our past.
+  if (!mine || !other || mine.kind !== other.kind) return 'foreign';
+  if (mine.kind === 'linux' && mine.boot === other.boot) {
+    // Same kernel, another pid namespace. Only the initial namespace can see
+    // into its siblings: from inside a container a neighbour's live namespace
+    // shows no processes at all, so "empty" would be a guess, not a fact.
+    if (mine.ns !== INITIAL_PID_NAMESPACE) return 'foreign';
+    const holder = recorded.holder ?? null;
+    const found = await findPidInNamespace(other.ns, holder ? holder.pid : null, seam.procRoot ?? '/proc');
+    // A process whose namespace could not be read may be the real holder (inner
+    // pids like 1 collide across containers), so no identity mismatch elsewhere
+    // can prove it gone.
+    if (found.uncertain) return 'foreign';
+    if (found.pid === null) return 'dead';
+    // Without the holder's identity, a populated namespace may hold it.
+    if (!holder) return 'foreign';
+    // That pid number exists in its namespace: it is the holder only when its
+    // start identity says so (a recycled pid must not read as alive).
+    return judgeHolder(holder, await (seam.readIdentity ?? readProcessIdentity)(found.pid)).alive ? 'foreign' : 'dead';
+  }
+  // Seen FROM a guest, another kernel's unflagged holder is the host (a
+  // restore or backup running there) — out of sight, possibly alive.
+  if (isVmGuest() && !recorded.guest) return 'foreign';
+  // Another boot, not a guest's: this machine (or a container on it) before a
+  // restart. Nothing from it is running.
+  return 'dead';
+}
+
+function parseNamespace(id: string): { kind: string; boot: string; ns: string } | null {
+  const m = /^(linux):([^:]+):(.+)$/.exec(id) ?? /^(darwin):(.+)()$/.exec(id);
+  return m ? { kind: m[1], boot: m[2], ns: m[3] } : null;
+}
+
+/** The kernel's initial pid namespace link; every other namespace is nested and cannot see its siblings. */
+const INITIAL_PID_NAMESPACE = 'pid:[4026531836]';
+
+/**
+ * The pid, as THIS side numbers it, of a process living in pid namespace `ns`.
+ * With `nspid` given, the process must carry that pid inside `ns` (the last
+ * `NSpid:` entry); without it any process in `ns` matches.
+ *
+ * A namespace link only a privileged reader may follow (a root-owned
+ * container's, seen by a non-root host user) cannot be matched by namespace, so
+ * such a process can never be returned as the holder (inner pids collide
+ * across containers); a nested one (two or more `NSpid` entries) that ends in
+ * the holder's pid, or any nested one when no holder pid is known, makes the
+ * answer `uncertain`. Null pid with `uncertain: false` means the namespace was
+ * fully looked at and the holder is not in it (or there is no procfs).
+ */
+async function findPidInNamespace(
+  ns: string,
+  nspid: number | null,
+  procRoot: string,
+): Promise<{ pid: number | null; uncertain: boolean }> {
+  let entries: string[];
+  try {
+    entries = await readdir(procRoot);
+  } catch {
+    // No procfs: nothing to look at, so nothing found.
+    return { pid: null, uncertain: false };
+  }
+  // A procfs mounted `hidepid=2` lists only this user's processes, and pid 1 is
+  // always there otherwise: without it, what is missing proves nothing.
+  let uncertain = !entries.includes('1');
+  let found: number | null = null;
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    const link = await readlink(`${procRoot}/${entry}/ns/pid`).catch(() => null);
+    if (link !== null && link !== ns) continue;
+    if (link === ns && nspid === null) return { pid: Number(entry), uncertain: false };
+    const status = await readFile(`${procRoot}/${entry}/status`, 'utf-8').catch(() => null);
+    if (link === null && status === null) {
+      // Neither file readable (`hidepid=1`, another user's process): it may be
+      // anywhere, the holder included — unless it simply exited meanwhile.
+      if (await stat(`${procRoot}/${entry}`).then(() => true, () => false)) uncertain = true;
+      continue;
+    }
+    const m = status ? /^NSpid:\s+(.*)$/m.exec(status) : null;
+    const levels = m ? m[1].trim().split(/\s+/) : [];
+    if (link === null) {
+      // Unreadable link: only a nested process can be in a sibling namespace.
+      if (levels.length < 2) continue;
+      // Never "the" holder: it may be in any container's namespace.
+      if (nspid === null || levels[levels.length - 1] === String(nspid)) uncertain = true;
+      continue;
+    }
+    // Scan on: a later unreadable process still makes the answer uncertain.
+    if (found === null && levels[levels.length - 1] === String(nspid)) found = Number(entry);
+  }
+  return { pid: found, uncertain };
 }

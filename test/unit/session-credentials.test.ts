@@ -27,7 +27,6 @@ import {
 } from '../../src/daemon/session-credentials';
 import {
   putUserCredential,
-  revokeUserCredential,
   clearUserCredentialCache,
   SERVICE_CREDENTIAL_USER_ID,
 } from '../../src/daemon/user-credentials';
@@ -235,20 +234,20 @@ describe('turn credential planning', () => {
   // when there is none the automation is disabled with a stated reason rather
   // than billed to an arbitrary member.
   test('system turns need a service credential and say so when there is none', async () => {
-    await putUserCredential(root, { userId: 'alice', kind: 'oauth', token: 'oat-alice' });
+    await putUserCredential(root, { userId: 'alice@example.com', kind: 'oauth', token: 'oat-alice' });
 
     const blocked = await systemTurnBlock(root);
-    expect(blocked).toContain(SERVICE_CREDENTIAL_USER_ID);
+    expect(blocked).toContain('No service credential for automated turns');
     await expect(
       planTurnCredential(root, { taskId: TASK, sessionId: SESSION }),
     ).rejects.toThrow(TurnCredentialUnavailableError);
 
     await putUserCredential(root, {
-      userId: SERVICE_CREDENTIAL_USER_ID, kind: 'api-key', token: 'svc-secret',
+      userId: SERVICE_CREDENTIAL_USER_ID, ownerEmail: 'alice@example.com', kind: 'api-key', token: 'svc-secret',
     });
     expect(await systemTurnBlock(root)).toBeNull();
     const plan = await planTurnCredential(root, { taskId: TASK, sessionId: SESSION });
-    expect(plan.mode === 'session' && plan.ownerUserId).toBe(SERVICE_CREDENTIAL_USER_ID);
+    expect(plan.mode === 'session' && plan.ownerUserId).toBe('alice@example.com');
   });
 
   // A container launched outside any turn must not be handed the daemon's real
@@ -263,25 +262,16 @@ describe('turn credential planning', () => {
     expect((await resolver(env![0].value)).ok).toBe(false);
   });
 
-  // REGRESSION (fix-resume-auth-after-restart): a task that ran under per-user
-  // credentials keeps its binding on disk, and its container keeps the
-  // placeholder in its env. If the project stops being a team-mode project —
-  // credentials revoked, or a restarted daemon that has not been re-provisioned
-  // yet — the next turn plans the daemon env. Reusing that container then runs
+  // REGRESSION (fix-resume-auth-after-restart): a solo install can retain a
+  // binding on disk from before durable member mode existed, while its
+  // container keeps the placeholder in its env. Reusing that container runs
   // the whole turn on a placeholder no live binding backs: 401 on the agent's
   // first request, `fatal_auth`, dead on attempt one. Two halves, both needed:
   // the env must go back to the daemon's own credential, and the container
   // holding the stale placeholder must be recreated to receive it.
   test('a leftover placeholder does not survive into a daemon-env turn', async () => {
-    await putUserCredential(root, { userId: 'alice', kind: 'oauth', token: 'oat-alice' });
-    const teamPlan = await planAs('alice', root, { taskId: TASK, sessionId: SESSION });
-    expect(teamPlan.mode).toBe('session');
-    expect(await mustRecreateForCredentialPlan(root, TASK, teamPlan)).toBe(true); // first bind
-
-    // The project stops running per-user credentials. The binding stays on disk
-    // (it is the record of what is in that container's environment).
-    await revokeUserCredential(root, 'alice');
-    clearUserCredentialCache();
+    await bindTurnCredential(root, { taskId: TASK, sessionId: SESSION, ownerUserId: 'alice', kind: 'oauth' });
+    // A stale binding cannot make a genuine solo install spend through it.
     expect(await getTaskSessionBinding(root, TASK)).not.toBeNull();
 
     const plan = await planTurnCredential(root, { taskId: TASK, sessionId: SESSION });
@@ -316,13 +306,13 @@ describe('turn credential planning', () => {
 
     const resolver = createSessionCredentialResolver(root);
     const resolved = await resolver(token);
-    expect(resolved).toEqual({ ok: true, userId: 'alice', kind: 'oauth', secret: 'oat-alice' });
+    expect(resolved).toEqual({ ok: true, userId: 'alice', endpoint: 'builtin:anthropic', kind: 'oauth', secret: 'oat-alice' });
 
     // The STORED kind wins over the bind-time kind: a user who rotated to an
     // API key must produce a loud mismatch at the proxy, not a silent swap.
     await putUserCredential(root, { userId: 'alice', kind: 'api-key', token: 'key-alice' });
     const afterRotation = await resolver(token);
-    expect(afterRotation).toEqual({ ok: true, userId: 'alice', kind: 'api-key', secret: 'key-alice' });
+    expect(afterRotation).toEqual({ ok: true, userId: 'alice', endpoint: 'builtin:anthropic', kind: 'api-key', secret: 'key-alice' });
 
     // Turn over: the placeholder stops resolving even though the container
     // still holds it.

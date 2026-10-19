@@ -180,6 +180,14 @@ export const ACTIVE_HARNESS_PHASES: ReadonlySet<string> = new Set([
   // interruption costs the most: the turn is finalized with the very work it
   // was in the middle of saving still uncommitted.
   'commit_leftovers',
+  // The once-per-turn "have you committed all your work?" nudge — the same
+  // kind of agent invocation, ahead of the wrap-up chain.
+  'commit_nudge',
+  // Its sibling: "your background work was stopped — did you need it?"
+  'background_nudge',
+  // Comments that arrived during the turn, handed to the agent before it ends
+  // — real work, often minutes long.
+  'pending_notes',
   'post_turn_check',
   'post_turn_sync',
   'writing_response',

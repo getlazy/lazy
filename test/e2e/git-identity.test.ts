@@ -6,7 +6,7 @@
  * are. Three claims, each with a failure mode worth a test of its own:
  *
  *   - a store write is REFUSED, in git's own words, and a READ is not
- *   - the refusal reaches the human BEFORE `$EDITOR` opens (CLAUDE.md's first
+ *   - the refusal reaches the human BEFORE `$EDITOR` opens (AGENTS.md's first
  *     invariant: feedback a human typed is never discarded)
  *   - identity arrives ONE way — from the daemon's git config, never on a
  *     request and never on a per-user token, neither of which exists here
@@ -89,7 +89,7 @@ describe('git identity (single-person install)', () => {
 
   // --- The refusal, and what it does not touch ---
 
-  // INVARIANT (CLAUDE.md's first): the human must never type feedback into
+  // INVARIANT (AGENTS.md's first): the human must never type feedback into
   // $EDITOR only to have a pre-flight failure discard it. The identity check is
   // therefore a PREFLIGHT — it asks the daemon before the editor opens — and
   // this test proves the editor never ran at all, not merely that the words

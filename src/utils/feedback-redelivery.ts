@@ -1,7 +1,7 @@
 /**
  * Crash-safe redelivery of unconsumed human feedback.
  *
- * INVARIANT (CLAUDE.md — never lose human feedback): when a work phase crashes
+ * INVARIANT (AGENTS.md — never lose human feedback): when a work phase crashes
  * AFTER feedback was persisted but BEFORE the agent consumed it, resuming with
  * a generic "you were interrupted, carry on" prompt effectively throws the
  * feedback away — it survives only implicitly via turn-history injection, and
@@ -14,10 +14,11 @@
  * the proxy would mask exactly the case this exists for.
  */
 
-import type { Turn } from '../types';
+import type { FeedbackItem, Turn } from '../types';
 
 import feedbackRedeliveryText from '../prompts/feedback-redelivery.md' with { type: 'text' };
 import { turnText } from './turn-content';
+import { lazyFold } from '../task/wrapper-fold';
 
 export interface PendingFeedback {
   /** The newest feedback turn the agent has not consumed. */
@@ -32,6 +33,20 @@ export interface PendingFeedback {
 }
 
 /**
+ * The person's own words a feedback turn carries, oldest first. A turn
+ * recorded before `feedback_items` existed (and a withheld turn, whose content
+ * IS the words) carries its content as the single item.
+ */
+export function feedbackItemsOf(turn: Turn): FeedbackItem[] {
+  if (turn.feedback_items && turn.feedback_items.length > 0) return turn.feedback_items;
+  return [{
+    text: turnText(turn),
+    ...(turn.actor_email ? { actor_email: turn.actor_email } : {}),
+    ...(turn.actor_name ? { actor_name: turn.actor_name } : {}),
+  }];
+}
+
+/**
  * Find the newest feedback turn in a session that no agent response has
  * consumed. Returns null when there is nothing to re-deliver.
  *
@@ -40,7 +55,10 @@ export interface PendingFeedback {
  * never trigger a redelivery.
  */
 export function findPendingFeedback(turns: Turn[]): PendingFeedback | null {
-  const pending = turns.filter(t => t.feedback_delivery === 'pending');
+  // A withheld turn (saved while its launch was refused) is owed to the NEXT unblock,
+  // not to a resume: redelivering it here would hand the agent a refused member's
+  // words as the interrupted turn's instruction and deliver them twice.
+  const pending = turns.filter(t => t.feedback_delivery === 'pending' && t.feedback_withheld !== true);
   if (pending.length === 0) return null;
 
   // `turns` is stored in sequence order, but sort defensively rather than
@@ -67,8 +85,12 @@ export function buildFeedbackRedeliveryPrompt(pending: PendingFeedback): string 
 
   // Function replacements, not string ones: the feedback is arbitrary human
   // text and `$&` / `$'` in a string replacement would mangle it. Verbatim
-  // means verbatim.
-  return feedbackRedeliveryText
-    .replace('{{older_note}}', () => olderNote)
-    .replace('{{feedback}}', () => turnText(pending.turn));
+  // means verbatim. The turn's content is lazy-composed (its human parts were
+  // neutralized when it was recorded); lazy's framing on either side is marked
+  // so review surfaces fold it (src/task/wrapper-fold.ts).
+  const [before, after = ''] = feedbackRedeliveryText.split('{{feedback}}');
+  const framing = before!.replace('{{older_note}}', () => olderNote).trimEnd();
+  const closing = after.trim();
+  return `${lazyFold('redelivery', framing)}\n\n${turnText(pending.turn)}` +
+    (closing ? `\n\n${lazyFold('redelivery', closing)}\n` : '\n');
 }

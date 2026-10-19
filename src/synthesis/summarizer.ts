@@ -89,8 +89,15 @@ export class ClaudeSummarizer implements Summarizer {
    * @param taskId Short ref of the task being accepted, where there is one.
    *   Threaded onto the proxied call as `x-lazy-task-id` so an accept-time
    *   summary is attributed to the task it summarizes.
+   * @param payerEmail Who asked for the work this summary is part of — the
+   *   member accepting the task — or null for work nobody asked for (a sweep,
+   *   a merge the forge reported). In team mode that person pays with their
+   *   own credential, and nobody means the project's service credential
+   *   holder; there is no fallback to the daemon's own credentials. A payer
+   *   who cannot pay throws, which the caller turns into the deterministic
+   *   description (regenerateFidelity never blocks a merge on synthesis).
    */
-  constructor(private projectRoot?: string, private taskId?: string) {}
+  constructor(private projectRoot?: string, private taskId?: string, private payerEmail: string | null = null) {}
 
   async summarize(input: SummarizerInput): Promise<string> {
     const prompt = fidelitySummaryPrompt
@@ -103,6 +110,15 @@ export class ClaudeSummarizer implements Summarizer {
     // actually synthesizing via Claude) keeps that out of the driver/lifecycle
     // import graph and avoids a cycle.
     const { runOneshot } = await import('../oneshot');
+    const { withOneshotCredential } = await import('../daemon/oneshot-credential');
+    const run = (ownerCredentialEnv: Array<{ key: string; value: string }> | undefined) => runOneshot({
+      prompt,
+      effort: SUMMARIZER_EFFORT,
+      repoAccess: 'none',
+      timeoutMs: SUMMARIZER_TIMEOUT_MS,
+      taskId: this.taskId,
+      ...(ownerCredentialEnv ? { ownerCredentialEnv } : {}),
+    }, this.projectRoot);
     // INVARIANT: this run happens mid-accept, and its caller (the daemon) is
     // sitting in the project root on the TARGET branch. Everything the summary
     // needs is in the prompt, so it asks for NO repository access at all — the
@@ -110,13 +126,9 @@ export class ClaudeSummarizer implements Summarizer {
     // tree, and write tools are disallowed either way. Running it in the project
     // root let a file-writing agent commit onto the target branch and
     // manufacture a conflict with the branch being merged.
-    const response = await runOneshot({
-      prompt,
-      effort: SUMMARIZER_EFFORT,
-      repoAccess: 'none',
-      timeoutMs: SUMMARIZER_TIMEOUT_MS,
-      taskId: this.taskId,
-    }, this.projectRoot);
+    const response = this.projectRoot
+      ? await withOneshotCredential(this.projectRoot, 'fidelity-summary', this.payerEmail, run)
+      : await run(undefined);
     const result = response.result?.trim();
     if (!result) {
       throw new Error('Summarizer returned empty result');
@@ -162,10 +174,10 @@ export class StubSummarizer implements Summarizer {
  * Resolve the Summarizer to use. Returns the stub under LAZY_SUMMARIZER_STUB
  * (test-only), otherwise the Claude-backed implementation.
  */
-export function getSummarizer(projectRoot?: string, taskId?: string): Summarizer {
+export function getSummarizer(projectRoot?: string, taskId?: string, payerEmail: string | null = null): Summarizer {
   if (process.env.LAZY_SUMMARIZER_STUB === '1') {
     logger.debug('Using StubSummarizer (LAZY_SUMMARIZER_STUB)');
     return new StubSummarizer();
   }
-  return new ClaudeSummarizer(projectRoot, taskId);
+  return new ClaudeSummarizer(projectRoot, taskId, payerEmail);
 }

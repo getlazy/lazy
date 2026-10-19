@@ -27,7 +27,7 @@
  * 429/529 or is unreachable is rerouted to the next fallback target in order,
  * re-sending the (already-buffered) request body. Failover is EXPLICIT — it only
  * happens when the user configured a fallback chain; with no fallbacks the proxy
- * fails hard exactly as before (CLAUDE.md: no silent fallbacks). Every reroute is
+ * fails hard exactly as before (AGENTS.md: no silent fallbacks). Every reroute is
  * logged (logger.warn) and recorded on the audit record (`reroute`). A response
  * that has already begun streaming to the client is never rerouted mid-stream —
  * failover decisions are made purely on the upstream's status line, before its
@@ -39,7 +39,8 @@
  * installed — the default — the chain is empty, short-circuits, and the original
  * bytes go out untouched.
  *
- * Clients identify themselves with two optional headers that lazy injects:
+ * Clients without a grant (see JIT CREDENTIALS below) may identify themselves
+ * with two optional headers:
  *   x-lazy-role     — "builder" | "agent"
  *   x-lazy-task-id  — short task id
  *
@@ -63,10 +64,12 @@
  */
 
 import { randomUUID } from 'crypto';
+import type { ResolvedConfig } from '../config/types';
 import type { ProxyAuditRecord, ProxyEnforcementAudit, ProxyReroute } from '../storage/types';
 import { extractRequest, classifyEndpoint } from './extractor';
 import { warmToolResultTokenizer } from './tool-result-tokens';
 import type { ProxyToolStatsRecorder } from './tool-stats';
+import type { ProxyTurnLatencyRecorder } from './turn-latency-recorder';
 import { AuditQueue, type AuditSink } from './audit';
 import {
   captureUsageLimitHeaders,
@@ -76,9 +79,10 @@ import {
   type UsageLimitTracker,
 } from './usage-limits';
 import { credentialValuesIn, upstreamErrorExcerpt } from './upstream-error';
+import { forwardableBody } from '../utils/forward-body';
 import {
   activityPath, closeEventFromRecord, proxyActivity,
-  CREDENTIAL_REFUSED_PREFIX, PATH_REFUSED_PREFIX, type ProxyActivityBus,
+  CREDENTIAL_REFUSED_PREFIX, CREDENTIAL_UNAVAILABLE_PREFIX, PATH_REFUSED_PREFIX, TIERS_FULL_PREFIX, TIER_REFUSED_PREFIX, type ProxyActivityBus,
 } from './activity';
 import {
   decideProxyPath,
@@ -87,7 +91,7 @@ import {
   pathRefusalReasonText,
 } from './path-allowlist';
 import { enforceResponseBody } from './enforce';
-import { extractUsage, teeUsageStream, type UsageWire } from './usage';
+import { extractUsage, readBodyTimed, teeUsageStream, type UsageWire } from './usage';
 import { isSseContentType, withSseKeepAlive } from './keepalive';
 import {
   DEFAULT_UPSTREAM_TIMEOUT_SECONDS,
@@ -97,6 +101,14 @@ import {
 } from './upstream-timeout';
 import { extractOpenAIRequest } from './openai-extractor';
 import { routeForProfile, type AgentUpstreamRoute } from './agent-upstreams';
+import {
+  chooseTier, earliestReset, allFullRetryAfterSeconds, allTiersFullMessage, allTiersFullBody,
+  isCapacityRefusal, refusalFor, describeRefusal, daemonTierRefusals, DEFAULT_TIER_RETRY_INTERVAL_SECONDS,
+  type TierChoice, type TierSwitchEvent, type TierRefusals,
+} from './tier-select';
+import { stripThinkingHistory } from './tier-history';
+import type { TierServed } from '../types';
+import { ANTHROPIC_OAUTH_BETA, originOf } from './target-credentials';
 import { defaultPolicyConfig, type ProxyPolicyConfig } from './policy';
 import { applyRequestPlugins, type ProxyRequestPlugin } from './plugins/types';
 import {
@@ -120,14 +132,21 @@ import {
 import {
   collectPresentedCredentials,
   applyCredential,
-  stripPresentedCredential,
+  stripAuthHeaders,
+  removeBetaFlag,
   credentialErrorBody,
+  credentialUnavailableBody,
   unknownPlaceholderMessage,
   missingCredentialMessage,
   type PresentedCredential,
 } from './inject';
 import type { TargetCredentialOutcome, TargetCredentials } from './target-credentials';
-import type { CredentialGrant } from './credential-broker';
+import {
+  derivedPlaceholderFor,
+  grantAcceptsPeer,
+  DERIVED_PLACEHOLDER_PATTERN,
+  type CredentialGrant,
+} from './credential-broker';
 import { looksLikeLazyPlaceholder } from './credential-broker';
 import { logger } from '../utils/logger';
 
@@ -143,6 +162,13 @@ import { logger } from '../utils/logger';
 export interface ProxyCredentialDeps {
   /** Resolve a presented value to the grant it was minted for, or null. */
   lookup(token: string): Promise<CredentialGrant | null>;
+  /**
+   * Hold upstream-minted credentials behind placeholders bound to the grant
+   * (src/proxy/credential-broker.ts, bindDerivedCredentials). False = the grant
+   * is gone. Optional only for unit tests of the routing paths; without it a
+   * Cursor key exchange's tokens are WITHHELD, never forwarded raw.
+   */
+  bindDerived?(grantToken: string, pairs: ReadonlyArray<{ placeholder: string; real: string }>): Promise<boolean>;
   /** Per-upstream real credentials, resolved live at request time. */
   targets: TargetCredentials;
   /**
@@ -153,7 +179,17 @@ export interface ProxyCredentialDeps {
    * map, and failover targets are dropped rather than paid by anybody else.
    * See resolveMemberCredential in ./credential-deps.ts.
    */
-  member?(grant: CredentialGrant): Promise<MemberCredentialResolution | null>;
+  member?(grant: CredentialGrant, expectedOrigin?: string, route?: ProxyMemberRoute): Promise<MemberCredentialResolution | null>;
+  /** null = solo mode; a member-mode answer never consults the project credential map. */
+  memberUsage?(grant: CredentialGrant, endpoint: string): Promise<{ key: string | null } | null>;
+}
+
+/** Host-derived selected route; never populated from a request field. */
+export interface ProxyMemberRoute {
+  upstream: string;
+  endpoint?: string;
+  tier?: number;
+  config?: ResolvedConfig;
 }
 
 /** What {@link ProxyCredentialDeps.member} answers. */
@@ -163,6 +199,7 @@ export interface MemberCredentialResolution {
   userId: string | null;
   /** The profile the credential was connected for; null when it is their Claude credential. */
   profile?: string | null;
+  endpoint?: string | null;
 }
 
 /** A presented placeholder that verified, and the grant it proves. */
@@ -204,6 +241,14 @@ export type ProxyServer = ReturnType<typeof Bun.serve> & {
  */
 export const PROXY_HEALTH_PATH = '/_lazy/health';
 
+export interface ProxyAgentRouting {
+  routes: Record<string, AgentUpstreamRoute>;
+  targets: TargetCredentials;
+  profiles: ReadonlySet<string>;
+  /** Consent and routing must use the very same effective configuration. */
+  config?: ResolvedConfig;
+}
+
 export interface ProxyServerConfig {
   /**
    * Addresses to listen on IN ADDITION to `bind`, on the same port — the
@@ -226,9 +271,17 @@ export interface ProxyServerConfig {
    * On a 429 whose `Retry-After` is ≤ this many seconds, wait that long and
    * retry the PRIMARY once before failing over (a brief rate-limit blip is
    * cheaper to wait out than to reroute). A larger Retry-After fails over
-   * immediately. Default 5. Only applies when a fallback chain is configured.
+   * immediately. Default 5. Applies when a fallback chain is configured, and
+   * to tiered profiles (a short 429 is waited out on the same tier).
    */
   retryAfterThreshold?: number;
+  /**
+   * Seconds a tier of a TIERED profile that refused for capacity (a 429) and
+   * gave no retry time stays skipped before the next request tries it again
+   * (`[proxy] tier_retry_interval`, default 300). Also the longest a
+   * windowed tier waits, whatever reset it reported.
+   */
+  tierRetryIntervalSeconds?: number;
   /**
    * Mechanistic policy (§6.3 layer 1). Defaults to the decided closed posture
    * (enforce on, connectors deny-by-default) when omitted.
@@ -265,18 +318,20 @@ export interface ProxyServerConfig {
    *
    * Deliberately NOT a failover chain: `[[proxy.fallback]]` is the primary's
    * failover, and failing an ollama profile over to api.anthropic.com would
-   * change the model AND bill the user, silently (CLAUDE.md: no silent
+   * change the model AND bill the user, silently (AGENTS.md: no silent
    * fallbacks). A profile upstream that is down fails, loudly, like any other
    * unreachable upstream.
    *
-   * Unlisted profiles — and unattributed traffic, which has no profile at all —
-   * use the primary upstream and its chain, unchanged.
+   * Existing profiles without an endpoint and unattributed traffic use the
+   * primary upstream; removed profiles with verified grants are refused.
    *
    * Each entry carries the upstream's WIRE FORMAT too: an `openai` wire routes
    * the request through the OpenAI path-allowlist tier and the OpenAI usage
    * extractor; the Anthropic-shaped extractor never sees that traffic.
    */
   agentUpstreams?: Record<string, AgentUpstreamRoute>;
+  /** Read routes and credential targets from the same config snapshot. */
+  liveAgentRouting?: () => Promise<ProxyAgentRouting>;
   /**
    * Cursor API base URL that the `/_lazy/cursor/<token>` route forwards
    * to. Defaults to Cursor's production origin. This route is a verbatim
@@ -349,6 +404,9 @@ function bodyForTarget(
   return JSON.stringify({ ...(parsedBody as Record<string, unknown>), model });
 }
 
+/** Most tasks whose tier state the proxy keeps in memory; the oldest is dropped. */
+const TIER_STATE_MAX = 1000;
+
 /**
  * Largest cursor request body lazy will BUFFER in order to substitute a
  * placeholder that appears in it.
@@ -373,6 +431,23 @@ const CURSOR_BODY_SUBSTITUTION_LIMIT = 64 * 1024;
  * encoding them is lossless and the byte search above is exact.
  */
 const ASCII = new TextEncoder();
+
+/**
+ * Overrides for a `missing` outcome that is only TRANSIENT (a token refresh that
+ * timed out, a 5xx from the token endpoint): a retryable 503 instead of a 401,
+ * and no `credential`, so the request is not evidence the credential is broken
+ * (src/proxy/credential-health.ts) and the turn is not parked as an auth failure.
+ */
+function transientRefusal(outcome: { reason: string; transient?: true }) {
+  if (!outcome.transient) return {};
+  return {
+    status: 503,
+    errorPrefix: CREDENTIAL_UNAVAILABLE_PREFIX,
+    body: credentialUnavailableBody,
+    message: `lazy could not resolve the credential for this request right now; retry it. ${outcome.reason}`,
+    credential: undefined,
+  };
+}
 
 /**
  * Enqueue an audit record for a request the proxy REFUSED, and return the
@@ -406,6 +481,13 @@ function refuse(
     errorPrefix?: string;
     /** Response body builder. Defaults to the authentication-error shape. */
     body?: (message: string) => string;
+    /** Extra response headers (e.g. `retry-after`). */
+    headers?: Record<string, string>;
+    /**
+     * Which credential was refused, when lazy knows: lets the refusal count as
+     * evidence about THAT credential's health (src/proxy/credential-health.ts).
+     */
+    credential?: { key: string; userId: string | null; profile: string | null };
   },
 ): Response {
   const status = opts.status ?? 401;
@@ -417,6 +499,10 @@ function refuse(
     ts: ctx.startMs,
     role: opts.role,
     taskId: opts.taskId,
+    // Its OWN field, never `credential`/`userId`: those are read as "this
+    // member's Claude token was rejected" (auth-verdict.ts) and as spend
+    // (usage-limits.ts), and a refusal is neither. Only credential-health reads it.
+    ...(opts.credential ? { refusedCredential: opts.credential } : {}),
     backend: opts.backend,
     upstream: opts.upstream,
     method: req.method,
@@ -440,7 +526,7 @@ function refuse(
   });
   return new Response(body(opts.message), {
     status,
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...(opts.headers ?? {}) },
   });
 }
 
@@ -472,19 +558,24 @@ function indexOfBytes(hay: Uint8Array, needle: Uint8Array, from: number): number
  */
 async function cursorBodyWithCredential(
   req: Request,
-  token: string,
-  real: string,
+  substitutions: ReadonlyArray<readonly [placeholder: string, real: string]>,
 ): Promise<Uint8Array | null> {
   const declared = Number(req.headers.get('content-length') ?? '');
   if (!Number.isFinite(declared) || declared <= 0) return null;
   if (declared > CURSOR_BODY_SUBSTITUTION_LIMIT) return null;
 
-  const bytes = new Uint8Array(await req.arrayBuffer());
-  const needle = ASCII.encode(token);
-  let at = indexOfBytes(bytes, needle, 0);
-  // No placeholder in the body: hand back the ORIGINAL bytes. The stream is
+  let bytes: Uint8Array = new Uint8Array(await req.arrayBuffer());
+  // No placeholder in the body: the ORIGINAL bytes come back. The stream is
   // already consumed, so "unchanged" has to mean these exact bytes, not a
   // re-encoding of them.
+  for (const [token, real] of substitutions) bytes = substituteBytes(bytes, token, real);
+  return bytes;
+}
+
+/** `bytes` with every occurrence of `token` replaced by `real`; the same array when there is none. */
+function substituteBytes(bytes: Uint8Array, token: string, real: string): Uint8Array {
+  const needle = ASCII.encode(token);
+  let at = indexOfBytes(bytes, needle, 0);
   if (at === -1) return bytes;
 
   const replacement = ASCII.encode(real);
@@ -505,6 +596,72 @@ async function cursorBodyWithCredential(
     offset += part.length;
   }
   return out;
+}
+
+const CURSOR_ERROR_CAPTURE_LIMIT = 16 * 1024;
+
+async function cursorErrorExcerpt(response: Response, secrets: string[]): Promise<string | null> {
+  const reader = response.body?.getReader();
+  if (!reader) return null;
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (length + value.byteLength > CURSOR_ERROR_CAPTURE_LIMIT) {
+        void reader.cancel().catch(() => {});
+        return 'upstream: error body exceeds diagnostic limit';
+      }
+      chunks.push(value);
+      length += value.byteLength;
+    }
+    const bytes = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return upstreamErrorExcerpt(new TextDecoder().decode(bytes), secrets);
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+/** The request's source address, as the listening server saw it. */
+function peerAddressOf(
+  req: Request,
+  srv?: { requestIP(req: Request): { address: string } | null },
+): string | null {
+  return normalizePeerAddress(srv?.requestIP(req)?.address);
+}
+
+/**
+ * Refuse a verified placeholder presented from an address its grant is not
+ * pinned to (src/proxy/credential-broker.ts, grantAcceptsPeer). Loud and
+ * audited: it means the value left the container it was minted for.
+ */
+function refuseWrongPeer(
+  ctx: { id: string; seq: number; startMs: number; auditQueue: AuditQueue },
+  req: Request,
+  grant: CredentialGrant,
+  peer: string | null,
+  where: { path: string; upstream: string; backend: string },
+): Response {
+  const detail = `it is pinned to ${grant.boundAddresses?.join(', ')}, the request came from ${peer ?? 'an unknown address'}`;
+  logger.error(
+    `[proxy] seq=${ctx.seq} refused task ${grant.taskId ?? '-'}'s placeholder: ${detail}. ` +
+    `It may have leaked out of its container.`,
+  );
+  return refuse(ctx, req, {
+    ...where,
+    role: grant.role,
+    taskId: grant.taskId,
+    reason: `placeholder presented from another address (${detail})`,
+    message:
+      'Unauthorized: this placeholder belongs to another container and is refused from here. ' +
+      'Each task container may spend only the credential placeholder it was launched with.',
+  });
 }
 
 /**
@@ -536,6 +693,7 @@ async function forwardCursor(
     auditQueue: AuditQueue;
     activity: ProxyActivityBus;
     upstreamTimeoutSeconds: number;
+    config?: ResolvedConfig;
   },
 ): Promise<Response> {
   const fwdHeaders = new Headers(req.headers);
@@ -547,14 +705,20 @@ async function forwardCursor(
   let hasBody = req.method !== 'GET' && req.method !== 'HEAD' && req.body != null;
   let bodyOverride: Uint8Array | null = null;
   let cursorCredentialLabel: string | null = null;
+  let cursorCredentialValue: string | null = null;
   let cursorUserId: string | null = null;
+  let cursorEndpoint: string | null = null;
+  const substitutions: Array<readonly [string, string]> = [];
 
   // --- JIT credential exchange ---
   if (caller && credentials) {
     // Team mode: the turn principal's own Cursor credential for the profile —
     // see ProxyCredentialDeps.member.
-    const member = credentials.member ? await credentials.member(caller.grant) : null;
+    const member = credentials.member ? await credentials.member(caller.grant, undefined, {
+      upstream: cursorUpstream, config: ctx.config,
+    }) : null;
     if (member?.userId) cursorUserId = member.userId;
+    cursorEndpoint = member?.endpoint ?? null;
     const outcome = member ? member.outcome : await credentials.targets.forTarget(cursorUpstream);
     const presented = collectPresentedCredentials(req.headers);
     if (outcome.kind === 'missing') {
@@ -566,20 +730,52 @@ async function forwardCursor(
         taskId: caller.grant.taskId,
         reason: outcome.reason,
         message: missingCredentialMessage(cursorUpstream, outcome.reason),
+        credential: {
+          key: usageLimitCredentialKey({ userId: cursorUserId, endpoint: cursorEndpoint, upstream: cursorUpstream }),
+          userId: cursorUserId,
+          profile: member?.profile ?? null,
+        },
+        ...transientRefusal(outcome),
       });
     }
     if (outcome.kind === 'none') {
       // Nothing to inject — but the placeholder must still not go upstream.
-      stripPresentedCredential(fwdHeaders, presented, caller.token);
+      stripAuthHeaders(fwdHeaders);
     } else {
       applyCredential(fwdHeaders, presented, caller.token, outcome.placement);
       cursorCredentialLabel = outcome.label;
+      cursorCredentialValue = outcome.placement.value;
       // Body substitution only for an in-place placement: that value is the
       // bare credential. A header placement's value may carry wire framing
       // ("Bearer x"), which belongs in a header and nowhere else.
-      if (hasBody && outcome.placement.kind === 'in-place') {
-        bodyOverride = await cursorBodyWithCredential(req, caller.token, outcome.placement.value);
+      if (outcome.placement.kind === 'in-place') substitutions.push([caller.token, outcome.placement.value]);
+    }
+
+    // --- Upstream-minted credentials (Cursor's key exchange) ---
+    // The container holds placeholders for the access/refresh tokens the
+    // exchange returned (see cursorTokenResponse below); swap this grant's
+    // back in. A derived placeholder this grant does not own is refused, not
+    // forwarded: it is another task's, or revoked.
+    const derived = caller.grant.derived ?? [];
+    for (const d of derived) substitutions.push([d.placeholder, d.real]);
+    // Collected first: Headers must not be mutated while being iterated.
+    for (const [name, value] of [...fwdHeaders]) {
+      let next = value;
+      for (const d of derived) if (next.includes(d.placeholder)) next = next.split(d.placeholder).join(d.real);
+      if (next !== value) fwdHeaders.set(name, next);
+      DERIVED_PLACEHOLDER_PATTERN.lastIndex = 0;
+      if (DERIVED_PLACEHOLDER_PATTERN.test(next)) {
+        DERIVED_PLACEHOLDER_PATTERN.lastIndex = 0;
+        return refuse(ctx, req, {
+          path: route.upstreamPath, upstream: cursorUpstream, backend: 'cursor',
+          role: caller.grant.role, taskId: caller.grant.taskId,
+          reason: 'a Cursor session placeholder this launch does not own (revoked, or another task\'s)',
+          message: unknownPlaceholderMessage(),
+        });
       }
+    }
+    if (hasBody && substitutions.length > 0) {
+      bodyOverride = await cursorBodyWithCredential(req, substitutions);
     }
   }
 
@@ -639,7 +835,7 @@ async function forwardCursor(
     upstreamResp = await fetch(target, {
       method: req.method,
       headers: fwdHeaders,
-      body: bodyOverride !== null ? bodyOverride : hasBody ? req.body : undefined,
+      body: bodyOverride !== null ? bodyOverride : hasBody ? forwardableBody(req.body) : undefined,
       // Required whenever the body is a stream: the request body is still being
       // sent while the response is read. A substituted body is a plain string
       // and must NOT declare half-duplex.
@@ -658,17 +854,19 @@ async function forwardCursor(
     );
   }
 
-  ctx.auditQueue.enqueue({
+  const cursorRecord: ProxyAuditRecord = {
     ...base,
     status: upstreamResp.status,
     usageLimitHeaders: captureUsageLimitHeaders(upstreamResp.headers),
     credential: usageLimitCredentialKey({
+      userId: cursorUserId,
+      endpoint: cursorEndpoint,
       credentialLabel: cursorCredentialLabel,
       upstream: cursorUpstream,
     }),
     error: null,
     durationMs: Date.now() - ctx.startMs,
-  });
+  };
 
   // Same stale-encoding strip as the Anthropic path: Bun's fetch already
   // decoded the body, so forwarding the compressed length would break clients.
@@ -676,10 +874,116 @@ async function forwardCursor(
   respHeaders.delete('content-encoding');
   respHeaders.delete('content-length');
 
+  if (upstreamResp.status >= 400 && upstreamResp.body != null &&
+      !(upstreamResp.headers.get('content-type') ?? '').includes('text/event-stream')) {
+    const secrets = [
+      ...credentialValuesIn(fwdHeaders),
+      ...(caller ? [caller.token] : []),
+      ...(cursorCredentialValue ? [cursorCredentialValue] : []),
+      ...substitutions.flatMap(([placeholder, real]) => [placeholder, real]),
+    ];
+    void cursorErrorExcerpt(upstreamResp.clone(), secrets)
+      .then((error) => ctx.auditQueue.enqueue({ ...cursorRecord, error }))
+      .catch(() => ctx.auditQueue.enqueue(cursorRecord));
+  } else {
+    ctx.auditQueue.enqueue(cursorRecord);
+  }
+
+  // A launch's container must never hold a credential Cursor minted for it:
+  // the key exchange's access/refresh tokens are swapped for grant-bound
+  // placeholders before the body leaves the proxy.
+  if (caller && upstreamResp.ok && upstreamResp.body != null && !isStreamingContentType(upstreamResp.headers.get('content-type'))) {
+    return cursorTokenResponse(upstreamResp, respHeaders, caller, credentials, ctx);
+  }
+
   return new Response(upstreamResp.body, {
     status: upstreamResp.status,
     statusText: upstreamResp.statusText,
     headers: respHeaders,
+  });
+}
+
+/**
+ * A streamed response (connect/gRPC streams, SSE) that must never be buffered.
+ * Everything else is inspected for upstream-minted tokens WHATEVER its declared
+ * type: cursor-agent parses the exchange answer as JSON regardless of the
+ * header, so trusting `application/json` would forward a mislabelled session raw.
+ */
+function isStreamingContentType(value: string | null): boolean {
+  return /^(application\/(connect\+|grpc)|text\/event-stream)/i.test((value ?? '').trim());
+}
+
+/** Fields of a token response that carry an upstream-minted credential. */
+const CURSOR_TOKEN_FIELDS = ['accessToken', 'refreshToken'] as const;
+
+/**
+ * Forward a JSON response from the cursor route with every upstream-minted
+ * token replaced by a placeholder bound to the caller's grant.
+ *
+ * WHY: cursor-agent (verified against the 2026.10.01 bundle) trades its API
+ * key for a session at `POST /auth/exchange_user_api_key` — key in
+ * `Authorization: Bearer`, body `{}` — and the answer is
+ * `{ accessToken, refreshToken, ... }`, the access token a JWT it sends as a
+ * bearer on every later call. Forwarded verbatim, a container that holds only a
+ * placeholder KEY still walked away with a real, spendable Cursor session.
+ * Applied to any unary JSON object carrying those fields, not to that one path,
+ * so a renamed endpoint cannot reopen it; the body is otherwise byte-for-byte
+ * what Cursor sent.
+ *
+ * Fails CLOSED: a body that names a token but cannot be bound (no binder, the
+ * grant revoked mid-request) is withheld with a 502, never forwarded.
+ */
+async function cursorTokenResponse(
+  upstreamResp: Response,
+  respHeaders: Headers,
+  caller: { grant: CredentialGrant; token: string },
+  credentials: ProxyCredentialDeps | null,
+  ctx: { seq: number },
+): Promise<Response> {
+  // Buffered as BYTES: unary Connect replies (`application/proto`) are binary,
+  // and decoding them as text replaced invalid UTF-8 with U+FFFD — a corrupted
+  // reply that broke Cursor launches. Only a valid-UTF-8 JSON object carrying
+  // a token field is ever rebuilt; everything else goes out byte-for-byte.
+  const bytes = new Uint8Array(await upstreamResp.arrayBuffer());
+  const passThrough = () => new Response(bytes, {
+    status: upstreamResp.status, statusText: upstreamResp.statusText, headers: respHeaders,
+  });
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+  } catch {
+    // Not UTF-8 JSON: it cannot carry a token FIELD, so there is nothing to
+    // swap. Forwarded as received.
+    return passThrough();
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return passThrough();
+  const body = parsed as Record<string, unknown>;
+  const pairs: Array<{ placeholder: string; real: string }> = [];
+  for (const field of CURSOR_TOKEN_FIELDS) {
+    const real = body[field];
+    if (typeof real !== 'string' || real === '') continue;
+    const placeholder = derivedPlaceholderFor(real);
+    pairs.push({ placeholder, real });
+    body[field] = placeholder;
+  }
+  if (pairs.length === 0) return passThrough();
+
+  const bound = credentials?.bindDerived ? await credentials.bindDerived(caller.token, pairs) : false;
+  if (!bound) {
+    logger.warn(`[proxy] seq=${ctx.seq} withheld a Cursor session token: its launch's grant could not hold it`);
+    return new Response(
+      JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'proxy_error',
+          message: 'lazy withheld the Cursor session this request created: the launch it belongs to has ended. Resume the task to start a new turn.',
+        },
+      }),
+      { status: 502, headers: { 'content-type': 'application/json' } },
+    );
+  }
+  return new Response(JSON.stringify(body), {
+    status: upstreamResp.status, statusText: upstreamResp.statusText, headers: respHeaders,
   });
 }
 
@@ -704,9 +1008,27 @@ export function createProxyServer(
   options?: {
     activity?: ProxyActivityBus;
     toolStats?: ProxyToolStatsRecorder;
+    // Durable per-turn latency rollups (src/proxy/turn-latency-recorder.ts);
+    // `observe` is an in-memory fold, flushed to Storage behind the request.
+    turnLatency?: ProxyTurnLatencyRecorder;
     // Latest usage-limit reading per credential. Defaults to the daemon-wide
     // tracker the `usageLimits` RPC reads; injectable for tests.
     usageLimits?: UsageLimitTracker;
+    // Called once per tier SWITCH of a tiered profile (src/proxy/tier-select.ts),
+    // never per request; the daemon records it durably on the task.
+    onTierSwitch?: (event: TierSwitchEvent) => void;
+    // Called for EVERY request a tier serves (past every refusal), naming the
+    // tier — the daemon dedupes it into the running turn's tiers_served.
+    onTierServed?: (event: { taskId: string; tier: TierServed }) => void;
+    // Has this task's tiered session already been served by more than one
+    // provider (durably, across daemon restarts)? See src/proxy/tier-history.ts.
+    historyCrossed?: (taskId: string) => Promise<boolean>;
+    // Refresh saved readings before tier choice; existing tracker readings
+    // remain usable if a refresh fails.
+    prepareTierChoice?: () => Promise<void>;
+    // Every tier's latest capacity refusal. Defaults to the daemon-wide record
+    // the usage pause reads; injectable for tests.
+    tierRefusals?: TierRefusals;
   },
 ): ProxyServer {
   const upstream = config.upstream.replace(/\/$/, '');
@@ -721,10 +1043,13 @@ export function createProxyServer(
       agentUpstreams[profile] = {
         upstream: route.upstream.replace(/\/$/, ''),
         wire: route.wire,
+        ...(route.tiers ? { tiers: route.tiers } : {}),
       };
     }
   }
   const retryAfterThreshold = config.retryAfterThreshold ?? DEFAULT_RETRY_AFTER_THRESHOLD;
+  const tierRetryIntervalSeconds = config.tierRetryIntervalSeconds ?? DEFAULT_TIER_RETRY_INTERVAL_SECONDS;
+  const tierRefusals = options?.tierRefusals ?? daemonTierRefusals;
   const upstreamTimeoutSeconds =
     config.upstreamTimeoutSeconds ?? DEFAULT_UPSTREAM_TIMEOUT_SECONDS;
   const policy = config.policy ?? defaultPolicyConfig();
@@ -735,6 +1060,7 @@ export function createProxyServer(
   // `lazy watch` subscriber. Wired at the queue so no record site can miss it.
   const activity = options?.activity ?? proxyActivity;
   const toolStats = options?.toolStats ?? null;
+  const turnLatency = options?.turnLatency ?? null;
   const usageLimits = options?.usageLimits ?? daemonUsageLimits;
   const auditQueue = new AuditQueue(auditSink, (record) => {
     activity.publish(closeEventFromRecord(record));
@@ -756,8 +1082,24 @@ export function createProxyServer(
         );
       }
     }
+    if (turnLatency) {
+      try {
+        turnLatency.observe(record);
+      } catch (err) {
+        logger.warn(
+          `[proxy] turn-latency fold failed for seq=${record.seq}: ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
   });
   let seq = 0;
+  // Per task+profile: the tier the last request used, and which upstream
+  // origins have served its session (two or more = its history crossed
+  // providers; see src/proxy/tier-history.ts). In memory: a daemon restart
+  // forgets it, which is a documented limit of the thinking-block handling.
+  // `full`: the last request found every tier full and was answered 429.
+  const tierState = new Map<string, { last: number | null; upstreams: Set<string>; full: boolean }>();
 
   // Load the BPE table the tool_result sizer needs, off the request path.
   // Fire-and-forget on purpose: results audited before it resolves record a
@@ -774,10 +1116,16 @@ export function createProxyServer(
     : '';
   const agentEntries = Object.entries(agentUpstreams);
   const agentNote = agentEntries.length
-    ? `, agent profiles: [${agentEntries.map(([p, u]) => `${p} → ${u.upstream} (${u.wire} wire)`).join(', ')}]`
+    ? `, initial agent profiles: [${agentEntries.map(([p, u]) => `${p} → ${u.upstream} (${u.wire} wire)`).join(', ')}]`
     : '';
 
-  const handleRequest = async (req: Request, srv?: { requestIP(req: Request): { address: string } | null }): Promise<Response> => {
+  // `tierAttempt`: how many tiers already refused THIS request (see the
+  // capacity-refusal retry below); bounds the re-dispatch.
+  const handleRequest = async (
+    req: Request,
+    srv?: { requestIP(req: Request): { address: string } | null },
+    tierAttempt = 0,
+  ): Promise<Response> => {
       const url = new URL(req.url);
       // Liveness self-check (see PROXY_HEALTH_PATH). FIRST, ahead of the
       // sequence counter and every audit site: it is not traffic.
@@ -788,6 +1136,22 @@ export function createProxyServer(
       const path = url.pathname + url.search;
       const id = randomUUID();
       const currentSeq = ++seq;
+      let requestRoutes = agentUpstreams;
+      let requestTargets = credentials?.targets;
+      let requestProfiles: ReadonlySet<string> | undefined;
+      let requestConfig: ResolvedConfig | undefined;
+      if (config.liveAgentRouting) {
+        try {
+          const routing = await config.liveAgentRouting();
+          requestRoutes = routing.routes;
+          requestTargets = routing.targets;
+          requestProfiles = routing.profiles;
+          requestConfig = routing.config;
+        } catch (err) {
+          logger.error(`[proxy] cannot load agent routing: ${err instanceof Error ? err.message : String(err)}`);
+          return Response.json({ error: 'Proxy agent routing is unavailable; check lazy.toml and run lazy doctor.' }, { status: 503 });
+        }
+      }
 
       // --- Cursor passthrough route ---
       // Opaque by design: forwarded verbatim, never parsed by the
@@ -831,6 +1195,23 @@ export function createProxyServer(
               headers: { 'content-type': 'application/json' },
             });
           }
+          if (!grantAcceptsPeer(grant, peerAddressOf(req, srv))) {
+            return refuseWrongPeer({ id, seq: currentSeq, startMs, auditQueue }, req, grant, peerAddressOf(req, srv), {
+              path: `${CURSOR_PROXY_PREFIX}/<redacted>`, upstream: cursorUpstream, backend: 'cursor',
+            });
+          }
+          if (grant.profile && requestProfiles && !requestProfiles.has(grant.profile)) {
+            return refuse(
+              { id, seq: currentSeq, startMs, auditQueue }, req,
+              {
+                path: `${CURSOR_PROXY_PREFIX}/<redacted>`, upstream: cursorUpstream, backend: 'cursor', role: grant.role,
+                taskId: grant.taskId,
+                reason: `agent profile "${grant.profile}" no longer exists`,
+                status: 410,
+                message: `Agent profile "${grant.profile}" no longer exists; start a new turn with a configured profile.`,
+              },
+            );
+          }
           cursorCaller = { grant, token: route.token };
         }
         return forwardCursor(req, route, cursorUpstream, cursorCaller, credentials, {
@@ -840,6 +1221,7 @@ export function createProxyServer(
           auditQueue,
           activity,
           upstreamTimeoutSeconds,
+          config: requestConfig,
         });
       }
 
@@ -853,6 +1235,11 @@ export function createProxyServer(
         for (const candidate of presented) {
           const grant = await credentials.lookup(candidate.value);
           if (grant) {
+            if (!grantAcceptsPeer(grant, peerAddressOf(req, srv))) {
+              return refuseWrongPeer({ id, seq: currentSeq, startMs, auditQueue }, req, grant, peerAddressOf(req, srv), {
+                path, upstream, backend: 'proxy',
+              });
+            }
             caller = { grant, token: candidate.value, presented };
             break;
           }
@@ -905,7 +1292,196 @@ export function createProxyServer(
       // with no profile route (an unattributed request — a host `claude` login
       // session sharing the proxy — or a profile with no endpoint of its own)
       // has nothing to route by and uses the primary upstream, as before.
-      const callerRoute = caller ? routeForProfile(agentUpstreams, caller.grant) : undefined;
+      if (caller?.grant.profile && requestProfiles && !requestProfiles.has(caller.grant.profile)) {
+        return refuse(
+          { id, seq: currentSeq, startMs, auditQueue }, req,
+          {
+            path, upstream, backend: 'proxy', role, taskId,
+            reason: `agent profile "${caller.grant.profile}" no longer exists`,
+            status: 410,
+            message: `Agent profile "${caller.grant.profile}" no longer exists; start a new turn with a configured profile.`,
+          },
+        );
+      }
+      let callerRoute = caller ? routeForProfile(requestRoutes, caller.grant) : undefined;
+      // --- Tiered profile: pick this request's tier (src/proxy/tier-select.ts) ---
+      // The grant names the TIERED profile; which endpoint and model serve this
+      // request is decided here, per request, from the live usage readings. The
+      // chosen tier's upstream then flows through the ordinary per-target
+      // credential lookup below, exactly like a plain profile's — so a tier's
+      // request carries that tier's endpoint credential and nothing else.
+      let tierChoice: TierChoice | null = null;
+      let tierStrip = false;
+      // The switch is RECORDED only once the request is past every refusal
+      // below (path allowlist, team mode): a refused request switched nothing.
+      let commitTierSwitch: (() => void) | null = null;
+      let tierThinkingOff = false;
+      // Set when every tier is full: answers the request with a 429 once it is
+      // past every other refusal, so a forbidden path is still audited as one.
+      let answerAllTiersFull: (() => Response) | null = null;
+      // The refusal key of each tier this request looked at (`keyFor`).
+      const tierKeys = new Map<number, string | null>();
+      let tierCount = 0;
+      if (caller && callerRoute?.tiers?.length) {
+        if (callerRoute.tiers.some((t) => t.usage !== null) && options?.prepareTierChoice) {
+          // Readings saved before a daemon restart, so a running turn's first
+          // request after it is judged on them rather than on an empty tracker.
+          try {
+            await options.prepareTierChoice();
+          } catch (err) {
+            logger.warn(`[proxy] cannot refresh saved tier usage; using known readings: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+        const targetsNow = requestTargets;
+        const tiers = callerRoute.tiers;
+        tierCount = tiers.length;
+        tierChoice = await chooseTier(tiers, {
+          keyFor: async (t) => {
+            const member = credentials?.memberUsage ? await credentials.memberUsage(caller!.grant, t.endpoint) : null;
+            if (member) {
+              tierKeys.set(t.index, member.key);
+              return member.key;
+            }
+            const outcome = targetsNow ? await targetsNow.forTarget(t.upstream) : null;
+            const key = usageLimitCredentialKey({
+              credentialLabel: outcome?.kind === 'credential' ? outcome.label : null,
+              upstream: t.upstream,
+            });
+            tierKeys.set(t.index, key);
+            return key;
+          },
+          readingFor: (key) => usageLimits.reading(key),
+          refusalFor: tierRefusals.lookupFor(caller.grant.profile ?? ''),
+        });
+        const choice = tierChoice;
+        const chosen = choice.tier;
+        const grant = caller.grant;
+        const stateKey = `${grant.taskId ?? grant.label}|${grant.profile ?? ''}`;
+        let state = tierState.get(stateKey);
+        if (!state) {
+          state = { last: null, upstreams: new Set<string>(), full: false };
+          // Durable half of "this session's history crossed providers": the
+          // in-memory set is lost on a daemon restart, and a session back on
+          // tier 0 would then send another provider's thinking blocks on every
+          // request (src/proxy/tier-history.ts).
+          if (grant.taskId && options?.historyCrossed) {
+            try {
+              if (await options.historyCrossed(grant.taskId)) state.upstreams.add('(before restart)');
+            } catch (err) {
+              // Unknown: assume crossed — stripping costs thinking continuity,
+              // not stripping can refuse every request.
+              logger.warn(`[proxy] cannot read tier history for task ${grant.taskId}: ${err instanceof Error ? err.message : String(err)}`);
+              state.upstreams.add('(unknown)');
+            }
+          }
+        }
+        const sessionState = state;
+        const rememberState = () => {
+          // Bounded: one entry per task on a tiered profile, oldest dropped.
+          tierState.delete(stateKey);
+          tierState.set(stateKey, sessionState);
+          while (tierState.size > TIER_STATE_MAX) {
+            const oldest = tierState.keys().next().value;
+            if (oldest === undefined) break;
+            tierState.delete(oldest);
+          }
+        };
+        if (choice.allFull) {
+          // Every tier is full: NO tier serves. The proxy answers 429 itself,
+          // with retry-after = the earliest reset among the full windows, and
+          // the request never leaves (engineer decision 2026-10-01,
+          // docs/design/tiered-agent-profiles.md). Recorded once per stretch
+          // of being full, like a switch, not once per refused request.
+          const fullRoute = callerRoute;
+          answerAllTiersFull = () => {
+            const resetAt = earliestReset(choice);
+            const message = allTiersFullMessage(grant.profile ?? '', choice, resetAt);
+            if (!sessionState.full) {
+              const from = sessionState.last === null ? null : tiers.find((t) => t.index === sessionState.last) ?? null;
+              logger.warn(`[proxy] seq=${currentSeq} every tier full task=${taskId ?? '-'} profile=${grant.profile}: ${choice.reason}`);
+              try {
+                options?.onTierSwitch?.({
+                  taskId: grant.taskId ?? null,
+                  label: grant.label,
+                  ...(grant.bindingKey ? { bindingKey: grant.bindingKey } : {}),
+                  profile: grant.profile ?? '',
+                  from: from ? { index: from.index, endpoint: from.endpoint, model: from.model } : null,
+                  to: null,
+                  retryAt: resetAt,
+                  reason: choice.reason,
+                  allFull: true,
+                  crossed: sessionState.upstreams.size > 1,
+                  thinkingDisabled: false,
+                  ts: startMs,
+                });
+              } catch (err) {
+                logger.warn(`[proxy] recording an every-tier-full event failed: ${err instanceof Error ? err.message : String(err)}`);
+              }
+            }
+            sessionState.full = true;
+            rememberState();
+            return refuse(
+              { id, seq: currentSeq, startMs, auditQueue }, req,
+              {
+                path, upstream: fullRoute.upstream, backend: 'proxy', role: grant.role,
+                taskId: grant.taskId,
+                reason: `every tier of agent profile "${grant.profile}" is full`,
+                message,
+                status: 429,
+                errorPrefix: TIERS_FULL_PREFIX,
+                body: allTiersFullBody(fullRoute.wire === 'openai' ? 'openai' : 'anthropic'),
+                headers: { 'retry-after': String(allFullRetryAfterSeconds(resetAt)) },
+              },
+            );
+          };
+        }
+        tierStrip = new Set([...sessionState.upstreams, originOf(chosen.upstream)]).size > 1;
+        commitTierSwitch = () => {
+          sessionState.upstreams.add(originOf(chosen.upstream));
+          const crossed = sessionState.upstreams.size > 1;
+          // Coming back from every-tier-full is always recorded, even onto the
+          // tier that served last.
+          const wasFull = sessionState.full;
+          sessionState.full = false;
+          if (sessionState.last !== chosen.index || wasFull) {
+            const from = sessionState.last === null ? null : tiers.find((t) => t.index === sessionState.last) ?? null;
+            // The first request a proxy sees for a task on tier 0 is the launch
+            // state, not a switch.
+            if (sessionState.last !== null || chosen.index !== 0 || wasFull) {
+              logger.info(
+                `[proxy] seq=${currentSeq} tier switch task=${taskId ?? '-'} profile=${grant.profile} ` +
+                `${from ? `${from.endpoint}/${from.model}` : '(unknown)'} → ${chosen.endpoint}/${chosen.model}: ${choice.reason}`,
+              );
+              try {
+                options?.onTierSwitch?.({
+                  taskId: grant.taskId ?? null,
+                  label: grant.label,
+                  ...(grant.bindingKey ? { bindingKey: grant.bindingKey } : {}),
+                  profile: grant.profile ?? '',
+                  from: from ? { index: from.index, endpoint: from.endpoint, model: from.model } : null,
+                  to: { index: chosen.index, endpoint: chosen.endpoint, model: chosen.model },
+                  reason: choice.reason,
+                  allFull: choice.allFull,
+                  crossed,
+                  thinkingDisabled: tierThinkingOff,
+                  ts: startMs,
+                });
+              } catch (err) {
+                logger.warn(`[proxy] recording a tier switch failed: ${err instanceof Error ? err.message : String(err)}`);
+              }
+            }
+            sessionState.last = chosen.index;
+          }
+          rememberState();
+        };
+        callerRoute = { upstream: chosen.upstream, wire: callerRoute.wire };
+      }
+      // A tier that refuses for capacity hands THIS request to the next tier
+      // (see below), so the turn continues; that needs the request as it
+      // arrived, before its body is read. Bounded by the chain's length.
+      const tierRetryReq = tierChoice && !answerAllTiersFull && tierAttempt < tierCount
+        ? req.clone()
+        : null;
       const routedUpstream = callerRoute?.upstream;
       // Which wire format this request's traffic speaks — picks the allowlist
       // tier, the request extractor, and the usage scanner. The Anthropic
@@ -959,6 +1535,32 @@ export function createProxyServer(
           parsedBody = JSON.parse(bodyText);
         } catch {
           // Non-JSON body (e.g., raw binary) — leave null; extractor handles it
+        }
+      }
+
+      // Tiered profile: the harness was launched on tier 0's model, so a request
+      // served by another tier asks for THAT tier's model; on tier 0 the
+      // harness's own choice (including its small background model) stands.
+      // Rewritten before extraction so the audit names the model actually sent.
+      if (tierChoice && parsedBody !== null && typeof parsedBody === 'object' && !Array.isArray(parsedBody)) {
+        let next = parsedBody as Record<string, unknown>;
+        if (tierChoice.tier.index !== 0 && typeof next.model === 'string') {
+          next = { ...next, model: tierChoice.tier.model };
+        }
+        if (tierStrip && wire === 'anthropic') {
+          const stripped = stripThinkingHistory(next);
+          if (stripped.stripped > 0) {
+            logger.info(
+              `[proxy] seq=${currentSeq} tiered history crossed providers: removed ${stripped.stripped} thinking ` +
+              `block(s)${stripped.thinkingDisabled ? ' and turned thinking off for this request' : ''}`,
+            );
+          }
+          tierThinkingOff = stripped.thinkingDisabled;
+          next = stripped.body;
+        }
+        if (next !== parsedBody) {
+          parsedBody = next;
+          bodyText = JSON.stringify(next);
         }
       }
 
@@ -1033,6 +1635,7 @@ export function createProxyServer(
       let userId: string | null = null;
       // Set when a member's credential FOR A PROFILE paid (see ProxyAuditRecord).
       let credentialProfile: string | null = null;
+      let credentialEndpoint: string | null = null;
       const scan = config.resolveSessionCredential
         ? scanForPlaceholder(fwdHeaders, isSessionPlaceholderToken)
         : ({ kind: 'none' } as const);
@@ -1074,13 +1677,16 @@ export function createProxyServer(
         // Where the request came from: a member placeholder is pinned to its
         // container's address, and refused from anywhere else.
         const peerAddress = normalizePeerAddress(srv?.requestIP(req)?.address);
-        const resolved = await config.resolveSessionCredential!(scan.credential.token, { peerAddress });
+        const resolved = await config.resolveSessionCredential!(scan.credential.token, {
+          peerAddress, upstream: routedUpstream ?? upstream, config: requestConfig,
+        });
         if (!resolved.ok) {
           return resolved.reason === 'wrong_origin'
             ? denySession('session_token_wrong_origin', resolved.detail)
             : denySession('unknown_session_token');
         }
         userId = resolved.userId;
+        credentialEndpoint = resolved.endpoint ?? null;
         const expected = expectedFormFor(resolved.kind);
         if (expected !== scan.credential.form) {
           return denySession(
@@ -1089,6 +1695,8 @@ export function createProxyServer(
             `${envVarForForm(expected)}, but the request arrived as ${envVarForForm(scan.credential.form)}`,
           );
         }
+        // Only the checked primary receives this raw-session credential.
+        stripAuthHeaders(fwdHeaders);
         swapCredential(fwdHeaders, scan.credential, resolved.secret);
       }
 
@@ -1097,8 +1705,8 @@ export function createProxyServer(
       // that list gets no failover chain. Everything else is
       // primary-then-fallbacks, and the primary never overrides the model
       // (undefined); fallbacks may.
-      const targets: ProxyFallbackTarget[] = routedUpstream
-        ? [{ upstream: routedUpstream, model: undefined }]
+      const targets: ProxyFallbackTarget[] = routedUpstream || scan.kind === 'one'
+        ? [{ upstream: routedUpstream ?? upstream, model: undefined }]
         : [{ upstream, model: undefined }, ...fallbacks];
 
       // --- Per-target credentials ---
@@ -1112,22 +1720,32 @@ export function createProxyServer(
         // TEAM MODE: a task caller is paid by its turn principal's own
         // credential for its profile, and by nothing else — so only the first
         // target is ever tried; a failover target would need somebody else's.
-        const member = credentials!.member ? await credentials!.member(caller.grant) : null;
+        const member = credentials!.member ? await credentials!.member(caller.grant, routedUpstream ? new URL(routedUpstream).origin : '', {
+          upstream: routedUpstream ?? upstream,
+          ...(tierChoice ? { endpoint: tierChoice.tier.endpoint, tier: tierChoice.tier.index } : {}),
+          config: requestConfig,
+        }) : null;
         if (member?.userId) userId = member.userId;
         if (member?.profile) credentialProfile = member.profile;
+        credentialEndpoint = member?.endpoint ?? null;
+        // All-full requests are authenticated and allowed, but use no target credential.
+        if (answerAllTiersFull && (!member || member.outcome.kind !== 'missing')) return answerAllTiersFull();
         for (const target of targets) {
           const outcome: TargetCredentialOutcome = member
             ? (target === targets[0]
               ? member.outcome
               : { kind: 'missing', reason: 'a failover target is not paid by the member who asked for this turn' })
-            : await credentials!.targets.forTarget(target.upstream);
+            : await requestTargets!.forTarget(target.upstream);
           const headers = new Headers(fwdHeaders);
           if (outcome.kind === 'credential') {
+            if (member && outcome.placement.kind === 'header') stripAuthHeaders(headers);
             applyCredential(headers, presented, caller.token, outcome.placement);
           } else if (outcome.kind === 'none') {
             // Deliberately credential-free (local Ollama, an unmapped
             // fallback). The placeholder still must not travel.
-            stripPresentedCredential(headers, presented, caller.token);
+            stripAuthHeaders(headers);
+            // The OAuth beta flag leaves with the OAuth bearer it describes.
+            removeBetaFlag(headers, ANTHROPIC_OAUTH_BETA);
           } else if (target === targets[0]) {
             // The primary has no usable credential. Refuse — never bill another
             // user's credential, never fall back silently.
@@ -1145,6 +1763,12 @@ export function createProxyServer(
                 taskId: caller.grant.taskId,
                 reason: outcome.reason,
                 message: missingCredentialMessage(target.upstream, outcome.reason),
+                credential: {
+                  key: usageLimitCredentialKey({ userId, endpoint: credentialEndpoint, upstream: target.upstream }),
+                  userId,
+                  profile: credentialProfile,
+                },
+                ...transientRefusal(outcome),
               },
             );
           } else {
@@ -1162,6 +1786,18 @@ export function createProxyServer(
         // No verified caller: forward exactly what arrived, to every target.
         for (const target of targets) chain.push({ target, headers: fwdHeaders, label: null });
       }
+
+      // The tier switch is recorded once the upstream has answered and the
+      // request is NOT being handed to another tier after a capacity refusal
+      // (below), or on the terminal error path: a tier that refused served
+      // nothing, so it is neither a switch nor a provider of this session.
+      // Same moments: the tier that actually answered is recorded as having
+      // served this turn (src/task/tiers-served.ts).
+      const recordTierServed = (): void => {
+        if (!tierChoice || !taskId) return;
+        const t = tierChoice.tier;
+        options?.onTierServed?.({ taskId, tier: { index: t.index, endpoint: t.endpoint, model: t.model, upstream: t.upstream } });
+      };
 
       // Every target reached below came OUT of the chain, so the lookup cannot
       // miss. It throws rather than defaulting to fwdHeaders because fwdHeaders
@@ -1210,6 +1846,7 @@ export function createProxyServer(
         if (!headers) return;
         const credential = usageLimitCredentialKey({
           userId,
+          endpoint: credentialEndpoint,
           credentialLabel: chain[i].label,
           upstream: chain[i].target.upstream,
         });
@@ -1251,7 +1888,10 @@ export function createProxyServer(
           // primary once before failing over — but only when failover is even
           // possible (a chain is configured). With no chain we must not wait:
           // that would change the no-config fail-hard behavior.
-          if (resp.status === 429 && isPrimary && chain.length > 1) {
+          // A tiered request counts as able to fail over too: its next TIER is
+          // the failover, and a short burst limit must not cost a tier switch
+          // (and the prompt cache) twice — down and straight back up.
+          if (resp.status === 429 && isPrimary && (chain.length > 1 || tierChoice !== null)) {
             const wait = parseRetryAfter(resp.headers.get('retry-after'));
             if (wait !== null && wait <= retryAfterThreshold) {
               noteDiscarded(resp, i);
@@ -1340,6 +1980,8 @@ export function createProxyServer(
       // Terminal error path: every target was unreachable (thrown). Matches the
       // original single-target behavior when no fallback chain is configured.
       if (upstreamResp === null) {
+        commitTierSwitch?.();
+        recordTierServed();
         const durationMs = Date.now() - startMs;
         auditQueue.enqueue({
           id,
@@ -1349,6 +1991,8 @@ export function createProxyServer(
           taskId,
           userId,
           ...(credentialProfile ? { credentialProfile } : {}),
+          ...(tierChoice ? { servedByEndpoint: tierChoice.tier.endpoint, tierIndex: tierChoice.tier.index, tierProfile: caller?.grant.profile ?? null } : {}),
+          credential: usageLimitCredentialKey({ userId, endpoint: credentialEndpoint, credentialLabel: chain.find((c) => c.target === finalTarget)?.label ?? null, upstream: finalTarget.upstream }),
           backend: 'proxy',
           upstream: finalTarget.upstream,
           method: req.method,
@@ -1378,6 +2022,9 @@ export function createProxyServer(
         );
       }
 
+      // TTFB: the upstream's response headers are in hand. Taken HERE, before
+      // anything below reads (or buffers) the body.
+      const headersAt = Date.now();
       const status = upstreamResp.status;
 
       // Usage-limit signal: read off the response HEADERS, which arrive before
@@ -1385,9 +2032,62 @@ export function createProxyServer(
       const usageLimitHeaders = captureUsageLimitHeaders(upstreamResp.headers);
       const credentialKey = usageLimitCredentialKey({
         userId,
+        endpoint: credentialEndpoint,
         credentialLabel: chain.find((c) => c.target === finalTarget)?.label ?? null,
         upstream: finalTarget.upstream,
       });
+      // A tiered profile chooses the NEXT request's tier from this reading, and
+      // an agent sends that request as soon as this response ends — before the
+      // audit queue folds the record in. So it is observed here, from the
+      // headers, the moment they arrive. Idempotent with the later fold.
+      if (tierChoice && usageLimitHeaders) {
+        usageLimits.observeReading({
+          credential: credentialKey, ts: startMs, upstream: finalTarget.upstream, backend: 'proxy',
+          status: upstreamResp.status, taskId, model: wireModel, headers: usageLimitHeaders,
+        });
+      }
+
+      // --- Tiered profile: a tier is used until it refuses for capacity ---
+      // The refusal marks the tier unavailable for this profile and credential
+      // until its retry time (src/proxy/tier-select.ts), and the SAME request
+      // goes again through the whole pipeline, which now chooses the next
+      // available tier — or answers "every tier full" when there is none. The
+      // refused attempt is audited here; the client never sees it.
+      if (tierChoice && caller && isCapacityRefusal(status)) {
+        const refusedTier = tierChoice.tier;
+        const profileName = caller.grant.profile ?? '';
+        const refusal = refusalFor(refusedTier, status, usageLimitHeaders, tierRetryIntervalSeconds);
+        tierRefusals.refuse(profileName, refusedTier, tierKeys.get(refusedTier.index) ?? null, refusal);
+        const message =
+          `tier ${refusedTier.index + 1} (${refusedTier.endpoint}, ${refusedTier.model}) ${describeRefusal(refusal)}` +
+          (tierRetryReq ? '; retrying the request on the next available tier' : '');
+        logger.warn(`[proxy] seq=${currentSeq} task=${taskId ?? '-'} profile=${profileName}: ${message}`);
+        if (tierRetryReq) {
+          await upstreamResp.body?.cancel();
+          auditQueue.enqueue({
+            id, seq: currentSeq, ts: startMs, role, taskId, userId,
+            ...(credentialProfile ? { credentialProfile } : {}),
+            servedByEndpoint: refusedTier.endpoint, tierIndex: refusedTier.index, tierProfile: caller?.grant.profile ?? null,
+            backend: 'proxy', upstream: finalTarget.upstream,
+            method: req.method, path, endpoint: extracted.endpoint, model: extracted.model,
+            tier: extracted.tier, stream: extracted.stream, requestShape: extracted.requestShape,
+            toolUses: extracted.toolUses, toolResults: extracted.toolResults,
+            status, usage: null, stopReason: null, error: `${TIER_REFUSED_PREFIX}: ${message}`,
+            durationMs: Date.now() - startMs, reroute, enforcement: null,
+            usageLimitHeaders, credential: credentialKey,
+          });
+          return handleRequest(tierRetryReq, srv, tierAttempt + 1);
+        }
+      } else if (tierChoice && caller && status < 400) {
+        // Only a refusal recorded BEFORE this request started is over: a
+        // concurrent request sent earlier must not erase a newer refusal.
+        const profileName = caller.grant.profile ?? '';
+        const key = tierKeys.get(tierChoice.tier.index) ?? null;
+        const prior = tierRefusals.get(profileName, tierChoice.tier, key);
+        if (prior && prior.refusedAt < startMs) tierRefusals.clear(profileName, tierChoice.tier, key);
+      }
+      commitTierSwitch?.();
+      recordTierServed();
 
       // A 404 on an inference path means the MODEL is not on this upstream, and
       // the proxy is the only place that holds both halves of that sentence: the
@@ -1430,9 +2130,13 @@ export function createProxyServer(
         upstreamResp.body != null;
 
       if (mayEnforce) {
-        const respText = await upstreamResp.text();
         const contentType = upstreamResp.headers.get('content-type') ?? '';
         const isStream = contentType.includes('text/event-stream') || extracted.stream === true;
+        // Read incrementally rather than with text(): the client gets nothing
+        // until the whole body is in (enforcement must see every tool_use), but
+        // the record still says when the first content token ARRIVED.
+        const timedBody = await readBodyTimed(upstreamResp.body!, isStream, wire);
+        const respText = timedBody.text;
 
         let enforced: ReturnType<typeof enforceResponseBody>;
         try {
@@ -1461,15 +2165,20 @@ export function createProxyServer(
         // rewrite changes content, never the tokens the upstream billed.
         const usage = extractUsage(isStream, respText);
 
-        const durationMs = Date.now() - startMs;
+        const durationMs = headersAt - startMs;
         auditQueue.enqueue({
           id, seq: currentSeq, ts: startMs, role, taskId, userId,
           ...(credentialProfile ? { credentialProfile } : {}),
+          ...(tierChoice ? { servedByEndpoint: tierChoice.tier.endpoint, tierIndex: tierChoice.tier.index, tierProfile: caller?.grant.profile ?? null } : {}),
           backend: 'proxy', upstream: finalTarget.upstream,
           method: req.method, path, endpoint: extracted.endpoint, model: extracted.model,
           tier: extracted.tier, stream: extracted.stream, requestShape: extracted.requestShape,
           toolUses: extracted.toolUses, toolResults: extracted.toolResults,
           status, usage, stopReason: enforced.stopReason, error: null, durationMs,
+          // Timed as the bytes arrived, before the buffered body was forwarded:
+          // the upstream's latency, not what the client saw.
+          ttftMs: timedBody.firstContentAt === null ? null : timedBody.firstContentAt - startMs,
+          ttltMs: timedBody.endedAt - startMs,
           reroute, enforcement, usageLimitHeaders, credential: credentialKey,
         });
 
@@ -1480,7 +2189,7 @@ export function createProxyServer(
         });
       }
 
-      const durationMs = Date.now() - startMs;
+      const durationMs = headersAt - startMs;
 
       // Everything about the record except `usage` is known now. `durationMs`
       // deliberately stays "time to the upstream's response", not "time until
@@ -1493,6 +2202,7 @@ export function createProxyServer(
         taskId,
         userId,
         ...(credentialProfile ? { credentialProfile } : {}),
+          ...(tierChoice ? { servedByEndpoint: tierChoice.tier.endpoint, tierIndex: tierChoice.tier.index, tierProfile: caller?.grant.profile ?? null } : {}),
         backend: 'proxy',
         upstream: finalTarget.upstream,
         method: req.method,
@@ -1591,8 +2301,15 @@ export function createProxyServer(
       // before the record is enqueued, so update the live view now. The later
       // observe from the audit tap carries the same ts and changes nothing.
       usageLimits.observe(record);
-      const teed = teeUsageStream(upstreamResp.body!, respIsStream, (usage) => {
-        auditQueue.enqueue({ ...record, usage });
+      const teed = teeUsageStream(upstreamResp.body!, respIsStream, (usage, timing) => {
+        auditQueue.enqueue({
+          ...record,
+          usage,
+          ttftMs: timing.firstContentAt === null ? null : timing.firstContentAt - startMs,
+          // A cancelled or broken stream has no "last token": recording its abort
+          // time would pass for a finished response in the percentiles.
+          ttltMs: timing.completed ? timing.endedAt - startMs : null,
+        });
       }, wire);
 
       // Keep-alive framing wraps the tee, never the other way round: the usage

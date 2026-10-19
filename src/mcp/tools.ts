@@ -153,6 +153,8 @@ import { resolveStorage, resolveLazyRoot } from '../preconditions';
 import { assertWorktreeUsable } from './turn-identity';
 import { describeNestedGit, scanTaskWorktreeNestedGit } from '../git/nested-git';
 import { assertTaskWorktreeHead, taskWorktreeOf } from '../git/worktree-pointers';
+import { deliveredFilesRefusal, findDeliveredFilesStaged } from '../git/delivered-files';
+import { deliveredGuardFor } from '../daemon/task-files';
 import { looksLikeTaskBranch, taskRefFromBranch } from '../git/branch-prefix';
 import { INTERNAL_GIT_TOOL_NAME, createInternalGitHandler } from './internal-git';
 import type { Storage, SearchResult } from '../storage';
@@ -165,6 +167,7 @@ import { resolveAgentForNewTaskFromConfig } from '../agent/task-agent';
 import { createRunner } from '../runner';
 import type { Runner } from '../runner';
 import { inheritCustomImageMetadata, droppedCustomImagePinWarning } from '../docker/worktree-image';
+import { statusCanShowFailure, taskTurnFailure, turnFailureLabel, type TaskTurnFailure } from '../task/turn-failure';
 import { formatWorkingSubstate, readSupervisorStatusAsync, type WorkingSubstate } from '../utils/working-substate';
 import { computeTaskWorkingSubstate } from '../utils/working-run';
 import { MAX_PROGRESS_MESSAGE_LENGTH } from '../protocol/progress';
@@ -175,12 +178,15 @@ import { formatRetrySummary } from '../utils/retry-summary';
 import { parentTaskIdOf, taskTarget, branchTarget, targetBranchOf, pruneTasksToDepth } from '../task-target';
 import { searchConversations } from '../conversation/search';
 import { currentPromptOf } from '../task-prompt';
+import { redactSecretValuesDeep } from '../utils/redact';
 import { resolveTaskForgeLink } from '../task-forge-link';
 import { isLinkedTask, linkedBranchOf, linkedSourceOf, formatLinkedMarker } from '../task/linked';
 import { loadConfig } from '../config/loader';
 import { resolveProjectModel } from '../daemon/project-settings';
 import { switchTaskAgent, formatAgentSwitchAnnouncement } from '../daemon/agent-switch';
+import { editTask } from '../daemon/edit-task';
 import { resolveEdgeGateDecision } from '../protection/edge-gate';
+import { isManagedMode } from '../config/managed-mode';
 import { recordPendingAcceptReview } from '../protection/pending-review';
 import { revertedProtectedFiles, revertedProtectedFilesNotice } from '../protection/reverted-files';
 import { resolveOutstandingViolations } from '../protection/outstanding-resolver';
@@ -193,8 +199,10 @@ import { RpcError, filterToSubtree } from '../daemon/rpc-handlers';
 
 import {
   queryWait,
+  ackWaitComments,
   queryStartTask,
   queryUnblockTask,
+  queryRunnerImage,
   queryAskTask,
   queryReviewTask,
   queryAcceptTask,
@@ -212,6 +220,7 @@ import {
   queryRegions,
   expandPresentation,
   queryCloneTask,
+  queryCreateTask,
 } from '../daemon/rpc-fallback';
 import { formatUpstreamStatusLine } from '../daemon/upstream-status';
 import { resolveDashboardAvailability } from '../daemon/dashboard-availability';
@@ -219,7 +228,6 @@ import {
   submitPlainConfirmText,
   submitStrongConfirmText,
 } from '../submit-confirmation';
-import { generateRedoCode } from '../cli/commands/redo';
 import { sanitizeUserText } from '../utils/sanitize-text';
 import { generateCode, storePending, validateCode, renderGuidance } from './confirmation';
 import {
@@ -295,6 +303,12 @@ export interface McpToolContext {
    * Undefined everywhere else — narration is strictly observational.
    */
   progress?: import('../daemon/progress').ProgressEmitter;
+  /**
+   * Registers an effect to run only after this call's answer was written to a
+   * still-connected caller (the heartbeat-framed route). Undefined where
+   * delivery cannot be observed, and handlers then skip the effect.
+   */
+  afterDelivery?: (effect: () => Promise<void>) => void;
   /**
    * WHOSE WORK this call is part of — the owner of the turn the calling agent
    * is running (src/daemon/turn-owner.ts).
@@ -734,8 +748,8 @@ export const searchTool: McpTool = {
   name: 'lazy_search',
   description:
     'Search tasks, prompts, turns, commits, comments, raised items, and shared ' +
-    'memory across the project — the way to find rationale and decisions from other ' +
-    'tasks. `offset`/`limit` page; the response always carries a `total`.\n\n' +
+    'memory across the project. A bare id (6+ hex chars, prefix or full) finds that ' +
+    'entity. `offset`/`limit` page; the response always carries a `total`.\n\n' +
     'Search LOCATES, lazy_show READS: excerpts are truncated to ~500 chars (match ' +
     'context 200), so read a hit in full afterwards with lazy_show ' +
     '(`sections: ["turns"]` gives untruncated bodies) or lazy_diff — both work on ' +
@@ -747,8 +761,7 @@ export const searchTool: McpTool = {
     'carry `turnSequence`, for citing a turn without re-reading it. Raised-item hits ' +
     'are the exception and need no paging: lazy_show always returns every raised item ' +
     'in full, so there is no `raised_items` section to request and `index` is just a ' +
-    'position in that array. Task, ' +
-    'prompt, conversation and memory hits carry no `index`.',
+    'position in that array. Other hits carry no `index`.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -767,7 +780,7 @@ export const searchTool: McpTool = {
           'and on query (lowercased, non-alphanumerics to hyphens), so tag:#Launch == ' +
           'tag:launch; QUOTE a multi-word tag (tag:"My Feature Work") or only its first ' +
           'word counts. Bare "#name" means tag:name OR the literal text. A zero-result ' +
-          'tag query returns a "hint" naming the tags that do not exist.',
+          'tag query returns a "hint".',
         minLength: 1,
       },
       fuzzy: {
@@ -777,7 +790,7 @@ export const searchTool: McpTool = {
       filter: {
         type: 'string',
         description: 'Filter results to a specific type',
-        enum: ['tasks', 'prompts', 'turns', 'commits', 'comments', 'raised', 'followups', 'conversations', 'memories', 'scratch'],
+        enum: ['tasks', 'prompts', 'turns', 'commits', 'comments', 'raised', 'followups', 'conversations', 'memories', 'scratch', 'messages', 'journal', 'artifacts', 'review_comments'],
       },
       offset: {
         type: 'number',
@@ -804,6 +817,8 @@ export const searchTool: McpTool = {
 function mapSearchHit(r: SearchResult): Record<string, unknown> {
   return {
     type: r.entity_type,
+    id: r.entity_id,
+    ...(r.matched_id ? { matchedId: true } : {}),
     taskId: shortId(r.task_id),
     taskCode: r.task_code,
     taskGoal: r.task_goal,
@@ -908,15 +923,14 @@ export const showTool: McpTool = {
     'The default response is a compact summary with counts; pass `sections` to get ' +
     'those in full and `offset`/`limit` to page within them. "chunks" groups turns ' +
     'by review boundary — each chunk starts at a human/builder turn and absorbs every ' +
-    'agent, supervisor and system turn until the next one — so reviewing by chunk ' +
-    'cannot silently skip the auto-resumes and nudges a "latest turn" glance misses.\n\n' +
+    'agent and supervisor turn until the next one, including auto-resumes and nudges. ' +
     'Some fields come back in full whatever `sections` and paging say, which is why ' +
     'there is no `raised_items` value in `sections`: `raised_items` is ' +
     'every item the agent raised, blocking and non-blocking together, each with its ' +
     '`blocking` flag and a `status` of open (nobody reacted yet) / responded / ' +
     'acknowledged / dismissed / promoted. A blocking item gates accept until it is ' +
     'resolved through `raised_resolutions`. Also `artifacts`: metadata only, read one ' +
-    'with lazy_artifact_get. `retry_status` appears when the supervisor is stuck ' +
+    'with lazy_artifact_get. `review-comments` pages saved web review threads. `retry_status` appears when the supervisor is stuck ' +
     'retrying; `protection` when a gate applies — read-only, because arranging gates ' +
     'and completing a gated merge are deliberately human-only.',
   inputSchema: {
@@ -931,7 +945,7 @@ export const showTool: McpTool = {
         type: 'array',
         items: {
           type: 'string',
-          enum: ['turns', 'chunks', 'commits', 'comments', 'journal', 'children', 'status-history', 'tag-history', 'notes', 'reviews'],
+          enum: ['turns', 'chunks', 'commits', 'comments', 'review-comments', 'journal', 'children', 'status-history', 'tag-history', 'notes', 'reviews'],
         },
         description: 'Sections to include in full; without this, only counts. With "chunks", offset/limit page over chunks rather than turns. "status-history" and "tag-history" are audit trails (transition/tag, actor, timestamp); current tags are always in the summary as `tags`. "notes": which comments the agent has seen and which the next prompt carries; "comments" repeat it as `delivered`. "reviews": the reviews that COUNT (no raises, no parseable sweeps = never happened), newest first.',
       },
@@ -972,6 +986,9 @@ function mapShowTurn(t: Turn): Record<string, unknown> {
     content: turnText(t),
     timestamp: new Date(t.timestamp).toISOString(),
     ...(t.auto_triggered ? { auto_triggered: true } : {}),
+    // Lazy's notice that the turn FAILED: present, this row is not the agent's
+    // reply even though its role is `agent` (src/types `Turn.failure`).
+    ...(t.failure ? { failure: t.failure, written_by: 'lazy' } : {}),
     // Per-turn launch labels. Emitted only when recorded: a pre-feature turn
     // stays label-free rather than inheriting the task's current agent/model/
     // effort, which would invent history. `agent` is the agent id the turn was
@@ -982,6 +999,10 @@ function mapShowTurn(t: Turn): Record<string, unknown> {
     ...(t.agent !== undefined ? { agent: t.agent } : {}),
     ...(t.model !== undefined ? { model: t.model } : {}),
     ...(t.model_id !== undefined ? { model_id: t.model_id } : {}),
+    // Where a tiered profile's requests actually went — `model` is tier 0's.
+    ...(t.tiers_served !== undefined ? { tiers_served: t.tiers_served } : {}),
+    // How fast the model answered the turn (src/task/turn-latency.ts).
+    ...(t.latency !== undefined ? { latency: t.latency } : {}),
     ...(t.effort !== undefined ? { effort: t.effort } : {}),
     ...(t.turn_type !== undefined ? { turn_type: t.turn_type } : {}),
     ...(t.review !== undefined ? { review: t.review } : {}),
@@ -1209,7 +1230,7 @@ export function createShowHandler(ctx: McpToolContext): McpToolHandler {
         };
 
         // Include latest turn in summary (untruncated) when not drilling into turns/chunks
-        if (!sectionsSet.has('turns') && !sectionsSet.has('chunks') && allTurns.length > 0) {
+        if (!sectionsSet.has('turns') && !sectionsSet.has('chunks') && !sectionsSet.has('review-comments') && allTurns.length > 0) {
           result.latest_turn = mapShowTurn(allTurns[allTurns.length - 1]);
         }
 
@@ -1219,6 +1240,20 @@ export function createShowHandler(ctx: McpToolContext): McpToolHandler {
         const retryStatus = await buildRetryStatus(task);
         if (retryStatus) {
           result.retry_status = retryStatus;
+        }
+
+        // The last turn FAILED and nothing will retry it — say what and the fix,
+        // so a dead credential never reads as an ordinary review park.
+        const turnFailure = taskTurnFailure(task, session);
+        if (turnFailure) {
+          result.turn_failure = {
+            label: turnFailureLabel(turnFailure),
+            class: turnFailure.class,
+            reason: turnFailure.reason,
+            remedy: turnFailure.remedy,
+            ...(turnFailure.agent ? { agent: turnFailure.agent } : {}),
+            at: new Date(turnFailure.at).toISOString(),
+          };
         }
       } else {
         result.turn_count = 0;
@@ -1399,11 +1434,30 @@ export function createShowHandler(ctx: McpToolContext): McpToolHandler {
         }));
       }
 
+      if (sectionsSet.has('review-comments')) {
+        const reviewComments = await storage.getTaskReviewComments(task.id);
+        result.review_comment_count = reviewComments.length;
+        result.review_comments = reviewComments.slice(offset, offset + limit).map(comment => ({
+          id: comment.id,
+          thread_id: comment.thread_id,
+          file: comment.file,
+          line: comment.line,
+          side: comment.side,
+          role: comment.role,
+          content: comment.content,
+          anchor_snippet: comment.anchor_snippet,
+          intent: comment.intent,
+          delivery_state: comment.delivery_state,
+          delivered_turn: comment.delivered_turn,
+          withdrawn_at: comment.withdrawn_at,
+        }));
+      }
+
       if (sectionsSet.has('comments') && allComments.length > 0) {
         const sliced = allComments.slice(offset, offset + limit);
         // `delivered` is the daemon's answer, not a timestamp comparison made
         // here: whether the agent has been SHOWN a comment is decided by the
-        // delivery cutoff (CLAUDE.md, "A lazy comment never starts a turn").
+        // delivery cutoff (AGENTS.md, "A lazy comment never starts a turn").
         const queued = new Set(notesState.queued_ids);
         result.comments = sliced.map(c => ({
           content: c.content,
@@ -1464,6 +1518,7 @@ export function createShowHandler(ctx: McpToolContext): McpToolHandler {
             from: (offset + i) === 0 ? null : allStatusHistory[offset + i - 1].status,
             to: c.status,
             actor: c.actor ?? null,
+            ...(c.reason ? { reason: c.reason } : {}),
             timestamp: new Date(c.timestamp).toISOString(),
           }));
         }
@@ -1772,6 +1827,34 @@ export function createCreateHandler(ctx: McpToolContext): McpToolHandler {
         if (!validateCode(confirmationCode, 'create', CREATE_CONFIRMATION_TASK_ID)) {
           throw new Error('Invalid or expired confirmation code. Call lazy_create without a code to get a new one.');
         }
+      }
+
+      // A clone bound to Lazy Teams creates in ONE daemon call: Teams authorizes
+      // each storage write alone, so a storage create followed by separate writes
+      // could leave a task behind without the settings a later write was refused.
+      if (ctx.boundToTeams) {
+        const created = await queryCreateTask({
+          goal,
+          prompt: prompt || undefined,
+          code,
+          parent: parentTaskId,
+          type: taskType,
+          model: model || undefined,
+          agent: agentArg,
+          deriveCode: false,
+          actor: mcpActor(ctx),
+        });
+        const task = await storage.getTask(created.taskId);
+        return {
+          id: shortId(created.taskId),
+          full_id: created.taskId,
+          goal: task?.goal ?? goal,
+          status: task?.status ?? 'backlog',
+          code: task?.code ?? null,
+          model: model ?? null,
+          runner: null,
+          parent_task_id: parentTaskId ? shortId(parentTaskId) : null,
+        };
       }
 
       // Explicit agent > parent task's agent (a subtask stays on its parent's
@@ -2148,6 +2231,80 @@ export function createMemoryRecallHandler(ctx: McpToolContext): McpToolHandler {
 }
 
 // ---------------------------------------------------------------------------
+// lazy_image_build (try-build this task's Dockerfile — src/daemon/image-try-build.ts)
+// ---------------------------------------------------------------------------
+
+export const imageBuildTool: McpTool = {
+  name: 'lazy_image_build',
+  description:
+    'Test-build this task\'s Dockerfile.lazy (your uncommitted edits to that file included) against your ' +
+    'COMMITTED files, in a throwaway builder, and return the output. Nothing is kept or used to run anything. ' +
+    'No secrets, SSH or registry logins are available. Commit files the Dockerfile COPYs first. A person ' +
+    'decides whether to adopt it.',
+  inputSchema: { type: 'object', properties: {} },
+};
+
+/**
+ * Tools served only with a daemon-granted capability (tool-roles.ts
+ * CAPABILITY_GATED_TOOLS) — never part of `allTools`, the role surface.
+ */
+export const capabilityTools: McpTool[] = [imageBuildTool];
+
+export function createImageBuildHandler(ctx: McpToolContext): McpToolHandler {
+  return async () => {
+    if (!ctx.taskId) {
+      throw new Error('lazy_image_build requires a task context. This tool is not available in builder mode.');
+    }
+    const { imageTryBuildAvailable, TRY_BUILD_UNAVAILABLE, tryBuildTaskDockerfile } = await import('../daemon/image-try-build');
+    // Refused before anything is resolved: the daemon's environment is the
+    // only thing that decides, and a server outside it (local stdio mode) has
+    // no managed environment, so it refuses too.
+    if (!imageTryBuildAvailable()) throw new Error(TRY_BUILD_UNAVAILABLE);
+    const projectRoot = ctx.projectRoot;
+    if (!projectRoot) throw new Error('lazy_image_build runs inside the project daemon only.');
+    const storage = ctx.storage;
+    const task = storage ? await storage.getTask(ctx.taskId) : null;
+    if (!task) throw new Error(`Task not found: ${ctx.taskId}`);
+    const { containerRunnerBinary } = await import('../daemon/runner-image');
+    const runner = await containerRunnerBinary(projectRoot);
+    if (!runner) throw new Error(TRY_BUILD_UNAVAILABLE);
+    const { displayId, getBranchName } = await import('../task/identity');
+    return tryBuildTaskDockerfile(projectRoot, { id: task.id, label: displayId(task), branch: getBranchName(task) },
+      ctx.worktreePath, { binary: runner.binary });
+  };
+}
+
+// ---------------------------------------------------------------------------
+// lazy_recipe (built-in, harness-independent recipes — src/recipes)
+// ---------------------------------------------------------------------------
+
+export const recipeTool: McpTool = {
+  name: 'lazy_recipe',
+  description:
+    'Built-in step-by-step recipes: no `name` lists them, a `name` returns one to follow.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      name: { type: 'string' },
+    },
+  },
+};
+
+export function createRecipeHandler(): McpToolHandler {
+  return async (args) => {
+    const { listRecipes, getRecipe } = await import('../recipes');
+    const name = args.name as string | undefined;
+    if (!name) return { recipes: listRecipes() };
+    const body = getRecipe(name);
+    if (body === null) {
+      const known = listRecipes().map(r => r.name).join(', ');
+      throw new Error(`No recipe named '${name}'. Available recipes: ${known}. Call lazy_recipe with no arguments to list them.`);
+    }
+    return { name: name.trim().toLowerCase(), body };
+  };
+}
+
+// ---------------------------------------------------------------------------
 // lazy_scratch (builder scratch sandbox, captured into the project store)
 // ---------------------------------------------------------------------------
 
@@ -2191,44 +2348,48 @@ export function createScratchHandler(ctx: McpToolContext): McpToolHandler {
     }
 
     const path = args.path as string | undefined;
-    const storage = await getStorage(ctx);
-    try {
-      if (!path) {
-        const files = await storage.listScratchFiles();
-        return {
-          total: files.length,
-          files: files.map(f => ({
-            path: f.path,
-            size: f.size,
-            ...(f.skipped ? { skipped: f.skipped } : {}),
-            sessionId: f.session_id ?? null,
-            builderId: f.builder_id ?? null,
-            updated_at: new Date(f.updated_at).toISOString(),
-            updated_by: f.updated_by,
-          })),
-        };
-      }
+    // The daemon's `scratchList` / `scratchShow` reads (the Teams Files tab's
+    // own), not storage calls, so a bound clone is authorized as the browser is.
+    const { queryScratchList, queryScratchShow } = await import('../daemon/rpc-fallback');
+    if (!path) {
+      const files = (await queryScratchList()).groups.flatMap((g) => g.files)
+        .sort((a, b) => a.path.localeCompare(b.path));
+      return {
+        total: files.length,
+        files: files.map(f => ({
+          path: f.path,
+          size: f.size,
+          ...(f.skipped ? { skipped: f.skipped } : {}),
+          sessionId: f.session_id ?? null,
+          builderId: f.builder_id ?? null,
+          updated_at: new Date(f.updated_at).toISOString(),
+          updated_by: f.updated_by,
+        })),
+      };
+    }
 
-      const file = await storage.getScratchFile(path);
-      if (!file) {
+    let file;
+    try {
+      file = (await queryScratchShow({ path })).file;
+    } catch (err) {
+      if ((err as { status?: number }).status === 404) {
         throw new Error(
           `No captured scratch file at '${path}'. Call lazy_scratch with no arguments to list them.`,
         );
       }
-      return {
-        path: file.path,
-        size: file.size,
-        ...(file.skipped ? { skipped: file.skipped } : {}),
-        content: file.content,
-        sessionId: file.session_id ?? null,
-        builderId: file.builder_id ?? null,
-        created_at: new Date(file.created_at).toISOString(),
-        updated_at: new Date(file.updated_at).toISOString(),
-        updated_by: file.updated_by,
-      };
-    } finally {
-      await storage.close();
+      throw err;
     }
+    return {
+      path: file.path,
+      size: file.size,
+      ...(file.skipped ? { skipped: file.skipped } : {}),
+      content: file.content ?? '',
+      sessionId: file.session_id ?? null,
+      builderId: file.builder_id ?? null,
+      created_at: new Date(file.created_at).toISOString(),
+      updated_at: new Date(file.updated_at).toISOString(),
+      updated_by: file.updated_by,
+    };
   };
 }
 
@@ -2280,9 +2441,9 @@ export function createUsageLimitsHandler(ctx: McpToolContext): McpToolHandler {
     }
     const { queryUsageLimits, queryUsagePause, queryTokenBudget } = await import('../daemon/rpc-fallback');
     const { projectUsageLimits } = await import('../usage-pause/limits-view');
-    const { readings } = await queryUsageLimits();
+    const { readings, credentialHealth } = await queryUsageLimits();
     const { attachBudget } = await import('../usage-pause/budget-view');
-    return attachBudget(projectUsageLimits(readings, await queryUsagePause()), queryTokenBudget);
+    return attachBudget(projectUsageLimits(readings, await queryUsagePause(), Date.now(), credentialHealth), queryTokenBudget);
   };
 }
 
@@ -2341,7 +2502,7 @@ export const tokenStatsTool: McpTool = {
       scope: { type: 'string', enum: ['tokens', 'tools'] },
       task: { type: 'string' },
       subtree: { type: 'boolean' },
-      group_by: { type: 'string', enum: ['task', 'model', 'role'] },
+      group_by: { type: 'string', enum: ['task', 'model', 'role', 'endpoint'] },
       since: { type: 'string', description: 'Window such as 30m, 2h, or 1d' },
       top: { type: 'number' },
       task_type: { type: 'string' },
@@ -2357,7 +2518,7 @@ export function createTokenStatsHandler(ctx: McpToolContext): McpToolHandler {
     const scope = args.scope === undefined ? undefined : String(args.scope);
     if (scope !== undefined && scope !== 'tokens' && scope !== 'tools') throw new Error("scope must be 'tokens' or 'tools'");
     const groupBy = args.group_by === undefined ? undefined : String(args.group_by);
-    if (groupBy !== undefined && !['task', 'model', 'role'].includes(groupBy)) throw new Error("group_by must be 'task', 'model', or 'role'");
+    if (groupBy !== undefined && !['task', 'model', 'role', 'endpoint'].includes(groupBy)) throw new Error("group_by must be 'task', 'model', 'role', or 'endpoint'");
     const top = args.top === undefined ? undefined : Number(args.top);
     const minTasks = args.min_tasks === undefined ? undefined : Number(args.min_tasks);
     if (top !== undefined && (!Number.isInteger(top) || top < 1)) throw new Error('top must be a positive integer');
@@ -2393,7 +2554,7 @@ export function createTokenStatsHandler(ctx: McpToolContext): McpToolHandler {
       scope: scope as 'tokens' | 'tools' | undefined,
       task: await resolve(args.task),
       subtree: args.subtree === true,
-      groupBy: groupBy as 'task' | 'model' | 'role' | undefined,
+      groupBy: groupBy as 'task' | 'model' | 'role' | 'endpoint' | undefined,
       sinceMs,
       top,
       taskType,
@@ -2540,6 +2701,8 @@ export function createMessagesHandler(ctx: McpToolContext): McpToolHandler {
             created_at: new Date(m.created_at).toISOString(),
             read: Boolean(m.read_at),
             ...(m.dismissed_at ? { dismissed: true } : {}),
+            ...(m.repeat_count && m.repeat_count > 1 ? { repeat_count: m.repeat_count } : {}),
+            ...(m.last_seen_at ? { last_seen_at: new Date(m.last_seen_at).toISOString() } : {}),
           })),
         };
       }
@@ -2793,12 +2956,17 @@ export function createFollowupPromoteHandler(ctx: McpToolContext): McpToolHandle
         }
       }
 
-      const result = await storage.promoteRaisedItem(resolved.task.id, itemId, {
+      // The daemon's `reviewPromoteRaised` (the browser's promote act), not a
+      // storage call, so a bound clone is authorized as the browser is.
+      const { queryReviewPromoteRaised } = await import('../daemon/rpc-fallback');
+      const result = await queryReviewPromoteRaised({
+        taskId: resolved.task.id,
+        itemId,
         goal: args.goal as string | undefined,
         prompt: args.prompt as string | undefined,
         code: args.code as string | undefined,
         parent: args.parent as string | undefined,
-        relation: args.relation as 'peer' | 'subtask' | undefined,
+        relation: (args.relation as 'peer' | 'subtask' | undefined) ?? 'peer',
         actor: mcpActor(ctx),
       });
 
@@ -4253,6 +4421,24 @@ export function createCommitHandler(ctx: McpToolContext): McpToolHandler {
       }
     }
 
+    // A per-task secret file lazy delivered (src/daemon/task-files.ts) is
+    // excluded from `git add`, but an explicit path or `git add -f` stages it
+    // anyway. Never commit it: unstage it and refuse, loudly. Any change at a
+    // path ever delivered to this task counts, edited or deselected — and the
+    // guard comes from the daemon's registry alone, never the agent-writable
+    // manifest.
+    const delivered = await deliveredGuardFor(ctx.projectRoot ?? wt?.projectRoot ?? resolveLazyRoot(), { taskId: ctx.taskId, ref: basename(cwd) });
+    const stagedSecrets = await findDeliveredFilesStaged(cwd, delivered.entries, delivered.paths);
+    if (stagedSecrets.length > 0) {
+      const reset = await runGit(['reset', '-q', '--', ...stagedSecrets.map(p => `:(literal)${p}`)], { cwd });
+      throw new Error(
+        deliveredFilesRefusal('lazy_commit', stagedSecrets) +
+        (reset.exitCode === 0
+          ? 'They were unstaged; nothing was committed. Commit again without them.'
+          : `Unstaging them failed (${reset.stderr}); nothing was committed — unstage them before committing again.`),
+      );
+    }
+
     // Check if there's anything to commit
     const statusResult = await runGit(['diff', '--no-color', '--cached', '--stat'], { cwd });
     const diffStat = statusResult.stdout;
@@ -4318,6 +4504,7 @@ export const statusTool: McpTool = {
     'git status (branch, uncommitted changes, recent commits), session info, and ' +
     'dashboard_url (the web dashboard base URL, or null when the dashboard is off), and ' +
     'agent_profiles (the offered `agent` profiles, each with when to use it). ' +
+    'A tiered builder also gets builder_tier (tier in use, last switch). ' +
     'Use this to understand the current state before making decisions.',
   inputSchema: {
     type: 'object',
@@ -4412,7 +4599,26 @@ export function createStatusHandler(ctx: McpToolContext): McpToolHandler {
         agent_profiles_error = err instanceof Error ? err.message : String(err);
       }
 
+      // The BUILDER (no task) on a tiered profile: which tier is answering and
+      // when it last switched, so a conversation that fell to a weaker model
+      // knows it. Absent for a task or an ordinary builder profile.
+      let builder_tier: string | null = null;
+      if (!task) {
+        try {
+          if (ctx.projectRoot) {
+            const { builderTierView, builderTierLine } = await import('../daemon/builder-tier');
+            builder_tier = builderTierLine(await builderTierView(ctx.projectRoot, await loadConfig(ctx.projectRoot), { label: ctx.builderTokenLabel }));
+          } else {
+            const { queryBuilderTierLine } = await import('../daemon/rpc-fallback');
+            builder_tier = await queryBuilderTierLine();
+          }
+        } catch (err) {
+          builder_tier = `cannot read the builder's tier: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      }
+
       return {
+        ...(builder_tier ? { builder_tier } : {}),
         task: task ? {
           id: shortId(task.id),
           code: task.code ?? null,
@@ -4674,9 +4880,12 @@ export function createConversationAskHandler(ctx: McpToolContext): McpToolHandle
     // [usage_pause]: one tool call is one command of several model calls,
     // judged once — as the channel asking, so an agent never spends a
     // person's one-shot override.
-    const { admitOneshotCommand } = await import('../oneshot');
+    const { admitOneshotCommand, runAsOneshotPayer } = await import('../oneshot');
     const oneshotCommand = await admitOneshotCommand({ actor: mcpRole(ctx) });
-    const result = await oneshotCommand.run(() => askConversation(conversation, question, {}));
+    // Paid by the person this caller acts for (a task turn's owner, a builder's
+    // member), else the project's service holder — never the daemon's own.
+    const result = await runAsOneshotPayer(ctx.actorPerson?.email ?? null, () =>
+      oneshotCommand.run(() => askConversation(conversation, question, {})));
 
     return {
       session_id: result.sessionId,
@@ -4806,39 +5015,81 @@ async function getDiffStat(
 // --- lazy_start ---
 
 /**
- * `past_usage_pause` on lazy_start / unblock / resume / review / ask: let THIS
- * task's next turn through the usage pause. The builder's, on the engineer's
- * behalf; never a task agent's — refused here at the door, and again by the
- * daemon, which owns the rule (src/daemon/usage-pause.ts, "The per-task
- * allowance").
+ * `override_usage_pause` on lazy_start / unblock / resume / review / ask: let THIS
+ * task's next turn through the usage pause (same name as the CLI flag). The
+ * builder's, on the engineer's behalf; never a task agent's — refused here at
+ * the door, and again by the daemon, which owns the rule
+ * (src/daemon/usage-pause.ts, "The per-task allowance"). `past_usage_pause` is
+ * the previous spelling, accepted as a deprecated alias for one release.
  */
+/**
+ * The confirmation for launching on lazy's DEFAULT runner image while the
+ * project's own image is still building or failed (src/daemon/runner-image.ts).
+ * The same two-step shape as every MCP confirmation: the first call is refused
+ * with a code, repeating it with the code confirms. Nothing is launched until
+ * then, and a call that needs no confirmation ignores the argument.
+ */
+const DEFAULT_IMAGE_CONFIRMATION_ARG = {
+  confirmation_code: {
+    type: 'string',
+    description: 'Code from a runner-image refusal.',
+  },
+} as const;
+
+export async function confirmDefaultImageForMcp(
+  args: Record<string, unknown>,
+  taskId: string,
+  tool: string,
+  /** The daemon's answer; injectable so the two-step protocol is testable on its own. */
+  ask: typeof queryRunnerImage = queryRunnerImage,
+): Promise<{ useDefaultImage?: true }> {
+  const answer = await ask({ taskId });
+  if (!answer?.task?.needsConfirmation) return {};
+  const code = args.confirmation_code as string | undefined;
+  if (code && validateCode(code, 'default-image', taskId)) return { useDefaultImage: true };
+  const fresh = generateCode('di');
+  storePending({ code: fresh, operation: 'default-image', taskId, createdAt: Date.now() });
+  throw new Error(
+    `${answer.description}\n\nNothing was launched. To run it now on lazy's default runner image ` +
+    `(${answer.project.defaultImage ?? 'lazy-runner'}) instead — it stays there until someone switches it back — ` +
+    `call ${tool} again with the same arguments plus confirmation_code: "${fresh}". Otherwise retry once the image is ready.`,
+  );
+}
+
 const PAST_USAGE_PAUSE_ARG = {
-  past_usage_pause: {
+  override_usage_pause: {
     type: 'boolean',
     description: 'Only when the human asks: let this turn start past the usage pause.',
+  },
+  past_usage_pause: {
+    type: 'boolean',
+    description: 'Deprecated alias of override_usage_pause.',
   },
 } as const;
 
 export function parsePastUsagePauseArg(ctx: McpToolContext, args: Record<string, unknown>): { usagePausePastOnce?: true } {
-  const v = args.past_usage_pause;
-  if (v === undefined || v === false) return {};
-  if (v !== true) throw new Error(`Invalid past_usage_pause: expected true or false.`);
-  if (ctx.taskId) {
-    throw new Error(
-      'past_usage_pause refused: only a person or the builder may let a task past the usage pause, ' +
-        'never a task agent. Wait for the window to reset.',
-    );
+  let allowed = false;
+  for (const name of ['override_usage_pause', 'past_usage_pause']) {
+    const v = args[name];
+    if (v === undefined || v === false) continue;
+    if (v !== true) throw new Error(`Invalid ${name}: expected true or false.`);
+    if (ctx.taskId) {
+      throw new Error(
+        `${name} refused: only a person or the builder may let a task past the usage pause, ` +
+          'never a task agent. Wait for the window to reset.',
+      );
+    }
+    allowed = true;
   }
-  return { usagePausePastOnce: true };
+  return allowed ? { usagePausePastOnce: true } : {};
 }
 
 export const startTool: McpTool = {
   name: 'lazy_start',
   description:
-    'Start working on an existing task. Creates a worktree, git branch, and ' +
-    'launches a supervisor to run the agent. To create a new task, use lazy_create first. ' +
-    'When called by an agent, you may only start your OWN subtasks (tasks whose ' +
-    'parent is your current task); starting any other task is not permitted.',
+    'Start working on an existing task: creates a worktree and git branch and ' +
+    'launches the agent. To create a new task, use lazy_create first. ' +
+    'An agent may only start its OWN subtasks (tasks whose parent is its current task).',
   inputSchema: {
     type: 'object',
     properties: {
@@ -4870,6 +5121,7 @@ export const startTool: McpTool = {
       },
       ...REVIEW_TOOL_ARGS,
       ...PAST_USAGE_PAUSE_ARG,
+      ...DEFAULT_IMAGE_CONFIRMATION_ARG,
       force_local: {
         type: 'boolean',
         description:
@@ -4955,7 +5207,7 @@ export function createStartHandler(ctx: McpToolContext): McpToolHandler {
     // launchTask() throws "Daemon storage not initialized". queryStartTask works
     // in both contexts: it forwards to the daemon via RPC when not in-daemon,
     // and falls back to the direct handler under LAZY_IS_DAEMON=1 / LAZY_TEST=1.
-    const result = await queryStartTask(params);
+    const result = await queryStartTask({ ...params, ...(await confirmDefaultImageForMcp(args, taskId, 'lazy_start')) });
 
     // [usage_pause]: an agent's start of its subtask on a paused credential is
     // HELD, not refused — nothing was launched, and it starts by itself after
@@ -5033,6 +5285,7 @@ export const unblockTool: McpTool = {
           'both work on any item.',
       },
       ...PAST_USAGE_PAUSE_ARG,
+      ...DEFAULT_IMAGE_CONFIRMATION_ARG,
     },
     required: ['task_id', 'feedback'],
   },
@@ -5094,7 +5347,7 @@ export function createUnblockHandler(ctx: McpToolContext): McpToolHandler {
       actor: mcpActor(ctx),
     };
 
-    const result = await queryUnblockTask(params);
+    const result = await queryUnblockTask({ ...params, ...(await confirmDefaultImageForMcp(args, taskId, 'lazy_unblock')) });
 
     // INVARIANT (reverting committed work is never silent —
     // fix-ask-nukes-violations): the daemon reports every reverted and approved
@@ -5512,7 +5765,8 @@ export function createAcceptHandler(ctx: McpToolContext): McpToolHandler {
                 'and attach it to the merge (task comment, and the approving PR/MR review on ' +
                 'forge drivers). Calling lazy_accept again with an updated reason replaces it.';
             }
-            throw new Error(renderGuidance('accept-gated', {
+            // Lazy Teams has its own route (a member's browser Accept).
+            throw new Error(renderGuidance(isManagedMode() ? 'accept-gated-teams' : 'accept-gated', {
               task_code: task.code ?? shortId(task.id),
               task_id: task.id,
               source_branch: gateSession.git_branch,
@@ -5990,12 +6244,9 @@ export const resumeTool: McpTool = {
   name: 'lazy_resume',
   description:
     'Resume a blocked or interrupted task WITHOUT new feedback — the agent is ' +
-    'relaunched with its existing prompt and context, and the turn is recorded ' +
-    'as "[Resumed after interruption]". ' +
-    'Use lazy_unblock instead whenever you actually have guidance to give: its ' +
-    '"feedback" is required and must be non-empty (the CLI rejects empty ' +
-    'feedback too), so lazy_unblock cannot express a no-feedback resume — this ' +
-    'tool is the only call that does.',
+    'relaunched with its existing prompt and context, recorded as ' +
+    '"[Resumed after interruption]". Have guidance? Use lazy_unblock, whose ' +
+    'feedback must be non-empty — so only this tool resumes without any.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -6010,6 +6261,7 @@ export const resumeTool: McpTool = {
 
       },
       ...PAST_USAGE_PAUSE_ARG,
+      ...DEFAULT_IMAGE_CONFIRMATION_ARG,
     },
     required: ['task_id'],
   },
@@ -6040,7 +6292,7 @@ export function createResumeHandler(ctx: McpToolContext): McpToolHandler {
       actor: mcpActor(ctx), // MCP boundary → 'builder' (project-wide) or 'agent' (task-scoped)
     };
 
-    const result = await queryUnblockTask(params);
+    const result = await queryUnblockTask({ ...params, ...(await confirmDefaultImageForMcp(args, taskId, 'lazy_resume')) });
 
     // Same never-silent rule as lazy_unblock: surface whatever the daemon warned about.
     const resumeWarnings = result.warnings ?? [];
@@ -6109,6 +6361,20 @@ async function deriveTaskSubstateLabel(
  * down whenever any task was working. The label is best-effort by design, so
  * a bound clone lists without it.
  */
+/**
+ * The failure a PARKED task's last turn ended in, or null. Reads the session
+ * only for a status that can show one, and never fails the listing it decorates.
+ */
+async function turnFailureOf(storage: Storage, task: Task): Promise<TaskTurnFailure | null> {
+  if (!statusCanShowFailure(task.status)) return null;
+  try {
+    return taskTurnFailure(task, await storage.getSessionByTaskId(task.id));
+  } catch (err) {
+    logger.debug(`lazy MCP: could not read the failure label for ${shortId(task.id)}: ${err instanceof Error ? err.message : err}`);
+    return null;
+  }
+}
+
 async function withSubstate<T extends { id: string; status: string }>(
   ctx: McpToolContext,
   storage: Storage,
@@ -6120,9 +6386,16 @@ async function withSubstate<T extends { id: string; status: string }>(
   const runner = lazyRoot ? await createRunner(lazyRoot) : null;
 
   return Promise.all(
-    tasks.map(async t =>
-      shape(t, lazyRoot && runner ? await deriveTaskSubstateLabel(storage, lazyRoot, runner, t) : null),
-    ),
+    tasks.map(async t => {
+      if (t.status !== 'working') {
+        // A parked task whose last turn FAILED says so here too — read off the
+        // session (src/task/turn-failure.ts), so it needs no runner and works
+        // in a bound clone.
+        const failure = await turnFailureOf(storage, t);
+        return shape(t, failure ? turnFailureLabel(failure) : null);
+      }
+      return shape(t, lazyRoot && runner ? await deriveTaskSubstateLabel(storage, lazyRoot, runner, t) : null);
+    }),
   );
 }
 
@@ -6297,12 +6570,18 @@ export function createBlockedHandler(ctx: McpToolContext): McpToolHandler {
 
       return {
         count: tasks.length,
-        tasks: tasks.map(t => ({
-          id: shortId(t.id),
-          code: t.code ?? null,
-          goal: t.goal,
-          agent: t.agent_id,
-          model: t.model ?? null,
+        tasks: await Promise.all(tasks.map(async t => {
+          // A blocked task whose last turn FAILED is not ready for review:
+          // say so (src/task/turn-failure.ts).
+          const failure = await turnFailureOf(storage, t);
+          return {
+            id: shortId(t.id),
+            code: t.code ?? null,
+            goal: t.goal,
+            agent: t.agent_id,
+            model: t.model ?? null,
+            ...(failure ? { turn_failure: { label: turnFailureLabel(failure), class: failure.class, reason: failure.reason, remedy: failure.remedy } } : {}),
+          };
         })),
       };
     } finally {
@@ -6679,9 +6958,9 @@ export const waitTool: McpTool = {
     'slow task while a faster one is already ready for review. The other tasks ' +
     'keep running; wait on them again afterwards. Returns head_sha (accept-tag ' +
     'commit when the task is complete, otherwise the task branch tip) so you can ' +
-    'match a later "[Subtask accepted]" note on a parent. Works on any task EXCEPT ' +
-    'your own — waiting on yourself can only time out, since your turn is what ' +
-    'would have to end for the wait to return.',
+    'match a later "[Subtask accepted]" note on a parent. Not your own task. ' +
+    'A subtask or comment added to YOUR task returns early with `interrupted` ' +
+    '(comment: .notes).',
   inputSchema: {
     type: 'object',
     properties: {
@@ -6722,7 +7001,8 @@ export function createWaitHandler(ctx: McpToolContext): McpToolHandler {
     // every other tool classified 'read' in tool-access.ts. It is the one
     // read that also BLOCKS the caller's turn, which is the argument for
     // keeping it gated — but the blocking is bounded (600s cap), changes no
-    // state, and costs only the caller's own turn. Weighed against the cost of
+    // task state of the peers it waits on (it may claim comments queued on the
+    // CALLER's own task, see below), and costs only the caller's own turn. Weighed against the cost of
     // one arbitrary-looking exception to "reads are open", consistency wins:
     // an agent that can see a peer task's status can also wait for it to
     // settle. Writes remain gated. Do not re-add a gate here.
@@ -6732,11 +7012,26 @@ export function createWaitHandler(ctx: McpToolContext): McpToolHandler {
     // return. Engineer decision 2026-08-07 — see assertAgentNotWaitingOnSelf.
     await assertAgentNotWaitingOnSelf(ctx, taskIdInputs);
 
+    // A task agent is told when a subtask is added under it mid-wait; the id
+    // comes from the authenticated context, never from a tool argument.
+    const interrupt = ctx.taskId ? { interruptOnNewChildOf: ctx.taskId } : {};
     const result = await queryWait(
       taskIdInputs.length === 1
-        ? { taskId: taskIdInputs[0], timeout: timeoutSecs }
-        : { taskIds: taskIdInputs, timeout: timeoutSecs },
+        ? { taskId: taskIdInputs[0], timeout: timeoutSecs, ...interrupt }
+        : { taskIds: taskIdInputs, timeout: timeoutSecs, ...interrupt },
     );
+
+    // Comments the wait handed over count as delivered only AFTER the answer
+    // was written to a still-connected caller (ctx.afterDelivery). The daemon
+    // never cancels a wait whose client left, so acking here would let an
+    // orphaned wait mark a human's comment delivered and discard it. Without a
+    // delivery signal (no heartbeat framing) nothing is acked: the batch stays
+    // claimed and the next claim re-issues it, uncounted — at-least-once.
+    const { claim, ...interrupted } = result.interrupted ?? ({} as NonNullable<typeof result.interrupted>);
+    if (claim && ctx.taskId && ctx.afterDelivery) {
+      const taskId = ctx.taskId;
+      ctx.afterDelivery(() => ackWaitComments({ taskId, through: claim.through, claim_id: claim.claim_id }));
+    }
 
     const shorten = (t: { task_id: string; display_id: string; code: string | null; status: string; held_by_usage_pause?: true }) => ({
       task_id: shortId(t.task_id),
@@ -6759,6 +7054,8 @@ export function createWaitHandler(ctx: McpToolContext): McpToolHandler {
       display_id: result.display_id,
       status: result.status,
       timed_out: result.timed_out,
+      // Not a settle and not a timeout: say WHY the wait returned early.
+      ...(result.interrupted ? { interrupted } : {}),
       ...(mergeState ? { merge_state: mergeState } : {}),
       // Same tip SHA the parent `[Subtask accepted]` comment carries after
       // accept (accept-tag when complete) — agents de-dupe wait vs note by it.
@@ -6778,12 +7075,11 @@ export const editTool: McpTool = {
   name: 'lazy_edit',
   description:
     'Edit a task\'s goal, prompt, model, effort, review mode, type, code, parent, or agent. ' +
-    'Goal/prompt/type/code/parent edits only work on tasks that have not been ' +
-    'started by an agent (no turns); model, effort, review and agent edits are also ' +
-    'allowed on started tasks. When switching agents mid-task, the session is ' +
-    'reset (cannot resume across agents), model and effort are re-resolved for ' +
-    'the new agent unless this call also supplies model/effort, and the task\'s ' +
-    'conversation history is preserved.',
+    'Goal/prompt/type/parent only before an agent has started (no turns). ' +
+    'Model, effort, review, agent, and a code-only rename (branch, worktree and PR ' +
+    'keep their old names) also work on started tasks. Switching agents mid-task ' +
+    'resets the session (no resume across agents), re-resolves model/effort unless ' +
+    'this call supplies them, and keeps the conversation history.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -6931,6 +7227,19 @@ export function createEditHandler(ctx: McpToolContext): McpToolHandler {
           || hasReviewOverrides(reviewOverrides))
         && goal === undefined && prompt === undefined
         && type === undefined && code === undefined && parent === undefined;
+      // A code change on its own on a started task is a cosmetic rename; the
+      // daemon's editTask owns its rules (collision, never cleared, on its own).
+      const onlyCode = code !== undefined && goal === undefined && prompt === undefined
+        && model === undefined && effort === undefined && type === undefined
+        && parent === undefined && agent === undefined && !hasReviewOverrides(reviewOverrides);
+      if (turnCount > 0 && onlyCode) {
+        const result = await editTask(storage, resolveLazyRoot(), { taskId: task.id, code, actor: mcpActor(ctx) });
+        return {
+          task_id: shortId(task.id),
+          changes: result.changes,
+          ...(result.announcements?.length ? { announcements: result.announcements } : {}),
+        };
+      }
       if (turnCount > 0 && !isMidFlightSafeEdit) {
         throw new Error('Cannot edit task after agent has started working (has turns); only model, effort and review mode can be changed on a started task (agent too, but only on its own — not combined with a goal/prompt/type/code/parent edit)');
       }
@@ -7181,6 +7490,40 @@ export function createCloneHandler(ctx: McpToolContext): McpToolHandler {
         explicit: agent,
         inheritFrom: parent,
       }, agentConfig, projectSettings).agentId;
+
+      // A clone bound to Lazy Teams creates in ONE daemon call (Teams authorizes
+      // each storage write alone, so create-then-update could strand a task).
+      // That create inherits a parent's image pin, which a variant must not, so
+      // a pinned parent is refused here rather than silently re-pinned.
+      if (ctx.boundToTeams) {
+        if (droppedCustomImagePinWarning(parent)) {
+          refuseInBoundClone(
+            ctx,
+            'lazy_clone of a task pinned to a custom image',
+            'Create the variant with lazy_create instead, or from a server-side builder session (`lazy builder`).',
+          );
+        }
+        const inheritModel = !model && parent.model && (agent === undefined || agent === parent.agent_id);
+        const created = await queryCreateTask({
+          goal,
+          prompt: promptOverride ?? currentPromptOf(parent) ?? undefined,
+          code,
+          parent: parent.id,
+          model: model || (inheritModel ? parent.model ?? undefined : undefined),
+          agent: agent,
+          deriveCode: false,
+          actor: mcpActor(ctx),
+        });
+        const made = await storage.getTask(created.taskId);
+        return {
+          id: shortId(created.taskId),
+          parent_id: shortId(parent.id),
+          goal: made?.goal ?? goal,
+          code: made?.code ?? null,
+          status: made?.status ?? 'backlog',
+          message: 'Variant created. Call lazy_start to begin work.',
+        };
+      }
       const child = await storage.createTask(goal, parent.id, undefined, code, undefined, childAgentId, mcpActor(ctx)); // channel actor on the initial backlog entry: 'builder' or 'agent'
 
       // Set prompt (inherit from parent or use override)
@@ -7386,15 +7729,6 @@ export function createRedoHandler(ctx: McpToolContext): McpToolHandler {
       );
     }
 
-    // A redo is several writes; Teams relays the replacement's creation and
-    // refuses closing the original, so it would stop with both open.
-    refuseInBoundClone(
-      ctx,
-      'lazy_redo',
-      'Redo it from the Teams web UI, which runs the whole redo on the server as one act, or from a ' +
-      'server-side builder session (`lazy builder`).',
-    );
-
     const taskIdInput = args.task_id as string;
     const promptOverride = args.prompt as string | undefined;
     const model = args.model as string | undefined;
@@ -7419,63 +7753,49 @@ export function createRedoHandler(ctx: McpToolContext): McpToolHandler {
           throw new Error('Invalid or expired confirmation code. Call lazy_redo without a code to get a new one.');
         }
 
-        // Generate a redo code using the old task's code (or fall back to task ID)
-        const baseCode = oldTask.code ?? shortId(oldTask.id);
-        const redoCode = await generateRedoCode(baseCode, storage);
+        // The redo itself is the DAEMON's `redoTask` — the same act the
+        // browser's redo button performs, so a bound clone is authorized as the
+        // browser is. It creates the replacement under the same parent with the
+        // previous attempt's context, closes the old task and cleans up.
+        const { queryRedoTask } = await import('../daemon/rpc-fallback');
+        const latestPrompt = currentPromptOf(oldTask) ?? '';
+        const redone = await queryRedoTask({
+          taskId: oldTask.id,
+          reason: 'Started over with lazy_redo',
+          actor: mcpActor(ctx),
+        });
 
-        // Get old prompt
-        let prompt = promptOverride;
-        if (!prompt) {
-          prompt = currentPromptOf(oldTask) ?? undefined;
+        // Overrides land on the backlog replacement (edit-task writes, which a
+        // bound clone's member may make anyway).
+        const warnings: string[] = [];
+        if (redone.imagePinWarning) warnings.push(redone.imagePinWarning);
+        if (promptOverride) {
+          try {
+            const created = await storage.getTask(redone.taskId);
+            const seeded = (created ? currentPromptOf(created) : null) ?? '';
+            const context = seeded.startsWith(latestPrompt) ? seeded.slice(latestPrompt.length) : '';
+            await storage.updateTaskPrompt(redone.taskId, promptOverride + context);
+          } catch (err) {
+            warnings.push(`The prompt override did not land (${err instanceof Error ? err.message : String(err)}); set it with lazy_edit before lazy_start.`);
+          }
         }
-
-        // Create new task. A redo is a second attempt at the SAME work, so it
-        // carries the original's agent over rather than the project default.
-        const [agentConfig, projectSettings] = await Promise.all([
-          loadConfig(resolveLazyRoot()).then(c => c.agent),
-          storage.getProjectSettings(),
-        ]);
-        const newTask = await storage.createTask(
-          oldTask.goal,
-          parentTaskIdOf(oldTask) ?? undefined,
-          undefined,
-          redoCode || undefined,
-          undefined,
-          resolveAgentForNewTaskFromConfig(
-            { inheritFrom: oldTask },
-            agentConfig,
-            projectSettings,
-          ).agentId,
-          // channel actor on the initial backlog entry: 'builder' or 'agent'
-          mcpActor(ctx),
-        );
-
-        if (prompt) {
-          await storage.updateTaskPrompt(newTask.id, prompt);
+        if (model) {
+          try {
+            await storage.updateTaskModel(redone.taskId, model);
+          } catch (err) {
+            warnings.push(`The model override did not land (${err instanceof Error ? err.message : String(err)}); set it with lazy_edit before lazy_start.`);
+          }
         }
-
-        const taskModel = model ?? oldTask.model;
-        if (taskModel) {
-          await storage.updateTaskModel(newTask.id, taskModel);
-        }
-
-        // Link new task to old via metadata
-        await storage.updateTaskMetadata(newTask.id, 'redo_of', shortId(oldTask.id));
-
-        // INVARIANT: redo is a fresh start — do NOT inherit the old image pin.
-        const imagePinWarning = droppedCustomImagePinWarning(oldTask);
-
-        // Abandon the old task
-        await storage.abandonTask(oldTask.id, `Redone as ${shortId(newTask.id)}`, mcpRole(ctx));
+        const newTask = await storage.getTask(redone.taskId);
 
         return {
           old_task_id: shortId(oldTask.id),
-          new_task_id: shortId(newTask.id),
-          new_task_code: newTask.code ?? null,
-          goal: newTask.goal,
-          status: newTask.status,
+          new_task_id: shortId(redone.taskId),
+          new_task_code: newTask?.code ?? null,
+          goal: newTask?.goal ?? oldTask.goal,
+          status: newTask?.status ?? 'backlog',
           message: 'New task created. Call lazy_start to begin work.',
-          ...(imagePinWarning ? { warnings: [imagePinWarning] } : {}),
+          ...(warnings.length > 0 ? { warnings } : {}),
         };
       }
 
@@ -7515,11 +7835,10 @@ export const syncTool: McpTool = {
     'A task that is not yours must be blocked, conflict, or interrupted (not working).\n\n' +
     'Calling it on YOUR OWN task is different, and always allowed: the merges run ' +
     'immediately, in your worktree, while you wait inside this call. It is ' +
-    'idempotent — it merges everything outstanding and stops at the first ' +
-    'conflict, returning which step conflicted and the conflicted files. Resolve ' +
-    'them, conclude the merge with lazy_commit, then call lazy_sync again; the ' +
-    'step you finished is skipped and the rest continues. Repeat until it reports ' +
-    'nothing left to merge.\n\n' +
+    'idempotent: it merges everything outstanding and stops at the first ' +
+    'conflict, naming the step and files. Resolve them, conclude with ' +
+    'lazy_commit, then call lazy_sync again; finished steps are skipped. ' +
+    'Repeat until nothing is left to merge.\n\n' +
     'If you are a CLUSTER task, do this before you start a new wave of children, ' +
     'so each one branches from a current base instead of whatever your parent ' +
     'was when you began. Not after every accept: it costs a merge for every ' +
@@ -7532,6 +7851,7 @@ export const syncTool: McpTool = {
         description: 'Task ID (short hex prefix or task code)',
         minLength: 1,
       },
+      ...DEFAULT_IMAGE_CONFIRMATION_ARG,
     },
     required: ['task_id'],
   },
@@ -7555,7 +7875,21 @@ export function createSyncHandler(ctx: McpToolContext): McpToolHandler {
       ...(ctx.taskId && resolvedId === ctx.taskId ? { callerTaskId: ctx.taskId } : {}),
     };
 
-    const result = await querySyncTask(params);
+    // A conflicting merge runs the task's agent: while the project's runner
+    // image is not ready that needs the usual two-step confirmation to run on
+    // lazy's default image. The daemon says when it does; the code confirms.
+    const code = args.confirmation_code as string | undefined;
+    const confirmed = !!code && validateCode(code, 'default-image-sync', taskId);
+    let result;
+    try {
+      result = await querySyncTask({ ...params, ...(confirmed ? { useDefaultImage: true } : {}) });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (confirmed || !message.includes("the project's runner image is not ready")) throw err;
+      const fresh = generateCode('dis');
+      storePending({ code: fresh, operation: 'default-image-sync', taskId, createdAt: Date.now() });
+      throw new Error(`${message}\n\nTo resolve it now on lazy's default runner image, call lazy_sync again with confirmation_code: "${fresh}". Otherwise retry once the image is ready.`);
+    }
 
     return {
       output: result.message,
@@ -7737,6 +8071,7 @@ export const allTools: McpTool[] = [
   journalTool,
   memorySaveTool,
   memoryRecallTool,
+  recipeTool,
   scratchTool,
   messagePostTool,
   messagesTool,
@@ -7801,9 +8136,9 @@ const ANNOTATED_TEXT_ARGS = new Set([
  * INTAKE BOUNDARY for every MCP tool call.
  *
  * MCP travels as JSON, and a JSON `\u0000` escape decodes to a real NUL. Any NUL that
- * reaches a prompt ends up as argv[2] of `claude -p`, where it kills the spawn
- * instantly — crash-looping the turn and (because auto-resume restarts with a
- * generic prompt) silently losing the feedback. Escape at the door instead.
+ * reached argv used to kill the spawn instantly — crash-looping the turn and
+ * silently losing the feedback. Prompts now ride stdin (src/agent/argv-safety.ts);
+ * escaping at the door stays as defence in depth.
  *
  * Sanitize-and-deliver, never reject: rejecting here would throw away a
  * builder's feedback at the moment it was written. See
@@ -7860,7 +8195,10 @@ export function createAllHandlers(ctx: McpToolContext): Map<string, McpToolHandl
     },
   };
   handlers.set('lazy_search', createSearchHandler(ctx));
-  handlers.set('lazy_show', createShowHandler(ctx));
+  // Deep-redacted like the show RPC (handleShow): a registered secret in a goal,
+  // prompt or a record written before it was registered never reaches a reader.
+  const showHandler = createShowHandler(ctx);
+  handlers.set('lazy_show', async (args, callCtx) => redactSecretValuesDeep(await showHandler(args, callCtx)));
   handlers.set('lazy_create', createCreateHandler(ctx));
   handlers.set('lazy_comment', createCommentHandler(ctx));
   handlers.set('lazy_tag', createTagHandler(ctx));
@@ -7868,6 +8206,8 @@ export function createAllHandlers(ctx: McpToolContext): Map<string, McpToolHandl
   handlers.set('lazy_journal', createJournalHandler(ctx));
   handlers.set('lazy_memory_save', createMemorySaveHandler(ctx));
   handlers.set('lazy_memory_recall', createMemoryRecallHandler(ctx));
+  handlers.set('lazy_recipe', createRecipeHandler());
+  handlers.set('lazy_image_build', createImageBuildHandler(ctx));
   handlers.set('lazy_scratch', createScratchHandler(ctx));
   handlers.set('lazy_message_post', createMessagePostHandler(ctx));
   handlers.set('lazy_messages', createMessagesHandler(ctx));

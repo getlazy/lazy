@@ -15,7 +15,7 @@
 import { readFile, readdir, stat } from 'fs/promises';
 import { join, basename } from 'path';
 import { getHome } from '../utils/home';
-import { isLocalCommandScaffolding } from './local-command-messages';
+import { isConversationNoise } from './local-command-messages';
 import type { TokenUsage } from '../types';
 import { LineageCollector, type SegmentLineage } from '../builder/identity';
 
@@ -324,7 +324,7 @@ function parseLogEntry(line: string): { entry: RawLogEntry; message: Conversatio
   // has no messages at all and every ingest path's empty-shell guard drops it.
   // Only user entries: those wrappers are something the harness writes into the
   // user turn, so an assistant message reproducing one is the agent talking.
-  if (entry.type === 'user' && isLocalCommandScaffolding(text)) {
+  if (entry.type === 'user' && isConversationNoise(text)) {
     return { entry, message: null };
   }
 

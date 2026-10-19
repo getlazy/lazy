@@ -79,7 +79,7 @@ describe('tracked source is text', () => {
     const files = textFiles();
     expect(files.length).toBeGreaterThan(500);
     expect(files).toContain('src/protection/outstanding-resolver.ts');
-    expect(files).toContain('CLAUDE.md');
+    expect(files).toContain('AGENTS.md');
   });
 
   // INVARIANT: no NUL byte in a tracked source file. One makes git call the file

@@ -72,7 +72,7 @@ function unwrapRpcMessage(err: unknown): string {
 /**
  * Pre-flight the ask against storage.
  *
- * INVARIANT (CLAUDE.md — never lose human feedback): everything that can fail
+ * INVARIANT (AGENTS.md — never lose human feedback): everything that can fail
  * before the agent runs happens BEFORE the human types their question. These
  * mirror the checks `launchAskTask` performs authoritatively (it is still the
  * gate that matters — the daemon may flip a task to `working` between this
@@ -94,7 +94,7 @@ async function preflight(storage: Storage, task: Task, jsonOutput: boolean): Pro
  * and a readline prompt cannot take embedded LF/CR and offers no way to correct
  * a typo three words back.
  *
- * INVARIANT (CLAUDE.md — never lose human feedback): `openEditor` writes the
+ * INVARIANT (AGENTS.md — never lose human feedback): `openEditor` writes the
  * typed text to a recovery file BEFORE its temp file is cleaned up, so the
  * question survives any later failure. The caller removes that file only once
  * the ask has actually been answered.
@@ -173,6 +173,7 @@ async function askConversationTarget(
   conv: StoredConversation,
   messageValue: string | undefined,
   jsonOutput: boolean,
+  overrideUsagePause: boolean,
 ): Promise<void> {
   const shortSession = conv.sessionId.substring(0, 8);
   // [usage_pause]: the answer is one command of several model calls, admitted
@@ -180,7 +181,7 @@ async function askConversationTarget(
   // the human what they wrote, and a one-shot override carries every call.
   let oneshotCommand: OneshotCommand;
   try {
-    oneshotCommand = await admitOneshotCommand({ actor: await overrideEligibleActor() });
+    oneshotCommand = await admitOneshotCommand({ actor: await overrideEligibleActor(), overrideUsagePause });
   } catch (err) {
     fail(jsonOutput, unwrapRpcMessage(err));
   }
@@ -254,7 +255,7 @@ export async function commandAsk(args: string[]): Promise<void> {
     { name: 'message', aliases: ['m'], takesValue: true },
     { name: 'json', takesValue: false },
     { name: 'no-wait', takesValue: false },
-    { name: 'past-usage-pause', takesValue: false },
+    { name: 'override-usage-pause', takesValue: false },
   ], 'ask');
 
   const jsonOutput = parsed.flags.get('json') === true;
@@ -287,7 +288,7 @@ export async function commandAsk(args: string[]): Promise<void> {
         );
       }
       if (conv) {
-        await askConversationTarget(conv.conversation, messageValue, jsonOutput);
+        await askConversationTarget(conv.conversation, messageValue, jsonOutput, parsed.flags.get('override-usage-pause') === true);
         return;
       }
       fail(jsonOutput, `No task or conversation found matching '${taskId}'`);
@@ -307,7 +308,7 @@ export async function commandAsk(args: string[]): Promise<void> {
     // credential is refused by the daemon ([usage_pause]). The live route spends
     // the task's credential; the record route runs a one-shot on the builder
     // role's, so that is the one peeked at there.
-    const paused = await usagePauseRefusalLines(task.id, 'ask', undefined, { beside: route === 'record', pastUsagePause: parsed.flags.get('past-usage-pause') === true });
+    const paused = await usagePauseRefusalLines(task.id, 'ask', undefined, { beside: route === 'record', pastUsagePause: parsed.flags.get('override-usage-pause') === true });
     if (paused) fail(jsonOutput, paused[0]!, paused.slice(1));
     // Likewise a missing model credential for the profile the answer runs on.
     const noCredential = await turnCredentialRefusal(task.id, { beside: route === 'record' });
@@ -363,7 +364,7 @@ export async function commandAsk(args: string[]): Promise<void> {
     // here", not "do not ask".
     if (noWait) {
       try {
-        const started = await queryAskTask({ taskId: task.id, message: question, ...(await usagePauseOverrideEligibility()), ...(parsed.flags.get('past-usage-pause') === true ? { usagePausePastOnce: true as const } : {}) }, display);
+        const started = await queryAskTask({ taskId: task.id, message: question, ...(await usagePauseOverrideEligibility()), ...(parsed.flags.get('override-usage-pause') === true ? route === 'record' ? { overrideUsagePause: true } : { usagePausePastOnce: true as const } : {}) }, display);
         display?.close();
         if (recoveryPath) removeRecoveryFile(recoveryPath);
         if (jsonOutput) {
@@ -403,7 +404,7 @@ export async function commandAsk(args: string[]): Promise<void> {
 
     let result;
     try {
-      result = await queryAskTaskAwaited({ taskId: task.id, message: question, ...(await usagePauseOverrideEligibility()), ...(parsed.flags.get('past-usage-pause') === true ? { usagePausePastOnce: true as const } : {}) }, display);
+      result = await queryAskTaskAwaited({ taskId: task.id, message: question, ...(await usagePauseOverrideEligibility()), ...(parsed.flags.get('override-usage-pause') === true ? route === 'record' ? { overrideUsagePause: true } : { usagePausePastOnce: true as const } : {}) }, display);
       display?.close();
     } catch (err) {
       const message = unwrapRpcMessage(err);
@@ -456,7 +457,7 @@ export async function commandAsk(args: string[]): Promise<void> {
 }
 
 export function askUsage(): void {
-  console.log(`Usage: lazy ask <id> [-m|--message "..."] [--no-wait] [--json] [--past-usage-pause]
+  console.log(`Usage: lazy ask <id> [-m|--message "..."] [--no-wait] [--json] [--override-usage-pause]
 
 Ask a question and print the answer. Read-only either way — an ask never writes.
 
@@ -499,7 +500,7 @@ Options:
                         Conversation: {type, conversationId, sessionId, answer,
                                        chunks, relevantChunks, usage, warnings}
                         Errors are printed as {"error": "..."} with exit 1.
-  --past-usage-pause    Let this task's ask start even though its credential is past the
+  --override-usage-pause    Let this task's ask start even though its credential is past the
                         usage-pause threshold (used up by that one turn). Asking a
                         finished task or a conversation is not a turn of the task.
 

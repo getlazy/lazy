@@ -53,7 +53,7 @@ describe('agentCredentialProfiles for a member', () => {
   // that a refused start was a lie.
   test('connected and missing agree with the launch rule, per profile', async () => {
     const before = await yours();
-    expect(before.cursor).toEqual({ state: 'missing', want: 'profile', detail: 'no Cursor credential is connected for it' });
+    expect(before.cursor).toEqual({ state: 'missing', want: 'profile', detail: 'no usable Cursor connection exists for endpoint "builtin:cursor"' });
     expect(before['codex-api']).toMatchObject({ state: 'missing', want: 'profile' });
     expect(before['claude-code']).toMatchObject({ state: 'missing', want: 'claude' });
     expect(before.pi).toEqual({ state: 'none-needed' });
@@ -88,7 +88,7 @@ describe('agentCredentialProfiles for a member', () => {
   test('codex-subscription and a keyed Pi profile agree with the launch rule too', async () => {
     await writeFile(
       join(root, 'lazy.toml'),
-      '[credentials]\nbackend = "file"\n\n[agents.pi-cloud]\nharness = "pi"\nmodel = "qwen3"\nendpoint = "https://ollama.com"\n',
+      '[credentials]\nbackend = "file"\n\n[agents.pi-cloud]\nharness = "pi"\nmodel = "qwen3"\nendpoint = "https://ollama.com"\ncredential = "ollama"\n',
     );
     expect((await yours())['pi-cloud']).toMatchObject({ state: 'missing', want: 'profile' });
     expect((await yours())['codex-subscription']).toMatchObject({ state: 'missing', want: 'profile' });

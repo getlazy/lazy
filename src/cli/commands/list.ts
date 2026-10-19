@@ -9,6 +9,7 @@ import { queryTaskList, queryBlockedTasks, queryActiveTasks } from '../../daemon
 import { parentTaskIdOf, collectSubtreeIds, pruneTasksToDepth } from '../../task-target';
 import { normalizeTag } from '../../utils/tags';
 import { renderWorkingStatus } from '../../utils/working-substate';
+import { turnFailureLabel } from '../../task/turn-failure';
 import { describeExpiry } from '../../utils/local-day';
 import {
   protectionMarkers,
@@ -40,39 +41,45 @@ function formatTurnCount(turnCount: number): string {
 /** Fixed width for the AGENT column — fits the longest registered agent id. */
 const TASK_LIST_AGENT_COL_WIDTH = 12;
 
+/** Widths of the columns that grow to fit their widest value. */
+export interface ListColumnWidths { status: number; model: number }
+
+/** Their widths when every value fits (the widths they always had). */
+const MIN_COLUMN_WIDTHS: Readonly<ListColumnWidths> = { status: 12, model: 8 };
+
 /** Bare agent id for listing rows (always shown, including the project default). */
 function taskListAgentLabel(task: Task): string {
   return task.agent_id || '-';
 }
 
 /** Tree-view column headers shared by list, active, blocked, and loop. */
-export function printTaskListTreeHeader(): void {
+export function printTaskListTreeHeader(widths: ListColumnWidths = MIN_COLUMN_WIDTHS): void {
   console.log(
-    `${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ` +
+    `${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(widths.status))} ${theme.header('MODEL'.padEnd(widths.model))} ` +
     `${theme.header('TYPE'.padEnd(10))} ${theme.header('TURNS'.padEnd(8))} ${theme.header('LAST ACTIVE'.padEnd(18))} ` +
     `${theme.header('DURATION'.padEnd(10))} ${theme.header('AGENT'.padEnd(TASK_LIST_AGENT_COL_WIDTH))} ${theme.header('GOAL')}`,
   );
   console.log(theme.separator(
-    `${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(10)} ${'─'.repeat(8)} ` +
+    `${'─'.repeat(20)} ${'─'.repeat(widths.status)} ${'─'.repeat(widths.model)} ${'─'.repeat(10)} ${'─'.repeat(8)} ` +
     `${'─'.repeat(18)} ${'─'.repeat(10)} ${'─'.repeat(TASK_LIST_AGENT_COL_WIDTH)} ${'─'.repeat(30)}`,
   ));
 }
 
 /** Flat-view column headers shared by list, active, and blocked. */
-function printTaskListFlatHeader(): void {
+function printTaskListFlatHeader(widths: ListColumnWidths = MIN_COLUMN_WIDTHS): void {
   console.log(
-    `${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(12))} ${theme.header('MODEL'.padEnd(8))} ` +
+    `${theme.header('CODE'.padEnd(20))} ${theme.header('STATUS'.padEnd(widths.status))} ${theme.header('MODEL'.padEnd(widths.model))} ` +
     `${theme.header('AGENT'.padEnd(TASK_LIST_AGENT_COL_WIDTH))} ${theme.header('TYPE'.padEnd(10))} ` +
     `${theme.header('PARENT'.padEnd(18))} ${theme.header('CREATED'.padEnd(18))} ${theme.header('GOAL')}`,
   );
   console.log(theme.separator(
-    `${'─'.repeat(20)} ${'─'.repeat(12)} ${'─'.repeat(8)} ${'─'.repeat(TASK_LIST_AGENT_COL_WIDTH)} ` +
+    `${'─'.repeat(20)} ${'─'.repeat(widths.status)} ${'─'.repeat(widths.model)} ${'─'.repeat(TASK_LIST_AGENT_COL_WIDTH)} ` +
     `${'─'.repeat(10)} ${'─'.repeat(18)} ${'─'.repeat(18)} ${'─'.repeat(30)}`,
   ));
 }
 
 /** Format the fixed-width data columns for a tree-view row (excludes CODE/connector). */
-function formatTaskListTreeDataCells(node: TaskWithSession, status: string): string {
+function formatTaskListTreeDataCells(node: TaskWithSession, status: string, widths: ListColumnWidths): string {
   const task = node.task;
   const sess = node.session;
   const lastInteraction = sess?.last_interaction_at ? formatDate(sess.last_interaction_at) : '-';
@@ -83,7 +90,7 @@ function formatTaskListTreeDataCells(node: TaskWithSession, status: string): str
   const agent = taskListAgentLabel(task);
 
   return (
-    `${theme.pad(theme.status(status), 12)} ${theme.pad(theme.model(model), 8)} ${theme.pad(taskType, 10)} ` +
+    `${theme.pad(theme.status(status), widths.status)} ${theme.pad(theme.model(model), widths.model)} ${theme.pad(taskType, 10)} ` +
     `${turns.padEnd(8)} ${theme.pad(theme.timestamp(lastInteraction), 18)} ${theme.pad(theme.duration(duration), 10)} ` +
     `${theme.pad(agent, TASK_LIST_AGENT_COL_WIDTH)}`
   );
@@ -113,7 +120,31 @@ export function printCrashedFootnote(crashedCount: number): void {
   }
 }
 
-export function printTaskTree(node: TaskWithSession, prefix: string = '', isLast: boolean = true, depth: number = 0): void {
+/**
+ * Widths of the STATUS and MODEL columns for a set of rows: wide enough for the
+ * widest value among them, never narrower than their minimums. Fixed widths
+ * let `blocked(failed:fatal_auth)` (and the [STOPPED]/[auto-resume …] markers)
+ * or a long model id spill into the next column and push the rest of that row
+ * out of line.
+ */
+export function listColumnWidths(
+  nodes: TaskWithSession[],
+  statusText: (node: TaskWithSession) => string = treeStatusText,
+): ListColumnWidths {
+  const widths = { ...MIN_COLUMN_WIDTHS };
+  const visit = (list: TaskWithSession[]): void => {
+    for (const node of list) {
+      widths.status = Math.max(widths.status, statusText(node).length);
+      widths.model = Math.max(widths.model, (node.task.model ?? '-').length);
+      visit(node.children);
+    }
+  };
+  visit(nodes);
+  return widths;
+}
+
+/** The STATUS cell's text for a tree-view row, with every marker it carries. */
+function treeStatusText(node: TaskWithSession): string {
   const task = node.task;
   const sess = node.session;
 
@@ -131,6 +162,12 @@ export function printTaskTree(node: TaskWithSession, prefix: string = '', isLast
   const isNotAlive = node.workingSubstate?.kind === 'not-alive';
   if (task.status === 'working' && status === 'working' && node.workingSubstate) {
     status = renderWorkingStatus(node.workingSubstate);
+  }
+
+  // A parked task whose last turn FAILED says so — it must never read as an
+  // ordinary review park (src/task/turn-failure.ts).
+  if (node.turnFailure) {
+    status = `${status}(${turnFailureLabel(node.turnFailure)})`;
   }
 
   // Add retry count to status if retrying — unless the substate label already
@@ -177,6 +214,18 @@ export function printTaskTree(node: TaskWithSession, prefix: string = '', isLast
   if (task.metadata?.auto_react_paused === 'true') {
     status = `${status} [AUTO-REACT PAUSED]`;
   }
+  return status;
+}
+
+export function printTaskTree(
+  node: TaskWithSession,
+  prefix: string = '',
+  isLast: boolean = true,
+  depth: number = 0,
+  widths: ListColumnWidths = listColumnWidths([node]),
+): void {
+  const task = node.task;
+  const status = treeStatusText(node);
 
   // Tree drawing characters
   const connector = depth === 0 ? '' : (isLast ? '└─ ' : '├─ ');
@@ -191,7 +240,7 @@ export function printTaskTree(node: TaskWithSession, prefix: string = '', isLast
 
   const codeWithPrefix = `${prefix}${connector}${code}`;
   const fitsOnOneLine = codeWithPrefix.length <= 20;
-  const dataCells = formatTaskListTreeDataCells(node, status);
+  const dataCells = formatTaskListTreeDataCells(node, status, widths);
 
   if (fitsOnOneLine) {
     // Code fits in CODE column — single line
@@ -210,7 +259,7 @@ export function printTaskTree(node: TaskWithSession, prefix: string = '', isLast
   for (let i = 0; i < node.children.length; i++) {
     const child = node.children[i];
     const isChildLast = i === node.children.length - 1;
-    printTaskTree(child, prefix + childPrefix, isChildLast, depth + 1);
+    printTaskTree(child, prefix + childPrefix, isChildLast, depth + 1, widths);
   }
 }
 
@@ -272,10 +321,11 @@ function filterTreeByTag(tree: TaskWithSession[], tag: string): TaskWithSession[
 /**
  * The GOAL cell: protection markers, the goal, then tags.
  *
- * Markers live in the LAST column on purpose. Every other column is a padded
- * fixed width that scripts slice by offset, so a new column — or a marker in an
- * existing one — would shift them all. Here the addition is purely additive:
- * a project with nothing protected renders exactly what it always did.
+ * Markers live in the LAST column on purpose. Every other column is padded to
+ * one width for the whole listing (STATUS and MODEL size to their widest value,
+ * the rest are fixed), so a marker in an earlier column would shift the ones
+ * after it. Here the addition is purely additive: a project with nothing
+ * protected renders exactly what it always did.
  */
 function goalCell(node: TaskWithSession, goal: string): string {
   const markers = node.protection ? protectionMarkers(node.protection) : '';
@@ -368,19 +418,21 @@ function renderListOutput(
   }
 
   if (opts.showTree) {
-    printTaskListTreeHeader();
+    const widths = listColumnWidths(tree);
+    printTaskListTreeHeader(widths);
 
     for (const rootNode of tree) {
-      printTaskTree(rootNode);
+      printTaskTree(rootNode, '', true, 0, widths);
     }
   } else {
     // Flat list
     const nodes = flattenTree(tree);
     const parentDisplayId = buildDisplayIdMap(nodes.map(n => n.task));
-    printTaskListFlatHeader();
+    const flatWidths = listColumnWidths(tree, flatStatusText);
+    printTaskListFlatHeader(flatWidths);
 
     for (const node of nodes) {
-      console.log(formatTaskListFlatRow(node, parentDisplayId));
+      console.log(formatTaskListFlatRow(node, parentDisplayId, flatWidths));
     }
   }
 
@@ -397,6 +449,8 @@ function flatStatusText(node: TaskWithSession): string {
   if (node.task.status === 'working' && node.workingSubstate) {
     return renderWorkingStatus(node.workingSubstate);
   }
+  // Same decoration as the tree view: a parked task whose last turn failed.
+  if (node.turnFailure) return `${node.task.status}(${turnFailureLabel(node.turnFailure)})`;
   return node.task.status;
 }
 
@@ -404,6 +458,7 @@ function flatStatusText(node: TaskWithSession): string {
 function formatTaskListFlatRow(
   node: TaskWithSession,
   parentDisplayId: ReturnType<typeof buildDisplayIdMap>,
+  widths: ListColumnWidths = MIN_COLUMN_WIDTHS,
 ): string {
   const task = node.task;
   const parentId = parentTaskIdOf(task);
@@ -414,8 +469,8 @@ function formatTaskListFlatRow(
   const agent = taskListAgentLabel(task);
 
   return (
-    `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(flatStatusText(node)), 12)} ` +
-    `${theme.pad(theme.model(model), 8)} ${theme.pad(agent, TASK_LIST_AGENT_COL_WIDTH)} ${theme.pad(taskType, 10)} ` +
+    `${theme.pad(theme.taskId(code), 20)} ${theme.pad(theme.status(flatStatusText(node)), widths.status)} ` +
+    `${theme.pad(theme.model(model), widths.model)} ${theme.pad(agent, TASK_LIST_AGENT_COL_WIDTH)} ${theme.pad(taskType, 10)} ` +
     `${theme.pad(parent, 18)} ${theme.pad(theme.timestamp(formatDate(task.created_at)), 18)} ${goalCell(node, task.goal)}`
   );
 }
@@ -528,18 +583,20 @@ function renderActiveOutput(
   }
 
   if (opts.showTree) {
-    printTaskListTreeHeader();
+    const widths = listColumnWidths(tree);
+    printTaskListTreeHeader(widths);
 
     for (const rootNode of tree) {
-      printTaskTree(rootNode);
+      printTaskTree(rootNode, '', true, 0, widths);
     }
   } else {
     const nodes = flattenTree(tree);
     const parentDisplayId = buildDisplayIdMap(nodes.map(n => n.task));
-    printTaskListFlatHeader();
+    const flatWidths = listColumnWidths(tree, flatStatusText);
+    printTaskListFlatHeader(flatWidths);
 
     for (const node of nodes) {
-      console.log(formatTaskListFlatRow(node, parentDisplayId));
+      console.log(formatTaskListFlatRow(node, parentDisplayId, flatWidths));
     }
   }
 
@@ -588,18 +645,20 @@ function renderBlockedOutput(
   }
 
   if (showTree) {
-    printTaskListTreeHeader();
+    const widths = listColumnWidths(tree);
+    printTaskListTreeHeader(widths);
 
     for (const rootNode of tree) {
-      printTaskTree(rootNode);
+      printTaskTree(rootNode, '', true, 0, widths);
     }
   } else {
     const flatNodes = flattenTree(tree);
     const parentDisplayId = buildDisplayIdMap(flatNodes.map(n => n.task));
-    printTaskListFlatHeader();
+    const flatWidths = listColumnWidths(tree, flatStatusText);
+    printTaskListFlatHeader(flatWidths);
 
     for (const node of flatNodes) {
-      console.log(formatTaskListFlatRow(node, parentDisplayId));
+      console.log(formatTaskListFlatRow(node, parentDisplayId, flatWidths));
     }
   }
 

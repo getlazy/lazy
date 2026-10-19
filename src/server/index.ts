@@ -5,6 +5,7 @@
  * Uses Bun's built-in HTTP server with no additional dependencies.
  */
 
+import { remotePrUrl } from '../task/remote-pr';
 import { withPromotedTaskCodes } from '../task/show-sections';
 import { reviewSettingsViewOf, type ReviewSettingsView } from '../review/mode';
 import type { Storage, Task, Session, StatusChange, Turn } from '../storage';
@@ -12,6 +13,7 @@ import { getCommitPatch } from '../git/operations';
 import { findRecordedCommit } from '../task/recorded-commit';
 import { executeSearch, QueryParseError } from '../search';
 import { logger } from '../utils/logger';
+import { redactSecretValuesDeep } from '../utils/redact';
 import { latestAgentWorkTurn } from '../task/turn-context';
 
 import {
@@ -98,6 +100,7 @@ import {
   raisedInboxHtml,
   raisedPanelHtml,
   raisedListOptions,
+  defaultRaisedLens,
   orderRaisedForDisplay,
   parseRaisedSort,
   similarRaisedForDetail,
@@ -128,6 +131,7 @@ import type { DoctorActions } from './doctor-actions';
 import type { ServeActions } from './serve-actions';
 import {
   settingsDoctorHtml,
+  settingsServicesHtml,
   doctorStreamOpenHtml,
   doctorProgressLineHtml,
   doctorStreamCloseHtml,
@@ -238,6 +242,9 @@ import { protocolDir } from '../protocol';
 import { readTaskProgress } from '../protocol/progress';
 import type { TurnReport } from '../types';
 import { usagePauseBannerHtml } from './usage-pause-banner';
+import { dashboardRunnerImageHtml } from './runner-image-banner';
+import { useCustomRunnerImage } from '../daemon/runner-image-choice';
+import { retryRunnerImageBuild } from '../daemon/runner-image';
 import { tokenBudgetBoxHtml } from './token-budget-box';
 import type { TokenBudgetView } from '../usage-pause/budget-view';
 import type { UsagePauseState } from '../daemon/usage-pause';
@@ -689,6 +696,7 @@ async function handleDashboard(
     activeStates,
     unreadMessages,
     usagePauseHtml: await dashboardUsagePauseHtml(usagePauseState),
+    runnerImageHtml: dashboardRunnerImageHtml(),
     tokenBudgetHtml: await dashboardTokenBudgetHtml(tokenBudget),
   };
 
@@ -714,7 +722,8 @@ async function handleTaskList(storage: Storage, url: URL): Promise<Response> {
       case 'merging':
         return await storage.listTasksWithOptions({ mergingOnly: true });
       case 'submitted':
-        return await storage.listTasksWithOptions({ submittedOnly: true });
+        return (await storage.listTasksWithOptions({}))
+          .filter(task => task.status === 'submitted' || remotePrUrl(task) !== null);
       default:
         return await storage.listTasksWithOptions({ nonTerminalOnly: true });
     }
@@ -864,7 +873,7 @@ async function containerControlsForTask(
     shellAvailable: shell?.available === true,
     // Designation saves to the project store through ServeActions —
     // without that port the form would 503, so it stays hidden.
-    canDesignate: !!serveActions,
+    canConfigure: !!serveActions,
   };
 }
 
@@ -961,9 +970,10 @@ async function handleArtifactUpload(storage: Storage, req: Request, url: URL, ta
  * which builds its notes block from storage.
  *
  * Content is sanitized at this intake boundary, like every other comment
- * surface: the text becomes prompt text, which becomes argv of `claude -p`.
+ * surface: the text becomes prompt text (delivered on stdin; sanitizing is
+ * defence in depth — src/agent/argv-safety.ts).
  *
- * NEVER LOSE HUMAN FEEDBACK (CLAUDE.md's first invariant): a failed write must
+ * NEVER LOSE HUMAN FEEDBACK (AGENTS.md's first invariant): a failed write must
  * not swallow what someone typed. The store can refuse — a full disk, a lost
  * remote-storage connection, a task deleted between render and submit — and the
  * browser has already discarded the textarea by the time the response lands. So
@@ -1079,29 +1089,23 @@ async function readStartServicesCmd(serveActions: ServeActions | undefined): Pro
 }
 
 /**
- * POST /tasks/:id/services/start-cmd — designate (or change) the project-wide
- * Start services command from the Services card. POST
- * /tasks/:id/services/start-cmd/clear (`mode: 'clear'`) clears it; the clear
- * sticks — lazy.toml's old key is not read back or re-imported.
+ * POST /settings/services/start-cmd — designate (or change) the project-wide
+ * Start services command. POST /settings/services/start-cmd/clear
+ * (`mode: 'clear'`) clears it; the clear sticks — lazy.toml's old key is not
+ * read back or re-imported. Lives in Settings, never on a task's page: what
+ * every task runs is not a control on one task.
  *
  * Saves to the project store through ServeActions (the daemon owns the write;
- * lazy.toml is never edited). Never a GET — designation is a mutation. Redirects back to the
- * Services tab so the card re-renders with Start services when a shell is up.
+ * lazy.toml is never edited). Never a GET — designation is a mutation.
  */
 async function handleDesignateStartCmd(
-  storage: Storage,
   serveActions: ServeActions | undefined,
   req: Request,
   url: URL,
-  taskIdParam: string,
   mode: 'set' | 'clear' = 'set',
 ): Promise<Response> {
   if (req.method !== 'POST') {
     return json({ error: 'Method not allowed' }, 405);
-  }
-  const task = await storage.getTask(taskIdParam);
-  if (!task) {
-    return html(errorHtml('Not Found', `Task not found: ${taskIdParam}`), 404);
   }
   if (!serveActions) {
     return html(
@@ -1121,7 +1125,7 @@ async function handleDesignateStartCmd(
       const message = err instanceof Error ? err.message : String(err);
       return html(errorHtml('Could not clear', message), 500);
     }
-    return Response.redirect(await taskPageUrl(storage, url.origin, task, '/services'), 303);
+    return Response.redirect(`${url.origin}/settings/services`, 303);
   }
 
   let form: FormData;
@@ -1137,12 +1141,39 @@ async function handleDesignateStartCmd(
     await serveActions.setStartServicesCmd(command);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    // Validation (blank, non-string) is a 400 the human can fix; anything else
-    // (unwritable file, uneditable TOML shape) surfaces as the refusal page.
-    return html(errorHtml('Could not save', message), 400);
+    // Validation (blank, multi-line) is a 400 the human can fix; the refusal
+    // page carries what they typed so it is not lost.
+    return html(errorHtml('Could not save', `${message} You typed: ${command}`), 400);
   }
 
-  return Response.redirect(await taskPageUrl(storage, url.origin, task, '/services'), 303);
+  return Response.redirect(`${url.origin}/settings/services`, 303);
+}
+
+/**
+ * POST /tasks/:id/runner-image/use-project — the task runs on lazy's default
+ * runner image because somebody confirmed it while the project's image was not
+ * ready; this switches it back from its next turn. The rule (and the refusal
+ * while the project's image is still not ready) is the daemon's.
+ */
+async function handleUseProjectRunnerImage(storage: Storage, req: Request, url: URL, taskIdParam: string): Promise<Response> {
+  if (req.method !== 'POST') return json({ error: 'Method not allowed' }, 405);
+  const task = await storage.getTask(taskIdParam);
+  if (!task) return html(errorHtml('Not Found', `Task not found: ${taskIdParam}`), 404);
+  try {
+    const result = await useCustomRunnerImage(storage, task);
+    return Response.redirect(`${url.origin}/tasks/${encodeURIComponent(task.id)}?flash=${encodeURIComponent(result.message)}`, 303);
+  } catch (err) {
+    const status = err instanceof RpcError ? err.status : 500;
+    return html(errorHtml('Failed', err instanceof Error ? err.message : String(err)), status);
+  }
+}
+
+/** POST /runner-image/retry — build the project's runner image again after it failed. */
+async function handleRetryRunnerImage(req: Request, url: URL): Promise<Response> {
+  if (req.method !== 'POST') return json({ error: 'Method not allowed' }, 405);
+  const result = await retryRunnerImageBuild();
+  if (!result.ok) return html(errorHtml('Not Started', result.message), 409);
+  return Response.redirect(`${url.origin}/`, 303);
 }
 
 /**
@@ -1718,7 +1749,9 @@ async function handleTaskDetail(
   // phases the template opens land under it as `render.turns`, `render.children`
   // and so on — no block has to know its own prefix.
   const page = timings.measureSync('render', () =>
-    taskPageHtml({
+    // Every string the page renders is scrubbed of registered secret values, as the
+    // show RPC is (handleShow) — before HTML escaping can change their spelling.
+    taskPageHtml(redactSecretValuesDeep({
       task,
       session,
       turns,
@@ -1766,7 +1799,7 @@ async function handleTaskDetail(
       artifactTexts,
       artifactNotice,
       duplicatedCodes: codeTables.duplicated,
-    }),
+    })),
   );
   if (fragment) {
     // Measured like every other render. An in-place tab switch is the request
@@ -2137,10 +2170,12 @@ async function handleTaskAction(
 
   // "Let this turn through the usage pause" (Start / Resume dialogs).
   const pastUsagePause = String(form.get('past_usage_pause') ?? '') === '1';
+  // "Run on lazy's default runner image" (the project's image is not ready).
+  const useDefaultImage = String(form.get('use_default_image') ?? '') === '1';
   const runVerb = async (onProgress?: ProgressEmitter): Promise<string> => {
     switch (verb) {
       case 'start':
-        await taskActions.startTask(task.id, onProgress, { pastUsagePause });
+        await taskActions.startTask(task.id, onProgress, { pastUsagePause, useDefaultImage });
         break;
       case 'stop':
         await taskActions.stopTask(task.id, reason, onProgress);
@@ -2152,7 +2187,7 @@ async function handleTaskAction(
         await taskActions.rejectTask(task.id, reason, onProgress);
         break;
       case 'resume':
-        await taskActions.resumeTask(task.id, onProgress, { pastUsagePause });
+        await taskActions.resumeTask(task.id, onProgress, { pastUsagePause, useDefaultImage });
         break;
       case 'reopen': {
         // The restore line and the sync-due hint are what reopen has to say —
@@ -2162,7 +2197,7 @@ async function handleTaskAction(
         return `${url.origin}${backPath}?flash=${encodeURIComponent(msg)}`;
       }
       case 'sync': {
-        const result = await taskActions.syncTask(task.id, onProgress);
+        const result = await taskActions.syncTask(task.id, onProgress, { useDefaultImage });
         const msg = [result.message, ...(result.warnings ?? [])].filter(Boolean).join(' ');
         return `${url.origin}${backPath}?flash=${encodeURIComponent(msg)}`;
       }
@@ -2927,7 +2962,8 @@ async function handleApiTaskList(storage: Storage, url: URL): Promise<Response> 
       tasks = await storage.listTasksWithOptions({ blockedOnly: true });
       break;
     case 'submitted':
-      tasks = await storage.listTasksWithOptions({ submittedOnly: true });
+      tasks = (await storage.listTasksWithOptions({}))
+        .filter(task => task.status === 'submitted' || remotePrUrl(task) !== null);
       break;
     default:
       tasks = await storage.listTasksWithOptions({ nonTerminalOnly: true });
@@ -3299,7 +3335,7 @@ async function routeWebRequest(
     // /memory listing redirects here so bookmarks keep working; create/edit
     // / compact stay at their /memory/... paths.
     if (path === '/settings' || path.startsWith('/settings/')) {
-      return await handleSettingsRoute(storage, doctorActions, req, url, path);
+      return await handleSettingsRoute(storage, doctorActions, serveActions, req, url, path);
     }
 
     // Shared memory. Reads are Storage; create/delete/compact go through
@@ -3335,6 +3371,10 @@ async function routeWebRequest(
     }
     if (path === `/tasks/${TASK_PATH_SEGMENT_LINK}`) {
       return await handleTaskLink(storage, taskActions, req, url);
+    }
+
+    if (path === '/runner-image/retry') {
+      return await handleRetryRunnerImage(req, url);
     }
 
     if (path === '/search') {
@@ -3379,6 +3419,12 @@ async function routeWebRequest(
       return await handleTaskAction(storage, taskActions, req, url, params.id, params.verb);
     }
 
+    // "Restart with the project's image" for a task on lazy's default image (POST-only).
+    params = matchRoute(path, '/tasks/:id/runner-image/use-project');
+    if (params) {
+      return await handleUseProjectRunnerImage(storage, req, url, params.id);
+    }
+
     // "Let its next turn through" the usage pause, and its Clear (POST-only).
     params = matchRoute(path, '/tasks/:id/usage-pause/:op');
     if (params) {
@@ -3391,20 +3437,8 @@ async function routeWebRequest(
       return await handleContainerStart(storage, taskActions, req, url, params.id);
     }
 
-    // Designate / change / clear the project's Start services command
-    // (POST-only). Before the generic /tasks/:id/:tab route so "services" is not
-    // eaten as a tab slug for a POST that must mutate.
-    params = matchRoute(path, '/tasks/:id/services/start-cmd/clear');
-    if (params) {
-      return await handleDesignateStartCmd(storage, serveActions, req, url, params.id, 'clear');
-    }
-    params = matchRoute(path, '/tasks/:id/services/start-cmd');
-    if (params) {
-      return await handleDesignateStartCmd(storage, serveActions, req, url, params.id);
-    }
-
     // Add a comment from the Comments tab (POST-only). Before the generic
-    // /tasks/:id/:tab route for the same reason start-cmd is: `comments` is a
+    // /tasks/:id/:tab route: `comments` is a
     // tab slug, and a mutation must not be swallowed as a tab render.
     params = matchRoute(path, '/tasks/:id/comments/add');
     if (params) {
@@ -3825,7 +3859,7 @@ async function handleReviewRoute(
       // comment carries the anchor (file/line, prose quote, thread) exactly as
       // Add comment would, and it is durable BEFORE the turn is attempted —
       // launchUnblockTask then batches it, with every other queued comment,
-      // into the turn it starts. CLAUDE.md: never lose human feedback.
+      // into the turn it starts. AGENTS.md: never lose human feedback.
       const comment = await actions.postComment(resolved.task.id, {
         file,
         line,
@@ -4001,7 +4035,7 @@ async function handleReviewRoute(
     // SAVE FIRST. Everything below can fail — a status gate, a worktree lock,
     // a runner that will not start — and with JS off nothing has autosaved
     // these words yet. Persisting before attempting is what makes the refusal
-    // recoverable instead of a blank textarea. CLAUDE.md: never lose human
+    // recoverable instead of a blank textarea. AGENTS.md: never lose human
     // feedback.
     //
     // Only the feedback box's own words go into its draft. Words sent from the
@@ -4012,6 +4046,7 @@ async function handleReviewRoute(
     if (fromFeedbackBox) await saveDraftQuietly(actions, resolved.task.id, { feedback: message });
     const raisedResolutions = parseRaisedResolutionsFromForm(form);
     const pastUsagePause = String(form.get('past_usage_pause') ?? '') === '1';
+    const useDefaultImage = String(form.get('use_default_image') ?? '') === '1';
     // INVARIANT (approval-happens-at-accept — move-file-approval-to-accept):
     // no protected-file gate here. Unblock reverts nothing, so a pending
     // violation neither blocks this POST nor travels with it.
@@ -4023,7 +4058,7 @@ async function handleReviewRoute(
           message,
           raisedResolutions.length > 0 ? raisedResolutions : undefined,
           onProgress,
-          { keepFeedbackDraft: !fromFeedbackBox, pastUsagePause },
+          { keepFeedbackDraft: !fromFeedbackBox, pastUsagePause, useDefaultImage },
         );
         return { redirect };
       });
@@ -4034,7 +4069,7 @@ async function handleReviewRoute(
         message,
         raisedResolutions.length > 0 ? raisedResolutions : undefined,
         undefined,
-        { keepFeedbackDraft: !fromFeedbackBox, pastUsagePause },
+        { keepFeedbackDraft: !fromFeedbackBox, pastUsagePause, useDefaultImage },
       );
     } catch (err) {
       return renderReviewPage(storage, actions, taskActions, resolved.task.id, {
@@ -4153,7 +4188,7 @@ async function handleReviewRoute(
     };
     if (dialog) {
       return actionRunStarted(taskId, 'sync', async (onProgress) => {
-        const result = await actions.sync(taskId, onProgress);
+        const result = await actions.sync(taskId, onProgress, { useDefaultImage: String(form.get('use_default_image') ?? '') === '1' });
         const dest = `${url.origin}${taskPath({ id: taskId, code: resolved.task?.code ?? null }, await reviewDupCodes())}/review`;
         const withFlash = new URL(dest);
         withFlash.searchParams.set('flash', result.message ?? 'Sync started.');
@@ -4161,7 +4196,7 @@ async function handleReviewRoute(
       });
     }
     try {
-      const result = await actions.sync(resolved.task.id);
+      const result = await actions.sync(resolved.task.id, undefined, { useDefaultImage: String(form.get('use_default_image') ?? '') === '1' });
       return renderReviewPage(
         storage,
         actions,
@@ -4396,6 +4431,37 @@ async function handleMessagesRoute(
     return html(messagesInboxHtml(messages, allView));
   }
 
+  // Bulk dismissal: every open message, or every one like a given message
+  // (same source and title). The store applies the filter; this only names it.
+  const likeMatch = matchRoute(path, '/messages/:id/dismiss-like');
+  if (path === '/messages/dismiss-all' || likeMatch) {
+    if (req.method !== 'POST') return json({ error: 'Method not allowed' }, 405);
+    if (!actions) {
+      return html(errorHtml('Unavailable', 'Message actions are not available: this dashboard was started without a daemon action port.'), 503);
+    }
+    const form = await req.formData();
+    const allView = String(form.get('all') ?? '') === '1';
+    try {
+      let filter = {};
+      if (likeMatch) {
+        if (!isValidMessageId(likeMatch.id)) {
+          return html(errorHtml('Bad Request', `Invalid message id '${likeMatch.id}' — ids are hex UUIDs (or a unique prefix).`), 400);
+        }
+        const like = await storage.getSystemMessage(likeMatch.id);
+        if (!like) return html(errorHtml('Not Found', `No system message matches '${likeMatch.id}'.`), 404);
+        filter = { source: like.source, title: like.title };
+      }
+      await actions.dismissMatching(filter);
+    } catch (err) {
+      const messages = await storage.listSystemMessages({ includeDismissed: allView });
+      return html(messagesInboxHtml(messages, allView, {
+        text: `Could not dismiss: ${err instanceof Error ? err.message : String(err)}`,
+        error: true,
+      }));
+    }
+    return Response.redirect(`${url.origin}/messages${allView ? '?all=1' : ''}`, 303);
+  }
+
   const actionMatch =
     matchRoute(path, '/messages/:id/read') ?? matchRoute(path, '/messages/:id/dismiss');
   const detailMatch = matchRoute(path, '/messages/:id');
@@ -4500,7 +4566,13 @@ async function handleRaisedRoute(
     gateParam === 'blocking' ? 'blocking' as const
     : gateParam === 'non-blocking' ? 'non-blocking' as const
     : 'all' as const;
-  const status = url.searchParams.get('status') === 'complete-only' ? 'complete-only' as const : undefined;
+  // Default: only tasks waiting on a human. `any` is the explicit way out.
+  const statusParam = url.searchParams.get('status');
+  const status =
+    statusParam === 'complete-only' ? 'complete-only' as const
+    : statusParam === 'any' ? undefined
+    : statusParam === 'blocked' ? 'blocked' as const
+    : defaultRaisedLens(state);
   const recurringOnly = url.searchParams.get('recurring') === '1';
   // The order is the service's to apply — the page passes the reader's choice
   // through, and only ranks the columns listRaisedItems has no ordering for.
@@ -4645,7 +4717,12 @@ async function handleRaisedRoute(
 
   if (path === '/api/raised') {
     if (req.method !== 'GET') return json({ error: 'Method not allowed' }, 405);
-    const result = await storage.listRaisedItems(listOptions);
+    // The JSON API keeps listing every task unless the caller names a lens: the
+    // blocked-tasks default is the PAGE's, and a script must not lose items to it.
+    const apiOptions = statusParam === null
+      ? raisedListOptions({ ...view, status: undefined })
+      : listOptions;
+    const result = await storage.listRaisedItems(apiOptions);
     // Same ordering as the page, so a `?sort=` the JSON caller passes means what
     // it means in a browser rather than silently degrading to the default.
     const items = orderRaisedForDisplay(result.items, sort);
@@ -4838,7 +4915,7 @@ async function handleConversationsRoute(
   if (path === '/builders') {
     const query = (url.searchParams.get('q') ?? '').trim();
     if (!query) {
-      return html(conversationsIndexHtml(await storage.listBuilders()));
+      return html(conversationsIndexHtml(await storage.listBuilders(), await builderTierForPage()));
     }
     const conversations = await listBuilderTranscripts(storage);
     const { hits, error } = await runConversationSearch(conversations, query);
@@ -4924,7 +5001,23 @@ async function renderConversationDetail(
     promotions,
     created: promotedLabel && promotedTask ? { id: promotedTask, label: promotedLabel } : null,
     error: selection.error ?? null,
-  }, duplicateTaskCodes(await storage.listTaskCodes()), await proseLinksFor(storage), builder));
+  }, duplicateTaskCodes(await storage.listTaskCodes()), await proseLinksFor(storage), builder, await builderTierForPage()));
+}
+
+/**
+ * The builder's tier view for a Builders page, or null when it cannot be read
+ * — the page renders without the panel rather than failing over it.
+ */
+async function builderTierForPage(): Promise<import('../daemon/builder-tier').BuilderTierView | null> {
+  try {
+    const { builderTierView } = await import('../daemon/builder-tier');
+    const root = findLazyRoot();
+    if (!root) return null;
+    return await builderTierView(root, await loadConfig(root));
+  } catch (err) {
+    logger.warn(`Builders page: cannot read the builder's tier: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
 }
 
 /**
@@ -4962,12 +5055,14 @@ const DOCTOR_ACTIONS_UNAVAILABLE =
 const DOCTOR_DIALOG_HEADER = 'x-lazy-doctor-dialog';
 
 /**
- * Settings: Memories (the existing listing) and Doctor (last report + run +
+ * Settings: Memories (the existing listing), Services (the project-wide Start
+ * services command) and Doctor (last report + run +
  * remedies). GET /settings/doctor is a file read — it never starts the sweep.
  */
 async function handleSettingsRoute(
   storage: Storage,
   doctorActions: DoctorActions | undefined,
+  serveActions: ServeActions | undefined,
   req: Request,
   url: URL,
   path: string,
@@ -4983,6 +5078,18 @@ async function handleSettingsRoute(
     const compact = await storage.getMemoryCompact();
     return html(memoryIndexHtml(records, compact, warnBytes, { allView }));
   }
+
+  if (path === '/settings/services') {
+    if (req.method !== 'GET') return json({ error: 'Method not allowed' }, 405);
+    if (!serveActions) return html(settingsServicesHtml(null, { unavailable: true }));
+    try {
+      return html(settingsServicesHtml(await serveActions.getStartServicesCmd()));
+    } catch (err) {
+      return html(settingsServicesHtml(null, { error: err instanceof Error ? err.message : String(err) }));
+    }
+  }
+  if (path === '/settings/services/start-cmd') return await handleDesignateStartCmd(serveActions, req, url);
+  if (path === '/settings/services/start-cmd/clear') return await handleDesignateStartCmd(serveActions, req, url, 'clear');
 
   if (path === '/settings/doctor') {
     if (req.method !== 'GET') return json({ error: 'Method not allowed' }, 405);

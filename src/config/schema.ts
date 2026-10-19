@@ -33,7 +33,7 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
   models: ['default', 'roles'],
   session: ['verbose', 'debug', 'auto_commit_instructions'],
   data: ['path'],
-  storage: ['backend', 'external_path'],
+  storage: ['backend', 'external_path', 'backup_keep'],
   git: ['default_branch_prefix', 'lfs_check', 'coauthor_trailer'],
   output: ['shortid_length'],
   // `graceful_exit_timeout_ms` is the pre-rename spelling of
@@ -61,7 +61,10 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
   // profile key nobody classified is a key a shared host would honour from an
   // untrusted repository, and `endpoint` is where the real model credential
   // goes.
-  agents: ['harness', 'model', 'endpoint', 'credential', 'description'],
+  agents: ['harness', 'model', 'endpoint', 'credential', 'description', 'named_endpoint', 'tiers'],
+  // `[endpoints.<name>]` — named upstreams, freeform like `agents`; inner keys
+  // are validated by resolveNamedEndpoints at config load.
+  endpoints: ['url', 'credential', 'description'],
   builder: ['effort'],
   chattiness: ['default', 'builder', 'agent'],
   server: ['port', 'sync_interval', 'bind', 'dashboard_url'],
@@ -89,7 +92,7 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
   // REMOVED — an upstream is a property of an agent profile now. Both are
   // deliberately absent here so a stale key is reported rather than tolerated;
   // the config loader rejects each outright with its migration message.
-  proxy: ['port', 'bind', 'upstream', 'cursor_upstream', 'fallback', 'retry_after_threshold', 'upstream_timeout', 'policy'],
+  proxy: ['port', 'bind', 'upstream', 'cursor_upstream', 'fallback', 'retry_after_threshold', 'tier_retry_interval', 'upstream_timeout', 'audit_retention_days', 'audit_retention_mib', 'policy'],
   documents: ['path'],
   docs: ['url'],
   worktree: ['include'],
@@ -121,7 +124,7 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
   // 'services' is a nested table ([serve.services]); its inner keys are service
   // NAMES chosen by the user, so they are validated by the config loader (name
   // shape + port range), not by this one-level scan.
-  serve: ['ports', 'services', 'start_services_cmd'],
+  serve: ['ports', 'services', 'start_services_cmd', 'main_service'],
   // DEPRECATED: folded into [automation]. Kept known so the unknown-key scan
   // does not double-report it — `lazy doctor` reports the deprecation itself.
   checks: ['post_turn', 'post_turn_timeout'],
@@ -144,7 +147,7 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
  * inner keys are still a closed set — `resolveAgentProfiles` rejects an unknown
  * one at config load with a hint, which is stricter than this scan's warning.
  */
-export const FREEFORM_SECTIONS = new Set(['features', 'agents']);
+export const FREEFORM_SECTIONS = new Set(['features', 'agents', 'endpoints']);
 
 /**
  * Whole SECTIONS lazy has removed, with the migration each one needs — the
@@ -167,7 +170,8 @@ export const DEPRECATED_SECTIONS: Record<string, () => string> = {
       '  [agents.<name>]\n' +
       '  harness = "<the agent you run>"\n' +
       '  model = "<the model that server serves>"\n' +
-      '  endpoint = "<the value that was here>"',
+      '  endpoint = "<the value that was here>"\n' +
+      '  credential = "<the credential that pays it, or none>"',
       'Then point `[agent] agent_id` (or one task, with `lazy create --agent <name>`) at it. ' +
       '`lazy doctor --fix agents` rewrites this for you.',
     ),
@@ -200,7 +204,8 @@ export const DEPRECATED_SECTION_KEYS: Record<string, () => string> = {
       '  [agents.codex]\n' +
       '  harness = "codex"\n' +
       '  model = "<the model that server serves>"\n' +
-      '  endpoint = "<the value that was here>"',
+      '  endpoint = "<the value that was here>"\n' +
+      '  credential = "<the credential that pays it, or none>"',
       'Then delete this key from [proxy]. Tasks pick a profile with `lazy create --agent <name>`.',
     ),
   'protection.passphrase_file': () =>

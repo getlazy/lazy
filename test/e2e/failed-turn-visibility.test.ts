@@ -24,8 +24,11 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask } from '../helpers/fixtures';
 import { expectSuccess, expectOutput } from '../helpers/assertions';
-import { crashScenario } from '../helpers/fake-claude';
-import { agentTurns, sessionInterrupt } from '../helpers/agent-seam';
+import { crashScenario, successScenario } from '../helpers/fake-claude';
+import { readSystemMessagesFile, taskFilePath } from '../helpers/storage';
+import { readFile, writeFile } from 'fs/promises';
+import { join } from 'path';
+import { agentTurns, allTurns, sessionInterrupt } from '../helpers/agent-seam';
 
 /** What a credential Anthropic rejects looks like on the way out of the agent. */
 const AUTH_401 = 'API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"invalid bearer token"}}\n';
@@ -70,4 +73,105 @@ describe('a failed turn always leaves a visible record', () => {
     const interrupt = await sessionInterrupt(ctx.root, taskId);
     expect(interrupt.interrupt_reason).toContain('fatal_auth');
   }, 150_000);
+
+  // INVARIANT (fix-fatal-failure-silent-park): a turn that dies on an
+  // unrecoverable failure is VISIBLE AS A FAILURE, not as a review park. The
+  // task shows failed:<class> with the fix, lazy files exactly one alert for the
+  // problem (no agent runs to write one when the credential is what broke), the
+  // park names the system with its reason — never the human who unblocked — and
+  // the next successful turn clears the label. In the field a member re-sent
+  // the same feedback for 14 hours because the task read as plain `blocked`.
+  test('a fatal_auth turn shows failed:fatal_auth, files one alert, names no human, and clears on success', async () => {
+    const taskId = await createTask(ctx, 'Dead credential, visibly', 'Do the work');
+    await ctx.setClaudeScenario(crashScenario({ stderr: AUTH_401, exitCode: 1 }));
+
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+    // A second failing turn on the same problem must not file a second alert.
+    expectSuccess(await ctx.lazy(['unblock', taskId, '--message', 'please continue']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+
+    const list = await ctx.lazy(['list']);
+    expectSuccess(list);
+    expectOutput(list, 'failed:fatal_auth');
+    const show = await ctx.lazy(['show', taskId]);
+    expectOutput(show, 'the last turn failed (fatal_auth)');
+    expectOutput(show, 'Fix:');
+
+    // The failure notice is lazy's, structurally — not the agent's reply.
+    const turns = await agentTurns(ctx.root, taskId);
+    expect((turns.at(-1) as { failure?: { class: string } }).failure?.class).toBe('fatal_auth');
+
+    const alerts = readSystemMessagesFile(ctx.root).filter(m => m.kind === 'alert' && m.source === 'turn-failure');
+    expect(alerts.length).toBe(1);
+    // The second failure was COUNTED on the open alert, not dropped.
+    expect(alerts[0]!.repeat_count).toBe(2);
+    expect(alerts[0]!.title).toContain('fatal_auth');
+    expect(alerts[0]!.body).toContain('What to do:');
+
+    const changes = JSON.parse(await readFile(taskFilePath(ctx.root, taskId, 'status-changelog.json'), 'utf-8')).changes as
+      Array<{ status: string; actor?: string; reason?: string }>;
+    const park = changes.at(-1)!;
+    expect(park.status).toBe('blocked');
+    expect(park.actor).not.toBe('human');
+    expect(park.reason).toContain('fatal_auth');
+
+    // The credential is fixed: the next turn succeeds and the label is gone.
+    await ctx.setClaudeScenario(successScenario());
+    expectSuccess(await ctx.lazy(['unblock', taskId, '--message', 'credential fixed']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+    const after = await ctx.lazy(['list']);
+    expectSuccess(after);
+    expect(after.stdout).not.toContain('failed:');
+
+    // Never lose human feedback: the words sent into the failed turn reach
+    // the turn that finally ran.
+    const delivered = (await allTurns(ctx.root, taskId))
+      .filter(t => t.role === 'human' && String(t.content).includes('credential fixed'));
+    expect(delivered.length).toBe(1);
+    expect(String(delivered[0]!.content)).toContain('please continue');
+  }, 200_000);
+
+  // INVARIANT (fix-fatal-failure-silent-park): when the task's environment
+  // fails to START on an unblock, the park names the system with its reason,
+  // never the person who unblocked, and leaves a failure notice. In the field
+  // this park was `actor: human` with no reason and no turn, and read as the
+  // member stopping the task themselves.
+  test('an unblock whose supervisor fails to launch parks as the system, with reason and a notice', async () => {
+    const taskId = await createTask(ctx, 'Launch dies', 'Do the work');
+    await ctx.setClaudeScenario(successScenario());
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+
+    // An agent profile whose pinned upstream answers nothing: the launch's
+    // preflight throws inside launchSupervisor.
+    const tomlPath = join(ctx.root, 'lazy.toml');
+    await writeFile(tomlPath, (await readFile(tomlPath, 'utf-8')) +
+      '\n[agents.dead-endpoint]\nharness = "claude-code"\nmodel = "claude-opus-5-5"\nendpoint = "http://10.255.255.1:9"\ncredential = "none"\n');
+
+    const unblock = await ctx.lazy(['unblock', taskId, '--agent', 'dead-endpoint', '--message', 'carry on']);
+    expect(unblock.exitCode).not.toBe(0);
+
+    const changes = JSON.parse(await readFile(taskFilePath(ctx.root, taskId, 'status-changelog.json'), 'utf-8')).changes as
+      Array<{ status: string; actor?: string; reason?: string }>;
+    const park = changes.at(-1)!;
+    expect(park.status).toBe('interrupted');
+    expect(park.actor).not.toBe('human');
+    expect(park.reason).toContain('did not start');
+    const last = (await allTurns(ctx.root, taskId)).at(-1) as { failure?: { class: string } };
+    expect(last.failure?.class).toBe('launch_failed');
+    expectOutput(await ctx.lazy(['list']), 'failed:launch_failed');
+    // The decorated status fits its column: every column after STATUS starts
+    // where its header does (a fixed 12-wide STATUS let this label spill over).
+    const lines = (await ctx.lazy(['list'])).stdout.replace(/\x1b\[[0-9;]*m/g, '').split('\n');
+    const header = lines.find(l => l.startsWith('CODE'))!;
+    const row = lines.find(l => l.includes('failed:launch_failed'))!;
+    const modelAt = header.indexOf('MODEL');
+    const statusAt = header.indexOf('STATUS');
+    expect(row.slice(statusAt, modelAt).trimEnd()).toBe('interrupted(failed:launch_failed)');
+    expect(row[modelAt - 1]).toBe(' ');
+    expect(row[modelAt]).not.toBe(' ');
+    // The status history says WHY lazy parked it, not only who did.
+    expect((await ctx.lazy(['show', taskId])).stdout).toMatch(/→ interrupted by system.*— the task's container did not start/);
+  }, 200_000);
 });

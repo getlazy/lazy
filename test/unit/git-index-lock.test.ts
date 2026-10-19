@@ -20,9 +20,31 @@ import {
   findIndexLockHolders,
   INCOMPLETE_PROCESS_TABLE_REASON,
   isIndexLockError,
+  processHasExited,
+  processTableProbe,
   resolveIndexLockPath,
 } from '../../src/git/index-lock';
 import { squashMergeBranchIntoTarget } from '../../src/git/operations';
+
+/**
+ * The real /proc scan, minus the permission gaps OTHER processes on the machine
+ * cause. Whether some pid's fd directory is unreadable (another user's process,
+ * a non-dumpable Chromium renderer) says nothing about these tests' locks, which
+ * only this process ever opens — but with gaps the scan rightly refuses to
+ * authorize deletion, so these tests failed whenever a browser was running.
+ */
+const realScanProcfs = processTableProbe.scanProcfs;
+function ignoreOtherProcessesPermissionGaps(): void {
+  beforeEach(() => {
+    processTableProbe.scanProcfs = async (lockPath) => {
+      const scan = await realScanProcfs(lockPath);
+      return scan && { ...scan, permissionGaps: false };
+    };
+  });
+  afterEach(() => {
+    processTableProbe.scanProcfs = realScanProcfs;
+  });
+}
 
 async function initRepo(dir: string): Promise<void> {
   await runGit(['init', '-q', '-b', 'main'], { cwd: dir });
@@ -67,6 +89,7 @@ describe('isIndexLockError', () => {
 });
 
 describe('clearStaleIndexLock', () => {
+  ignoreOtherProcessesPermissionGaps();
   let repo: string;
   let parentWorktree: string;
 
@@ -212,6 +235,7 @@ describe('clearStaleIndexLock', () => {
 });
 
 describe('squashMergeBranchIntoTarget recovers from a stale index.lock', () => {
+  ignoreOtherProcessesPermissionGaps();
   let repo: string;
   let parentWorktree: string;
 
@@ -267,6 +291,39 @@ describe('findIndexLockHolders', () => {
       }
     } finally {
       await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// INVARIANT: a process that has exited is not a permission gap. A zombie's
+// /proc/<pid>/fd answers EACCES even to its own user, and it holds no files;
+// counting it refused to clear a stale lock whenever anything on the machine
+// was mid-exit — which, on a busy host, is most of the time.
+// procfs is Linux's; on macOS the scan this serves never runs (lsof answers).
+const hasProcfs = process.platform === 'linux';
+if (!hasProcfs) console.log('skip: processHasExited — no /proc on this platform; the procfs scan it serves is Linux-only');
+describe.skipIf(!hasProcfs)('processHasExited', () => {
+  test('a zombie has exited; a live process and this one have not', async () => {
+    // The shell backgrounds a short sleep, then execs a long one that never
+    // reaps it: the short sleep is left a zombie of the long one.
+    const parent = Bun.spawn(['sh', '-c', 'sleep 0.1 & exec sleep 30']);
+    try {
+      let zombie: string | null = null;
+      for (let i = 0; i < 50 && !zombie; i++) {
+        await Bun.sleep(50);
+        const children = await Bun.file(`/proc/${parent.pid}/task/${parent.pid}/children`).text().catch(() => '');
+        for (const pid of children.trim().split(/\s+/).filter(Boolean)) {
+          const stat = await Bun.file(`/proc/${pid}/stat`).text().catch(() => '');
+          if (stat.slice(stat.lastIndexOf(') ') + 2).startsWith('Z')) zombie = pid;
+        }
+      }
+      expect(zombie).not.toBeNull();
+      expect(await processHasExited(zombie!)).toBe(true);
+      expect(await processHasExited(String(parent.pid))).toBe(false);
+      expect(await processHasExited(String(process.pid))).toBe(false);
+      expect(await processHasExited('999999999')).toBe(true);
+    } finally {
+      parent.kill();
     }
   });
 });

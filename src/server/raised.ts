@@ -24,6 +24,7 @@ import { findSimilarRaisedItems } from '../raised/similar';
 import { taskPath, taskPathByTaskId, type TaskCodeTables } from './task-urls';
 import { layoutHtml } from './templates';
 import { renderMarkdown, type RenderMarkdownOptions } from './markdown';
+import { copyMarkdownButtonHtml, renderMarkdownWithCopy } from './copy-markdown';
 import { escapeHtml } from './review-diff';
 import {
   orderPhrase,
@@ -278,12 +279,23 @@ function displayRowsForInbox(result: ListRaisedItemsResult): RaisedDisplayRow[] 
  * headers cannot disagree about what the other half of the query string is —
  * the filters carry the sort, and the sort carries the filters.
  */
+export type RaisedTaskLens = 'blocked' | 'complete-only';
+
+/** The task lens a state shows when `?status=` says nothing. */
+export function defaultRaisedLens(state: 'open' | 'all'): RaisedTaskLens | undefined {
+  return state === 'open' ? 'blocked' : undefined;
+}
+
 export interface RaisedView {
   state: 'open' | 'all';
   /** Gate filter: blocking only, non-blocking only, or both. */
   blocking: RaisedItemBlockingFilter;
-  /** The single task-status filter this page offers, when it is on. */
-  status?: 'complete-only';
+  /**
+   * The originating-task filter. Undefined means ANY task — the page defaults
+   * to `blocked` (tasks waiting on a human), so "any" is the explicit choice
+   * and spells `?status=any`.
+   */
+  status?: RaisedTaskLens;
   recurringOnly: boolean;
   sort: SortConfig<RaisedSortField>;
 }
@@ -333,7 +345,9 @@ function raisedHref(view: RaisedView, sortChosen: boolean): string {
   const params = new URLSearchParams();
   if (view.state === 'all') params.set('all', '1');
   if (view.blocking !== 'all') params.set('gate', view.blocking);
-  if (view.status) params.set('status', view.status);
+  // Omitted means the state's default lens: blocked tasks while open, any task under All.
+  const fallback = defaultRaisedLens(view.state);
+  if (view.status !== fallback) params.set('status', view.status ?? 'any');
   if (view.recurringOnly) params.set('recurring', '1');
   if (sortChosen && !isDefaultSort(view)) {
     params.set('sort', `${view.sort.direction === 'desc' ? '-' : ''}${view.sort.field}`);
@@ -349,16 +363,17 @@ function filterBar(view: RaisedView): string {
   const chosen = !isDefaultSort(view);
   const mk = (label: string, target: RaisedView, active: boolean) =>
     `<a href="${escapeHtml(raisedHref(target, chosen))}" class="btn btn-sm${active ? ' active' : ''}">${escapeHtml(label)}</a>`;
-  const unfiltered = !status && !recurringOnly && blocking === 'all';
+  const unfiltered = !recurringOnly && blocking === 'all';
   return `<div class="filter-bar">
-    ${mk('Needs attention', { ...view, state: 'open', blocking: 'all', status: undefined, recurringOnly: false }, state === 'open' && unfiltered)}
-    ${mk('All', { ...view, state: 'all', blocking: 'all', status: undefined, recurringOnly: false }, state === 'all' && unfiltered)}
+    ${mk('Needs attention', { ...view, state: 'open', blocking: 'all', status: 'blocked', recurringOnly: false }, state === 'open' && status === 'blocked' && unfiltered)}
+    ${mk('All', { ...view, state: 'all', blocking: 'all', status: undefined, recurringOnly: false }, state === 'all' && !status && unfiltered)}
     ${/* Labelled from the shared vocabulary, so the filter you click and the
         badge you then see in the Gate column are the same two words. */''}
-    ${mk(raisedGateVocabulary(true).label, { ...view, blocking: 'blocking', status: undefined, recurringOnly: false }, blocking === 'blocking')}
-    ${mk(raisedGateVocabulary(false).label, { ...view, blocking: 'non-blocking', status: undefined, recurringOnly: false }, blocking === 'non-blocking')}
+    ${mk(raisedGateVocabulary(true).label, { ...view, blocking: 'blocking', recurringOnly: false }, blocking === 'blocking')}
+    ${mk(raisedGateVocabulary(false).label, { ...view, blocking: 'non-blocking', recurringOnly: false }, blocking === 'non-blocking')}
+    ${mk('Blocked tasks', { ...view, status: 'blocked', recurringOnly: false }, state === 'all' && status === 'blocked' && !recurringOnly)}
     ${mk('Finished tasks', { ...view, status: 'complete-only', recurringOnly: false }, status === 'complete-only')}
-    ${mk('Recurring only', { ...view, status: undefined, recurringOnly: true }, recurringOnly)}
+    ${mk('Recurring only', { ...view, recurringOnly: true }, recurringOnly)}
   </div>`;
 }
 
@@ -367,7 +382,7 @@ export function raisedInboxHtml(
   options: {
     state?: 'open' | 'all';
     blocking?: RaisedItemBlockingFilter;
-    status?: 'complete-only';
+    status?: RaisedTaskLens;
     recurringOnly?: boolean;
     sort?: SortConfig<RaisedSortField>;
     /** Code lookup tables, for cluster rows that hold only task ids. */
@@ -378,7 +393,8 @@ export function raisedInboxHtml(
   const view: RaisedView = {
     state: options.state ?? 'open',
     blocking: options.blocking ?? 'all',
-    status: options.status,
+    // An absent key means the page's default lens; an explicit undefined is "any task".
+    status: 'status' in options ? options.status : defaultRaisedLens(options.state ?? 'open'),
     recurringOnly,
     // The route parses `?sort=` (it needs it to ask the service for that order);
     // a caller that gives none gets the order the service defaults to anyway.
@@ -565,6 +581,11 @@ export function raisedPanelHtml(
       ${item.resolution ? `<p class="text-muted">Note: ${escapeHtml(item.resolution)}</p>` : ''}
       ${decideError}
     </div>`;
+  const displayBody = raisedDisplayBody({
+    content: item.content,
+    ...(item.item_title ? { title: item.item_title } : {}),
+    ...(item.explanation ? { explanation: item.explanation } : {}),
+  });
   const optionsSection = item.options?.length
     ? `<div class="detail-section">
       <h2>Options the agent offered</h2>
@@ -576,7 +597,7 @@ export function raisedPanelHtml(
       <h2>Agent comments</h2>
       <ul class="raised-comments">${item.comments.map((c) =>
         `<li><span class="text-muted">${escapeHtml(c.actor)} · ${escapeHtml(formatDate(c.created_at))}</span>` +
-        `<div class="turn-content">${renderMarkdown(c.content, options?.markdown)}</div></li>`
+        `<div class="turn-content">${renderMarkdownWithCopy(c.content, options?.markdown)}</div></li>`
       ).join('')}</ul>
     </div>`
     : '';
@@ -604,11 +625,7 @@ export function raisedPanelHtml(
       · recurrence size ${item.recurrence_size}
     </div>
     <div class="detail-section">
-      <div class="turn-content" data-rv-prose="${escapeHtml(raisedItemProseFile(item.id))}">${renderMarkdown(raisedDisplayBody({
-        content: item.content,
-        ...(item.item_title ? { title: item.item_title } : {}),
-        ...(item.explanation ? { explanation: item.explanation } : {}),
-      }), options?.markdown)}</div>
+      ${copyMarkdownButtonHtml(displayBody)}<div class="turn-content" data-rv-prose="${escapeHtml(raisedItemProseFile(item.id))}">${renderMarkdown(displayBody, options?.markdown)}</div>
     </div>
     ${optionsSection}
     ${commentsSection}

@@ -35,8 +35,8 @@ export type OwnedRuns = Map<string, Task>;
  * ask. Built per runner because the naming differs — a Docker container name is
  * not a host PID file name.
  *
- * A task is indexed under BOTH the ref it carries (`task_ref` metadata, written
- * at first launch) and the ref it would be given if it were launched now. The
+ * A task is indexed under BOTH the ref it carries (`task_ref` metadata, pinned
+ * at create, or at first launch for older tasks) and the ref it would be given if it were launched now. The
  * two agree for every launched task; indexing both means a run whose task_ref
  * write did not survive is still recognized as ours rather than leaked.
  */

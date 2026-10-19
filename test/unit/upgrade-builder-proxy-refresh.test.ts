@@ -126,7 +126,7 @@ describe('builder proxy target refresh across an upgrade', () => {
     process.env.LAZY_TEST = '1';
     process.env.LAZY_FORCE_PROXY_GATE = '1';
     await configWith(
-      '[agents.gateway]\nharness = "claude-code"\nmodel = "m"\nendpoint = "http://127.0.0.1:9999"\n' +
+      '[agents.gateway]\nharness = "claude-code"\nmodel = "m"\nendpoint = "http://127.0.0.1:9999"\ncredential = "none"\n' +
       '[models.roles.builder]\nagent = "gateway"\n' +
       '[models.roles.agent]\nagent = "gateway"\n',
     );

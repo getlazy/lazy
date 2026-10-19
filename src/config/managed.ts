@@ -12,8 +12,9 @@
  *
  * WHAT MANAGED MODE IS NOT. It is not a sandbox and it does not distrust the
  * repository's CODE — the agent container already exists to run untrusted code,
- * and that is the design working as intended. Managed mode stops the repository
- * changing the SHAPE of that container or reaching around it.
+ * and that is the design working as intended. Managed mode restricts host
+ * mounts, credential redirects and host execution, but honours Docker run
+ * arguments: an administrator adopting a repository accepts their risk.
  *
  * WHY IT IS AN ENVIRONMENT VARIABLE AND NOT A CONFIG KEY. `lazy.toml` is the
  * untrusted input; a `managed = false` key in it would be self-certification.
@@ -52,6 +53,9 @@ declare const LAZY_RELEASE_BUILD: boolean;
 // LAZY_TEST_FORCE_MANAGED seam moved with `isManagedMode` into that leaf.
 import { MANAGED_ENV, isManagedMode } from './managed-mode';
 export { MANAGED_ENV, isManagedMode };
+
+/** `[protection] enabled` when a managed project's file does not set it. */
+export const MANAGED_PROTECTION_DEFAULT = true;
 
 /** The fleet-assigned store. REQUIRED when managed mode is armed. */
 export const MANAGED_STORAGE_ENV = 'LAZY_MANAGED_STORAGE_PATH';
@@ -372,7 +376,9 @@ export const MANAGED_POLICY: Record<string, ManagedRule> = {
     disposition: 'refused',
     why: 'a repository-invented credential name selects a secret the fleet did not assign to it',
     // Same reasoning as the endpoint: a name the project's owner chose selects
-    // which of each MEMBER's own credentials pays, never a slot of the fleet's.
+    // which of each MEMBER's own credentials pays, never a slot of the fleet's —
+    // in team mode no name, custom or not, is ever resolved from the daemon's
+    // environment or store (test/unit/ and test/e2e/teams-no-env-credentials.test.ts).
     controlPlaneMay: "a profile's credential is each member's own, connected for that profile",
     guard: (v) => {
       if (typeof v !== 'string' || v.trim() === '') return null;
@@ -382,6 +388,32 @@ export const MANAGED_POLICY: Record<string, ManagedRule> = {
         : `credential = "${name}" names a secret slot outside the fleet's providers (${PROVIDERS.join(', ')})`;
     },
   },
+
+  // A reference to an `[endpoints.<name>]` block, and a tiered chain of them:
+  // each only SELECTS endpoints, and the endpoints' own `url`/`credential` are
+  // classified below, so a selection is exactly as safe as what it selects.
+  'agents.*.named_endpoint': { disposition: 'respected' },
+  'agents.*.tiers[].endpoint': { disposition: 'respected' },
+  'agents.*.tiers[].model': { disposition: 'respected' },
+  'agents.*.tiers[].threshold_percent': { disposition: 'respected' },
+
+  // ── Named endpoints: `[endpoints.<name>]` ───────────────────────────────
+  //
+  // An endpoint is an upstream URL plus the credential that pays it — the same
+  // two credential-redirection primitives as a profile's inline `endpoint` and
+  // `credential`: repository choices remain refused, while trusted control-plane
+  // configuration has the same member-owned account semantics as inline profiles.
+  'endpoints.*.url': {
+    disposition: 'refused',
+    controlPlaneMay: 'members consent to each endpoint origin and spend only their own connected endpoint account',
+    why: 'an arbitrary upstream URL from a repository receives the real model credential',
+  },
+  'endpoints.*.credential': {
+    disposition: 'refused',
+    controlPlaneMay: 'endpoint authentication selects each member’s own account, never a fleet credential',
+    why: 'a repository-chosen credential name selects a secret the fleet did not assign to it',
+  },
+  'endpoints.*.description': { disposition: 'respected' },
 
   // ── Credentials: where the daemon keeps the model credential ────────────
   //
@@ -456,7 +488,12 @@ export const MANAGED_POLICY: Record<string, ManagedRule> = {
     effective: () => '127.0.0.1',
   },
   'proxy.retry_after_threshold': { disposition: 'respected' },
+  'proxy.tier_retry_interval': { disposition: 'respected' },
   'proxy.upstream_timeout': { disposition: 'respected' },
+  // Bounded by construction either way (a minimum, and the limit that comes
+  // first wins); disk on the host the fleet owns is the only stake.
+  'proxy.audit_retention_days': { disposition: 'respected' },
+  'proxy.audit_retention_mib': { disposition: 'respected' },
   'proxy.policy.enforce': {
     disposition: 'overridden',
     why: 'enforcement is the fleet\'s posture; a repository turning it off would disable its own tool-call policy',
@@ -534,7 +571,7 @@ export const MANAGED_POLICY: Record<string, ManagedRule> = {
   },
   'runner.verify_sandbox_boundary': {
     disposition: 'overridden',
-    why: 'the boundary self-check spends real agent sessions on the host, so the fleet decides when it runs',
+    why: 'retired: the host boundary self-check was removed and the key has no effect',
     apply: (c) => { c.runner.verify_sandbox_boundary = 'off'; },
     effective: () => 'off',
   },
@@ -567,6 +604,12 @@ export const MANAGED_POLICY: Record<string, ManagedRule> = {
     why: 'a repository naming a store path could point the daemon at another project\'s state',
     apply: (c, fleet) => { c.storage.external_path = fleet.storagePath; },
     effective: (fleet) => fleet.storagePath,
+  },
+  'storage.backup_keep': {
+    disposition: 'overridden',
+    why: 'the fleet keeps the count: the host backs the store up before every roll, and a local-docker daemon (which runs on the host) also before a start on a new version',
+    apply: (c) => { c.storage.backup_keep = 5; },
+    effective: () => 5,
   },
   'data.path': {
     disposition: 'overridden',
@@ -628,18 +671,7 @@ export const MANAGED_POLICY: Record<string, ManagedRule> = {
     guard: containedPath('[docker] dockerfile'),
   },
   'docker.build_inputs': { disposition: 'respected' },
-  // Extra `docker run` args shape the container itself: `--privileged` or a
-  // `-v /:/host` from a cloned lazy.toml would be a host handover, exactly the
-  // class of ask [[mounts]] refuses. There is no substitute a fleet could
-  // offer, so this refuses rather than overrides. The guard lets an EMPTY
-  // array be stated harmlessly.
-  'docker.run_args': {
-    disposition: 'refused',
-    why: 'a repository cannot add its own `docker run` arguments to agent containers on a shared machine',
-    guard: (v) => (Array.isArray(v) && v.length === 0
-      ? null
-      : 'a repository cannot add its own `docker run` arguments to agent containers on a shared machine'),
-  },
+  'docker.run_args': { disposition: 'respected' },
   'worktree.include': {
     disposition: 'respected',
     // Copied on the HOST from the main checkout into the worktree, which the
@@ -734,6 +766,7 @@ export const MANAGED_POLICY: Record<string, ManagedRule> = {
   'serve.ports': { disposition: 'respected' },
   'serve.services': { disposition: 'respected' },
   'serve.start_services_cmd': { disposition: 'respected' },
+  'serve.main_service': { disposition: 'respected' },
   'memory.warn_bytes': { disposition: 'respected' },
   'docs.url': { disposition: 'respected' },
   'daemon.auto_react_ci': { disposition: 'respected' },
@@ -832,7 +865,7 @@ export function flattenConfigAsks(raw: Record<string, unknown>): Map<string, unk
         // policy classifies the SHAPE. Without the `agents` case here, every
         // `[agents.<name>]` block would flatten under the name the repository
         // invented, match no rule, and be honoured — including its `endpoint`.
-        const segment = path === 'models.roles' || path === 'agents' ? '*' : k;
+        const segment = path === 'models.roles' || path === 'agents' || path === 'endpoints' ? '*' : k;
         walk(v, path ? `${path}.${segment}` : segment);
       }
       return;
@@ -972,6 +1005,18 @@ export function applyManagedPolicy(
   for (const [key, rule] of Object.entries(MANAGED_POLICY)) {
     if (rule.disposition === 'overridden' && rule.apply) rule.apply(config, fleet);
   }
+
+  // Branch protection is ON by default in Lazy Teams (engineer, 2026-10-10),
+  // where a signed-in member's Accept is the approval — no passphrase to share
+  // — so the default branch is protected unless the owner turns it off. Still a
+  // DEFAULT, not an override: a file that sets `[protection] enabled` keeps its
+  // value, which is the owner's switch on the Configuration page. Existing
+  // projects that never set it become protected too; see
+  // public-docs/protected-branches.md.
+  const rawProtection = raw?.protection;
+  const protectionSet = typeof rawProtection === 'object' && rawProtection !== null
+    && 'enabled' in (rawProtection as Record<string, unknown>);
+  if (!protectionSet) config.protection.enabled = MANAGED_PROTECTION_DEFAULT;
 
   // Recompute the effective values now that the config carries them, so the
   // report shows what the run actually uses rather than what the rule predicted.

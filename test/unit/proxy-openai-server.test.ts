@@ -41,19 +41,12 @@ describe('openai-wire profile upstream through the proxy', () => {
   let upstreamUrl: string;
   let records: ProxyAuditRecord[];
   let seen: { path: string; headers: Record<string, string> } | null = null;
-
-  const freePort = () => 41000 + Math.floor(Math.random() * 8000);
-
   beforeAll(async () => {
     records = [];
-    const upstreamPort = freePort();
-    const primaryPort = freePort();
-    upstreamUrl = `http://127.0.0.1:${upstreamPort}`;
-
     // The fake OpenAI-compatible upstream: records what it saw, answers a chat
     // completion (SSE when asked) or a responses body.
     upstream = Bun.serve({
-      port: upstreamPort, hostname: '127.0.0.1',
+      port: 0, hostname: '127.0.0.1',
       async fetch(req) {
         const url = new URL(req.url);
         const headers: Record<string, string> = {};
@@ -80,10 +73,13 @@ describe('openai-wire profile upstream through the proxy', () => {
         });
       },
     });
+    const upstreamPort = upstream.port!;
+    upstreamUrl = `http://127.0.0.1:${upstreamPort}`;
     primary = Bun.serve({
-      port: primaryPort, hostname: '127.0.0.1',
+      port: 0, hostname: '127.0.0.1',
       fetch: async () => Response.json({ type: 'message', from: 'primary' }),
     });
+    const primaryPort = primary.port!;
 
     const targets = new TargetCredentials();
     targets.set(upstreamUrl, async () => ({
@@ -94,16 +90,16 @@ describe('openai-wire profile upstream through the proxy', () => {
       targets,
     };
     const sink: AuditSink = { append: async (r) => { records.push(r); } };
-    proxyPort = freePort();
     proxy = createProxyServer(
       {
-        port: proxyPort, bind: '127.0.0.1',
+        port: 0, bind: '127.0.0.1',
         upstream: `http://127.0.0.1:${primaryPort}`,
         agentUpstreams: { [CODEX_PROFILE]: { upstream: upstreamUrl, wire: 'openai' } },
       },
       sink,
       credentials,
     );
+    proxyPort = proxy.port!;
     await new Promise(r => setTimeout(r, 50));
   });
 

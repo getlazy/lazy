@@ -33,7 +33,8 @@ import { builderSupervisorLogPath } from '../builder/supervisor-log-path';
 // JSONL discovery / capture for conversation capture
 import { discoverProjectSessionFiles } from '../import/claude-code-logs';
 import { excludeMachineOneshots } from '../import/machine-oneshot';
-import { safeArgvPrompt } from '../agent/argv-safety';
+import { assertArgvBounded, systemPromptArgv } from '../agent/argv-safety';
+import { SYSTEM_PROMPT_FILE_ARG } from '../agent/interface';
 import { AGENT_SELFCHECK_SENTINEL } from '../agent/binary-identity';
 import {
   snapshotSessionFiles,
@@ -48,7 +49,7 @@ declare const LAZY_RELEASE_BUILD: boolean;
 /** How often to check for JSONL changes and re-capture (ms) */
 const DEFAULT_CAPTURE_INTERVAL_MS = 30_000;
 
-/** Capture cadence — 30s in production; overridable in tests (see CLAUDE.md). */
+/** Capture cadence — 30s in production; overridable in tests (see AGENTS.md). */
 function captureIntervalMs(): number {
   if (typeof LAZY_RELEASE_BUILD === 'undefined' && process.env.LAZY_TEST === '1') {
     const override = process.env.LAZY_FORCE_BUILDER_CAPTURE_INTERVAL_MS;
@@ -190,6 +191,7 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
   const buildClaudeArgs = (resumeId: string | null, directive?: BuilderLaunchDirective): string[] =>
     composeBuilderClaudeArgs({
       systemPrompt,
+      systemPromptFile: config.systemPromptFile,
       resumeId: resumeId ?? initialResumeSessionId,
       extraArgs: claudeExtraWithoutResume,
       directive,
@@ -391,13 +393,30 @@ export async function preflightAgentBinary(command: string): Promise<void> {
 /** The claude argv for one builder launch. Exported so tests hit the real composition. */
 export function composeBuilderClaudeArgs(opts: {
   systemPrompt: string;
+  /**
+   * The file `systemPrompt` was read from. A system prompt over the argv
+   * bound is handed to Claude Code by this path instead of as an argument
+   * (the argv rule in src/agent/argv-safety.ts).
+   */
+  systemPromptFile?: string;
   resumeId: string | null;
   extraArgs: string[];
   directive?: BuilderLaunchDirective;
 }): string[] {
-  const args = ['claude', '--append-system-prompt', safeArgvPrompt(opts.systemPrompt, 'builder system prompt')];
+  const { args: promptArgs, systemPromptInput } = systemPromptArgv(
+    opts.systemPrompt, '--append-system-prompt', '--append-system-prompt-file',
+  );
+  if (systemPromptInput !== undefined && !opts.systemPromptFile) {
+    throw new Error(
+      `Builder system prompt is ${Buffer.byteLength(systemPromptInput, 'utf8')} bytes, too large for a ` +
+      'command-line argument, and no file was given to pass it by.',
+    );
+  }
+  const args = ['claude', ...promptArgs.map(a => a === SYSTEM_PROMPT_FILE_ARG ? opts.systemPromptFile! : a)];
   if (opts.resumeId) args.push('--resume', opts.resumeId);
   args.push(...applyLaunchDirective(opts.extraArgs, opts.directive));
+  // Same seam check as every other agent launch (src/agent/argv-safety.ts).
+  assertArgvBounded(args, 'Builder Claude Code');
   return args;
 }
 

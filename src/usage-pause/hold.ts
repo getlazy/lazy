@@ -65,6 +65,12 @@ export interface UsagePausePendingStart {
   requestedAt: number;
   /** The start's own parameters (StartTaskParams minus task and actor), replayed verbatim. */
   params: Record<string, unknown>;
+  /**
+   * Who asked for the held start (the parent turn's owner), replayed as the
+   * launch's owner so it bills the person it would have when asked. Absent for
+   * a start nobody asked for: the replay is a system turn then too.
+   */
+  owner?: { email: string; name?: string; spendable: boolean };
 }
 
 export function usagePausePendingStartOf(

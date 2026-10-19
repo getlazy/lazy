@@ -25,7 +25,7 @@ import { createHash } from 'crypto';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { slowSuiteSkipped } from '../helpers/slow-suite';
-import { demoTeamsPaths, teamsEnv } from '../../src/demo/teams';
+import { TEAMS_DEMO_EMAIL, demoTeamsPaths, teamsEnv } from '../../src/demo/teams';
 import { demoPaths } from '../../src/demo/paths';
 
 const CHECKOUT = resolve(import.meta.dir, '../..');
@@ -128,7 +128,7 @@ describe.skipIf(slowSuiteSkipped('teams adopt-store'))('adopting an existing sto
     // INVARIANT: a store whose lock is HELD is refused. A daemon Teams started
     // is serving this one; adopting it would give one store two writers.
     const refused = await teamsRun(root, [ 'bin/rails', 'lazy:adopt_store' ], {
-      TEAM: 'acme', NAME: 'Second Sight',
+      TEAM: 'acme', NAME: 'Second Sight', AS: TEAMS_DEMO_EMAIL,
       REPO_URL: `file://${demoPaths(root).repo}`, STORE: liveStore,
     });
     expect(refused.code).not.toBe(0);
@@ -141,7 +141,7 @@ describe.skipIf(slowSuiteSkipped('teams adopt-store'))('adopting an existing sto
 
     const before = await fingerprint(incoming);
     const adopted = await teamsRun(root, [ 'bin/rails', 'lazy:adopt_store' ], {
-      TEAM: 'acme', NAME: 'Adopted Project',
+      TEAM: 'acme', NAME: 'Adopted Project', AS: TEAMS_DEMO_EMAIL,
       REPO_URL: `file://${demoPaths(root).repo}`, STORE: incoming,
     });
     expect(adopted.out).toContain(`adopted ${taskCount} task(s)`);

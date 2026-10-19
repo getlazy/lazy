@@ -10,7 +10,7 @@
  * checks its own arguments against that and refuses to serve a mismatch.
  *
  * These tests pass env OBJECTS rather than touching process.env — the guard's
- * variables must not leak between test files (see CLAUDE.md on LAZY_TEST /
+ * variables must not leak between test files (see AGENTS.md on LAZY_TEST /
  * LAZY_IS_DAEMON cross-file leaks).
  */
 
@@ -86,7 +86,7 @@ describe('assertMcpServesExpectedTurn', () => {
     ).not.toThrow();
   });
 
-  // Per CLAUDE.md "errors are for humans": the message must name both sides and
+  // Per AGENTS.md "errors are for humans": the message must name both sides and
   // tell the human how to find the stray supervisor.
   test('names both turns and the remedy in the error', () => {
     let message = '';
@@ -131,7 +131,7 @@ describe('assertWorktreeUsable', () => {
     await expect(assertWorktreeUsable('lazy_status', file, TASK)).rejects.toBeInstanceOf(McpWorktreeMissingError);
   });
 
-  // Per CLAUDE.md "errors are for humans": name the tool, the path, the task,
+  // Per AGENTS.md "errors are for humans": name the tool, the path, the task,
   // and what to do — the raw git error had none of those.
   test('names the tool, the path and the remedy', async () => {
     const gone = join(tmpdir(), 'lazy-e2e-gone-4a71', 'worktrees', 'x');

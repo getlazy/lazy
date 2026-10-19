@@ -15,7 +15,7 @@
  *
  * - **External comments are untrusted input.** PR comments (from syncComments)
  *   are authored by external users and injected into agent prompts. They must
- *   never be treated as trusted instructions. The agent's CLAUDE.md and system
+ *   never be treated as trusted instructions. The agent's AGENTS.md and system
  *   prompt define the trust boundary, not comment authors.
  *
  * - **Token should have minimal privileges.** The GitHub token only needs
@@ -29,6 +29,7 @@
  *   token scope breadth, and remote URL correctness.
  */
 
+import { RemoteBranchMissingError, isRemoteRefMissing } from './branch-missing';
 import type {
   RepositoryDriver,
   DriverContext,
@@ -49,6 +50,7 @@ import type {
   AcceptGateWarning,
   MarkReadyOptions,
   OpenReview,
+  BranchReview,
   ReviewConversationItem,
   ReviewStatus,
 } from './driver';
@@ -64,7 +66,8 @@ import { runGit as defaultRunGit, fastForwardLocal as sharedFastForwardLocal, fi
 import { spawn, spawnSyncUnsupervised } from '../utils/spawn';
 import { truncateLog } from '../utils/log-truncate';
 import { withRemoteRetry, type RetryOptions } from '../utils/retry';
-import { applyFidelitySection, composeInitialBody } from '../synthesis/fidelity';
+import { applyFidelitySection, applyLinksSection, composeInitialBody } from '../synthesis/fidelity';
+import { descriptionLinksFor } from './description-links';
 import { remoteUrlHasHost, remoteUrlHost, remoteUrlHostContains, remoteUrlPath } from './remote-url';
 import { parsePaginatedApiJson } from './paginated-json';
 
@@ -358,16 +361,20 @@ export class GitHubDriver implements RepositoryDriver {
 
   async resolveUpstreamRef(parentBranch: string, worktreePath: string): Promise<string> {
     const remoteRef = this.upstreamRefName(parentBranch);
+    let missing = false;
     await withRemoteRetry(
       async () => {
         const fetchResult = await this.git(['fetch', this.remoteName, parentBranch], worktreePath);
         if (fetchResult.exitCode !== 0) {
+          // Not on the remote is an answer, not a network failure: no retry.
+          if (isRemoteRefMissing(fetchResult.stderr)) { missing = true; return; }
           throw new Error(`Failed to fetch ${remoteRef} from ${this.remoteName}: ${fetchResult.stderr}`);
         }
       },
       `fetch upstream ref ${parentBranch} from ${this.remoteName}`,
       this.retryOpts,
     );
+    if (missing) throw new RemoteBranchMissingError(parentBranch, this.remoteName);
     logger.debug(`resolveUpstreamRef: fetched ${remoteRef}`);
     return remoteRef;
   }
@@ -456,7 +463,7 @@ export class GitHubDriver implements RepositoryDriver {
     // Note: Branch is already pushed by exportTasks() before calling markReadyForReview().
     // We do not push again here to avoid duplicate push operations.
 
-    const body = this.buildPRBody(task);
+    const body = await this.buildPRBody(task);
 
     // Get the repository identifier to explicitly specify --repo for gh CLI.
     // This ensures the PR is created in the correct repository when multiple
@@ -563,7 +570,7 @@ export class GitHubDriver implements RepositoryDriver {
 
       logger.debug(`merge: sourceBranch=${sourceBranch}, targetBranch=${targetBranch}`);
 
-      const body = this.buildPRBody(task);
+      const body = await this.buildPRBody(task);
       const createArgs = [
         'pr', 'create',
         '--head', sourceBranch,
@@ -1260,7 +1267,7 @@ export class GitHubDriver implements RepositoryDriver {
     // 1. Check gh CLI is installed
     const ghVersion = await this.gh(['--version']);
     if (ghVersion.exitCode !== 0) {
-      checks.push({ state: 'fail', what: 'gh CLI installed', reason: 'Install from https://cli.github.com/' });
+      checks.push({ state: 'fail', what: 'gh CLI installed', problem: 'gh CLI isn\'t installed', reason: 'Install from https://cli.github.com/' });
       return checks;
     }
     checks.push({ state: 'ok', what: 'gh CLI installed' });
@@ -1288,6 +1295,7 @@ export class GitHubDriver implements RepositoryDriver {
       checks.push({
         state: 'fail',
         what: authLabel,
+        problem: `${authLabel} failed`,
         reason: enterpriseHost
           ? `gh is not authenticated to ${enterpriseHost}, the host of remote '${this.remoteName}'. Run: gh auth login --hostname ${enterpriseHost}`
           : 'Run: gh auth login',
@@ -1319,7 +1327,7 @@ export class GitHubDriver implements RepositoryDriver {
 
     // 4. Check that the configured git remote exists and points to GitHub
     if (remoteUrl.exitCode !== 0) {
-      checks.push({ state: 'fail', what: `Git remote ${this.remoteName}`, reason: `No remote '${this.remoteName}' configured. Run: git remote add ${this.remoteName} <github-url>` });
+      checks.push({ state: 'fail', what: `Git remote ${this.remoteName}`, problem: `Git remote ${this.remoteName} is not configured`, reason: `No remote '${this.remoteName}' configured. Run: git remote add ${this.remoteName} <github-url>` });
       return checks;
     }
     checks.push(remoteShapeCheck(remoteUrl.stdout, this.remoteName));
@@ -1460,7 +1468,15 @@ export class GitHubDriver implements RepositoryDriver {
   }
 
   async findOpenReviewForBranch(branch: string): Promise<OpenReview | null> {
-    const args = ['pr', 'view', branch, '--json', 'url,number,state,baseRefName'];
+    const found = await this.findReviewForBranch(branch);
+    if (!found || found.state !== 'OPEN') return null;
+    return { url: found.url, baseBranch: found.baseBranch, metadata: found.metadata };
+  }
+
+  async findReviewForBranch(branch: string): Promise<BranchReview | null> {
+    // `gh pr view <branch>` resolves the branch's open PR first and otherwise
+    // its most recent merged or closed one.
+    const args = ['pr', 'view', branch, '--json', 'url,number,state,baseRefName,headRefOid'];
     const repoIdentifier = await this.getRepoIdentifier();
     if (repoIdentifier) args.push('--repo', repoIdentifier);
     const result = await this.gh(args);
@@ -1471,14 +1487,17 @@ export class GitHubDriver implements RepositoryDriver {
       if (/no pull requests? found/i.test(result.stderr)) return null;
       throw new Error(`gh pr view ${branch} failed (exit ${result.exitCode}): ${result.stderr.trim()}`);
     }
-    let data: { url?: string; number?: number; state?: string; baseRefName?: string };
+    let data: { url?: string; number?: number; state?: string; baseRefName?: string; headRefOid?: string };
     try {
       data = JSON.parse(result.stdout);
     } catch (err) {
       throw new Error(`gh pr view ${branch} returned unparseable JSON: ${err instanceof Error ? err.message : err}`);
     }
-    if (data.state !== 'OPEN' || !data.url || data.number === undefined) return null;
+    const state = data.state === 'OPEN' || data.state === 'MERGED' || data.state === 'CLOSED' ? data.state : null;
+    if (!state || !data.url || data.number === undefined) return null;
     return {
+      state,
+      ...(data.headRefOid ? { headSha: data.headRefOid } : {}),
       url: data.url,
       baseBranch: data.baseRefName ?? '',
       metadata: {
@@ -1720,10 +1739,10 @@ export class GitHubDriver implements RepositoryDriver {
     return this.repoPrivate;
   }
 
-  private buildPRBody(task: Task): string {
+  private async buildPRBody(task: Task): Promise<string> {
     return composeInitialBody({
       goal: task.goal,
-      prompt: task.prompt ?? undefined,
+      links: await descriptionLinksFor(this.driverContext, this.config, task),
       footer: '---\n*Created by [lazy](https://getlazy.dev/)*',
     });
   }
@@ -1752,7 +1771,10 @@ export class GitHubDriver implements RepositoryDriver {
           throw new Error(`gh pr view returned unparseable JSON for PR #${prNumber}: ${err instanceof Error ? err.message : err}`);
         }
 
-        const newBody = applyFidelitySection(currentBody, summary);
+        const newBody = applyLinksSection(
+          applyFidelitySection(currentBody, summary),
+          await descriptionLinksFor(this.driverContext, this.config, task),
+        );
         if (newBody === currentBody) {
           logger.debug(`updateRemoteBody: PR #${prNumber} body unchanged — skipping edit`);
           return;

@@ -736,14 +736,15 @@ describe('armed, no reading — only for spend a usage source can read', () => {
     try {
       await putUserCredential(root, { userId: 'ada@example.com', kind: 'api-key', token: 'sk-ant-api-ada-usage' });
       const config = await loadConfig(root);
-      const cursorOnly = 'user:cursor@example.com';
-      const claude = 'user:claude@example.com';
+      const { memberEndpointUsageKey } = await import('../../src/proxy/usage-limits');
+      const cursorOnly = memberEndpointUsageKey('cursor@example.com', 'builtin:cursor');
+      const claude = memberEndpointUsageKey('claude@example.com', 'builtin:anthropic');
       daemonUsageLimits.observe({
-        ...spendWithoutHeaders(cursorOnly), credential: null, userId: 'cursor@example.com',
+        ...spendWithoutHeaders(cursorOnly), credential: cursorOnly, userId: 'cursor@example.com',
         backend: 'cursor', upstream: config.proxy.cursorUpstream,
       } as ProxyAuditRecord);
       daemonUsageLimits.observe({
-        ...spendWithoutHeaders(claude), credential: null, userId: 'claude@example.com',
+        ...spendWithoutHeaders(claude), credential: claude, userId: 'claude@example.com',
         upstream: config.proxy.upstream,
       } as ProxyAuditRecord);
       const flagged = (await usagePauseCoverage(root, config)).map((c) => c.credential);
@@ -1080,6 +1081,14 @@ describe('the usage-limits view carries coverage and never an unreadable store',
 });
 
 describe('the CLI names the override only to a person who could use it', () => {
+  test('a builder may carry a task allowance, but cannot override a beside-task ask', async () => {
+    const { overrideClearsUsagePausePreflight } = await import('../../src/cli/usage-pause-preflight');
+    expect(overrideClearsUsagePausePreflight({ pastUsagePause: true }, false, false)).toBe(true);
+    expect(overrideClearsUsagePausePreflight({ beside: true, pastUsagePause: true }, false, false)).toBe(false);
+    expect(overrideClearsUsagePausePreflight({ beside: true, pastUsagePause: true }, true, false)).toBe(true);
+    expect(overrideClearsUsagePausePreflight({ pastUsagePause: true }, true, true)).toBe(false);
+  });
+
   // INVARIANT: the CLI pre-flight and `lazy daemon config get` never name the
   // override command to a caller the daemon would not name it to. The builder
   // runs `lazy unblock` from its own shell; a hint spelling out the escape
@@ -1095,6 +1104,8 @@ describe('the CLI names the override only to a person who could use it', () => {
     expect(builder).not.toContain('lazy daemon config set');
     expect(builder).toContain('once the window resets');
     expect(preflightRefusalLines(verdict, 'unblock', true).join('\n')).toContain('lazy daemon config set usage_pause_threshold off');
+    expect(preflightRefusalLines(verdict, 'ask', true, undefined, 'finished-task').join('\n'))
+      .toContain('lazy ask finished-task --override-usage-pause');
   });
 
   test('the builder channel is never offered it', async () => {

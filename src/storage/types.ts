@@ -67,6 +67,7 @@ import type {
   ScratchSkipReason,
   SystemMessage,
   SystemMessageInput,
+  SystemMessageDismissFilter,
   SystemMessageKind,
   HunkApproval,
   HunkApprovalLineage,
@@ -157,6 +158,7 @@ export type {
   ScratchSkipReason,
   SystemMessage,
   SystemMessageInput,
+  SystemMessageDismissFilter,
   SystemMessageKind,
   HunkApproval,
   HunkApprovalLineage,
@@ -197,6 +199,11 @@ export interface StatusChange {
   actor_email?: string;
   /** Their display name at the time, when the write carried one. */
   actor_name?: string;
+  /**
+   * Why the change happened, when lazy itself caused it (a launch that failed,
+   * an unrecoverable agent failure). Absent on an ordinary transition.
+   */
+  reason?: string;
 }
 
 /**
@@ -473,7 +480,9 @@ export interface MemoryCompactFile {
  * Search result entry
  */
 export interface SearchResult {
-  entity_type: 'task' | 'prompt' | 'turn' | 'commit' | 'comment' | 'followup' | 'raised' | 'conversation' | 'memory' | 'scratch';
+  entity_type: 'task' | 'prompt' | 'turn' | 'commit' | 'comment' | 'followup' | 'raised' | 'conversation' | 'memory' | 'scratch' | 'review_comment' | 'artifact' | 'message' | 'journal';
+  /** True when the hit matched by the entity's id (prefix or full), not by text. */
+  matched_id?: boolean;
   entity_id: string;
   task_id: string;
   task_code: string | null;
@@ -534,6 +543,7 @@ export interface ConversationStats {
  * `listConversationSummaries()` so they do not parse every full file.
  */
 export interface ConversationSummary {
+  memberEmail?: string | null;
   sessionId: string;
   startedAt: string | null;
   endedAt: string | null;
@@ -544,6 +554,7 @@ export interface ConversationSummary {
 }
 
 export interface StoredConversation {
+  memberEmail?: string | null;
   /** Claude Code session UUID */
   sessionId: string;
   /** Encoded project directory name from Claude Code */
@@ -585,6 +596,7 @@ export interface StoredConversation {
  * segments on every read, never stored. See docs/design/builder-identity.md.
  */
 export interface BuilderSummary {
+  memberEmail?: string | null;
   /** Session id of the Builder's first segment. Stable as the Builder grows. */
   id: string;
   /** First human message of the first segment. */
@@ -826,6 +838,26 @@ export interface ProxyAuditRecord {
    */
   credentialProfile?: string | null;
   /**
+   * The credential lazy's proxy REFUSED to use on this request (it could not
+   * resolve a usable one — a refused refresh, a missing connection). Set only on
+   * the proxy's own refusals, and read only by src/proxy/credential-health.ts:
+   * deliberately not `credential`/`userId`, which other readers take as a
+   * rejection of the member's Claude token and as spend.
+   */
+  refusedCredential?: { key: string; userId: string | null; profile: string | null };
+  /**
+   * The `[endpoints.<name>]` a TIERED profile's request was served by, and that
+   * tier's 0-based position — so usage can be broken down per endpoint. Absent
+   * on every request of an ordinary profile.
+   */
+  servedByEndpoint?: string | null;
+  tierIndex?: number | null;
+  /**
+   * The tiered profile whose tier served the request, so two profiles that share
+   * an endpoint, model and tier position stay apart. Absent wherever `tierIndex` is.
+   */
+  tierProfile?: string | null;
+  /**
    * Resolved backend the request was forwarded to
    * (anthropic|ollama|proxy-upstream|cursor|unknown). `cursor` marks a record
    * from the verbatim cursor passthrough route: every Anthropic-wire field
@@ -868,8 +900,30 @@ export interface ProxyAuditRecord {
   stopReason: string | null;
   /** Upstream/proxy error message if the forward failed. */
   error: string | null;
-  /** Total proxy-side handling duration in ms. */
+  /**
+   * Milliseconds from request start (`ts`) to the upstream's response HEADERS
+   * (time to first byte). The name is historical — records written before the
+   * latency fields existed carry only this — so it keeps that meaning. For
+   * the end of the response see `ttltMs`.
+   */
   durationMs: number | null;
+  /**
+   * Milliseconds from `ts` to the first CONTENT event of a streamed response
+   * (time to first token): an Anthropic `content_block_delta`, an OpenAI chat
+   * chunk whose delta carries text/reasoning/tool arguments, a Responses
+   * `response.*.delta`. Keep-alive frames, `message_start` and role-only
+   * chunks do not count. Null on non-streamed and buffered responses; absent
+   * on records that predate it. Includes any connection/TLS setup: Bun's
+   * fetch does not expose that phase separately (docs/proxy-latency.md).
+   */
+  ttftMs?: number | null;
+  /**
+   * Milliseconds from `ts` to the last byte of the response (time to last
+   * token): the stream's end. Absent when the response was not teed (errors,
+   * count_tokens) and on records that predate it. A client cancel records the
+   * moment of the cancel.
+   */
+  ttltMs?: number | null;
   /**
    * Smart-routing failover metadata. Null when the request ran on the primary
    * upstream (the common case). Set when the proxy rerouted to a configured
@@ -1073,12 +1127,31 @@ export interface ProjectSettings {
    * daemon start, so a clear sticks. Designating a command removes it.
    */
   startServicesCmdCleared?: boolean;
+  /**
+   * The project-wide command that STOPS a task's services, run before lazy ends
+   * the Start services process group (src/serve/start-cmd.ts). Store-only, like
+   * `startServicesCmd`, with no lazy.toml counterpart; absent means "just end
+   * the process group". Carried forward by `setProjectSettings` the same way.
+   */
+  stopServicesCmd?: string;
+  /**
+   * How a PR/MR description links back into Lazy Teams, pushed by Teams
+   * (`setTeamsLinks`) — Teams owns its own address and URL scheme, the daemon
+   * only substitutes `{task}` / `{service}`. Absent on a solo install, where
+   * a description gets no links. Carried forward by `setProjectSettings`.
+   */
+  teamsLinks?: {
+    /** e.g. `https://teams.example/teams/1/projects/2/tasks/{task}`. */
+    taskUrlTemplate: string;
+    /** e.g. `https://teams.example/.../tasks/{task}/services/{service}`; absent: no service link. */
+    serviceUrlTemplate?: string;
+  };
   /** ISO timestamp of the last write. Display only. */
   updatedAt?: string;
   /**
    * Actor role that last wrote these settings (`human`, `system`, …). The wire
    * carries a role, never a person — Rails records WHICH user asked on its own
-   * side (see lazy-teams/CLAUDE.md, `TaskAction`).
+   * side (see lazy-teams/AGENTS.md, `TaskAction`).
    */
   updatedBy?: string;
 }
@@ -1207,6 +1280,20 @@ export interface BuilderSession {
    * start; the same events are in the daemon log under the run id.
    */
   startTimeline?: BuilderStartEvent[] | null;
+  /**
+   * The runner image the most recent launch ran on. `fallback` is lazy's
+   * default image because the project's own image was not ready when the run
+   * started — the builder page shows a banner for it, and offers a restart on
+   * the project's image once that is ready (src/daemon/runner-image.ts).
+   */
+  runnerImage?: BuilderRunnerImage | null;
+}
+
+/** Which image a builder run's container was launched from. */
+export interface BuilderRunnerImage {
+  image: string;
+  /** `custom` the project's image; `fallback` lazy's default while it was not ready; `standard` no custom image configured. */
+  kind: 'custom' | 'fallback' | 'standard';
 }
 
 /** One entry of a builder start's timeline. */
@@ -1233,4 +1320,5 @@ export interface BuilderSessionUpdate {
   endedAt?: string | null;
   lastExit?: string | null;
   startTimeline?: BuilderStartEvent[] | null;
+  runnerImage?: BuilderRunnerImage | null;
 }

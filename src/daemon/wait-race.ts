@@ -16,6 +16,7 @@ import { RpcError } from './rpc-handlers';
 import { displayId } from '../task/identity';
 import type { Task } from '../types';
 import { isUsagePauseHeldStart } from '../usage-pause/hold';
+import { createdByOwnAgent } from '../task/created-by-own-agent';
 
 export const WAIT_POLL_INTERVAL_MS = 1500;
 export const WAIT_MAX_TIMEOUT_S = 600;
@@ -27,6 +28,10 @@ export interface WaitStorage {
   getSessionByTaskId(id: string): Promise<{ id: string } | null>;
   getTurnCountByTaskId(id: string): Promise<number>;
   getSessionTurns(sessionId: string): Promise<Array<{ sequence: number; role: string; timestamp: number }>>;
+  /** Needed only when `interruptOnNewChildOf` is set. */
+  getChildTasks?(parentTaskId: string): Promise<Task[]>;
+  /** Needed only when `interruptOnNewChildOf` is set. */
+  getStatusHistory?(taskId: string): Promise<Array<{ timestamp: number; actor?: string }>>;
 }
 
 /** Current state of one task in the race. */
@@ -70,11 +75,54 @@ export interface WaitRaceResult {
    * Filled by handleWait (needs the project root), not by raceWait itself.
    */
   head_sha?: string;
+  /**
+   * Set ONLY when the wait was cut short by an event the waiter must know about
+   * rather than by a task finishing or the timeout. `timed_out` is false and
+   * `status` is whatever the first task's was — callers must check this first.
+   */
+  interrupted?: WaitInterruption;
+}
+
+export interface WaitInterruption {
+  reason: 'subtask_added' | 'comment_added';
+  message: string;
+  /** The subtasks that appeared under the waiter while it was waiting (`subtask_added`). */
+  new_tasks?: Array<{ task_id: string; display_id: string; code: string | null }>;
+  /** The notes block an unblock would carry, verbatim (`comment_added`). */
+  notes?: string;
+  comment_count?: number;
+  /**
+   * Handle for the delivery acknowledgement (`comment_added`). The MCP layer
+   * acks it just before the response goes to the agent and strips it from what
+   * the agent sees; nothing is marked delivered until then.
+   */
+  claim?: { through: number; claim_id: string };
+}
+
+/** What a comment hand-off hook returns when a deliverable comment is waiting. */
+export interface WaitCommentClaim {
+  notes: string;
+  count: number;
+  through: number;
+  claim_id: string;
 }
 
 export interface WaitRaceOptions {
   timeoutSecs?: number;
   pollIntervalMs?: number;
+  /**
+   * The WAITING task. When set, a subtask created under it after the wait began
+   * interrupts the wait: the caller is a parent blocked on its children, and a
+   * new child it did not start (its own agent is parked here) is news.
+   */
+  interruptOnNewChildOf?: string;
+  /**
+   * Claims the comments queued on the waiting task for its running turn (the
+   * mid-turn hand-off, src/daemon/turn-comments.ts), or null when none may be
+   * delivered. Claiming marks nothing delivered. Called only while no subtask
+   * interruption is pending, and a claim it makes is always returned.
+   */
+  claimComments?: () => Promise<WaitCommentClaim | null>;
 }
 
 interface WaitTarget {
@@ -250,10 +298,65 @@ export async function raceWait(
     return buildResult(alreadyDone, alreadyDone.status, tasks, {});
   }
 
+  const watchParent = options.interruptOnNewChildOf;
+  if (watchParent && (!storage.getChildTasks || !storage.getStatusHistory)) {
+    throw new Error('raceWait: interruptOnNewChildOf needs a storage with getChildTasks and getStatusHistory');
+  }
+  const knownChildren = new Set<string>(
+    watchParent ? (await storage.getChildTasks!(watchParent)).map(t => t.id) : [],
+  );
+
+  const pendingAdded: Task[] = [];
   const deadline = Date.now() + timeoutSecs * 1000;
 
   while (Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+
+    // Children added from outside since the wait began. Computed before the
+    // target sweep but applied after it: a task that settled in the same sweep
+    // is still the answer, and carries the interruption alongside.
+    let interruption: WaitInterruption | null = null;
+    if (watchParent) {
+      const added: Task[] = [];
+      for (const child of await storage.getChildTasks!(watchParent)) {
+        if (knownChildren.has(child.id)) continue;
+        knownChildren.add(child.id);
+        if (!(await createdByOwnAgent({ getStatusHistory: storage.getStatusHistory! }, child))) added.push(child);
+      }
+      if (added.length > 0) {
+        pendingAdded.push(...added);
+      }
+      if (pendingAdded.length > 0) {
+        const labels = pendingAdded.map(t => displayId(t));
+        interruption = {
+          reason: 'subtask_added',
+          message:
+            `Wait interrupted: ${pendingAdded.length === 1 ? 'a new subtask was' : 'new subtasks were'} added to your task ` +
+            `from outside (${labels.join(', ')}). The tasks you waited on have not necessarily finished; ` +
+            `review the new subtask, then wait again.`,
+          new_tasks: pendingAdded.map(t => ({ task_id: t.id, display_id: displayId(t), code: t.code ?? null })),
+        };
+      }
+    }
+    // A comment on the waiting task is news too. Claimed only when it will be
+    // returned (a claim counts against the turn budget); a pending subtask
+    // interruption goes first and the comment rides the next wait.
+    if (!interruption && options.claimComments) {
+      const claim = await options.claimComments();
+      if (claim) {
+        interruption = {
+          reason: 'comment_added',
+          message:
+            `Wait interrupted: ${claim.count === 1 ? 'a new comment was' : `${claim.count} new comments were`} added to your task. ` +
+            `They are below and count as delivered; act on them now. The tasks you waited on have not necessarily finished; wait again afterwards.`,
+          notes: claim.notes,
+          comment_count: claim.count,
+          claim: { through: claim.through, claim_id: claim.claim_id },
+        };
+      }
+    }
+    const withInterruption = (extra: Partial<WaitRaceResult>): Partial<WaitRaceResult> =>
+      interruption ? { ...extra, interrupted: interruption } : extra;
 
     // Statuses observed during THIS sweep, so the reported set reflects the
     // moment the winner fired rather than a second round of reads.
@@ -282,7 +385,7 @@ export async function raceWait(
       // Status changed from working — done
       if (task.status !== 'working') {
         const tasks = await currentSnapshots(storage, targets, observed, observedHeld);
-        return buildResult(target, task.status, tasks, {});
+        return buildResult(target, task.status, tasks, withInterruption({}));
       }
 
       // Check if turn count increased with an agent turn
@@ -295,17 +398,30 @@ export async function raceWait(
           const latestTurn = turns[turns.length - 1];
           if (latestTurn && latestTurn.role === 'agent') {
             const tasks = await currentSnapshots(storage, targets, observed, observedHeld);
-            return buildResult(target, task.status, tasks, {
+            return buildResult(target, task.status, tasks, withInterruption({
               turn_count: currentTurnCount,
               latest_turn: {
                 sequence: latestTurn.sequence,
                 role: latestTurn.role,
                 timestamp: latestTurn.timestamp,
               },
-            });
+            }));
           }
         }
       }
+    }
+
+    if (interruption) {
+      const tasks = await currentSnapshots(storage, targets, observed, observedHeld);
+      return {
+        task_id: targets[0].id,
+        display_id: targets[0].display,
+        status: tasks[0]?.status ?? 'working',
+        timed_out: false,
+        tasks,
+        pending: tasks.filter(stillRunning),
+        interrupted: interruption,
+      };
     }
   }
 

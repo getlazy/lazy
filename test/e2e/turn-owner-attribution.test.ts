@@ -23,13 +23,14 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
-import { readTurns, readSessionJson, taskFilePath, storageDirFor, findFullTaskId, setTaskStatus } from '../helpers/storage';
+import { readTurns, readSessionJson, readTaskStatus, taskFilePath, storageDirFor, findFullTaskId, setTaskStatus } from '../helpers/storage';
 import { runReconcile } from '../helpers/reconcile';
 import { consumeResponse, protocolDir as getProtocolDir } from '../../src/protocol';
 import { DaemonClient } from '../../src/daemon/client';
 import { getDaemonTcpTarget, readToken } from '../../src/daemon/lifecycle';
 import { mintMcpToken, clearMcpTokenCache } from '../../src/daemon/mcp-tokens';
-import { readFileSync } from 'fs';
+import { readFileSync, rmSync, writeFileSync } from 'fs';
+import { join } from 'path';
 
 interface AttributedRow {
   content?: string;
@@ -43,11 +44,15 @@ describe('agent turns carry the turn owner', () => {
   let sharedToken: string;
   let target: string;
   let managed = false;
+  let holdFile: string;
 
   beforeEach(async () => {
     managed = false;
     clearMcpTokenCache();
-    ctx = await setupTestLazy({ withDaemon: true });
+    // A task's MCP token acts only for the turn that is running, so an agent
+    // write is played while a turn is HELD open (the module mock's seam).
+    holdFile = join(process.env.TMPDIR ?? '/tmp', `lazy-owner-hold-${process.pid}-${Date.now()}`);
+    ctx = await setupTestLazy({ withDaemon: true, daemonEnv: { LAZY_MOCK_HOLD_TURN_FILE: holdFile } });
     const resolvedTarget = getDaemonTcpTarget(ctx.root);
     const resolvedToken = readToken(ctx.root);
     if (!resolvedTarget || !resolvedToken) {
@@ -58,9 +63,31 @@ describe('agent turns carry the turn owner', () => {
   });
 
   afterEach(async () => {
+    rmSync(holdFile, { force: true });
     await ctx.cleanup();
     clearMcpTokenCache();
   });
+
+  /**
+   * Run `during` while the turn `launch` starts on `shortId` is still running,
+   * then release it and wait it out.
+   */
+  async function duringTurn(shortId: string, launch: () => Promise<unknown>, during: () => Promise<void>): Promise<void> {
+    writeFileSync(holdFile, 'hold');
+    const launched = launch().catch((err) => err);
+    try {
+      const deadline = Date.now() + 20_000;
+      while (readTaskStatus(ctx.root, shortId) !== 'working') {
+        if (Date.now() > deadline) throw new Error(`no live turn on ${shortId}`);
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      await during();
+    } finally {
+      rmSync(holdFile, { force: true });
+      await launched;
+    }
+    expect(await ctx.lazy(['wait', shortId])).toHaveProperty('exitCode', 0);
+  }
 
   async function rpc(token: string, command: string, params: Record<string, unknown> = {}) {
     return await DaemonClient.fromTarget(target, token).rpc(command, ctx.root, params);
@@ -125,6 +152,19 @@ describe('agent turns carry the turn owner', () => {
     return resp.status;
   }
 
+  /** Any tool call the way the task's AGENT makes it: its own MCP token, no identity sent. */
+  async function agentTool(fullTaskId: string, tool: string, args: Record<string, unknown>): Promise<{ status: number; body: string }> {
+    clearMcpTokenCache();
+    const token = await mintMcpToken(ctx.root, { kind: 'task', taskId: fullTaskId }, 'e2e-agent');
+    const base = target.startsWith('http') ? target : `http://${target}`;
+    const resp = await fetch(`${base}/mcp/${fullTaskId}/${tool}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}`, 'X-Lazy-Project': ctx.root },
+      body: JSON.stringify({ arguments: args }),
+    } as any);
+    return { status: resp.status, body: await resp.text() };
+  }
+
   function readJournal(shortId: string): AttributedRow[] {
     try {
       return JSON.parse(readFileSync(taskFilePath(ctx.root, shortId, 'journal.json'), 'utf-8')).journal;
@@ -148,8 +188,10 @@ describe('agent turns carry the turn owner', () => {
     const ivanToken = await mintUserToken('ivan@example.com', 'Ivan');
     const peteToken = await mintUserToken('pete@example.com', 'Pete');
 
-    await rpc(ivanToken, 'unblockTask', { taskId, message: 'Handle the empty case too' });
-    expect(await ctx.lazy(['wait', taskId])).toHaveProperty('exitCode', 0);
+    // And a row the AGENT writes over its own MCP token, during that turn.
+    await duringTurn(taskId, () => rpc(ivanToken, 'unblockTask', { taskId, message: 'Handle the empty case too' }), async () => {
+      expect(await agentJournalWrite(fullTaskId, 'agent note during ivan\'s turn')).toBe(200);
+    });
 
     // The durable record, which is what a restarted daemon would read.
     expect(readSessionJson(ctx.root, taskId)?.turn_owner_email).toBe('ivan@example.com');
@@ -161,16 +203,15 @@ describe('agent turns carry the turn owner', () => {
     expect(afterIvan.at(-1)?.actor_email).toBe('ivan@example.com');
     expect(afterIvan.at(-1)?.actor_name).toBe('Ivan');
 
-    // And a row the AGENT wrote, over its own MCP token.
-    expect(await agentJournalWrite(fullTaskId, 'agent note during ivan\'s turn')).toBe(200);
     const ivanNote = readJournal(taskId).at(-1);
     expect(ivanNote?.actor_email).toBe('ivan@example.com');
     // The CHANNEL is still 'agent': "ivan's agent decided this" must stay
     // tellable from "ivan typed this".
     expect(ivanNote?.actor).toBe('agent');
 
-    await rpc(peteToken, 'unblockTask', { taskId, message: 'Now rename the module' });
-    expect(await ctx.lazy(['wait', taskId])).toHaveProperty('exitCode', 0);
+    await duringTurn(taskId, () => rpc(peteToken, 'unblockTask', { taskId, message: 'Now rename the module' }), async () => {
+      expect(await agentJournalWrite(fullTaskId, 'agent note during pete\'s turn')).toBe(200);
+    });
 
     expect(readSessionJson(ctx.root, taskId)?.turn_owner_email).toBe('pete@example.com');
 
@@ -180,13 +221,82 @@ describe('agent turns carry the turn owner', () => {
     // History is not rewritten: ivan's turn stays ivan's.
     expect(afterPete[afterIvan.length - 1]?.actor_email).toBe('ivan@example.com');
 
-    expect(await agentJournalWrite(fullTaskId, 'agent note during pete\'s turn')).toBe(200);
     expect(readJournal(taskId).at(-1)?.actor_email).toBe('pete@example.com');
+  });
+
+  // INVARIANT: a subtask a task's agent starts is part of that agent's turn, so
+  // it is owned by — and billed to — whoever asked for the PARENT's turn, read
+  // from the parent's session. It used to launch ownerless, and on a managed
+  // host was billed to the project's service holder and refused (field report
+  // 2026-10-06). The system-owned parent case is unit-tested in
+  // test/unit/endpoint-spending.test.ts.
+  test("a subtask the agent starts during ivan's turn is ivan's turn too", async () => {
+    const parentId = await createTask(ctx, 'Parent task', 'Some work');
+    await runOneTurn(parentId);
+    const fullParentId = findFullTaskId(ctx.root, parentId);
+    const ivanToken = await mintUserToken('ivan@example.com', 'Ivan');
+    let childId: string | undefined;
+    let starting: Promise<{ status: number; body: string }> | undefined;
+    await duringTurn(parentId, () => rpc(ivanToken, 'unblockTask', { taskId: parentId, message: 'Split the work into a subtask' }), async () => {
+      const created = await agentTool(fullParentId, 'lazy_create', { goal: 'Child task', prompt: 'Child work' });
+      expect(created.status).toBe(200);
+      childId = created.body.match(/\b([0-9a-f]{8})\b/)?.[1];
+      expect(childId).toBeDefined();
+      // The child's launch is held too (one hold per daemon): await it once
+      // the parent's turn is released.
+      starting = agentTool(fullParentId, 'lazy_start', { task_id: childId! });
+      const deadline = Date.now() + 20_000;
+      while (readTaskStatus(ctx.root, childId!) !== 'working' && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    });
+    expect(readSessionJson(ctx.root, parentId)?.turn_owner_email).toBe('ivan@example.com');
+    const started = await starting!;
+    expect(started.status, started.body).toBe(200);
+    expect(await ctx.lazy(['wait', childId!])).toHaveProperty('exitCode', 0);
+    expect(readSessionJson(ctx.root, childId!)?.turn_owner_email).toBe('ivan@example.com');
+  });
+
+  // INVARIANT: a task a member's builder session starts is that member's turn,
+  // billed to them — resolved from the builder session record the daemon finds
+  // through its own authenticated MCP token's label, never a request field.
+  // Builder launches used to run ownerless and bill (or be refused for) the
+  // project's service holder.
+  test("a task ivan's builder session starts is ivan's turn", async () => {
+    const taskId = await createTask(ctx, 'Builder-started task', 'Some work');
+    // Seeded as the DAEMON would write it, before managed mode is armed: on a
+    // managed host no caller may write a builder-session row.
+    const now = new Date().toISOString();
+    await rpc(sharedToken, 'storage', { method: 'createBuilderSession', args: { session: {
+      id: 'e2e-builder-session', projectRoot: ctx.root, memberEmail: 'ivan@example.com', kind: 'interactive',
+      state: 'running', containerName: null, builderId: 'b1', agentSessionId: null,
+      createdAt: now, updatedAt: now, endedAt: null,
+    } } });
+    await mintUserToken('ivan@example.com', 'Ivan');
+    clearMcpTokenCache();
+    const token = await mintMcpToken(ctx.root, { kind: 'builder' }, 'builder-b1');
+    const base = target.startsWith('http') ? target : `http://${target}`;
+    const resp = await fetch(`${base}/mcp/_/lazy_start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}`, 'X-Lazy-Project': ctx.root },
+      body: JSON.stringify({ arguments: { task_id: taskId } }),
+    } as any);
+    expect(resp.status, await resp.text()).toBe(200);
+    expect(await ctx.lazy(['wait', taskId])).toHaveProperty('exitCode', 0);
+    expect(readSessionJson(ctx.root, taskId)?.turn_owner_email).toBe('ivan@example.com');
   });
 
   // INVARIANT: the owner is DURABLE. This is the case the in-memory map loses
   // and the reason the record moved to the session: the daemon that reads the
   // owner back is frequently not the daemon that recorded it.
+  //
+  // What this proves since MCP authority was bound to the live turn
+  // (2026-10-10): the SESSION record survives the restart, and the MCP door
+  // reads the person from the session, not from request memory. It no longer
+  // proves an agent write that spans the restart. A work turn cannot span one
+  // any more: the restart interrupts it, the resume is a system turn, and a
+  // token with no live turn may not write. So the write happens during a turn
+  // launched after the restart.
   test('a restarted daemon still knows whose turn the agent is running', async () => {
     const taskId = await createTask(ctx, 'Restart attribution task', 'Some work');
     await runOneTurn(taskId);
@@ -204,7 +314,11 @@ describe('agent turns carry the turn owner', () => {
     // is the same one anyway.
     expect(readSessionJson(ctx.root, taskId)?.turn_owner_email).toBe('test@lazy.test');
 
-    expect(await agentJournalWrite(fullTaskId, 'note written after the restart')).toBe(200);
+    // A turn run after the restart: its agent's write names whoever the
+    // durable record says asked for it.
+    await duringTurn(taskId, () => ctx.lazyMocked(['unblock', taskId, '--message', 'Go on', '--yes'], MOCK_CLAUDE_SUCCESS), async () => {
+      expect(await agentJournalWrite(fullTaskId, 'note written after the restart')).toBe(200);
+    });
     const note = readJournal(taskId).at(-1);
     expect(note?.actor_email).toBe('test@lazy.test');
     expect(note?.actor_name).toBe('Lazy Test');

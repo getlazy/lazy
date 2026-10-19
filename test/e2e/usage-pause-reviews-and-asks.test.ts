@@ -292,7 +292,7 @@ describe('usage pause: reviews, asks and syncs', () => {
     expect(reviewOut).toContain('was not reviewed');
     expect(reviewOut).toContain('paused');
     expect(reviewOut).toContain('97%');
-    expect(reviewOut).toContain('--past-usage-pause');
+    expect(reviewOut).toContain('--override-usage-pause');
 
     // The CLI refuses before the question is typed…
     const ask = await ctx.lazy(['ask', taskId, '-m', 'why this way?']);

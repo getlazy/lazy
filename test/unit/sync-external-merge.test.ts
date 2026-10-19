@@ -27,6 +27,9 @@ let metadataWrites: Array<{ taskId: string; key: string; value: string }> = [];
 // records every method NAME the sync pass touches on the driver mock.
 let driverMethodCalls: string[] = [];
 let updateRemoteBodyBodies: string[] = [];
+// What the driver reports for a task never reflected (real drivers: -1).
+let unsetWatermark = 0;
+let mockChildren: any[] = [];
 // Set to simulate a forge outage: updateRemoteBody rejects with this message.
 let updateRemoteBodyError: string | null = null;
 // Set to make synthesis fail for ONE task (see getChildTasks in the storage mock).
@@ -75,7 +78,7 @@ await mockModule(resolve(import.meta.dir, '../../src/remote/index.ts'), () => ({
       // Reads the task's own metadata, as the real drivers do, so a test can
       // run two sync passes and have the second one see what the first wrote
       // (the mock storage's updateTaskMetadata mirrors into task.metadata).
-      getLastFidelityTurnSeq: (task: any) => Number(task.metadata?.github_fidelity_turn_seq ?? 0),
+      getLastFidelityTurnSeq: (task: any) => Number(task.metadata?.github_fidelity_turn_seq ?? unsetWatermark),
       isImportedComment: () => false,
       ciFailureSyncedKey: () => 'github_ci_failure_synced',
       getLastCIFailureSynced: () => undefined,
@@ -130,7 +133,7 @@ await mockModule(resolve(import.meta.dir, '../../src/protocol/index.ts'), () => 
 }));
 
 // Import after mocking
-const { runSync, clearPendingFidelity } = await import('../../src/daemon/remote-sync');
+const { runSync, refreshFidelityForTask, clearPendingFidelity } = await import('../../src/daemon/remote-sync');
 const { withTaskLifecycleLock } = await import('../../src/daemon/task-lifecycle-lock');
 
 // Mock storage
@@ -167,7 +170,7 @@ function createMockStorage() {
         gatherEventsAttempts++;
         throw new Error('malformed turn record');
       }
-      return [];
+      return mockChildren;
     },
     close: async () => {},
   } as any;
@@ -186,7 +189,7 @@ function createMockLogger() {
 }
 
 // Helper to create a task with given status
-function makeTask(status: 'blocked' | 'conflict' | 'merging', hasRemoteRef = true) {
+function makeTask(status: 'blocked' | 'conflict' | 'merging' | 'submitted', hasRemoteRef = true) {
   return {
     id: 'test-task-id-12345678',
     code: 'test-task',
@@ -245,6 +248,7 @@ describe('sync external merge detection', () => {
     metadataWrites = [];
     driverMethodCalls = [];
     updateRemoteBodyBodies = [];
+    unsetWatermark = 0;
     updateRemoteBodyError = null;
     failSynthesisForTaskId = null;
     gatherEventsAttempts = 0;
@@ -1458,5 +1462,122 @@ describe('a CLOSED PR: lazy\'s own close vs somebody else\'s', () => {
 
     expect(abandonedTasks).toEqual([mockTask.id]);
     expect(reparentedFrom).toEqual([mockTask.id]);
+  });
+});
+
+describe('PR description for a task submitted with work already done', () => {
+  beforeEach(() => {
+    updateRemoteBodyBodies = [];
+    updateRemoteBodyError = null;
+    mockTask = null; mockLinkedTask = null; mockSessionCommits = []; metadataWrites = [];
+    clearPendingFidelity();
+  });
+
+  // INVARIANT: a task with work never keeps the "Pending — updated automatically"
+  // promise when the summarizer cannot run: the description says so plainly.
+  test('synthesis fallback before the first summary writes an honest notice', async () => {
+    process.env.LAZY_SUMMARIZER_STUB = '1';
+    process.env.LAZY_SUMMARIZER_FAIL = '1';
+    unsetWatermark = -1;
+    try {
+      mockTask = makeTask('submitted');
+      mockSession = makeSession();
+      mockSessionTurns = [
+        { id: 'turn-1', session_id: mockSession.id, sequence: 1, role: 'agent', turn_type: 'work', auto_triggered: false, actor: 'agent', content: 'Did it', created_at: Date.now() },
+      ];
+      mockSessionCommits = [{ sha: 'c1', message: 'Do the thing' }];
+      mockPRState = 'OPEN';
+      await refreshFidelityForTask(createMockStorage(), '/tmp/test', mockTask.id);
+      expect(updateRemoteBodyBodies).toHaveLength(1);
+      expect(updateRemoteBodyBodies[0]).toContain('Summary not available yet');
+      expect(updateRemoteBodyBodies[0]).not.toContain('Pending');
+    } finally {
+      unsetWatermark = 0;
+      delete process.env.LAZY_SUMMARIZER_STUB;
+      delete process.env.LAZY_SUMMARIZER_FAIL;
+    }
+  });
+
+  // INVARIANT: submit refreshes this task's description at once (no wait for the sweep).
+  test('refreshFidelityForTask writes a real summary for a task with work', async () => {
+    process.env.LAZY_SUMMARIZER_STUB = '1';
+    unsetWatermark = -1;
+    try {
+      mockTask = makeTask('submitted');
+      mockSession = makeSession();
+      mockSessionTurns = [
+        { id: 'turn-1', session_id: mockSession.id, sequence: 1, role: 'agent', turn_type: 'work', auto_triggered: false, actor: 'agent', content: 'Did it', created_at: Date.now() },
+      ];
+      mockSessionCommits = [{ sha: 'c1', message: 'Do the thing' }];
+      await refreshFidelityForTask(createMockStorage(), '/tmp/test', mockTask.id);
+      expect(updateRemoteBodyBodies).toHaveLength(1);
+      expect(updateRemoteBodyBodies[0]).toContain('SYNTHESIZED-FIDELITY');
+    } finally {
+      unsetWatermark = 0;
+      delete process.env.LAZY_SUMMARIZER_STUB;
+    }
+  });
+});
+
+describe('single-task description refresh', () => {
+  // INVARIANT: a refresh scoped to one task never touches another task's carried
+  // retry state (breaker, attempt budget). Pruning it on every submit re-armed
+  // the budget for every task whenever anyone submitted.
+  test('refreshing a different task does not reset a tripped breaker', async () => {
+    process.env.LAZY_SUMMARIZER_STUB = '1';
+    process.env.LAZY_SUMMARIZER_FAIL = '1';
+    resetSynthesisLog();
+    try {
+      clearPendingFidelity();
+      updateRemoteBodyBodies = [];
+      mockTask = makeTask('blocked');
+      mockSession = makeSession();
+      mockSessionTurns = [
+        { id: 'turn-1', session_id: mockSession.id, sequence: 1, role: 'agent', turn_type: 'work', auto_triggered: false, actor: 'agent', content: 'Work', created_at: Date.now() },
+      ];
+      mockSessionCommits = [{ sha: 'c1', message: 'Do the thing' }];
+      mockPRState = 'OPEN';
+      const logger = createMockLogger();
+      for (let i = 0; i < 3; i++) await runSync('/tmp/test', createMockStorage(), logger);
+      expect(synthesisRuns()).toBe(3);
+
+      await refreshFidelityForTask(createMockStorage(), '/tmp/test', 'some-other-task-id');
+      await runSync('/tmp/test', createMockStorage(), logger);
+      expect(synthesisRuns()).toBe(3);
+    } finally {
+      delete process.env.LAZY_SUMMARIZER_STUB;
+      delete process.env.LAZY_SUMMARIZER_FAIL;
+      delete process.env.LAZY_SUMMARIZER_STUB_LOG;
+    }
+  });
+});
+
+describe('summary-unavailable note and parent tasks', () => {
+  // INVARIANT: the "Summary not available yet" note never replaces a real
+  // summary. A parent's description is regenerated at child accept without
+  // moving the sweep watermark, so a task with landed children may have one.
+  test('a task with a completed child gets no note when synthesis falls back', async () => {
+    process.env.LAZY_SUMMARIZER_STUB = '1';
+    process.env.LAZY_SUMMARIZER_FAIL = '1';
+    unsetWatermark = -1;
+    updateRemoteBodyBodies = [];
+    clearPendingFidelity();
+    mockChildren = [{ id: 'child-1', status: 'complete', goal: 'child' }];
+    try {
+      mockTask = makeTask('submitted');
+      mockSession = makeSession();
+      mockSessionTurns = [
+        { id: 'turn-1', session_id: mockSession.id, sequence: 1, role: 'agent', turn_type: 'work', auto_triggered: false, actor: 'agent', content: 'Did it', created_at: Date.now() },
+      ];
+      mockSessionCommits = [{ sha: 'c1', message: 'Do the thing' }];
+      mockPRState = 'OPEN';
+      await refreshFidelityForTask(createMockStorage(), '/tmp/test', mockTask.id);
+      expect(updateRemoteBodyBodies).toHaveLength(0);
+    } finally {
+      mockChildren = [];
+      unsetWatermark = 0;
+      delete process.env.LAZY_SUMMARIZER_STUB;
+      delete process.env.LAZY_SUMMARIZER_FAIL;
+    }
   });
 });

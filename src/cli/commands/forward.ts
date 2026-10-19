@@ -1,4 +1,4 @@
-import { requireLazyRoot, requireStorage, parseFlags, resolveTaskOrExit } from '../helpers';
+import { requireLazyRoot, requireStorage, parseFlags, resolveTaskOrExit, refuseIfBoundClone } from '../helpers';
 import { displayId, taskRef } from '../../task/identity';
 import { SERVE_BIND_HOST } from '../../serve/ports';
 import {
@@ -28,6 +28,7 @@ function socatArgv(containerPort: number): string[] {
  * connection, and nothing left behind when you stop it.
  */
 export async function commandForward(args: string[]): Promise<void> {
+  await refuseIfBoundClone('forward');
   const parsed = parseFlags(args, [], 'forward');
 
   const taskId = parsed.positional[0];

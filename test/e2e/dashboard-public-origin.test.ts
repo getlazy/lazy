@@ -231,7 +231,7 @@ describe('dashboard at a configured public origin', () => {
     await writeFile(configPath, edited);
 
     const doctor = await ctx.lazy(['doctor']);
-    expect(doctor.stdout).toContain('✗ Dashboard address');
+    expect(doctor.stdout).toContain('✗ The daemon serves the dashboard at a different address than lazy.toml asks for');
     expect(doctor.stdout).toContain('https://lazy.example.com');
     expect(doctor.stdout).toContain(proxy.origin);
     expect(doctor.stdout).toContain('lazy daemon reload');

@@ -7,18 +7,16 @@ Dockerfile.lazy that:
 4. Sets WORKDIR to /work
 
 Alternatively, if the project does not need a specific base image, Dockerfile.lazy
-can `FROM lazy-runner` to inherit the base runner image (which already includes
-git, bun, node, and the Claude Code CLI — lazy runs Claude Code inside the
-container for its own merge turns regardless of which agent your tasks use). Users
-building the project on a fresh machine must first run `lazy system build
-lazy-runner` to prebuild that base image. When inheriting from lazy-runner you
-still need the layer from step 3 unless {{agentName}} is Claude Code.
+can `FROM lazy-runner` to inherit the base runner image (Debian bookworm-slim with
+git, curl, jq, sudo, Chromium and the Claude Code CLI, and no language runtimes —
+add node, bun, python or whatever the project needs; lazy runs Claude Code inside
+the container for its own merge turns regardless of which agent your tasks use).
+lazy-runner is built locally (it is on no registry); lazy builds it first when
+it is missing. When inheriting from lazy-runner you still need the layer from step 3 unless {{agentName}} is Claude Code.
 
-Then update lazy.toml to set:
-```toml
-[docker]
-dockerfile = "Dockerfile.lazy"
-```
+No lazy.toml change is needed: when `[docker].dockerfile` is unset, lazy uses a
+`Dockerfile.lazy` in the project root automatically. (If lazy.toml already names
+a different Dockerfile, that setting wins — point it at Dockerfile.lazy.)
 
 Make sure the resulting image would work for running {{agentName}} agents — it
 needs git, the project's dependencies, and the {{agentName}} CLI on PATH for the

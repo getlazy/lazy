@@ -246,7 +246,7 @@ describe('runner rows', () => {
   test('runner diagnostics map one-to-one, verdicts unchanged', () => {
     const rows = buildRunnerRows('docker', [
       { state: 'ok', what: 'Docker installed' },
-      { state: 'fail', what: 'Docker daemon running', reason: 'Cannot connect to the Docker daemon' },
+      { state: 'fail', what: 'Docker daemon running', problem: 'Docker isn\'t responding', reason: 'Cannot connect to the Docker daemon' },
     ]);
     expect(rows.map(r => r.state)).toEqual(['ok', 'fail']);
     expect(rows[1]!.remedy).toContain('Cannot connect');
@@ -264,7 +264,7 @@ describe('runner rows', () => {
     const b = buildRunnerRows('docker', [
       { state: 'ok', what: 'Docker installed (v28.0.1)' },
       { state: 'ok', what: 'claude in the runner image: 2.2.4 (lazy-runner:def)' },
-      { state: 'fail', what: '[agent] pi reachable', reason: 'connection refused' },
+      { state: 'fail', what: '[agent] pi reachable', problem: '[agent] pi is unreachable', reason: 'connection refused' },
     ]);
     expect(a.map(r => r.id)).toEqual(b.map(r => r.id));
     expect(a.map(r => r.id)).toEqual(['runner:docker-installed', 'runner:claude-in-the-runner-image', 'runner:agent-pi-reachable']);
@@ -373,6 +373,10 @@ describe('dashboard and daemon rows', () => {
     const incomparable = buildBuildMatchRow(daemon, { version: '0.23.1', sourceId: 'build-x', sourceIdKind: 'build' });
     expect(incomparable.state).toBe('ok');
     expect(incomparable.reason).toContain('not comparable');
+    // An embedded (compiled) id compares only with another embedded one, never a checkout's.
+    const embedded = { version: '0.23.1', sourceId: 'eee', sourceIdKind: 'embedded' };
+    expect(buildBuildMatchRow(embedded, { version: '0.23.1', sourceId: 'eee', sourceIdKind: 'embedded' }).state).toBe('ok');
+    expect(buildBuildMatchRow(embedded, { version: '0.23.1', sourceId: 'aaa', sourceIdKind: 'computed' }).reason).toContain('not comparable');
   });
 
   test('summary takes the worst state', () => {

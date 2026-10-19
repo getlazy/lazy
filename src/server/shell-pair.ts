@@ -41,6 +41,7 @@ import { pathExists } from '../utils/fs';
 import { actorEmail } from '../actor-ref';
 import { taskTurnRunning } from '../daemon/member-entry';
 import { recordSessionCommits } from '../task/session-commits';
+import { neutralizeLazyMarkers } from '../task/wrapper-fold';
 
 /**
  * A reconnect inside the grace window resumes the SAME person's hold. Another
@@ -487,7 +488,7 @@ async function releasePair(taskId: string): Promise<void> {
         sessionId: session.id,
         sequence,
         role: 'human',
-        content: `[pairing session]\n\nWeb pairing session ended.${made}`,
+        content: `[pairing session]\n\nWeb pairing session ended.${neutralizeLazyMarkers(made)}`,
         actor: live.actor,
       });
     }

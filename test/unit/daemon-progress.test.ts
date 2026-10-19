@@ -187,7 +187,7 @@ describe('accept phase plans', () => {
 
   test('the fresh plan is in execution order and ends with cleanup', () => {
     expect(acceptPhasePlan(true).map(p => p.id)).toEqual([
-      'edge-gate', 'resurrection', 'lfs', 'accept-check', 'pre-accept', 'protection', 'remote-ref', 'merge-gates',
+      'task-branch', 'edge-gate', 'resurrection', 'lfs', 'accept-check', 'pre-accept', 'protection', 'mirror-target', 'remote-ref', 'merge-gates',
       'push-parent', 'description', 'merge', 'finalize', 'cleanup',
     ]);
   });

@@ -37,6 +37,7 @@ export function summarizeBuilders(
     const inBuilder = new Set(b.segments);
     const run = orderedRuns.find((r) => r.agentSessionId && inBuilder.has(r.agentSessionId)) ?? null;
     return {
+      memberEmail: members.find((member) => member.memberEmail)?.memberEmail ?? run?.memberEmail ?? null,
       id: b.id,
       title: b.title,
       startedAt: b.startedAt,

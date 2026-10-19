@@ -240,3 +240,24 @@ describe('the head-moved label', () => {
     expect(state!.head_sha).toBe('s3');
   });
 });
+
+describe('resolveFinalState — host sync vs agent self-sync', () => {
+  // INVARIANT: a host-side sync turn carries its head window, so a final's head
+  // movement is visible; a windowless (agent self-sync) turn cannot move it.
+  test('a windowed sync turn after the claim is a labelled head move', () => {
+    const state = resolveFinalState([
+      turn('agent', { final: claim() }),
+      turn('human', { turnType: 'sync', startSha: CLAIM_SHA, endSha: 'bbbbbbbb2222' }),
+    ]);
+    expect(state?.head_moved).toBe(true);
+    expect(state?.moved_by[0]?.turn_type).toBe('sync');
+  });
+
+  test('a windowless sync turn does not move the head', () => {
+    const state = resolveFinalState([
+      turn('agent', { final: claim() }),
+      turn('human', { turnType: 'sync' }),
+    ]);
+    expect(state?.head_moved).toBe(false);
+  });
+});

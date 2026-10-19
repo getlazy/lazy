@@ -21,7 +21,6 @@
  *    here can touch the adopted branch, which lazy never rewrites.
  */
 
-import { randomUUID } from 'crypto';
 import { getOrCreateStorage } from './rpc-handlers';
 import { RpcError } from './rpc-error';
 import { assertBesideLaunchAllowed } from './usage-pause';
@@ -42,13 +41,7 @@ import {
   type LinkDescriptionInput,
 } from '../task/link-description';
 import type { ResolvedConfig } from '../config/types';
-import { teamModeEnabled, getUserCredential } from './user-credentials';
-import {
-  credentialEnvForPlan,
-  NO_OWNER_CREDENTIAL_MARKER,
-  planTurnCredential,
-  releaseTurnCredential,
-} from './turn-credentials';
+import { oneshotCredentialProblem, withOneshotCredential } from './oneshot-credential';
 import { actorEmail } from '../actor-ref';
 import type { ActorInput, Session, Task } from '../types';
 import type { ImportResult, RepositoryDriver } from '../remote/driver';
@@ -416,7 +409,7 @@ async function gatherLinkDescriptionInput(opts: {
  * The ref this branch's work is measured against.
  *
  * Goes through `resolveTaskDiffBase` — the ONE resolver every "what did this
- * task change" surface uses (see the CLAUDE.md invariant and
+ * task change" surface uses (see the AGENTS.md invariant and
  * docs/task-diff-base-resolution.md). A description is exactly such a surface,
  * and taking the raw local default branch instead is the bug that resolver
  * exists for: lazy never checks out or updates the human's `main`, so on any
@@ -614,16 +607,13 @@ async function readBoundedGitOutput(
  * credential at run time — and, lacking one, is skipped with a warning.
  */
 export async function assertLinkActorCredential(projectRoot: string, actor?: ActorInput): Promise<void> {
-  if (!(await teamModeEnabled(projectRoot))) return;
   const userId = actorEmail(actor);
   if (!userId) return;
-  if (!(await getUserCredential(projectRoot, userId))) {
-    throw new RpcError(
-      400,
-      `${NO_OWNER_CREDENTIAL_MARKER}: describing a linked branch runs a model, billed to the person ` +
-      `who asked — user '${userId}' has no Anthropic credential stored in this daemon. ` +
-      'Connect your Claude account and retry.',
-    );
+  // Asked for the profile the description RUNS ON, so a member is asked for
+  // the credential it would really spend — and the refusal names it.
+  const problem = await oneshotCredentialProblem(projectRoot, userId);
+  if (problem) {
+    throw new RpcError(400, `Describing a linked branch runs a model, billed to the person who asked. ${problem}`);
   }
 }
 
@@ -636,27 +626,9 @@ export async function assertLinkActorCredential(projectRoot: string, actor?: Act
  */
 export async function withDescribeCredential<T>(
   projectRoot: string,
-  task: Task,
+  _task: Task,
   actor: ActorInput | undefined,
   fn: (env: Array<{ key: string; value: string }> | undefined) => Promise<T>,
 ): Promise<T> {
-  if (!(await teamModeEnabled(projectRoot))) return fn(undefined);
-  // A key of its OWN, never the task id: the task may be running (or have
-  // queued) a real turn whose binding and recorded owner live under its id,
-  // and re-pointing then revoking those would kill that turn with a 401 and
-  // bill it to whoever asked for this description.
-  const key = `oneshot:link-describe:${randomUUID()}`;
-  // The asker is the SPENDER of a launch beside the task, never its turn
-  // owner: this one-shot must not decide who asked for any task's turn.
-  const email = actorEmail(actor);
-  try {
-    const plan = await planTurnCredential(projectRoot, {
-      taskId: key,
-      sessionId: key,
-      ...(email ? { spender: { email } } : {}),
-    });
-    return await fn(credentialEnvForPlan(plan) ?? undefined);
-  } finally {
-    await releaseTurnCredential(projectRoot, key);
-  }
+  return withOneshotCredential(projectRoot, 'link-describe', actorEmail(actor) ?? null, fn);
 }

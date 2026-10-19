@@ -235,7 +235,7 @@ export function disablePreAccept(root: string): void {
  * The init template ALREADY writes a `[permissions]` table (with the key
  * commented out), so appending a second one is a TOML redefinition error and
  * every command in the test then dies on a config parse failure. Suites used to
- * append; this helper edits the key that is already there, per CLAUDE.md
+ * append; this helper edits the key that is already there, per AGENTS.md
  * ("Change a test's lazy.toml by EDITING the key, never by overwriting").
  */
 export function setProtectedPatterns(root: string, patterns: string[]): void {

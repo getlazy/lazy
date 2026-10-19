@@ -9,6 +9,7 @@
 import { layoutHtml } from './templates';
 import { escapeHtml } from './review-diff';
 import { renderMarkdown, type RenderMarkdownOptions } from './markdown';
+import { copyMarkdownButtonHtml, renderMarkdownWithCopy } from './copy-markdown';
 import { taskPath } from './task-urls';
 import { REVIEW_SESSION_FIRST_TURN_CLOSER } from './review-session-actions';
 import type { ReviewSession, ReviewSessionMessage, ReviewSessionStatus } from '../types';
@@ -64,10 +65,10 @@ function messageDeliveryHtml(_taskId: string, m: ReviewSessionMessage): string {
 
 function messageBodyHtml(m: ReviewSessionMessage, markdown?: RenderMarkdownOptions): string {
   if (m.role === 'assistant' || m.role === 'system') {
-    return `<div class="rv-msg-body turn-content">${renderMarkdown(m.content, markdown)}</div>`;
+    return `<div class="rv-msg-body turn-content">${renderMarkdownWithCopy(m.content, markdown)}</div>`;
   }
   // Human messages: plain pre-wrap (compose box text, not markdown authored by user).
-  return `<div class="rv-msg-body">${escapeHtml(m.content)}</div>`;
+  return `${copyMarkdownButtonHtml(m.content)}<div class="rv-msg-body">${escapeHtml(m.content)}</div>`;
 }
 
 function messageHtml(taskId: string, m: ReviewSessionMessage, markdown?: RenderMarkdownOptions): string {

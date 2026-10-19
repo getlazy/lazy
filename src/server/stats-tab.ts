@@ -26,7 +26,8 @@
  * left `'` raw.
  */
 
-import type { TaskStats, TurnTokenPoint, TokenTotals, StatsScope } from '../task/stats';
+import { formatErrorBreakdown, formatPercentiles, latencyRowLabel } from '../task/turn-latency';
+import type { TaskStats, TaskTokenStats, TurnTokenPoint, TokenTotals, StatsScope } from '../task/stats';
 import { escapeHtml } from './escape';
 
 // --- formatting -------------------------------------------------------------
@@ -129,7 +130,7 @@ const CHART_W = 720;
 const CHART_H = 200;
 const PAD_L = 52;
 const PAD_B = 22;
-const PAD_T = 8;
+const PAD_T = 24;
 
 function niceCeil(value: number): number {
   if (value <= 0) return 1;
@@ -222,20 +223,93 @@ function perTurnChartHtml(series: TurnTokenPoint[]): string {
 }
 
 /** Cumulative total tokens across the same turns — growth, on its own axis. */
-function cumulativeChartHtml(series: TurnTokenPoint[]): string {
+function isoMinute(ms: number): string | null {
+  return ms > 0 ? `${new Date(ms).toISOString().slice(0, 16)}Z` : null;
+}
+
+function cumulativeChartHtml(
+  series: TurnTokenPoint[],
+  chunks: TaskTokenStats['chunks'],
+  turnsHref?: string,
+): string {
   const points = series.filter((p) => p.usage);
   if (points.length < 2) return '';
   const max = niceCeil(points[points.length - 1].cumulative);
   const plotW = CHART_W - PAD_L - 8;
   const plotH = CHART_H - PAD_T - PAD_B;
+  // X is TIME; evenly spaced only when the timestamps cannot place the points.
+  const t0 = Math.min(...series.map((p) => p.timestamp));
+  const span = Math.max(...series.map((p) => p.timestamp)) - t0;
+  const timed = t0 > 0 && span > 0;
   const step = plotW / Math.max(1, series.length - 1);
   const coords = series.map((p, i) => ({
-    x: PAD_L + i * step,
+    x: timed ? PAD_L + ((p.timestamp - t0) / span) * plotW : PAD_L + i * step,
     y: PAD_T + plotH - (p.cumulative / max) * plotH,
     point: p,
   }));
   const path = coords.map((c, i) => `${i === 0 ? 'M' : 'L'}${c.x.toFixed(1)},${c.y.toFixed(1)}`).join(' ');
   const end = coords[coords.length - 1];
+  const first = coords[0];
+
+  const xTick = (c: (typeof coords)[number], anchor: string): string => {
+    const iso = isoMinute(c.point.timestamp);
+    return iso
+      ? `<text class="lz-viz-tick" x="${c.x.toFixed(1)}" y="${CHART_H - 6}" text-anchor="${escapeHtml(anchor)}">${escapeHtml(iso)}</text>`
+      : '';
+  };
+  const centre = (first.x + end.x) / 2;
+  const mid = coords.reduce((a, b) => (Math.abs(b.x - centre) < Math.abs(a.x - centre) ? b : a));
+  const xAxis =
+    xTick(first, 'start') +
+    (mid.x - first.x > 170 && end.x - mid.x > 170 ? xTick(mid, 'middle').replace('class="lz-viz-tick"', 'class="lz-viz-tick lz-viz-xtick-mid"') : '') +
+    xTick(end, 'end');
+
+  // Chunk starts, placed at the chunk's real opening (its boundary turn), so a
+  // chunk with no agent turn still shows and a trimmed series never mistakes a
+  // mid-chunk point for a start. The chunk already running at the left edge is
+  // pinned to it. Without usable timestamps nothing can be placed, so none draw.
+  const tMax = t0 + span;
+  const inRange = chunks.filter((c) => c.startTimestamp >= t0 && c.startTimestamp <= tMax);
+  const running = chunks.filter((c) => c.startTimestamp < t0).pop();
+  const marks = timed ? (running ? [running, ...inRange] : inRange) : [];
+  let lastLabelX = -Infinity;
+  const chunkMarks = marks
+    .map((c) => {
+      const x = PAD_L + (Math.max(0, c.startTimestamp - t0) / span) * plotW;
+      const late = x > CHART_W - 30;
+      // A label is dropped, never overlapped, when the previous one is too close.
+      const showLabel = x - lastLabelX >= 28;
+      if (showLabel) lastLabelX = x;
+      return (
+        `<line class="lz-viz-chunk-rule" x1="${x.toFixed(1)}" y1="${PAD_T}" x2="${x.toFixed(1)}" y2="${PAD_T + plotH}"/>` +
+        (showLabel
+          ? `<text class="lz-viz-chunk-label" aria-hidden="true" x="${(x + (late ? -3 : 3)).toFixed(1)}" y="${PAD_T - 4}" text-anchor="${late ? 'end' : 'start'}">#${c.number}</text>`
+          : '')
+      );
+    })
+    .join('');
+  // Links live outside the role="img" svg, where assistive tech can reach them.
+  const chunkLinks =
+    turnsHref && marks.length
+      ? `<p class="lz-stats-note lz-chunk-links">Chunks: ` +
+        marks
+          .map((c) => `<a href="${escapeHtml(`${turnsHref}/${c.startSequence}`)}">#${c.number}</a>`)
+          .join(' ') +
+        `</p>`
+      : '';
+  const hits = coords
+    .map((c) => {
+      const tip = [
+        isoMinute(c.point.timestamp),
+        pointLabel(c.point),
+        c.point.chunk ? `chunk ${c.point.chunk}` : null,
+        `${formatTokens(c.point.cumulative)} cumulative`,
+      ]
+        .filter(Boolean)
+        .join(' · ');
+      return `<circle class="lz-viz-hit" cx="${c.x.toFixed(1)}" cy="${c.y.toFixed(1)}" r="7"><title>${escapeHtml(tip)}</title></circle>`;
+    })
+    .join('');
 
   const ticks = [0, 0.5, 1]
     .map((f) => {
@@ -251,15 +325,19 @@ function cumulativeChartHtml(series: TurnTokenPoint[]): string {
 
   return (
     `<svg class="lz-viz-svg" viewBox="0 0 ${CHART_W} ${CHART_H}" role="img"` +
-    ` aria-label="Cumulative tokens across this task's turns">` +
+    ` aria-label="Cumulative tokens across this task's turns, by time; per-turn numbers follow in the table">` +
     ticks +
+    chunkMarks +
+    xAxis +
     `<path class="lz-viz-line" d="${path}" fill="none" stroke="var(--lz-viz-1)"/>` +
     // End-dot with the house 2px surface ring, and the one direct label.
     `<circle cx="${end.x.toFixed(1)}" cy="${end.y.toFixed(1)}" r="4" fill="var(--lz-viz-1)"` +
     ` stroke="var(--color-surface)" stroke-width="2"/>` +
     `<text class="lz-viz-endlabel" x="${(end.x - 8).toFixed(1)}" y="${(end.y - 8).toFixed(1)}" text-anchor="end">` +
     `${escapeHtml(formatTokens(end.point.cumulative))}</text>` +
-    `</svg>`
+    hits +
+    `</svg>` +
+    chunkLinks
   );
 }
 
@@ -278,6 +356,7 @@ function turnTableHtml(series: TurnTokenPoint[]): string {
   // In a subtree view the sequence column alone is ambiguous — every task has a
   // turn 1 — so the task each turn belongs to gets its own column.
   const labelled = series.some((p) => p.taskLabel !== null);
+  const hasChunks = series.some((p) => p.chunk !== null);
   const rows = [...series]
     .reverse()
     .map((p) => {
@@ -286,6 +365,7 @@ function turnTableHtml(series: TurnTokenPoint[]): string {
         `<tr>` +
         (labelled ? `<td><code>${escapeHtml(p.taskLabel ?? '—')}</code></td>` : '') +
         `<td class="lz-num">${p.sequence}</td>` +
+        (hasChunks ? `<td class="lz-num">${p.chunk ? `#${p.chunk}` : '—'}</td>` : '') +
         `<td>${escapeHtml(formatWhen(p.timestamp))}</td>` +
         `<td>${escapeHtml(p.model ?? 'unknown')}${p.effort ? escapeHtml(` · ${p.effort}`) : ''}</td>` +
         `<td class="lz-num">${escapeHtml(p.spanMs === null ? '—' : formatDuration(p.spanMs))}</td>` +
@@ -304,7 +384,7 @@ function turnTableHtml(series: TurnTokenPoint[]): string {
     `<details class="lz-stats-table"><summary>Per-turn numbers (${series.length})</summary>` +
     `<table class="lz-table"><thead><tr>` +
     (labelled ? `<th>Task</th>` : '') +
-    `<th>#</th><th>When</th><th>Model</th><th>Span</th>` +
+    `<th>#</th>` + (hasChunks ? `<th>Chunk</th>` : '') + `<th>When</th><th>Model</th><th>Span</th>` +
     `<th>Input</th><th>Output</th><th>Cache read</th><th>Cache write</th><th>Total</th>` +
     `</tr></thead><tbody>${rows}</tbody></table></details>`
   );
@@ -407,6 +487,47 @@ function toolsSectionHtml(stats: TaskStats): string {
   );
 }
 
+
+function latencySectionHtml(stats: TaskStats): string {
+  const latency = stats.latency;
+  const subject = stats.scope === 'subtree' ? 'any task in this subtree' : 'this task';
+  if (!latency) {
+    return (
+      `<h3>Model latency</h3>` +
+      `<p class="lz-stats-note">No latency rollups were recorded for ${subject} — it ran before lazy kept ` +
+      `them, its traffic did not go through the lazy proxy, or it ran on Cursor, whose traffic carries no model ` +
+      `or token counts the proxy can read.</p>`
+    );
+  }
+  const rows = latency.rows
+    .map(
+      (r) =>
+        `<tr><td>${escapeHtml(latencyRowLabel(r))}</td>` +
+        `<td class="lz-num">${formatCount(r.requests)}</td>` +
+        `<td class="lz-num">${escapeHtml(formatErrorBreakdown(r.errors))}</td>` +
+        `<td class="lz-num">${escapeHtml(formatPercentiles(r.ttfb, 'ms'))}</td>` +
+        `<td class="lz-num">${escapeHtml(formatPercentiles(r.ttft, 'ms'))}</td>` +
+        `<td class="lz-num">${escapeHtml(formatPercentiles(r.ttlt, 'ms'))}</td>` +
+        `<td class="lz-num">${escapeHtml(formatPercentiles(r.tps, 'tps'))}</td>` +
+        `<td class="lz-num">${formatCount(r.tokens.output)}</td></tr>`,
+    )
+    .join('');
+  const share =
+    latency.model_wait_share === null
+      ? ''
+      : ` About ${Math.round(latency.model_wait_share * 100)}% of the agent's turn time was spent waiting on the model; the rest went to tools and the agent itself.`;
+  return (
+    `<h3>Model latency</h3>` +
+    `<p class="lz-stats-note">${escapeHtml(
+      `Kept per turn in the store, so it covers ${subject}'s whole life (${formatCount(latency.turns)} turn(s)). ` +
+        `Cells are p5 / p50 / p95, all timed from request start; percentiles are within about ±16%. ` +
+        `TOK/S is output tokens over the whole request. (n=…) is the number of requests behind a cell; REQS includes errors, so TTFT and TTLT can have fewer.` + share,
+    )}</p>` +
+    `<table class="lz-table"><thead><tr><th>Endpoint · model</th><th>Requests</th><th>Errors</th>` +
+    `<th>TTFB</th><th>TTFT</th><th>TTLT</th><th>Tok/s</th><th>Output</th></tr></thead>` +
+    `<tbody>${rows}</tbody></table>`
+  );
+}
 function modelsSectionHtml(stats: TaskStats): string {
   const rows = stats.tokens.byModel;
   if (!rows.length) return '';
@@ -479,6 +600,8 @@ export interface StatsTabView {
   /** URL for each scope. Plain links — no script, and both are bookmarkable. */
   taskHref: string;
   subtreeHref: string;
+  /** The task's Turns tab; chunk marks link to `<turnsHref>/<turn sequence>`. */
+  turnsHref?: string;
 }
 
 /**
@@ -611,7 +734,7 @@ export function statsTabHtml(stats: TaskStats, view?: StatsTabView): string {
           bound,
       )}</p>` +
       `<h4>Cumulative</h4>` +
-      (cumulativeChartHtml(tokens.series) ||
+      (cumulativeChartHtml(tokens.series, tokens.chunks, view?.turnsHref) ||
         `<p class="lz-stats-note">Growth needs at least two turns with recorded usage.</p>`) +
       sessionLine +
       turnTableHtml(tokens.series);
@@ -625,6 +748,7 @@ export function statsTabHtml(stats: TaskStats, view?: StatsTabView): string {
     timeSection +
     tokenSection +
     toolsSectionHtml(stats) +
+    latencySectionHtml(stats) +
     modelsSectionHtml(stats) +
     `<p class="lz-stats-note">No cost figures: lazy has no price table, and hardcoding one here would ` +
     `go stale without anyone noticing.</p>` +

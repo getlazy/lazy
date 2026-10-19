@@ -63,7 +63,9 @@ describe('buildMergeAgentArgs', () => {
 
     expect(args[0]).toBe('claude');
     expect(args[1]).toBe('-p');
-    expect(args[2]).toBe(MERGE_PROMPT);
+    // The prompt rides stdin, never argv (src/agent/argv-safety.ts).
+    expect(args.stdinInput).toBe(MERGE_PROMPT);
+    expect(args).not.toContain(MERGE_PROMPT);
     expect(args).toContain('--output-format');
     expect(args).toContain('stream-json');
     expect(args).toContain('--dangerously-skip-permissions');
@@ -106,15 +108,15 @@ describe('buildMergeAgentArgs', () => {
     const standaloneArgs = buildMergeAgentArgs(CLAUDE, standalonePrompt, MODEL_ID, undefined, false);
     const resumeArgs = buildMergeAgentArgs(CLAUDE, resumePrompt, MODEL_ID, SESSION_ID, true);
 
-    expect(standaloneArgs[2]).toBe(standalonePrompt);
-    expect(resumeArgs[2]).toBe(resumePrompt);
+    expect(standaloneArgs.stdinInput).toBe(standalonePrompt);
+    expect(resumeArgs.stdinInput).toBe(resumePrompt);
   });
 });
 
 describe('--resume + -p arg order consistency', () => {
-  // INVARIANT: `claude --resume <id> -p <prompt>` sends the prompt as a follow-up
-  // message in the existing session. Both `-p` and `--resume` must be present, and
-  // `-p` always provides the merge instructions. The arg order produced by
+  // INVARIANT: `claude -p --resume <id>` with the prompt on stdin sends it as a
+  // follow-up message in the existing session. Both `-p` and `--resume` must be
+  // present, and stdin always carries the merge instructions (never argv). The arg order produced by
   // buildMergeAgentArgs must match what ClaudeCodeAgent.buildExecArgs produces,
   // ensuring consistent behavior between merge resolution and normal work.
   test('buildMergeAgentArgs produces same arg pattern as ClaudeCodeAgent.buildExecArgs', () => {
@@ -133,13 +135,13 @@ describe('--resume + -p arg order consistency', () => {
 
     // Both must contain -p with prompt, --resume with session, and --dangerously-skip-permissions
     expect(agentArgs).toContain('-p');
-    expect(agentArgs).toContain(prompt);
+    expect(agentArgs.stdinInput).toBe(prompt);
     expect(agentArgs).toContain('--resume');
     expect(agentArgs).toContain(sessionId);
     expect(agentArgs).toContain('--dangerously-skip-permissions');
 
     expect(mergeArgs).toContain('-p');
-    expect(mergeArgs).toContain(prompt);
+    expect(mergeArgs.stdinInput).toBe(prompt);
     expect(mergeArgs).toContain('--resume');
     expect(mergeArgs).toContain(sessionId);
     expect(mergeArgs).toContain('--dangerously-skip-permissions');

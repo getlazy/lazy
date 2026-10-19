@@ -14,7 +14,7 @@ import {
 import type { ResolvedService } from '../../src/serve/ports';
 
 /**
- * `<service>.<task>.lazy.localhost` — the naming layer over a task's published
+ * `<task>.<service>.lazy.localhost` — the naming layer over a task's published
  * ports (src/serve/subdomain.ts). `parseServeHost` is the predicate that decides
  * whether a request leaves the daemon for a container, so most of what is pinned
  * here is what it must REFUSE.
@@ -85,35 +85,35 @@ describe('parseServeHost', () => {
   const SUFFIX = 'lazy.localhost';
 
   test('splits a service and a task out of the host', () => {
-    expect(parseServeHost('web.my-task.lazy.localhost', SUFFIX)).toEqual({
+    expect(parseServeHost('my-task.web.lazy.localhost', SUFFIX)).toEqual({
       service: 'web',
       task: 'my-task',
     });
   });
 
   test('ignores the port', () => {
-    expect(parseServeHost('web.my-task.lazy.localhost:26024', SUFFIX)).toEqual({
+    expect(parseServeHost('my-task.web.lazy.localhost:26024', SUFFIX)).toEqual({
       service: 'web',
       task: 'my-task',
     });
   });
 
   test('takes a port label as the service', () => {
-    expect(parseServeHost('3000.my-task.lazy.localhost:26024', SUFFIX)).toEqual({
+    expect(parseServeHost('my-task.3000.lazy.localhost:26024', SUFFIX)).toEqual({
       service: '3000',
       task: 'my-task',
     });
   });
 
   test('takes a short id as the task', () => {
-    expect(parseServeHost('web.abcdef12.lazy.localhost', SUFFIX)).toEqual({
+    expect(parseServeHost('abcdef12.web.lazy.localhost', SUFFIX)).toEqual({
       service: 'web',
       task: 'abcdef12',
     });
   });
 
   test('is case-insensitive, as hostnames are', () => {
-    expect(parseServeHost('WEB.My-Task.Lazy.LocalHost', SUFFIX)).toEqual({
+    expect(parseServeHost('My-Task.WEB.Lazy.LocalHost', SUFFIX)).toEqual({
       service: 'web',
       task: 'my-task',
     });
@@ -143,30 +143,40 @@ describe('parseServeHost', () => {
   // to guess about when the answer decides whether a request leaves the daemon.
   test('requires exactly two labels before the suffix', () => {
     expect(parseServeHost('my-task.lazy.localhost', SUFFIX)).toBeNull();
-    expect(parseServeHost('a.web.my-task.lazy.localhost', SUFFIX)).toBeNull();
+    expect(parseServeHost('a.my-task.web.lazy.localhost', SUFFIX)).toBeNull();
+  });
+
+  // INVARIANT: the task label comes FIRST, and there is one spelling. The old
+  // `<service>.<task>` order is not an alias: read task-first, it names a task
+  // called `web`, which is exactly what it must resolve to (and then 404).
+  test('reads the task label first — the old order is not an alias', () => {
+    expect(parseServeHost('web.my-task.lazy.localhost', SUFFIX)).toEqual({
+      service: 'my-task',
+      task: 'web',
+    });
   });
 
   test('rejects labels that are not valid labels', () => {
-    expect(parseServeHost('web.my_task.lazy.localhost', SUFFIX)).toBeNull();
+    expect(parseServeHost('my_task.web.lazy.localhost', SUFFIX)).toBeNull();
     expect(parseServeHost('web..lazy.localhost', SUFFIX)).toBeNull();
-    expect(parseServeHost('-web.my-task.lazy.localhost', SUFFIX)).toBeNull();
+    expect(parseServeHost('-my-task.web.lazy.localhost', SUFFIX)).toBeNull();
   });
 
   // The suffix is a PARAMETER, never a literal: Teams will serve these names
   // under a different one.
   test('follows the suffix it is given', () => {
-    expect(parseServeHost('web.my-task.lazy.example.dev', 'lazy.example.dev')).toEqual({
+    expect(parseServeHost('my-task.web.lazy.example.dev', 'lazy.example.dev')).toEqual({
       service: 'web',
       task: 'my-task',
     });
-    expect(parseServeHost('web.my-task.lazy.localhost', 'lazy.example.dev')).toBeNull();
+    expect(parseServeHost('my-task.web.lazy.localhost', 'lazy.example.dev')).toBeNull();
   });
 });
 
 describe('serviceSubdomainUrl', () => {
   test('composes host and authority, with no trailing slash', () => {
     expect(serviceSubdomainUrl('web', 'my-task', 'lazy.localhost:26024')).toBe(
-      'http://web.my-task.lazy.localhost:26024',
+      'http://my-task.web.lazy.localhost:26024',
     );
   });
 
@@ -191,7 +201,7 @@ describe('withPublicUrls', () => {
 
   test('decorates a published service with its name', () => {
     const [decorated] = withPublicUrls(task, [service()], 'lazy.localhost:26024');
-    expect(decorated!.publicUrl).toBe('http://web.my-task.lazy.localhost:26024');
+    expect(decorated!.publicUrl).toBe('http://my-task.web.lazy.localhost:26024');
     // The raw mapping is kept: `lazy url --direct`, curl and lazy-teams need it.
     expect(decorated!.url).toBe('http://127.0.0.1:49154');
   });
@@ -210,7 +220,7 @@ describe('withPublicUrls', () => {
       [service()],
       'lazy.localhost:26024',
     );
-    expect(decorated!.publicUrl).toBe('http://web.abcdef12.lazy.localhost:26024');
+    expect(decorated!.publicUrl).toBe('http://abcdef12.web.lazy.localhost:26024');
   });
 
   // Null authority is a supported state, not a failure: a process that does not
@@ -240,8 +250,8 @@ describe('displayUrlFor', () => {
     expect(displayUrlFor({
       name: 'web', port: 3000, binding: null,
       url: 'http://127.0.0.1:49154',
-      publicUrl: 'http://web.my-task.lazy.localhost:26024',
-    })).toBe('http://web.my-task.lazy.localhost:26024');
+      publicUrl: 'http://my-task.web.lazy.localhost:26024',
+    })).toBe('http://my-task.web.lazy.localhost:26024');
 
     expect(displayUrlFor({
       name: 'web', port: 3000, binding: null, url: 'http://127.0.0.1:49154',

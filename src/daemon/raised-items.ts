@@ -509,7 +509,7 @@ async function createPromotedTask(
   const {
     allocatePromotedCode,
     defaultPromotedCodeFromRaised,
-    inheritOriginatingLaunchSettings,
+    originatingLaunchInitial,
   } = await import('../raised/promote-task');
   let code = defaultPromotedCodeFromRaised(item, goal);
   if (code) {
@@ -529,14 +529,14 @@ async function createPromotedTask(
     undefined,
     originating.agent_id,
     actor,
+    // ONE write, prompt and inherited launch settings included. Same helper the
+    // storage promote path uses, so the two routes cannot drift on what
+    // "inherit the originating task's launch settings" means.
+    {
+      prompt: buildPromotedTaskPrompt(item, originating, kind, item.resolution),
+      ...originatingLaunchInitial(originating),
+    },
   );
-  await storage.updateTaskPrompt(
-    created.id,
-    buildPromotedTaskPrompt(item, originating, kind, item.resolution),
-  );
-  // Same helper the storage promote path uses, so the two promotion routes
-  // cannot drift on what "inherit the originating task's launch settings" means.
-  await inheritOriginatingLaunchSettings(storage, created.id, originating);
   return created;
 }
 

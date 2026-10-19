@@ -37,6 +37,13 @@ lazy ships with rather than guessing.
 The agent is fixed for a task once work has started. Change it only on tasks
 still in the backlog, before the first turn.
 
+### Long prompts
+
+Every agent receives a turn's instructions on standard input, not as a
+command-line argument, so a task with a long history, many comments or long
+feedback is delivered whole — nothing is shortened or replaced with a pointer.
+You do not have to shorten feedback because a task has a long history.
+
 ## Project default agent
 
 Team **admins** set the default under **Settings → General** on a project page. The control
@@ -59,21 +66,42 @@ effort when somebody starts it days later from its own page.
 
 ## Agent credentials
 
-Every turn runs on the account of the person who starts it, **for the agent it
-runs on** — never a teammate's, and never one key the project shares. So each
-member connects their own credential for each agent they use.
+Every turn runs on the account of the person who starts it — never a teammate's,
+and never one key the project shares. Connect your credential **once per
+endpoint**; every agent profile using that endpoint uses the same connection.
+Separate named endpoints can use different accounts, even on the same provider.
+
+### Where endpoints and profiles come from
+
+A project's owner defines its endpoints and agent profiles — under **Settings →
+Configuration → Endpoints and agent profiles**, a page every member can open
+that also lists what is waiting for a project admin to confirm, with a form for each endpoint (name,
+URL, credential name) and each profile (harness, model, description, an endpoint
+or a list of tiers). The form writes the project's `lazy.toml`; the same checks
+as the raw editor apply, and nothing is saved while lazy rejects it. Members
+then connect their own key for each endpoint on **Your credentials**.
 
 ### Your Claude credential
 
 Open **Agent credentials** from your account menu (top right) and connect your
 own Anthropic account — subscription token or API key. Lazy Teams stores it
-encrypted, never shows it again, and uses it for every Claude agent whose
-traffic goes to Anthropic, on every project. Use **Test credential** to check
-it before running work.
+encrypted and never shows it again. This connects the built-in Anthropic endpoint
+(`builtin:anthropic`). An agent using a separately named Anthropic endpoint needs
+its own connection; it does not borrow the built-in account. Use **Test credential**
+for the built-in Anthropic connection to check each ready project's saved copy
+before running work. Results appear per project; an unreachable project means
+the test could not run, not that your credential is invalid. Named endpoints and
+other providers do not use this test. Projects still waiting for their normal
+upgrade cannot run credential tests; the page explains that no test was sent.
+If a project has not received your saved connection yet, the test sends it again
+and re-checks, and says why when it still cannot be delivered. Saved connections
+a project is missing are also re-sent automatically every few minutes, and the
+page tells you when a connection you saved for another team or project does not
+reach the one you are looking at.
 
 ### Account, team and project credentials
 
-Each credential — Claude or any other agent — can be set at three levels, and
+Each endpoint credential can be set at three levels, and
 the most specific one you set wins:
 
 1. **Account** (**Agent credentials** in your account menu) — used on every
@@ -90,33 +118,52 @@ credential copy it up a level on the server — the value is never shown, and yo
 are asked before an existing credential at that level is replaced. Only your
 own credentials are ever read or copied.
 
-A credential set at the team or account level carries the endpoint shown when
-you set it; a project whose agent sends its traffic somewhere else does not use
-it, and its Your credentials tab says so.
+A connection carries the origin shown when you set it: the URL's scheme, host
+and port. A project using the same endpoint name at a different origin cannot
+use it. A stale project or team override refuses work rather than silently
+spending a broader account; reconnect it or remove the override to inherit.
 
-### Credentials for a project's other agents
+### Endpoints a project uses
 
 On the project's **Settings → Your credentials** tab: Pi, Codex (on an OpenAI API key, or on a ChatGPT subscription), Cursor, and
 any agent the project defines with an endpoint of its own — for example a
-second Claude agent pointed at a gateway. The tab lists exactly the agents the
-project offers, and for each one:
+second Claude agent pointed at a gateway. The tab lists each endpoint once,
+shows the agent profiles and tiers using it, and explains:
 
 - what it needs — an API key, or for a ChatGPT subscription the contents of
   `~/.codex/auth.json` after `codex login` (use a login made for this: lazy
   keeps it renewed, which signs out any other copy);
-- **where your credential is sent** — the agent's own endpoint, when it has one;
-- whether it runs on your Claude credential instead, or needs no credential at
-  all (a model server that takes none).
+- **where your credential is sent** — the endpoint's origin;
+- whether your connection is available, needs reconnecting, or no credential is
+  needed (a model server that takes none).
 
-A credential you connect for an agent is sent only to that agent's endpoint. If
-the project later points the agent somewhere else, your credential stops being
-used until you connect it again — it never follows the agent to a new place on
-its own.
+A credential is sent only to the origin you connected it for. Changing a base
+path on that origin does not require reconnecting; changing the scheme, host or
+port does. Anthropic credentials are never sent to a non-Anthropic destination.
 
-Starting a task on an agent you have not connected is refused before anything
-runs, naming the agent, with a link to the Your credentials tab. Leaving a team
+Profiles that name an endpoint share its connection. A profile with its own inline
+endpoint has the identity `profile:<name>`; renaming that profile creates a new
+identity and does not move the old connection. Use a named endpoint when sharing
+one connection across profiles is intentional. Built-in endpoints use
+`builtin:<provider>` identities.
+
+Starting a task or builder without a required connection is refused before
+anything runs, naming the missing endpoint. Leaving a team
 removes the credentials you set for that team and its projects; your account
 credentials stay yours.
+
+### Tiered agents and builders
+
+A tiered profile can switch endpoints during a turn as its usage thresholds are
+reached. Connect **every paid endpoint in the chain** before starting it, including
+tiers you do not expect to use. Each request spends your connection for the tier
+actually selected; credential-free tiers send no authentication.
+
+Usage readings belong to your endpoint connection, so profiles sharing it see
+the same readings. Replacing a credential clears those readings; renewing the
+same session preserves them. Endpoints using the same upstream account still
+share the provider's real quota. Providers without usage readings cannot supply
+a measured percentage.
 
 
 ### Agents the project adds
@@ -130,8 +177,10 @@ list once the project has picked it up.
 
 Each project can designate one member's credentials for **automations** (turns
 nobody started). Only an admin can set that, and only from their own connected
-account; automations on an agent then run on that member's own credential for
-it.
+account; automations run on that member's endpoint connections, including every
+paid tier. A missing connection disables the affected automation rather than
+spending another member's account. Any connected agent account will do: an admin who has
+connected only Codex can pay for a Codex-only project's automations.
 
 ## CLI vs Teams
 

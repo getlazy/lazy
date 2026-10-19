@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
   daemonStatusBuild,
   readEmbeddedBuildProvenance,
@@ -10,6 +10,7 @@ const STAMPED = { buildBranch: 'lazy/x', buildSha: '16e8b4bec', buildDirty: fals
 const CHECKOUT = { buildBranch: 'main', buildSha: 'abc1234', buildDirty: true, buildSourcePath: '/co' };
 
 describe('running build provenance', () => {
+  beforeEach(() => resetRunningBuildProvenanceCache());
   afterEach(() => resetRunningBuildProvenanceCache());
 
   // INVARIANT: a failed load of the embedded build-info module never yields a

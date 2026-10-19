@@ -75,19 +75,34 @@ const ID_LENGTH = 16;
  * Where the id came from — which is information, not trivia.
  *
  * `baked` says a build wrote it and the tree was not read; `computed` says this
- * process hashed the tree it is running from; `build` says there is no source
- * tree at all (a compiled binary), so the id is derived from build provenance
- * and CANNOT be compared against a checkout's fingerprint.
+ * process hashed the tree it is running from; `embedded` says this is a compiled
+ * binary carrying the fingerprint of the tree it was built from (scripts/build.ts),
+ * comparable only with another `embedded` — never with a checkout's own answer;
+ * `build` says a compiled binary with nothing embedded, so the id is derived from
+ * build provenance and CANNOT be compared against a checkout's fingerprint.
  */
-export type SourceIdKind = 'baked' | 'computed' | 'build';
+export type SourceIdKind = 'baked' | 'computed' | 'embedded' | 'build';
 
 export interface SourceIdentity {
-  /** 16 hex chars for `baked`/`computed`; `build:<sha>` or `version:<v>` otherwise. */
+  /** 16 hex chars for `baked`/`computed`/`embedded`; `build:<sha>` or `version:<v>` otherwise. */
   id: string;
   kind: SourceIdKind;
   /** The checkout root the id describes, or null for a compiled binary. */
   checkoutPath: string | null;
 }
+
+/**
+ * Files under {@link FINGERPRINT_ROOTS} that are not part of the identity.
+ *
+ * `src/build-info.ts` is a build STAMP, not code: a checkout carries dev
+ * defaults there, and compiling the agent binary from a checkout rewrites it
+ * with real provenance for the length of the compile, then restores it
+ * (buildAgentBinaryFromSourceCheckout in src/capture/claude.ts). Hashing it made
+ * a daemon that started during another daemon's compile report a different id
+ * from the same tree, and the fleet roll that id drives would replace a current
+ * daemon. What it records is already reported separately (build provenance).
+ */
+const EXCLUDED_FILES = new Set(['src/build-info.ts']);
 
 /** Directory names never worth hashing — none of them is lazy's own source. */
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', 'coverage']);
@@ -142,6 +157,7 @@ export async function computeSourceFingerprint(checkoutRoot: string): Promise<st
 
   const normalised = files
     .map(path => (sep === '/' ? path : path.split(sep).join('/')))
+    .filter(path => !EXCLUDED_FILES.has(path))
     .sort();
 
   const outer = createHash('sha256');
@@ -201,10 +217,14 @@ let cached: SourceIdentity | undefined;
  * Never throws. An unreadable tree yields the `build` kind, which says "not
  * comparable" rather than inventing an id two surfaces would then disagree about.
  */
+let inFlight: Promise<SourceIdentity> | undefined;
+
 export async function getSourceIdentity(): Promise<SourceIdentity> {
   if (cached !== undefined) return cached;
-  cached = await resolveSourceIdentity();
-  return cached;
+  // Concurrent first callers share one hash of the tree rather than each
+  // reading every source file.
+  inFlight ??= resolveSourceIdentity().then((identity) => (cached = identity));
+  return inFlight;
 }
 
 async function resolveSourceIdentity(): Promise<SourceIdentity> {
@@ -219,7 +239,36 @@ async function resolveSourceIdentity(): Promise<SourceIdentity> {
       // a compiled binary than to a tree we can describe.
     }
   }
+  // A compiled binary has no tree to hash, but a build that was handed the
+  // fingerprint of the tree it was compiled from (scripts/build.ts) answers with
+  // THAT — the same id `--write` bakes next to the sources — so a fleet comparing
+  // a daemon's id against the checkout's keeps working when the daemon is a
+  // binary. `embedded` is the honest kind: a build compiled it in.
+  const embedded = await readEmbeddedSourceFingerprint();
+  if (embedded) return { id: embedded, kind: 'embedded', checkoutPath: null };
   return { id: await buildIdentityFallback(), kind: 'build', checkoutPath: null };
+}
+
+/**
+ * The fingerprint compiled into this binary, or null when the build embedded
+ * none. Validated like the baked file: a malformed value is treated as absent
+ * rather than compared against real ids forever.
+ */
+export async function readEmbeddedSourceFingerprint(
+  load: () => Promise<{ BUILD_SOURCE_FINGERPRINT?: string }> = () =>
+    // The resting build-info.ts declares no such export (it is emitted only when a
+    // build supplies one), so view the module through the structural type.
+    import('../build-info') as Promise<{ BUILD_SOURCE_FINGERPRINT?: string }>,
+): Promise<string | null> {
+  try {
+    const mod = await load();
+    const value = mod.BUILD_SOURCE_FINGERPRINT?.trim();
+    return value && new RegExp(`^[0-9a-f]{${ID_LENGTH}}$`).test(value) ? value : null;
+  } catch {
+    // The generated module is absent in a bare test context: nothing was
+    // embedded, and the caller falls back to build provenance.
+    return null;
+  }
 }
 
 /**

@@ -100,8 +100,13 @@ export type TargetCredentialOutcome =
    * degrade to forwarding the placeholder or the client's own value — the
    * per-user-token-billing mandate means a turn either bills the acting user's
    * own credential or refuses. The proxy answers 401 with `reason`.
+   *
+   * `transient`: lazy could not resolve the credential RIGHT NOW (the token
+   * endpoint timed out or was unreachable, or answered 5xx/429) — nothing says
+   * it is broken. The proxy answers 503 so the agent's own retry handles it,
+   * and records no refusal against the credential's health.
    */
-  | { kind: 'missing'; reason: string };
+  | { kind: 'missing'; reason: string; transient?: true };
 
 /** Resolves one upstream's credential, live, at request time. */
 export type TargetCredentialResolver = () => Promise<TargetCredentialOutcome>;
@@ -134,9 +139,9 @@ export function originOf(upstream: string): string {
 /**
  * The proxy's target → credential map.
  *
- * Built once at daemon start with one entry per configured upstream (primary,
- * each fallback, cursor). The RESOLVERS are live, so the map itself never holds
- * a secret.
+ * Rebuilt when the proxy configuration changes, with one entry per configured
+ * upstream (primary, each fallback, cursor, agent profiles). The RESOLVERS are
+ * live, so the map itself never holds a secret.
  */
 export class TargetCredentials {
   private readonly entries = new Map<string, TargetCredentialResolver>();

@@ -391,6 +391,11 @@ describe('lazy start', () => {
     expect(turnContent).toContain('commit(s) ahead');
     // Preamble should include working tree status
     expect(turnContent).toMatch(/Working tree (is clean|has uncommitted changes)/);
+    // INVARIANT: only lazy's fixed sentences fold. The branch's state — commit
+    // subjects, status, diffstat — is text somebody else wrote, and folding never hides it.
+    const foldClose = turnContent.indexOf("<!-- /lazy:fold -->");
+    expect(foldClose).toBeGreaterThan(turnContent.indexOf("forked from"));
+    expect(turnContent.indexOf("commit(s) ahead")).toBeGreaterThan(foldClose);
     // The original user prompt must appear AFTER the preamble
     expect(turnContent).toContain(userPrompt);
     // The preamble comes before the user prompt (separated by ---)

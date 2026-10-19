@@ -67,10 +67,17 @@ function stubStorage(options: StubOptions = {}): Storage {
   } as unknown as Storage;
 }
 
-/** A review port answering with `count` queued tasks. */
-function stubActions(count: number): ReviewActions {
+/**
+ * A review port. `explode` makes `listQueue` throw: the badge must not call it.
+ * The count comes from the live task read, and building the queue (comments and
+ * sessions per blocked task) was the cost on every page.
+ */
+function stubActions(count: number, opts?: { explode?: boolean }): ReviewActions {
   return {
-    listQueue: async () => Array.from({ length: count }, (_, i) => ({ id: `t${i}` })),
+    listQueue: async () => {
+      if (opts?.explode) throw new Error('nav must not build the review queue');
+      return Array.from({ length: count }, (_, i) => ({ id: `t${i}` }));
+    },
   } as unknown as ReviewActions;
 }
 
@@ -88,8 +95,14 @@ describe('/api/nav-counts degraded cases', () => {
   // unreadable. Do not "simplify" the allSettled back.
   test('a failing read blanks its own count and leaves the others', async () => {
     const body = await counts(
-      stubStorage({ unread: 3, raisedBlocking: 2, raisedNonBlocking: 3, fail: ['conversations'] }),
-      stubActions(2),
+      stubStorage({
+        unread: 3, raisedBlocking: 2, raisedNonBlocking: 3, fail: ['conversations'],
+        liveTasks: [['task', 'blocked'], ['task', 'submitted']],
+      }),
+      // INVARIANT: the review badge counts blocked/conflict/submitted on the
+      // live task read. It must not call listQueue — that builds a comment and
+      // session read per blocked task, and this route runs on every page.
+      stubActions(99, { explode: true }),
     );
     expect(body.conversations).toBeNull();
     expect(body.conversationsLatestAt).toBe(0);
@@ -152,9 +165,21 @@ describe('/api/nav-counts degraded cases', () => {
   // 503, so the count is unknown — reporting 0 would tell the human nothing is
   // waiting for review while the queue is full and merely unreachable.
   test('no review action port reports null, never 0', async () => {
-    const body = await counts(stubStorage({ unread: 1 }));
+    const body = await counts(stubStorage({
+      unread: 1,
+      liveTasks: [['task', 'blocked'], ['task', 'blocked']],
+    }));
     expect(body.review).toBeNull();
+    expect(body.blocked).toBe(2);
     expect(body.unread).toBe(1);
+  });
+
+  // INVARIANT: a task read that failed cannot say "nothing is waiting". The
+  // badge is null together with `blocked`, even when a review port is wired.
+  test('a failed task read blanks the review badge', async () => {
+    const body = await counts(stubStorage({ fail: ['tasks'] }), stubActions(5, { explode: true }));
+    expect(body.review).toBeNull();
+    expect(body.blocked).toBeNull();
   });
 
   test('an empty review queue is 0, which is a different answer from null', async () => {

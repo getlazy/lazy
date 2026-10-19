@@ -26,7 +26,7 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS, disablePreAccept } from '../helpers/fixtures';
 import { runReconcile } from '../helpers/reconcile';
-import { readTurns, worktreePathFor } from '../helpers/storage';
+import { readTurns, worktreePathFor, readSystemMessagesFile } from '../helpers/storage';
 
 describe('a turn that ends with uncommitted work', () => {
   let ctx: TestContext;
@@ -218,4 +218,75 @@ describe('a turn that ends with uncommitted work', () => {
       expectSuccess(accept);
     });
   });
+  /**
+   * A PARK — a turn that ends without declaring final — never runs the
+   * leftovers step; it gets the once-per-turn commit nudge instead (engineer's
+   * design, 2026-10-06), and anything still loose after it is announced. The
+   * real-supervisor coverage is test/e2e/commit-nudge.test.ts.
+   */
+  describe('the commit nudge on a park', () => {
+    // INVARIANT: a parked turn's loose work is asked about once, and committed
+    // work reaches the branch.
+    test('the agent is asked, commits, and the task parks clean', async () => {
+      const taskId = await createTask(ctx, 'Park and forget to commit', 'Do the work');
+      const result = await ctx.lazyMocked(
+        ['start', taskId, '--yes', '--follow'],
+        MOCK_CLAUDE_SUCCESS,
+        {
+          env: {
+            LAZY_MOCK_SHOULD_COMMIT: '1',
+            LAZY_MOCK_LEAVE_UNCOMMITTED: 'lazy-teams/app/fix.rb',
+            LAZY_MOCK_NUDGE_COMMIT: '1',
+          },
+        },
+      );
+      expectSuccess(result);
+      await runReconcile(ctx.root, ctx.protocolBase);
+
+      const turns = readTurns(ctx.root, taskId);
+      expect(turns.filter(t => typeof t.content === 'string' && t.content.startsWith('## Uncommitted Changes Check')).length).toBe(1);
+      expect(turns.some(t => typeof t.content === 'string' && t.content.startsWith('## Uncommitted Work'))).toBe(false);
+      expect(turns.find(t => t.role === 'agent')!.uncommitted).toBeUndefined();
+      const show = await ctx.lazy(['show', taskId, '--full']);
+      expect(show.stdout).not.toContain('[Uncommitted work left behind]');
+    });
+
+    // INVARIANT: work still loose after the nudge is LOUD — a comment on the
+    // task and a system notice naming the paths — never only a turn badge.
+    // The agent here cannot commit, so it says so and the paths stay loose. This
+    // only SIMULATES the reply of an agent whose lazy tools are gone; the cause of
+    // that disconnect is pinned in test/unit/mcp-entry-ownership.test.ts.
+    test('work the agent could not commit is announced on the task and as a notice', async () => {
+      const taskId = await createTask(ctx, 'Lost its tools', 'Do the work');
+      const result = await ctx.lazyMocked(
+        ['start', taskId, '--yes', '--follow'],
+        MOCK_CLAUDE_SUCCESS,
+        {
+          env: {
+            LAZY_MOCK_SHOULD_COMMIT: '1',
+            LAZY_MOCK_LEAVE_UNCOMMITTED: 'lazy-teams/script/native_cycle.rb,docs/native-cycle.md',
+            LAZY_MOCK_NUDGE_RESPONSE: 'I cannot commit: my lazy tools are unavailable.',
+          },
+        },
+      );
+      expectSuccess(result);
+      await runReconcile(ctx.root, ctx.protocolBase);
+
+      const show = await ctx.lazy(['show', taskId, '--full']);
+      expectSuccess(show);
+      expectOutput(show, '[Uncommitted work left behind]');
+      expectOutput(show, 'lazy-teams/script/native_cycle.rb');
+
+      const notices = readSystemMessagesFile(ctx.root)
+        .filter(m => String(m.title).includes('uncommitted work left behind'));
+      expect(notices.length).toBe(1);
+      expect(String(notices[0].body)).toContain('docs/native-cycle.md');
+
+      // A second reconcile pass over the same response announces nothing new.
+      await runReconcile(ctx.root, ctx.protocolBase);
+      expect(readSystemMessagesFile(ctx.root)
+        .filter(m => String(m.title).includes('uncommitted work left behind')).length).toBe(1);
+    });
+  });
+
 });

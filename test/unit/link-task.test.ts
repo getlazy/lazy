@@ -17,7 +17,7 @@ import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 import { IMPORT_SOURCE_BRANCH_KEY } from '../../src/task/linked';
 import { pinDaemonBaseDir } from '../helpers/daemon-base-dir';
 import { putUserCredential, clearUserCredentialCache } from '../../src/daemon/user-credentials';
-import { NO_OWNER_CREDENTIAL_MARKER } from '../../src/daemon/turn-credentials';
+import { NO_OWNER_ENDPOINT_CREDENTIAL_MARKER } from '../../src/daemon/member-credentials';
 
 function git(cwd: string, ...args: string[]): void {
   const result = spawnSyncUnsupervised(['git', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
@@ -209,7 +209,7 @@ describe('daemon linkTask', () => {
       }
       expect(err).toBeInstanceOf(RpcError);
       expect((err as RpcError).status).toBe(400);
-      expect((err as RpcError).message).toContain(NO_OWNER_CREDENTIAL_MARKER);
+      expect((err as RpcError).message).toContain(NO_OWNER_ENDPOINT_CREDENTIAL_MARKER);
       expect(await storage.listTasks()).toEqual(before);
     } finally {
       unpin();
@@ -238,7 +238,7 @@ describe('daemon linkTask', () => {
         err = caught;
       }
       expect(err).toBeInstanceOf(RpcError);
-      expect((err as RpcError).message).toContain(NO_OWNER_CREDENTIAL_MARKER);
+      expect((err as RpcError).message).toContain(NO_OWNER_ENDPOINT_CREDENTIAL_MARKER);
     } finally {
       unpin();
       clearUserCredentialCache();

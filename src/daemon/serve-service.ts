@@ -12,6 +12,9 @@
 import { getOrCreateStorage } from './rpc-handlers';
 import {
   clearStartServicesCmd,
+  clearStopServicesCmd,
+  resolveProjectStopServicesCmd,
+  setStopServicesCmd,
   resolveProjectStartServicesCmd,
   setStartServicesCmd,
   StartServicesCmdError,
@@ -57,9 +60,17 @@ export async function handleSetStartServicesCmd(
   }
 }
 
-/** RPC: the project's Start services command, `{ command }` ('' when none). */
-export async function handleGetStartServicesCmd(projectRoot: string): Promise<{ command: string }> {
-  return { command: await resolveProjectStartServicesCmd(await getOrCreateStorage(), projectRoot) };
+/**
+ * RPC: the project's Start services command, `{ command, stopCommand }` ('' when
+ * none). `stopCommand` rides the same answer so one read renders both.
+ */
+export async function handleGetStartServicesCmd(projectRoot: string): Promise<{ command: string; stopCommand: string }> {
+  const storage = await getOrCreateStorage();
+  const [command, stopCommand] = await Promise.all([
+    resolveProjectStartServicesCmd(storage, projectRoot),
+    resolveProjectStopServicesCmd(storage),
+  ]);
+  return { command, stopCommand };
 }
 
 /**
@@ -68,5 +79,27 @@ export async function handleGetStartServicesCmd(projectRoot: string): Promise<{ 
  */
 export async function handleClearStartServicesCmd(): Promise<{ command: string }> {
   await clearStartServicesCmd(await getOrCreateStorage());
+  return { command: '' };
+}
+
+/**
+ * RPC: designate the project's Stop services command. Same validation and the
+ * same `{ command }` answer as the Start one; a refusal is a 400.
+ */
+export async function handleSetStopServicesCmd(
+  params: Record<string, unknown>,
+): Promise<{ command: string }> {
+  const command = requireString(params, 'command');
+  try {
+    return { command: await setStopServicesCmd(await getOrCreateStorage(), command) };
+  } catch (err) {
+    if (err instanceof StartServicesCmdError) throw new RpcError(400, err.message);
+    throw err;
+  }
+}
+
+/** RPC: clear the Stop services command. Answers `{ command: '' }`. */
+export async function handleClearStopServicesCmd(): Promise<{ command: string }> {
+  await clearStopServicesCmd(await getOrCreateStorage());
   return { command: '' };
 }

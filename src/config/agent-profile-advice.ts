@@ -10,11 +10,11 @@
  * `[agents.<name>]` in lazy.toml". On an ordinary project that is the fix.
  *
  * On a MANAGED host it is worse than useless. `agents.*.endpoint` and
- * `agents.*.credential` carry `disposition: 'refused'` in `./managed`, and a
- * refusal is not "the key is ignored": `ManagedConfigRefusedError` fails the
- * config load, so a member who followed the advice would commit a key that
- * stops the whole project loading — a strictly worse state than the one they
- * were trying to get out of, reached by doing exactly what lazy told them.
+ * `agents.*.credential` carry `disposition: 'refused'` in `./managed`: the key is
+ * kept in the file but never used (./managed-withhold), so a member who
+ * followed the advice would commit a profile that is never available — no fix
+ * at all, reached by doing exactly what lazy told them. (Until 2026-10-08 a
+ * refused key stopped the whole project loading, which was worse still.)
  *
  * That is not hypothetical. lazy's built-in `pi` profile points at the machine's
  * own Ollama, so on an installation with no local model server every Pi task
@@ -41,20 +41,61 @@
  */
 
 import { isManagedMode } from './managed-mode';
+import { describeConfigInForceLine, lastLoadedConfig } from './config-provenance';
+
+/**
+ * The words a control plane looks for to link the refusal to its confirmation
+ * page (Lazy Teams' DaemonRefusal). Changing them breaks that link.
+ */
+export const PROFILE_AWAITING_CONFIRMATION = 'waiting for a project admin to confirm';
 
 /**
  * How to get a profile that does not exist — the tail of "Unknown agent
  * profile X. Available profiles: …".
  */
 export function defineProfileAdvice(name: string): string {
+  const loaded = lastLoadedConfig();
+  // The file the profiles were read from, so a name that IS in the config the
+  // reader believes is in force can be told apart from one that is not.
+  const from = loaded ? ` The profiles were read from ${describeConfigInForceLine(loaded)}.` : '';
   if (!isManagedMode()) {
-    return `Define a new one with an [agents.${name}] block in lazy.toml.`;
+    return `Define a new one with an [agents.${name}] block in lazy.toml.${from}`;
+  }
+  const withheld = loaded?.withheldProfiles?.[name];
+  if (withheld !== undefined && loaded?.awaitingConfirmation?.includes(name)) {
+    return (
+      `[agents.${name}] is in this project's configuration, but it is ${PROFILE_AWAITING_CONFIRMATION}: ` +
+      `it came from the repository's lazy.toml, whose endpoints and credentials are not used until a project admin ` +
+      `confirms them (${withheld}). Confirm them under the project's Settings › Configuration › Endpoints and agent profiles, or choose one of the available profiles.`
+    );
+  }
+  if (withheld !== undefined) {
+    return (
+      `[agents.${name}] is in this project's configuration (${describeConfigInForceLine(loaded!)}), but this ` +
+      `installation does not use it: ${withheld}. Change it on the project's Configuration page, or choose one of the available profiles.`
+    );
+  }
+  if (loaded?.repositoryAgentNames?.includes(name)) {
+    return (
+      `The repository's lazy.toml defines [agents.${name}], but the configuration this daemon runs on does not:` +
+      ` the profiles were read from ${describeConfigInForceLine(loaded)}. This installation copied the` +
+      ` repository's lazy.toml once and does not follow later changes to it; bringing it in is ${PROFILE_AWAITING_CONFIRMATION} it` +
+      ` under the project's Settings › Configuration › Endpoints and agent profiles, or choose one of the available profiles.`
+    );
+  }
+  if (Array.isArray(loaded?.repositoryAgentNames)) {
+    return (
+      `[agents.${name}] is not defined anywhere: neither this project's configuration nor the repository's lazy.toml in this ` +
+      `project's checkout has it.${from} This installation manages the project's configuration: add it on the project's Settings › Configuration › Endpoints and agent profiles, or choose one of the available profiles.`
+    );
   }
   return (
-    `This installation manages agent configuration, so an [agents.${name}] block in the ` +
-    `repository's lazy.toml would be refused — ask whoever runs it to offer that agent.`
+    `This installation manages the project's configuration: [agents.${name}] belongs in the ` +
+    `project's Configuration page, not the repository's lazy.toml.${from} If the newest ` +
+    `saved configuration defines it, this daemon is not running on that version — the Configuration page shows which one it is on.`
   );
 }
+
 
 /**
  * How to get MORE profiles than the ones just listed — the footer under a
@@ -81,7 +122,7 @@ export function changeProfileEndpointAdvice(profile: string): string {
   }
   return (
     `This installation manages agent configuration: setting [agents.${profile}] endpoint in the ` +
-    `repository's lazy.toml is refused there and would stop the project loading at all. ` +
+    `repository's lazy.toml is refused there: it stays in the file but is never used, so the profile is not available. ` +
     `Ask whoever runs this installation to make that upstream reachable from the host running ` +
     `this project's daemon, or choose an agent whose upstream it already provides.`
   );
@@ -122,11 +163,12 @@ export function piUpstreamExamples(): string {
       'A pi agent profile that names no endpoint runs the local Ollama pi defaults to; one with ' +
       'an "endpoint" runs that upstream — over the Anthropic wire, e.g. ' +
       '[agents.anthropic-pi] harness = "pi", model = "claude-opus-5-5", ' +
-      'endpoint = "https://api.anthropic.com", or [agents.remote-ollama-pi] harness = "pi", ' +
-      'model = "…", endpoint = "http://ollama.lan:11434", or over the OpenAI wire when the ' +
+      'endpoint = "https://api.anthropic.com", credential = "anthropic", or [agents.remote-ollama-pi] harness = "pi", ' +
+      'model = "…", endpoint = "http://ollama.lan:11434", credential = "none", or over the OpenAI wire when the ' +
       'endpoint is OpenAI\'s or OpenRouter\'s, e.g. [agents.openai-pi] harness = "pi", ' +
-      'model = "gpt-6-sol", endpoint = "https://api.openai.com" or [agents.openrouter-pi] ' +
-      'harness = "pi", model = "anthropic/claude-sonnet-4.5", endpoint = "https://openrouter.ai/api".'
+      'model = "gpt-6-sol", endpoint = "https://api.openai.com", credential = "openai" or [agents.openrouter-pi] ' +
+      'harness = "pi", model = "anthropic/claude-sonnet-4.5", endpoint = "https://openrouter.ai/api", ' +
+      'credential = "openrouter". Every endpoint names the credential that pays it.'
     );
   }
   return (
@@ -240,7 +282,8 @@ export function localModelProfileAdvice(): string {
 export function keepProfileOnEndpointAdvice(endpoint: string, servedBy: string): string {
   if (!isManagedMode()) {
     return (
-      `Add endpoint = ${JSON.stringify(endpoint)} to keep this profile on that upstream, ` +
+      `Add endpoint = ${JSON.stringify(endpoint)} and the credential that pays it ` +
+      `(credential = "anthropic" for your Anthropic key) to keep this profile on that upstream, ` +
       `or set a model ${servedBy} serves.`
     );
   }
@@ -266,6 +309,7 @@ export function generatedConfigProfileExamples(): string {
       '# harness = "claude-code"\n' +
       '# model = "qwen3.5:35b-a3b-coding-nvfp4"\n' +
       '# endpoint = "http://localhost:11434"\n' +
+      '# credential = "none"                 # every endpoint names its credential\n' +
       '#\n' +
       '# [agents.work-codex]\n' +
       '# harness = "codex"\n' +
@@ -274,8 +318,8 @@ export function generatedConfigProfileExamples(): string {
   }
   return (
     '# This installation manages agent configuration: an [agents.<name>] block here\n' +
-    '# naming an endpoint or a credential is refused, and the project will not load\n' +
-    '# with one. Ask whoever runs the installation which agents it offers.'
+    '# naming an endpoint or a credential is kept but not used, so that profile is not\n' +
+    '# available. Ask whoever runs the installation which agents it offers.'
   );
 }
 
@@ -292,5 +336,67 @@ export function unrunnableProfileRefusal(profile: string, endpoint: string): str
     `Agent "${profile}" cannot run on this installation: its model upstream (${endpoint}) is not ` +
     `answering, and a project cannot point it elsewhere here — this installation manages agent ` +
     `configuration. Choose an agent it already runs, or ask whoever runs it to provide that upstream.`
+  );
+}
+
+/**
+ * The dotted key a withheld part of a managed project's lazy.toml is reported
+ * under, and one sentence saying it is kept but not used (and why). Built here
+ * with the rest of the profile advice so `lazy doctor` and `lazy init` say the
+ * same thing and never spell their own `[agents.<name>]` sentence.
+ */
+export function withheldSettingKey(item: { kind: 'profile' | 'endpoint' | 'setting'; name: string }): string {
+  return item.kind === 'setting' ? item.name : `${item.kind === 'profile' ? 'agents' : 'endpoints'}.${item.name}`;
+}
+
+export function withheldSettingAdvice(item: { kind: 'profile' | 'endpoint' | 'setting'; name: string; reason: string }): string {
+  const what = item.kind === 'profile' ? `agent profile [agents.${item.name}]`
+    : item.kind === 'endpoint' ? `endpoint [endpoints.${item.name}]` : item.name;
+  return `This project's ${what} is kept in lazy.toml but not used on this managed host: ${item.reason}. ` +
+    'Remove or change it if you want it to take effect.';
+}
+
+/**
+ * How to fix an endpoint the proxy refused to send a provider's credential to,
+ * because the host is not that provider's and lazy.toml did not name the
+ * credential for it (the provider-host backstop, src/proxy/credential-deps.ts).
+ */
+export function providerCredentialHostAdvice(provider: string, block: { endpoint?: string; profile: string }): string {
+  if (!isManagedMode()) {
+    const where = block.endpoint ? `[endpoints.${block.endpoint}]` : `[agents.${block.profile}]`;
+    return (
+      `If this endpoint really is a ${provider}-compatible service that takes that key, write ` +
+      `credential = "${provider}" in ${where}; otherwise give it its own: credential = "<name>" ` +
+      `and \`lazy auth set <name>\`.`
+    );
+  }
+  return (
+    'Which credential an endpoint bills is not something a repository chooses on this installation, ' +
+    'which manages agent configuration — ask whoever runs it.'
+  );
+}
+
+/**
+ * The remedy in the "endpoint has no credential" load error. A local server is
+ * told `credential = "none"` first; anything else gets a credential name plus
+ * `lazy auth set`. A managed reader is not told to run `lazy auth set` — the
+ * installation decides which credentials exist there.
+ */
+export function endpointCredentialAdvice(block: string, suggested: string, local: boolean): string {
+  if (isManagedMode()) {
+    return (
+      `Add credential = "<name>" (or credential = "none" for a server that takes no key) to ${block} — ` +
+      'which credentials exist is up to whoever runs this installation, so ask them which name to use.'
+    );
+  }
+  if (local) {
+    return (
+      `Add one line to ${block}:\n  credential = "none"     # a local model server takes no key\n` +
+      `or, if it does want one:\n  credential = "${suggested}"     # then: lazy auth set ${suggested}`
+    );
+  }
+  return (
+    `Add one line to ${block}:\n  credential = "${suggested}"     # then: lazy auth set ${suggested}\n` +
+    'or, for a server that takes no credential (a local model server):\n  credential = "none"'
   );
 }

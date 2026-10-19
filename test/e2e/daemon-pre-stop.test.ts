@@ -6,7 +6,7 @@ import { getDaemonDir, getTokenPath, getWebPortPath } from '../../src/daemon/pat
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput, expectOutputExcludes } from '../helpers/assertions';
 import { createTask } from '../helpers/fixtures';
-import { setTaskStatus } from '../helpers/storage';
+import { setTaskMetadata, setTaskStatus } from '../helpers/storage';
 import { pinConfig } from '../helpers/pin-config';
 import {
   collectDaemonStopInventory,
@@ -65,6 +65,9 @@ describe('lazy daemon stop — pre-stop warning', () => {
     const paired = await createTask(ctx, 'Paired task', 'Some pairing');
     setTaskStatus(ctx.root, working, 'working');
     setTaskStatus(ctx.root, paired, 'pairing');
+    // Reconciler sweepStalePairing clears bare `pairing` status unless pairing_pid
+    // names a live process (see src/utils/reconcile.ts).
+    setTaskMetadata(ctx.root, paired, 'pairing_pid', String(process.pid));
 
     const result = await ctx.lazy(['daemon', 'stop', '--yes']);
     expectSuccess(result);
@@ -222,18 +225,25 @@ describe('lazy daemon stop — pre-stop warning', () => {
   }
 
   test('states the proxy consequence for builders and for pair sessions', async () => {
-    const out = await captured(() => printDaemonStopInventory(inventory({
+    const stopOut = await captured(() => printDaemonStopInventory(inventory({
       builders: ['lazy-builder-abc123'],
       pairing: [{ label: 'paired-task', goal: 'Pair on it' }],
       proxyLive: true,
     }), 'stop'));
 
-    expect(out).toContain('1 builder session is live');
-    expect(out).toContain('lazy-builder-abc123');
-    expect(out).toContain('their next request fails');
-    expect(out).toContain('Exit and relaunch each builder');
-    expect(out).toContain('1 pair session is open');
-    expect(out).toContain('left on a dead address');
+    expect(stopOut).toContain('1 builder session is live');
+    expect(stopOut).toContain('lazy-builder-abc123');
+    expect(stopOut).toContain('reconnects in place automatically');
+    expect(stopOut).not.toContain('Exit and relaunch each builder');
+    expect(stopOut).toContain('1 pair session is open');
+    expect(stopOut).toContain('left on a dead address');
+
+    const restartOut = await captured(() => printDaemonStopInventory(inventory({
+      builders: ['lazy-builder-abc123'],
+      proxyLive: true,
+    }), 'restart'));
+    expect(restartOut).toContain('reconnects in place once the new daemon is up');
+    expect(restartOut).not.toContain('Exit and relaunch each builder');
   });
 
   test('says nothing about the proxy when it is configured off', async () => {
@@ -266,7 +276,8 @@ describe('lazy daemon stop — pre-stop warning', () => {
 
     expect(inv.proxyLive).toBe(true);
     const out = await captured(() => printDaemonStopInventory({ ...inv, builders: ['lazy-builder-abc123'] }, 'stop'));
-    expect(out).toContain('Exit and relaunch each builder');
+    expect(out).toContain('reconnects in place automatically');
+    expect(out).not.toContain('Exit and relaunch each builder');
   });
 
   // INVARIANT: builder enumeration is independent of the storage lookup.
@@ -342,8 +353,25 @@ describe('lazy daemon stop — pre-stop warning', () => {
     expectOutput(result, 'lazy-builder-deadbee');
     // Builders are the class that survives the stop — a different consequence
     // from an interrupted agent turn, and reported as such.
-    expectOutput(result, 'NOT stopped and NOT resumed');
+    expectOutput(result, 'NOT stopped');
+    expectOutputExcludes(result, 'Exit and relaunch each builder');
     expectOutput(result, 'Daemon stopped.');
+  });
+
+  test('lists discovered builder containers on restart with in-place reconnect text', async () => {
+    const binDir = await fakeDockerPs(['lazy-builder-deadbee']);
+
+    const result = await ctx.lazy(['daemon', 'restart', '--yes'], {
+      env: { PATH: `${binDir}:${process.env.PATH ?? ''}` },
+    });
+
+    expectSuccess(result);
+    expectOutput(result, 'This restart affects live sessions:');
+    expectOutput(result, '1 builder session is live');
+    expectOutput(result, 'lazy-builder-deadbee');
+    expectOutput(result, 'reconnects in place once the new daemon is up');
+    expectOutputExcludes(result, 'Exit and relaunch each builder');
+    expectOutput(result, 'Daemon started');
   });
 
   test('distinguishes the causes of an incomplete inventory', () => {

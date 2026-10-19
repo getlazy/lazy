@@ -17,6 +17,7 @@ import {
   selectableAgentProfiles,
 } from '../config/agent-profiles';
 import { credentialKinds, credentialLabel } from '../credentials/providers';
+import { memberCredentialGuidance } from '../credentials/member-guidance';
 import { parseChatGptTokens, serializeChatGptTokens } from '../credentials/chatgpt-tokens';
 import { logger } from '../utils/logger';
 import { RpcError } from './rpc-error';
@@ -28,7 +29,7 @@ import {
   type MemberCredentialAnswer,
 } from './member-credentials';
 import {
-  getServiceCredential,
+  getServiceHolder,
   putUserCredential,
   SERVICE_CREDENTIAL_USER_ID,
   type UserCredentialKind,
@@ -95,7 +96,7 @@ export async function agentCredentialProfiles(
   const profiles: AgentCredentialProfile[] = [];
   for (const profile of selectableAgentProfiles(agentProfilesFor(config))) {
     const described = describe(profile);
-    if (principal !== undefined) described.yours = stateOf(await memberCredentialFor(projectRoot, principal, profile));
+    if (principal !== undefined) described.yours = stateOf(await memberCredentialFor(projectRoot, principal, profile, config));
     profiles.push(described);
   }
   return { profiles };
@@ -103,8 +104,9 @@ export async function agentCredentialProfiles(
 
 function stateOf(answer: MemberCredentialAnswer): MemberCredentialState {
   if (answer.kind === 'none-needed') return { state: 'none-needed' };
-  if (answer.kind === 'credential') return { state: 'connected', via: answer.via };
-  return { state: 'missing', want: answer.want, detail: answer.detail };
+  // Retain this legacy wire vocabulary; endpoint RPCs expose the exact identity.
+  if (answer.kind === 'credential') return { state: 'connected', via: answer.record.endpointId === 'builtin:anthropic' ? 'claude' : 'profile' };
+  return { state: 'missing', want: answer.endpoint === 'builtin:anthropic' ? 'claude' : 'profile', detail: answer.detail };
 }
 
 function describe(profile: AgentProfile): AgentCredentialProfile {
@@ -121,7 +123,7 @@ function describe(profile: AgentProfile): AgentCredentialProfile {
     kinds: paidBy !== 'profile' ? [] : session ? ['oauth'] : [...credentialKinds(profile.credential)],
     session,
     endpoint: originOf(profile.endpoint),
-    howToGet: paidBy === 'profile' ? howToGet(profile, session) : null,
+    howToGet: paidBy === 'profile' ? memberCredentialGuidance(profile.credential, session) : null,
   };
 }
 
@@ -132,28 +134,6 @@ function originOf(endpoint: string): string | null {
   } catch {
     return endpoint;
   }
-}
-
-/**
- * Where a member gets one, in a sentence for a web page — never a `lazy auth`
- * command, which is how a terminal user stores one for the daemon itself and
- * nothing a member of a hosted team can run.
- */
-const MEMBER_HOW_TO_GET: Record<string, string> = {
-  openai: 'An API key from platform.openai.com/api-keys.',
-  openrouter: 'An API key from openrouter.ai/keys.',
-  ollama: 'An API key from ollama.com.',
-  cursor: 'An API key from the Cursor dashboard.',
-  anthropic: 'A `claude setup-token` token, or an API key from the Anthropic console.',
-};
-
-function howToGet(profile: AgentProfile, session: boolean): string {
-  if (session) {
-    return 'Run `codex login` (or `codex login --device-auth`) on your own machine and paste the contents of ' +
-      '~/.codex/auth.json. Use a login made for this purpose: lazy renews it, which signs out any other copy.';
-  }
-  return MEMBER_HOW_TO_GET[profile.credential] ??
-    'The API key (or token) this agent\'s endpoint accepts — ask whoever runs that service.';
 }
 
 /**
@@ -251,7 +231,7 @@ export async function putProfileCredential(
   // no secret of its own.
   let sameAs: string | undefined;
   if (profile && input.userId.trim() === SERVICE_CREDENTIAL_USER_ID && describe(profile).session) {
-    sameAs = input.ownerEmail?.trim() || (await getServiceCredential(projectRoot))?.ownerEmail;
+    sameAs = input.ownerEmail?.trim() || (await getServiceHolder(projectRoot))?.email;
     if (!sameAs) {
       throw new RpcError(
         400,

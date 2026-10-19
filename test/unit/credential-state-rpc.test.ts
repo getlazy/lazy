@@ -33,7 +33,7 @@ const ENV_KEYS = [
 ] as const;
 
 const OPENROUTER_CODEX =
-  '[agents.openrouter-codex]\nharness = "codex"\nmodel = "gpt-5-codex"\nendpoint = "https://openrouter.ai/api"\n';
+  '[agents.openrouter-codex]\nharness = "codex"\nmodel = "gpt-5-codex"\nendpoint = "https://openrouter.ai/api"\ncredential = "openrouter"\n';
 
 describe('handleGetCredentialState', () => {
   let projectRoot: string;
@@ -120,7 +120,7 @@ describe('handleGetCredentialState', () => {
 
   test('an all-local project reports no credentials and no Anthropic requirement', async () => {
     await writeConfig(
-      '[agents.claude-code]\nharness = "claude-code"\nmodel = "qwen3.8:latest"\nendpoint = "http://localhost:11434"\n',
+      '[agents.claude-code]\nharness = "claude-code"\nmodel = "qwen3.8:latest"\nendpoint = "http://localhost:11434"\ncredential = "none"\n',
     );
     const state = await handleGetCredentialState(projectRoot, {});
     expect(state.providers).toEqual([]);

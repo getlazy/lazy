@@ -232,7 +232,7 @@ describe('usage pause', () => {
     const notByOverride = await launchAsPerson(ctx, 'startTask', { taskId: findFullTaskId(ctx.root, other) });
     expect(notByOverride.exitCode).not.toBe(0);
     expect(notByOverride.stderr).toContain(`lazy start ${other}`);
-    expect(notByOverride.stderr).toContain('--past-usage-pause');
+    expect(notByOverride.stderr).toContain('--override-usage-pause');
     expect((await ctx.lazy(['daemon', 'config', 'get'])).stdout).toContain('One-shot override: off');
 
     // INVARIANT: a launch the pause was not holding anyway never spends the
@@ -258,10 +258,10 @@ describe('usage pause', () => {
     expect(refusedAgain.exitCode).not.toBe(0);
     expect(refusedAgain.stderr).toContain('paused');
 
-    // INVARIANT: the CLI's `--past-usage-pause` carries the allowance with the
+    // INVARIANT: the CLI's `--override-usage-pause` carries the allowance with the
     // launch — no terminal needed, since the builder may take it too — and
     // leaves nothing pending behind it.
-    expectSuccess(await ctx.lazy(['unblock', taskId, '-m', 'through, once more', '--past-usage-pause']));
+    expectSuccess(await ctx.lazy(['unblock', taskId, '-m', 'through, once more', '--override-usage-pause']));
     expectSuccess(await ctx.lazy(['wait', taskId]));
     expect(await readTaskStatus(ctx.root, taskId)).toBe('blocked');
     expect((await ctx.lazy(['daemon', 'config', 'get'])).stdout).not.toContain('Let through:');

@@ -48,7 +48,7 @@ describe('review asks are filed by the unblock that submits the review', () => {
     throw new Error(`task ${shortId} never appeared in the review queue`);
   }
 
-  // INVARIANT: filing MOVES an ask, it never discards it (CLAUDE.md, "Never
+  // INVARIANT: filing MOVES an ask, it never discards it (AGENTS.md, "Never
   // Lose Human Feedback"). The question and the agent's answer stay on the
   // page — what changes is that they stop counting as the reviewer's open
   // business.

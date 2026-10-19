@@ -20,6 +20,8 @@
  */
 
 import { DEFAULT_CONFIG } from './loader';
+import { isManagedMode } from './managed-mode';
+import { MANAGED_PROTECTION_DEFAULT } from './managed';
 import { editableConfigKeys } from './project-config';
 import { VALID_CHATTINESS_LEVELS, VALID_EFFORT_LEVELS, VALID_LFS_CHECK_MODES } from './types';
 import { REVIEW_GATES, REVIEW_MODES } from '../review/mode';
@@ -142,8 +144,15 @@ export const SETTINGS_CATALOG: Record<string, SettingEntry> = {
   'agents.*.harness': { group: 'agents', label: 'Profile harness', summary: 'Which agent program a named profile runs (claude-code, codex, cursor, pi).', kind: 'table', effect: 'next-turn' },
   'agents.*.model': { group: 'agents', label: 'Profile model', summary: 'The model a named profile asks for.', kind: 'table', effect: 'next-turn' },
   'agents.*.description': { group: 'agents', label: 'Profile description', summary: 'When to choose a named profile, shown beside every agent picker. Never selects one by itself.', kind: 'table', effect: 'on-use' },
-  'agents.*.endpoint': { group: 'agents', label: 'Profile endpoint', summary: 'Where a named profile\'s requests are sent. Paid by the credential each member connects for that profile.', kind: 'table', effect: 'restart' },
-  'agents.*.credential': { group: 'agents', label: 'Profile credential', summary: 'Which of each member\'s credentials pays for a named profile.', kind: 'table', effect: 'restart' },
+  'agents.*.endpoint': { group: 'agents', label: 'Profile endpoint', summary: 'Where a named profile\'s requests are sent. Paid by the credential each member connects for its endpoint.', kind: 'table', effect: 'on-use' },
+  'agents.*.credential': { group: 'agents', label: 'Profile credential', summary: 'The authentication provider for an inline endpoint connection.', kind: 'table', effect: 'on-use' },
+  'agents.*.named_endpoint': { group: 'agents', label: 'Profile named endpoint', summary: 'A named endpoint a profile runs against instead of an inline endpoint.', kind: 'table', effect: 'on-use' },
+  'agents.*.tiers[].endpoint': { group: 'agents', label: 'Tier endpoint', summary: 'The named endpoint one tier of a tiered profile runs against.', kind: 'table', effect: 'on-use' },
+  'agents.*.tiers[].model': { group: 'agents', label: 'Tier model', summary: 'The model one tier of a tiered profile asks for.', kind: 'table', effect: 'on-use' },
+  'agents.*.tiers[].threshold_percent': { group: 'agents', label: 'Tier threshold', summary: 'How full a tier\'s usage window may get before requests move to the next tier.', kind: 'table', effect: 'on-use' },
+  'endpoints.*.description': { group: 'agents', label: 'Endpoint description', summary: 'A note about a named endpoint.', kind: 'table', effect: 'on-use' },
+  'endpoints.*.credential': { group: 'agents', label: 'Endpoint credential', summary: 'The authentication provider for a named endpoint connection.', kind: 'table', effect: 'on-use' },
+  'endpoints.*.url': { group: 'agents', label: 'Endpoint URL', summary: 'Where a named endpoint sends requests. A changed origin requires members to reconnect.', kind: 'table', effect: 'on-use' },
   'agent.agent_id': { group: 'agents', label: 'Default agent profile', summary: 'The agent profile a task uses when it does not pick one.', kind: 'string', effect: 'next-turn', default: 'claude-code' },
   'agent.by_type': { group: 'agents', label: 'Agent profile per task type', summary: 'A different default agent profile for particular task types (fix, spike, …).', kind: 'table', effect: 'next-turn' },
   'agent.effort': { group: 'agents', label: 'Effort', summary: 'How much thinking a task agent does per step. Higher is slower and costs more.', kind: 'choice', choices: EFFORTS, effect: 'next-turn' },
@@ -190,10 +199,10 @@ export const SETTINGS_CATALOG: Record<string, SettingEntry> = {
 
   // ── Protection ───────────────────────────────────────────────────────────
   'permissions.protected': { group: 'protection', label: 'Protected files', summary: 'Files an agent may not change without a person approving it at accept.', kind: 'list', effect: 'turn-end' },
-  'protection.enabled': { group: 'protection', label: 'Protection on', summary: 'Require a passphrase to accept into protected branches and tasks.', kind: 'boolean', effect: 'accept' },
+  'protection.enabled': { group: 'protection', label: 'Protection on', summary: 'Require a person to approve accepts into protected branches and tasks — in Lazy Teams, a signed-in member pressing Accept; elsewhere, the approval passphrase. On by default in Lazy Teams, where it protects the default branch.', kind: 'boolean', effect: 'accept' },
   'protection.gate_default_branch': { group: 'protection', label: 'Protect the default branch', summary: 'Treat the repository\'s default branch as protected.', kind: 'boolean', effect: 'accept' },
-  'protection.protected_branches': { group: 'protection', label: 'Protected branches', summary: 'Branches that need the passphrase to accept into.', kind: 'list', effect: 'accept' },
-  'protection.protected_tasks': { group: 'protection', label: 'Protected tasks', summary: 'Tasks that need the passphrase to accept into.', kind: 'list', effect: 'accept' },
+  'protection.protected_branches': { group: 'protection', label: 'Protected branches', summary: 'Branches that need a person\'s approval to accept into.', kind: 'list', effect: 'accept' },
+  'protection.protected_tasks': { group: 'protection', label: 'Protected tasks', summary: 'Tasks whose work needs a person\'s approval to move upward.', kind: 'list', effect: 'accept' },
 
   // ── Running on its own ───────────────────────────────────────────────────
   'daemon.auto_resume': { group: 'autonomy', label: 'Resume interrupted work', summary: 'Restart a task whose turn was interrupted (for example by a crash).', kind: 'boolean', effect: 'background' },
@@ -224,15 +233,20 @@ export const SETTINGS_CATALOG: Record<string, SettingEntry> = {
 
   // ── Workspace and services ───────────────────────────────────────────────
   'worktree.include': { group: 'workspace', label: 'Copy into new working copies', summary: 'Untracked files (like .env) copied into each new task\'s working copy.', kind: 'list', effect: 'on-use' },
-  'docker.dockerfile': { group: 'workspace', label: 'Container image', summary: 'A Dockerfile, relative to the repository root, for the image tasks run in.', kind: 'string', effect: 'next-turn' },
+  'docker.dockerfile': { group: 'workspace', label: 'Container image', summary: 'A Dockerfile, relative to the repository root, for the image tasks run in. Empty uses a committed Dockerfile.lazy at the root, where this install builds one.', kind: 'string', effect: 'next-turn' },
   'docker.build_inputs': { group: 'workspace', label: 'Image build inputs', summary: 'Files whose change rebuilds the container image.', kind: 'list', effect: 'next-turn' },
+  'docker.run_args': { group: 'workspace', label: 'Extra docker run arguments', summary: 'Extra arguments passed verbatim to `docker run` when a task container starts.', kind: 'list', effect: 'next-turn' },
   'serve.ports': { group: 'workspace', label: 'Served ports', summary: 'Ports a task\'s app listens on, reachable from the task page.', kind: 'list', effect: 'services' },
+  'serve.main_service': { group: 'workspace', label: 'Main service port', summary: 'The served port a PR/MR description links to as the running app on Lazy Teams. Empty uses the first one.', kind: 'integer', effect: 'on-use' },
   'serve.services': { group: 'workspace', label: 'Named services', summary: 'Named ports a task\'s app serves.', kind: 'table', effect: 'services' },
   'serve.start_services_cmd': { group: 'workspace', label: 'Start services command', summary: 'The command that starts a task\'s services.', kind: 'string', effect: 'services' },
   'documents.path': { group: 'workspace', label: 'Documents folder', summary: 'Where lazy looks for project documents.', kind: 'string', effect: 'on-use' },
 
   // ── Model traffic ────────────────────────────────────────────────────────
+  'proxy.tier_retry_interval': { group: 'proxy', label: 'Tier retry interval (s)', summary: 'How long a tier that refused for its rate limit, without saying when to come back, is skipped before the next request tries it again.', kind: 'integer', effect: 'restart', default: '300' },
   'proxy.retry_after_threshold': { group: 'proxy', label: 'Retry-after threshold (s)', summary: 'Wait and retry a rate-limited request when the provider asks for at most this many seconds.', kind: 'integer', effect: 'restart', default: '5' },
+  'proxy.audit_retention_days': { group: 'proxy', label: 'Audit log retention (days)', summary: 'How many days of proxy request history are kept, unless the size limit is reached first.', kind: 'integer', effect: 'restart', default: '7' },
+  'proxy.audit_retention_mib': { group: 'proxy', label: 'Audit log retention (MiB)', summary: 'How much disk the proxy request history may use in all, unless the age limit is reached first.', kind: 'integer', effect: 'restart', default: '128' },
   'proxy.upstream_timeout': { group: 'proxy', label: 'Upstream timeout (s)', summary: 'How long a model request may take before it is given up.', kind: 'integer', effect: 'restart', default: String(DEFAULT_UPSTREAM_TIMEOUT_SECONDS) },
   'proxy.policy.deny_path_globs': { group: 'proxy', label: 'Extra denied paths', summary: 'Paths agents may not read or write, on top of the installation\'s own list.', kind: 'list', effect: 'restart' },
 
@@ -262,6 +276,9 @@ export interface SettingsCatalogRead {
 }
 
 function defaultOf(key: string, entry: SettingEntry): string {
+  // The settings page of a managed (Teams) project must show the default the
+  // daemon actually applies there, which differs from lazy's own for this key.
+  if (key === 'protection.enabled' && isManagedMode()) return String(MANAGED_PROTECTION_DEFAULT);
   if (entry.default !== undefined) return entry.default;
   let value: unknown = DEFAULT_CONFIG;
   for (const part of key.split('.')) {
@@ -397,6 +414,10 @@ export function describeConfigChange(beforeToml: string, afterToml: string): Set
     if (b?.text === a?.text) continue;
     const catalogKey = (a ?? b)!.catalogKey;
     const entry = SETTINGS_CATALOG[catalogKey]!;
+    // Setting a key to the value lazy applies when it is unset (or unsetting it)
+    // changes nothing: the settings form writes every field, so an untouched
+    // `dockerfile = ""` would otherwise read as a second change.
+    if ((a === undefined ? b : b === undefined ? a : null)?.text === defaultOf(catalogKey, entry)) continue;
     const name = catalogKey.includes('*') ? key.split('.')[catalogKey.split('.').indexOf('*')] : null;
     changes.push({
       key,

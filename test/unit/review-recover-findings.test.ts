@@ -560,3 +560,42 @@ describe('a blocking handoff raise that dedupes', () => {
     expect(await storage.getTaskRaisedItems(taskId)).toHaveLength(1);
   });
 });
+
+describe('reviewSweepClaimsIssue — "no <qualifier> issue found" phrasings', () => {
+  // INVARIANT: a "nothing found" sweep in the "No exploitable issue found. …"
+  // shape is clean, while a sentence that merely starts with "no" and names a
+  // problem still claims one. The first was recorded as a critical security
+  // finding on a clean review; the second must never be waved through.
+  test('no-<qualifier>-issue-found statements are clean and add no finding', () => {
+    for (const clean of [
+      'No exploitable issue found. The push path validates every ref.',
+      'No exploitable issues found',
+      'No security vulnerabilities identified.',
+      'no data-integrity problems detected — writes are atomic',
+    ]) {
+      expect(reviewSweepClaimsIssue(clean)).toBe(false);
+    }
+    const r = report({
+      verdict: 'clean',
+      security: 'No exploitable issue found. Refs are validated.',
+      data_integrity: 'none found',
+    });
+    ensureSweepsAreCovered(r);
+    expect(r.findings).toHaveLength(0);
+    expect(reviewIsClean(r)).toBe(true);
+  });
+
+  test('real findings are still claimed', () => {
+    for (const claim of [
+      'No exploitable path is guarded; the ref name reaches git unescaped',
+      'No validation is done, so a crafted ref injects an option',
+      'no exploitable issue is guarded against, the write can corrupt',
+      'SQL injection in the search query',
+    ]) {
+      expect(reviewSweepClaimsIssue(claim)).toBe(true);
+    }
+    const r = report({ verdict: 'needs_work', security: 'SQL injection in search' });
+    ensureSweepsAreCovered(r);
+    expect(r.findings).toHaveLength(1);
+  });
+});

@@ -327,7 +327,7 @@ describe('daemon auth env', () => {
         '[agents.local-ollama]\n' +
         'harness = "claude-code"\n' +
         'model = "qwen3:8b"\n' +
-        'endpoint = "http://localhost:11434"\n',
+        'endpoint = "http://localhost:11434"\ncredential = "none"\n',
       );
       expect(await gate('local-ollama')).toBeNull();
       // ...while the Anthropic-billed profile in the same project still owes one.
@@ -402,7 +402,7 @@ describe('daemon auth env', () => {
       // unknown-profile refusal below.
       await writeFile(
         process.env.LAZY_CONFIG!,
-        '[agents.local-ollama]\nharness = "claude-code"\nmodel = "qwen"\nendpoint = "http://localhost:11434"\n',
+        '[agents.local-ollama]\nharness = "claude-code"\nmodel = "qwen"\nendpoint = "http://localhost:11434"\ncredential = "none"\n',
       );
       // Deliberately no CLAUDE/ANTHROPIC creds: this must not throw.
       const result = await handleGetAuthEnv(projectRoot, {
@@ -495,7 +495,7 @@ describe('daemon auth env', () => {
       // Anthropic credential — absent here, so it would throw.
       await writeFile(
         process.env.LAZY_CONFIG!,
-        '[agents.local-ollama]\nharness = "claude-code"\nmodel = "qwen"\nendpoint = "http://localhost:11434"\n',
+        '[agents.local-ollama]\nharness = "claude-code"\nmodel = "qwen"\nendpoint = "http://localhost:11434"\ncredential = "none"\n',
       );
       const result = await handleGetAuthEnv(projectRoot, {
         proxied: true, profile: 'local-ollama', role: 'agent', taskId: 'task-90', label: 'lazy-task-90',
@@ -521,6 +521,7 @@ describe('daemon auth env', () => {
         'harness = "claude-code"',
         'model = "qwen3:8b"',
         'endpoint = "http://localhost:11434"',
+        'credential = "none"',
         '',
         '[models.roles.builder]',
         'agent = "builder-ollama"',

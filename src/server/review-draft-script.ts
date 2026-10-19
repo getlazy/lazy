@@ -6,7 +6,7 @@
  * Both pages hold words the reviewer has typed and not yet sent, and both used
  * to hold them in the DOM only: navigating away, opening the task in a second
  * tab, or picking the review back up on another machine started from an empty
- * box. Unsent words are human feedback (CLAUDE.md: never lose it), so they are
+ * box. Unsent words are human feedback (AGENTS.md: never lose it), so they are
  * patched onto the task through the daemon instead — one endpoint, one debounce,
  * one way of telling the reviewer when a save failed.
  *

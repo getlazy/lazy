@@ -56,7 +56,7 @@ export function toStructuredCheck(
     : classifyDoctorCheck(result.label, id, remedyFlag);
   return {
     id,
-    title: result.label,
+    title: result.ok ? result.label : result.problem,
     status,
     detail,
     docs: result.docs ? docsUrl(result.docs) : undefined,
@@ -119,7 +119,7 @@ export async function runChecks<C>(
     } catch (err) {
       results.push({
         id: check.id,
-        title: check.title,
+        title: check.problem,
         status: 'error',
         detail: err instanceof Error ? err.message : String(err),
         remedyFlag: check.remedyFlag,

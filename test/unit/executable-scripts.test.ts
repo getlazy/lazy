@@ -25,9 +25,10 @@ const repoRoot = resolve(import.meta.dir, '..', '..');
 const MUST_BE_EXECUTABLE = [
   'lazy-teams/bin',
   'lazy-teams/deploy/daemon-image/lazy-guest-init',
+  'src/guest/lazy-guest-init',
   'lazy-teams/deploy/daemon-image/lazy-wrapper',
-  // `:(glob)` keeps `*` to one directory level: scripts/verify-host-sandbox-linux/lib.sh
-  // is sourced, not run, and must not be pulled in by a recursive match.
+  // `:(glob)` keeps `*` to one directory level: a sourced helper in a script
+  // subdirectory must not be pulled in by a recursive match.
   ':(glob)scripts/*.sh',
   ':(glob)scripts/smolvm-probes/*.sh',
 ];

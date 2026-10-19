@@ -21,7 +21,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { join } from 'path';
+import { basename, join } from 'path';
 import { readFile, rm, writeFile } from 'fs/promises';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask } from '../helpers/fixtures';
@@ -48,11 +48,14 @@ async function until<T>(read: () => T | Promise<T>, ok: (v: T) => boolean, budge
 }
 
 /** Session start → one proxied request → result. */
-function proxiedTurn(sessionId: string): ClaudeScenario {
+function proxiedTurn(sessionId: string, holdPath?: string): ClaudeScenario {
   return {
     steps: [
       { kind: 'emit', event: sessionStartEvent(sessionId) },
       { kind: 'http', expectStatus: 200 },
+      // A task's MCP token acts only while its turn is running, so a suite that
+      // plays the AGENT's tool calls holds the turn open around them.
+      ...(holdPath ? [{ kind: 'hold-while-file' as const, path: holdPath }] : []),
       { kind: 'emit', event: resultEvent({ result: 'Did some work.', sessionId }) },
     ],
   };
@@ -96,10 +99,20 @@ describe('usage pause hardening', () => {
   });
 
   afterEach(async () => {
+    await rm(holdPath(), { force: true });
     upstream.stop(true);
     await ctx.cleanup();
     clearMcpTokenCache();
   });
+
+  /** While this file exists, a turn scripted with it stays running. */
+  const holdPath = () => join(ctx.root, '..', `${basename(ctx.root)}-turn-hold`);
+
+  /** Hold the next scripted turn open; returns the release. */
+  async function holdTurn(): Promise<() => Promise<void>> {
+    await writeFile(holdPath(), 'hold');
+    return () => rm(holdPath(), { force: true });
+  }
 
   const client = () => DaemonClient.fromTarget(getDaemonTcpTarget(ctx.root)!, readToken(ctx.root)!);
 
@@ -108,12 +121,30 @@ describe('usage pause hardening', () => {
     return records.some((r) => r.usageLimitHeaders?.['anthropic-ratelimit-unified-5h-utilization'] === pct);
   }
 
-  /** One turn on a fresh task, whose request reads `utilization`; the task ends blocked. */
-  async function pauseWithOneTurn(utilization: string, resetAtSec: number, goal = 'Paused task'): Promise<string> {
+  /**
+   * One turn on a fresh task, whose request reads `utilization`; the task ends
+   * blocked. With `during`, that runs while the turn is still live — after the
+   * reading, before the turn ends.
+   */
+  async function pauseWithOneTurn(
+    utilization: string,
+    resetAtSec: number,
+    goal = 'Paused task',
+    during?: (taskId: string) => Promise<void>,
+  ): Promise<string> {
     reading = () => ({ utilization, resetAtSec });
     const taskId = await createTask(ctx, goal, 'Do work');
-    await ctx.setClaudeScenario(proxiedTurn(`sess-${goal.replace(/\W/g, '')}`));
+    const release = during ? await holdTurn() : null;
+    await ctx.setClaudeScenario(proxiedTurn(`sess-${goal.replace(/\W/g, '')}`, release ? holdPath() : undefined));
     expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    if (during && release) {
+      try {
+        expect(await until(() => sawReading(utilization), Boolean, 10_000, `the ${utilization} reading`)).toBe(true);
+        await during(taskId);
+      } finally {
+        await release();
+      }
+    }
     expectSuccess(await ctx.lazy(['wait', taskId]));
     expect(await until(() => sawReading(utilization), Boolean, 10_000, `the ${utilization} reading`)).toBe(true);
     return taskId;
@@ -239,8 +270,8 @@ describe('usage pause hardening', () => {
   // PER TASK): no task launch — from a terminal or not — spends the daemon-wide
   // one-shot override, which is left for launches beside any task; a task gets
   // through only with its own allowance, which the CLI carries with
-  // `--past-usage-pause` and which the builder's shell may use too.
-  test("a task launch never spends the daemon-wide override; --past-usage-pause lets it through", async () => {
+  // `--override-usage-pause` and which the builder's shell may use too.
+  test("a task launch never spends the daemon-wide override; --override-usage-pause lets it through", async () => {
     const paused = await pauseWithOneTurn('0.97', Math.floor(Date.now() / 1000) + 3600, 'Paused A');
     const other = await createTask(ctx, 'Task B', 'More work');
     await setUsagePauseOverrideRpc(ctx, 'off');
@@ -259,13 +290,13 @@ describe('usage pause hardening', () => {
     // …nor does a person's own launch: the override is not the task's way through.
     const person = await launchAsPerson(ctx, 'startTask', { taskId: findFullTaskId(ctx.root, other) });
     expect(person.exitCode).not.toBe(0);
-    expect(person.stderr).toContain('--past-usage-pause');
+    expect(person.stderr).toContain('--override-usage-pause');
     expect((await ctx.lazy(['daemon', 'config', 'get'])).stdout).toContain('One-shot override: off');
 
     // The task's own allowance, carried by the launch, lets it through — from
     // the builder's shell too — and the daemon-wide override is still pending.
     await ctx.setClaudeScenario(proxiedTurn('person-start'));
-    expectSuccess(await ctx.lazy(['start', other, '--yes', '--past-usage-pause'], { env: { LAZY_ACTOR: 'builder' } }));
+    expectSuccess(await ctx.lazy(['start', other, '--yes', '--override-usage-pause'], { env: { LAZY_ACTOR: 'builder' } }));
     expect((await ctx.lazy(['daemon', 'config', 'get'])).stdout).toContain('One-shot override: off');
   }, 240_000);
 
@@ -352,11 +383,12 @@ describe('usage pause hardening', () => {
     const clusterId = created.stdout.match(/Created task ([a-f0-9]{8})/)![1]!;
     const resetAtSec = Math.floor(Date.now() / 1000) + 50;
     reading = () => ({ utilization: '0.98', resetAtSec });
-    await ctx.setClaudeScenario(proxiedTurn('cluster-1'));
+    // The driver's turn is held open while its agent's calls are played: a
+    // task's MCP token acts only for the turn that is running.
+    const release = await holdTurn();
+    await ctx.setClaudeScenario(proxiedTurn('cluster-1', holdPath()));
     expectSuccess(await ctx.lazy(['start', clusterId, '--yes']));
-    expectSuccess(await ctx.lazy(['wait', clusterId]));
     expect(await until(() => sawReading('0.98'), Boolean, 10_000, 'the 98% reading')).toBe(true);
-    reading = () => ({ utilization: '0.05', resetAtSec: Math.floor(Date.now() / 1000) + 3600 });
 
     // Created by the driver's own agent, so the cluster restart (which wakes a
     // cluster only for children somebody ELSE added) cannot be what wakes it.
@@ -379,6 +411,13 @@ describe('usage pause hardening', () => {
     const waited = await agentTool(clusterId, 'lazy_wait', { task_id: childId, timeout: 2 });
     expect(waited.status).toBe(200);
     expect(JSON.stringify(waited.body)).toContain('held_by_usage_pause');
+
+    // The driver ends its turn, as it was told to.
+    await release();
+    expectSuccess(await ctx.lazy(['wait', clusterId]));
+    // Its own end-of-turn invocations are not spending by the held child.
+    await ctx.clearClaudeInvocations();
+    reading = () => ({ utilization: '0.05', resetAtSec: Math.floor(Date.now() / 1000) + 3600 });
 
     // Parked: nothing spends while the pause lasts.
     await sleep(6_000);
@@ -458,9 +497,13 @@ describe('usage pause hardening', () => {
     const created = await ctx.lazy(['create', '--goal', 'Cluster', '--prompt', 'Run children', '--type', 'cluster']);
     expectSuccess(created);
     const clusterId = created.stdout.match(/Created task ([a-f0-9]{8})/)![1]!;
-    await ctx.setClaudeScenario(proxiedTurn('cluster-own'));
+    // The driver's turn stays live throughout — its agent's calls need it —
+    // while the child runs to completion beside it.
+    const release = await holdTurn();
+    await ctx.setClaudeScenario({ sequence: [proxiedTurn('cluster-own', holdPath()), proxiedTurn('child-own')] });
     expectSuccess(await ctx.lazy(['start', clusterId, '--yes']));
-    expectSuccess(await ctx.lazy(['wait', clusterId]));
+    // Its request has read the unpaused window before the reading moves.
+    expect(await until(() => sawReading('0.10'), Boolean, 10_000, 'the driver turn reading')).toBe(true);
 
     const made = await agentTool(clusterId, 'lazy_create', { goal: 'A child that runs first', prompt: 'x' });
     expect(made.status).toBe(200);
@@ -478,15 +521,15 @@ describe('usage pause hardening', () => {
     expect(meta[USAGE_PAUSE_PENDING_START_KEY] ?? '').toBe('');
     expect(meta.usage_pause_held ?? '').toBe('');
     expect(await readTaskStatus(ctx.root, childId)).toBe(statusBefore);
+    await release();
   }, 240_000);
 
   // INVARIANT: running inside the daemon is not a way around the gate —
   // `lazy_conversation_ask` served on the daemon's own MCP route is judged
   // like every other model run, as the channel asking.
   test('lazy_conversation_ask over the daemon MCP route is refused while paused', async () => {
-    const taskId = await pauseWithOneTurn('0.97', Math.floor(Date.now() / 1000) + 3600);
     const now = new Date().toISOString();
-    await client().rpc('storage', ctx.root, { method: 'saveConversation', args: { conversation: {
+    const seed = () => client().rpc('storage', ctx.root, { method: 'saveConversation', args: { conversation: {
       sessionId: 'c0ffee00-0000-4000-8000-000000000001', projectPath: 'p', cwd: null, version: null, gitBranch: null,
       startedAt: now, endedAt: now, importedAt: Date.now(), summary: 'A seeded conversation',
       stats: { messageCount: 1, userMessageCount: 1, assistantMessageCount: 0, subagentCount: 0, totalTokens: 0 },
@@ -495,12 +538,17 @@ describe('usage pause hardening', () => {
       subagents: [],
     } } });
 
-    const asked = await agentTool(taskId, 'lazy_conversation_ask', {
-      session_id: 'c0ffee00', question: 'What was said?',
+    // Asked by the agent of a turn that is still running, after its own
+    // request read the paused window.
+    await pauseWithOneTurn('0.97', Math.floor(Date.now() / 1000) + 3600, 'Paused task', async (taskId) => {
+      await seed();
+      const asked = await agentTool(taskId, 'lazy_conversation_ask', {
+        session_id: 'c0ffee00', question: 'What was said?',
+      });
+      expect(asked.status).toBe(429);
+      expect(JSON.stringify(asked.body)).toContain('paused');
+      expect(JSON.stringify(asked.body)).not.toContain('usage_pause_threshold');
     });
-    expect(asked.status).toBe(429);
-    expect(JSON.stringify(asked.body)).toContain('paused');
-    expect(JSON.stringify(asked.body)).not.toContain('usage_pause_threshold');
   }, 240_000);
 
   // INVARIANT: `lazy ask` on a finished task (the record route, a one-shot on

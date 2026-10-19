@@ -93,7 +93,7 @@ describe('provider-aware missing-credential report', () => {
     await writeConfig(
       '[credentials]\nbackend = "file"\n\n' +
       '[agents.local]\nharness = "claude-code"\nmodel = "qwen"\n' +
-      'endpoint = "http://localhost:11434"\n\n' +
+      'endpoint = "http://localhost:11434"\ncredential = "none"\n\n' +
       '[models.roles.builder]\nagent = "local"\n\n' +
       '[models.roles.agent]\nagent = "local"\n',
     );
@@ -107,7 +107,7 @@ describe('provider-aware missing-credential report', () => {
     await writeConfig(
       '[credentials]\nbackend = "file"\n\n' +
       '[agents.local]\nharness = "claude-code"\nmodel = "qwen"\n' +
-      'endpoint = "http://localhost:11434"\n\n' +
+      'endpoint = "http://localhost:11434"\ncredential = "none"\n\n' +
       '[models.roles.builder]\nagent = "local"\n\n' +
       '[models.roles.agent]\nagent = "claude-code"\n',
     );
@@ -321,7 +321,7 @@ describe('startup credential hydration', () => {
       configPath,
       '[credentials]\nbackend = "file"\n\n' +
       '[agents.local]\nharness = "claude-code"\nmodel = "qwen"\n' +
-      'endpoint = "http://localhost:11434"\n\n' +
+      'endpoint = "http://localhost:11434"\ncredential = "none"\n\n' +
       '[models.roles.builder]\nagent = "local"\n\n' +
       '[models.roles.agent]\nagent = "local"\n',
     );
@@ -444,7 +444,7 @@ describe('startup credential hydration', () => {
         join(projectRoot, 'lazy.toml'),
         '[credentials]\nbackend = "file"\n\n' +
         '[agents.local]\nharness = "claude-code"\nmodel = "qwen"\n' +
-        'endpoint = "http://localhost:11434"\n\n' +
+        'endpoint = "http://localhost:11434"\ncredential = "none"\n\n' +
         '[models.roles.builder]\nagent = "local"\n\n' +
         '[models.roles.agent]\nagent = "local"\n',
       );

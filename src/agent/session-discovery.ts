@@ -294,3 +294,26 @@ export async function rediscoverSessionIdForHarness(
       return null;
   }
 }
+
+/** Start at a complete JSONL record near the end of the current session. */
+export async function watchSessionReplayStart(filePath: string, size: number): Promise<number> {
+  if (size <= 256 * 1024) return 0;
+  const start = size - 256 * 1024;
+  const handle = await open(filePath, 'r');
+  try {
+    const bytes = Buffer.alloc(size - start);
+    const { bytesRead } = await handle.read(bytes, 0, bytes.length, start);
+    const newline = bytes.subarray(0, bytesRead).indexOf(10);
+    return newline < 0 ? size : start + newline + 1;
+  } finally {
+    await handle.close();
+  }
+}
+
+/** JSONL entries predating the current turn must not reappear as live output. */
+export function watchEntryBelongsToTurn(timestamp: string | undefined, turnStart: number): boolean {
+  if (!turnStart) return true;
+  if (!timestamp) return false;
+  const timestampMs = Date.parse(timestamp);
+  return !Number.isNaN(timestampMs) && timestampMs >= turnStart;
+}

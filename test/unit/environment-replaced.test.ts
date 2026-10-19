@@ -1,9 +1,8 @@
 /**
  * The agent is told, once, when its environment was replaced between turns.
  *
- * INVARIANT: whenever lazy takes a RUNNING task container away — a member
- * entering the task through a terminal, a credential-kind change, an agent
- * switch — the next work turn's prompt opens with exactly one line saying so,
+ * INVARIANT: whenever lazy takes a RUNNING task container away — a
+ * credential-kind change, an agent switch — the next work turn's prompt opens with exactly one line saying so,
  * and the turn after it does not. Without it the agent reinstalls nothing and
  * chases "command not found" errors for tools it installed a turn ago.
  */
@@ -18,7 +17,6 @@ import {
   ENVIRONMENT_REPLACED_KEY,
   REASON_AGENT_CHANGED,
   REASON_CREDENTIAL_CHANGED,
-  REASON_MEMBER_ENTERED,
   clearEnvironmentReplaced,
   environmentReplacedLine,
   environmentReplacedPrefix,
@@ -89,57 +87,27 @@ describe('environment replaced notice', () => {
     expect(environmentReplacedLine('x')).toBe(EXPECTED('x'));
   });
 
-  test('member entry: the next work turn carries the line once, the one after does not', async () => {
+  // INVARIANT: a member's entry no longer takes the task's container away
+  // (engineer, 2026-10-05), so it never tells the agent its environment was
+  // replaced.
+  test('member entry leaves the environment in place and records nothing', async () => {
     const task = await storage.createTask('member', undefined, baseSha, undefined, undefined, 'claude-code');
     await storage.updateTaskStatus(task.id, 'blocked', 'human');
     const sess = await storage.createSession(task.id, 'claude-code', 'lazy/member', baseSha);
     await storage.createTurn({ sessionId: sess.id, sequence: 1, role: 'human', content: 'hi' });
-
     const email = 'alice@example.com';
     expect(claimMemberTerminal(task.id, email).ok).toBe(true);
     try {
       const entered = await enterTaskAsMember({
-        projectRoot: '/p',
-        storage,
-        taskId: task.id,
-        email,
-        deps: {
-          bindingFor: async () => null,
-          pairing: async () => ({ pairing: false, webPairEmail: null }),
-          worktreeHolders: async () => ({ webChat: { held: false, email: null }, lock: null }),
-          supervisorOwnsTurn: async () => null,
-          stopTaskContainer: async () => true,
-        },
-      });
-      expect(entered).toEqual({ ok: true });
-    } finally {
-      releaseMemberTerminal(task.id, email);
-    }
-
-    const first = await launchWorkTurn(task.id);
-    expect(count(first, EXPECTED(REASON_MEMBER_ENTERED))).toBe(1);
-    expect(first.startsWith(EXPECTED(REASON_MEMBER_ENTERED))).toBe(true);
-    expect(count(await launchWorkTurn(task.id), 'Your environment was replaced')).toBe(0);
-  });
-
-  test('member entry that found no running container records nothing', async () => {
-    const task = await storage.createTask('member idle', undefined, baseSha, undefined, undefined, 'claude-code');
-    await storage.updateTaskStatus(task.id, 'blocked', 'human');
-    const sess = await storage.createSession(task.id, 'claude-code', 'lazy/member-idle', baseSha);
-    await storage.createTurn({ sessionId: sess.id, sequence: 1, role: 'human', content: 'hi' });
-    const email = 'bob@example.com';
-    expect(claimMemberTerminal(task.id, email).ok).toBe(true);
-    try {
-      await enterTaskAsMember({
         projectRoot: '/p', storage, taskId: task.id, email,
         deps: {
           bindingFor: async () => null,
           pairing: async () => ({ pairing: false, webPairEmail: null }),
           worktreeHolders: async () => ({ webChat: { held: false, email: null }, lock: null }),
           supervisorOwnsTurn: async () => null,
-          stopTaskContainer: async () => false,
         },
       });
+      expect(entered).toEqual({ ok: true });
     } finally {
       releaseMemberTerminal(task.id, email);
     }
@@ -190,12 +158,12 @@ describe('environment replaced notice', () => {
 
   test('replacements before one work turn are told together, each reason once', async () => {
     const task = await storage.createTask('both', undefined, baseSha, undefined, undefined, 'claude-code');
-    await recordRecreationIfRunning(storage, task.id, REASON_MEMBER_ENTERED, RUNNING, "c");
-    await recordRecreationIfRunning(storage, task.id, REASON_MEMBER_ENTERED, RUNNING, "c");
+    await recordRecreationIfRunning(storage, task.id, REASON_AGENT_CHANGED, RUNNING, "c");
+    await recordRecreationIfRunning(storage, task.id, REASON_AGENT_CHANGED, RUNNING, "c");
     await recordRecreationIfRunning(storage, task.id, recreationReason(true, false), RUNNING, "c");
     const first = await launchWorkTurn(task.id);
     expect(count(first, 'Your environment was replaced')).toBe(1);
-    expect(count(first, REASON_MEMBER_ENTERED)).toBe(1);
+    expect(count(first, REASON_AGENT_CHANGED)).toBe(1);
     expect(count(first, REASON_CREDENTIAL_CHANGED)).toBe(1);
   });
 });

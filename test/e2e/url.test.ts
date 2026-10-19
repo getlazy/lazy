@@ -6,7 +6,7 @@
  * name/port lookup. Only the runtime is pretend.
  *
  * The URL printed is the SUBDOMAIN name the daemon's proxy answers on
- * (`http://web.<task>.lazy.localhost:<dashboard port>`), because the human's
+ * (`http://<task>.web.lazy.localhost:<dashboard port>`), because the human's
  * next move is to open it in a browser. `--direct` prints the raw 127.0.0.1
  * mapping the container actually publishes, for curl and scripts — both forms
  * are asserted here, since the two are what every other surface composes from.
@@ -139,9 +139,9 @@ describe('lazy url', () => {
     expectSuccess(result);
     // A bare `[serve] ports` entry is named by its port, so that is its label
     // in the hostname too — a leading digit is a valid DNS label.
-    expectOutput(result, `http://3000.${taskId}.lazy.localhost:${webPort}`);
+    expectOutput(result, `http://${taskId}.3000.lazy.localhost:${webPort}`);
     expectOutput(result, 'api');
-    expectOutput(result, `http://api.${taskId}.lazy.localhost:${webPort}`);
+    expectOutput(result, `http://${taskId}.api.lazy.localhost:${webPort}`);
     // These names only resolve in a browser, so the list says where to get a
     // URL that works in curl rather than leaving the reader to find out.
     expectOutput(result, '--direct');
@@ -163,7 +163,7 @@ describe('lazy url', () => {
   });
 
   // A task with a code is addressed BY that code — the whole point of a stable
-  // name is that `web.my-task.lazy.localhost` survives a container recreate and
+  // name is that `my-task.web.lazy.localhost` survives a container recreate and
   // reads like the task, not like a hex id.
   test('a task code becomes the label in the hostname', async () => {
     await declareServe('[serve.services]\nweb = 3000');
@@ -173,7 +173,7 @@ describe('lazy url', () => {
 
     const listed = await url(['my-task']);
     expectSuccess(listed);
-    expect(listed.stdout).toContain(`http://web.my-task.lazy.localhost:${webPort}`);
+    expect(listed.stdout).toContain(`http://my-task.web.lazy.localhost:${webPort}`);
   });
 
   // The list carries a liveness dot per service, from the shared TCP probe
@@ -214,7 +214,7 @@ describe('lazy url', () => {
 
     const result = await url([taskId, 'web']);
     expectSuccess(result);
-    expect(result.stdout.trim()).toBe(`http://web.${taskId}.lazy.localhost:${webPort}`);
+    expect(result.stdout.trim()).toBe(`http://${taskId}.web.lazy.localhost:${webPort}`);
   });
 
   // INVARIANT: `--direct` prints the raw mapping, alone, for the same reason —
@@ -238,7 +238,7 @@ describe('lazy url', () => {
 
     const result = await url([taskId, '5173']);
     expectSuccess(result);
-    expect(result.stdout.trim()).toBe(`http://5173.${taskId}.lazy.localhost:${webPort}`);
+    expect(result.stdout.trim()).toBe(`http://${taskId}.5173.lazy.localhost:${webPort}`);
 
     const direct = await url([taskId, '5173', '--direct']);
     expectSuccess(direct);
@@ -276,7 +276,7 @@ describe('lazy url', () => {
     expectSuccess(result);
     expectOutput(result, 'Serving:');
     expectOutput(result, 'web');
-    expectOutput(result, `http://web.${taskId}.lazy.localhost:${webPort}`);
+    expectOutput(result, `http://${taskId}.web.lazy.localhost:${webPort}`);
   });
 
   // The same block for a task whose container is down: named, but with no URL

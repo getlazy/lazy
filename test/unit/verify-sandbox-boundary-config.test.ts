@@ -1,10 +1,10 @@
 /**
  * Config plumbing for `[runner] verify_sandbox_boundary`.
  *
- * The key decides whether a host launch verifies the FILE-TOOL deny boundary
- * before running an agent. Its default is load-bearing in both directions: "off"
- * must not silently bill anyone for three headless Claude sessions, and an
- * operator who opts in must actually get a launch refusal on a violation.
+ * A RETIRED key: the host file-tool boundary self-check it selected was removed
+ * (2026-10-13). Like the other legacy host-process keys it is still accepted
+ * and validated so an existing lazy.toml keeps loading; it has no runtime
+ * effect.
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
@@ -31,9 +31,8 @@ describe('[runner] verify_sandbox_boundary', () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  // INVARIANT: off by default. The guard costs three real headless Claude
-  // sessions and needs an interactively logged-in `claude` — a cost no user
-  // should pay without asking for it. CI is the standing signal instead.
+  // INVARIANT: a retained legacy key keeps its old default, so a config that
+  // never set it reads the same as before the self-check was retired.
   test('defaults to "off"', () => {
     expect(DEFAULT_CONFIG.runner.verify_sandbox_boundary).toBe('off');
   });
@@ -46,9 +45,8 @@ describe('[runner] verify_sandbox_boundary', () => {
 
   test('a typo is rejected loudly, not silently ignored', async () => {
     await writeLazyToml(root, '[runner]\nverify_sandbox_boundary = "always"\n');
-    // Silently falling back to "off" would turn a request for verification into
-    // no verification at all — the exact false sense of safety the guard exists
-    // to prevent.
+    // Legacy keys are still validated (public-docs/lazy-toml.md): a bad value
+    // is a config error to fix, never silently accepted.
     await expect(loadConfig(root)).rejects.toThrow(/verify_sandbox_boundary/);
   });
 

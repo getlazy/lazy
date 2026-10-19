@@ -373,5 +373,5 @@ The MCP server is spawned automatically by Claude Code via ~/.claude.json.`);
   const oneShot = args.includes('--one-shot');
 
   const { runSupervisor } = await import('./supervisor/index');
-  await runSupervisor({ protocolDir, worktreePath, oneShot });
+  process.exitCode = await runSupervisor({ protocolDir, worktreePath, oneShot });
 }

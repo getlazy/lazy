@@ -79,6 +79,9 @@ function makeStorage(specs: FakeTaskSpec[]) {
     async getTurnCountByTaskId(id: string) {
       return turnCounts.get(id) ?? 1;
     },
+    async getStatusHistory(id: string) {
+      return [{ timestamp: 1, actor: id.startsWith('agentmade') ? 'agent' : 'human' }];
+    },
     async getSessionTurns(sessionId: string) {
       const id = sessionId.replace(/^sess-/, '');
       const count = turnCounts.get(id) ?? 1;
@@ -230,5 +233,111 @@ describe('raceWait', () => {
     expect(result.status).toBe('interrupted');
     expect(result.timed_out).toBe(false);
     expect(result.pending).toHaveLength(0);
+  });
+});
+
+describe('raceWait interruption by a new subtask', () => {
+  // INVARIANT: a subtask added under the waiter mid-wait ends the wait with an
+  // explicit `interrupted` reason — never a fake timeout or a fake settle — so a
+  // parent blocked on its children learns about work added from outside.
+  test('returns interrupted (not timed out) when a child appears under the waiter', async () => {
+    const storage = makeStorage([{ id: 'aaaa1111', code: 'a', status: 'working' }]);
+    let reads = 0;
+    storage.getChildTasks = async () => {
+      reads++;
+      const kids = [{ id: 'old1', code: 'old', status: 'working' }];
+      if (reads > 2) kids.push({ id: 'new1', code: 'fresh', status: 'backlog' });
+      return kids as unknown as Task[];
+    };
+
+    const result = await raceWait(storage, ['a'], { ...FAST, interruptOnNewChildOf: 'parent' });
+
+    expect(result.timed_out).toBe(false);
+    expect(result.interrupted?.reason).toBe('subtask_added');
+    expect(result.interrupted?.new_tasks?.map(t => t.task_id)).toEqual(['new1']);
+    expect(result.status).toBe('working');
+  });
+
+  test('children that existed when the wait began do not interrupt it', async () => {
+    const storage = makeStorage([{ id: 'aaaa1111', code: 'a', status: 'working', finishesAtPoll: 3 }]);
+    storage.getChildTasks = async () => [{ id: 'old1', code: 'old', status: 'working' }] as unknown as Task[];
+
+    const result = await raceWait(storage, ['a'], { ...FAST, interruptOnNewChildOf: 'parent' });
+
+    expect(result.interrupted).toBeUndefined();
+    expect(result.status).toBe('blocked');
+  });
+});
+
+describe('raceWait interruption details', () => {
+  // INVARIANT: only children created from outside interrupt; the waiter's own
+  // agent creating a child must never wake its own wait.
+  test('a child created by the waiting agent itself does not interrupt', async () => {
+    const storage = makeStorage([{ id: 'aaaa1111', code: 'a', status: 'working', finishesAtPoll: 4 }]);
+    let reads = 0;
+    storage.getChildTasks = async () => (reads++ > 1 ? [{ id: 'agentmade1', status: 'backlog' }] : []) as unknown as Task[];
+    const result = await raceWait(storage, ['a'], { ...FAST, interruptOnNewChildOf: 'parent' });
+    expect(result.interrupted).toBeUndefined();
+    expect(result.status).toBe('blocked');
+  });
+
+  // INVARIANT: a task that settles in the same sweep stays the answer.
+  test('a settle in the same sweep as a new child is reported as the winner, with the interruption', async () => {
+    const storage = makeStorage([{ id: 'aaaa1111', code: 'a', status: 'working', finishesAtPoll: 1 }]);
+    let reads = 0;
+    storage.getChildTasks = async () => (reads++ > 0 ? [{ id: 'new1', status: 'backlog' }] : []) as unknown as Task[];
+    const result = await raceWait(storage, ['a'], { ...FAST, interruptOnNewChildOf: 'parent' });
+    expect(result.status).toBe('blocked');
+    expect(result.task_id).toBe('aaaa1111');
+    expect(result.interrupted?.new_tasks?.map(t => t.task_id)).toEqual(['new1']);
+  });
+});
+
+describe('raceWait comment interruption', () => {
+  const claimOf = (notes: string) => ({ notes, count: 1, through: 5000, claim_id: 'claim-1' });
+
+  // INVARIANT: a comment that lands on the waiting task interrupts the wait
+  // within a poll and carries the notes block itself, so the agent can act on
+  // it without ending its turn. A human's comment and a builder's are the same.
+  for (const who of ['human', 'builder']) {
+    test(`a ${who} comment interrupts the wait with its content and a claim`, async () => {
+      const storage = makeStorage([{ id: 'aaaa1111', code: 'a', status: 'working', finishesAtPoll: 50 }]);
+      let polls = 0;
+      const result = await raceWait(storage, ['a'], {
+        ...FAST,
+        claimComments: async () => (++polls >= 3 ? claimOf(`NOTES ADDED SINCE YOUR LAST TURN:\n[${who}] use the new API`) : null),
+      });
+
+      expect(result.timed_out).toBe(false);
+      expect(result.status).toBe('working');
+      expect(result.interrupted?.reason).toBe('comment_added');
+      expect(result.interrupted?.notes).toContain('use the new API');
+      expect(result.interrupted?.claim).toEqual({ through: 5000, claim_id: 'claim-1' });
+      expect(result.pending.map(t => t.display_id)).toEqual(['a']);
+    });
+  }
+
+  // INVARIANT: with nothing claimable (the hook filters system notices and the
+  // waiter's own writes, as the mid-turn hand-off does) the wait runs on.
+  test('no claimable comment leaves the wait to settle normally', async () => {
+    const storage = makeStorage([{ id: 'aaaa1111', code: 'a', status: 'working', finishesAtPoll: 4 }]);
+    const result = await raceWait(storage, ['a'], { ...FAST, claimComments: async () => null });
+    expect(result.interrupted).toBeUndefined();
+    expect(result.status).toBe('blocked');
+  });
+
+  // INVARIANT: a claim counts against the turn budget, so it is made only when
+  // it will be returned: a pending subtask interruption goes first and the
+  // comment is never claimed (and so never lost) on that sweep.
+  test('a subtask interruption takes precedence and the comment is not claimed', async () => {
+    const storage = makeStorage([{ id: 'aaaa1111', code: 'a', status: 'working', finishesAtPoll: 50 }]);
+    let reads = 0;
+    storage.getChildTasks = async () => (reads++ > 0 ? [{ id: 'new1', status: 'backlog' }] : []) as unknown as Task[];
+    let claims = 0;
+    const result = await raceWait(storage, ['a'], {
+      ...FAST, interruptOnNewChildOf: 'parent', claimComments: async () => { claims++; return claimOf('n'); },
+    });
+    expect(result.interrupted?.reason).toBe('subtask_added');
+    expect(claims).toBe(0);
   });
 });

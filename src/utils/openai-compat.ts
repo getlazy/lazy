@@ -35,6 +35,22 @@ export function isOpenRouterEndpoint(endpoint: string): boolean {
 }
 
 /**
+ * True when the endpoint is Fireworks (api.fireworks.ai), which bills the
+ * user's Fireworks key. Its FireRouter models are served on both the
+ * OpenAI-compatible (`/inference/v1`) and Anthropic Messages (`/inference`)
+ * wires from this one hostname, and both take the key as a Bearer token.
+ */
+export function isFireworksEndpoint(endpoint: string): boolean {
+  if (!endpoint.trim()) return false;
+  try {
+    const host = new URL(endpoint).hostname.toLowerCase();
+    return host === 'fireworks.ai' || host.endsWith('.fireworks.ai');
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Upstream that serves Codex on a ChatGPT Plus/Pro SUBSCRIPTION, as opposed to
  * a metered platform API key.
  *

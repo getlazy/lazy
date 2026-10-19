@@ -58,6 +58,7 @@ export const DOCTOR_CHECK_FAMILIES: readonly FamilyRule[] = [
   { prefix: 'Repository has commits', family: 'repository-has-commits', remedyKind: 'manual', impact: 'work' },
   { prefix: 'Model credential present', family: 'model-credential', remedyKind: 'credential', impact: 'work' },
   { prefix: 'Stored credentials are readable', family: 'stored-credentials', remedyKind: 'credential', impact: 'work' },
+  { prefix: 'Proxy audit log', family: 'proxy-audit-reach', remedyKind: 'config', impact: 'setup' },
   { prefix: 'Model API accepts lazy credential', family: 'credential-accepted', remedyKind: 'credential', impact: 'work' },
   { prefix: 'Usage pause', family: 'usage-pause', remedyKind: 'manual', impact: 'work' },
   { prefix: 'Credentials (skipped', family: 'model-credential', remedyKind: 'config', impact: 'work' },
@@ -74,12 +75,22 @@ export const DOCTOR_CHECK_FAMILIES: readonly FamilyRule[] = [
   { prefix: 'Runner available', family: 'runner-available', remedyKind: 'restart-daemon', impact: 'work' },
   { prefix: 'Agent binary', family: 'agent-binary', remedyKind: 'host', impact: 'work' },
   { prefix: 'Worktree image adopt', family: 'worktree-image-adoption', remedyKind: 'manual', impact: 'setup' },
+  { prefix: 'Image adopted from a branch', family: 'worktree-image-adoption', remedyKind: 'manual', impact: 'setup' },
+  // An uncommitted root Dockerfile.lazy (commit it) or one this backend never builds: tasks still run, on the base image.
+  { prefix: 'Project Dockerfile.lazy', family: 'project-dockerfile', remedyKind: 'manual', impact: 'setup' },
   { prefix: 'Extra container run args', family: 'container-run-args', remedyKind: 'config', impact: 'setup' },
   // Never an error for an image not built yet (the first task start builds it): that is a warning, god mode only.
   { prefix: 'Container image exists', family: 'container-image', remedyKind: 'host', impact: 'work' },
   { prefix: 'Container image up to date', family: 'container-image-current', remedyKind: 'host', impact: 'setup' },
   { prefix: 'Running builders match current config', family: 'builders-current', remedyKind: 'manual', impact: 'setup' },
   { prefix: 'No stale runner images', family: 'stale-images', remedyKind: 'flag', impact: 'setup' },
+  // A runner image whose layers could not be read back; the daemon repairs it and records what it found.
+  // Unrepaired, launches fail until the machine's Docker storage is reset (a machine act, not a flag).
+  { prefix: 'No damaged runner images recorded', family: 'damaged-runner-image', remedyKind: 'host', impact: 'work' },
+  { prefix: 'Damaged runner images were repaired', family: 'damaged-runner-image', remedyKind: 'host', impact: 'work' },
+  // The automatic memory canary and image data audit on a Teams project machine: diagnostic evidence for
+  // the maintainers (lazy already self-repairs a damaged image), so operator-only, never a member notice.
+  { prefix: 'Machine memory and image data checks', family: 'machine-integrity', remedyKind: 'manual', impact: 'setup' },
   { prefix: 'No orphaned containers', family: 'orphaned-containers', remedyKind: 'flag', impact: 'setup' },
   { prefix: 'No worktrees left for finished tasks', family: 'finished-task-worktrees', remedyKind: 'flag', impact: 'setup' },
   { prefix: "Task worktrees' git pointers", family: 'worktree-git-pointers', remedyKind: 'flag', impact: 'work' },
@@ -87,6 +98,7 @@ export const DOCTOR_CHECK_FAMILIES: readonly FamilyRule[] = [
   { prefix: 'Task worktrees hold no nested git repositories', family: 'worktree-nested-git', remedyKind: 'flag', impact: 'work' },
   { prefix: 'No missing task runs', family: 'missing-task-runs', remedyKind: 'manual', impact: 'work' },
   { prefix: 'No stale locks', family: 'stale-locks', remedyKind: 'manual', impact: 'setup' },
+  { prefix: 'Store backup', family: 'store-backup', remedyKind: 'manual', impact: 'setup' },
   { prefix: 'No split storage', family: 'split-storage', remedyKind: 'manual', impact: 'setup' },
   { prefix: 'No tasks stranded in merging', family: 'stranded-merging', remedyKind: 'manual', impact: 'work' },
   { prefix: 'All conversations captured', family: 'conversation-capture', remedyKind: 'flag', impact: 'setup' },
@@ -110,10 +122,12 @@ export const DOCTOR_CHECK_FAMILIES: readonly FamilyRule[] = [
   { prefix: "lazy.toml '", family: 'managed-config', remedyKind: 'config', impact: 'setup' },
   { prefix: 'No lazy.toml setting is being overridden', family: 'managed-config', remedyKind: 'config', impact: 'setup' },
   { prefix: 'Managed mode', family: 'managed-config', remedyKind: 'config', impact: 'setup' },
+  { prefix: 'Repository plugins', family: 'repository-plugins', remedyKind: 'manual', impact: 'setup' },
   { prefix: 'Config ', family: 'config-keys', remedyKind: 'config', impact: 'setup' },
   { prefix: 'No unknown config options', family: 'config-keys', remedyKind: 'config', impact: 'setup' },
   { prefix: 'No deprecated config options', family: 'config-keys', remedyKind: 'config', impact: 'setup' },
   { prefix: 'Feature flags', family: 'feature-flags', remedyKind: 'config', impact: 'setup' },
+  { prefix: 'Agent profiles not honoured', family: 'agent-profiles-not-honoured', remedyKind: 'config', impact: 'setup' },
   { prefix: 'Shell detected', family: 'shell', remedyKind: 'host', impact: 'setup' },
   { prefix: 'Completions installed', family: 'completions', remedyKind: 'host', impact: 'setup' },
   { prefix: 'tmux', family: 'tmux', remedyKind: 'host', impact: 'setup' },

@@ -26,7 +26,7 @@ export const BUILD_TIMEOUT_USAGE =
  *
  * Exits with an actionable message on a non-numeric or negative value rather
  * than silently falling back to unbounded — a mistyped bound that silently does
- * nothing is exactly the kind of surprise CLAUDE.md forbids.
+ * nothing is exactly the kind of surprise AGENTS.md forbids.
  */
 export function resolveBuildTimeoutMs(
   value: string | boolean | string[] | undefined,

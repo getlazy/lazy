@@ -41,7 +41,12 @@ export function shortMessageId(id: string): string {
  */
 export function renderSystemMessageLine(message: SystemMessage): string {
   const date = new Date(message.created_at).toISOString().slice(0, 10);
-  return `- \`${shortMessageId(message.id)}\` [${message.kind}] ${message.title} — from ${message.source}, ${date}`;
+  // A collapsed repeat says so — "Docker restarted" once and 37 times are not
+  // the same news for whoever relays it.
+  const repeats = message.repeat_count && message.repeat_count > 1
+    ? ` (×${message.repeat_count}${message.last_seen_at ? `, last ${new Date(message.last_seen_at).toISOString().slice(0, 10)}` : ''})`
+    : '';
+  return `- \`${shortMessageId(message.id)}\` [${message.kind}] ${message.title}${repeats} — from ${message.source}, ${date}`;
 }
 
 /** A message is unread when the human has neither read nor dismissed it. */
@@ -90,7 +95,7 @@ export const SYSTEM_MESSAGE_KIND_MEANING: Record<SystemMessageKind, string> = {
  * system actually has something to say.
  *
  * INVARIANT: a broken store must not block the builder's launch. Any storage
- * failure is logged loudly (never swallowed — see CLAUDE.md) and the launch
+ * failure is logged loudly (never swallowed — see AGENTS.md) and the launch
  * proceeds without the section; the builder can still list messages on demand
  * with `lazy_messages`.
  */

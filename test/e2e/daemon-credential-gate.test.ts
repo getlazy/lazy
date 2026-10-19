@@ -1,6 +1,5 @@
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
-import { existsSync } from 'fs';
+import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { readSessionJson, readTaskJson, readTurns, writeTaskJson } from '../helpers/storage';
 import { resultEvent, sessionStartEvent } from '../helpers/fake-claude';
 import { DaemonClient, RpcApplicationError } from '../../src/daemon/client';
@@ -171,40 +170,63 @@ describe('a turn is where the credential is required', () => {
     expect(await statusOf(code)).toBe('blocked');
   }
 
-  /** An `$EDITOR` that leaves a marker file behind if it is ever run. */
-  async function markerEditor(): Promise<{ path: string; marker: string }> {
-    const marker = join(ctx.root, 'editor-ran.marker');
-    const path = join(ctx.root, 'marker-editor.sh');
-    await writeFile(path, `#!/bin/sh\ntouch "${marker}"\necho "feedback" >> "$1"\n`);
-    await chmod(path, 0o755);
-    return { path, marker };
-  }
-
-  // INVARIANT (CLAUDE.md: never lose human feedback — pre-flight before the
-  // editor): with no credential for the task's profile, `lazy unblock` refuses
-  // BEFORE $EDITOR opens, naming the profile. The daemon may now run with no
-  // credential at all, so this pre-flight is what keeps a human from typing
-  // feedback into a turn that cannot start.
-  test('unblock with no credential refuses before $EDITOR opens', async () => {
+  // INVARIANT (AGENTS.md: never lose human feedback): with no credential for the
+  // task's profile, `lazy unblock` refuses naming the profile, but the member's
+  // feedback is RECORDED FIRST as a withheld turn (`recordFeedbackThenRefuse`) so
+  // their words are never lost, and nothing is launched. With no feedback at all
+  // the refusal stays the plain "no feedback" one and nothing is recorded.
+  test('unblock with no credential refuses, keeps the feedback once as a withheld turn, launches nothing', async () => {
     await blockedTask('needs-feedback');
     await ctx.restartDaemon({ ANTHROPIC_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '' });
-    const editor = await markerEditor();
+    const shortId: string = JSON.parse((await ctx.lazy(['show', 'needs-feedback', '--json'])).stdout).id.slice(0, 8);
+    const before = readTurns(ctx.root, shortId).length;
+    await ctx.clearClaudeInvocations();
 
-    const refused = await ctx.lazy(['unblock', 'needs-feedback'], {
-      env: { LAZY_FORCE_TTY: '1', EDITOR: editor.path, VISUAL: editor.path },
-    });
+    const none = await ctx.lazy(['unblock', 'needs-feedback']);
+    expect(none.exitCode).not.toBe(0);
+    expect(none.stdout + none.stderr).toContain('No feedback provided');
+    expect(readTurns(ctx.root, shortId)).toHaveLength(before);
 
-    expect(refused.exitCode).not.toBe(0);
-    expect(refused.stderr).toContain('No credential for agent profile "claude-code"');
-    expect(existsSync(editor.marker)).toBe(false);
+    for (let i = 0; i < 2; i++) {
+      const refused = await ctx.lazy(['unblock', 'needs-feedback', '--message', 'please retry the parser']);
+      expect(refused.exitCode).not.toBe(0);
+      expect(refused.stdout + refused.stderr).toContain('No credential for agent profile "claude-code": it needs an Anthropic credential');
+      expect(refused.stdout + refused.stderr).toContain('Your feedback was saved');
+    }
+
+    // Recorded exactly once: the retry with the same words is not duplicated.
+    const turns = readTurns(ctx.root, shortId);
+    expect(turns).toHaveLength(before + 1);
+    const kept = turns[turns.length - 1] as unknown as { role: string; content: string; feedback_withheld?: boolean };
+    expect(kept.role).toBe('human');
+    expect(kept.content).toContain('please retry the parser');
+    expect(kept.feedback_withheld).toBe(true);
+    expect((await ctx.claudeInvocations()).length).toBe(0);
     expect(await statusOf('needs-feedback')).toBe('blocked');
-  }, 120_000);
 
-  // INVARIANT: a launch refused for a missing credential WRITES NOTHING. The
-  // daemon's unblock used to record the feedback turn and then refuse at the
-  // credential plan, leaving a half-dispatched turn the redelivery path would
-  // later hand the agent. Driven over the RPC directly, past the CLI pre-flight.
-  test('an unblock refused for a missing credential records no turn', async () => {
+    // INVARIANT: saved-but-undelivered feedback gates accept like a queued
+    // comment — merging would end the task with those words never read.
+    const acceptRefused = await ctx.lazy(['accept', 'needs-feedback', '--yes']);
+    expect(acceptRefused.exitCode).not.toBe(0);
+    expect(acceptRefused.stdout + acceptRefused.stderr).toContain('not been delivered');
+
+    // Delivered once a credential exists: the next unblock carries the kept
+    // words, and nothing is left marked withheld.
+    expect((await ctx.lazy(['auth', 'set', 'anthropic'], { input: 'sk-ant-connected-later\n' })).exitCode).toBe(0);
+    const resumed = await ctx.lazy(['unblock', 'needs-feedback', '--message', 'second words']);
+    expect(resumed.exitCode).toBe(0);
+    expect((await ctx.lazy(['wait', 'needs-feedback'])).exitCode).toBe(0);
+    const after = readTurns(ctx.root, shortId) as unknown as Array<{ role: string; content: string; feedback_withheld?: boolean }>;
+    expect(after.some((t) => t.feedback_withheld)).toBe(false);
+    const delivering = after.filter((t) => t.role === 'human' && t.content.includes('second words'));
+    expect(delivering).toHaveLength(1);
+    expect(delivering[0].content).toContain('please retry the parser');
+  }, 180_000);
+
+  // INVARIANT: over the RPC, past the CLI, a refused unblock records the
+  // feedback as ONE withheld turn (never a half-dispatched pending one the
+  // redelivery path would hand the agent) and the task stays blocked.
+  test('an unblock refused for a missing credential records only a withheld turn', async () => {
     await blockedTask('no-half-turn');
     await ctx.restartDaemon({ ANTHROPIC_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '' });
     const taskId: string = JSON.parse((await ctx.lazy(['show', 'no-half-turn', '--json'])).stdout).id;
@@ -216,9 +238,34 @@ describe('a turn is where the credential is required', () => {
 
     expect(err).toBeInstanceOf(RpcApplicationError);
     expect((err as RpcApplicationError).status).toBe(400);
-    expect((err as Error).message).toContain('No credential for agent profile "claude-code"');
-    expect(readTurns(ctx.root, taskId.slice(0, 8))).toHaveLength(before);
+    expect((err as Error).message).toContain('No credential for agent profile "claude-code": it needs an Anthropic credential');
+    const turns = readTurns(ctx.root, taskId.slice(0, 8));
+    expect(turns).toHaveLength(before + 1);
+    expect((turns[turns.length - 1] as unknown as { feedback_withheld?: boolean }).feedback_withheld).toBe(true);
     expect(await statusOf('no-half-turn')).toBe('blocked');
+  }, 120_000);
+
+  // INVARIANT: once a refused unblock has saved the words as a withheld turn, the
+  // caller's draft of them is spent (else a resend of the kept draft after
+  // someone else delivered them would deliver them twice) — unless the text came
+  // from an ask box (keepFeedbackDraft), where the draft is someone's other words.
+  test('a refused unblock clears the feedback draft it saved, unless keepFeedbackDraft', async () => {
+    await blockedTask('draft-spent');
+    await ctx.restartDaemon({ ANTHROPIC_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '' });
+    const taskId: string = JSON.parse((await ctx.lazy(['show', 'draft-spent', '--json'])).stdout).id;
+    const client = DaemonClient.fromTarget(getDaemonTcpTarget(ctx.root)!, readToken(ctx.root)!);
+    const draftFeedback = async () =>
+      ((await client.rpc('reviewGetDraft', ctx.root, { taskId })) as { draft: { feedback?: string } }).draft.feedback ?? '';
+
+    await client.rpc('reviewSaveDraft', ctx.root, { taskId, patch: { feedback: 'kept words' } });
+    await client.rpc('unblockTask', ctx.root, { taskId, message: 'kept words', keepFeedbackDraft: true })
+      .then(() => null, (e: unknown) => e);
+    expect(await draftFeedback()).toBe('kept words');
+
+    const err = await client.rpc('unblockTask', ctx.root, { taskId, message: 'kept words' })
+      .then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(RpcApplicationError);
+    expect(await draftFeedback()).toBe('');
   }, 120_000);
 
   // INVARIANT: a CLEAN merge needs no credential, but a sync that CONFLICTS

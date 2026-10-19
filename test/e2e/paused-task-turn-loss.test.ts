@@ -20,7 +20,7 @@
  *    `working`. A task parked early therefore never has its supervisor's
  *    finished response consumed, and nothing ever writes the turn.
  *
- * Both tests run on the fake-binary seam deliberately (CLAUDE.md, "Two agent
+ * Both tests run on the fake-binary seam deliberately (AGENTS.md, "Two agent
  * seams"): the loss lives in the host↔supervisor protocol FILES and in the
  * reconciler's own sweeps, and the module mock replaces `launchSupervisorAsync`
  * outright — under it neither the empty init commit's timing nor an unconsumed

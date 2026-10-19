@@ -11,6 +11,7 @@
 
 export {
   loadProxyRequestPlugins,
+  listRepositoryPluginFiles,
   proxyPluginDir,
   ProxyPluginLoadError,
   PLUGIN_DIR_RELATIVE,

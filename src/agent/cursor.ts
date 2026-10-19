@@ -8,7 +8,7 @@
  * - Binary is `cursor-agent` (the installer also drops a legacy `agent` symlink)
  * - No system-prompt flag exists (verified against 2026.08.11 --help) — the
  *   system prompt is prepended to the user prompt
- * - Prompt is a positional argument (at end of command), not a flag value
+ * - Prompt (system prompt folded in) rides stdin, never argv (src/agent/argv-safety.ts)
  * - Plan/ask/review turns do NOT use `--mode plan`: that mode rejects MCP tool
  *   calls (every Cursor review turn said "MCP calls were rejected" / "Shell is
  *   blocked in this review mode"). Instead they pass `--exclude-tools` for the
@@ -29,8 +29,7 @@
 import type { AgentResponse } from '../types';
 import { CURSOR_ENDPOINT_ENV } from '../proxy/cursor-route';
 import type { AgentActivityEvent, AgentActivityStream } from './activity-stream';
-import type { Agent } from './interface';
-import { safeArgvPrompt } from './argv-safety';
+import type { Agent, AgentExecArgs } from './interface';
 import { classifyNoModelRefusal, requireLaunchModel } from './launch-model';
 import { CURSOR_DEFAULT_MODEL } from '../config/default-models';
 import { CURSOR_INSTALL_HINT, CursorPackaging } from './cursor-packaging';
@@ -410,7 +409,7 @@ export class CursorAgent implements Agent {
     effort?: string;
     permissionMode?: 'plan' | 'default';
     extraArgs?: string[];
-  }): string[] {
+  }): AgentExecArgs {
     // No system-prompt flag exists (verified against cursor-agent 2026.08.11
     // --help) — prepend the system prompt to the user prompt instead.
     let prompt = opts.prompt;
@@ -525,11 +524,12 @@ export class CursorAgent implements Agent {
       args.push(...opts.extraArgs);
     }
 
-    // Prompt must be the last positional argument. A raw NUL anywhere in argv
-    // is fatal to the spawn, so escape rather than let the turn crash-loop.
-    args.push(safeArgvPrompt(prompt, 'prompt'));
-
-    return args;
+    // The prompt (system prompt folded in) goes on STDIN, never argv: in print
+    // mode with no positional prompt, cursor-agent reads the whole of stdin as
+    // the prompt (read off the 2026.10.01 bundle, src/commands/build-prompt.ts).
+    // A prompt in argv died with E2BIG past 128 KiB. See the argv rule in
+    // ./argv-safety.
+    return Object.assign(args, { stdinInput: prompt });
   }
 
   /**

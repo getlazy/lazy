@@ -26,7 +26,7 @@
  * It is a lazy-side module and not Ruby because the store's layout, its schema
  * version and its lock format are lazy's; the fleet supervisor reaches it
  * through `lazy system store-check`, which is the documented carve-out that
- * lets a supervisor shell out to the CLI (lazy-teams/CLAUDE.md).
+ * lets a supervisor shell out to the CLI (lazy-teams/AGENTS.md).
  */
 
 import { readdir, readFile, stat } from 'fs/promises';

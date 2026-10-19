@@ -31,6 +31,7 @@ import { createAllHandlers, type McpToolContext } from '../../src/mcp/tools';
 import { createStorage, type Storage } from '../../src/storage';
 import { currentPromptOf } from '../../src/task-prompt';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
+import { closeAllStorage } from '../../src/daemon/rpc-handlers';
 
 const V1 = 'ORIGINAL PROMPT\n\n## Note on your own worktree\nYou are a child of release-v022.';
 const V2 = 'EDITED PROMPT\n\nYou are targeting `main`, deliberately.\n\n## One hazard to watch\n...';
@@ -57,6 +58,10 @@ describe('current prompt resolution', () => {
 
   afterEach(async () => {
     if (storage) await storage.close();
+    // lazy_show's upstream-status lookup falls back in-process to the daemon's
+    // shared store, opening it for whatever project an earlier file pointed the
+    // daemon module at; close it so no later file inherits it.
+    await closeAllStorage();
     if (testDir) rmSync(testDir, { recursive: true, force: true });
   });
 

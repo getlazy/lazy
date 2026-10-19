@@ -18,7 +18,7 @@
  * two mutating routes answer 503 rather than half-working.
  */
 
-import type { SystemMessage } from '../types';
+import type { SystemMessage, SystemMessageDismissFilter } from '../types';
 
 export interface MessageActions {
   /**
@@ -34,6 +34,12 @@ export interface MessageActions {
    * context, and the record stays forever. Idempotent.
    */
   dismiss(id: string): Promise<SystemMessage>;
+  /**
+   * File away every open message matching `filter` (empty: all of them). The
+   * store applies the filter — this port only carries it. Returns what it
+   * dismissed.
+   */
+  dismissMatching(filter: SystemMessageDismissFilter): Promise<SystemMessage[]>;
 }
 
 /**

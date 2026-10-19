@@ -111,4 +111,26 @@ describe('[serve] start_services_cmd', () => {
     expect(config.serve.services).toEqual([]);
     expect(config.serve.start_services_cmd).toBe('npm run dev');
   });
+
+  // INVARIANT: main_service is one of the declared ports; unset means the first.
+  // A link to a port nothing publishes is a link to nowhere.
+  test('main_service picks a declared port', async () => {
+    const config = await load('[serve]\nports = [3000, 5173]\nmain_service = 5173\n');
+    expect(config.serve.main_service).toBe(5173);
+  });
+
+  test('a missing main_service stays unset', async () => {
+    const config = await load('[serve]\nports = [3000, 5173]\n');
+    expect(config.serve.main_service).toBeUndefined();
+  });
+
+  test('main_service naming an undeclared port is a clear config error', async () => {
+    await expect(load('[serve]\nports = [3000, 5173]\nmain_service = 9999\n')).rejects.toThrow(
+      /main_service: port 9999 is not one of the declared ports \(3000, 5173\)/,
+    );
+  });
+
+  test('main_service with no declared ports is a config error', async () => {
+    await expect(load('[serve]\nmain_service = 3000\n')).rejects.toThrow(/no ports are declared/);
+  });
 });

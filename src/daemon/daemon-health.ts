@@ -281,7 +281,14 @@ export function describeHeldSync(
   if (!backoff) {
     return { code, pending: task.pending_sync, state: 'due on the next retry tick', attempt: null };
   }
-  const why = backoff.reason === 'usage-pause' ? 'held by the usage pause' : 'fetch failed';
+  if (backoff.reason === 'waiting-for-parent') {
+    return { code, pending: task.pending_sync, state: "waiting for its parent to start (nothing to merge yet)", attempt: null };
+  }
+  const why = backoff.reason === 'usage-pause' ? 'held by the usage pause'
+    : backoff.reason === 'branch-missing' ? 'upstream branch does not exist on the remote'
+    : backoff.reason === 'no-credential' ? 'held: no model credential for its agent'
+    : backoff.reason === 'runner-image' ? "held until the project's runner image is ready"
+    : 'fetch failed';
   const next = backoff.nextRetryAt <= now ? 'retrying now' : `next try in ${formatElapsed(backoff.nextRetryAt - now)}`;
   return { code, pending: task.pending_sync, state: `${why}, attempt ${backoff.attempt + 1}, ${next}`, attempt: backoff.attempt };
 }

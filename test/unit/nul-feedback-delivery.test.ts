@@ -31,7 +31,7 @@ const REAL_WORLD_FEEDBACK =
   `The parser must reject NUL (${NUL}) bytes, and also strip ${NUL} from filenames.`;
 
 describe('NUL-bearing feedback: intake sanitization', () => {
-  // INVARIANT (CLAUDE.md "never lose human feedback"): sanitization must
+  // INVARIANT (AGENTS.md "never lose human feedback"): sanitization must
   // PRESERVE the feedback. We escape rather than strip or reject, so the
   // human's words all survive the trip.
   test('sanitized feedback keeps every word the human wrote', () => {
@@ -55,17 +55,17 @@ describe('NUL-bearing feedback: argv construction', () => {
   // INVARIANT: buildExecArgs must never emit an argv element containing NUL,
   // even when handed an unsanitized prompt. This is the defense-in-depth layer
   // behind intake sanitization — a future intake gap must degrade to a
-  // delivered (escaped) turn, never to a crash loop that eats the feedback.
-  test('ClaudeCodeAgent.buildExecArgs escapes a NUL prompt instead of emitting it', () => {
+  // delivered turn, never to a crash loop that eats the feedback. The prompt
+  // now rides STDIN (the argv rule, src/agent/argv-safety.ts), where a NUL is
+  // just a byte: it is delivered whole, and argv carries no prompt text at all.
+  test('ClaudeCodeAgent.buildExecArgs keeps a NUL prompt out of argv', () => {
     const args = new ClaudeCodeAgent().buildExecArgs({
       modelId: 'test-model',
       prompt: REAL_WORLD_FEEDBACK,
       dangerouslySkipPermissions: true,
     });
     expect(findArgvIllegalIndices(args)).toEqual([]);
-    // argv[2] is the prompt — the position named in the original crash.
-    expect(args[2]).toContain('\\u0000');
-    expect(args[2]).toContain('The parser must reject NUL');
+    expect(args.stdinInput).toContain('The parser must reject NUL');
   });
 
   test('ClaudeCodeAgent.buildExecArgs also escapes the system prompt', () => {
@@ -79,17 +79,17 @@ describe('NUL-bearing feedback: argv construction', () => {
     expect(args.join(' ')).toContain('system\\u0000instructions');
   });
 
-  test('CursorAgent.buildExecArgs escapes its trailing positional prompt', () => {
+  test('CursorAgent.buildExecArgs keeps its prompt out of argv', () => {
     const args = new CursorAgent().buildExecArgs({
       modelId: 'test-model',
       prompt: REAL_WORLD_FEEDBACK,
       dangerouslySkipPermissions: true,
     });
     expect(findArgvIllegalIndices(args)).toEqual([]);
-    expect(args[args.length - 1]).toContain('The parser must reject NUL');
+    expect(args.stdinInput).toContain('The parser must reject NUL');
   });
 
-  test('QaAgent.buildExecArgs escapes its prompt', () => {
+  test('QaAgent.buildExecArgs keeps its prompt out of argv', () => {
     const args = new QaAgent().buildExecArgs({
       modelId: 'test-model',
       prompt: REAL_WORLD_FEEDBACK,
@@ -98,15 +98,15 @@ describe('NUL-bearing feedback: argv construction', () => {
     expect(findArgvIllegalIndices(args)).toEqual([]);
   });
 
-  test('buildMergeAgentArgs escapes its prompt', () => {
+  test('buildMergeAgentArgs keeps its prompt out of argv', () => {
     const args = buildMergeAgentArgs(new ClaudeCodeAgent(), `resolve${NUL}conflicts`, 'test-model');
     expect(findArgvIllegalIndices(args)).toEqual([]);
-    expect(args[2]).toContain('resolve\\u0000conflicts');
+    expect(args.stdinInput).toBe(`resolve${NUL}conflicts`);
   });
 
   // The merge builder delegates to the agent, so the sanitization holds for
   // whichever agent resolves the conflicts — not just Claude Code.
-  test('buildMergeAgentArgs escapes its prompt for cursor too', () => {
+  test('buildMergeAgentArgs keeps its prompt out of argv for cursor too', () => {
     const args = buildMergeAgentArgs(new CursorAgent(), `resolve${NUL}conflicts`, 'test-model');
     expect(findArgvIllegalIndices(args)).toEqual([]);
   });
@@ -120,7 +120,7 @@ describe('NUL-bearing feedback: argv construction', () => {
       prompt,
       dangerouslySkipPermissions: true,
     });
-    expect(args[2]).toBe(prompt);
+    expect(args.stdinInput).toBe(prompt);
   });
 });
 
@@ -176,7 +176,7 @@ describe('NUL-bearing feedback: end-to-end at the delivery seam', () => {
     expect(() => spawn(spawnable, { stdout: 'pipe', stderr: 'pipe' })).not.toThrow();
 
     // And the human's actual words are still in the prompt that would be sent.
-    expect(args[2]).toContain('The parser must reject NUL');
-    expect(args[2]).toContain('also strip');
+    expect(args.stdinInput).toContain('The parser must reject NUL');
+    expect(args.stdinInput).toContain('also strip');
   });
 });

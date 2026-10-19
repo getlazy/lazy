@@ -143,9 +143,9 @@ describe('parseUnifiedDiff', () => {
   // hunks — the phantom "comments" file reported on the review page.
   test('a synthetic `diff --lazy` section does not swallow the previous file', () => {
     const withComments =
-      'diff --git a/CLAUDE.md b/CLAUDE.md\n' +
-      '--- a/CLAUDE.md\n' +
-      '+++ b/CLAUDE.md\n' +
+      'diff --git a/AGENTS.md b/AGENTS.md\n' +
+      '--- a/AGENTS.md\n' +
+      '+++ b/AGENTS.md\n' +
       '@@ -1,2 +1,2 @@\n' +
       ' intro\n' +
       '-old line\n' +
@@ -159,7 +159,7 @@ describe('parseUnifiedDiff', () => {
       '+please fix the heading\n';
 
     const files = parseUnifiedDiff(withComments);
-    expect(files.map(f => f.path)).toEqual(['CLAUDE.md']);
+    expect(files.map(f => f.path)).toEqual(['AGENTS.md']);
     expect(files[0].hunks).toHaveLength(1);
     expect(files[0].additions).toBe(1);
     expect(files[0].hunks[0].lines.map(l => l.content)).toEqual(['intro', 'old line', 'new line']);

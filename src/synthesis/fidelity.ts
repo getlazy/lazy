@@ -31,6 +31,45 @@ import { formatUnparsedReviewSuffix } from '../review/parse-report';
 export const FIDELITY_BEGIN = '<!-- lazy:fidelity:begin -->';
 export const FIDELITY_END = '<!-- lazy:fidelity:end -->';
 
+/**
+ * Delimiters for the lazy-owned links line at the TOP of a PR/MR description
+ * (task and running app in Lazy Teams). Same contract as the fidelity section:
+ * a refresh replaces only what is between them, so the links follow a changed
+ * host or main service and are never duplicated.
+ */
+export const LINKS_BEGIN = '<!-- lazy:links:begin -->';
+export const LINKS_END = '<!-- lazy:links:end -->';
+
+/** Wrap the links line in the lazy-owned delimiters. */
+export function wrapLinksSection(links: string): string {
+  return `${LINKS_BEGIN}\n${links.trim()}\n${LINKS_END}`;
+}
+
+/**
+ * Bring the links block of an existing body in line with `links`:
+ *  - `undefined` — unknown; the body is returned untouched;
+ *  - `null`      — this install has no links; a block lazy wrote is removed;
+ *  - a string     — replaces the block in place, or is placed at the very top
+ *                   when the body has none (a human deleting the markers is
+ *                   answered with one fresh block, never a second copy).
+ */
+export function applyLinksSection(existingBody: string, links: string | null | undefined): string {
+  if (links === undefined) return existingBody;
+  const start = existingBody.indexOf(LINKS_BEGIN);
+  const end = existingBody.indexOf(LINKS_END);
+  const present = start !== -1 && end !== -1 && end > start;
+
+  if (links === null) {
+    if (!present) return existingBody;
+    const after = existingBody.slice(end + LINKS_END.length).replace(/^\n{1,2}/, '');
+    return existingBody.slice(0, start) + after;
+  }
+
+  const wrapped = wrapLinksSection(links);
+  if (present) return existingBody.slice(0, start) + wrapped + existingBody.slice(end + LINKS_END.length);
+  return existingBody.trim().length > 0 ? `${wrapped}\n\n${existingBody}` : wrapped;
+}
+
 export interface FidelityResult {
   /**
    * Markdown summary suitable for the lazy-owned body section. Always present:
@@ -200,6 +239,8 @@ export function synthesisSuccessCount(): number {
   return synthesisSuccesses;
 }
 
+const LEGACY_PROMPT_SECTION = /(?<=^|\n)## Prompt\n[\s\S]*?\n\n(?=## Summary\n\s*$)/;
+
 /** Wrap a summary in the lazy-owned delimiters. */
 export function wrapFidelitySection(summary: string): string {
   return `${FIDELITY_BEGIN}\n${summary.trim()}\n${FIDELITY_END}`;
@@ -219,7 +260,9 @@ export function applyFidelitySection(existingBody: string, summary: string): str
   const endIdx = existingBody.indexOf(FIDELITY_END);
 
   if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
-    const before = existingBody.slice(0, startIdx);
+    // Descriptions written before the prompt was dropped carry a lazy-written
+    // `## Prompt` section right above `## Summary`; remove it on refresh.
+    const before = existingBody.slice(0, startIdx).replace(LEGACY_PROMPT_SECTION, '');
     const after = existingBody.slice(endIdx + FIDELITY_END.length);
     return `${before}${wrapped}${after}`;
   }
@@ -352,11 +395,10 @@ export async function regenerateFidelity(
  * regeneration lands in place. Used by drivers' body builders at creation time,
  * when no work has happened yet (the section starts as a placeholder).
  */
-export function composeInitialBody(opts: { goal: string; prompt?: string; footer: string }): string {
-  const sections: string[] = [`## Goal\n\n${opts.goal}`];
-  if (opts.prompt) {
-    sections.push(`## Prompt\n\n${opts.prompt}`);
-  }
+export function composeInitialBody(opts: { goal: string; footer: string; links?: string | null }): string {
+  const sections: string[] = [];
+  if (opts.links) sections.push(wrapLinksSection(opts.links));
+  sections.push(`## Goal\n\n${opts.goal}`);
   sections.push(
     `## Summary\n\n${wrapFidelitySection('_Pending — updated automatically as work lands._')}`,
   );

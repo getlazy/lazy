@@ -105,9 +105,11 @@ export function captureUsageLimitHeaders(headers: Headers): Record<string, strin
  */
 export function usageLimitCredentialKey(opts: {
   userId?: string | null;
+  endpoint?: string | null;
   credentialLabel?: string | null;
   upstream: string;
 }): string {
+  if (opts.userId && opts.endpoint) return memberEndpointUsageKey(opts.userId, opts.endpoint);
   if (opts.userId) return `user:${opts.userId}`;
   if (opts.credentialLabel) return `credential:${opts.credentialLabel}`;
   let origin = opts.upstream;
@@ -119,6 +121,16 @@ export function usageLimitCredentialKey(opts: {
     // credentials at append (redactAuditRecordContent).
   }
   return `upstream:${origin}`;
+}
+
+/** One account's reading at one endpoint; separators in either name cannot collide. */
+export function memberEndpointUsageKey(member: string, endpoint: string): string {
+  return `credential:member-endpoint:${JSON.stringify([member.trim().toLowerCase(), endpoint])}`;
+}
+
+/** Endpoint readings are persisted directly; old audit copies must never resurrect a cleared account. */
+export function isMemberEndpointUsageKey(key: string): boolean {
+  return key.startsWith('credential:member-endpoint:');
 }
 
 /** The latest usage-limit reading for one credential. */
@@ -256,6 +268,18 @@ export class UsageLimitTracker {
     } finally {
       this.listener = listener;
     }
+  }
+
+  /** The latest reading for one credential key, or null. */
+  reading(credential: string): UsageLimitReading | null {
+    return this.latest.get(credential) ?? null;
+  }
+
+  /** A replaced connection has no reading until its next response. */
+  clear(credential: string): void {
+    this.latest.delete(credential);
+    this.spent.delete(credential);
+    this.spentVia.delete(credential);
   }
 
   /** Readings, most recent first. */

@@ -13,9 +13,12 @@
  * 3. Error translation (RpcError → return types the CLI expects)
  */
 
+import { logger } from '../utils/logger';
 import type { TokenBudgetView } from '../usage-pause/budget-view';
 import type { ReviewSettingsOverrides } from '../review/mode';
 import { tryRpc, RpcApplicationError } from './client';
+import type { EditTaskResult } from './edit-task';
+import type { CreateTaskResult } from './create-task';
 import {
   handleList,
   handleBlocked,
@@ -24,6 +27,7 @@ import {
   handleSearch,
   handleDiff,
   handleWait,
+  handleAckWaitComments,
   handleStartTask,
   handleUnblockTask,
   handleAskTask,
@@ -33,6 +37,8 @@ import {
   handleAcceptTask,
   handleRejectTask,
   handleCloseTask,
+  handleEditTask,
+  handleCreateTask,
   handleReopenTask,
   handleSyncTask,
   handleReparentTask,
@@ -50,6 +56,14 @@ import {
   handleTokenStats,
   RpcError,
   withLaunchAllowance,
+  handleRunnerImage,
+  handleRetryRunnerImage,
+  handleUseCustomRunnerImage,
+  handleRebuildRunnerImage,
+  handleCancelImageBuild,
+  handleImageBuildLog,
+  handleMachineState,
+  handleResetMachineDockerStorage,
 } from './rpc-handlers';
 import { resolveLazyRoot, resolveStorage } from '../preconditions';
 import { admitInteractiveSession, describeUsagePauseState, type UsagePauseState } from './usage-pause';
@@ -65,6 +79,7 @@ import type { ProgressEmitter } from './progress';
 import type { RpcObservers } from './client';
 import type { EffectiveProjectSettings } from './project-settings';
 import type { UsageLimitReading } from '../proxy/usage-limits';
+import type { CredentialFailure } from '../proxy/credential-health';
 import type { IdentityAnswer } from '../identity';
 import type { CommitRepairResult, ConfirmedRepair } from './repair-commits';
 import type { BuilderSession } from '../storage/types';
@@ -450,6 +465,15 @@ export interface WaitResult {
    * comment after accept so agents can de-dupe wait vs note.
    */
   head_sha?: string;
+  /** Present ONLY when the wait was interrupted (e.g. a subtask was added) rather than settled. */
+  interrupted?: {
+    reason: 'subtask_added' | 'comment_added';
+    message: string;
+    new_tasks?: Array<{ task_id: string; display_id: string; code: string | null }>;
+    notes?: string;
+    comment_count?: number;
+    claim?: { through: number; claim_id: string };
+  };
 }
 
 /**
@@ -463,12 +487,15 @@ export async function queryWait(params: {
   taskId?: string;
   taskIds?: string[];
   timeout?: number;
+  /** The waiting task: a subtask added under it interrupts the wait. */
+  interruptOnNewChildOf?: string;
 }): Promise<WaitResult> {
   try {
     const rpc = await tryRpc<WaitResult>('wait', {
       taskId: params.taskId,
       taskIds: params.taskIds,
       timeout: params.timeout,
+      ...(params.interruptOnNewChildOf ? { interruptOnNewChildOf: params.interruptOnNewChildOf } : {}),
     });
     if (rpc) return rpc;
   } catch (err) {
@@ -491,6 +518,29 @@ export async function queryWait(params: {
   // path. RpcError extends Error, so callers that only read `.message` are
   // unaffected.
   return await handleWait(root, params) as WaitResult;
+}
+
+/**
+ * Acknowledge comments a wait handed to `taskId`'s agent (see handleAckWaitComments).
+ * A 409 (the batch was already acknowledged — a concurrent wait of the same
+ * session re-claimed and acked it first) is benign; a task with no running
+ * turn is warned about, since the comments then stay queued.
+ */
+export async function ackWaitComments(params: { taskId: string; through: number; claim_id: string }): Promise<void> {
+  try {
+    const answer = await tryRpc<{ kind: string; reason?: string }>('ackWaitComments', params) ?? await handleAckWaitComments(params);
+    if (answer.kind !== 'acknowledged') {
+      logger.warn(`wait: comments for ${params.taskId.substring(0, 8)} were not marked delivered (${'reason' in answer ? answer.reason : answer.kind}); they stay queued`);
+    }
+  } catch (err) {
+    const status = err instanceof RpcApplicationError || err instanceof RpcError ? err.status : undefined;
+    if (status === 409) {
+      logger.debug(`wait: comments for ${params.taskId.substring(0, 8)} were already acknowledged by a concurrent wait`);
+      return;
+    }
+    if (err instanceof RpcApplicationError) throw new RpcError(err.status, err.message);
+    throw err;
+  }
 }
 
 // --- Start Task ---
@@ -536,6 +586,8 @@ export async function queryStartTask(params: {
   usagePauseOverrideEligible?: boolean;
   /** Let THIS task's next turn through the usage pause (a person or the builder; src/daemon/usage-pause.ts). */
   usagePausePastOnce?: boolean;
+  /** Run on lazy's default runner image because the project's image is not ready — a person confirmed it (src/daemon/runner-image-choice.ts). */
+  useDefaultImage?: boolean;
   /** W3C trace context propagated from the CLI so daemon spans stitch onto the CLI trace. */
   traceparent?: string;
 }, progress?: ProgressSink): Promise<StartTaskRpcResult> {
@@ -555,6 +607,7 @@ export async function queryStartTask(params: {
     usagePauseOverrideEligible: params.usagePauseOverrideEligible,
     usagePausePastOnce: params.usagePausePastOnce || undefined,
     traceparent: params.traceparent,
+    useDefaultImage: optInFlag(params.useDefaultImage),
   }, observers);
   if (rpc) return rpc;
 
@@ -607,9 +660,10 @@ export async function queryUsagePause(params: {
   /** Also judge a model run beside a task (the builder role's credential). */
   beside?: boolean;
   /** `admitInteractive`: which session is opening. */
-  surface?: 'pair' | 'chat';
+  surface?: 'pair' | 'chat' | 'builder';
   /** `admitInteractive`: decide without taking the override (a pre-flight). */
   peek?: boolean;
+  overrideUsagePause?: boolean;
   /** The channel asking — only `human` may set the override; `human` or `builder` a task's allowance. */
   actor?: Actor;
   /** The pre-flight's own eligibility: `false` judges the task without the pending override. */
@@ -638,6 +692,7 @@ export async function queryUsagePause(params: {
       : await resolveStorage();
     await admitInteractiveSession(root, storage, {
       surface: params.surface ?? 'pair', taskId: params.taskId, actor: params.actor, peek: params.peek,
+      overrideUsagePause: params.overrideUsagePause,
     });
     return describeUsagePauseState(root, storage);
   }
@@ -799,6 +854,8 @@ export async function queryUnblockTask(params: {
   usagePauseOverrideEligible?: boolean;
   /** Let THIS task's next turn through the usage pause (a person or the builder; src/daemon/usage-pause.ts). */
   usagePausePastOnce?: boolean;
+  /** Run on lazy's default runner image because the project's image is not ready — a person confirmed it (src/daemon/runner-image-choice.ts). */
+  useDefaultImage?: boolean;
 }, progress?: ProgressSink): Promise<UnblockTaskRpcResult> {
   const observers = observersOf(progress);
   const rpc = await tryRpc<UnblockTaskRpcResult>('unblockTask', {
@@ -814,6 +871,7 @@ export async function queryUnblockTask(params: {
     actor: params.actor,
     usagePauseOverrideEligible: params.usagePauseOverrideEligible,
     usagePausePastOnce: params.usagePausePastOnce || undefined,
+    useDefaultImage: optInFlag(params.useDefaultImage),
   }, observers);
   if (rpc) return rpc;
 
@@ -868,6 +926,7 @@ export async function queryAskTask(params: {
   usagePauseOverrideEligible?: boolean;
   /** Let THIS task's next turn through the usage pause (a person or the builder; src/daemon/usage-pause.ts). */
   usagePausePastOnce?: boolean;
+  overrideUsagePause?: boolean;
 }, progress?: ProgressSink): Promise<AskTaskRpcResult> {
   const observers = observersOf(progress);
   const rpc = await tryRpc<AskTaskRpcResult>('askTask', {
@@ -877,6 +936,7 @@ export async function queryAskTask(params: {
     actor: params.actor,
     usagePauseOverrideEligible: params.usagePauseOverrideEligible,
     usagePausePastOnce: params.usagePausePastOnce || undefined,
+    overrideUsagePause: params.overrideUsagePause || undefined,
   }, observers);
   if (rpc) return rpc;
 
@@ -993,6 +1053,7 @@ export async function queryAskTaskAwaited(params: {
   usagePauseOverrideEligible?: boolean;
   /** Let THIS task's next turn through the usage pause (a person or the builder; src/daemon/usage-pause.ts). */
   usagePausePastOnce?: boolean;
+  overrideUsagePause?: boolean;
 }, progress?: ProgressSink): Promise<AwaitedAskResult> {
   const started = await queryAskTask(params, progress);
   if (started.outcome === 'answered') {
@@ -1256,6 +1317,50 @@ export async function queryCloseTask(params: {
   return await handleCloseTask(root, params, observers.onProgress) as CloseTaskRpcResult;
 }
 
+// --- Create Task ---
+
+/**
+ * The whole create in ONE daemon operation (`src/daemon/create-task.ts`):
+ * every field is written with the task's row, so it lands whole or not at
+ * all. A clone bound to Lazy Teams creates through this, never a storage
+ * create followed by separate writes, each of which Teams authorizes alone.
+ */
+export async function queryCreateTask(params: {
+  goal: string;
+  prompt?: string;
+  code?: string;
+  parent?: string;
+  type?: string;
+  model?: string;
+  effort?: string;
+  agent?: string;
+  review?: string;
+  reviewGate?: string;
+  reviewAutoFix?: string;
+  tags?: string[];
+  deriveCode?: boolean;
+  actor?: ActorInput;
+}): Promise<CreateTaskResult> {
+  const rpc = await tryRpc<CreateTaskResult>('createTask', params);
+  if (rpc) return rpc;
+  return await handleCreateTask(resolveLazyRoot(), params) as CreateTaskResult;
+}
+
+// --- Edit Task ---
+
+export async function queryEditTask(params: {
+  taskId: string;
+  code?: string | null;
+  /** An agent switch decided by the daemon (a clone bound to Teams). */
+  agent?: string;
+  model?: string;
+  effort?: string;
+}): Promise<EditTaskResult> {
+  const rpc = await tryRpc<EditTaskResult>('editTask', params);
+  if (rpc) return rpc;
+  return await handleEditTask(resolveLazyRoot(), params) as EditTaskResult;
+}
+
 // --- Stop Task ---
 
 export interface StopTaskRpcResult {
@@ -1410,6 +1515,8 @@ export async function queryResumeTask(params: {
   usagePauseOverrideEligible?: boolean;
   /** Let THIS task's next turn through the usage pause (a person or the builder; src/daemon/usage-pause.ts). */
   usagePausePastOnce?: boolean;
+  /** Run on lazy's default runner image because the project's image is not ready — a person confirmed it (src/daemon/runner-image-choice.ts). */
+  useDefaultImage?: boolean;
 }, progress?: ProgressSink): Promise<ResumeTaskRpcResult> {
   const observers = observersOf(progress);
   const rpc = await tryRpc<ResumeTaskRpcResult>('resumeTask', {
@@ -1419,6 +1526,7 @@ export async function queryResumeTask(params: {
     actor: params.actor,
     usagePauseOverrideEligible: params.usagePauseOverrideEligible,
     usagePausePastOnce: params.usagePausePastOnce || undefined,
+    useDefaultImage: optInFlag(params.useDefaultImage),
   }, observers);
   if (rpc) return rpc;
 
@@ -1432,7 +1540,7 @@ export interface SyncTaskRpcResult {
   taskId: string;
   displayId: string;
   /** `merged` / `conflict` are the self-sync route — see src/daemon/self-sync.ts. */
-  status: 'up_to_date' | 'sync_launched' | 'pending_sync' | 'merged' | 'conflict' | 'held_by_member';
+  status: 'up_to_date' | 'sync_launched' | 'pending_sync' | 'merged' | 'conflict' | 'held_by_member' | 'waiting_for_parent';
   message: string;
   warnings: string[];
   steps?: SelfSyncStep[];
@@ -1446,6 +1554,8 @@ export async function querySyncTask(params: {
   callerTaskId?: string;
   /** A person at their own terminal asked — see src/cli/human-terminal.ts. */
   usagePauseOverrideEligible?: boolean;
+  /** Confirmed: resolve a conflict on lazy's default runner image (the project's is not ready). */
+  useDefaultImage?: boolean;
 }, progress?: ProgressSink): Promise<SyncTaskRpcResult> {
   const observers = observersOf(progress);
   const rpc = await tryRpc<SyncTaskRpcResult>('syncTask', {
@@ -1453,6 +1563,7 @@ export async function querySyncTask(params: {
     actor: params.actor,
     callerTaskId: params.callerTaskId,
     usagePauseOverrideEligible: params.usagePauseOverrideEligible,
+    useDefaultImage: optInFlag(params.useDefaultImage),
   }, observers);
   if (rpc) return rpc;
 
@@ -1611,6 +1722,44 @@ export async function queryRedoTask(params: {
   return await handleRedoTask(root, params);
 }
 
+/**
+ * `lazy raised promote`: the review port's `reviewPromoteRaised`, the same
+ * daemon act the browser's promote button performs — not a storage call, so a
+ * clone bound to Lazy Teams is authorized exactly as the browser is.
+ */
+export async function queryReviewPromoteRaised(params: {
+  taskId: string;
+  itemId: string;
+  relation: 'peer' | 'subtask';
+  goal?: string;
+  prompt?: string;
+  code?: string;
+  parent?: string;
+  actor?: ActorInput;
+}): Promise<import('../types').PromoteRaisedItemResult> {
+  const rpc = await tryRpc<import('../types').PromoteRaisedItemResult>('reviewPromoteRaised', params);
+  if (rpc) return rpc;
+  const root = resolveLazyRoot();
+  const { handleReviewPromoteRaised } = await import('./rpc-review');
+  return await handleReviewPromoteRaised(root, params) as import('../types').PromoteRaisedItemResult;
+}
+
+/** `lazy scratch list`: the daemon's `scratchList`, the same read the Teams Files tab makes. */
+export async function queryScratchList(): Promise<{ groups: Array<{ files: import('../builder/scratch-view').ScratchFileEntry[] }> }> {
+  const rpc = await tryRpc<{ groups: Array<{ files: import('../builder/scratch-view').ScratchFileEntry[] }> }>('scratchList', {});
+  if (rpc) return rpc;
+  const { handleScratchList } = await import('./rpc-handlers');
+  return await handleScratchList();
+}
+
+/** `lazy scratch show`: the daemon's `scratchShow`; `content` is null for a name-only file. */
+export async function queryScratchShow(params: { path: string }): Promise<{ file: import('../builder/scratch-view').ScratchFileEntry & { content: string | null } }> {
+  const rpc = await tryRpc<{ file: import('../builder/scratch-view').ScratchFileEntry & { content: string | null } }>('scratchShow', params);
+  if (rpc) return rpc;
+  const { handleScratchShow } = await import('./rpc-handlers');
+  return await handleScratchShow(params);
+}
+
 export async function queryListReparentTargets(params: {
   exceptTaskId?: string;
 }): Promise<{ tasks: Array<{ id: string; code: string | null; goal: string }>; branches: string[] }> {
@@ -1640,6 +1789,13 @@ export interface EnsureTaskContainerRpcResult {
  * per-container token only the daemon can mint — a CLI-side `docker run` would
  * leave the agent inside with no `lazy_*` tools on its next turn.
  */
+export async function queryEnsureTaskWorktree(taskId: string): Promise<{ worktreePath: string }> {
+  const rpc = await tryRpc<{ worktreePath: string }>('ensureTaskWorktree', { taskId });
+  if (rpc) return rpc;
+  const { handleEnsureTaskWorktree } = await import('./rpc-handlers');
+  return handleEnsureTaskWorktree(resolveLazyRoot(), { taskId });
+}
+
 export async function queryEnsureTaskContainer(params: {
   taskId: string;
   restart?: boolean;
@@ -1749,11 +1905,128 @@ export async function queryTokenBudget(): Promise<TokenBudgetView> {
 
 // --- Proxy usage-limit readings (src/proxy/usage-limits.ts) ---
 
-export async function queryUsageLimits(): Promise<{ readings: UsageLimitReading[] }> {
-  const rpc = await tryRpc<{ readings: UsageLimitReading[] }>('usageLimits', {});
-  if (rpc) return rpc;
+export async function queryUsageLimits(): Promise<{ readings: UsageLimitReading[]; credentialHealth: CredentialFailure[] }> {
+  const rpc = await tryRpc<{ readings: UsageLimitReading[]; credentialHealth?: CredentialFailure[] }>('usageLimits', {});
+  // An older daemon sends no health list; that is "none known", not an error.
+  if (rpc) return { readings: rpc.readings, credentialHealth: rpc.credentialHealth ?? [] };
 
   // Daemon down: the same fold over the bounded audit log, in-process.
   const root = resolveLazyRoot();
   return await handleUsageLimits(root);
+}
+
+// --- Builder tier (src/daemon/builder-tier.ts) ---
+
+/**
+ * Which tier a TIERED builder is answering on, as one line; null for an
+ * ordinary builder profile. Daemon down: computed in-process (no switch
+ * history, which lives in the daemon's proxy).
+ */
+export async function queryBuilderTierLine(): Promise<string | null> {
+  const rpc = await tryRpc<{ line: string | null }>('builderTier', {});
+  if (rpc) return rpc.line;
+  const root = resolveLazyRoot();
+  const { builderTierView, builderTierLine } = await import('./builder-tier');
+  const { loadConfig } = await import('../config/loader');
+  return builderTierLine(await builderTierView(root, await loadConfig(root)));
+}
+
+// --- Runner image (src/daemon/runner-image.ts) ---
+
+export interface RunnerImageAnswer {
+  ready: boolean;
+  description: string;
+  project: { state: string; imageName?: string; defaultImage?: string };
+  /** The single image state (src/daemon/image-state.ts). */
+  imageState?: ImageStateAnswer['imageState'] & { build?: { id: string; outcome: string; progress: { step: number; total: number; label: string | null } } | null };
+  task?: {
+    needsConfirmation: boolean;
+    banner: { text: string; action: string | null } | null;
+  };
+}
+
+/**
+ * The daemon's runner-image state (and one task's banner, with `taskId`).
+ * Only the daemon tracks the boot build; in a process with none (tests,
+ * daemon-self) the state is `none` and nothing needs confirming.
+ */
+export async function queryRunnerImage(params: {
+  taskId?: string;
+} = {}): Promise<RunnerImageAnswer> {
+  const rpc = await tryRpc<RunnerImageAnswer>('runnerImage', {
+    taskId: params.taskId,
+  });
+  if (rpc) return rpc;
+  // Test/daemon-self mode: execute directly
+  return await handleRunnerImage(params, resolveLazyRoot()) as unknown as RunnerImageAnswer;
+}
+
+/** Re-run the daemon's build of the project's runner image (after a failure or a fix). */
+export async function queryRetryRunnerImage(): Promise<{ description: string }> {
+  const rpc = await tryRpc<{ description: string }>('retryRunnerImage', {});
+  if (rpc) return rpc;
+  return await handleRetryRunnerImage(resolveLazyRoot());
+}
+
+/** The project image's single state, as every image control answers it (src/daemon/image-state.ts). */
+export interface ImageStateAnswer {
+  imageState: { state: string; build?: { id: string; progress: { step: number; total: number; label: string | null } } | null } & Record<string, unknown>;
+}
+
+/** A Rebuild of the project's runner image; returns once it has started. */
+export async function queryRebuildRunnerImage(params: { noCache?: boolean } = {}): Promise<ImageStateAnswer & { description: string }> {
+  const rpc = await tryRpc<ImageStateAnswer & { description: string }>('rebuildRunnerImage', { noCache: params.noCache });
+  if (rpc) return rpc;
+  return await handleRebuildRunnerImage(resolveLazyRoot(), params) as ImageStateAnswer & { description: string };
+}
+
+/** Cancel the running image build (an adoption's, else the project image's). */
+export async function queryCancelImageBuild(params: { buildId?: string } = {}): Promise<ImageStateAnswer & { cancelled: string | null }> {
+  const rpc = await tryRpc<ImageStateAnswer & { cancelled: string | null }>('cancelImageBuild', { buildId: params.buildId });
+  if (rpc) return rpc;
+  return await handleCancelImageBuild(resolveLazyRoot(), params) as ImageStateAnswer & { cancelled: string | null };
+}
+
+export interface ImageBuildLogAnswer {
+  build: {
+    id: string; kind: string; title: string; outcome: string; startedAt: string; finishedAt: string | null; durationMs: number;
+    progress: { step: number; total: number; label: string | null };
+    steps: Array<{ id: string; kind: string; label: string; status: string; durationMs: number | null }>;
+    failure: { stepLabel: string | null; output: string; error: string } | null;
+  } | null;
+  lines: Array<{ seq: number; at: string; source: string; image: string | null; text: string }>;
+  next: number;
+  truncatedBefore: boolean;
+}
+
+/** One page of an image build's log, after cursor `after` (see handleImageBuildLog). */
+export async function queryImageBuildLog(params: { buildId?: string; after?: number; limit?: number; waitMs?: number } = {}): Promise<ImageBuildLogAnswer> {
+  const rpc = await tryRpc<ImageBuildLogAnswer>('imageBuildLog', params);
+  if (rpc) return rpc;
+  return await handleImageBuildLog(resolveLazyRoot(), params, { kind: 'control' }) as unknown as ImageBuildLogAnswer;
+}
+
+/** What the project's machine is doing: services, recent logs, resources. */
+export async function queryMachineState(params: { lines?: number } = {}): Promise<Record<string, unknown>> {
+  const rpc = await tryRpc<Record<string, unknown>>('machineState', params);
+  if (rpc) return rpc;
+  return await handleMachineState(resolveLazyRoot(), params, { kind: 'control' }) as unknown as Record<string, unknown>;
+}
+
+/** Switch a task that runs on lazy's default image back to the project's image from its next turn. */
+export async function queryUseCustomRunnerImage(params: {
+  taskId: string;
+}): Promise<{ switched: boolean; message: string }> {
+  const rpc = await tryRpc<{ switched: boolean; message: string }>('useCustomRunnerImage', {
+    taskId: params.taskId,
+  });
+  if (rpc) return rpc;
+  return await handleUseCustomRunnerImage(params);
+}
+
+/** Reset the machine's Docker storage (destructive; `confirm: true` is the caller's proof a person agreed). */
+export async function queryResetMachineDockerStorage(params: { confirm: boolean }): Promise<{ storageReset: Record<string, unknown> }> {
+  const rpc = await tryRpc<{ storageReset: Record<string, unknown> }>('resetMachineDockerStorage', params);
+  if (rpc) return rpc;
+  return await handleResetMachineDockerStorage(resolveLazyRoot(), params, { kind: 'control' }) as unknown as { storageReset: Record<string, unknown> };
 }

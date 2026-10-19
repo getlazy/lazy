@@ -19,6 +19,7 @@ import { viewedCardHtml } from './viewed-cards';
 import { SHOT_LINK_ATTR } from './screenshot-lightbox';
 import { PROSE_REPORT_FILE } from '../review/prose-anchor';
 import { renderMarkdown, type RenderMarkdownOptions } from './markdown';
+import { copyMarkdownButtonHtml } from './copy-markdown';
 import {
   appendResidualGroup,
   fileClaimsFromGroups,
@@ -374,7 +375,7 @@ function renderItemRun(
     // able to ask about it where they read it: declaring it as report prose
     // gives every paragraph the anchored "+" the report card has.
     return (
-      `<div class="rv-pres-prose turn-content" data-rv-prose="${escapeHtml(PROSE_REPORT_FILE)}">` +
+      `${copyMarkdownButtonHtml(first.body)}<div class="rv-pres-prose turn-content" data-rv-prose="${escapeHtml(PROSE_REPORT_FILE)}">` +
       `${renderMarkdown(first.body, options.markdown)}</div>`
     );
   }
@@ -411,7 +412,7 @@ function renderPresentationGroup(
     ? `<p class="rv-hint rv-pres-residual">Not listed in the agent's walkthrough — shown for completeness.</p>`
     : '';
   const summary = group.summary
-    ? `<div class="rv-pres-group-summary turn-content" data-rv-prose="${escapeHtml(PROSE_REPORT_FILE)}">${renderMarkdown(group.summary, options.markdown)}</div>`
+    ? `${copyMarkdownButtonHtml(group.summary)}<div class="rv-pres-group-summary turn-content" data-rv-prose="${escapeHtml(PROSE_REPORT_FILE)}">${renderMarkdown(group.summary, options.markdown)}</div>`
     : '';
 
   // A file claim whose path is not in the diff BEING SHOWN is not a broken

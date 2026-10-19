@@ -49,6 +49,15 @@ export interface LaunchIdentity {
   profile: string;
   /** The task's UUID, when the launch knows it — see `CredentialGrant.taskUuid`. */
   taskUuid?: string;
+  /** Team mode: the session binding a launch beside a task is paid through — see `CredentialGrant.bindingKey`. */
+  bindingKey?: string;
+  /**
+   * The project the launch belongs to, when the caller knows it — where its
+   * session binding and grants live. Without it the PROCESS's lazy root is
+   * used, which is wrong for a caller handed a root (a member terminal) and
+   * absent outside a project. Not part of the grant.
+   */
+  projectRoot?: string;
 }
 
 /**
@@ -81,6 +90,7 @@ export async function placeholderizeAuthEnv(
       envKey: v.key,
       profile: identity.profile,
       ...(identity.taskUuid ? { taskUuid: identity.taskUuid } : {}),
+      ...(identity.bindingKey ? { bindingKey: identity.bindingKey } : {}),
     });
     out.push({ key: v.key, value: token });
   }

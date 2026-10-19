@@ -14,8 +14,18 @@
  * placeholder upstream (an unauthenticated request that looks fine in the log).
  */
 
+import { ANTHROPIC_OAUTH_BETA } from './target-credentials';
+
 /** Headers whose value may carry a credential the client was given. */
 const CREDENTIAL_HEADERS = ['x-api-key', 'authorization', 'x-cursor-api-key', 'api-key'] as const;
+
+/** A credential-free route must receive no authentication, including client-supplied auth. */
+export function stripAuthHeaders(headers: Headers): void {
+  for (const name of CREDENTIAL_HEADERS) headers.delete(name);
+  headers.delete('chatgpt-account-id');
+  headers.delete('cookie');
+  headers.delete('proxy-authorization');
+}
 
 /** One credential value found on the request, and where it was found. */
 export interface PresentedCredential {
@@ -112,6 +122,13 @@ export function applyCredential(
   stripPresentedCredential(headers, presented, token);
   headers.set(placement.header, placement.value);
   if (placement.requiredBeta) mergeBetaFlag(headers, placement.requiredBeta);
+  // The OAuth beta flag is half of the OAuth FORM, and it leaves with the OAuth
+  // bearer. A harness launched on a subscription sends it on every request, so
+  // a request rerouted to a target paid by an API key (a tier switch, a
+  // fallback) would otherwise carry `x-api-key` beside a flag announcing a
+  // subscription token — which an Anthropic-compatible gateway reads as an
+  // OAuth request and refuses (field report 2026-10-06, tier 2 401).
+  else removeBetaFlag(headers, ANTHROPIC_OAUTH_BETA);
   // SET OR DELETE, never merge, and never "leave it alone": a companion header
   // identifies the ACCOUNT the credential belongs to, so the host's answer must
   // win over anything the container sent under the same name. A client that
@@ -152,18 +169,35 @@ export function mergeBetaFlag(headers: Headers, flag: string): void {
   headers.set('anthropic-beta', `${existing.trim()},${flag}`);
 }
 
+/** Drop one flag from `anthropic-beta`, keeping the client's others; the header goes when it empties. */
+export function removeBetaFlag(headers: Headers, flag: string): void {
+  const existing = headers.get('anthropic-beta');
+  if (!existing) return;
+  const kept = existing.split(',').map((f) => f.trim()).filter((f) => f && f !== flag);
+  if (kept.length) headers.set('anthropic-beta', kept.join(','));
+  else headers.delete('anthropic-beta');
+}
+
 /**
  * The 401 body the proxy answers with when a presented placeholder does not
  * verify, or when its target's credential cannot be resolved.
  *
  * Shaped like an Anthropic API error so a client surfaces it as an auth failure
  * rather than as a malformed response — the message inside is lazy's, and names
- * the remedy (CLAUDE.md: errors are actionable).
+ * the remedy (AGENTS.md: errors are actionable).
  */
 export function credentialErrorBody(message: string): string {
   return JSON.stringify({
     type: 'error',
     error: { type: 'authentication_error', message },
+  });
+}
+
+/** Body of a 503 for a credential lazy could not resolve right now (retryable). */
+export function credentialUnavailableBody(message: string): string {
+  return JSON.stringify({
+    type: 'error',
+    error: { type: 'api_error', message },
   });
 }
 

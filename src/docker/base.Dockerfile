@@ -1,6 +1,5 @@
-# Toolchain: base
-# Minimal dev container with git, curl, and common utilities.
-# Used as the fallback when no specific toolchain is detected.
+# lazy-runner: the default agent image, published as getlazy/lazy-runner.
+# A minimal dev container with git, curl, common utilities and every agent CLI.
 
 FROM debian:bookworm-slim
 
@@ -46,8 +45,7 @@ USER user
 ENV COLORTERM="truecolor"
 ENV PATH="/home/user/.local/bin:${PATH}"
 
-# Install Claude Code via native installer as `user` so it lands in
-# /home/user/.local/bin/claude — the layout Claude Code expects for the current user.
-RUN curl -fsSL https://claude.ai/install.sh | bash
-
-WORKDIR /work
+# Every agent CLI lazy can run in a container is appended after this point, one
+# RUN per agent, as `user` so each lands in /home/user/.local/bin (the layout
+# Claude Code expects). lazy composes them from each agent's own install line;
+# `lazy system export-dockerfile` prints the full result.

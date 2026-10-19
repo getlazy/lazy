@@ -270,6 +270,26 @@ describe('one-shot process contract', () => {
   });
 });
 
+describe('one-shot stdin delivery', () => {
+  test('passes an oversized pi prompt to the bounded subprocess', async () => {
+    const { execBoundedOneshot } = await import('../../src/oneshot/exec');
+    const prompt = 'P'.repeat(150_000);
+    const fixture = join(import.meta.dir, '..', 'fixtures', 'pi', 'print-turn.jsonl');
+    const script = [
+      'const fs = require("fs"); let input = "";',
+      'process.stdin.setEncoding("utf8");',
+      'process.stdin.on("data", part => input += part);',
+      'process.stdin.on("end", () => {',
+      '  if (input.length !== 150000) process.exit(9);',
+      '  process.stdout.write(fs.readFileSync(process.argv.at(-1), "utf8"));',
+      '});',
+    ].join('');
+    const args = Object.assign([process.execPath, '-e', script, fixture], { stdinInput: prompt });
+    const response = await execBoundedOneshot(args, { timeoutMs: 5000, harness: 'pi' });
+    expect(response.result).toBeTruthy();
+  });
+});
+
 describe('one-shot timeout polarity', () => {
   // INVARIANT: bounded is the DEFAULT and unbounded is the explicit opt-out —
   // not the other way round. An unbounded default only looks safe: the same

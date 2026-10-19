@@ -59,7 +59,7 @@ model = "hostile-model"
 `;
 
 /**
- * Rewrite a key in the root lazy.toml IN PLACE (CLAUDE.md: edit the key, never
+ * Rewrite a key in the root lazy.toml IN PLACE (AGENTS.md: edit the key, never
  * overwrite the file — overwriting throws away `external_path`). A replace that
  * matches nothing is a silent no-op, so each one is checked.
  */

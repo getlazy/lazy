@@ -212,10 +212,9 @@ describe('pi profiles on the OpenAI wire through the running daemon proxy', () =
 
   /**
    * The primary upstream at the loopback fake, and the two OpenAI-wire pi
-   * profiles by hostname only. No `credential` on either: the openai one is
-   * inferred from api.openai.com, the openrouter one from openrouter.ai —
-   * that inference, and the wire that comes with it, is what this suite
-   * exists to observe end to end.
+   * profiles, each naming its credential explicitly (`openai`, `openrouter`) —
+   * lazy never infers a credential from a hostname. The wire still follows the
+   * hostname, and that routing is what this suite exists to observe end to end.
    *
    * `[agents.pi]` overrides the built-in only in ADDRESS: its default is a
    * local Ollama on this machine, and the loopback fake stands in for one. The
@@ -230,9 +229,9 @@ describe('pi profiles on the OpenAI wire through the running daemon proxy', () =
     await writeFile(
       configPath,
       `${before}\n[proxy]\nupstream = "http://127.0.0.1:${primary!.port}"\n\n` +
-      `[agents.openai-pi]\nharness = "pi"\nmodel = "gpt-5.2"\nendpoint = "http://api.openai.com"\n\n` +
-      `[agents.openrouter-pi]\nharness = "pi"\nmodel = "${OPENROUTER_MODEL}"\nendpoint = "http://openrouter.ai/api"\n\n` +
-      `[agents.pi]\nharness = "pi"\nmodel = "qwen3.8:latest"\nendpoint = "http://127.0.0.1:${ollama!.port}"\n`,
+      `[agents.openai-pi]\nharness = "pi"\nmodel = "gpt-5.2"\nendpoint = "http://api.openai.com"\ncredential = "openai"\n\n` +
+      `[agents.openrouter-pi]\nharness = "pi"\nmodel = "${OPENROUTER_MODEL}"\nendpoint = "http://openrouter.ai/api"\ncredential = "openrouter"\n\n` +
+      `[agents.pi]\nharness = "pi"\nmodel = "qwen3.8:latest"\nendpoint = "http://127.0.0.1:${ollama!.port}"\ncredential = "none"\n`,
     );
   }
 

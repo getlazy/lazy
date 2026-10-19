@@ -7,18 +7,16 @@
  * (docs/design/git-pointer-boundary.md, "Project root"): case-insensitive,
  * `*` / `?` never cross `/`, character classes support ranges only, and a
  * pattern matching a directory covers everything beneath it. The real matcher
- * is exercised on a real host by `lazy system verify-host-boundary`.
+ * is not exercised here.
  */
 
 import { describe, test, expect } from 'bun:test';
 import {
   projectRootWriteDenyRules,
   withProjectRootWriteDenyArgs,
-  PROBE_PROJECT_ROOT_SCOPE,
   type ProjectRootWriteScope,
 } from '../../src/runner/host-sandbox';
 import { addProjectRootWriteDenies } from '../../src/supervisor/index';
-import { probeRootSettingsJson } from '../../src/runner/host-boundary-guard';
 import type { Command } from '../../src/protocol/types';
 import { mkdtemp, mkdir, realpath, rm, symlink } from 'fs/promises';
 import { tmpdir } from 'os';
@@ -60,7 +58,7 @@ describe('projectRootWriteDenyRules', () => {
   // choose its successor's permissions, checks and watchdog.
   test.each([
     'lazy.toml',
-    'CLAUDE.md',
+    'AGENTS.md',
     'src/index.ts',
     'new-file-created-after-launch',
     '.env',
@@ -189,16 +187,6 @@ describe('addProjectRootWriteDenies (supervisor)', () => {
   });
 });
 
-describe('boundary guard project-root probe settings', () => {
-  // INVARIANT: the guard probes the rules projectRootWriteDenyRules emits, not
-  // a hand-maintained copy, so it cannot verify a boundary nobody ships.
-  test('are the emitted rules for the probe placeholder scope', () => {
-    expect(JSON.parse(probeRootSettingsJson()).permissions.deny).toEqual(
-      projectRootWriteDenyRules(PROBE_PROJECT_ROOT_SCOPE),
-    );
-  });
-});
-
 describe('home dir write rules', () => {
   const HOME = '/home/u';
   const HOME_RULES = projectRootWriteDenyRules({ ...SCOPE, homeDirs: [HOME] });
@@ -206,8 +194,7 @@ describe('home dir write rules', () => {
   // INVARIANT: a host-runner agent's file tools cannot write the user's home
   // outside the way down to its own worktree. The fixed sensitive-path list
   // names only a few stores; ~/.gitconfig (core.fsmonitor), ~/.zshenv and
-  // ~/Library/LaunchAgents each run code outside the sandbox, and the boundary
-  // guard's `deny / write-TOOL` vector writes straight into $HOME.
+  // ~/Library/LaunchAgents each run code outside the sandbox.
   test.each([
     '.gitconfig',
     '.zshenv',

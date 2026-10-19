@@ -27,8 +27,14 @@ came from (a verification step, Services, opened here, Pair, Chat), and whether
 it is connected — with **go to** and close. A session renders in exactly one
 place; the list is an index, not a second terminal.
 
-**Maximise** enlarges that same terminal as an overlay. The element never moves
-in the page, so focus and scrollback stay put.
+**Fill window** makes that same terminal cover the whole browser window, width
+and height; **Exit full window** (or **Esc**, when the terminal itself is not focused — inside it Esc goes to your program) puts it back. The element never moves
+in the page, so focus and scrollback stay put. Every browser terminal in Lazy
+— the task Shell, Watch, a verification step's shell, and the terminals in Lazy
+Teams — has the same controls: **Fill window**, **Paste** (not on the read-only
+Watch), **Page Up** / **Page Down** to scroll back, **Ctrl/Cmd+C** to copy a
+selection (with none it stays the interrupt), **Ctrl/Cmd+V** or **Shift+Insert**
+to paste, and a draggable bottom edge to change the height.
 
 ## Pair and Chat
 

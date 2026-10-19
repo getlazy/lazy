@@ -180,15 +180,14 @@ dialog.lz-raised-dialog {
 }
 /* Task-page action dialog — live CLI phases, close on success, stay on failure.
    Floor at ~28rem so short forms → steps do not shrink the box; grow with
-   tall content up to the viewport; body scrolls only when that still is not
-   enough. Submit row sticks to the bottom of the scroll pane. */
+   tall content up to the viewport. Only the dialog scrolls. */
 dialog.lz-action-dialog {
   width: min(640px, calc(100vw - 40px));
   height: auto;
   min-height: min(28rem, calc(100vh - 40px));
   max-height: calc(100vh - 40px);
   padding: 0 0 var(--space-6);
-  overflow: hidden;
+  overflow: auto;
 }
 dialog.lz-action-dialog[open] {
   display: flex;
@@ -198,6 +197,10 @@ dialog.lz-action-form-hidden .lz-action-dialog-body {
   display: none;
 }
 .lz-action-dialog-close {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--color-bg);
   display: flex; justify-content: flex-end;
   padding: var(--space-3) var(--space-4) 0;
   flex: none;
@@ -209,9 +212,8 @@ dialog.lz-action-form-hidden .lz-action-dialog-body {
 }
 .lz-action-dialog-body {
   padding: 0 var(--space-8);
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow: auto;
+  flex: none;
+  overflow: visible;
 }
 .lz-action-dialog-body .lz-action-form { margin: 0; }
 .lz-action-dialog-body .lz-action-form .input,
@@ -232,7 +234,11 @@ dialog.lz-action-form-hidden .lz-action-dialog-body {
   border-top: 1px solid var(--color-divider);
   box-shadow: 0 -10px 14px -10px color-mix(in srgb, var(--color-neutral-900) 22%, transparent);
 }
+.lz-action-output { flex: none; }
+.lz-action-output:has(> [hidden]) { display: none; }
+.lz-action-output > summary { cursor: pointer; margin: var(--space-3) var(--space-8) 0; }
 .lz-action-steps {
+  overflow-wrap: anywhere;
   list-style: none;
   margin: var(--space-4) var(--space-8) 0;
   padding: 0;
@@ -240,11 +246,10 @@ dialog.lz-action-form-hidden .lz-action-dialog-body {
   font-size: 13px;
   line-height: 1.45;
   min-height: 6rem;
-  max-height: 14rem;
-  overflow-y: auto;
   flex: none;
 }
 .lz-action-step {
+  min-width: 0;
   display: flex;
   gap: var(--space-2);
   padding: 2px 0;
@@ -260,19 +265,16 @@ dialog.lz-action-form-hidden .lz-action-dialog-body {
 .lz-action-step-mark { width: 1.2em; flex: none; text-align: center; }
 .lz-action-step-text { white-space: pre-wrap; min-width: 0; }
 .lz-action-error {
+  overflow-wrap: anywhere;
   margin: var(--space-3) var(--space-8) 0;
   color: var(--color-danger, #c0392b);
   white-space: pre-wrap;
   flex: none;
-  overflow: auto;
-  max-height: 8rem;
 }
 .lz-action-remedy {
   margin: var(--space-3) var(--space-8) 0;
   padding: 0;
   flex: none;
-  overflow: auto;
-  max-height: 12rem;
 }
 .lz-action-remedy .lz-action-form label,
 .lz-action-remedy .lz-action-passphrase label {

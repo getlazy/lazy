@@ -184,6 +184,12 @@ limit killing them is the exact failure this default exists to prevent.
 An upgrade is the main path, but not the only one. Three triggers rebuild a
 runner image, on three different axes:
 
+These triggers apply to an image lazy BUILT on your machine. The default image
+pulled from a release is never rebuilt for its age: it keeps the agent CLIs it
+was pulled with, and upgrading lazy pulls again. A default image lazy built
+itself is replaced by the published one, when one exists, as soon as a trigger
+fires.
+
 | Trigger | What it catches |
 | --- | --- |
 | `lazy upgrade` | Everything. `--no-cache`, described above — asks first (default yes) when an identical image already exists |
@@ -205,13 +211,15 @@ current the moment lazy is.
 ## The base image a custom Dockerfile builds FROM
 
 If your project supplies its own Dockerfile and it starts with
-`FROM lazy-runner`, that base image is one lazy builds on your machine — it
-exists on no registry. On a machine where it has never been built, or where
-`docker system prune` removed it, Docker would treat the name as a Docker Hub
+`FROM lazy-runner`, that base has to be in your local image store. The bare name
+`lazy-runner` is not on a registry, so on a machine without it (never set up, or
+cleared by `docker system prune`) Docker would treat the name as a Docker Hub
 repository and fail with `pull access denied, repository does not exist`.
 
 Lazy avoids that: before building your custom image it checks for the base and,
-if it is missing, builds it first, saying so —
+if it is missing, pulls your release's `ghcr.io/getlazy/lazy-runner` image and
+tags it `lazy-runner`. If there is nothing to pull (offline, or no release published
+the base your lazy version builds from) it builds the base instead, saying so —
 
 ```
 Base image lazy-runner:latest not found — building it first, because
@@ -222,15 +230,16 @@ This happens **only when the base is missing**. It is not a fourth freshness
 trigger: an existing base image is left exactly as it is, and the three triggers
 in the table above are what keep it current.
 
-Two `FROM` spellings lazy will not build for you, because a base build would not
-produce the reference you asked for — a base build writes only the current
-`major.minor` tag and the `:latest` alias:
+Two `FROM` spellings lazy will not supply for you:
 
-- a base pinned to another tag, e.g. `FROM lazy-runner:0.19`
-- an agent-suffixed image, e.g. `FROM lazy-runner-cursor`. These are lazy's own
-  per-agent images (the default Dockerfile plus that agent's install line) and
-  are not a supported `FROM` target — build on `lazy-runner` and add the agent's
-  install line yourself.
+- a base pinned to another tag, e.g. `FROM lazy-runner:0.19`. Lazy only ever
+  writes the current `major.minor` tag and the `:latest` alias. Use
+  `FROM lazy-runner`, or build the base yourself with
+  `lazy system build lazy-runner`. To pin an exact release, name the published
+  image instead: `FROM ghcr.io/getlazy/lazy-runner:v0.91.1402`.
+- an agent-suffixed image, e.g. `FROM lazy-runner-cursor`. Per-agent images are
+  no longer produced, because `lazy-runner` now carries every agent CLI. Change
+  the line to `FROM lazy-runner`.
 
-In both cases lazy still names the remedy rather than leaving you with the
-registry error: run `lazy system build lazy-runner` and retry.
+In both cases lazy names the remedy rather than leaving you with the registry
+error.

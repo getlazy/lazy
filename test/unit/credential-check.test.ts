@@ -11,7 +11,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtemp, rm } from 'fs/promises';
+import { mkdtemp, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { pinDaemonBaseDir } from '../helpers/daemon-base-dir';
@@ -107,6 +107,63 @@ describe('checkUserCredential', () => {
     expect(result.outcome).toBe('ok');
     expect(calls[0]!.url).toContain('/v1/messages/count_tokens');
     expect(calls[0]!.headers.authorization).toBe(`Bearer ${SECRET}`);
+  });
+
+  // INVARIANT: the checker validates its own route, not a client's earlier
+  // snapshot. A route change must never send the stored Anthropic account away.
+  test('changed and downgraded destinations refuse before any fetch', async () => {
+    for (const kind of ['api-key', 'oauth'] as const) {
+      await store(kind);
+      for (const upstream of ['https://unconsented.example', 'http://api.anthropic.com']) {
+        await writeFile(join(root, 'lazy.toml'), `[proxy]\nupstream = "${upstream}"\n`);
+        const { impl, calls } = stubFetch(200);
+        await expect(checkUserCredential(root, 'ada', { fetchImpl: impl })).rejects.toThrow('No request was sent');
+        expect(calls).toHaveLength(0);
+      }
+    }
+  });
+
+  test('path-only changes retain known Anthropic origin consent', async () => {
+    await store('api-key');
+    await writeFile(join(root, 'lazy.toml'), '[proxy]\nupstream = "https://api.anthropic.com/provider-path"\n');
+    const { impl, calls } = stubFetch(200);
+    expect((await checkUserCredential(root, 'ada', { fetchImpl: impl })).outcome).toBe('ok');
+    expect(calls[0]!.url).toBe('https://api.anthropic.com/provider-path/v1/models');
+  });
+
+  // INVARIANT: a redirect cannot carry a member's credential to an unchecked
+  // origin. Exercise real fetch redirect handling with only the transport mocked.
+  test('API key and OAuth probes refuse redirects without reaching their recipient', async () => {
+    let redirectedRequests = 0;
+    const receiver = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch() {
+      redirectedRequests++;
+      return Response.json({});
+    } });
+    let probeRequests = 0;
+    const provider = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+      probeRequests++;
+      expect(request.headers.get('x-api-key') ?? request.headers.get('authorization')).toContain(SECRET);
+      return new Response(null, { status: 302, headers: { location: `http://127.0.0.1:${receiver.port}/capture` } });
+    } });
+    try {
+      const transport = (async (url: string | URL | Request, init?: RequestInit) => {
+        expect(String(url)).toStartWith('https://api.anthropic.com/');
+        return fetch(`http://127.0.0.1:${provider.port}${new URL(String(url)).pathname}`, init);
+      }) as typeof fetch;
+      for (const kind of ['api-key', 'oauth'] as const) {
+        await store(kind);
+        const result = await checkUserCredential(root, 'ada', { fetchImpl: transport });
+        expect(result.outcome).toBe('unreachable');
+        expect(result.ok).toBe(false);
+        expect(result.status).toBeNull();
+        expect(result.detail).not.toContain(SECRET);
+      }
+      expect(probeRequests).toBe(2);
+      expect(redirectedRequests).toBe(0);
+    } finally {
+      provider.stop(true);
+      receiver.stop(true);
+    }
   });
 
   test('a refused credential is a result, not a thrown error', async () => {
@@ -272,5 +329,52 @@ describe('checkUserCredential', () => {
 
   test('the RPC needs a userId', async () => {
     await expect(handleCheckUserCredential(root, {}, CONTROL)).rejects.toThrow(/userId/i);
+  });
+});
+
+describe('usageLimits credential health', () => {
+  // INVARIANT: the usage-limits view applies the same staleness rule as the
+  // credential listing — a failure from BEFORE the stored credential was last
+  // replaced is about a secret that no longer exists, so a replaced credential
+  // must not keep showing as failing there.
+  test('a failure older than the stored credential is not reported', async () => {
+    const { handleUsageLimits } = await import('../../src/daemon/rpc-handlers');
+    const { loadConfig } = await import('../../src/config/loader');
+    const { auditLogPath } = await import('../../src/proxy/audit-log');
+    const { memberEndpointUsageKey } = await import('../../src/proxy/usage-limits');
+    const { mkdir, appendFile } = await import('fs/promises');
+    const { dirname } = await import('path');
+    const root = await mkdtemp(join(tmpdir(), 'lazy-usage-health-'));
+    const base = await mkdtemp(join(tmpdir(), 'lzd-usage-health-'));
+    const unpin = pinDaemonBaseDir(base);
+    clearUserCredentialCache();
+    try {
+      const path = auditLogPath(join(root, (await loadConfig(root)).data.path));
+      await mkdir(dirname(path), { recursive: true });
+      const refusal = (ts: number) => JSON.stringify({
+        id: `r${ts}`, seq: ts, ts, role: 'agent', taskId: 't', backend: 'proxy', upstream: 'https://api.anthropic.com',
+        method: 'POST', path: '/v1/messages', endpoint: 'other', model: null, tier: null, stream: null, requestShape: null,
+        toolUses: [], toolResults: [], status: 401, usage: null, stopReason: null, error: 'credential refused: x',
+        durationMs: 1, reroute: null, enforcement: null,
+        refusedCredential: { key: memberEndpointUsageKey('ada', 'builtin:anthropic'), userId: 'ada', profile: null },
+      }) + '\n';
+      await appendFile(path, refusal(Date.now() - 60_000));
+      await putUserCredential(root, { userId: 'ada', kind: 'api-key', token: SECRET, label: 'ada@example.com' });
+      expect((await handleUsageLimits(root)).credentialHealth).toEqual([]);
+      // The MCP usage-limits view (lazy_usage_limits) filters through the same
+      // shared helper, so the rule cannot be applied on one surface only.
+      const { currentCredentialFailures } = await import('../../src/daemon/current-credential-failures');
+      const { readAuditRecords } = await import('../../src/proxy/audit-log');
+      const shared = async () => currentCredentialFailures(root, await readAuditRecords(join(root, (await loadConfig(root)).data.path), { limit: 200 }));
+      expect(await shared()).toEqual([]);
+      await appendFile(path, refusal(Date.now() + 1_000));
+      expect((await handleUsageLimits(root)).credentialHealth.map(f => f.credential)).toEqual([memberEndpointUsageKey('ada', 'builtin:anthropic')]);
+      expect((await shared()).map(f => f.credential)).toEqual([memberEndpointUsageKey('ada', 'builtin:anthropic')]);
+    } finally {
+      unpin();
+      clearUserCredentialCache();
+      await rm(root, { recursive: true, force: true });
+      await rm(base, { recursive: true, force: true });
+    }
   });
 });

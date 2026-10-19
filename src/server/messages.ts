@@ -11,10 +11,13 @@
  * coins a synonym for it, so the inbox and `lazy messages list` can never
  * describe the same message differently.
  *
- * NO-JS BY CONSTRUCTION: the two actions are plain form POSTs followed by a
+ * NO-JS BY CONSTRUCTION: the actions are plain form POSTs followed by a
  * redirect, like the review surface's retry/withdraw controls. The inbox is
  * where the human finds out something needs their attention; it must not depend
- * on scripting to work.
+ * on scripting to work. The bulk dismissals' confirm() prompts are progressive
+ * enhancement only, and their text carries NO message data — an entity-escaped
+ * value is decoded back before an inline handler runs, so interpolating a
+ * source there would be script injection.
  */
 
 import type { SystemMessage } from '../types';
@@ -29,6 +32,7 @@ import {
 import { layoutHtml } from './templates';
 import { escapeHtml } from './review-diff';
 import { renderMarkdown, type RenderMarkdownOptions } from './markdown';
+import { renderMarkdownWithCopy } from './copy-markdown';
 
 function formatDate(ts: number): string {
   const d = new Date(ts);
@@ -82,7 +86,17 @@ function actionsHtml(message: SystemMessage, allView: boolean): string {
     ? `<form class="msg-action" method="post" action="/messages/${id}/read">${back}<button class="btn btn-sm" type="submit">Mark read</button></form>`
     : '';
   const dismiss = `<form class="msg-action" method="post" action="/messages/${id}/dismiss">${back}<button class="btn btn-sm btn-primary" type="submit">Dismiss</button></form>`;
-  return `${markRead}${dismiss}`;
+  // Every open message with this source and title — the crash-loop case, where
+  // one event filed many identical messages before repeats were collapsed.
+  const dismissLike = `<form class="msg-action" method="post" action="/messages/${id}/dismiss-like" onsubmit="return confirm('Dismiss every open message with this source and title?')">${back}<button class="btn btn-sm" type="submit" title="Dismiss every open message with the same source and title">Dismiss all like this</button></form>`;
+  return `${markRead}${dismiss}${dismissLike}`;
+}
+
+/** "×37" style marker for a message that collapsed repeats; '' otherwise. */
+function repeatHtml(message: SystemMessage): string {
+  if (!message.repeat_count || message.repeat_count < 2) return '';
+  const last = message.last_seen_at ? `, last ${formatDate(message.last_seen_at)}` : '';
+  return ` <span class="text-muted msg-repeat" title="Repeats are counted here instead of filed as new messages">happened ${message.repeat_count} times${escapeHtml(last)}</span>`;
 }
 
 function noticeHtml(notice?: { text: string; error?: boolean }): string {
@@ -113,6 +127,7 @@ export function messagesInboxHtml(
   const filterBar = `<div class="filter-bar">
     <a href="/messages" class="btn btn-sm${allView ? '' : ' active'}">Inbox</a>
     <a href="/messages?all=1" class="btn btn-sm${allView ? ' active' : ''}">All (incl. dismissed)</a>
+    ${!allView && messages.length > 0 ? `<form class="msg-action" method="post" action="/messages/dismiss-all" onsubmit="return confirm('Dismiss all ${messages.length} open message(s)? They stay on record in the All view.')"><button class="btn btn-sm" type="submit">Dismiss all</button></form>` : ''}
   </div>`;
 
   const legend = `<div class="msg-legend">
@@ -141,7 +156,7 @@ export function messagesInboxHtml(
       <td>${stateBadge(state)}</td>
       <td>${escapeHtml(formatDate(m.created_at))}</td>
       <td>${escapeHtml(m.source)}</td>
-      <td class="wrap msg-title"><a href="/messages/${escapeHtml(encodeURIComponent(m.id))}">${escapeHtml(m.title)}</a></td>
+      <td class="wrap msg-title"><a href="/messages/${escapeHtml(encodeURIComponent(m.id))}">${escapeHtml(m.title)}</a>${repeatHtml(m)}</td>
       <td class="msg-actions">${actionsHtml(m, allView)}</td>
     </tr>`;
   }).join('\n');
@@ -185,7 +200,7 @@ export function messageDetailHtml(
     `from ${escapeHtml(message.source)}`,
     escapeHtml(formatDate(message.created_at)),
     stateBadge(state),
-  ].join(' · ');
+  ].join(' · ') + repeatHtml(message);
 
   return layoutHtml(message.title, `
     <div class="breadcrumb"><a href="/messages">Inbox</a> &rsaquo; Message</div>
@@ -194,7 +209,7 @@ export function messageDetailHtml(
     ${noticeHtml(notice)}
     <div class="action-links msg-detail-actions">${actionsHtml(message, false)}</div>
     <div class="detail-section">
-      <div class="turn-content">${renderMarkdown(message.body, markdown)}</div>
+      <div class="turn-content">${renderMarkdownWithCopy(message.body, markdown)}</div>
     </div>
     ${scratchMentionsHtml(scratchPaths)}
   `);

@@ -21,7 +21,11 @@ import { RpcApplicationError } from './client';
 import { lookupMcpIdentity } from './mcp-tokens';
 import type { ProgressEmitter } from './progress';
 import { trackWait, BLOCKING_WAIT_TOOLS } from './wait-registry';
-import { taskTurnOwner } from './turn-owner';
+import { runAsTurnOwnerRequest, type TurnOwnerRequest } from './turn-owner';
+import { assertMcpCallAuthorised, resolveMcpTurnAuthority } from './mcp-turn-authority';
+import { isManagedMode } from '../config/managed-mode';
+import { runWithLaunchOrigin, type LaunchOrigin } from './launch-origin';
+import { displayId } from '../task/identity';
 import type { Storage } from '../storage/interface';
 import { realignAfterDaemonWrite } from '../utils/worktree-ownership';
 import { INTERNAL_GIT_TOOL_NAME } from '../mcp/types';
@@ -211,6 +215,8 @@ export async function handleMcpToolCall(
   progress?: ProgressEmitter,
   /** The builder surface's MCP token label, resolved by the route from the token. */
   builderTokenLabel?: string | null,
+  /** Collects effects to run once the answer reached a connected caller. */
+  afterDelivery?: (effect: () => Promise<void>) => void,
 ): Promise<unknown> {
   if (!existsSync(projectRoot)) {
     throw new RpcError(400, `Project root does not exist: ${projectRoot}`);
@@ -234,6 +240,9 @@ export async function handleMcpToolCall(
 
   // Determine worktree path based on task ID
   let worktreePath: string;
+  let actorPerson: { email: string; name?: string } | undefined;
+  let authority: Awaited<ReturnType<typeof resolveMcpTurnAuthority>> | null = null;
+  let callerTask: Awaited<ReturnType<typeof storage.getTask>> = null;
   if (taskId) {
     // Task-scoped: resolve the task's worktree path
     const task = await storage.getTask(taskId);
@@ -241,6 +250,36 @@ export async function handleMcpToolCall(
       throw new RpcError(404, `Task not found: ${taskId}`);
     }
     worktreePath = getWorktreePath(projectRoot, task);
+
+    // AUTHORITY COMES FROM A LIVE TURN (./mcp-turn-authority.ts). The token is
+    // per task and outlives every turn — services and leftover processes in the
+    // task's container hold it too — so a launch or attributed write is accepted
+    // only while a turn is running, a read-only turn (ask, review, the low-high
+    // self-review) gets only the tools it was offered, and WHOSE WORK THIS IS
+    // comes from that turn's own record: the claim's captured owner for an
+    // ask/review, the session owner its launch wrote for a work turn. Never sent
+    // by the caller — an identity a request could carry is one an agent could
+    // choose. No recorded owner means the turn was system-initiated, and the
+    // rows record the channel and nobody, as they always have.
+    //
+    // This closed raised item `36a893f4`: the person used to be read from the
+    // task's CURRENT session on every call, whatever was calling, and since
+    // 2026-10-06 the same lookup decides BILLING (agentLaunchOwnerRequest), so a
+    // process outside any turn could launch subtasks billed to whoever owned the
+    // task's last turn.
+    //
+    // DELIBERATELY NOT the configured system identity the TURN rows of such a
+    // turn carry (§3.3 case 3, src/identity/system-identity.ts). That identity
+    // comes with the role `system`, and `actor` on this door is read as the
+    // CHANNEL by code that decides behaviour, not only by surfaces: a loop task
+    // asks whether a new child's creating actor was `agent` to tell its own
+    // agent's subtasks from ones a human added, and a loop whose turn the
+    // reconciler had resumed would have started answering "somebody else" to its
+    // own children — and woken itself forever. Widening these rows means giving
+    // each such reader the distinction first.
+    authority = await resolveMcpTurnAuthority(storage, task);
+    callerTask = task;
+    actorPerson = authority.kind === 'turn' ? authority.owner ?? undefined : undefined;
   } else {
     // Builder/project-wide mode: use project root
     worktreePath = projectRoot;
@@ -249,35 +288,6 @@ export async function handleMcpToolCall(
   // Create tool context scoped to this task's worktree.
   // Pass the daemon's storage singleton so handlers can access it without
   // needing to create their own (which would fail with LAZY_IS_DAEMON=1).
-  // WHOSE WORK THIS IS. The agent has already been authenticated as this task
-  // (authorizeMcpCall); the person is looked up FROM THE TASK, exactly as the
-  // launch path looks up whose credential to spend, and never sent by the
-  // caller — an identity a request could carry is one an agent could choose.
-  // No recorded owner means the turn was system-initiated, and the rows record
-  // the channel and nobody, as they always have.
-  //
-  // DELIBERATELY NOT the configured system identity the TURN rows of such a
-  // turn carry (§3.3 case 3, src/identity/system-identity.ts). That identity
-  // comes with the role `system`, and `actor` on this door is read as the
-  // CHANNEL by code that decides behaviour, not only by surfaces: a loop task
-  // asks whether a new child's creating actor was `agent` to tell its own
-  // agent's subtasks from ones a human added, and a loop whose turn the
-  // reconciler had resumed would have started answering "somebody else" to its
-  // own children — and woken itself forever. Widening these rows means giving
-  // each such reader the distinction first.
-  //
-  // KNOWN GAP, deliberately not closed here (raised item `36a893f4`): this
-  // resolves the person from the task's CURRENT session on every call, so it is
-  // per-TASK, not per-TURN. A task MCP token is minted per task and lives until
-  // the task ends, so a superseded agent that still holds a valid one has its
-  // late write (lazy_journal, lazy_raise, lazy_comment) stamped with whoever
-  // asked for the NEWER turn — the same defect the turn ROWS were fixed for,
-  // through this door. Turn rows got a per-turn capture on the in-flight claim
-  // (`InFlightTurn.turn_owner_email`); MCP writes have no equivalent, because
-  // closing it means binding the person to the TURN at this boundary — on the
-  // token, or on the per-turn binding the proxy already keys — which is a
-  // change of its own. Do not assume this is per-turn just because the turn
-  // rows are.
   const ctx: McpToolContext = {
     taskId,
     worktreePath,
@@ -285,7 +295,8 @@ export async function handleMcpToolCall(
     ...(taskId ? {} : { builderTokenLabel: builderTokenLabel ?? null }),
     storage,
     progress,
-    ...(taskId ? { actorPerson: (await taskTurnOwner(storage, taskId)) ?? undefined } : {}),
+    ...(afterDelivery ? { afterDelivery } : {}),
+    ...(taskId ? { actorPerson } : {}),
   };
 
   const handlers = createAllHandlers(ctx);
@@ -294,14 +305,139 @@ export async function handleMcpToolCall(
   if (!handler) {
     throw new RpcError(404, `Unknown tool: ${toolName}`);
   }
+  // After the 404, so an unknown name is reported as unknown, not as refused.
+  if (callerTask && authority) assertMcpCallAuthorised(callerTask, toolName, authority);
 
   logger.debug(`MCP tool call: ${toolName} (task=${taskId || 'builder'}, worktree=${worktreePath})`);
 
   // A commit this call makes (lazy_commit, a self-sync's merges, an accept)
   // is authored by the person who asked for the turn; a turn nobody asked for
   // falls through to the configured system identity (src/identity/git-author.ts).
+  //
+  // Inside that, a turn this call LAUNCHES runs as whoever asked for it (see
+  // launchScope below): the caller task's turn owner, or the member a builder
+  // session belongs to.
+  const launch = await launchScope(storage, projectRoot, taskId, toolName, args, ctx.actorPerson ?? null, builderTokenLabel ?? null);
   return runWithGitAuthor(ctx.actorPerson ?? null, () =>
-    dispatchMcpHandler(storage, taskId, toolName, worktreePath, handler, args));
+    launch(() => dispatchMcpHandler(storage, taskId, toolName, worktreePath, handler, args)));
+}
+
+/**
+ * The scope a turn-launching MCP call runs in: as its owner's request when it
+ * has one, otherwise with its ORIGIN recorded so an ownerless launch's
+ * service-holder refusal can name the real trigger (./launch-origin.ts).
+ * Every other call runs unchanged.
+ */
+async function launchScope(
+  storage: Storage,
+  projectRoot: string,
+  taskId: string,
+  toolName: string,
+  args: Record<string, unknown>,
+  actorPerson: { email: string; name?: string } | null,
+  builderTokenLabel: string | null,
+): Promise<<T>(fn: () => Promise<T>) => Promise<T>> {
+  if (!AGENT_TURN_LAUNCHING_TOOLS.has(toolName)) return (fn) => fn();
+  const request = taskId
+    ? await agentLaunchOwnerRequest(storage, taskId, toolName, args, actorPerson)
+    : await builderLaunchOwnerRequest(storage, projectRoot, toolName, args, builderTokenLabel);
+  if (request) return (fn) => runAsTurnOwnerRequest(request, fn);
+  const caller = taskId ? await storage.getTask(taskId) : null;
+  const origin: LaunchOrigin = caller ? { kind: 'agent', parentTask: displayId(caller) } : { kind: 'builder' };
+  return (fn) => runWithLaunchOrigin(origin, fn);
+}
+
+/**
+ * WHO ASKED for a turn a BUILDER session launches: the member the session
+ * belongs to. A Teams builder session is a person's conversation (§3.3 case 1),
+ * so a task it starts or unblocks is that person's turn, billed to them.
+ *
+ * The member is resolved from the session's own authenticated binding — the
+ * daemon looked the MCP token up and found its label (`builder-<builderId>`),
+ * which names a daemon-owned builder session record carrying `memberEmail` —
+ * never from a request field. What keeps this honest is not who may mint a
+ * label (`getDaemonMcpConfig` takes a caller-supplied name and does not refuse
+ * user tokens) but two other facts: the minted token's secret is written only
+ * into a daemon-side config file and never returned to the caller (the RPC
+ * answers with a path), so a token labelled `builder-<id>` is held only by the
+ * builder the daemon launched; and builder-session rows are written by the
+ * daemon alone — user-kind callers are refused every write
+ * (`BUILDER_SESSION_MEMBER_SCOPED_WRITE_METHODS`), and on a managed host the
+ * control token is refused them too — so nobody can plant a row naming another
+ * member. Managed mode only: on a laptop a builder's
+ * launches keep running on the daemon's own credential, as they always have.
+ * An ended session, an unknown label, or a session with no member yields null:
+ * the launch stays ownerless (the service holder pays or it is refused).
+ */
+export async function builderLaunchOwnerRequest(
+  storage: Storage,
+  projectRoot: string,
+  toolName: string,
+  args: Record<string, unknown>,
+  builderTokenLabel: string | null,
+): Promise<TurnOwnerRequest | null> {
+  if (!isManagedMode() || !AGENT_TURN_LAUNCHING_TOOLS.has(toolName)) return null;
+  if (!builderTokenLabel?.startsWith('builder-')) return null;
+  const builderId = builderTokenLabel.slice('builder-'.length);
+  const ref = typeof args.task_id === 'string' ? args.task_id : '';
+  if (!builderId || !ref) return null;
+  try {
+    const session = (await storage.listBuilderSessions(projectRoot))
+      .find((s) => s.builderId === builderId && s.state !== 'ended');
+    if (!session?.memberEmail) return null;
+    const resolved = await storage.resolveTask(ref);
+    if (!resolved.task) return null;
+    return { taskId: resolved.task.id, owner: { email: session.memberEmail, spendable: true } };
+  } catch (err) {
+    logger.debug(`Could not resolve the member behind builder ${builderId} for '${ref}': ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
+/**
+ * MCP tools through which a task's agent launches a turn — on a subtask, or on
+ * itself for `lazy_sync`. The agent-reachable half of the RPC layer's
+ * TURN_LAUNCHING_COMMANDS.
+ */
+export const AGENT_TURN_LAUNCHING_TOOLS = new Set([
+  'lazy_start', 'lazy_unblock', 'lazy_resume', 'lazy_ask', 'lazy_review', 'lazy_sync', 'lazy_accept',
+]);
+
+/**
+ * WHO ASKED for a turn a task's agent launches: whoever asked for the agent's
+ * OWN current turn. A subtask started (unblocked, resumed, asked, reviewed) by
+ * an agent is part of that agent's turn, so it is owned by — and billed to —
+ * the parent turn's owner — the person the caller's LIVE turn records
+ * (`actorPerson`, resolved by ./mcp-turn-authority.ts: an ask/review claim's
+ * captured owner, or the session owner a work turn's launch wrote),
+ * never from a request field. Without this every agent-launched turn ran with
+ * no owner and, on a managed host, was billed to the project's service holder:
+ * a member's own task starting a subtask was refused for want of a service
+ * credential (field report 2026-10-06).
+ *
+ * A parent turn nobody asked for yields null: its subtasks are system turns
+ * too. `spendable` mirrors how the parent's owner was derived — in managed
+ * mode only a member's user token ever names an owner; on a laptop the owner is
+ * the git identity, which is never spent.
+ */
+export async function agentLaunchOwnerRequest(
+  storage: Storage,
+  callerTaskId: string,
+  toolName: string,
+  args: Record<string, unknown>,
+  owner: { email: string; name?: string } | null,
+): Promise<TurnOwnerRequest | null> {
+  if (!callerTaskId || !owner || !AGENT_TURN_LAUNCHING_TOOLS.has(toolName)) return null;
+  const ref = typeof args.task_id === 'string' && args.task_id ? args.task_id : callerTaskId;
+  try {
+    const resolved = await storage.resolveTask(ref);
+    if (!resolved.task) return null;
+    return { taskId: resolved.task.id, owner: { ...owner, spendable: isManagedMode() } };
+  } catch (err) {
+    // The handler about to run produces the real "not found" for the caller.
+    logger.debug(`Could not resolve '${ref}' to name the turn owner: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
 }
 
 async function dispatchMcpHandler(

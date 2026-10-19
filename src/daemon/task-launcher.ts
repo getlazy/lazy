@@ -18,7 +18,9 @@
  * daemon code — it causes deadlocks and storage lock contention.
  */
 
+import { confirmRunnerImageForLaunch, mustRecreateForRunnerImage } from './runner-image-choice';
 import { ensureLazyExcludeBestEffort } from '../git/lazy-exclude';
+import { deliverTaskFilesForLaunch } from './task-files';
 import { actorRole } from '../actor-ref';
 import type { ReviewSettingsOverrides } from '../review/mode';
 
@@ -36,7 +38,7 @@ import { resolveAgentChattiness, renderChattinessSnippet } from '../config/chatt
 import { createRunner } from '../runner';
 import { stampSessionRunner, removeTaskRun, mustRecreateForContainerAgent } from '../runner/session-launch';
 import { mustRecreateForTaskEnv } from './task-env';
-import { pinnedCustomImage } from '../docker/worktree-image';
+import { launchImagePin } from '../docker/worktree-image';
 import { createDriver, resolveUpstreamMergeRef } from '../remote';
 import { autoPushEnabled, autoPushConfigKey } from '../remote/auto-push';
 import { getOrCreateStorage } from './rpc-handlers';
@@ -51,19 +53,23 @@ import {
 import { assertTurnStartAllowed, holdAgentStart } from './usage-pause';
 import { isUsagePauseRefusal } from './rpc-error';
 import { getMcpConfigDir } from './paths';
-import { getCurrentSha, getRemoteDefaultBranch, createWorktreeFromSha, recoverMissingWorktree, copyUntrackedFilesIntoWorktree } from '../git/operations';
+import { getCurrentSha, getRemoteDefaultBranch, createWorktreeFromSha, recoverMissingWorktree, copyUntrackedFilesIntoWorktree, WORKTREE_ADD_TIMEOUT, describeWorktreeAddFailure } from '../git/operations';
+import { ensureTaskWorktree } from './task-worktree';
 import { checkLock, acquireLock, removeLock } from '../utils/lock';
 import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields, containerHandoffFileModeFor } from '../protocol';
 import { shortId, displayId, taskRef, deriveTaskRef, getWorktreePath, getWorktreePathForRef, getBranchNameFromId } from '../task/identity';
 import { taskBranchFor, looksLikeTaskBranch } from '../git/branch-prefix';
+import { renderTaskTurnPrompt } from '../task/turn-prompt-render';
 import { buildNotesContext, buildJournalNotice, buildArtifactNotice, buildSystemPrompt } from '../task/turn-context';
 import { buildMemorySection } from '../memory';
 import { buildLazyMdSection } from '../task/lazy-md';
 import { checkOrphanedChild, retargetOrphanedChild } from '../task/orphan';
 import { typeConstraintsSection } from '../task/type-constraints';
+import { lazyFold, neutralizeLazyMarkers } from '../task/wrapper-fold';
 import { recordRecreationIfRunning, recreationReason, environmentReplacedPrefix, clearEnvironmentReplaced } from '../task/environment-replaced';
 import { pinnedBaseOf } from '../task/base-pin';
 import { parentTaskIdOf, branchTarget } from '../task-target';
+import { syncChildrenAfterParentStart } from './parent-started-sync';
 import { isLinkedTask as isLinkedTaskFn } from '../task/linked';
 import { getAgentPackaging } from '../agent/registry';
 import { profileForAgentName, profileNameForAgent } from '../config/agent-profiles';
@@ -72,6 +78,7 @@ import { assertKnownAgentProfile } from './agent-profile-check';
 import { getDataDir } from '../project-paths';
 import { isFeatureEnabled } from '../utils/features';
 import { logger } from '../utils/logger';
+import { recordLaunchFailure } from './launch-failure';
 import { retargetReviewsAfterReparent } from './review-retarget';
 import { getActor } from '../constants';
 import { getNonHumanTurnCount, incrementNonHumanTurnCount, resetNonHumanTurnCount, checkTurnBudget } from './turn-budget';
@@ -84,6 +91,7 @@ import { isOfflineMode } from '../utils/offline';
 import { resetClusterFixRound } from './cluster-fix-rounds';
 import { resolveWrapUpCommandFields } from './wrap-up-plan';
 import type { StartCommand } from '../protocol';
+import { imageTryBuildAvailable } from './image-try-build';
 import type { Task, Storage } from '../storage';
 import {
   PhaseReporter,
@@ -92,12 +100,16 @@ import {
   type ProgressEmitter,
 } from './progress';
 
-import goalContextStartText from '../prompts/goal-context-start.md' with { type: 'text' };
-import goalContextContinueText from '../prompts/goal-context-continue.md' with { type: 'text' };
 
 // --- Input/Output types ---
 
 export interface StartTaskParams {
+  /**
+   * A person confirmed running this launch on lazy's DEFAULT runner image while
+   * the project's own image is not ready (src/daemon/runner-image-choice.ts).
+   * Without it such a launch is refused before anything is written.
+   */
+  useDefaultImage?: boolean;
   taskId: string;
   /**
    * The caller is a person who may use the one-shot usage-pause override
@@ -134,10 +146,9 @@ export interface StartTaskParams {
    * read that answers `human` unless `LAZY_ACTOR=builder` is set — which meant
    * any launch path that forgot to thread the channel silently reported a HUMAN
    * launch. That is not merely an attribution slip: audience is derived from
-   * who ran the task (`audienceOf`, src/task/audience.ts), so a child a cluster
-   * started through a path that dropped the actor would be treated as work a
-   * person is going to read, and pay for a presentation, screenshots and a
-   * CHANGELOG pass that nobody opens. A required field makes the omission a
+   * who ran the task (`audienceOf`, src/task/audience.ts), and audience decides
+   * where a task's protected-file questions are asked and which review prompt
+   * it gets — a dropped actor would ask a person about an agent's child. A required field makes the omission a
    * type error at the two call sites instead of a wrong answer at review time.
    */
   actor: ActorInput;
@@ -215,23 +226,21 @@ export async function launchHeldStart(
   return result.usagePauseHeld ? 'held' : 'started';
 }
 
-function buildPromptWithInstructions(userPrompt: string, goal: string, isFirstTurn: boolean, lazyRoot: string, notesContext?: string, journalNotice?: string, artifactNotice?: string): string {
-  const goalContext = (isFirstTurn ? goalContextStartText : goalContextContinueText)
-    .replace(/\{\{goal\}\}/g, goal) + '\n\n';
-
-  const notesSection = notesContext ?? '';
-  // Count-only journal notice — never entry content. See buildJournalNotice.
-  const journalSection = journalNotice ?? '';
-  // Pointer to materialized files, never their content. See buildArtifactNotice.
-  const artifactSection = artifactNotice ?? '';
-  return goalContext + notesSection + journalSection + artifactSection + userPrompt;
-}
-
-async function buildLinkedTaskPreamble(worktreePath: string, branchName: string, parentBranch: string): Promise<string> {
+/**
+ * The linked-task preamble in two parts: lazy's own fixed sentences, which a
+ * review surface may fold, and the branch's state — commit subjects, `git
+ * status`, a diffstat — which is text somebody else wrote and is never folded.
+ */
+async function buildLinkedTaskPreamble(
+  worktreePath: string,
+  branchName: string,
+  parentBranch: string,
+): Promise<{ fixed: string; external: string }> {
+  const fixed = [
+    `You are working on an existing branch '${branchName}' that was forked from '${parentBranch}'.`,
+    'This branch already has work on it. Read the existing changes carefully before making modifications.',
+  ].join('\n');
   const lines: string[] = [];
-  lines.push(`You are working on an existing branch '${branchName}' that was forked from '${parentBranch}'.`);
-  lines.push('This branch already has work on it. Read the existing changes carefully before making modifications.');
-  lines.push('');
 
   const countResult = await runGit(
     ['rev-list', '--left-right', '--count', `${parentBranch}...${branchName}`],
@@ -277,7 +286,7 @@ async function buildLinkedTaskPreamble(worktreePath: string, branchName: string,
     lines.push('');
   }
 
-  return lines.join('\n');
+  return { fixed, external: lines.join('\n') };
 }
 
 /**
@@ -324,6 +333,9 @@ export async function writeDaemonMcpConfig(
     // --task-id, and the daemon refuses any claim that isn't this identity.
     taskId: identity.kind === 'task' ? identity.taskId : '',
     target: daemonMcpTarget(webPort),
+    // `lazy_image_build` is advertised to a TASK only where it can run: a
+    // managed daemon on the microVM backend (src/daemon/image-try-build.ts).
+    ...(identity.kind === 'task' && imageTryBuildAvailable() ? { capabilities: ['image-build'] } : {}),
   };
   // 0600: the file carries a bearer credential. It is bind-mounted read-only
   // into exactly one container, by absolute path. A root daemon on native
@@ -535,10 +547,11 @@ async function validateTask(storage: Storage, taskId: string, root: string, agen
     if (!parentTask) {
       throw new RpcError(400, `Parent task not found: ${parentIdAfterRetarget}`);
     }
-    const parentWorktreePath = getWorktreePath(root, parentTask);
-    if (!await pathExists(parentWorktreePath)) {
+    const parentSession = await storage.getSessionByTaskId(parentTask.id);
+    if (!parentSession && !await pathExists(getWorktreePath(root, parentTask))) {
       throw new RpcError(400, `Cannot start child task: parent task has no worktree. Start the parent first with: lazy start ${displayId(parentTask)}`);
     }
+    await ensureTaskWorktree(root, parentTask, parentSession?.git_branch);
   }
 
   // Check task status
@@ -594,6 +607,10 @@ async function launchTaskRun(
   let t = await withSpan('start.validate', { 'lazy.task_id': params.taskId }, () =>
     validateTask(storage, params.taskId, projectRoot, params.agentId, params.retargetOrphan),
   );
+
+  // The project's runner image: refused here, before any write, unless the
+  // caller confirmed the default image (or the task needs no confirmation).
+  await confirmRunnerImageForLaunch(storage, t, params.useDefaultImage);
 
   // Config needed for agent-switch re-resolution and later launch steps.
   // Loaded here (before runner preflight) so a mid-start --agent change can
@@ -765,6 +782,8 @@ async function launchTaskRun(
   phases.begin(START_PHASES.resolveBase);
 
   // --- Task ref ---
+  // Fallback only: refs are pinned at create (FileStorage.createTask) and
+  // backfilled at daemon startup. A task created before that reaches here bare.
   if (!t.metadata?.task_ref) {
     const allTasks = await storage.listTasks();
     const ref = deriveTaskRef(t, allTasks);
@@ -1011,9 +1030,9 @@ async function launchTaskRun(
         );
         if (existing.exitCode === 0) {
           await ensureLazyExcludeBestEffort(projectRoot);
-          const added = await runGit(['worktree', 'add', worktreePath, branchName], { cwd: projectRoot });
+          const added = await runGit(['worktree', 'add', worktreePath, branchName], { cwd: projectRoot, timeout: WORKTREE_ADD_TIMEOUT });
           if (added.exitCode !== 0) {
-            throw new Error(`git worktree add ${branchName} failed: ${added.stderr}`);
+            throw new Error(describeWorktreeAddFailure(added.stderr, worktreePath, branchName));
           }
           return;
         }
@@ -1039,6 +1058,12 @@ async function launchTaskRun(
   if (!worktreeExisted) {
     await copyUntrackedFilesIntoWorktree(projectRoot, worktreePath, config.worktree.include);
   }
+
+  // Per-task secret files (src/daemon/task-files.ts): at worktree creation and
+  // on every start, so a reused worktree is repaired. A refusal (a tracked
+  // path) rides the start result's warnings as well as the narration.
+  const fileDelivery = await deliverTaskFilesForLaunch(projectRoot, t.id, worktreePath, phases.notify);
+  for (const r of fileDelivery?.refused ?? []) warnings.push(`Secret file ${r.path} not delivered: ${r.reason}`);
 
   // Acquire lock
   await acquireLock(worktreePath, 'lazy start');
@@ -1105,7 +1130,7 @@ async function launchTaskRun(
     // seconds. A `lazy edit --prompt` accepted during that window is durably
     // stored (edits are allowed until the task has turns), so launching from the
     // stale snapshot would hand the agent a prompt the human already replaced.
-    // INVARIANT (CLAUDE.md, "Never Lose Human Feedback"): the task prompt is
+    // INVARIANT (AGENTS.md, "Never Lose Human Feedback"): the task prompt is
     // human input — the agent must receive the LATEST accepted version.
     const fresh = await storage.getTask(t.id);
     const taskPrompt = fresh?.prompt ?? t.prompt;
@@ -1114,15 +1139,26 @@ async function launchTaskRun(
     // Type constraints ride the TURN, not the stored prompt — see
     // src/task/type-constraints.ts for why a cluster's rules cannot be baked in
     // at creation. Empty for every type but `cluster`.
-    let turnPrompt = typeConstraintsSection(fresh ?? t) + taskPrompt;
+    // The prompt is a person's words: a marker in it is made inert so review
+    // surfaces never fold it away (src/task/wrapper-fold.ts).
+    let turnPrompt = typeConstraintsSection(fresh ?? t) + neutralizeLazyMarkers(taskPrompt);
     if (isLinkedTask) {
       const linkedParentBranch = t.metadata?.parent_branch ?? await getRemoteDefaultBranch(projectRoot, config.remote.git_remote);
       const preamble = await buildLinkedTaskPreamble(worktreePath, branchName, linkedParentBranch);
-      turnPrompt = preamble + '\n---\n\n' + taskPrompt;
+      // Only lazy's own sentences fold: the branch's commit subjects, status
+      // and diffstat are someone else's text, and folding never hides that.
+      const external = preamble.external.trim();
+      // The cluster contract rides a linked task's turn too (empty for other types).
+      turnPrompt = typeConstraintsSection(fresh ?? t) + lazyFold('linked-preamble', preamble.fixed)
+        + (external ? '\n\n' + neutralizeLazyMarkers(external) : '')
+        + '\n\n---\n\n' + neutralizeLazyMarkers(taskPrompt);
     }
 
     const systemPrompt = buildSystemPrompt(runner.getAgentInstructions(), renderChattinessSnippet(resolveAgentChattiness(config)), await buildMemorySection(storage, 'agent', { warnBytes: config.memory.warn_bytes }), await buildLazyMdSection(worktreePath));
-    const fullPrompt = buildPromptWithInstructions(turnPrompt, taskGoal, true, projectRoot, notesCtx, journalNotice, artifactNotice);
+    const fullPrompt = renderTaskTurnPrompt({
+      firstTurn: true, userPrompt: turnPrompt, goal: taskGoal, lazyRoot: projectRoot, notesContext: notesCtx,
+      journalNotice, artifactNotice,
+    });
 
     // --- Persist state BEFORE launch (crash-safe) ---
     let sess;
@@ -1170,7 +1206,7 @@ async function launchTaskRun(
     // the LIVE remote-tracking ref (e.g. `origin/main`) for a protected target,
     // so it never merges a stale local branch — but the LOCAL branch for an
     // unprotected parent that accept merges into locally and whose agent
-    // commits are not on origin. Per CLAUDE.md "fail hard on remote failures —
+    // commits are not on origin. Per AGENTS.md "fail hard on remote failures —
     // no silent fallbacks": a fetch failure here must be visible, never
     // swallowed. With `--force-local` the caller has opted into local HEAD, so
     // degrade to the local branch name but still surface a warning.
@@ -1216,9 +1252,6 @@ async function launchTaskRun(
       projectRoot,
       worktreePath,
       config: branchConfig,
-      // Turn 1 is recorded after this (below the flip); its actor decides the
-      // audience, so hand it over rather than let the creator's actor decide.
-      pendingLaunchActor: actorRole(actor),
     });
 
     // UNDER THE TASK'S LIFECYCLE LOCK, like every other launch path: the
@@ -1240,8 +1273,6 @@ async function launchTaskRun(
       if (runner.usesSandbox() && hasDaemonContext()) {
         daemonConfigPath = await writeDaemonMcpConfig(projectRoot, containerName, { kind: 'task', taskId: t.id });
       }
-
-      await storage.markNotesDelivered(sess.id, notesDeliveredThrough);
 
       await storage.createTurn({
         sessionId: sess.id,
@@ -1407,7 +1438,7 @@ async function launchTaskRun(
       logger.info(`[${tRef}] Recreating container: task environment changed (lazy env) — launch env is fixed at create time`);
     }
 
-    if (!mustRecreateForCredential && !mustRecreateForAgent && !mustRecreateForEnv && (await runner.isRunning(containerName))) {
+    if (!mustRecreateForCredential && !mustRecreateForAgent && !mustRecreateForEnv && !mustRecreateForRunnerImage(t) && (await runner.isRunning(containerName))) {
       // Supervisor already running — it will pick up the new command
       phases.note(`reusing running container ${containerName}`);
     } else {
@@ -1417,9 +1448,11 @@ async function launchTaskRun(
         await withSpan('docker.launch_supervisor', {
           'lazy.runner': runner.type,
           'lazy.container': containerName,
-        }, () => runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef, t.id, pinnedCustomImage(t), phases.notify));
+        }, () => runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef, t.id, launchImagePin(t), phases.notify));
       } catch (err) {
-        await storage.updateTaskStatus(t.id, 'interrupted', getActor());
+        // Lazy's failure, not the caller's: system-attributed, with its reason
+        // and a failure notice turn (src/daemon/launch-failure.ts).
+        await recordLaunchFailure(storage, t, sess.id, err, projectRoot);
         if (!worktreeExisted) {
           const { removeWorktree } = await import('../git/operations');
           try {
@@ -1438,7 +1471,20 @@ async function launchTaskRun(
     sess.container_agent_id = t.agent_id;
     await storage.updateSessionInteraction(sess.id, 0);
 
+    if (notesDeliveredThrough !== null) {
+      try {
+        await storage.markNotesDelivered(sess.id, notesDeliveredThrough);
+      } catch (err) {
+        logger.error(`Could not mark task notes delivered after launch: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
     phases.end(containerName);
+
+    // This task's branch exists now: children whose sync was waiting for it
+    // merge it at once, not on the retry loop's next tick. In the background —
+    // the start does not wait on its children's merges.
+    void syncChildrenAfterParentStart(projectRoot, storage, t.id);
 
     return {
       sessionId: sess.id,

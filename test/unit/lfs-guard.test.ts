@@ -353,7 +353,7 @@ describe('enforceLfsGuard', () => {
     expect(err.message).toContain('datasets/big.bin');
     expect(err.message).toContain('49 KB');
     expect(err.message).toContain('add dataset');
-    // Actionable per CLAUDE.md: the mechanism, the fix, and the escape hatch.
+    // Actionable per AGENTS.md: the mechanism, the fix, and the escape hatch.
     expect(err.message).toContain('filter.lfs.required');
     expect(err.message).toContain('git lfs install --local');
     expect(err.message).toContain('--approve-file datasets/big.bin');
